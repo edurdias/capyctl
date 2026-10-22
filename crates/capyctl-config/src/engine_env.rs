@@ -117,11 +117,26 @@ pub const DUMP_RESERVED_NAMES: &[(&str, &str)] = &[
     ),
 ];
 
-fn dump_reserved(upper: &str) -> bool {
+/// ADR 0033 §11: LMCache's configuration variables. Its 0.5.6 vLLM helper
+/// reads its configuration from the environment after any file, so a
+/// variable here would change what CapyCTL renders. Reserved on every engine,
+/// whatever an approval says; refused as `engine_env_reserved:<name>`.
+pub const LMCACHE_RESERVED_PREFIX: (&str, &str) = (
+    "LMCACHE_",
+    "LMCache reads its configuration from the environment after any file; CapyCTL \
+     renders LMCache from the deployment's `lmcache` setting (ADR 0033)",
+);
+
+/// Every reserved family: the dump families and LMCache's.
+fn reserved_prefixes() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    DUMP_RESERVED_PREFIXES
+        .iter()
+        .chain(std::iter::once(&LMCACHE_RESERVED_PREFIX))
+}
+
+fn reserved(upper: &str) -> bool {
     DUMP_RESERVED_NAMES.iter().any(|(name, _)| *name == upper)
-        || DUMP_RESERVED_PREFIXES
-            .iter()
-            .any(|(prefix, _)| upper.starts_with(prefix))
+        || reserved_prefixes().any(|(prefix, _)| upper.starts_with(prefix))
 }
 
 /// ADR 0028 §2.1 rule 2: the existing safe names. They need no approval and
@@ -142,9 +157,9 @@ const MAX_VALUE_BYTES: usize = 4096;
 pub(crate) const MAX_NAMES: usize = 64;
 const MAX_NAME_BYTES: usize = 128;
 
-/// Whether CapyCTL owns or reserves `name` (rule 1, and the dump families
-/// above). Compared upper-cased, so a lower-case spelling of an owned name is
-/// not a way around it.
+/// Whether CapyCTL owns or reserves `name` (rule 1, the dump families and
+/// LMCache's, above). Compared upper-cased, so a lower-case spelling of an
+/// owned name is not a way around it.
 pub fn is_owned(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     if SAFE_NAMES.contains(&upper.as_str()) {
@@ -154,7 +169,7 @@ pub fn is_owned(name: &str) -> bool {
         || OWNED_PREFIXES
             .iter()
             .any(|prefix| upper.starts_with(prefix))
-        || dump_reserved(&upper)
+        || reserved(&upper)
 }
 
 /// Why an engine environment was refused.
@@ -221,7 +236,7 @@ impl ApprovedEnv {
             let owned_only = if glob {
                 OWNED_PREFIXES
                     .iter()
-                    .chain(DUMP_RESERVED_PREFIXES.iter().map(|(prefix, _)| prefix))
+                    .chain(reserved_prefixes().map(|(prefix, _)| prefix))
                     .any(|prefix| stem.starts_with(prefix))
             } else {
                 is_owned(stem)
@@ -449,6 +464,7 @@ pub fn env_table() -> Vec<FlagRow> {
         name_match,
         class,
         approval: None,
+        value: None,
         reason: reason.to_owned(),
     };
     let owned = "CapyCTL renders or closes it";
@@ -461,7 +477,7 @@ pub fn env_table() -> Vec<FlagRow> {
                 .map(|name| row(name, NameMatch::Name, FlagClass::Owned, owned)),
         )
         .chain(
-            DUMP_RESERVED_PREFIXES.iter().map(|(prefix, reason)| {
+            reserved_prefixes().map(|(prefix, reason)| {
                 row(prefix, NameMatch::Prefix, FlagClass::Reserved, reason)
             }),
         )

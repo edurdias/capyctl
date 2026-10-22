@@ -1924,6 +1924,8 @@ async fn start_standalone_in(
         );
         models.write_into(&mut host);
         crate::standalone_config::apply_stated_queue(&mut host, &stated_host);
+        // ADR 0033 §9, §10: the stated `lmcache` and `retention`, published.
+        capyctl_config::standalone::publish_host_settings(&mut host, &stated_host);
         // ADR 0028 §3: the host's group policy, by the shared writer.
         role.groups
             .write_into(&mut host)

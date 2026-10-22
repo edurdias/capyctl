@@ -423,7 +423,13 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             "log_policy",
             FieldSpec::Struct(&[("max_file_bytes", BYTES), ("retained_files", SCALAR)]),
         ),
+        // ADR 0033 §1: the LMCache package `engine add` registered.
+        ("lmcache", LMCACHE_REGISTRATION),
     ]);
+    // ADR 0033 §1, contract decision 3: the LMCache package `engine add`
+    // found in the registered environment, with its ADR 0008 digest.
+    const LMCACHE_REGISTRATION: FieldSpec =
+        FieldSpec::Struct(&[("version", SCALAR), ("digest", SCALAR)]);
     // ADR 0031 §2: the manifest as a profile carries it; its own validation
     // (placeholders, paths, the idle signal) runs at resolution.
     const CUSTOM_MANIFEST: FieldSpec = FieldSpec::Struct(&[
@@ -461,6 +467,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             "log_policy",
             FieldSpec::Struct(&[("max_file_bytes", BYTES), ("retained_files", SCALAR)]),
         ),
+        ("lmcache", LMCACHE_REGISTRATION),
         (
             "custom",
             // ADR 0031 §8: the installation digest the operator approved.
@@ -525,6 +532,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("lifecycle", FieldSpec::Struct(HOST_LIFECYCLE)),
         // Owner decision 2026-10-20: where engine output is kept, as on a host.
         ("engine_logs", SCALAR),
+        // ADR 0033 §9, §10: LMCache and zero retention, as on a host.
+        ("lmcache", SCALAR),
+        ("retention", SCALAR),
     ];
     /// SPEC §6.5, §10: a host's activation policy, for every deployment that
     /// may run on it. Controller policy; never part of the document a
@@ -607,6 +617,10 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 // Role-local (owner decision 2026-10-20): `files` or `memory`,
                 // where each launch's redacted engine output is kept.
                 ("engine_logs", SCALAR),
+                // ADR 0033 §9, §10: `auto` or `off`, `standard` or `zero`.
+                // Published with the document: placement reads them.
+                ("lmcache", SCALAR),
+                ("retention", SCALAR),
             ],
         },
         ConfigKind::Deployment => &KindSchema {
@@ -618,6 +632,12 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 // ADR 0030 §1: the API the deployment serves, `chat` (the
                 // default) or `decisions`.
                 ("api", SCALAR),
+                // ADR 0033 §9, §6, §10: `auto` (the default), `off` or
+                // `required`; the pool, a whole number of GiB; `standard`
+                // (the default) or `zero`.
+                ("lmcache", SCALAR),
+                ("lmcache_pool", BYTES),
+                ("retention", SCALAR),
                 // ADR 0013 §2: `host` is shorthand for `placement.hosts: [host]`.
                 ("host", SCALAR),
                 ("instances", SCALAR),

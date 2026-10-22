@@ -82,6 +82,23 @@ pub fn deployment_command_fingerprint(
     if !input.api.is_chat() {
         semantic["api"] = json!(input.api);
     }
+    // ADR 0033 (contract decision 1): the LMCache settings are part of what
+    // the command asks for. Their defaults add nothing, so every earlier
+    // command keeps its fingerprint.
+    let pool = super::lmcache_declaration(
+        input.lmcache,
+        input.lmcache_pool.as_deref(),
+        input.retention,
+    )?;
+    if !input.lmcache.is_auto() {
+        semantic["lmcache"] = json!(input.lmcache);
+    }
+    if let Some(pool) = pool {
+        semantic["lmcache_pool_bytes"] = json!(pool);
+    }
+    if !input.retention.is_standard() {
+        semantic["retention"] = json!(input.retention);
+    }
     // ADR 0014 amendment A1: declared timeouts are part of what the command
     // asks for. Omitted, they add nothing, so older commands keep their
     // fingerprint.

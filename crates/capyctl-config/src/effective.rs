@@ -51,6 +51,7 @@ use crate::engine_env::{resolve_engine_env, ApprovedEnv, ResolvedEnv};
 use crate::engine_policy::{
     normalize_option_name, validate_profile_args, validate_profile_env, ExtraArgsPolicy,
 };
+use crate::lmcache::{HostLmcache, LmcacheMode, LmcacheRegistration, Retention};
 pub use crate::parked_growth::ParkedGrowthLimit;
 use crate::resource_controls::{ResourceContext, ResourceControls};
 use crate::{ConfigError, ConfigErrorCode};
@@ -181,6 +182,17 @@ pub struct EffectiveDeployment {
     /// field existed serializes, and fingerprints, exactly as before.
     #[serde(skip_serializing_if = "DeploymentApi::is_chat")]
     pub api: DeploymentApi,
+    /// ADR 0033 §9 (contract decision 1): the declared `lmcache`, omitted
+    /// while `auto` so every revision frozen before it keeps its encoding.
+    #[serde(skip_serializing_if = "LmcacheMode::is_auto")]
+    pub lmcache: LmcacheMode,
+    /// ADR 0033 §6: the declared `lmcache_pool` in bytes; omitted unless
+    /// stated (the default is 4 GiB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lmcache_pool_bytes: Option<u64>,
+    /// ADR 0033 §10: the declared `retention`, omitted while `standard`.
+    #[serde(skip_serializing_if = "Retention::is_standard")]
+    pub retention: Retention,
     pub model: ModelIdentity,
     pub routes: Vec<String>,
     pub recipe: String,
@@ -401,6 +413,10 @@ pub struct RuntimeProfile {
     /// profiles serialize exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom: Option<crate::custom::CustomProfile>,
+    /// ADR 0033 §1: the LMCache package registered with the installation.
+    /// Absent when none is, so such a profile serializes exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lmcache: Option<LmcacheRegistration>,
 }
 
 /// Whether this profile may park at all.
@@ -586,6 +602,14 @@ pub struct HostPolicy {
     /// it keeps every digest.
     #[serde(skip_serializing_if = "ParkedGrowthLimit::is_auto")]
     pub parked_growth_limit: ParkedGrowthLimit,
+    /// ADR 0033 §9, §13: the host's `lmcache`, published so placement can
+    /// refuse `lmcache: required` on a host that turned it off. Encoded only
+    /// when `off`.
+    #[serde(skip_serializing_if = "HostLmcache::is_auto")]
+    pub lmcache: HostLmcache,
+    /// ADR 0033 §10: the host's `retention`. Encoded only when `zero`.
+    #[serde(skip_serializing_if = "Retention::is_standard")]
+    pub retention: Retention,
 }
 
 /// Whether a domain's device memory and host memory are one physical pool.
@@ -937,6 +961,15 @@ struct DeploymentInput {
     /// ADR 0030 §1: optional; `chat` when omitted.
     #[serde(default)]
     api: DeploymentApi,
+    /// ADR 0033 §9: optional; `auto` when omitted.
+    #[serde(default)]
+    lmcache: LmcacheMode,
+    /// ADR 0033 §6: optional; a whole number of GiB, at least 1 GiB.
+    #[serde(default)]
+    lmcache_pool: Option<String>,
+    /// ADR 0033 §10: optional; `standard` when omitted.
+    #[serde(default)]
+    retention: Retention,
     model: RawModel,
     routes: Vec<String>,
     runtime_profile: String,
@@ -1051,6 +1084,13 @@ struct HostInput {
     checkpoints: Option<crate::model_settings::RawCheckpoints>,
     resource_policy: RawHostPolicy,
     runtime_profiles: BTreeMap<String, RawProfile>,
+    /// ADR 0033 §9, §10: the host's `lmcache` and `retention`, published
+    /// with the document (`remote_resources::local_host_document` keeps
+    /// them); absent is `auto` and `standard`.
+    #[serde(default)]
+    lmcache: HostLmcache,
+    #[serde(default)]
+    retention: Retention,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1196,6 +1236,9 @@ struct RawProfile {
     /// ADR 0031 §1: the copied manifest and its digest, a custom engine's only.
     #[serde(default)]
     custom: Option<serde_json::Value>,
+    /// ADR 0033 §1: the LMCache package `engine add` registered.
+    #[serde(default)]
+    lmcache: Option<LmcacheRegistration>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1388,6 +1431,39 @@ fn check_custom_deployment(
     Ok(())
 }
 
+/// ADR 0033 §6, §9, §10, §14: what a deployment's `lmcache`, `lmcache_pool`
+/// and `retention` say by themselves. The pool, in bytes, when stated: a whole
+/// number of GiB, at least 1 GiB, and never beside `lmcache: off`; `lmcache:
+/// required` beside `retention: zero` is `retention_zero:lmcache`.
+fn lmcache_declaration(
+    lmcache: LmcacheMode,
+    lmcache_pool: Option<&str>,
+    retention: Retention,
+) -> Result<Option<u64>, ConfigError> {
+    let pool = lmcache_pool
+        .map(crate::lmcache::parse_pool)
+        .transpose()
+        .map_err(|detail| invalid("lmcache_pool", detail))?;
+    if pool.is_some() && lmcache == LmcacheMode::Off {
+        return Err(invalid(
+            "lmcache_pool",
+            "lmcache_pool sizes the LMCache pool, and `lmcache: off` runs no LMCache; \
+             remove one of them",
+        ));
+    }
+    if lmcache == LmcacheMode::Required && retention == Retention::Zero {
+        return Err(invalid(
+            "lmcache",
+            format!(
+                "{}: `retention: zero` never starts LMCache, so `lmcache: required` cannot \
+                 be met; remove one of them",
+                crate::lmcache::LmcacheOffReason::RetentionZero.required_refusal()
+            ),
+        ));
+    }
+    Ok(pool)
+}
+
 pub fn resolve_effective(
     deployment: &serde_json::Value,
     host: &serde_json::Value,
@@ -1426,6 +1502,8 @@ pub fn resolve_effective_with_checkpoint(
     if d.name.is_empty() {
         return Err(invalid("deployment.name", "must not be empty"));
     }
+    let lmcache_pool_bytes =
+        lmcache_declaration(d.lmcache, d.lmcache_pool.as_deref(), d.retention)?;
     if d.routes.is_empty()
         || d.routes.iter().any(String::is_empty)
         || d.routes.iter().collect::<BTreeSet<_>>().len() != d.routes.len()
@@ -1717,6 +1795,31 @@ pub fn resolve_effective_with_checkpoint(
     if d.api == DeploymentApi::Decisions {
         crate::decisions::check_parsers(&engine_config)?;
     }
+    // ADR 0033 §9, §14: `lmcache: required` is refused here when the
+    // deployment and its profile alone keep LMCache off; what the host
+    // decides (its settings, its capabilities, the GPU) is placement's.
+    let lmcache_inputs = crate::lmcache::PlanInputs {
+        mode: d.lmcache,
+        pool_bytes: lmcache_pool_bytes,
+        retention: d.retention,
+        api: d.api,
+        topology: instance_spec.group.is_some(),
+        registration: profile.lmcache.as_ref(),
+        kv_transfer_config_set: crate::engine_policy::kv_transfer_config_set(
+            profile.engine,
+            &engine_args,
+        ),
+        ..crate::lmcache::PlanInputs::for_profile(
+            profile.engine,
+            &profile.build_fingerprint,
+            residency,
+        )
+    };
+    if let Some(code) =
+        crate::lmcache::deployment_refusal(&lmcache_inputs, crate::lmcache::QUALIFIED_PARKING)
+    {
+        return Err(invalid("lmcache", code));
+    }
     if let Some(topology) = member_of {
         let known = facts.weights_bytes.is_some();
         engine_config.memory_mut().member = Some(capyctl_domain::member_weights::MemberWeights {
@@ -1787,6 +1890,9 @@ pub fn resolve_effective_with_checkpoint(
     };
     let recipe = core::NormalizedRecipe {
         api: d.api,
+        lmcache: d.lmcache,
+        lmcache_pool_bytes,
+        retention: d.retention,
         model,
         recipe: d.recipe,
         residency,
@@ -1816,6 +1922,9 @@ pub fn resolve_effective_with_checkpoint(
         schema_version: 1,
         name: d.name,
         api: recipe.api,
+        lmcache: recipe.lmcache,
+        lmcache_pool_bytes: recipe.lmcache_pool_bytes,
+        retention: recipe.retention,
         model: recipe.model,
         routes: d.routes,
         recipe: recipe.recipe,
@@ -1837,6 +1946,7 @@ pub fn resolve_effective_with_checkpoint(
             security: profile.security,
             log_policy: profile.log_policy,
             custom: profile.custom,
+            lmcache: profile.lmcache,
         },
         engine_env,
         host,

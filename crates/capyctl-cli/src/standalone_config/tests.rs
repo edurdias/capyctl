@@ -1313,6 +1313,7 @@ fn registered(executable: &std::path::Path) -> serde_json::Map<String, serde_jso
             env: Default::default(),
             approved_env: vec![],
             trust_remote_code: false,
+            lmcache: None,
         },
     );
     [("vllm-patched".to_string(), profile)]
@@ -2099,6 +2100,7 @@ fn drafter_profile(options: &[&str], paths: &[&str]) -> serde_json::Value {
         env: Default::default(),
         approved_env: vec![],
         trust_remote_code: false,
+        lmcache: None,
     })
 }
 

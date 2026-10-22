@@ -218,6 +218,7 @@ fn spec(engine: Engine) -> ProfileSpec {
         env: Default::default(),
         approved_env: vec![],
         trust_remote_code: false,
+        lmcache: None,
     }
 }
 
