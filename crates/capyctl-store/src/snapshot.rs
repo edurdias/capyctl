@@ -408,6 +408,54 @@ pub struct InstanceSnapshot {
     /// ADR 0031 §6, SPEC §10: the instance's cancelling requests and what
     /// settles them. Additive.
     pub requests: InstanceRequests,
+    /// ADR 0033 §9: the LMCache of the instance's current incarnation, as
+    /// the store planned it and its host reported it. Absent for a launch
+    /// planned before ADR 0033 and an instance never started. Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lmcache: Option<InstanceLmcache>,
+}
+
+/// ADR 0033 §9: one instance's LMCache in status. The figures are the charge
+/// the store reserved; the cache figures a server reports (used bytes,
+/// lookups, hits) come from the load read and are merged by the client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InstanceLmcache {
+    /// `on` or `off`: what the host reported, else what the store planned.
+    pub state: String,
+    /// Off only: the closed reason (ADR 0033 §14).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Off only: the sentence status shows after "LMCache off: ".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// On only: `starting` (planned, not yet reported), `running`,
+    /// `exited` (it exited on its own; the instance failed) or `stopped`
+    /// (the launch is released).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// On only: the L1 pool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_bytes: Option<i64>,
+    /// On only: the server's memory beyond its pool the launch is charged,
+    /// measured or the allowance (`measured`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overhead_bytes: Option<i64>,
+    /// On only: the server's own GPU memory the launch is charged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_bytes: Option<i64>,
+    /// On only, `restart_only`: the engine KV cache the server keeps mapped
+    /// while a restart-park stopped the engine, charged in that phase only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held_kv_bytes: Option<i64>,
+    /// On only: the charge the launch holds for its server now (the pool,
+    /// the overhead and the device memory, and while restart-parked the
+    /// engine KV cache it keeps mapped).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charge_bytes: Option<i64>,
+    /// On only: the overhead and device figures were measured for the
+    /// revision on its host rather than the allowances.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured: Option<bool>,
 }
 
 /// ADR 0031 §6, SPEC §10: requests whose client hung up, whose deadline cut
@@ -958,6 +1006,7 @@ impl Store {
                             settle_at_stop: at_stop.to_string(),
                         }
                     },
+                    lmcache: None,
                 },
             ))
         })?;
@@ -978,6 +1027,7 @@ impl Store {
                     .clone()
                     .unwrap_or_else(|| entry.revision.clone());
                 instance.group = group_status(&tx, &deployment, instance.index, &revision)?;
+                instance.lmcache = instance_lmcache(&tx, &deployment, instance.index)?;
                 entry.instances.push(instance);
             }
         }
@@ -1192,6 +1242,144 @@ impl Store {
         tx.commit()?;
         Ok(snapshot)
     }
+}
+
+/// ADR 0033 §9: the LMCache of the newest launch of the instance's current
+/// incarnation: on or off (the host's report, else the store's plan), why it
+/// is off, the server's state and the charge the launch holds for it.
+fn instance_lmcache(
+    tx: &Transaction<'_>,
+    deployment: &str,
+    index: u32,
+) -> Result<Option<InstanceLmcache>, SnapshotError> {
+    use capyctl_config::lmcache::LmcacheOffReason;
+    use rusqlite::OptionalExtension;
+    type Row = (
+        String,
+        Option<String>,
+        Option<String>,
+        [Option<i64>; 4],
+        bool,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        bool,
+        Option<String>,
+        bool,
+        bool,
+    );
+    let row: Option<Row> = tx
+        .prepare_cached(
+            "SELECT l.planned,l.planned_reason,l.planned_detail,l.pool_bytes,l.overhead_bytes,
+                    l.device_bytes,l.held_kv_bytes,l.measured=1,l.state,l.reason,l.detail,
+                    l.restart_park=1,b.state,
+                    EXISTS(SELECT 1 FROM management_events e WHERE e.kind='lmcache_server_exited'
+                       AND e.deployment_id=l.deployment_id
+                       AND json_extract(e.payload_json,'$.binding_id')=l.binding_id),
+                    i.observed_state='parked'
+               FROM launch_lmcache l
+               JOIN deployment_instances i ON i.deployment_id=l.deployment_id
+                AND i.instance_index=l.instance_index AND i.generation=l.generation
+               LEFT JOIN runtime_bindings b ON b.id=l.binding_id
+              WHERE l.deployment_id=?1 AND l.instance_index=?2
+              ORDER BY l.rowid DESC LIMIT 1",
+        )?
+        .query_row(rusqlite::params![deployment, index], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                [r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?],
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+                r.get(11)?,
+                r.get(12)?,
+                r.get(13)?,
+                r.get(14)?,
+            ))
+        })
+        .optional()?;
+    let Some((
+        planned,
+        planned_reason,
+        planned_detail,
+        [pool, overhead, device, held_kv],
+        measured,
+        reported,
+        reported_reason,
+        reported_detail,
+        restart_park,
+        binding,
+        exited,
+        parked,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let on = reported.as_deref().unwrap_or(planned.as_str()) == "on";
+    if !on {
+        let (reason, detail) = match reported.as_deref() {
+            Some("off") => (reported_reason, reported_detail),
+            _ => (planned_reason, planned_detail),
+        };
+        let reason = reason
+            .as_deref()
+            .and_then(LmcacheOffReason::parse)
+            .ok_or(SnapshotError::CorruptData)?;
+        // The engine's log tail is the detail of `engine_start_failed`, and
+        // a detail of several lines is a diagnostic: status shows the
+        // reason's sentence for them.
+        let message = match detail.filter(|d| {
+            reason != LmcacheOffReason::EngineStartFailed
+                && !d.trim().is_empty()
+                && d.len() <= 256
+                && !d.contains('\n')
+        }) {
+            Some(detail) => detail,
+            None => reason.sentence().to_owned(),
+        };
+        return Ok(Some(InstanceLmcache {
+            state: "off".into(),
+            reason: Some(reason.code().into()),
+            message: Some(message),
+            server: None,
+            pool_bytes: None,
+            overhead_bytes: None,
+            device_bytes: None,
+            held_kv_bytes: None,
+            charge_bytes: None,
+            measured: None,
+        }));
+    }
+    let (Some(pool), Some(overhead), Some(device), Some(held_kv)) =
+        (pool, overhead, device, held_kv)
+    else {
+        return Err(SnapshotError::CorruptData);
+    };
+    let server = match binding.as_deref() {
+        None | Some("released") => "stopped",
+        Some(_) if exited => "exited",
+        Some(_) if reported.is_none() => "starting",
+        Some(_) => "running",
+    };
+    let mut charge = pool.saturating_add(overhead).saturating_add(device);
+    if restart_park && parked {
+        charge = charge.saturating_add(held_kv);
+    }
+    Ok(Some(InstanceLmcache {
+        state: "on".into(),
+        reason: None,
+        message: None,
+        server: Some(server.into()),
+        pool_bytes: Some(pool),
+        overhead_bytes: Some(overhead),
+        device_bytes: Some(device),
+        held_kv_bytes: restart_park.then_some(held_kv),
+        charge_bytes: (server != "stopped").then_some(charge),
+        measured: Some(measured),
+    }))
 }
 
 /// SPEC §6.4: the columns [`latest_operation`] reads, the operation aliased

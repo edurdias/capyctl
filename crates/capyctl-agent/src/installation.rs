@@ -973,6 +973,9 @@ pub struct InstallationRegistry {
     custom: BTreeMap<String, CustomManifest>,
     /// Profile name → the digest a launch measured instead (drift).
     drift: Mutex<BTreeMap<String, String>>,
+    /// ADR 0033 §1: profile name → the LMCache digest the last launch-time
+    /// check measured instead of the registered one, while drifted.
+    lmcache_drift: Mutex<BTreeMap<String, String>>,
     /// Profile name → (installation digest probed, report).
     capabilities: Mutex<BTreeMap<String, (String, CapabilityReport)>>,
     probe_timeout: Duration,
@@ -1013,6 +1016,7 @@ impl InstallationRegistry {
                     .map(|p| (p.name.clone(), p.installation_observed_digest.clone()))
                     .collect(),
             ),
+            lmcache_drift: Mutex::default(),
             capabilities: Mutex::default(),
             probe_timeout: PROBE_TIMEOUT,
         };
@@ -1152,6 +1156,15 @@ impl InstallationRegistry {
     > {
         let checked =
             crate::lmcache_install::check_lmcache(&self.measurer, engine, executable, registered);
+        // ADR 0033 §1: the drift stands in status until a check measures
+        // the registered digest again.
+        if let (Ok(install), Ok(mut drift)) = (checked.as_ref(), self.lmcache_drift.lock()) {
+            if install.drifted {
+                drift.insert(profile.to_owned(), install.digest.clone());
+            } else {
+                drift.remove(profile);
+            }
+        }
         if let Some(install) = checked.as_ref().ok().filter(|install| install.drifted) {
             capyctl_domain::role_log::notice(
                 capyctl_domain::role_log::Level::Warning,
@@ -1170,6 +1183,11 @@ impl InstallationRegistry {
     /// Status: overlay drift and missing capabilities on published profiles.
     pub fn overlay(&self, profiles: &mut [capyctl_protocol::pb::RuntimeProfileStatus]) {
         let drift = self.drift.lock().map(|d| d.clone()).unwrap_or_default();
+        let lmcache_drift = self
+            .lmcache_drift
+            .lock()
+            .map(|d| d.clone())
+            .unwrap_or_default();
         let capabilities = self
             .capabilities
             .lock()
@@ -1186,6 +1204,10 @@ impl InstallationRegistry {
             if let Some((_, report)) = capabilities.get(&profile.name) {
                 profile.capabilities_missing = report.missing_capabilities();
             }
+            profile.lmcache_observed_digest = lmcache_drift
+                .get(&profile.name)
+                .cloned()
+                .unwrap_or_default();
         }
     }
 }

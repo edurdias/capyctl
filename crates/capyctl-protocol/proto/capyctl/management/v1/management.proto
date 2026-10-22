@@ -307,6 +307,11 @@ message RuntimeProfileStatus {
   // Capabilities a launch-time probe found missing (engine_capabilities.py):
   // core | deep_park | metrics | observation. Empty until probed.
   repeated string capabilities_missing = 9;
+  // ADR 0033 §1 (additive): set while the profile's last launch-time check
+  // found its LMCache drifted from the registration `engine add` made: the
+  // `sha256:` digest it measured instead of the profile's `lmcache.digest`.
+  // Empty otherwise and from an older host.
+  string lmcache_observed_digest = 10;
 }
 message ReportOperationResult {
   string operation_id = 1;

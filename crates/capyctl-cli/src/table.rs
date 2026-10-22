@@ -275,6 +275,20 @@ fn hosts(value: &Value) -> String {
         {
             out.push_str(&format!("warning: {}: {}\n", clean(name), clean(warning)));
         }
+        // ADR 0033 §1: a profile whose LMCache changed since `engine add`.
+        for profile in host["session"]["profiles"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| p["installation"]["lmcache"]["state"] == "drifted")
+        {
+            out.push_str(&format!(
+                "warning: {}: LMCache of profile {} drifted from its registration: measured {}\n",
+                clean(name),
+                text(&profile["name"]),
+                text(&profile["installation"]["lmcache"]["observed_digest"])
+            ));
+        }
     }
     out
 }
@@ -666,6 +680,20 @@ fn status(value: &Value, names: &HostNames) -> String {
             out.push_str(&line);
         }
     }
+    // ADR 0033 §9: each instance's LMCache, on with its pool, charge and
+    // server, or off with why.
+    let lmcache: Vec<String> = d["instances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(lmcache_line)
+        .collect();
+    if !lmcache.is_empty() {
+        out.push('\n');
+        for line in lmcache {
+            out.push_str(&line);
+        }
+    }
     if let Some(engine) = d["engine"].as_str() {
         out.push_str(&format!("\nEngine  {engine}\n"));
     } else if d["installation"].is_object() {
@@ -678,6 +706,11 @@ fn status(value: &Value, names: &HostNames) -> String {
         ));
         if let Some(note) = d["engine_note"].as_str() {
             out.push_str(&format!("note: {note}\n"));
+        }
+        // ADR 0033 §1: LMCache in the engine's environment changed since
+        // `engine add` registered it.
+        if let Some(line) = lmcache_drift(&i["lmcache"]) {
+            out.push_str(&line);
         }
     }
     if let Some(line) = parsers(&d["parsers"]) {
@@ -742,6 +775,67 @@ fn cancelling_line(instance: &Value) -> Option<String> {
         "Instance {}  cancelling: {count}{settles}\n",
         text(&instance["index"])
     ))
+}
+
+/// ADR 0033 §9: one instance's LMCache line, absent when status has none:
+/// `LMCache   instance 0 on: pool 4.0 GiB, ...` or `... off: <why>`.
+fn lmcache_line(instance: &Value) -> Option<String> {
+    let lmcache = instance.get("lmcache").filter(|l| l.is_object())?;
+    let index = text(&instance["index"]);
+    if lmcache["state"] != "on" {
+        return Some(format!(
+            "LMCache   instance {index} off: {}\n",
+            text(&lmcache["message"])
+        ));
+    }
+    let mut parts = Vec::new();
+    if let Some(pool) = number(&lmcache["pool_bytes"]) {
+        parts.push(format!("pool {}", gib(pool)));
+    }
+    if let Some(used) = number(&lmcache["used_bytes"]) {
+        parts.push(format!("used {}", gib(used)));
+    }
+    if let Some(overhead) = number(&lmcache["overhead_bytes"]) {
+        parts.push(format!(
+            "overhead {} ({})",
+            gib(overhead),
+            if lmcache["measured"] == true {
+                "measured"
+            } else {
+                "allowance"
+            }
+        ));
+    }
+    if let Some(device) = number(&lmcache["device_bytes"]).filter(|d| *d > 0) {
+        parts.push(format!("GPU {}", gib(device)));
+    }
+    if let Some(charge) = number(&lmcache["charge_bytes"]) {
+        parts.push(format!("charged {}", gib(charge)));
+    }
+    if let Some(server) = lmcache["server"].as_str() {
+        parts.push(format!("server {}", clean(server)));
+    }
+    match (number(&lmcache["hits"]), number(&lmcache["lookups"])) {
+        (Some(hits), Some(lookups)) => parts.push(format!("{hits} hits / {lookups} lookups")),
+        (Some(hits), None) => parts.push(format!("{hits} hits")),
+        _ => {}
+    }
+    Some(format!(
+        "LMCache   instance {index} on: {}\n",
+        parts.join(", ")
+    ))
+}
+
+/// ADR 0033 §1: LMCache drifted from the registration `engine add` made,
+/// as an installation view reports it (`state: drifted`).
+fn lmcache_drift(view: &Value) -> Option<String> {
+    (view["state"] == "drifted").then(|| {
+        format!(
+            "LMCache drifted from its registration: registered {}, measured {}\n",
+            text(&view["digest"]),
+            text(&view["observed_digest"])
+        )
+    })
 }
 
 /// ADR 0023 §4 (amended 2026-10-03): the requests a TensorFold launch decodes

@@ -49,8 +49,10 @@ pub struct EmbeddedInstallation {
     /// `None` while not drifted: each drift is journaled once, a drift found
     /// at registration (ADR 0031 §8) by the first launch.
     reported: std::sync::Mutex<Option<String>>,
-    /// ADR 0033 §1: the observed LMCache digest of the drift last journaled.
-    lmcache_reported: std::sync::Mutex<Option<String>>,
+    /// ADR 0033 §1: LMCache's registered and observed digests while the
+    /// last launch-time check found it drifted, journaled once per observed
+    /// digest and shown in status; `None` while not drifted.
+    lmcache_drift: std::sync::Mutex<Option<(String, String)>>,
 }
 
 /// One launch-time measurement.
@@ -98,7 +100,7 @@ impl EmbeddedInstallation {
             registration,
             registry,
             reported: std::sync::Mutex::new(None),
-            lmcache_reported: std::sync::Mutex::new(None),
+            lmcache_drift: std::sync::Mutex::new(None),
         }
     }
 
@@ -142,6 +144,19 @@ impl EmbeddedInstallation {
         });
         if !profile.installation_observed_digest.is_empty() {
             view["observed_digest"] = profile.installation_observed_digest.into();
+        }
+        // ADR 0033 §1: LMCache in the environment changed since `engine add`.
+        if let Some((registered, observed)) = self
+            .lmcache_drift
+            .lock()
+            .ok()
+            .and_then(|drift| drift.clone())
+        {
+            view["lmcache"] = serde_json::json!({
+                "state": "drifted",
+                "digest": registered,
+                "observed_digest": observed,
+            });
         }
         view
     }
@@ -351,27 +366,33 @@ impl InstallationGate {
         .map_err(|_| RuntimeError::Uncertain("LMCache was not checked".into()))?;
         match checked {
             Ok(install) => {
+                let drift = lmcache
+                    .registered
+                    .as_ref()
+                    .filter(|_| install.drifted)
+                    .map(|registered| (registered.digest.clone(), install.digest.clone()));
+                let new = self
+                    .installation
+                    .lmcache_drift
+                    .lock()
+                    .map(|mut known| {
+                        let new = drift.is_some()
+                            && known.as_ref().map(|(_, observed)| observed)
+                                != drift.as_ref().map(|(_, observed)| observed);
+                        known.clone_from(&drift);
+                        new
+                    })
+                    .unwrap_or(false);
                 if !install.drifted {
                     return Ok(());
                 }
-                if let Some(registered) = &lmcache.registered {
-                    let new = self
-                        .installation
-                        .lmcache_reported
-                        .lock()
-                        .map(|mut reported| {
-                            let new = reported.as_deref() != Some(install.digest.as_str());
-                            *reported = Some(install.digest.clone());
-                            new
-                        })
-                        .unwrap_or(false);
-                    if new {
-                        self.journal_drift(
-                            &format!("{} (LMCache)", self.installation.profile),
-                            &registered.digest,
-                            &install.digest,
-                        );
-                    }
+                // The installation named `<profile>:lmcache`, a journal token.
+                if let (true, Some((registered, observed))) = (new, &drift) {
+                    self.journal_drift(
+                        &format!("{}:lmcache", self.installation.profile),
+                        registered,
+                        observed,
+                    );
                 }
                 match self.policy {
                     InstallationDrift::Refuse => Err(RuntimeError::Refused(DRIFT_REFUSAL.into())),

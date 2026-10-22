@@ -264,6 +264,18 @@ pub struct InstallationView {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub observed_digest: String,
     pub capabilities_missing: Vec<String>,
+    /// ADR 0033 §1: the profile's LMCache drifted from its registration;
+    /// absent otherwise and from an older host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lmcache: Option<LmcacheDriftView>,
+}
+/// ADR 0033 §1: LMCache in a profile's environment changed since `engine add`.
+#[derive(Clone, serde::Serialize)]
+pub struct LmcacheDriftView {
+    /// Always `drifted`.
+    pub state: &'static str,
+    /// The digest the last launch-time check measured instead.
+    pub observed_digest: String,
 }
 impl ProfileView {
     fn of(p: &pb::RuntimeProfileStatus) -> Self {
@@ -277,6 +289,10 @@ impl ProfileView {
                 state: p.installation_state.clone(),
                 observed_digest: p.installation_observed_digest.clone(),
                 capabilities_missing: p.capabilities_missing.clone(),
+                lmcache: (!p.lmcache_observed_digest.is_empty()).then(|| LmcacheDriftView {
+                    state: "drifted",
+                    observed_digest: p.lmcache_observed_digest.clone(),
+                }),
             },
         }
     }
@@ -301,6 +317,7 @@ fn installation_fields_valid(p: &pb::RuntimeProfileStatus) -> bool {
         && (p.installation_observed_digest.is_empty()
             || p.installation_observed_digest == "unmeasured"
             || digest(&p.installation_observed_digest))
+        && (p.lmcache_observed_digest.is_empty() || digest(&p.lmcache_observed_digest))
         && p.capabilities_missing.len() <= 8
         && p.capabilities_missing
             .iter()
@@ -334,6 +351,37 @@ fn newly_drifted(
                 new.installation_digest.clone(),
                 new.installation_observed_digest.clone(),
             )
+        })
+        .collect()
+}
+/// ADR 0033 §1: the LMCache drifts `new` reports that `old` did not (a new
+/// drift, or a drift to a different observed digest), each as the
+/// installation `<profile>:lmcache` with the registered digest the approved
+/// `document` gives the profile (`runtime_profiles.<name>.lmcache.digest`).
+/// A profile the document registers no LMCache for is left out.
+fn newly_lmcache_drifted(
+    new: &[pb::RuntimeProfileStatus],
+    old: &[pb::RuntimeProfileStatus],
+    document: &serde_json::Value,
+) -> Vec<(String, String, String)> {
+    new.iter()
+        .filter(|new| {
+            !new.lmcache_observed_digest.is_empty()
+                && old
+                    .iter()
+                    .find(|previous| previous.name == new.name)
+                    .is_none_or(|previous| {
+                        previous.lmcache_observed_digest != new.lmcache_observed_digest
+                    })
+        })
+        .filter_map(|new| {
+            let registered =
+                document["runtime_profiles"][new.name.as_str()]["lmcache"]["digest"].as_str()?;
+            Some((
+                format!("{}:lmcache", new.name),
+                registered.to_owned(),
+                new.lmcache_observed_digest.clone(),
+            ))
         })
         .collect()
 }
@@ -1348,7 +1396,13 @@ impl AgentSessions {
                                     // controller clock, so pre-send freshness never sees a future sample.
                                     // ADR 0008 (owner decision 2026-09-23): a drift the host newly
                                     // reports is journaled once; status follows what it reports.
-                                    let drifts = newly_drifted(&inventory.profiles, &old.profiles);
+                                    // ADR 0033 §1: LMCache's drift too, as `<profile>:lmcache`.
+                                    let mut drifts = newly_drifted(&inventory.profiles, &old.profiles);
+                                    drifts.extend(newly_lmcache_drifted(
+                                        &inventory.profiles,
+                                        &old.profiles,
+                                        &serde_json::from_str(&inventory.approved_host_config_json).unwrap_or_default(),
+                                    ));
                                     after = After::Refresh(Box::new(inventory), drifts);
                                     false
                                 }

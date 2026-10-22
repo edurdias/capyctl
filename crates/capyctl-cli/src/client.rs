@@ -1334,6 +1334,22 @@ pub async fn execute_with_start_options(
                     }
                 }
             }
+            // ADR 0033 §9: each instance's LMCache cache figures (used
+            // bytes, lookups, hits), from its server's latest sample in the
+            // load read. A server without the view, or an instance whose
+            // server has not reported, leaves the instance as it was.
+            if has_lmcache(&view) {
+                if let Some(id) = view["id"].as_str().map(str::to_owned) {
+                    if let Ok((status, load)) = api
+                        .exchange(Method::GET, &format!("/metrics/load?deployment={id}"), None)
+                        .await
+                    {
+                        if status.is_success() {
+                            add_lmcache_figures(&mut view, &load);
+                        }
+                    }
+                }
+            }
             Ok(view)
         }
         // SPEC §8.2: the resolved configuration and its provenance, with
@@ -1372,6 +1388,57 @@ fn has_group_members(deployment: &Value) -> bool {
     deployment["instances"]
         .as_array()
         .is_some_and(|instances| instances.iter().any(|i| i["members"].is_array()))
+}
+
+fn has_lmcache(deployment: &Value) -> bool {
+    deployment["instances"]
+        .as_array()
+        .is_some_and(|instances| instances.iter().any(|i| i["lmcache"]["state"] == "on"))
+}
+
+/// ADR 0033 §9: sets `used_bytes`, `lookups` and `hits` on each instance
+/// whose LMCache is on, from the same instance (index and generation) in a
+/// `GET /metrics/load` answer, when its server's last scrape answered. A
+/// figure the server did not report stays absent: unknown, never zero.
+pub fn add_lmcache_figures(deployment: &mut Value, load: &Value) {
+    let Some(reported) = load["deployments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|d| d["deployment_id"] == deployment["id"])
+        .and_then(|d| d["instances"].as_array())
+        .cloned()
+    else {
+        return;
+    };
+    let Some(instances) = deployment
+        .get_mut("instances")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for instance in instances {
+        if instance["lmcache"]["state"] != "on" {
+            continue;
+        }
+        // The snapshot carries the generation as a decimal string.
+        let generation = instance["generation"]
+            .as_str()
+            .and_then(|g| g.parse::<i64>().ok());
+        let Some(sample) = reported
+            .iter()
+            .find(|r| r["index"] == instance["index"] && r["generation"].as_i64() == generation)
+            .map(|r| &r["lmcache"])
+            .filter(|s| s["scrape_ok"] == true)
+        else {
+            continue;
+        };
+        for field in ["used_bytes", "lookups", "hits"] {
+            if sample[field].is_u64() {
+                instance["lmcache"][field] = sample[field].clone();
+            }
+        }
+    }
 }
 
 /// ADR 0028 §3, §15: sets each group member's `warnings` to the findings its
