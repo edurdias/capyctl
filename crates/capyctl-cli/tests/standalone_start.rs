@@ -1108,3 +1108,58 @@ async fn a_request_while_the_checkpoint_is_measured_is_told_it_is_starting() {
     }
     let _ = app.shutdown().await;
 }
+
+/// SPEC §15.2 (existing identity mismatched: fail for recovery): a standalone
+/// host is published under the machine's hostname, and its state belongs to
+/// that name. Fresh state proceeds under any hostname, the same hostname
+/// proceeds, and another hostname (a new container's) is refused
+/// `host_name_changed`, exit 2, naming both names and the fix. Tagged T06:
+/// the host keeps one stable identity across restarts, and a changed name
+/// never silently becomes a new host.
+// T06
+#[tokio::test]
+async fn a_changed_hostname_on_existing_state_is_refused_with_both_names_and_the_fix() {
+    use capyctl_cli::output::{ExitCode, StructuredError};
+    use capyctl_cli::roles::{check_host_name, StartError};
+    let fresh = capyctl_store::Store::open_in_memory().unwrap();
+    check_host_name(&fresh, Some("any-host")).expect("fresh state proceeds");
+
+    let dir = safe_state_dir();
+    let app = boot(dir.path()).await;
+    let stored = app
+        .store
+        .embedded_host_name()
+        .unwrap()
+        .expect("a booted standalone records the name it published");
+    check_host_name(&app.store, Some(stored.as_str())).expect("the same hostname proceeds");
+    // No device inventory: the fixed `standalone` name, not a hostname.
+    check_host_name(&app.store, None).expect("a name not taken from the hostname");
+
+    let current = format!("{stored}-recreated");
+    let error = check_host_name(&app.store, Some(current.as_str())).unwrap_err();
+    assert!(
+        matches!(&error, StartError::HostNameChanged { .. }),
+        "{error:?}"
+    );
+    let refused = StructuredError::from(error);
+    assert_eq!(refused.code, capyctl_cli::output::HOST_NAME_CHANGED);
+    assert_eq!(refused.closed_code(), "host_name_changed");
+    assert_eq!(refused.exit_code(), ExitCode::INVALID_CONFIG);
+    assert!(
+        !refused.message.contains('\n'),
+        "one line: {}",
+        refused.message
+    );
+    for named in [
+        format!("`{stored}`"),
+        format!("`{current}`"),
+        format!("docker run --hostname {stored}"),
+    ] {
+        assert!(
+            refused.message.contains(&named),
+            "{named}: {}",
+            refused.message
+        );
+    }
+    let _ = app.shutdown().await;
+}

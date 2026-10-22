@@ -67,6 +67,7 @@ fn other_structured_codes_are_documented_with_their_exit_code() {
         "host_revoked",
         "host_ineligible",
         "store_from_newer_version",
+        "host_name_changed",
         "engine_not_found",
         "engine_unsupported",
         "engine_version_failed",
