@@ -1512,3 +1512,209 @@ fn status_says_why_lmcache_is_off_and_when_its_server_exited() {
         "{never}"
     );
 }
+
+/// The binding's recorded identities, sorted.
+fn recorded(lab: &Lab, binding: &str) -> Vec<ProcessIdentity> {
+    let mut held = identities(
+        &decode::<Vec<IdentityDto>>(&lab.row::<String>(
+            "SELECT identities_json FROM runtime_bindings WHERE id=?1",
+            binding,
+        ))
+        .unwrap(),
+    );
+    held.sort_by_key(|identity| identity.pid);
+    held
+}
+
+// T45 T37 T14 T24 (ADR 0033 §§3, 9; found live on SGLang): a server that
+// failed its listener check under `auto` was stopped (verified gone by the
+// host) before the engine was spawned. Still recorded, it makes the engine's
+// Ready a `lifecycle conflict`; once it left the binding's record (journaled
+// `lmcache_server_departed`), the engine alone reaches Ready and status
+// shows LMCache off with the reason. A departure is refused for a set that
+// is not the server's, for a server the binding does not record, under a
+// stale fence and once the launch is no longer armed; a repeat is a replay.
+#[test]
+fn a_server_stopped_before_its_engine_leaves_the_record_and_the_engine_reaches_ready() {
+    let lab = Lab::new(|_| {});
+    let a = lab.deploy("a", |_| {});
+    let (_, context) = lab.start(&a, 100);
+    let fence = fence_of(&context);
+    let binding = context.binding_id.clone();
+    let group = vec![identity("lmcache", 60), identity("lmcache-0", 61)];
+    lab.store
+        .record_launch_identity(&lab.session, &fence, &binding, &group[0])
+        .unwrap();
+    // The bug: the engine alone against a record that names the server.
+    let receipt = OwnedLaunchReceipt {
+        binding_id: binding.clone(),
+        incarnation: context.incarnation.clone(),
+        identities: engine(10),
+        observed_at_ms: 150,
+        receipt: "fake ready".into(),
+    };
+    assert!(matches!(
+        lab.store
+            .record_owned_launch(&lab.session, &context.token.step_id, &receipt, 150),
+        Err(LifecycleError::Conflict)
+    ));
+    let depart = |fence: &DeploymentFence, server: &[ProcessIdentity]| {
+        lab.store
+            .depart_lmcache_server(&lab.session, fence, &binding, server)
+    };
+    assert!(matches!(
+        depart(&fence, &engine(10)),
+        Err(LifecycleError::Invalid)
+    ));
+    assert!(matches!(
+        depart(&fence, &[identity("lmcache", 99)]),
+        Err(LifecycleError::Conflict)
+    ));
+    let stale = DeploymentFence {
+        generation: fence.generation + 1,
+        ..fence.clone()
+    };
+    assert!(depart(&stale, &group).is_err());
+    assert_eq!(recorded(&lab, &binding), group[..1]);
+
+    depart(&fence, &group).unwrap();
+    depart(&fence, &group).unwrap();
+    assert!(recorded(&lab, &binding).is_empty());
+    let departed: i64 = lab.row(
+        "SELECT COUNT(*) FROM journal_entries WHERE operation_id=?1 AND state='lmcache_server_departed'",
+        &context.token.operation_id,
+    );
+    assert_eq!(departed, 1);
+
+    lab.store
+        .record_launch_identity(&lab.session, &fence, &binding, &engine(10)[0])
+        .unwrap();
+    lab.ready(
+        &context,
+        10,
+        Some(LmcacheOutcome::Off {
+            reason: LmcacheOffReason::ListenerExposed,
+            detail: "the LMCache server listens on 0.0.0.0:25002; the server was stopped".into(),
+        }),
+        200,
+    );
+    assert_eq!(recorded(&lab, &binding), engine(10));
+    let status = instance_status(&lab, &a);
+    assert_eq!(status["observed_state"], "ready", "{status}");
+    assert_eq!(status["lmcache"]["state"], "off", "{status}");
+    assert_eq!(status["lmcache"]["reason"], "listener_exposed", "{status}");
+    assert_eq!(lab.events("lmcache_off", &a.deployment_id).len(), 1);
+    assert!(matches!(
+        depart(&fence, &group),
+        Err(LifecycleError::Conflict)
+    ));
+}
+
+// T45 T24 T10 (ADR 0033 §3; found live on SGLang): the server is its group's
+// leader. A short-lived child recorded at Ready (`lmcache-0`) that exits is
+// not the server's exit: the instance keeps serving, and a restart-park
+// whose evidence no longer names the child parks with the child still
+// recorded (only the launch's verified stop proves it gone). The leader's
+// exit still fails the instance.
+#[test]
+fn a_server_member_exit_is_not_the_servers() {
+    let lab = Lab::new(|_| {});
+    let a = lab.deploy("a", |_| {});
+    let (_, context) = lab.start(&a, 100);
+    let fence = fence_of(&context);
+    let group = vec![identity("lmcache", 60), identity("lmcache-0", 61)];
+    lab.store
+        .record_launch_identity(&lab.session, &fence, &context.binding_id, &group[0])
+        .unwrap();
+    lab.store
+        .record_launch_lmcache(&lab.session, &context.binding_id, &LmcacheOutcome::On, 150)
+        .unwrap();
+    let mut launched = engine(10);
+    launched.extend(group.clone());
+    lab.store
+        .record_owned_launch(
+            &lab.session,
+            &context.token.step_id,
+            &OwnedLaunchReceipt {
+                binding_id: context.binding_id.clone(),
+                incarnation: context.incarnation.clone(),
+                identities: launched.clone(),
+                observed_at_ms: 150,
+                receipt: "fake ready".into(),
+            },
+            150,
+        )
+        .unwrap();
+    lab.store
+        .complete_step(
+            &lab.session,
+            &context.token.step_id,
+            &CompletionEvidence {
+                token: context.token.clone(),
+                identities: launched.clone(),
+                observed_at_ms: 150,
+                control_receipt: Some("fake ready".into()),
+                milestones: ResidencyKind::Restore.facts().to_vec(),
+            },
+            150,
+            2_000,
+        )
+        .unwrap();
+    let exit = |process: &ProcessIdentity, at: i64| EngineExit {
+        deployment_id: a.deployment_id.clone(),
+        generation: a.generation,
+        step_id: context.token.step_id.clone(),
+        process: process.clone(),
+        status: "exit code 0".into(),
+        observed_at_ms: at,
+    };
+    assert_eq!(
+        lab.store
+            .record_engine_exit(&lab.session, ExitSource::Embedded, &exit(&group[1], 300))
+            .unwrap(),
+        None
+    );
+    let dispatch = |lab: &Lab| -> bool {
+        lab.row(
+            "SELECT dispatch_enabled=1 FROM deployment_instances WHERE deployment_id=?1",
+            &a.deployment_id,
+        )
+    };
+    assert!(dispatch(&lab), "the instance still serves");
+    assert!(lab
+        .events("lmcache_server_exited", &a.deployment_id)
+        .is_empty());
+
+    let park = lab
+        .store
+        .accept_instance_park(
+            &lab.session,
+            "idle",
+            &a.deployment_id,
+            0,
+            "idle-1",
+            1_000,
+            61_000,
+        )
+        .unwrap();
+    let parking = lab.arm_residency(&park.step_id, 1_100);
+    lab.complete_residency(
+        &parking,
+        group[..1].to_vec(),
+        vec![Milestone::MemoryReleased],
+        1_200,
+    )
+    .unwrap();
+    assert_eq!(recorded(&lab, &context.binding_id), group);
+
+    let exited = lab
+        .store
+        .record_engine_exit(&lab.session, ExitSource::Embedded, &exit(&group[0], 1_300))
+        .unwrap()
+        .unwrap();
+    assert!(exited.lmcache_server && exited.parked);
+    assert_eq!(
+        lab.events("lmcache_server_exited", &a.deployment_id).len(),
+        1
+    );
+}

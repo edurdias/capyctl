@@ -858,3 +858,27 @@ quiescence. vLLM's proof was already its gauges. A remote host's restart-park ch
 ingress alone before it stopped the engine; it now also reads the engine's gauges after
 its ingress reads zero, and an engine that is busy or cannot say leaves the launch
 unchanged. Decision deployments (A6) park the same way. The deep-park proof is unchanged.
+
+**A9. The server is its group's leader (§§3, 9).** Live runs on SGLang with LMCache 0.5.6
+found the server starting a short-lived child of its own group. Three consequences:
+
+- The listener check reads each member's `/proc/<pid>/fd` and socket tables. A member
+  whose entries are missing and whose presence is verified gone exited during the read:
+  it holds no listener, and the group is listed again and checked as it is now (three
+  readings at most), so the group recorded never names it. The leader gone, a member of
+  unknown presence, any other read failure, or a group that changed on every reading
+  still fails the check (`server_start_failed`).
+- A server stopped with a verified exit before its engine was spawned (`server_start_failed`
+  or `listener_exposed` under `auto`) leaves the launch's record before the engine
+  launches without the connector: each of its processes is proven gone by identity, then
+  the record drops it, journaled (`lmcache_server_departed` in the controller's journal
+  for an embedded launch; the host journal's departed processes for a remote one). The
+  launch's Ready then names the engine alone, as its evidence does. Letting the Ready
+  accept a recorded server absent from its evidence instead would release a recorded
+  process on evidence that never names it. A server whose stop or departure was not
+  verified keeps its record for the launch's own stop: the launch is uncertain and no
+  engine is spawned.
+- Only the leader's exit is the server's: a member of its group (`lmcache-N`) that exits
+  while the instance is Ready or parked fails nothing, as a helper's does (ADR 0027), and
+  re-proofs and restart-park evidence judge the server by its leader. Every member
+  recorded stays recorded until the launch's verified stop proves it gone.

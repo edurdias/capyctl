@@ -554,6 +554,21 @@ pub trait OwnedProcessLaunch: Send + Sync {
     ) -> Result<(), RuntimeError> {
         Err(RuntimeError::Unsupported)
     }
+    /// ADR 0033 §§3, 9: the launch's LMCache server group `server`, stopped
+    /// by [`Self::stop_group`] before any engine of the launch was spawned
+    /// (`server_start_failed` or `listener_exposed` under `auto`), leaves
+    /// the launch's record: every identity is proven gone first, then the
+    /// departure is journaled where the record is kept, so the launch's
+    /// Ready names the engine it launched without the connector and nothing
+    /// else. Refused (and the record kept) when any identity is not proven
+    /// gone or the record already names an engine. `Unsupported` where the
+    /// tools cannot.
+    fn depart_lmcache(
+        &self,
+        _server: &[capyctl_domain::completion::ProcessIdentity],
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Unsupported)
+    }
     /// ADR 0033 §7: a restart-parked launch's engine, spawned again on wake
     /// under the key `"{incarnation}#wake-{wake}"` (one spawn per wake step),
     /// its `api` identity recorded for that wake before it runs.

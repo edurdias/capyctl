@@ -2909,6 +2909,23 @@ impl OwnedProcessLaunch for JournalLaunchTools {
             grace,
         )
     }
+    /// ADR 0033 §§3, 9: the server the launch stopped before its engine
+    /// leaves the launch's journaled processes (owned ones only).
+    fn depart_lmcache(
+        &self,
+        server: &[ProcessIdentity],
+    ) -> Result<(), capyctl_adapters::traits::RuntimeError> {
+        use capyctl_adapters::traits::RuntimeError;
+        let _gate = self
+            .journal
+            .transition
+            .lock()
+            .map_err(|_| RuntimeError::Uncertain("journal unavailable".into()))?;
+        if server.is_empty() || !server.iter().all(|id| self.owns(id)) {
+            return Err(RuntimeError::Uncertain("unowned process".into()));
+        }
+        self.tools.depart_lmcache(server)
+    }
     fn terminate_owned(
         &self,
         _: &[ProcessIdentity],
@@ -3126,6 +3143,63 @@ impl LaunchAssociation for JournalAssociation {
             return Err(AssociationError::Uncertain("not a server identity".into()));
         }
         self.persist_attempted(identity)
+    }
+    /// ADR 0033 §§3, 9 (found live on SGLang: a launch whose server failed
+    /// its listener check reached Ready naming the stopped server, and the
+    /// controller refused it): the server stopped before the engine (the
+    /// launch still `attempted`, its claim held, under the step's deadline
+    /// and session) leaves the launch's recorded processes for
+    /// `departed_processes` (history only), as a process departed during its
+    /// launch step does. Every server process recorded is set aside, each one
+    /// of `server` (proven gone by the caller) or proven gone here; nothing
+    /// moves if the launch records any engine process.
+    fn depart_lmcache_server(&self, server: &[ProcessIdentity]) -> Result<(), AssociationError> {
+        let depart = || -> Result<(), JournalError> {
+            let journal = self.journal.upgrade().ok_or(JournalError::Storage)?;
+            journal.validate()?;
+            let (clock, deadline, session) =
+                self.effect.as_ref().ok_or(JournalError::Unauthorized)?;
+            before_deadline(clock.as_ref(), *deadline)?;
+            journal.check_session(*session)?;
+            let mut db = journal.db.lock().map_err(|_| JournalError::Storage)?;
+            let tx = db.transaction()?;
+            let state: (i64, bool) = tx.query_row(
+                "SELECT state,claim FROM commands WHERE command_id=?1",
+                [&self.command_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let recorded = record(&tx, &self.command_id)?.processes;
+            if state != (1, true) || recorded.iter().any(|p| !p.is_lmcache()) {
+                return Err(JournalError::Conflict);
+            }
+            if recorded.iter().any(|p| {
+                !server.contains(p)
+                    && capyctl_launchers::process_absence::presence(p) != Presence::Gone
+            }) {
+                return Err(JournalError::Uncertain);
+            }
+            for p in &recorded {
+                tx.execute(
+                    "INSERT OR IGNORE INTO departed_processes VALUES(?1,?2,?3,?4,?5)",
+                    params![
+                        self.command_id,
+                        p.role,
+                        p.pid,
+                        p.boot_id,
+                        p.start_ticks as i64
+                    ],
+                )?;
+                tx.execute(
+                    "DELETE FROM processes WHERE command_id=?1 AND pid=?2 AND boot=?3 AND ticks=?4",
+                    params![self.command_id, p.pid, p.boot_id, p.start_ticks as i64],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        };
+        depart().map_err(|_| {
+            AssociationError::Uncertain("the stopped server's departure was not journaled".into())
+        })
     }
 }
 

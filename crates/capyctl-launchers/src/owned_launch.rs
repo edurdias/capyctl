@@ -301,6 +301,24 @@ impl OwnedProcessLaunch for DurableProcessLaunch {
         self.terminate_escalating(identities, grace).map(drop)
     }
 
+    fn depart_lmcache(&self, server: &[ProcessIdentity]) -> Result<(), RuntimeError> {
+        // ADR 0033 §§3, 9: only the server's group, each process proven gone
+        // by identity before its record is set aside (SPEC §13.2: uncertainty
+        // retains it).
+        if server.is_empty() || !server.iter().all(ProcessIdentity::is_lmcache) {
+            return Err(uncertain("a departure names the server's group alone"));
+        }
+        if let Some(left) = server.iter().find(|id| presence(id) != Presence::Gone) {
+            return Err(uncertain(format!(
+                "the stopped server's {} process {} is not proven gone",
+                left.role, left.pid
+            )));
+        }
+        self.association
+            .depart_lmcache_server(server)
+            .map_err(|error| uncertain(error.to_string()))
+    }
+
     fn terminate_owned(
         &self,
         identities: &[ProcessIdentity],

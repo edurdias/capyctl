@@ -131,9 +131,7 @@ pub(super) async fn initialize(
     let checked = identities.clone();
     let check_tools = tools.clone();
     let check = tokio::task::spawn_blocking(move || {
-        check_loopback(&root, &checked, &|identity| {
-            check_tools.present(identity) == Presence::Alive
-        })
+        check_loopback(&root, &checked, &|identity| check_tools.present(identity))
     })
     .await
     .map_err(|_| RuntimeError::Uncertain("listener task failed".into()))?;

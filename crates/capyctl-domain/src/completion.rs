@@ -146,20 +146,24 @@ pub fn same_engine(recorded: &[ProcessIdentity], observed: &[ProcessIdentity]) -
             .all(|identity| observed_set.contains(identity))
 }
 
-/// ADR 0033 §3: whether `observed` still holds exactly the LMCache server
-/// group `recorded` names: the recorded server is there, every server-group
-/// process there is a recorded one and every recorded one is there.
+/// ADR 0033 §3: whether `observed` still holds the LMCache server `recorded`
+/// names. The server is its group's leader (`lmcache`): exactly the recorded
+/// leader is there, by identity, and no other. Any other process of its
+/// group (`lmcache-N`) may have exited or started since, as a helper of the
+/// engine may (ADR 0027; found live on SGLang: a short-lived child recorded
+/// at Ready exited 90 s later); the group's ownership and its verified stop
+/// still cover every member recorded.
 pub fn same_lmcache(recorded: &[ProcessIdentity], observed: &[ProcessIdentity]) -> bool {
-    let recorded = lmcache_members(recorded);
-    let observed = lmcache_members(observed);
-    let recorded_set = recorded.iter().collect::<BTreeSet<_>>();
-    let observed_set = observed.iter().collect::<BTreeSet<_>>();
-    recorded
-        .iter()
-        .any(|identity| identity.role == LMCACHE_ROLE)
-        && recorded_set.len() == recorded.len()
-        && observed_set.len() == observed.len()
-        && recorded_set == observed_set
+    let leader = |set: &[ProcessIdentity]| {
+        let members = lmcache_members(set);
+        let unique = members.iter().collect::<BTreeSet<_>>().len() == members.len();
+        let mut leaders = members.into_iter().filter(|i| i.role == LMCACHE_ROLE);
+        match (unique, leaders.next(), leaders.next()) {
+            (true, Some(leader), None) => Some(leader),
+            _ => None,
+        }
+    };
+    matches!((leader(recorded), leader(observed)), (Some(a), Some(b)) if a == b)
 }
 
 /// Whether a recorded process still exists, judged by pid, boot id and start ticks

@@ -60,8 +60,9 @@ impl crate::Store {
     /// and close that instance's dispatch. `None` when the exit names no such
     /// launch now: another generation (T34), a launch that is stopping,
     /// settled or never Ready, a process outside its recorded group, a helper
-    /// of it (ADR 0027), or a source that does not serve it. Nothing changes
-    /// then.
+    /// of it (ADR 0027), a member of its LMCache server's group other than
+    /// the `lmcache` leader (ADR 0033 §3), or a source that does not serve
+    /// it. Nothing changes then.
     pub fn record_engine_exit(
         &self,
         s: &CoordinatorSession,
@@ -155,9 +156,16 @@ impl crate::Store {
             }
             None => members(association.held())?,
         };
-        // ADR 0027: a helper's exit is not the engine's. Cleanup still proves
-        // it gone with the rest of the recorded group.
-        if exit.process.is_helper() || !recorded.contains(&exit.process) {
+        // ADR 0027: a helper's exit is not the engine's. ADR 0033 §3 (found
+        // live on SGLang: a short-lived child of the server, recorded at
+        // Ready, exited 90 s later and failed the instance): the server is
+        // its group's leader, so only the `lmcache` leader's exit is the
+        // server's. Cleanup still proves every recorded member gone.
+        if exit.process.is_helper()
+            || (exit.process.is_lmcache()
+                && exit.process.role != capyctl_domain::completion::LMCACHE_ROLE)
+            || !recorded.contains(&exit.process)
+        {
             return Ok(None);
         }
         // ADR 0033 §3 (lifecycle design §5): the LMCache server's exit, while

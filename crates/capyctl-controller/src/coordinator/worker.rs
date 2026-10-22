@@ -1197,6 +1197,22 @@ impl LaunchAssociation for StoreAssociation {
         self.persist_api_identity(identity)
     }
 
+    /// ADR 0033 §§3, 9: the launch's server, stopped (proven gone by the
+    /// tools) before its engine was spawned, leaves the binding's record.
+    fn depart_lmcache_server(
+        &self,
+        server: &[capyctl_domain::completion::ProcessIdentity],
+    ) -> Result<(), AssociationError> {
+        let owner = self.owner.lock().map_err(|error| {
+            drop(error);
+            AssociationError::Uncertain("owner poisoned".into())
+        })?;
+        owner
+            .store()
+            .depart_lmcache_server(owner.session(), &self.fence, &self.binding_id, server)
+            .map_err(|error| AssociationError::Uncertain(error.to_string()))
+    }
+
     /// ADR 0033 §7 (lifecycle design §4.3): the engine a restart-park's
     /// restore step `wake` starts on the running server, recorded before it
     /// runs.

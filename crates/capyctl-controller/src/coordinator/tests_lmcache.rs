@@ -29,6 +29,9 @@ const SERVER_CHARGE: i64 = GIB + 1280 * MIB + 512 * MIB;
 /// The redacted engine-log tail the engine leaves when it fails with the
 /// connector (ADR 0033 §8).
 const TAIL: &str = "RuntimeError: LMCacheMPConnector handshake with 127.0.0.1 failed";
+/// What a server that failed its listener check reports (ADR 0033 §3).
+const EXPOSED: &str =
+    "the LMCache server listens on 0.0.0.0:25002, not on loopback; the server was stopped";
 
 /// How the scripted host reports what became of a launch's LMCache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,12 +59,15 @@ struct CacheHost {
     clock: Arc<AtomicI64>,
     /// An engine launched with the connector fails before Ready.
     connector_fails: AtomicBool,
+    /// ADR 0033 §§3, 9: the server fails its listener check and is stopped
+    /// (verified) before the engine is spawned.
+    server_exposed: AtomicBool,
     /// What the store planned for each launch the coordinator bound, in order.
     planned: Mutex<Vec<(String, PlannedLmcache)>>,
-    /// Real processes the next launch's engine group and server are recorded
-    /// as (one boot, as a launch must be), so an exit is one this machine
-    /// observes.
-    live_launch: Mutex<Option<(Vec<ProcessIdentity>, ProcessIdentity)>>,
+    /// Real processes the next launch's engine group and server group (its
+    /// `lmcache` leader first) are recorded as (one boot, as a launch must
+    /// be), so an exit is one this machine observes.
+    live_launch: Mutex<Option<(Vec<ProcessIdentity>, Vec<ProcessIdentity>)>>,
     next_pid: AtomicU32,
     steps: Mutex<Vec<Step>>,
     settlements: Mutex<Vec<SettlementContext>>,
@@ -75,6 +81,7 @@ impl CacheHost {
             owner,
             clock: Arc::new(AtomicI64::new(1900)),
             connector_fails: AtomicBool::new(false),
+            server_exposed: AtomicBool::new(false),
             planned: Mutex::new(Vec::new()),
             live_launch: Mutex::new(None),
             next_pid: AtomicU32::new(1000),
@@ -284,17 +291,41 @@ impl Launch {
             Some((engine, server)) => (engine, Some(server)),
             None => (host.engine(), None),
         };
-        let server = self
-            .grant
-            .map(|_| live_server.unwrap_or_else(|| host.identity(LMCACHE_ROLE, engine[0].pid + 5)));
+        let server: Option<Vec<ProcessIdentity>> = self.grant.map(|_| {
+            live_server.unwrap_or_else(|| vec![host.identity(LMCACHE_ROLE, engine[0].pid + 5)])
+        });
+        // ADR 0033 §§3, 9: a server that failed its listener check was
+        // stopped (verified) and, under `auto`, left the launch's record
+        // before the engine was spawned: on the embedded path through the
+        // store (as the coordinator's association does), on a remote one in
+        // the host's journal, so its result never names it.
+        let exposed = server.is_some() && host.server_exposed.load(Ordering::SeqCst);
         // ADR 0033 §3: the server is recorded before it runs, and is started
         // before the engine.
         if let Some(server) = &server {
-            host.associate(c, server);
+            if !exposed || host.report == Report::Adapter {
+                host.associate(c, &server[0]);
+            }
         }
+        let server = if exposed {
+            if host.report == Report::Adapter {
+                let o = host.owner.lock().unwrap();
+                o.store()
+                    .depart_lmcache_server(
+                        o.session(),
+                        &fence_of(c),
+                        &c.binding_id,
+                        server.as_deref().unwrap(),
+                    )
+                    .unwrap();
+            }
+            None
+        } else {
+            server
+        };
         let fails = server.is_some() && host.connector_fails.load(Ordering::SeqCst);
         let mut launched = engine.clone();
-        launched.extend(server.clone());
+        launched.extend(server.iter().flatten().cloned());
         if fails {
             host.associate(c, &engine[0]);
             host.steps.lock().unwrap().push((
@@ -316,10 +347,18 @@ impl Launch {
                         "the engine exited before readiness (exit code 1); log tail:\n{TAIL}"
                     )));
                 }
+                if exposed {
+                    // What `lmcache::connect` reports under `auto`.
+                    self.state.record(LmcacheReport::Off {
+                        reason: LmcacheOffReason::ListenerExposed,
+                        detail: EXPOSED.into(),
+                        connector_failed: false,
+                    });
+                }
                 if let (Some(server), Some(grant)) = (&server, &self.grant) {
                     // What `Connector::ready` reports.
                     self.state.record(LmcacheReport::On {
-                        server: vec![server.clone()],
+                        server: server.clone(),
                         rpc_port: grant.rpc_port,
                         http_port: grant.http_port,
                         pool_bytes: grant.pool_bytes,
@@ -341,10 +380,17 @@ impl Launch {
                     result.state = "completed".into();
                     result.model_usable = true;
                     result.processes = observed(&launched, "alive");
-                    result.lmcache = self.grant.map(|grant| {
-                        LaunchLmcache::on(grant.rpc_port, grant.http_port, grant.pool_bytes)
-                            .to_wire()
-                    });
+                    result.lmcache = if exposed {
+                        Some(
+                            LaunchLmcache::off(LmcacheOffReason::ListenerExposed, EXPOSED, false)
+                                .to_wire(),
+                        )
+                    } else {
+                        self.grant.map(|grant| {
+                            LaunchLmcache::on(grant.rpc_port, grant.http_port, grant.pool_bytes)
+                                .to_wire()
+                        })
+                    };
                 }
                 // As `RemoteEngine::execute_persisted`: the host's report is
                 // recorded on the launch's state, Ready or failed.
@@ -792,6 +838,65 @@ async fn a_remote_engine_failing_with_the_connector_relaunches_once_without_lmca
     the_fallback_relaunches_once_and_sticks(Report::HostResult).await;
 }
 
+/// ADR 0033 §§3, 9 (found live on SGLang: the launch failed `lifecycle
+/// conflict` at Ready and `start --wait` exited 13): a server that failed
+/// its listener check under `auto` is stopped (verified) and leaves the
+/// launch's record before the engine is spawned, so the engine launched
+/// without the connector reaches Ready on the first launch, charged alone,
+/// and status shows LMCache off with the reason.
+async fn an_exposed_server_leaves_the_engine_ready_alone(report: Report) {
+    let (dir, owner, fence, observations) = lab(|_| {}).await;
+    let deployment = fence.deployment_id.clone();
+    let host = CacheHost::new(report, owner.clone());
+    host.server_exposed.store(true, Ordering::SeqCst);
+    let w = worker(owner.clone(), observations, host.clone());
+    ready(&w, &fence).await;
+    assert_eq!(host.plans(), [None], "one launch, planned with LMCache");
+    assert_eq!(initializes(&dir, &deployment), 1);
+    let (state, open, _) = instance(&dir, &deployment);
+    assert_eq!((state.as_str(), open), ("ready", true));
+    let (_, recorded) = binding(&owner, &deployment);
+    assert!(recorded.iter().all(|p| !p.is_lmcache()), "{recorded:?}");
+    assert!(recorded.iter().any(|p| p.role == "api"), "{recorded:?}");
+    let (phase, bytes, host_kv) = charge(&owner, &deployment).unwrap();
+    assert_eq!(
+        (phase, (bytes, host_kv)),
+        (ResourcePhase::Ready, ENGINE_READY)
+    );
+    let shown = status(&owner, &deployment).lmcache.unwrap();
+    assert_eq!(
+        (shown.state.as_str(), shown.reason.as_deref()),
+        ("off", Some("listener_exposed"))
+    );
+    let off = events(&dir, "lmcache_off", &deployment);
+    assert_eq!(off.len(), 1, "{off:?}");
+    assert_eq!(off[0]["reason"], "listener_exposed");
+    // Embedded, the store journals the departure; a remote host journals it
+    // in its own journal, and its result never names the server.
+    let departed = sql(&dir)
+        .query_row(
+            "SELECT COUNT(*) FROM journal_entries WHERE state='lmcache_server_departed'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(departed, i64::from(report == Report::Adapter));
+    w.shutdown().await.unwrap();
+}
+
+// T45 T37 T14 T36 (ADR 0033 §§3, 9): the embedded adapter's path.
+#[tokio::test]
+async fn an_exposed_server_is_stopped_and_the_engine_is_ready_without_lmcache() {
+    an_exposed_server_leaves_the_engine_ready_alone(Report::Adapter).await;
+}
+
+// T45 T37 T14 T36 (ADR 0033 §§3, 9): the same through a remote host's
+// LaunchSingle result and its `lmcache` report.
+#[tokio::test]
+async fn a_remote_exposed_server_is_stopped_and_the_engine_is_ready_without_lmcache() {
+    an_exposed_server_leaves_the_engine_ready_alone(Report::HostResult).await;
+}
+
 // T45 T36 T14 (ADR 0033 §§8, 9): under `lmcache: required` the same failure
 // is not relaunched: the launch fails `lmcache_unavailable:engine_start_failed`
 // and nothing is left running: the host proved the engine and its server
@@ -856,18 +961,21 @@ impl Drop for Process {
     }
 }
 
-// T45 T24 T37 T10 T14 (ADR 0033 §3, LC9): the server of a Ready instance
-// exits (a real process, observed by the embedded exit watch). Dispatch
-// closes, `lmcache_server_exited` is recorded once, and the exit stop
-// settles on verified cleanup of the engine and the server: the instance
-// reads failed and its charge is released. On-demand activation then
-// relaunches the engine and a new server.
+// T45 T24 T37 T10 T14 (ADR 0033 §3, LC9; found live on SGLang): the server
+// is its group's leader. A short-lived child of the server, recorded at
+// Ready (`lmcache-0`), exits (a real process, observed by the embedded exit
+// watch): the instance keeps serving and nothing is recorded. Then the
+// server's leader exits: dispatch closes, `lmcache_server_exited` is
+// recorded once, and the exit stop settles on verified cleanup of the
+// engine and the whole recorded server group: the instance reads failed and
+// its charge is released. On-demand activation then relaunches the engine
+// and a new server.
 #[tokio::test]
 async fn a_server_exit_fails_the_instance_and_recovery_starts_a_new_server() {
     let (dir, owner, fence, observations) = lab(|_| {}).await;
     let deployment = fence.deployment_id.clone();
     let host = CacheHost::new(Report::Adapter, owner.clone());
-    let processes: Vec<_> = (0..3)
+    let processes: Vec<_> = (0..4)
         .map(|_| {
             Process(
                 std::process::Command::new("sleep")
@@ -880,13 +988,16 @@ async fn a_server_exit_fails_the_instance_and_recovery_starts_a_new_server() {
     let live = |role: &str, n: usize| capyctl_testkit::live_identity(role, processes[n].0.id());
     let engine = vec![live("api", 0), live("worker-0", 1)];
     let server = live(LMCACHE_ROLE, 2);
-    *host.live_launch.lock().unwrap() = Some((engine.clone(), server.clone()));
+    let member = live("lmcache-0", 3);
+    *host.live_launch.lock().unwrap() =
+        Some((engine.clone(), vec![server.clone(), member.clone()]));
     // The engine's processes stay alive throughout; only the server exits.
-    let [_api, _worker, mut child] = <[Process; 3]>::try_from(processes).ok().unwrap();
+    let [_api, _worker, mut leader, mut child] = <[Process; 4]>::try_from(processes).ok().unwrap();
     let w = worker(owner.clone(), observations, host.clone());
     ready(&w, &fence).await;
     let (first, recorded) = binding(&owner, &deployment);
     assert!(recorded.contains(&server), "{recorded:?}");
+    assert!(recorded.contains(&member), "{recorded:?}");
     let (phase, bytes, host_kv) = charge(&owner, &deployment).unwrap();
     assert_eq!(
         (phase, (bytes, host_kv)),
@@ -897,6 +1008,17 @@ async fn a_server_exit_fails_the_instance_and_recovery_starts_a_new_server() {
     child.0.kill().unwrap();
     child.0.wait().unwrap();
     let exits = crate::engine_exit::EngineExits::new(w.commands());
+    let watch = exits.clone();
+    let handled = tokio::task::spawn_blocking(move || watch.local_pass())
+        .await
+        .unwrap();
+    assert!(handled.is_empty(), "a server child's exit: {handled:?}");
+    let (state, open, _) = instance(&dir, &deployment);
+    assert_eq!((state.as_str(), open), ("ready", true));
+    assert!(events(&dir, "lmcache_server_exited", &deployment).is_empty());
+
+    leader.0.kill().unwrap();
+    leader.0.wait().unwrap();
     let watch = exits.clone();
     let handled = tokio::task::spawn_blocking(move || watch.local_pass())
         .await
@@ -918,6 +1040,7 @@ async fn a_server_exit_fails_the_instance_and_recovery_starts_a_new_server() {
     let cleanups = host.cleanups.lock().unwrap().clone();
     assert_eq!(cleanups.len(), 1);
     assert!(cleanups[0].identities.contains(&server));
+    assert!(cleanups[0].identities.contains(&member));
     assert!(cleanups[0].identities.iter().any(|p| p.role == "api"));
     let exited = events(&dir, "lmcache_server_exited", &deployment);
     assert_eq!(exited.len(), 1, "{exited:?}");
@@ -1019,7 +1142,7 @@ async fn measured_then_started_again(
     let live = |role: &str, n: usize| capyctl_testkit::live_identity(role, processes[n].0.id());
     let engine = vec![live("api", 0), live("worker-0", 1)];
     let server = live(LMCACHE_ROLE, 2);
-    *host.live_launch.lock().unwrap() = Some((engine, server.clone()));
+    *host.live_launch.lock().unwrap() = Some((engine, vec![server.clone()]));
     let [_api, _worker, mut child] = <[Process; 3]>::try_from(processes).ok().unwrap();
     let resident = |gpu: i64| capyctl_domain::resources::ProcessResident {
         pid: server.pid,
@@ -1420,7 +1543,7 @@ async fn an_embedded_sglang_restart_park_is_proven_quiescent_on_the_engines_gaug
     let live = |role: &str, n: usize| capyctl_testkit::live_identity(role, processes[n].0.id());
     *host.live_launch.lock().unwrap() = Some((
         vec![live("api", 0), live("worker-0", 1)],
-        live(LMCACHE_ROLE, 2),
+        vec![live(LMCACHE_ROLE, 2)],
     ));
     let running = Arc::new(AtomicU32::new(0));
     let endpoint = sglang_gauges(running.clone()).await;

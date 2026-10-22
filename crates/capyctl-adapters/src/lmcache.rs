@@ -413,6 +413,18 @@ async fn status_answers(http_port: u16) -> bool {
         .is_ok_and(|response| response.status().is_success())
 }
 
+/// ADR 0033 §§3, 9: why a launch's server did not start, and what became of
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerFailure {
+    pub reason: LmcacheOffReason,
+    pub detail: String,
+    /// The server's processes, stopped with a verified exit (none when it
+    /// never spawned); `None` when the stop was not verified, so the
+    /// launch's own stop still owns them.
+    pub stopped: Option<Vec<ProcessIdentity>>,
+}
+
 /// ADR 0033 §3: start the launch's server and prove it: spawn it gated, wait
 /// for `GET /status` within the start bound while it lives, observe its
 /// group, and run the loopback listener check on that group. Anything else
@@ -423,7 +435,7 @@ pub async fn start_server(
     tools: Arc<dyn OwnedProcessLaunch>,
     incarnation: &str,
     plan: &ServerPlan,
-) -> Result<Vec<ProcessIdentity>, (LmcacheOffReason, String)> {
+) -> Result<Vec<ProcessIdentity>, ServerFailure> {
     let cmd = render_server(plan);
     let spawn_tools = tools.clone();
     let key = incarnation.to_owned();
@@ -431,11 +443,10 @@ pub async fn start_server(
         .await
         .map_err(|_| RuntimeError::Uncertain("spawn task failed".into()))
         .and_then(|spawned| spawned)
-        .map_err(|error| {
-            (
-                LmcacheOffReason::ServerStartFailed,
-                format!("the LMCache server could not be started: {error}"),
-            )
+        .map_err(|error| ServerFailure {
+            reason: LmcacheOffReason::ServerStartFailed,
+            detail: format!("the LMCache server could not be started: {error}"),
+            stopped: Some(Vec::new()),
         })?;
     let deadline = Instant::now() + plan.start_bound;
     let started = loop {
@@ -476,7 +487,12 @@ pub async fn start_server(
         Err((reason, detail)) => (reason, detail, vec![leader]),
     };
     let (reason, detail, stopping) = failed;
-    Err((reason, stop_after(&tools, stopping, detail).await))
+    let (detail, stopped) = stop_after(&tools, stopping, detail).await;
+    Err(ServerFailure {
+        reason,
+        detail,
+        stopped,
+    })
 }
 
 /// ADR 0033 §§3, 5: re-prove a running server (a restart-parked launch's
@@ -509,7 +525,7 @@ pub async fn prove_server(
     match checked_group(&tools, plan, &leader).await {
         Ok(group) => Ok(group),
         Err((reason @ LmcacheOffReason::ListenerExposed, detail, stopping)) => {
-            Err((reason, stop_after(&tools, stopping, detail).await))
+            Err((reason, stop_after(&tools, stopping, detail).await.0))
         }
         Err((reason, detail, _)) => Err((reason, detail)),
     }
@@ -517,10 +533,86 @@ pub async fn prove_server(
 
 type GroupFailure = (LmcacheOffReason, String, Vec<ProcessIdentity>);
 
+/// How many times the server's group is listed again when a member exits
+/// while its sockets are read.
+const GROUP_READS: usize = 3;
+
 /// The server's group, observed and checked against loopback (ADR 0031 §7).
+/// A member that exited while it was read (a short-lived child of the
+/// server, found live on LMCache 0.5.6 under SGLang) holds no socket: the
+/// group is listed again and checked as it is now, so the recorded group
+/// never names it. The leader gone, or a group that changed on every read,
+/// fails closed.
 async fn checked_group(
     tools: &Arc<dyn OwnedProcessLaunch>,
     plan: &ServerPlan,
+    leader: &ProcessIdentity,
+) -> Result<Vec<ProcessIdentity>, GroupFailure> {
+    let mut vanished = None;
+    for _ in 0..GROUP_READS {
+        let group = observed_group(tools, leader).await?;
+        let root = plan.proc_root.clone();
+        let checked = group.clone();
+        let check_tools = tools.clone();
+        let check = tokio::task::spawn_blocking(move || {
+            check_loopback(&root, &checked, &|identity| check_tools.present(identity))
+        })
+        .await
+        .map_err(|_| {
+            (
+                LmcacheOffReason::ServerStartFailed,
+                "the listener check did not run".to_owned(),
+                group.clone(),
+            )
+        })?;
+        match check {
+            Ok(()) => return Ok(group),
+            Err(ListenerCheck::Exposed(address)) => {
+                return Err((
+                    LmcacheOffReason::ListenerExposed,
+                    format!("the LMCache server listens on {address}, not on loopback"),
+                    group,
+                ))
+            }
+            Err(ListenerCheck::Unreadable(reason)) => {
+                return Err((
+                    LmcacheOffReason::ServerStartFailed,
+                    format!("the LMCache server's listeners could not be read: {reason}"),
+                    group,
+                ))
+            }
+            // The leader itself gone is not a group that changed.
+            Err(ListenerCheck::Vanished(identity)) if &identity == leader => {
+                return Err((
+                    LmcacheOffReason::ServerStartFailed,
+                    "the LMCache server exited while its listeners were read".to_owned(),
+                    group,
+                ))
+            }
+            Err(ListenerCheck::Vanished(identity)) => vanished = Some((identity, group)),
+        }
+    }
+    let Some((identity, group)) = vanished else {
+        return Err((
+            LmcacheOffReason::ServerStartFailed,
+            "the listener check did not run".to_owned(),
+            vec![leader.clone()],
+        ));
+    };
+    Err((
+        LmcacheOffReason::ServerStartFailed,
+        format!(
+            "the LMCache server's listeners could not be read: its group changed on each of \
+             {GROUP_READS} reads ({} process {} exited)",
+            identity.role, identity.pid
+        ),
+        group,
+    ))
+}
+
+/// The server's process group as it is now, led by `leader`.
+async fn observed_group(
+    tools: &Arc<dyn OwnedProcessLaunch>,
     leader: &ProcessIdentity,
 ) -> Result<Vec<ProcessIdentity>, GroupFailure> {
     let observe_tools = tools.clone();
@@ -543,53 +635,30 @@ async fn checked_group(
             vec![leader.clone()],
         ));
     }
-    let root = plan.proc_root.clone();
-    let checked = group.clone();
-    let check_tools = tools.clone();
-    let check = tokio::task::spawn_blocking(move || {
-        check_loopback(&root, &checked, &|identity| {
-            check_tools.present(identity) == Presence::Alive
-        })
-    })
-    .await
-    .map_err(|_| {
-        (
-            LmcacheOffReason::ServerStartFailed,
-            "the listener check did not run".to_owned(),
-            group.clone(),
-        )
-    })?;
-    match check {
-        Ok(()) => Ok(group),
-        Err(ListenerCheck::Exposed(address)) => Err((
-            LmcacheOffReason::ListenerExposed,
-            format!("the LMCache server listens on {address}, not on loopback"),
-            group,
-        )),
-        Err(ListenerCheck::Unreadable(reason)) => Err((
-            LmcacheOffReason::ServerStartFailed,
-            format!("the LMCache server's listeners could not be read: {reason}"),
-            group,
-        )),
-    }
+    Ok(group)
 }
 
-/// Stop `server` (verified gone) and say how that went after `detail`.
+/// Stop `server` (verified gone) and say how that went after `detail`; the
+/// stopped identities when the stop was verified.
 async fn stop_after(
     tools: &Arc<dyn OwnedProcessLaunch>,
     server: Vec<ProcessIdentity>,
     detail: String,
-) -> String {
+) -> (String, Option<Vec<ProcessIdentity>>) {
     let stop_tools = tools.clone();
+    let stopping = server.clone();
     let stopped =
-        tokio::task::spawn_blocking(move || stop_tools.stop_group(&server, SERVER_STOP_GRACE))
+        tokio::task::spawn_blocking(move || stop_tools.stop_group(&stopping, SERVER_STOP_GRACE))
             .await
             .map_err(|_| RuntimeError::Uncertain("stop task failed".into()))
             .and_then(|stopped| stopped);
     match stopped {
-        Ok(()) => format!("{detail}; the server was stopped"),
-        Err(error) => format!(
-            "{detail}; stopping the server was not verified ({error}); the launch's stop still owns it"
+        Ok(()) => (format!("{detail}; the server was stopped"), Some(server)),
+        Err(error) => (
+            format!(
+                "{detail}; stopping the server was not verified ({error}); the launch's stop still owns it"
+            ),
+            None,
         ),
     }
 }
@@ -610,6 +679,13 @@ pub(crate) struct Connector {
 /// the server did not start under `auto`, which turns the state off).
 /// `lmcache: required` turns a server that did not start into the launch
 /// failure `lmcache_unavailable:<reason>`, before any engine is spawned.
+/// Under `auto` the engine launches without the connector only once the
+/// stopped server left the launch's record ([`OwnedProcessLaunch::depart_lmcache`]):
+/// the launch's Ready must name exactly what it holds, and a record still
+/// naming the server could never match an engine that runs alone (found
+/// live on SGLang: Ready refused `lifecycle conflict`). A server whose stop
+/// or departure was not verified leaves the launch uncertain, its record
+/// kept for the launch's own stop, and no engine is spawned.
 pub(crate) async fn connect(
     state: Option<&Arc<LmcacheState>>,
     tools: &Arc<dyn OwnedProcessLaunch>,
@@ -629,7 +705,11 @@ pub(crate) async fn connect(
                     plan,
                     first_start: true,
                 })),
-                Err((reason, detail)) => {
+                Err(ServerFailure {
+                    reason,
+                    detail,
+                    stopped,
+                }) => {
                     state.turn_off(reason, detail.clone());
                     if plan.required {
                         // ADR 0033 §9: nothing is left running; the engine is
@@ -638,6 +718,25 @@ pub(crate) async fn connect(
                             "{}; {detail}",
                             reason.required_refusal()
                         )));
+                    }
+                    match stopped {
+                        Some(server) if server.is_empty() => {}
+                        Some(server) => {
+                            let depart_tools = tools.clone();
+                            tokio::task::spawn_blocking(move || {
+                                depart_tools.depart_lmcache(&server)
+                            })
+                            .await
+                            .map_err(|_| RuntimeError::Uncertain("departure task failed".into()))
+                            .and_then(|departed| departed)
+                            .map_err(|error| {
+                                RuntimeError::Uncertain(format!(
+                                    "{detail}; the stopped server did not leave the launch's \
+                                     record ({error})"
+                                ))
+                            })?;
+                        }
+                        None => return Err(RuntimeError::Uncertain(detail)),
                     }
                     capyctl_domain::role_log::notice(
                         capyctl_domain::role_log::Level::Warning,

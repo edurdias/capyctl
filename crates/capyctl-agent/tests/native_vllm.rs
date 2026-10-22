@@ -2103,10 +2103,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
 http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 "#;
 
+/// ADR 0033 §3: the stand-in above, also listening on every interface (a
+/// server that fails the listener check).
+const EXPOSED_LMCACHE: &str = r#"
+import socket
+exposed = socket.socket()
+exposed.bind(("0.0.0.0", 0))
+exposed.listen()
+"#;
+
+/// ADR 0033 §3 (found live on SGLang): the stand-in above with a child in
+/// its group that lives while `child.hold` beside the script exists, then
+/// exits (reaped at once), as LMCache 0.5.6's short-lived child does.
+const CHILD_LMCACHE: &str = r#"
+import os, signal, time
+signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+hold = os.path.join(os.path.dirname(os.path.abspath(__file__)), "child.hold")
+if os.fork() == 0:
+    while os.path.exists(hold):
+        time.sleep(0.05)
+    os._exit(0)
+"#;
+
 /// LMCache 0.5.6 in the fixture's environment beside vLLM 0.32.0 (the
-/// check's source excerpts), its server the stand-in above; the profile
-/// registers it as `engine add` does.
-fn lmcache_environment(host: &mut Value) {
+/// check's source excerpts), its server the stand-in above with `prelude`
+/// run first; the profile registers it as `engine add` does.
+fn lmcache_environment_with(host: &mut Value, prelude: &str) {
     let engine = PathBuf::from(
         host["runtime_profiles"]["local"]["executable"]
             .as_str()
@@ -2142,7 +2164,7 @@ fn lmcache_environment(host: &mut Value) {
     .unwrap();
     capyctl_config::test_support::write_executable(
         &venv.join("bin/lmcache"),
-        format!("#!{}\n{FAKE_LMCACHE}", python3().display()),
+        format!("#!{}\n{prelude}{FAKE_LMCACHE}", python3().display()),
         0o755,
     )
     .unwrap();
@@ -2160,9 +2182,14 @@ fn lmcache_environment(host: &mut Value) {
 /// A `restart_only` vLLM launch granted an LMCache server on two leased
 /// ports with a 1 GiB pool, on a host whose LMCache directory root exists.
 fn lmcache_fixture() -> (Fixture, MemberCommand, [u16; 2]) {
+    lmcache_fixture_with("")
+}
+
+/// As [`lmcache_fixture`], the server's script beginning with `prelude`.
+fn lmcache_fixture_with(prelude: &'static str) -> (Fixture, MemberCommand, [u16; 2]) {
     let ports = [engine_port(), engine_port()];
     let fixture = Fixture::build(Some(false), true, |host, _| {
-        lmcache_environment(host);
+        lmcache_environment_with(host, prelude);
         let engine = host["resource_policy"]["endpoint_port_range"]["start"]
             .as_u64()
             .unwrap() as u16;
@@ -2426,6 +2453,131 @@ async fn a_parked_launchs_server_exit_is_reported() {
         .pid;
     unsafe { libc::kill(server as i32, libc::SIGKILL) };
     assert_eq!(server_exit(&host.journal).process.pid, server);
+    let stopped = host
+        .executor
+        .execute(host.session, fixture.stop(&launch))
+        .await
+        .unwrap();
+    assert!(stopped.processes.iter().all(|p| p.presence == "gone"));
+}
+
+// T45 T37 T14 (ADR 0033 §§3, 9; found live on SGLang, where the Ready that
+// followed was refused `lifecycle conflict`): a server listening off loopback
+// fails the listener check under `auto`; it is stopped (verified gone) and
+// leaves the launch's journaled processes before the engine is spawned. The
+// engine runs without the connector and the launch reports Ready with
+// LMCache off (`listener_exposed`), naming the engine alone, as the
+// controller records it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exposed_server_is_stopped_and_the_engine_is_ready_without_it() {
+    let (fixture, launch, _) = lmcache_fixture_with(EXPOSED_LMCACHE);
+    let host = lmcache_host(&fixture);
+    host.executor.provision(launch.clone(), GATE).await.unwrap();
+    let ready = host
+        .executor
+        .execute(host.session, launch.clone())
+        .await
+        .unwrap();
+    assert!(ready.model_usable && ready.claim_retained, "{ready:?}");
+    let report = ready.lmcache.clone().expect("the launch reports LMCache");
+    assert_eq!(
+        (report.state.as_str(), report.reason.as_str()),
+        ("off", "listener_exposed"),
+        "{report:?}"
+    );
+    assert!(
+        report.detail.contains("the server was stopped"),
+        "{report:?}"
+    );
+    assert!(
+        ready
+            .processes
+            .iter()
+            .all(|p| !p.role.starts_with("lmcache")),
+        "{ready:?}"
+    );
+    assert!(ready.processes.iter().any(|p| p.role == "api"));
+    let owned = host.journal.inspect_owned("launch").unwrap();
+    assert!(
+        owned.iter().all(|(p, _)| !p.is_lmcache()),
+        "the journal records the engine alone: {owned:?}"
+    );
+    let argv: Vec<String> =
+        serde_json::from_value(fixture.record().unwrap()["argv"].clone()).unwrap();
+    assert!(
+        !argv.iter().any(|a| a.contains("LMCacheMPConnector")),
+        "{argv:?}"
+    );
+    let stopped = host
+        .executor
+        .execute(host.session, fixture.stop(&launch))
+        .await
+        .unwrap();
+    assert!(!stopped.claim_retained, "{stopped:?}");
+    assert!(stopped.processes.iter().all(|p| p.presence == "gone"));
+}
+
+// T45 T24 T37 (ADR 0033 §3; found live on SGLang): the server is its group's
+// leader. A child of the server alive at Ready is recorded with the launch
+// (`lmcache-0`); when it exits, no exit is reported and a re-proof still
+// proves the launch. The leader's exit is still reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_child_exiting_after_ready_is_not_the_servers_exit() {
+    let (fixture, launch, _) = lmcache_fixture_with(CHILD_LMCACHE);
+    let hold = fixture.root.path().join("venv/bin/child.hold");
+    std::fs::write(&hold, "").unwrap();
+    let host = lmcache_host(&fixture);
+    host.executor.provision(launch.clone(), GATE).await.unwrap();
+    let ready = host
+        .executor
+        .execute(host.session, launch.clone())
+        .await
+        .unwrap();
+    assert!(ready.model_usable, "{ready:?}");
+    assert_eq!(ready.lmcache.as_ref().unwrap().state, "on", "{ready:?}");
+    let process = |p: &capyctl_protocol::pb::OwnedProcessObservation| {
+        capyctl_domain::completion::ProcessIdentity {
+            role: p.role.clone(),
+            pid: p.pid,
+            boot_id: p.boot_id.clone(),
+            start_ticks: p.start_ticks,
+        }
+    };
+    let child = roles(&ready, "alive")
+        .find(|p| p.role == "lmcache-0")
+        .map(process)
+        .unwrap_or_else(|| panic!("the server's child is recorded: {ready:?}"));
+    let leader = roles(&ready, "alive")
+        .find(|p| p.role == "lmcache")
+        .map(process)
+        .unwrap();
+
+    std::fs::remove_file(&hold).unwrap();
+    let started = std::time::Instant::now();
+    while capyctl_launchers::process_absence::presence(&child)
+        != capyctl_domain::completion::Presence::Gone
+    {
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    for _ in 0..5 {
+        let exited = capyctl_agent::exits::scan(&host.journal, "host", now_ms());
+        assert!(
+            exited.is_empty(),
+            "a server child's exit: {:?}",
+            exited.len()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let probed = host
+        .executor
+        .execute(host.session, fixture.probe(&launch, "probe"))
+        .await
+        .unwrap();
+    assert!(probed.model_usable, "{probed:?}");
+
+    unsafe { libc::kill(leader.pid as i32, libc::SIGKILL) };
+    assert_eq!(server_exit(&host.journal).process.pid, leader.pid);
     let stopped = host
         .executor
         .execute(host.session, fixture.stop(&launch))

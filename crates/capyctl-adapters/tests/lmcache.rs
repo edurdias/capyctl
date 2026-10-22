@@ -140,6 +140,14 @@ struct Tool {
     engine_dies: bool,
     spawned: Mutex<Vec<(String, RenderedCommand)>>,
     stopped: Mutex<Vec<Vec<ProcessIdentity>>>,
+    /// Successive listings of the server's group, before `server_group`.
+    listings: Mutex<std::collections::VecDeque<Vec<ProcessIdentity>>>,
+    /// Processes observed gone whatever their role.
+    gone: Mutex<Vec<u32>>,
+    /// A group stop is not verified.
+    stop_unverified: bool,
+    /// The server groups that left the launch's record.
+    departed: Mutex<Vec<Vec<ProcessIdentity>>>,
 }
 
 impl Tool {
@@ -155,6 +163,10 @@ impl Tool {
             engine_dies: false,
             spawned: Mutex::new(Vec::new()),
             stopped: Mutex::new(Vec::new()),
+            listings: Mutex::new(Default::default()),
+            gone: Mutex::new(Vec::new()),
+            stop_unverified: false,
+            departed: Mutex::new(Vec::new()),
         }
     }
 
@@ -225,6 +237,9 @@ impl OwnedProcessLaunch for Tool {
         Ok(self.engine_group[0].clone())
     }
     fn present(&self, identity: &ProcessIdentity) -> Presence {
+        if self.gone.lock().unwrap().contains(&identity.pid) {
+            return Presence::Gone;
+        }
         if identity.is_lmcache() {
             *self.server_presence.lock().unwrap()
         } else {
@@ -238,10 +253,22 @@ impl OwnedProcessLaunch for Tool {
         &self,
         _: &ProcessIdentity,
     ) -> Result<Vec<ProcessIdentity>, RuntimeError> {
-        Ok(self.server_group.clone())
+        Ok(self
+            .listings
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| self.server_group.clone()))
     }
     fn stop_group(&self, identities: &[ProcessIdentity], _: Duration) -> Result<(), RuntimeError> {
         self.stopped.lock().unwrap().push(identities.to_vec());
+        if self.stop_unverified {
+            return Err(RuntimeError::Uncertain("the group is still there".into()));
+        }
+        Ok(())
+    }
+    fn depart_lmcache(&self, server: &[ProcessIdentity]) -> Result<(), RuntimeError> {
+        self.departed.lock().unwrap().push(server.to_vec());
         Ok(())
     }
     fn terminate_owned(&self, _: &[ProcessIdentity], _: Duration) -> Result<(), RuntimeError> {
@@ -530,6 +557,62 @@ async fn a_server_on_loopback_that_answers_status_starts() {
     assert!(tool.stopped.lock().unwrap().is_empty());
 }
 
+// T45 T37 (ADR 0033 §3; found live on LMCache 0.5.6 and SGLang): a
+// short-lived child of the server that exits between the group's listing and
+// the read of its descriptors (verified gone) holds no socket. The group is
+// listed again and checked as it is now; the recorded group never names the
+// child. A child gone on every listing still fails closed.
+#[tokio::test]
+async fn a_server_child_that_exits_during_the_check_is_listed_out() {
+    let tool = Arc::new(Tool::new());
+    let child = identity("lmcache-1", 3009);
+    let mut listed = tool.server_group.clone();
+    listed.push(child.clone());
+    tool.listings.lock().unwrap().push_back(listed.clone());
+    tool.gone.lock().unwrap().push(child.pid);
+    // The child's `/proc/3009` is gone; the others hold loopback sockets.
+    let proc = fake_proc(&[(3000, 1111), (3001, 1111)]);
+    let port = status_server().await;
+    let group = start_server(tool.clone(), "i-1", &server_plan(port, proc.path(), false))
+        .await
+        .unwrap();
+    assert_eq!(group, tool.server_group);
+    assert!(tool.stopped.lock().unwrap().is_empty());
+
+    let tool = Arc::new(Tool::new());
+    for _ in 0..3 {
+        tool.listings.lock().unwrap().push_back(listed.clone());
+    }
+    tool.gone.lock().unwrap().push(child.pid);
+    let failure = start_server(tool.clone(), "i-1", &server_plan(port, proc.path(), false))
+        .await
+        .unwrap_err();
+    assert_eq!(failure.reason, LmcacheOffReason::ServerStartFailed);
+    assert!(
+        failure.detail.contains("changed on each of 3 reads"),
+        "{failure:?}"
+    );
+    assert_eq!(*tool.stopped.lock().unwrap(), [listed.clone()]);
+    assert_eq!(failure.stopped, Some(listed));
+
+    // A child whose entry is missing while it is still alive (not verified
+    // gone) proves nothing: the reading is unreadable at once.
+    let tool = Arc::new(Tool::new());
+    let mut unknown = tool.server_group.clone();
+    unknown.push(identity("lmcache-1", 3010));
+    tool.listings.lock().unwrap().push_back(unknown);
+    let failure = start_server(tool.clone(), "i-1", &server_plan(port, proc.path(), false))
+        .await
+        .unwrap_err();
+    assert_eq!(failure.reason, LmcacheOffReason::ServerStartFailed);
+    assert!(
+        failure
+            .detail
+            .contains("could not be read: the descriptors"),
+        "{failure:?}"
+    );
+}
+
 // T45 (ADR 0033 §3): no `/status` within the start bound: the server is
 // stopped (verified) and the reason is `server_start_failed`.
 #[tokio::test]
@@ -539,11 +622,15 @@ async fn a_server_silent_past_its_bound_is_stopped_and_fails_to_start() {
     let mut plan = server_plan(closed_port().await, proc.path(), false);
     plan.start_bound = Duration::from_millis(600);
     let started = std::time::Instant::now();
-    let (reason, detail) = start_server(tool.clone(), "i-1", &plan).await.unwrap_err();
-    assert_eq!(reason, LmcacheOffReason::ServerStartFailed);
-    assert!(detail.contains("GET /status"), "{detail}");
-    assert!(detail.ends_with("the server was stopped"), "{detail}");
+    let failure = start_server(tool.clone(), "i-1", &plan).await.unwrap_err();
+    assert_eq!(failure.reason, LmcacheOffReason::ServerStartFailed);
+    assert!(failure.detail.contains("GET /status"), "{failure:?}");
+    assert!(
+        failure.detail.ends_with("the server was stopped"),
+        "{failure:?}"
+    );
     assert_eq!(*tool.stopped.lock().unwrap(), [vec![tool.server.clone()]]);
+    assert_eq!(failure.stopped, Some(vec![tool.server.clone()]));
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 
@@ -554,16 +641,16 @@ async fn a_server_listening_off_loopback_is_stopped_as_exposed() {
     let tool = Arc::new(Tool::new());
     let proc = fake_proc(&[(3000, 1111), (3001, 2222)]);
     let port = status_server().await;
-    let (reason, detail) =
-        start_server(tool.clone(), "i-1", &server_plan(port, proc.path(), false))
-            .await
-            .unwrap_err();
-    assert_eq!(reason, LmcacheOffReason::ListenerExposed);
-    assert!(detail.contains("0.0.0.0:25002"), "{detail}");
+    let failure = start_server(tool.clone(), "i-1", &server_plan(port, proc.path(), false))
+        .await
+        .unwrap_err();
+    assert_eq!(failure.reason, LmcacheOffReason::ListenerExposed);
+    assert!(failure.detail.contains("0.0.0.0:25002"), "{failure:?}");
     assert_eq!(
         *tool.stopped.lock().unwrap(),
         std::slice::from_ref(&tool.server_group)
     );
+    assert_eq!(failure.stopped.as_ref(), Some(&tool.server_group));
 }
 
 // T45 (ADR 0033 §3): a server that exits before answering is stopped and
@@ -576,7 +663,8 @@ async fn a_server_that_exits_before_answering_fails_at_once() {
     let mut plan = server_plan(closed_port().await, proc.path(), false);
     plan.start_bound = Duration::from_secs(30);
     let started = std::time::Instant::now();
-    let (reason, _) = start_server(tool.clone(), "i-1", &plan).await.unwrap_err();
+    let failure = start_server(tool.clone(), "i-1", &plan).await.unwrap_err();
+    let reason = failure.reason;
     assert_eq!(reason, LmcacheOffReason::ServerStartFailed);
     assert!(started.elapsed() < Duration::from_secs(5));
 }
@@ -677,8 +765,10 @@ async fn a_required_launch_fails_without_spawning_an_engine() {
     ));
 }
 
-// T45 (ADR 0033 §§3, 9): under `auto` a server that did not start leaves the
-// launch to run without the connector, LMCache off with the reason.
+// T45 T37 (ADR 0033 §§3, 9; found live on SGLang): under `auto` a server
+// that did not start leaves the launch to run without the connector, LMCache
+// off with the reason. The stopped server leaves the launch's record before
+// the engine is spawned, so the launch's Ready names the engine alone.
 #[tokio::test]
 async fn an_auto_launch_runs_without_the_connector_when_the_server_fails() {
     let proc = fake_proc(&[(3000, 2222), (3001, 1111)]);
@@ -695,6 +785,11 @@ async fn an_auto_launch_runs_without_the_connector_when_the_server_fails() {
         .await
         .unwrap();
     assert_eq!(tool.spawned_kinds(), ["lmcache", "engine"]);
+    assert_eq!(
+        *tool.departed.lock().unwrap(),
+        std::slice::from_ref(&tool.server_group),
+        "the stopped group left the record before the engine"
+    );
     assert!(!tool
         .engine_command()
         .argv
@@ -712,6 +807,35 @@ async fn an_auto_launch_runs_without_the_connector_when_the_server_fails() {
             ..
         })
     ));
+}
+
+// T45 T37 T32 (ADR 0033 §§3, 9; SPEC §13.2): under `auto`, a server whose
+// stop was not verified stays on the launch's record for its own stop: no
+// engine is spawned and the launch is uncertain, since its Ready could never
+// match a record that names the server beside an engine that runs alone.
+#[tokio::test]
+async fn an_auto_launch_whose_server_stop_is_unverified_spawns_no_engine() {
+    let proc = fake_proc(&[(3000, 2222), (3001, 1111)]);
+    let state = started_state(proc.path(), false).await;
+    let mut tool = Tool::new();
+    tool.stop_unverified = true;
+    let tool = Arc::new(tool);
+    let port = stub_engine().await;
+    let adapter = vllm_adapter(
+        port,
+        vllm_plan(port, Some(state.clone()), None),
+        tool.clone(),
+    );
+    let error = adapter
+        .execute_persisted(&initialize(30_000))
+        .await
+        .unwrap_err();
+    let RuntimeError::Uncertain(message) = error else {
+        panic!("{error:?}");
+    };
+    assert!(message.contains("was not verified"), "{message}");
+    assert_eq!(tool.spawned_kinds(), ["lmcache"], "no engine was spawned");
+    assert!(tool.departed.lock().unwrap().is_empty());
 }
 
 // T45 (ADR 0033 §§3, 8): the server exiting while its engine starts is an

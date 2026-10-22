@@ -15,7 +15,7 @@ use capyctl_adapters::custom::{
 use capyctl_config::custom::CustomProfile;
 use capyctl_config::effective::EffectiveDeployment;
 use capyctl_config::engine_policy::Engine;
-use capyctl_domain::completion::{Presence, ProcessIdentity};
+use capyctl_domain::completion::ProcessIdentity;
 use capyctl_protocol::execution::SingleLaunchPlan;
 
 /// How long an exposed launch's processes get on SIGTERM before SIGKILL.
@@ -137,7 +137,7 @@ pub(super) fn check_listeners(identities: &[ProcessIdentity]) -> Result<(), List
     capyctl_adapters::custom::check_loopback(
         std::path::Path::new("/proc"),
         identities,
-        &|identity| capyctl_launchers::process_absence::presence(identity) == Presence::Alive,
+        &capyctl_launchers::process_absence::presence,
     )
 }
 

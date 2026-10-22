@@ -2014,10 +2014,11 @@ mod tests {
 
     /// ADR 0033 §7 (lifecycle design §4.1): a `restart_only` park stops the
     /// engine and keeps the LMCache server, so the host's `engine_stopped`
-    /// evidence proves it only when what is alive is exactly the recorded
-    /// server group: an engine process still alive, another server, or a
-    /// server process missing stays uncertain, and so does such evidence
-    /// for a launch that recorded no server.
+    /// evidence proves it only when what is alive is the recorded server
+    /// alone: an engine process still alive or another server stays
+    /// uncertain, and so does such evidence for a launch that recorded no
+    /// server. A9: the server is its leader, so a member of its group that
+    /// exited (a short-lived child, found live on SGLang) does not.
     // T45 T16 T34
     #[test]
     fn a_restart_park_is_proven_by_the_recorded_server_alone() {
@@ -2047,11 +2048,9 @@ mod tests {
             residency_evidence(true, &recorded, &parked("gone", 60, "alive")).unwrap();
         assert_eq!(alive, recorded[2..].to_vec());
         assert_eq!(facts, [Milestone::MemoryReleased]);
-        for uncertain in [
-            parked("alive", 60, "alive"),
-            parked("gone", 99, "alive"),
-            parked("gone", 60, "gone"),
-        ] {
+        let (alive, _) = residency_evidence(true, &recorded, &parked("gone", 60, "gone")).unwrap();
+        assert_eq!(alive, recorded[2..3].to_vec(), "a server member exited");
+        for uncertain in [parked("alive", 60, "alive"), parked("gone", 99, "alive")] {
             assert!(
                 matches!(
                     residency_evidence(true, &recorded, &uncertain),

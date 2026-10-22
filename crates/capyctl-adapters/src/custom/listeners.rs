@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
-use capyctl_domain::completion::ProcessIdentity;
+use capyctl_domain::completion::{Presence, ProcessIdentity};
 
 /// The kernel's `TCP_LISTEN` state in `/proc/net/tcp`.
 const TCP_LISTEN: &str = "0A";
@@ -20,9 +20,15 @@ const TCP_LISTEN: &str = "0A";
 pub enum ListenerCheck {
     /// An owned process listens off loopback (ADR 0031 §10).
     Exposed(SocketAddr),
-    /// The sockets could not be read, or a process changed while they were:
-    /// nothing is proven either way.
+    /// The sockets could not be read, or a process could not be established
+    /// as the recorded one after they were: nothing is proven either way.
     Unreadable(String),
+    /// A member exited while it was read: its `/proc/<pid>` was gone (or it
+    /// was no longer the recorded process once read) and its presence is
+    /// verified `Gone`. It holds no socket, but the group changed under the
+    /// check, so the caller lists it again (a server's short-lived child,
+    /// found live on LMCache 0.5.6 under SGLang) or fails closed.
+    Vanished(ProcessIdentity),
 }
 
 impl std::fmt::Display for ListenerCheck {
@@ -36,6 +42,12 @@ impl std::fmt::Display for ListenerCheck {
             ListenerCheck::Unreadable(reason) => {
                 write!(f, "the engine's listeners could not be read: {reason}")
             }
+            ListenerCheck::Vanished(identity) => write!(
+                f,
+                "the engine's listeners could not be read: {} process {} exited while \
+                 its sockets were read",
+                identity.role, identity.pid
+            ),
         }
     }
 }
@@ -129,13 +141,16 @@ fn socket_inodes(fd_dir: &Path) -> std::io::Result<BTreeSet<u64>> {
 }
 
 /// Every TCP listener the processes `identities` hold, read under
-/// `proc_root` (`/proc` on a host). `still_owned` is asked about each process
-/// after its sockets were read: a process that is no longer the recorded one
-/// (gone, or its pid reused) makes the reading unreadable rather than clean.
+/// `proc_root` (`/proc` on a host). `presence` is asked about a process
+/// whose entries are missing and about each process after its sockets were
+/// read. A process verified `Gone` then exited during the read
+/// ([`ListenerCheck::Vanished`]); one whose presence is anything but `Alive`
+/// otherwise, or any other read failure, makes the reading unreadable rather
+/// than clean.
 pub fn owned_listeners(
     proc_root: &Path,
     identities: &[ProcessIdentity],
-    still_owned: &dyn Fn(&ProcessIdentity) -> bool,
+    presence: &dyn Fn(&ProcessIdentity) -> Presence,
 ) -> Result<Vec<SocketAddr>, ListenerCheck> {
     if identities.is_empty() {
         return Err(ListenerCheck::Unreadable("no owned process to read".into()));
@@ -149,23 +164,41 @@ pub fn owned_listeners(
                 identity.role, identity.pid
             ))
         };
-        let inodes = socket_inodes(&process.join("fd"))
-            .map_err(|error| unreadable("the descriptors", error))?;
+        // A member whose `/proc/<pid>` entry is missing and that is verified
+        // gone exited during the read; any other failure is unknown.
+        let vanished = |error: &std::io::Error| {
+            error.kind() == std::io::ErrorKind::NotFound && presence(identity) == Presence::Gone
+        };
+        let inodes = match socket_inodes(&process.join("fd")) {
+            Ok(inodes) => inodes,
+            Err(error) if vanished(&error) => {
+                return Err(ListenerCheck::Vanished(identity.clone()))
+            }
+            Err(error) => return Err(unreadable("the descriptors", error)),
+        };
         let mut tables = BTreeMap::new();
         for table in ["tcp", "tcp6"] {
             match std::fs::read_to_string(process.join("net").join(table)) {
                 Ok(text) => tables.extend(listening_sockets(&text)),
+                Err(error) if vanished(&error) => {
+                    return Err(ListenerCheck::Vanished(identity.clone()))
+                }
                 // A kernel without IPv6 has no `tcp6`.
                 Err(error) if table == "tcp6" && error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(unreadable("the socket table", error)),
             }
         }
         listeners.extend(inodes.iter().filter_map(|inode| tables.get(inode).copied()));
-        if !still_owned(identity) {
-            return Err(ListenerCheck::Unreadable(format!(
-                "{} process {} changed while its sockets were read",
-                identity.role, identity.pid
-            )));
+        match presence(identity) {
+            Presence::Alive => {}
+            // What was read may be another process's: it proves nothing.
+            Presence::Gone => return Err(ListenerCheck::Vanished(identity.clone())),
+            Presence::Unknown => {
+                return Err(ListenerCheck::Unreadable(format!(
+                    "{} process {} changed while its sockets were read",
+                    identity.role, identity.pid
+                )))
+            }
         }
     }
     Ok(listeners.into_iter().collect())
@@ -176,9 +209,9 @@ pub fn owned_listeners(
 pub fn check_loopback(
     proc_root: &Path,
     identities: &[ProcessIdentity],
-    still_owned: &dyn Fn(&ProcessIdentity) -> bool,
+    presence: &dyn Fn(&ProcessIdentity) -> Presence,
 ) -> Result<(), ListenerCheck> {
-    match owned_listeners(proc_root, identities, still_owned)?
+    match owned_listeners(proc_root, identities, presence)?
         .into_iter()
         .find(|address| !is_loopback(address))
     {
@@ -286,25 +319,78 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fake_proc(root.path(), 10, &[1111, 5555, 4444]);
         fake_proc(root.path(), 11, &[2222]);
+        let alive = |_: &ProcessIdentity| Presence::Alive;
+        assert_eq!(check_loopback(root.path(), &[identity(10)], &alive), Ok(()));
         assert_eq!(
-            check_loopback(root.path(), &[identity(10)], &|_| true),
-            Ok(())
-        );
-        assert_eq!(
-            check_loopback(root.path(), &[identity(10), identity(11)], &|_| true),
+            check_loopback(root.path(), &[identity(10), identity(11)], &alive),
             Err(ListenerCheck::Exposed(at("0.0.0.0:8081")))
         );
         assert!(matches!(
-            check_loopback(root.path(), &[identity(10)], &|_| false),
+            check_loopback(root.path(), &[identity(10)], &|_| Presence::Unknown),
             Err(ListenerCheck::Unreadable(_))
         ));
         assert!(matches!(
-            check_loopback(root.path(), &[identity(12)], &|_| true),
+            check_loopback(root.path(), &[identity(12)], &alive),
             Err(ListenerCheck::Unreadable(_))
         ));
         assert_eq!(
             ListenerCheck::Exposed(at("0.0.0.0:8081")).to_string(),
             "custom_listener_exposed: an owned process listens on 0.0.0.0:8081, not on loopback"
         );
+    }
+
+    // T45 T44 (ADR 0033 §3; found live on LMCache 0.5.6 under SGLang): a
+    // member whose `/proc/<pid>` vanished and that is verified gone exited
+    // during the read: it holds no socket, and the check says so
+    // (`Vanished`) for the caller to list the group again. So does a member
+    // read whole and gone right after. A missing entry of a process alive or
+    // of unknown presence, or any other read failure, stays unknown.
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn a_member_that_vanished_is_named_not_read() {
+        let root = tempfile::tempdir().unwrap();
+        fake_proc(root.path(), 10, &[1111]);
+        let only_10 = |identity: &ProcessIdentity| {
+            if identity.pid == 10 {
+                Presence::Alive
+            } else {
+                Presence::Gone
+            }
+        };
+        assert_eq!(
+            check_loopback(root.path(), &[identity(10), identity(13)], &only_10),
+            Err(ListenerCheck::Vanished(identity(13)))
+        );
+        assert_eq!(
+            check_loopback(root.path(), &[identity(10)], &only_10),
+            Ok(())
+        );
+        for presence in [Presence::Alive, Presence::Unknown] {
+            assert!(matches!(
+                check_loopback(root.path(), &[identity(10), identity(13)], &|_| presence),
+                Err(ListenerCheck::Unreadable(_))
+            ));
+        }
+        // Read whole, then gone: what was read proves nothing.
+        assert_eq!(
+            check_loopback(root.path(), &[identity(10)], &|_| Presence::Gone),
+            Err(ListenerCheck::Vanished(identity(10)))
+        );
+        // Its table gone too, after its descriptors were listed.
+        fake_proc(root.path(), 14, &[2222]);
+        std::fs::remove_file(root.path().join("14/net/tcp")).unwrap();
+        assert_eq!(
+            check_loopback(root.path(), &[identity(14)], &only_10),
+            Err(ListenerCheck::Vanished(identity(14)))
+        );
+        // A descriptor directory that is not a directory is not a vanished
+        // process.
+        let odd = root.path().join("15");
+        std::fs::create_dir_all(odd.join("net")).unwrap();
+        std::fs::write(odd.join("fd"), "").unwrap();
+        assert!(matches!(
+            check_loopback(root.path(), &[identity(15)], &only_10),
+            Err(ListenerCheck::Unreadable(_))
+        ));
     }
 }

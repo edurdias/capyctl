@@ -36,6 +36,16 @@ pub trait LaunchAssociation {
     ) -> Result<(), AssociationError> {
         Err(AssociationError::Uncertain("unsupported".into()))
     }
+    /// ADR 0033 §§3, 9: the launch's LMCache server `server`, stopped with
+    /// every identity proven gone before any engine of the launch was
+    /// spawned (`server_start_failed` or `listener_exposed` under `auto`),
+    /// leaves the launch's record, journaled, so the engine launched without
+    /// the connector is the launch's whole record at Ready. Refused unless
+    /// the record names no engine process and every server process it names
+    /// is one of `server`.
+    fn depart_lmcache_server(&self, _server: &[ProcessIdentity]) -> Result<(), AssociationError> {
+        Err(AssociationError::Uncertain("unsupported".into()))
+    }
 }
 
 /// ADR 0033 §§3, 7: which process of a launch one gated spawn starts. Each

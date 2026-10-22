@@ -135,7 +135,9 @@ impl EngineExits {
     /// role did not start on this boot is never declared exited from here. Of
     /// those, only the engine's own (`api`, `worker-N`), never a helper.
     /// ADR 0033 §3 (lifecycle design §5): the LMCache server of a Ready or
-    /// parked launch is judged too; its exit stops the instance.
+    /// parked launch is judged too, by its `lmcache` leader alone (found live
+    /// on SGLang: a short-lived child of the server exited after Ready and
+    /// failed the instance); the leader's exit stops the instance.
     pub fn local_pass(&self) -> Vec<ExitHandled> {
         let (launches, servers) = {
             let Ok(owner) = self.commands.owner_for_read() else {
@@ -177,11 +179,12 @@ impl EngineExits {
             ));
         }
         for launch in servers {
-            let mut server = launch.server.clone();
-            server.sort_by_key(|p| (p.role != "lmcache", p.role.clone(), p.pid));
-            let Some(process) = server
-                .into_iter()
-                .find(capyctl_launchers::process_absence::exit_observed)
+            let Some(process) = launch
+                .server
+                .iter()
+                .find(|p| p.role == capyctl_domain::completion::LMCACHE_ROLE)
+                .filter(|leader| capyctl_launchers::process_absence::exit_observed(leader))
+                .cloned()
             else {
                 self.measure(&launch);
                 continue;

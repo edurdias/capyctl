@@ -317,7 +317,8 @@ fn a_helper_may_be_gone_but_an_engine_process_may_not() {
 }
 
 // T45: ADR 0033 §3: the LMCache server's group is neither the engine nor a
-// helper; the engine judgement ignores it and `same_lmcache` judges it.
+// helper; the engine judgement ignores it and `same_lmcache` judges it by its
+// leader.
 #[test]
 fn the_lmcache_group_is_judged_apart_from_the_engine() {
     assert!(is_lmcache_role("lmcache"));
@@ -360,13 +361,27 @@ fn the_lmcache_group_is_judged_apart_from_the_engine() {
     );
     assert!(same_lmcache(&recorded, &recorded));
     assert!(same_lmcache(&recorded, &recorded[2..]));
+    // Found live on SGLang: a short-lived child of the server, recorded at
+    // Ready, exited later; the server is still the one recorded.
     assert!(
-        !same_lmcache(&recorded, &recorded[..3]),
-        "a server member gone is another server group"
+        same_lmcache(&recorded, &recorded[..3]),
+        "a server member gone is the same server"
     );
     assert!(
-        !same_lmcache(&recorded, &[member("lmcache", 30), member("lmcache-0", 41)]),
-        "a replaced member is another server group"
+        same_lmcache(&recorded, &[member("lmcache", 30), member("lmcache-1", 41)]),
+        "a member started since is the same server"
+    );
+    assert!(
+        !same_lmcache(&recorded, &[member("lmcache", 31), member("lmcache-0", 30)]),
+        "another leader is another server"
+    );
+    assert!(
+        !same_lmcache(&recorded, &recorded[3..]),
+        "the leader gone is no server, whatever else of its group lives"
+    );
+    assert!(
+        !same_lmcache(&recorded, &[member("lmcache", 30), member("lmcache", 30)]),
+        "a duplicate is never a group"
     );
     assert!(
         !same_lmcache(&recorded[..2], &recorded[..2]),

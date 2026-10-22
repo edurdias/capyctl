@@ -753,34 +753,42 @@ pub(super) fn record_outcome(
 
 /// ADR 0033 §7 (lifecycle design §4.1): the identities a restart-park step's
 /// evidence leaves the binding with, or `None` when it does not prove the
-/// step. A park names the recorded server group alone, alive, with the
-/// engine's memory released; a restore names a new engine (any engine
-/// identity recorded for the wake among it) beside the same server, with
-/// every restore fact.
+/// step. A park names the recorded server (its leader, `same_lmcache`) alone,
+/// alive, with the engine's memory released; a restore names a new engine
+/// (any engine identity recorded for the wake among it) beside the same
+/// server, with every restore fact. A recorded member of the server's group
+/// the evidence no longer names (a child that exited) stays recorded: only
+/// the launch's verified stop proves it gone.
 pub(super) fn restart_park_evidence(
     park: bool,
     recorded: &[ProcessIdentity],
     observed: &[ProcessIdentity],
     facts: &[capyctl_domain::completion::Milestone],
 ) -> Option<Vec<ProcessIdentity>> {
-    use capyctl_domain::completion::{same_lmcache, Milestone};
+    use capyctl_domain::completion::{lmcache_members, same_lmcache, Milestone};
     if !same_lmcache(recorded, observed) {
         return None;
     }
-    let canonical = canonical_members(observed).ok()?;
+    let mut held = canonical_members(observed).ok()?;
+    let unnamed: Vec<_> = lmcache_members(recorded)
+        .into_iter()
+        .filter(|member| !held.contains(member))
+        .collect();
+    held.extend(unnamed);
+    let held = canonical_members(&held).ok()?;
     if park {
         let released = facts.contains(&Milestone::MemoryReleased)
             && facts
                 .iter()
                 .all(|f| matches!(f, Milestone::MemoryReleased | Milestone::Quiesced));
-        (released && canonical.iter().all(ProcessIdentity::is_lmcache)).then_some(canonical)
+        (released && observed.iter().all(ProcessIdentity::is_lmcache)).then_some(held)
     } else {
-        let fresh_engine = canonical.iter().any(|i| i.role == "api")
+        let fresh_engine = observed.iter().any(|i| i.role == "api")
             && recorded
                 .iter()
                 .filter(|i| !i.is_lmcache())
-                .all(|i| canonical.contains(i));
-        (fresh_engine && facts == super::park::ResidencyKind::Restore.facts()).then_some(canonical)
+                .all(|i| observed.contains(i));
+        (fresh_engine && facts == super::park::ResidencyKind::Restore.facts()).then_some(held)
     }
 }
 
@@ -869,6 +877,91 @@ impl crate::Store {
         }
         recorded.push(identity.clone());
         reassociate(&tx, &p, &recorded)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// ADR 0033 §§3, 9 (found live on SGLang: a launch whose server failed
+    /// its listener check launched its engine without LMCache, and its Ready
+    /// was refused `lifecycle conflict` because the binding still named the
+    /// stopped server beside the engine): the LMCache server of
+    /// `binding_id`'s launch, stopped with every process proven gone by the
+    /// host before any engine of the launch was spawned (`server_start_failed`
+    /// or `listener_exposed` under `auto`), leaves the binding's record, and
+    /// a `lmcache_server_departed` journal entry names it, in one
+    /// transaction. Accepted only while the launch's Initialize is armed in
+    /// this session under `fence`, before its association, with no engine
+    /// process recorded and every server identity the binding records among
+    /// `server`; a binding that records none is a replay. The gone evidence
+    /// is the caller's (the store observes no process): a caller that has
+    /// not proven each of `server` gone keeps the record as it is.
+    pub fn depart_lmcache_server(
+        &self,
+        s: &CoordinatorSession,
+        fence: &DeploymentFence,
+        binding_id: &str,
+        server: &[ProcessIdentity],
+    ) -> Result<(), LifecycleError> {
+        if server.is_empty() || !server.iter().all(ProcessIdentity::is_lmcache) {
+            return Err(LifecycleError::Invalid);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        check_session(&tx, s)?;
+        let step: String = tx
+            .query_row(
+                "SELECT s.id FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id
+                  WHERE s.binding_id=?1 AND s.state='armed' AND o.kind='initialize'",
+                [binding_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(LifecycleError::Conflict)?;
+        let (p, _, _) = load(&tx, &step)?;
+        current(&tx, s, &p, false)?;
+        if p.fence() != *fence || association(&tx, &p)?.is_some() {
+            return Err(LifecycleError::Conflict);
+        }
+        let stored: String = tx
+            .query_row(
+                "SELECT identities_json FROM runtime_bindings WHERE id=?1 AND state!='released'",
+                [binding_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(LifecycleError::Conflict)?;
+        let recorded = identities(&decode::<Vec<IdentityDto>>(&stored)?);
+        if recorded.iter().any(|identity| !identity.is_lmcache()) {
+            return Err(LifecycleError::Conflict);
+        }
+        if recorded.is_empty() {
+            return Ok(());
+        }
+        if recorded.iter().any(|identity| !server.contains(identity)) {
+            return Err(LifecycleError::Conflict);
+        }
+        one(tx.execute(
+            "UPDATE runtime_bindings SET identities_json='[]' WHERE id=?1 AND state!='released'",
+            [binding_id],
+        )?)?;
+        let named: Vec<String> = recorded
+            .iter()
+            .map(|identity| format!("{} {}", identity.role, identity.pid))
+            .collect();
+        tx.execute(
+            "INSERT INTO journal_entries(id,host_id,operation_id,state,evidence) VALUES(?1,NULL,?2,'lmcache_server_departed',?3)",
+            params![
+                ulid::Ulid::new().to_string(),
+                p.operation_id,
+                format!(
+                    "deployment {} instance {}: the LMCache server ({}) stopped with a verified \
+                     exit before the engine was spawned and left the launch's record; the \
+                     engine starts without LMCache",
+                    p.deployment_id,
+                    p.instance_index,
+                    named.join(", ")
+                ),
+            ],
+        )?;
         tx.commit()?;
         Ok(())
     }

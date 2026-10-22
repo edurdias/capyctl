@@ -62,6 +62,18 @@ What changed:
 - **Docs.** SPEC §§7.4, 8.2, 9.1, 9.2, 10, 12, 15.1, 20 (T45, LC rows), 21; the ADR's
   amendments; data retention, configuration, engine options, engines, requests,
   deploy, parking and errors.
+- **The server's short-lived child (A9, live on SGLang).** A member of the server's
+  group that exits during the listener check (verified gone) is listed out and the
+  group read again, instead of failing the start. A server stopped before its engine
+  (`server_start_failed`, `listener_exposed` under `auto`) leaves the launch's record,
+  journaled, before the engine launches without the connector, so its Ready is no
+  longer refused `lifecycle conflict`; an unverified stop leaves the launch uncertain
+  with no engine. Only the `lmcache` leader's exit fails the instance; re-proofs and
+  restart-park evidence judge the server by its leader, and every recorded member
+  stays recorded until the verified stop. Tests: the listener check's vanished member,
+  the adapter's re-listing and departure, the store's departure and member exit, the
+  coordinator's exposed server (embedded and remote) and child exit, and the host's
+  exposed server and child exit on real processes.
 
 Tests (T45 with related rows): coordinator tests on the real worker for the fallback
 (once, sticky, `lmcache_off`), `required` failing `lmcache_unavailable:engine_start_failed`

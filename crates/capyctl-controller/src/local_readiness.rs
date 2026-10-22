@@ -348,9 +348,11 @@ impl LocalReadiness {
         }
         let live = alive(&launch.identities)?;
         let checked = tokio::task::spawn_blocking(move || {
-            capyctl_adapters::custom::check_loopback(std::path::Path::new("/proc"), &live, &|id| {
-                capyctl_launchers::process_absence::presence(id) == Presence::Alive
-            })
+            capyctl_adapters::custom::check_loopback(
+                std::path::Path::new("/proc"),
+                &live,
+                &capyctl_launchers::process_absence::presence,
+            )
         })
         .await
         .map_err(|_| "the listener check did not run".to_owned())?;
@@ -685,16 +687,20 @@ impl capyctl_launchers::LaunchAssociation for ProveOnly {
 
 /// Every recorded engine process is alive as recorded; `Unknown` is not alive.
 /// Returns the recorded processes alive now. ADR 0027: a helper may have exited
-/// (an idle compile worker does); it is left out rather than refused.
+/// (an idle compile worker does); it is left out rather than refused. ADR 0033
+/// §3: so may a member of the LMCache server's group other than its `lmcache`
+/// leader (found live on SGLang: a short-lived child of the server).
 fn alive(identities: &[ProcessIdentity]) -> Result<Vec<ProcessIdentity>, String> {
     if identities.is_empty() {
         return Err("the launch recorded no processes".into());
     }
     let mut live = Vec::new();
     for identity in identities {
+        let member = identity.is_helper()
+            || (identity.is_lmcache() && identity.role != capyctl_domain::completion::LMCACHE_ROLE);
         match capyctl_launchers::process_absence::presence(identity) {
             Presence::Alive => live.push(identity.clone()),
-            _ if identity.is_helper() => {}
+            _ if member => {}
             Presence::Gone => {
                 return Err(format!(
                     "recorded {} process {} is gone",
