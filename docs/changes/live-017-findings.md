@@ -73,6 +73,41 @@ then does the entry write its failure line and exit.
 
 CPU and Fake-engine tests are not qualification.
 
+## Live recheck
+
+On host A on 2026-10-22, with a release build of this branch at `90071793`
+(before its rebase onto #182, which changed only docs), the approved SGLang
+0.5.22 environment, Qwen3-4B-Instruct-2507 BF16, and a standalone role set up
+as in the live-017 run (managed limit 108 GiB, free reserve 8 GiB, engine logs
+not in debug mode).
+
+- **Scheduler SIGKILL during the weight load:** sent to `sglang::scheduler`
+  after `Load weight begin` and before `Load weight end`, its pid taken from
+  the recorded entry's process group after checking the entry's pid, start
+  ticks and boot id. The resource tracker was a member of that group. The
+  launch failed 2.31 s later as `launch_failed`; the process group was empty
+  at 2.23 s, the binding was released and no reservation was left. The engine
+  log's last line is `sglang_startup_failed: engine_launch_failed (…)`; no
+  `ResourceTracker` or `ChildProcessError` line and no `FileNotFoundError`
+  appear in it.
+- **Streamed hang-up before the first token** (two runs): a deployment with
+  `max_concurrent_requests: 1`, a streaming blocker, and a streamed victim
+  waiting in SGLang's queue (running 1, waiting 1) with no body byte received.
+  The victim's curl was SIGKILLed; the first status reading after it, taken
+  within 0.1 s, already counted it as cancelling (`settle_at_stop` 1). SGLang
+  dropped it from its queue 2.65 s and 2.44 s after the hang-up while the
+  blocker kept running; that delay is SGLang's own disconnect check. The
+  blocker, hung up after its first token, settled on the next idle reading
+  (0.39 s and 0.37 s after its hang-up), and the victim stayed held until the
+  stop settled it on its verified exit. Before the fix the same case was
+  counted about 10 s late, at the moment SGLang started the request.
+
+Evidence is on the laptop under `target/live/live-017-findings/`. The role was
+stopped and host A left with no engine, CapyCTL or GPU process, its ports free,
+and the 30 `/tmp` and `/dev/shm` entries the engines created removed. The
+killed launch's `/dev/shm/sglang_loads_*.shm` was among them: the tracker that
+would unlink it is ended with the rest of the tree.
+
 # Release note: Fixes
 
 - **A streamed request whose client hangs up before its first token is
