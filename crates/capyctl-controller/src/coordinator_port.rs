@@ -113,6 +113,9 @@ pub struct RoutingSignals {
     /// Owner decision 2026-09-23: whether this host's session is up but its
     /// heartbeats are silent past the suspend bound.
     pub host_unresponsive: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    /// ADR 0032 §2: whether this host's current session declares the agent's
+    /// request abort operation (`request_abort`).
+    pub host_request_abort: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
 }
 
 impl RoutingSignals {
@@ -128,8 +131,29 @@ impl RoutingSignals {
                 let sessions = sessions.clone();
                 std::sync::Arc::new(move |host: &str| sessions.unresponsive(host))
             },
+            host_request_abort: {
+                let sessions = sessions.clone();
+                std::sync::Arc::new(move |host: &str| sessions.supports_request_abort(host))
+            },
         }
     }
+}
+
+/// ADR 0032 §1 (ADR 0017): whether a lane's engine launch can abort a request
+/// by CapyCTL's ID: SGLang whose registered build (the effective profile's
+/// `build_fingerprint`, never the adapter's descriptor contract) and frozen
+/// tokenizer worker count pass
+/// [`capyctl_adapters::sglang::request_abort_supported`]. A remote lane also
+/// needs its host's session to declare the operation; that is checked apart.
+fn launch_aborts_requests(lane: &capyctl_store::serving::LaneEngine) -> bool {
+    lane.engine.as_deref() == Some("sglang")
+        && lane
+            .build_fingerprint
+            .as_deref()
+            .zip(lane.tokenizer_workers)
+            .is_some_and(|(version, workers)| {
+                capyctl_adapters::sglang::request_abort_supported(version, workers)
+            })
 }
 
 impl CoordinatorLifecycle {
@@ -214,7 +238,22 @@ impl CoordinatorLifecycle {
         self
     }
 
-    /// Project one retained binding into where its engine is reached.
+    /// ADR 0032 §1, §2: whether the lane of `lane` carries CapyCTL's request
+    /// ID and can abort it: a capable launch, and for a remote instance a host
+    /// session that declares the abort operation (a server without routing
+    /// signals knows no session, so it never offers it).
+    fn lane_aborts_requests(&self, lane: &capyctl_store::serving::LaneEngine) -> bool {
+        launch_aborts_requests(lane)
+            && lane.remote_host.as_deref().is_none_or(|host| {
+                self.routing
+                    .as_ref()
+                    .is_some_and(|routing| (routing.host_request_abort)(host))
+            })
+    }
+
+    /// Project one retained binding into where its engine is reached, with
+    /// the lane (ADR 0032) whose abort capability is decided once the owner
+    /// lock is released ([`Self::lane_aborts_requests`]).
     ///
     /// SPEC §3: endpoint, key and served name belong to one launch, read as one
     /// answer so a caller never pairs this launch's port with another's key.
@@ -223,7 +262,7 @@ impl CoordinatorLifecycle {
         deployment: &str,
         binding: capyctl_store::lifecycle::StoredRuntimeBinding,
         gate_open: bool,
-    ) -> Result<RuntimeEndpoint, LifecycleFault> {
+    ) -> Result<(RuntimeEndpoint, Option<capyctl_store::serving::LaneEngine>), LifecycleFault> {
         // The engine received the key hex-encoded, because it travels through an
         // environment variable; it is handed back in exactly that form so nothing
         // downstream has to guess at an encoding. It is never logged.
@@ -298,14 +337,29 @@ impl CoordinatorLifecycle {
         let engine = owner
             .store()
             .revision_engine(deployment, binding.revision)?;
-        Ok(RuntimeEndpoint {
-            endpoint,
-            served_model,
-            engine_key,
-            incarnation: binding.incarnation,
-            engine,
-            request_abort: false,
-        })
+        let lane = owner.store().lane_engine(&binding.id)?;
+        Ok((
+            RuntimeEndpoint {
+                endpoint,
+                served_model,
+                engine_key,
+                incarnation: binding.incarnation,
+                engine,
+                // Decided by the caller once the owner lock is released.
+                request_abort: false,
+            },
+            lane,
+        ))
+    }
+
+    /// The endpoint with its abort capability, read outside the owner lock
+    /// (a host's session is read under the sessions' own lock).
+    fn with_abort(
+        &self,
+        (mut endpoint, lane): (RuntimeEndpoint, Option<capyctl_store::serving::LaneEngine>),
+    ) -> RuntimeEndpoint {
+        endpoint.request_abort = lane.is_some_and(|lane| self.lane_aborts_requests(&lane));
+        endpoint
     }
 
     /// The idempotency key for an on-demand activation.
@@ -743,7 +797,9 @@ impl LifecyclePort for CoordinatorLifecycle {
         else {
             return Ok(None);
         };
-        Self::endpoint_of(&owner, deployment, binding, gate_open).map(Some)
+        let projected = Self::endpoint_of(&owner, deployment, binding, gate_open)?;
+        drop(owner);
+        Ok(Some(self.with_abort(projected)))
     }
 
     async fn open_request_lease(
@@ -865,7 +921,9 @@ impl LifecyclePort for CoordinatorLifecycle {
         else {
             return Ok(None);
         };
-        Self::endpoint_of(&owner, deployment, binding, gate_open).map(Some)
+        let projected = Self::endpoint_of(&owner, deployment, binding, gate_open)?;
+        drop(owner);
+        Ok(Some(self.with_abort(projected)))
     }
 
     async fn open_instance_lease(
@@ -893,6 +951,73 @@ impl LifecyclePort for CoordinatorLifecycle {
     /// ([`crate::group_stall::report`]).
     async fn report_group_stall(&self, deployment_id: &str, instance: u32, generation: i64) {
         crate::group_stall::report(&self.commands, deployment_id, instance, generation).await;
+    }
+
+    /// ADR 0032 §3: abort CapyCTL's request `request_id` on the engine of
+    /// exactly the incarnation `generation` names, through that binding's
+    /// retained driver, only on a capable lane: false, with nothing sent, on
+    /// any other lane, or once the incarnation holds no runtime.
+    async fn abort_request(&self, deployment_id: &str, generation: i64, request_id: &str) -> bool {
+        let lane = {
+            let Ok(owner) = self.commands.owner_for_read() else {
+                return false;
+            };
+            let Ok(Some((binding, _))) =
+                owner.store().serving_binding_at(deployment_id, generation)
+            else {
+                return false;
+            };
+            let Ok(Some(lane)) = owner.store().lane_engine(&binding.id) else {
+                return false;
+            };
+            (binding.id, lane)
+        };
+        let (binding_id, lane) = lane;
+        if !self.lane_aborts_requests(&lane) {
+            return false;
+        }
+        self.commands
+            .abort_request(deployment_id, &binding_id, request_id)
+            .await
+    }
+
+    /// ADR 0032 §4: the per-request acknowledgement, group-committed.
+    async fn acknowledge_cancelled_request(
+        &self,
+        lease_id: &str,
+    ) -> Result<bool, crate::request_leases::LeaseRefused> {
+        self.leases.acknowledge(lease_id).await
+    }
+
+    /// ADR 0032 §7: against the deployment limit the router grants under
+    /// (`MAX_REQUESTS_PER_DEPLOYMENT`). Restarting also when every instance
+    /// holding the requests is already stopping.
+    async fn restart_for_held_requests(
+        &self,
+        deployment_id: &str,
+    ) -> Result<crate::port::HeldRestart, LifecycleFault> {
+        use capyctl_store::ordinary_lifecycle::held_restart::HeldRestartDecision;
+        let decision = self.commands.restart_for_held_requests(
+            deployment_id,
+            capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT as usize,
+        )?;
+        Ok(match decision {
+            HeldRestartDecision::NotHeld => crate::port::HeldRestart::NotHeld,
+            HeldRestartDecision::Restarting { accepted } => {
+                for restarted in &accepted {
+                    capyctl_domain::role_log::notice(
+                        capyctl_domain::role_log::Level::Notice,
+                        &format!(
+                            "deployment {deployment_id} instance {}: its {} cancelled requests \
+                             that settle only at its next stop fill the deployment's limit; \
+                             restarting it (stop operation {})",
+                            restarted.instance_index, restarted.count, restarted.operation_id
+                        ),
+                    );
+                }
+                crate::port::HeldRestart::Restarting
+            }
+        })
     }
 
     async fn observe_adapter(&self, _deployment: &str) -> Result<WorkObservation, LifecycleFault> {

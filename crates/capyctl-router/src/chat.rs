@@ -345,7 +345,8 @@ pub async fn dispatch_timed(
     // ADR 0013 §10 (I3): choose an instance, open its lease and resolve its
     // forwarder. Nothing has been sent yet: a refusal releases the guard on drop.
     let started = std::time::Instant::now();
-    let mut plan = crate::balance::Plan::new(deps, &deployment_id, view, ids)?;
+    let deadline = received + deps.inflight.waiting.limits().deadline;
+    let mut plan = crate::balance::Plan::new(deps, &deployment_id, view, ids, deadline)?;
     timing.selected(started.elapsed());
     let started = std::time::Instant::now();
     let first = plan.next().await?;
@@ -378,33 +379,64 @@ pub async fn dispatch_timed(
             let generation = attempt.generation;
             timing.forwarding(attempt.instance, generation);
             let progress = crate::stream::Progress::default();
-            let mut observer = crate::stream::ProgressOnly::new(progress.clone());
+            // ADR 0032 §1: on a capable lane the observer names CapyCTL's
+            // request ID, which the forwarder sends to the engine.
+            let mut observer =
+                crate::stream::ProgressOnly::new(progress.clone()).carrying(attempt.request_id());
+            let discard = observer.discard_switch();
             // ADR 0028 §11: a request to a group's head is watched for its
             // first token; the watch holds nothing of the response.
             let stall = attempt.stall.take();
-            let forward = async {
-                match endpoint {
-                    Endpoint::ChatCompletions => {
-                        crate::stream::bounded(
-                            attempt.forward.forward_chat_observed(&body, &mut observer),
-                            &progress,
-                            &bounds,
-                            stall,
-                        )
-                        .await
+            let bounded = match endpoint {
+                Endpoint::ChatCompletions => {
+                    let after_cut = attempt.after_cut();
+                    let forwarder = attempt.forward.clone();
+                    let mut forward =
+                        std::pin::pin!(forwarder.forward_chat_observed(&body, &mut observer));
+                    let bounded = unless_hung_up(
+                        crate::stream::bounded(forward.as_mut(), &progress, &bounds, stall),
+                        &mut reply,
+                    )
+                    .await;
+                    match (bounded, after_cut) {
+                        // ADR 0032 §3: a cut on a capable lane (a hang-up,
+                        // the deadline, the idle bound) settles and answers
+                        // exactly as below, then keeps reading the same
+                        // response, discarding it, after asking the engine
+                        // to abort the request.
+                        (Err(()), Some(after_cut)) => {
+                            discard.store(true, std::sync::atomic::Ordering::SeqCst);
+                            let answered = progress.produced();
+                            let cut_by = if reply.is_closed() {
+                                crate::stream::CutBy::HangUp
+                            } else {
+                                crate::stream::CutBy::bound(answered)
+                            };
+                            if attempt.settle(LeaseEnd::Cancelling { answered }).await {
+                                guard.release();
+                            }
+                            let _ = reply.send(Err(Refused::Uncertain));
+                            after_cut
+                                .read(cut_by, forward, bounds.idle, |ended| ended.is_ok())
+                                .await;
+                            return;
+                        }
+                        (bounded, _) => bounded,
                     }
-                    Endpoint::Decisions => {
+                }
+                Endpoint::Decisions => {
+                    unless_hung_up(
                         crate::stream::bounded(
                             attempt.forward.forward_decision(&body),
                             &progress,
                             &bounds,
                             stall,
-                        )
-                        .await
-                    }
+                        ),
+                        &mut reply,
+                    )
+                    .await
                 }
             };
-            let bounded = unless_hung_up(forward, &mut reply).await;
             // SPEC §10 (found live 2026-10-02): a cut drops the forward, which
             // closes the engine connection, so the lease is cancelling, as for
             // a stream whose client hung up. Amended 2026-10-21: so does a
@@ -640,25 +672,71 @@ pub fn validate_request(
     })
 }
 
-/// Open the durable lease for one dispatch (SPEC §10). `None` only from an
-/// authority that keeps no ledger at all.
-pub(crate) async fn open_lease(
+/// The answer to a refused durable lease grant for one dispatch (SPEC §10).
+/// A full bound is answered so only once [`restart_when_full`] found no
+/// restart to wait for.
+pub(crate) fn lease_refusal(
+    deployment: &str,
+    refused: LeaseRefused,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match refused {
+        // SPEC §§6.1, 13.2: the gate closed (a host draining or re-proving
+        // readiness, a stop in progress). Retryable, never a 500.
+        LeaseRefused::Closed => err(
+            "unavailable",
+            &format!("dispatch to deployment {deployment} is closed; retry shortly"),
+        ),
+        LeaseRefused::Full => queue_full(),
+        LeaseRefused::Unavailable(reason) => err("unavailable", &reason),
+    }
+}
+
+/// SPEC §10 (T19): the deployment's durable bound of outstanding requests is
+/// reached.
+fn queue_full() -> (StatusCode, Json<serde_json::Value>) {
+    err("queue_full", "outstanding request bound reached")
+}
+
+/// ADR 0032 §7: the deployment's durable lease bound refused a grant as full.
+/// When every open lease of `deployment` is a cancelled request that settles
+/// only at its instance's next stop, the authority restarts each instance
+/// holding them; the request then waits for the restart as for an
+/// activation (joining the deployment's one activation, SPEC §10 step 2),
+/// until `deadline`, and `Ok` lets the caller ask for its grant again.
+/// Otherwise the refusal stands: `queue_full`, as before.
+pub(crate) async fn restart_when_full(
     deps: &RouterDeps,
     deployment: &str,
-) -> Result<Option<RequestLease>, (StatusCode, Json<serde_json::Value>)> {
-    deps.controller
-        .open_request_lease(deployment, deps.limits.max_requests_per_deployment)
-        .await
-        .map_err(|refused| match refused {
-            // SPEC §§6.1, 13.2: the gate closed (a host draining or re-proving
-            // readiness, a stop in progress). Retryable, never a 500.
-            LeaseRefused::Closed => err(
-                "unavailable",
-                &format!("dispatch to deployment {deployment} is closed; retry shortly"),
+    deadline: tokio::time::Instant,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(queue_full());
+    }
+    match deps.controller.restart_for_held_requests(deployment).await {
+        Ok(capyctl_controller::HeldRestart::Restarting) => {}
+        Ok(capyctl_controller::HeldRestart::NotHeld) => return Err(queue_full()),
+        Err(fault) => {
+            capyctl_domain::role_log::notice(
+                capyctl_domain::role_log::Level::Warning,
+                &format!(
+                    "deployment {deployment}: could not ask for a restart of instances holding \
+                     requests until their stop: {fault}"
+                ),
+            );
+            return Err(queue_full());
+        }
+    }
+    match tokio::time::timeout_at(deadline, join_activation(deps, deployment)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(refusal)) => Err(refusal),
+        Err(_) => Err(err(
+            "unavailable",
+            &format!(
+                "deployment {deployment} was restarting to settle requests held until its stop \
+                 and did not become servable within the queue deadline; retry shortly"
             ),
-            LeaseRefused::Full => err("queue_full", "outstanding request bound reached"),
-            LeaseRefused::Unavailable(reason) => err("unavailable", &reason),
-        })
+        )),
+    }
 }
 
 /// Close or retain a lease on the evidence. A failed write leaves it charged,

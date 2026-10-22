@@ -2,6 +2,9 @@
 //! forwards engine chunks as SSE `data:` frames, ends with `data: [DONE]`,
 //! and releases the in-flight guard only on verified backend completion.
 //! A client hang-up closes the engine connection; accounting stays charged until the engine reports quiescence (SPEC §10).
+//! ADR 0032: on an SGLang lane with the per-request abort, a cut instead asks
+//! the engine to abort the request and keeps reading its response, which
+//! settles the lease when it ends with the request's own final output.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -166,6 +169,11 @@ pub(crate) async fn bounded<F: Future>(
 pub(crate) struct ProgressOnly {
     progress: Progress,
     pub(crate) generated: Option<std::time::Instant>,
+    /// ADR 0032 §1: CapyCTL's request ID, on a capable lane only.
+    request_id: Option<String>,
+    /// ADR 0032 §3: set at a cut on a capable lane; from then on the response
+    /// read after the abort is discarded and records nothing.
+    discard: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ProgressOnly {
@@ -173,24 +181,48 @@ impl ProgressOnly {
         Self {
             progress,
             generated: None,
+            request_id: None,
+            discard: Arc::default(),
         }
+    }
+
+    /// ADR 0032 §1: name `request_id` to the forwarder (a capable lane's).
+    pub(crate) fn carrying(mut self, request_id: Option<String>) -> Self {
+        self.request_id = request_id;
+        self
+    }
+
+    /// ADR 0032 §3: the switch that puts this sink in discard mode, held by
+    /// the router while the forward borrows the sink.
+    pub(crate) fn discard_switch(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.discard.clone()
+    }
+
+    fn discarding(&self) -> bool {
+        self.discard.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
 #[async_trait::async_trait]
 impl ChatSink for ProgressOnly {
+    fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
     fn progressed(&mut self) {
-        self.progress.mark();
+        if !self.discarding() {
+            self.progress.mark();
+        }
     }
 
     fn collected(&mut self, chunk: &str) {
-        if self.generated.is_none() && crate::timing::carries_content(chunk) {
+        if !self.discarding() && self.generated.is_none() && crate::timing::carries_content(chunk) {
             self.generated = Some(std::time::Instant::now());
         }
     }
 
     async fn send(&mut self, chunk: String) -> Result<(), DeliveryFailed> {
-        if !capyctl_adapters::forward::opens_reply_only(&chunk) {
+        if !self.discarding() && !capyctl_adapters::forward::opens_reply_only(&chunk) {
             self.progress.mark();
         }
         Ok(())
@@ -207,15 +239,61 @@ struct ResponseSink {
     /// SPEC §17 (owner decision 2026-10-09): what the engine reported about
     /// this request, read from the chunks that carry it.
     report: crate::engine_metrics::EngineReport,
+    /// ADR 0032 §1: CapyCTL's request ID while the attempt's lane is capable,
+    /// `None` elsewhere.
+    request_id: Option<String>,
+    /// ADR 0032 §3: set when a stream on a capable lane is cut, by the router
+    /// or by this sink's own failed delivery. From then on nothing more
+    /// reaches the client, and what the forward reads is discarded.
+    cut: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl ResponseSink {
+    fn discarding(&self) -> bool {
+        self.request_id.is_some() && *self.cut.borrow()
+    }
+
+    /// Deliver one event within the 10 s bound. On a capable lane the
+    /// delivery also ends at a cut, so a send waiting on a slow client never
+    /// outlives the cut.
+    async fn deliver(&self, event: Event) -> bool {
+        let bound = std::time::Duration::from_secs(10);
+        if self.request_id.is_none() {
+            return matches!(
+                tokio::time::timeout(bound, self.tx.send(Ok(event))).await,
+                Ok(Ok(()))
+            );
+        }
+        let mut cut = self.cut.subscribe();
+        let delivery = async {
+            tokio::select! {
+                biased;
+                _ = cut.wait_for(|cut| *cut) => false,
+                sent = self.tx.send(Ok(event)) => sent.is_ok(),
+            }
+        };
+        tokio::time::timeout(bound, delivery).await == Ok(true)
+    }
 }
 
 #[async_trait::async_trait]
 impl ChatSink for ResponseSink {
+    fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
     fn progressed(&mut self) {
-        self.progress.mark();
+        if !self.discarding() {
+            self.progress.mark();
+        }
     }
 
     async fn send(&mut self, chunk: String) -> Result<(), DeliveryFailed> {
+        // ADR 0032 §3: after a cut on a capable lane the forward keeps
+        // reading, and what it reads is discarded.
+        if self.discarding() {
+            return Ok(());
+        }
         // SPEC §10 (found live 2026-10-02): a chunk that only opens the reply is
         // relayed, but until the first output the request deadline bounds the
         // stream, not the idle bound.
@@ -237,21 +315,179 @@ impl ChatSink for ResponseSink {
         // Set failure before awaiting so cancellation by the adapter's delivery
         // deadline cannot later append a successful terminal to partial output.
         self.failed = true;
-        if chunk.len() > MAX_CHUNK_BYTES {
-            return Err(DeliveryFailed);
-        }
-        if !matches!(
-            tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                self.tx.send(Ok(Event::default().data(chunk)))
-            )
-            .await,
-            Ok(Ok(()))
-        ) {
+        let delivered =
+            chunk.len() <= MAX_CHUNK_BYTES && self.deliver(Event::default().data(chunk)).await;
+        if !delivered {
+            // ADR 0032 §3: on a capable lane a failed, slow or oversized
+            // delivery is a cut the router acts on (it aborts the request
+            // and reads it to its end); the forward is not ended here.
+            if self.request_id.is_some() {
+                self.cut.send_replace(true);
+                return Ok(());
+            }
             return Err(DeliveryFailed);
         }
         self.failed = false;
         Ok(())
+    }
+}
+
+/// ADR 0032 §3–§4: reading a request cut on a capable lane to its own end.
+/// The lease is already cancelling and the client already answered; nothing
+/// read here reaches it.
+pub(crate) struct AfterCut {
+    pub(crate) authority: Arc<dyn capyctl_controller::LifecyclePort>,
+    pub(crate) deployment: String,
+    pub(crate) generation: i64,
+    /// CapyCTL's request ID, the engine's `rid`.
+    pub(crate) request_id: String,
+    /// The cut attempt's own lease.
+    pub(crate) lease_id: String,
+    pub(crate) ids: Arc<crate::request_id::RequestIds>,
+}
+
+/// ADR 0032 §3: what cut a request on a capable lane, for its role-log line.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CutBy {
+    /// The client went away (its stream body or its answer's receiver).
+    HangUp,
+    /// A failed, slow or oversized delivery to the client.
+    Delivery,
+    /// No output by the request's deadline.
+    Deadline,
+    /// No output within the stream idle bound after the last.
+    Idle,
+}
+
+impl CutBy {
+    /// A bound cut: before any output it is the deadline's, after it the
+    /// idle bound's (`bounded` arms them so).
+    pub(crate) fn bound(answered: bool) -> Self {
+        if answered {
+            Self::Idle
+        } else {
+            Self::Deadline
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::HangUp => "hang_up",
+            Self::Delivery => "delivery",
+            Self::Deadline => "deadline",
+            Self::Idle => "idle",
+        }
+    }
+}
+
+impl AfterCut {
+    /// Ask the engine to abort the request once, keep polling the same
+    /// `forward` meanwhile, and bound the rest of the read by `idle` (the
+    /// stream idle bound) counted from the abort, never re-armed by progress.
+    /// If the forward ends with the request's final output read whole
+    /// (`final_output`) within that bound, the lease is acknowledged by its
+    /// own evidence. Anything else (the abort not sent, the bound passed, an
+    /// error or a truncated end) returns at once, and the caller drops the
+    /// forward, which closes the engine connection; the lease then settles
+    /// by today's rule (SPEC §10). Both steps are role-logged with the
+    /// request's IDs and the lease (`router_request_abort`,
+    /// `router_abort_settled`).
+    pub(crate) async fn read<F: Future>(
+        self,
+        cut: CutBy,
+        mut forward: std::pin::Pin<&mut F>,
+        idle: std::time::Duration,
+        final_output: impl Fn(&F::Output) -> bool,
+    ) {
+        let asked = tokio::time::Instant::now();
+        let abort = tokio::time::timeout(
+            idle,
+            self.authority
+                .abort_request(&self.deployment, self.generation, &self.request_id),
+        );
+        tokio::pin!(abort);
+        // The response is read while the abort is asked, so the engine is
+        // never held back by an unread connection.
+        let mut ended = None;
+        let sent = loop {
+            tokio::select! {
+                biased;
+                sent = &mut abort => break sent.unwrap_or(false),
+                output = forward.as_mut(), if ended.is_none() => ended = Some(output),
+            }
+        };
+        self.log(serde_json::json!({
+            "event": "router_request_abort",
+            "cut": cut.name(),
+            "sent": sent,
+        }));
+        let outcome = self.settle(sent, ended, forward, idle, final_output).await;
+        let (settled, reason) = match outcome {
+            Ok(()) => ("acknowledged", None),
+            Err(reason) => ("fallback", Some(reason)),
+        };
+        self.log(serde_json::json!({
+            "event": "router_abort_settled",
+            "outcome": settled,
+            "reason": reason,
+            "elapsed_ms": u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX),
+        }));
+    }
+
+    /// The rest of [`AfterCut::read`] once the abort was asked: `Ok` when the
+    /// lease was acknowledged, else why it was left to today's rule.
+    async fn settle<F: Future>(
+        &self,
+        sent: bool,
+        ended: Option<F::Output>,
+        forward: std::pin::Pin<&mut F>,
+        idle: std::time::Duration,
+        final_output: impl Fn(&F::Output) -> bool,
+    ) -> Result<(), &'static str> {
+        if !sent {
+            return Err("abort_not_sent");
+        }
+        let output = match ended {
+            Some(output) => output,
+            None => tokio::time::timeout(idle, forward)
+                .await
+                .map_err(|_| "bound_passed")?,
+        };
+        if !final_output(&output) {
+            return Err("no_final_output");
+        }
+        match self
+            .authority
+            .acknowledge_cancelled_request(&self.lease_id)
+            .await
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("lease_not_cancelling"),
+            // A failed write leaves the lease charged, which is the
+            // conservative outcome; it is reported as a failed close is.
+            Err(error) => {
+                capyctl_domain::role_log::notice(
+                    capyctl_domain::role_log::Level::Warning,
+                    &format!(
+                        "request lease {} stays charged: {error}{}",
+                        self.lease_id,
+                        self.ids.log_suffix()
+                    ),
+                );
+                Err("acknowledgement_failed")
+            }
+        }
+    }
+
+    /// One role-log line about this request, with its IDs and lease.
+    fn log(&self, mut event: serde_json::Value) {
+        if let Some(fields) = event.as_object_mut() {
+            fields.insert("deployment".into(), self.deployment.clone().into());
+            fields.insert("generation".into(), self.generation.into());
+            fields.insert("lease".into(), self.lease_id.clone().into());
+        }
+        self.ids.log_fields(&mut event);
+        capyctl_domain::role_log::event(event);
     }
 }
 
@@ -308,6 +544,10 @@ pub fn stream_planned_timed(
     bounds: StreamBounds,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(16);
+    // ADR 0032 §3: a cut on a capable lane ends the client's stream at once
+    // (after what is already queued), while the forward goes on being read.
+    let cut = Arc::new(tokio::sync::watch::Sender::new(false));
+    let mut client_cut = cut.subscribe();
     let pump = tokio::spawn(async move {
         // Accounting was registered BEFORE stream_response (the caller
         // enforces the in-flight bound synchronously). SPEC §10 (amended
@@ -323,6 +563,8 @@ pub fn stream_planned_timed(
             timing,
             progress: progress.clone(),
             report: Default::default(),
+            request_id: None,
+            cut: cut.clone(),
         };
         let mut attempt = first;
         let mut durable = false;
@@ -332,6 +574,10 @@ pub fn stream_planned_timed(
         let (result, refusal) = loop {
             let generation = attempt.generation;
             sink.timing.forwarding(attempt.instance, generation);
+            // ADR 0032 §1: on a capable lane the sink names CapyCTL's request
+            // ID, which the forwarder sends to the engine.
+            sink.request_id = attempt.request_id();
+            let capable = sink.request_id.is_some();
             let stall = attempt.stall.take();
             // SPEC §10 (found live 2026-10-22): the client's hang-up is
             // noticed when its response body is dropped, not at the next
@@ -341,17 +587,50 @@ pub fn stream_planned_timed(
             // the engine connection; a forward whose end is ready at the
             // same moment still ends with that end.
             let gone = sink.tx.clone();
-            let result = tokio::select! {
-                biased;
-                result = bounded(
-                    attempt.forward.forward_chat_stream_async(&body, &mut sink),
-                    &progress,
-                    &bounds,
-                    stall,
-                ) => result,
-                () = gone.closed() => Ok(Ok(StreamEnded::Cancelled)),
+            let mut delivery_cut = cut.subscribe();
+            let result = {
+                let forwarder = attempt.forward.clone();
+                let mut forward =
+                    std::pin::pin!(forwarder.forward_chat_stream_async(&body, &mut sink));
+                // `cut_by`: the router cut the forward, which has not ended.
+                let (result, cut_by) = tokio::select! {
+                    biased;
+                    result = bounded(forward.as_mut(), &progress, &bounds, stall) => {
+                        let cut_by = result.is_err().then(|| CutBy::bound(progress.produced()));
+                        (result, cut_by)
+                    }
+                    () = gone.closed() => (Ok(Ok(StreamEnded::Cancelled)), Some(CutBy::HangUp)),
+                    // ADR 0032 §3: on a capable lane a failed or slow
+                    // delivery leaves the forward reading; the sink marks
+                    // the cut instead.
+                    _ = delivery_cut.wait_for(|cut| *cut), if capable => {
+                        (Ok(Ok(StreamEnded::Cancelled)), Some(CutBy::Delivery))
+                    }
+                };
+                drop(gone);
+                // ADR 0032 §3: a cut on a capable lane (a hang-up, a failed or
+                // slow delivery, the first-output deadline, the idle bound)
+                // settles the lease as below and ends the client's stream,
+                // then reads the same response to its own end, discarding
+                // it, after asking the engine to abort the request.
+                if let Some((cut_by, after_cut)) =
+                    cut_by.and_then(|cut_by| Some((cut_by, attempt.after_cut()?)))
+                {
+                    let end = stream_lease_end(&result, progress.produced());
+                    let durable = attempt.settle(end).await;
+                    cut.send_replace(true);
+                    if durable {
+                        guard.release();
+                    }
+                    after_cut
+                        .read(cut_by, forward, bounds.idle, |ended| {
+                            matches!(ended, Ok(StreamEnded::Completed))
+                        })
+                        .await;
+                    return;
+                }
+                result
             };
-            drop(gone);
             if matches!(result, Ok(Ok(StreamEnded::Completed))) {
                 completed = Some(attempt);
                 break (result, None);
@@ -491,8 +770,29 @@ pub fn stream_planned_timed(
         drop(sink);
     });
     let stream = async_stream::stream! {
-        while let Some(ev) = rx.recv().await {
-            yield ev;
+        // ADR 0032 §3: at a cut on a capable lane the channel takes nothing
+        // more; what was already queued is still delivered, as when a cut
+        // dropped the sink. The cut is also read once the pump has ended,
+        // when the channel has no sender left anyway.
+        let mut open = true;
+        loop {
+            let next = if open {
+                tokio::select! {
+                    biased;
+                    _ = client_cut.wait_for(|cut| *cut) => None,
+                    event = rx.recv() => Some(event),
+                }
+            } else {
+                Some(rx.recv().await)
+            };
+            match next {
+                None => {
+                    rx.close();
+                    open = false;
+                }
+                Some(Some(event)) => yield event,
+                Some(None) => break,
+            }
         }
         let _ = pump.is_finished();
     };

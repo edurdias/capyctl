@@ -1291,7 +1291,53 @@ impl HostJournal {
         let MemberAction::Probe { owned_handle, .. } = &probe.action else {
             return Err(JournalError::Unauthorized);
         };
-        let owned_handle = owned_handle.as_str();
+        // ADR 0028 §9 (decided 2026-10-06): a completion probe also reaches a
+        // group's head, the only member that serves; a readiness probe still
+        // re-proves a single launch only.
+        let completion = matches!(
+            probe.action,
+            MemberAction::Probe {
+                max_tokens: Some(_),
+                ..
+            }
+        );
+        self.serving_target(probe, owned_handle, completion)
+    }
+
+    /// ADR 0032 §3: the launch an AbortRequest may post to. It is the launch
+    /// a fresh probe could question ([`Self::probe_target`]'s checks: claim
+    /// retained, launched, ready on its saved evidence, resident, the same
+    /// live engine group), of the command's member, deployment and profile,
+    /// and of exactly the command's generation: `same_owner` does not compare
+    /// generations, and an abort for another generation of the deployment
+    /// never reaches this launch's engine. A group's head serves, so it may
+    /// be named; a worker never.
+    pub fn abort_target(self: &Arc<Self>, abort: &MemberCommand) -> Result<(), JournalError> {
+        self.validate()?;
+        let MemberAction::AbortRequest { owned_handle, .. } = &abort.action else {
+            return Err(JournalError::Unauthorized);
+        };
+        let owner = {
+            let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+            load_command(&db, owned_handle).map_err(|_| JournalError::Uncertain)?
+        };
+        let declared = abort.identity.instance_index;
+        if owner.identity.generation != abort.identity.generation
+            || (declared != 0 && declared != owner.identity.instance_index)
+        {
+            return Err(JournalError::Uncertain);
+        }
+        self.serving_target(abort, owned_handle, true).map(|_| ())
+    }
+
+    /// The group a command naming the serving launch `owned_handle` must find
+    /// alive: see [`Self::probe_target`]. `head`: a group's head may be named.
+    fn serving_target(
+        self: &Arc<Self>,
+        command: &MemberCommand,
+        owned_handle: &str,
+        head: bool,
+    ) -> Result<Vec<ProcessIdentity>, JournalError> {
         let (owner, record, saved) = {
             let db = self.db.lock().map_err(|_| JournalError::Storage)?;
             let saved: Vec<u8> = db
@@ -1313,22 +1359,12 @@ impl HostJournal {
                 saved,
             )
         };
-        // ADR 0028 §9 (decided 2026-10-06): a completion probe also reaches a
-        // group's head, the only member that serves; a readiness probe still
-        // re-proves a single launch only.
-        let completion = matches!(
-            probe.action,
-            MemberAction::Probe {
-                max_tokens: Some(_),
-                ..
-            }
-        );
         let target = match &owner.action {
             MemberAction::LaunchSingle(_) => true,
-            MemberAction::Launch { member, .. } => completion && member.service_port != 0,
+            MemberAction::Launch { member, .. } => head && member.service_port != 0,
             _ => false,
         };
-        if !same_owner(&owner, probe)
+        if !same_owner(&owner, command)
             || !target
             || !record.claim_retained
             || record.state != CommandState::Launched

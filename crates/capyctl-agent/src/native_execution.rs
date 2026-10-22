@@ -63,6 +63,8 @@ mod coresidence;
 // ADR 0028 §12 (R12): each SGLang group member's saver map, reported by its
 // own host on its session.
 mod member_savers;
+// ADR 0032 §3: the request abort of a retained SGLang launch, on loopback.
+mod request_abort;
 
 /// The longest one fresh `/v1/models` readiness read may take.
 const PROBE_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1573,7 +1575,8 @@ impl NativeHostExecution {
                     custom::engine_access(
                         effective.profile.engine,
                         effective.profile.custom.as_ref(),
-                    ),
+                    )
+                    .with_request_abort(request_abort::request_abort_capable(&effective)),
                 )
                 .map_err(|_| SessionError)?;
         }
@@ -1878,6 +1881,14 @@ impl NativeHostExecution {
         }
         if let MemberAction::EngineLogTail(plan) = &command.action {
             return self.engine_log_tail(&command, plan).await;
+        }
+        // ADR 0032 §3: never journaled; bound to its retained launch there.
+        if let MemberAction::AbortRequest {
+            owned_handle,
+            request_id,
+        } = &command.action
+        {
+            return self.abort_request(&command, owned_handle, request_id).await;
         }
         // ADR 0028 §7: a group Prepare is checked here and never journaled.
         if let MemberAction::Prepare(plan) = &command.action {

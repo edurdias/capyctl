@@ -470,6 +470,24 @@ impl TryFrom<pb::EngineLogTailRequest> for EngineLogTailPlan {
     }
 }
 
+/// ADR 0032 §3: the `expected_state` an AbortRequest's identity carries. An
+/// abort holds for a serving launch whatever its instance is doing (Ready,
+/// or draining before a stop), so it names its own tag rather than a state.
+pub const ABORT_REQUEST_STATE: &str = "abort_request";
+
+/// ADR 0032 §1, §2: CapyCTL's request ID as the router issues it, a ULID in
+/// its canonical text: 26 characters of Crockford base32 (upper case, no
+/// I, L, O or U), the first at most `7` so it fits 128 bits. The host
+/// ingress and the AbortRequest action take nothing else, so the ID that
+/// becomes SGLang's `rid` is never free text.
+pub fn is_request_id(value: &str) -> bool {
+    value.len() == 26
+        && value.as_bytes()[0] <= b'7'
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b.is_ascii_uppercase() && !b"ILOU".contains(&b)))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemberAction {
     Prepare(GroupPlan),
@@ -547,6 +565,17 @@ pub enum MemberAction {
     /// retained launch's engine log. Read-only; its result carries only the
     /// tail evidence.
     EngineLogTail(EngineLogTailPlan),
+    /// ADR 0032 §3 (additive): ask the engine of the retained launch
+    /// `owned_handle` (its launch command id) to abort the request whose
+    /// CapyCTL request ID is `request_id` (SGLang's `rid`). The identity's
+    /// deployment, member, profile and generation must be the launch's own;
+    /// the host posts the abort on the engine's loopback port with the
+    /// launch's key, never through its ingress. It records nothing; its
+    /// answer is never evidence that the request ended.
+    AbortRequest {
+        owned_handle: String,
+        request_id: String,
+    },
 }
 
 impl MemberAction {
@@ -801,6 +830,14 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
             Action::DigestCheckpoint(plan) => MemberAction::DigestCheckpoint(plan.try_into()?),
             Action::MaterializeSource(plan) => MemberAction::MaterializeSource(plan.try_into()?),
             Action::EngineLogTail(plan) => MemberAction::EngineLogTail(plan.try_into()?),
+            Action::AbortRequest(abort)
+                if owned_handle_ok(&abort.owned_handle) && is_request_id(&abort.request_id) =>
+            {
+                MemberAction::AbortRequest {
+                    owned_handle: abort.owned_handle,
+                    request_id: abort.request_id,
+                }
+            }
             // SPEC §13.1, T34: an action this build does not know (including a
             // newer peer's field, which decodes as no action) is never guessed.
             _ => return Err(GroupIdentityError),
@@ -873,6 +910,13 @@ impl MemberCommand {
                 MemberAction::DigestCheckpoint(plan) => Action::DigestCheckpoint(plan.to_wire()),
                 MemberAction::MaterializeSource(plan) => Action::MaterializeSource(plan.to_wire()),
                 MemberAction::EngineLogTail(plan) => Action::EngineLogTail(plan.to_wire()),
+                MemberAction::AbortRequest {
+                    owned_handle,
+                    request_id,
+                } => Action::AbortRequest(pb::AbortRequestCommand {
+                    owned_handle: owned_handle.clone(),
+                    request_id: request_id.clone(),
+                }),
             }),
             restore_checkpoint_digest: match &self.action {
                 MemberAction::Restore {
@@ -1094,15 +1138,32 @@ pub fn validate_result(
             return Err(GroupIdentityError);
         }
     }
-    // A probe, park or restore reports on exactly the launch it names, whatever
-    // the outcome.
+    // A probe, park, restore or abort reports on exactly the launch it names,
+    // whatever the outcome.
     if let MemberAction::Probe { owned_handle, .. }
     | MemberAction::Park { owned_handle }
-    | MemberAction::Restore { owned_handle, .. } = &command.action
+    | MemberAction::Restore { owned_handle, .. }
+    | MemberAction::AbortRequest { owned_handle, .. } = &command.action
     {
         if result.owned_handle != *owned_handle {
             return Err(GroupIdentityError);
         }
+    }
+    // ADR 0032 §3: an abort answers `completed` (posted and answered, or
+    // refused with nothing posted) or `attempted` (posted, no answer), and
+    // carries nothing but its launch's handle: no claim, process, binding or
+    // evidence. Only a completed one may carry a refusal.
+    if matches!(command.action, MemberAction::AbortRequest { .. })
+        && (!matches!(result.state.as_str(), "completed" | "attempted")
+            || result.claim_retained
+            || result.model_usable
+            || !result.processes.is_empty()
+            || !result.binding_id.is_empty()
+            || !result.incarnation.is_empty()
+            || !result.launch_failure.is_empty()
+            || result.residency.is_some())
+    {
+        return Err(GroupIdentityError);
     }
     // Residency evidence belongs to Park and Restore results only.
     let residency = match (&command.action, &result.residency) {
@@ -1345,6 +1406,24 @@ pub fn is_prepare_refusal(reason: &str) -> bool {
             })
 }
 
+/// ADR 0032 §3: the closed codes a host refuses an AbortRequest with, having
+/// posted nothing. `launch_not_retained`: the command does not name a launch
+/// this host retains for its deployment, member, profile and generation (a
+/// handle it never launched or no longer claims, a forged deployment, another
+/// generation), or that launch is not serving (parked, or its engine is no
+/// longer the group that proved it ready), or its credentials are gone.
+/// `request_abort_unsupported`: the retained launch's engine lacks the
+/// capability (SGLang 0.5.22 with one tokenizer worker, ADR 0017), or the
+/// document it was approved under no longer resolves to show it has it.
+/// `deadline_passed`: the command's deadline had passed on the host's clock
+/// when it arrived; an abort is too short-lived to end a session over clock
+/// skew, so it is answered instead.
+pub const ABORT_REFUSALS: &[&str] = &[
+    "launch_not_retained",
+    "request_abort_unsupported",
+    "deadline_passed",
+];
+
 /// SPEC §13: a policy refusal is terminal evidence that nothing happened. A
 /// refused launch completed with no claim, no process and no usable model; a
 /// refused Park or Restore left the launch `unchanged`. ADR 0028 §7: a refused
@@ -1352,7 +1431,9 @@ pub fn is_prepare_refusal(reason: &str) -> bool {
 /// every Prepare result by [`validate_prepare`]). ADR 0028 §8 (R7): a group
 /// Launch whose host checks fail again at launch is refused like a single
 /// launch, with either a closed group code or a closed policy category, and
-/// names no binding. No other action carries a refusal.
+/// names no binding. ADR 0032 §3: a refused AbortRequest carries one closed
+/// abort code ([`ABORT_REFUSALS`]) and names only its launch's handle. No
+/// other action carries a refusal.
 fn validate_refusal(
     command: &MemberCommand,
     result: &pb::MemberExecutionResult,
@@ -1374,6 +1455,13 @@ fn validate_refusal(
         MemberAction::Park { .. } | MemberAction::Restore { .. } => {
             (unchanged, is_policy_refusal(&result.refused))
         }
+        // ADR 0032 §3: nothing was posted to the engine.
+        MemberAction::AbortRequest { owned_handle, .. } => (
+            !result.claim_retained
+                && result.processes.is_empty()
+                && result.owned_handle == *owned_handle,
+            ABORT_REFUSALS.contains(&result.refused.as_str()),
+        ),
         MemberAction::Prepare(_) => (true, is_prepare_refusal(&result.refused)),
         MemberAction::Launch { .. } => (
             !result.claim_retained

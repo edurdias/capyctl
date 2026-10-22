@@ -23,6 +23,9 @@ use super::{
 };
 use crate::traits::*;
 
+/// ADR 0032 §3: how long an abort request to the engine may take.
+const ABORT_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Fresh facts from a trusted local collector, not an engine HTTP response.
 /// `quiesced` requires a verified all-work barrier or confirmed terminal results
 /// for every registered request. Missing metrics must set `unknown_work`.
@@ -797,12 +800,25 @@ impl EngineAdapter for SglangAdapter {
     async fn observe_work(&self, _member: &MemberRef) -> Result<WorkObservation, AdapterError> {
         Ok(WorkObservation::Unknown)
     }
+    /// ADR 0032 §3: ask the engine to abort CapyCTL's request `request.id` (its
+    /// `rid`) on its loopback port with the launch's admin key, within
+    /// [`ABORT_BOUND`]. The engine's answer is not evidence that the request
+    /// stopped, so a delivered abort is `Uncertain`; only the request's own
+    /// final output, read by the router, settles it. An abort that could not
+    /// be sent or was refused (no credentials, a transport failure, a non-2xx
+    /// answer) is an error.
     async fn cancel_work(
         &self,
         _member: &MemberRef,
-        _request: &RequestRef,
+        request: &RequestRef,
         _require_ack: bool,
     ) -> Result<CancellationOutcome, AdapterError> {
+        let Some(http) = &self.http else {
+            return Err(AdapterError::Uncertain(
+                "SGLang abort needs the launch's admin key".into(),
+            ));
+        };
+        http.abort_request(&request.id, ABORT_BOUND).await?;
         Ok(CancellationOutcome::Uncertain)
     }
     /// Owner decision 2026-10-09: the wake canary of an embedded launch, the

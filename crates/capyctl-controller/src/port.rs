@@ -290,7 +290,12 @@ pub trait LifecyclePort: Send + Sync {
     /// operation. Returns whether the abort was sent. A sent abort is never
     /// evidence that the engine stopped; only the request's own final output
     /// is. The default is an authority that cannot abort: nothing is sent.
-    async fn abort_request(&self, _deployment_id: &str, _generation: i64, _request_id: &str) -> bool {
+    async fn abort_request(
+        &self,
+        _deployment_id: &str,
+        _generation: i64,
+        _request_id: &str,
+    ) -> bool {
         false
     }
 

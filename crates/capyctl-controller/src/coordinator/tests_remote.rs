@@ -1418,6 +1418,7 @@ async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence()
             Arc::new(move |host: &str| host == "lab" && live.load(Ordering::SeqCst))
         },
         host_unresponsive: Arc::new(|_: &str| false),
+        host_request_abort: Arc::new(|_: &str| false),
     };
     let lifecycle =
         crate::coordinator_port::CoordinatorLifecycle::new(w.commands()).with_routing(signals);

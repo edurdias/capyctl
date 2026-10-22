@@ -141,6 +141,30 @@ stays counted against its model's memory until CapyCTL sees the engine stop:
   Stopping or switching does not wait for it, and a model that would park
   stops instead.
 
+On SGLang 0.5.22 started with one tokenizer worker (the default), CapyCTL
+does more for a chat request. It sends the engine its own request ID, the
+`X-CapyCTL-Request-Id` value (never your `X-Request-Id`), as SGLang's `rid`,
+so the answer's `id` is that same ID. When the request is cut, CapyCTL asks
+SGLang to abort that ID and keeps reading the engine's answer, which no
+longer reaches you, until SGLang ends it. That end shows the engine finished
+the request, so CapyCTL stops counting it at once, whatever else the engine
+is running, instead of waiting for the engine to read idle or for its next
+stop. If the end does not come within `queue.stream_idle_timeout` of the
+abort, the rules above apply. A model on a host works the same way: its
+ingress gives the engine the ID, and the host's agent sends the abort on the
+host. Decision requests are not covered: SGLang's decision endpoint takes no
+request ID.
+
+Requests that wait for the engine's next stop can add up. When they are the
+only requests a model holds and fill its 32 places, CapyCTL restarts the
+instance holding them instead of answering new requests `429 queue_full`:
+the restart's stop settles them, the journal records
+`instance_restarted_for_held_requests` with the number of requests it
+settled, and requests waiting for a place wait through the restart as they
+would through a start. A request CapyCTL could not account for (`backend
+completion unverified`) keeps this from happening, since nothing shows the
+engine finished it.
+
 `capyctl status deployment <name>` shows, under the instance table, how many
 cancelled requests each instance still counts and how each will be settled.
 
