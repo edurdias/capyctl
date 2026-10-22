@@ -111,6 +111,11 @@ with mock.patch.object(composition, "enforce_closed_plugins"), \
         mock.patch.object(entry, "_guarded_engine_import", side_effect=guarded_import), \
         mock.patch.object(server_args, "construct_server_args", return_value=mock.Mock()):
     status = entry.main(fixture.argv(), fixture.payloads().__getitem__)
+# Whether multiprocessing's resource tracker still holds its pipe, and so has
+# a process its finalizer will wait for at interpreter exit. Python 3.12's
+# finalizer prints a ChildProcessError when the process was reaped by another.
+from multiprocessing import resource_tracker
+print("tracker_pipe:", "open" if resource_tracker._resource_tracker._fd is not None else "closed")
 raise SystemExit(status)
 """
 
@@ -163,23 +168,30 @@ class SchedulerDeathBeforeReadinessTests(unittest.TestCase):
             env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             start_new_session=True)
         try:
-            _, stderr = entry.communicate(timeout=60)
+            stdout, stderr = entry.communicate(timeout=60)
         except subprocess.TimeoutExpired:
             os.killpg(entry.pid, signal.SIGKILL)
             entry.communicate()
             self.fail("the entry outlived its failed launch")
-        return entry, stderr, time.monotonic() - started
+        return entry, stdout, stderr, time.monotonic() - started
 
     # T12: SPEC §§6.4, 13.2. A scheduler that exits before readiness,
     # without signalling its parent, ends the protected entry within seconds
     # with its closed category, and nothing it started is left running: the
     # live detokenizer and its own child are ended before the entry exits.
     def test_scheduler_death_before_readiness_fails_promptly_and_leaves_no_process(self):
-        entry, stderr, elapsed = self.run_entry()
+        entry, stdout, stderr, elapsed = self.run_entry()
         self.assertEqual(entry.returncode, 1, stderr)
         self.assertLess(elapsed, 20, stderr)
-        self.assertIn("sglang_startup_failed: engine_launch_failed (", stderr)
         self.assertEqual(stderr.count("sglang_startup_failed"), 1, stderr)
+        # Found live 2026-10-22: the failure line is the log's last; nothing
+        # the interpreter does at exit follows it. multiprocessing's resource
+        # tracker reaped its own process, so its finalizer, which on Python
+        # 3.12 printed a ChildProcessError there, has nothing to wait for.
+        self.assertTrue(stderr.endswith("\n"), stderr)
+        self.assertTrue(stderr.splitlines()[-1].startswith(
+            "sglang_startup_failed: engine_launch_failed ("), stderr)
+        self.assertIn("tracker_pipe: closed", stdout, stdout)
         # The process group is gone at the moment its leader is.
         self.assertEqual(running_group_members(entry.pid), [])
         detokenizer, helper, prometheus = self.record.read_text().split(" ", 2)

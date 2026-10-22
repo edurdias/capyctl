@@ -1611,6 +1611,74 @@ async fn a_hang_up_mid_collected_request_closes_the_engine_connection() {
     }
 }
 
+// T17 T38 (SPEC §10, found live 2026-10-22): a client that hangs up a stream
+// before the engine's first token cancels its forward at once, as one that
+// hangs up after it: before the engine's response head, and after a head and
+// a chunk that only opens the reply. Live on SGLang, the router noticed only
+// when the engine produced its first chunk for the queued request, which the
+// engine started only once the request ahead of it ended. The engine never
+// answered it, so it is held as cancelling until the instance's verified
+// stop, and its in-flight slot is released.
+#[tokio::test]
+async fn a_stream_hung_up_before_the_first_token_closes_the_engine_connection() {
+    for opening in [false, true] {
+        let engine = if opening {
+            capyctl_testkit::HeldEngine::opening().await
+        } else {
+            capyctl_testkit::HeldEngine::start().await
+        };
+        let (authority, deps) = stub_router(&engine.endpoint());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = capyctl_router::serve_router(deps.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (headed, head) = tokio::sync::oneshot::channel();
+        let client = tokio::spawn(async move {
+            let response = reqwest::Client::new()
+                .post(format!("http://{address}/v1/chat/completions"))
+                .json(&serde_json::json!({
+                    "model": "public-alias", "stream": true,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))
+                .send()
+                .await
+                .unwrap();
+            let _ = headed.send(response.status());
+            // Held open, reading whatever comes, until the client is aborted.
+            let mut body = response.bytes_stream();
+            while body.next().await.is_some() {}
+            std::future::pending::<()>().await;
+        });
+        let bound = std::time::Duration::from_secs(5);
+        assert!(
+            engine.arrived_within(1, bound).await,
+            "never reached the engine"
+        );
+        assert_eq!(head.await.unwrap(), 200);
+        // Long enough for the router to read the opening chunk, if any.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(engine.closed(), 0, "opening: {opening}");
+        // The client hangs up before any token, long before its deadline.
+        client.abort();
+        let _ = client.await;
+        // Well inside the 15 s between SSE keep-alive comments.
+        assert!(
+            engine
+                .closed_within(1, std::time::Duration::from_secs(2))
+                .await,
+            "the engine connection stayed open after the hang-up (opening: {opening})"
+        );
+        eventually(|| {
+            ends(&authority)
+                == vec![Some(capyctl_controller::LeaseEnd::Cancelling {
+                    answered: false,
+                })]
+        })
+        .await;
+        eventually(|| deps.inflight.current("dep-1") == 0).await;
+    }
+}
+
 // T17 T38 (SPEC §10, amended 2026-10-02 and 2026-10-21): a collected request
 // cut at its deadline drops its forward too, so the engine sees its
 // connection close.
