@@ -48,18 +48,12 @@ What changed:
 
 Not done yet on this branch (the integrator's state at the time of writing):
 
-- the server side of the remote path: filling `SingleLaunchPlan.lmcache` from the
-  store's grant (`remote_execution.rs`), recording the host's `LaunchLmcache` reports
-  and the fallback for remote hosts (`agent_sessions.rs`), the retirement pass on a
-  host publication (`host_publication.rs`), and the embedded metrics targets
-  (`embedded_load.rs`);
-- status display: the per-instance `LMCache` line and JSON `lmcache` object
-  (`snapshot.rs`, `table.rs`, `client.rs`, the management snapshot merge with the load
-  table);
-- coordinator-level tests for the embedded fallback, server exit and restart-park
-  round trip;
-- the fast and deep gates on the merged branch;
-- live rows LC2–LC11 (LC1 measured, A1).
+- tests for the remote path (`lmcache_report`, restart-park residency evidence, the
+  publication retirement), the status object and line, the load table's LMCache samples
+  and LMCache drift; coordinator-level tests for the embedded fallback, server exit and
+  restart-park round trip;
+- the rebase onto `origin/main` and the fast and deep gates on the merged branch;
+- live rows LC2–LC11 (LC1 measured, A1), and the decision-model (Clef-Flash) allowance.
 
 CPU and Fake-engine tests are not qualification.
 
