@@ -870,10 +870,11 @@ class _SharedMemoryWatch:
     user inspect is checked. One that hides its descriptors and mappings (a
     non-dumpable process) keeps every file when it runs in this entry's
     process group, where it could be one of the launch's own that left this
-    entry's tree; elsewhere (CapyCTL's own commands are non-dumpable, as are
-    SSH sessions) it could only have opened a file by its new name, and is
-    not checked. A file whose creator ended within one listing interval of
-    creating it is never claimed, and so stays.
+    entry's tree; elsewhere (an SSH session, the user's service manager) it
+    could only have opened a file by its new name, and is not checked. A
+    zombie, the entry's own unreaped children included, holds nothing. A
+    file whose creator ended within one listing interval of creating it is
+    never claimed, and so stays.
     """
 
     def __init__(self, directory=SHM_DIRECTORY, interval=_SHM_WATCH_INTERVAL):

@@ -333,6 +333,13 @@ class SharedMemoryAfterFailedLaunchTests(unittest.TestCase):
         foreign = self.segment("-foreign")
         foreign.write_bytes(b"\0" * 4096)
         foreign.chmod(0o600)
+        # Found live 2026-10-22: a process that hides its descriptors and runs
+        # outside the launch's process group (an SSH session), started
+        # during the launch, does not keep the files.
+        outsider = subprocess.Popen(
+            [sys.executable, "-I", "-S", "-c", HIDDEN_SLEEPER], start_new_session=True)
+        self.addCleanup(outsider.wait)
+        self.addCleanup(outsider.kill)
         # Long enough for the watch to list the directory several times.
         time.sleep(1.0)
         os.kill(int((self.scratch / "scheduler").read_text()), signal.SIGKILL)
@@ -351,6 +358,42 @@ class SharedMemoryAfterFailedLaunchTests(unittest.TestCase):
         self.assertTrue(old.exists())
         self.assertTrue(self.segment("-shared").exists())
         self.assertTrue(foreign.exists())
+
+
+# A sleeper that hides its descriptors and mappings (PR_SET_DUMPABLE 0, set
+# after exec, which resets it).
+HIDDEN_SLEEPER = ("import ctypes, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); "
+                  "time.sleep(60)")
+
+
+class HiddenHolderTests(unittest.TestCase):
+    # T12: SPEC §13.2 (found live 2026-10-22). /proc hides the descriptors of
+    # a non-dumpable process. One in the launch's process group could be one
+    # of the launch's own, so it keeps every file; a zombie holds nothing.
+    def test_a_hidden_process_in_the_group_keeps_the_files_and_a_zombie_does_not(self):
+        from runtime import sglang_entry as entry
+        hidden = subprocess.Popen(
+            [sys.executable, "-I", "-S", "-c", HIDDEN_SLEEPER])
+        self.addCleanup(hidden.wait)
+        self.addCleanup(hidden.kill)
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                os.listdir("/proc/%d/fd" % hidden.pid)
+            except PermissionError:
+                break
+            self.assertLess(time.monotonic(), deadline, "the child never hid its descriptors")
+            time.sleep(0.01)
+        _, uncertain = entry._held_files("/dev/shm", [hidden.pid], group=os.getpgrp())
+        self.assertTrue(uncertain)
+        # Outside the launch's process group it is not checked.
+        _, uncertain = entry._held_files("/dev/shm", [hidden.pid], group=os.getpgrp() + 1)
+        self.assertFalse(uncertain)
+        hidden.kill()
+        while running(hidden.pid):
+            time.sleep(0.01)
+        _, uncertain = entry._held_files("/dev/shm", [hidden.pid], group=os.getpgrp())
+        self.assertFalse(uncertain)
 
 
 if __name__ == "__main__":
