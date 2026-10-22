@@ -802,6 +802,135 @@ tell the two apart. A basal release that reports its running and queued
 requests can be given an `idle` entry in a new manifest, with no CapyCTL
 change.
 
+## LMCache
+
+[LMCache](https://github.com/LMCache/LMCache) keeps the KV cache of recent
+prompt prefixes in host RAM, outside the engine. CapyCTL runs it as a private
+server for each model instance, started and stopped with it, so a model that
+wakes from a park, or restarts, can answer a prompt that begins like an
+earlier one from that cache instead of recomputing it (ADR 0033).
+
+**What runs.** Each instance of a deployment that uses LMCache gets its own
+`lmcache server`, from the engine's own environment, as a CapyCTL-owned
+process:
+
+- listening only on loopback, on two ports CapyCTL leases from the host's
+  `endpoint_port_range`; a server found listening anywhere else is stopped
+  and the model runs without it;
+- with a pool of host RAM (4 GiB by default, `lmcache_pool` to change it)
+  allocated when it starts, evicting least recently used entries, and no disk,
+  remote or peer tier;
+- with an environment of `PATH`, `HOME` and the instance's GPU only, and its
+  script API off;
+- writing its output to its own log beside the engine's, through the same
+  redacting writer.
+
+The engine connects to it: vLLM through LMCache's `LMCacheMPConnector`
+(CapyCTL renders `--kv-transfer-config` with the connector's module path and
+`autostart: false`), SGLang through `--enable-lmcache --lmcache-config-file`
+(a private file holding only the server's address). The in-process
+`LMCacheConnectorV1` is never used: it ignores `cache_salt`.
+
+**Which engines.**
+
+| Engine | LMCache |
+|---|---|
+| vLLM 0.32.0 or newer | yes |
+| vLLM 0.31 and older | off: "LMCache needs vLLM 0.32.0 or newer" |
+| SGLang 0.5.22 or newer | yes, decision deployments included |
+| SGLang before 0.5.22 | off: "LMCache needs SGLang 0.5.22 or newer" |
+| llama.cpp, TensorFold | off: the engine has no LMCache integration |
+| custom engine | off: CapyCTL does not render options for it |
+
+vLLM 0.32.0 and SGLang 0.5.22 with LMCache 0.5.6 are the qualified versions
+(measured on a GB10); a newer engine or a later LMCache 0.5.x is used when
+the launch-time check below passes, and is not qualified until a live run
+covers it. A deployment with a `topology` runs without LMCache.
+
+**Install it in the engine's environment**, then register the engine again
+(CapyCTL never installs it, and it uses only an LMCache that `engine add` saw):
+
+```bash
+# vLLM 0.32.0: the published wheel
+~/vllm-0.32.0-venv/bin/pip install lmcache==0.5.6
+# SGLang 0.5.22 pins torch 2.14.1; build LMCache against it
+~/sglang-0.5.22-venv/bin/pip install --no-build-isolation lmcache==0.5.6
+capyctl engine add ~/vllm-0.32.0-venv --name vllm032
+```
+
+LMCache 0.5.6 is the oldest release CapyCTL accepts (it fixes
+CVE-2026-105192); a later 0.5.x is accepted. `engine add` records LMCache's
+version and a digest of its files on the profile, and every launch measures it
+again: a changed digest is drift, flagged and handled like the engine's
+(`security.installation_drift`). An LMCache installed after `engine add` is
+not used ("LMCache was installed after the engine was registered; register
+the engine again").
+
+**The launch-time check** reads files of the registered environment and runs
+nothing. It passes when LMCache is 0.5.6 or a later 0.5.x; its package holds
+the connector the engine needs, the `lmcache server` entry point and the
+server options CapyCTL renders; vLLM's KV transfer configuration accepts a
+connector module path; and SGLang declares its LMCache settings and selects
+its unified LMCache radix cache. On SGLang the check also verifies that the
+request's salt reaches LMCache: SGLang passes `cache_salt` to LMCache's
+unified connector, which puts it in the cache key, and SGLang does not use
+LMCache's older SGLang adapter (which dropped the salt, LMCache issue 4825).
+A release without that path fails the check, and its deployments run without
+LMCache until a release has it. A failed check names what was missing.
+
+**`capyctl engine list`** shows an `LMCACHE` column: the registered version,
+or `off (<reason>)` for a profile that cannot use it.
+
+**Status.** `capyctl status deployment <name>` shows a line per instance:
+
+```text
+LMCache   on: pool 4 GiB, used 1.3 GiB, overhead 0.8 GiB (measured), 212 hits / 260 lookups
+LMCache   off: LMCache needs vLLM 0.32.0 or newer
+```
+
+and `--json` an `lmcache` object (`state`, `reason`, `pool_bytes`,
+`used_bytes`, `overhead_bytes`, `measured`, `lookups`, `hits`; a figure
+CapyCTL could not read is `null`, never zero). The event `lmcache_off` records
+an instance and reason once per launch.
+
+**Memory.** An instance's reservation holds the pool plus the server's own
+memory in host RAM (on a GB10, the memory the GPU uses too), and the pool
+counts against `host_kv_limit`. Until a deployment's first measurement the
+server's own memory is charged at 1280 MiB plus 512 MiB of GPU memory, the
+largest figures measured on a GB10 plus a quarter; after it, at what was
+measured. The charge stays while the model is parked. `memory.request` stays
+the engine's own GPU memory.
+
+**Choosing.** A deployment's `lmcache` is `auto` (the default), `off` or
+`required`. With `auto`, a deployment that cannot use LMCache runs without
+it and says why. With `required` it refuses to start instead:
+`lmcache_unavailable:<reason>` (`retention_zero:lmcache`,
+`host_capability_missing:lmcache`), and a failure found at launch leaves
+nothing running. A host's `lmcache: off` or `retention: zero` keeps it off
+on that machine ([settings](../operations/configuration.md#lmcache-and-zero-retention)).
+
+**When the engine does not start with it.** An engine that exits or does not
+become ready with the connector is stopped with its server and started once
+more without LMCache, with a warning and an `lmcache_off` event
+(`engine_start_failed`); later starts of that revision with that engine go
+straight to the start without LMCache. Under `required` the start fails
+instead. A server that does not answer within 30 seconds of starting is
+stopped and the engine starts without it (`server_start_failed`). A server
+that exits while its engine serves fails the instance, which is started again
+with a new, empty server (`lmcache_server_exited`).
+
+**Local reach.** Any process on the machine can reach the server's loopback
+ports, as it can reach a llama.cpp engine: read its configuration, list or
+clear its cache, and store or look up KV under any salt. On a machine with
+untrusted local users, set the host's `lmcache: off` or `retention: zero`.
+
+**Options.** CapyCTL renders the LMCache options itself: SGLang's
+`--enable-lmcache` and `--lmcache-*` are refused in `extra_args`, so is a
+vLLM `--kv-transfer-config` naming an LMCache connector, and `LMCACHE_*`
+variables are reserved. A deployment that passes another KV connector runs
+without LMCache (`kv_transfer_config_set`)
+([engine options](engine-flags.md)).
+
 ## Tool calls and reasoning
 
 vLLM and SGLang return structured `tool_calls` and a separate reasoning trace

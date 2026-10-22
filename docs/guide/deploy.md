@@ -77,6 +77,14 @@ Add a field to choose something yourself, for example:
   them and 35 without, and kept about 0.7 GiB more of the card while parked.
   After the first park CapyCTL charges a parked model what it measured it
   holding (`parked` in `capyctl status deployment <name> --json`).
+- `lmcache: off` to run without [LMCache](engines.md#lmcache), the private
+  KV cache in host RAM that every vLLM 0.32.0+ and SGLang 0.5.22+ deployment
+  gets by default, or `lmcache: required` to refuse to start without it.
+  `lmcache_pool: 8GiB` sets its RAM pool (a whole number of GiB, 4 GiB by
+  default); it is refused beside `lmcache: off`.
+- `retention: zero` to keep this deployment's engine output in memory, start
+  it with no core dumps and never give it LMCache
+  ([zero data retention](../operations/data-retention.md#zero-data-retention)).
 
 Every other field is in [Configuration files](configuration.md).
 

@@ -12,6 +12,14 @@ recipe: standard
 # `deep` frees the model's GPU memory while it is parked.
 residency: deep
 recovery: reconcile
+# LMCache, a private KV cache in host RAM (vLLM 0.32.0+, SGLang 0.5.22+):
+# `auto` uses it where it can (here it stays off: a `deep` deployment uses it
+# only on a combination qualified for it), `off` never, `required` refuses to
+# start without it. `lmcache_pool` is its RAM pool, a whole number of GiB.
+lmcache: auto
+lmcache_pool: "4GiB"
+# `zero`: engine logs in memory, no core dumps, no LMCache.
+retention: standard
 model:
   # A checkpoint directory under the models directory (~/models by default).
   path: Qwen3-4B
