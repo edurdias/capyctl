@@ -700,6 +700,16 @@ pub enum StartError {
     /// (`insufficient_device_memory`).
     #[error("{0}")]
     Template(crate::standalone_config::TemplateError),
+    /// SPEC §15.2 (existing identity mismatched: fail for recovery): the
+    /// state belongs to the standalone host named `stored`, and this
+    /// machine's hostname is now `current` (`host_name_changed`).
+    #[error(
+        "this state directory belongs to the standalone host `{stored}`, but this machine's \
+         hostname is now `{current}`, and CapyCTL names its host after the hostname. A \
+         container gets a new hostname each time it is created: run it with \
+         `docker run --hostname {stored}`, or on a machine set the hostname back to `{stored}`"
+    )]
+    HostNameChanged { stored: String, current: String },
 }
 
 /// Discrete GPU design §6: each discrete GPU's total memory by driver index,
@@ -789,6 +799,7 @@ impl From<StartError> for StructuredError {
                 StartError::Setting(_) => "invalid_config",
                 StartError::GpuTopology(error) => error.code(),
                 StartError::Template(ref error) => error.code(),
+                StartError::HostNameChanged { .. } => crate::output::HOST_NAME_CHANGED,
                 _ => "internal",
             };
         StructuredError {
@@ -1672,6 +1683,32 @@ fn standalone_owned_state(
     )
 }
 
+/// SPEC §15.2 (existing identity mismatched: fail for recovery): a standalone
+/// host is published under the machine's hostname (the device inventory's
+/// `host_id`), and its state belongs to that name. `hostname` is that name for
+/// this start; when the state names another host, the start is refused
+/// `host_name_changed` with both names and the fix. Fresh state (no embedded
+/// host recorded yet) and an unchanged name proceed.
+///
+/// Only the embedded host this role owns is compared: enrolled hosts a store
+/// also holds are never read. A start without a device inventory publishes the
+/// fixed name `standalone`, not the hostname, so it is not compared here.
+pub fn check_host_name(store: &Store, hostname: Option<&str>) -> Result<(), StartError> {
+    let Some(current) = hostname else {
+        return Ok(());
+    };
+    let stored = store
+        .embedded_host_name()
+        .map_err(|error| StartError::Deploy(format!("stored host name unreadable: {error}")))?;
+    match stored {
+        Some(stored) if stored != current => Err(StartError::HostNameChanged {
+            stored,
+            current: current.to_owned(),
+        }),
+        _ => Ok(()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn start_standalone_in(
     state_dir: &Path,
@@ -1901,6 +1938,17 @@ async fn start_standalone_in(
         capyctl_config::effective::normalize_host_policy(&host)
             .map_err(|error| StartError::Deploy(format!("host policy invalid: {error}")))?
     };
+
+    // SPEC §15.2 (existing identity mismatched: fail for recovery): state
+    // created under another hostname is refused here, before the secrets
+    // key, the owned state or any policy is written, instead of failing later
+    // as an opaque resource policy revision conflict.
+    check_host_name(
+        &store,
+        inventory
+            .as_ref()
+            .map(|published| published.host_id.as_str()),
+    )?;
 
     // Spec §3: the identity key that seals every per-launch engine key lives in a
     // file beside the database, not in it, and it has to outlive the process or a

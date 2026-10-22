@@ -1096,6 +1096,24 @@ fn remote_policies_namespace_local_resources_and_do_not_break_embedded_lookup() 
     );
 }
 
+// T06 (SPEC §15.2): the embedded host's stored name is the name it was
+// published under, which a standalone start compares with its hostname. It
+// is none on fresh state, and enrolled hosts in the same store never change it.
+#[test]
+fn the_embedded_host_name_is_the_published_name_and_ignores_enrolled_hosts() {
+    let store = crate::Store::open_in_memory().unwrap();
+    assert_eq!(store.embedded_host_name().unwrap(), None);
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&session, &host(), &observations(), 11_000)
+        .unwrap();
+    assert_eq!(store.embedded_host_name().unwrap(), Some(host().name));
+    store
+        .import_remote_resource_policy(&session, "enrolled-one", &host(), &observations(), 11_000)
+        .unwrap();
+    assert_eq!(store.embedded_host_name().unwrap(), Some(host().name));
+}
+
 // T24: migration adds ownership metadata without changing accounting or replay bytes.
 #[test]
 fn namespace_upgrade_preserves_owned_reservations_grants_and_epoch() {
