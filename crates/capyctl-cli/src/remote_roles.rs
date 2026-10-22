@@ -1112,6 +1112,13 @@ async fn serve_host(
         // removed on gone evidence (0700, this service user).
         private_dir(&config.state_dir.join("rendezvous"))?;
         private_dir(&config.state_dir.join("engines"))?;
+        // ADR 0033 §4: each launch's private LMCache directory (SGLang's
+        // connector configuration), 0700, this service user. A role start
+        // removes every one no retained launch owns.
+        private_dir(&config.state_dir.join("lmcache"))?;
+        let claimed = journal.claimed_incarnations().map_err(|_| unavailable())?;
+        capyctl_agent::lmcache_dir::LmcacheDirs::new(config.state_dir.join("lmcache"))
+            .sweep(&claimed);
         let private =
             IdentityDirectory::open(&config.state_dir.join("ingress-identity")).map_err(|e| {
                 identity_refused(
@@ -1139,6 +1146,7 @@ async fn serve_host(
         // left its rendezvous directory in /tmp; the host now owns and removes it.
         .with_rendezvous_root(config.state_dir.join("rendezvous"))
         .with_engine_cache_root(config.state_dir.join("engines"))
+        .with_lmcache_dirs(config.state_dir.join("lmcache"))
         // SPEC §9.2 (W4): the production saver observation source; without it
         // SGLang Park is refused unchanged.
         .with_saver_residency(Arc::new(

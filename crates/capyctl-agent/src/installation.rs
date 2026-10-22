@@ -1133,6 +1133,40 @@ impl InstallationRegistry {
         self.drift.lock().ok()?.get(profile).cloned()
     }
 
+    /// ADR 0033 §1: the launch-time check of `profile`'s LMCache
+    /// ([`crate::lmcache_install::check_lmcache`]). A digest other than the
+    /// registered one is drift, handled as the engine package's is (ADR
+    /// 0008): flagged on the role log, and refused `installation_drift` only
+    /// under `installation_drift: refuse`. The inner result is the check's
+    /// verdict.
+    pub fn verify_lmcache(
+        &self,
+        profile: &str,
+        engine: Engine,
+        executable: &Path,
+        registered: Option<&capyctl_config::lmcache::LmcacheRegistration>,
+        policy: InstallationDrift,
+    ) -> Result<
+        Result<crate::lmcache_install::LmcacheInstall, crate::lmcache_install::LmcacheCheckFailure>,
+        &'static str,
+    > {
+        let checked =
+            crate::lmcache_install::check_lmcache(&self.measurer, engine, executable, registered);
+        if let Some(install) = checked.as_ref().ok().filter(|install| install.drifted) {
+            capyctl_domain::role_log::notice(
+                capyctl_domain::role_log::Level::Warning,
+                &format!(
+                    "LMCache in profile {profile} drifted from its registration: measured {}",
+                    install.digest
+                ),
+            );
+            if policy == InstallationDrift::Refuse {
+                return Err("installation_drift");
+            }
+        }
+        Ok(checked)
+    }
+
     /// Status: overlay drift and missing capabilities on published profiles.
     pub fn overlay(&self, profiles: &mut [capyctl_protocol::pb::RuntimeProfileStatus]) {
         let drift = self.drift.lock().map(|d| d.clone()).unwrap_or_default();

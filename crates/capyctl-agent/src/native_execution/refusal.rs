@@ -136,6 +136,18 @@ pub(crate) fn engine_port_free(port: u16) -> Result<(), LaunchVerdict> {
         .map_err(|_| LaunchVerdict::Refused("port_conflict"))
 }
 
+/// ADR 0033 §3 (lifecycle design §1.6): both loopback ports of a launch's
+/// LMCache grant must be free when it is admitted, as its engine port must.
+pub(crate) fn lmcache_ports_free(command: &MemberCommand) -> Result<(), LaunchVerdict> {
+    match command.action.launch_plan().and_then(|plan| plan.lmcache) {
+        Some(grant) => {
+            engine_port_free(grant.rpc_port)?;
+            engine_port_free(grant.http_port)
+        }
+        None => Ok(()),
+    }
+}
+
 /// Whether any allocation of `effective`'s starting footprint lands on a device
 /// domain, which is read from the GPU (discrete GPU design §4).
 pub(crate) fn charges_device(effective: &capyctl_config::effective::EffectiveDeployment) -> bool {
@@ -306,6 +318,8 @@ impl NativeHostExecution {
                 effective.profile.security.installation_drift,
             )
             .map_err(refused)?;
+        // ADR 0033 §§1, 9: then the launch's LMCache, when it has a grant.
+        self.admit_lmcache(command, plan, &effective, &installations)?;
         self.launch_capability(
             &effective,
             &plan.profile_name,
@@ -382,6 +396,9 @@ impl NativeHostExecution {
                     .filter(|owner| owner.identity.deployment_id == command.identity.deployment_id)
                     .and_then(|_| self.journal.execution_result(owned_handle, now).ok());
                 let mut result = owned.unwrap_or_default();
+                // ADR 0033 §§8, 9: the launch's own LMCache report is the
+                // launch's; a Park or Restore result carries only its own.
+                result.lmcache = None;
                 result.state = String::new();
                 result.model_usable = false;
                 result.owned_handle = owned_handle.clone();
@@ -412,12 +429,14 @@ impl NativeHostExecution {
         match &command.action {
             // SPEC §§3.1, 7.3: the journal refused alone or beside the
             // launches it still claims; the reason is recomputed the same way.
-            MemberAction::LaunchSingle(plan) | MemberAction::Launch { member: plan, .. } => {
-                Some(match self.admit_launch_here(command, plan) {
+            MemberAction::LaunchSingle(plan) | MemberAction::Launch { member: plan, .. } => Some(
+                match lmcache_ports_free(command)
+                    .and_then(|()| self.admit_launch_here(command, plan))
+                {
                     Err(LaunchVerdict::Refused(reason)) => reason,
                     _ => "unauthorized",
-                })
-            }
+                },
+            ),
             MemberAction::Park { owned_handle } | MemberAction::Restore { owned_handle, .. } => {
                 // ADR 0012: only a parking tier (`deep`, or `host_backed`
                 // where it resolved, discrete GPU design §5) parks. A
@@ -439,8 +458,14 @@ impl NativeHostExecution {
                 let tier = tensorfold_group
                     || owner
                         .as_ref()
-                        .and_then(|owner| self.resolve_retained(owner).ok())
-                        .is_some_and(|effective| !effective.residency.parks());
+                        .and_then(|owner| {
+                            let effective = self.resolve_retained(owner).ok()?;
+                            Some(
+                                !effective.residency.parks()
+                                    && !self.restart_parks(owner, &effective),
+                            )
+                        })
+                        .unwrap_or(false);
                 // SPEC §§3.1, 7.3, 9.1: a wake that does not fit beside the
                 // other claims is refused by the rule it breaks.
                 let wake = || match &command.action {
@@ -454,11 +479,15 @@ impl NativeHostExecution {
                     }
                     _ => None,
                 };
-                // ADR 0008: a Park the installation's probe cannot support.
+                // ADR 0008: a Park the installation's probe cannot support
+                // (ADR 0033 §7: a restart-park needs none).
                 let capability = || {
                     let owner = owner.as_ref()?;
                     let plan = owner.action.launch_plan()?;
                     let effective = self.resolve_retained(owner).ok()?;
+                    if self.restart_parks(owner, &effective) {
+                        return None;
+                    }
                     self.park_capability(&effective, &plan.profile_name)
                 };
                 Some(if tier {
