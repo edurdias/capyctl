@@ -42,18 +42,39 @@ What changed:
   role-start retirement under host `lmcache: off` or `retention: zero`. Placement gates
   and capabilities `lmcache`, `retention`; events `lmcache_off`,
   `lmcache_server_exited`; CLI exit 5 for the new codes.
+- **Remote hosts.** The launch grant carries the server's ports and charge; the host's
+  per-launch LMCache report reaches the coordinator as an embedded launch's does, so
+  the fallback, its codes and stickiness are the same; restart-park evidence (the server
+  alone while parked, a new engine beside the same server after the wake) is checked by
+  the server and again by the store; a host publishing `lmcache: off` or
+  `retention: zero` has its servers stopped and Ready instances started again without
+  LMCache; the servers' measured overhead and GPU memory from host load reports replace
+  the allowances for later launches of the revision on that host.
+- **Status.** Each instance's `lmcache` object (state, reason, server, pool, overhead,
+  device, held KV, charge, measured) and a `LMCache` line in `capyctl status`, with the
+  pool's used bytes, lookups and hits from the load read; LMCache drift shown under the
+  engine (standalone) and in `/hosts` (remote, additive
+  `RuntimeProfileStatus.lmcache_observed_digest`), journaled once per digest as
+  `<profile>:lmcache`.
 - **Docs.** SPEC §§7.4, 8.2, 9.1, 9.2, 10, 12, 15.1, 20 (T45, LC rows), 21; the ADR's
   amendments; data retention, configuration, engine options, engines, requests,
   deploy, parking and errors.
 
-Not done yet on this branch (the integrator's state at the time of writing):
+Tests (T45 with related rows): coordinator tests on the real worker for the fallback
+(once, sticky, `lmcache_off`), `required` failing `lmcache_unavailable:engine_start_failed`
+with nothing left, a server exit and its recovery with a new server, and the restart-park
+round trip, each embedded and through the host's report where it applies; the remote
+report and restart-park evidence, publication retirement, host measurements, drift
+(standalone, remote, CLI), the status object, line and load merge, the load table and
+capacity read, the standalone scrape; store tests for ports, charge, held KV, fallback,
+parking, exit and retirement. They found three bugs, fixed here: a restore of a
+restart-parked remote launch was accepted with the server alone and no new engine; a
+host's LMCache sample for another host's launch hid that launch's own later report; an
+embedded fallback relaunch journaled `lmcache_off` twice.
 
-- tests for the remote path (`lmcache_report`, restart-park residency evidence, the
-  publication retirement), the status object and line, the load table's LMCache samples
-  and LMCache drift; coordinator-level tests for the embedded fallback, server exit and
-  restart-park round trip;
-- the rebase onto `origin/main` and the fast and deep gates on the merged branch;
-- live rows LC2–LC11 (LC1 measured, A1), and the decision-model (Clef-Flash) allowance.
+Still missing: LC1 run through CapyCTL (LC1's figures were measured with LMCache and
+the engines run directly), the live rows LC2–LC11 on host A, and the decision-model
+(Clef-Flash) allowance measurement.
 
 CPU and Fake-engine tests are not qualification.
 

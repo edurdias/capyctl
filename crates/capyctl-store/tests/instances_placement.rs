@@ -2401,6 +2401,9 @@ fn lmcache_golden() -> (Value, Value) {
     profile["lmcache"] =
         json!({"version": "0.5.6", "digest": format!("sha256:{}", "0".repeat(64))});
     deployment["residency"] = json!("restart_only");
+    // ADR 0033 §6: the default 4 GiB pool counts against `host_kv_limit`
+    // beside the engine's own 1 GiB, so the gates are tested with room for it.
+    host["resource_policy"]["domains"]["unified"]["host_kv_limit"] = json!("8GiB");
     (deployment, host)
 }
 
