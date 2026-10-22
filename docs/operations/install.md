@@ -962,10 +962,12 @@ was PID 780 inside, with the same 14873 MiB in both; on the laptop card, a
 vLLM engine that was PID 1306164 on the host was PID 654 inside, with the same
 11088 MiB ready and 1194 MiB parked in both). CapyCTL's per-process figures
 therefore work in a container as on a host: the parked charge is measured, and
-on unified memory so is the startup peak. On a discrete card the startup peak
-is not measured, in a container or not: the cold phase charges the card and
-host RAM, and only a single-domain cold phase is measured, so status keeps the
-derived figure (`startup.provenance` `default`).
+so is the startup peak. On a discrete card the startup peak is measured for
+each memory domain apart: the card from the GPU memory the driver attributes
+to the engine's processes, host RAM from their resident pages. Each domain's
+estimate is replaced once it is measured, never below its steady charge, and
+`capyctl status deployment <name> --json` says which: `startup.device_provenance`
+and `startup.host_provenance` are `measured` or the estimate's (`default`).
 
 **Card sizing.** A discrete card's limits come from the card's total memory
 as `nvidia-smi` reports it, not from the container's memory limit (ADR 0019):

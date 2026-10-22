@@ -449,6 +449,11 @@ message SingleLaunchPlan {
   // ADR 0029 §9: the GGUF facts the server resolved a llama.cpp revision
   // with. Absent for any other engine.
   CheckpointGguf checkpoint_gguf = 17;
+  // ADR 0019 §3: on a discrete GPU whose startup peak the server measured per
+  // memory domain, the startup charge on host RAM (the system domain); with
+  // it, `startup_bytes` is the charge on the card (the device domain), so the
+  // host re-checks both. Absent otherwise.
+  optional int64 startup_host_bytes = 18;
 }
 // ADR 0028 §5 (amendment of 2026-10-07): how a checkpoint's weights split
 // across a group's ranks, read from its safetensors headers.

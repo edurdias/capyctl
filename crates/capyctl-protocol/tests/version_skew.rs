@@ -191,6 +191,7 @@ fn launch(digest: bool, startup: bool) -> MemberAction {
         checkpoint_tables: None,
         checkpoint_gguf: None,
         startup_bytes: startup.then_some(2 << 30),
+        startup_host_bytes: None,
     })
 }
 
@@ -296,6 +297,21 @@ fn every_post_baseline_field_names_its_capability() {
             ),
             vec![CHECKPOINT_DIGEST, STARTUP_BYTES, CHECKPOINT_STATE_SLOT],
         ),
+        // ADR 0019 §3: a discrete launch measured per domain carries the host
+        // RAM charge beside the card's.
+        (
+            wire(
+                match launch(true, true) {
+                    MemberAction::LaunchSingle(mut plan) => {
+                        plan.startup_host_bytes = Some(6 << 30);
+                        MemberAction::LaunchSingle(plan)
+                    }
+                    _ => unreachable!(),
+                },
+                0,
+            ),
+            vec![CHECKPOINT_DIGEST, STARTUP_BYTES, STARTUP_HOST_BYTES],
+        ),
         (wire(MemberAction::Inspect, 2), vec![INSTANCE_INDEX]),
         (
             wire(
@@ -353,6 +369,7 @@ fn every_post_baseline_field_names_its_capability() {
             CHECKPOINT_GGUF,
             DECISIONS,
             CUSTOM_ENGINES,
+            STARTUP_HOST_BYTES,
         ]
         .contains(name)
         {

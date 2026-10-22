@@ -29,7 +29,8 @@ pub use legacy::{
 pub use snapshot::decode_effective_snapshot;
 // Owner decision 2026-09-23: the startup memory budget.
 pub use startup::{
-    measurable, startup_budget, validate_declared_startup, StartupBudget, StartupProvenance,
+    startup_budget, startup_measure, validate_declared_startup, StartupBudget, StartupMeasure,
+    StartupProvenance,
 };
 // Owner decision 2026-09-22 (1), ADR 0014 amendment A1: lifecycle timeouts.
 pub use timeouts::{

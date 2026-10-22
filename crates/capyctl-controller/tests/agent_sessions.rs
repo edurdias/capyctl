@@ -1261,6 +1261,7 @@ async fn a_checkpoint_mismatch_is_answered_and_the_session_stays_up() {
                 checkpoint_tables: None,
                 checkpoint_gguf: None,
                 startup_bytes: None,
+                startup_host_bytes: None,
             },
         ),
     };
@@ -1393,6 +1394,7 @@ fn launch_command(
                 checkpoint_tables: None,
                 checkpoint_gguf: None,
                 startup_bytes: None,
+                startup_host_bytes: None,
             },
         ),
     };
