@@ -886,6 +886,7 @@ fn evidence(before: i64, after: i64, milestones: Vec<String>) -> pb::ResidencyEv
         mem_available_before_bytes: before,
         mem_available_after_bytes: after,
         milestones,
+        engine_stopped: false,
     }
 }
 

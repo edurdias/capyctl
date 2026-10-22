@@ -118,7 +118,12 @@ pub const STARTUP_HOST_BYTES: &str = "startup_host_bytes";
 /// its own document and of a deployment's. The server places a deployment
 /// with `lmcache: required` only on a host that declared it; any other host
 /// is refused `host_capability_missing:lmcache` before anything is sent. An
-/// `auto` deployment on such a host runs without LMCache, as before.
+/// `auto` deployment on such a host runs without LMCache, as before. It also
+/// covers a LaunchSingle plan's `lmcache` grant (sent only to such a host),
+/// and from the host `MemberExecutionResult.lmcache`,
+/// `ResidencyEvidence.engine_stopped` and `ReportLoad.lmcache`. The last is
+/// sent only to a server whose SessionReady lists it ([`server_capabilities`]),
+/// since an older server would refuse a report left with no load sample.
 pub const LMCACHE: &str = capyctl_config::lmcache::CAPABILITY;
 /// ADR 0033 §§10, 13: the host honours zero data retention (memory engine
 /// logs, no core dumps, no LMCache), its own `retention` setting and a
@@ -134,8 +139,9 @@ pub const MAX_RETIREMENT_DEPLOYMENTS: usize = 256;
 pub const MAX_REASON: usize = 512;
 
 /// ADR 0018: what this server advertises in `SessionReady.capabilities`.
+/// ADR 0033 §12: `lmcache`, so a host sends its LMCache samples.
 pub fn server_capabilities() -> Vec<String> {
-    vec![LIVE_PROFILE_UPDATE.to_owned()]
+    vec![LIVE_PROFILE_UPDATE.to_owned(), LMCACHE.to_owned()]
 }
 
 /// Which way a feature's messages flow.
@@ -253,6 +259,10 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
             if plan.checkpoint_gguf.is_some() {
                 needs.push(CHECKPOINT_GGUF);
             }
+            // ADR 0033 §§3, 6: an older host would drop the grant.
+            if plan.lmcache.is_some() {
+                needs.push(LMCACHE);
+            }
             lmcache_needs(&plan.deployment_config, &mut needs);
         }
         // ADR 0028 §14: a group plan carries fields an older host would drop.
@@ -296,9 +306,14 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
         if plan.checkpoint_tables.is_some() {
             needs.push(CHECKPOINT_TABLES);
         }
+        if plan.lmcache.is_some() {
+            needs.push(LMCACHE);
+        }
         lmcache_needs(&plan.deployment_config, &mut needs);
     }
     needs.sort_by_key(|need| CATALOGUE.iter().position(|(name, _)| name == need));
+    // ADR 0033: a grant and `lmcache: required` both name `lmcache`.
+    needs.dedup();
     needs
 }
 

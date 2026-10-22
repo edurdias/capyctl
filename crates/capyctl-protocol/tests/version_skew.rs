@@ -192,6 +192,7 @@ fn launch(digest: bool, startup: bool) -> MemberAction {
         checkpoint_gguf: None,
         startup_bytes: startup.then_some(2 << 30),
         startup_host_bytes: None,
+        lmcache: None,
     })
 }
 
@@ -529,7 +530,11 @@ fn live_profile_update_is_declared_both_ways() {
     use capabilities::*;
     assert!(CATALOGUE.contains(&(LIVE_PROFILE_UPDATE, Direction::ServerToHost)));
     assert!(agent_capabilities().contains(&LIVE_PROFILE_UPDATE.to_owned()));
-    assert_eq!(server_capabilities(), vec![LIVE_PROFILE_UPDATE.to_owned()]);
+    // ADR 0033 §12: and `lmcache`, so a host sends its LMCache samples.
+    assert_eq!(
+        server_capabilities(),
+        vec![LIVE_PROFILE_UPDATE.to_owned(), LMCACHE.to_owned()]
+    );
     let before = pb::SessionReady {
         controller_id: "c".into(),
         session_id: "s".into(),
@@ -705,6 +710,86 @@ fn lmcache_and_retention_gate_only_the_deployments_that_need_them() {
 
 fn refusal_for(declared: &BTreeSet<String>, command: &pb::ExecuteMember) -> Option<String> {
     capabilities::refusal(false, declared, command)
+}
+
+// T45 T35 T36 T34 (ADR 0033 §§3, 6, 13): a launch's LMCache grant is an
+// additive field that needs `lmcache`: a launch without one encodes exactly
+// as before, a host that did not declare it is refused typed before anything
+// is sent, and an older host that dropped the field would recompute another
+// digest. A grant beside `lmcache: required` names the capability once.
+#[test]
+fn an_lmcache_grant_is_sent_only_to_a_host_that_declared_lmcache() {
+    use capabilities::*;
+    use capyctl_protocol::execution::LmcacheGrant;
+    let grant = LmcacheGrant {
+        rpc_port: 8100,
+        http_port: 8101,
+        pool_bytes: 4 << 30,
+        overhead_bytes: 1280 << 20,
+        device_bytes: 512 << 20,
+        held_kv_bytes: 0,
+    };
+    let typed = |settings: serde_json::Value| {
+        let MemberAction::LaunchSingle(mut plan) = launch(true, false) else {
+            unreachable!()
+        };
+        let mut document: serde_json::Value =
+            serde_json::from_str(&plan.deployment_config).unwrap();
+        for (key, value) in settings.as_object().unwrap() {
+            document[key] = value.clone();
+        }
+        plan.deployment_config = document.to_string();
+        plan.lmcache = Some(grant);
+        let mut command = MemberCommand {
+            identity: identity(0),
+            action: MemberAction::LaunchSingle(plan),
+        };
+        command.identity.payload_digest = command.canonical_digest();
+        command
+    };
+    let with_grant = |settings: serde_json::Value| typed(settings).to_wire();
+    let plain = launch_with(serde_json::json!({}));
+    let granted = with_grant(serde_json::json!({}));
+    assert_eq!(required(&plain), vec![CHECKPOINT_DIGEST]);
+    assert_eq!(required(&granted), vec![CHECKPOINT_DIGEST, LMCACHE]);
+    let required_and_granted = with_grant(serde_json::json!({"lmcache": "required"}));
+    assert_eq!(
+        required(&required_and_granted),
+        vec![CHECKPOINT_DIGEST, LMCACHE]
+    );
+    let current: BTreeSet<String> = agent_capabilities().into_iter().collect();
+    let older: BTreeSet<String> = current
+        .iter()
+        .filter(|name| *name != LMCACHE)
+        .cloned()
+        .collect();
+    assert_eq!(
+        refusal_for(&older, &granted).as_deref(),
+        Some("host_capability_missing:lmcache")
+    );
+    assert_eq!(refusal_for(&older, &plain), None);
+    assert_eq!(refusal_for(&current, &granted), None);
+    // Absent, the plan encodes exactly as an older server's: no field 19.
+    let Some(pb::execute_member::Action::LaunchSingle(plan)) = granted.action.clone() else {
+        unreachable!()
+    };
+    let mut baseline = plan.clone();
+    baseline.lmcache = None;
+    let mut tail = Vec::new();
+    prost::encoding::message::encode(19, &grant.to_wire(), &mut tail);
+    assert_eq!(
+        plan.encode_to_vec(),
+        [baseline.encode_to_vec(), tail].concat(),
+        "the grant is only field 19, appended"
+    );
+    // An older host drops field 19 and recomputes a different digest.
+    let kept = typed(serde_json::json!({}));
+    let mut dropped = kept.clone();
+    let MemberAction::LaunchSingle(plan) = &mut dropped.action else {
+        unreachable!()
+    };
+    plan.lmcache = None;
+    assert_ne!(dropped.canonical_digest(), kept.identity.payload_digest);
 }
 
 // T34 T26 (ADR 0019, discrete GPU design §8): device memory domains are one

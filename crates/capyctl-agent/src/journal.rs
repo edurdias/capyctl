@@ -1812,6 +1812,9 @@ impl HostJournal {
             probe_text: String::new(),
             // ADR 0030 §4: nor a decision probe's answer.
             probe_decision: None,
+            // ADR 0033 §§8, 9: a launch's LMCache report travels with its
+            // persisted result (below); the journal holds none of its own.
+            lmcache: None,
         };
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         // A launch that is not resident (parking, parked, restoring or
@@ -1829,6 +1832,9 @@ impl HostJournal {
                 .map_err(|_| JournalError::Storage)?;
             capyctl_protocol::execution::validate_result(&command, &previous)
                 .map_err(|_| JournalError::Storage)?;
+            // ADR 0033 §§8, 9: what became of the launch's LMCache is part of
+            // the persisted outcome, replayed as it was.
+            result.lmcache = previous.lmcache.clone();
             // ADR 0027: the engine's own processes; a helper that exited
             // since the result was persisted does not change the launch.
             let alive = |report: &pb::MemberExecutionResult| {
@@ -2243,6 +2249,7 @@ fn unknown_residency() -> pb::ResidencyEvidence {
         mem_available_before_bytes: -1,
         mem_available_after_bytes: -1,
         milestones: Vec::new(),
+        engine_stopped: false,
     }
 }
 

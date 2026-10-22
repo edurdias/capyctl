@@ -1105,6 +1105,8 @@ fn launch_commands(
                 checkpoint_tables: memory.disk_tables.map(|recorded| recorded.tables),
                 // ADR 0029 §1: llama.cpp runs no groups.
                 checkpoint_gguf: None,
+                // ADR 0033 §2: a group runs no LMCache (`group_unsupported`).
+                lmcache: None,
                 startup_bytes: None,
                 startup_host_bytes: None,
             };

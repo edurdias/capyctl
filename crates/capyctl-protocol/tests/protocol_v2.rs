@@ -206,6 +206,7 @@ fn residency(state: &str) -> pb::ResidencyEvidence {
         mem_available_before_bytes: 10,
         mem_available_after_bytes: 90,
         milestones: vec!["sleep_level_2".into(), "released".into()],
+        engine_stopped: false,
     }
 }
 fn parked_result(command: &MemberCommand) -> pb::MemberExecutionResult {
@@ -230,6 +231,7 @@ fn parked_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         engine_log: None,
         probe_text: String::new(),
         probe_decision: None,
+        lmcache: None,
     }
 }
 
@@ -381,6 +383,7 @@ fn load(samples: Vec<pb::LoadSample>) -> pb::ReportLoad {
     pb::ReportLoad {
         host_id: "host".into(),
         samples,
+        lmcache: Vec::new(),
     }
 }
 
@@ -577,6 +580,7 @@ fn a_policy_refused_park_is_unchanged_with_a_closed_reason() {
             mem_available_before_bytes: -1,
             mem_available_after_bytes: -1,
             milestones: vec![],
+            engine_stopped: false,
         });
         result.refused = "residency_tier".into();
         validate_result(&command, &result).unwrap();

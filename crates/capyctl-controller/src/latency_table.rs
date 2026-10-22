@@ -162,6 +162,7 @@ mod tests {
                     histograms: vec![(series.into(), h)],
                 }),
             }],
+            lmcache: Vec::new(),
         }
     }
 

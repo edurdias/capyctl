@@ -3081,6 +3081,7 @@ mod tests {
                 checkpoint_gguf: None,
                 startup_bytes: None,
                 startup_host_bytes: None,
+                lmcache: None,
             }),
         };
         let legacy = command(&deployment);
@@ -3230,6 +3231,7 @@ mod tests {
             checkpoint_gguf: None,
             startup_bytes: None,
             startup_host_bytes: None,
+            lmcache: None,
         };
         let command = MemberCommand {
             identity: checkpoint_identity("launch", "reserved"),

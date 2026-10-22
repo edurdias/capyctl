@@ -168,6 +168,7 @@ fn launch(id: &str) -> MemberCommand {
             checkpoint_gguf: None,
             startup_bytes: None,
             startup_host_bytes: None,
+            lmcache: None,
         },
         plan: GroupPlan::new(
             GroupEngine::Vllm,
@@ -722,6 +723,7 @@ async fn native_result_replay_retains_probe_timestamp_and_rejects_forged_identit
         checkpoint_gguf: None,
         startup_bytes: None,
         startup_host_bytes: None,
+        lmcache: None,
     });
     let c = sign(c);
     let policy = std::sync::Arc::new(Workers);

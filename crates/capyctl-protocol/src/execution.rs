@@ -55,6 +55,77 @@ pub struct SingleLaunchPlan {
     /// ADR 0029 §9: the GGUF facts the server resolved a llama.cpp revision
     /// with.
     pub checkpoint_gguf: Option<GgufFacts>,
+    /// ADR 0033 §§3, 6, 7: the LMCache server the store planned for this
+    /// launch, its leased ports and its charge. `None` when the store planned
+    /// LMCache off (and in every command from a server that predates it).
+    pub lmcache: Option<LmcacheGrant>,
+}
+
+/// ADR 0033 §§3, 6, 7: one launch's LMCache server as the store planned it:
+/// the two loopback ports it leased from the host's endpoint range, and the
+/// charge it reserved beside the engine, which the host lays over the
+/// launch's footprint with `capyctl_config::lmcache::apply_charge` so both
+/// sides reserve the same bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LmcacheGrant {
+    pub rpc_port: u16,
+    pub http_port: u16,
+    /// The L1 pool, a whole number of GiB, at least 1 GiB.
+    pub pool_bytes: i64,
+    pub overhead_bytes: i64,
+    pub device_bytes: i64,
+    /// The engine KV the server keeps mapped while a `restart_only` park has
+    /// stopped its engine (charged in the parked phase only).
+    pub held_kv_bytes: i64,
+}
+
+impl LmcacheGrant {
+    /// The grant from the wire, if every field is in range: two distinct
+    /// nonzero ports, neither the engine's `service_port`; a whole-GiB pool
+    /// of at least 1 GiB; no negative figure.
+    pub fn from_wire(grant: &pb::LmcacheGrant, service_port: u32) -> Option<Self> {
+        const GIB: i64 = capyctl_config::lmcache::GIB as i64;
+        let port = |port: u32| u16::try_from(port).ok().filter(|port| *port != 0);
+        let rpc_port = port(grant.rpc_port)?;
+        let http_port = port(grant.http_port)?;
+        (rpc_port != http_port
+            && u32::from(rpc_port) != service_port
+            && u32::from(http_port) != service_port
+            && grant.pool_bytes >= GIB
+            && grant.pool_bytes % GIB == 0
+            && grant.overhead_bytes >= 0
+            && grant.device_bytes >= 0
+            && grant.held_kv_bytes >= 0)
+            .then_some(Self {
+                rpc_port,
+                http_port,
+                pool_bytes: grant.pool_bytes,
+                overhead_bytes: grant.overhead_bytes,
+                device_bytes: grant.device_bytes,
+                held_kv_bytes: grant.held_kv_bytes,
+            })
+    }
+
+    pub fn to_wire(&self) -> pb::LmcacheGrant {
+        pb::LmcacheGrant {
+            rpc_port: self.rpc_port.into(),
+            http_port: self.http_port.into(),
+            pool_bytes: self.pool_bytes,
+            overhead_bytes: self.overhead_bytes,
+            device_bytes: self.device_bytes,
+            held_kv_bytes: self.held_kv_bytes,
+        }
+    }
+
+    /// ADR 0033 §6: the charge the store reserved, for `apply_charge`.
+    pub fn charge(&self) -> capyctl_config::lmcache::LmcacheCharge {
+        capyctl_config::lmcache::LmcacheCharge {
+            pool_bytes: self.pool_bytes,
+            overhead_bytes: self.overhead_bytes,
+            device_bytes: self.device_bytes,
+            held_kv_bytes: self.held_kv_bytes,
+        }
+    }
 }
 /// ADR 0014 §7: an empty digest (pre-WE3 journal) or a canonical one; weights
 /// only alongside a digest, and never negative.
@@ -208,6 +279,11 @@ impl SingleLaunchPlan {
             || plan.checkpoint_gguf.as_ref().is_some_and(|gguf| {
                 gguf_from_wire(gguf).is_none() || plan.checkpoint_weights_bytes.is_none()
             })
+            // ADR 0033 §§3, 6: a grant in range; a group member never has one
+            // (ADR 0033 §2: no LMCache with a topology).
+            || plan.lmcache.as_ref().is_some_and(|grant| {
+                group_member || LmcacheGrant::from_wire(grant, plan.service_port).is_none()
+            })
         {
             return Err(GroupIdentityError);
         }
@@ -238,6 +314,10 @@ impl SingleLaunchPlan {
             checkpoint_layout: plan.checkpoint_layout.as_ref().and_then(layout_from_wire),
             checkpoint_tables: plan.checkpoint_tables.as_ref().and_then(tables_from_wire),
             checkpoint_gguf: plan.checkpoint_gguf.as_ref().and_then(gguf_from_wire),
+            lmcache: plan
+                .lmcache
+                .as_ref()
+                .and_then(|grant| LmcacheGrant::from_wire(grant, plan.service_port)),
         })
     }
     fn to_wire(&self) -> pb::SingleLaunchPlan {
@@ -266,6 +346,7 @@ impl SingleLaunchPlan {
             checkpoint_layout: self.checkpoint_layout.as_ref().map(layout_to_wire),
             checkpoint_tables: self.checkpoint_tables.as_ref().map(tables_to_wire),
             checkpoint_gguf: self.checkpoint_gguf.as_ref().map(gguf_to_wire),
+            lmcache: self.lmcache.as_ref().map(LmcacheGrant::to_wire),
         }
     }
 }
@@ -1182,10 +1263,17 @@ pub fn validate_result(
     validate_prepare(command, result)?;
     validate_refusal(command, result)?;
     validate_launch_failure(command, result)?;
+    validate_lmcache(command, result)?;
     let named_binding = !result.binding_id.is_empty()
         && result.binding_id.len() <= 128
         && !result.incarnation.is_empty()
         && result.incarnation.len() <= 128;
+    // ADR 0033 §7: a `restart_only` park stopped the engine and kept the
+    // launch's LMCache server: only the server's group is alive.
+    let engine_stopped = result
+        .residency
+        .as_ref()
+        .is_some_and(|evidence| evidence.engine_stopped);
     // SPEC §§9.1, 10: parked or restored is claimed only on completion, by the
     // still-owned launch it names, whose api and worker processes are alive.
     // Process identity unchanged against the retained launch is the caller's
@@ -1194,7 +1282,11 @@ pub fn validate_result(
         && (result.state != "completed"
             || !result.claim_retained
             || !named_binding
-            || !live_group(result, false))
+            || !if engine_stopped {
+                live_server_alone(result)
+            } else {
+                live_group(result, false)
+            })
     {
         return Err(GroupIdentityError);
     }
@@ -1231,13 +1323,18 @@ pub fn validate_result(
     Ok(())
 }
 
-/// The alive processes of a result form one local group with an api process and
-/// at least one worker, all on one boot with distinct roles and PIDs. ADR 0023 §6:
-/// for a readiness claim (`single`), a group of one process is its api process
-/// alone, as TensorFold serves from one; a residency claim keeps its worker, as
-/// only the engines with workers park.
-fn live_group(result: &pb::MemberExecutionResult, single: bool) -> bool {
-    let current: Vec<_> = result
+/// ADR 0033 §3: whether `role` belongs to a launch's LMCache server group
+/// (`lmcache`, or `lmcache-N`).
+fn lmcache_role(role: &str) -> bool {
+    role == "lmcache"
+        || role
+            .strip_prefix("lmcache-")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The alive processes of a result, as identities.
+fn alive(result: &pb::MemberExecutionResult) -> Vec<capyctl_domain::completion::ProcessIdentity> {
+    result
         .processes
         .iter()
         .filter(|p| p.presence == "alive")
@@ -1247,10 +1344,36 @@ fn live_group(result: &pb::MemberExecutionResult, single: bool) -> bool {
             boot_id: p.boot_id.clone(),
             start_ticks: p.start_ticks,
         })
-        .collect();
-    let single = single && result.processes.len() == 1;
+        .collect()
+}
+
+/// The alive processes of a result form one local group with an api process and
+/// at least one worker, all on one boot with distinct roles and PIDs. ADR 0023 §6:
+/// for a readiness claim (`single`), a group of one process is its api process
+/// alone, as TensorFold serves from one; a residency claim keeps its worker, as
+/// only the engines with workers park. ADR 0033 §3: the launch's LMCache server
+/// group, when it has one, is on the same boot and does not count as the
+/// engine's.
+fn live_group(result: &pb::MemberExecutionResult, single: bool) -> bool {
+    let current = alive(result);
+    let single = single
+        && result
+            .processes
+            .iter()
+            .filter(|p| !lmcache_role(&p.role))
+            .count()
+            == 1;
     current.iter().any(|p| p.role == "api")
         && (single || current.iter().any(|p| p.role.starts_with("worker-")))
+        && capyctl_domain::group::validate_local_processes(&current).is_ok()
+}
+
+/// ADR 0033 §7: the alive processes of a restart-parked launch are its LMCache
+/// server's group alone: the `lmcache` leader, no engine process, one boot.
+fn live_server_alone(result: &pb::MemberExecutionResult) -> bool {
+    let current = alive(result);
+    current.iter().any(|p| p.role == "lmcache")
+        && current.iter().all(|p| lmcache_role(&p.role))
         && capyctl_domain::group::validate_local_processes(&current).is_ok()
 }
 
@@ -1319,6 +1442,22 @@ pub fn is_policy_refusal(reason: &str) -> bool {
     POLICY_REFUSALS.contains(&reason)
 }
 
+/// ADR 0033 §§9, 14: whether `reason` is the code a `lmcache: required`
+/// launch is refused with when its host finds LMCache unusable before any
+/// effect (its launch-time check, or its own settings): the
+/// `required_refusal` of any reason but the deployment's own `disabled` and
+/// the three found only once something ran (`server_start_failed`,
+/// `listener_exposed`, `engine_start_failed`, which fail the launch instead).
+pub fn is_lmcache_refusal(reason: &str) -> bool {
+    use capyctl_config::lmcache::LmcacheOffReason as R;
+    R::ALL.into_iter().any(|off| {
+        !matches!(
+            off,
+            R::Disabled | R::ServerStartFailed | R::ListenerExposed | R::EngineStartFailed
+        ) && off.required_refusal() == reason
+    })
+}
+
 /// ADR 0028 §7, §16: the closed codes a host refuses a group Prepare (and a
 /// group Launch's re-run of its checks) with. The port codes name one nonzero
 /// port. `group_topology_invalid`: the plan gives a member more than one rank
@@ -1369,7 +1508,8 @@ fn validate_refusal(
             !result.claim_retained
                 && result.processes.is_empty()
                 && result.owned_handle == command.identity.command_id,
-            is_policy_refusal(&result.refused),
+            // ADR 0033 §9: or a `lmcache: required` launch's host-found code.
+            is_policy_refusal(&result.refused) || is_lmcache_refusal(&result.refused),
         ),
         MemberAction::Park { .. } | MemberAction::Restore { .. } => {
             (unchanged, is_policy_refusal(&result.refused))
@@ -1439,6 +1579,171 @@ fn validate_launch_failure(
         return Err(GroupIdentityError);
     }
     Ok(())
+}
+
+/// ADR 0033 §§8, 9: the longest detail a launch's LMCache report carries.
+pub const MAX_LMCACHE_DETAIL_BYTES: usize = 2048;
+
+/// ADR 0033 §§3, 8, 9: whether a launch ran with LMCache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchLmcacheState {
+    On,
+    Off,
+}
+
+/// ADR 0033 §§3, 8, 9 (lifecycle design §10): what became of one launch's
+/// LMCache, reported with its LaunchSingle and Restore results. `On` names
+/// the server's ports and pool; `Off` a closed reason and its detail (the
+/// redacted engine log tail for `engine_start_failed`, else the reason's
+/// sentence), and whether the engine failed with the connector.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchLmcache {
+    pub state: LaunchLmcacheState,
+    pub reason: Option<capyctl_config::lmcache::LmcacheOffReason>,
+    pub detail: String,
+    pub rpc_port: u16,
+    pub http_port: u16,
+    pub pool_bytes: i64,
+    pub connector_failed: bool,
+}
+
+impl LaunchLmcache {
+    /// LMCache ran: the server on these ports with this pool.
+    pub fn on(rpc_port: u16, http_port: u16, pool_bytes: i64) -> Self {
+        Self {
+            state: LaunchLmcacheState::On,
+            reason: None,
+            detail: String::new(),
+            rpc_port,
+            http_port,
+            pool_bytes,
+            connector_failed: false,
+        }
+    }
+
+    /// LMCache was off for `reason`. The detail keeps its last
+    /// [`MAX_LMCACHE_DETAIL_BYTES`] (a log tail's newest lines) with every
+    /// control character but a newline or tab replaced by a space.
+    pub fn off(
+        reason: capyctl_config::lmcache::LmcacheOffReason,
+        detail: &str,
+        connector_failed: bool,
+    ) -> Self {
+        let mut start = detail.len().saturating_sub(MAX_LMCACHE_DETAIL_BYTES);
+        while !detail.is_char_boundary(start) {
+            start += 1;
+        }
+        Self {
+            state: LaunchLmcacheState::Off,
+            reason: Some(reason),
+            detail: detail[start..]
+                .chars()
+                .map(|c| {
+                    if c.is_control() && c != '\n' && c != '\t' {
+                        ' '
+                    } else {
+                        c
+                    }
+                })
+                .collect(),
+            rpc_port: 0,
+            http_port: 0,
+            pool_bytes: 0,
+            connector_failed: connector_failed
+                && reason == capyctl_config::lmcache::LmcacheOffReason::EngineStartFailed,
+        }
+    }
+
+    pub fn to_wire(&self) -> pb::LaunchLmcacheReport {
+        pb::LaunchLmcacheReport {
+            state: match self.state {
+                LaunchLmcacheState::On => "on",
+                LaunchLmcacheState::Off => "off",
+            }
+            .into(),
+            reason: self.reason.map(|r| r.code().to_owned()).unwrap_or_default(),
+            detail: self.detail.clone(),
+            rpc_port: self.rpc_port.into(),
+            http_port: self.http_port.into(),
+            pool_bytes: self.pool_bytes,
+            connector_failed: self.connector_failed,
+        }
+    }
+}
+
+impl TryFrom<&pb::LaunchLmcacheReport> for LaunchLmcache {
+    type Error = GroupIdentityError;
+    /// `on`: two distinct nonzero ports, a whole-GiB pool, nothing else.
+    /// `off`: a closed reason, a detail of at most
+    /// [`MAX_LMCACHE_DETAIL_BYTES`] without control characters but newline
+    /// and tab, no port or pool, and `connector_failed` only beside
+    /// `engine_start_failed`.
+    fn try_from(report: &pb::LaunchLmcacheReport) -> Result<Self, Self::Error> {
+        use capyctl_config::lmcache::{LmcacheOffReason, GIB};
+        match report.state.as_str() {
+            "on" => {
+                let port = |port: u32| u16::try_from(port).ok().filter(|port| *port != 0);
+                let (Some(rpc_port), Some(http_port)) =
+                    (port(report.rpc_port), port(report.http_port))
+                else {
+                    return Err(GroupIdentityError);
+                };
+                if rpc_port == http_port
+                    || report.pool_bytes < GIB as i64
+                    || report.pool_bytes % GIB as i64 != 0
+                    || !report.reason.is_empty()
+                    || !report.detail.is_empty()
+                    || report.connector_failed
+                {
+                    return Err(GroupIdentityError);
+                }
+                Ok(Self::on(rpc_port, http_port, report.pool_bytes))
+            }
+            "off" => {
+                let reason = LmcacheOffReason::parse(&report.reason).ok_or(GroupIdentityError)?;
+                if report.detail.len() > MAX_LMCACHE_DETAIL_BYTES
+                    || report
+                        .detail
+                        .chars()
+                        .any(|c| c.is_control() && c != '\n' && c != '\t')
+                    || report.rpc_port != 0
+                    || report.http_port != 0
+                    || report.pool_bytes != 0
+                    || (report.connector_failed && reason != LmcacheOffReason::EngineStartFailed)
+                {
+                    return Err(GroupIdentityError);
+                }
+                Ok(Self {
+                    state: LaunchLmcacheState::Off,
+                    reason: Some(reason),
+                    detail: report.detail.clone(),
+                    rpc_port: 0,
+                    http_port: 0,
+                    pool_bytes: 0,
+                    connector_failed: report.connector_failed,
+                })
+            }
+            _ => Err(GroupIdentityError),
+        }
+    }
+}
+
+/// ADR 0033 §§8, 9: a launch's LMCache report belongs to a LaunchSingle or a
+/// Restore result only, and is well formed.
+fn validate_lmcache(
+    command: &MemberCommand,
+    result: &pb::MemberExecutionResult,
+) -> Result<(), GroupIdentityError> {
+    let Some(report) = &result.lmcache else {
+        return Ok(());
+    };
+    if !matches!(
+        command.action,
+        MemberAction::LaunchSingle(_) | MemberAction::Restore { .. }
+    ) {
+        return Err(GroupIdentityError);
+    }
+    LaunchLmcache::try_from(report).map(|_| ())
 }
 
 /// ADR 0014 §7: `computed` carries a canonical digest and its weights;
@@ -1605,6 +1910,8 @@ fn validate_residency(
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b))
         })
+        // ADR 0033 §7: only a completed restart-park says its engine stopped.
+        || (evidence.engine_stopped && claim != ResidencyClaim::Parked)
     {
         return Err(GroupIdentityError);
     }

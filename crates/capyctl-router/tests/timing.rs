@@ -261,6 +261,7 @@ async fn host_series_are_grouped_with_the_router_series() {
                     ],
                 }),
             }],
+            lmcache: Vec::new(),
         },
         1,
     );

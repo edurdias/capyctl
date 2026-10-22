@@ -166,10 +166,112 @@ impl LoadSample {
     }
 }
 
+/// ADR 0033 §12: the cache figures of one launch's private LMCache server,
+/// Ready or parked, and its server group's measured memory. Every figure is
+/// `None` when unknown (absent from `/metrics`, unparseable, or the scrape
+/// failed), never zero. A status figure and an accounting measurement, never
+/// readiness, admission or release evidence; never journaled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LmcacheSample {
+    pub deployment_id: String,
+    pub generation: i64,
+    pub owned_handle: String,
+    pub sampled_at_ms: i64,
+    /// The `/metrics` scrape answered; `false` carries no cache figure.
+    pub scrape_ok: bool,
+    /// `lmcache_mp_l1_memory_usage_bytes`.
+    pub used_bytes: Option<u64>,
+    /// `lmcache_mp_l1_usage_ratio`, in parts per million.
+    pub usage_ppm: Option<u32>,
+    /// `lmcache_mp_inflight_load_memory_usage_bytes`.
+    pub inflight_bytes: Option<u64>,
+    /// The L1 allocation-failure counters, summed.
+    pub alloc_failures: Option<u64>,
+    /// Lookup and hit counters, each summed over every label set.
+    pub lookups: Option<u64>,
+    pub hits: Option<u64>,
+    /// `lmcache_mp_l2_usage_bytes`: expected absent or zero; above zero is a
+    /// degraded condition (ADR 0033 §12).
+    pub l2_bytes: Option<u64>,
+    /// The server group's resident memory and, on a discrete GPU, its GPU
+    /// memory, measured by the host (ADR 0033 §6).
+    pub rss_bytes: Option<u64>,
+    pub device_bytes: Option<u64>,
+}
+
+impl LmcacheSample {
+    /// ADR 0033 §12: L2 holds data although no L2 tier is configured.
+    pub fn l2_degraded(&self) -> bool {
+        self.l2_bytes.is_some_and(|bytes| bytes > 0)
+    }
+
+    fn try_from_wire(sample: pb::LmcacheSample) -> Result<Self, GroupIdentityError> {
+        let scraped = [
+            sample.used_bytes.is_some(),
+            sample.usage_ppm.is_some(),
+            sample.inflight_bytes.is_some(),
+            sample.alloc_failures.is_some(),
+            sample.lookups.is_some(),
+            sample.hits.is_some(),
+            sample.l2_bytes.is_some(),
+        ];
+        if !bounded_id(&sample.deployment_id)
+            || sample.generation <= 0
+            || !bounded_handle(&sample.owned_handle)
+            || sample.sampled_at_unix_ms < 0
+            || sample.usage_ppm.is_some_and(|ppm| ppm > KV_USAGE_PPM_FULL)
+            // Hits are lookups that hit.
+            || matches!((sample.lookups, sample.hits), (Some(lookups), Some(hits)) if hits > lookups)
+            // A failed scrape carries no cache figure at all.
+            || (!sample.scrape_ok && scraped.contains(&true))
+        {
+            return Err(GroupIdentityError);
+        }
+        Ok(Self {
+            deployment_id: sample.deployment_id,
+            generation: sample.generation,
+            owned_handle: sample.owned_handle,
+            sampled_at_ms: sample.sampled_at_unix_ms,
+            scrape_ok: sample.scrape_ok,
+            used_bytes: sample.used_bytes,
+            usage_ppm: sample.usage_ppm,
+            inflight_bytes: sample.inflight_bytes,
+            alloc_failures: sample.alloc_failures,
+            lookups: sample.lookups,
+            hits: sample.hits,
+            l2_bytes: sample.l2_bytes,
+            rss_bytes: sample.rss_bytes,
+            device_bytes: sample.device_bytes,
+        })
+    }
+
+    pub fn to_wire(&self) -> pb::LmcacheSample {
+        pb::LmcacheSample {
+            deployment_id: self.deployment_id.clone(),
+            generation: self.generation,
+            owned_handle: self.owned_handle.clone(),
+            sampled_at_unix_ms: self.sampled_at_ms,
+            scrape_ok: self.scrape_ok,
+            used_bytes: self.used_bytes,
+            usage_ppm: self.usage_ppm,
+            inflight_bytes: self.inflight_bytes,
+            alloc_failures: self.alloc_failures,
+            lookups: self.lookups,
+            hits: self.hits,
+            l2_bytes: self.l2_bytes,
+            rss_bytes: self.rss_bytes,
+            device_bytes: self.device_bytes,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoadReport {
     pub host_id: String,
     pub samples: Vec<LoadSample>,
+    /// ADR 0033 §12: one per launch with a private LMCache server, Ready or
+    /// parked; at most [`MAX_LOAD_SAMPLES`].
+    pub lmcache: Vec<LmcacheSample>,
 }
 
 impl TryFrom<pb::ReportLoad> for LoadReport {
@@ -177,8 +279,11 @@ impl TryFrom<pb::ReportLoad> for LoadReport {
     fn try_from(report: pb::ReportLoad) -> Result<Self, Self::Error> {
         use prost::Message;
         if !bounded_id(&report.host_id)
-            || report.samples.is_empty()
+            // ADR 0033 §12: a parked launch's server is sampled alone, so a
+            // report may carry LMCache samples and no load sample.
+            || (report.samples.is_empty() && report.lmcache.is_empty())
             || report.samples.len() > MAX_LOAD_SAMPLES
+            || report.lmcache.len() > MAX_LOAD_SAMPLES
             || report.encoded_len() > MAX_LOAD_REPORT_BYTES
         {
             return Err(GroupIdentityError);
@@ -225,9 +330,19 @@ impl TryFrom<pb::ReportLoad> for LoadReport {
                 ingress_in_flight: sample.ingress_in_flight,
             });
         }
+        let mut lmcache = Vec::with_capacity(report.lmcache.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for sample in report.lmcache {
+            // One LMCache sample per scope and generation per report.
+            if !seen.insert((sample.deployment_id.clone(), sample.generation)) {
+                return Err(GroupIdentityError);
+            }
+            lmcache.push(LmcacheSample::try_from_wire(sample)?);
+        }
         Ok(Self {
             host_id: report.host_id,
             samples,
+            lmcache,
         })
     }
 }
@@ -260,6 +375,7 @@ impl LoadReport {
                     }
                 })
                 .collect(),
+            lmcache: self.lmcache.iter().map(LmcacheSample::to_wire).collect(),
         }
     }
 }

@@ -86,6 +86,7 @@ fn the_load_read_reports_fresh_then_stale_then_no_sample() {
             LoadReport {
                 host_id: "h1".into(),
                 samples: vec![sample(7, Some(24)), sample(8, Some(99))],
+                lmcache: Vec::new(),
             },
             NOW,
         )
@@ -169,6 +170,7 @@ fn unknown_load_is_null_never_zero() {
             LoadReport {
                 host_id: "h1".into(),
                 samples: vec![unscraped],
+                lmcache: Vec::new(),
             },
             NOW,
         )

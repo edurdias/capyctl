@@ -929,6 +929,7 @@ impl FakeHost {
                     checkpoint_gguf: None,
                     startup_bytes: None,
                     startup_host_bytes: None,
+                    lmcache: None,
                 },
             },
         };
@@ -1285,6 +1286,7 @@ fn launch(plan: GroupPlan) -> MemberAction {
             checkpoint_gguf: None,
             startup_bytes: None,
             startup_host_bytes: None,
+            lmcache: None,
         },
         plan,
     }
