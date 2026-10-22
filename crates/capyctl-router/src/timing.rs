@@ -579,6 +579,7 @@ mod tests {
                         histograms: vec![("ingress_time_to_last_byte".into(), histogram)],
                     }),
                 }],
+                lmcache: Vec::new(),
             },
             1,
         );

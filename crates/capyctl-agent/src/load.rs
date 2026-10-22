@@ -1005,6 +1005,7 @@ pub fn batch(host_id: &str, samples: Vec<LoadSample>) -> Vec<pb::ReportLoad> {
         LoadReport {
             host_id: host_id.to_owned(),
             samples: samples.to_vec(),
+            lmcache: Vec::new(),
         }
         .to_wire()
     };

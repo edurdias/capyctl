@@ -311,6 +311,7 @@ mod tests {
         LoadReport {
             host_id: host.into(),
             samples,
+            lmcache: Vec::new(),
         }
     }
 

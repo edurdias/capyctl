@@ -553,6 +553,7 @@ impl crate::remote_readiness::ReadinessHosts for ScriptedReadiness {
             engine_log: None,
             probe_text: String::new(),
             probe_decision: None,
+            lmcache: None,
         };
         Box::pin(async move { session.map(|s| (s, result)).ok_or(()) })
     }
@@ -1441,6 +1442,7 @@ async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence()
         LoadReport {
             host_id: "lab".into(),
             samples: vec![sample(&launch.step_id)],
+            lmcache: Vec::new(),
         },
         now,
     )
@@ -1730,6 +1732,7 @@ async fn a_remote_cancelling_lease_settles_only_on_an_idle_sample_after_the_hang
                 checkpoint_gguf: None,
                 startup_bytes: None,
                 startup_host_bytes: None,
+                lmcache: None,
             },
             ingress_gate_key: [7; 32],
             instance_index: 0,
@@ -1760,6 +1763,7 @@ async fn a_remote_cancelling_lease_settles_only_on_an_idle_sample_after_the_hang
                     latency: None,
                     max_running: None,
                 }],
+                lmcache: Vec::new(),
             },
             capyctl_protocol::now_unix_ms(),
         )
@@ -1889,6 +1893,7 @@ async fn a_remote_cancelling_lease_settles_while_a_stop_drains() {
                 checkpoint_gguf: None,
                 startup_bytes: None,
                 startup_host_bytes: None,
+                lmcache: None,
             },
             ingress_gate_key: [7; 32],
             instance_index: 0,
@@ -1947,6 +1952,7 @@ async fn a_remote_cancelling_lease_settles_while_a_stop_drains() {
                     latency: None,
                     max_running: None,
                 }],
+                lmcache: Vec::new(),
             },
             capyctl_protocol::now_unix_ms(),
         )

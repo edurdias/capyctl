@@ -595,6 +595,7 @@ impl GroupHost {
                 mem_available_before_bytes: -1,
                 mem_available_after_bytes: -1,
                 milestones: Vec::new(),
+                engine_stopped: false,
             }),
             ..Self::reply(command)
         })
@@ -2390,6 +2391,7 @@ fn launch(host: &str, rank: u32, plan: &GroupPlan, command_id: &str) -> MemberCo
                 checkpoint_layout: None,
                 checkpoint_tables: None,
                 checkpoint_gguf: None,
+                lmcache: None,
             },
         },
     )

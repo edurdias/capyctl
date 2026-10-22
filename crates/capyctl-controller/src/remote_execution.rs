@@ -1201,6 +1201,9 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
             // host RAM's apart, so the host charges each where it belongs.
             startup_bytes: Some(startup_bytes),
             startup_host_bytes,
+            // ADR 0033 §§3, 6: the store's LMCache grant (lifecycle design
+            // §10: filled from `launch_lmcache`); none is planned here.
+            lmcache: None,
             checkpoint_digest,
             deployment_config: local.to_string(),
             profile_name,
@@ -1473,6 +1476,7 @@ mod tests {
                 checkpoint_gguf: None,
                 startup_bytes: None,
                 startup_host_bytes: None,
+                lmcache: None,
             },
             ingress_gate_key: [7; 32],
             instance_index: 0,
