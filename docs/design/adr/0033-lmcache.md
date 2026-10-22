@@ -834,3 +834,14 @@ neither. CapyCTL now renders both into the server's environment, and into the en
 whenever its connector is on (the connector imports LMCache in the engine), embedded and
 remote; the engine's resolved environment never replaces them. Nothing about a launch
 leaves the host.
+
+**A8. A restart-park's quiescence (§7).** Found live on SGLang 0.5.22: an embedded
+restart-park was always refused as not quiescent, because SGLang's quiescence proof is the
+memory saver's observer, which a `restart_only` launch never has. A restart-park stops
+the engine and releases nothing in place, so its proof is the one SPEC §10 step 4 needs
+without a saver: nothing in flight at ingress (the park is armed only then) and the
+engine's own running and queued gauges at zero, read now; an unreadable gauge is not
+quiescence. vLLM's proof was already its gauges. A remote host's restart-park checked its
+ingress alone before it stopped the engine; it now also reads the engine's gauges after
+its ingress reads zero, and an engine that is busy or cannot say leaves the launch
+unchanged. Decision deployments (A6) park the same way. The deep-park proof is unchanged.

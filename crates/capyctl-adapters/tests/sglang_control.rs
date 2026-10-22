@@ -927,6 +927,14 @@ async fn a_separated_trace_with_the_exact_marker_still_passes() {
 
 /// A loopback SGLang `/metrics` that answers `body` to the inference key only.
 async fn sglang_metrics(body: &'static str) -> SglangAdapter {
+    sglang_metrics_with(body, capyctl_testkit::sglang_launch_settings()).await
+}
+
+/// As [`sglang_metrics`], for a launch frozen with `settings`.
+async fn sglang_metrics_with(
+    body: &'static str,
+    settings: capyctl_domain::launch::SglangLaunchSettings,
+) -> SglangAdapter {
     let app = Router::new().route(
         "/metrics",
         axum::routing::get(move |headers: HeaderMap| async move {
@@ -941,12 +949,85 @@ async fn sglang_metrics(body: &'static str) -> SglangAdapter {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    SglangAdapter::from_frozen(
-        &frozen_with(endpoint, capyctl_testkit::sglang_launch_settings()),
-        None,
-    )
-    .unwrap()
-    .with_credentials("inference-secret".into(), "admin-secret".into())
+    // The frozen launch rides along, as an owned launch's does: the
+    // restart-park choice reads its settings.
+    let frozen = frozen_with(endpoint, settings);
+    SglangAdapter::from_frozen(&frozen, None)
+        .unwrap()
+        .with_launch(frozen)
+        .with_credentials("inference-secret".into(), "admin-secret".into())
+}
+
+// T45 T43 T10 T16 (ADR 0033 §7, A6, A8, SPEC §10; found live on SGLang
+// 0.5.22): a restart-park of a `restart_only` launch with LMCache on has no
+// memory saver to observe, so its quiescence is the engine's own gauges: idle
+// parks, any running or queued request refuses, chat and decision
+// deployments alike. A launch without LMCache keeps the deep-park rule: no
+// saver observer, never quiescent.
+#[tokio::test]
+async fn a_restart_park_is_quiescent_on_the_engines_own_gauges() {
+    use capyctl_adapters::lmcache::{LmcacheState, ServerPlan};
+    let member = MemberRef {
+        deployment_id: "deployment".into(),
+        member_id: "member".into(),
+    };
+    let mut restart_only = capyctl_testkit::sglang_launch_settings();
+    restart_only.memory_saver = false;
+    let server = || {
+        LmcacheState::attached(
+            vec![ProcessIdentity {
+                role: "lmcache".into(),
+                pid: 4242,
+                boot_id: "boot".into(),
+                start_ticks: 7,
+            }],
+            ServerPlan {
+                lmcache_bin: "/opt/sglang/bin/lmcache".into(),
+                rpc_port: 25001,
+                http_port: 25002,
+                pool_gib: 1,
+                path: "/opt/sglang/bin:/usr/bin:/bin".into(),
+                home: None,
+                cuda_visible_devices: None,
+                cuda_device_order: None,
+                log: None,
+                config_dir: "/var/lib/capyctl/lmcache/i-1".into(),
+                start_bound: Duration::from_secs(30),
+                proc_root: "/proc".into(),
+                required: false,
+            },
+        )
+    };
+    const IDLE: &str = "sglang:num_running_reqs 0\nsglang:num_queue_reqs 0\n";
+    let requests = [
+        (IDLE, true),
+        (
+            "sglang:num_running_reqs 1\nsglang:num_queue_reqs 0\n",
+            false,
+        ),
+        (
+            "sglang:num_running_reqs 0\nsglang:num_queue_reqs 3\n",
+            false,
+        ),
+        ("# no gauges\n", false),
+    ];
+    use capyctl_config::effective::DeploymentApi;
+    for api in [DeploymentApi::Chat, DeploymentApi::Decisions] {
+        for (body, quiescent) in requests {
+            let adapter = sglang_metrics_with(body, restart_only.clone())
+                .await
+                .with_api(api)
+                .with_lmcache(server());
+            let answer = adapter.prepare_park(&member).await.unwrap();
+            assert_eq!(answer.quiescent, quiescent, "{api:?} {body}");
+        }
+    }
+    // Without LMCache on, the same idle engine is not proven quiescent: only
+    // the saver observer proves a deep park's.
+    let adapter = sglang_metrics_with(IDLE, restart_only.clone()).await;
+    assert!(!adapter.prepare_park(&member).await.unwrap().quiescent);
+    let adapter = sglang_metrics(IDLE).await.with_lmcache(server());
+    assert!(!adapter.prepare_park(&member).await.unwrap().quiescent);
 }
 
 // T17 T22, SPEC §10 (amended 2026-10-01): a cancelled request is acknowledged

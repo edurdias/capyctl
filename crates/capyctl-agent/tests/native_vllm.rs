@@ -2277,6 +2277,15 @@ async fn an_lmcache_launch_restart_parks_wakes_and_terminates_whole() {
     let evidence = parked.residency.clone().unwrap();
     assert_eq!(evidence.state, "parked", "{parked:?}");
     assert!(evidence.engine_stopped);
+    assert_eq!(
+        evidence.milestones,
+        [
+            "gate_closed",
+            "ingress_idle",
+            "engine_quiescent",
+            "engine_stopped"
+        ]
+    );
     assert!(
         roles(&parked, "alive").all(|p| p.role.starts_with("lmcache")),
         "{parked:?}"
@@ -2333,6 +2342,59 @@ async fn an_lmcache_launch_restart_parks_wakes_and_terminates_whole() {
     assert!(stopped.processes.iter().all(|p| p.presence == "gone"));
     assert!(stopped.processes.iter().any(|p| p.role == "lmcache"));
     assert!(!dir.exists());
+}
+
+// T45 T16 T20 (ADR 0033 §7, A8; SPEC §10 step 4): a restart-park proves the
+// engine quiescent on its own gauges once its ingress reads zero. A busy
+// engine leaves the launch unchanged with its engine running (nothing
+// stopped); once its gauges read idle it parks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_busy_lmcache_launch_is_not_restart_parked() {
+    let (fixture, launch, _) = lmcache_fixture();
+    let host = lmcache_host(&fixture);
+    host.executor.provision(launch.clone(), GATE).await.unwrap();
+    let ready = host
+        .executor
+        .execute(host.session, launch.clone())
+        .await
+        .unwrap();
+    assert!(ready.model_usable, "{ready:?}");
+    let api = roles(&ready, "alive")
+        .find(|p| p.role == "api")
+        .unwrap()
+        .pid;
+    fixture.engine_file("busy", Some("1"));
+    let park = fixture.park(&launch, "park-busy");
+    let refused = host
+        .executor
+        .execute(host.session, park.clone())
+        .await
+        .unwrap();
+    capyctl_protocol::execution::validate_result(&park, &refused).unwrap();
+    assert_eq!(residency(&refused), "unchanged", "{refused:?}");
+    assert_eq!(milestones(&refused), ["gate_closed", "ingress_idle"]);
+    assert!(!refused.residency.as_ref().unwrap().engine_stopped);
+    assert!(host
+        .journal
+        .inspect_owned("launch")
+        .unwrap()
+        .iter()
+        .any(|(p, presence)| p.pid == api
+            && *presence == capyctl_domain::completion::Presence::Alive));
+    fixture.engine_file("busy", None);
+    let parked = host
+        .executor
+        .execute(host.session, fixture.park(&launch, "park"))
+        .await
+        .unwrap();
+    assert_eq!(residency(&parked), "parked", "{parked:?}");
+    assert!(roles(&parked, "alive").all(|p| p.role.starts_with("lmcache")));
+    let stopped = host
+        .executor
+        .execute(host.session, fixture.stop(&launch))
+        .await
+        .unwrap();
+    assert!(stopped.processes.iter().all(|p| p.presence == "gone"));
 }
 
 // T45 (ADR 0033 §§3, 5): the server of a restart-parked launch is watched

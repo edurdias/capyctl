@@ -218,6 +218,19 @@ enum Driver {
     },
 }
 
+impl Driver {
+    /// SPEC §10 step 4, ADR 0033 A8: the engine's own running and waiting
+    /// gauges at zero, read now, with no saver involved. The proof of a
+    /// restart-park, which stops the engine and releases nothing in place;
+    /// an engine that cannot be read is not quiescent.
+    async fn engine_idle(&self, member: &MemberRef) -> bool {
+        match self {
+            Driver::Vllm(vllm) => vllm.engine_quiescent(member, 0).await,
+            Driver::Sglang { idle, .. } => idle().await == Ok(true),
+        }
+    }
+}
+
 /// Why a step did not complete.
 enum StepFailure {
     /// Refused before any engine call.
@@ -897,6 +910,26 @@ impl NativeHostExecution {
             // ADR 0031 §4: a custom engine never parks.
             Engine::Custom => return Err(SessionError),
         })
+    }
+
+    /// ADR 0033 A8: a restart-park's engine quiescence (SPEC §10 step 4),
+    /// asked after its ingress reads zero: the retained engine's own gauges,
+    /// with no saver. A launch whose driver cannot be built is not quiescent.
+    pub(super) async fn engine_idle(
+        &self,
+        owner: &MemberCommand,
+        plan: &SingleLaunchPlan,
+        scope: &IngressScope,
+    ) -> bool {
+        let Ok(driver) = self.driver(owner, plan, scope) else {
+            return false;
+        };
+        driver
+            .engine_idle(&MemberRef {
+                deployment_id: owner.identity.deployment_id.clone(),
+                member_id: plan.binding_id.clone(),
+            })
+            .await
     }
 
     pub(super) async fn unchanged_group(

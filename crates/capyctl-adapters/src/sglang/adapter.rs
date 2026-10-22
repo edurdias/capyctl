@@ -859,7 +859,17 @@ impl EngineAdapter for SglangAdapter {
             ))),
         }
     }
-    async fn prepare_park(&self, _member: &MemberRef) -> Result<Quiescence, AdapterError> {
+    async fn prepare_park(&self, member: &MemberRef) -> Result<Quiescence, AdapterError> {
+        // ADR 0033 §7 (found live): a restart-park stops the engine and has
+        // no memory saver to observe; its quiescence is the engine's own
+        // running and queued gauges, read now (the store armed the park only
+        // with nothing in flight at ingress). An unreadable gauge is not.
+        if self.restart_park() {
+            return Ok(Quiescence {
+                quiescent: self.engine_quiescent(member, 0).await,
+                unproven: None,
+            });
+        }
         // SPEC §10 step 4: only the observer can prove quiescence and a fully
         // mapped saver; without one (or without credentials) it is not.
         match (&self.observer, self.access()) {

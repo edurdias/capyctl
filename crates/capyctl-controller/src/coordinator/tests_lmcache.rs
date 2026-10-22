@@ -1062,3 +1062,218 @@ async fn a_restart_park_keeps_the_server_and_the_wake_starts_a_new_engine_on_it(
 async fn a_remote_restart_park_keeps_the_server_and_the_wake_starts_a_new_engine_on_it() {
     a_restart_park_keeps_the_server_and_wakes_a_new_engine(Report::HostResult).await;
 }
+
+/// A loopback SGLang `/metrics` answering the launch's inference key with
+/// the running gauge `running` holds (SGLang always runs with
+/// `--enable-metrics` under CapyCTL). Returns its endpoint.
+async fn sglang_gauges(running: Arc<AtomicU32>) -> String {
+    use axum::{http::HeaderMap, http::StatusCode, response::IntoResponse};
+    let app = axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(move |headers: HeaderMap| {
+            let running = running.load(Ordering::SeqCst);
+            async move {
+                if headers.get("authorization").and_then(|v| v.to_str().ok())
+                    != Some("Bearer inference-secret")
+                {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                format!("sglang:num_running_reqs {running}\nsglang:num_queue_reqs 0\n")
+                    .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    endpoint
+}
+
+/// An embedded SGLang launch: the scripted launch carries out every step,
+/// and the real SGLang adapter of a frozen `restart_only` launch (no memory
+/// saver, no saver observer), sharing the launch's LMCache state, answers
+/// the coordinator's quiescence question before a park.
+struct EmbeddedSglang {
+    launch: Arc<dyn EngineAdapter>,
+    sglang: capyctl_adapters::sglang::SglangAdapter,
+}
+
+#[async_trait::async_trait]
+impl EngineAdapter for EmbeddedSglang {
+    async fn execute_persisted(
+        &self,
+        command: &RuntimeCommand,
+    ) -> Result<EffectObservation, RuntimeError> {
+        self.launch.execute_persisted(command).await
+    }
+    async fn inspect(&self, m: &MemberRef) -> Result<EngineState, AdapterError> {
+        self.launch.inspect(m).await
+    }
+    async fn render_plan(&self, p: &PlanInput) -> Result<RenderedCommand, AdapterError> {
+        self.launch.render_plan(p).await
+    }
+    async fn check_readiness(&self, m: &MemberRef) -> Result<Readiness, AdapterError> {
+        self.launch.check_readiness(m).await
+    }
+    async fn prepare_park(&self, m: &MemberRef) -> Result<Quiescence, AdapterError> {
+        self.sglang.prepare_park(m).await
+    }
+    async fn park(&self, m: &MemberRef, level: ParkLevel) -> Result<ParkOutcome, AdapterError> {
+        self.launch.park(m, level).await
+    }
+    async fn restore(&self, m: &MemberRef) -> Result<RestoreOutcome, AdapterError> {
+        self.launch.restore(m).await
+    }
+    async fn reload_weights(&self, m: &MemberRef) -> Result<ReloadOutcome, AdapterError> {
+        self.launch.reload_weights(m).await
+    }
+    async fn observe_work(&self, m: &MemberRef) -> Result<WorkObservation, AdapterError> {
+        self.launch.observe_work(m).await
+    }
+    async fn cancel_work(
+        &self,
+        m: &MemberRef,
+        r: &RequestRef,
+        force: bool,
+    ) -> Result<CancellationOutcome, AdapterError> {
+        self.launch.cancel_work(m, r, force).await
+    }
+}
+
+/// The frozen SGLang launch of a `restart_only` deployment: no memory saver.
+fn restart_only_sglang(endpoint: String) -> capyctl_domain::launch::NativeLaunch {
+    use capyctl_domain::launch::{NativeDeviceSelection, NativeLaunch, NativeLaunchMetadata};
+    let mut settings = capyctl_testkit::sglang_launch_settings();
+    settings.memory_saver = false;
+    NativeLaunch::from_frozen_store(
+        NativeLaunchMetadata {
+            engine: "sglang".into(),
+            recipe: capyctl_adapters::sglang::pinned::NATIVE_SGLANG_CONTRACT.into(),
+            checkpoint_revision: "sha256:cached".into(),
+            binding_id: "01K00000000000000000000001".into(),
+            incarnation: "01K00000000000000000000002".into(),
+            endpoint,
+            served_name: "cached".into(),
+            rendered_settings_digest: "a".repeat(64),
+            placement_digest: None,
+            device: NativeDeviceSelection {
+                host_id: "lab".into(),
+                hardware_fingerprint: "hw-01".into(),
+                device_id: "gpu0".into(),
+                memory_domain: "unified".into(),
+                physical_gpu_uuid: None,
+                cuda_pci_index: None,
+            },
+        },
+        "/private/checkpoint".into(),
+        "/usr/bin/python3".into(),
+        "secret://engine-key".into(),
+        "secret://admin-key".into(),
+        settings,
+    )
+}
+
+// T45 T10 T16 T20 (ADR 0033 §7, A8, SPEC §10 step 4; found live on SGLang
+// 0.5.22): an embedded `restart_only` SGLang launch with LMCache on has no
+// memory saver, so the coordinator's quiescence check before its park is the
+// engine's own gauges. While a request runs on the engine the park is refused
+// `park_refused` before anything is sent, and the instance serves again; once
+// the gauges read idle the park stops the engine and keeps the server.
+#[tokio::test]
+async fn an_embedded_sglang_restart_park_is_proven_quiescent_on_the_engines_gauges() {
+    let (dir, owner, fence, observations) = lab(|_| {}).await;
+    let deployment = fence.deployment_id.clone();
+    let host = CacheHost::new(Report::Adapter, owner.clone());
+    // An embedded launch's evidence names processes that are alive.
+    let processes: Vec<_> = (0..3)
+        .map(|_| {
+            Process(
+                std::process::Command::new("sleep")
+                    .arg("120")
+                    .spawn()
+                    .unwrap(),
+            )
+        })
+        .collect();
+    let live = |role: &str, n: usize| capyctl_testkit::live_identity(role, processes[n].0.id());
+    *host.live_launch.lock().unwrap() = Some((
+        vec![live("api", 0), live("worker-0", 1)],
+        live(LMCACHE_ROLE, 2),
+    ));
+    let running = Arc::new(AtomicU32::new(0));
+    let endpoint = sglang_gauges(running.clone()).await;
+    let bound = host.clone();
+    let clock = host.clock.clone();
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        Arc::new(Observations(observations)),
+        Arc::new(move || Ok(clock.load(Ordering::SeqCst))),
+        CoordinatorOptions {
+            retry_cooldown: Duration::from_millis(50),
+            ..Default::default()
+        },
+        Arc::new(move |work: &InitializeWork| {
+            let binding = bound.bind(work);
+            let state = binding.lmcache.clone().unwrap();
+            let frozen = restart_only_sglang(endpoint.clone());
+            let sglang = capyctl_adapters::sglang::SglangAdapter::from_frozen(&frozen, None)
+                .unwrap()
+                .with_launch(frozen)
+                .with_credentials("inference-secret".into(), "admin-secret".into())
+                .with_lmcache(state);
+            let tools: Arc<dyn OwnedProcessLaunch> = capyctl_testkit::ScriptedTool::proving();
+            Ok(Arc::new(Driver {
+                engine: Arc::new(EmbeddedSglang {
+                    launch: binding.engine,
+                    sglang,
+                }),
+                cleanup: binding.cleanup,
+                tools: Some(tools),
+                settle: None,
+                lmcache: binding.lmcache,
+            }))
+        }),
+    )
+    .unwrap();
+    ready(&w, &fence).await;
+
+    running.store(1, Ordering::SeqCst);
+    let busy = w
+        .commands()
+        .park(
+            "operator",
+            &deployment,
+            fence.revision,
+            "park-busy",
+            100_000,
+        )
+        .unwrap();
+    until("the busy park refused", || {
+        operation(&owner, &busy.operation_id).0 == "failed"
+    })
+    .await;
+    assert_eq!(
+        operation(&owner, &busy.operation_id).1.as_deref(),
+        Some("park_refused")
+    );
+    assert!(host.steps(RuntimeAction::Park).is_empty(), "nothing sent");
+    let (state, open, _) = instance(&dir, &deployment);
+    assert_eq!((state.as_str(), open), ("ready", true));
+
+    running.store(0, Ordering::SeqCst);
+    let park = w
+        .commands()
+        .park(
+            "operator",
+            &deployment,
+            fence.revision,
+            "park-idle",
+            100_000,
+        )
+        .unwrap();
+    until("parked", || instance(&dir, &deployment).0 == "parked").await;
+    assert_eq!(operation(&owner, &park.operation_id).0, "succeeded");
+    assert_eq!(host.steps(RuntimeAction::Park).len(), 1);
+    w.shutdown().await.unwrap();
+    drop(processes);
+}

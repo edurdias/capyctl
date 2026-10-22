@@ -435,7 +435,8 @@ impl NativeHostExecution {
 
     /// ADR 0033 §7 (lifecycle design §4.2): the Park or Restore of a
     /// restart-parked launch, after its gate closed. Park proves ingress
-    /// idle, stops the engine's group and helpers (verified gone), keeps the
+    /// idle and the engine quiescent on its own gauges (A8), stops the
+    /// engine's group and helpers (verified gone), keeps the
     /// server and claims `parked` for the server's group alone. Restore
     /// starts the engine again on that server through a fresh adapter (the
     /// server re-proved, the connector, one wake spawn, readiness and the
@@ -459,6 +460,11 @@ impl NativeHostExecution {
                     return finish(ResidencyOutcome::Unchanged, -1, milestones, None, false);
                 }
                 milestones.push("ingress_idle".into());
+                // SPEC §10 step 4, ADR 0033 A8: then the engine's own gauges.
+                if !self.engine_idle(owner, plan, scope).await {
+                    return finish(ResidencyOutcome::Unchanged, -1, milestones, None, false);
+                }
+                milestones.push("engine_quiescent".into());
                 let before = super::residency::mem_available();
                 let journal = self.journal.clone();
                 let handle = owner.identity.command_id.clone();
