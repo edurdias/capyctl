@@ -26,8 +26,10 @@ import hmac
 import ipaddress
 import json
 import os
+import signal
 import stat
 import sys
+import time
 
 # The renderer invokes this file under python -IS. SPEC §9.1 / T21: resolve our
 # own package from the verified runtime directory alone. The package `runtime`
@@ -79,6 +81,9 @@ _CODES = frozenset({"invalid_descriptor", "invalid_credentials", "descriptor_io"
                     # SPEC §8.2 / T21: the single-rank rendezvous stays off the
                     # network (loopback_rendezvous.py).
                     "loopback_rendezvous_failed",
+                    # SPEC §§6.4, 13.2: SGLang's launch raised after it started
+                    # engine processes (a scheduler that exited before readiness).
+                    "engine_launch_failed",
                     # ADR 0028 §10: a group field SGLang's resolution changed.
                     "group_drift:tp_size", "group_drift:pp_size", "group_drift:nnodes",
                     "group_drift:node_rank", "group_drift:dist_init_addr"})
@@ -700,10 +705,114 @@ def _import_and_launch(spec, contract, approvals=None):
     # ADR 0028 §9: readiness is the head's. A rank > 0 runs SGLang's health
     # server on its loopback worker port and nothing probes it: its health
     # always passes.
-    if target is None:
-        launch.launch_server(checked._native)
-    else:
-        launch.launch_server(checked._native, run_scheduler_process_func=target)
+    options = {} if target is None else {"run_scheduler_process_func": target}
+    try:
+        launch.launch_server(checked._native, **options)
+    except Exception:
+        # SPEC §§6.4, 13.2 (found live 2026-10-20): a scheduler that exits
+        # before readiness (a missing CUDA library, an import failure in the
+        # spawned child) sends no SIGQUIT; SGLang's readiness wait notices it
+        # within seconds and raises here. The processes it already started
+        # (the detokenizer, any live scheduler) are non-daemon children that
+        # interpreter exit would join forever, holding this entry, and so the
+        # launch, alive until the host's readiness deadline. They are ended and
+        # seen gone first: the entry leaves only once nothing it started runs.
+        _end_engine_processes()
+        raise LaunchError("engine_launch_failed") from None
+
+
+def _process_table():
+    """Every process /proc lists now: pid -> (parent pid, state letter)."""
+    table = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/" + name + "/stat", "rb") as handle:
+                raw = handle.read()
+        except OSError:
+            continue  # Exited during the scan.
+        # The command name may hold spaces and parentheses; the fields after
+        # its last ')' are the state, then the parent pid.
+        fields = raw[raw.rindex(b")") + 2:].split()
+        table[int(name)] = (int(fields[1]), fields[0].decode("ascii"))
+    return table
+
+
+def _running_descendants(table):
+    """This process's descendants that have not exited (zombies excluded)."""
+    children = {}
+    for pid, (parent, state) in table.items():
+        if state not in ("Z", "X"):
+            children.setdefault(parent, []).append(pid)
+    found, frontier = [], [os.getpid()]
+    while frontier:
+        below = children.get(frontier.pop(), ())
+        found.extend(below)
+        frontier.extend(below)
+    return found
+
+
+def _signal(pid, number):
+    try:
+        os.kill(pid, number)
+    except ProcessLookupError:
+        pass
+
+
+def _reap(table):
+    """Collect this process's exited children, multiprocessing's first."""
+    multiprocessing = sys.modules.get("multiprocessing")
+    if multiprocessing is not None:
+        # Each Process object reaps its own child and records its exit.
+        multiprocessing.active_children()
+    for pid, (parent, state) in table.items():
+        if parent == os.getpid() and state in ("Z", "X"):
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass  # Already reaped through its Process object.
+
+
+def _end_engine_processes(pause=0.05):
+    """SPEC §13.2: end everything this entry started; return once none runs.
+
+    The tree is frozen before it is killed, so no member forks a process that
+    outlives its parent unseen: every running descendant is stopped, and the
+    tree is read again until a pass finds none that is not stopped. Then each
+    is killed, the entry's own children are reaped, and the tree is read again.
+    This returns only once /proc shows no running descendant; a member that
+    will not die keeps the entry, and so the launch's recorded ownership,
+    alive, and the host's readiness deadline reports that, never a release.
+    """
+    while True:
+        try:
+            if _end_pass(pause):
+                return
+        except (OSError, ValueError):
+            pass  # /proc unreadable: nothing is seen gone, so nothing is.
+        time.sleep(pause)
+
+
+def _end_pass(pause):
+    """Freeze, kill and reap the running tree once; True if none runs after."""
+    stopped = set()
+    while True:
+        table = _process_table()
+        unstopped = [pid for pid in _running_descendants(table)
+                     if pid not in stopped or table[pid][1] not in ("T", "t")]
+        if not unstopped:
+            break
+        for pid in unstopped:
+            if pid not in stopped:
+                _signal(pid, signal.SIGSTOP)
+                stopped.add(pid)
+        time.sleep(pause)
+    for pid in stopped:
+        _signal(pid, signal.SIGKILL)
+    time.sleep(pause)
+    _reap(_process_table())
+    return not _running_descendants(_process_table())
 
 
 def prepare_group_environment(environ, expected_ifname=None):
@@ -833,6 +942,10 @@ def _hint(code):
                 " or use a build that provides them)")
     if code == "capability_missing:core":
         return " (this SGLang installation lacks an interface every launch needs)"
+    if code == "engine_launch_failed":
+        return (" (SGLang's launch failed after it started its processes, for example a"
+                " scheduler that exited before readiness; every one was ended, and the"
+                " engine's own lines above say why)")
     return ""
 
 
