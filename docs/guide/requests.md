@@ -179,7 +179,11 @@ only 10.3 s after the hang-up. In a run where the clients hung up 1.5 s
 after sending (about 12,500 tokens each), the count read 0 at the hang-up;
 two of those decisions then showed in SGLang's queue and ran within the next
 7 s. This is the case the rule above is for: a cancelled decision stays
-counted until the engine's next stop or restart.
+counted until the engine's next stop or restart. On SGLang 0.5.22 an
+abandoned decision therefore still uses the engine until it ends: its
+decision endpoint neither stops on a closed connection nor takes a request
+ID CapyCTL could cancel
+([sgl-project/sglang#45842](https://github.com/sgl-project/sglang/issues/45842)).
 
 ## Per-request metrics
 

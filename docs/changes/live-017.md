@@ -112,4 +112,10 @@ Evidence (laptop, not committed): `target/live/live-017/` (scripts, per-run
 samples, status and management-event extracts). CPU and Fake-engine tests are
 not qualification; this file records live runs only.
 
-# Release note: none
+# Release note: Requests
+
+- How quickly each engine stops a request whose client hung up, measured on SGLang,
+  vLLM, llama.cpp and TensorFold, is in the requests guide. Known limit: on SGLang
+  0.5.22 a decision request whose client hung up still runs to its end in the engine
+  (reported upstream as sgl-project/sglang#45842); CapyCTL keeps it counted until the
+  next stop.
