@@ -232,7 +232,12 @@ impl SglangAdapter {
                 base.clone(),
                 metadata.served_name.clone(),
                 None,
-                true,
+                // ADR 0033 §5: the adapter's own requests are probes, which
+                // carry no salt, and it does not know the launch's deployment
+                // and revision; a salt reaching it is refused, never forwarded
+                // unchanged. Client requests go through the router's
+                // launch-specific forwarder.
+                crate::forward::CacheSalt::Refused,
             ),
             http: None,
             base,
@@ -348,7 +353,8 @@ impl SglangAdapter {
             self.base.clone(),
             self.served_name.clone(),
             Some(inference.clone()),
-            true,
+            // ADR 0033 §5: refused here, as in the constructor.
+            crate::forward::CacheSalt::Refused,
         );
         self.inference_key = Some(inference);
         self.admin_key = Some(admin);

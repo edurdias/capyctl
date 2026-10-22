@@ -84,19 +84,15 @@ pub const CHAT_REQUEST_FIELDS: &[&str] = &[
     "separate_reasoning",
     "stream_reasoning",
     "include_reasoning",
-    // Prefix-cache partition (SPEC §10): forwarded unchanged to an engine that
-    // honours it, refused for one that would ignore it.
+    // Prefix-cache partition (SPEC §10, ADR 0033 §5): sent as the effective
+    // salt to an engine that honours it, refused for one that would ignore it.
     "cache_salt",
 ];
 
-/// SPEC §10: the longest `cache_salt` forwarded, in bytes. vLLM bounds the
-/// field at 1024 characters, so no salt this admits is one it refuses.
+/// SPEC §10: the longest caller `cache_salt` admitted, in bytes. vLLM bounds
+/// the field at 1024 characters, and the effective salt the engine receives
+/// (ADR 0033 §5) is 64.
 pub const MAX_CACHE_SALT_BYTES: usize = 1024;
-
-/// Whether `body` asks for a prefix-cache partition (a non-null `cache_salt`).
-pub fn carries_cache_salt(body: &Value) -> bool {
-    body.get("cache_salt").is_some_and(|salt| !salt.is_null())
-}
 
 /// Whether `body` is a JSON object carrying only [`CHAT_REQUEST_FIELDS`].
 pub fn chat_request_allowed(body: &Value) -> bool {
@@ -393,9 +389,74 @@ pub(crate) struct ChatHttp {
     model: String,
     key: Option<String>,
     client: reqwest::Client,
-    /// SPEC §10: whether this engine partitions its prefix cache by
-    /// `cache_salt`. When it does not, a request carrying one is refused.
-    honours_cache_salt: bool,
+    /// SPEC §10, ADR 0033 §5: what this forwarder does with a request's
+    /// `cache_salt`.
+    cache_salt: CacheSalt,
+}
+
+/// ADR 0033 §5: the domain separator of [`effective_cache_salt`]. A new
+/// encoding takes a new version, never a changed layout under this one.
+const CACHE_SALT_DOMAIN: &[u8] = b"capyctl/cache-salt/v1";
+
+/// ADR 0033 §5: the salt the engine receives in place of the caller's: the
+/// lowercase hexadecimal SHA-256 digest (64 characters) of
+/// `"capyctl/cache-salt/v1" 0x00 u32be(len id) id u64be(revision)
+/// u32be(len salt) salt`, lengths in UTF-8 bytes. Different deployments or
+/// revisions never share one; within a revision equal caller salts share and
+/// different ones never do. Every digest fits LMCache's 128 characters and
+/// character set. The value is never logged, stored or put in an error.
+///
+/// # Panics
+///
+/// When `deployment_id` or `caller_salt` is 4 GiB or longer, which no
+/// deployment ID and no admitted salt ([`MAX_CACHE_SALT_BYTES`]) is.
+pub fn effective_cache_salt(deployment_id: &str, revision: u64, caller_salt: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let length = |field: &str| {
+        u32::try_from(field.len())
+            .expect("a deployment ID and a cache salt are shorter than 4 GiB")
+            .to_be_bytes()
+    };
+    let mut digest = Sha256::new();
+    digest.update(CACHE_SALT_DOMAIN);
+    digest.update([0u8]);
+    digest.update(length(deployment_id));
+    digest.update(deployment_id.as_bytes());
+    digest.update(revision.to_be_bytes());
+    digest.update(length(caller_salt));
+    digest.update(caller_salt.as_bytes());
+    hex::encode(digest.finalize())
+}
+
+/// SPEC §10, ADR 0033 §5: what one launch's forwarder does with a request's
+/// `cache_salt`. A request without one is sent without one either way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CacheSalt {
+    /// Refused before anything is sent (`cache_salt_unsupported`): the engine
+    /// would ignore it, or the forwarder does not know the launch it reaches.
+    Refused,
+    /// The engine partitions its prefix cache (and LMCache's) by the salt. It
+    /// receives [`effective_cache_salt`] of the serving launch's durable
+    /// deployment ID, the revision that launch runs and the caller's salt.
+    Namespaced {
+        deployment_id: String,
+        revision: u64,
+    },
+}
+
+impl CacheSalt {
+    /// The policy for a launch of the engine family `engine` (as its revision
+    /// froze it) serving `deployment_id` at `revision`.
+    pub fn for_launch(engine: Option<&str>, deployment_id: &str, revision: u64) -> Self {
+        if engine_honours_cache_salt(engine) {
+            Self::Namespaced {
+                deployment_id: deployment_id.to_owned(),
+                revision,
+            }
+        } else {
+            Self::Refused
+        }
+    }
 }
 
 /// SPEC §10: whether an engine family partitions its prefix cache by
@@ -411,14 +472,14 @@ impl ChatHttp {
         base: reqwest::Url,
         model: String,
         key: Option<String>,
-        honours_cache_salt: bool,
+        cache_salt: CacheSalt,
     ) -> Self {
         Self {
             endpoint: upstream(&base, "/v1/chat/completions").expect("a forwarded path"),
             decisions: upstream(&base, "/v1/systemone").expect("a forwarded path"),
             model,
             key,
-            honours_cache_salt,
+            cache_salt,
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .retry(reqwest::retry::never())
@@ -783,12 +844,25 @@ impl ChatHttp {
         // parameter the relay cannot answer faithfully is refused before
         // anything is sent (tools are forwarded: SPEC §10 preserves tool calls).
         validate_chat_request(body)?;
-        // SPEC §10: a requested prefix-cache partition is forwarded unchanged
-        // only to an engine that honours it; anywhere else it would be silently
-        // absent, so the request is refused before anything is sent.
-        if !self.honours_cache_salt && carries_cache_salt(body) {
-            return Err(AdapterError::CacheSaltUnsupported);
-        }
+        // SPEC §10, ADR 0033 §5: a requested prefix-cache partition reaches only
+        // an engine that honours it, as the effective salt of this launch's
+        // deployment and revision; anywhere else it would be silently absent,
+        // so the request is refused before anything is sent. Validation above
+        // made a non-null salt a string; no salt stays no salt.
+        let effective = match (
+            body.get("cache_salt").and_then(Value::as_str),
+            &self.cache_salt,
+        ) {
+            (None, _) => None,
+            (Some(_), CacheSalt::Refused) => return Err(AdapterError::CacheSaltUnsupported),
+            (
+                Some(salt),
+                CacheSalt::Namespaced {
+                    deployment_id,
+                    revision,
+                },
+            ) => Some(effective_cache_salt(deployment_id, *revision, salt)),
+        };
         let public = body
             .get("model")
             .and_then(Value::as_str)
@@ -797,6 +871,9 @@ impl ChatHttp {
         let mut request = body.clone();
         request["model"] = json!(self.model);
         request["stream"] = json!(true);
+        if let Some(effective) = effective {
+            request["cache_salt"] = json!(effective);
+        }
         let response = self.post(&self.endpoint, &request, uncertain).await?;
         if !response.status().is_success() || !content_type_is(&response, "text/event-stream") {
             return Err(uncertain());
@@ -1125,20 +1202,15 @@ impl crate::traits::ChatForward for EngineForward {
 /// belong to a single launch, so a forwarder built once at boot would keep
 /// addressing a port and presenting a credential that a later launch replaced.
 ///
-/// `honours_cache_salt` is the engine family's answer from
-/// [`engine_honours_cache_salt`] (SPEC §10).
+/// `cache_salt` decides what a request's prefix-cache partition becomes
+/// (SPEC §10, ADR 0033 §5): see [`CacheSalt::for_launch`].
 pub fn engine_forwarder(
     base: reqwest::Url,
     model: String,
     key: Option<String>,
-    honours_cache_salt: bool,
+    cache_salt: CacheSalt,
 ) -> std::sync::Arc<dyn crate::traits::ChatForward> {
-    std::sync::Arc::new(EngineForward(ChatHttp::new(
-        base,
-        model,
-        key,
-        honours_cache_salt,
-    )))
+    std::sync::Arc::new(EngineForward(ChatHttp::new(base, model, key, cache_salt)))
 }
 
 struct Parser<'a> {
@@ -1566,8 +1638,12 @@ mod tests {
     async fn only_a_shutting_down_refusal_proves_the_engine_never_saw_the_request() {
         let request = serde_json::json!({"model":"m","messages":[]});
         let refusal = serde_json::json!({"error":{"code":"shutting_down","message":"restarting","retryable":true}});
-        let forward =
-            crate::forward::engine_forwarder(answering(503, refusal).await, "m".into(), None, true);
+        let forward = crate::forward::engine_forwarder(
+            answering(503, refusal).await,
+            "m".into(),
+            None,
+            crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
+        );
         assert!(matches!(
             forward.forward_chat(&request).await,
             Err(AdapterError::NotAccepted(_))
@@ -1581,7 +1657,7 @@ mod tests {
                 answering(503, body).await,
                 "m".into(),
                 None,
-                true,
+                crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
             );
             assert!(matches!(
                 forward.forward_chat(&request).await,
@@ -1589,8 +1665,12 @@ mod tests {
             ));
         }
         let refusal = serde_json::json!({"error":{"code":"shutting_down","retryable":true}});
-        let forward =
-            crate::forward::engine_forwarder(answering(500, refusal).await, "m".into(), None, true);
+        let forward = crate::forward::engine_forwarder(
+            answering(500, refusal).await,
+            "m".into(),
+            None,
+            crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
+        );
         assert!(matches!(
             forward.forward_chat(&request).await,
             Err(AdapterError::EngineError { status: 500, .. })
@@ -1629,7 +1709,7 @@ mod tests {
                 answering(status, body).await,
                 "m".into(),
                 None,
-                true,
+                crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
             );
             match forward.forward_chat(&request).await {
                 Err(AdapterError::Rejected {
@@ -1647,7 +1727,7 @@ mod tests {
             answering(400, serde_json::json!({"error":{"message": long}})).await,
             "m".into(),
             None,
-            true,
+            crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
         match forward.forward_chat(&request).await {
             Err(AdapterError::Rejected { message, .. }) => {
@@ -1664,7 +1744,7 @@ mod tests {
                 answering(status, body).await,
                 "m".into(),
                 None,
-                true,
+                crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
             );
             assert!(
                 matches!(
@@ -1731,7 +1811,7 @@ mod tests {
                 replying(status, Raw::Whole(llama.to_vec())).await,
                 "m".into(),
                 None,
-                true,
+                crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
             );
             let mut relayed = Vec::new();
             for result in [
@@ -1760,7 +1840,7 @@ mod tests {
             replying(500, Raw::Whole(long.into_bytes())).await,
             "m".into(),
             None,
-            true,
+            crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
         match forward.forward_chat(&chat).await {
             Err(AdapterError::EngineError { message, .. }) => {
@@ -1781,7 +1861,12 @@ mod tests {
             // A 503 keeps its own reading: not a shutting-down refusal.
             (503, Raw::Whole(llama.to_vec())),
         ] {
-            let forward = engine_forwarder(replying(status, raw).await, "m".into(), None, true);
+            let forward = engine_forwarder(
+                replying(status, raw).await,
+                "m".into(),
+                None,
+                crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
+            );
             for result in [
                 forward.forward_chat(&chat).await.map(|_| ()),
                 forward.forward_decision(&decision).await.map(|_| ()),
@@ -1807,7 +1892,7 @@ mod tests {
             format!("http://{address}").parse().unwrap(),
             "m".into(),
             None,
-            true,
+            crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
         assert!(matches!(
             forward.forward_chat(&request).await,
@@ -1827,7 +1912,7 @@ mod tests {
             format!("http://{address}").parse().unwrap(),
             "m".into(),
             None,
-            true,
+            crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
         assert!(matches!(
             forward.forward_chat(&request).await,
@@ -1876,7 +1961,7 @@ mod tests {
                 answering(200, serde_json::json!({})).await,
                 "m".into(),
                 None,
-                true,
+                crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
             );
             assert!(
                 matches!(
@@ -1945,7 +2030,12 @@ mod tests {
         ]
         .concat();
         let (url, seen) = recording(sse).await;
-        let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
+        let forward = crate::forward::engine_forwarder(
+            url,
+            "m".into(),
+            None,
+            crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
+        );
         let request = serde_json::json!({"model":"public","messages":[]});
         let response = forward.forward_chat(&request).await.unwrap();
         assert_eq!(response["usage"]["total_tokens"], 4, "{response}");
@@ -1982,7 +2072,12 @@ mod tests {
         ]
         .concat();
         let (url, seen) = recording(sse).await;
-        let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
+        let forward = crate::forward::engine_forwarder(
+            url,
+            "m".into(),
+            None,
+            crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
+        );
         let tools = serde_json::json!([{"type":"function","function":{"name":"get_weather",
             "parameters":{"type":"object"}}}]);
         let request = serde_json::json!({"model":"public","messages":[],"tools":tools,
@@ -2031,7 +2126,12 @@ mod tests {
         .map(|line| format!("{line}\n\n"))
         .concat();
         let (url, _) = recording(sse).await;
-        let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
+        let forward = crate::forward::engine_forwarder(
+            url,
+            "m".into(),
+            None,
+            crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
+        );
         let request = serde_json::json!({"model":"public","messages":[],
             "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}],
             "tool_choice":{"type":"function","function":{"name":"get_weather"}}});
@@ -2065,7 +2165,12 @@ mod tests {
             .map(|line| format!("{line}\n\n"))
             .collect::<String>();
         let (url, _) = recording(sse).await;
-        let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
+        let forward = crate::forward::engine_forwarder(
+            url,
+            "m".into(),
+            None,
+            crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
+        );
         let request = serde_json::json!({"model":"public","messages":[],
             "stream_options":{"include_usage":true}});
         let mut relayed = Vec::new();
@@ -2225,7 +2330,12 @@ mod tests {
         let request = serde_json::json!({"model":"p","messages":[]});
         let sse = [error(400), "data: [DONE]\n\n".to_owned()].concat();
         let (url, _) = recording(sse).await;
-        let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
+        let forward = crate::forward::engine_forwarder(
+            url,
+            "m".into(),
+            None,
+            crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
+        );
         match forward.forward_chat(&request).await {
             Err(AdapterError::Rejected { status, message }) => {
                 assert_eq!(status, 400);
@@ -2258,7 +2368,12 @@ mod tests {
             [error(503), "data: [DONE]\n\n".to_owned()].concat(),
         ] {
             let (url, _) = recording(sse).await;
-            let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
+            let forward = crate::forward::engine_forwarder(
+                url,
+                "m".into(),
+                None,
+                crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
+            );
             let result = forward.forward_chat(&request).await;
             assert!(
                 matches!(result, Err(AdapterError::Uncertain(_))),
@@ -2268,7 +2383,12 @@ mod tests {
         }
         let sse = [error(500), "data: [DONE]\n\n".to_owned()].concat();
         let (url, _) = recording(sse).await;
-        let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
+        let forward = crate::forward::engine_forwarder(
+            url,
+            "m".into(),
+            None,
+            crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
+        );
         let mut relayed = Vec::new();
         let streamed = forward
             .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
@@ -2299,7 +2419,12 @@ mod tests {
             ]
             .concat();
             let (url, _) = recording(sse).await;
-            let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
+            let forward = crate::forward::engine_forwarder(
+                url,
+                "m".into(),
+                None,
+                crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
+            );
             let result = forward
                 .forward_chat(&serde_json::json!({"model":"p","messages":[]}))
                 .await;
@@ -2333,7 +2458,12 @@ mod tests {
                 "{field}"
             );
             let (url, seen) = recording(String::new()).await;
-            let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
+            let forward = crate::forward::engine_forwarder(
+                url,
+                "m".into(),
+                None,
+                crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
+            );
             assert!(
                 matches!(
                     forward.forward_chat(&body).await,
@@ -2541,7 +2671,12 @@ mod tests {
         ]
         .concat();
         let (url, _) = recording(sse).await;
-        let forward = crate::forward::engine_forwarder(url, "m".into(), None, true);
+        let forward = crate::forward::engine_forwarder(
+            url,
+            "m".into(),
+            None,
+            crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
+        );
         let request = json!({"model":"public","messages":[]});
         let mut sink = Counting::default();
         let end = forward
@@ -2631,11 +2766,30 @@ mod tests {
         // T42 T37 (ADR 0029 §11): llama-server never reads the field.
         assert!(!engine_honours_cache_salt(Some("llamacpp")));
         assert!(!engine_honours_cache_salt(None));
+        // ADR 0033 §5: the launch policy follows the same answer.
+        use crate::forward::CacheSalt;
+        for engine in [Some("tensorfold"), Some("llamacpp"), Some("custom"), None] {
+            assert_eq!(
+                CacheSalt::for_launch(engine, "dep-1", 3),
+                CacheSalt::Refused,
+                "{engine:?}"
+            );
+        }
+        for engine in ["vllm", "sglang"] {
+            assert_eq!(
+                CacheSalt::for_launch(Some(engine), "dep-1", 3),
+                CacheSalt::Namespaced {
+                    deployment_id: "dep-1".into(),
+                    revision: 3
+                },
+                "{engine}"
+            );
+        }
         let forward = crate::forward::engine_forwarder(
             "http://127.0.0.1:9".parse().unwrap(),
             "m".into(),
             None,
-            false,
+            crate::forward::CacheSalt::Refused,
         );
         let request = json!({"model":"m","messages":[],"cache_salt":"tenant-a"});
         assert!(matches!(
@@ -2653,5 +2807,99 @@ mod tests {
             forward.forward_chat(&plain).await,
             Err(AdapterError::CacheSaltUnsupported)
         ));
+    }
+
+    /// ADR 0033 §5: the documented byte layout, computed independently of
+    /// [`super::effective_cache_salt`].
+    fn documented_digest(deployment_id: &str, revision: u64, caller_salt: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut bytes = b"capyctl/cache-salt/v1".to_vec();
+        bytes.push(0x00);
+        bytes.extend_from_slice(&(deployment_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(deployment_id.as_bytes());
+        bytes.extend_from_slice(&revision.to_be_bytes());
+        bytes.extend_from_slice(&(caller_salt.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(caller_salt.as_bytes());
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    // T45 T37 (ADR 0033 §5): the effective salt is the lowercase hexadecimal
+    // SHA-256 of the documented layout; fixed vectors pin it across releases.
+    #[test]
+    fn the_effective_cache_salt_matches_its_fixed_vectors() {
+        use super::effective_cache_salt;
+        let pinned = [
+            (
+                ("dep-1", 3, "tenant-a/\u{fc}/0001"),
+                "18d1486516c53f38bd0e5e4b5760aefb4633a2f3b31183ffd69c70457382c645",
+            ),
+            (
+                ("dep-1", 3, ""),
+                "2a34b1fe7ca05f8036b08e0ee57f892f598eedcfb7ee47814ba2cb52c2d81759",
+            ),
+            (
+                ("dep-1", 3, "tenant-b"),
+                "c6857dd0e803efd2a7617da127c51164ef317855cad15f27fc64a3c884751d2b",
+            ),
+            (
+                ("dep-1", 1, "tenant-a/\u{fc}/0001"),
+                "1cc2f95daa7e78eb7c623f3552cedcdec816f9cd0f8992d81d60379852b6e1c2",
+            ),
+        ];
+        for ((deployment, revision, salt), expected) in pinned {
+            let effective = effective_cache_salt(deployment, revision, salt);
+            assert_eq!(effective, expected, "{deployment} {revision} {salt:?}");
+            assert_eq!(
+                effective,
+                documented_digest(deployment, revision, salt),
+                "{deployment} {revision} {salt:?}"
+            );
+        }
+    }
+
+    // T45 T37 (ADR 0033 §5): equal inputs share an effective salt; another
+    // deployment, revision or caller salt never does, including inputs whose
+    // bytes only move across a field boundary; every digest is 64 lowercase
+    // hexadecimal characters, inside LMCache's 128 characters.
+    #[test]
+    fn the_effective_cache_salt_separates_deployments_revisions_and_salts() {
+        use super::{effective_cache_salt, MAX_CACHE_SALT_BYTES};
+        let base = effective_cache_salt("dep-1", 3, "tenant-a");
+        assert_eq!(base, effective_cache_salt("dep-1", 3, "tenant-a"));
+        let longest = "s".repeat(MAX_CACHE_SALT_BYTES);
+        let others = [
+            effective_cache_salt("dep-2", 3, "tenant-a"),
+            effective_cache_salt("dep-1", 4, "tenant-a"),
+            effective_cache_salt("dep-1", 3, "tenant-b"),
+            effective_cache_salt("dep-1", 3, ""),
+            effective_cache_salt("dep-1", u64::MAX, "tenant-a"),
+            effective_cache_salt("dep-1t", 3, "enant-a"),
+            effective_cache_salt("", 3, "tenant-a"),
+            effective_cache_salt("dep-1", 3, &longest),
+        ];
+        let mut seen = std::collections::HashSet::from([base.clone()]);
+        for digest in others.iter().chain([&base]) {
+            assert_eq!(digest.len(), 64, "{digest}");
+            assert!(
+                digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "{digest}"
+            );
+        }
+        for digest in others {
+            assert!(
+                seen.insert(digest.clone()),
+                "a shared effective salt: {digest}"
+            );
+        }
+        // The empty salt differs from a different non-empty one too.
+        assert_ne!(
+            effective_cache_salt("dep-1", 3, ""),
+            effective_cache_salt("dep-1", 3, "\0")
+        );
     }
 }

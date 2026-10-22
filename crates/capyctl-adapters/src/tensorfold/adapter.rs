@@ -30,7 +30,7 @@ impl TensorfoldAdapter {
                 model_id.clone(),
                 None,
                 // SPEC §10: TensorFold ignores `cache_salt`, so it is refused.
-                false,
+                crate::forward::CacheSalt::Refused,
             ),
             endpoint,
             fingerprint,

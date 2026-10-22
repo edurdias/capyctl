@@ -39,7 +39,7 @@ impl LlamacppAdapter {
                 None,
                 // ADR 0029 §11, SPEC §10: llama-server never reads
                 // `cache_salt`, so a request carrying one is refused.
-                false,
+                crate::forward::CacheSalt::Refused,
             ),
             endpoint,
             fingerprint,

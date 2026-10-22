@@ -1467,6 +1467,13 @@ async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence()
         .unwrap()
         .expect("the instance's endpoint");
     assert_eq!(endpoint.endpoint, "http://100.64.0.1:9443");
+    // T45 (ADR 0033 §5): the salt namespace is the launch's binding: its
+    // durable deployment ID and the revision it runs.
+    assert_eq!(endpoint.deployment_id, fence.deployment_id);
+    assert_eq!(
+        endpoint.revision,
+        u64::try_from(launch.fence.revision).unwrap()
+    );
     assert!(lifecycle
         .instance_endpoint(&fence.deployment_id, fence.generation + 7)
         .unwrap()

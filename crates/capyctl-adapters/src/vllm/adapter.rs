@@ -103,7 +103,12 @@ impl VllmAdapter {
                 base.clone(),
                 model_id.clone(),
                 api_key.clone(),
-                true,
+                // ADR 0033 §5: the adapter's own requests are probes, which
+                // carry no salt, and it does not know the launch's deployment
+                // and revision; a salt reaching it is refused, never forwarded
+                // unchanged. Client requests go through the router's
+                // launch-specific forwarder.
+                crate::forward::CacheSalt::Refused,
             ),
             endpoint: base.to_string(),
             http: EngineHttp::new(base, api_key),
@@ -225,7 +230,8 @@ impl VllmAdapter {
             base.clone(),
             self.model_id.clone(),
             Some(engine_key.clone()),
-            true,
+            // ADR 0033 §5: refused here, as in the constructor.
+            crate::forward::CacheSalt::Refused,
         );
         self.http = EngineHttp::new(base, Some(engine_key.clone()));
         if let Some(admin) = &self.admin_key {
