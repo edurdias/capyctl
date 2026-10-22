@@ -316,6 +316,64 @@ fn a_helper_may_be_gone_but_an_engine_process_may_not() {
     assert!(!same_engine(&[], &[]));
 }
 
+// T45: ADR 0033 §3: the LMCache server's group is neither the engine nor a
+// helper; the engine judgement ignores it and `same_lmcache` judges it.
+#[test]
+fn the_lmcache_group_is_judged_apart_from_the_engine() {
+    assert!(is_lmcache_role("lmcache"));
+    assert!(is_lmcache_role("lmcache-0"));
+    assert!(is_lmcache_role("lmcache-12"));
+    assert!(!is_lmcache_role("lmcache-"), "a bare prefix is no role");
+    assert!(!is_lmcache_role("lmcache-x"));
+    assert!(!is_lmcache_role("lmcacheserver"));
+    assert!(member("lmcache", 30).is_lmcache());
+    assert!(!member("lmcache", 30).is_engine());
+    assert!(!member("helper-0", 12).is_engine());
+    assert!(member("api", 10).is_engine());
+    assert!(member("worker-0", 11).is_engine());
+
+    let recorded = vec![
+        member("api", 10),
+        member("worker-0", 11),
+        member("lmcache", 30),
+        member("lmcache-0", 31),
+    ];
+    assert_eq!(
+        engine_members(&recorded),
+        vec![member("api", 10), member("worker-0", 11)]
+    );
+    assert_eq!(
+        lmcache_members(&recorded),
+        vec![member("lmcache", 30), member("lmcache-0", 31)]
+    );
+    assert!(
+        same_engine(&recorded, &recorded[..2]),
+        "the server gone does not change the engine"
+    );
+    assert!(
+        same_engine(&recorded[..2], &recorded),
+        "a server alive beside it does not change the engine"
+    );
+    assert!(
+        !same_engine(&recorded[2..], &recorded[2..]),
+        "a server alone is no engine"
+    );
+    assert!(same_lmcache(&recorded, &recorded));
+    assert!(same_lmcache(&recorded, &recorded[2..]));
+    assert!(
+        !same_lmcache(&recorded, &recorded[..3]),
+        "a server member gone is another server group"
+    );
+    assert!(
+        !same_lmcache(&recorded, &[member("lmcache", 30), member("lmcache-0", 41)]),
+        "a replaced member is another server group"
+    );
+    assert!(
+        !same_lmcache(&recorded[..2], &recorded[..2]),
+        "no recorded server is never the server"
+    );
+}
+
 // ADR 0027: the Ready proof still needs the recorded group exactly; only later
 // liveness proofs let a helper be gone.
 #[test]

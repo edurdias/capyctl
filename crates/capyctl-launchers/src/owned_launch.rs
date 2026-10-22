@@ -12,9 +12,12 @@ use capyctl_adapters::protected::ProtectedLaunchDescriptors;
 use capyctl_adapters::traits::{OwnedProcessLaunch, RenderedCommand, RuntimeError};
 use capyctl_domain::completion::{Presence, ProcessIdentity};
 
-use crate::durable::{DurableSpawn, DurableSpawnError, DurableSpawnOutcome, LaunchAssociation};
-use crate::group_observation::observe_process_group_or_empty;
+use crate::durable::{
+    DurableSpawn, DurableSpawnError, DurableSpawnOutcome, LaunchAssociation, SpawnRole,
+};
+use crate::group_observation::{observe_process_group_or_empty, GroupProcessFact};
 use crate::process_absence::{presence, verify_gone, GoneProof};
+use crate::spawn_policy::SpawnPolicy;
 
 /// How long to wait after SIGKILL before the outcome is reported as uncertain.
 const KILL_PROOF_WINDOW: Duration = Duration::from_secs(5);
@@ -24,12 +27,20 @@ const KILL_PROOF_WINDOW: Duration = Duration::from_secs(5);
 /// restricted or hidden `/proc` still fails after the last attempt.
 const OBSERVATION_ATTEMPTS: u32 = 8;
 
+/// The host's POSIX shared-memory directory.
+const DEV_SHM: &str = "/dev/shm";
+
 /// The association is shared across threads because the builder's process tools
 /// are, so it carries the `Send + Sync` bounds the trait itself does not impose on
 /// its other, single-threaded callers.
 pub struct DurableProcessLaunch {
     spawn: DurableSpawn,
     association: Arc<dyn LaunchAssociation + Send + Sync>,
+    /// ADR 0033 §10: how every process of this launch is started.
+    policy: SpawnPolicy,
+    /// ADR 0033 (LC1): where the CUDA driver leaves a server's
+    /// `cuda.shm.<uid>.<pid>.1` (`/dev/shm` on a host).
+    shm_root: std::path::PathBuf,
 }
 
 impl DurableProcessLaunch {
@@ -37,8 +48,134 @@ impl DurableProcessLaunch {
         Self {
             spawn: DurableSpawn::new(),
             association,
+            policy: SpawnPolicy::default(),
+            shm_root: std::path::PathBuf::from(DEV_SHM),
         }
     }
+
+    /// ADR 0033 §10: start every process of this launch (engine, LMCache
+    /// server, a wake's engine) under `policy`.
+    pub fn with_policy(mut self, policy: SpawnPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Use `relay` as the log writer instead of the process's installed one.
+    pub fn with_log_relay(mut self, relay: crate::engine_log_relay::LogRelay) -> Self {
+        self.spawn = self.spawn.with_log_relay(relay);
+        self
+    }
+
+    /// Where a stopped LMCache server's CUDA driver file is looked for
+    /// (`/dev/shm`; tests name their own).
+    pub fn with_shm_root(mut self, root: std::path::PathBuf) -> Self {
+        self.shm_root = root;
+        self
+    }
+
+    /// ADR 0033 (owner requirement from LC1): an LMCache server that had an
+    /// engine connected leaves the CUDA driver's
+    /// `<shm>/cuda.shm.<uid hex>.<pid hex>.1` behind after a clean exit. Once
+    /// a stop has verified every recorded identity gone, exactly that file is
+    /// removed for each identity of the server's group: named from this
+    /// process's uid and the exited pid, never a pattern, and only a regular
+    /// file (not followed through a symlink) this uid owns. An absent file is
+    /// the usual case; any other failure is logged and does not fail the stop.
+    fn remove_server_shm(&self, gone: &[ProcessIdentity]) {
+        use std::os::unix::fs::MetadataExt;
+        let uid = nix::unistd::geteuid().as_raw();
+        for identity in gone.iter().filter(|identity| identity.is_lmcache()) {
+            let path = self
+                .shm_root
+                .join(format!("cuda.shm.{uid:x}.{:x}.1", identity.pid));
+            let removed = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_file() && metadata.uid() == uid => {
+                    std::fs::remove_file(&path)
+                }
+                // Not a regular file of this uid: never this server's to remove.
+                Ok(_) => Ok(()),
+                Err(error) => Err(error),
+            };
+            match removed {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => capyctl_domain::role_log::notice(
+                    capyctl_domain::role_log::Level::Warning,
+                    &format!(
+                        "the CUDA shared-memory file {} of the stopped LMCache server was not removed: {error}",
+                        path.display()
+                    ),
+                ),
+            }
+        }
+    }
+
+    fn spawn_as(
+        &self,
+        incarnation: &str,
+        role: SpawnRole<'_>,
+        cmd: &RenderedCommand,
+        descriptors: Option<&ProtectedLaunchDescriptors>,
+    ) -> Result<ProcessIdentity, RuntimeError> {
+        released(self.spawn.spawn_role(
+            incarnation,
+            role,
+            cmd,
+            descriptors,
+            self.association.as_ref(),
+            self.policy,
+        ))
+    }
+
+    /// The live processes of the group `leader` leads, read from the kernel,
+    /// retried over the transient failures a busy host produces.
+    fn group_facts(&self, leader: &ProcessIdentity) -> Result<Vec<GroupProcessFact>, RuntimeError> {
+        let mut observed = observe_process_group_or_empty(leader);
+        for _ in 1..OBSERVATION_ATTEMPTS {
+            use crate::group_observation::GroupObservationError::{Changed, Visibility};
+            if !matches!(observed, Err(Visibility | Changed)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            observed = observe_process_group_or_empty(leader);
+        }
+        let facts = observed.map_err(|error| uncertain(error.to_string()))?;
+        // SPEC §13.2: a reused leader is neither ours nor proof of an empty
+        // group. Dropping it from the split would manufacture cleanup.
+        if facts
+            .iter()
+            .any(|fact| fact.pid == leader.pid && fact.start_ticks != leader.start_ticks)
+        {
+            return Err(uncertain("process group leader identity changed"));
+        }
+        Ok(facts)
+    }
+}
+
+/// The recorded leader first while it lives, then every other live member in
+/// start order (pids wrap, start ticks within one boot do not).
+fn split_leader<'a>(
+    leader: &ProcessIdentity,
+    facts: &'a [GroupProcessFact],
+) -> (Option<ProcessIdentity>, Vec<&'a GroupProcessFact>) {
+    let mut others: Vec<_> = facts.iter().filter(|fact| fact.pid != leader.pid).collect();
+    others.sort_by_key(|fact| (fact.start_ticks, fact.pid));
+    let alive = facts
+        .iter()
+        .any(|fact| fact.pid == leader.pid && fact.start_ticks == leader.start_ticks);
+    (alive.then(|| leader.clone()), others)
+}
+
+fn named(prefix: &str, list: Vec<&GroupProcessFact>) -> Vec<ProcessIdentity> {
+    list.into_iter()
+        .enumerate()
+        .map(|(index, fact)| ProcessIdentity {
+            role: format!("{prefix}{index}"),
+            pid: fact.pid,
+            boot_id: fact.boot_id.clone(),
+            start_ticks: fact.start_ticks,
+        })
+        .collect()
 }
 
 fn uncertain(reason: impl Into<String>) -> RuntimeError {
@@ -71,10 +208,7 @@ impl OwnedProcessLaunch for DurableProcessLaunch {
         incarnation: &str,
         cmd: &RenderedCommand,
     ) -> Result<ProcessIdentity, RuntimeError> {
-        released(
-            self.spawn
-                .spawn_persisted(incarnation, cmd, self.association.as_ref()),
-        )
+        self.spawn_as(incarnation, SpawnRole::Engine, cmd, None)
     }
 
     fn spawn_durable_protected(
@@ -83,12 +217,25 @@ impl OwnedProcessLaunch for DurableProcessLaunch {
         cmd: &RenderedCommand,
         descriptors: &ProtectedLaunchDescriptors,
     ) -> Result<ProcessIdentity, RuntimeError> {
-        released(self.spawn.spawn_persisted_with_descriptors(
-            incarnation,
-            cmd,
-            Some(descriptors),
-            self.association.as_ref(),
-        ))
+        self.spawn_as(incarnation, SpawnRole::Engine, cmd, Some(descriptors))
+    }
+
+    fn spawn_lmcache(
+        &self,
+        incarnation: &str,
+        cmd: &RenderedCommand,
+    ) -> Result<ProcessIdentity, RuntimeError> {
+        self.spawn_as(incarnation, SpawnRole::Lmcache, cmd, None)
+    }
+
+    fn spawn_durable_wake(
+        &self,
+        incarnation: &str,
+        wake: &str,
+        cmd: &RenderedCommand,
+        descriptors: Option<&ProtectedLaunchDescriptors>,
+    ) -> Result<ProcessIdentity, RuntimeError> {
+        self.spawn_as(incarnation, SpawnRole::Wake(wake), cmd, descriptors)
     }
 
     fn present(&self, identity: &ProcessIdentity) -> Presence {
@@ -100,34 +247,9 @@ impl OwnedProcessLaunch for DurableProcessLaunch {
     }
 
     fn observe_group(&self, api: &ProcessIdentity) -> Result<Vec<ProcessIdentity>, RuntimeError> {
-        let mut observed = observe_process_group_or_empty(api);
-        for _ in 1..OBSERVATION_ATTEMPTS {
-            use crate::group_observation::GroupObservationError::{Changed, Visibility};
-            if !matches!(observed, Err(Visibility | Changed)) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-            observed = observe_process_group_or_empty(api);
-        }
-        let facts = observed.map_err(|error| uncertain(error.to_string()))?;
-        // SPEC §13.2: a reused leader is neither ours nor proof of an empty
-        // group. Dropping it from the API/worker split would manufacture cleanup.
-        if facts
-            .iter()
-            .any(|fact| fact.pid == api.pid && fact.start_ticks != api.start_ticks)
-        {
-            return Err(uncertain("process group leader identity changed"));
-        }
-        let mut members: Vec<ProcessIdentity> = Vec::new();
-        let mut others: Vec<_> = facts.iter().filter(|fact| fact.pid != api.pid).collect();
-        // Start order, not pid order: pids wrap, start ticks within one boot do not.
-        others.sort_by_key(|fact| (fact.start_ticks, fact.pid));
-        if facts
-            .iter()
-            .any(|fact| fact.pid == api.pid && fact.start_ticks == api.start_ticks)
-        {
-            members.push(api.clone());
-        }
+        let facts = self.group_facts(api)?;
+        let (leader, others) = split_leader(api, &facts);
+        let mut members: Vec<ProcessIdentity> = leader.into_iter().collect();
         // ADR 0027: the processes the API process started itself are the
         // engine's workers. Anything else in the group was started by one of
         // them (a compile worker pool) or outlived its parent: a helper,
@@ -136,23 +258,47 @@ impl OwnedProcessLaunch for DurableProcessLaunch {
         let (workers, helpers): (Vec<_>, Vec<_>) = others
             .into_iter()
             .partition(|fact| fact.parent_pid == api.pid);
-        let named = |prefix: &str, list: Vec<&crate::group_observation::GroupProcessFact>| {
-            list.into_iter()
-                .enumerate()
-                .map(|(index, fact)| ProcessIdentity {
-                    role: format!("{prefix}{index}"),
-                    pid: fact.pid,
-                    boot_id: fact.boot_id.clone(),
-                    start_ticks: fact.start_ticks,
-                })
-                .collect::<Vec<_>>()
-        };
         members.extend(named("worker-", workers));
         members.extend(named(
             capyctl_domain::completion::HELPER_ROLE_PREFIX,
             helpers,
         ));
         Ok(members)
+    }
+
+    fn observe_lmcache_group(
+        &self,
+        leader: &ProcessIdentity,
+    ) -> Result<Vec<ProcessIdentity>, RuntimeError> {
+        if leader.role != capyctl_domain::completion::LMCACHE_ROLE {
+            return Err(uncertain("the LMCache group's leader is not `lmcache`"));
+        }
+        let facts = self.group_facts(leader)?;
+        // ADR 0033 §3: every other process of the server's group, whoever
+        // started it, is `lmcache-N` by start order.
+        let (alive, others) = split_leader(leader, &facts);
+        let mut members: Vec<ProcessIdentity> = alive.into_iter().collect();
+        members.extend(named(
+            capyctl_domain::completion::LMCACHE_MEMBER_PREFIX,
+            others,
+        ));
+        Ok(members)
+    }
+
+    fn stop_group(
+        &self,
+        identities: &[ProcessIdentity],
+        grace: Duration,
+    ) -> Result<(), RuntimeError> {
+        // ADR 0033 §§3, 7: exactly one owned group: the server's, or the
+        // engine's with its helpers. The launch's Terminate stops both.
+        let servers = identities.iter().filter(|id| id.is_lmcache()).count();
+        if identities.is_empty() || (servers != 0 && servers != identities.len()) {
+            return Err(uncertain(
+                "a group stop names exactly one owned group of the launch",
+            ));
+        }
+        self.terminate_escalating(identities, grace).map(drop)
     }
 
     fn terminate_owned(
@@ -164,13 +310,40 @@ impl OwnedProcessLaunch for DurableProcessLaunch {
     }
 }
 
+/// One owned process group of a launch, as recorded: the engine's (`api`, its
+/// workers and helpers) or the LMCache server's (`lmcache`, `lmcache-N`).
+struct RecordedGroup {
+    leader: ProcessIdentity,
+    members: Vec<ProcessIdentity>,
+    /// SPEC §13.2: the group id is provably ours, so the group may be signalled.
+    provable: bool,
+}
+
 impl DurableProcessLaunch {
     /// SPEC §13.2: terminate the recorded group with SIGTERM, a bounded wait
     /// of `grace`, then SIGKILL, and prove it gone. ADR 0028 §11: the answer
     /// says whether SIGKILL was needed (`true`), which a group member's gone
     /// report carries as `escalated`; a SGLang worker ignores SIGTERM, so its
     /// stop normally escalates. Never waits past grace plus the proof window.
+    ///
+    /// ADR 0033 §3: a launch with an LMCache server owns two groups. The
+    /// recorded set is split by group (the engine's, led by `api`; the
+    /// server's, led by `lmcache`), each is signalled by the rule below, both
+    /// share one grace window, and the stop is settled only when every
+    /// recorded identity is gone and every group is empty. The same function
+    /// stops an engine-only or a server-only subset.
     pub fn terminate_escalating(
+        &self,
+        identities: &[ProcessIdentity],
+        grace: Duration,
+    ) -> Result<bool, RuntimeError> {
+        let escalated = self.terminate_groups(identities, grace)?;
+        // Every recorded identity is proven gone here, and only here.
+        self.remove_server_shm(identities);
+        Ok(escalated)
+    }
+
+    fn terminate_groups(
         &self,
         identities: &[ProcessIdentity],
         grace: Duration,
@@ -191,68 +364,95 @@ impl DurableProcessLaunch {
                 )));
             }
         }
-        let Some(api) = identities.iter().find(|identity| identity.role == "api") else {
-            // With no leader recorded there is no group to signal; only proof that
-            // the recorded set is already gone can end this without one.
-            return match verify_gone(identities) {
-                GoneProof::AllGone => Ok(false),
-                _ => Err(uncertain(
-                    "no API identity recorded and the set is not proven gone",
-                )),
+        let (server, engine): (Vec<_>, Vec<_>) = identities
+            .iter()
+            .cloned()
+            .partition(ProcessIdentity::is_lmcache);
+        let mut groups = Vec::new();
+        for (members, leader_role) in [
+            (engine, "api"),
+            (server, capyctl_domain::completion::LMCACHE_ROLE),
+        ] {
+            if members.is_empty() {
+                continue;
+            }
+            let Some(leader) = members.iter().find(|id| id.role == leader_role).cloned() else {
+                // With no leader recorded there is no group to signal; only proof
+                // that the recorded set is already gone can end this without one.
+                if verify_gone(&members) == GoneProof::AllGone {
+                    continue;
+                }
+                return Err(uncertain(format!(
+                    "no {leader_role} identity recorded and the set is not proven gone"
+                )));
             };
-        };
-        // SPEC §13.2: signal only a group whose id is provably ours: its leader
-        // is alive (`presence` compares boot id and start ticks, so a reused pid
-        // reads as Gone and is never signalled), or this launcher still holds it
-        // unreaped, which pins the group id (ADR 0028 §11, `pinned_leader`).
-        if presence(api) == Presence::Alive || crate::pinned_leader::is_held(api) {
-            signal_launch_group(api, nix::sys::signal::Signal::SIGTERM)?;
-            if self.settled(identities, api, Instant::now() + grace, 200)? {
-                return Ok(false);
-            }
-            // ADR 0028 §11 (MN5, found live): a leader that died, during grace or
-            // before this stop, is still held, so the processes of its group that
-            // were never recorded (a vLLM worker the engine forked after the
-            // tree was recorded) get the group's SIGKILL too.
-            signal_launch_group(api, nix::sys::signal::Signal::SIGKILL)?;
-            // Spec §5 escalates per identity, not only per group. A leader that
-            // died during grace and was not held can no longer be signalled
-            // through, so a worker still holding device memory would otherwise
-            // never receive the group's SIGKILL. Everything recorded has had
-            // SIGTERM and the whole grace window by now, so the second signal
-            // follows immediately rather than opening another grace window: a
-            // stop stays within grace plus the proof window, which is what the
-            // coordinator validates its protocol timeout against.
-            signal_recorded(identities, nix::sys::signal::Signal::SIGTERM)?;
-            signal_recorded(identities, nix::sys::signal::Signal::SIGKILL)?;
-            if self.settled(identities, api, Instant::now() + KILL_PROOF_WINDOW, 100)? {
-                return Ok(true);
-            }
-        } else {
-            // The head crashed and left its workers behind, and this process
-            // does not hold the leader (it was launched before this role
-            // restarted). There is no leader to signal the group through, but
-            // each recorded identity carries a boot id and start ticks that
-            // `presence` has just matched, so naming them one by one kills
-            // exactly the launch's own processes and nothing else. Refusing here
-            // instead would pause an operator over a state capyctl can prove and
-            // end.
-            //
-            // ADR 0028 §8, §11: only recorded identities are signalled here. A
-            // leaderless group scan can name an unrelated group once the
-            // leader's pid is reused, so it never authorizes a signal: an
-            // unrecorded process still in the group is settlement evidence
-            // only, and the stop below reports it uncertain (claim retained).
-            signal_recorded(identities, nix::sys::signal::Signal::SIGTERM)?;
-            if self.settled(identities, api, Instant::now() + grace, 200)? {
-                return Ok(false);
-            }
-            signal_recorded(identities, nix::sys::signal::Signal::SIGKILL)?;
-            if self.settled(identities, api, Instant::now() + KILL_PROOF_WINDOW, 100)? {
-                return Ok(true);
+            // SPEC §13.2: signal only a group whose id is provably ours: its
+            // leader is alive (`presence` compares boot id and start ticks, so
+            // a reused pid reads as Gone and is never signalled), or this
+            // launcher still holds it unreaped, which pins the group id (ADR
+            // 0028 §11, `pinned_leader`).
+            let provable =
+                presence(&leader) == Presence::Alive || crate::pinned_leader::is_held(&leader);
+            groups.push(RecordedGroup {
+                leader,
+                members,
+                provable,
+            });
+        }
+        if groups.is_empty() {
+            return Ok(false);
+        }
+        for group in &groups {
+            if group.provable {
+                signal_launch_group(&group.leader, nix::sys::signal::Signal::SIGTERM)?;
+            } else {
+                // The head crashed and left its workers behind, and this process
+                // does not hold the leader (it was launched before this role
+                // restarted). There is no leader to signal the group through, but
+                // each recorded identity carries a boot id and start ticks that
+                // `presence` has just matched, so naming them one by one kills
+                // exactly the launch's own processes and nothing else. Refusing
+                // here instead would pause an operator over a state capyctl can
+                // prove and end.
+                //
+                // ADR 0028 §8, §11: only recorded identities are signalled here.
+                // A leaderless group scan can name an unrelated group once the
+                // leader's pid is reused, so it never authorizes a signal: an
+                // unrecorded process still in the group is settlement evidence
+                // only, and the stop below reports it uncertain (claim retained).
+                signal_recorded(&group.members, nix::sys::signal::Signal::SIGTERM)?;
             }
         }
-        match (verify_gone(identities), self.observe_group(api)?.is_empty()) {
+        if self.settled(identities, &groups, Instant::now() + grace, 200)? {
+            return Ok(false);
+        }
+        for group in &groups {
+            if group.provable {
+                // ADR 0028 §11 (MN5, found live): a leader that died, during grace or
+                // before this stop, is still held, so the processes of its group that
+                // were never recorded (a vLLM worker the engine forked after the
+                // tree was recorded) get the group's SIGKILL too.
+                signal_launch_group(&group.leader, nix::sys::signal::Signal::SIGKILL)?;
+                // Spec §5 escalates per identity, not only per group. A leader that
+                // died during grace and was not held can no longer be signalled
+                // through, so a worker still holding device memory would otherwise
+                // never receive the group's SIGKILL. Everything recorded has had
+                // SIGTERM and the whole grace window by now, so the second signal
+                // follows immediately rather than opening another grace window: a
+                // stop stays within grace plus the proof window, which is what the
+                // coordinator validates its protocol timeout against.
+                signal_recorded(&group.members, nix::sys::signal::Signal::SIGTERM)?;
+            }
+            signal_recorded(&group.members, nix::sys::signal::Signal::SIGKILL)?;
+        }
+        if self.settled(identities, &groups, Instant::now() + KILL_PROOF_WINDOW, 100)? {
+            return Ok(true);
+        }
+        let mut empty = true;
+        for group in &groups {
+            empty &= self.group_facts(&group.leader)?.is_empty();
+        }
+        match (verify_gone(identities), empty) {
             (GoneProof::AllGone, true) => Ok(true),
             (GoneProof::AllGone, false) => Err(uncertain(
                 "recorded processes gone but the group still has members",
@@ -298,9 +498,9 @@ pub fn terminate_recorded(
 }
 
 impl DurableProcessLaunch {
-    /// Poll until every recorded process is proven gone and the group itself is
-    /// empty, or the deadline passes. Both halves are required: a recorded process
-    /// may exit while a worker it started keeps running in the same group.
+    /// Poll until every recorded process is proven gone and every group itself
+    /// is empty, or the deadline passes. Both halves are required: a recorded
+    /// process may exit while a worker it started keeps running in the same group.
     /// An observation that fails here is "not settled yet", not a verdict. A
     /// hidden `/proc` entry on a busy host, or unrelated process churn, would
     /// otherwise end the stop early and report uncertainty for a state the next
@@ -309,13 +509,18 @@ impl DurableProcessLaunch {
     fn settled(
         &self,
         identities: &[ProcessIdentity],
-        api: &ProcessIdentity,
+        groups: &[RecordedGroup],
         deadline: Instant,
         poll_millis: u64,
     ) -> Result<bool, RuntimeError> {
         while Instant::now() < deadline {
             let gone = verify_gone(identities) == GoneProof::AllGone;
-            if gone && self.observe_group(api).is_ok_and(|group| group.is_empty()) {
+            if gone
+                && groups.iter().all(|group| {
+                    self.group_facts(&group.leader)
+                        .is_ok_and(|facts| facts.is_empty())
+                })
+            {
                 return Ok(true);
             }
             std::thread::sleep(Duration::from_millis(poll_millis));

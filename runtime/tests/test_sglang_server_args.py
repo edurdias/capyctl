@@ -265,6 +265,43 @@ class MappingTests(LaunchFixture, unittest.TestCase):
                 self.placement(), constructor, AVAILABLE, approvals=approved)
         self.assertEqual(caught.exception.code, "effective_args_mismatch")
 
+    # T45 (ADR 0033 §4): a launch whose LMCache server is up turns the
+    # connector on through the reserved subset, with its own file; without
+    # one the constant pins keep it off, exactly as before.
+    def test_an_lmcache_config_file_turns_the_connector_on_as_reserved_values(self):
+        config = "/var/lib/capyctl/lmcache/i/config.yaml"
+        kwargs = self.seen(self.spec_with(lmcache_config_file=config))
+        self.assertIs(kwargs["enable_lmcache"], True)
+        self.assertEqual(kwargs["lmcache_config_file"], config)
+        kwargs = self.seen(self.build_without("lmcache_config_file"))
+        self.assertIs(kwargs["enable_lmcache"], False)
+        self.assertIsNone(kwargs["lmcache_config_file"])
+
+    # T45 T22 (ADR 0033 §4): the rendered connector is pinned after SGLang's
+    # own resolution: turned off, turned on, or another file is a closed
+    # mismatch.
+    def test_resolution_changing_the_lmcache_connector_is_a_closed_mismatch(self):
+        config = "/var/lib/capyctl/lmcache/i/config.yaml"
+        for with_file, key, replacement in (
+                (True, "enable_lmcache", False),
+                (True, "lmcache_config_file", "/tmp/elsewhere.yaml"),
+                (True, "lmcache_config_file", None),
+                (False, "enable_lmcache", True),
+                (False, "lmcache_config_file", config)):
+            def changed(**kwargs):
+                effective = synthetic_constructor(**kwargs)
+                effective.resolve_once()
+                effective.resolve_once = lambda: None
+                setattr(effective, key, replacement)
+                return effective
+            changed.add_cli_args = SyntheticArgs.add_cli_args
+            spec = (self.spec_with(lmcache_config_file=config) if with_file
+                    else self.build_without("lmcache_config_file"))
+            with self.subTest(with_file=with_file, key=key), \
+                    self.assertRaises(mapping.ServerArgsError) as caught:
+                construct(spec, self.placement(), changed)
+            self.assertEqual(caught.exception.code, "effective_args_mismatch")
+
     # T14: extra arguments flow in through the installed parser.
     def test_extra_arguments_reach_the_constructor_under_their_field_names(self):
         kwargs = self.seen(self.spec_with(extra_args=[
