@@ -155,7 +155,7 @@ pub(super) async fn settle_failed_launch(
     // it. Two store guards make both orderings safe, and this code depends on
     // them: `release_failed_launch` refuses evidence whose identity set differs
     // from the recorded one, so a release built on a stale empty read cannot
-    // commit; and `record_api_identity` refuses a released binding, so an
+    // commit; and `record_launch_identity` refuses a released binding, so an
     // association arriving after the release is refused and the launcher disposes
     // of the gated child. Neither guard is optional for what follows.
     let recorded = {

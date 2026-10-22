@@ -228,6 +228,8 @@ pub(super) fn prepare_work(
     let binding = decode(&plan.binding_json)?;
     let fence = plan.fence();
     let group = group_shape(tx, &plan.deployment_id, plan.revision)?;
+    // ADR 0033 §§3, 10: what the store planned for the launch's LMCache.
+    let lmcache = super::lmcache::read_plan(tx, &plan.binding_id)?;
     Ok(InitializeWork {
         plan,
         effective,
@@ -235,6 +237,7 @@ pub(super) fn prepare_work(
         binding,
         fence,
         group,
+        lmcache,
     })
 }
 
@@ -290,6 +293,7 @@ pub struct InitializeWork {
     binding: BindingDto,
     fence: DeploymentFence,
     group: Option<capyctl_config::topology::GroupShape>,
+    lmcache: Option<super::lmcache::LaunchLmcachePlan>,
 }
 
 /// ADR 0028 §5: one member of a group revision as its own host resolved it.
@@ -349,6 +353,12 @@ impl InitializeWork {
     /// ids in rank order; `None` for a single-host start.
     pub fn group(&self) -> Option<&capyctl_config::topology::GroupShape> {
         self.group.as_ref()
+    }
+    /// ADR 0033 §§3, 10: the launch's LMCache as the store planned it (on
+    /// with its grant, or off with the reason); `None` for a binding planned
+    /// before ADR 0033.
+    pub fn lmcache(&self) -> Option<&super::lmcache::LaunchLmcachePlan> {
+        self.lmcache.as_ref()
     }
 }
 
@@ -590,10 +600,11 @@ impl crate::Store {
             |row| row.get(0),
         )?;
         // Spec §3: a durable launcher records the API identity as soon as the
-        // process exists, before the launch is associated. An armed step may
-        // therefore carry exactly that one identity with no association yet; a
-        // planned step has launched nothing and must carry none. Any other
-        // unassociated shape is not one the launch path can write.
+        // process exists, before the launch is associated (ADR 0033 §3: and the
+        // LMCache server's leader before that). An armed step may therefore
+        // carry exactly those leaders with no association yet; a planned step
+        // has launched nothing and must carry none. Any other unassociated
+        // shape is not one the launch path can write.
         if associated.is_none() {
             let recorded = decode::<Vec<IdentityDto>>(&identities)?;
             let launching = matches!(state.as_str(), "armed" | "uncertain");
@@ -603,7 +614,11 @@ impl crate::Store {
                         &crate::lifecycle::completion::identities(&recorded),
                     )
                     .ok()
-                    .is_none_or(|members| members.len() != 1))
+                    .is_none_or(|members| {
+                        !members.iter().all(|m| {
+                            m.role == "api" || m.role == capyctl_domain::completion::LMCACHE_ROLE
+                        })
+                    }))
             {
                 return Err(LifecycleError::CorruptStoredData);
             }

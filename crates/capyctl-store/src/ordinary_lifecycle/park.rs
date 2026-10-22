@@ -387,14 +387,77 @@ pub(super) struct Footprints {
 }
 
 /// ADR 0014 amendment A13: the footprints of the launch `p` started, its
-/// parked phase charged the residue measured for its revision.
+/// parked phase charged the residue measured for its revision. ADR 0033 §§6,
+/// 7 (lifecycle design §4.1): every phase carries the launch's LMCache charge
+/// while its server runs; a restart-park's parked phase is the server's
+/// charge alone (with the stopped engine's KV it keeps mapped), and its wake
+/// is a cold start beside that server.
 pub(super) fn charged_footprints(
     tx: &rusqlite::Connection,
     p: &Plan,
     e: &EffectiveDeployment,
 ) -> Result<Footprints, LifecycleError> {
+    use super::lmcache::{charge_of, lay, park_mode, Charged, ParkMode};
+    let Some((charge, restart_park)) = charge_of(tx, &p.binding_id, Charged::Reported)? else {
+        let measured = super::parked_charge::measured(tx, &p.deployment_id, p.revision, e)?;
+        return Ok(footprints_with(e, &measured));
+    };
+    let ready = lay(
+        e,
+        &phase(&e.resources.ready, ResourcePhase::Ready),
+        &charge,
+        false,
+        false,
+    )?;
+    let parking = lay(
+        e,
+        &phase(&e.resources.parking, ResourcePhase::Parking),
+        &charge,
+        false,
+        false,
+    )?;
+    if restart_park && park_mode(tx, e, &p.binding_id)? == ParkMode::EngineStop {
+        let parked = lay(
+            e,
+            &phase(&e.resources.parked, ResourcePhase::Parked),
+            &charge,
+            true,
+            true,
+        )?;
+        let mut cold = super::startup::cold(tx, p, e)?;
+        cold.phase = ResourcePhase::Wake;
+        return Ok(Footprints {
+            parking: peak(&ready, &parking, ResourcePhase::Parking),
+            wake: peak(&parked, &cold, ResourcePhase::Wake),
+            ready,
+            parked,
+        });
+    }
     let measured = super::parked_charge::measured(tx, &p.deployment_id, p.revision, e)?;
-    Ok(footprints_with(e, &measured))
+    let parked = lay(
+        e,
+        &super::parked_charge::apply(
+            &phase(&e.resources.parked, ResourcePhase::Parked),
+            &phase(&e.resources.ready, ResourcePhase::Ready),
+            &measured,
+        ),
+        &charge,
+        false,
+        true,
+    )?;
+    let wake = lay(
+        e,
+        &phase(&e.resources.wake, ResourcePhase::Wake),
+        &charge,
+        false,
+        false,
+    )?;
+    Ok(Footprints {
+        parking: peak(&ready, &parking, ResourcePhase::Parking),
+        wake: peak(&parked, &wake, ResourcePhase::Wake),
+        ready,
+        parked,
+    })
 }
 
 fn footprints_with(
@@ -589,7 +652,7 @@ pub(super) fn launch(
         return Err(LifecycleError::Conflict);
     }
     let association = association(tx, &p)?.ok_or(LifecycleError::CorruptStoredData)?;
-    let identities = members(&association.identities)?;
+    let identities = members(association.held())?;
     Ok((p, e, identities))
 }
 
@@ -802,7 +865,9 @@ fn accept_instance(
             source.generation,
         )?)
     } else {
-        parks(&e)
+        // ADR 0033 §7: a restart_only launch whose LMCache server runs parks
+        // by stopping its engine and keeping the server.
+        super::lmcache::park_mode(tx, &e, &source.binding_id)? != super::lmcache::ParkMode::None
     };
     if kind == ResidencyKind::Park && !parkable {
         // SPEC §6.3: fail clearly if explicit parking is unsupported.
@@ -1011,6 +1076,9 @@ impl crate::Store {
         super::receipt::command_revision(&tx, deployment, expected_revision)?;
         super::check_managed_command_target(&tx, deployment)?;
         let e = declared(&tx, deployment)?;
+        // ADR 0033 §7: a restart_only single launch whose LMCache server runs
+        // parks by stopping its engine; one without a server refuses.
+        let restart_park = !parks(&e) && e.residency == Residency::RestartOnly;
         if !parks(&e) {
             // ADR 0028 §12 (R34): park follows the effective residency, not
             // the engine. A restart_only group parks by a group stop and
@@ -1035,7 +1103,9 @@ impl crate::Store {
                 tx.commit()?;
                 return Ok(receipt);
             }
-            return Err(LifecycleError::Unsupported);
+            if !restart_park {
+                return Err(LifecycleError::Unsupported);
+            }
         }
         let targets: Vec<u32> = tx
             .prepare(
@@ -1048,24 +1118,30 @@ impl crate::Store {
             .query_map([deployment], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
         let mut first: Option<ResidencyReceipt> = None;
+        let mut unsupported = false;
         for instance in targets {
             // ADR 0014 amendment A19: an instance whose parked charge grew
             // past its host's bound is stopped instead, under this command.
-            let accepted =
-                match growth_stop(&tx, s, principal, deployment, instance, key, now, deadline)? {
-                    Some(receipt) => Ok(receipt),
-                    None => accept_instance(
-                        &tx,
-                        s,
-                        ResidencyKind::Park,
-                        deployment,
-                        instance,
-                        principal,
-                        now,
-                        deadline,
-                        false,
-                    ),
-                };
+            // A restart-park keeps no parked residue to outgrow.
+            let growth = if restart_park {
+                None
+            } else {
+                growth_stop(&tx, s, principal, deployment, instance, key, now, deadline)?
+            };
+            let accepted = match growth {
+                Some(receipt) => Ok(receipt),
+                None => accept_instance(
+                    &tx,
+                    s,
+                    ResidencyKind::Park,
+                    deployment,
+                    instance,
+                    principal,
+                    now,
+                    deadline,
+                    false,
+                ),
+            };
             match accepted {
                 Ok(receipt) => {
                     if first.is_some() {
@@ -1090,11 +1166,19 @@ impl crate::Store {
                 // An instance whose own launch is busy (a start, a stop) is
                 // not READY for this command; its siblings still park.
                 Err(LifecycleError::Conflict | LifecycleError::Stale) => {}
+                // ADR 0033 §7: a restart_only instance without a running
+                // LMCache server does not park; its siblings still may.
+                Err(LifecycleError::Unsupported) if restart_park => unsupported = true,
                 Err(error) => return Err(error),
             }
         }
-        // SPEC §6.3: a deployment with no READY instance has nothing to park.
-        let receipt = first.ok_or(LifecycleError::Conflict)?;
+        // SPEC §6.3: a deployment with no READY instance has nothing to park;
+        // one whose instances cannot park refuses the park clearly.
+        let receipt = first.ok_or(if unsupported {
+            LifecycleError::Unsupported
+        } else {
+            LifecycleError::Conflict
+        })?;
         store_receipt(
             &tx,
             principal,
@@ -2116,12 +2200,33 @@ fn complete(
         .clone()
         .ok_or(LifecycleError::CorruptStoredData)?;
     let ttl = policy(tx, &e)?.controls.observation_ttl_ms;
+    // ADR 0033 §7 (lifecycle design §4.1): a restart-park's evidence names the
+    // server's group alone once parked, and a new engine beside the same
+    // server once restored; the binding records that set afterwards.
+    let restart =
+        super::lmcache::park_mode(tx, &e, &p.binding_id)? == super::lmcache::ParkMode::EngineStop;
+    let rewritten = if restart {
+        Some(
+            super::lmcache::restart_park_evidence(
+                p.kind == ResidencyKind::Park,
+                &identities,
+                &o.identities,
+                &o.facts,
+            )
+            .ok_or_else(|| {
+                LifecycleError::Rejected(
+                    "restart-park evidence does not match the retained launch".into(),
+                )
+            })?,
+        )
+    } else {
+        None
+    };
     // ADR 0027: the engine's own processes, all of them; a helper may be gone.
     if o.token != p.token()
         || o.binding_id != p.binding_id
         || o.incarnation != p.incarnation
-        || !names_engine(&identities, &o.identities)
-        || o.facts != p.kind.facts()
+        || (!restart && (!names_engine(&identities, &o.identities) || o.facts != p.kind.facts()))
     {
         return Err(LifecycleError::Rejected(
             "residency evidence does not match the retained launch".into(),
@@ -2170,6 +2275,9 @@ fn complete(
         "UPDATE resource_owners SET footprint_json=?2 WHERE owner_id=?1",
         params![p.owner(), resource_ledger::encode(next).map_err(resource)?],
     )?)?;
+    if let Some(identities) = &rewritten {
+        super::lmcache::reassociate(tx, &source, identities)?;
+    }
     match p.kind {
         // SPEC §6.1 PARKED: initialized runtime retained, release verified.
         ResidencyKind::Park => one(tx.execute(
@@ -2501,7 +2609,7 @@ impl crate::Store {
             context.limits.iter().map(|l| l.domain.as_str()),
         )
         .map_err(resource)?;
-        let cold = super::startup::cold(&p, &e);
+        let cold = super::startup::cold(&tx, &p, &e)?;
         // ADR 0019: each domain credited by its kind. A policy that does not
         // read here credits nothing; the start's own arm judges the policy.
         let kinds = policy(&tx, &e)
@@ -2690,7 +2798,12 @@ fn idle_one(
     // ADR 0014 amendment A19: a launch whose parked charge grew past its
     // host's bound since its first park stops instead, so its next
     // activation starts a fresh engine.
-    let growth = if !parked && parks(&e) && !refused_park {
+    // ADR 0033 §7: a restart-park (engine stopped, server kept) parks too,
+    // and stays eligible for on-demand activation (T10); it has no parked
+    // residue to outgrow.
+    let mode = super::lmcache::park_mode(tx, &e, &source.binding_id)?;
+    let parkable = mode != super::lmcache::ParkMode::None;
+    let growth = if !parked && mode == super::lmcache::ParkMode::Engine && !refused_park {
         super::parked_charge::outgrown(tx, &source, &e)?
     } else {
         None
@@ -2700,7 +2813,7 @@ fn idle_one(
     // it forever (SPEC §9.2: unknown work is not quiescence for a park), so
     // the instance stops instead.
     let unanswered = !parked
-        && parks(&e)
+        && parkable
         && tx.query_row(
             &format!(
                 "SELECT EXISTS(SELECT 1 FROM request_leases l WHERE l.deployment_id=?1 AND l.instance_index=?2
@@ -2710,7 +2823,7 @@ fn idle_one(
             params![deployment, instance],
             |r| r.get::<_, bool>(0),
         )?;
-    if !parked && parks(&e) && !refused_park && growth.is_none() && !unanswered {
+    if !parked && parkable && !refused_park && growth.is_none() && !unanswered {
         let key = format!("idle-park:{generation}:{since}");
         let receipt = crate::Store::instance_park_in_transaction(
             tx, s, "idle", deployment, instance, &key, now, deadline, false,

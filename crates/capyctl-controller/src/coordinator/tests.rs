@@ -132,7 +132,7 @@ impl EngineAdapter for Gate {
                 // Spec §3: the launcher persists the API identity before the
                 // engine has answered anything; no association exists yet.
                 o.store()
-                    .record_api_identity(
+                    .record_launch_identity(
                         o.session(),
                         &DeploymentFence {
                             deployment_id: command.context.token.deployment_id.clone(),

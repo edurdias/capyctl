@@ -1115,6 +1115,78 @@ DROP TABLE startup_measurements;
 ALTER TABLE startup_measurements_v52 RENAME TO startup_measurements;
 "#;
 
+/// v53 (ADR 0033 §§3, 6, 8, 9, 10; lifecycle design §§1.6, 3, 7, 9): LMCache.
+/// `launch_lmcache` is what the store planned for one launch (on with two
+/// leased loopback ports and the reserved charge, or off with the reason) and
+/// what its host reported; the ports stay held while the binding is retained.
+/// `lmcache_fallbacks` is the sticky `engine_start_failed` of a revision on a
+/// host's profile; `lmcache_measurements` the largest overhead and device
+/// memory measured for a revision on a host; `lmcache_relaunches` the
+/// instances a role start under `lmcache: off` or `retention: zero` stopped
+/// and owes a start without LMCache. Additive and forward-only.
+pub const SCHEMA_V53: &str = r#"
+CREATE TABLE IF NOT EXISTS launch_lmcache(
+  binding_id TEXT PRIMARY KEY,
+  deployment_id TEXT NOT NULL,
+  instance_index INTEGER NOT NULL CHECK(instance_index>=0),
+  generation INTEGER NOT NULL CHECK(generation>=0),
+  revision INTEGER NOT NULL CHECK(revision>=1),
+  host_id TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK(mode IN('auto','off','required')),
+  retention_zero INTEGER NOT NULL DEFAULT 0 CHECK(retention_zero IN(0,1)),
+  planned TEXT NOT NULL CHECK(planned IN('on','off')),
+  planned_reason TEXT,
+  planned_detail TEXT,
+  rpc_port INTEGER CHECK(rpc_port BETWEEN 1 AND 65535),
+  http_port INTEGER CHECK(http_port BETWEEN 1 AND 65535),
+  pool_bytes INTEGER CHECK(pool_bytes>0),
+  overhead_bytes INTEGER CHECK(overhead_bytes>=0),
+  device_bytes INTEGER CHECK(device_bytes>=0),
+  held_kv_bytes INTEGER CHECK(held_kv_bytes>=0),
+  measured INTEGER NOT NULL DEFAULT 0 CHECK(measured IN(0,1)),
+  state TEXT CHECK(state IN('on','off')),
+  reason TEXT,
+  detail TEXT,
+  restart_park INTEGER NOT NULL DEFAULT 0 CHECK(restart_park IN(0,1)),
+  off_event INTEGER NOT NULL DEFAULT 0 CHECK(off_event IN(0,1)),
+  reported_at_ms INTEGER,
+  CHECK((planned='on')=(rpc_port IS NOT NULL AND http_port IS NOT NULL AND pool_bytes IS NOT NULL
+        AND overhead_bytes IS NOT NULL AND device_bytes IS NOT NULL AND held_kv_bytes IS NOT NULL)),
+  CHECK(planned='on' OR planned_reason IS NOT NULL),
+  CHECK(rpc_port IS NULL OR rpc_port<>http_port)
+);
+CREATE INDEX IF NOT EXISTS launch_lmcache_host ON launch_lmcache(host_id);
+CREATE INDEX IF NOT EXISTS launch_lmcache_instance ON launch_lmcache(deployment_id,instance_index);
+CREATE TABLE IF NOT EXISTS lmcache_fallbacks(
+  deployment_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision>=1),
+  host_id TEXT NOT NULL,
+  profile_name TEXT NOT NULL,
+  profile_fingerprint TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0),
+  PRIMARY KEY(deployment_id,revision,host_id,profile_name,profile_fingerprint)
+);
+CREATE TABLE IF NOT EXISTS lmcache_measurements(
+  deployment_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision>=1),
+  host_id TEXT NOT NULL,
+  overhead_bytes INTEGER NOT NULL CHECK(overhead_bytes>=0),
+  device_bytes INTEGER NOT NULL CHECK(device_bytes>=0),
+  binding_id TEXT NOT NULL,
+  measured_at_ms INTEGER NOT NULL CHECK(measured_at_ms>=0),
+  PRIMARY KEY(deployment_id,revision,host_id)
+);
+CREATE TABLE IF NOT EXISTS lmcache_relaunches(
+  deployment_id TEXT NOT NULL,
+  instance_index INTEGER NOT NULL CHECK(instance_index>=0),
+  generation INTEGER NOT NULL CHECK(generation>=0),
+  reason TEXT NOT NULL CHECK(reason IN('host_off','retention_zero')),
+  stop_operation_id TEXT NOT NULL,
+  PRIMARY KEY(deployment_id,instance_index)
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

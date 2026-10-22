@@ -159,7 +159,7 @@ fn record_launch_accepts_the_api_identity_the_association_wrote() {
     let api = identity("api", 10);
     let worker0 = identity("worker-0", 11);
     store
-        .record_api_identity(&session, &fence, &execution.binding_id, &api)
+        .record_launch_identity(&session, &fence, &execution.binding_id, &api)
         .unwrap();
     let receipt = OwnedLaunchReceipt {
         binding_id: execution.binding_id.clone(),
@@ -184,7 +184,7 @@ fn record_launch_accepts_the_api_identity_the_association_wrote() {
 fn record_launch_refuses_a_mismatched_prior_identity() {
     let (store, session, fence, execution) = armed_ordinary();
     store
-        .record_api_identity(
+        .record_launch_identity(
             &session,
             &fence,
             &execution.binding_id,

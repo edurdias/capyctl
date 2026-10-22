@@ -148,7 +148,7 @@ struct StoreAssociation<'a> {
 impl LaunchAssociation for StoreAssociation<'_> {
     fn persist_api_identity(&self, identity: &ProcessIdentity) -> Result<(), AssociationError> {
         self.store
-            .record_api_identity(self.session, self.fence, self.binding_id, identity)
+            .record_launch_identity(self.session, self.fence, self.binding_id, identity)
             .map_err(|error| AssociationError::Uncertain(error.to_string()))
     }
 }
@@ -349,7 +349,7 @@ impl LaunchAssociation for NativeLaunchHandoff<'_> {
         self.validate_current()
             .map_err(|_| AssociationError::Uncertain("handoff is stale".into()))?;
         self.store
-            .record_api_identity(
+            .record_launch_identity(
                 self.session,
                 &self.fence,
                 &self.frozen.metadata().binding_id,

@@ -982,31 +982,33 @@ impl crate::Store {
         Ok(())
     }
 
-    /// Records API membership only; it never establishes complete worker ownership.
-    pub fn record_api_identity(
+    /// Records a launch leader's membership only (the engine's `api`, or ADR
+    /// 0033 §3 the LMCache server's `lmcache`), before that process runs; it
+    /// never establishes complete worker ownership. Each leader is appended
+    /// once; the same identity again is a replay, another one for a recorded
+    /// role a conflict, and nothing is appended once the launch's full set
+    /// was associated.
+    pub fn record_launch_identity(
         &self,
         session: &CoordinatorSession,
         fence: &DeploymentFence,
         binding_id: &str,
         identity: &ProcessIdentity,
     ) -> Result<(), LifecycleError> {
-        if identity.role != "api"
+        let leader = |role: &str| role == "api" || role == capyctl_domain::completion::LMCACHE_ROLE;
+        if !leader(&identity.role)
             || identity.pid == 0
             || identity.boot_id.is_empty()
             || identity.start_ticks == 0
         {
             return Err(LifecycleError::Invalid);
         }
-        let dto = [IdentityDto {
+        let dto = IdentityDto {
             role: identity.role.clone(),
             pid: identity.pid,
             boot_id: identity.boot_id.clone(),
             start_ticks: identity.start_ticks,
-        }];
-        let json = serde_json::to_string(&dto).map_err(|_| LifecycleError::Invalid)?;
-        if json.len() > MAX_DTO_BYTES {
-            return Err(LifecycleError::Invalid);
-        }
+        };
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         fenced(&transaction, session, fence)?;
         let row:Option<(String,String,String)>=transaction.query_row("SELECT ownership,binding_json,identities_json FROM runtime_bindings WHERE id=?1 AND deployment_id=?2 AND revision=?3 AND state!='released'",params![binding_id,fence.deployment_id,fence.revision],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
@@ -1018,7 +1020,7 @@ impl crate::Store {
         if existing.len() > MAX_DTO_BYTES {
             return Err(LifecycleError::CorruptStoredData);
         }
-        let members: Vec<IdentityDto> =
+        let mut members: Vec<IdentityDto> =
             serde_json::from_str(&existing).map_err(|_| LifecycleError::CorruptStoredData)?;
         let mut roles = std::collections::BTreeSet::new();
         let mut processes = std::collections::BTreeSet::new();
@@ -1033,15 +1035,27 @@ impl crate::Store {
         }) {
             return Err(LifecycleError::CorruptStoredData);
         }
-        if !members.is_empty() {
-            if !members.iter().any(|m| m.role == "api") {
-                return Err(LifecycleError::CorruptStoredData);
-            }
-            return if members.contains(&dto[0]) {
-                Ok(())
-            } else {
-                Err(LifecycleError::Conflict)
-            };
+        if !members.is_empty() && !members.iter().any(|m| leader(&m.role)) {
+            return Err(LifecycleError::CorruptStoredData);
+        }
+        if members.contains(&dto) {
+            return Ok(());
+        }
+        // One identity per leader, of one boot, only while nothing but
+        // leaders is recorded (the full set is the association's).
+        if members
+            .iter()
+            .any(|m| !leader(&m.role) || m.role == dto.role)
+            || members
+                .first()
+                .is_some_and(|m| m.boot_id != dto.boot_id || m.pid == dto.pid)
+        {
+            return Err(LifecycleError::Conflict);
+        }
+        members.push(dto);
+        let json = serde_json::to_string(&members).map_err(|_| LifecycleError::Invalid)?;
+        if json.len() > MAX_DTO_BYTES {
+            return Err(LifecycleError::Invalid);
         }
         let changed = transaction.execute(
             "UPDATE runtime_bindings SET identities_json=?1,state='uncertain'
@@ -1451,7 +1465,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            store.record_api_identity(
+            store.record_launch_identity(
                 &session,
                 &b,
                 "other-binding",
@@ -1827,7 +1841,7 @@ mod tests {
             start_ticks: 99,
         };
         store
-            .record_api_identity(&session, &fence, "binding-a", &api)
+            .record_launch_identity(&session, &fence, "binding-a", &api)
             .unwrap();
         assert_eq!(store.retained_processes().unwrap(), vec![api]);
     }
@@ -1980,7 +1994,7 @@ mod tests {
             Err(LifecycleError::Conflict)
         ));
         store
-            .record_api_identity(
+            .record_launch_identity(
                 &session,
                 &fence,
                 "binding-uncertain",
@@ -1999,12 +2013,12 @@ mod tests {
         let mut changed_api = api.clone();
         changed_api.start_ticks += 1;
         assert!(matches!(
-            store.record_api_identity(&session, &fence, "binding-uncertain", &changed_api),
+            store.record_launch_identity(&session, &fence, "binding-uncertain", &changed_api),
             Err(LifecycleError::Conflict)
         ));
         store.conn.execute("UPDATE runtime_bindings SET identities_json='[{\"role\":\"api\",\"pid\":42,\"boot_id\":\"boot\",\"start_ticks\":7},{\"role\":\"worker-0\",\"pid\":43,\"boot_id\":\"boot\",\"start_ticks\":8}]' WHERE id='binding-uncertain'",[]).unwrap();
         store
-            .record_api_identity(&session, &fence, "binding-uncertain", &api)
+            .record_launch_identity(&session, &fence, "binding-uncertain", &api)
             .unwrap();
         assert_eq!(
             store
@@ -2027,7 +2041,7 @@ mod tests {
 
         let _new_session = store.begin_coordinator_session().unwrap();
         assert!(matches!(
-            store.record_api_identity(
+            store.record_launch_identity(
                 &session,
                 &fence,
                 "binding-uncertain",

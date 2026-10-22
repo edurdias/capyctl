@@ -47,23 +47,17 @@ fn evidence_value(id: &str, e: &CleanupEvidence) -> Result<String, LifecycleErro
 /// launch path is able to write. Nothing at all, when the gate never opened. The
 /// API process alone, because a durable launcher records that identity as soon as
 /// the process exists. Or the full canonical set, once the launch was associated.
-/// `canonical_members` covers only the last of the three, so the two earlier shapes
-/// are accepted here under the same per-identity rules. Field sizes are bounded by
-/// `encode` on the way in and by `decode` on the way out.
+/// ADR 0033 §3: the LMCache server's leader is recorded the same way before it
+/// runs, so its leader alone, or beside the API process (a canonical set), is
+/// a shape too. Field sizes are bounded by `encode` on the way in and by
+/// `decode` on the way out.
 pub(super) fn canonical_members_or_empty(
     ids: &[ProcessIdentity],
 ) -> Result<Vec<ProcessIdentity>, LifecycleError> {
     match ids {
         [] => Ok(Vec::new()),
-        [only] => {
-            if only.role != "api"
-                || only.pid == 0
-                || only.start_ticks == 0
-                || only.boot_id.trim().is_empty()
-            {
-                return Err(LifecycleError::Invalid);
-            }
-            Ok(vec![only.clone()])
+        [only] if only.role != "api" && only.role != capyctl_domain::completion::LMCACHE_ROLE => {
+            Err(LifecycleError::Invalid)
         }
         _ => canonical_members(ids),
     }
@@ -130,9 +124,26 @@ impl crate::Store {
         now: i64,
         ttl: i64,
     ) -> Result<(), LifecycleError> {
+        self.release_failed_launch_coded(s, id, evidence, now, ttl, "launch_failed")
+    }
+
+    /// [`Self::release_failed_launch`] with the operation's closed failure
+    /// code: ADR 0033 §9, a `lmcache: required` launch that failed for a
+    /// launch-time reason fails `lmcache_unavailable:<reason>`. Any other code
+    /// than `launch_failed` or `lmcache_unavailable:<reason>` is refused.
+    #[allow(clippy::too_many_arguments)]
+    pub fn release_failed_launch_coded(
+        &self,
+        s: &CoordinatorSession,
+        id: &str,
+        evidence: &CleanupEvidence,
+        now: i64,
+        ttl: i64,
+        error_code: &str,
+    ) -> Result<(), LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
-        release(&tx, s, id, evidence, now, ttl)?;
+        release_with_code(&tx, s, id, evidence, now, ttl, error_code)?;
         tx.commit()?;
         Ok(())
     }
@@ -159,14 +170,24 @@ impl crate::Store {
     }
 }
 
-fn release(
+/// [`crate::Store::release_failed_launch_coded`] inside the caller's
+/// transaction.
+pub(super) fn release_with_code(
     tx: &Transaction<'_>,
     s: &CoordinatorSession,
     id: &str,
     evidence: &CleanupEvidence,
     now: i64,
     ttl: i64,
+    error_code: &str,
 ) -> Result<(), LifecycleError> {
+    let lmcache_code = error_code
+        .strip_prefix("lmcache_unavailable:")
+        .and_then(capyctl_config::lmcache::LmcacheOffReason::parse)
+        .is_some();
+    if error_code != "launch_failed" && !lmcache_code {
+        return Err(LifecycleError::Invalid);
+    }
     if !is_ordinary(tx, id)? {
         return Err(LifecycleError::Unsupported);
     }
@@ -208,8 +229,8 @@ fn release(
         [&p.operation_id],
     )?)?;
     one(tx.execute(
-        "UPDATE operations SET state='failed',error_code='launch_failed' WHERE id=?1 AND state='running'",
-        [&p.operation_id],
+        "UPDATE operations SET state='failed',error_code=?2 WHERE id=?1 AND state='running'",
+        params![p.operation_id, error_code],
     )?)?;
     // ADR 0028 §11, SPEC §11: a failed group launch is released only once
     // every member settled on its own host's evidence; it holds no
@@ -355,7 +376,7 @@ mod tests {
         store.set_secrets_key(SecretsKey::generate_ephemeral());
         let api = identity("api", 7);
         store
-            .record_api_identity(&session, &fence, &execution.binding_id, &api)
+            .record_launch_identity(&session, &fence, &execution.binding_id, &api)
             .unwrap();
         store
             .store_engine_key(
@@ -527,7 +548,7 @@ mod tests {
     fn mismatched_identities_are_refused() {
         let (store, session, fence, execution) = armed_ordinary();
         store
-            .record_api_identity(&session, &fence, &execution.binding_id, &identity("api", 7))
+            .record_launch_identity(&session, &fence, &execution.binding_id, &identity("api", 7))
             .unwrap();
         let step = execution.token.step_id.clone();
         let ttl = store.observation_ttl_for_step(&step).unwrap();

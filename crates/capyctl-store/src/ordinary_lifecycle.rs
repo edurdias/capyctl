@@ -10,6 +10,8 @@ pub mod group_stall;
 pub mod lanes;
 pub(crate) mod legacy_engine_config;
 pub mod local_recovery;
+// ADR 0033: each launch's LMCache plan, grant, report and lifecycle.
+pub mod lmcache;
 pub mod park;
 // ADR 0014 amendment A13: the parked charge measured per revision.
 pub mod parked_charge;
@@ -135,6 +137,21 @@ struct Association {
     identities: Vec<IdentityDto>,
     observed_at_ms: i64,
     receipt: String,
+    /// ADR 0033 §7: what a restart-parked launch holds now, when a park or a
+    /// wake changed it (the server's group alone, or a new engine beside the
+    /// server); `identities` stays what its Initialize associated, which its
+    /// Ready evidence names. Absent for every other launch, so their
+    /// associations keep their exact encoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    held: Option<Vec<IdentityDto>>,
+}
+
+impl Association {
+    /// The processes the launch holds now: the associated set, or what a
+    /// restart-park left it with.
+    fn held(&self) -> &[IdentityDto] {
+        self.held.as_deref().unwrap_or(&self.identities)
+    }
 }
 
 fn resource(error: impl std::fmt::Display) -> LifecycleError {
@@ -613,7 +630,7 @@ fn validate_local(
                 }
                 return Ok(());
             }
-            let frozen = resource_ledger::encode(&startup::cold(p, e)).map_err(resource)?;
+            let frozen = resource_ledger::encode(&startup::cold(tx, p, e)?).map_err(resource)?;
             let identity = encode(&(
                 &p.deployment_id,
                 &p.operation_id,
@@ -629,7 +646,7 @@ fn validate_local(
             let held = if state == "completed" {
                 park::retained_footprint(tx, p, e, ledger.owners.get(&p.owner()))?
             } else {
-                ledger.owners.get(&p.owner()) == Some(&startup::cold(p, e))
+                ledger.owners.get(&p.owner()) == Some(&startup::cold(tx, p, e)?)
             };
             if !exact || ledger.epoch <= execution.expected_epoch || !held {
                 return Err(LifecycleError::Conflict);
@@ -763,7 +780,7 @@ impl crate::Store {
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
-        let accepted = Self::accept_start_in_transaction(&tx, s, f, now, deadline, false)?;
+        let accepted = Self::accept_start_in_transaction(&tx, s, f, now, deadline, false, None)?;
         tx.commit()?;
         Ok(accepted)
     }
@@ -854,7 +871,7 @@ impl crate::Store {
             // A refused start rolls back with its transaction; the instance
             // stays stopped, eligible for an operator's or on-demand start.
             if let Ok(start) =
-                Self::accept_start_in_transaction(&tx, s, &fence, now, deadline, false)
+                Self::accept_start_in_transaction(&tx, s, &fence, now, deadline, false, None)
             {
                 tx.commit()?;
                 started.push(start);
@@ -863,6 +880,9 @@ impl crate::Store {
         Ok(started)
     }
 
+    /// `force_off` (ADR 0033 §8): the start's LMCache is off with this reason
+    /// whatever the plan says (the relaunch after `engine_start_failed`).
+    #[allow(clippy::too_many_arguments)]
     fn accept_start_in_transaction(
         tx: &Transaction<'_>,
         s: &CoordinatorSession,
@@ -870,6 +890,7 @@ impl crate::Store {
         now: i64,
         deadline: i64,
         detailed: bool,
+        force_off: Option<capyctl_config::lmcache::LmcacheOffReason>,
     ) -> Result<Start, LifecycleError> {
         let existing: Option<String> = tx.query_row("SELECT s.id FROM lifecycle_steps s JOIN lifecycle_runs r ON r.operation_id=s.operation_id JOIN operations o ON o.id=r.operation_id WHERE r.deployment_id=?1 AND r.revision=?2 AND r.generation=?3 AND r.state IN ('queued','running','uncertain') AND o.kind='initialize'",params![f.deployment_id,f.revision,f.generation],|r|r.get(0)).optional()?;
         if let Some(id) = existing {
@@ -941,7 +962,9 @@ impl crate::Store {
         // retry may create a fresh operation only after all retained runtime,
         // claims, leases, and reservations are gone; the guards below remain.
         // ADR 0013 §5: the instance, not its siblings, must hold nothing.
-        let stopped: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM instance_runtime WHERE id=?1 AND revision=?2 AND current_generation=?3 AND instance_index=?5 AND name=?4 AND kind='model' AND lifecycle='active' AND (desired_state='stopped' OR (desired_state='ready' AND EXISTS(SELECT 1 FROM operations o JOIN lifecycle_runs r ON r.operation_id=o.id WHERE o.deployment_id=?1 AND r.instance_index=?5 AND o.kind='initialize' AND o.state='failed' AND o.error_code='launch_failed'))) AND observed_state='stopped' AND admission_enabled=0 AND dispatch_enabled=0 AND suspended=0) AND NOT EXISTS(SELECT 1 FROM runtime_bindings WHERE deployment_id=?1 AND instance_index=?5 AND state!='released') AND NOT EXISTS(SELECT 1 FROM lifecycle_claims WHERE deployment_id=?1 AND instance_index=?5) AND NOT EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=?1 AND instance_index=?5) AND NOT EXISTS(SELECT 1 FROM resource_owners WHERE deployment_id=?1 AND instance_index=?5) AND NOT EXISTS(SELECT 1 FROM lifecycle_runs WHERE deployment_id=?1 AND instance_index=?5 AND state NOT IN ('succeeded','failed'))", params![f.deployment_id,f.revision,f.generation,e.name,instance],|r|r.get(0))?;
+        // ADR 0033 §§8, 9: a launch that failed `lmcache_unavailable:<reason>`
+        // is a verified failed launch too.
+        let stopped: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM instance_runtime WHERE id=?1 AND revision=?2 AND current_generation=?3 AND instance_index=?5 AND name=?4 AND kind='model' AND lifecycle='active' AND (desired_state='stopped' OR (desired_state='ready' AND EXISTS(SELECT 1 FROM operations o JOIN lifecycle_runs r ON r.operation_id=o.id WHERE o.deployment_id=?1 AND r.instance_index=?5 AND o.kind='initialize' AND o.state='failed' AND (o.error_code='launch_failed' OR o.error_code LIKE 'lmcache_unavailable:%')))) AND observed_state='stopped' AND admission_enabled=0 AND dispatch_enabled=0 AND suspended=0) AND NOT EXISTS(SELECT 1 FROM runtime_bindings WHERE deployment_id=?1 AND instance_index=?5 AND state!='released') AND NOT EXISTS(SELECT 1 FROM lifecycle_claims WHERE deployment_id=?1 AND instance_index=?5) AND NOT EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=?1 AND instance_index=?5) AND NOT EXISTS(SELECT 1 FROM resource_owners WHERE deployment_id=?1 AND instance_index=?5) AND NOT EXISTS(SELECT 1 FROM lifecycle_runs WHERE deployment_id=?1 AND instance_index=?5 AND state NOT IN ('succeeded','failed'))", params![f.deployment_id,f.revision,f.generation,e.name,instance],|r|r.get(0))?;
         if !stopped {
             if detailed {
                 let retained: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_bindings WHERE deployment_id=?1 AND instance_index=?2 AND state!='released') OR EXISTS(SELECT 1 FROM resource_owners WHERE deployment_id=?1 AND instance_index=?2) OR EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=?1 AND instance_index=?2)", params![f.deployment_id, instance], |r| r.get(0))?;
@@ -975,7 +998,12 @@ impl crate::Store {
                 params![port, host_key],
                 |r| r.get(0),
             )?;
-            if leased || crate::groups::rendezvous_port_held(tx, &host_key, port)? {
+            // ADR 0033 §3 (lifecycle design §1.6): nor a port a retained
+            // launch's LMCache server holds there.
+            if leased
+                || crate::groups::rendezvous_port_held(tx, &host_key, port)?
+                || lmcache::port_held(tx, &host_key, port)?
+            {
                 continue;
             }
             let request = ReserveBinding {
@@ -1004,6 +1032,9 @@ impl crate::Store {
         } else {
             LifecycleError::Conflict
         })?;
+        // ADR 0033 §§3, 6, 9: the launch's LMCache plan, its server's two
+        // ports and its charge, recorded with the binding.
+        lmcache::plan_launch(tx, f, instance, &binding_id, &host_key, &e, force_off, now)?;
         let binding_json = tx.query_row(
             "SELECT binding_json FROM runtime_bindings WHERE id=?1",
             [&binding_id],
@@ -1178,7 +1209,7 @@ pub(crate) fn arm_with_context(
             generation: p.generation,
             expected_epoch: ledger.epoch,
             // Owner decision 2026-09-23: the startup peak until Ready.
-            next: startup::cold(&p, &e),
+            next: startup::cold(tx, &p, &e)?,
         },
         context,
     )
@@ -1273,11 +1304,12 @@ fn association(tx: &Transaction<'_>, p: &Plan) -> Result<Option<Association>, Li
         || a.session_id != p.session_id
         || a.binding_id != p.binding_id
         || a.incarnation != p.incarnation
-        || identities != a.identities
+        || identities != a.held()
     {
         return Err(LifecycleError::Conflict);
     }
     canonical_members(&members(&a.identities)?)?;
+    canonical_members(&members(a.held())?)?;
     crate::lifecycle::completion::nonempty_receipt(&a.receipt)?;
     Ok(Some(a))
 }
@@ -1307,6 +1339,7 @@ pub(crate) fn record_launch(
         identities: identity_dtos(&canonical),
         observed_at_ms: r.observed_at_ms,
         receipt: r.receipt.clone(),
+        held: None,
     };
     if let Some(old) = association(tx, &p)? {
         return if old == supplied {
@@ -1328,13 +1361,23 @@ pub(crate) fn record_launch(
     // Spec §3: the association wrote the API identity before the engine ran.
     // A durable launcher records that identity as soon as the API process
     // exists, then this call must accept exactly that prior content, or none.
+    // ADR 0033 §3: the LMCache server's leader is recorded the same way
+    // before it runs, so the prior content is any of the two leaders the
+    // supplied set names.
     let prior_json: String = tx.query_row(
         "SELECT identities_json FROM runtime_bindings WHERE id=?1",
         [&p.binding_id],
         |r| r.get(0),
     )?;
     let prior: Vec<IdentityDto> = decode(&prior_json)?;
-    if !prior.is_empty() && prior != identity_dtos(std::slice::from_ref(&canonical[0])) {
+    let leaders: Vec<IdentityDto> = identity_dtos(
+        &canonical
+            .iter()
+            .filter(|i| i.role == "api" || i.role == capyctl_domain::completion::LMCACHE_ROLE)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    if !canonical.iter().any(|i| i.role == "api") || prior.iter().any(|i| !leaders.contains(i)) {
         return Err(LifecycleError::Conflict);
     }
     tx.execute("INSERT INTO owned_launch_associations(step_id,binding_id,incarnation,association_json) VALUES(?1,?2,?3,?4)",params![id,p.binding_id,p.incarnation,encode(&supplied)?])?;
@@ -1417,12 +1460,20 @@ pub(crate) fn complete(
     if p.execution.as_ref().is_some_and(|x| x.group) {
         complete_group_members(tx, &p)?;
     } else {
+        // ADR 0033 §6: the steady footprint carries the launch's LMCache
+        // charge unless its host reported LMCache off.
+        let ready = lmcache::charged(
+            tx,
+            &p.binding_id,
+            &e,
+            phase(&e.resources.ready, ResourcePhase::Ready),
+            lmcache::Charged::Reported,
+        )?;
         one(tx.execute(
             "UPDATE resource_owners SET footprint_json=?2 WHERE owner_id=?1",
             params![
                 p.owner(),
-                resource_ledger::encode(&phase(&e.resources.ready, ResourcePhase::Ready))
-                    .map_err(resource)?
+                resource_ledger::encode(&ready).map_err(resource)?
             ],
         )?)?;
     }

@@ -279,8 +279,9 @@ fn act(
     match prepare(tx, &c.deployment_id, c.instance, eligible)? {
         Prepared::Placed(fence) => {
             let deadline = bounded_deadline(tx, &fence, now, until)?;
-            let start =
-                crate::Store::accept_start_in_transaction(tx, s, &fence, now, deadline, true)?;
+            let start = crate::Store::accept_start_in_transaction(
+                tx, s, &fence, now, deadline, true, None,
+            )?;
             Ok(Some(Reconciled::Started {
                 deployment_id: c.deployment_id.clone(),
                 instance: c.instance,

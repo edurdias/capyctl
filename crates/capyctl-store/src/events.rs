@@ -533,48 +533,10 @@ impl crate::Store {
         reason: capyctl_config::lmcache::LmcacheOffReason,
         detail: &str,
     ) -> Result<bool, crate::StoreError> {
-        if !launch.valid() {
-            return Err(crate::StoreError::Conflict);
-        }
-        let detail = match lmcache_detail(detail) {
-            detail if detail.is_empty() => reason.sentence().to_owned(),
-            detail => detail,
-        };
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let recorded: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM management_events
-                 WHERE kind='lmcache_off' AND deployment_id=?1
-                   AND json_extract(payload_json,'$.instance_index')=?2
-                   AND json_extract(payload_json,'$.generation')=?3
-                   AND json_extract(payload_json,'$.binding_id')=?4
-                   AND json_extract(payload_json,'$.reason')=?5)",
-            params![
-                launch.deployment_id,
-                launch.instance_index,
-                launch.generation,
-                launch.binding_id,
-                reason.code()
-            ],
-            |r| r.get(0),
-        )?;
-        if recorded {
-            return Ok(false);
-        }
-        append_event(
-            &tx,
-            &EventMetadata::LmcacheOff {
-                deployment_id: launch.deployment_id.into(),
-                instance_index: launch.instance_index,
-                generation: launch.generation,
-                binding_id: launch.binding_id.into(),
-                host_id: launch.host_id.into(),
-                reason: reason.code().into(),
-                detail,
-            },
-        )
-        .map_err(|_| crate::StoreError::Conflict)?;
+        let recorded = lmcache_off_in(&tx, launch, reason, detail)?;
         tx.commit()?;
-        Ok(true)
+        Ok(recorded)
     }
 
     /// ADR 0033 §3: journal that `launch`'s LMCache server exited while its
@@ -584,29 +546,90 @@ impl crate::Store {
         launch: &LmcacheLaunch<'_>,
         detail: &str,
     ) -> Result<(), crate::StoreError> {
-        if !launch.valid() {
-            return Err(crate::StoreError::Conflict);
-        }
-        let detail = match lmcache_detail(detail) {
-            detail if detail.is_empty() => "the LMCache server exited".to_owned(),
-            detail => detail,
-        };
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        append_event(
-            &tx,
-            &EventMetadata::LmcacheServerExited {
-                deployment_id: launch.deployment_id.into(),
-                instance_index: launch.instance_index,
-                generation: launch.generation,
-                binding_id: launch.binding_id.into(),
-                host_id: launch.host_id.into(),
-                detail,
-            },
-        )
-        .map_err(|_| crate::StoreError::Conflict)?;
+        lmcache_server_exited_in(&tx, launch, detail)?;
         tx.commit()?;
         Ok(())
     }
+}
+
+/// [`crate::Store::record_lmcache_off`] inside the caller's transaction, so
+/// the event commits with the lifecycle change it reports.
+pub(crate) fn lmcache_off_in(
+    tx: &Transaction<'_>,
+    launch: &LmcacheLaunch<'_>,
+    reason: capyctl_config::lmcache::LmcacheOffReason,
+    detail: &str,
+) -> Result<bool, crate::StoreError> {
+    if !launch.valid() {
+        return Err(crate::StoreError::Conflict);
+    }
+    let detail = match lmcache_detail(detail) {
+        detail if detail.is_empty() => reason.sentence().to_owned(),
+        detail => detail,
+    };
+    let recorded: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM management_events
+             WHERE kind='lmcache_off' AND deployment_id=?1
+               AND json_extract(payload_json,'$.instance_index')=?2
+               AND json_extract(payload_json,'$.generation')=?3
+               AND json_extract(payload_json,'$.binding_id')=?4
+               AND json_extract(payload_json,'$.reason')=?5)",
+        params![
+            launch.deployment_id,
+            launch.instance_index,
+            launch.generation,
+            launch.binding_id,
+            reason.code()
+        ],
+        |r| r.get(0),
+    )?;
+    if recorded {
+        return Ok(false);
+    }
+    append_event(
+        tx,
+        &EventMetadata::LmcacheOff {
+            deployment_id: launch.deployment_id.into(),
+            instance_index: launch.instance_index,
+            generation: launch.generation,
+            binding_id: launch.binding_id.into(),
+            host_id: launch.host_id.into(),
+            reason: reason.code().into(),
+            detail,
+        },
+    )
+    .map_err(|_| crate::StoreError::Conflict)?;
+    Ok(true)
+}
+
+/// [`crate::Store::record_lmcache_server_exited`] inside the caller's
+/// transaction.
+pub(crate) fn lmcache_server_exited_in(
+    tx: &Transaction<'_>,
+    launch: &LmcacheLaunch<'_>,
+    detail: &str,
+) -> Result<(), crate::StoreError> {
+    if !launch.valid() {
+        return Err(crate::StoreError::Conflict);
+    }
+    let detail = match lmcache_detail(detail) {
+        detail if detail.is_empty() => "the LMCache server exited".to_owned(),
+        detail => detail,
+    };
+    append_event(
+        tx,
+        &EventMetadata::LmcacheServerExited {
+            deployment_id: launch.deployment_id.into(),
+            instance_index: launch.instance_index,
+            generation: launch.generation,
+            binding_id: launch.binding_id.into(),
+            host_id: launch.host_id.into(),
+            detail,
+        },
+    )
+    .map_err(|_| crate::StoreError::Conflict)?;
+    Ok(())
 }
 
 pub(crate) fn append_event(
