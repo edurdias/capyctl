@@ -142,6 +142,45 @@ stays counted against its model's memory until CapyCTL sees the engine stop:
 `capyctl status deployment <name>` shows, under the instance table, how many
 cancelled requests each instance still counts and how each will be settled.
 
+#### How quickly each engine stops
+
+Measured on an NVIDIA GB10 on 2026-10-22, through CapyCTL built from `main`
+at `466b6fa8`: four long generations at once (`max_tokens` 4096, a prompt
+that keeps the model counting), all four clients killed once the engine
+reported four running requests (and, for a stream, once each client had read
+generated text), then the engine's own count of running and waiting requests
+read every 100 ms until both were 0. Each row is three repeats; the figures
+are seconds from the hang-up to the first reading of 0, median and maximum.
+At one reading every 100 ms, 0.1 s is the smallest figure this can show.
+
+| Engine | Model | Streamed | Non-streamed | Count read |
+|---|---|---|---|---|
+| SGLang 0.5.22 | Qwen3-4B-Instruct-2507, BF16 | 0.22 / 0.22 | 0.10 / 0.10 | `sglang:num_running_reqs`, `sglang:num_queue_reqs` |
+| vLLM 0.32.0 | Qwen3-4B-Instruct-2507, BF16 | 0.10 / 0.10 | 0.10 / 0.10 | `vllm:num_requests_running`, `vllm:num_requests_waiting` |
+| llama.cpp v0.7.0 | Qwen3-4B, Q4_K_M GGUF | 0.10 / 0.10 | 0.10 / 0.10 | `llamacpp:requests_processing`, `llamacpp:requests_deferred` |
+| TensorFold 0.6.6 | FrogNano-4B-2609, NVFP4 | 0.10 / 0.10 | 0.10 / 0.10 | `/health`: `requests_running`, `busy` |
+
+All four requests stopped together on every engine; none started again
+within 5 s. CapyCTL asks the engine for a stream even when your client did
+not, and collects the answer itself, so a non-streamed request is stopped the
+way a stream is. That matters for llama.cpp: asked directly, without a
+stream, llama.cpp v0.7.0 does not stop when its client goes away, and the
+four requests ran on until their count reached 0 after 65 s (three
+repeats, 64.6 to 65.9 s). Asked directly with a stream, it stopped within
+0.1 s, as TensorFold did both ways. SGLang and vLLM answer only CapyCTL,
+so they were measured only through it.
+
+Decision requests behaved differently on SGLang 0.5.22 (Clef-Flash, four
+decisions with an input of about 15,600 tokens each). Its count read 0 for
+the first 4 s, while it answered the first of them. It then worked on one at
+a time, and closing their connections did not stop the ones it already had:
+the three left ran to their ends, about 3.4 s each, and its count read 0
+only 10.3 s after the hang-up. In a run where the clients hung up 1.5 s
+after sending (about 12,500 tokens each), the count read 0 at the hang-up;
+two of those decisions then showed in SGLang's queue and ran within the next
+7 s. This is the case the rule above is for: a cancelled decision stays
+counted until the engine's next stop or restart.
+
 ## Per-request metrics
 
 Every completed chat answer carries the engine's figures for that request,
