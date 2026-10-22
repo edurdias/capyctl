@@ -269,31 +269,56 @@ pub(super) async fn initialize(
 
     // SPEC §6.1: the served model in the list is not a model that answers. One
     // probe, through the same authenticated path inference will use.
-    let body = json!({
-        "model": plan.served_model_name,
-        "messages": [{"role": "user", "content": "Say ready."}],
-        "max_tokens": 8,
-        "temperature": 0,
-    });
     // Spec §4: every wait is bounded by the context deadline, and the builder's own
     // waits end first so its reason, not a bare coordinator timeout, is what gets
     // recorded. The probe is bounded by the remaining budget alone, never by the
     // transport's shorter read bound (a slow first completion is still startup).
     let probe_budget = Duration::from_millis(u64::try_from(stop_at - now_ms()?).unwrap_or(0));
-    let answer = crate::forward::startup_probe(adapter, &body, probe_budget)
+    if adapter.decisions() {
+        // ADR 0030 §3, SPEC §6.1: a decision model generates nothing; it is
+        // ready when it answers the fixed decision completely and
+        // well-formed. Never a chat probe in its place: vLLM 0.32.0 serves a
+        // decision model's checkpoint as a generating model too, so a chat
+        // answer would prove nothing about `/v1/systemone`.
+        tokio::time::timeout(
+            probe_budget,
+            crate::traits::ChatForward::decision_probe(
+                adapter,
+                &plan.served_model_name,
+                probe_budget,
+            ),
+        )
         .await
-        .ok_or_else(|| {
+        .map_err(|_| {
             RuntimeError::Uncertain("probe deadline reached with the engine alive".into())
         })?
         .map_err(|e| {
             RuntimeError::Uncertain(redact_text(&format!(
-                "engine listed the model but did not answer: {e:?}"
+                "engine listed the model but did not answer the decision probe: {e}"
             )))
         })?;
-    if !crate::forward::probe_answered(&answer) {
-        return Err(RuntimeError::Uncertain(
-            "engine answered with empty content".into(),
-        ));
+    } else {
+        let body = json!({
+            "model": plan.served_model_name,
+            "messages": [{"role": "user", "content": "Say ready."}],
+            "max_tokens": 8,
+            "temperature": 0,
+        });
+        let answer = crate::forward::startup_probe(adapter, &body, probe_budget)
+            .await
+            .ok_or_else(|| {
+                RuntimeError::Uncertain("probe deadline reached with the engine alive".into())
+            })?
+            .map_err(|e| {
+                RuntimeError::Uncertain(redact_text(&format!(
+                    "engine listed the model but did not answer: {e:?}"
+                )))
+            })?;
+        if !crate::forward::probe_answered(&answer) {
+            return Err(RuntimeError::Uncertain(
+                "engine answered with empty content".into(),
+            ));
+        }
     }
 
     let group_tools = tools.clone();

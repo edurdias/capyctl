@@ -6,6 +6,8 @@ them (SGLang 0.5.22 approved and installed; llama.cpp v0.7.0 already serves them
 TensorFold follow as below); the release ships recipes for Clef-Flash, Clef, Kev-4B and
 one of Julia-1 or Laya; and the first version keeps the three scope limits of section 7.
 Nothing is implemented yet.
+**Amended:** 2026-10-21 (owner decision), §6: vLLM stays refused on every version (see
+"Amendment 2026-10-21" at the end).
 **Amends:** `SPEC.md` §6.1 (readiness of a model that generates no text), §10 (the
 inference surface), §15.1/§16 (a deployment field), §20 (T43); ADR 0028 §§9, 11, 12 only
 by excluding decision deployments from groups (§7.1); ADR 0024 §1 (parsers apply to chat
@@ -148,6 +150,8 @@ so a client can tell which endpoint a model answers.
 - **SGLang 0.5.22** (installed 2026-10-17): Clef and Clef-Flash in BF16, and chat models
   answering decisions through label scoring; qualified live before it is listed.
 - **vLLM:** refused until a release ships `/v1/systemone`; then verified and admitted.
+  Amendment 2026-10-21: 0.32.0 ships it but does not read Clef and Clef-Flash with their
+  decision head, so vLLM stays refused.
 - **TensorFold 1.0:** a separate change (a new engine integration for its native binary);
   decision models follow it.
 
@@ -190,3 +194,38 @@ so a client can tell which endpoint a model answers.
   usable model.
 - **Exact canary equality.** Rejected: probabilities are not bit-stable across batches and
   caches on the engines that serve these models.
+
+## Amendment 2026-10-21: vLLM 0.32.0 measured, still refused (§6; owner decision)
+
+vLLM 0.32.0 ships `POST /v1/systemone` (`entrypoints/generate/structured_decisions`), and
+was measured live through CapyCTL on one GB10 (isolated standalone, a build that let it
+resolve `api: decisions`). Clef and Clef-Flash (BF16) became ready on the fixed decision
+of §3, answered through the router, were refused `api_mismatch` on chat and
+`invalid_request` on a malformed body, and ran capyctl-bench's decisions suites.
+
+vLLM 0.32.0 reads both checkpoints (architecture `Qwen3_5ForConditionalGeneration`) from
+their text output, scoring each option's label token with the language-model head (its
+`NextTokenStrategy`); it uses a checkpoint's joint schema head only for Clef-Omni. The
+answers are not the models' decisions as published:
+
+| Clef-Flash, capyctl-bench | vLLM 0.32.0 | SGLang 0.5.22 | llama.cpp v0.7.0 |
+|---|---|---|---|
+| API-Bank | refused (all 508: "at most 26 options for this model") | 93.1% | 92.9% |
+| Home appliances | 0.0% | 97.7% | 96.6% |
+| GPQA Diamond | 44.4% | 51.0% | 51.5% |
+| Typed Decisions (ECE) | 69.5% (0.243) | 70.2% (0.012) | 70.7% (0.013) |
+| AG News / BoolQ | 90.2% / 89.8% | 89.4% / 89.6% | 89.6% / 89.6% |
+| 1 question, 2k-token text, p50 | 517 ms | 545 ms | 718 ms |
+
+Clef on vLLM 0.32.0 scored 43.2% on Home appliances (SGLang 79.5%, llama.cpp 81.8%).
+
+Decision: resolution keeps refusing `api: decisions` on vLLM, on every version, with
+`capability_missing:decisions` and this reason. vLLM is admitted once a release reads
+these models with their decision heads, qualified live as §6 requires. The vLLM adapter
+keeps the decision readiness probe and wake canary of §§3, 4 (covered by T43 tests), which
+no resolved deployment reaches while the refusal stands. vLLM 0.32.0 is verified for
+chat (ADR 0018 §1).
+
+Parking, for the later decision of §7.2: Clef-Flash launched directly on vLLM 0.32.0 with
+sleep mode slept at level 2 (about 33 GB freed), woke its weights, reloaded them, woke the
+KV cache and answered the fixed decision with bit-identical probabilities.

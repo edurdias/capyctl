@@ -3,9 +3,11 @@
 //! is stored or launched.
 //!
 //! - Only an engine installation that serves `POST /v1/systemone` takes one:
-//!   llama.cpp 0.7.0 or newer and SGLang 0.5.22 or newer. vLLM (no release
-//!   serves it yet) and TensorFold (its 1.0 binary is not integrated) are
-//!   refused. Every refusal is `capability_missing:decisions`.
+//!   llama.cpp 0.7.0 or newer and SGLang 0.5.22 or newer. vLLM is refused on
+//!   every version (ADR 0030 §6, amended 2026-10-21: 0.32.0 serves the
+//!   endpoint but reads Clef and Clef-Flash from their text output, not their
+//!   decision head), and so is TensorFold (its 1.0 binary is not integrated).
+//!   Every refusal is `capability_missing:decisions`.
 //! - The version is read from the installation's `build_fingerprint`, the
 //!   one fact about the build that every resolution of the deployment has:
 //!   the server's, against the profile the host published, and the host's
@@ -141,10 +143,15 @@ pub fn engine_refusal(engine: Engine, build_fingerprint: &str) -> Option<String>
     let (name, minimum) = match engine {
         Engine::Llamacpp => ("llama.cpp", LLAMACPP_MINIMUM),
         Engine::Sglang => ("SGLang", SGLANG_MINIMUM),
+        // ADR 0030 §6 (amended 2026-10-21, owner decision): measured live,
+        // vLLM 0.32.0 answers Clef and Clef-Flash from their text output
+        // instead of their decision head.
         Engine::Vllm => {
             return Some(format!(
-                "{CAPABILITY_MISSING}: no vLLM release CapyCTL supports serves \
-                 `/v1/systemone` yet; {serve_on}"
+                "{CAPABILITY_MISSING}: vLLM serves Clef and Clef-Flash from their text \
+                 output instead of their decision head (questions over 26 options are \
+                 refused and accuracy and calibration fall), so CapyCTL admits it once a \
+                 vLLM release uses these models' decision heads; {serve_on}"
             ))
         }
         Engine::Tensorfold => {

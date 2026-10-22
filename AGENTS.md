@@ -136,7 +136,8 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     with LMCache 0.5.6 built against its torch 2.14.1);
   - host A: vLLM 0.31.0 and a llama.cpp v0.6.0 build in the home directory
     (approved 2026-10-14), and basal 2.2.0 (~/basal-2.2.0-venv, torch 2.11.0
-    cu130), approved 2026-10-20 for qualifying custom engines (ADR 0031);
+    cu130), approved 2026-10-20 for qualifying custom engines (ADR 0031), and vLLM
+    0.32.0 (~/vllm-0.32.0-venv, approved 2026-10-21, for chat);
   - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B.
 
   Use these as they are. Do not create or modify any engine environment without the

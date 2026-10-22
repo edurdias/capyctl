@@ -185,6 +185,21 @@ impl EngineHttp {
         probe::openai_answer(&answer)
     }
 
+    /// ADR 0030 §3: the fixed decision probe, `POST /v1/systemone`, on this
+    /// engine's loopback endpoint with its inference key (the guard admits it
+    /// on `/v1`), answering the served model `served`.
+    pub async fn decision_probe(
+        &self,
+        served: &str,
+        bound: Duration,
+    ) -> Result<crate::decision_probe::DecisionAnswer, crate::traits::AdapterError> {
+        let key = self
+            .api_key
+            .as_deref()
+            .and_then(crate::completion_probe::bearer);
+        crate::decision_probe::probe(&self.client, &self.base, key.as_ref(), served, bound).await
+    }
+
     /// Served model ids from `/v1/models`. Presence of the deployment's
     /// model id is the readiness signal.
     pub async fn list_models(&self) -> Result<Vec<String>, HttpError> {

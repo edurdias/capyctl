@@ -16,7 +16,7 @@ from unittest import mock
 from runtime import vllm_entry as entry
 
 
-def _fake_parser(drop=(), nested=False):
+def _fake_parser(drop=(), nested=False, grpc_port=False):
     # `nested` shapes vLLM 0.31.0's serve parser (ADR 0017 §2): logging moved
     # into the nested `--logging-config` dotted config, and the parser defines
     # the whole surface on one `logging_config` destination — the
@@ -95,6 +95,10 @@ def _fake_parser(drop=(), nested=False):
     option("--enable-scale-out", action=argparse.BooleanOptionalAction, default=False)
     option("--watermark-config", type=json.loads, default=None)
     option("--engram-config", type=json.loads, default=None)
+    if grpc_port:
+        # vLLM 0.32.0: a second, gRPC listener beside HTTP
+        # (entrypoints/launchers/cli_args.py `FrontendArgs.grpc_port`).
+        option("--grpc-port", type=int, default=None)
     option("--worker-extension-cls", default="")
     option("--compilation-config", "-cc", type=json.loads, default=None)
     option("--download-dir", default=None)
@@ -113,6 +117,12 @@ def fake_parser_0310(drop=()):
     default, so a namespace-first reservation reads nothing; the version-skew
     aware entry reads the parser's own actions instead."""
     return _fake_parser(drop, nested=True)
+
+
+def fake_parser_0320(drop=()):
+    """The vLLM 0.32.0 serve parser: 0.31.0's nested logging, and
+    `--grpc-port` (read from the installed build, 2026-10-21)."""
+    return _fake_parser(drop, nested=True, grpc_port=True)
 
 
 RESERVED = ["serve", "/models/qwen", "--host", "127.0.0.1", "--served-model-name", "route",
@@ -389,6 +399,18 @@ class VersionSkewTests(unittest.TestCase):
         args = self.resolve(sleep=True, parser=fake_parser_0310())
         self.assertIs(args.enable_sleep_mode, True)
 
+    # T14 T21: the same rendered block launches on the 0.32.0 shape, and its
+    # `--grpc-port` (a second listener) is reserved however spelled; a build
+    # without it reserves nothing for it.
+    def test_the_0320_parser_launches_and_reserves_the_grpc_port(self):
+        args = self.resolve(parser=fake_parser_0320())
+        self.assertEqual(args.model_tag, "/models/qwen")
+        self.assertIs(args.grpc_port, None)
+        for user in (["--grpc-port", "50051"], ["--grpc-port=0"], ["--grpc-p", "1"]):
+            with self.subTest(user=user):
+                self.refused(user, fake_parser_0320())
+        self.resolve(parser=fake_parser_0310())
+
     # T21 / SPEC §13.3 (amended 2026-10-08; owner decision 2026-10-20): the
     # rendered block turns request and output logging off on every supported
     # build, each defining both switches with `--no-` negations: vLLM 0.29.0
@@ -397,7 +419,8 @@ class VersionSkewTests(unittest.TestCase):
     # (arg_utils.py:3141-3143, cli_args.py:163). No argument turns either back on.
     def test_request_and_output_logging_are_off_on_every_supported_version(self):
         for version, parser in (("0.29.0", fake_parser), ("0.30.0", fake_parser),
-                                ("0.31.0", fake_parser_0310)):
+                                ("0.31.0", fake_parser_0310),
+                                ("0.32.0", fake_parser_0320)):
             with self.subTest(version=version):
                 args = self.resolve(parser=parser())
                 self.assertIs(args.enable_log_requests, False)

@@ -63,9 +63,11 @@ RESERVED = (
 # SPEC §8.2 / T21: multi-node rendezvous (0.26+ `ParallelConfig`). Compared
 # whenever the installed parser defines them; unlike RESERVED, a build without
 # them is not drift, since no argument can then reach them.
-# vLLM 0.30 scale-out (extra serving routes) is reserved the same way.
+# vLLM 0.30 scale-out (extra serving routes) is reserved the same way, and so is
+# vLLM 0.32.0's `--grpc-port` (a second, gRPC listener beside HTTP,
+# entrypoints/launchers/cli_args.py `FrontendArgs.grpc_port`).
 RESERVED_IF_PRESENT = ("nnodes", "node_rank", "master_addr", "master_port",
-                       "enable_scale_out")
+                       "enable_scale_out", "grpc_port")
 # ADR 0017 §2 (version skew): vLLM 0.31.0 moved logging into the nested
 # `--logging-config` dotted config (vllm/config/logging.py, `LoggingConfig`:
 # log_level, configure_logging, pylogging_config_file). The serve parser
