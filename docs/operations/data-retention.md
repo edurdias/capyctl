@@ -156,6 +156,10 @@ digest above, so different salts never share them.
 - **Logs:** the server's output goes to its own log beside the engine's, through
   the same redacting writer and the same `engine_logs` mode. Its lookup-hash and
   event logs stay off.
+- **Nothing leaves the host:** LMCache's own usage telemetry (which by default
+  reports to `stats.lmcache.ai` over plain HTTP) is turned off, in the server
+  and in the engine, whose connector loads LMCache: both start with
+  `LMCACHE_TRACK_USAGE=false` and `DO_NOT_TRACK=1`.
 - **Turn it off:** `lmcache: off` on the deployment, `lmcache: off` on the host
   (every deployment there), or `retention: zero`.
 

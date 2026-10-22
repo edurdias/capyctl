@@ -260,8 +260,9 @@ pub fn server_log_path(engine_log: &Path) -> PathBuf {
 /// the pool the charge covers is allocated at start only when it is negated).
 /// Never `--run-script-api-enabled`, never an L2, disk, GDS, Device-DAX or P2P
 /// option. The environment is exactly `PATH`, `HOME` and the instance's
-/// `CUDA_VISIBLE_DEVICES`, when set; `CAPYCTL_ENGINE_LOG` names the server's
-/// log to the launcher, which never passes it to the server.
+/// `CUDA_VISIBLE_DEVICES`, when set, and [`NO_USAGE_TRACKING`];
+/// `CAPYCTL_ENGINE_LOG` names the server's log to the launcher, which never
+/// passes it to the server.
 pub fn render_server(plan: &ServerPlan) -> RenderedCommand {
     let argv = [
         plan.lmcache_bin.to_string_lossy().into_owned(),
@@ -284,6 +285,11 @@ pub fn render_server(plan: &ServerPlan) -> RenderedCommand {
     ]
     .into();
     let mut env = std::collections::BTreeMap::from([("PATH".to_owned(), plan.path.clone())]);
+    env.extend(
+        NO_USAGE_TRACKING
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+    );
     if let Some(home) = &plan.home {
         env.insert("HOME".into(), home.clone());
     }
@@ -301,6 +307,16 @@ pub fn render_server(plan: &ServerPlan) -> RenderedCommand {
     }
     RenderedCommand { argv, env }
 }
+
+/// ADR 0033 §3 (A7): LMCache's usage telemetry off. LMCache 0.5.6
+/// (`lmcache/usage_telemetry`, default `LMCACHE_USAGE_TRACK_URL`) reports
+/// each process that imports it to `stats.lmcache.ai:8080` over plain HTTP
+/// unless `LMCACHE_TRACK_USAGE` is `false` or `DO_NOT_TRACK` is `1`; found
+/// live on host A. Both are rendered into the server's environment and into
+/// the engine's whenever its connector (which imports LMCache in the engine)
+/// is on, so nothing about a launch leaves the host.
+pub const NO_USAGE_TRACKING: [(&str, &str); 2] =
+    [("DO_NOT_TRACK", "1"), ("LMCACHE_TRACK_USAGE", "false")];
 
 /// ADR 0033 §4: vLLM's `--kv-transfer-config`: LMCache's external MP
 /// connector by module path (never a bundled connector of the same name),

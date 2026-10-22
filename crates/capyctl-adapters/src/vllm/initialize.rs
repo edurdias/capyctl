@@ -122,11 +122,18 @@ fn engine_environment(
     // ADR 0028 §2.1: the resolved engine env's names join the fixed list.
     // ADR 0028 §10: a group member also keeps exactly the group names
     // `render_command` rendered (none exist for a single rank, T39).
+    // ADR 0033 §3 (A7): a launch with the LMCache connector keeps the
+    // telemetry switches `render_command` rendered for it.
     env.retain(|name, _| {
         ENGINE_ENV_ALLOWLIST.contains(&name.as_str())
             || plan.build_env.contains_key(name)
             || (plan.group.is_some()
                 && GROUP_ENV.contains(&name.as_str())
+                && rendered.contains_key(name))
+            || (plan.kv_transfer_config.is_some()
+                && crate::lmcache::NO_USAGE_TRACKING
+                    .iter()
+                    .any(|(tracking, _)| tracking == name)
                 && rendered.contains_key(name))
     });
     env
@@ -577,5 +584,42 @@ mod tests {
         assert!(!env
             .keys()
             .any(|k| k.starts_with("NCCL_") || k.starts_with("GLOO_") || k.starts_with("MASTER_")));
+    }
+
+    // T45 T21 (ADR 0033 §3, A7; found live): an engine with the LMCache
+    // connector imports LMCache, so it spawns with LMCache's usage telemetry
+    // off, whatever the resolved engine env says; without the connector
+    // CapyCTL renders neither name.
+    #[test]
+    fn an_engine_with_the_connector_spawns_with_lmcache_telemetry_off() {
+        let mut plan = input(None);
+        plan.build_env = BTreeMap::from([("DO_NOT_TRACK".to_owned(), "0".to_owned())]);
+        let resolved = plan.build_env.clone();
+        let spawn = |plan: &PlanInputVllm| {
+            engine_environment(
+                &render_command(plan).unwrap().env,
+                plan,
+                "engine-key",
+                None,
+                &|_| None,
+                &resolved,
+            )
+        };
+        let env = spawn(&plan);
+        assert_eq!(env["DO_NOT_TRACK"], "0", "the deployment's own value");
+        assert!(!env.contains_key("LMCACHE_TRACK_USAGE"));
+        plan.kv_transfer_config = Some(crate::lmcache::vllm_kv_transfer_config(25001));
+        let env = spawn(&plan);
+        assert_eq!(env["DO_NOT_TRACK"], "1");
+        assert_eq!(env["LMCACHE_TRACK_USAGE"], "false");
+        plan.build_env.clear();
+        let env = spawn(&plan);
+        assert_eq!(
+            (
+                env["DO_NOT_TRACK"].as_str(),
+                env["LMCACHE_TRACK_USAGE"].as_str()
+            ),
+            ("1", "false")
+        );
     }
 }

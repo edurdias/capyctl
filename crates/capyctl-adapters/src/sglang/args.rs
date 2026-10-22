@@ -251,11 +251,18 @@ impl SglangLaunch {
         // naming no entry point, so SGLang loads none of the plugins its own
         // dependencies install (0.5.22: smg-grpc-servicer); spawned ranks
         // inherit it, and the entry's guard refuses any other value.
-        let env = [(
+        let mut env: std::collections::BTreeMap<String, String> = [(
             capyctl_config::engine_env::SGLANG_PLUGINS.to_owned(),
             capyctl_config::engine_env::SGLANG_NO_PLUGINS.to_owned(),
         )]
         .into();
+        // ADR 0033 §3 (A7): LMCache's connector runs in the engine; its usage
+        // telemetry is off there too.
+        if self.public["settings"].get("lmcache_config_file").is_some() {
+            for (name, value) in crate::lmcache::NO_USAGE_TRACKING {
+                env.insert(name.into(), value.into());
+            }
+        }
         Ok(RenderedCommand { argv, env })
     }
 

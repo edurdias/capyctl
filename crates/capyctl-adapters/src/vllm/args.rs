@@ -416,6 +416,11 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
             capyctl_config::engine_policy::KV_TRANSFER_CONFIG,
             config.clone(),
         );
+        // The connector imports LMCache in the engine: its usage telemetry
+        // is off there too (A7); rendered, so no resolved env replaces it.
+        for (name, value) in crate::lmcache::NO_USAGE_TRACKING {
+            env.insert(name.into(), value.into());
+        }
     }
     // ADR 0014 §6: everything after the marker is parsed by vLLM, and the entry
     // refuses it if any reserved field above resolves differently.

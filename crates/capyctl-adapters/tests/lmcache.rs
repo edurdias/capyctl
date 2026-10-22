@@ -369,25 +369,52 @@ fn the_server_argv_is_exactly_capyctls() {
         .any(|a| a.contains("l2") || a.contains("p2p") || a.contains("gds") || a.contains("disk")));
 }
 
-// T45 T21 T37 (ADR 0033 §3): the server's environment is exactly PATH, HOME
-// and the instance's CUDA_VISIBLE_DEVICES; only the launcher's log name rides
-// beside them, and the launcher never passes it on (capyctl-launchers test
+// T45 T21 T37 (ADR 0033 §3, A7): the server's environment is exactly PATH,
+// HOME, the instance's CUDA_VISIBLE_DEVICES and LMCache's usage telemetry
+// switched off (found live: LMCache 0.5.6 reports to stats.lmcache.ai over
+// plain HTTP otherwise); only the launcher's log name rides beside them, and
+// the launcher never passes it on (capyctl-launchers test
 // `the_server_starts_with_exactly_its_three_variables_and_its_own_log`).
 #[test]
-fn the_server_env_is_exactly_three_names() {
+fn the_server_env_is_exactly_its_names_with_telemetry_off() {
     let root = tempfile::tempdir().unwrap();
     let mut plan = server_plan(25002, root.path(), false);
     let names = |plan: &ServerPlan| render_server(plan).env.keys().cloned().collect::<Vec<_>>();
-    assert_eq!(names(&plan), ["CUDA_VISIBLE_DEVICES", "HOME", "PATH"]);
     assert_eq!(
-        render_server(&plan).env["PATH"],
-        "/opt/venv/bin:/usr/bin:/bin"
+        names(&plan),
+        [
+            "CUDA_VISIBLE_DEVICES",
+            "DO_NOT_TRACK",
+            "HOME",
+            "LMCACHE_TRACK_USAGE",
+            "PATH"
+        ]
+    );
+    let env = render_server(&plan).env;
+    assert_eq!(env["PATH"], "/opt/venv/bin:/usr/bin:/bin");
+    assert_eq!(
+        (
+            env["DO_NOT_TRACK"].as_str(),
+            env["LMCACHE_TRACK_USAGE"].as_str()
+        ),
+        ("1", "false")
     );
     plan.home = None;
     plan.cuda_visible_devices = None;
-    assert_eq!(names(&plan), ["PATH"]);
+    assert_eq!(
+        names(&plan),
+        ["DO_NOT_TRACK", "LMCACHE_TRACK_USAGE", "PATH"]
+    );
     plan.log = Some("/var/log/capyctl/d/i-1.lmcache.log".into());
-    assert_eq!(names(&plan), ["CAPYCTL_ENGINE_LOG", "PATH"]);
+    assert_eq!(
+        names(&plan),
+        [
+            "CAPYCTL_ENGINE_LOG",
+            "DO_NOT_TRACK",
+            "LMCACHE_TRACK_USAGE",
+            "PATH"
+        ]
+    );
 }
 
 // ----------------------------------------------------------------- connectors

@@ -825,3 +825,12 @@ they did before this ADR.
 `restart_only` (ADR 0030); with LMCache on, it parks as §7 says (the engine stops, the
 server stays) instead of stopping, and the engine started at the wake is checked against
 the launch's wake reference (ADR 0030 §3) like any wake.
+
+**A7. LMCache's usage telemetry is off (§§3, 10).** Found live on host A: LMCache 0.5.6
+reports usage from every process that imports it to `stats.lmcache.ai:8080` over plain
+HTTP (`lmcache/usage_telemetry`, default `LMCACHE_USAGE_TRACK_URL`) unless
+`LMCACHE_TRACK_USAGE=false` or `DO_NOT_TRACK=1`, and the server's closed environment set
+neither. CapyCTL now renders both into the server's environment, and into the engine's
+whenever its connector is on (the connector imports LMCache in the engine), embedded and
+remote; the engine's resolved environment never replaces them. Nothing about a launch
+leaves the host.
