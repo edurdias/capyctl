@@ -104,6 +104,17 @@ pub(super) fn snapshot_inputs(
     if let Some(api) = value.get("api") {
         deployment["api"] = api.clone();
     }
+    // ADR 0033 (contract decision 1): the LMCache settings are frozen only
+    // when declared away from their defaults; restated as declared, and the
+    // exact-equality check below proves the claim.
+    for field in ["lmcache", "retention"] {
+        if let Some(declared) = value.get(field) {
+            deployment[field] = declared.clone();
+        }
+    }
+    if let Some(pool) = value.get("lmcache_pool_bytes") {
+        deployment["lmcache_pool"] = json!(quantity(pool, "B")?);
+    }
     // ADR 0028 §2.1: the deployment's engine environment is stored with its
     // values in `engine_env`; its deployment entries are restated as declared,
     // and the exact-equality check below proves the claim.
@@ -228,6 +239,13 @@ pub(super) fn snapshot_inputs(
     // ADR 0014 amendment A19: encoded only when stated, in its written form.
     if !h["parked_growth_limit"].is_null() {
         host["resource_policy"]["parked_growth_limit"] = h["parked_growth_limit"].clone();
+    }
+    // ADR 0033 §9, §10: the host's LMCache settings, encoded only away from
+    // their defaults.
+    for field in ["lmcache", "retention"] {
+        if let Some(stated) = h.get(field) {
+            host[field] = stated.clone();
+        }
     }
     // ADR 0008: encoded only when stated; restated in its written form.
     if !h["model_sources"].is_null() {

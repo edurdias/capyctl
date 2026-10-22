@@ -43,6 +43,7 @@ fn register(document: &std::path::Path, name: &str) {
             env: Default::default(),
             approved_env: vec![],
             trust_remote_code: false,
+            lmcache: None,
         }),
     );
     write_engines(&engines, &lock, None).unwrap();
@@ -575,6 +576,7 @@ fn standalone_publishes_a_registered_tensorfold_profile() {
             env: Default::default(),
             approved_env: vec![],
             trust_remote_code: false,
+            lmcache: None,
         }),
     );
     write_engines(&engines, &lock, None).unwrap();

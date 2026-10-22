@@ -594,6 +594,8 @@ async fn add(
             .map(|path| path.to_string_lossy().into_owned())
             .collect(),
         trust_remote_code: extras.remote_code,
+        // ADR 0033 §1: the LMCache package measured in the environment.
+        lmcache: None,
     };
     let revision = write_profile(target, &name, &spec)?;
     let out = json!({

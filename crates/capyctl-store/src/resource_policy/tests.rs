@@ -50,6 +50,8 @@ fn host() -> HostPolicy {
         },
         model_sources: Default::default(),
         parked_growth_limit: Default::default(),
+        lmcache: Default::default(),
+        retention: Default::default(),
     }
 }
 

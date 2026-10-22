@@ -929,6 +929,9 @@ pub fn defaults(
             ("lifecycle.activation", Value::from("on_demand")),
             // Owner decision 2026-10-20: engine output in private log files.
             ("engine_logs", Value::from("files")),
+            // ADR 0033 §9, §10: LMCache on where it can run; standard retention.
+            ("lmcache", Value::from("auto")),
+            ("retention", Value::from("standard")),
         ];
         if let Some(root) = crate::model_settings::default_models_root(home) {
             out.push((

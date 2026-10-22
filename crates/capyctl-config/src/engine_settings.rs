@@ -642,6 +642,9 @@ pub fn apply_to_host_with(
             env: Default::default(),
             approved_env: Vec::new(),
             trust_remote_code: settings.trust_remote_code,
+            // ADR 0033 §1: only `engine add` registers LMCache; a role's own
+            // installation runs without it (`not_installed`).
+            lmcache: None,
         });
         crate::registration::check_profile(name, &profile)?;
         profiles.insert(name.to_owned(), profile);

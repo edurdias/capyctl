@@ -158,6 +158,8 @@ mod tests {
             queue: controls.queue,
             model_sources: Default::default(),
             parked_growth_limit: controls.parked_growth_limit,
+            lmcache: Default::default(),
+            retention: Default::default(),
         }
     }
 

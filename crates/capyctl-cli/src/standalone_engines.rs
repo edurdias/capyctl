@@ -89,6 +89,8 @@ impl EmbeddedHost {
             .expect("a generated host document is a mapping");
         crate::standalone_config::apply_stated_memory(&mut document, &stated_host, capacity_bytes)
             .expect("the stated memory limits were checked when the declared host was built");
+        // ADR 0033 §9, §10: the stated `lmcache` and `retention`, published.
+        capyctl_config::standalone::publish_host_settings(&mut document, &stated_host);
         let installations = EmbeddedInstallations::new();
         for n in &named {
             installations.register(
@@ -163,6 +165,7 @@ impl EmbeddedHost {
             self.capacity_bytes,
         )
         .expect("the stated memory limits were checked when the declared host was built");
+        capyctl_config::standalone::publish_host_settings(&mut document, &self.stated_host);
         document
     }
 

@@ -459,7 +459,11 @@ pub fn check_honoured(
         .map_err(|error| refuse(&format!("host.{}", error.path), error.detail))?;
     // Owner decision 2026-10-20: where the embedded host keeps engine output,
     // as on a host; a malformed value is refused before any side effect.
-    crate::remote_roles::engine_logs(host)
+    // ADR 0033 §9, §10: so are its `lmcache` and `retention`, and `retention:
+    // zero` beside `engine_logs: files`.
+    crate::remote_roles::host_lmcache(host)
+        .and_then(|_| crate::remote_roles::host_retention(host))
+        .and_then(|_| crate::remote_roles::engine_logs(host))
         .map_err(|error| refuse(&format!("host.{}", error.path), error.detail))?;
     if let Some(policy) = host.get("resource_policy") {
         let mut policy = policy.clone();
@@ -511,6 +515,18 @@ pub fn check_honoured(
         }
     }
     Ok(ignored)
+}
+
+/// ADR 0033 §9, §10, §13: the embedded host publishes its stated `lmcache`
+/// and `retention` in the host document deployments resolve against, so
+/// placement sees them as it would a host's. Copied as stated (checked by
+/// [`check_honoured`]); an unstated one stays absent, its default.
+pub fn publish_host_settings(document: &mut Value, stated_host: &Value) {
+    for field in ["lmcache", "retention"] {
+        if let Some(value) = stated_host.get(field) {
+            document[field] = value.clone();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -766,6 +782,46 @@ mod tests {
         doc["host"]["engine_logs"] = json!("disk");
         let error = check_honoured(&doc, Path::new("/s/config"), Path::new("/s")).unwrap_err();
         assert_eq!(error.path, "host.engine_logs", "{error}");
+    }
+
+    // T45 T03 (ADR 0033 §9, §10, §14): standalone honours `host.lmcache` and
+    // `host.retention` as a host does, refuses another value and zero
+    // retention beside stated `engine_logs: files` with their paths, and
+    // publishes the stated values in the embedded host's document.
+    #[test]
+    fn standalone_honours_lmcache_and_retention() {
+        let mut doc = generated("/s");
+        doc["host"]["lmcache"] = json!("off");
+        doc["host"]["retention"] = json!("zero");
+        crate::validate(
+            &serde_json::to_string(&doc).unwrap(),
+            crate::ConfigKind::Standalone,
+        )
+        .unwrap();
+        check_honoured(&doc, Path::new("/s/config"), Path::new("/s")).unwrap();
+        assert_eq!(
+            crate::remote_roles::engine_logs(&doc["host"]).unwrap(),
+            crate::remote_roles::EngineLogs::Memory
+        );
+        let mut published = json!({"schema_version": 1, "kind": "host"});
+        publish_host_settings(&mut published, &doc["host"]);
+        assert_eq!(published["lmcache"], "off");
+        assert_eq!(published["retention"], "zero");
+        let mut unstated = json!({"schema_version": 1});
+        publish_host_settings(&mut unstated, &generated("/s")["host"]);
+        assert_eq!(unstated, json!({"schema_version": 1}));
+        for (field, value, path) in [
+            ("lmcache", json!("required"), "host.lmcache"),
+            ("retention", json!("minimal"), "host.retention"),
+        ] {
+            let mut bad = generated("/s");
+            bad["host"][field] = value;
+            let error = check_honoured(&bad, Path::new("/s/config"), Path::new("/s")).unwrap_err();
+            assert_eq!(error.path, path, "{error}");
+        }
+        doc["host"]["engine_logs"] = json!("files");
+        let error = check_honoured(&doc, Path::new("/s/config"), Path::new("/s")).unwrap_err();
+        assert_eq!(error.path, "host.retention", "{error}");
     }
 
     // T14 (ADR 0028 §3, R21): standalone honours `host.resource_policy.groups`
