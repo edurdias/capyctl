@@ -525,7 +525,13 @@ fn lmcache_environment_names_are_reserved() {
         .find(|row| row.name == "LMCACHE_")
         .unwrap();
     assert_eq!(row.class, FlagClass::Reserved);
-    assert!(row.reason.contains("ADR 0033"), "{}", row.reason);
+    // The reason names what the operator sets instead; runtime messages cite
+    // no requirement.
+    assert!(
+        row.reason.contains("the deployment's `lmcache` setting") && !row.reason.contains("ADR"),
+        "{}",
+        row.reason
+    );
     // Through resolution, on every engine's profile env and a deployment's.
     let (deployment, mut host) = fixture();
     host["runtime_profiles"]["local"]["security"]["approved_env"] = json!(["L*"]);
