@@ -121,9 +121,12 @@ other listed versions are assumed to match until run against them.
 If your client hangs up, or a request runs past its deadline (no answer
 within `queue.request_deadline`, or a stream that goes quiet for
 `queue.stream_idle_timeout`), CapyCTL closes the engine connection, which
-asks the engine to stop. Closing a connection does not prove the engine
-stopped, so the request stays counted against its model's memory until
-CapyCTL sees the engine stop:
+asks the engine to stop. That holds for streamed and non-streamed chat
+requests and for decision requests alike, and for a model served on a host,
+whose ingress closes its own engine connection when CapyCTL's goes away.
+(Before 0.1.7, a non-streamed request whose client hung up ran on to its
+end.) Closing a connection does not prove the engine stopped, so the request
+stays counted against its model's memory until CapyCTL sees the engine stop:
 
 - If the engine had already answered (it produced part of the answer, or
   answered with an error), CapyCTL counts the request finished the first time

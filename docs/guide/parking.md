@@ -116,14 +116,14 @@ other-model   parked   0/1     1          gpu-box
 
 CapyCTL waits for requests in progress to finish before it parks a model; it
 never cuts an answer off. When a client hangs up in the middle of an answer,
-CapyCTL stops the engine's work on it instead of letting it run to the end,
-and waits until the engine reports no running or waiting requests before it
-parks or switches. Two more cases end a streamed answer the same way: a client
-that reads nothing for 10 seconds, and a single piece of the answer larger
-than 64 KiB. A request cut before the engine produced any of its answer is
-different: the engine may not have started it yet, so its reading of no
-running requests proves nothing about it. CapyCTL then stops the model rather
-than park it, and the stop settles the request (see
+streamed or not, CapyCTL stops the engine's work on it instead of letting it
+run to the end, and waits until the engine reports no running or waiting
+requests before it parks or switches. Two more cases end a streamed answer the
+same way: a client that reads nothing for 10 seconds, and a single piece of
+the answer larger than 64 KiB. A request cut before the engine produced any
+of its answer is different: the engine may not have started it yet, so its
+reading of no running requests proves nothing about it. CapyCTL then stops
+the model rather than park it, and the stop settles the request (see
 [When a request is cut short](requests.md#when-a-request-is-cut-short)). When
 there is no room to keep a parked copy, CapyCTL stops the idle model instead
 and says so: `released: stopped (no room to park)`.

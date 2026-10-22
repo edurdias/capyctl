@@ -4,6 +4,7 @@
 //! (simultaneous requests join one wake — T15).
 
 use async_trait::async_trait;
+use std::future::Future;
 
 use axum::http::StatusCode;
 use axum::Json;
@@ -293,9 +294,11 @@ fn serves_now(
 ///
 /// SPEC §10 (owner decision 2026-09-22): a durable request lease is opened
 /// before anything reaches the engine and closed only on evidence. The forward
-/// runs as its own task, so a client that disconnects does not cancel it: the
-/// backend's completion is still observed and closes the lease, instead of a
-/// dropped future leaving the lease charged forever.
+/// runs as its own task, so a dropped handler never leaves the lease charged
+/// forever: the task settles it whatever the client does. Amended 2026-10-21:
+/// a client that disconnects cancels the forward, which closes the engine
+/// connection as for a stream whose client hung up, and the task closes the
+/// lease as cancelling.
 pub async fn dispatch(
     deps: &RouterDeps,
     model: &str,
@@ -361,10 +364,17 @@ pub async fn dispatch_timed(
     // before its lease close is committed; the dispatch task then closes the
     // lease and only after that releases the in-flight slot, so the
     // deployment's bound counts the request until the ledger no longer does.
-    let (reply, answer) = tokio::sync::oneshot::channel();
+    let (mut reply, answer) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let mut attempt = first;
         let refused = loop {
+            // SPEC §10 (amended 2026-10-21): a client gone before this attempt
+            // was sent leaves nothing to forward, and nothing reached the engine.
+            if reply.is_closed() {
+                attempt.settle(LeaseEnd::NotAccepted).await;
+                guard.release();
+                return;
+            }
             let generation = attempt.generation;
             timing.forwarding(attempt.instance, generation);
             let progress = crate::stream::Progress::default();
@@ -372,37 +382,43 @@ pub async fn dispatch_timed(
             // ADR 0028 §11: a request to a group's head is watched for its
             // first token; the watch holds nothing of the response.
             let stall = attempt.stall.take();
-            let bounded = match endpoint {
-                Endpoint::ChatCompletions => {
-                    crate::stream::bounded(
-                        attempt.forward.forward_chat_observed(&body, &mut observer),
-                        &progress,
-                        &bounds,
-                        stall,
-                    )
-                    .await
-                }
-                Endpoint::Decisions => {
-                    crate::stream::bounded(
-                        attempt.forward.forward_decision(&body),
-                        &progress,
-                        &bounds,
-                        stall,
-                    )
-                    .await
+            let forward = async {
+                match endpoint {
+                    Endpoint::ChatCompletions => {
+                        crate::stream::bounded(
+                            attempt.forward.forward_chat_observed(&body, &mut observer),
+                            &progress,
+                            &bounds,
+                            stall,
+                        )
+                        .await
+                    }
+                    Endpoint::Decisions => {
+                        crate::stream::bounded(
+                            attempt.forward.forward_decision(&body),
+                            &progress,
+                            &bounds,
+                            stall,
+                        )
+                        .await
+                    }
                 }
             };
+            let bounded = unless_hung_up(forward, &mut reply).await;
             // SPEC §10 (found live 2026-10-02): a cut drops the forward, which
             // closes the engine connection, so the lease is cancelling, as for
-            // a stream whose client hung up. Amended 2026-10-21: it settles on
-            // the engine's quiescence only if the engine produced output for
-            // it first. A decision reports no progress, and its answer comes
-            // whole, so a cut decision was never answered.
+            // a stream whose client hung up. Amended 2026-10-21: so does a
+            // client that disconnects (owner decision for 0.1.7), and it
+            // settles on the engine's quiescence only if the engine produced
+            // output for it first. A decision reports no progress, and its
+            // answer comes whole, so a cut decision was never answered.
             let cut = bounded.is_err();
             let answered = progress.produced();
             let result = bounded.unwrap_or_else(|()| {
                 Err(AdapterError::Uncertain(
-                    "the backend missed the request's deadline or idle bound".into(),
+                    "the client went away, or the backend missed the request's deadline or \
+                     idle bound"
+                        .into(),
                 ))
             });
             let error = match result {
@@ -436,6 +452,12 @@ pub async fn dispatch_timed(
                 // be offered to the next instance; never after acceptance.
                 AdapterError::NotAccepted(reason) => {
                     plan.refused(generation, &reason);
+                    // Amended 2026-10-21: no other instance is offered a
+                    // request whose client is gone.
+                    if reply.is_closed() {
+                        guard.release();
+                        return;
+                    }
                     let started = std::time::Instant::now();
                     let next = plan.next().await;
                     timing.leased(started.elapsed());
@@ -501,6 +523,24 @@ pub async fn dispatch_timed(
         Ok(Err(Refused::Uncertain)) | Err(_) => {
             Err(err("engine_error", "backend completion unverified"))
         }
+    }
+}
+
+/// SPEC §10 (amended 2026-10-21, owner decision for 0.1.7): run a non-streamed
+/// request's bounded forward until it ends or its client goes away. A client
+/// that disconnects drops its handler, and with it the answer's receiver;
+/// the forward is then dropped, which closes the engine connection, and the
+/// request is cut (`Err(())`), as one cut at its deadline. An end ready at the
+/// same moment wins, so a completion observed before the cut still closes
+/// the lease completed.
+async fn unless_hung_up<T, R>(
+    forward: impl Future<Output = Result<T, ()>>,
+    reply: &mut tokio::sync::oneshot::Sender<R>,
+) -> Result<T, ()> {
+    tokio::select! {
+        biased;
+        ended = forward => ended,
+        () = reply.closed() => Err(()),
     }
 }
 
@@ -735,5 +775,51 @@ impl capyctl_adapters::traits::ChatForward for NoForward {
         _body: &serde_json::Value,
     ) -> Result<serde_json::Value, capyctl_adapters::traits::AdapterError> {
         Err(capyctl_adapters::traits::AdapterError::UnsupportedCapability)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unless_hung_up;
+
+    // T17 (SPEC §10, amended 2026-10-21): a forward whose end is ready when
+    // its client has already gone still ends with that end, so a completion
+    // observed before the cut closes the lease completed.
+    #[tokio::test]
+    async fn a_completion_ready_with_the_hang_up_wins() {
+        let (mut reply, answer) = tokio::sync::oneshot::channel::<()>();
+        drop(answer);
+        let ended = unless_hung_up(std::future::ready(Ok::<_, ()>("done")), &mut reply).await;
+        assert_eq!(ended, Ok("done"));
+    }
+
+    // T17 (SPEC §10, amended 2026-10-21): a client that goes away while the
+    // forward is still waiting cuts it, and the forward is dropped (which is
+    // what closes the engine connection).
+    #[tokio::test]
+    async fn a_hang_up_cuts_and_drops_a_pending_forward() {
+        struct Dropped(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = Dropped(dropped.clone());
+        let forward = async move {
+            let _held = held;
+            std::future::pending::<Result<(), ()>>().await
+        };
+        let (mut reply, answer) = tokio::sync::oneshot::channel::<()>();
+        let racing = tokio::spawn(async move { unless_hung_up(forward, &mut reply).await });
+        tokio::task::yield_now().await;
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        drop(answer);
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), racing)
+            .await
+            .expect("cut on the hang-up")
+            .unwrap();
+        assert_eq!(ended, Err(()));
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

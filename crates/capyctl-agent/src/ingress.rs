@@ -622,6 +622,11 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
     // producing at a fixed wall time; the router bounds a relayed stream by
     // its deadline and the idle gap between events, and dropping it closes
     // this body.
+    // SPEC §10 (amended 2026-10-21): the engine request runs inside this
+    // handler and its relayed body, never on a task of its own, so when the
+    // router's connection goes away (its client hung up or its deadline cut
+    // the request, streamed, collected or a decision) the server drops them
+    // and with them the engine connection, before the engine's head as after.
     // ADR 0031 §7 / amendment A1: the native key is sent only to an engine
     // that takes it; a custom engine whose manifest does not use `{api_key}`
     // gets no `Authorization` header. An entry no launch is bound to yet

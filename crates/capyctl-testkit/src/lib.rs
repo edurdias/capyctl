@@ -1,6 +1,7 @@
 //! Test scaffolding for capyctl: the Fake engine, the fake multi-host engine
 //! group, the fake launcher, the lifecycle simulation, the shared store
-//! fixture and the scripted process tools.
+//! fixture, the scripted process tools and an engine double that holds every
+//! request.
 //!
 //! None of this is a product. The Fake engine reports Ready without an engine
 //! behind it, which is exactly what makes it useful in a test and exactly what
@@ -21,6 +22,7 @@ pub mod fake_engine;
 pub mod fake_group;
 pub mod fake_launcher;
 pub mod fixture;
+pub mod held_engine;
 mod lifecycle;
 pub mod ports;
 mod provider;
@@ -29,6 +31,7 @@ mod scripted_tool;
 pub use fake_engine::{FakeEngine, BUFFER_RESIDUE, FULL_RESIDENT_BYTES, LEVEL1_RETAINED_BYTES};
 pub use fake_group::{FakeGroup, JournalState, RankEnd};
 pub use fake_launcher::FakeLauncher;
+pub use held_engine::HeldEngine;
 pub use lifecycle::FakeFault;
 pub use provider::{
     fake_bindings, fake_bindings_with_members, fake_installation, fake_provider,

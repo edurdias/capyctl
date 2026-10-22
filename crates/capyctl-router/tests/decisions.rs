@@ -660,6 +660,51 @@ async fn a_decision_is_bounded_by_the_request_deadline() {
     );
 }
 
+// T43 T17 (SPEC §10, amended 2026-10-21, owner decision for 0.1.7): a client
+// that disconnects while its decision is being computed cancels the forward,
+// so the engine sees its connection close within a bound. A decision comes
+// whole, so it was never answered: it is held as cancelling until the
+// instance's verified stop, and its in-flight slot is released.
+#[tokio::test]
+async fn a_hang_up_mid_decision_closes_the_engine_connection() {
+    let engine = capyctl_testkit::HeldEngine::start().await;
+    let (authority, deps, router) = stack(DeploymentApi::Decisions, &engine.endpoint());
+    authority.ready.store(true, Ordering::SeqCst);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/systemone"))
+            .json(&decision_body())
+            .send()
+            .await
+    });
+    let bound = Duration::from_secs(5);
+    assert!(
+        engine.arrived_within(1, bound).await,
+        "never reached the engine"
+    );
+    assert_eq!(engine.closed(), 0);
+    client.abort();
+    let _ = client.await;
+    assert!(
+        engine.closed_within(1, bound).await,
+        "the engine connection stayed open after the hang-up"
+    );
+    let deadline = tokio::time::Instant::now() + bound;
+    while authority.ends() != vec![Some(LeaseEnd::Cancelling { answered: false })]
+        || deps.inflight.current(DEPLOYMENT) != 0
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{:?}",
+            authority.ends()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 // T43 (ADR 0030 §5): `/v1/models` names the API each model answers, read
 // without waking anything.
 #[tokio::test]
