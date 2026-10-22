@@ -1736,6 +1736,8 @@ async fn a_remote_cancelling_lease_settles_only_on_an_idle_sample_after_the_hang
             device_memory: false,
             decisions: false,
             custom_engine: false,
+            lmcache_required: false,
+            retention_zero: false,
         },
         Default::default(),
     ));
@@ -1893,6 +1895,8 @@ async fn a_remote_cancelling_lease_settles_while_a_stop_drains() {
             device_memory: false,
             decisions: false,
             custom_engine: false,
+            lmcache_required: false,
+            retention_zero: false,
         },
         Default::default(),
     ));

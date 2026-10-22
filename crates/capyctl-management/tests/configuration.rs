@@ -2117,3 +2117,158 @@ async fn a_host_without_custom_engines_never_takes_a_custom_deployment() {
     assert!(message.contains("host-a"), "{message}");
     assert_eq!(state.lock().unwrap().store().deployment_count().unwrap(), 1);
 }
+
+/// Two enrolled hosts whose `local` profile is vLLM 0.32.0 with LMCache
+/// 0.5.6 registered (ADR 0033 §§1, 2); each publishes `settings[i]` at its
+/// document's root (its `lmcache`, its `retention`) and declares
+/// `capabilities[i]`.
+fn lmcache_hosts(
+    state: &Arc<Mutex<OwnedCoordinatorState>>,
+    settings: [Value; 2],
+    capabilities: [&[&str]; 2],
+) -> (axum::Router, Vec<String>) {
+    let mut ids = Vec::new();
+    for (index, (name, digest)) in [("host-a", 'e'), ("host-b", 'f')].into_iter().enumerate() {
+        let id = publish_host(state, name, digest, json!({}));
+        let owner = state.lock().unwrap();
+        let mut document: Value = serde_json::from_str(
+            &owner
+                .store()
+                .host_publication(&id)
+                .unwrap()
+                .unwrap()
+                .config_json,
+        )
+        .unwrap();
+        let profile = &mut document["runtime_profiles"]["local"];
+        profile["build_fingerprint"] = "0.32.0".into();
+        profile["lmcache"] =
+            json!({"version": "0.5.6", "digest": format!("sha256:{}", "0".repeat(64))});
+        for (key, value) in settings[index].as_object().unwrap() {
+            document[key] = value.clone();
+        }
+        owner
+            .store()
+            .publish_host_configuration(&capyctl_store::host_publication::HostPublication {
+                host_id: id.clone(),
+                config_json: document.to_string(),
+                boot_id: format!("boot-{name}"),
+                fingerprint: capyctl_config::remote_resources::policy_fingerprint(&document),
+                received_at_ms: 2000,
+            })
+            .unwrap();
+        owner
+            .store()
+            .record_host_version(
+                &id,
+                &capyctl_store::host_versions::HostVersion {
+                    binary_version: "0.1.7".into(),
+                    compatibility: "supported".into(),
+                    reason: String::new(),
+                    capabilities: capabilities[index]
+                        .iter()
+                        .map(|c| (*c).to_owned())
+                        .collect(),
+                    recorded_at_ms: 2000,
+                },
+            )
+            .unwrap();
+        ids.push(id);
+    }
+    let router = configuration_router(
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+        Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+    );
+    (router, ids)
+}
+
+/// The golden deployment, restart only, with `fields` at its root, on `hosts`.
+fn lmcache_config(mut config: Value, fields: Value, hosts: &[&str]) -> Value {
+    config["residency"] = "restart_only".into();
+    for (key, value) in fields.as_object().unwrap() {
+        config[key] = value.clone();
+    }
+    config["placement"] = json!({ "hosts": hosts });
+    config["devices"] = json!([{"sharing": "shared"}]);
+    for phase in ["cold", "ready", "parking", "wake"] {
+        config["resources"][phase]["devices"] = json!([{"sharing": "shared"}]);
+    }
+    config
+}
+
+/// ADR 0033 §§9, 10, 13, 14: the registry refuses each host LMCache cannot
+/// run on, before anything is sent, with the typed code: among several
+/// allowed hosts it is recorded refused and the others take the deployment;
+/// named alone it refuses the deploy (`invalid_config` carrying the code,
+/// exit 5 in the CLI), storing nothing.
+// T45 T36 T34
+#[tokio::test]
+async fn the_registry_refuses_each_host_lmcache_cannot_run_on() {
+    let current: &[&str] = &["heartbeats", "lmcache", "retention"];
+    let older: &[&str] = &["heartbeats"];
+    let required = json!({"lmcache": "required"});
+    for (settings, capabilities, fields, code) in [
+        (
+            json!({"lmcache": "off"}),
+            current,
+            &required,
+            "lmcache_unavailable:host_off",
+        ),
+        (
+            json!({"retention": "zero"}),
+            current,
+            &required,
+            "retention_zero:lmcache",
+        ),
+        (
+            json!({}),
+            older,
+            &required,
+            "host_capability_missing:lmcache",
+        ),
+        (
+            json!({}),
+            older,
+            &json!({"retention": "zero"}),
+            "host_capability_missing:retention",
+        ),
+    ] {
+        let (_directory, state, config, _host) = fixture();
+        let (router, ids) = lmcache_hosts(&state, [settings, json!({})], [capabilities, current]);
+        let (status, body) = deploy(
+            &router,
+            "both",
+            &lmcache_config(config.clone(), fields.clone(), &["host-a", "host-b"]),
+        )
+        .await;
+        assert_eq!(status, 202, "{code}: {body}");
+        let id = body["deployment_id"].as_str().unwrap().to_owned();
+        let snapshot = state.lock().unwrap().store().snapshot().unwrap();
+        let deployment = snapshot.deployments.iter().find(|d| d.id == id).unwrap();
+        let hosts: Vec<_> = deployment
+            .hosts
+            .iter()
+            .map(|h| (h.host_id.clone(), h.outcome.clone(), h.diagnostic.clone()))
+            .collect();
+        assert!(
+            hosts.contains(&("host-a".into(), "refused".into(), Some(code.into()))),
+            "{code}: {hosts:?}"
+        );
+        assert!(
+            hosts.contains(&(ids[1].clone(), "resolved".into(), None)),
+            "{code}: {hosts:?}"
+        );
+
+        let (status, body) = deploy(
+            &router,
+            "alone",
+            &lmcache_config(config, fields.clone(), &["host-a"]),
+        )
+        .await;
+        assert_eq!(status, 400, "{code}: {body}");
+        assert_eq!(body["error"]["code"], "invalid_config", "{body}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains(&format!("{code}: ")), "{message}");
+        assert_eq!(state.lock().unwrap().store().deployment_count().unwrap(), 1);
+    }
+}

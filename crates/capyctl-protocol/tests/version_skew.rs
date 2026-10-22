@@ -370,6 +370,8 @@ fn every_post_baseline_field_names_its_capability() {
             DECISIONS,
             CUSTOM_ENGINES,
             STARTUP_HOST_BYTES,
+            LMCACHE,
+            RETENTION,
         ]
         .contains(name)
         {
@@ -613,6 +615,96 @@ fn custom_engines_gates_only_custom_engine_deployments() {
         custom_engines_refusal(&agent_capabilities().into_iter().collect()),
         None
     );
+}
+
+/// A single launch of the test deployment with `settings` merged into its
+/// document's root.
+fn launch_with(settings: serde_json::Value) -> pb::ExecuteMember {
+    let MemberAction::LaunchSingle(mut plan) = launch(true, false) else {
+        unreachable!()
+    };
+    let mut document: serde_json::Value = serde_json::from_str(&plan.deployment_config).unwrap();
+    for (key, value) in settings.as_object().unwrap() {
+        document[key] = value.clone();
+    }
+    plan.deployment_config = document.to_string();
+    wire(MemberAction::LaunchSingle(plan), 0)
+}
+
+// T45 T34 (ADR 0033 §13): `lmcache` and `retention` are capabilities every
+// current agent declares. Neither is a placement requirement for other
+// deployments: only `lmcache: required` and `retention: zero` need them,
+// at placement (typed, before anything is sent) and as the launch's own
+// requirement, so the session's last fence refuses such a launch to an
+// older host too.
+#[test]
+fn lmcache_and_retention_gate_only_the_deployments_that_need_them() {
+    use capabilities::*;
+    use capyctl_config::lmcache::{HostLmcache, LmcacheMode, Retention};
+    assert_eq!(LMCACHE, "lmcache");
+    assert_eq!(RETENTION, "retention");
+    for name in [LMCACHE, RETENTION] {
+        assert!(CATALOGUE.contains(&(name, Direction::ServerToHost)));
+        assert!(agent_capabilities().contains(&name.to_owned()));
+        assert!(!PLACEMENT_REQUIRED.contains(&name));
+        assert!(is_gate_refusal(&missing(name)));
+    }
+    assert!(agent_capabilities().len() <= MAX_DECLARED);
+    let current: BTreeSet<String> = agent_capabilities().into_iter().collect();
+    let older: BTreeSet<String> = current
+        .iter()
+        .filter(|name| *name != LMCACHE && *name != RETENTION)
+        .cloned()
+        .collect();
+    let standard = (HostLmcache::Auto, Retention::Standard);
+    let refusal = |declared: &BTreeSet<String>, mode, retention| {
+        lmcache_refusal(declared, mode, retention, standard.0, standard.1)
+    };
+    assert_eq!(
+        refusal(&older, LmcacheMode::Required, Retention::Standard),
+        Some("host_capability_missing:lmcache")
+    );
+    assert_eq!(
+        refusal(&older, LmcacheMode::Auto, Retention::Zero),
+        Some("host_capability_missing:retention")
+    );
+    assert_eq!(
+        refusal(&older, LmcacheMode::Auto, Retention::Standard),
+        None
+    );
+    assert_eq!(refusal(&older, LmcacheMode::Off, Retention::Standard), None);
+    assert_eq!(
+        refusal(&current, LmcacheMode::Required, Retention::Standard),
+        None
+    );
+    assert_eq!(refusal(&current, LmcacheMode::Auto, Retention::Zero), None);
+    assert_eq!(decisions_refusal(&older), None);
+    assert_eq!(custom_engines_refusal(&older), None);
+
+    // The launch carries the deployment's needs.
+    let plain = launch_with(serde_json::json!({}));
+    assert_eq!(required(&plain), vec![CHECKPOINT_DIGEST]);
+    let auto = launch_with(serde_json::json!({"lmcache": "auto", "retention": "standard"}));
+    assert_eq!(required(&auto), vec![CHECKPOINT_DIGEST]);
+    let needs_lmcache = launch_with(serde_json::json!({"lmcache": "required"}));
+    assert_eq!(required(&needs_lmcache), vec![CHECKPOINT_DIGEST, LMCACHE]);
+    let zero = launch_with(serde_json::json!({"lmcache": "off", "retention": "zero"}));
+    assert_eq!(required(&zero), vec![CHECKPOINT_DIGEST, RETENTION]);
+    assert_eq!(
+        refusal_for(&older, &needs_lmcache).as_deref(),
+        Some("host_capability_missing:lmcache")
+    );
+    assert_eq!(
+        refusal_for(&older, &zero).as_deref(),
+        Some("host_capability_missing:retention")
+    );
+    assert_eq!(refusal_for(&older, &plain), None);
+    assert_eq!(refusal_for(&current, &needs_lmcache), None);
+    assert_eq!(refusal_for(&current, &zero), None);
+}
+
+fn refusal_for(declared: &BTreeSet<String>, command: &pb::ExecuteMember) -> Option<String> {
+    capabilities::refusal(false, declared, command)
 }
 
 // T34 T26 (ADR 0019, discrete GPU design §8): device memory domains are one

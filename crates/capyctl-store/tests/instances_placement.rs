@@ -2391,3 +2391,170 @@ fn a_custom_engine_deployment_is_never_placed_on_a_host_without_the_capability()
         vec![(0, "host-b")],
     );
 }
+
+/// The vLLM golden on vLLM 0.32.0 with LMCache 0.5.6 registered, restart
+/// only: a profile on which `lmcache: required` resolves (ADR 0033 §§1, 2, 7).
+fn lmcache_golden() -> (Value, Value) {
+    let (mut deployment, mut host) = golden();
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["build_fingerprint"] = json!("0.32.0");
+    profile["lmcache"] =
+        json!({"version": "0.5.6", "digest": format!("sha256:{}", "0".repeat(64))});
+    deployment["residency"] = json!("restart_only");
+    (deployment, host)
+}
+
+impl TwoHosts {
+    /// ADR 0033 §§9, 10: `host` publishes a document whose root states
+    /// `settings` (its `lmcache`, its `retention`).
+    fn publish_settings(&self, host: &str, settings: Value) {
+        self.sql
+            .execute(
+                "INSERT INTO approved_host_publications VALUES(?1,?2,'boot','fingerprint',?3)
+                 ON CONFLICT(host_id) DO UPDATE SET config_json=excluded.config_json",
+                params![host, settings.to_string(), NOW],
+            )
+            .unwrap();
+    }
+
+    fn start_refused(&self, id: &str) -> capyctl_store::lifecycle::LifecycleError {
+        match self.store.accept_scoped_start_command(
+            &self.session,
+            "owner",
+            id,
+            StartScope::All,
+            self.revision(id),
+            "start",
+            NOW,
+            DEADLINE,
+            None,
+        ) {
+            Ok(start) => panic!("started {}", start.operation_id()),
+            Err(error) => error,
+        }
+    }
+}
+
+/// ADR 0033 §§9, 10, 13: at activation, `lmcache: required` is placed only on
+/// a host that declared `lmcache`, does not publish `lmcache: off` and does
+/// not publish `retention: zero`; the host that would otherwise win (spread,
+/// ties by host id) is passed over. When every host refuses with the same
+/// gate, the start is refused with that typed code and nothing is started:
+/// never a capacity block or a generic ineligible host.
+// T45 T36 T34
+#[test]
+fn lmcache_required_is_placed_only_where_lmcache_can_run() {
+    let both = ["engine_groups", "lmcache", "retention"];
+    let t = two_hosts_with(lmcache_golden(), "32GiB", "shared");
+    t.declared("host-a", &both);
+    t.declared("host-b", &both);
+    let id = t
+        .deploy("deploy", json!({"lmcache": "required"}))
+        .deployment_id;
+    assert_eq!(
+        t.store
+            .effective_configuration(&id)
+            .unwrap()
+            .unwrap()
+            .effective["lmcache"],
+        "required"
+    );
+    t.publish_settings("host-a", json!({"lmcache": "off"}));
+    t.start(&id, "start", StartScope::All, None);
+    assert_eq!(
+        t.planned(&id)
+            .iter()
+            .map(|(_, k, h)| (*k, h.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(0, "host-b")],
+    );
+
+    for (host_b, declared_b, code) in [
+        (
+            json!({"lmcache": "off"}),
+            &both[..],
+            "lmcache_unavailable:host_off",
+        ),
+        (
+            json!({"retention": "zero"}),
+            &both[..],
+            "retention_zero:lmcache",
+        ),
+        (
+            json!({}),
+            &["engine_groups", "retention"][..],
+            "host_capability_missing:lmcache",
+        ),
+    ] {
+        let t = two_hosts_with(lmcache_golden(), "32GiB", "shared");
+        t.declared("host-a", &both);
+        t.declared("host-b", declared_b);
+        let id = t
+            .deploy("deploy", json!({"lmcache": "required"}))
+            .deployment_id;
+        // Host A refuses with the same gate as host B, so the code is the
+        // diagnostic.
+        match code {
+            "host_capability_missing:lmcache" => t.declared("host-a", &["engine_groups"]),
+            _ => t.publish_settings("host-a", host_b.clone()),
+        }
+        t.publish_settings("host-b", host_b);
+        match t.start_refused(&id) {
+            capyctl_store::lifecycle::LifecycleError::PlacementRefused(reason) => {
+                assert!(reason.starts_with(&format!("{code}: ")), "{reason}");
+                assert!(reason.contains(&format!("host host-a: {code}")), "{reason}");
+                assert!(reason.contains(&format!("host host-b: {code}")), "{reason}");
+            }
+            other => panic!("{code}: {other:?}"),
+        }
+        assert!(t.planned(&id).is_empty());
+    }
+
+    // An `auto` deployment runs on such hosts, without LMCache.
+    let t = two_hosts_with(lmcache_golden(), "32GiB", "shared");
+    t.declared("host-a", &["engine_groups"]);
+    t.declared("host-b", &["engine_groups"]);
+    t.publish_settings("host-a", json!({"lmcache": "off", "retention": "zero"}));
+    let id = t.deploy("deploy", json!({})).deployment_id;
+    t.start(&id, "start", StartScope::All, None);
+    assert_eq!(t.planned(&id).len(), 1);
+}
+
+/// ADR 0033 §§10, 13: a deployment with `retention: zero` is placed only on a
+/// host that declared `retention`, whatever its `lmcache`; with no such host
+/// the start is refused `host_capability_missing:retention`.
+// T45 T34
+#[test]
+fn zero_retention_is_placed_only_on_a_host_that_declared_retention() {
+    let t = two_hosts("32GiB");
+    t.declared("host-a", &["engine_groups", "lmcache"]);
+    t.declared("host-b", &["engine_groups", "retention"]);
+    let id = t
+        .deploy("deploy", json!({"retention": "zero"}))
+        .deployment_id;
+    t.start(&id, "start", StartScope::All, None);
+    assert_eq!(
+        t.planned(&id)
+            .iter()
+            .map(|(_, k, h)| (*k, h.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(0, "host-b")],
+    );
+
+    let t = two_hosts("32GiB");
+    t.declared("host-a", &["engine_groups", "lmcache"]);
+    t.declared("host-b", &["engine_groups"]);
+    let id = t
+        .deploy("deploy", json!({"retention": "zero", "lmcache": "off"}))
+        .deployment_id;
+    match t.start_refused(&id) {
+        capyctl_store::lifecycle::LifecycleError::PlacementRefused(reason) => {
+            assert!(
+                reason.starts_with("host_capability_missing:retention: "),
+                "{reason}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(t.planned(&id).is_empty());
+}

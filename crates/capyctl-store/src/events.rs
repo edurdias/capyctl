@@ -207,6 +207,30 @@ pub(crate) enum EventMetadata {
         count: usize,
         receipt: String,
     },
+    /// ADR 0033 §§8, 9, 14: LMCache is off for one launch of an instance,
+    /// with the closed reason and a bounded, redacted detail. Recorded once
+    /// per launch and reason ([`crate::Store::record_lmcache_off`]).
+    #[serde(rename = "1")]
+    LmcacheOff {
+        deployment_id: String,
+        instance_index: u32,
+        generation: i64,
+        binding_id: String,
+        host_id: String,
+        reason: String,
+        detail: String,
+    },
+    /// ADR 0033 §3: an instance's LMCache server exited while its engine
+    /// served; the instance fails and recovers with a new server.
+    #[serde(rename = "1")]
+    LmcacheServerExited {
+        deployment_id: String,
+        instance_index: u32,
+        generation: i64,
+        binding_id: String,
+        host_id: String,
+        detail: String,
+    },
 }
 
 /// SPEC §10 (W10): what a request-driven switch recorded.
@@ -348,6 +372,8 @@ impl EventMetadata {
                 SwitchPhase::Failed => "switch_failed",
             },
             Self::RequestCancellationAcknowledged { .. } => "request_cancellation_acknowledged",
+            Self::LmcacheOff { .. } => "lmcache_off",
+            Self::LmcacheServerExited { .. } => "lmcache_server_exited",
         }
     }
 
@@ -397,7 +423,9 @@ impl EventMetadata {
             Self::SwitchRecorded {
                 target_deployment, ..
             } => (Some(target_deployment.as_str()), None),
-            Self::RequestCancellationAcknowledged { deployment_id, .. } => {
+            Self::RequestCancellationAcknowledged { deployment_id, .. }
+            | Self::LmcacheOff { deployment_id, .. }
+            | Self::LmcacheServerExited { deployment_id, .. } => {
                 (Some(deployment_id.as_str()), None)
             }
         }
@@ -436,6 +464,143 @@ impl crate::Store {
                 installation: installation.into(),
                 registered_digest: registered_digest.into(),
                 observed_digest: observed_digest.into(),
+            },
+        )
+        .map_err(|_| crate::StoreError::Conflict)?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+/// ADR 0033 §§3, 8, 9: the launch an LMCache event is about: the instance, the
+/// generation it runs, the launch's runtime binding and the host it runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LmcacheLaunch<'a> {
+    pub deployment_id: &'a str,
+    pub instance_index: u32,
+    pub generation: i64,
+    pub binding_id: &'a str,
+    pub host_id: &'a str,
+}
+
+/// The most characters an LMCache event's detail keeps (the management
+/// stream's bound on free text).
+pub const MAX_LMCACHE_DETAIL_CHARS: usize = 512;
+
+impl LmcacheLaunch<'_> {
+    /// A ULID deployment, a non-negative generation, and the binding and
+    /// host as bounded tokens; anything else is refused.
+    fn valid(&self) -> bool {
+        let token = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 256
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.:/".contains(&b))
+        };
+        self.deployment_id.len() == 26
+            && self.deployment_id.parse::<ulid::Ulid>().is_ok()
+            && self.generation >= 0
+            && token(self.binding_id)
+            && token(self.host_id)
+    }
+}
+
+/// SPEC §13.3, ADR 0033 §8: an event's detail as journaled: credentials in
+/// any URL scrubbed, control characters (line breaks of an engine log's
+/// last lines included) folded to spaces, and at most
+/// [`MAX_LMCACHE_DETAIL_CHARS`] characters. The host already passed it
+/// through the redacting writer; this is the journal's own bound.
+fn lmcache_detail(detail: &str) -> String {
+    capyctl_domain::redact::redact_urls(detail)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_LMCACHE_DETAIL_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+impl crate::Store {
+    /// ADR 0033 §§8, 9, 14: journal that LMCache is off for `launch`, with
+    /// `reason` and `detail` (bounded and redacted, the reason's sentence
+    /// when empty). Once per launch: a second report of the same reason for
+    /// the same deployment, instance, generation and binding records nothing
+    /// and returns `false`.
+    pub fn record_lmcache_off(
+        &self,
+        launch: &LmcacheLaunch<'_>,
+        reason: capyctl_config::lmcache::LmcacheOffReason,
+        detail: &str,
+    ) -> Result<bool, crate::StoreError> {
+        if !launch.valid() {
+            return Err(crate::StoreError::Conflict);
+        }
+        let detail = match lmcache_detail(detail) {
+            detail if detail.is_empty() => reason.sentence().to_owned(),
+            detail => detail,
+        };
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let recorded: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM management_events
+                 WHERE kind='lmcache_off' AND deployment_id=?1
+                   AND json_extract(payload_json,'$.instance_index')=?2
+                   AND json_extract(payload_json,'$.generation')=?3
+                   AND json_extract(payload_json,'$.binding_id')=?4
+                   AND json_extract(payload_json,'$.reason')=?5)",
+            params![
+                launch.deployment_id,
+                launch.instance_index,
+                launch.generation,
+                launch.binding_id,
+                reason.code()
+            ],
+            |r| r.get(0),
+        )?;
+        if recorded {
+            return Ok(false);
+        }
+        append_event(
+            &tx,
+            &EventMetadata::LmcacheOff {
+                deployment_id: launch.deployment_id.into(),
+                instance_index: launch.instance_index,
+                generation: launch.generation,
+                binding_id: launch.binding_id.into(),
+                host_id: launch.host_id.into(),
+                reason: reason.code().into(),
+                detail,
+            },
+        )
+        .map_err(|_| crate::StoreError::Conflict)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// ADR 0033 §3: journal that `launch`'s LMCache server exited while its
+    /// engine served, with a bounded, redacted `detail`.
+    pub fn record_lmcache_server_exited(
+        &self,
+        launch: &LmcacheLaunch<'_>,
+        detail: &str,
+    ) -> Result<(), crate::StoreError> {
+        if !launch.valid() {
+            return Err(crate::StoreError::Conflict);
+        }
+        let detail = match lmcache_detail(detail) {
+            detail if detail.is_empty() => "the LMCache server exited".to_owned(),
+            detail => detail,
+        };
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        append_event(
+            &tx,
+            &EventMetadata::LmcacheServerExited {
+                deployment_id: launch.deployment_id.into(),
+                instance_index: launch.instance_index,
+                generation: launch.generation,
+                binding_id: launch.binding_id.into(),
+                host_id: launch.host_id.into(),
+                detail,
             },
         )
         .map_err(|_| crate::StoreError::Conflict)?;
@@ -889,5 +1054,128 @@ mod tests {
             serialize_bounded(&oversized),
             Err(EventWriteError::PayloadTooLarge)
         ))
+    }
+
+    const DEPLOYMENT: &str = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
+
+    fn launch(binding_id: &str, generation: i64) -> LmcacheLaunch<'_> {
+        LmcacheLaunch {
+            deployment_id: DEPLOYMENT,
+            instance_index: 1,
+            generation,
+            binding_id,
+            host_id: "host-a",
+        }
+    }
+
+    fn lmcache_events(s: &Store) -> Vec<ManagementEvent> {
+        s.events_after(None, 100)
+            .unwrap()
+            .events
+            .into_iter()
+            .filter(|e| e.kind.starts_with("lmcache_"))
+            .collect()
+    }
+
+    #[test]
+    // T45 (ADR 0033 §§8, 9, 14): `lmcache_off` is journaled with the launch's
+    // identity and the reason, associated with the deployment; once per
+    // launch and reason. A new generation or binding, or another reason, is
+    // its own record.
+    fn lmcache_off_is_recorded_once_per_launch() {
+        use capyctl_config::lmcache::LmcacheOffReason as R;
+        let s = Store::open_in_memory().unwrap();
+        let first = launch("01BX5ZZKBKACTAV9WEVGEMMVS4", 3);
+        assert!(s
+            .record_lmcache_off(&first, R::NotInstalled, "no lmcache-*.dist-info")
+            .unwrap());
+        assert!(!s
+            .record_lmcache_off(&first, R::NotInstalled, "reported again")
+            .unwrap());
+        assert!(s
+            .record_lmcache_off(&first, R::EngineStartFailed, "")
+            .unwrap());
+        assert!(s
+            .record_lmcache_off(
+                &launch("01BX5ZZKBKACTAV9WEVGEMMVS5", 4),
+                R::NotInstalled,
+                ""
+            )
+            .unwrap());
+        let events = lmcache_events(&s);
+        assert_eq!(events.len(), 3);
+        let event = &events[0];
+        assert_eq!(event.kind, "lmcache_off");
+        assert_eq!(event.deployment_id.as_deref(), Some(DEPLOYMENT));
+        assert_eq!(event.operation_id, None);
+        let payload: serde_json::Value = serde_json::from_str(&event.payload_json).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({"version": "1", "deployment_id": DEPLOYMENT,
+                "instance_index": 1, "generation": 3,
+                "binding_id": "01BX5ZZKBKACTAV9WEVGEMMVS4", "host_id": "host-a",
+                "reason": "not_installed", "detail": "no lmcache-*.dist-info"})
+        );
+        // An empty detail is the reason's sentence.
+        let payload: serde_json::Value = serde_json::from_str(&events[1].payload_json).unwrap();
+        assert_eq!(payload["reason"], "engine_start_failed");
+        assert_eq!(payload["detail"], "the engine did not start with LMCache");
+    }
+
+    #[test]
+    // T45 (ADR 0033 §§3, 8; SPEC §13.3): the detail is bounded and redacted:
+    // URL credentials scrubbed, line breaks folded, at most 512 characters;
+    // a launch identity that is not well formed is refused.
+    fn lmcache_event_detail_is_bounded_and_redacted() {
+        use capyctl_config::lmcache::LmcacheOffReason as R;
+        let s = Store::open_in_memory().unwrap();
+        let binding = "01BX5ZZKBKACTAV9WEVGEMMVS4";
+        let detail = format!(
+            "engine log:\nfetch https://user:hunter2@example.org/x?sig=abc failed\n{}",
+            "é".repeat(600)
+        );
+        s.record_lmcache_server_exited(&launch(binding, 3), &detail)
+            .unwrap();
+        assert!(s
+            .record_lmcache_off(&launch(binding, 3), R::EngineStartFailed, &detail)
+            .unwrap());
+        for event in lmcache_events(&s) {
+            let payload: serde_json::Value = serde_json::from_str(&event.payload_json).unwrap();
+            let text = payload["detail"].as_str().unwrap();
+            assert!(
+                !text.contains("hunter2") && !text.contains("sig=abc"),
+                "{text}"
+            );
+            assert!(!text.contains('\n'), "{text}");
+            assert!(
+                text.starts_with("engine log: fetch https://<redacted>@example.org/x?<redacted>")
+            );
+            assert!(text.chars().count() <= MAX_LMCACHE_DETAIL_CHARS);
+        }
+        let events = lmcache_events(&s);
+        assert_eq!(events[0].kind, "lmcache_server_exited");
+        assert_eq!(events[0].deployment_id.as_deref(), Some(DEPLOYMENT));
+        s.record_lmcache_server_exited(&launch(binding, 3), "")
+            .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(&lmcache_events(&s)[2].payload_json).unwrap();
+        assert_eq!(payload["detail"], "the LMCache server exited");
+
+        for bad in [
+            LmcacheLaunch {
+                deployment_id: "not-a-ulid",
+                ..launch(binding, 3)
+            },
+            launch("bad binding", 3),
+            launch(binding, -1),
+            LmcacheLaunch {
+                host_id: "",
+                ..launch(binding, 3)
+            },
+        ] {
+            assert!(s.record_lmcache_off(&bad, R::HostOff, "").is_err());
+            assert!(s.record_lmcache_server_exited(&bad, "").is_err());
+        }
+        assert_eq!(lmcache_events(&s).len(), 3);
     }
 }

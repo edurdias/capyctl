@@ -18,7 +18,7 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 2 | `group_model_path_mismatch` | A SGLang group with `residency: deep` has the model at different paths on its machines; the message names both. | Put the model at the same path on every machine, or use `residency: restart_only`. |
 | 2 | `peer_address_missing` | A machine named in `placement.hosts` declares no peer address. | Set `resource_policy.groups.peer_address` (or `--peer-address`) on that machine and restart CapyCTL there. |
 | 2 | `peer_address_not_local` | The declared peer address is not on any network interface of that machine. | Declare an address the machine holds on its direct link. |
-| 2 | `engine_env_reserved:<name>` | An engine environment variable CapyCTL sets itself (for example `NCCL_*`, `GLOO_*`, `MASTER_*`, `VLLM_HOST_IP`, `CUDA_VISIBLE_DEVICES`). | Remove it; CapyCTL renders these names ([the full list](../operations/configuration.md#engine-environment)). |
+| 2 | `engine_env_reserved:<name>` | An engine environment variable CapyCTL sets itself (for example `NCCL_*`, `GLOO_*`, `MASTER_*`, `VLLM_HOST_IP`, `CUDA_VISIBLE_DEVICES`), or any `LMCACHE_*` variable, which LMCache would read as configuration. | Remove it; CapyCTL renders these names ([the full list](../operations/configuration.md#engine-environment)). |
 | 2 | `engine_env_not_approved:<name>` | A deployment sets an engine variable the engine profile does not approve (on some machine of a group). | Approve it with `capyctl engine add ... --approve-env <name>` on every machine, or remove it ([Engine variables](engines.md#engine-variables)). |
 | 2 | `engine_env_conflict:<name>` | The same variable is in the file and on the command line. | Give it one way only. |
 | 2 | `custom_field_unsupported:<field>` | A deployment on a custom engine states something the engine's manifest owns: `extra_args`, `accept_extra_args`, a tool-call or reasoning parser, `memory`, a draft model or a typed engine field such as `dtype` or `max_concurrent_requests`. | Remove it; a custom engine's deployment states only `engine_config.context_length` and `engine_config.env` ([Custom engines](engines.md#custom-engines)). |
@@ -48,6 +48,10 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 5 | `capability_missing:chat` | A chat deployment (no `api`, or `api: chat`) names a custom engine whose manifest says `api: decisions`. | Add `api: decisions` to the deployment, or use a chat engine. |
 | 5 | `host_capability_missing:decisions` | A machine runs a CapyCTL too old for decision models. | Upgrade CapyCTL on that machine. |
 | 5 | `host_capability_missing:custom_engines` | The deployment's engine is a custom engine and a machine it names runs a CapyCTL too old for custom engines. | Upgrade CapyCTL on that machine. |
+| 5 | `lmcache_unavailable:<reason>` | A deployment with `lmcache: required` cannot use LMCache, for the reason named after the colon ([LMCache](#lmcache) lists them). A reason known before anything starts (the machine's `lmcache: off`, the engine or its version, a missing or unsupported LMCache package, a `topology`, a parking residency not qualified, the deployment's own `--kv-transfer-config`) refuses it at deploy or start; one found when the launch runs (the launch-time check, the server's start, its listener check, the engine's start with LMCache) fails the launch, and nothing is left running. | Remove the reason ([LMCache](#lmcache) says how for each), or set `lmcache: auto`, which runs without LMCache where it cannot be used. |
+| 5 | `retention_zero:lmcache` | `lmcache: required` beside `retention: zero`, the deployment's own or that of a machine it names. Zero retention never runs LMCache. | Drop `lmcache: required` or the deployment's `retention: zero`, or place it on a machine without `retention: zero`. |
+| 5 | `host_capability_missing:lmcache` | A deployment with `lmcache: required` names a machine that runs a CapyCTL too old for LMCache. | Upgrade CapyCTL on that machine, or set `lmcache: auto` (it then runs there without LMCache). |
+| 5 | `host_capability_missing:retention` | A deployment with `retention: zero` names a machine that runs a CapyCTL too old to honour it. | Upgrade CapyCTL on that machine. |
 | 6 | `unreconciled` | CapyCTL cannot yet tell what an engine is doing, so it will not act on it. | Wait for the host to reconnect, then retry. |
 | 7 | `device_conflict` | Another deployment holds the GPU exclusively. | Stop that deployment or choose another device. |
 | 8 | `category_limit` | A host limit on how many models of this kind may run was reached. | Stop one, or raise the limit in the host document. |
@@ -154,6 +158,63 @@ For decision models:
   the engine's. Some custom engines answer every failure this way, an engine
   failure included: when a request you believe valid is rejected, read the
   instance's engine log ([Example: basal decision models](engines.md#example-basal-decision-models)).
+
+## LMCache
+
+`capyctl status deployment <name>` shows `LMCache   off: <why>` for an
+instance that runs without LMCache, with the reason in the JSON view, and the
+event `lmcache_off` (on `/management/v1/events`) records the instance, its
+launch and the reason once per launch. A deployment with `lmcache: auto` (the
+default) then runs as without LMCache; one with `lmcache: required` is refused
+or its launch fails with `lmcache_unavailable:<reason>` (exit 5). The reasons:
+
+- `disabled`: the deployment states `lmcache: off`.
+- `host_off`: the machine sets `lmcache: off`. Use another machine, or set it
+  back to `auto` there.
+- `retention_zero`: the deployment or the machine sets `retention: zero`
+  (`retention_zero:lmcache` under `required`).
+- `host_capability_missing`: the machine runs a CapyCTL too old for LMCache
+  (`host_capability_missing:lmcache` under `required`). Upgrade it.
+- `engine_unsupported`: llama.cpp, TensorFold or a custom engine, which have
+  no LMCache integration. Use vLLM or SGLang.
+- `engine_version_unsupported`: vLLM before 0.32.0 or SGLang before 0.5.22.
+  Register a newer engine.
+- `not_installed`: the engine's environment holds no LMCache. Install
+  LMCache 0.5.6 there and register the engine again with `capyctl engine add`.
+- `not_registered`: LMCache was installed after the engine was registered.
+  Register the engine again.
+- `version_unsupported`: LMCache below 0.5.6, or not a 0.5.x release.
+  Install 0.5.6 or a later 0.5.x release and register the engine again.
+- `check_failed`: the launch-time check of the LMCache installation found
+  something missing; the detail names it. Reinstall LMCache in the engine's
+  environment and register the engine again.
+- `group_unsupported`: the deployment has a `topology`; a group across
+  machines does not use LMCache.
+- `park_unqualified`: the deployment parks with `residency: deep` (or
+  `host_backed` on a discrete GPU) on an engine version, model and GPU not
+  qualified for LMCache. Use `residency: restart_only` to keep LMCache.
+- `kv_transfer_config_set`: the deployment passes its own
+  `--kv-transfer-config`; the engine takes one connector. Remove it to use
+  LMCache.
+- `server_start_failed`: the LMCache server did not answer within its start
+  bound; the engine started without it. Read the engine log.
+- `listener_exposed`: the LMCache server listened on an address other than
+  `127.0.0.1` or `::1`; CapyCTL stopped it and the engine started without it.
+- `engine_start_failed`: the engine did not start with LMCache; CapyCTL
+  started it once more without LMCache, and later launches of the same
+  revision on the same engine skip LMCache. The detail holds the end of the
+  engine log.
+
+The event `lmcache_server_exited` records that an instance's LMCache server
+exited while its engine served. The instance fails, CapyCTL stops its engine
+and recovers it with a new server, whose cache starts empty.
+
+LMCache settings a deployment or a machine cannot state are refused
+`invalid_config` (exit 2): an `lmcache_pool` that is not a whole number of GiB
+of at least 1 GiB or that sits beside `lmcache: off`; an LMCache
+`--kv-transfer-config`, `--enable-lmcache` or `--lmcache-*` in `extra_args`
+(CapyCTL renders these itself); on a machine, `retention: zero` with
+`engine_logs: files`, or an `lmcache` other than `auto` or `off`.
 
 ## Troubleshooting
 

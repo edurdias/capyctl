@@ -47,11 +47,31 @@ pub struct RemoteLaunchBinding {
     /// needs the host's `custom_engines`; a host without it is refused typed
     /// before anything is sent.
     pub custom_engine: bool,
+    /// ADR 0033 §13: the deployment states `lmcache: required`. Every
+    /// command of it then needs the host's `lmcache`; a host without it is
+    /// refused typed before anything is sent.
+    pub lmcache_required: bool,
+    /// ADR 0033 §§10, 13: the deployment states `retention: zero`. Every
+    /// command of it then needs the host's `retention`; a host without it
+    /// would not honour it, and is refused typed before anything is sent.
+    pub retention_zero: bool,
     /// ADR 0013 §5: the instance every command of this launch names, so the
     /// host fences it by that instance's own generation. Zero on a host that
     /// does not advertise per-instance fencing: its journal fences per
     /// deployment, and a nonzero index would not survive its digest check.
     pub instance_index: u32,
+}
+impl RemoteLaunchBinding {
+    /// ADR 0033 §13: the capabilities the deployment's declared `lmcache`
+    /// and `retention` need of the host.
+    fn lmcache_needs(&self, needs: &mut Vec<&'static str>) {
+        if self.lmcache_required {
+            needs.push(capabilities::LMCACHE);
+        }
+        if self.retention_zero {
+            needs.push(capabilities::RETENTION);
+        }
+    }
 }
 struct RemoteEngine {
     sessions: Arc<AgentSessions>,
@@ -314,6 +334,7 @@ impl RemoteEngine {
         if b.custom_engine {
             needs.push(capabilities::CUSTOM_ENGINES);
         }
+        b.lmcache_needs(&mut needs);
         self.sessions
             .preflight(&b.host_id, &needs, true)
             .map_err(RuntimeError::Refused)?;
@@ -499,6 +520,9 @@ impl EngineAdapter for RemoteEngine {
         if b.custom_engine {
             needs.push(capabilities::CUSTOM_ENGINES);
         }
+        // ADR 0033 §13: `lmcache: required` and `retention: zero` go only to
+        // a host that declared what honours them.
+        b.lmcache_needs(&mut needs);
         self.sessions
             .preflight(&b.host_id, &needs, true)
             .map_err(RuntimeError::Refused)?;
@@ -1229,6 +1253,12 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
                 // that declared it.
                 custom_engine: work.effective().profile.engine
                     == capyctl_config::engine_policy::Engine::Custom,
+                // ADR 0033 §13: `lmcache: required` and `retention: zero`
+                // go only to a host that declared what honours them.
+                lmcache_required: work.effective().lmcache
+                    == capyctl_config::lmcache::LmcacheMode::Required,
+                retention_zero: work.effective().retention
+                    == capyctl_config::lmcache::Retention::Zero,
             },
             self.readiness.clone(),
         ))
@@ -1449,6 +1479,8 @@ mod tests {
             device_memory: false,
             decisions: false,
             custom_engine: false,
+            lmcache_required: false,
+            retention_zero: false,
         }
     }
     fn observed(role: &str, pid: u32, presence: &str) -> pb::OwnedProcessObservation {

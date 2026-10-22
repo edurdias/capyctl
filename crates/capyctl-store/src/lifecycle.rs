@@ -403,6 +403,13 @@ pub enum LifecycleError {
     /// reconciled). Not a capacity refusal: releasing memory would not help.
     #[error("every allowed host is ineligible for placement")]
     HostIneligible,
+    /// ADR 0033 §§9, 10, 13 (ADR 0017): every allowed host refused the start
+    /// with the same feature gate, kept as its `<code>: ...` text
+    /// (`lmcache_unavailable:host_off: ...`, `retention_zero:lmcache: ...`,
+    /// `host_capability_missing:lmcache: ...`). Not a capacity refusal: the
+    /// deployment or the hosts must change.
+    #[error("{0}")]
+    PlacementRefused(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

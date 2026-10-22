@@ -1095,6 +1095,18 @@ fn store_shaped(kind: &str) -> (serde_json::Value, Option<String>, Option<String
             "receipt":"the engine's own counters read no running and no waiting request after the client hung up"}),
             (Some(DEP.to_owned()), None),
         ),
+        "lmcache_off" => (
+            serde_json::json!({"version":"1","deployment_id":DEP,"instance_index":0,
+            "generation":3,"binding_id":"01BX5ZZKBKACTAV9WEVGEMMVS4","host_id":"host-a",
+            "reason":"host_off","detail":"turned off on this host"}),
+            (Some(DEP.to_owned()), None),
+        ),
+        "lmcache_server_exited" => (
+            serde_json::json!({"version":"1","deployment_id":DEP,"instance_index":0,
+            "generation":3,"binding_id":"01BX5ZZKBKACTAV9WEVGEMMVS4","host_id":"host-a",
+            "detail":"the LMCache server exited"}),
+            (Some(DEP.to_owned()), None),
+        ),
         k if k.starts_with("switch_") => (
             serde_json::json!({"version":"1","phase":&k["switch_".len()..],
             "switch_id":"sw-1","target_deployment":DEP,"host":"host-a",
@@ -1158,5 +1170,102 @@ async fn every_store_event_kind_projects_through_the_events_stream() {
         assert_eq!(response.status(), 200, "{kind}");
         let text = next(&mut response.into_body().into_data_stream()).await;
         assert!(text.contains(&format!("event: {kind}\n")), "{kind}: {text}");
+    }
+}
+
+// T45 T37 (ADR 0033 §§3, 8, 9, 14): `lmcache_off` and `lmcache_server_exited`
+// recorded by the store reach `/management/v1/events` with their closed
+// fields, associated with the deployment; a launch's repeated `lmcache_off`
+// is one event.
+#[tokio::test]
+async fn lmcache_events_recorded_by_the_store_project_through_the_stream() {
+    use capyctl_config::lmcache::LmcacheOffReason;
+    const DEP: &str = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("events.sqlite")).unwrap();
+    let launch = capyctl_store::events::LmcacheLaunch {
+        deployment_id: DEP,
+        instance_index: 1,
+        generation: 3,
+        binding_id: "01BX5ZZKBKACTAV9WEVGEMMVS4",
+        host_id: "host-a",
+    };
+    assert!(store
+        .record_lmcache_off(
+            &launch,
+            LmcacheOffReason::ParkUnqualified,
+            "not qualified with deep park on 0.32.0 / qwen3 / GB10"
+        )
+        .unwrap());
+    assert!(!store
+        .record_lmcache_off(&launch, LmcacheOffReason::ParkUnqualified, "again")
+        .unwrap());
+    store
+        .record_lmcache_server_exited(&launch, "exited with status 1")
+        .unwrap();
+    let app = read_only_router(
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+        Arc::new(StoreSnapshotSource::new(store)),
+    );
+    let response = app
+        .oneshot(
+            request("/management/v1/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body().into_data_stream();
+    let data = |frame: &str| -> serde_json::Value {
+        let line = frame
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        serde_json::from_str(line).unwrap()
+    };
+    let frame = next(&mut body).await;
+    assert!(frame.contains("event: lmcache_off\n"), "{frame}");
+    let off = data(&frame);
+    assert_eq!(off["deployment_id"], DEP, "{off}");
+    assert_eq!(
+        off["payload"],
+        serde_json::json!({"deployment_id": DEP, "instance_index": "1", "generation": "3",
+            "binding_id": "01BX5ZZKBKACTAV9WEVGEMMVS4", "host_id": "host-a",
+            "reason": "park_unqualified",
+            "detail": "not qualified with deep park on 0.32.0 / qwen3 / GB10"}),
+    );
+    let frame = next(&mut body).await;
+    assert!(frame.contains("event: lmcache_server_exited\n"), "{frame}");
+    let exited = data(&frame);
+    assert_eq!(exited["payload"]["detail"], "exited with status 1");
+    assert_eq!(exited["payload"]["instance_index"], "1");
+}
+
+// T45 (ADR 0033 §14): an `lmcache_off` whose reason is not one of the closed
+// reasons is corruption, as any field outside its schema is; the shaped one
+// projects.
+#[tokio::test]
+async fn an_lmcache_off_with_an_unknown_reason_is_corruption() {
+    for (reason, status) in [("host_off", 200), ("disk_full", 500)] {
+        let (mut payload, deployment, operation) = store_shaped("lmcache_off");
+        payload["reason"] = reason.into();
+        let source = fake(move |_, _| {
+            let mut e = event(1);
+            e.kind = "lmcache_off".into();
+            e.payload_json = payload.to_string();
+            e.deployment_id = deployment.clone();
+            e.operation_id = operation.clone();
+            Ok(page(vec![e], 1))
+        });
+        let response = fake_app(source, options())
+            .oneshot(
+                request("/management/v1/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{reason}");
     }
 }

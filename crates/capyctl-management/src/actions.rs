@@ -862,6 +862,17 @@ fn command_failure(error: CoordinatorCommandError) -> ConfigurationFailure {
             // ADR 0008.
             LifecycleError::ModelSourcePending => F::ModelSourcePending,
             LifecycleError::ModelSourceFailed => F::ModelSourceFailed,
+            // ADR 0033 §§9, 10, 13: the gate's code leads the reason, as the
+            // deploy-time refusal of the same host gives it, so the CLI shows
+            // it with its exit.
+            LifecycleError::PlacementRefused(reason) => F::InvalidConfigReason {
+                path: if reason.starts_with(capyctl_config::lmcache::MISSING_RETENTION) {
+                    "retention".into()
+                } else {
+                    "lmcache".into()
+                },
+                reason,
+            },
         },
     }
 }

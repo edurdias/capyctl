@@ -221,6 +221,212 @@ impl std::fmt::Display for LmcacheOffReason {
     }
 }
 
+/// ADR 0033 §13 (ADR 0017): the host capability a host implementing this
+/// ADR declares. `capyctl_protocol::capabilities::LMCACHE` is this name.
+pub const CAPABILITY: &str = "lmcache";
+/// ADR 0033 §§10, 13: the host capability that says the host honours a
+/// deployment's `retention: zero`. `capyctl_protocol::capabilities::RETENTION`
+/// is this name.
+pub const RETENTION_CAPABILITY: &str = "retention";
+
+/// ADR 0033 §§9, 14: `lmcache: required` on a host whose `lmcache` is `off`.
+pub const REFUSED_HOST_OFF: &str = "lmcache_unavailable:host_off";
+/// ADR 0033 §§10, 14: `lmcache: required` where the host or the deployment
+/// has `retention: zero`.
+pub const REFUSED_RETENTION_ZERO: &str = "retention_zero:lmcache";
+/// ADR 0033 §§13, 14: `lmcache: required` on a host that did not declare
+/// `lmcache`.
+pub const MISSING_LMCACHE: &str = "host_capability_missing:lmcache";
+/// ADR 0033 §§10, 13, 14: `retention: zero` on a host that did not declare
+/// `retention`, which would not honour it.
+pub const MISSING_RETENTION: &str = "host_capability_missing:retention";
+/// Every closed code [`placement_refusal`] returns.
+pub const PLACEMENT_REFUSALS: [&str; 4] = [
+    REFUSED_HOST_OFF,
+    REFUSED_RETENTION_ZERO,
+    MISSING_LMCACHE,
+    MISSING_RETENTION,
+];
+
+/// ADR 0033 §§9, 10: a deployment document's declared `lmcache` and
+/// `retention` (at its root), `auto` and `standard` when not stated. Read
+/// defensively: a validated document never holds another value, and a
+/// value this build does not know grants nothing beyond the default.
+pub fn deployment_settings(document: &serde_json::Value) -> (LmcacheMode, Retention) {
+    (
+        LmcacheMode::deserialize(&document["lmcache"]).unwrap_or_default(),
+        Retention::deserialize(&document["retention"]).unwrap_or_default(),
+    )
+}
+
+/// ADR 0033 §§9, 10, 13: why a host may not take a deployment with these
+/// declared settings, before anything is sent to it, or `None` when it may.
+/// `declared` answers whether the host declared a capability (ADR 0017).
+///
+/// It is [`LmcachePlan::refusal`] for what the host alone decides (its
+/// `lmcache`, its `retention`, its capabilities), judged on a profile that
+/// could run LMCache: what the deployment and its profile decide is
+/// resolution's ([`deployment_refusal`]). The answer is one of
+/// [`PLACEMENT_REFUSALS`].
+pub fn placement_refusal(
+    mode: LmcacheMode,
+    retention: Retention,
+    host_lmcache: HostLmcache,
+    host_retention: Retention,
+    declared: impl Fn(&str) -> bool,
+) -> Option<&'static str> {
+    let registration = LmcacheRegistration::new(
+        "0.5.6",
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    );
+    let inputs = PlanInputs {
+        mode,
+        retention,
+        host_lmcache,
+        host_retention,
+        host_declares_lmcache: declared(CAPABILITY),
+        host_declares_retention: declared(RETENTION_CAPABILITY),
+        registration: Some(&registration),
+        ..PlanInputs::for_profile(Engine::Vllm, "0.32.0", Residency::RestartOnly)
+    };
+    let code = plan(&inputs).refusal()?;
+    PLACEMENT_REFUSALS.into_iter().find(|known| *known == code)
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use serde_json::json;
+
+    // T45 T36 (ADR 0033 §§9, 10, 13): every placement refusal, in the order
+    // the reasons apply, and none for what a host can run as declared.
+    #[test]
+    fn placement_refuses_required_and_zero_retention_where_they_cannot_run() {
+        use HostLmcache as H;
+        use LmcacheMode as M;
+        use Retention as R;
+        let every = |_: &str| true;
+        let none = |_: &str| false;
+        let without_lmcache = |name: &str| name != CAPABILITY;
+        let cases = [
+            (
+                M::Required,
+                R::Standard,
+                H::Auto,
+                R::Standard,
+                &every as &dyn Fn(&str) -> bool,
+                None,
+            ),
+            (
+                M::Required,
+                R::Zero,
+                H::Auto,
+                R::Standard,
+                &every,
+                Some(REFUSED_RETENTION_ZERO),
+            ),
+            (
+                M::Required,
+                R::Standard,
+                H::Auto,
+                R::Zero,
+                &every,
+                Some(REFUSED_RETENTION_ZERO),
+            ),
+            (
+                M::Required,
+                R::Standard,
+                H::Off,
+                R::Zero,
+                &every,
+                Some(REFUSED_RETENTION_ZERO),
+            ),
+            (
+                M::Required,
+                R::Standard,
+                H::Off,
+                R::Standard,
+                &every,
+                Some(REFUSED_HOST_OFF),
+            ),
+            (
+                M::Required,
+                R::Standard,
+                H::Off,
+                R::Standard,
+                &none,
+                Some(REFUSED_HOST_OFF),
+            ),
+            (
+                M::Required,
+                R::Standard,
+                H::Auto,
+                R::Standard,
+                &without_lmcache,
+                Some(MISSING_LMCACHE),
+            ),
+            (
+                M::Required,
+                R::Standard,
+                H::Auto,
+                R::Standard,
+                &none,
+                Some(MISSING_LMCACHE),
+            ),
+            (M::Auto, R::Standard, H::Off, R::Zero, &none, None),
+            (M::Off, R::Standard, H::Auto, R::Standard, &none, None),
+            (
+                M::Auto,
+                R::Zero,
+                H::Auto,
+                R::Standard,
+                &none,
+                Some(MISSING_RETENTION),
+            ),
+            (M::Off, R::Zero, H::Off, R::Standard, &without_lmcache, None),
+            (M::Auto, R::Zero, H::Auto, R::Standard, &every, None),
+        ];
+        for (mode, retention, host_lmcache, host_retention, declared, expected) in cases {
+            assert_eq!(
+                placement_refusal(mode, retention, host_lmcache, host_retention, declared),
+                expected,
+                "{mode:?} {retention:?} on {host_lmcache:?} {host_retention:?}"
+            );
+        }
+        // The codes are the ones the reasons give under `required` (§14).
+        assert_eq!(
+            REFUSED_HOST_OFF,
+            LmcacheOffReason::HostOff.required_refusal()
+        );
+        assert_eq!(
+            REFUSED_RETENTION_ZERO,
+            LmcacheOffReason::RetentionZero.required_refusal()
+        );
+        assert_eq!(
+            MISSING_LMCACHE,
+            LmcacheOffReason::HostCapabilityMissing.required_refusal()
+        );
+    }
+
+    // T45 (ADR 0033 §§9, 10): a deployment document's settings read from its
+    // root, with the defaults when absent or not a value this build knows.
+    #[test]
+    fn deployment_settings_are_read_from_the_document_root_with_defaults() {
+        assert_eq!(
+            deployment_settings(&json!({"lmcache": "required", "retention": "zero"})),
+            (LmcacheMode::Required, Retention::Zero)
+        );
+        assert_eq!(
+            deployment_settings(&json!({"model": {}})),
+            (LmcacheMode::Auto, Retention::Standard)
+        );
+        assert_eq!(
+            deployment_settings(&json!({"lmcache": "sometimes", "retention": 3})),
+            (LmcacheMode::Auto, Retention::Standard)
+        );
+    }
+}
+
 /// ADR 0033 §6: the L1 pool of an instance, by default.
 pub const DEFAULT_POOL_GIB: u64 = 4;
 pub const GIB: u64 = 1 << 30;
