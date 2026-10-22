@@ -30,6 +30,9 @@ pub mod ingress_identity;
 // ADR 0008 (owner decision 2026-09-23): installation fingerprints and
 // launch-time capability probes, instead of pinned hashes.
 pub mod installation;
+// ADR 0033 §1: LMCache in an engine environment, measured for `engine add`
+// and checked by shape at launch, executing nothing.
+pub mod lmcache_install;
 // ADR 0018 §1: resolving a named engine installation and its bounded
 // version check.
 pub mod engines;

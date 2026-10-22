@@ -597,6 +597,9 @@ pub struct ProfileSpec {
     /// `engine_config.trust_remote_code: true` and run the Python a checkpoint
     /// ships (`--allow-remote-code`), written as `security.trust_remote_code`.
     pub trust_remote_code: bool,
+    /// ADR 0033 §1: the LMCache found in the registered environment, written
+    /// as `lmcache: {version, digest}` only when found.
+    pub lmcache: Option<crate::lmcache::LmcacheRegistration>,
 }
 
 /// ADR 0014 §8: `security.approved_options` and `security.approved_paths`,
@@ -679,6 +682,13 @@ pub fn profile_document(spec: &ProfileSpec) -> Value {
     });
     if let Some(cuda_home) = &spec.cuda_home {
         profile["cuda_home"] = cuda_home.to_string_lossy().into();
+    }
+    // ADR 0033 §1: absent when no LMCache was found, so such a profile is unchanged.
+    if let Some(lmcache) = &spec.lmcache {
+        profile["lmcache"] = serde_json::json!({
+            "version": lmcache.version,
+            "digest": lmcache.digest,
+        });
     }
     profile
 }

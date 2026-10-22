@@ -1196,6 +1196,11 @@ struct RawProfile {
     /// ADR 0031 §1: the copied manifest and its digest, a custom engine's only.
     #[serde(default)]
     custom: Option<serde_json::Value>,
+    /// ADR 0033 §1: the LMCache `engine add` registered. The config slice
+    /// carries it into the normalized and runtime profiles.
+    #[serde(default)]
+    #[allow(dead_code)]
+    lmcache: Option<crate::lmcache::LmcacheRegistration>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

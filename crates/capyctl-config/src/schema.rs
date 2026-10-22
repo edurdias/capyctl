@@ -423,6 +423,11 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             "log_policy",
             FieldSpec::Struct(&[("max_file_bytes", BYTES), ("retained_files", SCALAR)]),
         ),
+        // ADR 0033 §1: the LMCache `engine add` registered.
+        (
+            "lmcache",
+            FieldSpec::Struct(&[("version", SCALAR), ("digest", SCALAR)]),
+        ),
     ]);
     // ADR 0031 §2: the manifest as a profile carries it; its own validation
     // (placeholders, paths, the idle signal) runs at resolution.

@@ -819,6 +819,7 @@ fn engines(value: &Value) -> String {
                 text(&e["version"]),
                 text(&e["custom"]),
                 text(&e["deep_park"]),
+                lmcache_cell(&e["lmcache"]),
                 // ADR 0031 §6, §7: a custom engine's idle signal and engine key.
                 text(&e["idle_signal"]),
                 text(&e["engine_key"]),
@@ -835,6 +836,7 @@ fn engines(value: &Value) -> String {
             "VERSION",
             "CUSTOM",
             "DEEP PARK",
+            "LMCACHE",
             "IDLE SIGNAL",
             "ENGINE KEY",
             "STATE",
@@ -842,6 +844,19 @@ fn engines(value: &Value) -> String {
         ],
         &rows,
     )
+}
+
+/// ADR 0033 §9: the registered LMCache version, or `off (<reason>)`; `-`
+/// where a row carries no LMCache view (a server older than 0.1.7).
+fn lmcache_cell(view: &Value) -> String {
+    match view["state"].as_str() {
+        Some("on") => text(&view["version"]),
+        Some("off") => format!(
+            "off ({})",
+            clean(view["reason"].as_str().unwrap_or("unknown"))
+        ),
+        _ => "-".into(),
+    }
 }
 
 fn local_engines(value: &Value) -> String {
@@ -857,6 +872,7 @@ fn local_engines(value: &Value) -> String {
                 text(&e["version"]),
                 text(&e["custom"]),
                 text(&e["deep_park"]),
+                lmcache_cell(&e["lmcache"]),
                 // ADR 0031 §6, §7: a custom engine's idle signal and engine key.
                 text(&e["idle_signal"]),
                 text(&e["engine_key"]),
@@ -873,6 +889,7 @@ fn local_engines(value: &Value) -> String {
             "VERSION",
             "CUSTOM",
             "DEEP PARK",
+            "LMCACHE",
             "IDLE SIGNAL",
             "ENGINE KEY",
             "PUBLISHED",
@@ -1464,18 +1481,22 @@ mod tests {
             View::Engines,
             &json!({"engines": [{"host_id": "01HOSTA", "host": "gpu-a", "online": true,
                 "profile": "vllm", "engine": "vllm", "version": "0.11.0", "custom": false,
-                "deep_park": "enabled", "retiring": false, "deployments": ["chat"]}]}),
+                "deep_park": "enabled", "retiring": false, "deployments": ["chat"],
+                "lmcache": {"state": "off", "reason": "engine_version_unsupported",
+                    "detail": "LMCache needs vLLM 0.32.0 or newer"}}]}),
             &HostNames::new(),
         );
+        // ADR 0033 §9: `LMCACHE` is the version or `off (<reason>)`.
         assert_eq!(
             out.lines().nth(1).unwrap(),
-            "gpu-a   vllm      vllm     0.11.0    no       enabled     -             -            online   chat"
+            "gpu-a   vllm      vllm     0.11.0    no       enabled     off (engine_version_unsupported)   -             -            online   chat"
         );
         let local = render(
             View::LocalEngines,
             &json!({"engines": [{"profile": "local-vllm", "source": "environment",
                 "engine": "vllm", "version": "0.11.0", "custom": true,
-                "deep_park": null, "published": "published", "deployments": []}]}),
+                "deep_park": null, "published": "published", "deployments": [],
+                "lmcache": {"state": "on", "version": "0.5.6", "drift": false}}]}),
             &HostNames::new(),
         );
         assert!(local
@@ -1487,7 +1508,7 @@ mod tests {
             .lines()
             .nth(1)
             .unwrap()
-            .ends_with("yes      -           -             -            published   -"));
+            .ends_with("yes      -           0.5.6     -             -            published   -"));
     }
 
     // T44 T37 (ADR 0031 §6, §7): a custom engine's row shows `CUSTOM yes`,
@@ -1500,12 +1521,14 @@ mod tests {
             &json!({"engines": [{"profile": "basal", "source": "custom-engines.yaml",
                 "engine": "custom", "version": "2.2.0", "custom": true,
                 "deep_park": "disabled", "idle_signal": "none", "engine_key": "none",
-                "published": "published", "deployments": []}]}),
+                "published": "published", "deployments": [],
+                "lmcache": {"state": "off", "reason": "engine_unsupported",
+                    "detail": "CapyCTL does not render options for a custom engine"}}]}),
             &HostNames::new(),
         );
         let row = local.lines().nth(1).unwrap();
         assert!(
-            row.starts_with("basal     custom-engines.yaml   custom   2.2.0     yes      disabled    none          none"),
+            row.starts_with("basal     custom-engines.yaml   custom   2.2.0     yes      disabled    off (engine_unsupported)   none          none"),
             "{local}"
         );
         let server = render(
