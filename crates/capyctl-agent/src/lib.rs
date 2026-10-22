@@ -33,6 +33,9 @@ pub mod installation;
 // ADR 0033 §1: LMCache in an engine environment, measured for `engine add`
 // and checked by shape at launch, executing nothing.
 pub mod lmcache_install;
+// ADR 0033 §4: per-launch private LMCache directories (SGLang's connector
+// configuration), removed on gone evidence and swept at role start.
+pub mod lmcache_dir;
 // ADR 0018 §1: resolving a named engine installation and its bounded
 // version check.
 pub mod engines;

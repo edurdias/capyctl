@@ -232,10 +232,14 @@ impl NativeHostExecution {
         // a custom engine's load is its manifest's idle signal, never a
         // built-in family's `/metrics`; each ingress entry carries the signal
         // frozen with its launch (`Ingress::bind_handle`).
-        let load = crate::load::LoadReporter::new(ingress.clone(), host_id.clone())
-            .and_then(|reporter| reporter.with_interval(config.load_report_interval))
-            .ok()
-            .map(Arc::new);
+        // ADR 0033 §12: and each Ready or parked launch's LMCache server.
+        let load = crate::load::LoadReporter::new(
+            crate::load::HostLoad::new(ingress.clone(), journal.clone()),
+            host_id.clone(),
+        )
+        .and_then(|reporter| reporter.with_interval(config.load_report_interval))
+        .ok()
+        .map(Arc::new);
         // ADR 0008: the store and policy come from this host's own approved
         // document; token references resolve from `<state_dir>/secrets`.
         let sources = capyctl_config::remote_resources::local_host_document(&config.document)
@@ -1542,12 +1546,21 @@ impl NativeHostExecution {
         let served = effective.routes.first().cloned().ok_or(SessionError)?;
         let group = self.group_args(command).map_err(|_| SessionError)?;
         let prepared = self.prepare(&effective, plan, &served, group)?;
+        // ADR 0033 §10: under the host's or the deployment's zero retention
+        // every process of the launch starts with RLIMIT_CORE 0 and keeps its
+        // output in memory.
+        let retention_zero = effective.retention == capyctl_config::lmcache::Retention::Zero
+            || effective.host.retention == capyctl_config::lmcache::Retention::Zero;
         let tools = self
             .journal
             .launch_tools(
                 ticket,
                 capyctl_protocol::now_unix_ms(),
                 Arc::new(self.clone()),
+                capyctl_launchers::SpawnPolicy {
+                    no_core_dumps: retention_zero,
+                    memory_logs: retention_zero,
+                },
             )
             .map_err(|_| SessionError)?;
         let adapter =
@@ -4341,7 +4354,7 @@ mod tests {
         };
         let tools = executor
             .journal
-            .launch_tools(ticket, now, sleeper.clone())
+            .launch_tools(ticket, now, sleeper.clone(), Default::default())
             .unwrap();
         let command = sleeper.render_launch(&launch).unwrap().command;
         let api = tools.spawn_durable(&plan.incarnation, &command).unwrap();

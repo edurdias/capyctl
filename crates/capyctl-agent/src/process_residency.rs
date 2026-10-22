@@ -209,6 +209,56 @@ fn run_nvidia_smi() -> Option<String> {
     status.success().then_some(text)
 }
 
+/// ADR 0033 §6 (lifecycle design §7): the resident memory of a launch's
+/// LMCache server group: `RssAnon` plus `RssShmem` of each of its recorded
+/// processes still alive (same boot, same start ticks), summed. `None` when
+/// the server's `lmcache` leader is not alive or a live member cannot be
+/// read: unknown, never zero.
+pub fn group_resident_bytes(group: &[capyctl_domain::completion::ProcessIdentity]) -> Option<u64> {
+    let boot = boot_id()?;
+    let alive = |identity: &capyctl_domain::completion::ProcessIdentity| {
+        identity.boot_id == boot && start_ticks(identity.pid) == Some(identity.start_ticks)
+    };
+    if !group.iter().any(|identity| {
+        identity.role == capyctl_domain::completion::LMCACHE_ROLE && alive(identity)
+    }) {
+        return None;
+    }
+    group
+        .iter()
+        .filter(|identity| alive(identity))
+        .try_fold(0_u64, |sum, identity| {
+            let bytes = u64::try_from(anonymous_resident_bytes(identity.pid)?).ok()?;
+            sum.checked_add(bytes)
+        })
+}
+
+/// ADR 0033 §6: the GPU memory `sample` attributes to the processes of
+/// `group` (matched by pid, boot and start ticks), summed. `None` when the
+/// sample names none of them: unknown, never zero.
+pub fn group_device_bytes(
+    sample: &[ProcessResident],
+    group: &[capyctl_domain::completion::ProcessIdentity],
+) -> Option<u64> {
+    let matched: Vec<i64> = sample
+        .iter()
+        .filter(|resident| {
+            group.iter().any(|identity| {
+                identity.pid == resident.pid
+                    && identity.boot_id == resident.boot_id
+                    && identity.start_ticks == resident.start_ticks
+            })
+        })
+        .map(|resident| resident.device_bytes)
+        .collect();
+    if matched.is_empty() {
+        return None;
+    }
+    matched.into_iter().try_fold(0_u64, |sum, bytes| {
+        sum.checked_add(u64::try_from(bytes).ok()?)
+    })
+}
+
 fn boot_id() -> Option<String> {
     let raw = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
     let boot = raw.trim();

@@ -39,7 +39,10 @@ pub struct ExitedLaunch {
 /// because it is the one this host's launcher reaps and so knows the status of.
 /// ADR 0028 §11: a group worker's launch is watched from its Launch on, and
 /// its exit is reported under the member's own roles (`worker-<r>`), the ones
-/// its Launch reported and the controller recorded.
+/// its Launch reported and the controller recorded. ADR 0033 §§3, 5: a
+/// launch's LMCache server (its `lmcache` leader) is watched too, Ready and
+/// parked (a restart-parked launch is its server alone); its exit is reported
+/// under the server's role, after any engine exit.
 pub fn scan(journal: &Arc<HostJournal>, host_id: &str, now_ms: i64) -> Vec<ExitedLaunch> {
     let Ok(ready) = journal.ready_launches() else {
         return Vec::new();
@@ -48,9 +51,15 @@ pub fn scan(journal: &Arc<HostJournal>, host_id: &str, now_ms: i64) -> Vec<Exite
     for (command, group) in ready {
         // ADR 0027: a helper (an idle compile worker) exits on its own; only
         // the engine's own processes are watched. Terminate still ends helpers.
-        let mut group = capyctl_domain::completion::engine_members(&group);
-        group.sort_by_key(|p| (p.role != "api", p.role.clone(), p.pid));
-        let Some(process) = group
+        let mut watched = capyctl_domain::completion::engine_members(&group);
+        watched.sort_by_key(|p| (p.role != "api", p.role.clone(), p.pid));
+        watched.extend(
+            group
+                .iter()
+                .filter(|p| p.role == capyctl_domain::completion::LMCACHE_ROLE)
+                .cloned(),
+        );
+        let Some(process) = watched
             .iter()
             .find(|p| capyctl_launchers::process_absence::exit_observed(p))
         else {

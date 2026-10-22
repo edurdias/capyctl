@@ -591,7 +591,9 @@ fn adapter_launch_tools_preserve_gate_ownership_and_disconnect_fence() {
     let s = j.connect().unwrap();
     let c = launch("adapter-launch");
     let ticket = fresh(j.accept(s, &c, 10, policy.as_ref()).unwrap());
-    let tools = j.launch_tools(ticket, 10, policy.clone()).unwrap();
+    let tools = j
+        .launch_tools(ticket, 10, policy.clone(), Default::default())
+        .unwrap();
     let rendered = policy.render_launch(&c).unwrap();
     let api = tools
         .spawn_durable(
@@ -615,7 +617,9 @@ fn adapter_launch_tools_preserve_gate_ownership_and_disconnect_fence() {
     stop(&j, s, "adapter-launch", policy.as_ref());
     let c = launch("fenced-adapter");
     let ticket = fresh(j.accept(s, &c, 10, policy.as_ref()).unwrap());
-    let tools = j.launch_tools(ticket, 10, policy.clone()).unwrap();
+    let tools = j
+        .launch_tools(ticket, 10, policy.clone(), Default::default())
+        .unwrap();
     j.disconnect(s).unwrap();
     assert!(tools
         .spawn_durable("fenced-adapter", &rendered.command)
@@ -655,7 +659,9 @@ fn a_claimed_launchs_running_child_keeps_a_build_lock() {
     let s = j.connect().unwrap();
     let c = launch("building");
     let ticket = fresh(j.accept(s, &c, 10, policy.as_ref()).unwrap());
-    let tools = j.launch_tools(ticket, 10, policy.clone()).unwrap();
+    let tools = j
+        .launch_tools(ticket, 10, policy.clone(), Default::default())
+        .unwrap();
     let rendered = policy.render_launch(&c).unwrap();
     let incarnation = &c.action.launch_plan().unwrap().incarnation;
     let api = tools.spawn_durable(incarnation, &rendered.command).unwrap();
@@ -728,7 +734,9 @@ async fn native_result_replay_retains_probe_timestamp_and_rejects_forged_identit
     let c = sign(c);
     let policy = std::sync::Arc::new(Workers);
     let ticket = fresh(journal.accept(session, &c, 10, policy.as_ref()).unwrap());
-    let tools = journal.launch_tools(ticket, 10, policy.clone()).unwrap();
+    let tools = journal
+        .launch_tools(ticket, 10, policy.clone(), Default::default())
+        .unwrap();
     let api = tools
         .spawn_durable(&incarnation, &policy.render_launch(&c).unwrap().command)
         .unwrap();
@@ -884,7 +892,9 @@ fn terminate_settles_a_launch_that_never_released_a_process() {
     // Attempted, with launch tools in hand but no spawn yet.
     let c = launch("attempted");
     let ticket = fresh(j.accept(s, &c, 10, policy.as_ref()).unwrap());
-    let tools = j.launch_tools(ticket, 10, policy.clone()).unwrap();
+    let tools = j
+        .launch_tools(ticket, 10, policy.clone(), Default::default())
+        .unwrap();
     let ticket = fresh(
         j.accept(
             s,

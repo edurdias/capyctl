@@ -652,6 +652,10 @@ async fn connect_once(
     // SPEC §10, D9: load reports start once the session is reconciled and
     // stop with it. They are routing hints: a full queue skips a tick.
     let (load_ready, mut load_gate) = watch::channel(false);
+    // ADR 0033 §12, ADR 0017: LMCache samples go only to a server whose
+    // SessionReady lists `lmcache`; an older one would refuse a report left
+    // with no load sample.
+    let server_lmcache = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // SPEC §13.2 (W13): owned engine exits, reported promptly once the session
     // is reconciled and repeated while they stand; they stop with the session.
     let mut exit_gate = load_ready.subscribe();
@@ -692,6 +696,7 @@ async fn connect_once(
     });
     let _load = execution.clone().map(|execution| {
         let reports = reports.clone();
+        let server_lmcache = server_lmcache.clone();
         Producer(tokio::spawn(async move {
             if load_gate.wait_for(|ready| *ready).await.is_err() {
                 return Ok(());
@@ -707,7 +712,14 @@ async fn connect_once(
                 let Some(sampled) = execution.load_reports() else {
                     return Ok(());
                 };
-                for report in sampled.await {
+                let lmcache = server_lmcache.load(std::sync::atomic::Ordering::Acquire);
+                for mut report in sampled.await {
+                    if !lmcache {
+                        report.lmcache.clear();
+                    }
+                    if report.samples.is_empty() && report.lmcache.is_empty() {
+                        continue;
+                    }
                     match reports.try_send(frame(agent_to_server::Msg::ReportLoad(report))) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => break,
@@ -874,6 +886,13 @@ async fn connect_once(
                     beat = tokio::time::interval(period);
                     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 }
+                server_lmcache.store(
+                    ready
+                        .capabilities
+                        .iter()
+                        .any(|name| name == capyctl_protocol::capabilities::LMCACHE),
+                    std::sync::atomic::Ordering::Release,
+                );
                 let _ = load_ready.send(true);
                 if let Some(drain) = &drain {
                     drain.connected.send_replace(true);
