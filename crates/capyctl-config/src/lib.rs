@@ -28,6 +28,8 @@ pub mod groups_policy;
 pub mod instances;
 // ADR 0029: llama.cpp's registration constants and its `--version` line.
 pub mod llamacpp;
+// ADR 0033: LMCache, a private KV cache server per deployment instance.
+pub mod lmcache;
 // ADR 0019, design §9: the one-time move of the old loopback inference bind.
 // ADR 0008: declared model sources and the host's model-source policy.
 pub mod model_source;
