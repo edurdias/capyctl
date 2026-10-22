@@ -161,7 +161,7 @@ impl RemoteEvidenceObserver for OwnershipObserver {
             .map_err(|_| tonic::Status::internal("ownership unavailable"))?;
         owner
             .store()
-            .record_api_identity(
+            .record_launch_identity(
                 owner.session(),
                 &capyctl_store::lifecycle::DeploymentFence {
                     deployment_id: command.identity.deployment_id.clone(),

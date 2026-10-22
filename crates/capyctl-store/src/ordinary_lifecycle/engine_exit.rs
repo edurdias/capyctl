@@ -38,6 +38,12 @@ pub struct ExitedLaunch {
     /// ADR 0028 §11: the rank of the group member that exited, when the
     /// launch is a group's; `None` for a single-host launch.
     pub group_rank: Option<u32>,
+    /// ADR 0033 §3 (lifecycle design §5): the process that exited was the
+    /// launch's LMCache server (`lmcache_server_exited` is journaled).
+    pub lmcache_server: bool,
+    /// The instance was parked (a restart-park whose server exited): it is
+    /// released like an idle stop rather than failed.
+    pub parked: bool,
 }
 
 /// Which evidence source is reporting.
@@ -147,12 +153,30 @@ impl crate::Store {
                     })
                     .collect()
             }
-            None => members(&association.identities)?,
+            None => members(association.held())?,
         };
         // ADR 0027: a helper's exit is not the engine's. Cleanup still proves
         // it gone with the rest of the recorded group.
         if exit.process.is_helper() || !recorded.contains(&exit.process) {
             return Ok(None);
+        }
+        // ADR 0033 §3 (lifecycle design §5): the LMCache server's exit, while
+        // the instance serves or while it is parked, fails it the same way.
+        let parked: bool = tx.query_row(
+            "SELECT observed_state='parked' FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2",
+            params![p.deployment_id, p.instance_index],
+            |r| r.get(0),
+        )?;
+        let lmcache_server = exit.process.is_lmcache();
+        if lmcache_server {
+            super::lmcache::server_exited(
+                &tx,
+                &p.binding_id,
+                &format!(
+                    "the LMCache server process {} ({}) exited ({})",
+                    exit.process.pid, exit.process.role, exit.status
+                ),
+            )?;
         }
         // SPEC §13.2: dispatch to this incarnation closes before anything else;
         // ownership, the reservation and request leases all stay.
@@ -214,6 +238,8 @@ impl crate::Store {
             binding_id: p.binding_id,
             first,
             group_rank: member.map(|(_, rank, _)| rank),
+            lmcache_server,
+            parked,
         }))
     }
 }

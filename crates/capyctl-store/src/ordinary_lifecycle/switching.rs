@@ -1996,11 +1996,11 @@ fn plan_start_in(
             let (raw, _) = frozen_on_device(tx, target, revision, Some(&host), device.as_deref())?;
             let e =
                 decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
-            assumed.charges.push((
-                host,
-                instance_owner_id(target, k),
-                super::startup::steady(&e),
-            ));
+            // ADR 0033 §6: with the LMCache charge a start there is granted.
+            let steady = super::startup::prospective_steady(tx, target, revision, &host, &e)?;
+            assumed
+                .charges
+                .push((host, instance_owner_id(target, k), steady));
         }
     }
     // Rule 5 over the whole start: a deployment losing several instances to

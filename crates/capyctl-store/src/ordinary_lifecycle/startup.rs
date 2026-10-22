@@ -306,29 +306,80 @@ fn with_startup(
 }
 
 /// The cold (startup) footprint a start reserves from arm until Ready.
-pub(super) fn cold(p: &Plan, e: &EffectiveDeployment) -> PhaseFootprint {
-    with_startup(e, p.startup_bytes, &p.startup_domains)
+/// ADR 0033 §6 (lifecycle design §7): with the LMCache charge it was granted,
+/// laid over after the startup peak so a measured engine peak never drops it.
+pub(super) fn cold(
+    conn: &rusqlite::Connection,
+    p: &Plan,
+    e: &EffectiveDeployment,
+) -> Result<PhaseFootprint, LifecycleError> {
+    super::lmcache::charged(
+        conn,
+        &p.binding_id,
+        e,
+        with_startup(e, p.startup_bytes, &p.startup_domains),
+        super::lmcache::Charged::Planned,
+    )
 }
 
 /// The startup footprint an instance of this revision would reserve if it were
-/// accepted now (placement judges it before any plan exists), and whether it
-/// is a solo first start that needs the whole host.
+/// accepted now on `host` (placement judges it before any plan exists), and
+/// whether it is a solo first start that needs the whole host. ADR 0033 §6:
+/// with the LMCache charge a start there would be granted.
 pub(super) fn startup_footprint(
     tx: &Transaction<'_>,
     deployment_id: &str,
     revision: i64,
+    host: &str,
     e: &EffectiveDeployment,
 ) -> Result<(PhaseFootprint, bool), LifecycleError> {
     let frozen = frozen_plan_startup(tx, deployment_id, revision, e)?;
     Ok((
-        with_startup(e, frozen.bytes, &frozen.domains),
+        super::lmcache::prospective(
+            tx,
+            deployment_id,
+            revision,
+            host,
+            e,
+            with_startup(e, frozen.bytes, &frozen.domains),
+        )?,
         frozen.whole_host,
     ))
 }
 
-/// The footprint a launch holds once Ready.
-pub(super) fn steady(e: &EffectiveDeployment) -> PhaseFootprint {
-    phase(&e.resources.ready, ResourcePhase::Ready)
+/// The footprint a launch holds once Ready, with the LMCache charge its host
+/// did not report off (ADR 0033 §6).
+pub(super) fn steady(
+    conn: &rusqlite::Connection,
+    p: &Plan,
+    e: &EffectiveDeployment,
+) -> Result<PhaseFootprint, LifecycleError> {
+    super::lmcache::charged(
+        conn,
+        &p.binding_id,
+        e,
+        phase(&e.resources.ready, ResourcePhase::Ready),
+        super::lmcache::Charged::Reported,
+    )
+}
+
+/// The Ready footprint a start of this revision on `host` would hold, with
+/// the LMCache charge it would be granted (no plan exists yet).
+pub(super) fn prospective_steady(
+    conn: &rusqlite::Connection,
+    deployment_id: &str,
+    revision: i64,
+    host: &str,
+    e: &EffectiveDeployment,
+) -> Result<PhaseFootprint, LifecycleError> {
+    super::lmcache::prospective(
+        conn,
+        deployment_id,
+        revision,
+        host,
+        e,
+        phase(&e.resources.ready, ResourcePhase::Ready),
+    )
 }
 
 /// The steady footprint of every launch that is armed and still starting,
@@ -349,7 +400,7 @@ fn starting_owners(
         let plan: Plan = decode(&raw)?;
         let e = decode_effective_snapshot(&plan.effective_json)
             .map_err(|_| LifecycleError::CorruptStoredData)?;
-        owners.insert(plan.owner(), steady(&e));
+        owners.insert(plan.owner(), steady(tx, &plan, &e)?);
     }
     Ok(owners)
 }
@@ -455,8 +506,10 @@ fn overall(whole: StartupProvenance, split: &Option<StartupSplit>) -> StartupPro
     split.as_ref().map_or(whole, |s| s.device_provenance)
 }
 
+/// The engine's own startup reservation (T14); the LMCache charge beside it
+/// is shown with the instance's LMCache.
 fn reservation(p: &Plan, e: &EffectiveDeployment) -> StartupReservation {
-    let footprint = cold(p, e);
+    let footprint = with_startup(e, p.startup_bytes, &p.startup_domains);
     let provenance = if p.whole_host {
         StartupProvenance::WholeHost
     } else if p.estimated {
@@ -715,11 +768,11 @@ impl crate::Store {
                 && eq.host.name == e.host.name
                 && !now.owners.contains_key(&q.owner())
             {
-                now.owners.insert(q.owner(), cold(&q, &eq));
-                unarmed.insert(q.owner(), steady(&eq));
+                now.owners.insert(q.owner(), cold(&tx, &q, &eq)?);
+                unarmed.insert(q.owner(), steady(&tx, &q, &eq)?);
             }
         }
-        let candidate = cold(&p, &e);
+        let candidate = cold(&tx, &p, &e)?;
         let max_parked = policy.controls.max_parked as usize;
         match fits(&now, &p.owner(), &candidate, &limits, max_parked) {
             Ok(_) => Ok(StartupGate::Proceed),

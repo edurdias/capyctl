@@ -73,7 +73,8 @@ fn pending_charges(
         charges.push((
             e.host.name.clone(),
             plan.owner(),
-            super::startup::steady(&e),
+            // ADR 0033 §6: with the LMCache charge the start was granted.
+            super::startup::steady(tx, &plan, &e)?,
         ));
     }
     Ok(charges)
@@ -205,7 +206,7 @@ pub(super) fn candidates(
         // (declared, measured on this host, or the placeholder), or the whole
         // managed limit for a solo first start.
         let (footprint, whole_host) =
-            super::startup::startup_footprint(tx, deployment_id, revision, &e)?;
+            super::startup::startup_footprint(tx, deployment_id, revision, &host, &e)?;
         let (device_options, preferred_device) =
             device_options(tx, deployment_id, revision, instance, &host)?;
         // ADR 0030 §1: a decisions revision is placed only on a host that
@@ -278,8 +279,8 @@ pub(super) fn candidates(
 /// ADR 0033 §§9, 10, 13: `host`'s `lmcache` and `retention` as its current
 /// approved publication states them, else as the revision resolved with
 /// them there (`e.host`; the embedded host publishes nothing).
-fn host_lmcache_settings(
-    tx: &Transaction<'_>,
+pub(super) fn host_lmcache_settings(
+    tx: &rusqlite::Connection,
     host: &str,
     e: &capyctl_config::effective::EffectiveDeployment,
 ) -> Result<
@@ -336,7 +337,7 @@ fn device_options(
             .map(|policy| policy.domain.clone())
             .ok_or(LifecycleError::CorruptStoredData)?;
         let (footprint, _) =
-            super::startup::startup_footprint(tx, deployment_id, revision, &on_device)?;
+            super::startup::startup_footprint(tx, deployment_id, revision, host, &on_device)?;
         options.push(DeviceOption {
             device,
             domain,
@@ -724,7 +725,9 @@ impl crate::Store {
             let mut undo = false;
             match prepared {
                 Prepared::Joined(fence) => {
-                    match Self::accept_start_in_transaction(tx, s, &fence, now, deadline, true) {
+                    match Self::accept_start_in_transaction(
+                        tx, s, &fence, now, deadline, true, None,
+                    ) {
                         Ok(start) => {
                             first.get_or_insert(start);
                         }
@@ -738,7 +741,9 @@ impl crate::Store {
                     refusal.get_or_insert(LifecycleError::RuntimeRetained);
                 }
                 Prepared::Placed(fence) => {
-                    match Self::accept_start_in_transaction(tx, s, &fence, now, deadline, true) {
+                    match Self::accept_start_in_transaction(
+                        tx, s, &fence, now, deadline, true, None,
+                    ) {
                         Ok(start) => {
                             first.get_or_insert(start);
                         }

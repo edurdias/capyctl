@@ -246,7 +246,7 @@ impl crate::Store {
                 step_id: p.step_id.clone(),
                 binding_id: p.binding_id.clone(),
                 incarnation: p.incarnation.clone(),
-                identities: members(&association.identities)?,
+                identities: members(association.held())?,
                 dispatch_enabled,
             });
         }
@@ -273,7 +273,7 @@ impl crate::Store {
         current_admitted(&tx, s, &p, true, true)?;
         if evidence.binding_id != p.binding_id
             || evidence.incarnation != p.incarnation
-            || !names_engine(&members(&association.identities)?, &evidence.identities)
+            || !names_engine(&members(association.held())?, &evidence.identities)
         {
             return Err(LifecycleError::Conflict);
         }

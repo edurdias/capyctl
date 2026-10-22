@@ -1156,7 +1156,7 @@ impl LaunchAssociation for StoreAssociation {
         })?;
         owner
             .store()
-            .record_api_identity(owner.session(), &self.fence, &self.binding_id, identity)
+            .record_launch_identity(owner.session(), &self.fence, &self.binding_id, identity)
             .map_err(|error| AssociationError::Uncertain(error.to_string()))
     }
 }

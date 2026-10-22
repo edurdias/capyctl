@@ -335,7 +335,7 @@ impl crate::Store {
                 incarnation: p.incarnation.clone(),
                 host_id,
                 profile_fingerprint: e.profile.build_fingerprint.clone(),
-                identities: members(&association.identities)?,
+                identities: members(association.held())?,
                 dispatch_enabled,
             });
         }
@@ -414,7 +414,7 @@ impl crate::Store {
         current_admitted(&tx, s, &p, true, true)?;
         if evidence.binding_id != p.binding_id
             || evidence.incarnation != p.incarnation
-            || !names_engine(&members(&association.identities)?, &evidence.identities)
+            || !names_engine(&members(association.held())?, &evidence.identities)
         {
             return Err(LifecycleError::Conflict);
         }
@@ -485,7 +485,7 @@ mod tests {
         let (store, session, fence, execution) = armed_ordinary();
         let api = identity("api", 41);
         store
-            .record_api_identity(&session, &fence, &execution.binding_id, &api)
+            .record_launch_identity(&session, &fence, &execution.binding_id, &api)
             .unwrap();
         let step = execution.token.step_id.clone();
         let now = execution.issued_at_ms + 10;
