@@ -70,7 +70,13 @@ capacity read, the standalone scrape; store tests for ports, charge, held KV, fa
 parking, exit and retirement. They found three bugs, fixed here: a restore of a
 restart-parked remote launch was accepted with the server alone and no new engine; a
 host's LMCache sample for another host's launch hid that launch's own later report; an
-embedded fallback relaunch journaled `lmcache_off` twice.
+embedded fallback relaunch journaled `lmcache_off` twice. Two older tests were brought up
+to date: a placement test now leaves `host_kv_limit` room for the default pool, and the
+reserved `LMCACHE_` row's reason is checked without a requirement citation.
+
+Verification, rebased onto `main` (`53764248`): `scripts/ci-local.sh` passes (unit 1588
+passed, 1 ignored; runtime 366); `scripts/ci-local.sh --deep --ci-shape` passes (core
+1691 passed; workspace 3633 passed, 1 ignored).
 
 Still missing: LC1 run through CapyCTL (LC1's figures were measured with LMCache and
 the engines run directly), the live rows LC2–LC11 on host A, and the decision-model
