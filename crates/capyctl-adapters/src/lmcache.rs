@@ -151,6 +151,22 @@ impl LmcacheState {
         Arc::new(state)
     }
 
+    /// An adopted launch (a restarted role re-attaching a running engine)
+    /// whose engine became Ready connected to its running `server`: on, and
+    /// a later restart-park wake attaches to the same server.
+    pub fn adopted(server: Vec<ProcessIdentity>, plan: ServerPlan) -> Arc<Self> {
+        let report = LmcacheReport::On {
+            server: server.clone(),
+            rpc_port: plan.rpc_port,
+            http_port: plan.http_port,
+            pool_bytes: plan.pool_bytes(),
+        };
+        Arc::new(Self {
+            launch: Mutex::new(Some(LmcacheLaunch::Attached { server, plan })),
+            report: Mutex::new(Some(report)),
+        })
+    }
+
     /// ADR 0033 §1: turn LMCache off for this launch before Initialize (the
     /// launch-time check failed under `auto`); nothing is started.
     pub fn turn_off(&self, reason: LmcacheOffReason, detail: String) {

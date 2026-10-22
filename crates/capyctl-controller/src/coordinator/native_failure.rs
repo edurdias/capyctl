@@ -123,7 +123,7 @@ pub(super) async fn settle_failed_group(
         }
         Err(error) => Err(error),
     };
-    conclude(shared, launch, reason, report, proven).await
+    conclude(shared, launch, reason, report, proven, None).await
 }
 
 /// Terminate what the launch recorded, prove it gone, release against that proof
@@ -226,16 +226,36 @@ pub(super) async fn settle_failed_launch(
             Err(error) => Err(error.to_string()),
         }
     };
-    conclude(shared, launch, reason, report, proven).await
+    // ADR 0033 §8 (lifecycle design §3): what Initialize reported about the
+    // launch's LMCache decides how it is released.
+    let lmcache = driver.lmcache.as_ref().and_then(|state| state.report());
+    conclude(shared, launch, reason, report, proven, lmcache).await
+}
+
+/// ADR 0033 §9 (lifecycle design §3): the closed code a `lmcache: required`
+/// launch failed with for a launch-time reason, as its adapter's error names
+/// it (`lmcache_unavailable:<reason>`).
+fn lmcache_unavailable(reason: &str) -> Option<String> {
+    const PREFIX: &str = "lmcache_unavailable:";
+    let start = reason.find(PREFIX)? + PREFIX.len();
+    let code: String = reason[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_lowercase() || *c == '_')
+        .collect();
+    capyctl_config::lmcache::LmcacheOffReason::parse(&code).map(|_| format!("{PREFIX}{code}"))
 }
 
 /// Release the failed launch against `proven`, or retain it `Uncertain`.
+/// ADR 0033 §8: a launch whose engine failed with the LMCache connector
+/// (`lmcache`) is released with the sticky fallback and started again
+/// without LMCache once; a required launch-time refusal keeps its code.
 async fn conclude(
     shared: &Arc<Shared>,
     launch: &LaunchRef,
     reason: &str,
     report: bool,
     proven: Result<CleanupEvidence, String>,
+    lmcache: Option<capyctl_adapters::lmcache::LmcacheReport>,
 ) -> Result<InitializeStatus, CoordinatorError> {
     let binding_id = launch.binding_id.clone();
     let step_id = launch.step_id.clone();
@@ -286,23 +306,85 @@ async fn conclude(
     ));
     let readmit = shared.clone();
     let readmit_binding = binding_id.clone();
-    shared
+    // ADR 0033 §8: the engine failed before Ready with the connector; the
+    // redacted log tail is the detail of its `engine_start_failed`.
+    let fallback = match &lmcache {
+        Some(capyctl_adapters::lmcache::LmcacheReport::Off {
+            reason: capyctl_config::lmcache::LmcacheOffReason::EngineStartFailed,
+            detail,
+            connector_failed: true,
+        }) => Some(detail.clone()),
+        _ => None,
+    };
+    let other_off = match &lmcache {
+        Some(report @ capyctl_adapters::lmcache::LmcacheReport::Off { .. }) if fallback.is_none() => {
+            Some(lmcache_outcome(report))
+        }
+        _ => None,
+    };
+    let code = lmcache_unavailable(reason).unwrap_or_else(|| "launch_failed".to_owned());
+    let fallback_deployment = deployment_id.clone();
+    let relaunched = shared
         .with_owner(move |owner| {
             let now = clock()?;
+            fn service(error: impl std::fmt::Display) -> CoordinatorError {
+                CoordinatorError::Service(error.to_string())
+            }
             let ttl = owner
                 .store()
                 .observation_ttl_for_step(&step)
-                .map_err(|error| CoordinatorError::Service(error.to_string()))?;
+                .map_err(service)?;
             // Read before the release: the instance this launch realizes.
             let lane = owner
                 .store()
                 .binding_lane(&readmit_binding)
-                .map_err(|error| CoordinatorError::Service(error.to_string()))?
+                .map_err(service)?
                 .map(|(_, instance)| instance);
-            owner
-                .store()
-                .release_failed_launch(owner.session(), &step, &evidence, now, ttl)
-                .map_err(|error| CoordinatorError::Service(error.to_string()))?;
+            let relaunched = match &fallback {
+                // ADR 0033 §8 (lifecycle design §3): released with the sticky
+                // fallback, the `lmcache_off` event and the instance's
+                // admission closed, then (unless `required`) started again
+                // once without LMCache, all in one transaction.
+                Some(detail) => Some(matches!(
+                    owner
+                        .store()
+                        .release_failed_launch_lmcache(
+                            owner.session(),
+                            &step,
+                            &evidence,
+                            now,
+                            ttl,
+                            detail,
+                        )
+                        .map_err(service)?,
+                    capyctl_store::ordinary_lifecycle::lmcache::LmcacheFallback::Relaunched(_)
+                )),
+                None => {
+                    // ADR 0033 §§3, 9: LMCache off for a launch-time reason is
+                    // recorded (and `lmcache_off` journaled) before the
+                    // release; evidence only, it never decides the release.
+                    if let Some(outcome) = &other_off {
+                        let _ = owner.store().record_launch_lmcache(
+                            owner.session(),
+                            &readmit_binding,
+                            outcome,
+                            now,
+                        );
+                    }
+                    owner
+                        .store()
+                        .release_failed_launch_coded(
+                            owner.session(),
+                            &step,
+                            &evidence,
+                            now,
+                            ttl,
+                            &code,
+                        )
+                        .map_err(service)?;
+                    None
+                }
+            };
             owner
                 .store()
                 .record_journal(
@@ -311,13 +393,29 @@ async fn conclude(
                     Some("launch_failed"),
                     &entry,
                 )
-                .map_err(|error| CoordinatorError::Service(error.to_string()))?;
+                .map_err(service)?;
+            if relaunched == Some(true) {
+                owner
+                    .store()
+                    .record_journal(
+                        None,
+                        Some(&journal_operation),
+                        Some("lmcache_fallback"),
+                        &format!(
+                            "deployment {fallback_deployment}: the engine did not start with \
+                             LMCache; it starts again without LMCache, and later starts of \
+                             this revision on this host go without it"
+                        ),
+                    )
+                    .map_err(service)?;
+            }
             // ADR 0011 decision 4: a deployment that is given up on closes its own
             // admission, not the host's. Every other deployment keeps being served.
             // ADR 0013 §6 (review finding): only the failed launch's own
             // instance closes, keyed by (deployment, instance index) and fenced
-            // by its generation; its siblings keep being admitted.
-            if let Some(instance) = lane {
+            // by its generation; its siblings keep being admitted. ADR 0033 §8:
+            // the fallback release closed it itself, before its relaunch.
+            if let (Some(instance), None) = (lane, relaunched) {
                 owner
                     .store()
                     .close_instance_admission_at(
@@ -325,7 +423,7 @@ async fn conclude(
                         i64::from(instance),
                         closed_generation,
                     )
-                    .map_err(|error| CoordinatorError::Service(error.to_string()))?;
+                    .map_err(service)?;
             }
             // ADR 0011 decision 4: only this deployment closed. Starts for every
             // other deployment are admitted again here, under the same lock that
@@ -337,9 +435,22 @@ async fn conclude(
             // ADR 0015: re-admission lifts this binding's own pause, if it had
             // one, and admits starts again only when no other launch is paused.
             readmit.unpause_locked(&readmit_binding);
-            Ok(())
+            Ok(relaunched == Some(true))
         })
         .await?;
+    if relaunched {
+        // ADR 0033 §8: said once in the role log; the planned start is driven
+        // like any accepted one.
+        capyctl_domain::role_log::notice(
+            capyctl_domain::role_log::Level::Warning,
+            &format!(
+                "deployment {deployment_id}: the engine did not start with LMCache; \
+                 starting it again without LMCache"
+            ),
+        );
+        shared.changed.notify_waiters();
+        shared.wake.notify_one();
+    }
     // The binding was released, so the runtime built for it is no longer this
     // worker's to hand to a cleanup. Leaving it retained would refuse the next
     // launch that derives the same binding id.
@@ -477,4 +588,27 @@ async fn journal(
                 .map_err(|error| CoordinatorError::Service(error.to_string()))
         })
         .await;
+}
+
+#[cfg(test)]
+mod lmcache_tests {
+    // T45 T36: a `required` launch-time refusal the adapter names keeps its
+    // closed code on the failed operation; any other failure is
+    // `launch_failed`.
+    #[test]
+    fn a_required_launch_time_refusal_keeps_its_code() {
+        assert_eq!(
+            super::lmcache_unavailable(
+                "launch failed: lmcache_unavailable:server_start_failed: no /status in 30 s"
+            )
+            .as_deref(),
+            Some("lmcache_unavailable:server_start_failed")
+        );
+        assert_eq!(
+            super::lmcache_unavailable("lmcache_unavailable:listener_exposed").as_deref(),
+            Some("lmcache_unavailable:listener_exposed")
+        );
+        assert_eq!(super::lmcache_unavailable("lmcache_unavailable:bogus"), None);
+        assert_eq!(super::lmcache_unavailable("engine exited"), None);
+    }
 }

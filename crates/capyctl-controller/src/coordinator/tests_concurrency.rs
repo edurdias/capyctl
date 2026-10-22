@@ -492,6 +492,7 @@ fn dropped_host_worker(
                 }),
                 tools: None,
                 settle: None,
+                lmcache: None,
             }))
         }),
     )
@@ -624,6 +625,7 @@ async fn an_unproven_cleanup_is_retried_in_session_and_lifts_its_pause() {
                 }),
                 tools: None,
                 settle: None,
+                lmcache: None,
             }))
         }),
     )

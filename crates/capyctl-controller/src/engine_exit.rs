@@ -52,11 +52,18 @@ pub enum ExitHandled {
 #[derive(Clone)]
 pub struct EngineExits {
     commands: CoordinatorCommands,
+    /// ADR 0033 §6 (lifecycle design §7): the largest server overhead
+    /// measured per launch this run, so the store is written only when it
+    /// grows.
+    overhead: Arc<std::sync::Mutex<std::collections::BTreeMap<String, i64>>>,
 }
 
 impl EngineExits {
     pub fn new(commands: CoordinatorCommands) -> Self {
-        Self { commands }
+        Self {
+            commands,
+            overhead: Default::default(),
+        }
     }
 
     /// A `MemberExit` an authenticated host session reported. Blocking store
@@ -112,15 +119,22 @@ impl EngineExits {
     /// recorded against this boot are judged (`exit_observed`): an engine this
     /// role did not start on this boot is never declared exited from here. Of
     /// those, only the engine's own (`api`, `worker-N`), never a helper.
+    /// ADR 0033 §3 (lifecycle design §5): the LMCache server of a Ready or
+    /// parked launch is judged too; its exit stops the instance.
     pub fn local_pass(&self) -> Vec<ExitHandled> {
-        let launches = {
+        let (launches, servers) = {
             let Ok(owner) = self.commands.owner_for_read() else {
                 return Vec::new();
             };
-            match owner.store().local_ready_launches(owner.session()) {
+            let launches = match owner.store().local_ready_launches(owner.session()) {
                 Ok(launches) => launches,
                 Err(_) => return Vec::new(),
-            }
+            };
+            let servers = owner
+                .store()
+                .local_lmcache_launches(owner.session())
+                .unwrap_or_default();
+            (launches, servers)
         };
         let mut handled = Vec::new();
         for launch in launches {
@@ -147,7 +161,62 @@ impl EngineExits {
                 },
             ));
         }
+        for launch in servers {
+            let mut server = launch.server.clone();
+            server.sort_by_key(|p| (p.role != "lmcache", p.role.clone(), p.pid));
+            let Some(process) = server
+                .into_iter()
+                .find(capyctl_launchers::process_absence::exit_observed)
+            else {
+                self.measure(&launch);
+                continue;
+            };
+            let status = local_status(&process);
+            handled.push(self.settle(
+                ExitSource::Embedded,
+                EngineExit {
+                    deployment_id: launch.fence.deployment_id.clone(),
+                    generation: launch.fence.generation,
+                    step_id: launch.step_id.clone(),
+                    process,
+                    status,
+                    observed_at_ms: capyctl_protocol::now_unix_ms(),
+                },
+            ));
+        }
         handled
+    }
+
+    /// ADR 0033 §6 (lifecycle design §7): the running server's resident
+    /// memory beyond its pool, recorded for the revision on this host when
+    /// it is the most seen. Evidence only: a failure changes nothing.
+    fn measure(&self, launch: &capyctl_store::ordinary_lifecycle::lmcache::LocalLmcacheLaunch) {
+        let Some(resident) = server_resident_bytes(&launch.server) else {
+            return;
+        };
+        let overhead = resident.saturating_sub(launch.pool_bytes).max(0);
+        let Ok(mut seen) = self.overhead.lock() else {
+            return;
+        };
+        if overhead == 0 || seen.get(&launch.binding_id).is_some_and(|most| *most >= overhead) {
+            return;
+        }
+        let Ok(owner) = self.commands.owner_for_read() else {
+            return;
+        };
+        if owner
+            .store()
+            .record_lmcache_overhead(
+                owner.session(),
+                &launch.binding_id,
+                overhead,
+                0,
+                capyctl_protocol::now_unix_ms(),
+            )
+            .is_ok()
+        {
+            seen.insert(launch.binding_id.clone(), overhead);
+        }
     }
 
     fn settle(&self, source: ExitSource<'_>, exit: EngineExit) -> ExitHandled {
@@ -179,9 +248,16 @@ impl EngineExits {
                     capyctl_domain::role_log::notice(
                         capyctl_domain::role_log::Level::Warning,
                         &format!(
-                            "deployment {} instance {}: engine exited ({}); dispatch closed, \
+                            "deployment {} instance {}: {} exited ({}); dispatch closed, \
                              settling with verified cleanup",
-                            launch.fence.deployment_id, launch.instance_index, exit.status
+                            launch.fence.deployment_id,
+                            launch.instance_index,
+                            if launch.lmcache_server {
+                                "the LMCache server"
+                            } else {
+                                "engine"
+                            },
+                            exit.status
                         ),
                     );
                 }
@@ -210,7 +286,9 @@ impl EngineExits {
 
 /// SPEC §6.3: an ordinary stop of exactly the exited instance, so the
 /// deployment stays eligible for on-demand activation. Keyed by the binding,
-/// so a repeated exit report replays the same stop.
+/// so a repeated exit report replays the same stop. ADR 0033 §3 (lifecycle
+/// design §5): a restart-parked instance whose server exited is released
+/// like an idle stop.
 pub(crate) fn accept_exit_stop(
     commands: &CoordinatorCommands,
     launch: &ExitedLaunch,
@@ -219,9 +297,46 @@ pub(crate) fn accept_exit_stop(
         commands,
         &launch.fence.deployment_id,
         launch.instance_index,
-        EXIT_PRINCIPAL,
+        if launch.parked {
+            IDLE_PRINCIPAL
+        } else {
+            EXIT_PRINCIPAL
+        },
         &format!("engine-exit:{}", launch.binding_id),
     )
+}
+
+/// The principal an idle stop is accepted under (SPEC §6.5).
+const IDLE_PRINCIPAL: &str = "idle";
+
+/// ADR 0033 §6 (lifecycle design §7): the resident host memory (`RssAnon`
+/// plus `RssShmem`) of the alive processes of an LMCache server group, in
+/// bytes; `None` when none is alive or one cannot be read.
+pub(crate) fn server_resident_bytes(server: &[ProcessIdentity]) -> Option<i64> {
+    let mut total = 0_i64;
+    let mut any = false;
+    for process in server {
+        if capyctl_launchers::process_absence::presence(process)
+            != capyctl_domain::completion::Presence::Alive
+        {
+            continue;
+        }
+        let status = std::fs::read_to_string(format!("/proc/{}/status", process.pid)).ok()?;
+        let field = |name: &str| -> Option<i64> {
+            let kib: i64 = status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))?
+                .trim()
+                .strip_suffix("kB")?
+                .trim()
+                .parse()
+                .ok()?;
+            kib.checked_mul(1024)
+        };
+        total = total.checked_add(field("RssAnon:")?.checked_add(field("RssShmem:")?)?)?;
+        any = true;
+    }
+    any.then_some(total)
 }
 
 /// SPEC §6.3: an ordinary stop of one instance under `principal`, at the

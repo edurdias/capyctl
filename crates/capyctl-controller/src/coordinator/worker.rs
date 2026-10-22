@@ -189,6 +189,12 @@ pub struct CoordinatorOptions {
     /// ADR 0028 §12 (found live 2026-10-15, MN4): how long a group park's or
     /// wake's member evidence is awaited after the head's reply.
     pub group_member_evidence: crate::group_residency::MemberEvidence,
+    /// ADR 0033 §§9, 10 (lifecycle design §9): the standalone host started
+    /// with `lmcache: off` (`HostOff`) or `retention: zero`
+    /// (`RetentionZero`): after adoption every instance on this host (by
+    /// name) whose launch runs a server is stopped with it, a Ready one
+    /// started again without LMCache.
+    pub retire_lmcache: Option<(String, capyctl_config::lmcache::LmcacheOffReason)>,
 }
 impl Default for CoordinatorOptions {
     fn default() -> Self {
@@ -207,6 +213,7 @@ impl Default for CoordinatorOptions {
             startup_sample_interval: Some(Duration::from_secs(1)),
             stop_drain_timeout: Duration::from_secs(30),
             group_member_evidence: Default::default(),
+            retire_lmcache: None,
         }
     }
 }
@@ -1124,13 +1131,24 @@ struct Driver {
     /// SPEC §13.2: a remote builder's way to settle a failed launch through its
     /// authenticated host, in place of local process tools.
     settle: Option<SettlementExecutor>,
+    /// ADR 0033 (lifecycle design §2.3): the launch's LMCache state, shared
+    /// with its adapter: what Initialize did about the server, read at Ready
+    /// and at failure. `None` for a launch planned before ADR 0033, a remote
+    /// one and a group.
+    lmcache: Option<Arc<capyctl_adapters::lmcache::LmcacheState>>,
 }
 
 /// Builds the process tools for one launch around the association that records its
-/// API identity. The director owns both: the builder never learns where identities
-/// are written (Spec §3).
+/// API identity, under the launch's spawn policy (ADR 0033 §10: no core dumps
+/// and engine output in memory under `retention: zero`). The director owns
+/// both: the builder never learns where identities are written (Spec §3).
 pub type ToolsFactory = Arc<
-    dyn Fn(Arc<dyn LaunchAssociation + Send + Sync>) -> Arc<dyn OwnedProcessLaunch> + Send + Sync,
+    dyn Fn(
+            Arc<dyn LaunchAssociation + Send + Sync>,
+            capyctl_launchers::SpawnPolicy,
+        ) -> Arc<dyn OwnedProcessLaunch>
+        + Send
+        + Sync,
 >;
 
 /// Records the API identity of a launch under the binding it belongs to, through
@@ -1158,6 +1176,45 @@ impl LaunchAssociation for StoreAssociation {
             .store()
             .record_launch_identity(owner.session(), &self.fence, &self.binding_id, identity)
             .map_err(|error| AssociationError::Uncertain(error.to_string()))
+    }
+
+    /// ADR 0033 §3: the launch's LMCache server, recorded beside its engine
+    /// before the server runs.
+    fn persist_lmcache_identity(
+        &self,
+        identity: &capyctl_domain::completion::ProcessIdentity,
+    ) -> Result<(), AssociationError> {
+        self.persist_api_identity(identity)
+    }
+
+    /// ADR 0033 §7 (lifecycle design §4.3): the engine a restart-park's
+    /// restore step `wake` starts on the running server, recorded before it
+    /// runs.
+    fn persist_wake_api_identity(
+        &self,
+        wake: &str,
+        identity: &capyctl_domain::completion::ProcessIdentity,
+    ) -> Result<(), AssociationError> {
+        let owner = self.owner.lock().map_err(|error| {
+            drop(error);
+            AssociationError::Uncertain("owner poisoned".into())
+        })?;
+        owner
+            .store()
+            .record_wake_identity(owner.session(), &self.fence, &self.binding_id, wake, identity)
+            .map_err(|error| AssociationError::Uncertain(error.to_string()))
+    }
+}
+
+/// ADR 0033 (lifecycle design §2.3): the LMCache state a vLLM or SGLang spec
+/// carries to its adapter.
+pub(super) fn spec_lmcache(
+    spec: &capyctl_adapters::resolve::AdapterSpec,
+) -> Option<Arc<capyctl_adapters::lmcache::LmcacheState>> {
+    match spec {
+        capyctl_adapters::resolve::AdapterSpec::Vllm { lmcache, .. }
+        | capyctl_adapters::resolve::AdapterSpec::Sglang { lmcache, .. } => lmcache.clone(),
+        _ => None,
     }
 }
 /// Supplies what the lifecycle must not know: resolved credentials and the frozen
@@ -1321,6 +1378,7 @@ impl OwnedCoordinator {
                     cleanup: binding.cleanup,
                     tools: None,
                     settle: binding.settle,
+                    lmcache: None,
                 }))
             }),
             true,
@@ -1519,7 +1577,19 @@ impl OwnedCoordinator {
                         fence: work.fence().clone(),
                         binding_id: work.binding_id().to_owned(),
                     });
-                let tools = tools_factory(association);
+                // ADR 0033 §10: under `retention: zero` the launch's processes
+                // start with no core dumps and their output in memory.
+                let retention_zero = work.lmcache().is_some_and(|plan| plan.retention_zero);
+                let tools = tools_factory(
+                    association,
+                    capyctl_launchers::SpawnPolicy {
+                        no_core_dumps: retention_zero,
+                        memory_logs: retention_zero,
+                    },
+                );
+                // ADR 0033 (lifecycle design §2.3): the one state the adapter,
+                // the launch-time check and this driver share.
+                let lmcache = spec_lmcache(&spec);
                 let engine = bindings.adapter(declared, spec, tools.clone())?;
                 // ADR 0014 §7 (WE3): the embedded host verifies the checkpoint
                 // against the recorded digest before Initialize and Restore,
@@ -1545,6 +1615,7 @@ impl OwnedCoordinator {
                         factory_owner.clone(),
                         installation,
                         work,
+                        lmcache.clone(),
                     ) as Arc<dyn EngineAdapter>,
                     None => engine,
                 };
@@ -1558,6 +1629,7 @@ impl OwnedCoordinator {
                     ),
                     tools: Some(tools),
                     settle: None,
+                    lmcache,
                 }))
             }),
             false,
@@ -2268,16 +2340,43 @@ impl StartupPeak {
         }
     }
 
+    /// ADR 0033 §6 (lifecycle design §7): the most host RAM and GPU memory
+    /// the LMCache `server` group held in one sample taken while the engine
+    /// started (a discrete GPU's samples name each process); `(0, 0)` with
+    /// none.
+    fn server_residency(&self, server: &[capyctl_domain::completion::ProcessIdentity]) -> (i64, i64) {
+        let ours = |r: &ProcessResident| {
+            server.iter().any(|i| {
+                i.pid == r.pid && i.boot_id == r.boot_id && i.start_ticks == r.start_ticks
+            })
+        };
+        self.residents
+            .iter()
+            .map(|(_, processes)| {
+                processes.iter().filter(|r| ours(r)).fold((0_i64, 0_i64), |(h, d), r| {
+                    (
+                        h.saturating_add(r.host_bytes.max(0)),
+                        d.saturating_add(r.device_bytes.max(0)),
+                    )
+                })
+            })
+            .fold((0, 0), |(h, d), (sh, sd)| (h.max(sh), d.max(sd)))
+    }
+
     /// The measured peak of each domain, when a fresh sample outside every
     /// kernel build the engine reported measured one. ADR 0014 amendment A12:
     /// a compiler's memory is the build's, not the engine's. On one pool, the
     /// largest drop in availability; on a discrete GPU, the most the launch's
     /// own processes (`identities`, as the engine reported them at Ready) held
-    /// on each domain.
+    /// on each domain. ADR 0033 §6 (lifecycle design §7): the LMCache server
+    /// is not the engine: on one pool its charge (`server_bytes`, the pool
+    /// and device allowance, allocated before it answered) comes off the
+    /// drop; on a discrete GPU only the engine's own processes count.
     fn peaks(
         &self,
         builds: &[capyctl_domain::completion::KernelBuild],
         identities: &[capyctl_domain::completion::ProcessIdentity],
+        server_bytes: i64,
     ) -> BTreeMap<String, i64> {
         use capyctl_config::effective::StartupMeasure;
         let outside = |at: i64| !builds.iter().any(|build| build.covers(at));
@@ -2294,6 +2393,7 @@ impl StartupPeak {
                     .map(|(_, bytes)| *bytes)
                     .min()
                     .and_then(|lowest| available.checked_sub(lowest))
+                    .map(|drop| drop.saturating_sub(server_bytes.max(0)))
                     .filter(|drop| *drop > 0)
                 {
                     peaks.insert(domain.clone(), drop);
@@ -2302,7 +2402,10 @@ impl StartupPeak {
             StartupMeasure::Domains { device, host } => {
                 let ours = |r: &&ProcessResident| {
                     identities.iter().any(|i| {
-                        i.pid == r.pid && i.boot_id == r.boot_id && i.start_ticks == r.start_ticks
+                        !i.is_lmcache()
+                            && i.pid == r.pid
+                            && i.boot_id == r.boot_id
+                            && i.start_ticks == r.start_ticks
                     })
                 };
                 for (domain, on_card) in [(device, true), (host, false)] {
@@ -2550,6 +2653,28 @@ async fn drive(
         .await?;
     let builds = observation.kernel_builds.clone();
     let identities = observation.identities.clone();
+    // ADR 0033 §§3, 8 (lifecycle design §10): what became of the launch's
+    // LMCache, recorded before Ready so its steady charge drops LMCache's
+    // when the server did not run.
+    let lmcache = driver.lmcache.as_ref().and_then(|state| state.report());
+    if let Some(outcome) = lmcache.as_ref().map(lmcache_outcome) {
+        let binding = work.binding_id().to_owned();
+        shared
+            .read(move |owner, now| {
+                owner
+                    .store()
+                    .record_launch_lmcache(owner.session(), &binding, &outcome, now)
+            })
+            .await?;
+    }
+    // ADR 0033 §6 (lifecycle design §7): the server's own charge, kept out
+    // of the engine's measured startup peak.
+    let server_bytes = match (&lmcache, work.lmcache().and_then(|plan| plan.grant())) {
+        (Some(capyctl_adapters::lmcache::LmcacheReport::On { .. }), Some(grant)) => {
+            grant.pool_bytes.saturating_add(grant.device_bytes)
+        }
+        _ => 0,
+    };
     let evidence = CompletionEvidence {
         token: observation.token,
         identities: observation.identities,
@@ -2574,7 +2699,7 @@ async fn drive(
     // the host's memory (no other activation or cleanup on it) is recorded
     // for later starts of this revision there, per memory domain. A failure
     // to record it costs nothing but the measurement.
-    let peaks = peak.peaks(&builds, &identities);
+    let peaks = peak.peaks(&builds, &identities, server_bytes);
     if !peaks.is_empty() && !contended.load(Ordering::Acquire) {
         let step = work.step_id().to_owned();
         let _ = shared
@@ -2585,7 +2710,51 @@ async fn drive(
             })
             .await;
     }
+    // ADR 0033 §6 (lifecycle design §7): the server's memory beyond its pool
+    // and its own GPU memory, as measured while the engine started and now;
+    // later starts of the revision here charge them in place of the
+    // allowances. A failure to record it costs nothing but the measurement.
+    if let Some(capyctl_adapters::lmcache::LmcacheReport::On {
+        server, pool_bytes, ..
+    }) = &lmcache
+    {
+        let (sampled_host, device) = peak.server_residency(server);
+        let host = crate::engine_exit::server_resident_bytes(server)
+            .unwrap_or(0)
+            .max(sampled_host);
+        let overhead = host.saturating_sub(*pool_bytes).max(0);
+        if overhead > 0 || device > 0 {
+            let binding = work.binding_id().to_owned();
+            let _ = shared
+                .read(move |owner, now| {
+                    owner.store().record_lmcache_overhead(
+                        owner.session(),
+                        &binding,
+                        overhead,
+                        device,
+                        now,
+                    )
+                })
+                .await;
+        }
+    }
     Ok(())
+}
+
+/// ADR 0033 (lifecycle design §10): the host's report as the store records it.
+fn lmcache_outcome(
+    report: &capyctl_adapters::lmcache::LmcacheReport,
+) -> capyctl_store::ordinary_lifecycle::lmcache::LmcacheOutcome {
+    use capyctl_store::ordinary_lifecycle::lmcache::LmcacheOutcome;
+    match report {
+        capyctl_adapters::lmcache::LmcacheReport::On { .. } => LmcacheOutcome::On,
+        capyctl_adapters::lmcache::LmcacheReport::Off { reason, detail, .. } => {
+            LmcacheOutcome::Off {
+                reason: *reason,
+                detail: detail.clone(),
+            }
+        }
+    }
 }
 
 /// ADR 0028 §5–§9: drive one planned group Initialize through its activation.
