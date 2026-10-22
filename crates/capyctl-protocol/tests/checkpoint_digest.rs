@@ -91,6 +91,7 @@ fn launch_plan() -> pb::SingleLaunchPlan {
         checkpoint_tables: None,
         checkpoint_gguf: None,
         startup_bytes: None,
+        startup_host_bytes: None,
     }
 }
 
@@ -197,6 +198,7 @@ fn a_launch_plan_carries_the_recorded_checkpoint_additively() {
         checkpoint_weights_bytes: Some(4 << 30),
         checkpoint_state_slot_bytes: None,
         startup_bytes: None,
+        startup_host_bytes: None,
         ..typed.clone()
     };
     let mut command = legacy.clone();

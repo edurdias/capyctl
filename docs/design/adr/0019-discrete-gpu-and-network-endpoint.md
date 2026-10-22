@@ -421,3 +421,49 @@ was charged 14.48 GiB of the card and started and served FrogNano-4B-2609 on vLL
 on SGLang 0.5.21 (12.6 GiB in use); with `context_length: 16384` it did so on vLLM 0.29.0
 too. With another program listening on the first port of the range, the SGLang launch
 leased the next one.
+
+## Amendment A2: the startup peak is measured per memory domain (owner decision 2026-10-21)
+
+Problem: found during the discrete container qualification (2026-10-21, the 16 GB laptop
+card). ADR 0014 amendment A2 measures a revision's startup peak on a first run and reserves
+it for later starts, but only for a cold phase of one allocation: the measurement was the
+largest drop in one domain's published availability. On a discrete GPU the cold phase
+charges two domains (§3), the card and host RAM, so nothing was ever measured there, and
+every start kept the estimate (`startup.provenance` `default`).
+
+Rule:
+
+- **Each domain is measured on its own, from the launch's own processes.** While an
+  uncontended Initialize runs on a discrete GPU, the coordinator samples the host's
+  processes with its availability (ADR 0007). Once the engine is ready, the samples are
+  matched to the process identities it reported (as for the parked charge, ADR 0014
+  amendment A13): the card's peak is the most GPU memory the driver attributed to them in
+  one sample, host RAM's the most resident pages (`RssAnon` + `RssShmem`, §4). Another
+  program's memory on the card or in host RAM is not counted, which an availability drop
+  could not tell apart. Samples inside a reported kernel build are left out (ADR 0014
+  amendment A12), and a start beside another activation on its host records nothing, as on
+  unified memory.
+- **Recorded per domain.** A peak is recorded per revision, host, engine installation and
+  memory domain, the largest kept (store schema v52; a peak recorded before keeps the
+  domain of its revision's one cold allocation). A unified pool's peak is one such record.
+- **Each estimate is replaced once its domain is measured.** A later start of the revision
+  on that host and installation reserves each measured domain's peak, never below that
+  domain's steady charge, and the estimate on a domain not yet measured (a host whose
+  reporter does not split a process's memory measures host RAM only). A declared
+  `memory.startup` or a declared `resources:` block is the operator's and is never
+  replaced, as before.
+- **The host charges the same.** A remote host is sent both figures:
+  `SingleLaunchPlan.startup_bytes` is then the card's and the new `startup_host_bytes`
+  (field 18) host RAM's, and the host charges each on its own domain, never below the steady
+  charge it resolves there. The field is gated by the capability `startup_host_bytes`
+  (ADR 0017): a host without it is refused `host_capability_missing:startup_host_bytes` for
+  such a launch before anything is sent. Any other launch carries no `startup_host_bytes`
+  and needs nothing new.
+- **Status says where each figure came from.** Beside `startup.device_bytes` and
+  `startup.host_bytes`, `startup.device_provenance` and `startup.host_provenance` are
+  `measured` or the estimate's provenance; `startup.provenance` is the card's. Each
+  `startup.measured` record names its `domain`. A starting instance's `startup` carries the
+  same fields.
+
+Nothing here changes admission, the placeholders or the measurement on unified memory.
+CPU and Fake-engine tests only; not yet checked live.

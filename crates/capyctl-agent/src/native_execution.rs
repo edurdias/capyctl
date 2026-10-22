@@ -617,6 +617,39 @@ impl NativeHostExecution {
         ) {
             cold.bytes = startup.max(ready.bytes);
         }
+        // ADR 0019 §3: on a discrete GPU measured per domain, the card's and
+        // host RAM's startup charges apart, each never below the steady
+        // charge this host resolved on that domain.
+        if let (
+            Some(device_startup),
+            Some(host_startup),
+            Some(capyctl_config::effective::StartupMeasure::Domains { device, host }),
+        ) = (
+            plan.startup_bytes,
+            plan.startup_host_bytes,
+            capyctl_config::effective::startup_measure(&effective),
+        ) {
+            let steady = |domain: &str| {
+                effective
+                    .resources
+                    .ready
+                    .allocations
+                    .iter()
+                    .filter(|ready| ready.domain == domain)
+                    .fold(0_i64, |sum, ready| sum.saturating_add(ready.bytes))
+            };
+            let (device_bytes, host_bytes) = (
+                device_startup.max(steady(&device)),
+                host_startup.max(steady(&host)),
+            );
+            for cold in &mut effective.resources.cold.allocations {
+                if cold.domain == device {
+                    cold.bytes = device_bytes;
+                } else if cold.domain == host {
+                    cold.bytes = host_bytes;
+                }
+            }
+        }
         // ADR 0028 §4, §8: a group member runs on exactly the plan's devices,
         // `local_ranks` of them; a single launch on exactly one.
         let group = group_member(command);
@@ -3047,6 +3080,7 @@ mod tests {
                 checkpoint_tables: None,
                 checkpoint_gguf: None,
                 startup_bytes: None,
+                startup_host_bytes: None,
             }),
         };
         let legacy = command(&deployment);
@@ -3195,6 +3229,7 @@ mod tests {
             checkpoint_tables: None,
             checkpoint_gguf: None,
             startup_bytes: None,
+            startup_host_bytes: None,
         };
         let command = MemberCommand {
             identity: checkpoint_identity("launch", "reserved"),
@@ -3238,6 +3273,7 @@ mod tests {
             checkpoint_weights_bytes: Some(1),
             checkpoint_state_slot_bytes: None,
             startup_bytes: None,
+            startup_host_bytes: None,
             ..plan.clone()
         };
         let (other, _) = launch_with(&deployment, &policy, &recorded);

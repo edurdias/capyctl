@@ -63,15 +63,57 @@ pub fn startup_budget(effective: &EffectiveDeployment) -> StartupBudget {
     StartupBudget { bytes, provenance }
 }
 
-/// Whether a measured peak may replace the frozen startup budget: only a
-/// placeholder or a pre-budget request is replaced; a declared startup or a
-/// declared cold phase is the operator's and stays. The derived cold phase
-/// must be one allocation for the measured bytes to replace it.
-pub fn measurable(effective: &EffectiveDeployment) -> bool {
-    matches!(
+/// How a first run on a host measures a revision's startup peak, when its
+/// frozen budget is only a placeholder (a declared startup or a declared cold
+/// phase is the operator's and stays, so nothing is measured for it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupMeasure {
+    /// One allocation on one memory pool (unified memory, or a host without
+    /// a GPU domain): the largest drop in the pool's published availability.
+    Pool { domain: String },
+    /// ADR 0019 §3: a discrete GPU, whose cold phase charges the card and
+    /// host RAM apart. Each is measured on its own from the launch's own
+    /// processes: the card from the GPU memory the driver attributes to them,
+    /// host RAM from their resident pages (`RssAnon` + `RssShmem`, ADR 0019
+    /// §4), and each domain's estimate is replaced once it is measured.
+    Domains { device: String, host: String },
+}
+
+/// How a measured peak may replace the frozen startup budget, if it may:
+/// only a placeholder or a pre-budget request is replaced. The derived cold
+/// phase must be one allocation, or exactly one card and one host RAM
+/// allocation on a discrete GPU, for the measured bytes to replace it.
+pub fn startup_measure(effective: &EffectiveDeployment) -> Option<StartupMeasure> {
+    if !matches!(
         startup_budget(effective).provenance,
         StartupProvenance::Default | StartupProvenance::Request
-    ) && effective.resources.cold.allocations.len() == 1
+    ) {
+        return None;
+    }
+    let on_device = |domain: &str| {
+        effective
+            .host
+            .domains
+            .get(domain)
+            .map(|d| d.memory == super::DomainMemory::Device)
+    };
+    match effective.resources.cold.allocations.as_slice() {
+        [allocation] => Some(StartupMeasure::Pool {
+            domain: allocation.domain.clone(),
+        }),
+        [a, b] => match (on_device(&a.domain)?, on_device(&b.domain)?) {
+            (true, false) => Some(StartupMeasure::Domains {
+                device: a.domain.clone(),
+                host: b.domain.clone(),
+            }),
+            (false, true) => Some(StartupMeasure::Domains {
+                device: b.domain.clone(),
+                host: a.domain.clone(),
+            }),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Owner decision 2026-09-23: the checks a declared `memory.startup` must pass

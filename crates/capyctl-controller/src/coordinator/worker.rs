@@ -7,7 +7,7 @@ use capyctl_adapters::vllm::args::redact_text;
 use capyctl_config::engine_policy::Engine;
 use capyctl_domain::{
     completion::{CleanupEvidence, CompletionEvidence, OwnedLaunchReceipt},
-    resources::{MemoryLimit, MemoryObservation},
+    resources::{MemoryLimit, MemoryObservation, ProcessResident},
 };
 use capyctl_launchers::{AssociationError, LaunchAssociation};
 use capyctl_store::ordinary_lifecycle::park::{
@@ -2150,73 +2150,188 @@ fn fresh(observations: &[MemoryObservation], now: i64, ttl: i64) -> bool {
             .all(|o| o.sampled_at_ms >= 0 && o.sampled_at_ms <= now && now - o.sampled_at_ms <= ttl)
 }
 
-/// Owner decision 2026-09-23: the startup peak of one Initialize, measured as
-/// the largest drop in its host's published availability of the domain its
-/// startup reservation charges, below what was available when it armed.
+/// Owner decision 2026-09-23: the startup peak of one Initialize, by memory
+/// domain. On one pool it is the largest drop in its host's published
+/// availability of that pool below what was available when it armed. ADR 0019
+/// §3: on a discrete GPU the cold phase charges the card and host RAM apart,
+/// so each is measured on its own from what the launch's own processes held:
+/// the GPU memory the driver attributes to them on the card, their resident
+/// pages (`RssAnon` + `RssShmem`) in host RAM. Other memory on the card or in
+/// host RAM is not the launch's, so an availability drop cannot stand in.
 ///
 /// ADR 0014 amendment A12: samples are kept until the engine answers, so that
-/// those taken while it reported a kernel build can be left out.
+/// those taken while it reported a kernel build can be left out, and on a
+/// discrete GPU so that they can be matched to the processes it reports.
 struct StartupPeak {
-    domain: Option<String>,
+    measure: Option<capyctl_config::effective::StartupMeasure>,
+    /// `(available_bytes, sampled_at_ms)` of the pool when the start armed;
+    /// on a discrete GPU, only `sampled_at_ms` (the card's) matters.
     baseline: Option<(i64, i64)>,
-    /// `(sampled_at_ms, available_bytes)`, one per distinct host sample.
+    /// One pool: `(sampled_at_ms, available_bytes)`, one per distinct sample.
     samples: Vec<(i64, i64)>,
+    /// A discrete GPU: `(sampled_at_ms, processes)`, one per distinct sample.
+    residents: Vec<(i64, Vec<ProcessResident>)>,
 }
 
 /// Samples one Initialize keeps. The coordinator's 3600 s ceiling at the
 /// default 1 s interval stays below it; later samples are dropped.
 const MAX_STARTUP_SAMPLES: usize = 8192;
+/// Processes one discrete sample keeps. A host reports its GPU processes, a
+/// handful; a sample naming more keeps the first ones.
+const MAX_SAMPLED_PROCESSES: usize = 64;
 
 impl StartupPeak {
     fn new(work: &InitializeWork, baseline: &[MemoryObservation]) -> Self {
-        let domain = match work.effective().resources.cold.allocations.as_slice() {
-            [allocation] => Some(allocation.domain.clone()),
-            _ => None,
+        use capyctl_config::effective::StartupMeasure;
+        let measure = capyctl_config::effective::startup_measure(work.effective());
+        let timed = match &measure {
+            Some(
+                StartupMeasure::Pool { domain } | StartupMeasure::Domains { device: domain, .. },
+            ) => Some(domain),
+            None => None,
         };
-        let baseline = domain.as_ref().and_then(|domain| {
+        let baseline = timed.and_then(|domain| {
             baseline
                 .iter()
                 .find(|o| &o.domain == domain)
                 .map(|o| (o.available_bytes, o.sampled_at_ms))
         });
         Self {
-            domain,
+            measure,
             baseline,
             samples: Vec::new(),
+            residents: Vec::new(),
         }
+    }
+
+    /// Whether a sample needs the host's processes (a discrete GPU).
+    fn by_process(&self) -> bool {
+        matches!(
+            self.measure,
+            Some(capyctl_config::effective::StartupMeasure::Domains { .. })
+        )
     }
 
     /// Take one sample. Only an observation sampled after the baseline counts.
-    fn sample(&mut self, observed: &[MemoryObservation]) {
-        let (Some(domain), Some((_, since))) = (&self.domain, self.baseline) else {
+    fn sample(&mut self, observed: &[MemoryObservation], residents: &[ProcessResident]) {
+        use capyctl_config::effective::StartupMeasure;
+        let (Some(measure), Some((_, since))) = (&self.measure, self.baseline) else {
             return;
         };
-        if let Some(o) = observed
-            .iter()
-            .find(|o| &o.domain == domain && o.sampled_at_ms > since && o.available_bytes >= 0)
-        {
-            // A host that has not published since the last tick repeats it.
-            if self.samples.last() == Some(&(o.sampled_at_ms, o.available_bytes))
-                || self.samples.len() >= MAX_STARTUP_SAMPLES
-            {
-                return;
+        match measure {
+            StartupMeasure::Pool { domain } => {
+                if let Some(o) = observed.iter().find(|o| {
+                    &o.domain == domain && o.sampled_at_ms > since && o.available_bytes >= 0
+                }) {
+                    // A host that has not published since the last tick repeats it.
+                    if self.samples.last() == Some(&(o.sampled_at_ms, o.available_bytes))
+                        || self.samples.len() >= MAX_STARTUP_SAMPLES
+                    {
+                        return;
+                    }
+                    self.samples.push((o.sampled_at_ms, o.available_bytes));
+                }
             }
-            self.samples.push((o.sampled_at_ms, o.available_bytes));
+            StartupMeasure::Domains { device, host } => {
+                // A sample needs a card reading taken after the arm. It is
+                // dated by the later of the card and host readings: the
+                // processes are sampled after the availability they come with
+                // (ADR 0007).
+                let reading = |domain: &str| {
+                    observed
+                        .iter()
+                        .find(|o| o.domain == domain)
+                        .map(|o| o.sampled_at_ms)
+                };
+                let (Some(card), Some(ram)) = (reading(device), reading(host)) else {
+                    return;
+                };
+                if card <= since {
+                    return;
+                }
+                let at = card.max(ram);
+                let processes: Vec<ProcessResident> = residents
+                    .iter()
+                    .take(MAX_SAMPLED_PROCESSES)
+                    .cloned()
+                    .collect();
+                if self
+                    .residents
+                    .last()
+                    .is_some_and(|(last, held)| *last == at && *held == processes)
+                    || self.residents.len() >= MAX_STARTUP_SAMPLES
+                {
+                    return;
+                }
+                self.residents.push((at, processes));
+            }
         }
     }
 
-    /// The measured peak, when a fresh sample outside every kernel build the
-    /// engine reported showed availability dropping. ADR 0014 amendment A12:
-    /// a compiler's memory is the build's, not the engine's.
-    fn peak(&self, builds: &[capyctl_domain::completion::KernelBuild]) -> Option<i64> {
-        let (available, _) = self.baseline?;
-        let lowest = self
-            .samples
-            .iter()
-            .filter(|(at, _)| !builds.iter().any(|build| build.covers(*at)))
-            .map(|(_, bytes)| *bytes)
-            .min()?;
-        available.checked_sub(lowest).filter(|drop| *drop > 0)
+    /// The measured peak of each domain, when a fresh sample outside every
+    /// kernel build the engine reported measured one. ADR 0014 amendment A12:
+    /// a compiler's memory is the build's, not the engine's. On one pool, the
+    /// largest drop in availability; on a discrete GPU, the most the launch's
+    /// own processes (`identities`, as the engine reported them at Ready) held
+    /// on each domain.
+    fn peaks(
+        &self,
+        builds: &[capyctl_domain::completion::KernelBuild],
+        identities: &[capyctl_domain::completion::ProcessIdentity],
+    ) -> BTreeMap<String, i64> {
+        use capyctl_config::effective::StartupMeasure;
+        let outside = |at: i64| !builds.iter().any(|build| build.covers(at));
+        let mut peaks = BTreeMap::new();
+        let (Some(measure), Some((available, _))) = (&self.measure, self.baseline) else {
+            return peaks;
+        };
+        match measure {
+            StartupMeasure::Pool { domain } => {
+                if let Some(drop) = self
+                    .samples
+                    .iter()
+                    .filter(|(at, _)| outside(*at))
+                    .map(|(_, bytes)| *bytes)
+                    .min()
+                    .and_then(|lowest| available.checked_sub(lowest))
+                    .filter(|drop| *drop > 0)
+                {
+                    peaks.insert(domain.clone(), drop);
+                }
+            }
+            StartupMeasure::Domains { device, host } => {
+                let ours = |r: &&ProcessResident| {
+                    identities.iter().any(|i| {
+                        i.pid == r.pid && i.boot_id == r.boot_id && i.start_ticks == r.start_ticks
+                    })
+                };
+                for (domain, on_card) in [(device, true), (host, false)] {
+                    let held = |r: &ProcessResident| {
+                        if on_card {
+                            r.device_bytes
+                        } else {
+                            r.host_bytes
+                        }
+                    };
+                    let most = self
+                        .residents
+                        .iter()
+                        .filter(|(at, _)| outside(*at))
+                        .filter_map(|(_, processes)| {
+                            processes
+                                .iter()
+                                .filter(ours)
+                                .try_fold(0_i64, |sum, r| sum.checked_add(held(r).max(0)))
+                        })
+                        .max()
+                        .filter(|most| *most > 0);
+                    if let Some(most) = most {
+                        peaks.insert(domain.clone(), most);
+                    }
+                }
+            }
+        }
+        peaks
     }
 }
 
@@ -2378,8 +2493,9 @@ async fn drive(
         context,
     };
     // Owner decision 2026-09-23: sample the host's published availability
-    // while the engine starts, to measure its startup peak. Sampling never
-    // decides anything about this Initialize.
+    // while the engine starts, to measure its startup peak; on a discrete GPU
+    // (ADR 0019 §3) with the memory each of its processes holds. Sampling
+    // never decides anything about this Initialize.
     let mut peak = StartupPeak::new(work, &observed);
     let host = work.effective().host.name.clone();
     let interval = shared.options.startup_sample_interval;
@@ -2393,10 +2509,19 @@ async fn drive(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            if let Ok(Ok(observed)) =
+            if peak.by_process() {
+                if let Ok(Ok((observed, residents))) = tokio::time::timeout(
+                    protocol_timeout,
+                    source.observe_with_residents(host.clone()),
+                )
+                .await
+                {
+                    peak.sample(&observed, &residents);
+                }
+            } else if let Ok(Ok(observed)) =
                 tokio::time::timeout(protocol_timeout, source.observe(host.clone())).await
             {
-                peak.sample(&observed);
+                peak.sample(&observed, &[]);
             }
         }
     };
@@ -2424,6 +2549,7 @@ async fn drive(
         })
         .await?;
     let builds = observation.kernel_builds.clone();
+    let identities = observation.identities.clone();
     let evidence = CompletionEvidence {
         token: observation.token,
         identities: observation.identities,
@@ -2446,18 +2572,16 @@ async fn drive(
     record_wake_canary(shared, &driver, work.instance_index(), &command.context).await;
     // Owner decision 2026-09-23: a peak measured while nothing else changed
     // the host's memory (no other activation or cleanup on it) is recorded
-    // for later starts of this revision there. A failure to record it costs
-    // nothing but the measurement.
-    if let Some(peak) = peak
-        .peak(&builds)
-        .filter(|_| !contended.load(Ordering::Acquire))
-    {
+    // for later starts of this revision there, per memory domain. A failure
+    // to record it costs nothing but the measurement.
+    let peaks = peak.peaks(&builds, &identities);
+    if !peaks.is_empty() && !contended.load(Ordering::Acquire) {
         let step = work.step_id().to_owned();
         let _ = shared
             .read(move |owner, now| {
                 owner
                     .store()
-                    .record_startup_peak(owner.session(), &step, peak, now)
+                    .record_startup_peak(owner.session(), &step, &peaks, now)
             })
             .await;
     }

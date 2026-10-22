@@ -107,6 +107,12 @@ pub const DECISIONS: &str = capyctl_config::decisions::HOST_CAPABILITY;
 /// host that declared it; any other is refused
 /// `host_capability_missing:custom_engines` before anything is sent.
 pub const CUSTOM_ENGINES: &str = capyctl_config::custom::CAPABILITY;
+/// ADR 0019 §3: a LaunchSingle plan's `startup_host_bytes`, sent only for a
+/// launch on a discrete GPU whose startup peak the server measured per memory
+/// domain. A host without it is refused
+/// `host_capability_missing:startup_host_bytes` for such a launch before
+/// anything is sent; every other launch needs nothing.
+pub const STARTUP_HOST_BYTES: &str = "startup_host_bytes";
 
 /// ADR 0018: bounds on the new messages' strings and lists.
 pub const MAX_REQUEST_ID: usize = 64;
@@ -152,6 +158,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (CHECKPOINT_GGUF, Direction::ServerToHost),
     (DECISIONS, Direction::ServerToHost),
     (CUSTOM_ENGINES, Direction::ServerToHost),
+    (STARTUP_HOST_BYTES, Direction::ServerToHost),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.
@@ -214,6 +221,9 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
             }
             if plan.startup_bytes.is_some() {
                 needs.push(STARTUP_BYTES);
+            }
+            if plan.startup_host_bytes.is_some() {
+                needs.push(STARTUP_HOST_BYTES);
             }
             if plan.checkpoint_state_slot_bytes.is_some() {
                 needs.push(CHECKPOINT_STATE_SLOT);

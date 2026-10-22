@@ -205,6 +205,7 @@ fn group_member_launch(
         checkpoint_tables: None,
         checkpoint_gguf: None,
         startup_bytes: None,
+        startup_host_bytes: None,
     }
 }
 
@@ -244,6 +245,7 @@ fn single_host_launch_binds_local_resolution_and_retained_grant() {
         checkpoint_tables: None,
         checkpoint_gguf: None,
         startup_bytes: None,
+        startup_host_bytes: None,
     });
     typed.identity.payload_digest = typed.canonical_digest();
     typed.verify_digest().unwrap();
@@ -259,6 +261,43 @@ fn single_host_launch_binds_local_resolution_and_retained_grant() {
     assert!(typed.verify_digest().is_err());
     typed.identity.payload_digest = typed.canonical_digest();
     assert!(typed.verify_digest().is_err());
+}
+
+// T14 T26 (ADR 0019 §3): a discrete launch measured per memory domain carries
+// the host RAM charge beside the card's, bound by the digest; the host RAM
+// charge alone, or a charge that is not positive, never decodes.
+#[test]
+fn a_launch_carries_the_host_ram_startup_charge_only_beside_the_cards() {
+    use capyctl_protocol::execution::MemberAction;
+    let mut typed = launch_single();
+    let MemberAction::LaunchSingle(plan) = &mut typed.action else {
+        panic!()
+    };
+    plan.startup_bytes = Some(14 << 30);
+    plan.startup_host_bytes = Some(6 << 30);
+    typed.identity.payload_digest = typed.canonical_digest();
+    let decode = |command: &MemberCommand| {
+        MemberCommand::try_from(pb::ServerToAgent {
+            msg: Some(pb::server_to_agent::Msg::ExecuteMember(command.to_wire())),
+        })
+    };
+    assert_eq!(decode(&typed).unwrap(), typed);
+    let mut moved = typed.clone();
+    let MemberAction::LaunchSingle(plan) = &mut moved.action else {
+        panic!()
+    };
+    plan.startup_host_bytes = Some(7 << 30);
+    assert!(moved.verify_digest().is_err(), "the digest binds it");
+    for (card, ram) in [(None, Some(6 << 30)), (Some(14 << 30), Some(0))] {
+        let mut bad = typed.clone();
+        let MemberAction::LaunchSingle(plan) = &mut bad.action else {
+            panic!()
+        };
+        plan.startup_bytes = card;
+        plan.startup_host_bytes = ram;
+        bad.identity.payload_digest = bad.canonical_digest();
+        assert!(decode(&bad).is_err(), "{card:?} {ram:?}");
+    }
 }
 
 fn probe(handle: &str) -> MemberCommand {
@@ -411,6 +450,7 @@ fn launch_single() -> MemberCommand {
         checkpoint_tables: None,
         checkpoint_gguf: None,
         startup_bytes: None,
+        startup_host_bytes: None,
     });
     typed.identity.payload_digest = typed.canonical_digest();
     typed

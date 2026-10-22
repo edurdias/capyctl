@@ -10,8 +10,8 @@ use crate::schema::{
     SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28, SCHEMA_V29, SCHEMA_V3, SCHEMA_V30,
     SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
     SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
-    SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V49, SCHEMA_V5, SCHEMA_V50, SCHEMA_V51, SCHEMA_V6,
-    SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V49, SCHEMA_V5, SCHEMA_V50, SCHEMA_V51, SCHEMA_V52,
+    SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -81,6 +81,9 @@ pub const MIGRATIONS: &[&str] = &[
     // SPEC §10 (amended 2026-10-21): whether the engine answered a cancelled
     // request; old rows read as not answered.
     SCHEMA_V51,
+    // ADR 0019 §3: startup peaks per memory domain (a discrete GPU's card and
+    // host RAM apart).
+    SCHEMA_V52,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -376,6 +379,47 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    /// ADR 0019 §3 (v52): a startup peak recorded before the per-domain key
+    /// keeps its value and takes the domain of its revision's one cold
+    /// allocation; one whose revision is not stored is not carried over. A
+    /// discrete revision can then hold one peak per domain, each kept apart.
+    // T14 T26 T33
+    #[test]
+    fn v52_keys_startup_peaks_by_domain_and_carries_rows_across() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        apply_through(&conn, 51).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version,revision) VALUES('a','a','model','ready',1,0,1,1,1);
+            INSERT INTO effective_revisions VALUES('a',1,'{"host":{"name":"host-a"},"resources":{"cold":{"allocations":[{"bytes":10,"domain":"unified","host_kv_bytes":0}],"devices":[]}}}','fa');
+            INSERT INTO startup_measurements(deployment_id,revision,host_id,installation,peak_bytes,step_id,measured_at_ms) VALUES('a',1,'host-a','vllm@1',12,'s1',7),('gone',1,'host-a','vllm@1',9,'s0',3);"#,
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let rows: Vec<(String, String, i64, String, i64)> = conn
+            .prepare("SELECT deployment_id,domain,peak_bytes,step_id,measured_at_ms FROM startup_measurements")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![("a".into(), "unified".into(), 12, "s1".into(), 7)]
+        );
+        conn.execute_batch(
+            "INSERT INTO startup_measurements(deployment_id,revision,host_id,installation,domain,peak_bytes,step_id,measured_at_ms) VALUES('a',1,'host-a','vllm@1','gpu0',5,'s2',8),('a',1,'host-a','vllm@1','system',6,'s2',8);",
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO startup_measurements(deployment_id,revision,host_id,installation,domain,peak_bytes,step_id,measured_at_ms) VALUES('a',1,'host-a','vllm@1','',5,'s2',8)",
+                []
+            )
+            .is_err());
     }
 
     /// ADR 0028 §5, §6 (v41): resource owners, endpoint leases and recorded
