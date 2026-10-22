@@ -370,6 +370,9 @@ impl EngineBindings for ProfileBindings {
                     // ADR 0010, discrete GPU design §5: `host_backed` parks at
                     // sleep level 1, fixed by the frozen residency.
                     residency: effective.residency,
+                    // ADR 0030 §1, §6: readiness and the wake canary follow
+                    // the deployment's API.
+                    api: effective.api,
                 })
             }
             Engine::Sglang => {

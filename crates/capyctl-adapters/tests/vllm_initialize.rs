@@ -42,6 +42,11 @@ struct Stub {
     ready_after: usize,
     polls: Arc<AtomicUsize>,
     chat: ChatBehaviour,
+    /// ADR 0030 §3: what `POST /v1/systemone` answers, or `None` for a
+    /// build without the route (vLLM before 0.32.0 answers 404).
+    decision: Option<Value>,
+    chats: Arc<AtomicUsize>,
+    decisions: Arc<AtomicUsize>,
 }
 
 /// What the chat surface does once the model is listed. The three failures are
@@ -92,6 +97,7 @@ async fn chat(
     if presented != format!("Bearer {}", stub.key) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    stub.chats.fetch_add(1, Ordering::SeqCst);
     match stub.chat {
         ChatBehaviour::Answers | ChatBehaviour::Empty => {}
         ChatBehaviour::Stalls => {
@@ -126,6 +132,29 @@ async fn chat(
     Sse::new(futures::stream::iter(events.collect::<Vec<_>>())).into_response()
 }
 
+/// ADR 0030 §3: vLLM 0.32.0's `/v1/systemone`, guarded by the same key.
+async fn systemone(
+    State(stub): State<Stub>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    let presented = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if presented != format!("Bearer {}", stub.key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    stub.decisions.fetch_add(1, Ordering::SeqCst);
+    let Some(answer) = stub.decision.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut answer = answer;
+    answer["model"] = body["model"].clone();
+    Json(answer).into_response()
+}
+
 async fn stub_engine(model: &str, ready_after: usize, key: &str) -> (Stub, u16) {
     serve_stub(model, ready_after, key, ChatBehaviour::Answers, 0).await
 }
@@ -139,16 +168,31 @@ async fn serve_stub(
     chat_behaviour: ChatBehaviour,
     port: u16,
 ) -> (Stub, u16) {
+    serve_stub_deciding(model, ready_after, key, chat_behaviour, port, None).await
+}
+
+async fn serve_stub_deciding(
+    model: &str,
+    ready_after: usize,
+    key: &str,
+    chat_behaviour: ChatBehaviour,
+    port: u16,
+    decision: Option<Value>,
+) -> (Stub, u16) {
     let stub = Stub {
         model: model.into(),
         key: key.into(),
         ready_after,
         polls: Arc::new(AtomicUsize::new(0)),
         chat: chat_behaviour,
+        decision,
+        chats: Arc::new(AtomicUsize::new(0)),
+        decisions: Arc::new(AtomicUsize::new(0)),
     };
     let app = axum::Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/systemone", post(systemone))
         .with_state(stub.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
@@ -785,6 +829,101 @@ async fn the_engine_key_is_the_one_presented() {
         .execute_persisted(&initialize_command(30_000))
         .await
         .is_ok());
+}
+
+/// ADR 0030 §3, §6 (amended 2026-10-21; resolution refuses vLLM decisions
+/// until a release reads these models' decision heads), SPEC §6.1: a decisions
+/// launch on vLLM is ready only on a complete, well-formed answer to the
+/// fixed decision, sent with the launch's key. A malformed answer, or a
+/// build without `/v1/systemone` (vLLM before 0.32.0 answers 404), fails the
+/// step, and no chat probe is ever sent in its place: vLLM serves a decision
+/// checkpoint as a generating model too, so a chat answer would prove nothing.
+// T43
+#[tokio::test]
+async fn a_decisions_launch_is_ready_only_on_the_fixed_decision() {
+    use capyctl_adapters::completion_probe::CanaryEvidence;
+    use capyctl_config::effective::DeploymentApi;
+    let answer = |choice: &str, probabilities: Value| {
+        json!({
+            "id": "decision-1", "object": "structured_decision", "created": 1,
+            "model": "gate-m",
+            "answers": {"route": {"type": "choice", "choice": choice,
+                "probabilities": probabilities, "confidence": 0.9}},
+            "usage": {"input_tokens": 60, "output_tokens": 1},
+            "diagnostics": {"route": {"label_mass": 0.99, "argmax_is_label": true}}
+        })
+    };
+    let well_formed = answer(
+        "billing",
+        json!({"billing": 0.95, "shipping": 0.02, "technical": 0.03}),
+    );
+    let malformed = answer(
+        "billing",
+        json!({"billing": 0.95, "shipping": 0.02, "technical": 0.30}),
+    );
+    for (decision, ready) in [
+        (Some(well_formed), true),
+        (Some(malformed), false),
+        (None, false),
+    ] {
+        let (stub, port) = serve_stub_deciding(
+            "gate-m",
+            0,
+            "k3y",
+            ChatBehaviour::Answers,
+            0,
+            decision.clone(),
+        )
+        .await;
+        let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+        let adapter = adapter(port, Some("k3y"))
+            .with_launch(plan(port))
+            .with_tools(tool)
+            .with_engine_key("k3y".into())
+            .with_api(DeploymentApi::Decisions);
+        let result = adapter.execute_persisted(&initialize_command(30_000)).await;
+        assert_eq!(result.is_ok(), ready, "{decision:?}: {result:?}");
+        if let Err(RuntimeError::Uncertain(message)) = &result {
+            assert!(message.contains("decision probe"), "{message}");
+        }
+        assert_eq!(stub.decisions.load(Ordering::SeqCst), 1);
+        assert_eq!(stub.chats.load(Ordering::SeqCst), 0);
+        // ADR 0030 §4: the wake canary of a decisions launch is the same
+        // fixed decision, never a completion; one the engine cannot answer
+        // is uncertain, never `Unsupported` (that would pass a wake unchecked).
+        let canary = adapter
+            .wake_canary(
+                &initialize_command(30_000).context,
+                8,
+                Duration::from_secs(5),
+            )
+            .await;
+        if ready {
+            let CanaryEvidence::Decision(answer) = canary.unwrap().answer else {
+                panic!("a decisions launch's canary is its decision");
+            };
+            assert_eq!(answer.choice, "billing");
+        } else {
+            assert!(
+                matches!(canary, Err(RuntimeError::Uncertain(_))),
+                "{canary:?}"
+            );
+        }
+        assert_eq!(stub.decisions.load(Ordering::SeqCst), 2);
+        assert_eq!(stub.chats.load(Ordering::SeqCst), 0);
+    }
+    // A chat launch keeps its chat probe and never asks for a decision.
+    let (stub, port) = stub_engine("gate-m", 0, "k3y").await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let chat = adapter(port, Some("k3y"))
+        .with_launch(plan(port))
+        .with_tools(tool)
+        .with_engine_key("k3y".into());
+    chat.execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+    assert_eq!(stub.decisions.load(Ordering::SeqCst), 0);
+    assert_eq!(stub.chats.load(Ordering::SeqCst), 1);
 }
 
 /// Actions other than Initialize are refused for a launch-shaped step: Stop and

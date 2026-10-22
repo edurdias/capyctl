@@ -77,6 +77,10 @@ pub struct VllmAdapter {
     /// ADR 0010, discrete GPU design §5: the sleep level a park uses, from the
     /// deployment's declared residency at launch; never from a command.
     park_level: crate::vllm::residency::ParkLevel,
+    /// ADR 0030 §1, §6 (amended 2026-10-21): the API the deployment serves,
+    /// which decides how readiness and the wake canary are proven (§§3, 4).
+    /// Set by whoever resolved the deployment; `chat` unless set.
+    api: capyctl_config::effective::DeploymentApi,
 }
 
 #[derive(Default)]
@@ -114,7 +118,20 @@ impl VllmAdapter {
             admin_key: None,
             residency: Mutex::new(ResidencyFence::default()),
             park_level: crate::vllm::residency::ParkLevel::Deep,
+            api: capyctl_config::effective::DeploymentApi::Chat,
         }
+    }
+
+    /// ADR 0030 §1: the API the deployment serves (`chat` unless set).
+    pub fn with_api(mut self, api: capyctl_config::effective::DeploymentApi) -> Self {
+        self.api = api;
+        self
+    }
+
+    /// ADR 0030 §3: whether readiness, the post-wake probe and the wake
+    /// canary are the fixed decision probe rather than a generation.
+    pub(super) fn decisions(&self) -> bool {
+        !self.api.is_chat()
     }
 
     /// ADR 0010, discrete GPU design §5: park at the level the deployment's
@@ -552,25 +569,43 @@ impl EngineAdapter for VllmAdapter {
     }
     /// Owner decision 2026-10-09: the wake canary of an embedded launch, the
     /// completion probe on this engine's own loopback endpoint and key,
-    /// observed when its answer arrived.
+    /// observed when its answer arrived. ADR 0030 §4: a decisions launch's
+    /// canary is the fixed decision probe instead (a decision model's
+    /// reference is its answer, never a generation), and it never answers
+    /// `Unsupported` (that would pass a wake unchecked).
     async fn wake_canary(
         &self,
         _context: &capyctl_domain::completion::StepExecutionContext,
         max_tokens: u32,
         bound: std::time::Duration,
     ) -> Result<crate::completion_probe::CanaryAnswer, RuntimeError> {
-        let answer = crate::traits::ChatForward::complete_probe(
-            self,
-            self.served_model(),
-            max_tokens,
-            bound,
-        )
-        .await
-        .map_err(|e| {
-            RuntimeError::Uncertain(crate::vllm::args::redact_text(&format!(
-                "vLLM did not answer the wake canary: {e}"
-            )))
-        })?;
+        use crate::completion_probe::{CanaryAnswer, CanaryEvidence};
+        let answer = if self.decisions() {
+            CanaryEvidence::Decision(
+                crate::traits::ChatForward::decision_probe(self, self.served_model(), bound)
+                    .await
+                    .map_err(|e| {
+                        RuntimeError::Uncertain(crate::vllm::args::redact_text(&format!(
+                            "vLLM did not answer the decision probe: {e}"
+                        )))
+                    })?,
+            )
+        } else {
+            CanaryEvidence::Generated(
+                crate::traits::ChatForward::complete_probe(
+                    self,
+                    self.served_model(),
+                    max_tokens,
+                    bound,
+                )
+                .await
+                .map_err(|e| {
+                    RuntimeError::Uncertain(crate::vllm::args::redact_text(&format!(
+                        "vLLM did not answer the wake canary: {e}"
+                    )))
+                })?,
+            )
+        };
         let observed_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
@@ -578,8 +613,8 @@ impl EngineAdapter for VllmAdapter {
             .ok_or_else(|| {
                 RuntimeError::Uncertain("the system clock is before the epoch".into())
             })?;
-        Ok(crate::completion_probe::CanaryAnswer {
-            answer: crate::completion_probe::CanaryEvidence::Generated(answer),
+        Ok(CanaryAnswer {
+            answer,
             observed_at_ms,
         })
     }
@@ -620,5 +655,17 @@ impl crate::traits::ChatForward for VllmAdapter {
         bound: std::time::Duration,
     ) -> Result<crate::completion_probe::ProbeAnswer, AdapterError> {
         self.http.complete_probe(served, max_tokens, bound).await
+    }
+    /// ADR 0030 §3, §6 (amended 2026-10-21: resolution still refuses vLLM
+    /// decisions; this probe is ready for the release that admits them): the
+    /// fixed decision on this
+    /// engine's loopback endpoint with its inference key, which the guard
+    /// admits on `/v1`, as the completion probe.
+    async fn decision_probe(
+        &self,
+        served: &str,
+        bound: std::time::Duration,
+    ) -> Result<crate::decision_probe::DecisionAnswer, AdapterError> {
+        self.http.decision_probe(served, bound).await
     }
 }
