@@ -78,6 +78,9 @@ struct RemoteEngine {
     owner: SharedCoordinatorState,
     binding: Arc<RemoteLaunchBinding>,
     readiness: ReadinessLedger,
+    /// ADR 0033 (lifecycle design §10): what the host reported about the
+    /// launch's LMCache, shared with the coordinator's driver of the launch.
+    lmcache: Arc<capyctl_adapters::lmcache::LmcacheState>,
 }
 /// The caller resolves this frozen plan from the selected enrolled host's
 /// approved configuration. This is construction only, never permission to send.
@@ -88,13 +91,15 @@ pub fn binding(
     readiness: ReadinessLedger,
 ) -> ExecutionBinding {
     let binding = Arc::new(binding);
+    let lmcache = Arc::new(capyctl_adapters::lmcache::LmcacheState::default());
     let engine = Arc::new(RemoteEngine {
         sessions: sessions.clone(),
         owner,
         binding: binding.clone(),
         readiness,
+        lmcache: lmcache.clone(),
     });
-    remote_binding(engine, sessions, binding)
+    remote_binding(engine, sessions, binding).with_lmcache(lmcache)
 }
 
 /// The engine half of [`binding`] alone: the adapter the coordinator drives
@@ -111,6 +116,7 @@ pub fn engine(
         owner,
         binding: Arc::new(binding),
         readiness,
+        lmcache: Arc::default(),
     })
 }
 
@@ -147,35 +153,42 @@ struct OwnershipObserver {
     binding: String,
 }
 impl RemoteEvidenceObserver for OwnershipObserver {
+    /// Spec §3: the host's evidence names a leader the store does not hold
+    /// yet; it is recorded before anything else is believed of the launch.
+    /// ADR 0033 §3: the LMCache server's leader is recorded the same way,
+    /// so a failed or uncertain launch's settlement proves it gone too.
     fn retain(
         &self,
         command: &MemberCommand,
         result: &pb::MemberExecutionResult,
     ) -> Result<(), Box<tonic::Status>> {
-        let Some(api) = result.processes.iter().find(|p| p.role == "api") else {
+        let leaders: Vec<_> = ["api", capyctl_domain::completion::LMCACHE_ROLE]
+            .into_iter()
+            .filter_map(|role| result.processes.iter().find(|p| p.role == role))
+            .collect();
+        if leaders.is_empty() {
             return Ok(());
-        };
+        }
         let owner = self
             .owner
             .lock()
             .map_err(|_| tonic::Status::internal("ownership unavailable"))?;
-        owner
-            .store()
-            .record_launch_identity(
-                owner.session(),
-                &capyctl_store::lifecycle::DeploymentFence {
-                    deployment_id: command.identity.deployment_id.clone(),
-                    revision: command.identity.revision,
-                    generation: command.identity.generation,
-                },
-                &self.binding,
-                &process(api),
-            )
-            .map_err(|_| {
-                Box::new(tonic::Status::internal(
-                    "remote ownership could not be retained",
-                ))
-            })
+        let fence = capyctl_store::lifecycle::DeploymentFence {
+            deployment_id: command.identity.deployment_id.clone(),
+            revision: command.identity.revision,
+            generation: command.identity.generation,
+        };
+        for leader in leaders {
+            owner
+                .store()
+                .record_launch_identity(owner.session(), &fence, &self.binding, &process(leader))
+                .map_err(|_| {
+                    Box::new(tonic::Status::internal(
+                        "remote ownership could not be retained",
+                    ))
+                })?;
+        }
+        Ok(())
     }
 }
 impl RemoteEngine {
@@ -417,22 +430,39 @@ impl RemoteEngine {
 /// the engine the controller recorded (every engine process and no other; a
 /// helper may be gone, ADR 0027). `unchanged` is a refusal
 /// without effect; every other result is uncertain.
+///
+/// ADR 0033 §7 (lifecycle design §4.1): a `restart_only` park stops the
+/// engine and keeps the launch's LMCache server, so its evidence names the
+/// recorded server's group alone (`engine_stopped`), and the restore of such
+/// a launch (which records the server alone) names a new engine beside that
+/// same server. The store judges both again before it records them.
 fn residency_evidence(
     park: bool,
     recorded: &[ProcessIdentity],
     result: &pb::MemberExecutionResult,
 ) -> Result<(Vec<ProcessIdentity>, Vec<Milestone>), RuntimeError> {
+    use capyctl_domain::completion::{same_engine, same_lmcache};
     let alive: Vec<_> = result
         .processes
         .iter()
         .filter(|p| p.presence == "alive")
         .map(process)
         .collect();
+    let restart_park = if park {
+        result.residency.as_ref().is_some_and(|r| r.engine_stopped)
+    } else {
+        !recorded.iter().any(ProcessIdentity::is_engine)
+    };
     // ADR 0027: every engine process the controller recorded and no other;
     // a helper of the group may have exited.
     let held = result.state == "completed"
         && result.claim_retained
-        && capyctl_domain::completion::same_engine(recorded, &alive);
+        && if restart_park {
+            same_lmcache(recorded, &alive)
+                && (!park || alive.iter().all(ProcessIdentity::is_lmcache))
+        } else {
+            same_engine(recorded, &alive)
+        };
     let facts = match result.residency.as_ref().map(|r| r.state.as_str()) {
         Some("parked") if park && held && !result.model_usable => vec![Milestone::MemoryReleased],
         Some("restored") if !park && held && result.model_usable => vec![
@@ -595,6 +625,12 @@ impl EngineAdapter for RemoteEngine {
             .execute_on_session(command, Some(observer))
             .await
             .map_err(|status| unresolved(&status, "remote initialize remains unresolved"))?;
+        // ADR 0033 (lifecycle design §10): what became of the launch's
+        // LMCache, Ready or failed, for the coordinator's record before Ready
+        // and its fallback, exactly as an embedded launch reports it.
+        if let Some(report) = lmcache_report(&result) {
+            self.lmcache.record(report);
+        }
         launch_evidence(&result)?;
         // SPEC §13.2 (G2): this readiness belongs to the host session that
         // proved it; a later session must re-prove it before dispatch.
@@ -943,6 +979,38 @@ fn launch_evidence(result: &pb::MemberExecutionResult) -> Result<(), RuntimeErro
     ))
 }
 
+/// ADR 0033 (lifecycle design §10): a LaunchSingle result's LMCache report
+/// as the coordinator reads it for an embedded launch. `On` names the
+/// server's group among the result's alive processes. The result was
+/// validated, so a report that does not convert was never there.
+fn lmcache_report(
+    result: &pb::MemberExecutionResult,
+) -> Option<capyctl_adapters::lmcache::LmcacheReport> {
+    use capyctl_adapters::lmcache::LmcacheReport;
+    use capyctl_protocol::execution::{LaunchLmcache, LaunchLmcacheState};
+    let report = LaunchLmcache::try_from(result.lmcache.as_ref()?).ok()?;
+    Some(match report.state {
+        LaunchLmcacheState::On => LmcacheReport::On {
+            server: capyctl_domain::completion::lmcache_members(
+                &result
+                    .processes
+                    .iter()
+                    .filter(|p| p.presence == "alive")
+                    .map(process)
+                    .collect::<Vec<_>>(),
+            ),
+            rpc_port: report.rpc_port,
+            http_port: report.http_port,
+            pool_bytes: report.pool_bytes,
+        },
+        LaunchLmcacheState::Off => LmcacheReport::Off {
+            reason: report.reason?,
+            detail: report.detail,
+            connector_failed: report.connector_failed,
+        },
+    })
+}
+
 /// ADR 0014 amendment A12: the kernel builds a usable launch's host saw, in
 /// the host's clock (the clock its memory samples carry). The result was
 /// validated, so every span is ordered and there are at most 64.
@@ -1201,9 +1269,19 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
             // host RAM's apart, so the host charges each where it belongs.
             startup_bytes: Some(startup_bytes),
             startup_host_bytes,
-            // ADR 0033 §§3, 6: the store's LMCache grant (lifecycle design
-            // §10: filled from `launch_lmcache`); none is planned here.
-            lmcache: None,
+            // ADR 0033 §§3, 6 (lifecycle design §10): the store's LMCache
+            // grant, its ports and the charge it reserved, which the host lays
+            // over the same footprint. Absent when the store planned it off.
+            lmcache: work.lmcache().and_then(|plan| plan.grant()).map(|grant| {
+                capyctl_protocol::execution::LmcacheGrant {
+                    rpc_port: grant.rpc_port,
+                    http_port: grant.http_port,
+                    pool_bytes: grant.pool_bytes,
+                    overhead_bytes: grant.overhead_bytes,
+                    device_bytes: grant.device_bytes,
+                    held_kv_bytes: grant.held_kv_bytes,
+                }
+            }),
             checkpoint_digest,
             deployment_config: local.to_string(),
             profile_name,

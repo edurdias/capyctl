@@ -98,6 +98,33 @@ struct Entry {
     max_running: Option<u32>,
 }
 
+/// ADR 0033 §12: the latest cache figures of one instance's private LMCache
+/// server, Ready or parked, as status reads them. Every figure is `None` when
+/// unknown, never zero. A status figure only, never readiness, admission or
+/// release evidence.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LmcacheView {
+    pub host_id: String,
+    pub owned_handle: String,
+    /// Sample time on the controller clock.
+    pub sampled_at_ms: i64,
+    pub age_ms: i64,
+    pub fresh: bool,
+    /// The server's `/metrics` answered.
+    pub scrape_ok: bool,
+    pub used_bytes: Option<u64>,
+    pub usage_ppm: Option<u32>,
+    pub lookups: Option<u64>,
+    pub hits: Option<u64>,
+    pub alloc_failures: Option<u64>,
+    /// ADR 0033 §12: above zero, L2 holds data although none is configured.
+    pub l2_bytes: Option<u64>,
+    /// The server group's resident memory and GPU memory, as its host
+    /// measured them.
+    pub rss_bytes: Option<u64>,
+    pub device_bytes: Option<u64>,
+}
+
 /// Why a whole report was refused. A refused report ends the host session;
 /// individually unusable samples inside an accepted report are only skipped.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -118,6 +145,9 @@ pub struct LoadApplied {
 #[derive(Default)]
 pub struct LoadTable {
     entries: Mutex<BTreeMap<InstanceKey, Entry>>,
+    /// ADR 0033 §12: the latest LMCache sample per instance incarnation,
+    /// under the same host, freshness and retention rules as the engine's.
+    lmcache: Mutex<BTreeMap<InstanceKey, (String, capyctl_protocol::reports::LmcacheSample)>>,
 }
 
 impl LoadTable {
@@ -136,9 +166,10 @@ impl LoadTable {
         if report.host_id != session_host {
             return Err(LoadRejected::HostMismatch);
         }
+        let mut outcome = LoadApplied::default();
+        self.accept_lmcache(session_host, &report.lmcache, now_ms, &mut outcome);
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.retain(|_, entry| now_ms - entry.sampled_at_ms <= LOAD_RETAIN_MS);
-        let mut outcome = LoadApplied::default();
         for sample in report.samples {
             let key = InstanceKey::new(sample.deployment_id, sample.generation);
             // SPEC §7: freshness is judged on the controller clock.
@@ -191,18 +222,103 @@ impl LoadTable {
         Ok(outcome)
     }
 
+    /// ADR 0033 §12: the LMCache samples of an accepted report, each kept
+    /// for its instance incarnation as an engine sample is: on the
+    /// controller clock, fresh when received, never replacing a newer one or
+    /// another host's fresh one, within the table's bounds.
+    fn accept_lmcache(
+        &self,
+        session_host: &str,
+        samples: &[capyctl_protocol::reports::LmcacheSample],
+        now_ms: i64,
+        outcome: &mut LoadApplied,
+    ) {
+        let mut entries = self.lmcache.lock().unwrap_or_else(|e| e.into_inner());
+        entries.retain(|_, (_, sample)| now_ms - sample.sampled_at_ms <= LOAD_RETAIN_MS);
+        for sample in samples {
+            let key = InstanceKey::new(sample.deployment_id.clone(), sample.generation);
+            let Some(sampled_at_ms) = controller_time(sample.sampled_at_ms, now_ms)
+                .filter(|at| now_ms - at <= LOAD_STALE_AFTER_MS)
+            else {
+                outcome.skipped += 1;
+                continue;
+            };
+            let usable = match entries.get(&key) {
+                Some((host, old)) if host != session_host => {
+                    now_ms - old.sampled_at_ms > LOAD_STALE_AFTER_MS
+                }
+                Some((_, old)) => sampled_at_ms > old.sampled_at_ms,
+                None => {
+                    entries.len() < MAX_LOAD_ENTRIES
+                        && entries
+                            .values()
+                            .filter(|(host, _)| host == session_host)
+                            .count()
+                            < MAX_LOAD_ENTRIES_PER_HOST
+                }
+            };
+            if !usable {
+                outcome.skipped += 1;
+                continue;
+            }
+            entries.insert(
+                key,
+                (
+                    session_host.to_owned(),
+                    capyctl_protocol::reports::LmcacheSample {
+                        sampled_at_ms,
+                        ..sample.clone()
+                    },
+                ),
+            );
+            outcome.applied += 1;
+        }
+    }
+
+    /// ADR 0033 §12: the latest LMCache sample of exactly this instance,
+    /// fresh or stale, within the retention bound.
+    pub fn lmcache_at(&self, key: &InstanceKey, now_ms: i64) -> Option<LmcacheView> {
+        let entries = self.lmcache.lock().unwrap_or_else(|e| e.into_inner());
+        let (host, sample) = entries.get(key)?;
+        let age_ms = now_ms.saturating_sub(sample.sampled_at_ms).max(0);
+        (age_ms <= LOAD_RETAIN_MS).then(|| LmcacheView {
+            host_id: host.clone(),
+            owned_handle: sample.owned_handle.clone(),
+            sampled_at_ms: sample.sampled_at_ms,
+            age_ms,
+            fresh: age_ms <= LOAD_STALE_AFTER_MS,
+            scrape_ok: sample.scrape_ok,
+            used_bytes: sample.used_bytes,
+            usage_ppm: sample.usage_ppm,
+            lookups: sample.lookups,
+            hits: sample.hits,
+            alloc_failures: sample.alloc_failures,
+            l2_bytes: sample.l2_bytes,
+            rss_bytes: sample.rss_bytes,
+            device_bytes: sample.device_bytes,
+        })
+    }
+
     /// SPEC §13.2: a host whose control session ended reports nothing current.
     pub fn forget_host(&self, host_id: &str) {
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|_, entry| entry.host_id != host_id);
+        self.lmcache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, (host, _)| host != host_id);
     }
 
     /// T34: drop every sample of `deployment_id` whose generation is not one
     /// the caller currently serves (a retired or replaced instance).
     pub fn retain_generations(&self, deployment_id: &str, live: &[i64]) {
         self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|key, _| key.deployment_id != deployment_id || live.contains(&key.generation));
+        self.lmcache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|key, _| key.deployment_id != deployment_id || live.contains(&key.generation));

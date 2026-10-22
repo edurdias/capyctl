@@ -77,9 +77,20 @@ fn instance_report(
 ) -> Value {
     // T18, T34: a sample counts only for this incarnation, as reported by the
     // host the instance is placed on.
-    let sample = match (loads, instance.generation, instance.host_id.as_deref()) {
-        (Some(loads), Some(generation), Some(host)) => loads
-            .sample_at(&InstanceKey::new(deployment, generation), now_ms)
+    let key = instance
+        .generation
+        .map(|generation| InstanceKey::new(deployment, generation));
+    let sample = match (loads, key.as_ref(), instance.host_id.as_deref()) {
+        (Some(loads), Some(key), Some(host)) => loads
+            .sample_at(key, now_ms)
+            .filter(|view| view.host_id == host),
+        _ => None,
+    };
+    // ADR 0033 §12: the instance's LMCache server, Ready or parked, as the
+    // same host last reported it.
+    let lmcache = match (loads, key.as_ref(), instance.host_id.as_deref()) {
+        (Some(loads), Some(key), Some(host)) => loads
+            .lmcache_at(key, now_ms)
             .filter(|view| view.host_id == host),
         _ => None,
     };
@@ -87,7 +98,7 @@ fn instance_report(
         Some(reported) => Some(MaxRunning::reported(reported)),
         None => derived.cloned(),
     };
-    json!({
+    let mut report = json!({
         "index": instance.index,
         "host_id": instance.host_id,
         "generation": instance.generation,
@@ -97,7 +108,11 @@ fn instance_report(
             .map_or(0, |generation| inflight.instance_in_flight(deployment, generation)),
         "max_running": max_running,
         "sample": sample.as_ref().map(sample_report),
-    })
+    });
+    if let Some(lmcache) = lmcache {
+        report["lmcache"] = json!(lmcache);
+    }
+    report
 }
 
 fn sample_report(view: &LoadView) -> Value {

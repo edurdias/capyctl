@@ -1059,6 +1059,7 @@ pub struct ExecutionBinding {
     engine: Arc<dyn EngineAdapter>,
     cleanup: CleanupExecutor,
     settle: Option<SettlementExecutor>,
+    lmcache: Option<Arc<capyctl_adapters::lmcache::LmcacheState>>,
 }
 impl ExecutionBinding {
     /// Remote bindings deliberately have no local process tools. Their cleanup
@@ -1068,6 +1069,7 @@ impl ExecutionBinding {
             engine,
             cleanup,
             settle: None,
+            lmcache: None,
         }
     }
 
@@ -1076,6 +1078,14 @@ impl ExecutionBinding {
     /// a launch pauses uncertain until an operator Stop resolves it.
     pub fn with_settlement(mut self, settle: SettlementExecutor) -> Self {
         self.settle = Some(settle);
+        self
+    }
+
+    /// ADR 0033 (lifecycle design §10): the state the binding's engine fills
+    /// with its host's LMCache report, read at Ready and at failure exactly
+    /// as an embedded launch's (the record before Ready, the fallback).
+    pub fn with_lmcache(mut self, state: Arc<capyctl_adapters::lmcache::LmcacheState>) -> Self {
+        self.lmcache = Some(state);
         self
     }
 }
@@ -1132,9 +1142,9 @@ struct Driver {
     /// authenticated host, in place of local process tools.
     settle: Option<SettlementExecutor>,
     /// ADR 0033 (lifecycle design §2.3): the launch's LMCache state, shared
-    /// with its adapter: what Initialize did about the server, read at Ready
-    /// and at failure. `None` for a launch planned before ADR 0033, a remote
-    /// one and a group.
+    /// with its adapter (embedded) or filled from its host's report (remote):
+    /// what Initialize did about the server, read at Ready and at failure.
+    /// `None` for a launch planned before ADR 0033 and a group.
     lmcache: Option<Arc<capyctl_adapters::lmcache::LmcacheState>>,
 }
 
@@ -1384,7 +1394,7 @@ impl OwnedCoordinator {
                     cleanup: binding.cleanup,
                     tools: None,
                     settle: binding.settle,
-                    lmcache: None,
+                    lmcache: binding.lmcache,
                 }))
             }),
             true,
@@ -2726,12 +2736,17 @@ async fn drive(
     // and its own GPU memory, as measured while the engine started and now;
     // later starts of the revision here charge them in place of the
     // allowances. A failure to record it costs nothing but the measurement.
+    // Only an embedded server is read from this machine's `/proc`; a remote
+    // one is measured by its host (its load reports, `agent_sessions`).
     if let Some(capyctl_adapters::lmcache::LmcacheReport::On {
         server, pool_bytes, ..
     }) = &lmcache
     {
         let (sampled_host, device) = peak.server_residency(server);
-        let host = crate::engine_exit::server_resident_bytes(server)
+        let host = driver
+            .tools
+            .as_ref()
+            .and_then(|_| crate::engine_exit::server_resident_bytes(server))
             .unwrap_or(0)
             .max(sampled_host);
         let overhead = host.saturating_sub(*pool_bytes).max(0);

@@ -168,6 +168,40 @@ pub fn publish(
         .store()
         .publish_host_configuration_with_launch_claims(&publication, claims)
         .map_err(|_| PublicationError::default())?;
+    // ADR 0033 §§9, 10 (lifecycle design §9): a host that publishes
+    // `lmcache: off` or `retention: zero` has every instance there whose
+    // launch runs a server stopped with it, as a standalone role start does;
+    // a Ready one is owed a start without LMCache (the coordinator's relaunch
+    // pass). Its stops are accepted here and driven by the coordinator; one
+    // refused now is asked again at the host's next publication.
+    if let Some(reason) = lmcache_retirement(&config.document) {
+        match state
+            .store()
+            .retire_lmcache_on_host(state.session(), host_id, reason, now)
+        {
+            Ok(stops) if !stops.is_empty() => capyctl_domain::role_log::notice(
+                capyctl_domain::role_log::Level::Warning,
+                &format!(
+                    "Host {host_id}: its settings say `{}`; {} instance{} with an LMCache server \
+                     stop{} with it",
+                    match reason {
+                        capyctl_config::lmcache::LmcacheOffReason::HostOff => "lmcache: off",
+                        _ => "retention: zero",
+                    },
+                    stops.len(),
+                    if stops.len() == 1 { "" } else { "s" },
+                    if stops.len() == 1 { "s" } else { "" },
+                ),
+            ),
+            Ok(_) => {}
+            // Evidence for the operator only: the publication stands, and the
+            // host's servers are refused re-proof under these settings.
+            Err(error) => capyctl_domain::role_log::notice(
+                capyctl_domain::role_log::Level::Warning,
+                &format!("Host {host_id}: its LMCache servers could not be stopped yet: {error}"),
+            ),
+        }
+    }
     for warning in &warnings {
         capyctl_domain::role_log::notice(
             capyctl_domain::role_log::Level::Warning,
@@ -175,6 +209,20 @@ pub fn publish(
         );
     }
     Ok(warnings)
+}
+
+/// ADR 0033 §§9, 10: why a host's published settings retire its LMCache
+/// servers, `host_off` before `retention_zero` as a standalone role names
+/// it; `None` when they allow LMCache.
+pub fn lmcache_retirement(
+    document: &serde_json::Value,
+) -> Option<capyctl_config::lmcache::LmcacheOffReason> {
+    use capyctl_config::lmcache::{HostLmcache, LmcacheOffReason, Retention};
+    match capyctl_config::lmcache::host_settings(document) {
+        (HostLmcache::Off, _) => Some(LmcacheOffReason::HostOff),
+        (_, Retention::Zero) => Some(LmcacheOffReason::RetentionZero),
+        _ => None,
+    }
 }
 
 /// ADR 0018 §3: a live re-publication, validated like a startup publication

@@ -1419,6 +1419,12 @@ impl AgentSessions {
                                         .map_err(|_| Status::invalid_argument("invalid host load report"))?;
                                     // SPEC §17 (M80): latency deltas ride on the same report.
                                     self.latency.accept(&host, &report, capyctl_protocol::now_unix_ms());
+                                    // ADR 0033 §§6, 12: the host's measurement of each
+                                    // LMCache server group, recorded for later launches
+                                    // of its revision there (evidence only).
+                                    if report.host_id == host {
+                                        self.authority.record_lmcache_samples(&host, &report.lmcache);
+                                    }
                                     self.load.accept(&host, report, capyctl_protocol::now_unix_ms()).map_err(|_| denied())?;
                                     false
                                 }

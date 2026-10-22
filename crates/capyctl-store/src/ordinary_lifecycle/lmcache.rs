@@ -956,33 +956,55 @@ impl crate::Store {
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
-        let launch: Option<(String, i64, String)> = tx
+        let grew = record_overhead(&tx, binding_id, overhead_bytes, device_bytes, now)?;
+        tx.commit()?;
+        Ok(grew)
+    }
+
+    /// ADR 0033 §§6, 12 (lifecycle design §7): what `host` measured of the
+    /// LMCache server of its launch `step_id` (the launch's owned handle) of
+    /// `deployment` at `generation`: the server group's resident memory and
+    /// its GPU memory. The resident memory beyond the granted pool is the
+    /// overhead, recorded as [`Self::record_lmcache_overhead`] does. A sample
+    /// naming no retained launch of that host with a server changes nothing.
+    /// Returns whether the record grew.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_host_lmcache_measurement(
+        &self,
+        s: &CoordinatorSession,
+        host: &str,
+        deployment: &str,
+        generation: i64,
+        step_id: &str,
+        resident_bytes: i64,
+        device_bytes: i64,
+        now: i64,
+    ) -> Result<bool, LifecycleError> {
+        if resident_bytes < 0 || device_bytes < 0 || now < 0 {
+            return Err(LifecycleError::Invalid);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        check_session(&tx, s)?;
+        let launch: Option<(String, i64)> = tx
             .query_row(
-                "SELECT l.deployment_id,l.revision,l.host_id FROM launch_lmcache l
-                   JOIN runtime_bindings b ON b.id=l.binding_id
-                  WHERE l.binding_id=?1 AND l.planned='on' AND b.state!='released'",
-                [binding_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                "SELECT l.binding_id,l.pool_bytes FROM lifecycle_steps st
+                   JOIN launch_lmcache l ON l.binding_id=st.binding_id
+                  WHERE st.id=?1 AND st.deployment_id=?2 AND l.generation=?3 AND l.host_id=?4
+                    AND l.planned='on'",
+                params![step_id, deployment, generation, host],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let Some((deployment, revision, host)) = launch else {
+        let Some((binding, pool)) = launch else {
             return Ok(false);
         };
-        let prior = measured(&tx, &deployment, revision, &host)?;
-        if prior.is_some_and(|(o, d)| o >= overhead_bytes && d >= device_bytes) {
+        let overhead = resident_bytes.saturating_sub(pool).max(0);
+        if overhead == 0 && device_bytes == 0 {
             return Ok(false);
         }
-        tx.execute(
-            "INSERT INTO lmcache_measurements(deployment_id,revision,host_id,overhead_bytes,device_bytes,binding_id,measured_at_ms)
-             VALUES(?1,?2,?3,?4,?5,?6,?7)
-             ON CONFLICT(deployment_id,revision,host_id) DO UPDATE SET
-               overhead_bytes=MAX(overhead_bytes,excluded.overhead_bytes),
-               device_bytes=MAX(device_bytes,excluded.device_bytes),
-               binding_id=excluded.binding_id,measured_at_ms=excluded.measured_at_ms",
-            params![deployment, revision, host, overhead_bytes, device_bytes, binding_id, now],
-        )?;
+        let grew = record_overhead(&tx, &binding, overhead, device_bytes, now)?;
         tx.commit()?;
-        Ok(true)
+        Ok(grew)
     }
 
     /// ADR 0033 §8 (lifecycle design §3): release a launch whose engine failed
@@ -1399,6 +1421,44 @@ impl crate::Store {
 /// The principal a role start's retirement of a Ready instance stops it
 /// under (ADR 0033 §§9, 10).
 pub const RETIRE_PRINCIPAL: &str = "system:lmcache_retire";
+
+/// ADR 0033 §6: grow the measurement of `binding_id`'s revision on its host
+/// to `overhead_bytes` and `device_bytes` where they exceed it. Whether it
+/// grew; a binding that is released or planned off changes nothing.
+fn record_overhead(
+    tx: &Transaction<'_>,
+    binding_id: &str,
+    overhead_bytes: i64,
+    device_bytes: i64,
+    now: i64,
+) -> Result<bool, LifecycleError> {
+    let launch: Option<(String, i64, String)> = tx
+        .query_row(
+            "SELECT l.deployment_id,l.revision,l.host_id FROM launch_lmcache l
+               JOIN runtime_bindings b ON b.id=l.binding_id
+              WHERE l.binding_id=?1 AND l.planned='on' AND b.state!='released'",
+            [binding_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((deployment, revision, host)) = launch else {
+        return Ok(false);
+    };
+    let prior = measured(tx, &deployment, revision, &host)?;
+    if prior.is_some_and(|(o, d)| o >= overhead_bytes && d >= device_bytes) {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO lmcache_measurements(deployment_id,revision,host_id,overhead_bytes,device_bytes,binding_id,measured_at_ms)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(deployment_id,revision,host_id) DO UPDATE SET
+           overhead_bytes=MAX(overhead_bytes,excluded.overhead_bytes),
+           device_bytes=MAX(device_bytes,excluded.device_bytes),
+           binding_id=excluded.binding_id,measured_at_ms=excluded.measured_at_ms",
+        params![deployment, revision, host, overhead_bytes, device_bytes, binding_id, now],
+    )?;
+    Ok(true)
+}
 
 #[cfg(test)]
 #[path = "lmcache_tests.rs"]

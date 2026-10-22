@@ -18,7 +18,7 @@ use crate::latency_table::LatencyTable;
 use crate::load_table::LoadTable;
 use crate::ownership::SharedCoordinatorState;
 use capyctl_agent::ingress::{IngressScope, LoadTarget};
-use capyctl_agent::load::{LoadError, LoadReporter, LoadSource};
+use capyctl_agent::load::{LmcacheTarget, LoadError, LoadReporter, LoadSource};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -107,6 +107,32 @@ impl LoadSource for EmbeddedTargets {
                 (self.in_flight)(&target.scope.deployment_id, target.scope.generation);
         }
         targets
+    }
+
+    /// ADR 0033 §12 (lifecycle design §8): every Ready or parked embedded
+    /// launch that runs an LMCache server, read on the server's loopback
+    /// admin port as a host reads its own. The server's GPU memory is
+    /// unknown here; its resident memory is read with the sample.
+    fn lmcache_targets(&self) -> Vec<LmcacheTarget> {
+        let Ok(owner) = self.owner.lock() else {
+            return Vec::new();
+        };
+        let Ok(launches) = owner.store().local_lmcache_launches(owner.session()) else {
+            return Vec::new();
+        };
+        launches
+            .into_iter()
+            .map(|launch| LmcacheTarget {
+                deployment_id: launch.fence.deployment_id,
+                instance_index: launch.instance_index,
+                generation: launch.fence.generation,
+                owned_handle: launch.step_id,
+                http: (std::net::Ipv4Addr::LOCALHOST, launch.http_port).into(),
+                server: launch.server,
+                pool_bytes: launch.pool_bytes,
+                device_bytes: None,
+            })
+            .collect()
     }
 }
 

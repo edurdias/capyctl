@@ -181,6 +181,14 @@ impl LmcacheState {
         });
     }
 
+    /// ADR 0033 (lifecycle design §10): what a remote host reported about
+    /// the launch's LMCache, recorded by the server's launch driver so a
+    /// remote launch is recorded at Ready, and released at failure, as an
+    /// embedded one is.
+    pub fn record(&self, report: LmcacheReport) {
+        self.set_report(report);
+    }
+
     /// What happened, once something did.
     pub fn report(&self) -> Option<LmcacheReport> {
         lock(&self.report).clone()
