@@ -80,6 +80,10 @@ its abbreviations, `_` spellings, `--no-` negations and `=value` forms) or
 compared upper-cased, so `dumper_enable` is refused like `DUMPER_ENABLE`, with
 `engine_env_reserved:<name>`.
 
+Every `LMCACHE_*` variable is reserved on every engine (ADR 0033): LMCache's
+vLLM helper reads its configuration from the environment after any file, and
+CapyCTL renders LMCache's settings itself.
+
 ## vLLM 0.30 and 0.31
 
 | Need | Option | Class | CapyCTL |
@@ -109,7 +113,7 @@ compared upper-cased, so `dumper_enable` is refused like `DUMPER_ENABLE`, with
 | Request and stats logging | `--enable-log-requests`, `--disable-log-requests`, `--enable-log-outputs`, `--disable-log-stats` | reserved | CapyCTL starts vLLM with request and output logging off (`--no-enable-log-requests`, `--no-enable-log-outputs`), so prompts and completions never reach the engine log. It logs requests itself and reads the engine's stats for load reports. |
 | Per-request metrics | `--enable-per-request-metrics` | reserved | Always on: each answer carries vLLM's timings for the request, which CapyCTL adds to its [per-request metrics](requests.md#per-request-metrics). |
 | Cached-token count | `--enable-prompt-tokens-details` | extra | Off unless you pass it. With it, usage reports `prompt_tokens_details.cached_tokens` and the per-request metrics show `cached_tokens`. |
-| KV offload, LMCache | `--kv-transfer-config` | approval | vLLM's KV connectors (LMCache among them) are set here. It can reach off the host. |
+| KV offload, other connectors | `--kv-transfer-config` | approval | Any KV connector other than LMCache's. It can reach off the host. A deployment that passes one runs without LMCache (`kv_transfer_config_set`), since the engine takes one connector configuration. A value naming an LMCache connector (`LMCacheConnectorV1`, `LMCacheMPConnector`, a `kv_connector_module_path` under `lmcache.`, or either inside a `MultiConnector`) is refused in every spelling, whatever the host approves: CapyCTL renders LMCache's connector itself on vLLM 0.32.0 or newer, from the deployment's `lmcache` ([LMCache](engines.md#lmcache)); `capyctl engine flags` lists it as owned. |
 | CPU KV offload | `--kv-offloading-backend`, `--kv-offloading-size` | extra | Uses host memory that CapyCTL does not count. |
 | Plugins | `--io-processor-plugin`, `--worker-extension-cls`, `--logits-processors` | approval | They load code. `VLLM_PLUGINS` is set by CapyCTL and cannot be changed. |
 | Compilation settings | `--compilation-config` | approval | A JSON value that no check reads. |
@@ -146,7 +150,8 @@ compared upper-cased, so `dumper_enable` is refused like `DUMPER_ENABLE`, with
 | Request logging | `--log-requests`, `--log-requests-target` | reserved | CapyCTL logs requests itself. |
 | Metrics | `--enable-metrics` | reserved | Always on: CapyCTL reads them for load reports. |
 | Cached-token report | `--enable-cache-report` | reserved | Always on: usage reports `prompt_tokens_details.cached_tokens`, which the [per-request metrics](requests.md#per-request-metrics) show. |
-| KV offload, LMCache | `--enable-lmcache`, `--enable-hierarchical-cache`, `--hicache-storage-backend`, `--enable-flexkv` | reserved | Not supported: these caches hold memory and files outside CapyCTL's accounting. Every `--lmcache-*`, `--hicache-storage-*` and `--flexkv-*` option is reserved too. |
+| LMCache | `--enable-lmcache`, `--lmcache-config-file`, every `--lmcache-*` option | reserved | CapyCTL renders them itself on SGLang 0.5.22 or newer, from the deployment's `lmcache` ([LMCache](engines.md#lmcache)); `capyctl engine flags` lists them as owned. |
+| KV offload | `--enable-hierarchical-cache`, `--hicache-storage-backend`, `--enable-flexkv` | reserved | Not supported: these caches hold memory and files outside CapyCTL's accounting. Every `--hicache-storage-*` and `--flexkv-*` option is reserved too. |
 | Plugins, custom code | `--custom-weight-loader`, `--enable-custom-logit-processor` | approval | They load code. `SGLANG_PLUGINS` is set by CapyCTL and cannot be changed: SGLang loads no plugin. |
 | Loader settings | `--model-loader-extra-config` | approval | A JSON value that no check reads. |
 | Dumps to disk, watermark key | `--watermark-config`, `--debug-tensor-dump-output-folder`, `--debug-tensor-dump-layers`, `--debug-tensor-dump-input-file`, `--msprobe-dump-config`, `--export-metrics-to-file`, `--export-metrics-to-file-dir`, `--spec-trace-dir` | reserved | Not supported, whatever the host approves. They write requests, tensors or debug data to disk, or (0.5.22) read the key that marks every answer. Every `--debug-tensor-dump-*` option is reserved too, and so are the `DUMPER_*`, `SGLANG_DUMP*`, `SGLANG_KERNEL_API_*` and `SGLANG_CUDA_COREDUMP*` variables and `SGLANG_DSPARK_DEBUG_DUMP`, `SGLANG_DSPARK_ENABLE_SPS_RECORD`, `SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR` and `SGLANG_TORCH_PROFILER_DIR`. |
