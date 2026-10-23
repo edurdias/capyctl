@@ -257,7 +257,7 @@ impl SglangLaunch {
         )]
         .into();
         // ADR 0033 §3 (A7): LMCache's connector runs in the engine; its usage
-        // telemetry is off there too.
+        // telemetry is off there too, whatever `engine_telemetry` says.
         if self.public["settings"].get("lmcache_config_file").is_some() {
             for (name, value) in crate::lmcache::NO_USAGE_TRACKING {
                 env.insert(name.into(), value.into());

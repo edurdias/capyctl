@@ -850,7 +850,11 @@ HTTP (`lmcache/usage_telemetry`, default `LMCACHE_USAGE_TRACK_URL`) unless
 neither. CapyCTL now renders both into the server's environment, and into the engine's
 whenever its connector is on (the connector imports LMCache in the engine), embedded and
 remote; the engine's resolved environment never replaces them. Nothing about a launch
-leaves the host.
+leaves the host. With the host setting `engine_telemetry` (owner decision 2026-10-22),
+`LMCACHE_TRACK_USAGE=false` stays rendered whenever LMCache runs, whatever that setting
+says, and `DO_NOT_TRACK=1`, which also silences the engine's own reporting, follows the
+setting: set under `off` (the default), in the server and the engine; not set under
+`allow`, so that the engine keeps its own default and LMCache still reports nothing.
 
 **A8. A restart-park's quiescence (§7).** Found live on SGLang 0.5.22: an embedded
 restart-park was always refused as not quiescent, because SGLang's quiescence proof is the

@@ -542,7 +542,8 @@ use off the machine. By default they do not.
   their own use; `DO_NOT_TRACK=1` turns off the Hugging Face Hub library's
   telemetry in the Python engines, and a custom engine may honour it.
 - `allow` sets none of them, so each engine keeps its own default (vLLM then
-  reports as above).
+  reports as above). LMCache, when it runs, still starts with its own
+  reporting off (`LMCACHE_TRACK_USAGE=false`) in the server and the engine.
 
 Neither a profile nor a deployment can set these names
 (`engine_env_reserved:<name>`). TensorFold's release check, which asks GitHub

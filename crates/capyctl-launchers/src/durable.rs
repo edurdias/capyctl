@@ -97,7 +97,8 @@ impl SpawnRole<'_> {
 /// ADR 0033 §3: the only variables the LMCache server is started with. Its
 /// `/env` route shows them to any local process, so nothing else (no engine
 /// key, no log writer metadata, no other `LMCACHE_*`) may reach it. A7: its
-/// usage telemetry switched off (`NO_USAGE_TRACKING`, those values only).
+/// usage telemetry switched off (`NO_USAGE_TRACKING` and, under the host's
+/// `engine_telemetry: off`, `DO_NOT_TRACK`; those values only).
 const LMCACHE_ENVIRONMENT: [&str; 4] =
     ["PATH", "HOME", "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER"];
 
@@ -106,6 +107,7 @@ fn lmcache_environment(name: &str, value: &str) -> bool {
     LMCACHE_ENVIRONMENT.contains(&name)
         || capyctl_adapters::lmcache::NO_USAGE_TRACKING
             .iter()
+            .chain(capyctl_adapters::engine_telemetry::DO_NOT_TRACK)
             .any(|(off, off_value)| *off == name && *off_value == value)
 }
 

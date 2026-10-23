@@ -260,10 +260,14 @@ pub fn server_log_path(engine_log: &Path) -> PathBuf {
 /// the pool the charge covers is allocated at start only when it is negated).
 /// Never `--run-script-api-enabled`, never an L2, disk, GDS, Device-DAX or P2P
 /// option. The environment is exactly `PATH`, `HOME` and the instance's
-/// `CUDA_VISIBLE_DEVICES`, when set, and [`NO_USAGE_TRACKING`];
-/// `CAPYCTL_ENGINE_LOG` names the server's log to the launcher, which never
-/// passes it to the server.
-pub fn render_server(plan: &ServerPlan) -> RenderedCommand {
+/// `CUDA_VISIBLE_DEVICES`, when set, [`NO_USAGE_TRACKING`] and, under the
+/// host's `engine_telemetry: off`, `DO_NOT_TRACK=1`; `CAPYCTL_ENGINE_LOG`
+/// names the server's log to the launcher, which never passes it to the
+/// server.
+pub fn render_server(
+    plan: &ServerPlan,
+    telemetry: crate::engine_telemetry::EngineTelemetry,
+) -> RenderedCommand {
     let argv = [
         plan.lmcache_bin.to_string_lossy().into_owned(),
         "server".into(),
@@ -290,6 +294,7 @@ pub fn render_server(plan: &ServerPlan) -> RenderedCommand {
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
     );
+    crate::engine_telemetry::apply(&mut env, crate::engine_telemetry::DO_NOT_TRACK, telemetry);
     if let Some(home) = &plan.home {
         env.insert("HOME".into(), home.clone());
     }
@@ -312,11 +317,13 @@ pub fn render_server(plan: &ServerPlan) -> RenderedCommand {
 /// (`lmcache/usage_telemetry`, default `LMCACHE_USAGE_TRACK_URL`) reports
 /// each process that imports it to `stats.lmcache.ai:8080` over plain HTTP
 /// unless `LMCACHE_TRACK_USAGE` is `false` or `DO_NOT_TRACK` is `1`; found
-/// live on host A. Both are rendered into the server's environment and into
-/// the engine's whenever its connector (which imports LMCache in the engine)
-/// is on, so nothing about a launch leaves the host.
-pub const NO_USAGE_TRACKING: [(&str, &str); 2] =
-    [("DO_NOT_TRACK", "1"), ("LMCACHE_TRACK_USAGE", "false")];
+/// live on host A. `LMCACHE_TRACK_USAGE=false` is rendered into the server's
+/// environment and into the engine's whenever its connector (which imports
+/// LMCache in the engine) is on, whatever the host's `engine_telemetry`
+/// says, so LMCache reports nothing off the host. `DO_NOT_TRACK=1`, which
+/// silences the engine's own reporting too, follows `engine_telemetry`
+/// (owner decision 2026-10-22): under `allow` the engine keeps its default.
+pub const NO_USAGE_TRACKING: [(&str, &str); 1] = [("LMCACHE_TRACK_USAGE", "false")];
 
 /// ADR 0033 §4: vLLM's `--kv-transfer-config`: LMCache's external MP
 /// connector by module path (never a bundled connector of the same name),
@@ -436,7 +443,7 @@ pub async fn start_server(
     incarnation: &str,
     plan: &ServerPlan,
 ) -> Result<Vec<ProcessIdentity>, ServerFailure> {
-    let cmd = render_server(plan);
+    let cmd = render_server(plan, crate::engine_telemetry::host_setting());
     let spawn_tools = tools.clone();
     let key = incarnation.to_owned();
     let leader = tokio::task::spawn_blocking(move || spawn_tools.spawn_lmcache(&key, &cmd))

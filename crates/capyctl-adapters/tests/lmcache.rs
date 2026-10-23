@@ -18,6 +18,7 @@ use axum::routing::{get, post};
 use axum::Json;
 use serde_json::{json, Value};
 
+use capyctl_adapters::engine_telemetry::EngineTelemetry;
 use capyctl_adapters::lmcache::{
     render_server, start_server, vllm_kv_transfer_config, write_sglang_config, LmcacheLaunch,
     LmcacheReport, LmcacheState, ServerPlan,
@@ -355,7 +356,10 @@ fn vllm_adapter(port: u16, plan: PlanInputVllm, tool: Arc<Tool>) -> VllmAdapter 
 #[test]
 fn the_server_argv_is_exactly_capyctls() {
     let root = tempfile::tempdir().unwrap();
-    let command = render_server(&server_plan(25002, root.path(), false));
+    let command = render_server(
+        &server_plan(25002, root.path(), false),
+        EngineTelemetry::Off,
+    );
     assert_eq!(
         command.argv,
         [
@@ -396,17 +400,24 @@ fn the_server_argv_is_exactly_capyctls() {
         .any(|a| a.contains("l2") || a.contains("p2p") || a.contains("gds") || a.contains("disk")));
 }
 
-// T45 T21 T37 (ADR 0033 §3, A7): the server's environment is exactly PATH,
-// HOME, the instance's CUDA_VISIBLE_DEVICES and LMCache's usage telemetry
-// switched off (found live: LMCache 0.5.6 reports to stats.lmcache.ai over
-// plain HTTP otherwise); only the launcher's log name rides beside them, and
-// the launcher never passes it on (capyctl-launchers test
+// T45 T21 T37 (ADR 0033 §3, A7; owner decision 2026-10-22): the server's
+// environment is exactly PATH, HOME, the instance's CUDA_VISIBLE_DEVICES and
+// LMCache's usage telemetry switched off (found live: LMCache 0.5.6 reports to
+// stats.lmcache.ai over plain HTTP otherwise), plus DO_NOT_TRACK=1 under the
+// host's `engine_telemetry: off` only; only the launcher's log name rides
+// beside them, and the launcher never passes it on (capyctl-launchers test
 // `the_server_starts_with_exactly_its_closed_environment_and_its_own_log`).
 #[test]
 fn the_server_env_is_exactly_its_names_with_telemetry_off() {
     let root = tempfile::tempdir().unwrap();
     let mut plan = server_plan(25002, root.path(), false);
-    let names = |plan: &ServerPlan| render_server(plan).env.keys().cloned().collect::<Vec<_>>();
+    let names = |plan: &ServerPlan| {
+        render_server(plan, EngineTelemetry::Off)
+            .env
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
     assert_eq!(
         names(&plan),
         [
@@ -417,7 +428,7 @@ fn the_server_env_is_exactly_its_names_with_telemetry_off() {
             "PATH"
         ]
     );
-    let env = render_server(&plan).env;
+    let env = render_server(&plan, EngineTelemetry::Off).env;
     assert_eq!(env["PATH"], "/opt/venv/bin:/usr/bin:/bin");
     assert_eq!(
         (
@@ -426,6 +437,10 @@ fn the_server_env_is_exactly_its_names_with_telemetry_off() {
         ),
         ("1", "false")
     );
+    // Under `allow` LMCache's own switch stays; DO_NOT_TRACK is not set.
+    let env = render_server(&plan, EngineTelemetry::Allow).env;
+    assert_eq!(env["LMCACHE_TRACK_USAGE"], "false");
+    assert!(!env.contains_key("DO_NOT_TRACK"));
     plan.home = None;
     plan.cuda_visible_devices = None;
     assert_eq!(

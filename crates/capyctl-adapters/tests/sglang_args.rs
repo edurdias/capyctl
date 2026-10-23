@@ -114,10 +114,12 @@ fn wrapper_command_cannot_resolve_through_daemon_working_directory() {
     );
 }
 
-// T45 T21 (ADR 0033 §3, A7; found live): a launch with LMCache's connector
-// renders LMCache's usage telemetry off beside the plugin selection (the
-// connector imports LMCache in the engine; `initialize` never lets the
-// resolved engine env replace a rendered name); without it, neither name.
+// T45 T21 (ADR 0033 §3, A7; found live; owner decision 2026-10-22): a launch
+// with LMCache's connector renders LMCache's usage telemetry off beside the
+// plugin selection (the connector imports LMCache in the engine; `initialize`
+// never lets the resolved engine env replace a rendered name); without it,
+// no LMCache name. `DO_NOT_TRACK` is not LMCache's to render: it follows the
+// host's `engine_telemetry` in `initialize`.
 #[test]
 fn a_launch_with_lmcache_renders_its_telemetry_off() {
     let launch = SglangLaunch::from_frozen(&frozen(metadata(1), settings())).unwrap();
@@ -130,7 +132,6 @@ fn a_launch_with_lmcache_renders_its_telemetry_off() {
             .unwrap()
             .env
     };
-    assert!(!env(&launch).contains_key("DO_NOT_TRACK"));
     assert!(!env(&launch).contains_key("LMCACHE_TRACK_USAGE"));
     let launch = launch
         .with_lmcache_config_file(std::path::Path::new(
@@ -140,7 +141,6 @@ fn a_launch_with_lmcache_renders_its_telemetry_off() {
     assert_eq!(
         env(&launch),
         [
-            ("DO_NOT_TRACK".to_owned(), "1".to_owned()),
             ("LMCACHE_TRACK_USAGE".to_owned(), "false".to_owned()),
             (
                 "SGLANG_PLUGINS".to_owned(),

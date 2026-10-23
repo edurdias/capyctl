@@ -598,34 +598,31 @@ mod tests {
             .any(|k| k.starts_with("NCCL_") || k.starts_with("GLOO_") || k.starts_with("MASTER_")));
     }
 
-    // T45 T21 (ADR 0033 §3, A7; found live): an engine with the LMCache
-    // connector imports LMCache, so it spawns with LMCache's usage telemetry
-    // off, whatever the resolved engine env says; without the connector
-    // CapyCTL renders neither name.
+    // T45 T21 (ADR 0033 §3, A7; found live; owner decision 2026-10-22): an
+    // engine with the LMCache connector imports LMCache, so it spawns with
+    // `LMCACHE_TRACK_USAGE=false` under either `engine_telemetry` setting;
+    // `DO_NOT_TRACK` follows the setting alone, so under `allow` vLLM keeps
+    // its own default. Without the connector CapyCTL renders no LMCache name.
     #[test]
     fn an_engine_with_the_connector_spawns_with_lmcache_telemetry_off() {
+        use crate::engine_telemetry::EngineTelemetry;
         let mut plan = input(None);
-        plan.build_env = BTreeMap::from([("DO_NOT_TRACK".to_owned(), "0".to_owned())]);
-        let resolved = plan.build_env.clone();
-        let spawn = |plan: &PlanInputVllm| {
+        let spawn = |plan: &PlanInputVllm, telemetry: EngineTelemetry| {
             engine_environment(
                 &render_command(plan).unwrap().env,
                 plan,
                 "engine-key",
                 None,
                 &|_| None,
-                &resolved,
+                &BTreeMap::new(),
+                telemetry,
             )
         };
-        let env = spawn(&plan);
-        assert_eq!(env["DO_NOT_TRACK"], "0", "the deployment's own value");
-        assert!(!env.contains_key("LMCACHE_TRACK_USAGE"));
+        for telemetry in [EngineTelemetry::Off, EngineTelemetry::Allow] {
+            assert!(!spawn(&plan, telemetry).contains_key("LMCACHE_TRACK_USAGE"));
+        }
         plan.kv_transfer_config = Some(crate::lmcache::vllm_kv_transfer_config(25001));
-        let env = spawn(&plan);
-        assert_eq!(env["DO_NOT_TRACK"], "1");
-        assert_eq!(env["LMCACHE_TRACK_USAGE"], "false");
-        plan.build_env.clear();
-        let env = spawn(&plan);
+        let env = spawn(&plan, EngineTelemetry::Off);
         assert_eq!(
             (
                 env["DO_NOT_TRACK"].as_str(),
@@ -633,6 +630,11 @@ mod tests {
             ),
             ("1", "false")
         );
+        let env = spawn(&plan, EngineTelemetry::Allow);
+        assert_eq!(env["LMCACHE_TRACK_USAGE"], "false");
+        for (name, _) in crate::engine_telemetry::VLLM {
+            assert!(!env.contains_key(*name), "{name}");
+        }
     }
 
     // T21 (owner decision 2026-10-22): under `engine_telemetry: off` every

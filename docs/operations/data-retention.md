@@ -161,7 +161,8 @@ digest above, so different salts never share them.
 - **Nothing leaves the host:** LMCache's own usage telemetry (which by default
   reports to `stats.lmcache.ai` over plain HTTP) is turned off, in the server
   and in the engine, whose connector loads LMCache: both start with
-  `LMCACHE_TRACK_USAGE=false` and `DO_NOT_TRACK=1`.
+  `LMCACHE_TRACK_USAGE=false`, whatever the host's `engine_telemetry` says,
+  and under its default `off` also with `DO_NOT_TRACK=1`.
 - **Turn it off:** `lmcache: off` on the deployment, `lmcache: off` on the host
   (every deployment there), or `retention: zero`.
 
@@ -220,4 +221,5 @@ and whether it honours it is up to the program.
 
 A deployment or an engine profile cannot change this. Only the host can, with
 `engine_telemetry: allow` ([settings](configuration.md#engine-usage-reporting)),
-which leaves each engine's own default.
+which leaves each engine's own default. LMCache, when it runs, reports nothing
+either way ([LMCache](#lmcache)).

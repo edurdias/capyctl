@@ -119,7 +119,7 @@ fn the_server_starts_with_exactly_its_closed_environment_and_its_own_log() {
     let dir = tempfile::tempdir().unwrap();
     let recorder = Arc::new(Recorder::default());
     let tools = DurableProcessLaunch::new(recorder.clone());
-    let spawn = |incarnation: &str, telemetry: [(&str, &str); 2]| {
+    let spawn = |incarnation: &str, telemetry: &[(&str, &str)]| {
         let log = dir.path().join(format!("{incarnation}.lmcache.log"));
         let mut env: std::collections::BTreeMap<String, String> = [
             ("PATH", "/usr/bin:/bin"),
@@ -156,7 +156,11 @@ fn the_server_starts_with_exactly_its_closed_environment_and_its_own_log() {
         tools.stop_group(&[server], Duration::from_secs(1)).unwrap();
         text
     };
-    let text = spawn("inc-env", capyctl_adapters::lmcache::NO_USAGE_TRACKING);
+    // The server's switches under the host's `engine_telemetry: off`.
+    let text = spawn(
+        "inc-env",
+        &[("DO_NOT_TRACK", "1"), ("LMCACHE_TRACK_USAGE", "false")],
+    );
     assert_eq!(recorder.kinds(), ["lmcache"]);
     assert_eq!(
         printed_names(&text),
@@ -174,7 +178,7 @@ fn the_server_starts_with_exactly_its_closed_environment_and_its_own_log() {
     // A switch with any other value never reaches the server.
     let text = spawn(
         "inc-env-on",
-        [("DO_NOT_TRACK", "0"), ("LMCACHE_TRACK_USAGE", "true")],
+        &[("DO_NOT_TRACK", "0"), ("LMCACHE_TRACK_USAGE", "true")],
     );
     assert_eq!(
         printed_names(&text),

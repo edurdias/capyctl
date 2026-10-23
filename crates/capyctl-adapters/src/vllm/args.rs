@@ -417,7 +417,8 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
             config.clone(),
         );
         // The connector imports LMCache in the engine: its usage telemetry
-        // is off there too (A7); rendered, so no resolved env replaces it.
+        // is off there too, whatever `engine_telemetry` says (A7); rendered,
+        // so no resolved env replaces it.
         for (name, value) in crate::lmcache::NO_USAGE_TRACKING {
             env.insert(name.into(), value.into());
         }
