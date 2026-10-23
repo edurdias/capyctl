@@ -534,6 +534,51 @@ async fn a_readiness_probe_proves_the_woken_model_usable() {
     );
 }
 
+/// SPEC §13.2 / T20 (found live 2026-10-23): a launch parks and wakes as often
+/// as it is asked to. Its 13th wake was refused at the probe, before any
+/// engine call, by a bound on the step ids the launch had ever run (5 per park
+/// and wake), and the wake read uncertain. Twenty-five cycles all complete on
+/// one adapter, each answered by the engine, and a repeat of a recent step is
+/// still refused without a call.
+// T20 T16
+#[tokio::test]
+async fn a_launch_parks_and_wakes_as_often_as_it_is_asked() {
+    let engine = Shared::default();
+    let port = serve(engine.clone()).await;
+    let vllm = adapter(port, ParkPolicy::Enabled);
+    for cycle in 0..25 {
+        for (action, suffix) in [
+            (RuntimeAction::Park, "park"),
+            (RuntimeAction::Restore, "wake"),
+            (RuntimeAction::ReloadWeights, "wake:reload"),
+            (RuntimeAction::InvalidateCache, "wake:cache"),
+            (RuntimeAction::Probe, "wake:probe"),
+        ] {
+            let id = format!("op-{cycle}-{suffix}");
+            vllm.execute_persisted(&step(action, &id))
+                .await
+                .unwrap_or_else(|e| panic!("{id}: {e:?}"));
+        }
+    }
+    let chats = |engine: &Shared| {
+        engine
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|call| *call == "chat")
+            .count()
+    };
+    assert_eq!(chats(&engine), 25);
+    assert_eq!(
+        vllm.execute_persisted(&step(RuntimeAction::Probe, "op-24-wake:probe"))
+            .await
+            .unwrap_err(),
+        RuntimeError::Unsupported
+    );
+    assert_eq!(chats(&engine), 25);
+}
+
 /// ADR 0030 §3, §4: a decisions launch woken on vLLM is proven usable by the
 /// fixed decision, never by a chat answer. Decision deployments resolve
 /// `restart_only` today (§7.2), so this is the post-wake proof parking them

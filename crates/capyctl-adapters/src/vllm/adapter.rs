@@ -71,8 +71,8 @@ pub struct VllmAdapter {
     /// or remote, has one; `None` is only an engine launched before the admin
     /// role, which keeps its single-key guard until it restarts (ADR 0012).
     admin_key: Option<String>,
-    /// The residency-step fence (SPEC §13.2): one step at a time, each step id
-    /// once, and nothing further after a step whose outcome is unknown.
+    /// The residency-step fence (SPEC §13.2): one step at a time, each recent
+    /// step id once, and nothing further after a step whose outcome is unknown.
     residency: Mutex<ResidencyFence>,
     /// ADR 0010, discrete GPU design §5: the sleep level a park uses, from the
     /// deployment's declared residency at launch; never from a command.
@@ -90,7 +90,7 @@ pub struct VllmAdapter {
 struct ResidencyFence {
     active: bool,
     uncertain: bool,
-    steps: std::collections::HashSet<String>,
+    steps: crate::step_fence::RecentSteps,
 }
 
 impl VllmAdapter {
@@ -227,21 +227,18 @@ impl VllmAdapter {
         self.set_parked(member, parked);
     }
 
-    /// Admit one residency step: none running, this step id never seen, and
-    /// no earlier step left uncertain. Refusal here precedes any engine call.
+    /// Admit one residency step: none running, this step id not among the
+    /// recent ones, and no earlier step left uncertain. Refusal here precedes
+    /// any engine call. The step ids are not bounded over the launch's life: a
+    /// launch parks and wakes as often as it is asked to (`step_fence`).
     pub(super) fn begin_residency_step(&self, step_id: &str) -> Result<(), RuntimeError> {
         let mut fence = self
             .residency
             .lock()
             .map_err(|_| RuntimeError::Unsupported)?;
-        if fence.active
-            || fence.uncertain
-            || fence.steps.len() >= 64
-            || fence.steps.contains(step_id)
-        {
+        if fence.active || fence.uncertain || !fence.steps.admit(step_id) {
             return Err(RuntimeError::Unsupported);
         }
-        fence.steps.insert(step_id.to_string());
         fence.active = true;
         Ok(())
     }
