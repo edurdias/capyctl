@@ -22,7 +22,17 @@ Tests (T14 T20): `a_restart_only_wake_gets_the_initialize_window` (config: deriv
 declared values, request-deadline bound), `a_restart_only_revision_frozen_with_the_deep_park_wake_still_decodes`,
 and the store's `a_restart_only_wake_gets_the_initialize_window` (frozen, host-resolved,
 declared and parking revisions). CPU and Fake-engine tests are not qualification. Live
-check: LIVE_RESULT
+check (host A, 2026-10-23, standalone built from this branch with `fix/wake-flakes` on
+`0b6f6fb6`; SGLang 0.5.22 with LMCache 0.5.6, Qwen3-4B, the benchmark's deployment): status
+shows a wake window of 1,200 s with `timeouts.initialize: 1200s` and 690 s for the same
+deployment without `timeouts` (both were 105 s). 36 restart-park wakes over three launches
+(14, 11, 11), each woken by a router request with a new prompt, were all served: 92–99 s,
+and one of 197 s that the old window would have failed. The first launch's 15th wake was
+held back for memory (`insufficient_memory`, then a 503 after 600 s): the LMCache server's
+GPU memory grew by one engine KV cache (5,328 MiB) per restart-park while the charge
+counted one. That is a separate defect with its own fix, not this one. The benchmark's
+failed wake was the 11th consecutive park of one launch, where that growth had probably
+slowed the restart [inference].
 
 # Release note: Fixes
 
