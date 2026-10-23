@@ -19,7 +19,7 @@ CI_STEPS=(fmt name clippy unit runtime shellcheck installer changes)
 DEEP_STEPS=(core workspace)
 STEPS=("${CI_STEPS[@]}")
 CORE_PKGS=(-p capyctl-adapters -p capyctl-store -p capyctl-controller -p capyctl-management -p harness)
-SHELL_FILES=(packaging/release.sh packaging/install.sh scripts/verify-packaging.sh scripts/check-release-clean.sh scripts/test-install.sh scripts/check-name.sh scripts/assemble-changes.sh scripts/test-assemble-changes.sh)
+SHELL_FILES=(packaging/release.sh packaging/install.sh scripts/verify-packaging.sh scripts/check-release-clean.sh scripts/test-install.sh scripts/check-name.sh scripts/assemble-changes.sh scripts/test-assemble-changes.sh scripts/release-notes-body.sh)
 
 cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/capyctl-ci"
 ORIG_TARGET_DIR="${CARGO_TARGET_DIR:-}"

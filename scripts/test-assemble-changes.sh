@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Exercise scripts/assemble-changes.sh on scratch checkouts.
+# Exercise scripts/assemble-changes.sh and scripts/release-notes-body.sh on
+# scratch checkouts.
 #
 #   scripts/test-assemble-changes.sh
 #
@@ -18,7 +19,14 @@
 #   - refusals: an empty file, no "# Status:" first, no "# Release note:",
 #     another level-1 heading, text before "# Status:", a relative link
 #     without ../, "none" with text, an empty release note; none of them
-#     changes any file.
+#     changes any file;
+#   - the release page body: every relative link (inline, with a title, a
+#     reference definition, a same-folder file, the notes' own anchor, a
+#     folder) pinned to the full release commit, given abbreviated; absolute
+#     links, code spans and fences unchanged; refused, with nothing printed:
+#     a heading added after the release commit, a "heading" inside a code
+#     fence, a missing file, an anchor on a folder, a link out of the
+#     repository.
 set -euo pipefail
 
 root=$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)
@@ -342,6 +350,109 @@ refuse "an empty release note" 'the release note is empty' <<'EOF'
 y.
 
 # Release note: Fixes
+EOF
+
+# --- the release page body (scripts/release-notes-body.sh) --------------------
+body_script=$root/scripts/release-notes-body.sh
+new_tree "$work/body"
+mkdir -p "$tree/docs/guide"
+cat >"$tree/docs/guide/a.md" <<'EOF'
+# Guide
+
+## A heading with `code` and llama.cpp
+
+## Repeated
+
+## Repeated
+
+<a id="explicit-anchor"></a>
+
+```bash
+## not a heading
+```
+EOF
+printf '# Settings\n' >"$tree/docs/operations/configuration.md"
+cat >"$tree/docs/operations/release-notes-0.0.3.md" <<'EOF'
+# CapyCTL 0.0.3
+
+## Fixes
+
+- **Guide.** See [a heading](../guide/a.md#a-heading-with-code-and-llamacpp) and
+  [again](../guide/a.md#repeated-1), [with a title](../guide/a.md "the guide").
+- **Same folder.** [settings](configuration.md), [the page](https://example.com/x),
+  [mail](mailto:x@example.invalid), [here](#fixes), [guides](../guide/).
+- **Code.** `[kept](../guide/missing.md)` stays.
+
+```text
+[kept too](../guide/missing.md)
+```
+
+[ref]: ../guide/a.md#explicit-anchor
+EOF
+g add -A
+GIT_COMMITTER_DATE='@200 +0000' GIT_AUTHOR_DATE='@200 +0000' g commit -q -m release
+release=$(g rev-parse HEAD)
+printf '\n## Later\n' >>"$tree/docs/guide/a.md"
+g add -A
+GIT_COMMITTER_DATE='@300 +0000' GIT_AUTHOR_DATE='@300 +0000' g commit -q -m later
+expected_body=$work/expected-body
+sed "s/@SHA@/$release/g" >"$expected_body" <<'EOF'
+# CapyCTL 0.0.3
+
+## Fixes
+
+- **Guide.** See [a heading](https://github.com/edurdias/capyctl/blob/@SHA@/docs/guide/a.md#a-heading-with-code-and-llamacpp) and
+  [again](https://github.com/edurdias/capyctl/blob/@SHA@/docs/guide/a.md#repeated-1), [with a title](https://github.com/edurdias/capyctl/blob/@SHA@/docs/guide/a.md "the guide").
+- **Same folder.** [settings](https://github.com/edurdias/capyctl/blob/@SHA@/docs/operations/configuration.md), [the page](https://example.com/x),
+  [mail](mailto:x@example.invalid), [here](https://github.com/edurdias/capyctl/blob/@SHA@/docs/operations/release-notes-0.0.3.md#fixes), [guides](https://github.com/edurdias/capyctl/tree/@SHA@/docs/guide).
+- **Code.** `[kept](../guide/missing.md)` stays.
+
+```text
+[kept too](../guide/missing.md)
+```
+
+[ref]: https://github.com/edurdias/capyctl/blob/@SHA@/docs/guide/a.md#explicit-anchor
+EOF
+before=$(snapshot)
+if out=$("$body_script" --root "$tree" 0.0.3 "${release:0:12}" 2>"$work/body-err") \
+  && [ "$out" = "$(cat "$expected_body")" ] && [ "$(snapshot)" = "$before" ]; then
+  pass "the release body pins every relative link to the full release commit"
+else
+  fail "release body: $(cat "$work/body-err")"
+  diff <(echo "$out") "$expected_body" >&2 || true
+fi
+
+refuse_body() { # label message ; the notes' extra line on stdin
+  local label=$1 message=$2 out
+  cat "$tree/docs/operations/release-notes-0.0.3.md" - >"$work/notes-extra"
+  cp "$work/notes-extra" "$tree/docs/operations/release-notes-0.0.3.md"
+  if out=$("$body_script" --root "$tree" 0.0.3 "$release" 2>"$work/body-err"); then
+    fail "$label: accepted"
+  elif [ -n "$out" ]; then
+    fail "$label: printed a body"
+  elif ! grep -qF -- "$message" "$work/body-err"; then
+    fail "$label: message '$(cat "$work/body-err")' lacks '$message'"
+  else
+    pass "the release body refuses $label"
+  fi
+  g checkout -q -- docs/operations/release-notes-0.0.3.md
+}
+
+refuse_body "a heading added after the release commit" \
+  "line 16: ../guide/a.md#later: docs/guide/a.md has no heading #later" <<'EOF'
+- [later](../guide/a.md#later)
+EOF
+refuse_body "a heading inside a code fence" "has no heading #not-a-heading" <<'EOF'
+- [fenced](../guide/a.md#not-a-heading)
+EOF
+refuse_body "a missing file" "line 16: ../guide/b.md: docs/guide/b.md does not exist" <<'EOF'
+- [missing](../guide/b.md)
+EOF
+refuse_body "an anchor of a directory" "docs/guide has no heading #x" <<'EOF'
+- [folder](../guide/#x)
+EOF
+refuse_body "a link out of the repository" "../../../x.md leaves the repository" <<'EOF'
+- [out](../../../x.md)
 EOF
 
 echo
