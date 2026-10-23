@@ -102,9 +102,9 @@ short-lived child and a server stopped before its engine (A9; `7d9ab7fa`).
 Verification, with `main` `9c7c7ab0` merged in (#187, ADR 0032: the router's forwarder
 carries both the effective salt and ADR 0032's request-ID lane; #188,
 `engine_telemetry`; #189, docs; merges `012105f8`, `0a73eaf3` and `54aa3740`, no
-rebase), both fix branches below and the A13 fix: `scripts/ci-local.sh --deep
---ci-shape` passes, every step (unit 1632 passed, 1 ignored; runtime 369; core 1736
-passed; workspace 3707 passed, 1 ignored).
+rebase), both fix branches below and the A13 fix with the embedded SGLang wake fix
+(`417a2643`): `scripts/ci-local.sh --deep --ci-shape` passes, every step (unit 1632
+passed, 1 ignored; runtime 369; core 1737 passed; workspace 3708 passed, 1 ignored).
 
 Live rows, host A (GB10), Qwen3-4B (context 4096, KV cache 1 GiB, `restart_only`
 unless stated), 2026-10-22, standalone role, builds of `49f10efa` (the branch before the
@@ -305,13 +305,54 @@ its servers held 1608–1656 MiB after their engine's exit):
   never through a symlink). Test: an embedded SGLang restart-park then restore starts a
   new engine on the same server, the directory absent when it is spawned.
 
-Still missing: LC4 on SGLang (the restart-park quiescence fix); LC7 rerun as amended
-(decisions on SGLang off, `required` refused); LC1 through CapyCTL on a server and host
-pair; the vLLM usage-report egress check on this head (#188) and the egress check under
-`engine_telemetry: allow` (no connection to `stats.lmcache.ai` from the server or the
-engine); the post-wake KV charge and measurement fix (A13) live on both engines; the
-decision-model allowance measurement, which waits for a SGLang release with the upstream
-fix.
+Second live rerun, host A (GB10), build `d2901204` (before A13 and the SGLang wake fix),
+Qwen3-4B (context 4096, KV cache 1 GiB, `restart_only` unless stated), standalone role,
+fresh state, 2026-10-23 05:24–06:04 UTC; record `target/live/lmcache-rerun2/spark-0292/`
+on the laptop:
+
+- **LC4 on SGLang, fail at the wake.** The restart-park now passes (about 6 s, no
+  `park_refused`): engine PIDs gone, the same server PID, server GPU 408 → 1656 MiB,
+  parked charge 7,247,757,312 B (the Ready charge 6,174,015,488 B plus 1 GiB held KV).
+  The wake by request failed in about 2 s, `loopback_rendezvous_failed` (fixed above in
+  `a3b9cc48`, not yet run live). The parked reading also became the measurement (device
+  1,736,441,856 B), so the next launch charged 6,886,703,104 B while the server held 406
+  MiB of GPU memory: the SGLang case of the A13 finding.
+- **LC7 as amended, pass.** Clef-Flash (`api: decisions`, SGLang 0.5.22) runs off
+  `engine_unsupported` with the reason and the SGLang issue link in status, JSON and one
+  `lmcache_off` event; no LMCache server, launch settings without LMCache; decisions
+  served (0.77–0.80 s). With `lmcache: required` the deploy is refused, exit 5,
+  `lmcache_unavailable:engine_unsupported`, nothing created.
+- **`--disable-radix-cache` on SGLang, pass.** Off `engine_unsupported` with the event,
+  served, no server; `required` refused, exit 5, `lmcache_unavailable:engine_unsupported`.
+- **LC2 on SGLang, pass:** after three fillers the prompt hit 3,328 tokens (13 chunks) and
+  the answer equalled the `lmcache: off` deployment's fresh answer. SGLang 0.5.22's
+  temperature-0 output varied with the prefix cache's shape with and without LMCache
+  (the first cold answer, and the off deployment's own radix-cache hit), not an LMCache
+  effect.
+- **LC3 on SGLang, pass:** no hit across salt A, salt B and no salt; after the fillers
+  each hit 3,328 tokens with the same answer; LMCache's
+  `lmcache_mp_l1_write_chunks_total` shows 13 chunks under each salt's digest, equal to
+  §5's digest computed independently, and unsalted keys under `""`.
+- **LC8 on SGLang, pass:** SIGKILL to the recorded server 5 s into the start stopped the
+  engine (verified), relaunched it once without LMCache (served), one `lmcache_off`
+  `engine_start_failed`, the warning, `start --wait` exit 13; the next start planned
+  off. With `required` the launch failed `lmcache_unavailable:engine_start_failed` with
+  every recorded PID gone and nothing running.
+- **Egress, pass.** `ss -tuanp` every 0.2 s over the role's process tree: under the
+  default `engine_telemetry` (a `deep` vLLM deployment off `park_unqualified` Ready 20
+  min, and the SGLang rows; 6,729 samples) and under `retention: zero` (vLLM, 1,993
+  samples) nothing left loopback, vLLM engines carried `DO_NOT_TRACK=1`,
+  `VLLM_DO_NOT_TRACK=1` and `VLLM_NO_USAGE_STATS=1`, and vLLM wrote no usage file. Under
+  `engine_telemetry: allow` with LMCache on both engines (Ready 9 min, 14 requests, 2,964
+  samples) nothing left loopback and no process reached `stats.lmcache.ai`; the server
+  and every process importing LMCache had `LMCACHE_TRACK_USAGE=false` and none of the
+  other opt-outs. vLLM's own reporter ran under `allow` (its usage file was written) but
+  no `stats.vllm.ai` socket was caught; a short request can fall between 0.2 s samples,
+  for LMCache too.
+
+Still missing: LC4 on SGLang and the A13 charge and measurement live on both engines, on
+`417a2643`; LC1 through CapyCTL on a server and host pair; the decision-model allowance
+measurement, which waits for a SGLang release with the upstream fix.
 
 CPU and Fake-engine tests are not qualification.
 
