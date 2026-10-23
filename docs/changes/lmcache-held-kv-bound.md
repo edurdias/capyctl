@@ -44,7 +44,20 @@ server, through the embedded adapter's and a remote host's evidence. Existing re
 tests now send the release reading before the idle park. CPU and Fake-engine tests only;
 they are not qualification.
 
-Live check: LIVE_RESULTS_PENDING
+Live check (host A, GB10, 2026-10-23, this branch's code; evidence kept outside the
+repository): 12 park and wake cycles with the same prompt each, SGLang 0.5.22 then vLLM
+0.32.0 with LMCache 0.5.6 (Qwen3-4B, 12 GiB pool, 5 GiB KV). All 24 requests answered 200.
+SGLang alternated a restart-park (the cache answered 2,048 tokens after the wake) and a stop
+of the instance with its server (6 `lmcache_server_stopped`, each server's process gone, a
+new server per start); the server never read more than 5,736 MiB (53,624 MiB before the
+fix). vLLM held the old KV the same way whenever the request after the wake stored nothing
+(5,526 MiB parked, 5,670 MiB after the wake, no release) and stopped at the next park
+(4 stops); at the other parks the server held no engine KV and the reading after the wake
+released the charged KV (4 `lmcache_kv_released`). In all 114 samples with a server running
+the charge covered its GPU reading; it was raised from readings 16 times (for example 5,736
+MiB after a SGLang wake against the 5,632 MiB the first launch held). The first SGLang try
+failed its first wake at 103 s on the 105 s restart-park wake window
+(`fix/restart-park-wake-window`, not on main); the run used `timeouts.wake: 1200s`.
 
 # Release note: Fixes
 

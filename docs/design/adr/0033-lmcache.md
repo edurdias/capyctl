@@ -1018,8 +1018,10 @@ the same prompt the server held 53,624 MiB at the tenth wake while the launch wa
 device allowance); the wake was refused for memory (`residency_blocked insufficient_memory`)
 and the router answered 503 after 600 s. With a new prompt every cycle the fifteenth wake
 was refused the same way with the server at 80,324 MiB and 18.2 GiB charged. A13's release
-(a reading below the KV after the new engine first stores KV) held on vLLM and never came
-on SGLang. Two rules, on both engines and every host:
+(a reading below the KV after the new engine first stores KV) never came on SGLang, and on
+vLLM 0.32.0 not when the request after the wake stored nothing (the live check of this
+amendment: 5,526 MiB parked, 5,670 MiB after a wake with the same prompt, no release). Two
+rules, on both engines and every host:
 
 - **The charge is never below what the server is seen to hold.** A GPU reading of the
   server above the GPU memory the launch's charge holds for it in its phase (its device
