@@ -315,6 +315,9 @@ pub struct HostConfig {
     /// Owner decision 2026-10-20: `engine_logs`, where each launch's redacted
     /// engine output is kept ([`engine_logs`]).
     pub engine_logs: EngineLogs,
+    /// Owner decision 2026-10-22: `engine_telemetry`, whether the engines'
+    /// own usage reporting keeps its defaults ([`engine_telemetry`]).
+    pub engine_telemetry: EngineTelemetry,
     pub document: Value,
     /// Owner decision 2026-09-25: the generic overrides (`--set`,
     /// `CAPYCTL_SET__…`) the host started with. A live reload of the document
@@ -384,6 +387,33 @@ pub fn engine_logs(document: &Value) -> Result<EngineLogs, ConfigError> {
                 ConfigErrorCode::UnsupportedCombination,
                 "engine_logs",
                 "must be `files` or `memory`",
+            )),
+        },
+    }
+}
+/// Owner decision 2026-10-22 (SPEC §13.3): whether the engines a host starts
+/// may report their own usage off the host. `off` (the default) starts every
+/// engine with its usage-reporting opt-outs set; `allow` leaves each engine's
+/// own default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EngineTelemetry {
+    #[default]
+    Off,
+    Allow,
+}
+/// The `engine_telemetry` of a host document (or of a standalone document's
+/// `host:` block). Omitted, it is `off`; any value but `off` or `allow` is
+/// refused by name.
+pub fn engine_telemetry(document: &Value) -> Result<EngineTelemetry, ConfigError> {
+    match document.get("engine_telemetry") {
+        None => Ok(EngineTelemetry::Off),
+        Some(value) => match value.as_str() {
+            Some("off") => Ok(EngineTelemetry::Off),
+            Some("allow") => Ok(EngineTelemetry::Allow),
+            _ => Err(ConfigError::new(
+                ConfigErrorCode::UnsupportedCombination,
+                "engine_telemetry",
+                "must be `off` or `allow`",
             )),
         },
     }
@@ -681,6 +711,7 @@ impl HostConfig {
             drain_timeout: drain_timeout(&document)?,
             activation: host_activation(&document)?,
             engine_logs: engine_logs(&document)?,
+            engine_telemetry: engine_telemetry(&document)?,
             document,
             overrides: crate::setting_overrides::SettingOverrides::none(ConfigKind::Host),
         })

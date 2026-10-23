@@ -466,6 +466,9 @@ async fn the_engine_environment_is_a_closed_allowlist() {
         "CUDA_HOME",
         "MAX_JOBS",
         "FLASHINFER_NVCC_THREADS",
+        "DO_NOT_TRACK",
+        "VLLM_DO_NOT_TRACK",
+        "VLLM_NO_USAGE_STATS",
     ];
     for name in env.keys() {
         assert!(
@@ -484,6 +487,11 @@ async fn the_engine_environment_is_a_closed_allowlist() {
         Some("adm1n")
     );
     assert!(env.contains_key("CAPYCTL_EXTRA_APPROVALS"));
+    // T21 (owner decision 2026-10-22): the host's `engine_telemetry` is `off`
+    // unless a role says otherwise, so vLLM starts with its usage reporting off.
+    for name in ["DO_NOT_TRACK", "VLLM_DO_NOT_TRACK", "VLLM_NO_USAGE_STATS"] {
+        assert_eq!(env.get(name).map(String::as_str), Some("1"), "{name}");
+    }
     // PATH is the engine's own bin and fixed system directories only: no
     // profile `cuda_home`, no CUDA bin (SPEC §13.3 as amended 2026-09-25).
     assert_eq!(

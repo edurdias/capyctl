@@ -929,6 +929,8 @@ pub fn defaults(
             ("lifecycle.activation", Value::from("on_demand")),
             // Owner decision 2026-10-20: engine output in private log files.
             ("engine_logs", Value::from("files")),
+            // Owner decision 2026-10-22: engines report no usage off the host.
+            ("engine_telemetry", Value::from("off")),
         ];
         if let Some(root) = crate::model_settings::default_models_root(home) {
             out.push((

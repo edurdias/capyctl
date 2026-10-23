@@ -107,11 +107,13 @@ pub fn render_command(plan: &PlanInputCustom) -> Result<RenderedCommand, CustomA
 /// the engine's own names (`rendered`), then what CapyCTL owns: `HOME` and
 /// `CUDA_VISIBLE_DEVICES` from the agent (or the pinned device), `PATH` the
 /// executable's directory then the fixed system directories, both offline
-/// switches, and the log metadata. Nothing else of the agent's environment.
+/// switches, `DO_NOT_TRACK=1` unless the host allows usage reporting, and the
+/// log metadata. Nothing else of the agent's environment.
 pub fn engine_environment(
     rendered: &BTreeMap<String, String>,
     plan: &PlanInputCustom,
     inherited: &dyn Fn(&str) -> Option<String>,
+    telemetry: crate::engine_telemetry::EngineTelemetry,
 ) -> BTreeMap<String, String> {
     let mut env = rendered.clone();
     for name in PASS_THROUGH {
@@ -136,6 +138,9 @@ pub fn engine_environment(
     for (name, value) in OFFLINE {
         env.insert(name.into(), value.into());
     }
+    // Owner decision 2026-10-22: a custom engine is an unknown program, so it
+    // gets the general convention; whether it honours it is its own.
+    crate::engine_telemetry::apply(&mut env, crate::engine_telemetry::DO_NOT_TRACK, telemetry);
     if let Some(log) = &plan.engine_log {
         env.insert("CAPYCTL_ENGINE_LOG".into(), log.clone());
     }
@@ -153,6 +158,7 @@ pub fn engine_environment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine_telemetry::EngineTelemetry;
     use capyctl_config::custom::CustomManifest;
 
     fn manifest(text: &str) -> CustomManifest {
@@ -241,7 +247,7 @@ mod tests {
             "CUDA_VISIBLE_DEVICES" => Some("0".to_owned()),
             _ => Some("leaked".to_owned()),
         };
-        let env = engine_environment(&command.env, &plan, &inherited);
+        let env = engine_environment(&command.env, &plan, &inherited, EngineTelemetry::Off);
         assert_eq!(env["SERVE_AUTH"], "k3y-0123456789");
         assert_eq!(env["SERVE_NAME"], "m-basal");
         assert_eq!(env["SHARED"], "deployment", "the deployment's value wins");
@@ -267,6 +273,7 @@ mod tests {
                 "CAPYCTL_ENGINE_LOG",
                 "CAPYCTL_ENGINE_LOG_OWNS",
                 "CUDA_VISIBLE_DEVICES",
+                "DO_NOT_TRACK",
                 "HF_HUB_OFFLINE",
                 "HOME",
                 "PATH",
@@ -277,6 +284,13 @@ mod tests {
                 "TRANSFORMERS_OFFLINE",
             ]
         );
+        // T21 (owner decision 2026-10-22): under the host's
+        // `engine_telemetry: off` the convention's opt-out is set; under
+        // `allow` nothing is.
+        assert_eq!(env["DO_NOT_TRACK"], "1");
+        let allowed = engine_environment(&command.env, &plan, &inherited, EngineTelemetry::Allow);
+        assert!(!allowed.contains_key("DO_NOT_TRACK"));
+        assert_eq!(allowed.len(), env.len() - 1);
     }
 
     // T44 (ADR 0031 §2, §10): a reserved name is refused again at launch,
@@ -343,7 +357,7 @@ mod tests {
             Some("k3y-0123456789"),
         );
         let mut command = render_command(&plan).unwrap();
-        command.env = engine_environment(&command.env, &plan, &|_| None);
+        command.env = engine_environment(&command.env, &plan, &|_| None, EngineTelemetry::Off);
         let shown = format!("{command:?} {plan:?}");
         assert!(!shown.contains("k3y-0123456789"), "{shown}");
         assert!(shown.contains("--api-key=<redacted>"), "{shown}");

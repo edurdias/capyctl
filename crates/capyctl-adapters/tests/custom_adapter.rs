@@ -435,6 +435,9 @@ async fn a_chat_engine_is_ready_only_after_its_chat_probe() {
     );
     assert_eq!(spawned.env["HF_HUB_OFFLINE"], "1");
     assert_eq!(spawned.env["TRANSFORMERS_OFFLINE"], "1");
+    // T21 (owner decision 2026-10-22): `engine_telemetry` is `off` unless a
+    // role says otherwise.
+    assert_eq!(spawned.env["DO_NOT_TRACK"], "1");
     assert!(spawned.env["PATH"].starts_with("/home/u/basal-venv/bin:"));
     assert!(!spawned
         .env

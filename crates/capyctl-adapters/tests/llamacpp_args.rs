@@ -1,6 +1,7 @@
 //! ADR 0029 §4–§6, §9: the llama-server command and its closed environment.
 //! CPU tests only; they prove the rendering, not that llama-server starts,
 //! and they do not qualify llama.cpp (only the live rows LC1–LC6 do).
+use capyctl_adapters::engine_telemetry::EngineTelemetry;
 use capyctl_adapters::llamacpp::{
     engine_environment, plan_from_effective, recheck_rendered, render_command, LlamacppArgsError,
     LlamacppDirs, LlamacppPlanError, PlanInputLlamacpp,
@@ -233,12 +234,13 @@ fn the_environment_is_closed() {
         "CUDA_VISIBLE_DEVICES" => Some("GPU-0".to_owned()),
         _ => None,
     };
-    let env = engine_environment(&rendered, &input, &inherited);
+    let env = engine_environment(&rendered, &input, &inherited, EngineTelemetry::Off);
     assert_eq!(
         env.keys().map(String::as_str).collect::<Vec<_>>(),
         [
             "CAPYCTL_ENGINE_LOG",
             "CUDA_VISIBLE_DEVICES",
+            "DO_NOT_TRACK",
             "GGML_CUDA_NO_PINNED",
             "LLAMA_CACHE",
             "PATH",
@@ -246,6 +248,12 @@ fn the_environment_is_closed() {
             "XDG_CONFIG_HOME",
         ]
     );
+    // T21 (owner decision 2026-10-22): under the host's `engine_telemetry:
+    // off` the convention's opt-out is set; under `allow` nothing is.
+    assert_eq!(env["DO_NOT_TRACK"], "1");
+    let allowed = engine_environment(&rendered, &input, &inherited, EngineTelemetry::Allow);
+    assert!(!allowed.contains_key("DO_NOT_TRACK"));
+    assert_eq!(allowed.len(), env.len() - 1);
     assert_eq!(
         env["XDG_CONFIG_HOME"],
         "/var/lib/capyctl/engines/llamacpp/config"
@@ -288,7 +296,7 @@ fn the_environment_drops_listener_and_device_overrides() {
         .chain([("GGML_CUDA_NO_PINNED".to_owned(), "1".to_owned())])
         .collect();
     let rendered = render_command(&input).unwrap().env;
-    let env = engine_environment(&rendered, &input, &|_| None);
+    let env = engine_environment(&rendered, &input, &|_| None, EngineTelemetry::Off);
     for name in overrides {
         assert!(!env.contains_key(name), "{name} reached the engine");
     }

@@ -1,5 +1,6 @@
 //! ADR 0023 §3: the TensorFold command and its closed environment. CPU tests
 //! only; they prove the rendering, not that TensorFold starts.
+use capyctl_adapters::engine_telemetry::EngineTelemetry;
 use capyctl_adapters::tensorfold::{
     engine_environment, plan_from_effective, render_command, PlanInputTensorfold,
     TensorfoldArgsError, TensorfoldPlanError,
@@ -229,7 +230,13 @@ fn the_engine_environment_is_closed() {
         ("CUDA_HOME".to_string(), "/usr/local/cuda".to_string()),
         ("MAX_JOBS".to_string(), "4".to_string()),
     ]);
-    let env = engine_environment(&rendered, &input, &inherited, &toolchain);
+    let env = engine_environment(
+        &rendered,
+        &input,
+        &inherited,
+        &toolchain,
+        EngineTelemetry::Off,
+    );
     assert_eq!(
         env["PATH"],
         "/opt/tf/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
@@ -242,6 +249,19 @@ fn the_engine_environment_is_closed() {
     }
     assert_eq!(env["CAPYCTL_ENGINE_LOG"], "/var/lib/capyctl/logs/i.log");
     assert!(!env.contains_key("TENSORFOLD_CUDA_MEMORY_LIMIT_GB"));
+    // T21 (owner decision 2026-10-22): under the host's `engine_telemetry:
+    // off` the convention's opt-out is set; under `allow` nothing is.
+    assert_eq!(env["DO_NOT_TRACK"], "1");
+    let allowed = engine_environment(
+        &rendered,
+        &input,
+        &inherited,
+        &toolchain,
+        EngineTelemetry::Allow,
+    );
+    assert!(!allowed.contains_key("DO_NOT_TRACK"));
+    // The release check is not usage reporting: it stays off either way.
+    assert_eq!(allowed["TENSORFOLD_NO_UPDATE_CHECK"], "1");
 }
 
 // T37: the resolved engine env joins the closed allowlist, and CapyCTL's own
@@ -255,7 +275,13 @@ fn the_resolved_engine_env_is_admitted_but_never_wins() {
     ]);
     let rendered = render_command(&input).unwrap().env;
     let toolchain = input.build_env.clone();
-    let env = engine_environment(&rendered, &input, &|_| None, &toolchain);
+    let env = engine_environment(
+        &rendered,
+        &input,
+        &|_| None,
+        &toolchain,
+        EngineTelemetry::Off,
+    );
     assert_eq!(env["MBX_FUSED_DRAFT"], "1");
     assert_eq!(env["CAPYCTL_ENGINE_LOG"], "/var/lib/capyctl/logs/i.log");
 }
@@ -283,7 +309,13 @@ fn the_declared_allocation_caps_the_cuda_budget() {
     input.memory_limit_bytes = Some(58 << 30);
     let rendered = render_command(&input).unwrap().env;
     assert_eq!(rendered["TENSORFOLD_CUDA_MEMORY_LIMIT_GB"], "58");
-    let env = engine_environment(&rendered, &input, &|_| None, &BTreeMap::new());
+    let env = engine_environment(
+        &rendered,
+        &input,
+        &|_| None,
+        &BTreeMap::new(),
+        EngineTelemetry::Off,
+    );
     assert_eq!(env["TENSORFOLD_CUDA_MEMORY_LIMIT_GB"], "58");
     // Rounded down to a whole MiB, written exactly.
     input.memory_limit_bytes = Some((58 << 30) + (512 << 20) + 1000);
@@ -666,7 +698,13 @@ fn no_transport_variables_and_no_credentials() {
         let cmd = render_command(&input).unwrap();
         assert!(!cmd.env.keys().any(owned), "{:?}", cmd.env);
         assert_eq!(cmd.env["TF_NCCL_LIB"], "/opt/tf/nccl/libnccl.so.2");
-        let env = engine_environment(&cmd.env, &input, &inherited, &BTreeMap::new());
+        let env = engine_environment(
+            &cmd.env,
+            &input,
+            &inherited,
+            &BTreeMap::new(),
+            EngineTelemetry::Off,
+        );
         assert!(!env.keys().any(owned), "{env:?}");
         assert_eq!(env["TF_NCCL_LIB"], "/opt/tf/nccl/libnccl.so.2");
         for absent in ["VLLM_API_KEY", "CAPYCTL_VLLM_ADMIN_KEY", "VLLM_HOST_IP"] {

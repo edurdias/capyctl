@@ -68,6 +68,7 @@ pub(super) async fn initialize(
         &plan,
         &|name| std::env::var(name).ok(),
         &toolchain,
+        crate::engine_telemetry::host_setting(),
     );
     let incarnation = context.incarnation.clone();
     let spawn_tools = tools.clone();

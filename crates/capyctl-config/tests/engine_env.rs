@@ -94,6 +94,21 @@ fn owned_names_are_never_settable() {
         let e = resolve_engine_env(&map(&[(name, "x")]), &a, &map(&[])).unwrap_err();
         assert_eq!(e.code(), format!("engine_env_reserved:{name}"));
     }
+    // T21 (owner decision 2026-10-22): the usage-reporting opt-outs are the
+    // host's `engine_telemetry`; a profile or a deployment cannot set them,
+    // whatever the approval and whatever the case.
+    let wide = approved(&["D*", "V*"]);
+    for name in [
+        "DO_NOT_TRACK",
+        "VLLM_DO_NOT_TRACK",
+        "VLLM_NO_USAGE_STATS",
+        "do_not_track",
+    ] {
+        let e = resolve_engine_env(&map(&[]), &wide, &map(&[(name, "0")])).unwrap_err();
+        assert_eq!(e.code(), format!("engine_env_reserved:{name}"));
+        let e = resolve_engine_env(&map(&[(name, "0")]), &wide, &map(&[])).unwrap_err();
+        assert_eq!(e.code(), format!("engine_env_reserved:{name}"));
+    }
     // T21: the TensorFold key is refused whatever its case, through its own
     // prefix glob too; naming it alone is not a valid approval.
     assert!(ApprovedEnv::parse(&["TENSORFOLD_API_KEY".to_string()]).is_err());
