@@ -337,6 +337,10 @@ pub fn apply_stated_queue(host: &mut Value, stated_host: &Value) {
 /// category sub-limit of the managed ceiling (SPEC §7.1, §6.5 bounded parked
 /// sets), so one above the managed limit is refused; the derived
 /// parked and host-KV sub-limits are lowered to a managed limit below them.
+/// ADR 0025 amendment of 2026-10-23: a stated host-KV limit is published as
+/// stated, as an enrolled host's `host_kv_limit` is (any size of zero or
+/// more, never compared with the managed limit, which bounds the same
+/// allocations anyway).
 /// Forms and ranges were checked when the document was read
 /// ([`capyctl_config::standalone::check_honoured`]).
 ///
@@ -411,7 +415,8 @@ pub fn apply_stated_memory(
         }
     }
     for sub_limit in ["parked_limit", "host_kv_limit"] {
-        if domain.get(sub_limit).is_some() && bytes(domain, sub_limit) > managed {
+        let stated = shares.iter().any(|(field, _)| *field == sub_limit);
+        if !stated && domain.get(sub_limit).is_some() && bytes(domain, sub_limit) > managed {
             domain[sub_limit] = json!(format!("{managed}B"));
         }
     }

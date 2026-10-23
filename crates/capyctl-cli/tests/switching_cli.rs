@@ -478,3 +478,79 @@ async fn standalone_parked_limit_follows_the_document_and_its_overrides() {
         "{error}"
     );
 }
+
+// T03 T16 T45 (ADR 0025 amendment of 2026-10-23; found live: a 20 GiB
+// LMCache pool did not fit the derived tenth of a 128 GB GB10, and `--set` of
+// the limit was refused): the standalone host-KV limit is set three ways,
+// `--set` over `CAPYCTL_SET__…` over the document over the derived 10 %, and
+// reaches the stored policy admission reads. As on an enrolled host, one
+// above the managed limit is stored as stated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_host_kv_limit_follows_the_document_and_its_overrides() {
+    use capyctl_cli::roles::SettingOverrides;
+    use capyctl_config::ConfigKind;
+    const CAPACITY: i64 = support::TEST_CAPACITY_BYTES;
+    const ENV: &str = "CAPYCTL_SET__HOST__RESOURCE_POLICY__MEMORY__SYSTEM__HOST_KV_LIMIT";
+    let dir = support::safe_state_dir();
+    let config = dir.path().join("standalone.yaml");
+    let ports = support::engine_ports();
+    let host_kv = |app: &capyctl_cli::roles::App| {
+        app.store
+            .resource_policy("standalone")
+            .unwrap()
+            .expect("the embedded host published its policy")
+            .controls
+            .domains["unified"]
+            .host_kv_limit
+    };
+    let boot = |yaml: &'static str, flags: Vec<String>, env: Vec<(String, String)>| {
+        std::fs::write(&config, yaml).unwrap();
+        let overrides = SettingOverrides::parse(ConfigKind::Standalone, &flags, &env).unwrap();
+        let config = config.clone();
+        let dir = dir.path().to_path_buf();
+        async move { support::boot_with_overrides_on(&dir, Some(&config), &overrides, ports).await }
+    };
+    const NONE: &str = "schema_version: 1\nkind: standalone\nname: s\n";
+    const YAML: &str = "schema_version: 1\nkind: standalone\nname: s\nhost:\n  resource_policy:\n    memory:\n      system:\n        host_kv_limit: 15%\n";
+    let flag = |value: &str| {
+        vec![format!(
+            "host.resource_policy.memory.system.host_kv_limit={value}"
+        )]
+    };
+    let env = || vec![(ENV.to_owned(), "18%".to_owned())];
+    for (yaml, flags, env, expected, channel) in [
+        (
+            NONE,
+            vec![],
+            vec![],
+            CAPACITY / 100 * 10,
+            "the derived default",
+        ),
+        (YAML, vec![], vec![], CAPACITY / 100 * 15, "the document"),
+        (
+            YAML,
+            vec![],
+            env(),
+            CAPACITY / 100 * 18,
+            "the environment over the document",
+        ),
+        (
+            YAML,
+            flag("20%"),
+            env(),
+            CAPACITY / 100 * 20,
+            "the flag over the environment",
+        ),
+        (
+            YAML,
+            flag("60%"),
+            vec![],
+            CAPACITY / 100 * 60,
+            "above the managed limit, as on a host",
+        ),
+    ] {
+        let app = boot(yaml, flags, env).await.expect(channel);
+        assert_eq!(host_kv(&app), Some(expected), "{channel}");
+        let _ = app.shutdown().await;
+    }
+}

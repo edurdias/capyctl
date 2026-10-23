@@ -920,6 +920,30 @@ released ([parking](parking.md#parking-with-lmcache)); a reading taken in that
 window is never the measurement. `memory.request` stays the engine's own GPU
 memory.
 
+**Long prompts.** LMCache 0.5.6 starts evicting once its pool is 80 % full,
+so the pool has to hold the prompts you want back plus whatever passes
+through it in between. Measured on a GB10 with vLLM 0.32.0 and Qwen3-4B
+(144 KiB of KV per token, 4.5 GiB for a 32,000-token prompt), after other long
+prompts had pushed a 32,000-token prompt out of the engine's cache: with a
+12 GiB pool LMCache returned 17,000 to 28,000 of its tokens and the first
+token came in 4.66 s; with a 20 GiB pool it returned all of them, in 0.35 s
+instead of 7.85 s without LMCache. The pool counts against the machine's
+host-KV limit, a tenth of memory on standalone (12.17 GiB on a 128 GB GB10),
+so a larger pool needs that limit raised too:
+
+```yaml
+# The deployment
+lmcache: required
+lmcache_pool: 20GiB
+```
+
+```bash
+capyctl start standalone --set host.resource_policy.memory.system.host_kv_limit=24GiB
+```
+
+On an enrolled host, raise `host_kv_limit` on the host memory domain in its
+document ([settings](../operations/configuration.md#standalone-host-kv-limit)).
+
 **Choosing.** A deployment's `lmcache` is `auto` (the default), `off` or
 `required`. With `auto`, a deployment that cannot use LMCache runs without
 it and says why. With `required` it refuses to start instead:

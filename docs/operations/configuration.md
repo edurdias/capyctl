@@ -441,7 +441,7 @@ a run with `--set` or `CAPYCTL_SET__…` (next section), and restart the role.
 | Idle, heartbeat, switching and shutdown bounds (unset, an idle timer is off: no idle model is stopped or parked) | server: `lifecycle_defaults`, `control`, `switching.drain_timeout` (standalone: `server.lifecycle_defaults`, `server.switching`); every role: `shutdown.drain_timeout` |
 | Response timing header | server: `observability.timing_header` (standalone: `server.observability`) |
 | Private ingress | host: `ingress` |
-| Memory domains, devices, limits, queues, labels, parked growth | host: `resource_policy` (standalone derives its own: its document accepts `auto` values there, the memory limits `memory.system.managed_limit`, `free_reserve` and `parked_limit`, `parked_growth_limit`, `endpoint_port_range`, and the `queue` bounds of a host) |
+| Memory domains, devices, limits, queues, labels, parked growth | host: `resource_policy` (standalone derives its own: its document accepts `auto` values there, the memory limits `memory.system.managed_limit`, `free_reserve`, `parked_limit` and `host_kv_limit`, `parked_growth_limit`, `endpoint_port_range`, and the `queue` bounds of a host) |
 | Runtime profiles | host: `runtime_profiles`; or `capyctl engine add` (its own flags: `--name`, `--deep-park`, `--drift`, `--arg`, `--approve-option`, `--approve-path`, `--allow-remote-code`; they write `engines.yaml`, which a host and standalone read alike); or `capyctl engine add --custom` with `--manifest` and `--yes`, which writes `custom-engines.yaml` ([Custom engines](#custom-engines)) |
 | Load report period | host: `load_report_interval` |
 | Activation policy: `on_demand` (default), or `explicit`, under which every deployment that may run on the host starts, stops, parks and wakes only on an operator's action | host: `lifecycle.activation` (standalone: `host.lifecycle.activation`) |
@@ -707,6 +707,40 @@ derived quarter, and its stored policy is unchanged. A card's own parked limit
 its limits literally, in `resource_policy.domains.<domain>.parked_limit`, and
 takes `--set` and `CAPYCTL_SET__…` the same way.
 
+### Standalone host-KV limit
+
+KV cache kept in host RAM outside the engine counts against the host-KV
+limit; on standalone that is the [LMCache](../guide/engines.md#lmcache) pool
+of each model that uses it. Standalone sets the limit at a tenth of the memory
+it observes (on a discrete-GPU machine, of host RAM): 12.17 GiB on a 128 GB
+GB10. A model is not admitted while its pool, with the pools of the models
+already running, would exceed it, so on that machine no `lmcache_pool` above
+12 GiB fits. Raise the limit with a size or a whole percentage (as with the
+other limits, a percentage is of the memory observed at start):
+
+```bash
+capyctl start standalone --set host.resource_policy.memory.system.host_kv_limit=24GiB
+CAPYCTL_SET__HOST__RESOURCE_POLICY__MEMORY__SYSTEM__HOST_KV_LIMIT=20%
+```
+
+```yaml
+host:
+  resource_policy:
+    memory:
+      system:
+        host_kv_limit: "24GiB"   # or "20%"; auto is 10 %
+```
+
+`--set` wins over the variable, and both over the document. It takes what a
+host role's `resource_policy.domains.<domain>.host_kv_limit` takes, any size
+from `0B` (no pool fits), and is kept as stated, even above the managed limit;
+the pool is also part of the managed memory, so the managed limit still
+bounds it. A document that leaves it out or says `auto` keeps the derived
+tenth, and its stored policy is unchanged. It applies to host memory only; a
+card's domain has no host-KV limit. The
+[LMCache section](../guide/engines.md#lmcache) of the engines guide has a
+long-prompt example that sets both.
+
 ### Parked growth limit
 
 Some engines leave memory behind on every park and wake: vLLM 0.30 on a GB10
@@ -782,6 +816,7 @@ host.resource_policy.endpoint_port_range.end       8199                         
 host.resource_policy.endpoint_port_range.start     8100                                default
 host.resource_policy.memory.accounting             auto                                yaml
 host.resource_policy.memory.system.free_reserve    auto                                yaml
+host.resource_policy.memory.system.host_kv_limit   auto                                yaml
 host.resource_policy.memory.system.managed_limit   auto                                yaml
 host.resource_policy.memory.system.parked_limit    auto                                yaml
 host.resource_policy.parked_growth_limit           auto                                yaml

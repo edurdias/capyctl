@@ -273,8 +273,15 @@ fn check_state_dir(
 /// is a server and one host, every setting three ways). `auto` keeps the
 /// derived default. Owner decision 2026-10-06 (ADR 0014 amendment A17): the
 /// parked limit is one of them, so a parked footprint above the derived
-/// quarter of memory can be admitted.
-pub const STATED_MEMORY_LIMITS: &[&str] = &["managed_limit", "free_reserve", "parked_limit"];
+/// quarter of memory can be admitted. ADR 0025 amendment of 2026-10-23: the
+/// host-KV limit is one too, so an LMCache pool (ADR 0033 §6, counted against
+/// it) can be larger than the derived tenth of memory.
+pub const STATED_MEMORY_LIMITS: &[&str] = &[
+    "managed_limit",
+    "free_reserve",
+    "parked_limit",
+    "host_kv_limit",
+];
 
 /// A stated standalone memory limit: a size, or a whole percentage of the
 /// memory the host observes at start.
@@ -320,8 +327,10 @@ impl MemoryShare {
 
 /// One stated memory limit's form and range: the managed limit is above zero
 /// and the free reserve below the whole memory; a parked limit of zero parks
-/// nothing. Whether the limits fit the observed memory together, and the
-/// parked limit the managed one, is checked at start, when it is known.
+/// nothing, and a host-KV limit takes any size an enrolled host's
+/// `host_kv_limit` takes (zero or more). Whether the limits fit the observed
+/// memory together, and the parked limit the managed one, is checked at
+/// start, when it is known.
 fn check_memory_limit(field: &str, value: &Value, path: &str) -> Result<(), ConfigError> {
     let Some(text) = value.as_str() else {
         return Err(refuse(
@@ -1034,6 +1043,54 @@ mod tests {
             let error = check(&doc).expect_err(bad);
             assert_eq!(
                 error.path, "host.resource_policy.memory.system.parked_limit",
+                "{bad}"
+            );
+        }
+    }
+
+    // T03 T45 (ADR 0025 amendment of 2026-10-23; found live: a 20 GiB
+    // LMCache pool did not fit the derived tenth of a 128 GB GB10 and
+    // `--set` of the limit was refused as an unknown standalone setting): the
+    // host-KV limit is set three ways with one precedence and takes `auto`,
+    // a size of zero or more, as an enrolled host's does, or a share.
+    #[test]
+    fn the_host_kv_limit_is_set_three_ways() {
+        use crate::setting_overrides::SettingOverrides;
+        const FLAG: &str = "host.resource_policy.memory.system.host_kv_limit=24GiB";
+        const ENV: &str = "CAPYCTL_SET__HOST__RESOURCE_POLICY__MEMORY__SYSTEM__HOST_KV_LIMIT";
+        let mut yaml = generated("/s");
+        yaml["host"]["resource_policy"]["memory"]["system"]["host_kv_limit"] = json!("16GiB");
+        let host_kv = |flags: &[&str], env: &[(&str, &str)]| {
+            let overrides = SettingOverrides::parse(
+                crate::ConfigKind::Standalone,
+                &flags.iter().map(|f| (*f).to_owned()).collect::<Vec<_>>(),
+                &env.iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let applied = overrides.apply_and_validate(yaml.clone()).unwrap();
+            check(&applied).unwrap();
+            applied["host"]["resource_policy"]["memory"]["system"]["host_kv_limit"].clone()
+        };
+        assert_eq!(host_kv(&[FLAG], &[(ENV, "20%")]), "24GiB", "the flag wins");
+        assert_eq!(
+            host_kv(&[], &[(ENV, "20%")]),
+            "20%",
+            "the environment over YAML"
+        );
+        assert_eq!(host_kv(&[], &[]), "16GiB", "the YAML");
+        for good in ["auto", "0B", "0%", "24GiB", "20%", "100%", "1TiB"] {
+            let mut doc = generated("/s");
+            doc["host"]["resource_policy"]["memory"]["system"]["host_kv_limit"] = json!(good);
+            check(&doc).unwrap_or_else(|error| panic!("{good}: {error}"));
+        }
+        for bad in ["101%", "-1GiB", "7.5%", "lots", "1 GiB"] {
+            let mut doc = generated("/s");
+            doc["host"]["resource_policy"]["memory"]["system"]["host_kv_limit"] = json!(bad);
+            let error = check(&doc).expect_err(bad);
+            assert_eq!(
+                error.path, "host.resource_policy.memory.system.host_kv_limit",
                 "{bad}"
             );
         }
