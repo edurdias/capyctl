@@ -2,7 +2,7 @@
 
 ADR 0033 (owner decisions of 2026-10-21, amended by #179; owner input of 2026-10-22 on
 LMCache issue 4825) is implemented on this branch for 0.1.7, with the implementation
-amendments A1–A6 recorded in the ADR.
+amendments A1–A9 recorded in the ADR.
 
 What changed:
 
@@ -89,15 +89,24 @@ embedded fallback relaunch journaled `lmcache_off` twice. Two older tests were b
 to date: a placement test now leaves `host_kv_limit` room for the default pool, and the
 reserved `LMCACHE_` row's reason is checked without a requirement citation.
 
-Verification, rebased onto `main` (`53764248`): `scripts/ci-local.sh` passes (unit 1588
-passed, 1 ignored; runtime 366); `scripts/ci-local.sh --deep --ci-shape` passes (core
-1691 passed; workspace 3633 passed, 1 ignored).
+Fixes after the first live rows (each with its test, failing before): the vLLM entry no
+longer reads CapyCTL's own `--kv-transfer-config` as an extra (vLLM 0.32.0 gives it a
+random `engine_id` on every parse; `0bb4d59b`); LMCache's usage telemetry is off in the
+server and in the engine with the connector (A7; `3dd2d9eb`, `ce90c0f0`); a restart-park
+is proven quiescent by the engine's own gauges, embedded and remote (A8; `6ac5cb3e`);
+the server's measured charge is its group's VmRSS beyond the pool plus its sampled GPU
+memory, a figure nothing read keeping its allowance (A1; `d8ab848d`); the server's
+short-lived child and a server stopped before its engine (A9; `7d9ab7fa`).
+
+Verification, rebased onto `main` (`800e6614`): `scripts/ci-local.sh` passes (unit 1600
+passed, 1 ignored; runtime 369); `scripts/ci-local.sh --deep --ci-shape` passes (core
+1705 passed; workspace 3652 passed, 1 ignored).
 
 Live rows, host A (GB10), Qwen3-4B (context 4096, KV cache 1 GiB, `restart_only`
 unless stated), 2026-10-22, standalone role, builds of `49f10efa` (the branch before the
-fixes) and `8958142d` (vLLM entry and telemetry fixes); evidence in
-`target/live/lmcache-live/` on the laptop. Fixes 3 (`b2ed1f75`) and later are not yet
-run live.
+fixes) and `8958142d` (with the vLLM entry and engine telemetry fixes, now `0bb4d59b` and
+`3dd2d9eb`; the branch was rebased since); evidence in `target/live/lmcache-live/` on the
+laptop. The later fixes are not yet run live.
 
 - **LC1, fail.** SGLang on `49f10efa`: on by default with `restart_only`, argv exactly
   §3 plus `--no-l1-use-lazy`, listeners 127.0.0.1 only (`ss`), environment `HOME` and
@@ -115,7 +124,7 @@ run live.
   LMCache failed `lifecycle conflict`; on two other starts that child's exit failed a
   Ready instance as `lmcache_server_exited`. Every server on `49f10efa` and `8958142d`
   connected to `stats.lmcache.ai:8080` (LMCache usage telemetry; on `8958142d` the
-  engine had the opt-out variables but the server did not, fixed in `d72d2906`, not
+  engine had the opt-out variables but the server did not, fixed in `ce90c0f0`, not
   yet run live).
 - **LC2, pass** (both engines): after three 3.4k-token fillers evicted the engine's own
   cache, the prompt again hit 3,328 tokens (13 chunks) from LMCache, and the answer at
@@ -127,7 +136,7 @@ run live.
   equal to §5's digest computed independently, and unsalted keys under `""`.
 - **LC4, fail on SGLang, pass on vLLM, part 3 blocked.** SGLang (`49f10efa`):
   restart-park refused `park_refused` ("the engine is not quiescent": the deep-park
-  saver check ran for a restart-park; fixed in `b2ed1f75`, not yet run live). vLLM
+  saver check ran for a restart-park; fixed in `6ac5cb3e`, not yet run live). vLLM
   (`8958142d`): parked with the server up (same PID, GPU 1430 MiB, charge pool + 1280 +
   512 MiB + 1 GiB held KV), the wake hit 3,328 tokens with the same answer. A `deep`
   deployment runs deep with LMCache off, but the reason reads "an unknown model type /
@@ -166,6 +175,14 @@ run live.
 - **Status while Ready.** `held_kv_bytes` (the engine's KV cache) shows while the
   instance is Ready although it is charged only while restart-parked (Ready charge
   6,174,015,488 B, parked 7,247,757,312 B); the JSON reads as if the KV were held now.
+
+Still missing: the live rows again on this head (LC1 and LC4 on SGLang, the egress
+check with the server's environment fixed, the measured charge, the server-child cases,
+LC1 through CapyCTL); LC5 and LC10 (a role restarted into `retention: zero` or
+`lmcache: off` relaunches with a new server: the standalone plan reads the revision's
+frozen host settings; not fixed); LC4 part 3 (qualified parking needs the checkpoint's
+`model_type` and the GPU name in the plan; not fixed); LC7 (SGLang 0.5.22 crashes with
+LMCache on Clef-Flash, upstream) and so the decision-model allowance measurement.
 
 CPU and Fake-engine tests are not qualification.
 
