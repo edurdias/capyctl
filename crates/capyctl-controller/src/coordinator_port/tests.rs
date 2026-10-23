@@ -60,6 +60,34 @@ fn refusals_name_the_missing_capability() {
     }
 }
 
+// T17 (ADR 0032 §1, ADR 0017): a lane carries CapyCTL's request ID and can
+// abort it only on an SGLang launch whose registered build is exactly 0.5.22
+// with one tokenizer worker; any other engine, version or worker count keeps
+// today's settlement.
+#[test]
+fn only_sglang_0_5_22_with_one_tokenizer_worker_aborts_requests() {
+    let lane =
+        |engine: &str, build: &str, workers: Option<u32>| capyctl_store::serving::LaneEngine {
+            engine: Some(engine.into()),
+            build_fingerprint: Some(build.into()),
+            tokenizer_workers: workers,
+            remote_host: None,
+        };
+    assert!(launch_aborts_requests(&lane("sglang", "0.5.22", Some(1))));
+    assert!(!launch_aborts_requests(&lane("sglang", "0.5.22", Some(2))));
+    assert!(!launch_aborts_requests(&lane("sglang", "0.5.21", Some(1))));
+    assert!(!launch_aborts_requests(&lane("sglang", "0.5.23", Some(1))));
+    assert!(!launch_aborts_requests(&lane("sglang", "0.5.22", None)));
+    assert!(!launch_aborts_requests(&lane("vllm", "0.5.22", Some(1))));
+    let unknown = capyctl_store::serving::LaneEngine {
+        engine: None,
+        build_fingerprint: None,
+        tokenizer_workers: None,
+        remote_host: None,
+    };
+    assert!(!launch_aborts_requests(&unknown));
+}
+
 mod wait_terminal {
     use super::*;
     use capyctl_domain::LifecycleState;

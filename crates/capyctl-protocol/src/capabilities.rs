@@ -132,6 +132,14 @@ pub const LMCACHE: &str = capyctl_config::lmcache::CAPABILITY;
 /// `host_capability_missing:retention` before anything is sent, since it
 /// would not honour it.
 pub const RETENTION: &str = capyctl_config::lmcache::RETENTION_CAPABILITY;
+/// ADR 0032 §2, §3: the host's ingress sets CapyCTL's request ID as SGLang's
+/// `rid` on a capable launch, and the host runs the AbortRequest action (an
+/// abort posted to a retained launch's engine on loopback). The server sends
+/// an AbortRequest only to a host that declared it, and counts a remote lane
+/// as capable only on such a host; any other is refused
+/// `host_capability_missing:request_abort` before anything is sent and keeps
+/// today's settlement rule.
+pub const REQUEST_ABORT: &str = "request_abort";
 
 /// ADR 0018: bounds on the new messages' strings and lists.
 pub const MAX_REQUEST_ID: usize = 64;
@@ -181,6 +189,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (STARTUP_HOST_BYTES, Direction::ServerToHost),
     (LMCACHE, Direction::ServerToHost),
     (RETENTION, Direction::ServerToHost),
+    (REQUEST_ABORT, Direction::ServerToHost),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.
@@ -275,6 +284,7 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
         }
         Some(Action::MaterializeSource(_)) => needs.push(MODEL_SOURCES),
         Some(Action::EngineLogTail(_)) => needs.push(ENGINE_LOG_TAIL),
+        Some(Action::AbortRequest(_)) => needs.push(REQUEST_ABORT),
         _ => {}
     }
     if command
@@ -343,7 +353,8 @@ fn lmcache_needs(deployment_config: &str, needs: &mut Vec<&'static str>) {
 /// ADR 0017: the actions a drain-only host may still be sent. They stop,
 /// close, re-prove or observe what the server already owns there; none of
 /// them places, starts, wakes, parks, measures or downloads anything. An
-/// engine log tail (SPEC §13.3) only reads what a retained launch wrote.
+/// engine log tail (SPEC §13.3) only reads what a retained launch wrote; a
+/// request abort (ADR 0032 §3) only stops work a retained launch is running.
 pub fn drain_only_permits(command: &pb::ExecuteMember) -> bool {
     use pb::execute_member::Action;
     matches!(
@@ -354,6 +365,7 @@ pub fn drain_only_permits(command: &pb::ExecuteMember) -> bool {
                 | Action::CloseIngress(_)
                 | Action::ProbeOwnedHandle(_)
                 | Action::EngineLogTail(_)
+                | Action::AbortRequest(_)
         )
     )
 }

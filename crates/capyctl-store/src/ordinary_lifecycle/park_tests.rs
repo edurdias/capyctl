@@ -1818,3 +1818,7 @@ fn a_revision_stored_before_device_coverage_still_decodes_stops_and_is_replaced(
 // ADR 0031 §6: cancelling requests on custom engines.
 #[path = "park_cancelling_tests.rs"]
 mod cancelling;
+
+// ADR 0032 §7: restart when the limit is full of held cancellations.
+#[path = "held_restart_tests.rs"]
+mod held_restart;

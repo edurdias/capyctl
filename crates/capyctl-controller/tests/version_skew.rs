@@ -1522,3 +1522,157 @@ async fn a_remote_unified_host_keeps_its_resident_credit() {
         h.server.abort();
     }
 }
+
+// T17 (ADR 0032 §3, ADR 0017): an AbortRequest is refused, typed, and never
+// sent to a host that did not declare `request_abort` (an older agent), whose
+// lanes are then not capable; the remote engine's `cancel_work` sends it
+// nothing either. A host that declared it is sent the action naming the
+// launch and the request, and its answer, `attempted` included, is final:
+// never redelivered to be posted again. At most `MAX_ABORTS_PER_HOST` are in
+// flight to one host.
+#[tokio::test]
+async fn a_request_abort_is_sent_only_to_a_host_that_declared_it() {
+    use capyctl_adapters::traits::{AdapterError, MemberRef, RequestRef};
+    use capyctl_controller::agent_sessions::MAX_ABORTS_PER_HOST;
+    const ID: &str = "01JAAAAAAAAAAAAAAAAAAAAAAA";
+    const HANDLE: &str = "01K00000000000000000000005";
+    let abort = || MemberAction::AbortRequest {
+        owned_handle: HANDLE.into(),
+        request_id: ID.into(),
+    };
+    let engine_for = |h: &Harness| {
+        let MemberAction::LaunchSingle(plan) = launch() else {
+            unreachable!()
+        };
+        remote_execution::engine(
+            h.sessions.clone(),
+            h.state.clone(),
+            RemoteLaunchBinding {
+                controller_id: h.authority.controller_id(),
+                host_id: h.host.clone(),
+                member_id: "head".into(),
+                profile_fingerprint: "sglang-0.5.20".into(),
+                launch_command_id: HANDLE.into(),
+                plan,
+                ingress_gate_key: [7; 32],
+                instance_index: 0,
+                device_memory: false,
+                decisions: false,
+                custom_engine: false,
+                lmcache_required: false,
+                retention_zero: false,
+            },
+            Default::default(),
+        )
+    };
+    let member = MemberRef {
+        deployment_id: "deployment".into(),
+        member_id: "01K00000000000000000000001".into(),
+    };
+    let request = |id: &str| RequestRef { id: id.into() };
+
+    // An older host, without `request_abort`.
+    let h = enrolled().await;
+    let mut declared = all();
+    declared.retain(|c| c != capabilities::REQUEST_ABORT);
+    let (_send, mut stream) = h.reconciled(BINARY_VERSION, declared).await;
+    assert!(!h.sessions.supports_request_abort(&h.host));
+    assert_eq!(
+        refused(&h.sessions, h.command("abort", abort())).await,
+        "host_capability_missing:request_abort"
+    );
+    let engine = engine_for(&h);
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.cancel_work(&member, &request(ID), false)
+        )
+        .await
+        .expect("answered at once"),
+        Err(AdapterError::UnsupportedCapability)
+    ));
+    assert!(
+        next_command(&mut stream, Duration::from_millis(500))
+            .await
+            .is_none(),
+        "nothing was sent"
+    );
+    h.server.abort();
+
+    // A host that declared it.
+    let h = enrolled().await;
+    let (send, mut stream) = h.reconciled(BINARY_VERSION, all()).await;
+    assert!(h.sessions.supports_request_abort(&h.host));
+    let engine = engine_for(&h);
+    // Not a ULID, or a launch this coordinator session does not run there:
+    // nothing is sent.
+    assert!(matches!(
+        engine
+            .cancel_work(&member, &request("caller-1"), false)
+            .await,
+        Err(AdapterError::UnsupportedCombination)
+    ));
+    assert!(engine
+        .cancel_work(&member, &request(ID), false)
+        .await
+        .is_err());
+    assert!(
+        next_command(&mut stream, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "nothing was sent"
+    );
+    for (state, refused) in [
+        ("completed", ""),
+        ("attempted", ""),
+        ("completed", "launch_not_retained"),
+    ] {
+        let command = h.command(&format!("abort-{state}-{refused}"), abort());
+        let sessions = h.sessions.clone();
+        let pending = tokio::spawn(async move { sessions.execute(command).await });
+        let sent = next_command(&mut stream, Duration::from_secs(5))
+            .await
+            .expect("the abort is sent");
+        let Some(pb::execute_member::Action::AbortRequest(sent_abort)) = &sent.action else {
+            panic!("{sent:?}");
+        };
+        assert_eq!(
+            (
+                sent_abort.owned_handle.as_str(),
+                sent_abort.request_id.as_str()
+            ),
+            (HANDLE, ID)
+        );
+        send.send(pb::AgentToServer {
+            msg: Some(agent_to_server::Msg::MemberResult(
+                pb::MemberExecutionResult {
+                    identity: sent.identity.clone(),
+                    state: state.into(),
+                    owned_handle: HANDLE.into(),
+                    observed_at_unix_ms: capyctl_protocol::now_unix_ms(),
+                    refused: refused.into(),
+                    ..Default::default()
+                },
+            )),
+        })
+        .await
+        .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("the answer is final, never redelivered to its deadline")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (result.state.as_str(), result.refused.as_str()),
+            (state, refused)
+        );
+    }
+    let slots: Vec<_> = (0..MAX_ABORTS_PER_HOST)
+        .map(|_| h.sessions.abort_slot(&h.host).expect("a free slot"))
+        .collect();
+    assert!(h.sessions.abort_slot(&h.host).is_none());
+    assert!(h.sessions.abort_slot("another-host").is_some());
+    drop(slots);
+    assert!(h.sessions.abort_slot(&h.host).is_some());
+    h.server.abort();
+}

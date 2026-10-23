@@ -131,6 +131,9 @@ pub struct Scored {
     /// ADR 0028 §11: a multi-node group's head; its requests are watched
     /// for their first token.
     pub group: bool,
+    /// ADR 0032 §2: served through its host's ingress, not by an engine the
+    /// router reaches directly.
+    pub remote: bool,
 }
 
 impl Scored {
@@ -212,6 +215,7 @@ pub fn rank(
             sample_age_ms: load.map(|(_, age)| age),
             score: score(router_in_flight, engine),
             group: instance.group,
+            remote: instance.remote_host.is_some(),
         });
     }
     ranking.order.sort_by_key(|c| (c.score, c.instance_index));
@@ -338,7 +342,16 @@ pub struct Attempt {
     pub(crate) stall: Option<crate::stream::StallWatch>,
     /// SPEC §10: the request's IDs, for the lease's role-log lines.
     ids: Option<Arc<RequestIds>>,
+    /// ADR 0032 §1–§3: set when this attempt's lane carries CapyCTL's request
+    /// ID and the authority can ask its engine to abort a request by it.
+    abort: Option<AbortLane>,
     _slot: Option<InstanceSlot>,
+}
+
+/// ADR 0032 §3: the instance incarnation an abort is sent to.
+struct AbortLane {
+    deployment: String,
+    generation: i64,
 }
 
 impl Attempt {
@@ -354,8 +367,37 @@ impl Attempt {
             instance: None,
             stall: None,
             ids: None,
+            abort: None,
             _slot: None,
         }
+    }
+
+    /// ADR 0032 §1: CapyCTL's request ID (the first granted lease's, never the
+    /// caller's), for a sink to hand the forwarder, on a capable lane with a
+    /// durable lease only; `None` everywhere else.
+    pub(crate) fn request_id(&self) -> Option<String> {
+        self.abort.as_ref()?;
+        self.lease.as_ref()?;
+        Some(self.ids.as_ref()?.capyctl().to_owned())
+    }
+
+    /// ADR 0032 §3–§4: what reading a cut request to its own end needs, taken
+    /// before [`Attempt::settle`] consumes the lease: the authority, the
+    /// incarnation, the request ID and this attempt's own lease ID (a later
+    /// failover lease is never named). `None` when the lane is not capable,
+    /// which keeps today's path.
+    pub(crate) fn after_cut(&self) -> Option<crate::stream::AfterCut> {
+        let lane = self.abort.as_ref()?;
+        let (authority, lease) = self.lease.as_ref()?;
+        let ids = self.ids.as_ref()?;
+        Some(crate::stream::AfterCut {
+            authority: authority.clone(),
+            deployment: lane.deployment.clone(),
+            generation: lane.generation,
+            request_id: ids.capyctl().to_owned(),
+            lease_id: lease.id().to_owned(),
+            ids: ids.clone(),
+        })
     }
 
     /// Close or retain the lease on the evidence (SPEC §10) and drop the
@@ -408,75 +450,103 @@ pub struct Plan {
     /// Role-log lines written before CapyCTL's request ID was decided, held
     /// until it is (at most one selection and [`MAX_ATTEMPTS`] failovers).
     pending: Vec<serde_json::Value>,
+    /// SPEC §10: the request's queue deadline (activation included), which
+    /// also bounds waiting for a restart (ADR 0032 §7).
+    deadline: tokio::time::Instant,
 }
+
+/// Why an offer produced no attempt.
+enum Unoffered {
+    /// The refusal that ends the request.
+    Refused(Refusal),
+    /// ADR 0032 §7: the deployment's durable lease bound refused the grant
+    /// as full; the request asks for a restart before it is refused.
+    Full,
+}
+
+impl From<Refusal> for Unoffered {
+    fn from(refusal: Refusal) -> Self {
+        Self::Refused(refusal)
+    }
+}
+
+/// ADR 0032 §7: the pause before asking again for a restart that left the
+/// bound full, so a request waiting through one does not spin on the ledger.
+/// It paces the retries only; a timer never triggers a restart.
+const RESTART_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl Plan {
     /// Rank the deployment's serving instances: `view` when admission read
     /// them for this request, otherwise a fresh read. Logs the selection with
-    /// its inputs and the request's `ids`.
+    /// its inputs and the request's `ids`. `deadline` is the request's queue
+    /// deadline (SPEC §10).
     pub fn new(
         deps: &RouterDeps,
         deployment: &str,
         view: Option<InstanceView>,
         ids: Arc<RequestIds>,
+        deadline: tokio::time::Instant,
     ) -> Result<Self, Refusal> {
-        let instances = match view {
-            Some(InstanceView(instances)) => instances,
-            None => deps
-                .controller
-                .serving_instances(deployment)
-                .map_err(crate::chat::map_controller)?,
-        };
-        let route = match instances {
-            None => Route::Whole { offered: false },
-            Some(instances) => {
-                let ranking = deps.inflight.instances.choose(deployment, &instances);
-                let selection = serde_json::json!({
-                    "event": "router_selection",
-                    "deployment": deployment,
-                    "chosen": ranking.order.first().map(|c| c.generation),
-                    "candidates": ranking.order.iter().map(Scored::log).collect::<Vec<_>>(),
-                    "skipped": ranking.skipped.iter().map(|s| serde_json::json!({
-                        "instance": s.instance_index,
-                        "generation": s.generation,
-                        "reason": s.reason,
-                    })).collect::<Vec<_>>(),
-                });
-                let last = if ranking.skipped.is_empty() {
-                    None
-                } else {
-                    Some(crate::chat::refusal(
-                        "unavailable",
-                        &format!(
-                            "no instance of deployment {deployment} is open for dispatch; \
-                             retry shortly"
-                        ),
-                    ))
-                };
-                let mut plan = Self {
-                    deps: deps.clone(),
-                    deployment: deployment.to_owned(),
-                    route: Route::Instances {
-                        order: ranking.order,
-                        next: 0,
-                        first_counted: true,
-                    },
-                    last,
-                    ids,
-                    pending: Vec::new(),
-                };
-                plan.log(selection);
-                return Ok(plan);
-            }
-        };
-        Ok(Self {
+        let mut plan = Self {
             deps: deps.clone(),
             deployment: deployment.to_owned(),
-            route,
+            route: Route::Whole { offered: false },
             last: None,
             ids,
             pending: Vec::new(),
-        })
+            deadline,
+        };
+        plan.set_route(view)?;
+        Ok(plan)
+    }
+
+    /// Set the route from `view`, or from a fresh read of the deployment's
+    /// serving instances, and log the selection.
+    fn set_route(&mut self, view: Option<InstanceView>) -> Result<(), Refusal> {
+        let deployment = self.deployment.clone();
+        let instances = match view {
+            Some(InstanceView(instances)) => instances,
+            None => self
+                .deps
+                .controller
+                .serving_instances(&deployment)
+                .map_err(crate::chat::map_controller)?,
+        };
+        let Some(instances) = instances else {
+            self.route = Route::Whole { offered: false };
+            self.last = None;
+            return Ok(());
+        };
+        let ranking = self.deps.inflight.instances.choose(&deployment, &instances);
+        let selection = serde_json::json!({
+            "event": "router_selection",
+            "deployment": deployment,
+            "chosen": ranking.order.first().map(|c| c.generation),
+            "candidates": ranking.order.iter().map(Scored::log).collect::<Vec<_>>(),
+            "skipped": ranking.skipped.iter().map(|s| serde_json::json!({
+                "instance": s.instance_index,
+                "generation": s.generation,
+                "reason": s.reason,
+            })).collect::<Vec<_>>(),
+        });
+        self.last = if ranking.skipped.is_empty() {
+            None
+        } else {
+            Some(crate::chat::refusal(
+                "unavailable",
+                &format!(
+                    "no instance of deployment {deployment} is open for dispatch; \
+                     retry shortly"
+                ),
+            ))
+        };
+        self.route = Route::Instances {
+            order: ranking.order,
+            next: 0,
+            first_counted: true,
+        };
+        self.log(selection);
+        Ok(())
     }
 
     /// Write one role-log line with the request's IDs, or hold it until
@@ -489,8 +559,37 @@ impl Plan {
     /// is decided before anything reaches an engine. Once it returns, the
     /// request's CapyCTL ID is decided: the first granted lease's, or a fresh
     /// one when none was granted (SPEC §10, owner decision 2026-10-19).
+    ///
+    /// ADR 0032 §7: a grant refused because the deployment's durable bound is
+    /// full asks the authority to restart the instances holding requests that
+    /// settle only at their next stop. While one restarts, the request waits
+    /// for it as for an activation, within its deadline, and is offered again
+    /// on a fresh read of the instances; otherwise it is answered `queue_full`
+    /// as before.
     pub async fn next(&mut self) -> Result<Attempt, Refusal> {
-        let next = self.offer().await;
+        let mut restarts = 0u32;
+        let next = loop {
+            match self.offer().await {
+                Ok(attempt) => break Ok(attempt),
+                Err(Unoffered::Refused(refusal)) => break Err(refusal),
+                Err(Unoffered::Full) => {
+                    if restarts > 0 {
+                        let pause = tokio::time::Instant::now() + RESTART_RETRY_PAUSE;
+                        tokio::time::sleep_until(pause.min(self.deadline)).await;
+                    }
+                    restarts += 1;
+                    if let Err(refusal) =
+                        crate::chat::restart_when_full(&self.deps, &self.deployment, self.deadline)
+                            .await
+                    {
+                        break Err(refusal);
+                    }
+                    if let Err(refusal) = self.set_route(None) {
+                        break Err(refusal);
+                    }
+                }
+            }
+        };
         if let Ok(Attempt {
             lease: Some((_, lease)),
             ..
@@ -507,21 +606,37 @@ impl Plan {
         next
     }
 
-    async fn offer(&mut self) -> Result<Attempt, Refusal> {
+    async fn offer(&mut self) -> Result<Attempt, Unoffered> {
         let deps = self.deps.clone();
         let deployment = self.deployment.clone();
         match &mut self.route {
             Route::Whole { offered } => {
                 if std::mem::replace(offered, true) {
-                    return Err(self.last.take().unwrap_or_else(|| {
-                        crate::chat::refusal("unavailable", "no further engine to offer")
-                    }));
+                    return Err(self
+                        .last
+                        .take()
+                        .unwrap_or_else(|| {
+                            crate::chat::refusal("unavailable", "no further engine to offer")
+                        })
+                        .into());
                 }
                 let forward = deps
                     .forwards
                     .forwarder(&deployment)
                     .map_err(crate::chat::map_forwarder)?;
-                let lease = crate::chat::open_lease(&deps, &deployment).await?;
+                let lease = match deps
+                    .controller
+                    .open_request_lease(&deployment, deps.limits.max_requests_per_deployment)
+                    .await
+                {
+                    Ok(lease) => lease,
+                    // ADR 0032 §7: the caller asks for a restart first, then
+                    // routes the request afresh.
+                    Err(LeaseRefused::Full) => return Err(Unoffered::Full),
+                    Err(refused) => {
+                        return Err(crate::chat::lease_refusal(&deployment, refused).into())
+                    }
+                };
                 Ok(Attempt {
                     forward,
                     lease: lease.map(|lease| (deps.controller.clone(), lease)),
@@ -529,6 +644,7 @@ impl Plan {
                     instance: None,
                     stall: None,
                     ids: Some(self.ids.clone()),
+                    abort: None,
                     _slot: None,
                 })
             }
@@ -577,24 +693,22 @@ impl Plan {
                             ));
                             continue;
                         }
-                        Err(LeaseRefused::Full) => {
-                            return Err(crate::chat::refusal(
-                                "queue_full",
-                                "outstanding request bound reached",
-                            ))
-                        }
+                        // ADR 0032 §7: the caller asks for a restart before it
+                        // answers `queue_full`.
+                        Err(LeaseRefused::Full) => return Err(Unoffered::Full),
                         Err(LeaseRefused::Unavailable(reason)) => {
-                            return Err(crate::chat::refusal("unavailable", &reason))
+                            return Err(crate::chat::refusal("unavailable", &reason).into())
                         }
                     };
                     // ADR 0013 §10: resolve exactly the incarnation the lease
                     // names. If it moved on or its gate closed since, nothing was
                     // sent: close the lease as not accepted and offer the next.
-                    match deps
-                        .forwards
-                        .forwarder_for(&deployment, candidate.generation)
-                    {
-                        Ok(forward) => {
+                    match deps.forwards.forwarder_for(
+                        &deployment,
+                        candidate.generation,
+                        candidate.remote,
+                    ) {
+                        Ok(lane) => {
                             // ADR 0028 §11 (decided 2026-10-06): a request to a
                             // group's head is watched for its first token; a
                             // single-host instance's never is.
@@ -605,13 +719,20 @@ impl Plan {
                                 generation: candidate.generation,
                                 after: deps.controller.group_stall_timeout(),
                             });
+                            // ADR 0032 §1–§3: a capable lane carries the
+                            // request ID and is aborted by it after a cut.
+                            let abort = lane.request_abort.then(|| AbortLane {
+                                deployment: deployment.clone(),
+                                generation: candidate.generation,
+                            });
                             return Ok(Attempt {
-                                forward,
+                                forward: lane.forward,
                                 lease: lease.map(|lease| (deps.controller.clone(), lease)),
                                 generation: Some(candidate.generation),
                                 instance: Some(candidate.instance_index),
                                 stall,
                                 ids: Some(self.ids.clone()),
+                                abort,
                                 _slot: Some(slot),
                             });
                         }
@@ -632,11 +753,15 @@ impl Plan {
                         }
                     }
                 }
-                Err(self.last.take().unwrap_or_else(|| {
-                    crate::chat::map_forwarder(crate::forwarders::ForwarderError::NoRuntime(
-                        deployment.clone(),
-                    ))
-                }))
+                Err(self
+                    .last
+                    .take()
+                    .unwrap_or_else(|| {
+                        crate::chat::map_forwarder(crate::forwarders::ForwarderError::NoRuntime(
+                            deployment.clone(),
+                        ))
+                    })
+                    .into())
             }
         }
     }

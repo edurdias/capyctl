@@ -15,7 +15,7 @@ use axum::http::StatusCode;
 use capyctl_adapters::traits::{AdapterError, ChatForward, ChatSink, StreamEnded};
 use capyctl_controller::load_table::{EngineGauges, LoadView};
 use capyctl_controller::{LeaseEnd, LeaseRefused, LifecycleFault, RequestLease, ServingInstance};
-use capyctl_router::forwarders::{ForwarderError, ForwarderSource};
+use capyctl_router::forwarders::{ForwarderError, ForwarderSource, Lane};
 use capyctl_router::{QueueLimits, RouterDeps};
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -343,12 +343,16 @@ impl ForwarderSource for Engines {
         &self,
         deployment: &str,
         generation: i64,
-    ) -> Result<Arc<dyn ChatForward>, ForwarderError> {
+        _ingress: bool,
+    ) -> Result<Lane, ForwarderError> {
         self.resolved.lock().unwrap().push(generation);
         if self.authority.moved.lock().unwrap().contains(&generation) {
             return Err(ForwarderError::NoRuntime(deployment.into()));
         }
-        Ok(self.by_generation[&generation].clone())
+        Ok(Lane {
+            forward: self.by_generation[&generation].clone(),
+            request_abort: false,
+        })
     }
 }
 

@@ -108,6 +108,7 @@ impl capyctl_controller::LifecyclePort for Authority {
                 engine: Some("llamacpp".into()),
                 deployment_id: DEPLOYMENT.into(),
                 revision: 1,
+                request_abort: false,
             }),
         )
     }

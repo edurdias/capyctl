@@ -313,6 +313,59 @@ async fn release_sends_exact_tags_once_with_admin_key_and_rejects_duplicate() {
     assert_eq!(requests[0].authorization, "Bearer admin-secret");
 }
 
+// T17 (ADR 0032 §3): `cancel_work` asks the engine to abort CapyCTL's request
+// by its `rid`, `POST /abort_request` with the launch's admin key, and reports
+// `Uncertain` on the engine's empty 200: a delivered abort is never evidence
+// that the request stopped. A refused abort is an error (not sent), and an
+// adapter without credentials sends nothing.
+#[tokio::test]
+async fn cancel_work_posts_abort_request_with_the_admin_key_and_stays_uncertain() {
+    let f = Fixture::new().await;
+    let member = MemberRef {
+        deployment_id: "deployment".into(),
+        member_id: "member".into(),
+    };
+    let request = RequestRef {
+        id: "01K00000000000000000000009".into(),
+    };
+    f.reply(StatusCode::OK, "");
+    assert_eq!(
+        f.adapter
+            .cancel_work(&member, &request, false)
+            .await
+            .unwrap(),
+        CancellationOutcome::Uncertain
+    );
+    let requests = f.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, Method::POST);
+    assert_eq!(requests[0].path, "/abort_request");
+    assert_eq!(
+        requests[0].body,
+        json!({"rid": "01K00000000000000000000009"})
+    );
+    assert_eq!(requests[0].authorization, "Bearer admin-secret");
+    for refused in [StatusCode::UNAUTHORIZED, StatusCode::INTERNAL_SERVER_ERROR] {
+        f.reply(refused, "");
+        assert!(
+            f.adapter
+                .cancel_work(&member, &request, false)
+                .await
+                .is_err(),
+            "{refused}"
+        );
+    }
+    let keyless = SglangAdapter::from_frozen(
+        &frozen_with(
+            "http://127.0.0.1:9".into(),
+            capyctl_testkit::sglang_launch_settings(),
+        ),
+        None,
+    )
+    .unwrap();
+    assert!(keyless.cancel_work(&member, &request, false).await.is_err());
+}
+
 // T16
 #[tokio::test]
 async fn restore_is_separate_from_reload_flush_and_accounted_probe() {

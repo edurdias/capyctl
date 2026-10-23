@@ -611,6 +611,12 @@ pub trait ChatSink: Send {
     /// forwarder kept for its non-streaming answer, lent as it arrives so the
     /// router can time the first generated text. Nothing is delivered.
     fn collected(&mut self, _chunk: &str) {}
+    /// ADR 0032 §1: CapyCTL's request ID (the `X-CapyCTL-Request-Id` value,
+    /// never the caller's) for a forwarder whose lane carries it to the engine
+    /// as SGLang's `rid`. `None` sends no ID.
+    fn request_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Inference forwarding: how the router reaches a deployment's engine

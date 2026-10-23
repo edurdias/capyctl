@@ -664,11 +664,36 @@ pub struct AgentSessions {
     /// with a hook (an exit settlement, a drain suspension) still running
     /// against the coordinator's owned state.
     tasks: Arc<crate::supervised::Children>,
+    /// ADR 0032 §3: request aborts in flight per host ([`AbortSlot`]).
+    aborts: Arc<Mutex<BTreeMap<String, usize>>>,
 }
 /// Suspends dispatch to every engine on the named host.
 pub type DrainHook = Arc<dyn Fn(&str) + Send + Sync>;
 /// Handles one validated `MemberExit` from the named host's current session.
 pub type ExitHook = Arc<dyn Fn(&str, &capyctl_protocol::reports::MemberExit) + Send + Sync>;
+/// ADR 0032 §3: the most request aborts in flight to one host at once. A
+/// host runs at most 8 commands at once and ends its session past that, and
+/// cancelled requests come in bursts (a deadline cut, many hang-ups), so the
+/// aborts take a small share. One past it is not sent, and its request keeps
+/// today's settlement rule.
+pub const MAX_ABORTS_PER_HOST: usize = 2;
+/// One of a host's [`MAX_ABORTS_PER_HOST`] abort slots, released on drop.
+pub struct AbortSlot {
+    aborts: Arc<Mutex<BTreeMap<String, usize>>>,
+    host: String,
+}
+impl Drop for AbortSlot {
+    fn drop(&mut self) {
+        if let Ok(mut aborts) = self.aborts.lock() {
+            if let Some(count) = aborts.get_mut(&self.host) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    aborts.remove(&self.host);
+                }
+            }
+        }
+    }
+}
 impl AgentSessions {
     pub fn new(authority: Arc<EnrollmentAuthority>) -> Arc<Self> {
         Self::with_heartbeats(authority, HeartbeatPolicy::default())
@@ -692,6 +717,7 @@ impl AgentSessions {
             exit_hook: Arc::new(Mutex::new(None)),
             heartbeat,
             tasks: Default::default(),
+            aborts: Default::default(),
         })
     }
 
@@ -844,6 +870,27 @@ impl AgentSessions {
                 .host_version(host)
                 .is_some_and(|recorded| recorded.capabilities.iter().any(|c| c == name)),
         }
+    }
+    /// ADR 0032 §2, §3: whether `host` declared `request_abort` ([`Self::supports`]):
+    /// its ingress sets CapyCTL's request ID as `rid` on a capable launch and
+    /// it runs the AbortRequest action. A remote lane is capable only on such
+    /// a host; on any other the server never sends an abort.
+    pub fn supports_request_abort(&self, host: &str) -> bool {
+        self.supports(host, capabilities::REQUEST_ABORT)
+    }
+    /// ADR 0032 §3: a slot for one request abort to `host`, or `None` when
+    /// [`MAX_ABORTS_PER_HOST`] are already in flight there.
+    pub fn abort_slot(&self, host: &str) -> Option<AbortSlot> {
+        let mut aborts = self.aborts.lock().ok()?;
+        let count = aborts.entry(host.to_owned()).or_default();
+        if *count >= MAX_ABORTS_PER_HOST {
+            return None;
+        }
+        *count += 1;
+        Some(AbortSlot {
+            aborts: self.aborts.clone(),
+            host: host.to_owned(),
+        })
     }
     /// ADR 0017: why an operation needing `needs` (and, when `effect`, one a
     /// drain-only host may not take) is refused for `host`'s live session, as
@@ -1114,6 +1161,13 @@ impl AgentSessions {
                 result.model_usable
                     || (result.state == "completed" && !result.claim_retained)
                     || launch_ended_before_readiness(&result)
+            }
+            // ADR 0032 §3: an abort is never journaled, so its answer is
+            // final either way: `attempted` (the engine did not answer) is
+            // not redelivered to be posted again; the request keeps today's
+            // rule.
+            capyctl_protocol::execution::MemberAction::AbortRequest { .. } => {
+                matches!(result.state.as_str(), "completed" | "attempted")
             }
             _ => matches!(
                 result.state.as_str(),

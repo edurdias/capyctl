@@ -502,3 +502,222 @@ async fn a_switch_does_not_wait_for_a_cancellation_without_an_idle_signal() {
     assert_eq!(acknowledgements(&lab, &id).len(), 1);
     lab.worker.shutdown().await.unwrap();
 }
+
+// T17 (ADR 0032 §4): the router's acknowledgement by lease ID closes the
+// cancelling lease through the group-committed writer with one
+// acknowledgement naming the evidence; a second one changes nothing, and a
+// lease that is not cancelling is left charged.
+#[tokio::test]
+async fn the_authority_acknowledges_one_cancelled_request_by_its_lease() {
+    let h = harness_with_ready_instance(false).await;
+    let live = h.open_lease().await;
+    let live_id = live.id().to_owned();
+    let cancelled = h.open_lease().await;
+    let id = cancelled.id().to_owned();
+    h.close_lease(cancelled, UNANSWERED).await;
+    assert!(!h
+        .port
+        .acknowledge_cancelled_request(&live_id)
+        .await
+        .unwrap());
+    assert!(h.port.acknowledge_cancelled_request(&id).await.unwrap());
+    assert_eq!(h.outstanding(), 1, "the live lease stays charged");
+    assert!(!h.port.acknowledge_cancelled_request(&id).await.unwrap());
+    let acknowledged = acknowledgements(&h.lab, &h.lab.a.deployment_id);
+    assert_eq!(acknowledged.len(), 1, "{acknowledged:?}");
+    assert_eq!(
+        acknowledged[0]["receipt"],
+        json!(format!(
+            "the engine finished this request after it was asked to abort it; request lease {id}"
+        ))
+    );
+    h.close_lease(live, LeaseEnd::Completed).await;
+    h.lab.worker.shutdown().await.unwrap();
+}
+
+/// ADR 0032 §7: the deployment limit the router grants under.
+const LIMIT: usize = capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT as usize;
+
+/// The restarts for held requests journaled for `deployment`, as payloads.
+fn restarts(lab: &Lab, deployment: &str) -> Vec<Value> {
+    let sql = lab.sql();
+    let mut statement = sql
+        .prepare("SELECT payload_json FROM management_events WHERE kind='instance_restarted_for_held_requests' AND deployment_id=?1")
+        .unwrap();
+    statement
+        .query_map([deployment], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|payload| serde_json::from_str(&payload.unwrap()).unwrap())
+        .collect()
+}
+
+fn retained_binding(lab: &Lab, deployment: &str) -> String {
+    lab.sql()
+        .query_row(
+            "SELECT id FROM runtime_bindings WHERE deployment_id=?1 AND state!='released'",
+            [deployment],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+// T17 (ADR 0032 §7, SPEC §10): requests cut before the engine answered them
+// fill the deployment's limit, so a grant is refused full; the restart is
+// accepted, its verified exit settles all of them with the stop's receipt,
+// it is journaled with the instance and the count, and the instance serves
+// again under a new incarnation.
+#[tokio::test]
+async fn held_requests_filling_the_limit_restart_the_instance_which_serves_again() {
+    let h = harness_with_ready_instance(false).await;
+    let id = h.lab.a.deployment_id.clone();
+    for _ in 0..LIMIT {
+        let lease = h.open_lease().await;
+        h.close_lease(lease, UNANSWERED).await;
+    }
+    assert!(matches!(
+        h.port.open_instance_lease(&id, h.generation, LIMIT).await,
+        Err(crate::request_leases::LeaseRefused::Full)
+    ));
+    assert_eq!(
+        h.port.restart_for_held_requests(&id).await.unwrap(),
+        crate::port::HeldRestart::Restarting
+    );
+    h.until_outstanding(0).await;
+    let restarted = restarts(&h.lab, &id);
+    assert_eq!(restarted.len(), 1, "{restarted:?}");
+    assert_eq!(restarted[0]["instance_index"], json!(0));
+    assert_eq!(restarted[0]["generation"], json!(h.generation));
+    assert_eq!(restarted[0]["count"], json!(LIMIT));
+    let acknowledged = acknowledgements(&h.lab, &id);
+    assert_eq!(acknowledged.len(), 1, "{acknowledged:?}");
+    assert_eq!(acknowledged[0]["count"], json!(LIMIT));
+    let receipt = acknowledged[0]["receipt"].as_str().unwrap();
+    assert!(
+        receipt.contains(restarted[0]["operation_id"].as_str().unwrap()),
+        "{receipt}"
+    );
+    until("the restarted instance to serve", || {
+        let (state, open, generation, _) = h.lab.instance(&id, 0);
+        state == "ready" && open && generation.is_some_and(|g| g != h.generation)
+    })
+    .await;
+    let generation = h.lab.instance(&id, 0).2.unwrap();
+    let lease = h
+        .port
+        .open_instance_lease(&id, generation, LIMIT)
+        .await
+        .unwrap()
+        .unwrap();
+    h.close_lease(lease, LeaseEnd::Completed).await;
+    h.lab.worker.shutdown().await.unwrap();
+}
+
+// T17 (ADR 0032 §7): one request below the limit, or a live request among
+// the held ones, restarts nothing.
+#[tokio::test]
+async fn held_requests_below_the_limit_or_beside_live_work_restart_nothing() {
+    let h = harness_with_ready_instance(false).await;
+    let id = h.lab.a.deployment_id.clone();
+    for _ in 0..LIMIT - 1 {
+        let lease = h.open_lease().await;
+        h.close_lease(lease, UNANSWERED).await;
+    }
+    assert_eq!(
+        h.port.restart_for_held_requests(&id).await.unwrap(),
+        crate::port::HeldRestart::NotHeld
+    );
+    let live = h.open_lease().await;
+    assert_eq!(
+        h.port.restart_for_held_requests(&id).await.unwrap(),
+        crate::port::HeldRestart::NotHeld
+    );
+    assert!(restarts(&h.lab, &id).is_empty());
+    assert_eq!(h.lab.state(&id), "ready");
+    h.close_lease(live, LeaseEnd::Completed).await;
+    h.lab.worker.shutdown().await.unwrap();
+}
+
+// T17 (ADR 0032 §1–§3): an SGLang 0.5.22 launch with one tokenizer worker
+// carries the request ID and is aborted by it through its own retained
+// driver (the adapter's `cancel_work`, named by its binding); a vLLM lane is
+// neither offered it nor sent anything.
+#[tokio::test]
+async fn an_sglang_0_5_22_lane_aborts_a_request_through_its_driver() {
+    let lab = lab(15, 50).await;
+    lab.ready(&lab.a).await;
+    let port = lab.port(Duration::from_secs(5));
+    let request = "01K00000000000000000000R01";
+    let a = lab.a.deployment_id.clone();
+    let a_generation = lab.instance(&a, 0).2.unwrap();
+    assert!(
+        !port
+            .instance_endpoint(&a, a_generation)
+            .unwrap()
+            .unwrap()
+            .request_abort
+    );
+    assert!(!port.runtime_endpoint(&a).unwrap().unwrap().request_abort);
+    assert!(!port.abort_request(&a, a_generation, request).await);
+    assert!(lab.engine.aborted.lock().unwrap().is_empty());
+    let s = lab.deploy_build("sglang-s", SGLANG, "0.5.22", |_| {});
+    tokio::time::timeout(Duration::from_secs(30), port.activate_for_request(&s))
+        .await
+        .unwrap()
+        .unwrap();
+    let generation = lab.instance(&s, 0).2.unwrap();
+    assert!(
+        port.instance_endpoint(&s, generation)
+            .unwrap()
+            .unwrap()
+            .request_abort
+    );
+    assert!(port.abort_request(&s, generation, request).await);
+    let aborted = lab.engine.aborted.lock().unwrap().clone();
+    assert_eq!(
+        aborted,
+        vec![(
+            MemberRef {
+                deployment_id: s.clone(),
+                member_id: retained_binding(&lab, &s),
+            },
+            request.to_owned()
+        )]
+    );
+    // An incarnation that holds no runtime is sent nothing.
+    assert!(!port.abort_request(&s, generation + 100, request).await);
+    assert_eq!(lab.engine.aborted.lock().unwrap().len(), 1);
+    lab.worker.shutdown().await.unwrap();
+}
+
+// T17 (ADR 0032 §1, ADR 0017): SGLang 0.5.22 with two tokenizer workers, or
+// another SGLang build, is not offered the abort and is sent nothing.
+#[tokio::test]
+async fn other_sglang_launches_are_not_offered_the_abort() {
+    for (name, build, workers) in [("sglang-w2", "0.5.22", 2), ("sglang-old", "0.5.21", 1)] {
+        let lab = lab(15, 50).await;
+        let s = lab.deploy_build(name, SGLANG, build, |d| {
+            d["engine_config"]["sglang"] = json!({ "tokenizer_workers": workers });
+        });
+        let port = lab.port(Duration::from_secs(5));
+        tokio::time::timeout(Duration::from_secs(30), port.activate_for_request(&s))
+            .await
+            .unwrap()
+            .unwrap();
+        let generation = lab.instance(&s, 0).2.unwrap();
+        assert!(
+            !port
+                .instance_endpoint(&s, generation)
+                .unwrap()
+                .unwrap()
+                .request_abort,
+            "{name}"
+        );
+        assert!(
+            !port
+                .abort_request(&s, generation, "01K00000000000000000000R01")
+                .await
+        );
+        assert!(lab.engine.aborted.lock().unwrap().is_empty(), "{name}");
+        lab.worker.shutdown().await.unwrap();
+    }
+}

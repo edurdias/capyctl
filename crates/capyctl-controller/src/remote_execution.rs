@@ -689,13 +689,90 @@ impl EngineAdapter for RemoteEngine {
     async fn observe_work(&self, _: &MemberRef) -> Result<WorkObservation, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
     }
+    /// ADR 0032 §3: abort one request on the launch this binding owns, by
+    /// CapyCTL's request ID (`req.id`, SGLang's `rid`). One AbortRequest,
+    /// which the host's agent runs on loopback against its retained launch
+    /// with the launch's own key, never through ingress or the router. It is
+    /// sent only to a host whose session declares `request_abort` (ADR
+    /// 0017), for the launch this coordinator session still runs there (its
+    /// deployment, generation and revision from the store), with at most
+    /// [`crate::agent_sessions::MAX_ABORTS_PER_HOST`] in flight to the host,
+    /// and bounded by [`ABORT_BOUND`]. `Uncertain` once the host reports the
+    /// engine answered the abort: that answer is never evidence the request
+    /// ended. Anything else is an error (not sent, refused by the host, or
+    /// unanswered), and the request keeps today's rule.
     async fn cancel_work(
         &self,
-        _: &MemberRef,
-        _: &RequestRef,
+        member: &MemberRef,
+        req: &RequestRef,
         _: bool,
     ) -> Result<CancellationOutcome, AdapterError> {
-        Err(AdapterError::UnsupportedCapability)
+        let b = &self.binding;
+        if member.member_id != b.plan.binding_id
+            || !capyctl_protocol::execution::is_request_id(&req.id)
+        {
+            return Err(AdapterError::UnsupportedCombination);
+        }
+        if !self.sessions.supports_request_abort(&b.host_id) {
+            return Err(AdapterError::UnsupportedCapability);
+        }
+        let launch = {
+            let owner = self
+                .owner
+                .lock()
+                .map_err(|_| AdapterError::Uncertain("ownership unavailable".into()))?;
+            owner
+                .store()
+                .remote_live_launch(owner.session(), &b.plan.binding_id)
+                .ok()
+                .flatten()
+        };
+        let Some(launch) = launch
+            .filter(|l| l.host_id == b.host_id && l.fence.deployment_id == member.deployment_id)
+        else {
+            return Err(AdapterError::PolicyDenied);
+        };
+        // Past the host's share of aborts: not sent.
+        let Some(_slot) = self.sessions.abort_slot(&b.host_id) else {
+            return Err(AdapterError::PolicyDenied);
+        };
+        let id = ulid::Ulid::new().to_string();
+        let mut command = MemberCommand {
+            identity: CommandIdentity {
+                controller_id: b.controller_id.clone(),
+                member: MemberKey {
+                    host_id: b.host_id.clone(),
+                    member_id: b.member_id.clone(),
+                },
+                deployment_id: launch.fence.deployment_id.clone(),
+                operation_id: id.clone(),
+                command_id: id.clone(),
+                step_id: id,
+                generation: launch.fence.generation,
+                revision: launch.fence.revision,
+                deadline_ms: capyctl_protocol::now_unix_ms()
+                    .saturating_add(ABORT_BOUND.as_millis() as i64),
+                payload_digest: [0; 32],
+                expected_state: capyctl_protocol::execution::ABORT_REQUEST_STATE.into(),
+                profile_fingerprint: b.profile_fingerprint.clone(),
+                instance_index: b.instance_index,
+            },
+            action: MemberAction::AbortRequest {
+                owned_handle: b.launch_command_id.clone(),
+                request_id: req.id.clone(),
+            },
+        };
+        command.identity.payload_digest = command.canonical_digest();
+        let result = tokio::time::timeout(ABORT_BOUND, self.sessions.execute(command))
+            .await
+            .map_err(|_| AdapterError::Uncertain("the host did not answer the abort".into()))?
+            .map_err(
+                |status| match crate::agent_sessions::gate_refusal(&status) {
+                    Some(_) => AdapterError::UnsupportedCapability,
+                    None => AdapterError::Uncertain("the host did not answer the abort".into()),
+                },
+            )?;
+        abort_outcome(&result)
     }
     async fn engine_quiescent(&self, member: &MemberRef, after_ms: i64) -> bool {
         // SPEC §10 (W12; amended 2026-10-01): the host's load report for this
@@ -833,6 +910,25 @@ impl EngineAdapter for RemoteEngine {
             answer,
             observed_at_ms: result.observed_at_unix_ms,
         })
+    }
+}
+
+/// ADR 0032 §3: how long the server waits for a host's answer to an abort,
+/// and the AbortRequest's deadline. The host's post is bounded at 3 s.
+pub const ABORT_BOUND: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// ADR 0032 §3: what a host's answer to an AbortRequest (shape already
+/// checked by `validate_result`) means: posted and answered by the engine
+/// (`Uncertain`, never evidence the request ended), refused with nothing
+/// posted, or posted without an answer.
+fn abort_outcome(result: &pb::MemberExecutionResult) -> Result<CancellationOutcome, AdapterError> {
+    match (result.state.as_str(), result.refused.as_str()) {
+        ("completed", "") => Ok(CancellationOutcome::Uncertain),
+        ("completed", "request_abort_unsupported") => Err(AdapterError::UnsupportedCapability),
+        ("completed", _) => Err(AdapterError::PolicyDenied),
+        _ => Err(AdapterError::Uncertain(
+            "the engine did not answer the abort".into(),
+        )),
     }
 }
 

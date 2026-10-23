@@ -41,6 +41,8 @@ struct Scripted {
     idle_at: Mutex<Option<i64>>,
     /// The engine never answers a quiescence question.
     wedged: AtomicBool,
+    /// ADR 0032 §3: (member, request ID) of every abort the engine was asked.
+    aborted: Mutex<Vec<(MemberRef, String)>>,
 }
 
 impl Scripted {
@@ -54,6 +56,7 @@ impl Scripted {
             asked: Mutex::new(vec![]),
             idle_at: Mutex::new(None),
             wedged: AtomicBool::new(false),
+            aborted: Mutex::new(vec![]),
         })
     }
     fn calls(&self, action: RuntimeAction, deployment: &str) -> usize {
@@ -144,11 +147,15 @@ impl EngineAdapter for Scripted {
     }
     async fn cancel_work(
         &self,
-        _: &MemberRef,
-        _: &RequestRef,
+        member: &MemberRef,
+        request: &RequestRef,
         _: bool,
     ) -> Result<CancellationOutcome, AdapterError> {
-        Err(AdapterError::UnsupportedCapability)
+        self.aborted
+            .lock()
+            .unwrap()
+            .push((member.clone(), request.id.clone()));
+        Ok(CancellationOutcome::Uncertain)
     }
     async fn engine_quiescent(&self, _: &MemberRef, after_ms: i64) -> bool {
         self.asked.lock().unwrap().push(after_ms);
@@ -384,9 +391,20 @@ impl Lab {
     /// Create one more managed deployment on the host from a golden
     /// fixture, edited.
     fn deploy(&self, name: &str, golden: &str, edit: impl FnOnce(&mut Value)) -> String {
+        self.deploy_build(name, golden, "qualification-fake-v1", edit)
+    }
+
+    /// As [`Self::deploy`], with the host's engine registered at `build`.
+    fn deploy_build(
+        &self,
+        name: &str,
+        golden: &str,
+        build: &str,
+        edit: impl FnOnce(&mut Value),
+    ) -> String {
         let source: Value = serde_json::from_str(golden).unwrap();
         let mut host = source["input"]["host"].clone();
-        host["runtime_profiles"]["local"]["build_fingerprint"] = json!("qualification-fake-v1");
+        host["runtime_profiles"]["local"]["build_fingerprint"] = json!(build);
         host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
             json!("secret://another-admin");
         // The trusted host document matches the policy the budget published.

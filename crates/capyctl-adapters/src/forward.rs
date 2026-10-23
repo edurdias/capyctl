@@ -380,6 +380,27 @@ fn upstream(base: &reqwest::Url, path: &str) -> Option<reqwest::Url> {
     base.join(path).ok()
 }
 
+/// ADR 0032 §1–§2: how a lane carries CapyCTL's request ID (the
+/// `X-CapyCTL-Request-Id` value, never the caller's `X-Request-Id`) to the
+/// engine, for chat requests only (a decision request never carries it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RequestIdLane {
+    /// The engine has no per-request abort: no ID is sent.
+    Absent,
+    /// An SGLang launch with the capability, reached directly: the ID goes as
+    /// `rid` in the JSON sent to the engine, after the caller's request was
+    /// validated (a caller's `rid` is still refused).
+    Engine,
+    /// A host ingress serving such a launch: the ID goes as the
+    /// [`CAPYCTL_REQUEST_ID_HEADER`] header, which the ingress consumes and
+    /// sets as `rid` on a launch with the capability.
+    Ingress,
+}
+
+/// ADR 0032 §2: the header that carries CapyCTL's request ID to a host
+/// ingress. The ingress never forwards it to the engine as a header.
+pub const CAPYCTL_REQUEST_ID_HEADER: &str = "x-capyctl-request-id";
+
 /// Holds only service-selected endpoint, model, and inference authentication.
 /// Intentionally no Debug implementation: credentials must never be formatted.
 pub(crate) struct ChatHttp {
@@ -392,6 +413,9 @@ pub(crate) struct ChatHttp {
     /// SPEC §10, ADR 0033 §5: what this forwarder does with a request's
     /// `cache_salt`.
     cache_salt: CacheSalt,
+    /// ADR 0032 §1–§2: how a chat request carries the ID its sink names
+    /// ([`ChatSink::request_id`]).
+    request_ids: RequestIdLane,
 }
 
 /// ADR 0033 §5: the domain separator of [`effective_cache_salt`]. A new
@@ -480,6 +504,7 @@ impl ChatHttp {
             model,
             key,
             cache_salt,
+            request_ids: RequestIdLane::Absent,
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .retry(reqwest::retry::never())
@@ -488,6 +513,12 @@ impl ChatHttp {
                 .build()
                 .expect("static client configuration"),
         }
+    }
+
+    /// ADR 0032 §1–§2: carry CapyCTL's request ID on this lane as `lane` says.
+    pub(crate) fn with_request_ids(mut self, lane: RequestIdLane) -> Self {
+        self.request_ids = lane;
+        self
     }
 
     /// The callback path's collection, with the transport's own bounds (60 s
@@ -554,6 +585,10 @@ struct Collecting<'a> {
 impl ChatSink for Collecting<'_> {
     fn progressed(&mut self) {
         self.observer.progressed();
+    }
+    /// ADR 0032 §1: the collected path carries the observer's request ID.
+    fn request_id(&self) -> Option<&str> {
+        self.observer.request_id()
     }
     async fn send(&mut self, chunk: String) -> Result<(), DeliveryFailed> {
         self.observer.collected(&chunk);
@@ -757,16 +792,21 @@ impl ChatHttp {
     /// (`NotAccepted`); an engine's complete invalid-request answer is
     /// `Rejected`, and its complete error answer is `EngineError`. Any other
     /// transport error is `unverified()`. The caller judges every other
-    /// response.
+    /// response. `request_id` goes as [`CAPYCTL_REQUEST_ID_HEADER`] (ADR 0032
+    /// §2: to a host ingress only).
     async fn post(
         &self,
         url: &reqwest::Url,
         request: &Value,
+        request_id: Option<&str>,
         unverified: fn() -> AdapterError,
     ) -> Result<reqwest::Response, AdapterError> {
         let mut send = self.client.post(url.clone()).json(request);
         if let Some(key) = &self.key {
             send = send.bearer_auth(key);
+        }
+        if let Some(id) = request_id {
+            send = send.header(CAPYCTL_REQUEST_ID_HEADER, id);
         }
         let response = send.send().await.map_err(|error| {
             // SPEC §10, ADR 0013 §10: a connection that was never established
@@ -815,7 +855,7 @@ impl ChatHttp {
         let mut request = body.clone();
         request["model"] = json!(self.model);
         let response = self
-            .post(&self.decisions, &request, decision_uncertain)
+            .post(&self.decisions, &request, None, decision_uncertain)
             .await?;
         if !response.status().is_success() || !content_type_is(&response, "application/json") {
             return Err(decision_uncertain());
@@ -868,18 +908,38 @@ impl ChatHttp {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or(AdapterError::UnsupportedCapability)?;
+        // ADR 0032 §1–§2: CapyCTL's request ID, on a lane that carries it,
+        // added only after the caller's request was validated, so a caller's
+        // own `rid` is still refused above.
+        let request_id = match self.request_ids {
+            RequestIdLane::Absent => None,
+            RequestIdLane::Engine | RequestIdLane::Ingress => sink.request_id().map(str::to_owned),
+        };
         let mut request = body.clone();
         request["model"] = json!(self.model);
         request["stream"] = json!(true);
         if let Some(effective) = effective {
             request["cache_salt"] = json!(effective);
         }
-        let response = self.post(&self.endpoint, &request, uncertain).await?;
+        let header = match (self.request_ids, &request_id) {
+            (RequestIdLane::Engine, Some(id)) => {
+                request["rid"] = json!(id);
+                None
+            }
+            (RequestIdLane::Ingress, Some(id)) => Some(id.as_str()),
+            _ => None,
+        };
+        let response = self
+            .post(&self.endpoint, &request, header, uncertain)
+            .await?;
         if !response.status().is_success() || !content_type_is(&response, "text/event-stream") {
             return Err(uncertain());
         }
         let mut stream = response.bytes_stream();
-        let mut parser = Parser::new(&self.model, public);
+        // ADR 0032 §4: SGLang's graceful abort ends a request it was asked to
+        // abort with a final chunk whose finish reason is `abort`; only a
+        // request that carries CapyCTL's ID can have been asked.
+        let mut parser = Parser::new(&self.model, public, request_id.is_some());
         loop {
             let next = match read_idle {
                 Some(idle) => tokio::time::timeout(idle, stream.next())
@@ -904,10 +964,18 @@ impl ChatHttp {
                     sink.progressed();
                 }
                 if let Some(chunk) = payload {
-                    let sink_failed = !matches!(
-                        tokio::time::timeout(Duration::from_secs(10), sink.send(chunk)).await,
-                        Ok(Ok(()))
-                    );
+                    // ADR 0032 §3: a sink that carries the request ID bounds
+                    // its own delivery and keeps the forward reading after a
+                    // failed one (it discards instead), so the router can read
+                    // the request to its own end after the abort.
+                    let sink_failed = if request_id.is_some() {
+                        sink.send(chunk).await.is_err()
+                    } else {
+                        !matches!(
+                            tokio::time::timeout(Duration::from_secs(10), sink.send(chunk)).await,
+                            Ok(Ok(()))
+                        )
+                    };
                     // SPEC §10 (amended 2026-10-01): a client that left is not proof the engine
                     // stopped, so the engine is asked to stop: the connection closes here and
                     // the lease stays charged until the engine reports quiescence.
@@ -1210,7 +1278,22 @@ pub fn engine_forwarder(
     key: Option<String>,
     cache_salt: CacheSalt,
 ) -> std::sync::Arc<dyn crate::traits::ChatForward> {
-    std::sync::Arc::new(EngineForward(ChatHttp::new(base, model, key, cache_salt)))
+    engine_forwarder_on(base, model, key, cache_salt, RequestIdLane::Absent)
+}
+
+/// As [`engine_forwarder`], for a lane that carries CapyCTL's request ID as
+/// `request_ids` says (ADR 0032 §1–§2): the router builds it from the
+/// endpoint's `request_abort` and whether the endpoint is a host ingress.
+pub fn engine_forwarder_on(
+    base: reqwest::Url,
+    model: String,
+    key: Option<String>,
+    cache_salt: CacheSalt,
+    request_ids: RequestIdLane,
+) -> std::sync::Arc<dyn crate::traits::ChatForward> {
+    std::sync::Arc::new(EngineForward(
+        ChatHttp::new(base, model, key, cache_salt).with_request_ids(request_ids),
+    ))
 }
 
 struct Parser<'a> {
@@ -1222,9 +1305,13 @@ struct Parser<'a> {
     event_bytes: usize,
     id: Option<String>,
     finished: bool,
+    /// ADR 0032 §4: whether a finish reason of `abort` (SGLang's graceful
+    /// abort, `entrypoints/openai/serving_chat.py` 0.5.22) finishes the
+    /// stream: only on a lane that sent CapyCTL's request ID.
+    abort_finishes: bool,
 }
 impl<'a> Parser<'a> {
-    fn new(backend: &'a str, public: &'a str) -> Self {
+    fn new(backend: &'a str, public: &'a str, abort_finishes: bool) -> Self {
         Self {
             backend,
             public,
@@ -1234,6 +1321,7 @@ impl<'a> Parser<'a> {
             event_bytes: 0,
             id: None,
             finished: false,
+            abort_finishes,
         }
     }
     fn byte(
@@ -1370,6 +1458,11 @@ impl<'a> Parser<'a> {
                         "stop" | "length" | "content_filter" | "tool_calls"
                     ) =>
                 {
+                    self.finished = true
+                }
+                // ADR 0032 §4: the request's own final output after it was
+                // asked to abort; elsewhere an `abort` finish stays uncertain.
+                Some(Value::String(s)) if s == "abort" && self.abort_finishes => {
                     self.finished = true
                 }
                 _ => return Err(uncertain()),
@@ -2901,5 +2994,242 @@ mod tests {
             effective_cache_salt("dep-1", 3, ""),
             effective_cache_salt("dep-1", 3, "\0")
         );
+    }
+
+    /// ADR 0032: a sink naming CapyCTL's request ID, collecting what it is sent.
+    struct Carrying {
+        id: Option<&'static str>,
+        chunks: Vec<String>,
+    }
+    #[async_trait::async_trait]
+    impl crate::traits::ChatSink for Carrying {
+        fn request_id(&self) -> Option<&str> {
+            self.id
+        }
+        async fn send(&mut self, chunk: String) -> Result<(), crate::traits::DeliveryFailed> {
+            self.chunks.push(chunk);
+            Ok(())
+        }
+    }
+
+    /// What reached an engine: the request body and its
+    /// `X-CapyCTL-Request-Id` header, per route.
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, Value, Option<String>)>>>;
+
+    /// An engine that records each chat and decision request with its
+    /// request-ID header and answers chat with `sse`.
+    async fn recording_ids(sse: String) -> (reqwest::Url, Seen) {
+        let seen: Seen = Default::default();
+        let record = |route: &'static str, seen: Seen| {
+            move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                let header = headers
+                    .get(super::CAPYCTL_REQUEST_ID_HEADER)
+                    .map(|v| v.to_str().unwrap().to_owned());
+                seen.lock().unwrap().push((route.to_owned(), body, header));
+                async {}
+            }
+        };
+        let chat = record("chat", seen.clone());
+        let router = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(
+                    move |headers: axum::http::HeaderMap, body: axum::Json<Value>| {
+                        let answer = chat(headers, body);
+                        let sse = sse.clone();
+                        async move {
+                            answer.await;
+                            ([("content-type", "text/event-stream")], sse)
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/v1/systemone",
+                axum::routing::post(record("decision", seen.clone())),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        (format!("http://{address}").parse().unwrap(), seen)
+    }
+
+    fn completed_sse(finish: &str) -> String {
+        [
+            tool_chunk(json!({"role":"assistant"}), Value::Null),
+            tool_chunk(json!({"content":"hi"}), Value::Null),
+            tool_chunk(json!({}), json!(finish)),
+            "data: [DONE]\n\n".to_owned(),
+        ]
+        .concat()
+    }
+
+    const RID: &str = "01K00000000000000000000009";
+
+    // T17 (ADR 0032 §1–§2): on an engine lane CapyCTL's request ID (the sink's)
+    // goes as `rid` in the body sent to the engine; on an ingress lane as the
+    // `X-CapyCTL-Request-Id` header, never in the body; on a lane without the
+    // capability, or with no ID from the sink, nowhere. A decision never
+    // carries it, and a caller's own `rid` is still refused before anything
+    // is sent.
+    #[tokio::test]
+    async fn the_request_id_reaches_the_engine_only_as_its_lane_says() {
+        use super::{engine_forwarder_on, RequestIdLane};
+        let request = json!({"model":"public","messages":[]});
+        for (lane, id, rid, header) in [
+            (RequestIdLane::Engine, Some(RID), Some(RID), None),
+            (RequestIdLane::Ingress, Some(RID), None, Some(RID)),
+            (RequestIdLane::Absent, Some(RID), None, None),
+            (RequestIdLane::Engine, None, None, None),
+            (RequestIdLane::Ingress, None, None, None),
+        ] {
+            let (url, seen) = recording_ids(completed_sse("stop")).await;
+            let forward = engine_forwarder_on(
+                url,
+                "m".into(),
+                None,
+                crate::forward::CacheSalt::for_launch(Some("sglang"), "dep-1", 1),
+                lane,
+            );
+            let mut sink = Carrying { id, chunks: vec![] };
+            let end = forward
+                .forward_chat_stream_async(&request, &mut sink)
+                .await
+                .unwrap();
+            assert_eq!(end, crate::traits::StreamEnded::Completed, "{lane:?}");
+            let mut observer = Carrying { id, chunks: vec![] };
+            forward
+                .forward_chat_observed(&request, &mut observer)
+                .await
+                .unwrap();
+            let _ = forward.forward_decision(&decision(json!({}))).await;
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 3, "{lane:?}");
+            for (route, body, sent) in &seen[..2] {
+                assert_eq!(route, "chat");
+                assert_eq!(body.get("rid").and_then(Value::as_str), rid, "{lane:?}");
+                assert_eq!(sent.as_deref(), header, "{lane:?}");
+            }
+            let (route, body, sent) = &seen[2];
+            assert_eq!(route, "decision");
+            assert!(body.get("rid").is_none(), "{lane:?}");
+            assert_eq!(sent, &None, "{lane:?}");
+        }
+        let (url, seen) = recording_ids(completed_sse("stop")).await;
+        let forward = engine_forwarder_on(
+            url,
+            "m".into(),
+            None,
+            crate::forward::CacheSalt::for_launch(Some("sglang"), "dep-1", 1),
+            RequestIdLane::Engine,
+        );
+        let mut sink = Carrying {
+            id: Some(RID),
+            chunks: vec![],
+        };
+        let caller = json!({"model":"public","messages":[],"rid":"mine"});
+        assert!(matches!(
+            forward.forward_chat_stream_async(&caller, &mut sink).await,
+            Err(AdapterError::PolicyDenied)
+        ));
+        assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
+    }
+
+    // T17 (ADR 0032 §4): SGLang's graceful abort ends a request with a final
+    // chunk whose finish reason is `abort`, then `[DONE]`. On a lane that sent
+    // CapyCTL's request ID that is the request's own final output, read
+    // whole: the stream completes and the collected answer is assembled.
+    // Anywhere else it stays uncertain, and on a capable lane a truncated end
+    // or a later error event is not that output either.
+    #[tokio::test]
+    async fn an_abort_finish_is_a_final_output_only_where_the_id_was_sent() {
+        use super::{engine_forwarder_on, RequestIdLane};
+        let request = json!({"model":"public","messages":[]});
+        let (url, _) = recording_ids(completed_sse("abort")).await;
+        let forward = engine_forwarder_on(
+            url,
+            "m".into(),
+            None,
+            crate::forward::CacheSalt::for_launch(Some("sglang"), "dep-1", 1),
+            RequestIdLane::Engine,
+        );
+        let mut sink = Carrying {
+            id: Some(RID),
+            chunks: vec![],
+        };
+        assert_eq!(
+            forward
+                .forward_chat_stream_async(&request, &mut sink)
+                .await
+                .unwrap(),
+            crate::traits::StreamEnded::Completed
+        );
+        let mut observer = Carrying {
+            id: Some(RID),
+            chunks: vec![],
+        };
+        let answer = forward
+            .forward_chat_observed(&request, &mut observer)
+            .await
+            .unwrap();
+        assert_eq!(answer["choices"][0]["finish_reason"], "abort");
+        assert_eq!(answer["choices"][0]["message"]["content"], "hi");
+        for (lane, id) in [
+            (RequestIdLane::Absent, Some(RID)),
+            (RequestIdLane::Engine, None),
+        ] {
+            let (url, _) = recording_ids(completed_sse("abort")).await;
+            let forward = engine_forwarder_on(
+                url,
+                "m".into(),
+                None,
+                crate::forward::CacheSalt::for_launch(Some("sglang"), "dep-1", 1),
+                lane,
+            );
+            let mut sink = Carrying { id, chunks: vec![] };
+            assert!(
+                matches!(
+                    forward.forward_chat_stream_async(&request, &mut sink).await,
+                    Err(AdapterError::Uncertain(_))
+                ),
+                "{lane:?}"
+            );
+        }
+        let error = format!(
+            "data: {}\n\n",
+            json!({"error":{"object":"error","message":"Generation aborted.",
+                "type":"ServiceUnavailable","code":503}})
+        );
+        for sse in [
+            // Truncated: the abort finish without the terminator.
+            [
+                tool_chunk(json!({"content":"hi"}), Value::Null),
+                tool_chunk(json!({}), json!("abort")),
+            ]
+            .concat(),
+            // SGLang's error abort (with a status code) after output.
+            [
+                tool_chunk(json!({"content":"hi"}), Value::Null),
+                error.clone(),
+            ]
+            .concat(),
+        ] {
+            let (url, _) = recording_ids(sse).await;
+            let forward = engine_forwarder_on(
+                url,
+                "m".into(),
+                None,
+                crate::forward::CacheSalt::for_launch(Some("sglang"), "dep-1", 1),
+                RequestIdLane::Engine,
+            );
+            let mut sink = Carrying {
+                id: Some(RID),
+                chunks: vec![],
+            };
+            assert!(matches!(
+                forward.forward_chat_stream_async(&request, &mut sink).await,
+                Err(AdapterError::Uncertain(_))
+            ));
+        }
     }
 }

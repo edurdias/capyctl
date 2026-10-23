@@ -263,7 +263,8 @@ async fn chat_completion(
         // held from before the first byte reaches the engine until the backend
         // stream ends. Refusals before any offer are ordinary HTTP errors.
         let started = std::time::Instant::now();
-        let mut plan = balance::Plan::new(deps, &deployment_id, view, ids.clone())?;
+        let deadline = received + deps.inflight.waiting.limits().deadline;
+        let mut plan = balance::Plan::new(deps, &deployment_id, view, ids.clone(), deadline)?;
         timing.selected(started.elapsed());
         let started = std::time::Instant::now();
         let first = plan.next().await?;

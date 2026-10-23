@@ -62,7 +62,7 @@ pub use engine_provider::{EngineInstallation, EngineProvider, ProviderError};
 pub use fault::LifecycleFault;
 pub use operations::{AttachRequest, Controller, ControllerError, DeployRequest, OperationHandle};
 pub use ownership::{OwnedCoordinatorState, OwnedStateError};
-pub use port::{LifecyclePort, RuntimeEndpoint, ServingInstance};
+pub use port::{HeldRestart, LifecyclePort, RuntimeEndpoint, ServingInstance};
 pub use request_leases::{LeaseEnd, LeaseRefused, RequestLease};
 pub use runtime::{DurableRuntimeSupervisor, RuntimeBinding, RuntimeBindings, RuntimeOwnership};
 

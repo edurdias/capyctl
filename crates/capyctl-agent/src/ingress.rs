@@ -62,13 +62,20 @@ pub struct EngineAccess {
     /// as a bearer token. ADR 0031 §7 / amendment A1: a custom engine is
     /// keyed only when its manifest uses `{api_key}`.
     pub keyed: bool,
+    /// ADR 0032 §2: whether the launch's engine takes CapyCTL's request ID
+    /// as `rid` (SGLang 0.5.22 with one tokenizer worker, ADR 0017), from the
+    /// version and settings it was approved with. Only then does a chat
+    /// request carry the router's ID to the engine; otherwise it is dropped.
+    pub request_abort: bool,
 }
 impl EngineAccess {
     /// A built-in engine: read by its family's `/metrics`, always keyed.
+    /// It takes no request ID unless [`Self::with_request_abort`] says so.
     pub fn builtin() -> Self {
         Self {
             signal: crate::load::LaunchSignal::Builtin,
             keyed: true,
+            request_abort: false,
         }
     }
     /// ADR 0031 §6, §7: a custom engine, read by its manifest's idle signal
@@ -78,6 +85,7 @@ impl EngineAccess {
         Self {
             signal: crate::load::LaunchSignal::Custom(custom.manifest.idle.clone()),
             keyed: custom.manifest.uses_api_key(),
+            request_abort: false,
         }
     }
     /// ADR 0031 §6, AGENTS.md (uncertainty must retain accounting): a launch
@@ -88,6 +96,15 @@ impl EngineAccess {
         Self {
             signal: crate::load::LaunchSignal::Unknown,
             keyed: false,
+            request_abort: false,
+        }
+    }
+    /// ADR 0032 §2: the same access, with whether the launch's engine takes
+    /// CapyCTL's request ID as `rid`.
+    pub fn with_request_abort(self, request_abort: bool) -> Self {
+        Self {
+            request_abort,
+            ..self
         }
     }
 }
@@ -588,6 +605,15 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
     ) {
         return failure(StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
+    // ADR 0032 §2: CapyCTL's request ID, as the router sends it with the
+    // request. It is consumed here and never forwarded as a header. A value
+    // that is not one canonical ULID, or more than one value, is malformed
+    // input and refused like any other (400) before the engine is reached:
+    // stricter than dropping it, and only the router, which always sends a
+    // ULID, holds this gate's credential.
+    let Ok(request_id) = request_id(request.headers()) else {
+        return failure(StatusCode::BAD_REQUEST);
+    };
     // ADR 0030 §2: one bound for every kind; a decision's images count in it.
     let body = match tokio::time::timeout(
         Duration::from_secs(15),
@@ -631,12 +657,34 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
     // that takes it; a custom engine whose manifest does not use `{api_key}`
     // gets no `Authorization` header. An entry no launch is bound to yet
     // keeps the key it was registered with.
-    let keyed = entry
+    let (keyed, request_abort) = entry
         .handle
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
-        .is_none_or(|(_, engine)| engine.keyed);
+        .map_or((true, false), |(_, engine)| {
+            (engine.keyed, engine.request_abort)
+        });
+    // ADR 0032 §1, §2: on a launch whose engine takes it, a chat request
+    // carries CapyCTL's request ID as SGLang's `rid`, set only here, after
+    // the allowlist above refused any `rid` of the caller's. A decision never
+    // carries one (SGLang 0.5.22's `/v1/systemone` builds its request without
+    // a `rid`), and a launch without the capability gets none: the ID is
+    // dropped. The body is re-encoded only when the ID is set.
+    let body = match request_id.filter(|_| request_abort && matches!(kind, Kind::Chat)) {
+        Some(id) => {
+            let mut value = value;
+            let Some(fields) = value.as_object_mut() else {
+                return failure(StatusCode::BAD_REQUEST);
+            };
+            fields.insert("rid".into(), serde_json::Value::String(id));
+            match serde_json::to_vec(&value) {
+                Ok(encoded) => axum::body::Bytes::from(encoded),
+                Err(_) => return failure(StatusCode::BAD_REQUEST),
+            }
+        }
+        None => body,
+    };
     let upstream = ingress
         .client
         .post(format!("http://{}{}", entry.target, kind.path()));
@@ -717,4 +765,20 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
     builder
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| failure(StatusCode::BAD_GATEWAY))
+}
+
+/// ADR 0032 §2: the router's `X-CapyCTL-Request-Id`, if it sent one: `None`
+/// without it, an error for a repeated or non-ULID value.
+fn request_id(headers: &axum::http::HeaderMap) -> Result<Option<String>, ()> {
+    let mut values = headers
+        .get_all(capyctl_adapters::forward::CAPYCTL_REQUEST_ID_HEADER)
+        .iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| ())?;
+    if values.next().is_some() || !capyctl_protocol::execution::is_request_id(value) {
+        return Err(());
+    }
+    Ok(Some(value.to_owned()))
 }

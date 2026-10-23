@@ -55,6 +55,12 @@ pub struct RuntimeEndpoint {
     /// ADR 0033 §5: the revision this launch runs, read from its binding;
     /// never the deployment's current revision, which may already be newer.
     pub revision: u64,
+    /// ADR 0032 §1–§3: this lane carries CapyCTL's request ID to the engine as
+    /// SGLang's `rid` (through the host's ingress for a remote instance), and
+    /// the authority can ask the engine to abort that `rid`
+    /// ([`LifecyclePort::abort_request`]). Only an SGLang 0.5.22 launch with one
+    /// tokenizer worker, on a host whose session declares the abort operation.
+    pub request_abort: bool,
 }
 
 /// ADR 0013 §10 (unit I3): one instance of a deployment that holds a runtime,
@@ -283,6 +289,59 @@ pub trait LifecyclePort: Send + Sync {
     /// current is ignored. The default is an authority without groups, which
     /// has nothing to probe.
     async fn report_group_stall(&self, _deployment_id: &str, _instance: u32, _generation: i64) {}
+
+    /// ADR 0032 §3: ask the engine of instance incarnation `generation` of
+    /// `deployment_id` to abort CapyCTL's request `request_id` (its `rid`), on
+    /// the engine's loopback port with the launch's key: on the router's machine
+    /// through the adapter's `cancel_work`, on a host through the agent's abort
+    /// operation. Returns whether the abort was sent. A sent abort is never
+    /// evidence that the engine stopped; only the request's own final output
+    /// is. The default is an authority that cannot abort: nothing is sent.
+    async fn abort_request(
+        &self,
+        _deployment_id: &str,
+        _generation: i64,
+        _request_id: &str,
+    ) -> bool {
+        false
+    }
+
+    /// ADR 0032 §4–§5: close the cancelling lease `lease_id` on its own
+    /// evidence (the engine's final output for the request, read whole after
+    /// the abort), journaling `request_cancellation_acknowledged` with the
+    /// per-request receipt in the same transaction. `Ok(false)` when the lease
+    /// is no longer an open cancelling lease of the current session (already
+    /// settled, or uncertain): nothing changes. An error leaves it charged.
+    async fn acknowledge_cancelled_request(
+        &self,
+        _lease_id: &str,
+    ) -> Result<bool, crate::request_leases::LeaseRefused> {
+        Ok(false)
+    }
+
+    /// ADR 0032 §7: the deployment's durable lease bound refused a grant as
+    /// full. When every open lease of `deployment_id` is a cancelled request
+    /// that settles only at its instance's next verified stop (and none is
+    /// uncertain), restart each instance holding them and journal
+    /// `instance_restarted_for_held_requests`; the router then waits for the
+    /// restart as for an activation. The default restarts nothing.
+    async fn restart_for_held_requests(
+        &self,
+        _deployment_id: &str,
+    ) -> Result<HeldRestart, LifecycleFault> {
+        Ok(HeldRestart::NotHeld)
+    }
+}
+
+/// ADR 0032 §7: what [`LifecyclePort::restart_for_held_requests`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldRestart {
+    /// Not every open lease is held until a stop (a live or uncertain lease,
+    /// or the deployment is not full): nothing restarts; the refusal stands.
+    NotHeld,
+    /// A restart of every instance holding them was accepted now, or one was
+    /// already under way; their verified exit settles them.
+    Restarting,
 }
 
 #[async_trait]

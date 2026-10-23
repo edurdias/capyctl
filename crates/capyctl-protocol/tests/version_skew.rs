@@ -373,6 +373,7 @@ fn every_post_baseline_field_names_its_capability() {
             STARTUP_HOST_BYTES,
             LMCACHE,
             RETENTION,
+            REQUEST_ABORT,
         ]
         .contains(name)
         {
