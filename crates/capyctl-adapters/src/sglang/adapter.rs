@@ -3,7 +3,7 @@
 //! permission, verifies a recipe, commits a completion, or opens dispatch.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -100,7 +100,7 @@ pub trait SglangRuntimeObserver: Send + Sync {
 struct Attempts {
     active: bool,
     uncertain: bool,
-    steps: HashSet<String>,
+    steps: crate::step_fence::RecentSteps,
 }
 
 struct Attempt<'a> {
@@ -477,11 +477,7 @@ impl SglangAdapter {
         }
         {
             let mut attempts = self.attempts.lock().map_err(|_| uncertain())?;
-            if attempts.active
-                || attempts.uncertain
-                || attempts.steps.len() >= 4096
-                || !attempts.steps.insert(c.token.step_id.clone())
-            {
+            if attempts.active || attempts.uncertain || !attempts.steps.admit(&c.token.step_id) {
                 return Err(uncertain());
             }
             attempts.active = true;
@@ -812,11 +808,7 @@ impl EngineAdapter for SglangAdapter {
         ));
         {
             let mut attempts = self.attempts.lock().map_err(|_| uncertain())?;
-            if attempts.active
-                || attempts.uncertain
-                || attempts.steps.len() >= 4096
-                || !attempts.steps.insert(c.token.step_id.clone())
-            {
+            if attempts.active || attempts.uncertain || !attempts.steps.admit(&c.token.step_id) {
                 return Err(uncertain());
             }
             attempts.active = true;

@@ -26,6 +26,8 @@ pub mod policy;
 pub mod protected;
 pub mod resolve;
 pub mod sglang;
+// SPEC §13.2 / T20: the once-only guard of a launch's residency steps.
+pub(crate) mod step_fence;
 pub mod tensorfold;
 pub mod traits;
 pub mod vllm;
