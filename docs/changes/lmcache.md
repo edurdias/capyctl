@@ -2,7 +2,7 @@
 
 ADR 0033 (owner decisions of 2026-10-21, amended by #179; owner input of 2026-10-22 on
 LMCache issue 4825) is implemented on this branch for 0.1.7, with the implementation
-amendments A1–A11 recorded in the ADR.
+amendments A1–A12 recorded in the ADR.
 
 What changed:
 
@@ -98,9 +98,9 @@ the server's measured charge is its group's VmRSS beyond the pool plus its sampl
 memory, a figure nothing read keeping its allowance (A1; `d8ab848d`); the server's
 short-lived child and a server stopped before its engine (A9; `7d9ab7fa`).
 
-Verification, rebased onto `main` (`800e6614`): `scripts/ci-local.sh` passes (unit 1600
-passed, 1 ignored; runtime 369); `scripts/ci-local.sh --deep --ci-shape` passes (core
-1705 passed; workspace 3652 passed, 1 ignored).
+Verification on `36f39c71` (both fix branches below merged; `main` still `800e6614`):
+`scripts/ci-local.sh --deep --ci-shape` passes, every step (unit 1607 passed, 1 ignored;
+core 1709 passed; workspace 3660 passed, 1 ignored).
 
 Live rows, host A (GB10), Qwen3-4B (context 4096, KV cache 1 GiB, `restart_only`
 unless stated), 2026-10-22, standalone role, builds of `49f10efa` (the branch before the
@@ -176,7 +176,8 @@ laptop. The later fixes are not yet run live.
   instance is Ready although it is charged only while restart-parked (Ready charge
   6,174,015,488 B, parked 7,247,757,312 B); the JSON reads as if the KV were held now.
 
-Fixed after these rows (`fix/lmcache-host-settings`, CPU tests only, not yet run live):
+Fixed after these rows (`fix/lmcache-host-settings` `1055f321` and
+`fix/lmcache-qualified-parking` `36f39c71`, CPU tests only, not yet run live):
 
 - **LC5, LC10 (A11).** A standalone role records the `lmcache` and `retention` it starts
   with (store schema v54, `embedded_host_settings`) before anything is placed or
@@ -201,13 +202,24 @@ Fixed after these rows (`fix/lmcache-host-settings`, CPU tests only, not yet run
 - **The `lmcache_off` detail.** A detail over its 512-character bound keeps its end
   (marked `…`), so an engine log tail's last line, the error, is kept (it was lost in
   LC7).
+- **LC4 part 3 (A12, finding 8).** The qualified parking table now compares the
+  checkpoint's real `config.json` `model_type` (read from local disk on the embedded
+  host; from the host's reported sizing or digest on a remote host, store schema v55
+  adding `model_type` to `checkpoint_sizes` and `checkpoint_digests`) and the GPU
+  product name hosts publish from `nvidia-smi` (`devices.<id>.product_name`). A
+  combination that does not match stays off and names both. Limits: a remote first
+  start before sizing plans off as "an unknown model type"; a revision frozen before its
+  host published product names shows an unknown GPU until it is applied again. The
+  released table is still empty, so every deep-parking deployment still runs without
+  LMCache.
 
 Still missing: the live rows again on this head (LC1 and LC4 on SGLang, the egress
 check with the server's environment fixed, the measured charge, the server-child cases,
 LC1 through CapyCTL); LC5 and LC10 rerun live on the fix above; LC7 rerun as amended
-(decisions on SGLang off, `required` refused); LC4 part 3 (qualified parking needs the
-checkpoint's `model_type` and the GPU name in the plan; not fixed); the decision-model
-allowance measurement, which waits for a SGLang release with the upstream fix.
+(decisions on SGLang off, `required` refused); LC4 part 3 rerun live on its fix (the
+status names the real model type and GPU; no row qualifies until the table has one);
+the decision-model allowance measurement, which waits for a SGLang release with the
+upstream fix.
 
 CPU and Fake-engine tests are not qualification.
 
