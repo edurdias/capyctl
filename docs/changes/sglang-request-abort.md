@@ -132,11 +132,8 @@ loopback `/metrics` every 50 ms. Times are the router's `router_abort_settled`
     counted it.
   - 40 `request_cancellation_acknowledged` events, one per lease (8 victims and the 32
     background streams cut at the end), and no lease left open.
-  - [INFERENCE] The 66–78 ms includes the HTTP post to the engine, SGLang's hop from its
-    tokenizer to its scheduler, the step already in progress and the "one more forward
-    pass" the ADR reads in `scheduler.py`. When the abort reached the scheduler was not
-    measured, so "within one decode step of the abort reaching the engine" is neither
-    shown nor ruled out.
+  - Where those 66–78 ms go was measured afterwards; see "L1: when the abort reaches the
+    scheduler" below.
 - **L2, passes.** Standalone, `queue.request_deadline` 240 s. A 90 s deadline cannot be
   used: `timeouts.initialize` may not exceed it, and the SGLang start did not fit in 90 s
   (`launch_failed`, the engine was cleaned up). The deployment ran 1 request at a time,
@@ -175,6 +172,63 @@ loopback `/metrics` every 50 ms. Times are the router's `router_abort_settled`
 Host A was cleaned afterwards: no role, engine or listener left, and the run
 directories, the synced tree, and this session's `/tmp` and `/dev/shm` entries (65, the 6
 per-launch `sglang_loads_*.shm` included) were removed.
+
+## L1: when the abort reaches the scheduler (host A, 2026-10-22)
+
+L1 was run again from `5bc0668a` with the same setup (standalone, fresh state, 108 GiB /
+8 GiB, Qwen3-4B-Instruct, context 8192, 4 background streams, a victim that hangs up after
+120 chunks), 8 runs after one trial run, with timestamps on both sides of the abort. No
+CapyCTL code, protection or engine environment was changed:
+
+- **SGLang's side**, from its own logging. The profile set `SGLANG_LOG_MS=1` (millisecond
+  log times) and `SGLANG_LOG_FORWARD_ITERS=1` (step numbers) with `capyctl engine add
+  --env`. The deployment's `extra_args` set `--decode-log-interval 1` (one line per decode
+  step, written when the scheduler has the step's result) and
+  `--enable-request-time-stats-logging` (a line when the scheduler sends a request's final
+  output). The role ran with `--debug-engine-logs`, whose debug level makes the scheduler
+  log `Abort running request` when it applies the abort. A `sitecustomize` hook is not
+  possible: profile and deployment environments refuse every `PYTHON*` name.
+- **CapyCTL's side**, from the role's event lines, each stamped with the wall clock as it
+  arrived. The ask is the `router_abort_settled` stamp less its `elapsed_ms`.
+  `router_request_abort` is written when the engine has answered the abort's POST, and
+  SGLang's tokenizer manager answers only after handing the abort to the scheduler, so it
+  bounds the tokenizer manager's receipt. The tokenizer manager logs nothing of its own,
+  and the HTTP access log has whole seconds, so the receipt is bounded, not stamped.
+
+Times are good to about 1 ms. SGLang ran its default overlap scheduler, which starts step
+N+1 before it processes step N's result. Steps below are the median decode step of the
+second before the abort, 37.0–38.0 ms with 5 requests running. Per-step logging did not
+slow the engine (38.8 ms before).
+
+| Run | Ask → scheduler | Scheduler → final output | Step that carried it | Within one step | Ask → settled |
+|---|---|---|---|---|---|
+| 1 | 31.8 ms (0.86 steps) | 38.0 ms (1.03 steps) | 38 ms | yes | 75 ms |
+| 2 | 34.4 ms (0.93) | 38.0 ms (1.03) | 38 ms | yes | 76 ms |
+| 3 | 35.1 ms (0.94) | 38.0 ms (1.01) | 38 ms | yes | 85 ms |
+| 4 | 31.3 ms (0.85) | 38.0 ms (1.03) | 39 ms | yes | 74 ms |
+| 5 | 31.1 ms (0.83) | 37.0 ms (0.99) | 38 ms | yes | 74 ms |
+| 6 | 33.7 ms (0.90) | 37.0 ms (0.99) | 38 ms | yes | 89 ms |
+| 7 | 28.3 ms (0.75) | 37.0 ms (0.99) | 38 ms | yes | 69 ms |
+| 8 | 34.6 ms (0.91) | 37.0 ms (0.97) | 39 ms | yes | 76 ms |
+
+- The engine answered the abort's POST 1.5–4.7 ms after the ask.
+- The abort then waited for the step in progress. In every run the scheduler applied it
+  0–1 ms after that step's result, with exactly one step ending in between.
+- The final output left with the result of the next step: the one the overlap scheduler
+  had already started. Measured from when the scheduler applied the abort, that took 37–38 ms,
+  never longer than that step (38–39 ms). Each run settled within one decode step of the
+  abort reaching the scheduler (the trial run too: 28.8 and 39.0 ms).
+- From the ask to the final output leaving the scheduler took 65.3–73.1 ms. The router
+  settled 3.6–18.3 ms after that, 69–89 ms after the ask. The two slowest runs (85 and
+  89 ms) spent that extra time after the engine's scheduler, not in it.
+- The asks came 2.9–9.7 ms after a step ended because the victim hangs up just after a
+  chunk, and chunks leave at step ends. That is why the wait for the scheduler was close to
+  a whole step each time. [INFERENCE] A cut at any other moment waits 0–1 step, so from
+  CapyCTL's ask the final output takes 1–2 steps plus the HTTP hop.
+- 45 `request_cancellation_acknowledged` (9 victims, 36 background streams) and no lease
+  left open. Host A was cleaned the same way as before: role, engine, listeners, the run
+  directory, the synced tree and the 11 `/tmp` and `/dev/shm` entries the launch left
+  were removed.
 
 # Release note: Requests
 
