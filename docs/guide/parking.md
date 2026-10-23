@@ -124,7 +124,9 @@ the answer larger than 64 KiB. A request cut before the engine produced any
 of its answer is different: the engine may not have started it yet, so its
 reading of no running requests proves nothing about it. CapyCTL then stops
 the model rather than park it, and the stop settles the request (see
-[When a request is cut short](requests.md#when-a-request-is-cut-short)). When
+[When a request is cut short](requests.md#when-a-request-is-cut-short)). On
+SGLang 0.5.22, CapyCTL instead asks the engine to abort a cut chat request by
+its ID and counts it finished as soon as the engine ends it. When
 there is no room to keep a parked copy, CapyCTL stops the idle model instead
 and says so: `released: stopped (no room to park)`.
 

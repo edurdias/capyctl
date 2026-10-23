@@ -284,6 +284,46 @@ struct StubAuthority {
     instances: InstanceStub,
     /// SPEC §10 (owner decision 2026-10-18): holds lease closes back.
     closes: CloseGate,
+    /// ADR 0032: aborts, acknowledgements and restarts asked of it.
+    abort: AbortStub,
+}
+
+/// ADR 0032 §3–§4, §7: what the stub was asked about cancelled requests,
+/// and how it answers.
+struct AbortStub {
+    /// Whether an abort is reported sent.
+    sends: std::sync::atomic::AtomicBool,
+    /// Every abort asked: deployment, generation and request ID.
+    asked: Mutex<Vec<(String, i64, String)>>,
+    /// One permit per abort sent, for an engine double that ends a request
+    /// when it is aborted.
+    aborted: Arc<tokio::sync::Semaphore>,
+    /// Every lease acknowledged by its own final output.
+    acks: Mutex<Vec<String>>,
+    /// The answer to a restart request, and every deployment asked.
+    restart: Mutex<capyctl_controller::HeldRestart>,
+    restarts: Mutex<Vec<String>>,
+    /// While held, the activation a request waits for after a restart waits
+    /// for a permit; every such activation is counted.
+    activation_held: std::sync::atomic::AtomicBool,
+    activation_permits: tokio::sync::Semaphore,
+    activations: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for AbortStub {
+    fn default() -> Self {
+        Self {
+            sends: std::sync::atomic::AtomicBool::new(true),
+            asked: Mutex::new(Vec::new()),
+            aborted: Arc::new(tokio::sync::Semaphore::new(0)),
+            acks: Mutex::new(Vec::new()),
+            restart: Mutex::new(capyctl_controller::HeldRestart::NotHeld),
+            restarts: Mutex::new(Vec::new()),
+            activation_held: std::sync::atomic::AtomicBool::new(false),
+            activation_permits: tokio::sync::Semaphore::new(0),
+            activations: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
 }
 
 /// SPEC §10 (owner decision 2026-10-18): while held, every lease close waits
@@ -342,6 +382,7 @@ impl StubAuthority {
                 engine_key: None,
                 incarnation: generation.to_string(),
                 engine: Some("vllm".into()),
+                request_abort: false,
             }),
             leases: Mutex::new(Vec::new()),
             refuse_leases: Mutex::new(None),
@@ -363,7 +404,63 @@ impl StubAuthority {
                 reports: Mutex::new(Vec::new()),
             },
             closes: CloseGate::default(),
+            abort: AbortStub::default(),
         })
+    }
+
+    /// ADR 0032: deployment `dep-1` (route `public-alias`) served by one
+    /// SGLang instance (instance 0, generation 1) at `endpoint`, whose lane
+    /// has the per-request abort when `request_abort`, reached through its
+    /// host's ingress when `remote`.
+    fn sglang(endpoint: &str, remote: bool, request_abort: bool) -> Arc<Self> {
+        Arc::new(Self {
+            deployment: "dep-1".into(),
+            route: "public-alias".into(),
+            runtime: Mutex::new(capyctl_controller::RuntimeEndpoint {
+                endpoint: endpoint.into(),
+                served_model: "served-name".into(),
+                engine_key: None,
+                incarnation: "1".into(),
+                engine: Some("sglang".into()),
+                request_abort,
+            }),
+            leases: Mutex::new(Vec::new()),
+            refuse_leases: Mutex::new(None),
+            instances: InstanceStub {
+                serving: Some(capyctl_controller::ServingInstance {
+                    instance_index: 0,
+                    generation: 1,
+                    host_id: None,
+                    remote_host: remote.then(|| "host-a".into()),
+                    launch_command_id: None,
+                    dispatch_open: true,
+                    host_live: true,
+                    host_unresponsive: false,
+                    engine_exited: false,
+                    load: None,
+                    group: false,
+                }),
+                stall_timeout: std::time::Duration::from_secs(120),
+                reports: Mutex::new(Vec::new()),
+            },
+            closes: CloseGate::default(),
+            abort: AbortStub::default(),
+        })
+    }
+
+    /// ADR 0032 §3: every abort asked of this authority, in order.
+    fn aborts(&self) -> Vec<(String, i64, String)> {
+        self.abort.asked.lock().unwrap().clone()
+    }
+
+    /// ADR 0032 §4: every lease acknowledged by its own final output.
+    fn acks(&self) -> Vec<String> {
+        self.abort.acks.lock().unwrap().clone()
+    }
+
+    /// ADR 0032 §7: every deployment a restart was asked for.
+    fn restarts(&self) -> Vec<String> {
+        self.abort.restarts.lock().unwrap().clone()
     }
 
     /// ADR 0028 §9: a multi-node group's instance `index` at `generation`,
@@ -541,6 +638,73 @@ impl capyctl_controller::LifecyclePort for StubAuthority {
             .unwrap()
             .push((deployment_id.into(), instance, generation));
     }
+    async fn abort_request(&self, deployment_id: &str, generation: i64, request_id: &str) -> bool {
+        self.abort.asked.lock().unwrap().push((
+            deployment_id.into(),
+            generation,
+            request_id.into(),
+        ));
+        let sent = self.abort.sends.load(std::sync::atomic::Ordering::SeqCst);
+        if sent {
+            self.abort.aborted.add_permits(1);
+        }
+        sent
+    }
+    async fn acknowledge_cancelled_request(
+        &self,
+        lease_id: &str,
+    ) -> Result<bool, capyctl_controller::LeaseRefused> {
+        let leases = self.leases.lock().unwrap();
+        let (_, end) = leases
+            .iter()
+            .find(|(id, _)| id == lease_id)
+            .expect("a lease this authority granted");
+        assert!(
+            matches!(end, Some(capyctl_controller::LeaseEnd::Cancelling { .. })),
+            "only a cancelling lease is acknowledged: {end:?}"
+        );
+        self.abort.acks.lock().unwrap().push(lease_id.into());
+        Ok(true)
+    }
+    async fn restart_for_held_requests(
+        &self,
+        deployment_id: &str,
+    ) -> Result<capyctl_controller::HeldRestart, capyctl_controller::LifecycleFault> {
+        self.abort
+            .restarts
+            .lock()
+            .unwrap()
+            .push(deployment_id.into());
+        let answer = *self.abort.restart.lock().unwrap();
+        if answer == capyctl_controller::HeldRestart::Restarting {
+            // The restart's verified exit settles the held requests, so the
+            // bound has room once it is done.
+            *self.refuse_leases.lock().unwrap() = None;
+        }
+        Ok(answer)
+    }
+    async fn activate_for_request(
+        &self,
+        deployment: &str,
+    ) -> Result<(), capyctl_controller::LifecycleFault> {
+        assert_eq!(deployment, self.deployment);
+        self.abort
+            .activations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .abort
+            .activation_held
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.abort
+                .activation_permits
+                .acquire()
+                .await
+                .unwrap()
+                .forget();
+        }
+        Ok(())
+    }
 }
 
 /// What the stub engine will accept: the key of the launch it belongs to, and the
@@ -660,11 +824,13 @@ async fn the_router_forwards_to_the_deployments_live_endpoint_with_its_key() {
             engine_key: Some("k3y".into()),
             incarnation: "1".into(),
             engine: Some("vllm".into()),
+            request_abort: false,
         }),
         leases: Mutex::new(Vec::new()),
         refuse_leases: Mutex::new(None),
         instances: InstanceStub::default(),
         closes: CloseGate::default(),
+        abort: AbortStub::default(),
     });
     let port = authority.clone() as Arc<dyn capyctl_controller::LifecyclePort>;
     let router = capyctl_router::serve_router(RouterDeps {
@@ -749,11 +915,13 @@ fn stub_router_on(endpoint: &str, engine: Option<&str>) -> (Arc<StubAuthority>, 
             engine_key: None,
             incarnation: "1".into(),
             engine: engine.map(str::to_owned),
+            request_abort: false,
         }),
         leases: Mutex::new(Vec::new()),
         refuse_leases: Mutex::new(None),
         instances: InstanceStub::default(),
         closes: CloseGate::default(),
+        abort: AbortStub::default(),
     });
     let port = authority.clone() as Arc<dyn capyctl_controller::LifecyclePort>;
     let deps = RouterDeps {
@@ -2210,4 +2378,535 @@ fn a_crash_between_answer_and_close_leaves_the_lease_charged() {
     // The process dies with the close still pending.
     drop(runtime);
     assert_eq!(ends(&authority), vec![None], "never closed: still charged");
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0032: SGLang's per-request abort and the restart when held requests
+// fill a deployment's bound.
+
+/// The router's dependencies on `authority`, as [`stub_router_on`] builds them.
+fn deps_on(authority: &Arc<StubAuthority>) -> RouterDeps {
+    let port = authority.clone() as Arc<dyn capyctl_controller::LifecyclePort>;
+    RouterDeps {
+        controller: port.clone(),
+        forwards: Arc::new(capyctl_router::forwarders::LiveForwarders::new(port)),
+        limits: QueueLimits {
+            max_requests_per_deployment: 4,
+            max_buffered_bytes_total: 64 * 1024,
+        },
+        api_key: None,
+        inflight: Arc::new(capyctl_router::admission::InFlight::default()),
+        activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+    }
+}
+
+/// What an SGLang double received: each chat body, with the
+/// `X-CapyCTL-Request-Id` header it carried.
+type Received = Arc<Mutex<Vec<(serde_json::Value, Option<String>)>>>;
+
+/// How an SGLang double answers each chat request.
+#[derive(Clone, Copy)]
+enum Script {
+    /// A whole stream at once, finished `stop`.
+    Answers,
+    /// The stream's opening chunk (and a content chunk, when `content`),
+    /// then nothing until the authority sends an abort; then its final chunk
+    /// with finish reason `abort` and `[DONE]` (SGLang 0.5.22's graceful
+    /// abort).
+    AbortFinishes { content: bool },
+    /// As `AbortFinishes`, ending after the abort with an error event.
+    AbortErrors { content: bool },
+    /// As `AbortFinishes`, ending after the abort with the final chunk but no
+    /// `[DONE]`.
+    AbortTruncates { content: bool },
+}
+
+/// ADR 0032: an SGLang double for `script`, ending an aborted request when
+/// `aborted` gives it a permit (one per abort the authority sent). Each
+/// answer's `id` is the request's `rid` when it has one, as SGLang's is.
+async fn sglang_engine(script: Script, aborted: Arc<tokio::sync::Semaphore>) -> (String, Received) {
+    let received: Received = Arc::default();
+    let recorded = received.clone();
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(
+            move |headers: axum::http::HeaderMap,
+                  axum::Json(body): axum::Json<serde_json::Value>| {
+                let header = headers
+                    .get("x-capyctl-request-id")
+                    .map(|value| value.to_str().unwrap().to_owned());
+                let id = body["rid"].as_str().unwrap_or("chat-1").to_owned();
+                recorded.lock().unwrap().push((body, header));
+                let aborted = aborted.clone();
+                async move {
+                    let chunk = move |delta: serde_json::Value, finish: serde_json::Value| {
+                        format!(
+                            "data: {}\n\n",
+                            serde_json::json!({"id": id, "object": "chat.completion.chunk",
+                                "created": 1, "model": "served-name",
+                                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+                        )
+                    };
+                    let null = serde_json::Value::Null;
+                    let stream = async_stream::stream! {
+                        let opening = chunk(serde_json::json!({"role": "assistant", "content": ""}), null.clone());
+                        yield Ok::<_, std::io::Error>(opening);
+                        let content = match script {
+                            Script::Answers => {
+                                yield Ok(chunk(serde_json::json!({"content": "hello"}), "stop".into()));
+                                yield Ok("data: [DONE]\n\n".to_owned());
+                                return;
+                            }
+                            Script::AbortFinishes { content }
+                            | Script::AbortErrors { content }
+                            | Script::AbortTruncates { content } => content,
+                        };
+                        if content {
+                            yield Ok(chunk(serde_json::json!({"content": "he"}), null.clone()));
+                        }
+                        aborted.acquire().await.unwrap().forget();
+                        match script {
+                            Script::AbortFinishes { .. } => {
+                                yield Ok(chunk(serde_json::json!({}), "abort".into()));
+                                yield Ok("data: [DONE]\n\n".to_owned());
+                            }
+                            Script::AbortErrors { .. } => {
+                                let error = serde_json::json!({"error": {"object": "error",
+                                    "message": "Generation aborted.", "type": "ServiceUnavailable",
+                                    "code": 503}});
+                                yield Ok(format!("data: {error}\n\n"));
+                            }
+                            Script::AbortTruncates { .. } => {
+                                yield Ok(chunk(serde_json::json!({}), "abort".into()));
+                            }
+                            Script::Answers => {}
+                        }
+                    };
+                    (
+                        [("content-type", "text/event-stream")],
+                        axum::body::Body::from_stream(stream),
+                    )
+                }
+            },
+        ),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", socket.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+    (base, received)
+}
+
+/// ADR 0032: deployment `dep-1` on one SGLang instance answering as `script`,
+/// its lane capable when `request_abort`, reached through an ingress when
+/// `remote`.
+async fn sglang_lane(
+    remote: bool,
+    request_abort: bool,
+    script: Script,
+) -> (Arc<StubAuthority>, RouterDeps, Received) {
+    let authority = StubAuthority::sglang("http://127.0.0.1:9", remote, request_abort);
+    let (endpoint, received) = sglang_engine(script, authority.abort.aborted.clone()).await;
+    authority.runtime.lock().unwrap().endpoint = endpoint;
+    let deps = deps_on(&authority);
+    (authority, deps, received)
+}
+
+/// Serve `deps` on a loopback port, for a client that hangs up.
+async fn serve(deps: &RouterDeps) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = capyctl_router::serve_router(deps.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    address
+}
+
+fn cancelling(answered: bool) -> Vec<Option<capyctl_controller::LeaseEnd>> {
+    vec![Some(capyctl_controller::LeaseEnd::Cancelling { answered })]
+}
+
+/// The one abort a cut request on `dep-1` asks for: its instance's
+/// generation and CapyCTL's request ID, the first lease's.
+fn one_abort() -> Vec<(String, i64, String)> {
+    vec![("dep-1".into(), 1, "lease-0".into())]
+}
+
+// T17 (ADR 0032 §1–§2): on a capable SGLang lane every chat request, streamed
+// or collected, reaches the engine with `rid` set to CapyCTL's request ID,
+// the value of the response's `X-CapyCTL-Request-Id`, never the caller's
+// `X-Request-Id`; through a host's ingress the ID goes as that header and the
+// body carries no `rid`. A lane without the capability carries neither. A
+// caller's own `rid` is still refused before anything is sent.
+#[tokio::test]
+async fn capyctl_request_id_reaches_only_a_capable_sglang_lane() {
+    for (remote, request_abort) in [(false, true), (true, true), (false, false), (true, false)] {
+        let (authority, deps, received) = sglang_lane(remote, request_abort, Script::Answers).await;
+        let router = capyctl_router::serve_router(deps);
+        let mut ids = Vec::new();
+        for stream in [false, true] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .header("x-request-id", "caller-7")
+                        .body(axum::body::Body::from(chat_body(
+                            "public-alias",
+                            serde_json::json!({"stream": stream}),
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let id = response.headers()["x-capyctl-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let text = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&text).contains("hello"));
+            ids.push(id);
+        }
+        let received = received.lock().unwrap().clone();
+        assert_eq!(received.len(), 2);
+        for ((body, header), id) in received.iter().zip(&ids) {
+            let case = format!("remote {remote}, capable {request_abort}: {body}");
+            let rid = body.get("rid").and_then(serde_json::Value::as_str);
+            match (request_abort, remote) {
+                (true, false) => {
+                    assert_eq!(rid, Some(id.as_str()), "{case}");
+                    assert_eq!(header, &None, "{case}");
+                }
+                (true, true) => {
+                    assert_eq!(rid, None, "{case}");
+                    assert_eq!(header.as_deref(), Some(id.as_str()), "{case}");
+                }
+                (false, _) => {
+                    assert_eq!(rid, None, "{case}");
+                    assert_eq!(header, &None, "{case}");
+                }
+            }
+            assert_ne!(id, "caller-7");
+        }
+        assert!(authority.aborts().is_empty());
+        assert_eq!(
+            ends(&authority),
+            vec![Some(capyctl_controller::LeaseEnd::Completed); 2]
+        );
+    }
+    let (authority, deps, received) = sglang_lane(false, true, Script::Answers).await;
+    let router = capyctl_router::serve_router(deps);
+    let (status, answer) = post_raw(
+        &router,
+        chat_body("public-alias", serde_json::json!({"rid": "mine"})),
+        None,
+    )
+    .await;
+    assert_eq!(status, 400, "{answer}");
+    assert_eq!(answer["code"], "invalid_request");
+    assert!(received.lock().unwrap().is_empty());
+    assert!(ends(&authority).is_empty());
+}
+
+// T17 (ADR 0032 §3–§4): a client that hangs up a stream on a capable lane
+// leaves its lease cancelling exactly as before (answered: the engine
+// produced output), and the router asks the engine once to abort CapyCTL's
+// request ID while it keeps reading the response. The engine's final output
+// for it, read whole, acknowledges that lease by its ID.
+#[tokio::test]
+async fn a_stream_hung_up_on_a_capable_lane_settles_on_its_own_final_output() {
+    let (authority, deps, received) =
+        sglang_lane(false, true, Script::AbortFinishes { content: true }).await;
+    let address = serve(&deps).await;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://{address}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "public-alias", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-capyctl-request-id"], "lease-0");
+    let mut body = response.bytes_stream();
+    let mut seen = String::new();
+    while !seen.contains("\"he\"") {
+        let bytes = body.next().await.unwrap().unwrap();
+        seen.push_str(&String::from_utf8_lossy(&bytes));
+    }
+    drop(body);
+    drop(client);
+    eventually(|| authority.acks() == vec!["lease-0".to_owned()]).await;
+    assert_eq!(authority.aborts(), one_abort());
+    assert_eq!(ends(&authority), cancelling(true));
+    assert_eq!(received.lock().unwrap()[0].0["rid"], "lease-0");
+    eventually(|| deps.inflight.current("dep-1") == 0).await;
+}
+
+// T17 (ADR 0032 §3–§4): a client that disconnects in the middle of a
+// collected request on a capable lane: cancelling as unanswered, aborted
+// once, acknowledged when the engine's final output arrives whole.
+#[tokio::test]
+async fn a_collected_request_hung_up_on_a_capable_lane_settles_on_its_own_final_output() {
+    let (authority, deps, received) =
+        sglang_lane(false, true, Script::AbortFinishes { content: false }).await;
+    let address = serve(&deps).await;
+    let client = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": "public-alias",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await
+    });
+    eventually(|| !received.lock().unwrap().is_empty()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        authority.aborts().is_empty(),
+        "nothing is aborted before the cut"
+    );
+    client.abort();
+    let _ = client.await;
+    eventually(|| authority.acks() == vec!["lease-0".to_owned()]).await;
+    assert_eq!(authority.aborts(), one_abort());
+    assert_eq!(ends(&authority), cancelling(false));
+    eventually(|| deps.inflight.current("dep-1") == 0).await;
+}
+
+// T17 (ADR 0032 §3–§4): a collected request cut at its deadline before any
+// output on a capable lane gets today's answer, is cancelling as unanswered,
+// and settles on its own final output after the abort.
+#[tokio::test]
+async fn a_deadline_cut_on_a_capable_lane_settles_on_its_own_final_output() {
+    let (authority, deps, _) =
+        sglang_lane(false, true, Script::AbortFinishes { content: false }).await;
+    deps.inflight
+        .waiting
+        .set_limits(capyctl_router::queue::WaitLimits {
+            deadline: std::time::Duration::from_millis(300),
+            ..Default::default()
+        });
+    let router = capyctl_router::serve_router(deps.clone());
+    let (status, answer) = chat_once(&router, "public-alias").await;
+    assert_eq!(status, 500, "{answer}");
+    assert_eq!(answer["code"], "engine_error");
+    eventually(|| authority.acks() == vec!["lease-0".to_owned()]).await;
+    assert_eq!(authority.aborts(), one_abort());
+    assert_eq!(ends(&authority), cancelling(false));
+}
+
+// T17 (ADR 0032 §3–§4): a stream cut at the idle bound after output on a
+// capable lane ends for its client without `[DONE]`, is cancelling as
+// answered, and settles on its own final output after the abort.
+#[tokio::test]
+async fn an_idle_cut_on_a_capable_lane_settles_on_its_own_final_output() {
+    let (authority, deps, _) =
+        sglang_lane(false, true, Script::AbortFinishes { content: true }).await;
+    deps.inflight
+        .waiting
+        .set_limits(capyctl_router::queue::WaitLimits {
+            stream_idle: std::time::Duration::from_millis(300),
+            ..Default::default()
+        });
+    let router = capyctl_router::serve_router(deps.clone());
+    let (status, text) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        chat_stream(&router, "public-alias"),
+    )
+    .await
+    .expect("the client's stream ends at the cut");
+    assert_eq!(status, 200);
+    assert!(text.contains("\"he\""), "{text}");
+    assert!(
+        !text.contains("[DONE]") && !text.contains("abort"),
+        "{text}"
+    );
+    eventually(|| authority.acks() == vec!["lease-0".to_owned()]).await;
+    assert_eq!(authority.aborts(), one_abort());
+    assert_eq!(ends(&authority), cancelling(true));
+}
+
+// T17 (ADR 0032 §4): on a capable lane, after the abort, an error event or a
+// final chunk without `[DONE]` is not the request's final output read whole:
+// no acknowledgement, the lease stays cancelling.
+#[tokio::test]
+async fn an_error_or_truncated_end_after_the_abort_is_not_acknowledged() {
+    for script in [
+        Script::AbortErrors { content: true },
+        Script::AbortTruncates { content: true },
+    ] {
+        let (authority, deps, _) = sglang_lane(false, true, script).await;
+        deps.inflight
+            .waiting
+            .set_limits(capyctl_router::queue::WaitLimits {
+                stream_idle: std::time::Duration::from_millis(300),
+                ..Default::default()
+            });
+        let router = capyctl_router::serve_router(deps.clone());
+        let (status, _) = chat_stream(&router, "public-alias").await;
+        assert_eq!(status, 200);
+        eventually(|| authority.aborts() == one_abort()).await;
+        // Longer than the bound counted from the abort.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(authority.acks().is_empty());
+        assert_eq!(ends(&authority), cancelling(true));
+    }
+}
+
+// T17 (ADR 0032 §3–§4): when the engine never ends an aborted request, the
+// router keeps its connection open for the stream idle bound counted from
+// the abort, then closes it; nothing is acknowledged.
+#[tokio::test]
+async fn an_aborted_request_that_never_ends_is_closed_at_the_bound() {
+    let engine = capyctl_testkit::HeldEngine::opening().await;
+    let authority = StubAuthority::sglang(&engine.endpoint(), false, true);
+    let deps = deps_on(&authority);
+    deps.inflight
+        .waiting
+        .set_limits(capyctl_router::queue::WaitLimits {
+            deadline: std::time::Duration::from_millis(300),
+            stream_idle: std::time::Duration::from_millis(800),
+            ..Default::default()
+        });
+    let router = capyctl_router::serve_router(deps.clone());
+    let (status, _) = chat_once(&router, "public-alias").await;
+    assert_eq!(status, 500);
+    assert_eq!(authority.aborts(), one_abort());
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(engine.closed(), 0, "still read after the abort");
+    assert!(
+        engine
+            .closed_within(1, std::time::Duration::from_secs(5))
+            .await,
+        "closed once the bound passed"
+    );
+    assert!(authority.acks().is_empty());
+    assert_eq!(ends(&authority), cancelling(false));
+}
+
+// T17 (ADR 0032 §4): an abort that could not be sent leaves nothing to wait
+// for: the engine connection closes at once and nothing is acknowledged.
+#[tokio::test]
+async fn a_cut_whose_abort_was_not_sent_closes_the_engine_connection_at_once() {
+    let engine = capyctl_testkit::HeldEngine::opening().await;
+    let authority = StubAuthority::sglang(&engine.endpoint(), false, true);
+    authority
+        .abort
+        .sends
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let deps = deps_on(&authority);
+    deps.inflight
+        .waiting
+        .set_limits(capyctl_router::queue::WaitLimits {
+            deadline: std::time::Duration::from_millis(300),
+            stream_idle: std::time::Duration::from_secs(60),
+            ..Default::default()
+        });
+    let router = capyctl_router::serve_router(deps.clone());
+    let (status, _) = chat_once(&router, "public-alias").await;
+    assert_eq!(status, 500);
+    assert!(
+        engine
+            .closed_within(1, std::time::Duration::from_secs(2))
+            .await,
+        "closed without waiting for the bound"
+    );
+    assert_eq!(authority.aborts(), one_abort());
+    assert!(authority.acks().is_empty());
+    assert_eq!(ends(&authority), cancelling(false));
+}
+
+// T17 (ADR 0032 §6): an SGLang lane without the capability keeps today's
+// rule: a cut drops the forward at once, and nothing is aborted.
+#[tokio::test]
+async fn a_cut_on_a_lane_without_the_capability_is_not_aborted() {
+    let engine = capyctl_testkit::HeldEngine::opening().await;
+    let authority = StubAuthority::sglang(&engine.endpoint(), false, false);
+    let deps = deps_on(&authority);
+    deps.inflight
+        .waiting
+        .set_limits(capyctl_router::queue::WaitLimits {
+            deadline: std::time::Duration::from_millis(300),
+            stream_idle: std::time::Duration::from_secs(60),
+            ..Default::default()
+        });
+    let router = capyctl_router::serve_router(deps.clone());
+    let (status, _) = chat_once(&router, "public-alias").await;
+    assert_eq!(status, 500);
+    assert!(
+        engine
+            .closed_within(1, std::time::Duration::from_secs(2))
+            .await
+    );
+    assert!(authority.aborts().is_empty());
+    assert!(authority.acks().is_empty());
+    assert_eq!(ends(&authority), cancelling(false));
+}
+
+// T17 (ADR 0032 §7): a grant refused because the deployment's bound is full
+// asks the authority for a restart. While the instances holding requests
+// until their stop restart, the request waits for them as for an activation
+// and is then served; with the instance view and without one.
+#[tokio::test]
+async fn a_full_bound_of_held_requests_restarts_and_the_request_waits() {
+    let (endpoint, _) = scripted_engine(200, "text/event-stream", engine_sse("served-name")).await;
+    let instance = StubAuthority::sglang(&endpoint, false, false);
+    let (whole, _) = stub_router_on(&endpoint, Some("sglang"));
+    for authority in [instance, whole] {
+        *authority.refuse_leases.lock().unwrap() = Some(capyctl_controller::LeaseRefused::Full);
+        *authority.abort.restart.lock().unwrap() = capyctl_controller::HeldRestart::Restarting;
+        authority
+            .abort
+            .activation_held
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let router = capyctl_router::serve_router(deps_on(&authority));
+        let request = tokio::spawn(async move { chat_once(&router, "public-alias").await });
+        eventually(|| {
+            authority
+                .abort
+                .activations
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 1
+        })
+        .await;
+        assert_eq!(authority.restarts(), vec!["dep-1".to_owned()]);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!request.is_finished(), "waits for the restart");
+        authority.abort.activation_permits.add_permits(1);
+        let (status, body) = request.await.unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            ends(&authority),
+            vec![Some(capyctl_controller::LeaseEnd::Completed)]
+        );
+    }
+}
+
+// T17 (ADR 0032 §7): when the open leases are not all held until a stop, no
+// restart happens and the request is refused `queue_full` as before.
+#[tokio::test]
+async fn a_full_bound_not_held_is_refused_queue_full() {
+    let (endpoint, _) = scripted_engine(200, "text/event-stream", engine_sse("served-name")).await;
+    let authority = StubAuthority::sglang(&endpoint, false, false);
+    *authority.refuse_leases.lock().unwrap() = Some(capyctl_controller::LeaseRefused::Full);
+    let router = capyctl_router::serve_router(deps_on(&authority));
+    let (status, body) = chat_once(&router, "public-alias").await;
+    assert_eq!(status, 429, "{body}");
+    assert_eq!(body["code"], "queue_full");
+    assert_eq!(authority.restarts(), vec!["dep-1".to_owned()]);
+    assert_eq!(
+        authority
+            .abort
+            .activations
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(ends(&authority).is_empty());
 }

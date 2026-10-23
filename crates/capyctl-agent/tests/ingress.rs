@@ -893,3 +893,173 @@ async fn the_engine_connection_closes_when_the_upstream_goes_away() {
         task.abort();
     }
 }
+
+// T17 (ADR 0032 §1, §2): the router's CapyCTL request ID is consumed by the
+// ingress. On a launch whose engine takes it, a chat request reaches the
+// engine with it as `rid` in the body; a launch without the capability, a
+// decision, and a request without the header get none. Neither ID ever
+// reaches the engine as a header. A malformed or repeated ID is refused
+// (400) before the engine is reached, and a caller's own `rid` stays
+// refused on a capable launch.
+#[tokio::test]
+async fn the_capyctl_request_id_becomes_rid_only_on_a_capable_chat_launch() {
+    type Seen = Arc<Mutex<Vec<(String, axum::http::HeaderMap, serde_json::Value)>>>;
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let native = Router::new().fallback(move |request: Request<Body>| {
+        let seen = recorded.clone();
+        async move {
+            let path = request.uri().path().to_owned();
+            let headers = request.headers().clone();
+            let body = axum::body::to_bytes(request.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            seen.lock().unwrap().push((path.clone(), headers, value));
+            let answer = if path == "/v1/systemone" {
+                r#"{"model":"model","answers":{"q":{"type":"noul","noul":0.6}}}"#
+            } else {
+                "{}"
+            };
+            Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from(answer))
+                .unwrap()
+        }
+    });
+    let (native_addr, native_task) = serve(native).await;
+    let ingress = Ingress::new().unwrap();
+    let capable = IngressScope {
+        deployment_id: "capable".into(),
+        ..scope(1)
+    };
+    let plain = IngressScope {
+        deployment_id: "plain".into(),
+        ..scope(1)
+    };
+    ingress
+        .register(
+            capable.clone(),
+            native_addr,
+            "model".into(),
+            [1; 32],
+            [2; 32],
+        )
+        .unwrap();
+    ingress
+        .bind_handle(
+            &capable,
+            "launch-capable",
+            EngineAccess::builtin().with_request_abort(true),
+        )
+        .unwrap();
+    ingress.open(&capable).unwrap();
+    ingress
+        .register(plain.clone(), native_addr, "model".into(), [3; 32], [4; 32])
+        .unwrap();
+    ingress
+        .bind_handle(&plain, "launch-plain", EngineAccess::builtin())
+        .unwrap();
+    ingress.open(&plain).unwrap();
+    let (address, task) = serve(ingress.clone().router()).await;
+    const ID: &str = "01JAAAAAAAAAAAAAAAAAAAAAAA";
+    let post = |gate: u8, path: &'static str, ids: Vec<&'static str>, body: serde_json::Value| async move {
+        let mut request = reqwest::Client::new()
+            .post(format!("http://{address}{path}"))
+            .bearer_auth(hex::encode([gate; 32]))
+            .header("x-request-id", "caller-1");
+        for id in ids {
+            request = request.header("x-capyctl-request-id", id);
+        }
+        request.json(&body).send().await.unwrap().status()
+    };
+    let chat = serde_json::json!({"model":"model","messages":[],"stream":true});
+    let decision = serde_json::json!({"model": "model", "state": "hi",
+        "questions": {"q": {"type": "noul", "instructions": "Angry?"}}});
+    let take = || std::mem::take(&mut *seen.lock().unwrap());
+    let no_id_headers = |headers: &axum::http::HeaderMap| {
+        !headers.contains_key("x-request-id") && !headers.contains_key("x-capyctl-request-id")
+    };
+
+    // A capable launch: the ID becomes `rid`, the rest of the body unchanged.
+    assert_eq!(
+        post(1, "/v1/chat/completions", vec![ID], chat.clone()).await,
+        StatusCode::OK
+    );
+    let forwarded = take();
+    assert_eq!(forwarded.len(), 1);
+    let (path, headers, body) = &forwarded[0];
+    assert_eq!(path, "/v1/chat/completions");
+    assert!(no_id_headers(headers), "{headers:?}");
+    let mut expected = chat.clone();
+    expected["rid"] = serde_json::json!(ID);
+    assert_eq!(*body, expected);
+
+    // No header: nothing is set.
+    assert_eq!(
+        post(1, "/v1/chat/completions", vec![], chat.clone()).await,
+        StatusCode::OK
+    );
+    let (_, headers, body) = take().remove(0);
+    assert!(no_id_headers(&headers));
+    assert_eq!(body, chat);
+
+    // A launch without the capability: dropped.
+    assert_eq!(
+        post(3, "/v1/chat/completions", vec![ID], chat.clone()).await,
+        StatusCode::OK
+    );
+    let (_, headers, body) = take().remove(0);
+    assert!(no_id_headers(&headers));
+    assert_eq!(body, chat);
+
+    // A decision, even on a capable launch: dropped.
+    assert_eq!(
+        post(1, "/v1/systemone", vec![ID], decision.clone()).await,
+        StatusCode::OK
+    );
+    let (path, headers, body) = take().remove(0);
+    assert_eq!(path, "/v1/systemone");
+    assert!(no_id_headers(&headers));
+    assert_eq!(body, decision);
+
+    // A malformed or repeated ID is refused before the engine, on either
+    // launch and either path.
+    for (gate, path, ids, body) in [
+        (1, "/v1/chat/completions", vec!["caller-1"], chat.clone()),
+        (
+            1,
+            "/v1/chat/completions",
+            vec!["01jaaaaaaaaaaaaaaaaaaaaaaa"],
+            chat.clone(),
+        ),
+        (
+            1,
+            "/v1/chat/completions",
+            vec!["01JAAAAAAAAAAAAAAAAAAAAAA"],
+            chat.clone(),
+        ),
+        (1, "/v1/chat/completions", vec![ID, ID], chat.clone()),
+        (3, "/v1/chat/completions", vec!["not-a-ulid"], chat.clone()),
+        (1, "/v1/systemone", vec!["not-a-ulid"], decision.clone()),
+    ] {
+        assert_eq!(
+            post(gate, path, ids.clone(), body).await,
+            StatusCode::BAD_REQUEST,
+            "{gate} {path} {ids:?}"
+        );
+    }
+    // A caller's own `rid` is still refused on a capable launch, with or
+    // without CapyCTL's ID.
+    let mut with_rid = chat.clone();
+    with_rid["rid"] = serde_json::json!(ID);
+    for ids in [vec![ID], vec![]] {
+        assert_eq!(
+            post(1, "/v1/chat/completions", ids, with_rid.clone()).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert!(take().is_empty());
+    task.abort();
+    native_task.abort();
+}

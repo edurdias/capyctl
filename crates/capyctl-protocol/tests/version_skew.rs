@@ -370,6 +370,7 @@ fn every_post_baseline_field_names_its_capability() {
             DECISIONS,
             CUSTOM_ENGINES,
             STARTUP_HOST_BYTES,
+            REQUEST_ABORT,
         ]
         .contains(name)
         {

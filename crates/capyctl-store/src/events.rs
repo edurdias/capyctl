@@ -207,6 +207,18 @@ pub(crate) enum EventMetadata {
         count: usize,
         receipt: String,
     },
+    /// ADR 0032 §7: the deployment's limit was full of cancelled requests
+    /// that settle only at their instance's next verified stop, so that
+    /// instance's restart was accepted: the stop `operation_id`, whose
+    /// verified exit settles the `count` held requests, then a start again.
+    #[serde(rename = "1")]
+    InstanceRestartedForHeldRequests {
+        deployment_id: String,
+        operation_id: String,
+        instance_index: u32,
+        generation: i64,
+        count: usize,
+    },
 }
 
 /// SPEC §10 (W10): what a request-driven switch recorded.
@@ -348,6 +360,7 @@ impl EventMetadata {
                 SwitchPhase::Failed => "switch_failed",
             },
             Self::RequestCancellationAcknowledged { .. } => "request_cancellation_acknowledged",
+            Self::InstanceRestartedForHeldRequests { .. } => "instance_restarted_for_held_requests",
         }
     }
 
@@ -400,6 +413,11 @@ impl EventMetadata {
             Self::RequestCancellationAcknowledged { deployment_id, .. } => {
                 (Some(deployment_id.as_str()), None)
             }
+            Self::InstanceRestartedForHeldRequests {
+                deployment_id,
+                operation_id,
+                ..
+            } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
         }
     }
 }

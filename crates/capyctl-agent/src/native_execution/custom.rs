@@ -62,11 +62,16 @@ pub(super) fn frozen_profile(
 impl NativeHostExecution {
     /// ADR 0031 §6, §7: how a retained launch's engine is read and keyed,
     /// from the profile it was approved under ([`Self::frozen_engine`]);
-    /// unknown when that profile is no longer held, never today's.
+    /// unknown when that profile is no longer held, never today's. ADR 0032
+    /// §2: whether it takes CapyCTL's request ID, from its own resolution
+    /// only (not capable when that no longer resolves), as its abort decides.
     pub(super) fn retained_access(
         &self,
         owned: &capyctl_protocol::execution::MemberCommand,
     ) -> EngineAccess {
+        let request_abort = self
+            .resolve_retained(owned)
+            .is_ok_and(|effective| super::request_abort::request_abort_capable(&effective));
         owned
             .action
             .launch_plan()
@@ -74,6 +79,7 @@ impl NativeHostExecution {
             .map_or_else(EngineAccess::unknown, |(engine, custom)| {
                 engine_access(engine, custom.as_ref())
             })
+            .with_request_abort(request_abort)
     }
     /// ADR 0031 §2: the launch plan. The key is the adapter's to give it
     /// ([`Self::custom_adapter`]), from the launch's own credentials.

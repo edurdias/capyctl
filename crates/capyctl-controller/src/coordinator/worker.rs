@@ -646,6 +646,97 @@ impl CoordinatorCommands {
         Ok(receipt)
     }
 
+    /// ADR 0032 §7 (owner decision 7): when the open leases of `deployment_id`
+    /// fill `limit` and every one is a cancellation held until its instance's
+    /// next stop (none uncertain, none live), accept a restart of each
+    /// instance holding them that is not already stopping: its verified stop,
+    /// whose cleanup settles them, then a pending start the reconciliation
+    /// places. Classified, accepted and journaled in one store transaction
+    /// under the ownership lock, so concurrent callers never stop an instance
+    /// twice. Never called on a timer.
+    pub fn restart_for_held_requests(
+        &self,
+        deployment_id: &str,
+        limit: usize,
+    ) -> Result<
+        capyctl_store::ordinary_lifecycle::held_restart::HeldRestartDecision,
+        CoordinatorCommandError,
+    > {
+        use capyctl_store::ordinary_lifecycle::held_restart::HeldRestartDecision;
+        let _permit = self
+            .shared
+            .observers
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CoordinatorError::Busy)?;
+        let owner = self.shared.owner.lock().map_err(|error| {
+            drop(error);
+            self.shared.fail("ownership mutex poisoned")
+        })?;
+        if !self.shared.accepting.load(Ordering::Acquire) {
+            return Err(CoordinatorError::Stopped("worker is not admitting cleanup".into()).into());
+        }
+        let now = (self.shared.clock)()?;
+        let decision = owner
+            .store()
+            .restart_for_held_requests(owner.session(), deployment_id, limit, now)
+            .map_err(|error| {
+                if matches!(
+                    error,
+                    LifecycleError::Sql(_) | LifecycleError::CorruptStoredData
+                ) {
+                    self.shared.fail_locked(&owner, error.to_string());
+                }
+                CoordinatorCommandError::Lifecycle(error)
+            })?;
+        drop(owner);
+        if matches!(&decision, HeldRestartDecision::Restarting { accepted } if !accepted.is_empty())
+        {
+            self.shared.wake.notify_one();
+        }
+        Ok(decision)
+    }
+
+    /// ADR 0032 §3: ask the engine of retained binding `binding_id` of
+    /// `deployment_id` to abort CapyCTL's request `request_id` (its `rid`),
+    /// through the binding's own driver: the SGLang adapter's keyed loopback
+    /// `/abort_request` on this machine, the agent's abort operation on a
+    /// host (`RemoteEngine::cancel_work`). Bounded; runs on the caller's task,
+    /// never on the scheduler loop. Returns whether the abort was sent, which
+    /// is never evidence that the engine stopped. The caller decides the lane
+    /// is capable first.
+    pub(crate) async fn abort_request(
+        &self,
+        deployment_id: &str,
+        binding_id: &str,
+        request_id: &str,
+    ) -> bool {
+        let driver = self
+            .shared
+            .retained
+            .lock()
+            .ok()
+            .and_then(|retained| retained.get(binding_id).cloned());
+        let Some(driver) = driver else {
+            return false;
+        };
+        let member = capyctl_adapters::traits::MemberRef {
+            deployment_id: deployment_id.to_owned(),
+            member_id: binding_id.to_owned(),
+        };
+        let request = capyctl_adapters::traits::RequestRef {
+            id: request_id.to_owned(),
+        };
+        matches!(
+            tokio::time::timeout(
+                REQUEST_ABORT_BOUND,
+                driver.engine.cancel_work(&member, &request, false)
+            )
+            .await,
+            Ok(Ok(_))
+        )
+    }
+
     /// SPEC §6.3 (W6): `delete deployment` removes a deployment whose cleanup
     /// is already verified, in one store transaction. Nothing is executed and no accounting is
     /// released: a deployment still holding a runtime, reservation, lease or
@@ -3834,6 +3925,11 @@ const LOCAL_CANCELLATION_RECEIPT: &str = "the engine's own counters read no runn
 const REMOTE_CANCELLATION_RECEIPT: &str = "the host reported the launch's engine with 0 running and 0 waiting and 0 in flight at its ingress after the request was cancelled or answered with an error";
 /// One quiescence question may take no longer than this.
 const QUIESCENCE_QUESTION_BOUND: Duration = Duration::from_secs(3);
+/// ADR 0032 §3: one abort may take no longer than this, a margin above the
+/// drivers' own bounds (the local SGLang post at 3 s, a host's AbortRequest
+/// at `remote_execution::ABORT_BOUND`).
+const REQUEST_ABORT_BOUND: Duration =
+    crate::remote_execution::ABORT_BOUND.saturating_add(Duration::from_secs(1));
 
 fn lease_store_error(error: capyctl_store::StoreError) -> LifecycleError {
     match error {

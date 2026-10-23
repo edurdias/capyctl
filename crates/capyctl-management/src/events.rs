@@ -541,6 +541,15 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
             ("count", Number),
             ("receipt", Text),
         ],
+        // ADR 0032 §7: an instance restarted because requests held until its
+        // next stop alone filled the deployment's limit; its stop settles them.
+        "instance_restarted_for_held_requests" => &[
+            ("deployment_id", Id),
+            ("operation_id", Id),
+            ("instance_index", Number),
+            ("generation", Number),
+            ("count", Number),
+        ],
         _ => return Err(Failure::Internal),
     };
     if input.len() != fields.len() + 1 {

@@ -230,6 +230,37 @@ impl ControlHttp {
         .await
     }
 
+    /// ADR 0032 §3: ask the engine to abort request `rid`, `POST
+    /// /abort_request` with `{"rid": rid}` on this engine's loopback endpoint
+    /// with its admin key (SGLang 0.5.22 guards the route `ADMIN_OPTIONAL`,
+    /// which accepts only the admin key once one is set, `utils/auth.py`),
+    /// bounded by `bound`. `Ok` once the engine answered 2xx: it answers an
+    /// empty 200 whether or not it knew the request, so this proves only that
+    /// the abort was delivered, never that the request stopped. The answer's
+    /// body is never read.
+    pub(super) async fn abort_request(
+        &self,
+        rid: &str,
+        bound: Duration,
+    ) -> Result<(), AdapterError> {
+        let refused = || AdapterError::Uncertain("SGLang did not accept the abort".into());
+        let url = self.base.join("/abort_request").map_err(|_| refused())?;
+        let response = self
+            .client
+            .post(url)
+            .header(AUTHORIZATION, &self.admin)
+            .timeout(bound)
+            .json(&json!({ "rid": rid }))
+            .send()
+            .await
+            .map_err(|_| refused())?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(refused())
+        }
+    }
+
     /// Served model ids from `/v1/models`, guarded by the inference key the
     /// engine was launched with. Presence of the served name is the readiness
     /// signal; a connect refusal is the engine still staging weights.

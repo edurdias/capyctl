@@ -396,6 +396,12 @@ pub enum LeaseWrite {
         ticket: DispatchTicket,
         answered: bool,
     },
+    /// ADR 0032 §4: the cancelling lease `lease_id` of this session closes on
+    /// its request's own final output, read whole after the engine was asked
+    /// to abort it, with `request_cancellation_acknowledged` and the
+    /// per-request receipt in the same transaction. Settled(false) when it is
+    /// no longer an open cancelling lease of this session; nothing changes.
+    AcknowledgeCancelled { lease_id: String },
 }
 
 /// What one `LeaseWrite` in a batch produced.
@@ -481,6 +487,14 @@ impl crate::Store {
                 LeaseWrite::Cancel { ticket, answered } => {
                     cancel_in(&transaction, session, ticket, *answered)
                         .map(LeaseWriteOutcome::Settled)
+                }
+                LeaseWrite::AcknowledgeCancelled { lease_id } => {
+                    crate::request_lease_cancellations::acknowledge_in(
+                        &transaction,
+                        session,
+                        lease_id,
+                    )
+                    .map(LeaseWriteOutcome::Settled)
                 }
             };
             // A storage error inside the transaction poisons the whole group.

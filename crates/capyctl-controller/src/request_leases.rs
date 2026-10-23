@@ -158,7 +158,8 @@ impl Drop for Undelivered {
 /// The writer's answer to one job.
 enum Answer {
     Granted(Undelivered),
-    Settled,
+    /// Whether the lease was present to settle.
+    Settled(bool),
 }
 
 struct Job {
@@ -261,7 +262,7 @@ impl RequestLeaseWriter {
                 .take()
                 .map(RequestLease::durable)
                 .ok_or_else(|| LeaseRefused::Unavailable("unexpected ledger answer".into())),
-            Ok(Answer::Settled) => {
+            Ok(Answer::Settled(_)) => {
                 Err(LeaseRefused::Unavailable("unexpected ledger answer".into()))
             }
             Err(refused) => Err(refused),
@@ -280,6 +281,22 @@ impl RequestLeaseWriter {
             LeaseEnd::Cancelling { answered } => LeaseWrite::Cancel { ticket, answered },
         };
         self.submit(write).await.map(|_| ())
+    }
+
+    /// ADR 0032 §4: close the cancelling lease `lease_id` on its request's own
+    /// final output, read whole after the engine was asked to abort it.
+    /// `Ok(false)` when it is no longer an open cancelling lease of this
+    /// session; nothing changed. An error leaves it charged.
+    pub async fn acknowledge(&self, lease_id: &str) -> Result<bool, LeaseRefused> {
+        match self
+            .submit(LeaseWrite::AcknowledgeCancelled {
+                lease_id: lease_id.to_owned(),
+            })
+            .await?
+        {
+            Answer::Settled(closed) => Ok(closed),
+            Answer::Granted(_) => Err(LeaseRefused::Unavailable("unexpected ledger answer".into())),
+        }
     }
 
     async fn submit(&self, write: LeaseWrite) -> Result<Answer, LeaseRefused> {
@@ -372,7 +389,7 @@ fn run(receiver: mpsc::Receiver<Job>, backend: LeaseBackend, queued_grants: Arc<
                                 orphans: orphans.clone(),
                             }))
                         }
-                        Ok(LeaseWriteOutcome::Settled(_)) => Ok(Answer::Settled),
+                        Ok(LeaseWriteOutcome::Settled(closed)) => Ok(Answer::Settled(closed)),
                         Err(error) => Err(refusal(error)),
                     };
                     // A reply that cannot be sent comes back and is dropped
