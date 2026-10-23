@@ -101,3 +101,42 @@ fn a_revision_without_timeouts_gets_the_pending_window() {
     assert_eq!(windows.wake_ms, None);
     assert!(windows.provenance.is_empty());
 }
+
+/// T14 T20, ADR 0014 amendment A23 (found live 2026-10-23): a `restart_only`
+/// revision wakes by starting its engine again, so a wake it did not declare
+/// gets the Initialize window, a revision frozen with the deep-park formula
+/// included, and so does a revision a host resolved `restart_only`. A declared
+/// wake, and a parking revision's derived one, are kept.
+// T14 T20
+#[test]
+fn a_restart_only_wake_gets_the_initialize_window() {
+    let mut frozen = effective("600s", Some(json!({"initialize": "8m"})));
+    frozen["residency"] = json!("restart_only");
+    // The deep-park formula's window, as revisions before A23 froze it.
+    frozen["timeouts"]["wake_ms"] = json!(105_000);
+    assert_eq!(frozen["timeouts"]["provenance"]["wake"], "derived");
+    let (_dir, store) = store_with(&frozen, None);
+    let windows = store.lifecycle_windows("d").unwrap().unwrap();
+    assert_eq!(windows.initialize_ms, 480_000);
+    assert_eq!(windows.wake_ms, Some(480_000));
+
+    let mut deep = frozen.clone();
+    deep["residency"] = json!("deep");
+    let (_dir, store) = store_with(&deep, None);
+    assert_eq!(
+        store.lifecycle_windows("d").unwrap().unwrap().wake_ms,
+        Some(105_000)
+    );
+    let (_dir, store) = store_with(&deep, Some(&frozen));
+    assert_eq!(
+        store.lifecycle_windows("d").unwrap().unwrap().wake_ms,
+        Some(480_000)
+    );
+
+    let mut declared = effective("600s", Some(json!({"initialize": "8m", "wake": "150s"})));
+    declared["residency"] = json!("restart_only");
+    let (_dir, store) = store_with(&declared, None);
+    let windows = store.lifecycle_windows("d").unwrap().unwrap();
+    assert_eq!(windows.wake_ms, Some(150_000));
+    assert_eq!(windows.provenance["wake"], "declared");
+}

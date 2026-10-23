@@ -1927,6 +1927,7 @@ pub fn resolve_effective_with_checkpoint(
         recipe.request_deadline_ms,
         facts,
         raw_profile.engine,
+        recipe.residency,
     )?;
     let recipe_fingerprint =
         core::recipe_fingerprint(&recipe, &profile, &engine_config, &engine_env, &host)?;

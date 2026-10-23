@@ -20,6 +20,13 @@ pub fn decode_effective_snapshot(text: &str) -> Result<EffectiveDeployment, Conf
     if let Some(frozen) = frozen_load_term_initialize(&effective, &value) {
         effective.timeouts.initialize_ms = frozen;
     }
+    // ADR 0014 amendment A23 (2026-10-23): a `restart_only` revision frozen
+    // before its wake window became the Initialize window keeps the derived
+    // wake window it was frozen with, the deep-park formula; any other claimed
+    // value is refused. The store gives its wakes the Initialize window.
+    if let Some(frozen) = frozen_formula_wake(&effective, &value) {
+        effective.timeouts.wake_ms = frozen;
+    }
     let mut encoded =
         serde_json::to_value(&effective).map_err(|_| invalid("snapshot", "encoding failed"))?;
     // ADR 0014 amendment A1: a revision frozen before `timeouts` existed has
@@ -55,6 +62,24 @@ fn frozen_load_term_initialize(effective: &EffectiveDeployment, value: &Value) -
         && effective.timeouts.provenance.get("initialize") == Some(&TimeoutSource::Derived)
         && claimed == load_term
         && claimed != effective.timeouts.initialize_ms)
+        .then_some(claimed)
+}
+
+/// The wake window a `restart_only` snapshot claims, when it is the one
+/// derived before ADR 0014 amendment A23: derived, and equal to the deep-park
+/// formula lowered to the request deadline.
+fn frozen_formula_wake(effective: &EffectiveDeployment, value: &Value) -> Option<i64> {
+    let claimed = value["timeouts"]["wake_ms"].as_i64()?;
+    let weights = effective
+        .engine_config
+        .memory()
+        .checkpoint_weights_bytes()
+        .filter(|bytes| *bytes > 0);
+    let formula = derived_wake_ms(weights).min(effective.request_deadline_ms);
+    (effective.residency == Residency::RestartOnly
+        && effective.timeouts.provenance.get("wake") == Some(&TimeoutSource::Derived)
+        && claimed == formula
+        && claimed != effective.timeouts.wake_ms)
         .then_some(claimed)
 }
 

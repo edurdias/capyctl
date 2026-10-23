@@ -170,11 +170,19 @@ fn refuse_short_request_deadline(request_deadline_ms: i64) -> Result<(), ConfigE
 
 /// Resolve the `timeouts` block against the deployment's request deadline and
 /// the checkpoint facts the rest of the revision is resolved with.
+///
+/// ADR 0014 amendment A23: a `restart_only` deployment parks only by stopping
+/// its engine beside its LMCache server and wakes by starting the engine
+/// again (ADR 0033 §7), so its undeclared wake window is its Initialize
+/// window, not the deep-park formula (found live 2026-10-23: SGLang 0.5.22
+/// restarted Qwen3-4B in 94–99 s against a derived 105 s wake window, and one
+/// wake in 16 ran out).
 pub(super) fn resolve_timeouts(
     raw: Option<&RawTimeouts>,
     request_deadline_ms: i64,
     facts: CheckpointFacts,
     engine: Engine,
+    residency: Residency,
 ) -> Result<DeploymentTimeouts, ConfigError> {
     let raw = raw.cloned().unwrap_or_default();
     refuse_short_request_deadline(request_deadline_ms)?;
@@ -220,7 +228,11 @@ pub(super) fn resolve_timeouts(
         Engine::Custom => derived_initialize_ms(weights),
     };
     let initialize_ms = pick("initialize", initialize, derived_initialize);
-    let wake_ms = pick("wake", wake, derived_wake_ms(weights));
+    let derived_wake = match residency {
+        Residency::RestartOnly => initialize_ms,
+        Residency::Deep | Residency::HostBacked => derived_wake_ms(weights),
+    };
+    let wake_ms = pick("wake", wake, derived_wake);
     let basis = (initialize.is_none() || wake.is_none()).then_some(match weights {
         Some(_) => TimeoutBasis::CheckpointWeights,
         None => TimeoutBasis::CheckpointDigestPending,
@@ -250,6 +262,7 @@ pub fn validate_declared_timeouts(deployment: &serde_json::Value) -> Result<(), 
         ceiling,
         CheckpointFacts::default(),
         Engine::Vllm,
+        Residency::Deep,
     )
     .map(|_| ())
 }
@@ -301,6 +314,7 @@ mod tests {
                     ..Default::default()
                 },
                 engine,
+                Residency::Deep,
             )
             .unwrap();
             assert_eq!(
@@ -310,8 +324,14 @@ mod tests {
             assert_eq!(t.initialize_ms, 820_000);
         }
         // The pending value is already the conservative one.
-        let pending =
-            resolve_timeouts(None, 3_600_000, CheckpointFacts::default(), Engine::Vllm).unwrap();
+        let pending = resolve_timeouts(
+            None,
+            3_600_000,
+            CheckpointFacts::default(),
+            Engine::Vllm,
+            Residency::Deep,
+        )
+        .unwrap();
         assert_eq!(pending.initialize_ms, PENDING_INITIALIZE_MS);
     }
 
@@ -326,11 +346,57 @@ mod tests {
                 ..Default::default()
             },
             Engine::Vllm,
+            Residency::Deep,
         )
         .unwrap();
         assert_eq!((t.initialize_ms, t.wake_ms), (300_000, 300_000));
         assert_eq!(t.provenance["initialize"], TimeoutSource::Derived);
         assert_eq!(t.basis, Some(TimeoutBasis::CheckpointWeights));
+    }
+
+    // T14 (found live 2026-10-23): a `restart_only` wake starts the engine
+    // again, so its undeclared wake window is the Initialize window, declared
+    // or derived; a declared wake is kept, and a parking residency keeps the
+    // deep-park formula. SGLang 0.5.22 restarted Qwen3-4B (8.05 GB) in 94–99 s
+    // against the formula's 105 s.
+    #[test]
+    fn a_restart_only_wake_gets_the_initialize_window() {
+        let qwen = CheckpointFacts {
+            weights_bytes: Some(8_050_000_000),
+            ..Default::default()
+        };
+        let window = |raw: Option<&RawTimeouts>, residency| {
+            resolve_timeouts(raw, 3_600_000, qwen, Engine::Sglang, residency).unwrap()
+        };
+        let deep = window(None, Residency::Deep);
+        assert_eq!(deep.wake_ms, 105_000);
+        assert_eq!(window(None, Residency::HostBacked).wake_ms, 105_000);
+        let restart = window(None, Residency::RestartOnly);
+        assert_eq!(restart.initialize_ms, deep.initialize_ms);
+        assert_eq!(restart.wake_ms, restart.initialize_ms);
+        assert_eq!(restart.wake_ms, 690_000);
+        assert_eq!(restart.provenance["wake"], TimeoutSource::Derived);
+        let declared_initialize = RawTimeouts {
+            initialize: Some("1200s".into()),
+            wake: None,
+        };
+        let restart = window(Some(&declared_initialize), Residency::RestartOnly);
+        assert_eq!(
+            (restart.initialize_ms, restart.wake_ms),
+            (1_200_000, 1_200_000)
+        );
+        assert_eq!(restart.provenance["wake"], TimeoutSource::Derived);
+        let declared_wake = RawTimeouts {
+            initialize: None,
+            wake: Some("150s".into()),
+        };
+        let restart = window(Some(&declared_wake), Residency::RestartOnly);
+        assert_eq!(restart.wake_ms, 150_000);
+        assert_eq!(restart.provenance["wake"], TimeoutSource::Declared);
+        // Lowered to the request deadline with the Initialize window.
+        let short =
+            resolve_timeouts(None, 300_000, qwen, Engine::Sglang, Residency::RestartOnly).unwrap();
+        assert_eq!((short.initialize_ms, short.wake_ms), (300_000, 300_000));
     }
 
     // T03
@@ -352,6 +418,7 @@ mod tests {
                 600_000,
                 CheckpointFacts::default(),
                 Engine::Vllm,
+                Residency::Deep,
             )
             .unwrap_err();
             assert_eq!(error.path, path, "{initialize} {wake}");
@@ -369,6 +436,7 @@ mod tests {
                 ..Default::default()
             },
             Engine::Vllm,
+            Residency::Deep,
         )
         .unwrap();
         assert_eq!(
@@ -385,8 +453,14 @@ mod tests {
     #[test]
     fn a_request_deadline_below_the_activation_floors_is_refused() {
         for deadline in [5_000, MIN_WAKE_MS, MIN_INITIALIZE_MS - 1] {
-            let error = resolve_timeouts(None, deadline, CheckpointFacts::default(), Engine::Vllm)
-                .unwrap_err();
+            let error = resolve_timeouts(
+                None,
+                deadline,
+                CheckpointFacts::default(),
+                Engine::Vllm,
+                Residency::Deep,
+            )
+            .unwrap_err();
             assert_eq!(error.path, "request_deadline", "{deadline}");
             assert!(error.detail.contains("30s"), "{}", error.detail);
         }
@@ -395,6 +469,7 @@ mod tests {
             MIN_INITIALIZE_MS,
             CheckpointFacts::default(),
             Engine::Vllm,
+            Residency::Deep,
         )
         .unwrap();
         assert_eq!(

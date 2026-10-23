@@ -47,17 +47,20 @@ pub(crate) fn read(
     let e = "e.effective_json";
     let h = "h.effective_json";
     let sql = format!(
-        "SELECT {},{},{},{},{},\
+        "SELECT {},{},{},{},{},{},\
          (SELECT MIN({}) FROM host_effective_revisions h WHERE h.deployment_id=d.id AND h.revision=d.revision AND h.outcome='resolved'),\
-         (SELECT MIN({}) FROM host_effective_revisions h WHERE h.deployment_id=d.id AND h.revision=d.revision AND h.outcome='resolved') \
+         (SELECT MIN({}) FROM host_effective_revisions h WHERE h.deployment_id=d.id AND h.revision=d.revision AND h.outcome='resolved'),\
+         (SELECT MAX({}='restart_only') FROM host_effective_revisions h WHERE h.deployment_id=d.id AND h.revision=d.revision AND h.outcome='resolved') \
          FROM deployments d JOIN effective_revisions e ON e.deployment_id=d.id AND e.revision=d.revision WHERE d.id=?1",
         integer(e, "$.request_deadline_ms"),
         integer(e, "$.timeouts.initialize_ms"),
         integer(e, "$.timeouts.wake_ms"),
         text(e, "$.timeouts.provenance.initialize"),
         text(e, "$.timeouts.provenance.wake"),
+        text(e, "$.residency"),
         integer(h, "$.request_deadline_ms"),
         integer(h, "$.timeouts.initialize_ms"),
+        text(h, "$.residency"),
     );
     type Row = (
         Option<i64>,
@@ -65,6 +68,8 @@ pub(crate) fn read(
         Option<i64>,
         Option<String>,
         Option<String>,
+        Option<String>,
+        Option<i64>,
         Option<i64>,
         Option<i64>,
     );
@@ -78,6 +83,8 @@ pub(crate) fn read(
                 r.get(4)?,
                 r.get(5)?,
                 r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
             ))
         })
         .optional()?;
@@ -87,8 +94,10 @@ pub(crate) fn read(
         wake,
         initialize_source,
         wake_source,
+        residency,
         host_deadline,
         host_initialize,
+        host_restart_only,
     )) = row
     else {
         return Ok(None);
@@ -105,6 +114,16 @@ pub(crate) fn read(
     };
     let (initialize_ms, stop_ms) =
         capyctl_config::effective::lifecycle_windows(request_deadline_ms, initialize);
+    // ADR 0014 amendment A23: a `restart_only` revision wakes by starting its
+    // engine again, so a wake it did not declare gets the Initialize window,
+    // revisions frozen before the amendment with the deep-park formula too. A
+    // host that resolved the revision `restart_only` (deep parking off there)
+    // wakes it the same way.
+    let restart_only = residency.as_deref() == Some("restart_only") || host_restart_only == Some(1);
+    let wake = match wake_source.as_deref() {
+        Some("derived") if restart_only => Some(initialize_ms),
+        _ => wake.map(|w| w.min(request_deadline_ms)),
+    };
     let provenance = [("initialize", initialize_source), ("wake", wake_source)]
         .into_iter()
         .filter_map(|(field, source)| source.map(|s| (field.to_owned(), s)))
@@ -112,7 +131,7 @@ pub(crate) fn read(
     Ok(Some(LifecycleWindows {
         request_deadline_ms,
         initialize_ms,
-        wake_ms: wake.map(|w| w.min(request_deadline_ms)),
+        wake_ms: wake,
         stop_ms,
         provenance,
     }))
