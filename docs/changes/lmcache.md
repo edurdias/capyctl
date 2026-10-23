@@ -223,14 +223,60 @@ too), so `allow` leaves the engine's own default and LMCache still reports nothi
 Tests: the server's environment and the vLLM engine's under both settings, SGLang's
 render, the launcher's closed server environment (CPU only; not run live).
 
-Still missing: the live rows again on this head (LC1 and LC4 on SGLang, the egress
-check with the server's environment fixed, the measured charge, the server-child cases,
-LC1 through CapyCTL); LC5 and LC10 rerun live on the fix above; LC7 rerun as amended
-(decisions on SGLang off, `required` refused); LC4 part 3 rerun live on its fix (the
-status names the real model type and GPU; no row qualifies until the table has one);
-the decision-model allowance measurement, which waits for a SGLang release with the
-upstream fix; the egress check under `engine_telemetry: allow` (no connection to
-`stats.lmcache.ai` from the server or the engine).
+Live rerun, host A (GB10), build `0e04823c` (both fix branches and `main` `67a09823`; not
+#188), Qwen3-4B (context 4096, KV cache 1 GiB, `restart_only` unless stated), standalone
+role, 2026-10-23 03:50–04:49 UTC; record `target/live/lmcache-rerun/spark-0292/rows.md`
+on the laptop:
+
+- **LC1, pass** (both engines): on; first charge pool + 1280 + 512 MiB (6,174,015,488 B);
+  measured overhead 821.6 MiB (SGLang) and 810.9 MiB (vLLM), device 408 and 406 MiB
+  (non-zero); the second launch charged pool plus the measured figures (5,584,244,736 B
+  and 5,570,973,696 B, `measured: true`); `/status` 5.23–5.86 s (bound 30 s); listeners
+  127.0.0.1 only; the server's environment `HOME`, `PATH`, `DO_NOT_TRACK=1`,
+  `LMCACHE_TRACK_USAGE=false`, and the engines with the connector carry both.
+- **Measured charge (finding 6), pass:** an independent 0.25 s sampling of VmRSS beyond
+  the pool and per-process `nvidia-smi` equals the recorded figures (SGLang exactly,
+  vLLM within 268 KiB).
+- **LC4, pass on vLLM:** park in about 1 s with the same server PID, server GPU 406 →
+  1430 MiB, parked charge 6,644,715,520 B (the Ready charge plus 1 GiB held KV); the wake
+  by request took 67.0 s and hit 3,328 tokens (13 keys) with the same answer, a new engine
+  beside the same server. SGLang's restart-park was not reported in this rerun.
+- **LC4 part 3, pass:** a `deep` deployment runs off `park_unqualified`, "not qualified
+  with deep park on SGLang 0.5.22 / qwen3 / NVIDIA GB10" (and "vLLM 0.32.0 / qwen3 /
+  NVIDIA GB10"), in status, JSON and the event.
+- **LC5, pass:** the role restarted with `retention: zero` stopped servers and engines
+  (PIDs gone), journaled `lmcache_off` `retention_zero` and relaunched both off; a later
+  stop and start stays off; core size 0; no server; `engine list` "off (retention_zero)".
+- **LC10, pass:** the same under `lmcache: off`, `host_off`, "turned off on this host"; a
+  later start stays off; `engine list` "off (host_off)".
+- **Egress, pass for LMCache:** `ss -tuanp` every 0.2 s over the role's process tree
+  (12,872 samples across start, requests, park, wake and stop on both engines): no
+  socket from an LMCache server or a connector engine off loopback. vLLM's own usage
+  report (`stats.vllm.ai:443`) left the host from every vLLM engine with LMCache off
+  (the `deep` deployment, and under `retention: zero` and host `lmcache: off`), since
+  that build rendered `DO_NOT_TRACK` only with the connector. #188, merged since, sets
+  `DO_NOT_TRACK`, `VLLM_DO_NOT_TRACK` and `VLLM_NO_USAGE_STATS` on every vLLM launch under
+  the default `engine_telemetry: off`; not yet checked live.
+- **The server's child (finding 7), pass, case not met:** Ready 11–18 min with 5 s polls
+  and requests and a 10 ms group watch over 13 servers: extra members appeared only in
+  the first 1.2 s after a server's start (the gate, a short fork on SGLang, `file` on
+  vLLM), each gone in 10–20 ms, before the listener check; no `lmcache-N` member was ever
+  recorded, no `lmcache_server_exited`, no instance failed. The fixed path (a member
+  exiting during the check or while Ready) did not occur live.
+- **Finding (not fixed): KV still mapped after a vLLM wake.** After a vLLM restart-park
+  wake the server kept the old engine's KV mapped (1574 MiB of GPU memory, Ready, at
+  least 37 s) until the new engine's first storing request. The measurement recorded
+  it, so vLLM's device figure became 1,650,458,624 B and later launches charge
+  6,795,710,464 B, about 1.14 GiB over the steady state; during that window the Ready
+  charge (device 406 MiB) was below what the server held.
+
+Still missing: LC4 on SGLang (the restart-park quiescence fix); LC7 rerun as amended
+(decisions on SGLang off, `required` refused); LC1 through CapyCTL on a server and host
+pair; the vLLM usage-report egress check on this head (#188) and the egress check under
+`engine_telemetry: allow` (no connection to `stats.lmcache.ai` from the server or the
+engine); a decision on the KV still mapped after a vLLM wake (the charge in that window
+and the measured device figure it leaves); the decision-model allowance measurement,
+which waits for a SGLang release with the upstream fix.
 
 CPU and Fake-engine tests are not qualification.
 
