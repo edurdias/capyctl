@@ -1062,15 +1062,23 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
             })
         })
         .collect();
-    // ADR 0033 §9: the host's own `lmcache` and `retention`, when its role
-    // document says.
-    let host = role_document(target)
-        .ok()
-        .map(|document| match target.kind {
-            RoleKind::Host => capyctl_config::lmcache::host_settings(&document),
-            RoleKind::Standalone => capyctl_config::lmcache::host_settings(&document["host"]),
-        })
-        .unwrap_or_default();
+    // ADR 0033 §9: the host's `lmcache` and `retention` as the running role
+    // reports them (what it was started with, overrides included), else as
+    // its role document says.
+    let host = role
+        .as_ref()
+        .and_then(running_host_settings)
+        .unwrap_or_else(|| {
+            role_document(target)
+                .ok()
+                .map(|document| match target.kind {
+                    RoleKind::Host => capyctl_config::lmcache::host_settings(&document),
+                    RoleKind::Standalone => {
+                        capyctl_config::lmcache::host_settings(&document["host"])
+                    }
+                })
+                .unwrap_or_default()
+        });
     let inputs: Vec<(String, Value)> = rows
         .iter()
         .map(|row| row["version"].as_str().unwrap_or_default().to_owned())
@@ -1093,6 +1101,19 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
         "custom_engines_file": custom.path, "custom_revision": custom.revision,
         "agent": if role.is_some() { "reachable" } else { "unreachable" }, "engines": rows}),
     )
+}
+
+/// ADR 0033 §9: the `lmcache` and `retention` a running role's `list` reply
+/// reports it runs under; `None` from a role that does not report them.
+fn running_host_settings(
+    reply: &Value,
+) -> Option<(
+    capyctl_config::lmcache::HostLmcache,
+    capyctl_config::lmcache::Retention,
+)> {
+    reply["host"]
+        .is_object()
+        .then(|| capyctl_config::lmcache::host_settings(&reply["host"]))
 }
 
 /// ADR 0033 §9: a local profile's `lmcache` field: off with the first reason
@@ -1412,5 +1433,39 @@ mod tests {
             REMOVE_REPLY >= role + Duration::from_secs(120),
             "{REMOVE_REPLY:?}"
         );
+    }
+
+    // T45 (ADR 0033 §9; finding 9, live 2026-10-22): `engine list` shows
+    // LMCache off with its reason, not the registered version, under the
+    // `lmcache` and `retention` the running role reports it runs under; a
+    // reply that reports none falls back to the role document.
+    #[test]
+    fn lmcache_listing_follows_the_running_roles_settings() {
+        use capyctl_config::lmcache::{HostLmcache, Retention};
+        let measurer = capyctl_agent::installation::InstallationMeasurer::new();
+        let vllm = json!({"engine": "vllm", "executable": "/nonexistent/bin/vllm",
+            "lmcache": {"version": "0.5.6", "digest": "sha256:00"}});
+        for (reported, reason) in [
+            (
+                json!({"lmcache": "off", "retention": "standard"}),
+                "host_off",
+            ),
+            (
+                json!({"lmcache": "auto", "retention": "zero"}),
+                "retention_zero",
+            ),
+        ] {
+            let reply = json!({"ok": true, "accepted": {}, "host": reported});
+            let host = running_host_settings(&reply).expect("reported");
+            let view = listed_lmcache(&measurer, host, "0.32.0", &vllm);
+            assert_eq!(view["state"], "off", "{view}");
+            assert_eq!(view["reason"], reason, "{view}");
+            assert!(view.get("version").is_none(), "{view}");
+        }
+        assert_eq!(
+            running_host_settings(&json!({"ok": true, "host": {}})),
+            Some((HostLmcache::Auto, Retention::Standard))
+        );
+        assert_eq!(running_host_settings(&json!({"ok": true})), None);
     }
 }

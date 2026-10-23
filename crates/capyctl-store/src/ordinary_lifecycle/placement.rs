@@ -276,9 +276,11 @@ pub(super) fn candidates(
     Ok(candidates)
 }
 
-/// ADR 0033 §§9, 10, 13: `host`'s `lmcache` and `retention` as its current
-/// approved publication states them, else as the revision resolved with
-/// them there (`e.host`; the embedded host publishes nothing).
+/// ADR 0033 §§9, 10: `host`'s `lmcache` and `retention` now: as its current
+/// approved publication states them, or for standalone's embedded host (it
+/// publishes no approved document) as the role last started with them. The
+/// settings a revision was resolved under (`e.host`) are read only for a
+/// host with neither, which no running role is.
 pub(super) fn host_lmcache_settings(
     tx: &rusqlite::Connection,
     host: &str,
@@ -297,12 +299,27 @@ pub(super) fn host_lmcache_settings(
             |r| r.get(0),
         )
         .optional()?;
-    Ok(match published {
-        Some(document) => capyctl_config::lmcache::host_settings(
+    if let Some(document) = published {
+        return Ok(capyctl_config::lmcache::host_settings(
             &serde_json::from_str(&document).map_err(|_| LifecycleError::CorruptStoredData)?,
-        ),
-        None => (e.host.lmcache, e.host.retention),
-    })
+        ));
+    }
+    let embedded: Option<(String, String)> = tx
+        .query_row(
+            "SELECT lmcache,retention FROM embedded_host_settings WHERE host_id=?1",
+            [host],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match embedded {
+        Some((lmcache, retention)) => Ok((
+            serde_json::from_value(serde_json::Value::String(lmcache))
+                .map_err(|_| LifecycleError::CorruptStoredData)?,
+            serde_json::from_value(serde_json::Value::String(retention))
+                .map_err(|_| LifecycleError::CorruptStoredData)?,
+        )),
+        None => Ok((e.host.lmcache, e.host.retention)),
+    }
 }
 
 /// ADR 0019 (discrete GPU design §7): the GPUs of `host` the instance may

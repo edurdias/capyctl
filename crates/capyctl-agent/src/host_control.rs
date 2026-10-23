@@ -266,9 +266,14 @@ impl HostControl {
                 }),
             );
         }
+        // ADR 0033 §9: the `lmcache` and `retention` this host runs under,
+        // which `engine list` shows LMCache off by.
+        let (lmcache, retention) =
+            capyctl_config::lmcache::host_settings(&accepted.config.document);
         json!({"ok": true, "connected": self.updates.connected(),
             "live_profile_update": self.updates.server_supports(),
-            "accepted": profiles, "users": users})
+            "accepted": profiles, "users": users,
+            "host": {"lmcache": lmcache, "retention": retention}})
     }
 }
 

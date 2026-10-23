@@ -2002,6 +2002,22 @@ async fn start_standalone_in(
         prepare_private_dir(&lmcache)?;
         capyctl_agent::rendezvous::RendezvousRoot::new(lmcache).sweep(&retained);
     }
+    // ADR 0033 §§9, 10 (finding 9, live 2026-10-22): the `lmcache` and
+    // `retention` this start runs under, recorded before anything is placed
+    // or started, so LMCache is planned from them and not from the settings
+    // a revision was resolved under: a role restarted into `lmcache: off` or
+    // `retention: zero` relaunches, and later starts, without a server.
+    owner
+        .lock()
+        .map_err(|_| StartError::Deploy("ownership mutex poisoned".into()))?
+        .store()
+        .record_embedded_host_settings(
+            &declared_host.name,
+            declared_host.lmcache,
+            declared_host.retention,
+            capyctl_protocol::now_unix_ms(),
+        )
+        .map_err(|error| StartError::Deploy(format!("host LMCache settings: {error}")))?;
     // ADR 0023 §3: the private TensorFold build cache root.
     prepare_private_dir(&state_dir.join("engines"))?;
     let options = CoordinatorOptions {

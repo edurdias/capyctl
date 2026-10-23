@@ -648,6 +648,37 @@ pub fn engine_gate(engine: Engine, build_fingerprint: &str) -> Option<LmcacheOff
     })
 }
 
+/// The upstream report of SGLang failing with LMCache while its radix cache
+/// is disabled (LC7).
+pub const SGLANG_RADIX_ISSUE: &str = "https://github.com/sgl-project/sglang/issues/45929";
+
+/// ADR 0033 amendment of 2026-10-22 (owner decision, LC7): SGLang with its
+/// radix cache disabled fails with LMCache at its first idle check
+/// ([`SGLANG_RADIX_ISSUE`]). A decision deployment (SGLang disables the
+/// radix cache for the embedding models that serve decisions) and one whose
+/// arguments state `--disable-radix-cache` are planned without LMCache,
+/// `engine_unsupported`, so no start fails on it. Other models SGLang
+/// disables the radix cache for are left to the `engine_start_failed`
+/// fallback.
+fn sglang_radix_gate(inputs: &PlanInputs<'_>) -> Option<LmcacheOff> {
+    if inputs.engine != Engine::Sglang {
+        return None;
+    }
+    let why = if inputs.api == DeploymentApi::Decisions {
+        "decision deployments on SGLang run without LMCache"
+    } else if inputs.radix_cache_disabled {
+        "SGLang with --disable-radix-cache runs without LMCache"
+    } else {
+        return None;
+    };
+    Some(LmcacheOff::with_detail(
+        LmcacheOffReason::EngineUnsupported,
+        format!(
+            "{why}: SGLang fails with LMCache while its radix cache is disabled ({SGLANG_RADIX_ISSUE})"
+        ),
+    ))
+}
+
 /// Contract decision 2: everything [`plan`] decides from. Every role fills it
 /// from what it holds; [`PlanInputs::for_profile`] gives the host-neutral
 /// start resolution uses.
@@ -670,8 +701,8 @@ pub struct PlanInputs<'a> {
     pub engine: Engine,
     /// The registered build (`build_fingerprint`), the engine's version.
     pub engine_version: &'a str,
-    /// ADR 0033 §2: decision deployments use LMCache like chat ones; the
-    /// engines that serve decisions are gated by resolution already.
+    /// ADR 0033 §2: decision deployments use LMCache like chat ones on vLLM;
+    /// on SGLang they run without it (amendment of 2026-10-22, LC7).
     pub api: DeploymentApi,
     /// The deployment declares a `topology`.
     pub topology: bool,
@@ -685,6 +716,10 @@ pub struct PlanInputs<'a> {
     /// An approved non-LMCache `--kv-transfer-config` is in `extra_args`
     /// (`engine_policy::kv_transfer_config_set`).
     pub kv_transfer_config_set: bool,
+    /// SGLang's `--disable-radix-cache` is in the profile's arguments or
+    /// `extra_args` (`engine_policy::radix_cache_disabled`): ADR 0033
+    /// amendment of 2026-10-22 (LC7).
+    pub radix_cache_disabled: bool,
     /// ADR 0033 §8: a sticky `engine_start_failed` fallback is recorded for
     /// this revision on this profile.
     pub engine_start_failed: bool,
@@ -697,8 +732,8 @@ impl<'a> PlanInputs<'a> {
     /// An `auto` deployment with the default pool and standard retention on
     /// this profile and residency, on a host that leaves LMCache on, keeps
     /// standard retention and declares both capabilities; no topology, no
-    /// registration, no `--kv-transfer-config`, no fallback, no model type
-    /// or GPU known.
+    /// registration, no `--kv-transfer-config` or `--disable-radix-cache`,
+    /// no fallback, no model type or GPU known.
     pub fn for_profile(engine: Engine, engine_version: &'a str, residency: Residency) -> Self {
         Self {
             mode: LmcacheMode::Auto,
@@ -717,6 +752,7 @@ impl<'a> PlanInputs<'a> {
             gpu: None,
             registration: None,
             kv_transfer_config_set: false,
+            radix_cache_disabled: false,
             engine_start_failed: false,
             discrete_gpu: false,
         }
@@ -1046,6 +1082,9 @@ fn off_reason(inputs: &PlanInputs<'_>, table: &[QualifiedParking]) -> Option<Lmc
     if let Some(off) = engine_gate(inputs.engine, inputs.engine_version) {
         return Some(off);
     }
+    if let Some(off) = sglang_radix_gate(inputs) {
+        return Some(off);
+    }
     if inputs.topology {
         return Some(LmcacheOff::new(R::GroupUnsupported));
     }
@@ -1291,14 +1330,13 @@ mod tests {
     };
 
     // T45 (ADR 0033 §2, §9): a supported engine, registered and restarting,
-    // is on, decision deployments on SGLang 0.5.22 included, and a newer
-    // engine version too.
+    // is on, chat deployments on SGLang 0.5.22 included, and a newer engine
+    // version too.
     #[test]
     fn a_supported_deployment_is_on() {
         let registration = registered();
         assert_eq!(plan(&on(&registration)).state, LmcacheState::On);
         for (engine, version, api) in [
-            (Engine::Sglang, "0.5.22", DeploymentApi::Decisions),
             (Engine::Sglang, "0.5.22", DeploymentApi::Chat),
             (Engine::Sglang, "0.5.23", DeploymentApi::Chat),
             (Engine::Vllm, "0.33.1", DeploymentApi::Chat),
@@ -1311,6 +1349,85 @@ mod tests {
             };
             assert!(plan(&inputs).is_on(), "{engine:?} {version} {api:?}");
         }
+    }
+
+    // T45 (ADR 0033 amendment of 2026-10-22, LC7): SGLang fails with LMCache
+    // while its radix cache is disabled, so a decision deployment on SGLang
+    // (any version) and one stating `--disable-radix-cache` are planned off,
+    // `engine_unsupported`, with the upstream issue in the detail; `required`
+    // is refused for it before any host is asked. A chat deployment on
+    // SGLang, and the same flag's absence, leave LMCache on.
+    #[test]
+    fn sglang_with_its_radix_cache_disabled_is_off() {
+        let registration = registered();
+        let sglang = PlanInputs {
+            engine: Engine::Sglang,
+            engine_version: "0.5.22",
+            ..on(&registration)
+        };
+        assert!(plan(&sglang).is_on(), "chat on SGLang");
+        for (inputs, starts) in [
+            (
+                PlanInputs {
+                    api: DeploymentApi::Decisions,
+                    ..sglang
+                },
+                "decision deployments on SGLang run without LMCache: ",
+            ),
+            (
+                PlanInputs {
+                    api: DeploymentApi::Decisions,
+                    engine_version: "0.5.23",
+                    ..sglang
+                },
+                "decision deployments on SGLang run without LMCache: ",
+            ),
+            (
+                PlanInputs {
+                    radix_cache_disabled: true,
+                    ..sglang
+                },
+                "SGLang with --disable-radix-cache runs without LMCache: ",
+            ),
+        ] {
+            let planned = plan(&inputs);
+            let off = planned.off().expect("off");
+            assert_eq!(off.reason, LmcacheOffReason::EngineUnsupported);
+            assert!(off.detail.starts_with(starts), "{}", off.detail);
+            assert!(off.detail.ends_with(&format!("({SGLANG_RADIX_ISSUE})")));
+            assert_eq!(planned.charge(), None);
+            let required = PlanInputs {
+                mode: LmcacheMode::Required,
+                ..inputs
+            };
+            assert!(deployment_refusal(&required, &[])
+                .is_some_and(|code| code.starts_with("lmcache_unavailable:engine_unsupported: ")));
+        }
+        // The radix gate is SGLang's alone: vLLM is planned as before.
+        let vllm = PlanInputs {
+            radix_cache_disabled: true,
+            ..on(&registration)
+        };
+        assert!(plan(&vllm).is_on());
+        let args = |list: &[&str]| list.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+        for flag in [
+            &["--disable-radix-cache"][..],
+            &["--disable_radix_cache"][..],
+            &["--mem-fraction-static", "0.5", "--disable-radix-cache"][..],
+        ] {
+            assert!(
+                crate::engine_policy::radix_cache_disabled(Engine::Sglang, &args(flag)),
+                "{flag:?}"
+            );
+            assert!(!crate::engine_policy::radix_cache_disabled(
+                Engine::Vllm,
+                &args(flag)
+            ));
+        }
+        assert!(!crate::engine_policy::radix_cache_disabled(
+            Engine::Sglang,
+            &args(&["--disable-cuda-graph"])
+        ));
     }
 
     // T45 (ADR 0033 §2, contract decision 4): each engine that cannot use

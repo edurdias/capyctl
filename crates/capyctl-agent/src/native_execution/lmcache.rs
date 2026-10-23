@@ -213,6 +213,10 @@ impl NativeHostExecution {
                 effective.profile.engine,
                 &args,
             ),
+            radix_cache_disabled: capyctl_config::engine_policy::radix_cache_disabled(
+                effective.profile.engine,
+                &args,
+            ),
             engine_start_failed: false,
             discrete_gpu: charge_domains(&effective.host, &effective.selected_devices)
                 .is_some_and(|domains| domains.device.is_some()),

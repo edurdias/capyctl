@@ -1187,6 +1187,21 @@ CREATE TABLE IF NOT EXISTS lmcache_relaunches(
 );
 "#;
 
+/// v54 (ADR 0033 §§9, 10): the `lmcache` and `retention` standalone's
+/// embedded host runs under now, recorded at every start. The embedded host
+/// has no approved publication, and a revision keeps the settings it was
+/// resolved under; this row is what LMCache is planned from, so a role
+/// restarted into `lmcache: off` or `retention: zero` starts no server.
+/// Additive and forward-only.
+pub const SCHEMA_V54: &str = r#"
+CREATE TABLE IF NOT EXISTS embedded_host_settings(
+  host_id TEXT PRIMARY KEY CHECK(length(host_id) BETWEEN 1 AND 128),
+  lmcache TEXT NOT NULL CHECK(lmcache IN('auto','off')),
+  retention TEXT NOT NULL CHECK(retention IN('standard','zero')),
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0)
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

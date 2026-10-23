@@ -509,16 +509,24 @@ impl LmcacheLaunch<'_> {
 /// SPEC §13.3, ADR 0033 §8: an event's detail as journaled: credentials in
 /// any URL scrubbed, control characters (line breaks of an engine log's
 /// last lines included) folded to spaces, and at most
-/// [`MAX_LMCACHE_DETAIL_CHARS`] characters. The host already passed it
-/// through the redacting writer; this is the journal's own bound.
+/// [`MAX_LMCACHE_DETAIL_CHARS`] characters: a longer one keeps its end (an
+/// engine log tail's last line is the error, found live in LC7), marked
+/// `…` where it was cut. The host already passed it through the redacting
+/// writer; this is the journal's own bound.
 fn lmcache_detail(detail: &str) -> String {
-    capyctl_domain::redact::redact_urls(detail)
+    let folded: Vec<char> = capyctl_domain::redact::redact_urls(detail)
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
-        .take(MAX_LMCACHE_DETAIL_CHARS)
-        .collect::<String>()
-        .trim()
-        .to_owned()
+        .collect();
+    let kept: String = if folded.len() > MAX_LMCACHE_DETAIL_CHARS {
+        let cut = folded.len() - (MAX_LMCACHE_DETAIL_CHARS - 1);
+        std::iter::once('…')
+            .chain(folded[cut..].iter().copied())
+            .collect()
+    } else {
+        folded.into_iter().collect()
+    };
+    kept.trim().to_owned()
 }
 
 impl crate::Store {
@@ -1147,14 +1155,15 @@ mod tests {
 
     #[test]
     // T45 (ADR 0033 §§3, 8; SPEC §13.3): the detail is bounded and redacted:
-    // URL credentials scrubbed, line breaks folded, at most 512 characters;
-    // a launch identity that is not well formed is refused.
+    // URL credentials scrubbed, line breaks folded, at most 512 characters,
+    // the end of a longer one kept (an engine log tail's last line is its
+    // error, LC7); a launch identity that is not well formed is refused.
     fn lmcache_event_detail_is_bounded_and_redacted() {
         use capyctl_config::lmcache::LmcacheOffReason as R;
         let s = Store::open_in_memory().unwrap();
         let binding = "01BX5ZZKBKACTAV9WEVGEMMVS4";
         let detail = format!(
-            "engine log:\nfetch https://user:hunter2@example.org/x?sig=abc failed\n{}",
+            "engine log:\n{}\nfetch https://user:hunter2@example.org/x?sig=abc failed\nAttributeError: 'UnifiedRadixCache' object has no attribute 'has_pending_cache_operations'\n",
             "é".repeat(600)
         );
         s.record_lmcache_server_exited(&launch(binding, 3), &detail)
@@ -1170,11 +1179,17 @@ mod tests {
                 "{text}"
             );
             assert!(!text.contains('\n'), "{text}");
+            assert!(text.starts_with('…'), "{text}");
             assert!(
-                text.starts_with("engine log: fetch https://<redacted>@example.org/x?<redacted>")
+                text.ends_with(
+                    "fetch https://<redacted>@example.org/x?<redacted> failed AttributeError: 'UnifiedRadixCache' object has no attribute 'has_pending_cache_operations'"
+                ),
+                "{text}"
             );
             assert!(text.chars().count() <= MAX_LMCACHE_DETAIL_CHARS);
         }
+        // A detail within the bound is kept whole.
+        assert_eq!(lmcache_detail("engine log:\nboom"), "engine log: boom");
         let events = lmcache_events(&s);
         assert_eq!(events[0].kind, "lmcache_server_exited");
         assert_eq!(events[0].deployment_id.as_deref(), Some(DEPLOYMENT));

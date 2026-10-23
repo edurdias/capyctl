@@ -1809,6 +1809,10 @@ pub fn resolve_effective_with_checkpoint(
             profile.engine,
             &engine_args,
         ),
+        radix_cache_disabled: crate::engine_policy::radix_cache_disabled(
+            profile.engine,
+            &engine_args,
+        ),
         ..crate::lmcache::PlanInputs::for_profile(
             profile.engine,
             &profile.build_fingerprint,

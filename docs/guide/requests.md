@@ -372,6 +372,12 @@ as the engine reported it, plus the request's figures in `capyctl.metrics`
 (see [Request IDs and metrics](#request-ids-and-metrics)). A parked or stopped
 decision model wakes or starts for the request, as a chat model does.
 
+A decision request carries no `cache_salt`. On SGLang a decision model runs
+without [LMCache](engines.md#lmcache) for now, and SGLang keeps no prefix
+cache for it either (it disables its radix cache for these models), so a
+repeated state is computed again
+([sgl-project/sglang#45929](https://github.com/sgl-project/sglang/issues/45929)).
+
 Sent to the other endpoint, a request is answered `400 api_mismatch` without
 waking anything; the message names the endpoint to use:
 

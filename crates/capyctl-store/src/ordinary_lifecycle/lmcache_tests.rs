@@ -923,6 +923,86 @@ fn role_start_retirement_stops_servers_and_owes_ready_ones_a_relaunch() {
         .is_empty());
 }
 
+// T45 T10 (ADR 0033 §§9, 10; finding 9, live 2026-10-22): standalone's
+// embedded host restarted into `lmcache: off` or `retention: zero` has no
+// approved publication, and its revisions were resolved with LMCache
+// allowed. Planned from the settings the role records at its start, the
+// relaunch owed after the retirement starts without LMCache, and so does a
+// later start of the same revision.
+#[test]
+fn a_role_restarted_into_lmcache_off_or_zero_retention_starts_without_lmcache() {
+    use capyctl_config::lmcache::{HostLmcache, Retention};
+    for (lmcache, retention, reason) in [
+        (
+            HostLmcache::Off,
+            Retention::Standard,
+            LmcacheOffReason::HostOff,
+        ),
+        (
+            HostLmcache::Auto,
+            Retention::Zero,
+            LmcacheOffReason::RetentionZero,
+        ),
+    ] {
+        let lab = Lab::new(|_| {});
+        let a = lab.deploy("a", |_| {});
+        let (_, context) = lab.start(&a, 100);
+        let running = lab.ready(&context, 10, Some(LmcacheOutcome::On), 200);
+        // The role starts again under the new settings.
+        lab.store
+            .record_embedded_host_settings("lab", lmcache, retention, 1_000)
+            .unwrap();
+        let stops = lab
+            .store
+            .retire_lmcache_on_host(&lab.session, "lab", reason, 2_000)
+            .unwrap();
+        assert_eq!(stops.len(), 1, "{reason:?}");
+        let step: String = lab.row(
+            "SELECT id FROM lifecycle_steps WHERE operation_id=?1",
+            &stops[0],
+        );
+        finish_stop(&lab, &step, running, 2_100);
+        let relaunched = lab
+            .store
+            .relaunch_retired_lmcache(&lab.session, 2_300, None)
+            .unwrap();
+        assert_eq!(relaunched.len(), 1, "{reason:?}");
+        let planned = |binding: &str| lab.store.launch_lmcache(binding).unwrap().unwrap().planned;
+        assert!(
+            matches!(&planned(&relaunched[0].binding_id), PlannedLmcache::Off(off) if off.reason == reason),
+            "{reason:?}: the relaunch starts no server"
+        );
+        // Ready without a server, stopped, then started again: still off.
+        let context = lab.arm_start(&relaunched[0].step_id, 2_400).unwrap();
+        let running = lab.ready(&context, 30, None, 2_500);
+        let stop = lab
+            .store
+            .accept_ordinary_stop_command(
+                &lab.session,
+                "operator",
+                &a.deployment_id,
+                a.revision,
+                "stop-later",
+                3_000,
+                63_000,
+            )
+            .unwrap();
+        finish_stop(&lab, &stop.step_id, running, 3_100);
+        let fence = DeploymentFence {
+            generation: lab.row(
+                "SELECT current_generation FROM deployments WHERE id=?1",
+                &a.deployment_id,
+            ),
+            ..a.clone()
+        };
+        let (later, _) = lab.start(&fence, 4_000);
+        assert!(
+            matches!(&planned(&later.binding_id), PlannedLmcache::Off(off) if off.reason == reason),
+            "{reason:?}: a later start starts no server"
+        );
+    }
+}
+
 // T45: the server's group stands beside the engine's in a canonical set, and
 // alone for a restart-parked launch; members need their leader.
 #[test]

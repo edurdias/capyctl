@@ -2,7 +2,7 @@
 
 ADR 0033 (owner decisions of 2026-10-21, amended by #179; owner input of 2026-10-22 on
 LMCache issue 4825) is implemented on this branch for 0.1.7, with the implementation
-amendments A1–A9 recorded in the ADR.
+amendments A1–A11 recorded in the ADR.
 
 What changed:
 
@@ -176,13 +176,38 @@ laptop. The later fixes are not yet run live.
   instance is Ready although it is charged only while restart-parked (Ready charge
   6,174,015,488 B, parked 7,247,757,312 B); the JSON reads as if the KV were held now.
 
+Fixed after these rows (`fix/lmcache-host-settings`, CPU tests only, not yet run live):
+
+- **LC5, LC10 (A11).** A standalone role records the `lmcache` and `retention` it starts
+  with (store schema v54, `embedded_host_settings`) before anything is placed or
+  started, and placement and the LMCache plan read them in place of the revision's
+  frozen copy (a server host's stay its approved publication). A role restarted into
+  `retention: zero` or `lmcache: off` now relaunches the retired instance without
+  LMCache, and a later start of the revision stays off. `capyctl engine list` shows
+  LMCache off with the reason under the settings the running role reports (both roles'
+  `list` replies carry them), falling back to the role document when it is not running.
+- **LC7 (A10, owner decision 2026-10-22).** LMCache is planned off, `engine_unsupported`,
+  for every decision deployment on SGLang and for any SGLang deployment stating
+  `--disable-radix-cache`, at resolution, in the store's plan and in the host's, so no
+  start fails on it; `lmcache: required` there is refused
+  `lmcache_unavailable:engine_unsupported`. Cause, in SGLang 0.5.22:
+  `mem_cache/registry.py` returns the plain radix cache under `disable_radix_cache`
+  before its LMCache branch, and `managers/scheduler.py` `is_fully_idle` then calls
+  `has_pending_cache_operations()` on it
+  ([sgl-project/sglang#45929](https://github.com/sgl-project/sglang/issues/45929)).
+  Other models SGLang disables its radix cache for are left to the
+  `engine_start_failed` fallback. LC7 as first written runs again on a SGLang release
+  with the fix.
+- **The `lmcache_off` detail.** A detail over its 512-character bound keeps its end
+  (marked `…`), so an engine log tail's last line, the error, is kept (it was lost in
+  LC7).
+
 Still missing: the live rows again on this head (LC1 and LC4 on SGLang, the egress
 check with the server's environment fixed, the measured charge, the server-child cases,
-LC1 through CapyCTL); LC5 and LC10 (a role restarted into `retention: zero` or
-`lmcache: off` relaunches with a new server: the standalone plan reads the revision's
-frozen host settings; not fixed); LC4 part 3 (qualified parking needs the checkpoint's
-`model_type` and the GPU name in the plan; not fixed); LC7 (SGLang 0.5.22 crashes with
-LMCache on Clef-Flash, upstream) and so the decision-model allowance measurement.
+LC1 through CapyCTL); LC5 and LC10 rerun live on the fix above; LC7 rerun as amended
+(decisions on SGLang off, `required` refused); LC4 part 3 (qualified parking needs the
+checkpoint's `model_type` and the GPU name in the plan; not fixed); the decision-model
+allowance measurement, which waits for a SGLang release with the upstream fix.
 
 CPU and Fake-engine tests are not qualification.
 
@@ -197,6 +222,8 @@ CPU and Fake-engine tests are not qualification.
   off` on a host. The pool (4 GiB by default, `lmcache_pool`) and the server's own
   memory are reserved. `cache_salt` now reaches the engine and LMCache as a digest of
   the deployment, its revision and the salt. `retention: zero` keeps engine logs in
-  memory, turns core dumps off and never starts LMCache
-  ([LMCache](../guide/engines.md#lmcache),
+  memory, turns core dumps off and never starts LMCache. Decision deployments on
+  SGLang run without LMCache for now: SGLang fails with it while its radix cache is
+  disabled ([sgl-project/sglang#45929](https://github.com/sgl-project/sglang/issues/45929);
+  [LMCache](../guide/engines.md#lmcache),
   [zero data retention](../operations/data-retention.md#zero-data-retention)).

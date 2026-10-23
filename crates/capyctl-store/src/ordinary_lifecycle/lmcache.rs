@@ -352,6 +352,15 @@ pub(super) fn plan_on(
             e.profile.engine,
             e.engine_config.extra_args(),
         ),
+        radix_cache_disabled: capyctl_config::engine_policy::radix_cache_disabled(
+            e.profile.engine,
+            &e.profile
+                .args
+                .iter()
+                .chain(e.engine_config.extra_args())
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
         engine_start_failed: fallback_recorded(conn, deployment_id, revision, host, e)?,
         discrete_gpu: domains(e).is_ok_and(|d| d.device.is_some()),
         model_type: None,
@@ -1209,6 +1218,36 @@ impl crate::Store {
         };
         tx.commit()?;
         Ok(outcome)
+    }
+
+    /// ADR 0033 §§9, 10: record the `lmcache` and `retention` standalone's
+    /// embedded host `host` runs under now. Recorded at every start, before
+    /// anything is placed or started: the embedded host publishes no
+    /// approved document, and LMCache is planned from this row rather than
+    /// from the settings a revision was resolved under.
+    pub fn record_embedded_host_settings(
+        &self,
+        host: &str,
+        lmcache: lc::HostLmcache,
+        retention: lc::Retention,
+        now: i64,
+    ) -> Result<(), LifecycleError> {
+        if host.is_empty() || host.len() > 128 || now < 0 {
+            return Err(LifecycleError::Invalid);
+        }
+        let name = |value: serde_json::Value| value.as_str().map(str::to_owned);
+        let (Some(lmcache), Some(retention)) = (
+            name(serde_json::json!(lmcache)),
+            name(serde_json::json!(retention)),
+        ) else {
+            return Err(LifecycleError::Invalid);
+        };
+        self.conn.execute(
+            "INSERT INTO embedded_host_settings(host_id,lmcache,retention,recorded_at_ms) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(host_id) DO UPDATE SET lmcache=excluded.lmcache,retention=excluded.retention,recorded_at_ms=excluded.recorded_at_ms",
+            params![host, lmcache, retention, now],
+        )?;
+        Ok(())
     }
 
     /// ADR 0033 §§9, 10 (lifecycle design §9): a role starts on `host` with

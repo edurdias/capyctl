@@ -79,7 +79,8 @@ Add a field to choose something yourself, for example:
   holding (`parked` in `capyctl status deployment <name> --json`).
 - `lmcache: off` to run without [LMCache](engines.md#lmcache), the private
   KV cache in host RAM that every vLLM 0.32.0+ and SGLang 0.5.22+ deployment
-  gets by default, or `lmcache: required` to refuse to start without it.
+  gets by default (decision deployments on SGLang excepted, for now), or
+  `lmcache: required` to refuse to start without it.
   `lmcache_pool: 8GiB` sets its RAM pool (a whole number of GiB, 4 GiB by
   default); it is refused beside `lmcache: off`.
 - `retention: zero` to keep this deployment's engine output in memory, start

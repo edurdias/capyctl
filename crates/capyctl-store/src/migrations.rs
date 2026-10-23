@@ -11,7 +11,7 @@ use crate::schema::{
     SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
     SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
     SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V49, SCHEMA_V5, SCHEMA_V50, SCHEMA_V51, SCHEMA_V52,
-    SCHEMA_V53, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V53, SCHEMA_V54, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -87,6 +87,8 @@ pub const MIGRATIONS: &[&str] = &[
     // ADR 0033: per-launch LMCache plans, sticky fallbacks, measured
     // overheads and relaunches owed after a role start turned it off.
     SCHEMA_V53,
+    // ADR 0033 §§9, 10: the embedded host's current LMCache settings.
+    SCHEMA_V54,
 ];
 
 /// The newest schema version this binary knows how to read and write.

@@ -514,6 +514,17 @@ on `capyctl start standalone`), or with `CAPYCTL_SET__LMCACHE=off` and
 `CAPYCTL_SET__HOST__RETENTION` for standalone). Any other value refuses the
 start. A host publishes both with its document, so placement refuses a
 `required` deployment there before anything is sent; a change takes a restart.
+After the restart every start on the machine, the instances started again
+after their servers were stopped included, follows the settings the role now
+runs under, whatever they were when a deployment was made, and `capyctl
+engine list` shows LMCache off with the reason under them.
+
+Apart from these settings, decision deployments (`api: decisions`) on SGLang,
+and SGLang deployments that state `--disable-radix-cache`, run without
+LMCache (`engine_unsupported`;
+[sgl-project/sglang#45929](https://github.com/sgl-project/sglang/issues/45929)),
+and `lmcache: required` is refused for them
+([LMCache](../guide/engines.md#lmcache)).
 
 ## Any setting by its path
 

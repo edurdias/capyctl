@@ -176,7 +176,11 @@ or its launch fails with `lmcache_unavailable:<reason>` (exit 5). The reasons:
 - `host_capability_missing`: the machine runs a CapyCTL too old for LMCache
   (`host_capability_missing:lmcache` under `required`). Upgrade it.
 - `engine_unsupported`: llama.cpp, TensorFold or a custom engine, which have
-  no LMCache integration. Use vLLM or SGLang.
+  no LMCache integration. Use vLLM or SGLang. On SGLang, also a decision
+  deployment (`api: decisions`) or one whose arguments state
+  `--disable-radix-cache`: SGLang fails with LMCache while its radix cache is
+  disabled ([sgl-project/sglang#45929](https://github.com/sgl-project/sglang/issues/45929)),
+  so these run without it until a release with the fix is qualified.
 - `engine_version_unsupported`: vLLM before 0.32.0 or SGLang before 0.5.22.
   Register a newer engine.
 - `not_installed`: the engine's environment holds no LMCache. Install

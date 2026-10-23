@@ -837,7 +837,8 @@ The engine connects to it: vLLM through LMCache's `LMCacheMPConnector`
 |---|---|
 | vLLM 0.32.0 or newer | yes |
 | vLLM 0.31 and older | off: "LMCache needs vLLM 0.32.0 or newer" |
-| SGLang 0.5.22 or newer | yes, decision deployments included |
+| SGLang 0.5.22 or newer | yes, for chat deployments |
+| SGLang, a decision deployment or `--disable-radix-cache` | off: `engine_unsupported` (below) |
 | SGLang before 0.5.22 | off: "LMCache needs SGLang 0.5.22 or newer" |
 | llama.cpp, TensorFold | off: the engine has no LMCache integration |
 | custom engine | off: CapyCTL does not render options for it |
@@ -846,6 +847,17 @@ vLLM 0.32.0 and SGLang 0.5.22 with LMCache 0.5.6 are the qualified versions
 (measured on a GB10); a newer engine or a later LMCache 0.5.x is used when
 the launch-time check below passes, and is not qualified until a live run
 covers it. A deployment with a `topology` runs without LMCache.
+
+**Decision deployments on SGLang run without LMCache**, and so does any SGLang
+deployment whose arguments state `--disable-radix-cache`: SGLang 0.5.22 fails
+with LMCache when its radix cache is disabled, which it always is for the
+embedding models that serve decisions
+([sgl-project/sglang#45929](https://github.com/sgl-project/sglang/issues/45929)).
+Status shows "LMCache off" with reason `engine_unsupported` and the issue,
+and `lmcache: required` on such a deployment is refused,
+`lmcache_unavailable:engine_unsupported`. This lifts once a SGLang release
+with the fix is qualified. A model SGLang disables its radix cache for on its
+own fails its first start with LMCache and starts again without it (below).
 
 **Install it in the engine's environment**, then register the engine again
 (CapyCTL never installs it, and it uses only an LMCache that `engine add` saw):

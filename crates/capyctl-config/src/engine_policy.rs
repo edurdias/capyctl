@@ -1638,6 +1638,26 @@ pub fn kv_transfer_config_set(engine: Engine, args: &[String]) -> bool {
         })
 }
 
+/// SGLang's `--disable-radix-cache`.
+pub const DISABLE_RADIX_CACHE: &str = "--disable-radix-cache";
+
+/// ADR 0033 amendment of 2026-10-22 (LC7): whether `args` (a profile's
+/// host-fixed arguments and a deployment's `extra_args`) set SGLang's
+/// `--disable-radix-cache` in any spelling. SGLang 0.5.22 builds the plain
+/// radix cache when it is set, before its LMCache branch
+/// (`mem_cache/registry.py`, `default_radix_cache_factory`), and the
+/// scheduler's idle check then fails on it with LMCache on
+/// (`managers/scheduler.py`, `is_fully_idle`), so such a launch runs without
+/// LMCache (`engine_unsupported`).
+pub fn radix_cache_disabled(engine: Engine, args: &[String]) -> bool {
+    engine == Engine::Sglang
+        && parse_options(args).is_ok_and(|options| {
+            options
+                .iter()
+                .any(|option| matches_name(&option.name, DISABLE_RADIX_CACHE))
+        })
+}
+
 /// ADR 0028 §2.1: the profile half of engine environment resolution. The
 /// error is the closed reason code or the detail naming the entry.
 pub fn validate_profile_env(env: &BTreeMap<String, String>) -> Result<(), String> {
