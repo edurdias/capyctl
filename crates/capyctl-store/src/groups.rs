@@ -385,7 +385,8 @@ pub(crate) fn rendezvous_port_held(
 /// ADR 0028 §5 (R15), SPEC §3: a rendezvous port is free on `head` when no
 /// unsettled plan holds it, no unexpired exclusion names it, and no endpoint
 /// lease on that host holds it under any address (a host's rendezvous range may
-/// overlap its endpoint range).
+/// overlap its endpoint range), nor (ADR 0033 §3) a retained launch's LMCache
+/// server.
 fn rendezvous_port_free(
     tx: &Transaction<'_>,
     head: &str,
@@ -393,6 +394,7 @@ fn rendezvous_port_free(
     now: i64,
 ) -> Result<bool, GroupStoreError> {
     Ok(!rendezvous_port_held(tx, head, port)?
+        && !crate::ordinary_lifecycle::lmcache::port_held(tx, head, port)?
         && tx.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM group_port_exclusions WHERE host_id=?1 AND port=?2 AND until_ms>?3)
                 AND NOT EXISTS(SELECT 1 FROM endpoint_leases WHERE host_id=?1 AND port=?2)",

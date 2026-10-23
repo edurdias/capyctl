@@ -26,10 +26,21 @@ pub struct HostInvitation {
     /// id it re-enrolls. `host_name` is then that host's enrolled name.
     pub recover_host_id: Option<String>,
 }
+/// ADR 0033 §6: what each launch's LMCache samples sent the store, per
+/// (host, deployment, generation, owned handle), by resident set and device.
+type LmcacheSeen = std::collections::BTreeMap<
+    (String, String, i64, String),
+    capyctl_store::ordinary_lifecycle::lmcache::MeasurementSeen,
+>;
 pub struct EnrollmentAuthority {
     state: SharedCoordinatorState,
     ca: CertificateAuthority,
     revocations: watch::Sender<u64>,
+    /// ADR 0033 §6: the largest LMCache figures offered per launch, keyed by
+    /// what the store matches the launch on (host, deployment, generation,
+    /// owned handle), so a host's every load report does not write the store
+    /// and a sample naming another host's launch never hides that host's own.
+    lmcache_measured: std::sync::Mutex<LmcacheSeen>,
 }
 #[derive(Debug, thiserror::Error)]
 #[error("host identity authorization failed")]
@@ -92,6 +103,69 @@ impl EnrollmentAuthority {
             .record_installation_drift(host, installation, registered, observed)
             .map_err(|_| EnrollmentError)
     }
+    /// ADR 0033 §§6, 12 (lifecycle design §7): what `host` measured of its
+    /// launches' LMCache servers (each server group's resident and GPU
+    /// memory, from its load report), recorded for later launches of the
+    /// revision there when it is the most seen. Evidence only: a sample that
+    /// names no launch of the host with a server, or a store refusal,
+    /// changes nothing.
+    pub fn record_lmcache_samples(
+        &self,
+        host: &str,
+        samples: &[capyctl_protocol::reports::LmcacheSample],
+    ) {
+        const MAX_SEEN: usize = 4096;
+        for sample in samples {
+            let resident = sample
+                .rss_bytes
+                .map_or(0, |bytes| i64::try_from(bytes).unwrap_or(i64::MAX));
+            let device = sample
+                .device_bytes
+                .map_or(0, |bytes| i64::try_from(bytes).unwrap_or(i64::MAX));
+            if resident == 0 && device == 0 {
+                continue;
+            }
+            let Ok(mut seen) = self.lmcache_measured.lock() else {
+                return;
+            };
+            let key = (
+                host.to_owned(),
+                sample.deployment_id.clone(),
+                sample.generation,
+                sample.owned_handle.clone(),
+            );
+            // ADR 0033 A13: while the server may still hold a stopped
+            // engine's KV, only a reading below it (its release) is sent.
+            if !seen
+                .get(&key)
+                .copied()
+                .unwrap_or_default()
+                .wants(resident, device)
+            {
+                continue;
+            }
+            let Ok(state) = self.state.lock() else {
+                return;
+            };
+            if let Ok(measured) = state.store().record_host_lmcache_measurement(
+                state.session(),
+                host,
+                &sample.deployment_id,
+                sample.generation,
+                &sample.owned_handle,
+                resident,
+                device,
+                capyctl_protocol::now_unix_ms(),
+            ) {
+                if seen.len() >= MAX_SEEN {
+                    seen.clear();
+                }
+                seen.entry(key)
+                    .or_default()
+                    .sent(resident, device, measured);
+            }
+        }
+    }
     /// ADR 0017: record the version, capabilities and skew verdict a host
     /// declared on its control session. Status evidence only.
     pub fn record_host_version(
@@ -141,6 +215,7 @@ impl EnrollmentAuthority {
             state,
             ca,
             revocations,
+            lmcache_measured: Default::default(),
         }
     }
     pub fn controller_id(&self) -> String {

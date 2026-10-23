@@ -848,6 +848,36 @@ fn registry_targets(
                 continue;
             }
         }
+        // ADR 0033 §§9, 10, 13: `lmcache: required` is never placed on a host
+        // that did not declare `lmcache`, whose published `lmcache` is `off`,
+        // or beside zero retention, and `retention: zero` never on a host that
+        // did not declare `retention`; such a host is recorded refused, typed,
+        // and is sent nothing.
+        let (mode, retention) = capyctl_config::lmcache::deployment_settings(&config);
+        if mode == capyctl_config::lmcache::LmcacheMode::Required
+            || retention == capyctl_config::lmcache::Retention::Zero
+        {
+            let declared: std::collections::BTreeSet<String> = store
+                .host_version(&publication.host_id)
+                .map_err(|_| ConfigurationFailure::Internal)?
+                .map(|version| version.capabilities.into_iter().collect())
+                .unwrap_or_default();
+            if let Some((code, path, detail)) =
+                lmcache_refusal(&config, &original, &declared, selector)
+            {
+                single = Some(refuse(
+                    capyctl_config::ConfigError::new(
+                        capyctl_config::ConfigErrorCode::UnsupportedCombination,
+                        path,
+                        detail,
+                    )
+                    .into(),
+                    code,
+                    &mut refusals,
+                ));
+                continue;
+            }
+        }
         let Ok(trusted) =
             capyctl_config::remote_resources::scope_host_document(&publication.host_id, &original)
         else {
@@ -906,6 +936,51 @@ fn registry_targets(
         });
     }
     Ok((targets, refusals))
+}
+
+/// ADR 0033 §§9, 10, 13: why the deployment document `config` may not be
+/// placed on the host `selector` that publishes `host_document` and declared
+/// `declared`: the closed code, the field it concerns and the message that
+/// leads with the code. `None` when it may.
+fn lmcache_refusal(
+    config: &Value,
+    host_document: &Value,
+    declared: &std::collections::BTreeSet<String>,
+    selector: &str,
+) -> Option<(&'static str, &'static str, String)> {
+    use capyctl_config::lmcache as l;
+    let (mode, retention) = l::deployment_settings(config);
+    let (host_lmcache, host_retention) = l::host_settings(host_document);
+    let code = capyctl_protocol::capabilities::lmcache_refusal(
+        declared,
+        mode,
+        retention,
+        host_lmcache,
+        host_retention,
+    )?;
+    let (path, why) = match code {
+        l::REFUSED_HOST_OFF => (
+            "lmcache",
+            format!("host `{selector}` has `lmcache: off`; use `lmcache: auto` to run without LMCache there, or another host"),
+        ),
+        l::REFUSED_RETENTION_ZERO if retention == l::Retention::Zero => (
+            "lmcache",
+            "`lmcache: required` cannot run beside the deployment's `retention: zero`".to_owned(),
+        ),
+        l::REFUSED_RETENTION_ZERO => (
+            "lmcache",
+            format!("host `{selector}` has `retention: zero`, which never runs LMCache; use `lmcache: auto` or another host"),
+        ),
+        l::MISSING_LMCACHE => (
+            "lmcache",
+            format!("host `{selector}` predates LMCache support; upgrade its agent"),
+        ),
+        _ => (
+            "retention",
+            format!("host `{selector}` cannot honour `retention: zero`; upgrade its agent"),
+        ),
+    };
+    Some((code, path, format!("{code}: {why}")))
 }
 
 /// ADR 0028 §2, spec §16: a group deploy is refused as a whole when a named
@@ -1289,4 +1364,94 @@ pub(crate) async fn accept_blocking<T: Send + 'static>(
         .await
         .map_err(|_| DeadlineExceeded)?
         .map_err(|_| Internal)?
+}
+
+#[cfg(test)]
+mod lmcache_tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::BTreeSet;
+
+    fn declared(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    // T45 T36 T34 (ADR 0033 §§9, 10, 13, 14): the registry refuses a host
+    // for each closed code, before anything is sent, with the field it
+    // concerns and a message that leads with the code; a host that can run
+    // the deployment as declared, and every `auto` deployment, pass.
+    #[test]
+    fn lmcache_refusal_names_each_code_and_its_field() {
+        let current = declared(&["heartbeats", "lmcache", "retention"]);
+        let older = declared(&["heartbeats"]);
+        let required = json!({"lmcache": "required"});
+        let zero = json!({"retention": "zero"});
+        let cases = [
+            (
+                &required,
+                json!({"lmcache": "off"}),
+                &current,
+                Some(("lmcache_unavailable:host_off", "lmcache")),
+            ),
+            (
+                &required,
+                json!({"retention": "zero"}),
+                &current,
+                Some(("retention_zero:lmcache", "lmcache")),
+            ),
+            (
+                &json!({"lmcache": "required", "retention": "zero"}),
+                json!({}),
+                &current,
+                Some(("retention_zero:lmcache", "lmcache")),
+            ),
+            (
+                &required,
+                json!({}),
+                &older,
+                Some(("host_capability_missing:lmcache", "lmcache")),
+            ),
+            (
+                &zero,
+                json!({}),
+                &older,
+                Some(("host_capability_missing:retention", "retention")),
+            ),
+            (&required, json!({}), &current, None),
+            (&zero, json!({"lmcache": "off"}), &current, None),
+            (
+                &json!({}),
+                json!({"lmcache": "off", "retention": "zero"}),
+                &older,
+                None,
+            ),
+        ];
+        for (config, host, declared, expected) in cases {
+            let refusal = lmcache_refusal(config, &host, declared, "host-a");
+            assert_eq!(
+                refusal.as_ref().map(|(code, path, _)| (*code, *path)),
+                expected,
+                "{config} on {host}"
+            );
+            if let Some((code, path, detail)) = refusal {
+                assert!(detail.starts_with(&format!("{code}: ")), "{detail}");
+                assert!(
+                    detail.contains("host-a") || code == "retention_zero:lmcache",
+                    "{detail}"
+                );
+                // The deploy answers `invalid_config` with the code leading
+                // the reason, which the CLI maps to exit 5.
+                let failure = ConfigurationFailure::from(capyctl_config::ConfigError::new(
+                    capyctl_config::ConfigErrorCode::UnsupportedCombination,
+                    path,
+                    detail,
+                ));
+                let ConfigurationFailure::InvalidConfigReason { path: at, reason } = failure else {
+                    panic!("{code}");
+                };
+                assert_eq!(at, path);
+                assert!(reason.contains(code), "{reason}");
+            }
+        }
+    }
 }

@@ -524,7 +524,14 @@ impl crate::Store {
             params![park.deployment_id, park.instance, park.generation],
             |r| r.get(0),
         )?;
-        if !still_parked || p.binding_id != park.binding_id || !measurable(&e) {
+        // ADR 0033 §7: a restart-park stopped its engine; what its server
+        // holds is the LMCache charge, not a parked residue.
+        if !still_parked
+            || p.binding_id != park.binding_id
+            || !measurable(&e)
+            || super::lmcache::park_mode(&tx, &e, &p.binding_id)?
+                == super::lmcache::ParkMode::EngineStop
+        {
             return Ok(false);
         }
         let processes: Vec<&ProcessResident> = residents

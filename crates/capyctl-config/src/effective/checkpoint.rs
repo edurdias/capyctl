@@ -50,6 +50,12 @@ impl CheckpointLocation {
         crate::context_fit::sglang_state_slot_bytes(&self.checkpoint, self.sglang_args.as_ref()?)
     }
 
+    /// ADR 0033 §7 (amendment A12): the checkpoint's `config.json`
+    /// `model_type`, as the qualified LMCache parking table compares it.
+    pub fn model_type(&self) -> Option<String> {
+        crate::lmcache::checkpoint_model_type(&self.checkpoint)
+    }
+
     /// ADR 0028 §5 (amendment of 2026-10-07) and ADR 0014 amendment A20: how
     /// the checkpoint's weights split across a group's ranks, and the tables
     /// an engine option can keep on disk, from one read of its safetensors

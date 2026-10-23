@@ -131,6 +131,15 @@ pub fn interpreter(executable: &Path) -> Option<PathBuf> {
 /// so a virtual environment keeps its own tree). Exactly one must hold it.
 pub fn site_packages(engine: Engine, executable: &Path) -> Result<PathBuf, FingerprintError> {
     let package = package_name(engine).ok_or(FingerprintError::NotFound)?;
+    site_packages_holding(package, executable)
+}
+
+/// As [`site_packages`], for any top-level package of the environment
+/// (ADR 0033 §1: LMCache in the engine's own environment).
+pub fn site_packages_holding(
+    package: &str,
+    executable: &Path,
+) -> Result<PathBuf, FingerprintError> {
     let interpreter = interpreter(executable).ok_or(FingerprintError::NotFound)?;
     let prefix = interpreter
         .parent()
@@ -162,34 +171,18 @@ pub fn site_packages(engine: Engine, executable: &Path) -> Result<PathBuf, Finge
 
 /// The package version from exactly one `<package>-<version>.dist-info`.
 fn version(site: &Path, package: &str) -> String {
-    let unknown = || "unknown".to_owned();
-    let Ok(entries) = std::fs::read_dir(site) else {
-        return unknown();
-    };
-    let prefix = format!("{package}-");
-    let mut matches = Vec::new();
-    for (index, entry) in entries.enumerate() {
-        if index >= MAX_SITE_ENTRIES {
-            return unknown();
-        }
-        let Ok(entry) = entry else {
-            return unknown();
-        };
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with(&prefix) && name.ends_with(".dist-info") {
-            matches.push(entry.path());
-        }
-    }
-    let [dist] = matches.as_slice() else {
-        return unknown();
-    };
+    dist_info_version(site, package).unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// The `Version:` of exactly one `<package>-<version>.dist-info` in `site`,
+/// read within bounds; `None` when there is none, more than one, or no
+/// valid version.
+pub(crate) fn dist_info_version(site: &Path, package: &str) -> Option<String> {
+    let dist = dist_info(site, package)?;
     let mut text = String::new();
-    let read = std::fs::File::open(dist.join("METADATA"))
-        .and_then(|file| file.take(MAX_METADATA).read_to_string(&mut text));
-    if read.is_err() {
-        return unknown();
-    }
+    std::fs::File::open(dist.join("METADATA"))
+        .and_then(|file| file.take(MAX_METADATA).read_to_string(&mut text))
+        .ok()?;
     text.lines()
         .find_map(|line| line.strip_prefix("Version: "))
         .map(str::trim)
@@ -198,7 +191,27 @@ fn version(site: &Path, package: &str) -> String {
                 && value.len() <= MAX_VERSION
                 && value.bytes().all(|b| b.is_ascii_graphic())
         })
-        .map_or_else(unknown, str::to_owned)
+        .map(str::to_owned)
+}
+
+/// Exactly one `<package>-<version>.dist-info` directory in `site`.
+pub(crate) fn dist_info(site: &Path, package: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(site).ok()?;
+    let prefix = format!("{package}-");
+    let mut matches = Vec::new();
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_SITE_ENTRIES {
+            return None;
+        }
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && name.ends_with(".dist-info") {
+            matches.push(entry.path());
+        }
+    }
+    let [dist] = <[PathBuf; 1]>::try_from(matches).ok()?;
+    Some(dist)
 }
 
 /// One file's stat identity; any difference forces a rehash.
@@ -262,20 +275,30 @@ impl InstallationMeasurer {
             return self.measure_binary(executable);
         };
         let site = site_packages(engine, executable)?;
-        let root = site.join(package);
-        let mut collected = Collected::default();
-        self.walk(&root, b"", &mut collected)?;
-        // Forget files that left the installation, so the cache stays bounded.
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.retain(|path, _| !path.starts_with(&root) || collected.seen.contains(path));
-        }
-        let digest = manifest_digest(&mut collected.entries)?;
+        let (digest, files, bytes) = self.measure_tree(&site.join(package))?;
         Ok(InstallationFingerprint {
             version: version(&site, package),
             digest,
-            files: collected.entries.len(),
-            bytes: collected.total,
+            files,
+            bytes,
         })
+    }
+
+    /// ADR 0008: the `sha256:` digest of the canonical manifest over every
+    /// file under `root` (bytecode caches left out), with its file and byte
+    /// counts, within the installation bounds.
+    pub(crate) fn measure_tree(
+        &self,
+        root: &Path,
+    ) -> Result<(String, usize, u64), FingerprintError> {
+        let mut collected = Collected::default();
+        self.walk(root, b"", &mut collected)?;
+        // Forget files that left the installation, so the cache stays bounded.
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.retain(|path, _| !path.starts_with(root) || collected.seen.contains(path));
+        }
+        let digest = manifest_digest(&mut collected.entries)?;
+        Ok((digest, collected.entries.len(), collected.total))
     }
 
     /// ADR 0008: every file under `root` (bytecode caches left out, a link by
@@ -950,6 +973,9 @@ pub struct InstallationRegistry {
     custom: BTreeMap<String, CustomManifest>,
     /// Profile name → the digest a launch measured instead (drift).
     drift: Mutex<BTreeMap<String, String>>,
+    /// ADR 0033 §1: profile name → the LMCache digest the last launch-time
+    /// check measured instead of the registered one, while drifted.
+    lmcache_drift: Mutex<BTreeMap<String, String>>,
     /// Profile name → (installation digest probed, report).
     capabilities: Mutex<BTreeMap<String, (String, CapabilityReport)>>,
     probe_timeout: Duration,
@@ -990,6 +1016,7 @@ impl InstallationRegistry {
                     .map(|p| (p.name.clone(), p.installation_observed_digest.clone()))
                     .collect(),
             ),
+            lmcache_drift: Mutex::default(),
             capabilities: Mutex::default(),
             probe_timeout: PROBE_TIMEOUT,
         };
@@ -1110,9 +1137,57 @@ impl InstallationRegistry {
         self.drift.lock().ok()?.get(profile).cloned()
     }
 
+    /// ADR 0033 §1: the launch-time check of `profile`'s LMCache
+    /// ([`crate::lmcache_install::check_lmcache`]). A digest other than the
+    /// registered one is drift, handled as the engine package's is (ADR
+    /// 0008): flagged on the role log, and refused `installation_drift` only
+    /// under `installation_drift: refuse`. The inner result is the check's
+    /// verdict.
+    pub fn verify_lmcache(
+        &self,
+        profile: &str,
+        engine: Engine,
+        executable: &Path,
+        registered: Option<&capyctl_config::lmcache::LmcacheRegistration>,
+        policy: InstallationDrift,
+    ) -> Result<
+        Result<crate::lmcache_install::LmcacheInstall, crate::lmcache_install::LmcacheCheckFailure>,
+        &'static str,
+    > {
+        let checked =
+            crate::lmcache_install::check_lmcache(&self.measurer, engine, executable, registered);
+        // ADR 0033 §1: the drift stands in status until a check measures
+        // the registered digest again.
+        if let (Ok(install), Ok(mut drift)) = (checked.as_ref(), self.lmcache_drift.lock()) {
+            if install.drifted {
+                drift.insert(profile.to_owned(), install.digest.clone());
+            } else {
+                drift.remove(profile);
+            }
+        }
+        if let Some(install) = checked.as_ref().ok().filter(|install| install.drifted) {
+            capyctl_domain::role_log::notice(
+                capyctl_domain::role_log::Level::Warning,
+                &format!(
+                    "LMCache in profile {profile} drifted from its registration: measured {}",
+                    install.digest
+                ),
+            );
+            if policy == InstallationDrift::Refuse {
+                return Err("installation_drift");
+            }
+        }
+        Ok(checked)
+    }
+
     /// Status: overlay drift and missing capabilities on published profiles.
     pub fn overlay(&self, profiles: &mut [capyctl_protocol::pb::RuntimeProfileStatus]) {
         let drift = self.drift.lock().map(|d| d.clone()).unwrap_or_default();
+        let lmcache_drift = self
+            .lmcache_drift
+            .lock()
+            .map(|d| d.clone())
+            .unwrap_or_default();
         let capabilities = self
             .capabilities
             .lock()
@@ -1129,6 +1204,10 @@ impl InstallationRegistry {
             if let Some((_, report)) = capabilities.get(&profile.name) {
                 profile.capabilities_missing = report.missing_capabilities();
             }
+            profile.lmcache_observed_digest = lmcache_drift
+                .get(&profile.name)
+                .cloned()
+                .unwrap_or_default();
         }
     }
 }

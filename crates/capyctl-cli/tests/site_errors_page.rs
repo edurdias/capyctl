@@ -136,6 +136,20 @@ fn group_codes_are_documented_with_their_exit_code() {
             "host_capability_missing:decisions",
             "host_capability_missing:decisions",
         ),
+        // T45 (ADR 0033 §14).
+        (
+            "lmcache_unavailable:<reason>",
+            "lmcache_unavailable:host_off",
+        ),
+        ("retention_zero:lmcache", "retention_zero:lmcache"),
+        (
+            "host_capability_missing:lmcache",
+            "host_capability_missing:lmcache",
+        ),
+        (
+            "host_capability_missing:retention",
+            "host_capability_missing:retention",
+        ),
     ] {
         let exit = StructuredError {
             code: "invalid_config",

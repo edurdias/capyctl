@@ -43,6 +43,7 @@ fn register(document: &std::path::Path, name: &str) {
             env: Default::default(),
             approved_env: vec![],
             trust_remote_code: false,
+            lmcache: None,
         }),
     );
     write_engines(&engines, &lock, None).unwrap();
@@ -145,6 +146,12 @@ async fn standalone_add_is_usable_without_restart() {
         .unwrap();
     assert!(listed["accepted"]["vllm-patched"].is_object(), "{listed}");
     assert!(listed["accepted"]["local"].is_object(), "{listed}");
+    // ADR 0033 §9: and the `lmcache` and `retention` the role runs under.
+    assert_eq!(
+        listed["host"],
+        serde_json::json!({"lmcache": "auto", "retention": "standard"}),
+        "{listed}"
+    );
     let _ = app.shutdown().await;
 }
 
@@ -575,6 +582,7 @@ fn standalone_publishes_a_registered_tensorfold_profile() {
             env: Default::default(),
             approved_env: vec![],
             trust_remote_code: false,
+            lmcache: None,
         }),
     );
     write_engines(&engines, &lock, None).unwrap();

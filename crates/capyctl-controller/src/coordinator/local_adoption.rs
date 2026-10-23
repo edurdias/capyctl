@@ -18,9 +18,11 @@ use super::*;
 use capyctl_adapters::resolve::AdapterSpec;
 use capyctl_store::secrets::SecretRole;
 
-/// An adopted runtime never spawns: the launch it stands for already ran, and a
-/// second spawn for the same incarnation would be a different engine.
-struct NoLaunch;
+/// An adopted runtime never spawns a launch: the launch it stands for already
+/// ran, and a second spawn for the same incarnation would be a different
+/// engine. ADR 0033 §7: only a restart-parked launch's wake starts its engine
+/// again, recorded under its restore step through the store's association.
+struct NoLaunch(StoreAssociation);
 
 impl LaunchAssociation for NoLaunch {
     fn persist_api_identity(
@@ -30,6 +32,23 @@ impl LaunchAssociation for NoLaunch {
         Err(AssociationError::Uncertain(
             "an adopted runtime never launches".into(),
         ))
+    }
+
+    fn persist_lmcache_identity(
+        &self,
+        _identity: &capyctl_domain::completion::ProcessIdentity,
+    ) -> Result<(), AssociationError> {
+        Err(AssociationError::Uncertain(
+            "an adopted runtime never starts a server".into(),
+        ))
+    }
+
+    fn persist_wake_api_identity(
+        &self,
+        wake: &str,
+        identity: &capyctl_domain::completion::ProcessIdentity,
+    ) -> Result<(), AssociationError> {
+        self.0.persist_wake_api_identity(wake, identity)
     }
 }
 
@@ -116,8 +135,50 @@ pub(super) fn factory(
                 // key to recover.
                 AdapterSpec::Tensorfold { .. } | AdapterSpec::Llamacpp { .. } => {}
             }
+            // ADR 0033 §§3, 7: an adopted launch runs on the server its
+            // Initialize started (recorded beside its engine), never a new
+            // one; a launch that recorded no server runs without LMCache.
+            if let AdapterSpec::Vllm { lmcache, .. } | AdapterSpec::Sglang { lmcache, .. } =
+                &mut spec
+            {
+                let server = capyctl_domain::completion::lmcache_members(
+                    &owner
+                        .store()
+                        .runtime_binding_identities(work.binding_id())
+                        .map_err(|error| {
+                            CoordinatorError::Service(format!(
+                                "the launch's recorded processes are unreadable: {error}"
+                            ))
+                        })?,
+                );
+                *lmcache = match lmcache.as_ref().and_then(|state| state.launch()) {
+                    Some(capyctl_adapters::lmcache::LmcacheLaunch::Start(plan))
+                        if !server.is_empty() =>
+                    {
+                        Some(capyctl_adapters::lmcache::LmcacheState::attached(
+                            server, plan,
+                        ))
+                    }
+                    _ => None,
+                };
+            }
         }
-        let tools = tools_factory(Arc::new(NoLaunch));
+        let lmcache = spec_lmcache(&spec);
+        // ADR 0033 §§7, 10: an adopted restart-parked launch's wake starts its
+        // engine again on the running server, recorded under the restore step
+        // and spawned under the launch's retention.
+        let retention_zero = work.lmcache().is_some_and(|plan| plan.retention_zero);
+        let tools = tools_factory(
+            Arc::new(NoLaunch(StoreAssociation {
+                owner: owner.clone(),
+                fence: work.fence().clone(),
+                binding_id: work.binding_id().to_owned(),
+            })),
+            capyctl_launchers::SpawnPolicy {
+                no_core_dumps: retention_zero,
+                memory_logs: retention_zero,
+            },
+        );
         let engine = bindings.adapter(declared, spec, tools.clone())?;
         // SPEC §§6.2, 9.1: an adopted launch (one started before the rule
         // reached this host) is refused its Park and Restore as a fresh one is.
@@ -132,6 +193,7 @@ pub(super) fn factory(
             ),
             tools: Some(tools),
             settle: None,
+            lmcache,
         }))
     })
 }

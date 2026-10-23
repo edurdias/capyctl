@@ -81,6 +81,7 @@ fn router(clock: Arc<AtomicI64>) -> axum::Router {
                     latency: None,
                     max_running: Some(16),
                 }],
+                lmcache: Vec::new(),
             },
             NOW,
         )

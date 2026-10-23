@@ -258,6 +258,10 @@ pub fn plan_from_effective(
             .map_err(|_| VllmPlanError::UnpinnableDevice)?,
         // ADR 0028 §10: single-rank unless `with_group` sets it.
         group: None,
+        // ADR 0033: rendered by Initialize once the launch's server is up;
+        // the launch builder attaches the state (`AdapterSpec::Vllm.lmcache`).
+        kv_transfer_config: None,
+        lmcache: None,
     })
 }
 

@@ -13,11 +13,18 @@ pub(super) struct NormalizedProfile {
     pub(super) security: Security,
     pub(super) log_policy: LogPolicy,
     pub(super) custom: Option<crate::custom::CustomProfile>,
+    /// ADR 0033 §1: the LMCache package `engine add` registered.
+    pub(super) lmcache: Option<LmcacheRegistration>,
 }
 
 pub(super) struct NormalizedRecipe {
     /// ADR 0030 §1: the API the revision serves, part of its identity.
     pub(super) api: DeploymentApi,
+    /// ADR 0033 §6, §9, §10 (contract decision 1): the declared LMCache
+    /// settings, part of the revision's identity when not the default.
+    pub(super) lmcache: LmcacheMode,
+    pub(super) lmcache_pool_bytes: Option<u64>,
+    pub(super) retention: Retention,
     pub(super) model: ModelIdentity,
     pub(super) recipe: String,
     pub(super) residency: Residency,
@@ -224,6 +231,12 @@ pub(super) fn normalize_profile(
         }
         (_, None) => None,
     };
+    // ADR 0033 §1: a registration names its version and an ADR 0008 digest.
+    if let Some(lmcache) = &raw_profile.lmcache {
+        lmcache
+            .check()
+            .map_err(|detail| invalid("runtime_profiles.lmcache", detail))?;
+    }
     let profile = NormalizedProfile {
         engine: raw_profile.engine,
         revision: raw_profile.revision,
@@ -238,6 +251,7 @@ pub(super) fn normalize_profile(
             retained_files: raw_profile.log_policy.retained_files,
         },
         custom,
+        lmcache: raw_profile.lmcache.clone(),
     };
     Ok(profile)
 }
@@ -469,6 +483,16 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
                 ));
             }
         }
+        // ADR 0033 §7 (amendment A12): a published product name is a table
+        // key exactly as the qualified table compares it.
+        if let Some(product) = device.product_name.as_deref() {
+            if crate::lmcache::table_key(product) != Some(product) {
+                return Err(invalid(
+                    format!("resource_policy.devices.{name}.product_name"),
+                    "must be printable ASCII without surrounding spaces, at most 128 bytes",
+                ));
+            }
+        }
     }
     check_domain_shape(&domains, &h.resource_policy.devices)?;
     let host = HostPolicy {
@@ -487,6 +511,8 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
         queue,
         model_sources,
         parked_growth_limit,
+        lmcache: h.lmcache,
+        retention: h.retention,
     };
     ResourceControls::from_host(&host).validate(&ResourceContext::from_host(&host))?;
     Ok(host)
@@ -920,6 +946,15 @@ pub(super) fn recipe_fingerprint(
         // fingerprint keeps its identity.
         #[serde(skip_serializing_if = "DeploymentApi::is_chat")]
         api: DeploymentApi,
+        // ADR 0033 (contract decision 1): the declared LMCache settings,
+        // absent at their defaults so every existing fingerprint keeps its
+        // identity.
+        #[serde(skip_serializing_if = "LmcacheMode::is_auto")]
+        lmcache: LmcacheMode,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lmcache_pool_bytes: Option<u64>,
+        #[serde(skip_serializing_if = "Retention::is_standard")]
+        retention: Retention,
         recipe: &'a str,
         residency: Residency,
         recovery: Recovery,
@@ -958,9 +993,17 @@ pub(super) fn recipe_fingerprint(
         // identity.
         #[serde(skip_serializing_if = "Option::is_none")]
         manifest_digest: Option<&'a str>,
+        // ADR 0033 §1: the LMCache package is part of the installation, as
+        // its build is. Absent without one, so existing fingerprints keep
+        // their identity.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lmcache_registration: Option<&'a LmcacheRegistration>,
     }
     let material = Recipe {
         api: d.api,
+        lmcache: d.lmcache,
+        lmcache_pool_bytes: d.lmcache_pool_bytes,
+        retention: d.retention,
         model: &d.model,
         recipe: &d.recipe,
         residency: d.residency,
@@ -990,6 +1033,7 @@ pub(super) fn recipe_fingerprint(
         hardware_fingerprint: &host.hardware_fingerprint,
         environment_fingerprint: &host.environment_fingerprint,
         manifest_digest: profile.custom.as_ref().map(|c| c.manifest_digest.as_str()),
+        lmcache_registration: profile.lmcache.as_ref(),
     };
     let recipe_fingerprint = hex::encode(Sha256::digest(
         serde_json::to_vec(&material).map_err(|e| invalid("fingerprint", e.to_string()))?,

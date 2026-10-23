@@ -256,6 +256,7 @@ fn plan() -> SingleLaunchPlan {
         checkpoint_gguf: None,
         startup_bytes: None,
         startup_host_bytes: None,
+        lmcache: None,
     }
 }
 
@@ -429,6 +430,26 @@ async fn sglang_without_saver_evidence_or_quiescence_is_refused_before_any_call(
             Err(StepFailure::Refused)
         ));
     }
+    assert!(stand.engine.lock().unwrap().calls.is_empty());
+}
+
+/// ADR 0033 A8, SPEC §10 step 4: a restart-park's engine quiescence is the
+/// engine's own gauges with no saver at all: a host with no saver
+/// observation proves an idle SGLang engine quiescent, and a busy one not,
+/// where the deep park above is refused without a saver either way. Nothing
+/// is sent to the engine's control surface.
+// T45 T16 T20
+#[tokio::test]
+async fn a_restart_parks_quiescence_is_the_engines_gauges_without_a_saver() {
+    let stand = stand().await;
+    let member = MemberRef {
+        deployment_id: "deployment".into(),
+        member_id: BINDING.into(),
+    };
+    let unsaved = driver(&stand, None, 0);
+    assert!(unsaved.engine_idle(&member).await);
+    stand.engine.lock().unwrap().busy = true;
+    assert!(!unsaved.engine_idle(&member).await);
     assert!(stand.engine.lock().unwrap().calls.is_empty());
 }
 

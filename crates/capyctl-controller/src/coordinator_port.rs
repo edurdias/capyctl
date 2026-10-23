@@ -337,6 +337,15 @@ impl CoordinatorLifecycle {
         let engine = owner
             .store()
             .revision_engine(deployment, binding.revision)?;
+        // ADR 0033 §5: the salt namespace is the launch's own deployment and
+        // the revision its binding runs, never the deployment's current one.
+        let revision = u64::try_from(binding.revision).map_err(|_| {
+            LifecycleFault::Conflict(format!(
+                "deployment {deployment} has a retained runtime recording revision {}, \
+                 which is not a revision",
+                binding.revision
+            ))
+        })?;
         let lane = owner.store().lane_engine(&binding.id)?;
         Ok((
             RuntimeEndpoint {
@@ -345,6 +354,8 @@ impl CoordinatorLifecycle {
                 engine_key,
                 incarnation: binding.incarnation,
                 engine,
+                deployment_id: binding.deployment_id,
+                revision,
                 // Decided by the caller once the owner lock is released.
                 request_abort: false,
             },

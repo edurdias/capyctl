@@ -81,6 +81,9 @@ pub struct VllmAdapter {
     /// which decides how readiness and the wake canary are proven (§§3, 4).
     /// Set by whoever resolved the deployment; `chat` unless set.
     api: capyctl_config::effective::DeploymentApi,
+    /// ADR 0033 §7: the deployment's residency is `restart_only`: with
+    /// LMCache on, a park stops the engine and keeps the server.
+    restart_only: bool,
 }
 
 #[derive(Default)]
@@ -103,7 +106,12 @@ impl VllmAdapter {
                 base.clone(),
                 model_id.clone(),
                 api_key.clone(),
-                true,
+                // ADR 0033 §5: the adapter's own requests are probes, which
+                // carry no salt, and it does not know the launch's deployment
+                // and revision; a salt reaching it is refused, never forwarded
+                // unchanged. Client requests go through the router's
+                // launch-specific forwarder.
+                crate::forward::CacheSalt::Refused,
             ),
             endpoint: base.to_string(),
             http: EngineHttp::new(base, api_key),
@@ -119,6 +127,7 @@ impl VllmAdapter {
             residency: Mutex::new(ResidencyFence::default()),
             park_level: crate::vllm::residency::ParkLevel::Deep,
             api: capyctl_config::effective::DeploymentApi::Chat,
+            restart_only: false,
         }
     }
 
@@ -144,7 +153,53 @@ impl VllmAdapter {
             capyctl_config::effective::Residency::HostBacked => ParkLevel::HostBacked,
             _ => ParkLevel::Deep,
         };
+        self.restart_only = residency == capyctl_config::effective::Residency::RestartOnly;
         self
+    }
+
+    /// ADR 0033 §7: whether a Park or Restore of this launch is the
+    /// restart-park one: LMCache is on, and the launch never sleeps (its
+    /// residency is `restart_only`, or the host's deep-park policy is off).
+    fn restart_park(&self) -> bool {
+        (self.restart_only || !self.deep_park_enabled())
+            && self
+                .launch
+                .as_ref()
+                .and_then(|launch| launch.lmcache.as_ref())
+                .is_some_and(|state| state.is_on())
+    }
+
+    /// ADR 0033 §7: one restart-park step, under the same residency fence
+    /// as a sleep step.
+    async fn restart_park_step(
+        &self,
+        command: &RuntimeCommand,
+    ) -> Result<capyctl_domain::completion::EffectObservation, RuntimeError> {
+        let tools = self.tools.clone().ok_or(RuntimeError::Unsupported)?;
+        self.begin_residency_step(&command.context.token.step_id)?;
+        let member = MemberRef {
+            deployment_id: command.context.token.deployment_id.clone(),
+            member_id: command.context.binding_id.clone(),
+        };
+        let result = match command.action {
+            RuntimeAction::Park => {
+                // vLLM keeps no file rendezvous.
+                let parked = crate::lmcache::park_engine(tools, command, None).await;
+                if parked.is_ok() {
+                    self.set_parked(&member, true);
+                }
+                parked
+            }
+            RuntimeAction::Restore => {
+                // The new engine's readiness is read like a launch's: the
+                // stopped one's parked state does not describe it.
+                self.set_parked(&member, false);
+                crate::vllm::initialize::restore_engine(self, command).await
+            }
+            _ => Err(RuntimeError::Unsupported),
+        };
+        self.end_residency_step(result.is_ok());
+        result
     }
 
     /// The sleep level this launch parks at.
@@ -225,7 +280,8 @@ impl VllmAdapter {
             base.clone(),
             self.model_id.clone(),
             Some(engine_key.clone()),
-            true,
+            // ADR 0033 §5: refused here, as in the constructor.
+            crate::forward::CacheSalt::Refused,
         );
         self.http = EngineHttp::new(base, Some(engine_key.clone()));
         if let Some(admin) = &self.admin_key {
@@ -352,6 +408,9 @@ impl EngineAdapter for VllmAdapter {
     ) -> Result<capyctl_domain::completion::EffectObservation, RuntimeError> {
         match command.action {
             RuntimeAction::Initialize => crate::vllm::initialize::initialize(self, command).await,
+            RuntimeAction::Park | RuntimeAction::Restore if self.restart_park() => {
+                self.restart_park_step(command).await
+            }
             RuntimeAction::Park
             | RuntimeAction::Restore
             | RuntimeAction::ReloadWeights

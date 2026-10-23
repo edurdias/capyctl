@@ -183,6 +183,9 @@ impl From<LifecycleError> for LifecycleFault {
             // that failed terminally needs a new revision.
             LifecycleError::ModelSourcePending => Self::Unavailable(text),
             LifecycleError::ModelSourceFailed => Self::Blocked(text),
+            // ADR 0033 §13: a feature gate refused every host; the deployment
+            // or the hosts must change first.
+            LifecycleError::PlacementRefused(_) => Self::Blocked(text),
             // The store cannot say what the current state is, so nothing about the
             // request was decided.
             LifecycleError::ReconciliationRequired

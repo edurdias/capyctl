@@ -26,12 +26,13 @@
 //! frozen profile is no longer held is never read and never reads idle.
 use crate::ingress::{Ingress, IngressScope, LoadTarget};
 use capyctl_adapters::tensorfold::http::HealthReport;
+use capyctl_domain::completion::ProcessIdentity;
 use capyctl_domain::latency::{Histogram, MAX_BUCKETS};
 use capyctl_protocol::{
     pb,
     reports::{
-        EngineLoad, LoadReport, LoadSample, SampleLatency, KV_USAGE_PPM_FULL, MAX_LOAD_GAUGE,
-        MAX_LOAD_REPORT_BYTES, MAX_LOAD_SAMPLES,
+        EngineLoad, LmcacheSample, LoadReport, LoadSample, SampleLatency, KV_USAGE_PPM_FULL,
+        MAX_LOAD_GAUGE, MAX_LOAD_REPORT_BYTES, MAX_LOAD_SAMPLES,
     },
 };
 use std::{
@@ -547,6 +548,25 @@ fn launch_key(target: &LoadTarget) -> LaunchKey {
     )
 }
 
+/// ADR 0033 §12 (lifecycle design §8): one launch's private LMCache server to
+/// read, Ready or parked (a parked launch keeps its server).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LmcacheTarget {
+    pub deployment_id: String,
+    pub instance_index: u32,
+    pub generation: i64,
+    pub owned_handle: String,
+    /// The server's loopback admin HTTP address (`/metrics`).
+    pub http: std::net::SocketAddr,
+    /// The server group's recorded processes, for its measured memory.
+    pub server: Vec<ProcessIdentity>,
+    /// The server's L1 pool.
+    pub pool_bytes: i64,
+    /// ADR 0033 §6: the server group's GPU memory as the host's per-process
+    /// sampler last saw it; `None` when unknown.
+    pub device_bytes: Option<u64>,
+}
+
 /// SPEC §10, D9: what a reporter samples: the Ready scopes of one host, each
 /// with its loopback engine target and launch key, and the forwarding
 /// timings recorded for a scope since the last tick.
@@ -558,6 +578,105 @@ pub trait LoadSource: Send + Sync {
     fn drain_latency(&self, _scope: &IngressScope) -> Vec<(String, Histogram)> {
         Vec::new()
     }
+    /// ADR 0033 §12: every launch with a private LMCache server to read now,
+    /// Ready and parked. Empty for a source without any.
+    fn lmcache_targets(&self) -> Vec<LmcacheTarget> {
+        Vec::new()
+    }
+}
+
+/// ADR 0033 §12: the Prometheus names LMCache 0.5.6's MP server exports on
+/// its HTTP `/metrics` (`docs/source/mp/observability/metrics.rst`: dots
+/// become underscores, counters gain an optional unit and `_total`).
+const LMCACHE_L1_USED: &str = "lmcache_mp_l1_memory_usage_bytes";
+const LMCACHE_L1_RATIO: &str = "lmcache_mp_l1_usage_ratio";
+const LMCACHE_INFLIGHT: &str = "lmcache_mp_inflight_load_memory_usage_bytes";
+const LMCACHE_L2_USED: &str = "lmcache_mp_l2_usage_bytes";
+const LMCACHE_ALLOC_FAILURES: &str = "lmcache_mp_l1_allocation_failure";
+/// Tokens submitted for lookup and found (`lookup_requested`, `lookup_hit`),
+/// labelled by model and salt.
+const LMCACHE_LOOKUPS: &str = "lmcache_mp_lookup_requested";
+const LMCACHE_HITS: &str = "lmcache_mp_lookup_hit";
+/// The unit suffixes a counter may carry before `_total`.
+const COUNTER_UNITS: &[&str] = &["tokens", "requests", "failures", "allocations", "events"];
+
+/// ADR 0033 §12: the cache figures of one LMCache `/metrics` body. Each is
+/// `None` when absent or unparseable: unknown, never zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LmcacheFigures {
+    pub used_bytes: Option<u64>,
+    pub usage_ppm: Option<u32>,
+    pub inflight_bytes: Option<u64>,
+    pub alloc_failures: Option<u64>,
+    pub lookups: Option<u64>,
+    pub hits: Option<u64>,
+    pub l2_bytes: Option<u64>,
+}
+
+/// The sum of every series of the exact metric `name` (one per adapter, per
+/// model, per salt: every label set is summed and none is kept).
+fn summed(text: &str, name: &str) -> Option<u64> {
+    let series = labelled(text, name).ok()?;
+    if series.is_empty() {
+        return None;
+    }
+    series
+        .into_iter()
+        .try_fold(0_u64, |sum, (_, value)| sum.checked_add(whole(value)?))
+}
+
+/// One counter `base`, exported as `<base>_total` or `<base>_<unit>_total`,
+/// summed over every label set. `None` when no such series is there or one
+/// does not parse.
+fn counter(text: &str, base: &str) -> Option<u64> {
+    let mut names: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split(['{', ' ', '\t']).next())
+        .filter(|name| {
+            name.strip_prefix(base)
+                .and_then(|rest| rest.strip_suffix("_total"))
+                .is_some_and(|unit| {
+                    unit.is_empty()
+                        || unit
+                            .strip_prefix('_')
+                            .is_some_and(|unit| COUNTER_UNITS.contains(&unit))
+                })
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        return None;
+    }
+    names
+        .into_iter()
+        .try_fold(0_u64, |sum, name| sum.checked_add(summed(text, name)?))
+}
+
+/// ADR 0033 §12: the figures of one LMCache `/metrics` body: L1 use (bytes
+/// and ratio), in-flight load reservations, allocation failures, the lookup
+/// and hit token counters summed over their model and salt labels (no label
+/// is kept), and L2 use (expected absent or zero). A figure LMCache does not
+/// export yet (`/metrics` is empty before the first store) or renamed is
+/// unknown.
+pub fn parse_lmcache_metrics(text: &str) -> LmcacheFigures {
+    LmcacheFigures {
+        used_bytes: summed(text, LMCACHE_L1_USED),
+        usage_ppm: series(text, LMCACHE_L1_RATIO)
+            .ok()
+            .and_then(|values| values.into_iter().reduce(f64::max))
+            .filter(|ratio| *ratio <= 1.0)
+            .map(|ratio| {
+                ((ratio * f64::from(KV_USAGE_PPM_FULL)).round() as u32).min(KV_USAGE_PPM_FULL)
+            }),
+        inflight_bytes: summed(text, LMCACHE_INFLIGHT),
+        alloc_failures: counter(text, LMCACHE_ALLOC_FAILURES),
+        lookups: counter(text, LMCACHE_LOOKUPS),
+        hits: counter(text, LMCACHE_HITS),
+        l2_bytes: summed(text, LMCACHE_L2_USED),
+    }
 }
 
 /// A host agent samples the scopes its ingress holds open.
@@ -567,6 +686,72 @@ impl LoadSource for Ingress {
     }
     fn drain_latency(&self, scope: &IngressScope) -> Vec<(String, Histogram)> {
         Ingress::drain_latency(self, scope).unwrap_or_default()
+    }
+}
+
+/// ADR 0033 §12: a host agent's load source: the scopes its ingress holds
+/// open, and the LMCache servers of the launches its journal holds Ready or
+/// parked.
+pub struct HostLoad {
+    ingress: Arc<Ingress>,
+    journal: Arc<crate::journal::HostJournal>,
+    /// ADR 0033 §6: the per-process GPU sampler, once the role names one.
+    residency: Mutex<Option<Arc<crate::process_residency::ResidencySampler>>>,
+}
+
+impl HostLoad {
+    pub fn new(ingress: Arc<Ingress>, journal: Arc<crate::journal::HostJournal>) -> Arc<Self> {
+        Arc::new(Self {
+            ingress,
+            journal,
+            residency: Mutex::new(None),
+        })
+    }
+
+    /// Read the server groups' GPU memory from `sampler`.
+    pub fn set_residency(&self, sampler: Arc<crate::process_residency::ResidencySampler>) {
+        *self.residency.lock().unwrap_or_else(|p| p.into_inner()) = Some(sampler);
+    }
+}
+
+impl LoadSource for HostLoad {
+    fn targets(&self) -> Vec<LoadTarget> {
+        self.ingress.targets()
+    }
+    fn drain_latency(&self, scope: &IngressScope) -> Vec<(String, Histogram)> {
+        LoadSource::drain_latency(self.ingress.as_ref(), scope)
+    }
+    fn lmcache_targets(&self) -> Vec<LmcacheTarget> {
+        let Ok(launches) = self.journal.ready_launches() else {
+            return Vec::new();
+        };
+        let sample = self
+            .residency
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .map(|sampler| sampler.current())
+            .unwrap_or_default();
+        launches
+            .into_iter()
+            .filter_map(|(command, group)| {
+                let grant = command.action.launch_plan()?.lmcache?;
+                let server = capyctl_domain::completion::lmcache_members(&group);
+                if server.is_empty() {
+                    return None;
+                }
+                Some(LmcacheTarget {
+                    device_bytes: crate::process_residency::group_device_bytes(&sample, &server),
+                    deployment_id: command.identity.deployment_id.clone(),
+                    instance_index: command.identity.instance_index,
+                    generation: command.identity.generation,
+                    owned_handle: command.identity.command_id.clone(),
+                    http: (std::net::Ipv4Addr::LOCALHOST, grant.http_port).into(),
+                    server,
+                    pool_bytes: grant.pool_bytes,
+                })
+            })
+            .collect()
     }
 }
 
@@ -820,6 +1005,8 @@ impl LoadReporter {
     /// One tick: a sample per Ready scope, split into reports that each pass
     /// the W3 bounds. Empty when no scope is Ready.
     pub async fn reports(&self) -> Vec<pb::ReportLoad> {
+        // ADR 0033 §12: each Ready or parked launch's LMCache server.
+        let lmcache = self.lmcache_samples().await;
         let targets: Vec<_> = self
             .source
             .targets()
@@ -935,11 +1122,84 @@ impl LoadReporter {
             merge_latency(&mut b.1.latency, a.1.latency.take());
             true
         });
-        batch(&self.host_id, samples.into_iter().map(|(_, s)| s).collect())
+        let mut reports = batch(&self.host_id, samples.into_iter().map(|(_, s)| s).collect());
+        reports.extend(batch_lmcache(&self.host_id, lmcache));
+        reports
     }
 }
 
 impl LoadReporter {
+    /// ADR 0033 §12: one loopback `/metrics` read of an LMCache server's
+    /// admin port, unkeyed (the server has no key), within the scrape bound.
+    async fn scrape_lmcache(&self, target: &LmcacheTarget) -> Option<String> {
+        if !target.http.ip().is_loopback() {
+            return None;
+        }
+        let read = async {
+            let response = self
+                .client
+                .get(format!("http://{}/metrics", target.http))
+                .send()
+                .await
+                .ok()?;
+            if response.status() != reqwest::StatusCode::OK {
+                return None;
+            }
+            String::from_utf8(bounded_body(response).await?).ok()
+        };
+        tokio::time::timeout(SCRAPE_TIMEOUT, read)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// ADR 0033 §§6, 12: one sample per launch's LMCache server: its cache
+    /// figures (unknown when the scrape failed) and its group's measured
+    /// memory. Never readiness or release evidence.
+    async fn lmcache_samples(&self) -> Vec<LmcacheSample> {
+        let targets = self.source.lmcache_targets();
+        let bodies =
+            futures::future::join_all(targets.iter().map(|t| self.scrape_lmcache(t))).await;
+        let mut samples: Vec<LmcacheSample> = targets
+            .into_iter()
+            .zip(bodies)
+            .map(|(target, body)| {
+                let figures = body
+                    .as_deref()
+                    .map(parse_lmcache_metrics)
+                    .unwrap_or_default();
+                LmcacheSample {
+                    rss_bytes: crate::process_residency::group_resident_bytes(&target.server),
+                    device_bytes: target.device_bytes,
+                    deployment_id: target.deployment_id,
+                    generation: target.generation,
+                    owned_handle: target.owned_handle,
+                    sampled_at_ms: capyctl_protocol::now_unix_ms(),
+                    scrape_ok: body.is_some(),
+                    used_bytes: figures.used_bytes,
+                    usage_ppm: figures.usage_ppm,
+                    inflight_bytes: figures.inflight_bytes,
+                    alloc_failures: figures.alloc_failures,
+                    // A hit count above the lookups read with it is not a
+                    // figure LMCache could report; both stay unknown.
+                    lookups: figures
+                        .lookups
+                        .filter(|lookups| figures.hits.is_none_or(|hits| hits <= *lookups)),
+                    hits: figures
+                        .hits
+                        .filter(|hits| figures.lookups.is_none_or(|lookups| *hits <= lookups)),
+                    l2_bytes: figures.l2_bytes,
+                }
+            })
+            .collect();
+        // One sample per scope and generation per report.
+        samples.sort_by(|a, b| {
+            (&a.deployment_id, a.generation).cmp(&(&b.deployment_id, b.generation))
+        });
+        samples.dedup_by(|a, b| a.deployment_id == b.deployment_id && a.generation == b.generation);
+        samples
+    }
+
     /// SPEC §17 (M80): this scope's ingress timings since the last tick and
     /// its engine histograms' growth since the last scrape.
     fn latency(
@@ -998,18 +1258,35 @@ fn merge_latency(into: &mut Option<SampleLatency>, extra: Option<SampleLatency>)
 /// Split samples into reports within the W3 count and size bounds. A report
 /// the receiver would refuse is never sent.
 pub fn batch(host_id: &str, samples: Vec<LoadSample>) -> Vec<pb::ReportLoad> {
-    use prost::Message;
-    let mut reports = Vec::new();
-    let mut current: Vec<LoadSample> = Vec::new();
-    let wire = |samples: &[LoadSample]| {
+    split(samples, |samples| {
         LoadReport {
             host_id: host_id.to_owned(),
             samples: samples.to_vec(),
+            lmcache: Vec::new(),
         }
         .to_wire()
-    };
-    for sample in samples {
-        current.push(sample);
+    })
+}
+
+/// ADR 0033 §12: LMCache samples in their own reports (a parked launch has
+/// no load sample to ride beside), within the same bounds.
+pub fn batch_lmcache(host_id: &str, samples: Vec<LmcacheSample>) -> Vec<pb::ReportLoad> {
+    split(samples, |samples| {
+        LoadReport {
+            host_id: host_id.to_owned(),
+            samples: Vec::new(),
+            lmcache: samples.to_vec(),
+        }
+        .to_wire()
+    })
+}
+
+fn split<T>(items: Vec<T>, wire: impl Fn(&[T]) -> pb::ReportLoad) -> Vec<pb::ReportLoad> {
+    use prost::Message;
+    let mut reports = Vec::new();
+    let mut current: Vec<T> = Vec::new();
+    for item in items {
+        current.push(item);
         if current.len() > MAX_LOAD_SAMPLES || wire(&current).encoded_len() > MAX_LOAD_REPORT_BYTES
         {
             let overflow = current.pop();
@@ -1026,4 +1303,61 @@ pub fn batch(host_id: &str, samples: Vec<LoadSample>) -> Vec<pb::ReportLoad> {
         .into_iter()
         .filter(|r| LoadReport::try_from(r.clone()).is_ok())
         .collect()
+}
+
+#[cfg(test)]
+mod lmcache_tests {
+    use super::*;
+
+    // T45 (ADR 0033 §12): lookups and hits are summed over every model and
+    // salt label set and no label is kept; an absent figure stays unknown,
+    // never zero; an L2 above zero is carried, flagged degraded.
+    #[test]
+    fn lmcache_metrics_sum_labels_and_keep_unknowns_unknown() {
+        let text = "\
+# TYPE lmcache_mp_lookup_requested_tokens_total counter
+lmcache_mp_lookup_requested_tokens_total{model_name=\"m\",cache_salt=\"aa\"} 200
+lmcache_mp_lookup_requested_tokens_total{model_name=\"m\",cache_salt=\"bb\"} 60
+lmcache_mp_lookup_hit_tokens_total{model_name=\"m\",cache_salt=\"aa\"} 200
+lmcache_mp_lookup_hit_tokens_total{model_name=\"m\",cache_salt=\"bb\"} 12
+lmcache_mp_lookup_hit_l1_tokens_total{model_name=\"m\",cache_salt=\"aa\"} 999
+lmcache_mp_l1_memory_usage_bytes 1395864371
+lmcache_mp_l1_usage_ratio 0.325
+lmcache_mp_l2_usage_bytes{l2_name=\"fs\"} 4096
+";
+        let figures = parse_lmcache_metrics(text);
+        assert_eq!(figures.lookups, Some(260));
+        assert_eq!(figures.hits, Some(212));
+        assert_eq!(figures.used_bytes, Some(1_395_864_371));
+        assert_eq!(figures.usage_ppm, Some(325_000));
+        assert_eq!(figures.l2_bytes, Some(4096));
+        // Not exported (yet): unknown, never zero.
+        assert_eq!(figures.inflight_bytes, None);
+        assert_eq!(figures.alloc_failures, None);
+        assert_eq!(parse_lmcache_metrics(""), LmcacheFigures::default());
+        // A malformed series leaves its figure unknown.
+        let broken = parse_lmcache_metrics("lmcache_mp_l1_memory_usage_bytes nope\n");
+        assert_eq!(broken.used_bytes, None);
+        let sample = LmcacheSample {
+            deployment_id: "d".into(),
+            generation: 1,
+            owned_handle: "h".into(),
+            sampled_at_ms: 1,
+            scrape_ok: true,
+            used_bytes: figures.used_bytes,
+            usage_ppm: figures.usage_ppm,
+            inflight_bytes: None,
+            alloc_failures: None,
+            lookups: figures.lookups,
+            hits: figures.hits,
+            l2_bytes: figures.l2_bytes,
+            rss_bytes: None,
+            device_bytes: None,
+        };
+        assert!(sample.l2_degraded());
+        // The salt never leaves the host: no label is in the report.
+        let reports = batch_lmcache("host", vec![sample]);
+        assert_eq!(reports.len(), 1);
+        assert!(!format!("{:?}", reports[0]).contains("aa"));
+    }
 }

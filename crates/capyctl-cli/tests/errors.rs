@@ -484,3 +484,69 @@ fn group_status_codes_have_no_exit() {
         }
     }
 }
+
+// T45 T36 (ADR 0033 §14): every LMCache refusal exits 5 and shows its own
+// closed code, as the code itself or nested in a generic refusal: a deploy's
+// `invalid_config`, a start refused at activation, a failed launch.
+// `lmcache_unavailable:<reason>` holds for every reason.
+#[test]
+fn lmcache_codes_map_to_exit_5() {
+    let mut codes: Vec<String> = capyctl_config::lmcache::LmcacheOffReason::ALL
+        .iter()
+        .map(|reason| format!("lmcache_unavailable:{}", reason.code()))
+        .collect();
+    codes.extend(
+        [
+            "retention_zero:lmcache",
+            "host_capability_missing:lmcache",
+            "host_capability_missing:retention",
+        ]
+        .map(str::to_owned),
+    );
+    for code in &codes {
+        for (carrier, message) in [
+            (
+                "invalid_config",
+                format!(
+                    "invalid_config: Invalid deployment configuration: unsupported combination \
+                     at `lmcache`: {code}: host `host-a` has `lmcache: off`"
+                ),
+            ),
+            (
+                "invalid_config",
+                format!(
+                    "invalid_config: Invalid deployment configuration: {code}: no allowed host \
+                     can run the deployment as declared (host host-a: {code})"
+                ),
+            ),
+            ("operation_failed", format!("Operation 01J failed: {code}")),
+            ("command_rejected", format!("{code}: refused")),
+        ] {
+            let error = StructuredError {
+                code: carrier,
+                message,
+            };
+            assert_eq!(error.exit_code(), ExitCode(5), "{carrier} {code}");
+            assert_eq!(error.closed_code(), code, "{carrier} {code}");
+            assert!(error.to_string().starts_with(&format!("error [{code}]")));
+        }
+    }
+    for code in [
+        "lmcache_unavailable:host_off",
+        "retention_zero:lmcache",
+        "host_capability_missing:lmcache",
+        "host_capability_missing:retention",
+    ] {
+        let direct = StructuredError {
+            code,
+            message: "refused".into(),
+        };
+        assert_eq!(direct.exit_code(), ExitCode(5), "{code}");
+    }
+    // A bare `lmcache_unavailable` names no reason and is not the code.
+    let bare = StructuredError {
+        code: "invalid_config",
+        message: "see lmcache_unavailable in the guide".into(),
+    };
+    assert_eq!(bare.exit_code(), ExitCode(2));
+}

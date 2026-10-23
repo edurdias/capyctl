@@ -48,6 +48,13 @@ pub struct RuntimeEndpoint {
     /// (`vllm`, `sglang`, `tensorfold`), or `None` when it is not recorded.
     /// Decides whether a request's prefix-cache partition can be honoured.
     pub engine: Option<String>,
+    /// ADR 0033 §5: the durable ID of the deployment this launch serves, read
+    /// from the launch's binding. With `revision` it namespaces a request's
+    /// `cache_salt` into the effective salt the engine receives.
+    pub deployment_id: String,
+    /// ADR 0033 §5: the revision this launch runs, read from its binding;
+    /// never the deployment's current revision, which may already be newer.
+    pub revision: u64,
     /// ADR 0032 §1–§3: this lane carries CapyCTL's request ID to the engine as
     /// SGLang's `rid` (through the host's ingress for a remote instance), and
     /// the authority can ask the engine to abort that `rid`

@@ -287,6 +287,19 @@ impl crate::Store {
             "DELETE FROM dispatch_closures WHERE deployment_id=?1",
             [deployment],
         )?;
+        // ADR 0033: fallbacks, measurements and owed relaunches of a deleted
+        // deployment are read by nothing; each launch's own row stays with
+        // its (released) binding as history.
+        for table in [
+            "lmcache_fallbacks",
+            "lmcache_measurements",
+            "lmcache_relaunches",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE deployment_id=?1"),
+                [deployment],
+            )?;
+        }
         tx.execute(
             "UPDATE deployments SET kind=?2,name=?3,route_model_id=NULL,desired_state='stopped',
                     admission_enabled=0,dispatch_enabled=0,

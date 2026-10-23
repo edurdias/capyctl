@@ -51,6 +51,10 @@ pub struct InventoryPublication {
     /// (as `gpu0`, the one entry such a host publishes); more than one device
     /// cannot be keyed by index, so none is.
     pub physical_gpu_uuids: BTreeMap<u32, String>,
+    /// ADR 0033 §7 (amendment A12): each device's product name as the boot
+    /// `nvidia-smi` sample reports it, keyed by the same driver index; empty
+    /// without a sample. The qualified LMCache parking table is keyed on it.
+    pub product_names: BTreeMap<u32, String>,
 }
 
 /// Run the collector from the verified `runtime_dir` with isolated Python
@@ -185,6 +189,7 @@ pub fn publication(raw: &str, sample: Option<&GpuSample>) -> Option<InventoryPub
         host_id: host_id.to_owned(),
         digest: digest.to_owned(),
         physical_gpu_uuids,
+        product_names: sample.map(product_names).unwrap_or_default(),
     })
 }
 
@@ -260,4 +265,27 @@ pub fn publish_host(document: &mut Value, inventory: Option<&InventoryPublicatio
             }
         }
     }
+    // ADR 0033 §7 (amendment A12): each device's product name, on its `gpuN`
+    // entry by driver index like the UUID; a stated name is never replaced.
+    for (index, name) in &inventory.product_names {
+        if let Some(device) = devices.get_mut(&format!("gpu{index}")) {
+            if device.is_object() && device["product_name"].is_null() {
+                device["product_name"] = Value::String(name.clone());
+            }
+        }
+    }
+}
+
+/// ADR 0033 §7 (amendment A12): each sampled device's product name as
+/// `nvidia-smi` reports it, keyed by its driver index; a name that is not a
+/// table key (`lmcache::table_key`) is left out.
+fn product_names(sample: &GpuSample) -> BTreeMap<u32, String> {
+    sample
+        .devices
+        .iter()
+        .filter_map(|device| {
+            capyctl_config::lmcache::table_key(&device.name)
+                .map(|name| (device.index, name.to_owned()))
+        })
+        .collect()
 }

@@ -18,6 +18,8 @@ pub mod kernel_builds;
 pub mod launch_failure;
 // ADR 0029: llama.cpp's `llama-server`.
 pub mod llamacpp;
+// ADR 0033: the LMCache server of a vLLM or SGLang launch.
+pub mod lmcache;
 // SPEC §9.1, §13.3 / T21 T37: the owner-only rule for capyctl's runtime helpers.
 pub mod owner_only;
 pub mod policy;

@@ -4,8 +4,10 @@ This page lists what CapyCTL keeps about the requests it serves, where it keeps
 it and for how long. CapyCTL never writes prompt or response bodies to its own
 database, journal or role logs. The one place request content can reach disk is
 the engine's own output, and only if the engine prints it; see
-[Engine logs](#engine-logs). The engines CapyCTL launches report nothing about
-their use off the host unless the host allows it; see
+[Engine logs](#engine-logs). Besides the engine's own GPU caches, the one place
+request-derived data outlives a request is the host RAM of a deployment's
+LMCache server; see [LMCache](#lmcache). The engines CapyCTL launches report
+nothing about their use off the host unless the host allows it; see
 [Nothing reported off the host](#nothing-reported-off-the-host).
 
 ## Summary
@@ -18,8 +20,9 @@ their use off the host unless the host allows it; see
 | Journal | Lifecycle commands and their evidence; no request bodies, engine log tails or probe text | Server, standalone and host databases | Never pruned | Cannot be turned off |
 | Latency and load figures | Per-request timings and engine load samples | Memory only | Until the role restarts | Nothing to turn off; never written to disk |
 | Role logs | What each role does; no request bodies | The role's log (journald under systemd) | Your log system's retention | Set by your log system |
-| Engine logs | The engine's own output, with credentials removed | A file per launch, or memory only | `files`: never deleted by CapyCTL. `memory`: 60 seconds after the engine exits | `engine_logs: memory` |
-| Engine caches | Prefix and KV cache of recent requests | GPU memory of the running engine | While the engine runs; discarded when it parks or stops | Partition with `cache_salt` |
+| Engine logs | The engine's own output, with credentials removed | A file per launch, or memory only | `files`: never deleted by CapyCTL. `memory`: 60 seconds after the engine exits | `engine_logs: memory` or `retention: zero` |
+| Engine caches | Prefix and KV cache of recent requests | GPU memory of the running engine | While the engine runs; discarded when it parks or stops | Partition with `cache_salt`; not covered by `retention: zero` |
+| LMCache | KV of recent request prefixes, keyed by a digest of the deployment, its revision and the request's salt | Host RAM of the instance's private loopback LMCache server | While the model runs or is parked; gone when it stops | `lmcache: off` on the deployment or the host, or `retention: zero` |
 | Wake canary references | A fixed probe prompt and the engine's answer to it | Server or standalone database | Replaced by the next launch of the same instance | Cannot be turned off |
 
 ## Request records
@@ -108,7 +111,8 @@ What each engine prints by default:
   options that log or save requests out of the manifest
   ([custom engines](../guide/engines.md#what-capyctl-cannot-promise)).
 
-If you need no request content on disk at all, use `engine_logs: memory`.
+If you need no request content on disk at all, use `engine_logs: memory`, or
+`retention: zero` ([Zero data retention](#zero-data-retention)).
 
 ## Engine caches
 
@@ -117,13 +121,81 @@ while they run, so a repeated prompt prefix is not recomputed. CapyCTL does not
 copy these caches anywhere. Parking discards the KV cache (vLLM sleep, SGLang
 memory release) and stopping discards everything; a parked vLLM engine keeps
 only its weights in host memory. CapyCTL also starts llama.cpp with its host
-RAM prompt cache off.
+RAM prompt cache off. Zero data retention does not turn these caches off: they
+are written nowhere and die with the engine process.
 
 To stop requests from different users sharing cached prefixes, send a
-`cache_salt` field with each request. CapyCTL forwards it unchanged to an
-engine that honours it (up to 1024 bytes) and refuses the request on an engine
-that would ignore it, rather than serve it from a shared cache. CapyCTL does
-not set a salt on its own.
+`cache_salt` field with each request. CapyCTL does not send the salt itself:
+it sends an engine that honours salts (vLLM, SGLang) a SHA-256 digest of the
+deployment, the revision serving the request and the salt (up to 1024 bytes),
+and the engine passes that digest on to LMCache. It refuses the request on an
+engine that would ignore the salt, rather than serve it from a shared cache. A
+request without a salt is sent without one and shares the cache with every
+other unsalted request to that deployment. CapyCTL does not set a salt on its
+own, and never logs or stores the digest. A salt partitions a cache; it
+authorizes nothing.
+
+## LMCache
+
+A deployment on vLLM 0.32.0 or newer or SGLang 0.5.22 or newer uses LMCache
+by default ([engines](../guide/engines.md#lmcache)): each instance gets its own
+LMCache server, a CapyCTL-owned process listening only on loopback, that keeps
+the KV cache of recent request prefixes in a pool of host RAM (4 GiB by
+default), so a model that parks and wakes, or restarts, answers a repeated
+prefix from that pool instead of recomputing it. Entries are keyed by the
+digest above, so different salts never share them.
+
+- **Where:** host RAM only. CapyCTL configures no disk, remote or peer tier,
+  so nothing LMCache holds reaches disk (the operating system may still page
+  any process out to swap).
+- **How long:** while the model runs or is parked. The server stops, and its
+  RAM is released, when the instance stops (an operator stop, an idle stop, a
+  switch, deletion) and with a new revision.
+- **Who can reach it:** any process on the machine can reach the server's
+  loopback ports, as it can reach a llama.cpp engine: it can read the
+  configuration, list cached keys, clear the cache and store or look up KV
+  under any salt. On a machine with untrusted local users, turn LMCache off.
+- **Logs:** the server's output goes to its own log beside the engine's, through
+  the same redacting writer and the same `engine_logs` mode. Its lookup-hash and
+  event logs stay off.
+- **Nothing leaves the host:** LMCache's own usage telemetry (which by default
+  reports to `stats.lmcache.ai` over plain HTTP) is turned off, in the server
+  and in the engine, whose connector loads LMCache: both start with
+  `LMCACHE_TRACK_USAGE=false`, whatever the host's `engine_telemetry` says,
+  and under its default `off` also with `DO_NOT_TRACK=1`.
+- **Turn it off:** `lmcache: off` on the deployment, `lmcache: off` on the host
+  (every deployment there), or `retention: zero`.
+
+## Zero data retention
+
+`retention: zero` on a host (`--set retention=zero` or
+`CAPYCTL_SET__RETENTION=zero`; standalone: `host.retention: zero` or
+`--set host.retention=zero`), or on a deployment for a host that does not set
+it:
+
+- keeps engine logs in memory (`engine_logs: memory`); a host document that
+  states `engine_logs: files` with `retention: zero` refuses the start, and
+  `--debug-engine-logs` is refused;
+- never starts LMCache: a deployment runs without it (reason `retention_zero`),
+  and `lmcache: required` is refused `retention_zero:lmcache`;
+- starts engine and LMCache processes with no core dumps (`RLIMIT_CORE` 0), so
+  a crash writes no dump of request data.
+
+Turning it on for a host stops the LMCache servers already running there: each
+instance using one is drained, stopped with its server, and started again
+without LMCache; a parked one is released like an idle stop. The servers held
+RAM only, so nothing is left on disk to purge.
+
+What zero retention does not cover:
+
+- the engine's own prefix and KV cache in GPU memory (above): kept for the life
+  of the engine process, written nowhere, partitioned by salt;
+- whatever a custom engine's manifest makes it write;
+- swap: the operating system may page any process's memory out; whether the
+  machine has swap is yours to decide.
+
+A host from before 0.1.7 cannot honour a deployment's `retention: zero`, so
+such a deployment is not placed there (`host_capability_missing:retention`).
 
 ## Wake canary references
 
@@ -149,4 +221,5 @@ and whether it honours it is up to the program.
 
 A deployment or an engine profile cannot change this. Only the host can, with
 `engine_telemetry: allow` ([settings](configuration.md#engine-usage-reporting)),
-which leaves each engine's own default.
+which leaves each engine's own default. LMCache, when it runs, reports nothing
+either way ([LMCache](#lmcache)).

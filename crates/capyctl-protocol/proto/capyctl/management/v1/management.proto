@@ -110,6 +110,30 @@ message ProfileRetirement {
 message ReportLoad {
   string host_id = 1;
   repeated LoadSample samples = 2;
+  // ADR 0033 §12 (additive): one sample per launch whose private LMCache
+  // server the host read, Ready or parked. Sent only to a server whose
+  // SessionReady lists `lmcache`; an older receiver ignores it.
+  repeated LmcacheSample lmcache = 3;
+}
+// ADR 0033 §12: the cache figures of one launch's LMCache server, read from
+// its loopback `/metrics`, and the server group's measured memory. Every
+// figure is optional: absent is unknown, never zero. Lookups and hits are
+// summed over every label set (model and salt); no label is carried.
+message LmcacheSample {
+  string deployment_id = 1;
+  int64 generation = 2;
+  string owned_handle = 3;
+  int64 sampled_at_unix_ms = 4;
+  bool scrape_ok = 5;                  // false: /metrics failed or timed out
+  optional uint64 used_bytes = 6;      // lmcache_mp_l1_memory_usage_bytes
+  optional uint32 usage_ppm = 7;       // lmcache_mp_l1_usage_ratio, 0..=1_000_000
+  optional uint64 inflight_bytes = 8;  // lmcache_mp_inflight_load_memory_usage_bytes
+  optional uint64 alloc_failures = 9;  // L1 allocation-failure counters, summed
+  optional uint64 lookups = 10;
+  optional uint64 hits = 11;
+  optional uint64 l2_bytes = 12;       // lmcache_mp_l2_usage_bytes; above zero is degraded
+  optional uint64 rss_bytes = 13;      // the server group's resident set (VmRSS)
+  optional uint64 device_bytes = 14;   // the server group's GPU memory (per process, any GPU)
 }
 message LoadSample {
   string deployment_id = 1;
@@ -283,6 +307,11 @@ message RuntimeProfileStatus {
   // Capabilities a launch-time probe found missing (engine_capabilities.py):
   // core | deep_park | metrics | observation. Empty until probed.
   repeated string capabilities_missing = 9;
+  // ADR 0033 §1 (additive): set while the profile's last launch-time check
+  // found its LMCache drifted from the registration `engine add` made: the
+  // `sha256:` digest it measured instead of the profile's `lmcache.digest`.
+  // Empty otherwise and from an older host.
+  string lmcache_observed_digest = 10;
 }
 message ReportOperationResult {
   string operation_id = 1;
@@ -454,6 +483,20 @@ message SingleLaunchPlan {
   // it, `startup_bytes` is the charge on the card (the device domain), so the
   // host re-checks both. Absent otherwise.
   optional int64 startup_host_bytes = 18;
+  // ADR 0033 §§3, 6, 7 (additive): the LMCache server the store planned for
+  // this launch: its two leased loopback ports and the charge it reserved.
+  // Absent when the store planned LMCache off. Sent only to a host that
+  // declared `lmcache`.
+  LmcacheGrant lmcache = 19;
+}
+// ADR 0033 §§3, 6: the ports and the charge of one launch's LMCache server.
+message LmcacheGrant {
+  uint32 rpc_port = 1;
+  uint32 http_port = 2;
+  int64 pool_bytes = 3;      // the L1 pool, a whole number of GiB
+  int64 overhead_bytes = 4;  // the server's footprint beyond its pool
+  int64 device_bytes = 5;    // the server's own GPU memory
+  int64 held_kv_bytes = 6;   // engine KV the server keeps mapped while restart-parked
 }
 // ADR 0028 §5 (amendment of 2026-10-07): how a checkpoint's weights split
 // across a group's ranks, read from its safetensors headers.
@@ -705,6 +748,21 @@ message MemberExecutionResult {
   // ADR 0030 §4 (additive): a completed decision probe only, the answer it
   // returned. Absent otherwise, which encodes exactly as before.
   DecisionProbeEvidence probe_decision = 20;
+  // ADR 0033 §§8, 9 (additive): LaunchSingle and Restore results only, what
+  // became of the launch's LMCache. Absent otherwise and from an older host.
+  LaunchLmcacheReport lmcache = 21;
+}
+// ADR 0033 §§3, 8, 9: `on` names the server's ports and pool; `off` names a
+// closed reason and its detail (at most 2048 bytes: the redacted engine log
+// tail for `engine_start_failed`, else the reason's sentence).
+message LaunchLmcacheReport {
+  string state = 1;          // on | off
+  string reason = 2;         // off only
+  string detail = 3;         // off only
+  uint32 rpc_port = 4;       // on only
+  uint32 http_port = 5;      // on only
+  int64 pool_bytes = 6;      // on only
+  bool connector_failed = 7; // off engine_start_failed only
 }
 message KernelBuildSpan {
   int64 from_unix_ms = 1;
@@ -753,12 +811,20 @@ message CheckpointDigestEvidence {
   // ADR 0029 §9: a llama.cpp deployment's GGUF facts; computed and mismatch
   // only. Empty from an older host, which reads no GGUF header.
   CheckpointGguf gguf = 12;
+  // ADR 0033 §7 (amendment A12, additive): the checkpoint's `config.json`
+  // `model_type` as the qualified LMCache parking table compares it
+  // (`lmcache::table_key`); computed, mismatch and sized only. Empty when
+  // unreadable, and from an older host.
+  string model_type = 13;
 }
 message ResidencyEvidence {
   string state = 1;                      // parked | restored | unchanged | unknown
   int64 mem_available_before_bytes = 2;  // -1 = not observed
   int64 mem_available_after_bytes = 3;   // -1 = not observed
   repeated string milestones = 4;        // bounded engine-generic step names
+  // ADR 0033 §7 (additive): a `restart_only` park stopped the engine and
+  // kept the launch's LMCache server; only the server's group is alive.
+  bool engine_stopped = 5;
 }
 
 // Private mTLS delivery only. Never write this message to command/result journals.

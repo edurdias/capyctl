@@ -214,6 +214,9 @@ pub struct SglangAdapter {
     /// readiness and the wake canary are proven (§§3, 4). Set by whoever
     /// resolved the deployment; `chat` unless set.
     api: capyctl_config::effective::DeploymentApi,
+    /// ADR 0033: the launch's LMCache server and report, shared with the
+    /// caller; `None` for a launch that never uses LMCache.
+    lmcache: Option<Arc<crate::lmcache::LmcacheState>>,
 }
 
 impl SglangAdapter {
@@ -235,7 +238,12 @@ impl SglangAdapter {
                 base.clone(),
                 metadata.served_name.clone(),
                 None,
-                true,
+                // ADR 0033 §5: the adapter's own requests are probes, which
+                // carry no salt, and it does not know the launch's deployment
+                // and revision; a salt reaching it is refused, never forwarded
+                // unchanged. Client requests go through the router's
+                // launch-specific forwarder.
+                crate::forward::CacheSalt::Refused,
             ),
             http: None,
             base,
@@ -261,6 +269,7 @@ impl SglangAdapter {
             cpu_weight_backup: frozen.settings().cpu_weight_backup,
             resident_weights: frozen.settings().weight_restore == "resident",
             api: capyctl_config::effective::DeploymentApi::Chat,
+            lmcache: None,
         })
     }
 
@@ -351,7 +360,8 @@ impl SglangAdapter {
             self.base.clone(),
             self.served_name.clone(),
             Some(inference.clone()),
-            true,
+            // ADR 0033 §5: refused here, as in the constructor.
+            crate::forward::CacheSalt::Refused,
         );
         self.inference_key = Some(inference);
         self.admin_key = Some(admin);
@@ -414,6 +424,89 @@ impl SglangAdapter {
     pub fn with_log(mut self, log: impl Into<String>) -> Self {
         self.log = Some(log.into());
         self
+    }
+
+    /// ADR 0033: the launch's LMCache server and report. Initialize starts
+    /// (or re-proves) the server first and connects the engine to it.
+    pub fn with_lmcache(mut self, state: Arc<crate::lmcache::LmcacheState>) -> Self {
+        self.lmcache = Some(state);
+        self
+    }
+
+    pub(super) fn lmcache(&self) -> Option<&Arc<crate::lmcache::LmcacheState>> {
+        self.lmcache.as_ref()
+    }
+
+    /// ADR 0033 §7: whether a Park or Restore of this launch is the
+    /// restart-park one: LMCache is on and the frozen launch never releases
+    /// its memory in place (no memory saver: its residency resolved
+    /// `restart_only`).
+    fn restart_park(&self) -> bool {
+        self.launch
+            .as_ref()
+            .is_some_and(|launch| !launch.settings().memory_saver)
+            && self.lmcache.as_ref().is_some_and(|state| state.is_on())
+    }
+
+    /// ADR 0033 §7: one restart-park step (Park stops the engine and keeps
+    /// the server; Restore starts the engine again on it), under the same
+    /// attempt fence as the persisted control path.
+    async fn restart_park_step(
+        &self,
+        command: &RuntimeCommand,
+    ) -> Result<EffectObservation, RuntimeError> {
+        let tools = self.tools.clone().ok_or(RuntimeError::Unsupported)?;
+        let c = &command.context;
+        let now = clock_ms()?;
+        if c.issued_at_ms < 0
+            || c.issued_at_ms > now
+            || c.deadline_ms <= now
+            || c.completion_target.is_some()
+            || c.launch_settings.is_some()
+            || c.token.revision < 1
+            || c.token.generation < 1
+            || [
+                &c.token.deployment_id,
+                &c.token.operation_id,
+                &c.token.step_id,
+            ]
+            .iter()
+            .any(|value| value.is_empty())
+        {
+            return Err(uncertain());
+        }
+        {
+            let mut attempts = self.attempts.lock().map_err(|_| uncertain())?;
+            if attempts.active
+                || attempts.uncertain
+                || attempts.steps.len() >= 4096
+                || !attempts.steps.insert(c.token.step_id.clone())
+            {
+                return Err(uncertain());
+            }
+            attempts.active = true;
+        }
+        let mut attempt = Attempt {
+            state: &self.attempts,
+            succeeded: false,
+        };
+        let budget = std::time::Duration::from_millis((c.deadline_ms - now) as u64);
+        let step = async {
+            match command.action {
+                RuntimeAction::Park => {
+                    crate::lmcache::park_engine(tools, command, self.rendezvous_dir()).await
+                }
+                RuntimeAction::Restore => {
+                    crate::sglang::initialize::restore_engine(self, command).await
+                }
+                _ => Err(RuntimeError::Unsupported),
+            }
+        };
+        let result = tokio::time::timeout(budget, step)
+            .await
+            .map_err(|_| uncertain())?;
+        attempt.succeeded = result.is_ok();
+        result
     }
 
     /// The engine's recipe pin, for the receipt an Initialize records. A builder
@@ -687,6 +780,12 @@ impl EngineAdapter for SglangAdapter {
         if command.action == RuntimeAction::Initialize {
             return crate::sglang::initialize::initialize(self, command).await;
         }
+        // ADR 0033 §7: a restart-parked launch parks by stopping its engine.
+        if matches!(command.action, RuntimeAction::Park | RuntimeAction::Restore)
+            && self.restart_park()
+        {
+            return self.restart_park_step(command).await;
+        }
         let cap = action_timeout(command.action)?;
         let c = &command.context;
         let now = clock_ms()?;
@@ -765,7 +864,17 @@ impl EngineAdapter for SglangAdapter {
             ))),
         }
     }
-    async fn prepare_park(&self, _member: &MemberRef) -> Result<Quiescence, AdapterError> {
+    async fn prepare_park(&self, member: &MemberRef) -> Result<Quiescence, AdapterError> {
+        // ADR 0033 §7 (found live): a restart-park stops the engine and has
+        // no memory saver to observe; its quiescence is the engine's own
+        // running and queued gauges, read now (the store armed the park only
+        // with nothing in flight at ingress). An unreadable gauge is not.
+        if self.restart_park() {
+            return Ok(Quiescence {
+                quiescent: self.engine_quiescent(member, 0).await,
+                unproven: None,
+            });
+        }
         // SPEC §10 step 4: only the observer can prove quiescence and a fully
         // mapped saver; without one (or without credentials) it is not.
         match (&self.observer, self.access()) {

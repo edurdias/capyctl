@@ -1005,6 +1005,20 @@ pub enum ProfileArgError {
          as the next argument"
     )]
     EqualsSpelling(String),
+    /// ADR 0033 §11: a `--kv-transfer-config` naming an LMCache connector.
+    #[error(
+        "option `{0}` names an LMCache connector; CapyCTL renders LMCache itself from the \
+         deployment's `lmcache` setting, so it cannot be passed (set `lmcache: off` to run \
+         without it)"
+    )]
+    Lmcache(String),
+    /// ADR 0033 §11: a `--kv-transfer-config` value that is not a JSON
+    /// object, so it cannot be shown not to name an LMCache connector.
+    #[error(
+        "option `{0}` is not a JSON object CapyCTL can read, so it cannot be shown not to \
+         name an LMCache connector (`lmcache`); pass a JSON object"
+    )]
+    LmcacheUnreadable(String),
 }
 
 /// Lowercase long-option name with `_` spelled `-`, without any `=value`.
@@ -1319,6 +1333,12 @@ pub fn validate_extra_args(
                 field: field.to_owned(),
             });
         }
+        // ADR 0033 §11: an LMCache connector is CapyCTL's, refused in every
+        // spelling whatever the host approves.
+        let kv_transfer = kv_transfer(context.engine, &option);
+        if kv_transfer == Some(KvTransfer::Lmcache) {
+            return Err(ProfileArgError::Lmcache(name));
+        }
         let base = candidate_names(&name).pop().unwrap_or_else(|| name.clone());
         if !seen.insert(base.clone()) || context.host_fixed.contains(&base) {
             return Err(ProfileArgError::Duplicate(name));
@@ -1360,6 +1380,11 @@ pub fn validate_extra_args(
                 return Err(ProfileArgError::Sensitive(name));
             }
             Some(Sensitivity::Code | Sensitivity::ListenerOrEgress | Sensitivity::Config) => {}
+        }
+        // ADR 0033 §11: an approved value that cannot be read cannot be
+        // shown not to name LMCache.
+        if kv_transfer == Some(KvTransfer::Unreadable) {
+            return Err(ProfileArgError::LmcacheUnreadable(name));
         }
     }
     Ok(())
@@ -1492,12 +1517,18 @@ pub fn validate_rendered_args(
     }
     let mut seen = BTreeSet::new();
     for option in parse_options(args)? {
-        let name = option.name;
+        let name = option.name.clone();
         if config_file_option(&name) {
             return Err(ProfileArgError::ConfigFile(name));
         }
         if reserved_option(engine, &name, sleep_mode) {
             return Err(ProfileArgError::Reserved(name));
+        }
+        // ADR 0033 §11: host-fixed arguments may not name LMCache either.
+        match kv_transfer(engine, &option) {
+            Some(KvTransfer::Lmcache) => return Err(ProfileArgError::Lmcache(name)),
+            Some(KvTransfer::Unreadable) => return Err(ProfileArgError::LmcacheUnreadable(name)),
+            _ => {}
         }
         let base = candidate_names(&name).pop().unwrap_or_else(|| name.clone());
         if !seen.insert(base) {
@@ -1505,6 +1536,126 @@ pub fn validate_rendered_args(
         }
     }
     Ok(())
+}
+
+/// ADR 0033 §11: vLLM's KV connector configuration, a JSON object. CapyCTL
+/// renders LMCache's here; another connector needs named approval.
+pub const KV_TRANSFER_CONFIG: &str = "--kv-transfer-config";
+
+/// What a `--kv-transfer-config` option says about LMCache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvTransfer {
+    /// It names an LMCache connector.
+    Lmcache,
+    /// It names another connector (or none).
+    Other,
+    /// Its value is not a JSON object, so it cannot be shown not to.
+    Unreadable,
+}
+
+/// The dotted sub-key path of a `--kv-transfer-config` spelling (`None` for
+/// the whole object), in any spelling the policy normalizes: exact, an
+/// abbreviation, `_` for `-`, `=value` or a separate value. `None` for any
+/// other option.
+fn kv_transfer_spelling(name: &str) -> Option<Option<&str>> {
+    let (base, subkey) = match name.split_once('.') {
+        Some((base, subkey)) => (base, Some(subkey)),
+        None => (name, None),
+    };
+    matches_name(base, KV_TRANSFER_CONFIG).then_some(subkey)
+}
+
+/// ADR 0033 §11: what a vLLM `--kv-transfer-config` option names; `None` for
+/// any other option or engine.
+fn kv_transfer(engine: Engine, option: &ParsedOption) -> Option<KvTransfer> {
+    if engine != Engine::Vllm {
+        return None;
+    }
+    let subkey = kv_transfer_spelling(&option.name)?;
+    let Some(value) = option.value.as_deref() else {
+        return Some(KvTransfer::Unreadable);
+    };
+    let parsed = serde_json::from_str::<serde_json::Value>(value).ok();
+    let config = match subkey {
+        // vLLM's dotted form sets one key of the object; its value is JSON
+        // when it parses as JSON, else the string.
+        Some(path) => path.rsplit('.').fold(
+            parsed.unwrap_or_else(|| serde_json::Value::String(value.to_owned())),
+            |inner, key| serde_json::json!({ key.replace('-', "_"): inner }),
+        ),
+        None => match parsed {
+            Some(object @ serde_json::Value::Object(_)) => object,
+            // Unreadable, and plainly naming LMCache: refused as LMCache.
+            _ if value.to_ascii_lowercase().contains("lmcache") => {
+                return Some(KvTransfer::Lmcache)
+            }
+            _ => return Some(KvTransfer::Unreadable),
+        },
+    };
+    Some(if names_lmcache(&config) {
+        KvTransfer::Lmcache
+    } else {
+        KvTransfer::Other
+    })
+}
+
+/// Whether a KV transfer configuration names an LMCache connector anywhere
+/// in it: a `kv_connector` naming LMCache (`LMCacheConnectorV1`,
+/// `LMCacheMPConnector`), a `kv_connector_module_path` with a module under
+/// `lmcache`, or either nested inside another object or list (a
+/// `MultiConnector`'s `kv_connector_extra_config.connectors`).
+fn names_lmcache(config: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match config {
+        Value::Object(fields) => fields.iter().any(|(key, field)| {
+            let key = key.replace('-', "_").to_ascii_lowercase();
+            let text = field.as_str().map(str::to_ascii_lowercase);
+            let named = match (key.as_str(), text.as_deref()) {
+                ("kv_connector", Some(connector)) => connector.contains("lmcache"),
+                ("kv_connector_module_path", Some(module)) => module
+                    .split('.')
+                    .any(|segment| segment.starts_with("lmcache")),
+                _ => false,
+            };
+            named || names_lmcache(field)
+        }),
+        Value::Array(items) => items.iter().any(names_lmcache),
+        _ => false,
+    }
+}
+
+/// ADR 0033 §11: whether `args` (a profile's host-fixed arguments and a
+/// deployment's `extra_args`, already validated) set vLLM's
+/// `--kv-transfer-config` in any spelling. Validation refuses an LMCache
+/// connector there, so a set one is another connector, and the deployment
+/// runs without LMCache (`kv_transfer_config_set`).
+pub fn kv_transfer_config_set(engine: Engine, args: &[String]) -> bool {
+    engine == Engine::Vllm
+        && parse_options(args).is_ok_and(|options| {
+            options
+                .iter()
+                .any(|option| kv_transfer_spelling(&option.name).is_some())
+        })
+}
+
+/// SGLang's `--disable-radix-cache`.
+pub const DISABLE_RADIX_CACHE: &str = "--disable-radix-cache";
+
+/// ADR 0033 amendment of 2026-10-22 (LC7): whether `args` (a profile's
+/// host-fixed arguments and a deployment's `extra_args`) set SGLang's
+/// `--disable-radix-cache` in any spelling. SGLang 0.5.22 builds the plain
+/// radix cache when it is set, before its LMCache branch
+/// (`mem_cache/registry.py`, `default_radix_cache_factory`), and the
+/// scheduler's idle check then fails on it with LMCache on
+/// (`managers/scheduler.py`, `is_fully_idle`), so such a launch runs without
+/// LMCache (`engine_unsupported`).
+pub fn radix_cache_disabled(engine: Engine, args: &[String]) -> bool {
+    engine == Engine::Sglang
+        && parse_options(args).is_ok_and(|options| {
+            options
+                .iter()
+                .any(|option| matches_name(&option.name, DISABLE_RADIX_CACHE))
+        })
 }
 
 /// ADR 0028 §2.1: the profile half of engine environment resolution. The
@@ -1593,13 +1744,22 @@ pub struct FlagRow {
     /// The approval kind of a sensitive row.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval: Option<&'static str>,
+    /// A value this row is about (ADR 0033 §11: `--kv-transfer-config`
+    /// naming an LMCache connector reads owned, another value reads as the
+    /// option's next row). Absent: the row holds for every value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<&'static str>,
     pub reason: String,
 }
 
-/// Adds `row` unless an earlier row names the same option: rows are added in
-/// the order the checks apply, so the first class is the one a check gives.
+/// Adds `row` unless an earlier row names the same option (and value): rows
+/// are added in the order the checks apply, so the first class is the one a
+/// check gives.
 fn add_row(rows: &mut Vec<FlagRow>, row: FlagRow) {
-    if !rows.iter().any(|existing| existing.name == row.name) {
+    if !rows
+        .iter()
+        .any(|existing| existing.name == row.name && existing.value == row.value)
+    {
         rows.push(row);
     }
 }
@@ -1610,8 +1770,23 @@ fn row(name: &str, name_match: NameMatch, class: FlagClass, reason: String) -> F
         name_match,
         class,
         approval: None,
+        value: None,
         reason,
     }
+}
+
+/// ADR 0033 §11: why an owned option is CapyCTL's when LMCache renders it
+/// (SGLang's `--enable-lmcache` and every `--lmcache-*` option).
+const LMCACHE_OWNED: &str = "CapyCTL renders LMCache from the deployment's `lmcache` setting";
+
+/// ADR 0033 §4: the connector configuration CapyCTL renders for vLLM, the
+/// value the table's owned `--kv-transfer-config` row is about.
+const LMCACHE_CONNECTOR_EXAMPLE: &str = "{\"kv_connector\":\"LMCacheMPConnector\",\
+    \"kv_connector_module_path\":\"lmcache.integration.vllm.lmcache_mp_connector\",\
+    \"kv_role\":\"kv_both\"}";
+
+fn lmcache_option(name: &str) -> bool {
+    name == "--enable-lmcache" || name.starts_with("--lmcache-")
 }
 
 /// ADR 0014 §3, §6, §8, ADR 0021: every option the policy names for
@@ -1656,13 +1831,18 @@ pub fn flag_table(engine: Engine) -> Vec<FlagRow> {
         );
     }
     for family in reserved_families(engine) {
+        let reason = if lmcache_option(family) {
+            LMCACHE_OWNED
+        } else {
+            "CapyCTL owns every option in this family"
+        };
         add_row(
             &mut rows,
             row(
                 family,
                 NameMatch::Prefix,
                 FlagClass::Owned,
-                "CapyCTL owns every option in this family".to_owned(),
+                reason.to_owned(),
             ),
         );
     }
@@ -1671,11 +1851,32 @@ pub fn flag_table(engine: Engine) -> Vec<FlagRow> {
             (Engine::Llamacpp, Some(field)) => {
                 format!("CapyCTL renders it from the typed field `{field}`")
             }
+            _ if lmcache_option(&name) => LMCACHE_OWNED.to_owned(),
             _ => "CapyCTL renders or closes it".to_owned(),
         };
         add_row(
             &mut rows,
             row(&name, NameMatch::Name, FlagClass::Owned, reason),
+        );
+    }
+    // ADR 0033 §11: vLLM's connector option reads owned with an LMCache
+    // connector; with another one it is the sensitive row below.
+    if engine == Engine::Vllm {
+        add_row(
+            &mut rows,
+            FlagRow {
+                value: Some(LMCACHE_CONNECTOR_EXAMPLE),
+                ..row(
+                    KV_TRANSFER_CONFIG,
+                    NameMatch::Name,
+                    FlagClass::Owned,
+                    "with a value naming an LMCache connector (LMCacheConnectorV1, \
+                     LMCacheMPConnector, a kv_connector_module_path under `lmcache.`, or \
+                     either inside a MultiConnector), in any spelling: CapyCTL renders \
+                     LMCache from the deployment's `lmcache` setting"
+                        .to_owned(),
+                )
+            },
         );
     }
     for (name, field) in typed_options(engine) {

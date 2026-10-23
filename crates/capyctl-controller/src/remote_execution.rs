@@ -47,17 +47,40 @@ pub struct RemoteLaunchBinding {
     /// needs the host's `custom_engines`; a host without it is refused typed
     /// before anything is sent.
     pub custom_engine: bool,
+    /// ADR 0033 §13: the deployment states `lmcache: required`. Every
+    /// command of it then needs the host's `lmcache`; a host without it is
+    /// refused typed before anything is sent.
+    pub lmcache_required: bool,
+    /// ADR 0033 §§10, 13: the deployment states `retention: zero`. Every
+    /// command of it then needs the host's `retention`; a host without it
+    /// would not honour it, and is refused typed before anything is sent.
+    pub retention_zero: bool,
     /// ADR 0013 §5: the instance every command of this launch names, so the
     /// host fences it by that instance's own generation. Zero on a host that
     /// does not advertise per-instance fencing: its journal fences per
     /// deployment, and a nonzero index would not survive its digest check.
     pub instance_index: u32,
 }
+impl RemoteLaunchBinding {
+    /// ADR 0033 §13: the capabilities the deployment's declared `lmcache`
+    /// and `retention` need of the host.
+    fn lmcache_needs(&self, needs: &mut Vec<&'static str>) {
+        if self.lmcache_required {
+            needs.push(capabilities::LMCACHE);
+        }
+        if self.retention_zero {
+            needs.push(capabilities::RETENTION);
+        }
+    }
+}
 struct RemoteEngine {
     sessions: Arc<AgentSessions>,
     owner: SharedCoordinatorState,
     binding: Arc<RemoteLaunchBinding>,
     readiness: ReadinessLedger,
+    /// ADR 0033 (lifecycle design §10): what the host reported about the
+    /// launch's LMCache, shared with the coordinator's driver of the launch.
+    lmcache: Arc<capyctl_adapters::lmcache::LmcacheState>,
 }
 /// The caller resolves this frozen plan from the selected enrolled host's
 /// approved configuration. This is construction only, never permission to send.
@@ -68,13 +91,15 @@ pub fn binding(
     readiness: ReadinessLedger,
 ) -> ExecutionBinding {
     let binding = Arc::new(binding);
+    let lmcache = Arc::new(capyctl_adapters::lmcache::LmcacheState::default());
     let engine = Arc::new(RemoteEngine {
         sessions: sessions.clone(),
         owner,
         binding: binding.clone(),
         readiness,
+        lmcache: lmcache.clone(),
     });
-    remote_binding(engine, sessions, binding)
+    remote_binding(engine, sessions, binding).with_lmcache(lmcache)
 }
 
 /// The engine half of [`binding`] alone: the adapter the coordinator drives
@@ -91,6 +116,7 @@ pub fn engine(
         owner,
         binding: Arc::new(binding),
         readiness,
+        lmcache: Arc::default(),
     })
 }
 
@@ -127,35 +153,42 @@ struct OwnershipObserver {
     binding: String,
 }
 impl RemoteEvidenceObserver for OwnershipObserver {
+    /// Spec §3: the host's evidence names a leader the store does not hold
+    /// yet; it is recorded before anything else is believed of the launch.
+    /// ADR 0033 §3: the LMCache server's leader is recorded the same way,
+    /// so a failed or uncertain launch's settlement proves it gone too.
     fn retain(
         &self,
         command: &MemberCommand,
         result: &pb::MemberExecutionResult,
     ) -> Result<(), Box<tonic::Status>> {
-        let Some(api) = result.processes.iter().find(|p| p.role == "api") else {
+        let leaders: Vec<_> = ["api", capyctl_domain::completion::LMCACHE_ROLE]
+            .into_iter()
+            .filter_map(|role| result.processes.iter().find(|p| p.role == role))
+            .collect();
+        if leaders.is_empty() {
             return Ok(());
-        };
+        }
         let owner = self
             .owner
             .lock()
             .map_err(|_| tonic::Status::internal("ownership unavailable"))?;
-        owner
-            .store()
-            .record_api_identity(
-                owner.session(),
-                &capyctl_store::lifecycle::DeploymentFence {
-                    deployment_id: command.identity.deployment_id.clone(),
-                    revision: command.identity.revision,
-                    generation: command.identity.generation,
-                },
-                &self.binding,
-                &process(api),
-            )
-            .map_err(|_| {
-                Box::new(tonic::Status::internal(
-                    "remote ownership could not be retained",
-                ))
-            })
+        let fence = capyctl_store::lifecycle::DeploymentFence {
+            deployment_id: command.identity.deployment_id.clone(),
+            revision: command.identity.revision,
+            generation: command.identity.generation,
+        };
+        for leader in leaders {
+            owner
+                .store()
+                .record_launch_identity(owner.session(), &fence, &self.binding, &process(leader))
+                .map_err(|_| {
+                    Box::new(tonic::Status::internal(
+                        "remote ownership could not be retained",
+                    ))
+                })?;
+        }
+        Ok(())
     }
 }
 impl RemoteEngine {
@@ -314,6 +347,7 @@ impl RemoteEngine {
         if b.custom_engine {
             needs.push(capabilities::CUSTOM_ENGINES);
         }
+        b.lmcache_needs(&mut needs);
         self.sessions
             .preflight(&b.host_id, &needs, true)
             .map_err(RuntimeError::Refused)?;
@@ -396,22 +430,45 @@ impl RemoteEngine {
 /// the engine the controller recorded (every engine process and no other; a
 /// helper may be gone, ADR 0027). `unchanged` is a refusal
 /// without effect; every other result is uncertain.
-fn residency_evidence(
+///
+/// ADR 0033 §7 (lifecycle design §4.1): a `restart_only` park stops the
+/// engine and keeps the launch's LMCache server, so its evidence names the
+/// recorded server's group alone (`engine_stopped`), and the restore of such
+/// a launch (which records the server alone) names a new engine beside that
+/// same server. The store judges both again before it records them.
+pub(crate) fn residency_evidence(
     park: bool,
     recorded: &[ProcessIdentity],
     result: &pb::MemberExecutionResult,
 ) -> Result<(Vec<ProcessIdentity>, Vec<Milestone>), RuntimeError> {
+    use capyctl_domain::completion::{same_engine, same_lmcache};
     let alive: Vec<_> = result
         .processes
         .iter()
         .filter(|p| p.presence == "alive")
         .map(process)
         .collect();
+    let restart_park = if park {
+        result.residency.as_ref().is_some_and(|r| r.engine_stopped)
+    } else {
+        !recorded.iter().any(ProcessIdentity::is_engine)
+    };
     // ADR 0027: every engine process the controller recorded and no other;
     // a helper of the group may have exited.
     let held = result.state == "completed"
         && result.claim_retained
-        && capyctl_domain::completion::same_engine(recorded, &alive);
+        && if restart_park {
+            // A park leaves the server alone; a restore names a new engine
+            // (its `api`) beside it.
+            same_lmcache(recorded, &alive)
+                && if park {
+                    alive.iter().all(ProcessIdentity::is_lmcache)
+                } else {
+                    alive.iter().any(|p| p.role == "api")
+                }
+        } else {
+            same_engine(recorded, &alive)
+        };
     let facts = match result.residency.as_ref().map(|r| r.state.as_str()) {
         Some("parked") if park && held && !result.model_usable => vec![Milestone::MemoryReleased],
         Some("restored") if !park && held && result.model_usable => vec![
@@ -499,6 +556,9 @@ impl EngineAdapter for RemoteEngine {
         if b.custom_engine {
             needs.push(capabilities::CUSTOM_ENGINES);
         }
+        // ADR 0033 §13: `lmcache: required` and `retention: zero` go only to
+        // a host that declared what honours them.
+        b.lmcache_needs(&mut needs);
         self.sessions
             .preflight(&b.host_id, &needs, true)
             .map_err(RuntimeError::Refused)?;
@@ -571,6 +631,12 @@ impl EngineAdapter for RemoteEngine {
             .execute_on_session(command, Some(observer))
             .await
             .map_err(|status| unresolved(&status, "remote initialize remains unresolved"))?;
+        // ADR 0033 (lifecycle design §10): what became of the launch's
+        // LMCache, Ready or failed, for the coordinator's record before Ready
+        // and its fallback, exactly as an embedded launch reports it.
+        if let Some(report) = lmcache_report(&result) {
+            self.lmcache.record(report);
+        }
         launch_evidence(&result)?;
         // SPEC §13.2 (G2): this readiness belongs to the host session that
         // proved it; a later session must re-prove it before dispatch.
@@ -1015,6 +1081,38 @@ fn launch_evidence(result: &pb::MemberExecutionResult) -> Result<(), RuntimeErro
     ))
 }
 
+/// ADR 0033 (lifecycle design §10): a LaunchSingle result's LMCache report
+/// as the coordinator reads it for an embedded launch. `On` names the
+/// server's group among the result's alive processes. The result was
+/// validated, so a report that does not convert was never there.
+pub(crate) fn lmcache_report(
+    result: &pb::MemberExecutionResult,
+) -> Option<capyctl_adapters::lmcache::LmcacheReport> {
+    use capyctl_adapters::lmcache::LmcacheReport;
+    use capyctl_protocol::execution::{LaunchLmcache, LaunchLmcacheState};
+    let report = LaunchLmcache::try_from(result.lmcache.as_ref()?).ok()?;
+    Some(match report.state {
+        LaunchLmcacheState::On => LmcacheReport::On {
+            server: capyctl_domain::completion::lmcache_members(
+                &result
+                    .processes
+                    .iter()
+                    .filter(|p| p.presence == "alive")
+                    .map(process)
+                    .collect::<Vec<_>>(),
+            ),
+            rpc_port: report.rpc_port,
+            http_port: report.http_port,
+            pool_bytes: report.pool_bytes,
+        },
+        LaunchLmcacheState::Off => LmcacheReport::Off {
+            reason: report.reason?,
+            detail: report.detail,
+            connector_failed: report.connector_failed,
+        },
+    })
+}
+
 /// ADR 0014 amendment A12: the kernel builds a usable launch's host saw, in
 /// the host's clock (the clock its memory samples carry). The result was
 /// validated, so every span is ordered and there are at most 64.
@@ -1273,6 +1371,19 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
             // host RAM's apart, so the host charges each where it belongs.
             startup_bytes: Some(startup_bytes),
             startup_host_bytes,
+            // ADR 0033 §§3, 6 (lifecycle design §10): the store's LMCache
+            // grant, its ports and the charge it reserved, which the host lays
+            // over the same footprint. Absent when the store planned it off.
+            lmcache: work.lmcache().and_then(|plan| plan.grant()).map(|grant| {
+                capyctl_protocol::execution::LmcacheGrant {
+                    rpc_port: grant.rpc_port,
+                    http_port: grant.http_port,
+                    pool_bytes: grant.pool_bytes,
+                    overhead_bytes: grant.overhead_bytes,
+                    device_bytes: grant.device_bytes,
+                    held_kv_bytes: grant.held_kv_bytes,
+                }
+            }),
             checkpoint_digest,
             deployment_config: local.to_string(),
             profile_name,
@@ -1325,6 +1436,12 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
                 // that declared it.
                 custom_engine: work.effective().profile.engine
                     == capyctl_config::engine_policy::Engine::Custom,
+                // ADR 0033 §13: `lmcache: required` and `retention: zero`
+                // go only to a host that declared what honours them.
+                lmcache_required: work.effective().lmcache
+                    == capyctl_config::lmcache::LmcacheMode::Required,
+                retention_zero: work.effective().retention
+                    == capyctl_config::lmcache::Retention::Zero,
             },
             self.readiness.clone(),
         ))
@@ -1539,12 +1656,15 @@ mod tests {
                 checkpoint_gguf: None,
                 startup_bytes: None,
                 startup_host_bytes: None,
+                lmcache: None,
             },
             ingress_gate_key: [7; 32],
             instance_index: 0,
             device_memory: false,
             decisions: false,
             custom_engine: false,
+            lmcache_required: false,
+            retention_zero: false,
         }
     }
     fn observed(role: &str, pid: u32, presence: &str) -> pb::OwnedProcessObservation {
@@ -1885,5 +2005,214 @@ mod tests {
             .record_host_version(&host, &declared(capabilities::agent_capabilities()))
             .unwrap();
         assert_eq!(recorded_for(&sessions, &remote, &identities), identities);
+    }
+
+    /// ADR 0033 (lifecycle design §10): a launch result's LMCache report
+    /// reaches the coordinator as an embedded launch reports it. `On` names
+    /// the server's group among the result's alive processes (never the
+    /// engine's, never one gone) with the host's ports and pool; `Off` its
+    /// closed reason, detail and whether the engine failed with the
+    /// connector. A report that does not convert (an unknown reason, a
+    /// malformed `on`, `connector_failed` beside another reason) is none.
+    // T45 T30
+    #[test]
+    fn a_launch_results_lmcache_report_names_the_alive_server_group() {
+        use capyctl_adapters::lmcache::LmcacheReport;
+        use capyctl_config::lmcache::{LmcacheOffReason, GIB};
+        use capyctl_protocol::execution::LaunchLmcache;
+        let gib = GIB as i64;
+        let mut ready = result(vec![
+            observed("api", 10, "alive"),
+            observed("worker-0", 11, "alive"),
+            observed("lmcache", 60, "alive"),
+            observed("lmcache-1", 61, "alive"),
+            observed("lmcache-2", 62, "gone"),
+        ]);
+        assert_eq!(lmcache_report(&ready), None);
+        ready.lmcache = Some(LaunchLmcache::on(8150, 8151, 2 * gib).to_wire());
+        assert_eq!(
+            lmcache_report(&ready),
+            Some(LmcacheReport::On {
+                server: vec![
+                    process(&observed("lmcache", 60, "alive")),
+                    process(&observed("lmcache-1", 61, "alive")),
+                ],
+                rpc_port: 8150,
+                http_port: 8151,
+                pool_bytes: 2 * gib,
+            })
+        );
+        let mut failed = result(vec![observed("api", 10, "gone")]);
+        failed.lmcache = Some(
+            LaunchLmcache::off(
+                LmcacheOffReason::EngineStartFailed,
+                "RuntimeError: connector handshake failed",
+                true,
+            )
+            .to_wire(),
+        );
+        assert_eq!(
+            lmcache_report(&failed),
+            Some(LmcacheReport::Off {
+                reason: LmcacheOffReason::EngineStartFailed,
+                detail: "RuntimeError: connector handshake failed".into(),
+                connector_failed: true,
+            })
+        );
+        let mut off = failed.clone();
+        off.lmcache = Some(
+            LaunchLmcache::off(LmcacheOffReason::ServerStartFailed, "no /status", false).to_wire(),
+        );
+        assert_eq!(
+            lmcache_report(&off),
+            Some(LmcacheReport::Off {
+                reason: LmcacheOffReason::ServerStartFailed,
+                detail: "no /status".into(),
+                connector_failed: false,
+            })
+        );
+        type Edit = fn(&mut pb::LaunchLmcacheReport);
+        let malformed: &[(&pb::MemberExecutionResult, Edit)] = &[
+            (&off, |r| r.reason = "lmcache_bored".into()),
+            (&off, |r| r.connector_failed = true),
+            (&off, |r| r.rpc_port = 8150),
+            (&off, |r| r.detail = "a\u{1b}[2J".into()),
+            (&off, |r| r.state = "maybe".into()),
+            (&ready, |r| r.http_port = r.rpc_port),
+            (&ready, |r| r.rpc_port = 0),
+            (&ready, |r| r.rpc_port = 70_000),
+            (&ready, |r| r.pool_bytes = 3 << 29),
+            (&ready, |r| r.reason = "host_off".into()),
+        ];
+        for (base, edit) in malformed {
+            let mut r = (*base).clone();
+            edit(r.lmcache.as_mut().unwrap());
+            assert_eq!(lmcache_report(&r), None, "{:?}", r.lmcache);
+        }
+    }
+
+    fn residency(
+        state: &str,
+        engine_stopped: bool,
+        usable: bool,
+        processes: Vec<pb::OwnedProcessObservation>,
+    ) -> pb::MemberExecutionResult {
+        let mut r = result(processes);
+        r.claim_retained = true;
+        r.model_usable = usable;
+        r.residency = Some(pb::ResidencyEvidence {
+            state: state.into(),
+            engine_stopped,
+            ..Default::default()
+        });
+        r
+    }
+
+    /// ADR 0033 §7 (lifecycle design §4.1): a `restart_only` park stops the
+    /// engine and keeps the LMCache server, so the host's `engine_stopped`
+    /// evidence proves it only when what is alive is the recorded server
+    /// alone: an engine process still alive or another server stays
+    /// uncertain, and so does such evidence for a launch that recorded no
+    /// server. A9: the server is its leader, so a member of its group that
+    /// exited (a short-lived child, found live on SGLang) does not.
+    // T45 T16 T34
+    #[test]
+    fn a_restart_park_is_proven_by_the_recorded_server_alone() {
+        let recorded: Vec<_> = [
+            ("api", 10),
+            ("worker-0", 11),
+            ("lmcache", 60),
+            ("lmcache-1", 61),
+        ]
+        .into_iter()
+        .map(|(role, pid)| process(&observed(role, pid, "alive")))
+        .collect();
+        let parked = |api: &str, server: u32, helper: &str| {
+            residency(
+                "parked",
+                true,
+                false,
+                vec![
+                    observed("api", 10, api),
+                    observed("worker-0", 11, "gone"),
+                    observed("lmcache", server, "alive"),
+                    observed("lmcache-1", 61, helper),
+                ],
+            )
+        };
+        let (alive, facts) =
+            residency_evidence(true, &recorded, &parked("gone", 60, "alive")).unwrap();
+        assert_eq!(alive, recorded[2..].to_vec());
+        assert_eq!(facts, [Milestone::MemoryReleased]);
+        let (alive, _) = residency_evidence(true, &recorded, &parked("gone", 60, "gone")).unwrap();
+        assert_eq!(alive, recorded[2..3].to_vec(), "a server member exited");
+        for uncertain in [parked("alive", 60, "alive"), parked("gone", 99, "alive")] {
+            assert!(
+                matches!(
+                    residency_evidence(true, &recorded, &uncertain),
+                    Err(RuntimeError::Uncertain(_))
+                ),
+                "{uncertain:?}"
+            );
+        }
+        // Without `engine_stopped` the park is judged as an ordinary one: the
+        // engine stopped is not the engine held.
+        let mut ordinary = parked("gone", 60, "alive");
+        ordinary.residency.as_mut().unwrap().engine_stopped = false;
+        assert!(matches!(
+            residency_evidence(true, &recorded, &ordinary),
+            Err(RuntimeError::Uncertain(_))
+        ));
+        // A launch that recorded no server is never restart-parked.
+        assert!(matches!(
+            residency_evidence(true, &recorded[..2], &parked("gone", 60, "alive")),
+            Err(RuntimeError::Uncertain(_))
+        ));
+    }
+
+    /// ADR 0033 §7 (lifecycle design §4.3): the restore of a restart-parked
+    /// launch (which records its server alone) is proven by a new engine
+    /// beside that same server group; another server, or the server with no
+    /// engine, stays uncertain however usable the host calls it.
+    // T45 T10 T34
+    #[test]
+    fn a_restart_park_restore_is_a_new_engine_beside_the_same_server() {
+        let recorded = vec![
+            process(&observed("lmcache", 60, "alive")),
+            process(&observed("lmcache-1", 61, "alive")),
+        ];
+        let restored = |server: u32, engine: bool| {
+            let mut processes = vec![
+                observed("lmcache", server, "alive"),
+                observed("lmcache-1", 61, "alive"),
+            ];
+            if engine {
+                processes.extend([
+                    observed("api", 70, "alive"),
+                    observed("worker-0", 71, "alive"),
+                ]);
+            }
+            residency("restored", false, true, processes)
+        };
+        let (alive, facts) = residency_evidence(false, &recorded, &restored(60, true)).unwrap();
+        assert_eq!(alive.len(), 4);
+        assert!(alive.contains(&process(&observed("api", 70, "alive"))));
+        assert_eq!(facts.last(), Some(&Milestone::ModelUsable));
+        for uncertain in [restored(99, true), restored(60, false)] {
+            assert!(
+                matches!(
+                    residency_evidence(false, &recorded, &uncertain),
+                    Err(RuntimeError::Uncertain(_))
+                ),
+                "{uncertain:?}"
+            );
+        }
+        // Not usable: the restore proves nothing.
+        let mut unusable = restored(60, true);
+        unusable.model_usable = false;
+        assert!(matches!(
+            residency_evidence(false, &recorded, &unusable),
+            Err(RuntimeError::Uncertain(_))
+        ));
     }
 }

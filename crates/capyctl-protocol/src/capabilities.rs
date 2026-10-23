@@ -113,6 +113,25 @@ pub const CUSTOM_ENGINES: &str = capyctl_config::custom::CAPABILITY;
 /// `host_capability_missing:startup_host_bytes` for such a launch before
 /// anything is sent; every other launch needs nothing.
 pub const STARTUP_HOST_BYTES: &str = "startup_host_bytes";
+/// ADR 0033 §13: the host runs LMCache (ADR 0033): it renders the connector,
+/// owns the private server per instance and reads the `lmcache` setting of
+/// its own document and of a deployment's. The server places a deployment
+/// with `lmcache: required` only on a host that declared it; any other host
+/// is refused `host_capability_missing:lmcache` before anything is sent. An
+/// `auto` deployment on such a host runs without LMCache, as before. It also
+/// covers a LaunchSingle plan's `lmcache` grant (sent only to such a host),
+/// and from the host `MemberExecutionResult.lmcache`,
+/// `ResidencyEvidence.engine_stopped` and `ReportLoad.lmcache`. The last is
+/// sent only to a server whose SessionReady lists it ([`server_capabilities`]),
+/// since an older server would refuse a report left with no load sample.
+pub const LMCACHE: &str = capyctl_config::lmcache::CAPABILITY;
+/// ADR 0033 §§10, 13: the host honours zero data retention (memory engine
+/// logs, no core dumps, no LMCache), its own `retention` setting and a
+/// deployment's. The server places a deployment with `retention: zero` only
+/// on a host that declared it; any other host is refused
+/// `host_capability_missing:retention` before anything is sent, since it
+/// would not honour it.
+pub const RETENTION: &str = capyctl_config::lmcache::RETENTION_CAPABILITY;
 /// ADR 0032 §2, §3: the host's ingress sets CapyCTL's request ID as SGLang's
 /// `rid` on a capable launch, and the host runs the AbortRequest action (an
 /// abort posted to a retained launch's engine on loopback). The server sends
@@ -128,8 +147,9 @@ pub const MAX_RETIREMENT_DEPLOYMENTS: usize = 256;
 pub const MAX_REASON: usize = 512;
 
 /// ADR 0018: what this server advertises in `SessionReady.capabilities`.
+/// ADR 0033 §12: `lmcache`, so a host sends its LMCache samples.
 pub fn server_capabilities() -> Vec<String> {
-    vec![LIVE_PROFILE_UPDATE.to_owned()]
+    vec![LIVE_PROFILE_UPDATE.to_owned(), LMCACHE.to_owned()]
 }
 
 /// Which way a feature's messages flow.
@@ -167,6 +187,8 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (DECISIONS, Direction::ServerToHost),
     (CUSTOM_ENGINES, Direction::ServerToHost),
     (STARTUP_HOST_BYTES, Direction::ServerToHost),
+    (LMCACHE, Direction::ServerToHost),
+    (RETENTION, Direction::ServerToHost),
     (REQUEST_ABORT, Direction::ServerToHost),
 ];
 
@@ -246,6 +268,11 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
             if plan.checkpoint_gguf.is_some() {
                 needs.push(CHECKPOINT_GGUF);
             }
+            // ADR 0033 §§3, 6: an older host would drop the grant.
+            if plan.lmcache.is_some() {
+                needs.push(LMCACHE);
+            }
+            lmcache_needs(&plan.deployment_config, &mut needs);
         }
         // ADR 0028 §14: a group plan carries fields an older host would drop.
         Some(Action::Prepare(_) | Action::Launch(_)) => needs.push(ENGINE_GROUPS),
@@ -285,15 +312,42 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
     }
     // ADR 0014 amendment A20: a group member's own launch carries the tables
     // as a single launch does.
-    if command
-        .group_member_launch
-        .as_ref()
-        .is_some_and(|plan| plan.checkpoint_tables.is_some())
-    {
-        needs.push(CHECKPOINT_TABLES);
+    if let Some(plan) = command.group_member_launch.as_ref() {
+        if plan.checkpoint_tables.is_some() {
+            needs.push(CHECKPOINT_TABLES);
+        }
+        if plan.lmcache.is_some() {
+            needs.push(LMCACHE);
+        }
+        lmcache_needs(&plan.deployment_config, &mut needs);
     }
     needs.sort_by_key(|need| CATALOGUE.iter().position(|(name, _)| name == need));
+    // ADR 0033: a grant and `lmcache: required` both name `lmcache`.
+    needs.dedup();
     needs
+}
+
+/// ADR 0033 §13: what a launch's deployment document needs of the host: a
+/// deployment with `lmcache: required` needs `lmcache`, one with
+/// `retention: zero` needs `retention`. An older host would not honour
+/// either. A document that does not parse needs nothing here; the host
+/// refuses it on its own.
+fn lmcache_needs(deployment_config: &str, needs: &mut Vec<&'static str>) {
+    use capyctl_config::lmcache::{deployment_settings, LmcacheMode, Retention};
+    // Only a document that names either setting is parsed.
+    if !deployment_config.contains("lmcache") && !deployment_config.contains("retention") {
+        return;
+    }
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(deployment_config) else {
+        return;
+    };
+    let (mode, retention) = deployment_settings(&document);
+    if mode == LmcacheMode::Required {
+        needs.push(LMCACHE);
+    }
+    if retention == Retention::Zero {
+        needs.push(RETENTION);
+    }
 }
 
 /// ADR 0017: the actions a drain-only host may still be sent. They stop,
@@ -353,6 +407,25 @@ pub fn decisions_refusal(host_capabilities: &BTreeSet<String>) -> Option<String>
 /// may be placed. A decisions custom engine needs [`decisions_refusal`] too.
 pub fn custom_engines_refusal(host_capabilities: &BTreeSet<String>) -> Option<String> {
     (!host_capabilities.contains(CUSTOM_ENGINES)).then(|| missing(CUSTOM_ENGINES))
+}
+
+/// ADR 0033 §§9, 10, 13: the typed refusal for placing a deployment with
+/// these declared settings on a host with these settings and capabilities,
+/// or `None` when it may be placed ([`capyctl_config::lmcache::placement_refusal`]).
+pub fn lmcache_refusal(
+    host_capabilities: &BTreeSet<String>,
+    mode: capyctl_config::lmcache::LmcacheMode,
+    retention: capyctl_config::lmcache::Retention,
+    host_lmcache: capyctl_config::lmcache::HostLmcache,
+    host_retention: capyctl_config::lmcache::Retention,
+) -> Option<&'static str> {
+    capyctl_config::lmcache::placement_refusal(
+        mode,
+        retention,
+        host_lmcache,
+        host_retention,
+        |name| host_capabilities.contains(name),
+    )
 }
 
 /// ADR 0017: why `command` may not be sent to a host with this policy state

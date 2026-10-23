@@ -446,6 +446,8 @@ a run with `--set` or `CAPYCTL_SET__…` (next section), and restart the role.
 | Load report period | host: `load_report_interval` |
 | Activation policy: `on_demand` (default), or `explicit`, under which every deployment that may run on the host starts, stops, parks and wakes only on an operator's action | host: `lifecycle.activation` (standalone: `host.lifecycle.activation`) |
 | Engine logs: `files` (default), or `memory`, which keeps each launch's redacted engine output in memory only ([below](#engine-logs)) | host: `engine_logs` (standalone: `host.engine_logs`) |
+| LMCache: `auto` (default), or `off`, which keeps LMCache off for every deployment on the machine ([below](#lmcache-and-zero-retention)) | host: `lmcache` (standalone: `host.lmcache`) |
+| Retention: `standard` (default), or `zero`: engine logs in memory, no core dumps, no LMCache ([below](#lmcache-and-zero-retention)) | host: `retention` (standalone: `host.retention`) |
 | Engines' own usage reporting: `off` (default), or `allow`, which leaves each engine's own default ([below](#engine-usage-reporting)) | host: `engine_telemetry` (standalone: `host.engine_telemetry`) |
 
 `lifecycle.activation` follows the server's lifecycle settings: the document,
@@ -484,6 +486,49 @@ because raw log files would defeat it. Redaction removes credentials, not
 prompts or outputs; see [data retention](data-retention.md) for everything
 CapyCTL keeps.
 
+### LMCache and zero retention
+
+`lmcache` decides whether deployments on the machine may use LMCache, a
+private KV cache server per model instance in host RAM
+([LMCache](../guide/engines.md#lmcache)):
+
+- `auto` (the default): every deployment that can use it does, unless it
+  says `lmcache: off`.
+- `off`: no deployment on the machine uses it (status shows "LMCache off:
+  turned off on this host", reason `host_off`), and a deployment with
+  `lmcache: required` is refused there, `lmcache_unavailable:host_off`. A
+  role that starts with `off` and finds LMCache servers it started before
+  drains each instance using one, stops it with its server and starts it
+  again without LMCache; a parked one is released like an idle stop.
+
+`retention` is `standard` (the default) or `zero`
+([zero data retention](data-retention.md#zero-data-retention)). With `zero`
+the machine keeps engine logs in memory as `engine_logs: memory` does (a
+document that also states `engine_logs: files` refuses the start, and
+`--debug-engine-logs` is refused), starts engine and LMCache processes with
+no core dumps, and never starts LMCache (`lmcache: required` is refused
+`retention_zero:lmcache`); servers already running are stopped as for
+`lmcache: off`.
+
+Set them in the document, with `--set lmcache=off` or `--set retention=zero`
+on `capyctl start host` (`--set host.lmcache=off`, `--set host.retention=zero`
+on `capyctl start standalone`), or with `CAPYCTL_SET__LMCACHE=off` and
+`CAPYCTL_SET__RETENTION=zero` (`CAPYCTL_SET__HOST__LMCACHE`,
+`CAPYCTL_SET__HOST__RETENTION` for standalone). Any other value refuses the
+start. A host publishes both with its document, so placement refuses a
+`required` deployment there before anything is sent; a change takes a restart.
+After the restart every start on the machine, the instances started again
+after their servers were stopped included, follows the settings the role now
+runs under, whatever they were when a deployment was made, and `capyctl
+engine list` shows LMCache off with the reason under them.
+
+Apart from these settings, decision deployments (`api: decisions`) on SGLang,
+and SGLang deployments that state `--disable-radix-cache`, run without
+LMCache (`engine_unsupported`;
+[sgl-project/sglang#45929](https://github.com/sgl-project/sglang/issues/45929)),
+and `lmcache: required` is refused for them
+([LMCache](../guide/engines.md#lmcache)).
+
 ### Engine usage reporting
 
 `engine_telemetry` says whether the engines a host starts may report their own
@@ -497,7 +542,8 @@ use off the machine. By default they do not.
   their own use; `DO_NOT_TRACK=1` turns off the Hugging Face Hub library's
   telemetry in the Python engines, and a custom engine may honour it.
 - `allow` sets none of them, so each engine keeps its own default (vLLM then
-  reports as above).
+  reports as above). LMCache, when it runs, still starts with its own
+  reporting off (`LMCACHE_TRACK_USAGE=false`) in the server and the engine.
 
 Neither a profile nor a deployment can set these names
 (`engine_env_reserved:<name>`). TensorFold's release check, which asks GitHub

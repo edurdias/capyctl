@@ -132,11 +132,18 @@ fn engine_environment(
     // ADR 0028 §2.1: the resolved engine env's names join the fixed list.
     // ADR 0028 §10: a group member also keeps exactly the group names
     // `render_command` rendered (none exist for a single rank, T39).
+    // ADR 0033 §3 (A7): a launch with the LMCache connector keeps the
+    // telemetry switches `render_command` rendered for it.
     env.retain(|name, _| {
         ENGINE_ENV_ALLOWLIST.contains(&name.as_str())
             || plan.build_env.contains_key(name)
             || (plan.group.is_some()
                 && GROUP_ENV.contains(&name.as_str())
+                && rendered.contains_key(name))
+            || (plan.kv_transfer_config.is_some()
+                && crate::lmcache::NO_USAGE_TRACKING
+                    .iter()
+                    .any(|(tracking, _)| tracking == name)
                 && rendered.contains_key(name))
     });
     env
@@ -149,7 +156,7 @@ pub(super) async fn initialize(
     let context = &command.context;
     // Unsupported when any part is missing: a builder without its plan, its tools
     // or its key cannot launch anything, and must not half-run the step.
-    let (mut plan, tools, key) = adapter.launch_parts()?;
+    let (plan, tools, key) = adapter.launch_parts()?;
     if !matches!(
         context.launch_settings,
         Some(capyctl_domain::launch::LaunchSettings::Vllm(_))
@@ -160,6 +167,62 @@ pub(super) async fn initialize(
     // One launch per incarnation: a repeat would start a second engine holding the
     // same device memory while the first is still recorded as owned.
     adapter.claim_incarnation(&context.binding_id, &context.incarnation)?;
+    launch(adapter, command, plan, tools, key, Spawn::Launch).await
+}
+
+/// ADR 0033 §7: the Restore of a restart-parked launch: the Initialize body
+/// again, on the launch's running server (`LmcacheLaunch::Attached`), its
+/// engine spawned once for this wake step. The adapter's one-launch claim is
+/// not taken again: the wake key (`"{incarnation}#wake-{step}"`) is the
+/// once-only guard, one per step.
+pub(super) async fn restore_engine(
+    adapter: &VllmAdapter,
+    command: &RuntimeCommand,
+) -> Result<EffectObservation, RuntimeError> {
+    let (plan, tools, key) = adapter.launch_parts()?;
+    crate::lmcache::restore_server(command)?;
+    if !matches!(
+        plan.lmcache.as_ref().and_then(|state| state.launch()),
+        Some(crate::lmcache::LmcacheLaunch::Attached { .. })
+    ) {
+        return Err(RuntimeError::Unsupported);
+    }
+    launch(adapter, command, plan, tools, key, Spawn::Wake).await
+}
+
+/// How the engine of this step is spawned.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Spawn {
+    /// The launch's engine (`spawn_durable`).
+    Launch,
+    /// ADR 0033 §7: a restart-parked launch's engine again, for this wake step.
+    Wake,
+}
+
+async fn launch(
+    adapter: &VllmAdapter,
+    command: &RuntimeCommand,
+    mut plan: crate::vllm::args::PlanInputVllm,
+    tools: std::sync::Arc<dyn crate::traits::OwnedProcessLaunch>,
+    key: String,
+    spawn: Spawn,
+) -> Result<EffectObservation, RuntimeError> {
+    let context = &command.context;
+    // ADR 0033 §3 "Order": the server first, proven up and on loopback, then
+    // the engine with the connector. Under `required` a server that did not
+    // start ends the step here, before any engine exists.
+    let connector = crate::lmcache::connect(
+        plan.lmcache.as_ref(),
+        &tools,
+        &context.incarnation,
+        &context.binding_id,
+    )
+    .await?;
+    // ADR 0033 §4: the owned connector, rendered after the pass-through
+    // validation (which refuses an LMCache connector there).
+    plan.kv_transfer_config = connector
+        .as_ref()
+        .map(|connector| crate::lmcache::vllm_kv_transfer_config(connector.rpc_port()));
 
     // Spec §3: the key rides the environment, never argv.
     plan.api_key = None;
@@ -193,10 +256,20 @@ pub(super) async fn initialize(
     // The tool is synchronous on purpose (capyctl-launchers has no runtime), so every
     // call into it leaves the async threads free.
     let incarnation = context.incarnation.clone();
+    let wake = context.token.step_id.clone();
     let spawn_tools = tools.clone();
-    let api = tokio::task::spawn_blocking(move || spawn_tools.spawn_durable(&incarnation, &cmd))
-        .await
-        .map_err(|_| RuntimeError::Uncertain("spawn task failed".into()))??;
+    let api = tokio::task::spawn_blocking(move || match spawn {
+        Spawn::Launch => spawn_tools.spawn_durable(&incarnation, &cmd),
+        Spawn::Wake => spawn_tools.spawn_durable_wake(&incarnation, &wake, &cmd, None),
+    })
+    .await
+    .map_err(|_| RuntimeError::Uncertain("spawn task failed".into()))??;
+    // ADR 0033 §8: from here a failure before Ready is the engine's start
+    // with the connector failing; ownership errors are not.
+    let log = plan.engine_log.clone();
+    let failed = |error: RuntimeError| {
+        crate::lmcache::engine_failed(connector.as_ref(), log.as_deref(), error)
+    };
     // ADR 0014 amendment A12: note any kernel build until the step ends.
     let builds = crate::kernel_builds::BuildWatch::start(tools.clone(), api.clone());
 
@@ -258,10 +331,10 @@ pub(super) async fn initialize(
             // launch failure with its own reason, not ownership uncertainty.
             Presence::Gone => {
                 let tail = crate::launch_failure::log_tail(plan.engine_log.as_deref());
-                return Err(RuntimeError::LaunchFailed(format!(
+                return Err(failed(RuntimeError::LaunchFailed(format!(
                     "{}; log tail:\n{tail}",
                     crate::launch_failure::summary(&tail, None)
-                )));
+                ))));
             }
             // Unknown is retained, never absent: the step fails but says why.
             Presence::Unknown => {
@@ -270,10 +343,17 @@ pub(super) async fn initialize(
                 ))
             }
         }
+        // ADR 0033 §3: a server that exits while its engine is still starting
+        // is an engine start failure with the connector.
+        if let Some(connector) = &connector {
+            if connector.server_gone(&tools).await {
+                return Err(failed(connector.server_exited(plan.engine_log.as_deref())));
+            }
+        }
         if now_ms()? >= stop_at {
-            return Err(RuntimeError::Uncertain(
+            return Err(failed(RuntimeError::Uncertain(
                 "readiness deadline reached with the engine alive".into(),
-            ));
+            )));
         }
         tokio::time::sleep(READINESS_POLL).await;
     }
@@ -301,7 +381,9 @@ pub(super) async fn initialize(
         )
         .await
         .map_err(|_| {
-            RuntimeError::Uncertain("probe deadline reached with the engine alive".into())
+            failed(RuntimeError::Uncertain(
+                "probe deadline reached with the engine alive".into(),
+            ))
         })?
         .map_err(|e| {
             RuntimeError::Uncertain(redact_text(&format!(
@@ -318,7 +400,9 @@ pub(super) async fn initialize(
         let answer = crate::forward::startup_probe(adapter, &body, probe_budget)
             .await
             .ok_or_else(|| {
-                RuntimeError::Uncertain("probe deadline reached with the engine alive".into())
+                failed(RuntimeError::Uncertain(
+                    "probe deadline reached with the engine alive".into(),
+                ))
             })?
             .map_err(|e| {
                 RuntimeError::Uncertain(redact_text(&format!(
@@ -340,12 +424,18 @@ pub(super) async fn initialize(
     // A group without its API process, or without a single worker, is not the
     // deployment this step was asked to build; reporting it would record an
     // ownership set that does not cover the processes holding the device.
+    // ADR 0033 §3: the engine's own group alone is counted here.
     if identities.first().map(|i| i.role.as_str()) != Some("api") || identities.len() < 2 {
         return Err(RuntimeError::Uncertain(format!(
             "engine group incomplete: {}",
             roles(&identities)
         )));
     }
+    // ADR 0033 §3: the launch owns both groups; LMCache is on.
+    let identities = match &connector {
+        Some(connector) => connector.ready(identities),
+        None => identities,
+    };
 
     Ok(EffectObservation {
         token: context.token.clone(),
@@ -355,9 +445,14 @@ pub(super) async fn initialize(
         observed_at_ms: now_ms()?,
         // The receipt carries provenance, never a credential.
         receipt: format!(
-            "vllm {} ready on {}; probe answered",
+            "vllm {} ready on {}; probe answered{}",
             adapter.fingerprint(),
-            adapter.endpoint()
+            adapter.endpoint(),
+            if connector.is_some() {
+                "; LMCache on"
+            } else {
+                ""
+            }
         ),
         facts: vec![
             Milestone::AllocationsRestored,
@@ -501,6 +596,45 @@ mod tests {
         assert!(!env
             .keys()
             .any(|k| k.starts_with("NCCL_") || k.starts_with("GLOO_") || k.starts_with("MASTER_")));
+    }
+
+    // T45 T21 (ADR 0033 §3, A7; found live; owner decision 2026-10-22): an
+    // engine with the LMCache connector imports LMCache, so it spawns with
+    // `LMCACHE_TRACK_USAGE=false` under either `engine_telemetry` setting;
+    // `DO_NOT_TRACK` follows the setting alone, so under `allow` vLLM keeps
+    // its own default. Without the connector CapyCTL renders no LMCache name.
+    #[test]
+    fn an_engine_with_the_connector_spawns_with_lmcache_telemetry_off() {
+        use crate::engine_telemetry::EngineTelemetry;
+        let mut plan = input(None);
+        let spawn = |plan: &PlanInputVllm, telemetry: EngineTelemetry| {
+            engine_environment(
+                &render_command(plan).unwrap().env,
+                plan,
+                "engine-key",
+                None,
+                &|_| None,
+                &BTreeMap::new(),
+                telemetry,
+            )
+        };
+        for telemetry in [EngineTelemetry::Off, EngineTelemetry::Allow] {
+            assert!(!spawn(&plan, telemetry).contains_key("LMCACHE_TRACK_USAGE"));
+        }
+        plan.kv_transfer_config = Some(crate::lmcache::vllm_kv_transfer_config(25001));
+        let env = spawn(&plan, EngineTelemetry::Off);
+        assert_eq!(
+            (
+                env["DO_NOT_TRACK"].as_str(),
+                env["LMCACHE_TRACK_USAGE"].as_str()
+            ),
+            ("1", "false")
+        );
+        let env = spawn(&plan, EngineTelemetry::Allow);
+        assert_eq!(env["LMCACHE_TRACK_USAGE"], "false");
+        for (name, _) in crate::engine_telemetry::VLLM {
+            assert!(!env.contains_key(*name), "{name}");
+        }
     }
 
     // T21 (owner decision 2026-10-22): under `engine_telemetry: off` every

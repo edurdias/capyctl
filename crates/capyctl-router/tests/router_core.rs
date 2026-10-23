@@ -382,6 +382,8 @@ impl StubAuthority {
                 engine_key: None,
                 incarnation: generation.to_string(),
                 engine: Some("vllm".into()),
+                deployment_id: deployment.into(),
+                revision: 1,
                 request_abort: false,
             }),
             leases: Mutex::new(Vec::new()),
@@ -422,6 +424,8 @@ impl StubAuthority {
                 engine_key: None,
                 incarnation: "1".into(),
                 engine: Some("sglang".into()),
+                deployment_id: "dep-1".into(),
+                revision: 1,
                 request_abort,
             }),
             leases: Mutex::new(Vec::new()),
@@ -824,6 +828,8 @@ async fn the_router_forwards_to_the_deployments_live_endpoint_with_its_key() {
             engine_key: Some("k3y".into()),
             incarnation: "1".into(),
             engine: Some("vllm".into()),
+            deployment_id: "dep-1".into(),
+            revision: 1,
             request_abort: false,
         }),
         leases: Mutex::new(Vec::new()),
@@ -906,8 +912,19 @@ fn stub_router(endpoint: &str) -> (Arc<StubAuthority>, RouterDeps) {
 
 /// As [`stub_router`], with the engine family the launch's revision froze.
 fn stub_router_on(endpoint: &str, engine: Option<&str>) -> (Arc<StubAuthority>, RouterDeps) {
+    stub_router_serving(endpoint, engine, "dep-1", 1)
+}
+
+/// As [`stub_router_on`], serving `deployment` from a launch that runs
+/// `revision` (ADR 0033 §5: the namespace of the effective salt).
+fn stub_router_serving(
+    endpoint: &str,
+    engine: Option<&str>,
+    deployment: &str,
+    revision: u64,
+) -> (Arc<StubAuthority>, RouterDeps) {
     let authority = Arc::new(StubAuthority {
-        deployment: "dep-1".into(),
+        deployment: deployment.into(),
         route: "public-alias".into(),
         runtime: Mutex::new(capyctl_controller::RuntimeEndpoint {
             endpoint: endpoint.into(),
@@ -915,6 +932,8 @@ fn stub_router_on(endpoint: &str, engine: Option<&str>) -> (Arc<StubAuthority>, 
             engine_key: None,
             incarnation: "1".into(),
             engine: engine.map(str::to_owned),
+            deployment_id: deployment.into(),
+            revision,
             request_abort: false,
         }),
         leases: Mutex::new(Vec::new()),
@@ -2139,33 +2158,76 @@ async fn recording_engine() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
     (base, seen)
 }
 
-// SPEC §10 (`cache_salt`): a request's prefix-cache partition reaches vLLM and
-// SGLang byte for byte, streaming and not.
+// T45 T37 (ADR 0033 §5, SPEC §10): vLLM and SGLang receive, in place of the
+// caller's `cache_salt`, the effective salt of the serving launch's deployment
+// ID, the revision it runs and the caller's salt, streaming and not. Equal
+// inputs share it; another deployment, revision or salt never does.
 #[tokio::test]
-async fn cache_salt_reaches_vllm_and_sglang_unchanged() {
-    let salt = "tenant-a/\u{fc}/0001";
+async fn cache_salt_reaches_vllm_and_sglang_as_the_effective_salt() {
+    use capyctl_adapters::forward::effective_cache_salt;
+    let salts = ["tenant-a/\u{fc}/0001", "tenant-b"];
+    let mut distinct = std::collections::HashSet::new();
+    for engine in ["vllm", "sglang"] {
+        for (deployment, revision) in [("dep-1", 3), ("dep-2", 3), ("dep-1", 4)] {
+            let (endpoint, seen) = recording_engine().await;
+            let (authority, deps) =
+                stub_router_serving(&endpoint, Some(engine), deployment, revision);
+            let router = capyctl_router::serve_router(deps);
+            for salt in salts {
+                for stream in [false, true] {
+                    let body = chat_body(
+                        "public-alias",
+                        serde_json::json!({"cache_salt": salt, "stream": stream}),
+                    );
+                    let (status, answer) = post_raw(&router, body, None).await;
+                    assert_eq!(status, 200, "{engine} stream={stream}: {answer}");
+                }
+            }
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 4, "{engine} {deployment} {revision}");
+            for (body, salt) in seen.iter().zip(salts.iter().flat_map(|s| [s, s])) {
+                let expected = effective_cache_salt(deployment, revision, salt);
+                assert_eq!(body["cache_salt"], expected.as_str(), "{engine}: {body}");
+                assert_ne!(body["cache_salt"], *salt, "{engine}: {body}");
+                if (deployment, revision, *salt) == ("dep-1", 3, "tenant-a/\u{fc}/0001") {
+                    assert_eq!(
+                        expected,
+                        "18d1486516c53f38bd0e5e4b5760aefb4633a2f3b31183ffd69c70457382c645"
+                    );
+                }
+            }
+            for salt in salts {
+                distinct.insert(effective_cache_salt(deployment, revision, salt));
+            }
+            assert_eq!(
+                ends(&authority),
+                vec![Some(capyctl_controller::LeaseEnd::Completed); 4],
+                "{engine}"
+            );
+        }
+    }
+    // Three launches times two salts, the same for both engine families.
+    assert_eq!(distinct.len(), 6);
+}
+
+// T45 T37 (ADR 0033 §5): no salt stays no salt; a request without
+// `cache_salt` reaches vLLM and SGLang without the field, streaming and not.
+#[tokio::test]
+async fn a_request_without_cache_salt_reaches_the_engine_without_one() {
     for engine in ["vllm", "sglang"] {
         let (endpoint, seen) = recording_engine().await;
-        let (authority, deps) = stub_router_on(&endpoint, Some(engine));
+        let (_authority, deps) = stub_router_serving(&endpoint, Some(engine), "dep-1", 3);
         let router = capyctl_router::serve_router(deps);
         for stream in [false, true] {
-            let body = chat_body(
-                "public-alias",
-                serde_json::json!({"cache_salt": salt, "stream": stream}),
-            );
+            let body = chat_body("public-alias", serde_json::json!({"stream": stream}));
             let (status, answer) = post_raw(&router, body, None).await;
             assert_eq!(status, 200, "{engine} stream={stream}: {answer}");
         }
         let seen = seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 2, "{engine}");
         for body in &seen {
-            assert_eq!(body["cache_salt"], salt, "{engine}: {body}");
+            assert!(body.get("cache_salt").is_none(), "{engine}: {body}");
         }
-        assert_eq!(
-            ends(&authority),
-            vec![Some(capyctl_controller::LeaseEnd::Completed); 2],
-            "{engine}"
-        );
     }
 }
 

@@ -1,9 +1,13 @@
 # ADR 0033 — LMCache: a private KV cache server per deployment instance
 
 **Status:** Accepted (owner decisions 2026-10-21: the design, and the owner's answers to
-the ten open questions of the first draft, recorded below). Target release 0.1.7.
-Nothing is implemented yet; the SPEC, guide and operations texts this ADR lists change
-with the implementation (§15), as for ADRs 0030 and 0031.
+the ten open questions of the first draft, recorded below). Implemented for 0.1.7
+(2026-10-22), with the amendments of the implementation at the end of this record (A1–A13):
+the measured defaults of §6, the server's command line and log, the SGLang salt check
+(LMCache issue 4825), the charge of the engine KV a server keeps while its engine is
+stopped and after the wake until a reading shows it released (A13), `restart_only`
+decision deployments parking with LMCache, and decision deployments on SGLang running
+without LMCache until LC7 passes on a release (A10).
 **Amends (with the implementation):** `SPEC.md` §7.4 (a private cache service per
 instance), §8.2 (the rendered connector is owned), §9.1 and §9.2 (LMCache beside a
 parking residency only where qualified), §10 (`cache_salt` is no longer forwarded
@@ -154,6 +158,7 @@ start with the connector (§8) are the live checks, and the LC rows the qualific
 | llama.cpp | no | `engine_unsupported`: "llama.cpp has no LMCache integration" |
 | TensorFold | no | `engine_unsupported`: "TensorFold has no LMCache integration" |
 | custom engine | no | `engine_unsupported`: "CapyCTL does not render options for a custom engine" |
+| SGLang, a decision deployment or `--disable-radix-cache` (A10) | no | `engine_unsupported`: "decision deployments on SGLang run without LMCache: …" or "SGLang with --disable-radix-cache runs without LMCache: …" |
 
 vLLM 0.32.0 and SGLang 0.5.22 are the qualified versions (the LC rows); a newer one is
 used on its launch-time check and is not qualified until a live row runs on it. The
@@ -164,9 +169,10 @@ list` say "LMCache off" with the reason (§9).
 **Every model gets LMCache by default**, hybrid layouts included (Mamba or gated-delta-net
 state, linear or sliding-window attention): models are qualified as they are run, and a
 model whose engine fails to start with the connector falls back as §8 says. **Decision
-deployments** (`api: decisions`, ADR 0030) use it like chat deployments wherever their
-engine serves decisions and supports LMCache: SGLang 0.5.22 or newer (vLLM is refused for
-decisions, ADR 0030 §6 amendment of 2026-10-21); a decision request
+deployments** (`api: decisions`, ADR 0030) were to use it like chat deployments wherever
+their engine serves decisions and supports LMCache: SGLang 0.5.22 or newer (vLLM is
+refused for decisions, ADR 0030 §6 amendment of 2026-10-21). Amended 2026-10-22 (A10):
+on SGLang they run without LMCache until LC7 passes on a release. A decision request
 carries no salt, so decisions share the deployment's unsalted partition. The one layout
 without LMCache in 0.1.7 is a deployment with a `topology` (`group_unsupported`: one
 private server on one machine cannot serve the ranks of a group across machines, ADR
@@ -689,7 +695,7 @@ engine:
 | LC4 | Park and wake per engine: `restart_only` with LMCache (the server stays up and charged while parked; the first request after the wake hits from LMCache with the same answer); a `deep` deployment on a combination outside the table runs deep with LMCache off and the reason shown; then `deep` with LMCache for the combination under test, on a build whose table lists it: park, wake, a hit with the same answer as without the cache. A pass adds the combination to the released table; a failure leaves it out. |
 | LC5 | Zero retention: a host with `retention: zero` refuses `lmcache: required` (`retention_zero:lmcache`), runs an `auto` deployment with LMCache off (`retention_zero`), writes no engine log file, and its engine shows `Max core file size 0` in `/proc/<pid>/limits`; turning it on with a server running stops that server (verified exit) and relaunches its instance without LMCache. |
 | LC6 | Missing package: a deployment on the approved environment without LMCache (`~/sglang-0.5.22-venv` as registered) runs with LMCache off (`not_installed`) in status, `engine list` and an `lmcache_off` event; `lmcache: required` on it is refused. |
-| LC7 | Decisions: a decision deployment (Clef-Flash) on SGLang 0.5.22 starts with LMCache on; the same state asked twice, the second time after the engine's own cache no longer holds it, hits from LMCache and gives the same pick with probabilities within ADR 0030's 0.05; it parks `restart_only` and the first decision after the wake hits. (vLLM is refused for decisions, ADR 0030 §6.) |
+| LC7 | Decisions (amended 2026-10-22, A10): a decision deployment (Clef-Flash) on SGLang 0.5.22 starts with LMCache off (`engine_unsupported`, the upstream issue in the detail) and serves; `lmcache: required` on it is refused before anything starts (`lmcache_unavailable:engine_unsupported`). The row as first written (LMCache on, the same state asked twice hitting from LMCache with the same pick within ADR 0030's 0.05, a `restart_only` park whose first decision after the wake hits) runs again on the first SGLang release with the upstream fix, and a pass lifts A10 for that release. (vLLM is refused for decisions, ADR 0030 §6.) |
 | LC8 | Relaunch without LMCache: the LMCache server of a starting instance is killed (SIGKILL to its owned PID) before the engine is ready; the engine is stopped with a verified exit and relaunched once without LMCache, which serves; the warning, the `lmcache_off` event (`engine_start_failed`) and status show it, and the next start of that revision goes without LMCache. With `lmcache: required` the same launch fails `lmcache_unavailable:engine_start_failed` and nothing is left running. |
 | LC9 | Server exit while serving: the server of a ready instance is killed; the instance fails, its engine is stopped with a verified exit, and recovery relaunches the engine and a new server (`lmcache_server_exited`). |
 | LC10 | Host off: a host with `lmcache: off` runs an `auto` deployment with LMCache off (`host_off`) in status and `engine list`; restarting a role with a server running into `lmcache: off` stops that server (verified exit) and relaunches its instance without LMCache. |
@@ -748,7 +754,8 @@ The answers to the first draft's ten open questions:
    answer 2 (§2).
 6. **Decision deployments:** on where supported, like chat, with a qualification row
    (§2, LC7). Amended 2026-10-21: SGLang only, since vLLM stays refused for decisions
-   (ADR 0030 §6 amendment of 2026-10-21).
+   (ADR 0030 §6 amendment of 2026-10-21). Amended 2026-10-22 (owner decision, A10): off
+   on SGLang too until LC7 passes on a release.
 7. **LMCache versions:** any 0.5.x release from 0.5.6 is used when CapyCTL's launch-time
    check passes (§1).
 8. **SGLang after 0.5.22:** LMCache is used when the launch-time check passes (§§1–2).
@@ -757,3 +764,230 @@ The answers to the first draft's ten open questions:
 10. **Host switch:** a host setting `lmcache: auto|off`; `off` turns LMCache off for every
     deployment on that machine, and `lmcache: required` is refused there with a code
     (§9).
+
+## Amendments with the implementation (2026-10-22)
+
+Facts found while implementing and measuring, within the owner's decisions above.
+
+**A1. The measured defaults (§6).** Live row LC1 on host A (GB10; LMCache 0.5.6, Qwen3-4B
+chat on vLLM 0.32.0 and SGLang 0.5.22, pools of 4 and 8 GiB, five engine runs and twenty
+bare server starts) measured: the server's resident memory beyond its pool at most
+824.3 MiB (781–824 MiB across runs, about the same at 8 GiB); its per-process GPU memory
+at most 408 MiB while its engine ran (170 MiB alone); the slowest start to `GET /status`
+4.80 s (2.90–4.80 s). The defaults are therefore: overhead allowance 1280 MiB (824.3 MiB
+plus 25 %, rounded up to 256 MiB), device allowance 512 MiB (408 MiB plus 25 %), start
+bound 30 s (4.80 s × 3 = 14.4 s, rounded up to 20 s, raised to the 30 s floor). On a
+unified-memory machine the server's GPU memory lies outside its resident set and inside
+the one memory pool (measured: a 2 GiB CUDA allocation moved `MemAvailable` by 2 GiB and
+the resident set by nothing), so there the charge is the pool, the overhead and the device
+figure, all in the one domain; on a discrete GPU the device figure goes to the device
+domain as §6 says.
+
+The figures measured on later launches, which replace these allowances for the revision on
+that host, are taken on the allowances' own basis (found live 2026-10-22 on GB10: a SGLang
+server's 4903 MiB resident set was 436 MiB anonymous, 4138 MiB shared and 329 MiB
+file-backed, and the driver attributed 406 MiB of GPU memory to it; measuring anonymous and
+shared pages alone, with no GPU figure, undercharged it by about 735 MiB). The overhead is
+the server group's whole resident set (`VmRSS`, file-backed pages included) beyond its
+pool, on every path: the embedded watch while it runs, the reading at Ready, and a remote
+host's load reports. The device figure is the GPU memory the driver attributes to the
+server's processes (the per-process `nvidia-smi` sample of ADR 0007), on unified memory as
+on a discrete GPU. A figure no source read is recorded as zero and keeps its allowance: a
+source that cannot see that memory never replaces an allowance. Each figure is the
+largest seen for the revision on that host, so a smaller later reading never lowers it.
+
+**A2. The command line (§3).** In LMCache 0.5.6 the L1 pool is lazy by default
+(`--l1-use-lazy` is a boolean option defaulting to true, starting at
+`--l1-init-size-gb 20`), so §3's "the pool is allocated at start" needs the option stated:
+CapyCTL renders `--no-l1-use-lazy` after §3's options. The server's `--shm-name` default
+(empty) keeps LMCache's shared-memory transfer off and is not passed. The L1 options are
+declared in `lmcache/v1/distributed/config.py`, the server's own in
+`lmcache/v1/multiprocess/config.py`; the launch-time check reads both.
+
+**A3. The server's log (§3).** The server's output goes to its own log beside the engine's
+(`<launch>.lmcache.log`), through its own redacting writer in the same `engine_logs` mode,
+rather than into the engine's log: the in-memory log buffer is one per log path, the
+writer is started with the engine's credentials (which do not exist yet when the server
+starts first), and a `restart_only` server outlives each engine. §8's log tail stays the
+engine's.
+
+**A4. The SGLang salt check (§1).** LMCache issue 4825 (owner input 2026-10-22) found that
+LMCache's legacy SGLang multiprocess adapter drops `cache_salt`; only the unified SGLang
+integration threads it end to end (LMCache main b28250e, regression tests in LMCache PR
+5964). LMCache 0.5.6 has the unified path: `unified_lmcache_mp_connector.py` builds
+`IPCCacheServerKey(..., cache_salt=...)`, and SGLang 0.5.22's
+`lmcache_unified_radix_cache.py` passes `req.cache_salt` on lookup and store (confirmed on
+host A, and LMCache's own object keys carried the salt in LC1). The launch-time check for
+SGLang therefore verifies the salt support, not only the files: the unified connector
+passes the salt into the key, the IPC key and object key carry it, SGLang's radix cache
+passes the request's salt to the unified connector and imports neither
+`sglang_adapter` nor `multi_process_adapter`, and SGLang's cache registry selects the
+unified radix cache under `enable_lmcache` (SGLang 0.5.22 declares `enable_lmcache` and
+`lmcache_config_file` in `arg_groups/fields/memory.py`, not `server_args.py`). A release
+without it fails `check_failed`, and SGLang runs with LMCache off until a release has it.
+Live row LC3 on SGLang also reads LMCache's own record of the stored keys for a
+non-empty salt.
+
+**A5. A stopped engine's KV (§§6, 7).** LC1 found that after an engine exits, its LMCache
+server keeps the engine's KV cache mapped through CUDA IPC (the server's GPU figure rose
+to 1430 MiB with a 1 GiB vLLM KV cache, 1656 MiB on SGLang, unchanged after 92 s) until
+the next engine registers (it then dropped back to 406–408 MiB, the old KV released, not
+both held; corrected by A13: the release comes with the new engine's first stored KV, not
+its registration) or the server stops. A `restart_only` instance parked with its server
+therefore charges, in its parked phase, the server's charge plus the engine's KV cache.
+Each server that had an engine connected also leaves a CUDA driver file,
+`/dev/shm/cuda.shm.<uid>.<pid>.1` (80 KiB, owner-only), after its verified exit; CapyCTL
+removes the stopped server's file. The engine processes leave the same kind of files, as
+they did before this ADR.
+
+**A6. Decision deployments park with LMCache.** A decision deployment resolves
+`restart_only` (ADR 0030); with LMCache on, it parks as §7 says (the engine stops, the
+server stays) instead of stopping, and the engine started at the wake is checked against
+the launch's wake reference (ADR 0030 §3) like any wake.
+
+**A7. LMCache's usage telemetry is off (§§3, 10).** Found live on host A: LMCache 0.5.6
+reports usage from every process that imports it to `stats.lmcache.ai:8080` over plain
+HTTP (`lmcache/usage_telemetry`, default `LMCACHE_USAGE_TRACK_URL`) unless
+`LMCACHE_TRACK_USAGE=false` or `DO_NOT_TRACK=1`, and the server's closed environment set
+neither. CapyCTL now renders both into the server's environment, and into the engine's
+whenever its connector is on (the connector imports LMCache in the engine), embedded and
+remote; the engine's resolved environment never replaces them. Nothing about a launch
+leaves the host. With the host setting `engine_telemetry` (owner decision 2026-10-22),
+`LMCACHE_TRACK_USAGE=false` stays rendered whenever LMCache runs, whatever that setting
+says, and `DO_NOT_TRACK=1`, which also silences the engine's own reporting, follows the
+setting: set under `off` (the default), in the server and the engine; not set under
+`allow`, so that the engine keeps its own default and LMCache still reports nothing.
+
+**A8. A restart-park's quiescence (§7).** Found live on SGLang 0.5.22: an embedded
+restart-park was always refused as not quiescent, because SGLang's quiescence proof is the
+memory saver's observer, which a `restart_only` launch never has. A restart-park stops
+the engine and releases nothing in place, so its proof is the one SPEC §10 step 4 needs
+without a saver: nothing in flight at ingress (the park is armed only then) and the
+engine's own running and queued gauges at zero, read now; an unreadable gauge is not
+quiescence. vLLM's proof was already its gauges. A remote host's restart-park checked its
+ingress alone before it stopped the engine; it now also reads the engine's gauges after
+its ingress reads zero, and an engine that is busy or cannot say leaves the launch
+unchanged. Decision deployments (A6) park the same way. The deep-park proof is unchanged.
+
+**A9. The server is its group's leader (§§3, 9).** Live runs on SGLang with LMCache 0.5.6
+found the server starting a short-lived child of its own group. Three consequences:
+
+- The listener check reads each member's `/proc/<pid>/fd` and socket tables. A member
+  whose entries are missing and whose presence is verified gone exited during the read:
+  it holds no listener, and the group is listed again and checked as it is now (three
+  readings at most), so the group recorded never names it. The leader gone, a member of
+  unknown presence, any other read failure, or a group that changed on every reading
+  still fails the check (`server_start_failed`).
+- A server stopped with a verified exit before its engine was spawned (`server_start_failed`
+  or `listener_exposed` under `auto`) leaves the launch's record before the engine
+  launches without the connector: each of its processes is proven gone by identity, then
+  the record drops it, journaled (`lmcache_server_departed` in the controller's journal
+  for an embedded launch; the host journal's departed processes for a remote one). The
+  launch's Ready then names the engine alone, as its evidence does. Letting the Ready
+  accept a recorded server absent from its evidence instead would release a recorded
+  process on evidence that never names it. A server whose stop or departure was not
+  verified keeps its record for the launch's own stop: the launch is uncertain and no
+  engine is spawned.
+- Only the leader's exit is the server's: a member of its group (`lmcache-N`) that exits
+  while the instance is Ready or parked fails nothing, as a helper's does (ADR 0027), and
+  re-proofs and restart-park evidence judge the server by its leader. Every member
+  recorded stays recorded until the launch's verified stop proves it gone.
+
+**A10. Decision deployments on SGLang run without LMCache (§2; owner decision 2026-10-22,
+LC7).** LC7 failed on SGLang 0.5.22: the decision deployment's engine started with the
+connector and failed at its first idle check with `AttributeError: 'UnifiedRadixCache'
+object has no attribute 'has_pending_cache_operations'`. The cause is in SGLang 0.5.22
+(read on host A; upstream issue
+[sgl-project/sglang#45929](https://github.com/sgl-project/sglang/issues/45929)):
+`mem_cache/registry.py`, `default_radix_cache_factory`, returns the plain
+`UnifiedRadixCache` whenever `disable_radix_cache` is set, before its `enable_lmcache`
+branch, and `managers/scheduler.py` (line 5233), `is_fully_idle`, calls
+`tree_cache.has_pending_cache_operations()` whenever `enable_lmcache` is on. Decision
+models run as embedding models (`is_embedding`), for which SGLang resolves
+`disable_radix_cache` to true. LMCache is therefore planned off, reason
+`engine_unsupported` with the issue in its detail, at plan time in the store, on the
+host and at resolution, so no start fails on it: for every decision deployment on SGLang
+(any version), and for any SGLang deployment whose profile arguments or `extra_args`
+state `--disable-radix-cache`. `lmcache: required` on either is refused at resolution,
+`lmcache_unavailable:engine_unsupported`. Other models SGLang disables the radix cache for
+on its own are not recognised in advance; their first start fails with the connector and
+falls back as §8 says (`engine_start_failed`, sticky for the revision on that profile).
+A6 stands for an engine that serves decisions with LMCache; none does until LC7 passes on
+a release.
+
+**A11. A standalone role plans from the settings it runs under (§§9, 10).** Found live
+(LC5, LC10): a standalone role restarted into `retention: zero` or `lmcache: off` stopped
+its LMCache server correctly, then relaunched the instance with a new server, and a later
+start of the same revision started one too. The embedded host publishes no approved
+document, and LMCache was planned from the settings the revision was resolved under. A
+standalone role now records the `lmcache` and `retention` it starts with before anything
+is placed or started, and placement and LMCache's plan read them (a server host's are its
+current approved publication, as before); a revision's own copy is read only for a host
+with neither. `capyctl engine list` likewise shows LMCache off with the reason under the
+settings the running role reports, falling back to its role document when the role is
+not running. An `lmcache_off` or `lmcache_server_exited` detail longer than its bound
+keeps its end, marked `…` where it was cut: an engine log tail's last line is its error.
+
+**A12. Where the qualified table's model type and GPU come from (§7).** Found in review: a
+deep deployment always showed "LMCache off: not qualified with deep park on SGLang 0.5.22 /
+an unknown model type / an unknown GPU", because neither plan (the store's at a start, the
+host's at its launch) was given the checkpoint's model type or the GPU's product name, so
+no row of the table could ever match. Both plans now compare real values:
+
+- **The GPU.** Each host publishes, with its GPU inventory, the product name `nvidia-smi`
+  reports at boot (`resource_policy.devices.<id>.product_name`, kept across a reload as
+  the physical UUID is). A launch's GPU is the product its selected devices name, or its
+  host's devices when the deployment selects none; devices naming different products, or
+  none, are an unknown GPU. The product name is read from the revision's frozen host
+  policy, as every other host fact a launch uses is, so a revision accepted before its host
+  published product names plans with an unknown GPU until it is applied again.
+- **The model type.** It is the checkpoint's `config.json` `model_type`. The host reads it
+  where its launch reads the checkpoint, and so does the store for its embedded host, which
+  shares that machine. An enrolled host's checkpoint is not on the server's machine, so the
+  host reports the model type with its sizing and its measured digest, and the store keeps
+  it with them (schema v55: `model_type` on `checkpoint_sizes` and `checkpoint_digests`).
+  A remote start plans with the model type its host reported; before that host has sized
+  or measured the checkpoint the model type is unknown and the start plans LMCache off,
+  saying so. A digest recorded before v55 takes the model type the next identical
+  measurement names.
+- **The comparison.** Both values are compared trimmed, and only as printable ASCII of 1
+  to 128 bytes; anything else is unknown, which no row matches. A host's report naming a
+  model type in any other form is refused.
+
+The released table is unchanged: it is still empty until LC4 passes, so every parking
+combination stays off, now naming its real model type and GPU.
+
+**A13. The stopped engine's KV after the wake (§§6, 7; found live on vLLM, 2026-10-23).**
+The live rerun on host A found A5's release point wrong: after a restart-park's wake the
+server kept the old engine's KV mapped (1574 MiB of GPU memory, Ready, at least 37 s)
+until the new engine's first request that stored KV, then 406 MiB. Two errors followed.
+The Ready charge in that window was the server's steady figure, below what it held; and
+the measurement recorded that reading as the server's GPU figure (1,650,458,624 B), so
+every later launch of the revision charged about 1.14 GiB too much. SGLang servers also
+held 1608–1656 MiB between their engine's exit and their own stop. The rule, on both
+engines and on every host:
+
+- **The charge.** Once a restart-park completes, the server holds the stopped engine's
+  KV until a GPU reading of the server shows it released, and nothing else (no timer,
+  no engine registration) ends that. The wake is charged its cold start beside the
+  server plus that KV (and at least the Ready charge below), and the Ready instance
+  after the wake keeps the KV in its charge, in the device domain on a discrete GPU
+  and the one shared pool on unified memory, as the parked phase does. The evidence of
+  the release is a GPU reading of the server's processes below the engine's KV cache
+  (a server still holding that KV cannot show less), taken while the instance is Ready
+  on that launch with no lifecycle run open; a reading of zero is none. On it the
+  instance's reservation moves to the Ready charge without the KV, journaled
+  `lmcache_kv_released`. A host whose GPU readings name no server process keeps the KV
+  charged until the instance stops, and so does a server whose own GPU memory is not
+  below the engine's KV cache: uncertainty keeps its accounting. Status shows the
+  charge with the KV in it while it is held.
+- **The measurement.** From a restart-park's arm until that release reading, no GPU
+  reading of the server is recorded as its measurement (the resident set beyond the
+  pool still is): the largest figure seen per revision never takes a reading that
+  counts a stopped engine's KV. The release reading itself is a measurement.
+  Callers that skip samples no larger than the last still send a reading below the
+  held KV while the server may hold it.
+- **Where it is kept.** `launch_lmcache.held_kv_state` (schema v56): `parking` from the
+  park's arm (measurement only), `held` from its completion (measurement and charge).
+  A remote host's co-residence re-check still charges the wake and the Ready phase
+  without the KV; the control plane's admission, which charges it, stays the authority.

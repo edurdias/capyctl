@@ -28,7 +28,10 @@ pub(crate) fn check_session(
 /// EngineCore already numbers them this way; ADR 0023 §6: TensorFold serves from
 /// the api process alone. The vLLM and SGLang adapters refuse a group without a
 /// worker before it reaches the store. ADR 0027: any number of helpers
-/// (`helper-N`, distinct, gaps allowed) may stand beside the workers.
+/// (`helper-N`, distinct, gaps allowed) may stand beside the workers. ADR
+/// 0033 §3: the launch's LMCache server group (`lmcache` and `lmcache-N`,
+/// numbered by start order) stands beside the engine as its own group, and is
+/// all a restart-parked launch holds (§7): members only with their leader.
 pub(crate) fn canonical_members(
     ids: &[ProcessIdentity],
 ) -> Result<Vec<ProcessIdentity>, LifecycleError> {
@@ -55,15 +58,25 @@ pub(crate) fn canonical_members(
     {
         return Err(LifecycleError::Invalid);
     }
+    // ADR 0033 §3: the server's group, set aside like the helpers.
+    let server = ids.iter().filter(|i| i.is_lmcache()).count();
+    if server > 0 && !roles.contains(capyctl_domain::completion::LMCACHE_ROLE) {
+        return Err(LifecycleError::Invalid);
+    }
+    roles.retain(|role| !capyctl_domain::completion::is_lmcache_role(role));
     // ADR 0027: helpers are numbered apart from the workers, and one that has
     // exited leaves a gap, so they are set aside first and only need distinct
     // `helper-N` roles. They never stand in for the engine's own workers.
     let helpers = ids.iter().filter(|i| i.is_helper()).count();
     roles.retain(|role| !capyctl_domain::completion::is_helper_role(role));
+    // ADR 0033 §7: a restart-parked launch holds its server's group alone.
+    if server > 0 && helpers == 0 && roles.is_empty() {
+        return Ok(ids);
+    }
     // Every role is distinct (checked above), so removing `api` and then every
     // expected `worker-i` in turn only succeeds, with nothing left over, when
     // the remaining role set is exactly {api, worker-0, ..., worker-(n-2)}.
-    let engine = ids.len() - helpers;
+    let engine = ids.len() - helpers - server;
     if !roles.remove("api") || (helpers > 0 && engine < 2) {
         return Err(LifecycleError::Invalid);
     }
@@ -80,9 +93,17 @@ pub(crate) fn canonical_members(
 /// ADR 0027: liveness evidence still names the engine `recorded` names. It is
 /// a canonical set holding every engine process of `recorded` and no other
 /// engine process; a helper may be missing (it exited) or new (started later).
+/// ADR 0033 §§3, 7: the LMCache server's group does not decide it, except for
+/// a restart-parked launch, which holds no engine: its evidence is the same
+/// server group, and no engine.
 pub(crate) fn names_engine(recorded: &[ProcessIdentity], evidence: &[ProcessIdentity]) -> bool {
+    use capyctl_domain::completion::{same_engine, same_lmcache};
     canonical_members(evidence).is_ok()
-        && capyctl_domain::completion::same_engine(recorded, evidence)
+        && if recorded.iter().any(ProcessIdentity::is_engine) {
+            same_engine(recorded, evidence)
+        } else {
+            same_lmcache(recorded, evidence) && !evidence.iter().any(ProcessIdentity::is_engine)
+        }
 }
 pub(crate) fn identity_dtos(ids: &[ProcessIdentity]) -> Vec<IdentityDto> {
     ids.iter()

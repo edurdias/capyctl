@@ -140,6 +140,8 @@ async fn engines(State(state): State<Arc<HostState>>) -> Response {
             else {
                 continue;
             };
+            // ADR 0033 §9: the host's `lmcache` and `retention`, as published.
+            let lmcache = capyctl_config::lmcache::host_settings(&document);
             for (name, profile) in document["runtime_profiles"]
                 .as_object()
                 .cloned()
@@ -155,7 +157,12 @@ async fn engines(State(state): State<Arc<HostState>>) -> Response {
                     .flatten()
                     .is_some();
                 rows.push((
-                    (host.host_id.clone(), host.host_name.clone(), host.revoked),
+                    (
+                        host.host_id.clone(),
+                        host.host_name.clone(),
+                        host.revoked,
+                        lmcache,
+                    ),
                     name,
                     profile,
                     deployments,
@@ -176,7 +183,7 @@ async fn engines(State(state): State<Arc<HostState>>) -> Response {
     let engines: Vec<_> = rows
         .into_iter()
         .map(
-            |((host_id, host_name, revoked), name, profile, deployments, retiring)| {
+            |((host_id, host_name, revoked, lmcache), name, profile, deployments, retiring)| {
                 let session = state.sessions.inspect(&host_id);
                 let reported = session
                     .as_ref()
@@ -207,6 +214,7 @@ async fn engines(State(state): State<Arc<HostState>>) -> Response {
                     deep_park_missing: missing,
                     retiring,
                     deployments,
+                    host_lmcache: lmcache,
                 })
             },
         )
@@ -227,6 +235,11 @@ struct EngineRow<'a> {
     deep_park_missing: bool,
     retiring: bool,
     deployments: Vec<String>,
+    /// ADR 0033 §9: the host's `lmcache` and `retention`.
+    host_lmcache: (
+        capyctl_config::lmcache::HostLmcache,
+        capyctl_config::lmcache::Retention,
+    ),
 }
 
 /// ADR 0018: the engines row, one shape for every role.
@@ -257,6 +270,10 @@ fn engine_row(row: EngineRow<'_>) -> serde_json::Value {
         "published": "published",
         "retiring": row.retiring,
         "deployments": row.deployments,
+        // ADR 0033 §9: from the host's settings, the engine and the
+        // profile's registration; the host's launch-time check is what a
+        // launch uses.
+        "lmcache": lmcache_view(row.host_lmcache, kind, &version, profile),
     });
     if kind == Some(Engine::Custom) {
         if let Some(object) = row_value.as_object_mut() {
@@ -264,6 +281,29 @@ fn engine_row(row: EngineRow<'_>) -> serde_json::Value {
         }
     }
     row_value
+}
+
+/// ADR 0033 §9: the `lmcache` field of an engines row. A profile of an
+/// engine this build does not know is unsupported.
+fn lmcache_view(
+    host: (
+        capyctl_config::lmcache::HostLmcache,
+        capyctl_config::lmcache::Retention,
+    ),
+    engine: Option<capyctl_config::engine_policy::Engine>,
+    version: &str,
+    profile: &serde_json::Value,
+) -> serde_json::Value {
+    use capyctl_config::lmcache::{listed, listed_view, LmcacheOff, LmcacheOffReason};
+    let Some(engine) = engine else {
+        let reason = LmcacheOffReason::EngineUnsupported;
+        return listed_view(&Err(LmcacheOff {
+            reason,
+            detail: reason.sentence().to_owned(),
+        }));
+    };
+    let registration = serde_json::from_value(profile["lmcache"].clone()).ok();
+    listed_view(&listed(host, engine, version, registration.as_ref()))
 }
 
 /// ADR 0031 §6, §7, §8: what the server shows of a custom engine: the
@@ -502,6 +542,7 @@ async fn standalone_engines(State(state): State<Arc<StandaloneState>>) -> Respon
                 }),
                 retiring,
                 deployments,
+                host_lmcache: capyctl_config::lmcache::host_settings(&document),
             }));
         }
         Some(rows)
@@ -614,6 +655,7 @@ mod tests {
                 deep_park_missing: false,
                 retiring: false,
                 deployments: vec![],
+                host_lmcache: Default::default(),
             })
         };
         let custom = row(&profile);
@@ -640,5 +682,63 @@ mod tests {
         for field in ["manifest", "idle_signal", "engine_key"] {
             assert!(known.get(field).is_none(), "{known}");
         }
+    }
+
+    // T45 (ADR 0033 §9): the server's engines row carries `lmcache`: the
+    // registered version, or off with the first reason the server knows
+    // (the host's published `retention` and `lmcache`, the engine and its
+    // version, the profile's registration).
+    #[test]
+    fn an_engines_row_shows_lmcache_on_or_off_with_the_reason() {
+        use capyctl_config::lmcache::{host_settings, HostLmcache, Retention};
+        let row = |profile: serde_json::Value, host: (HostLmcache, Retention)| {
+            super::engine_row(super::EngineRow {
+                host_id: "h",
+                host_name: "h",
+                online: true,
+                profile_name: "p",
+                profile: &profile,
+                reported_version: None,
+                fingerprint: None,
+                deep_park_missing: false,
+                retiring: false,
+                deployments: vec![],
+                host_lmcache: host,
+            })["lmcache"]
+                .clone()
+        };
+        let registered = serde_json::json!({"engine": "sglang", "build_fingerprint": "0.5.22",
+            "lmcache": {"version": "0.5.6", "digest": "sha256:00"}, "security": {}});
+        let defaults = Default::default();
+        assert_eq!(
+            row(registered.clone(), defaults),
+            serde_json::json!({"state": "on", "version": "0.5.6"})
+        );
+        let reason = |profile: serde_json::Value, host| row(profile, host)["reason"].clone();
+        assert_eq!(
+            reason(
+                registered.clone(),
+                host_settings(&serde_json::json!({"lmcache": "off"}))
+            ),
+            "host_off"
+        );
+        assert_eq!(
+            reason(
+                registered.clone(),
+                host_settings(&serde_json::json!({"retention": "zero", "lmcache": "off"}))
+            ),
+            "retention_zero"
+        );
+        let mut old = registered.clone();
+        old["build_fingerprint"] = "0.5.21".into();
+        assert_eq!(reason(old, defaults), "engine_version_unsupported");
+        let mut bare = registered.clone();
+        bare.as_object_mut().unwrap().remove("lmcache");
+        assert_eq!(reason(bare, defaults), "not_installed");
+        let mut below = registered;
+        below["lmcache"]["version"] = "0.5.5".into();
+        assert_eq!(reason(below, defaults), "version_unsupported");
+        let llamacpp = serde_json::json!({"engine": "llamacpp", "build_fingerprint": "b1+abc"});
+        assert_eq!(reason(llamacpp, defaults), "engine_unsupported");
     }
 }

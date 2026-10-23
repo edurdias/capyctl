@@ -38,6 +38,12 @@ pub struct ExitedLaunch {
     /// ADR 0028 §11: the rank of the group member that exited, when the
     /// launch is a group's; `None` for a single-host launch.
     pub group_rank: Option<u32>,
+    /// ADR 0033 §3 (lifecycle design §5): the process that exited was the
+    /// launch's LMCache server (`lmcache_server_exited` is journaled).
+    pub lmcache_server: bool,
+    /// The instance was parked (a restart-park whose server exited): it is
+    /// released like an idle stop rather than failed.
+    pub parked: bool,
 }
 
 /// Which evidence source is reporting.
@@ -54,8 +60,9 @@ impl crate::Store {
     /// and close that instance's dispatch. `None` when the exit names no such
     /// launch now: another generation (T34), a launch that is stopping,
     /// settled or never Ready, a process outside its recorded group, a helper
-    /// of it (ADR 0027), or a source that does not serve it. Nothing changes
-    /// then.
+    /// of it (ADR 0027), a member of its LMCache server's group other than
+    /// the `lmcache` leader (ADR 0033 §3), or a source that does not serve
+    /// it. Nothing changes then.
     pub fn record_engine_exit(
         &self,
         s: &CoordinatorSession,
@@ -147,12 +154,37 @@ impl crate::Store {
                     })
                     .collect()
             }
-            None => members(&association.identities)?,
+            None => members(association.held())?,
         };
-        // ADR 0027: a helper's exit is not the engine's. Cleanup still proves
-        // it gone with the rest of the recorded group.
-        if exit.process.is_helper() || !recorded.contains(&exit.process) {
+        // ADR 0027: a helper's exit is not the engine's. ADR 0033 §3 (found
+        // live on SGLang: a short-lived child of the server, recorded at
+        // Ready, exited 90 s later and failed the instance): the server is
+        // its group's leader, so only the `lmcache` leader's exit is the
+        // server's. Cleanup still proves every recorded member gone.
+        if exit.process.is_helper()
+            || (exit.process.is_lmcache()
+                && exit.process.role != capyctl_domain::completion::LMCACHE_ROLE)
+            || !recorded.contains(&exit.process)
+        {
             return Ok(None);
+        }
+        // ADR 0033 §3 (lifecycle design §5): the LMCache server's exit, while
+        // the instance serves or while it is parked, fails it the same way.
+        let parked: bool = tx.query_row(
+            "SELECT observed_state='parked' FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2",
+            params![p.deployment_id, p.instance_index],
+            |r| r.get(0),
+        )?;
+        let lmcache_server = exit.process.is_lmcache();
+        if lmcache_server {
+            super::lmcache::server_exited(
+                &tx,
+                &p.binding_id,
+                &format!(
+                    "the LMCache server process {} ({}) exited ({})",
+                    exit.process.pid, exit.process.role, exit.status
+                ),
+            )?;
         }
         // SPEC §13.2: dispatch to this incarnation closes before anything else;
         // ownership, the reservation and request leases all stay.
@@ -214,6 +246,8 @@ impl crate::Store {
             binding_id: p.binding_id,
             first,
             group_rank: member.map(|(_, rank, _)| rank),
+            lmcache_server,
+            parked,
         }))
     }
 }

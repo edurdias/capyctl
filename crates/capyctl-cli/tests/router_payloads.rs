@@ -137,7 +137,8 @@ async fn stack(seen: Arc<Mutex<Vec<Value>>>, heard: Heard) -> SocketAddr {
         format!("http://{ingress_address}").parse().unwrap(),
         "served".into(),
         Some(hex(GATE)),
-        true,
+        // ADR 0033 §5: the launch's salt namespace, as the router reads it.
+        capyctl_adapters::forward::CacheSalt::for_launch(Some("vllm"), "deployment", 1),
     );
     let deps = RouterDeps {
         controller: controller.clone(),
@@ -295,5 +296,33 @@ async fn request_ids_survive_the_ingress_and_never_reach_the_engine() {
     for headers in heard.iter() {
         assert!(!headers.contains_key("x-request-id"), "{headers:?}");
         assert!(!headers.contains_key("x-capyctl-request-id"), "{headers:?}");
+    }
+}
+
+// T45 T37 (ADR 0033 §5): through a host's ingress the engine receives the
+// effective salt the router derived, exactly once: the ingress relays the
+// body as sent and derives nothing itself.
+#[tokio::test]
+async fn the_effective_salt_is_derived_once_at_the_router_and_relayed_by_the_ingress() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let router = stack(seen.clone(), Heard::default()).await;
+    for stream in [false, true] {
+        let mut sent = request(stream);
+        sent["cache_salt"] = json!("tenant-a");
+        let response = reqwest::Client::new()
+            .post(format!("http://{router}/v1/chat/completions"))
+            .bearer_auth("test-key")
+            .json(&sent)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(response.text().await.unwrap().contains("lo"));
+    }
+    let expected = capyctl_adapters::forward::effective_cache_salt("deployment", 1, "tenant-a");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    for body in seen.iter() {
+        assert_eq!(body["cache_salt"], expected.as_str(), "{body}");
     }
 }

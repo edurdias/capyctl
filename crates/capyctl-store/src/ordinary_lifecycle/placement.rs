@@ -73,7 +73,8 @@ fn pending_charges(
         charges.push((
             e.host.name.clone(),
             plan.owner(),
-            super::startup::steady(&e),
+            // ADR 0033 §6: with the LMCache charge the start was granted.
+            super::startup::steady(tx, &plan, &e)?,
         ));
     }
     Ok(charges)
@@ -205,7 +206,7 @@ pub(super) fn candidates(
         // (declared, measured on this host, or the placeholder), or the whole
         // managed limit for a solo first start.
         let (footprint, whole_host) =
-            super::startup::startup_footprint(tx, deployment_id, revision, &e)?;
+            super::startup::startup_footprint(tx, deployment_id, revision, &host, &e)?;
         let (device_options, preferred_device) =
             device_options(tx, deployment_id, revision, instance, &host)?;
         // ADR 0030 §1: a decisions revision is placed only on a host that
@@ -226,7 +227,29 @@ pub(super) fn candidates(
         let serves_api = (e.api.is_chat() || declared(capyctl_config::decisions::HOST_CAPABILITY)?)
             && (e.profile.engine != capyctl_config::engine_policy::Engine::Custom
                 || declared(capyctl_config::custom::CAPABILITY)?);
+        // ADR 0033 §§9, 10, 13: `lmcache: required` and `retention: zero`
+        // are placed only where they can run, judged again here against the
+        // host's current published settings and latest declaration; the host
+        // is refused with the typed code, not as a generic ineligible one.
+        let gate = {
+            use capyctl_config::lmcache::{placement_refusal, CAPABILITY, RETENTION_CAPABILITY};
+            let (host_lmcache, host_retention) = host_lmcache_settings(tx, &host, &e)?;
+            let has_lmcache = declared(CAPABILITY)?;
+            let has_retention = declared(RETENTION_CAPABILITY)?;
+            placement_refusal(
+                e.lmcache,
+                e.retention,
+                host_lmcache,
+                host_retention,
+                |name| match name {
+                    CAPABILITY => has_lmcache,
+                    RETENTION_CAPABILITY => has_retention,
+                    _ => false,
+                },
+            )
+        };
         candidates.push(HostCandidate {
+            gate,
             device_options,
             preferred_device,
             occupied,
@@ -251,6 +274,52 @@ pub(super) fn candidates(
         });
     }
     Ok(candidates)
+}
+
+/// ADR 0033 §§9, 10: `host`'s `lmcache` and `retention` now: as its current
+/// approved publication states them, or for standalone's embedded host (it
+/// publishes no approved document) as the role last started with them. The
+/// settings a revision was resolved under (`e.host`) are read only for a
+/// host with neither, which no running role is.
+pub(super) fn host_lmcache_settings(
+    tx: &rusqlite::Connection,
+    host: &str,
+    e: &capyctl_config::effective::EffectiveDeployment,
+) -> Result<
+    (
+        capyctl_config::lmcache::HostLmcache,
+        capyctl_config::lmcache::Retention,
+    ),
+    LifecycleError,
+> {
+    let published: Option<String> = tx
+        .query_row(
+            "SELECT config_json FROM approved_host_publications WHERE host_id=?1",
+            [host],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(document) = published {
+        return Ok(capyctl_config::lmcache::host_settings(
+            &serde_json::from_str(&document).map_err(|_| LifecycleError::CorruptStoredData)?,
+        ));
+    }
+    let embedded: Option<(String, String)> = tx
+        .query_row(
+            "SELECT lmcache,retention FROM embedded_host_settings WHERE host_id=?1",
+            [host],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match embedded {
+        Some((lmcache, retention)) => Ok((
+            serde_json::from_value(serde_json::Value::String(lmcache))
+                .map_err(|_| LifecycleError::CorruptStoredData)?,
+            serde_json::from_value(serde_json::Value::String(retention))
+                .map_err(|_| LifecycleError::CorruptStoredData)?,
+        )),
+        None => Ok((e.host.lmcache, e.host.retention)),
+    }
 }
 
 /// ADR 0019 (discrete GPU design §7): the GPUs of `host` the instance may
@@ -285,7 +354,7 @@ fn device_options(
             .map(|policy| policy.domain.clone())
             .ok_or(LifecycleError::CorruptStoredData)?;
         let (footprint, _) =
-            super::startup::startup_footprint(tx, deployment_id, revision, &on_device)?;
+            super::startup::startup_footprint(tx, deployment_id, revision, host, &on_device)?;
         options.push(DeviceOption {
             device,
             domain,
@@ -650,6 +719,10 @@ impl crate::Store {
         // was refused only because no allowed host is eligible now. That is
         // reported as `HostIneligible`, never masked as a capacity block.
         let mut only_ineligible = true;
+        // ADR 0033 §§9, 10, 13: the gate code every instance that fit nowhere
+        // was refused with, when they all were; reported as that code, never
+        // masked as a capacity block or a generic ineligible host.
+        let mut gated: Option<Option<&'static str>> = None;
         for instance in targets {
             // Q5: on demand, one instance is brought up; the rest only fill in
             // where they fit, so a failure to fit is not queued for them.
@@ -669,7 +742,9 @@ impl crate::Store {
             let mut undo = false;
             match prepared {
                 Prepared::Joined(fence) => {
-                    match Self::accept_start_in_transaction(tx, s, &fence, now, deadline, true) {
+                    match Self::accept_start_in_transaction(
+                        tx, s, &fence, now, deadline, true, None,
+                    ) {
                         Ok(start) => {
                             first.get_or_insert(start);
                         }
@@ -683,7 +758,9 @@ impl crate::Store {
                     refusal.get_or_insert(LifecycleError::RuntimeRetained);
                 }
                 Prepared::Placed(fence) => {
-                    match Self::accept_start_in_transaction(tx, s, &fence, now, deadline, true) {
+                    match Self::accept_start_in_transaction(
+                        tx, s, &fence, now, deadline, true, None,
+                    ) {
                         Ok(start) => {
                             first.get_or_insert(start);
                         }
@@ -702,6 +779,13 @@ impl crate::Store {
                     detail.get_or_insert(why);
                     needs_empty_host &= code == "startup_requires_empty_host";
                     only_ineligible &= code == "host_ineligible";
+                    let gate = capyctl_config::lmcache::PLACEMENT_REFUSALS
+                        .contains(&code)
+                        .then_some(code);
+                    gated = match gated {
+                        None => Some(gate),
+                        Some(seen) => Some(seen.filter(|_| seen == gate)),
+                    };
                     let until = (scope != StartScope::OnDemand).then_some(deadline);
                     if !filling {
                         defer(tx, deployment_id, instance, code, until)?;
@@ -719,6 +803,7 @@ impl crate::Store {
                 refusal = None;
             }
         }
+        let gate = gated.flatten();
         match first {
             Some(start) => Ok(start),
             None if blocked && refusal.is_none() && needs_empty_host => {
@@ -726,6 +811,13 @@ impl crate::Store {
             }
             None if blocked && refusal.is_none() && only_ineligible => {
                 Err(LifecycleError::HostIneligible)
+            }
+            None if blocked && refusal.is_none() && gate.is_some() => {
+                Err(LifecycleError::PlacementRefused(format!(
+                    "{}: no allowed host can run the deployment as declared ({})",
+                    gate.unwrap_or_default(),
+                    detail.unwrap_or_default()
+                )))
             }
             None if blocked && refusal.is_none() => Err(LifecycleError::CapacityBlocked(detail)),
             None => Err(refusal.unwrap_or(LifecycleError::CapacityBlocked(detail))),

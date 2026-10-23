@@ -30,6 +30,10 @@ mod switching_tests;
 #[path = "tests_groups.rs"]
 mod tests_groups;
 
+// ADR 0033: LMCache fallback, server exit and restart-park round trip.
+#[path = "tests_lmcache.rs"]
+mod lmcache_tests;
+
 use capyctl_testkit::{fixture, FakeEngine};
 
 struct Observations(Vec<MemoryObservation>);
@@ -132,7 +136,7 @@ impl EngineAdapter for Gate {
                 // Spec §3: the launcher persists the API identity before the
                 // engine has answered anything; no association exists yet.
                 o.store()
-                    .record_api_identity(
+                    .record_launch_identity(
                         o.session(),
                         &DeploymentFence {
                             deployment_id: command.context.token.deployment_id.clone(),
@@ -266,6 +270,7 @@ fn spawn_fake(
                 // The Fake launches nothing, so there is nothing to terminate.
                 tools: None,
                 settle: None,
+                lmcache: None,
             }))
         }),
     )
@@ -308,6 +313,7 @@ fn test_driver(gate: Arc<Gate>) -> Arc<Driver> {
         // failure path pauses uncertain for it, as it does for the Fake.
         tools: None,
         settle: None,
+        lmcache: None,
     })
 }
 async fn stopped(worker: &OwnedCoordinator) -> WorkerStatus {
@@ -2384,6 +2390,7 @@ mod native {
             ),
             tools: Some(tools),
             settle: None,
+            lmcache: None,
         })
     }
 
@@ -3680,7 +3687,7 @@ mod native {
                 log_dir.path().to_path_buf(),
                 runtime_dir.path().to_path_buf(),
             )),
-            Arc::new(move |association| {
+            Arc::new(move |association, _policy| {
                 *factory_tool.association.lock().unwrap() = Some(association);
                 factory_tool.clone() as Arc<dyn capyctl_adapters::traits::OwnedProcessLaunch>
             }),
@@ -3941,7 +3948,7 @@ mod native {
                 log_dir.path().to_path_buf(),
                 runtime_dir.path().to_path_buf(),
             )),
-            Arc::new(move |_| factory_tool.clone() as Arc<dyn OwnedProcessLaunch>),
+            Arc::new(move |_, _| factory_tool.clone() as Arc<dyn OwnedProcessLaunch>),
         )
         .unwrap();
 

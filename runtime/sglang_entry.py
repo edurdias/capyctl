@@ -103,7 +103,11 @@ _PARSER_SETTINGS = ("tool_call_parser", "reasoning_parser")
 # ADR 0028 §10: `group` is present only on a multi-node group member (T39).
 # ADR 0008 amendment 2026-10-08: `draft_model_path`, the declared drafter's
 # directory capyctl materialized, is present only with a drafter.
-_OPTIONAL_SETTINGS = _PARSER_SETTINGS + ("max_mamba_cache_size", "group", "draft_model_path")
+# ADR 0033 §4: `lmcache_config_file`, the launch's owner-only LMCache
+# connector file, is present only on a launch whose LMCache server is up; it
+# turns on the reserved `enable_lmcache` (sglang_server_args.py).
+_OPTIONAL_SETTINGS = _PARSER_SETTINGS + ("max_mamba_cache_size", "group", "draft_model_path",
+                                         "lmcache_config_file")
 # ADR 0028 §10: a member's group object (crates/capyctl-adapters/src/sglang/
 # args.rs `public_group`); `gloo_socket_ifname` only when the host resolved one.
 _GROUP_KEYS = ("tp_size", "pp_size", "nnodes", "node_rank", "dist_init_addr", "host_ip")
@@ -232,6 +236,12 @@ def _validate_settings(settings):
         draft = _text(settings["draft_model_path"], 4096)
         if not draft.startswith("/") or any(part in (".", "..")
                                             for part in draft.split("/")):
+            _reject()
+    if "lmcache_config_file" in settings:
+        config = _text(settings["lmcache_config_file"], 4096)
+        # ADR 0033 §2: one private server on one machine; never a group member.
+        if (not config.startswith("/") or "group" in settings
+                or any(part in (".", "..") for part in config.split("/"))):
             _reject()
     for name in _PARSER_SETTINGS:
         if name in settings:

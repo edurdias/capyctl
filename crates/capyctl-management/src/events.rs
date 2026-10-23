@@ -389,6 +389,8 @@ enum Field {
     Tokens,
     /// Bounded free text.
     Text,
+    /// ADR 0033 §14: one of the closed reasons LMCache is off.
+    LmcacheReason,
 }
 
 const STEP_FIELDS: &[(&str, Field)] = &[
@@ -458,7 +460,7 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
     if input.get("version").and_then(Value::as_str) != Some("1") {
         return Err(Failure::Internal);
     }
-    use Field::{Id, Number, OptionalToken, Phase, Text, Token, Tokens};
+    use Field::{Id, LmcacheReason, Number, OptionalToken, Phase, Text, Token, Tokens};
     let step = step_transition(event.kind.as_str());
     let switch_phase = event.kind.strip_prefix("switch_").filter(|phase| {
         matches!(
@@ -541,6 +543,27 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
             ("count", Number),
             ("receipt", Text),
         ],
+        // ADR 0033 §§8, 9, 14: LMCache off for one launch, once per launch
+        // and reason; the detail is bounded and redacted by the store.
+        "lmcache_off" => &[
+            ("deployment_id", Id),
+            ("instance_index", Number),
+            ("generation", Number),
+            ("binding_id", Token),
+            ("host_id", Token),
+            ("reason", LmcacheReason),
+            ("detail", Text),
+        ],
+        // ADR 0033 §3: a launch's LMCache server exited while its engine
+        // served.
+        "lmcache_server_exited" => &[
+            ("deployment_id", Id),
+            ("instance_index", Number),
+            ("generation", Number),
+            ("binding_id", Token),
+            ("host_id", Token),
+            ("detail", Text),
+        ],
         // ADR 0032 §7: an instance restarted because requests held until its
         // next stop alone filled the deployment's limit; its stop settles them.
         "instance_restarted_for_held_requests" => &[
@@ -611,6 +634,13 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
                 if text.chars().count() > 512 {
                     return Err(Failure::Internal);
                 }
+                value.clone()
+            }
+            Field::LmcacheReason => {
+                value
+                    .as_str()
+                    .and_then(capyctl_config::lmcache::LmcacheOffReason::parse)
+                    .ok_or(Failure::Internal)?;
                 value.clone()
             }
         };

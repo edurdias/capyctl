@@ -1015,7 +1015,7 @@ fn engine_views_print_tables_and_json_on_request() {
     let table = capyctl(dir.path(), &list);
     assert!(
         table.starts_with(
-            "PROFILE   SOURCE   ENGINE   VERSION   CUSTOM   DEEP PARK   IDLE SIGNAL   ENGINE KEY   PUBLISHED   DEPLOYMENTS\n"
+            "PROFILE   SOURCE   ENGINE   VERSION   CUSTOM   DEEP PARK   LMCACHE   IDLE SIGNAL   ENGINE KEY   PUBLISHED   DEPLOYMENTS\n"
         ),
         "{table}"
     );
@@ -1348,5 +1348,198 @@ fn a_missing_config_file_is_named_with_what_to_do() {
             "config file {} does not exist; create it or leave out --config",
             missing.display()
         )
+    );
+}
+
+/// Excerpts of the real LMCache 0.5.6, vLLM 0.32.0 and SGLang 0.5.22 files
+/// the launch-time check reads (ADR 0033 §1).
+const LMCACHE_FIXTURES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../capyctl-agent/tests/fixtures/lmcache"
+);
+
+fn copy_tree(from: &Path, to: &Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            std::fs::create_dir_all(&target).unwrap();
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// LMCache 0.5.6 installed into a vLLM environment from [`vllm_env`]: its
+/// package, its dist-info and its console script (which must never run),
+/// and vLLM 0.32.0's KV transfer configuration.
+fn install_lmcache(env: &Path) {
+    let site = env.join("lib/python3.12/site-packages");
+    copy_tree(&Path::new(LMCACHE_FIXTURES).join("lmcache-0.5.6"), &site);
+    copy_tree(&Path::new(LMCACHE_FIXTURES).join("vllm-0.32.0"), &site);
+    let dist = site.join("lmcache-0.5.6.dist-info");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(dist.join("METADATA"), "Name: lmcache\nVersion: 0.5.6\n").unwrap();
+    std::fs::write(
+        dist.join("entry_points.txt"),
+        "[console_scripts]\nlmcache = lmcache.cli.main:main\n",
+    )
+    .unwrap();
+    script(&env.join("bin/lmcache"), "exit 97");
+}
+
+fn add_named(path: &Path, profile: &str) -> Command {
+    let mut command = add(path);
+    if let Command::EngineAdd { name, .. } = &mut command {
+        *name = Some(profile.into());
+    }
+    command
+}
+
+// T45 (ADR 0033 §1): `engine add` records the environment's LMCache version
+// and the digest of its files on the profile, read from the files; a profile
+// without LMCache records nothing.
+#[tokio::test]
+async fn add_records_lmcache_version_and_digest() {
+    let dir = private_dir();
+    let with = vllm_env(&dir.path().join("w"), "0.32.0", "0.32.0", &[]);
+    install_lmcache(&with);
+    let without = vllm_env(&dir.path().join("o"), "0.32.0", "0.32.0", &[]);
+    let document = host_doc(dir.path());
+    let out = execute(&add_named(&with, "with"), Some(&document), dir.path())
+        .await
+        .unwrap();
+    execute(&add_named(&without, "without"), Some(&document), dir.path())
+        .await
+        .unwrap();
+    let engines = engines_of(&document);
+    let recorded = &engines.profiles["with"]["lmcache"];
+    assert_eq!(recorded["version"], "0.5.6", "{recorded}");
+    let digest = recorded["digest"].as_str().unwrap();
+    assert!(
+        digest.starts_with("sha256:") && digest.len() == 71,
+        "{digest}"
+    );
+    assert_eq!(out["lmcache"], *recorded);
+    let measured = capyctl_agent::lmcache_install::measure_lmcache(
+        &capyctl_agent::installation::InstallationMeasurer::new(),
+        &with.join("bin/vllm"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(measured.digest, digest);
+    assert!(engines.profiles["without"].get("lmcache").is_none());
+}
+
+// T45 (ADR 0033 §9): `engine list` shows the registered LMCache version, or
+// `off (<reason>)`, in the `LMCACHE` column and the `lmcache` JSON field:
+// on for vLLM 0.32.0 with LMCache 0.5.6, `engine_version_unsupported` for
+// vLLM 0.29.0, `not_installed` without the package, `not_registered` for a
+// package installed after `engine add`, `check_failed` naming a missing
+// file, and `engine_unsupported` for TensorFold. Nothing in the
+// environments runs.
+#[test]
+fn list_shows_lmcache_on_or_off_with_the_reason() {
+    let dir = private_dir();
+    let document = host_doc(dir.path());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let register = |env: &Path, name: &str| {
+        runtime
+            .block_on(execute(&add_named(env, name), Some(&document), dir.path()))
+            .unwrap();
+    };
+    let on = vllm_env(&dir.path().join("on"), "0.32.0", "0.32.0", &[]);
+    install_lmcache(&on);
+    register(&on, "on");
+    let old = vllm_env(&dir.path().join("old"), "0.29.0", "0.29.0", &[]);
+    install_lmcache(&old);
+    register(&old, "old");
+    let bare = vllm_env(&dir.path().join("bare"), "0.32.0", "0.32.0", &[]);
+    register(&bare, "bare");
+    let late = vllm_env(&dir.path().join("late"), "0.32.0", "0.32.0", &[]);
+    register(&late, "late");
+    install_lmcache(&late);
+    let broken = vllm_env(&dir.path().join("broken"), "0.32.0", "0.32.0", &[]);
+    install_lmcache(&broken);
+    register(&broken, "broken");
+    std::fs::remove_file(
+        broken
+            .join("lib/python3.12/site-packages/lmcache/integration/vllm/lmcache_mp_connector.py"),
+    )
+    .unwrap();
+    let tf = tensorfold_env(&dir.path().join("tf"), "0.6.6", &["ninja", "nvcc", "c++"]);
+    register(&tf, "tf");
+    // Every program of every environment now records that it ran.
+    let marker = dir.path().join("ran");
+    for env in [&on, &old, &bare, &late, &broken] {
+        for program in ["vllm", "python3", "lmcache"] {
+            script(
+                &env.join("bin").join(program),
+                &format!("touch {}; exit 97", marker.display()),
+            );
+        }
+    }
+
+    let list = ["engine", "list", "--config", document.to_str().unwrap()];
+    let json = capyctl(dir.path(), &[&list[..], &["--format", "json"]].concat());
+    let value: Value = serde_json::from_str(&json).unwrap();
+    let row = |name: &str| {
+        value["engines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["profile"] == name)
+            .unwrap_or_else(|| panic!("{json}"))["lmcache"]
+            .clone()
+    };
+    assert_eq!(
+        row("on"),
+        json!({"state": "on", "version": "0.5.6", "drift": false})
+    );
+    for (name, reason) in [
+        ("old", "engine_version_unsupported"),
+        ("bare", "not_installed"),
+        ("late", "not_registered"),
+        ("broken", "check_failed"),
+        ("tf", "engine_unsupported"),
+    ] {
+        let view = row(name);
+        assert_eq!(view["state"], "off", "{name}: {view}");
+        assert_eq!(view["reason"], reason, "{name}: {view}");
+    }
+    assert_eq!(row("old")["detail"], "LMCache needs vLLM 0.32.0 or newer");
+    assert!(
+        row("broken")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("lmcache/integration/vllm/lmcache_mp_connector.py is missing"),
+        "{json}"
+    );
+
+    let table = capyctl(dir.path(), &list);
+    let header = table.lines().next().unwrap();
+    let column = header.find("LMCACHE").unwrap_or_else(|| panic!("{table}"));
+    let cell = |name: &str| {
+        let line = table
+            .lines()
+            .find(|l| l.starts_with(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("{table}"));
+        line[column..]
+            .split("   ")
+            .next()
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    assert_eq!(cell("on"), "0.5.6", "{table}");
+    assert_eq!(cell("old"), "off (engine_version_unsupported)", "{table}");
+    assert_eq!(cell("bare"), "off (not_installed)", "{table}");
+    assert_eq!(cell("late"), "off (not_registered)", "{table}");
+    assert_eq!(cell("broken"), "off (check_failed)", "{table}");
+    assert_eq!(cell("tf"), "off (engine_unsupported)", "{table}");
+    assert!(
+        !marker.exists(),
+        "engine list ran a program of an environment"
     );
 }

@@ -64,6 +64,11 @@ pub struct HostCandidate {
     /// ADR 0013 §4 step 5 for devices: the device the instance last ran on,
     /// when this host is the one it last ran on.
     pub preferred_device: Option<String>,
+    /// ADR 0017, ADR 0033 §13: the closed refusal a feature gate gives this
+    /// host for this deployment (`host_capability_missing:lmcache`,
+    /// `lmcache_unavailable:host_off`, ...), whatever its eligibility now.
+    /// The host is refused with that code, never as a generic ineligible one.
+    pub gate: Option<&'static str>,
 }
 
 /// Why a host cannot take the instance.
@@ -82,6 +87,9 @@ pub enum HostRefusal {
     /// Owner decision 2026-09-23: a whole-host first start while another
     /// owner holds a charge on the host.
     RequiresEmptyHost,
+    /// ADR 0017, ADR 0033 §13: a feature gate refused the host with its own
+    /// closed code (`HostCandidate::gate`).
+    Gate(&'static str),
 }
 
 impl HostRefusal {
@@ -95,6 +103,7 @@ impl HostRefusal {
             Self::Insufficient => "insufficient_capacity",
             Self::Invalid => "invalid_footprint",
             Self::RequiresEmptyHost => "startup_requires_empty_host",
+            Self::Gate(code) => code,
         }
     }
 }
@@ -119,7 +128,7 @@ pub struct Unplaceable {
 
 impl Unplaceable {
     /// The one closed diagnostic for status: the first host's reason when all
-    /// agree, otherwise that no allowed host fits.
+    /// agree (a gate's own code included), otherwise that no allowed host fits.
     pub fn code(&self) -> &'static str {
         match self.refusals.as_slice() {
             [] => "no_allowed_host",
@@ -217,7 +226,11 @@ pub fn place(
     let mut fitting = Vec::new();
     let mut refusals = Vec::new();
     for candidate in candidates {
-        let verdict = if !candidate.eligible {
+        // A gate is a fact about the deployment on this host, so it is named
+        // even when the host is also ineligible now.
+        let verdict = if let Some(code) = candidate.gate {
+            Err(HostRefusal::Gate(code))
+        } else if !candidate.eligible {
             Err(HostRefusal::Ineligible)
         } else if max_per_host.is_some_and(|max| candidate.instances_here >= max) {
             Err(HostRefusal::MaxPerHost)
@@ -312,6 +325,9 @@ pub fn fits_group(
     for (host, owner) in owners {
         let verdict = match candidates.iter().find(|c| &c.host_id == host) {
             None => Err(HostRefusal::Ineligible),
+            Some(&HostCandidate {
+                gate: Some(code), ..
+            }) => Err(HostRefusal::Gate(code)),
             Some(c) if !c.eligible => Err(HostRefusal::Ineligible),
             Some(c) if c.occupied => Err(HostRefusal::Occupied),
             Some(c) => candidate_fits(c, owner).map(drop),
@@ -531,6 +547,7 @@ mod tests {
             whole_host: false,
             device_options: vec![],
             preferred_device: None,
+            gate: None,
         }
     }
 
@@ -553,6 +570,62 @@ mod tests {
         assert_eq!(
             Unplaceable { refusals: vec![] }.detail(&[], "d"),
             "no allowed host resolved the deployment's revision"
+        );
+    }
+
+    // T45 T36 (ADR 0033 §13, ADR 0017): a host a feature gate refuses is
+    // refused with the gate's own closed code, never as a generic ineligible
+    // host, even when it is also ineligible now; the instance goes to the
+    // other host. When every host is refused by the same gate, that code is
+    // the diagnostic.
+    #[test]
+    fn a_gated_host_is_refused_with_its_own_code() {
+        let mut a = host("a", 100 * GIB, 0, &[]);
+        a.gate = Some("lmcache_unavailable:host_off");
+        let b = host("b", 50 * GIB, 0, &[]);
+        let placed = place(
+            &[a.clone(), b.clone()],
+            "d",
+            Strategy::Spread,
+            None,
+            Some("a"),
+        )
+        .unwrap();
+        assert_eq!(placed.host_id, "b");
+
+        let mut b = b;
+        b.gate = Some("lmcache_unavailable:host_off");
+        b.eligible = false;
+        let refused =
+            place(&[a.clone(), b.clone()], "d", Strategy::Spread, None, None).unwrap_err();
+        assert_eq!(refused.code(), "lmcache_unavailable:host_off");
+        assert_eq!(
+            refused.detail(&[a.clone(), b.clone()], "d"),
+            "host a: lmcache_unavailable:host_off; host b: lmcache_unavailable:host_off"
+        );
+
+        b.gate = Some("host_capability_missing:lmcache");
+        let refused =
+            place(&[a.clone(), b.clone()], "d", Strategy::Spread, None, None).unwrap_err();
+        assert_eq!(refused.code(), "no_host_fits");
+
+        let owners: BTreeMap<String, String> = [("a", "m0"), ("b", "m1")]
+            .map(|(h, o)| (h.to_owned(), o.to_owned()))
+            .into_iter()
+            .collect();
+        let refused = fits_group(&[a, b], &owners).unwrap_err();
+        assert_eq!(
+            refused.refusals,
+            vec![
+                (
+                    "a".to_owned(),
+                    HostRefusal::Gate("lmcache_unavailable:host_off")
+                ),
+                (
+                    "b".to_owned(),
+                    HostRefusal::Gate("host_capability_missing:lmcache")
+                ),
+            ]
         );
     }
 
@@ -1068,6 +1141,7 @@ mod group_tests {
             whole_host: false,
             device_options: vec![],
             preferred_device: None,
+            gate: None,
         };
         let owners: BTreeMap<String, String> = [("host-a", "m0"), ("host-b", "m1")]
             .map(|(h, o)| (h.to_owned(), o.to_owned()))

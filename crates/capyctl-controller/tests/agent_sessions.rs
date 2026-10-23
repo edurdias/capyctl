@@ -944,6 +944,7 @@ impl capyctl_agent::session::SessionExecution for LoadingExecutor {
                     latency: None,
                     max_running: None,
                 }],
+                lmcache: Vec::new(),
             }
             .to_wire()]
         }))
@@ -1262,6 +1263,7 @@ async fn a_checkpoint_mismatch_is_answered_and_the_session_stays_up() {
                 checkpoint_gguf: None,
                 startup_bytes: None,
                 startup_host_bytes: None,
+                lmcache: None,
             },
         ),
     };
@@ -1395,6 +1397,7 @@ fn launch_command(
                 checkpoint_gguf: None,
                 startup_bytes: None,
                 startup_host_bytes: None,
+                lmcache: None,
             },
         ),
     };
@@ -2105,6 +2108,7 @@ async fn a_replaced_session_leaves_no_load_behind() {
                         latency: None,
                         max_running: None,
                     }],
+                    lmcache: Vec::new(),
                 }
                 .to_wire(),
             )),

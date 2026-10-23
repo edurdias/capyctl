@@ -264,6 +264,18 @@ pub struct InstallationView {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub observed_digest: String,
     pub capabilities_missing: Vec<String>,
+    /// ADR 0033 §1: the profile's LMCache drifted from its registration;
+    /// absent otherwise and from an older host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lmcache: Option<LmcacheDriftView>,
+}
+/// ADR 0033 §1: LMCache in a profile's environment changed since `engine add`.
+#[derive(Clone, serde::Serialize)]
+pub struct LmcacheDriftView {
+    /// Always `drifted`.
+    pub state: &'static str,
+    /// The digest the last launch-time check measured instead.
+    pub observed_digest: String,
 }
 impl ProfileView {
     fn of(p: &pb::RuntimeProfileStatus) -> Self {
@@ -277,6 +289,10 @@ impl ProfileView {
                 state: p.installation_state.clone(),
                 observed_digest: p.installation_observed_digest.clone(),
                 capabilities_missing: p.capabilities_missing.clone(),
+                lmcache: (!p.lmcache_observed_digest.is_empty()).then(|| LmcacheDriftView {
+                    state: "drifted",
+                    observed_digest: p.lmcache_observed_digest.clone(),
+                }),
             },
         }
     }
@@ -301,6 +317,7 @@ fn installation_fields_valid(p: &pb::RuntimeProfileStatus) -> bool {
         && (p.installation_observed_digest.is_empty()
             || p.installation_observed_digest == "unmeasured"
             || digest(&p.installation_observed_digest))
+        && (p.lmcache_observed_digest.is_empty() || digest(&p.lmcache_observed_digest))
         && p.capabilities_missing.len() <= 8
         && p.capabilities_missing
             .iter()
@@ -334,6 +351,37 @@ fn newly_drifted(
                 new.installation_digest.clone(),
                 new.installation_observed_digest.clone(),
             )
+        })
+        .collect()
+}
+/// ADR 0033 §1: the LMCache drifts `new` reports that `old` did not (a new
+/// drift, or a drift to a different observed digest), each as the
+/// installation `<profile>:lmcache` with the registered digest the approved
+/// `document` gives the profile (`runtime_profiles.<name>.lmcache.digest`).
+/// A profile the document registers no LMCache for is left out.
+fn newly_lmcache_drifted(
+    new: &[pb::RuntimeProfileStatus],
+    old: &[pb::RuntimeProfileStatus],
+    document: &serde_json::Value,
+) -> Vec<(String, String, String)> {
+    new.iter()
+        .filter(|new| {
+            !new.lmcache_observed_digest.is_empty()
+                && old
+                    .iter()
+                    .find(|previous| previous.name == new.name)
+                    .is_none_or(|previous| {
+                        previous.lmcache_observed_digest != new.lmcache_observed_digest
+                    })
+        })
+        .filter_map(|new| {
+            let registered =
+                document["runtime_profiles"][new.name.as_str()]["lmcache"]["digest"].as_str()?;
+            Some((
+                format!("{}:lmcache", new.name),
+                registered.to_owned(),
+                new.lmcache_observed_digest.clone(),
+            ))
         })
         .collect()
 }
@@ -1402,7 +1450,13 @@ impl AgentSessions {
                                     // controller clock, so pre-send freshness never sees a future sample.
                                     // ADR 0008 (owner decision 2026-09-23): a drift the host newly
                                     // reports is journaled once; status follows what it reports.
-                                    let drifts = newly_drifted(&inventory.profiles, &old.profiles);
+                                    // ADR 0033 §1: LMCache's drift too, as `<profile>:lmcache`.
+                                    let mut drifts = newly_drifted(&inventory.profiles, &old.profiles);
+                                    drifts.extend(newly_lmcache_drifted(
+                                        &inventory.profiles,
+                                        &old.profiles,
+                                        &serde_json::from_str(&inventory.approved_host_config_json).unwrap_or_default(),
+                                    ));
                                     after = After::Refresh(Box::new(inventory), drifts);
                                     false
                                 }
@@ -1473,6 +1527,12 @@ impl AgentSessions {
                                         .map_err(|_| Status::invalid_argument("invalid host load report"))?;
                                     // SPEC §17 (M80): latency deltas ride on the same report.
                                     self.latency.accept(&host, &report, capyctl_protocol::now_unix_ms());
+                                    // ADR 0033 §§6, 12: the host's measurement of each
+                                    // LMCache server group, recorded for later launches
+                                    // of its revision there (evidence only).
+                                    if report.host_id == host {
+                                        self.authority.record_lmcache_samples(&host, &report.lmcache);
+                                    }
                                     self.load.accept(&host, report, capyctl_protocol::now_unix_ms()).map_err(|_| denied())?;
                                     false
                                 }
@@ -2290,6 +2350,145 @@ mod installation_tests {
             pinned_drifts(&unmeasured, &inventory.profiles),
             vec![("serve".to_owned(), pinned, "unmeasured".to_owned())]
         );
+    }
+
+    // T45 T21 T22 (ADR 0033 §1, ADR 0008): a reconciled host's status
+    // refresh reporting a profile's LMCache drift. The refresh is checked
+    // (an observed digest that is not `sha256:` and 64 lowercase hex digits
+    // refuses the whole refresh), the `/hosts` profile view shows
+    // `installation.lmcache: {state: drifted, observed_digest}` (absent
+    // without drift), and the drift is journaled in the real store once as
+    // the installation `<profile>:lmcache` with the digest the approved
+    // document registered: not again on an unchanged report, again on a new
+    // observed digest, never for a profile the document registers no LMCache
+    // for. The steps are the ones the session's refresh arm takes, in order.
+    #[test]
+    fn an_lmcache_drift_is_checked_shown_and_journaled_once_per_digest() {
+        use std::os::unix::fs::PermissionsExt;
+        let state_dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::ownership::OwnedCoordinatorState::open(state_dir.path()).unwrap(),
+        ));
+        let authority = crate::enrollment::EnrollmentAuthority::new(
+            state.clone(),
+            capyctl_agent::identity::CertificateAuthority::generate(100).unwrap(),
+        );
+        let registered = format!("sha256:{}", "1".repeat(64));
+        let (first, second) = (
+            format!("sha256:{}", "b".repeat(64)),
+            format!("sha256:{}", "c".repeat(64)),
+        );
+        let document = serde_json::json!({"runtime_profiles": {
+            "vllm": {"engine": "vllm",
+                "lmcache": {"version": "0.5.6", "digest": registered}},
+            "sglang": {"engine": "sglang"},
+        }})
+        .to_string();
+        let report = |vllm: &str, sglang: &str| pb::ReportInventory {
+            approved_host_config_json: document.clone(),
+            profiles: vec![
+                pb::RuntimeProfileStatus {
+                    name: "vllm".into(),
+                    lmcache_observed_digest: vllm.into(),
+                    ..measured()
+                },
+                pb::RuntimeProfileStatus {
+                    name: "sglang".into(),
+                    lmcache_observed_digest: sglang.into(),
+                    ..measured()
+                },
+            ],
+            ..Default::default()
+        };
+        // The refresh arm: refused unless every profile's fields are valid;
+        // the new drifts journaled through the authority; the views shown.
+        let refresh = |new: &pb::ReportInventory, old: &pb::ReportInventory| {
+            if !new.profiles.iter().all(installation_fields_valid) {
+                return None;
+            }
+            let mut drifts = newly_drifted(&new.profiles, &old.profiles);
+            drifts.extend(newly_lmcache_drifted(
+                &new.profiles,
+                &old.profiles,
+                &serde_json::from_str(&new.approved_host_config_json).unwrap_or_default(),
+            ));
+            for (name, registered, observed) in drifts {
+                authority
+                    .record_installation_drift("01HOSTA", &name, &registered, &observed)
+                    .expect("the journal accepts the drift");
+            }
+            Some(
+                new.profiles
+                    .iter()
+                    .map(|p| serde_json::to_value(ProfileView::of(p)).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let journaled = || -> Vec<serde_json::Value> {
+            state
+                .lock()
+                .unwrap()
+                .store()
+                .events_after(None, 1000)
+                .unwrap()
+                .events
+                .into_iter()
+                .filter(|event| event.kind == "installation_drift_flagged")
+                .map(|event| serde_json::from_str(&event.payload_json).unwrap())
+                .collect()
+        };
+
+        let clean = report("", "");
+        let views = refresh(&clean, &clean).unwrap();
+        assert!(views[0]["installation"].get("lmcache").is_none());
+        assert!(journaled().is_empty());
+
+        let drifted = report(&first, &first);
+        let views = refresh(&drifted, &clean).unwrap();
+        assert_eq!(
+            views[0]["installation"]["lmcache"],
+            serde_json::json!({"state": "drifted", "observed_digest": first})
+        );
+        assert_eq!(
+            views[1]["installation"]["lmcache"]["state"], "drifted",
+            "shown even when the document registers no LMCache"
+        );
+        let events = journaled();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["host_id"], "01HOSTA");
+        assert_eq!(events[0]["installation"], "vllm:lmcache");
+        assert_eq!(events[0]["registered_digest"], registered.as_str());
+        assert_eq!(events[0]["observed_digest"], first.as_str());
+
+        refresh(&drifted, &drifted).unwrap();
+        assert_eq!(journaled().len(), 1, "an unchanged report journals nothing");
+
+        let moved = report(&second, &first);
+        refresh(&moved, &drifted).unwrap();
+        let events = journaled();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[1]["installation"], "vllm:lmcache");
+        assert_eq!(events[1]["observed_digest"], second.as_str());
+
+        let views = refresh(&clean, &moved).unwrap();
+        assert!(views[0]["installation"].get("lmcache").is_none());
+        assert_eq!(journaled().len(), 2, "a cleared drift journals nothing");
+
+        for bad in [
+            "unmeasured".to_owned(),
+            "md5:abc".to_owned(),
+            "sha256:short".to_owned(),
+            format!("sha256:{}", "B".repeat(64)),
+            format!("sha256:{}", "b".repeat(65)),
+        ] {
+            assert!(refresh(&report(&bad, ""), &clean).is_none(), "{bad}");
+        }
+        assert_eq!(journaled().len(), 2, "a refused refresh journals nothing");
+        // The name the embedded journal used before was never a valid one.
+        assert!(authority
+            .record_installation_drift("01HOSTA", "vllm (LMCache)", &registered, &first)
+            .is_err());
     }
 }
 

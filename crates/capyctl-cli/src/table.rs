@@ -275,6 +275,20 @@ fn hosts(value: &Value) -> String {
         {
             out.push_str(&format!("warning: {}: {}\n", clean(name), clean(warning)));
         }
+        // ADR 0033 §1: a profile whose LMCache changed since `engine add`.
+        for profile in host["session"]["profiles"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| p["installation"]["lmcache"]["state"] == "drifted")
+        {
+            out.push_str(&format!(
+                "warning: {}: LMCache of profile {} drifted from its registration: measured {}\n",
+                clean(name),
+                text(&profile["name"]),
+                text(&profile["installation"]["lmcache"]["observed_digest"])
+            ));
+        }
     }
     out
 }
@@ -666,6 +680,20 @@ fn status(value: &Value, names: &HostNames) -> String {
             out.push_str(&line);
         }
     }
+    // ADR 0033 §9: each instance's LMCache, on with its pool, charge and
+    // server, or off with why.
+    let lmcache: Vec<String> = d["instances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(lmcache_line)
+        .collect();
+    if !lmcache.is_empty() {
+        out.push('\n');
+        for line in lmcache {
+            out.push_str(&line);
+        }
+    }
     if let Some(engine) = d["engine"].as_str() {
         out.push_str(&format!("\nEngine  {engine}\n"));
     } else if d["installation"].is_object() {
@@ -678,6 +706,11 @@ fn status(value: &Value, names: &HostNames) -> String {
         ));
         if let Some(note) = d["engine_note"].as_str() {
             out.push_str(&format!("note: {note}\n"));
+        }
+        // ADR 0033 §1: LMCache in the engine's environment changed since
+        // `engine add` registered it.
+        if let Some(line) = lmcache_drift(&i["lmcache"]) {
+            out.push_str(&line);
         }
     }
     if let Some(line) = parsers(&d["parsers"]) {
@@ -742,6 +775,67 @@ fn cancelling_line(instance: &Value) -> Option<String> {
         "Instance {}  cancelling: {count}{settles}\n",
         text(&instance["index"])
     ))
+}
+
+/// ADR 0033 §9: one instance's LMCache line, absent when status has none:
+/// `LMCache   instance 0 on: pool 4.0 GiB, ...` or `... off: <why>`.
+fn lmcache_line(instance: &Value) -> Option<String> {
+    let lmcache = instance.get("lmcache").filter(|l| l.is_object())?;
+    let index = text(&instance["index"]);
+    if lmcache["state"] != "on" {
+        return Some(format!(
+            "LMCache   instance {index} off: {}\n",
+            text(&lmcache["message"])
+        ));
+    }
+    let mut parts = Vec::new();
+    if let Some(pool) = number(&lmcache["pool_bytes"]) {
+        parts.push(format!("pool {}", gib(pool)));
+    }
+    if let Some(used) = number(&lmcache["used_bytes"]) {
+        parts.push(format!("used {}", gib(used)));
+    }
+    if let Some(overhead) = number(&lmcache["overhead_bytes"]) {
+        parts.push(format!(
+            "overhead {} ({})",
+            gib(overhead),
+            if lmcache["measured"] == true {
+                "measured"
+            } else {
+                "allowance"
+            }
+        ));
+    }
+    if let Some(device) = number(&lmcache["device_bytes"]).filter(|d| *d > 0) {
+        parts.push(format!("GPU {}", gib(device)));
+    }
+    if let Some(charge) = number(&lmcache["charge_bytes"]) {
+        parts.push(format!("charged {}", gib(charge)));
+    }
+    if let Some(server) = lmcache["server"].as_str() {
+        parts.push(format!("server {}", clean(server)));
+    }
+    match (number(&lmcache["hits"]), number(&lmcache["lookups"])) {
+        (Some(hits), Some(lookups)) => parts.push(format!("{hits} hits / {lookups} lookups")),
+        (Some(hits), None) => parts.push(format!("{hits} hits")),
+        _ => {}
+    }
+    Some(format!(
+        "LMCache   instance {index} on: {}\n",
+        parts.join(", ")
+    ))
+}
+
+/// ADR 0033 §1: LMCache drifted from the registration `engine add` made,
+/// as an installation view reports it (`state: drifted`).
+fn lmcache_drift(view: &Value) -> Option<String> {
+    (view["state"] == "drifted").then(|| {
+        format!(
+            "LMCache drifted from its registration: registered {}, measured {}\n",
+            text(&view["digest"]),
+            text(&view["observed_digest"])
+        )
+    })
 }
 
 /// ADR 0023 §4 (amended 2026-10-03): the requests a TensorFold launch decodes
@@ -819,6 +913,7 @@ fn engines(value: &Value) -> String {
                 text(&e["version"]),
                 text(&e["custom"]),
                 text(&e["deep_park"]),
+                lmcache_cell(&e["lmcache"]),
                 // ADR 0031 §6, §7: a custom engine's idle signal and engine key.
                 text(&e["idle_signal"]),
                 text(&e["engine_key"]),
@@ -835,6 +930,7 @@ fn engines(value: &Value) -> String {
             "VERSION",
             "CUSTOM",
             "DEEP PARK",
+            "LMCACHE",
             "IDLE SIGNAL",
             "ENGINE KEY",
             "STATE",
@@ -842,6 +938,19 @@ fn engines(value: &Value) -> String {
         ],
         &rows,
     )
+}
+
+/// ADR 0033 §9: the registered LMCache version, or `off (<reason>)`; `-`
+/// where a row carries no LMCache view (a server older than 0.1.7).
+fn lmcache_cell(view: &Value) -> String {
+    match view["state"].as_str() {
+        Some("on") => text(&view["version"]),
+        Some("off") => format!(
+            "off ({})",
+            clean(view["reason"].as_str().unwrap_or("unknown"))
+        ),
+        _ => "-".into(),
+    }
 }
 
 fn local_engines(value: &Value) -> String {
@@ -857,6 +966,7 @@ fn local_engines(value: &Value) -> String {
                 text(&e["version"]),
                 text(&e["custom"]),
                 text(&e["deep_park"]),
+                lmcache_cell(&e["lmcache"]),
                 // ADR 0031 §6, §7: a custom engine's idle signal and engine key.
                 text(&e["idle_signal"]),
                 text(&e["engine_key"]),
@@ -873,6 +983,7 @@ fn local_engines(value: &Value) -> String {
             "VERSION",
             "CUSTOM",
             "DEEP PARK",
+            "LMCACHE",
             "IDLE SIGNAL",
             "ENGINE KEY",
             "PUBLISHED",
@@ -1053,6 +1164,92 @@ mod tests {
             "{out}"
         );
         assert!(!host(Value::Null).contains("warning"));
+    }
+
+    // T45 (ADR 0033 §1): a host's profile whose LMCache drifted from its
+    // registration is warned below the hosts table, by host and profile,
+    // with the digest measured; a profile without drift, and a host without
+    // any, add nothing. The profiles are the server's own `/hosts` view
+    // serialized.
+    #[test]
+    fn hosts_warn_of_a_drifted_lmcache_below_the_table() {
+        use capyctl_controller::agent_sessions::{InstallationView, LmcacheDriftView, ProfileView};
+        let observed = format!("sha256:{}", "b".repeat(64));
+        let profile = |name: &str, lmcache: Option<LmcacheDriftView>| {
+            serde_json::to_value(ProfileView {
+                name: name.into(),
+                build_fingerprint: "vllm-0.32.0".into(),
+                eligibility: "eligible".into(),
+                installation: InstallationView {
+                    version: "0.32.0".into(),
+                    digest: format!("sha256:{}", "a".repeat(64)),
+                    state: "measured".into(),
+                    observed_digest: String::new(),
+                    capabilities_missing: vec![],
+                    lmcache,
+                },
+            })
+            .unwrap()
+        };
+        let hosts = |profiles: Vec<Value>| {
+            render(
+                View::Hosts,
+                &json!({"hosts": [{"host_id": "01HOSTA", "name": "gpu-a", "online": true,
+                    "session": {"reconciled": true, "profiles": profiles}}]}),
+                &HostNames::new(),
+            )
+        };
+        let out = hosts(vec![
+            profile(
+                "vllm-lmcache",
+                Some(LmcacheDriftView {
+                    state: "drifted",
+                    observed_digest: observed.clone(),
+                }),
+            ),
+            profile("sglang", None),
+        ]);
+        assert!(
+            out.ends_with(&format!(
+                "\nwarning: gpu-a: LMCache of profile vllm-lmcache drifted from its \
+                 registration: measured {observed}\n"
+            )),
+            "{out}"
+        );
+        assert_eq!(out.matches("warning").count(), 1, "{out}");
+        let out = hosts(vec![profile("vllm-lmcache", None)]);
+        assert!(!out.contains("warning"), "{out}");
+    }
+
+    // T45 (ADR 0033 §1): standalone status says, under the engine line, that
+    // the LMCache in the engine's environment drifted from its registration,
+    // with both digests; nothing while it has not. The installation object is
+    // shaped as the embedded installation view emits it.
+    #[test]
+    fn status_warns_of_a_drifted_lmcache_under_the_engine_line() {
+        let registered = format!("sha256:{}", "a".repeat(64));
+        let observed = format!("sha256:{}", "b".repeat(64));
+        let mut d = json!({"name": "m", "observed_state": "ready", "instances": [],
+            "installation": {"profile": "local", "executable": "/opt/vllm/bin/vllm",
+                "version": "0.32.0", "digest": format!("sha256:{}", "c".repeat(64)),
+                "state": "measured", "capabilities_missing": []}});
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(
+            out.ends_with("\nEngine  local 0.32.0 (/opt/vllm/bin/vllm)\n"),
+            "{out}"
+        );
+        assert!(!out.contains("LMCache"), "{out}");
+        d["installation"]["lmcache"] = json!({"state": "drifted", "digest": registered,
+            "observed_digest": observed});
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(
+            out.ends_with(&format!(
+                "\nEngine  local 0.32.0 (/opt/vllm/bin/vllm)\n\
+                 LMCache drifted from its registration: registered {registered}, \
+                 measured {observed}\n"
+            )),
+            "{out}"
+        );
     }
 
     #[test]
@@ -1464,18 +1661,22 @@ mod tests {
             View::Engines,
             &json!({"engines": [{"host_id": "01HOSTA", "host": "gpu-a", "online": true,
                 "profile": "vllm", "engine": "vllm", "version": "0.11.0", "custom": false,
-                "deep_park": "enabled", "retiring": false, "deployments": ["chat"]}]}),
+                "deep_park": "enabled", "retiring": false, "deployments": ["chat"],
+                "lmcache": {"state": "off", "reason": "engine_version_unsupported",
+                    "detail": "LMCache needs vLLM 0.32.0 or newer"}}]}),
             &HostNames::new(),
         );
+        // ADR 0033 §9: `LMCACHE` is the version or `off (<reason>)`.
         assert_eq!(
             out.lines().nth(1).unwrap(),
-            "gpu-a   vllm      vllm     0.11.0    no       enabled     -             -            online   chat"
+            "gpu-a   vllm      vllm     0.11.0    no       enabled     off (engine_version_unsupported)   -             -            online   chat"
         );
         let local = render(
             View::LocalEngines,
             &json!({"engines": [{"profile": "local-vllm", "source": "environment",
                 "engine": "vllm", "version": "0.11.0", "custom": true,
-                "deep_park": null, "published": "published", "deployments": []}]}),
+                "deep_park": null, "published": "published", "deployments": [],
+                "lmcache": {"state": "on", "version": "0.5.6", "drift": false}}]}),
             &HostNames::new(),
         );
         assert!(local
@@ -1487,7 +1688,7 @@ mod tests {
             .lines()
             .nth(1)
             .unwrap()
-            .ends_with("yes      -           -             -            published   -"));
+            .ends_with("yes      -           0.5.6     -             -            published   -"));
     }
 
     // T44 T37 (ADR 0031 §6, §7): a custom engine's row shows `CUSTOM yes`,
@@ -1500,12 +1701,14 @@ mod tests {
             &json!({"engines": [{"profile": "basal", "source": "custom-engines.yaml",
                 "engine": "custom", "version": "2.2.0", "custom": true,
                 "deep_park": "disabled", "idle_signal": "none", "engine_key": "none",
-                "published": "published", "deployments": []}]}),
+                "published": "published", "deployments": [],
+                "lmcache": {"state": "off", "reason": "engine_unsupported",
+                    "detail": "CapyCTL does not render options for a custom engine"}}]}),
             &HostNames::new(),
         );
         let row = local.lines().nth(1).unwrap();
         assert!(
-            row.starts_with("basal     custom-engines.yaml   custom   2.2.0     yes      disabled    none          none"),
+            row.starts_with("basal     custom-engines.yaml   custom   2.2.0     yes      disabled    off (engine_unsupported)   none          none"),
             "{local}"
         );
         let server = render(

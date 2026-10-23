@@ -77,6 +77,25 @@ const DEFAULT_ENGINE_PORTS: (u16, u16) = capyctl_config::engine_settings::DEFAUL
 /// root under the state directory, the same name a host uses.
 const RENDEZVOUS_DIR: &str = "rendezvous";
 
+/// ADR 0033 §4 (lifecycle design §1.8): the standalone root of each launch's
+/// private LMCache directory, under the state directory.
+const LMCACHE_DIR: &str = "lmcache";
+
+/// ADR 0033 §§9, 10: why the standalone host's settings forbid LMCache, if
+/// they do (`lmcache: off`, else `retention: zero`).
+fn lmcache_forbidden(
+    host: &capyctl_config::effective::HostPolicy,
+) -> Option<capyctl_config::lmcache::LmcacheOffReason> {
+    use capyctl_config::lmcache::{HostLmcache, LmcacheOffReason, Retention};
+    if host.lmcache == HostLmcache::Off {
+        Some(LmcacheOffReason::HostOff)
+    } else if host.retention == Retention::Zero {
+        Some(LmcacheOffReason::RetentionZero)
+    } else {
+        None
+    }
+}
+
 /// SPEC §8.2 / T21 (owner decision 2026-09-25): create the private rendezvous
 /// root (0700, this user) or refuse one that is not, as a host does; no
 /// permissions are changed. Then remove every directory in it that belongs to
@@ -1128,6 +1147,9 @@ impl EngineProvider for EnvEngineProvider {
             .with_device_totals(device_totals)
             .with_checkpoint_cache(cache)
             .with_rendezvous_root(log_dir.with_file_name(RENDEZVOUS_DIR))
+            // ADR 0033 §4 (lifecycle design §1.8): each launch's private
+            // LMCache directory, in the root the role created at start.
+            .with_lmcache_root(log_dir.with_file_name(LMCACHE_DIR))
             .with_engine_cache_root(log_dir.with_file_name("engines"));
         // SPEC §9.2 (W5): memory-saver SGLang launches enroll their saver
         // observation in a private directory beside the logs. One that cannot
@@ -1152,7 +1174,10 @@ impl EngineProvider for EnvEngineProvider {
     fn tools_factory(&self) -> ToolsFactory {
         // Spec §3: the builder owns the processes it launches, and the association
         // it is given is what records their identities before they can run.
-        Arc::new(|association| Arc::new(DurableProcessLaunch::new(association)))
+        // ADR 0033 §10: under the launch's spawn policy.
+        Arc::new(|association, policy| {
+            Arc::new(DurableProcessLaunch::new(association).with_policy(policy))
+        })
     }
 }
 
@@ -1930,6 +1955,8 @@ async fn start_standalone_in(
         );
         models.write_into(&mut host);
         crate::standalone_config::apply_stated_queue(&mut host, &stated_host);
+        // ADR 0033 §9, §10: the stated `lmcache` and `retention`, published.
+        capyctl_config::standalone::publish_host_settings(&mut host, &stated_host);
         // ADR 0028 §3: the host's group policy, by the shared writer.
         role.groups
             .write_into(&mut host)
@@ -1975,7 +2002,28 @@ async fn start_standalone_in(
             .retained_incarnations()
             .map_err(|error| StartError::Deploy(format!("retained launches: {error}")))?;
         prepare_rendezvous_root(state_dir, &retained)?;
+        // ADR 0033 §4 (lifecycle design §1.8): the private LMCache root,
+        // swept the same way of directories no retained launch owns.
+        let lmcache = state_dir.join(LMCACHE_DIR);
+        prepare_private_dir(&lmcache)?;
+        capyctl_agent::rendezvous::RendezvousRoot::new(lmcache).sweep(&retained);
     }
+    // ADR 0033 §§9, 10 (finding 9, live 2026-10-22): the `lmcache` and
+    // `retention` this start runs under, recorded before anything is placed
+    // or started, so LMCache is planned from them and not from the settings
+    // a revision was resolved under: a role restarted into `lmcache: off` or
+    // `retention: zero` relaunches, and later starts, without a server.
+    owner
+        .lock()
+        .map_err(|_| StartError::Deploy("ownership mutex poisoned".into()))?
+        .store()
+        .record_embedded_host_settings(
+            &declared_host.name,
+            declared_host.lmcache,
+            declared_host.retention,
+            capyctl_protocol::now_unix_ms(),
+        )
+        .map_err(|error| StartError::Deploy(format!("host LMCache settings: {error}")))?;
     // ADR 0023 §3: the private TensorFold build cache root.
     prepare_private_dir(&state_dir.join("engines"))?;
     let options = CoordinatorOptions {
@@ -1996,6 +2044,11 @@ async fn start_standalone_in(
             ready_idle_ms: idle.ready_idle.map(|d| d.as_millis() as i64),
             parked_idle_ms: idle.parked_idle.map(|d| d.as_millis() as i64),
         },
+        // ADR 0033 §§9, 10 (lifecycle design §9): a host that starts with
+        // `lmcache: off` or `retention: zero` stops, after adoption, every
+        // instance here whose launch runs a server.
+        retire_lmcache: lmcache_forbidden(&declared_host)
+            .map(|reason| (declared_host.name.clone(), reason)),
         ..Default::default()
     };
     // ADR 0008 (owner decision 2026-09-23): register each installation (its
@@ -2082,6 +2135,10 @@ async fn start_standalone_in(
             .spawn_until(supervision.cancel_signal()),
         );
     }
+    // ADR 0007 (found live 2026-09-23, matrix M33): credit the engines
+    // already resident here instead of charging them twice. ADR 0033 §6, A1:
+    // the same per-process sample measures the LMCache servers' GPU memory.
+    let residency = capyctl_agent::process_residency::ResidencySampler::nvidia();
     let coordinator = OwnedCoordinator::spawn_resolved(
         owner.clone(),
         Arc::new(
@@ -2092,9 +2149,7 @@ async fn start_standalone_in(
             ))
             .with_memory_reader(memory.clone())
             .with_gpu_sampler(gpu.clone())
-            // ADR 0007 (found live 2026-09-23, matrix M33): credit the
-            // engines already resident here instead of charging them twice.
-            .with_process_residency(capyctl_agent::process_residency::ResidencySampler::nvidia()),
+            .with_process_residency(residency.clone()),
         ),
         system_clock(),
         options,
@@ -2113,13 +2168,17 @@ async fn start_standalone_in(
     // by the coordinator at start; this supervisor re-proves each one locally
     // before dispatch reopens.
     supervision.supervise(
-        capyctl_controller::local_readiness::LocalReadiness::new(owner.clone())
-            .spawn_until(supervision.cancel_signal()),
+        capyctl_controller::local_readiness::LocalReadiness::on_host(
+            owner.clone(),
+            lmcache_forbidden(&declared_host).is_some(),
+        )
+        .spawn_until(supervision.cancel_signal()),
     );
     // SPEC §13.2 (W13): an embedded engine that exits is closed and settled with
     // verified cleanup. Supervised with readiness, so it ends with it.
     supervision.supervise(
         capyctl_controller::engine_exit::EngineExits::new(coordinator.commands())
+            .with_process_residency(residency)
             .spawn_local_until(supervision.cancel_signal()),
     );
     let configuration = Arc::new(

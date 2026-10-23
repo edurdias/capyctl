@@ -55,9 +55,7 @@ impl CustomAdapter {
                 // ADR 0031 §4, SPEC §10: CapyCTL cannot know a custom
                 // engine honours `cache_salt`, so a request carrying one is
                 // refused.
-                crate::forward::engine_honours_cache_salt(Some(
-                    capyctl_config::engine_policy::Engine::Custom.name(),
-                )),
+                crate::forward::CacheSalt::Refused,
             ),
             endpoint,
             fingerprint,

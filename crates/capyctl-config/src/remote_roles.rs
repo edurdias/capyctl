@@ -313,8 +313,13 @@ pub struct HostConfig {
     /// deployment that may run on this host ([`host_activation`]).
     pub activation: crate::instances::Activation,
     /// Owner decision 2026-10-20: `engine_logs`, where each launch's redacted
-    /// engine output is kept ([`engine_logs`]).
+    /// engine output is kept ([`engine_logs`]; `memory` under `retention:
+    /// zero`, ADR 0033 §10).
     pub engine_logs: EngineLogs,
+    /// ADR 0033 §9: the host's `lmcache` ([`host_lmcache`]).
+    pub lmcache: crate::lmcache::HostLmcache,
+    /// ADR 0033 §10: the host's `retention` ([`host_retention`]).
+    pub retention: crate::lmcache::Retention,
     /// Owner decision 2026-10-22: `engine_telemetry`, whether the engines'
     /// own usage reporting keeps its defaults ([`engine_telemetry`]).
     pub engine_telemetry: EngineTelemetry,
@@ -376,17 +381,66 @@ pub enum EngineLogs {
 }
 /// The `engine_logs` of a host document (or of a standalone document's
 /// `host:` block). Omitted, it is `files`; any value but `files` or `memory`
-/// is refused by name.
+/// is refused by name. ADR 0033 §10: under `retention: zero` it is `memory`,
+/// and a document that states `engine_logs: files` beside it is refused.
 pub fn engine_logs(document: &Value) -> Result<EngineLogs, ConfigError> {
-    match document.get("engine_logs") {
-        None => Ok(EngineLogs::Files),
+    let stated = match document.get("engine_logs") {
+        None => None,
         Some(value) => match value.as_str() {
-            Some("files") => Ok(EngineLogs::Files),
-            Some("memory") => Ok(EngineLogs::Memory),
+            Some("files") => Some(EngineLogs::Files),
+            Some("memory") => Some(EngineLogs::Memory),
+            _ => {
+                return Err(ConfigError::new(
+                    ConfigErrorCode::UnsupportedCombination,
+                    "engine_logs",
+                    "must be `files` or `memory`",
+                ))
+            }
+        },
+    };
+    match (host_retention(document)?, stated) {
+        (crate::lmcache::Retention::Zero, Some(EngineLogs::Files)) => Err(ConfigError::new(
+            ConfigErrorCode::UnsupportedCombination,
+            "retention",
+            "`retention: zero` keeps engine logs in memory, and `engine_logs: files` writes \
+             them to disk; remove one of them",
+        )),
+        (crate::lmcache::Retention::Zero, _) => Ok(EngineLogs::Memory),
+        (_, stated) => Ok(stated.unwrap_or_default()),
+    }
+}
+/// ADR 0033 §9: the `lmcache` of a host document (or of a standalone
+/// document's `host:` block). Omitted, it is `auto`; any value but `auto` or
+/// `off` is refused by name.
+pub fn host_lmcache(document: &Value) -> Result<crate::lmcache::HostLmcache, ConfigError> {
+    use crate::lmcache::HostLmcache;
+    match document.get("lmcache") {
+        None => Ok(HostLmcache::Auto),
+        Some(value) => match value.as_str() {
+            Some("auto") => Ok(HostLmcache::Auto),
+            Some("off") => Ok(HostLmcache::Off),
             _ => Err(ConfigError::new(
                 ConfigErrorCode::UnsupportedCombination,
-                "engine_logs",
-                "must be `files` or `memory`",
+                "lmcache",
+                "must be `auto` or `off`",
+            )),
+        },
+    }
+}
+/// ADR 0033 §10: the `retention` of a host document (or of a standalone
+/// document's `host:` block). Omitted, it is `standard`; any value but
+/// `standard` or `zero` is refused by name.
+pub fn host_retention(document: &Value) -> Result<crate::lmcache::Retention, ConfigError> {
+    use crate::lmcache::Retention;
+    match document.get("retention") {
+        None => Ok(Retention::Standard),
+        Some(value) => match value.as_str() {
+            Some("standard") => Ok(Retention::Standard),
+            Some("zero") => Ok(Retention::Zero),
+            _ => Err(ConfigError::new(
+                ConfigErrorCode::UnsupportedCombination,
+                "retention",
+                "must be `standard` or `zero`",
             )),
         },
     }
@@ -711,6 +765,8 @@ impl HostConfig {
             drain_timeout: drain_timeout(&document)?,
             activation: host_activation(&document)?,
             engine_logs: engine_logs(&document)?,
+            lmcache: host_lmcache(&document)?,
+            retention: host_retention(&document)?,
             engine_telemetry: engine_telemetry(&document)?,
             document,
             overrides: crate::setting_overrides::SettingOverrides::none(ConfigKind::Host),

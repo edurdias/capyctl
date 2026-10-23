@@ -149,7 +149,7 @@ pub fn live_identity(role: &str, pid: u32) -> capyctl_domain::completion::Proces
 /// The Fake launches no process, so there is never a recorded identity for these
 /// to signal; they exist because the coordinator gives every launch its tools.
 pub fn fake_tools_factory() -> ToolsFactory {
-    Arc::new(|_association| ScriptedTool::proving())
+    Arc::new(|_association, _policy| ScriptedTool::proving())
 }
 
 /// A coordinator that drives the Fake on every binding it is given.

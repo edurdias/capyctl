@@ -1090,6 +1090,204 @@ async fn a_host_named_rendezvous_directory_reaches_the_entry() {
     }
 }
 
+/// A process tool for a restart-parked launch: the LMCache server's group
+/// stands throughout, the engine group stops on request, and each wake
+/// spawn records whether the launch's rendezvous directory existed then
+/// (the entry refuses one that exists).
+struct RestartTool {
+    server: Vec<ProcessIdentity>,
+    engine: Vec<ProcessIdentity>,
+    rendezvous: std::path::PathBuf,
+    stopped: Mutex<Vec<Vec<ProcessIdentity>>>,
+    wakes: Mutex<Vec<(String, bool, Option<String>)>>,
+}
+
+impl OwnedProcessLaunch for RestartTool {
+    fn spawn_durable(&self, _: &str, _: &RenderedCommand) -> Result<ProcessIdentity, RuntimeError> {
+        Err(RuntimeError::Unsupported)
+    }
+    fn spawn_durable_wake(
+        &self,
+        _: &str,
+        wake: &str,
+        cmd: &RenderedCommand,
+        _: Option<&ProtectedLaunchDescriptors>,
+    ) -> Result<ProcessIdentity, RuntimeError> {
+        self.wakes.lock().unwrap().push((
+            wake.into(),
+            self.rendezvous.exists(),
+            cmd.env.get("CAPYCTL_RENDEZVOUS_DIR").cloned(),
+        ));
+        Ok(self.engine[0].clone())
+    }
+    fn present(&self, _: &ProcessIdentity) -> Presence {
+        Presence::Alive
+    }
+    fn observe_group(&self, _: &ProcessIdentity) -> Result<Vec<ProcessIdentity>, RuntimeError> {
+        Ok(self.engine.clone())
+    }
+    fn observe_lmcache_group(
+        &self,
+        _: &ProcessIdentity,
+    ) -> Result<Vec<ProcessIdentity>, RuntimeError> {
+        Ok(self.server.clone())
+    }
+    fn stop_group(&self, identities: &[ProcessIdentity], _: Duration) -> Result<(), RuntimeError> {
+        self.stopped.lock().unwrap().push(identities.to_vec());
+        Ok(())
+    }
+    fn terminate_owned(&self, _: &[ProcessIdentity], _: Duration) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+}
+
+/// A Park or Restore of the restart-parked launch, retaining `identities`.
+fn restart_step(
+    action: RuntimeAction,
+    step: &str,
+    identities: Vec<ProcessIdentity>,
+) -> RuntimeCommand {
+    let mut command = initialize_command(30_000);
+    command.action = action;
+    command.context.token.step_id = step.into();
+    command.context.identities = ExecutionIdentities::Retained(identities);
+    command.context.launch_settings = None;
+    command
+}
+
+/// SPEC §8.2 / T21, ADR 0033 §7 (found live on SGLang, 2026-10-23: an
+/// embedded restart-park's wake failed in about 2 s with
+/// `loopback_rendezvous_failed`, the stopped engine's rendezvous directory
+/// still there for the same incarnation): the embedded restart-park removes
+/// the launch's rendezvous directory once the engine's stop is verified, so
+/// the restore starts a new engine on the same server, handed the same
+/// directory, which does not exist when it is spawned.
+// T45 T21 T10
+#[tokio::test]
+async fn an_sglang_restart_park_retires_the_rendezvous_so_the_wake_starts() {
+    use capyctl_adapters::lmcache::{LmcacheState, ServerPlan};
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    let (_stub, port) = serve_stub(MODEL, 0, INFERENCE, 0).await;
+    // The server's `/status`, and a `/proc` where it holds one loopback
+    // listener (inode 1111).
+    let status = Router::new().route("/status", get(|| async { "ok" }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, status).await.unwrap() });
+    let root = tempfile::tempdir().unwrap();
+    let proc_root = root.path().join("proc");
+    let process = proc_root.join("3000");
+    std::fs::create_dir_all(process.join("fd")).unwrap();
+    std::fs::create_dir_all(process.join("net")).unwrap();
+    std::os::unix::fs::symlink("socket:[1111]", process.join("fd").join("3")).unwrap();
+    std::fs::write(
+        process.join("net").join("tcp"),
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:61A9 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1111 1 0000000000000000 100 0 0 10 0\n",
+    )
+    .unwrap();
+    let server = vec![ProcessIdentity {
+        role: "lmcache".into(),
+        pid: 3000,
+        boot_id: "boot".into(),
+        start_ticks: 7,
+    }];
+    let state = LmcacheState::attached(
+        server.clone(),
+        ServerPlan {
+            lmcache_bin: "/opt/sglang/bin/lmcache".into(),
+            rpc_port: 25001,
+            http_port,
+            pool_gib: 1,
+            path: "/opt/sglang/bin:/usr/bin:/bin".into(),
+            home: None,
+            cuda_visible_devices: None,
+            cuda_device_order: None,
+            log: None,
+            config_dir: root.path().join("lmcache"),
+            start_bound: Duration::from_secs(5),
+            proc_root,
+            required: false,
+        },
+    );
+    // The launch's rendezvous directory, as its first engine's entry made it.
+    let rendezvous = root.path().join("rendezvous").join(INCARNATION);
+    std::fs::create_dir_all(&rendezvous).unwrap();
+    std::fs::write(rendezvous.join("store"), "").unwrap();
+    let engine = vec![api_identity(), worker0()];
+    let tool = Arc::new(RestartTool {
+        server: server.clone(),
+        engine: engine.clone(),
+        rendezvous: rendezvous.clone(),
+        stopped: Mutex::new(Vec::new()),
+        wakes: Mutex::new(Vec::new()),
+    });
+    // `restart_only`: no memory saver, LMCache on.
+    let launch = NativeLaunch::from_frozen_store(
+        frozen_launch(port).metadata().clone(),
+        CHECKPOINT.into(),
+        "/opt/sglang/bin/python3".into(),
+        format!("sglang-inference-{BINDING}"),
+        format!("sglang-admin-{BINDING}"),
+        SglangLaunchSettings {
+            memory_saver: false,
+            ..settings()
+        },
+    );
+    let adapter = SglangAdapter::from_frozen(&launch, None)
+        .unwrap()
+        .with_credentials(INFERENCE.into(), ADMIN.into())
+        .with_launch(launch)
+        .with_tools(tool.clone())
+        .with_wrapper(wrapper().to_path_buf())
+        .with_log(log.to_string_lossy().into_owned())
+        .with_session(SESSION)
+        .with_rendezvous_dir(rendezvous.clone())
+        .with_lmcache(state);
+
+    let mut held = engine.clone();
+    held.extend(server.clone());
+    let parked = adapter
+        .execute_persisted(&restart_step(
+            RuntimeAction::Park,
+            "01K00000000000000000000007",
+            held,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(parked.identities, server, "the server alone is kept");
+    assert_eq!(*tool.stopped.lock().unwrap(), std::slice::from_ref(&engine));
+    assert!(
+        !rendezvous.exists(),
+        "the stopped engine's rendezvous is retired"
+    );
+    assert!(
+        rendezvous.parent().unwrap().exists(),
+        "only the launch's own directory goes"
+    );
+
+    let woken = adapter
+        .execute_persisted(&restart_step(
+            RuntimeAction::Restore,
+            "01K00000000000000000000008",
+            server.clone(),
+        ))
+        .await
+        .unwrap();
+    assert!(woken.identities.iter().any(|p| p.role == "api"));
+    assert_eq!(
+        *tool.wakes.lock().unwrap(),
+        [(
+            "01K00000000000000000000008".to_owned(),
+            false,
+            Some(rendezvous.to_string_lossy().into_owned())
+        )],
+        "the wake's engine gets the same directory, absent when it is spawned"
+    );
+    std::fs::remove_file(&log).ok();
+}
+
 /// SPEC §13.3 amendment (owner decision 2026-09-25): a profile's host-approved
 /// `cuda_home` puts `<cuda_home>/bin` after the engine's own bin and sets
 /// `CUDA_HOME`; a profile `env` build limit overrides the computed one.

@@ -183,6 +183,23 @@ impl SglangLaunch {
         &self.public
     }
 
+    /// ADR 0033 §4: the launch's LMCache connector configuration, a public
+    /// setting (`lmcache_config_file`) the entry validates and renders as the
+    /// reserved `enable_lmcache=True, lmcache_config_file=<path>`, pinned after
+    /// SGLang resolved its arguments. Absent, the entry keeps LMCache off as
+    /// before. A group member never uses LMCache (`group_unsupported`).
+    pub fn with_lmcache_config_file(mut self, path: &Path) -> Result<Self, RuntimeError> {
+        let path = path
+            .to_str()
+            .filter(|path| absolute_path(path) && !path.split('/').any(|p| p == "." || p == ".."))
+            .ok_or(RuntimeError::Unsupported)?;
+        if self.public["settings"].get("group").is_some() {
+            return Err(RuntimeError::Unsupported);
+        }
+        self.public["settings"]["lmcache_config_file"] = json!(path);
+        Ok(self)
+    }
+
     /// The final launcher substitutes three distinct protected descriptor numbers
     /// (for a group worker, the private launch descriptor and, when deep, its
     /// observation credential) only after resolving the private frozen inputs
@@ -234,11 +251,18 @@ impl SglangLaunch {
         // naming no entry point, so SGLang loads none of the plugins its own
         // dependencies install (0.5.22: smg-grpc-servicer); spawned ranks
         // inherit it, and the entry's guard refuses any other value.
-        let env = [(
+        let mut env: std::collections::BTreeMap<String, String> = [(
             capyctl_config::engine_env::SGLANG_PLUGINS.to_owned(),
             capyctl_config::engine_env::SGLANG_NO_PLUGINS.to_owned(),
         )]
         .into();
+        // ADR 0033 §3 (A7): LMCache's connector runs in the engine; its usage
+        // telemetry is off there too, whatever `engine_telemetry` says.
+        if self.public["settings"].get("lmcache_config_file").is_some() {
+            for (name, value) in crate::lmcache::NO_USAGE_TRACKING {
+                env.insert(name.into(), value.into());
+            }
+        }
         Ok(RenderedCommand { argv, env })
     }
 

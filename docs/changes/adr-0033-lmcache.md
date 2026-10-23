@@ -10,7 +10,9 @@ SGLang 0.5.22 or newer through `--enable-lmcache --lmcache-config-file`; the in-
 vLLM 0.31, older SGLang, llama.cpp, TensorFold and custom engines show "LMCache off" with
 the reason. Every model gets LMCache by default, hybrid layouts and decision deployments
 included (decisions on SGLang only: vLLM stays refused for decisions, ADR 0030 §6
-amendment of 2026-10-21). Each deployment instance gets its own LMCache server, started and stopped by
+amendment of 2026-10-21; amended 2026-10-22, A10: decision deployments on SGLang, and
+SGLang deployments stating `--disable-radix-cache`, run without LMCache until LC7 passes on
+a release, [sgl-project/sglang#45929](https://github.com/sgl-project/sglang/issues/45929)). Each deployment instance gets its own LMCache server, started and stopped by
 CapyCTL with it, on loopback ports CapyCTL leases, checked with ADR 0031's listener check
 because the 0.5.6 admin HTTP API has no authentication; the script API stays off; host
 RAM (L1) only, LRU within the private pool, nothing on disk. The server stays up while

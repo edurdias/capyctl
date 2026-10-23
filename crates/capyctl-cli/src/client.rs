@@ -1334,6 +1334,22 @@ pub async fn execute_with_start_options(
                     }
                 }
             }
+            // ADR 0033 §9: each instance's LMCache cache figures (used
+            // bytes, lookups, hits), from its server's latest sample in the
+            // load read. A server without the view, or an instance whose
+            // server has not reported, leaves the instance as it was.
+            if has_lmcache(&view) {
+                if let Some(id) = view["id"].as_str().map(str::to_owned) {
+                    if let Ok((status, load)) = api
+                        .exchange(Method::GET, &format!("/metrics/load?deployment={id}"), None)
+                        .await
+                    {
+                        if status.is_success() {
+                            add_lmcache_figures(&mut view, &load);
+                        }
+                    }
+                }
+            }
             Ok(view)
         }
         // SPEC §8.2: the resolved configuration and its provenance, with
@@ -1372,6 +1388,57 @@ fn has_group_members(deployment: &Value) -> bool {
     deployment["instances"]
         .as_array()
         .is_some_and(|instances| instances.iter().any(|i| i["members"].is_array()))
+}
+
+fn has_lmcache(deployment: &Value) -> bool {
+    deployment["instances"]
+        .as_array()
+        .is_some_and(|instances| instances.iter().any(|i| i["lmcache"]["state"] == "on"))
+}
+
+/// ADR 0033 §9: sets `used_bytes`, `lookups` and `hits` on each instance
+/// whose LMCache is on, from the same instance (index and generation) in a
+/// `GET /metrics/load` answer, when its server's last scrape answered. A
+/// figure the server did not report stays absent: unknown, never zero.
+pub fn add_lmcache_figures(deployment: &mut Value, load: &Value) {
+    let Some(reported) = load["deployments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|d| d["deployment_id"] == deployment["id"])
+        .and_then(|d| d["instances"].as_array())
+        .cloned()
+    else {
+        return;
+    };
+    let Some(instances) = deployment
+        .get_mut("instances")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for instance in instances {
+        if instance["lmcache"]["state"] != "on" {
+            continue;
+        }
+        // The snapshot carries the generation as a decimal string.
+        let generation = instance["generation"]
+            .as_str()
+            .and_then(|g| g.parse::<i64>().ok());
+        let Some(sample) = reported
+            .iter()
+            .find(|r| r["index"] == instance["index"] && r["generation"].as_i64() == generation)
+            .map(|r| &r["lmcache"])
+            .filter(|s| s["scrape_ok"] == true)
+        else {
+            continue;
+        };
+        for field in ["used_bytes", "lookups", "hits"] {
+            if sample[field].is_u64() {
+                instance["lmcache"][field] = sample[field].clone();
+            }
+        }
+    }
 }
 
 /// ADR 0028 §3, §15: sets each group member's `warnings` to the findings its
@@ -1893,5 +1960,169 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(refused.code, "unauthorized");
+    }
+
+    // T45: ADR 0033 §§9, 12. `status deployment` merges into each instance's
+    // `lmcache` object (as the store's snapshot serializes it) the cache
+    // figures of its server's latest sample in the load read (as the router
+    // composes it from the controller's load table): for the same index and
+    // generation only, from a scrape that answered. A failed scrape, a sample
+    // the instance's own host did not report, an off instance and a missing
+    // read leave the figures out, and every line still reads.
+    #[test]
+    fn status_merges_each_instances_lmcache_figures_and_renders_its_line() {
+        use capyctl_controller::load_table::LoadTable;
+        use capyctl_protocol::reports::{LmcacheSample, LoadReport};
+        use capyctl_router::{admission::InFlight, capacity::capacity_report};
+        use capyctl_store::snapshot::{DeploymentCapacity, InstanceCapacity, InstanceLmcache};
+        const GIB: i64 = 1 << 30;
+        const MIB: i64 = 1 << 20;
+        const NOW: i64 = 1_800_000_000_000;
+        let on = InstanceLmcache {
+            state: "on".into(),
+            reason: None,
+            message: None,
+            server: Some("running".into()),
+            pool_bytes: Some(4 * GIB),
+            overhead_bytes: Some(800 * MIB),
+            device_bytes: Some(0),
+            held_kv_bytes: None,
+            charge_bytes: Some(4 * GIB + 800 * MIB),
+            measured: Some(true),
+        };
+        let off = InstanceLmcache {
+            state: "off".into(),
+            reason: Some("engine_version_unsupported".into()),
+            message: Some("this engine version does not support LMCache".into()),
+            server: None,
+            pool_bytes: None,
+            overhead_bytes: None,
+            device_bytes: None,
+            held_kv_bytes: None,
+            charge_bytes: None,
+            measured: None,
+        };
+        // The snapshot carries an instance's generation as a decimal string.
+        let instance = |index: u32, generation: i64, host: &str, lmcache: &InstanceLmcache| {
+            json!({"index": index, "generation": generation.to_string(), "host_id": host,
+                "observed_state": "ready", "lifecycle": "active",
+                "lmcache": serde_json::to_value(lmcache).unwrap()})
+        };
+        let pristine = json!({"id": "dep-1", "name": "chat", "observed_state": "ready",
+            "instances": [instance(0, 7, "h1", &on), instance(1, 8, "h2", &on),
+                instance(2, 9, "h1", &off), instance(3, 10, "h2", &on)]});
+        assert!(has_lmcache(&pristine));
+
+        let sample = |generation: i64, scrape_ok: bool| LmcacheSample {
+            deployment_id: "dep-1".into(),
+            generation,
+            owned_handle: format!("launch-{generation}"),
+            sampled_at_ms: NOW,
+            scrape_ok,
+            used_bytes: scrape_ok.then_some(1_395_864_371),
+            usage_ppm: scrape_ok.then_some(325_000),
+            inflight_bytes: None,
+            alloc_failures: None,
+            lookups: scrape_ok.then_some(260),
+            hits: scrape_ok.then_some(212),
+            l2_bytes: None,
+            rss_bytes: None,
+            device_bytes: None,
+        };
+        let loads = LoadTable::new();
+        let report = |host: &str, lmcache: Vec<LmcacheSample>| LoadReport {
+            host_id: host.into(),
+            samples: Vec::new(),
+            lmcache,
+        };
+        // h1 reports instance 0's server, and a sample for instance 3,
+        // which runs on h2; h2 reports instance 1's failed scrape.
+        loads
+            .accept(
+                "h1",
+                report("h1", vec![sample(7, true), sample(10, true)]),
+                NOW,
+            )
+            .unwrap();
+        loads
+            .accept("h2", report("h2", vec![sample(8, false)]), NOW)
+            .unwrap();
+        let capacity = |index: u32, generation: i64, host: &str| InstanceCapacity {
+            index,
+            host_id: Some(host.into()),
+            generation: Some(generation),
+            observed_state: "ready".into(),
+        };
+        let load = capacity_report(
+            &[DeploymentCapacity {
+                id: "dep-1".into(),
+                name: "chat".into(),
+                max_running: None,
+                instances: vec![
+                    capacity(0, 7, "h1"),
+                    capacity(1, 8, "h2"),
+                    capacity(2, 9, "h1"),
+                    capacity(3, 10, "h2"),
+                ],
+            }],
+            &InFlight::default(),
+            32,
+            Some(&loads),
+            NOW + 500,
+        );
+        let mut view = pristine.clone();
+        add_lmcache_figures(&mut view, &load);
+        let figures = |view: &Value, index: usize| {
+            let lmcache = &view["instances"][index]["lmcache"];
+            ["used_bytes", "lookups", "hits"].map(|field| lmcache[field].clone())
+        };
+        assert_eq!(
+            figures(&view, 0),
+            [json!(1_395_864_371_u64), json!(260), json!(212)]
+        );
+        for index in 1..4 {
+            assert_eq!(
+                figures(&view, index),
+                [Value::Null, Value::Null, Value::Null]
+            );
+            assert_eq!(
+                view["instances"][index], pristine["instances"][index],
+                "{index}"
+            );
+        }
+
+        let out = crate::table::render(
+            crate::table::View::Status,
+            &view,
+            &crate::table::HostNames::new(),
+        );
+        let lines: Vec<&str> = out.lines().filter(|l| l.starts_with("LMCache")).collect();
+        assert_eq!(
+            lines,
+            [
+                "LMCache   instance 0 on: pool 4.0 GiB, used 1.3 GiB, overhead 0.8 GiB (measured), \
+                 charged 4.8 GiB, server running, 212 hits / 260 lookups",
+                "LMCache   instance 1 on: pool 4.0 GiB, overhead 0.8 GiB (measured), \
+                 charged 4.8 GiB, server running",
+                "LMCache   instance 2 off: this engine version does not support LMCache",
+                "LMCache   instance 3 on: pool 4.0 GiB, overhead 0.8 GiB (measured), \
+                 charged 4.8 GiB, server running",
+            ],
+            "{out}"
+        );
+
+        // A server without the load read, or one that answered for another
+        // deployment, leaves the status as the snapshot had it.
+        let other = json!({"deployments": [{"deployment_id": "dep-2",
+            "instances": load["deployments"][0]["instances"].clone()}]});
+        for unread in [json!({}), other] {
+            let mut view = pristine.clone();
+            add_lmcache_figures(&mut view, &unread);
+            assert_eq!(view, pristine);
+        }
+        // A deployment with LMCache off everywhere asks for no load read.
+        assert!(!has_lmcache(
+            &json!({"instances": [instance(0, 7, "h1", &off)]})
+        ));
     }
 }

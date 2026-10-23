@@ -28,6 +28,7 @@ fn host() -> HostPolicy {
             "gpu0".into(),
             DevicePolicy {
                 physical_gpu_uuid: None,
+                product_name: None,
                 domain: "system".into(),
                 sharing: Sharing::Shared,
             },
@@ -50,6 +51,8 @@ fn host() -> HostPolicy {
         },
         model_sources: Default::default(),
         parked_growth_limit: Default::default(),
+        lmcache: Default::default(),
+        retention: Default::default(),
     }
 }
 

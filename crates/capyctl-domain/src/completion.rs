@@ -62,12 +62,32 @@ pub struct ProcessIdentity {
 /// proves it gone, but its exit is not the engine's exit.
 pub const HELPER_ROLE_PREFIX: &str = "helper-";
 
+/// ADR 0033 §3: the role of a launch's LMCache server, the leader of its own
+/// owned process group beside the engine's.
+pub const LMCACHE_ROLE: &str = "lmcache";
+
+/// ADR 0033 §3: the role prefix of any other process of the server's group
+/// (`lmcache-N`, N a decimal number, numbered by start order).
+pub const LMCACHE_MEMBER_PREFIX: &str = "lmcache-";
+
 impl ProcessIdentity {
     /// ADR 0027: whether this recorded process is a helper rather than one of
     /// the engine's own processes (`api` and `worker-N`). A helper's role is
     /// `helper-N`, with N a decimal number.
     pub fn is_helper(&self) -> bool {
         is_helper_role(&self.role)
+    }
+
+    /// ADR 0033 §3: whether this recorded process belongs to the launch's
+    /// LMCache server group (`lmcache` or `lmcache-N`).
+    pub fn is_lmcache(&self) -> bool {
+        is_lmcache_role(&self.role)
+    }
+
+    /// ADR 0033 §3: whether this recorded process is one of the engine's own
+    /// processes: neither a helper nor a member of the LMCache server group.
+    pub fn is_engine(&self) -> bool {
+        !self.is_helper() && !self.is_lmcache()
     }
 }
 
@@ -77,11 +97,30 @@ pub fn is_helper_role(role: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// ADR 0027: the engine's own processes of a recorded group, without helpers.
+/// ADR 0033 §3: whether `role` names the LMCache server (`lmcache`) or another
+/// process of its group (`lmcache-N`, N a decimal number).
+pub fn is_lmcache_role(role: &str) -> bool {
+    role == LMCACHE_ROLE
+        || role
+            .strip_prefix(LMCACHE_MEMBER_PREFIX)
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// ADR 0027, ADR 0033 §3: the engine's own processes of a recorded launch,
+/// without helpers and without the LMCache server's group.
 pub fn engine_members(identities: &[ProcessIdentity]) -> Vec<ProcessIdentity> {
     identities
         .iter()
-        .filter(|identity| !identity.is_helper())
+        .filter(|identity| identity.is_engine())
+        .cloned()
+        .collect()
+}
+
+/// ADR 0033 §3: the LMCache server's group of a recorded launch.
+pub fn lmcache_members(identities: &[ProcessIdentity]) -> Vec<ProcessIdentity> {
+    identities
+        .iter()
+        .filter(|identity| identity.is_lmcache())
         .cloned()
         .collect()
 }
@@ -90,20 +129,41 @@ pub fn engine_members(identities: &[ProcessIdentity]) -> Vec<ProcessIdentity> {
 /// still the engine `recorded` names: every engine process of `recorded` is
 /// there, and every engine process there is one `recorded` names. Helpers do
 /// not decide it: one that exited since, or one the engine started later, does
-/// not change the engine.
+/// not change the engine. ADR 0033 §3: neither does the LMCache server's group
+/// (`same_lmcache` judges it).
 pub fn same_engine(recorded: &[ProcessIdentity], observed: &[ProcessIdentity]) -> bool {
     let recorded_set = recorded.iter().collect::<BTreeSet<_>>();
     let observed_set = observed.iter().collect::<BTreeSet<_>>();
-    !recorded.is_empty()
+    recorded.iter().any(ProcessIdentity::is_engine)
         && observed_set.len() == observed.len()
         && observed
             .iter()
-            .filter(|identity| !identity.is_helper())
+            .filter(|identity| identity.is_engine())
             .all(|identity| recorded_set.contains(identity))
         && recorded
             .iter()
-            .filter(|identity| !identity.is_helper())
+            .filter(|identity| identity.is_engine())
             .all(|identity| observed_set.contains(identity))
+}
+
+/// ADR 0033 §3: whether `observed` still holds the LMCache server `recorded`
+/// names. The server is its group's leader (`lmcache`): exactly the recorded
+/// leader is there, by identity, and no other. Any other process of its
+/// group (`lmcache-N`) may have exited or started since, as a helper of the
+/// engine may (ADR 0027; found live on SGLang: a short-lived child recorded
+/// at Ready exited 90 s later); the group's ownership and its verified stop
+/// still cover every member recorded.
+pub fn same_lmcache(recorded: &[ProcessIdentity], observed: &[ProcessIdentity]) -> bool {
+    let leader = |set: &[ProcessIdentity]| {
+        let members = lmcache_members(set);
+        let unique = members.iter().collect::<BTreeSet<_>>().len() == members.len();
+        let mut leaders = members.into_iter().filter(|i| i.role == LMCACHE_ROLE);
+        match (unique, leaders.next(), leaders.next()) {
+            (true, Some(leader), None) => Some(leader),
+            _ => None,
+        }
+    };
+    matches!((leader(recorded), leader(observed)), (Some(a), Some(b)) if a == b)
 }
 
 /// Whether a recorded process still exists, judged by pid, boot id and start ticks

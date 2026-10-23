@@ -6,14 +6,35 @@ negation actions, short aliases). The real parser is exercised only live.
 """
 
 import argparse
+import dataclasses
 import io
 import json
 import os
 from pathlib import Path
 import unittest
 from unittest import mock
+import uuid
 
 from runtime import vllm_entry as entry
+
+
+@dataclasses.dataclass
+class KVTransferConfig:
+    """The shape of vLLM 0.32.0's `KVTransferConfig`: `engine_id` left unset
+    is filled with a fresh uuid4 in `__post_init__`."""
+    kv_connector: object = None
+    engine_id: object = None
+    kv_role: object = None
+    kv_connector_extra_config: dict = dataclasses.field(default_factory=dict)
+    kv_connector_module_path: object = None
+
+    def __post_init__(self):
+        if self.engine_id is None:
+            self.engine_id = str(uuid.uuid4())
+
+    @classmethod
+    def parse(cls, raw):
+        return cls(**json.loads(raw))
 
 
 def _fake_parser(drop=(), nested=False, grpc_port=False):
@@ -101,6 +122,9 @@ def _fake_parser(drop=(), nested=False, grpc_port=False):
         option("--grpc-port", type=int, default=None)
     option("--worker-extension-cls", default="")
     option("--compilation-config", "-cc", type=json.loads, default=None)
+    # vLLM 0.32.0 `KVTransferConfig`: a dataclass whose unset `engine_id` is
+    # drawn at random (uuid4) by every parse (vllm/config/kv_transfer.py).
+    option("--kv-transfer-config", type=KVTransferConfig.parse, default=None)
     option("--download-dir", default=None)
     option("--chat-template", default=None)
     return parser
@@ -338,6 +362,56 @@ class ExtraArgumentTests(unittest.TestCase):
         self.resolve(["--chat-template", "/models/qwen/chat.jinja"])
         # Host-fixed arguments before the second marker are the host's own.
         self.resolve([], fixed=["--download-dir", "/srv/other"])
+
+    # T45 T21 (ADR 0033 §4, found live on vLLM 0.32.0): CapyCTL's own
+    # `--kv-transfer-config` in the reserved block parses to a config with a
+    # fresh random `engine_id` every time, which is not an extra setting it;
+    # an extra that sets the option is still refused as egress.
+    def test_the_rendered_kv_transfer_config_is_not_read_as_an_extra(self):
+        rendered = json.dumps({
+            "kv_connector": "LMCacheMPConnector",
+            "kv_connector_module_path": "lmcache.integration.vllm.lmcache_mp_connector",
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": {"lmcache.mp.host": "127.0.0.1",
+                                          "lmcache.mp.port": 20002,
+                                          "lmcache.mp.autostart": False}})
+        owned = ["--kv-transfer-config", rendered]
+
+        def resolve(extra, reserved=owned, fixed=()):
+            vector = RESERVED + reserved + [entry.MARKER, *fixed, entry.EXTRA_MARKER, *extra]
+            with mock.patch("sys.stderr", io.StringIO()):
+                return entry.resolve(vector, fake_parser())
+
+        # Two parses of the same tokens differ in `engine_id` alone.
+        parser = fake_parser()
+        first, second = (parser.parse_args(["serve", *owned]).kv_transfer_config
+                         for _ in range(2))
+        self.assertNotEqual(first.engine_id, second.engine_id)
+        for fixed in ((), ("--dtype", "bfloat16")):
+            with self.subTest(fixed=fixed):
+                args = resolve([], fixed=fixed)
+                self.assertEqual(args.kv_transfer_config.kv_connector, "LMCacheMPConnector")
+                template = "/models/qwen/chat.jinja"
+                self.assertEqual(resolve(["--chat-template", template],
+                                         fixed=fixed).chat_template, template)
+
+        another = json.dumps({"kv_connector": "NixlConnector", "kv_role": "kv_both"})
+        for reserved, extra in (
+                # Another connector beside CapyCTL's, or a change of any field.
+                (owned, ["--kv-transfer-config", another]),
+                (owned, ["--kv-transfer-config",
+                         rendered.replace("20002", "20003")]),
+                # The same connector with an engine id the extra names.
+                (owned, ["--kv-transfer-config",
+                         rendered[:-1] + ', "engine_id": "mine"}']),
+                (owned, ["--kv-transfer-c", another]),
+                # No LMCache: any connector in the extras.
+                ([], ["--kv-transfer-config", rendered]),
+                ([], ["--kv-transfer-config=" + another])):
+            with self.subTest(reserved=bool(reserved), extra=extra):
+                with self.assertRaises(entry.LaunchError) as caught:
+                    resolve(extra, reserved=reserved)
+                self.assertEqual(caught.exception.code, "sensitive_option_refused")
 
     # T14 T21: a typed field cannot be restated or reversed by an extra.
     def test_extras_cannot_change_typed_fields(self):

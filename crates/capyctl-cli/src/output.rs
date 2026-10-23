@@ -274,6 +274,30 @@ const GROUP_CODES: &[(&str, Named, Option<ExitCode>)] = &[
         Named::Bare,
         Some(ExitCode::UNSUPPORTED),
     ),
+    // ADR 0033 §§9, 10, 13, 14: `lmcache: required` where LMCache cannot run
+    // (`lmcache_unavailable:<reason>`, any `LmcacheOffReason` code), beside
+    // zero retention, or on a host too old for it; `retention: zero` on a
+    // host too old to honour it. Refused at resolution, placement or launch.
+    (
+        "lmcache_unavailable",
+        Named::Required,
+        Some(ExitCode::UNSUPPORTED),
+    ),
+    (
+        "retention_zero:lmcache",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
+    (
+        "host_capability_missing:lmcache",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
+    (
+        "host_capability_missing:retention",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
     // ADR 0031 §10: a manifest refused at `engine add` (or a profile's copy
     // refused at role start), and resolution's custom engine refusals.
     (

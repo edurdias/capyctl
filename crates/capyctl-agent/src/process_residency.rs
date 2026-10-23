@@ -209,6 +209,59 @@ fn run_nvidia_smi() -> Option<String> {
     status.success().then_some(text)
 }
 
+/// ADR 0033 §6, A1 (lifecycle design §7): the resident set (`VmRSS`:
+/// anonymous, shared and file-backed pages) of a launch's LMCache server
+/// group: each of its recorded processes still alive (same boot, same start
+/// ticks), summed. The basis A1's overhead allowance was measured on (found
+/// live 2026-10-22, GB10: a SGLang server's 4903 MiB `VmRSS` held 329 MiB of
+/// `RssFile` that `RssAnon` plus `RssShmem` missed). `None` when the
+/// server's `lmcache` leader is not alive or a live member cannot be read:
+/// unknown, never zero.
+pub fn group_resident_bytes(group: &[capyctl_domain::completion::ProcessIdentity]) -> Option<u64> {
+    let boot = boot_id()?;
+    let alive = |identity: &capyctl_domain::completion::ProcessIdentity| {
+        identity.boot_id == boot && start_ticks(identity.pid) == Some(identity.start_ticks)
+    };
+    if !group.iter().any(|identity| {
+        identity.role == capyctl_domain::completion::LMCACHE_ROLE && alive(identity)
+    }) {
+        return None;
+    }
+    group
+        .iter()
+        .filter(|identity| alive(identity))
+        .try_fold(0_u64, |sum, identity| {
+            let status = std::fs::read_to_string(format!("/proc/{}/status", identity.pid)).ok()?;
+            sum.checked_add(u64::try_from(parse_vm_resident_bytes(&status)?).ok()?)
+        })
+}
+
+/// ADR 0033 §6: the GPU memory `sample` attributes to the processes of
+/// `group` (matched by pid, boot and start ticks), summed. `None` when the
+/// sample names none of them: unknown, never zero.
+pub fn group_device_bytes(
+    sample: &[ProcessResident],
+    group: &[capyctl_domain::completion::ProcessIdentity],
+) -> Option<u64> {
+    let matched: Vec<i64> = sample
+        .iter()
+        .filter(|resident| {
+            group.iter().any(|identity| {
+                identity.pid == resident.pid
+                    && identity.boot_id == resident.boot_id
+                    && identity.start_ticks == resident.start_ticks
+            })
+        })
+        .map(|resident| resident.device_bytes)
+        .collect();
+    if matched.is_empty() {
+        return None;
+    }
+    matched.into_iter().try_fold(0_u64, |sum, bytes| {
+        sum.checked_add(u64::try_from(bytes).ok()?)
+    })
+}
+
 fn boot_id() -> Option<String> {
     let raw = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
     let boot = raw.trim();
@@ -237,13 +290,22 @@ fn anonymous_resident_bytes(pid: u32) -> Option<i64> {
 
 /// The `RssAnon` and `RssShmem` lines of a /proc/<pid>/status text, summed.
 fn parse_resident_host_bytes(status: &str) -> Option<i64> {
-    let field = |name: &str| -> Option<i64> {
-        let line = status.lines().find(|line| line.starts_with(name))?;
-        let mut words = line[name.len()..].split_whitespace();
-        let kib: i64 = words.next()?.parse().ok()?;
-        (words.next() == Some("kB") && kib >= 0).then(|| kib.checked_mul(1024))?
-    };
-    field("RssAnon:")?.checked_add(field("RssShmem:")?)
+    status_kib(status, "RssAnon:")?
+        .checked_add(status_kib(status, "RssShmem:")?)?
+        .checked_mul(1024)
+}
+
+/// The `VmRSS` line of a /proc/<pid>/status text, in bytes.
+fn parse_vm_resident_bytes(status: &str) -> Option<i64> {
+    status_kib(status, "VmRSS:")?.checked_mul(1024)
+}
+
+/// The kB figure of the `name` line of a /proc/<pid>/status text.
+fn status_kib(status: &str, name: &str) -> Option<i64> {
+    let line = status.lines().find(|line| line.starts_with(name))?;
+    let mut words = line[name.len()..].split_whitespace();
+    let kib: i64 = words.next()?.parse().ok()?;
+    (words.next() == Some("kB") && kib >= 0).then_some(kib)
 }
 
 #[cfg(test)]
@@ -279,6 +341,36 @@ mod tests {
             parse_resident_host_bytes("RssAnon:\t x kB\nRssShmem:\t 1 kB\n"),
             None
         );
+    }
+
+    // T45 T26 (ADR 0033 §6, A1; found live 2026-10-22, GB10): an LMCache
+    // server's resident set is `VmRSS`, its file-backed pages included, the
+    // basis A1's overhead allowance was measured on; a status without it
+    // gives none.
+    #[test]
+    fn a_server_groups_resident_set_counts_file_backed_pages() {
+        let status = "Name:\tpython3\nVmRSS:\t 5020672 kB\nRssAnon:\t  446464 kB\nRssFile:\t  336896 kB\nRssShmem:\t 4237312 kB\n";
+        assert_eq!(parse_vm_resident_bytes(status), Some(5_020_672 * 1024));
+        assert!(parse_vm_resident_bytes(status) > parse_resident_host_bytes(status));
+        assert_eq!(parse_vm_resident_bytes("RssAnon:\t 1 kB\n"), None);
+        // A live group reads its leader's `VmRSS`; a dead leader reads none.
+        let me = std::process::id();
+        let identity = capyctl_domain::completion::ProcessIdentity {
+            pid: me,
+            boot_id: boot_id().unwrap(),
+            start_ticks: start_ticks(me).unwrap(),
+            role: capyctl_domain::completion::LMCACHE_ROLE.into(),
+        };
+        let own = std::fs::read_to_string("/proc/self/status").unwrap();
+        let read = group_resident_bytes(std::slice::from_ref(&identity)).unwrap();
+        let vm = parse_vm_resident_bytes(&own).unwrap() as u64;
+        assert!(read.abs_diff(vm) < 64 << 20, "{read} vs {vm}");
+        assert!(read as i64 > parse_resident_host_bytes(&own).unwrap());
+        let gone = capyctl_domain::completion::ProcessIdentity {
+            start_ticks: identity.start_ticks + 1,
+            ..identity
+        };
+        assert_eq!(group_resident_bytes(&[gone]), None);
     }
 
     // T26: a sample is bound to the process identity: this process's own pid

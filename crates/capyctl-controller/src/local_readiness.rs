@@ -14,7 +14,11 @@
 //! - ADR 0030 §3: a decisions deployment also answers the fixed decision probe,
 //!   complete and well-formed, on the same key (it generates no text, and its
 //!   readiness is a decision, never a model list alone);
-//! - every recorded process is still alive after the answer.
+//! - every recorded process is still alive after the answer;
+//! - ADR 0033 §3: a launch's LMCache server is alive, answers `GET /status`
+//!   and listens on loopback only (an exposed one is stopped), and none is
+//!   re-proved while the host's settings say `lmcache: off` or
+//!   `retention: zero` (§§9, 10), so its dispatch stays closed.
 //!
 //! Only then does the store reopen dispatch, with a readiness receipt in the
 //! journal. A failed proof leaves the deployment charged, closed and owned; an
@@ -96,10 +100,19 @@ pub struct LocalReadiness {
     probes: Mutex<BTreeMap<String, ProbeState>>,
     /// Review finding 15: every probe task, owned by the supervision loop.
     children: crate::supervised::Children,
+    /// ADR 0033 §§9, 10: the standalone host's settings say `lmcache: off`
+    /// or `retention: zero`; no launch with a server is re-proved.
+    lmcache_forbidden: bool,
 }
 
 impl LocalReadiness {
     pub fn new(owner: SharedCoordinatorState) -> Arc<Self> {
+        Self::on_host(owner, false)
+    }
+
+    /// ADR 0033 §§9, 10: `lmcache_forbidden` when the host's settings say
+    /// `lmcache: off` or `retention: zero`.
+    pub fn on_host(owner: SharedCoordinatorState, lmcache_forbidden: bool) -> Arc<Self> {
         Arc::new(Self {
             owner,
             client: reqwest::Client::builder()
@@ -110,6 +123,7 @@ impl LocalReadiness {
                 .expect("a plain HTTP client builds"),
             probes: Mutex::new(BTreeMap::new()),
             children: Default::default(),
+            lmcache_forbidden,
         })
     }
 
@@ -334,9 +348,11 @@ impl LocalReadiness {
         }
         let live = alive(&launch.identities)?;
         let checked = tokio::task::spawn_blocking(move || {
-            capyctl_adapters::custom::check_loopback(std::path::Path::new("/proc"), &live, &|id| {
-                capyctl_launchers::process_absence::presence(id) == Presence::Alive
-            })
+            capyctl_adapters::custom::check_loopback(
+                std::path::Path::new("/proc"),
+                &live,
+                &capyctl_launchers::process_absence::presence,
+            )
         })
         .await
         .map_err(|_| "the listener check did not run".to_owned())?;
@@ -358,9 +374,73 @@ impl LocalReadiness {
         }
     }
 
+    /// ADR 0033 §§3, 9, 10 (lifecycle design §5): re-prove the launch's
+    /// LMCache server (leader alive, `GET /status` answering, its group on
+    /// loopback; an exposed one is stopped), unless the host's settings
+    /// forbid LMCache.
+    async fn prove_lmcache(
+        &self,
+        launch: &LocalReadyLaunch,
+        server: &[ProcessIdentity],
+    ) -> Result<(), String> {
+        if self.lmcache_forbidden {
+            return Err(
+                "the host's settings say `lmcache: off` or `retention: zero`; \
+                        the launch's LMCache server is not re-proved"
+                    .into(),
+            );
+        }
+        let grant = {
+            let owner = self
+                .owner
+                .lock()
+                .map_err(|_| "coordinator state unavailable".to_owned())?;
+            owner
+                .store()
+                .launch_lmcache_grant(&launch.binding_id)
+                .map_err(|error| format!("the LMCache grant is unreadable: {error}"))?
+                .ok_or_else(|| "the launch records a server but no LMCache grant".to_owned())?
+        };
+        // What the proof reads: the grant's ports and the host's `/proc`.
+        // Nothing is started, so the start fields stay empty.
+        let plan = capyctl_adapters::lmcache::ServerPlan {
+            lmcache_bin: std::path::PathBuf::new(),
+            rpc_port: grant.rpc_port,
+            http_port: grant.http_port,
+            pool_gib: u64::try_from(grant.pool_bytes >> 30).unwrap_or(0),
+            path: String::new(),
+            home: None,
+            cuda_visible_devices: None,
+            cuda_device_order: None,
+            log: None,
+            config_dir: std::path::PathBuf::new(),
+            start_bound: Duration::from_millis(capyctl_config::lmcache::SERVER_START_BOUND_MS),
+            proc_root: std::path::PathBuf::from("/proc"),
+            required: false,
+        };
+        let tools: Arc<dyn capyctl_adapters::traits::OwnedProcessLaunch> = Arc::new(
+            capyctl_launchers::DurableProcessLaunch::new(Arc::new(ProveOnly)),
+        );
+        capyctl_adapters::lmcache::prove_server(tools, &plan, server)
+            .await
+            .map(|_| ())
+            .map_err(|(reason, detail)| {
+                format!(
+                    "the LMCache server was not re-proved ({}): {detail}",
+                    reason.code()
+                )
+            })
+    }
+
     async fn prove(&self, launch: &LocalReadyLaunch) -> Result<(), String> {
         alive(&launch.identities)?;
         let target = self.target(launch)?;
+        // ADR 0033 §3: the server first, so an engine connected to a server
+        // that is gone or exposed is never re-admitted.
+        let server = capyctl_domain::completion::lmcache_members(&launch.identities);
+        if !server.is_empty() {
+            self.prove_lmcache(launch, &server).await?;
+        }
         match &target.custom {
             Some(custom) => self.prove_custom(launch, &target, custom).await?,
             None => self.prove_listed(&target).await?,
@@ -590,18 +670,37 @@ fn custom_adapter(
     .with_idle(custom.manifest.idle.clone())
 }
 
+/// The re-proof never launches: it only observes the recorded server and
+/// stops an exposed one.
+struct ProveOnly;
+
+impl capyctl_launchers::LaunchAssociation for ProveOnly {
+    fn persist_api_identity(
+        &self,
+        _identity: &ProcessIdentity,
+    ) -> Result<(), capyctl_launchers::AssociationError> {
+        Err(capyctl_launchers::AssociationError::Uncertain(
+            "a readiness proof never launches".into(),
+        ))
+    }
+}
+
 /// Every recorded engine process is alive as recorded; `Unknown` is not alive.
 /// Returns the recorded processes alive now. ADR 0027: a helper may have exited
-/// (an idle compile worker does); it is left out rather than refused.
+/// (an idle compile worker does); it is left out rather than refused. ADR 0033
+/// §3: so may a member of the LMCache server's group other than its `lmcache`
+/// leader (found live on SGLang: a short-lived child of the server).
 fn alive(identities: &[ProcessIdentity]) -> Result<Vec<ProcessIdentity>, String> {
     if identities.is_empty() {
         return Err("the launch recorded no processes".into());
     }
     let mut live = Vec::new();
     for identity in identities {
+        let member = identity.is_helper()
+            || (identity.is_lmcache() && identity.role != capyctl_domain::completion::LMCACHE_ROLE);
         match capyctl_launchers::process_absence::presence(identity) {
             Presence::Alive => live.push(identity.clone()),
-            _ if identity.is_helper() => {}
+            _ if member => {}
             Presence::Gone => {
                 return Err(format!(
                     "recorded {} process {} is gone",

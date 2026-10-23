@@ -12,7 +12,7 @@ use capyctl_config::engine_policy::{
     FlagClass, NameMatch, ProfileArgError, SGLANG_DUMP_RESERVED,
 };
 
-fn check(engine: Engine, option: &str) -> Result<(), ProfileArgError> {
+fn check(engine: Engine, option: &str, value: &str) -> Result<(), ProfileArgError> {
     let none = BTreeSet::new();
     let paths: Vec<PathBuf> = Vec::new();
     let context = ExtraArgsContext {
@@ -23,7 +23,7 @@ fn check(engine: Engine, option: &str) -> Result<(), ProfileArgError> {
         checkpoint_root: None,
         host_fixed: &none,
     };
-    validate_extra_args(&[option.to_owned(), "1".to_owned()], &context)
+    validate_extra_args(&[option.to_owned(), value.to_owned()], &context)
 }
 
 // T21
@@ -37,13 +37,15 @@ fn every_row_is_classed_as_the_checks_class_it() {
                 NameMatch::Name => row.name.clone(),
                 NameMatch::Prefix => format!("{}x", row.name),
             };
-            let result = check(engine, &option);
+            // ADR 0033 §11: a row about one value is checked with it.
+            let result = check(engine, &option, row.value.unwrap_or("1"));
             let agrees = match row.class {
                 FlagClass::Owned => matches!(
                     result,
                     Err(ProfileArgError::Reserved(_)
                         | ProfileArgError::ReservedField { .. }
-                        | ProfileArgError::TypedField { .. })
+                        | ProfileArgError::TypedField { .. }
+                        | ProfileArgError::Lmcache(_))
                 ),
                 FlagClass::Reserved => matches!(
                     result,

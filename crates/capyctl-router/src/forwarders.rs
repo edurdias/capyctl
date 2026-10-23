@@ -152,8 +152,15 @@ impl LiveForwarders {
             base,
             runtime.served_model.clone(),
             runtime.engine_key.clone(),
-            // SPEC §10: a `cache_salt` reaches only an engine that honours it.
-            capyctl_adapters::forward::engine_honours_cache_salt(runtime.engine.as_deref()),
+            // SPEC §10, ADR 0033 §5: a `cache_salt` reaches only an engine that
+            // honours it, as the effective salt of this launch's deployment and
+            // the revision it runs. The router is the one place it is derived;
+            // a remote host's ingress relays the body as sent.
+            capyctl_adapters::forward::CacheSalt::for_launch(
+                runtime.engine.as_deref(),
+                &runtime.deployment_id,
+                runtime.revision,
+            ),
             request_ids,
         );
         cache.retain(|(cached, cached_generation, _, _), _| {

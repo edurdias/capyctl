@@ -643,6 +643,9 @@ async fn activate(
                 measured.tables,
                 // ADR 0029 §1: llama.cpp runs no groups.
                 None,
+                // ADR 0033 §9: a group runs no LMCache, so its plan compares
+                // no model type.
+                None,
                 capyctl_protocol::now_unix_ms(),
             )
             .map_err(|e| e.to_string())
@@ -1105,6 +1108,8 @@ fn launch_commands(
                 checkpoint_tables: memory.disk_tables.map(|recorded| recorded.tables),
                 // ADR 0029 §1: llama.cpp runs no groups.
                 checkpoint_gguf: None,
+                // ADR 0033 §2: a group runs no LMCache (`group_unsupported`).
+                lmcache: None,
                 startup_bytes: None,
                 startup_host_bytes: None,
             };

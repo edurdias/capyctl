@@ -49,6 +49,10 @@ pub struct EmbeddedInstallation {
     /// `None` while not drifted: each drift is journaled once, a drift found
     /// at registration (ADR 0031 §8) by the first launch.
     reported: std::sync::Mutex<Option<String>>,
+    /// ADR 0033 §1: LMCache's registered and observed digests while the
+    /// last launch-time check found it drifted, journaled once per observed
+    /// digest and shown in status; `None` while not drifted.
+    lmcache_drift: std::sync::Mutex<Option<(String, String)>>,
 }
 
 /// One launch-time measurement.
@@ -96,6 +100,7 @@ impl EmbeddedInstallation {
             registration,
             registry,
             reported: std::sync::Mutex::new(None),
+            lmcache_drift: std::sync::Mutex::new(None),
         }
     }
 
@@ -139,6 +144,19 @@ impl EmbeddedInstallation {
         });
         if !profile.installation_observed_digest.is_empty() {
             view["observed_digest"] = profile.installation_observed_digest.into();
+        }
+        // ADR 0033 §1: LMCache in the environment changed since `engine add`.
+        if let Some((registered, observed)) = self
+            .lmcache_drift
+            .lock()
+            .ok()
+            .and_then(|drift| drift.clone())
+        {
+            view["lmcache"] = serde_json::json!({
+                "state": "drifted",
+                "digest": registered,
+                "observed_digest": observed,
+            });
         }
         view
     }
@@ -248,12 +266,24 @@ impl EmbeddedInstallations {
 
 /// Wraps an embedded engine adapter: before Initialize the installation is
 /// measured, a new drift is journaled, and `refuse` refuses before any effect.
+/// ADR 0033 §1: a launch planned with an LMCache server has LMCache checked
+/// in the same environment, with the same drift policy.
 pub struct InstallationGate {
     inner: Arc<dyn EngineAdapter>,
     owner: SharedCoordinatorState,
     installation: Arc<EmbeddedInstallation>,
     policy: InstallationDrift,
     host: String,
+    /// ADR 0033 (lifecycle design §2.3): the launch's LMCache state, shared
+    /// with its adapter, and what its check needs.
+    lmcache: Option<LmcacheCheck>,
+}
+
+/// The launch-time LMCache check of one launch (ADR 0033 §1).
+struct LmcacheCheck {
+    state: Arc<capyctl_adapters::lmcache::LmcacheState>,
+    required: bool,
+    registered: Option<capyctl_config::lmcache::LmcacheRegistration>,
 }
 
 impl InstallationGate {
@@ -262,6 +292,7 @@ impl InstallationGate {
         owner: SharedCoordinatorState,
         installation: Arc<EmbeddedInstallation>,
         work: &InitializeWork,
+        lmcache: Option<Arc<capyctl_adapters::lmcache::LmcacheState>>,
     ) -> Arc<Self> {
         let effective = work.effective();
         Arc::new(Self {
@@ -270,6 +301,11 @@ impl InstallationGate {
             installation,
             policy: effective.profile.security.installation_drift,
             host: effective.host.name.clone(),
+            lmcache: lmcache.map(|state| LmcacheCheck {
+                state,
+                required: work.lmcache().is_some_and(|plan| plan.required()),
+                registered: effective.profile.lmcache.clone(),
+            }),
         })
     }
 
@@ -280,19 +316,96 @@ impl InstallationGate {
             .await
             .map_err(|_| RuntimeError::Uncertain("the installation was not measured".into()))?;
         if let Some((registered, observed)) = &check.newly_drifted {
-            // Evidence only; a journal failure never decides the launch.
-            if let Ok(owner) = self.owner.lock() {
-                let _ = owner.store().record_installation_drift(
-                    &self.host,
-                    &self.installation.profile,
-                    registered,
-                    observed,
-                );
-            }
+            self.journal_drift(&self.installation.profile, registered, observed);
         }
         match check.refused {
             Some(reason) => Err(RuntimeError::Refused(reason.into())),
-            None => Ok(()),
+            None => self.lmcache_admitted().await,
+        }
+    }
+
+    /// Evidence only; a journal failure never decides the launch.
+    fn journal_drift(&self, profile: &str, registered: &str, observed: &str) {
+        if let Ok(owner) = self.owner.lock() {
+            let _ = owner
+                .store()
+                .record_installation_drift(&self.host, profile, registered, observed);
+        }
+    }
+
+    /// ADR 0033 §1 (lifecycle design §2.3): a launch that is to start a
+    /// server has LMCache checked in its environment first. Drift is the
+    /// engine's: journaled once per digest, refused `installation_drift`
+    /// under `refuse`. A failing check refuses `lmcache_unavailable:<reason>`
+    /// under `required`; otherwise LMCache is off for the launch with the
+    /// check's reason, and the engine starts without it.
+    async fn lmcache_admitted(&self) -> Result<(), RuntimeError> {
+        let Some(lmcache) = &self.lmcache else {
+            return Ok(());
+        };
+        if !matches!(
+            lmcache.state.launch(),
+            Some(capyctl_adapters::lmcache::LmcacheLaunch::Start(_))
+        ) {
+            return Ok(());
+        }
+        let (engine, executable, registered) = (
+            self.installation.engine,
+            self.installation.executable.clone(),
+            lmcache.registered.clone(),
+        );
+        let checked = tokio::task::spawn_blocking(move || {
+            capyctl_agent::lmcache_install::check_lmcache(
+                &capyctl_agent::installation::InstallationMeasurer::new(),
+                engine,
+                &executable,
+                registered.as_ref(),
+            )
+        })
+        .await
+        .map_err(|_| RuntimeError::Uncertain("LMCache was not checked".into()))?;
+        match checked {
+            Ok(install) => {
+                let drift = lmcache
+                    .registered
+                    .as_ref()
+                    .filter(|_| install.drifted)
+                    .map(|registered| (registered.digest.clone(), install.digest.clone()));
+                let new = self
+                    .installation
+                    .lmcache_drift
+                    .lock()
+                    .map(|mut known| {
+                        let new = drift.is_some()
+                            && known.as_ref().map(|(_, observed)| observed)
+                                != drift.as_ref().map(|(_, observed)| observed);
+                        known.clone_from(&drift);
+                        new
+                    })
+                    .unwrap_or(false);
+                if !install.drifted {
+                    return Ok(());
+                }
+                // The installation named `<profile>:lmcache`, a journal token.
+                if let (true, Some((registered, observed))) = (new, &drift) {
+                    self.journal_drift(
+                        &format!("{}:lmcache", self.installation.profile),
+                        registered,
+                        observed,
+                    );
+                }
+                match self.policy {
+                    InstallationDrift::Refuse => Err(RuntimeError::Refused(DRIFT_REFUSAL.into())),
+                    InstallationDrift::Warn => Ok(()),
+                }
+            }
+            Err(failure) if lmcache.required => {
+                Err(RuntimeError::Refused(failure.reason.required_refusal()))
+            }
+            Err(failure) => {
+                lmcache.state.turn_off(failure.reason, failure.detail);
+                Ok(())
+            }
         }
     }
 }
@@ -803,11 +916,374 @@ mod tests {
             )),
             policy: InstallationDrift::Warn,
             host: "host".into(),
+            lmcache: None,
         };
         let member = MemberRef {
             deployment_id: "d".into(),
             member_id: "b".into(),
         };
         assert!(gate.engine_quiescent(&member, 0).await);
+    }
+
+    /// A server plan whose environment is `dir`.
+    fn server_plan(dir: &Path) -> capyctl_adapters::lmcache::ServerPlan {
+        capyctl_adapters::lmcache::ServerPlan {
+            lmcache_bin: dir.join("bin/lmcache"),
+            rpc_port: 25001,
+            http_port: 25002,
+            pool_gib: 1,
+            path: "/usr/bin:/bin".into(),
+            home: None,
+            cuda_visible_devices: None,
+            cuda_device_order: None,
+            log: None,
+            config_dir: dir.join("lmcache/inc"),
+            start_bound: std::time::Duration::from_secs(30),
+            proc_root: "/proc".into(),
+            required: false,
+        }
+    }
+
+    // T45: the launch-time LMCache check of an embedded launch that is to
+    // start a server: LMCache missing from the environment turns it off for
+    // the launch under `auto` (the engine starts without it, nothing
+    // refused), and refuses the launch `lmcache_unavailable:not_installed`
+    // under `required`; a launch the store planned off is not checked.
+    #[tokio::test]
+    async fn the_lmcache_check_turns_off_under_auto_and_refuses_under_required() {
+        use capyctl_adapters::lmcache::{LmcacheLaunch, LmcacheReport, LmcacheState};
+        use capyctl_config::lmcache::LmcacheOffReason;
+        use std::os::unix::fs::PermissionsExt;
+        let state_dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = Arc::new(std::sync::Mutex::new(
+            crate::ownership::OwnedCoordinatorState::open(state_dir.path()).unwrap(),
+        ));
+        let env = venv();
+        let gate = |state: Arc<LmcacheState>, required: bool| InstallationGate {
+            inner: Arc::new(NeverInitialized),
+            owner: owner.clone(),
+            installation: Arc::new(EmbeddedInstallation::register(
+                "local",
+                Engine::Vllm,
+                &env.path().join("bin/vllm"),
+                None,
+            )),
+            policy: InstallationDrift::Warn,
+            host: "host".into(),
+            lmcache: Some(LmcacheCheck {
+                state,
+                required,
+                registered: None,
+            }),
+        };
+        let auto = LmcacheState::new(LmcacheLaunch::Start(server_plan(env.path())));
+        assert!(gate(auto.clone(), false).admitted().await.is_ok());
+        assert_eq!(auto.launch(), None, "nothing is started");
+        assert!(matches!(
+            auto.report(),
+            Some(LmcacheReport::Off {
+                reason: LmcacheOffReason::NotInstalled,
+                connector_failed: false,
+                ..
+            })
+        ));
+        let required = LmcacheState::new(LmcacheLaunch::Start(server_plan(env.path())));
+        match gate(required.clone(), true).admitted().await {
+            Err(RuntimeError::Refused(code)) => {
+                assert_eq!(code, "lmcache_unavailable:not_installed")
+            }
+            other => panic!("required LMCache missing must refuse, got {other:?}"),
+        }
+        assert!(required.report().is_none(), "a refusal reports nothing");
+        let planned_off = LmcacheState::off(LmcacheOffReason::HostOff, "off here".into());
+        assert!(gate(planned_off.clone(), true).admitted().await.is_ok());
+        assert!(matches!(
+            planned_off.report(),
+            Some(LmcacheReport::Off {
+                reason: LmcacheOffReason::HostOff,
+                ..
+            })
+        ));
+    }
+
+    /// A vLLM 0.32.0 environment with LMCache 0.5.6, built from the agent's
+    /// fixture excerpts of the real sources. Returns the directory, the
+    /// engine's executable and the site-packages directory.
+    fn lmcache_venv() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        fn copy_tree(from: &Path, to: &Path) {
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    std::fs::create_dir_all(&target).unwrap();
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), &target).unwrap();
+                }
+            }
+        }
+        let fixtures =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../capyctl-agent/tests/fixtures/lmcache");
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("lib/python3.12/site-packages");
+        std::fs::create_dir_all(&site).unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        std::fs::write(dir.path().join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        for program in ["python3", "vllm", "lmcache"] {
+            std::fs::write(dir.path().join("bin").join(program), "").unwrap();
+        }
+        copy_tree(&fixtures.join("vllm-0.32.0"), &site);
+        copy_tree(&fixtures.join("lmcache-0.5.6"), &site);
+        let dist = site.join("lmcache-0.5.6.dist-info");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(
+            dist.join("METADATA"),
+            "Metadata-Version: 2.4\nName: lmcache\nVersion: 0.5.6\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dist.join("entry_points.txt"),
+            "[console_scripts]\nlmcache = lmcache.cli.main:main\n",
+        )
+        .unwrap();
+        let executable = dir.path().join("bin/vllm");
+        (dir, executable, site)
+    }
+
+    /// The coordinator state an embedded gate journals into, in a private
+    /// directory.
+    fn owned_state() -> (tempfile::TempDir, SharedCoordinatorState) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = Arc::new(std::sync::Mutex::new(
+            crate::ownership::OwnedCoordinatorState::open(dir.path()).unwrap(),
+        ));
+        (dir, owner)
+    }
+
+    /// The `installation_drift_flagged` events journaled so far, as payloads.
+    fn drift_events(owner: &SharedCoordinatorState) -> Vec<serde_json::Value> {
+        owner
+            .lock()
+            .unwrap()
+            .store()
+            .events_after(None, 1000)
+            .unwrap()
+            .events
+            .into_iter()
+            .filter(|event| event.kind == "installation_drift_flagged")
+            .map(|event| serde_json::from_str(&event.payload_json).unwrap())
+            .collect()
+    }
+
+    // T45 T21 T22 (ADR 0033 §1, ADR 0008): the embedded launch-time check of
+    // an LMCache registered by `engine add` (version and the digest the real
+    // measurement computes). Unchanged, the launch starts its server and
+    // nothing is drifted or journaled. One installed LMCache file changed,
+    // it is drift: under `warn` LMCache is still used and the launch goes on,
+    // the installation view shows `lmcache: {state: drifted, ...}`, and the
+    // drift is journaled once as `<profile>:lmcache` (a valid journal name);
+    // under `refuse` the launch is refused `installation_drift`, `auto` or
+    // `required` alike. A further change journals again; measured as
+    // registered again, the drift clears.
+    #[tokio::test]
+    async fn a_drifted_lmcache_is_shown_journaled_once_and_handled_by_the_drift_policy() {
+        use capyctl_adapters::lmcache::{LmcacheLaunch, LmcacheReport, LmcacheState};
+        let (_state_dir, owner) = owned_state();
+        let (env, executable, site) = lmcache_venv();
+        let registered = capyctl_agent::lmcache_install::measure_lmcache(
+            &capyctl_agent::installation::InstallationMeasurer::new(),
+            &executable,
+        )
+        .unwrap()
+        .expect("LMCache is installed")
+        .registration();
+        assert_eq!(registered.version, "0.5.6");
+        let installation = Arc::new(EmbeddedInstallation::register(
+            "local",
+            Engine::Vllm,
+            &executable,
+            None,
+        ));
+        let launch = |policy: InstallationDrift, required: bool| {
+            let state = LmcacheState::new(LmcacheLaunch::Start(server_plan(env.path())));
+            let gate = InstallationGate {
+                inner: Arc::new(NeverInitialized),
+                owner: owner.clone(),
+                installation: installation.clone(),
+                policy,
+                host: "host-a".into(),
+                lmcache: Some(LmcacheCheck {
+                    state: state.clone(),
+                    required,
+                    registered: Some(registered.clone()),
+                }),
+            };
+            async move { (gate.admitted().await, state) }
+        };
+        let starts_its_server = |state: &Arc<LmcacheState>| {
+            matches!(state.launch(), Some(LmcacheLaunch::Start(_)))
+                && !matches!(state.report(), Some(LmcacheReport::Off { .. }))
+        };
+
+        let (verdict, state) = launch(InstallationDrift::Refuse, true).await;
+        assert!(verdict.is_ok(), "{verdict:?}");
+        assert!(starts_its_server(&state));
+        assert!(installation.view().get("lmcache").is_none());
+        assert!(drift_events(&owner).is_empty());
+
+        let file = site.join("lmcache/v1/multiprocess/config.py");
+        let original = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, format!("{original}\n# patched after engine add\n")).unwrap();
+        for required in [false, true] {
+            let (verdict, state) = launch(InstallationDrift::Warn, required).await;
+            assert!(verdict.is_ok(), "required {required}: {verdict:?}");
+            assert!(starts_its_server(&state), "warn uses LMCache");
+        }
+        let view = installation.view();
+        let observed = view["lmcache"]["observed_digest"]
+            .as_str()
+            .expect("the drift is shown")
+            .to_owned();
+        assert!(observed.starts_with("sha256:"));
+        assert_ne!(observed, registered.digest);
+        assert_eq!(
+            view["lmcache"],
+            serde_json::json!({"state": "drifted", "digest": registered.digest,
+                "observed_digest": observed})
+        );
+        assert_eq!(view["state"], "measured", "the engine package is unchanged");
+        let journaled = drift_events(&owner);
+        assert_eq!(journaled.len(), 1, "journaled once: {journaled:?}");
+        assert_eq!(journaled[0]["host_id"], "host-a");
+        assert_eq!(journaled[0]["installation"], "local:lmcache");
+        assert_eq!(
+            journaled[0]["registered_digest"],
+            registered.digest.as_str()
+        );
+        assert_eq!(journaled[0]["observed_digest"], observed.as_str());
+
+        for required in [false, true] {
+            match launch(InstallationDrift::Refuse, required).await.0 {
+                Err(RuntimeError::Refused(code)) => assert_eq!(code, DRIFT_REFUSAL),
+                other => panic!("refuse must refuse the drifted launch, got {other:?}"),
+            }
+        }
+        assert_eq!(drift_events(&owner).len(), 1, "the same drift again");
+
+        std::fs::write(&file, format!("{original}\n# patched twice\n")).unwrap();
+        assert!(launch(InstallationDrift::Warn, false).await.0.is_ok());
+        let journaled = drift_events(&owner);
+        assert_eq!(
+            journaled.len(),
+            2,
+            "a drift to another digest: {journaled:?}"
+        );
+        assert_eq!(journaled[1]["installation"], "local:lmcache");
+        assert_ne!(journaled[1]["observed_digest"], observed.as_str());
+        assert_eq!(
+            installation.view()["lmcache"]["observed_digest"],
+            journaled[1]["observed_digest"]
+        );
+
+        std::fs::write(&file, &original).unwrap();
+        let (verdict, state) = launch(InstallationDrift::Refuse, true).await;
+        assert!(verdict.is_ok(), "{verdict:?}");
+        assert!(starts_its_server(&state));
+        assert!(installation.view().get("lmcache").is_none());
+        assert_eq!(drift_events(&owner).len(), 2);
+    }
+
+    // T45 T36 (ADR 0033 §1): LMCache installed in the environment after
+    // `engine add` (the profile registers none) is not loaded: under `auto`
+    // the launch goes on with LMCache off and the reason saying to register
+    // the engine again; under `required` it is refused
+    // `lmcache_unavailable:not_registered` before anything starts. Neither is
+    // drift.
+    #[tokio::test]
+    async fn lmcache_installed_after_engine_add_is_off_under_auto_and_refused_under_required() {
+        use capyctl_adapters::lmcache::{LmcacheLaunch, LmcacheReport, LmcacheState};
+        use capyctl_config::lmcache::LmcacheOffReason;
+        let (_state_dir, owner) = owned_state();
+        let (env, executable, _site) = lmcache_venv();
+        let installation = Arc::new(EmbeddedInstallation::register(
+            "local",
+            Engine::Vllm,
+            &executable,
+            None,
+        ));
+        let gate = |state: Arc<LmcacheState>, required: bool| InstallationGate {
+            inner: Arc::new(NeverInitialized),
+            owner: owner.clone(),
+            installation: installation.clone(),
+            policy: InstallationDrift::Refuse,
+            host: "host-a".into(),
+            lmcache: Some(LmcacheCheck {
+                state,
+                required,
+                registered: None,
+            }),
+        };
+        let auto = LmcacheState::new(LmcacheLaunch::Start(server_plan(env.path())));
+        assert!(gate(auto.clone(), false).admitted().await.is_ok());
+        assert_eq!(auto.launch(), None, "no server is started");
+        match auto.report() {
+            Some(LmcacheReport::Off { reason, detail, .. }) => {
+                assert_eq!(reason, LmcacheOffReason::NotRegistered);
+                assert!(detail.contains("register the engine again"), "{detail}");
+            }
+            other => panic!("LMCache must be off for the launch, got {other:?}"),
+        }
+        let required = LmcacheState::new(LmcacheLaunch::Start(server_plan(env.path())));
+        match gate(required.clone(), true).admitted().await {
+            Err(RuntimeError::Refused(code)) => {
+                assert_eq!(code, "lmcache_unavailable:not_registered")
+            }
+            other => panic!("required LMCache unregistered must refuse, got {other:?}"),
+        }
+        assert!(required.report().is_none(), "a refusal reports nothing");
+        assert!(installation.view().get("lmcache").is_none());
+        assert!(drift_events(&owner).is_empty());
+    }
+
+    /// An inner adapter the LMCache check tests never reach.
+    struct NeverInitialized;
+
+    #[async_trait::async_trait]
+    impl EngineAdapter for NeverInitialized {
+        async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {
+            Err(AdapterError::UnsupportedCapability)
+        }
+        async fn render_plan(&self, _: &PlanInput) -> Result<RenderedCommand, AdapterError> {
+            Err(AdapterError::UnsupportedCapability)
+        }
+        async fn check_readiness(&self, _: &MemberRef) -> Result<Readiness, AdapterError> {
+            Err(AdapterError::UnsupportedCapability)
+        }
+        async fn prepare_park(&self, _: &MemberRef) -> Result<Quiescence, AdapterError> {
+            Err(AdapterError::UnsupportedCapability)
+        }
+        async fn park(&self, _: &MemberRef, _: ParkLevel) -> Result<ParkOutcome, AdapterError> {
+            Err(AdapterError::UnsupportedCapability)
+        }
+        async fn restore(&self, _: &MemberRef) -> Result<RestoreOutcome, AdapterError> {
+            Err(AdapterError::UnsupportedCapability)
+        }
+        async fn reload_weights(&self, _: &MemberRef) -> Result<ReloadOutcome, AdapterError> {
+            Err(AdapterError::UnsupportedCapability)
+        }
+        async fn observe_work(&self, _: &MemberRef) -> Result<WorkObservation, AdapterError> {
+            Err(AdapterError::UnsupportedCapability)
+        }
+        async fn cancel_work(
+            &self,
+            _: &MemberRef,
+            _: &RequestRef,
+            _: bool,
+        ) -> Result<CancellationOutcome, AdapterError> {
+            Err(AdapterError::UnsupportedCapability)
+        }
     }
 }

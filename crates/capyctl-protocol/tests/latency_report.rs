@@ -23,6 +23,7 @@ fn wire(latency: Option<SampleLatency>) -> pb::ReportLoad {
     LoadReport {
         host_id: "host".into(),
         samples: vec![sample(latency)],
+        lmcache: Vec::new(),
     }
     .to_wire()
 }

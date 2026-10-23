@@ -140,15 +140,18 @@ fn debug_engine_logs() -> bool {
 /// The engine's standard output and error for a launch whose log is `log`:
 /// a pipe into a started writer, or, under `--debug-engine-logs` or with no
 /// writer installed, the file opened by `open`. Under `engine_logs: memory`
-/// it is always the writer, and nothing is created at `log`.
+/// it is always the writer, and nothing is created at `log`. ADR 0033 §10:
+/// `memory_logs` keeps this launch's log in memory whatever the host's
+/// setting (a launch with `retention: zero`).
 pub(crate) fn attach(
     log: &Path,
     relay: Option<&LogRelay>,
     env: &std::collections::BTreeMap<String, String>,
     descriptors: Option<&ProtectedLaunchDescriptors>,
     open: impl Fn(&Path) -> std::io::Result<std::fs::File>,
+    memory_logs: bool,
 ) -> std::io::Result<(Stdio, Stdio)> {
-    let memory = in_memory();
+    let memory = in_memory() || memory_logs;
     let relay = match relay {
         Some(relay) if !debug_engine_logs() => relay,
         // Owner decision 2026-10-20: never a file under `engine_logs: memory`.

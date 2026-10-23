@@ -9,7 +9,7 @@ use capyctl_launchers::{
     ProtectedLaunchDescriptors,
 };
 use capyctl_protocol::{
-    execution::{MemberAction, MemberCommand},
+    execution::{LaunchLmcache, LaunchLmcacheState, MemberAction, MemberCommand},
     pb,
 };
 use prost::Message;
@@ -480,6 +480,11 @@ impl HostJournal {
         // (SGLang's short-lived first child): history only, never one of the
         // launch's recorded processes. Same schema version like member_exits.
         tx.execute_batch("CREATE TABLE IF NOT EXISTS departed_processes(command_id TEXT NOT NULL REFERENCES commands(command_id),role TEXT NOT NULL,pid INTEGER NOT NULL,boot TEXT NOT NULL,ticks INTEGER NOT NULL,PRIMARY KEY(command_id,pid,boot,ticks));")?;
+        // ADR 0033 §§8, 9 (lifecycle design §10): what became of a LaunchSingle's
+        // or a Restore's LMCache, as reported with its result (an encoded
+        // `LaunchLmcacheReport`). Evidence only, same schema version like
+        // member_exits: an older journal simply has no report.
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS launch_lmcache(command_id TEXT PRIMARY KEY REFERENCES commands(command_id),report BLOB NOT NULL);")?;
         let bound: (String, String) = tx.query_row(
             "SELECT controller,host FROM authority WHERE singleton=1",
             [],
@@ -1073,12 +1078,15 @@ impl HostJournal {
 
     /// SPEC §13: a fresh durable ticket supplies one local native adapter with
     /// gated process tools. The adapter remains responsible for model readiness;
-    /// these tools confer neither completion nor cleanup authority.
+    /// these tools confer neither completion nor cleanup authority. ADR 0033
+    /// §10: every process of the launch (its engine, its LMCache server)
+    /// starts under `spawn`.
     pub fn launch_tools(
         self: &Arc<Self>,
         ticket: ExecutionTicket,
         now_ms: i64,
         policy: Arc<dyn LocalExecutionPolicy + Send + Sync>,
+        spawn: capyctl_launchers::SpawnPolicy,
     ) -> Result<Arc<dyn OwnedProcessLaunch>, JournalError> {
         let _gate = self.transition.lock().map_err(|_| JournalError::Storage)?;
         self.validate()?;
@@ -1105,7 +1113,8 @@ impl HostJournal {
             journal: Arc::downgrade(self),
             command_id: ticket.command_id.clone(),
             effect: Some((clock.clone(), command.identity.deadline_ms, ticket.session)),
-        }));
+        }))
+        .with_policy(spawn);
         Ok(Arc::new(JournalLaunchTools {
             journal: self.clone(),
             command,
@@ -1115,6 +1124,7 @@ impl HostJournal {
             incarnation,
             policy,
             spent: AtomicBool::new(false),
+            server_spent: AtomicBool::new(false),
         }))
     }
 
@@ -1145,19 +1155,48 @@ impl HostJournal {
                 let db = self.db.lock().map_err(|_| JournalError::Storage)?;
                 record(&db, &owner)?.processes
             };
-            let Some(api) = processes.iter().find(|p| p.role == "api") else {
-                uncertain = true;
-                continue;
-            };
-            // A reused leader PID cannot authorize adoption of a new group.
-            if tools.present(api) != Presence::Alive {
+            // ADR 0033 §§3, 7: a launch with an LMCache server is re-proved by
+            // both of its groups; a restart-parked one (its engine stopped)
+            // by its server's alone.
+            let leaders = [
+                (processes.iter().find(|p| p.role == "api"), false),
+                (
+                    processes
+                        .iter()
+                        .find(|p| p.role == capyctl_domain::completion::LMCACHE_ROLE),
+                    true,
+                ),
+            ];
+            if leaders.iter().all(|(leader, _)| leader.is_none()) {
                 uncertain = true;
                 continue;
             }
-            let Ok(observed) = tools.observe_group(api) else {
+            let mut observed = Vec::new();
+            let mut proved = true;
+            for (leader, server) in leaders {
+                let Some(leader) = leader else { continue };
+                // A reused leader PID cannot authorize adoption of a new group.
+                if tools.present(leader) != Presence::Alive {
+                    proved = false;
+                    break;
+                }
+                let group = if server {
+                    tools.observe_lmcache_group(leader)
+                } else {
+                    tools.observe_group(leader)
+                };
+                match group {
+                    Ok(group) => observed.extend(group),
+                    Err(_) => {
+                        proved = false;
+                        break;
+                    }
+                }
+            }
+            if !proved {
                 uncertain = true;
                 continue;
-            };
+            }
             let mut db = self.db.lock().map_err(|_| JournalError::Storage)?;
             let ready: bool = db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM native_results WHERE command_id=?1)",
@@ -1225,10 +1264,9 @@ impl HostJournal {
         // ADR 0027: the observation names the group, helpers included. A
         // helper that has exited since is no reason to refuse it; an engine
         // process gone, or anything alive the observation does not name, is.
-        if !capyctl_domain::completion::same_engine(
-            &observation.identities,
-            &alive_identities(&result),
-        ) {
+        // ADR 0033 §3: an observation that names an LMCache server must also
+        // find exactly that server's group alive.
+        if !same_launch(&observation.identities, &alive_identities(&result)) {
             return Err(JournalError::Uncertain);
         }
         result.model_usable = true;
@@ -1385,8 +1423,9 @@ impl HostJournal {
             .filter(|(_, presence)| *presence == Presence::Alive)
             .map(|(identity, _)| identity)
             .collect();
-        // ADR 0027: every engine process of the Ready group; a helper may be gone.
-        if !capyctl_domain::completion::same_engine(&expected, &current) {
+        // ADR 0027: every engine process of the Ready group; a helper may be
+        // gone. ADR 0033 §3: and its LMCache server's group, when it has one.
+        if !same_launch(&expected, &current) {
             return Err(JournalError::Uncertain);
         }
         Ok(expected)
@@ -1416,7 +1455,7 @@ impl HostJournal {
             return Err(JournalError::Uncertain);
         }
         let mut result = self.execution_result(probe_id, observed_at_ms)?;
-        if !capyctl_domain::completion::same_engine(expected, &alive_identities(&result)) {
+        if !same_launch(expected, &alive_identities(&result)) {
             return Err(JournalError::Uncertain);
         }
         result.model_usable = true;
@@ -1538,7 +1577,7 @@ impl HostJournal {
             .map_err(|_| JournalError::Storage)?;
         capyctl_protocol::execution::validate_result(owner, &saved)
             .map_err(|_| JournalError::Storage)?;
-        if !record.claim_retained || record.state != CommandState::Launched || !saved.model_usable {
+        if !record.claim_retained || record.state != CommandState::Launched {
             return Ok(None);
         }
         let expected = alive_identities(&saved);
@@ -1548,11 +1587,23 @@ impl HostJournal {
             .filter(|(_, presence)| *presence == Presence::Alive)
             .map(|(identity, _)| identity)
             .collect();
-        Ok(capyctl_domain::completion::same_engine(&expected, &current).then_some(expected))
+        // ADR 0033 §7: a restart-parked launch holds its LMCache server alone
+        // (its engine stopped and departed); its wake starts from exactly
+        // that server group, alive.
+        let restart_parked = !record.processes.is_empty()
+            && record.processes.iter().all(ProcessIdentity::is_lmcache);
+        if restart_parked {
+            return Ok(server_alone(&expected, &current).then_some(expected));
+        }
+        if !saved.model_usable {
+            return Ok(None);
+        }
+        Ok(same_launch(&expected, &current).then_some(expected))
     }
 
     /// The journaled group of a launch is still `expected`, alive: every engine
-    /// process of it and no other (a helper may be gone, ADR 0027).
+    /// process of it and no other (a helper may be gone, ADR 0027), and its
+    /// LMCache server's group when it has one (ADR 0033 §3).
     pub fn group_unchanged(
         self: &Arc<Self>,
         owned_handle: &str,
@@ -1564,13 +1615,15 @@ impl HostJournal {
             .filter(|(_, presence)| *presence == Presence::Alive)
             .map(|(identity, _)| identity)
             .collect();
-        Ok(capyctl_domain::completion::same_engine(expected, &current))
+        Ok(same_launch(expected, &current))
     }
 
     /// SPEC §§9.1, 13.1: persist how a begun Park or Restore ended, with its
     /// evidence, before the result is sent. A `Parked` or `Restored` claim
     /// holds only for the unchanged live group `begin_residency` returned;
     /// otherwise it is recorded `Uncertain` and the launch is quarantined.
+    /// ADR 0033 §7: a restart-park's `Parked` (evidence `engine_stopped`)
+    /// holds for the launch's server group alone, `expected`.
     pub fn finish_residency(
         self: &Arc<Self>,
         command_id: &str,
@@ -1609,12 +1662,16 @@ impl HostJournal {
             let db = self.db.lock().map_err(|_| JournalError::Storage)?;
             residency_row(&db, &owned)?.is_some_and(|(_, by)| by == command_id)
         };
+        let alive = alive_identities(&result);
+        // ADR 0033 §7: a restart-park leaves the server's group alone alive.
+        let holds = if evidence.engine_stopped {
+            server_alone(expected, &alive)
+        } else {
+            same_launch(expected, &alive)
+        };
         // A claim needs the unchanged group and this command's own durable
         // intent (a Terminate that settled the launch meanwhile removed it).
-        if claimed
-            && (!intent_held
-                || !capyctl_domain::completion::same_engine(expected, &alive_identities(&result)))
-        {
+        if claimed && (!intent_held || !holds) {
             outcome = ResidencyOutcome::Uncertain;
         }
         let shape = |outcome: ResidencyOutcome,
@@ -1684,6 +1741,34 @@ impl HostJournal {
             [command_id],
         )?;
         tx.execute("INSERT INTO native_results(command_id,result) VALUES(?1,?2) ON CONFLICT(command_id) DO UPDATE SET result=excluded.result", params![command_id, result.encode_to_vec()])?;
+        // ADR 0033 §7: a restart-park changes the launch's group. Parked, it
+        // is its server's group alone; restored, a new engine beside that
+        // server. The launch's own recorded readiness follows, so its
+        // supervision, probes and next residency step watch that group.
+        let wake = matches!(command.action, MemberAction::Restore { .. })
+            && outcome == ResidencyOutcome::Restored
+            && mine
+            && restart_parked(&tx, &owned)?;
+        if (outcome == ResidencyOutcome::Parked && mine && evidence.engine_stopped) || wake {
+            let owner = load_command(&tx, &owned)?;
+            let saved: Vec<u8> = tx.query_row(
+                "SELECT result FROM native_results WHERE command_id=?1",
+                [&owned],
+                |r| r.get(0),
+            )?;
+            let mut saved = pb::MemberExecutionResult::decode(saved.as_slice())
+                .map_err(|_| JournalError::Storage)?;
+            saved.processes = result.processes.clone();
+            saved.model_usable = wake;
+            saved.observed_at_unix_ms = observed_at_ms;
+            saved.kernel_builds.clear();
+            capyctl_protocol::execution::validate_result(&owner, &saved)
+                .map_err(|_| JournalError::Conflict)?;
+            tx.execute(
+                "UPDATE native_results SET result=?2 WHERE command_id=?1",
+                params![owned, saved.encode_to_vec()],
+            )?;
+        }
         tx.commit()?;
         Ok(outcome)
     }
@@ -1848,6 +1933,15 @@ impl HostJournal {
             probe_text: String::new(),
             // ADR 0030 §4: nor a decision probe's answer.
             probe_decision: None,
+            // ADR 0033 §§8, 9: a LaunchSingle's or a Restore's own LMCache
+            // report, as journaled when its Initialize ended.
+            lmcache: match command.action {
+                MemberAction::LaunchSingle(_) | MemberAction::Restore { .. } => {
+                    let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+                    lmcache_report(&db, command_id)?.map(|report| report.to_wire())
+                }
+                _ => None,
+            },
         };
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         // A launch that is not resident (parking, parked, restoring or
@@ -2024,7 +2118,227 @@ impl HostJournal {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?)
     }
+
+    /// ADR 0033 §§8, 9 (lifecycle design §10): journal what became of the
+    /// LMCache of the LaunchSingle or Restore `command_id`, before its result
+    /// is sent, so a replay reports it too. The latest report stands.
+    pub fn record_launch_lmcache(
+        &self,
+        command_id: &str,
+        report: &LaunchLmcache,
+    ) -> Result<(), JournalError> {
+        self.validate()?;
+        let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+        let command = load_command(&db, command_id)?;
+        if !matches!(
+            command.action,
+            MemberAction::LaunchSingle(_) | MemberAction::Restore { .. }
+        ) {
+            return Err(JournalError::Unauthorized);
+        }
+        db.execute(
+            "INSERT INTO launch_lmcache(command_id,report) VALUES(?1,?2) ON CONFLICT(command_id) DO UPDATE SET report=excluded.report",
+            params![command_id, report.to_wire().encode_to_vec()],
+        )?;
+        Ok(())
+    }
+
+    /// ADR 0033 §7: whether the retained launch `owned_handle` runs with its
+    /// LMCache server (its launch reported LMCache on).
+    pub fn lmcache_on(&self, owned_handle: &str) -> Result<bool, JournalError> {
+        self.validate()?;
+        let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+        Ok(lmcache_report(&db, owned_handle)?
+            .is_some_and(|report| report.state == LaunchLmcacheState::On))
+    }
+
+    /// ADR 0033 §4 (lifecycle design §1.8): the incarnation of every launch
+    /// this host still claims, whose private LMCache directory a role start
+    /// keeps.
+    pub fn claimed_incarnations(&self) -> Result<std::collections::BTreeSet<String>, JournalError> {
+        self.validate()?;
+        let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+        Ok(claimed_launches(&db, "")?
+            .into_iter()
+            .filter_map(|claimed| {
+                claimed
+                    .command
+                    .action
+                    .launch_plan()
+                    .map(|plan| plan.incarnation.clone())
+            })
+            .collect())
+    }
+
+    /// ADR 0033 §7: a restart-park stopped the engine of the parking launch
+    /// `owned_handle` (verified gone) and kept its LMCache server. The stopped
+    /// processes leave the launch's recorded set for its history, so the
+    /// parked launch is its server's group alone. Every one must be a
+    /// recorded engine process (or helper) proven gone now; anything else is
+    /// uncertain and leaves the record as it was.
+    pub fn depart_stopped(
+        &self,
+        owned_handle: &str,
+        stopped: &[ProcessIdentity],
+    ) -> Result<(), JournalError> {
+        let _gate = self.transition.lock().map_err(|_| JournalError::Storage)?;
+        self.validate()?;
+        let mut db = self.db.lock().map_err(|_| JournalError::Storage)?;
+        let tx = db.transaction()?;
+        let owned = record(&tx, owned_handle)?;
+        let parking =
+            residency_row(&tx, owned_handle)?.is_some_and(|(state, _)| state == "parking");
+        if !owned.claim_retained
+            || !parking
+            || stopped.is_empty()
+            || stopped
+                .iter()
+                .any(|p| p.is_lmcache() || !owned.processes.contains(p))
+        {
+            return Err(JournalError::Conflict);
+        }
+        if stopped
+            .iter()
+            .any(|p| capyctl_launchers::process_absence::presence(p) != Presence::Gone)
+        {
+            return Err(JournalError::Uncertain);
+        }
+        for p in stopped {
+            tx.execute(
+                "INSERT OR IGNORE INTO departed_processes VALUES(?1,?2,?3,?4,?5)",
+                params![owned_handle, p.role, p.pid, p.boot_id, p.start_ticks as i64],
+            )?;
+            tx.execute(
+                "DELETE FROM processes WHERE command_id=?1 AND pid=?2 AND boot=?3 AND ticks=?4",
+                params![owned_handle, p.pid, p.boot_id, p.start_ticks as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// ADR 0033 §7 (lifecycle design §4.2): the process tools of one begun
+    /// Restore of a restart-parked launch. They spawn its engine again once,
+    /// under the wake key of this Restore's step, only while the launch is
+    /// `restoring` by this command, its claim held, this session connected
+    /// and the Restore's deadline not passed; the new `api` identity is
+    /// journaled with the launch before the engine runs, and every
+    /// observation of the launch's groups is journaled with it as a launch's
+    /// is. They never start a server and grant no cleanup.
+    pub fn wake_tools(
+        self: &Arc<Self>,
+        restore_id: &str,
+        session: u64,
+        now_ms: i64,
+        spawn: capyctl_launchers::SpawnPolicy,
+    ) -> Result<Arc<dyn OwnedProcessLaunch>, JournalError> {
+        let _gate = self.transition.lock().map_err(|_| JournalError::Storage)?;
+        self.validate()?;
+        self.check_session(session)?;
+        let (restore, owner) = {
+            let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+            let restore = load_command(&db, restore_id)?;
+            let MemberAction::Restore { owned_handle, .. } = &restore.action else {
+                return Err(JournalError::Unauthorized);
+            };
+            let restoring = residency_row(&db, owned_handle)?
+                .is_some_and(|(state, by)| state == "restoring" && by == restore_id);
+            if !restoring || !record(&db, owned_handle)?.claim_retained {
+                return Err(JournalError::Unauthorized);
+            }
+            let owner = load_command(&db, owned_handle)?;
+            (restore, owner)
+        };
+        let incarnation = owner
+            .action
+            .launch_plan()
+            .map(|plan| plan.incarnation.clone())
+            .ok_or(JournalError::Unauthorized)?;
+        let clock: Arc<dyn ExecutionClock> = Arc::new(AnchoredClock {
+            epoch_ms: now_ms,
+            started: Instant::now(),
+        });
+        let tools = DurableProcessLaunch::new(Arc::new(WakeAssociation {
+            journal: Arc::downgrade(self),
+            owner: owner.identity.command_id.clone(),
+            restore: restore_id.to_owned(),
+            clock: clock.clone(),
+            deadline_ms: restore.identity.deadline_ms,
+            session,
+        }))
+        .with_policy(spawn);
+        Ok(Arc::new(JournalWakeTools {
+            journal: self.clone(),
+            wake: restore.identity.step_id.clone(),
+            restore,
+            owner,
+            session,
+            clock,
+            tools,
+            incarnation,
+            spent: AtomicBool::new(false),
+        }))
+    }
 }
+
+/// ADR 0033 §7: whether the launch `owner`'s recorded readiness is a
+/// restart-park's: its server group alone, no engine process alive in it.
+fn restart_parked(db: &Connection, owner: &str) -> Result<bool, JournalError> {
+    let saved: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT result FROM native_results WHERE command_id=?1",
+            [owner],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(saved) = saved else {
+        return Ok(false);
+    };
+    let saved =
+        pb::MemberExecutionResult::decode(saved.as_slice()).map_err(|_| JournalError::Storage)?;
+    let alive = alive_identities(&saved);
+    Ok(!alive.is_empty() && alive.iter().all(ProcessIdentity::is_lmcache))
+}
+
+/// ADR 0033 §§8, 9: the journaled LMCache report of `command_id`, if any.
+fn lmcache_report(
+    db: &Connection,
+    command_id: &str,
+) -> Result<Option<LaunchLmcache>, JournalError> {
+    let bytes: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT report FROM launch_lmcache WHERE command_id=?1",
+            [command_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    bytes
+        .map(|bytes| {
+            pb::LaunchLmcacheReport::decode(bytes.as_slice())
+                .ok()
+                .and_then(|report| LaunchLmcache::try_from(&report).ok())
+                .ok_or(JournalError::Storage)
+        })
+        .transpose()
+}
+
+/// ADR 0027, ADR 0033 §3: `current` is still the launch `expected` names:
+/// every engine process of it and no other (a helper may be gone), and when
+/// it has an LMCache server, exactly that server's group.
+pub(crate) fn same_launch(expected: &[ProcessIdentity], current: &[ProcessIdentity]) -> bool {
+    use capyctl_domain::completion::{lmcache_members, same_engine, same_lmcache};
+    same_engine(expected, current)
+        && (lmcache_members(expected).is_empty() || same_lmcache(expected, current))
+}
+
+/// ADR 0033 §7: `current` is a restart-parked launch's server group alone,
+/// exactly the one `expected` names, with no engine process alive.
+pub(crate) fn server_alone(expected: &[ProcessIdentity], current: &[ProcessIdentity]) -> bool {
+    !current.iter().any(ProcessIdentity::is_engine)
+        && !expected.iter().any(ProcessIdentity::is_engine)
+        && capyctl_domain::completion::same_lmcache(expected, current)
+}
+
 fn alive_identities(result: &pb::MemberExecutionResult) -> Vec<ProcessIdentity> {
     result
         .processes
@@ -2106,20 +2420,34 @@ fn after_readiness(
             .iter()
             .any(|r| r.pid == p.pid && r.boot_id == p.boot_id && r.start_ticks == p.start_ticks)
     };
-    let mut next = recorded
-        .iter()
-        .filter_map(|p| {
-            p.role
-                .strip_prefix(capyctl_domain::completion::HELPER_ROLE_PREFIX)
-                .and_then(|n| n.parse::<u64>().ok())
-        })
-        .max()
-        .map_or(0, |n| n + 1);
+    let next_of = |prefix: &str| {
+        recorded
+            .iter()
+            .filter_map(|p| {
+                p.role
+                    .strip_prefix(prefix)
+                    .and_then(|n| n.parse::<u64>().ok())
+            })
+            .max()
+            .map_or(0, |n| n + 1)
+    };
+    let mut next = next_of(capyctl_domain::completion::HELPER_ROLE_PREFIX);
+    // ADR 0033 §3: a process new in the LMCache server's group stays the
+    // server's (`lmcache-N`), never the engine's helper.
+    let mut next_server = next_of(capyctl_domain::completion::LMCACHE_MEMBER_PREFIX);
     observed
         .into_iter()
         .filter(|p| !known(p))
         .map(|mut p| {
-            if p.role != "api" {
+            if p.is_lmcache() {
+                if p.role != capyctl_domain::completion::LMCACHE_ROLE {
+                    p.role = format!(
+                        "{}{next_server}",
+                        capyctl_domain::completion::LMCACHE_MEMBER_PREFIX
+                    );
+                    next_server += 1;
+                }
+            } else if p.role != "api" {
                 p.role = format!("{}{next}", capyctl_domain::completion::HELPER_ROLE_PREFIX);
                 next += 1;
             }
@@ -2159,7 +2487,11 @@ fn stable_roles(
                 p.role = known.role.clone();
                 return p;
             }
-            for prefix in ["worker-", capyctl_domain::completion::HELPER_ROLE_PREFIX] {
+            for prefix in [
+                "worker-",
+                capyctl_domain::completion::HELPER_ROLE_PREFIX,
+                capyctl_domain::completion::LMCACHE_MEMBER_PREFIX,
+            ] {
                 if index(&p.role, prefix).is_some() {
                     let next = taken
                         .iter()
@@ -2185,11 +2517,16 @@ fn stable_roles(
 /// recorded, its exit read as the member's own and failed the group right
 /// after it answered. The spawned leader is never set aside, and a process
 /// whose presence cannot be established stays recorded (uncertainty retains
-/// it). Returns the processes still recorded.
+/// it). ADR 0033 §3: a scan sees one group only, the engine's or (`server`)
+/// the LMCache server's, so only a process of that group can depart on it; a
+/// dead server is never set aside by an engine scan (its death would be
+/// lost), and the server's leader never departs. Returns the processes
+/// still recorded.
 fn depart_gone(
     tx: &Connection,
     command: &str,
     observed: &[ProcessIdentity],
+    server: bool,
 ) -> Result<Vec<ProcessIdentity>, JournalError> {
     let same = |a: &ProcessIdentity, b: &ProcessIdentity| {
         a.pid == b.pid && a.boot_id == b.boot_id && a.start_ticks == b.start_ticks
@@ -2197,6 +2534,8 @@ fn depart_gone(
     let (departed, kept): (Vec<_>, Vec<_>) =
         record(tx, command)?.processes.into_iter().partition(|p| {
             p.role != "api"
+                && p.role != capyctl_domain::completion::LMCACHE_ROLE
+                && p.is_lmcache() == server
                 && !observed.iter().any(|o| same(o, p))
                 && capyctl_launchers::process_absence::presence(p) == Presence::Gone
         });
@@ -2279,6 +2618,7 @@ fn unknown_residency() -> pb::ResidencyEvidence {
         mem_available_before_bytes: -1,
         mem_available_after_bytes: -1,
         milestones: Vec::new(),
+        engine_stopped: false,
     }
 }
 
@@ -2370,18 +2710,30 @@ struct JournalLaunchTools {
     incarnation: String,
     policy: Arc<dyn LocalExecutionPolicy + Send + Sync>,
     spent: AtomicBool,
+    /// ADR 0033 §3: the launch's LMCache server is spawned at most once too.
+    server_spent: AtomicBool,
 }
 impl JournalLaunchTools {
+    /// One gated spawn of the launch's engine, or (`server`) of its LMCache
+    /// server, each at most once. The server starts before the engine, so it
+    /// moves the command to no new state; the engine's spawn marks it
+    /// launched.
     fn launch(
         &self,
         incarnation: &str,
         command: &RenderedCommand,
         descriptors: Option<&ProtectedLaunchDescriptors>,
+        server: bool,
     ) -> Result<ProcessIdentity, capyctl_adapters::traits::RuntimeError> {
         use capyctl_adapters::traits::RuntimeError;
         let failure = || RuntimeError::Uncertain("journal launch authority unavailable".into());
         let _gate = self.journal.transition.lock().map_err(|_| failure())?;
-        if self.spent.swap(true, Ordering::AcqRel) || incarnation != self.incarnation {
+        let spent = if server {
+            &self.server_spent
+        } else {
+            &self.spent
+        };
+        if spent.swap(true, Ordering::AcqRel) || incarnation != self.incarnation {
             return Err(failure());
         }
         self.journal.validate().map_err(|_| failure())?;
@@ -2428,6 +2780,12 @@ impl JournalLaunchTools {
                 .admit_beside(&self.command, &claimed)
                 .map_err(|_| failure())?;
         }
+        if server {
+            // ADR 0033 §3: the server's identity is journaled (role
+            // `lmcache`) before it runs; the launch stays `attempted` until
+            // its engine spawns.
+            return self.tools.spawn_lmcache(incarnation, command);
+        }
         let identity = match descriptors {
             Some(descriptors) => {
                 self.tools
@@ -2444,21 +2802,76 @@ impl JournalLaunchTools {
         Ok(identity)
     }
     fn owns(&self, identity: &ProcessIdentity) -> bool {
-        self.journal
-            .db
-            .lock()
-            .ok()
-            .and_then(|db| record(&db, &self.command.identity.command_id).ok())
-            .is_some_and(|record| record.processes.contains(identity))
+        owns(&self.journal, &self.command.identity.command_id, identity)
     }
 }
+
+/// Whether `identity` is one of the processes the launch `owner` records.
+fn owns(journal: &HostJournal, owner: &str, identity: &ProcessIdentity) -> bool {
+    journal
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| record(&db, owner).ok())
+        .is_some_and(|record| record.processes.contains(identity))
+}
+
+/// One launch step's own scan of a group of the launch `owner` (its engine's,
+/// or with `server` its LMCache server's), journaled. ADR 0028 §8 (found
+/// live 2026-10-15, MN2, MN5): what departed from that group is set aside,
+/// then each process keeps the role it was first journaled under
+/// ([`stable_roles`]).
+fn persist_scan(
+    journal: &HostJournal,
+    owner: &str,
+    observed: Vec<ProcessIdentity>,
+    server: bool,
+) -> Result<Vec<ProcessIdentity>, capyctl_adapters::traits::RuntimeError> {
+    let persist = || -> Result<Vec<ProcessIdentity>, JournalError> {
+        journal.validate()?;
+        let mut db = journal.db.lock().map_err(|_| JournalError::Storage)?;
+        let tx = db.transaction()?;
+        let recorded = depart_gone(&tx, owner, &observed, server)?;
+        let named = stable_roles(&recorded, observed);
+        for identity in &named {
+            persist_process(&tx, owner, identity)?;
+        }
+        tx.commit()?;
+        Ok(named)
+    };
+    persist().map_err(|_| {
+        capyctl_adapters::traits::RuntimeError::Uncertain(
+            "process observation could not be retained".into(),
+        )
+    })
+}
+
+/// ADR 0033 §§3, 7: a verified stop of exactly one owned group of the
+/// launch `owner` (its server's, or its engine's with helpers); every
+/// identity must be one it records. The claim and the accounting stay until
+/// the launch's own Terminate.
+fn stop_owned_group(
+    journal: &HostJournal,
+    owner: &str,
+    tools: &DurableProcessLaunch,
+    identities: &[ProcessIdentity],
+    grace: Duration,
+) -> Result<(), capyctl_adapters::traits::RuntimeError> {
+    if identities.is_empty() || !identities.iter().all(|id| owns(journal, owner, id)) {
+        return Err(capyctl_adapters::traits::RuntimeError::Uncertain(
+            "unowned process".into(),
+        ));
+    }
+    tools.stop_group(identities, grace)
+}
+
 impl OwnedProcessLaunch for JournalLaunchTools {
     fn spawn_durable(
         &self,
         incarnation: &str,
         command: &RenderedCommand,
     ) -> Result<ProcessIdentity, capyctl_adapters::traits::RuntimeError> {
-        self.launch(incarnation, command, None)
+        self.launch(incarnation, command, None, false)
     }
     fn spawn_durable_protected(
         &self,
@@ -2466,7 +2879,14 @@ impl OwnedProcessLaunch for JournalLaunchTools {
         command: &RenderedCommand,
         descriptors: &ProtectedLaunchDescriptors,
     ) -> Result<ProcessIdentity, capyctl_adapters::traits::RuntimeError> {
-        self.launch(incarnation, command, Some(descriptors))
+        self.launch(incarnation, command, Some(descriptors), false)
+    }
+    fn spawn_lmcache(
+        &self,
+        incarnation: &str,
+        command: &RenderedCommand,
+    ) -> Result<ProcessIdentity, capyctl_adapters::traits::RuntimeError> {
+        self.launch(incarnation, command, None, true)
     }
     fn present(&self, identity: &ProcessIdentity) -> Presence {
         if self.owns(identity) {
@@ -2487,25 +2907,60 @@ impl OwnedProcessLaunch for JournalLaunchTools {
             return Err(RuntimeError::Uncertain("unowned process".into()));
         }
         let observed = self.tools.observe_group(api)?;
-        // ADR 0028 §8 (found live 2026-10-15, MN2, MN5): what departed is set
-        // aside, then each process keeps the role it was first journaled
-        // under ([`stable_roles`]).
-        let persist = || -> Result<Vec<ProcessIdentity>, JournalError> {
-            self.journal.validate()?;
-            let mut db = self.journal.db.lock().map_err(|_| JournalError::Storage)?;
-            let tx = db.transaction()?;
-            let id = &self.command.identity.command_id;
-            let recorded = depart_gone(&tx, id, &observed)?;
-            let named = stable_roles(&recorded, observed);
-            for identity in &named {
-                persist_process(&tx, id, identity)?;
-            }
-            tx.commit()?;
-            Ok(named)
-        };
-        persist().map_err(|_| {
-            RuntimeError::Uncertain("process observation could not be retained".into())
-        })
+        persist_scan(
+            &self.journal,
+            &self.command.identity.command_id,
+            observed,
+            false,
+        )
+    }
+    fn observe_lmcache_group(
+        &self,
+        leader: &ProcessIdentity,
+    ) -> Result<Vec<ProcessIdentity>, capyctl_adapters::traits::RuntimeError> {
+        use capyctl_adapters::traits::RuntimeError;
+        if !self.owns(leader) {
+            return Err(RuntimeError::Uncertain("unowned process".into()));
+        }
+        let observed = self.tools.observe_lmcache_group(leader)?;
+        // ADR 0033 §3: the server's whole group is the launch's, journaled
+        // for its Terminate like the engine's.
+        persist_scan(
+            &self.journal,
+            &self.command.identity.command_id,
+            observed,
+            true,
+        )
+    }
+    fn stop_group(
+        &self,
+        identities: &[ProcessIdentity],
+        grace: Duration,
+    ) -> Result<(), capyctl_adapters::traits::RuntimeError> {
+        stop_owned_group(
+            &self.journal,
+            &self.command.identity.command_id,
+            &self.tools,
+            identities,
+            grace,
+        )
+    }
+    /// ADR 0033 §§3, 9: the server the launch stopped before its engine
+    /// leaves the launch's journaled processes (owned ones only).
+    fn depart_lmcache(
+        &self,
+        server: &[ProcessIdentity],
+    ) -> Result<(), capyctl_adapters::traits::RuntimeError> {
+        use capyctl_adapters::traits::RuntimeError;
+        let _gate = self
+            .journal
+            .transition
+            .lock()
+            .map_err(|_| RuntimeError::Uncertain("journal unavailable".into()))?;
+        if server.is_empty() || !server.iter().all(|id| self.owns(id)) {
+            return Err(RuntimeError::Uncertain("unowned process".into()));
+        }
+        self.tools.depart_lmcache(server)
     }
     fn terminate_owned(
         &self,
@@ -2517,13 +2972,173 @@ impl OwnedProcessLaunch for JournalLaunchTools {
     }
 }
 
+/// ADR 0033 §7 (lifecycle design §4.2): the tools of one Restore of a
+/// restart-parked launch ([`HostJournal::wake_tools`]).
+struct JournalWakeTools {
+    journal: Arc<HostJournal>,
+    restore: MemberCommand,
+    owner: MemberCommand,
+    /// The wake key's step: the Restore's own step id.
+    wake: String,
+    session: u64,
+    clock: Arc<dyn ExecutionClock>,
+    tools: DurableProcessLaunch,
+    incarnation: String,
+    spent: AtomicBool,
+}
+impl JournalWakeTools {
+    fn wake(
+        &self,
+        incarnation: &str,
+        command: &RenderedCommand,
+        descriptors: Option<&ProtectedLaunchDescriptors>,
+    ) -> Result<ProcessIdentity, capyctl_adapters::traits::RuntimeError> {
+        use capyctl_adapters::traits::RuntimeError;
+        let failure = || RuntimeError::Uncertain("journal wake authority unavailable".into());
+        let _gate = self.journal.transition.lock().map_err(|_| failure())?;
+        if self.spent.swap(true, Ordering::AcqRel) || incarnation != self.incarnation {
+            return Err(failure());
+        }
+        self.journal.validate().map_err(|_| failure())?;
+        self.journal
+            .check_session(self.session)
+            .map_err(|_| failure())?;
+        before_deadline(self.clock.as_ref(), self.restore.identity.deadline_ms)
+            .map_err(|_| failure())?;
+        wake_held(
+            &self.journal,
+            &self.owner.identity.command_id,
+            &self.restore.identity.command_id,
+        )
+        .map_err(|_| failure())?;
+        self.tools
+            .spawn_durable_wake(incarnation, &self.wake, command, descriptors)
+    }
+    fn owns(&self, identity: &ProcessIdentity) -> bool {
+        owns(&self.journal, &self.owner.identity.command_id, identity)
+    }
+}
+
+/// ADR 0033 §7: the restart-parked launch `owner` is being restored by
+/// `restore` and still holds its claim.
+fn wake_held(journal: &HostJournal, owner: &str, restore: &str) -> Result<(), JournalError> {
+    let db = journal.db.lock().map_err(|_| JournalError::Storage)?;
+    let restoring =
+        residency_row(&db, owner)?.is_some_and(|(state, by)| state == "restoring" && by == restore);
+    let owned: (i64, bool) = db.query_row(
+        "SELECT state,claim FROM commands WHERE command_id=?1",
+        [owner],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if !restoring || owned != (2, true) {
+        return Err(JournalError::Conflict);
+    }
+    Ok(())
+}
+
+impl OwnedProcessLaunch for JournalWakeTools {
+    fn spawn_durable(
+        &self,
+        incarnation: &str,
+        command: &RenderedCommand,
+    ) -> Result<ProcessIdentity, capyctl_adapters::traits::RuntimeError> {
+        self.wake(incarnation, command, None)
+    }
+    fn spawn_durable_protected(
+        &self,
+        incarnation: &str,
+        command: &RenderedCommand,
+        descriptors: &ProtectedLaunchDescriptors,
+    ) -> Result<ProcessIdentity, capyctl_adapters::traits::RuntimeError> {
+        self.wake(incarnation, command, Some(descriptors))
+    }
+    fn spawn_durable_wake(
+        &self,
+        incarnation: &str,
+        wake: &str,
+        command: &RenderedCommand,
+        descriptors: Option<&ProtectedLaunchDescriptors>,
+    ) -> Result<ProcessIdentity, capyctl_adapters::traits::RuntimeError> {
+        if wake != self.wake {
+            return Err(capyctl_adapters::traits::RuntimeError::Uncertain(
+                "another wake step".into(),
+            ));
+        }
+        self.wake(incarnation, command, descriptors)
+    }
+    fn present(&self, identity: &ProcessIdentity) -> Presence {
+        if self.owns(identity) {
+            self.tools.present(identity)
+        } else {
+            Presence::Unknown
+        }
+    }
+    fn building(&self, api: &ProcessIdentity) -> bool {
+        self.owns(api) && self.tools.building(api)
+    }
+    fn observe_group(
+        &self,
+        api: &ProcessIdentity,
+    ) -> Result<Vec<ProcessIdentity>, capyctl_adapters::traits::RuntimeError> {
+        use capyctl_adapters::traits::RuntimeError;
+        if !self.owns(api) {
+            return Err(RuntimeError::Uncertain("unowned process".into()));
+        }
+        let observed = self.tools.observe_group(api)?;
+        persist_scan(
+            &self.journal,
+            &self.owner.identity.command_id,
+            observed,
+            false,
+        )
+    }
+    fn observe_lmcache_group(
+        &self,
+        leader: &ProcessIdentity,
+    ) -> Result<Vec<ProcessIdentity>, capyctl_adapters::traits::RuntimeError> {
+        use capyctl_adapters::traits::RuntimeError;
+        if !self.owns(leader) {
+            return Err(RuntimeError::Uncertain("unowned process".into()));
+        }
+        let observed = self.tools.observe_lmcache_group(leader)?;
+        persist_scan(
+            &self.journal,
+            &self.owner.identity.command_id,
+            observed,
+            true,
+        )
+    }
+    fn stop_group(
+        &self,
+        identities: &[ProcessIdentity],
+        grace: Duration,
+    ) -> Result<(), capyctl_adapters::traits::RuntimeError> {
+        stop_owned_group(
+            &self.journal,
+            &self.owner.identity.command_id,
+            &self.tools,
+            identities,
+            grace,
+        )
+    }
+    fn terminate_owned(
+        &self,
+        _: &[ProcessIdentity],
+        _: Duration,
+    ) -> Result<(), capyctl_adapters::traits::RuntimeError> {
+        Err(capyctl_adapters::traits::RuntimeError::Unsupported)
+    }
+}
+
 struct JournalAssociation {
     journal: Weak<HostJournal>,
     command_id: String,
     effect: Option<(Arc<dyn ExecutionClock>, i64, u64)>,
 }
-impl LaunchAssociation for JournalAssociation {
-    fn persist_api_identity(&self, identity: &ProcessIdentity) -> Result<(), AssociationError> {
+impl JournalAssociation {
+    /// Persist one spawned process of the launch while it is `attempted`
+    /// with its claim, under the step's deadline and session.
+    fn persist_attempted(&self, identity: &ProcessIdentity) -> Result<(), AssociationError> {
         let persist = || -> Result<(), JournalError> {
             let journal = self.journal.upgrade().ok_or(JournalError::Storage)?;
             journal.validate()?;
@@ -2547,6 +3162,130 @@ impl LaunchAssociation for JournalAssociation {
             // the launcher disposes only its just-created child. Claim remains.
             before_deadline(clock.as_ref(), *deadline)?;
             journal.check_session(*session)?;
+            Ok(())
+        };
+        persist()
+            .map_err(|_| AssociationError::Uncertain("host ownership persistence failed".into()))
+    }
+}
+impl LaunchAssociation for JournalAssociation {
+    fn persist_api_identity(&self, identity: &ProcessIdentity) -> Result<(), AssociationError> {
+        self.persist_attempted(identity)
+    }
+    /// ADR 0033 §3: the server is journaled as the launch's (role `lmcache`)
+    /// under the same fences as its engine, before it runs.
+    fn persist_lmcache_identity(&self, identity: &ProcessIdentity) -> Result<(), AssociationError> {
+        if identity.role != capyctl_domain::completion::LMCACHE_ROLE {
+            return Err(AssociationError::Uncertain("not a server identity".into()));
+        }
+        self.persist_attempted(identity)
+    }
+    /// ADR 0033 §§3, 9 (found live on SGLang: a launch whose server failed
+    /// its listener check reached Ready naming the stopped server, and the
+    /// controller refused it): the server stopped before the engine (the
+    /// launch still `attempted`, its claim held, under the step's deadline
+    /// and session) leaves the launch's recorded processes for
+    /// `departed_processes` (history only), as a process departed during its
+    /// launch step does. Every server process recorded is set aside, each one
+    /// of `server` (proven gone by the caller) or proven gone here; nothing
+    /// moves if the launch records any engine process.
+    fn depart_lmcache_server(&self, server: &[ProcessIdentity]) -> Result<(), AssociationError> {
+        let depart = || -> Result<(), JournalError> {
+            let journal = self.journal.upgrade().ok_or(JournalError::Storage)?;
+            journal.validate()?;
+            let (clock, deadline, session) =
+                self.effect.as_ref().ok_or(JournalError::Unauthorized)?;
+            before_deadline(clock.as_ref(), *deadline)?;
+            journal.check_session(*session)?;
+            let mut db = journal.db.lock().map_err(|_| JournalError::Storage)?;
+            let tx = db.transaction()?;
+            let state: (i64, bool) = tx.query_row(
+                "SELECT state,claim FROM commands WHERE command_id=?1",
+                [&self.command_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let recorded = record(&tx, &self.command_id)?.processes;
+            if state != (1, true) || recorded.iter().any(|p| !p.is_lmcache()) {
+                return Err(JournalError::Conflict);
+            }
+            if recorded.iter().any(|p| {
+                !server.contains(p)
+                    && capyctl_launchers::process_absence::presence(p) != Presence::Gone
+            }) {
+                return Err(JournalError::Uncertain);
+            }
+            for p in &recorded {
+                tx.execute(
+                    "INSERT OR IGNORE INTO departed_processes VALUES(?1,?2,?3,?4,?5)",
+                    params![
+                        self.command_id,
+                        p.role,
+                        p.pid,
+                        p.boot_id,
+                        p.start_ticks as i64
+                    ],
+                )?;
+                tx.execute(
+                    "DELETE FROM processes WHERE command_id=?1 AND pid=?2 AND boot=?3 AND ticks=?4",
+                    params![self.command_id, p.pid, p.boot_id, p.start_ticks as i64],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        };
+        depart().map_err(|_| {
+            AssociationError::Uncertain("the stopped server's departure was not journaled".into())
+        })
+    }
+}
+
+/// ADR 0033 §7: the association of a restart-parked launch's wake: the new
+/// engine's `api` identity is journaled with the launch it belongs to while
+/// this Restore holds it `restoring`, under the Restore's deadline and the
+/// session.
+struct WakeAssociation {
+    journal: Weak<HostJournal>,
+    owner: String,
+    restore: String,
+    clock: Arc<dyn ExecutionClock>,
+    deadline_ms: i64,
+    session: u64,
+}
+impl LaunchAssociation for WakeAssociation {
+    fn persist_api_identity(&self, _: &ProcessIdentity) -> Result<(), AssociationError> {
+        Err(AssociationError::Uncertain(
+            "a wake spawns only under its wake key".into(),
+        ))
+    }
+    fn persist_wake_api_identity(
+        &self,
+        _wake: &str,
+        identity: &ProcessIdentity,
+    ) -> Result<(), AssociationError> {
+        let persist = || -> Result<(), JournalError> {
+            let journal = self.journal.upgrade().ok_or(JournalError::Storage)?;
+            journal.validate()?;
+            before_deadline(self.clock.as_ref(), self.deadline_ms)?;
+            journal.check_session(self.session)?;
+            if identity.role != "api" {
+                return Err(JournalError::Conflict);
+            }
+            wake_held(&journal, &self.owner, &self.restore)?;
+            let mut db = journal.db.lock().map_err(|_| JournalError::Storage)?;
+            let tx = db.transaction()?;
+            // The parked launch records its server alone: no engine
+            // process may be recorded beside the new one.
+            if record(&tx, &self.owner)?
+                .processes
+                .iter()
+                .any(ProcessIdentity::is_engine)
+            {
+                return Err(JournalError::Conflict);
+            }
+            persist_process(&tx, &self.owner, identity)?;
+            tx.commit()?;
+            before_deadline(self.clock.as_ref(), self.deadline_ms)?;
+            journal.check_session(self.session)?;
             Ok(())
         };
         persist()

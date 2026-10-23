@@ -14,6 +14,7 @@ fn vllm() -> AdapterSpec {
         admin_key: None,
         residency: capyctl_config::effective::Residency::Deep,
         api: capyctl_config::effective::DeploymentApi::Chat,
+        lmcache: None,
     }
 }
 

@@ -165,7 +165,7 @@ fn expected_identities(
     p: &CleanupPlan,
 ) -> Result<Vec<ProcessIdentity>, LifecycleError> {
     match &p.association {
-        Some(association) => members(&association.identities),
+        Some(association) => members(association.held()),
         None => super::failed_launch::recorded_identities(tx, &p.receipt.binding_id),
     }
 }
@@ -313,7 +313,7 @@ fn source(tx: &Transaction<'_>, p: &Plan) -> Result<EffectiveDeployment, Lifecyc
     {
         return Err(LifecycleError::CorruptStoredData);
     }
-    let footprint = resource_ledger::encode(&super::startup::cold(p, &e)).map_err(resource)?;
+    let footprint = resource_ledger::encode(&super::startup::cold(tx, p, &e)?).map_err(resource)?;
     let request = encode(&(
         &p.deployment_id,
         &p.operation_id,
@@ -647,7 +647,7 @@ fn retained(
     } else if p.source_state == "completed" {
         super::park::retained_footprint(tx, original, e, ledger.owners.get(&original.owner()))?
     } else {
-        ledger.owners.get(&original.owner()) == Some(&super::startup::cold(original, e))
+        ledger.owners.get(&original.owner()) == Some(&super::startup::cold(tx, original, e)?)
     };
     let source_state: String = tx.query_row(
         "SELECT state FROM lifecycle_steps WHERE id=?1",

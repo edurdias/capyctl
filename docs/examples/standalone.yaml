@@ -54,6 +54,9 @@ host:
   #   vllm: /opt/vllm/bin/vllm  # or sglang: /opt/sglang/bin/python3
   #   deep_park: "on"           # or "off"
   #   installation_drift: warn  # or refuse
+  # engine_logs: files          # or memory
+  # lmcache: auto               # or off: no deployment here uses LMCache
+  # retention: standard         # or zero: engine logs in memory, no core dumps, no LMCache
   # runtime_dir: /home/operator/capyctl/runtime   # development only
 shutdown:
   drain_timeout: "30s"

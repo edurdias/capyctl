@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use capyctl_config::context_fit::{MaxRunning, MaxRunningSource};
 use capyctl_controller::load_table::{LoadTable, LOAD_RETAIN_MS, LOAD_STALE_AFTER_MS};
-use capyctl_protocol::reports::{EngineLoad, LoadReport, LoadSample};
+use capyctl_protocol::reports::{EngineLoad, LmcacheSample, LoadReport, LoadSample};
 use capyctl_router::admission::InFlight;
 use capyctl_router::capacity::capacity_report;
 use capyctl_router::queue::WaitLimits;
@@ -86,6 +86,7 @@ fn the_load_read_reports_fresh_then_stale_then_no_sample() {
             LoadReport {
                 host_id: "h1".into(),
                 samples: vec![sample(7, Some(24)), sample(8, Some(99))],
+                lmcache: Vec::new(),
             },
             NOW,
         )
@@ -169,6 +170,7 @@ fn unknown_load_is_null_never_zero() {
             LoadReport {
                 host_id: "h1".into(),
                 samples: vec![unscraped],
+                lmcache: Vec::new(),
             },
             NOW,
         )
@@ -190,4 +192,98 @@ fn unknown_load_is_null_never_zero() {
         capacity_report(&[], &inflight, 32, None, NOW)["deployments"],
         json!([])
     );
+}
+
+fn lmcache(generation: i64) -> LmcacheSample {
+    LmcacheSample {
+        deployment_id: "dep-1".into(),
+        generation,
+        owned_handle: format!("launch-{generation}"),
+        sampled_at_ms: NOW,
+        scrape_ok: true,
+        used_bytes: Some(1_395_864_371),
+        usage_ppm: Some(325_000),
+        inflight_bytes: Some(0),
+        alloc_failures: None,
+        lookups: Some(260),
+        hits: Some(212),
+        l2_bytes: None,
+        rss_bytes: Some(5 << 30),
+        device_bytes: None,
+    }
+}
+
+// T45 T34: ADR 0033 §12. Each instance of the load read carries the latest
+// sample of its own LMCache server, for exactly its generation and as the
+// host it is placed on reported it, beside its engine sample: fresh, then
+// stale, then gone after the retention bound. An instance whose sample came
+// from another host, one never activated and a read with no load table
+// carry none.
+#[test]
+fn the_load_read_carries_each_instances_lmcache_sample_from_its_own_host() {
+    let inflight = InFlight::default();
+    let loads = LoadTable::new();
+    loads
+        .accept(
+            "h1",
+            LoadReport {
+                host_id: "h1".into(),
+                samples: vec![sample(7, None)],
+                // Generation 8 is instance 1's, placed on h2.
+                lmcache: vec![lmcache(7), lmcache(8)],
+            },
+            NOW,
+        )
+        .unwrap();
+    let deployments = [deployment()];
+    let report = capacity_report(&deployments, &inflight, 32, Some(&loads), NOW + 500);
+    let instances = &report["deployments"][0]["instances"];
+    assert_eq!(
+        instances[0]["lmcache"],
+        json!({
+            "host_id": "h1",
+            "owned_handle": "launch-7",
+            "sampled_at_ms": NOW,
+            "age_ms": 500,
+            "fresh": true,
+            "scrape_ok": true,
+            "used_bytes": 1_395_864_371_u64,
+            "usage_ppm": 325_000,
+            "lookups": 260,
+            "hits": 212,
+            "alloc_failures": null,
+            "l2_bytes": null,
+            "rss_bytes": 5_u64 << 30,
+            "device_bytes": null,
+        })
+    );
+    assert_eq!(instances[0]["sample"]["engine"]["running"], 3);
+    for index in [1, 2] {
+        assert!(instances[index].get("lmcache").is_none(), "{report}");
+    }
+
+    let stale = capacity_report(
+        &deployments,
+        &inflight,
+        32,
+        Some(&loads),
+        NOW + LOAD_STALE_AFTER_MS + 1,
+    );
+    let instance = &stale["deployments"][0]["instances"][0];
+    assert_eq!(instance["lmcache"]["fresh"], false);
+    assert_eq!(instance["lmcache"]["hits"], 212);
+    let gone = capacity_report(
+        &deployments,
+        &inflight,
+        32,
+        Some(&loads),
+        NOW + LOAD_RETAIN_MS + 1,
+    );
+    assert!(gone["deployments"][0]["instances"][0]
+        .get("lmcache")
+        .is_none());
+    let unread = capacity_report(&deployments, &inflight, 32, None, NOW);
+    assert!(unread["deployments"][0]["instances"][0]
+        .get("lmcache")
+        .is_none());
 }

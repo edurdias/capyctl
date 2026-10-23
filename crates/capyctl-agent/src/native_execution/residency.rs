@@ -218,6 +218,19 @@ enum Driver {
     },
 }
 
+impl Driver {
+    /// SPEC §10 step 4, ADR 0033 A8: the engine's own running and waiting
+    /// gauges at zero, read now, with no saver involved. The proof of a
+    /// restart-park, which stops the engine and releases nothing in place;
+    /// an engine that cannot be read is not quiescent.
+    async fn engine_idle(&self, member: &MemberRef) -> bool {
+        match self {
+            Driver::Vllm(vllm) => vllm.engine_quiescent(member, 0).await,
+            Driver::Sglang { idle, .. } => idle().await == Ok(true),
+        }
+    }
+}
+
 /// Why a step did not complete.
 enum StepFailure {
     /// Refused before any engine call.
@@ -443,7 +456,7 @@ fn step_name(action: RuntimeAction) -> &'static str {
     }
 }
 
-fn mem_available() -> i64 {
+pub(super) fn mem_available() -> i64 {
     crate::memory::read_host_memory()
         .map(|sample| sample.memory.available_bytes)
         .unwrap_or(-1)
@@ -473,10 +486,15 @@ impl NativeHostExecution {
         // SPEC §§9.1, 13.2: the readiness this session proved for the launch,
         // held aside so a Park refused after the gate closed can give it back.
         let prior = self.ready_claim(session, &owner.identity.command_id);
-        let (outcome, evidence) = match self.drive(command, &owner, &expected).await {
+        let (outcome, evidence, held) = match self.drive(session, command, &owner, &expected).await
+        {
             Ok(done) => done,
             // The intent is durable and nothing proved the launch unchanged.
-            Err(_) => (ResidencyOutcome::Uncertain, evidence(-1, -1, Vec::new())),
+            Err(_) => (
+                ResidencyOutcome::Uncertain,
+                evidence(-1, -1, Vec::new()),
+                None,
+            ),
         };
         // A refused Park left the engine as it was, so its readiness stands,
         // but only for the very group that readiness proved: a changed or
@@ -491,7 +509,9 @@ impl NativeHostExecution {
         };
         let journal = self.journal.clone();
         let id = command.identity.command_id.clone();
-        let retained = expected.clone();
+        // ADR 0033 §7: a restart-park's claim holds for the group it left
+        // (the server alone parked; a new engine beside it restored).
+        let retained = held.unwrap_or_else(|| expected.clone());
         let outcome = tokio::task::spawn_blocking(move || {
             journal.finish_residency(
                 &id,
@@ -623,10 +643,11 @@ impl NativeHostExecution {
 
     async fn drive(
         &self,
+        session: u64,
         command: &MemberCommand,
         owner: &MemberCommand,
         expected: &[ProcessIdentity],
-    ) -> Result<(ResidencyOutcome, pb::ResidencyEvidence), SessionError> {
+    ) -> Result<super::lmcache::Drive, SessionError> {
         // ADR 0028 §12: a single launch or a group's head (admitted by
         // `authorize_residency`); the head's collective reaches every rank.
         let Some(plan) = owner
@@ -637,7 +658,11 @@ impl NativeHostExecution {
             return Err(SessionError);
         };
         let unchanged = |milestones: Vec<String>| {
-            Ok((ResidencyOutcome::Unchanged, evidence(-1, -1, milestones)))
+            Ok((
+                ResidencyOutcome::Unchanged,
+                evidence(-1, -1, milestones),
+                None,
+            ))
         };
         // Gate first: whatever happens next, nothing new is forwarded.
         let Ok(scope) = self.register_retained(owner) else {
@@ -646,6 +671,21 @@ impl NativeHostExecution {
         self.ingress.close(&scope).map_err(|_| SessionError)?;
         self.revoke_ready(&owner.identity.command_id)?;
         let mut milestones = vec!["gate_closed".to_string()];
+        // ADR 0033 §7: a restart-park stops or starts the engine beside its
+        // running server (its launch reported LMCache on); it drives no sleep.
+        if let Some(effective) = self.resolve_retained(owner).ok().filter(|effective| {
+            self.restart_parks(owner, effective)
+                && self
+                    .journal
+                    .lmcache_on(&owner.identity.command_id)
+                    .unwrap_or(false)
+        }) {
+            return self
+                .restart_park(
+                    session, command, owner, plan, expected, &scope, effective, milestones,
+                )
+                .await;
+        }
         let driver = match self.driver(owner, plan, &scope) {
             Ok(driver) => driver,
             Err(_) => return unchanged(milestones),
@@ -686,6 +726,7 @@ impl NativeHostExecution {
                         return Ok((
                             ResidencyOutcome::Uncertain,
                             evidence(before, mem_available(), milestones),
+                            None,
                         ))
                     }
                 }
@@ -696,6 +737,7 @@ impl NativeHostExecution {
                     return Ok((
                         ResidencyOutcome::Uncertain,
                         evidence(before, mem_available(), milestones),
+                        None,
                     ));
                 }
                 milestones.push("identity_unchanged".into());
@@ -705,6 +747,7 @@ impl NativeHostExecution {
                 Ok((
                     ResidencyOutcome::Parked,
                     evidence(before, mem_available(), milestones),
+                    None,
                 ))
             }
             MemberAction::Restore {
@@ -715,6 +758,7 @@ impl NativeHostExecution {
                     Ok((
                         ResidencyOutcome::Uncertain,
                         evidence(before, mem_available(), milestones),
+                        None,
                     ))
                 };
                 // ADR 0014 §7 (WE3): waking reloads weights from disk (SPEC
@@ -787,6 +831,7 @@ impl NativeHostExecution {
                 Ok((
                     ResidencyOutcome::Restored,
                     evidence(before, mem_available(), milestones),
+                    None,
                 ))
             }
             _ => Err(SessionError),
@@ -867,7 +912,31 @@ impl NativeHostExecution {
         })
     }
 
-    async fn unchanged_group(&self, owned_handle: &str, expected: &[ProcessIdentity]) -> bool {
+    /// ADR 0033 A8: a restart-park's engine quiescence (SPEC §10 step 4),
+    /// asked after its ingress reads zero: the retained engine's own gauges,
+    /// with no saver. A launch whose driver cannot be built is not quiescent.
+    pub(super) async fn engine_idle(
+        &self,
+        owner: &MemberCommand,
+        plan: &SingleLaunchPlan,
+        scope: &IngressScope,
+    ) -> bool {
+        let Ok(driver) = self.driver(owner, plan, scope) else {
+            return false;
+        };
+        driver
+            .engine_idle(&MemberRef {
+                deployment_id: owner.identity.deployment_id.clone(),
+                member_id: plan.binding_id.clone(),
+            })
+            .await
+    }
+
+    pub(super) async fn unchanged_group(
+        &self,
+        owned_handle: &str,
+        expected: &[ProcessIdentity],
+    ) -> bool {
         let journal = self.journal.clone();
         let handle = owned_handle.to_string();
         let expected = expected.to_vec();
@@ -879,13 +948,14 @@ impl NativeHostExecution {
     }
 }
 
-fn evidence(before: i64, after: i64, milestones: Vec<String>) -> pb::ResidencyEvidence {
+pub(super) fn evidence(before: i64, after: i64, milestones: Vec<String>) -> pb::ResidencyEvidence {
     pb::ResidencyEvidence {
         // The journal sets the state from the persisted outcome.
         state: "unknown".into(),
         mem_available_before_bytes: before,
         mem_available_after_bytes: after,
         milestones,
+        engine_stopped: false,
     }
 }
 

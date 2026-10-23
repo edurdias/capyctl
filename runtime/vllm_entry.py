@@ -29,9 +29,11 @@ body therefore has no effects. Passing tests here are CPU fakes, never evidence
 that a vLLM build serves a model.
 """
 
+import dataclasses
 import json
 import os
 import sys
+import uuid
 
 MARKER = "--capyctl-user-args"
 # ADR 0014 §8, SPEC §8.2: the deployment's own extra arguments follow this
@@ -241,6 +243,52 @@ def _policy():
     return extra_args_policy
 
 
+# vLLM 0.32.0's `KVTransferConfig` draws a random `engine_id` (uuid4) on every
+# parse that leaves it unset, so two parses of CapyCTL's own rendered
+# `--kv-transfer-config` (ADR 0033 §4) differ in that field alone.
+PER_PARSE_RANDOM = {"kv_transfer_config": ("engine_id",)}
+
+
+def _is_uuid(value):
+    if type(value) is not str:
+        return False
+    try:
+        return str(uuid.UUID(value)) == value
+    except ValueError:
+        return False
+
+
+def _config_fields(value):
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {f.name: getattr(value, f.name, None) for f in dataclasses.fields(value)}
+    if hasattr(value, "__dict__"):
+        return dict(vars(value))
+    return None
+
+
+def same_resolution(name, before, after):
+    """Two parses resolved `name` to the same value.
+
+    Only a field vLLM fills at random on every parse is set aside, and only
+    while both parses hold a canonical UUID there; an extra that names any
+    value of it, or changes any other field, still differs.
+    """
+    if type(before) is not type(after):
+        return False
+    if before == after:
+        return True
+    random_fields = PER_PARSE_RANDOM.get(name)
+    if not random_fields:
+        return False
+    want, have = _config_fields(before), _config_fields(after)
+    if want is None or have is None or want.keys() != have.keys():
+        return False
+    for field in random_fields:
+        if not (_is_uuid(want.pop(field, None)) and _is_uuid(have.pop(field, None))):
+            return False
+    return want == have
+
+
 def check_extra(base, actual, approvals, checkpoint):
     """ADR 0014 §2, §8: what the extras changed, as vLLM resolved it.
 
@@ -253,7 +301,7 @@ def check_extra(base, actual, approvals, checkpoint):
     supplied = {}
     for name, value in vars(actual).items():
         before = getattr(base, name, missing)
-        if before is missing or type(before) is not type(value) or before != value:
+        if before is missing or not same_resolution(name, before, value):
             supplied[name] = value
     if any(name in TYPED for name in supplied):
         raise LaunchError("effective_args_mismatch")

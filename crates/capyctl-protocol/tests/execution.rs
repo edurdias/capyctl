@@ -206,6 +206,7 @@ fn group_member_launch(
         checkpoint_gguf: None,
         startup_bytes: None,
         startup_host_bytes: None,
+        lmcache: None,
     }
 }
 
@@ -246,6 +247,7 @@ fn single_host_launch_binds_local_resolution_and_retained_grant() {
         checkpoint_gguf: None,
         startup_bytes: None,
         startup_host_bytes: None,
+        lmcache: None,
     });
     typed.identity.payload_digest = typed.canonical_digest();
     typed.verify_digest().unwrap();
@@ -342,6 +344,7 @@ fn ready_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         engine_log: None,
         probe_text: String::new(),
         probe_decision: None,
+        lmcache: None,
     }
 }
 
@@ -451,6 +454,7 @@ fn launch_single() -> MemberCommand {
         checkpoint_gguf: None,
         startup_bytes: None,
         startup_host_bytes: None,
+        lmcache: None,
     });
     typed.identity.payload_digest = typed.canonical_digest();
     typed

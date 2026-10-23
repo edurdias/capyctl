@@ -82,6 +82,23 @@ pub fn deployment_command_fingerprint(
     if !input.api.is_chat() {
         semantic["api"] = json!(input.api);
     }
+    // ADR 0033 (contract decision 1): the LMCache settings are part of what
+    // the command asks for. Their defaults add nothing, so every earlier
+    // command keeps its fingerprint.
+    let pool = super::lmcache_declaration(
+        input.lmcache,
+        input.lmcache_pool.as_deref(),
+        input.retention,
+    )?;
+    if !input.lmcache.is_auto() {
+        semantic["lmcache"] = json!(input.lmcache);
+    }
+    if let Some(pool) = pool {
+        semantic["lmcache_pool_bytes"] = json!(pool);
+    }
+    if !input.retention.is_standard() {
+        semantic["retention"] = json!(input.retention);
+    }
     // ADR 0014 amendment A1: declared timeouts are part of what the command
     // asks for. Omitted, they add nothing, so older commands keep their
     // fingerprint.
@@ -132,6 +149,10 @@ pub fn compose_current_resource_controls(
     for (id, device) in &normalized.devices {
         if let Some(uuid) = &device.physical_gpu_uuid {
             composed["resource_policy"]["devices"][id]["physical_gpu_uuid"] = json!(uuid);
+        }
+        // ADR 0033 amendment A12: the inventory's product name likewise.
+        if let Some(product) = &device.product_name {
+            composed["resource_policy"]["devices"][id]["product_name"] = json!(product);
         }
     }
     // ADR 0028 §3: the groups block (peer address, rendezvous range) is host
