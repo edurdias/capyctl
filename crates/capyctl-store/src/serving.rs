@@ -11,7 +11,7 @@
 //! (SPEC §10, T18), and the forwarder is resolved for exactly the generation the
 //! lease names.
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::lifecycle::{LifecycleError, StoredRuntimeBinding};
 
@@ -45,6 +45,23 @@ pub struct ServingInstanceRow {
     /// ADR 0028 §9, §11: this incarnation is a multi-node group, served at
     /// its head's ingress (the router watches its requests' first token).
     pub group: bool,
+}
+
+/// ADR 0032 §1, §2: what decides whether a retained binding's lane carries
+/// CapyCTL's request ID as SGLang's `rid` and can abort it: the engine family
+/// and registered build its instance's revision froze as resolved on its
+/// placed host (and GPU), the frozen tokenizer worker count, and the host
+/// whose ingress serves it. The build is the profile's `build_fingerprint`
+/// (the registered engine version), never the adapter's descriptor contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneEngine {
+    pub engine: Option<String>,
+    pub build_fingerprint: Option<String>,
+    /// SGLang's `tokenizer_workers`; `None` for any other engine.
+    pub tokenizer_workers: Option<u32>,
+    /// The enrolled host whose ingress serves the binding; `None` for an
+    /// engine the embedded role runs itself.
+    pub remote_host: Option<String>,
 }
 
 /// The gate a dispatch needs, over `deployment_instances i` and `deployments d`.
@@ -131,5 +148,63 @@ impl crate::Store {
             return Ok(None);
         };
         Ok(self.retained_binding(&id)?.map(|binding| (binding, open)))
+    }
+
+    /// ADR 0032 §1, §2: the [`LaneEngine`] of retained binding `binding_id`,
+    /// or `None` when it is released or its revision froze no effective
+    /// configuration (treated as not capable).
+    pub fn lane_engine(&self, binding_id: &str) -> Result<Option<LaneEngine>, LifecycleError> {
+        // Read only; dropped without a commit.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        // (deployment, revision, placed host, device, remote ingress host)
+        type Lane = (String, i64, Option<String>, Option<String>, Option<String>);
+        let lane: Option<Lane> = tx
+            .prepare_cached(
+                "SELECT b.deployment_id,b.revision,i.host_id,i.device,r.host_id
+                   FROM runtime_bindings b
+                   JOIN deployment_instances i ON i.deployment_id=b.deployment_id
+                        AND i.instance_index=b.instance_index
+                   LEFT JOIN remote_binding_ingress r ON r.binding_id=b.id
+                  WHERE b.id=?1 AND b.state!='released'",
+            )?
+            .query_row([binding_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .optional()?;
+        let Some((deployment, revision, host, device, remote_host)) = lane else {
+            return Ok(None);
+        };
+        let raw = match crate::ordinary_lifecycle::frozen_on_device(
+            &tx,
+            &deployment,
+            revision,
+            host.as_deref(),
+            device.as_deref(),
+        ) {
+            Ok((raw, _)) => raw,
+            Err(LifecycleError::Conflict) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Ok(effective) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return Ok(None);
+        };
+        let text = |pointer: &str| {
+            effective
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        let engine = text("/profile/engine");
+        let tokenizer_workers = (text("/engine_config/engine").as_deref() == Some("sglang"))
+            .then(|| effective.pointer("/engine_config/tokenizer_workers"))
+            .flatten()
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|workers| u32::try_from(workers).ok());
+        Ok(Some(LaneEngine {
+            engine,
+            build_fingerprint: text("/profile/build_fingerprint"),
+            tokenizer_workers,
+            remote_host,
+        }))
     }
 }

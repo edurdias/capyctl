@@ -517,6 +517,18 @@ message EngineLogTailRequest {
   // 1 ..= 262144 (256 KiB); the answer's text is never longer.
   uint32 max_bytes = 2;
 }
+// ADR 0032 §3 (additive): ask the engine of one retained launch to abort one
+// request by CapyCTL's request ID (SGLang's `rid`). The command's identity
+// names the deployment, the member, the profile and the launch's generation;
+// this names the launch by its owned handle and the request by its ID, a
+// ULID (26 Crockford base32 characters). The host checks all of them against
+// the launch it retains, and that the launch's engine has the capability,
+// before it posts the abort on the engine's loopback port with the launch's
+// own key. Never journaled: it launches, releases and records nothing.
+message AbortRequestCommand {
+  string owned_handle = 1;
+  string request_id = 2;
+}
 message ExecuteMember {
   CommandIdentity identity = 1;
   oneof action {
@@ -541,6 +553,9 @@ message ExecuteMember {
     // SPEC §13.3 (additive): sent only to a host whose Connect declared
     // `engine_log_tail`.
     EngineLogTailRequest engine_log_tail = 17;
+    // ADR 0032 §3 (additive): sent only to a host whose Connect declared
+    // `request_abort`.
+    AbortRequestCommand abort_request = 19;
   }
   // ADR 0014 §7, owner decision 5 (2026-09-22), additive: with
   // restore_owned_handle only, the checkpoint digest the server recorded for
@@ -650,6 +665,10 @@ message MemberExecutionResult {
   // or Restore before any effect; nothing was journaled or started. Empty
   // otherwise. A refused launch is `completed` with no claim; a refused Park or
   // Restore reports residency `unchanged`.
+  // ADR 0032 §3: an AbortRequest is `completed` when the engine answered the
+  // abort, `completed` with one of its own closed refusals when the host
+  // posted nothing, and `attempted` when the post got no answer from the
+  // engine. Its result names the launch's owned handle and nothing else.
   string refused = 12;
   // SPEC §§6.4, 13.2: a LaunchSingle whose engine exited before readiness
   // (`launched`, not usable, every recorded process gone) says why in at most

@@ -137,7 +137,11 @@ The inference endpoint answers HTTP errors with a JSON body holding `code` and
   CapyCTL could not tell what the engine did with the request (the connection
   failed, or the answer was cut short or unreadable). The request stays
   counted until CapyCTL has evidence that it ended, so many of these in a row
-  can fill the model's running requests (`429 queue_full`).
+  can fill the model's running requests (`429 queue_full`). Requests cut
+  before the engine answered them fill those places the same way until the
+  engine's next stop; when they alone fill all 32, CapyCTL restarts the
+  instance instead ([When a request is cut short](requests.md#when-a-request-is-cut-short)),
+  but not while an unverified request is among them.
 
 For decision models:
 

@@ -252,6 +252,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not self.admin_keyed(): return
             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             self.control(url.path, urllib.parse.parse_qs(url.query), body); return
+        # ADR 0032 §3: SGLang's `/abort_request`, recorded with which key it
+        # carried and from where; SGLang answers an empty 200 either way.
+        if url.path == "/abort_request":
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            auth = self.headers.get("Authorization")
+            with open(os.path.join(here, "aborts.log"), "a") as f:
+                f.write(json.dumps({"client": self.client_address[0],
+                                    "admin": bool(admin) and auth == "Bearer " + admin,
+                                    "inference": bool(key) and auth == "Bearer " + key,
+                                    "body": json.loads(body or b"null")}) + "\n")
+            self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers(); return
         keyed = bool(key) and self.headers.get("Authorization") == "Bearer " + key
         if self.path in ("/v1/completions", "/generate"):
             with open(os.path.join(here, "last-request.tmp"), "w") as f:
@@ -259,6 +270,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             os.replace(os.path.join(here, "last-request.tmp"), os.path.join(here, "last-request.json"))
         if not self.keyed(): return
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+        if self.path == "/v1/chat/completions":
+            with open(os.path.join(here, "last-chat.tmp"), "w") as f:
+                json.dump({"body": body, "headers": sorted(k.lower() for k in self.headers.keys())}, f)
+            os.replace(os.path.join(here, "last-chat.tmp"), os.path.join(here, "last-chat.json"))
         if not usable() or os.path.exists(os.path.join(here, "released")):
             self.send_response(503); self.send_header("Content-Length", "0"); self.end_headers(); return
         ids = completion()
@@ -420,6 +435,8 @@ struct FakeHost {
     holds_peer: bool,
     /// Peer ports held outside CapyCTL.
     held: Vec<u16>,
+    /// The profile's registered engine version, in place of the fixture's.
+    build_fingerprint: Option<String>,
     /// ADR 0028 §9: the token ids the engine answers a completion probe with.
     completion: Option<Vec<u32>>,
     /// ADR 0028 §12 (R12): the host reads its SGLang saver map through
@@ -528,6 +545,7 @@ impl FakeHost {
             deep: false,
             holds_peer: true,
             held: Vec::new(),
+            build_fingerprint: None,
             completion: None,
             stub_saver: false,
             gpu: None,
@@ -590,6 +608,12 @@ impl FakeHost {
     /// `port` is held on the peer address by something outside CapyCTL.
     fn with_held_peer_port(mut self, port: u16) -> Self {
         self.held.push(port);
+        self
+    }
+    /// The profile registers the engine at `version` (ADR 0032: SGLang
+    /// 0.5.22 takes CapyCTL's request ID and its abort).
+    fn with_build_fingerprint(mut self, version: &str) -> Self {
+        self.build_fingerprint = Some(version.into());
         self
     }
     /// ADR 0028 §9: the head's engine answers a completion probe with `ids`.
@@ -702,6 +726,9 @@ impl FakeHost {
                     .unwrap()
                     .remove("admin_credential_ref");
             }
+        }
+        if let Some(version) = &self.build_fingerprint {
+            profile["build_fingerprint"] = json!(version);
         }
 
         let mut deployment = source["input"]["deployment"].clone();
@@ -1163,6 +1190,111 @@ impl FakeHost {
         .filter_map(|file| std::fs::read_to_string(file).ok())
         .flat_map(|text| text.lines().map(str::to_owned).collect::<Vec<_>>())
         .collect()
+    }
+
+    /// ADR 0032 §3: the AbortRequest the server sends for request
+    /// `request_id` on the launch `owned_handle`, under command id `id`,
+    /// named as that launch's owner; `tweak` changes the identity first.
+    fn abort_command(
+        &self,
+        id: &str,
+        owned_handle: &str,
+        request_id: &str,
+        tweak: impl FnOnce(&mut CommandIdentity),
+    ) -> MemberCommand {
+        let owner = self
+            .journal()
+            .retained_command(&self.launch_handle())
+            .unwrap();
+        let mut identity = identity(
+            id,
+            owner.identity.member.clone(),
+            capyctl_protocol::execution::ABORT_REQUEST_STATE,
+            owner.identity.generation,
+            &owner.identity.profile_fingerprint,
+        );
+        identity.deadline_ms = now_ms() + 4_000;
+        tweak(&mut identity);
+        let mut command = MemberCommand {
+            identity,
+            action: MemberAction::AbortRequest {
+                owned_handle: owned_handle.into(),
+                request_id: request_id.into(),
+            },
+        };
+        command.identity.payload_digest = command.canonical_digest();
+        command.verify_digest().unwrap();
+        command
+    }
+
+    /// The owned handle of this host's group Launch (`FakeHost::execute`).
+    fn launch_handle(&self) -> String {
+        "launch".into()
+    }
+
+    /// Send the AbortRequest `command`: its answer, checked as a valid one.
+    async fn send_abort(&self, command: &MemberCommand) -> pb::MemberExecutionResult {
+        let built = self.host();
+        let result = built
+            .executor
+            .execute(built.session, command.clone())
+            .await
+            .expect("an abort is answered, never the end of the session");
+        capyctl_protocol::execution::validate_result(command, &result)
+            .expect("the result is a valid answer to its AbortRequest");
+        result
+    }
+
+    /// Every `/abort_request` the engine received, in order.
+    fn aborts(&self) -> Vec<Value> {
+        let path = self.host().root.path();
+        [
+            path.join("venv/bin/aborts.log"),
+            path.join("runtime/aborts.log"),
+        ]
+        .iter()
+        .filter_map(|file| std::fs::read_to_string(file).ok())
+        .flat_map(|text| {
+            text.lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect::<Vec<Value>>()
+        })
+        .collect()
+    }
+
+    /// The last chat request the engine received: its body and header names.
+    fn last_chat(&self) -> Value {
+        let path = self.host().root.path();
+        let file = [
+            path.join("venv/bin/last-chat.json"),
+            path.join("runtime/last-chat.json"),
+        ]
+        .into_iter()
+        .find(|file| file.exists())
+        .expect("the engine saw a chat request");
+        serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap()
+    }
+
+    /// Send one streamed chat through this host's ingress with CapyCTL's
+    /// request ID `request_id`, as the router does.
+    async fn chat_through_ingress(&self, request_id: &str) -> reqwest::StatusCode {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = self.host().ingress.clone().router();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let served = self.effective().routes[0].clone();
+        let status = reqwest::Client::new()
+            .post(format!("http://{address}/v1/chat/completions"))
+            .bearer_auth(hex::encode(GATE))
+            .header("x-request-id", "caller-1")
+            .header("x-capyctl-request-id", request_id)
+            .json(&json!({"model": served, "messages": [], "stream": true}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        server.abort();
+        status
     }
 }
 
@@ -2285,5 +2417,146 @@ async fn a_deep_sglang_worker_reports_its_saver_map_on_its_session() {
     let released = reported_saver(&host, &handle, now_ms()).await;
     assert_eq!(released.mapped_bytes, 0);
     let gone = host.terminate(&handle, &out.processes).await.unwrap();
+    assert!(gone.all_gone(), "{:?}", gone.result);
+}
+
+const REQUEST_ID: &str = "01JAAAAAAAAAAAAAAAAAAAAAAA";
+
+// T17 (ADR 0032 §3): the head's agent posts `/abort_request` for its
+// retained SGLang 0.5.22 launch (one tokenizer worker), on loopback with the
+// launch's admin key, naming the request by its `rid`. It refuses, posting
+// nothing, a launch it does not retain, a forged deployment, another
+// generation and a passed deadline. ADR 0032 §2: its ingress sets the
+// router's ID as `rid` and forwards neither ID header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_head_posts_an_abort_for_its_retained_capable_launch_only() {
+    let host = FakeHost::new("host-a")
+        .with_groups_policy(HEAD_PEER)
+        .with_engine("sglang")
+        .with_build_fingerprint("0.5.22");
+    let out = host.execute(launch(two_member_plan(&host))).await.unwrap();
+    assert!(out.result.model_usable, "{:?}", out.result);
+    let handle = out.owned_handle.clone();
+    assert_eq!(handle, host.launch_handle());
+
+    let posted = host
+        .send_abort(&host.abort_command("abort-1", &handle, REQUEST_ID, |_| {}))
+        .await;
+    assert_eq!(
+        (posted.state.as_str(), posted.refused.as_str()),
+        ("completed", ""),
+        "{posted:?}"
+    );
+    assert_eq!(posted.owned_handle, handle);
+    let aborts = host.aborts();
+    assert_eq!(aborts.len(), 1, "{aborts:?}");
+    assert_eq!(aborts[0]["body"], json!({"rid": REQUEST_ID}));
+    assert_eq!(aborts[0]["admin"], true, "{aborts:?}");
+    assert_eq!(aborts[0]["inference"], false, "{aborts:?}");
+    assert!(aborts[0]["client"]
+        .as_str()
+        .unwrap()
+        .parse::<IpAddr>()
+        .unwrap()
+        .is_loopback());
+
+    // (command id, handle named, identity change, refusal)
+    type Refused = (&'static str, String, fn(&mut CommandIdentity), &'static str);
+    let refused: [Refused; 5] = [
+        (
+            "abort-unknown",
+            "never-launched".into(),
+            |_| {},
+            "launch_not_retained",
+        ),
+        (
+            "abort-forged",
+            handle.clone(),
+            |id| id.deployment_id = "other".into(),
+            "launch_not_retained",
+        ),
+        (
+            "abort-next",
+            handle.clone(),
+            |id| id.generation += 1,
+            "launch_not_retained",
+        ),
+        (
+            "abort-other-member",
+            handle.clone(),
+            |id| id.member.member_id = "rank-9".into(),
+            "launch_not_retained",
+        ),
+        (
+            "abort-late",
+            handle.clone(),
+            |id| id.deadline_ms = now_ms() - 1,
+            "deadline_passed",
+        ),
+    ];
+    for (id, owned, tweak, code) in refused {
+        let result = host
+            .send_abort(&host.abort_command(id, &owned, REQUEST_ID, tweak))
+            .await;
+        assert_eq!(
+            (result.state.as_str(), result.refused.as_str()),
+            ("completed", code),
+            "{id}: {result:?}"
+        );
+    }
+    assert_eq!(host.aborts().len(), 1, "a refused abort posts nothing");
+
+    // ADR 0032 §2: the router's ID reaches the engine as `rid` only.
+    assert_eq!(
+        host.chat_through_ingress(REQUEST_ID).await,
+        reqwest::StatusCode::OK
+    );
+    let chat = host.last_chat();
+    assert_eq!(chat["body"]["rid"], REQUEST_ID, "{chat}");
+    let headers: Vec<String> = serde_json::from_value(chat["headers"].clone()).unwrap();
+    assert!(!headers
+        .iter()
+        .any(|h| h == "x-request-id" || h == "x-capyctl-request-id"));
+
+    let gone = host.terminate(&handle, &out.processes).await.unwrap();
+    assert!(gone.all_gone(), "{:?}", gone.result);
+    // A launch proven gone is no longer retained: nothing is posted.
+    let after = host
+        .send_abort(&host.abort_command("abort-gone", &handle, REQUEST_ID, |_| {}))
+        .await;
+    assert_eq!(after.refused, "launch_not_retained", "{after:?}");
+    assert_eq!(host.aborts().len(), 1);
+}
+
+// T17 (ADR 0032 §1, §3, ADR 0017): a launch whose engine lacks the
+// capability (here SGLang registered at 0.5.21) is refused the abort with
+// nothing posted, and its ingress drops the router's ID.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_launch_without_the_capability_is_refused_the_abort() {
+    let host = FakeHost::new("host-a")
+        .with_groups_policy(HEAD_PEER)
+        .with_engine("sglang")
+        .with_build_fingerprint("0.5.21");
+    let out = host.execute(launch(two_member_plan(&host))).await.unwrap();
+    assert!(out.result.model_usable, "{:?}", out.result);
+    let result = host
+        .send_abort(&host.abort_command("abort-1", &out.owned_handle, REQUEST_ID, |_| {}))
+        .await;
+    assert_eq!(
+        (result.state.as_str(), result.refused.as_str()),
+        ("completed", "request_abort_unsupported"),
+        "{result:?}"
+    );
+    assert!(host.aborts().is_empty());
+    assert_eq!(
+        host.chat_through_ingress(REQUEST_ID).await,
+        reqwest::StatusCode::OK
+    );
+    let chat = host.last_chat();
+    assert!(chat["body"].get("rid").is_none(), "{chat}");
+    let gone = host
+        .terminate(&out.owned_handle, &out.processes)
+        .await
+        .unwrap();
     assert!(gone.all_gone(), "{:?}", gone.result);
 }

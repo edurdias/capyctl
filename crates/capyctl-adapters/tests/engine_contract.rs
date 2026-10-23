@@ -401,15 +401,19 @@ async fn unsupported_multi_choice_and_tool_requests_do_not_report_success() {
 #[tokio::test]
 async fn canceled_stream_does_not_prove_backend_quiescence_or_sglang_readiness() {
     use capyctl_adapters::{CancellationOutcome, EngineAdapter, MemberRef, RequestRef};
-    let app = Router::new().route(
-        "/v1/chat/completions",
-        post(|| async {
-            let body = axum::body::Body::from_stream(futures::stream::pending::<
-                Result<String, std::io::Error>,
-            >());
-            ([("content-type", "text/event-stream")], body)
-        }),
-    );
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(|| async {
+                let body = axum::body::Body::from_stream(futures::stream::pending::<
+                    Result<String, std::io::Error>,
+                >());
+                ([("content-type", "text/event-stream")], body)
+            }),
+        )
+        // ADR 0032 §3: SGLang answers an abort with an empty 200, which is
+        // still not evidence that the request stopped.
+        .route("/abort_request", post(|| async { "" }));
     let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", socket.local_addr().unwrap());
     let task = tokio::spawn(async move {

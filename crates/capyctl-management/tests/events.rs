@@ -1095,6 +1095,11 @@ fn store_shaped(kind: &str) -> (serde_json::Value, Option<String>, Option<String
             "receipt":"the engine's own counters read no running and no waiting request after the client hung up"}),
             (Some(DEP.to_owned()), None),
         ),
+        "instance_restarted_for_held_requests" => (
+            serde_json::json!({"version":"1","deployment_id":DEP,"operation_id":OP,
+            "instance_index":0,"generation":3,"count":32}),
+            ids.clone(),
+        ),
         k if k.starts_with("switch_") => (
             serde_json::json!({"version":"1","phase":&k["switch_".len()..],
             "switch_id":"sw-1","target_deployment":DEP,"host":"host-a",

@@ -501,6 +501,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-build",
+ "ulid",
 ]
 
 [[package]]

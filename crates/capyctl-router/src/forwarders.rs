@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use capyctl_adapters::forward::RequestIdLane;
 use capyctl_adapters::traits::ChatForward;
 use capyctl_controller::{LifecycleFault, LifecyclePort};
 
@@ -58,13 +59,28 @@ pub trait ForwarderSource: Send + Sync {
     /// ADR 0013 §10 (I3): the forwarder for exactly the instance incarnation
     /// `generation` names, the one a request lease was just granted for. Never
     /// another instance's: a lease and its forward name the same incarnation.
+    /// `ingress` says the instance is served through its host's ingress (ADR
+    /// 0032 §2: CapyCTL's request ID then travels as a header). The default is
+    /// a source whose lanes carry no request ID.
     fn forwarder_for(
         &self,
         deployment: &str,
         _generation: i64,
-    ) -> Result<Arc<dyn ChatForward>, ForwarderError> {
-        self.forwarder(deployment)
+        _ingress: bool,
+    ) -> Result<Lane, ForwarderError> {
+        Ok(Lane {
+            forward: self.forwarder(deployment)?,
+            request_abort: false,
+        })
     }
+}
+
+/// ADR 0032 §1–§3: the forwarder for one instance incarnation, and whether its
+/// lane carries CapyCTL's request ID to the engine and the authority can ask
+/// the engine to abort a request by it (`RuntimeEndpoint::request_abort`).
+pub struct Lane {
+    pub forward: Arc<dyn ChatForward>,
+    pub request_abort: bool,
 }
 
 /// Forwarders built from what the lifecycle authority reports is running.
@@ -75,11 +91,13 @@ pub struct LiveForwarders {
     /// forwarder built for the launch it replaced, which is the exact failure
     /// this module exists to prevent; and a deployment with several instances
     /// (ADR 0013 §5) has one live incarnation per generation. The legacy
-    /// whole-deployment read has no generation (`None`).
+    /// whole-deployment read has no generation (`None`). ADR 0032: and by how
+    /// the lane carries CapyCTL's request ID, which a host session can change
+    /// for the same launch.
     cache: Mutex<HashMap<CacheKey, Arc<dyn ChatForward>>>,
 }
 
-type CacheKey = (String, Option<i64>, String);
+type CacheKey = (String, Option<i64>, String, RequestIdLane);
 
 /// SPEC §17: the cache is bounded. Past this many entries it is emptied, which
 /// only costs rebuilding a forwarder; every entry is re-validated per request.
@@ -114,11 +132,13 @@ impl LiveForwarders {
         deployment: &str,
         generation: Option<i64>,
         runtime: capyctl_controller::RuntimeEndpoint,
+        request_ids: RequestIdLane,
     ) -> Result<Arc<dyn ChatForward>, ForwarderError> {
         let key = (
             deployment.to_string(),
             generation,
             runtime.incarnation.clone(),
+            request_ids,
         );
         let mut cache = self.cache();
         if let Some(existing) = cache.get(&key) {
@@ -128,14 +148,15 @@ impl LiveForwarders {
             .endpoint
             .parse()
             .map_err(|_| ForwarderError::Endpoint(deployment.to_string()))?;
-        let forwarder = capyctl_adapters::forward::engine_forwarder(
+        let forwarder = capyctl_adapters::forward::engine_forwarder_on(
             base,
             runtime.served_model.clone(),
             runtime.engine_key.clone(),
             // SPEC §10: a `cache_salt` reaches only an engine that honours it.
             capyctl_adapters::forward::engine_honours_cache_salt(runtime.engine.as_deref()),
+            request_ids,
         );
-        cache.retain(|(cached, cached_generation, _), _| {
+        cache.retain(|(cached, cached_generation, _, _), _| {
             cached != deployment || *cached_generation != generation
         });
         if cache.len() >= MAX_CACHED_FORWARDERS {
@@ -155,19 +176,34 @@ impl ForwarderSource for LiveForwarders {
             .port
             .runtime_endpoint(deployment)?
             .ok_or_else(|| ForwarderError::NoRuntime(deployment.to_string()))?;
-        self.build(deployment, None, runtime)
+        // A dispatch to the deployment whole names no instance incarnation to
+        // abort a request on, so its lane carries no request ID.
+        self.build(deployment, None, runtime, RequestIdLane::Absent)
     }
 
     fn forwarder_for(
         &self,
         deployment: &str,
         generation: i64,
-    ) -> Result<Arc<dyn ChatForward>, ForwarderError> {
+        ingress: bool,
+    ) -> Result<Lane, ForwarderError> {
         let runtime = self
             .port
             .instance_endpoint(deployment, generation)?
             .ok_or_else(|| ForwarderError::NoRuntime(deployment.to_string()))?;
-        self.build(deployment, Some(generation), runtime)
+        // ADR 0032 §1–§2: a capable lane carries CapyCTL's request ID, as
+        // `rid` to an engine reached directly and as a header to a host's
+        // ingress; any other lane carries none.
+        let request_abort = runtime.request_abort;
+        let request_ids = match (request_abort, ingress) {
+            (false, _) => RequestIdLane::Absent,
+            (true, false) => RequestIdLane::Engine,
+            (true, true) => RequestIdLane::Ingress,
+        };
+        Ok(Lane {
+            forward: self.build(deployment, Some(generation), runtime, request_ids)?,
+            request_abort,
+        })
     }
 }
 
