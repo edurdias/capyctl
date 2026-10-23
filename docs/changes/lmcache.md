@@ -272,7 +272,7 @@ on the laptop:
   launches charge 6,795,710,464 B, about 1.14 GiB over the steady state; during that
   window the Ready charge (device 406 MiB) was below what the server held.
 
-Fixed after the rerun (`fix/lmcache-wake-charge`, CPU tests only, not yet run live), ADR
+Fixed after the rerun (`fix/lmcache-wake-charge`; run live in the third rerun below), ADR
 0033 A13, on both engines (SGLang's restart-park goes through the same park and wake, and
 its servers held 1608–1656 MiB after their engine's exit):
 
@@ -350,9 +350,44 @@ on the laptop:
   no `stats.vllm.ai` socket was caught; a short request can fall between 0.2 s samples,
   for LMCache too.
 
-Still missing: LC4 on SGLang and the A13 charge and measurement live on both engines, on
-`417a2643`; LC1 through CapyCTL on a server and host pair; the decision-model allowance
-measurement, which waits for a SGLang release with the upstream fix.
+Third live rerun, host A (GB10), build `417a2643` (A13 and the SGLang wake fix), the same
+setup, fresh state, 2026-10-23 06:24–06:55 UTC, with a 0.5 s sampler of the footprint,
+`held_kv_state`, the measurement, the server's GPU memory and the journal; record
+`target/live/lmcache-rerun2/spark-0292/rows.md` on the laptop:
+
+- **LC4 on SGLang, pass.** Park in about 6 s, no `park_refused`; the same server PID, GPU
+  408 → 1656 MiB; the rendezvous directory of the incarnation removed (its root kept,
+  0700); parked charge 7,247,757,312 B (Ready plus 1 GiB), `held_kv_state` held, the
+  measured device figure unchanged (427,819,008 B). The wake by request took 86.6 s and
+  hit 3,328 tokens (13 keys) with the same answer, a new engine beside the same server.
+- **A13 on SGLang, pass.** The woken Ready instance stayed charged with the held KV
+  (charge 7,247,757,312 B) while the server held 1800 MiB; 31 s after Ready a 408 MiB
+  reading, with no request, released it, journaled `lmcache_kv_released`, and the charge
+  went back to 6,174,015,488 B.
+- **LC4 and A13 on vLLM, pass.** First cycle: the server's GPU fell to 240 MiB at the park
+  (the KV not kept this time) and the parked instance was still charged the 1 GiB; the
+  wake (62.0 s) hit 3,328 tokens with the same answer, and the first Ready reading
+  (406 MiB) released it at once, journaled. Second cycle: park with the server at 406 →
+  1430 MiB; the wake (62.4 s) hit 3,328 tokens with the same answer; Ready with the server
+  at 1574 MiB stayed charged 7,247,757,312 B for 52 s, then a 406 MiB reading, with no
+  request between, released it (journaled; 6,174,015,488 B). The measured device figure
+  stayed 425,721,856 B throughout, never the parked or woken reading.
+- **The next launch, pass:** SGLang charged 5,579,173,888 B (4 GiB + 856,387,584 +
+  427,819,008) and vLLM 5,565,747,200 B (4 GiB + 845,058,048 + 425,721,856),
+  `measured: true` (the same SGLang sequence on `d2901204` had charged 6,886,703,104 B).
+- **Egress, pass.** Under the default `engine_telemetry` (a `deep` vLLM deployment Ready
+  11 min and every LC4 run; 4,642 samples) and under `retention: zero` (1,668 samples)
+  nothing left loopback and vLLM wrote no usage file; vLLM engines carried the three
+  opt-outs and core size 0 under zero retention. Under `engine_telemetry: allow` with
+  LMCache on both engines (8 min, 2,536 samples) the one socket off loopback was vLLM's
+  own usage report (EngineCore to `stats.vllm.ai:443`, its usage file written the same
+  second), as `allow` intends; nothing from either LMCache server or the SGLang engine,
+  and nothing to `stats.lmcache.ai`; servers and engines carried
+  `LMCACHE_TRACK_USAGE=false` and no `DO_NOT_TRACK`.
+
+Still missing: LC1 through CapyCTL on a server and host pair (every row above ran on a
+standalone role); the decision-model allowance measurement, which waits for a SGLang
+release with the upstream fix.
 
 CPU and Fake-engine tests are not qualification.
 
