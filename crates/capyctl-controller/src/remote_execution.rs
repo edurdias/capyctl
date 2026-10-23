@@ -2230,7 +2230,7 @@ mod tests {
         ));
     }
 
-    /// ADR 0028 note of 2026-10-16, ADR 0033 §7 (found live 2026-10-23): a
+    /// ADR 0028 note of 2026-10-16, ADR 0033 A14 (found live 2026-10-23): a
     /// restart-park's wake canary counts on the engine its restore named
     /// beside the server, as the coordinator passes it. The server alone the
     /// restore recorded names no engine, so judged on it every such canary

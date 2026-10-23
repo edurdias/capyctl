@@ -991,3 +991,17 @@ engines and on every host:
   park's arm (measurement only), `held` from its completion (measurement and charge).
   A remote host's co-residence re-check still charges the wake and the Ready phase
   without the KV; the control plane's admission, which charges it, stays the authority.
+
+**A14. A restart-park's wake on an enrolled host (§7; found live 2026-10-23).** With the
+server on the control host and host A as its host, every wake of a restart-parked vLLM
+0.32.0 deployment failed after about 73 s, with "the wake canary was not answered ... the
+host did not report the launch's engine alive"; standalone wakes passed. A remote host's
+answer to the wake canary counts only with the engine the canary's context names alive
+(ADR 0028 note of 2026-10-16). The canary ran on the restore's own context, whose
+processes are what the launch recorded before the wake: for a restart-park the server
+alone, which names no engine, so the canary failed after the new engine had started and
+the restore had been proven. SGLang 0.5.22 restart-parks on an enrolled host take the same
+path. The canary now runs on the restore's context with the processes the restore's
+evidence names: the new engine beside the same server for a restart-park, the recorded
+engine for any other wake. The check itself is unchanged: the claim retained, every engine
+process named alive and no other.

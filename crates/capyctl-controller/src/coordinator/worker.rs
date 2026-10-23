@@ -3796,7 +3796,7 @@ enum CanaryCheck {
     Differs,
 }
 
-/// ADR 0028 note of 2026-10-16, ADR 0033 §7: the wake canary's context, the
+/// ADR 0028 note of 2026-10-16, ADR 0033 A14: the wake canary's context, the
 /// restore's own with the processes its evidence names. A remote host's
 /// answer counts only with the engine the context names alive, and a
 /// restart-park's restore (which records the server alone) starts a new
