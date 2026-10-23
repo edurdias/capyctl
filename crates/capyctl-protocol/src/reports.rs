@@ -193,8 +193,10 @@ pub struct LmcacheSample {
     /// `lmcache_mp_l2_usage_bytes`: expected absent or zero; above zero is a
     /// degraded condition (ADR 0033 §12).
     pub l2_bytes: Option<u64>,
-    /// The server group's resident memory and, on a discrete GPU, its GPU
-    /// memory, measured by the host (ADR 0033 §6).
+    /// The server group's resident set (`VmRSS`, file-backed pages included)
+    /// and the GPU memory the driver attributes to its processes (on a
+    /// unified-memory machine too, where it lies outside the resident set),
+    /// measured by the host; `None` when not read (ADR 0033 §6, A1).
     pub rss_bytes: Option<u64>,
     pub device_bytes: Option<u64>,
 }

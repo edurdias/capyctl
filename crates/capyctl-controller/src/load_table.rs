@@ -119,8 +119,8 @@ pub struct LmcacheView {
     pub alloc_failures: Option<u64>,
     /// ADR 0033 §12: above zero, L2 holds data although none is configured.
     pub l2_bytes: Option<u64>,
-    /// The server group's resident memory and GPU memory, as its host
-    /// measured them.
+    /// The server group's resident set (`VmRSS`) and GPU memory, as its host
+    /// measured them (ADR 0033 A1).
     pub rss_bytes: Option<u64>,
     pub device_bytes: Option<u64>,
 }

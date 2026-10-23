@@ -778,6 +778,19 @@ the resident set by nothing), so there the charge is the pool, the overhead and 
 figure, all in the one domain; on a discrete GPU the device figure goes to the device
 domain as §6 says.
 
+The figures measured on later launches, which replace these allowances for the revision on
+that host, are taken on the allowances' own basis (found live 2026-10-22 on GB10: a SGLang
+server's 4903 MiB resident set was 436 MiB anonymous, 4138 MiB shared and 329 MiB
+file-backed, and the driver attributed 406 MiB of GPU memory to it; measuring anonymous and
+shared pages alone, with no GPU figure, undercharged it by about 735 MiB). The overhead is
+the server group's whole resident set (`VmRSS`, file-backed pages included) beyond its
+pool, on every path: the embedded watch while it runs, the reading at Ready, and a remote
+host's load reports. The device figure is the GPU memory the driver attributes to the
+server's processes (the per-process `nvidia-smi` sample of ADR 0007), on unified memory as
+on a discrete GPU. A figure no source read is recorded as zero and keeps its allowance: a
+source that cannot see that memory never replaces an allowance. Each figure is the
+largest seen for the revision on that host, so a smaller later reading never lowers it.
+
 **A2. The command line (§3).** In LMCache 0.5.6 the L1 pool is lazy by default
 (`--l1-use-lazy` is a boolean option defaulting to true, starting at
 `--l1-init-size-gb 20`), so §3's "the pool is allocated at start" needs the option stated:

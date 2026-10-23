@@ -887,6 +887,8 @@ mod tests {
         // Smaller does not lower it; a larger figure grows on its own.
         authority.record_lmcache_samples(&b, &[sample(&on_b, GIB + 500 * MIB, Some(200 * MIB))]);
         authority.record_lmcache_samples(&b, &[sample(&on_b, GIB + 800 * MIB, None)]);
+        // ADR 0033 A1: no GPU reading records zero, which keeps the device
+        // allowance (`charge_measured`).
         authority.record_lmcache_samples(&a, &[sample(&on_a, GIB + 100 * MIB, None)]);
         let mut expected = vec![
             (a.clone(), mi(100 * MIB), 0),

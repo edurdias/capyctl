@@ -1107,6 +1107,50 @@ fn a_host_measurement_replaces_the_allowances_of_the_next_launch_there() {
     );
 }
 
+// T45 T14 (ADR 0033 §§6, 12, A1; found live 2026-10-22, GB10): a host's
+// report whose server GPU memory nothing read (device zero) records the
+// overhead alone, and the revision's next launch there keeps the device
+// allowance; once a report reads the GPU memory, that figure replaces it.
+#[test]
+fn a_host_measurement_without_a_gpu_reading_keeps_the_device_allowance() {
+    let lab = Lab::new(|_| {});
+    let a = lab.deploy("a", |_| {});
+    let (_, context) = lab.start(&a, 100);
+    lab.ready(&context, 10, Some(LmcacheOutcome::On), 200);
+    let step = context.token.step_id.clone();
+    let measure = |resident: i64, device: i64| {
+        lab.store
+            .record_host_lmcache_measurement(
+                &lab.session,
+                "lab",
+                &a.deployment_id,
+                a.generation,
+                &step,
+                resident,
+                device,
+                300,
+            )
+            .unwrap()
+    };
+    let next = || {
+        let tx = lab.store.conn.unchecked_transaction().unwrap();
+        let (_, e) = effective(&tx, &a).unwrap();
+        let plan = plan_on(&tx, &a.deployment_id, a.revision, "lab", &e).unwrap();
+        let (charge, measured) = plan_charge(&tx, &plan, &a.deployment_id, a.revision, "lab", &e)
+            .unwrap()
+            .unwrap();
+        (measured, charge.overhead_bytes, charge.device_bytes)
+    };
+    // The server's `VmRSS` is the 1 GiB pool plus 807 MiB.
+    assert!(measure(GIB + 807 * MIB, 0));
+    assert_eq!(next(), (true, 807 * MIB, 512 * MIB));
+    assert!(measure(GIB + 807 * MIB, 406 * MIB));
+    assert_eq!(next(), (true, 807 * MIB, 406 * MIB));
+    // A later report without a GPU reading lowers nothing.
+    assert!(!measure(GIB + 700 * MIB, 0));
+    assert_eq!(next(), (true, 807 * MIB, 406 * MIB));
+}
+
 /// Instance 0 of `fence` in the status snapshot, as the management API
 /// serializes it.
 fn instance_status(lab: &Lab, fence: &DeploymentFence) -> Value {

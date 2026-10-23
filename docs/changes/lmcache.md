@@ -35,7 +35,10 @@ What changed:
 - **Accounting.** Pool plus allowance (1280 MiB overhead and 512 MiB device, from LC1,
   A1) then the measured figures, in the system domain (the shared pool on unified
   memory), the pool against `host_kv_limit`; a restart-parked instance also holds the
-  engine KV its server keeps mapped (A5).
+  engine KV its server keeps mapped (A5). Measured on the allowances' basis (A1): the
+  server's whole resident set (`VmRSS`) beyond its pool and the GPU memory the driver
+  attributes to its processes, on unified memory too; a figure nothing read keeps its
+  allowance.
 - **Lifecycle.** Fallback relaunch once without LMCache (sticky per revision and
   profile), `required` failing instead; restart-only parking keeps the server and wakes
   a new engine on it; a server exit fails the instance (`lmcache_server_exited`);

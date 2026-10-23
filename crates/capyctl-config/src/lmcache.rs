@@ -786,17 +786,20 @@ impl LmcachePlan {
 
     /// [`LmcachePlan::charge`] with the overhead beyond the pool and the
     /// device memory measured on earlier launches in place of the
-    /// allowances where known.
+    /// allowances where known. A figure of zero is no reading (a launch
+    /// whose GPU memory nothing could read records none), so it keeps its
+    /// allowance: a measurement never lowers a charge to what no source saw.
     pub fn charge_measured(
         &self,
         overhead_bytes: Option<i64>,
         device_bytes: Option<i64>,
     ) -> Option<LmcacheCharge> {
         let figure = |bytes: u64| i64::try_from(bytes).unwrap_or(i64::MAX);
+        let read = |bytes: Option<i64>| bytes.filter(|bytes| *bytes > 0);
         self.is_on().then(|| LmcacheCharge {
             pool_bytes: figure(self.pool_bytes),
-            overhead_bytes: overhead_bytes.unwrap_or(figure(OVERHEAD_ALLOWANCE_BYTES)),
-            device_bytes: device_bytes.unwrap_or(figure(DEVICE_ALLOWANCE_BYTES)),
+            overhead_bytes: read(overhead_bytes).unwrap_or(figure(OVERHEAD_ALLOWANCE_BYTES)),
+            device_bytes: read(device_bytes).unwrap_or(figure(DEVICE_ALLOWANCE_BYTES)),
             held_kv_bytes: 0,
         })
     }
@@ -1772,10 +1775,11 @@ mod tests {
         assert_eq!(deployment_refusal(&auto, &[]), None);
     }
 
-    // T45 T25 (ADR 0033 §6): the charge is the pool plus the overhead
+    // T45 T25 (ADR 0033 §6, A1): the charge is the pool plus the overhead
     // allowance in the system domain, the pool against host_kv_limit, the
     // device allowance on unified memory and on a discrete GPU alike (LC1);
-    // measured figures replace the allowances; nothing is charged while off.
+    // measured figures replace the allowances, but a figure of zero (no
+    // reading) never does; nothing is charged while off.
     #[test]
     fn the_charge() {
         let registration = registered();
@@ -1811,6 +1815,27 @@ mod tests {
                 pool_bytes: 8 << 30,
                 overhead_bytes: 700 << 20,
                 device_bytes: 300 << 20,
+                held_kv_bytes: 0,
+            })
+        );
+        // Found live 2026-10-22 (GB10, SGLang): a launch whose server's GPU
+        // memory nothing read recorded device 0, and the next launch charged
+        // no GPU memory at all. No reading keeps the allowance.
+        assert_eq!(
+            planned.charge_measured(Some(800 << 20), Some(0)),
+            Some(LmcacheCharge {
+                pool_bytes: 4 << 30,
+                overhead_bytes: 800 << 20,
+                device_bytes: allowance(DEVICE_ALLOWANCE_BYTES),
+                held_kv_bytes: 0,
+            })
+        );
+        assert_eq!(
+            planned.charge_measured(Some(0), Some(400 << 20)),
+            Some(LmcacheCharge {
+                pool_bytes: 4 << 30,
+                overhead_bytes: allowance(OVERHEAD_ALLOWANCE_BYTES),
+                device_bytes: 400 << 20,
                 held_kv_bytes: 0,
             })
         );

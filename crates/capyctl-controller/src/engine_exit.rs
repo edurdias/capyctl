@@ -52,18 +52,33 @@ pub enum ExitHandled {
 #[derive(Clone)]
 pub struct EngineExits {
     commands: CoordinatorCommands,
-    /// ADR 0033 §6 (lifecycle design §7): the largest server overhead
-    /// measured per launch this run, so the store is written only when it
-    /// grows.
-    overhead: Arc<std::sync::Mutex<std::collections::BTreeMap<String, i64>>>,
+    /// ADR 0033 §6 (lifecycle design §7): the largest server overhead and
+    /// GPU memory measured per launch this run, so the store is written only
+    /// when one grows.
+    measured: Arc<std::sync::Mutex<std::collections::BTreeMap<String, (i64, i64)>>>,
+    /// ADR 0033 §6, A1: the per-process GPU sampler the host observation
+    /// reads (`nvidia-smi`), which names the server's processes on unified
+    /// memory and on a discrete GPU alike. `None` reads no GPU memory, and
+    /// the device allowance stays.
+    residency: Option<Arc<capyctl_agent::process_residency::ResidencySampler>>,
 }
 
 impl EngineExits {
     pub fn new(commands: CoordinatorCommands) -> Self {
         Self {
             commands,
-            overhead: Default::default(),
+            measured: Default::default(),
+            residency: None,
         }
+    }
+
+    /// Read the running LMCache servers' GPU memory from `sampler`.
+    pub fn with_process_residency(
+        mut self,
+        sampler: Arc<capyctl_agent::process_residency::ResidencySampler>,
+    ) -> Self {
+        self.residency = Some(sampler);
+        self
     }
 
     /// A `MemberExit` an authenticated host session reported. Blocking store
@@ -187,22 +202,30 @@ impl EngineExits {
         handled
     }
 
-    /// ADR 0033 §6 (lifecycle design §7): the running server's resident
-    /// memory beyond its pool, recorded for the revision on this host when
-    /// it is the most seen. Evidence only: a failure changes nothing.
-    fn measure(&self, launch: &capyctl_store::ordinary_lifecycle::lmcache::LocalLmcacheLaunch) {
-        let Some(resident) = server_resident_bytes(&launch.server) else {
+    /// ADR 0033 §6, A1 (lifecycle design §7): the running server's resident
+    /// set beyond its pool and its GPU memory, recorded for the revision on
+    /// this host when either is the most seen. A figure nothing read is
+    /// recorded as zero, which keeps its allowance. Evidence only: a failure
+    /// changes nothing.
+    pub(crate) fn measure(
+        &self,
+        launch: &capyctl_store::ordinary_lifecycle::lmcache::LocalLmcacheLaunch,
+    ) {
+        use capyctl_agent::process_residency::{group_device_bytes, group_resident_bytes};
+        let figure = |bytes: u64| i64::try_from(bytes).unwrap_or(i64::MAX);
+        let overhead = group_resident_bytes(&launch.server).map_or(0, |resident| {
+            figure(resident).saturating_sub(launch.pool_bytes).max(0)
+        });
+        let device = self
+            .residency
+            .as_ref()
+            .and_then(|sampler| group_device_bytes(&sampler.current(), &launch.server))
+            .map_or(0, figure);
+        let Ok(mut seen) = self.measured.lock() else {
             return;
         };
-        let overhead = resident.saturating_sub(launch.pool_bytes).max(0);
-        let Ok(mut seen) = self.overhead.lock() else {
-            return;
-        };
-        if overhead == 0
-            || seen
-                .get(&launch.binding_id)
-                .is_some_and(|most| *most >= overhead)
-        {
+        let most = seen.get(&launch.binding_id).copied().unwrap_or_default();
+        if overhead <= most.0 && device <= most.1 {
             return;
         }
         let Ok(owner) = self.commands.owner_for_read() else {
@@ -214,12 +237,15 @@ impl EngineExits {
                 owner.session(),
                 &launch.binding_id,
                 overhead,
-                0,
+                device,
                 capyctl_protocol::now_unix_ms(),
             )
             .is_ok()
         {
-            seen.insert(launch.binding_id.clone(), overhead);
+            seen.insert(
+                launch.binding_id.clone(),
+                (most.0.max(overhead), most.1.max(device)),
+            );
         }
     }
 
@@ -312,36 +338,6 @@ pub(crate) fn accept_exit_stop(
 
 /// The principal an idle stop is accepted under (SPEC §6.5).
 const IDLE_PRINCIPAL: &str = "idle";
-
-/// ADR 0033 §6 (lifecycle design §7): the resident host memory (`RssAnon`
-/// plus `RssShmem`) of the alive processes of an LMCache server group, in
-/// bytes; `None` when none is alive or one cannot be read.
-pub(crate) fn server_resident_bytes(server: &[ProcessIdentity]) -> Option<i64> {
-    let mut total = 0_i64;
-    let mut any = false;
-    for process in server {
-        if capyctl_launchers::process_absence::presence(process)
-            != capyctl_domain::completion::Presence::Alive
-        {
-            continue;
-        }
-        let status = std::fs::read_to_string(format!("/proc/{}/status", process.pid)).ok()?;
-        let field = |name: &str| -> Option<i64> {
-            let kib: i64 = status
-                .lines()
-                .find_map(|line| line.strip_prefix(name))?
-                .trim()
-                .strip_suffix("kB")?
-                .trim()
-                .parse()
-                .ok()?;
-            kib.checked_mul(1024)
-        };
-        total = total.checked_add(field("RssAnon:")?.checked_add(field("RssShmem:")?)?)?;
-        any = true;
-    }
-    any.then_some(total)
-}
 
 /// SPEC §6.3: an ordinary stop of one instance under `principal`, at the
 /// deployment's current revision and within its stop window, so it stays

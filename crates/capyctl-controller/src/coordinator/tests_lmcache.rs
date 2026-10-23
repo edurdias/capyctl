@@ -957,6 +957,228 @@ async fn a_server_exit_fails_the_instance_and_recovery_starts_a_new_server() {
     w.shutdown().await.unwrap();
 }
 
+/// The lab's observations with the per-process GPU memory a host's sample
+/// attributes to its processes (ADR 0007), as `nvidia-smi` gives it on
+/// unified memory and on a discrete GPU alike.
+struct GpuResidents(
+    Vec<MemoryObservation>,
+    Vec<capyctl_domain::resources::ProcessResident>,
+);
+impl ServiceObservation for GpuResidents {
+    fn observe(&self, _: String) -> ObservationFuture {
+        let values = self.0.clone();
+        Box::pin(async move { Ok(values) })
+    }
+    fn observe_with_residents(&self, _: String) -> ResidentObservationFuture {
+        let (values, residents) = (self.0.clone(), self.1.clone());
+        Box::pin(async move { Ok((values, residents)) })
+    }
+}
+
+/// `/proc/<pid>/status` figures of a live process, in bytes: (`VmRSS`,
+/// `RssAnon` + `RssShmem`).
+fn resident_figures(pid: u32) -> (i64, i64) {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let kib = |name: &str| -> i64 {
+        let line = status.lines().find(|l| l.starts_with(name)).unwrap();
+        line[name.len()..]
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap()
+            * 1024
+    };
+    (kib("VmRSS:"), kib("RssAnon:") + kib("RssShmem:"))
+}
+
+/// One embedded launch measured on unified memory, then started again:
+/// `ready_gpu` is the server's GPU memory the host's sample names at Ready,
+/// `running_gpu` what the exit watch's sampler names while it runs (`None`:
+/// nothing names the server). Returns (the recorded overhead and device
+/// figures, the server's `VmRSS` and `RssAnon` + `RssShmem` when measured,
+/// the next launch's Ready charge).
+async fn measured_then_started_again(
+    ready_gpu: Option<i64>,
+    running_gpu: Option<i64>,
+) -> ((i64, i64), (i64, i64), (ResourcePhase, i64, i64)) {
+    use rusqlite::OptionalExtension;
+    let (dir, owner, fence, observations) = lab(|_| {}).await;
+    let deployment = fence.deployment_id.clone();
+    let host = CacheHost::new(Report::Adapter, owner.clone());
+    let processes: Vec<_> = (0..3)
+        .map(|_| {
+            Process(
+                std::process::Command::new("sleep")
+                    .arg("120")
+                    .spawn()
+                    .unwrap(),
+            )
+        })
+        .collect();
+    let live = |role: &str, n: usize| capyctl_testkit::live_identity(role, processes[n].0.id());
+    let engine = vec![live("api", 0), live("worker-0", 1)];
+    let server = live(LMCACHE_ROLE, 2);
+    *host.live_launch.lock().unwrap() = Some((engine, server.clone()));
+    let [_api, _worker, mut child] = <[Process; 3]>::try_from(processes).ok().unwrap();
+    let resident = |gpu: i64| capyctl_domain::resources::ProcessResident {
+        pid: server.pid,
+        boot_id: server.boot_id.clone(),
+        start_ticks: server.start_ticks,
+        bytes: gpu,
+        device_bytes: gpu,
+        host_bytes: 0,
+    };
+    let clock = host.clock.clone();
+    let bound = host.clone();
+    let w = OwnedCoordinator::spawn_with_execution_bindings(
+        owner.clone(),
+        Arc::new(GpuResidents(
+            observations,
+            ready_gpu.map(resident).into_iter().collect(),
+        )),
+        Arc::new(move || Ok(clock.load(Ordering::SeqCst))),
+        CoordinatorOptions {
+            retry_cooldown: Duration::from_millis(50),
+            ..Default::default()
+        },
+        Arc::new(move |work: &InitializeWork| Ok(bound.bind(work))),
+    )
+    .unwrap();
+    ready(&w, &fence).await;
+    let measured = || -> Option<(i64, i64)> {
+        sql(&dir)
+            .query_row(
+                "SELECT overhead_bytes,device_bytes FROM lmcache_measurements WHERE deployment_id=?1",
+                [&deployment],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .unwrap()
+    };
+    assert_eq!(
+        measured(),
+        ready_gpu.map(|gpu| (0, gpu)),
+        "measured at Ready"
+    );
+    let mut exits = crate::engine_exit::EngineExits::new(w.commands());
+    if let Some(gpu) = running_gpu {
+        let pid = server.pid;
+        let sampler = capyctl_agent::process_residency::ResidencySampler::with_collector(Arc::new(
+            move || Some(vec![(pid, gpu)]),
+        ));
+        // The exit watch reads the latest sample without waiting for one.
+        assert_eq!(sampler.sample_fresh().len(), 1);
+        exits = exits.with_process_residency(sampler);
+    }
+    // The exit watch's pass measures the running server: a `sleep` holds a
+    // few MiB, within its 1 GiB pool, so only its GPU memory counts here.
+    let watch = exits.clone();
+    let handled = tokio::task::spawn_blocking(move || watch.local_pass())
+        .await
+        .unwrap();
+    assert!(handled.is_empty(), "{handled:?}");
+    assert_eq!(
+        measured(),
+        ready_gpu.max(running_gpu).map(|gpu| (0, gpu)),
+        "the most seen while it ran"
+    );
+    // The same launch as the watch reads it, its pool lowered to one byte so
+    // the server's whole resident set lies beyond it.
+    let mut launch = {
+        let o = owner.lock().unwrap();
+        o.store().local_lmcache_launches(o.session()).unwrap()
+    };
+    assert_eq!(launch.len(), 1, "{launch:?}");
+    let mut launch = launch.remove(0);
+    launch.pool_bytes = 1;
+    let figures = resident_figures(server.pid);
+    let watch = exits.clone();
+    tokio::task::spawn_blocking(move || watch.measure(&launch))
+        .await
+        .unwrap();
+    let recorded = measured().expect("the running server was measured");
+
+    // The server exits; its stop settles, and on-demand activation starts
+    // the revision again on this host.
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let watch = exits.clone();
+    let handled = tokio::task::spawn_blocking(move || watch.local_pass())
+        .await
+        .unwrap();
+    let [crate::engine_exit::ExitHandled::Settling {
+        operation_id: Some(stop),
+    }] = handled.as_slice()
+    else {
+        panic!("expected the server's exit to be settling, got {handled:?}");
+    };
+    until("the exit stop settled", || {
+        operation(&owner, stop).0 == "succeeded"
+    })
+    .await;
+    let port = crate::coordinator_port::CoordinatorLifecycle::new(w.commands());
+    use crate::port::LifecyclePort;
+    let activation = port.auto_activate(&deployment).await.unwrap();
+    assert_eq!(
+        port.wait_terminal(&activation).await.unwrap(),
+        capyctl_domain::LifecycleState::Ready
+    );
+    let next = charge(&owner, &deployment).unwrap();
+    w.shutdown().await.unwrap();
+    (recorded, figures, next)
+}
+
+// T45 T25 T14 (ADR 0033 §6, A1; found live 2026-10-22, GB10, SGLang): the
+// overhead is the server's whole resident set beyond its pool, file-backed
+// pages included (the basis A1's allowance was measured on), and its GPU
+// memory, which on unified memory lies outside that resident set, is
+// recorded from the host's per-process sample, at Ready and while it runs.
+// The next launch charges the pool, the measured overhead and the most GPU
+// memory seen.
+#[tokio::test]
+async fn a_measured_launch_charges_its_servers_resident_set_and_gpu_memory() {
+    let (recorded, (vm_rss, anon_shmem), next) =
+        measured_then_started_again(Some(300 * MIB), Some(406 * MIB)).await;
+    let (overhead, device) = recorded;
+    assert_eq!(device, 406 * MIB, "the most seen while it ran");
+    // `VmRSS` beyond the one-byte pool, read moments apart.
+    assert!(
+        (overhead - (vm_rss - 1)).abs() < 4 * MIB,
+        "{overhead} vs VmRSS {vm_rss}"
+    );
+    assert!(
+        overhead > anon_shmem,
+        "file-backed pages counted: {overhead} vs {anon_shmem}"
+    );
+    assert_eq!(
+        next,
+        (
+            ResourcePhase::Ready,
+            ENGINE_READY.0 + GIB + overhead + 406 * MIB,
+            CACHED_READY.1
+        )
+    );
+}
+
+// T45 T25 T14 (ADR 0033 §6, A1): a server whose GPU memory no sample names
+// records its overhead alone, and the next launch keeps the device
+// allowance: a measurement never replaces an allowance with zero.
+#[tokio::test]
+async fn a_launch_without_a_gpu_reading_keeps_the_device_allowance() {
+    let ((overhead, device), _, next) = measured_then_started_again(None, None).await;
+    assert!(overhead > 0);
+    assert_eq!(device, 0, "no reading");
+    assert_eq!(
+        next,
+        (
+            ResourcePhase::Ready,
+            ENGINE_READY.0 + GIB + overhead + 512 * MIB,
+            CACHED_READY.1
+        )
+    );
+}
+
 /// ADR 0033 §§6, 7, A5: a `restart_only` launch with LMCache on parks by
 /// stopping its engine: the park's evidence names the server alone, the
 /// binding keeps the server, and the parked charge is the server's plus the

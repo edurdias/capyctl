@@ -944,11 +944,15 @@ impl crate::Store {
         Ok(())
     }
 
-    /// ADR 0033 §6 (lifecycle design §7): the server overhead beyond its pool
-    /// and the server's own GPU memory measured for `binding_id`'s launch,
-    /// kept per (deployment, revision, host) as the largest seen; later
-    /// launches of the revision there charge them in place of the
-    /// allowances. Returns whether the record grew.
+    /// ADR 0033 §6, A1 (lifecycle design §7): the server overhead beyond its
+    /// pool (its whole resident set, file-backed pages included, beyond the
+    /// pool) and the server's own GPU memory measured for `binding_id`'s
+    /// launch, kept per (deployment, revision, host) as the largest seen;
+    /// later launches of the revision there charge them in place of the
+    /// allowances. Zero is no reading: it never lowers a figure, and a
+    /// figure never read keeps its allowance
+    /// ([`capyctl_config::lmcache::LmcachePlan::charge_measured`]). Returns
+    /// whether the record grew.
     pub fn record_lmcache_overhead(
         &self,
         s: &CoordinatorSession,
@@ -967,13 +971,13 @@ impl crate::Store {
         Ok(grew)
     }
 
-    /// ADR 0033 §§6, 12 (lifecycle design §7): what `host` measured of the
-    /// LMCache server of its launch `step_id` (the launch's owned handle) of
-    /// `deployment` at `generation`: the server group's resident memory and
-    /// its GPU memory. The resident memory beyond the granted pool is the
-    /// overhead, recorded as [`Self::record_lmcache_overhead`] does. A sample
-    /// naming no retained launch of that host with a server changes nothing.
-    /// Returns whether the record grew.
+    /// ADR 0033 §§6, 12, A1 (lifecycle design §7): what `host` measured of
+    /// the LMCache server of its launch `step_id` (the launch's owned handle)
+    /// of `deployment` at `generation`: the server group's resident set and
+    /// its GPU memory (zero: none read). The resident set beyond the granted
+    /// pool is the overhead, recorded as [`Self::record_lmcache_overhead`]
+    /// does. A sample naming no retained launch of that host with a server
+    /// changes nothing. Returns whether the record grew.
     #[allow(clippy::too_many_arguments)]
     pub fn record_host_lmcache_measurement(
         &self,

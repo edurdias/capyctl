@@ -2113,6 +2113,10 @@ async fn start_standalone_in(
             .spawn_until(supervision.cancel_signal()),
         );
     }
+    // ADR 0007 (found live 2026-09-23, matrix M33): credit the engines
+    // already resident here instead of charging them twice. ADR 0033 §6, A1:
+    // the same per-process sample measures the LMCache servers' GPU memory.
+    let residency = capyctl_agent::process_residency::ResidencySampler::nvidia();
     let coordinator = OwnedCoordinator::spawn_resolved(
         owner.clone(),
         Arc::new(
@@ -2123,9 +2127,7 @@ async fn start_standalone_in(
             ))
             .with_memory_reader(memory.clone())
             .with_gpu_sampler(gpu.clone())
-            // ADR 0007 (found live 2026-09-23, matrix M33): credit the
-            // engines already resident here instead of charging them twice.
-            .with_process_residency(capyctl_agent::process_residency::ResidencySampler::nvidia()),
+            .with_process_residency(residency.clone()),
         ),
         system_clock(),
         options,
@@ -2154,6 +2156,7 @@ async fn start_standalone_in(
     // verified cleanup. Supervised with readiness, so it ends with it.
     supervision.supervise(
         capyctl_controller::engine_exit::EngineExits::new(coordinator.commands())
+            .with_process_residency(residency)
             .spawn_local_until(supervision.cancel_signal()),
     );
     let configuration = Arc::new(

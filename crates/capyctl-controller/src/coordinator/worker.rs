@@ -2356,10 +2356,10 @@ impl StartupPeak {
         }
     }
 
-    /// ADR 0033 §6 (lifecycle design §7): the most host RAM and GPU memory
-    /// the LMCache `server` group held in one sample taken while the engine
-    /// started (a discrete GPU's samples name each process); `(0, 0)` with
-    /// none.
+    /// ADR 0033 §6 (lifecycle design §7): the most host RAM (anonymous and
+    /// shared pages) and GPU memory the LMCache `server` group held in one
+    /// sample taken while the engine started (a discrete GPU's samples name
+    /// each process); `(0, 0)` with none.
     fn server_residency(
         &self,
         server: &[capyctl_domain::completion::ProcessIdentity],
@@ -2732,24 +2732,48 @@ async fn drive(
             })
             .await;
     }
-    // ADR 0033 §6 (lifecycle design §7): the server's memory beyond its pool
-    // and its own GPU memory, as measured while the engine started and now;
-    // later starts of the revision here charge them in place of the
-    // allowances. A failure to record it costs nothing but the measurement.
-    // Only an embedded server is read from this machine's `/proc`; a remote
-    // one is measured by its host (its load reports, `agent_sessions`).
+    // ADR 0033 §6, A1 (lifecycle design §7): the server's resident set
+    // beyond its pool and its own GPU memory, as measured while the engine
+    // started and now; later starts of the revision here charge them in
+    // place of the allowances. A failure to record it costs nothing but the
+    // measurement. Only an embedded server's resident set is read from this
+    // machine's `/proc` (`VmRSS`, the basis of A1's allowance); a startup
+    // sample of its anonymous and shared pages counts only beside that
+    // reading, never alone. Its GPU memory is what the host's per-process
+    // sample attributes to its processes, on unified memory and on a
+    // discrete GPU alike (a remote host's sample comes with its
+    // observation). A figure nothing read is recorded as zero, which keeps
+    // its allowance; a remote server's resident set is measured by its host
+    // (its load reports, `agent_sessions`).
     if let Some(capyctl_adapters::lmcache::LmcacheReport::On {
         server, pool_bytes, ..
     }) = &lmcache
     {
-        let (sampled_host, device) = peak.server_residency(server);
-        let host = driver
+        let figure = |bytes: u64| i64::try_from(bytes).unwrap_or(i64::MAX);
+        let (sampled_host, sampled_device) = peak.server_residency(server);
+        let overhead = driver
             .tools
             .as_ref()
-            .and_then(|_| crate::engine_exit::server_resident_bytes(server))
-            .unwrap_or(0)
-            .max(sampled_host);
-        let overhead = host.saturating_sub(*pool_bytes).max(0);
+            .and_then(|_| capyctl_agent::process_residency::group_resident_bytes(server))
+            .map_or(0, |resident| {
+                figure(resident)
+                    .max(sampled_host)
+                    .saturating_sub(*pool_bytes)
+                    .max(0)
+            });
+        let now_device = match tokio::time::timeout(
+            shared.options.protocol_timeout,
+            source.observe_with_residents(work.effective().host.name.clone()),
+        )
+        .await
+        {
+            Ok(Ok((_, residents))) => {
+                capyctl_agent::process_residency::group_device_bytes(&residents, server)
+                    .map_or(0, figure)
+            }
+            _ => 0,
+        };
+        let device = sampled_device.max(now_device);
         if overhead > 0 || device > 0 {
             let binding = work.binding_id().to_owned();
             let _ = shared

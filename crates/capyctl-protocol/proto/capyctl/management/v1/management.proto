@@ -132,8 +132,8 @@ message LmcacheSample {
   optional uint64 lookups = 10;
   optional uint64 hits = 11;
   optional uint64 l2_bytes = 12;       // lmcache_mp_l2_usage_bytes; above zero is degraded
-  optional uint64 rss_bytes = 13;      // the server group's resident memory
-  optional uint64 device_bytes = 14;   // the server group's GPU memory (discrete)
+  optional uint64 rss_bytes = 13;      // the server group's resident set (VmRSS)
+  optional uint64 device_bytes = 14;   // the server group's GPU memory (per process, any GPU)
 }
 message LoadSample {
   string deployment_id = 1;
