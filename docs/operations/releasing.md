@@ -59,7 +59,22 @@ Only the owner publishes a release. Contributors and automation stop at a draft.
 
 4. **Create a draft release** tagged `v<version>` on the release commit and
    upload the two tarballs, their `.sha256` files, `install.sh` and
-   `SHA256SUMS`. Paste the release notes as the description.
+   `SHA256SUMS`. Its description is the release notes with their links
+   pinned to that commit: the notes link to the other documents by relative
+   paths, which work in the repository and break on the release page.
+
+   ```bash
+   scripts/release-notes-body.sh <version> <release commit> >release-body.md
+   ```
+
+   It prints `docs/operations/release-notes-<version>.md` with every relative
+   link made `https://github.com/edurdias/capyctl/blob/<commit>/docs/...`,
+   anchors kept, and fails, printing nothing, if a link's file or heading
+   does not exist at that commit; fix the notes and run it again. Paste
+   `release-body.md` as the description (or pass it with
+   `gh release create --draft --notes-file release-body.md`). To correct a
+   published release's notes later, run it on the corrected notes with the
+   same release commit.
 
 5. **Check it live.** Install from the draft on a real host with
    `install.sh --version v<version>`, start the server and a host
