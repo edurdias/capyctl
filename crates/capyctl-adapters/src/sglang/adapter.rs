@@ -493,7 +493,9 @@ impl SglangAdapter {
         let budget = std::time::Duration::from_millis((c.deadline_ms - now) as u64);
         let step = async {
             match command.action {
-                RuntimeAction::Park => crate::lmcache::park_engine(tools, command).await,
+                RuntimeAction::Park => {
+                    crate::lmcache::park_engine(tools, command, self.rendezvous_dir()).await
+                }
                 RuntimeAction::Restore => {
                     crate::sglang::initialize::restore_engine(self, command).await
                 }

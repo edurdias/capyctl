@@ -295,6 +295,15 @@ its servers held 1608–1656 MiB after their engine's exit):
   and the next launch charges the steady one, on vLLM and on SGLang; the callers'
   sample filter; the v56 migration. The restart-park round trip now expects the held KV
   in the charge after the wake.
+- **The embedded SGLang wake (found live on `d2901204`).** An embedded SGLang
+  restart-park's wake failed in about 2 s, `sglang_startup_failed:
+  loopback_rendezvous_failed` (restore `wake_uncertain`, the server stopped by cleanup):
+  the park stopped the engine but left its rendezvous directory
+  (`<state>/rendezvous/<incarnation>`), and the wake's engine, of the same incarnation,
+  refuses one that exists. The embedded restart-park now removes it once the engine's
+  stop is verified, as a remote host's already did (only this user's own directory,
+  never through a symlink). Test: an embedded SGLang restart-park then restore starts a
+  new engine on the same server, the directory absent when it is spawned.
 
 Still missing: LC4 on SGLang (the restart-park quiescence fix); LC7 rerun as amended
 (decisions on SGLang off, `required` refused); LC1 through CapyCTL on a server and host

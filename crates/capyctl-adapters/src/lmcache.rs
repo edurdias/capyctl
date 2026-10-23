@@ -850,10 +850,15 @@ pub(crate) fn engine_failed(
 
 /// ADR 0033 §7: a restart-parked launch's Park: stop the engine's group and
 /// its helpers (verified gone), keep the server. The evidence names the
-/// server group, which is all the launch holds while parked.
+/// server group, which is all the launch holds while parked. SPEC §8.2 / T21
+/// (found live on SGLang, 2026-10-23): once the engine's exit is verified,
+/// its file rendezvous directory `rendezvous` is stale and is removed, as a
+/// remote host's restart-park does, so the wake's engine (the same
+/// incarnation) can make its own: the entry refuses one that exists.
 pub(crate) async fn park_engine(
     tools: Arc<dyn OwnedProcessLaunch>,
     command: &RuntimeCommand,
+    rendezvous: Option<&Path>,
 ) -> Result<EffectObservation, RuntimeError> {
     let c = &command.context;
     let ExecutionIdentities::Retained(identities) = &c.identities else {
@@ -879,6 +884,9 @@ pub(crate) async fn park_engine(
     tokio::task::spawn_blocking(move || stop_tools.stop_group(&engine, grace))
         .await
         .map_err(|_| RuntimeError::Uncertain("stop task failed".into()))??;
+    if let Some(dir) = rendezvous {
+        retire_rendezvous(dir);
+    }
     Ok(EffectObservation {
         token: c.token.clone(),
         binding_id: c.binding_id.clone(),
@@ -892,6 +900,16 @@ pub(crate) async fn park_engine(
         facts: vec![Milestone::Quiesced, Milestone::MemoryReleased],
         kernel_builds: Vec::new(),
     })
+}
+
+/// SPEC §8.2 / T21: remove a stopped engine's rendezvous directory: only
+/// this user's own real directory at exactly `dir`, never a symlink (not
+/// followed). Whether it was removed.
+fn retire_rendezvous(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(dir)
+        .is_ok_and(|meta| meta.is_dir() && meta.uid() == nix::unistd::geteuid().as_raw())
+        && std::fs::remove_dir_all(dir).is_ok()
 }
 
 /// A restart-parked launch's Restore context: the server group the launch

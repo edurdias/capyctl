@@ -183,7 +183,8 @@ impl VllmAdapter {
         };
         let result = match command.action {
             RuntimeAction::Park => {
-                let parked = crate::lmcache::park_engine(tools, command).await;
+                // vLLM keeps no file rendezvous.
+                let parked = crate::lmcache::park_engine(tools, command, None).await;
                 if parked.is_ok() {
                     self.set_parked(&member, true);
                 }
