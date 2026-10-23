@@ -366,9 +366,10 @@ The SPEC text to land with the implementation:
 
 ## Consequences
 
-- On SGLang, a cancelled chat request would settle about one forward pass after the
-  abort reaches the scheduler, whatever else the engine runs, so cuts stop filling the
-  limit there. [INFERENCE until measured live: row L1.]
+- On SGLang, a cancelled chat request settles about one forward pass after the abort
+  reaches the scheduler, whatever else the engine runs, so cuts stop filling the limit
+  there. Measured live on 2026-10-22 (row L1): 37–38 ms after the scheduler applied the
+  abort, with 38–39 ms steps.
 - The router keeps an engine response open for up to the stream idle bound after each
   cut, and a host's ingress keeps relaying it. The ingress in-flight count then stays
   above 0, so the remote idle reading cannot settle anything meanwhile.
@@ -440,11 +441,16 @@ and Fake-engine tests are not qualification.
 Run in a live session the owner schedules (one live session on the hosts at a time), in
 the approved SGLang 0.5.22 environment:
 
-- **L1, abort settles within one decode step.** Under steady traffic that keeps the
-  engine from reading idle, a client hangs up mid-stream. The lease settles with the
-  per-request receipt within one decode step of the abort reaching the engine (the time
-  from the abort to the settlement, against the engine's step time), while its gauges
-  never read 0, and the engine's running count drops by one.
+- **L1, abort settles within one decode step of reaching the scheduler.** Under steady
+  traffic that keeps the engine from reading idle, a client hangs up mid-stream. The
+  victim's final output leaves within one decode step of the abort reaching the engine's
+  scheduler; from CapyCTL's abort request, within at most two decode steps plus the
+  request to the engine, because SGLang applies an abort only between steps and the step
+  already started carries the final output. The lease settles on that per-request output
+  while the engine's gauges never read 0, and its running count drops by one. (Clarified
+  2026-10-22 by the owner after measuring: the first text did not name its reference
+  point. Measured: 37–38 ms from the scheduler, 65–73 ms to the final output and 69–89 ms
+  to settlement from CapyCTL's request, with 37–39 ms steps.)
 - **L2, a deadline cut before output settles promptly.** A request whose deadline passes
   before its first output (queued behind others, or in a long prefill) is cut; it
   settles on its own final output well within the stream idle bound, not at the next

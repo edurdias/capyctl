@@ -118,7 +118,9 @@ Gauges are `sglang:num_running_reqs` and `sglang:num_queue_reqs`, read from the 
 loopback `/metrics` every 50 ms. Times are the router's `router_abort_settled`
 `elapsed_ms`, which runs from the router asking for the abort to the settlement.
 
-- **L1, passes, except that settling takes about two decode steps, not one.** Standalone,
+- **L1, passes (criterion clarified 2026-10-22: within one decode step of the abort
+  reaching SGLang's scheduler; from CapyCTL's request, at most two steps plus the request
+  to the engine; see ADR 0032).** Standalone,
   context 8192. 4 background streams kept the engine busy, and a fifth (the victim) hung
   up mid-stream, 8 times in all.
   - Every victim was acknowledged by its own ID 66–78 ms after the abort (68, 78, 75, 74,
