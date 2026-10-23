@@ -1,5 +1,1782 @@
 # Current implementation and launch status
 
+## LMCache — 2026-10-22 (branch `feat/lmcache`)
+
+ADR 0033 (owner decisions of 2026-10-21, amended by #179; owner input of 2026-10-22 on
+LMCache issue 4825) is implemented on this branch for 0.1.7, with the implementation
+amendments A1–A12 recorded in the ADR.
+
+What changed:
+
+- **Configuration.** Deployment fields `lmcache` (`auto`, `off`, `required`),
+  `lmcache_pool` (whole GiB, at least 1 GiB, refused beside `off`) and `retention`
+  (`standard`, `zero`), frozen only when stated so older revisions keep their
+  fingerprints; host settings `lmcache` (`auto`, `off`) and `retention`
+  (`standard`, `zero`), published with the host document; `retention: zero` beside a
+  stated `engine_logs: files` refuses the role's start and forces memory engine logs.
+  A vLLM `--kv-transfer-config` naming an LMCache connector is refused in every
+  spelling, another connector turns LMCache off (`kv_transfer_config_set`); SGLang's
+  LMCache options are owned; `LMCACHE_*` is reserved. `capyctl_config::lmcache::plan`
+  decides on or off with the closed reasons of ADR 0033 §14.
+- **Registration and the launch-time check.** `engine add` records LMCache's version
+  and digest on the profile; the check by shape reads files only and, on SGLang,
+  verifies the salt threading of LMCache's unified integration and refuses the
+  legacy adapter path (issue 4825). LMCache 0.5.6 on host A has it (unified connector
+  `IPCCacheServerKey(cache_salt=...)`, SGLang 0.5.22 `cache_salt=req.cache_salt`).
+  `capyctl engine list` shows `LMCACHE`.
+- **Salt.** The router sends vLLM and SGLang the effective salt, a domain-separated
+  SHA-256 digest of the deployment, the serving revision and the caller's salt; no salt
+  stays no salt.
+- **The server.** One private `lmcache server` per instance, gated and journaled
+  before it runs, own process group, argv exactly ADR §3 plus `--no-l1-use-lazy` (A2),
+  environment `PATH`, `HOME`, the instance's `CUDA_VISIBLE_DEVICES` (and
+  `CUDA_DEVICE_ORDER` when the GPU is pinned by index), `GET /status` within 30 s,
+  listener check, own log beside the engine's (A3), multi-group verified stop, the
+  server's `/dev/shm/cuda.shm.*` file removed after its verified exit (A5).
+  `RLIMIT_CORE` 0 and per-launch memory logs under zero retention.
+- **Accounting.** Pool plus allowance (1280 MiB overhead and 512 MiB device, from LC1,
+  A1) then the measured figures, in the system domain (the shared pool on unified
+  memory), the pool against `host_kv_limit`; a restart-parked instance also holds the
+  engine KV its server keeps mapped (A5), and after the wake until a GPU reading of the
+  server shows it released (A13). Measured on the allowances' basis (A1): the
+  server's whole resident set (`VmRSS`) beyond its pool and the GPU memory the driver
+  attributes to its processes, on unified memory too; a figure nothing read keeps its
+  allowance.
+- **Lifecycle.** Fallback relaunch once without LMCache (sticky per revision and
+  profile), `required` failing instead; restart-only parking keeps the server and wakes
+  a new engine on it; a server exit fails the instance (`lmcache_server_exited`);
+  role-start retirement under host `lmcache: off` or `retention: zero`. Placement gates
+  and capabilities `lmcache`, `retention`; events `lmcache_off`,
+  `lmcache_server_exited`; CLI exit 5 for the new codes.
+- **Remote hosts.** The launch grant carries the server's ports and charge; the host's
+  per-launch LMCache report reaches the coordinator as an embedded launch's does, so
+  the fallback, its codes and stickiness are the same; restart-park evidence (the server
+  alone while parked, a new engine beside the same server after the wake) is checked by
+  the server and again by the store; a host publishing `lmcache: off` or
+  `retention: zero` has its servers stopped and Ready instances started again without
+  LMCache; the servers' measured overhead and GPU memory from host load reports replace
+  the allowances for later launches of the revision on that host.
+- **Status.** Each instance's `lmcache` object (state, reason, server, pool, overhead,
+  device, held KV, charge, measured) and a `LMCache` line in `capyctl status`, with the
+  pool's used bytes, lookups and hits from the load read; LMCache drift shown under the
+  engine (standalone) and in `/hosts` (remote, additive
+  `RuntimeProfileStatus.lmcache_observed_digest`), journaled once per digest as
+  `<profile>:lmcache`.
+- **Docs.** SPEC §§7.4, 8.2, 9.1, 9.2, 10, 12, 15.1, 20 (T45, LC rows), 21; the ADR's
+  amendments; data retention, configuration, engine options, engines, requests,
+  deploy, parking and errors.
+- **The server's short-lived child (A9, live on SGLang).** A member of the server's
+  group that exits during the listener check (verified gone) is listed out and the
+  group read again, instead of failing the start. A server stopped before its engine
+  (`server_start_failed`, `listener_exposed` under `auto`) leaves the launch's record,
+  journaled, before the engine launches without the connector, so its Ready is no
+  longer refused `lifecycle conflict`; an unverified stop leaves the launch uncertain
+  with no engine. Only the `lmcache` leader's exit fails the instance; re-proofs and
+  restart-park evidence judge the server by its leader, and every recorded member
+  stays recorded until the verified stop. Tests: the listener check's vanished member,
+  the adapter's re-listing and departure, the store's departure and member exit, the
+  coordinator's exposed server (embedded and remote) and child exit, and the host's
+  exposed server and child exit on real processes.
+
+Tests (T45 with related rows): coordinator tests on the real worker for the fallback
+(once, sticky, `lmcache_off`), `required` failing `lmcache_unavailable:engine_start_failed`
+with nothing left, a server exit and its recovery with a new server, and the restart-park
+round trip, each embedded and through the host's report where it applies; the remote
+report and restart-park evidence, publication retirement, host measurements, drift
+(standalone, remote, CLI), the status object, line and load merge, the load table and
+capacity read, the standalone scrape; store tests for ports, charge, held KV, fallback,
+parking, exit and retirement. They found three bugs, fixed here: a restore of a
+restart-parked remote launch was accepted with the server alone and no new engine; a
+host's LMCache sample for another host's launch hid that launch's own later report; an
+embedded fallback relaunch journaled `lmcache_off` twice. Two older tests were brought up
+to date: a placement test now leaves `host_kv_limit` room for the default pool, and the
+reserved `LMCACHE_` row's reason is checked without a requirement citation.
+
+Fixes after the first live rows (each with its test, failing before): the vLLM entry no
+longer reads CapyCTL's own `--kv-transfer-config` as an extra (vLLM 0.32.0 gives it a
+random `engine_id` on every parse; `0bb4d59b`); LMCache's usage telemetry is off in the
+server and in the engine with the connector (A7; `3dd2d9eb`, `ce90c0f0`); a restart-park
+is proven quiescent by the engine's own gauges, embedded and remote (A8; `6ac5cb3e`);
+the server's measured charge is its group's VmRSS beyond the pool plus its sampled GPU
+memory, a figure nothing read keeping its allowance (A1; `d8ab848d`); the server's
+short-lived child and a server stopped before its engine (A9; `7d9ab7fa`).
+
+Verification, with `main` `9c7c7ab0` merged in (#187, ADR 0032: the router's forwarder
+carries both the effective salt and ADR 0032's request-ID lane; #188,
+`engine_telemetry`; #189, docs; merges `012105f8`, `0a73eaf3` and `54aa3740`, no
+rebase), both fix branches below and the A13 fix with the embedded SGLang wake fix
+(`417a2643`): `scripts/ci-local.sh --deep --ci-shape` passes, every step (unit 1632
+passed, 1 ignored; runtime 369; core 1737 passed; workspace 3708 passed, 1 ignored).
+
+Live rows, host A (GB10), Qwen3-4B (context 4096, KV cache 1 GiB, `restart_only`
+unless stated), 2026-10-22, standalone role, builds of `49f10efa` (the branch before the
+fixes) and `8958142d` (with the vLLM entry and engine telemetry fixes, now `0bb4d59b` and
+`3dd2d9eb`; the branch was rebased since); evidence in `target/live/lmcache-live/` on the
+laptop. The later fixes are not yet run live.
+
+- **LC1, fail.** SGLang on `49f10efa`: on by default with `restart_only`, argv exactly
+  §3 plus `--no-l1-use-lazy`, listeners 127.0.0.1 only (`ss`), environment `HOME` and
+  `PATH`, `GET /status` 5.6–7.9 s after start (bound 30 s), `/metrics` read, `engine
+  list` 0.5.6, first charge pool + 1280 MiB + 512 MiB (6,174,015,488 B). Server VmRSS
+  beyond the pool 807–816 MiB (4 and 8 GiB pools), GPU 406–408 MiB. vLLM on `49f10efa`:
+  every LMCache launch failed `vllm_startup_failed: sensitive_option_refused` (the
+  entry read CapyCTL's own `--kv-transfer-config` as an extra, since each parse gets a
+  random `engine_id`); on `8958142d` it starts on, `/status` within the bound, loopback
+  only. Failures: the measured charge drops the server's GPU memory (device recorded 0,
+  overhead 485 MiB as RssAnon plus RssShmem, so later launches charge pool + 485 MiB
+  where the server holds about 807 MiB beyond its pool and 406 MiB of GPU memory); a
+  short-lived server child (`lmcache-0`) made one start fail `server_start_failed`
+  (listener check read a vanished `/proc/<pid>/fd`), after which the launch without
+  LMCache failed `lifecycle conflict`; on two other starts that child's exit failed a
+  Ready instance as `lmcache_server_exited`. Every server on `49f10efa` and `8958142d`
+  connected to `stats.lmcache.ai:8080` (LMCache usage telemetry; on `8958142d` the
+  engine had the opt-out variables but the server did not, fixed in `ce90c0f0`, not
+  yet run live).
+- **LC2, pass** (both engines): after three 3.4k-token fillers evicted the engine's own
+  cache, the prompt again hit 3,328 tokens (13 chunks) from LMCache, and the answer at
+  temperature 0 equalled the first one and a `lmcache: off` deployment's.
+- **LC3, pass** (both engines): salt A, salt B, no salt: no LMCache hit across them;
+  salt A after eviction hit 3,328 tokens, no salt again hit its own entry. LMCache's
+  own record of the stored keys (`lmcache_mp_l1_write_chunks_total` by `cache_salt`,
+  grouped from the ObjectKeys written to L1) shows 13 chunks under each salt's digest,
+  equal to §5's digest computed independently, and unsalted keys under `""`.
+- **LC4, fail on SGLang, pass on vLLM, part 3 blocked.** SGLang (`49f10efa`):
+  restart-park refused `park_refused` ("the engine is not quiescent": the deep-park
+  saver check ran for a restart-park; fixed in `6ac5cb3e`, not yet run live). vLLM
+  (`8958142d`): parked with the server up (same PID, GPU 1430 MiB, charge pool + 1280 +
+  512 MiB + 1 GiB held KV), the wake hit 3,328 tokens with the same answer. A `deep`
+  deployment runs deep with LMCache off, but the reason reads "an unknown model type /
+  an unknown GPU": the plans never carry the checkpoint's `model_type` or the GPU name,
+  so no qualified-table row can match; part 3 waits for that fix.
+- **LC5, fail.** New deployments under host `retention: zero` pass (`auto` off
+  `retention_zero` with the event, no engine log file, `Max core file size 0`;
+  `required` refused `retention_zero:lmcache`). Restarting the role into zero
+  retention stopped the running server and engine (verified gone) but relaunched the
+  instance with a new LMCache server, and a later start of that revision did too: the
+  standalone plan reads the revision's frozen host settings.
+- **LC6, pass.** `~/sglang-0.5.22-venv`: off `not_installed` in status, `engine list`
+  and an `lmcache_off` event; `required` refused `lmcache_unavailable:not_installed`.
+- **LC7, fail (SGLang upstream).** Clef-Flash: SGLang 0.5.22 disables its radix cache
+  for this model and then crashes at idle under `--enable-lmcache`
+  (`UnifiedRadixCache` has no `has_pending_cache_operations`); the relaunch without
+  LMCache served decisions. The server's overhead while it ran: 787 MiB beyond the
+  pool and 170 MiB of GPU memory, within the allowances, but no engine registered
+  with it, so the decision model's figures with LMCache in use remain unmeasured.
+- **LC8, pass** (both engines): SIGKILL to the recorded server while its engine
+  started stopped the engine (verified), relaunched it once without LMCache, which
+  served; warning, `lmcache_off` `engine_start_failed`, status; the next start of the
+  revision went without LMCache. With `required` (SGLang) the launch failed
+  `lmcache_unavailable:engine_start_failed` with nothing left running or charged.
+  `start --wait` exits 13 while the relaunch is still starting.
+- **LC9, pass** (both engines): SIGKILL to a Ready instance's server failed the
+  instance, stopped its engine with a verified exit and journaled
+  `lmcache_server_exited`; the next request relaunched the engine with a new server
+  (cold cache).
+- **LC10, fail.** A new deployment under host `lmcache: off` runs off `host_off`
+  (status, event), but `engine list` still shows 0.5.6; restarting the role into
+  `lmcache: off` stopped the running server and relaunched the instance with a new one
+  (same cause as LC5).
+- **LC11, pass (standalone).** `required` on the off host refused at placement
+  `lmcache_unavailable:host_off`, nothing started. Not run on a server and host pair.
+- **Status while Ready.** `held_kv_bytes` (the engine's KV cache) shows while the
+  instance is Ready although it is charged only while restart-parked (Ready charge
+  6,174,015,488 B, parked 7,247,757,312 B); the JSON reads as if the KV were held now.
+
+Fixed after these rows (`fix/lmcache-host-settings` `1055f321` and
+`fix/lmcache-qualified-parking` `36f39c71`, CPU tests only, not yet run live):
+
+- **LC5, LC10 (A11).** A standalone role records the `lmcache` and `retention` it starts
+  with (store schema v54, `embedded_host_settings`) before anything is placed or
+  started, and placement and the LMCache plan read them in place of the revision's
+  frozen copy (a server host's stay its approved publication). A role restarted into
+  `retention: zero` or `lmcache: off` now relaunches the retired instance without
+  LMCache, and a later start of the revision stays off. `capyctl engine list` shows
+  LMCache off with the reason under the settings the running role reports (both roles'
+  `list` replies carry them), falling back to the role document when it is not running.
+- **LC7 (A10, owner decision 2026-10-22).** LMCache is planned off, `engine_unsupported`,
+  for every decision deployment on SGLang and for any SGLang deployment stating
+  `--disable-radix-cache`, at resolution, in the store's plan and in the host's, so no
+  start fails on it; `lmcache: required` there is refused
+  `lmcache_unavailable:engine_unsupported`. Cause, in SGLang 0.5.22:
+  `mem_cache/registry.py` returns the plain radix cache under `disable_radix_cache`
+  before its LMCache branch, and `managers/scheduler.py` `is_fully_idle` then calls
+  `has_pending_cache_operations()` on it
+  ([sgl-project/sglang#45929](https://github.com/sgl-project/sglang/issues/45929)).
+  Other models SGLang disables its radix cache for are left to the
+  `engine_start_failed` fallback. LC7 as first written runs again on a SGLang release
+  with the fix.
+- **The `lmcache_off` detail.** A detail over its 512-character bound keeps its end
+  (marked `…`), so an engine log tail's last line, the error, is kept (it was lost in
+  LC7).
+- **LC4 part 3 (A12, finding 8).** The qualified parking table now compares the
+  checkpoint's real `config.json` `model_type` (read from local disk on the embedded
+  host; from the host's reported sizing or digest on a remote host, store schema v55
+  adding `model_type` to `checkpoint_sizes` and `checkpoint_digests`) and the GPU
+  product name hosts publish from `nvidia-smi` (`devices.<id>.product_name`). A
+  combination that does not match stays off and names both. Limits: a remote first
+  start before sizing plans off as "an unknown model type"; a revision frozen before its
+  host published product names shows an unknown GPU until it is applied again. The
+  released table is still empty, so every deep-parking deployment still runs without
+  LMCache.
+
+With the host setting `engine_telemetry` from `main` (#188, merged here; owner decision
+2026-10-22, ADR 0033 A7): `LMCACHE_TRACK_USAGE=false` is set in the server and in the
+engine with the connector whatever `engine_telemetry` says, and `DO_NOT_TRACK=1`
+follows the setting (set under `off`, the default; not set under `allow`, in the server
+too), so `allow` leaves the engine's own default and LMCache still reports nothing.
+Tests: the server's environment and the vLLM engine's under both settings, SGLang's
+render, the launcher's closed server environment (CPU only; not run live).
+
+Live rerun, host A (GB10), build `0e04823c` (both fix branches and `main` `67a09823`; not
+#188), Qwen3-4B (context 4096, KV cache 1 GiB, `restart_only` unless stated), standalone
+role, 2026-10-23 03:50–04:49 UTC; record `target/live/lmcache-rerun/spark-0292/rows.md`
+on the laptop:
+
+- **LC1, pass** (both engines): on; first charge pool + 1280 + 512 MiB (6,174,015,488 B);
+  measured overhead 821.6 MiB (SGLang) and 810.9 MiB (vLLM), device 408 and 406 MiB
+  (non-zero); the second launch charged pool plus the measured figures (5,584,244,736 B
+  and 5,570,973,696 B, `measured: true`); `/status` 5.23–5.86 s (bound 30 s); listeners
+  127.0.0.1 only; the server's environment `HOME`, `PATH`, `DO_NOT_TRACK=1`,
+  `LMCACHE_TRACK_USAGE=false`, and the engines with the connector carry both.
+- **Measured charge (finding 6), pass:** an independent 0.25 s sampling of VmRSS beyond
+  the pool and per-process `nvidia-smi` equals the recorded figures (SGLang exactly,
+  vLLM within 268 KiB).
+- **LC4, pass on vLLM:** park in about 1 s with the same server PID, server GPU 406 →
+  1430 MiB, parked charge 6,644,715,520 B (the Ready charge plus 1 GiB held KV); the wake
+  by request took 67.0 s and hit 3,328 tokens (13 keys) with the same answer, a new engine
+  beside the same server. SGLang's restart-park was not reported in this rerun.
+- **LC4 part 3, pass:** a `deep` deployment runs off `park_unqualified`, "not qualified
+  with deep park on SGLang 0.5.22 / qwen3 / NVIDIA GB10" (and "vLLM 0.32.0 / qwen3 /
+  NVIDIA GB10"), in status, JSON and the event.
+- **LC5, pass:** the role restarted with `retention: zero` stopped servers and engines
+  (PIDs gone), journaled `lmcache_off` `retention_zero` and relaunched both off; a later
+  stop and start stays off; core size 0; no server; `engine list` "off (retention_zero)".
+- **LC10, pass:** the same under `lmcache: off`, `host_off`, "turned off on this host"; a
+  later start stays off; `engine list` "off (host_off)".
+- **Egress, pass for LMCache:** `ss -tuanp` every 0.2 s over the role's process tree
+  (12,872 samples across start, requests, park, wake and stop on both engines): no
+  socket from an LMCache server or a connector engine off loopback. vLLM's own usage
+  report (`stats.vllm.ai:443`) left the host from every vLLM engine with LMCache off
+  (the `deep` deployment, and under `retention: zero` and host `lmcache: off`), since
+  that build rendered `DO_NOT_TRACK` only with the connector. #188, merged since, sets
+  `DO_NOT_TRACK`, `VLLM_DO_NOT_TRACK` and `VLLM_NO_USAGE_STATS` on every vLLM launch under
+  the default `engine_telemetry: off`; not yet checked live.
+- **The server's child (finding 7), pass, case not met:** Ready 11–18 min with 5 s polls
+  and requests and a 10 ms group watch over 13 servers: extra members appeared only in
+  the first 1.2 s after a server's start (the gate, a short fork on SGLang, `file` on
+  vLLM), each gone in 10–20 ms, before the listener check; no `lmcache-N` member was ever
+  recorded, no `lmcache_server_exited`, no instance failed. The fixed path (a member
+  exiting during the check or while Ready) did not occur live.
+- **Finding (fixed after this rerun, A13, below): KV still mapped after a vLLM wake.**
+  After a vLLM restart-park wake the server kept the old engine's KV mapped (1574 MiB of
+  GPU memory, Ready, at least 37 s) until the new engine's first storing request. The
+  measurement recorded it, so vLLM's device figure became 1,650,458,624 B and later
+  launches charge 6,795,710,464 B, about 1.14 GiB over the steady state; during that
+  window the Ready charge (device 406 MiB) was below what the server held.
+
+Fixed after the rerun (`fix/lmcache-wake-charge`; run live in the third rerun below), ADR
+0033 A13, on both engines (SGLang's restart-park goes through the same park and wake, and
+its servers held 1608–1656 MiB after their engine's exit):
+
+- **The charge after a wake.** A completed restart-park marks the launch's server as
+  holding the stopped engine's KV (store schema v56, `launch_lmcache.held_kv_state`).
+  The wake is charged its cold start plus that KV, and the Ready instance after it keeps
+  the KV in its charge until a GPU reading of the server below the engine's KV cache,
+  taken while Ready with nothing in flight, shows it released; then the reservation
+  moves to the Ready charge without it, journaled `lmcache_kv_released`. No timer ends
+  it; a host whose readings name no server process keeps it charged until the stop.
+  Status's `charge_bytes` includes it while held.
+- **The measurement.** From a restart-park's arm until that release reading, the
+  server's GPU readings are not recorded as its measurement (largest seen per revision),
+  embedded and from a host's load reports alike; the release reading is recorded. The
+  callers that skip samples no larger than the last (the embedded watch, a host's
+  samples) still send a reading below the held KV.
+- Tests: the wake keeps the held KV charged through an inflated reading and a missing
+  one, a low reading while parked releases nothing, the release reading lowers the
+  charge once and journals it, no reading in the window becomes the revision's figure,
+  and the next launch charges the steady one, on vLLM and on SGLang; the callers'
+  sample filter; the v56 migration. The restart-park round trip now expects the held KV
+  in the charge after the wake.
+- **The embedded SGLang wake (found live on `d2901204`).** An embedded SGLang
+  restart-park's wake failed in about 2 s, `sglang_startup_failed:
+  loopback_rendezvous_failed` (restore `wake_uncertain`, the server stopped by cleanup):
+  the park stopped the engine but left its rendezvous directory
+  (`<state>/rendezvous/<incarnation>`), and the wake's engine, of the same incarnation,
+  refuses one that exists. The embedded restart-park now removes it once the engine's
+  stop is verified, as a remote host's already did (only this user's own directory,
+  never through a symlink). Test: an embedded SGLang restart-park then restore starts a
+  new engine on the same server, the directory absent when it is spawned.
+
+Second live rerun, host A (GB10), build `d2901204` (before A13 and the SGLang wake fix),
+Qwen3-4B (context 4096, KV cache 1 GiB, `restart_only` unless stated), standalone role,
+fresh state, 2026-10-23 05:24–06:04 UTC; record `target/live/lmcache-rerun2/spark-0292/`
+on the laptop:
+
+- **LC4 on SGLang, fail at the wake.** The restart-park now passes (about 6 s, no
+  `park_refused`): engine PIDs gone, the same server PID, server GPU 408 → 1656 MiB,
+  parked charge 7,247,757,312 B (the Ready charge 6,174,015,488 B plus 1 GiB held KV).
+  The wake by request failed in about 2 s, `loopback_rendezvous_failed` (fixed above in
+  `a3b9cc48`, not yet run live). The parked reading also became the measurement (device
+  1,736,441,856 B), so the next launch charged 6,886,703,104 B while the server held 406
+  MiB of GPU memory: the SGLang case of the A13 finding.
+- **LC7 as amended, pass.** Clef-Flash (`api: decisions`, SGLang 0.5.22) runs off
+  `engine_unsupported` with the reason and the SGLang issue link in status, JSON and one
+  `lmcache_off` event; no LMCache server, launch settings without LMCache; decisions
+  served (0.77–0.80 s). With `lmcache: required` the deploy is refused, exit 5,
+  `lmcache_unavailable:engine_unsupported`, nothing created.
+- **`--disable-radix-cache` on SGLang, pass.** Off `engine_unsupported` with the event,
+  served, no server; `required` refused, exit 5, `lmcache_unavailable:engine_unsupported`.
+- **LC2 on SGLang, pass:** after three fillers the prompt hit 3,328 tokens (13 chunks) and
+  the answer equalled the `lmcache: off` deployment's fresh answer. SGLang 0.5.22's
+  temperature-0 output varied with the prefix cache's shape with and without LMCache
+  (the first cold answer, and the off deployment's own radix-cache hit), not an LMCache
+  effect.
+- **LC3 on SGLang, pass:** no hit across salt A, salt B and no salt; after the fillers
+  each hit 3,328 tokens with the same answer; LMCache's
+  `lmcache_mp_l1_write_chunks_total` shows 13 chunks under each salt's digest, equal to
+  §5's digest computed independently, and unsalted keys under `""`.
+- **LC8 on SGLang, pass:** SIGKILL to the recorded server 5 s into the start stopped the
+  engine (verified), relaunched it once without LMCache (served), one `lmcache_off`
+  `engine_start_failed`, the warning, `start --wait` exit 13; the next start planned
+  off. With `required` the launch failed `lmcache_unavailable:engine_start_failed` with
+  every recorded PID gone and nothing running.
+- **Egress, pass.** `ss -tuanp` every 0.2 s over the role's process tree: under the
+  default `engine_telemetry` (a `deep` vLLM deployment off `park_unqualified` Ready 20
+  min, and the SGLang rows; 6,729 samples) and under `retention: zero` (vLLM, 1,993
+  samples) nothing left loopback, vLLM engines carried `DO_NOT_TRACK=1`,
+  `VLLM_DO_NOT_TRACK=1` and `VLLM_NO_USAGE_STATS=1`, and vLLM wrote no usage file. Under
+  `engine_telemetry: allow` with LMCache on both engines (Ready 9 min, 14 requests, 2,964
+  samples) nothing left loopback and no process reached `stats.lmcache.ai`; the server
+  and every process importing LMCache had `LMCACHE_TRACK_USAGE=false` and none of the
+  other opt-outs. vLLM's own reporter ran under `allow` (its usage file was written) but
+  no `stats.vllm.ai` socket was caught; a short request can fall between 0.2 s samples,
+  for LMCache too.
+
+Third live rerun, host A (GB10), build `417a2643` (A13 and the SGLang wake fix), the same
+setup, fresh state, 2026-10-23 06:24–06:55 UTC, with a 0.5 s sampler of the footprint,
+`held_kv_state`, the measurement, the server's GPU memory and the journal; record
+`target/live/lmcache-rerun2/spark-0292/rows.md` on the laptop:
+
+- **LC4 on SGLang, pass.** Park in about 6 s, no `park_refused`; the same server PID, GPU
+  408 → 1656 MiB; the rendezvous directory of the incarnation removed (its root kept,
+  0700); parked charge 7,247,757,312 B (Ready plus 1 GiB), `held_kv_state` held, the
+  measured device figure unchanged (427,819,008 B). The wake by request took 86.6 s and
+  hit 3,328 tokens (13 keys) with the same answer, a new engine beside the same server.
+- **A13 on SGLang, pass.** The woken Ready instance stayed charged with the held KV
+  (charge 7,247,757,312 B) while the server held 1800 MiB; 31 s after Ready a 408 MiB
+  reading, with no request, released it, journaled `lmcache_kv_released`, and the charge
+  went back to 6,174,015,488 B.
+- **LC4 and A13 on vLLM, pass.** First cycle: the server's GPU fell to 240 MiB at the park
+  (the KV not kept this time) and the parked instance was still charged the 1 GiB; the
+  wake (62.0 s) hit 3,328 tokens with the same answer, and the first Ready reading
+  (406 MiB) released it at once, journaled. Second cycle: park with the server at 406 →
+  1430 MiB; the wake (62.4 s) hit 3,328 tokens with the same answer; Ready with the server
+  at 1574 MiB stayed charged 7,247,757,312 B for 52 s, then a 406 MiB reading, with no
+  request between, released it (journaled; 6,174,015,488 B). The measured device figure
+  stayed 425,721,856 B throughout, never the parked or woken reading.
+- **The next launch, pass:** SGLang charged 5,579,173,888 B (4 GiB + 856,387,584 +
+  427,819,008) and vLLM 5,565,747,200 B (4 GiB + 845,058,048 + 425,721,856),
+  `measured: true` (the same SGLang sequence on `d2901204` had charged 6,886,703,104 B).
+- **Egress, pass.** Under the default `engine_telemetry` (a `deep` vLLM deployment Ready
+  11 min and every LC4 run; 4,642 samples) and under `retention: zero` (1,668 samples)
+  nothing left loopback and vLLM wrote no usage file; vLLM engines carried the three
+  opt-outs and core size 0 under zero retention. Under `engine_telemetry: allow` with
+  LMCache on both engines (8 min, 2,536 samples) the one socket off loopback was vLLM's
+  own usage report (EngineCore to `stats.vllm.ai:443`, its usage file written the same
+  second), as `allow` intends; nothing from either LMCache server or the SGLang engine,
+  and nothing to `stats.lmcache.ai`; servers and engines carried
+  `LMCACHE_TRACK_USAGE=false` and no `DO_NOT_TRACK`.
+
+Still missing: LC1 through CapyCTL on a server and host pair (every row above ran on a
+standalone role); the decision-model allowance measurement, which waits for a SGLang
+release with the upstream fix.
+
+CPU and Fake-engine tests are not qualification.
+
+## LMCache 0.5.6 environments on host B — 2026-10-22 (branch `docs/lmcache-envs-host-b`)
+
+Owner approval 2026-10-22 (ADR 0033): host B gets byte-identical copies of host A's two
+LMCache environments, so the ADR 0033 LC rows can run on either host. No code changes;
+there are no tests. CPU and Fake-engine tests are not qualification.
+
+**Copies.** `rsync -a` from host A to host B over the direct link, same paths:
+
+- `~/vllm-0.32.0-lmcache-venv`: 70,203 files, 4 symlinks, 8,250 directories.
+- `~/sglang-0.5.22-lmcache-venv`: 89,994 files, 4 symlinks, 10,708 directories.
+
+For each environment, a manifest was computed on both hosts: the SHA-256 of every
+regular file, every symlink with its target, and every directory with its mode. Each
+manifest is identical on the two hosts (vLLM `adbeb70b7f0a…`, SGLang `ac50e7d84930…`).
+`rsync -a` does not keep hard links. On host A the SGLang environment shares hard-linked
+files with the vLLM one, so on host B it takes 9.0 GiB of disk instead of 4.9 GiB; the
+contents are the same.
+
+**Models.** Host B's `~/models/qwen3-4b-instruct` (Qwen3-4B-Instruct-2507) is the same
+checkpoint as host A's: its 13 checkpoint files have the same SHA-256 on both hosts. Only
+the `.cache/huggingface/` download metadata differs, and CapyCTL leaves that out of the
+checkpoint digest. Clef-Flash was not in host B's `~/models`, so host A's
+`~/models/clef-flash` was copied there. All 54 of its files, `.cache` included, have the
+same SHA-256 on both hosts.
+
+**Still to check on host B.** Host B was in use by other work, so nothing was run there:
+`import vllm, lmcache` and `import sglang, lmcache`, CUDA being available in each
+environment, and the LC rows. These wait until the owner says host B is free.
+
+## Engines no longer report usage off the host by default — 2026-10-22 (branch `feat/engine-telemetry-off`)
+
+Owner decision 2026-10-22: the engines' own usage reporting is off for every engine by
+default, and a host opts in. SPEC §13.3 (the closed engine environment) and ADR 0028
+§2.1 rule 1 (names CapyCTL owns) govern where it lands.
+
+What each engine reports, read from its own source:
+
+- vLLM (0.31.0, `vllm/usage/usage_lib.py`, `vllm/envs.py`): rank 0 posts the platform,
+  the model architecture and the engine settings to `https://stats.vllm.ai` when it
+  starts, and its id and runtime figures every ten minutes after, unless
+  `VLLM_NO_USAGE_STATS=1`,
+  `VLLM_DO_NOT_TRACK=1` or `DO_NOT_TRACK=1` (a set `VLLM_DO_NOT_TRACK` hides
+  `DO_NOT_TRACK`, so all three are set). 0.30.0 and 0.32.0 read the same three names
+  (their `usage_lib.py`, read on the lab hosts); there the report is made by the rank 0
+  worker (`v1/worker/gpu_worker.py`), which for one rank runs in the `VLLM::EngineCore`
+  process.
+- SGLang 0.5.22 (the published wheel's source): no usage reporting of its own, no usage
+  library and no tracking switch; its OpenTelemetry tracing needs an exporter the
+  launch asks for. The Hugging Face Hub library it imports turns its telemetry off
+  under `DO_NOT_TRACK=1` (`huggingface_hub/constants.py`, read in the vLLM and
+  TensorFold environments).
+- llama.cpp: no usage reporting in the v0.6.0 source. [INFERENCE] v0.7.0 the same.
+- TensorFold 0.6.6: no usage reporting; its GitHub release check was already off on
+  every launch (`--no-update-check`, `TENSORFOLD_NO_UPDATE_CHECK=1`) and stays off
+  whatever the new setting says.
+- Custom engines (ADR 0031): unknown programs; `DO_NOT_TRACK=1` as the general
+  convention.
+
+What changed:
+
+- A host setting `engine_telemetry: off | allow` (default `off`; standalone
+  `host.engine_telemetry`), role-local like `engine_logs`: it never reaches the
+  document deployments are resolved against, so no recipe or revision changes. Any
+  other value refuses the start by name. The host and standalone roles hand it to the
+  adapters when they start (`capyctl_adapters::engine_telemetry`), so it holds for
+  every launch, embedded and remote.
+- Under `off`, every launch environment gets `DO_NOT_TRACK=1`; vLLM also gets
+  `VLLM_DO_NOT_TRACK=1` and `VLLM_NO_USAGE_STATS=1`. That covers vLLM (group workers
+  too), SGLang, llama.cpp, TensorFold and custom engines. Under `allow` CapyCTL sets
+  none of them and each engine keeps its own default.
+- `DO_NOT_TRACK`, `VLLM_DO_NOT_TRACK` and `VLLM_NO_USAGE_STATS` are CapyCTL-owned
+  names: a profile, a deployment or a custom manifest that sets one is refused with
+  `engine_env_reserved:<name>`, whatever the approval says and whatever the case.
+  A custom profile whose manifest already set `DO_NOT_TRACK` is refused at its next
+  launch, as for any newly reserved name (ADR 0031 §2).
+- Docs: the settings reference (the owned names, the setting, the variables CapyCTL
+  sets), data retention (a "Nothing reported off the host" section) and the custom
+  engine environment in the engines guide.
+
+## Tests
+
+Each failed before the change (the names were absent or settable) and passes after:
+
+- `capyctl-adapters` `vllm::initialize` `usage_reporting_is_off_unless_the_host_allows_it`
+  (T21): a single-rank and a group-worker launch get the three vLLM opt-outs under
+  `off` and none under `allow`; `tests/vllm_initialize.rs`
+  `the_engine_environment_is_a_closed_allowlist` (T21) sees them in the spawned
+  environment.
+- `tests/sglang_initialize.rs`
+  `initialize_spawns_protected_waits_probes_and_reports_the_group` (T21): the spawned
+  SGLang environment carries `DO_NOT_TRACK=1`.
+- `tests/llamacpp_args.rs` `the_environment_is_closed`, `tests/tensorfold_args.rs`
+  `the_engine_environment_is_closed`, `custom::args`
+  `the_environment_is_closed_and_layered` and `tests/custom_adapter.rs` (T21):
+  `DO_NOT_TRACK=1` under `off`, nothing under `allow`, TensorFold's release check off
+  either way.
+- `engine_telemetry` `off_writes_the_opt_outs_and_allow_leaves_the_environment` and
+  `tests/engine_telemetry_host.rs` `the_role_setting_reaches_every_launch` (T21): the
+  role's setting reaches every launch and every opt-out is an owned name.
+- `capyctl-config` `tests/remote_roles.rs`
+  `engine_telemetry_defaults_to_off_and_stays_role_local` and `standalone`
+  `standalone_honours_engine_telemetry` (T21): `off` when omitted, `allow` accepted,
+  role-local, any other value refused with its path; `tests/engine_env.rs` (T21): the
+  three names are refused at the profile and the deployment level.
+
+CPU and Fake-engine tests are not qualification.
+
+## Live check (host A and host B, 2026-10-23)
+
+Release build of `58c1bf99` from a git archive on each host (the same binary sha256 on
+both). Each host had a standalone role on 127.0.0.1:38443 (management 37443) with a fresh
+state directory, a 108 GiB limit and an 8 GiB free reserve. `HOME` and
+`XDG_CONFIG_HOME` pointed into the run directory. The engines inherit that `HOME`: their
+caches and vLLM's usage file were written there, and neither host's own
+`~/.config/vllm/usage_stats.json` changed (same size, modification time and sha256
+before and after). Host A ran vLLM 0.32.0 and SGLang 0.5.22 on Qwen3-4B, and llama.cpp
+v0.7.0 on Qwen3-4B Q4_K_M. Host B ran the rest of step 3 on vLLM 0.30.0 with
+Qwen3-4B-Instruct-2507, because host A was needed for another run and vLLM 0.32.0 is
+installed only on host A. Context was 8192 everywhere. Environments were read from
+`/proc/<pid>/environ` for the three names only. The evidence is in
+`target/t188-live/` on the laptop.
+
+1. **The default sets the opt-outs: pass.** On host A, vLLM 0.32.0's API process and its
+   `multiprocessing` resource tracker showed `DO_NOT_TRACK=1`, `VLLM_DO_NOT_TRACK=1` and
+   `VLLM_NO_USAGE_STATS=1`. SGLang's entry process and its tracker showed
+   `DO_NOT_TRACK=1`, and so did `llama-server`. On host B, vLLM 0.30.0 showed the same
+   three.
+
+   Processes that rename themselves (`VLLM::EngineCore`, `sglang::scheduler`,
+   `sglang::detokenizer`) show none of the names, because setproctitle zeroes the
+   start of the area `/proc/<pid>/environ` reads. That is the first 728 to 733 bytes,
+   and the names that survive after it are the tail of the tracker's list, the three
+   names sitting at the head. EngineCore makes vLLM's report. Under the default it
+   wrote no usage file in its `HOME`; under `allow` the same process wrote one and
+   connected (step 3). That shows the names reach it.
+2. **No egress: pass.** On host A, `ss -tuanp` was sampled every 0.2 s over the role's
+   whole process tree, 77 PIDs including compile workers, from before the first
+   start (03:08:06 UTC) to 03:23:47. That is 11 min 52 s after vLLM was Ready
+   (03:10:53), 11 min 23 s after SGLang (03:12:24) and 11 min 21 s after llama.cpp
+   (03:12:26). There were 4685 samples and 22682 loopback socket observations. There
+   were no connections to anything else, and no listening or unconnected socket off
+   loopback. Each engine answered a request ("42").
+
+   On host B (vLLM 0.30.0, start to 22 s after Ready) a second watcher read the tree's
+   sockets every 20 ms, 12375 times. It found no resolver lookup and no connection
+   off loopback.
+3. **`allow`: pass.** The role was restarted with
+   `--set host.engine_telemetry=allow`, keeping the same state directory.
+   - **Host A (vLLM 0.32.0):** the API process and its tracker showed none of the three
+     names. vLLM wrote one report record to `<run-dir HOME>/.config/vllm/usage_stats.json`,
+     1473 bytes with the architecture, GPU and engine settings. It writes that record
+     just before it posts, so it attempted the report. The 0.2 s sampler saw no
+     connection, because the post is too short for it. The engine still served (200,
+     "42").
+   - **Host B (vLLM 0.30.0):** the 20 ms watcher caught the report. EngineCore looked up
+     a name through 127.0.0.53 at 03:37:08.39. It then opened a TCP connection to
+     `[2606:4700:3032::6815:58f5]:443`, an address `stats.vllm.ai` resolves to, at
+     03:37:08.55 (SYN-SENT, then ESTAB until 03:37:08.79). The usage file gained one
+     record and the engine still served (200, "42").
+   - **Restored `off` (host B):** the role was restarted without the setting. vLLM again
+     showed the three names, the usage file stayed at its one record, and neither
+     watcher saw anything off loopback.
+4. **Reserved names are refused: pass.** `capyctl engine add <vLLM venv>` with
+   `--env DO_NOT_TRACK=0`, `--env vllm_do_not_track=0` or
+   `--env VLLM_NO_USAGE_STATS=0`, and with `--approve-env DO_NOT_TRACK`, was refused
+   with `engine_env_reserved:<name>` (exit 2), and no profile was saved. A deployment
+   with `engine_config.env` setting `DO_NOT_TRACK` or `VLLM_NO_USAGE_STATS` (vLLM), or
+   `do_not_track` (llama.cpp), was refused at `deploy model` with `invalid_config` at
+   `engine_config.env: engine_env_reserved:<name>`.
+
+Not run: a TensorFold launch and a custom launch under the default (optional).
+
+## SGLang: a cancelled request is aborted by its ID and settles on proof (ADR 0032) — 2026-10-22 (branch `feat/sglang-request-abort`)
+
+Implements [ADR 0032](../design/adr/0032-cancelled-request-settlement.md) (owner decisions
+of 2026-10-21) and its SPEC text: §10 (two amendments and the note of 2026-10-19), §13.1
+and §20 T17.
+
+## The request ID as `rid`
+
+A launch is capable when its engine is SGLang at exactly 0.5.22 (the registered
+version, from the profile's build fingerprint, never the adapter's descriptor contract)
+with one tokenizer worker (`capyctl_adapters::sglang::request_abort_supported`), and, for
+a remote instance, when the host's session declares the new `request_abort` capability.
+On a capable lane every chat request carries CapyCTL's request ID (the
+`X-CapyCTL-Request-Id` value, the first lease's ID, kept across failover offers; never the
+caller's `X-Request-Id`):
+
+- on the router's machine the forwarder adds `"rid"` to the JSON it sends the engine,
+  after the caller's body passed validation, so a caller's `rid` is still refused;
+- to a host the router sends it as the `X-CapyCTL-Request-Id` header. The ingress refuses
+  a value that is not one canonical ULID (400, before the engine), never forwards the
+  header, and sets `rid` only on chat to a capable launch.
+
+Decisions never carry it. SGLang returns the ID as the answer's `id`, which is kept.
+
+## Abort and keep reading
+
+On a capable lane a cut (client hang-up, a failed, slow or oversized delivery, the request
+deadline before the first output, the stream idle bound after it), streamed or collected,
+settles the lease `cancelling` as before, with the same answered flag, and the cut client
+gets its answer as before. The router then keeps polling the same engine response with a
+sink that delivers nothing, asks the engine once to abort the `rid`, and bounds the rest
+of the read by `queue.stream_idle_timeout` from the abort
+(`crates/capyctl-router/src/stream.rs`, `AfterCut`). If the response ends with its final
+output read whole (a finish chunk then `[DONE]`; on a capable lane the parser accepts
+SGLang's graceful `finish_reason: "abort"`), the lease is acknowledged by its own ID:
+`LeaseWrite::AcknowledgeCancelled` closes that one cancelling lease of the current session
+and journals `request_cancellation_acknowledged` (count 1, receipt "the engine finished
+this request after it was asked to abort it; request lease <ID>") in the same
+transaction. Anything else (the abort not sent, the bound passed, an error event, a
+truncated or unreadable end) drops the response, which closes the engine connection, and
+leaves the lease to the rules before it. The role log records `router_request_abort`
+(the cut and whether the abort was sent) and `router_abort_settled` (acknowledged or the
+fallback's reason, with the time since the abort). Lanes without the capability behave
+exactly as before.
+
+The abort is `POST /abort_request {"rid": …}` on the engine's loopback port with the
+launch's admin key (CapyCTL starts SGLang with both keys, and SGLang 0.5.22 then accepts
+only the admin key there), bounded at 3 s; its 200 is never evidence (`cancel_work`
+reports `Uncertain`). On the router's machine the coordinator calls the SGLang adapter's
+`cancel_work`; on a host it sends the new `AbortRequest` member action (field 19), which
+the agent runs only against the launch it retains: the same member, deployment, profile
+and exact generation, claim held, launched, ready, not parked, the same live engine
+group, and a capable launch. The agent does not journal it (one row per cancelled request
+would grow without bound, and a repeated abort is harmless); a refusal or a failed post
+never ends the session. At most 2 aborts are in flight per host; a third is not sent and
+its request falls back.
+
+## Restart when full
+
+When a durable grant is refused as full, the router asks the authority whether the
+deployment's requests are all held until the next stop. In one transaction the store
+checks that the open lease rows have reached the limit of 32 and that every one is an
+in-flight cancellation of the current session held until the next stop (cancelled before
+the engine answered, or on a custom engine with no idle signal), with no live or
+uncertain row. If so, for each instance holding them that is not already stopping, it
+accepts an ordinary verified stop (principal `system:held_requests`, idempotency key
+`held-restart:<index>:<generation>`), marks the instance's start pending (the same
+reconciliation a revision restart uses), and journals `instance_restarted_for_held_requests`
+(deployment, stop operation, instance index, generation, count). The stop's existing
+verified-exit cleanup settles the held requests with its receipt; a stop that cannot
+verify the exit keeps them. The router waits for the instance through the existing
+activation wait, within the request's deadline, and offers the request again; a full
+bound that is not all held answers `queue_full` as before. The trigger is the count,
+never a timer.
+
+## Tests (T17)
+
+CPU and Fake-engine tests are not qualification.
+
+- Adapters: `the_request_id_reaches_the_engine_only_as_its_lane_says`,
+  `an_abort_finish_is_a_final_output_only_where_the_id_was_sent`,
+  `cancel_work_posts_abort_request_with_the_admin_key_and_stays_uncertain`.
+- Router (`router_core.rs`): `capyctl_request_id_reaches_only_a_capable_sglang_lane`; a
+  stream hang-up, a collected hang-up, a deadline cut and an idle cut on a capable lane
+  each abort once with the request's ID and settle on their own final output; an error or
+  truncated end, an abort that never ends (closed at the bound) and an abort not sent
+  (engine connection closed at once) are not acknowledged; a lane without the capability
+  is not aborted; a full bound of held requests restarts and the request waits (with and
+  without an instance view); a full bound not held answers `queue_full`.
+- Store: an acknowledgement closes exactly that cancelling lease and journals it, also a
+  lease held until the next stop, and leaves uncancelled, settled, uncertain and
+  other-session leases alone; 31 held requests restart nothing, 32 restart the instance
+  once, an uncertain or a live lease keeps the restart from triggering, an instance
+  already stopping is not stopped again, and the restart's verified exit settles the held
+  requests and starts the instance again (an unverified exit keeps them).
+- Controller: only SGLang 0.5.22 with one tokenizer worker aborts (0.5.21 and two workers
+  do not); `abort_request` reaches the lane's driver with the request ID (a vLLM lane
+  sends nothing); the authority acknowledges one cancelled request by its lease; held
+  requests filling the limit restart the instance, which serves again, and below the
+  limit or beside live work nothing restarts; a request abort is sent only to a host that
+  declared it (version skew), an `attempted` answer is not redelivered, and the per-host
+  cap holds.
+- Protocol: `AbortRequest` round-trips and names one canonical ULID; its results name
+  their launch only; it needs its capability.
+- Agent: the head posts an abort for its retained capable launch only, with the admin key
+  on loopback, and refuses an unknown handle, a forged deployment, the next generation,
+  another member, a passed deadline and a terminated launch; chat through the ingress
+  gets `rid` and no ID header reaches the engine; SGLang 0.5.21 is refused and gets no
+  `rid`; the ingress sets `rid` from a valid header only on a capable chat launch.
+
+## Live (host A, SGLang 0.5.22, 2026-10-22)
+
+The binaries were built from `8df7a399`: host A built its own from the synced tree, and
+the control host's server binary came from the snapshot before the rebase, whose
+`crates/` and `Cargo.*` are the same. The standalone rows used a fresh state directory
+with `managed_limit` 108 GiB and `free_reserve` 8 GiB. The chat model is Qwen3-4B-Instruct.
+Gauges are `sglang:num_running_reqs` and `sglang:num_queue_reqs`, read from the engine's
+loopback `/metrics` every 50 ms. Times are the router's `router_abort_settled`
+`elapsed_ms`, which runs from the router asking for the abort to the settlement.
+
+- **L1, passes (criterion clarified 2026-10-22: within one decode step of the abort
+  reaching SGLang's scheduler; from CapyCTL's request, at most two steps plus the request
+  to the engine; see ADR 0032).** Standalone,
+  context 8192. 4 background streams kept the engine busy, and a fifth (the victim) hung
+  up mid-stream, 8 times in all.
+  - Every victim was acknowledged by its own ID 66–78 ms after the abort (68, 78, 75, 74,
+    66, 76, 77, 76 ms).
+  - The engine took 38.8 ms per step with 5 requests running (5 / 128.8 tokens/s, the mean
+    of 23 decode-batch lines), so settling took 1.7–2.0 steps after the router asked.
+  - Between each hang-up and the end of the background traffic, running + waiting never
+    read below 4.
+  - In the 7 runs with the longer victim (120–200 chunks), the running count went from 5
+    to 4. In the first run the victim hung up after 8 chunks, before any batch report
+    counted it.
+  - 40 `request_cancellation_acknowledged` events, one per lease (8 victims and the 32
+    background streams cut at the end), and no lease left open.
+  - Where those 66–78 ms go was measured afterwards; see "L1: when the abort reaches the
+    scheduler" below.
+- **L2, passes.** Standalone, `queue.request_deadline` 240 s. A 90 s deadline cannot be
+  used: `timeouts.initialize` may not exceed it, and the SGLang start did not fit in 90 s
+  (`launch_failed`, the engine was cleaned up). The deployment ran 1 request at a time,
+  context 32768. A blocker streamed up to 24000 tokens, and the victim, sent 0.10 s
+  after it:
+  - waited in SGLang's queue (gauges: 1 running, 1 waiting from 1.2 s to 241.8 s);
+  - was cut at its deadline with no output (stream headers, 0 chunks, then the end);
+  - was aborted and acknowledged by its ID 42 ms after the abort, against a stream idle
+    bound of 120 s. The waiting count went to 0 while the blocker still ran.
+
+  The collected variant was not run.
+- **L3, passes.** A server on the control host, with host A as its host: the harness's
+  `normal` host policy, the ingress on port 9443 and the same model. The victim and 4
+  background streams went through the server's endpoint, 3 times; gauges were read over an
+  SSH forward to the engine's loopback port.
+  - Each answer's `id` was the response's `X-CapyCTL-Request-Id`: the ingress set `rid`.
+  - Each abort was sent (`sent: true`: the agent's `AbortRequest` answered within its
+    bound), and the lease was acknowledged on the final output relayed through the
+    ingress, 79, 92 and 76 ms after the abort.
+  - Running + waiting never read below 4, and the running count went from 5 to 4.
+  - 15 acknowledgements (3 victims, 12 background streams) and no lease left open.
+  - The host ran without engine logs, so the engine's own record of `/abort_request` was
+    not captured.
+- **L4, passes.** Standalone, a decisions deployment of Clef Flash (context 8192). One
+  decision with this state took 1.74 s (8185 input tokens). 32 decisions were sent and all
+  hung up 1.0 s later, before any answer. The 33rd was sent 3 s after the hang-ups.
+  - Within 35 ms the store accepted a stop and journaled
+    `instance_restarted_for_held_requests` (count 32, generation 1).
+  - On the verified exit, `request_cancellation_acknowledged` settled all 32 with the
+    receipt "cancelled before the engine answered; stop operation … verified the exit of
+    the instance's process group".
+  - The instance started again 6.3 s after the stop.
+  - The 33rd request was answered 200 by the restarted instance (a new binding) 140.2 s
+    after it was sent; its own time to response was 1.71 s. No lease was left open.
+
+Host A was cleaned afterwards: no role, engine or listener left, and the run
+directories, the synced tree, and this session's `/tmp` and `/dev/shm` entries (65, the 6
+per-launch `sglang_loads_*.shm` included) were removed.
+
+## L1: when the abort reaches the scheduler (host A, 2026-10-22)
+
+L1 was run again from `5bc0668a` with the same setup (standalone, fresh state, 108 GiB /
+8 GiB, Qwen3-4B-Instruct, context 8192, 4 background streams, a victim that hangs up after
+120 chunks), 8 runs after one trial run, with timestamps on both sides of the abort. No
+CapyCTL code, protection or engine environment was changed:
+
+- **SGLang's side**, from its own logging. The profile set `SGLANG_LOG_MS=1` (millisecond
+  log times) and `SGLANG_LOG_FORWARD_ITERS=1` (step numbers) with `capyctl engine add
+  --env`. The deployment's `extra_args` set `--decode-log-interval 1` (one line per decode
+  step, written when the scheduler has the step's result) and
+  `--enable-request-time-stats-logging` (a line when the scheduler sends a request's final
+  output). The role ran with `--debug-engine-logs`, whose debug level makes the scheduler
+  log `Abort running request` when it applies the abort. A `sitecustomize` hook is not
+  possible: profile and deployment environments refuse every `PYTHON*` name.
+- **CapyCTL's side**, from the role's event lines, each stamped with the wall clock as it
+  arrived. The ask is the `router_abort_settled` stamp less its `elapsed_ms`.
+  `router_request_abort` is written when the engine has answered the abort's POST, and
+  SGLang's tokenizer manager answers only after handing the abort to the scheduler, so it
+  bounds the tokenizer manager's receipt. The tokenizer manager logs nothing of its own,
+  and the HTTP access log has whole seconds, so the receipt is bounded, not stamped.
+
+Times are good to about 1 ms. SGLang ran its default overlap scheduler, which starts step
+N+1 before it processes step N's result. Steps below are the median decode step of the
+second before the abort, 37.0–38.0 ms with 5 requests running. Per-step logging did not
+slow the engine (38.8 ms before).
+
+| Run | Ask → scheduler | Scheduler → final output | Step that carried it | Within one step | Ask → settled |
+|---|---|---|---|---|---|
+| 1 | 31.8 ms (0.86 steps) | 38.0 ms (1.03 steps) | 38 ms | yes | 75 ms |
+| 2 | 34.4 ms (0.93) | 38.0 ms (1.03) | 38 ms | yes | 76 ms |
+| 3 | 35.1 ms (0.94) | 38.0 ms (1.01) | 38 ms | yes | 85 ms |
+| 4 | 31.3 ms (0.85) | 38.0 ms (1.03) | 39 ms | yes | 74 ms |
+| 5 | 31.1 ms (0.83) | 37.0 ms (0.99) | 38 ms | yes | 74 ms |
+| 6 | 33.7 ms (0.90) | 37.0 ms (0.99) | 38 ms | yes | 89 ms |
+| 7 | 28.3 ms (0.75) | 37.0 ms (0.99) | 38 ms | yes | 69 ms |
+| 8 | 34.6 ms (0.91) | 37.0 ms (0.97) | 39 ms | yes | 76 ms |
+
+- The engine answered the abort's POST 1.5–4.7 ms after the ask.
+- The abort then waited for the step in progress. In every run the scheduler applied it
+  0–1 ms after that step's result, with exactly one step ending in between.
+- The final output left with the result of the next step: the one the overlap scheduler
+  had already started. Measured from when the scheduler applied the abort, that took 37–38 ms,
+  never longer than that step (38–39 ms). Each run settled within one decode step of the
+  abort reaching the scheduler (the trial run too: 28.8 and 39.0 ms).
+- From the ask to the final output leaving the scheduler took 65.3–73.1 ms. The router
+  settled 3.6–18.3 ms after that, 69–89 ms after the ask. The two slowest runs (85 and
+  89 ms) spent that extra time after the engine's scheduler, not in it.
+- The asks came 2.9–9.7 ms after a step ended because the victim hangs up just after a
+  chunk, and chunks leave at step ends. That is why the wait for the scheduler was close to
+  a whole step each time. [INFERENCE] A cut at any other moment waits 0–1 step, so from
+  CapyCTL's ask the final output takes 1–2 steps plus the HTTP hop.
+- 45 `request_cancellation_acknowledged` (9 victims, 36 background streams) and no lease
+  left open. Host A was cleaned the same way as before: role, engine, listeners, the run
+  directory, the synced tree and the 11 `/tmp` and `/dev/shm` entries the launch left
+  were removed.
+
+## SGLang: a failed launch leaves no shared memory behind — 2026-10-22 (branch `fix/sglang-shm-cleanup`)
+
+Found live in the live-017 recheck on host A (SGLang 0.5.22): with the scheduler
+SIGKILLed during the weight load, the launch failed promptly and nothing it started kept
+running, but `/dev/shm/sglang_loads_*.shm` was left behind. `/dev/shm` is RAM. SGLang's
+scheduler creates that file (its load snapshot, `managers/load_snapshot.py`) and maps it,
+and SGLang never removes it outside its own CI sweep; segments made through Python's
+`multiprocessing.shared_memory` are removed only by the resource tracker, which the
+entry's cleanup kills with everything else (SPEC §13.2: the entry ends every process it
+started, verified gone).
+
+`runtime/sglang_entry.py` now watches `/dev/shm` while `launch_server` runs and claims the
+files that are the launch's on evidence, never on a name pattern: a file is claimed only
+if it appeared after the launch began and, when first seen, the entry or one of its
+descendants held it open or mapped (read from `/proc/<pid>/fd` and `/proc/<pid>/maps`).
+When the launch fails, the entry claims once more while the processes still run, ends
+them as before (frozen, killed, and `/proc` read again until none runs), and only then
+removes each claimed file that is still the same file (device and inode), owned by this
+user with no group or other access, and held by no live process other than the exiting
+entry. Every process the user can inspect is checked. A process `/proc` hides
+(non-dumpable) keeps every file only when it is alive and in the entry's process group,
+where it could be one of the launch's own; found live, the user's SSH sessions and
+service manager hide theirs, and so do the entry's own zombie children, and a zombie
+holds nothing. A segment that existed before the launch, one another process made
+during it, and one a process outside the launch still maps all stay. The watch lists
+the directory every 0.25 s, so a file whose creator ended within that time of making it
+is not claimed and stays. A launch that serves is not affected: its stop is unchanged.
+
+Found on host A and not changed here: SGLang never removes its load snapshot file, so
+[INFERENCE from its source] every SGLang launch, a normal stop included, leaves one
+`sglang_loads_*.shm` (16 KiB) behind; host A held 38 of them from 2026-10-17 to
+2026-10-22, with 31 multiprocessing `sem.mp-*` semaphores (32 bytes each) of the same
+period whose source was not traced. A stop kills the whole process group, the entry
+included, so nothing in the entry runs after it.
+
+## Tests
+
+- `runtime/tests/test_sglang_startup_death.py`,
+  `test_a_failed_launch_removes_the_shared_memory_it_left` (T12): a stub SGLang scheduler
+  creates and maps a `sglang_loads_*.shm` file as SGLang 0.5.22 does, creates a
+  `multiprocessing.shared_memory` segment, maps a segment made before the launch, and
+  makes one more that a process outside the launch (detached into its own session) maps;
+  the test makes another segment of its own during the launch and then SIGKILLs the
+  scheduler. The launch fails with `engine_launch_failed` as its last line, the load
+  snapshot file and the multiprocessing segment are gone, and the other three remain.
+  Before the fix the load snapshot file remained. During the launch a non-dumpable
+  process outside the entry's process group runs too; it does not keep the files (with
+  the first version of this change, which let any hidden process of the user keep them,
+  this failed).
+- `HiddenHolderTests` (T12): a non-dumpable process in the caller's process group makes
+  the holder check uncertain, the same process outside the group does not, and once it
+  is a zombie it does not either.
+
+CPU and Fake-engine tests are not qualification.
+
+## Live check (host A, SGLang 0.5.22)
+
+Release build of this branch at `18dd5f0d`, standalone role on 127.0.0.1:38443 with a
+108 GiB limit and an 8 GiB free reserve, Qwen3-4B-Instruct-2507. The scheduler was
+SIGKILLed after `Load weight begin` and before `Load weight end`, picked from the
+recorded entry's process group after its pid, start ticks and boot id were checked.
+Two runs: the launch failed as `launch_failed` 2.48 s and 2.37 s after the kill, the
+process group was empty, the binding was released with no reservation left, and the
+engine log ended with the `engine_launch_failed` line. The load snapshot file the
+launch made was in `/dev/shm` just before the kill and was gone after; no new
+`/dev/shm` entry was left. A first build, whose rule let any hidden process of the
+user started after the entry keep the files, left the file: diagnostic lines showed
+the entry's own zombie detokenizer, then SSH (tailscaled) and systemd user processes,
+as the hidden processes. The evidence is in `target/live/sglang-shm-cleanup/` on the
+laptop.
+
+## LMCache 0.5.6 environments on host A and the LC1 measurements — 2026-10-22 (branch `docs/lmcache-envs`)
+
+Owner approval 2026-10-21 (ADR 0033): two new environments on host A, now made. ADR 0033
+§6 asks LC1 for the server's overhead beyond its pool, its GPU memory and its start time;
+these were measured with LMCache and the engines run directly, without CapyCTL. This is
+not the LC1 row: LC1 through CapyCTL is still needed. No code changes; there are no
+tests. CPU and Fake-engine tests are not qualification.
+
+**Release.** LMCache 0.5.6 (PyPI, 2026-10-15) is the newest 0.5.x release and the only
+one at or above the 0.5.6 floor. It passes `cache_salt` to the server on both engines:
+
+- SGLang, unified path: in `lmcache/integration/sglang/unified_lmcache_mp_connector.py`,
+  `_create_key` (lines 600–624) builds `IPCCacheServerKey(cache_salt=operation.cache_salt)`
+  for both lookups (`submit_lookup`, 626–641) and stores (`submit_store`, 1018–1038);
+  `build_cache_salt` (453–459) uses the salt alone, or the SHA-256 of the salt and
+  SGLang's extra key when the request has one. SGLang 0.5.22's
+  `lmcache_unified_radix_cache.py` passes `req.cache_salt` (lines 853 and 946).
+- vLLM: `lmcache_mp_metadata.py:85` takes `request.cache_salt`; `lmcache_mp_connector.py`
+  passes it on retrieve (924, 936), store (1003, 1017) and lookup (1298, 1370, 1456).
+- Server: `ipc_key_to_object_keys` (`lmcache/v1/distributed/api.py:608–649`) copies the
+  salt into every `ObjectKey`.
+
+SGLang 0.5.22 declares `enable_lmcache` and `lmcache_config_file` in
+`sglang/srt/arg_groups/fields/memory.py`, not in `server_args.py`. The legacy
+`sglang_adapter.py` and `multi_process_adapter.py` are still in the 0.5.6 package.
+
+**Environments.** Each was made with its base's recipe (`uv venv --python 3.12 --seed
+--managed-python`), constrained to the base environment's exact package list. Before
+LMCache was added, the vLLM one matched its base exactly and the SGLang one differed only
+in its seeded pip:
+
+- `~/vllm-0.32.0-lmcache-venv`: `uv pip install vllm==0.32.0 --torch-backend=cu130`,
+  then the `lmcache==0.5.6` aarch64 wheel. That wheel is built against torch 2.13.0,
+  which is vLLM's torch.
+- `~/sglang-0.5.22-lmcache-venv`: `uv pip install --prerelease=allow sglang==0.5.22`,
+  then the build requirements (`ninja`, `setuptools<81`, `setuptools_scm`,
+  `grpcio-tools==1.78.0`, `wheel`), then `lmcache==0.5.6` built from its source archive
+  against torch 2.14.1+cu130 (`--no-build-isolation --no-binary lmcache`, CUDA 13.0
+  `nvcc`, `sm_120` code).
+
+Both import and see the GPU; torch, vLLM and SGLang did not change. LMCache's bounds
+moved numpy 2.3.5 to 2.2.6, protobuf 7.x to 6.33.6, grpcio to 1.78.0,
+OpenTelemetry 1.45.1 to 1.40.0 and prometheus-client 0.26.0 to 0.24.1. In the SGLang
+environment they also moved setuptools 84.0.0 to 80.10.2 and fastapi 0.143.3 to 0.141.1.
+
+**Measurements**, host A (GB10), Qwen3-4B. Every server ran as `lmcache server --host
+127.0.0.1 --port P --transport zmq --http-host 127.0.0.1 --http-port H --l1-size-gb
+{4,8} --eviction-policy LRU`. vLLM 0.32.0 connected through `LMCacheMPConnector` by
+module path with autostart off; SGLang 0.5.22 used `--enable-lmcache` with a file of
+`mp_host` and `mp_port`. Engine KV caches were held to about 7k tokens so that 3,000-token
+prompts pushed earlier prompts out of the engine's own prefix cache.
+
+- The server's resident memory beyond its pool was 781–794 MiB when ready, 801–814 MiB
+  with an engine connected, and 807–824 MiB after the pool filled past its size and LRU
+  evicted. It was the same for 4 GiB and 8 GiB pools. The maximum was **824.3 MiB**.
+- The server's GPU memory (nvidia-smi, per process) was 170 MiB alone and 406–408 MiB
+  with an engine connected. The maximum while an engine was up was **408 MiB**.
+- From start to `GET /status` 200 took 2.90–4.80 s over 20 starts (5 per environment
+  and pool size), and 3.1–3.8 s in the engine runs. The slowest was **4.80 s**.
+- Only `127.0.0.1` was listened on, on both ports. SIGTERM stopped the server in
+  1.8–6.7 s in 25 of 27 stops, and in 12.8 s and 13.7 s in the other two.
+- **Allowances (ADR §6):** overhead 824.3 × 1.25 = 1030 MiB, rounded up to **1280 MiB**;
+  device 408 × 1.25 = 510 MiB, rounded up to **512 MiB**; start bound 4.80 s × 3 = 14.4 s,
+  raised to the 30 s minimum, so **30 s**.
+- On GB10, per-process GPU memory is not counted in RSS but does come out of
+  MemAvailable: allocating 2 GiB on the device left RSS unchanged and lowered
+  MemAvailable by 2,096 MiB; 2 GiB of pinned host memory raised RSS by 2,049 MiB and
+  left the GPU figure unchanged. On a unified-memory machine the server therefore costs
+  its pool plus its RSS beyond the pool plus its GPU memory, with no overlap: at most
+  1,232 MiB was measured, and the two allowances together give 1,792 MiB.
+- On both engines, a prompt held by LMCache but no longer in the engine's prefix cache
+  hit for 2,816 of its 3,000 tokens (11 chunks of 256), and none of them came from the
+  engine's own cache. SGLang reported `storage: 2816, storage_backend: LMCache, device: 0`;
+  vLLM reported a prefix cache hit rate of 0% and an external hit rate above 0%.
+- The same prompt sent under salt A, then salt B, then with no salt never hit LMCache.
+  Sent again under A, and then under B, after the engine had evicted it, it hit for
+  2,816 tokens each time. The server's own `ObjectKey`s carried
+  `cache_salt='lc1-salt-A'` and `'lc1-salt-B'`, with the same chunk hash but as separate
+  objects. Its `lmcache_mp_lookup_hit` counters were labelled by salt.
+- After its engine exits, the server keeps that engine's KV cache allocated through CUDA
+  IPC. Its GPU memory rose to 1,430 MiB on vLLM (1 GiB of KV) and 1,656 MiB on SGLang,
+  and was unchanged 92 s later. When a new engine connected to the same server (as on a
+  `restart_only` wake), the figure dropped back to 406–408 MiB, so the server does not
+  hold two engines' KV caches at once. The new engine hit, for 2,816 tokens, on prompts
+  the first engine had stored. Until the server stops or another engine connects, a
+  stopped engine's KV memory is not freed (ADR §7 parking and LC4).
+- 0.5.6 defaults to `--l1-use-lazy` with `--l1-init-size-gb 20`. The pools measured
+  here (4 and 8 GiB) were therefore allocated in full at start. A pool above 20 GiB
+  would start at 20 GiB and grow, unless `--no-l1-use-lazy` is passed.
+- Every server that had an engine connected left a 0600 `/dev/shm/cuda.shm.<uid>.<pid
+  hex>.1` file (80 KiB, created by the CUDA driver) after its SIGTERM exit. Servers that
+  never had an engine left nothing. No segment with an LMCache name appeared.
+
+Evidence is in capyctl `target/live/lmcache-lc1/` (harness, logs, JSON results,
+`summary.txt`). Host A was cleaned afterwards; the two environments were kept.
+
+Live check still needed: LC1 through CapyCTL (the defaults above as the implementation
+renders them), and LC2–LC11.
+
+## Prompt hang-up record before the first token; SGLang startup failure line last — 2026-10-22 (branch `fix/live-017-findings`)
+
+Two findings of the live-017 run on host A (SGLang 0.5.22, release build of
+`466b6fa8`), both fixed here.
+
+## A stream hung up before its first token
+
+Found live: a streamed request queued in SGLang behind a streaming request was
+hung up before its first token, and CapyCTL counted it as cancelling only about
+10 s later. The 10 s was the run's own pause before it hung up the request
+ahead: SGLang started the queued request only then, and its first chunk was
+when the router noticed. The router learned of a stream's hang-up only when it
+next delivered a chunk to the client and the delivery failed (SPEC §10). After
+the first token chunks come continuously, so that was prompt; before it there
+was nothing to deliver, so the engine connection stayed open, the engine kept
+the request queued, and its cancellation was recorded only when the engine
+produced a first chunk, however long that took. The client's own connection
+was closed at once: hyper drops the response body when the client goes, and
+that was not watched.
+
+`crates/capyctl-router/src/stream.rs` now races each attempt's forward against
+the response body's channel closing: when the client goes, the forward is
+dropped at once, which closes the engine connection, and the attempt ends as
+`Cancelled`. A forward whose end is ready at the same moment still ends with
+that end (the race is biased toward it), as for collected requests (#180).
+Nothing about settlement changed: a request hung up before the engine's first
+token is cancelling as unanswered and settles only on its instance's verified
+stop; one hung up after it settles on the engine's idle reading. A request
+through a host's ingress already closed its engine connection when the router's
+went away (the ingress relays the engine's body directly).
+
+## SGLang's failure line was not the log's last
+
+Found live: with the scheduler SIGKILLed during the weight load, the launch
+failed promptly (#181), but the engine log tail ended with five lines after
+`sglang_startup_failed: engine_launch_failed`: `Exception ignored in:
+ResourceTracker.__del__ … ChildProcessError: [Errno 10] No child processes`.
+The entry's cleanup reaps every child it ended, multiprocessing's resource
+tracker included (a child of the entry, started when SGLang spawns its first
+process). At interpreter exit the tracker object's finalizer then waited for
+its process again; Python 3.12 (3.12.13 here, 3.12.14 on host A) raises
+`ChildProcessError` there and prints it, while 3.14 ignores it silently.
+
+`runtime/sglang_entry.py` now has the tracker stop itself before the entry
+reaps the rest: once every descendant is killed, `_reap` calls the tracker's
+own `_stop`, which closes its pipe and reaps its process, so its finalizer at
+exit has nothing to do. The verified-exit cleanup is unchanged: the tree is
+frozen, killed and read again until `/proc` shows none of it running, and only
+then does the entry write its failure line and exit.
+
+## Tests
+
+- `runtime/tests/test_sglang_startup_death.py` (T12) now asserts that the
+  failure line is the last line of the entry's stderr, and that the resource
+  tracker's pipe is closed after `main` returns (so the finalizer has nothing
+  to wait for on any Python). Before the fix it failed under Python 3.12.13
+  (the five `ChildProcessError` lines followed the failure line) and under
+  3.14.7 (the tracker's pipe was still open); after it, it passes under both.
+- `crates/capyctl-router/tests/router_core.rs`,
+  `a_stream_hung_up_before_the_first_token_closes_the_engine_connection` (T17
+  T38): a held engine, with no response head and with a head and an opening
+  chunk; the streamed client hangs up before any token, the engine sees its
+  connection close within 2 s (well inside the 15 s between SSE keep-alive
+  comments), the lease ends cancelling as unanswered and the in-flight slot is
+  released. Before the fix the engine connection stayed open (failed at the
+  2 s bound); after it, it closes at once.
+- `crates/capyctl-router/tests/stream_safety.rs`: the transitional test
+  `a_backend_that_completes_after_a_hang_up_releases_on_completion` assumed the
+  router waits for a forward after its client has gone, which it no longer
+  does; it is replaced by `a_hang_up_before_the_first_token_drops_the_forward`,
+  which checks that a hang-up drops a forward that has produced nothing, and
+  that without a ledger the slot stays charged.
+
+CPU and Fake-engine tests are not qualification.
+
+## Live recheck
+
+On host A on 2026-10-22, with a release build of this branch at `90071793`
+(before its rebase onto #182, which changed only docs), the approved SGLang
+0.5.22 environment, Qwen3-4B-Instruct-2507 BF16, and a standalone role set up
+as in the live-017 run (managed limit 108 GiB, free reserve 8 GiB, engine logs
+not in debug mode).
+
+- **Scheduler SIGKILL during the weight load:** sent to `sglang::scheduler`
+  after `Load weight begin` and before `Load weight end`, its pid taken from
+  the recorded entry's process group after checking the entry's pid, start
+  ticks and boot id. The resource tracker was a member of that group. The
+  launch failed 2.31 s later as `launch_failed`; the process group was empty
+  at 2.23 s, the binding was released and no reservation was left. The engine
+  log's last line is `sglang_startup_failed: engine_launch_failed (…)`; no
+  `ResourceTracker` or `ChildProcessError` line and no `FileNotFoundError`
+  appear in it.
+- **Streamed hang-up before the first token** (two runs): a deployment with
+  `max_concurrent_requests: 1`, a streaming blocker, and a streamed victim
+  waiting in SGLang's queue (running 1, waiting 1) with no body byte received.
+  The victim's curl was SIGKILLed; the first status reading after it, taken
+  within 0.1 s, already counted it as cancelling (`settle_at_stop` 1). SGLang
+  dropped it from its queue 2.65 s and 2.44 s after the hang-up while the
+  blocker kept running; that delay is SGLang's own disconnect check. The
+  blocker, hung up after its first token, settled on the next idle reading
+  (0.39 s and 0.37 s after its hang-up), and the victim stayed held until the
+  stop settled it on its verified exit. Before the fix the same case was
+  counted about 10 s late, at the moment SGLang started the request.
+
+Evidence is on the laptop under `target/live/live-017-findings/`. The role was
+stopped and host A left with no engine, CapyCTL or GPU process, its ports free,
+and the 30 `/tmp` and `/dev/shm` entries the engines created removed. The
+killed launch's `/dev/shm/sglang_loads_*.shm` was among them: the tracker that
+would unlink it is ended with the rest of the tree.
+
+## Live checks of #173, #180 and #181, and how quickly each engine stops — 2026-10-22 (branch `docs/abort-measurements`)
+
+Run on host A (one NVIDIA GB10) on 2026-10-22 with a release build of `main` at
+`466b6fa8`, one standalone role with its own state directory (managed limit
+108 GiB, free reserve 8 GiB), and the approved environments: SGLang 0.5.22,
+vLLM 0.32.0, llama.cpp v0.7.0 and TensorFold 0.6.6. Signals went only to
+processes named by ownership evidence (the recorded launch identity) or to the
+test's own clients. No code changes; the guide gains the measurement
+([When a request is cut short](../guide/requests.md#how-quickly-each-engine-stops)).
+
+## #181: an SGLang scheduler killed while the weights load
+
+Qwen3-4B-Instruct-2507 on SGLang 0.5.22. As soon as the engine log showed
+`Load weight begin` (no `Load weight end` yet), the `sglang::scheduler` in the
+process group of the recorded entry (its pid, start ticks and boot id matched
+the binding) got SIGKILL. The start failed 2.35 s later as a launch failure
+(`initialize failed (launch_failed)`, "the engine exited before readiness"),
+not ownership uncertainty; the process group was empty at the 2.25 s reading,
+the binding was released and no reservation was left. The engine log had no
+prometheus `FileNotFoundError`. Two runs gave the same result, one with
+`--debug-engine-logs` (2.58 s) and one without (2.35 s).
+
+One expectation did not hold: the log tail does not end with
+`sglang_startup_failed: engine_launch_failed`. That line is followed by five
+lines from Python's interpreter exit, `Exception ignored in: <function
+ResourceTracker.__del__ ...>` ending `ChildProcessError: [Errno 10] No child
+processes`. The entry reaps its own children, multiprocessing's resource tracker
+among them, before it exits, and the tracker's finalizer then finds no child to
+wait for (read from the traceback, not traced further). The failure is reported
+correctly; the tail only has this noise after the line. With
+`--debug-engine-logs` the launch-failure journal entry omits the tail, as
+designed for raw logs.
+
+A scheduler killed after Ready (an earlier run, by mistake) was reported as
+`engine_exited`, and ordinary cleanup verified the group gone in 7.2 s.
+
+## #180: a client hang-up on non-streamed requests, SGLang 0.5.22
+
+- Chat, Qwen3-4B: four collected requests (`max_tokens` 4096); the clients were
+  killed when `sglang:num_running_reqs` read 4, and the next reading, 0.1 s
+  later, was 0 running and 0 queued. Status showed the four `cancelling`, all
+  settling on the idle signal, and the next reading had settled them
+  (`request_cancellation_acknowledged`, count 4, on the engine's counters). They
+  were not held until the stop: CapyCTL collects a non-streamed answer from a
+  stream, so each had produced output before the hang-up, and ADR 0032
+  decision 6 settles an answered request on idle.
+- Decisions, Clef-Flash: SGLang's gauge never read 4. It answered these long
+  decisions (about 15,600 input tokens) one at a time and read 0 while
+  answering the first. The clients were killed when that first answer came
+  (gauge then 0 running, 2 queued): SGLang ran the other three to their ends,
+  about 3.4 s each, and its gauge read 0 only 10.3 s after the hang-up. In an
+  earlier run (clients killed at 1.5 s, gauge at 0), two of the four showed
+  in SGLang's queue 2 s later and ran within 7 s. Status held all seven as
+  `settle_at_stop` until the stop (3 min 15 s for the first four), through
+  every idle reading, and the stop settled them when it verified the process
+  group's exit (count 7, "cancelled before the engine answered; stop
+  operation ... verified the exit of the instance's process group"). The
+  expectation that the gauge drops within seconds therefore holds for chat
+  and not for decisions: SGLang does not stop abandoned decisions.
+- Not run: a decision or chat request through a host's ingress.
+
+## #173: settling a cut request, SGLang 0.5.22 and vLLM 0.32.0
+
+Qwen3-4B with `max_concurrent_requests: 1` and the standalone's
+`queue.request_deadline` at 300 s: a streamed request (the victim) waited in the
+engine's queue behind a streaming one (the blocker).
+
+| | SGLang 0.5.22 | vLLM 0.32.0 |
+|---|---|---|
+| Victim cut at the deadline, before any token | 300.0 s; `settle_at_stop` 1 | 300.0 s; `settle_at_stop` 1 |
+| Engine drops it from its queue | within 1 s | within 1 s |
+| Blocker hung up after its first token, settled on idle | 0.25 s after the hang-up | 0.14 s after the hang-up |
+| Victim still counted through idle readings | 59 readings, 61 s | 59 readings, 61 s |
+| Settled at the stop | when the stop verified the exit | when the stop verified the exit |
+
+A further SGLang run cut the queued victim by a client hang-up instead: it was
+held until the stop in the same way. CapyCTL counted that cancellation only
+about 10 s after the hang-up, in the same second as the blocker's hang-up let
+SGLang start the queued request; how it noticed it then was not traced.
+
+A first attempt set `request_deadline: 180s` on the deployment, under the
+standalone's default `queue.request_deadline` of 1800 s. The queued stream was
+not cut in 20 minutes: the bound on a reply's first output is the host's
+`queue.request_deadline`, as the guide says, and the deployment's
+`request_deadline` did not shorten it. In the code it bounds the deployment's
+lifecycle windows (Initialize, wake, stop).
+
+## How quickly each engine stops (0.1.7 item)
+
+Four long generations at once, the clients killed once the engine counted four
+running (for a stream, after each had read generated text), the engine's own
+running and waiting counts read every 100 ms; three repeats, streamed and
+non-streamed, through CapyCTL. Seconds from the hang-up to the first reading of
+0 (median / max): SGLang 0.5.22 0.22 / 0.22 streamed and 0.10 / 0.10
+non-streamed; vLLM 0.32.0, llama.cpp v0.7.0 (Qwen3-4B Q4_K_M) and TensorFold
+0.6.6 (FrogNano-4B-2609 NVFP4) 0.10 / 0.10 both ways, the smallest figure the
+100 ms reading shows. Directly against the engine (llama.cpp and TensorFold;
+SGLang and vLLM answer only CapyCTL), streams stopped as fast; llama.cpp did
+not stop non-streamed requests (0 after 64.6 to 65.9 s), which CapyCTL avoids by
+streaming from the engine. vLLM's `/metrics` needs the engine's key, read from
+the engine's environment by the measuring script and never printed.
+
+## Other observations
+
+- Ordinary stops leave the engines' scratch files in `/tmp` (the engine's
+  environment carries no `TMPDIR`): each SGLang launch left a prometheus
+  directory with `counter_<pid>.db` files and ZMQ sockets, and each vLLM launch
+  a `vllm_dist_*` file and sockets. The #181 failure runs left no prometheus
+  directory. 108 such entries from this session were removed by hand.
+
+Evidence (laptop, not committed): `target/live/live-017/` (scripts, per-run
+samples, status and management-event extracts). CPU and Fake-engine tests are
+not qualification; this file records live runs only.
+
+## SGLang: a startup failure fails the launch promptly — 2026-10-22 (branch `fix/sglang-startup-death`)
+
+Found live on host A on 2026-10-20, in a container: SGLang's scheduler failed at
+startup (a missing CUDA library) but the protected entry stayed alive, so the host
+waited out the whole readiness deadline and reported that runtime ownership was
+uncertain instead of a launch failure (SPEC §§6.4, 13.2). No raw log survives. The
+cause below is read from SGLang's public source (v0.5.20, v0.5.21 and v0.5.22 alike)
+and reproduced with a synthetic SGLang tree; it is not confirmed against that run.
+
+A scheduler that dies before it reaches its own exception handler (an import that
+fails in the spawned child, a missing shared library) sends its parent no SIGQUIT.
+SGLang's `_wait_for_scheduler_ready` (`entrypoints/engine.py`) polls the scheduler
+every 5 s, sees it dead and raises out of `launch_server`. The entry reported
+`sglang_startup_failed: startup_error` and returned, but interpreter exit then joins
+the processes SGLang had already started (the detokenizer, any live scheduler), which
+are non-daemon children that never exit. The entry stayed alive, so the host's
+readiness loop saw the engine present until its deadline. A scheduler that raises
+inside its handler was already prompt: it sends SIGQUIT, and SGLang's handler kills
+the whole tree, the entry included.
+
+`runtime/sglang_entry.py` now catches an exception raised out of `launch_server`
+and ends everything it started before it leaves: it stops every running descendant
+(reading the tree again until each one is stopped, so none forks a survivor), kills
+them, reaps its own children, and exits only once `/proc` shows none running,
+reporting `sglang_startup_failed: engine_launch_failed` with a fixed hint. The host
+sees the entry gone at its next presence check and reports a launch failure with the
+engine's log tail. Nothing about release changed: memory is still released only on
+the host's verified gone evidence for the launch's process group. A process that will
+not die keeps the entry alive, and the readiness deadline reports uncertainty as
+before, never a release.
+
+The repeated prometheus `FileNotFoundError` traceback about a missing `/tmp` file
+was ours, and the same fix removes it. With `enable_metrics` on (CapyCTL's reserved
+setting), SGLang 0.5.22's `set_prometheus_multiproc_dir` (`utils/common.py`) makes
+the multiprocess directory a `tempfile.TemporaryDirectory` owned by the parent, and
+its children create their metric files in it. The engine's environment is cleared
+and carries no `TMPDIR`, so the directory lands in `/tmp`; that only places it. The
+entry's normal exit after the failure ran that directory's finalizer before
+multiprocessing's join of the still-running children (atexit runs the last-registered
+handler first, and `import torch` loads `multiprocessing.util`, which registers the
+join, long before SGLang makes the directory), so the
+children kept failing to create files in it. With the children ended first, the
+directory is removed with nothing left writing into it. SGLang's own failure path
+never reaches this: its SIGQUIT handler kills the parent outright, with no finalizer.
+
+Tests: `runtime/tests/test_sglang_startup_death.py` (T12) runs the entry to
+interpreter exit as its own process group's leader, as the launcher does, against a
+synthetic SGLang tree whose `launch_server` does what 0.5.22's does: the parent-owned
+prometheus directory, a non-daemon spawned detokenizer with a child of its own, a
+scheduler that exits 1 without signalling its parent, and the readiness poll. The
+entry exits 1 within seconds (about 1 s here) with `engine_launch_failed`, no running
+process is left in its group, the detokenizer and its child are gone, no
+`FileNotFoundError` was printed, and the prometheus directory is removed. Before the
+fix the same test timed out at 60 s with the entry alive, and the surviving child
+printed 83 `FileNotFoundError` tracebacks in its first 5 s. CPU and Fake-engine tests
+are not qualification.
+
+Live check still needed, on host A with the approved SGLang 0.5.22 environment: start
+a deployment and, while the weights load, send SIGKILL to its `sglang::scheduler`
+process (a member of the launch's process group, whose leader is the recorded
+entry). A killed scheduler runs no handler, which is the path seen live. Expect the
+launch to fail within about 10 s as a launch failure, not ownership uncertainty; the
+log tail to end with `sglang_startup_failed: engine_launch_failed`; the launch's
+process group to be empty and its memory released on that evidence; and no prometheus
+`FileNotFoundError` in the engine log.
+
+## A client hang-up stops the engine's work for non-streamed requests too — 2026-10-21 (branch `fix/collected-hangup-abort`)
+
+Owner decision of 2026-10-21 (0.1.7); SPEC §10 amended 2026-10-21, §20 T17. A
+client that hung up on a streamed request already closed the engine connection
+(SPEC §10, amended 2026-10-01 and 2026-10-02), but a non-streamed request, a
+collected chat completion or any decision at `/v1/systemone`, ran on to its end:
+its forward runs on a task of its own so that a dropped handler never leaves the
+request counted, and nothing told that task the client had gone. Now the task
+races the forward against the client's departure (the answer channel's receiver
+dropped with the handler) and drops the forward when the client goes, which closes
+the engine connection. The request is `cancelling`, settled by the amendment of
+2026-10-21 and [ADR 0032](../design/adr/0032-cancelled-request-settlement.md)
+decision 6: a collected chat request the engine had answered (an output event
+read) settles on the engine's idle reading; one cut before its answer, and every
+decision, is held until the instance's next verified stop or restart. The task
+still settles every lease, and an answer it observed whole before it saw the
+client go still closes the lease completed (a ready completion wins the race). A
+client gone before a request was sent to an instance closes its lease as not
+accepted, and no other instance is offered it. A host's ingress already ran its
+engine request inside the forwarded request and its relayed body, so when the
+router's connection goes away the ingress drops its engine connection, before the
+engine's response head as after; this is now documented in the code and pinned by
+a test. SGLang's per-request abort (ADR 0032) is a separate later change and is
+not implemented here.
+
+Tests (T17 T38 T43, CPU and scripted engines; a new testkit engine double,
+`HeldEngine`, reads each request on a raw socket, never finishes answering, and
+counts the connections its client closes): router
+`a_hang_up_mid_collected_request_closes_the_engine_connection` (before the
+engine's head and after a head and a chunk that only opens the reply; the engine
+sees its connection close within 5 s; the lease ends `cancelling`, unanswered;
+the in-flight slot is released),
+`a_hang_up_mid_decision_closes_the_engine_connection` (the same for a decision),
+`a_collected_request_cut_at_its_deadline_closes_the_engine_connection`, and unit
+tests `a_completion_ready_with_the_hang_up_wins` and
+`a_hang_up_cuts_and_drops_a_pending_forward`; agent
+`the_engine_connection_closes_when_the_upstream_goes_away` (a chat request before
+the engine's head and after its opening chunk, and a decision, through the
+ingress; the forwarding slot is freed). The two router hang-up tests fail on the
+code before the change (the engine connection stayed open past the 5 s bound);
+the deadline and ingress tests pass on it too, pinning behavior that already held.
+CPU and Fake-engine tests are not qualification.
+
+Live check still needed (host A, SGLang 0.5.22, in an owner-scheduled live
+session): start 4 non-streamed long generations against a chat deployment (for
+example `max_tokens` 4096 each, `stream: false`), wait until the engine's
+`sglang:num_running_reqs` reads 4, kill the 4 clients, and read the gauge again:
+it should drop to 0 within a few seconds instead of staying at 4 until the
+generations end. `capyctl status deployment` should show the 4 requests
+cancelling (settling on the idle signal if each had produced output, otherwise
+at the next stop or restart). Repeat with decision requests on a decisions
+deployment, and once through a host's ingress (host A as a host of a server on
+the control host).
+
+## vLLM 0.32 qualified for chat; decisions stay refused — 2026-10-21 (branch `feat/vllm-0.32-decisions`)
+
+Owner decision 2026-10-21. ADR 0018 §1: vLLM 0.32.0 joins the verified set for chat.
+ADR 0030 §6 amendment: `api: decisions` stays refused on vLLM on every version
+(`capability_missing:decisions`), now with the measured reason: vLLM 0.32.0 serves
+`POST /v1/systemone` but answers Clef and Clef-Flash from their text output instead of
+their decision head; vLLM is admitted once a release uses these models' decision heads.
+vLLM 0.32.0's `--grpc-port` (a second listener) is reserved (SPEC §8.2, T21). The vLLM
+adapter takes the deployment's API and, for a decisions launch, proves readiness, the
+post-wake probe and the wake canary with the fixed decision (ADR 0030 §§3, 4), never a
+chat completion; no resolved deployment reaches it while the refusal stands. The host A
+venv `~/vllm-0.32.0-venv` was made with `uv venv --python 3.12 --seed --managed-python`
+and `uv pip install vllm==0.32.0 --torch-backend=cu130` (torch 2.13.0+cu130).
+
+Tests: T43 (`capyctl-config` decisions: vLLM 0.31.0, 0.32.0, 0.33.0 and a versionless
+build are refused with the reason; `vllm_initialize`: a decisions launch is ready only on
+the fixed decision, no chat probe, the canary is a decision; `vllm_residency`: a woken
+decisions launch is proven by the decision), registration (0.32.0 verified), T14/T21
+(`runtime/tests/test_vllm_entry.py`: the 0.32.0 parser launches, `--grpc-port` reserved
+however spelled). CPU and Fake-engine tests are not qualification.
+
+Live on host A (GB10), isolated standalone, managed limit 108 GiB:
+
+- Qwen3-4B chat with deep park on vLLM 0.32.0: start 96 s (digest included), chat and a
+  stream answered, park freed about 12 GiB, two wakes on request (8.3 s and 9.3 s) passed
+  the wake canary (no mismatch recorded), stop 5 s.
+- Decisions, measured with a build that let vLLM resolve `api: decisions`: Clef-Flash and
+  Clef (BF16) became ready on the fixed decision, answered through the router, and were
+  refused `api_mismatch` on chat and `invalid_request` on a malformed body. capyctl-bench
+  (Clef-Flash; results in capyctl `target/live/vllm-032/`): API-Bank refused on all 508
+  requests ("at most 26 options for this model"), Home appliances 0.0%, GPQA Diamond
+  44.4%, Typed Decisions 69.5% with ECE 0.243, AG News 90.2%, BoolQ 89.8%; 1 question
+  about a 2k-token text p50 517 ms. On SGLang 0.5.22 the same model scores API-Bank
+  93.1%, Home appliances 97.7%, GPQA 51.0%, Typed 70.2% with ECE 0.012. Clef on vLLM
+  scored 43.2% on Home appliances (SGLang 79.5%).
+- Parking, for the later ADR 0030 §7.2 decision: Clef-Flash run directly on vLLM 0.32.0
+  with sleep mode slept at level 2, woke, reloaded its weights and answered the fixed
+  decision with identical probabilities.
+
+Live check still needed: none for chat; decisions on vLLM once a release reads these
+models with their decision heads.
+
+## A changed hostname is reported clearly — 2026-10-21 (branch `fix/hostname-changed`)
+
+SPEC §15.2 ("existing identity missing or mismatched: fail for recovery"). A
+standalone role publishes its host under the machine's hostname (the device
+inventory's `host_id`; the fixed name `standalone` when it observes no
+inventory), and its store records that name as the embedded host's namespace.
+Started on existing state under another hostname, as every new container is
+unless `docker run --hostname` fixes it, the role failed late, when it
+published its policy, with the opaque `internal: deploy: blocked: resource
+policy refused: resource policy revision conflict` (found in the discrete-GPU
+container run, `docs/container-qualification-discrete`).
+
+The role now compares the hostname with the stored embedded host name right
+after it derives its host policy, before the secrets key, the owned state, the
+rendezvous sweep or any policy is written, and refuses with the new code
+`host_name_changed`, exit 2 (invalid configuration, which the packaged units do
+not restart). The message names the stored name, the current hostname and the
+fix: `docker run --hostname <stored>`, or setting the machine's hostname back.
+No setting names the host instead of the hostname, so none is offered. Only
+the embedded host's record is read: the enrolled hosts a server store also
+holds are never compared, and the host role, which uses its enrolled name, is
+unchanged. A start without a device inventory, which publishes `standalone`
+rather than the hostname, is not compared here and keeps the earlier refusal.
+
+Code: `Store::embedded_host_name` (`capyctl-store`), `roles::check_host_name`
+and `StartError::HostNameChanged` (`capyctl-cli`), the code and its exit in
+`output.rs`. Tests (T06): the store returns no name on fresh state and the
+published one after an import, unchanged by an enrolled host; a booted
+standalone proceeds under its own name and under no hostname-derived name,
+fresh state proceeds under any name, and another name is refused
+`host_name_changed`, exit 2, naming both names and `docker run --hostname`;
+the errors page documents the code with its exit. Docs: the errors guide, the
+exit-code table and the container section of the install guide.
+
+CPU and Fake-engine tests are not qualification. Live on the laptop,
+2026-10-21 (release build of `main` d9d5640d with this branch and
+`fix/discrete-startup-peak`, the discrete container setup: `ubuntu:24.04`,
+CDI, `--user 1000:1000`): on state created under `--hostname capyctl-laptop`
+with a stopped vLLM deployment, the container recreated without `--hostname`
+(hostname `22be0919ef8d`) exited 2 with `host_name_changed` naming
+`capyctl-laptop`, `22be0919ef8d` and `docker run --hostname capyctl-laptop`;
+recreated with `--hostname capyctl-laptop` it started, its host online and the
+deployment listed.
+
+## Discrete GPUs: the startup peak is measured per memory domain — 2026-10-21 (branch `fix/discrete-startup-peak`)
+
+Owner decision 2026-10-21; ADR 0019 amendment A2, with ADR 0014 amendments A2
+(measured startup), A12 (kernel builds) and A13 (process identities). Found
+during the discrete container qualification on the 16 GB laptop card: on a
+discrete GPU CapyCTL never measured a deployment's startup peak. The cold phase
+charges two domains, the card and host RAM (ADR 0019 §3), and the measurement
+ran only for a cold phase of one allocation (`StartupPeak::new` in the
+coordinator, `measurable` in `capyctl-config`), so every start kept the
+estimate (`startup.provenance` `default`).
+
+What changed:
+
+- `capyctl_config::effective::startup_measure` replaces `measurable`: one pool
+  is measured as before; a discrete cold phase of one card and one host RAM
+  allocation is measured per domain.
+- The coordinator samples the host's processes with its availability while an
+  Initialize runs on a discrete GPU and, once the engine is ready, matches them
+  to the process identities it reported: the card's peak is the most GPU memory
+  the driver attributed to them in one sample, host RAM's the most resident
+  pages (`RssAnon` + `RssShmem`). Another program's memory is not counted.
+  Samples inside a kernel build and a start beside another activation on its
+  host record nothing, as on unified memory.
+- `startup_measurements` is keyed by memory domain (store schema v52; each
+  earlier peak keeps the domain of its revision's one cold allocation, read
+  from the frozen revision). A start freezes each measured domain's peak into
+  its plan (`startup_domains`), never below that domain's steady charge; a
+  domain not yet measured keeps its estimate. A declared `memory.startup` or
+  `resources:` block is never replaced.
+- A remote host is sent the card's figure as `SingleLaunchPlan.startup_bytes`
+  and host RAM's as the new `startup_host_bytes` (field 18, capability
+  `startup_host_bytes`, ADR 0017), and charges each on its own domain. A host
+  without the capability is refused `host_capability_missing:startup_host_bytes`
+  for such a launch before anything is sent.
+- Status: `startup.device_provenance` and `startup.host_provenance` beside
+  `startup.device_bytes` and `startup.host_bytes` (deployment and starting
+  instance), `startup.provenance` the card's, and each `startup.measured`
+  record names its `domain`.
+
+Tests (T14 T26): `a_discrete_startup_peak_is_measured_per_memory_domain` and
+`a_discrete_domain_keeps_its_estimate_until_it_is_measured` (coordinator, both
+failing before: nothing was recorded on a discrete host),
+`v52_keys_startup_peaks_by_domain_and_carries_rows_across` (store migration),
+`a_launch_carries_the_host_ram_startup_charge_only_beside_the_cards` and the
+capability cases in `every_post_baseline_field_names_its_capability`
+(protocol). The unified startup tests pass unchanged. CPU and Fake-engine tests
+are not qualification.
+
+Live on the laptop, 2026-10-21 (RTX 4090 Laptop GPU, 16 GiB; vLLM 0.31.0;
+release build of `main` d9d5640d with this branch and `fix/hostname-changed`),
+a deployment stating only `name`, `engine` and `model`. Qwen3-4B did not fit:
+its host RAM estimate (15.2 GiB) was above the 12 GiB the laptop had free, so
+the run used Qwen2.5-1.5B-Instruct. Isolated standalone on the host: the first
+start became Ready in 200 s with `startup.measured` one `gpu0` record of
+8149532672 bytes (7772 MiB; `nvidia-smi` peaked at 7774 MiB for the engine's
+processes) and one `system` record of 6874185728 bytes (sampled peak
+`RssAnon` + `RssShmem` of the engine's processes 7.3 GB), both `measured`.
+After a stop, the starting instance's `startup` reserved 13.2 GiB on the card
+and 8.3 GiB of RAM (`measured`; each the steady charge, above the measured
+peak) and was Ready in 39 s. In the discrete container setup (`ubuntu:24.04`,
+CDI, `--user 1000:1000`, `--hostname capyctl-laptop`): first start Ready in
+165 s, `gpu0` 8149532672 bytes (`nvidia-smi` 7774 MiB) and `system`
+6209007616 bytes (sampled 7.1 GB), both `measured`; the restart reserved the
+same figures and was Ready in 42 s.
+
+## A cancelled request settles on engine idle only after the engine answered it — 2026-10-21 (branch `fix/settle-after-engine-output`)
+
+Owner decision 6 of 2026-10-21 in
+[ADR 0032](../design/adr/0032-cancelled-request-settlement.md); SPEC §10
+amended 2026-10-21, §20 T17. A `cancelling` request (client hang-up, request
+deadline or stream idle cut; streamed, collected or a decision) used to settle
+on the first engine-wide idle reading taken after its cancellation. Reading the
+pinned engines' source showed that such a reading does not prove a request the
+engine never answered cannot still reach its scheduler: vLLM 0.31.0 and 0.32.0
+send no abort for a request cancelled while it is being added to the engine
+core; SGLang 0.5.22 dispatches with no disconnect check after tokenizing, and
+its grammar queue is not in the gauge CapyCTL reads; llama.cpp b11669 answers
+`/metrics` through a task posted ahead of queued inference tasks and counts
+neither its primary queue nor work before posting; TensorFold 0.6.6 (CUDA)
+checks for a disconnect before it counts the request in `/health`. Source
+reading only, not reproduced live.
+
+Now the idle reading settles only a cancellation the engine answered first:
+for a stream or a collected chat request, an event read from the engine that
+is backend progress (content, reasoning, tool-call or finish; not headers and
+not a chunk that only opens the reply, which TensorFold sends before it counts
+the request); and a complete engine error answer (5xx other than 503 with a
+JSON object body), which is the engine's whole answer. Any other cancellation,
+including every decision or collected request cut before its answer, settles
+only on its instance's verified exit at the next stop or restart, the rule ADR
+0031 §6 gave engines without an idle signal: it is never asked about, stop,
+idle stop and switch drains do not wait for it, an idle park or a switch
+releases the instance by a stop (journaled `ready_idle_unanswered_cancellation`
+or the switch's stop reason), and the verified exit journals
+`request_cancellation_acknowledged` with the receipt "cancelled before the
+engine answered; stop operation ...". An operator's park still drains every
+recorded request first, so it does not proceed while one remains. The same
+holds for remote instances (the host's load report path).
+
+Schema v51 adds `request_lease_cancellations.engine_answered` (0 or 1). A row
+written by 0.1.6 reads 0, not answered: the conservative reading. In practice
+an upgrade restarts the role, which already turns every lease of the previous
+session uncertain, so those leases keep settling as retired leases do.
+Status: each instance's `requests` gains `settle_when_idle` and
+`settle_at_stop` (decimal strings); the text line reads, for example,
+`cancelling: 3 (2 settle on the engine's idle signal; 1 at the next stop or
+restart: cancelled before the engine answered)`.
+
+Tests (T17 T38 T43 T33, CPU and scripted engines): store
+`an_unanswered_cancellation_is_never_settled_by_an_idle_reading`,
+`an_unanswered_cancellation_stays_charged_until_the_verified_stop`,
+`an_unverified_stop_keeps_an_unanswered_cancellation`,
+`an_unanswered_cancellation_turns_a_park_into_a_stop`,
+`v51_reads_an_existing_cancellation_as_unanswered`; controller
+`a_cut_before_any_engine_output_settles_only_at_the_verified_stop`,
+`a_switch_releases_an_unanswered_cancellation_by_a_stop`,
+`a_remote_cancelling_lease_settles_only_on_an_idle_sample_after_the_hang_up`
+(an unanswered one beside it stays charged), `closing_as_cancelling_keeps_the_lease_charged`;
+router `a_stream_cut_before_any_engine_output_is_unanswered`,
+`a_hang_up_after_an_engine_chunk_is_answered`,
+`a_collected_request_cut_before_its_answer_is_unanswered`,
+`a_decision_is_bounded_by_the_request_deadline` (unanswered),
+the engine error answer tests (answered); CLI
+`status_shows_each_instances_cancelling_requests_and_what_settles_them`.
+Before the change the old code settled every cancellation on the first idle
+reading after it, so the tests that keep an unanswered one charged through
+idle readings could not pass (they do not compile against the old types
+either). CPU and Fake-engine tests are not qualification. Live check still
+needed: on each engine, a request cut at its deadline before its first token
+stays `settle_at_stop` through idle readings and is acknowledged by the next
+stop; a hang-up after the first token still settles on the idle reading.
+
+## Tests no longer depend on the machine's GPU, memory or speed — 2026-10-21 (branch `test/hardware-independent`)
+
+Tests only; no product behavior changes. Several tests passed or failed with
+the machine running them rather than with the code (AGENTS.md: tests state
+their observations). Each now states what it observes through an existing
+seam, and none was deleted, skipped or loosened:
+
+- **GPU (SPEC §7.2, design §1).** Every `capyctl` process a binary test spawns
+  observes no GPU through `CAPYCTL_TEST_PINNED_GPU`, read only by debug builds
+  like the existing `CAPYCTL_TEST_PINNED_HOST_MEMORY`: `nvidia-smi`'s memory
+  and process samples and the device inventory read nothing of the machine.
+  On the laptop, whose GPU another program held (1.9 GiB of 16 free), every
+  standalone launch in `engine_exit` (2 tests) and `role_shutdown` (5) failed
+  `insufficient_device_memory`. Their documents are now always sized for the
+  unified shape the pinned binary publishes.
+- **Device inventory (SPEC §3).** A standalone boot through the test entry
+  points collects no device inventory, as it already sampled no GPU. On
+  host A the real collector named the host after the machine, so
+  `admission_figures::a_role_warns_when_its_limits_exceed_the_memory_available`
+  and `switching_cli::standalone_memory_limits_follow_the_document_and_its_overrides`
+  and `standalone_parked_limit_follows_the_document_and_its_overrides` found
+  their warnings and policy under `spark-0292` instead of `standalone`.
+  Production boots still run the collector.
+- **Model store (ADR 0008).** `prune_sources_lists_then_removes_only_unreferenced_copies`
+  resolves the store with an empty environment layer; the process's own
+  named host A's real store, which the listing then showed.
+- **Speed.** `only_an_engine_answering_busy_is_not_signalled` no longer
+  requires the idle, exited and loading engines to finish within 900 ms: they
+  get a minute-long idle-check bound and must complete inside the 15 s the
+  stop is awaited, so one that waited for its bound still fails.
+  `group_engine_env_is_approved_everywhere_and_equal` and
+  `empty_journal_reconnect_settles_on_recorded_identities_only` state the
+  longest observation TTL a policy accepts (10 s); under the default 2 s a
+  loaded run (703 s for the controller suite) committed on stale evidence and
+  the store refused it (`evidence freshness`).
+
+Each fixed test passed 20 runs in a row on the laptop, under the gate lock.
+CPU and Fake-engine tests are not qualification; no live check is needed.
+
+## Hosts under a systemd user service are no longer refused — 2026-10-21 (branch `fix/cgroup-path-at`)
+
+SPEC §7.2 and the operations guide's "Memory limits" section
+([install](../operations/install.md)): a host names the cgroup v2 cgroup that
+bounded its memory reading in each host domain's `memory_source`
+(`cgroup_v2:<cgroup>`). The controller checked that token with the alphabet it
+uses for every other name (letters, digits, `-_.:/`), so a cgroup systemd
+names with `@` (a user service, `user@1000.service`, or any template unit
+instance, `foo@bar.service`) failed the inventory check and ended the session
+with `host session authorization failed`. Found by the CI-shape deep gate,
+which runs under `systemd-run --user --scope` and so places the tests' hosts
+under `user@1000.service`.
+
+`memory_source` now has its own check: letters, digits, `-_.:/@`, and `\`
+only as the start of a systemd `\xNN` escape (`dev-disk-by\x2duuid`), up to
+512 characters. Control characters, whitespace, other punctuation and
+non-ASCII are still refused. Every other inventory name keeps the narrower
+check. The token is status only: it reaches `capyctl inspect host --json` and
+the session view, never a file path or an SQL statement, and the host does not
+validate it before publishing.
+
+Tests (failing before, passing after where new): the controller accepts a
+session whose memory source is a user-service cgroup or a template-unit
+cgroup and shows it in the host view, and still refuses one with a newline,
+an escape sequence, a space, or past 512 characters (T07, T26); unit tests
+cover `\xNN` escapes, the length bound at 512 and 513, malformed escapes and
+other refused characters, and that other names still refuse `@` (T26). The
+CI-shape deep gate passes. CPU and Fake-engine tests are not qualification. A
+live check is still needed: a role run as a systemd user service or template
+unit joins its server and reports its cgroup.
+
+## Containers run live on a discrete GPU — 2026-10-21 (branch `docs/container-qualification-discrete`)
+
+Live qualification of a standalone role running as the main process of a
+container on the development laptop (RTX 4090 Laptop GPU, 16 GiB, driver
+615.71.09, Docker 29.1.3 with CDI), with the published 0.1.6 x86-64 release
+binary (commit `04087627`, verified against `SHA256SUMS`). Documentation only:
+no code changed. It follows the GB10 run (`docs/container-qualification`).
+
+The container: `docker run --init --device nvidia.com/gpu=all --cap-drop ALL
+--security-opt no-new-privileges --user 1000:1000 --shm-size 8g --hostname
+capyctl-laptop`, the container's own `/proc` and cgroup namespace, ports 38443
+and 37443 published to the host's loopback only, and read-only mounts at their
+host paths of the binary, vLLM 0.31.0, TensorFold 0.6.6, the CUDA 13.4 toolkit,
+the `uv` interpreter directory and the models, beside a fresh writable state
+directory. Host RAM limits stated for the run: managed 16 GiB, free reserve
+4 GiB. The image is `ubuntu:24.04` plus `python3`, `gcc`, `g++`, `ninja-build`,
+`/usr/local/cuda` linked to the mounted toolkit and a loader cache for the CUDA
+libraries, built with Docker's legacy builder (no `buildx` on the laptop): a
+build stage holds a copy of CUDA's shared libraries at the mount path, runs
+`ldconfig`, and only `/etc/ld.so.cache` reaches the image.
+
+Results:
+
+- Qwen3-4B on vLLM 0.31.0 (`residency: deep`, context 8192, KV cache 2 GiB):
+  cold start 209 s (start request to the engine's listener, with FlashInfer's
+  and torch.compile's first-start work: compile 42.9 s), chat collected
+  (`Jupiter is the largest planet in our solar system.`, 12 tokens) and
+  streamed (14 data lines) HTTP 200 in about 0.25 s each (`/v1/models`
+  answered HTTP 200 through the published port from the host); park under a
+  second (0.57 s from the park request to the measured parked charge; vLLM
+  fell asleep in 0.34 s), wake
+  through a request 14.3 s, stop 2.4 s with every engine process gone from the
+  container. `parked.measured` 1251999744 bytes on `gpu0`. A second start, in
+  the `--memory` run, took 60 s with the compile caches in the state
+  directory.
+- FrogNano-4B-2609 MLX 4-bit on TensorFold 0.6.6 (the laptop recipe
+  `tensorfold/frognano-4b-mlx-4bit-rtx4090`: `restart_only`, declared 11 GiB
+  card and 2 GiB RAM, context 32768, `--no-drafts`): cold start 249 s
+  (TensorFold built its CUDA extensions on this first start and reported
+  "loaded in 176.7s"; the readiness request then built one more), chat
+  collected (`Jupiter is the largest planet in our solar system.`,
+  `finish_reason` `stop`) and streamed (401 data lines) HTTP 200; park refused
+  as it should be (`unsupported_capability`), stop 2.4 s.
+- `startup.measured`: absent for both, and not because of the container. On a
+  discrete card the derived cold phase charges two domains (the card and host
+  RAM), and the startup peak is measured only for a single-domain cold phase
+  (`StartupPeak::new` in the coordinator, `measurable` in
+  `capyctl-config/src/effective/startup.rs`), so vLLM's status keeps the
+  derived 14220787655 card bytes plus 4294967296 RAM bytes (`provenance`
+  `default`). TensorFold's peak is declared (`provenance` `resources`) and is
+  never replaced.
+- Per-process GPU memory (ADR 0007, ADR 0019): `nvidia-smi
+  --query-compute-apps` inside the container reports the container's PIDs on
+  the discrete card too, equal to the container's `/proc` and to the host's
+  `NSpid`: vLLM host 1306164 → container 654 (11088 MiB ready, 1194 MiB parked,
+  the same in both readings), TensorFold host 1525551 → 3564 (3030 MiB ready,
+  3198 MiB after two requests), vLLM in the `--memory` run host 1685166 → 315
+  (10368 MiB). The parked charge above was measured from those readings, so
+  attribution works without a translation.
+- Card sizing (ADR 0019): the card's domain has the card's total, 17171480576
+  bytes (16376 MiB), with or without `--memory`; its managed limit is
+  15797762136 bytes (14.71 GiB, an 8 % reserve). vLLM rendered
+  `--gpu-memory-utilization 0.75` and `--kv-cache-memory-bytes 2147483648`, and
+  was charged 14220787655 bytes: 75 % of the card plus the 1.25 GiB CUDA context
+  and graphs. A deployment asking `memory.request: 14GiB` was refused at deploy
+  (`insufficient_device_memory`: 16374562816 bytes needed, above the
+  15797762136 the device domain manages).
+- Memory limits: without `--memory` the role reported `meminfo` (cgroup `/`,
+  `memory.max` `max`, capacity 65743319040 bytes); with `--memory 24g` it
+  reported `cgroup_v2:/`, capacity 25769803776 bytes (24576 MiB), said so at
+  start, and vLLM started and served within it.
+- Found and documented: TensorFold's registration needs `ninja` on the engine's
+  `PATH` (`toolchain_missing` without it); the legacy builder needs the
+  build-stage form of the loader cache; and a role restarted from persisted
+  state in a new container, which Docker gives a new hostname, refuses to start
+  (`internal: deploy: blocked: resource policy refused: resource policy
+  revision conflict`), since the host is named after the hostname: a fixed
+  `--hostname` avoids it.
+- Nothing left running: the container and the image removed, `docker ps`
+  showing only the laptop's four other containers, no GPU processes.
+
+CPU and Fake-engine tests are not qualification; this entry records a live
+run. Still not run live in a container: Podman and a host role joined to a
+server.
+
+## ADR 0033 accepted: LMCache — 2026-10-21 (branch `docs/adr-0033-lmcache`)
+
+ADR 0033 records the owner's decisions of 2026-10-21 for LMCache in 0.1.7, including the
+owner's answers to the ten open questions of its first draft. LMCache 0.5.6 (the security
+floor: CVE-2026-105192 is fixed in it), or a later 0.5.x release that passes CapyCTL's
+launch-time check by shape, runs in multiprocess server mode only: vLLM 0.32.0 or newer
+connects through LMCache's external `LMCacheMPConnector`, named with its module path, and
+SGLang 0.5.22 or newer through `--enable-lmcache --lmcache-config-file`; the in-process
+`LMCacheConnectorV1` is refused because it ignores `cache_salt` (LMCache issue #2878).
+vLLM 0.31, older SGLang, llama.cpp, TensorFold and custom engines show "LMCache off" with
+the reason. Every model gets LMCache by default, hybrid layouts and decision deployments
+included (decisions on SGLang only: vLLM stays refused for decisions, ADR 0030 §6
+amendment of 2026-10-21; amended 2026-10-22, A10: decision deployments on SGLang, and
+SGLang deployments stating `--disable-radix-cache`, run without LMCache until LC7 passes on
+a release, [sgl-project/sglang#45929](https://github.com/sgl-project/sglang/issues/45929)). Each deployment instance gets its own LMCache server, started and stopped by
+CapyCTL with it, on loopback ports CapyCTL leases, checked with ADR 0031's listener check
+because the 0.5.6 admin HTTP API has no authentication; the script API stays off; host
+RAM (L1) only, LRU within the private pool, nothing on disk. The server stays up while
+its model is parked, with its pool charged, and stops with the stop; a `restart_only`
+deployment keeps a warm cache across the restart. Parking wins: a deep-parking deployment
+uses LMCache only on an engine version, model type and GPU combination qualified live,
+and elsewhere keeps deep parking and runs with LMCache off and the reason shown. An
+engine that fails to start with the connector is relaunched once without LMCache, with a
+warning and an `lmcache_off` event (under `lmcache: required` the launch fails); a server
+that dies while its engine runs fails the instance, which recovers with both relaunched.
+`cache_salt` is no longer forwarded unchanged: vLLM, SGLang and LMCache receive a
+domain-separated SHA-256 digest (64 hex characters) of the deployment, its revision and
+the caller's salt; no salt stays no salt; a salt is not authorization. The pool is 4 GiB
+per instance by default (`lmcache_pool`), charged with the server's measured overhead in
+host RAM; the overhead allowance and the server's start bound are set from live row LC1's
+measurements plus a stated margin, and no number is committed before that. LMCache is on
+by default (`lmcache: auto`); a deployment's `lmcache: off` opts out, `lmcache: required`
+refuses to start rather than run without it, and a host's `lmcache: off` turns it off for
+every deployment on the machine and refuses `required` there. Zero data retention: a host
+or deployment `retention: zero` keeps engine logs in memory, starts engine and LMCache
+processes with no core dumps, and never starts LMCache; turning it on for a host stops
+existing LMCache servers; the engine's own GPU prefix caches are not covered. The ADR
+also gives the engine-option changes (SGLang's LMCache options owned, an LMCache
+`--kv-transfer-config` refused from vLLM `extra_args`, `LMCACHE_*` reserved), the metrics
+read from the server's `/metrics`, the refusal codes, conformance row T45, and live rows
+LC1–LC11 (decisions, the relaunch without LMCache, a server exit, a host's `off` and
+`required` refused on it among them). `AGENTS.md` lists the two host A qualification
+environments the owner approved on 2026-10-21, `~/vllm-0.32.0-lmcache-venv` and
+`~/sglang-0.5.22-lmcache-venv`. Nothing is implemented; the SPEC, guide and
+data-retention changes the ADR lists land with the implementation. No code or tests
+change; CPU and Fake-engine tests are not qualification, and the LC rows are the live
+check still needed.
+
+## ADR 0032 accepted: settling a cancelled request on evidence about that request — 2026-10-21 (branch `docs/adr-0032-settlement`)
+
+[ADR 0032](../design/adr/0032-cancelled-request-settlement.md) records the owner's
+decisions of 2026-10-21 on cancelled requests, which today stay counted until their
+engine reads idle (SPEC §10, amended 2026-10-01) and under steady traffic can fill the 32
+requests a deployment may hold. From the public source of SGLang 0.5.22, vLLM 0.31.0 and
+0.32.0 and llama.cpp v0.7.0 (b11669), only SGLang gives proof about one request: its own
+final output after an abort by `rid`.
+
+The decisions: on SGLang, CapyCTL sends its own request ID (the `X-CapyCTL-Request-Id`
+value, never the caller's) as `rid`, also through a host's ingress (amending the note of
+2026-10-19). On a client hang-up, a deadline cut or a stream idle cut, it aborts that
+`rid` on loopback (on a host through a new host-agent operation), keeps reading, and
+settles on that request's final output within the stream idle bound, falling back to
+today's rule. The answer's `id` stays CapyCTL's request ID. Other engines keep today's
+rule, as amended separately on 2026-10-21: an idle reading settles only a request the
+engine produced output for. When requests held until the next stop alone fill a
+deployment's limit, CapyCTL restarts the instance, journals the restart, and settles them
+on its verified exit, never on a timer.
+
+The ADR gives the plan for 0.1.7 and four live rows on host A with SGLang 0.5.22.
+Nothing is implemented; no code or tests change. CPU and Fake-engine tests are not
+qualification, and those live rows are still needed.
+
+## Summaries brought up to 0.1.6 — 2026-10-21 (branch `docs/after-0.1.6`)
+
+Docs and website copy only. The README's list of what works in 0.1.6 gains
+custom engines, request IDs and decision metrics, engine logs kept in memory,
+the controller guide and running a role in a container, each linked to its
+guide page; its documentation list links the user guide, the container section
+and the 0.1.6 release notes. `docs/README.md` links the user guide and the
+0.1.5 release notes, which it had skipped. The guide's overview, install,
+how-it-works and engine options pages mention custom engines, and the install
+page gains "In a container", which points to the operations guide's container
+section and states what has not run in a container yet. The operations guide's
+engine log section and the data retention page no longer say that no engine
+logs prompts: they name llama.cpp, and say that a custom engine logs whatever
+its manifest's command prints. On the website, the landing page's capabilities
+table lists custom engines, containers, decision models and request IDs,
+engine logs kept in memory and the controller guide, and the hero line and the
+site description name custom engines. No code or tests change; CPU and
+Fake-engine tests are not qualification, and no live check is needed.
+
 ## The exact decision readiness request — 2026-10-21 (branch `docs/decision-probe-text`)
 
 Docs only. ADR 0030 §3 now publishes the exact v1 readiness request of a
