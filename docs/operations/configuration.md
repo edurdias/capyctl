@@ -487,7 +487,7 @@ CapyCTL keeps.
 ### Engine usage reporting
 
 `engine_telemetry` says whether the engines a host starts may report their own
-use off the machine. Owner decision 2026-10-22: by default they do not.
+use off the machine. By default they do not.
 
 - `off` (the default) starts every engine with its opt-outs set:
   `DO_NOT_TRACK=1` for every engine, and for vLLM also `VLLM_DO_NOT_TRACK=1`
