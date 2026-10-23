@@ -11,7 +11,7 @@ use crate::schema::{
     SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
     SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
     SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V49, SCHEMA_V5, SCHEMA_V50, SCHEMA_V51, SCHEMA_V52,
-    SCHEMA_V53, SCHEMA_V54, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V53, SCHEMA_V54, SCHEMA_V55, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -89,6 +89,9 @@ pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V53,
     // ADR 0033 §§9, 10: the embedded host's current LMCache settings.
     SCHEMA_V54,
+    // ADR 0033 §7 (amendment A12): the checkpoint's model type with its
+    // sizing and its digest.
+    SCHEMA_V55,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -197,6 +200,10 @@ fn apply_through(conn: &Connection, last: i64) -> Result<(), StoreError> {
             // SPEC §10 (amended 2026-10-21): whether the engine answered a
             // cancelled request; old rows read as not answered.
             crate::request_lease_cancellations::migrate_v51(&tx)?;
+        }
+        if version == 55 {
+            // ADR 0033 §7 (amendment A12): the checkpoint's model type.
+            crate::checkpoint_digests::migrate_v55(&tx)?;
         }
         if version == 28 {
             // SPEC §6.5 (ADR 0013 amendment): the warm-residency flag.
@@ -425,6 +432,49 @@ mod tests {
                 []
             )
             .is_err());
+    }
+
+    /// ADR 0033 §7 (amendment A12, v55): a sizing and a digest recorded
+    /// before v55 read no model type; the columns take a bounded name, and
+    /// applying v55 again changes nothing.
+    // T45
+    #[test]
+    fn v55_adds_the_checkpoint_model_type_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        apply_through(&conn, 54).unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        conn.execute(
+            "INSERT INTO checkpoint_digests(deployment_id,revision,state,host_id,expected,digest,weights_bytes,provisional,diagnostic,updated_at_ms) VALUES('a',1,'recorded','h',NULL,?1,1,0,NULL,1)",
+            [&digest],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO checkpoint_sizes(deployment_id,revision,host_id,weights_bytes,sized_at_ms) VALUES('a',1,'h',1,1)",
+            [],
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            crate::checkpoint_digests::migrate_v55(&tx).unwrap();
+            tx.commit().unwrap();
+        }
+        for table in ["checkpoint_digests", "checkpoint_sizes"] {
+            let read: Option<String> = conn
+                .query_row(&format!("SELECT model_type FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(read, None, "{table}");
+            conn.execute(&format!("UPDATE {table} SET model_type='qwen3'"), [])
+                .unwrap();
+            for bad in [String::new(), "q".repeat(129)] {
+                assert!(
+                    conn.execute(&format!("UPDATE {table} SET model_type=?1"), [&bad])
+                        .is_err(),
+                    "{table}"
+                );
+            }
+        }
     }
 
     /// ADR 0028 §5, §6 (v41): resource owners, endpoint leases and recorded

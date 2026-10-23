@@ -12,8 +12,9 @@ use capyctl_config::{
     effective::{EffectiveDeployment, Residency},
     engine_policy::Engine,
     lmcache::{
-        apply_charge, charge_domains, plan, HostLmcache, LmcacheMode, LmcacheOff, LmcacheOffReason,
-        LmcachePlan, PlanInputs, Retention, GIB, SERVER_START_BOUND_MS,
+        apply_charge, charge_domains, launch_gpu, launch_model_type, plan_with_table, HostLmcache,
+        LmcacheMode, LmcacheOff, LmcacheOffReason, LmcachePlan, PlanInputs, QualifiedParking,
+        Retention, GIB, QUALIFIED_PARKING, SERVER_START_BOUND_MS,
     },
 };
 use capyctl_domain::completion::{
@@ -37,9 +38,6 @@ pub(super) type LmcacheVerdicts = Mutex<HashMap<[u8; 32], (Instant, Option<Lmcac
 /// The longest SIGTERM grace a restart-park gives the engine it stops; half
 /// the step's remaining budget when that is less.
 const ENGINE_STOP_GRACE: Duration = Duration::from_secs(10);
-
-/// The largest `config.json` read for its `model_type`.
-const MAX_MODEL_CONFIG: u64 = 1 << 20;
 
 /// ADR 0033 §14: the closed code a `lmcache: required` launch is refused
 /// with when its LMCache is off for `reason` (`reason.required_refusal()`,
@@ -115,23 +113,6 @@ pub(super) fn apply_grant(
     true
 }
 
-/// The checkpoint's `config.json` `model_type`, when readable.
-fn model_type(effective: &EffectiveDeployment) -> Option<String> {
-    use std::io::Read;
-    let path = Path::new(effective.model.resolved_path.as_deref()?).join("config.json");
-    let mut text = String::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(MAX_MODEL_CONFIG)
-        .read_to_string(&mut text)
-        .ok()?;
-    serde_json::from_str::<serde_json::Value>(&text)
-        .ok()?
-        .get("model_type")?
-        .as_str()
-        .map(str::to_owned)
-}
-
 /// Process tools that spawn nothing: they observe and stop a retained
 /// launch's recorded groups, for its re-proof and its restart-park.
 fn group_tools() -> Arc<dyn OwnedProcessLaunch> {
@@ -175,24 +156,25 @@ fn finish(
     Ok((outcome, evidence, held))
 }
 
-impl NativeHostExecution {
-    /// Contract decision 2: whether LMCache runs for `effective` on this host,
-    /// from this host's own inputs. A sticky `engine_start_failed` fallback
-    /// is the store's: that launch arrives without a grant.
-    pub(super) fn lmcache_plan(
-        &self,
-        effective: &EffectiveDeployment,
-        topology: bool,
-    ) -> LmcachePlan {
-        let args: Vec<String> = effective
-            .profile
-            .args
-            .iter()
-            .chain(effective.engine_config.extra_args())
-            .cloned()
-            .collect();
-        let model_type = model_type(effective);
-        plan(&PlanInputs {
+/// [`NativeHostExecution::lmcache_plan`] against `table` in place of
+/// [`QUALIFIED_PARKING`]. ADR 0033 §7 (amendment A12): the checkpoint's
+/// `model_type` is read from its `config.json` here, where the launch reads
+/// it, and the GPU is the one this host published for the launch's device.
+pub(super) fn lmcache_plan_in(
+    effective: &EffectiveDeployment,
+    topology: bool,
+    table: &[QualifiedParking],
+) -> LmcachePlan {
+    let args: Vec<String> = effective
+        .profile
+        .args
+        .iter()
+        .chain(effective.engine_config.extra_args())
+        .cloned()
+        .collect();
+    let model_type = launch_model_type(effective);
+    plan_with_table(
+        &PlanInputs {
             mode: effective.lmcache,
             pool_bytes: effective.lmcache_pool_bytes,
             retention: effective.retention,
@@ -207,7 +189,7 @@ impl NativeHostExecution {
             topology,
             residency: effective.residency,
             model_type: model_type.as_deref(),
-            gpu: None,
+            gpu: launch_gpu(effective),
             registration: effective.profile.lmcache.as_ref(),
             kv_transfer_config_set: capyctl_config::engine_policy::kv_transfer_config_set(
                 effective.profile.engine,
@@ -220,7 +202,21 @@ impl NativeHostExecution {
             engine_start_failed: false,
             discrete_gpu: charge_domains(&effective.host, &effective.selected_devices)
                 .is_some_and(|domains| domains.device.is_some()),
-        })
+        },
+        table,
+    )
+}
+
+impl NativeHostExecution {
+    /// Contract decision 2: whether LMCache runs for `effective` on this host,
+    /// from this host's own inputs. A sticky `engine_start_failed` fallback
+    /// is the store's: that launch arrives without a grant.
+    pub(super) fn lmcache_plan(
+        &self,
+        effective: &EffectiveDeployment,
+        topology: bool,
+    ) -> LmcachePlan {
+        lmcache_plan_in(effective, topology, QUALIFIED_PARKING)
     }
 
     /// ADR 0033 §§1, 9 (lifecycle design §2.3): the LMCache half of a
@@ -635,5 +631,75 @@ mod tests {
         for reason in LmcacheOffReason::ALL {
             assert_eq!(required_refusal(reason), reason.required_refusal());
         }
+    }
+
+    /// ADR 0033 §7 (amendment A12): the fixture deployment deep-parking a
+    /// checkpoint whose `config.json` names `model_type`, resolved on a host
+    /// whose GPU publishes `NVIDIA GB10` and whose vLLM 0.32.0 profile has
+    /// LMCache 0.5.6 registered.
+    fn deep_on_gb10(model_type: &str) -> (EffectiveDeployment, tempfile::TempDir) {
+        use serde_json::json;
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../capyctl-config/tests/fixtures/f2-deployment.json"
+        ))
+        .unwrap();
+        let (mut config, mut host) = (fixture["deployment"].clone(), fixture["host"].clone());
+        let profile = &mut host["runtime_profiles"]["local"];
+        profile["build_fingerprint"] = json!("0.32.0");
+        profile["lmcache"] =
+            json!({"version": "0.5.6", "digest": format!("sha256:{}", "0".repeat(64))});
+        host["resource_policy"]["devices"]["gpu0"]["product_name"] = json!("NVIDIA GB10");
+        let checkpoint = tempfile::tempdir().unwrap();
+        std::fs::write(
+            checkpoint.path().join("config.json"),
+            json!({ "model_type": model_type }).to_string(),
+        )
+        .unwrap();
+        config["residency"] = json!("deep");
+        config["lmcache_pool"] = json!("1GiB");
+        config["model"]["path"] = json!(checkpoint.path().to_str().unwrap());
+        let effective = capyctl_config::effective::resolve_effective(&config, &host).unwrap();
+        (effective, checkpoint)
+    }
+
+    const QWEN3_ON_GB10: &[QualifiedParking] = &[QualifiedParking {
+        engine: "vllm",
+        engine_version: "0.32.0",
+        model_type: "qwen3",
+        gpu: "NVIDIA GB10",
+        residency: "deep",
+    }];
+
+    // T45 (ADR 0033 §7, amendment A12): the host's own plan compares the
+    // checkpoint's `config.json` model type and the product name it
+    // published for the GPU. A qualified row runs LMCache; any other
+    // combination stays off and names the real model type and GPU.
+    #[test]
+    fn the_host_plan_matches_a_qualified_row_and_names_any_other() {
+        let (qwen3, _checkpoint) = deep_on_gb10("qwen3");
+        assert_eq!(
+            lmcache_plan_in(&qwen3, false, QWEN3_ON_GB10).state,
+            capyctl_config::lmcache::LmcacheState::On
+        );
+        let off = |effective: &EffectiveDeployment, table: &[QualifiedParking], detail: &str| {
+            assert_eq!(
+                lmcache_plan_in(effective, false, table).off(),
+                Some(&LmcacheOff::with_detail(
+                    LmcacheOffReason::ParkUnqualified,
+                    detail
+                ))
+            );
+        };
+        off(
+            &qwen3,
+            QUALIFIED_PARKING,
+            "not qualified with deep park on vLLM 0.32.0 / qwen3 / NVIDIA GB10",
+        );
+        let (llama, _checkpoint) = deep_on_gb10("llama");
+        off(
+            &llama,
+            QWEN3_ON_GB10,
+            "not qualified with deep park on vLLM 0.32.0 / llama / NVIDIA GB10",
+        );
     }
 }

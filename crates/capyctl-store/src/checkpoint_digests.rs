@@ -30,6 +30,51 @@ use capyctl_config::effective::{
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 
+/// v55 (ADR 0033 §7, amendment A12): add `model_type` to
+/// `checkpoint_digests` and `checkpoint_sizes`, each unless a store rolled
+/// back from v55 or later still has it.
+pub(crate) fn migrate_v55(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    for table in ["checkpoint_digests", "checkpoint_sizes"] {
+        let present: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name='model_type')",
+            [table],
+            |r| r.get(0),
+        )?;
+        if !present {
+            tx.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN model_type TEXT
+                   CHECK(model_type IS NULL OR length(model_type) BETWEEN 1 AND 128);"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+/// ADR 0033 §7 (amendment A12): whether `model_type`, when named, is a
+/// table key as the qualified parking table compares it.
+fn valid_model_type(model_type: Option<&str>) -> bool {
+    model_type
+        .is_none_or(|model_type| capyctl_config::lmcache::table_key(model_type) == Some(model_type))
+}
+
+/// ADR 0033 §7 (amendment A12): the checkpoint model type a host reported
+/// for this revision: with its recorded digest, else with its sizing while
+/// the digest is pending. `None` before either names one.
+pub(crate) fn recorded_model_type(
+    conn: &rusqlite::Connection,
+    deployment: &str,
+    revision: i64,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT COALESCE(
+            (SELECT model_type FROM checkpoint_digests
+              WHERE deployment_id=?1 AND revision=?2 AND state='recorded'),
+            (SELECT model_type FROM checkpoint_sizes WHERE deployment_id=?1 AND revision=?2))",
+        params![deployment, revision],
+        |r| r.get(0),
+    )
+}
+
 /// The closed diagnostic categories a pending digest may carry.
 const REASONS: &[&str] = &[
     "invalid_root",
@@ -509,10 +554,13 @@ impl crate::Store {
 
     /// Owner decision 2026-09-23 (solo first start): record the weights a host
     /// sized (a stat walk, no hash) for a revision whose digest is pending, so
-    /// a first start's startup estimate uses them before the digest exists.
-    /// The digest stays pending; its own measurement later records the
+    /// a first start's startup estimate uses them before the digest exists,
+    /// and (ADR 0033 §7, amendment A12) the checkpoint's model type the host
+    /// read, which a remote launch's LMCache plan compares before the digest
+    /// exists. The digest stays pending; its own measurement later records the
     /// weights it hashed. Returns whether anything was recorded (only a
     /// pending revision with no weights yet takes them).
+    #[allow(clippy::too_many_arguments)]
     pub fn record_checkpoint_weights(
         &self,
         session: &CoordinatorSession,
@@ -520,18 +568,19 @@ impl crate::Store {
         revision: i64,
         host_id: &str,
         weights_bytes: i64,
+        model_type: Option<&str>,
         now_ms: i64,
     ) -> Result<bool> {
-        if weights_bytes < 0 || now_ms < 0 || host_id.is_empty() {
+        if weights_bytes < 0 || now_ms < 0 || host_id.is_empty() || !valid_model_type(model_type) {
             return Err(CheckpointDigestError::Invalid);
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, session).map_err(|_| CheckpointDigestError::StaleSession)?;
         let changed = tx.execute(
-            "INSERT OR IGNORE INTO checkpoint_sizes(deployment_id,revision,host_id,weights_bytes,sized_at_ms)
-             SELECT ?1,?2,?4,?3,?5 WHERE EXISTS(SELECT 1 FROM checkpoint_digests
+            "INSERT OR IGNORE INTO checkpoint_sizes(deployment_id,revision,host_id,weights_bytes,sized_at_ms,model_type)
+             SELECT ?1,?2,?4,?3,?5,?6 WHERE EXISTS(SELECT 1 FROM checkpoint_digests
                WHERE deployment_id=?1 AND revision=?2 AND host_id=?4 AND state='pending')",
-            params![deployment, revision, weights_bytes, host_id, now_ms],
+            params![deployment, revision, weights_bytes, host_id, now_ms, model_type],
         )?;
         tx.commit()?;
         Ok(changed == 1)
@@ -568,6 +617,7 @@ impl crate::Store {
             DigestProvenance::Measured,
             None,
             None,
+            None,
             now_ms,
         )
     }
@@ -585,7 +635,10 @@ impl crate::Store {
     /// the host's file hashes came from (ADR 0014 §7, amendment of
     /// 2026-10-08), kept with the digest it records. A host can only trust a
     /// declaration the revision makes, so `declared_trusted` for any other
-    /// digest is refused as invalid and records nothing.
+    /// digest is refused as invalid and records nothing. `model_type` is the
+    /// checkpoint's `config.json` `model_type` the host read (ADR 0033 §7,
+    /// amendment A12), kept with the recorded digest for a remote launch's
+    /// LMCache plan.
     #[allow(clippy::too_many_arguments)]
     pub fn record_checkpoint_measurement(
         &self,
@@ -600,6 +653,7 @@ impl crate::Store {
         provenance: DigestProvenance,
         tables: Option<capyctl_domain::disk_tables::CheckpointTables>,
         gguf: Option<capyctl_domain::gguf::GgufFacts>,
+        model_type: Option<&str>,
         now_ms: i64,
     ) -> Result<RecordOutcome> {
         if !is_checkpoint_digest(digest)
@@ -608,6 +662,7 @@ impl crate::Store {
             || layout.is_some_and(|layout| !layout.is_valid())
             || tables.is_some_and(|tables| !tables.is_valid() || tables.bytes > weights_bytes)
             || gguf.is_some_and(|gguf| !gguf.is_valid())
+            || !valid_model_type(model_type)
             || now_ms < 0
             || host_id.is_empty()
         {
@@ -643,6 +698,15 @@ impl crate::Store {
                     && (existing.state_slot_bytes.is_none()
                         || state_slot_bytes.is_none()
                         || existing.state_slot_bytes == state_slot_bytes);
+                // ADR 0033 §7 (amendment A12): a digest recorded before its
+                // host reported model types (or before v55) takes the one
+                // the same measurement names.
+                if same && model_type.is_some() {
+                    tx.execute(
+                        "UPDATE checkpoint_digests SET model_type=?3 WHERE deployment_id=?1 AND revision=?2 AND model_type IS NULL",
+                        params![deployment, revision, model_type],
+                    )?;
+                }
                 tx.commit()?;
                 return Ok(if same {
                     RecordOutcome::Recorded {
@@ -854,8 +918,8 @@ impl crate::Store {
             }
         }
         tx.execute(
-            "UPDATE checkpoint_digests SET state='recorded',digest=?3,weights_bytes=?4,host_id=?5,provisional=0,diagnostic=NULL,updated_at_ms=?6,state_slot_bytes=?7,provenance=?8 WHERE deployment_id=?1 AND revision=?2",
-            params![deployment, revision, digest, weights_bytes, host_id, now_ms, state_slot_bytes, provenance.code()],
+            "UPDATE checkpoint_digests SET state='recorded',digest=?3,weights_bytes=?4,host_id=?5,provisional=0,diagnostic=NULL,updated_at_ms=?6,state_slot_bytes=?7,provenance=?8,model_type=?9 WHERE deployment_id=?1 AND revision=?2",
+            params![deployment, revision, digest, weights_bytes, host_id, now_ms, state_slot_bytes, provenance.code(), model_type],
         )?;
         tx.commit()?;
         Ok(RecordOutcome::Recorded {

@@ -915,16 +915,19 @@ impl NativeHostExecution {
                 let sized = tokio::task::spawn_blocking(move || {
                     let size = checkpoints.size(&location.model_store, &location.checkpoint)?;
                     let weights = with_drafter(&checkpoints, &location, size.weights_bytes)?;
-                    Ok::<_, CheckpointError>((size, weights))
+                    // ADR 0033 amendment A12: the model type the server's
+                    // LMCache plan compares, known before the digest.
+                    Ok::<_, CheckpointError>((size, weights, location.model_type()))
                 })
                 .await
                 .map_err(|_| SessionError)?;
                 match sized {
-                    Ok((size, weights_bytes)) => pb::CheckpointDigestEvidence {
+                    Ok((size, weights_bytes, model_type)) => pb::CheckpointDigestEvidence {
                         state: "sized".into(),
                         weights_bytes,
                         file_count: size.file_count,
                         total_bytes: size.total_bytes,
+                        model_type: model_type.unwrap_or_default(),
                         ..Default::default()
                     },
                     Err(error) => refused(error.code()),
@@ -957,12 +960,22 @@ impl NativeHostExecution {
                         // ADR 0029 §9: what a llama.cpp launch loads, and
                         // its GGUF header.
                         location.gguf_facts(),
+                        // ADR 0033 amendment A12: the model type.
+                        location.model_type(),
                     ))
                 })
                 .await
                 .map_err(|_| SessionError)?;
                 match measured {
-                    Ok((verified, weights_bytes, state_slot_bytes, layout, tables, gguf)) => {
+                    Ok((
+                        verified,
+                        weights_bytes,
+                        state_slot_bytes,
+                        layout,
+                        tables,
+                        gguf,
+                        model_type,
+                    )) => {
                         let manifest = verified.manifest;
                         let mismatch = plan
                             .expected_digest
@@ -985,6 +998,7 @@ impl NativeHostExecution {
                                 .as_ref()
                                 .map(capyctl_protocol::execution::tables_to_wire),
                             gguf: gguf.as_ref().map(capyctl_protocol::execution::gguf_to_wire),
+                            model_type: model_type.unwrap_or_default(),
                         }
                     }
                     Err(error) => refused(error.code()),

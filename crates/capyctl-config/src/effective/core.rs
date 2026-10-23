@@ -483,6 +483,16 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
                 ));
             }
         }
+        // ADR 0033 §7 (amendment A12): a published product name is a table
+        // key exactly as the qualified table compares it.
+        if let Some(product) = device.product_name.as_deref() {
+            if crate::lmcache::table_key(product) != Some(product) {
+                return Err(invalid(
+                    format!("resource_policy.devices.{name}.product_name"),
+                    "must be printable ASCII without surrounding spaces, at most 128 bytes",
+                ));
+            }
+        }
     }
     check_domain_shape(&domains, &h.resource_policy.devices)?;
     let host = HostPolicy {

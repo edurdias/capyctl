@@ -1798,3 +1798,178 @@ fn a_server_member_exit_is_not_the_servers() {
         1
     );
 }
+
+/// ADR 0033 §7 (amendment A12): a test's qualified row, the Lab's vLLM
+/// 0.32.0 deep-parking a `qwen3` checkpoint on a GB10. The released table is
+/// empty until LC4 passes.
+const QWEN3_ON_GB10: &[lc::QualifiedParking] = &[lc::QualifiedParking {
+    engine: "vllm",
+    engine_version: "0.32.0",
+    model_type: "qwen3",
+    gpu: "NVIDIA GB10",
+    residency: "deep",
+}];
+
+/// A Lab whose GPU publishes the product name `NVIDIA GB10`, and a deep
+/// parking deployment on a checkpoint whose `config.json` names `model_type`.
+fn deep_on_gb10(model_type: &str) -> (Lab, DeploymentFence, tempfile::TempDir) {
+    let lab = Lab::new(|host| {
+        host["resource_policy"]["devices"]["gpu0"]["product_name"] = json!("NVIDIA GB10");
+    });
+    let checkpoint = tempfile::tempdir().unwrap();
+    std::fs::write(
+        checkpoint.path().join("config.json"),
+        json!({ "model_type": model_type }).to_string(),
+    )
+    .unwrap();
+    let fence = lab.deploy("deep", |c| {
+        c["residency"] = json!("deep");
+        c["model"]["path"] = json!(checkpoint.path().to_str().unwrap());
+    });
+    (lab, fence, checkpoint)
+}
+
+fn planned(lab: &Lab, context: &StepExecutionContext) -> PlannedLmcache {
+    lab.store
+        .launch_lmcache(&context.binding_id)
+        .unwrap()
+        .unwrap()
+        .planned
+}
+
+fn unqualified(model_type: &str) -> PlannedLmcache {
+    PlannedLmcache::Off(LmcacheOff::with_detail(
+        LmcacheOffReason::ParkUnqualified,
+        format!("not qualified with deep park on vLLM 0.32.0 / {model_type} / NVIDIA GB10"),
+    ))
+}
+
+// T45 (ADR 0033 §7, amendment A12): on the embedded host, a deep start's plan
+// compares the checkpoint's own `config.json` model type and the GPU's
+// published product name with the qualified table. A matching row runs
+// LMCache with leased ports; any other combination stays off and names the
+// real model type and GPU, never "unknown".
+#[test]
+fn an_embedded_deep_start_plans_lmcache_on_a_qualified_row_and_names_any_other() {
+    let (lab, fence, _checkpoint) = deep_on_gb10("qwen3");
+    let (_, context) = lab.start(&fence, 100);
+    assert_eq!(planned(&lab, &context), unqualified("qwen3"));
+
+    let (lab, fence, _checkpoint) = deep_on_gb10("qwen3");
+    QUALIFIED_PARKING.set(QWEN3_ON_GB10);
+    let (_, context) = lab.start(&fence, 100);
+    assert!(
+        matches!(planned(&lab, &context), PlannedLmcache::On(_)),
+        "{:?}",
+        planned(&lab, &context)
+    );
+    assert!(lab
+        .store
+        .launch_lmcache_grant(&context.binding_id)
+        .unwrap()
+        .is_some());
+
+    let (lab, fence, _checkpoint) = deep_on_gb10("llama");
+    let (_, context) = lab.start(&fence, 100);
+    assert_eq!(planned(&lab, &context), unqualified("llama"));
+    QUALIFIED_PARKING.set(lc::QUALIFIED_PARKING);
+}
+
+// T45 (ADR 0033 §7, amendment A12): an enrolled host's checkpoint is not on
+// the server's machine, so its plan compares the model type that host
+// reported with its sizing, then with its recorded digest; never what the
+// server's own disk holds. Before any report it is unknown.
+#[test]
+fn a_remote_plan_compares_the_model_type_its_host_reported() {
+    let (lab, fence, _checkpoint) = deep_on_gb10("llama");
+    lab.store
+        .conn
+        .execute_batch(
+            "INSERT INTO enrolled_hosts(host_id,host_name,key_digest,revoked) VALUES('lab','lab','key',0);
+             INSERT INTO host_versions VALUES('lab','0.1.6','supported','','[\"lmcache\"]',1);",
+        )
+        .unwrap();
+    QUALIFIED_PARKING.set(QWEN3_ON_GB10);
+    let plan = || {
+        let tx = lab.store.conn.unchecked_transaction().unwrap();
+        let (_, e) =
+            crate::checkpoint_digests::frozen_revision(&tx, &fence.deployment_id, fence.revision)
+                .unwrap();
+        plan_on(&tx, &fence.deployment_id, fence.revision, "lab", &e)
+            .unwrap()
+            .state
+    };
+    assert_eq!(
+        plan(),
+        lc::LmcacheState::Off(LmcacheOff::with_detail(
+            LmcacheOffReason::ParkUnqualified,
+            "not qualified with deep park on vLLM 0.32.0 / an unknown model type / NVIDIA GB10",
+        ))
+    );
+    // The host sized the checkpoint and read its model type.
+    assert!(lab
+        .store
+        .record_checkpoint_weights(
+            &lab.session,
+            &fence.deployment_id,
+            fence.revision,
+            "lab",
+            7,
+            Some("qwen3"),
+            200,
+        )
+        .unwrap());
+    assert_eq!(plan(), lc::LmcacheState::On);
+    // Its recorded digest names the model type from then on.
+    assert!(matches!(
+        lab.store
+            .record_checkpoint_measurement(
+                &lab.session,
+                &fence.deployment_id,
+                fence.revision,
+                "lab",
+                DIGEST,
+                7,
+                None,
+                None,
+                capyctl_config::effective::DigestProvenance::Measured,
+                None,
+                None,
+                Some("qwen3"),
+                300,
+            )
+            .unwrap(),
+        crate::checkpoint_digests::RecordOutcome::Recorded { .. }
+    ));
+    lab.store
+        .conn
+        .execute("DELETE FROM checkpoint_sizes", [])
+        .unwrap();
+    assert_eq!(plan(), lc::LmcacheState::On);
+    // A model type outside the table stays off and is named.
+    lab.store
+        .conn
+        .execute("UPDATE checkpoint_digests SET model_type='mistral'", [])
+        .unwrap();
+    assert_eq!(
+        plan(),
+        lc::LmcacheState::Off(LmcacheOff::with_detail(
+            LmcacheOffReason::ParkUnqualified,
+            "not qualified with deep park on vLLM 0.32.0 / mistral / NVIDIA GB10",
+        ))
+    );
+    // A model type that is not a table key is refused, and records nothing.
+    assert!(lab
+        .store
+        .record_checkpoint_weights(
+            &lab.session,
+            &fence.deployment_id,
+            fence.revision,
+            "lab",
+            7,
+            Some(" qwen3"),
+            400,
+        )
+        .is_err());
+    QUALIFIED_PARKING.set(lc::QUALIFIED_PARKING);
+}

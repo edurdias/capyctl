@@ -217,6 +217,10 @@ pub fn resource_policy(
                 if let [uuid] = published.physical_gpu_uuids.values().collect::<Vec<_>>()[..] {
                     gpu0["physical_gpu_uuid"] = json!(uuid);
                 }
+                // ADR 0033 §7 (amendment A12): the one device's product name.
+                if let [name] = published.product_names.values().collect::<Vec<_>>()[..] {
+                    gpu0["product_name"] = json!(name);
+                }
             }
             let domains = json!({
                 DOMAIN: {
@@ -270,6 +274,12 @@ pub fn resource_policy(
                     inventory.and_then(|published| published.physical_gpu_uuids.get(&gpu.index))
                 {
                     entry["physical_gpu_uuid"] = json!(uuid);
+                }
+                // ADR 0033 §7 (amendment A12): its product name likewise.
+                if let Some(name) =
+                    inventory.and_then(|published| published.product_names.get(&gpu.index))
+                {
+                    entry["product_name"] = json!(name);
                 }
                 devices.insert(id, entry);
             }

@@ -154,6 +154,7 @@ async fn the_supervisor_records_measurements_and_backs_off_after_refusals() {
             provenance: DigestProvenance::Measured,
             tables: None,
             gguf: None,
+            model_type: None,
         }),
         calls: AtomicUsize::new(0),
     });
@@ -184,6 +185,7 @@ async fn a_recorded_digest_keeps_where_it_came_from() {
             provenance: DigestProvenance::DeclaredTrusted,
             tables: None,
             gguf: None,
+            model_type: None,
         }),
         calls: AtomicUsize::new(0),
     });
@@ -203,6 +205,7 @@ async fn a_recorded_digest_keeps_where_it_came_from() {
             provenance: DigestProvenance::Fetched,
             tables: None,
             gguf: None,
+            model_type: None,
         }),
         calls: AtomicUsize::new(0),
     });
@@ -313,7 +316,7 @@ async fn the_embedded_source_counts_the_draft_models_weights() {
         .remove(0);
     let local = LocalDigests::new(checkpoints.clone());
     let sized = local.size(pending.clone()).await.unwrap();
-    assert_eq!(sized, target.weights_bytes + 13);
+    assert_eq!(sized.weights_bytes, target.weights_bytes + 13);
     let measured = local.measure(pending).await.unwrap();
     assert_eq!(
         measured.digest, target.digest,
@@ -335,7 +338,12 @@ impl DigestSource for SizedFirst {
         true
     }
     fn size(&self, _: PendingDigest) -> SizeFuture {
-        Box::pin(async { Ok(7) })
+        Box::pin(async {
+            Ok(SizedCheckpoint {
+                weights_bytes: 7,
+                model_type: None,
+            })
+        })
     }
     fn measure(&self, _: PendingDigest) -> MeasureFuture {
         // What a start accepted now would see: the sized weights, digest pending.
@@ -388,7 +396,7 @@ async fn the_supervisor_records_sized_weights_before_the_digest() {
         .measure(f.models.path(), &f.models.path().join("toy"))
         .unwrap()
         .manifest;
-    assert_eq!(sized, expected.weights_bytes);
+    assert_eq!(sized.weights_bytes, expected.weights_bytes);
 }
 
 /// Counts the engine calls a gate lets through.
@@ -749,6 +757,7 @@ async fn a_legacy_wake_measures_and_records_the_digest_first() {
                 provenance: DigestProvenance::Measured,
                 tables: None,
                 gguf: None,
+                model_type: None,
             })
         }
     };
@@ -814,6 +823,7 @@ async fn a_legacy_wake_is_refused_on_mismatch_or_without_a_measurement() {
                 provenance: DigestProvenance::Measured,
                 tables: None,
                 gguf: None,
+                model_type: None,
             })
         },
     )
@@ -848,6 +858,7 @@ async fn a_first_placement_mismatch_is_refused_as_checkpoint_mismatch() {
                 provenance: DigestProvenance::Measured,
                 tables: None,
                 gguf: None,
+                model_type: None,
             })
         },
     )
@@ -891,6 +902,7 @@ async fn a_first_placement_mismatch_is_refused_as_checkpoint_mismatch() {
                     provenance: DigestProvenance::Measured,
                     tables: None,
                     gguf: None,
+                    model_type: None,
                 })
             }
         },

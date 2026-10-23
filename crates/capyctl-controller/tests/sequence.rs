@@ -785,6 +785,7 @@ mod host_scoped {
                 "gpu0".into(),
                 DevicePolicy {
                     physical_gpu_uuid: None,
+                    product_name: None,
                     domain: "ram".into(),
                     sharing: Sharing::Shared,
                 },

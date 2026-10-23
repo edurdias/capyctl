@@ -505,10 +505,73 @@ pub fn parking_qualified_in(
     table.iter().any(|row| {
         row.engine == engine
             && row.engine_version == engine_version
-            && Some(row.model_type) == model_type
-            && Some(row.gpu) == gpu
+            && model_type.and_then(table_key) == Some(row.model_type)
+            && gpu.and_then(table_key) == Some(row.gpu)
             && row.residency == residency
     })
+}
+
+/// The longest model type or GPU product name the table compares.
+pub const MAX_TABLE_KEY_BYTES: usize = 128;
+
+/// ADR 0033 §7 (amendment A12): a model type or a GPU product name as the
+/// qualified table compares it: trimmed, then non-empty, at most
+/// [`MAX_TABLE_KEY_BYTES`] and printable ASCII (spaces included, as in
+/// `NVIDIA GB10`). Anything else is unknown, which no row matches. The
+/// table's rows are written in this form, and both plans (the store's and
+/// the host's) compare through it.
+pub fn table_key(raw: &str) -> Option<&str> {
+    let key = raw.trim();
+    (!key.is_empty()
+        && key.len() <= MAX_TABLE_KEY_BYTES
+        && key.bytes().all(|byte| (0x20..=0x7E).contains(&byte)))
+    .then_some(key)
+}
+
+/// ADR 0033 §7 (amendment A12): the checkpoint's `config.json` `model_type`
+/// under `checkpoint_root`, read where the launch reads it (bounded,
+/// [`crate::context_fit::read_model_config`]); `None` when unreadable or
+/// not a [`table_key`].
+pub fn checkpoint_model_type(checkpoint_root: &std::path::Path) -> Option<String> {
+    let config = crate::context_fit::read_model_config(checkpoint_root).ok()?;
+    table_key(config.get("model_type")?.as_str()?).map(str::to_owned)
+}
+
+/// [`checkpoint_model_type`] of `effective`'s checkpoint, where this machine
+/// sees it (`model.resolved_path`): the launching host's, or the embedded
+/// store's, which is on the same machine as its launches.
+pub fn launch_model_type(effective: &crate::effective::EffectiveDeployment) -> Option<String> {
+    checkpoint_model_type(std::path::Path::new(
+        effective.model.resolved_path.as_deref()?,
+    ))
+}
+
+/// ADR 0033 §7 (amendment A12): the product name of the GPU a launch of
+/// `effective` runs on, as its host published it from its GPU inventory
+/// (`resource_policy.devices.<id>.product_name`). The selected devices, or
+/// the host's devices when the deployment selects none, must all name the
+/// same product; otherwise (none published, or several products) it is
+/// unknown.
+pub fn launch_gpu(effective: &crate::effective::EffectiveDeployment) -> Option<&str> {
+    let host = &effective.host;
+    let names: Vec<Option<&str>> = if effective.selected_devices.is_empty() {
+        host.devices
+            .values()
+            .map(|device| device.product_name.as_deref())
+            .collect()
+    } else {
+        effective
+            .selected_devices
+            .iter()
+            .map(|claim| host.devices.get(&claim.id)?.product_name.as_deref())
+            .collect()
+    };
+    let first = (*names.first()?)?;
+    names
+        .iter()
+        .all(|name| *name == Some(first))
+        .then_some(first)
+        .and_then(table_key)
 }
 
 /// ADR 0033 §6: the defaults live row LC1 set on host A (GB10, 2026-10-22;

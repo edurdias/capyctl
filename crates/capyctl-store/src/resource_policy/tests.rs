@@ -28,6 +28,7 @@ fn host() -> HostPolicy {
             "gpu0".into(),
             DevicePolicy {
                 physical_gpu_uuid: None,
+                product_name: None,
                 domain: "system".into(),
                 sharing: Sharing::Shared,
             },

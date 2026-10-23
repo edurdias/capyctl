@@ -921,3 +921,32 @@ with neither. `capyctl engine list` likewise shows LMCache off with the reason u
 settings the running role reports, falling back to its role document when the role is
 not running. An `lmcache_off` or `lmcache_server_exited` detail longer than its bound
 keeps its end, marked `…` where it was cut: an engine log tail's last line is its error.
+
+**A12. Where the qualified table's model type and GPU come from (§7).** Found in review: a
+deep deployment always showed "LMCache off: not qualified with deep park on SGLang 0.5.22 /
+an unknown model type / an unknown GPU", because neither plan (the store's at a start, the
+host's at its launch) was given the checkpoint's model type or the GPU's product name, so
+no row of the table could ever match. Both plans now compare real values:
+
+- **The GPU.** Each host publishes, with its GPU inventory, the product name `nvidia-smi`
+  reports at boot (`resource_policy.devices.<id>.product_name`, kept across a reload as
+  the physical UUID is). A launch's GPU is the product its selected devices name, or its
+  host's devices when the deployment selects none; devices naming different products, or
+  none, are an unknown GPU. The product name is read from the revision's frozen host
+  policy, as every other host fact a launch uses is, so a revision accepted before its host
+  published product names plans with an unknown GPU until it is applied again.
+- **The model type.** It is the checkpoint's `config.json` `model_type`. The host reads it
+  where its launch reads the checkpoint, and so does the store for its embedded host, which
+  shares that machine. An enrolled host's checkpoint is not on the server's machine, so the
+  host reports the model type with its sizing and its measured digest, and the store keeps
+  it with them (schema v55: `model_type` on `checkpoint_sizes` and `checkpoint_digests`).
+  A remote start plans with the model type its host reported; before that host has sized
+  or measured the checkpoint the model type is unknown and the start plans LMCache off,
+  saying so. A digest recorded before v55 takes the model type the next identical
+  measurement names.
+- **The comparison.** Both values are compared trimmed, and only as printable ASCII of 1
+  to 128 bytes; anything else is unknown, which no row matches. A host's report naming a
+  model type in any other form is refused.
+
+The released table is unchanged: it is still empty until LC4 passes, so every parking
+combination stays off, now naming its real model type and GPU.

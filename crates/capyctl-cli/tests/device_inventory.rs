@@ -388,6 +388,14 @@ fn a_two_device_inventory_publishes_both_uuids_and_the_same_digest() {
     let devices = &host["resource_policy"]["devices"];
     assert_eq!(devices["gpu0"]["physical_gpu_uuid"], OTHER_UUID);
     assert_eq!(devices["gpu1"]["physical_gpu_uuid"], UUID);
+    // ADR 0033 amendment A12 (T45): each device's product name, by index.
+    assert_eq!(
+        (
+            &devices["gpu0"]["product_name"],
+            &devices["gpu1"]["product_name"]
+        ),
+        (&serde_json::json!("RTX"), &serde_json::json!("RTX"))
+    );
 }
 
 // T26 (design §1): the inventory and `nvidia-smi` must name the same UUID at
@@ -421,8 +429,9 @@ fn a_disagreeing_gpu_sample_publishes_no_uuids() {
     }
 }
 
-// T26: a unified host whose one device `nvidia-smi` also sees publishes the
-// same `gpu0` UUID as before.
+// T26 T45: a unified host whose one device `nvidia-smi` also sees publishes the
+// same `gpu0` UUID as before, and (ADR 0033 amendment A12) the product name the
+// sample reports, which an unsampled publication cannot know.
 #[test]
 fn a_sampled_single_device_publishes_gpu0_identically() {
     let single = || {
@@ -445,7 +454,15 @@ fn a_sampled_single_device_publishes_gpu0_identically() {
     )
     .unwrap();
     let unsampled = collect_with(Path::new("/any"), None, &|_root| single()).unwrap();
-    assert_eq!(sampled, unsampled);
+    assert_eq!(
+        (&sampled.digest, &sampled.physical_gpu_uuids),
+        (&unsampled.digest, &unsampled.physical_gpu_uuids)
+    );
+    assert_eq!(
+        sampled.product_names,
+        BTreeMap::from([(0, "GB10".to_owned())])
+    );
+    assert!(unsampled.product_names.is_empty());
     let document = |published| {
         standalone_config::host_policy(
             &named(&installation()),
@@ -456,11 +473,15 @@ fn a_sampled_single_device_publishes_gpu0_identically() {
             capyctl_config::engine_settings::DEFAULT_ENGINE_PORTS,
         )
     };
-    assert_eq!(document(&sampled), document(&unsampled));
-    assert_eq!(
-        document(&sampled)["resource_policy"]["devices"]["gpu0"]["physical_gpu_uuid"],
-        UUID
-    );
+    let mut named_gpu = document(&sampled);
+    let gpu0 = &mut named_gpu["resource_policy"]["devices"]["gpu0"];
+    assert_eq!(gpu0["physical_gpu_uuid"], UUID);
+    assert_eq!(gpu0["product_name"], "GB10");
+    gpu0.as_object_mut().unwrap().remove("product_name");
+    assert_eq!(named_gpu, document(&unsampled));
+    // The published name resolves as the host's device product.
+    let policy = capyctl_config::effective::normalize_host_policy(&document(&sampled)).unwrap();
+    assert_eq!(policy.devices["gpu0"].product_name.as_deref(), Some("GB10"));
 }
 
 // T26 (design §1, carried must-do): on a unified host (GB10) whose one device
@@ -539,14 +560,16 @@ fn a_unified_host_whose_sample_disagrees_publishes_no_uuid_and_still_resolves() 
     }
 }
 
-// T14 T22 T37: remote hosts fill missing placement evidence without changing
-// their enrolled name, other devices, or explicit administrator pins.
+// T14 T22 T37 T45: remote hosts fill missing placement evidence (and, ADR 0033
+// amendment A12, each device's product name) without changing their enrolled
+// name, other devices, or explicit administrator pins.
 #[test]
 fn remote_host_publication_preserves_aliases_and_explicit_pins() {
     let publication = capyctl_cli::device_inventory::InventoryPublication {
         host_id: "kernel-host".into(),
         digest: DIGEST.into(),
         physical_gpu_uuids: BTreeMap::from([(0, UUID.into())]),
+        product_names: BTreeMap::from([(0, "NVIDIA GB10".into())]),
     };
     let mut host = serde_json::json!({
         "name": "gpu-box",
@@ -562,12 +585,20 @@ fn remote_host_publication_preserves_aliases_and_explicit_pins() {
         host["resource_policy"]["devices"]["gpu0"]["physical_gpu_uuid"],
         UUID
     );
+    assert_eq!(
+        host["resource_policy"]["devices"]["gpu0"]["product_name"],
+        "NVIDIA GB10"
+    );
     assert!(host["resource_policy"]["devices"]["gpu1"]
         .get("physical_gpu_uuid")
+        .is_none());
+    assert!(host["resource_policy"]["devices"]["gpu1"]
+        .get("product_name")
         .is_none());
     host["device_inventory_digest"] = serde_json::json!("explicit-pin");
     host["resource_policy"]["devices"]["gpu0"]["physical_gpu_uuid"] =
         serde_json::json!("explicit-uuid");
+    host["resource_policy"]["devices"]["gpu0"]["product_name"] = serde_json::json!("Stated GPU");
     let pinned = host.clone();
     capyctl_cli::device_inventory::publish_host(&mut host, Some(&publication));
     assert_eq!(
@@ -591,6 +622,7 @@ fn engine_reload_retains_boot_evidence_and_exposes_explicit_pin_changes() {
             host_id: "kernel-host".into(),
             digest: DIGEST.into(),
             physical_gpu_uuids: BTreeMap::from([(0, UUID.into())]),
+            product_names: BTreeMap::from([(0, "NVIDIA GB10".into())]),
         }),
     );
     let mut reloaded = original;

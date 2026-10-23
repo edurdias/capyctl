@@ -719,11 +719,12 @@ pub fn carry_start_settings(running: &Value, reloaded: &mut Value) {
         .and_then(Value::as_object_mut)
     {
         for (id, device) in devices {
-            if device["physical_gpu_uuid"].is_null() {
-                if let Some(uuid) =
-                    running["resource_policy"]["devices"][id].get("physical_gpu_uuid")
-                {
-                    device["physical_gpu_uuid"] = uuid.clone();
+            // ADR 0033 amendment A12: the boot-observed product name too.
+            for fact in ["physical_gpu_uuid", "product_name"] {
+                if device[fact].is_null() {
+                    if let Some(value) = running["resource_policy"]["devices"][id].get(fact) {
+                        device[fact] = value.clone();
+                    }
                 }
             }
         }

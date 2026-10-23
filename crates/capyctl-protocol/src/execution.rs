@@ -1750,11 +1750,17 @@ fn validate_checkpoint(
 ) -> Result<(), GroupIdentityError> {
     use capyctl_config::effective::DigestProvenance;
     let provenance = DigestProvenance::parse(&evidence.provenance);
+    // ADR 0033 amendment A12: a model type, when named, is a table key as the
+    // qualified parking table compares it.
+    let model_type = evidence.model_type.is_empty()
+        || capyctl_config::lmcache::table_key(&evidence.model_type)
+            == Some(evidence.model_type.as_str());
     let measured = capyctl_config::effective::is_checkpoint_digest(&evidence.digest)
         && evidence.weights_bytes >= 0
         && u64::try_from(evidence.weights_bytes).is_ok_and(|w| w <= evidence.total_bytes)
         && evidence.file_count <= 65_536
         && evidence.reason.is_empty()
+        && model_type
         && evidence.state_slot_bytes.is_none_or(|bytes| bytes > 0)
         // ADR 0028 §5: a layout splits no more than the weights measured.
         && evidence.layout.as_ref().is_none_or(|layout| {
@@ -1787,6 +1793,7 @@ fn validate_checkpoint(
                 && u64::try_from(evidence.weights_bytes).is_ok_and(|w| w <= evidence.total_bytes)
                 && evidence.file_count <= 65_536
                 && evidence.reason.is_empty()
+                && model_type
                 && !evidence.full_rehash
                 && evidence.state_slot_bytes.is_none()
                 && evidence.layout.is_none()
@@ -1819,6 +1826,7 @@ fn validate_checkpoint(
                 && evidence.provenance.is_empty()
                 && evidence.tables.is_none()
                 && evidence.gguf.is_none()
+                && evidence.model_type.is_empty()
                 && CHECKPOINT_REFUSALS.contains(&evidence.reason.as_str())
         }
         _ => false,

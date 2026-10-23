@@ -110,6 +110,7 @@ fn evidence(state: &str, digest: &str) -> pb::CheckpointDigestEvidence {
         provenance: String::new(),
         tables: None,
         gguf: None,
+        model_type: String::new(),
     }
 }
 
@@ -669,6 +670,49 @@ fn a_size_only_request_is_answered_with_weights_and_no_digest() {
             "{evidence:?}"
         );
     }
+}
+
+// T45 (ADR 0033 §7, amendment A12): a computed, mismatch or sized result may
+// name the checkpoint's model type, only as the qualified parking table
+// compares it (trimmed printable ASCII, 1 to 128 bytes); a refusal names none.
+#[test]
+fn a_checkpoint_result_names_its_model_type_as_a_table_key() {
+    let open = digest_command("");
+    let mut wire = request("");
+    wire.size_only = true;
+    let mut sizing = decode(pb::execute_member::Action::DigestCheckpoint(wire)).unwrap();
+    sizing.identity.payload_digest = sizing.canonical_digest();
+    let sized = pb::CheckpointDigestEvidence {
+        state: "sized".into(),
+        weights_bytes: 10,
+        file_count: 2,
+        total_bytes: 12,
+        ..Default::default()
+    };
+    let named =
+        |evidence: pb::CheckpointDigestEvidence, model_type: &str| pb::CheckpointDigestEvidence {
+            model_type: model_type.into(),
+            ..evidence
+        };
+    for (command, evidence) in [
+        (&open, evidence("computed", DIGEST)),
+        (&sizing, sized.clone()),
+    ] {
+        validate_result(command, &result(command, named(evidence.clone(), "qwen3"))).unwrap();
+        for bad in [" qwen3", "qwen\u{e9}", "qwen\n3", &"q".repeat(129)] {
+            assert!(
+                validate_result(command, &result(command, named(evidence.clone(), bad))).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+    let refusal = pb::CheckpointDigestEvidence {
+        state: "refused".into(),
+        reason: "unsafe_file".into(),
+        model_type: "qwen3".into(),
+        ..Default::default()
+    };
+    assert!(validate_result(&open, &result(&open, refusal)).is_err());
 }
 
 // T42 (ADR 0029 §9): a llama.cpp launch plan carries the GGUF facts its

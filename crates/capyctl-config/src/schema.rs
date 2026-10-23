@@ -296,6 +296,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("domain", SCALAR),
         ("sharing", SCALAR),
         ("physical_gpu_uuid", SCALAR),
+        // ADR 0033 amendment A12: the inventory's product name.
+        ("product_name", SCALAR),
     ]);
     const QUEUE: &[(&str, FieldSpec)] = &[
         ("max_pending_per_deployment", SCALAR),

@@ -62,6 +62,9 @@ pub struct Measured {
     /// ADR 0029 §9: a llama.cpp launch's GGUF facts, which its request is
     /// derived from.
     pub gguf: Option<capyctl_domain::gguf::GgufFacts>,
+    /// ADR 0033 §7 (amendment A12): the checkpoint's `config.json`
+    /// `model_type`, which a remote launch's LMCache plan compares.
+    pub model_type: Option<String>,
 }
 
 /// Why a measurement produced no digest.
@@ -75,8 +78,15 @@ pub enum MeasureError {
 
 pub type MeasureFuture = Pin<Box<dyn Future<Output = Result<Measured, MeasureError>> + Send>>;
 
-/// The weights a sizing found (owner decision 2026-09-23, solo first start).
-pub type SizeFuture = Pin<Box<dyn Future<Output = Result<i64, MeasureError>> + Send>>;
+/// The weights a sizing found (owner decision 2026-09-23, solo first start),
+/// and (ADR 0033 amendment A12) the checkpoint's model type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SizedCheckpoint {
+    pub weights_bytes: i64,
+    pub model_type: Option<String>,
+}
+
+pub type SizeFuture = Pin<Box<dyn Future<Output = Result<SizedCheckpoint, MeasureError>> + Send>>;
 
 /// Where a pending digest is measured.
 pub trait DigestSource: Send + Sync + 'static {
@@ -119,24 +129,33 @@ pub fn measured_from(result: &pb::MemberExecutionResult) -> Result<Measured, Mea
                 .gguf
                 .as_ref()
                 .and_then(capyctl_protocol::execution::gguf_from_wire),
+            model_type: model_type(evidence),
         }),
         "refused" => Err(MeasureError::Refused(evidence.reason.clone())),
         _ => Err(MeasureError::Unavailable),
     }
 }
 
-/// What a size-only DigestCheckpoint result proves: the weights, or a closed
-/// refusal.
-pub fn sized_from(result: &pb::MemberExecutionResult) -> Result<i64, MeasureError> {
+/// What a size-only DigestCheckpoint result proves: the weights and the
+/// model type, or a closed refusal.
+pub fn sized_from(result: &pb::MemberExecutionResult) -> Result<SizedCheckpoint, MeasureError> {
     let evidence = result
         .checkpoint
         .as_ref()
         .ok_or(MeasureError::Unavailable)?;
     match evidence.state.as_str() {
-        "sized" => Ok(evidence.weights_bytes),
+        "sized" => Ok(SizedCheckpoint {
+            weights_bytes: evidence.weights_bytes,
+            model_type: model_type(evidence),
+        }),
         "refused" => Err(MeasureError::Refused(evidence.reason.clone())),
         _ => Err(MeasureError::Unavailable),
     }
+}
+
+/// ADR 0033 amendment A12: the evidence's model type, when it names one.
+fn model_type(evidence: &pb::CheckpointDigestEvidence) -> Option<String> {
+    capyctl_config::lmcache::table_key(&evidence.model_type).map(str::to_owned)
 }
 
 /// Record a measurement under the owner. The recorded digest is returned only
@@ -163,6 +182,7 @@ pub fn record(
             measured.provenance,
             measured.tables,
             measured.gguf,
+            measured.model_type.as_deref(),
             capyctl_protocol::now_unix_ms(),
         )
         .map_err(|_| MeasureError::Unavailable)
@@ -441,8 +461,8 @@ impl LocalDigests {
 }
 
 /// The checkpoint's verification, its weights with the draft model's, its
-/// hybrid state slot, its layout, its tables and a llama.cpp launch's GGUF
-/// facts.
+/// hybrid state slot, its layout, its tables, a llama.cpp launch's GGUF
+/// facts and its model type.
 type LocalMeasurement = (
     capyctl_agent::checkpoint::Verification,
     i64,
@@ -450,6 +470,7 @@ type LocalMeasurement = (
     Option<capyctl_domain::member_weights::CheckpointLayout>,
     Option<capyctl_domain::disk_tables::CheckpointTables>,
     Option<capyctl_domain::gguf::GgufFacts>,
+    Option<String>,
 );
 
 /// Measure an effective revision's checkpoint on this machine, with the
@@ -489,6 +510,8 @@ async fn measure_locally(
             tables.filter(|tables| tables.bytes <= weights),
             // ADR 0029 §9: what a llama.cpp launch loads and its header.
             effective.gguf_facts(),
+            // ADR 0033 amendment A12: the checkpoint's model type.
+            capyctl_config::lmcache::launch_model_type(&effective),
         ))
     })
     .await
@@ -505,7 +528,7 @@ impl DigestSource for LocalDigests {
     fn measure(&self, pending: PendingDigest) -> MeasureFuture {
         let checkpoints = self.checkpoints.clone();
         Box::pin(async move {
-            let (verified, weights_bytes, state_slot_bytes, layout, tables, gguf) =
+            let (verified, weights_bytes, state_slot_bytes, layout, tables, gguf, model_type) =
                 measure_locally(checkpoints, &pending.effective).await?;
             Ok(Measured {
                 digest: verified.manifest.digest,
@@ -515,6 +538,7 @@ impl DigestSource for LocalDigests {
                 provenance: verified.provenance,
                 tables,
                 gguf,
+                model_type,
             })
         })
     }
@@ -529,7 +553,8 @@ impl DigestSource for LocalDigests {
                 .map_err(|_| MeasureError::Refused("not_materializable".into()))?
                 .to_owned();
             let drafter = pending.effective.drafter_location();
-            tokio::task::spawn_blocking(move || {
+            let model_type = capyctl_config::lmcache::launch_model_type(&pending.effective);
+            let weights_bytes = tokio::task::spawn_blocking(move || {
                 let size = checkpoints.size(&store, Path::new(&checkpoint))?;
                 checkpoints
                     .drafter_weights(drafter.as_ref())?
@@ -538,7 +563,11 @@ impl DigestSource for LocalDigests {
             })
             .await
             .map_err(|_| MeasureError::Unavailable)?
-            .map_err(|error| MeasureError::Refused(error.code().into()))
+            .map_err(|error| MeasureError::Refused(error.code().into()))?;
+            Ok(SizedCheckpoint {
+                weights_bytes,
+                model_type,
+            })
         })
     }
 }
@@ -638,14 +667,15 @@ impl CheckpointDigests {
                 // estimate is known within seconds rather than after the full
                 // hash. A sizing that fails changes nothing; the digest follows.
                 if digest.weights_bytes.is_none() {
-                    if let Ok(weights) = this.source.size(digest.clone()).await {
+                    if let Ok(sized) = this.source.size(digest.clone()).await {
                         if let Ok(owner) = this.owner.lock() {
                             let _ = owner.store().record_checkpoint_weights(
                                 owner.session(),
                                 &digest.deployment_id,
                                 digest.revision,
                                 &host,
-                                weights,
+                                sized.weights_bytes,
+                                sized.model_type.as_deref(),
                                 capyctl_protocol::now_unix_ms(),
                             );
                         }
@@ -771,7 +801,7 @@ impl CheckpointGate {
                 .recorded_checkpoint(&self.deployment_id, self.revision)
                 .map_err(|_| unrecorded())?
         };
-        let (measured, weights_bytes, state_slot_bytes, layout, tables, gguf) =
+        let (measured, weights_bytes, state_slot_bytes, layout, tables, gguf, model_type) =
             measure_locally(self.checkpoints.clone(), &self.effective)
                 .await
                 .map_err(|error| match error {
@@ -811,6 +841,7 @@ impl CheckpointGate {
                         provenance: measured.provenance,
                         tables,
                         gguf,
+                        model_type,
                     },
                 )
                 .map_err(|_| unrecorded())?;

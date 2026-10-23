@@ -132,6 +132,7 @@ fn admit_measured(
                 capyctl_config::effective::DigestProvenance::Measured,
                 None,
                 Some(gguf),
+                None,
                 1750,
             )
             .expect("record the checkpoint measurement");

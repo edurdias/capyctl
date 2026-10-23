@@ -1202,6 +1202,15 @@ CREATE TABLE IF NOT EXISTS embedded_host_settings(
 );
 "#;
 
+/// v55 (ADR 0033 §7, amendment A12): the checkpoint's `config.json`
+/// `model_type` a host reported with its sizing (`checkpoint_sizes`) or its
+/// measured digest (`checkpoint_digests`), which a remote launch's LMCache
+/// plan compares with the qualified parking table. A row written before v55
+/// reads null, an unknown model type. The columns are added by
+/// `checkpoint_digests::migrate_v55` only when missing. Additive and
+/// forward-only.
+pub const SCHEMA_V55: &str = "-- checkpoint model types (checkpoint_digests::migrate_v55)";
+
 #[cfg(test)]
 mod tests {
     use super::*;

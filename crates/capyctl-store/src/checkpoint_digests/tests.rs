@@ -255,6 +255,7 @@ fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
             DigestProvenance::Measured,
             None,
             None,
+            None,
             2
         ),
         Err(CheckpointDigestError::Invalid)
@@ -270,6 +271,7 @@ fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
             Some(slot),
             None,
             DigestProvenance::Measured,
+            None,
             None,
             None,
             2,
@@ -301,6 +303,7 @@ fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
                 Some(slot + 1),
                 None,
                 DigestProvenance::Measured,
+                None,
                 None,
                 None,
                 3
@@ -364,6 +367,7 @@ fn measured_tables_size_an_engine_that_keeps_them_on_disk() {
             DigestProvenance::Measured,
             Some(too_large),
             None,
+            None,
             2
         ),
         Err(CheckpointDigestError::Invalid)
@@ -380,6 +384,7 @@ fn measured_tables_size_an_engine_that_keeps_them_on_disk() {
             None,
             DigestProvenance::Measured,
             Some(tables),
+            None,
             None,
             2,
         )
@@ -768,7 +773,7 @@ fn a_recorded_digest_keeps_its_provenance() {
     let declared = deploy(&store, &session, "declared", &config, &host);
     let record = |id: &str, digest: &str, provenance| {
         store.record_checkpoint_measurement(
-            &session, id, 1, "lab", digest, 7, None, None, provenance, None, None, 2,
+            &session, id, 1, "lab", digest, 7, None, None, provenance, None, None, None, 2,
         )
     };
     for (id, digest) in [

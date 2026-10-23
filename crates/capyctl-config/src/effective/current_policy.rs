@@ -150,6 +150,10 @@ pub fn compose_current_resource_controls(
         if let Some(uuid) = &device.physical_gpu_uuid {
             composed["resource_policy"]["devices"][id]["physical_gpu_uuid"] = json!(uuid);
         }
+        // ADR 0033 amendment A12: the inventory's product name likewise.
+        if let Some(product) = &device.product_name {
+            composed["resource_policy"]["devices"][id]["product_name"] = json!(product);
+        }
     }
     // ADR 0028 §3: the groups block (peer address, rendezvous range) is host
     // context, not a resource control, so a group deploy reads it from the

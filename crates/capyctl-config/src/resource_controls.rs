@@ -148,6 +148,7 @@ mod tests {
                     domain: "system".into(),
                     sharing: Sharing::Exclusive,
                     physical_gpu_uuid: None,
+                    product_name: None,
                 },
             )]),
             max_parked: controls.max_parked,

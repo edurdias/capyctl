@@ -313,12 +313,58 @@ fn fallback_recorded(
     )?)
 }
 
+/// ADR 0033 §7: the qualified parking table the store plans against, the
+/// released [`lc::QUALIFIED_PARKING`]. A test substitutes its own rows on its
+/// thread, as the released table is empty until LC4 passes.
+#[cfg(not(test))]
+fn qualified_parking() -> &'static [lc::QualifiedParking] {
+    lc::QUALIFIED_PARKING
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static QUALIFIED_PARKING: std::cell::Cell<&'static [lc::QualifiedParking]> =
+        const { std::cell::Cell::new(lc::QUALIFIED_PARKING) };
+}
+
+#[cfg(test)]
+fn qualified_parking() -> &'static [lc::QualifiedParking] {
+    QUALIFIED_PARKING.with(std::cell::Cell::get)
+}
+
+/// ADR 0033 §7 (amendment A12): the checkpoint's model type for a launch on
+/// `host`. The embedded host's checkpoint is on this machine, so its
+/// `config.json` is read where the launch reads it; an enrolled host's is
+/// the one that host reported with its sizing or its recorded digest, unknown
+/// until it has reported one.
+fn model_type_on(
+    conn: &rusqlite::Connection,
+    deployment_id: &str,
+    revision: i64,
+    host: &str,
+    e: &EffectiveDeployment,
+) -> Result<Option<String>, LifecycleError> {
+    let enrolled: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM enrolled_hosts WHERE host_id=?1)",
+        [host],
+        |r| r.get(0),
+    )?;
+    if !enrolled {
+        return Ok(lc::launch_model_type(e));
+    }
+    Ok(
+        crate::checkpoint_digests::recorded_model_type(conn, deployment_id, revision)?
+            .filter(|model_type| lc::table_key(model_type) == Some(model_type.as_str())),
+    )
+}
+
 /// Contract decision 2: the plan for this revision on `host`, from what the
 /// store holds: the frozen revision (declared settings, profile and its
-/// registration, residency, engine options), the host's published settings
-/// and declared capabilities, and the sticky fallback. The checkpoint's
-/// `model_type` and the GPU's product name are not in the store, so a parking
-/// residency is judged against the qualified table with both unknown.
+/// registration, residency, engine options, and the product name of the GPU
+/// the host published for its devices), the host's published settings and
+/// declared capabilities, the sticky fallback and, for a parking residency,
+/// the checkpoint's model type ([`model_type_on`]), which the qualified table
+/// compares (ADR 0033 §7, amendment A12).
 pub(super) fn plan_on(
     conn: &rusqlite::Connection,
     deployment_id: &str,
@@ -335,6 +381,12 @@ pub(super) fn plan_on(
             params![host, capability],
             |r| r.get(0),
         )?)
+    };
+    // Only a parking residency compares the model type.
+    let model_type = if e.residency.parks() {
+        model_type_on(conn, deployment_id, revision, host, e)?
+    } else {
+        None
     };
     let pool_bytes = e.lmcache_pool_bytes;
     let inputs = PlanInputs {
@@ -363,11 +415,11 @@ pub(super) fn plan_on(
         ),
         engine_start_failed: fallback_recorded(conn, deployment_id, revision, host, e)?,
         discrete_gpu: domains(e).is_ok_and(|d| d.device.is_some()),
-        model_type: None,
-        gpu: None,
+        model_type: model_type.as_deref(),
+        gpu: lc::launch_gpu(e),
         ..PlanInputs::for_profile(e.profile.engine, &e.profile.build_fingerprint, e.residency)
     };
-    Ok(lc::plan(&inputs))
+    Ok(lc::plan_with_table(&inputs, qualified_parking()))
 }
 
 /// The charge a plan reserves, with the revision's measured figures where

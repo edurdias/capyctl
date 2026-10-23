@@ -655,6 +655,13 @@ pub struct DevicePolicy {
     /// publishes no UUID, and placement then fails closed at the gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical_gpu_uuid: Option<String>,
+    /// ADR 0033 §7 (amendment A12): the device's product name as the host's
+    /// GPU inventory (its boot `nvidia-smi` sample) reports it, published
+    /// by the host beside the UUID; the qualified LMCache parking table is
+    /// keyed on it. Optional: a host that publishes none leaves the GPU
+    /// unknown, which no row of the table matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_name: Option<String>,
 }
 /// Discrete GPU design §7 (review decision): how an engine child's CUDA
 /// namespace is narrowed to the one GPU its launch selected.
@@ -1193,6 +1200,7 @@ pub fn compose_resource_policy(
                     domain: domain.clone(),
                     sharing,
                     physical_gpu_uuid: None,
+                    product_name: None,
                 },
             )
         })

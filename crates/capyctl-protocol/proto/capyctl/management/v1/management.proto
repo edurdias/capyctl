@@ -792,6 +792,11 @@ message CheckpointDigestEvidence {
   // ADR 0029 §9: a llama.cpp deployment's GGUF facts; computed and mismatch
   // only. Empty from an older host, which reads no GGUF header.
   CheckpointGguf gguf = 12;
+  // ADR 0033 §7 (amendment A12, additive): the checkpoint's `config.json`
+  // `model_type` as the qualified LMCache parking table compares it
+  // (`lmcache::table_key`); computed, mismatch and sized only. Empty when
+  // unreadable, and from an older host.
+  string model_type = 13;
 }
 message ResidencyEvidence {
   string state = 1;                      // parked | restored | unchanged | unknown
