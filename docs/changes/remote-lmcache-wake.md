@@ -35,7 +35,20 @@ canary was reached: a restart-park's wake restarts the engine. That window is ch
 separately (branch `fix/restart-park-wake-window`); the SGLang live check below declares
 `timeouts.wake`.
 
-Live check: LIVE-PENDING
+Live check (2026-10-23, host A, server on the control host at 17443/18443, fresh state
+on both, `fe0b16ad` built on each machine): Qwen3-4B, `restart_only`, `lmcache:
+required`, 20 GiB pool, 5 GiB KV cache, 32k context, `timeouts.initialize` 1200 s, each
+deployment parked and woken by a chat request 3 times, all at generation 1 on the same
+launch, every wake answering 200 and Ready with no last error:
+
+- vLLM 0.32.0 (`~/vllm-0.32.0-lmcache-venv`, the deployment that failed): wakes of
+  80.2, 77.4 and 78.4 s (restore accepted to completed 79.5, 76.7, 77.7 s).
+- SGLang 0.5.22 (`~/sglang-0.5.22-lmcache-venv`), with `timeouts.wake: 1200s`: wakes of
+  107.6, 106.1 and 109.0 s (105.5-108.3 s restores), past the 105 s derived window.
+
+Both readiness canary references were recorded and every wake was compared with them.
+Host A was left with no CapyCTL or engine process, listener or GPU process, and with
+`/tmp` and `/dev/shm` back at their starting counts.
 
 # Release note: Fixes
 
