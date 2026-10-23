@@ -108,13 +108,73 @@ CPU and Fake-engine tests are not qualification.
   gets `rid` and no ID header reaches the engine; SGLang 0.5.21 is refused and gets no
   `rid`; the ingress sets `rid` from a valid header only on a capable chat launch.
 
-## Live (host A, SGLang 0.5.22)
+## Live (host A, SGLang 0.5.22, 2026-10-22)
 
-Not run yet. Host A was held by the LMCache live rows when this branch was finished. All
-four rows remain: L1 (an abort settles within one decode step under steady traffic), L2
-(a deadline cut before output settles promptly), L3 (the host path through host A's
-ingress and agent) and L4 (32 cut decisions fill the limit and the instance restarts).
-Until they pass, nothing here is qualified on a real engine.
+The binaries were built from `8df7a399`: host A built its own from the synced tree, and
+the control host's server binary came from the snapshot before the rebase, whose
+`crates/` and `Cargo.*` are the same. The standalone rows used a fresh state directory
+with `managed_limit` 108 GiB and `free_reserve` 8 GiB. The chat model is Qwen3-4B-Instruct.
+Gauges are `sglang:num_running_reqs` and `sglang:num_queue_reqs`, read from the engine's
+loopback `/metrics` every 50 ms. Times are the router's `router_abort_settled`
+`elapsed_ms`, which runs from the router asking for the abort to the settlement.
+
+- **L1, passes, except that settling takes about two decode steps, not one.** Standalone,
+  context 8192. 4 background streams kept the engine busy, and a fifth (the victim) hung
+  up mid-stream, 8 times in all.
+  - Every victim was acknowledged by its own ID 66–78 ms after the abort (68, 78, 75, 74,
+    66, 76, 77, 76 ms).
+  - The engine took 38.8 ms per step with 5 requests running (5 / 128.8 tokens/s, the mean
+    of 23 decode-batch lines), so settling took 1.7–2.0 steps after the router asked.
+  - Between each hang-up and the end of the background traffic, running + waiting never
+    read below 4.
+  - In the 7 runs with the longer victim (120–200 chunks), the running count went from 5
+    to 4. In the first run the victim hung up after 8 chunks, before any batch report
+    counted it.
+  - 40 `request_cancellation_acknowledged` events, one per lease (8 victims and the 32
+    background streams cut at the end), and no lease left open.
+  - [INFERENCE] The 66–78 ms includes the HTTP post to the engine, SGLang's hop from its
+    tokenizer to its scheduler, the step already in progress and the "one more forward
+    pass" the ADR reads in `scheduler.py`. When the abort reached the scheduler was not
+    measured, so "within one decode step of the abort reaching the engine" is neither
+    shown nor ruled out.
+- **L2, passes.** Standalone, `queue.request_deadline` 240 s. A 90 s deadline cannot be
+  used: `timeouts.initialize` may not exceed it, and the SGLang start did not fit in 90 s
+  (`launch_failed`, the engine was cleaned up). The deployment ran 1 request at a time,
+  context 32768. A blocker streamed up to 24000 tokens, and the victim, sent 0.10 s
+  after it:
+  - waited in SGLang's queue (gauges: 1 running, 1 waiting from 1.2 s to 241.8 s);
+  - was cut at its deadline with no output (stream headers, 0 chunks, then the end);
+  - was aborted and acknowledged by its ID 42 ms after the abort, against a stream idle
+    bound of 120 s. The waiting count went to 0 while the blocker still ran.
+
+  The collected variant was not run.
+- **L3, passes.** A server on the control host, with host A as its host: the harness's
+  `normal` host policy, the ingress on port 9443 and the same model. The victim and 4
+  background streams went through the server's endpoint, 3 times; gauges were read over an
+  SSH forward to the engine's loopback port.
+  - Each answer's `id` was the response's `X-CapyCTL-Request-Id`: the ingress set `rid`.
+  - Each abort was sent (`sent: true`: the agent's `AbortRequest` answered within its
+    bound), and the lease was acknowledged on the final output relayed through the
+    ingress, 79, 92 and 76 ms after the abort.
+  - Running + waiting never read below 4, and the running count went from 5 to 4.
+  - 15 acknowledgements (3 victims, 12 background streams) and no lease left open.
+  - The host ran without engine logs, so the engine's own record of `/abort_request` was
+    not captured.
+- **L4, passes.** Standalone, a decisions deployment of Clef Flash (context 8192). One
+  decision with this state took 1.74 s (8185 input tokens). 32 decisions were sent and all
+  hung up 1.0 s later, before any answer. The 33rd was sent 3 s after the hang-ups.
+  - Within 35 ms the store accepted a stop and journaled
+    `instance_restarted_for_held_requests` (count 32, generation 1).
+  - On the verified exit, `request_cancellation_acknowledged` settled all 32 with the
+    receipt "cancelled before the engine answered; stop operation … verified the exit of
+    the instance's process group".
+  - The instance started again 6.3 s after the stop.
+  - The 33rd request was answered 200 by the restarted instance (a new binding) 140.2 s
+    after it was sent; its own time to response was 1.71 s. No lease was left open.
+
+Host A was cleaned afterwards: no role, engine or listener left, and the run
+directories, the synced tree, and this session's `/tmp` and `/dev/shm` entries (65, the 6
+per-launch `sglang_loads_*.shm` included) were removed.
 
 # Release note: Requests
 
