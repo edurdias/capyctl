@@ -72,6 +72,11 @@ struct CacheHost {
     steps: Mutex<Vec<Step>>,
     settlements: Mutex<Vec<SettlementContext>>,
     cleanups: Mutex<Vec<CleanupExecutionContext>>,
+    /// A remote host's view of the launch's processes alive now, which its
+    /// answer to a wake canary reports.
+    alive: Mutex<Vec<ProcessIdentity>>,
+    /// Whether each wake canary a remote host answered counted.
+    canaries: Mutex<Vec<bool>>,
 }
 
 impl CacheHost {
@@ -88,6 +93,8 @@ impl CacheHost {
             steps: Mutex::new(Vec::new()),
             settlements: Mutex::new(Vec::new()),
             cleanups: Mutex::new(Vec::new()),
+            alive: Mutex::new(Vec::new()),
+            canaries: Mutex::new(Vec::new()),
         })
     }
 
@@ -404,6 +411,7 @@ impl Launch {
                     return Err(RuntimeError::LaunchFailed(result.launch_failure));
                 }
                 launched = alive(&result);
+                *host.alive.lock().unwrap() = launched.clone();
             }
         }
         host.steps
@@ -476,7 +484,10 @@ impl Launch {
                     engine_stopped: park,
                     ..Default::default()
                 });
-                crate::remote_execution::residency_evidence(park, recorded, &result)?
+                let evidence =
+                    crate::remote_execution::residency_evidence(park, recorded, &result)?;
+                *host.alive.lock().unwrap() = evidence.0.clone();
+                evidence
             }
         };
         host.steps
@@ -532,6 +543,35 @@ impl EngineAdapter for Launch {
         _: bool,
     ) -> Result<CancellationOutcome, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
+    }
+    /// Owner decision 2026-10-09: a remote host answers the wake canary with
+    /// a completion and the launch's processes alive now, judged as
+    /// `RemoteEngine::wake_canary` judges it. The embedded adapter's canary
+    /// probes its own engine, which this scripted one has not.
+    async fn wake_canary(
+        &self,
+        c: &StepExecutionContext,
+        _: u32,
+        _: Duration,
+    ) -> Result<capyctl_adapters::completion_probe::CanaryAnswer, RuntimeError> {
+        use capyctl_adapters::completion_probe::{CanaryAnswer, CanaryEvidence, ProbeAnswer};
+        if self.host.report == Report::Adapter {
+            return Err(RuntimeError::Unsupported);
+        }
+        let mut result = self.result(c);
+        result.state = "completed".into();
+        result.claim_retained = true;
+        result.processes = observed(&self.host.alive.lock().unwrap(), "alive");
+        let counted = crate::remote_execution::canary_engine_alive(&c.identities, &result);
+        self.host.canaries.lock().unwrap().push(counted.is_ok());
+        counted?;
+        Ok(CanaryAnswer {
+            answer: CanaryEvidence::Generated(ProbeAnswer {
+                tokens: vec![1, 2, 3],
+                text: "Ready.".into(),
+            }),
+            observed_at_ms: result.observed_at_unix_ms,
+        })
     }
 }
 
@@ -1407,6 +1447,15 @@ async fn a_restart_park_keeps_the_server_and_wakes_a_new_engine(report: Report) 
         (ResourcePhase::Ready, CACHED_READY)
     );
     assert_eq!(host.plans(), [None], "never started again");
+    if report == Report::HostResult {
+        // Found live 2026-10-23: the wake's canary is judged on the new
+        // engine the restore named, not on the server alone it recorded.
+        assert_eq!(
+            *host.canaries.lock().unwrap(),
+            [true, true],
+            "readiness and the wake"
+        );
+    }
     assert!(events(&dir, "lmcache_off", &deployment).is_empty());
     w.shutdown().await.unwrap();
 }
