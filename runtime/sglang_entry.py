@@ -719,6 +719,8 @@ def _import_and_launch(spec, contract, approvals=None):
     options = {} if target is None else {"run_scheduler_process_func": target}
     shared_memory = _SharedMemoryWatch()
     shared_memory.start()
+    ending = _LaunchEnd(shared_memory)
+    ending.install()
     try:
         launch.launch_server(checked._native, **options)
     except Exception:
@@ -731,12 +733,16 @@ def _import_and_launch(spec, contract, approvals=None):
         # launch, alive until the host's readiness deadline. They are ended and
         # seen gone first: the entry leaves only once nothing it started runs.
         # Then the shared memory they left in /dev/shm (RAM) is removed.
-        shared_memory.stop()
-        shared_memory.claim()
-        _end_engine_processes()
-        shared_memory.release()
+        ending.run()
         raise LaunchError("engine_launch_failed") from None
-    shared_memory.stop()
+    else:
+        # SPEC §13.2 (found live 2026-10-22, SGLang 0.5.22): on the host's
+        # SIGTERM SGLang drains, kills its process tree without this entry,
+        # and `launch_server` returns: the launch is stopped. It ends here as
+        # a failed one does, so its shared memory is removed too.
+        ending.run()
+    finally:
+        ending.uninstall()
 
 
 def _process_table():
@@ -863,12 +869,15 @@ _SHM_CLAIM_ATTEMPTS = 3
 
 
 class _SharedMemoryWatch:
-    """SPEC §13.2: the shared memory a failed launch leaves behind is removed.
+    """SPEC §13.2: the shared memory a launch leaves behind is removed.
 
     Found live 2026-10-22: a scheduler killed while loading left
     `/dev/shm/sglang_loads_*.shm` behind. SGLang never removes that file, and
     the resource tracker that removes registered segments is killed with
-    everything else, so each failed launch kept its segments in RAM.
+    everything else, so each failed launch kept its segments in RAM; found
+    again 2026-10-23 after normal stops. The watch runs for as long as
+    `launch_server` does, and `_LaunchEnd` releases what it claimed when the
+    launch fails or is stopped.
 
     Ownership is evidence, never a name pattern: a file is the launch's only
     when it appeared in the directory after the launch began and, when first
@@ -970,13 +979,38 @@ class _SharedMemoryWatch:
             return  # Nothing is seen unheld, so nothing is removed.
         if uncertain:
             return
+        finalizers = _semaphore_finalizers()
         for key, name in self._claimed.items():
             if key in held or self._identity(name) != key:
                 continue
             try:
                 os.unlink(os.path.join(self._directory, name))
             except OSError:
-                pass  # Removed by another, or not removable: left as it is.
+                continue  # Removed by another, or not removable: left as it is.
+            if name in finalizers:
+                # Removed for it: at a normal exit its finalizer would not
+                # find the file and print a traceback after the entry's
+                # last line.
+                finalizers[name].cancel()
+
+
+def _semaphore_finalizers():
+    """This process's pending multiprocessing semaphore finalizers, by file name.
+
+    A semaphore this entry made (`SemLock`, spawn context) unlinks its
+    `/dev/shm/sem.<name>` file in a finalizer that runs at a normal exit.
+    """
+    util = sys.modules.get("multiprocessing.util")
+    synchronize = sys.modules.get("multiprocessing.synchronize")
+    cleanup = getattr(getattr(synchronize, "SemLock", None), "_cleanup", None)
+    if util is None or cleanup is None:
+        return {}
+    found = {}
+    for finalizer in list(getattr(util, "_finalizer_registry", {}).values()):
+        arguments = getattr(finalizer, "_args", None)
+        if getattr(finalizer, "_callback", None) is cleanup and arguments:
+            found["sem." + str(arguments[0]).lstrip("/")] = finalizer
+    return found
 
 
 def _held_files(directory, pids, group=None):
@@ -1033,6 +1067,90 @@ def _may_hide_ours(pid, group):
     except (OSError, ValueError, IndexError):
         pass  # Exited during the scan.
     return False
+
+
+class _LaunchEnd:
+    """SPEC §13.2: a launch that fails or is stopped leaves no shared memory.
+
+    Found live 2026-10-22: every SGLang 0.5.22 launch, normal stops included,
+    left `/dev/shm/sglang_loads_*.shm` and a multiprocessing semaphore
+    (`sem.mp-*`) behind; only a failed launch removed them. The host's
+    SIGTERM reaches this entry (the group's leader) and every process of the
+    group, and then
+
+    - while SGLang loads, SIGTERM's default action ended this entry at once;
+    - once SGLang serves, its handler drains, kills its process tree without
+      this entry and `launch_server` returns (the usual stop); or, after a
+      child's exit, its SIGQUIT handler kills the tree and then this entry
+      with SIGKILL (`kill_process_tree`, through psutil's `os.kill`), which
+      no finalizer survives.
+
+    So the launch ends here, once, on whichever comes first: `launch_server`
+    returning or raising, a SIGTERM this entry handles itself while
+    `launch_server` runs (SGLang's own handler replaces it once it serves),
+    or this process's SIGKILL to itself, which its `os.kill` intercepts. The
+    watch claims once more, every process the entry started is ended and seen
+    gone (`_end_engine_processes`), and only then is each claimed file no
+    other live process holds removed (`_SharedMemoryWatch.release`). The
+    SIGTERM then ends the entry as before, and the SIGKILL is delivered. A
+    stop the host escalates to SIGKILL ends the entry with no chance to run,
+    and its files stay.
+    """
+
+    def __init__(self, shared_memory):
+        self._shared_memory = shared_memory
+        self._pid = os.getpid()
+        self._kill = os.kill
+        self._lock = threading.RLock()
+        self._state = "launched"  # then "ending", then "ended"
+        self._installed_sigterm = False
+        self._previous_sigterm = signal.SIG_DFL
+
+    def install(self):
+        """Take SIGTERM and this process's SIGKILL to itself."""
+        os.kill = self._guarded_kill
+        try:
+            self._previous_sigterm = signal.signal(signal.SIGTERM, self._terminated)
+            self._installed_sigterm = True
+        except ValueError:
+            pass  # Not the main thread: SIGTERM keeps its handler.
+
+    def uninstall(self):
+        """Hand both back: `launch_server` returned or raised."""
+        if os.kill == self._guarded_kill:
+            os.kill = self._kill
+        if self._installed_sigterm and signal.getsignal(signal.SIGTERM) == self._terminated:
+            signal.signal(signal.SIGTERM, self._previous_sigterm)
+
+    def run(self):
+        """End the launch's processes, verified, then remove its shared memory."""
+        with self._lock:
+            if self._state != "launched":
+                return
+            self._state = "ending"
+            self._shared_memory.stop()
+            self._shared_memory.claim()
+            _end_engine_processes()
+            self._shared_memory.release()
+            self._state = "ended"
+
+    def _terminated(self, number, frame):
+        if os.getpid() != self._pid:
+            # A child forked while this handler was in place (a worker pool):
+            # SIGTERM ends it as it did before; the launch is this entry's.
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            self._kill(os.getpid(), signal.SIGTERM)
+            return
+        if self._state == "ending":
+            return  # The launch is already ending; the entry exits after.
+        self.run()
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        self._kill(self._pid, signal.SIGTERM)
+
+    def _guarded_kill(self, pid, number):
+        if number == signal.SIGKILL and pid == self._pid == os.getpid():
+            self.run()
+        return self._kill(pid, number)
 
 
 def prepare_group_environment(environ, expected_ifname=None):
