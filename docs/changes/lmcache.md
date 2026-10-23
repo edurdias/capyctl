@@ -81,9 +81,79 @@ Verification, rebased onto `main` (`53764248`): `scripts/ci-local.sh` passes (un
 passed, 1 ignored; runtime 366); `scripts/ci-local.sh --deep --ci-shape` passes (core
 1691 passed; workspace 3633 passed, 1 ignored).
 
-Still missing: LC1 run through CapyCTL (LC1's figures were measured with LMCache and
-the engines run directly), the live rows LC2–LC11 on host A, and the decision-model
-(Clef-Flash) allowance measurement.
+Live rows, host A (GB10), Qwen3-4B (context 4096, KV cache 1 GiB, `restart_only`
+unless stated), 2026-10-22, standalone role, builds of `49f10efa` (the branch before the
+fixes) and `8958142d` (vLLM entry and telemetry fixes); evidence in
+`target/live/lmcache-live/` on the laptop. Fixes 3 (`b2ed1f75`) and later are not yet
+run live.
+
+- **LC1, fail.** SGLang on `49f10efa`: on by default with `restart_only`, argv exactly
+  §3 plus `--no-l1-use-lazy`, listeners 127.0.0.1 only (`ss`), environment `HOME` and
+  `PATH`, `GET /status` 5.6–7.9 s after start (bound 30 s), `/metrics` read, `engine
+  list` 0.5.6, first charge pool + 1280 MiB + 512 MiB (6,174,015,488 B). Server VmRSS
+  beyond the pool 807–816 MiB (4 and 8 GiB pools), GPU 406–408 MiB. vLLM on `49f10efa`:
+  every LMCache launch failed `vllm_startup_failed: sensitive_option_refused` (the
+  entry read CapyCTL's own `--kv-transfer-config` as an extra, since each parse gets a
+  random `engine_id`); on `8958142d` it starts on, `/status` within the bound, loopback
+  only. Failures: the measured charge drops the server's GPU memory (device recorded 0,
+  overhead 485 MiB as RssAnon plus RssShmem, so later launches charge pool + 485 MiB
+  where the server holds about 807 MiB beyond its pool and 406 MiB of GPU memory); a
+  short-lived server child (`lmcache-0`) made one start fail `server_start_failed`
+  (listener check read a vanished `/proc/<pid>/fd`), after which the launch without
+  LMCache failed `lifecycle conflict`; on two other starts that child's exit failed a
+  Ready instance as `lmcache_server_exited`. Every server on `49f10efa` and `8958142d`
+  connected to `stats.lmcache.ai:8080` (LMCache usage telemetry; on `8958142d` the
+  engine had the opt-out variables but the server did not, fixed in `d72d2906`, not
+  yet run live).
+- **LC2, pass** (both engines): after three 3.4k-token fillers evicted the engine's own
+  cache, the prompt again hit 3,328 tokens (13 chunks) from LMCache, and the answer at
+  temperature 0 equalled the first one and a `lmcache: off` deployment's.
+- **LC3, pass** (both engines): salt A, salt B, no salt: no LMCache hit across them;
+  salt A after eviction hit 3,328 tokens, no salt again hit its own entry. LMCache's
+  own record of the stored keys (`lmcache_mp_l1_write_chunks_total` by `cache_salt`,
+  grouped from the ObjectKeys written to L1) shows 13 chunks under each salt's digest,
+  equal to §5's digest computed independently, and unsalted keys under `""`.
+- **LC4, fail on SGLang, pass on vLLM, part 3 blocked.** SGLang (`49f10efa`):
+  restart-park refused `park_refused` ("the engine is not quiescent": the deep-park
+  saver check ran for a restart-park; fixed in `b2ed1f75`, not yet run live). vLLM
+  (`8958142d`): parked with the server up (same PID, GPU 1430 MiB, charge pool + 1280 +
+  512 MiB + 1 GiB held KV), the wake hit 3,328 tokens with the same answer. A `deep`
+  deployment runs deep with LMCache off, but the reason reads "an unknown model type /
+  an unknown GPU": the plans never carry the checkpoint's `model_type` or the GPU name,
+  so no qualified-table row can match; part 3 waits for that fix.
+- **LC5, fail.** New deployments under host `retention: zero` pass (`auto` off
+  `retention_zero` with the event, no engine log file, `Max core file size 0`;
+  `required` refused `retention_zero:lmcache`). Restarting the role into zero
+  retention stopped the running server and engine (verified gone) but relaunched the
+  instance with a new LMCache server, and a later start of that revision did too: the
+  standalone plan reads the revision's frozen host settings.
+- **LC6, pass.** `~/sglang-0.5.22-venv`: off `not_installed` in status, `engine list`
+  and an `lmcache_off` event; `required` refused `lmcache_unavailable:not_installed`.
+- **LC7, fail (SGLang upstream).** Clef-Flash: SGLang 0.5.22 disables its radix cache
+  for this model and then crashes at idle under `--enable-lmcache`
+  (`UnifiedRadixCache` has no `has_pending_cache_operations`); the relaunch without
+  LMCache served decisions. The server's overhead while it ran: 787 MiB beyond the
+  pool and 170 MiB of GPU memory, within the allowances, but no engine registered
+  with it, so the decision model's figures with LMCache in use remain unmeasured.
+- **LC8, pass** (both engines): SIGKILL to the recorded server while its engine
+  started stopped the engine (verified), relaunched it once without LMCache, which
+  served; warning, `lmcache_off` `engine_start_failed`, status; the next start of the
+  revision went without LMCache. With `required` (SGLang) the launch failed
+  `lmcache_unavailable:engine_start_failed` with nothing left running or charged.
+  `start --wait` exits 13 while the relaunch is still starting.
+- **LC9, pass** (both engines): SIGKILL to a Ready instance's server failed the
+  instance, stopped its engine with a verified exit and journaled
+  `lmcache_server_exited`; the next request relaunched the engine with a new server
+  (cold cache).
+- **LC10, fail.** A new deployment under host `lmcache: off` runs off `host_off`
+  (status, event), but `engine list` still shows 0.5.6; restarting the role into
+  `lmcache: off` stopped the running server and relaunched the instance with a new one
+  (same cause as LC5).
+- **LC11, pass (standalone).** `required` on the off host refused at placement
+  `lmcache_unavailable:host_off`, nothing started. Not run on a server and host pair.
+- **Status while Ready.** `held_kv_bytes` (the engine's KV cache) shows while the
+  instance is Ready although it is charged only while restart-parked (Ready charge
+  6,174,015,488 B, parked 7,247,757,312 B); the JSON reads as if the KV were held now.
 
 CPU and Fake-engine tests are not qualification.
 
