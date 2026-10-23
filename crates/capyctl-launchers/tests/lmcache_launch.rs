@@ -106,51 +106,81 @@ fn printed_names(text: &str) -> Vec<String> {
     names
 }
 
-// T45 T21 T37 (ADR 0033 §3): the server runs with exactly PATH, HOME and
-// CUDA_VISIBLE_DEVICES, whatever else its command names (no engine key, no log
-// variable, nothing the gate shell adds), and its output reaches its own
-// sibling log. Its identity is recorded as `lmcache` before it runs. The
-// server here is `env` itself, which prints the environment it was given.
+// T45 T21 T37 (ADR 0033 §3, A7): the server runs with exactly PATH, HOME,
+// CUDA_VISIBLE_DEVICES and LMCache's usage telemetry switched off, whatever
+// else its command names (no engine key, no log variable, no other
+// `LMCACHE_*`, a telemetry switch only with its off value, nothing the gate
+// shell adds), and its output reaches its own sibling log. Its identity is
+// recorded as `lmcache` before it runs. The server here is `env` itself,
+// which prints the environment it was given. Found live: the server started
+// with HOME and PATH only, and reported usage off the host.
 #[test]
-fn the_server_starts_with_exactly_its_three_variables_and_its_own_log() {
+fn the_server_starts_with_exactly_its_closed_environment_and_its_own_log() {
     let dir = tempfile::tempdir().unwrap();
-    let log = dir.path().join("inc.lmcache.log");
     let recorder = Arc::new(Recorder::default());
     let tools = DurableProcessLaunch::new(recorder.clone());
-    let server = tools
-        .spawn_lmcache(
-            "inc-env",
-            &RenderedCommand {
-                argv: vec!["/usr/bin/env".into()],
-                env: [
-                    ("PATH", "/usr/bin:/bin"),
-                    ("HOME", "/nonexistent"),
-                    ("CUDA_VISIBLE_DEVICES", "GPU-x"),
-                    (LOG_VARIABLE, log.to_str().unwrap()),
-                    ("VLLM_API_KEY", "must-not-leak"),
-                    ("LMCACHE_CONFIG_FILE", "/tmp/x"),
-                    (capyctl_adapters::engine_log::OWNED_VALUES_VARIABLE, "x"),
-                ]
-                .into_iter()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect(),
-            },
-        )
-        .unwrap();
-    assert_eq!(server.role, "lmcache");
+    let spawn = |incarnation: &str, telemetry: [(&str, &str); 2]| {
+        let log = dir.path().join(format!("{incarnation}.lmcache.log"));
+        let mut env: std::collections::BTreeMap<String, String> = [
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/nonexistent"),
+            ("CUDA_VISIBLE_DEVICES", "GPU-x"),
+            (LOG_VARIABLE, log.to_str().unwrap()),
+            ("VLLM_API_KEY", "must-not-leak"),
+            ("LMCACHE_CONFIG_FILE", "/tmp/x"),
+            (capyctl_adapters::engine_log::OWNED_VALUES_VARIABLE, "x"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        env.extend(
+            telemetry
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+        );
+        let server = tools
+            .spawn_lmcache(
+                incarnation,
+                &RenderedCommand {
+                    argv: vec!["/usr/bin/env".into()],
+                    env,
+                },
+            )
+            .unwrap();
+        assert_eq!(server.role, "lmcache");
+        let mut text = String::new();
+        wait_for("the server's output", || {
+            text = std::fs::read_to_string(&log).unwrap_or_default();
+            text.contains("CUDA_VISIBLE_DEVICES=GPU-x")
+        });
+        tools.stop_group(&[server], Duration::from_secs(1)).unwrap();
+        text
+    };
+    let text = spawn("inc-env", capyctl_adapters::lmcache::NO_USAGE_TRACKING);
     assert_eq!(recorder.kinds(), ["lmcache"]);
-    let mut text = String::new();
-    wait_for("the server's output", || {
-        text = std::fs::read_to_string(&log).unwrap_or_default();
-        text.contains("CUDA_VISIBLE_DEVICES=GPU-x")
-    });
+    assert_eq!(
+        printed_names(&text),
+        [
+            "CUDA_VISIBLE_DEVICES",
+            "DO_NOT_TRACK",
+            "HOME",
+            "LMCACHE_TRACK_USAGE",
+            "PATH"
+        ],
+        "{text}"
+    );
+    assert!(text.contains("DO_NOT_TRACK=1\n") && text.contains("LMCACHE_TRACK_USAGE=false\n"));
+    assert!(!text.contains("must-not-leak"));
+    // A switch with any other value never reaches the server.
+    let text = spawn(
+        "inc-env-on",
+        [("DO_NOT_TRACK", "0"), ("LMCACHE_TRACK_USAGE", "true")],
+    );
     assert_eq!(
         printed_names(&text),
         ["CUDA_VISIBLE_DEVICES", "HOME", "PATH"],
         "{text}"
     );
-    assert!(!text.contains("must-not-leak"));
-    tools.stop_group(&[server], Duration::from_secs(1)).unwrap();
 }
 
 // T45 (ADR 0033 §§3, 7): one launch spawns its engine once, its server once,

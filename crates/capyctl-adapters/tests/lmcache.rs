@@ -374,7 +374,7 @@ fn the_server_argv_is_exactly_capyctls() {
 // switched off (found live: LMCache 0.5.6 reports to stats.lmcache.ai over
 // plain HTTP otherwise); only the launcher's log name rides beside them, and
 // the launcher never passes it on (capyctl-launchers test
-// `the_server_starts_with_exactly_its_three_variables_and_its_own_log`).
+// `the_server_starts_with_exactly_its_closed_environment_and_its_own_log`).
 #[test]
 fn the_server_env_is_exactly_its_names_with_telemetry_off() {
     let root = tempfile::tempdir().unwrap();
