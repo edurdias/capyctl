@@ -2244,17 +2244,16 @@ mod tests {
             process(&observed("lmcache", 60, "alive")),
             process(&observed("lmcache-1", 61, "alive")),
         ];
-        let restored =
-            residency_evidence(false, &server, &{
-                let mut processes = observed_all(&server);
-                processes.extend([
-                    observed("api", 70, "alive"),
-                    observed("worker-0", 71, "alive"),
-                ]);
-                residency("restored", false, true, processes)
-            })
-            .unwrap()
-            .0;
+        let restored = residency_evidence(false, &server, &{
+            let mut processes = observed_all(&server);
+            processes.extend([
+                observed("api", 70, "alive"),
+                observed("worker-0", 71, "alive"),
+            ]);
+            residency("restored", false, true, processes)
+        })
+        .unwrap()
+        .0;
         let answer = |processes: Vec<pb::OwnedProcessObservation>| {
             let mut r = result(processes);
             r.state = "completed".into();
@@ -2282,7 +2281,10 @@ mod tests {
         for uncertain in [answer(other), answer(worker_gone), released] {
             assert!(
                 matches!(
-                    canary_engine_alive(&ExecutionIdentities::Retained(restored.clone()), &uncertain),
+                    canary_engine_alive(
+                        &ExecutionIdentities::Retained(restored.clone()),
+                        &uncertain
+                    ),
                     Err(RuntimeError::Uncertain(_))
                 ),
                 "{uncertain:?}"
