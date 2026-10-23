@@ -85,10 +85,12 @@ the server stops when the model stops.
 - **`restart_only`** (declared, or what a decision model or a machine with
   deep parking turned off resolves to): parking stops the engine and keeps the
   LMCache server; waking starts the engine again on the same server, so the
-  first request after the wake can be answered from the cache. Without
-  LMCache such a model stops instead of parking, as before. While it is
-  parked, the memory set aside for it also counts the engine's KV cache: the
-  server keeps the stopped engine's KV memory mapped. It still holds it after
+  first request after the wake can be answered from the cache. The wake is a
+  start, so unless the deployment states `timeouts.wake` it may take as long
+  as a start (`timeouts.initialize`, or the window CapyCTL derives for a
+  start). Without LMCache such a model stops instead of parking, as before.
+  While it is parked, the memory set aside for it also counts the engine's KV
+  cache: the server keeps the stopped engine's KV memory mapped. It still holds it after
   the wake, until the new engine first stores KV, so the KV cache stays counted
   after the wake too, until a reading of the server's GPU memory shows it
   released (measured on a GB10). Where no reading of the server's GPU memory is

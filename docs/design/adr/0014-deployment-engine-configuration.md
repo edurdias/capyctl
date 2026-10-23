@@ -1710,3 +1710,39 @@ with its whole-host first start
 (`status_shows_the_whole_host_a_start_above_the_managed_limit_reserves`). Not qualification:
 the measurements cover vLLM 0.30.0 on GB10 with `eager`; another engine build, a discrete GPU
 or a much larger KV cache should be measured before the cap is trusted there.
+
+## Amendment A23: a `restart_only` wake gets the Initialize window (2026-10-23)
+
+Problem: amendment A1 derives every undeclared wake window from the deep-park formula
+(60 s + 5 s per GB). A `restart_only` deployment parks only by stopping its engine beside
+its LMCache server, and wakes by starting the engine again (ADR 0033 §7): its wake is a
+start, not a deep-park restoration. Found live on host A (2026-10-23, CapyCTL 0.1.7,
+standalone): SGLang 0.5.22 with LMCache 0.5.6 restarted Qwen3-4B (8.05 GB, a derived 105 s
+wake window) in 94–99 s, and one wake in 16 ran out of its window at 103 s
+(`wake_uncertain`, the readiness poll's own bound two seconds before the deadline). vLLM
+0.32.0 restarted the same model in 64–68 s, inside the window only because it starts
+faster.
+
+Decision:
+
+1. An undeclared wake window of a deployment whose residency resolves `restart_only` is its
+   Initialize window, declared or derived (A1, A7), lowered to the request deadline as every
+   window is. Its provenance stays `derived`. A declared `timeouts.wake` is kept. A parking
+   residency (`deep`, `host_backed`) keeps the deep-park formula.
+2. The store gives a wake the Initialize window whenever the revision resolved
+   `restart_only`, on the deployment or on any host that resolved it (a host with deep
+   parking off), and its wake is derived. This covers revisions frozen before this
+   amendment, whose effective configuration still claims the deep-park formula.
+3. A snapshot frozen before this amendment still decodes with the window it was frozen with
+   (the formula, lowered to the request deadline), as amendment A7 does for Initialize; any
+   other claimed value is refused. Status shows the window the store gives.
+
+A longer window only delays noticing an engine that is alive but stuck, never one that
+exited (its exit ends the wait at once).
+
+Evidence: CPU tests cover the derivation (`a_restart_only_wake_gets_the_initialize_window`
+in `timeouts.rs`), a frozen revision
+(`a_restart_only_revision_frozen_with_the_deep_park_wake_still_decodes`) and the store's
+window for frozen, host-resolved, declared and parking revisions
+(`a_restart_only_wake_gets_the_initialize_window` in the store's `lifecycle_windows.rs`).
+Not qualification: the live check is repeated `restart_only` wakes with LMCache on host A.

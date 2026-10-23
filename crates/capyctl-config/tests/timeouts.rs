@@ -122,6 +122,44 @@ fn a_revision_frozen_before_the_first_start_allowance_still_decodes() {
     assert!(decode_effective_snapshot(&frozen.to_string()).is_err());
 }
 
+/// T14, ADR 0014 amendment A23 (2026-10-23): a `restart_only` revision's
+/// undeclared wake window is its Initialize window, and one frozen before
+/// that, with the deep-park formula, still decodes with the window it was
+/// frozen with; any other claimed value is refused.
+// T14
+#[test]
+fn a_restart_only_revision_frozen_with_the_deep_park_wake_still_decodes() {
+    let (mut deployment, host) = fixture();
+    deployment["residency"] = json!("restart_only");
+    let effective = resolve_effective_with_checkpoint(
+        &deployment,
+        &host,
+        CheckpointFacts {
+            weights_bytes: Some(3 * GB),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(effective.timeouts.initialize_ms, 600_000);
+    assert_eq!(effective.timeouts.wake_ms, 600_000);
+    assert_eq!(
+        effective.timeouts.provenance["wake"],
+        TimeoutSource::Derived
+    );
+    let mut frozen = serde_json::to_value(&effective).unwrap();
+    assert_eq!(
+        decode_effective_snapshot(&frozen.to_string()).unwrap(),
+        effective
+    );
+    // What the deep-park formula derived: 60 s + 5 s per GB of 3 GB.
+    frozen["timeouts"]["wake_ms"] = json!(75_000);
+    let decoded = decode_effective_snapshot(&frozen.to_string()).unwrap();
+    assert_eq!(decoded.timeouts.wake_ms, 75_000);
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), frozen);
+    frozen["timeouts"]["wake_ms"] = json!(80_000);
+    assert!(decode_effective_snapshot(&frozen.to_string()).is_err());
+}
+
 /// T14: a revision frozen before `timeouts` existed still decodes; its
 /// timeouts are derived again from the same facts.
 // T14
