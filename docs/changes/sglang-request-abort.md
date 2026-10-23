@@ -110,7 +110,11 @@ CPU and Fake-engine tests are not qualification.
 
 ## Live (host A, SGLang 0.5.22)
 
-LIVE-RESULTS
+Not run yet. Host A was held by the LMCache live rows when this branch was finished. All
+four rows remain: L1 (an abort settles within one decode step under steady traffic), L2
+(a deadline cut before output settles promptly), L3 (the host path through host A's
+ingress and agent) and L4 (32 cut decisions fill the limit and the instance restarts).
+Until they pass, nothing here is qualified on a real engine.
 
 # Release note: Requests
 
