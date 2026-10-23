@@ -67,6 +67,13 @@ pub const OWNED_NAMES: &[&str] = &[
     // security switch.
     "VLLM_PORT",
     "VLLM_ALLOW_INSECURE_SERIALIZATION",
+    // Owner decision 2026-10-22: the engines' usage-reporting opt-outs are
+    // the host's (`engine_telemetry`), never a profile's or a deployment's.
+    // vLLM reads all three (`vllm/envs.py`, `usage/usage_lib.py`);
+    // `DO_NOT_TRACK` is the general convention every engine is started with.
+    "DO_NOT_TRACK",
+    "VLLM_DO_NOT_TRACK",
+    "VLLM_NO_USAGE_STATS",
 ];
 
 /// SPEC §8.2, T21 (owner decision 2026-10-20): environment families that make

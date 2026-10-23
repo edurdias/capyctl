@@ -521,7 +521,10 @@ refused (`engine_env_reserved:<name>`, [the list](../operations/configuration.md
 The engine starts with a closed environment: `PATH` is the executable's
 directory and then the system directories, `HOME` and `CUDA_VISIBLE_DEVICES`
 come from CapyCTL, and `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set,
-since CapyCTL downloads models and the engine does not. Then come the
+since CapyCTL downloads models and the engine does not. `DO_NOT_TRACK=1` is
+set too, unless the host allows engines to report their usage
+([`engine_telemetry`](../operations/configuration.md#engine-usage-reporting)).
+Then come the
 manifest's variables, the engine's (`--env`) and the deployment's
 (`engine_config.env`, approved with `--approve-env`), each winning over the one
 before.

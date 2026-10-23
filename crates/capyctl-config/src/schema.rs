@@ -537,6 +537,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         // ADR 0033 §9, §10: LMCache and zero retention, as on a host.
         ("lmcache", SCALAR),
         ("retention", SCALAR),
+        // Owner decision 2026-10-22: the engines' own usage reporting, as on
+        // a host.
+        ("engine_telemetry", SCALAR),
     ];
     /// SPEC §6.5, §10: a host's activation policy, for every deployment that
     /// may run on it. Controller policy; never part of the document a
@@ -623,6 +626,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 // Published with the document: placement reads them.
                 ("lmcache", SCALAR),
                 ("retention", SCALAR),
+                // Role-local (owner decision 2026-10-22): `off` or `allow`,
+                // whether the engines' own usage reporting keeps its defaults.
+                ("engine_telemetry", SCALAR),
             ],
         },
         ConfigKind::Deployment => &KindSchema {

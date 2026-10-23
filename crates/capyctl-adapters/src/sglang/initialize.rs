@@ -248,6 +248,13 @@ async fn launch(
     // SPEC §9.1 / T21: neither the entry nor any engine child writes bytecode
     // beside capyctl's checked runtime source.
     cmd.env.insert("PYTHONDONTWRITEBYTECODE".into(), "1".into());
+    // Owner decision 2026-10-22: SGLang and what it imports report no usage
+    // off the host unless the host allows it (engine_telemetry.rs).
+    crate::engine_telemetry::apply(
+        &mut cmd.env,
+        crate::engine_telemetry::DO_NOT_TRACK,
+        crate::engine_telemetry::host_setting(),
+    );
     // ADR 0014 §8, SPEC §8.2: the host's approvals for sensitive extras.
     if let Some(approvals) = adapter.extra_approvals() {
         cmd.env.insert(

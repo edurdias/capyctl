@@ -61,6 +61,11 @@ pub const ENGINE_ENV_ALLOWLIST: &[&str] = &[
     "CUDA_HOME",
     "MAX_JOBS",
     "FLASHINFER_NVCC_THREADS",
+    // Owner decision 2026-10-22: the usage-reporting opt-outs, under the
+    // host's `engine_telemetry: off` (engine_telemetry.rs).
+    "DO_NOT_TRACK",
+    "VLLM_DO_NOT_TRACK",
+    "VLLM_NO_USAGE_STATS",
 ];
 
 /// ADR 0028 §10 (R11): the variables a group member's launch renders beyond
@@ -74,8 +79,9 @@ const GROUP_ENV: &[&str] = &[
 ];
 
 /// The closed environment one vLLM launch starts with: the rendered variables,
-/// the keys, the engine's tool path, a few named pass-throughs, and the pins
-/// (no plugins, no bytecode). Anything outside the allowlist is dropped.
+/// the keys, the engine's tool path, a few named pass-throughs, the pins
+/// (no plugins, no bytecode) and, unless the host allows the engine's own
+/// usage reporting, its opt-outs. Anything outside the allowlist is dropped.
 fn engine_environment(
     rendered: &std::collections::BTreeMap<String, String>,
     plan: &crate::vllm::args::PlanInputVllm,
@@ -83,6 +89,7 @@ fn engine_environment(
     admin: Option<&str>,
     inherited: &dyn Fn(&str) -> Option<String>,
     toolchain: &std::collections::BTreeMap<String, String>,
+    telemetry: crate::engine_telemetry::EngineTelemetry,
 ) -> std::collections::BTreeMap<String, String> {
     let mut env = std::collections::BTreeMap::new();
     for name in PASS_THROUGH {
@@ -119,6 +126,9 @@ fn engine_environment(
     if let Some(log) = &plan.engine_log {
         env.insert("CAPYCTL_ENGINE_LOG".into(), log.clone());
     }
+    // Owner decision 2026-10-22: vLLM reports no usage off the host unless
+    // the host allows it.
+    crate::engine_telemetry::apply(&mut env, crate::engine_telemetry::VLLM, telemetry);
     // ADR 0028 §2.1: the resolved engine env's names join the fixed list.
     // ADR 0028 §10: a group member also keeps exactly the group names
     // `render_command` rendered (none exist for a single rank, T39).
@@ -240,6 +250,7 @@ async fn launch(
         adapter.admin_key(),
         &|name| std::env::var(name).ok(),
         &toolchain,
+        crate::engine_telemetry::host_setting(),
     );
 
     // The tool is synchronous on purpose (capyctl-launchers has no runtime), so every
@@ -521,6 +532,7 @@ mod tests {
             Some("admin-key"),
             &inherited,
             &BTreeMap::new(),
+            crate::engine_telemetry::EngineTelemetry::Off,
         )
     }
 
@@ -621,5 +633,32 @@ mod tests {
             ),
             ("1", "false")
         );
+    }
+
+    // T21 (owner decision 2026-10-22): under `engine_telemetry: off` every
+    // vLLM launch, a group worker included, starts with vLLM's three
+    // usage-reporting opt-outs; under `allow` none of them is set, so vLLM
+    // keeps its own default.
+    #[test]
+    fn usage_reporting_is_off_unless_the_host_allows_it() {
+        use crate::engine_telemetry::EngineTelemetry;
+        for plan in [input(None), input(Some((1, Some("eth9"))))] {
+            let env = spawned(&plan);
+            for (name, value) in crate::engine_telemetry::VLLM {
+                assert_eq!(env[*name], *value, "{name}");
+            }
+            let allowed = engine_environment(
+                &render_command(&plan).unwrap().env,
+                &plan,
+                "engine-key",
+                None,
+                &|_| None,
+                &BTreeMap::new(),
+                EngineTelemetry::Allow,
+            );
+            for (name, _) in crate::engine_telemetry::VLLM {
+                assert!(!allowed.contains_key(*name), "{name}");
+            }
+        }
     }
 }

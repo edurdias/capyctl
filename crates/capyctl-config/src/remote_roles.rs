@@ -320,6 +320,9 @@ pub struct HostConfig {
     pub lmcache: crate::lmcache::HostLmcache,
     /// ADR 0033 §10: the host's `retention` ([`host_retention`]).
     pub retention: crate::lmcache::Retention,
+    /// Owner decision 2026-10-22: `engine_telemetry`, whether the engines'
+    /// own usage reporting keeps its defaults ([`engine_telemetry`]).
+    pub engine_telemetry: EngineTelemetry,
     pub document: Value,
     /// Owner decision 2026-09-25: the generic overrides (`--set`,
     /// `CAPYCTL_SET__…`) the host started with. A live reload of the document
@@ -438,6 +441,33 @@ pub fn host_retention(document: &Value) -> Result<crate::lmcache::Retention, Con
                 ConfigErrorCode::UnsupportedCombination,
                 "retention",
                 "must be `standard` or `zero`",
+            )),
+        },
+    }
+}
+/// Owner decision 2026-10-22 (SPEC §13.3): whether the engines a host starts
+/// may report their own usage off the host. `off` (the default) starts every
+/// engine with its usage-reporting opt-outs set; `allow` leaves each engine's
+/// own default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EngineTelemetry {
+    #[default]
+    Off,
+    Allow,
+}
+/// The `engine_telemetry` of a host document (or of a standalone document's
+/// `host:` block). Omitted, it is `off`; any value but `off` or `allow` is
+/// refused by name.
+pub fn engine_telemetry(document: &Value) -> Result<EngineTelemetry, ConfigError> {
+    match document.get("engine_telemetry") {
+        None => Ok(EngineTelemetry::Off),
+        Some(value) => match value.as_str() {
+            Some("off") => Ok(EngineTelemetry::Off),
+            Some("allow") => Ok(EngineTelemetry::Allow),
+            _ => Err(ConfigError::new(
+                ConfigErrorCode::UnsupportedCombination,
+                "engine_telemetry",
+                "must be `off` or `allow`",
             )),
         },
     }
@@ -737,6 +767,7 @@ impl HostConfig {
             engine_logs: engine_logs(&document)?,
             lmcache: host_lmcache(&document)?,
             retention: host_retention(&document)?,
+            engine_telemetry: engine_telemetry(&document)?,
             document,
             overrides: crate::setting_overrides::SettingOverrides::none(ConfigKind::Host),
         })

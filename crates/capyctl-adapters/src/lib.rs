@@ -7,6 +7,9 @@ pub mod decision_probe;
 pub mod engine_env;
 // SPEC §13.3 / T21: engine logs redacted as written, read back as a bounded tail.
 pub mod engine_log;
+// Owner decision 2026-10-22: the engines' own usage reporting, off unless
+// the host allows it.
+pub mod engine_telemetry;
 pub mod forward;
 // ADR 0028 §10: the engine-neutral arguments of a multi-node group member.
 pub mod group;

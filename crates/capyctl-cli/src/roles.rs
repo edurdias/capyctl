@@ -1852,6 +1852,12 @@ async fn start_standalone_in(
         engine_logs == capyctl_config::remote_roles::EngineLogs::Memory,
     )
     .map_err(|error| StartError::Setting(error.to_string()))?;
+    // Owner decision 2026-10-22: `host.engine_telemetry` (validated by
+    // `check_honoured` above) holds for every launch from here on.
+    capyctl_adapters::engine_telemetry::set_host_setting(
+        capyctl_config::remote_roles::engine_telemetry(&stated_host)
+            .map_err(|error| StartError::Deploy(format!("standalone configuration: {error}")))?,
+    );
     let db_path = state_dir.join("server").join("srv.sqlite3");
     // SPEC §15.2: an explicit document is operator configuration, not state,
     // so it does not bring the credentials a generated default would. A state

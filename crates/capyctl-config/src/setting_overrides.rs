@@ -932,6 +932,8 @@ pub fn defaults(
             // ADR 0033 §9, §10: LMCache on where it can run; standard retention.
             ("lmcache", Value::from("auto")),
             ("retention", Value::from("standard")),
+            // Owner decision 2026-10-22: engines report no usage off the host.
+            ("engine_telemetry", Value::from("off")),
         ];
         if let Some(root) = crate::model_settings::default_models_root(home) {
             out.push((

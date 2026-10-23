@@ -58,7 +58,12 @@ pub(super) async fn initialize(
     adapter.claim_incarnation(&context.binding_id, &context.incarnation)?;
     let mut cmd =
         render_command(&plan).map_err(|e| RuntimeError::Uncertain(format!("render: {e}")))?;
-    cmd.env = engine_environment(&cmd.env, &plan, &|name| std::env::var(name).ok());
+    cmd.env = engine_environment(
+        &cmd.env,
+        &plan,
+        &|name| std::env::var(name).ok(),
+        crate::engine_telemetry::host_setting(),
+    );
     let incarnation = context.incarnation.clone();
     let spawn_tools = tools.clone();
     let api = tokio::task::spawn_blocking(move || spawn_tools.spawn_durable(&incarnation, &cmd))
