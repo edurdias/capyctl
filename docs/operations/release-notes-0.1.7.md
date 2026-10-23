@@ -49,9 +49,13 @@ launches fail fast and clean up after themselves.
   newer with LMCache 0.5.6 (or a later 0.5.x) installed and registered, each model
   instance gets its own LMCache server in host RAM, on loopback only, started and
   stopped with it, so a prompt that begins like an earlier one is answered from the
-  cache after the engine's own cache dropped it, across a `restart_only` park too. It is
-  on by default (`lmcache: auto`); set `lmcache: off` or `required` on a deployment, or
-  `lmcache: off` on a host. The pool (4 GiB by default, `lmcache_pool`) and the LMCache
+  cache after the engine's own cache dropped it, across a `restart_only` park too.
+  `lmcache: auto` is the default, but a deployment that parks deep, the default
+  residency, runs without LMCache until its engine, model type and GPU are qualified
+  for deep parking with it, and this release qualifies none. Declare
+  `residency: restart_only` to use LMCache now (see
+  [Parking with LMCache](../guide/parking.md#parking-with-lmcache)).
+  Set `lmcache: off` or `required` on a deployment, or `lmcache: off` on a host. The pool (4 GiB by default, `lmcache_pool`) and the LMCache
   server's own memory are reserved. `cache_salt` now reaches the engine and LMCache as a
   digest of the deployment, its revision and the salt. See
   [LMCache](../guide/engines.md#lmcache).
