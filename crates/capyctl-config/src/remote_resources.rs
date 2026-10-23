@@ -29,6 +29,7 @@ pub fn local_host_document(raw: &Value) -> Result<Value, ConfigError> {
         "ingress",
         "load_report_interval",
         "engine_logs",
+        "engine_telemetry",
         "shutdown",
         "lifecycle",
     ] {

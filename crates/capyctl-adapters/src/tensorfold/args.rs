@@ -29,6 +29,9 @@ pub const ENGINE_ENV_ALLOWLIST: &[&str] = &[
     "FLASHINFER_NVCC_THREADS",
     // ADR 0028 §10 (found live 2026-10-15, MN3): a group member's libnccl.
     "TF_NCCL_LIB",
+    // Owner decision 2026-10-22: the usage-reporting convention, under the
+    // host's `engine_telemetry: off` (engine_telemetry.rs).
+    "DO_NOT_TRACK",
 ];
 /// Variables taken from the agent's own environment.
 const PASS_THROUGH: &[&str] = &["HOME", "CUDA_VISIBLE_DEVICES"];
@@ -376,12 +379,14 @@ fn gib_text(bytes: i64) -> String {
 }
 
 /// The closed environment one launch starts with (SPEC §13.3): the rendered
-/// variables, the closed PATH, the toolchain limits, a few pass-throughs.
+/// variables, the closed PATH, the toolchain limits, a few pass-throughs and,
+/// unless the host allows usage reporting, `DO_NOT_TRACK=1`.
 pub fn engine_environment(
     rendered: &BTreeMap<String, String>,
     plan: &PlanInputTensorfold,
     inherited: &dyn Fn(&str) -> Option<String>,
     toolchain: &BTreeMap<String, String>,
+    telemetry: crate::engine_telemetry::EngineTelemetry,
 ) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     for name in PASS_THROUGH {
@@ -404,6 +409,10 @@ pub fn engine_environment(
     if let Some(log) = &plan.engine_log {
         env.insert("CAPYCTL_ENGINE_LOG".into(), log.clone());
     }
+    // Owner decision 2026-10-22: TensorFold has no usage reporting of its
+    // own (its release check is off on every launch, above); the convention
+    // covers what it imports.
+    crate::engine_telemetry::apply(&mut env, crate::engine_telemetry::DO_NOT_TRACK, telemetry);
     // ADR 0028 §2.1: the resolved engine env's names join the fixed list.
     env.retain(|name, _| {
         ENGINE_ENV_ALLOWLIST.contains(&name.as_str()) || plan.build_env.contains_key(name)

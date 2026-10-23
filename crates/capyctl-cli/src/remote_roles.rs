@@ -1510,6 +1510,9 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                     host.engine_logs == capyctl_config::remote_roles::EngineLogs::Memory,
                 )
                 .map_err(|refused| error(&format!("Invalid host configuration: {refused}")))?;
+                // Owner decision 2026-10-22: `engine_telemetry` holds for
+                // every launch from here on.
+                capyctl_adapters::engine_telemetry::set_host_setting(host.engine_telemetry);
                 // Owner decision 2026-09-26: a command run later on this
                 // machine without --config (`capyctl engine`, `config show`)
                 // finds this host's document.

@@ -22,6 +22,9 @@ pub const ENGINE_ENV_ALLOWLIST: &[&str] = &[
     "XDG_CONFIG_HOME",
     "LLAMA_CACHE",
     "CAPYCTL_ENGINE_LOG",
+    // Owner decision 2026-10-22: the usage-reporting convention, under the
+    // host's `engine_telemetry: off` (engine_telemetry.rs).
+    "DO_NOT_TRACK",
 ];
 /// Variables taken from the agent's own environment. `HOME` is not one:
 /// llama-server would find its user configuration and cache through it
@@ -279,13 +282,15 @@ pub fn recheck_rendered(argv: &[String]) -> Result<(), LlamacppArgsError> {
 
 /// The closed environment one launch starts with (SPEC §13.3, ADR 0029 §6):
 /// the rendered variables, the closed PATH, the resolved engine environment
-/// and `CUDA_VISIBLE_DEVICES` from the agent. No `LLAMA_*` variable reaches the
+/// and `CUDA_VISIBLE_DEVICES` from the agent, and, unless the host allows
+/// usage reporting, `DO_NOT_TRACK=1`. No `LLAMA_*` variable reaches the
 /// engine but the rendered `LLAMA_CACHE`, and `XDG_CONFIG_HOME` is always
 /// CapyCTL's.
 pub fn engine_environment(
     rendered: &BTreeMap<String, String>,
     plan: &PlanInputLlamacpp,
     inherited: &dyn Fn(&str) -> Option<String>,
+    telemetry: crate::engine_telemetry::EngineTelemetry,
 ) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     for name in PASS_THROUGH {
@@ -316,6 +321,9 @@ pub fn engine_environment(
     if let Some(log) = &plan.engine_log {
         env.insert("CAPYCTL_ENGINE_LOG".into(), log.clone());
     }
+    // Owner decision 2026-10-22: llama-server has no usage reporting; the
+    // convention is set all the same, as for every engine.
+    crate::engine_telemetry::apply(&mut env, crate::engine_telemetry::DO_NOT_TRACK, telemetry);
     env.retain(|name, _| {
         ENGINE_ENV_ALLOWLIST.contains(&name.as_str())
             || (plan.build_env.contains_key(name) && !refused_env_name(name))

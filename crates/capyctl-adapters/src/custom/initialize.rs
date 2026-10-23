@@ -47,7 +47,12 @@ pub(super) async fn initialize(
     // ADR 0031 §2: an unset placeholder or a reserved environment name is
     // refused before anything starts.
     let mut cmd = render_command(&plan).map_err(|error| RuntimeError::Refused(error.code()))?;
-    cmd.env = engine_environment(&cmd.env, &plan, &|name| std::env::var(name).ok());
+    cmd.env = engine_environment(
+        &cmd.env,
+        &plan,
+        &|name| std::env::var(name).ok(),
+        crate::engine_telemetry::host_setting(),
+    );
     adapter.claim_incarnation(&context.binding_id, &context.incarnation)?;
     let incarnation = context.incarnation.clone();
     let spawn_tools = tools.clone();

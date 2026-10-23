@@ -4,7 +4,9 @@ This page lists what CapyCTL keeps about the requests it serves, where it keeps
 it and for how long. CapyCTL never writes prompt or response bodies to its own
 database, journal or role logs. The one place request content can reach disk is
 the engine's own output, and only if the engine prints it; see
-[Engine logs](#engine-logs).
+[Engine logs](#engine-logs). The engines CapyCTL launches report nothing about
+their use off the host unless the host allows it; see
+[Nothing reported off the host](#nothing-reported-off-the-host).
 
 ## Summary
 
@@ -131,3 +133,20 @@ prompt and the engine's answer as a reference. Each wake repeats the probe and
 compares the answer, to catch an engine that came back wrong. The reference
 contains no user data. Only the latest launch's reference is kept per instance;
 it is replaced when the instance launches again.
+
+## Nothing reported off the host
+
+The engines CapyCTL launches report nothing about their use off the host
+unless the host allows it. By default (`engine_telemetry: off`) every engine
+starts with `DO_NOT_TRACK=1`, and vLLM also with `VLLM_DO_NOT_TRACK=1` and
+`VLLM_NO_USAGE_STATS=1`, so vLLM does not post its usage report (the platform,
+the model architecture and the engine settings, sent to `stats.vllm.ai` at
+start, and a short report every ten minutes after). SGLang, llama.cpp and TensorFold have no usage
+reporting of their own; `DO_NOT_TRACK=1` also turns off the Hugging Face Hub
+library's telemetry, and TensorFold's release check is off on every launch.
+A custom engine is a program CapyCTL does not know: it gets `DO_NOT_TRACK=1`,
+and whether it honours it is up to the program.
+
+A deployment or an engine profile cannot change this. Only the host can, with
+`engine_telemetry: allow` ([settings](configuration.md#engine-usage-reporting)),
+which leaves each engine's own default.

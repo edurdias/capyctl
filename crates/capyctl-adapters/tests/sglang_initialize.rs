@@ -559,6 +559,10 @@ async fn initialize_spawns_protected_waits_probes_and_reports_the_group() {
         env.get("SGLANG_PLUGINS").map(String::as_str),
         Some("capyctl-loads-no-plugins")
     );
+    // T21 (owner decision 2026-10-22): the host's `engine_telemetry` is `off`
+    // unless a role says otherwise, so the launch carries the convention's
+    // opt-out; SGLang has no usage reporting of its own.
+    assert_eq!(env.get("DO_NOT_TRACK").map(String::as_str), Some("1"));
     let rendered = argv.join(" ");
     for secret in [INFERENCE, ADMIN] {
         assert!(!rendered.contains(secret), "a credential reached argv");

@@ -165,6 +165,39 @@ fn engine_logs_default_to_files_and_stay_role_local() {
     }
 }
 
+// T21 (owner decision 2026-10-22): `engine_telemetry` is `off` when omitted,
+// `allow` leaves the engines' own usage reporting at its defaults; it is
+// role-local, so it never reaches the document deployments are resolved
+// against; any other value is refused by name.
+#[test]
+fn engine_telemetry_defaults_to_off_and_stays_role_local() {
+    use capyctl_config::remote_roles::EngineTelemetry;
+    let root = Path::new("/home/operator/host");
+    let mut document: serde_json::Value =
+        serde_json::from_str(&HostConfig::template(root)).unwrap();
+    let config = HostConfig::parse(&document.to_string()).unwrap();
+    assert_eq!(config.engine_telemetry, EngineTelemetry::Off);
+    let unset = capyctl_config::remote_resources::local_host_document(&config.document).unwrap();
+    for (text, expected) in [
+        ("off", EngineTelemetry::Off),
+        ("allow", EngineTelemetry::Allow),
+    ] {
+        document["engine_telemetry"] = text.into();
+        let config = HostConfig::parse(&document.to_string()).unwrap();
+        assert_eq!(config.engine_telemetry, expected, "{text}");
+        assert_eq!(
+            capyctl_config::remote_resources::local_host_document(&config.document).unwrap(),
+            unset,
+            "{text}"
+        );
+    }
+    for refused in [serde_json::json!("on"), serde_json::json!(false)] {
+        document["engine_telemetry"] = refused.clone();
+        let error = HostConfig::parse(&document.to_string()).unwrap_err();
+        assert_eq!(error.path, "engine_telemetry", "{refused}: {error}");
+    }
+}
+
 // T03 T17: the shutdown drain bound is role configuration,
 // `shutdown.drain_timeout`, in server, host and standalone documents: 30 s when
 // omitted, 0 s to 600 s when set, refused outside that range.

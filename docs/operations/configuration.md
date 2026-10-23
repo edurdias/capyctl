@@ -288,7 +288,9 @@ whatever an approval says (`engine_env_reserved:<name>`):
   `VLLM_PLUGINS`, `SGLANG_PLUGINS`, `SGLANG_PLATFORM`, `VLLM_SERVER_DEV_MODE`,
   `VLLM_API_KEY`, `TORCH_EXTENSIONS_DIR`, `TENSORFOLD_CUDA_MEMORY_LIMIT_GB`,
   `TENSORFOLD_NO_UPDATE_CHECK`, `VLLM_PORT`,
-  `VLLM_ALLOW_INSECURE_SERIALIZATION`.
+  `VLLM_ALLOW_INSECURE_SERIALIZATION`, and the usage-reporting opt-outs
+  `DO_NOT_TRACK`, `VLLM_DO_NOT_TRACK` and `VLLM_NO_USAGE_STATS`, which only
+  the host's [`engine_telemetry`](#engine-usage-reporting) decides.
 
 CapyCTL starts every SGLang process with `SGLANG_PLUGINS=capyctl-loads-no-plugins`,
 a plugin selection that names no plugin, so SGLang loads none. SGLang 0.5.22
@@ -444,6 +446,7 @@ a run with `--set` or `CAPYCTL_SET__…` (next section), and restart the role.
 | Load report period | host: `load_report_interval` |
 | Activation policy: `on_demand` (default), or `explicit`, under which every deployment that may run on the host starts, stops, parks and wakes only on an operator's action | host: `lifecycle.activation` (standalone: `host.lifecycle.activation`) |
 | Engine logs: `files` (default), or `memory`, which keeps each launch's redacted engine output in memory only ([below](#engine-logs)) | host: `engine_logs` (standalone: `host.engine_logs`) |
+| Engines' own usage reporting: `off` (default), or `allow`, which leaves each engine's own default ([below](#engine-usage-reporting)) | host: `engine_telemetry` (standalone: `host.engine_telemetry`) |
 
 `lifecycle.activation` follows the server's lifecycle settings: the document,
 `--set lifecycle.activation=explicit` on `capyctl start host` (or
@@ -480,6 +483,33 @@ the next start. `--debug-engine-logs` is refused together with `memory`,
 because raw log files would defeat it. Redaction removes credentials, not
 prompts or outputs; see [data retention](data-retention.md) for everything
 CapyCTL keeps.
+
+### Engine usage reporting
+
+`engine_telemetry` says whether the engines a host starts may report their own
+use off the machine. By default they do not.
+
+- `off` (the default) starts every engine with its opt-outs set:
+  `DO_NOT_TRACK=1` for every engine, and for vLLM also `VLLM_DO_NOT_TRACK=1`
+  and `VLLM_NO_USAGE_STATS=1`. vLLM otherwise posts the platform, the model
+  architecture and the engine settings to `stats.vllm.ai` when it starts, and
+  a short report every ten minutes after. SGLang, llama.cpp and TensorFold report nothing of
+  their own use; `DO_NOT_TRACK=1` turns off the Hugging Face Hub library's
+  telemetry in the Python engines, and a custom engine may honour it.
+- `allow` sets none of them, so each engine keeps its own default (vLLM then
+  reports as above).
+
+Neither a profile nor a deployment can set these names
+(`engine_env_reserved:<name>`). TensorFold's release check, which asks GitHub
+for a newer version, is off on every launch whatever this says.
+
+Set it in the document, with `--set engine_telemetry=allow` on `capyctl start
+host` (`--set host.engine_telemetry=allow` on `capyctl start standalone`), or
+with `CAPYCTL_SET__ENGINE_TELEMETRY=allow`
+(`CAPYCTL_SET__HOST__ENGINE_TELEMETRY` for standalone). Any other value
+refuses the start. It applies to launches from the next start; an engine
+already running keeps the environment it started with. See
+[data retention](data-retention.md#nothing-reported-off-the-host).
 
 ## Any setting by its path
 
@@ -764,7 +794,9 @@ written by CapyCTL for the engine process; setting them yourself has no effect.
 For TensorFold it also writes `TENSORFOLD_NO_UPDATE_CHECK`, `HF_HUB_OFFLINE`,
 `TRANSFORMERS_OFFLINE` and `TORCH_EXTENSIONS_DIR`
 (`<state dir>/engines/tensorfold/<version>/torch_extensions`, private to the
-service user).
+service user). Under `engine_telemetry: off` (the default) it writes
+`DO_NOT_TRACK=1` for every engine and `VLLM_DO_NOT_TRACK=1` and
+`VLLM_NO_USAGE_STATS=1` for vLLM ([Engine usage reporting](#engine-usage-reporting)).
 Other variables in CapyCTL's own environment do not reach an engine. The CUDA
 toolkit is the exception by design: a profile's `cuda_home` (stated as above
 for the role's own installation, detected by `capyctl engine add`, or written in
