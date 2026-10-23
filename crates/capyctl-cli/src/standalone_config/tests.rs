@@ -2383,6 +2383,79 @@ fn a_stated_parked_limit_above_the_managed_limit_is_refused() {
     assert_eq!(domain_bytes(&host, DOMAIN, "parked_limit"), managed);
 }
 
+// T03 T45 (ADR 0025 amendment of 2026-10-23; found live: the derived tenth of
+// a 128 GB GB10, 12.17 GiB, held no LMCache pool above 12 GiB, and ADR 0033
+// §6 counts the pool against `host_kv_limit`): a stated host-KV limit
+// replaces the derived one as a size or a share, and nothing else changes.
+#[test]
+fn a_stated_host_kv_limit_replaces_the_derived_one() {
+    const POOL: i64 = 20 * GIB;
+    let capacity = 128 * GIB;
+    let derived = || {
+        host_policy(
+            &installations(),
+            "env",
+            capacity,
+            None,
+            &HostShape::Unified,
+            PORTS,
+        )
+    };
+    assert!(domain_bytes(&derived(), DOMAIN, "host_kv_limit") < POOL);
+    for (stated, expected) in [
+        ("24GiB", 24 * GIB),
+        ("20%", capacity / 100 * 20),
+        ("0B", 0),
+        ("50%", capacity / 100 * MANAGED_FRACTION),
+    ] {
+        let mut host = derived();
+        let doc = serde_json::json!({"resource_policy": {"memory": {"system": {
+            "host_kv_limit": stated}}}});
+        apply_stated_memory(&mut host, &doc, capacity).unwrap();
+        let mut expected_host = derived();
+        expected_host["resource_policy"]["domains"][DOMAIN]["host_kv_limit"] =
+            serde_json::json!(format!("{expected}B"));
+        assert_eq!(host, expected_host, "{stated}: nothing else changes");
+        let policy = capyctl_config::effective::normalize_host_policy(&host).unwrap();
+        assert_eq!(
+            policy.domains[DOMAIN].host_kv_limit,
+            Some(expected),
+            "{stated}"
+        );
+    }
+}
+
+// T03 T45 (ADR 0025 amendment of 2026-10-23): a stated host-KV limit is
+// bounded as an enrolled host's is, zero or more, and never compared with the
+// managed limit: one above it is published as stated, not refused and not
+// lowered, and the policy normalizes as a host document stating it does. A
+// derived one is still lowered to a stated managed limit below it.
+#[test]
+fn a_stated_host_kv_limit_is_bounded_as_a_hosts() {
+    for (stated_managed, stated_host_kv, expected) in [
+        ("auto", "60%", CAPACITY / 100 * 60),
+        ("auto", "100%", CAPACITY / 100 * 100),
+        ("8GiB", "10GiB", 10 * GIB),
+        ("auto", "1TiB", 1 << 40),
+    ] {
+        let mut host = derived_unified();
+        let doc = serde_json::json!({"resource_policy": {"memory": {"system": {
+            "managed_limit": stated_managed, "host_kv_limit": stated_host_kv}}}});
+        apply_stated_memory(&mut host, &doc, CAPACITY).unwrap();
+        let policy = capyctl_config::effective::normalize_host_policy(&host).unwrap();
+        assert_eq!(
+            policy.domains[DOMAIN].host_kv_limit,
+            Some(expected),
+            "{stated_managed}/{stated_host_kv}"
+        );
+    }
+    let mut host = derived_unified();
+    let doc = serde_json::json!({"resource_policy": {"memory": {"system": {
+        "managed_limit": "8GiB"}}}});
+    apply_stated_memory(&mut host, &doc, CAPACITY).unwrap();
+    assert_eq!(domain_bytes(&host, DOMAIN, "host_kv_limit"), 8 << 30);
+}
+
 // T26 (owner decision 2026-10-06): a document that states no parked limit,
 // or states `auto` (the generated document), publishes the policy captured
 // from `main` before the setting existed, so its policy digest is unchanged.
@@ -2398,7 +2471,8 @@ fn no_stated_parked_limit_keeps_the_policy_digest() {
     for stated in [
         serde_json::json!({}),
         serde_json::json!({"resource_policy": {"memory": {"system": {
-            "managed_limit": "auto", "free_reserve": "auto", "parked_limit": "auto"}}}}),
+            "managed_limit": "auto", "free_reserve": "auto", "parked_limit": "auto",
+            "host_kv_limit": "auto"}}}}),
     ] {
         let mut host = host_policy(
             &installations(),
@@ -2478,6 +2552,15 @@ fn stated_memory_limits_apply_to_host_ram_on_a_discrete_host() {
         host["resource_policy"]["domains"]["gpu0"],
         derived["resource_policy"]["domains"]["gpu0"]
     );
+    let mut host = derived.clone();
+    let stated = serde_json::json!({"resource_policy": {"memory": {"system": {
+        "host_kv_limit": "24GiB"}}}});
+    apply_stated_memory(&mut host, &stated, CAPACITY).unwrap();
+    assert_eq!(domain_bytes(&host, "system", "host_kv_limit"), 24 * GIB);
+    assert!(host["resource_policy"]["domains"]["gpu0"]
+        .get("host_kv_limit")
+        .is_none());
+    capyctl_config::effective::normalize_host_policy(&host).unwrap();
 }
 
 // T14 (ADR 0028 §3, R21; owner rule: standalone is a server plus one host):

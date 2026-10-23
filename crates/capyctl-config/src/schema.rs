@@ -153,6 +153,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                         ("managed_limit", SCALAR),
                         ("free_reserve", SCALAR),
                         ("parked_limit", SCALAR),
+                        ("host_kv_limit", SCALAR),
                     ]),
                 ),
             ]),

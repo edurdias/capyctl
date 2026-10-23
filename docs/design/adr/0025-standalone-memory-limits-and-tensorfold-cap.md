@@ -101,3 +101,22 @@ with both numbers rather than being lowered; a derived one is still lowered as i
 published before, byte for byte. The embedded host's published document carries the
 stated limits too, so a discrete template sizes its `host_backed` default on the same
 parked room admission uses. An enrolled host already states `parked_limit` per domain.
+
+## Amendment (2026-10-23, 0.1.8): the host-KV limit is settable
+
+Found while measuring LMCache (ADR 0033) on a 128 GB GB10: standalone's derived host-KV
+limit, a tenth of the observed memory (12.17 GiB), bounds the LMCache pools it admits
+(ADR 0033 §6 counts the pool against `host_kv_limit`), and
+`--set host.resource_policy.memory.system.host_kv_limit=…` was refused as an unknown
+standalone setting. A 12 GiB pool returned only part of a 32,000-token prompt; a 20 GiB
+pool, run on an enrolled host stating `host_kv_limit: 24GiB`, returned all of it.
+
+`host.resource_policy.memory.system.host_kv_limit` joins the limits of §1, set the same
+three ways with the same precedence and forms: `auto` (the default, unchanged: 10 %), a
+size or a whole percentage of the observed memory. Its bounds are an enrolled host's: any
+size of zero or more, published as stated and never compared with the managed limit,
+which bounds the same allocations (a host-KV allocation is part of its domain's managed
+charge). Only a derived host-KV limit is still lowered to a managed limit below it, as in
+§1. It applies to the host-memory domain only; a device domain carries none (ADR 0019). A
+document that states none, or `auto`, publishes the policy it published before, byte for
+byte.
