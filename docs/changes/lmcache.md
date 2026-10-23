@@ -98,12 +98,11 @@ the server's measured charge is its group's VmRSS beyond the pool plus its sampl
 memory, a figure nothing read keeping its allowance (A1; `d8ab848d`); the server's
 short-lived child and a server stopped before its engine (A9; `7d9ab7fa`).
 
-Verification on `36f39c71` (both fix branches below merged; `main` still `800e6614`):
-`scripts/ci-local.sh --deep --ci-shape` passes, every step (unit 1607 passed, 1 ignored;
-core 1709 passed; workspace 3660 passed, 1 ignored). Then `main` `67a09823` (#187, ADR
-0032) was merged in (`012105f8`; the router's forwarder carries both the effective salt
-and ADR 0032's request-ID lane): `scripts/ci-local.sh` passes (unit 1625 passed, 1
-ignored; runtime 369); the deep gate is not yet run on the merge.
+Verification, with `main` `c20b9927` merged in (#187, ADR 0032: the router's forwarder
+carries both the effective salt and ADR 0032's request-ID lane; #188,
+`engine_telemetry`; merges `012105f8` and `0a73eaf3`, no rebase) and both fix branches
+below: `scripts/ci-local.sh --deep --ci-shape` passes, every step (unit 1628 passed, 1
+ignored; runtime 369; core 1732 passed; workspace 3703 passed, 1 ignored).
 
 Live rows, host A (GB10), Qwen3-4B (context 4096, KV cache 1 GiB, `restart_only`
 unless stated), 2026-10-22, standalone role, builds of `49f10efa` (the branch before the
