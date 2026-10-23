@@ -892,25 +892,39 @@ impl EngineAdapter for RemoteEngine {
                 RuntimeError::Uncertain("the host did not answer the wake canary".into())
             })?;
         let answer = canary_evidence(b.decisions, &result)?;
-        if let capyctl_domain::completion::ExecutionIdentities::Retained(recorded) = &c.identities {
-            let alive: Vec<_> = result
-                .processes
-                .iter()
-                .filter(|p| p.presence == "alive")
-                .map(process)
-                .collect();
-            if !result.claim_retained || !capyctl_domain::completion::same_engine(recorded, &alive)
-            {
-                return Err(RuntimeError::Uncertain(
-                    "the host did not report the launch's engine alive with the wake canary".into(),
-                ));
-            }
-        }
+        canary_engine_alive(&c.identities, &result)?;
         Ok(CanaryAnswer {
             answer,
             observed_at_ms: result.observed_at_unix_ms,
         })
     }
+}
+
+/// ADR 0028 note of 2026-10-16: a host's answer to the wake canary of a
+/// retained launch counts only with the claim retained and the engine
+/// `identities` names alive (every recorded engine process and no other; a
+/// helper may be gone, ADR 0027). The coordinator names the processes the
+/// restore's evidence named, so a restart-park's wake (ADR 0033 §7) is
+/// judged on its new engine.
+pub(crate) fn canary_engine_alive(
+    identities: &capyctl_domain::completion::ExecutionIdentities,
+    result: &pb::MemberExecutionResult,
+) -> Result<(), RuntimeError> {
+    let capyctl_domain::completion::ExecutionIdentities::Retained(recorded) = identities else {
+        return Ok(());
+    };
+    let alive: Vec<_> = result
+        .processes
+        .iter()
+        .filter(|p| p.presence == "alive")
+        .map(process)
+        .collect();
+    if !result.claim_retained || !capyctl_domain::completion::same_engine(recorded, &alive) {
+        return Err(RuntimeError::Uncertain(
+            "the host did not report the launch's engine alive with the wake canary".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// ADR 0032 §3: how long the server waits for a host's answer to an abort,
@@ -2214,5 +2228,80 @@ mod tests {
             residency_evidence(false, &recorded, &unusable),
             Err(RuntimeError::Uncertain(_))
         ));
+    }
+
+    /// ADR 0028 note of 2026-10-16, ADR 0033 A14 (found live 2026-10-23): a
+    /// restart-park's wake canary counts on the engine its restore named
+    /// beside the server, as the coordinator passes it. The server alone the
+    /// restore recorded names no engine, so judged on it every such canary
+    /// failed; another engine, a recorded engine process gone, or the claim
+    /// not retained still does not count.
+    // T45 T20 T34
+    #[test]
+    fn a_restart_park_wake_canary_counts_on_the_new_engine_the_restore_named() {
+        use capyctl_domain::completion::ExecutionIdentities;
+        let server = vec![
+            process(&observed("lmcache", 60, "alive")),
+            process(&observed("lmcache-1", 61, "alive")),
+        ];
+        let restored = residency_evidence(false, &server, &{
+            let mut processes = observed_all(&server);
+            processes.extend([
+                observed("api", 70, "alive"),
+                observed("worker-0", 71, "alive"),
+            ]);
+            residency("restored", false, true, processes)
+        })
+        .unwrap()
+        .0;
+        let answer = |processes: Vec<pb::OwnedProcessObservation>| {
+            let mut r = result(processes);
+            r.state = "completed".into();
+            r.claim_retained = true;
+            r
+        };
+        let woken = answer(observed_all(&restored));
+        canary_engine_alive(&ExecutionIdentities::Retained(restored.clone()), &woken).unwrap();
+        assert!(matches!(
+            canary_engine_alive(&ExecutionIdentities::Retained(server.clone()), &woken),
+            Err(RuntimeError::Uncertain(_))
+        ));
+        let mut other = observed_all(&server);
+        other.extend([
+            observed("api", 80, "alive"),
+            observed("worker-0", 81, "alive"),
+        ]);
+        let mut worker_gone = observed_all(&restored);
+        worker_gone
+            .iter_mut()
+            .filter(|p| p.role == "worker-0")
+            .for_each(|p| p.presence = "gone".into());
+        let mut released = woken.clone();
+        released.claim_retained = false;
+        for uncertain in [answer(other), answer(worker_gone), released] {
+            assert!(
+                matches!(
+                    canary_engine_alive(
+                        &ExecutionIdentities::Retained(restored.clone()),
+                        &uncertain
+                    ),
+                    Err(RuntimeError::Uncertain(_))
+                ),
+                "{uncertain:?}"
+            );
+        }
+    }
+
+    fn observed_all(identities: &[ProcessIdentity]) -> Vec<pb::OwnedProcessObservation> {
+        identities
+            .iter()
+            .map(|p| pb::OwnedProcessObservation {
+                role: p.role.clone(),
+                pid: p.pid,
+                boot_id: p.boot_id.clone(),
+                start_ticks: p.start_ticks,
+                presence: "alive".into(),
+            })
+            .collect()
     }
 }

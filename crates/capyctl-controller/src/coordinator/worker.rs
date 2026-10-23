@@ -3679,7 +3679,12 @@ async fn execute_residency(
             let canary = if restore {
                 tokio::time::timeout_at(
                     deadline,
-                    wake_canary_check(shared, driver, work, &canary_context),
+                    wake_canary_check(
+                        shared,
+                        driver,
+                        work,
+                        &woken_context(&canary_context, &observation),
+                    ),
                 )
                 .await
                 .unwrap_or_else(|_| {
@@ -3789,6 +3794,24 @@ enum CanaryCheck {
     Unanswered(String),
     /// The model answered differently than at its first readiness.
     Differs,
+}
+
+/// ADR 0028 note of 2026-10-16, ADR 0033 A14: the wake canary's context, the
+/// restore's own with the processes its evidence names. A remote host's
+/// answer counts only with the engine the context names alive, and a
+/// restart-park's restore (which records the server alone) starts a new
+/// engine beside it, so the restore's recorded processes name no engine and
+/// every such wake failed its canary (found live 2026-10-23, vLLM 0.32.0 with
+/// LMCache on an enrolled host). Any other restore's evidence names the
+/// engine it recorded.
+fn woken_context(
+    restore: &capyctl_domain::completion::StepExecutionContext,
+    observation: &capyctl_domain::completion::EffectObservation,
+) -> capyctl_domain::completion::StepExecutionContext {
+    let mut context = restore.clone();
+    context.identities =
+        capyctl_domain::completion::ExecutionIdentities::Retained(observation.identities.clone());
+    context
 }
 
 /// ADR 0028 note of 2026-10-16: what a wake commits once its canary passed.
