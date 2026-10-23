@@ -99,11 +99,12 @@ the server's measured charge is its group's VmRSS beyond the pool plus its sampl
 memory, a figure nothing read keeping its allowance (A1; `d8ab848d`); the server's
 short-lived child and a server stopped before its engine (A9; `7d9ab7fa`).
 
-Verification, with `main` `c20b9927` merged in (#187, ADR 0032: the router's forwarder
+Verification, with `main` `9c7c7ab0` merged in (#187, ADR 0032: the router's forwarder
 carries both the effective salt and ADR 0032's request-ID lane; #188,
-`engine_telemetry`; merges `012105f8` and `0a73eaf3`, no rebase) and both fix branches
-below: `scripts/ci-local.sh --deep --ci-shape` passes, every step (unit 1628 passed, 1
-ignored; runtime 369; core 1732 passed; workspace 3703 passed, 1 ignored).
+`engine_telemetry`; #189, docs; merges `012105f8`, `0a73eaf3` and `54aa3740`, no
+rebase), both fix branches below and the A13 fix: `scripts/ci-local.sh --deep
+--ci-shape` passes, every step (unit 1632 passed, 1 ignored; runtime 369; core 1736
+passed; workspace 3707 passed, 1 ignored).
 
 Live rows, host A (GB10), Qwen3-4B (context 4096, KV cache 1 GiB, `restart_only`
 unless stated), 2026-10-22, standalone role, builds of `49f10efa` (the branch before the
