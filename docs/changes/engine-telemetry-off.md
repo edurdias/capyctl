@@ -11,8 +11,10 @@ What each engine reports, read from its own source:
   starts, and its id and runtime figures every ten minutes after, unless
   `VLLM_NO_USAGE_STATS=1`,
   `VLLM_DO_NOT_TRACK=1` or `DO_NOT_TRACK=1` (a set `VLLM_DO_NOT_TRACK` hides
-  `DO_NOT_TRACK`, so all three are set). [INFERENCE] 0.30 and 0.32 read the same
-  names; only 0.31.0 was read.
+  `DO_NOT_TRACK`, so all three are set). 0.30.0 and 0.32.0 read the same three names
+  (their `usage_lib.py`, read on the lab hosts); there the report is made by the rank 0
+  worker (`v1/worker/gpu_worker.py`), which for one rank runs in the `VLLM::EngineCore`
+  process.
 - SGLang 0.5.22 (the published wheel's source): no usage reporting of its own, no usage
   library and no tracking switch; its OpenTelemetry tracing needs an exporter the
   launch asks for. The Hugging Face Hub library it imports turns its telemetry off
@@ -74,18 +76,70 @@ Each failed before the change (the names were absent or settable) and passes aft
 
 CPU and Fake-engine tests are not qualification.
 
-## Live check still needed
+## Live check (host A and host B, 2026-10-23)
 
-On host A, with a vLLM chat deployment and an SGLang deployment: start the host with
-the default and read `/proc/<engine pid>/environ` for the engine's API process (PID from
-the ownership evidence, names only, never values other than these switches): vLLM shows
-`DO_NOT_TRACK=1`, `VLLM_DO_NOT_TRACK=1`, `VLLM_NO_USAGE_STATS=1`; SGLang (and its
-scheduler children) `DO_NOT_TRACK=1`; and no connection from the engine processes to
-`stats.vllm.ai` during start and ten minutes after (`ss -tnp` for the engine's process
-tree, or the resolver log). Then restart the host with `--set engine_telemetry=allow`:
-the vLLM launch shows none of the three switches and `~/.config/vllm/usage_stats.json`
-of the service user gains an entry; the engine still serves. Optional: a llama.cpp, a
-TensorFold and a custom launch each show `DO_NOT_TRACK=1` under the default.
+Release build of `58c1bf99` from a git archive on each host (the same binary sha256 on
+both). Each host had a standalone role on 127.0.0.1:38443 (management 37443) with a fresh
+state directory, a 108 GiB limit and an 8 GiB free reserve. `HOME` and
+`XDG_CONFIG_HOME` pointed into the run directory. The engines inherit that `HOME`: their
+caches and vLLM's usage file were written there, and neither host's own
+`~/.config/vllm/usage_stats.json` changed (same size, modification time and sha256
+before and after). Host A ran vLLM 0.32.0 and SGLang 0.5.22 on Qwen3-4B, and llama.cpp
+v0.7.0 on Qwen3-4B Q4_K_M. Host B ran the rest of step 3 on vLLM 0.30.0 with
+Qwen3-4B-Instruct-2507, because host A was needed for another run and vLLM 0.32.0 is
+installed only on host A. Context was 8192 everywhere. Environments were read from
+`/proc/<pid>/environ` for the three names only. The evidence is in
+`target/t188-live/` on the laptop.
+
+1. **The default sets the opt-outs: pass.** On host A, vLLM 0.32.0's API process and its
+   `multiprocessing` resource tracker showed `DO_NOT_TRACK=1`, `VLLM_DO_NOT_TRACK=1` and
+   `VLLM_NO_USAGE_STATS=1`. SGLang's entry process and its tracker showed
+   `DO_NOT_TRACK=1`, and so did `llama-server`. On host B, vLLM 0.30.0 showed the same
+   three.
+
+   Processes that rename themselves (`VLLM::EngineCore`, `sglang::scheduler`,
+   `sglang::detokenizer`) show none of the names, because setproctitle zeroes the
+   start of the area `/proc/<pid>/environ` reads. That is the first 728 to 733 bytes,
+   and the names that survive after it are the tail of the tracker's list, the three
+   names sitting at the head. EngineCore makes vLLM's report. Under the default it
+   wrote no usage file in its `HOME`; under `allow` the same process wrote one and
+   connected (step 3). That shows the names reach it.
+2. **No egress: pass.** On host A, `ss -tuanp` was sampled every 0.2 s over the role's
+   whole process tree, 77 PIDs including compile workers, from before the first
+   start (03:08:06 UTC) to 03:23:47. That is 11 min 52 s after vLLM was Ready
+   (03:10:53), 11 min 23 s after SGLang (03:12:24) and 11 min 21 s after llama.cpp
+   (03:12:26). There were 4685 samples and 22682 loopback socket observations. There
+   were no connections to anything else, and no listening or unconnected socket off
+   loopback. Each engine answered a request ("42").
+
+   On host B (vLLM 0.30.0, start to 22 s after Ready) a second watcher read the tree's
+   sockets every 20 ms, 12375 times. It found no resolver lookup and no connection
+   off loopback.
+3. **`allow`: pass.** The role was restarted with
+   `--set host.engine_telemetry=allow`, keeping the same state directory.
+   - **Host A (vLLM 0.32.0):** the API process and its tracker showed none of the three
+     names. vLLM wrote one report record to `<run-dir HOME>/.config/vllm/usage_stats.json`,
+     1473 bytes with the architecture, GPU and engine settings. It writes that record
+     just before it posts, so it attempted the report. The 0.2 s sampler saw no
+     connection, because the post is too short for it. The engine still served (200,
+     "42").
+   - **Host B (vLLM 0.30.0):** the 20 ms watcher caught the report. EngineCore looked up
+     a name through 127.0.0.53 at 03:37:08.39. It then opened a TCP connection to
+     `[2606:4700:3032::6815:58f5]:443`, an address `stats.vllm.ai` resolves to, at
+     03:37:08.55 (SYN-SENT, then ESTAB until 03:37:08.79). The usage file gained one
+     record and the engine still served (200, "42").
+   - **Restored `off` (host B):** the role was restarted without the setting. vLLM again
+     showed the three names, the usage file stayed at its one record, and neither
+     watcher saw anything off loopback.
+4. **Reserved names are refused: pass.** `capyctl engine add <vLLM venv>` with
+   `--env DO_NOT_TRACK=0`, `--env vllm_do_not_track=0` or
+   `--env VLLM_NO_USAGE_STATS=0`, and with `--approve-env DO_NOT_TRACK`, was refused
+   with `engine_env_reserved:<name>` (exit 2), and no profile was saved. A deployment
+   with `engine_config.env` setting `DO_NOT_TRACK` or `VLLM_NO_USAGE_STATS` (vLLM), or
+   `do_not_track` (llama.cpp), was refused at `deploy model` with `invalid_config` at
+   `engine_config.env: engine_env_reserved:<name>`.
+
+Not run: a TensorFold launch and a custom launch under the default (optional).
 
 # Release note: Privacy
 
