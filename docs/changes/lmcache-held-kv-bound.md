@@ -57,7 +57,7 @@ released the charged KV (4 `lmcache_kv_released`). In all 114 samples with a ser
 the charge covered its GPU reading; it was raised from readings 16 times (for example 5,736
 MiB after a SGLang wake against the 5,632 MiB the first launch held). The first SGLang try
 failed its first wake at 103 s on the 105 s restart-park wake window
-(`fix/restart-park-wake-window`, not on main); the run used `timeouts.wake: 1200s`.
+(fixed since in #197); the run used `timeouts.wake: 1200s`.
 
 # Release note: Fixes
 
