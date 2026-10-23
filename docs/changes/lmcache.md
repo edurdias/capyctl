@@ -216,13 +216,22 @@ Fixed after these rows (`fix/lmcache-host-settings` `1055f321` and
   released table is still empty, so every deep-parking deployment still runs without
   LMCache.
 
+With the host setting `engine_telemetry` from `main` (#188, merged here; owner decision
+2026-10-22, ADR 0033 A7): `LMCACHE_TRACK_USAGE=false` is set in the server and in the
+engine with the connector whatever `engine_telemetry` says, and `DO_NOT_TRACK=1`
+follows the setting (set under `off`, the default; not set under `allow`, in the server
+too), so `allow` leaves the engine's own default and LMCache still reports nothing.
+Tests: the server's environment and the vLLM engine's under both settings, SGLang's
+render, the launcher's closed server environment (CPU only; not run live).
+
 Still missing: the live rows again on this head (LC1 and LC4 on SGLang, the egress
 check with the server's environment fixed, the measured charge, the server-child cases,
 LC1 through CapyCTL); LC5 and LC10 rerun live on the fix above; LC7 rerun as amended
 (decisions on SGLang off, `required` refused); LC4 part 3 rerun live on its fix (the
 status names the real model type and GPU; no row qualifies until the table has one);
 the decision-model allowance measurement, which waits for a SGLang release with the
-upstream fix.
+upstream fix; the egress check under `engine_telemetry: allow` (no connection to
+`stats.lmcache.ai` from the server or the engine).
 
 CPU and Fake-engine tests are not qualification.
 
