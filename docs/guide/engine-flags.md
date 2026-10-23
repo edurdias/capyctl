@@ -80,7 +80,7 @@ its abbreviations, `_` spellings, `--no-` negations and `=value` forms) or
 compared upper-cased, so `dumper_enable` is refused like `DUMPER_ENABLE`, with
 `engine_env_reserved:<name>`.
 
-Every `LMCACHE_*` variable is reserved on every engine (ADR 0033): LMCache's
+Every `LMCACHE_*` variable is reserved on every engine: LMCache's
 vLLM helper reads its configuration from the environment after any file, and
 CapyCTL renders LMCache's settings itself.
 

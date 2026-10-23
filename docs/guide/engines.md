@@ -811,13 +811,13 @@ change.
 prompt prefixes in host RAM, outside the engine. CapyCTL runs it as a private
 server for each model instance, started and stopped with it, so a model that
 wakes from a park, or restarts, can answer a prompt that begins like an
-earlier one from that cache instead of recomputing it (ADR 0033).
+earlier one from that cache instead of recomputing it.
 
 **What runs.** Each instance of a deployment that uses LMCache gets its own
 `lmcache server`, from the engine's own environment, as a CapyCTL-owned
 process:
 
-- listening only on loopback, on two ports CapyCTL leases from the host's
+- listening only on loopback, on two ports CapyCTL takes from the host's
   `endpoint_port_range`; a server found listening anywhere else is stopped
   and the model runs without it;
 - with a pool of host RAM (4 GiB by default, `lmcache_pool` to change it)
@@ -908,16 +908,17 @@ and `--json` an `lmcache` object (`state`, `reason`, `pool_bytes`,
 CapyCTL could not read is `null`, never zero). The event `lmcache_off` records
 an instance and reason once per launch.
 
-**Memory.** An instance's reservation holds the pool plus the server's own
-memory in host RAM (on a GB10, the memory the GPU uses too), and the pool
-counts against `host_kv_limit`. Until a deployment's first measurement the
-server's own memory is charged at 1280 MiB plus 512 MiB of GPU memory, the
-largest figures measured on a GB10 plus a quarter; after it, at what was
-measured. The charge stays while the model is parked, and a `restart_only`
-model's charge also holds the stopped engine's KV cache from its park until
-a reading of the server's GPU memory after the wake shows it released
-([parking](parking.md#parking-with-lmcache)); a reading taken in that window
-is never the measurement. `memory.request` stays the engine's own GPU memory.
+**Memory.** The memory CapyCTL sets aside for an instance covers the pool
+plus the server's own memory in host RAM (on a GB10, the memory the GPU uses
+too), and the pool counts against `host_kv_limit`. Until a deployment's
+first measurement the server's own memory is charged at 1280 MiB plus 512 MiB
+of GPU memory, the largest figures measured on a GB10 plus a quarter; after
+it, at what was measured. The charge stays while the model is parked, and a
+`restart_only` model's charge also holds the stopped engine's KV cache from
+its park until a reading of the server's GPU memory after the wake shows it
+released ([parking](parking.md#parking-with-lmcache)); a reading taken in that
+window is never the measurement. `memory.request` stays the engine's own GPU
+memory.
 
 **Choosing.** A deployment's `lmcache` is `auto` (the default), `off` or
 `required`. With `auto`, a deployment that cannot use LMCache runs without
