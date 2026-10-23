@@ -20,8 +20,12 @@ durable guard.
 
 Tests (T20 T16): `a_launch_parks_and_wakes_as_often_as_it_is_asked` (25 park and wake
 cycles on one vLLM adapter, each probe answered by the engine, a recent step's repeat still
-refused; with the old bound the 13th cycle's probe was refused) and the guard's unit test.
-CPU and Fake-engine tests are not qualification. Live check: LIVE_RESULT
+refused; run against the old fence it fails at the 13th cycle's probe) and the guard's unit
+test. CPU and Fake-engine tests are not qualification. Live check (host A, 2026-10-23,
+standalone built from this branch with `fix/restart-park-wake-window` on `0b6f6fb6`): vLLM
+0.32.0, Qwen3-4B, deep park, LMCache off: 30 park and wake cycles on one launch (150
+residency steps), each woken by a router request, all served (wake 7.2–8.7 s, median
+8.1 s), one binding throughout, no uncertain wake.
 
 # Release note: Fixes
 
