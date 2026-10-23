@@ -1211,6 +1211,17 @@ CREATE TABLE IF NOT EXISTS embedded_host_settings(
 /// forward-only.
 pub const SCHEMA_V55: &str = "-- checkpoint model types (checkpoint_digests::migrate_v55)";
 
+/// v56 (ADR 0033 §§6, 7, amendment A13): `launch_lmcache.held_kv_state`,
+/// whether a launch's LMCache server may still hold a stopped engine's KV
+/// cache. `parking` from a restart-park's arm: the server's GPU readings are
+/// not recorded as its measurement. `held` from that park's completion: the
+/// same, and the instance's Ready charge after its wake keeps the held KV.
+/// Null again only on a server GPU reading below that KV cache taken while
+/// the instance is Ready with nothing in flight. A row written before v56
+/// reads null. The column is added by `lmcache::migrate_v56` only when
+/// missing. Additive and forward-only.
+pub const SCHEMA_V56: &str = "-- held engine KV after a restart-park (lmcache::migrate_v56)";
+
 #[cfg(test)]
 mod tests {
     use super::*;

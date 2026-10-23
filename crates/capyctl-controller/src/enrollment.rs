@@ -26,9 +26,12 @@ pub struct HostInvitation {
     /// id it re-enrolls. `host_name` is then that host's enrolled name.
     pub recover_host_id: Option<String>,
 }
-/// ADR 0033 §6: the LMCache figures already offered to the store, per
-/// (host, deployment, generation, owned handle): (resident, device).
-type LmcacheSeen = std::collections::BTreeMap<(String, String, i64, String), (i64, i64)>;
+/// ADR 0033 §6: what each launch's LMCache samples sent the store, per
+/// (host, deployment, generation, owned handle), by resident set and device.
+type LmcacheSeen = std::collections::BTreeMap<
+    (String, String, i64, String),
+    capyctl_store::ordinary_lifecycle::lmcache::MeasurementSeen,
+>;
 pub struct EnrollmentAuthority {
     state: SharedCoordinatorState,
     ca: CertificateAuthority,
@@ -131,34 +134,35 @@ impl EnrollmentAuthority {
                 sample.generation,
                 sample.owned_handle.clone(),
             );
-            if seen
+            // ADR 0033 A13: while the server may still hold a stopped
+            // engine's KV, only a reading below it (its release) is sent.
+            if !seen
                 .get(&key)
-                .is_some_and(|(r, d)| *r >= resident && *d >= device)
+                .copied()
+                .unwrap_or_default()
+                .wants(resident, device)
             {
                 continue;
             }
             let Ok(state) = self.state.lock() else {
                 return;
             };
-            if state
-                .store()
-                .record_host_lmcache_measurement(
-                    state.session(),
-                    host,
-                    &sample.deployment_id,
-                    sample.generation,
-                    &sample.owned_handle,
-                    resident,
-                    device,
-                    capyctl_protocol::now_unix_ms(),
-                )
-                .is_ok()
-            {
+            if let Ok(measured) = state.store().record_host_lmcache_measurement(
+                state.session(),
+                host,
+                &sample.deployment_id,
+                sample.generation,
+                &sample.owned_handle,
+                resident,
+                device,
+                capyctl_protocol::now_unix_ms(),
+            ) {
                 if seen.len() >= MAX_SEEN {
                     seen.clear();
                 }
-                let entry = seen.entry(key).or_default();
-                *entry = (entry.0.max(resident), entry.1.max(device));
+                seen.entry(key)
+                    .or_default()
+                    .sent(resident, device, measured);
             }
         }
     }

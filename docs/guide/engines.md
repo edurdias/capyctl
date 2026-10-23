@@ -913,8 +913,11 @@ memory in host RAM (on a GB10, the memory the GPU uses too), and the pool
 counts against `host_kv_limit`. Until a deployment's first measurement the
 server's own memory is charged at 1280 MiB plus 512 MiB of GPU memory, the
 largest figures measured on a GB10 plus a quarter; after it, at what was
-measured. The charge stays while the model is parked. `memory.request` stays
-the engine's own GPU memory.
+measured. The charge stays while the model is parked, and a `restart_only`
+model's charge also holds the stopped engine's KV cache from its park until
+a reading of the server's GPU memory after the wake shows it released
+([parking](parking.md#parking-with-lmcache)); a reading taken in that window
+is never the measurement. `memory.request` stays the engine's own GPU memory.
 
 **Choosing.** A deployment's `lmcache` is `auto` (the default), `off` or
 `required`. With `auto`, a deployment that cannot use LMCache runs without

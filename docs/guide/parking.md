@@ -88,8 +88,11 @@ the server stops when the model stops.
   first request after the wake can be answered from the cache. Without
   LMCache such a model stops instead of parking, as before. While it is
   parked, the reservation also holds the engine's KV cache: the server keeps
-  the stopped engine's KV memory mapped until the next engine connects
-  (measured on a GB10).
+  the stopped engine's KV memory mapped. It still holds it after the wake,
+  until the new engine first stores KV, so the reservation keeps it after the
+  wake too, until a reading of the server's GPU memory shows it released
+  (measured on a GB10). Where no reading of the server's GPU memory is
+  available, the reservation keeps it until the model stops.
 - **`deep` and `host_backed`** use LMCache only on an engine version, model
   type and GPU combination qualified live for parking with it. This release
   qualifies none, so a deep-parking deployment keeps parking deep and runs

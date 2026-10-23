@@ -444,12 +444,14 @@ pub struct InstanceLmcache {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_bytes: Option<i64>,
     /// On only, `restart_only`: the engine KV cache the server keeps mapped
-    /// while a restart-park stopped the engine, charged in that phase only.
+    /// once a restart-park stopped the engine, charged while parked and,
+    /// after the wake, until a GPU reading of the server shows it released
+    /// (ADR 0033 amendment A13).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub held_kv_bytes: Option<i64>,
     /// On only: the charge the launch holds for its server now (the pool,
-    /// the overhead and the device memory, and while restart-parked the
-    /// engine KV cache it keeps mapped).
+    /// the overhead and the device memory, and the engine KV cache it keeps
+    /// mapped while restart-parked and after the wake until released).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub charge_bytes: Option<i64>,
     /// On only: the overhead and device figures were measured for the
@@ -1267,6 +1269,7 @@ fn instance_lmcache(
         Option<String>,
         bool,
         bool,
+        bool,
     );
     let row: Option<Row> = tx
         .prepare_cached(
@@ -1276,7 +1279,7 @@ fn instance_lmcache(
                     EXISTS(SELECT 1 FROM management_events e WHERE e.kind='lmcache_server_exited'
                        AND e.deployment_id=l.deployment_id
                        AND json_extract(e.payload_json,'$.binding_id')=l.binding_id),
-                    i.observed_state='parked'
+                    i.observed_state='parked',l.held_kv_state IS 'held'
                FROM launch_lmcache l
                JOIN deployment_instances i ON i.deployment_id=l.deployment_id
                 AND i.instance_index=l.instance_index AND i.generation=l.generation
@@ -1298,6 +1301,7 @@ fn instance_lmcache(
                 r.get(12)?,
                 r.get(13)?,
                 r.get(14)?,
+                r.get(15)?,
             ))
         })
         .optional()?;
@@ -1314,6 +1318,7 @@ fn instance_lmcache(
         binding,
         exited,
         parked,
+        kv_held,
     )) = row
     else {
         return Ok(None);
@@ -1365,7 +1370,7 @@ fn instance_lmcache(
         Some(_) => "running",
     };
     let mut charge = pool.saturating_add(overhead).saturating_add(device);
-    if restart_park && parked {
+    if restart_park && (parked || kv_held) {
         charge = charge.saturating_add(held_kv);
     }
     Ok(Some(InstanceLmcache {

@@ -1306,8 +1306,9 @@ async fn a_launch_without_a_gpu_reading_keeps_the_device_allowance() {
 /// stopping its engine: the park's evidence names the server alone, the
 /// binding keeps the server, and the parked charge is the server's plus the
 /// engine KV cache it keeps mapped. The wake starts a new engine beside the
-/// same server, at the same generation on the same binding, and the Ready
-/// charge returns.
+/// same server, at the same generation on the same binding. A13: the Ready
+/// charge keeps that KV until a GPU reading of the server below it, which
+/// returns the Ready charge.
 async fn a_restart_park_keeps_the_server_and_wakes_a_new_engine(report: Report) {
     let (dir, owner, fence, observations) = lab(|_| {}).await;
     let deployment = fence.deployment_id.clone();
@@ -1385,6 +1386,21 @@ async fn a_restart_park_keeps_the_server_and_wakes_a_new_engine(report: Report) 
     assert_eq!(woken_binding, launch);
     assert_eq!(lmcache_members(&recorded), server);
     assert!(recorded.iter().all(|p| !engine.contains(p)), "{recorded:?}");
+    let (phase, bytes, host_kv) = charge(&owner, &deployment).unwrap();
+    assert_eq!(
+        (phase, (bytes, host_kv)),
+        (
+            ResourcePhase::Ready,
+            (CACHED_READY.0 + 4 * GIB, CACHED_READY.1)
+        )
+    );
+    let measured = {
+        let o = owner.lock().unwrap();
+        o.store()
+            .record_lmcache_overhead(o.session(), &launch, 0, 406 * MIB, 1)
+            .unwrap()
+    };
+    assert_eq!(measured.held_kv_bytes, None, "the reading released it");
     let (phase, bytes, host_kv) = charge(&owner, &deployment).unwrap();
     assert_eq!(
         (phase, (bytes, host_kv)),

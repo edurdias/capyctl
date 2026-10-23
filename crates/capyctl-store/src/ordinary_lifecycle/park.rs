@@ -380,7 +380,7 @@ fn peak(base: &PhaseFootprint, next: &PhaseFootprint, at: ResourcePhase) -> Phas
 
 /// The four footprints a Ready launch's owner may hold (SPEC §7.3).
 pub(super) struct Footprints {
-    ready: PhaseFootprint,
+    pub(super) ready: PhaseFootprint,
     parking: PhaseFootprint,
     pub(super) parked: PhaseFootprint,
     pub(super) wake: PhaseFootprint,
@@ -391,7 +391,11 @@ pub(super) struct Footprints {
 /// 7 (lifecycle design §4.1): every phase carries the launch's LMCache charge
 /// while its server runs; a restart-park's parked phase is the server's
 /// charge alone (with the stopped engine's KV it keeps mapped), and its wake
-/// is a cold start beside that server.
+/// is a cold start beside that server. ADR 0033 amendment A13 (found live on
+/// vLLM, 2026-10-23): the server keeps that KV after the wake's engine
+/// registers, until that engine first stores KV, so once a restart-park
+/// completed, the wake and the Ready charge carry it too, until a GPU reading
+/// of the server shows it released (`lmcache::release_held_kv`).
 pub(super) fn charged_footprints(
     tx: &rusqlite::Connection,
     p: &Plan,
@@ -426,9 +430,26 @@ pub(super) fn charged_footprints(
         )?;
         let mut cold = super::startup::cold(tx, p, e)?;
         cold.phase = ResourcePhase::Wake;
+        if !super::lmcache::kv_held(tx, &p.binding_id)? {
+            return Ok(Footprints {
+                parking: peak(&ready, &parking, ResourcePhase::Parking),
+                wake: peak(&parked, &cold, ResourcePhase::Wake),
+                ready,
+                parked,
+            });
+        }
+        // The wake's engine starts, and settles Ready, beside the KV the
+        // server still holds: neither its startup peak nor its Ready charge
+        // replaces that KV.
+        let ready = super::lmcache::with_held_kv(e, ready, &charge)?;
+        let cold = super::lmcache::with_held_kv(e, cold, &charge)?;
         return Ok(Footprints {
             parking: peak(&ready, &parking, ResourcePhase::Parking),
-            wake: peak(&parked, &cold, ResourcePhase::Wake),
+            wake: peak(
+                &peak(&parked, &cold, ResourcePhase::Wake),
+                &ready,
+                ResourcePhase::Wake,
+            ),
             ready,
             parked,
         });
@@ -487,7 +508,7 @@ fn footprints_with(
 }
 
 /// Footprints compared as the ledger stores them (sorted, versioned).
-fn same(a: &PhaseFootprint, b: &PhaseFootprint) -> bool {
+pub(super) fn same(a: &PhaseFootprint, b: &PhaseFootprint) -> bool {
     matches!(
         (resource_ledger::encode(a), resource_ledger::encode(b)),
         (Ok(a), Ok(b)) if a == b
@@ -712,7 +733,7 @@ fn instance_state(
 }
 
 /// Any lifecycle run of the instance still open, with its operation kind.
-fn open_run(
+pub(super) fn open_run(
     tx: &Transaction<'_>,
     deployment: &str,
     instance: u32,
@@ -2139,6 +2160,14 @@ fn arm(
         // Stale observation, a racing epoch: nothing was written; retry later.
         Err(error) => return Ok(ResidencyArm::Blocked(error.to_string())),
     }
+    // ADR 0033 amendment A13: from here the engine may stop and leave its KV
+    // with the server, so no GPU reading of the server is its measurement
+    // until one shows that KV released.
+    if p.kind == ResidencyKind::Park
+        && super::lmcache::park_mode(tx, &e, &p.binding_id)? == super::lmcache::ParkMode::EngineStop
+    {
+        super::lmcache::kv_may_be_held(tx, &p.binding_id)?;
+    }
     one(tx.execute(
         "UPDATE operations SET state='running' WHERE id=?1 AND state='pending'",
         [&p.operation_id],
@@ -2277,6 +2306,11 @@ fn complete(
     )?)?;
     if let Some(identities) = &rewritten {
         super::lmcache::reassociate(tx, &source, identities)?;
+        // ADR 0033 amendment A13: the server holds the stopped engine's KV,
+        // through the wake and after it until a reading shows it released.
+        if p.kind == ResidencyKind::Park {
+            super::lmcache::kv_held_by_server(tx, &p.binding_id)?;
+        }
     }
     match p.kind {
         // SPEC §6.1 PARKED: initialized runtime retained, release verified.

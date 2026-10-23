@@ -52,10 +52,18 @@ pub enum ExitHandled {
 #[derive(Clone)]
 pub struct EngineExits {
     commands: CoordinatorCommands,
-    /// ADR 0033 §6 (lifecycle design §7): the largest server overhead and
-    /// GPU memory measured per launch this run, so the store is written only
-    /// when one grows.
-    measured: Arc<std::sync::Mutex<std::collections::BTreeMap<String, (i64, i64)>>>,
+    /// ADR 0033 §6 (lifecycle design §7): what each launch's server
+    /// measurements sent the store this run, so the store is written only
+    /// for a sample that may change something (a larger figure, or the
+    /// reading that shows a stopped engine's KV released, A13).
+    measured: Arc<
+        std::sync::Mutex<
+            std::collections::BTreeMap<
+                String,
+                capyctl_store::ordinary_lifecycle::lmcache::MeasurementSeen,
+            >,
+        >,
+    >,
     /// ADR 0033 §6, A1: the per-process GPU sampler the host observation
     /// reads (`nvidia-smi`), which names the server's processes on unified
     /// memory and on a discrete GPU alike. `None` reads no GPU memory, and
@@ -208,8 +216,10 @@ impl EngineExits {
     /// ADR 0033 §6, A1 (lifecycle design §7): the running server's resident
     /// set beyond its pool and its GPU memory, recorded for the revision on
     /// this host when either is the most seen. A figure nothing read is
-    /// recorded as zero, which keeps its allowance. Evidence only: a failure
-    /// changes nothing.
+    /// recorded as zero, which keeps its allowance. A13: while the server may
+    /// still hold a stopped engine's KV, its GPU reading is offered only when
+    /// below that KV, as the evidence that releases it. Evidence only: a
+    /// failure changes nothing.
     pub(crate) fn measure(
         &self,
         launch: &capyctl_store::ordinary_lifecycle::lmcache::LocalLmcacheLaunch,
@@ -228,27 +238,22 @@ impl EngineExits {
             return;
         };
         let most = seen.get(&launch.binding_id).copied().unwrap_or_default();
-        if overhead <= most.0 && device <= most.1 {
+        if !most.wants(overhead, device) {
             return;
         }
         let Ok(owner) = self.commands.owner_for_read() else {
             return;
         };
-        if owner
-            .store()
-            .record_lmcache_overhead(
-                owner.session(),
-                &launch.binding_id,
-                overhead,
-                device,
-                capyctl_protocol::now_unix_ms(),
-            )
-            .is_ok()
-        {
-            seen.insert(
-                launch.binding_id.clone(),
-                (most.0.max(overhead), most.1.max(device)),
-            );
+        if let Ok(measured) = owner.store().record_lmcache_overhead(
+            owner.session(),
+            &launch.binding_id,
+            overhead,
+            device,
+            capyctl_protocol::now_unix_ms(),
+        ) {
+            seen.entry(launch.binding_id.clone())
+                .or_default()
+                .sent(overhead, device, measured);
         }
     }
 

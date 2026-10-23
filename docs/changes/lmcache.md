@@ -35,7 +35,8 @@ What changed:
 - **Accounting.** Pool plus allowance (1280 MiB overhead and 512 MiB device, from LC1,
   A1) then the measured figures, in the system domain (the shared pool on unified
   memory), the pool against `host_kv_limit`; a restart-parked instance also holds the
-  engine KV its server keeps mapped (A5). Measured on the allowances' basis (A1): the
+  engine KV its server keeps mapped (A5), and after the wake until a GPU reading of the
+  server shows it released (A13). Measured on the allowances' basis (A1): the
   server's whole resident set (`VmRSS`) beyond its pool and the GPU memory the driver
   attributes to its processes, on unified memory too; a figure nothing read keeps its
   allowance.
@@ -263,20 +264,44 @@ on the laptop:
   vLLM), each gone in 10–20 ms, before the listener check; no `lmcache-N` member was ever
   recorded, no `lmcache_server_exited`, no instance failed. The fixed path (a member
   exiting during the check or while Ready) did not occur live.
-- **Finding (not fixed): KV still mapped after a vLLM wake.** After a vLLM restart-park
-  wake the server kept the old engine's KV mapped (1574 MiB of GPU memory, Ready, at
-  least 37 s) until the new engine's first storing request. The measurement recorded
-  it, so vLLM's device figure became 1,650,458,624 B and later launches charge
-  6,795,710,464 B, about 1.14 GiB over the steady state; during that window the Ready
-  charge (device 406 MiB) was below what the server held.
+- **Finding (fixed after this rerun, A13, below): KV still mapped after a vLLM wake.**
+  After a vLLM restart-park wake the server kept the old engine's KV mapped (1574 MiB of
+  GPU memory, Ready, at least 37 s) until the new engine's first storing request. The
+  measurement recorded it, so vLLM's device figure became 1,650,458,624 B and later
+  launches charge 6,795,710,464 B, about 1.14 GiB over the steady state; during that
+  window the Ready charge (device 406 MiB) was below what the server held.
+
+Fixed after the rerun (`fix/lmcache-wake-charge`, CPU tests only, not yet run live), ADR
+0033 A13, on both engines (SGLang's restart-park goes through the same park and wake, and
+its servers held 1608–1656 MiB after their engine's exit):
+
+- **The charge after a wake.** A completed restart-park marks the launch's server as
+  holding the stopped engine's KV (store schema v56, `launch_lmcache.held_kv_state`).
+  The wake is charged its cold start plus that KV, and the Ready instance after it keeps
+  the KV in its charge until a GPU reading of the server below the engine's KV cache,
+  taken while Ready with nothing in flight, shows it released; then the reservation
+  moves to the Ready charge without it, journaled `lmcache_kv_released`. No timer ends
+  it; a host whose readings name no server process keeps it charged until the stop.
+  Status's `charge_bytes` includes it while held.
+- **The measurement.** From a restart-park's arm until that release reading, the
+  server's GPU readings are not recorded as its measurement (largest seen per revision),
+  embedded and from a host's load reports alike; the release reading is recorded. The
+  callers that skip samples no larger than the last (the embedded watch, a host's
+  samples) still send a reading below the held KV.
+- Tests: the wake keeps the held KV charged through an inflated reading and a missing
+  one, a low reading while parked releases nothing, the release reading lowers the
+  charge once and journals it, no reading in the window becomes the revision's figure,
+  and the next launch charges the steady one, on vLLM and on SGLang; the callers'
+  sample filter; the v56 migration. The restart-park round trip now expects the held KV
+  in the charge after the wake.
 
 Still missing: LC4 on SGLang (the restart-park quiescence fix); LC7 rerun as amended
 (decisions on SGLang off, `required` refused); LC1 through CapyCTL on a server and host
 pair; the vLLM usage-report egress check on this head (#188) and the egress check under
 `engine_telemetry: allow` (no connection to `stats.lmcache.ai` from the server or the
-engine); a decision on the KV still mapped after a vLLM wake (the charge in that window
-and the measured device figure it leaves); the decision-model allowance measurement,
-which waits for a SGLang release with the upstream fix.
+engine); the post-wake KV charge and measurement fix (A13) live on both engines; the
+decision-model allowance measurement, which waits for a SGLang release with the upstream
+fix.
 
 CPU and Fake-engine tests are not qualification.
 

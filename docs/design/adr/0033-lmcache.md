@@ -2,11 +2,12 @@
 
 **Status:** Accepted (owner decisions 2026-10-21: the design, and the owner's answers to
 the ten open questions of the first draft, recorded below). Implemented for 0.1.7
-(2026-10-22), with the amendments of the implementation at the end of this record (A1–A11):
+(2026-10-22), with the amendments of the implementation at the end of this record (A1–A13):
 the measured defaults of §6, the server's command line and log, the SGLang salt check
 (LMCache issue 4825), the charge of the engine KV a server keeps while its engine is
-stopped, `restart_only` decision deployments parking with LMCache, and decision
-deployments on SGLang running without LMCache until LC7 passes on a release (A10).
+stopped and after the wake until a reading shows it released (A13), `restart_only`
+decision deployments parking with LMCache, and decision deployments on SGLang running
+without LMCache until LC7 passes on a release (A10).
 **Amends (with the implementation):** `SPEC.md` §7.4 (a private cache service per
 instance), §8.2 (the rendered connector is owned), §9.1 and §9.2 (LMCache beside a
 parking residency only where qualified), §10 (`cache_salt` is no longer forwarded
@@ -831,7 +832,8 @@ non-empty salt.
 server keeps the engine's KV cache mapped through CUDA IPC (the server's GPU figure rose
 to 1430 MiB with a 1 GiB vLLM KV cache, 1656 MiB on SGLang, unchanged after 92 s) until
 the next engine registers (it then dropped back to 406–408 MiB, the old KV released, not
-both held) or the server stops. A `restart_only` instance parked with its server
+both held; corrected by A13: the release comes with the new engine's first stored KV, not
+its registration) or the server stops. A `restart_only` instance parked with its server
 therefore charges, in its parked phase, the server's charge plus the engine's KV cache.
 Each server that had an engine connected also leaves a CUDA driver file,
 `/dev/shm/cuda.shm.<uid>.<pid>.1` (80 KiB, owner-only), after its verified exit; CapyCTL
@@ -954,3 +956,38 @@ no row of the table could ever match. Both plans now compare real values:
 
 The released table is unchanged: it is still empty until LC4 passes, so every parking
 combination stays off, now naming its real model type and GPU.
+
+**A13. The stopped engine's KV after the wake (§§6, 7; found live on vLLM, 2026-10-23).**
+The live rerun on host A found A5's release point wrong: after a restart-park's wake the
+server kept the old engine's KV mapped (1574 MiB of GPU memory, Ready, at least 37 s)
+until the new engine's first request that stored KV, then 406 MiB. Two errors followed.
+The Ready charge in that window was the server's steady figure, below what it held; and
+the measurement recorded that reading as the server's GPU figure (1,650,458,624 B), so
+every later launch of the revision charged about 1.14 GiB too much. SGLang servers also
+held 1608–1656 MiB between their engine's exit and their own stop. The rule, on both
+engines and on every host:
+
+- **The charge.** Once a restart-park completes, the server holds the stopped engine's
+  KV until a GPU reading of the server shows it released, and nothing else (no timer,
+  no engine registration) ends that. The wake is charged its cold start beside the
+  server plus that KV (and at least the Ready charge below), and the Ready instance
+  after the wake keeps the KV in its charge, in the device domain on a discrete GPU
+  and the one shared pool on unified memory, as the parked phase does. The evidence of
+  the release is a GPU reading of the server's processes below the engine's KV cache
+  (a server still holding that KV cannot show less), taken while the instance is Ready
+  on that launch with no lifecycle run open; a reading of zero is none. On it the
+  instance's reservation moves to the Ready charge without the KV, journaled
+  `lmcache_kv_released`. A host whose GPU readings name no server process keeps the KV
+  charged until the instance stops, and so does a server whose own GPU memory is not
+  below the engine's KV cache: uncertainty keeps its accounting. Status shows the
+  charge with the KV in it while it is held.
+- **The measurement.** From a restart-park's arm until that release reading, no GPU
+  reading of the server is recorded as its measurement (the resident set beyond the
+  pool still is): the largest figure seen per revision never takes a reading that
+  counts a stopped engine's KV. The release reading itself is a measurement.
+  Callers that skip samples no larger than the last still send a reading below the
+  held KV while the server may hold it.
+- **Where it is kept.** `launch_lmcache.held_kv_state` (schema v56): `parking` from the
+  park's arm (measurement only), `held` from its completion (measurement and charge).
+  A remote host's co-residence re-check still charges the wake and the Ready phase
+  without the KV; the control plane's admission, which charges it, stays the authority.

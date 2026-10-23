@@ -252,6 +252,86 @@ pub(super) fn charged(
     }
 }
 
+/// v56 (ADR 0033 §§6, 7, amendment A13): add `launch_lmcache.held_kv_state`
+/// unless a store rolled back from v56 or later still has it.
+pub(crate) fn migrate_v56(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    let present: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('launch_lmcache') WHERE name='held_kv_state')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !present {
+        tx.execute_batch(
+            "ALTER TABLE launch_lmcache ADD COLUMN held_kv_state TEXT
+               CHECK(held_kv_state IN('parking','held'));",
+        )?;
+    }
+    Ok(())
+}
+
+/// ADR 0033 §§6, 7, amendment A13 (found live on vLLM, 2026-10-23): whether
+/// `binding_id`'s server holds the KV of an engine a restart-park stopped
+/// that its Ready charge keeps after the wake. The wake's engine registering
+/// does not release it: only a GPU reading of the server below that KV cache
+/// does ([`release_held_kv`]).
+pub(super) fn kv_held(
+    conn: &rusqlite::Connection,
+    binding_id: &str,
+) -> Result<bool, LifecycleError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM launch_lmcache WHERE binding_id=?1 AND held_kv_state='held')",
+        [binding_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// ADR 0033 §§6, 7, amendment A13: a restart-park of `binding_id` was armed,
+/// so from now on its server may hold the engine's KV: none of its GPU
+/// readings is recorded as its measurement until one shows that KV released.
+/// A launch already holding KV from an earlier park keeps `held`.
+pub(super) fn kv_may_be_held(tx: &Transaction<'_>, binding_id: &str) -> Result<(), LifecycleError> {
+    tx.execute(
+        "UPDATE launch_lmcache SET held_kv_state=COALESCE(held_kv_state,'parking')
+          WHERE binding_id=?1 AND planned='on' AND held_kv_bytes>0",
+        [binding_id],
+    )?;
+    Ok(())
+}
+
+/// ADR 0033 §§6, 7, amendment A13: a restart-park of `binding_id` completed:
+/// its server holds the stopped engine's KV, charged while parked and, after
+/// the wake, beside the new engine until a reading shows it released.
+pub(super) fn kv_held_by_server(
+    tx: &Transaction<'_>,
+    binding_id: &str,
+) -> Result<(), LifecycleError> {
+    tx.execute(
+        "UPDATE launch_lmcache SET held_kv_state='held'
+          WHERE binding_id=?1 AND planned='on' AND held_kv_bytes>0",
+        [binding_id],
+    )?;
+    Ok(())
+}
+
+/// ADR 0033 §§6, 7, amendment A13: `footprint` with the stopped engine's KV
+/// `charge` holds added where the parked phase charges it: the device domain
+/// on a discrete GPU, the one shared pool on unified memory.
+pub(super) fn with_held_kv(
+    e: &EffectiveDeployment,
+    mut footprint: PhaseFootprint,
+    charge: &LmcacheCharge,
+) -> Result<PhaseFootprint, LifecycleError> {
+    use lc::ChargeAllocations;
+    if charge.held_kv_bytes > 0 {
+        let domains = domains(e)?;
+        let domain = domains.device.as_deref().unwrap_or(&domains.system);
+        footprint
+            .allocations
+            .add_charge(domain, charge.held_kv_bytes, 0);
+    }
+    Ok(footprint)
+}
+
 /// The figures measured for this revision on `host`, if any.
 fn measured(
     conn: &rusqlite::Connection,
@@ -1105,8 +1185,10 @@ impl crate::Store {
     /// later launches of the revision there charge them in place of the
     /// allowances. Zero is no reading: it never lowers a figure, and a
     /// figure never read keeps its allowance
-    /// ([`capyctl_config::lmcache::LmcachePlan::charge_measured`]). Returns
-    /// whether the record grew.
+    /// ([`capyctl_config::lmcache::LmcachePlan::charge_measured`]). A13:
+    /// from a restart-park's arm until a GPU reading shows the stopped
+    /// engine's KV released, the GPU reading is not recorded (it counts that
+    /// KV), and such a reading releases it ([`LmcacheMeasured`]).
     pub fn record_lmcache_overhead(
         &self,
         s: &CoordinatorSession,
@@ -1114,15 +1196,15 @@ impl crate::Store {
         overhead_bytes: i64,
         device_bytes: i64,
         now: i64,
-    ) -> Result<bool, LifecycleError> {
+    ) -> Result<LmcacheMeasured, LifecycleError> {
         if overhead_bytes < 0 || device_bytes < 0 || now < 0 {
             return Err(LifecycleError::Invalid);
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
-        let grew = record_overhead(&tx, binding_id, overhead_bytes, device_bytes, now)?;
+        let measured = record_overhead(&tx, binding_id, overhead_bytes, device_bytes, now)?;
         tx.commit()?;
-        Ok(grew)
+        Ok(measured)
     }
 
     /// ADR 0033 §§6, 12, A1 (lifecycle design §7): what `host` measured of
@@ -1131,7 +1213,7 @@ impl crate::Store {
     /// its GPU memory (zero: none read). The resident set beyond the granted
     /// pool is the overhead, recorded as [`Self::record_lmcache_overhead`]
     /// does. A sample naming no retained launch of that host with a server
-    /// changes nothing. Returns whether the record grew.
+    /// changes nothing.
     #[allow(clippy::too_many_arguments)]
     pub fn record_host_lmcache_measurement(
         &self,
@@ -1143,7 +1225,7 @@ impl crate::Store {
         resident_bytes: i64,
         device_bytes: i64,
         now: i64,
-    ) -> Result<bool, LifecycleError> {
+    ) -> Result<LmcacheMeasured, LifecycleError> {
         if resident_bytes < 0 || device_bytes < 0 || now < 0 {
             return Err(LifecycleError::Invalid);
         }
@@ -1160,15 +1242,12 @@ impl crate::Store {
             )
             .optional()?;
         let Some((binding, pool)) = launch else {
-            return Ok(false);
+            return Ok(LmcacheMeasured::default());
         };
         let overhead = resident_bytes.saturating_sub(pool).max(0);
-        if overhead == 0 && device_bytes == 0 {
-            return Ok(false);
-        }
-        let grew = record_overhead(&tx, &binding, overhead, device_bytes, now)?;
+        let measured = record_overhead(&tx, &binding, overhead, device_bytes, now)?;
         tx.commit()?;
-        Ok(grew)
+        Ok(measured)
     }
 
     /// ADR 0033 §8 (lifecycle design §3): release a launch whose engine failed
@@ -1616,31 +1695,106 @@ impl crate::Store {
 /// under (ADR 0033 §§9, 10).
 pub const RETIRE_PRINCIPAL: &str = "system:lmcache_retire";
 
+/// What one measurement of a launch's server did (ADR 0033 §6, A1, A13).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LmcacheMeasured {
+    /// The revision's recorded figures grew.
+    pub grew: bool,
+    /// A13: the server may still hold a stopped engine's KV, of this size:
+    /// the sample's GPU reading was not recorded. A later GPU reading below
+    /// it, taken while the instance is Ready, is the evidence that releases
+    /// it; a caller that skips samples no larger than the last still sends
+    /// such a reading.
+    pub held_kv_bytes: Option<i64>,
+}
+
+/// The figures one launch's server measurements sent the store this run, so
+/// a caller writes the store only for a sample that may change something
+/// (ADR 0033 §6, A1, A13). The host figure is the one the caller sends: the
+/// overhead beyond the pool, or the resident set it is taken from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MeasurementSeen {
+    host_bytes: i64,
+    device_bytes: i64,
+    /// A13: the stopped engine's KV the server may still hold, as the store
+    /// last said.
+    held_kv_bytes: Option<i64>,
+}
+
+impl MeasurementSeen {
+    /// Whether a sample may change what the store holds: a larger host
+    /// figure; a larger GPU reading; or, while the server may still hold a
+    /// stopped engine's KV, a GPU reading below that KV (the evidence that
+    /// releases it), a larger one counting that KV and changing nothing.
+    pub fn wants(&self, host_bytes: i64, device_bytes: i64) -> bool {
+        host_bytes > self.host_bytes
+            || match self.held_kv_bytes {
+                Some(held) => device_bytes > 0 && device_bytes < held,
+                None => device_bytes > self.device_bytes,
+            }
+    }
+
+    /// Remember a sample the store took and what it said of it.
+    pub fn sent(&mut self, host_bytes: i64, device_bytes: i64, measured: LmcacheMeasured) {
+        self.host_bytes = self.host_bytes.max(host_bytes);
+        if measured.held_kv_bytes.is_none() {
+            self.device_bytes = self.device_bytes.max(device_bytes);
+        }
+        self.held_kv_bytes = measured.held_kv_bytes;
+    }
+}
+
 /// ADR 0033 §6: grow the measurement of `binding_id`'s revision on its host
-/// to `overhead_bytes` and `device_bytes` where they exceed it. Whether it
-/// grew; a binding that is released or planned off changes nothing.
+/// to `overhead_bytes` and `device_bytes` where they exceed it; a binding
+/// that is released or planned off changes nothing. A13 (found live on vLLM,
+/// 2026-10-23: a reading taken after a wake while the server still held the
+/// old engine's KV became the revision's device figure, so every later
+/// launch charged about 1.14 GiB too much): while the server may hold a
+/// stopped engine's KV, the GPU reading counts that KV and is not recorded,
+/// unless it is the reading that releases it ([`release_held_kv`]).
 fn record_overhead(
     tx: &Transaction<'_>,
     binding_id: &str,
     overhead_bytes: i64,
     device_bytes: i64,
     now: i64,
-) -> Result<bool, LifecycleError> {
-    let launch: Option<(String, i64, String)> = tx
+) -> Result<LmcacheMeasured, LifecycleError> {
+    type Launch = (String, i64, String, u32, Option<String>, i64);
+    let launch: Option<Launch> = tx
         .query_row(
-            "SELECT l.deployment_id,l.revision,l.host_id FROM launch_lmcache l
-               JOIN runtime_bindings b ON b.id=l.binding_id
+            "SELECT l.deployment_id,l.revision,l.host_id,l.instance_index,l.held_kv_state,l.held_kv_bytes
+               FROM launch_lmcache l JOIN runtime_bindings b ON b.id=l.binding_id
               WHERE l.binding_id=?1 AND l.planned='on' AND b.state!='released'",
             [binding_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )
         .optional()?;
-    let Some((deployment, revision, host)) = launch else {
-        return Ok(false);
+    let Some((deployment, revision, host, instance, held_state, held_kv)) = launch else {
+        return Ok(LmcacheMeasured::default());
     };
+    let mut device_bytes = device_bytes;
+    let mut held_kv_bytes = None;
+    if let Some(state) = held_state {
+        let release = HeldKv {
+            binding_id,
+            deployment: &deployment,
+            instance,
+            charged: state == "held",
+            held_kv_bytes: held_kv,
+        };
+        if !release_held_kv(tx, &release, device_bytes)? {
+            device_bytes = 0;
+            held_kv_bytes = Some(held_kv);
+        }
+    }
     let prior = measured(tx, &deployment, revision, &host)?;
-    if prior.is_some_and(|(o, d)| o >= overhead_bytes && d >= device_bytes) {
-        return Ok(false);
+    if (overhead_bytes == 0 && device_bytes == 0)
+        || prior.is_some_and(|(o, d)| o >= overhead_bytes && d >= device_bytes)
+    {
+        return Ok(LmcacheMeasured {
+            grew: false,
+            held_kv_bytes,
+        });
     }
     tx.execute(
         "INSERT INTO lmcache_measurements(deployment_id,revision,host_id,overhead_bytes,device_bytes,binding_id,measured_at_ms)
@@ -1651,6 +1805,98 @@ fn record_overhead(
            binding_id=excluded.binding_id,measured_at_ms=excluded.measured_at_ms",
         params![deployment, revision, host, overhead_bytes, device_bytes, binding_id, now],
     )?;
+    Ok(LmcacheMeasured {
+        grew: true,
+        held_kv_bytes,
+    })
+}
+
+/// A launch whose server may still hold a stopped engine's KV.
+struct HeldKv<'a> {
+    binding_id: &'a str,
+    deployment: &'a str,
+    instance: u32,
+    /// `held`: the Ready charge keeps the KV (the restart-park completed).
+    charged: bool,
+    held_kv_bytes: i64,
+}
+
+/// ADR 0033 §§6, 7, amendment A13: whether `device_bytes`, a GPU reading of
+/// the server, proves the stopped engine's KV released: a reading (zero is
+/// none) below that KV cache, which a server still holding it cannot show,
+/// taken while the instance is Ready on this launch with no lifecycle run
+/// open. On that evidence the launch leaves the state and, when its Ready
+/// charge kept the KV, its owner moves from that charge to the one without
+/// it, journaled. An owner holding anything else keeps it all: what it
+/// holds is not the charge the evidence speaks to.
+fn release_held_kv(
+    tx: &Transaction<'_>,
+    held: &HeldKv<'_>,
+    device_bytes: i64,
+) -> Result<bool, LifecycleError> {
+    if device_bytes <= 0 || device_bytes >= held.held_kv_bytes {
+        return Ok(false);
+    }
+    let ready: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2
+            AND observed_state='ready')",
+        params![held.deployment, held.instance],
+        |r| r.get(0),
+    )?;
+    if !ready || super::park::open_run(tx, held.deployment, held.instance)?.is_some() {
+        return Ok(false);
+    }
+    let (p, e, _) = match super::park::launch(tx, held.deployment, held.instance) {
+        Ok(launch) => launch,
+        Err(LifecycleError::Conflict) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if p.binding_id != held.binding_id {
+        return Ok(false);
+    }
+    let charged = if held.charged {
+        let before = super::park::charged_footprints(tx, &p, &e)?.ready;
+        let ledger = resource_ledger::read_snapshot(tx).map_err(resource)?;
+        if !ledger
+            .owners
+            .get(&p.owner())
+            .is_some_and(|current| super::park::same(current, &before))
+        {
+            return Ok(false);
+        }
+        true
+    } else {
+        false
+    };
+    one(tx.execute(
+        "UPDATE launch_lmcache SET held_kv_state=NULL WHERE binding_id=?1 AND held_kv_state IS NOT NULL",
+        [held.binding_id],
+    )?)?;
+    if charged {
+        let after = super::park::charged_footprints(tx, &p, &e)?.ready;
+        one(tx.execute(
+            "UPDATE resource_owners SET footprint_json=?2 WHERE owner_id=?1",
+            params![
+                p.owner(),
+                resource_ledger::encode(&after).map_err(resource)?
+            ],
+        )?)?;
+        resource_ledger::advance_completion_epoch(tx)?;
+        super::park::journal(
+            tx,
+            &p.operation_id,
+            "lmcache_kv_released",
+            &format!(
+                "deployment {} instance {}: the LMCache server's GPU reading ({} MiB) is below \
+                 the stopped engine's KV cache it held since the restart-park ({} MiB): that KV \
+                 is released and the Ready charge no longer holds it",
+                p.deployment_id,
+                p.instance_index,
+                device_bytes >> 20,
+                held.held_kv_bytes >> 20
+            ),
+        )?;
+    }
     Ok(true)
 }
 
