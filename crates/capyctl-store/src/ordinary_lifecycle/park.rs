@@ -395,17 +395,21 @@ pub(super) struct Footprints {
 /// vLLM, 2026-10-23): the server keeps that KV after the wake's engine
 /// registers, until that engine first stores KV, so once a restart-park
 /// completed, the wake and the Ready charge carry it too, until a GPU reading
-/// of the server shows it released (`lmcache::release_held_kv`).
+/// of the server shows it released (`lmcache::release_held_kv`). ADR 0033
+/// amendment A15: and no phase charges the server less GPU memory than the
+/// largest reading of it above its charge (`lmcache::observed_device`).
 pub(super) fn charged_footprints(
     tx: &rusqlite::Connection,
     p: &Plan,
     e: &EffectiveDeployment,
 ) -> Result<Footprints, LifecycleError> {
-    use super::lmcache::{charge_of, lay, park_mode, Charged, ParkMode};
+    use super::lmcache::{charge_of, lay, park_mode, with_observed, Charged, ParkMode};
     let Some((charge, restart_park)) = charge_of(tx, &p.binding_id, Charged::Reported)? else {
         let measured = super::parked_charge::measured(tx, &p.deployment_id, p.revision, e)?;
         return Ok(footprints_with(e, &measured));
     };
+    let observed = super::lmcache::observed_device(tx, &p.binding_id)?;
+    let floor = |footprint, held| with_observed(e, footprint, &charge, held, observed);
     let ready = lay(
         e,
         &phase(&e.resources.ready, ResourcePhase::Ready),
@@ -413,24 +417,32 @@ pub(super) fn charged_footprints(
         false,
         false,
     )?;
-    let parking = lay(
-        e,
-        &phase(&e.resources.parking, ResourcePhase::Parking),
-        &charge,
-        false,
+    let parking = floor(
+        lay(
+            e,
+            &phase(&e.resources.parking, ResourcePhase::Parking),
+            &charge,
+            false,
+            false,
+        )?,
         false,
     )?;
     if restart_park && park_mode(tx, e, &p.binding_id)? == ParkMode::EngineStop {
-        let parked = lay(
-            e,
-            &phase(&e.resources.parked, ResourcePhase::Parked),
-            &charge,
-            true,
+        let parked = floor(
+            lay(
+                e,
+                &phase(&e.resources.parked, ResourcePhase::Parked),
+                &charge,
+                true,
+                true,
+            )?,
             true,
         )?;
         let mut cold = super::startup::cold(tx, p, e)?;
         cold.phase = ResourcePhase::Wake;
         if !super::lmcache::kv_held(tx, &p.binding_id)? {
+            let ready = floor(ready, false)?;
+            let cold = floor(cold, false)?;
             return Ok(Footprints {
                 parking: peak(&ready, &parking, ResourcePhase::Parking),
                 wake: peak(&parked, &cold, ResourcePhase::Wake),
@@ -441,8 +453,8 @@ pub(super) fn charged_footprints(
         // The wake's engine starts, and settles Ready, beside the KV the
         // server still holds: neither its startup peak nor its Ready charge
         // replaces that KV.
-        let ready = super::lmcache::with_held_kv(e, ready, &charge)?;
-        let cold = super::lmcache::with_held_kv(e, cold, &charge)?;
+        let ready = floor(super::lmcache::with_held_kv(e, ready, &charge)?, true)?;
+        let cold = floor(super::lmcache::with_held_kv(e, cold, &charge)?, true)?;
         return Ok(Footprints {
             parking: peak(&ready, &parking, ResourcePhase::Parking),
             wake: peak(
@@ -454,23 +466,30 @@ pub(super) fn charged_footprints(
             parked,
         });
     }
+    let ready = floor(ready, false)?;
     let measured = super::parked_charge::measured(tx, &p.deployment_id, p.revision, e)?;
-    let parked = lay(
-        e,
-        &super::parked_charge::apply(
-            &phase(&e.resources.parked, ResourcePhase::Parked),
-            &phase(&e.resources.ready, ResourcePhase::Ready),
-            &measured,
-        ),
-        &charge,
+    let parked = floor(
+        lay(
+            e,
+            &super::parked_charge::apply(
+                &phase(&e.resources.parked, ResourcePhase::Parked),
+                &phase(&e.resources.ready, ResourcePhase::Ready),
+                &measured,
+            ),
+            &charge,
+            false,
+            true,
+        )?,
         false,
-        true,
     )?;
-    let wake = lay(
-        e,
-        &phase(&e.resources.wake, ResourcePhase::Wake),
-        &charge,
-        false,
+    let wake = floor(
+        lay(
+            e,
+            &phase(&e.resources.wake, ResourcePhase::Wake),
+            &charge,
+            false,
+            false,
+        )?,
         false,
     )?;
     Ok(Footprints {
@@ -894,6 +913,13 @@ fn accept_instance(
         // SPEC §6.3: fail clearly if explicit parking is unsupported.
         return Err(LifecycleError::Unsupported);
     }
+    // ADR 0033 amendment A15: a server still holding the KV of the engine
+    // an earlier restart-park stopped is never parked on again (each park
+    // would leave it one more KV); its callers stop the instance instead
+    // (`held_kv_stop`).
+    if kind == ResidencyKind::Park && held_kv_unreleased(tx, &e, &source.binding_id)? {
+        return Err(LifecycleError::Conflict);
+    }
     let (observed, lifecycle, _, admitting) =
         instance_state(tx, deployment, instance)?.ok_or(LifecycleError::NotFound)?;
     let expected = match kind {
@@ -1064,6 +1090,105 @@ fn growth_stop(
     }))
 }
 
+/// ADR 0033 amendment A15: whether the launch `binding_id` resolved as `e`
+/// restart-parks and its server still holds the KV of the engine an earlier
+/// restart-park stopped (no GPU reading of the server has shown it released
+/// since: `lmcache::release_held_kv`).
+fn held_kv_unreleased(
+    tx: &rusqlite::Connection,
+    e: &EffectiveDeployment,
+    binding_id: &str,
+) -> Result<bool, LifecycleError> {
+    Ok(
+        super::lmcache::park_mode(tx, e, binding_id)? == super::lmcache::ParkMode::EngineStop
+            && super::lmcache::kv_held(tx, binding_id)?,
+    )
+}
+
+/// ADR 0033 amendment A15: journal why a park of a restart-parked server's
+/// instance became the stop `operation` of the instance and its server.
+fn journal_held_kv_stop(
+    tx: &Transaction<'_>,
+    operation: &str,
+    deployment: &str,
+    instance: u32,
+) -> Result<(), LifecycleError> {
+    journal(
+        tx,
+        operation,
+        "lmcache_server_stopped",
+        &format!(
+            "held_kv_unreleased: deployment {deployment}: instance {instance}'s LMCache server still \
+             holds the KV of the engine an earlier park stopped (no reading of the server has shown \
+             it released since the wake), and parking again would leave it one more, so the \
+             instance stops with its server instead; its next activation starts a new engine and \
+             a new server"
+        ),
+    )
+}
+
+/// ADR 0033 amendment A15 (found live on SGLang 0.5.22 with LMCache 0.5.6,
+/// 2026-10-23: with no new KV stored between wakes, the server kept the KV
+/// of every engine a restart-park stopped, 53,624 MiB of GPU memory after
+/// nine cycles, and the tenth wake was refused for memory): `park
+/// deployment` on a Ready instance whose server still holds the KV of the
+/// engine an earlier restart-park stopped stops the instance and its server
+/// instead (an ordinary stop, which releases nothing before its own cleanup
+/// evidence names both exits, and leaves it eligible for on-demand
+/// activation as a new start), as [`growth_stop`] does. The server so holds
+/// at most one stopped engine's KV. `None` when the instance parks: its KV
+/// was released, it has work open (a park in flight is joined), it is not
+/// Ready, or it does not restart-park.
+#[allow(clippy::too_many_arguments)]
+fn held_kv_stop(
+    tx: &Transaction<'_>,
+    s: &CoordinatorSession,
+    principal: &str,
+    deployment: &str,
+    instance: u32,
+    key: &str,
+    now: i64,
+    deadline: i64,
+) -> Result<Option<ResidencyReceipt>, LifecycleError> {
+    if open_run(tx, deployment, instance)?.is_some() {
+        return Ok(None);
+    }
+    let Ok((source, e, _)) = launch(tx, deployment, instance) else {
+        return Ok(None);
+    };
+    let ready = instance_state(tx, deployment, instance)?
+        .is_some_and(|(observed, lifecycle, _, _)| observed == "ready" && lifecycle == "active");
+    if !ready || !held_kv_unreleased(tx, &e, &source.binding_id)? {
+        return Ok(None);
+    }
+    let stop = crate::Store::accept_instance_stop_in_transaction(
+        tx,
+        s,
+        principal,
+        &source.fence(),
+        key,
+        now,
+        now.saturating_add(e.request_deadline_ms).max(deadline),
+        &StopCommand {
+            scope: Some(instance_scope(deployment, instance)),
+            revision: Some(source.revision),
+        },
+    )?;
+    journal_held_kv_stop(tx, &stop.operation_id, deployment, instance)?;
+    Ok(Some(ResidencyReceipt {
+        operation_id: stop.operation_id,
+        step_id: stop.step_id,
+        deployment_id: deployment.into(),
+        instance,
+        kind: ResidencyKind::Park,
+        revision: stop.revision,
+        generation: stop.generation,
+        accepted_at_ms: stop.accepted_at_ms,
+        deadline_ms: stop.deadline_ms,
+        joined: false,
+    }))
+}
+
 impl crate::Store {
     /// SPEC §6.3 `park deployment`: drain and park every READY instance at the
     /// declared tier, leaving the deployment eligible for on-demand
@@ -1143,13 +1268,15 @@ impl crate::Store {
         for instance in targets {
             // ADR 0014 amendment A19: an instance whose parked charge grew
             // past its host's bound is stopped instead, under this command.
-            // A restart-park keeps no parked residue to outgrow.
-            let growth = if restart_park {
-                None
+            // A restart-park keeps no parked residue to outgrow; ADR 0033
+            // amendment A15: one whose server still holds an earlier
+            // stopped engine's KV is stopped instead, with its server.
+            let stopped = if restart_park {
+                held_kv_stop(&tx, s, principal, deployment, instance, key, now, deadline)?
             } else {
                 growth_stop(&tx, s, principal, deployment, instance, key, now, deadline)?
             };
-            let accepted = match growth {
+            let accepted = match stopped {
                 Some(receipt) => Ok(receipt),
                 None => accept_instance(
                     &tx,
@@ -2842,6 +2969,12 @@ fn idle_one(
     } else {
         None
     };
+    // ADR 0033 amendment A15: a server still holding the KV of the engine an
+    // earlier restart-park stopped is not parked on again; the instance stops
+    // with its server, and its next activation is a new start.
+    let held_kv = !parked
+        && mode == super::lmcache::ParkMode::EngineStop
+        && super::lmcache::kv_held(tx, &source.binding_id)?;
     // SPEC §10 (amended 2026-10-21): a cancelled request the engine never
     // answered settles only at the verified exit, and a park would wait for
     // it forever (SPEC §9.2: unknown work is not quiescence for a park), so
@@ -2857,7 +2990,7 @@ fn idle_one(
             params![deployment, instance],
             |r| r.get::<_, bool>(0),
         )?;
-    if !parked && parkable && !refused_park && growth.is_none() && !unanswered {
+    if !parked && parkable && !refused_park && growth.is_none() && !unanswered && !held_kv {
         let key = format!("idle-park:{generation}:{since}");
         let receipt = crate::Store::instance_park_in_transaction(
             tx, s, "idle", deployment, instance, &key, now, deadline, false,
@@ -2882,6 +3015,8 @@ fn idle_one(
         "ready_idle_parked_growth"
     } else if unanswered {
         "ready_idle_unanswered_cancellation"
+    } else if held_kv {
+        "ready_idle_held_kv_unreleased"
     } else {
         "ready_idle_restart_only"
     };
@@ -2915,6 +3050,9 @@ fn idle_one(
     )?;
     if growth.is_some() {
         super::parked_charge::mark_stopped(tx, &source, &receipt.operation_id)?;
+    }
+    if held_kv {
+        journal_held_kv_stop(tx, &receipt.operation_id, deployment, instance)?;
     }
     Ok(Some(IdleAction::Stopped {
         deployment_id: deployment.into(),
