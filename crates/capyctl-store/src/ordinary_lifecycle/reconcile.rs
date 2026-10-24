@@ -45,11 +45,12 @@ pub enum Reconciled {
         instance: u32,
         operation_id: String,
     },
-    /// A pending start still fits nowhere.
+    /// A pending start still fits nowhere: the diagnostic its `last_error`
+    /// records (the closed code, with the host-KV limit where that refused).
     Deferred {
         deployment_id: String,
         instance: u32,
-        code: &'static str,
+        reason: String,
     },
     /// A pending start reached its deadline unplaced.
     Expired {
@@ -295,17 +296,17 @@ fn act(
             )?;
             Ok(None)
         }
-        Prepared::Unplaceable(code, _) => {
+        Prepared::Unplaceable(_, _, reason) => {
             let changed: bool = tx.query_row(
                 "SELECT COALESCE(last_error,'')!=?3 FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2",
-                params![c.deployment_id, c.instance, format!("placement: {code}")],
+                params![c.deployment_id, c.instance, format!("placement: {reason}")],
                 |r| r.get(0),
             )?;
-            defer(tx, &c.deployment_id, c.instance, code, None)?;
+            defer(tx, &c.deployment_id, c.instance, &reason, None)?;
             Ok(changed.then(|| Reconciled::Deferred {
                 deployment_id: c.deployment_id.clone(),
                 instance: c.instance,
-                code,
+                reason,
             }))
         }
     }

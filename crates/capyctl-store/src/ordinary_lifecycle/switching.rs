@@ -26,7 +26,9 @@ use crate::instances::instance_owner_id;
 use capyctl_config::instances::Placement;
 use capyctl_domain::resources::gib;
 use capyctl_scheduler::device_choice::choose_device_with_eviction_within;
-use capyctl_scheduler::placement::{candidate_fits, fits};
+use capyctl_scheduler::placement::{
+    candidate_fits, fits, host_kv_short, HostKvRemedy, HostRefusal,
+};
 use capyctl_scheduler::switching::{
     choose_victims_within, observed_room, order_victims, Release, Victim, VictimCandidate,
 };
@@ -1528,6 +1530,7 @@ fn plan_in(
                     &c.limits,
                     &by_owner.keys().cloned().collect(),
                     refusal.code(),
+                    c.host_kv_remedy,
                 ));
             }
         }
@@ -1723,6 +1726,7 @@ fn plan_group_in(
                     &view.limits,
                     &planned[host].offered.by_owner.keys().cloned().collect(),
                     refusal.code(),
+                    planned[host].c.host_kv_remedy,
                 ));
             }
         }
@@ -1837,7 +1841,10 @@ fn mark_last_ready(
 /// Owner decision 2026-09-25: why one host cannot take the instance even with
 /// eviction, in the operator's terms: on the domain with the least slack, what
 /// the instance needs, what is free as the ledger stands and what releasing
-/// every eligible READY instance there would add.
+/// every eligible READY instance there would add. ADR 0033 §6: when that
+/// would leave room but the host-KV limit still refuses it, that limit, what
+/// stays held and the setting to raise.
+#[allow(clippy::too_many_arguments)]
 fn shortfall(
     host: &str,
     ledger: &capyctl_domain::resources::LedgerSnapshot,
@@ -1846,6 +1853,7 @@ fn shortfall(
     limits: &[MemoryLimit],
     evictable: &BTreeSet<String>,
     code: &str,
+    remedy: HostKvRemedy,
 ) -> String {
     let bytes = |f: &PhaseFootprint, domain: &str| -> i64 {
         f.allocations
@@ -1875,14 +1883,24 @@ fn shortfall(
             (free + released - need, need, free, released)
         })
         .min();
-    match worst {
-        Some((_, need, free, released)) => format!(
+    let host_kv = (code == HostRefusal::Insufficient.code())
+        .then(|| {
+            host_kv_short(ledger, owner, footprint, limits, &|id| {
+                evictable.contains(id)
+            })
+        })
+        .flatten();
+    match (worst, host_kv) {
+        (worst, Some(kv)) if worst.is_none_or(|(slack, ..)| slack >= 0) => {
+            format!("host {host}: {code}: {}", kv.describe(remedy))
+        }
+        (Some((_, need, free, released)), _) => format!(
             "host {host} needs {}, {} free and {} evictable ({code})",
             gib(need),
             gib(free),
             gib(released)
         ),
-        None => format!("host {host}: {code}"),
+        (None, _) => format!("host {host}: {code}"),
     }
 }
 

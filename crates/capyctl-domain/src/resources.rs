@@ -89,7 +89,7 @@ pub fn gib(bytes: i64) -> String {
 
 /// A domain's own name: an enrolled host's ledger key
 /// (`host/<n>:<host>/domain/<id>`) shown as its local id.
-fn local_domain(key: &str) -> &str {
+pub fn local_domain(key: &str) -> &str {
     match key
         .strip_prefix("host/")
         .and_then(|k| k.rsplit_once("/domain/"))
