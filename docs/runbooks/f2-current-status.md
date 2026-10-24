@@ -1,5 +1,496 @@
 # Current implementation and launch status
 
+## LMCache launches leave no shared memory behind — 2026-10-24 (branch `fix/lmcache-engine-shm`)
+
+Found live on host A (SGLang 0.5.22 and vLLM 0.32.0 with LMCache 0.5.6, `restart_only`):
+a launch with LMCache left the engine's CUDA driver file
+`/dev/shm/cuda.shm.<uid>.<pid>.1` (80 KiB, named for the SGLang scheduler's or vLLM engine
+core's pid) after it stopped, and on vLLM also a `torch_<pid>_*` file (80 KiB, named for
+the engine core). The LMCache server maps the engine's CUDA driver file through CUDA IPC,
+so the SGLang entry's cleanup correctly leaves a file the running server still maps (a
+`restart_only` park keeps the server), and the server's verified stop removed only the
+server's own file. vLLM's engine core makes the torch file only with the connector on and
+never removes it; no process holds it once the engine has exited. Without LMCache, vLLM
+0.32.0 left neither file (checked on host A).
+
+Every verified stop of an owned launch runs through
+`DurableProcessLaunch::terminate_escalating` (the embedded host's and a remote host's, a
+full stop and a restart-park's group stops alike). For a launch with LMCache (the stop names
+its server, or is a group stop, which only LMCache launches make) it now also removes the
+files its engines left (ADR 0033 A5 amended, SPEC §13.2):
+
+- Once the stop has proven every recorded identity gone, each file in `/dev/shm` named for
+  an engine process of that stop (the exact `cuda.shm.<uid hex>.<pid hex>.1` for this user,
+  or `torch_<pid>_<n>_<n>`) is removed if it is still the same file (device and inode), a
+  regular file (never followed through a symlink) owned by this user with no group or other
+  access, and no live process this user can inspect holds it (its mappings and
+  descriptors).
+- After a restart-park's engine stop, a file the running server still holds is recorded
+  with its holders instead. After the verified stop of a server that was one of them, the
+  file is removed by the same rules, also if the server let go of it earlier (as it lets go
+  of a parked engine's KV once a woken engine stores).
+- A file named for no process of the stop, one another live process holds, one others may
+  read and one replaced at the same name all stay; a launch without LMCache is stopped as
+  before. The record lives in the role's memory: a role restarted between a restart-park
+  and the server's stop leaves those files, as before.
+
+The SGLang entry's own cleanup is unchanged.
+
+## Tests
+
+- `crates/capyctl-launchers/tests/lmcache_launch.rs`,
+  `a_launch_stop_removes_the_files_its_engines_left` (T45 T12): one stop of both groups
+  removes the CUDA driver and torch files named for the engine's processes, held by the
+  server or by nothing, and keeps one a live process outside the launch holds, one with
+  group and other read access, and one named for a pid outside the launch.
+- `a_parked_engines_files_are_removed_once_its_server_stops` (T45 T12): the engine's stop
+  alone removes its file nothing holds and keeps those the running server holds; the
+  server's later stop removes them, including one only a server process that exited before
+  the stop held, and keeps the file that replaced one at the same name.
+- `a_stop_without_lmcache_leaves_the_engine_files` (T45): an engine-only launch's stop
+  removes nothing.
+- `launch_shm::tests::only_the_exact_driver_and_torch_names_carry_a_creator` (T45).
+- The first two failed before the fix (every file stayed). The existing test that removes
+  the server's own file now makes the engine's file there group-readable, so it still
+  shows that only the server's file is removed.
+
+CPU and Fake-engine tests are not qualification.
+
+## Live check (host A, 2026-10-24)
+
+Release build of this branch's code (on origin/main with #194), standalone role on
+127.0.0.1:38443 with a fresh state directory, Qwen3-4B-Instruct-2507, `restart_only`,
+`lmcache: required`, SGLang 0.5.22 and vLLM 0.32.0 with LMCache 0.5.6. `/dev/shm` held 70
+entries before the run and 70 identical entries after it. Each launch made a
+`cuda.shm.3e8.<pid>.1` named for its scheduler or engine core, held by that process and
+the LMCache server, a `torch_<pid>_*` file held by that process alone, and SGLang's or
+multiprocessing's own files.
+
+| Case | After the park | Left after the stop |
+|---|---|---|
+| SGLang: chat, park, stop | the engine's `cuda.shm` only, held by the server | none |
+| vLLM: chat, park, stop | the engine's `cuda.shm` only, held by the server (the torch file was gone) | none |
+| SGLang: chat, stop | - | none |
+| vLLM: chat, stop | - | none |
+| vLLM: chat, park, wake by a chat, stop | the first engine's `cuda.shm`; after the wake both engines' | none |
+| SGLang: chat, park, wake by a chat, stop | the first engine's `cuda.shm`; after the wake both engines' | none |
+
+Every chat answered 200; after each stop no engine or server process ran, and the GPU was
+empty at the end.
+
+A first build without #194 showed that SGLang's `sglang_loads_*`, `sem.mp-*` and torch
+files are the entry's to remove (only the engine's process held them), and a build that
+removed only files the server held left vLLM's torch file in both vLLM cases, which led to
+the rule above. Evidence is in `target/live/lmcache-engine-shm/` on the laptop; the host
+was cleaned (the run directory and the 98 `/tmp` entries the run made removed).
+
+## A start refused for host-KV room says which limit to raise — 2026-10-23 (branch `fix/host-kv-refusal-hint`)
+
+Found in the live check of the settable standalone host-KV limit on host A (GB10): a vLLM
+0.32.0 deployment with `lmcache: required` and `lmcache_pool: 20GiB` on a standalone with
+the derived 12.17 GiB host-KV limit was refused, exit 4 `insufficient_resources`, with only
+`capacity_blocked: Capacity is unavailable: host spark-0292: insufficient_capacity; wait,
+stop another deployment, or start with --evict`, so nothing told the operator that the
+host-KV limit was what to raise.
+
+ADR 0033 §6 counts a deployment's host-KV need (its LMCache pool, and any `host_kv_bytes`
+its resources declare) against the host's `host_kv_limit`; ADR 0025's amendment of
+2026-10-23 made standalone's settable. When no managed limit is short but a host-KV limit
+is, the placement refusal now names it, per host:
+`host <h>: insufficient_capacity: host_kv (needs 20.0 GiB, limit 12.2 GiB; raise
+host.resource_policy.memory.system.host_kv_limit or lower lmcache_pool)`, with `, <n> GiB
+already held` when other owners hold host-KV room there. Standalone's embedded host (the
+only host not enrolled) names the standalone setting; an enrolled host names its own
+`resource_policy.domains.<domain>.host_kv_limit`. What to lower is `lmcache_pool` when the
+need includes an LMCache pool, the deployment's `host_kv_bytes` when it declares them, or
+both. The same words reach every place the refusal is shown: the management refusal
+(`capacity_blocked`, its message), so the CLI's text and JSON (`code` and `message`,
+unchanged fields); an instance deferred for it records
+`placement: insufficient_capacity: host_kv (…)` as its `last_error` (status, `start
+--wait`), and the `instance_start_deferred` event carries the same reason; a start with
+`--evict` that eviction cannot fit names it when releasing would leave the memory but not
+the host-KV room. The closed code (`capacity_blocked`, `insufficient_resources`, exit 4)
+is unchanged, and a refusal by any other limit (a managed limit short, even beside a
+host-KV one, parked limits, device conflicts, gates) reads as before. The admission check
+at arm is unchanged. Errors guide (the `insufficient_resources` row and its LMCache
+section) and configuration ("Standalone host-KV limit") updated.
+
+Tests (failing before, passing after): scheduler — a host-KV refusal names host_kv, the
+need, what is held and the limit, standalone's or an enrolled host's setting, on one host
+and on two; a managed limit short as well is named as before and the `last_error` reason is
+the code alone. Store — a standalone start with a 12 GiB pool against an 8 GiB limit is
+`CapacityBlocked` naming host_kv and standalone's setting, and a second instance deferred
+for it records the same words in `last_error`; a start refused by the host-KV limit of two
+enrolled hosts names each host's `resource_policy.domains.unified.host_kv_limit`, and so
+does the plan of the same start with eviction. CPU and
+Fake-engine tests only; they are not qualification. Live check still needed: on host A, a
+standalone without `host_kv_limit` refuses the 20 GiB pool deployment with the message
+above.
+
+## SGLang: a stopped launch leaves no shared memory behind — 2026-10-23 (branch `fix/sglang-shm-on-stop`)
+
+Found live on host A (SGLang 0.5.22) in the 0.1.7 checks: after a normal stop
+(`delete --stop`, then the role drained) `/dev/shm/sglang_loads_*.shm` (16 KiB) and a
+`sem.mp-*` semaphore were still there. The failed-launch cleanup of `sglang-shm-cleanup`
+(#185) ran only when `launch_server` raised. A stop sends SIGTERM to the launch's process
+group, the entry included, and the engine logs show what SGLang 0.5.22 then does: once
+it serves, its handler drains, kills its process tree without the entry and
+`launch_server` returns (`kill_process_tree called: ... include_parent=False`, then
+uvicorn's `Finished server process`); after a child's exit its SIGQUIT handler instead
+kills the tree and then the entry with SIGKILL (`include_parent=True`); while it loads it
+has no SIGTERM handler, so SIGTERM's default action ended the entry at once. In none of
+these did anything in the entry remove the launch's files.
+
+`runtime/sglang_entry.py` (SPEC §13.2, T12) now ends the launch the same way on every one
+of those paths, once: when `launch_server` returns or raises; on a SIGTERM the entry
+handles itself while `launch_server` runs (SGLang's own handler replaces it once it
+serves); and on the entry's SIGKILL to itself, which its `os.kill` intercepts while
+`launch_server` runs (psutil's `Process.kill`, which SGLang's `kill_process_tree` uses,
+goes through `os.kill`). The watch claims once more, every process the entry started is
+ended and seen gone (frozen, killed, `/proc` read again until none runs), and only then
+is each claimed file removed under #185's rules: claimed on evidence (appeared after the
+launch began, held by the entry or a descendant when first seen), still the same private
+file of this user, and held by no other live process. The SIGTERM then ends the entry as
+before, and the SIGKILL is delivered. A semaphore the entry made and removed this way has
+its pending multiprocessing finalizer cancelled, so a normal exit prints no
+`FileNotFoundError` traceback after the entry's last line. A child forked while the
+entry's handler is in place (a worker pool) is ended by SIGTERM as before and never ends
+the launch. Both hooks are handed back when `launch_server` returns. A stop the host
+escalates to SIGKILL (after its 15 s grace) ends the entry with no chance to run, and
+its files stay.
+
+## Tests
+
+- `runtime/tests/test_sglang_startup_death.py`, `SharedMemoryAfterStopTests` (T12): a stub
+  SGLang tree whose scheduler makes the segments of the failed-launch test (a load
+  snapshot file, a `multiprocessing.shared_memory` segment, a pre-existing segment it
+  maps, one a process outside the launch maps) and whose entry keeps a
+  `multiprocessing.Lock` (`sem.mp-*`); the test makes one more segment during the launch
+  and stops it with SIGTERM to the process group, as the host does. Three ways: stopped
+  while serving, the stub drains, kills its tree without the entry and returns (exit 0);
+  stopped while serving, it kills the tree and the entry with SIGKILL through `os.kill`
+  (exit by SIGKILL); stopped while loading, before it has a SIGTERM handler (exit by
+  SIGTERM). Each time the process group is empty, the load snapshot file, the
+  multiprocessing segment and the semaphore are gone, the other three remain, and stderr
+  holds no traceback. All three failed before the change.
+- `ForkedChildTests` (T12): a child forked with the handler in place, sent SIGTERM, ends
+  itself with SIGTERM and touches neither the watch nor the entry.
+- `test_sglang_entry.py`: the in-process launch tests now stub `_end_engine_processes`,
+  since a returning `launch_server` ends the launch's processes, which in the test
+  runner would be its own children.
+
+CPU and Fake-engine tests are not qualification.
+
+## Live on host A (2026-10-23, SGLang 0.5.22)
+
+Release build of `064bbf1d` (this branch rebased on `05eee83b`), standalone on
+38443/37443 with a fresh state directory, Qwen3-4B-Instruct (`context_length: 16384`,
+`kv_cache: 8GiB`). For each case, `/dev/shm` was listed before the start, when the launch
+was up (the new entries, and which launch process maps or holds each one), and after
+the end. The 70 entries already in `/dev/shm` from earlier runs (old `sglang_loads_*`,
+`sem.mp-*`, a `cuda.shm.*` and a `torch_*`) were still there after every case.
+
+| Case | Launch's new entries | How it ended | Group empty | Left behind |
+| --- | --- | --- | --- | --- |
+| Stop while serving (`capyctl stop deployment`, after one chat) | `sem.mp-pac61y7_`, `sglang_loads_1a0c…shm` | SGLang drains, `kill_process_tree … include_parent=False`, `Finished server process`: `launch_server` returned | 2.8 s | none |
+| Stop during weight load: `timeouts.initialize: 35s` ran out with 1 of 3 shards loaded | `sglang_loads_cc44…shm` | CapyCTL ended the start; the receipt says every recorded process was seen gone 0.8 s after the group started exiting; status `failed` (`launch_failed`) | under 1 s | none |
+| `restart_only` park, `~/sglang-0.5.22-lmcache-venv`, `lmcache: required` (LMCache on, 4 GiB pool) | `sem.mp-ha3edrcl`, `sglang_loads_c3dd…shm`, `torch_28618_…_0`, `cuda.shm.3e8.6fca.1` | SGLang drains, `include_parent=False`, `Finished server process`; status `parked` | 2.8 s | `cuda.shm.3e8.6fca.1` (80 KiB, see below) |
+| SIGKILL to the owned `sglang::detokenizer` (pid checked against the entry's recorded pid, start ticks and boot id) | `sem.mp-tuo3vhk4`, `sglang_loads_b7eb…shm` | `detokenizer … crashed with exit code -9. Triggering SIGQUIT`, 5 s wait, `kill_process_tree … include_parent=True`; status `failed` | 6.3 s | none |
+| Deep park, wake by a chat, then stop | `sem.mp-o8cbjwrl`, `sglang_loads_7dae…shm` | Park: `release_memory_occupation` 200, all 4 processes and both entries kept. Wake: chat 200 in 57.9 s (sent while still parking), same entry pid, both entries kept. Stop: SIGTERM, then `detokenizer … exit code -15`, the SIGQUIT path, `include_parent=True` | 6.1 s | none |
+
+Every end settled well inside the 15 s grace. No stop escalated to SIGKILL, and each
+binding was released with `every recorded process observed gone`. Nothing was logged
+after SGLang's own last line. The engine logs have no `FileNotFoundError` and no
+traceback after the end began. Before the end, each request the engine served logged a
+uvicorn access-log `--- Logging error ---` traceback (`TypeError: cannot unpack
+non-iterable NoneType object`). The same tracebacks appear in the 2026-10-22 SGLang 0.5.22
+logs taken before this change, so the change does not cause them.
+
+- **A stop during weight loading is deferred.** A `capyctl stop deployment` sent one
+  second after `Load weight begin` was recorded as `administrative_stop_deferred` and was
+  delivered only when the start reached Ready, 80 s later. The SIGTERM then reached a
+  serving engine, and SGLang took its SIGQUIT path (the scheduler exited -15; a SIGKILL
+  to the entry, intercepted). The group was gone about 7 s after the SIGTERM (the log
+  has whole seconds), and its `sglang_loads_27dc…shm` was removed. So `stop` never
+  reaches the entry's own handler while weights load. The initialize timeout above does
+  reach it. That launch's file is gone, which neither SIGTERM's default action nor a
+  SIGKILL would do (inference: the entry's handler ran; it logs nothing).
+- **LMCache leaves one CUDA IPC file per launch.** The LMCache park case fails the
+  "nothing left" criterion with one file. `cuda.shm.3e8.6fca.1` is named for the
+  launch's scheduler (pid 28618 = 0x6fca). When the entry ended, the LMCache server
+  (pid 28230, CapyCTL-owned, kept through a `restart_only` park) also mapped it, so the
+  entry correctly left it under #185's rule. It was still there after `capyctl stop
+  deployment` ended that server, so nothing removes it. vLLM 0.32.0 with LMCache does the
+  same on host A (a `cuda.shm.*` and a `torch_*` per EngineCore). The leftover is outside
+  this change: neither the entry nor the LMCache server's stop removes it.
+- **Known limit, not exercised:** a stop that the host escalates to SIGKILL after its 15 s
+  grace ends the entry with no chance to clean up, and its files stay.
+
+Evidence: `target/live/live-018/` on the maintainer laptop (`res/b1-…` to `res/b5-…`,
+each with `shm-before/launch/after`, `held-by-launch.txt`, `engine.log`, `poll.txt`,
+`lifecycle-evidence.txt`). This is a live check of one engine version and one model on
+one host.
+
+## LMCache: a model parked and woken repeatedly no longer runs out of memory — 2026-10-23 (branch `fix/lmcache-held-kv-bound`)
+
+Found live on host A (GB10, SGLang 0.5.22 with LMCache 0.5.6, Qwen3-4B, `restart_only`, a
+12 GiB pool and a 5 GiB KV cache): every restart-park added the stopped engine's KV cache to
+the LMCache server's GPU memory (5,328 MiB per park), and nothing released it, neither the
+wake nor its requests, whether they hit the cache or stored new KV. With the same prompt
+every cycle the server held 53,624 MiB at the tenth wake while the launch was charged
+20,132,659,200 B; the wake was refused (`residency_blocked insufficient_memory`) and the
+router answered 503 after 600 s. With a new prompt every cycle the fifteenth wake failed the
+same way at 80,324 MiB. ADR 0033 A13's release (a reading below the KV after the new engine
+first stores KV) held on vLLM and never came on SGLang.
+
+Owner decision of 2026-10-23 ("bound it and charge the evidence"), ADR 0033 amendment A15:
+
+- **The charge is never below what the server is seen to hold.** A GPU reading of the server
+  above the GPU memory its launch's charge holds in its phase (its device figure, the
+  stopped engine's KV while held, or an earlier larger reading) raises every phase's charge
+  to it, journaled `lmcache_charge_raised`, while the instance is Ready or parked with no
+  lifecycle run open; from the embedded watch and from a host's load reports alike. Only
+  A13's release reading lowers it (with the held KV), or the stop. Kept per launch in
+  `launch_lmcache.observed_device_bytes` (store schema v57). Status's `charge_bytes`
+  includes it. The revision's measurement rules are unchanged.
+- **No restart-park while an earlier engine's KV is held.** `park deployment` on a Ready
+  instance whose server still holds it (no release reading since the last park) stops the
+  instance and its server instead, answered under the park command's receipt (as the parked
+  growth stop is); the idle policy stops it (`ready_idle_held_kv_unreleased`); both journal
+  `lmcache_server_stopped` with `held_kv_unreleased: …`. The stop releases nothing before
+  its cleanup evidence names the engine's and the server's exits; the next activation is a
+  new start with a new server. A server so holds at most one stopped engine's KV, which its
+  charge counts. Any other park of such an instance is refused.
+
+Guides: parking ("Parking with LMCache") and engines (LMCache memory). A draft upstream
+LMCache issue is kept for the owner, not filed.
+
+Tests (T45; failing before, passing after): store — readings above the charge raise it
+when Ready, parked with the KV and after the wake, never during a run, lowered only by the
+release reading (vLLM and SGLang); a second park while the KV is held is a stop that needs
+both the engine's and the server's exits, replayed by the park command, and the next start
+restart-parks again (vLLM and SGLang); the idle policy's stop with its journal (vLLM and
+SGLang); the measurement callers send readings above the charge; the v57 migration.
+Coordinator — the raise from a host's report while parked, the Ready charge after the wake,
+and the second park stopping the instance with its server, then a new launch with a new
+server, through the embedded adapter's and a remote host's evidence. Existing restart-park
+tests now send the release reading before the idle park. CPU and Fake-engine tests only;
+they are not qualification.
+
+Live check (host A, GB10, 2026-10-23, this branch's code; evidence kept outside the
+repository): 12 park and wake cycles with the same prompt each, SGLang 0.5.22 then vLLM
+0.32.0 with LMCache 0.5.6 (Qwen3-4B, 12 GiB pool, 5 GiB KV). All 24 requests answered 200.
+SGLang alternated a restart-park (the cache answered 2,048 tokens after the wake) and a stop
+of the instance with its server (6 `lmcache_server_stopped`, each server's process gone, a
+new server per start); the server never read more than 5,736 MiB (53,624 MiB before the
+fix). vLLM held the old KV the same way whenever the request after the wake stored nothing
+(5,526 MiB parked, 5,670 MiB after the wake, no release) and stopped at the next park
+(4 stops); at the other parks the server held no engine KV and the reading after the wake
+released the charged KV (4 `lmcache_kv_released`). In all 114 samples with a server running
+the charge covered its GPU reading; it was raised from readings 16 times (for example 5,736
+MiB after a SGLang wake against the 5,632 MiB the first launch held). The first SGLang try
+failed its first wake at 103 s on the 105 s restart-park wake window
+(fixed since in #197); the run used `timeouts.wake: 1200s`.
+
+## An enrolled host wakes a model parked with LMCache — 2026-10-23 (branch `fix/remote-lmcache-wake`)
+
+Found live 2026-10-23 (the LMCache benchmark): with the server on the control host and
+host A as its host, parking a `restart_only` vLLM 0.32.0 deployment with LMCache and
+waking it failed 3 of 3, each after about 73 s, with "the wake canary was not answered:
+… the host did not report the launch's engine alive with the wake canary". Standalone
+restart-park wakes passed. Reproduced on v0.1.7 (release binaries, laptop server, host A,
+`~/vllm-0.32.0-lmcache-venv`, Qwen3-4B): the same message after 77.5 s.
+
+Cause ([ADR 0033](../design/adr/0033-lmcache.md) A14): a remote host's answer to the
+wake canary counts only with the engine the canary's context names alive (ADR 0028
+note of 2026-10-16). The coordinator ran the canary on the restore's own context, whose
+processes are what the launch recorded before the wake. A restart-park records the
+LMCache server alone, so that context named no engine and the canary failed after the
+host had started the new engine and proven the restore. The embedded adapters never read
+those processes, which is why standalone passed. SGLang restart-parks on an enrolled
+host take the same path.
+
+Fix: the canary runs on the restore's context with the processes the restore's evidence
+names (`woken_context` in the coordinator worker): the new engine beside the same server
+for a restart-park, the recorded engine for any other wake. The remote check is unchanged
+and now lives in `remote_execution::canary_engine_alive`.
+
+Tests (T45 T20 T34): the scripted remote restart-park in `coordinator/tests_lmcache.rs`
+now answers the wake canary as a host does (its processes alive now, judged by
+`canary_engine_alive`); without the fix the wake does not reach Ready, with it the
+readiness and wake canaries both count. A unit test covers `canary_engine_alive` on a
+restart-park's restore: the new engine counts, the server alone, another engine, a
+recorded engine process gone, or the claim not retained do not. CPU and Fake-engine tests
+are not qualification.
+
+On the same v0.1.7 setup the SGLang 0.5.22 wake also ran out of its derived wake window
+(105 s for Qwen3-4B) at 102.5 s, "remote residency change is unproven", before the
+canary was reached: a restart-park's wake restarts the engine. That window is changed
+separately (branch `fix/restart-park-wake-window`); the SGLang live check below declares
+`timeouts.wake`.
+
+Live check (2026-10-23, host A, server on the control host at 17443/18443, fresh state
+on both, `fe0b16ad` built on each machine): Qwen3-4B, `restart_only`, `lmcache:
+required`, 20 GiB pool, 5 GiB KV cache, 32k context, `timeouts.initialize` 1200 s, each
+deployment parked and woken by a chat request 3 times, all at generation 1 on the same
+launch, every wake answering 200 and Ready with no last error:
+
+- vLLM 0.32.0 (`~/vllm-0.32.0-lmcache-venv`, the deployment that failed): wakes of
+  80.2, 77.4 and 78.4 s (restore accepted to completed 79.5, 76.7, 77.7 s).
+- SGLang 0.5.22 (`~/sglang-0.5.22-lmcache-venv`), with `timeouts.wake: 1200s`: wakes of
+  107.6, 106.1 and 109.0 s (105.5-108.3 s restores), past the 105 s derived window.
+
+Both readiness canary references were recorded and every wake was compared with them.
+Host A was left with no CapyCTL or engine process, listener or GPU process, and with
+`/tmp` and `/dev/shm` back at their starting counts.
+
+## a `restart_only` wake gets the start's window — 2026-10-23 (branch `fix/restart-park-wake-window`)
+
+Found in the 0.1.7 LMCache benchmark on host A (standalone, SGLang 0.5.22 with LMCache
+0.5.6, Qwen3-4B, `residency: restart_only`, `lmcache: required`): one wake in 16 failed
+`wake_uncertain` after 103 s. The wake of a `restart_only` deployment with LMCache starts
+its engine again (ADR 0033 §7), but its undeclared wake window was the deep-park formula of
+ADR 0014 amendment A1 (60 s + 5 s per GB: 105 s for the 8.05 GB checkpoint), and SGLang
+restarts the model in 94–99 s; the readiness poll's own bound, two seconds before the
+deadline, ran out at 103 s while the engine was still capturing CUDA graphs. The same
+deadline ended a server-plus-host wake at 102.5 s in another run on host A. vLLM 0.32.0
+restarted the model in 64–68 s, inside the window only because it starts faster.
+
+ADR 0014 amendment A23: an undeclared wake window of a deployment that resolves
+`restart_only` is its Initialize window (declared or derived, lowered to the request
+deadline), still `derived`; a declared `timeouts.wake` is kept and parking residencies keep
+the formula. The store gives a wake the Initialize window whenever the revision resolved
+`restart_only`, on the deployment or on a host, and its wake is derived, so revisions frozen
+before this change are covered; such a snapshot still decodes with the window it was frozen
+with. Status shows the window the store gives.
+
+Tests (T14 T20): `a_restart_only_wake_gets_the_initialize_window` (config: derivation,
+declared values, request-deadline bound), `a_restart_only_revision_frozen_with_the_deep_park_wake_still_decodes`,
+and the store's `a_restart_only_wake_gets_the_initialize_window` (frozen, host-resolved,
+declared and parking revisions). CPU and Fake-engine tests are not qualification. Live
+check (host A, 2026-10-23, standalone built from this branch with `fix/wake-flakes` on
+`0b6f6fb6`; SGLang 0.5.22 with LMCache 0.5.6, Qwen3-4B, the benchmark's deployment): status
+shows a wake window of 1,200 s with `timeouts.initialize: 1200s` and 690 s for the same
+deployment without `timeouts` (both were 105 s). 36 restart-park wakes over three launches
+(14, 11, 11), each woken by a router request with a new prompt, were all served: 92–99 s,
+and one of 197 s that the old window would have failed. The first launch's 15th wake was
+held back for memory (`insufficient_memory`, then a 503 after 600 s): the LMCache server's
+GPU memory grew by one engine KV cache (5,328 MiB) per restart-park while the charge
+counted one. That is a separate defect with its own fix, not this one. The benchmark's
+failed wake was the 11th consecutive park of one launch, where that growth had probably
+slowed the restart [inference].
+
+## Release notes on the release page link to the release commit — 2026-10-23 (branch `fix/release-notes-links`)
+
+`scripts/assemble-changes.sh` writes the release notes with repository-relative links
+(`../guide/engines.md#lmcache`), which render in the repository but break when the notes
+are pasted as a GitHub release's description: the 0.1.6 release page still has them
+broken, and 0.1.7's links were pinned to its release commit by hand. The repository file
+stays relative. `scripts/release-notes-body.sh <version> <commit>` prints the release page
+body: the checkout's `docs/operations/release-notes-<version>.md` with every relative link
+(inline, with a title, or a reference definition; a link to the notes' own anchor goes to
+the notes file) made `https://github.com/edurdias/capyctl/blob/<full commit>/docs/...`
+(`tree/` for a folder), anchors kept; absolute links, code spans and fenced blocks are
+left as they are. Every rewritten link is checked first: its file must exist at that
+commit and its anchor must be a heading there (GitHub's heading ids, duplicates numbered)
+or an explicit `id`/`name`; otherwise it lists each failing link with its line and prints
+nothing. `docs/operations/releasing.md` step 4 now uses it, also for correcting a
+published release's notes. The script is in the shellcheck lists of `scripts/ci-local.sh`
+and the CI workflow.
+
+Checked against the real releases: on the current notes, `0.1.7 v0.1.7` prints exactly
+the body published on the 0.1.7 release page (corrected by hand on 2026-10-23), and
+`0.1.6 v0.1.6`, and every release from 0.1.0 to 0.1.5 at its tag, resolve all their links.
+
+Tests: `scripts/test-assemble-changes.sh` (CI step `changes`) gains a scratch repository
+whose notes hold each link form; the body is compared byte for byte with the expected one
+for an abbreviated commit, and the script refuses, printing nothing, a heading added
+after the release commit, a heading inside a code fence, a missing file, an anchor on a
+folder and a link out of the repository. No product behavior changes.
+
+## a vLLM model's 13th deep-park wake no longer fails — 2026-10-23 (branch `fix/wake-flakes`)
+
+Found in the 0.1.7 LMCache benchmark on host A (standalone, vLLM 0.32.0, deep park,
+LMCache off): one wake in 16 failed `wake_uncertain` ("the restore stopped after its
+first effect: runtime operation is unsupported"), and CapyCTL stopped the engine right
+after vLLM had answered `/wake_up` and `/reset_prefix_cache` with 200. It was not
+intermittent: it was the launch's 13th park and wake. SPEC §13.2's step fence in the vLLM
+adapter admitted each residency step id once, but also refused every step once the launch
+had run 64 of them over its life. A deep park and its wake are 5 steps (park, weight
+wake, reload, KV wake, probe), so after 12 cycles the 13th wake's probe (step 65) was
+refused before any engine call (`Unsupported`), which the coordinator reads as uncertain
+after the restore's first effect (T20). SGLang's fence had the same lifetime bound at
+4,096 steps.
+
+Both fences now remember the most recent 64 step ids (`capyctl-adapters::step_fence`): a
+repeat of a recent step is still refused without an engine call, one step runs at a time,
+and nothing runs after an uncertain step, but a launch parks and wakes as often as it is
+asked to. Step ids are the store's, unique per step, and the store's step state stays the
+durable guard.
+
+Tests (T20 T16): `a_launch_parks_and_wakes_as_often_as_it_is_asked` (25 park and wake
+cycles on one vLLM adapter, each probe answered by the engine, a recent step's repeat still
+refused; run against the old fence it fails at the 13th cycle's probe) and the guard's unit
+test. CPU and Fake-engine tests are not qualification. Live check (host A, 2026-10-23,
+standalone built from this branch with `fix/restart-park-wake-window` on `0b6f6fb6`): vLLM
+0.32.0, Qwen3-4B, deep park, LMCache off: 30 park and wake cycles on one launch (150
+residency steps), each woken by a router request, all served (wake 7.2–8.7 s, median
+8.1 s), one binding throughout, no uncertain wake.
+
+## Standalone host-KV limit is settable — 2026-10-23 (branch `fix/standalone-host-kv-limit`)
+
+Found in the 0.1.7 LMCache measurement on host A (128 GB GB10): standalone fixed
+`host_kv_limit` at a tenth of the observed memory (12.17 GiB), and
+`--set host.resource_policy.memory.system.host_kv_limit=…` was refused as an unknown
+standalone setting, so no LMCache pool above 12 GiB fitted (ADR 0033 §6 counts the pool
+against it). With a 12 GiB pool only 17–28k of a 32k-token prompt came back after engine
+eviction (TTFT 4.66 s); a 20 GiB pool on an enrolled host stating `host_kv_limit: 24GiB`
+returned it all (0.35 s, against 7.85 s without LMCache).
+
+ADR 0025 amendment of 2026-10-23: `host.resource_policy.memory.system.host_kv_limit` is a
+stated standalone memory limit, by YAML, `--set` and
+`CAPYCTL_SET__HOST__RESOURCE_POLICY__MEMORY__SYSTEM__HOST_KV_LIMIT` (flag over environment
+over YAML): `auto` (the tenth), a size or a whole percentage. Its bounds are an enrolled
+host's `host_kv_limit`: zero or more, published as stated, never compared with the managed
+limit (only the derived one is lowered to a lowered managed limit). On a discrete machine
+it sets the `system` domain. The generated document states `host_kv_limit: auto`, so
+`capyctl config show` lists it. A document without it, or with `auto`, publishes the same
+policy, byte for byte. Documented in configuration ("Standalone host-KV limit") and the
+engines guide's LMCache section (a long-prompt example with `lmcache_pool: 20GiB` and
+`host_kv_limit=24GiB`).
+
+Tests (failing before, passing after): the three channels and forms in the configuration
+crate; the stated value replacing the derived one, kept above the managed limit and
+normalizing as a host's, the discrete `system` domain, and the unchanged digest with
+`auto`; a booted standalone storing each channel's value in the policy admission reads.
+CPU and Fake-engine tests only; they are not qualification. Live check still needed: on
+host A, a standalone started with `--set host.resource_policy.memory.system.host_kv_limit=24GiB`
+admits a vLLM 0.32.0 deployment with `lmcache: required` and `lmcache_pool: 20GiB`, and
+`capyctl status` shows the 20 GiB pool.
+
+## 0.1.7 release notes say when LMCache is used — 2026-10-23 (branch `docs/release-notes-017-lmcache`)
+
+The 0.1.7 release notes said LMCache "is on by default (`lmcache: auto`)". A deployment
+that parks deep, the default residency, runs without LMCache in 0.1.7: no engine, model
+type and GPU combination is qualified for deep parking with it (ADR 0033 §7, "parking
+wins"). The LMCache bullet now says so and points to "Parking with LMCache" for
+`residency: restart_only`. The published GitHub release notes were corrected the same
+day, with their links pinned to the release commit. Docs only.
+
+## LMCache environments on host B import and see the GPU — 2026-10-23 (branch `docs/lmcache-host-b-checked`)
+
+The owner freed host B for a short check on 2026-10-23. Both LMCache environments copied
+there on 2026-10-22 (see "LMCache 0.5.6 environments on host B") import and see the GPU:
+
+- `~/vllm-0.32.0-lmcache-venv`: vLLM 0.32.0, LMCache 0.5.6, torch 2.13.0+cu130; CUDA
+  available, NVIDIA GB10.
+- `~/sglang-0.5.22-lmcache-venv`: SGLang 0.5.22, LMCache 0.5.6, torch 2.14.1+cu130; CUDA
+  available, NVIDIA GB10.
+
+The check imported each engine and `lmcache` and asked torch for the device; it started
+no engine, role or LMCache server, and left no process on the GPU. The LC rows have not
+been run on host B; every row in 0.1.7 ran on host A.
+
 ## LMCache — 2026-10-22 (branch `feat/lmcache`)
 
 ADR 0033 (owner decisions of 2026-10-21, amended by #179; owner input of 2026-10-22 on
