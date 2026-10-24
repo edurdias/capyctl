@@ -11,7 +11,8 @@ use crate::schema::{
     SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
     SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
     SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V49, SCHEMA_V5, SCHEMA_V50, SCHEMA_V51, SCHEMA_V52,
-    SCHEMA_V53, SCHEMA_V54, SCHEMA_V55, SCHEMA_V56, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V53, SCHEMA_V54, SCHEMA_V55, SCHEMA_V56, SCHEMA_V57, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
+    SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -95,6 +96,9 @@ pub const MIGRATIONS: &[&str] = &[
     // ADR 0033 §§6, 7 (amendment A13): the stopped engine's KV a server may
     // still hold, from a restart-park until a reading shows it released.
     SCHEMA_V56,
+    // ADR 0033 §6 (amendment A15): the largest GPU reading of a server
+    // above its charge, which every phase's charge holds.
+    SCHEMA_V57,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -212,6 +216,11 @@ fn apply_through(conn: &Connection, last: i64) -> Result<(), StoreError> {
             // ADR 0033 §§6, 7 (amendment A13): the stopped engine's KV a
             // restart-parked server may still hold.
             crate::ordinary_lifecycle::lmcache::migrate_v56(&tx)?;
+        }
+        if version == 57 {
+            // ADR 0033 §6 (amendment A15): the largest server GPU reading
+            // above its charge.
+            crate::ordinary_lifecycle::lmcache::migrate_v57(&tx)?;
         }
         if version == 28 {
             // SPEC §6.5 (ADR 0013 amendment): the warm-residency flag.
@@ -516,6 +525,43 @@ mod tests {
         assert!(conn
             .execute("UPDATE launch_lmcache SET held_kv_state='released'", [])
             .is_err());
+    }
+
+    /// ADR 0033 §6 (amendment A15, v57): a launch recorded before v57 holds
+    /// no raised reading; the column takes a positive figure only, and
+    /// applying v57 again changes nothing.
+    // T45
+    #[test]
+    fn v57_adds_the_observed_device_figure_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        apply_through(&conn, 56).unwrap();
+        conn.execute(
+            "INSERT INTO launch_lmcache(binding_id,deployment_id,instance_index,generation,revision,host_id,mode,planned,planned_reason) VALUES('b','a',0,1,1,'h','auto','off','disabled')",
+            [],
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            crate::ordinary_lifecycle::lmcache::migrate_v57(&tx).unwrap();
+            tx.commit().unwrap();
+        }
+        let read: Option<i64> = conn
+            .query_row(
+                "SELECT observed_device_bytes FROM launch_lmcache",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(read, None);
+        conn.execute("UPDATE launch_lmcache SET observed_device_bytes=1", [])
+            .unwrap();
+        for bad in [0, -1] {
+            assert!(conn
+                .execute("UPDATE launch_lmcache SET observed_device_bytes=?1", [bad])
+                .is_err());
+        }
     }
 
     /// ADR 0028 §5, §6 (v41): resource owners, endpoint leases and recorded

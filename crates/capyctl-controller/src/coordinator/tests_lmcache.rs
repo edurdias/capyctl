@@ -1473,6 +1473,136 @@ async fn a_remote_restart_park_keeps_the_server_and_the_wake_starts_a_new_engine
     a_restart_park_keeps_the_server_and_wakes_a_new_engine(Report::HostResult).await;
 }
 
+/// ADR 0033 amendment A15 (found live on SGLang 0.5.22 with LMCache 0.5.6,
+/// 2026-10-23: the server kept every stopped engine's KV, 5,328 MiB more per
+/// restart-park, while the launch stayed charged one KV, and a later wake was
+/// refused for memory). A reading of the parked server above its charge
+/// raises the parked charge, and the Ready charge after the wake keeps it.
+/// With no reading since the wake showing the old KV released, the next park
+/// stops the instance and its server (the cleanup names both, the charge is
+/// released on that evidence, journaled `lmcache_server_stopped`); the next
+/// activation is a new launch with a new server.
+async fn a_park_while_the_kv_is_held_stops_the_server_too(report: Report) {
+    let (dir, owner, fence, observations) = lab(|_| {}).await;
+    let deployment = fence.deployment_id.clone();
+    let host = CacheHost::new(report, owner.clone());
+    let w = worker(owner.clone(), observations, host.clone());
+    ready(&w, &fence).await;
+    let (launch, _) = binding(&owner, &deployment);
+    let park = |key: &str| {
+        w.commands()
+            .park("operator", &deployment, fence.revision, key, 100_000)
+            .unwrap()
+    };
+    let first = park("park-1");
+    until("parked", || instance(&dir, &deployment).0 == "parked").await;
+    assert_eq!(operation(&owner, &first.operation_id).0, "succeeded");
+
+    // The host reports the parked server 1 GiB above the KV it is charged.
+    let (host_id, step): (String, String) = sql(&dir)
+        .query_row(
+            "SELECT l.host_id,st.id FROM launch_lmcache l
+               JOIN lifecycle_steps st ON st.binding_id=l.binding_id
+               JOIN operations o ON o.id=st.operation_id
+              WHERE l.binding_id=?1 AND o.kind='initialize'",
+            [&launch],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let measured = {
+        let o = owner.lock().unwrap();
+        o.store()
+            .record_host_lmcache_measurement(
+                o.session(),
+                &host_id,
+                &deployment,
+                fence.generation,
+                &step,
+                GIB,
+                512 * MIB + 5 * GIB,
+                1,
+            )
+            .unwrap()
+    };
+    assert_eq!(measured.charged_device_bytes, Some(512 * MIB + 5 * GIB));
+    let (phase, bytes, _) = charge(&owner, &deployment).unwrap();
+    assert_eq!(
+        (phase, bytes),
+        (ResourcePhase::Parked, SERVER_CHARGE + 5 * GIB)
+    );
+    assert_eq!(journal(&dir, "lmcache_charge_raised", &deployment).len(), 1);
+
+    let port = crate::coordinator_port::CoordinatorLifecycle::new(w.commands());
+    use crate::port::LifecyclePort;
+    let wake = port.auto_activate(&deployment).await.unwrap();
+    assert_eq!(
+        port.wait_terminal(&wake).await.unwrap(),
+        capyctl_domain::LifecycleState::Ready
+    );
+    let (phase, bytes, _) = charge(&owner, &deployment).unwrap();
+    assert_eq!(
+        (phase, bytes),
+        (ResourcePhase::Ready, CACHED_READY.0 + 5 * GIB)
+    );
+
+    // No reading released the old KV: this park stops it all.
+    let second = park("park-2");
+    until("stopped", || instance(&dir, &deployment).0 == "stopped").await;
+    assert_eq!(operation(&owner, &second.operation_id).0, "succeeded");
+    assert_eq!(
+        host.steps(RuntimeAction::Park).len(),
+        1,
+        "never parked again"
+    );
+    let stopped = host
+        .cleanups
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .identities
+        .clone();
+    assert!(
+        stopped.iter().any(|p| p.role == LMCACHE_ROLE) && stopped.iter().any(|p| p.role == "api"),
+        "the stop named the engine and the server: {stopped:?}"
+    );
+    assert_eq!(charge(&owner, &deployment), None);
+    let why = journal(&dir, "lmcache_server_stopped", &deployment);
+    assert_eq!(why.len(), 1);
+    assert!(why[0].starts_with("held_kv_unreleased: "), "{why:?}");
+
+    // The next activation starts a new launch with a new server.
+    let start = port.auto_activate(&deployment).await.unwrap();
+    assert_eq!(
+        port.wait_terminal(&start).await.unwrap(),
+        capyctl_domain::LifecycleState::Ready
+    );
+    assert_eq!(host.plans(), [None, None]);
+    let (next, recorded) = binding(&owner, &deployment);
+    assert_ne!(next, launch);
+    assert!(lmcache_members(&recorded)
+        .iter()
+        .all(|p| !stopped.contains(p)));
+    assert_eq!(
+        charge(&owner, &deployment).map(|(phase, bytes, _)| (phase, bytes)),
+        Some((ResourcePhase::Ready, CACHED_READY.0))
+    );
+    w.shutdown().await.unwrap();
+}
+
+// T45 T10 T16 T14 (ADR 0033 amendment A15): the embedded adapter's evidence.
+#[tokio::test]
+async fn a_park_while_the_kv_is_held_stops_the_instance_with_its_server() {
+    a_park_while_the_kv_is_held_stops_the_server_too(Report::Adapter).await;
+}
+
+// T45 T10 T16 T14 (ADR 0033 amendment A15): the same through a remote
+// host's results.
+#[tokio::test]
+async fn a_remote_park_while_the_kv_is_held_stops_the_instance_with_its_server() {
+    a_park_while_the_kv_is_held_stops_the_server_too(Report::HostResult).await;
+}
+
 /// A loopback SGLang `/metrics` answering the launch's inference key with
 /// the running gauge `running` holds (SGLang always runs with
 /// `--enable-metrics` under CapyCTL). Returns its endpoint.

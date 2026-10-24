@@ -451,7 +451,9 @@ pub struct InstanceLmcache {
     pub held_kv_bytes: Option<i64>,
     /// On only: the charge the launch holds for its server now (the pool,
     /// the overhead and the device memory, and the engine KV cache it keeps
-    /// mapped while restart-parked and after the wake until released).
+    /// mapped while restart-parked and after the wake until released), never
+    /// below the largest GPU reading of the server above that (ADR 0033
+    /// amendment A15).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub charge_bytes: Option<i64>,
     /// On only: the overhead and device figures were measured for the
@@ -1260,7 +1262,7 @@ fn instance_lmcache(
         String,
         Option<String>,
         Option<String>,
-        [Option<i64>; 4],
+        [Option<i64>; 5],
         bool,
         Option<String>,
         Option<String>,
@@ -1279,7 +1281,7 @@ fn instance_lmcache(
                     EXISTS(SELECT 1 FROM management_events e WHERE e.kind='lmcache_server_exited'
                        AND e.deployment_id=l.deployment_id
                        AND json_extract(e.payload_json,'$.binding_id')=l.binding_id),
-                    i.observed_state='parked',l.held_kv_state IS 'held'
+                    i.observed_state='parked',l.held_kv_state IS 'held',l.observed_device_bytes
                FROM launch_lmcache l
                JOIN deployment_instances i ON i.deployment_id=l.deployment_id
                 AND i.instance_index=l.instance_index AND i.generation=l.generation
@@ -1292,7 +1294,7 @@ fn instance_lmcache(
                 r.get(0)?,
                 r.get(1)?,
                 r.get(2)?,
-                [r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?],
+                [r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(16)?],
                 r.get(7)?,
                 r.get(8)?,
                 r.get(9)?,
@@ -1309,7 +1311,7 @@ fn instance_lmcache(
         planned,
         planned_reason,
         planned_detail,
-        [pool, overhead, device, held_kv],
+        [pool, overhead, device, held_kv, observed],
         measured,
         reported,
         reported_reason,
@@ -1369,10 +1371,15 @@ fn instance_lmcache(
         Some(_) if reported.is_none() => "starting",
         Some(_) => "running",
     };
+    let held = restart_park && (parked || kv_held);
     let mut charge = pool.saturating_add(overhead).saturating_add(device);
-    if restart_park && (parked || kv_held) {
+    if held {
         charge = charge.saturating_add(held_kv);
     }
+    // ADR 0033 amendment A15: never below the largest GPU reading of the
+    // server above what its charge held.
+    let gpu = device.saturating_add(if held { held_kv } else { 0 });
+    charge = charge.saturating_add(observed.unwrap_or(0).saturating_sub(gpu).max(0));
     Ok(Some(InstanceLmcache {
         state: "on".into(),
         reason: None,

@@ -1005,3 +1005,54 @@ path. The canary now runs on the restore's context with the processes the restor
 evidence names: the new engine beside the same server for a restart-park, the recorded
 engine for any other wake. The check itself is unchanged: the claim retained, every engine
 process named alive and no other.
+**A15. A server holds at most one stopped engine's KV, and its charge follows its readings
+(§§6, 7; found live on SGLang 0.5.22 with LMCache 0.5.6, host A, 2026-10-23; owner
+decision of 2026-10-23, "bound it and charge the evidence").** A `restart_only` deployment
+(Qwen3-4B, a 12 GiB pool, a 5 GiB KV cache) was parked and woken repeatedly. Every park
+added 5,328 MiB to the server's GPU memory (the engine's KV and about 208 MiB): the server
+kept the KV of every stopped engine mapped through CUDA IPC, and neither the wake, nor the
+new engine registering, nor its requests released any of it, whether each request was an
+LMCache hit (the same prompt every cycle) or stored new KV (a new prompt every cycle). With
+the same prompt the server held 53,624 MiB at the tenth wake while the launch was charged
+20,132,659,200 B (the pool, the 5 GiB held KV, the overhead allowance and the 512 MiB
+device allowance); the wake was refused for memory (`residency_blocked insufficient_memory`)
+and the router answered 503 after 600 s. With a new prompt every cycle the fifteenth wake
+was refused the same way with the server at 80,324 MiB and 18.2 GiB charged. A13's release
+(a reading below the KV after the new engine first stores KV) never came on SGLang, and on
+vLLM 0.32.0 not when the request after the wake stored nothing (the live check of this
+amendment: 5,526 MiB parked, 5,670 MiB after a wake with the same prompt, no release). Two
+rules, on both engines and every host:
+
+- **The charge is never below what the server is seen to hold.** A GPU reading of the
+  server above the GPU memory the launch's charge holds for it in its phase (its device
+  figure, plus the stopped engine's KV while that is held, or an earlier larger reading)
+  raises that charge to the reading in every phase, in the device domain on a discrete GPU
+  and the one shared pool on unified memory, journaled `lmcache_charge_raised`. The reading
+  is the evidence: the memory is already in use, so the raise takes no admission. It is
+  taken only while the instance is Ready or parked on that launch with no lifecycle run
+  open and the owner holding that phase's charge; any other time the charge stays and a
+  later reading raises it. The figure is kept per launch
+  (`launch_lmcache.observed_device_bytes`, schema v57) and never lowers on a smaller
+  reading: only A13's release reading (below the stopped engine's KV, while Ready) lowers
+  it, with the held KV, or the launch's stop. The embedded watch and a host's load reports
+  take the same path; callers that skip samples still send a reading above the charge the
+  store last answered. The revision's measurement is unchanged (A13): a reading while KV
+  may be held is not recorded.
+- **No restart-park while an earlier engine's KV is held.** A park of a Ready instance
+  whose server still holds the KV of the engine an earlier restart-park stopped (no
+  release reading since that park: `held_kv_state` is `held`) stops the instance and its
+  server instead: `park deployment` answers with that stop under its own receipt, as
+  ADR 0014 A19's growth stop does, and the idle policy stops it with the reason
+  `ready_idle_held_kv_unreleased`; both journal `lmcache_server_stopped` with the
+  evidence starting `held_kv_unreleased:`. The stop is an ordinary one: nothing is
+  released before its cleanup evidence proves both the engine's and the server's processes
+  gone, and the instance stays eligible for on-demand activation, whose start is a new
+  launch with a new server and no held KV. A server so holds at most one stopped engine's
+  KV, which its charge counts. A model parked and woken repeatedly on SGLang (and on vLLM
+  whenever no release reading comes) alternates a restart-park and a stop; the first
+  request after each stop is a cold start without the cache. No path parks on the server
+  again while the KV is held: an instance park through any other caller is refused.
+
+The cause is upstream (the server's CUDA IPC mapping of a stopped engine's KV outlives
+that engine until, at best, a later store); a draft issue for LMCache is kept with the
+evidence, not filed.

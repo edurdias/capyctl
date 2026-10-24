@@ -627,6 +627,11 @@ fn restart_park_parks_on_the_server_and_wakes_a_new_engine() {
         unified(&lab.footprint(&a)),
         (8 * GIB + CHARGE + 4 * GIB, 2 * GIB)
     );
+    // A reading of the server's own memory alone releases it.
+    lab.store
+        .record_lmcache_overhead(&lab.session, &context.binding_id, 0, 406 * MIB, 2_300)
+        .unwrap();
+    assert_eq!(unified(&lab.footprint(&a)), (8 * GIB + CHARGE, 2 * GIB));
 
     // T10: the idle policy parks it the same way and keeps it eligible.
     let actions = lab
@@ -736,13 +741,7 @@ fn a_wake_keeps_the_held_kv_charged_until_a_reading_shows_it_released() {
 // (1608-1656 MiB of GPU memory live): the same charge and measurement rules.
 #[test]
 fn an_sglang_wake_keeps_the_held_kv_charged_until_a_reading_shows_it_released() {
-    held_kv_until_released(|host| {
-        let profile = &mut host["runtime_profiles"]["local"];
-        profile["engine"] = json!("sglang");
-        profile["build_fingerprint"] = json!("0.5.22");
-        profile["args"] = json!([]);
-        profile["security"]["admin_credential_ref"] = json!("secret://engine-admin-key");
-    });
+    held_kv_until_released(sglang_host);
 }
 
 fn held_kv_until_released(edit_host: impl FnOnce(&mut Value)) {
@@ -765,9 +764,12 @@ fn held_kv_until_released(edit_host: impl FnOnce(&mut Value)) {
             )
             .unwrap()
     };
-    let held = |held: bool| LmcacheMeasured {
+    // What the store says of a sample: whether the server may hold the
+    // stopped engine's KV, and the GPU memory the launch's charge holds.
+    let held = |held: bool, charged: i64| LmcacheMeasured {
         grew: false,
         held_kv_bytes: held.then_some(4 * GIB),
+        charged_device_bytes: Some(charged),
     };
     let ready = (8 * GIB + CHARGE, 2 * GIB);
     let ready_holding = (8 * GIB + CHARGE + 4 * GIB, 2 * GIB);
@@ -778,10 +780,16 @@ fn held_kv_until_released(edit_host: impl FnOnce(&mut Value)) {
 
     // Armed and parked, the server's reading counts the engine's KV (LC4:
     // 406 -> 1430 MiB): never the measurement; while parked, even a reading
-    // below the KV releases nothing.
+    // below the KV releases nothing. While the park is armed no reading
+    // raises the charge (A15: a lifecycle run is open); once parked the
+    // charge holds the KV.
     restart_park_round_trip(&lab, &a, &context, || {
-        assert_eq!(measure(406 * MIB + 4 * GIB), held(true));
-        assert_eq!(measure(200 * MIB), held(true));
+        let sample = measure(406 * MIB + 4 * GIB);
+        assert!(
+            sample == held(true, 512 * MIB) || sample == held(true, 512 * MIB + 4 * GIB),
+            "{sample:?}"
+        );
+        assert_eq!(measure(200 * MIB).held_kv_bytes, Some(4 * GIB));
     });
     assert_eq!(recorded(), (600 * MIB, 406 * MIB));
 
@@ -790,10 +798,14 @@ fn held_kv_until_released(edit_host: impl FnOnce(&mut Value)) {
     let status = instance_status(&lab, &a)["lmcache"].clone();
     assert_eq!(status["charge_bytes"], json!(CHARGE + 4 * GIB));
     assert_eq!(status["held_kv_bytes"], json!(4 * GIB));
-    // The reading after the wake still counts the old KV (1574 MiB live), and
-    // no reading at all proves nothing: both change nothing.
-    assert_eq!(measure(550 * MIB + 4 * GIB), held(true));
-    assert_eq!(measure(0), held(true));
+    // The reading after the wake still counts the old KV (1574 MiB live),
+    // within the charge, and no reading at all proves nothing: both change
+    // nothing.
+    assert_eq!(
+        measure(500 * MIB + 4 * GIB),
+        held(true, 512 * MIB + 4 * GIB)
+    );
+    assert_eq!(measure(0), held(true, 512 * MIB + 4 * GIB));
     assert_eq!(unified(&lab.footprint(&a)), ready_holding);
     assert_eq!(recorded(), (600 * MIB, 406 * MIB));
     let released = || -> i64 {
@@ -811,14 +823,14 @@ fn held_kv_until_released(edit_host: impl FnOnce(&mut Value)) {
     // The new engine stored KV: the server is back to its own memory. That
     // reading releases the held KV, journaled once, and is a measurement
     // again (no larger than the one recorded).
-    assert_eq!(measure(406 * MIB), held(false));
+    assert_eq!(measure(406 * MIB), held(false, 512 * MIB));
     assert_eq!(unified(&lab.footprint(&a)), ready);
     assert_eq!(
         instance_status(&lab, &a)["lmcache"]["charge_bytes"],
         json!(CHARGE)
     );
     assert_eq!(released(), 1);
-    assert_eq!(measure(300 * MIB), held(false));
+    assert_eq!(measure(300 * MIB), held(false, 512 * MIB));
     assert_eq!(released(), 1);
     assert_eq!(recorded(), (600 * MIB, 406 * MIB));
 
@@ -835,6 +847,318 @@ fn held_kv_until_released(edit_host: impl FnOnce(&mut Value)) {
         (charge.overhead_bytes, charge.device_bytes),
         (600 * MIB, 406 * MIB)
     );
+}
+
+/// The lab's host profile as SGLang 0.5.22 with LMCache 0.5.6.
+fn sglang_host(host: &mut Value) {
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["engine"] = json!("sglang");
+    profile["build_fingerprint"] = json!("0.5.22");
+    profile["args"] = json!([]);
+    profile["security"]["admin_credential_ref"] = json!("secret://engine-admin-key");
+}
+
+/// The journal entries of `state`, as (operation, evidence).
+fn journaled(lab: &Lab, state: &str) -> Vec<(String, String)> {
+    lab.store
+        .conn
+        .prepare("SELECT operation_id,evidence FROM journal_entries WHERE state=?1 ORDER BY rowid")
+        .unwrap()
+        .query_map([state], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+// T45 T14 (ADR 0033 §6, amendment A15; found live on SGLang 0.5.22 with
+// LMCache 0.5.6, 2026-10-23: the server held 53,624 MiB of GPU memory where
+// the launch was charged 18.8 GiB). A GPU reading of the server above what
+// the charge holds raises every phase's charge to it, from the embedded
+// watch and from a host's report alike: Ready, parked with the stopped
+// engine's KV, and Ready after the wake. A smaller reading never lowers it,
+// nor does a reading while a lifecycle run is open raise it; only the
+// reading that releases the held KV lowers it.
+#[test]
+fn a_reading_above_the_charge_raises_it_until_the_release() {
+    reading_above_the_charge(|_| {});
+}
+
+// T45 T14 (ADR 0033 amendment A15): the same on SGLang, where it was found.
+#[test]
+fn an_sglang_reading_above_the_charge_raises_it_until_the_release() {
+    reading_above_the_charge(sglang_host);
+}
+
+fn reading_above_the_charge(edit_host: impl FnOnce(&mut Value)) {
+    let lab = Lab::new(edit_host);
+    let a = lab.deploy("a", |_| {});
+    let (_, context) = lab.start(&a, 100);
+    lab.ready(&context, 10, Some(LmcacheOutcome::On), 200);
+    let step = context.token.step_id.clone();
+    let measure = |device: i64| {
+        lab.store
+            .record_lmcache_overhead(&lab.session, &context.binding_id, 0, device, 300)
+            .unwrap()
+            .charged_device_bytes
+    };
+    let reported = |device: i64| {
+        lab.store
+            .record_host_lmcache_measurement(
+                &lab.session,
+                "lab",
+                &a.deployment_id,
+                a.generation,
+                &step,
+                GIB,
+                device,
+                300,
+            )
+            .unwrap()
+            .charged_device_bytes
+    };
+    let charge = || instance_status(&lab, &a)["lmcache"]["charge_bytes"].clone();
+    let raised = || journaled(&lab, "lmcache_charge_raised").len();
+    let ready = 8 * GIB + CHARGE;
+
+    // Ready with no KV held: the server's 700 MiB is above its 512 MiB.
+    assert_eq!(measure(400 * MIB), Some(512 * MIB));
+    assert_eq!(measure(700 * MIB), Some(700 * MIB));
+    assert_eq!(unified(&lab.footprint(&a)).0, ready + 188 * MIB);
+    assert_eq!(charge(), json!(CHARGE + 188 * MIB));
+    assert_eq!(raised(), 1);
+    assert_eq!(measure(600 * MIB), Some(700 * MIB));
+    assert_eq!(unified(&lab.footprint(&a)).0, ready + 188 * MIB);
+
+    // Armed, no reading raises it; parked, a server holding 1 GiB more than
+    // the stopped engine's KV it is charged for raises the parked charge.
+    let samples = std::cell::Cell::new(0);
+    restart_park_round_trip(&lab, &a, &context, || {
+        samples.set(samples.get() + 1);
+        if samples.get() == 1 {
+            assert_eq!(reported(512 * MIB + 5 * GIB), Some(700 * MIB));
+            assert_eq!(raised(), 1);
+        } else {
+            assert_eq!(reported(512 * MIB + 5 * GIB), Some(512 * MIB + 5 * GIB));
+            assert_eq!(unified(&lab.footprint(&a)).0, CHARGE + 5 * GIB);
+            assert_eq!(charge(), json!(CHARGE + 5 * GIB));
+            assert_eq!(raised(), 2);
+            assert_eq!(reported(512 * MIB + 4 * GIB), Some(512 * MIB + 5 * GIB));
+        }
+    });
+    // Woken, the Ready charge keeps the raised figure beside the new engine.
+    assert_eq!(unified(&lab.footprint(&a)).0, ready + 5 * GIB);
+    assert_eq!(charge(), json!(CHARGE + 5 * GIB));
+    assert_eq!(measure(512 * MIB + 4 * GIB), Some(512 * MIB + 5 * GIB));
+    assert_eq!(raised(), 2);
+
+    // The release reading lowers it, with the held KV, journaled once.
+    assert_eq!(measure(406 * MIB), Some(512 * MIB));
+    assert_eq!(unified(&lab.footprint(&a)).0, ready);
+    assert_eq!(charge(), json!(CHARGE));
+    let released = journaled(&lab, "lmcache_kv_released");
+    assert_eq!(released.len(), 1);
+    assert!(released[0].1.contains("(5632 MiB)"), "{released:?}");
+    // Raised again from a new reading above it.
+    assert_eq!(measure(700 * MIB), Some(700 * MIB));
+    assert_eq!(unified(&lab.footprint(&a)).0, ready + 188 * MIB);
+    assert_eq!(raised(), 3);
+}
+
+// T45 T10 T16 (ADR 0033 amendment A15; found live on SGLang 0.5.22 with
+// LMCache 0.5.6: with the same prompt every cycle no new KV was stored, the
+// server kept the KV of every stopped engine, and the tenth wake was refused
+// for memory). A park of an instance whose server still holds the KV of the
+// engine an earlier restart-park stopped (no release reading since the wake)
+// is a stop of the instance with its server, journaled
+// `lmcache_server_stopped` (`held_kv_unreleased`), answered under the park
+// command and replayed by it; the stop releases nothing until the evidence
+// names the engine's and the server's exits. The next start is a new launch
+// with a new server, which restart-parks again.
+#[test]
+fn a_second_park_while_the_kv_is_held_stops_the_instance_and_its_server() {
+    second_park_while_held(|_| {});
+}
+
+// T45 T10 T16 (ADR 0033 amendment A15): the same on SGLang.
+#[test]
+fn an_sglang_second_park_while_the_kv_is_held_stops_the_instance_and_its_server() {
+    second_park_while_held(sglang_host);
+}
+
+fn second_park_while_held(edit_host: impl FnOnce(&mut Value)) {
+    let lab = Lab::new(edit_host);
+    let a = lab.deploy("a", |_| {});
+    let (_, context) = lab.start(&a, 100);
+    lab.ready(&context, 10, Some(LmcacheOutcome::On), 200);
+    restart_park_round_trip(&lab, &a, &context, || {});
+    let mut woken = engine(70);
+    woken.extend(server(10));
+    // No path parks on the server again while it holds the old KV.
+    assert!(matches!(
+        lab.store.accept_instance_park(
+            &lab.session,
+            "idle",
+            &a.deployment_id,
+            0,
+            "instance-park",
+            3_000,
+            63_000
+        ),
+        Err(LifecycleError::Conflict)
+    ));
+    let park = || {
+        lab.store
+            .accept_park_command(
+                &lab.session,
+                "operator",
+                &a.deployment_id,
+                a.revision,
+                "park-2",
+                3_000,
+                63_000,
+            )
+            .unwrap()
+    };
+    let stop = park();
+    assert_eq!(park(), stop, "a retry replays the stop");
+    let kind: String = lab.row(
+        "SELECT kind FROM operations WHERE id=?1",
+        &stop.operation_id,
+    );
+    assert_eq!(kind, "ordinary_cleanup");
+    let stopped = journaled(&lab, "lmcache_server_stopped");
+    assert_eq!(stopped.len(), 1);
+    assert_eq!(stopped[0].0, stop.operation_id);
+    assert!(
+        stopped[0].1.starts_with("held_kv_unreleased: "),
+        "{stopped:?}"
+    );
+
+    // The engine's exit alone releases nothing: the server is recorded too.
+    let (_, cleanup) = lab
+        .store
+        .arm_ordinary_cleanup_with_context(&lab.session, &stop.step_id, 3_100)
+        .unwrap();
+    let cleanup = cleanup.unwrap();
+    let ttl = lab
+        .store
+        .resource_policy("lab")
+        .unwrap()
+        .unwrap()
+        .controls
+        .observation_ttl_ms;
+    let evidence = |identities: Vec<ProcessIdentity>| CleanupEvidence {
+        binding_id: cleanup.binding_id.clone(),
+        incarnation: cleanup.incarnation.clone(),
+        identities,
+        observed_at_ms: 3_200,
+        receipt: "every recorded process observed gone".into(),
+    };
+    assert!(lab
+        .store
+        .complete_cleanup(
+            &lab.session,
+            &stop.step_id,
+            &evidence(engine(70)),
+            3_200,
+            ttl
+        )
+        .is_err());
+    let owner = crate::instances::instance_owner_id(&a.deployment_id, 0);
+    assert!(lab
+        .store
+        .resource_snapshot()
+        .unwrap()
+        .owners
+        .contains_key(&owner));
+    lab.store
+        .complete_cleanup(&lab.session, &stop.step_id, &evidence(woken), 3_200, ttl)
+        .unwrap();
+    assert!(!lab
+        .store
+        .resource_snapshot()
+        .unwrap()
+        .owners
+        .contains_key(&owner));
+    assert_eq!(instance_status(&lab, &a)["observed_state"], "stopped");
+
+    // The next start is a new launch with a new server, holding no KV, and
+    // it restart-parks.
+    let restarted = DeploymentFence {
+        generation: lab.row(
+            "SELECT current_generation FROM deployments WHERE id=?1",
+            &a.deployment_id,
+        ),
+        ..a.clone()
+    };
+    let (_, next) = lab.start(&restarted, 4_000);
+    assert_ne!(next.binding_id, context.binding_id);
+    lab.ready(&next, 80, Some(LmcacheOutcome::On), 4_100);
+    assert_eq!(unified(&lab.footprint(&a)), (8 * GIB + CHARGE, 2 * GIB));
+    let park = lab
+        .store
+        .accept_park_command(
+            &lab.session,
+            "operator",
+            &a.deployment_id,
+            a.revision,
+            "park-3",
+            5_000,
+            65_000,
+        )
+        .unwrap();
+    let kind: String = lab.row(
+        "SELECT kind FROM operations WHERE id=?1",
+        &park.operation_id,
+    );
+    assert_eq!(kind, "park");
+}
+
+// T45 T10 (ADR 0033 amendment A15): the idle policy stops an instance whose
+// server still holds an earlier stopped engine's KV, with its server,
+// journaled, instead of parking it again (released, it parks:
+// `restart_park_parks_on_the_server_and_wakes_a_new_engine`). vLLM and SGLang.
+#[test]
+fn an_idle_park_while_the_kv_is_held_stops_instead() {
+    let edits: [fn(&mut Value); 2] = [|_| {}, sglang_host];
+    for edit in edits {
+        let lab = Lab::new(edit);
+        let a = lab.deploy("a", |_| {});
+        let (_, context) = lab.start(&a, 100);
+        lab.ready(&context, 10, Some(LmcacheOutcome::On), 200);
+        restart_park_round_trip(&lab, &a, &context, || {});
+        let actions = lab
+            .store
+            .apply_idle_policy(
+                &lab.session,
+                1_000_000,
+                crate::ordinary_lifecycle::park::IdlePolicy {
+                    ready_idle_ms: Some(1_000),
+                    ..Default::default()
+                },
+                &|_, _| None,
+                0,
+            )
+            .unwrap();
+        let [crate::ordinary_lifecycle::park::IdleAction::Stopped {
+            operation_id,
+            reason,
+            ..
+        }] = actions.as_slice()
+        else {
+            panic!("{actions:?}");
+        };
+        assert_eq!(*reason, "ready_idle_held_kv_unreleased");
+        let kind: String = lab.row("SELECT kind FROM operations WHERE id=?1", operation_id);
+        assert_eq!(kind, "ordinary_cleanup");
+        let stopped = journaled(&lab, "lmcache_server_stopped");
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(&stopped[0].0, operation_id);
+        assert!(
+            stopped[0].1.starts_with("held_kv_unreleased: "),
+            "{stopped:?}"
+        );
+    }
 }
 
 // T45 (ADR 0033 §6, amendment A13): a caller of the measurement writes the
@@ -854,6 +1178,7 @@ fn a_measurement_caller_sends_the_release_reading_while_kv_is_held() {
         LmcacheMeasured {
             grew: false,
             held_kv_bytes: Some(GIB),
+            charged_device_bytes: None,
         },
     );
     // Held: a larger reading counts the KV; only one below it is sent, and
@@ -865,6 +1190,35 @@ fn a_measurement_caller_sends_the_release_reading_while_kv_is_held() {
     seen.sent(800 * MIB, 406 * MIB, LmcacheMeasured::default());
     assert!(!seen.wants(800 * MIB, 406 * MIB));
     assert!(seen.wants(800 * MIB, 410 * MIB));
+}
+
+// T45 (ADR 0033 §6, amendment A15): a caller also sends a GPU reading above
+// the server's GPU memory the launch's charge holds, as the store last said,
+// held KV or not, and again after a sample the store could not raise the
+// charge on (it answers the charge it still holds).
+#[test]
+fn a_measurement_caller_sends_a_reading_above_the_charge() {
+    let mut seen = MeasurementSeen::default();
+    let said = |held: Option<i64>, charged: i64| LmcacheMeasured {
+        grew: false,
+        held_kv_bytes: held,
+        charged_device_bytes: Some(charged),
+    };
+    seen.sent(800 * MIB, 1430 * MIB, said(Some(GIB), 512 * MIB + GIB));
+    // Within the charge: nothing to raise or release.
+    assert!(!seen.wants(800 * MIB, 1500 * MIB));
+    // Above it: sent, the store raised the charge to it.
+    assert!(seen.wants(800 * MIB, 2 * GIB));
+    seen.sent(800 * MIB, 2 * GIB, said(Some(GIB), 2 * GIB));
+    assert!(!seen.wants(800 * MIB, 2 * GIB));
+    // A run was open: the store kept the charge, so the reading goes again.
+    assert!(seen.wants(800 * MIB, 3 * GIB));
+    seen.sent(800 * MIB, 3 * GIB, said(Some(GIB), 2 * GIB));
+    assert!(seen.wants(800 * MIB, 3 * GIB));
+    // Released: the charge is the server's own figure again.
+    seen.sent(800 * MIB, 406 * MIB, said(None, 512 * MIB));
+    assert!(!seen.wants(800 * MIB, 400 * MIB));
+    assert!(seen.wants(800 * MIB, 600 * MIB));
 }
 
 // T45: a restart_only launch whose host reported LMCache off does not park.

@@ -1222,6 +1222,17 @@ pub const SCHEMA_V55: &str = "-- checkpoint model types (checkpoint_digests::mig
 /// missing. Additive and forward-only.
 pub const SCHEMA_V56: &str = "-- held engine KV after a restart-park (lmcache::migrate_v56)";
 
+/// v57 (ADR 0033 §6, amendment A15): `launch_lmcache.observed_device_bytes`,
+/// the largest GPU reading of a launch's LMCache server above the GPU memory
+/// its charge held (found live on SGLang 0.5.22: a server kept every stopped
+/// engine's KV mapped while no new KV was stored). Every phase's charge
+/// holds at least it; null again only on the reading that releases a held
+/// stopped engine's KV. A row written before v57 reads null. The column is
+/// added by `lmcache::migrate_v57` only when missing. Additive and
+/// forward-only.
+pub const SCHEMA_V57: &str =
+    "-- the largest server GPU reading above its charge (lmcache::migrate_v57)";
+
 #[cfg(test)]
 mod tests {
     use super::*;

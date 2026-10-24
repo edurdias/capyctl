@@ -917,8 +917,9 @@ it, at what was measured. The charge stays while the model is parked, and a
 `restart_only` model's charge also holds the stopped engine's KV cache from
 its park until a reading of the server's GPU memory after the wake shows it
 released ([parking](parking.md#parking-with-lmcache)); a reading taken in that
-window is never the measurement. `memory.request` stays the engine's own GPU
-memory.
+window is never the measurement. The charge is never less than the server's
+GPU memory as read: a larger reading raises it. `memory.request` stays the
+engine's own GPU memory.
 
 **Long prompts.** LMCache 0.5.6 starts evicting once its pool is 80 % full,
 so the pool has to hold the prompts you want back plus whatever passes

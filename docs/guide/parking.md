@@ -90,11 +90,18 @@ the server stops when the model stops.
   as a start (`timeouts.initialize`, or the window CapyCTL derives for a
   start). Without LMCache such a model stops instead of parking, as before.
   While it is parked, the memory set aside for it also counts the engine's KV
-  cache: the server keeps the stopped engine's KV memory mapped. It still holds it after
-  the wake, until the new engine first stores KV, so the KV cache stays counted
+  cache: the server keeps the stopped engine's KV memory mapped. It can still
+  hold it after the wake (measured on a GB10), so the KV cache stays counted
   after the wake too, until a reading of the server's GPU memory shows it
-  released (measured on a GB10). Where no reading of the server's GPU memory is
-  available, it stays counted until the model stops.
+  released. Where no reading of the server's GPU memory is available, it stays
+  counted until the model stops. The memory set aside for the server is never
+  less than what its GPU memory reads.
+- **Parked again before the old KV is released**: the server would keep one
+  more engine's KV for every park, so instead of parking, the model stops
+  together with its LMCache server, and the next request starts it fresh
+  with a new server. The first request after that start is not answered from
+  the cache. A model parked and woken repeatedly therefore alternates between
+  a park and a stop when its server does not release the old KV.
 - **`deep` and `host_backed`** use LMCache only on an engine version, model
   type and GPU combination qualified live for parking with it. This release
   qualifies none, so a deep-parking deployment keeps parking deep and runs
