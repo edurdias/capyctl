@@ -612,6 +612,11 @@ class StartupTests(LaunchFixture, unittest.TestCase):
         environ = mock.patch.dict(os.environ)
         environ.start()
         self.addCleanup(environ.stop)
+        # A launch ends its processes when `launch_server` returns; in this
+        # process those would be the test runner's own children.
+        ending = mock.patch.object(entry, "_end_engine_processes")
+        ending.start()
+        self.addCleanup(ending.stop)
 
     def _launch_recording_environment(self, drift=None):
         """Run main to the launch seam; return (result, stderr, env at launch)."""
@@ -1180,6 +1185,9 @@ class EntryGroupStartupTests(LaunchFixture, unittest.TestCase):
         environ = mock.patch.dict(os.environ)
         environ.start()
         self.addCleanup(environ.stop)
+        ending = mock.patch.object(entry, "_end_engine_processes")
+        ending.start()
+        self.addCleanup(ending.stop)
 
     def _launch(self, public, drift=None, target=None):
         seen = {}

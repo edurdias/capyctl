@@ -272,7 +272,11 @@ def launch_server(server_args, run_scheduler_process_func=None):
 '''
 
 
-class SharedMemoryAfterFailedLaunchTests(unittest.TestCase):
+class _SharedMemoryFixture:
+    """A synthetic SGLang tree whose `launch_server` is `SERVER`."""
+
+    SERVER = None
+
     def setUp(self):
         if not os.path.isdir("/dev/shm"):
             self.skipTest("no /dev/shm")
@@ -282,7 +286,7 @@ class SharedMemoryAfterFailedLaunchTests(unittest.TestCase):
         self.tree = root / "venv" / "site-packages"
         sglang_tree(self.tree, saver_hooks=False)
         (self.tree / "sglang/srt/entrypoints/http_server.py").write_text(
-            textwrap.dedent(SHM_HTTP_SERVER))
+            textwrap.dedent(self.SERVER))
         self.temp = root / "tmp"
         self.temp.mkdir()
         self.scratch = root / "scratch"
@@ -310,6 +314,10 @@ class SharedMemoryAfterFailedLaunchTests(unittest.TestCase):
                 os.killpg(entry.pid, signal.SIGKILL)
                 self.fail("the stub scheduler never started: %s" % (entry.communicate(),))
             time.sleep(0.05)
+
+
+class SharedMemoryAfterFailedLaunchTests(_SharedMemoryFixture, unittest.TestCase):
+    SERVER = SHM_HTTP_SERVER
 
     # T12: SPEC §13.2 (found live 2026-10-22). A scheduler killed while it
     # loads fails the launch, and the shared memory the launch made, which
@@ -360,6 +368,147 @@ class SharedMemoryAfterFailedLaunchTests(unittest.TestCase):
         self.assertTrue(foreign.exists())
 
 
+# A launch that serves, then is stopped the three ways SGLang 0.5.22 stops on
+# the host's SIGTERM to the group: while it loads (no SGLang handler yet);
+# serving, its handler drains, kills its tree without this entry and
+# `launch_server` returns (found live 2026-10-22); serving, after a child's
+# exit its SIGQUIT handler kills the tree and then this entry with SIGKILL,
+# through `os.kill` as psutil's `Process.kill` does. Its scheduler makes the
+# segments of the failed-launch stub above, and the entry keeps a
+# multiprocessing semaphore (`sem.mp-*`), whose finalizer would remove it at a
+# normal exit. This `launch_server` replaces the one above.
+STOP_HTTP_SERVER = SHM_HTTP_SERVER + '''
+import signal
+
+KEPT = []
+
+def _tree(pid):
+    children = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % name, "rb") as handle:
+                raw = handle.read()
+        except OSError:
+            continue
+        children.setdefault(int(raw[raw.rindex(b")") + 2:].split()[1]), []).append(int(name))
+    found, frontier = [], [pid]
+    while frontier:
+        below = children.get(frontier.pop(), [])
+        found.extend(below)
+        frontier.extend(below)
+    return found
+
+def kill_process_tree(parent_pid, include_parent=True):
+    for child in _tree(parent_pid):
+        try:
+            os.kill(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if include_parent:
+        os.kill(parent_pid, signal.SIGKILL)
+        sys.exit(0)
+
+def launch_server(server_args, run_scheduler_process_func=None):
+    mode, scratch = os.environ["STUB_MODE"], os.environ["STUB_SCRATCH"]
+    mp.set_start_method("spawn", force=True)
+    KEPT.append(mp.Lock())
+    with open(os.path.join(scratch, "semaphore"), "w") as handle:
+        handle.write(KEPT[0]._semlock.name)
+    scheduler = mp.Process(target=_scheduler,
+                           args=(os.environ["STUB_TOKEN"], scratch))
+    scheduler.start()
+    if mode == "loading":
+        while True:
+            time.sleep(0.05)
+    while not os.path.exists(os.path.join(scratch, "scheduler")):
+        time.sleep(0.05)
+    stopping = []
+    signal.signal(signal.SIGTERM, lambda *_: stopping.append(True))
+    open(os.path.join(scratch, "serving"), "w").close()
+    while not stopping:
+        time.sleep(0.05)
+    kill_process_tree(os.getpid(), include_parent=mode == "sigquit")
+'''
+
+
+class SharedMemoryAfterStopTests(_SharedMemoryFixture, unittest.TestCase):
+    SERVER = STOP_HTTP_SERVER
+
+    def remove_semaphore(self):
+        record = self.scratch / "semaphore"
+        if record.exists():
+            Path("/dev/shm/sem." + record.read_text().lstrip("/")).unlink(missing_ok=True)
+
+    def stop(self, mode, ready):
+        """Start a launch and stop it as the host does; (returncode, stderr)."""
+        self.addCleanup(self.remove_semaphore)
+        old = self.segment("-old")
+        old.write_bytes(b"\0" * 4096)
+        old.chmod(0o600)
+        environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                       "TMPDIR": str(self.temp), "STUB_TOKEN": self.token,
+                       "STUB_SCRATCH": str(self.scratch), "STUB_MODE": mode}
+        entry = subprocess.Popen(
+            [sys.executable, "-I", "-S", "-c", ENTRY_SCRIPT, str(REPO), str(TESTS),
+             str(self.tree)],
+            env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        self.wait_for(self.scratch / ready, entry)
+        semaphore = Path("/dev/shm/sem." + (self.scratch / "semaphore").read_text().lstrip("/"))
+        self.assertTrue(semaphore.exists())
+        foreign = self.segment("-foreign")
+        foreign.write_bytes(b"\0" * 4096)
+        foreign.chmod(0o600)
+        # Long enough for the watch to list the directory several times.
+        time.sleep(1.0)
+        # The host's stop: SIGTERM to the launch's process group.
+        os.killpg(entry.pid, signal.SIGTERM)
+        try:
+            _, stderr = entry.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            os.killpg(entry.pid, signal.SIGKILL)
+            entry.communicate()
+            self.fail("the entry outlived its stop")
+        self.assertEqual(running_group_members(entry.pid), [])
+        self.assertFalse(Path("/dev/shm/sglang_loads_%s_0.shm" % self.token).exists())
+        self.assertFalse(self.segment("-psm").exists())
+        self.assertFalse(semaphore.exists())
+        self.assertTrue(old.exists())
+        self.assertTrue(self.segment("-shared").exists())
+        self.assertTrue(foreign.exists())
+        # The semaphore's own finalizer, at a normal exit, does not find it
+        # gone and print a traceback.
+        self.assertNotIn("Traceback", stderr)
+        return entry.returncode, stderr
+
+    # T12: SPEC §13.2 (found live 2026-10-22: SGLang 0.5.22 left
+    # `sglang_loads_*.shm` and a `sem.mp-*` semaphore after a normal stop).
+    # Stopped while serving, SGLang drains, ends its tree without the entry
+    # and `launch_server` returns; the entry then ends what is left, sees it
+    # gone and removes the shared memory the launch made. A segment that
+    # existed before, one a process outside the launch maps, and one another
+    # process made during the launch all stay.
+    def test_a_stop_while_serving_removes_the_shared_memory_the_launch_made(self):
+        returncode, stderr = self.stop("drain", "serving")
+        self.assertEqual(returncode, 0, stderr)
+
+    # T12: SPEC §13.2. SGLang's SIGQUIT path kills the tree and then the entry
+    # with SIGKILL; the entry's `os.kill` ends the launch, verified, and
+    # removes its shared memory first, and the SIGKILL is still delivered.
+    def test_a_stop_that_kills_the_entry_still_removes_the_shared_memory(self):
+        returncode, stderr = self.stop("sigquit", "serving")
+        self.assertEqual(returncode, -signal.SIGKILL, stderr)
+
+    # T12: SPEC §13.2. Stopped while it loads, before SGLang has a SIGTERM
+    # handler, the entry ends the launch, verified, removes its shared memory
+    # and then dies of the SIGTERM, as it did before.
+    def test_a_stop_while_loading_removes_the_shared_memory(self):
+        returncode, stderr = self.stop("loading", "scheduler")
+        self.assertEqual(returncode, -signal.SIGTERM, stderr)
+
+
 # A sleeper that hides its descriptors and mappings (PR_SET_DUMPABLE 0, set
 # after exec, which resets it).
 HIDDEN_SLEEPER = ("import ctypes, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); "
@@ -394,6 +543,30 @@ class HiddenHolderTests(unittest.TestCase):
             time.sleep(0.01)
         _, uncertain = entry._held_files("/dev/shm", [hidden.pid], group=os.getpgrp())
         self.assertFalse(uncertain)
+
+
+class ForkedChildTests(unittest.TestCase):
+    # T12: SPEC §13.2. A child forked while the entry's SIGTERM handler is in
+    # place (a worker pool) gets the group's SIGTERM too. It is ended by it as
+    # before, and never ends the launch or signals the entry: the launch is
+    # the entry's.
+    def test_a_forked_child_is_ended_by_sigterm_and_leaves_the_launch_alone(self):
+        from unittest import mock
+        from runtime import sglang_entry as entry
+        watch = mock.Mock()
+        ending = entry._LaunchEnd(watch)
+        child = os.fork()
+        if child == 0:  # The forked child never returns into the test runner.
+            ok = False
+            try:
+                calls = []
+                ending._kill = lambda pid, number: calls.append((pid, number))
+                ending._terminated(signal.SIGTERM, None)
+                ok = calls == [(os.getpid(), signal.SIGTERM)] and not watch.mock_calls
+            finally:
+                os._exit(0 if ok else 1)
+        _, status = os.waitpid(child, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
 
 
 if __name__ == "__main__":
