@@ -14,8 +14,8 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use capyctl_domain::resources::{
-    claims_conflict, gib, validate_footprint, LedgerSnapshot, MemoryLimit, PhaseFootprint,
-    ResourcePhase,
+    claims_conflict, gib, local_domain, validate_footprint, LedgerSnapshot, MemoryLimit,
+    PhaseFootprint, ResourcePhase,
 };
 
 use crate::device_choice::{choose_device, DeviceOption};
@@ -69,6 +69,104 @@ pub struct HostCandidate {
     /// `lmcache_unavailable:host_off`, ...), whatever its eligibility now.
     /// The host is refused with that code, never as a generic ineligible one.
     pub gate: Option<&'static str>,
+    /// ADR 0033 §6, ADR 0025 amendment of 2026-10-23: what an operator
+    /// changes when this host's host-KV limit is what refuses the instance.
+    pub host_kv_remedy: HostKvRemedy,
+}
+
+/// Where the host-KV limit that refused an instance is set, and what its
+/// host-KV need is made of, so the refusal names what to change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostKvRemedy {
+    /// Standalone's embedded host: the limit is the standalone setting
+    /// `host.resource_policy.memory.system.host_kv_limit`. Otherwise the
+    /// enrolled host's own `resource_policy.domains.<domain>.host_kv_limit`.
+    pub standalone: bool,
+    /// The need includes the deployment's LMCache pool (`lmcache_pool`).
+    pub lmcache_pool: bool,
+    /// The need includes host-KV bytes the deployment's resources declare.
+    pub declared: bool,
+}
+
+impl HostKvRemedy {
+    /// `raise <setting> or lower <need>`, for the limit on `domain`.
+    fn advice(self, domain: &str) -> String {
+        let raise = if self.standalone {
+            "host.resource_policy.memory.system.host_kv_limit".to_owned()
+        } else {
+            format!(
+                "the host's resource_policy.domains.{}.host_kv_limit",
+                local_domain(domain)
+            )
+        };
+        let lower = match (self.lmcache_pool, self.declared) {
+            (true, true) => "lmcache_pool or the deployment's host_kv_bytes",
+            (true, false) => "lmcache_pool",
+            _ => "the deployment's host_kv_bytes",
+        };
+        format!("raise {raise} or lower {lower}")
+    }
+}
+
+/// ADR 0033 §6: a host-KV limit an instance's need overruns, in bytes: what
+/// the instance needs, what other owners already hold and cannot release,
+/// and the limit, on the ledger domain `domain`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostKvShort {
+    pub domain: String,
+    pub needs: i64,
+    pub held: i64,
+    pub limit: i64,
+}
+
+impl HostKvShort {
+    /// The refusal in the operator's terms, e.g. `host_kv (needs 20.0 GiB,
+    /// limit 12.2 GiB; raise host.resource_policy.memory.system.host_kv_limit
+    /// or lower lmcache_pool)`.
+    pub fn describe(&self, remedy: HostKvRemedy) -> String {
+        let held = if self.held > 0 {
+            format!(", {} already held", gib(self.held))
+        } else {
+            String::new()
+        };
+        format!(
+            "host_kv (needs {}{held}, limit {}; {})",
+            gib(self.needs),
+            gib(self.limit),
+            remedy.advice(&self.domain)
+        )
+    }
+}
+
+/// ADR 0033 §6: the host-KV limit `footprint` overruns on the ledger as it
+/// stands, less the owners `released` would free, or `None` when every
+/// host-KV limit takes it. With several, the one overrun the most.
+pub fn host_kv_short(
+    ledger: &LedgerSnapshot,
+    owner: &str,
+    footprint: &PhaseFootprint,
+    limits: &[MemoryLimit],
+    released: &dyn Fn(&str) -> bool,
+) -> Option<HostKvShort> {
+    limits
+        .iter()
+        .filter_map(|limit| {
+            let max = limit.host_kv_bytes?;
+            let needs = amount(footprint, &limit.domain).1;
+            let held: i64 = ledger
+                .owners
+                .iter()
+                .filter(|(id, _)| id.as_str() != owner && !released(id))
+                .map(|(_, f)| amount(f, &limit.domain).1)
+                .fold(0, i64::saturating_add);
+            (needs > 0 && needs.saturating_add(held) > max).then(|| HostKvShort {
+                domain: limit.domain.clone(),
+                needs,
+                held,
+                limit: max,
+            })
+        })
+        .max_by_key(|s| s.needs.saturating_add(s.held).saturating_sub(s.limit))
 }
 
 /// Why a host cannot take the instance.
@@ -465,10 +563,46 @@ pub fn shortfall(candidate: &HostCandidate, owner: &str) -> Option<String> {
         })
 }
 
+/// ADR 0033 §6: when no managed limit is short but `candidate`'s host-KV
+/// limit cannot take the instance, that limit in the operator's terms (see
+/// [`HostKvShort::describe`]); on a host offering a device choice, only when
+/// no device's footprint fits it. `None` otherwise.
+pub fn host_kv_refusal(candidate: &HostCandidate, owner: &str) -> Option<String> {
+    if shortfall(candidate, owner).is_some() {
+        return None;
+    }
+    let footprints: Vec<&PhaseFootprint> = if candidate.device_options.is_empty() {
+        vec![&candidate.footprint]
+    } else {
+        candidate
+            .device_options
+            .iter()
+            .map(|o| &o.footprint)
+            .collect()
+    };
+    let mut shorts = Vec::with_capacity(footprints.len());
+    for footprint in footprints {
+        shorts.push(host_kv_short(
+            &candidate.ledger,
+            owner,
+            footprint,
+            &candidate.limits,
+            &|_| false,
+        )?);
+    }
+    shorts
+        .into_iter()
+        .min_by_key(|s| s.needs.saturating_add(s.held).saturating_sub(s.limit))
+        .map(|short| short.describe(candidate.host_kv_remedy))
+}
+
 impl Unplaceable {
     /// Each refusing host and its reason, naming the limit for a host that
     /// is short of memory, e.g. `host a needs 64.0 GiB of gpu0 memory,
-    /// 60.8 GiB free of its 60.8 GiB limit`.
+    /// 60.8 GiB free of its 60.8 GiB limit`, or of host-KV room, e.g. `host
+    /// a: insufficient_capacity: host_kv (needs 20.0 GiB, limit 12.2 GiB;
+    /// raise host.resource_policy.memory.system.host_kv_limit or lower
+    /// lmcache_pool)`.
     pub fn detail(&self, candidates: &[HostCandidate], owner: &str) -> String {
         if self.refusals.is_empty() {
             return "no allowed host resolved the deployment's revision".into();
@@ -476,17 +610,53 @@ impl Unplaceable {
         self.refusals
             .iter()
             .map(|(host, refusal)| {
-                let short = (*refusal == HostRefusal::Insufficient)
+                let candidate = (*refusal == HostRefusal::Insufficient)
                     .then(|| candidates.iter().find(|c| &c.host_id == host))
-                    .flatten()
-                    .and_then(|c| shortfall(c, owner));
-                match short {
-                    Some(short) => format!("host {host} {short}"),
+                    .flatten();
+                if let Some(short) = candidate.and_then(|c| shortfall(c, owner)) {
+                    return format!("host {host} {short}");
+                }
+                match candidate.and_then(|c| host_kv_refusal(c, owner)) {
+                    Some(kv) => format!("host {host}: {}: {kv}", refusal.code()),
                     None => format!("host {host}: {}", refusal.code()),
                 }
             })
             .collect::<Vec<_>>()
             .join("; ")
+    }
+
+    /// The closed diagnostic as an instance's `last_error` records it:
+    /// [`Self::code`], followed by the host-KV limit when that limit alone
+    /// refused every host, e.g. `insufficient_capacity: host_kv (needs 20.0
+    /// GiB, limit 12.2 GiB; raise ... or lower lmcache_pool)`.
+    pub fn reason(&self, candidates: &[HostCandidate], owner: &str) -> String {
+        let code = self.code();
+        if code != HostRefusal::Insufficient.code() {
+            return code.into();
+        }
+        let notes: Option<Vec<(&str, String)>> = self
+            .refusals
+            .iter()
+            .map(|(host, _)| {
+                candidates
+                    .iter()
+                    .find(|c| &c.host_id == host)
+                    .and_then(|c| host_kv_refusal(c, owner))
+                    .map(|note| (host.as_str(), note))
+            })
+            .collect();
+        match notes.as_deref() {
+            Some([(_, note)]) => format!("{code}: {note}"),
+            Some(notes) if !notes.is_empty() => format!(
+                "{code}: {}",
+                notes
+                    .iter()
+                    .map(|(host, note)| format!("host {host} {note}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            _ => code.into(),
+        }
     }
 }
 
@@ -548,6 +718,7 @@ mod tests {
             device_options: vec![],
             preferred_device: None,
             gate: None,
+            host_kv_remedy: HostKvRemedy::default(),
         }
     }
 
@@ -571,6 +742,113 @@ mod tests {
             Unplaceable { refusals: vec![] }.detail(&[], "d"),
             "no allowed host resolved the deployment's revision"
         );
+    }
+
+    fn with_host_kv(mut candidate: HostCandidate, need: i64, limit: i64) -> HostCandidate {
+        candidate.footprint.allocations[0].host_kv_bytes = need;
+        candidate.limits[0].host_kv_bytes = Some(limit);
+        candidate
+    }
+
+    // T45 T23 (ADR 0033 §6, ADR 0025 amendment of 2026-10-23): a start the
+    // host-KV limit refuses names that domain, what the instance needs, what
+    // other owners already hold and the limit, and the setting to raise:
+    // standalone's own, or the enrolled host's domain setting. The closed code
+    // is unchanged, and `reason` carries the same words for `last_error`.
+    #[test]
+    fn a_host_kv_refusal_names_the_limit_and_the_setting_to_raise() {
+        let mut standalone =
+            with_host_kv(host("spark", 100 * GIB, 0, &[]), 20 * GIB, 13_066_317_000);
+        standalone.footprint.allocations[0].bytes = 30 * GIB;
+        standalone.host_kv_remedy = HostKvRemedy {
+            standalone: true,
+            lmcache_pool: true,
+            declared: false,
+        };
+        let refused = place(
+            std::slice::from_ref(&standalone),
+            "d",
+            Strategy::Spread,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(refused.code(), "insufficient_capacity");
+        let expected = "host_kv (needs 20.0 GiB, limit 12.2 GiB; raise \
+                        host.resource_policy.memory.system.host_kv_limit or lower lmcache_pool)";
+        assert_eq!(
+            refused.detail(std::slice::from_ref(&standalone), "d"),
+            format!("host spark: insufficient_capacity: {expected}")
+        );
+        assert_eq!(
+            refused.reason(std::slice::from_ref(&standalone), "d"),
+            format!("insufficient_capacity: {expected}")
+        );
+
+        // An enrolled host (ledger keys are host-scoped) where another owner
+        // already holds host-KV room; the need is declared host_kv_bytes.
+        let mut held = footprint(4 * GIB, None);
+        held.allocations[0].host_kv_bytes = 4 * GIB;
+        let mut enrolled = with_host_kv(
+            host("lab", 100 * GIB, 0, &[("other", held)]),
+            10 * GIB,
+            12 * GIB,
+        );
+        let scoped = "host/1:lab/domain/unified";
+        enrolled.footprint.allocations[0].domain = scoped.into();
+        enrolled.limits[0].domain = scoped.into();
+        for f in enrolled.ledger.owners.values_mut() {
+            f.allocations[0].domain = scoped.into();
+        }
+        enrolled.host_kv_remedy.declared = true;
+        let refused = place(
+            std::slice::from_ref(&enrolled),
+            "d",
+            Strategy::Spread,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused.detail(std::slice::from_ref(&enrolled), "d"),
+            "host lab: insufficient_capacity: host_kv (needs 10.0 GiB, 4.0 GiB already held, \
+             limit 12.0 GiB; raise the host's resource_policy.domains.unified.host_kv_limit \
+             or lower the deployment's host_kv_bytes)"
+        );
+
+        // Two hosts the host-KV limit refuses: `reason` names each.
+        let mut other = standalone.clone();
+        other.host_id = "spark-b".into();
+        let both = [standalone.clone(), other];
+        let refused = place(&both, "d", Strategy::Spread, None, None).unwrap_err();
+        assert_eq!(
+            refused.reason(&both, "d"),
+            format!("insufficient_capacity: host spark {expected}; host spark-b {expected}")
+        );
+
+        // Other constraints are unchanged: a managed limit short as well is
+        // named as before, and `reason` is the closed code alone.
+        let mut both_short = standalone.clone();
+        both_short.limits[0].managed_bytes = 15 * GIB;
+        let refused = place(
+            std::slice::from_ref(&both_short),
+            "d",
+            Strategy::Spread,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused.detail(std::slice::from_ref(&both_short), "d"),
+            "host spark needs 30.0 GiB of unified memory, 15.0 GiB free of its 15.0 GiB limit"
+        );
+        assert_eq!(
+            refused.reason(std::slice::from_ref(&both_short), "d"),
+            "insufficient_capacity"
+        );
+        // A host-KV limit with room left refuses nothing on its own account.
+        let roomy = with_host_kv(host("spark", 100 * GIB, 0, &[]), 10 * GIB, 12 * GIB);
+        assert!(place(&[roomy], "d", Strategy::Spread, None, None).is_ok());
     }
 
     // T45 T36 (ADR 0033 §13, ADR 0017): a host a feature gate refuses is
@@ -1142,6 +1420,7 @@ mod group_tests {
             device_options: vec![],
             preferred_device: None,
             gate: None,
+            host_kv_remedy: HostKvRemedy::default(),
         };
         let owners: BTreeMap<String, String> = [("host-a", "m0"), ("host-b", "m1")]
             .map(|(h, o)| (h.to_owned(), o.to_owned()))

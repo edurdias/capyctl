@@ -21,7 +21,7 @@ use crate::resource_ledger::{read_snapshot, scoped_to_domain_hosts};
 use capyctl_config::instances::{Placement, PlacementStrategy};
 use capyctl_domain::resources::MemoryLimit;
 use capyctl_scheduler::device_choice::DeviceOption;
-use capyctl_scheduler::placement::{fits_group, place, HostCandidate, Strategy};
+use capyctl_scheduler::placement::{fits_group, place, HostCandidate, HostKvRemedy, Strategy};
 use std::collections::BTreeSet;
 
 /// Which hosts are eligible now (W12: a live reconciled session, approved
@@ -38,9 +38,27 @@ pub(crate) enum Prepared {
     Running,
     /// The instance was placed and fenced for a fresh start.
     Placed(DeploymentFence),
-    /// No allowed host can take it now; the closed diagnostic, and each
-    /// host's reason naming the limit it hit.
-    Unplaceable(&'static str, String),
+    /// No allowed host can take it now; the closed diagnostic, each host's
+    /// reason naming the limit it hit, and the diagnostic as `last_error`
+    /// records it (the code, naming the host-KV limit when that alone
+    /// refused every host).
+    Unplaceable(&'static str, String, String),
+}
+
+/// [`Prepared::Unplaceable`] for a refusal first judged `code`, as `refused`
+/// (judged again with parked capacity reclaimable) explains it.
+fn unplaced(
+    code: &'static str,
+    refused: &capyctl_scheduler::placement::Unplaceable,
+    hosts: &[HostCandidate],
+    owner: &str,
+) -> Prepared {
+    let reason = if refused.code() == code {
+        refused.reason(hosts, owner)
+    } else {
+        code.to_owned()
+    };
+    Prepared::Unplaceable(code, refused.detail(hosts, owner), reason)
 }
 
 pub(super) fn strategy(placement: &Placement) -> Strategy {
@@ -248,8 +266,31 @@ pub(super) fn candidates(
                 },
             )
         };
+        // ADR 0033 §6, ADR 0025 amendment of 2026-10-23: a refusal by the
+        // host-KV limit names the setting to raise (standalone's own on its
+        // embedded host, the only host not enrolled) and what to lower: the
+        // LMCache pool when the need holds more than the revision declares.
+        let host_kv_remedy = {
+            let kv = |f: &PhaseFootprint| -> i64 {
+                f.allocations
+                    .iter()
+                    .map(|a| a.host_kv_bytes)
+                    .fold(0, i64::saturating_add)
+            };
+            let declared = kv(&super::phase(&e.resources.cold, ResourcePhase::Cold));
+            HostKvRemedy {
+                standalone: !tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM enrolled_hosts WHERE host_id=?1)",
+                    [&host],
+                    |r| r.get::<_, bool>(0),
+                )?,
+                lmcache_pool: kv(&footprint) > declared,
+                declared: declared > 0,
+            }
+        };
         candidates.push(HostCandidate {
             gate,
+            host_kv_remedy,
             device_options,
             preferred_device,
             occupied,
@@ -472,10 +513,7 @@ pub(crate) fn prepare(
             ) {
                 Ok(chosen) => chosen,
                 Err(reclaimed) => {
-                    return Ok(Prepared::Unplaceable(
-                        unplaceable.code(),
-                        reclaimed.detail(&hosts, &owner),
-                    ))
+                    return Ok(unplaced(unplaceable.code(), &reclaimed, &hosts, &owner))
                 }
             }
         }
@@ -601,10 +639,7 @@ fn prepare_group(
                 .and_then(|h| owners.get(h))
                 .cloned()
                 .unwrap_or_default();
-            return Ok(Prepared::Unplaceable(
-                unplaceable.code(),
-                still.detail(&reclaimed, &head),
-            ));
+            return Ok(unplaced(unplaceable.code(), &still, &reclaimed, &head));
         }
     }
     let generation = match generation {
@@ -624,19 +659,25 @@ fn prepare_group(
     }))
 }
 
-/// Record a capacity diagnostic, and keep the start pending until `until`.
+/// Record a capacity diagnostic (`reason`, a closed code with its detail
+/// where it has one), and keep the start pending until `until`.
 pub(crate) fn defer(
     tx: &Transaction<'_>,
     deployment_id: &str,
     instance: u32,
-    code: &str,
+    reason: &str,
     until: Option<i64>,
 ) -> Result<(), LifecycleError> {
     tx.execute(
         "UPDATE deployment_instances SET last_error=?3,
                 pending_start_until_ms=CASE WHEN ?4 IS NULL THEN pending_start_until_ms ELSE ?4 END
           WHERE deployment_id=?1 AND instance_index=?2",
-        params![deployment_id, instance, format!("placement: {code}"), until],
+        params![
+            deployment_id,
+            instance,
+            format!("placement: {reason}"),
+            until
+        ],
     )?;
     Ok(())
 }
@@ -774,7 +815,7 @@ impl crate::Store {
                         }
                     }
                 }
-                Prepared::Unplaceable(code, why) => {
+                Prepared::Unplaceable(code, why, reason) => {
                     blocked = true;
                     detail.get_or_insert(why);
                     needs_empty_host &= code == "startup_requires_empty_host";
@@ -788,7 +829,7 @@ impl crate::Store {
                     };
                     let until = (scope != StartScope::OnDemand).then_some(deadline);
                     if !filling {
-                        defer(tx, deployment_id, instance, code, until)?;
+                        defer(tx, deployment_id, instance, &reason, until)?;
                     }
                 }
             }

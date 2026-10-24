@@ -27,7 +27,7 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 2 | `custom_credential_ref_missing` | A custom engine profile written by hand states no `security.credential_ref`, or a blank one. | Add `credential_ref: "secret://engine-key"` under the profile's `security` ([Custom engines](../operations/configuration.md#custom-engines)). |
 | 2 | `declined` | `capyctl engine add --custom` asked for confirmation and the answer was not `y` or `yes`. Nothing was written. | Run it again and answer `y`, after checking what it prints. |
 | 3 | `unauthorized` | The credentials were refused. | Check the admin token or the host's identity. |
-| 4 | `insufficient_resources` | No host has the GPU memory the deployment needs. The message names each host's limit, for example `host a needs 64.0 GiB of gpu0 memory, 60.8 GiB free of its 60.8 GiB limit`. | Stop or park another deployment, start with `--evict`, or lower the deployment's memory. |
+| 4 | `insufficient_resources` | No host has the GPU memory the deployment needs. The message names each host's limit, for example `host a needs 64.0 GiB of gpu0 memory, 60.8 GiB free of its 60.8 GiB limit`. When the memory is there but the room for KV cache kept in host RAM (an LMCache pool) is not, it says `host_kv` with the numbers and the setting to raise, for example `host spark: insufficient_capacity: host_kv (needs 20.0 GiB, limit 12.2 GiB; raise host.resource_policy.memory.system.host_kv_limit or lower lmcache_pool)`. | Stop or park another deployment, start with `--evict`, or lower the deployment's memory. For `host_kv`, raise the setting it names ([Standalone host-KV limit](../operations/configuration.md#standalone-host-kv-limit); on a machine of several, its document's `resource_policy.domains.<domain>.host_kv_limit`) or lower `lmcache_pool`. |
 | 4 | `insufficient_device_memory` | The card cannot hold the model, or another program holds its memory now. | Use a smaller or quantized checkpoint, a smaller KV cache, or free the card. vLLM needs a card of about 10 GiB or more. |
 | 4 | `device_unobserved` | `nvidia-smi` gave no fresh reading for that GPU, so nothing new starts on it. | Check that `nvidia-smi` works on that machine, then retry. |
 | 4 | `rendezvous_ports_exhausted` | Every rendezvous port of the head machine's range is held by another group. | Stop a group on that machine, or widen `--rendezvous-ports`. |
@@ -223,6 +223,17 @@ of at least 1 GiB or that sits beside `lmcache: off`; an LMCache
 `--kv-transfer-config`, `--enable-lmcache` or `--lmcache-*` in `extra_args`
 (CapyCTL renders these itself); on a machine, `retention: zero` with
 `engine_logs: files`, or an `lmcache` other than `auto` or `off`.
+
+A model whose `lmcache_pool` does not fit the machine's host-KV limit, with
+the pools of the models already running there, is not started: the start
+exits 4 (`insufficient_resources`) and the message says `host_kv`, what the
+model needs, what other models already hold there, the limit and the setting
+to raise, for example
+`host_kv (needs 20.0 GiB, limit 12.2 GiB; raise host.resource_policy.memory.system.host_kv_limit or lower lmcache_pool)`.
+On a machine of several it names that machine's
+`resource_policy.domains.<domain>.host_kv_limit` instead. A second copy of a
+model (`instances`) that waits for that room shows the same words in its
+`LAST ERROR`.
 
 ## Troubleshooting
 

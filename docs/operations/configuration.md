@@ -715,8 +715,13 @@ of each model that uses it. Standalone sets the limit at a tenth of the memory
 it observes (on a discrete-GPU machine, of host RAM): 12.17 GiB on a 128 GB
 GB10. A model is not admitted while its pool, with the pools of the models
 already running, would exceed it, so on that machine no `lmcache_pool` above
-12 GiB fits. Raise the limit with a size or a whole percentage (as with the
-other limits, a percentage is of the memory observed at start):
+12 GiB fits. Such a start exits 4 (`insufficient_resources`) with a message
+that names the limit and this setting:
+`host_kv (needs 20.0 GiB, limit 12.2 GiB; raise host.resource_policy.memory.system.host_kv_limit or lower lmcache_pool)`
+(on a host role, it names that host's
+`resource_policy.domains.<domain>.host_kv_limit`). Raise the limit with a
+size or a whole percentage (as with the other limits, a percentage is of the
+memory observed at start):
 
 ```bash
 capyctl start standalone --set host.resource_policy.memory.system.host_kv_limit=24GiB

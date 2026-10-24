@@ -966,6 +966,87 @@ fn per_launch_hosts_take_other_deployments_but_not_a_second_instance() {
     assert!(t.planned(&fourth).is_empty(), "never over budget");
 }
 
+/// ADR 0033 §6, ADR 0025 amendment of 2026-10-23: a start refused only by
+/// the host-KV limit of enrolled hosts stays `CapacityBlocked`, and its
+/// detail names, for each host, host_kv with what the instance needs, what is
+/// already held and the limit, and the host's own setting to raise.
+// T23 T27
+#[test]
+fn a_host_kv_refusal_on_enrolled_hosts_names_each_hosts_setting() {
+    let (config, mut host) = golden();
+    host["resource_policy"]["domains"]["unified"]["host_kv_limit"] = json!("1536MiB");
+    let t = two_hosts_with((config, host), "32GiB", "shared");
+    for (id, _) in HOSTS {
+        t.sql
+            .execute(
+                "INSERT OR REPLACE INTO host_launch_claims VALUES(?1,'per_launch',1)",
+                [id],
+            )
+            .unwrap();
+    }
+    // One instance on each host holds 1 GiB of its 1.5 GiB host-KV limit.
+    let first = t
+        .deploy(
+            "first",
+            json!({"name": "first", "routes": ["first"], "instances": 2}),
+        )
+        .deployment_id;
+    t.start(&first, "start-first", StartScope::All, None);
+    assert_eq!(t.planned(&first).len(), 2);
+    let second = t
+        .deploy("second", json!({"name": "second", "routes": ["second"]}))
+        .deployment_id;
+    let refused = t.store.accept_scoped_start_command(
+        &t.session,
+        "owner",
+        &second,
+        StartScope::All,
+        t.revision(&second),
+        "start-second",
+        NOW,
+        DEADLINE,
+        None,
+    );
+    let kv = "host_kv (needs 1.0 GiB, 1.0 GiB already held, limit 1.5 GiB; raise the host's \
+              resource_policy.domains.unified.host_kv_limit or lower the deployment's host_kv_bytes)";
+    match refused {
+        Err(capyctl_store::lifecycle::LifecycleError::CapacityBlocked(Some(detail))) => {
+            assert_eq!(
+                detail,
+                format!(
+                    "host host-a: insufficient_capacity: {kv}; \
+                     host host-b: insufficient_capacity: {kv}"
+                )
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(t.planned(&second).is_empty(), "never over budget");
+    // With eviction: nothing READY there to release, so the evicting start's
+    // plan names the same limit on each host.
+    let plan = t
+        .store
+        .plan_start_switch(
+            &t.session,
+            &second,
+            None,
+            &BTreeSet::new(),
+            &|_, _| None,
+            &Default::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        plan,
+        capyctl_store::ordinary_lifecycle::switching::StartSwitchPlan::Impossible {
+            instance: 0,
+            code: "insufficient_capacity".into(),
+            detail: format!(
+                "host host-a: insufficient_capacity: {kv}; host host-b: insufficient_capacity: {kv}"
+            ),
+        }
+    );
+}
+
 /// ADR 0013 §4, §5 (owner decision P1; per-instance host fencing): a host
 /// whose journal fences each instance of a deployment on its own takes a
 /// second instance of the same deployment beside the first, bounded by the

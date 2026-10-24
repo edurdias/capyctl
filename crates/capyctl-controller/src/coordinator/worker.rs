@@ -2258,10 +2258,10 @@ async fn journal_reconciled(
                 "instance_start_placed",
                 format!("deployment {deployment_id}: pending instance {instance} was placed and started"),
             ),
-            Reconciled::Deferred { deployment_id, instance, code } => (
+            Reconciled::Deferred { deployment_id, instance, reason } => (
                 None,
                 "instance_start_deferred",
-                format!("deployment {deployment_id}: instance {instance} fits no allowed host yet ({code})"),
+                format!("deployment {deployment_id}: instance {instance} fits no allowed host yet ({reason})"),
             ),
             Reconciled::Expired { deployment_id, instance } => (
                 None,

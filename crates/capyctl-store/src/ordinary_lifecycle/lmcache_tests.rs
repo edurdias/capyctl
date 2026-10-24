@@ -525,6 +525,68 @@ fn the_pool_counts_against_host_kv_limit() {
     assert!(lab.arm_start(&accepted.step_id, 100).is_err());
 }
 
+// T45 T23 (ADR 0033 §6, ADR 0025 amendment of 2026-10-23): a start the
+// host-KV limit refuses on standalone's embedded host is still
+// `CapacityBlocked`, and its detail names host_kv, what the instance needs,
+// what is already held, the limit, and standalone's setting to raise. An
+// instance deferred for it records the same words in `last_error`.
+#[test]
+fn a_host_kv_refusal_names_the_limit_and_standalones_setting() {
+    use crate::ordinary_lifecycle::placement::StartScope;
+    let lab = Lab::new(|_| {});
+    let start = |id: &str, key: &str| {
+        lab.store.accept_scoped_start_command(
+            &lab.session,
+            "principal",
+            id,
+            StartScope::All,
+            1,
+            key,
+            100,
+            100_100,
+            None,
+        )
+    };
+    let advice = "raise host.resource_policy.memory.system.host_kv_limit \
+                  or lower lmcache_pool or the deployment's host_kv_bytes";
+    // A 12 GiB pool beside the engine's 1 GiB of host KV against 8 GiB.
+    let big = lab.deploy("big", |c| c["lmcache_pool"] = json!("12GiB"));
+    match start(&big.deployment_id, "start-big") {
+        Err(LifecycleError::CapacityBlocked(Some(detail))) => assert_eq!(
+            detail,
+            format!(
+                "host lab: insufficient_capacity: host_kv (needs 13.0 GiB, limit 8.0 GiB; {advice})"
+            )
+        ),
+        other => panic!("{other:?}"),
+    }
+    // Two instances with 4 GiB pools: the first is placed, the second waits
+    // with the limit, its need and what the first already holds.
+    let pair = lab.deploy("pair", |c| {
+        c["lmcache_pool"] = json!("4GiB");
+        c["instances"] = json!(2);
+    });
+    start(&pair.deployment_id, "start-pair").unwrap();
+    let status = lab.store.snapshot().unwrap();
+    let instances = &status
+        .deployments
+        .iter()
+        .find(|d| d.id == pair.deployment_id)
+        .unwrap()
+        .instances;
+    assert_eq!(instances[0].last_error, None);
+    assert_eq!(
+        instances[1].last_error.as_deref(),
+        Some(
+            format!(
+                "placement: insufficient_capacity: host_kv (needs 5.0 GiB, 5.0 GiB already held, \
+                 limit 8.0 GiB; {advice})"
+            )
+            .as_str()
+        )
+    );
+}
+
 // T45 T10 T16: a restart_only launch with LMCache on parks by stopping its
 // engine (explicit park and idle park), parked charge = server charge + the
 // engine KV it keeps mapped; an on-demand wake starts a new engine on the same
