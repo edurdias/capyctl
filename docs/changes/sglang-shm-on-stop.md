@@ -52,22 +52,55 @@ its files stay.
 
 CPU and Fake-engine tests are not qualification.
 
-## Live check still needed (host A, SGLang 0.5.22)
+## Live on host A (2026-10-23, SGLang 0.5.22)
 
-Release build of this branch, standalone role on 38443/37443 with a fresh state
-directory, Qwen3-4B-Instruct on SGLang 0.5.22. Record `ls -la /dev/shm` before the start,
-while serving (the launch's `sglang_loads_*.shm` and any new `sem.mp-*`) and after each
-stop. Stop it three ways: `capyctl stop deployment` while it serves (SGLang drains and
-returns); `capyctl stop deployment` while it loads weights (the entry's own handler);
-and, on `~/sglang-0.5.22-lmcache-venv` with `lmcache: required` and
-`residency: restart_only`, a `capyctl park`, which stops the engine. Then one stop
-through SGLang's SIGQUIT path: SIGKILL the launch's detokenizer (its pid from the
-recorded process group after pid, start ticks and boot id are checked) and let SGLang end
-the rest. Each time: the engine log shows no traceback after SGLang's own lines, the stop
-settles with a verified exit within the 15 s grace (not escalated), the process group is
-empty, and no `/dev/shm` entry the launch made remains, while entries that existed
-before stay. Then one deep park and wake, to show a serving launch keeps its files until
-it stops.
+Release build of `064bbf1d` (this branch rebased on `05eee83b`), standalone on
+38443/37443 with a fresh state directory, Qwen3-4B-Instruct (`context_length: 16384`,
+`kv_cache: 8GiB`). For each case, `/dev/shm` was listed before the start, when the launch
+was up (the new entries, and which launch process maps or holds each one), and after
+the end. The 70 entries already in `/dev/shm` from earlier runs (old `sglang_loads_*`,
+`sem.mp-*`, a `cuda.shm.*` and a `torch_*`) were still there after every case.
+
+| Case | Launch's new entries | How it ended | Group empty | Left behind |
+| --- | --- | --- | --- | --- |
+| Stop while serving (`capyctl stop deployment`, after one chat) | `sem.mp-pac61y7_`, `sglang_loads_1a0c…shm` | SGLang drains, `kill_process_tree … include_parent=False`, `Finished server process`: `launch_server` returned | 2.8 s | none |
+| Stop during weight load: `timeouts.initialize: 35s` ran out with 1 of 3 shards loaded | `sglang_loads_cc44…shm` | CapyCTL ended the start; the receipt says every recorded process was seen gone 0.8 s after the group started exiting; status `failed` (`launch_failed`) | under 1 s | none |
+| `restart_only` park, `~/sglang-0.5.22-lmcache-venv`, `lmcache: required` (LMCache on, 4 GiB pool) | `sem.mp-ha3edrcl`, `sglang_loads_c3dd…shm`, `torch_28618_…_0`, `cuda.shm.3e8.6fca.1` | SGLang drains, `include_parent=False`, `Finished server process`; status `parked` | 2.8 s | `cuda.shm.3e8.6fca.1` (80 KiB, see below) |
+| SIGKILL to the owned `sglang::detokenizer` (pid checked against the entry's recorded pid, start ticks and boot id) | `sem.mp-tuo3vhk4`, `sglang_loads_b7eb…shm` | `detokenizer … crashed with exit code -9. Triggering SIGQUIT`, 5 s wait, `kill_process_tree … include_parent=True`; status `failed` | 6.3 s | none |
+| Deep park, wake by a chat, then stop | `sem.mp-o8cbjwrl`, `sglang_loads_7dae…shm` | Park: `release_memory_occupation` 200, all 4 processes and both entries kept. Wake: chat 200 in 57.9 s (sent while still parking), same entry pid, both entries kept. Stop: SIGTERM, then `detokenizer … exit code -15`, the SIGQUIT path, `include_parent=True` | 6.1 s | none |
+
+Every end settled well inside the 15 s grace. No stop escalated to SIGKILL, and each
+binding was released with `every recorded process observed gone`. Nothing was logged
+after SGLang's own last line. The engine logs have no `FileNotFoundError` and no
+traceback after the end began. Before the end, each request the engine served logged a
+uvicorn access-log `--- Logging error ---` traceback (`TypeError: cannot unpack
+non-iterable NoneType object`). The same tracebacks appear in the 2026-10-22 SGLang 0.5.22
+logs taken before this change, so the change does not cause them.
+
+- **A stop during weight loading is deferred.** A `capyctl stop deployment` sent one
+  second after `Load weight begin` was recorded as `administrative_stop_deferred` and was
+  delivered only when the start reached Ready, 80 s later. The SIGTERM then reached a
+  serving engine, and SGLang took its SIGQUIT path (the scheduler exited -15; a SIGKILL
+  to the entry, intercepted). The group was gone about 7 s after the SIGTERM (the log
+  has whole seconds), and its `sglang_loads_27dc…shm` was removed. So `stop` never
+  reaches the entry's own handler while weights load. The initialize timeout above does
+  reach it. That launch's file is gone, which neither SIGTERM's default action nor a
+  SIGKILL would do (inference: the entry's handler ran; it logs nothing).
+- **LMCache leaves one CUDA IPC file per launch.** The LMCache park case fails the
+  "nothing left" criterion with one file. `cuda.shm.3e8.6fca.1` is named for the
+  launch's scheduler (pid 28618 = 0x6fca). When the entry ended, the LMCache server
+  (pid 28230, CapyCTL-owned, kept through a `restart_only` park) also mapped it, so the
+  entry correctly left it under #185's rule. It was still there after `capyctl stop
+  deployment` ended that server, so nothing removes it. vLLM 0.32.0 with LMCache does the
+  same on host A (a `cuda.shm.*` and a `torch_*` per EngineCore). The leftover is outside
+  this change: neither the entry nor the LMCache server's stop removes it.
+- **Known limit, not exercised:** a stop that the host escalates to SIGKILL after its 15 s
+  grace ends the entry with no chance to clean up, and its files stay.
+
+Evidence: `target/live/live-018/` on the maintainer laptop (`res/b1-…` to `res/b5-…`,
+each with `shm-before/launch/after`, `held-by-launch.txt`, `engine.log`, `poll.txt`,
+`lifecycle-evidence.txt`). This is a live check of one engine version and one model on
+one host.
 
 # Release note: Fixes
 
