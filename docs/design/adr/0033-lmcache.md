@@ -838,7 +838,18 @@ therefore charges, in its parked phase, the server's charge plus the engine's KV
 Each server that had an engine connected also leaves a CUDA driver file,
 `/dev/shm/cuda.shm.<uid>.<pid>.1` (80 KiB, owner-only), after its verified exit; CapyCTL
 removes the stopped server's file. The engine processes leave the same kind of files, as
-they did before this ADR.
+they did before this ADR. Found live on 2026-10-23 (SGLang 0.5.22 and vLLM 0.32.0): with
+the connector on, the engine's scheduler (SGLang) or engine core (vLLM) makes its own
+`cuda.shm.<uid>.<pid>.1`, which the server maps, so the engine's cleanup leaves it and a
+restart-park keeps it until the server stops; vLLM's engine core also makes a
+`torch_<pid>_*` file (80 KiB) that nothing removes. Without LMCache neither is made. After
+each verified stop of a launch with LMCache (a restart-park's engine stop, the server's
+stop, the launch's stop), CapyCTL removes each such file named for an engine process the
+stop proved gone that is still the same file (device and inode), private to the user and
+held by no live process; a file the server still holds after the engine's stop is recorded
+with its holders and removed the same way after that server's verified stop. A role
+restarted between a restart-park and the server's stop has not kept that record and
+leaves those files.
 
 **A6. Decision deployments park with LMCache.** A decision deployment resolves
 `restart_only` (ADR 0030); with LMCache on, it parks as §7 says (the engine stops, the
