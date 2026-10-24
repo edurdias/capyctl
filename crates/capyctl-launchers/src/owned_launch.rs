@@ -38,8 +38,8 @@ pub struct DurableProcessLaunch {
     association: Arc<dyn LaunchAssociation + Send + Sync>,
     /// ADR 0033 §10: how every process of this launch is started.
     policy: SpawnPolicy,
-    /// ADR 0033 (LC1): where the CUDA driver leaves a server's
-    /// `cuda.shm.<uid>.<pid>.1` (`/dev/shm` on a host).
+    /// ADR 0033 (LC1, A5): where the CUDA driver leaves a server's
+    /// `cuda.shm.<uid>.<pid>.1`, and its engines' files (`/dev/shm` on a host).
     shm_root: std::path::PathBuf,
 }
 
@@ -66,8 +66,8 @@ impl DurableProcessLaunch {
         self
     }
 
-    /// Where a stopped LMCache server's CUDA driver file is looked for
-    /// (`/dev/shm`; tests name their own).
+    /// Where a stopped LMCache server's CUDA driver file, and the files its
+    /// engines left to it, are looked for (`/dev/shm`; tests name their own).
     pub fn with_shm_root(mut self, root: std::path::PathBuf) -> Self {
         self.shm_root = root;
         self
@@ -298,7 +298,8 @@ impl OwnedProcessLaunch for DurableProcessLaunch {
                 "a group stop names exactly one owned group of the launch",
             ));
         }
-        self.terminate_escalating(identities, grace).map(drop)
+        // A group stop is only ever an LMCache launch's (ADR 0033 §7).
+        self.terminate_launch(identities, grace, true).map(drop)
     }
 
     fn depart_lmcache(&self, server: &[ProcessIdentity]) -> Result<(), RuntimeError> {
@@ -355,9 +356,25 @@ impl DurableProcessLaunch {
         identities: &[ProcessIdentity],
         grace: Duration,
     ) -> Result<bool, RuntimeError> {
+        let lmcache = identities.iter().any(ProcessIdentity::is_lmcache);
+        self.terminate_launch(identities, grace, lmcache)
+    }
+
+    /// [`Self::terminate_escalating`]; `lmcache` says the identities are an
+    /// LMCache launch's.
+    fn terminate_launch(
+        &self,
+        identities: &[ProcessIdentity],
+        grace: Duration,
+        lmcache: bool,
+    ) -> Result<bool, RuntimeError> {
         let escalated = self.terminate_groups(identities, grace)?;
         // Every recorded identity is proven gone here, and only here.
         self.remove_server_shm(identities);
+        if lmcache {
+            // ADR 0033 A5: and the files its engines left.
+            crate::launch_shm::after_verified_stop(&self.shm_root, identities);
+        }
         Ok(escalated)
     }
 

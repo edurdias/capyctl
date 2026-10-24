@@ -348,8 +348,9 @@ fn touch(path: &Path) {
 // T45 (ADR 0033 §3): one stop of a launch that holds both groups proves every
 // recorded identity gone and both groups empty, children included; then
 // (owner requirement from LC1) the stopped server's CUDA driver file is
-// removed, and nothing else: the engine's file, another uid's file and a
-// symlink in the server group's name stay.
+// removed, and nothing else of the server's: an engine's file others may read
+// (A5 removes only private ones), another uid's file and a symlink in the
+// server group's name stay.
 #[test]
 fn a_launch_stop_proves_both_groups_empty_and_removes_only_the_servers_shm_file() {
     let shm = tempfile::tempdir().unwrap();
@@ -382,6 +383,11 @@ fn a_launch_stop_proves_both_groups_empty_and_removes_only_the_servers_shm_file(
         touch(file);
     }
     std::os::unix::fs::symlink(&target, &member_link).unwrap();
+    std::fs::set_permissions(
+        &engines_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .unwrap();
 
     let all: Vec<ProcessIdentity> = engine_group
         .iter()
@@ -398,7 +404,7 @@ fn a_launch_stop_proves_both_groups_empty_and_removes_only_the_servers_shm_file(
     assert!(!servers_file.exists(), "the server's file is removed");
     assert!(
         engines_file.exists(),
-        "an engine's file is not the server's"
+        "an engine's file others may read stays"
     );
     assert!(
         other_uid_file.exists(),
@@ -437,4 +443,182 @@ fn a_group_stop_stops_one_group_and_leaves_the_other() {
         .stop_group(&server_group, Duration::from_secs(1))
         .unwrap();
     assert_eq!(group_members(&server), 0);
+}
+
+/// A file only this user may read or write, as the CUDA driver and torch make
+/// theirs.
+fn private_file(path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap();
+}
+
+/// `sh` redirections opening each of `files` for reading from descriptor 3 on.
+fn opening(files: &[&Path]) -> String {
+    files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| format!("{}<'{}'", index + 3, file.display()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// T45 T12 (ADR 0033 A5, found live on host A): with LMCache on, an engine
+// process's CUDA driver file (which its LMCache server maps) and a torch file
+// (which vLLM never removes) outlive the engine. One stop of the launch
+// removes each one named for an exited engine process once both groups are
+// proven gone, whether the server held it or not; a file another live
+// process still holds, one others may read and one whose name carries no pid
+// of the launch stay. Before the fix, every one of them stayed.
+#[test]
+fn a_launch_stop_removes_the_files_its_engines_left() {
+    let shm = tempfile::tempdir().unwrap();
+    let tools = DurableProcessLaunch::new(Arc::new(Recorder::default()))
+        .with_shm_root(shm.path().to_path_buf());
+    let tree = command("sleep 60 & exec sleep 60", &[("PATH", "/usr/bin:/bin")]);
+    let api = tools.spawn_durable("inc-held", &tree).unwrap();
+    let engine_group = observed("the engine's worker", 2, || tools.observe_group(&api));
+    let scheduler = engine_group[1].pid;
+    let uid = nix::unistd::geteuid().as_raw();
+    let cuda = shm.path().join(format!("cuda.shm.{uid:x}.{scheduler:x}.1"));
+    let torch = shm.path().join(format!("torch_{scheduler}_2793364754_0"));
+    let shared = shm.path().join(format!("torch_{scheduler}_1_0"));
+    let readable = shm.path().join(format!("torch_{scheduler}_2_0"));
+    let foreign = shm.path().join(format!("cuda.shm.{uid:x}.1.1"));
+    let unheld = shm.path().join(format!("torch_{}_3_0", api.pid));
+    for file in [&cuda, &torch, &shared, &readable, &foreign, &unheld] {
+        private_file(file);
+    }
+    std::fs::set_permissions(
+        &readable,
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .unwrap();
+    let _still_open = std::fs::File::open(&shared).unwrap();
+    let held = opening(&[&cuda, &torch, &shared, &readable, &foreign]);
+    let server = tools
+        .spawn_lmcache(
+            "inc-held",
+            &command(
+                &format!("exec {held}; sleep 60 & exec sleep 60"),
+                &[("PATH", "/usr/bin:/bin")],
+            ),
+        )
+        .unwrap();
+    let server_group = observed("the server's child", 2, || {
+        tools.observe_lmcache_group(&server)
+    });
+
+    let all: Vec<ProcessIdentity> = engine_group
+        .iter()
+        .chain(server_group.iter())
+        .cloned()
+        .collect();
+    tools.terminate_owned(&all, Duration::from_secs(1)).unwrap();
+    assert!(!cuda.exists(), "the engine's CUDA driver file is removed");
+    assert!(!torch.exists(), "the engine's torch file is removed");
+    assert!(!unheld.exists(), "a file the server never held is removed");
+    assert!(shared.exists(), "a file a live process holds stays");
+    assert!(readable.exists(), "a file others may read stays");
+    assert!(foreign.exists(), "a file named for no launch process stays");
+}
+
+// T45 (ADR 0033 A5): only an LMCache launch's stop removes its engines'
+// files; an engine launched without LMCache is stopped as before.
+#[test]
+fn a_stop_without_lmcache_leaves_the_engine_files() {
+    let shm = tempfile::tempdir().unwrap();
+    let tools = DurableProcessLaunch::new(Arc::new(Recorder::default()))
+        .with_shm_root(shm.path().to_path_buf());
+    let tree = command("sleep 60 & exec sleep 60", &[("PATH", "/usr/bin:/bin")]);
+    let api = tools.spawn_durable("inc-plain", &tree).unwrap();
+    let engine_group = observed("the engine's worker", 2, || tools.observe_group(&api));
+    let uid = nix::unistd::geteuid().as_raw();
+    let cuda = shm
+        .path()
+        .join(format!("cuda.shm.{uid:x}.{:x}.1", engine_group[1].pid));
+    private_file(&cuda);
+    tools
+        .terminate_owned(&engine_group, Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(group_members(&api), 0);
+    assert!(cuda.exists(), "a launch without LMCache keeps its files");
+}
+
+// T45 T12 (ADR 0033 §7, A5, found live on host A): a restart-park stops the
+// engine and keeps the server. The engine's file nothing holds is removed at
+// once; the files the server still holds stay, and the server's later
+// verified stop removes them, including one the server let go of before it
+// stopped (as it lets go of an old engine's KV once a woken engine stores),
+// but not a file that replaced one at the same name.
+#[test]
+fn a_parked_engines_files_are_removed_once_its_server_stops() {
+    let shm = tempfile::tempdir().unwrap();
+    let tools = DurableProcessLaunch::new(Arc::new(Recorder::default()))
+        .with_shm_root(shm.path().to_path_buf());
+    let tree = command("sleep 60 & exec sleep 60", &[("PATH", "/usr/bin:/bin")]);
+    let api = tools.spawn_durable("inc-parked", &tree).unwrap();
+    let engine_group = observed("the engine's worker", 2, || tools.observe_group(&api));
+    let scheduler = engine_group[1].pid;
+    let uid = nix::unistd::geteuid().as_raw();
+    let cuda = shm.path().join(format!("cuda.shm.{uid:x}.{scheduler:x}.1"));
+    let released = shm.path().join(format!("torch_{scheduler}_1_0"));
+    let replaced = shm.path().join(format!("torch_{scheduler}_2_0"));
+    let unheld = shm.path().join(format!("torch_{scheduler}_3_0"));
+    for file in [&cuda, &released, &replaced, &unheld] {
+        private_file(file);
+    }
+    // The server's child holds `released` until the test writes to `fifo`
+    // once and closes it.
+    let fifo = shm.path().join("let-go");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+    let held = opening(&[&cuda, &replaced]);
+    let script = format!(
+        "exec {held}; (exec 5<'{}'; exec cat '{}') & exec sleep 60",
+        released.display(),
+        fifo.display()
+    );
+    let server = tools
+        .spawn_lmcache(
+            "inc-parked",
+            &command(&script, &[("PATH", "/usr/bin:/bin")]),
+        )
+        .unwrap();
+    let server_group = observed("the server's child", 2, || {
+        tools.observe_lmcache_group(&server)
+    });
+    let child = server_group[1].pid;
+    wait_for("the server's child to hold its file", || {
+        std::fs::read_link(format!("/proc/{child}/fd/5")).is_ok()
+    });
+
+    tools
+        .stop_group(&engine_group, Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(group_members(&api), 0);
+    assert!(
+        !unheld.exists(),
+        "a file nothing holds is removed at the park"
+    );
+    for file in [&cuda, &released, &replaced] {
+        assert!(file.exists(), "{} is held by the server", file.display());
+    }
+    std::fs::remove_file(&replaced).unwrap();
+    private_file(&replaced);
+    drop(std::fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+    wait_for("the server's child to let go", || {
+        std::fs::read_link(format!("/proc/{child}/fd/5")).is_err()
+    });
+
+    tools
+        .stop_group(&server_group, Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(group_members(&server), 0);
+    assert!(!cuda.exists(), "the parked engine's file is removed");
+    assert!(!released.exists(), "a file the server let go of is removed");
+    assert!(replaced.exists(), "a different file at the same name stays");
 }

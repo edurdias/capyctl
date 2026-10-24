@@ -4,6 +4,8 @@ mod durable;
 pub mod engine_log_relay;
 pub mod exec;
 pub mod group_observation;
+// ADR 0033 A5: the shared memory an LMCache launch's engines leave behind.
+mod launch_shm;
 pub mod native_observation;
 pub mod owned_launch;
 mod ownership;
