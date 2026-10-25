@@ -443,6 +443,21 @@ impl crate::Store {
                     }
                     Ok(source)
                 };
+                // ADR 0035 §1a: under `topology: auto` the host's own row is
+                // the `auto` document's own resolution, which records the
+                // candidate table placement chooses N from (and is the N this
+                // host's cards hold now, on its lowest set); each set of each
+                // size is a choice beside it, resolved as the explicit N.
+                let auto =
+                    instance_spec.local == Some(capyctl_config::topology::LocalTopology::Auto);
+                let own =
+                    || -> Result<(Value, capyctl_config::effective::EffectiveDeployment, bool)> {
+                        let source = recipe(&command)?;
+                        let (mut effective, provisional) =
+                            resolve_for_acceptance(&source, &host.trusted_host)?;
+                        effective.routes.sort();
+                        Ok((source, effective, provisional))
+                    };
                 let mut devices = Vec::new();
                 let (source, effective, provisional) = if choices.len() > 1 {
                     // Final review I7 (design §7): each GPU is judged on its
@@ -475,9 +490,15 @@ impl crate::Store {
                             }
                         }
                     }
-                    let Some((_, source, effective, provisional)) = resolved_on.first().cloned()
-                    else {
-                        return Err(first_error.unwrap_or(ManagedConfigurationError::Invalid));
+                    let (source, effective, provisional) = if auto {
+                        own()?
+                    } else {
+                        let Some((_, source, effective, provisional)) =
+                            resolved_on.first().cloned()
+                        else {
+                            return Err(first_error.unwrap_or(ManagedConfigurationError::Invalid));
+                        };
+                        (source, effective, provisional)
                     };
                     // One checkpoint, one set of facts: every GPU's
                     // resolution is provisional exactly when the host's is.
@@ -489,6 +510,8 @@ impl crate::Store {
                         .map(|(device, source, on_device, _)| (device, source, on_device))
                         .collect();
                     (source, effective, provisional)
+                } else if auto {
+                    own()?
                 } else {
                     let source = recipe(choices.first().map_or(&command, |(_, first)| first))?;
                     let (mut effective, provisional) =

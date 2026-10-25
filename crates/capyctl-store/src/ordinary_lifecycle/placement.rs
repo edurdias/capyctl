@@ -36,8 +36,10 @@ pub(crate) enum Prepared {
     Joined(DeploymentFence),
     /// The instance holds a runtime that is not a start (Ready, stopping).
     Running,
-    /// The instance was placed and fenced for a fresh start.
-    Placed(DeploymentFence),
+    /// The instance was placed and fenced for a fresh start, with the change
+    /// of tensor-parallel size its `topology: auto` journals once the start
+    /// is accepted (ADR 0035 §1a).
+    Placed(DeploymentFence, Option<TopologyChange>),
     /// No allowed host can take it now; the closed diagnostic, each host's
     /// reason naming the limit it hit, and the diagnostic as `last_error`
     /// records it (the code, naming the host-KV limit when that alone
@@ -227,6 +229,26 @@ pub(super) fn candidates(
             super::startup::startup_footprint(tx, deployment_id, revision, &host, &e)?;
         let (device_options, preferred_device) =
             device_options(tx, deployment_id, revision, instance, &host)?;
+        // ADR 0035 §1a: under `topology: auto` this host's N is chosen now,
+        // from its cards' managed limits, and only that N's sets are options.
+        let pick = match e.topology.as_ref().and_then(|t| t.auto.as_ref()) {
+            Some(table) => auto_pick(
+                tx,
+                deployment_id,
+                revision,
+                &e,
+                table,
+                &limits,
+                device_options,
+                preferred_device,
+            )?,
+            None => AutoPick {
+                tensor_parallel: e.local_tensor_parallel(),
+                options: device_options,
+                preferred: preferred_device,
+                refusal: None,
+            },
+        };
         // ADR 0030 §1: a decisions revision is placed only on a host that
         // declared `decisions` (ADR 0017), as its latest session recorded it;
         // the live session's own declaration still gates the launch before
@@ -265,7 +287,16 @@ pub(super) fn candidates(
                     _ => false,
                 },
             )
-        };
+        }
+        .map(|code| (code, None))
+        // ADR 0035 §1a: `topology: auto` refused on this host for its GPUs.
+        .or(pick.refusal)
+        // ADR 0035 §11: a launch on several GPUs goes only to a host that
+        // declared `local_tensor_parallel`; the live session's declaration
+        // still gates it before anything is sent.
+        .or((pick.tensor_parallel > 1
+            && !declared(capyctl_config::topology::LOCAL_TP_CAPABILITY)?)
+        .then_some((capyctl_config::topology::LOCAL_TP_CAPABILITY_MISSING, None)));
         // ADR 0033 §6, ADR 0025 amendment of 2026-10-23: a refusal by the
         // host-KV limit names the setting to raise (standalone's own on its
         // embedded host, the only host not enrolled) and what to lower: the
@@ -289,10 +320,11 @@ pub(super) fn candidates(
             }
         };
         candidates.push(HostCandidate {
-            gate,
+            gate: gate.as_ref().map(|(code, _)| *code),
+            gate_detail: gate.and_then(|(_, detail)| detail),
             host_kv_remedy,
-            device_options,
-            preferred_device,
+            device_options: pick.options,
+            preferred_device: pick.preferred,
             occupied,
             whole_host,
             // ADR 0018 §4: nor while the deployment's profile is retiring on
@@ -315,6 +347,119 @@ pub(super) fn candidates(
         });
     }
     Ok(candidates)
+}
+
+/// ADR 0035 §§1a, 11, 13: the placement refusals of a deployment on several
+/// GPUs of one host, reported with their own code like ADR 0033's gates,
+/// never as a generic capacity block.
+pub(super) const PLACEMENT_REFUSALS: [&str; 4] = [
+    capyctl_config::topology::LOCAL_TP_CAPABILITY_MISSING,
+    capyctl_scheduler::placement::INSUFFICIENT_GPUS,
+    capyctl_scheduler::placement::INSUFFICIENT_DEVICE_MEMORY,
+    "checkpoint_digest_pending",
+];
+
+/// What one host offers an instance once its tensor-parallel size is known.
+struct AutoPick {
+    /// The size it runs at on this host: the revision's own, or (ADR 0035
+    /// §1a) the one `topology: auto` chose here.
+    tensor_parallel: u32,
+    /// The GPU sets of that size the host resolved the revision on.
+    options: Vec<DeviceOption>,
+    /// The instance's last set, when it is one of them.
+    preferred: Option<String>,
+    /// The closed refusal of this host and what it names, when `auto` can
+    /// choose no size here.
+    refusal: Option<(&'static str, Option<String>)>,
+}
+
+/// ADR 0035 §1a: choose N for a `topology: auto` revision on one host (`e`,
+/// the host's own row, carries the candidate table): the smallest candidate
+/// whose per-GPU charge, with the startup peak measured at that N when one
+/// is recorded, every GPU of some set of N identical GPUs holds within its
+/// managed limit now (`limits`, the host's current policy), never its free
+/// memory: a busy card is evicted for at that N, it never pushes N up. Then
+/// only that N's sets are placement options, and the last set only when it
+/// is one of them. Weights not yet measured choose no N: the host is refused
+/// `checkpoint_digest_pending`, the condition an unmeasured checkpoint waits
+/// on (ADR 0014 §7). No size fitting refuses the host
+/// `insufficient_device_memory` or `insufficient_gpus`, naming what would
+/// fit ([`capyctl_config::effective::auto_refusal`]).
+#[allow(clippy::too_many_arguments)]
+fn auto_pick(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    revision: i64,
+    e: &capyctl_config::effective::EffectiveDeployment,
+    table: &capyctl_config::effective::AutoTable,
+    limits: &[MemoryLimit],
+    mut options: Vec<DeviceOption>,
+    preferred: Option<String>,
+) -> Result<AutoPick, LifecycleError> {
+    use capyctl_config::effective::{auto_gpus, auto_refusal, choose_tensor_parallel, AutoChoice};
+    let mut gpus = auto_gpus(&e.host);
+    if gpus.is_empty() {
+        // A unified host has one GPU domain: `auto` is N = 1 there.
+        return Ok(AutoPick {
+            tensor_parallel: 1,
+            options,
+            preferred,
+            refusal: None,
+        });
+    }
+    for gpu in &mut gpus {
+        if let Some(limit) = e
+            .host
+            .devices
+            .get(&gpu.id)
+            .and_then(|device| limits.iter().find(|l| l.domain == device.domain))
+        {
+            gpu.managed_limit = limit.managed_bytes;
+        }
+    }
+    let mut peaks = std::collections::BTreeMap::new();
+    for candidate in &table.candidates {
+        let n = candidate.tensor_parallel;
+        if let Some(peak) = super::startup::measured_device_peak(tx, deployment_id, revision, e, n)?
+        {
+            peaks.insert(n, peak);
+        }
+    }
+    let measured = |n: u32| peaks.get(&n).copied();
+    match choose_tensor_parallel(table, &gpus, &measured) {
+        AutoChoice::Chosen {
+            tensor_parallel, ..
+        } => {
+            if !options.is_empty() {
+                options.retain(|o| o.domains.len() == tensor_parallel as usize);
+            }
+            let preferred = preferred.filter(|p| options.iter().any(|o| &o.device == p));
+            Ok(AutoPick {
+                tensor_parallel,
+                options,
+                preferred,
+                refusal: None,
+            })
+        }
+        AutoChoice::Unmeasured => Ok(AutoPick {
+            tensor_parallel: 1,
+            options,
+            preferred,
+            refusal: Some((
+                "checkpoint_digest_pending",
+                Some("topology: auto chooses its tensor-parallel size once the checkpoint's weights are measured".into()),
+            )),
+        }),
+        AutoChoice::NoFit => {
+            let (code, text) = auto_refusal(table, &gpus, &measured);
+            Ok(AutoPick {
+                tensor_parallel: 1,
+                options,
+                preferred,
+                refusal: Some((code, Some(text))),
+            })
+        }
+    }
 }
 
 /// ADR 0033 §§9, 10: `host`'s `lmcache` and `retention` now: as its current
@@ -367,7 +512,8 @@ pub(super) fn host_lmcache_settings(
 /// run on, each with the startup footprint it resolved to there, and the GPU
 /// it last ran on when that was on this host (ADR 0013 §4 step 5). Empty when
 /// the host offered no GPU choice for the revision (a unified host, a pinned
-/// device, explicit resources).
+/// device, explicit resources). ADR 0035 §2: on several GPUs each option is a
+/// set, keyed by its GPUs in rank order, and the preference is the last set.
 fn device_options(
     tx: &Transaction<'_>,
     deployment_id: &str,
@@ -388,17 +534,16 @@ fn device_options(
     for (device, raw) in rows {
         let on_device =
             decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
-        let domain = on_device
-            .host
-            .devices
-            .get(&device)
-            .map(|policy| policy.domain.clone())
+        let domains = capyctl_config::instances::set_ids(&device)
+            .into_iter()
+            .map(|id| on_device.host.devices.get(id).map(|p| p.domain.clone()))
+            .collect::<Option<Vec<_>>>()
             .ok_or(LifecycleError::CorruptStoredData)?;
         let (footprint, _) =
             super::startup::startup_footprint(tx, deployment_id, revision, host, &on_device)?;
         options.push(DeviceOption {
             device,
-            domain,
+            domains,
             footprint,
         });
     }
@@ -407,7 +552,7 @@ fn device_options(
     }
     let preferred: Option<String> = tx
         .query_row(
-            "SELECT device FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2 AND host_id=?3",
+            "SELECT COALESCE(device_set,device) FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2 AND host_id=?3",
             params![deployment_id, instance, host],
             |r| r.get(0),
         )
@@ -563,9 +708,53 @@ pub(crate) fn prepare(
         }
         _ => draw_generation(tx, deployment_id)?,
     };
+    // ADR 0035 §2: the chosen set in rank order and its size N, beside the
+    // GPU of rank 0 (`device`, the single GPU's key as before). The set's key
+    // is what its frozen revision is kept under on the host.
+    let n = e.local_tensor_parallel();
+    let (device, device_set) = match chosen.device.as_deref() {
+        Some(key) if n > 1 => (
+            capyctl_config::instances::set_ids(key)
+                .first()
+                .map(|id| (*id).to_owned()),
+            Some(key.to_owned()),
+        ),
+        Some(key) => (Some(key.to_owned()), None),
+        None if n > 1 => (
+            None,
+            Some(capyctl_config::instances::set_key(
+                &e.selected_devices
+                    .iter()
+                    .map(|claim| claim.id.clone())
+                    .collect::<Vec<_>>(),
+            )),
+        ),
+        None => (None, None),
+    };
+    // ADR 0035 §1a: a start under `topology: auto` that chose a different N
+    // than the instance's previous start journals both sizes.
+    let (previous, auto): (Option<u32>, bool) = tx.query_row(
+        "SELECT i.tensor_parallel,
+                EXISTS(SELECT 1 FROM host_effective_revisions h
+                        WHERE h.deployment_id=i.deployment_id AND h.revision=?3 AND h.host_id=?4
+                          AND json_type(h.effective_json,'$.topology.auto')='object')
+           FROM deployment_instances i WHERE i.deployment_id=?1 AND i.instance_index=?2",
+        params![deployment_id, instance, current, chosen.host_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let changed = previous
+        .filter(|previous| auto && *previous != n)
+        .map(|previous| TopologyChange {
+            instance,
+            generation,
+            host: chosen.host_id.clone(),
+            previous,
+            chosen: n,
+            devices: e.selected_devices.iter().map(|d| d.id.clone()).collect(),
+        });
     one(tx.execute(
         "UPDATE deployment_instances SET revision=?3,generation=?4,host_id=?5,device_json=?6,device=?7,
-                placed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                device_set=?8,tensor_parallel=?9,placed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
           WHERE deployment_id=?1 AND instance_index=?2",
         params![
             deployment_id,
@@ -574,14 +763,79 @@ pub(crate) fn prepare(
             generation,
             chosen.host_id,
             devices,
-            chosen.device
+            device,
+            device_set,
+            n
         ],
     )?)?;
-    Ok(Prepared::Placed(DeploymentFence {
-        deployment_id: deployment_id.into(),
-        revision: current,
-        generation,
-    }))
+    Ok(Prepared::Placed(
+        DeploymentFence {
+            deployment_id: deployment_id.into(),
+            revision: current,
+            generation,
+        },
+        changed,
+    ))
+}
+
+/// ADR 0035 §1a: an instance under `topology: auto` whose start chose a
+/// tensor-parallel size other than its previous start's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TopologyChange {
+    instance: u32,
+    generation: i64,
+    host: String,
+    previous: u32,
+    chosen: u32,
+    devices: Vec<String>,
+}
+
+impl TopologyChange {
+    /// Journal `topology_auto_changed` on the start `operation` that made the
+    /// choice, with the management event of the same name, in the start's
+    /// own transaction (ADR 0035 §13: an event, no exit code).
+    pub(crate) fn record(
+        &self,
+        tx: &Transaction<'_>,
+        deployment_id: &str,
+        operation: &str,
+    ) -> Result<(), LifecycleError> {
+        let local = |id: &str| {
+            id.rsplit('/')
+                .next()
+                .filter(|_| id.starts_with("host/"))
+                .unwrap_or(id)
+                .to_owned()
+        };
+        let devices: Vec<String> = self.devices.iter().map(|id| local(id)).collect();
+        super::park::journal(
+            tx,
+            operation,
+            "topology_auto_changed",
+            &format!(
+                "deployment {deployment_id}: instance {} under topology: auto chose tensor_parallel {} on host {} ({}), where its previous start chose {}",
+                self.instance,
+                self.chosen,
+                self.host,
+                devices.join(", "),
+                self.previous
+            ),
+        )?;
+        crate::events::append_event(
+            tx,
+            &crate::events::EventMetadata::TopologyAutoChanged {
+                deployment_id: deployment_id.into(),
+                instance_index: self.instance,
+                generation: self.generation,
+                host_id: self.host.clone(),
+                previous_tensor_parallel: self.previous,
+                tensor_parallel: self.chosen,
+                devices,
+            },
+        )
+        .map(drop)
+        .map_err(|_| LifecycleError::CorruptStoredData)
+    }
 }
 
 /// ADR 0028 §5: place group instance `instance` on its named `hosts` (rank
@@ -652,11 +906,14 @@ fn prepare_group(
           WHERE deployment_id=?1 AND instance_index=?2",
         params![deployment_id, instance, revision, generation],
     )?)?;
-    Ok(Prepared::Placed(DeploymentFence {
-        deployment_id: deployment_id.into(),
-        revision,
-        generation,
-    }))
+    Ok(Prepared::Placed(
+        DeploymentFence {
+            deployment_id: deployment_id.into(),
+            revision,
+            generation,
+        },
+        None,
+    ))
 }
 
 /// Record a capacity diagnostic (`reason`, a closed code with its detail
@@ -798,10 +1055,16 @@ impl crate::Store {
                 Prepared::Running => {
                     refusal.get_or_insert(LifecycleError::RuntimeRetained);
                 }
-                Prepared::Placed(fence) => {
+                Prepared::Placed(fence, changed) => {
                     match Self::accept_start_in_transaction(
                         tx, s, &fence, now, deadline, true, None,
-                    ) {
+                    )
+                    .and_then(|start| {
+                        if let Some(changed) = &changed {
+                            changed.record(tx, deployment_id, &start.operation_id)?;
+                        }
+                        Ok(start)
+                    }) {
                         Ok(start) => {
                             first.get_or_insert(start);
                         }
@@ -820,9 +1083,9 @@ impl crate::Store {
                     detail.get_or_insert(why);
                     needs_empty_host &= code == "startup_requires_empty_host";
                     only_ineligible &= code == "host_ineligible";
-                    let gate = capyctl_config::lmcache::PLACEMENT_REFUSALS
-                        .contains(&code)
-                        .then_some(code);
+                    let gate = (capyctl_config::lmcache::PLACEMENT_REFUSALS.contains(&code)
+                        || PLACEMENT_REFUSALS.contains(&code))
+                    .then_some(code);
                     gated = match gated {
                         None => Some(gate),
                         Some(seen) => Some(seen.filter(|_| seen == gate)),

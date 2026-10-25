@@ -1288,11 +1288,17 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
         let ingress = host_config.ingress.as_ref().ok_or_else(denied)?;
         // ADR 0013 §3: the document as scoped to the host this instance was
         // placed on and (ADR 0019) to the GPU placement chose there, which the
-        // frozen launch names as its one selected device.
-        let device = match work.effective().selected_devices.as_slice() {
-            [claim] => Some(claim.id.as_str()),
-            _ => None,
-        };
+        // frozen launch names as its one selected device. ADR 0035 §2: on
+        // several GPUs, to the set it chose, keyed by its GPUs in rank order,
+        // so the host resolves the launch on all N of them.
+        let set: Vec<String> = work
+            .effective()
+            .selected_devices
+            .iter()
+            .map(|claim| claim.id.clone())
+            .collect();
+        let key = (!set.is_empty()).then(|| capyctl_config::instances::set_key(&set));
+        let device = key.as_deref();
         let source = owner
             .store()
             .launch_configuration_source(
@@ -1367,7 +1373,18 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
             // ADR 0014 amendment A16: and the hybrid state slot beside them.
             checkpoint_state_slot_bytes: work.effective().engine_config.memory().state_slot_bytes,
             // ADR 0028 §5: a single-host launch holds the whole checkpoint.
-            checkpoint_layout: None,
+            // ADR 0035 §3: on N GPUs of one host each rank's share is taken
+            // with the checkpoint's layout, as a group member's is, so the
+            // host derives the same per-GPU charge.
+            checkpoint_layout: (work.effective().local_tensor_parallel() > 1)
+                .then(|| {
+                    work.effective()
+                        .engine_config
+                        .memory()
+                        .member
+                        .and_then(|member| member.layout)
+                })
+                .flatten(),
             // ADR 0014 amendment A20: the tables an engine that keeps them on
             // disk was sized without.
             checkpoint_tables: work
