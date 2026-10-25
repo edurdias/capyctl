@@ -57,6 +57,9 @@ pub struct ObservationAccess<'a> {
     /// ADR 0014 amendment A17: the launch parks with its weights resident, so
     /// a released saver map is the KV cache unmapped and the weights mapped.
     pub resident_weights: bool,
+    /// ADR 0035 §9: the launch's ranks, one scheduler per GPU of its device
+    /// list, each enrolling its own saver map; 1 on one GPU.
+    pub ranks: u32,
 }
 
 /// The coordinator supplies this trusted seam. Each call must inspect current
@@ -210,6 +213,8 @@ pub struct SglangAdapter {
     /// decoding): release and resume name the KV cache alone, and the reload
     /// step has nothing to send.
     resident_weights: bool,
+    /// ADR 0035 §9: the frozen launch's tensor-parallel size.
+    ranks: u32,
     /// ADR 0030 §1: the API the deployment serves, which decides how
     /// readiness and the wake canary are proven (§§3, 4). Set by whoever
     /// resolved the deployment; `chat` unless set.
@@ -268,6 +273,7 @@ impl SglangAdapter {
             launched: Mutex::new(None),
             cpu_weight_backup: frozen.settings().cpu_weight_backup,
             resident_weights: frozen.settings().weight_restore == "resident",
+            ranks: metadata.tensor_parallel(),
             api: capyctl_config::effective::DeploymentApi::Chat,
             lmcache: None,
         })
@@ -334,6 +340,7 @@ impl SglangAdapter {
                 inference_key: inference,
                 admin_key: admin,
                 resident_weights: self.resident_weights,
+                ranks: self.ranks,
             }),
             _ => Err(uncertain()),
         }

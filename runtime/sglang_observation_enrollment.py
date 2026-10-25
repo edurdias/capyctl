@@ -42,6 +42,10 @@ WEIGHT_RESTORES = ("disk_reload", "cpu_backup", "resident")
 # ADR 0028 §12 (R12): a group member's topology, `<tp>:<pp>:<nnodes>`, which
 # the saver topology check admits in place of the single-rank pin.
 ENV_GROUP = "CAPYCTL_OBSERVATION_GROUP"
+# ADR 0035 §9: a launch on N GPUs of one host (its plan's N, 2 or more). Each
+# of its N schedulers enrolls its own saver map: rank 0 under the binding's
+# own names, rank r > 0 under `<binding>.rank<r>` (`enrollment_name`).
+ENV_TP = "CAPYCTL_OBSERVATION_TP"
 
 # The live listener, retained for the scheduler process lifetime.
 _ENROLLED = []
@@ -83,9 +87,25 @@ def _group(value):
     return tp, pp, nnodes
 
 
+def _tensor_parallel(value):
+    """N from `ENV_TP`, or raise ValueError."""
+    if (not value.isascii() or not value.isdigit() or value != str(int(value))
+            or not 2 <= int(value) <= 64):
+        raise ValueError()
+    return int(value)
+
+
+def enrollment_name(binding, rank):
+    """ADR 0035 §9: the record and socket name of one scheduler's enrollment:
+    the binding itself for rank 0 (and every launch on one GPU), and
+    `<binding>.rank<r>` for rank r of a launch on several GPUs."""
+    return binding if rank == 0 else "%s.rank%d" % (binding, rank)
+
+
 def _scope():
-    """(dir, binding, incarnation, weight restore, group) from the entry's
-    environment, or None. `group` is None for a single-rank launch."""
+    """(dir, binding, incarnation, weight restore, group, tensor parallel) from
+    the entry's environment, or None. `group` is None for a single-rank
+    launch, `tensor parallel` None for any launch on one GPU."""
     directory = os.environ.get(ENV_DIR)
     scope = os.environ.get(ENV_SCOPE)
     restore = os.environ.get(ENV_RESTORE)
@@ -93,12 +113,16 @@ def _scope():
             or restore not in WEIGHT_RESTORES):
         return None
     group = os.environ.get(ENV_GROUP)
+    tensor_parallel = os.environ.get(ENV_TP)
     try:
         group = None if group is None else _group(group)
+        tensor_parallel = None if tensor_parallel is None else _tensor_parallel(tensor_parallel)
     except ValueError:
         return None
+    if group is not None and tensor_parallel is not None:
+        return None
     binding, incarnation = scope.split(":")
-    return directory, binding, incarnation, restore, group
+    return directory, binding, incarnation, restore, group, tensor_parallel
 
 
 def _preload_library():
@@ -183,7 +207,7 @@ def enroll(scheduler):
         scope = _scope()
         if scope is None:
             return False
-        directory, binding, incarnation, restore, group = scope
+        directory, binding, incarnation, restore, group, tensor_parallel = scope
         from . import sglang_saver_binding as saver
         from . import sglang_saver_residency as residency
         from .sglang_observation_server import SchedulerObservationServer
@@ -193,6 +217,15 @@ def enroll(scheduler):
         args = saver._fields(scheduler).get("server_args")
         if residency.server_arg(args, "enable_memory_saver") is not True:
             return False
+        # ADR 0035 §9: this scheduler's tensor-parallel rank names its
+        # enrollment on a launch on several GPUs; one GPU has rank 0 only.
+        rank = 0
+        if tensor_parallel is not None:
+            stage = "rank"
+            rank = saver._fields(scheduler).get("tp_rank")
+            if type(rank) is not int or not 0 <= rank < tensor_parallel:
+                raise ValueError("rank")
+        name = enrollment_name(binding, rank)
         # The key comes from the launch's admin credential; a group worker,
         # which holds none (ADR 0012), uses its own observation credential
         # (ADR 0028 §12).
@@ -208,17 +241,15 @@ def enroll(scheduler):
             scheduler, binding_id=binding, incarnation_id=incarnation, expected_owner=owner,
             build=build,
             observe=functools.partial(residency.observe_scheduler_saver, weight_restore=restore),
-            topology=(functools.partial(residency.topology, weight_restore=restore)
-                      if group is None else
-                      functools.partial(residency.topology, weight_restore=restore,
-                                        group=group)))
+            topology=functools.partial(residency.topology, weight_restore=restore,
+                                       group=group, tensor_parallel=tensor_parallel))
         stage = "listen"
         server = SchedulerObservationServer.start(
-            path=os.path.join(directory, binding + ".sock"), bridge=bridge, binding_id=binding,
+            path=os.path.join(directory, name + ".sock"), bridge=bridge, binding_id=binding,
             incarnation_id=incarnation, expected_owner=owner, key=key)
         _ENROLLED.append(server)
         stage = "record"
-        _write_record(directory, binding + ".json", {
+        _write_record(directory, name + ".json", {
             "version": 1,
             "binding_id": binding,
             "incarnation_id": incarnation,
@@ -227,7 +258,7 @@ def enroll(scheduler):
             "library_path": path,
             "library_sha256": build.sha256,
             "hook_mode": "preload",
-            "socket": binding + ".sock",
+            "socket": name + ".sock",
         })
         return True
     except Exception as error:
@@ -283,14 +314,16 @@ class ScopeRefused(Exception):
 
 
 def entry_environment(directory, binding, incarnation, weight_restore="disk_reload",
-                      group=None):
+                      group=None, tensor_parallel=None):
     """Validate the host's observation directory and publish the child scope.
 
     Called by the protected entry before `launch_server`; the directory must be
     an absolute, canonical, private (0700, service-owned) directory, and
     `weight_restore` the launch's declared restore. ADR 0028 §12: `group` is a
     group member's (tp, pp, nnodes), published for the topology check; None
-    for a single rank. Returns False (no enrollment) otherwise, and says why on
+    for a single rank. ADR 0035 §9: `tensor_parallel` is a launch on several
+    GPUs' N, published for the topology check and the per-rank enrollment;
+    None on one GPU. Returns False (no enrollment) otherwise, and says why on
     the engine's log (`_refused`, stage `scope`).
 
     The directory's length is not limited: the listener binds and the host
@@ -310,6 +343,14 @@ def entry_environment(directory, binding, incarnation, weight_restore="disk_relo
                 _group(group)
             except ValueError:
                 raise ScopeRefused("group") from None
+        if tensor_parallel is not None:
+            if group is not None or type(tensor_parallel) is not int:
+                raise ScopeRefused("tensor_parallel")
+            tensor_parallel = str(tensor_parallel)
+            try:
+                _tensor_parallel(tensor_parallel)
+            except ValueError:
+                raise ScopeRefused("tensor_parallel") from None
         info = os.stat(directory, follow_symlinks=False)
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
                 or stat.S_IMODE(info.st_mode) != 0o700):
@@ -319,6 +360,8 @@ def entry_environment(directory, binding, incarnation, weight_restore="disk_relo
         os.environ[ENV_RESTORE] = weight_restore
         if group is not None:
             os.environ[ENV_GROUP] = group
+        if tensor_parallel is not None:
+            os.environ[ENV_TP] = tensor_parallel
         return True
     except Exception as error:
         _refused("scope", error)
@@ -330,3 +373,4 @@ def clear_environment():
     os.environ.pop(ENV_SCOPE, None)
     os.environ.pop(ENV_RESTORE, None)
     os.environ.pop(ENV_GROUP, None)
+    os.environ.pop(ENV_TP, None)

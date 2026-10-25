@@ -134,11 +134,17 @@ fn engine_environment(
     // `render_command` rendered (none exist for a single rank, T39).
     // ADR 0033 §3 (A7): a launch with the LMCache connector keeps the
     // telemetry switches `render_command` rendered for it.
+    // ADR 0035 §4: a launch on several GPUs keeps the expected shape
+    // `render_command` rendered for the entry's `tp_drift` check.
     env.retain(|name, _| {
         ENGINE_ENV_ALLOWLIST.contains(&name.as_str())
             || plan.build_env.contains_key(name)
             || (plan.group.is_some()
                 && GROUP_ENV.contains(&name.as_str())
+                && rendered.contains_key(name))
+            || (plan.group.is_none()
+                && plan.tensor_parallel_size > 1
+                && name == crate::vllm::args::TP_EXPECTED_ENV
                 && rendered.contains_key(name))
             || (plan.kv_transfer_config.is_some()
                 && crate::lmcache::NO_USAGE_TRACKING
@@ -662,5 +668,50 @@ mod tests {
                 assert!(!allowed.contains_key(*name), "{name}");
             }
         }
+    }
+
+    // T46 T21 (ADR 0035 §4): a launch on two GPUs of this host spawns with
+    // both GPUs in rank order (UUIDs, or indices in PCI bus order), the
+    // expected shape its entry checks, the loopback pin left to the entry and
+    // no group name or other transport variable; one GPU renders none of it.
+    #[test]
+    fn a_launch_on_two_gpus_spawns_with_its_device_list() {
+        use capyctl_config::effective::CudaNamespace;
+        let mut plan = input(None);
+        plan.tensor_parallel_size = 2;
+        for (namespaces, visible, order) in [
+            (
+                vec![
+                    CudaNamespace::Uuid("GPU-a".into()),
+                    CudaNamespace::Uuid("GPU-b".into()),
+                ],
+                "GPU-a,GPU-b",
+                None,
+            ),
+            (
+                vec![CudaNamespace::PciIndex(2), CudaNamespace::PciIndex(0)],
+                "2,0",
+                Some("PCI_BUS_ID"),
+            ),
+        ] {
+            plan.cuda_namespaces = namespaces;
+            let env = spawned(&plan);
+            assert_eq!(env["CUDA_VISIBLE_DEVICES"], visible);
+            assert_eq!(env.get("CUDA_DEVICE_ORDER").map(String::as_str), order);
+            let expected: serde_json::Value =
+                serde_json::from_str(&env[crate::vllm::args::TP_EXPECTED_ENV]).unwrap();
+            assert_eq!(expected["tensor_parallel_size"], 2);
+            assert_eq!(expected["distributed_executor_backend"], "mp");
+            assert_eq!(
+                expected["devices"],
+                serde_json::json!(visible.split(',').collect::<Vec<_>>())
+            );
+            for name in super::GROUP_ENV {
+                assert!(!env.contains_key(*name), "{name}");
+            }
+            assert_no_transport(&env, None);
+        }
+        let env = spawned(&input(None));
+        assert!(!env.contains_key(crate::vllm::args::TP_EXPECTED_ENV));
     }
 }

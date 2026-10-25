@@ -135,8 +135,10 @@ impl LlamacppBuild {
 }
 
 /// ADR 0029 §6: options CapyCTL renders on every launch (`--mmproj` when the
-/// deployment names a projector). Each row is one llama-server 0.6.0 option
-/// with every long spelling its parser accepts: aliases and negative forms.
+/// deployment names a projector; the layer split, ADR 0029 §6 as amended by
+/// ADR 0035 §4, on a launch on several GPUs only). Each row is one
+/// llama-server 0.6.0 option with every long spelling its parser accepts:
+/// aliases and negative forms.
 pub const RESERVED_RENDERED: &[&[&str]] = &[
     &["--host"],
     &["--port"],
@@ -163,15 +165,21 @@ pub const RESERVED_RENDERED: &[&[&str]] = &[
     &["--cors-headers"],
     &["--cors-credentials", "--no-cors-credentials"],
     &["--mmproj"],
+    // ADR 0035 §4 (owner decision 5): only `--split-mode layer` is rendered;
+    // `row` and `tensor` are never, and no deployment or host passes any.
+    &["--split-mode"],
+    &["--tensor-split"],
+    &["--main-gpu"],
 ];
 
 /// ADR 0029 §6: options CapyCTL never renders and a deployment or host may
 /// not pass: the engine key, its own idle unload, router mode, RPC, slot
 /// files, other listeners and routes, logs (request logging stays off, SPEC
 /// §13.3), model sources and presets (CapyCTL materializes checkpoints, ADR
-/// 0008), the built-in agent surface, the device choice (one GPU, chosen by
-/// CapyCTL, ADR 0019), embedding and reranking (v1 serves chat), and the
-/// options that print and exit.
+/// 0008), the built-in agent surface, the device choice (the GPUs CapyCTL
+/// chose, ADR 0019, ADR 0035 §4: the namespace narrows the engine to them),
+/// embedding and reranking (v1 serves chat), and the options that print and
+/// exit.
 pub const RESERVED_NEVER_RENDERED: &[&[&str]] = &[
     &["--api-key"],
     &["--api-key-file"],
@@ -224,9 +232,6 @@ pub const RESERVED_NEVER_RENDERED: &[&[&str]] = &[
         "--no-webui-mcp-proxy",
     ],
     &["--device"],
-    &["--split-mode"],
-    &["--tensor-split"],
-    &["--main-gpu"],
     &["--spec-draft-device", "--device-draft"],
     &["--mmproj-device"],
     &["--embedding", "--embeddings"],

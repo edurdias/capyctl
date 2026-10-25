@@ -160,6 +160,7 @@ fn frozen_with(endpoint: String, weight_restore: &str) -> NativeLaunch {
             checkpoint_revision: "cdbee75f17c01a7cc42f958dc650907174af0554".into(),
             rendered_settings_digest: "a".repeat(64),
             placement_digest: None,
+            devices: Vec::new(),
             device: capyctl_domain::launch::NativeDeviceSelection {
                 host_id: "host".into(),
                 hardware_fingerprint: "hardware-v1".into(),

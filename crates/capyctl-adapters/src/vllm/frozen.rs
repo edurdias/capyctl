@@ -92,6 +92,11 @@ pub fn park_policy(effective: &EffectiveDeployment) -> ParkPolicy {
 /// The share is the memory request, not the device domain's charge: the
 /// charge also carries the CUDA context and graphs vLLM holds beyond its
 /// utilization budget (ADR 0019), which vLLM must not be told to allocate.
+///
+/// ADR 0035 §4: vLLM applies both the utilization and the KV bytes per rank,
+/// so a launch on several GPUs renders them from one GPU's grant: the memory
+/// request and KV cache are per GPU there, and the stated total is the
+/// smallest chosen card's.
 fn utilization_pct(effective: &EffectiveDeployment, settings: &VllmLaunchSettings) -> u8 {
     match (
         effective.ready_device_allocation(),
@@ -176,9 +181,11 @@ pub fn plan_from_effective(
         port,
         served_model_name,
         // Reserved: tensor and pipeline parallelism come from placement. A
-        // single-rank launch is one rank; a group member takes both from the
-        // group plan through `with_group` (ADR 0028 §10).
-        tensor_parallel_size: 1,
+        // single-rank launch is one rank; ADR 0035 §4: a launch on N GPUs of
+        // this host is N ranks, pipeline 1 (its device list, rank order); a
+        // group member takes both from the group plan through `with_group`
+        // (ADR 0028 §10).
+        tensor_parallel_size: effective.local_tensor_parallel(),
         pipeline_parallel_size: 1,
         // ADR 0014 §2: typed fields render in vLLM's own spelling; an omitted
         // field renders nothing and the engine's default applies.
@@ -253,9 +260,11 @@ pub fn plan_from_effective(
         runtime_dir: Some(runtime_dir),
         // Discrete GPU design §7 (review decision): with a choice of GPU the
         // selected one is always pinned; one that cannot be is refused.
-        cuda_namespace: effective
-            .cuda_namespace()
-            .map_err(|_| VllmPlanError::UnpinnableDevice)?,
+        // ADR 0035 §4: on several GPUs every one, in rank order.
+        cuda_namespaces: effective
+            .cuda_namespaces()
+            .map_err(|_| VllmPlanError::UnpinnableDevice)?
+            .unwrap_or_default(),
         // ADR 0028 §10: single-rank unless `with_group` sets it.
         group: None,
         // ADR 0033: rendered by Initialize once the launch's server is up;

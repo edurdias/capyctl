@@ -32,6 +32,12 @@ from . import sglang_entry
 # ADR 0028 §10: the reserved fields a multi-node group member takes from its
 # descriptor's `group` object instead of the single-rank constants below.
 GROUP_FIELDS = ("tp_size", "pp_size", "nnodes", "node_rank", "dist_init_addr")
+# ADR 0035 §4: the fields a launch on several GPUs of one host pins from its
+# descriptor's device list (tp_size = N, base GPU 0, step 1) beside the
+# constants that keep it one tensor-parallel group of one host; a change
+# SGLang's resolution makes to any is named `tp_drift:<field>`.
+TP_FIELDS = ("tp_size", "base_gpu_id", "gpu_id_step", "dp_size", "pp_size", "ep_size",
+             "enable_dp_attention", "nnodes")
 
 
 class ServerArgsError(Exception):
@@ -42,7 +48,8 @@ class ServerArgsError(Exception):
                         "server_args_construction_failed", "effective_args_mismatch",
                         "invalid_extra_args", "memory_grant_unavailable",
                         "sensitive_option_refused",
-                        *("group_drift:" + name for name in GROUP_FIELDS)):
+                        *("group_drift:" + name for name in GROUP_FIELDS),
+                        *("tp_drift:" + name for name in (*TP_FIELDS, "devices"))):
             code = "effective_args_mismatch"
         super().__init__(code)
         self.code = code
@@ -68,6 +75,9 @@ class ObservedPlacement:
     physical_gpu_uuid: str
     cuda_visible_uuids: tuple
     cuda_index: int
+    # ADR 0035 §4: the device ids of a launch on several GPUs, in rank order,
+    # each rank r on cuda_visible_uuids[r]; empty on one GPU.
+    device_ids: tuple = ()
 
     def __repr__(self):
         return "ObservedPlacement(<local observation>)"
@@ -204,8 +214,19 @@ def _check_placement(public, placement):
         if (type(placement.physical_gpu_uuid) is not str
                 or visible[index] != placement.physical_gpu_uuid):
             raise ValueError()
+        devices = public.get("devices")
+        if devices is None:
+            if placement.device_ids != ():
+                raise ValueError()
     except Exception:
         raise ServerArgsError("placement_mismatch") from None
+    if devices is not None:
+        # ADR 0035 §4: rank r runs on the r-th GPU of the device list, which
+        # the namespace lists in rank order from index 0 (base 0, step 1).
+        wanted = tuple(device.get("device_id") for device in devices)
+        if (placement.device_ids != wanted or index != 0
+                or len(visible) != len(devices)):
+            raise ServerArgsError("tp_drift:devices")
 
 
 def available_memory_bytes(meminfo="/proc/meminfo"):
@@ -381,6 +402,9 @@ class CheckedServerArgs:
     # ADR 0028 §10: the group fields of a multi-node member, whose change is
     # named `group_drift:<field>`; empty for a single rank.
     _group_fields: tuple = field(default=(), repr=False)
+    # ADR 0035 §4: the tensor-parallel fields of a launch on several GPUs of
+    # one host, whose change is named `tp_drift:<field>`; empty otherwise.
+    _tp_fields: tuple = field(default=(), repr=False)
 
     def __repr__(self):
         return "CheckedServerArgs(<private; not launch authority>)"
@@ -397,6 +421,11 @@ class CheckedServerArgs:
             value = resolved.get(key, _MISSING) if type(resolved) is dict else _MISSING
             if type(value) is not type(wanted[key]) or value != wanted[key]:
                 raise ServerArgsError("group_drift:" + key)
+        # ADR 0035 §4: and a tensor-parallel field, as a group's are.
+        for key in self._tp_fields:
+            value = resolved.get(key, _MISSING) if type(resolved) is dict else _MISSING
+            if type(value) is not type(wanted[key]) or value != wanted[key]:
+                raise ServerArgsError("tp_drift:" + key)
         try:
             # SPEC §8.1 / T22: 0.5.20 preserves raw fields; validate the resolved
             # projection consumed by the engine, not constructor declarations.
@@ -495,6 +524,17 @@ def construct_server_args(spec, placement, guarded_constructor, available_bytes=
     group = settings.get("group")
     if group is not None:
         reserved.update({name: group[name] for name in GROUP_FIELDS})
+    # ADR 0035 §4: a launch on several GPUs of one host runs one tensor-
+    # parallel rank per GPU of its descriptor's device list, rank r on the
+    # r-th visible GPU (base 0, step 1); data, pipeline and expert parallel
+    # and DP attention keep their single-host constants (an extra argument
+    # naming any is refused as reserved). The rendezvous stays the loopback
+    # file store (loopback_rendezvous.py), never a group's.
+    devices = public.get("devices")
+    if devices is not None:
+        if group is not None:
+            raise ServerArgsError("invalid_launch_inputs")
+        reserved.update(tp_size=len(devices), base_gpu_id=0)
     keywords = dict(_SAFE_DEFAULTS)
     keywords.update(typed_keywords(settings))
     keywords.update(extra)
@@ -510,6 +550,7 @@ def construct_server_args(spec, placement, guarded_constructor, available_bytes=
         raise ServerArgsError("server_args_construction_failed") from None
     checked = CheckedServerArgs(native, tuple(expected.items()),
                                 settings["cuda_graphs"] is False,
-                                GROUP_FIELDS if group is not None else ())
+                                GROUP_FIELDS if group is not None else (),
+                                TP_FIELDS if devices is not None else ())
     checked.revalidate()
     return checked

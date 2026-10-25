@@ -31,6 +31,7 @@ fn metadata(index: u16) -> NativeLaunchMetadata {
         endpoint: format!("http://127.0.0.1:{}", 20000 + index),
         rendered_settings_digest: "a".repeat(64),
         placement_digest: None,
+        devices: Vec::new(),
         device: capyctl_domain::launch::NativeDeviceSelection {
             host_id: "host-a".into(),
             hardware_fingerprint: "hardware-v1".into(),

@@ -81,38 +81,47 @@ pub fn frozen_from_effective(
         .map(|parsers| (parsers.tool_call.name, parsers.reasoning.name))
         .unwrap_or_default();
     let settings = &settings;
-    // SPEC §3: the launch carries exactly one reviewed logical placement. The
-    // native startup still resolves and corroborates it independently.
-    let [device] = effective.selected_devices.as_slice() else {
+    // SPEC §3: the launch carries its reviewed logical placement: one device,
+    // or (ADR 0035 §4) the GPUs of one host in rank order. The native startup
+    // still resolves and corroborates it independently.
+    if effective.selected_devices.is_empty() {
         return Err(RuntimeError::Uncertain(
-            "initialize work must carry exactly one selected device".into(),
+            "initialize work must carry its selected devices".into(),
         ));
-    };
-    let memory_domain = &effective
-        .host
-        .devices
-        .get(&device.id)
-        .ok_or_else(|| RuntimeError::Uncertain("selected device is not a host device".into()))?
-        .domain;
-    // The service-authorized physical UUID the guarded launcher sets the
-    // child's CUDA namespace from. Absent when the host published no
-    // inventory, which leaves the namespace unset and the placement gate
-    // fail-closed (runtime/sglang_device.py's guarded-service obligation).
-    let physical_gpu_uuid = effective
-        .host
-        .devices
-        .get(&device.id)
-        .and_then(|policy| policy.physical_gpu_uuid.clone());
+    }
     // Discrete GPU design §7 (review decision): with a choice of GPU and no
     // published UUID, the selected GPU is pinned by its PCI-ordered index; one
     // that cannot be pinned either way is refused, never handed every GPU.
-    let cuda_pci_index = match effective
-        .cuda_namespace()
-        .map_err(|_| RuntimeError::Uncertain("the selected GPU cannot be pinned".into()))?
-    {
-        Some(capyctl_config::effective::CudaNamespace::PciIndex(index)) => Some(index),
-        _ => None,
-    };
+    // ADR 0035 §4: on several GPUs, every one by its UUID, or every one by
+    // its index when any UUID is missing.
+    let namespaces = effective
+        .cuda_namespaces()
+        .map_err(|_| RuntimeError::Uncertain("the selected GPU cannot be pinned".into()))?;
+    let mut selections = Vec::with_capacity(effective.selected_devices.len());
+    for (rank, device) in effective.selected_devices.iter().enumerate() {
+        let policy = effective.host.devices.get(&device.id).ok_or_else(|| {
+            RuntimeError::Uncertain("selected device is not a host device".into())
+        })?;
+        // The service-authorized physical UUID the guarded launcher sets the
+        // child's CUDA namespace from. Absent when the host published no
+        // inventory, which leaves the namespace unset and the placement gate
+        // fail-closed (runtime/sglang_device.py's guarded-service obligation).
+        let cuda_pci_index = match namespaces.as_deref().and_then(|list| list.get(rank)) {
+            Some(capyctl_config::effective::CudaNamespace::PciIndex(index)) => Some(*index),
+            _ => None,
+        };
+        selections.push(NativeDeviceSelection {
+            host_id: effective.host.name.clone(),
+            hardware_fingerprint: effective.host.hardware_fingerprint.clone(),
+            device_id: device.id.clone(),
+            memory_domain: policy.domain.clone(),
+            physical_gpu_uuid: policy.physical_gpu_uuid.clone().filter(|_| {
+                // ADR 0035 §4: a list is all UUIDs or all indices.
+                cuda_pci_index.is_none()
+            }),
+            cuda_pci_index,
+        });
+    }
     // SPEC §13.3: a launch needs a directory on disk; an unresolved source is
     // refused rather than invented.
     let checkpoint_root = effective
@@ -150,13 +159,12 @@ pub fn frozen_from_effective(
         // placement against freshly collected inventory. Absent when the host
         // published none, which leaves the gate unasserted and fail-closed.
         placement_digest: effective.host.device_inventory_digest.clone(),
-        device: NativeDeviceSelection {
-            host_id: effective.host.name.clone(),
-            hardware_fingerprint: effective.host.hardware_fingerprint.clone(),
-            device_id: device.id.clone(),
-            memory_domain: memory_domain.clone(),
-            physical_gpu_uuid,
-            cuda_pci_index,
+        device: selections[0].clone(),
+        // ADR 0035 §4: one GPU keeps its descriptor exactly as before.
+        devices: if selections.len() > 1 {
+            selections
+        } else {
+            Vec::new()
         },
     };
     Ok(NativeLaunch::from_frozen_store(

@@ -1698,6 +1698,7 @@ fn restart_only_sglang(endpoint: String) -> capyctl_domain::launch::NativeLaunch
             served_name: "cached".into(),
             rendered_settings_digest: "a".repeat(64),
             placement_digest: None,
+            devices: Vec::new(),
             device: NativeDeviceSelection {
                 host_id: "lab".into(),
                 hardware_fingerprint: "hw-01".into(),

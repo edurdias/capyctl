@@ -1531,6 +1531,21 @@ pub fn resolve_effective_with_checkpoint(
         .map_err(|error| multi_gpu::with_fit_hint(error, &document, host, facts))
 }
 
+/// ADR 0035 §§9, 10: resolve an explicit deployment against `support` in
+/// place of the shipped [`crate::group_support::local_support`] data. A test
+/// seam only: it shows that an engine's `deep_park` flipped is all a deep or
+/// host-backed launch on several GPUs needs to resolve, before the shipped
+/// data flips it.
+#[doc(hidden)]
+pub fn resolve_effective_with_local_support(
+    deployment: &serde_json::Value,
+    host: &serde_json::Value,
+    facts: CheckpointFacts,
+    support: fn(&str) -> Option<crate::group_support::LocalSupport>,
+) -> Result<EffectiveDeployment, ConfigError> {
+    resolve_with_support(deployment, host, facts, Limits::Enforce, support)
+}
+
 /// One resolution of an explicit deployment (no `auto`); with
 /// [`Limits::Ignore`] a charge above a device domain's managed limit is
 /// derived rather than refused (the candidate table, ADR 0035 §1a).
@@ -1539,6 +1554,22 @@ fn resolve_with(
     host: &serde_json::Value,
     facts: CheckpointFacts,
     limits: Limits,
+) -> Result<EffectiveDeployment, ConfigError> {
+    resolve_with_support(
+        deployment,
+        host,
+        facts,
+        limits,
+        crate::group_support::local_support,
+    )
+}
+
+fn resolve_with_support(
+    deployment: &serde_json::Value,
+    host: &serde_json::Value,
+    facts: CheckpointFacts,
+    limits: Limits,
+    support: fn(&str) -> Option<crate::group_support::LocalSupport>,
 ) -> Result<EffectiveDeployment, ConfigError> {
     // Owner decision 2026-09-25 (ADR 0014 amendment): complete a minimal
     // document, first from itself, then from this host. A full document is
@@ -1596,7 +1627,7 @@ fn resolve_with(
     }
     // ADR 0035 §1, §10: the engine's local multi-GPU mode, from its support
     // data, before anything else is resolved.
-    let local_support = crate::group_support::local_support(raw_profile.engine.name());
+    let local_support = support(raw_profile.engine.name());
     if let Some(topology) = local {
         let unsupported = |detail: String| invalid("topology", detail);
         // ADR 0035 owner decision 9: no pipeline parallel on one host.
