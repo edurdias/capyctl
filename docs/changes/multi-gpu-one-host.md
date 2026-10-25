@@ -54,7 +54,11 @@ pin exactly N GPUs, and `topology: auto` lets CapyCTL choose N.
   0.5.22 and the llama.cpp v0.7.0 build, and removes everything it created
   ([its README](../../scripts/live/multi-gpu/README.md)).
 
-Tests (T46): GATE_TOTALS. CPU and Fake-engine tests are not qualification: nothing here has
+Tests (T46), new in `capyctl-config` (`tests/multi_gpu.rs`), `capyctl-store`
+(`tests/multi_gpu_placement.rs`, the v58 migration), `capyctl-scheduler`, `capyctl-domain`
+(`local_tp`), `capyctl-agent`, `capyctl-controller`, `capyctl-router` and `capyctl-protocol`.
+Fast gate (`scripts/ci-local.sh`) on this branch: every step passes, 1678 unit tests, 0
+failed. The deep gate is still owed before merge. CPU and Fake-engine tests are not qualification: nothing here has
 run on two GPUs. The live check still needed is the rented session (ADR 0035 §14): MG1–MG14
 and the bandwidth test; MG4 and MG5 decide whether vLLM's and SGLang's `deep_park` is turned
 on at N > 1, and MG1–MG3, MG6–MG9 and MG13 must pass before the release notes call the
