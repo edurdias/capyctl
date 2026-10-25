@@ -401,11 +401,19 @@ def cmd_events(a):
 
 
 def cmd_charge(a):
+    # The resource ledger: one footprint per owner (instance 0 is the deployment
+    # id, another instance `deployment:<id>/instance:<k>`), its allocations
+    # (domain, bytes, host KV bytes) in the owner's current phase; no row, or no
+    # allocation, is no charge. The `reservations` table is the F1 skeleton and
+    # stays empty.
     ident = deployment_id(a.db, a.name)
     out = {}
-    for r in rows(a.db, "SELECT owner_id,domain_id,bytes,phase FROM reservations "
+    for r in rows(a.db, "SELECT owner_id,footprint_json FROM resource_owners "
                         "WHERE owner_id=? OR owner_id LIKE ?", (ident, f"deployment:{ident}/instance:%")):
-        out.setdefault(r["domain_id"], []).append({"owner": r["owner_id"], "bytes": r["bytes"], "phase": r["phase"]})
+        footprint = json.loads(r["footprint_json"])
+        for domain, nbytes, host_kv in footprint.get("allocations", []):
+            out.setdefault(domain, []).append({"owner": r["owner_id"], "bytes": nbytes, "host_kv_bytes": host_kv,
+                                               "phase": footprint.get("phase")})
     print(json.dumps(out, sort_keys=True))
     return 0
 
