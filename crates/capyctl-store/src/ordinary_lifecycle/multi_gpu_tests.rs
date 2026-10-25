@@ -15,7 +15,7 @@ const GIB: i64 = 1 << 30;
 /// The vLLM golden deployment, its phases derived from a 12 GiB request, on
 /// a host with two identical 41 GiB cards managing 40 GiB beside host RAM;
 /// `patch` adds or replaces fields.
-fn revision(patch: Value) -> EffectiveDeployment {
+pub(super) fn revision(patch: Value) -> EffectiveDeployment {
     let golden: Value = serde_json::from_str(include_str!(
         "../../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
     ))
@@ -51,7 +51,7 @@ fn revision(patch: Value) -> EffectiveDeployment {
 /// two-GPU revision is resolved restart-only and then given the deep tier
 /// and a parked phase on its two GPUs, which is what the residue applies to
 /// once the gate opens.
-fn revisions() -> (EffectiveDeployment, EffectiveDeployment) {
+pub(super) fn revisions() -> (EffectiveDeployment, EffectiveDeployment) {
     let one = revision(json!({"residency": "deep"}));
     let mut two = revision(json!({"residency": "restart_only",
                                   "topology": {"tensor_parallel": 2},
@@ -171,5 +171,82 @@ fn parked_residue_is_read_only_at_its_own_size() {
         residue(&one),
         bytes(&[("gpu0", 3 * GIB)]),
         "N = 2's never charges N = 1"
+    );
+}
+
+// T46 T33 (ADR 0035 §§3, 8; ADR 0014 amendment A13): a parked launch on two
+// GPUs is credited each GPU's own residue: the bytes its processes hold on
+// that GPU, never one process's sum over both GPUs on each. A reading without
+// per-GPU figures (an older host) measures neither GPU of a two-GPU launch,
+// and still measures a one-GPU launch's card as before; a GPU whose reading
+// predates the park is not measured.
+#[test]
+fn parked_residue_is_credited_per_gpu() {
+    use capyctl_domain::resources::{DeviceBytes, MemoryObservation, ProcessResident};
+    let (one, two) = revisions();
+    let resident = |pid: u32, per_gpu: &[(&str, i64)]| {
+        let per_device: Vec<DeviceBytes> = per_gpu
+            .iter()
+            .map(|(device, gib)| DeviceBytes {
+                device: (*device).into(),
+                bytes: (*gib * GIB) as u64,
+            })
+            .collect();
+        let device_bytes = per_gpu.iter().map(|(_, gib)| gib * GIB).sum();
+        ProcessResident {
+            pid,
+            boot_id: "boot".into(),
+            start_ticks: 1,
+            bytes: device_bytes,
+            device_bytes,
+            host_bytes: 0,
+            per_device,
+        }
+    };
+    let read = |domain: &str, at: i64| MemoryObservation {
+        domain: domain.into(),
+        capacity_bytes: 41 * GIB,
+        available_bytes: 30 * GIB,
+        sampled_at_ms: at,
+    };
+    let fresh = [read("gpu0", 100), read("gpu1", 100), read("system", 100)];
+    // Rank 0 holds 2 GiB on gpu0 and a 1 GiB context on gpu1; rank 1 holds
+    // 3 GiB on gpu1.
+    let ranks = [
+        resident(10, &[("gpu0", 2), ("gpu1", 1)]),
+        resident(11, &[("gpu1", 3)]),
+    ];
+    let processes: Vec<&ProcessResident> = ranks.iter().collect();
+    assert_eq!(
+        parked_charge::parked_residue(&two, &fresh, &processes, 100),
+        bytes(&[("gpu0", 2 * GIB), ("gpu1", 4 * GIB)]),
+        "each GPU its own bytes, never 6 GiB on each"
+    );
+    // gpu1's reading predates the park: only gpu0 is measured.
+    let stale = [read("gpu0", 100), read("gpu1", 99)];
+    assert_eq!(
+        parked_charge::parked_residue(&two, &stale, &processes, 100),
+        bytes(&[("gpu0", 2 * GIB)])
+    );
+    // An older host's reading (no per-GPU figures).
+    let older: Vec<ProcessResident> = ranks
+        .iter()
+        .cloned()
+        .map(|mut r| {
+            r.per_device.clear();
+            r
+        })
+        .collect();
+    let older: Vec<&ProcessResident> = older.iter().collect();
+    assert!(parked_charge::parked_residue(&two, &fresh, &older, 100).is_empty());
+    assert_eq!(
+        parked_charge::parked_residue(&one, &fresh, &older[..1], 100),
+        bytes(&[("gpu0", 3 * GIB)]),
+        "one GPU: the whole device figure, as before"
+    );
+    // One GPU with per-GPU figures: only the bytes on its own card.
+    assert_eq!(
+        parked_charge::parked_residue(&one, &fresh, &processes[..1], 100),
+        bytes(&[("gpu0", 2 * GIB)])
     );
 }

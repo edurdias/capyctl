@@ -191,7 +191,8 @@ pub struct CoordinatorOptions {
     /// `switching.drain_timeout`.
     pub stop_drain_timeout: Duration,
     /// ADR 0028 §12 (found live 2026-10-15, MN4): how long a group park's or
-    /// wake's member evidence is awaited after the head's reply.
+    /// wake's member evidence is awaited after the head's reply. ADR 0035 §9:
+    /// and a vLLM launch's per-GPU readings on several GPUs of one host.
     pub group_member_evidence: crate::group_residency::MemberEvidence,
     /// ADR 0033 §§9, 10 (lifecycle design §9): the standalone host started
     /// with `lmcache: off` (`HostOff`) or `retention: zero`
@@ -3242,7 +3243,7 @@ async fn drive_residency(
             return Ok(true);
         }
     }
-    execute_residency(shared, &driver, &work, context, stop).await?;
+    execute_residency(shared, source, &driver, &work, context, stop).await?;
     if work.kind == ResidencyKind::Park {
         measure_parked(shared, source, &work, stop).await;
     }
@@ -3732,6 +3733,7 @@ const PARKED_SAMPLE_RETRY: Duration = Duration::from_secs(3);
 /// Send one armed park or restore exactly once and record what it proved.
 async fn execute_residency(
     shared: &Arc<Shared>,
+    source: &dyn ServiceObservation,
     driver: &Arc<Driver>,
     work: &ResidencyWork,
     context: capyctl_domain::completion::StepExecutionContext,
@@ -3828,26 +3830,41 @@ async fn execute_residency(
                     match after_canary(driver, observation, answered) {
                         Err(reason) => Some((WAKE_UNCERTAIN, reason)),
                         Ok(observation) => {
-                            let step = step.clone();
-                            let completed = shared
-                                .read(move |owner, now| {
-                                    owner.store().complete_residency(
-                                        owner.session(),
-                                        &step,
-                                        &observation,
-                                        now,
-                                    )
-                                })
-                                .await;
-                            match completed {
-                                Ok(()) => None,
-                                Err(error) if !shared.accepting.load(Ordering::Acquire) => {
-                                    return Err(error)
+                            match commit_residency(
+                                shared,
+                                source,
+                                work,
+                                observation,
+                                deadline,
+                                stop,
+                            )
+                            .await?
+                            {
+                                Committed::Done => None,
+                                Committed::Unproven(reason) => Some((WAKE_UNCERTAIN, reason)),
+                                Committed::Stopped => {
+                                    if restore {
+                                        record_wake_failure(
+                                            shared,
+                                            work,
+                                            &canary_context,
+                                            WAKE_UNCERTAIN,
+                                        )
+                                        .await;
+                                    }
+                                    let reason = format!(
+                                        "the controller stopped before every GPU's reading proved the {verb}"
+                                    );
+                                    uncertain(if restore {
+                                        format!("{WAKE_UNCERTAIN}: {reason}")
+                                    } else {
+                                        reason
+                                    })
+                                    .await?;
+                                    return Err(CoordinatorError::Stopped(format!(
+                                        "shutdown during a {verb}"
+                                    )));
                                 }
-                                Err(error) => Some((
-                                    WAKE_UNCERTAIN,
-                                    format!("its evidence was not accepted: {error}"),
-                                )),
                             }
                         }
                     }
@@ -3902,6 +3919,124 @@ async fn execute_residency(
     uncertain(format!("{code}: {reason}")).await?;
     retry_wake_stops(shared).await?;
     Ok(())
+}
+
+/// What committing a park's or wake's evidence came to.
+enum Committed {
+    Done,
+    /// The evidence did not settle the step: it reads uncertain.
+    Unproven(String),
+    /// The controller is stopping.
+    Stopped,
+}
+
+/// Commit a park's or wake's `observation` (the engine's reply, a wake's
+/// after its canary). ADR 0035 §9: a vLLM launch on several GPUs of its host
+/// settles only on a host sample, taken after this, in which every chosen
+/// GPU's bytes held by the launch's processes are at or below that GPU's
+/// parked budget (a park) or above it (a wake). The host is asked again
+/// until a sample proves it or the evidence window passes (the one a group
+/// member's evidence has, within the step's deadline); a GPU never read, or
+/// read on the wrong side of its budget, leaves the step unproven: uncertain,
+/// with every charge kept (AGENTS.md: uncertainty retains accounting).
+async fn commit_residency(
+    shared: &Arc<Shared>,
+    source: &dyn ServiceObservation,
+    work: &ResidencyWork,
+    observation: capyctl_domain::completion::EffectObservation,
+    deadline: tokio::time::Instant,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<Committed, CoordinatorError> {
+    let accepted = |completed: Result<(), CoordinatorError>| match completed {
+        Ok(()) => Ok(Committed::Done),
+        Err(error) if !shared.accepting.load(Ordering::Acquire) => Err(error),
+        Err(error) => Ok(Committed::Unproven(format!(
+            "its evidence was not accepted: {error}"
+        ))),
+    };
+    let step = work.step_id.clone();
+    let evidence = shared
+        .read(move |owner, _| {
+            owner
+                .store()
+                .residency_device_evidence(owner.session(), &step)
+        })
+        .await;
+    let evidence = match evidence {
+        Ok(evidence) => evidence,
+        Err(error) if !shared.accepting.load(Ordering::Acquire) => return Err(error),
+        Err(error) => {
+            return Ok(Committed::Unproven(format!(
+                "its per-GPU evidence could not be read: {error}"
+            )))
+        }
+    };
+    let Some(evidence) = evidence else {
+        let step = work.step_id.clone();
+        let completed = shared
+            .read(move |owner, now| {
+                owner
+                    .store()
+                    .complete_residency(owner.session(), &step, &observation, now)
+            })
+            .await;
+        return accepted(completed);
+    };
+    let timing = shared.options.group_member_evidence;
+    // A host's process sample may predate its report by up to `sample_lag`:
+    // only a reading observed that long after now was sampled after the
+    // engine's reply (and a wake's canary).
+    let not_before = (shared.clock)()?
+        .saturating_add(i64::try_from(timing.sample_lag.as_millis()).unwrap_or(i64::MAX));
+    let until = (tokio::time::Instant::now() + timing.window).min(
+        deadline
+            .checked_sub(crate::group_residency::EVIDENCE_MARGIN)
+            .unwrap_or(deadline),
+    );
+    let mut why = "no GPU was read".to_owned();
+    loop {
+        let sampled = tokio::select! {
+            biased;
+            _ = stop.changed() => return Ok(Committed::Stopped),
+            result = tokio::time::timeout_at(until, source.observe_with_residents(work.host.clone())) => result,
+        };
+        if let Ok(Ok((observed, residents))) = sampled {
+            let now = (shared.clock)()?;
+            match evidence.judge(&observed, &residents, not_before, now) {
+                Ok(_) => {
+                    let step = work.step_id.clone();
+                    let completed = shared
+                        .read(move |owner, now| {
+                            owner.store().complete_residency_on_gpus(
+                                owner.session(),
+                                &step,
+                                &observation,
+                                &capyctl_store::ordinary_lifecycle::park::GpuReadings {
+                                    observations: &observed,
+                                    residents: &residents,
+                                    since_ms: not_before,
+                                },
+                                now,
+                            )
+                        })
+                        .await;
+                    return accepted(completed);
+                }
+                Err(reason) => why = reason,
+            }
+        }
+        let poll = crate::group_residency::MEMBER_EVIDENCE_POLL;
+        if tokio::time::Instant::now() + poll >= until {
+            return Ok(Committed::Unproven(format!(
+                "not every GPU proved it within its evidence window: {why}"
+            )));
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => return Ok(Committed::Stopped),
+            _ = tokio::time::sleep(poll) => {}
+        }
+    }
 }
 
 /// Owner decision 2026-10-09: what a wake's canary proved.

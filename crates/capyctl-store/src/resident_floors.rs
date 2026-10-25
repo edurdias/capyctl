@@ -65,10 +65,16 @@ pub(crate) fn domain_kinds(controls: &ResourceControls) -> BTreeMap<String, Doma
 pub(crate) fn domain_devices(
     policy: &crate::resource_policy::ResourcePolicySnapshot,
 ) -> BTreeMap<String, String> {
-    let scoped =
-        capyctl_config::remote_resources::ledger_key(&policy.context.host_id, "device", "");
-    policy
-        .context
+    domain_devices_of(&policy.context)
+}
+
+/// [`domain_devices`] of one resource context (a policy's, or the one a
+/// revision's host resolves to).
+pub(crate) fn domain_devices_of(
+    context: &capyctl_config::resource_controls::ResourceContext,
+) -> BTreeMap<String, String> {
+    let scoped = capyctl_config::remote_resources::ledger_key(&context.host_id, "device", "");
+    context
         .device_domains
         .iter()
         .map(|(device, domain)| {
@@ -82,7 +88,7 @@ pub(crate) fn domain_devices(
 /// device domain, its bytes on that domain's GPU (`device`), or its whole
 /// device figure when the reading has no per-GPU figures and the owner holds
 /// one device allocation only (`sole_device`).
-fn credited_bytes(
+pub(crate) fn credited_bytes(
     resident: &ProcessResident,
     kind: DomainMemory,
     device: Option<&str>,

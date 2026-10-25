@@ -44,21 +44,29 @@ pin exactly N GPUs, and `topology: auto` lets CapyCTL choose N.
 - **Parking** (§9): vLLM and SGLang deep parking at N > 1 is built on per-GPU evidence and
   ships off in the support data (owner decision 3): until MG4 and MG5 pass, a multi-GPU
   deployment resolves `restart_only` and a stated `deep` or `host_backed` is refused
-  `capability_missing:deep_park`. LMCache is off for N > 1 (`multi_gpu_unqualified`).
+  `capability_missing:deep_park`. With it on, a vLLM park settles only when, after the
+  engine's reply, a host reading of every chosen GPU shows the launch's own processes at or
+  below that GPU's parked charge (above it for a wake), awaited for the group evidence
+  window; a GPU with no fresh reading, a reading without per-GPU figures or a GPU on the
+  wrong side of its charge leaves the step uncertain with every charge kept, and the store
+  refuses to complete such a step on the engine's reply alone. SGLang's host reads each
+  rank's own saver enrollment (`<binding>.rank<r>`, its map on its own GPU) and a park or
+  wake settles only when every rank agrees; a missing or disagreeing rank is unknown. The
+  controller's saver observer judges each device the same way. The parked residue is
+  credited per GPU (each GPU its own bytes, never a process's sum over every GPU). LMCache
+  is off for N > 1 (`multi_gpu_unqualified`).
 - **Docs**: SPEC §7.2, §8.2, §9.1, §9.2, §9.4, §11, §15.1 and §20 (T46, MG1–MG14); ADR 0019,
   0027, 0028 and 0029 amendments; the deploy, parking, errors, engine flags and
   several-machines guides; the install and settings references. AGENTS.md records the rented
   machine's one session and its engine environments.
-- **Live script set**: `scripts/live/multi-gpu/run.sh` runs MG1–MG14 and a download bandwidth
-  test on the rented two-GPU machine in one session, installing only vLLM 0.32.0, SGLang
-  0.5.22 and the llama.cpp v0.7.0 build, and removes everything it created
-  ([its README](../../scripts/live/multi-gpu/README.md)).
-
-**Not yet on this branch (draft):** per-GPU park and wake evidence (§9): the vLLM judgment
-per GPU, SGLang's per-rank saver read on the host and the controller's per-device judgment,
-and the parked residue credited per GPU. Until they land, `deep_park` must stay off at
-N > 1 and MG4–MG6, MG10 and MG13's park must not run. This file is corrected to match when
-they merge.
+- **Live script set**: `scripts/live/multi-gpu/run.sh --ssh <user>@<host>` runs every row,
+  MG1–MG14 and a download bandwidth test, on the rented two-GPU machine in one session,
+  installing only vLLM 0.32.0, SGLang 0.5.22 and the llama.cpp v0.7.0 build; MG4–MG6, MG10
+  and MG13 run on a qualification build with vLLM's and SGLang's `deep_park` at N > 1 turned
+  on (the change MG4 and MG5 make when they pass). At the end it writes `verdict.md` under
+  `target/live/multi-gpu/<run>/` and removes everything it created
+  ([its README](../../scripts/live/multi-gpu/README.md)). `--dry-run` prints the whole plan
+  and checks that this checkout's qualification edit flips exactly those two entries.
 
 Tests (T46), new in `capyctl-config` (`tests/multi_gpu.rs`), `capyctl-store`
 (`tests/multi_gpu_placement.rs`, the v58 migration), `capyctl-scheduler`, `capyctl-domain`

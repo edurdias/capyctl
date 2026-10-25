@@ -189,6 +189,17 @@ build_capyctl() {
     run python3 -c "$QUALIFY_PY" "$MG/src-qualify/crates/capyctl-config/src/group_support.rs"
     run sh -c "cd $MG/src-qualify && PROTOC=$BIN/protoc ${cargo[*]} 2>&1 | tail -n 3 && cp target/release/capyctl $BIN/capyctl-qualify"
   fi
+  # A dry run makes the qualification edit on a copy of this checkout's support
+  # data, so a plan that passes is one whose qualification build turns on deep
+  # parking at N > 1 for vLLM and SGLang (and for nothing else).
+  local support=$HERE/../../../crates/capyctl-config/src/group_support.rs
+  if [ "$PLAN" = 1 ] && [ -f "$support" ]; then
+    cp "$support" "$MG/group_support.rs"
+    python3 -c "$QUALIFY_PY" "$MG/group_support.rs" >/dev/null ||
+      { echo "qualify: this checkout's support data cannot make the qualification build" >&2; exit 1; }
+    show "qualification edit checked on this checkout: $(diff "$support" "$MG/group_support.rs" | grep -c '^>') line(s) set deep_park: true"
+    diff "$support" "$MG/group_support.rs" | grep '^>' | sed -e 's/^>/     +/' >&3
+  fi
   if [ ! -x "$BIN/capyctl-old" ] && [ -d "$MG/src-old" ]; then
     run sh -c "cd $MG/src-old && PROTOC=$BIN/protoc ${cargo[*]} 2>&1 | tail -n 3 && cp target/release/capyctl $BIN/capyctl-old"
   fi

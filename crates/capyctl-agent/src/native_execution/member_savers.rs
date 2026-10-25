@@ -143,21 +143,27 @@ impl NativeHostExecution {
             return None;
         }
         let observed_at = capyctl_protocol::now_unix_ms();
-        let mapped = saver.mapped(&SaverScope {
+        let mapped = saver.mapped_ranks(&SaverScope {
             binding_id: plan.binding_id.clone(),
             incarnation: plan.incarnation.clone(),
             members: Some(members),
             admin_key: hex::encode(keys.admin),
             executable: frozen.executable().into(),
+            // A group member is one rank on this host (ADR 0028 §12).
+            ranks: 1,
         });
         // SPEC §9.2: only a whole map from the approved saver is evidence.
         let facts = saver_facts(&mapped, frozen.settings().weight_restore == "resident")?;
         if !facts.real_saver {
             return None;
         }
+        let bytes = mapped
+            .ok()?
+            .iter()
+            .try_fold(0u64, |sum, m| sum.checked_add(m.mapped_bytes()))?;
         Some(pb::MemberSaver {
             owned_handle: handle.clone(),
-            mapped_bytes: i64::try_from(mapped.ok()?.mapped_bytes()).ok()?,
+            mapped_bytes: i64::try_from(bytes).ok()?,
             observed_at_unix_ms: observed_at,
         })
     }

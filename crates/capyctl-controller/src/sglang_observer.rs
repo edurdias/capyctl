@@ -78,11 +78,17 @@ pub struct NativeResidencyObserver {
     incarnation: String,
     expected_identities: Vec<ProcessIdentity>,
     expected_saver_sha256: String,
+    /// The launch's GPU count, one rank per GPU on CUDA ordinals `0..devices`.
+    devices: u32,
     committed: Arc<dyn CommittedFacts>,
     work: Arc<dyn RegisteredWork>,
     physical: Arc<dyn PhysicalFacts>,
     liveness: Arc<dyn GroupLiveness>,
 }
+
+/// The most GPUs one launch may span. A larger count is not a launch this
+/// observer can judge, so construction refuses it.
+const MAX_DEVICES: u32 = 64;
 
 /// Residency implied by committed milestones since the most recent release.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -115,35 +121,63 @@ fn residency(facts: &[Milestone]) -> Residency {
     r
 }
 
-/// Bytes the saver currently has mapped for a tag. Paused allocations are mapped
-/// in the saver's table but hold no device memory, so they are not residency.
-///
-/// Summing across devices is only sound for a single-device runtime. Under tensor
-/// parallelism a non-zero sum can mean one rank restored while another stayed dark,
-/// which would report residency that does not exist. `single_device` gates that, so
-/// multi-rank runtimes fail closed until per-rank evidence is implemented.
-fn mapped(facts: &AllocationFacts, tag: AllocationTag) -> u64 {
-    facts
-        .allocations
-        .groups
-        .iter()
-        .filter(|g| g.tag == tag)
-        .map(|g| g.mapped_bytes)
-        .sum()
+/// Bytes the saver currently has mapped on one device. Paused allocations are
+/// mapped in the saver's table but hold no device memory, so they are not
+/// residency.
+#[derive(Clone, Copy, Debug, Default)]
+struct DeviceMapped {
+    weights: u64,
+    cache: u64,
+    seen: bool,
 }
 
-/// The pinned recipe is TP=1, DP=1. A runtime spanning several devices needs
-/// per-rank release and restore evidence that neither this observer nor the
-/// engine's control replies currently provide, so it is reported as unknown.
-fn single_device(facts: &AllocationFacts) -> bool {
-    facts
-        .allocations
-        .groups
-        .iter()
-        .map(|g| g.device)
-        .collect::<std::collections::BTreeSet<_>>()
-        .len()
-        <= 1
+impl DeviceMapped {
+    fn add(&mut self, tag: &AllocationTag, bytes: u64) {
+        match tag {
+            AllocationTag::Weights => self.weights += bytes,
+            AllocationTag::KvCache => self.cache += bytes,
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.weights > 0 || self.cache > 0
+    }
+}
+
+/// Mapped bytes per device, and whether the map covers exactly the launch's
+/// devices.
+///
+/// ADR 0035 §9: summing across devices is unsound under tensor parallelism, since
+/// a non-zero sum can mean one rank restored while another stayed dark. Each rank
+/// runs on CUDA ordinal `r` of the launch's own GPUs, so the devices in the map
+/// must be exactly `0..devices`: a missing device is unread evidence and an extra
+/// one is not this launch's, and both report unknown.
+///
+/// One device keeps the rule that predates ADR 0035 unchanged: the map may name at
+/// most one device, whatever its ordinal, and an empty map reads as nothing mapped.
+fn mapped(facts: &AllocationFacts, devices: u32) -> (Vec<DeviceMapped>, bool) {
+    let groups = &facts.allocations.groups;
+    if devices == 1 {
+        let mut only = DeviceMapped::default();
+        for g in groups {
+            only.add(&g.tag, g.mapped_bytes);
+        }
+        let one = groups.iter().all(|g| g.device == groups[0].device);
+        return (vec![only], one);
+    }
+    let mut per = vec![DeviceMapped::default(); devices as usize];
+    let mut complete = true;
+    for g in groups {
+        match usize::try_from(g.device).ok().and_then(|i| per.get_mut(i)) {
+            Some(device) => {
+                device.seen = true;
+                device.add(&g.tag, g.mapped_bytes);
+            }
+            None => complete = false,
+        }
+    }
+    complete &= per.iter().all(|d| d.seen);
+    (per, complete)
 }
 
 impl NativeResidencyObserver {
@@ -154,6 +188,7 @@ impl NativeResidencyObserver {
         incarnation: String,
         expected_identities: Vec<ProcessIdentity>,
         expected_saver_sha256: String,
+        devices: u32,
         committed: Arc<dyn CommittedFacts>,
         work: Arc<dyn RegisteredWork>,
         physical: Arc<dyn PhysicalFacts>,
@@ -166,6 +201,8 @@ impl NativeResidencyObserver {
             || !expected_saver_sha256
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || devices == 0
+            || devices > MAX_DEVICES
         {
             return Err(RuntimeError::Unsupported);
         }
@@ -175,6 +212,7 @@ impl NativeResidencyObserver {
             incarnation,
             expected_identities,
             expected_saver_sha256,
+            devices,
             committed,
             work,
             physical,
@@ -205,22 +243,30 @@ impl NativeResidencyObserver {
                 note(false);
             }
             note(observed.library_sha256 == self.expected_saver_sha256);
-            note(single_device(observed));
-            let weight_bytes = mapped(observed, AllocationTag::Weights);
-            let cache_bytes = mapped(observed, AllocationTag::KvCache);
-            let any = weight_bytes > 0 || cache_bytes > 0;
-            if residency.allocations != any {
+            // ADR 0035 §9: the committed residency must agree with every device.
+            // A park settles only when every device is unmapped, a wake only when
+            // every device is mapped; any device missing or disagreeing is unknown.
+            let (per_device, complete) = mapped(observed, self.devices);
+            note(complete);
+            let every = per_device.iter().all(DeviceMapped::any);
+            let some = per_device.iter().any(DeviceMapped::any);
+            if every != some {
                 note(false);
             }
-            allocations = residency.allocations && any;
+            if residency.allocations != every {
+                note(false);
+            }
+            allocations = residency.allocations && every;
             // Contents are never physically provable; the committed milestone is
             // authoritative and the mapping is only a necessary condition.
-            weights = residency.weights && weight_bytes > 0;
-            cache = residency.cache && cache_bytes > 0;
-            if residency.weights && weight_bytes == 0 {
+            let all_weights = per_device.iter().all(|d| d.weights > 0);
+            let all_cache = per_device.iter().all(|d| d.cache > 0);
+            weights = residency.weights && all_weights;
+            cache = residency.cache && all_cache;
+            if residency.weights && !all_weights {
                 note(false);
             }
-            if residency.cache && cache_bytes == 0 {
+            if residency.cache && !all_cache {
                 note(false);
             }
         }

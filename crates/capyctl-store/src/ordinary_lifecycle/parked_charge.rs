@@ -211,6 +211,62 @@ pub(super) fn member_residue(e: &EffectiveDeployment, device_bytes: i64, bytes: 
         .collect()
 }
 
+/// ADR 0014 amendment A13, ADR 0035 §§3, 8: what the launch's `processes`
+/// hold on each domain of `e`'s parked phase that holds the engine's device
+/// memory, from a sample whose reading of that domain was taken at or after
+/// `since_ms`. On a `device` domain only the bytes on that domain's own GPU
+/// count: a launch on several GPUs is credited each GPU's own residue, never
+/// one process's sum over every GPU (`resident_floors::credited_bytes`, the
+/// rule resident floors use). A reading without per-GPU figures (an older
+/// host) counts only toward a launch on one GPU, as before. The whole figure
+/// counts on a unified pool.
+pub(super) fn parked_residue(
+    e: &EffectiveDeployment,
+    observations: &[MemoryObservation],
+    processes: &[&ProcessResident],
+    since_ms: i64,
+) -> Measured {
+    let devices = crate::resident_floors::domain_devices_of(
+        &capyctl_config::resource_controls::ResourceContext::from_host(&e.host),
+    );
+    let sole_device = e
+        .resources
+        .parked
+        .allocations
+        .iter()
+        .filter(|a| kind(e, &a.domain) == Some(DomainMemory::Device))
+        .count()
+        == 1;
+    let mut residue = Measured::new();
+    for allocation in &e.resources.parked.allocations {
+        let Some(kind) = kind(e, &allocation.domain) else {
+            continue;
+        };
+        if !matches!(kind, DomainMemory::Device | DomainMemory::Unified) {
+            continue;
+        }
+        let fresh = observations
+            .iter()
+            .any(|o| o.domain == allocation.domain && o.sampled_at_ms >= since_ms);
+        if !fresh {
+            continue;
+        }
+        let device = devices.get(&allocation.domain).map(String::as_str);
+        let bytes = processes.iter().try_fold(0_i64, |sum, r| {
+            sum.checked_add(crate::resident_floors::credited_bytes(
+                r,
+                kind,
+                device,
+                sole_device,
+            ))
+        });
+        if let Some(bytes) = bytes.filter(|b| *b > 0) {
+            residue.insert(allocation.domain.clone(), bytes);
+        }
+    }
+    residue
+}
+
 /// ADR 0014 amendments A13, A19: record `residue`, measured after the park
 /// step `step_id` of the launch at `generation` of `instance` resolved as `e`
 /// on its host: the revision's residue there (the largest recorded is kept)
@@ -573,30 +629,7 @@ impl crate::Store {
         if processes.is_empty() {
             return Ok(false);
         }
-        let mut residue = Measured::new();
-        for allocation in &e.resources.parked.allocations {
-            let Some(kind) = kind(&e, &allocation.domain) else {
-                continue;
-            };
-            if !matches!(kind, DomainMemory::Device | DomainMemory::Unified) {
-                continue;
-            }
-            let fresh = observations
-                .iter()
-                .any(|o| o.domain == allocation.domain && o.sampled_at_ms >= since_ms);
-            if !fresh {
-                continue;
-            }
-            let bytes = processes.iter().try_fold(0_i64, |sum, r| {
-                sum.checked_add(match kind {
-                    DomainMemory::Device => r.device_bytes,
-                    _ => r.bytes,
-                })
-            });
-            if let Some(bytes) = bytes.filter(|b| *b > 0) {
-                residue.insert(allocation.domain.clone(), bytes);
-            }
-        }
+        let residue = parked_residue(&e, observations, &processes, since_ms);
         if residue.is_empty() {
             return Ok(false);
         }

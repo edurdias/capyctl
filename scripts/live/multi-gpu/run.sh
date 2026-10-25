@@ -81,7 +81,8 @@ if [ "$DRY" = 1 ]; then
   step "dry run: the plan of every host phase, printed by remote.sh plan on this machine"
   PLANDIR=$(mktemp -d "${XDG_CACHE_HOME:-$HOME/.cache}/capyctl-mg-plan.XXXXXX")
   printf 'ONLY=%q\nSTALL=%q\nCYCLES=%q\nHB_CYCLES=%q\nPORT=%q\nMPORT=%q\n' "$ONLY" "$STALL" "$CYCLES" "$HB_CYCLES" "$PORT" "$MPORT" >"$PLANDIR/mg.env"
-  MG=$PLANDIR bash "$HERE/remote.sh" plan | sed -e "s#$PLANDIR#~/mg#g" -e "s#${PLANDIR/#$HOME/\~}#~/mg#g"
+  MG=$PLANDIR bash "$HERE/remote.sh" plan | sed -e "s#$PLANDIR#~/mg#g" -e "s#${PLANDIR/#$HOME/\~}#~/mg#g" ||
+    { rm -rf "$PLANDIR"; echo "dry run: the plan failed" >&2; exit 1; }
   rm -rf "$PLANDIR"
 fi
 

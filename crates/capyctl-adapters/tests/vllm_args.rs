@@ -315,6 +315,11 @@ fn render_emits_the_reserved_launch_settings() {
     let mut p = plan();
     p.tensor_parallel_size = 2;
     p.pipeline_parallel_size = 1;
+    // ADR 0035 §4: a launch on two GPUs of one host names both, in rank order.
+    p.cuda_namespaces = vec![
+        capyctl_config::effective::CudaNamespace::PciIndex(0),
+        capyctl_config::effective::CudaNamespace::PciIndex(1),
+    ];
     p.cpu_offload_bytes = 4 * 1024 * 1024 * 1024;
     let cmd = render_command(&p).unwrap();
     assert_flag(&cmd, "--tensor-parallel-size", "2");
