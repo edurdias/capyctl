@@ -461,8 +461,8 @@ PY
   check "$row" listeners "no recorded process of the launch listens off 127.0.0.1/::1, by /proc and by ss -ltnp alike; status shows collectives: loopback"
   if [ "$PLAN" = 0 ]; then
     lis=$("${HELPER[@]}" listeners --pids "$pids"); echo "$lis" >"$RES/$row-listeners.json"
-    coll=$("${HELPER[@]}" find "$RES/$row-status.json" collectives | head -1 | tr -d '"')
-    tp=$("${HELPER[@]}" find "$RES/$row-status.json" tensor_parallel | head -1)
+    coll=$("${HELPER[@]}" get "$RES/$row-status.json" 'instances[0].collectives')
+    tp=$("${HELPER[@]}" get "$RES/$row-status.json" 'instances[0].topology.tensor_parallel')
     r=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["off_loopback"]), len(d["ss_off_loopback"]), len(d["proc"]))' "$RES/$row-listeners.json")
     read -r off ssoff total <<<"$r"
     if [ "$off" = 0 ] && [ "$ssoff" = 0 ] && [ "$coll" = loopback ] && [ "$tp" = 2 ]; then
@@ -471,11 +471,12 @@ PY
       result "$row" listeners fail "off loopback: proc $off, ss $ssoff; collectives '${coll}'; tensor_parallel '${tp}'"
     fi
   fi
-  check "$row" peaks "the role recorded a per-GPU startup peak and the host RAM figure for this revision at N = 2 (status / ledger)"
+  check "$row" peaks "after the start the role holds a measured startup figure for this revision (status startup.measured; per GPU at N = 2, ADR 0035 §3)"
   if [ "$PLAN" = 0 ]; then
-    "${HELPER[@]}" find "$RES/$row-status.json" startup_peak >"$RES/$row-peaks.json"
-    if [ -s "$RES/$row-peaks.json" ]; then result "$row" peaks pass "$(tr '\n' ' ' <"$RES/$row-peaks.json" | cut -c1-300)"
-    else result "$row" peaks fail "no startup_peak in status"; fi
+    "${HELPER[@]}" get "$RES/$row-status.json" startup >"$RES/$row-peaks.json"
+    if [ "$("${HELPER[@]}" get "$RES/$row-status.json" 'startup.measured[0]')" != "" ]; then
+      result "$row" peaks pass "$(tr '\n' ' ' <"$RES/$row-peaks.json" | cut -c1-300)"
+    else result "$row" peaks fail "no measured startup figure in status: $(cut -c1-200 "$RES/$row-peaks.json")"; fi
   fi
   [ "$e" = lc ] || return 0
   check "$row" fit "llama.cpp's per-device model buffers each fit that GPU's grant; both CUDA0 and CUDA1 hold a part"
@@ -872,7 +873,7 @@ engine_config: {context_length: 32768}"
       b=$(latest_args vllm)
       status_json mg13-4b "$RES/mg13-4b.json"; c status deployment mg13-4b >"$RES/mg13-4b.txt" 2>&1
       if [ "$PLAN" = 0 ]; then
-        tp=$("${HELPER[@]}" find "$RES/mg13-4b.json" tensor_parallel | head -1)
+        tp=$("${HELPER[@]}" get "$RES/mg13-4b.json" 'instances[0].topology.tensor_parallel')
         txt=$(grep -c 'TP auto (1)' "$RES/mg13-4b.txt")
         [ "$tp" = 1 ] && [ "$txt" -gt 0 ] && [ "$a" = "$b" ] && [ -n "$a" ] &&
           result MG13 n1 pass "tensor_parallel 1; 'TP auto (1)'; arguments equal" ||
@@ -883,8 +884,8 @@ engine_config: {context_length: 32768}"
       status_json mg13-30b "$RES/mg13-30b.json"; c status deployment mg13-30b >"$RES/mg13-30b.txt" 2>&1
       b=$(latest_args sglang)
       if [ "$PLAN" = 0 ]; then
-        tp=$("${HELPER[@]}" find "$RES/mg13-30b.json" tensor_parallel | head -1)
-        devs=$("${HELPER[@]}" find "$RES/mg13-30b.json" devices | head -1)
+        tp=$("${HELPER[@]}" get "$RES/mg13-30b.json" 'instances[0].topology.tensor_parallel')
+        devs=$("${HELPER[@]}" get "$RES/mg13-30b.json" 'instances[0].topology.devices')
         a=$(cat "$RES/mg9-sglang-args.json" 2>/dev/null)
         st=$(state_of mg13-4b)
         [ "$tp" = 2 ] && grep -q 'TP auto (2)' "$RES/mg13-30b.txt" && [ "$st" != ready ] && { [ -z "$a" ] || [ "$a" = "$b" ]; } &&
@@ -897,8 +898,8 @@ engine_config: {context_length: 32768}"
       c start deployment mg13-30b --wait >>"$RES/cli.log" 2>&1
       status_json mg13-30b "$RES/mg13-30b-woken.json"
       if [ "$PLAN" = 0 ]; then
-        devs2=$("${HELPER[@]}" find "$RES/mg13-30b-woken.json" devices | head -1)
-        tp=$("${HELPER[@]}" find "$RES/mg13-30b-woken.json" tensor_parallel | head -1)
+        devs2=$("${HELPER[@]}" get "$RES/mg13-30b-woken.json" 'instances[0].topology.devices')
+        tp=$("${HELPER[@]}" get "$RES/mg13-30b-woken.json" 'instances[0].topology.tensor_parallel')
         r=$(chat mg13-30b mg13-wake)
         [ "$tp" = 2 ] && [ "$devs" = "$devs2" ] && [ "${r%% *}" = 200 ] &&
           result MG13 wake pass "tensor_parallel 2 on $devs2; chat $r" ||
