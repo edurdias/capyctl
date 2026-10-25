@@ -35,18 +35,12 @@ fn tp2_pp2_over_four_hosts_parses() {
     assert_eq!(spec.group.unwrap().topology.world_size(), 4);
 }
 
-// T03, T14: every deploy-time refusal carries its closed code.
+// T03, T14: every deploy-time refusal carries its closed code. ADR 0035 §1
+// (T46): a world size above one without two or more named hosts, alone or
+// beside `host`, is one host's, no longer `group_placement_required`.
 #[test]
 fn group_refusals_carry_codes() {
     let cases = [
-        (
-            json!({"topology": {"tensor_parallel": 2}}),
-            "group_placement_required",
-        ),
-        (
-            json!({"topology": {"tensor_parallel": 2}, "host": "a"}),
-            "group_placement_required",
-        ),
         (
             json!({"topology": {"tensor_parallel": 2},
                 "placement": {"hosts": ["a", "b"], "strategy": "spread"}}),

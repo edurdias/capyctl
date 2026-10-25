@@ -297,6 +297,47 @@ fn discrete_gpu_codes_exit_with_their_spec_class() {
     assert_eq!(specific.exit_code(), ExitCode(3));
 }
 
+// T46 (ADR 0035 §13): a model on several GPUs of one host adds closed codes
+// and no exit number: too few GPUs exits 4 as memory does, the resolution
+// refusals 5, a `devices` list against the topology 2, and `auto` beside a
+// group 2. Each is found as a detail prefix under the generic classes, and
+// the codes `group_shape_unsupported:<engine>` and
+// `capability_missing:deep_park` keep their exits.
+#[test]
+fn multi_gpu_codes_exit_with_their_class() {
+    let cases = [
+        ("insufficient_gpus", 4),
+        ("multi_gpu_unsupported", 5),
+        ("multi_gpu_mixed_devices", 5),
+        ("tensor_parallel_indivisible", 5),
+        ("topology_devices_mismatch", 2),
+        ("group_topology_invalid", 2),
+        ("group_shape_unsupported:vllm", 5),
+    ];
+    for (code, exit) in cases {
+        for carrier in ["invalid_config", "command_rejected", "operation_failed"] {
+            let wrapped = StructuredError {
+                code: carrier,
+                message: format!(
+                    "invalid_config: Invalid deployment configuration: unsupported combination \
+                     at `topology`: {code}: the detail; what would fit: `topology: \
+                     {{tensor_parallel: 2}}`"
+                ),
+            };
+            assert_eq!(wrapped.exit_code(), ExitCode(exit), "{carrier} {code}");
+            assert_eq!(wrapped.closed_code(), code, "{carrier} {code}");
+        }
+    }
+    // A memory refusal that names a tensor-parallel size is still memory.
+    let memory = StructuredError {
+        code: "invalid_config",
+        message: "insufficient_device_memory: 70 GiB per GPU; what would fit: \
+                  `topology: {tensor_parallel: 2}`"
+            .into(),
+    };
+    assert_eq!(memory.exit_code(), ExitCode(4));
+}
+
 // T01 T41 (ADR 0023 §2): a missing TensorFold build toolchain exits 26.
 #[test]
 fn toolchain_missing_exits_26() {

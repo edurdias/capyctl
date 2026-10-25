@@ -106,6 +106,9 @@ pub enum LmcacheOffReason {
     CheckFailed,
     /// The deployment has a `topology`.
     GroupUnsupported,
+    /// ADR 0035 §9: an instance on several GPUs of one host, until an LC row
+    /// qualifies it (ADR 0034 owns the rule).
+    MultiGpuUnqualified,
     /// A parking residency on a combination not qualified for it.
     ParkUnqualified,
     /// An approved non-LMCache `--kv-transfer-config` is in `extra_args`.
@@ -123,7 +126,7 @@ pub enum LmcacheOffReason {
 }
 
 impl LmcacheOffReason {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Disabled,
         Self::HostOff,
         Self::EngineUnsupported,
@@ -133,6 +136,7 @@ impl LmcacheOffReason {
         Self::VersionUnsupported,
         Self::CheckFailed,
         Self::GroupUnsupported,
+        Self::MultiGpuUnqualified,
         Self::ParkUnqualified,
         Self::KvTransferConfigSet,
         Self::RetentionZero,
@@ -153,6 +157,7 @@ impl LmcacheOffReason {
             Self::VersionUnsupported => "version_unsupported",
             Self::CheckFailed => "check_failed",
             Self::GroupUnsupported => "group_unsupported",
+            Self::MultiGpuUnqualified => "multi_gpu_unqualified",
             Self::ParkUnqualified => "park_unqualified",
             Self::KvTransferConfigSet => "kv_transfer_config_set",
             Self::RetentionZero => "retention_zero",
@@ -204,6 +209,7 @@ impl LmcacheOffReason {
             Self::VersionUnsupported => "LMCache 0.5.6 or a later 0.5.x release is needed",
             Self::CheckFailed => "the launch-time check of the LMCache installation failed",
             Self::GroupUnsupported => "a deployment with a topology does not use LMCache",
+            Self::MultiGpuUnqualified => "not qualified for a model on several GPUs of one host",
             Self::ParkUnqualified => "not qualified with this parking residency",
             Self::KvTransferConfigSet => "the deployment sets its own --kv-transfer-config",
             Self::RetentionZero => "zero data retention",
@@ -769,6 +775,8 @@ pub struct PlanInputs<'a> {
     pub api: DeploymentApi,
     /// The deployment declares a `topology`.
     pub topology: bool,
+    /// ADR 0035 §9: the instance runs on several GPUs of one host.
+    pub multi_gpu: bool,
     pub residency: Residency,
     /// The checkpoint's `config.json` `model_type` and the GPU's product
     /// name as the host's inventory reports it, for the qualified table.
@@ -810,6 +818,7 @@ impl<'a> PlanInputs<'a> {
             engine_version,
             api: DeploymentApi::Chat,
             topology: false,
+            multi_gpu: false,
             residency,
             model_type: None,
             gpu: None,
@@ -1151,6 +1160,9 @@ fn off_reason(inputs: &PlanInputs<'_>, table: &[QualifiedParking]) -> Option<Lmc
     if inputs.topology {
         return Some(LmcacheOff::new(R::GroupUnsupported));
     }
+    if inputs.multi_gpu {
+        return Some(LmcacheOff::new(R::MultiGpuUnqualified));
+    }
     if inputs.kv_transfer_config_set {
         return Some(LmcacheOff::new(R::KvTransferConfigSet));
     }
@@ -1222,6 +1234,7 @@ pub fn deployment_refusal(inputs: &PlanInputs<'_>, table: &[QualifiedParking]) -
         R::EngineUnsupported
         | R::EngineVersionUnsupported
         | R::GroupUnsupported
+        | R::MultiGpuUnqualified
         | R::KvTransferConfigSet
         | R::NotInstalled
         | R::VersionUnsupported => true,
@@ -1703,6 +1716,7 @@ mod tests {
             engine: Engine::Vllm,
             engine_version: "0.31.0",
             topology: true,
+            multi_gpu: true,
             kv_transfer_config_set: true,
             registration: None,
             residency: Residency::Deep,
@@ -1716,6 +1730,7 @@ mod tests {
             LmcacheOffReason::HostCapabilityMissing,
             LmcacheOffReason::EngineVersionUnsupported,
             LmcacheOffReason::GroupUnsupported,
+            LmcacheOffReason::MultiGpuUnqualified,
             LmcacheOffReason::KvTransferConfigSet,
             LmcacheOffReason::NotInstalled,
             LmcacheOffReason::VersionUnsupported,
@@ -1731,6 +1746,7 @@ mod tests {
                 LmcacheOffReason::HostCapabilityMissing => inputs.host_declares_lmcache = true,
                 LmcacheOffReason::EngineVersionUnsupported => inputs.engine_version = "0.32.0",
                 LmcacheOffReason::GroupUnsupported => inputs.topology = false,
+                LmcacheOffReason::MultiGpuUnqualified => inputs.multi_gpu = false,
                 LmcacheOffReason::KvTransferConfigSet => inputs.kv_transfer_config_set = false,
                 LmcacheOffReason::NotInstalled => inputs.registration = Some(&old),
                 LmcacheOffReason::VersionUnsupported => inputs.registration = Some(&registration),

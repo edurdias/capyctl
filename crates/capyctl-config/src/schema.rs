@@ -75,6 +75,12 @@ pub enum FieldSpec {
     RequiredStruct(&'static [(&'static str, FieldSpec)]),
     /// Transitional F1/F2 field: legacy scalar or strict F2 mapping.
     ScalarOrStruct(&'static [(&'static str, FieldSpec)]),
+    /// One of the listed keywords, or a closed mapping (ADR 0035 §1a:
+    /// `topology: auto` or `topology: {tensor_parallel: N}`).
+    KeywordOrStruct(
+        &'static [&'static str],
+        &'static [(&'static str, FieldSpec)],
+    ),
     /// Mapping whose keys are entry *names* (not capyctl fields — e.g.
     /// `listeners` entries named `management`/`inference`); every value
     /// must match the given entry spec, so entries themselves stay
@@ -659,13 +665,15 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                         ("max_per_host", SCALAR),
                     ]),
                 ),
-                // ADR 0028 §2: the multi-node topology.
+                // ADR 0028 §2: the multi-node topology; ADR 0035 §1, §1a:
+                // on one host without two or more `placement.hosts`, and
+                // `topology: auto`.
                 (
                     "topology",
-                    FieldSpec::Struct(&[
-                        ("tensor_parallel", SCALAR),
-                        ("pipeline_parallel", SCALAR),
-                    ]),
+                    FieldSpec::KeywordOrStruct(
+                        &[crate::topology::AUTO],
+                        &[("tensor_parallel", SCALAR), ("pipeline_parallel", SCALAR)],
+                    ),
                 ),
                 ("model", FieldSpec::ScalarOrStruct(MODEL)),
                 ("routes", FieldSpec::Seq(&SCALAR)),

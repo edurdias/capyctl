@@ -337,6 +337,7 @@ fn leaf_of(spec: &FieldSpec) -> Option<Leaf> {
         | FieldSpec::Bytes
         | FieldSpec::Duration
         | FieldSpec::ScalarOrStruct(_)
+        | FieldSpec::KeywordOrStruct(..)
         | FieldSpec::Moved(_) => Some(Leaf::Scalar),
         FieldSpec::Seq(_) => Some(Leaf::Seq),
         FieldSpec::Struct(_) | FieldSpec::RequiredStruct(_) | FieldSpec::MapOf(_) => None,
@@ -390,7 +391,8 @@ fn resolve(
             Some(
                 FieldSpec::Struct(inner)
                 | FieldSpec::RequiredStruct(inner)
-                | FieldSpec::ScalarOrStruct(inner),
+                | FieldSpec::ScalarOrStruct(inner)
+                | FieldSpec::KeywordOrStruct(_, inner),
             ) => {
                 fields = inner;
                 let (name, field) = fields

@@ -734,8 +734,10 @@ impl crate::Store {
                 warm,
                 activation,
                 // ADR 0028 §2: a group is read from the revision's config_json,
-                // never from these rows, so it is `None` here by design.
+                // never from these rows, so it is `None` here by design; so is
+                // ADR 0035's topology on one host.
                 group: None,
+                local: None,
             })
         })
         .transpose()
