@@ -19,9 +19,10 @@ scripts/live/multi-gpu/run.sh --ssh ubuntu@203.0.113.7 --purge-only
 What the owner rents (ADR 0035 §14, owner decision 2): x86_64, two RTX A6000
 48 GB PCIe cards, a driver whose `nvidia-smi` header reads CUDA 13.0 or higher,
 at least 128 GB of RAM (MG6 is SKIP below 120 GiB), 250 GB free in the home
-directory, and `git`, `curl`, `python3`, `cc`/`c++`, `make`, `cmake` and `tar`.
-SSH access by key. `nvcc` is used when present (`/usr/local/cuda/bin/nvcc` or on
-`PATH`); without it, setup installs NVIDIA's CUDA 13.0 compiler wheel into the
+directory, and `git`, `curl`, `python3`, `cc`/`c++`, `make` and `tar`. SSH
+access by key. `cmake` and `nvcc` are used when present (`nvcc` at
+`/usr/local/cuda/bin/nvcc` or on `PATH`); without them, setup installs the
+`cmake` wheel from PyPI and NVIDIA's CUDA 13.0 compiler wheel into the
 session's directory for the llama.cpp build. The preflight refuses a machine
 with fewer than two GPUs, GPUs that differ, an older driver, too little disk, or
 an engine already running, before anything is installed.

@@ -116,7 +116,8 @@ preflight() {
   echo "memory: $(awk '/^MemTotal:/ {printf "%.0f GiB", $2/1048576}' /proc/meminfo)"
   echo "disk free under ~: $(df -BG --output=avail "$HOME" | tail -1 | tr -d ' ')"
   [ "$(df -BG --output=avail "$HOME" | tail -1 | tr -dc 0-9)" -ge 250 ] || { echo "FAIL: under 250 GB free in ~ (models about 75 GB, engines about 20 GB, builds about 10 GB)"; fail=1; }
-  for t in git curl python3 cc c++ make cmake tar; do command -v "$t" >/dev/null || { echo "FAIL: missing $t"; fail=1; }; done
+  for t in git curl python3 cc c++ make tar; do command -v "$t" >/dev/null || { echo "FAIL: missing $t"; fail=1; }; done
+  command -v cmake >/dev/null || echo "note: no cmake; setup installs the cmake wheel from PyPI into $MG/cmake-venv for the llama.cpp build"
   if command -v nvcc >/dev/null || [ -x /usr/local/cuda/bin/nvcc ]; then
     echo "nvcc: $( (command -v nvcc || echo /usr/local/cuda/bin/nvcc) | head -1)"
   else
@@ -156,7 +157,12 @@ setup_tools() {
   if [ ! -x "$MG/rust/bin/rustup" ]; then
     run sh -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none"
   fi
-  [ "$PLAN" = 1 ] || { "$BIN/uv" --version; "$BIN/protoc" --version; } | tee -a "$RES/versions.txt"
+  if ! command -v cmake >/dev/null; then
+    run "$BIN/uv" venv "$MG/cmake-venv"
+    run "$BIN/uv" pip install --python "$MG/cmake-venv/bin/python" cmake
+    run ln -sfn "$MG/cmake-venv/bin/cmake" "$BIN/cmake"
+  fi
+  [ "$PLAN" = 1 ] || { "$BIN/uv" --version; "$BIN/protoc" --version; cmake --version | head -1; } | tee -a "$RES/versions.txt"
 }
 
 # The qualification build (ADR 0035 §9, owner decision 3): the shipped support
