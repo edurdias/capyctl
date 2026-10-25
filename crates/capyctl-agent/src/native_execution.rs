@@ -2829,6 +2829,16 @@ impl SessionExecution for NativeHostExecution {
                 // the server credits each domain with its own memory.
                 device_bytes: p.device_bytes,
                 host_bytes: p.host_bytes,
+                // ADR 0035 §8 (`local_tensor_parallel`): the GPU memory per
+                // GPU, so the server credits each GPU's domain with its own.
+                per_device: p
+                    .per_device
+                    .into_iter()
+                    .map(|d| pb::DeviceResidency {
+                        device_id: d.device,
+                        bytes: d.bytes,
+                    })
+                    .collect(),
             })
             .collect();
         if !device.is_empty() {
@@ -3216,6 +3226,7 @@ mod tests {
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
+                devices: Vec::new(),
             }),
         };
         let legacy = command(&deployment);
@@ -3366,6 +3377,7 @@ mod tests {
             startup_bytes: None,
             startup_host_bytes: None,
             lmcache: None,
+            devices: Vec::new(),
         };
         let command = MemberCommand {
             identity: checkpoint_identity("launch", "reserved"),
@@ -5519,6 +5531,7 @@ mod tests {
             boot_id: "boot-that-never-reaped".into(),
             start_ticks: 7,
             presence: "gone".into(),
+            rank: None,
         };
         let result = pb::MemberExecutionResult {
             state: "launched".into(),
@@ -5552,6 +5565,7 @@ mod tests {
                 boot_id: "boot-that-never-reaped".into(),
                 start_ticks: 7,
                 presence: "gone".into(),
+                rank: None,
             }],
             ..Default::default()
         };

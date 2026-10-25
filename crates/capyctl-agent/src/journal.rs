@@ -1892,6 +1892,7 @@ impl HostJournal {
                         Presence::Unknown => "unknown",
                     }
                     .into(),
+                    rank: None,
                 })
                 .collect(),
             observed_at_unix_ms: observed_at_ms,

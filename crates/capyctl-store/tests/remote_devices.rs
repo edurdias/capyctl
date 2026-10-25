@@ -423,6 +423,7 @@ fn a_remote_unified_host_is_credited_the_resident_sum_as_before() {
             bytes: gib * GIB,
             device_bytes: if split { (gib - 1) * GIB } else { 0 },
             host_bytes: if split { GIB } else { 0 },
+            per_device: Vec::new(),
         };
         assert!(
             t.arm(&planned[1].0, &observations, &[]).is_err(),
@@ -492,6 +493,7 @@ fn a_remote_discrete_host_is_credited_per_domain() {
             bytes: (device + host) * GIB,
             device_bytes: if split { device * GIB } else { 0 },
             host_bytes: if split { host * GIB } else { 0 },
+            per_device: Vec::new(),
         };
         let residents = [resident(100, 11, 2), resident(101, 1, 1)];
         let armed = t.arm(&planned[1].0, &observations, &residents);

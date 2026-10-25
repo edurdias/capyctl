@@ -1188,6 +1188,7 @@ pub(crate) fn arm_with_context(
         context.observations,
         residents,
         &crate::resident_floors::domain_kinds(&policy.controls),
+        &crate::resident_floors::domain_devices(&policy),
     )?;
     let context = AdmissionContext {
         resident_floors: &floors,

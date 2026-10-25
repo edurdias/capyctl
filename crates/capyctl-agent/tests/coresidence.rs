@@ -330,6 +330,7 @@ impl Fixture {
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
+                devices: Vec::new(),
             }),
         })
     }

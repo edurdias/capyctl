@@ -1409,6 +1409,10 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
             grant_id: work.step_id().into(),
             issued_at_ms: 0,
             coordinator_session_id: owner.session().id().into(),
+            // ADR 0035 §§2, 11: a launch on several GPUs of this host names
+            // them in rank order, by the host's own ids; on one GPU none, so
+            // the command encodes exactly as before.
+            devices: local_devices(host, work.effective()),
             service_port: work
                 .endpoint()
                 .rsplit(':')
@@ -1640,6 +1644,31 @@ impl crate::group_activation::GroupHosts for AgentGroupHosts {
     }
 }
 
+/// ADR 0035 §§2, 11: the host-local ids (`gpuN`) of the GPUs a launch on
+/// several GPUs of `host` runs on, in rank order (rank r on the r-th claim of
+/// the frozen revision); empty for a launch on one GPU. Its size is the
+/// launch's local tensor-parallel size N.
+pub(crate) fn local_devices(
+    host: &str,
+    effective: &capyctl_config::effective::EffectiveDeployment,
+) -> Vec<String> {
+    if effective.selected_devices.len() < 2 {
+        return Vec::new();
+    }
+    let scoped = capyctl_config::remote_resources::ledger_key(host, "device", "");
+    effective
+        .selected_devices
+        .iter()
+        .map(|claim| {
+            claim
+                .id
+                .strip_prefix(&scoped)
+                .unwrap_or(&claim.id)
+                .to_owned()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1671,6 +1700,7 @@ mod tests {
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
+                devices: Vec::new(),
             },
             ingress_gate_key: [7; 32],
             instance_index: 0,
@@ -1688,6 +1718,7 @@ mod tests {
             boot_id: "boot".into(),
             start_ticks: 9,
             presence: presence.into(),
+            rank: None,
         }
     }
     fn result(processes: Vec<pb::OwnedProcessObservation>) -> pb::MemberExecutionResult {
@@ -2301,6 +2332,7 @@ mod tests {
                 boot_id: p.boot_id.clone(),
                 start_ticks: p.start_ticks,
                 presence: "alive".into(),
+                rank: None,
             })
             .collect()
     }

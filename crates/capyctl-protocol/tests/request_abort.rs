@@ -192,6 +192,7 @@ fn abort_results_name_their_launch_and_nothing_else() {
         boot_id: "boot".into(),
         start_ticks: 9,
         presence: "alive".into(),
+        rank: None,
     });
     assert!(validate_result(&command, &observed).is_err());
     let mut tail = result(&command, "completed", "");

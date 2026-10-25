@@ -464,6 +464,7 @@ impl MemberExit {
                 boot_id: self.process.boot_id.clone(),
                 start_ticks: self.process.start_ticks,
                 presence: "gone".into(),
+                rank: None,
             }),
             exit_code,
             exit_signal,

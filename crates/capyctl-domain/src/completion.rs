@@ -70,6 +70,12 @@ pub const LMCACHE_ROLE: &str = "lmcache";
 /// (`lmcache-N`, N a decimal number, numbered by start order).
 pub const LMCACHE_MEMBER_PREFIX: &str = "lmcache-";
 
+/// ADR 0035 §6: the role prefix of a rank process of a launch on several GPUs
+/// of one host (`rank-N`, N the rank: the position of its GPU in the
+/// launch's device list) that is neither `api` nor a `worker-N`. It is an
+/// engine process: its exit is the engine's.
+pub const RANK_ROLE_PREFIX: &str = "rank-";
+
 impl ProcessIdentity {
     /// ADR 0027: whether this recorded process is a helper rather than one of
     /// the engine's own processes (`api` and `worker-N`). A helper's role is
@@ -89,6 +95,26 @@ impl ProcessIdentity {
     pub fn is_engine(&self) -> bool {
         !self.is_helper() && !self.is_lmcache()
     }
+
+    /// ADR 0035 §6: the rank a `rank-N` role names.
+    pub fn rank_role(&self) -> Option<u32> {
+        rank_role(&self.role)
+    }
+
+    /// Whether `other` is the same kernel process (pid, boot id and start
+    /// ticks), whatever role either names it by.
+    pub fn same_process(&self, other: &ProcessIdentity) -> bool {
+        self.pid == other.pid
+            && self.boot_id == other.boot_id
+            && self.start_ticks == other.start_ticks
+    }
+}
+
+/// ADR 0035 §6: the rank of a `rank-N` role (N a decimal number).
+pub fn rank_role(role: &str) -> Option<u32> {
+    role.strip_prefix(RANK_ROLE_PREFIX)
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|n| n.parse().ok())
 }
 
 /// ADR 0027: whether `role` is a helper's (`helper-N`, N a decimal number).
@@ -131,7 +157,15 @@ pub fn lmcache_members(identities: &[ProcessIdentity]) -> Vec<ProcessIdentity> {
 /// not decide it: one that exited since, or one the engine started later, does
 /// not change the engine. ADR 0033 §3: neither does the LMCache server's group
 /// (`same_lmcache` judges it).
+///
+/// ADR 0035 §6: a recorded `rank-N` process is named by readiness from the
+/// per-GPU readings, not by the group scan, which names it a helper or a
+/// worker again. Ranks are identified by kernel facts, never by names: an
+/// observed process that is the same kernel process as a recorded rank is
+/// that rank, so every proof requires each rank alive.
 pub fn same_engine(recorded: &[ProcessIdentity], observed: &[ProcessIdentity]) -> bool {
+    let observed = with_recorded_ranks(recorded, observed);
+    let observed = observed.as_slice();
     let recorded_set = recorded.iter().collect::<BTreeSet<_>>();
     let observed_set = observed.iter().collect::<BTreeSet<_>>();
     recorded.iter().any(ProcessIdentity::is_engine)
@@ -144,6 +178,26 @@ pub fn same_engine(recorded: &[ProcessIdentity], observed: &[ProcessIdentity]) -
             .iter()
             .filter(|identity| identity.is_engine())
             .all(|identity| observed_set.contains(identity))
+}
+
+/// ADR 0035 §6: `observed` with every process that is the same kernel process
+/// as a recorded `rank-N` named by that recorded role.
+pub fn with_recorded_ranks(
+    recorded: &[ProcessIdentity],
+    observed: &[ProcessIdentity],
+) -> Vec<ProcessIdentity> {
+    observed
+        .iter()
+        .map(|identity| {
+            match recorded
+                .iter()
+                .find(|r| r.rank_role().is_some() && r.same_process(identity))
+            {
+                Some(rank) => rank.clone(),
+                None => identity.clone(),
+            }
+        })
+        .collect()
 }
 
 /// ADR 0033 §3: whether `observed` still holds the LMCache server `recorded`

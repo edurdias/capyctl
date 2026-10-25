@@ -169,6 +169,7 @@ fn launch(id: &str) -> MemberCommand {
             startup_bytes: None,
             startup_host_bytes: None,
             lmcache: None,
+            devices: Vec::new(),
         },
         plan: GroupPlan::new(
             GroupEngine::Vllm,
@@ -730,6 +731,7 @@ async fn native_result_replay_retains_probe_timestamp_and_rejects_forged_identit
         startup_bytes: None,
         startup_host_bytes: None,
         lmcache: None,
+        devices: Vec::new(),
     });
     let c = sign(c);
     let policy = std::sync::Arc::new(Workers);
@@ -1551,6 +1553,7 @@ fn launch_single(id: &str) -> MemberCommand {
         startup_bytes: None,
         startup_host_bytes: None,
         lmcache: None,
+        devices: Vec::new(),
     });
     sign(c)
 }

@@ -51,6 +51,7 @@ fn residents(base: u32, quarters: [i64; 2]) -> Vec<ProcessResident> {
             bytes: q * GIB / 4,
             device_bytes: q * GIB / 4,
             host_bytes: 0,
+            per_device: Vec::new(),
         })
         .collect()
 }

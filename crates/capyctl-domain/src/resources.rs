@@ -181,10 +181,41 @@ pub struct ProcessResident {
     pub bytes: i64,
     /// ADR 0019: GPU memory the driver attributes to the process, credited
     /// against a `device` domain. Zero when the reporter did not split it.
+    /// ADR 0035 §8: the sum of `per_device` whenever that is reported.
     pub device_bytes: i64,
     /// ADR 0019: anonymous resident pages, credited against a `distinct`
     /// system domain. Zero when the reporter did not split it.
     pub host_bytes: i64,
+    /// ADR 0035 §8: the process's GPU memory per GPU, one entry per GPU it
+    /// holds memory on, by host-local device id (`gpuN`). Each GPU's bytes
+    /// are credited to that GPU's domain only. Empty from a reporter that
+    /// does not read per GPU (an older host): `device_bytes` is then the
+    /// only figure, credited only to an owner with one device allocation.
+    pub per_device: Vec<DeviceBytes>,
+}
+
+/// ADR 0035 §8: the GPU memory one process holds on one GPU.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DeviceBytes {
+    /// The host-local device id (`gpuN`), as the host's inventory names it.
+    pub device: String,
+    pub bytes: u64,
+}
+
+impl ProcessResident {
+    /// ADR 0035 §8: the GPU memory this process holds on `device`, when the
+    /// reporter read per GPU; `None` when it did not (`per_device` empty).
+    pub fn bytes_on(&self, device: &str) -> Option<u64> {
+        if self.per_device.is_empty() {
+            return None;
+        }
+        Some(
+            self.per_device
+                .iter()
+                .filter(|entry| entry.device == device)
+                .fold(0_u64, |sum, entry| sum.saturating_add(entry.bytes)),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

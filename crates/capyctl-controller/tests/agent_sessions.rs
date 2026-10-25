@@ -1264,6 +1264,7 @@ async fn a_checkpoint_mismatch_is_answered_and_the_session_stays_up() {
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
+                devices: Vec::new(),
             },
         ),
     };
@@ -1330,6 +1331,7 @@ impl capyctl_agent::session::SessionExecution for LaunchObservation {
                     boot_id: "boot".into(),
                     start_ticks: 7,
                     presence: presence.into(),
+                    rank: None,
                 }],
                 observed_at_unix_ms: capyctl_protocol::now_unix_ms(),
                 claim_retained: true,
@@ -1398,6 +1400,7 @@ fn launch_command(
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
+                devices: Vec::new(),
             },
         ),
     };

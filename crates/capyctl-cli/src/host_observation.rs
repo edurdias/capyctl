@@ -367,7 +367,7 @@ mod tests {
     async fn every_observation_carries_a_fresh_resident_sample() {
         let me = std::process::id();
         let sampler = capyctl_agent::process_residency::ResidencySampler::with_collector(
-            std::sync::Arc::new(move || Some(vec![(me, 1 << 20)])),
+            std::sync::Arc::new(move || Some(vec![(me, "gpu0".into(), 1 << 20)])),
         );
         let observation =
             HostMemoryObservation::new(["unified".to_string()]).with_process_residency(sampler);

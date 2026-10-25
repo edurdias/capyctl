@@ -8,6 +8,7 @@ pub mod identity;
 pub mod latency;
 pub mod launch;
 pub mod lifecycle;
+pub mod local_tp;
 pub mod member_weights;
 pub mod park;
 pub mod redact;

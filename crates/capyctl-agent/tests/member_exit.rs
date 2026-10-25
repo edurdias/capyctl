@@ -163,6 +163,7 @@ async fn an_exited_member_of_a_ready_launch_is_reported_with_its_status() {
         startup_bytes: None,
         startup_host_bytes: None,
         lmcache: None,
+        devices: Vec::new(),
     });
     let launch = sign(launch);
     let policy = std::sync::Arc::new(Workers);
@@ -327,6 +328,7 @@ async fn a_helper_exit_of_a_ready_launch_is_not_reported() {
         startup_bytes: None,
         startup_host_bytes: None,
         lmcache: None,
+        devices: Vec::new(),
     });
     let launch = sign(launch);
     let policy = std::sync::Arc::new(WithHelper);

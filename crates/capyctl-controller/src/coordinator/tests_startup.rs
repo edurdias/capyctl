@@ -1270,6 +1270,7 @@ fn process(pid: u32, device: i64, host: i64) -> ProcessResident {
         bytes: device + host,
         device_bytes: device,
         host_bytes: host,
+        per_device: Vec::new(),
     }
 }
 
@@ -1527,4 +1528,47 @@ async fn a_discrete_domain_keeps_its_estimate_until_it_is_measured() {
     })
     .await;
     w.shutdown().await.unwrap();
+}
+
+// T46 (ADR 0035 §§3, 8): a startup sample's device figure is the most any one
+// GPU held, each GPU's bytes summed over the launch's processes, never the sum
+// over GPUs; a single-GPU launch keeps today's figure, a stray context on a
+// second GPU no longer adds to it, and an older reading counts toward one GPU.
+#[test]
+fn the_startup_peak_is_the_largest_per_gpu_figure() {
+    use capyctl_domain::resources::DeviceBytes;
+    let on = |pid: u32, readings: &[(&str, i64)]| {
+        let mut p = process(pid, readings.iter().map(|(_, b)| b).sum(), GIB);
+        p.per_device = readings
+            .iter()
+            .map(|(device, bytes)| DeviceBytes {
+                device: (*device).into(),
+                bytes: *bytes as u64,
+            })
+            .collect();
+        p
+    };
+    let peak = |processes: &[ProcessResident]| {
+        super::super::per_gpu_peak(&processes.iter().collect::<Vec<_>>())
+    };
+    // Two ranks, 20 GiB each on their own GPU plus 1 GiB contexts on the peer.
+    let ranks = [
+        on(71, &[("gpu0", 20 * GIB), ("gpu1", GIB)]),
+        on(72, &[("gpu1", 20 * GIB), ("gpu0", GIB)]),
+    ];
+    assert_eq!(peak(&ranks), Some(21 * GIB));
+    // One GPU: the processes' bytes there, summed, as before.
+    assert_eq!(
+        peak(&[on(71, &[("gpu0", 9 * GIB)]), on(72, &[("gpu0", GIB)])]),
+        Some(10 * GIB)
+    );
+    assert_eq!(
+        peak(&[on(71, &[("gpu0", 9 * GIB), ("gpu1", GIB / 2)])]),
+        Some(9 * GIB)
+    );
+    assert_eq!(
+        peak(&[process(71, 9 * GIB, GIB), process(72, GIB, 0)]),
+        Some(10 * GIB)
+    );
+    assert_eq!(peak(&[]), Some(0));
 }

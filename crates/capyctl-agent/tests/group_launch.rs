@@ -957,6 +957,7 @@ impl FakeHost {
                     startup_bytes: None,
                     startup_host_bytes: None,
                     lmcache: None,
+                    devices: Vec::new(),
                 },
             },
         };
@@ -1419,6 +1420,7 @@ fn launch(plan: GroupPlan) -> MemberAction {
             startup_bytes: None,
             startup_host_bytes: None,
             lmcache: None,
+            devices: Vec::new(),
         },
         plan,
     }
@@ -2321,7 +2323,7 @@ async fn a_vllm_worker_members_processes_are_in_its_residency_report() {
         Some(
             group_pids(leader)
                 .into_iter()
-                .map(|pid| (pid, 64 << 20))
+                .map(|pid| (pid, "gpu0".to_owned(), 64 << 20))
                 .collect(),
         )
     });
