@@ -249,7 +249,9 @@ def cmd_engine_args(a):
                         value, i = rest[i + 1], i + 2
                     else:
                         value, i = True, i + 1
-                    if not re.search(r"(^|_)(key|secret|token)$", key):
+                    # `--capyctl-user-args` is CapyCTL's own marker between its
+                    # reserved arguments and the user's (runtime/vllm_entry.py).
+                    if not re.search(r"(^|_)(key|secret|token)$", key) and not key.startswith("capyctl"):
                         parsed[key] = value
                 else:
                     i += 1
