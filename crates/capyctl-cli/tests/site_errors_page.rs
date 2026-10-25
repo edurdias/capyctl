@@ -150,6 +150,11 @@ fn group_codes_are_documented_with_their_exit_code() {
             "host_capability_missing:retention",
             "host_capability_missing:retention",
         ),
+        // T46 (ADR 0035 §§11, 13).
+        (
+            "host_capability_missing:local_tensor_parallel",
+            "host_capability_missing:local_tensor_parallel",
+        ),
     ] {
         let exit = StructuredError {
             code: "invalid_config",

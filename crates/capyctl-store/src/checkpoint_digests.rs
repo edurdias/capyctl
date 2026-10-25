@@ -912,7 +912,11 @@ impl crate::Store {
                     } else {
                         error.to_string()
                     };
-                    let diagnostic = capyctl_domain::diagnostics::bound_chars(&reason, 512);
+                    // ADR 0035 §§1, 13: a refusal for device memory names
+                    // what would fit after its own reason (the per-GPU charge
+                    // and the cards that would hold it), so the bound keeps
+                    // the whole hint.
+                    let diagnostic = capyctl_domain::diagnostics::bound_chars(&reason, 1024);
                     tx.execute(
                         "UPDATE checkpoint_digests SET state='unusable',digest=?3,host_id=?4,diagnostic=?6,updated_at_ms=?5,provenance=?7 WHERE deployment_id=?1 AND revision=?2",
                         params![deployment, revision, digest, host_id, now_ms, diagnostic, provenance.code()],

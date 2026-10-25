@@ -882,6 +882,119 @@ mod tests {
         assert!(text.starts_with("Deployed my-model: ready\n"), "{text}");
     }
 
+    /// Five phases charging `ready` everywhere but the parked phase.
+    fn phases(ready: i64) -> serde_json::Value {
+        json!({"cold": ready, "ready": ready, "parking": ready, "parked": 0, "wake": ready})
+    }
+
+    /// The topology view `deploy`, `validate config` and status share
+    /// (`capyctl_config::effective::topology_view`): 30 GiB of weights on two
+    /// 40 GiB cards under `topology: auto`, as resolved on its host.
+    fn auto_view(chosen: serde_json::Value) -> serde_json::Value {
+        const GIB: i64 = 1 << 30;
+        let mut view = json!({
+            "tensor_parallel": 1, "gpus": ["gpu0"],
+            "per_gpu": phases(41_070_624_746), "system": phases(4 * GIB),
+            "requested": "auto",
+            "candidates": {"weights_measured": true,
+                "candidates": [
+                    {"tensor_parallel": 1, "device": phases(41_070_624_746),
+                     "system": phases(4 * GIB)},
+                    {"tensor_parallel": 2, "device": phases(35_433_480_129),
+                     "system": phases(7 * GIB)}],
+                "excluded": [{"tensor_parallel": 3, "reason": "insufficient_gpus"}]},
+            "chosen": chosen,
+        });
+        if view["chosen"].is_null() {
+            view["note"] = json!("no size is chosen until the checkpoint is measured");
+        }
+        view
+    }
+
+    /// A text block: each line followed by a newline.
+    fn block(lines: &[&str]) -> String {
+        lines.iter().map(|line| format!("{line}\n")).collect()
+    }
+
+    /// The Topology block of [`auto_view`] choosing one GPU.
+    fn auto_block() -> String {
+        block(&[
+            "",
+            "Topology",
+            "  TP          auto (1)",
+            "  GPUs        gpu0",
+            "  Per GPU     ready 38.2 GiB, peak 38.2 GiB",
+            "  Host RAM    ready 4.0 GiB, peak 4.0 GiB",
+            "  Candidates  TP 1: 38.2 GiB per GPU; TP 2: 33.0 GiB per GPU",
+            "              TP 3: insufficient_gpus",
+            "  Chosen      TP 1 on this host now",
+        ])
+    }
+
+    // T46 (ADR 0035 §§1, 1a): `deploy` prints a Topology block after the
+    // deployment's rows: the size (`auto (N)` under `topology: auto`), the
+    // GPUs in rank order, each GPU's and host RAM's charge, and under `auto`
+    // each candidate's per-GPU charge, the sizes left out and the size this
+    // host would choose now (or why none yet). A deployment on one GPU
+    // without `auto` prints none (`deploy_with_wait_prints_the_state_not_the_record`).
+    #[test]
+    fn deploy_prints_the_topology_block() {
+        let rows = block(&[
+            "Deployed my-model: ready",
+            "",
+            "  Revision    1",
+            "  Hosts       gpu-box",
+            "  Ready       1/1",
+            "  Startup     17.2 GiB",
+            "  Context     26752 tokens",
+            "  Operation   initialize succeeded",
+        ]);
+        let with = |view: serde_json::Value| {
+            let mut d = deployment();
+            d["topology"] = view;
+            run(deploy(true), json!({"deployment": d}), Some("my-model"))
+        };
+        assert_eq!(with(auto_view(json!(1))), format!("{rows}{}", auto_block()));
+        assert!(with(auto_view(serde_json::Value::Null))
+            .ends_with("  Chosen      no size is chosen until the checkpoint is measured\n"));
+        let explicit = json!({"tensor_parallel": 2, "gpus": ["gpu0", "gpu1"],
+            "per_gpu": phases(35_433_480_129), "system": phases(7 << 30)});
+        assert_eq!(
+            with(explicit),
+            format!(
+                "{rows}{}",
+                block(&[
+                    "",
+                    "Topology",
+                    "  TP          2",
+                    "  GPUs        gpu0, gpu1",
+                    "  Per GPU     ready 33.0 GiB, peak 33.0 GiB",
+                    "  Host RAM    ready 7.0 GiB, peak 7.0 GiB",
+                ])
+            )
+        );
+    }
+
+    // T46 (ADR 0035 §§1, 1a): `validate config --host` prints the same
+    // Topology block after the resources; without a topology view (one GPU,
+    // no `auto`) it prints none.
+    #[test]
+    fn validate_prints_the_topology_block() {
+        let mut value = json!({"file": "auto.yaml", "kind": "deployment",
+            "resolved_against": "gpu-box", "effective": {}});
+        let plain = validate(&value);
+        assert_eq!(
+            plain,
+            block(&[
+                "auto.yaml is a valid deployment document",
+                "",
+                "  Resolved against   gpu-box",
+            ])
+        );
+        value["effective"]["topology"] = auto_view(json!(1));
+        assert_eq!(validate(&value), format!("{plain}{}", auto_block()));
+    }
+
     // T02 (ADR 0021): the results `delete` and `drain --wait` really return.
     #[test]
     fn delete_and_settled_drain_shapes() {
