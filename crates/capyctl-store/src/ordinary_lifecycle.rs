@@ -1584,3 +1584,6 @@ fn event(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod multi_gpu_tests;

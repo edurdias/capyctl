@@ -126,7 +126,7 @@ pub fn apply(conn: &Connection) -> Result<(), StoreError> {
 
 /// [`apply`], stopping after version `last`. Tests use it to build a store as
 /// an older binary left it.
-fn apply_through(conn: &Connection, last: i64) -> Result<(), StoreError> {
+pub(crate) fn apply_through(conn: &Connection, last: i64) -> Result<(), StoreError> {
     let migrations_table: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",

@@ -1086,6 +1086,99 @@ mod tests {
         ]}))
     }
 
+    // T46 (ADR 0035 §§1a, 5): each instance on several GPUs or under
+    // `topology: auto` gets a line after the instances table, as status
+    // JSON gives its `topology` (`multi_gpu_placement.rs` pins that JSON):
+    // `TP auto (2) on gpu0, gpu1` for an `auto` instance placed at 2,
+    // `TP auto` for one not placed, `TP 2 on ...` for a stated size, and
+    // `TP auto (1) on gpu0` for an `auto` instance placed on one GPU. The
+    // Collectives line follows when any instance's collectives are on
+    // loopback, and only then.
+    #[test]
+    fn status_shows_each_instances_tensor_parallel_size_and_collectives() {
+        let instance = |index: u32, topology: Value, loopback: bool| {
+            let mut i = json!({"index": index, "host_id": "01HOSTA",
+                "observed_state": "ready", "lifecycle": "active", "topology": topology});
+            if loopback {
+                i["collectives"] = json!("loopback");
+            }
+            i
+        };
+        let status = |instances: Vec<Value>| {
+            render(
+                View::Status,
+                &json!({"name": "m", "observed_state": "ready", "revision": "1",
+                    "instances": instances}),
+                &names(),
+            )
+        };
+        let tail = |out: &str| -> Vec<String> {
+            out.lines()
+                .skip_while(|line| !line.starts_with("Instance "))
+                .map(str::to_owned)
+                .collect()
+        };
+        let auto_two = json!({"requested": "auto", "tensor_parallel": 2,
+            "devices": ["gpu0", "gpu1"]});
+        let unplaced = json!({"requested": "auto"});
+        let stated = json!({"requested": 2, "tensor_parallel": 2, "devices": ["gpu2", "gpu3"]});
+        let auto_one = json!({"requested": "auto", "tensor_parallel": 1, "devices": ["gpu0"]});
+        let out = status(vec![
+            instance(0, auto_two, true),
+            instance(1, unplaced.clone(), false),
+            instance(2, stated, true),
+            instance(3, auto_one.clone(), false),
+        ]);
+        assert_eq!(
+            tail(&out),
+            [
+                "Instance 0  TP auto (2) on gpu0, gpu1",
+                "Instance 1  TP auto",
+                "Instance 2  TP 2 on gpu2, gpu3",
+                "Instance 3  TP auto (1) on gpu0",
+                "Collectives  loopback (the ranks' collective listeners are on this host's \
+                 loopback, unauthenticated there)",
+            ],
+            "{out}"
+        );
+        let out = status(vec![
+            instance(0, auto_one, false),
+            instance(1, unplaced, false),
+        ]);
+        assert_eq!(
+            tail(&out),
+            ["Instance 0  TP auto (1) on gpu0", "Instance 1  TP auto"],
+            "no instance on several GPUs, no collectives: {out}"
+        );
+    }
+
+    // T46 (ADR 0035 §5): a deployment on one GPU without `auto` (status JSON
+    // with no `topology` and no `collectives`) prints exactly what it printed
+    // before: no TP line, no Collectives line.
+    #[test]
+    fn status_on_one_gpu_without_auto_is_unchanged() {
+        let out = render(
+            View::Status,
+            &json!({"name": "chat", "kind": "model", "desired_state": "running",
+                "observed_state": "ready", "ready_instances": 1, "desired_instances": 1,
+                "revision": "3", "startup": {"bytes": 14_i64 << 30},
+                "timeouts": {"initialize_ms": 600_000},
+                "latest_operation": {"kind": "initialize", "state": "succeeded"},
+                "instances": [{"index": 0, "host_id": "01HOSTA", "observed_state": "ready",
+                    "lifecycle": "active",
+                    "devices": [{"id": "gpu0", "sharing": "shared"}]}]}),
+            &names(),
+        );
+        assert_eq!(
+            out,
+            "NAME   STATE   READY   REVISION   STARTUP    INITIALIZE   LAST OPERATION\n\
+             chat   ready   1/1     3          14.0 GiB   600s         initialize succeeded\n\
+             \n\
+             INSTANCE   HOST    STATE   LIFECYCLE   DEVICES   LAST ERROR\n\
+             0          gpu-a   ready   active      gpu0      -\n"
+        );
+    }
+
     #[test]
     fn columns_align_and_lines_carry_no_trailing_blanks() {
         let out = table(

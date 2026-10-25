@@ -303,6 +303,13 @@ const GROUP_CODES: &[(&str, Named, Option<ExitCode>)] = &[
         Named::Bare,
         Some(ExitCode::UNSUPPORTED),
     ),
+    // ADR 0035 §§11, 13: a host too old to run a model on several of its
+    // GPUs, refused at placement before anything is sent to it.
+    (
+        "host_capability_missing:local_tensor_parallel",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
     // ADR 0031 §10: a manifest refused at `engine add` (or a profile's copy
     // refused at role start), and resolution's custom engine refusals.
     (
