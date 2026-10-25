@@ -930,11 +930,14 @@ mod tests {
                 ("system".to_owned(), overhead + copy)
             ]
         );
+        // ADR 0035 §§3, 9: each GPU parks its context, graphs and
+        // communication buffers, the allowances beside its request.
+        let parked_gpu = ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES + GIB;
         assert_eq!(
             bytes(&footprints.parked),
             [
-                ("gpu0".to_owned(), PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES),
-                ("gpu1".to_owned(), PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES),
+                ("gpu0".to_owned(), parked_gpu),
+                ("gpu1".to_owned(), parked_gpu),
                 ("system".to_owned(), overhead + copy)
             ]
         );

@@ -378,7 +378,10 @@ without any new transaction.
   GPU and N, and A19's growth bound applies per GPU against that GPU's
   `parked_growth_limit`. A record from before this ADR is the N = 1 record.
 - **Parked limits.** A parked multi-GPU instance counts against each of its GPUs'
-  `parked_limit` with that GPU's residue, and once in `max_parked`.
+  `parked_limit` with that GPU's residue, and once in `max_parked`. Until a park at N
+  measures it, each GPU's parked residue is charged the context-and-graph and
+  communication allowances above (2.25 GiB), what a sleeping rank keeps on its GPU
+  (implementation note, 2026-10-25); one GPU keeps its 1 GiB placeholder.
 
 ### 4. Launch per engine
 

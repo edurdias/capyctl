@@ -17,8 +17,9 @@ pin exactly N GPUs, and `topology: auto` lets CapyCTL choose N.
 - **Accounting** (§3): one owner, one allocation per chosen GPU's `device` domain (ADR 0028's
   rank share with `T = N`, KV cache, margin, 1.25 GiB CUDA context, 1 GiB communication
   allowance, both `derived` until measured) and the system domain (4 GiB plus 3 GiB per rank
-  after the first). Every refusal for memory or GPU count names the `tensor_parallel` that
-  would fit.
+  after the first). Until a park measures it, each GPU's parked charge is those two
+  allowances (2.25 GiB), what a sleeping rank keeps on its GPU; one GPU keeps 1 GiB. Every
+  refusal for memory or GPU count names the `tensor_parallel` that would fit.
 - **Placement** (§2, §1a): sets of N identical GPUs, the largest smallest headroom first;
   eviction by the smallest union of victims, a multi-GPU victim whole; the chosen set and N
   recorded with the instance (new forward-only schema version) and kept through parks and
@@ -69,16 +70,24 @@ pin exactly N GPUs, and `topology: auto` lets CapyCTL choose N.
   and checks that this checkout's qualification edit flips exactly those two entries.
 
 Tests (T46), new in `capyctl-config` (`tests/multi_gpu.rs`), `capyctl-store`
-(`tests/multi_gpu_placement.rs`, the v58 migration), `capyctl-scheduler`, `capyctl-domain`
-(`local_tp`), `capyctl-agent`, `capyctl-controller`, `capyctl-router` and `capyctl-protocol`.
-Fast gate (`scripts/ci-local.sh`) on this branch: every step passes, 1687 unit tests, 0
-failed. The placement tests' branch ran the store, scheduler, controller and CLI suites with
-every target: 1732 passed, 0 failed. The deep gate is still owed before merge. CPU and
-Fake-engine tests are not qualification: nothing here has
-run on two GPUs. The live check still needed is the rented session (ADR 0035 §14): MG1–MG14
-and the bandwidth test; MG4 and MG5 decide whether vLLM's and SGLang's `deep_park` is turned
-on at N > 1, and MG1–MG3, MG6–MG9 and MG13 must pass before the release notes call the
-feature qualified.
+(`tests/multi_gpu_placement.rs`, the v58 migration, the per-GPU park and wake judgment and
+the per-GPU residue), `capyctl-scheduler`, `capyctl-domain` (`local_tp`), `capyctl-agent`
+(the per-rank saver read and each device-list refusal), `capyctl-controller` (the saver
+observer per device), `capyctl-router`, `capyctl-protocol` and `capyctl-management` (the
+`topology_auto_changed` event). Gates on this branch: `scripts/ci-local.sh --deep
+--ci-shape`, every step passes: unit 1708 passed, 0 failed (1 ignored); runtime Python 384
+passed; core 1795 passed, 0 failed; workspace 3833 passed, 0 failed (1 ignored). CPU and
+Fake-engine tests are not qualification: nothing here has run on two GPUs. The live check
+still needed is the rented session (ADR 0035 §14), every row in one run:
+
+```bash
+scripts/live/multi-gpu/run.sh --ssh <user>@<host>
+```
+
+MG1–MG14 and the bandwidth test; MG4 and MG5 decide whether vLLM's and SGLang's
+`deep_park` is turned on at N > 1 (the first park at N > 1 also shows whether each GPU's
+parked residue stays within its 2.25 GiB parked charge), and MG1–MG3, MG6–MG9 and MG13 must
+pass before the release notes call the feature qualified.
 
 # Release note: Several GPUs
 

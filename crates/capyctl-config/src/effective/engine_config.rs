@@ -1205,7 +1205,17 @@ fn derive_discrete(inputs: DiscreteInputs<'_>) -> Result<RecipeFootprints, Confi
     };
     let steady = add(overhead, always)?;
     let with_copy = add(overhead, copy)?;
-    let residue = PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES.min(request);
+    // ADR 0035 §§3, 9: a rank parked on one of several GPUs keeps what its
+    // Ready charge carries beside its request there: the CUDA context and
+    // graphs and the communication buffers (NCCL, custom all-reduce, the
+    // contexts opened from its peers). Until a park measures it (ADR 0014
+    // A13), that is each GPU's parked charge, and so the bound its per-GPU
+    // park evidence is judged against; one GPU keeps its placeholder.
+    let residue = if ranks > 1 {
+        add(overheads.device, overheads.communication)?.min(active)
+    } else {
+        PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES.min(request)
+    };
     // The parked phase is what admission counts against each domain's
     // parked_limit, so the copy is charged there as parked residue. Parking and
     // wake are the transitions into and out of it: the copy exists while the
