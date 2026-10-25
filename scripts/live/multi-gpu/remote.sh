@@ -626,10 +626,20 @@ bench_pair() { # name engine label
   if [ "$PLAN" = 0 ]; then
     log=$(find "$SD/logs" -type f -name '*.log' -newer "$RES/start-$n.out" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)
     [ -n "$log" ] || log=$(find "$SD/logs" -type f -name '*.log' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)
-    args=$("${HELPER[@]}" engine-args --engine "$([ "$e" = v32 ] && echo vllm || echo sglang)" "$log")
+    # vLLM logs no `non-default args` under CapyCTL: its API process's argv,
+    # read while it runs, is the record then (mg.py engine-args --argv).
+    local api
+    api=$("${HELPER[@]}" owned "$DB" "$n" --role api 2>/dev/null | head -1 | python3 -c 'import json,sys; print(json.loads(sys.stdin.read() or "{}").get("pid",""))')
+    : >"$RES/mg9-$l-argv.txt"
+    [ -n "$api" ] && [ -r "/proc/$api/cmdline" ] && tr '\0' '\n' <"/proc/$api/cmdline" >"$RES/mg9-$l-argv.txt"
+    args=$("${HELPER[@]}" engine-args --engine "$([ "$e" = v32 ] && echo vllm || echo sglang)" "$log" --argv "$RES/mg9-$l-argv.txt")
     echo "$args" >"$RES/mg9-$l-args.json"
   fi
   stopd "$n"
+  if [ "$PLAN" = 0 ] && [ "$(tr -d ' \n' <"$RES/mg9-$l-args.json")" = "{}" ]; then
+    result MG9 "$l" fail "no record of the engine's arguments under CapyCTL (log or argv); nothing launched by hand"
+    return
+  fi
   if [ "$PLAN" = 1 ]; then uuids='<uuid of gpu0>,<uuid of gpu1>'; else
     uuids=$(nvidia-smi --query-gpu=uuid --format=csv,noheader | head -2 | paste -sd,)
   fi
@@ -651,7 +661,11 @@ bench_pair() { # name engine label
   if [ "$PLAN" = 1 ]; then show "\$ ${hp[*]} &   (by hand; then wait for /v1/models on 127.0.0.1:$port)"; else
     setsid nohup "${hp[@]}" >"$RES/mg9-$l-hand.log" 2>&1 </dev/null &
     local hand=$! _
-    for _ in $(seq 1800); do curl -fs "http://127.0.0.1:$port/v1/models" >/dev/null 2>&1 && break; sleep 1; done
+    for _ in $(seq 1800); do
+      curl -fs "http://127.0.0.1:$port/v1/models" >/dev/null 2>&1 && break
+      [ -d "/proc/$hand" ] || { say "the hand launch exited before serving; see mg9-$l-hand.log"; break; }
+      sleep 1
+    done
     for cc in 1 4 8; do
       "${HELPER[@]}" bench --no-key --endpoint "http://127.0.0.1:$port" --model "$model" --concurrency "$cc" --tokens 256 --rounds 3 --out "$RES/mg9-$l-hand-c$cc.json" >>"$RES/cli.log"
     done

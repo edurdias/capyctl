@@ -18,7 +18,7 @@ read. The role's ledger is opened read-only (mode=ro).
     mg.py owned      DB NAME [--role R | --rank N]
                      the ownership evidence of a deployment's live launches (JSON lines)
     mg.py gpus       [--pids P,P]         per-GPU totals and, for those PIDs, per-GPU bytes (JSON)
-    mg.py engine-args --engine vllm|sglang LOG
+    mg.py engine-args --engine vllm|sglang LOG [--argv FILE]
                      the engine's own record of its arguments (vLLM `non-default args`, SGLang
                      `server_args`), less the per-launch keys (port, key, names), as JSON
     mg.py listeners  --pids P,P           TCP listeners of those PIDs, from /proc; with `ss -ltnp` beside
@@ -230,6 +230,29 @@ def cmd_engine_args(a):
                     parsed[k] = ast.literal_eval(v)
                 except (ValueError, SyntaxError):
                     parsed[k] = v.strip()
+    if not parsed and a.argv and Path(a.argv).is_file():
+        # vLLM 0.32.0 under CapyCTL logs no `non-default args` line: the API
+        # process's own argv (one token per line, read from /proc while it ran),
+        # `... serve MODEL --flag [value] ...`. The engine key rides the
+        # environment, never argv; any key-like flag is dropped all the same.
+        tokens = Path(a.argv).read_text().split("\n")
+        if "serve" in tokens:
+            rest = tokens[tokens.index("serve") + 2:]
+            i = 0
+            while i < len(rest):
+                tok = rest[i]
+                if tok.startswith("--"):
+                    key = tok[2:].split("=", 1)[0].replace("-", "_")
+                    if "=" in tok:
+                        value, i = tok.split("=", 1)[1], i + 1
+                    elif i + 1 < len(rest) and rest[i + 1] and not rest[i + 1].startswith("--"):
+                        value, i = rest[i + 1], i + 2
+                    else:
+                        value, i = True, i + 1
+                    if not re.search(r"key|token|secret", key):
+                        parsed[key] = value
+                else:
+                    i += 1
     print(json.dumps({k: v for k, v in parsed.items() if k not in VOLATILE}, sort_keys=True, default=str))
     return 0 if parsed else 1
 
@@ -542,6 +565,7 @@ def main():
     s = sub.add_parser("engine-args")
     s.add_argument("--engine", required=True, choices=["vllm", "sglang"])
     s.add_argument("log")
+    s.add_argument("--argv")
     a = p.parse_args()
     return globals()["cmd_" + a.cmd.replace("-", "_")](a)
 
