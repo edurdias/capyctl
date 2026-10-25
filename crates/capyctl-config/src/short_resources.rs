@@ -71,7 +71,8 @@ fn figures(resources: &Value) -> Result<Option<[(String, i64); 2]>, ConfigError>
 }
 
 /// The checks a short-form block needs no host for: its figures, a residency
-/// that does not park and at most one device. `None` for the long form.
+/// that does not park and at most one device, or (ADR 0035 §3) one device
+/// per rank of a one-host `topology`. `None` for the long form.
 pub fn check(deployment: &Value) -> Result<Option<[(String, i64); 2]>, ConfigError> {
     let Some(figures) = figures(&deployment["resources"])? else {
         return Ok(None);
@@ -88,13 +89,17 @@ pub fn check(deployment: &Value) -> Result<Option<[(String, i64); 2]>, ConfigErr
             ),
         ));
     }
+    // ADR 0035 §3: on several GPUs of one host `gpu` is each GPU's charge
+    // and `ram` the whole instance's.
+    let ranks = crate::topology::declared_local_size(deployment).unwrap_or(1) as usize;
     if deployment["devices"]
         .as_array()
-        .is_some_and(|d| d.len() > 1)
+        .is_some_and(|d| d.len() > ranks)
     {
         return Err(invalid(
             "resources",
-            "the short form charges one device; with several devices write the five phases",
+            "the short form charges one device; with several devices write the five phases, \
+             or state `topology: {tensor_parallel: N}` to charge `gpu` on each of N GPUs",
         ));
     }
     Ok(Some(figures))
@@ -118,14 +123,16 @@ pub fn offline_phases(resources: &Value) -> Option<Value> {
 }
 
 /// Replace a short-form block with the five phases it stands for on `host`.
-/// A document whose one claim names no device yet keeps the short form until
-/// placement names it (`instances::assign_devices`).
+/// A document whose claims name no device yet keeps the short form until
+/// placement names them (`instances::assign_devices`). ADR 0035 §3: with
+/// several claims (a one-host `topology`), `gpu` charges each claimed GPU's
+/// device domain and `ram` the system domain once.
 pub fn expand_for_host(deployment: &mut Value, host: &Value) -> Result<(), ConfigError> {
     let Some([(gpu_text, gpu), (ram_text, ram)]) = check(deployment)? else {
         return Ok(());
     };
-    let claim = match deployment["devices"].as_array().map(Vec::as_slice) {
-        Some([claim]) => claim.clone(),
+    let claims = match deployment["devices"].as_array() {
+        Some(claims) if !claims.is_empty() => claims.clone(),
         _ => {
             return Err(invalid(
                 "resources",
@@ -133,13 +140,23 @@ pub fn expand_for_host(deployment: &mut Value, host: &Value) -> Result<(), Confi
             ))
         }
     };
-    let Some(id) = claim["id"].as_str() else {
+    let Some(ids) = claims
+        .iter()
+        .map(|claim| claim["id"].as_str())
+        .collect::<Option<Vec<&str>>>()
+    else {
         return Ok(());
     };
     let policy = &host["resource_policy"];
-    let domain = policy["devices"][id]["domain"]
-        .as_str()
-        .ok_or_else(|| invalid("devices", "unknown device"))?;
+    let domains = ids
+        .iter()
+        .map(|id| {
+            policy["devices"][*id]["domain"]
+                .as_str()
+                .ok_or_else(|| invalid("devices", "unknown device"))
+        })
+        .collect::<Result<Vec<&str>, ConfigError>>()?;
+    let domain = domains[0];
     let allocations = |gpu: Value, ram: Value| -> Result<Value, ConfigError> {
         if policy["domains"][domain]["memory"] != "device" {
             return Ok(json!([{"domain": domain, "bytes": gpu, "host_kv_bytes": "0B"}]));
@@ -158,10 +175,12 @@ pub fn expand_for_host(deployment: &mut Value, host: &Value) -> Result<(), Confi
                  for the short form's `ram`",
             ));
         };
-        Ok(json!([
-            {"domain": domain, "bytes": gpu, "host_kv_bytes": "0B"},
-            {"domain": system, "bytes": ram, "host_kv_bytes": "0B"}
-        ]))
+        let mut charged: Vec<Value> = domains
+            .iter()
+            .map(|device| json!({"domain": device, "bytes": gpu, "host_kv_bytes": "0B"}))
+            .collect();
+        charged.push(json!({"domain": system, "bytes": ram, "host_kv_bytes": "0B"}));
+        Ok(Value::Array(charged))
     };
     let discrete = policy["domains"][domain]["memory"] == "device";
     let active = if discrete {
@@ -178,7 +197,7 @@ pub fn expand_for_host(deployment: &mut Value, host: &Value) -> Result<(), Confi
         let value = if phase == "parked" {
             json!({"allocations": parked, "devices": []})
         } else {
-            json!({"allocations": active, "devices": [claim]})
+            json!({"allocations": active, "devices": claims})
         };
         phases.insert(phase.into(), value);
     }

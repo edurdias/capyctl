@@ -547,7 +547,10 @@ pub(super) fn plan_on(
         host_declares_lmcache: declared(lc::CAPABILITY)?,
         host_declares_retention: declared(lc::RETENTION_CAPABILITY)?,
         api: e.api,
-        topology: e.engine_config.memory().member.is_some(),
+        // ADR 0035 §9: a model on several GPUs of one host records its rank
+        // share in `memory.member` too, and is not a group.
+        topology: e.engine_config.memory().member.is_some() && e.local_tensor_parallel() == 1,
+        multi_gpu: e.local_tensor_parallel() > 1,
         registration: e.profile.lmcache.as_ref(),
         kv_transfer_config_set: capyctl_config::engine_policy::kv_transfer_config_set(
             e.profile.engine,

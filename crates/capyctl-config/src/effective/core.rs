@@ -585,25 +585,31 @@ fn check_domain_shape(
     Ok(())
 }
 
-/// Discrete GPU design §7: one GPU per model on a machine. On a host with a device
-/// domain, a deployment claiming more than one device is refused before any
-/// phase is resolved. Tensor parallelism on one machine has no deployment field
-/// to ask for it: `--tensor-parallel-size` is a reserved engine argument
-/// (`engine_policy`). A group's `topology` spreads ranks over machines, with one
-/// device per host (ADR 0028).
+/// Discrete GPU design §7: one GPU per model on a machine unless the
+/// deployment asks for several. ADR 0035 §1 (narrowing ADR 0019 §6): on a
+/// host with a device domain, a deployment claiming more devices than its
+/// `topology.tensor_parallel` (none: one) is refused before any phase is
+/// resolved, with the hint to state the size. A group's `topology` spreads
+/// ranks over machines, with one device per host (ADR 0028).
 pub(super) fn check_single_device(
     devices: &[DeviceClaim],
     host: &HostPolicy,
+    ranks: u32,
 ) -> Result<(), ConfigError> {
     let discrete = host
         .domains
         .values()
         .any(|d| d.memory == DomainMemory::Device);
-    if discrete && devices.len() > 1 {
+    if discrete && ranks == 1 && devices.len() > 1 {
         return Err(invalid(
             "devices",
-            "multi_gpu_unsupported: one GPU per model on a machine; to spread one model \
-             over machines, give it a `topology` and `placement.hosts`",
+            format!(
+                "multi_gpu_unsupported: the deployment names {n} devices without a `topology`; \
+                 to run one model on {n} GPUs of this host add `topology: {{tensor_parallel: \
+                 {n}}}`; to spread one model over machines, give it a `topology` and \
+                 `placement.hosts`",
+                n = devices.len()
+            ),
         ));
     }
     Ok(())
@@ -611,19 +617,31 @@ pub(super) fn check_single_device(
 
 /// Review decision (discrete GPU design §3): the device domain a deployment
 /// without explicit resources derives its phases on, when it is a discrete
-/// GPU's. `None` on a unified host or when the selected devices do not name
-/// exactly one device domain (derivation refuses that shape on its own).
+/// GPU's. `None` on a unified host or when the selected devices do not all
+/// name device domains (derivation refuses that shape on its own). ADR 0035
+/// §3: on several identical GPUs each rank sizes from one GPU, the smallest
+/// figures of the set, and carries the communication allowance.
 pub(super) fn derived_device_sizing(
     devices: &[DeviceClaim],
     host: &HostPolicy,
+    communication: i64,
+    limits: super::Limits,
 ) -> Option<super::engine_config::DeviceSizing> {
-    let [claim] = devices else {
-        return None;
-    };
-    let domain = host.domains.get(&host.devices.get(&claim.id)?.domain)?;
-    (domain.memory == DomainMemory::Device).then(|| super::engine_config::DeviceSizing {
-        managed_limit: domain.managed_limit,
-        declared_total: domain.managed_limit.saturating_add(domain.free_reserve),
+    let domains = devices
+        .iter()
+        .map(|claim| {
+            let domain = host.domains.get(&host.devices.get(&claim.id)?.domain)?;
+            (domain.memory == DomainMemory::Device).then_some(domain)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(super::engine_config::DeviceSizing {
+        managed_limit: domains.iter().map(|domain| domain.managed_limit).min()?,
+        declared_total: domains
+            .iter()
+            .map(|domain| domain.managed_limit.saturating_add(domain.free_reserve))
+            .min()?,
+        communication,
+        enforce_limit: limits == super::Limits::Enforce,
     })
 }
 

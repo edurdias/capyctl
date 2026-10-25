@@ -441,6 +441,15 @@ fn check_value(value: &Value, spec: &FieldSpec, path: &str) -> Result<(), Config
                 Ok(())
             }
         }
+        FieldSpec::KeywordOrStruct(keywords, fields) => match value {
+            serde_json::Value::Object(obj) => check_object(obj, fields, path),
+            serde_json::Value::String(text) if keywords.contains(&text.as_str()) => Ok(()),
+            _ => Err(ConfigError::new(
+                ConfigErrorCode::SchemaVersion,
+                path,
+                format!("expected a mapping or one of: {}", keywords.join(", ")),
+            )),
+        },
         FieldSpec::MapOf(entry) => {
             let obj = value.as_object().ok_or_else(|| {
                 ConfigError::new(ConfigErrorCode::SchemaVersion, path, "expected a mapping")

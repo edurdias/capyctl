@@ -1011,3 +1011,115 @@ fn the_short_resources_form_shows_its_phases() {
         "{text_out}"
     );
 }
+
+/// The discrete host example with a second identical card, `gpu1`.
+fn two_gpu_host(root: &Path) -> PathBuf {
+    let text = std::fs::read_to_string(examples().join("host-discrete.yaml"))
+        .unwrap()
+        .replace(
+            "  # host_backed parks keep weights here",
+            "    gpu1:\n      memory: device\n      device: gpu1\n      managed_limit: \"22GiB\"\n      \
+             free_reserve: \"2GiB\"\n      parked_limit: \"2GiB\"\n  # host_backed parks keep weights here",
+        )
+        .replace(
+            "    gpu0:\n      domain: gpu0\n      sharing: shared\n",
+            "    gpu0:\n      domain: gpu0\n      sharing: shared\n    gpu1:\n      domain: gpu1\n      sharing: shared\n",
+        );
+    write(root, "host-two.yaml", &text)
+}
+
+// T46 (ADR 0035 §1): `validate config --host` shows a model's GPUs in rank
+// order and the charge on each, beside every key it showed before; too few
+// GPUs exits 4 naming what would fit.
+#[test]
+fn validate_shows_the_gpus_and_the_per_gpu_charge() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = two_gpu_host(dir.path());
+    let file = write(
+        dir.path(),
+        "tp2.yaml",
+        "name: tp2\nengine: vllm\nmodel: coding-small-r1\ntopology: {tensor_parallel: 2}\n\
+         engine_config:\n  memory:\n    request: 12GiB\n    kv_cache: 2GiB\n",
+    );
+    let (code, value, raw) = validate(&[
+        "--file",
+        file.to_str().unwrap(),
+        "--host",
+        host.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{raw}");
+    let effective = &value["effective"];
+    assert_eq!(effective["selected_devices"][1]["id"], "gpu1", "{raw}");
+    let topology = &effective["topology"];
+    assert_eq!(topology["tensor_parallel"], 2, "{raw}");
+    assert_eq!(topology["gpus"], json!(["gpu0", "gpu1"]), "{raw}");
+    let gib: i64 = 1 << 30;
+    let per_gpu = 12 * gib + (5 << 28) + gib;
+    assert_eq!(topology["per_gpu"]["ready"], per_gpu, "{raw}");
+    assert_eq!(topology["system"]["ready"], 7 * gib, "{raw}");
+    let domains: Vec<&str> = effective["resources"]["ready"]["allocations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["domain"].as_str().unwrap())
+        .collect();
+    assert_eq!(domains, ["gpu0", "gpu1", "system"], "{raw}");
+    let three = write(
+        dir.path(),
+        "tp3.yaml",
+        "name: tp3\nengine: vllm\nmodel: coding-small-r1\ntopology: {tensor_parallel: 3}\n\
+         engine_config:\n  memory:\n    request: 12GiB\n    kv_cache: 2GiB\n",
+    );
+    let (code, _, raw) = validate(&[
+        "--file",
+        three.to_str().unwrap(),
+        "--host",
+        host.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 4, "{raw}");
+    assert!(raw.contains("insufficient_gpus"), "{raw}");
+    assert!(raw.contains("what would fit"), "{raw}");
+}
+
+// T46 (ADR 0035 §1a): under `topology: auto` validate shows the candidate
+// table; offline the weights are unknown, so no size is chosen yet.
+#[test]
+fn validate_shows_the_auto_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = two_gpu_host(dir.path());
+    let file = write(
+        dir.path(),
+        "auto.yaml",
+        "name: auto\nengine: vllm\nmodel: coding-small-r1\ntopology: auto\n",
+    );
+    let (code, value, raw) = validate(&[
+        "--file",
+        file.to_str().unwrap(),
+        "--host",
+        host.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{raw}");
+    let topology = &value["effective"]["topology"];
+    assert_eq!(topology["requested"], "auto", "{raw}");
+    let sizes: Vec<i64> = topology["candidates"]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["tensor_parallel"].as_i64().unwrap())
+        .collect();
+    assert_eq!(sizes, [1, 2], "{raw}");
+    assert_eq!(topology["chosen"], Value::Null, "{raw}");
+    assert!(
+        topology["note"].as_str().unwrap().contains("measured"),
+        "{raw}"
+    );
+    // Beside `devices` it is refused, exit 2.
+    let pinned = write(
+        dir.path(),
+        "pinned.yaml",
+        "name: auto\nengine: vllm\nmodel: coding-small-r1\ntopology: auto\ndevices: [{id: gpu0}]\n",
+    );
+    let (code, _, raw) = validate(&["--file", pinned.to_str().unwrap()]);
+    assert_eq!(code, 2, "{raw}");
+    assert!(raw.contains("topology_devices_mismatch"), "{raw}");
+}

@@ -82,3 +82,39 @@ pub fn check_engine_shape(
     }
     Ok(())
 }
+
+/// ADR 0035 §10: what each engine runs on several GPUs of one host. `None`
+/// for an engine with no local multi-GPU mode (TensorFold until its own
+/// change says otherwise, custom engines), which stays on one GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalSupport {
+    /// The largest tensor-parallel size; `None` is any size up to the
+    /// host's GPU count.
+    pub max_tensor_parallel: Option<u32>,
+    /// Pipeline parallel on one host (ADR 0035 owner decision 9: not in 0.1.9).
+    pub pipeline: bool,
+    /// Deep and host-backed parking at N > 1, enabled per engine only once
+    /// its live row passes (ADR 0035 §9: MG4 for vLLM, MG5 for SGLang).
+    pub deep_park: bool,
+    /// llama.cpp's `--split-mode` values CapyCTL renders (ADR 0035 §4,
+    /// owner decision 5: `layer` only); empty for the tensor-parallel engines.
+    pub split_modes: &'static [&'static str],
+}
+
+pub fn local_support(engine: &str) -> Option<LocalSupport> {
+    match engine {
+        "vllm" | "sglang" => Some(LocalSupport {
+            max_tensor_parallel: None,
+            pipeline: false,
+            deep_park: false,
+            split_modes: &[],
+        }),
+        "llamacpp" => Some(LocalSupport {
+            max_tensor_parallel: None,
+            pipeline: false,
+            deep_park: false,
+            split_modes: &["layer"],
+        }),
+        _ => None,
+    }
+}

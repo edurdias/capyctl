@@ -129,6 +129,11 @@ pub struct InstanceSpec {
     /// for a world size above one, so a single-host command keeps its identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<crate::topology::GroupShape>,
+    /// ADR 0035 §1, §1a: one instance on several GPUs of one host, or
+    /// `topology: auto`. Absent on one GPU and for a group, so their commands
+    /// keep their identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<crate::topology::LocalTopology>,
 }
 
 impl Default for InstanceSpec {
@@ -139,6 +144,7 @@ impl Default for InstanceSpec {
             warm: false,
             activation: Activation::OnDemand,
             group: None,
+            local: None,
         }
     }
 }
@@ -249,6 +255,129 @@ pub fn assign_devices(deployment: &Value, host: &Value) -> Result<Value, ConfigE
     Ok(result)
 }
 
+/// ADR 0035 §1: the tolerance within which two GPUs' total memory is the
+/// same, that of the ADR 0019 sample.
+pub const SAME_TOTAL_TOLERANCE_BYTES: i64 = 64 << 20;
+
+/// One discrete GPU of a host document, as eligibility reads it.
+struct HostGpu {
+    id: String,
+    sharing: String,
+    product: Option<String>,
+    /// The card as the host policy declares it: the device domain's managed
+    /// limit plus its free reserve.
+    total: Option<i64>,
+}
+
+/// The driver index a `gpuN` id names, `u32::MAX` for any other id (so it
+/// sorts last).
+fn gpu_order(id: &str) -> u32 {
+    id.strip_prefix("gpu")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(u32::MAX)
+}
+
+/// The host's GPUs whose domain is a `device` domain, lowest driver index
+/// first, with the sharing each allows.
+fn host_gpus(host: &Value) -> Vec<HostGpu> {
+    let policy = &host["resource_policy"];
+    let default_sharing = policy["device_sharing"].as_str().unwrap_or("exclusive");
+    let bytes = |value: &Value| {
+        value
+            .as_str()
+            .and_then(|text| crate::effective::parse_bytes(text).ok())
+    };
+    let mut gpus: Vec<HostGpu> = policy["devices"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(id, device)| {
+            let domain = &policy["domains"][device["domain"].as_str()?];
+            (domain["memory"] == "device").then(|| HostGpu {
+                id: id.clone(),
+                sharing: device["sharing"]
+                    .as_str()
+                    .unwrap_or(default_sharing)
+                    .to_owned(),
+                product: device["product_name"].as_str().map(str::to_owned),
+                total: bytes(&domain["managed_limit"])
+                    .zip(bytes(&domain["free_reserve"]))
+                    .and_then(|(managed, reserve)| managed.checked_add(reserve)),
+            })
+        })
+        .collect();
+    gpus.sort_by(|a, b| {
+        gpu_order(&a.id)
+            .cmp(&gpu_order(&b.id))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    gpus
+}
+
+/// ADR 0035 §1 (owner decision 4): two GPUs are the same product with the
+/// same total memory, within [`SAME_TOTAL_TOLERANCE_BYTES`].
+fn identical(a: &HostGpu, b: &HostGpu) -> bool {
+    a.product == b.product
+        && match (a.total, b.total) {
+            (Some(x), Some(y)) => (x - y).abs() <= SAME_TOTAL_TOLERANCE_BYTES,
+            _ => false,
+        }
+}
+
+/// The number of discrete GPUs (device domains) a host document has.
+pub fn discrete_gpu_count(host: &Value) -> usize {
+    host_gpus(host).len()
+}
+
+/// ADR 0035 §1, §2: the host's sets of `n` identical discrete GPUs, each in
+/// rank order (ascending driver index), the sets in lexicographic order of
+/// their indices, so the first is the lowest. With `shared_only`, only GPUs
+/// the host lets be shared. `n == 1` is every GPU on its own.
+pub fn eligible_sets(host: &Value, n: usize, shared_only: bool) -> Vec<Vec<String>> {
+    let gpus: Vec<HostGpu> = host_gpus(host)
+        .into_iter()
+        .filter(|gpu| !shared_only || gpu.sharing == "shared")
+        .collect();
+    let mut sets = Vec::new();
+    for_each_combination(gpus.len(), n, &mut |pick| {
+        let first = &gpus[pick[0]];
+        if pick.iter().all(|&i| n == 1 || identical(first, &gpus[i])) {
+            sets.push(pick.iter().map(|&i| gpus[i].id.clone()).collect());
+        }
+    });
+    sets
+}
+
+/// Every `n`-combination of `0..len`, ascending within, in lexicographic
+/// order; none when `n` is 0 or above `len`.
+pub(crate) fn for_each_combination(len: usize, n: usize, visit: &mut dyn FnMut(&[usize])) {
+    if n == 0 || n > len {
+        return;
+    }
+    let mut pick: Vec<usize> = (0..n).collect();
+    loop {
+        visit(&pick);
+        let Some(at) = (0..n).rev().find(|&k| pick[k] < len - n + k) else {
+            return;
+        };
+        let base = pick[at] + 1;
+        for (offset, slot) in pick[at..].iter_mut().enumerate() {
+            *slot = base + offset;
+        }
+    }
+}
+
+/// ADR 0035 §2: the key a set of GPUs is chosen and recorded under, its ids
+/// in rank order joined by `,` (one GPU's key is its id, as before).
+pub fn set_key(ids: &[String]) -> String {
+    ids.join(",")
+}
+
+/// The ids of a key [`set_key`] wrote, in rank order.
+pub fn set_ids(key: &str) -> Vec<&str> {
+    key.split(',').collect()
+}
+
 /// Discrete GPU design §7 (ADR 0019, owner decision 3): on a host whose GPUs
 /// are device-memory domains, a deployment that pins no device is resolved
 /// once per GPU, and placement picks the GPU. Each choice is the deployment
@@ -263,33 +392,24 @@ pub fn assign_devices(deployment: &Value, host: &Value) -> Result<Value, ConfigE
 /// `multi_gpu_unsupported` by resolution), or declares explicit `resources`,
 /// which name their domains and so their device (the short form
 /// `{gpu, ram}` names none, so it offers the choice).
+///
+/// ADR 0035 §2: with `topology.tensor_parallel: N` on one host, each choice
+/// is a set of N identical GPUs (no claim, or N unnamed claims of one
+/// sharing), keyed by [`set_key`]. ADR 0035 §1a: under `topology: auto`
+/// the choices are every candidate size's sets, N = 1 first, each the
+/// deployment as an explicit `tensor_parallel: N` states it (no `topology`
+/// at N = 1), so a chosen set launches exactly as the explicit N does;
+/// placement picks N from the candidate table of the `auto` deployment's
+/// own resolution ([`crate::effective::choose_tensor_parallel`]) and the
+/// set among that N's choices.
 pub fn device_choices(
     deployment: &Value,
     host: &Value,
 ) -> Result<Vec<(String, Value)>, ConfigError> {
-    let policy = &host["resource_policy"];
-    let default_sharing = policy["device_sharing"].as_str().unwrap_or("exclusive");
-    let mut devices: Vec<(String, String)> = policy["devices"]
-        .as_object()
-        .map(|devices| {
-            devices
-                .iter()
-                .filter(|(_, device)| {
-                    device["domain"]
-                        .as_str()
-                        .is_some_and(|domain| policy["domains"][domain]["memory"] == "device")
-                })
-                .map(|(id, device)| {
-                    let sharing = device["sharing"].as_str().unwrap_or(default_sharing);
-                    (id.clone(), sharing.to_owned())
-                })
-                .collect()
-        })
-        .unwrap_or_default();
     let names_domains = deployment
         .get("resources")
         .is_some_and(|r| !r.is_null() && !crate::short_resources::is_short(r));
-    if devices.is_empty() || names_domains {
+    if host_gpus(host).is_empty() || names_domains {
         return Ok(Vec::new());
     }
     let claims = match deployment.get("devices") {
@@ -297,31 +417,59 @@ pub fn device_choices(
         Some(Value::Array(claims)) => claims.clone(),
         Some(_) => return Err(invalid("devices", "must be a list")),
     };
+    let local = parse_instance_spec(deployment)?.local;
+    let sizes: Vec<usize> = match local {
+        None => vec![1],
+        Some(crate::topology::LocalTopology::Fixed(topology)) => {
+            vec![topology.tensor_parallel as usize]
+        }
+        Some(crate::topology::LocalTopology::Auto) => (1..=host_gpus(host).len()).collect(),
+    };
     let wanted = match claims.as_slice() {
         [] => None,
-        [claim] if claim.get("id").is_none() => claim["sharing"].as_str(),
+        [claim, ..]
+            if claims.len() == sizes[0]
+                && claims
+                    .iter()
+                    .all(|c| c.get("id").is_none() && c["sharing"] == claim["sharing"]) =>
+        {
+            claim["sharing"].as_str()
+        }
         _ => return Ok(Vec::new()),
     };
-    if wanted == Some("shared") {
-        devices.retain(|(_, sharing)| sharing == "shared");
-    }
-    let index = |id: &str| -> u32 {
-        id.strip_prefix("gpu")
-            .and_then(|n| n.parse().ok())
-            .unwrap_or(u32::MAX)
+    let sharing_of = |id: &str| {
+        host_gpus(host)
+            .into_iter()
+            .find(|gpu| gpu.id == id)
+            .map(|gpu| gpu.sharing)
+            .unwrap_or_default()
     };
-    devices.sort_by(|(a, _), (b, _)| index(a).cmp(&index(b)).then_with(|| a.cmp(b)));
-    Ok(devices
-        .into_iter()
-        .map(|(id, sharing)| {
+    let mut choices = Vec::new();
+    for n in sizes {
+        for set in eligible_sets(host, n, wanted == Some("shared")) {
             let mut choice = deployment.clone();
-            choice["devices"] = serde_json::json!([{
-                "id": id,
-                "sharing": wanted.unwrap_or(&sharing),
-            }]);
-            (id, choice)
-        })
-        .collect())
+            if local == Some(crate::topology::LocalTopology::Auto) {
+                let object = choice.as_object_mut().expect("a deployment is a mapping");
+                if n == 1 {
+                    object.remove("topology");
+                } else {
+                    object.insert("topology".into(), serde_json::json!({"tensor_parallel": n}));
+                }
+            }
+            choice["devices"] = Value::Array(
+                set.iter()
+                    .map(|id| {
+                        serde_json::json!({
+                            "id": id,
+                            "sharing": wanted.map_or_else(|| sharing_of(id), str::to_owned),
+                        })
+                    })
+                    .collect(),
+            );
+            choices.push((set_key(&set), choice));
+        }
+    }
+    Ok(choices)
 }
 
 /// The command identity of unnamed device claims: each takes the placeholder
@@ -535,8 +683,13 @@ pub fn parse_instance_spec(deployment: &Value) -> Result<InstanceSpec, ConfigErr
         warm,
         activation,
         group: None,
+        local: None,
     };
     spec.group = crate::topology::parse_group_shape(deployment, &spec)?;
+    spec.local = crate::topology::parse_local_topology(deployment, &spec)?;
+    if let Some(local) = spec.local {
+        check_local_declaration(object, local)?;
+    }
     // ADR 0013 §3: with an explicit allowed set the count must fit it. A group
     // places its ranks on its named hosts instead (ADR 0028 §2).
     if let Some(hosts) = spec
@@ -572,4 +725,85 @@ pub fn parse_instance_spec(deployment: &Value) -> Result<InstanceSpec, ConfigErr
         ));
     }
     Ok(spec)
+}
+
+/// ADR 0035 §1, §1a, §3: what a deployment on several GPUs of one host may
+/// state beside its `topology`. `devices` pins exactly N distinct GPUs (no
+/// claim, or N claims); beside `auto` it pins none, and declares no
+/// `resources`, `memory.request` or `memory.startup`: the charge is derived
+/// for each candidate N, and a fixed per-GPU figure would mean something
+/// different at each.
+fn check_local_declaration(
+    object: &serde_json::Map<String, Value>,
+    local: crate::topology::LocalTopology,
+) -> Result<(), ConfigError> {
+    use crate::topology::{LocalTopology, TOPOLOGY_DEVICES_MISMATCH};
+    let claims = object
+        .get("devices")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    match local {
+        LocalTopology::Auto => {
+            if !claims.is_empty() {
+                return Err(invalid(
+                    "devices",
+                    &format!(
+                        "{TOPOLOGY_DEVICES_MISMATCH}: `topology: auto` chooses its GPUs; to pin \
+                         GPUs, state `topology: {{tensor_parallel: N}}` with N devices"
+                    ),
+                ));
+            }
+            let memory = object
+                .get("engine_config")
+                .and_then(|config| config.get("memory"));
+            let stated =
+                |key: &str| memory.is_some_and(|m| m.get(key).is_some_and(|v| !v.is_null()));
+            for (path, stated) in [
+                (
+                    "resources",
+                    object.get("resources").is_some_and(|r| !r.is_null()),
+                ),
+                ("engine_config.memory.request", stated("request")),
+                ("engine_config.memory.startup", stated("startup")),
+            ] {
+                if stated {
+                    return Err(invalid(
+                        path,
+                        &format!(
+                            "`{path}` beside `topology: auto`: the charge is derived for each \
+                             candidate tensor-parallel size, and a fixed per-GPU figure would \
+                             mean something different at each; remove it, or state \
+                             `topology: {{tensor_parallel: N}}`"
+                        ),
+                    ));
+                }
+            }
+        }
+        LocalTopology::Fixed(topology) => {
+            let named: BTreeSet<&str> = claims
+                .iter()
+                .filter_map(|claim| claim.get("id").and_then(Value::as_str))
+                .collect();
+            let distinct = named.len() == claims.len() || named.is_empty();
+            if !claims.is_empty()
+                && (claims.len() != topology.tensor_parallel as usize || !distinct)
+            {
+                return Err(invalid(
+                    "devices",
+                    &format!(
+                        "{TOPOLOGY_DEVICES_MISMATCH}: `topology.tensor_parallel: {n}` runs on {n} \
+                         distinct GPUs; `devices` lists {} {}",
+                        claims.len(),
+                        if distinct {
+                            "entries"
+                        } else {
+                            "entries with a repeat"
+                        },
+                        n = topology.tensor_parallel,
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }

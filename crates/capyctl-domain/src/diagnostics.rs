@@ -76,7 +76,12 @@ const HINTS: &[(&str, &str)] = &[
     ),
     (
         "insufficient_device_memory",
-        "the GPU cannot hold the launch now; stop or park another deployment on that GPU, or lower the deployment's device memory request",
+        "the GPU cannot hold the launch now; stop or park another deployment on that GPU, or lower the deployment's device memory request; a model larger than one GPU runs on several with topology: {tensor_parallel: N} (the refusal names the size that fits)",
+    ),
+    // ADR 0035 §1, §13: no allowed host has enough identical discrete GPUs.
+    (
+        "insufficient_gpus",
+        "no allowed host has as many identical discrete GPUs as the deployment's tensor_parallel; lower it to a size the refusal names, or use topology: auto",
     ),
     // ADR 0019 (final review M4): a device domain without a fresh reading
     // closes admission on it.

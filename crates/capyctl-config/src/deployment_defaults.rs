@@ -328,9 +328,23 @@ pub fn for_host(deployment: &Value, host: &Value) -> Result<Value, ConfigError> 
     let names_domains = object
         .get("resources")
         .is_some_and(|r| !crate::short_resources::is_short(r));
-    if !object.contains_key("devices") && !names_domains {
-        if let Some(claim) = default_device(host) {
-            object.insert("devices".into(), json!([claim]));
+    // ADR 0035 §1a: `topology: auto` chooses its GPUs at placement; ADR 0035
+    // §1: `tensor_parallel: N` on one host takes the lowest N identical GPUs
+    // (none when the host has no such set: resolution refuses it
+    // `insufficient_gpus`).
+    if !object.contains_key("devices")
+        && !names_domains
+        && !crate::topology::declares_auto(deployment)
+    {
+        let claims = match crate::topology::declared_local_size(deployment) {
+            Some(n) => crate::instances::eligible_sets(host, n as usize, false)
+                .into_iter()
+                .next()
+                .map(|set| set.into_iter().map(|id| json!({"id": id})).collect()),
+            None => default_device(host).map(|claim| vec![claim]),
+        };
+        if let Some(claims) = claims {
+            object.insert("devices".into(), Value::Array(claims));
         }
     }
     fill_device_sharing(&mut result, host);

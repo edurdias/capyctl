@@ -384,10 +384,57 @@ fn resolve_on_host(
             "parsers": capyctl_config::parsers::parsers_for_effective(&effective),
         },
     });
+    if let Some(view) = topology_view(&effective) {
+        out["effective"]["topology"] = view;
+    }
     if provisional {
         unknown_until_measured(&mut out["effective"], &effective);
     }
     Ok((out, effective))
+}
+
+/// ADR 0035 §1, §1a: what `validate config --host` shows of a deployment on
+/// several GPUs of one host or under `topology: auto`: its GPUs in rank
+/// order, the charge on each GPU and on the host's RAM phase by phase, and
+/// for `auto` the candidate table and the size this host would choose now
+/// (from its cards' managed limits). `None` on one GPU without `auto`.
+fn topology_view(effective: &capyctl_config::effective::EffectiveDeployment) -> Option<Value> {
+    use capyctl_config::effective::{auto_gpus, choose_tensor_parallel, fit_hint, AutoChoice};
+    let record = effective.topology.as_ref()?;
+    let charges = effective.per_gpu_charges();
+    let mut view = json!({
+        "tensor_parallel": record.tensor_parallel,
+        "gpus": effective
+            .selected_devices
+            .iter()
+            .map(|claim| claim.id.clone())
+            .collect::<Vec<_>>(),
+        "per_gpu": charges.device,
+        "system": charges.system,
+    });
+    if let Some(bytes) = record.communication_bytes {
+        view["communication_bytes"] = json!(bytes);
+    }
+    if let Some(table) = &record.auto {
+        let gpus = auto_gpus(&effective.host);
+        let (chosen, note) = match choose_tensor_parallel(table, &gpus, &|_| None) {
+            AutoChoice::Chosen {
+                tensor_parallel, ..
+            } => (json!(tensor_parallel), Value::Null),
+            AutoChoice::Unmeasured => (
+                Value::Null,
+                json!("no size is chosen until the checkpoint is measured"),
+            ),
+            AutoChoice::NoFit => (Value::Null, json!(fit_hint(table, &gpus))),
+        };
+        view["requested"] = json!(capyctl_config::topology::AUTO);
+        view["candidates"] = json!(table);
+        view["chosen"] = chosen;
+        if !note.is_null() {
+            view["note"] = note;
+        }
+    }
+    Some(view)
 }
 
 /// What a group's offline validation cannot judge: whether each host's model

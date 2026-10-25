@@ -129,6 +129,21 @@ pub(super) fn snapshot_inputs(
     if let Some(api) = value.get("api") {
         deployment["api"] = api.clone();
     }
+    // ADR 0035 §1, §1a: a revision on several GPUs of one host restates its
+    // tensor-parallel size; one under `topology: auto` restates `auto`, whose
+    // resolution chooses its GPUs again, and the exact-equality check below
+    // proves the claim.
+    if let Some(record) = value.get("topology") {
+        if record.get("auto").is_some() {
+            deployment["topology"] = json!(crate::topology::AUTO);
+            deployment
+                .as_object_mut()
+                .expect("deployment is an object")
+                .remove("devices");
+        } else {
+            deployment["topology"] = json!({"tensor_parallel": record["tensor_parallel"]});
+        }
+    }
     // ADR 0033 (contract decision 1): the LMCache settings are frozen only
     // when declared away from their defaults; restated as declared, and the
     // exact-equality check below proves the claim.

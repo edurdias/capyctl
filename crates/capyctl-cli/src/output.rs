@@ -143,6 +143,11 @@ pub const DEVICE_CODES: &[&str] = &[
     "insufficient_device_memory",
     "device_unobserved",
     "multi_gpu_unsupported",
+    // ADR 0035 §13: a model on several GPUs of one host.
+    "multi_gpu_mixed_devices",
+    "tensor_parallel_indivisible",
+    "topology_devices_mismatch",
+    "insufficient_gpus",
     "unsupported_gpu_topology",
     "host_backed_unavailable",
     "device_policy_mismatch",
@@ -451,12 +456,18 @@ impl StructuredError {
                 ExitCode::INSUFFICIENT_RESOURCES
             }
             // Design §11: a device domain with no fresh observation closes
-            // admission there; the insufficient-resources exit.
-            "device_unobserved" => ExitCode::INSUFFICIENT_RESOURCES,
-            // Design §11: the existing unsupported exit.
-            "multi_gpu_unsupported" | "unsupported_gpu_topology" | "host_backed_unavailable" => {
-                ExitCode::UNSUPPORTED
-            }
+            // admission there; the insufficient-resources exit. ADR 0035 §13:
+            // too few identical GPUs likewise.
+            "device_unobserved" | "insufficient_gpus" => ExitCode::INSUFFICIENT_RESOURCES,
+            // Design §11: the existing unsupported exit; ADR 0035 §13 adds
+            // its resolution refusals.
+            "multi_gpu_unsupported"
+            | "unsupported_gpu_topology"
+            | "host_backed_unavailable"
+            | "multi_gpu_mixed_devices"
+            | "tensor_parallel_indivisible" => ExitCode::UNSUPPORTED,
+            // ADR 0035 §13: `devices` against `topology`, invalid configuration.
+            "topology_devices_mismatch" => ExitCode::INVALID_CONFIG,
             // Design §11: the invalid-configuration exit.
             "device_policy_mismatch" | "missing_system_allocation" => ExitCode::INVALID_CONFIG,
             HOST_NAME_CHANGED => ExitCode::INVALID_CONFIG,
