@@ -249,10 +249,29 @@ def cmd_engine_args(a):
                         value, i = rest[i + 1], i + 2
                     else:
                         value, i = True, i + 1
-                    if not re.search(r"key|token|secret", key):
+                    if not re.search(r"(^|_)(key|secret|token)$", key):
                         parsed[key] = value
                 else:
                     i += 1
+        elif "--public-settings-json" in tokens:
+            # SGLang under CapyCTL logs no `server_args`: CapyCTL's entry composes
+            # them from the public launch settings (argv; the keys ride separate
+            # descriptors). The same composition, from the role's own runtime copy
+            # (runtime/sglang_server_args.py), less the keys, paths and endpoint.
+            entry = next(t for t in tokens if t.endswith("/sglang_entry.py"))
+            sys.path.insert(0, str(Path(entry).parent.parent))
+            from runtime import sglang_server_args as s
+            public = json.loads(tokens[tokens.index("--public-settings-json") + 1])
+            settings = public["settings"]
+            available = s.available_bytes_for(settings["memory"])
+            parsed = dict(s._SAFE_DEFAULTS)
+            parsed.update(s.typed_keywords(settings))
+            parsed.update(s._RESERVED_CONSTANT)
+            parsed.update(mem_fraction_static=s.static_fraction(s.fraction_bytes(settings["memory"], available), available),
+                          enable_memory_saver=settings["memory_saver"],
+                          enable_weights_cpu_backup=settings["cpu_weight_backup"])
+            if public.get("devices") is not None:
+                parsed.update(tp_size=len(public["devices"]), base_gpu_id=0)
     print(json.dumps({k: v for k, v in parsed.items() if k not in VOLATILE}, sort_keys=True, default=str))
     return 0 if parsed else 1
 
