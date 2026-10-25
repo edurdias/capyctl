@@ -326,9 +326,12 @@ def cmd_owned(a):
     ident = deployment_id(a.db, a.name)
     for b in rows(a.db, "SELECT id,state,binding_json,identities_json FROM runtime_bindings "
                         "WHERE deployment_id=? AND state IN ('live','uncertain')", (ident,)):
-        # The receipt rides the binding or the journal's evidence; a PID only counts
-        # when it is one of this binding's own identities (below).
-        texts = [b["binding_json"] or ""] + [r["evidence"] or "" for r in rows(
+        # The receipt rides the binding, its steps' evidence (SGLang's `tp ranks:
+        # 0=worker-1:...` names its scheduler processes) or the journal's; a PID
+        # only counts when it is one of this binding's own identities (below).
+        texts = [b["binding_json"] or ""] + [r["evidence_json"] or "" for r in rows(
+            a.db, "SELECT e.evidence_json FROM lifecycle_evidence e JOIN lifecycle_steps s ON s.id=e.step_id "
+                  "WHERE s.binding_id=?", (b["id"],))] + [r["evidence"] or "" for r in rows(
             a.db, "SELECT evidence FROM journal_entries WHERE evidence LIKE '%tp ranks: %' ORDER BY recorded_at")]
         ranks = {}
         for text in texts:
