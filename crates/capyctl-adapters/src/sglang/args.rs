@@ -124,14 +124,8 @@ impl SglangLaunch {
             || !valid_reference(frozen.inference_credential_ref())
             || !valid_reference(frozen.admin_credential_ref())
             || frozen.inference_credential_ref() == frozen.admin_credential_ref()
-            || !selector(&m.device.host_id)
-            || !selector(&m.device.device_id)
-            || !selector(&m.device.memory_domain)
-            || !selector(&m.device.hardware_fingerprint)
-            || m.device
-                .physical_gpu_uuid
-                .as_deref()
-                .is_some_and(|uuid| !physical_gpu_uuid(uuid))
+            || !valid_selection(&m.device)
+            || !valid_devices(m, frozen.group().is_some())
         {
             return Err(RuntimeError::Unsupported);
         }
@@ -156,7 +150,7 @@ impl SglangLaunch {
         }
         // The checkpoint revision stays out of the public descriptor: the
         // entry no longer pins a checkpoint (ADR 0014 §9; WE3 verifies a digest).
-        let public = json!({
+        let mut public = json!({
             "schema_version": 2,
             "kind": "sglang_launch",
             "engine": m.engine,
@@ -168,6 +162,12 @@ impl SglangLaunch {
             "device": m.device,
             "settings": settings,
         });
+        // ADR 0035 §4: a launch on several GPUs names each one, in rank
+        // order; the entry runs `tp_size` = their count. Absent on one GPU,
+        // whose descriptor is unchanged.
+        if !m.devices.is_empty() {
+            public["devices"] = json!(m.devices);
+        }
         let worker = frozen.group().is_some_and(|group| !group.is_head());
         Ok(Self {
             executable: frozen.executable().into(),
@@ -562,6 +562,46 @@ fn physical_gpu_uuid(value: &str) -> bool {
         && rest.bytes().enumerate().all(|(index, byte)| match index {
             8 | 13 | 18 | 23 => byte == b'-',
             _ => matches!(byte, b'0'..=b'9' | b'a'..=b'f'),
+        })
+}
+
+/// The four reviewed selectors of one device, and its physical UUID (a
+/// launch parameter) in the shape the collector observes.
+fn valid_selection(device: &capyctl_domain::launch::NativeDeviceSelection) -> bool {
+    selector(&device.host_id)
+        && selector(&device.device_id)
+        && selector(&device.memory_domain)
+        && selector(&device.hardware_fingerprint)
+        && device
+            .physical_gpu_uuid
+            .as_deref()
+            .is_none_or(physical_gpu_uuid)
+}
+
+/// ADR 0035 §4: a launch's device list is empty (one GPU), or names 2 to 64
+/// distinct GPUs of one host in rank order, the first being `device`, each
+/// with a valid UUID, or every one by its index (ADR 0019 §6). A group
+/// member runs on one device per host (ADR 0028, ADR 0035 §12).
+fn valid_devices(m: &capyctl_domain::launch::NativeLaunchMetadata, group: bool) -> bool {
+    let devices = &m.devices;
+    if devices.is_empty() {
+        return true;
+    }
+    let ids: std::collections::BTreeSet<&str> =
+        devices.iter().map(|d| d.device_id.as_str()).collect();
+    let by_uuid = devices.iter().all(|d| d.physical_gpu_uuid.is_some());
+    let by_index = devices
+        .iter()
+        .all(|d| d.physical_gpu_uuid.is_none() && d.cuda_pci_index.is_some());
+    !group
+        && (2..=64).contains(&devices.len())
+        && devices[0] == m.device
+        && ids.len() == devices.len()
+        && (by_uuid || by_index)
+        && devices.iter().all(|d| {
+            valid_selection(d)
+                && d.host_id == m.device.host_id
+                && d.hardware_fingerprint == m.device.hardware_fingerprint
         })
 }
 

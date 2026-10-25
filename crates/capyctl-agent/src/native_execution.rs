@@ -697,16 +697,27 @@ impl NativeHostExecution {
             }
         }
         // ADR 0028 §4, §8: a group member runs on exactly the plan's devices,
-        // `local_ranks` of them; a single launch on exactly one.
+        // `local_ranks` of them; a single launch on exactly one. ADR 0035 §4,
+        // §11: a single launch on several GPUs of this host runs on exactly
+        // its plan's device list, N of them.
         let group = group_member(command);
-        let devices = group.map_or(1, |(plan, _)| plan.topology().local_ranks as usize);
+        let devices = group.map_or(plan.devices.len().max(1), |(plan, _)| {
+            plan.topology().local_ranks as usize
+        });
         if effective.profile.build_fingerprint != command.identity.profile_fingerprint
             || effective.model.content_fingerprint != plan.checkpoint_fingerprint
             || effective.selected_devices.len() != devices
+            || effective.local_tensor_parallel() as usize != devices.max(1)
             // Discrete GPU design §7 (review decision): with a choice of
             // GPU the launch pins the selected one; one it cannot pin (no
             // published UUID, no `gpuN` index) is refused before any effect.
-            || effective.cuda_namespace().is_err()
+            // ADR 0035 §4: every GPU of a device list, each by its UUID or
+            // (every one) by its index.
+            || effective.cuda_namespaces().is_err()
+            // ADR 0035 §4: the plan's device list is the effective
+            // deployment's claims in rank order, each a GPU this host's
+            // accepted inventory publishes.
+            || !local_devices_match(plan, &effective)
             // ADR 0028 §8: a worker leases no service port; a SGLang worker
             // leases its loopback port from the same range.
             || leased_port(command).is_some_and(|port| {
@@ -2466,6 +2477,40 @@ fn group_member(command: &MemberCommand) -> Option<(&GroupPlan, &MemberPlan)> {
         .iter()
         .find(|member| member.member == command.identity.member)?;
     Some((plan, member))
+}
+
+/// ADR 0035 §§4, 11: a single launch's device list corroborated against what
+/// this host resolved: empty for a launch on one GPU (and a group member,
+/// whose devices its group plan names); otherwise exactly the effective
+/// deployment's claims in rank order, each a GPU of this host's accepted
+/// inventory (a device whose domain is a device domain) with a published
+/// UUID or a `gpuN` index to pin it by.
+fn local_devices_match(plan: &SingleLaunchPlan, effective: &EffectiveDeployment) -> bool {
+    if plan.devices.is_empty() {
+        return effective.selected_devices.len() <= 1;
+    }
+    plan.devices.len() == effective.selected_devices.len()
+        && plan
+            .devices
+            .iter()
+            .zip(&effective.selected_devices)
+            .all(|(device, claim)| {
+                *device == claim.id
+                    && effective.host.devices.get(device).is_some_and(|policy| {
+                        let discrete =
+                            effective
+                                .host
+                                .domains
+                                .get(&policy.domain)
+                                .is_some_and(|domain| {
+                                    domain.memory == capyctl_config::effective::DomainMemory::Device
+                                });
+                        let index = device.strip_prefix("gpu").is_some_and(|n| {
+                            !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+                        });
+                        discrete && (policy.physical_gpu_uuid.is_some() || index)
+                    })
+            })
 }
 
 /// SPEC §3.1, ADR 0028 §5: the loopback port a launch leases: a single

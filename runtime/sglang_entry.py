@@ -348,25 +348,48 @@ def _validate_group(group):
             _reject()
 
 
-def _validate_public(value):
-    # ADR 0008 (owner decision 2026-09-23): no source revision token. The
-    # installed SGLang build is identified by the host's installation
-    # fingerprint and probed by shape (engine_capabilities.py), never pinned.
-    _exact_object(value, ("schema_version", "kind", "engine",
-                         "binding_id", "incarnation", "endpoint", "served_name",
-                         "rendered_settings_digest", "settings", "device"))
-    for key, expected in (("schema_version", 2), ("kind", "sglang_launch"),
-                          ("engine", "sglang")):
-        _literal(value[key], expected)
-    _ulid(value["binding_id"])
-    _ulid(value["incarnation"])
-    device = value["device"]
+def _validate_selection(device):
     _exact_object(device, ("host_id", "hardware_fingerprint", "device_id", "memory_domain"))
     for selector in device.values():
         _text(selector, 256)
         if not selector.isascii() or any(not (char.isalnum() or char in "_-.:")
                                          for char in selector):
             _reject()
+
+
+def _validate_devices(value):
+    """ADR 0035 §4: a launch on several GPUs of one host names each one in
+    rank order, the first being `device`: 2 to 64 distinct GPUs of the same
+    host, never beside a group (ADR 0035 §12)."""
+    devices = value["devices"]
+    if (type(devices) is not list or not 2 <= len(devices) <= 64
+            or "group" in value["settings"]):
+        _reject()
+    for device in devices:
+        _validate_selection(device)
+    if (devices[0] != value["device"]
+            or len({device["device_id"] for device in devices}) != len(devices)
+            or any(device["host_id"] != value["device"]["host_id"]
+                   or device["hardware_fingerprint"] != value["device"]["hardware_fingerprint"]
+                   for device in devices)):
+        _reject()
+
+
+def _validate_public(value):
+    # ADR 0008 (owner decision 2026-09-23): no source revision token. The
+    # installed SGLang build is identified by the host's installation
+    # fingerprint and probed by shape (engine_capabilities.py), never pinned.
+    # ADR 0035 §4: `devices` only on a launch on several GPUs.
+    keys = ("schema_version", "kind", "engine", "binding_id", "incarnation", "endpoint",
+            "served_name", "rendered_settings_digest", "settings", "device")
+    _exact_object(value, keys + (("devices",) if type(value) is dict and "devices" in value
+                                 else ()))
+    for key, expected in (("schema_version", 2), ("kind", "sglang_launch"),
+                          ("engine", "sglang")):
+        _literal(value[key], expected)
+    _ulid(value["binding_id"])
+    _ulid(value["incarnation"])
+    _validate_selection(value["device"])
     # The served name is the deployment's route (Spec §3), not a derived
     # binding artifact: an ASCII printable token, a non-empty run of at most
     # 256 bytes restricted to 0x21..=0x7E. This mirrors the coordinator's
@@ -386,6 +409,8 @@ def _validate_public(value):
     if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
         _reject()
     _validate_settings(value["settings"])
+    if "devices" in value:
+        _validate_devices(value)
 
 
 def _credential(raw):
@@ -571,14 +596,21 @@ def _placement_mapping(spec, digest):
     documents — observed here, never invented. observe_placement corroborates
     the assembled mapping against freshly collected inventory; nothing here is
     placement evidence by construction.
+
+    ADR 0035 §4: on several GPUs the inherited namespace is their UUIDs in
+    rank order; the first is the mapping's UUID and all of them its list.
     """
     from runtime.sglang_device import TrustedDeviceMapping
-    device = json.loads(spec._public_json)["device"]
+    public = json.loads(spec._public_json)
+    device = public["device"]
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    several = "devices" in public
+    uuids = tuple(visible.split(",")) if several and type(visible) is str else ()
     return TrustedDeviceMapping(
         host_id=device["host_id"], hardware_fingerprint=device["hardware_fingerprint"],
         device_id=device["device_id"], memory_domain=device["memory_domain"],
-        physical_gpu_uuid=os.environ.get("CUDA_VISIBLE_DEVICES"),
-        inventory_digest=digest)
+        physical_gpu_uuid=uuids[0] if uuids else visible,
+        inventory_digest=digest, physical_gpu_uuids=uuids)
 
 
 def _verified_native_contract(spec):
@@ -1239,11 +1271,18 @@ def _observation_target(spec, launch):
     settings = public["settings"]
     scope = (directory, public["binding_id"], public["incarnation"], settings["weight_restore"])
     group = settings.get("group")
+    # ADR 0035 §9: every scheduler of a launch on several GPUs enrolls its
+    # own saver map; the scope carries the plan's N.
+    devices = public.get("devices")
+    if group is not None:
+        options = {"group": (group["tp_size"], group["pp_size"], group["nnodes"])}
+    elif devices is not None:
+        options = {"tensor_parallel": len(devices)}
+    else:
+        options = {}
     if (directory is None or settings["memory_saver"] is not True
             or not engine_capabilities.accepts_scheduler_target(launch)
-            or not (enrollment.entry_environment(*scope) if group is None else
-                    enrollment.entry_environment(*scope, group=(
-                        group["tp_size"], group["pp_size"], group["nnodes"])))):
+            or not enrollment.entry_environment(*scope, **options)):
         return None
     return enrollment.scheduler_target(spec._observation_secret)
 

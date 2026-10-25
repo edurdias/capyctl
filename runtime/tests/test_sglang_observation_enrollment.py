@@ -50,7 +50,8 @@ class EnrollmentTests(unittest.TestCase):
     def scope(self):
         self.assertTrue(enrollment.entry_environment(self.directory.name, BINDING, INCARNATION))
 
-    def ask(self, proof=None, request_id="read-1", version=2, secret="a" * 64, directory=None):
+    def ask(self, proof=None, request_id="read-1", version=2, secret="a" * 64, directory=None,
+            name=BINDING):
         """One request from a client thread while this thread, the one that
         enrolled (the scheduler thread), ticks the safe point. The client
         connects through its own descriptor of the directory, as the host does,
@@ -63,7 +64,7 @@ class EnrollmentTests(unittest.TestCase):
             connection.settimeout(3)
             parent = os.open(directory, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
             try:
-                connection.connect(f"/proc/self/fd/{parent}/{BINDING}.sock")
+                connection.connect(f"/proc/self/fd/{parent}/{name}.sock")
             finally:
                 os.close(parent)
             key = observation_key(secret, BINDING, INCARNATION)
@@ -390,6 +391,57 @@ class EnrollmentTests(unittest.TestCase):
         self.assertEqual(calls, [((1, 2), {"writer": 3})])
         self.assertEqual(enrollment._SECRET[0]._value, self.WORKER_SECRET)
         self.assertIs(enrollment.scheduler_target(), enrollment.run_enrolled_scheduler)
+
+    # ------------------------- ADR 0035 §9: ranks of a launch on several GPUs
+
+    # T46 T22: every scheduler of a launch on two GPUs enrolls its own saver
+    # map, rank 0 under the binding's names and rank 1 under `.rank1`, each
+    # answering keyed observations of its own map.
+    def test_every_rank_of_a_launch_on_several_gpus_enrolls(self):
+        from test_sglang_saver_residency import ServerArgs
+        for rank in (0, 1):
+            with self.subTest(rank=rank):
+                self.close_all()
+                self.fakes = Fakes(self)
+                self.fakes.impl._binary_wrapper.cdll._name = self.library
+                mock.patch.object(residency, "CudaDriver",
+                                  return_value=self.fakes.driver).start()
+                self.fakes.scheduler.server_args = ServerArgs(tp_size=2,
+                                                              admin_api_key="a" * 64)
+                self.fakes.scheduler.tp_rank = rank
+                self.assertTrue(enrollment.entry_environment(
+                    self.directory.name, BINDING, INCARNATION, tensor_parallel=2))
+                self.assertEqual(os.environ[enrollment.ENV_TP], "2")
+                self.assertTrue(enrollment.enroll(self.fakes.scheduler))
+                name = enrollment.enrollment_name(BINDING, rank)
+                self.assertEqual(name, BINDING if rank == 0 else BINDING + ".rank1")
+                record = json.loads((Path(self.directory.name) / (name + ".json")).read_text())
+                self.assertEqual((record["binding_id"], record["socket"]),
+                                 (BINDING, name + ".sock"))
+                self.assertEqual(self.ask(name=name)["status"], "observed")
+        names = sorted(os.listdir(self.directory.name))
+        self.assertIn(BINDING + ".rank1.json", names)
+        self.assertIn(BINDING + ".json", names)
+
+    # T46 T22: a rank outside the plan, a scheduler whose tp_size is not the
+    # plan's N, and a scope that is no launch on several GPUs enroll nothing.
+    def test_a_rank_or_topology_other_than_the_plan_is_refused(self):
+        from test_sglang_saver_residency import ServerArgs
+        for tp_size, rank in ((2, 2), (2, -1), (2, None), (2, True), (1, 0), (4, 0)):
+            with self.subTest(tp_size=tp_size, rank=rank):
+                self.fakes.scheduler.server_args = ServerArgs(tp_size=tp_size)
+                self.fakes.scheduler.tp_rank = rank
+                self.assertTrue(enrollment.entry_environment(
+                    self.directory.name, BINDING, INCARNATION, tensor_parallel=2))
+                self.assertFalse(enrollment.enroll(self.fakes.scheduler))
+        for options in ({"tensor_parallel": 1}, {"tensor_parallel": 65},
+                        {"tensor_parallel": "2"},
+                        {"tensor_parallel": 2, "group": (2, 1, 2)}):
+            with self.subTest(options=options):
+                enrollment.clear_environment()
+                self.assertFalse(enrollment.entry_environment(
+                    self.directory.name, BINDING, INCARNATION, **options))
+                self.assertNotIn(enrollment.ENV_TP, os.environ)
 
 
 if __name__ == "__main__":

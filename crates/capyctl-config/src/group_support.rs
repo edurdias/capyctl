@@ -101,9 +101,19 @@ pub struct LocalSupport {
     pub split_modes: &'static [&'static str],
 }
 
+/// One arm per engine: `deep_park` flips per engine as its live row passes
+/// (ADR 0035 §9: MG4 for vLLM, MG5 for SGLang), and nothing else gates
+/// parking at N > 1 (resolution, the sleep and saver launch flags and the
+/// per-GPU park evidence all follow it).
 pub fn local_support(engine: &str) -> Option<LocalSupport> {
     match engine {
-        "vllm" | "sglang" => Some(LocalSupport {
+        "vllm" => Some(LocalSupport {
+            max_tensor_parallel: None,
+            pipeline: false,
+            deep_park: false,
+            split_modes: &[],
+        }),
+        "sglang" => Some(LocalSupport {
             max_tensor_parallel: None,
             pipeline: false,
             deep_park: false,

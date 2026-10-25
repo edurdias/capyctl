@@ -296,15 +296,33 @@ async fn launch(
     // names; the entry observes the namespace, it never invents it. Absent
     // when the host published no inventory UUID, which leaves the namespace
     // unset and placement fail-closed.
-    let device = &launch.frozen.metadata().device;
-    if let Some(uuid) = device.physical_gpu_uuid.as_deref() {
-        cmd.env.insert("CUDA_VISIBLE_DEVICES".into(), uuid.into());
-    } else if let Some(index) = device.cuda_pci_index {
-        // Discrete GPU design §7 (review decision): a host with a choice of
-        // GPU that published no UUID pins the selected one by its index, in
-        // the PCI bus order `nvidia-smi` published it under.
-        let namespace = capyctl_config::effective::CudaNamespace::PciIndex(index);
-        for (name, value) in namespace.environment() {
+    // ADR 0035 §4: on several GPUs, every one in rank order (rank r is
+    // `cuda:r`): every UUID, or every index in PCI bus order.
+    let metadata = launch.frozen.metadata();
+    let selections = if metadata.devices.is_empty() {
+        std::slice::from_ref(&metadata.device)
+    } else {
+        metadata.devices.as_slice()
+    };
+    let namespaces: Option<Vec<capyctl_config::effective::CudaNamespace>> = selections
+        .iter()
+        .map(
+            |device| match (&device.physical_gpu_uuid, device.cuda_pci_index) {
+                (Some(uuid), _) => {
+                    Some(capyctl_config::effective::CudaNamespace::Uuid(uuid.clone()))
+                }
+                // Discrete GPU design §7 (review decision): a host with a choice of
+                // GPU that published no UUID pins the selected one by its index, in
+                // the PCI bus order `nvidia-smi` published it under.
+                (None, Some(index)) => {
+                    Some(capyctl_config::effective::CudaNamespace::PciIndex(index))
+                }
+                (None, None) => None,
+            },
+        )
+        .collect();
+    if let Some(namespaces) = namespaces {
+        for (name, value) in capyctl_config::effective::CudaNamespace::environment_of(&namespaces) {
             cmd.env.insert(name.into(), value);
         }
     }

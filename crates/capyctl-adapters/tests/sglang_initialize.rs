@@ -335,6 +335,7 @@ fn frozen_launch_pinned(
             endpoint: format!("http://127.0.0.1:{port}"),
             rendered_settings_digest: "a".repeat(64),
             placement_digest: None,
+            devices: Vec::new(),
             device: NativeDeviceSelection {
                 host_id: "host-a".into(),
                 hardware_fingerprint: "hardware-v1".into(),

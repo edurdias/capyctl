@@ -41,6 +41,12 @@ pub enum LlamacppPlanError {
     /// approved paths through a symlink (the launch-time half of the check).
     #[error("{0} names a path outside the approved paths")]
     PathNotApproved(String),
+    /// ADR 0035 §4: a launch on several GPUs whose per-GPU grants do not
+    /// give one positive share per GPU.
+    #[error(
+        "the launch on several GPUs has no device grant on each of them to split the layers by"
+    )]
+    NoSplit,
 }
 
 pub fn plan_from_effective(
@@ -128,10 +134,37 @@ pub fn plan_from_effective(
         config_dir: display(&dirs.config),
         cache_dir: display(&dirs.cache),
         engine_log: Some(engine_log),
-        cuda_namespace: effective
-            .cuda_namespace()
-            .map_err(|_| LlamacppPlanError::UnpinnableDevice)?,
+        cuda_namespaces: effective
+            .cuda_namespaces()
+            .map_err(|_| LlamacppPlanError::UnpinnableDevice)?
+            .unwrap_or_default(),
+        tensor_split: tensor_split(effective)?,
     })
+}
+
+/// ADR 0035 §4: on several GPUs each one's share of the layers is its Ready
+/// grant in rank order, reduced by their common divisor (equal grants on
+/// identical GPUs split `1,1`). One GPU splits nothing.
+fn tensor_split(effective: &EffectiveDeployment) -> Result<Vec<u64>, LlamacppPlanError> {
+    if effective.local_tensor_parallel() < 2 {
+        return Ok(Vec::new());
+    }
+    let grants = effective
+        .ready_device_allocations()
+        .into_iter()
+        .map(|(_, bytes)| u64::try_from(bytes).ok().filter(|bytes| *bytes > 0))
+        .collect::<Option<Vec<u64>>>()
+        .filter(|grants| grants.len() == effective.selected_devices.len())
+        .ok_or(LlamacppPlanError::NoSplit)?;
+    fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 {
+            a
+        } else {
+            gcd(b, a % b)
+        }
+    }
+    let common = grants.iter().copied().fold(0, gcd).max(1);
+    Ok(grants.into_iter().map(|grant| grant / common).collect())
 }
 
 fn display(path: &Path) -> String {
