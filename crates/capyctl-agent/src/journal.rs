@@ -1270,6 +1270,16 @@ impl HostJournal {
             return Err(JournalError::Uncertain);
         }
         result.model_usable = true;
+        // ADR 0035 §6: the rank processes readiness named for a launch on
+        // several GPUs, as its receipt records them, travel with the result
+        // (each one's `rank`), which the server reads.
+        let ranks = capyctl_domain::local_tp::recorded_ranks(&observation.receipt);
+        for process in &mut result.processes {
+            process.rank = ranks
+                .iter()
+                .find(|r| r.role == process.role && r.pid == process.pid)
+                .map(|r| r.rank);
+        }
         result.observed_at_unix_ms = observation.observed_at_ms;
         // ADR 0014 amendment A12: the kernel builds the adapter saw, so the
         // controller leaves their samples out of the startup peak.
@@ -1286,6 +1296,37 @@ impl HostJournal {
             .map_err(|_| JournalError::Conflict)?;
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         db.execute("INSERT INTO native_results(command_id,result) VALUES(?1,?2) ON CONFLICT(command_id) DO UPDATE SET result=excluded.result", params![command_id, result.encode_to_vec()])?;
+        Ok(())
+    }
+
+    /// ADR 0035 §6: the rank processes readiness named for the launch
+    /// `command_id` on several GPUs. Each one named `rank-N` is journaled
+    /// under that role (a later scan keeps a recorded process's role), so the
+    /// exit watcher and every later proof judge it as an engine process; a
+    /// rank that is `api` or a worker keeps its role. A process the journal
+    /// does not record for the launch refuses the whole naming.
+    pub fn record_rank_roles(
+        self: &Arc<Self>,
+        session: u64,
+        command_id: &str,
+        ranks: &[capyctl_domain::local_tp::RankRecord],
+    ) -> Result<(), JournalError> {
+        let _gate = self.transition.lock().map_err(|_| JournalError::Storage)?;
+        self.validate()?;
+        self.check_session(session)?;
+        let mut db = self.db.lock().map_err(|_| JournalError::Storage)?;
+        let tx = db.transaction()?;
+        for rank in ranks {
+            let p = &rank.process;
+            let renamed = tx.execute(
+                "UPDATE processes SET role=?2 WHERE command_id=?1 AND pid=?3 AND boot=?4 AND ticks=?5",
+                params![command_id, p.role, p.pid, p.boot_id, p.start_ticks as i64],
+            )?;
+            if renamed != 1 {
+                return Err(JournalError::Conflict);
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -2004,6 +2045,19 @@ impl HostJournal {
                 }
             } else if unchanged && resident {
                 result.model_usable = previous.model_usable;
+                // ADR 0035 §6: the ranks its readiness named.
+                for process in &mut result.processes {
+                    process.rank = previous
+                        .processes
+                        .iter()
+                        .find(|p| {
+                            p.role == process.role
+                                && p.pid == process.pid
+                                && p.boot_id == process.boot_id
+                                && p.start_ticks == process.start_ticks
+                        })
+                        .and_then(|p| p.rank);
+                }
                 // A physical process observation cannot refresh model readiness.
                 result.observed_at_unix_ms = previous.observed_at_unix_ms;
                 // ADR 0014 amendment A12: they travel with the readiness proof.

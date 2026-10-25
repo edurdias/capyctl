@@ -45,6 +45,8 @@ mod tensorfold;
 mod llamacpp;
 // ADR 0031: custom engines' plan, adapter and loopback check.
 mod custom;
+// ADR 0035 §§5, 6: launches on several GPUs of this host.
+mod local_tp;
 // ADR 0023 §6, ADR 0029 §10: the engines' own idle check before Terminate.
 mod idle_gate;
 // SPEC §§9.1, 10 (W4): remote Park and Restore of a retained launch.
@@ -1712,11 +1714,113 @@ impl NativeHostExecution {
             // and recorded processes are its whole answer.
             return Ok(());
         }
+        // ADR 0035 §§5, 6: a launch on several GPUs of this host names its
+        // ranks and checks its listeners before its readiness is journaled.
+        let observation = self
+            .local_tp_readiness(session, command, plan, &effective, observation)
+            .await?;
         let id = &command.identity;
         self.journal
             .record_launch_ready(session, &id.command_id, &observation)
             .map_err(|_| SessionError)?;
         Ok(self.publish_ready(session, &id.command_id, &id.command_id, &scope)?)
+    }
+
+    /// ADR 0035 §§5, 6: the readiness of a launch on several GPUs of this
+    /// host ([`local_tp`]): its rank processes named from this host's own
+    /// per-GPU samples and journaled under their roles, the ranks recorded
+    /// in its receipt, and its owned listeners checked. A launch that fails
+    /// either is stopped here with gone evidence, so its result carries the
+    /// closed code (`tp_rank_unobserved`, `engine_listener_exposed`); the
+    /// claim stays until the controller's Terminate settles it. A launch on
+    /// one GPU is returned as it is.
+    async fn local_tp_readiness(
+        &self,
+        session: u64,
+        command: &MemberCommand,
+        plan: &SingleLaunchPlan,
+        effective: &EffectiveDeployment,
+        mut observation: capyctl_domain::completion::EffectObservation,
+    ) -> Result<capyctl_domain::completion::EffectObservation, LaunchError> {
+        if plan.devices.len() < 2 {
+            return Ok(observation);
+        }
+        let id = command.identity.command_id.clone();
+        let stop_launch = |journal: Arc<HostJournal>, owner: String| {
+            let recorded: Vec<_> = journal
+                .inspect_owned(&owner)
+                .map(|seen| seen.into_iter().map(|(identity, _)| identity).collect())
+                .unwrap_or_default();
+            !recorded.is_empty() && custom::stop_exposed(&recorded)
+        };
+        // ADR 0035 §6 and its evidence table: vLLM and SGLang run one
+        // process per rank, named here. llama.cpp runs one process across
+        // every GPU of its layer split, so it has no rank processes to name
+        // (naming would always fail it `tp_rank_unobserved`).
+        if capyctl_domain::local_tp::names_ranks(effective.profile.engine.name()) {
+            let sampler = self.residency.clone();
+            let until = command.identity.deadline_ms - PROBE_MARGIN_MS;
+            let named =
+                local_tp::await_ranks(&observation.identities, &plan.devices, until, || {
+                    let sampler = sampler.clone();
+                    async move {
+                        let sampler = sampler?;
+                        tokio::task::spawn_blocking(move || sampler.sample_now())
+                            .await
+                            .ok()
+                            .filter(|sample| !sample.is_empty())
+                    }
+                })
+                .await;
+            let (identities, ranks) = match named {
+                Ok(named) => named,
+                Err(text) => {
+                    let journal = self.journal.clone();
+                    let owner = id.clone();
+                    let _ = tokio::task::spawn_blocking(move || stop_launch(journal, owner)).await;
+                    return Err(LaunchError { engine: Some(text) });
+                }
+            };
+            let journal = self.journal.clone();
+            let (owner, named) = (id.clone(), ranks.clone());
+            tokio::task::spawn_blocking(move || journal.record_rank_roles(session, &owner, &named))
+                .await
+                .map_err(|_| SessionError)?
+                .map_err(|_| SessionError)?;
+            observation.identities = identities;
+            observation.receipt = format!(
+                "{}; {}",
+                observation.receipt,
+                capyctl_domain::local_tp::ranks_receipt(&ranks)
+            );
+        }
+        let journal = self.journal.clone();
+        let checked = observation.identities.clone();
+        let verdict =
+            tokio::task::spawn_blocking(move || match local_tp::check_listeners(&checked) {
+                Ok(()) => Ok(()),
+                Err(capyctl_adapters::custom::ListenerCheck::Exposed(listener)) => {
+                    let stopped = stop_launch(journal, id);
+                    Err(Some(format!(
+                        "{}{}",
+                        capyctl_adapters::custom::engine_listener_exposed(&listener),
+                        if stopped {
+                            "; the engine was stopped"
+                        } else {
+                            ""
+                        }
+                    )))
+                }
+                Err(_) => Err(None),
+            })
+            .await
+            .map_err(|_| SessionError)?;
+        verdict.map_err(|engine| LaunchError { engine })?;
+        observation.receipt = format!(
+            "{}; every owned listener is on loopback",
+            observation.receipt
+        );
+        Ok(observation)
     }
 
     /// Register a retained launch's exact scope with its protected credentials.
@@ -1814,8 +1918,10 @@ impl NativeHostExecution {
         .await?;
         // ADR 0031 §7: a custom launch's listeners are checked again
         // whenever this host re-proves it, after the probe and before the
-        // gate reopens; one off loopback stops the launch.
-        if effective.profile.engine == Engine::Custom {
+        // gate reopens; one off loopback stops the launch. ADR 0035 §5: so
+        // are a built-in engine's on several GPUs.
+        let several_gpus = plan.devices.len() >= 2;
+        if effective.profile.engine == Engine::Custom || several_gpus {
             let journal = self.journal.clone();
             let owner = owned_handle.to_owned();
             let checked = tokio::task::spawn_blocking(move || {
@@ -1828,7 +1934,12 @@ impl NativeHostExecution {
                     })
                     .map(|(identity, _)| identity)
                     .collect();
-                match custom::check_listeners(&alive) {
+                let check = if several_gpus {
+                    local_tp::check_listeners(&alive)
+                } else {
+                    custom::check_listeners(&alive)
+                };
+                match check {
                     Ok(()) => Ok(()),
                     Err(capyctl_adapters::custom::ListenerCheck::Exposed(_)) => {
                         let recorded: Vec<_> = journal
@@ -2410,7 +2521,15 @@ fn launch_failure(result: &pb::MemberExecutionResult, engine: Option<&str>) -> S
     use capyctl_adapters::launch_failure::{summary, EngineExit};
     if let Some(exposed) = engine
         .and_then(|text| text.lines().next())
-        .filter(|line| line.starts_with(capyctl_config::custom::LISTENER_EXPOSED))
+        .filter(|line| {
+            [
+                capyctl_config::custom::LISTENER_EXPOSED,
+                capyctl_domain::local_tp::ENGINE_LISTENER_EXPOSED,
+                capyctl_domain::local_tp::TP_RANK_UNOBSERVED,
+            ]
+            .iter()
+            .any(|code| line.starts_with(&format!("{code}:")))
+        })
         .filter(|line| capyctl_protocol::execution::is_launch_failure_text(line))
     {
         return exposed.to_owned();
@@ -5576,6 +5695,37 @@ mod tests {
             "custom_listener_exposed: an owned process listens on 0.0.0.0:8081, not on loopback"
         );
         assert!(capyctl_protocol::execution::is_launch_failure_text(&text));
+    }
+
+    /// ADR 0035 §§5, 6, 13: a launch on several GPUs this host stopped at
+    /// readiness reports its closed code (`engine_listener_exposed` naming
+    /// the process, address and port, or `tp_rank_unobserved`) in one line
+    /// the wire validation accepts, never the exit summary.
+    // T46
+    #[test]
+    fn a_stopped_launch_on_several_gpus_reports_its_closed_code() {
+        let result = pb::MemberExecutionResult {
+            state: "launched".into(),
+            processes: vec![pb::OwnedProcessObservation {
+                role: "api".into(),
+                pid: 10,
+                boot_id: "boot-that-never-reaped".into(),
+                start_ticks: 7,
+                presence: "gone".into(),
+                rank: None,
+            }],
+            ..Default::default()
+        };
+        for engine in [
+            "engine_listener_exposed: the rank-1 process 13 listens on address 0.0.0.0 port \
+             29500, not on loopback; the engine was stopped",
+            "tp_rank_unobserved: no distinct rank process per GPU by the initialize timeout \
+             (no owned process holds memory on gpu1 (rank 1))",
+        ] {
+            let text = launch_failure(&result, Some(engine));
+            assert_eq!(text, engine);
+            assert!(capyctl_protocol::execution::is_launch_failure_text(&text));
+        }
     }
 
     /// ADR 0028 §7 (owner decision 10): a group Prepare answers from this
