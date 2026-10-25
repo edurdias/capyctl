@@ -27,11 +27,21 @@
 //!   `recovery: reconcile` relaunches the group once every member settled
 //!   ([`StallOutcome::Stopped`]).
 //!
-//! CPU and fake-engine tests only cover this; the live rows MN1–MN9 qualify
-//! it.
+//! ADR 0035 §7: the same rule applies to every instance on several GPUs of
+//! one host (no group plan): the router watches its requests the same way,
+//! with the same timeout, and a report for its current Ready generation
+//! probes it once through its own endpoint ([`on_local_stalled`]: one
+//! 1-token completion with its retained runtime, on loopback with its key
+//! for an embedded engine, through its host's agent on loopback for a remote
+//! one), bounded the same way and shared per generation. A failing probe
+//! fails it `tp_stalled` (status only) and stops it like a stalled group; a
+//! passing one stops nothing. An idle instance is never probed.
+//!
+//! CPU and fake-engine tests only cover this; the live rows MN1–MN9 (and
+//! ADR 0035's MG rows) qualify it.
 use crate::coordinator::CoordinatorCommands;
 use crate::group_activation::{probe_head, GroupCtx, HeadLaunch};
-use capyctl_store::ordinary_lifecycle::group_stall::{GroupStallStop, StalledGroup};
+use capyctl_store::ordinary_lifecycle::group_stall::{GroupStallStop, StalledGroup, StalledLocal};
 use futures::future::{BoxFuture, FutureExt, Shared};
 use std::collections::HashMap;
 use std::future::Future;
@@ -106,50 +116,183 @@ impl StallChecks {
     }
 }
 
+/// ADR 0035 §7: what one probe of a Ready launch through its own endpoint
+/// proved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchProbe {
+    /// It answered: the request was slow, not stalled.
+    Answered,
+    /// It was sent and not answered (or answered nothing usable).
+    Failed(String),
+    /// No probe could be sent (no retained runtime, or an engine without a
+    /// completion probe of its launch): nothing is proven either way.
+    Unavailable(String),
+}
+
 /// ADR 0028 §11: a stall reported by the router for `instance` of
 /// `deployment_id` at `generation`. Ignored unless that generation is the
-/// instance's current Ready group with no failure recorded; otherwise the
-/// generation's one probe (shared) decides.
+/// instance's current Ready group with no failure recorded, or (ADR 0035
+/// §7) its current Ready launch on several GPUs of one host not already
+/// failed `tp_stalled`; otherwise the generation's one probe (shared)
+/// decides.
 pub async fn report(
     commands: &CoordinatorCommands,
     deployment_id: &str,
     instance: u32,
     generation: i64,
 ) -> StallOutcome {
-    let Some(ctx) = commands.group_ctx() else {
-        return StallOutcome::Ignored;
-    };
+    let ctx = commands.group_ctx();
     let stalled = commands
         .owner_for_read()
         .map_err(|error| error.to_string())
         .and_then(|owner| {
-            owner
-                .store()
-                .stalled_group(deployment_id, instance, generation)
-                .map_err(|error| error.to_string())
+            let store = owner.store();
+            let group = match &ctx {
+                Some(_) => store
+                    .stalled_group(deployment_id, instance, generation)
+                    .map_err(|error| error.to_string())?,
+                None => None,
+            };
+            let local = match group {
+                Some(_) => None,
+                None => store
+                    .stalled_local(deployment_id, instance, generation)
+                    .map_err(|error| error.to_string())?,
+            };
+            Ok((group, local))
         });
-    let group = match stalled {
-        Ok(Some(group)) => group,
-        Ok(None) => return StallOutcome::Ignored,
+    let owned = commands.clone();
+    let key = (deployment_id.to_owned(), instance, generation);
+    match stalled {
+        Ok((Some(group), _)) => {
+            let Some(ctx) = ctx else {
+                return StallOutcome::Ignored;
+            };
+            commands
+                .stall_checks()
+                .share(key, move || async move {
+                    on_request_stalled(&ctx, &owned, &group).await
+                })
+                .await
+        }
+        Ok((None, Some(local))) => {
+            commands
+                .stall_checks()
+                .share(key, move || async move {
+                    on_local_stalled(&owned, &local).await
+                })
+                .await
+        }
+        Ok((None, None)) => StallOutcome::Ignored,
         Err(error) => {
             capyctl_domain::role_log::notice(
                 capyctl_domain::role_log::Level::Warning,
                 &format!(
-                    "deployment {deployment_id} instance {instance}: a group stall report \
-                     could not be read ({error}); nothing was probed"
+                    "deployment {deployment_id} instance {instance}: a stall report could not \
+                     be read ({error}); nothing was probed"
+                ),
+            );
+            StallOutcome::Ignored
+        }
+    }
+}
+
+/// ADR 0035 §7: one probe of the stalled instance on several GPUs through
+/// its own endpoint ([`CoordinatorCommands::probe_ready_launch`], 1 token,
+/// bounded by [`STALL_PROBE_DEADLINE`]). It answers: nothing is stopped. It
+/// fails: the instance failed `tp_stalled`, its dispatch is closed and its
+/// stop accepted (or owed and retried), whose cleanup releases every GPU
+/// only once every recorded process is gone. A probe that could not be sent
+/// proves nothing and stops nothing.
+pub async fn on_local_stalled(
+    commands: &CoordinatorCommands,
+    local: &StalledLocal,
+) -> StallOutcome {
+    let probed = commands
+        .probe_ready_launch(local, STALL_PROBE_TOKENS, STALL_PROBE_DEADLINE)
+        .await;
+    let failure = match probed {
+        LaunchProbe::Answered => {
+            capyctl_domain::role_log::notice(
+                capyctl_domain::role_log::Level::Notice,
+                &format!(
+                    "deployment {} instance {}: a request got no first token within the \
+                     stall timeout; the instance answered its probe, so nothing is stopped",
+                    local.deployment_id, local.instance_index
+                ),
+            );
+            return StallOutcome::Healthy;
+        }
+        LaunchProbe::Unavailable(why) => {
+            capyctl_domain::role_log::notice(
+                capyctl_domain::role_log::Level::Warning,
+                &format!(
+                    "deployment {} instance {}: a request got no first token within the \
+                     stall timeout and the instance could not be probed ({why}); nothing is \
+                     stopped",
+                    local.deployment_id, local.instance_index
                 ),
             );
             return StallOutcome::Ignored;
         }
+        LaunchProbe::Failed(error) => error,
     };
-    let owned = commands.clone();
-    commands
-        .stall_checks()
-        .share(
-            (deployment_id.to_owned(), instance, generation),
-            move || async move { on_request_stalled(&ctx, &owned, &group).await },
-        )
-        .await
+    let (owned, stalled) = (commands.clone(), local.clone());
+    let recorded = tokio::task::spawn_blocking(move || {
+        let recorded = owned.record_tp_stall(
+            &stalled.deployment_id,
+            stalled.instance_index,
+            stalled.generation,
+        )?;
+        if recorded {
+            let owed = GroupStallStop {
+                deployment_id: stalled.deployment_id.clone(),
+                instance_index: stalled.instance_index,
+                generation: stalled.generation,
+            };
+            if let Err(reason) = accept_tp_stall_stop(&owned, &owed) {
+                capyctl_domain::role_log::notice(
+                    capyctl_domain::role_log::Level::Warning,
+                    &format!(
+                        "deployment {} instance {}: the stop of the stalled instance was not \
+                         accepted yet ({reason}); dispatch stays closed, every GPU stays \
+                         charged and the stop is retried",
+                        owed.deployment_id, owed.instance_index
+                    ),
+                );
+            }
+        }
+        Ok::<bool, String>(recorded)
+    })
+    .await
+    .unwrap_or_else(|error| Err(error.to_string()));
+    match recorded {
+        Ok(true) => {
+            capyctl_domain::role_log::notice(
+                capyctl_domain::role_log::Level::Warning,
+                &format!(
+                    "deployment {} instance {}: a request got no first token within the \
+                     stall timeout and the instance failed its probe ({failure}); \
+                     tp_stalled: dispatch closed, stopping the instance",
+                    local.deployment_id, local.instance_index
+                ),
+            );
+            StallOutcome::Stopped
+        }
+        Ok(false) => StallOutcome::Ignored,
+        Err(reason) => {
+            capyctl_domain::role_log::notice(
+                capyctl_domain::role_log::Level::Warning,
+                &format!(
+                    "deployment {} instance {}: the instance failed its stall probe \
+                     ({failure}) but the failure could not be recorded ({reason}); it keeps \
+                     serving and the next stalled request probes it again",
+                    local.deployment_id, local.instance_index
+                ),
+            );
+            StallOutcome::Ignored
+        }
+    }
 }
 
 /// ADR 0028 §11 (decided 2026-10-06): one probe through the head
@@ -258,6 +401,26 @@ pub(crate) fn accept_stall_stop(
         crate::engine_exit::EXIT_PRINCIPAL,
         &format!(
             "group-stall:{}:{}:{}",
+            owed.deployment_id, owed.instance_index, owed.generation
+        ),
+    )
+}
+
+/// ADR 0035 §7: the stop a stalled instance on several GPUs owes: an
+/// ordinary stop of the instance under the failure principal, as after an
+/// engine exit. Keyed by the stalled generation, so the first attempt and
+/// every retry are one stop.
+pub(crate) fn accept_tp_stall_stop(
+    commands: &CoordinatorCommands,
+    owed: &GroupStallStop,
+) -> Result<Option<String>, String> {
+    crate::engine_exit::accept_instance_stop(
+        commands,
+        &owed.deployment_id,
+        owed.instance_index,
+        crate::engine_exit::EXIT_PRINCIPAL,
+        &format!(
+            "tp-stall:{}:{}:{}",
             owed.deployment_id, owed.instance_index, owed.generation
         ),
     )

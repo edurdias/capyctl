@@ -371,8 +371,15 @@ impl StubAuthority {
     }
 
     /// A READY deployment `deployment` (its route the same name) served by
-    /// exactly one open instance, a group's head when `group` is set.
-    fn with_instance(deployment: &str, index: u32, generation: i64, group: bool) -> Arc<Self> {
+    /// exactly one open instance, a group's head when `group` is set, on
+    /// `gpus` GPUs of its host (ADR 0035).
+    fn with_instance(
+        deployment: &str,
+        index: u32,
+        generation: i64,
+        group: bool,
+        gpus: u32,
+    ) -> Arc<Self> {
         Arc::new(Self {
             deployment: deployment.into(),
             route: deployment.into(),
@@ -401,6 +408,7 @@ impl StubAuthority {
                     engine_exited: false,
                     load: None,
                     group,
+                    local_tensor_parallel: gpus,
                 }),
                 stall_timeout: std::time::Duration::from_secs(120),
                 reports: Mutex::new(Vec::new()),
@@ -443,6 +451,7 @@ impl StubAuthority {
                     engine_exited: false,
                     load: None,
                     group: false,
+                    local_tensor_parallel: 1,
                 }),
                 stall_timeout: std::time::Duration::from_secs(120),
                 reports: Mutex::new(Vec::new()),
@@ -470,12 +479,18 @@ impl StubAuthority {
     /// ADR 0028 §9: a multi-node group's instance `index` at `generation`,
     /// served at its head.
     fn with_group(deployment: &str, index: u32, generation: i64) -> Arc<Self> {
-        Self::with_instance(deployment, index, generation, true)
+        Self::with_instance(deployment, index, generation, true, 1)
     }
 
     /// A single-host instance (instance 0, generation 1).
     fn with_single(deployment: &str) -> Arc<Self> {
-        Self::with_instance(deployment, 0, 1, false)
+        Self::with_instance(deployment, 0, 1, false, 1)
+    }
+
+    /// ADR 0035: a single-host instance (instance 0, generation 1) on
+    /// `gpus` GPUs of its host.
+    fn with_gpus(deployment: &str, gpus: u32) -> Arc<Self> {
+        Self::with_instance(deployment, 0, 1, false, gpus)
     }
 
     /// ADR 0028 §11: the group stall timeout this authority sets.
@@ -2105,6 +2120,24 @@ async fn first_token_timeout_reports_a_group_stall() {
     let _pending = router.send_chat("s");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(single.stall_reports().is_empty());
+}
+
+// T46 T31 (ADR 0035 §7): a request to an instance on several GPUs of one host
+// that gets no first token within the stall timeout is reported once, as a
+// group's is; an instance on one GPU never is.
+#[tokio::test]
+async fn first_token_timeout_reports_a_stall_on_several_gpus() {
+    use std::time::Duration;
+    let authority = StubAuthority::with_gpus("tp", 2).stall_timeout(Duration::from_millis(50));
+    let router = router_with(&authority).with_upstream_silent();
+    let _pending = router.send_chat("tp");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(authority.stall_reports(), vec![("tp".to_string(), 0, 1)]);
+    let one = StubAuthority::with_gpus("one", 1).stall_timeout(Duration::from_millis(50));
+    let router = router_with(&one).with_upstream_silent();
+    let _pending = router.send_chat("one");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(one.stall_reports().is_empty(), "N = 1 is never watched");
 }
 
 // T31 T39 (ADR 0028 §11): the watch observes a group request without holding

@@ -483,6 +483,81 @@ impl CoordinatorCommands {
             .map_err(|error| error.to_string())
     }
 
+    /// ADR 0035 §7: the instance on several GPUs at `generation` stalled
+    /// and failed its probe: its dispatch closes and `tp_stalled` is
+    /// recorded ([`capyctl_store::Store::record_tp_stall`]). `Ok(false)`
+    /// when that generation is no longer its current Ready launch.
+    pub(crate) fn record_tp_stall(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        generation: i64,
+    ) -> Result<bool, String> {
+        let owner = self.owner_for_read().map_err(|error| error.to_string())?;
+        owner
+            .store()
+            .record_tp_stall(owner.session(), deployment_id, instance_index, generation)
+            .map_err(|error| error.to_string())
+    }
+
+    /// ADR 0035 §7: one completion probe of at most `max_tokens` tokens of
+    /// the Ready launch `local` names, through the instance's own endpoint:
+    /// its retained runtime's probe, on loopback with the launch's key for an
+    /// embedded engine and run by the host's agent on its loopback for a
+    /// remote one (never through ingress or the router), bounded by `bound`.
+    pub(crate) async fn probe_ready_launch(
+        &self,
+        local: &capyctl_store::ordinary_lifecycle::group_stall::StalledLocal,
+        max_tokens: u32,
+        bound: Duration,
+    ) -> crate::group_stall::LaunchProbe {
+        use crate::group_stall::LaunchProbe;
+        let driver = match self.shared.retained.lock() {
+            Ok(retained) => retained.get(&local.binding_id).cloned(),
+            Err(_) => None,
+        };
+        let Some(driver) = driver else {
+            return LaunchProbe::Unavailable(
+                "this coordinator retains no runtime for the launch".into(),
+            );
+        };
+        let Ok(now) = (self.shared.clock)() else {
+            return LaunchProbe::Unavailable("the coordinator's clock is unreadable".into());
+        };
+        let context = capyctl_domain::completion::StepExecutionContext {
+            token: capyctl_domain::completion::TransitionToken {
+                deployment_id: local.deployment_id.clone(),
+                revision: local.revision,
+                generation: local.generation,
+                operation_id: local.operation_id.clone(),
+                step_id: local.step_id.clone(),
+            },
+            binding_id: local.binding_id.clone(),
+            incarnation: local.incarnation.clone(),
+            issued_at_ms: now,
+            deadline_ms: now.saturating_add(i64::try_from(bound.as_millis()).unwrap_or(i64::MAX)),
+            identities: capyctl_domain::completion::ExecutionIdentities::Retained(
+                local.identities.clone(),
+            ),
+            completion_target: None,
+            grant_id: None,
+            launch_settings: None,
+        };
+        match tokio::time::timeout(
+            bound,
+            driver.engine.wake_canary(&context, max_tokens, bound),
+        )
+        .await
+        {
+            Ok(Ok(_)) => LaunchProbe::Answered,
+            Ok(Err(RuntimeError::Unsupported)) => LaunchProbe::Unavailable(
+                "the engine offers no completion probe of its launch".into(),
+            ),
+            Ok(Err(error)) => LaunchProbe::Failed(error.to_string()),
+            Err(_) => LaunchProbe::Failed(format!("the probe was not answered within {bound:?}")),
+        }
+    }
+
     /// Commit Stop using a service-resolved generation. History is observation only.
     ///
     /// The deployment stays eligible for on-demand activation, which is what SPEC
@@ -3558,9 +3633,18 @@ async fn retry_group_residency_stops(shared: &Arc<Shared>) -> Result<bool, Coord
 /// dispatch stays closed under its recorded reason and every member stays
 /// charged. Returns whether any stop was accepted.
 async fn retry_group_stall_stops(shared: &Arc<Shared>) -> Result<bool, CoordinatorError> {
-    let owed = shared
-        .read(|owner, _| owner.store().group_stall_stops_due(owner.session()))
+    let (mut owed, tp) = shared
+        .read(|owner, _| {
+            Ok((
+                owner.store().group_stall_stops_due(owner.session())?,
+                // ADR 0035 §7: and every instance on several GPUs that
+                // failed `tp_stalled`.
+                owner.store().tp_stall_stops_due(owner.session())?,
+            ))
+        })
         .await?;
+    let groups = owed.len();
+    owed.extend(tp);
     if owed.is_empty() {
         return Ok(false);
     }
@@ -3569,7 +3653,14 @@ async fn retry_group_stall_stops(shared: &Arc<Shared>) -> Result<bool, Coordinat
     };
     Ok(tokio::task::spawn_blocking(move || {
         owed.iter()
-            .filter(|owed| crate::group_stall::accept_stall_stop(&commands, owed).is_ok())
+            .enumerate()
+            .filter(|(index, owed)| {
+                if *index < groups {
+                    crate::group_stall::accept_stall_stop(&commands, owed).is_ok()
+                } else {
+                    crate::group_stall::accept_tp_stall_stop(&commands, owed).is_ok()
+                }
+            })
             .count()
             > 0
     })

@@ -100,6 +100,10 @@ pub struct ServingInstance {
     /// head; the router watches each request it forwards here for its first
     /// token ([`LifecyclePort::report_group_stall`]).
     pub group: bool,
+    /// ADR 0035 §§2, 7: the number of GPUs of its host this incarnation runs
+    /// on; above 1, the router watches each request it forwards here for its
+    /// first token like a group's, and a stall is reported the same way.
+    pub local_tensor_parallel: u32,
 }
 
 #[async_trait]

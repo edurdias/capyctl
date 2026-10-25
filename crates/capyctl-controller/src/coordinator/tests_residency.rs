@@ -45,6 +45,8 @@ struct Residency {
     canary: Mutex<Option<CanaryEvidence>>,
     /// The wake canary is asked but never answered.
     canary_hangs: std::sync::atomic::AtomicBool,
+    /// The wake canary (or ADR 0035 §7's stall probe) is asked and fails.
+    canary_fails: std::sync::atomic::AtomicBool,
     /// How long (test clock, ms) the engine takes to answer the wake canary.
     canary_takes: AtomicI64,
     /// (incarnation, generation) of every wake canary asked.
@@ -76,6 +78,7 @@ impl Residency {
             residents: Mutex::new(vec![]),
             canary: Mutex::new(None),
             canary_hangs: std::sync::atomic::AtomicBool::new(false),
+            canary_fails: std::sync::atomic::AtomicBool::new(false),
             canary_takes: AtomicI64::new(0),
             canaries: Mutex::new(vec![]),
         })
@@ -260,13 +263,25 @@ impl EngineAdapter for Residency {
         max_tokens: u32,
         _: Duration,
     ) -> Result<capyctl_adapters::completion_probe::CanaryAnswer, RuntimeError> {
-        assert_eq!(max_tokens, crate::wake_canary::CANARY_TOKENS);
+        // ADR 0035 §7: the stall probe of an instance on several GPUs is
+        // the same probe, one token.
+        assert!(
+            [
+                crate::wake_canary::CANARY_TOKENS,
+                crate::group_stall::STALL_PROBE_TOKENS
+            ]
+            .contains(&max_tokens),
+            "{max_tokens}"
+        );
         self.canaries
             .lock()
             .unwrap()
             .push((context.incarnation.clone(), context.token.generation));
         if self.canary_hangs.load(Ordering::SeqCst) {
             return std::future::pending().await;
+        }
+        if self.canary_fails.load(Ordering::SeqCst) {
+            return Err(RuntimeError::Uncertain("the engine did not answer".into()));
         }
         // The answer comes `canary_takes` later, and is observed then.
         let takes = self.canary_takes.load(Ordering::SeqCst);
@@ -1558,4 +1573,113 @@ async fn a_controller_restart_keeps_the_reference() {
             .unwrap(),
         Some(recorded)
     );
+}
+
+// T46 T31 (ADR 0035 §7, ADR 0028 §11): a stall reported for an instance on
+// several GPUs of one host is probed once through its own endpoint (its
+// retained runtime's one-token probe). A passing probe stops nothing; a
+// failing one fails it `tp_stalled` (status only), closes its dispatch and
+// stops it, and the stop it owes is not owed again once accepted. A stall
+// reported for an instance on one GPU is never probed.
+#[tokio::test]
+async fn a_stalled_instance_on_several_gpus_fails_tp_stalled_only_when_its_probe_fails() {
+    use crate::group_stall::{report, StallOutcome};
+    let (dir, owner, fence, observations) = setup().await;
+    let clock = Arc::new(AtomicI64::new(1900));
+    let engine = Residency::new(true, clock.clone());
+    let w = residency_worker(
+        owner.clone(),
+        observations,
+        engine.clone(),
+        clock,
+        IdlePolicy::default(),
+    );
+    ready(&w, &fence).await;
+    let id = fence.deployment_id.clone();
+    let (_, open, generation, _) = instance(&dir, &id);
+    assert!(open);
+    // N = 1: no stall rule. (Its first readiness asked the wake canary.)
+    until("the readiness canary", || {
+        engine.canaries.lock().unwrap().len() == 1
+    })
+    .await;
+    let asked = 1;
+    assert_eq!(
+        report(&w.commands(), &id, 0, generation).await,
+        StallOutcome::Ignored
+    );
+    assert_eq!(engine.canaries.lock().unwrap().len(), asked, "never probed");
+
+    // The instance runs on two GPUs of its host.
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    sql.execute(
+        "UPDATE deployment_instances SET device_json='[{\"id\":\"gpu0\"},{\"id\":\"gpu1\"}]'
+          WHERE deployment_id=?1 AND instance_index=0",
+        [&id],
+    )
+    .unwrap();
+    // The router reads it as watched for stalls.
+    let serving = owner
+        .lock()
+        .unwrap()
+        .store()
+        .serving_instances(&id)
+        .unwrap();
+    assert_eq!(serving[0].local_tensor_parallel, 2);
+    // The probe answers: the request was slow; nothing is stopped.
+    engine.generates(&[7]);
+    assert_eq!(
+        report(&w.commands(), &id, 0, generation).await,
+        StallOutcome::Healthy
+    );
+    assert_eq!(engine.canaries.lock().unwrap().len(), asked + 1);
+    assert!(instance(&dir, &id).1, "dispatch stays open");
+    // A stale generation is ignored.
+    assert_eq!(
+        report(&w.commands(), &id, 0, generation + 1).await,
+        StallOutcome::Ignored
+    );
+
+    // The probe fails too: tp_stalled, dispatch closed, the instance stopped.
+    engine
+        .canary_fails
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        report(&w.commands(), &id, 0, generation).await,
+        StallOutcome::Stopped
+    );
+    let (status, journaled): (Option<String>, i64) = sql
+        .query_row(
+            "SELECT last_error,(SELECT COUNT(*) FROM journal_entries WHERE state='tp_stalled')
+               FROM deployment_instances WHERE deployment_id=?1 AND instance_index=0",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((status.as_deref(), journaled), (Some("tp_stalled"), 1));
+    // The stop was accepted: the instance settles stopped on its host's
+    // gone evidence, and nothing more is owed.
+    until("the stalled instance stopped", || {
+        instance(&dir, &id).0 != "ready"
+    })
+    .await;
+    assert!(!instance(&dir, &id).1);
+    until("the stop settled", || {
+        engine.cleanups.load(std::sync::atomic::Ordering::SeqCst) == 1
+    })
+    .await;
+    {
+        let o = owner.lock().unwrap();
+        assert!(o
+            .store()
+            .tp_stall_stops_due(o.session())
+            .unwrap()
+            .is_empty());
+    }
+    // A repeated report names no Ready launch any more.
+    assert_eq!(
+        report(&w.commands(), &id, 0, generation).await,
+        StallOutcome::Ignored
+    );
+    w.shutdown().await.unwrap();
 }

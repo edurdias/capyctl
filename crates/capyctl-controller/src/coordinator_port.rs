@@ -912,6 +912,7 @@ impl LifecyclePort for CoordinatorLifecycle {
                         engine_exited: row.engine_exited,
                         load,
                         group: row.group,
+                        local_tensor_parallel: row.local_tensor_parallel,
                     }
                 })
                 .collect(),
