@@ -22,8 +22,9 @@ at least 128 GB of RAM (MG6 is SKIP below 120 GiB), 250 GB free in the home
 directory, and `git`, `curl`, `python3`, `cc`/`c++`, `make` and `tar`. SSH
 access by key. `cmake` and `nvcc` are used when present (`nvcc` at
 `/usr/local/cuda/bin/nvcc` or on `PATH`); without them, setup installs the
-`cmake` wheel from PyPI and NVIDIA's CUDA 13.0 compiler wheel into the
-session's directory for the llama.cpp build. The preflight refuses a machine
+`cmake` wheel from PyPI and NVIDIA's CUDA 13.0 compiler, runtime and cuBLAS
+wheels into the session's directory for the llama.cpp build (built with `c++`
+as the CUDA host compiler). The preflight refuses a machine
 with fewer than two GPUs, GPUs that differ, an older driver, too little disk, or
 an engine already running, before anything is installed.
 

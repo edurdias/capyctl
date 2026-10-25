@@ -140,9 +140,10 @@ setup_tools() {
   run mkdir -m 700 -p "$MG" "$BIN" "$RES"
   created "$MG"
   # Caches the installs and engines fill in the home directory: removed by purge
-  # only when this run is the one that created them.
+  # only when this run is the one that created them (parents before children, so
+  # purge, which goes from the last line up, removes a created parent last).
   local d
-  for d in .cache/uv .local/share/uv .cache/vllm .cache/flashinfer .cache/torch .cache/triton .triton \
+  for d in .cache .local .local/share .config .cache/uv .local/share/uv .cache/vllm .cache/flashinfer .cache/torch .cache/triton .triton \
     .cache/sglang .cache/huggingface .nv .cache/tvm-ffi .cache/torch_extensions .config/vllm .cache/pip; do
     [ -e "$HOME/$d" ] || created "$HOME/$d"
   done
@@ -229,12 +230,14 @@ setup_engines() {
   run chmod -R go-w "$V32" "$S22"
   local nvcc arch
   nvcc=$(nvcc_path)
-  if [ ! -x "$nvcc" ]; then
+  if [ "$nvcc" = "$MG/cuda/bin/nvcc" ]; then
     created "$MG/cuda"
-    run "$BIN/uv" venv --python 3.12 "$MG/cuda-venv"
-    run "$BIN/uv" pip install --python "$MG/cuda-venv/bin/python" "cuda-toolkit[nvcc,cccl,cudart]==13.0.*"
+    [ -x "$MG/cuda-venv/bin/python" ] || run "$BIN/uv" venv --python 3.12 "$MG/cuda-venv"
+    run "$BIN/uv" pip install --python "$MG/cuda-venv/bin/python" "cuda-toolkit[nvcc,cccl,cudart,cublas]==13.0.*"
     run sh -c "ln -sfn \$(dirname \$(dirname \$(find $MG/cuda-venv -path '*/bin/nvcc' | head -1))) $MG/cuda"
-    nvcc=$MG/cuda/bin/nvcc
+    # The wheels keep versioned libraries in lib/: nvcc links from lib64, and
+    # CMake's FindCUDAToolkit looks for the unversioned names.
+    run sh -c "cd $MG/cuda/lib && for l in libcudart libcublas libcublasLt; do ln -sfn \$l.so.13 \$l.so; done && ln -sfn lib $MG/cuda/lib64"
   fi
   if [ "$PLAN" = 1 ]; then arch=86; else
     arch=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
@@ -242,7 +245,13 @@ setup_engines() {
   if ! { [ -x "$LCBIN" ] && "$LCBIN" --version 2>&1 | grep -q "commit $LC_COMMIT"; }; then
     created "$LC"
     [ -d "$LC/.git" ] || run git clone --branch "$LC_TAG" --depth 1 https://github.com/ggml-org/llama.cpp "$LC"
-    run sh -c "cd $LC && cmake -B build -DGGML_CUDA=ON -DLLAMA_BUILD_IS_DEV=OFF -DCMAKE_CUDA_COMPILER=$nvcc -DCMAKE_CUDA_ARCHITECTURES=${arch}-real -DCMAKE_BUILD_TYPE=Release >/dev/null && cmake --build build -j \$(nproc) --target llama-server 2>&1 | tail -n 2"
+    # The host compiler is `c++` for CUDA as well: `gcc` can be a newer major
+    # version than the installed g++ (no cc1plus for it). CMake leaves the
+    # toolkit's library directory out of the runpath (nvcc reports it as
+    # implicit), so llama-server would not find the wheels' libcudart.so.13.
+    local cudaroot
+    cudaroot=$(dirname "$(dirname "$nvcc")")
+    run sh -c "cd $LC && rm -rf build && cmake -B build -DGGML_CUDA=ON -DLLAMA_BUILD_IS_DEV=OFF -DCUDAToolkit_ROOT=$cudaroot -DCMAKE_CUDA_COMPILER=$nvcc -DCMAKE_CXX_COMPILER=\$(command -v c++) -DCMAKE_CUDA_HOST_COMPILER=\$(command -v c++) -DCMAKE_BUILD_RPATH=$cudaroot/lib64 -DCMAKE_CUDA_ARCHITECTURES=${arch}-real -DCMAKE_BUILD_TYPE=Release >/dev/null && cmake --build build -j \$(nproc) --target llama-server 2>&1 | tail -n 2"
   fi
   [ "$PLAN" = 1 ] || {
     echo "vllm $("$V32/bin/python" -c 'import vllm, torch; print(vllm.__version__, torch.__version__, torch.version.cuda)')"

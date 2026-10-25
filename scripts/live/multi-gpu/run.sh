@@ -151,7 +151,7 @@ step "host phases ended with status $rc"
 step "copy the results back"
 x mkdir -p "$OUT/raw"
 x rsync -e "ssh -p $SSH_PORT" -rlz "$TARGET:mg/res/" "$OUT/raw/"
-x rsync -e "ssh -p $SSH_PORT" -rlz "$TARGET:mg/dep" "$TARGET:mg/all.log" "$OUT/raw/"
+x rsync -e "ssh -p $SSH_PORT" -rlz "$TARGET:mg/dep" "$TARGET:mg/all.log" "$OUT/raw/" || echo "warning: deployment files or all.log not copied (setup stopped before the rows?)"
 if [ "$DRY" = 0 ]; then
   find "$OUT/raw" -type f \( -name '*.log' -o -name '*.txt' -o -name '*.tsv' -o -name '*.yaml' -o -name '*.json' -o -name '*.jsonl' -o -name '*.out' \) \
     -exec sed -i -e "s#$HOST_ADDR#rented-host#g" -e "s#/home/[A-Za-z0-9._-]*/#~/#g" -e "s#/root/#~/#g" {} +
