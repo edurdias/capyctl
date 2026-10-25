@@ -678,21 +678,19 @@ PY
   stopd "$n"
 }
 
-refusal() { # row part file expected-code expected-exit [start]
+refusal() { # row part file expected-code expected-exit: refused at deploy, or at start when deploy accepts it
   local row=$1 part=$2 f=$3 code=$4 want=$5 rc out
-  check "$row" "$part" "refused $code (exit $want)$( [ -n "${6:-}" ] && echo " at start")"
-  if [ -n "${6:-}" ]; then
-    deploy "$f" >/dev/null || true
-    c start deployment "$f" --wait >"$RES/$row-$part.out" 2>&1
+  check "$row" "$part" "refused $code (exit $want), at deploy or, when deploy accepts it, at start"
+  c deploy model --file "$MG/dep/$f.yaml" >"$RES/$row-$part.out" 2>&1
+  rc=$?
+  if [ "$rc" = 0 ] && [ "$PLAN" = 0 ]; then
+    DEPLOYS="$DEPLOYS $f"
+    c start deployment "$f" --wait >>"$RES/$row-$part.out" 2>&1
     rc=$?
-  else
-    c deploy model --file "$MG/dep/$f.yaml" >"$RES/$row-$part.out" 2>&1
-    rc=$?
-    [ "$rc" = 0 ] && DEPLOYS="$DEPLOYS $f"
   fi
   [ "$PLAN" = 1 ] && return 0
   out=$(tr '\n' ' ' <"$RES/$row-$part.out" | cut -c1-400)
-  if [ "$rc" = "$want" ] && grep -q -- "$code" "$RES/$row-$part.out"; then
+  if [ "$rc" = "$want" ] && tr '\n' ' ' <"$RES/$row-$part.out" | grep -qE -- "$code"; then
     result "$row" "$part" pass "exit $rc: $out"
   else
     result "$row" "$part" fail "exit $rc (wanted $want): $out"
@@ -738,7 +736,7 @@ rows_shipped() {
   if want MG12; then
     phase "MG12 refusals"
     dep mg12-tp3 v32 "$(q30)" "topology: {tensor_parallel: 3}"
-    refusal MG12 tp3 mg12-tp3 insufficient_gpus 4 start
+    refusal MG12 tp3 mg12-tp3 insufficient_gpus 4
     dep mg12-pin v32 "$(q30)" "topology: {tensor_parallel: 2}
 devices: [{id: gpu0}]"
     refusal MG12 pin mg12-pin topology_devices_mismatch 2
@@ -746,10 +744,10 @@ devices: [{id: gpu0}]"
   if want MG14; then
     phase "MG14 refusals name what would fit"
     dep mg14-tp1 v32 "$(q30)" "topology: {tensor_parallel: 1}"
-    refusal MG14 tp1 mg14-tp1 'tensor_parallel: 2' 4 start
+    refusal MG14 tp1 mg14-tp1 'insufficient_device_memory.*tensor_parallel: 2' 4
     dep mg14-auto v32 "$(q30)" "topology: auto
 engine_config: {memory: {kv_cache: 40GiB}}"
-    refusal MG14 auto mg14-auto insufficient_device_memory 4 start
+    refusal MG14 auto mg14-auto 'insufficient_device_memory.*tensor_parallel: 2 each GPU is charged' 4
   fi
 
   dep mg-v v32 "$(q30)" "topology: {tensor_parallel: 2}

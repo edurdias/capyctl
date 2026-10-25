@@ -275,21 +275,33 @@ def deployment_id(db, name):
 
 
 def cmd_owned(a):
-    """The identities a deployment's live launches recorded (ADR 0027; ADR 0035 §6: rank-N)."""
+    """The identities a deployment's live launches recorded (ADR 0027; ADR 0035 §6).
+
+    A rank process is `rank-N`, or an `api`/`worker-N` process the readiness receipt
+    names (`tp ranks: 0=worker-0:11@gpu0 1=worker-2:13@gpu1`, in the binding)."""
     ident = deployment_id(a.db, a.name)
-    for b in rows(a.db, "SELECT id,state,identities_json FROM runtime_bindings "
+    for b in rows(a.db, "SELECT id,state,binding_json,identities_json FROM runtime_bindings "
                         "WHERE deployment_id=? AND state IN ('live','uncertain')", (ident,)):
+        # The receipt rides the binding or the journal's evidence; a PID only counts
+        # when it is one of this binding's own identities (below).
+        texts = [b["binding_json"] or ""] + [r["evidence"] or "" for r in rows(
+            a.db, "SELECT evidence FROM journal_entries WHERE evidence LIKE '%tp ranks: %' ORDER BY recorded_at")]
+        ranks = {}
+        for text in texts:
+            for entry in re.findall(r"tp ranks: ((?:\d+=[\w-]+:\d+@gpu\d+ ?)+)", text):
+                for rank, _role, pid, gpu in re.findall(r"(\d+)=([\w-]+):(\d+)@(gpu\d+)", entry):
+                    ranks[int(pid)] = (int(rank), gpu)
         for identity in json.loads(b["identities_json"] or "[]"):
             role = identity.get("role", "")
-            rank = identity.get("rank")
+            rank, gpu = ranks.get(identity.get("pid"), (None, None))
             if rank is None and re.match(r"^rank-\d+$", role):
                 rank = int(role.split("-")[1])
             if a.role and role != a.role:
                 continue
             if a.rank is not None and rank != a.rank:
                 continue
-            print(json.dumps({"binding_id": b["id"], "binding_state": b["state"], "rank": rank, **identity},
-                             sort_keys=True))
+            print(json.dumps({"binding_id": b["id"], "binding_state": b["state"], "rank": rank, "gpu": gpu,
+                              **identity}, sort_keys=True))
     return 0
 
 
