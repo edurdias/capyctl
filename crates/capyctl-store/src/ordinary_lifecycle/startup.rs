@@ -58,7 +58,8 @@ fn total(footprint: &capyctl_config::effective::PhaseFootprint) -> i64 {
 }
 
 /// The startup peaks recorded for this revision on its host and installation,
-/// by memory domain.
+/// by memory domain. ADR 0035 §3: at the revision's tensor-parallel size N
+/// only; a peak measured at N = 2 never sizes a start at N = 1.
 fn measured_peaks(
     tx: &rusqlite::Connection,
     deployment_id: &str,
@@ -69,13 +70,56 @@ fn measured_peaks(
         .prepare(
             "SELECT domain,peak_bytes FROM startup_measurements
               WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND installation=?4
-                AND peak_bytes>0",
+                AND tensor_parallel=?5 AND peak_bytes>0",
         )?
         .query_map(
-            params![deployment_id, revision, e.host.name, installation(e)],
+            params![
+                deployment_id,
+                revision,
+                e.host.name,
+                installation(e),
+                e.local_tensor_parallel()
+            ],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
         )?
         .collect::<Result<_, _>>()?)
+}
+
+/// Whether `domain` is one of the host's discrete GPUs.
+fn is_device(e: &EffectiveDeployment, domain: &str) -> bool {
+    e.host
+        .domains
+        .get(domain)
+        .is_some_and(|d| d.memory == capyctl_config::effective::DomainMemory::Device)
+}
+
+/// ADR 0035 §§1a, 3: the per-GPU device peak measured for this revision on
+/// `e`'s host and installation at tensor-parallel size `n`, whichever GPUs it
+/// was measured on (the GPUs are identical), for `topology: auto`'s choice of
+/// N; `None` when none is recorded at that size.
+pub(super) fn measured_device_peak(
+    tx: &rusqlite::Connection,
+    deployment_id: &str,
+    revision: i64,
+    e: &EffectiveDeployment,
+    n: u32,
+) -> Result<Option<i64>, LifecycleError> {
+    let rows: Vec<(String, i64)> = tx
+        .prepare(
+            "SELECT domain,peak_bytes FROM startup_measurements
+              WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND installation=?4
+                AND tensor_parallel=?5 AND peak_bytes>0",
+        )?
+        .query_map(
+            params![deployment_id, revision, e.host.name, installation(e), n],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?
+        .collect::<Result<_, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(domain, _)| is_device(e, domain))
+        .map(|(_, peak)| peak)
+        .max())
 }
 
 /// The pool a single-allocation placeholder is measured on (unified memory).
@@ -118,17 +162,35 @@ pub(super) fn frozen_startup(
                 .map(|peak| (*peak).max(total(&e.resources.ready))),
             BTreeMap::new(),
         ),
-        StartupMeasure::Domains { device, host } => (
-            None,
-            [device, host]
-                .into_iter()
-                .filter_map(|domain| {
-                    let peak = *measured.get(&domain)?;
+        StartupMeasure::Domains { device, host } => {
+            // ADR 0035 §3: on N GPUs the peak is per GPU and applies to every
+            // GPU of the set, whichever GPUs it was measured on; on one GPU
+            // to that GPU's domain only, as before.
+            let n = e.local_tensor_parallel();
+            let (device_peak, devices) = if n > 1 {
+                (
+                    measured
+                        .iter()
+                        .filter(|(domain, _)| is_device(e, domain))
+                        .map(|(_, peak)| *peak)
+                        .max(),
+                    capyctl_config::effective::startup_device_domains(e),
+                )
+            } else {
+                (measured.get(&device).copied(), vec![device])
+            };
+            let mut domains = BTreeMap::new();
+            if let Some(peak) = device_peak {
+                for domain in devices {
                     let bytes = peak.max(ready_on(e, &domain));
-                    Some((domain, bytes))
-                })
-                .collect(),
-        ),
+                    domains.insert(domain, bytes);
+                }
+            }
+            if let Some(peak) = measured.get(&host) {
+                domains.insert(host.clone(), (*peak).max(ready_on(e, &host)));
+            }
+            (None, domains)
+        }
     })
 }
 
@@ -449,7 +511,9 @@ pub struct StartupReservation {
 /// CUDA context) and the part charged on host RAM (the engine process), apart,
 /// so the card's figure is not read as the sum, each with where it came from:
 /// a domain whose peak a first run measured is `measured`, any other keeps
-/// the provenance of the estimate it reserves.
+/// the provenance of the estimate it reserves. ADR 0035 §3: on N GPUs the
+/// card's part is each GPU's (every GPU is charged one rank), which is what a
+/// host lays over each of the launch's GPUs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct StartupSplit {
     pub device_bytes: i64,
@@ -480,9 +544,14 @@ fn split(
     }
     let part = |device: bool| {
         let mut allocations = cold.iter().filter(|a| on_device(&a.domain) == device);
-        let bytes = allocations
-            .clone()
-            .fold(0_i64, |sum, a| sum.saturating_add(a.bytes));
+        let bytes = if device {
+            // ADR 0035 §3: one GPU's part (the largest; they are equal).
+            allocations.clone().map(|a| a.bytes).max().unwrap_or(0)
+        } else {
+            allocations
+                .clone()
+                .fold(0_i64, |sum, a| sum.saturating_add(a.bytes))
+        };
         let provenance = if allocations.all(|a| measured.contains_key(&a.domain)) && bytes > 0 {
             StartupProvenance::Measured
         } else {
@@ -543,6 +612,14 @@ pub struct StartupMeasurement {
     pub domain: String,
     pub peak_bytes: i64,
     pub measured_at_ms: i64,
+    /// ADR 0035 §3: the tensor-parallel size it was measured at (the
+    /// per-GPU peak of a launch on that many GPUs). Absent at 1. Additive.
+    #[serde(skip_serializing_if = "one")]
+    pub tensor_parallel: u32,
+}
+
+fn one(n: &u32) -> bool {
+    *n == 1
 }
 
 /// A deployment's startup budget as status shows it: what a start of its
@@ -612,8 +689,8 @@ pub(crate) fn status(
     };
     let measured = tx
         .prepare(
-            "SELECT host_id,installation,domain,peak_bytes,measured_at_ms FROM startup_measurements
-              WHERE deployment_id=?1 AND revision=?2 ORDER BY host_id,installation,domain",
+            "SELECT host_id,installation,domain,peak_bytes,measured_at_ms,tensor_parallel FROM startup_measurements
+              WHERE deployment_id=?1 AND revision=?2 ORDER BY host_id,installation,tensor_parallel,domain",
         )?
         .query_map(params![deployment_id, revision], |r| {
             Ok(StartupMeasurement {
@@ -622,6 +699,7 @@ pub(crate) fn status(
                 domain: r.get(2)?,
                 peak_bytes: r.get(3)?,
                 measured_at_ms: r.get(4)?,
+                tensor_parallel: r.get(5)?,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -631,6 +709,37 @@ pub(crate) fn status(
         provenance: overall(provenance, &split),
         split,
         measured,
+    }))
+}
+
+/// ADR 0035 §1, §1a: the current revision's topology as status and `deploy`
+/// show it ([`capyctl_config::effective::topology_view`]), as resolved on its
+/// first host, the size `topology: auto` would choose there now taking the
+/// startup peak measured at each size into account. `None` on one GPU
+/// without `auto`, and for an unknown deployment or one whose revision does
+/// not decode.
+pub(crate) fn topology_status(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+) -> rusqlite::Result<Option<serde_json::Value>> {
+    let row: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT e.effective_json,d.revision FROM deployments d JOIN effective_revisions e
+              ON e.deployment_id=d.id AND e.revision=d.revision WHERE d.id=?1",
+            [deployment_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((raw, revision)) = row else {
+        return Ok(None);
+    };
+    let Ok(e) = decode_effective_snapshot(&raw) else {
+        return Ok(None);
+    };
+    Ok(capyctl_config::effective::topology_view(&e, &|n| {
+        measured_device_peak(tx, deployment_id, revision, &e, n)
+            .ok()
+            .flatten()
     }))
 }
 
@@ -827,11 +936,13 @@ impl crate::Store {
         if state != "completed" {
             return Ok(false);
         }
+        // ADR 0035 §3: kept per revision, host, installation and N, the
+        // tensor-parallel size the launch ran at.
         for (domain, peak_bytes) in peaks {
             tx.execute(
-                "INSERT INTO startup_measurements(deployment_id,revision,host_id,installation,domain,peak_bytes,step_id,measured_at_ms)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
-                 ON CONFLICT(deployment_id,revision,host_id,installation,domain) DO UPDATE SET
+                "INSERT INTO startup_measurements(deployment_id,revision,host_id,installation,tensor_parallel,domain,peak_bytes,step_id,measured_at_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                 ON CONFLICT(deployment_id,revision,host_id,installation,tensor_parallel,domain) DO UPDATE SET
                    step_id=CASE WHEN excluded.peak_bytes>peak_bytes THEN excluded.step_id ELSE step_id END,
                    measured_at_ms=CASE WHEN excluded.peak_bytes>peak_bytes THEN excluded.measured_at_ms ELSE measured_at_ms END,
                    peak_bytes=MAX(peak_bytes,excluded.peak_bytes)",
@@ -840,6 +951,7 @@ impl crate::Store {
                     p.revision,
                     e.host.name,
                     installation(&e),
+                    e.local_tensor_parallel(),
                     domain,
                     peak_bytes,
                     p.step_id,

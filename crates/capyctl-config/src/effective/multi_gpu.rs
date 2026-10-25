@@ -274,6 +274,91 @@ pub fn fit_hint(table: &AutoTable, gpus: &[AutoGpu]) -> String {
     }
 }
 
+/// The per-GPU charge of a candidate row, its cold phase replaced by the
+/// peak measured at that size when one is recorded.
+fn charge_at(candidate: &AutoCandidate, measured_cold: &dyn Fn(u32) -> Option<i64>) -> i64 {
+    let mut device = candidate.device;
+    if let Some(peak) = measured_cold(candidate.tensor_parallel) {
+        device.cold = peak;
+    }
+    device.peak()
+}
+
+/// ADR 0035 §1a: the refusal of a `topology: auto` deployment none of whose
+/// sizes fits a host's GPUs ([`AutoChoice::NoFit`]), as a closed code and the
+/// text that names what would fit there.
+///
+/// The per-GPU charge falls as N grows (each rank holds `ceil(sharded / N)`
+/// of the weights) toward what every rank holds whatever N is (its KV cache,
+/// the replicated tensors, the margin and the allowances). When the table's
+/// two largest sizes say that this charge would come within the cards'
+/// managed limit at some N above the host's GPU count, only a host with more
+/// identical GPUs would hold the deployment: `insufficient_gpus`, naming that
+/// N (an estimate from the table, `share = a / N + b`). Otherwise
+/// `insufficient_device_memory`, naming the per-GPU charge at the largest N
+/// this host offers and how many cards managing at least that would hold it.
+pub fn auto_refusal(
+    table: &AutoTable,
+    gpus: &[AutoGpu],
+    measured_cold: &dyn Fn(u32) -> Option<i64>,
+) -> (&'static str, String) {
+    let count = gpus.len();
+    let limit = gpus.iter().map(|gpu| gpu.managed_limit).max().unwrap_or(0);
+    let Some(last) = table.candidates.last() else {
+        return (
+            "insufficient_device_memory",
+            format!("no tensor_parallel up to this host's {count} GPU(s) can run this deployment"),
+        );
+    };
+    let largest = charge_at(last, measured_cold);
+    let more_gpus = match table.candidates.as_slice() {
+        [.., before, last] if limit > 0 => {
+            // The charge without the communication allowance, which is the
+            // same at every N above 1.
+            let bare = |c: &AutoCandidate| {
+                charge_at(c, measured_cold) as f64
+                    - communication_allowance(c.tensor_parallel) as f64
+            };
+            let (n1, n2) = (
+                f64::from(before.tensor_parallel),
+                f64::from(last.tensor_parallel),
+            );
+            let a = (bare(before) - bare(last)) * n1 * n2 / (n2 - n1);
+            let b = bare(last) - a / n2;
+            let room = limit as f64 - LOCAL_TP_COMMUNICATION_PLACEHOLDER_BYTES as f64 - b;
+            (a > 0.0 && room > 0.0)
+                .then(|| (a / room).ceil())
+                .filter(|n| *n > n2 && *n <= crate::topology::MAX_DIMENSION as f64)
+                .map(|n| n as u32)
+        }
+        _ => None,
+    };
+    match more_gpus {
+        Some(n) => (
+            crate::topology::INSUFFICIENT_GPUS,
+            format!(
+                "no tensor_parallel up to this host's {count} GPU(s) fits; at tensor_parallel: \
+                 {} each GPU is charged {}, above the {} each GPU here manages; about {n} \
+                 identical GPUs like these would hold it (estimated from the candidate table)",
+                last.tensor_parallel,
+                gib(largest),
+                gib(limit),
+            ),
+        ),
+        None => (
+            "insufficient_device_memory",
+            format!(
+                "no tensor_parallel up to this host's {count} GPU(s) fits; at tensor_parallel: \
+                 {n} each GPU is charged {}, above the {} the largest GPU here manages; {n} \
+                 identical GPUs each managing at least that would hold it",
+                gib(largest),
+                gib(limit),
+                n = last.tensor_parallel,
+            ),
+        ),
+    }
+}
+
 /// ADR 0035 §1, §1a: the number of attention heads in the checkpoint's
 /// `config.json` (`num_attention_heads`, or its `text_config`'s for a
 /// multimodal model). `None` when the checkpoint is not materialized here
@@ -424,6 +509,54 @@ impl EffectiveDeployment {
     pub fn per_gpu_charges(&self) -> AutoCandidate {
         row(self, self.local_tensor_parallel())
     }
+}
+
+/// ADR 0035 §1, §1a: what `validate config --host`, `deploy` and status show
+/// of a deployment on several GPUs of one host or under `topology: auto`:
+/// its GPUs in rank order, the charge on each GPU and on the host's RAM
+/// phase by phase, and for `auto` the candidate table and the size this host
+/// would choose now from its cards' managed limits (with the startup peak
+/// `measured_cold` gives for a size, when one is recorded). `None` on one
+/// GPU without `auto`.
+pub fn topology_view(
+    effective: &EffectiveDeployment,
+    measured_cold: &dyn Fn(u32) -> Option<i64>,
+) -> Option<Value> {
+    let record = effective.topology.as_ref()?;
+    let charges = effective.per_gpu_charges();
+    let mut view = serde_json::json!({
+        "tensor_parallel": record.tensor_parallel,
+        "gpus": effective
+            .selected_devices
+            .iter()
+            .map(|claim| claim.id.clone())
+            .collect::<Vec<_>>(),
+        "per_gpu": charges.device,
+        "system": charges.system,
+    });
+    if let Some(bytes) = record.communication_bytes {
+        view["communication_bytes"] = serde_json::json!(bytes);
+    }
+    if let Some(table) = &record.auto {
+        let gpus = auto_gpus(&effective.host);
+        let (chosen, note) = match choose_tensor_parallel(table, &gpus, measured_cold) {
+            AutoChoice::Chosen {
+                tensor_parallel, ..
+            } => (serde_json::json!(tensor_parallel), Value::Null),
+            AutoChoice::Unmeasured => (
+                Value::Null,
+                serde_json::json!("no size is chosen until the checkpoint is measured"),
+            ),
+            AutoChoice::NoFit => (Value::Null, serde_json::json!(fit_hint(table, &gpus))),
+        };
+        view["requested"] = serde_json::json!(crate::topology::AUTO);
+        view["candidates"] = serde_json::json!(table);
+        view["chosen"] = chosen;
+        if !note.is_null() {
+            view["note"] = note;
+        }
+    }
+    Some(view)
 }
 
 /// A row of the table from a resolution at `n`.

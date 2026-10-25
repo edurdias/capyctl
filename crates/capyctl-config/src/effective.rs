@@ -31,14 +31,15 @@ pub use snapshot::decode_effective_snapshot;
 // ADR 0035: one model on several GPUs of one host, and `topology: auto`.
 use multi_gpu::Limits;
 pub use multi_gpu::{
-    auto_gpus, choose_tensor_parallel, communication_allowance, engine_host_overhead, fit_hint,
-    AutoCandidate, AutoChoice, AutoExcluded, AutoGpu, AutoTable, LocalTopologyRecord, PhaseCharges,
-    LOCAL_TP_COMMUNICATION_PLACEHOLDER_BYTES, LOCAL_TP_HOST_OVERHEAD_PER_RANK_BYTES,
+    auto_gpus, auto_refusal, choose_tensor_parallel, communication_allowance, engine_host_overhead,
+    fit_hint, topology_view, AutoCandidate, AutoChoice, AutoExcluded, AutoGpu, AutoTable,
+    LocalTopologyRecord, PhaseCharges, LOCAL_TP_COMMUNICATION_PLACEHOLDER_BYTES,
+    LOCAL_TP_HOST_OVERHEAD_PER_RANK_BYTES,
 };
 // Owner decision 2026-09-23: the startup memory budget.
 pub use startup::{
-    startup_budget, startup_measure, validate_declared_startup, StartupBudget, StartupMeasure,
-    StartupProvenance,
+    startup_budget, startup_device_domains, startup_measure, validate_declared_startup,
+    StartupBudget, StartupMeasure, StartupProvenance,
 };
 // Owner decision 2026-09-22 (1), ADR 0014 amendment A1: lifecycle timeouts.
 pub use timeouts::{

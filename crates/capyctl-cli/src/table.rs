@@ -666,6 +666,32 @@ fn status(value: &Value, names: &HostNames) -> String {
             out.push_str(&block);
         }
     }
+    // ADR 0035 §1a, §5: an instance on several GPUs of one host, or under
+    // `topology: auto`: its tensor-parallel size and GPUs, and that its
+    // collectives listen on loopback, unauthenticated there.
+    let topology: Vec<String> = d["instances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(topology_line)
+        .collect();
+    if !topology.is_empty() {
+        out.push('\n');
+        for line in topology {
+            out.push_str(&line);
+        }
+        if d["instances"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|i| i["collectives"] == "loopback")
+        {
+            out.push_str(
+                "Collectives  loopback (the ranks' collective listeners are on this host's \
+                 loopback, unauthenticated there)\n",
+            );
+        }
+    }
     // ADR 0031 §6, SPEC §10: each instance's cancelled requests still charged,
     // and what settles them.
     let cancelling: Vec<String> = d["instances"]
@@ -773,6 +799,40 @@ fn cancelling_line(instance: &Value) -> Option<String> {
     };
     Some(format!(
         "Instance {}  cancelling: {count}{settles}\n",
+        text(&instance["index"])
+    ))
+}
+
+/// ADR 0035 §1a, §5: one instance's tensor-parallel line, absent on one GPU
+/// without `topology: auto`: `Instance 0  TP auto (2) on gpu0, gpu1` for a
+/// placed `auto` instance, `TP auto` before it is placed, `TP 2` for a
+/// stated size.
+fn topology_line(instance: &Value) -> Option<String> {
+    let topology = instance.get("topology").filter(|t| t.is_object())?;
+    // A group's flattened topology is a mapping of its own dimensions.
+    if instance.get("members").is_some() {
+        return None;
+    }
+    let placed = topology["tensor_parallel"].as_u64();
+    let size = match (&topology["requested"], placed) {
+        (Value::String(auto), Some(n)) => format!("{} ({n})", clean(auto)),
+        (Value::String(auto), None) => clean(auto),
+        (Value::Number(n), _) => n.to_string(),
+        (_, Some(n)) => n.to_string(),
+        _ => return None,
+    };
+    let on = topology["devices"]
+        .as_array()
+        .filter(|devices| !devices.is_empty())
+        .map(|devices| {
+            format!(
+                " on {}",
+                devices.iter().map(text).collect::<Vec<_>>().join(", ")
+            )
+        })
+        .unwrap_or_default();
+    Some(format!(
+        "Instance {}  TP {size}{on}\n",
         text(&instance["index"])
     ))
 }

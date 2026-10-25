@@ -69,10 +69,21 @@ pub struct HostCandidate {
     /// `lmcache_unavailable:host_off`, ...), whatever its eligibility now.
     /// The host is refused with that code, never as a generic ineligible one.
     pub gate: Option<&'static str>,
+    /// ADR 0035 §1, §1a: what the gate's refusal names on this host, in the
+    /// operator's terms (for `insufficient_gpus` and a `topology: auto` that
+    /// fits none of its sizes, each host's GPU count and what would fit).
+    pub gate_detail: Option<String>,
     /// ADR 0033 §6, ADR 0025 amendment of 2026-10-23: what an operator
     /// changes when this host's host-KV limit is what refuses the instance.
     pub host_kv_remedy: HostKvRemedy,
 }
+
+/// ADR 0035 §13: the placement refusal when no allowed host has enough
+/// identical discrete GPUs (`HostCandidate::gate`).
+pub const INSUFFICIENT_GPUS: &str = "insufficient_gpus";
+/// ADR 0035 §13: the placement refusal when no tensor-parallel size up to a
+/// host's GPU count holds the per-GPU charge.
+pub const INSUFFICIENT_DEVICE_MEMORY: &str = "insufficient_device_memory";
 
 /// Where the host-KV limit that refused an instance is set, and what its
 /// host-KV need is made of, so the refusal names what to change.
@@ -227,10 +238,24 @@ pub struct Unplaceable {
 impl Unplaceable {
     /// The one closed diagnostic for status: the first host's reason when all
     /// agree (a gate's own code included), otherwise that no allowed host fits.
+    /// ADR 0035 §1a: when every host is refused for its GPUs, the deployment
+    /// is `insufficient_gpus` when some host would hold it with more
+    /// identical GPUs, else `insufficient_device_memory`.
     pub fn code(&self) -> &'static str {
+        let gpus = |r: &HostRefusal| matches!(r, HostRefusal::Gate(c) if *c == INSUFFICIENT_GPUS || *c == INSUFFICIENT_DEVICE_MEMORY);
         match self.refusals.as_slice() {
             [] => "no_allowed_host",
             [(_, first), rest @ ..] if rest.iter().all(|(_, r)| r == first) => first.code(),
+            all if all.iter().all(|(_, r)| gpus(r)) => {
+                if all
+                    .iter()
+                    .any(|(_, r)| *r == HostRefusal::Gate(INSUFFICIENT_GPUS))
+                {
+                    INSUFFICIENT_GPUS
+                } else {
+                    INSUFFICIENT_DEVICE_MEMORY
+                }
+            }
             _ => "no_host_fits",
         }
     }
@@ -610,6 +635,14 @@ impl Unplaceable {
         self.refusals
             .iter()
             .map(|(host, refusal)| {
+                // ADR 0035 §1a: a gate that explains itself on this host.
+                if let Some(note) = matches!(refusal, HostRefusal::Gate(_))
+                    .then(|| candidates.iter().find(|c| &c.host_id == host))
+                    .flatten()
+                    .and_then(|c| c.gate_detail.as_deref())
+                {
+                    return format!("host {host}: {}: {note}", refusal.code());
+                }
                 let candidate = (*refusal == HostRefusal::Insufficient)
                     .then(|| candidates.iter().find(|c| &c.host_id == host))
                     .flatten();
@@ -629,8 +662,25 @@ impl Unplaceable {
     /// [`Self::code`], followed by the host-KV limit when that limit alone
     /// refused every host, e.g. `insufficient_capacity: host_kv (needs 20.0
     /// GiB, limit 12.2 GiB; raise ... or lower lmcache_pool)`.
+    /// ADR 0035 §1a: an `insufficient_gpus` or `insufficient_device_memory`
+    /// of every host names each host's GPU count and what would fit.
     pub fn reason(&self, candidates: &[HostCandidate], owner: &str) -> String {
         let code = self.code();
+        if code == INSUFFICIENT_GPUS || code == INSUFFICIENT_DEVICE_MEMORY {
+            let notes: Vec<String> = self
+                .refusals
+                .iter()
+                .filter_map(|(host, _)| {
+                    let c = candidates.iter().find(|c| &c.host_id == host)?;
+                    Some(format!("host {host}: {}", c.gate_detail.as_deref()?))
+                })
+                .collect();
+            return if notes.is_empty() {
+                code.into()
+            } else {
+                format!("{code}: {}", notes.join("; "))
+            };
+        }
         if code != HostRefusal::Insufficient.code() {
             return code.into();
         }
@@ -718,6 +768,7 @@ mod tests {
             device_options: vec![],
             preferred_device: None,
             gate: None,
+            gate_detail: None,
             host_kv_remedy: HostKvRemedy::default(),
         }
     }
@@ -1168,7 +1219,7 @@ mod tests {
         use crate::device_choice::DeviceOption;
         let device = |id: &str, bytes: i64| DeviceOption {
             device: id.into(),
-            domain: id.into(),
+            domains: vec![id.into()],
             footprint: PhaseFootprint {
                 phase: ResourcePhase::Cold,
                 allocations: vec![Allocation {
@@ -1420,6 +1471,7 @@ mod group_tests {
             device_options: vec![],
             preferred_device: None,
             gate: None,
+            gate_detail: None,
             host_kv_remedy: HostKvRemedy::default(),
         };
         let owners: BTreeMap<String, String> = [("host-a", "m0"), ("host-b", "m1")]
