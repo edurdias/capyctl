@@ -54,15 +54,16 @@ pin exactly N GPUs, and `topology: auto` lets CapyCTL choose N.
   0.5.22 and the llama.cpp v0.7.0 build, and removes everything it created
   ([its README](../../scripts/live/multi-gpu/README.md)).
 
-**Not yet on this branch (draft):** the engine side of §4 and §9 (vLLM, SGLang and llama.cpp
-flags and device lists, `tp_drift`, the agent's N-device launch check, per-GPU park
-evidence) is on `feat/mg-engines`, and the remaining placement tests are on `feat/mg-tests`;
-both merge here before review, and this file is corrected to match then.
+**Not yet on this branch (draft):** per-GPU park and wake evidence (§9): the vLLM judgment
+per GPU, SGLang's per-rank saver read on the host and the controller's per-device judgment,
+and the parked residue credited per GPU. Until they land, `deep_park` must stay off at
+N > 1 and MG4–MG6, MG10 and MG13's park must not run. The remaining placement tests are on
+`feat/mg-tests`. This file is corrected to match when they merge.
 
 Tests (T46), new in `capyctl-config` (`tests/multi_gpu.rs`), `capyctl-store`
 (`tests/multi_gpu_placement.rs`, the v58 migration), `capyctl-scheduler`, `capyctl-domain`
 (`local_tp`), `capyctl-agent`, `capyctl-controller`, `capyctl-router` and `capyctl-protocol`.
-Fast gate (`scripts/ci-local.sh`) on this branch: every step passes, 1678 unit tests, 0
+Fast gate (`scripts/ci-local.sh`) on this branch: every step passes, 1679 unit tests, 0
 failed. The deep gate is still owed before merge. CPU and Fake-engine tests are not qualification: nothing here has
 run on two GPUs. The live check still needed is the rented session (ADR 0035 §14): MG1–MG14
 and the bandwidth test; MG4 and MG5 decide whether vLLM's and SGLang's `deep_park` is turned
