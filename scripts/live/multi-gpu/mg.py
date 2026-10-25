@@ -397,6 +397,18 @@ def cmd_events(a):
             continue
         e["payload"] = json.loads(e.pop("payload_json") or "{}")
         print(json.dumps(e, sort_keys=True))
+    # ADR 0035 §7: engine_rank_exited and tp_stalled are journal states (the
+    # instance's last error), not management events: the journal entries of
+    # those kinds recorded after the event sequence `after` was.
+    if kinds:
+        since = rows(a.db, "SELECT recorded_at_ms FROM management_events WHERE sequence=?", (a.after,))
+        since_ms = since[0]["recorded_at_ms"] if since else 0
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(since_ms / 1000)) + f".{since_ms % 1000:03d}Z"
+        marks = ",".join("?" * len(kinds))
+        for j in rows(a.db, f"SELECT recorded_at,state,evidence FROM journal_entries WHERE state IN ({marks}) "
+                            "AND recorded_at>=? ORDER BY recorded_at", (*sorted(kinds), stamp)):
+            print(json.dumps({"source": "journal", "kind": j["state"], "recorded_at": j["recorded_at"],
+                              "evidence": j["evidence"]}, sort_keys=True))
     return 0
 
 

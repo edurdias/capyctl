@@ -568,10 +568,10 @@ rank_kill() { # name label
     done
     events_since "$seq0" engine_rank_exited >"$RES/mg7-$l-events.jsonl"
     st=$(state_of "$n")
-    if [ -n "$t_rel" ] && [ -n "$t_gone" ] && [ "$t_rel" -ge "$t_gone" ] && grep -q '1' "$RES/mg7-$l-events.jsonl" && [ "$st" = failed ]; then
-      result MG7 "$l kill" pass "state $st; engine_rank_exited recorded; processes gone at tick $t_gone, charge released at tick $t_rel (0.5 s ticks)"
+    if [ -n "$t_rel" ] && [ -n "$t_gone" ] && [ "$t_rel" -ge "$t_gone" ] && grep -q 'engine_rank_exited: rank 1 ' "$RES/mg7-$l-events.jsonl" && [ "$st" = failed ]; then
+      result MG7 "$l kill" pass "state $st; engine_rank_exited names rank 1; processes gone at tick $t_gone, charge released at tick $t_rel (0.5 s ticks)"
     else
-      result MG7 "$l kill" fail "state '$st'; events $(wc -l <"$RES/mg7-$l-events.jsonl"); gone tick '${t_gone}', release tick '${t_rel}'"
+      result MG7 "$l kill" fail "state '$st'; engine_rank_exited: $(grep -o 'engine_rank_exited: rank [0-9]* on gpu[0-9]* ([a-z0-9-]* process [0-9]*)' "$RES/mg7-$l-events.jsonl" | paste -sd';')' (rank 1 killed); gone tick '${t_gone}', release tick '${t_rel}'"
     fi
     "${HELPER[@]}" shm --out "$RES/mg7-$l-shm-after-kill.txt"
   fi
