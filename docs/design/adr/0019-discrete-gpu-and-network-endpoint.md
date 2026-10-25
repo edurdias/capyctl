@@ -467,3 +467,29 @@ Rule:
 
 Nothing here changes admission, the placeholders or the measurement on unified memory.
 CPU and Fake-engine tests only; not yet checked live.
+
+## Amendment of 2026-10-25: one model on several GPUs of one host (ADR 0035)
+
+Owner decisions 2026-10-25 ([ADR 0035](0035-multi-gpu-one-host.md)).
+
+- **§6, placement.** A deployment with `topology: {tensor_parallel: N}` and no named hosts runs
+  on N identical GPUs of one host: placement evaluates (host, set of N GPUs) instead of (host,
+  GPU), takes the set whose smallest headroom is largest, then the lowest indices, and pins
+  the engine to the set with `CUDA_VISIBLE_DEVICES` listing the UUIDs in rank order (indices
+  with `CUDA_DEVICE_ORDER=PCI_BUS_ID` when the host published no UUIDs). `devices` may pin
+  exactly N GPUs; `topology: auto` lets CapyCTL choose N from the cards' managed limits.
+- **§6 and §11, codes.** `multi_gpu_unsupported` is narrowed to two or more `devices` without a
+  `topology` (its hint names the `topology` to add), a unified-memory host, and an engine with
+  no local multi-GPU mode (TensorFold, custom engines). New: `topology_devices_mismatch`
+  (exit 2), `multi_gpu_mixed_devices` (exit 5), `tensor_parallel_indivisible` (exit 5) and
+  `insufficient_gpus` (exit 4).
+- **§3, the budget.** Each chosen GPU's `device` domain is charged one rank; the system domain
+  carries the engine overhead plus a per-rank overhead.
+- **§4, residents.** The per-process reading is per process and GPU
+  (`--query-compute-apps=pid,gpu_uuid,used_memory`); a process's device bytes are credited to
+  the domain of the GPU they are on, so a single-GPU launch's credit no longer depends on
+  which GPU a stray context lands on. A row naming a UUID outside the inventory refuses the
+  whole sample.
+- **Amendment A2, peaks.** The startup peak of a launch on N GPUs is the largest any chosen
+  GPU showed, stored per revision, host, installation and N, and applied to every GPU of a
+  later start at that N; a record from before ADR 0035 is the N = 1 record.

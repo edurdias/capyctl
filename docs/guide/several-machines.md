@@ -285,6 +285,11 @@ pipeline-parallel rank). The first machine in `placement.hosts` is the head:
 it runs rank 0 and serves the API. The others are workers. vLLM, SGLang and
 TensorFold can run groups ([Engine support for groups](engines.md#groups-across-machines)).
 
+A machine with several identical GPUs needs no group: give the deployment a
+`topology` without `placement.hosts` and it runs on that many GPUs of one
+machine, with nothing listening off the machine
+([One model on several GPUs](deploy.md#one-model-on-several-gpus)).
+
 Below, host A (`192.0.2.10`) is the head and host B (`192.0.2.11`) the
 worker, joined by a direct link.
 

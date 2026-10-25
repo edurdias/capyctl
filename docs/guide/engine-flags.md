@@ -98,6 +98,7 @@ CapyCTL renders LMCache's settings itself.
 | Mamba / state cache | `--mamba-cache-dtype`, `--mamba-ssm-cache-dtype`, `--mamba-cache-mode`, `--mamba-block-size` | extra | vLLM has no state slot count; it takes the state from the KV cache budget (`memory.kv_cache`). |
 | GPU memory fraction | `--gpu-memory-utilization` | reserved | `engine_config.memory.request`. CapyCTL computes the fraction from it. |
 | KV cache size | `--kv-cache-memory-bytes` | reserved | `engine_config.memory.kv_cache` |
+| Parallel sizes, executor | `--tensor-parallel-size`, `--pipeline-parallel-size`, `--data-parallel-size`, `--distributed-executor-backend` | reserved | `topology`. On one machine CapyCTL renders `--tensor-parallel-size N --distributed-executor-backend mp` ([One model on several GPUs](deploy.md#one-model-on-several-gpus)); across machines, the group's settings. |
 | CPU weight offload, swap | `--cpu-offload-gb`, `--swap-space` | reserved | Not supported: CapyCTL owns where the weights live and counts them in `memory.request`. |
 | Sleep mode | `--enable-sleep-mode` | reserved | `residency` (parking) |
 | KV cache dtype | `--kv-cache-dtype` | typed | `engine_config.kv_cache_dtype` |
@@ -133,6 +134,7 @@ CapyCTL renders LMCache's settings itself.
 | KV pool in tokens | `--max-total-tokens` | typed | `engine_config.sglang.max_total_tokens`. Without it CapyCTL computes it from `memory.kv_cache`. |
 | Mamba / state cache | `--max-mamba-cache-size`, `--mamba-full-memory-ratio`, `--mamba-ssm-dtype` | extra | On a gated-delta-net hybrid CapyCTL sets `--max-mamba-cache-size` itself from `max_concurrent_requests`. If you pass either of the first two, it leaves the state pool to you, and `memory.request` must hold it. A stated `memory.request` that cannot hold the state `--max-mamba-cache-size` fixes, with the weights, the KV cache, SGLang's own allocations and the margin, is refused before the start, naming the request that does. |
 | Static memory fraction | `--mem-fraction-static` | reserved | `engine_config.memory.request` and `memory.kv_cache`. See [Reaching a memory fraction](#reaching-an-sglang-memory-fraction). |
+| Parallel sizes, GPU choice | `--tp-size`, `--pp-size`, `--dp-size`, `--ep-size`, `--enable-dp-attention`, `--base-gpu-id`, `--gpu-id-step` | reserved | `topology`. On one machine CapyCTL sets `tp_size` N with `base_gpu_id` 0 and `gpu_id_step` 1 ([One model on several GPUs](deploy.md#one-model-on-several-gpus)); data parallel, expert parallel and DP attention are not supported. |
 | CPU offload, weight backup | `--cpu-offload-gb`, `--enable-weights-cpu-backup` | reserved | `residency`: CapyCTL chooses how weights come back after parking. |
 | Memory saver | `--enable-memory-saver` | reserved | `residency` (parking) |
 | KV cache dtype | `--kv-cache-dtype` | typed | `engine_config.kv_cache_dtype` |
@@ -255,7 +257,7 @@ option, and `--name=value` is refused because llama-server takes only
 | Downloads | `--offline`, `--hf-repo`, `--hf-file`, `--model-url` | reserved | CapyCTL fetches models. |
 | Saved slots, RPC | `--slot-save-path`, `--rpc` | reserved | They write files or open connections. |
 | Logs | `--log-file`, `--verbose`, `--log-verbosity` | reserved | CapyCTL owns the engine log. |
-| Devices | `--device`, `--split-mode`, `--tensor-split`, `--main-gpu` | reserved | `devices`: one GPU per deployment. |
+| Devices | `--device`, `--split-mode`, `--tensor-split`, `--main-gpu` | reserved | `devices` and `topology`. On several GPUs CapyCTL renders `--split-mode layer`, `--tensor-split` and `--main-gpu 0`; `row` and `tensor` are not supported. |
 | Built-in tools and agent | `--tools`, `--agent` | reserved | They run code on the host. |
 | Embeddings and reranking | `--embedding`, `--rerank`, `--pooling` | reserved | A llama.cpp deployment serves chat. |
 

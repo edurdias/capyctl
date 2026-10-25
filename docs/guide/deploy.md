@@ -65,6 +65,9 @@ Add a field to choose something yourself, for example:
   `deep` to drop its weights when parked
   ([Parking and switching](parking.md)).
 - `devices: [{id: gpu1}]` to pin a GPU on a machine with several.
+- `topology: {tensor_parallel: 2}` to spread one model over two GPUs of the
+  machine, or `topology: auto` to let CapyCTL choose
+  ([One model on several GPUs](#one-model-on-several-gpus)).
 - `host: gpu-box` to choose the machine, with
   [several machines](several-machines.md).
 - `engine_config: {memory: {request: 16GiB}}` to set the GPU memory it may
@@ -88,6 +91,79 @@ Add a field to choose something yourself, for example:
   ([zero data retention](../operations/data-retention.md#zero-data-retention)).
 
 Every other field is in [Configuration files](configuration.md).
+
+## One model on several GPUs
+
+A model too large for one card can run on several identical cards of one
+machine. Say how many with `topology`:
+
+```yaml title="qwen3-30b.yaml"
+name: qwen3-30b
+engine: vllm
+model: {hf: Qwen/Qwen3-30B-A3B}
+topology: {tensor_parallel: 2}
+```
+
+CapyCTL picks two GPUs of the same product and memory, gives each one rank of
+the model, and starts the engine on both: vLLM with `--tensor-parallel-size 2`,
+SGLang with `tp_size` 2, llama.cpp with `--split-mode layer` (each card holds
+part of the layers). Those options are CapyCTL's; a deployment cannot set them
+itself. It is still one model and one route, on one machine: no second machine,
+no group.
+
+- **Which GPUs.** CapyCTL picks the cards with the most room. To choose them,
+  name exactly as many as `tensor_parallel` says:
+  `devices: [{id: gpu0}, {id: gpu1}]`. Two `devices` without a `topology` are
+  refused, with a hint to add one.
+- **Let CapyCTL choose the number.** `topology: auto` takes the smallest number
+  of GPUs whose share of the model fits each card's memory limit:
+
+  ```yaml
+  name: qwen3-30b
+  engine: sglang
+  model: {hf: Qwen/Qwen3-30B-A3B}
+  topology: auto
+  ```
+
+  On a machine with two 48 GB cards, Qwen3-4B gets one GPU and Qwen3-30B-A3B
+  (about 61 GB of weights) gets two. The choice is made from the cards' limits,
+  not from what is free at the moment, so the same model on the same machine
+  always gets the same number; a busy card is made free by parking or stopping
+  what is on it, as for one GPU. The number is chosen when the model starts and
+  kept until it stops, parks and wakes included. `capyctl status deployment`
+  shows `TP auto (2)`. `auto` cannot be combined with `devices`, `resources`,
+  `memory.request` or `memory.startup`, which are per-GPU figures; a
+  `memory.kv_cache` is per GPU and holds for every size.
+- **What it costs.** Each card is charged its share of the weights, its KV
+  cache, a margin, 1.25 GiB for the CUDA context and 1 GiB for the traffic
+  between the cards; host RAM is charged 4 GiB plus 3 GiB for each card after
+  the first. `capyctl validate config --file qwen3-30b.yaml --host host.yaml`
+  prints the charge per GPU, and for `auto` the charge at every size and the
+  size the machine would take now. Those two allowances are estimates until
+  measured on a two-GPU machine.
+- **Which numbers work.** For vLLM and SGLang the number must divide the model's
+  attention heads (`num_attention_heads` in its `config.json`; 32 for the Qwen3
+  models above, so 1, 2, 4 or 8 work). llama.cpp takes any number.
+- **Refused.** Cards of different products or memory, a machine with one
+  unified-memory GPU (such as a GB10), TensorFold, custom engines, decision
+  models and `pipeline_parallel` on one machine. More GPUs than the machine has
+  is `insufficient_gpus`; a model that does not fit is
+  `insufficient_device_memory`, and both name the `tensor_parallel` that would
+  fit ([errors](errors.md)).
+- **Parking.** For now a model on several GPUs stops instead of parking
+  (`restart_only`); a stated `deep` or `host_backed` is refused, and under
+  `auto` it keeps the model on one GPU ([Parking and switching](parking.md)).
+- **Security.** The engine's ranks talk to each other over listeners on
+  `127.0.0.1` only, without authentication, and status shows
+  `collectives: loopback`. Another user logged in to the same machine could
+  reach them, as with any engine's own API on loopback. CapyCTL checks after
+  every start that none of the engine's processes listens on any other address,
+  and stops the model if one does (`engine_listener_exposed`).
+
+If one rank exits, the whole model stops and reads `failed`; if one hangs, a
+request that gets no first output within the stall timeout (120 s,
+`groups.stall_timeout`) makes CapyCTL probe the model once and stop it when
+the probe fails too (`tp_stalled`).
 
 ## Decision models
 

@@ -36,6 +36,23 @@ for them:
 - Nemotron 3.5 Super VL on vLLM: after a park and a wake, vLLM 0.31.0 answers
   wrongly.
 
+### A model on several GPUs
+
+A model spread over several GPUs of one machine
+([One model on several GPUs](deploy.md#one-model-on-several-gpus)) stops
+instead of parking for now: it resolves `restart_only`, and a stated `deep` or
+`host_backed` is refused `capability_missing:deep_park` with the hint to state
+`restart_only`. Under `topology: auto`, a stated `deep` or `host_backed` keeps
+the model on one GPU instead. vLLM and SGLang can park on several GPUs, and
+CapyCTL already checks every card's memory when they do; that parking is
+turned on per engine once it passes on a two-GPU machine. llama.cpp stops, on
+one GPU or several. LMCache is off for a model on several GPUs
+(`multi_gpu_unqualified`).
+
+Switching works on whole models: to make room for a model on GPUs 0 and 1,
+CapyCTL parks or stops whatever is on either card, and a model on two GPUs
+that has to make room for another is parked or stopped on both.
+
 ## Park and wake
 
 ```bash

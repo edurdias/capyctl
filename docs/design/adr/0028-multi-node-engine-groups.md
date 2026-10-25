@@ -804,3 +804,19 @@ again, an SGLang group that states no residency resolves `deep`, and `deep` is
 accepted at deploy. The refusal of both parking tiers stays for an engine whose
 group cannot park (TensorFold). The branch merges once the MN4 SGLang row (deep
 park and wake cycles on both lab hosts) passes live.
+
+## Amendment of 2026-10-25: a world size above one without named hosts is one host (ADR 0035)
+
+Owner decisions 2026-10-25 ([ADR 0035](0035-multi-gpu-one-host.md)).
+
+- **§2.** `topology` with fewer than two `placement.hosts` is no longer refused
+  `group_placement_required`: it is one instance on N GPUs of one host, not a group (no group
+  plan, peer address, rendezvous port or `engine_groups` capability; the single-host loopback
+  pin applies). `host`, `placement.selector`, `strategy`, `max_per_host` and `instances` stay
+  allowed there, and standalone accepts it. `pipeline_parallel` above 1 on one host is refused
+  `group_shape_unsupported:<engine>`. `topology: auto` beside two or more hosts is refused
+  `group_topology_invalid`: a group's shape is the operator's. Groups keep `local_ranks == 1`.
+- **§11.** The stall rule covers every instance with N > 1 on one host as well, with the same
+  `groups.stall_timeout`; its failure is `tp_stalled`.
+- **Amendment of 2026-10-07.** The per-rank share (`ceil(sharded / T) + replicated`) sizes each
+  GPU of a one-host instance with `T = N`, `P = 1`.

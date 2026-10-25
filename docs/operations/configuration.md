@@ -225,14 +225,16 @@ change needs a restart.
 
 | Setting | YAML | Flag | Variable | Default | Roles |
 |---|---|---|---|---|---|
-| Request-stall timeout: a request to a multi-node group with no first token within it makes the server probe the group's head once, and stop the group (`group_stalled`) if the probe fails too | `groups.stall_timeout` (server); `server.groups.stall_timeout` (standalone) | `--group-stall-timeout <duration>` (`start server`) | `CAPYCTL_GROUP_STALL_TIMEOUT` | `120s` (`1s` to `3600s`) | server, standalone |
+| Request-stall timeout: a request to a multi-node group, or to a model on several GPUs of one machine, with no first token within it makes the server probe the group's head (or the model) once, and stop it (`group_stalled`, `tp_stalled`) if the probe fails too | `groups.stall_timeout` (server); `server.groups.stall_timeout` (standalone) | `--group-stall-timeout <duration>` (`start server`) | `CAPYCTL_GROUP_STALL_TIMEOUT` | `120s` (`1s` to `3600s`) | server, standalone |
 | Peer address: this machine's address on the direct link that group members use | `resource_policy.groups.peer_address` | `--peer-address <ip>` | `CAPYCTL_PEER_ADDRESS` | none (the machine cannot join a group) | host, standalone |
 | Rendezvous ports a group head picks from | `resource_policy.groups.rendezvous_port_range` (`start`, `end`) | `--rendezvous-ports <start-end>` | `CAPYCTL_RENDEZVOUS_PORTS` | `25000-25099` | host, standalone |
 | Refuse a group when `memlock` or `infiniband` is missing | `resource_policy.groups.require_rdma` | `--require-rdma true\|false` | `CAPYCTL_REQUIRE_RDMA` | `false` | host, standalone |
 
-An idle group is never probed: only a request in flight can start the probe,
-and requests to single-host deployments are not watched. Standalone never runs
-a group, so its value has no effect there.
+An idle group or model is never probed: only a request in flight can start the
+probe, and requests to a model on one GPU are not watched. Standalone never
+runs a group, but it does run models on several GPUs of its machine
+([One model on several GPUs](../guide/deploy.md#one-model-on-several-gpus)), so
+its value applies to them.
 
 Each setting follows one order: flag, then variable, then YAML, then the
 default. The host checks are read, never changed. The `compaction` check never
@@ -242,6 +244,11 @@ refuses: it warns with either value of `require_rdma`. `memlock` and
 For a group launch CapyCTL sets `GLOO_SOCKET_IFNAME` to the interface that
 holds the member's peer address. It sets no `NCCL_*` variable and passes none
 through, so there is no NCCL tuning setting.
+
+A model on several GPUs of one machine is not a group: CapyCTL pins its
+collectives to loopback as for any single-machine launch (`GLOO_SOCKET_IFNAME`
+and `NCCL_SOCKET_IFNAME` set to `lo` for vLLM and SGLang, `NCCL_SOCKET_IFNAME=lo`
+for llama.cpp) and opens no rendezvous port.
 
 ### Tables kept on disk
 
