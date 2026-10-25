@@ -245,6 +245,17 @@ fn lmcache_unavailable(reason: &str) -> Option<String> {
     capyctl_config::lmcache::LmcacheOffReason::parse(&code).map(|_| format!("{PREFIX}{code}"))
 }
 
+/// ADR 0035 §13: the closed code a launch on several GPUs failed with at
+/// readiness, as its reason names it (embedded, or the host's report):
+/// `tp_rank_unobserved` or `engine_listener_exposed`.
+fn local_tp_failure(reason: &str) -> Option<String> {
+    use capyctl_domain::local_tp::{ENGINE_LISTENER_EXPOSED, TP_RANK_UNOBSERVED};
+    [TP_RANK_UNOBSERVED, ENGINE_LISTENER_EXPOSED]
+        .into_iter()
+        .find(|code| reason.contains(&format!("{code}:")))
+        .map(str::to_owned)
+}
+
 /// Release the failed launch against `proven`, or retain it `Uncertain`.
 /// ADR 0033 §8: a launch whose engine failed with the LMCache connector
 /// (`lmcache`) is released with the sticky fallback and started again
@@ -324,7 +335,9 @@ async fn conclude(
         }
         _ => None,
     };
-    let code = lmcache_unavailable(reason).unwrap_or_else(|| "launch_failed".to_owned());
+    let code = lmcache_unavailable(reason)
+        .or_else(|| local_tp_failure(reason))
+        .unwrap_or_else(|| "launch_failed".to_owned());
     let fallback_deployment = deployment_id.clone();
     let relaunched = shared
         .with_owner(move |owner| {

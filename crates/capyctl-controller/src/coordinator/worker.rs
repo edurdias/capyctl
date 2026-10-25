@@ -48,6 +48,10 @@ mod local_adoption;
 #[path = "cleanup_adoption.rs"]
 mod cleanup_adoption;
 
+// ADR 0035 §§5, 6: readiness of an embedded launch on several GPUs.
+#[path = "local_ranks.rs"]
+mod local_ranks;
+
 // SPEC §10, ADR 0013 §8 (W10): request-driven switching commands.
 #[path = "switching.rs"]
 mod switching;
@@ -2782,6 +2786,14 @@ async fn drive(
         _ = stop.changed() => return Err(CoordinatorError::Stopped("shutdown during Initialize".into())),
         result = tokio::time::timeout(bound, driver.engine.execute_persisted(&command)) => result.map_err(|_| CoordinatorError::Service("Initialize timeout".into()))?.map_err(|e| CoordinatorError::Service(e.to_string()))?,
         _ = sampling => unreachable!("sampling never ends"),
+    };
+    // ADR 0035 §§5, 6: on several GPUs, the ranks are named and the
+    // listeners checked before anything is recorded; a failure here is a
+    // failed launch, stopped and settled on gone evidence.
+    let observation = tokio::select! {
+        biased;
+        _ = stop.changed() => return Err(CoordinatorError::Stopped("shutdown during Initialize".into())),
+        result = local_ranks::at_readiness(shared, work, source, &driver, observation) => result?,
     };
     let step = work.step_id().to_owned();
     let receipt = OwnedLaunchReceipt {
