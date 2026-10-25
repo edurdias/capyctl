@@ -654,6 +654,7 @@ fn a_host_backed_victim_is_planned_a_stop_when_observed_host_ram_cannot_take_its
                         bytes: 14 * GIB,
                         device_bytes: 12 * GIB,
                         host_bytes: 2 * GIB,
+                        per_device: Vec::new(),
                     }],
                 ),
             );

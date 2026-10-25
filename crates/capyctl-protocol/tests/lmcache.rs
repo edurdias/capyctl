@@ -82,6 +82,7 @@ fn plan(lmcache: Option<LmcacheGrant>) -> SingleLaunchPlan {
         startup_bytes: None,
         startup_host_bytes: None,
         lmcache,
+        devices: Vec::new(),
     }
 }
 
@@ -151,6 +152,7 @@ fn alive(role: &str, pid: u32) -> pb::OwnedProcessObservation {
         boot_id: "boot".into(),
         start_ticks: 7,
         presence: "alive".into(),
+        rank: None,
     }
 }
 

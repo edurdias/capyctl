@@ -929,6 +929,7 @@ async fn a_park_the_growth_bound_turns_into_a_stop_runs_the_stop() {
                     bytes,
                     device_bytes: bytes,
                     host_bytes: 0,
+                    per_device: Vec::new(),
                 },
             )
             .collect();

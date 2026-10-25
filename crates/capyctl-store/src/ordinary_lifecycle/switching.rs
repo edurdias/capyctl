@@ -1126,10 +1126,15 @@ fn planning_floors<'a>(
     let Some((observations, residents)) = observed.get(&c.host_id) else {
         return Ok(None);
     };
-    let kinds = read_selected_policy(tx, &c.host_id)
-        .ok()
-        .flatten()
+    let policy = read_selected_policy(tx, &c.host_id).ok().flatten();
+    let kinds = policy
+        .as_ref()
         .map(|policy| crate::resident_floors::domain_kinds(&policy.controls))
+        .unwrap_or_default();
+    // ADR 0035 §8: each GPU's domain credited from the bytes on that GPU.
+    let devices = policy
+        .as_ref()
+        .map(crate::resident_floors::domain_devices)
         .unwrap_or_default();
     Ok(Some((
         observations,
@@ -1140,6 +1145,7 @@ fn planning_floors<'a>(
             observations,
             residents,
             &kinds,
+            &devices,
         )?,
     )))
 }

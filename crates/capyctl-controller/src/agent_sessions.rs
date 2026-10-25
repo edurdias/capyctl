@@ -187,9 +187,21 @@ pub struct DomainView {
     pub residents: Vec<capyctl_domain::resources::ProcessResident>,
 }
 impl DomainView {
-    /// The view of one reported domain. Residents outside their bounds are
-    /// dropped as a whole: no credit is safe, a partial one is not.
-    fn of(d: &pb::DomainObservation) -> Self {
+    /// The views of every reported domain.
+    fn all(domains: &[pb::DomainObservation]) -> Vec<Self> {
+        // ADR 0035 §8: the GPUs this report observes, by host device id.
+        let devices: std::collections::BTreeSet<&str> = domains
+            .iter()
+            .filter(|d| d.kind == "device" && !d.device_id.is_empty())
+            .map(|d| d.device_id.as_str())
+            .collect();
+        domains.iter().map(|d| Self::of(d, &devices)).collect()
+    }
+
+    /// The view of one reported domain, beside the GPUs the report observes.
+    /// Residents outside their bounds are dropped as a whole: no credit is
+    /// safe, a partial one is not.
+    fn of(d: &pb::DomainObservation, devices: &std::collections::BTreeSet<&str>) -> Self {
         let valid = d.residents.len() <= crate::agent_sessions::MAX_RESIDENTS
             && d.residents.iter().all(|r| {
                 // ADR 0019: the split figures, when reported, add up to the
@@ -209,6 +221,7 @@ impl DomainView {
                     } else {
                         r.resident_bytes <= d.capacity_bytes
                     }
+                    && per_device_valid(r, devices)
             });
         Self {
             domain_id: d.domain_id.clone(),
@@ -235,6 +248,16 @@ impl DomainView {
                         // as before; its device or system domain gets none.
                         device_bytes: r.device_bytes,
                         host_bytes: r.host_bytes,
+                        // ADR 0035 §8: each GPU's bytes, credited to that
+                        // GPU's domain only. Empty from an older host.
+                        per_device: r
+                            .per_device
+                            .iter()
+                            .map(|d| capyctl_domain::resources::DeviceBytes {
+                                device: d.device_id.clone(),
+                                bytes: d.bytes,
+                            })
+                            .collect(),
                     })
                     .collect()
             } else {
@@ -242,6 +265,33 @@ impl DomainView {
             },
         }
     }
+}
+
+/// ADR 0035 §8: a resident's per-GPU readings, when reported, name distinct
+/// host devices (`gpuN`; each a GPU the report observes, when it observes
+/// any as a `device` domain) and add up to its `device_bytes`.
+fn per_device_valid(
+    resident: &pb::ProcessResidency,
+    devices: &std::collections::BTreeSet<&str>,
+) -> bool {
+    if resident.per_device.is_empty() {
+        return true;
+    }
+    let ids: std::collections::BTreeSet<&str> = resident
+        .per_device
+        .iter()
+        .map(|d| d.device_id.as_str())
+        .collect();
+    let sum = resident.per_device.iter().try_fold(0_i64, |sum, d| {
+        sum.checked_add(i64::try_from(d.bytes).ok()?)
+    });
+    resident.per_device.len() <= 64
+        && ids.len() == resident.per_device.len()
+        && ids.iter().all(|id| {
+            capyctl_agent::gpu_memory::device_index(id).is_some()
+                && (devices.is_empty() || devices.contains(id))
+        })
+        && sum == Some(resident.device_bytes)
 }
 /// ADR 0007: the most processes one domain report may attribute memory to.
 pub const MAX_RESIDENTS: usize = 256;
@@ -1587,7 +1637,7 @@ impl AgentSessions {
                                 let mut sessions = self.sessions.lock().map_err(|_| denied())?;
                                 let s = sessions.get_mut(&host).ok_or_else(denied)?;
                                 if s.view.session_id != id || s.view.reconciled || s.inventory.is_some() { return Err(denied()); }
-                                s.view.domains = inventory.domains.iter().map(DomainView::of).collect();
+                                s.view.domains = DomainView::all(&inventory.domains);
                                 s.view.member_savers = MemberSaverView::of(&inventory);
                                 s.view.group = GroupInventoryView::of(&inventory);
                                 s.view.profiles = inventory.profiles.iter().map(ProfileView::of).collect();
@@ -1606,7 +1656,7 @@ impl AgentSessions {
                                 let mut sessions = self.sessions.lock().map_err(|_| denied())?;
                                 let s = sessions.get_mut(&host).ok_or_else(denied)?;
                                 if s.view.session_id != id { return Err(denied()); }
-                                s.view.domains = inventory.domains.iter().map(DomainView::of).collect();
+                                s.view.domains = DomainView::all(&inventory.domains);
                                 s.view.member_savers = MemberSaverView::of(&inventory);
                                 s.view.group = GroupInventoryView::of(&inventory);
                                 s.view.profiles = inventory.profiles.iter().map(ProfileView::of).collect();
@@ -2493,6 +2543,79 @@ mod installation_tests {
 }
 
 #[cfg(test)]
+mod per_device_tests {
+    use super::*;
+
+    fn report(per_device: &[(&str, u64)], device_bytes: i64) -> Vec<pb::DomainObservation> {
+        let gpu = |id: &str| pb::DomainObservation {
+            domain_id: id.into(),
+            kind: "device".into(),
+            device_id: id.into(),
+            capacity_bytes: 48 << 30,
+            available_bytes: 20 << 30,
+            ..Default::default()
+        };
+        vec![
+            gpu("gpu0"),
+            gpu("gpu1"),
+            pb::DomainObservation {
+                domain_id: "system".into(),
+                kind: "system".into(),
+                capacity_bytes: 128 << 30,
+                available_bytes: 64 << 30,
+                residents: vec![pb::ProcessResidency {
+                    pid: 7,
+                    boot_id: "b".repeat(36),
+                    start_ticks: 9,
+                    resident_bytes: device_bytes + (2 << 30),
+                    device_bytes,
+                    host_bytes: 2 << 30,
+                    per_device: per_device
+                        .iter()
+                        .map(|(device, bytes)| pb::DeviceResidency {
+                            device_id: (*device).into(),
+                            bytes: *bytes,
+                        })
+                        .collect(),
+                }],
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn residents(
+        domains: &[pb::DomainObservation],
+    ) -> Vec<capyctl_domain::resources::ProcessResident> {
+        DomainView::all(domains).remove(2).residents
+    }
+
+    // T46 (ADR 0035 §8): a host's per-GPU readings are kept when they name
+    // GPUs it observes, each once, and add up to the process's device bytes;
+    // otherwise the domain's residents are dropped whole (no partial credit).
+    // A reading without them (an older host) is kept as before.
+    #[test]
+    fn per_gpu_readings_are_kept_only_when_consistent() {
+        let kept = residents(&report(&[("gpu0", 20 << 30), ("gpu1", 1 << 30)], 21 << 30));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].bytes_on("gpu1"), Some(1 << 30));
+        assert_eq!(kept[0].device_bytes, 21 << 30);
+        assert_eq!(residents(&report(&[], 21 << 30)).len(), 1);
+        assert!(kept[0].per_device.len() == 2);
+        for (per_device, sum) in [
+            (vec![("gpu0", 20 << 30), ("gpu1", 1 << 30)], 20 << 30),
+            (vec![("gpu0", 20 << 30), ("gpu2", 1 << 30)], 21 << 30),
+            (vec![("gpu0", 20 << 30), ("gpu0", 1 << 30)], 21 << 30),
+            (vec![("card0", 21 << 30)], 21 << 30),
+        ] {
+            assert!(
+                residents(&report(&per_device, sum)).is_empty(),
+                "{per_device:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod memory_source_tests {
     use super::*;
 
@@ -2524,7 +2647,7 @@ mod memory_source_tests {
         for source in ["", "meminfo", "cgroup_v2:/system.slice/docker-1.scope"] {
             let report = inventory(source);
             assert!(inventory_shape_valid(&report, "host-a"), "{source}");
-            let view = serde_json::to_value(DomainView::of(&report.domains[0])).unwrap();
+            let view = serde_json::to_value(&DomainView::all(&report.domains)[0]).unwrap();
             assert_eq!(
                 view.get("memory_source").and_then(|s| s.as_str()),
                 (!source.is_empty()).then_some(source)
@@ -2556,7 +2679,7 @@ mod memory_source_tests {
         ] {
             let report = inventory(source);
             assert!(inventory_shape_valid(&report, "host-a"), "{source}");
-            let view = serde_json::to_value(DomainView::of(&report.domains[0])).unwrap();
+            let view = serde_json::to_value(&DomainView::all(&report.domains)[0]).unwrap();
             assert_eq!(view["memory_source"], source);
         }
         let longest = format!(

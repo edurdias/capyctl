@@ -93,6 +93,7 @@ fn launch_plan() -> pb::SingleLaunchPlan {
         startup_bytes: None,
         startup_host_bytes: None,
         lmcache: None,
+        devices: Vec::new(),
     }
 }
 
@@ -369,6 +370,7 @@ fn digest_results_carry_only_bounded_checkpoint_evidence() {
                 boot_id: "boot".into(),
                 start_ticks: 1,
                 presence: "alive".into(),
+                rank: None,
             })
         },
     ];
@@ -601,6 +603,7 @@ fn a_policy_refused_launch_is_terminal_bounded_evidence() {
                 boot_id: "boot".into(),
                 start_ticks: 7,
                 presence: "gone".into(),
+                rank: None,
             }]
         },
     ];

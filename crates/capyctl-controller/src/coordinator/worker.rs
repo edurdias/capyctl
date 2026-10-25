@@ -2538,22 +2538,19 @@ impl StartupPeak {
                     })
                 };
                 for (domain, on_card) in [(device, true), (host, false)] {
-                    let held = |r: &ProcessResident| {
-                        if on_card {
-                            r.device_bytes
-                        } else {
-                            r.host_bytes
-                        }
-                    };
                     let most = self
                         .residents
                         .iter()
                         .filter(|(at, _)| outside(*at))
                         .filter_map(|(_, processes)| {
-                            processes
-                                .iter()
-                                .filter(ours)
-                                .try_fold(0_i64, |sum, r| sum.checked_add(held(r).max(0)))
+                            let held: Vec<&ProcessResident> =
+                                processes.iter().filter(ours).collect();
+                            if on_card {
+                                per_gpu_peak(&held)
+                            } else {
+                                held.iter()
+                                    .try_fold(0_i64, |sum, r| sum.checked_add(r.host_bytes.max(0)))
+                            }
                         })
                         .max()
                         .filter(|most| *most > 0);
@@ -2565,6 +2562,27 @@ impl StartupPeak {
         }
         peaks
     }
+}
+
+/// ADR 0035 §§3, 8: the device figure of one startup sample of the launch's
+/// own processes: the most any one GPU held, each GPU's bytes summed over the
+/// processes. A launch on N GPUs records the largest per-GPU peak (the GPUs
+/// are identical), never their sum. On one GPU this is today's figure; a
+/// reading without per-GPU figures (an older host) counts toward one GPU.
+fn per_gpu_peak(processes: &[&ProcessResident]) -> Option<i64> {
+    let mut per_gpu: BTreeMap<&str, i64> = BTreeMap::new();
+    for process in processes {
+        if process.per_device.is_empty() {
+            let held = per_gpu.entry("").or_default();
+            *held = held.checked_add(process.device_bytes.max(0))?;
+            continue;
+        }
+        for reading in &process.per_device {
+            let held = per_gpu.entry(reading.device.as_str()).or_default();
+            *held = held.checked_add(i64::try_from(reading.bytes).ok()?)?;
+        }
+    }
+    Some(per_gpu.into_values().max().unwrap_or(0))
 }
 
 async fn drive(

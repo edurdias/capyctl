@@ -2190,6 +2190,7 @@ fn arm(
         context.observations,
         residents,
         &kinds,
+        &crate::resident_floors::domain_devices(&policy),
     )?;
     // Discrete GPU design §5 (found live on a 16 GB card): a park or a wake
     // is charged only what it adds beyond the owner's own charge.
@@ -2773,8 +2774,14 @@ impl crate::Store {
         let cold = super::startup::cold(&tx, &p, &e)?;
         // ADR 0019: each domain credited by its kind. A policy that does not
         // read here credits nothing; the start's own arm judges the policy.
-        let kinds = policy(&tx, &e)
+        let policy = policy(&tx, &e).ok();
+        let kinds = policy
+            .as_ref()
             .map(|policy| crate::resident_floors::domain_kinds(&policy.controls))
+            .unwrap_or_default();
+        let devices = policy
+            .as_ref()
+            .map(crate::resident_floors::domain_devices)
             .unwrap_or_default();
         let floors = crate::resident_floors::resident_floors(
             &tx,
@@ -2783,6 +2790,7 @@ impl crate::Store {
             context.observations,
             residents,
             &kinds,
+            &devices,
         )?;
         let context = AdmissionContext {
             resident_floors: &floors,

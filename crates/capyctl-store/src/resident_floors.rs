@@ -25,6 +25,14 @@
 //! `device` domain, anonymous and shared pages on a `distinct` one, their sum on a
 //! `unified` one. Skipping a multi-domain owner would bring back the double
 //! counting of M33 on every discrete host.
+//!
+//! ADR 0035 §8: a process's GPU memory is read per GPU, and the bytes it
+//! holds on one GPU are credited to that GPU's domain only, never to the
+//! owner's other GPUs: the resident credit of a device domain is the sum over
+//! the owner's recorded processes of their bytes on that GPU, capped at the
+//! owner's allocation there. On a single-GPU launch this is today's figure. A
+//! reading without per-GPU figures (an older host) credits its device bytes
+//! only to an owner with exactly one device allocation, as before.
 use std::collections::BTreeMap;
 
 use capyctl_config::effective::DomainMemory;
@@ -51,10 +59,47 @@ pub(crate) fn domain_kinds(controls: &ResourceControls) -> BTreeMap<String, Doma
         .collect()
 }
 
-/// The figure of `resident` that counts against a domain of `kind`.
-fn credited_bytes(resident: &ProcessResident, kind: DomainMemory) -> i64 {
+/// ADR 0035 §8: the host-local device id (`gpuN`, as the host's readings name
+/// it) of each device domain of `policy`. An enrolled host's policy names its
+/// devices by scoped ledger keys; the host reads them by their local ids.
+pub(crate) fn domain_devices(
+    policy: &crate::resource_policy::ResourcePolicySnapshot,
+) -> BTreeMap<String, String> {
+    let scoped =
+        capyctl_config::remote_resources::ledger_key(&policy.context.host_id, "device", "");
+    policy
+        .context
+        .device_domains
+        .iter()
+        .map(|(device, domain)| {
+            let local = device.strip_prefix(&scoped).unwrap_or(device);
+            (domain.clone(), local.to_owned())
+        })
+        .collect()
+}
+
+/// The figure of `resident` that counts against a domain of `kind`; on a
+/// device domain, its bytes on that domain's GPU (`device`), or its whole
+/// device figure when the reading has no per-GPU figures and the owner holds
+/// one device allocation only (`sole_device`).
+fn credited_bytes(
+    resident: &ProcessResident,
+    kind: DomainMemory,
+    device: Option<&str>,
+    sole_device: bool,
+) -> i64 {
     match kind {
-        DomainMemory::Device => resident.device_bytes,
+        DomainMemory::Device if resident.per_device.is_empty() => {
+            if sole_device {
+                resident.device_bytes
+            } else {
+                0
+            }
+        }
+        DomainMemory::Device => device
+            .and_then(|device| resident.bytes_on(device))
+            .and_then(|bytes| i64::try_from(bytes).ok())
+            .unwrap_or(0),
         DomainMemory::Distinct => resident.host_bytes,
         // ADR 0007: one pool holds both.
         DomainMemory::Unified => resident.bytes,
@@ -63,7 +108,8 @@ fn credited_bytes(resident: &ProcessResident, kind: DomainMemory) -> i64 {
 
 /// The floors `residents` support for the owners `scoped` holds, for an
 /// admission of `candidate` judged against `observations`, each allocation
-/// credited by the memory kind `kinds` gives its domain.
+/// credited by the memory kind `kinds` gives its domain, a device domain from
+/// the bytes sampled on its GPU (`devices`, domain to host device id).
 pub(crate) fn resident_floors(
     conn: &Connection,
     scoped: &LedgerSnapshot,
@@ -71,6 +117,7 @@ pub(crate) fn resident_floors(
     observations: &[MemoryObservation],
     residents: &[ProcessResident],
     kinds: &BTreeMap<String, DomainMemory>,
+    devices: &BTreeMap<String, String>,
 ) -> rusqlite::Result<Vec<ResidentFloor>> {
     if residents.is_empty() {
         return Ok(Vec::new());
@@ -120,6 +167,12 @@ pub(crate) fn resident_floors(
                     .copied()
             })
             .collect();
+        let sole_device = footprint
+            .allocations
+            .iter()
+            .filter(|a| kinds.get(&a.domain) == Some(&DomainMemory::Device))
+            .count()
+            == 1;
         for allocation in &footprint.allocations {
             let Some(observation) = observations.iter().find(|o| o.domain == allocation.domain)
             else {
@@ -130,9 +183,10 @@ pub(crate) fn resident_floors(
             let Some(&kind) = kinds.get(&allocation.domain) else {
                 continue;
             };
-            let resident = processes
-                .iter()
-                .try_fold(0_i64, |sum, p| sum.checked_add(credited_bytes(p, kind)));
+            let device = devices.get(&allocation.domain).map(String::as_str);
+            let resident = processes.iter().try_fold(0_i64, |sum, p| {
+                sum.checked_add(credited_bytes(p, kind, device, sole_device))
+            });
             let bytes = resident.unwrap_or(0).min(allocation.bytes);
             if bytes > 0 {
                 floors.push(ResidentFloor {

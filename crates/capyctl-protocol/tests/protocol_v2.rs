@@ -198,6 +198,7 @@ fn process(role: &str, pid: u32) -> pb::OwnedProcessObservation {
         boot_id: "boot".into(),
         start_ticks: 7,
         presence: "alive".into(),
+        rank: None,
     }
 }
 fn residency(state: &str) -> pb::ResidencyEvidence {

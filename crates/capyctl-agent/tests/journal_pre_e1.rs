@@ -94,6 +94,7 @@ fn a_pre_e1_launch_command_re_decodes_from_the_journal_unchanged() {
             startup_bytes: None,
             startup_host_bytes: None,
             lmcache: None,
+            devices: Vec::new(),
         }),
     };
     command.identity.payload_digest = command.canonical_digest();

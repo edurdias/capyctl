@@ -193,6 +193,7 @@ fn launch(digest: bool, startup: bool) -> MemberAction {
         startup_bytes: startup.then_some(2 << 30),
         startup_host_bytes: None,
         lmcache: None,
+        devices: Vec::new(),
     })
 }
 
@@ -374,6 +375,7 @@ fn every_post_baseline_field_names_its_capability() {
             LMCACHE,
             RETENTION,
             REQUEST_ABORT,
+            LOCAL_TENSOR_PARALLEL,
         ]
         .contains(name)
         {
@@ -848,6 +850,96 @@ fn device_memory_domains_is_one_additive_capability() {
         ..older.residents[0].clone()
     };
     assert!(split.encode_to_vec().len() > older.residents[0].encode_to_vec().len());
+    assert_eq!(
+        pb::ProcessResidency::decode(split.encode_to_vec().as_slice()).unwrap(),
+        split
+    );
+}
+
+/// A launch on `devices` of one host, with a checkpoint layout when `layout`.
+fn local_launch(devices: &[&str], layout: bool) -> MemberAction {
+    let MemberAction::LaunchSingle(mut plan) = launch(true, true) else {
+        unreachable!()
+    };
+    plan.devices = devices.iter().map(|d| (*d).to_owned()).collect();
+    plan.checkpoint_layout = layout.then_some(capyctl_domain::member_weights::CheckpointLayout {
+        sharded_bytes: 1 << 29,
+        layer_count: 4,
+        largest_layer_bytes: 1 << 27,
+    });
+    MemberAction::LaunchSingle(plan)
+}
+
+// T46 T34 (ADR 0035 §11, ADR 0017): a launch on several GPUs of one host
+// needs `local_tensor_parallel`, never `engine_groups`, even with the layout
+// its rank share is sized with; a launch on one GPU needs nothing new, and a
+// group member's layout still needs `engine_groups`. A host without the
+// capability is refused before anything is sent.
+#[test]
+fn a_launch_on_several_gpus_needs_local_tensor_parallel() {
+    use capabilities::*;
+    assert_eq!(LOCAL_TENSOR_PARALLEL, "local_tensor_parallel");
+    assert!(CATALOGUE.contains(&(LOCAL_TENSOR_PARALLEL, Direction::ServerToHost)));
+    assert!(agent_capabilities().contains(&LOCAL_TENSOR_PARALLEL.to_owned()));
+    assert!(!PLACEMENT_REQUIRED.contains(&LOCAL_TENSOR_PARALLEL));
+    let base = required(&wire(launch(true, true), 0));
+    let local = wire(local_launch(&["gpu0", "gpu1"], true), 0);
+    let mut expected = base.clone();
+    expected.push(LOCAL_TENSOR_PARALLEL);
+    assert_eq!(required(&local), expected);
+    assert!(!required(&local).contains(&ENGINE_GROUPS));
+    assert!(required(&wire(local_launch(&[], true), 0)).contains(&ENGINE_GROUPS));
+    assert_eq!(required(&wire(local_launch(&[], false), 0)), base);
+
+    let everything: BTreeSet<String> = agent_capabilities().into_iter().collect();
+    let older: BTreeSet<String> = everything
+        .iter()
+        .filter(|c| *c != LOCAL_TENSOR_PARALLEL)
+        .cloned()
+        .collect();
+    assert_eq!(refusal(false, &everything, &local), None);
+    assert_eq!(
+        refusal(false, &older, &local).as_deref(),
+        Some("host_capability_missing:local_tensor_parallel")
+    );
+    assert_eq!(refusal(false, &older, &wire(launch(true, true), 0)), None);
+    assert_eq!(local_tensor_parallel_refusal(&everything, 2), None);
+    assert_eq!(local_tensor_parallel_refusal(&older, 1), None);
+    assert_eq!(
+        local_tensor_parallel_refusal(&older, 2).as_deref(),
+        Some("host_capability_missing:local_tensor_parallel")
+    );
+}
+
+// T46 (ADR 0035 §8): the per-GPU readings are additive: a resident without
+// them encodes exactly as before, and one with them decodes back unchanged.
+#[test]
+fn per_gpu_readings_are_additive() {
+    let older = pb::ProcessResidency {
+        pid: 7,
+        boot_id: "b".into(),
+        start_ticks: 9,
+        resident_bytes: 3 << 30,
+        device_bytes: 2 << 30,
+        host_bytes: 1 << 30,
+        ..Default::default()
+    };
+    let mut same = older.clone();
+    same.per_device.clear();
+    assert_eq!(older.encode_to_vec(), same.encode_to_vec());
+    let split = pb::ProcessResidency {
+        per_device: vec![
+            pb::DeviceResidency {
+                device_id: "gpu0".into(),
+                bytes: 3 << 29,
+            },
+            pb::DeviceResidency {
+                device_id: "gpu1".into(),
+                bytes: 1 << 29,
+            },
+        ],
+        ..older.clone()
+    };
     assert_eq!(
         pb::ProcessResidency::decode(split.encode_to_vec().as_slice()).unwrap(),
         split
