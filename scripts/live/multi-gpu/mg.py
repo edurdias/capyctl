@@ -43,7 +43,9 @@ import time
 import urllib.request
 from pathlib import Path
 
-DEFAULT_PROMPT = "What is 17+25? Answer with only the number."
+# Qwen3's soft switch: without it the model reasons first and 16 tokens end
+# inside the reasoning, before the answer.
+DEFAULT_PROMPT = "What is 17+25? Answer with only the number. /no_think"
 LONG_PROMPT = "Write a long story about a lighthouse keeper, at least two thousand words."
 
 
@@ -474,7 +476,7 @@ def main():
         return s
 
     s = client("chat")
-    s.add_argument("--max-tokens", type=int, default=16)
+    s.add_argument("--max-tokens", type=int, default=32)
     s.add_argument("--timeout", type=float, default=1800)
     s = client("hold")
     s.add_argument("--max-tokens", type=int, default=4096)

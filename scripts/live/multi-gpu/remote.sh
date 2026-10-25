@@ -135,6 +135,15 @@ nvcc_path() {
   else echo "$MG/cuda/bin/nvcc"; fi
 }
 
+# The CUDA toolkit the vLLM and SGLang profiles name (FlashInfer JIT-compiles
+# its sampling kernels at warm-up): the machine's, else the session's wheel
+# toolkit (setup_engines). `capyctl engine add` records `CUDA_HOME` as the
+# profile's cuda_home when it holds bin/nvcc.
+cuda_dir() {
+  if [ -x /usr/local/cuda/bin/nvcc ]; then echo /usr/local/cuda
+  elif [ "$PLAN" = 1 ] || [ -x "$MG/cuda/bin/nvcc" ]; then echo "$MG/cuda"; fi
+}
+
 setup_tools() {
   phase "tools under $MG: uv, protoc $PROTOC_VERSION, Rust (rust-toolchain.toml)"
   run mkdir -m 700 -p "$MG" "$BIN" "$RES"
@@ -347,13 +356,10 @@ role_down() {
 }
 
 profiles() { # the three engines, once per role
-  # The CUDA toolkit FlashInfer JIT-compiles with: the machine's, else the
-  # session's wheel toolkit (setup_engines).
   local cuda=()
-  if [ -x /usr/local/cuda/bin/nvcc ]; then cuda=(--cuda-home /usr/local/cuda)
-  elif [ "$PLAN" = 1 ] || [ -x "$MG/cuda/bin/nvcc" ]; then cuda=(--cuda-home "$MG/cuda"); fi
-  c engine add "$V32" --name v32 "${cuda[@]}" >>"$RES/cli.log" 2>&1 && PROFILES="$PROFILES v32"
-  c engine add "$S22" --name s22 "${cuda[@]}" >>"$RES/cli.log" 2>&1 && PROFILES="$PROFILES s22"
+  [ -z "$(cuda_dir)" ] || cuda=(CUDA_HOME="$(cuda_dir)")
+  run env "${cuda[@]}" XDG_CONFIG_HOME="$MG/cfg-$ROLE" "$CAPYCTL" --state-dir "$SD" engine add "$V32" --name v32 >>"$RES/cli.log" 2>&1 && PROFILES="$PROFILES v32"
+  run env "${cuda[@]}" XDG_CONFIG_HOME="$MG/cfg-$ROLE" "$CAPYCTL" --state-dir "$SD" engine add "$S22" --name s22 >>"$RES/cli.log" 2>&1 && PROFILES="$PROFILES s22"
   c engine add "$LCBIN" --name lc >>"$RES/cli.log" 2>&1 && PROFILES="$PROFILES lc"
   [ "$PLAN" = 1 ] || c engine list >>"$RES/cli.log" 2>&1
 }
@@ -475,7 +481,7 @@ serve_check() { # row name engine
   check "$row" ready "deploy and start $n; one chat through the router answers 42"
   if ! startd "$n"; then result "$row" ready fail "start failed; see start-$n.out"; return 1; fi
   r=$(chat "$n" "$row")
-  [ "${r%% *}" = 200 ] && result "$row" ready pass "Ready in $START_S s; chat ${r}" || result "$row" ready fail "chat ${r:-none}"
+  [ "${r%% *}" = 200 ] && [ "${r##* }" = ok ] && result "$row" ready pass "Ready in $START_S s; chat ${r}" || result "$row" ready fail "Ready in $START_S s; chat ${r:-none}"
   status_json "$n" "$RES/$row-status.json"
   c status deployment "$n" >"$RES/$row-status.txt" 2>&1
   pids=$(owned_pids "$n")
@@ -483,6 +489,9 @@ serve_check() { # row name engine
   if [ "$PLAN" = 0 ]; then
     gpus=$("${HELPER[@]}" gpus --pids "$pids"); echo "$gpus" >"$RES/$row-gpus.json"
     charge=$("${HELPER[@]}" charge "$DB" "$n"); echo "$charge" >"$RES/$row-charge.json"
+    # The whole ledger beside it, so a charge that reads empty can be explained.
+    "${HELPER[@]}" sql "$DB" "SELECT owner_id,domain_id,bytes,phase FROM reservations ORDER BY owner_id" >"$RES/$row-reservations.tsv"
+    "${HELPER[@]}" sql "$DB" "SELECT id,name FROM deployments" >"$RES/$row-deployments.tsv"
     r=$(python3 - "$RES/$row-gpus.json" "$RES/$row-charge.json" <<'PY'
 import json, re, sys
 g = json.load(open(sys.argv[1])); c = json.load(open(sys.argv[2]))
@@ -526,7 +535,15 @@ PY
     if grep -q 'CUDA0 model buffer' "$RES/$row-fit.txt" && grep -q 'CUDA1 model buffer' "$RES/$row-fit.txt"; then
       result "$row" fit pass "$(grep -c buffer "$RES/$row-fit.txt") buffer lines; see $row-fit.txt beside $row-charge.json"
     else
-      result "$row" fit fail "no per-device buffer lines for both GPUs"
+      # llama.cpp v0.7.0 logs no buffer sizes at its default verbosity: the
+      # launch's own per-GPU readings stand in (both cards hold a part, each
+      # within its grant, as the charge part reads them).
+      r=$(python3 -c 'import json,sys; u=json.load(open(sys.argv[1]))["owned_mib"]; print(" ".join(f"{k}={v}MiB" for k, v in sorted(u.items())) if len(u) >= 2 and all(v > 0 for v in u.values()) else "")' "$RES/$row-gpus.json")
+      if [ -n "$r" ] && grep -q "^$row"$'\t'"charge"$'\t'"pass" "$RES/results.tsv"; then
+        result "$row" fit pass "no buffer lines in llama.cpp's log (default verbosity); the launch's own readings: $r, each within its grant"
+      else
+        result "$row" fit fail "no per-device buffer lines; readings '${r}'; the charge part did not pass"
+      fi
     fi
   fi
 }
@@ -616,8 +633,14 @@ bench_pair() { # name engine label
   if [ "$PLAN" = 1 ]; then uuids='<uuid of gpu0>,<uuid of gpu1>'; else
     uuids=$(nvidia-smi --query-gpu=uuid --format=csv,noheader | head -2 | paste -sd,)
   fi
-  # The loopback pin CapyCTL renders for every single-host launch (runtime/loopback_rendezvous.py).
+  # The loopback pin CapyCTL renders for every single-host launch (runtime/loopback_rendezvous.py),
+  # and the toolchain part of its engine environment: the engine's bin and the
+  # profile's <cuda_home>/bin on PATH, CUDA_HOME (adapters' engine_env.rs).
   local envs=(CUDA_VISIBLE_DEVICES="$uuids" NCCL_SOCKET_IFNAME=lo GLOO_SOCKET_IFNAME=lo VLLM_HOST_IP=127.0.0.1 HF_HUB_OFFLINE=1)
+  local venv=$V32 cuda
+  [ "$e" = v32 ] || venv=$S22
+  cuda=$(cuda_dir)
+  if [ -n "$cuda" ]; then envs+=(CUDA_HOME="$cuda" PATH="$venv/bin:$cuda/bin:$PATH"); else envs+=(PATH="$venv/bin:$PATH"); fi
   local model
   model=$(find "$SOURCES" -maxdepth 3 -type d -name "${Q30_REPO//\//--}@*" 2>/dev/null | head -1)
   if [ "$e" = v32 ]; then
@@ -750,7 +773,7 @@ bandwidth() {
   local s0 s1 bytes st
   bytes=$(du -sb "$SOURCES" 2>/dev/null | cut -f1)
   s0=$(now)
-  deploy bw-q30 || { result BW download fail "deploy refused; see deploy-bw-q30.out"; return 1; }
+  deploy bw-q30 || { want BW && result BW download fail "deploy refused; see deploy-bw-q30.out"; say "the source deploy was refused; see deploy-bw-q30.out"; return 1; }
   st=$(poll_sources bw-q30 7200)
   s1=$(since "$s0")
   if [ "$PLAN" = 0 ]; then
@@ -1011,7 +1034,9 @@ PY
       echo $! >"$dir/host.pid"
       sleep 10
     fi
-    run env XDG_CONFIG_HOME="$dir/cfg" "$bin" engine add "$V32" --name v32 --config "$dir/host.yaml"
+    local cuda=()
+    [ -z "$(cuda_dir)" ] || cuda=(CUDA_HOME="$(cuda_dir)")
+    run env "${cuda[@]}" XDG_CONFIG_HOME="$dir/cfg" "$bin" engine add "$V32" --name v32 --config "$dir/host.yaml"
   }
   enroll_host mg-new "$h1" "$BIN/capyctl" 18749
   [ -x "$BIN/capyctl-old" ] || [ "$PLAN" = 1 ] && enroll_host mg-old "$h0" "$BIN/capyctl-old" 18750
