@@ -573,6 +573,17 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
             ("generation", Number),
             ("count", Number),
         ],
+        // ADR 0035 §1a: a `topology: auto` instance started on another
+        // tensor-parallel size than its previous launch, on these GPUs.
+        "topology_auto_changed" => &[
+            ("deployment_id", Id),
+            ("instance_index", Number),
+            ("generation", Number),
+            ("host_id", Token),
+            ("previous_tensor_parallel", Number),
+            ("tensor_parallel", Number),
+            ("devices", Tokens),
+        ],
         _ => return Err(Failure::Internal),
     };
     if input.len() != fields.len() + 1 {

@@ -48,7 +48,8 @@ CUDA change. Three CapyCTL binaries are built from the pushed trees:
   SGLang's local multi-GPU support data (`local_support` in
   `crates/capyctl-config/src/group_support.rs`), which is exactly the change MG4
   and MG5 make when they pass; the build refuses unless it flips those two
-  entries;
+  entries, and `--dry-run` makes the same edit on a copy of this checkout's
+  file and fails unless it flips exactly those two;
 - `capyctl-old`: the `v0.1.8` tag, the older host of MG11 (no
   `local_tensor_parallel` capability).
 

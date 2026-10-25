@@ -1112,6 +1112,13 @@ fn store_shaped(kind: &str) -> (serde_json::Value, Option<String>, Option<String
             "instance_index":0,"generation":3,"count":32}),
             ids.clone(),
         ),
+        // T46 T37 (ADR 0035 §1a): `auto` chose another N on these GPUs.
+        "topology_auto_changed" => (
+            serde_json::json!({"version":"1","deployment_id":DEP,"instance_index":0,
+            "generation":3,"host_id":"host-a","previous_tensor_parallel":1,
+            "tensor_parallel":2,"devices":["gpu0","gpu1"]}),
+            (Some(DEP.to_owned()), None),
+        ),
         k if k.starts_with("switch_") => (
             serde_json::json!({"version":"1","phase":&k["switch_".len()..],
             "switch_id":"sw-1","target_deployment":DEP,"host":"host-a",
