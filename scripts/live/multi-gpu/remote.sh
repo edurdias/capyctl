@@ -231,13 +231,25 @@ setup_engines() {
   local nvcc arch
   nvcc=$(nvcc_path)
   if [ "$nvcc" = "$MG/cuda/bin/nvcc" ]; then
+    # The session's CUDA 13.0 toolkit, from NVIDIA's wheels: the llama.cpp
+    # build, and the CUDA_HOME of the vLLM and SGLang profiles (FlashInfer
+    # JIT-compiles its sampling kernels at warm-up; curand for those).
     created "$MG/cuda"
     [ -x "$MG/cuda-venv/bin/python" ] || run "$BIN/uv" venv --python 3.12 "$MG/cuda-venv"
-    run "$BIN/uv" pip install --python "$MG/cuda-venv/bin/python" "cuda-toolkit[nvcc,cccl,cudart,cublas]==13.0.*"
+    run "$BIN/uv" pip install --python "$MG/cuda-venv/bin/python" "cuda-toolkit[nvcc,cccl,cudart,cublas,curand]==13.0.*"
     run sh -c "ln -sfn \$(dirname \$(dirname \$(find $MG/cuda-venv -path '*/bin/nvcc' | head -1))) $MG/cuda"
     # The wheels keep versioned libraries in lib/: nvcc links from lib64, and
     # CMake's FindCUDAToolkit looks for the unversioned names.
     run sh -c "cd $MG/cuda/lib && for l in libcudart libcublas libcublasLt; do ln -sfn \$l.so.13 \$l.so; done && ln -sfn lib $MG/cuda/lib64"
+    # nvcc runs `gcc` as its host compiler; where `gcc` is a newer major version
+    # than the installed g++ (no cc1plus for it), the toolkit's bin directory,
+    # which the engine PATH puts before the system's, names the pair g++ has.
+    if ! gcc -print-prog-name=cc1plus | grep -q /; then
+      local gxx
+      gxx=$(c++ -dumpversion | cut -d. -f1)
+      run ln -sfn "/usr/bin/gcc-$gxx" "$MG/cuda/bin/gcc"
+      run ln -sfn "/usr/bin/g++-$gxx" "$MG/cuda/bin/g++"
+    fi
   fi
   if [ "$PLAN" = 1 ]; then arch=86; else
     arch=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
@@ -335,10 +347,13 @@ role_down() {
 }
 
 profiles() { # the three engines, once per role
+  # The CUDA toolkit FlashInfer JIT-compiles with: the machine's, else the
+  # session's wheel toolkit (setup_engines).
   local cuda=()
-  [ -x /usr/local/cuda/bin/nvcc ] && cuda=(--cuda-home /usr/local/cuda)
+  if [ -x /usr/local/cuda/bin/nvcc ]; then cuda=(--cuda-home /usr/local/cuda)
+  elif [ "$PLAN" = 1 ] || [ -x "$MG/cuda/bin/nvcc" ]; then cuda=(--cuda-home "$MG/cuda"); fi
   c engine add "$V32" --name v32 "${cuda[@]}" >>"$RES/cli.log" 2>&1 && PROFILES="$PROFILES v32"
-  c engine add "$S22" --name s22 >>"$RES/cli.log" 2>&1 && PROFILES="$PROFILES s22"
+  c engine add "$S22" --name s22 "${cuda[@]}" >>"$RES/cli.log" 2>&1 && PROFILES="$PROFILES s22"
   c engine add "$LCBIN" --name lc >>"$RES/cli.log" 2>&1 && PROFILES="$PROFILES lc"
   [ "$PLAN" = 1 ] || c engine list >>"$RES/cli.log" 2>&1
 }
@@ -741,7 +756,10 @@ bandwidth() {
   if [ "$PLAN" = 0 ]; then
     local got
     got=$(( $(du -sb "$SOURCES" | cut -f1) - ${bytes:-0} ))
-    if [ "$st" = verified ]; then
+    # Run only for the sources of other rows (--only without BW), the
+    # download is not the bandwidth test and records nothing.
+    if ! want BW; then :
+    elif [ "$st" = verified ]; then
       result BW q30 pass "$(gib "$got") GiB in $s1 s = $(awk -v b="$got" -v s="$s1" 'BEGIN {printf "%.1f MB/s", b / s / 1e6}')"
     else
       result BW q30 fail "sources $st after $s1 s"
@@ -1039,7 +1057,15 @@ engine_config: {context_length: 32768}"
 }
 
 run_rows() {
-  [ "$PLAN" = 1 ] || { mkdir -p "$RES"; : >"$RES/results.tsv"; }
+  # A follow-up run (--only) replaces the results of its own rows and keeps
+  # the others', so verdict.md covers the whole session.
+  if [ "$PLAN" = 0 ]; then
+    mkdir -p "$RES"
+    if [ "$ONLY" = all ] || [ ! -f "$RES/results.tsv" ]; then : >"$RES/results.tsv"; else
+      awk -F'\t' -v only=",$ONLY," 'index(only, "," $1 ",") == 0' "$RES/results.tsv" >"$RES/results.tsv.keep"
+      mv "$RES/results.tsv.keep" "$RES/results.tsv"
+    fi
+  fi
   if [ -f "$MG/revs.env" ]; then
     # shellcheck disable=SC1091
     . "$MG/revs.env"
