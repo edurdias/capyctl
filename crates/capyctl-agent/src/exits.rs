@@ -42,7 +42,11 @@ pub struct ExitedLaunch {
 /// its Launch reported and the controller recorded. ADR 0033 §§3, 5: a
 /// launch's LMCache server (its `lmcache` leader) is watched too, Ready and
 /// parked (a restart-parked launch is its server alone); its exit is reported
-/// under the server's role, after any engine exit.
+/// under the server's role, after any engine exit. ADR 0035 §7: a rank
+/// process of a launch on several GPUs, journaled `rank-N` by its readiness
+/// (or a worker that is a rank), is an engine process: its exit is the
+/// engine's, reported under its rank role, and the controller names its rank
+/// and GPU (`engine_rank_exited`) and stops the whole group.
 pub fn scan(journal: &Arc<HostJournal>, host_id: &str, now_ms: i64) -> Vec<ExitedLaunch> {
     let Ok(ready) = journal.ready_launches() else {
         return Vec::new();

@@ -131,6 +131,9 @@ pub struct Scored {
     /// ADR 0028 §11: a multi-node group's head; its requests are watched
     /// for their first token.
     pub group: bool,
+    /// ADR 0035 §7: the number of GPUs of one host it runs on; above 1 its
+    /// requests are watched for their first token too.
+    pub local_tensor_parallel: u32,
     /// ADR 0032 §2: served through its host's ingress, not by an engine the
     /// router reaches directly.
     pub remote: bool,
@@ -215,6 +218,7 @@ pub fn rank(
             sample_age_ms: load.map(|(_, age)| age),
             score: score(router_in_flight, engine),
             group: instance.group,
+            local_tensor_parallel: instance.local_tensor_parallel,
             remote: instance.remote_host.is_some(),
         });
     }
@@ -710,9 +714,12 @@ impl Plan {
                     ) {
                         Ok(lane) => {
                             // ADR 0028 §11 (decided 2026-10-06): a request to a
-                            // group's head is watched for its first token; a
-                            // single-host instance's never is.
-                            let stall = candidate.group.then(|| crate::stream::StallWatch {
+                            // group's head is watched for its first token; ADR
+                            // 0035 §7: so is one to an instance on several GPUs
+                            // of one host (the same stall timeout). A
+                            // single-GPU instance's never is.
+                            let watched = candidate.group || candidate.local_tensor_parallel > 1;
+                            let stall = watched.then(|| crate::stream::StallWatch {
                                 authority: deps.controller.clone(),
                                 deployment: deployment.clone(),
                                 instance: candidate.instance_index,

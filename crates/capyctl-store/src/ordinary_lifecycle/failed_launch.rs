@@ -129,8 +129,10 @@ impl crate::Store {
 
     /// [`Self::release_failed_launch`] with the operation's closed failure
     /// code: ADR 0033 §9, a `lmcache: required` launch that failed for a
-    /// launch-time reason fails `lmcache_unavailable:<reason>`. Any other code
-    /// than `launch_failed` or `lmcache_unavailable:<reason>` is refused.
+    /// launch-time reason fails `lmcache_unavailable:<reason>`; ADR 0035 §13,
+    /// a launch on several GPUs fails `tp_rank_unobserved` or
+    /// `engine_listener_exposed`. Any other code than these or
+    /// `launch_failed` is refused.
     #[allow(clippy::too_many_arguments)]
     pub fn release_failed_launch_coded(
         &self,
@@ -185,7 +187,12 @@ pub(super) fn release_with_code(
         .strip_prefix("lmcache_unavailable:")
         .and_then(capyctl_config::lmcache::LmcacheOffReason::parse)
         .is_some();
-    if error_code != "launch_failed" && !lmcache_code {
+    let local_tp_code = [
+        capyctl_domain::local_tp::TP_RANK_UNOBSERVED,
+        capyctl_domain::local_tp::ENGINE_LISTENER_EXPOSED,
+    ]
+    .contains(&error_code);
+    if error_code != "launch_failed" && !lmcache_code && !local_tp_code {
         return Err(LifecycleError::Invalid);
     }
     if !is_ordinary(tx, id)? {

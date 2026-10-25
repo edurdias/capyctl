@@ -587,6 +587,8 @@ impl EngineAdapter for RemoteEngine {
             // before the launch is sent; nothing has been sent to the host yet.
             plan.checkpoint_digest = self.first_placement(c, &plan).await?;
         }
+        // ADR 0035 §6: the rank-ordered GPUs, for the ranks the host names.
+        let devices = plan.devices.clone();
         let mut command = MemberCommand {
             identity: CommandIdentity {
                 controller_id: b.controller_id.clone(),
@@ -638,6 +640,7 @@ impl EngineAdapter for RemoteEngine {
             self.lmcache.record(report);
         }
         launch_evidence(&result)?;
+        let receipt = remote_receipt(&result, &devices)?;
         // SPEC §13.2 (G2): this readiness belongs to the host session that
         // proved it; a later session must re-prove it before dispatch.
         self.readiness
@@ -655,7 +658,7 @@ impl EngineAdapter for RemoteEngine {
                 .map(process)
                 .collect(),
             observed_at_ms: result.observed_at_unix_ms,
-            receipt: "authenticated host native model probe".into(),
+            receipt,
             facts: vec![
                 Milestone::AllocationsRestored,
                 Milestone::WeightsUsable,
@@ -1652,7 +1655,7 @@ pub(crate) fn local_devices(
     host: &str,
     effective: &capyctl_config::effective::EffectiveDeployment,
 ) -> Vec<String> {
-    if effective.selected_devices.len() < 2 {
+    if effective.local_tensor_parallel() < 2 {
         return Vec::new();
     }
     let scoped = capyctl_config::remote_resources::ledger_key(host, "device", "");
@@ -1667,6 +1670,51 @@ pub(crate) fn local_devices(
                 .to_owned()
         })
         .collect()
+}
+
+/// The readiness receipt of a remote launch. ADR 0035 §6: the host's own
+/// observation names the rank processes of a launch on several GPUs (each
+/// alive process's `rank`, its GPU the plan's `devices[rank]`); the receipt
+/// records them, as an embedded launch's does, so a rank's exit is named by
+/// its rank and GPU. A host that names ranks names one per GPU, or the
+/// readiness proves nothing. llama.cpp runs one process on every GPU and
+/// names none.
+fn remote_receipt(
+    result: &pb::MemberExecutionResult,
+    devices: &[String],
+) -> Result<String, RuntimeError> {
+    use capyctl_domain::local_tp::{ranks_receipt, RankRecord};
+    const PROBED: &str = "authenticated host native model probe";
+    let mut ranks: Vec<RankRecord> = result
+        .processes
+        .iter()
+        .filter(|p| p.presence == "alive")
+        .filter_map(|p| {
+            let rank = p.rank?;
+            Some(RankRecord {
+                rank,
+                device: devices.get(usize::try_from(rank).ok()?)?.clone(),
+                process: process(p),
+            })
+        })
+        .collect();
+    if ranks.is_empty() && result.processes.iter().all(|p| p.rank.is_none()) {
+        return Ok(PROBED.into());
+    }
+    ranks.sort_by_key(|r| r.rank);
+    let covers = devices.len() >= 2
+        && ranks.len() == devices.len()
+        && ranks
+            .iter()
+            .enumerate()
+            .all(|(index, r)| usize::try_from(r.rank).ok() == Some(index));
+    if !covers {
+        return Err(RuntimeError::Uncertain(
+            "the host's readiness names rank processes that are not one per GPU of the launch"
+                .into(),
+        ));
+    }
+    Ok(format!("{PROBED}; {}", ranks_receipt(&ranks)))
 }
 
 #[cfg(test)]
@@ -2335,5 +2383,60 @@ mod tests {
                 rank: None,
             })
             .collect()
+    }
+
+    // T46 (ADR 0035 §6): the remote readiness receipt records the ranks the
+    // host's own observation named, one per GPU in rank order; a launch
+    // naming none (one GPU, llama.cpp) keeps the plain receipt, and ranks
+    // that do not cover the GPUs prove nothing.
+    #[test]
+    fn the_remote_receipt_records_the_ranks_the_host_named() {
+        let observed = |role: &str, pid: u32, rank: Option<u32>| pb::OwnedProcessObservation {
+            role: role.into(),
+            pid,
+            boot_id: "boot".into(),
+            start_ticks: u64::from(pid),
+            presence: "alive".into(),
+            rank,
+        };
+        let devices = vec!["gpu0".to_owned(), "gpu1".to_owned()];
+        let result = |processes| pb::MemberExecutionResult {
+            processes,
+            ..Default::default()
+        };
+        let named = result(vec![
+            observed("api", 10, None),
+            observed("worker-0", 11, None),
+            observed("rank-1", 13, Some(1)),
+            observed("rank-0", 12, Some(0)),
+        ]);
+        let receipt = remote_receipt(&named, &devices).unwrap();
+        assert_eq!(
+            receipt,
+            "authenticated host native model probe; tp ranks: 0=rank-0:12@gpu0 1=rank-1:13@gpu1"
+        );
+        assert_eq!(
+            capyctl_domain::local_tp::rank_of(
+                &receipt,
+                &ProcessIdentity {
+                    role: "rank-1".into(),
+                    pid: 13,
+                    boot_id: "boot".into(),
+                    start_ticks: 13,
+                }
+            )
+            .map(|r| r.device),
+            Some("gpu1".into())
+        );
+        let plain = result(vec![observed("api", 10, None)]);
+        assert_eq!(
+            remote_receipt(&plain, &[]).unwrap(),
+            "authenticated host native model probe"
+        );
+        let partial = result(vec![
+            observed("api", 10, None),
+            observed("rank-0", 12, Some(0)),
+        ]);
+        assert!(remote_receipt(&partial, &devices).is_err());
     }
 }

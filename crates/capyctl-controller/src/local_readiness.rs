@@ -92,6 +92,9 @@ struct Target {
     /// ADR 0031: a custom engine's manifest; its proof is the port, the
     /// health path, the API probe and the loopback check, never a model list.
     custom: Option<capyctl_config::custom::CustomProfile>,
+    /// ADR 0035 §5: a built-in engine's launch on several GPUs; its owned
+    /// listeners are checked at every re-proof.
+    several_gpus: bool,
 }
 
 pub struct LocalReadiness {
@@ -291,12 +294,23 @@ impl LocalReadiness {
             ),
             _ => None,
         };
+        // ADR 0035 §5: the frozen revision's device list, rank-ordered, or
+        // the rank processes the launch recorded.
+        let several_gpus = custom.is_none()
+            && (effective["selected_devices"]
+                .as_array()
+                .is_some_and(|devices| devices.len() >= 2)
+                || launch
+                    .identities
+                    .iter()
+                    .any(|identity| identity.rank_role().is_some()));
         Ok(Target {
             url,
             key,
             served,
             decisions,
             custom,
+            several_gpus,
         })
     }
 
@@ -346,32 +360,7 @@ impl LocalReadiness {
                 return Err("the engine answered the chat probe with empty content".into());
             }
         }
-        let live = alive(&launch.identities)?;
-        let checked = tokio::task::spawn_blocking(move || {
-            capyctl_adapters::custom::check_loopback(
-                std::path::Path::new("/proc"),
-                &live,
-                &capyctl_launchers::process_absence::presence,
-            )
-        })
-        .await
-        .map_err(|_| "the listener check did not run".to_owned())?;
-        match checked {
-            Ok(()) => Ok(()),
-            Err(exposed @ capyctl_adapters::custom::ListenerCheck::Exposed(_)) => {
-                let recorded = launch.identities.clone();
-                let stopped = tokio::task::spawn_blocking(move || {
-                    capyctl_launchers::owned_launch::terminate_recorded(&recorded, EXPOSED_GRACE)
-                })
-                .await
-                .map_err(|_| format!("{exposed}; the stop did not run"))?;
-                Err(match stopped {
-                    Ok(_) => format!("{exposed}; the engine was stopped"),
-                    Err(error) => format!("{exposed}; the stop is unproven: {error}"),
-                })
-            }
-            Err(unreadable) => Err(unreadable.to_string()),
-        }
+        check_owned_listeners(launch, false).await
     }
 
     /// ADR 0033 §§3, 9, 10 (lifecycle design §5): re-prove the launch's
@@ -445,6 +434,12 @@ impl LocalReadiness {
             Some(custom) => self.prove_custom(launch, &target, custom).await?,
             None => self.prove_listed(&target).await?,
         }
+        // ADR 0035 §5: a built-in engine's launch on several GPUs is checked
+        // for listeners off loopback whenever it is re-proved; one is stopped
+        // and the proof fails `engine_listener_exposed`.
+        if target.several_gpus {
+            check_owned_listeners(launch, true).await?;
+        }
         // SPEC §6.1: the answer must come from the recorded group, so the group is
         // proven alive on both sides of it.
         let live = alive(&launch.identities)?;
@@ -467,10 +462,15 @@ impl LocalReadiness {
                 ),
                     None => format!(
                     "every recorded engine process alive with its recorded start ticks and boot; \
-                     the engine answered an authenticated model list naming {}{}",
+                     the engine answered an authenticated model list naming {}{}{}",
                     target.served,
                     if target.decisions {
                         " and the fixed decision probe"
+                    } else {
+                        ""
+                    },
+                    if target.several_gpus {
+                        "; every owned listener is on loopback"
                     } else {
                         ""
                     }
@@ -682,6 +682,49 @@ impl capyctl_launchers::LaunchAssociation for ProveOnly {
         Err(capyctl_launchers::AssociationError::Uncertain(
             "a readiness proof never launches".into(),
         ))
+    }
+}
+
+/// ADR 0031 §7, ADR 0035 §5: the loopback check of every live owned process
+/// of an adopted launch (`built_in`: a built-in engine's launch on several
+/// GPUs, where a helper that exited during the read is left out). One that
+/// listens off loopback is stopped, with gone evidence, and the proof fails
+/// `custom_listener_exposed`, or for a built-in engine
+/// `engine_listener_exposed` naming the process role, address and port.
+async fn check_owned_listeners(launch: &LocalReadyLaunch, built_in: bool) -> Result<(), String> {
+    use capyctl_adapters::custom::ListenerCheck;
+    let live = alive(&launch.identities)?;
+    let checked = tokio::task::spawn_blocking(move || {
+        let root = std::path::Path::new("/proc");
+        let presence = &capyctl_launchers::process_absence::presence;
+        if built_in {
+            capyctl_adapters::custom::check_engine_launch(root, &live, presence)
+        } else {
+            capyctl_adapters::custom::check_loopback(root, &live, presence)
+        }
+    })
+    .await
+    .map_err(|_| "the listener check did not run".to_owned())?;
+    match checked {
+        Ok(()) => Ok(()),
+        Err(ListenerCheck::Exposed(listener)) => {
+            let exposed = if built_in {
+                capyctl_adapters::custom::engine_listener_exposed(&listener)
+            } else {
+                ListenerCheck::Exposed(listener).to_string()
+            };
+            let recorded = launch.identities.clone();
+            let stopped = tokio::task::spawn_blocking(move || {
+                capyctl_launchers::owned_launch::terminate_recorded(&recorded, EXPOSED_GRACE)
+            })
+            .await
+            .map_err(|_| format!("{exposed}; the stop did not run"))?;
+            Err(match stopped {
+                Ok(_) => format!("{exposed}; the engine was stopped"),
+                Err(error) => format!("{exposed}; the stop is unproven: {error}"),
+            })
+        }
+        Err(unreadable) => Err(unreadable.to_string()),
     }
 }
 

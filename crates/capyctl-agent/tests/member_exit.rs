@@ -439,3 +439,167 @@ async fn a_helper_exit_of_a_ready_launch_is_not_reported() {
         );
     }
 }
+
+/// ADR 0035 §§6, 7: on a launch on several GPUs, a process readiness named a
+/// rank (here the worker's own child, a helper by the group scan) is
+/// journaled `rank-N`, its result carries its rank, a later scan keeps the
+/// role, and its exit is the engine's exit, reported under that role. The
+/// claim stays until a Terminate proves the whole group gone.
+// T46
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rank_exit_of_a_ready_launch_on_several_gpus_is_reported() {
+    use capyctl_domain::local_tp::{ranks_receipt, RankRecord};
+    let d = directory();
+    let journal = HostJournal::open(d.path(), "controller", "host").unwrap();
+    let session = journal.connect().unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+    ))
+    .unwrap();
+    let mut launch = command("rank-launch");
+    let binding = "01K00000000000000000000001".to_owned();
+    let incarnation = "01K00000000000000000000002".to_owned();
+    launch.action = MemberAction::LaunchSingle(SingleLaunchPlan {
+        deployment_config: fixture["input"]["deployment"].to_string(),
+        profile_name: "profile".into(),
+        checkpoint_fingerprint: "sha256:model".into(),
+        host_policy_fingerprint: "a".repeat(64),
+        binding_id: binding.clone(),
+        incarnation: incarnation.clone(),
+        grant_id: "01K00000000000000000000003".into(),
+        service_port: 30000,
+        issued_at_ms: 1,
+        coordinator_session_id: "01K00000000000000000000004".into(),
+        checkpoint_digest: String::new(),
+        checkpoint_weights_bytes: None,
+        checkpoint_state_slot_bytes: None,
+        checkpoint_layout: None,
+        checkpoint_tables: None,
+        checkpoint_gguf: None,
+        startup_bytes: None,
+        startup_host_bytes: None,
+        lmcache: None,
+        devices: vec!["gpu0".into(), "gpu1".into()],
+    });
+    let launch = sign(launch);
+    let policy = std::sync::Arc::new(WithHelper);
+    let Acceptance::Fresh(ticket) = journal
+        .accept(session, &launch, 10, policy.as_ref())
+        .unwrap()
+    else {
+        panic!("fresh acceptance");
+    };
+    let tools = journal
+        .launch_tools(ticket, 10, policy.clone(), Default::default())
+        .unwrap();
+    let api = tools
+        .spawn_durable(
+            &incarnation,
+            &policy.render_launch(&launch).unwrap().command,
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let group = loop {
+        let observed = tools.observe_group(&api).unwrap();
+        if observed.len() >= 3 {
+            break observed;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    };
+    let _cleanup = Group(group.clone());
+    // Readiness named the worker rank 0 and its child rank 1.
+    let rank1 = ProcessIdentity {
+        role: "rank-1".into(),
+        ..group[2].clone()
+    };
+    let ranks = vec![
+        RankRecord {
+            rank: 0,
+            device: "gpu0".into(),
+            process: group[1].clone(),
+        },
+        RankRecord {
+            rank: 1,
+            device: "gpu1".into(),
+            process: rank1.clone(),
+        },
+    ];
+    journal
+        .record_rank_roles(session, "rank-launch", &ranks)
+        .unwrap();
+    let named = vec![group[0].clone(), group[1].clone(), rank1.clone()];
+    journal
+        .record_launch_ready(
+            session,
+            "rank-launch",
+            &EffectObservation {
+                token: TransitionToken {
+                    deployment_id: "deployment".into(),
+                    operation_id: "operation".into(),
+                    step_id: "rank-launch".into(),
+                    revision: 1,
+                    generation: 1,
+                },
+                binding_id: binding,
+                incarnation,
+                identities: named.clone(),
+                observed_at_ms: 20,
+                receipt: format!("controlled adapter probe; {}", ranks_receipt(&ranks)),
+                facts: vec![
+                    Milestone::AllocationsRestored,
+                    Milestone::WeightsUsable,
+                    Milestone::CacheValid,
+                    Milestone::ModelUsable,
+                ],
+                kernel_builds: Vec::new(),
+            },
+        )
+        .unwrap();
+    let result = journal.execution_result("rank-launch", 25).unwrap();
+    let rank_of = |role: &str| {
+        result
+            .processes
+            .iter()
+            .find(|p| p.role == role)
+            .and_then(|p| p.rank)
+    };
+    assert!(result.model_usable);
+    assert_eq!(
+        (rank_of("api"), rank_of("worker-0"), rank_of("rank-1")),
+        (None, Some(0), Some(1))
+    );
+    // A later scan of the group names the rank as recorded.
+    let rescanned = tools.observe_group(&api).unwrap();
+    assert!(rescanned.contains(&rank1), "{rescanned:?}");
+
+    // The rank process exits: the engine's exit, under its rank role.
+    unsafe {
+        libc::kill(rank1.pid as i32, libc::SIGKILL);
+    }
+    let reported = scan_until(&journal, Duration::from_secs(5), |exited| {
+        !exited.is_empty()
+    });
+    assert_eq!(reported[0].process, rank1);
+
+    drop(tools);
+    let mut stop = command("stop-rank-launch");
+    stop.identity.expected_state = "retained".into();
+    stop.action = MemberAction::Terminate {
+        owned_handle: "rank-launch".into(),
+        recorded: Vec::new(),
+    };
+    let stop = sign(stop);
+    let Acceptance::Fresh(ticket) = journal.accept(session, &stop, 10, policy.as_ref()).unwrap()
+    else {
+        panic!("fresh acceptance");
+    };
+    journal.execute(ticket, 10, policy.as_ref()).unwrap();
+    for process in &named {
+        assert_ne!(
+            capyctl_launchers::process_absence::presence(process),
+            capyctl_domain::completion::Presence::Alive,
+            "{process:?} outlived the Terminate"
+        );
+    }
+}

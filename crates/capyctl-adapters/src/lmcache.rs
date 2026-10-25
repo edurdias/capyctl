@@ -574,10 +574,13 @@ async fn checked_group(
         })?;
         match check {
             Ok(()) => return Ok(group),
-            Err(ListenerCheck::Exposed(address)) => {
+            Err(ListenerCheck::Exposed(listener)) => {
                 return Err((
                     LmcacheOffReason::ListenerExposed,
-                    format!("the LMCache server listens on {address}, not on loopback"),
+                    format!(
+                        "the LMCache server listens on {}, not on loopback",
+                        listener.address
+                    ),
                     group,
                 ))
             }

@@ -258,3 +258,20 @@ fn canonical_members_accept_helpers_with_gaps_beside_the_workers() {
         "helpers never stand in for the engine's workers"
     );
 }
+
+/// ADR 0035 §6: a launch on several GPUs records its rank processes that are
+/// neither `api` nor a worker as `rank-N`, beside its workers and helpers;
+/// a rank role without a number, or past 63, is not one.
+// T46
+#[test]
+fn canonical_members_accept_rank_processes() {
+    let api = identity("api", 10);
+    let w0 = identity("worker-0", 11);
+    let r0 = identity("rank-0", 12);
+    let r1 = identity("rank-1", 13);
+    let h0 = identity("helper-0", 14);
+    assert!(canonical_members(&[api.clone(), w0.clone(), r0.clone(), r1.clone(), h0]).is_ok());
+    assert!(canonical_members(&[api.clone(), w0.clone(), r1.clone()]).is_ok());
+    assert!(canonical_members(&[api.clone(), w0.clone(), identity("rank-", 15)]).is_err());
+    assert!(canonical_members(&[api, w0, identity("rank-64", 15)]).is_err());
+}
