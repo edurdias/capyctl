@@ -54,6 +54,11 @@ pin exactly N GPUs, and `topology: auto` lets CapyCTL choose N.
   0.5.22 and the llama.cpp v0.7.0 build, and removes everything it created
   ([its README](../../scripts/live/multi-gpu/README.md)).
 
+**Not yet on this branch (draft):** the engine side of §4 and §9 (vLLM, SGLang and llama.cpp
+flags and device lists, `tp_drift`, the agent's N-device launch check, per-GPU park
+evidence) is on `feat/mg-engines`, and the remaining placement tests are on `feat/mg-tests`;
+both merge here before review, and this file is corrected to match then.
+
 Tests (T46), new in `capyctl-config` (`tests/multi_gpu.rs`), `capyctl-store`
 (`tests/multi_gpu_placement.rs`, the v58 migration), `capyctl-scheduler`, `capyctl-domain`
 (`local_tp`), `capyctl-agent`, `capyctl-controller`, `capyctl-router` and `capyctl-protocol`.
