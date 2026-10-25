@@ -66,7 +66,7 @@ impl GroupRefusal {
 }
 
 /// Far above any hardware in hand, low enough that `world_size` never overflows.
-const MAX_DIMENSION: u64 = 64;
+pub(crate) const MAX_DIMENSION: u64 = 64;
 
 fn dimension(raw: &Value, key: &str) -> Result<u32, ConfigError> {
     match raw.get(key) {
@@ -115,6 +115,11 @@ pub const MULTI_GPU_UNSUPPORTED: &str = "multi_gpu_unsupported";
 pub const MULTI_GPU_MIXED_DEVICES: &str = "multi_gpu_mixed_devices";
 pub const TENSOR_PARALLEL_INDIVISIBLE: &str = "tensor_parallel_indivisible";
 pub const INSUFFICIENT_GPUS: &str = "insufficient_gpus";
+/// ADR 0035 §11: the ADR 0017 capability a host declares when it takes a
+/// launch on several of its GPUs (`capyctl_protocol::capabilities` names the
+/// same string), and the placement refusal of a host that does not.
+pub const LOCAL_TP_CAPABILITY: &str = "local_tensor_parallel";
+pub const LOCAL_TP_CAPABILITY_MISSING: &str = "host_capability_missing:local_tensor_parallel";
 
 fn named_hosts(spec: &InstanceSpec) -> usize {
     spec.placement.hosts.as_ref().map_or(0, Vec::len)

@@ -1272,6 +1272,19 @@ fn plan_in(
     let owner = instance_owner_id(target, instance);
     let spec = placement_spec(tx, target, revision)?;
     let mut hosts = placement::candidates(tx, target, revision, instance, eligible, true)?;
+    // ADR 0035 §1a, §2: a parked instance wakes on the GPU set it parked on,
+    // with the N it was started at; `topology: auto` chooses nothing again.
+    let parked_device: Option<String> = if wake {
+        tx.query_row(
+            "SELECT COALESCE(device_set,device) FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2",
+            params![target, instance],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten()
+    } else {
+        None
+    };
     if let Some((_, Some(parked_on))) = &parked {
         hosts.retain(|c| &c.host_id == parked_on);
         let (source, e, _) = launch(tx, target, instance)?;
@@ -1280,6 +1293,13 @@ fn plan_in(
             c.footprint = peak.clone();
             // ADR 0019: it wakes on the GPU it parked on, no other.
             c.device_options.clear();
+            if c.gate.is_some_and(|gate| {
+                gate != capyctl_config::topology::LOCAL_TP_CAPABILITY_MISSING
+                    && placement::PLACEMENT_REFUSALS.contains(&gate)
+            }) {
+                c.gate = None;
+                c.gate_detail = None;
+            }
         }
     }
     // Owner decision 2026-09-25: earlier instances of the same evicting start
@@ -1358,7 +1378,7 @@ fn plan_in(
             });
             return Ok(Planned::Fits {
                 host: Some(chosen),
-                device,
+                device: parked_device.or(device),
             });
         }
         let Offered {
@@ -1569,7 +1589,7 @@ fn plan_in(
             victims,
             admission_window_ms,
         },
-        choice.device,
+        parked_device.or(choice.device),
     ))
 }
 

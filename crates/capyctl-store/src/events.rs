@@ -231,6 +231,20 @@ pub(crate) enum EventMetadata {
         host_id: String,
         detail: String,
     },
+    /// ADR 0035 §1a, §13: a start of an instance under `topology: auto`
+    /// chose a tensor-parallel size other than its previous start's (the
+    /// host's cards, their limits or a measured figure changed), on the GPUs
+    /// named by their host-local ids in rank order.
+    #[serde(rename = "1")]
+    TopologyAutoChanged {
+        deployment_id: String,
+        instance_index: u32,
+        generation: i64,
+        host_id: String,
+        previous_tensor_parallel: u32,
+        tensor_parallel: u32,
+        devices: Vec<String>,
+    },
     /// ADR 0032 §7: the deployment's limit was full of cancelled requests
     /// that settle only at their instance's next verified stop, so that
     /// instance's restart was accepted: the stop `operation_id`, whose
@@ -386,6 +400,7 @@ impl EventMetadata {
             Self::RequestCancellationAcknowledged { .. } => "request_cancellation_acknowledged",
             Self::LmcacheOff { .. } => "lmcache_off",
             Self::LmcacheServerExited { .. } => "lmcache_server_exited",
+            Self::TopologyAutoChanged { .. } => "topology_auto_changed",
             Self::InstanceRestartedForHeldRequests { .. } => "instance_restarted_for_held_requests",
         }
     }
@@ -438,7 +453,8 @@ impl EventMetadata {
             } => (Some(target_deployment.as_str()), None),
             Self::RequestCancellationAcknowledged { deployment_id, .. }
             | Self::LmcacheOff { deployment_id, .. }
-            | Self::LmcacheServerExited { deployment_id, .. } => {
+            | Self::LmcacheServerExited { deployment_id, .. }
+            | Self::TopologyAutoChanged { deployment_id, .. } => {
                 (Some(deployment_id.as_str()), None)
             }
             Self::InstanceRestartedForHeldRequests {

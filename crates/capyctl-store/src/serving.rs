@@ -156,11 +156,12 @@ impl crate::Store {
     pub fn lane_engine(&self, binding_id: &str) -> Result<Option<LaneEngine>, LifecycleError> {
         // Read only; dropped without a commit.
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
-        // (deployment, revision, placed host, device, remote ingress host)
+        // (deployment, revision, placed host, device or GPU set (ADR 0035
+        // §2), remote ingress host)
         type Lane = (String, i64, Option<String>, Option<String>, Option<String>);
         let lane: Option<Lane> = tx
             .prepare_cached(
-                "SELECT b.deployment_id,b.revision,i.host_id,i.device,r.host_id
+                "SELECT b.deployment_id,b.revision,i.host_id,COALESCE(i.device_set,i.device),r.host_id
                    FROM runtime_bindings b
                    JOIN deployment_instances i ON i.deployment_id=b.deployment_id
                         AND i.instance_index=b.instance_index

@@ -45,6 +45,9 @@ pub(super) fn measurable(e: &EffectiveDeployment) -> bool {
 }
 
 /// The residue recorded for this revision on its host and installation.
+/// ADR 0035 §3: at the revision's tensor-parallel size N only; on N GPUs the
+/// per-GPU residue recorded at N (the largest any GPU held, whichever GPUs it
+/// was measured on) is applied to every GPU of the set.
 pub(super) fn measured(
     conn: &rusqlite::Connection,
     deployment_id: &str,
@@ -54,21 +57,44 @@ pub(super) fn measured(
     if !measurable(e) {
         return Ok(Measured::new());
     }
-    Ok(conn
+    let n = e.local_tensor_parallel();
+    let rows: Measured = conn
         .prepare(
             "SELECT domain,bytes FROM parked_measurements
-              WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND installation=?4",
+              WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND installation=?4
+                AND tensor_parallel=?5",
         )?
         .query_map(
             params![
                 deployment_id,
                 revision,
                 e.host.name,
-                super::startup::installation(e)
+                super::startup::installation(e),
+                n
             ],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
         )?
-        .collect::<Result<_, _>>()?)
+        .collect::<Result<_, _>>()?;
+    if n <= 1 {
+        return Ok(rows);
+    }
+    let per_gpu = rows
+        .iter()
+        .filter(|(domain, _)| kind(e, domain) == Some(DomainMemory::Device))
+        .map(|(_, bytes)| *bytes)
+        .max();
+    let mut out: Measured = rows
+        .into_iter()
+        .filter(|(domain, _)| kind(e, domain) != Some(DomainMemory::Device))
+        .collect();
+    if let Some(bytes) = per_gpu {
+        for allocation in &e.resources.parked.allocations {
+            if kind(e, &allocation.domain) == Some(DomainMemory::Device) {
+                out.insert(allocation.domain.clone(), bytes);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// `parked` with each measured domain charged its residue: never below the
@@ -203,15 +229,17 @@ pub(super) fn record_residue(
     now_ms: i64,
 ) -> Result<(), LifecycleError> {
     let installation = super::startup::installation(e);
+    // ADR 0035 §3: per revision, host, installation, N and GPU.
+    let n = e.local_tensor_parallel();
     for (domain, bytes) in residue {
         tx.execute(
-            "INSERT INTO parked_measurements(deployment_id,revision,host_id,installation,domain,bytes,step_id,measured_at_ms)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
-             ON CONFLICT(deployment_id,revision,host_id,installation,domain) DO UPDATE SET
+            "INSERT INTO parked_measurements(deployment_id,revision,host_id,installation,tensor_parallel,domain,bytes,step_id,measured_at_ms)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(deployment_id,revision,host_id,installation,tensor_parallel,domain) DO UPDATE SET
                step_id=CASE WHEN excluded.bytes>bytes THEN excluded.step_id ELSE step_id END,
                measured_at_ms=CASE WHEN excluded.bytes>bytes THEN excluded.measured_at_ms ELSE measured_at_ms END,
                bytes=MAX(bytes,excluded.bytes)",
-            params![deployment_id, revision, e.host.name, installation, domain, bytes, step_id, now_ms],
+            params![deployment_id, revision, e.host.name, installation, n, domain, bytes, step_id, now_ms],
         )?;
     }
     record_launch_charges(
