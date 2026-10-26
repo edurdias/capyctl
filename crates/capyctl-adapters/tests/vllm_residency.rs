@@ -44,6 +44,7 @@ struct Engine {
     metrics: bool,
     /// The waiting gauge is absent from `/metrics`.
     no_waiting: bool,
+    copy_delay: std::time::Duration,
 }
 
 type Shared = Arc<Mutex<Engine>>;
@@ -73,6 +74,8 @@ async fn sleep(
     if let Err(status) = record(&engine, &call) {
         return status.into_response();
     }
+    let delay = engine.lock().unwrap().copy_delay;
+    tokio::time::sleep(delay).await;
     let mut e = engine.lock().unwrap();
     e.sleeping = true;
     e.weights_awake = false;
@@ -95,6 +98,8 @@ async fn wake(
     if let Err(status) = record(&engine, &format!("wake:{tag}")) {
         return status.into_response();
     }
+    let delay = engine.lock().unwrap().copy_delay;
+    tokio::time::sleep(delay).await;
     let mut e = engine.lock().unwrap();
     match tag.as_str() {
         "weights" => e.weights_awake = true,
@@ -656,6 +661,59 @@ async fn host_backed_parks_at_level_one_and_never_reloads() {
     );
     assert!(!e.calls.iter().any(|c| c.contains("reload_weights")));
     assert!(!e.sleeping && e.weights_loaded);
+}
+
+// T16 T20 T46: MG6's TP2 CPU copy took 31.3 s. A persisted copy uses its
+// operation's deadline, not the short control timeout; an expired copy is
+// uncertain and must never be replayed.
+#[tokio::test]
+async fn host_backed_copies_use_the_operation_deadline() {
+    use std::time::Duration;
+    let run = |action, id| async move {
+        let engine = Shared::default();
+        engine.lock().unwrap().copy_delay = Duration::from_secs(32);
+        let port = serve(engine.clone()).await;
+        let vllm = adapter(port, ParkPolicy::Enabled).with_residency(Residency::HostBacked);
+        let mut command = step(action, id);
+        command.context.deadline_ms = now_ms() + 90_000;
+        let outcome = vllm.execute_persisted(&command).await.unwrap();
+        let expected = if action == RuntimeAction::Park {
+            Milestone::MemoryReleased
+        } else {
+            Milestone::AllocationsRestored
+        };
+        assert_eq!(outcome.facts, vec![expected]);
+    };
+    tokio::join!(
+        run(RuntimeAction::Park, "slow-park"),
+        run(RuntimeAction::Restore, "slow-wake")
+    );
+}
+
+// T20: a missing copy acknowledgement is not proof of completion.
+#[tokio::test]
+async fn host_backed_copy_past_deadline_is_uncertain_and_not_repeated() {
+    use std::time::Duration;
+    for action in [RuntimeAction::Park, RuntimeAction::Restore] {
+        let engine = Shared::default();
+        engine.lock().unwrap().copy_delay = Duration::from_secs(32);
+        let port = serve(engine.clone()).await;
+        let vllm = adapter(port, ParkPolicy::Enabled).with_residency(Residency::HostBacked);
+        let mut command = step(action, "expired-copy");
+        command.context.deadline_ms = now_ms() + 1_000;
+        assert!(matches!(
+            vllm.execute_persisted(&command).await,
+            Err(RuntimeError::Uncertain(_))
+        ));
+        assert_eq!(engine.lock().unwrap().calls.len(), 1);
+        assert_eq!(
+            vllm.execute_persisted(&step(action, "retry-copy"))
+                .await
+                .unwrap_err(),
+            RuntimeError::Unsupported
+        );
+        assert_eq!(engine.lock().unwrap().calls.len(), 1);
+    }
 }
 
 /// ADR 0010: the level follows the declared residency; `deep` still sleeps at

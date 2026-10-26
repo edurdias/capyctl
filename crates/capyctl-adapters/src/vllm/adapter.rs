@@ -553,10 +553,13 @@ impl EngineAdapter for VllmAdapter {
         self.require_policy("park")?;
         let outcome = self
             .http
-            .sleep(match level {
-                ParkLevel::One => 1,
-                ParkLevel::Two => 2,
-            })
+            .sleep(
+                match level {
+                    ParkLevel::One => 1,
+                    ParkLevel::Two => 2,
+                },
+                std::time::Duration::from_secs(crate::vllm::http::ENGINE_CONTROL_TIMEOUT_SECS),
+            )
             .await
             .map_err(|e| Self::uncertain_http("park", e))?;
         match outcome {

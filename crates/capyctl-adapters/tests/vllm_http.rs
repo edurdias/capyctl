@@ -17,6 +17,8 @@ use std::sync::Arc;
 /// The adapter-level reload bound the collective is given here.
 const RELOAD: std::time::Duration =
     std::time::Duration::from_secs(capyctl_adapters::vllm::http::WEIGHT_RELOAD_TIMEOUT_SECS);
+const CONTROL: std::time::Duration =
+    std::time::Duration::from_secs(capyctl_adapters::vllm::http::ENGINE_CONTROL_TIMEOUT_SECS);
 
 #[derive(Clone, Default)]
 struct MockState {
@@ -158,7 +160,7 @@ async fn sleep_applies_and_wake_applies() {
     let (addr, st) = spawn_mock().await;
     let http = EngineHttp::new(format!("http://{addr}").parse().unwrap(), None);
     assert!(matches!(
-        http.sleep(2).await.unwrap(),
+        http.sleep(2, CONTROL).await.unwrap(),
         SleepOutcome::Applied
     ));
     assert_eq!(st.sleep_hit.load(Ordering::SeqCst), 1);
@@ -183,7 +185,10 @@ async fn sleep_with_dropped_response_is_uncertain() {
         // Drop without responding (sock dropped at scope end).
     });
     let http = EngineHttp::new(format!("http://{addr}").parse().unwrap(), None);
-    assert!(matches!(http.sleep(2).await, Err(HttpError::Uncertain(_))));
+    assert!(matches!(
+        http.sleep(2, CONTROL).await,
+        Err(HttpError::Uncertain(_))
+    ));
 }
 
 #[tokio::test]
@@ -249,7 +254,7 @@ async fn engine_client_never_follows_a_redirect() {
     );
     assert!(http.list_models().await.is_err());
     assert!(http.is_sleeping().await.is_err());
-    assert!(http.sleep(1).await.is_err());
+    assert!(http.sleep(1, CONTROL).await.is_err());
     assert!(http.wake().await.is_err());
     assert!(http.collective_rpc(RELOAD).await.is_err());
     assert_eq!(target_hits.load(Ordering::SeqCst), 0);
@@ -364,9 +369,9 @@ async fn drive_every_route(http: &EngineHttp) {
     http.chat_completion_stream(&serde_json::json!({"model": "toy-model"}), |_| {})
         .await
         .unwrap();
-    http.sleep(1).await.unwrap();
+    http.sleep(1, CONTROL).await.unwrap();
     http.wake().await.unwrap();
-    http.wake_tag(capyctl_adapters::vllm::WakeTag::Weights)
+    http.wake_tag(capyctl_adapters::vllm::WakeTag::Weights, CONTROL)
         .await
         .unwrap();
     assert!(!http.is_sleeping().await.unwrap());
@@ -408,7 +413,7 @@ async fn control_routes_take_the_admin_key_and_inference_takes_the_inference_key
     // The inference key alone opens nothing on the control surface.
     seen.lock().unwrap().clear();
     let inference_only = EngineHttp::new(base, Some("inference-key".into()));
-    assert!(inference_only.sleep(1).await.is_err());
+    assert!(inference_only.sleep(1, CONTROL).await.is_err());
     assert!(inference_only.is_sleeping().await.is_err());
     assert!(inference_only.collective_rpc(RELOAD).await.is_err());
     assert!(inference_only.reset_prefix_cache().await.is_err());

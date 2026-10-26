@@ -217,11 +217,12 @@ impl EngineHttp {
         Ok(ids)
     }
 
-    /// `POST /sleep?level=N`. A transport failure after dispatch maps to
-    /// `Uncertain` — the effect may or may not have been applied.
-    pub async fn sleep(&self, level: u8) -> Result<SleepOutcome, HttpError> {
+    /// `POST /sleep?level=N`, bounded by the caller's operation window.
+    /// A transport failure after dispatch maps to `Uncertain` — the effect
+    /// may or may not have been applied.
+    pub async fn sleep(&self, level: u8, timeout: Duration) -> Result<SleepOutcome, HttpError> {
         let url = self.url(&format!("/sleep?level={level}"));
-        let req = self.control(self.admin_auth(self.client.post(url)));
+        let req = self.admin_auth(self.client.post(url)).timeout(timeout);
         self.post_outcome(req, "sleep")
             .await
             .map(|()| SleepOutcome::Applied)
@@ -236,12 +237,17 @@ impl EngineHttp {
             .map(|()| WakeOutcome::Applied)
     }
 
-    /// `POST /wake_up?tags=<tag>`: wake one allocation class only. SPEC §9.1
-    /// restores a level-2 park in order: weights, `reload_weights`, then KV,
-    /// so the two wakes are separate controls with separate evidence.
-    pub async fn wake_tag(&self, tag: WakeTag) -> Result<WakeOutcome, HttpError> {
+    /// `POST /wake_up?tags=<tag>`, bounded by the caller's operation window:
+    /// a host-backed weights wake copies the weights from CPU memory.
+    /// SPEC §9.1 restores a level-2 park in order: weights, `reload_weights`,
+    /// then KV, with separate controls and evidence.
+    pub async fn wake_tag(
+        &self,
+        tag: WakeTag,
+        timeout: Duration,
+    ) -> Result<WakeOutcome, HttpError> {
         let url = self.url(&format!("/wake_up?tags={}", tag.as_str()));
-        let req = self.control(self.admin_auth(self.client.post(url)));
+        let req = self.admin_auth(self.client.post(url)).timeout(timeout);
         self.post_outcome(req, "wake_up")
             .await
             .map(|()| WakeOutcome::Applied)
