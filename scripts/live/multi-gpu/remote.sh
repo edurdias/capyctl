@@ -434,7 +434,16 @@ startd() { # name [start options]: Ready by --wait
   fi
   return "$rc"
 }
-stopd() { c stop deployment "$1" >>"$RES/cli.log" 2>&1; waitgone; pause 5; }
+stopd() {
+  local n=$1 st
+  c stop deployment "$n" >>"$RES/cli.log" 2>&1 || return 1
+  # Process disappearance precedes durable cleanup. MG6 must not start the
+  # next engine or inspect released charges until the controller settles stop.
+  st=$(poll_state "$n" 600 stopped)
+  status_json "$n" "$RES/stop-$n-status.json"
+  [ "$st" = stopped ] || { say "stop $n did not settle: $st"; return 1; }
+  waitgone
+}
 status_json() { c status deployment "$1" --json >"$2" 2>>"$RES/cli.log"; }
 state_of() {
   [ "$PLAN" = 1 ] && { echo "${2:-ready}"; return 0; }
@@ -751,10 +760,11 @@ launch_server(native)
 '
 
 # MG4, MG5, MG6: park and wake cycles; per-GPU readings after each.
-cycles() { # row name count label
-  local row=$1 n=$2 k=$3 l=$4 i st r pids ok=0
+cycles() { # row name count label [engine: capture explicit command baseline]
+  local row=$1 n=$2 k=$3 l=$4 engine=${5:-} i st r pids ok=0
   check "$row" "$l" "$k park and wake cycles: each park settles (parked) with both GPUs' owned bytes down; each wake Ready with the canary request answering 42 and both GPUs' bytes back"
   startd "$n" || { result "$row" "$l" fail "start failed; see start-$n-status and start-$n-events"; stopd "$n"; return; }
+  if [ -n "$engine" ]; then latest_args "$engine" "$n" >"$RES/$row-args.json"; fi
   for i in $(seq "$k"); do
     c park deployment "$n" >>"$RES/cli.log" 2>&1
     st=$(poll_state "$n" 600 parked failed)
@@ -877,9 +887,9 @@ engine_config: {context_length: 16384}"
     if want MG8; then phase "MG8 vLLM"; rank_hang mg-v vllm; fi
     if want MG9; then phase "MG9 vLLM"; bench_pair mg-v v32 vllm; fi
   fi
-  if want MG2 MG7 MG8 MG9 MG13; then
+  if want MG2 MG7 MG8 MG9; then
     deploy mg-s || result MG2 deploy fail "refused: $(tr '\n' ' ' <"$RES/deploy-mg-s.out" | cut -c1-300)"
-    if want MG2 MG13; then phase "MG2 SGLang 0.5.22 TP 2 (also MG13's argument baseline)"; serve_check MG2 mg-s s22; stopd mg-s; fi
+    if want MG2; then phase "MG2 SGLang 0.5.22 TP 2"; serve_check MG2 mg-s s22; stopd mg-s; fi
     if want MG7; then phase "MG7 SGLang"; shm_stop mg-s sglang; rank_kill mg-s sglang; fi
     if want MG8; then phase "MG8 SGLang"; rank_hang mg-s sglang; fi
     if want MG9; then phase "MG9 SGLang"; bench_pair mg-s s22 sglang; fi
@@ -918,12 +928,12 @@ residency: deep
 engine_config: {context_length: 32768}"
     deploy mg4 && cycles MG4 mg4 "$CYCLES" deep || result MG4 deep fail "deploy failed; see deploy-mg4.out"
   fi
-  if want MG5; then
+  if want MG5 MG13; then
     phase "MG5 SGLang TP 2 deep"
     dep mg5 s22 "$(q30)" "topology: {tensor_parallel: 2}
 residency: deep
 engine_config: {context_length: 32768}"
-    deploy mg5 && cycles MG5 mg5 "$CYCLES" deep || result MG5 deep fail "deploy failed; see deploy-mg5.out"
+    deploy mg5 && cycles MG5 mg5 "$CYCLES" deep sglang || result MG5 deep fail "deploy failed; see deploy-mg5.out"
   fi
   if want MG6; then
     phase "MG6 host_backed, vLLM and SGLang TP 2"
@@ -959,21 +969,24 @@ residency: restart_only
 engine_config: {context_length: 32768, memory: {kv_cache: 30GiB}}"
     local seq0 st r
     if deploy mg10-tp2 && deploy mg10-one && startd mg10-tp2; then
-      c park deployment mg10-tp2 >>"$RES/cli.log" 2>&1
-      poll_state mg10-tp2 600 parked >/dev/null
-      startd mg10-one
-      seq0=$(event_seq)
-      check MG10 switch "a request to the parked TP 2 model wakes it: the planner evicts the single-GPU model; the switch record names gpu0 and gpu1"
-      r=$(chat mg10-tp2 mg10)
-      st=$(state_of mg10-one stopped)
-      if [ "$PLAN" = 0 ]; then
-        events_since "$seq0" >"$RES/mg10-events.jsonl"
-        "${HELPER[@]}" sql "$DB" "SELECT switch_id,phase,victims_json FROM active_switches" >"$RES/mg10-switches.tsv"
-        if [ "${r%% *}" = 200 ] && [ "${r##* }" = ok ] && [ "$st" != ready ] && grep -q gpu0 "$RES/mg10-events.jsonl" && grep -q gpu1 "$RES/mg10-events.jsonl"; then
-          result MG10 switch pass "request ${r}; single-GPU model $st; events name gpu0 and gpu1"
-        else
-          result MG10 switch fail "request ${r:-none}; single-GPU model '$st'; see mg10-events.jsonl"
+      if c park deployment mg10-tp2 >>"$RES/cli.log" 2>&1 &&
+         [ "$(poll_state mg10-tp2 600 parked failed)" = parked ] &&
+         startd mg10-one; then
+        seq0=$(event_seq)
+        check MG10 switch "a request to the parked TP 2 model wakes it: the planner evicts the single-GPU model; the switch record names gpu0 and gpu1"
+        r=$(chat mg10-tp2 mg10)
+        st=$(state_of mg10-one stopped)
+        if [ "$PLAN" = 0 ]; then
+          events_since "$seq0" >"$RES/mg10-events.jsonl"
+          "${HELPER[@]}" sql "$DB" "SELECT switch_id,phase,victims_json FROM active_switches" >"$RES/mg10-switches.tsv"
+          if [ "${r%% *}" = 200 ] && [ "${r##* }" = ok ] && [ "$st" != ready ] && grep -q gpu0 "$RES/mg10-events.jsonl" && grep -q gpu1 "$RES/mg10-events.jsonl"; then
+            result MG10 switch pass "request ${r}; single-GPU model $st; events name gpu0 and gpu1"
+          else
+            result MG10 switch fail "request ${r:-none}; single-GPU model '$st'; see mg10-events.jsonl"
+          fi
         fi
+      else
+        result MG10 switch fail "park or single-GPU start failed; see cli.log"
       fi
       stopd mg10-tp2
       stopd mg10-one
@@ -1019,7 +1032,7 @@ engine_config: {context_length: 32768}"
           result MG13 n1 pass "tensor_parallel 1; 'TP auto (1)'; arguments equal" ||
           result MG13 n1 fail "tensor_parallel '$tp'; TP auto lines $txt; arguments equal: $([ "$a" = "$b" ] && echo yes || echo no)"
       fi
-      check MG13 n2 "with the 4B model serving on gpu0, the 30B model started with --evict chooses N = 2 (status 'TP auto (2)'), its SGLang arguments equal MG2's, and the 4B model is evicted"
+      check MG13 n2 "with the 4B model serving on gpu0, the 30B model started with --evict chooses N = 2 (status 'TP auto (2)'), its SGLang arguments equal MG5's explicit TP 2 deep launch, and the 4B model is evicted"
       if ! startd mg13-30b --evict; then
         result MG13 n2 fail "automatic two-GPU start failed; see start-mg13-30b.out"
         result MG13 wake fail "blocked by failed automatic two-GPU start"
@@ -1031,16 +1044,16 @@ engine_config: {context_length: 32768}"
       if [ "$PLAN" = 0 ]; then
         tp=$("${HELPER[@]}" get "$RES/mg13-30b.json" 'instances[0].topology.tensor_parallel')
         devs=$("${HELPER[@]}" get "$RES/mg13-30b.json" 'instances[0].topology.devices')
-        a=$(cat "$RES/MG2-args.json" 2>/dev/null)
+        a=$(cat "$RES/MG5-args.json" 2>/dev/null)
         printf '%s\n' "$a" >"$RES/mg13-baseline-args.json"
         st=$(state_of mg13-4b)
         [ "$tp" = 2 ] && grep -q 'TP auto (2)' "$RES/mg13-30b.txt" && [ "$st" != ready ] && [ -n "$a" ] && [ "$a" != "{}" ] && [ "$a" = "$b" ] &&
-          result MG13 n2 pass "tensor_parallel 2 on $devs; 4B model $st; arguments equal MG2's" ||
-          result MG13 n2 fail "tensor_parallel '$tp'; 4B model '$st'; arguments equal MG2's: $([ "$a" = "$b" ] && echo yes || echo no)"
+          result MG13 n2 pass "tensor_parallel 2 on $devs; 4B model $st; arguments equal MG5's explicit deep launch" ||
+          result MG13 n2 fail "tensor_parallel '$tp'; 4B model '$st'; arguments equal MG5's: $([ "$a" = "$b" ] && echo yes || echo no)"
       fi
       check MG13 wake "the 30B model parked and woken keeps N = 2 and the same GPUs"
       if ! c park deployment mg13-30b >>"$RES/cli.log" 2>&1 ||
-         ! poll_state mg13-30b 600 parked >/dev/null ||
+         [ "$(poll_state mg13-30b 600 parked failed)" != parked ] ||
          ! c start deployment mg13-30b --wait >>"$RES/cli.log" 2>&1; then
         result MG13 wake fail "park or wake failed; see cli.log"
         role_down

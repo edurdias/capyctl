@@ -232,6 +232,32 @@ A further native run remains required. After a temporary capacity shortage,
 the provider again offered a qualifying two-A6000 machine with 128 GB RAM.
 The PR remains draft and the shipped multi-GPU parking switches remain off.
 
+The next full run passed the llama.cpp allocation diagnostic and retained
+parseable journals. It exposed a SGLang enrollment defect: 0.5.22 stores its
+tensor-parallel rank in the process-local runtime context, not the Scheduler.
+Enrollment now reads that context when the Scheduler has no rank field,
+retaining the existing range check and refusal on unavailable evidence.
+The rank-one regression failed before the fix; all 21 enrollment tests pass
+after it. A smoke check against the installed SGLang context enrolled rank one
+and served its authenticated observation socket. This is not yet proof of
+native deep parking.
+
+MG6 also exposed a harness race: process exit preceded controller cleanup,
+so the next engine could start before the previous reservation was released.
+The stop helper now waits for the stopped state and saves its status before
+checking released charges or moving on. A delayed-cleanup shell smoke returned
+too early before the change and waited for settlement afterward.
+MG10 separately failed with a changing process-group observation at launch;
+that failure remains unresolved and the ownership checks remain unchanged.
+
+MG13 chose the expected GPU counts and evicted the smaller model, but its
+command differed from MG2 only in the required memory-saver switch: MG2 was
+`restart_only`, MG13 `deep`. The owner clarified on 2026-10-26 that the
+comparison must use identical residency. MG13 now compares exactly against
+MG5's explicit TP 2 deep command, also captured in an MG13-only run.
+MG10 and MG13 additionally require an observed parked state before testing
+a wake; a successful polling command alone does not establish that state.
+
 
 # Release note: Several GPUs
 

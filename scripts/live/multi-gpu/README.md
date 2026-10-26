@@ -126,7 +126,7 @@ Fewer than five deep cycles or three host-backed cycles cannot qualify.
 | MG5 | s2 | SGLang TP 2 `deep`: 5 cycles | as MG4 |
 | MG6 | s2 | vLLM and SGLang TP 2 `host_backed`: 3 cycles each | as MG4, and nothing of the deployment left in the ledger after each stop |
 | MG10 | s2 | the 30B model (SGLang, TP 2, `deep`) parked; the 4B model on gpu0 with a 30 GiB KV cache; a request to the 30B model | the request answers, the 4B model is evicted, and the switch's events name gpu0 and gpu1 |
-| MG13 | s2 | `topology: auto`: the 4B model on vLLM (against an explicit single-GPU deployment), then the 30B model on SGLang with the 4B model serving, then park/wake | N = 1 and `TP auto (1)` with equal nonempty arguments; N = 2 and `TP auto (2)`, arguments equal MG2's captured baseline, and the 4B model evicted; the wake preserves N and devices and answers the canary |
+| MG13 | s2 | `topology: auto`: the 4B model on vLLM (against an explicit single-GPU deployment), then the 30B model on SGLang with the 4B model serving, then park/wake | N = 1 and `TP auto (1)` with equal nonempty arguments; N = 2 and `TP auto (2)`, arguments equal MG5's captured explicit TP 2 deep baseline with identical residency, and the 4B model evicted; the wake preserves N and devices and answers the canary |
 | MG11 | srv | a control-plane server, a host of this build and an older host (`v0.1.8`), all on loopback on the machine; MG1's deployment on each | Ready and answering through the server on the new host; on the older host refused `host_capability_missing:local_tensor_parallel` with no engine started |
 
 Role `s1` runs `capyctl`, role `s2` `capyctl-qualify`; each role has its own
@@ -147,7 +147,7 @@ engine installs, the llama.cpp build), the 30B download at the machine's
 bandwidth (61 GB; 10 minutes at 1 Gbit/s), then the rows about 2.5 hours, most
 of it engine starts of the 30B model. `--only` with `--keep` and later
 `--skip-setup` can split a session while the same supervised rental remains
-authorized. An MG13-only attempt also captures MG2's argument baseline.
+authorized. An MG13-only attempt also runs MG5 to capture its explicit deep baseline.
 `--purge-only` copies existing exported evidence before removing the session.
 
 ## Output and cleanup

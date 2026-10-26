@@ -133,6 +133,12 @@ framing/authentication, and `sglang_observation_server` protected Unix listener.
 No helper imports an engine or converts allocation facts into Ready, idle,
 release, residency, or qualification evidence; the host fuses them with its own.
 
+On a launch across several GPUs, enrollment reads the scheduler's `tp_rank`
+when present. SGLang 0.5.22 instead keeps it in the initialized process-local
+`sglang.srt.runtime_context.get_parallel()` context. That already-loaded
+context supplies the rank when the scheduler has no such field. Missing,
+non-integer or out-of-plan ranks refuse enrollment; none defaults to rank zero.
+
 `SchedulerObservationServer.start(...)` requires the exact current scheduler
 identity and a separately enrolled live controller identity. It creates a new
 socket only, under a canonical service-owned 0700 directory whose ancestors

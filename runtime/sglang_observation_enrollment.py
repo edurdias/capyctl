@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import stat
+import sys
 
 # Environment the protected entry sets for its spawned children (validated there).
 ENV_DIR = "CAPYCTL_OBSERVATION_DIR"
@@ -222,7 +223,15 @@ def enroll(scheduler):
         rank = 0
         if tensor_parallel is not None:
             stage = "rank"
-            rank = saver._fields(scheduler).get("tp_rank")
+            fields = saver._fields(scheduler)
+            if "tp_rank" in fields:
+                rank = fields["tp_rank"]
+            else:
+                # SGLang 0.5.22 publishes rank placement before constructing
+                # Scheduler. Read its already-loaded context, never infer rank
+                # from GPU ordinals or default an unavailable rank to zero.
+                context = sys.modules["sglang.srt.runtime_context"]
+                rank = vars(context)["get_parallel"]().tp_rank
             if type(rank) is not int or not 0 <= rank < tensor_parallel:
                 raise ValueError("rank")
         name = enrollment_name(binding, rank)

@@ -729,13 +729,18 @@ refused `host_capability_missing:local_tensor_parallel`.
 | MG10 | Switching: a TP 2 model parked, a single-GPU model started on one card, then the TP 2 model requested | the planner evicts the single-GPU model and the TP 2 model wakes; the switch record names both GPUs |
 | MG11 | Enrolled host: the rented machine as a host of the control-plane server; and a host without the capability | MG1 passes remotely; the older host is refused before anything is sent |
 | MG12 | Refusals: TP 3 on two GPUs; pinned count mismatch | `insufficient_gpus`; `topology_devices_mismatch` |
-| MG13 | `topology: auto`: Qwen3-4B on vLLM; Qwen3-30B-A3B on SGLang; then, with the 4B model serving on gpu0, the 30B model started; the 30B model parked and woken | the 4B model chooses N = 1 and its effective command equals an explicit single-GPU deployment's; the 30B model chooses N = 2 and its command equals MG2's; status shows `TP auto (1)` and `TP auto (2)`; with gpu0 busy the 30B model still chooses 2 and the 4B model is evicted; the wake keeps N = 2 and the same GPUs |
+| MG13 | `topology: auto`: Qwen3-4B on vLLM; Qwen3-30B-A3B on SGLang; then, with the 4B model serving on gpu0, the 30B model started; the 30B model parked and woken | the 4B model chooses N = 1 and its effective command equals an explicit single-GPU deployment's; the 30B model chooses N = 2 and its command equals MG5's explicit TP 2 deep launch with the same residency; status shows `TP auto (1)` and `TP auto (2)`; with gpu0 busy the 30B model still chooses 2 and the 4B model is evicted; the wake keeps N = 2 and the same GPUs |
 | MG14 | Refusals name what would fit: Qwen3-30B-A3B with `tensor_parallel: 1`; the same under `auto` with a declared `memory.kv_cache` no two cards hold | `insufficient_device_memory` with the hint naming `tensor_parallel: 2`; `insufficient_device_memory` naming the per-GPU charge at N = 2 and the cards that would hold it |
 
 All rows and the download bandwidth test run in the one rental session (§14). MG4 and MG5
 flip each engine's `deep_park` in the support data when they pass (owner decision 3); an
 engine whose row fails keeps `restart_only` at N > 1. MG1–MG3, MG6–MG9 and MG13 are
 required before the release notes say the feature is qualified.
+
+Owner clarification, 2026-10-26: MG13 compares identical residency settings.
+MG2 uses `restart_only`, whereas MG13's park/wake requires `deep`; their
+memory-saver switches must differ. MG5 supplies the explicit TP 2 deep baseline,
+so the command comparison remains exact rather than ignoring that switch.
 
 ## Owner decisions of 2026-10-25
 

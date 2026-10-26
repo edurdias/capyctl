@@ -408,7 +408,14 @@ class EnrollmentTests(unittest.TestCase):
                                   return_value=self.fakes.driver).start()
                 self.fakes.scheduler.server_args = ServerArgs(tp_size=2,
                                                               admin_api_key="a" * 64)
-                self.fakes.scheduler.tp_rank = rank
+                if rank == 0:
+                    self.fakes.scheduler.tp_rank = rank
+                else:
+                    # SGLang 0.5.22 keeps ranks in its published process context,
+                    # not on Scheduler. Exercise the same real enrollment/socket.
+                    context = types.ModuleType("sglang.srt.runtime_context")
+                    context.get_parallel = lambda: types.SimpleNamespace(tp_rank=rank)
+                    mock.patch.dict(sys.modules, {context.__name__: context}).start()
                 self.assertTrue(enrollment.entry_environment(
                     self.directory.name, BINDING, INCARNATION, tensor_parallel=2))
                 self.assertEqual(os.environ[enrollment.ENV_TP], "2")
@@ -422,6 +429,25 @@ class EnrollmentTests(unittest.TestCase):
         names = sorted(os.listdir(self.directory.name))
         self.assertIn(BINDING + ".rank1.json", names)
         self.assertIn(BINDING + ".json", names)
+
+    # T46 T22: unavailable or invalid process-local rank is never rank zero.
+    def test_missing_scheduler_rank_requires_a_valid_parallel_context(self):
+        from test_sglang_saver_residency import ServerArgs
+        self.fakes.scheduler.server_args = ServerArgs(tp_size=2)
+        self.fakes.scheduler.__dict__.pop("tp_rank", None)
+        for rank in (None, True, -1, 2):
+            with self.subTest(rank=rank):
+                context = types.ModuleType("sglang.srt.runtime_context")
+                context.get_parallel = lambda: types.SimpleNamespace(tp_rank=rank)
+                with mock.patch.dict(sys.modules, {context.__name__: context}):
+                    self.assertTrue(enrollment.entry_environment(
+                        self.directory.name, BINDING, INCARNATION, tensor_parallel=2))
+                    self.assertFalse(enrollment.enroll(self.fakes.scheduler))
+        with mock.patch.dict(sys.modules, {"sglang.srt.runtime_context": None}):
+            self.assertTrue(enrollment.entry_environment(
+                self.directory.name, BINDING, INCARNATION, tensor_parallel=2))
+            self.assertFalse(enrollment.enroll(self.fakes.scheduler))
+        self.assertFalse(list(Path(self.directory.name).glob("*.json")))
 
     # T46 T22: a rank outside the plan, a scheduler whose tp_size is not the
     # plan's N, and a scope that is no launch on several GPUs enroll nothing.
