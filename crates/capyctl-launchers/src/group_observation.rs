@@ -76,7 +76,21 @@ pub fn observe_process_group(
     let first = snapshot(expected_api.pid, &boot)?;
     validate_api(expected_api, &first)?;
     let second = snapshot(expected_api.pid, &boot)?;
-    if read_boot()? != boot || read_bounded("/proc/mounts", MAX_METADATA_BYTES)? != mounts {
+    let change = if read_boot()? != boot {
+        Some("boot identity")
+    } else if read_bounded("/proc/mounts", MAX_METADATA_BYTES)? != mounts {
+        Some("mount table")
+    } else {
+        None
+    };
+    if let Some(change) = change {
+        capyctl_domain::role_log::notice(
+            capyctl_domain::role_log::Level::Notice,
+            &format!(
+                "process group {} observation changed: {change}",
+                expected_api.pid
+            ),
+        );
         return Err(GroupObservationError::Changed);
     }
     finish(expected_api, first, second)
@@ -473,6 +487,16 @@ fn finish(
     validate_api(expected, &first)?;
     validate_api(expected, &second)?;
     if first != second {
+        // Retain only kernel identities, never argv or environment. A failed
+        // launch otherwise loses the facts needed to distinguish child churn
+        // from a host mount-table change. Neither permits an ownership claim.
+        capyctl_domain::role_log::notice(
+            capyctl_domain::role_log::Level::Notice,
+            &format!(
+                "group {}: membership changed; first={first:?}; second={second:?}",
+                expected.pid
+            ),
+        );
         return Err(GroupObservationError::Changed);
     }
     Ok(ProcessGroupObservation {

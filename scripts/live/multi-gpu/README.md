@@ -127,13 +127,31 @@ Fewer than five deep cycles or three host-backed cycles cannot qualify.
 | MG6 | s2 | vLLM and SGLang TP 2 `host_backed`: 3 cycles each | as MG4, and nothing of the deployment left in the ledger after each stop |
 | MG10 | s2 | the 30B model (SGLang, TP 2, `deep`) parked; the 4B model on gpu0 with a 30 GiB KV cache; a request to the 30B model | the request answers, the 4B model is evicted, and the switch's events name gpu0 and gpu1 |
 | MG13 | s2 | `topology: auto`: the 4B model on vLLM (against an explicit single-GPU deployment), then the 30B model on SGLang with the 4B model serving, then park/wake | N = 1 and `TP auto (1)` with equal nonempty arguments; N = 2 and `TP auto (2)`, arguments equal MG5's captured explicit TP 2 deep baseline with identical residency, and the 4B model evicted; the wake preserves N and devices and answers the canary |
-| MG11 | srv | a control-plane server, a host of this build and an older host (`v0.1.8`), all on loopback on the machine; MG1's deployment on each | Ready and answering through the server on the new host; on the older host refused `host_capability_missing:local_tensor_parallel` with no engine started |
+| MG11 | srv | a control-plane server, a host of this build and an older host (`v0.1.8`), all on loopback on the machine; MG1's deployment on each | Full MG1 serving evidence on the new host: Ready/chat, owned per-GPU use within reservations, loopback-only listeners and TP 2/loopback collectives status, measured startup peaks; on the older host refused `host_capability_missing:local_tensor_parallel` with no engine started |
 
 Role `s1` runs `capyctl`, role `s2` `capyctl-qualify`; each role has its own
 state and config directories under `~/mg`, listens on `127.0.0.1:--port` and
 runs one deployment at a time. Rank processes are found in the role's ledger
 (the identities each launch recorded, ADR 0035 §6), never by name, and are
 signalled only when their PID, start ticks and boot id still match.
+
+MG11 uses the same serving checks as MG1, including when selected alone. Its
+commands use the server configuration and its ledger is `state/srv/srv.sqlite3`.
+`MG11-owned.jsonl` retains the coordinator's recorded runtime-binding identities;
+the enrolled host is this same machine, so the collector can inspect their PIDs
+with `/proc`, `ss`, and NVIDIA tooling. Missing identities do not fall back to
+other GPU processes and cannot pass charge/listener checks. Remote identity or
+startup-measurement publication failures remain qualification failures, not
+permission to infer evidence. The strict collector requires the MG11 status,
+GPU use, charge, listeners, peaks, identities and deployment exports
+alongside chat and refusal outputs. The shared start helper now writes
+`start-mg11-new.out` (formerly `mg11-new-start.out`); `chat-mg11.json` is unchanged.
+Startup peaks must include positive measured bytes at TP 2 for `system` and a
+representative GPU domain, with measured host/device provenance. ADR0035 §3
+stores the largest selected GPU peak once and applies it to every identical GPU;
+it does not require a measurement record for each GPU. The legacy reservation-table
+export is diagnostic only; `MG11-charge.json` captures the authoritative
+resource-owner charges.
 
 MG4 and MG5 decide whether each engine's `deep_park` is set in the shipped
 support data (owner decision 3); an engine whose row fails keeps `restart_only`

@@ -598,7 +598,7 @@ EXPECTED = {
     "MG6": ("vllm", "sglang", "released"),
     "MG7": ("vllm stop", "vllm kill", "sglang stop", "sglang kill"),
     "MG8": ("vllm", "sglang"), "MG9": ("vllm", "sglang"),
-    "MG10": ("switch",), "MG11": ("remote", "old"),
+    "MG10": ("switch",), "MG11": ("remote", "charge", "listeners", "peaks", "old"),
     "MG12": ("tp3", "pin"), "MG13": ("n1", "n2", "wake"),
     "MG14": ("tp1", "auto"), "BW": ("q30",),
 }
@@ -627,11 +627,39 @@ def cmd_fit_check(a):
     return 0 if ok else 1
 
 
+def startup_peaks_complete(startup):
+    """ADR0035 §3 stores the largest GPU peak once, plus the host peak."""
+    try:
+        if any(startup.get(f"{kind}_provenance") != "measured" for kind in ("host", "device")):
+            return False
+        domains = {record["domain"] for record in startup["measured"]
+                   if record.get("tensor_parallel") == 2
+                   and type(record.get("peak_bytes")) is int and record["peak_bytes"] > 0}
+        return "system" in domains and any(
+            isinstance(domain, str) and re.fullmatch(r"gpu\d+", domain) for domain in domains)
+    except (KeyError, TypeError, AttributeError):
+        return False
+
+
+def cmd_peaks_check(a):
+    try:
+        ok = startup_peaks_complete(json.loads(Path(a.file).read_text()))
+    except (OSError, ValueError):
+        ok = False
+    print("positive measured TP2 host and representative per-GPU startup peaks" if ok else
+          "missing positive measured TP2 host or representative per-GPU startup peak")
+    return 0 if ok else 1
+
+
 def row_evidence(rid, settings):
-    if rid in ("MG1", "MG2", "MG3"):
+    if rid in ("MG1", "MG2", "MG3", "MG11"):
         files = [f"{rid}-{suffix}" for suffix in
                  ("status.json", "gpus.json", "charge.json", "listeners.json", "peaks.json")]
-        files.append(f"chat-{rid}.json")
+        files.append(f"chat-{'mg11' if rid == 'MG11' else rid}.json")
+        if rid == "MG11":
+            files.extend(("start-mg11-new.out", "mg11-new-deploy.out",
+                          "mg11-old-deploy.out", "mg11-old-start.out",
+                          "MG11-owned.jsonl", "MG11-deployments.tsv"))
         if rid == "MG3":
             files.extend(("MG3-fit.txt", "MG3-fit-replay.json", "MG3-fit-replay.log"))
         return files
@@ -659,7 +687,6 @@ def row_evidence(rid, settings):
                     for suffix in ("args.json", "hand-args.json", "hand.log")]
     return {
         "MG10": ["mg10-events.jsonl", "chat-mg10.json"],
-        "MG11": ["mg11-new-start.out", "mg11-old-deploy.out", "mg11-old-start.out", "chat-mg11.json"],
         "MG12": ["MG12-tp3.out", "MG12-pin.out"],
         "MG13": ["mg13-4b.json", "mg13-30b.json", "mg13-30b-woken.json",
                  "mg13-pinned-args.json", "mg13-n1-args.json", "mg13-n2-args.json", "mg13-baseline-args.json",
@@ -1027,6 +1054,8 @@ def main():
     s = sub.add_parser("fit-check")
     s.add_argument("log")
     s.add_argument("charge")
+    s = sub.add_parser("peaks-check")
+    s.add_argument("file")
     s = sub.add_parser("snapshot")
     s.add_argument("--root", required=True)
     s.add_argument("--attempt", required=True)

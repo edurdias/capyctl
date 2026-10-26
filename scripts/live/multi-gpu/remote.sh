@@ -335,7 +335,11 @@ setup() {
 # Roles, profiles, deployments
 # ---------------------------------------------------------------------------
 ROLE="" SD="" CRED="" DB="" ROLE_LOG="" CAPYCTL="" DEPLOYS="" PROFILES=""
-c() { run env XDG_CONFIG_HOME="$MG/cfg-$ROLE" "$CAPYCTL" --state-dir "$SD" "$@"; }
+c() {
+  local config=(--state-dir "$SD")
+  [ "$ROLE" != srv ] || config=(--config "$SD/server.yaml")
+  run env XDG_CONFIG_HOME="$MG/cfg-$ROLE" "$CAPYCTL" "${config[@]}" "$@"
+}
 
 role_up() { # tag binary [start standalone options]
   local tag=$1 bin=$2 _
@@ -513,16 +517,22 @@ events_since() { # after kinds... -> JSON lines
 
 # MG1, MG2, MG3: Ready, the probe answers, per-GPU charge against the cards' use,
 # peaks recorded, listeners on loopback only, `collectives: loopback` in status.
-serve_check() { # row name engine
-  local row=$1 n=$2 e=$3 r pids gpus lis charge tp coll
-  check "$row" ready "deploy and start $n; one chat through the router answers 42"
-  if ! startd "$n"; then result "$row" ready fail "start failed; see start-$n.out"; return 1; fi
-  r=$(chat "$n" "$row")
-  [ "${r%% *}" = 200 ] && [ "${r##* }" = ok ] && result "$row" ready pass "Ready in $START_S s; chat ${r}" || result "$row" ready fail "Ready in $START_S s; chat ${r:-none}"
+serve_check() { # row name engine [ready-part] [chat-tag]
+  local row=$1 n=$2 e=$3 ready=${4:-ready} chat_tag=${5:-$1} r pids gpus lis charge tp coll
+  check "$row" "$ready" "deploy and start $n; one chat through the router answers 42"
+  if ! startd "$n"; then result "$row" "$ready" fail "start failed; see start-$n.out"; return 1; fi
+  r=$(chat "$n" "$chat_tag")
+  [ "${r%% *}" = 200 ] && [ "${r##* }" = ok ] && result "$row" "$ready" pass "Ready in $START_S s; chat ${r}" || result "$row" "$ready" fail "Ready in $START_S s; chat ${r:-none}"
   status_json "$n" "$RES/$row-status.json"
   if [ "$e" = s22 ]; then latest_args sglang "$n" >"$RES/$row-args.json"; fi
   c status deployment "$n" >"$RES/$row-status.txt" 2>&1
-  pids=$(owned_pids "$n")
+  if [ "$PLAN" = 0 ]; then
+    # Remote launch receipts retain their real host process identities in the
+    # coordinator DB. MG11 enrolls this machine, so /proc and NVML see those
+    # same identities; never substitute unrelated GPU processes if absent.
+    "${HELPER[@]}" owned "$DB" "$n" >"$RES/$row-owned.jsonl"
+    pids=$(python3 -c 'import json,sys; print(",".join(str(json.loads(l)["pid"]) for l in open(sys.argv[1]) if l.strip()))' "$RES/$row-owned.jsonl")
+  else pids=0; fi
   check "$row" charge "each GPU's ledger charge covers the launch's own bytes on that card (nvidia-smi per process and GPU), and both GPUs hold part"
   if [ "$PLAN" = 0 ]; then
     gpus=$("${HELPER[@]}" gpus --pids "$pids"); echo "$gpus" >"$RES/$row-gpus.json"
@@ -553,7 +563,7 @@ PY
     tp=$("${HELPER[@]}" get "$RES/$row-status.json" 'instances[0].topology.tensor_parallel')
     r=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["off_loopback"]), len(d["ss_off_loopback"]), len(d["proc"]))' "$RES/$row-listeners.json")
     read -r off ssoff total <<<"$r"
-    if [ "$off" = 0 ] && [ "$ssoff" = 0 ] && [ "$coll" = loopback ] && [ "$tp" = 2 ]; then
+    if [ -n "$pids" ] && [ "$total" -gt 0 ] && [ "$off" = 0 ] && [ "$ssoff" = 0 ] && [ "$coll" = loopback ] && [ "$tp" = 2 ]; then
       result "$row" listeners pass "$total listeners, all loopback; collectives $coll; tensor_parallel $tp"
     else
       result "$row" listeners fail "off loopback: proc $off, ss $ssoff; collectives '${coll}'; tensor_parallel '${tp}'"
@@ -562,9 +572,9 @@ PY
   check "$row" peaks "after the start the role holds a measured startup figure for this revision (status startup.measured; per GPU at N = 2, ADR 0035 §3)"
   if [ "$PLAN" = 0 ]; then
     "${HELPER[@]}" get "$RES/$row-status.json" startup >"$RES/$row-peaks.json"
-    if [ "$("${HELPER[@]}" get "$RES/$row-status.json" 'startup.measured[0]')" != "" ]; then
-      result "$row" peaks pass "$(tr '\n' ' ' <"$RES/$row-peaks.json" | cut -c1-300)"
-    else result "$row" peaks fail "no measured startup figure in status: $(cut -c1-200 "$RES/$row-peaks.json")"; fi
+    if r=$("${HELPER[@]}" peaks-check "$RES/$row-peaks.json"); then
+      result "$row" peaks pass "$r; see $row-peaks.json"
+    else result "$row" peaks fail "$r; see $row-peaks.json"; fi
   fi
   [ "$e" = lc ] || return 0
   check "$row" fit "after the managed stop, replay its exact argv/environment with only verbosity 4; llama.cpp's model buffers fit each grant"
@@ -1091,7 +1101,7 @@ rows_enrolled() {
   phase "MG11 enrolled host: server, host (this build) and an older host ($OLD_TAG) on loopback"
   if [ "$PLAN" = 0 ] && [ ! -x "$BIN/capyctl-old" ]; then skip MG11 old "no $OLD_TAG build"; fi
   local srv=$STATE/srv h1=$STATE/h1 h0=$STATE/h0 r out rc
-  ROLE=srv SD=$srv CAPYCTL=$BIN/capyctl CRED=$srv/identity/server-credentials.json DB=$srv/server/srv.sqlite3
+  ROLE=srv SD=$srv CAPYCTL=$BIN/capyctl CRED=$srv/identity/server-credentials.json DB=$srv/srv.sqlite3
   run mkdir -m 700 -p "$srv" "$h1" "$h0" "$MG/cfg-srv"
   run env CAPYCTL_STATE_DIR="$srv" "$CAPYCTL" init server --output "$srv/init.json"
   run python3 - "$srv/init.json" "$srv/server.yaml" "$PORT" "$MPORT" <<'PY'
@@ -1144,20 +1154,12 @@ engine_config: {context_length: 32768}"
   dep mg11-old v32 "$(q30)" "host: mg-old
 topology: {tensor_parallel: 2}
 engine_config: {context_length: 32768}"
-  check MG11 remote "MG1's deployment on the enrolled host: Ready and answering through the server's router"
-  srvc() { run env XDG_CONFIG_HOME="$MG/cfg-srv" "$CAPYCTL" --config "$srv/server.yaml" "$@"; }
-  srvc deploy model --file "$MG/dep/mg11-new.yaml" >"$RES/mg11-new-deploy.out" 2>&1
-  srvc start deployment mg11-new --wait >"$RES/mg11-new-start.out" 2>&1
-  rc=$?
-  r=$(chat mg11-new mg11)
-  if [ "$PLAN" = 0 ]; then
-    [ "$rc" = 0 ] && [ "${r%% *}" = 200 ] && [ "${r##* }" = ok ] && result MG11 remote pass "Ready; chat $r" || result MG11 remote fail "start exit $rc; chat ${r:-none}"
-  fi
-  srvc stop deployment mg11-new >>"$RES/cli.log" 2>&1
-  waitgone
+  c deploy model --file "$MG/dep/mg11-new.yaml" >"$RES/mg11-new-deploy.out" 2>&1
+  serve_check MG11 mg11-new v32 remote mg11
+  stopd mg11-new
   check MG11 old "the same deployment on the older host is refused host_capability_missing:local_tensor_parallel and no engine starts"
-  srvc deploy model --file "$MG/dep/mg11-old.yaml" >"$RES/mg11-old-deploy.out" 2>&1
-  srvc start deployment mg11-old --wait >"$RES/mg11-old-start.out" 2>&1
+  c deploy model --file "$MG/dep/mg11-old.yaml" >"$RES/mg11-old-deploy.out" 2>&1
+  c start deployment mg11-old --wait >"$RES/mg11-old-start.out" 2>&1
   rc=$?
   if [ "$PLAN" = 0 ]; then
     out=$(cat "$RES/mg11-old-deploy.out" "$RES/mg11-old-start.out" | tr '\n' ' ' | cut -c1-400)
@@ -1167,8 +1169,8 @@ engine_config: {context_length: 32768}"
       result MG11 old fail "exit $rc: $out"
     fi
   fi
-  srvc delete deployment mg11-new --stop >>"$RES/cli.log" 2>&1
-  srvc delete deployment mg11-old --stop >>"$RES/cli.log" 2>&1
+  c delete deployment mg11-new --stop >>"$RES/cli.log" 2>&1
+  c delete deployment mg11-old --stop >>"$RES/cli.log" 2>&1
   waitgone
   local pf pid
   for pf in "$h1/host.pid" "$h0/host.pid" "$ATTEMPT/srv.pid"; do

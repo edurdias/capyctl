@@ -59,6 +59,60 @@ class EvidenceTests(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertIn("MG12-tp3.out", report["rows"]["MG12"]["missing_evidence"])
 
+    def test_startup_peaks_require_host_and_representative_device_measurements(self):
+        records = [{"domain": domain, "tensor_parallel": 2, "peak_bytes": 1024}
+                   for domain in ("system", "gpu1")]
+        startup = {"measured": records, "host_provenance": "measured", "device_provenance": "measured"}
+        self.assertTrue(mg.startup_peaks_complete(startup))
+        self.assertTrue(mg.startup_peaks_complete(dict(startup, measured=[
+            dict(record, domain="gpu0") if record["domain"] == "gpu1" else record for record in records])))
+        for index in range(len(records)):
+            with self.subTest(missing=records[index]["domain"]):
+                self.assertFalse(mg.startup_peaks_complete(dict(
+                    startup, measured=records[:index] + records[index + 1:])))
+            for value in (0, -1, None, "1024", True):
+                with self.subTest(domain=records[index]["domain"], peak_bytes=value):
+                    changed = [dict(record) for record in records]
+                    changed[index]["peak_bytes"] = value
+                    self.assertFalse(mg.startup_peaks_complete(dict(startup, measured=changed)))
+        self.assertFalse(mg.startup_peaks_complete(dict(startup, measured=[
+            dict(record, tensor_parallel=1) for record in records])))
+        for key in ("host_provenance", "device_provenance"):
+            self.assertFalse(mg.startup_peaks_complete(dict(startup, **{key: "derived"})))
+        for invalid in ({}, {"measured": []}, {"measured": None}, {"bytes": 1024}, None):
+            self.assertFalse(mg.startup_peaks_complete(invalid))
+
+    def test_enrolled_requires_full_remote_mg1_parts_and_artifacts(self):
+        parts = ("remote", "charge", "listeners", "peaks", "old")
+        files = ("MG11-status.json", "MG11-gpus.json", "MG11-charge.json",
+                 "MG11-listeners.json", "MG11-peaks.json", "MG11-owned.jsonl",
+                 "MG11-deployments.tsv",
+                 "start-mg11-new.out", "mg11-new-deploy.out", "chat-mg11.json",
+                 "mg11-old-deploy.out", "mg11-old-start.out",
+                 "events-srv.jsonl", "journal-srv.jsonl")
+        for name in files:
+            (self.raw / name).write_text("{}\n" if name.endswith((".json", ".jsonl")) else "evidence\n")
+        logs = self.raw / "engine-logs/h1"
+        logs.mkdir(parents=True)
+        (logs / "engine.log").write_text("engine startup evidence\n")
+        lines = "".join(f"MG11\t{part}\tpass\tevidence\n" for part in parts)
+        rc, report = self.verdict(lines, "MG11")
+        self.assertEqual(rc, 0)
+        self.assertTrue(report["selected_pass"])
+        self.assertFalse(report["qualified"])
+        for part in parts:
+            with self.subTest(part=part):
+                rc, report = self.verdict(lines.replace(f"MG11\t{part}\tpass\tevidence\n", ""), "MG11")
+                self.assertNotEqual(rc, 0)
+                self.assertIn(part, report["rows"]["MG11"]["missing_parts"])
+        for name in files:
+            with self.subTest(file=name):
+                (self.raw / name).unlink()
+                rc, report = self.verdict(lines, "MG11")
+                self.assertNotEqual(rc, 0)
+                self.assertIn(name, report["rows"]["MG11"]["missing_evidence"])
+                (self.raw / name).write_text("{}\n" if name.endswith((".json", ".jsonl")) else "evidence\n")
+
     def test_selected_success_is_not_full_qualification(self):
         for part in ("tp3", "pin"):
             (self.raw / f"MG12-{part}.out").write_text("refused\n")
@@ -315,6 +369,8 @@ class RunnerTests(unittest.TestCase):
                         result.write_text(result.read_text().replace("MG5\\tdeep\\tpass", "MG5\\tdeep\\tfail"))
                     if mode == "missing":
                         (target / "raw/MG3-fit.txt").unlink()
+                    if mode == "missing-enrolled":
+                        (target / "raw/MG11-owned.jsonl").unlink()
                     if mode != "disconnect":
                         (target / "host-completion.json").write_text(json.dumps(dict(exit_code=0)))
                 elif command.endswith(" finalize"):
@@ -356,13 +412,13 @@ class RunnerTests(unittest.TestCase):
         for name in ("ssh", "rsync"):
             (self.bin / name).symlink_to(transport.name)
 
-    def run_fixture(self, mode):
+    def run_fixture(self, mode, only="all"):
         out = self.root / "output"
         env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
                    MG_FIXTURE_ROOT=str(self.root), MG_FIXTURE_MODE=mode)
         result = subprocess.run(["bash", str(HERE / "run.sh"), "--ssh", "fixture@203.0.113.9",
                                  "--skip-setup", "--out", str(out), "--max-seconds", "8",
-                                 "--disconnect-seconds", "1", "--poll-seconds", "1"] +
+                                 "--disconnect-seconds", "1", "--poll-seconds", "1", "--only", only] +
                                 (["--purge-only"] if mode.startswith("purge-") else []),
                                 env=env, capture_output=True, text=True, timeout=30)
         completion = json.loads((out / "completion.json").read_text())
@@ -377,6 +433,14 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(completion["purged"])
         self.assertTrue(json.loads((out / "verdict.json").read_text())["qualified"])
 
+    def test_enrolled_only_collects_full_serving_evidence(self):
+        result, _, out = self.run_fixture("success", only="MG11")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = json.loads((out / "verdict.json").read_text())
+        self.assertTrue(report["selected_pass"])
+        self.assertFalse(report["qualified"])
+        self.assertEqual(report["rows"]["MG11"]["result"], "pass")
+
     def test_failing_row_exits_nonzero_despite_zero_host_exit(self):
         result, completion, _ = self.run_fixture("fail")
         self.assertNotEqual(result.returncode, 0)
@@ -387,6 +451,13 @@ class RunnerTests(unittest.TestCase):
         result, _, out = self.run_fixture("missing")
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(json.loads((out / "verdict.json").read_text())["qualified"])
+
+    def test_missing_enrolled_ownership_cannot_qualify(self):
+        result, _, out = self.run_fixture("missing-enrolled")
+        self.assertNotEqual(result.returncode, 0)
+        report = json.loads((out / "verdict.json").read_text())
+        self.assertFalse(report["qualified"])
+        self.assertIn("MG11-owned.jsonl", report["rows"]["MG11"]["missing_evidence"])
 
     def test_interrupted_connection_preserves_last_copy_and_does_not_purge(self):
         result, completion, out = self.run_fixture("disconnect")

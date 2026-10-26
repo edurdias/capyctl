@@ -258,6 +258,31 @@ MG5's explicit TP 2 deep command, also captured in an MG13-only run.
 MG10 and MG13 additionally require an observed parked state before testing
 a wake; a successful polling command alone does not establish that state.
 
+The run on `bb74a235` reached every row and finished with a failing verdict.
+Final collection succeeded, exported JSON remained valid, and the supervisor
+confirmed rental deletion at a provider-reported cost of $2.67. MG1–MG4,
+MG7–MG9, MG12, MG14 and bandwidth passed; MG5, MG6, MG10 and MG13 failed as
+described above. MG11 passed remote serving and older-host refusal; that run
+did not collect MG1's full accounting, listener and startup-peak evidence on
+the enrolled host. The harness now reuses the same serving checks remotely,
+with the coordinator's recorded host process identities and reservations.
+The strict verdict requires every added part and artifact. Missing ownership
+or observed listeners cannot pass. Startup evidence must include positive
+TP2 host and representative per-GPU peaks with measured provenance, matching
+ADR 0035 §3's largest-card measurement rule. All 27 collector regressions,
+ShellCheck and the MG11-only dry-run passed; the peak-check command also
+accepted the retained native measurements for all three engines.
+The rank and transition corrections are committed as `41dc56a4`; the full
+corrected native matrix remains required.
+
+MG10's retained evidence does not distinguish engine child churn from a
+host mount-table change. Observation now records which check changed; for
+membership changes it records the compared kernel identities, never command
+arguments or environment. Retry bounds and fail-closed ownership are
+unchanged. All 13 observation tests passed. A real, bounded CPU process-group
+smoke observed 19 stable snapshots and refused eight changing snapshots,
+with the corresponding membership diagnostics captured and the child reaped.
+
 
 # Release note: Several GPUs
 
