@@ -46,6 +46,11 @@ as the CUDA host compiler). The preflight refuses a machine
 with fewer than two GPUs, GPUs that differ, an older driver, too little disk, or
 an engine already running, before anything is installed.
 
+For MG6, the qualification role explicitly sets system managed and parked
+limits to 80%, retaining a 20% free reserve. The 30B TP2 host-backed charge is
+about 94.1 GiB; the default 25% parked limit cannot hold it. Admission still
+checks available RAM, so the configured budget is not a guarantee of a start.
+
 ## What it installs
 
 Only the approved engine versions, fresh x86_64 CUDA builds, in the home
@@ -79,6 +84,15 @@ current/qualification binaries when their recorded source commit differs;
 `--skip-setup` refuses that mismatch rather than attributing stale binaries to a
 new commit. Each attempt gets fresh role state, while approved engine installs
 and model downloads can be reused.
+
+MG3 also runs a separate allocation diagnostic after stopping the managed
+llama.cpp launch. Version 0.7.0 hides its model-buffer lines at default verbosity.
+The diagnostic reuses the live launch's captured arguments and environment,
+adding only `--verbosity 4`, sends no requests, and stops the process after it
+listens. `MG3-fit-replay.json` identifies both argument lists and the GPU namespace;
+`MG3-fit-replay.log` supplies the engine's allocation lines for comparison against
+the managed launch's grants. Managed serving, listeners and accounting are still
+checked on the ordinary CapyCTL build. Production logging is unchanged.
 
 ## Models
 

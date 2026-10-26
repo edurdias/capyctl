@@ -180,6 +180,58 @@ the corrected launch returns immediately. The supervisor deleted the rental
 and retained setup logs and a provider receipt (reported cost $0.014).
 No qualification row ran in that attempt.
 
+The next rental passed MG3's managed startup, serving, accounting and listener
+checks, but llama.cpp v0.7.0 suppressed the required allocation lines at default
+verbosity. The owner chose a separate diagnostic replay: after the managed stop,
+reuse the captured command and environment with only `--verbosity 4` added,
+record its model buffers and stop it. The harness retains the diagnostic
+separately; production logging is unchanged. A local process smoke proved capture,
+managed-process exit, replay readiness and teardown; all 22 collector checks and
+ShellCheck passed. Native diagnostic replay remains pending.
+
+The supervised rerun retained startup logs and row evidence locally, including
+vLLM's five successful deep-park cycles. SGLang's deep launch failed before
+Python started: its CUDA 13 saver preload could not resolve the wheel's
+`libcudart.so.13`. The runtime now derives the child loader path from CUDA runtime
+wheel records within the selected installation. Fifteen runtime tests and a
+native smoke with the installed saver in two fresh Python children passed;
+full SGLang parking qualification remains pending.
+
+MG6's unchanged 30B model requires about 94.1 GiB of host RAM for host-backed
+parking. The harness now explicitly budgets 80% of host RAM for managed and
+parked memory, retaining the 20% free reserve and normal admission checks.
+MG13's two 4B comparison launches now declare 6 GiB of KV cache, enough for
+their 32,768-token context, and failed prerequisites no longer lead to a wake
+wait on a model that never started.
+
+MG13 also exposed a product defect in the qualification build: a one-GPU
+automatic choice dropped the measured tensor layout needed to reconstruct
+larger candidates' host-backed charges. Exact snapshot validation then failed,
+and the coordinator stopped. The automatic candidate table now retains that
+layout. A focused regression failed before the fix and passed afterward in an
+isolated source copy with the same parking switches as the rental build.
+The shipped switches remain unchanged.
+
+The interrupted rental's final collection succeeded, and the supervisor
+confirmed deletion at a provider-reported cost of $1.95. This was not a
+complete matrix pass. Its final verdict also rejected the qualification
+role's journal: text redaction had inserted unescaped quotes into JSON-encoded
+engine diagnostics. The collector now redacts decoded values before encoding,
+including nested event payloads. A regression reproduced the JSON error before
+the fix; all 23 collector checks pass afterward. An actual `snapshot` followed
+by `sanitize-tree` smoke preserved parseable journal/event exports and removed
+fixture credentials. The original evidence remains unchanged, so MG4 is not
+qualified despite its five passing cycles. ShellCheck and the revised full
+dry-run passed; CPU checks do not establish native-engine qualification.
+
+The corrected source passed `scripts/ci-local.sh` and the complete
+`scripts/ci-local.sh --deep --ci-shape` gate, including the core and full
+workspace suites. Scoped reviews of the snapshot reconstruction, saver loader,
+fixtures and structured redaction found no remaining actionable defects.
+A further native run remains required. After a temporary capacity shortage,
+the provider again offered a qualifying two-A6000 machine with 128 GB RAM.
+The PR remains draft and the shipped multi-GPU parking switches remain off.
+
 
 # Release note: Several GPUs
 

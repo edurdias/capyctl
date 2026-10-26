@@ -75,6 +75,10 @@ pub struct AutoTable {
     /// Whether the rows were sized from the checkpoint's measured weights.
     /// A host chooses N only once they were (ADR 0014 §7).
     pub weights_measured: bool,
+    /// The measured layout used to size every candidate, including when
+    /// N = 1 has no `memory.member` in which to retain it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<capyctl_domain::member_weights::CheckpointLayout>,
     /// One row per tensor-parallel size the engine can run on this host,
     /// N = 1 first.
     pub candidates: Vec<AutoCandidate>,
@@ -655,6 +659,7 @@ pub(super) fn candidate_table(
     }
     Ok(AutoTable {
         weights_measured: facts.weights_bytes.is_some_and(|bytes| bytes > 0),
+        layout: facts.layout,
         candidates,
         excluded,
     })

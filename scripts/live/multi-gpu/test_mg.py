@@ -115,6 +115,31 @@ class EvidenceTests(unittest.TestCase):
         database.unlink()
         self.assertNotEqual(mg.cmd_snapshot(args), 0)
 
+    def test_snapshot_redaction_preserves_json_and_nested_journal_evidence(self):
+        root = self.root / "host"
+        database = root / "attempts/a/state/srv/srv.sqlite3"
+        self.make_database(database)
+        evidence = "server_args={'api_key': None, 'ssl_keyfile_password': 'private-password'}"
+        payload = json.dumps({"api_key": "private-key", "detail": evidence})
+        with contextlib.closing(sqlite3.connect(database)) as db:
+            db.execute("UPDATE journal_entries SET evidence=?", (evidence,))
+            db.execute("INSERT INTO management_events VALUES(1, 1, 'failed', 'model', ?)", (payload,))
+            db.commit()
+        args = argparse.Namespace(root=str(root), attempt="a", host="")
+        self.assertEqual(mg.cmd_snapshot(args), 0)
+        exported = root / "evidence/a/raw"
+        journal = json.loads((exported / "journal-srv.jsonl").read_text())
+        events = json.loads((exported / "events-srv.jsonl").read_text())
+        nested = json.loads(events["payload_json"])
+        self.assertIn("server_args=", journal["evidence"])
+        self.assertEqual(nested["api_key"], "<REDACTED>")
+        for name in ("journal-srv.jsonl", "events-srv.jsonl"):
+            text = (exported / name).read_text()
+            self.assertNotIn("private-password", text)
+            self.assertNotIn("private-key", text)
+            # The second local sanitization pass must preserve the export too.
+            self.assertEqual(json.loads(mg.sanitize(text)), json.loads(text))
+
     def test_snapshot_excludes_credentials_and_database_and_copies_live_logs(self):
         root = self.root / "host"
         attempt = root / "attempts/a"

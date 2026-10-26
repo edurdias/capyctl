@@ -732,6 +732,10 @@ def _import_and_launch(spec, contract, approvals=None):
         # ADR 0014 §6: the mapper's closed category reaches the operator.
         raise LaunchError(error.code) from None
     if json.loads(spec._public_json)["settings"]["memory_saver"] is True:
+        # The saver preloads in a fresh interpreter, before torch can locate
+        # wheel-shipped libcudart. Compose its loader path before any spawn.
+        from runtime.sglang_startup_guards import prepare_saver_library_path
+        prepare_saver_library_path(os.path.dirname(os.path.dirname(_trusted_package_root())))
         # Only a memory-saver launch is ever woken by a disk reload.
         _keep_served_name_on_reload()
     # ADR 0028 §12 (R12): every rank, head and worker alike, enrolls its own

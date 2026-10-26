@@ -561,6 +561,26 @@ fn auto_records_its_table_and_takes_the_smallest_fitting_size() {
     }
 }
 
+// T46 / MG13: the N=1 auto choice still needs measured layout facts to
+// validate the larger candidates when its frozen revision is opened.
+#[test]
+fn auto_single_gpu_preserves_layout_for_snapshot_validation() {
+    let facts = CheckpointFacts {
+        weights_bytes: Some(8 * GIB),
+        layout: Some(CheckpointLayout {
+            sharded_bytes: 7 * GIB,
+            layer_count: 32,
+            largest_layer_bytes: 224 << 20,
+        }),
+        ..CheckpointFacts::default()
+    };
+    let mut d = deployment(Some(json!("auto")));
+    d["residency"] = json!("host_backed");
+    let e = resolve_effective_with_checkpoint(&d, &host(2), facts).unwrap();
+    assert_eq!(e.local_tensor_parallel(), 1);
+    round_trips(&e);
+}
+
 // T46: a requirement only N = 1 meets narrows the table to N = 1: a stated
 // parking tier while the gate is closed, `lmcache: required`.
 #[test]
@@ -640,6 +660,7 @@ fn gpu(id: &str, managed: i64, product: &str) -> AutoGpu {
 fn table(rows: &[(u32, i64)]) -> AutoTable {
     AutoTable {
         weights_measured: true,
+        layout: None,
         candidates: rows
             .iter()
             .map(|(n, bytes)| AutoCandidate {

@@ -558,13 +558,19 @@ PY
     else result "$row" peaks fail "no measured startup figure in status: $(cut -c1-200 "$RES/$row-peaks.json")"; fi
   fi
   [ "$e" = lc ] || return 0
-  check "$row" fit "llama.cpp's per-device model buffers each fit that GPU's grant; both CUDA0 and CUDA1 hold a part"
+  check "$row" fit "after the managed stop, replay its exact argv/environment with only verbosity 4; llama.cpp's model buffers fit each grant"
   if [ "$PLAN" = 0 ]; then
-    find "$SD/logs" -type f -newer "$RES/deploy-$n.out" -exec "${HELPER[@]}" fit {} + >"$RES/$row-fit.txt" 2>/dev/null
-    if r=$("${HELPER[@]}" fit-check "$RES/$row-fit.txt" "$RES/$row-charge.json"); then
-      result "$row" fit pass "$r; see $row-fit.txt beside $row-charge.json"
+    local api
+    api=$("${HELPER[@]}" owned "$DB" "$n" --role api | python3 -c 'import json,sys; print(json.loads(sys.stdin.readline())["pid"])')
+    if "${HELPER[@]}" fit-replay --pid "$api" --log "$RES/$row-fit-replay.log" \
+      --receipt "$RES/$row-fit-replay.json" env XDG_CONFIG_HOME="$MG/cfg-$ROLE" \
+      "$CAPYCTL" --state-dir "$SD" stop deployment "$n"; then
+      "${HELPER[@]}" fit "$RES/$row-fit-replay.log" >"$RES/$row-fit.txt"
+      if r=$("${HELPER[@]}" fit-check "$RES/$row-fit.txt" "$RES/$row-charge.json"); then
+        result "$row" fit pass "$r; separate diagnostic replay, only verbosity changed; see $row-fit-replay.json"
+      else result "$row" fit fail "$r; GPU readings cannot substitute for engine fit logs"; fi
     else
-      result "$row" fit fail "$r; GPU readings cannot substitute for engine fit logs"
+      result "$row" fit fail "diagnostic replay failed; see $row-fit-replay.json and .log"
     fi
   fi
 }
@@ -890,7 +896,20 @@ engine_config: {context_length: 16384}"
 rows_qualify() {
   want MG4 MG5 MG6 MG10 MG13 || return 0
   phase "role s2: the qualification build (vLLM and SGLang deep parking at N > 1 on, as MG4/MG5 would set it)"
-  role_up s2 capyctl-qualify || { say "role s2 did not start"; return; }
+  local -a host_weights_budget=()
+  if want MG6; then
+    # Qwen3-30B TP2 charges ~94.1 GiB of host RAM: 1.5x the full
+    # checkpoint plus 7 GiB of rank overhead, in every host_backed phase.
+    # The default 25% parked / 50% managed limits cannot hold it. On the
+    # >=120 GiB fixture, 80% holds it while preserving the 20% free reserve.
+    # Admission still requires that reserve against observed available RAM.
+    host_weights_budget=(
+      --set host.resource_policy.memory.system.managed_limit=80%
+      --set host.resource_policy.memory.system.parked_limit=80%
+      --set host.resource_policy.memory.system.free_reserve=20%
+    )
+  fi
+  role_up s2 capyctl-qualify "${host_weights_budget[@]}" || { say "role s2 did not start"; return; }
   profiles
   if want MG4; then
     phase "MG4 vLLM TP 2 deep"
@@ -909,7 +928,7 @@ engine_config: {context_length: 32768}"
   if want MG6; then
     phase "MG6 host_backed, vLLM and SGLang TP 2"
     if [ "$PLAN" = 0 ] && [ "$(awk '/^MemTotal:/ {print int($2/1048576)}' /proc/meminfo)" -lt 120 ]; then
-      skip MG6 both "under 120 GiB of host RAM: the host_backed copy of the bring-up model does not fit"
+      skip MG6 both "under 120 GiB of host RAM: the Qwen3-30B host_backed charge (~94.1 GiB) needs the 80% host-weights budget with 20% kept free"
     else
       dep mg6-v v32 "$(q30)" "topology: {tensor_parallel: 2}
 residency: host_backed
@@ -964,19 +983,33 @@ engine_config: {context_length: 32768, memory: {kv_cache: 30GiB}}"
   fi
   if want MG13; then
     phase "MG13 topology: auto"
+    # Qwen3-4B at 32768 tokens needs 4.5 GiB KV on vLLM 0.32. Give both
+    # comparison launches the same sufficient pool; the 4 GiB default cannot start.
     dep mg13-4b v32 "$(q4)" "topology: auto
-engine_config: {context_length: 32768}"
+engine_config: {context_length: 32768, memory: {kv_cache: 6GiB}}"
     dep mg13-4b-x v32 "$(q4)" "devices: [{id: gpu0}]
-engine_config: {context_length: 32768}"
+engine_config: {context_length: 32768, memory: {kv_cache: 6GiB}}"
     dep mg13-30b s22 "$(q30)" "topology: auto
 residency: deep
 engine_config: {context_length: 32768}"
     local tp devs devs2 a b txt
     if deploy mg13-4b && deploy mg13-4b-x && deploy mg13-30b; then
       check MG13 n1 "the 4B model chooses N = 1, status 'TP auto (1)', and its vLLM arguments equal an explicit single-GPU deployment's"
-      startd mg13-4b-x
+      if ! startd mg13-4b-x; then
+        result MG13 n1 fail "explicit baseline start failed; see start-mg13-4b-x.out"
+        result MG13 n2 fail "blocked by failed baseline start"
+        result MG13 wake fail "blocked by failed baseline start"
+        role_down
+        return
+      fi
       a=$(latest_args vllm mg13-4b-x); printf '%s\n' "$a" >"$RES/mg13-pinned-args.json"; stopd mg13-4b-x
-      startd mg13-4b
+      if ! startd mg13-4b; then
+        result MG13 n1 fail "automatic single-GPU start failed; see start-mg13-4b.out"
+        result MG13 n2 fail "blocked by failed automatic single-GPU start"
+        result MG13 wake fail "blocked by failed automatic single-GPU start"
+        role_down
+        return
+      fi
       b=$(latest_args vllm mg13-4b); printf '%s\n' "$b" >"$RES/mg13-n1-args.json"
       status_json mg13-4b "$RES/mg13-4b.json"; c status deployment mg13-4b >"$RES/mg13-4b.txt" 2>&1
       if [ "$PLAN" = 0 ]; then
@@ -987,7 +1020,12 @@ engine_config: {context_length: 32768}"
           result MG13 n1 fail "tensor_parallel '$tp'; TP auto lines $txt; arguments equal: $([ "$a" = "$b" ] && echo yes || echo no)"
       fi
       check MG13 n2 "with the 4B model serving on gpu0, the 30B model started with --evict chooses N = 2 (status 'TP auto (2)'), its SGLang arguments equal MG2's, and the 4B model is evicted"
-      startd mg13-30b --evict
+      if ! startd mg13-30b --evict; then
+        result MG13 n2 fail "automatic two-GPU start failed; see start-mg13-30b.out"
+        result MG13 wake fail "blocked by failed automatic two-GPU start"
+        role_down
+        return
+      fi
       status_json mg13-30b "$RES/mg13-30b.json"; c status deployment mg13-30b >"$RES/mg13-30b.txt" 2>&1
       b=$(latest_args sglang mg13-30b); printf '%s\n' "$b" >"$RES/mg13-n2-args.json"
       if [ "$PLAN" = 0 ]; then
@@ -1001,9 +1039,13 @@ engine_config: {context_length: 32768}"
           result MG13 n2 fail "tensor_parallel '$tp'; 4B model '$st'; arguments equal MG2's: $([ "$a" = "$b" ] && echo yes || echo no)"
       fi
       check MG13 wake "the 30B model parked and woken keeps N = 2 and the same GPUs"
-      c park deployment mg13-30b >>"$RES/cli.log" 2>&1
-      poll_state mg13-30b 600 parked >/dev/null
-      c start deployment mg13-30b --wait >>"$RES/cli.log" 2>&1
+      if ! c park deployment mg13-30b >>"$RES/cli.log" 2>&1 ||
+         ! poll_state mg13-30b 600 parked >/dev/null ||
+         ! c start deployment mg13-30b --wait >>"$RES/cli.log" 2>&1; then
+        result MG13 wake fail "park or wake failed; see cli.log"
+        role_down
+        return
+      fi
       status_json mg13-30b "$RES/mg13-30b-woken.json"
       if [ "$PLAN" = 0 ]; then
         devs2=$("${HELPER[@]}" get "$RES/mg13-30b-woken.json" 'instances[0].topology.devices')

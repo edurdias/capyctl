@@ -535,6 +535,61 @@ def cmd_fit(a):
     return 0
 
 
+def cmd_fit_replay(a):
+    """Owner-approved MG3 diagnostic: same launch, only verbosity differs."""
+    proc = Path(f"/proc/{a.pid}")
+    argv = proc.joinpath("cmdline").read_bytes().decode().strip("\0").split("\0")
+    cwd = os.readlink(proc / "cwd")
+    if Path(argv[0]).name != "llama-server" or any(
+            "key" in arg.lower() or "token" in arg.lower() for arg in argv if arg.startswith("--")):
+        raise ValueError("fit replay requires the keyless llama-server launch")
+    if any(arg in argv for arg in ("--verbosity", "--log-verbosity", "--verbose", "--log-verbose")):
+        raise ValueError("fit replay requires the default-verbosity launch")
+    environment = dict(item.split("=", 1) for item in
+                       proc.joinpath("environ").read_bytes().decode().strip("\0").split("\0"))
+    # This fixture has no engine key. Never persist arbitrary environment values.
+    visible = {k: v for k, v in environment.items() if k in (
+        "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "NCCL_SOCKET_IFNAME")}
+    original_ticks = proc.joinpath("stat").read_text().rsplit(")", 1)[1].split()[19]
+    subprocess.run(a.stop_command, check=True, timeout=660,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 600
+    while proc.exists():
+        try:
+            if proc.joinpath("stat").read_text().rsplit(")", 1)[1].split()[19] != original_ticks:
+                break
+        except FileNotFoundError:
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError("managed llama-server has not exited; replay refused")
+        time.sleep(1)
+    replay = [*argv, "--verbosity", "4"]
+    receipt = {"managed_argv": argv, "diagnostic_argv": replay, "gpu_environment": visible,
+               "only_change": ["--verbosity", "4"], "ready": False, "stopped": False}
+    child = None
+    try:
+        with Path(a.log).open("w") as log:
+            child = subprocess.Popen(replay, env=environment, cwd=cwd, stdout=log, stderr=log)
+            deadline = time.monotonic() + 180
+            while child.poll() is None and time.monotonic() < deadline:
+                if "listening on http://" in Path(a.log).read_text(errors="replace"):
+                    receipt["ready"] = True
+                    break
+                time.sleep(0.5)
+    finally:
+        if child is not None:
+            if child.poll() is None:
+                child.terminate()
+            try:
+                child.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=30)
+            receipt["stopped"] = True
+        Path(a.receipt).write_text(json.dumps(receipt, indent=2) + "\n")
+    return 0 if receipt["ready"] and receipt["stopped"] else 1
+
+
 EXPECTED = {
     "MG1": ("ready", "charge", "listeners", "peaks"),
     "MG2": ("ready", "charge", "listeners", "peaks"),
@@ -578,7 +633,7 @@ def row_evidence(rid, settings):
                  ("status.json", "gpus.json", "charge.json", "listeners.json", "peaks.json")]
         files.append(f"chat-{rid}.json")
         if rid == "MG3":
-            files.append("MG3-fit.txt")
+            files.extend(("MG3-fit.txt", "MG3-fit-replay.json", "MG3-fit-replay.log"))
         return files
     if rid in ("MG4", "MG5", "MG6"):
         labels = ("vllm", "sglang") if rid == "MG6" else ("deep",)
@@ -777,7 +832,7 @@ def atomic_text(path, text):
         os.close(directory)
 
 
-def sanitize(text, secrets=(), host=""):
+def sanitize_text(text, secrets=(), host=""):
     for secret in sorted(set(secrets), key=len, reverse=True):
         if secret:
             text = text.replace(secret, "<REDACTED>")
@@ -789,6 +844,42 @@ def sanitize(text, secrets=(), host=""):
     text = re.sub(r"(?i)((?:api[_-]?key|inference[_-]?key|admin[_-]?token|access[_-]?token|secret|password)[\"']?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^,\s}\]]+)",
                   r'\1"<REDACTED>"', text)
     return text
+
+
+def sanitize(text, secrets=(), host=""):
+    """Redact values before JSON encoding, including JSON strings in exports."""
+    def clean(value):
+        if isinstance(value, dict):
+            return {
+                key: "<REDACTED>" if re.search(
+                    r"(?i)(api[_-]?key|inference[_-]?key|admin[_-]?token|access[_-]?token|secret|password)$", key
+                ) else clean(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [clean(item) for item in value]
+        if isinstance(value, str):
+            # Management payload_json is itself a JSON document; journal
+            # evidence may instead contain plain engine output/Python repr.
+            if value.lstrip().startswith(("{", "[")):
+                return sanitize(value, secrets, host)
+            return sanitize_text(value, secrets, host)
+        return value
+
+    def document(value):
+        return json.dumps(clean(value), ensure_ascii=False)
+
+    try:
+        return document(json.loads(text)) + ("\n" if text.endswith("\n") else "")
+    except ValueError:
+        # JSONL exports and mixed logs retain their record boundaries.
+        lines = []
+        for line in text.splitlines(keepends=True):
+            try:
+                lines.append(document(json.loads(line)) + ("\n" if line.endswith("\n") else ""))
+            except ValueError:
+                lines.append(sanitize_text(line, secrets, host))
+        return "".join(lines)
 
 
 def cmd_snapshot(a):
@@ -920,6 +1011,11 @@ def main():
     s.add_argument("repo")
     s = sub.add_parser("fit")
     s.add_argument("logs", nargs="+")
+    s = sub.add_parser("fit-replay")
+    s.add_argument("--pid", type=int, required=True)
+    s.add_argument("--log", required=True)
+    s.add_argument("--receipt", required=True)
+    s.add_argument("stop_command", nargs=argparse.REMAINDER)
     s = sub.add_parser("verdict")
     s.add_argument("results")
     s.add_argument("out")
