@@ -632,11 +632,24 @@ def startup_peaks_complete(startup):
     try:
         if any(startup.get(f"{kind}_provenance") != "measured" for kind in ("host", "device")):
             return False
-        domains = {record["domain"] for record in startup["measured"]
-                   if record.get("tensor_parallel") == 2
-                   and type(record.get("peak_bytes")) is int and record["peak_bytes"] > 0}
-        return "system" in domains and any(
-            isinstance(domain, str) and re.fullmatch(r"gpu\d+", domain) for domain in domains)
+        domains = {}
+        for record in startup["measured"]:
+            if record.get("tensor_parallel") != 2 or type(record.get("peak_bytes")) is not int or record["peak_bytes"] <= 0:
+                continue
+            domain, host = record["domain"], record.get("host_id")
+            if not isinstance(domain, str):
+                return False
+            if domain.startswith("host/"):
+                if not isinstance(host, str):
+                    return False
+                # Enrolled domains encode their host's UTF-8 byte length.
+                prefix = f"host/{len(host.encode('utf-8'))}:{host}/domain/"
+                if not domain.startswith(prefix):
+                    return False
+                domain = domain[len(prefix):]
+            domains.setdefault(host, set()).add(domain)
+        return any("system" in names and any(re.fullmatch(r"gpu\d+", name) for name in names)
+                   for names in domains.values())
     except (KeyError, TypeError, AttributeError):
         return False
 

@@ -299,6 +299,24 @@ the row. Request-driven and explicit-start plans now retain their selected
 GPU sets for the planned-switch diagnostic. The qualification predicate
 is unchanged. Both corrections still require a native rerun.
 
+That run completed with MG6, MG10 and MG11 failing; every other row,
+including automatic topology and wake, passed. Final evidence collection
+succeeded, exported JSON remained valid, and the supervisor confirmed
+rental deletion at a provider-reported cost of $2.96. MG11's enrolled host
+served, passed per-GPU accounting and loopback checks, and recorded positive
+TP2 startup peaks, but the collector rejected its host-qualified domain
+names. The collector now recognizes the exact domain prefix belonging to
+each measurement's host and requires host and GPU peaks from the same host.
+The new regression failed before the correction; all 28 collector tests
+passed afterward, including rejection of mismatched and mixed-host peaks.
+The real `peaks-check` command accepted MG11's retained native measurements
+afterward. The original failed verdict is unchanged.
+
+The deadline and switch-diagnostic corrections (`f1772030`, `b167f741`)
+passed the complete `scripts/ci-local.sh --deep --ci-shape` gate, including
+the core and full-workspace suites. Scoped reviews found no actionable
+defects. These CPU checks do not establish native-engine qualification.
+
 
 # Release note: Several GPUs
 

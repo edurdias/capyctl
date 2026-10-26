@@ -82,6 +82,21 @@ class EvidenceTests(unittest.TestCase):
         for invalid in ({}, {"measured": []}, {"measured": None}, {"bytes": 1024}, None):
             self.assertFalse(mg.startup_peaks_complete(invalid))
 
+    def test_enrolled_startup_peaks_keep_their_host_identity(self):
+        # T46 / MG11: enrolled domains are qualified; both peaks must belong
+        # to the same host, and the domain's host must match its record.
+        host = "remote-a"
+        records = [{"domain": f"host/{len(host)}:{host}/domain/{domain}",
+                    "host_id": host, "tensor_parallel": 2, "peak_bytes": 1024}
+                   for domain in ("system", "gpu0")]
+        startup = {"measured": records, "host_provenance": "measured", "device_provenance": "measured"}
+        self.assertTrue(mg.startup_peaks_complete(startup))
+        mismatched = [dict(record) for record in records]
+        mismatched[1]["host_id"] = "remote-b"
+        self.assertFalse(mg.startup_peaks_complete(dict(startup, measured=mismatched)))
+        mismatched[1]["domain"] = "host/8:remote-b/domain/gpu0"
+        self.assertFalse(mg.startup_peaks_complete(dict(startup, measured=mismatched)))
+
     def test_enrolled_requires_full_remote_mg1_parts_and_artifacts(self):
         parts = ("remote", "charge", "listeners", "peaks", "old")
         files = ("MG11-status.json", "MG11-gpus.json", "MG11-charge.json",
