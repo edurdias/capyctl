@@ -1,4 +1,4 @@
-# Status: One model across several GPUs of one host (ADR 0035), implemented; live rows pending — 2026-10-25 (branch `feat/multi-gpu-one-host`)
+# Status: One model across several GPUs of one host (ADR 0035), implemented; live qualification incomplete — 2026-10-26 (branch `feat/multi-gpu-one-host`)
 
 ADR 0035 (owner decisions 2026-10-25) is implemented for 0.1.9. A deployment with
 `topology: {tensor_parallel: N}` and no `placement.hosts` runs as one instance on N
@@ -74,11 +74,12 @@ Tests (T46), new in `capyctl-config` (`tests/multi_gpu.rs`), `capyctl-store`
 the per-GPU residue), `capyctl-scheduler`, `capyctl-domain` (`local_tp`), `capyctl-agent`
 (the per-rank saver read and each device-list refusal), `capyctl-controller` (the saver
 observer per device), `capyctl-router`, `capyctl-protocol` and `capyctl-management` (the
-`topology_auto_changed` event). Gates on this branch: `scripts/ci-local.sh --deep
---ci-shape`, every step passes: unit 1708 passed, 0 failed (1 ignored); runtime Python 384
-passed; core 1795 passed, 0 failed; workspace 3833 passed, 0 failed (1 ignored). CPU and
-Fake-engine tests are not qualification: nothing here has run on two GPUs. The live check
-still needed is the rented session (ADR 0035 §14), every row in one run:
+`topology_auto_changed` event). Gates recorded before the live-script fixes:
+`scripts/ci-local.sh --deep --ci-shape`, every step passed: unit 1708 passed,
+0 failed (1 ignored); runtime Python 384 passed; core 1795 passed, 0 failed;
+workspace 3833 passed, 0 failed (1 ignored). CPU and Fake-engine tests are not
+qualification. The rented session below ran on two GPUs but did not establish
+qualification. The complete live check remains required (ADR 0035 §14):
 
 ```bash
 scripts/live/multi-gpu/run.sh --ssh <user>@<host>
@@ -88,6 +89,50 @@ MG1–MG14 and the bandwidth test; MG4 and MG5 decide whether vLLM's and SGLang'
 `deep_park` is turned on at N > 1 (the first park at N > 1 also shows whether each GPU's
 parked residue stays within its 2.25 GiB parked charge), and MG1–MG3, MG6–MG9 and MG13 must
 pass before the release notes call the feature qualified.
+
+## Interrupted qualification on two RTX A6000 GPUs, 2026-10-25
+
+The session used two NVIDIA RTX A6000 48 GiB PCIe GPUs, driver 580.126.09,
+vLLM 0.32.0, SGLang 0.5.22 and llama.cpp v0.7.0. Setup and measurement-script
+fixes were committed through `7c54d1c8`; the engine binaries were not rebuilt
+for each script-only change.
+
+The remote runner reported `RUN_DONE` at 23:48:54 UTC, but the agent stopped
+before copying the complete results or purging the machine. The rental was
+automatically deleted at its spending cap on 2026-10-26 at 07:38:34 UTC.
+No clean-home or empty-GPU check was obtained before deletion. The surviving
+progress excerpts are not a substitute for the missing raw results, engine
+logs and per-cycle evidence. Neither engine's multi-GPU parking qualification
+flag is changed.
+
+| Row | Surviving observation | Qualification consequence |
+|---|---|---|
+| BW | 61,085,172,367 bytes downloaded and verified in 562.1 s: 108.7 MB/s, 0.87 Gbit/s | Measurement retained |
+| MG1 | vLLM reported all four parts passing; Ready in 91.8 s; 34,226 MiB used and 39,159 MiB charged on each GPU; 31 listeners, all loopback | Progress evidence retained; complete raw evidence missing |
+| MG2 | SGLang reported all four parts passing; Ready in 186.3 s; 34,308 MiB used and 39,098 MiB charged on each GPU; 32 listeners, all loopback | Progress evidence retained; complete raw evidence missing |
+| MG3 | llama.cpp answered the canary; used 6,460/6,098 MiB, charged 12,961 MiB per GPU; one loopback listener | The script accepted GPU readings instead of the required model-buffer log lines; that does not establish the documented fit criterion |
+| MG4 | vLLM deep parking reported a pass; the truncated excerpt shows four cycles at 740 MiB parked and 34,238 MiB awake per GPU | The full five-cycle evidence was not recovered; keep qualification off |
+| MG5 | SGLang deep parking failed to start | Cause unavailable without the missing engine log |
+| MG6 | Both host-backed starts failed; the subsequent release check passed | Failed starts do not qualify host-backed parking |
+| MG7 | Normal stops passed; both rank-kill checks failed. vLLM named rank 0 after rank 1 was killed; SGLang's excerpt had no rank-exit detail. Process disappearance and charge release were sampled at the same tick | Diagnose rank-exit reporting; same-tick samples alone cannot prove ordering |
+| MG8 | Both engines reported `tp_stalled`, failed the instance and removed the engine processes | Progress evidence retained; full timing evidence missing |
+| MG9 | SGLang reported 96%, 97% and 99% of direct throughput at C1/C4/C8. vLLM's direct launch rejected a CapyCTL-only argument | The argument-filter fix is committed; no successful vLLM comparison was recovered |
+| MG10 | Switching failed at deployment or start | Cause unavailable without the missing CLI log |
+| MG11 | Current-host check failed: start exit 0, no chat result. Older-host refusal reported a pass | Current-host path remains unqualified |
+| MG12 | Both insufficient-GPU and pinned-count refusals passed | Refusal output retained |
+| MG13 | Both automatic-topology checks and the wake check failed; the wake request returned 503 | Cause unavailable without the missing state and engine logs |
+| MG14 | Status explained the device-memory refusal and what would fit; `start --wait` returned generic `capacity_blocked` instead | Preserve the specific refusal through the start path |
+
+Local evidence (not committed) is under
+`target/live/multi-gpu/2026-10-25-1719-multi-gpu/`: `bandwidth.txt`,
+`preflight.txt`, `MG14-status-at-refusal.txt` and `recovered-progress.txt`.
+The latter contains tool-output excerpts from multiple attempts, including
+earlier failures; it is not a reconstructed `results.tsv` or a passing verdict.
+The live-script commits also fix CUDA-wheel setup, CUDA discovery at engine
+registration, charge and rank-identity readers, and direct-launch argument
+reconstruction. Before another paid session, the runner must preserve evidence
+incrementally and its completion must not depend on an agent remaining available.
+
 
 # Release note: Several GPUs
 
