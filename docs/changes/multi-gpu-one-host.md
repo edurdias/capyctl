@@ -173,6 +173,13 @@ refuses an active runner, stops the remaining roles, and refreshes all exports
 before copying and deleting anything. Regression cases failed before those
 corrections and pass afterward. The integrated fast gate passed all eight steps.
 
+The first supervised rental passed preflight but its collector timed out while
+starting the detached setup command. A backgrounded shell AND-list retained
+SSH's output pipe; a local process smoke reproduced that delay and confirmed
+the corrected launch returns immediately. The supervisor deleted the rental
+and retained setup logs and a provider receipt (reported cost $0.014).
+No qualification row ran in that attempt.
+
 
 # Release note: Several GPUs
 

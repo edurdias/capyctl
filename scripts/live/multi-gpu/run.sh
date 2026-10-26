@@ -108,7 +108,7 @@ finish() {
   fi
   python3 "$HERE/mg.py" verdict "$ATTEMPT/raw/results.tsv" "$OUT/verdict.md" --settings "$ATTEMPT/settings.json" --attempts "$OUT/attempts" --only "$ONLY" --host-status "$HOST_STATUS" --collection-status "$FINAL_COPY" >"$ATTEMPT/verdict.log" 2>&1
   verdict_rc=$?
-  [ "$verdict_rc" = 0 ] || REASON=qualification_failed
+  if [ "$original" = 0 ] && [ "$verdict_rc" != 0 ]; then REASON=qualification_failed; fi
   cp "$OUT/verdict.md" "$OUT/verdict.json" "$ATTEMPT/" 2>/dev/null
   if [ "$FINAL_COPY" = 1 ] && [ -n "$HOST_STATUS" ] && [ "$KEEP" = 0 ]; then
     if remote "ATTEMPT_ID=$ATTEMPT_ID bash ~/mg/live/remote.sh purge" >>"$ATTEMPT/purge.log" 2>&1; then PURGED=1; else REASON=purge_failed; fi
@@ -180,7 +180,9 @@ if [ "$SKIP_SETUP" = 0 ]; then
 fi
 # The remote process is detached from SSH, not from this runner's responsibility.
 # Setup output is copied on every poll, before any row has completed.
-remote "cd ~/mg && ATTEMPT_ID=$ATTEMPT_ID setsid nohup timeout --kill-after=10 $MAX_SECONDS bash live/remote.sh all >attempts/$ATTEMPT_ID/raw/all.log 2>&1 </dev/null &"
+REASON=remote_launch_failed
+# Do not background an AND-list: its shell retains SSH's output pipe.
+remote "cd ~/mg || exit; ATTEMPT_ID=$ATTEMPT_ID setsid nohup timeout --kill-after=10 $MAX_SECONDS bash live/remote.sh all >attempts/$ATTEMPT_ID/raw/all.log 2>&1 </dev/null &"
 start=$SECONDS
 last_contact=$SECONDS
 REASON=running
