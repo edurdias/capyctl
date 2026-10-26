@@ -20,20 +20,28 @@
 # `test && result pass ... || result fail ...` is used on purpose: result and say always succeed.
 # shellcheck disable=SC2015
 set -uo pipefail
+umask 077
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 cmd=${1:-}
 MG=${MG:-$HOME/mg}
 PLAN=0
 [ "$cmd" = plan ] && PLAN=1
-if [ -f "$MG/mg.env" ]; then
+if [ -n "${ATTEMPT_ID:-}" ] && [ -f "$MG/attempts/$ATTEMPT_ID/mg.env" ]; then
+  # shellcheck disable=SC1090
+  . "$MG/attempts/$ATTEMPT_ID/mg.env"
+elif [ -f "$MG/mg.env" ]; then
   # shellcheck disable=SC1091
   . "$MG/mg.env"
 fi
 PORT=${PORT:-18743} MPORT=${MPORT:-18744} ENGINE_PORTS=${ENGINE_PORTS:-8740-8759}
 ONLY=${ONLY:-all} STALL=${STALL:-30} CYCLES=${CYCLES:-5} HB_CYCLES=${HB_CYCLES:-3}
 OLD_TAG=${OLD_TAG:-v0.1.8}
-RES=$MG/res
+ATTEMPT_ID=${ATTEMPT_ID:-manual}
+[[ $ATTEMPT_ID =~ ^[A-Za-z0-9_-]+$ ]] || exit 2
+ATTEMPT=$MG/attempts/$ATTEMPT_ID
+RES=$ATTEMPT/raw
+STATE=$ATTEMPT/state
 BIN=$MG/bin
 export RUSTUP_HOME=$MG/rust CARGO_HOME=$MG/rust
 export PATH=$BIN:$MG/rust/bin:$PATH
@@ -74,11 +82,16 @@ say() {
 phase() { if [ "$PLAN" = 1 ]; then printf '\n== %s\n' "$*" >&3; else say "== $*"; fi; }
 run() { if [ "$PLAN" = 1 ]; then show "\$ $(printf '%q ' "$@")"; return 0; fi; "$@"; }
 ev() { [ "$PLAN" = 1 ] && return 0; "${HELPER[@]}" "$@"; }
+snapshot() {
+  [ "$PLAN" = 1 ] && return 0
+  "${HELPER[@]}" snapshot --root "$MG" --attempt "$ATTEMPT_ID"
+}
 check() { if [ "$PLAN" = 1 ]; then printf '    => %s (%s) PASS when: %s\n' "$1" "$2" "$3" >&3; else say "checking $1 ($2)"; fi; }
 result() { # id part pass|fail|skip detail
   [ "$PLAN" = 1 ] && return 0
   printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >>"$RES/results.tsv"
   say "[$3] $1 ($2): $4"
+  snapshot || say "EVIDENCE_SNAPSHOT_FAILED"
 }
 skip() { if [ "$PLAN" = 1 ]; then printf '    => %s (%s) SKIP: %s\n' "$1" "$2" "$3" >&3; else result "$1" "$2" skip "$3"; fi; }
 want() { local id; [ "$ONLY" = all ] && return 0; for id in "$@"; do case ",$ONLY," in *",$id,"*) return 0 ;; esac; done; return 1; }
@@ -195,15 +208,18 @@ print("qualify: vllm and sglang local deep_park set to true")
 
 build_capyctl() {
   phase "CapyCTL builds: this checkout (shipped support data), its qualification build, and $OLD_TAG (MG11's older host)"
-  local cargo=(cargo build --release --locked --bin capyctl)
+  local cargo=(cargo build --release --locked --bin capyctl -j 4)
+  if [ "$PLAN" = 0 ] && [ "$(cat "$MG/build-commit" 2>/dev/null)" != "${CAPYCTL_COMMIT:-unknown}" ]; then
+    rm -f "$BIN/capyctl" "$BIN/capyctl-qualify"
+  fi
   if [ ! -x "$BIN/capyctl" ]; then
-    run sh -c "cd $MG/src && PROTOC=$BIN/protoc ${cargo[*]} 2>&1 | tail -n 3 && cp target/release/capyctl $BIN/capyctl"
+    run bash -o pipefail -c "cd $MG/src && PROTOC=$BIN/protoc ${cargo[*]} && cp target/release/capyctl $BIN/capyctl"
   fi
   if [ ! -x "$BIN/capyctl-qualify" ]; then
     run rm -rf "$MG/src-qualify"
     run cp -a "$MG/src" "$MG/src-qualify"
     run python3 -c "$QUALIFY_PY" "$MG/src-qualify/crates/capyctl-config/src/group_support.rs"
-    run sh -c "cd $MG/src-qualify && PROTOC=$BIN/protoc ${cargo[*]} 2>&1 | tail -n 3 && cp target/release/capyctl $BIN/capyctl-qualify"
+    run bash -o pipefail -c "cd $MG/src-qualify && PROTOC=$BIN/protoc ${cargo[*]} && cp target/release/capyctl $BIN/capyctl-qualify"
   fi
   # A dry run makes the qualification edit on a copy of this checkout's support
   # data, so a plan that passes is one whose qualification build turns on deep
@@ -217,7 +233,7 @@ build_capyctl() {
     diff "$support" "$MG/group_support.rs" | grep '^>' | sed -e 's/^>/     +/' >&3
   fi
   if [ ! -x "$BIN/capyctl-old" ] && [ -d "$MG/src-old" ]; then
-    run sh -c "cd $MG/src-old && PROTOC=$BIN/protoc ${cargo[*]} 2>&1 | tail -n 3 && cp target/release/capyctl $BIN/capyctl-old"
+    run bash -o pipefail -c "cd $MG/src-old && PROTOC=$BIN/protoc ${cargo[*]} && cp target/release/capyctl $BIN/capyctl-old"
   fi
   [ "$PLAN" = 1 ] || for b in capyctl capyctl-qualify capyctl-old; do
     [ -x "$BIN/$b" ] && echo "$b $("$BIN/$b" --version 2>&1 | head -1) sha256 $(sha256sum "$BIN/$b" | cut -c1-64)"
@@ -272,7 +288,7 @@ setup_engines() {
     # implicit), so llama-server would not find the wheels' libcudart.so.13.
     local cudaroot
     cudaroot=$(dirname "$(dirname "$nvcc")")
-    run sh -c "cd $LC && rm -rf build && cmake -B build -DGGML_CUDA=ON -DLLAMA_BUILD_IS_DEV=OFF -DCUDAToolkit_ROOT=$cudaroot -DCMAKE_CUDA_COMPILER=$nvcc -DCMAKE_CXX_COMPILER=\$(command -v c++) -DCMAKE_CUDA_HOST_COMPILER=\$(command -v c++) -DCMAKE_BUILD_RPATH=$cudaroot/lib64 -DCMAKE_CUDA_ARCHITECTURES=${arch}-real -DCMAKE_BUILD_TYPE=Release >/dev/null && cmake --build build -j \$(nproc) --target llama-server 2>&1 | tail -n 2"
+    run bash -o pipefail -c "cd $LC && rm -rf build && cmake -B build -DGGML_CUDA=ON -DLLAMA_BUILD_IS_DEV=OFF -DCUDAToolkit_ROOT=$cudaroot -DCMAKE_CUDA_COMPILER=$nvcc -DCMAKE_CXX_COMPILER=\$(command -v c++) -DCMAKE_CUDA_HOST_COMPILER=\$(command -v c++) -DCMAKE_BUILD_RPATH=$cudaroot/lib64 -DCMAKE_CUDA_ARCHITECTURES=${arch}-real -DCMAKE_BUILD_TYPE=Release && cmake --build build -j 4 --target llama-server"
   fi
   [ "$PLAN" = 1 ] || {
     echo "vllm $("$V32/bin/python" -c 'import vllm, torch; print(vllm.__version__, torch.__version__, torch.version.cuda)')"
@@ -309,6 +325,8 @@ setup() {
     [ -s "$GGUF_DIR/$GGUF_FILE" ] || missing="$missing $GGUF_DIR/$GGUF_FILE"
     grep -q '^Q30_REV=[0-9a-f]\{40\}$' "$MG/revs.env" || missing="$missing Q30_REV"
     [ -z "$missing" ] || { say "SETUP_FAILED: missing$missing"; return 1; }
+    printf '%s\n' "${CAPYCTL_COMMIT:-unknown}" >"$MG/build-commit"
+    cp "$RES/versions.txt" "$MG/build-versions.txt"
   fi
   say "SETUP_OK"
 }
@@ -322,7 +340,7 @@ c() { run env XDG_CONFIG_HOME="$MG/cfg-$ROLE" "$CAPYCTL" --state-dir "$SD" "$@";
 role_up() { # tag binary [start standalone options]
   local tag=$1 bin=$2 _
   shift 2
-  ROLE=$tag SD=$MG/$tag CAPYCTL=$BIN/$bin DEPLOYS="" PROFILES=""
+  ROLE=$tag SD=$STATE/$tag CAPYCTL=$BIN/$bin DEPLOYS="" PROFILES=""
   CRED=$SD/identity/credentials DB=$SD/server/srv.sqlite3 ROLE_LOG=$RES/role-$tag.log
   say "role $tag ($bin): standalone, state $SD, 127.0.0.1:$PORT, engine ports $ENGINE_PORTS, stall timeout ${STALL}s"
   run mkdir -m 700 -p "$SD" "$MG/cfg-$tag"
@@ -332,8 +350,8 @@ role_up() { # tag binary [start standalone options]
   fi
   XDG_CONFIG_HOME="$MG/cfg-$tag" CAPYCTL_GROUP_STALL_TIMEOUT="${STALL}s" setsid nohup "$CAPYCTL" --state-dir "$SD" \
     start standalone --listen "127.0.0.1:$PORT" --management-listen "127.0.0.1:$MPORT" \
-    --engine-ports "$ENGINE_PORTS" --model-sources-path "$SOURCES" "$@" --json >"$ROLE_LOG" 2>&1 </dev/null &
-  echo $! >"$MG/role.pid"
+    --engine-ports "$ENGINE_PORTS" --model-sources-path "$SOURCES" "$@" --json >"$ROLE_LOG" 2>&1 </dev/null 9>&- &
+  echo $! >"$ATTEMPT/role.pid"
   for _ in $(seq 180); do grep -q '"ready":true' "$ROLE_LOG" 2>/dev/null && return 0; sleep 1; done
   say "role $tag: no ready line in 180 s"
   return 1
@@ -346,12 +364,12 @@ role_down() {
   for d in $DEPLOYS; do c delete deployment "$d" --stop >>"$RES/cli.log" 2>&1; done
   waitgone
   for d in $PROFILES; do c engine remove "$d" >>"$RES/cli.log" 2>&1; done
-  if [ "$PLAN" = 0 ] && [ -f "$MG/role.pid" ] && pid=$(cat "$MG/role.pid") && [ -r "/proc/$pid/cmdline" ] &&
+  if [ "$PLAN" = 0 ] && [ -f "$ATTEMPT/role.pid" ] && pid=$(cat "$ATTEMPT/role.pid") && [ -r "/proc/$pid/cmdline" ] &&
      tr '\0' ' ' <"/proc/$pid/cmdline" | grep -qF -- "$SD"; then
     kill -TERM "$pid"
     for _ in $(seq 60); do [ -d "/proc/$pid" ] || break; sleep 1; done
   fi
-  [ "$PLAN" = 1 ] || { rm -f "$MG/role.pid"; [ -d "$SD/logs" ] && cp -r "$SD/logs" "$RES/engine-logs-$ROLE"; }
+  [ "$PLAN" = 1 ] || { rm -f "$ATTEMPT/role.pid"; [ -d "$SD/logs" ] && cp -r "$SD/logs" "$RES/engine-logs-$ROLE"; }
   ROLE=""
 }
 
@@ -404,6 +422,16 @@ startd() { # name [start options]: Ready by --wait
   [ "$PLAN" = 1 ] && rc=0
   START_S=$(since "$s")
   [ "$rc" = 0 ] && say "started $n in $START_S s" || say "start $n failed (exit $rc); see start-$n.out"
+  if [ "$PLAN" = 0 ]; then
+    status_json "$n" "$RES/start-$n-status.json"
+    c status deployment "$n" >"$RES/start-$n-status.txt" 2>&1
+    events_since 0 >"$RES/start-$n-events.jsonl"
+    local saved
+    saved=$RES/starts/$(date +%s%N)-$n
+    mkdir -p "$saved"
+    cp "$RES/start-$n.out" "$RES/start-$n-status.json" "$RES/start-$n-status.txt" "$RES/start-$n-events.jsonl" "$saved/"
+    snapshot
+  fi
   return "$rc"
 }
 stopd() { c stop deployment "$1" >>"$RES/cli.log" 2>&1; waitgone; pause 5; }
@@ -483,6 +511,7 @@ serve_check() { # row name engine
   r=$(chat "$n" "$row")
   [ "${r%% *}" = 200 ] && [ "${r##* }" = ok ] && result "$row" ready pass "Ready in $START_S s; chat ${r}" || result "$row" ready fail "Ready in $START_S s; chat ${r:-none}"
   status_json "$n" "$RES/$row-status.json"
+  if [ "$e" = s22 ]; then latest_args sglang "$n" >"$RES/$row-args.json"; fi
   c status deployment "$n" >"$RES/$row-status.txt" 2>&1
   pids=$(owned_pids "$n")
   check "$row" charge "each GPU's ledger charge covers the launch's own bytes on that card (nvidia-smi per process and GPU), and both GPUs hold part"
@@ -501,7 +530,7 @@ for domain, rs in c.items():
     m = re.search(r"gpu(\d+)", domain)
     if m:
         charged[f"gpu{m.group(1)}"] = max(r["bytes"] for r in rs) / 2**20
-ok = len(used) >= 2 and all(charged.get(k, 0) >= v for k, v in used.items())
+ok = len(used) >= 2 and all(0 < v <= charged.get(k, 0) for k, v in used.items())
 print(("pass" if ok else "fail") + "\t" + "; ".join(
     f"{k}: used {used.get(k, 0)} MiB, charged {charged.get(k, 0):.0f} MiB" for k in sorted(set(used) | set(charged))))
 PY
@@ -531,19 +560,11 @@ PY
   [ "$e" = lc ] || return 0
   check "$row" fit "llama.cpp's per-device model buffers each fit that GPU's grant; both CUDA0 and CUDA1 hold a part"
   if [ "$PLAN" = 0 ]; then
-    find "$SD/logs" -type f -name '*.log' -newer "$RES/deploy-$n.out" -exec "${HELPER[@]}" fit {} + >"$RES/$row-fit.txt" 2>/dev/null
-    if grep -q 'CUDA0 model buffer' "$RES/$row-fit.txt" && grep -q 'CUDA1 model buffer' "$RES/$row-fit.txt"; then
-      result "$row" fit pass "$(grep -c buffer "$RES/$row-fit.txt") buffer lines; see $row-fit.txt beside $row-charge.json"
+    find "$SD/logs" -type f -newer "$RES/deploy-$n.out" -exec "${HELPER[@]}" fit {} + >"$RES/$row-fit.txt" 2>/dev/null
+    if r=$("${HELPER[@]}" fit-check "$RES/$row-fit.txt" "$RES/$row-charge.json"); then
+      result "$row" fit pass "$r; see $row-fit.txt beside $row-charge.json"
     else
-      # llama.cpp v0.7.0 logs no buffer sizes at its default verbosity: the
-      # launch's own per-GPU readings stand in (both cards hold a part, each
-      # within its grant, as the charge part reads them).
-      r=$(python3 -c 'import json,sys; u=json.load(open(sys.argv[1]))["owned_mib"]; print(" ".join(f"{k}={v}MiB" for k, v in sorted(u.items())) if len(u) >= 2 and all(v > 0 for v in u.values()) else "")' "$RES/$row-gpus.json")
-      if [ -n "$r" ] && grep -q "^$row"$'\t'"charge"$'\t'"pass" "$RES/results.tsv"; then
-        result "$row" fit pass "no buffer lines in llama.cpp's log (default verbosity); the launch's own readings: $r, each within its grant"
-      else
-        result "$row" fit fail "no per-device buffer lines; readings '${r}'; the charge part did not pass"
-      fi
+      result "$row" fit fail "$r; GPU readings cannot substitute for engine fit logs"
     fi
   fi
 }
@@ -568,10 +589,10 @@ rank_kill() { # name label
     done
     events_since "$seq0" engine_rank_exited >"$RES/mg7-$l-events.jsonl"
     st=$(state_of "$n")
-    if [ -n "$t_rel" ] && [ -n "$t_gone" ] && [ "$t_rel" -ge "$t_gone" ] && grep -q 'engine_rank_exited: rank 1 ' "$RES/mg7-$l-events.jsonl" && [ "$st" = failed ]; then
+    if [ -n "$t_rel" ] && [ -n "$t_gone" ] && [ "$t_rel" -ge "$t_gone" ] && "${HELPER[@]}" rank-exit "$RES/mg7-$l-events.jsonl" --rank 1 && [ "$st" = failed ]; then
       result MG7 "$l kill" pass "state $st; engine_rank_exited names rank 1; processes gone at tick $t_gone, charge released at tick $t_rel (0.5 s ticks)"
     else
-      result MG7 "$l kill" fail "state '$st'; engine_rank_exited: $(grep -o 'engine_rank_exited: rank [0-9]* on gpu[0-9]* ([a-z0-9-]* process [0-9]*)' "$RES/mg7-$l-events.jsonl" | paste -sd';')' (rank 1 killed); gone tick '${t_gone}', release tick '${t_rel}'"
+      result MG7 "$l kill" fail "state '$st'; rank 1 must appear in the observed exit set (no ordering assumed); see mg7-$l-events.jsonl; gone tick '${t_gone}', release tick '${t_rel}'"
     fi
     "${HELPER[@]}" shm --out "$RES/mg7-$l-shm-after-kill.txt"
   fi
@@ -601,7 +622,7 @@ rank_hang() { # name label
   seq0=$(event_seq)
   signal_rank "$n" 1 STOP || { result MG8 "$l" fail "no rank 1 identity recorded"; stopd "$n"; return; }
   if [ "$PLAN" = 0 ]; then
-    "${HELPER[@]}" hold --cred "$CRED" --endpoint "$EP" --model "$n" --max-tokens 256 --out "$RES/mg8-$l-hold.json" &
+    "${HELPER[@]}" hold --cred "$CRED" --endpoint "$EP" --model "$n" --max-tokens 256 --out "$RES/mg8-$l-hold.json" 9>&- &
     hold=$!
     st=$(poll_state "$n" $((STALL + 180)) failed stopped)
     events_since "$seq0" tp_stalled >"$RES/mg8-$l-events.jsonl"
@@ -627,12 +648,10 @@ bench_pair() { # name engine label
     log=$(find "$SD/logs" -type f -name '*.log' -newer "$RES/start-$n.out" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)
     [ -n "$log" ] || log=$(find "$SD/logs" -type f -name '*.log' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)
     # vLLM logs no `non-default args` under CapyCTL: its API process's argv,
-    # read while it runs, is the record then (mg.py engine-args --argv).
+    # Parse the live API argv without ever persisting its raw secret-bearing bytes.
     local api
     api=$("${HELPER[@]}" owned "$DB" "$n" --role api 2>/dev/null | head -1 | python3 -c 'import json,sys; print(json.loads(sys.stdin.read() or "{}").get("pid",""))')
-    : >"$RES/mg9-$l-argv.txt"
-    [ -n "$api" ] && [ -r "/proc/$api/cmdline" ] && tr '\0' '\n' <"/proc/$api/cmdline" >"$RES/mg9-$l-argv.txt"
-    args=$("${HELPER[@]}" engine-args --engine "$([ "$e" = v32 ] && echo vllm || echo sglang)" "$log" --argv "$RES/mg9-$l-argv.txt")
+    args=$("${HELPER[@]}" engine-args --engine "$([ "$e" = v32 ] && echo vllm || echo sglang)" "$log" --pid "${api:-0}")
     echo "$args" >"$RES/mg9-$l-args.json"
   fi
   stopd "$n"
@@ -659,13 +678,20 @@ bench_pair() { # name engine label
     hp=(env "${envs[@]}" "$S22/bin/python" -c "$HAND_SGLANG" "$model" "$port" "$RES/mg9-$l-args.json")
   fi
   if [ "$PLAN" = 1 ]; then show "\$ ${hp[*]} &   (by hand; then wait for /v1/models on 127.0.0.1:$port)"; else
-    setsid nohup "${hp[@]}" >"$RES/mg9-$l-hand.log" 2>&1 </dev/null &
+    setsid nohup "${hp[@]}" >"$RES/mg9-$l-hand.log" 2>&1 </dev/null 9>&- &
     local hand=$! _
     for _ in $(seq 1800); do
       curl -fs "http://127.0.0.1:$port/v1/models" >/dev/null 2>&1 && break
       [ -d "/proc/$hand" ] || { say "the hand launch exited before serving; see mg9-$l-hand.log"; break; }
       sleep 1
     done
+    "${HELPER[@]}" engine-args --engine "$([ "$e" = v32 ] && echo vllm || echo sglang)" "$RES/mg9-$l-hand.log" --pid "$hand" >"$RES/mg9-$l-hand-args.json"
+    if ! cmp -s "$RES/mg9-$l-args.json" "$RES/mg9-$l-hand-args.json"; then
+      result MG9 "$l" fail "effective direct-launch arguments differ; see mg9-$l-{args,hand-args}.json"
+      kill -TERM -- "-$hand" 2>/dev/null
+      waitgone
+      return
+    fi
     for cc in 1 4 8; do
       "${HELPER[@]}" bench --no-key --endpoint "http://127.0.0.1:$port" --model "$model" --concurrency "$cc" --tokens 256 --rounds 3 --out "$RES/mg9-$l-hand-c$cc.json" >>"$RES/cli.log"
     done
@@ -678,8 +704,11 @@ res, label = sys.argv[1:3]
 parts, ok = [], True
 for c in (1, 4, 8):
     try:
-        a = json.load(open(f"{res}/mg9-{label}-capyctl-c{c}.json"))["tokens_per_s"]
-        b = json.load(open(f"{res}/mg9-{label}-hand-c{c}.json"))["tokens_per_s"]
+        router = json.load(open(f"{res}/mg9-{label}-capyctl-c{c}.json"))
+        direct = json.load(open(f"{res}/mg9-{label}-hand-c{c}.json"))
+        if any(r["ok"] != r["requests"] or r["requests"] != c * 3 for r in (router, direct)):
+            raise ValueError("benchmark requests failed")
+        a, b = router["tokens_per_s"], direct["tokens_per_s"]
     except (OSError, KeyError, ValueError):
         print("fail\tmissing benchmark results"); sys.exit()
     ratio = a / b if b else 0
@@ -705,36 +734,33 @@ for k, v in sorted(args.items()):
 os.execv(os.path.join(os.path.dirname(sys.executable), "vllm"), argv)
 '
 HAND_SGLANG='
-import json, os, sys
-model, port, args = sys.argv[1], sys.argv[2], json.load(open(sys.argv[3]))
-argv = [sys.executable, "-m", "sglang.launch_server", "--model-path", model, "--host", "127.0.0.1", "--port", port]
-keep = ("tp_size", "mem_fraction_static", "context_length", "max_running_requests", "chunked_prefill_size",
-        "max_total_tokens", "kv_cache_dtype", "attention_backend", "cuda_graph_max_bs", "disable_cuda_graph",
-        "page_size", "schedule_policy", "dtype", "trust_remote_code")
-for k in keep:
-    v = args.get(k)
-    flag = "--" + k.replace("_", "-")
-    if v is True: argv.append(flag)
-    elif v is False or v is None: continue
-    else: argv += [flag, str(v)]
-os.execv(sys.executable, argv)
+import json, sys
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.entrypoints.http_server import launch_server
+model, port, args = sys.argv[1], int(sys.argv[2]), json.load(open(sys.argv[3]))
+native = ServerArgs(**dict(args, model_path=model, tokenizer_path=model, host="127.0.0.1", port=port))
+native.resolve_once()
+print("MG_EFFECTIVE_ARGS=" + json.dumps({k: getattr(native, k) for k in args}, sort_keys=True, default=str), flush=True)
+launch_server(native)
 '
 
 # MG4, MG5, MG6: park and wake cycles; per-GPU readings after each.
 cycles() { # row name count label
   local row=$1 n=$2 k=$3 l=$4 i st r pids ok=0
   check "$row" "$l" "$k park and wake cycles: each park settles (parked) with both GPUs' owned bytes down; each wake Ready with the canary request answering 42 and both GPUs' bytes back"
-  startd "$n" || { result "$row" "$l" fail "start failed"; return; }
+  startd "$n" || { result "$row" "$l" fail "start failed; see start-$n-status and start-$n-events"; stopd "$n"; return; }
   for i in $(seq "$k"); do
     c park deployment "$n" >>"$RES/cli.log" 2>&1
     st=$(poll_state "$n" 600 parked failed)
     pids=$(owned_pids "$n")
     ev gpus --pids "$pids" >"$RES/$row-$l-park$i-gpus.json"
     ev charge "$DB" "$n" >"$RES/$row-$l-park$i-charge.json"
+    status_json "$n" "$RES/$row-$l-park$i-status.json"
     [ "$st" = parked ] || { result "$row" "$l" fail "cycle $i: park reached '$st'"; stopd "$n"; return; }
     c start deployment "$n" --wait >>"$RES/cli.log" 2>&1
     r=$(chat "$n" "$row-$l-wake$i")
     ev gpus --pids "$(owned_pids "$n")" >"$RES/$row-$l-wake$i-gpus.json"
+    status_json "$n" "$RES/$row-$l-wake$i-status.json"
     [ "${r%% *}" = 200 ] && [ "${r##* }" = ok ] || { result "$row" "$l" fail "cycle $i: wake canary ${r:-none}"; stopd "$n"; return; }
     ok=$((ok + 1))
   done
@@ -747,7 +773,7 @@ ok = True
 for i in range(1, k + 1):
     p = json.load(open(f"{res}/{row}-{label}-park{i}-gpus.json"))["owned_mib"]
     w = json.load(open(f"{res}/{row}-{label}-wake{i}-gpus.json"))["owned_mib"]
-    ok = ok and len(w) >= 2 and all(p.get(g, 0) < w[g] for g in w)
+    ok = ok and len(w) >= 2 and set(p) == set(w) and all(p[g] < w[g] for g in w)
     lines.append(f"{i}: parked {p} woken {w}")
 print(("pass" if ok else "fail") + "\t" + " | ".join(lines))
 PY
@@ -809,7 +835,7 @@ bandwidth() {
 }
 
 rows_shipped() {
-  want BW MG1 MG2 MG3 MG7 MG8 MG9 MG12 MG14 || return 0
+  want BW MG1 MG2 MG3 MG4 MG5 MG6 MG7 MG8 MG9 MG10 MG11 MG12 MG13 MG14 || return 0
   phase "role s1: the shipped build (deep parking at N > 1 off for every engine)"
   role_up s1 capyctl || { say "role s1 did not start"; return; }
   profiles
@@ -845,9 +871,9 @@ engine_config: {context_length: 16384}"
     if want MG8; then phase "MG8 vLLM"; rank_hang mg-v vllm; fi
     if want MG9; then phase "MG9 vLLM"; bench_pair mg-v v32 vllm; fi
   fi
-  if want MG2 MG7 MG8 MG9; then
+  if want MG2 MG7 MG8 MG9 MG13; then
     deploy mg-s || result MG2 deploy fail "refused: $(tr '\n' ' ' <"$RES/deploy-mg-s.out" | cut -c1-300)"
-    if want MG2; then phase "MG2 SGLang 0.5.22 TP 2"; serve_check MG2 mg-s s22; stopd mg-s; fi
+    if want MG2 MG13; then phase "MG2 SGLang 0.5.22 TP 2 (also MG13's argument baseline)"; serve_check MG2 mg-s s22; stopd mg-s; fi
     if want MG7; then phase "MG7 SGLang"; shm_stop mg-s sglang; rank_kill mg-s sglang; fi
     if want MG8; then phase "MG8 SGLang"; rank_hang mg-s sglang; fi
     if want MG9; then phase "MG9 SGLang"; bench_pair mg-s s22 sglang; fi
@@ -871,14 +897,14 @@ rows_qualify() {
     dep mg4 v32 "$(q30)" "topology: {tensor_parallel: 2}
 residency: deep
 engine_config: {context_length: 32768}"
-    deploy mg4 && cycles MG4 mg4 "$CYCLES" deep
+    deploy mg4 && cycles MG4 mg4 "$CYCLES" deep || result MG4 deep fail "deploy failed; see deploy-mg4.out"
   fi
   if want MG5; then
     phase "MG5 SGLang TP 2 deep"
     dep mg5 s22 "$(q30)" "topology: {tensor_parallel: 2}
 residency: deep
 engine_config: {context_length: 32768}"
-    deploy mg5 && cycles MG5 mg5 "$CYCLES" deep
+    deploy mg5 && cycles MG5 mg5 "$CYCLES" deep || result MG5 deep fail "deploy failed; see deploy-mg5.out"
   fi
   if want MG6; then
     phase "MG6 host_backed, vLLM and SGLang TP 2"
@@ -891,9 +917,9 @@ engine_config: {context_length: 32768}"
       dep mg6-s s22 "$(q30)" "topology: {tensor_parallel: 2}
 residency: host_backed
 engine_config: {context_length: 32768}"
-      deploy mg6-v && cycles MG6 mg6-v "$HB_CYCLES" vllm
+      deploy mg6-v && cycles MG6 mg6-v "$HB_CYCLES" vllm || result MG6 vllm fail "deploy failed; see deploy-mg6-v.out"
       ev charge "$DB" mg6-v >"$RES/mg6-vllm-charge-after.json"
-      deploy mg6-s && cycles MG6 mg6-s "$HB_CYCLES" sglang
+      deploy mg6-s && cycles MG6 mg6-s "$HB_CYCLES" sglang || result MG6 sglang fail "deploy failed; see deploy-mg6-s.out"
       ev charge "$DB" mg6-s >"$RES/mg6-sglang-charge-after.json"
       check MG6 released "after each stop the ledger holds no reservation of the deployment (host copy included)"
       if [ "$PLAN" = 0 ]; then
@@ -924,7 +950,7 @@ engine_config: {context_length: 32768, memory: {kv_cache: 30GiB}}"
       if [ "$PLAN" = 0 ]; then
         events_since "$seq0" >"$RES/mg10-events.jsonl"
         "${HELPER[@]}" sql "$DB" "SELECT switch_id,phase,victims_json FROM active_switches" >"$RES/mg10-switches.tsv"
-        if [ "${r%% *}" = 200 ] && [ "$st" != ready ] && grep -q gpu0 "$RES/mg10-events.jsonl" && grep -q gpu1 "$RES/mg10-events.jsonl"; then
+        if [ "${r%% *}" = 200 ] && [ "${r##* }" = ok ] && [ "$st" != ready ] && grep -q gpu0 "$RES/mg10-events.jsonl" && grep -q gpu1 "$RES/mg10-events.jsonl"; then
           result MG10 switch pass "request ${r}; single-GPU model $st; events name gpu0 and gpu1"
         else
           result MG10 switch fail "request ${r:-none}; single-GPU model '$st'; see mg10-events.jsonl"
@@ -949,28 +975,29 @@ engine_config: {context_length: 32768}"
     if deploy mg13-4b && deploy mg13-4b-x && deploy mg13-30b; then
       check MG13 n1 "the 4B model chooses N = 1, status 'TP auto (1)', and its vLLM arguments equal an explicit single-GPU deployment's"
       startd mg13-4b-x
-      a=$(latest_args vllm); stopd mg13-4b-x
+      a=$(latest_args vllm mg13-4b-x); printf '%s\n' "$a" >"$RES/mg13-pinned-args.json"; stopd mg13-4b-x
       startd mg13-4b
-      b=$(latest_args vllm)
+      b=$(latest_args vllm mg13-4b); printf '%s\n' "$b" >"$RES/mg13-n1-args.json"
       status_json mg13-4b "$RES/mg13-4b.json"; c status deployment mg13-4b >"$RES/mg13-4b.txt" 2>&1
       if [ "$PLAN" = 0 ]; then
         tp=$("${HELPER[@]}" get "$RES/mg13-4b.json" 'instances[0].topology.tensor_parallel')
         txt=$(grep -c 'TP auto (1)' "$RES/mg13-4b.txt")
-        [ "$tp" = 1 ] && [ "$txt" -gt 0 ] && [ "$a" = "$b" ] && [ -n "$a" ] &&
+        [ "$tp" = 1 ] && [ "$txt" -gt 0 ] && [ "$a" = "$b" ] && [ -n "$a" ] && [ "$a" != "{}" ] &&
           result MG13 n1 pass "tensor_parallel 1; 'TP auto (1)'; arguments equal" ||
           result MG13 n1 fail "tensor_parallel '$tp'; TP auto lines $txt; arguments equal: $([ "$a" = "$b" ] && echo yes || echo no)"
       fi
       check MG13 n2 "with the 4B model serving on gpu0, the 30B model started with --evict chooses N = 2 (status 'TP auto (2)'), its SGLang arguments equal MG2's, and the 4B model is evicted"
       startd mg13-30b --evict
       status_json mg13-30b "$RES/mg13-30b.json"; c status deployment mg13-30b >"$RES/mg13-30b.txt" 2>&1
-      b=$(latest_args sglang)
+      b=$(latest_args sglang mg13-30b); printf '%s\n' "$b" >"$RES/mg13-n2-args.json"
       if [ "$PLAN" = 0 ]; then
         tp=$("${HELPER[@]}" get "$RES/mg13-30b.json" 'instances[0].topology.tensor_parallel')
         devs=$("${HELPER[@]}" get "$RES/mg13-30b.json" 'instances[0].topology.devices')
-        a=$(cat "$RES/mg9-sglang-args.json" 2>/dev/null)
+        a=$(cat "$RES/MG2-args.json" 2>/dev/null)
+        printf '%s\n' "$a" >"$RES/mg13-baseline-args.json"
         st=$(state_of mg13-4b)
-        [ "$tp" = 2 ] && grep -q 'TP auto (2)' "$RES/mg13-30b.txt" && [ "$st" != ready ] && { [ -z "$a" ] || [ "$a" = "$b" ]; } &&
-          result MG13 n2 pass "tensor_parallel 2 on $devs; 4B model $st; arguments $([ -z "$a" ] && echo "not compared (no MG9 SGLang record)" || echo "equal MG2's")" ||
+        [ "$tp" = 2 ] && grep -q 'TP auto (2)' "$RES/mg13-30b.txt" && [ "$st" != ready ] && [ -n "$a" ] && [ "$a" != "{}" ] && [ "$a" = "$b" ] &&
+          result MG13 n2 pass "tensor_parallel 2 on $devs; 4B model $st; arguments equal MG2's" ||
           result MG13 n2 fail "tensor_parallel '$tp'; 4B model '$st'; arguments equal MG2's: $([ "$a" = "$b" ] && echo yes || echo no)"
       fi
       check MG13 wake "the 30B model parked and woken keeps N = 2 and the same GPUs"
@@ -982,7 +1009,7 @@ engine_config: {context_length: 32768}"
         devs2=$("${HELPER[@]}" get "$RES/mg13-30b-woken.json" 'instances[0].topology.devices')
         tp=$("${HELPER[@]}" get "$RES/mg13-30b-woken.json" 'instances[0].topology.tensor_parallel')
         r=$(chat mg13-30b mg13-wake)
-        [ "$tp" = 2 ] && [ "$devs" = "$devs2" ] && [ "${r%% *}" = 200 ] &&
+        [ "$tp" = 2 ] && [ -n "$devs" ] && [ "$devs" = "$devs2" ] && [ "${r%% *}" = 200 ] && [ "${r##* }" = ok ] &&
           result MG13 wake pass "tensor_parallel 2 on $devs2; chat $r" ||
           result MG13 wake fail "tensor_parallel '$tp'; devices '$devs' then '$devs2'; chat ${r:-none}"
       fi
@@ -994,11 +1021,12 @@ engine_config: {context_length: 32768}"
   fi
   role_down
 }
-latest_args() { # engine: the newest launch's own argument record (mg.py engine-args)
+latest_args() { # engine deployment: log plus live API argv, never raw keys
   [ "$PLAN" = 1 ] && { echo "{}"; return 0; }
-  local log
+  local log api
   log=$(find "$SD/logs" -type f -name '*.log' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)
-  [ -n "$log" ] && "${HELPER[@]}" engine-args --engine "$1" "$log"
+  api=$("${HELPER[@]}" owned "$DB" "$2" --role api 2>/dev/null | head -1 | python3 -c 'import json,sys; print(json.loads(sys.stdin.read() or "{}").get("pid",""))')
+  "${HELPER[@]}" engine-args --engine "$1" "${log:-/dev/null}" --pid "${api:-0}"
 }
 
 # MG11: the machine enrolled as a host of a control-plane server on loopback, and
@@ -1007,7 +1035,7 @@ rows_enrolled() {
   want MG11 || return 0
   phase "MG11 enrolled host: server, host (this build) and an older host ($OLD_TAG) on loopback"
   if [ "$PLAN" = 0 ] && [ ! -x "$BIN/capyctl-old" ]; then skip MG11 old "no $OLD_TAG build"; fi
-  local srv=$MG/srv h1=$MG/h1 h0=$MG/h0 r out rc
+  local srv=$STATE/srv h1=$STATE/h1 h0=$STATE/h0 r out rc
   ROLE=srv SD=$srv CAPYCTL=$BIN/capyctl CRED=$srv/identity/server-credentials.json DB=$srv/server/srv.sqlite3
   run mkdir -m 700 -p "$srv" "$h1" "$h0" "$MG/cfg-srv"
   run env CAPYCTL_STATE_DIR="$srv" "$CAPYCTL" init server --output "$srv/init.json"
@@ -1025,8 +1053,8 @@ with os.fdopen(fd, "w") as handle:
     json.dump(doc, handle, indent=2)
 PY
   if [ "$PLAN" = 1 ]; then show "\$ setsid capyctl start server --config $srv/server.yaml &"; else
-    setsid nohup "$CAPYCTL" start server --config "$srv/server.yaml" >"$RES/role-srv.log" 2>&1 </dev/null &
-    echo $! >"$MG/srv.pid"
+    setsid nohup "$CAPYCTL" start server --config "$srv/server.yaml" >"$RES/role-srv.log" 2>&1 </dev/null 9>&- &
+    echo $! >"$ATTEMPT/srv.pid"
     sleep 10
   fi
   enroll_host() { # name dir binary ingress-port
@@ -1044,7 +1072,7 @@ open(path, "w").write(text)
 PY
     run env XDG_CONFIG_HOME="$dir/cfg" "$bin" join host --join-file "$dir/$name.join" --config "$dir/host.yaml"
     if [ "$PLAN" = 1 ]; then show "\$ setsid $bin start host --config $dir/host.yaml &"; else
-      XDG_CONFIG_HOME="$dir/cfg" setsid nohup "$bin" start host --config "$dir/host.yaml" >"$RES/role-$name.log" 2>&1 </dev/null &
+      XDG_CONFIG_HOME="$dir/cfg" setsid nohup "$bin" start host --config "$dir/host.yaml" >"$RES/role-$name.log" 2>&1 </dev/null 9>&- &
       echo $! >"$dir/host.pid"
       sleep 10
     fi
@@ -1068,7 +1096,7 @@ engine_config: {context_length: 32768}"
   rc=$?
   r=$(chat mg11-new mg11)
   if [ "$PLAN" = 0 ]; then
-    [ "$rc" = 0 ] && [ "${r%% *}" = 200 ] && result MG11 remote pass "Ready; chat $r" || result MG11 remote fail "start exit $rc; chat ${r:-none}"
+    [ "$rc" = 0 ] && [ "${r%% *}" = 200 ] && [ "${r##* }" = ok ] && result MG11 remote pass "Ready; chat $r" || result MG11 remote fail "start exit $rc; chat ${r:-none}"
   fi
   srvc stop deployment mg11-new >>"$RES/cli.log" 2>&1
   waitgone
@@ -1088,7 +1116,7 @@ engine_config: {context_length: 32768}"
   srvc delete deployment mg11-old --stop >>"$RES/cli.log" 2>&1
   waitgone
   local pf pid
-  for pf in "$h1/host.pid" "$h0/host.pid" "$MG/srv.pid"; do
+  for pf in "$h1/host.pid" "$h0/host.pid" "$ATTEMPT/srv.pid"; do
     [ "$PLAN" = 0 ] && [ -f "$pf" ] && pid=$(cat "$pf") && kill -TERM "$pid" 2>/dev/null
   done
   pause 10
@@ -1096,15 +1124,8 @@ engine_config: {context_length: 32768}"
 }
 
 run_rows() {
-  # A follow-up run (--only) replaces the results of its own rows and keeps
-  # the others', so verdict.md covers the whole session.
-  if [ "$PLAN" = 0 ]; then
-    mkdir -p "$RES"
-    if [ "$ONLY" = all ] || [ ! -f "$RES/results.tsv" ]; then : >"$RES/results.tsv"; else
-      awk -F'\t' -v only=",$ONLY," 'index(only, "," $1 ",") == 0' "$RES/results.tsv" >"$RES/results.tsv.keep"
-      mv "$RES/results.tsv.keep" "$RES/results.tsv"
-    fi
-  fi
+  # Each attempt owns an immutable history directory; no prior result is erased.
+  if [ "$PLAN" = 0 ]; then mkdir -p "$RES"; : >"$RES/results.tsv"; fi
   if [ -f "$MG/revs.env" ]; then
     # shellcheck disable=SC1091
     . "$MG/revs.env"
@@ -1114,47 +1135,84 @@ run_rows() {
   rows_qualify
   rows_enrolled
   say "RUN_DONE"
+  if [ "$PLAN" = 0 ]; then
+    snapshot || return 1
+    "${HELPER[@]}" verdict "$MG/evidence/$ATTEMPT_ID/raw/results.tsv" "$RES/verdict.md" --settings "$ATTEMPT/settings.json" --only "$ONLY"
+  fi
 }
 
 down() {
   local pf pid
-  for pf in "$MG/role.pid" "$MG/srv.pid" "$MG/h1/host.pid" "$MG/h0/host.pid"; do
+  for pf in "$MG"/attempts/*/role.pid "$MG"/attempts/*/srv.pid "$MG"/attempts/*/state/h1/host.pid "$MG"/attempts/*/state/h0/host.pid; do
     [ -f "$pf" ] || continue
     pid=$(cat "$pf")
-    if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" | grep -q capyctl; then
+    if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" | grep -qF "$MG/attempts/"; then
       kill -TERM "$pid" 2>/dev/null
     fi
     rm -f "$pf"
   done
-  waitgone || echo "warning: an engine process is still running"
+  waitgone || { echo "FAIL: an engine process is still running"; return 1; }
 }
 
 purge() {
-  down
+  down || return 1
   [ -f "$CREATED" ] || { echo "nothing recorded in $CREATED"; return 0; }
   local p
   # The engine directories, then the work directory itself (the last line).
   tac "$CREATED" | while read -r p; do
-    case $p in "$HOME"/*) ;; *) echo "refusing to remove $p (outside ~)"; continue ;; esac
+    case $p in "$HOME"/*) ;; *) echo "refusing to remove $p (outside ~)"; exit 1 ;; esac
     echo "remove $p"
-    rm -rf -- "$p"
-  done
+    rm -rf -- "$p" || exit 1
+  done || return 1
   echo PURGED
 }
 
 case $cmd in
   preflight) preflight ;;
-  setup) setup ;;
+  setup) set -e; mkdir -p "$RES"; setup ;;
   run) run_rows ;;
   plan) mkdir -p "$RES" "$MG/dep"; setup; run_rows ;;
-  # run.sh starts this one detached: setup unless SKIP_SETUP=1, then the rows; the
-  # exit status goes to $MG/done, which run.sh waits for.
-  all)
-    rm -f "$MG/done"
-    if [ "${SKIP_SETUP:-0}" = 1 ] || setup; then (run_rows); rc=$?; else rc=3; fi
-    down
-    echo "$rc" >"$MG/done"
+  finalize)
+    exec 9>"$MG/session.lock"
+    flock -n 9 || { echo "cannot finalize an active qualification attempt"; exit 1; }
+    down || exit 1
+    for attempt in "$MG"/attempts/*; do
+      [ -d "$attempt/raw" ] || continue
+      "${HELPER[@]}" snapshot --root "$MG" --attempt "${attempt##*/}" || exit 1
+    done
     ;;
+  # One detached run, bounded by run.sh's timeout. Always publish a final marker.
+  all)
+    mkdir -p "$RES"
+    printf '%s\n' "$$" >"$ATTEMPT/runner.pid"
+    awk '{print $22}' "/proc/$$/stat" >"$ATTEMPT/runner.ticks"
+    exec 9>"$MG/session.lock"
+    flock -n 9 || { echo "another qualification attempt is active"; exit 1; }
+    # Invoked by the EXIT trap after setup or row completion.
+    # shellcheck disable=SC2329
+    finish_remote() {
+      local rc=$?
+      trap - EXIT TERM INT HUP
+      down || rc=1
+      printf '{"attempt":"%s","exit_code":%s}\n' "$ATTEMPT_ID" "$rc" >"$ATTEMPT/host-completion.json.partial"
+      mv "$ATTEMPT/host-completion.json.partial" "$ATTEMPT/host-completion.json"
+      snapshot
+      exit "$rc"
+    }
+    trap 'finish_remote' EXIT
+    trap 'exit 143' TERM HUP
+    trap 'exit 130' INT
+    if [ "${SKIP_SETUP:-0}" = 1 ]; then
+      [ "$(cat "$MG/build-commit" 2>/dev/null)" = "${CAPYCTL_COMMIT:-unknown}" ] ||
+        { say "SETUP_FAILED: --skip-setup build commit mismatch"; exit 3; }
+      cp "$MG/build-versions.txt" "$RES/versions.txt" || exit 3
+    else
+      ATTEMPT_ID=$ATTEMPT_ID bash "$HERE/remote.sh" setup || exit 3
+    fi
+    run_rows
+    exit $?
+    ;;
+  collect) snapshot ;;
   down) down ;;
   purge) purge ;;
   *) sed -n '2,20p' "$0"; exit 2 ;;

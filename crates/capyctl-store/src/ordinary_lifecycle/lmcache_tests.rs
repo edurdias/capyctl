@@ -1435,6 +1435,7 @@ fn a_server_exit_fails_the_instance_once_ready_or_parked() {
         generation: a.generation,
         step_id: context.token.step_id.clone(),
         process: server(10)[0].clone(),
+        also_exited: Vec::new(),
         status: "signal 9".into(),
         observed_at_ms: 300,
     };
@@ -1486,6 +1487,7 @@ fn a_server_exit_fails_the_instance_once_ready_or_parked() {
                 generation: b.generation,
                 step_id: cb.token.step_id.clone(),
                 process: server(20)[0].clone(),
+                also_exited: Vec::new(),
                 status: "exit code 1".into(),
                 observed_at_ms: 1_300,
             },
@@ -2180,6 +2182,7 @@ fn status_says_why_lmcache_is_off_and_when_its_server_exited() {
                 generation: exited.generation,
                 step_id: context.token.step_id.clone(),
                 process: server(40)[0].clone(),
+                also_exited: Vec::new(),
                 status: "signal 9".into(),
                 observed_at_ms: 300,
             },
@@ -2390,6 +2393,7 @@ fn a_server_member_exit_is_not_the_servers() {
         generation: a.generation,
         step_id: context.token.step_id.clone(),
         process: process.clone(),
+        also_exited: Vec::new(),
         status: "exit code 0".into(),
         observed_at_ms: at,
     };

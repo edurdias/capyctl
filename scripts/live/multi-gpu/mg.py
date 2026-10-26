@@ -39,6 +39,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -50,8 +51,14 @@ LONG_PROMPT = "Write a long story about a lighthouse keeper, at least two thousa
 
 
 def credential(path, name):
-    """One `name: value` line of the role's credentials file; never printed."""
-    for line in Path(path).read_text().splitlines():
+    """Standalone YAML-like lines or enrolled-server JSON; never printed."""
+    text = Path(path).read_text()
+    if text.lstrip().startswith("{"):
+        value = json.loads(text).get(name)
+        if isinstance(value, str) and value:
+            return value
+        raise SystemExit(f"no {name} in the credentials file")
+    for line in text.splitlines():
         m = re.match(rf"^\s*{name}\s*:\s*(\S+)\s*$", line)
         if m:
             return m.group(1)
@@ -214,7 +221,7 @@ VOLATILE = {"port", "host", "api_key", "served_model_name", "model", "model_path
 
 def cmd_engine_args(a):
     import ast
-    text = Path(a.log).read_text(errors="replace")
+    text = Path(a.log).read_text(errors="replace") if Path(a.log).is_file() else ""
     parsed = {}
     if a.engine == "vllm":
         for m in re.finditer(r"non-default args: (\{.*\})", text):
@@ -230,13 +237,21 @@ def cmd_engine_args(a):
                     parsed[k] = ast.literal_eval(v)
                 except (ValueError, SyntaxError):
                     parsed[k] = v.strip()
-    if not parsed and a.argv and Path(a.argv).is_file():
-        # vLLM 0.32.0 under CapyCTL logs no `non-default args` line: the API
-        # process's own argv (one token per line, read from /proc while it ran),
-        # `... serve MODEL --flag [value] ...`. The engine key rides the
-        # environment, never argv; any key-like flag is dropped all the same.
-        tokens = Path(a.argv).read_text().split("\n")
+        for match in re.finditer(r"^MG_EFFECTIVE_ARGS=(.*)$", text, re.M):
+            parsed = json.loads(match.group(1))
+    tokens = []
+    if a.pid:
+        try:
+            tokens = Path(f"/proc/{a.pid}/cmdline").read_bytes().decode().split("\0")
+        except OSError:
+            pass
+    elif a.argv and Path(a.argv).is_file():
+        tokens = Path(a.argv).read_text().splitlines()
+    # Compare vLLM argv with argv (not its differently typed non-default log
+    # summary). Read it in memory only: no credential-bearing argv artifact.
+    if tokens and (not parsed or a.engine == "vllm"):
         if "serve" in tokens:
+            parsed = {}
             rest = tokens[tokens.index("serve") + 2:]
             i = 0
             while i < len(rest):
@@ -249,6 +264,15 @@ def cmd_engine_args(a):
                         value, i = rest[i + 1], i + 2
                     else:
                         value, i = True, i + 1
+                    if isinstance(value, str):
+                        try:
+                            decoded = json.loads(value)
+                            # An explicit scalar `false`/`null` is an argv value,
+                            # not an absent flag. Bare flags alone are True.
+                            if decoded is not None and not isinstance(decoded, bool):
+                                value = decoded
+                        except ValueError:
+                            pass
                     # `--capyctl-user-args` is CapyCTL's own marker between its
                     # reserved arguments and the user's (runtime/vllm_entry.py).
                     if not re.search(r"(^|_)(key|secret|token)$", key) and not key.startswith("capyctl"):
@@ -274,7 +298,8 @@ def cmd_engine_args(a):
                           enable_weights_cpu_backup=settings["cpu_weight_backup"])
             if public.get("devices") is not None:
                 parsed.update(tp_size=len(public["devices"]), base_gpu_id=0)
-    print(json.dumps({k: v for k, v in parsed.items() if k not in VOLATILE}, sort_keys=True, default=str))
+    print(json.dumps({k: v for k, v in parsed.items() if k not in VOLATILE and
+                      not re.search(r"(^|_)(key|secret|token)$", k)}, sort_keys=True, default=str))
     return 0 if parsed else 1
 
 
@@ -459,6 +484,16 @@ def cmd_events(a):
     return 0
 
 
+def cmd_rank_exit(a):
+    """An observed exit set must name the targeted rank, in any order."""
+    for line in Path(a.events).read_text().splitlines():
+        event = json.loads(line)
+        if event.get("kind") == "engine_rank_exited" and re.search(
+                rf"\brank\s+{a.rank}\b", json.dumps(event)):
+            return 0
+    return 1
+
+
 def cmd_charge(a):
     # The resource ledger: one footprint per owner (instance 0 is the deployment
     # id, another instance `deployment:<id>/instance:<k>`), its allocations
@@ -492,7 +527,7 @@ def cmd_hf_rev(a):
 
 def cmd_fit(a):
     """llama.cpp's per-device lines: the model and KV buffers each CUDA device holds."""
-    pattern = re.compile(r"(CUDA\d+) (model|KV|compute) buffer size\s*=\s*([\d.]+) MiB|llama_params_fit|split_mode|tensor_split")
+    pattern = re.compile(r"CUDA\d+\s+(?:model|KV|compute) buffer size\s*=\s*[\d.]+\s+MiB|llama_params_fit|split_mode|tensor_split")
     for log in a.logs:
         for line in Path(log).read_text(errors="replace").splitlines():
             if pattern.search(line):
@@ -500,32 +535,335 @@ def cmd_fit(a):
     return 0
 
 
+EXPECTED = {
+    "MG1": ("ready", "charge", "listeners", "peaks"),
+    "MG2": ("ready", "charge", "listeners", "peaks"),
+    "MG3": ("ready", "charge", "listeners", "peaks", "fit"),
+    "MG4": ("deep",), "MG5": ("deep",),
+    "MG6": ("vllm", "sglang", "released"),
+    "MG7": ("vllm stop", "vllm kill", "sglang stop", "sglang kill"),
+    "MG8": ("vllm", "sglang"), "MG9": ("vllm", "sglang"),
+    "MG10": ("switch",), "MG11": ("remote", "old"),
+    "MG12": ("tp3", "pin"), "MG13": ("n1", "n2", "wake"),
+    "MG14": ("tp1", "auto"), "BW": ("q30",),
+}
+
+
+def fit_matches(text, charge):
+    """Require llama.cpp's own positive model allocation on each granted GPU."""
+    try:
+        buffers = {}
+        for gpu, mib in re.findall(r"CUDA(\d+)\s+model buffer size\s*=\s*([\d.]+)\s+MiB", text):
+            buffers[f"gpu{gpu}"] = max(buffers.get(f"gpu{gpu}", 0), float(mib) * 2**20)
+        grants = {}
+        for domain, records in charge.items():
+            match = re.search(r"gpu(\d+)", domain)
+            if match:
+                grants[f"gpu{match.group(1)}"] = max((r["bytes"] for r in records), default=0)
+        return all(0 < buffers.get(gpu, 0) <= grants.get(gpu, 0) for gpu in ("gpu0", "gpu1"))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
+def cmd_fit_check(a):
+    ok = fit_matches(Path(a.log).read_text(), json.loads(Path(a.charge).read_text()))
+    print("CUDA0/CUDA1 model buffers fit their grants" if ok else
+          "missing, zero, or over-grant CUDA0/CUDA1 model-buffer evidence")
+    return 0 if ok else 1
+
+
+def row_evidence(rid, settings):
+    if rid in ("MG1", "MG2", "MG3"):
+        files = [f"{rid}-{suffix}" for suffix in
+                 ("status.json", "gpus.json", "charge.json", "listeners.json", "peaks.json")]
+        files.append(f"chat-{rid}.json")
+        if rid == "MG3":
+            files.append("MG3-fit.txt")
+        return files
+    if rid in ("MG4", "MG5", "MG6"):
+        labels = ("vllm", "sglang") if rid == "MG6" else ("deep",)
+        count = 3 if rid == "MG6" else 5
+        files = [f"{rid}-{label}-{phase}{i}-{kind}.json"
+                 for label in labels for i in range(1, count + 1)
+                 for phase, kind in (("park", "gpus"), ("park", "charge"), ("park", "status"),
+                                     ("wake", "gpus"), ("wake", "status"))]
+        files += [f"chat-{rid}-{label}-wake{i}.json" for label in labels for i in range(1, count + 1)]
+        if rid == "MG6":
+            files += [f"mg6-{label}-charge-after.json" for label in labels]
+        return files
+    if rid == "MG7":
+        return [f"mg7-{engine}-{suffix}" for engine in ("vllm", "sglang") for suffix in
+                ("events.jsonl", "shm-before.txt", "shm-after.txt", "shm-after-kill.txt")]
+    if rid == "MG8":
+        return [f"mg8-{engine}-{suffix}" for engine in ("vllm", "sglang") for suffix in
+                ("events.jsonl", "hold.json")]
+    if rid == "MG9":
+        return [f"mg9-{engine}-{side}-c{c}.json" for engine in ("vllm", "sglang")
+                for side in ("capyctl", "hand") for c in (1, 4, 8)] + [
+                    f"mg9-{engine}-{suffix}" for engine in ("vllm", "sglang")
+                    for suffix in ("args.json", "hand-args.json", "hand.log")]
+    return {
+        "MG10": ["mg10-events.jsonl", "chat-mg10.json"],
+        "MG11": ["mg11-new-start.out", "mg11-old-deploy.out", "mg11-old-start.out", "chat-mg11.json"],
+        "MG12": ["MG12-tp3.out", "MG12-pin.out"],
+        "MG13": ["mg13-4b.json", "mg13-30b.json", "mg13-30b-woken.json",
+                 "mg13-pinned-args.json", "mg13-n1-args.json", "mg13-n2-args.json", "mg13-baseline-args.json",
+                 "chat-mg13-wake.json"],
+        "MG14": ["MG14-tp1.out", "MG14-auto.out"],
+        "BW": ["sources-bw-q30.json"],
+    }[rid]
+
+
+def evidence_role(rid):
+    return "srv" if rid == "MG11" else "s2" if rid in ("MG4", "MG5", "MG6", "MG10", "MG13") else "s1"
+
+
+def required_evidence(rid, settings):
+    role = evidence_role(rid)
+    return row_evidence(rid, settings) + ["versions.txt", f"events-{role}.jsonl", f"journal-{role}.jsonl"]
+
+
+def selected_rows(only):
+    return set(EXPECTED) if only.lower() == "all" else set(only.upper().split(","))
+
+
+def read_results(path):
+    results, errors = {}, []
+    if path.exists():
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            fields = line.split("\t", 3)
+            if len(fields) != 4 or fields[0] not in EXPECTED or fields[2] not in ("pass", "fail", "skip"):
+                errors.append(f"{path.name}:{number}: malformed result")
+                continue
+            results.setdefault(fields[0], []).append(fields)
+    return results, errors
+
+
+def compatible_attempt(path, settings):
+    try:
+        other = json.loads((path / "settings.json").read_text())
+        keys = ("commit", "harness", "cycles", "hb_cycles", "stall")
+        return all(other.get(k) == settings.get(k) for k in keys)
+    except (OSError, ValueError):
+        return False
+
+
+def historical_errors(path, raw):
+    errors = []
+    try:
+        if (path / "raw/versions.txt").read_text() != (raw / "versions.txt").read_text():
+            errors.append("engine fingerprints differ")
+    except OSError:
+        errors.append("engine fingerprints missing")
+    try:
+        host = json.loads((path / "host-completion.json").read_text())
+        completion = json.loads((path / "completion.json").read_text())
+        if (host.get("exit_code") != 0 or completion.get("state") != "complete"
+                or completion.get("host_exit") != 0 or completion.get("final_collection") is not True):
+            errors.append("historical attempt did not complete successfully")
+    except (OSError, ValueError):
+        errors.append("historical completion evidence missing")
+    return errors
+
+
 def cmd_verdict(a):
-    results = [line.split("\t") for line in Path(a.results).read_text().splitlines() if line.strip()] \
-        if Path(a.results).exists() else []
-    settings = json.loads(Path(a.settings).read_text()) if a.settings and Path(a.settings).exists() else {}
-    rows_by_id = {}
-    for r in results:
-        rows_by_id.setdefault(r[0], []).append(r)
-    order = [f"MG{i}" for i in range(1, 15)] + ["BW"]
-    lines = ["# Multi-GPU live rows (ADR 0035)", ""]
-    for key in ("commit", "machine", "engines", "started", "ended"):
+    raw = Path(a.results).parent
+    sources, errors = {}, []
+    if getattr(a, "host_status", None) not in (None, "0"):
+        errors.append("host completion missing or unsuccessful")
+    if getattr(a, "collection_status", None) not in (None, "1"):
+        errors.append("final evidence collection incomplete")
+    try:
+        settings = json.loads(Path(a.settings).read_text()) if a.settings else {}
+    except (OSError, ValueError):
+        settings = {}
+        errors.append("missing or malformed settings.json")
+    # Latest *selected* attempt owns a row, including a row it failed to produce.
+    # Missing/failed reruns never resurrect an earlier pass; other commits never mix.
+    if a.attempts:
+        for attempt in sorted(Path(a.attempts).iterdir()):
+            if not attempt.is_dir() or attempt.resolve() == raw.parent.resolve():
+                continue
+            if not compatible_attempt(attempt, settings):
+                continue
+            prior = json.loads((attempt / "settings.json").read_text())
+            records, malformed = read_results(attempt / "raw/results.tsv")
+            malformed.extend(historical_errors(attempt, raw))
+            for rid in selected_rows(prior.get("only", "all")):
+                result = records.get(rid, [])
+                if malformed:
+                    result = result + [[rid, "format", "fail", "; ".join(malformed)]]
+                sources[rid] = (result, attempt / "raw", prior)
+    records, malformed = read_results(Path(a.results))
+    errors.extend(malformed)
+    for rid in selected_rows(settings.get("only", a.only)):
+        sources[rid] = (records.get(rid, []), raw, settings)
+    rows, lines = {}, ["# Multi-GPU live rows (ADR 0035)", ""]
+    for key in ("commit", "started", "ended", "only"):
         if key in settings:
             lines.append(f"- {key}: {settings[key]}")
     lines += ["", "| Row | Part | Result | Evidence |", "|---|---|---|---|"]
-    overall = {}
-    for rid in order + sorted(set(rows_by_id) - set(order)):
-        for r in rows_by_id.get(rid, []):
-            part, res, detail = (r + ["", "", ""])[1:4]
+    for rid, parts in EXPECTED.items():
+        result, evidence, row_settings = sources.get(rid, ([], raw, settings))
+        present = {r[1] for r in result}
+        missing = sorted(set(parts) - present)
+        required = required_evidence(rid, row_settings)
+        missing_files = [f for f in required if not (evidence / f).is_file()]
+        empty_files = [f for f in required
+                       if (evidence / f).is_file() and not (evidence / f).stat().st_size and "-shm-" not in f
+                       and not f.startswith(("events-", "journal-"))]
+        invalid_files = []
+        if rid not in ("MG12", "MG14", "BW"):
+            role = "h1" if rid == "MG11" else evidence_role(rid)
+            if not any(p.is_file() and p.stat().st_size for p in (evidence / "engine-logs" / role).rglob("*")):
+                missing_files.append(f"engine-logs/{role}/")
+        for name in required:
+            if name.endswith((".json", ".jsonl")) and name not in missing_files:
+                try:
+                    text = (evidence / name).read_text()
+                    if name.endswith(".jsonl"):
+                        for line in text.splitlines():
+                            if line.strip():
+                                json.loads(line)
+                    else:
+                        json.loads(text)
+                except ValueError:
+                    invalid_files.append(name)
+        passed = (bool(result) and not missing and not missing_files and not empty_files and
+                  not invalid_files and all(r[2] == "pass" for r in result) and bool(row_settings.get("commit")))
+        if rid == "MG3" and passed:
+            passed = fit_matches((evidence / "MG3-fit.txt").read_text(),
+                                 json.loads((evidence / "MG3-charge.json").read_text()))
+        if rid in ("MG4", "MG5") and int(row_settings.get("cycles", 0)) < 5:
+            passed = False
+        if rid == "MG6" and int(row_settings.get("hb_cycles", 0)) < 3:
+            passed = False
+        rows[rid] = {"result": "pass" if passed else "fail", "missing_parts": missing,
+                     "missing_evidence": missing_files, "empty_evidence": empty_files, "invalid_evidence": invalid_files,
+                     "attempt": evidence.parent.name}
+        for _, part, res, detail in result:
             lines.append(f"| {rid} | {part} | {res.upper()} | {detail.replace('|', '/')} |")
-            prev = overall.get(rid)
-            overall[rid] = "fail" if "fail" in (prev, res) else ("skip" if res == "skip" and prev in (None, "skip") else "pass")
-    lines += ["", "## Per row", ""]
-    for rid in order:
-        lines.append(f"- {rid}: {overall.get(rid, 'not run').upper()}")
-    lines += ["", "CPU and Fake-engine tests are not qualification; these rows are the live check.", ""]
-    Path(a.out).write_text("\n".join(lines))
+        if missing or missing_files or empty_files or invalid_files:
+            lines.append(f"| {rid} | completeness | FAIL | Missing parts: {', '.join(missing)}; missing/empty/invalid evidence: {', '.join(missing_files + empty_files + invalid_files)} |")
+    selected = selected_rows(a.only)
+    selected_pass = not errors and all(rows[rid]["result"] == "pass" for rid in selected)
+    qualified = not errors and all(row["result"] == "pass" for row in rows.values())
+    report = {"qualified": qualified, "selected_pass": selected_pass, "rows": rows, "errors": errors}
+    lines += ["", "## Per row", ""] + [f"- {rid}: {r['result'].upper()} (attempt {r['attempt']})" for rid, r in rows.items()]
+    if errors:
+        lines += ["", "## Run errors", ""] + [f"- {error}" for error in errors]
+    lines += ["", f"All-row qualification: {'PASS' if qualified else 'FAIL'}", "",
+              "CPU and Fake-engine tests are not qualification; these rows are the live check.", ""]
+    atomic_text(Path(a.out), "\n".join(lines))
+    atomic_text(Path(a.out).with_suffix(".json"), json.dumps(report, indent=2) + "\n")
     print("\n".join(lines))
+    return 0 if selected_pass else 1
+
+
+def atomic_text(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.is_file() and path.read_text(errors="replace") == text:
+        return
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=".evidence-", delete=False) as stream:
+        tmp = Path(stream.name)
+        stream.write(text)
+        stream.flush()
+        os.fsync(stream.fileno())
+    tmp.replace(path)
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def sanitize(text, secrets=(), host=""):
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        if secret:
+            text = text.replace(secret, "<REDACTED>")
+    if host:
+        text = text.replace(host, "rented-host")
+    text = re.sub(r"/(?:home/[^/\\\s\"']+|root)/", "~/", text)
+    text = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1<REDACTED>", text)
+    text = re.sub(r"\bhf_[A-Za-z0-9]+\b", "<REDACTED>", text)
+    text = re.sub(r"(?i)((?:api[_-]?key|inference[_-]?key|admin[_-]?token|access[_-]?token|secret|password)[\"']?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^,\s}\]]+)",
+                  r'\1"<REDACTED>"', text)
+    return text
+
+
+def cmd_snapshot(a):
+    """Export an allowlist, never raw state, keys, credentials, or database files."""
+    root = Path(a.root)
+    attempt = root / "attempts" / a.attempt
+    dest = root / "evidence" / a.attempt
+    secrets = []
+    # These are harness-generated inference/admin credentials, not engine keys.
+    for credentials in (attempt / "state").glob("*/identity/*credentials*"):
+        text = credentials.read_text(errors="replace")
+        try:
+            doc = json.loads(text)
+            secrets.extend(v for k, v in doc.items() if isinstance(v, str) and ("key" in k or "token" in k))
+        except ValueError:
+            secrets.extend(line.split(":", 1)[1].strip().strip("\"'") for line in text.splitlines() if ":" in line)
+    def copy(source, relative):
+        if source.is_file() and not source.is_symlink():
+            atomic_text(dest / relative, sanitize(source.read_text(errors="replace"), secrets, a.host))
+    for source in (attempt / "raw").rglob("*"):
+        if source.is_file() and source.suffix in (".log", ".txt", ".tsv", ".json", ".jsonl", ".out", ".yaml"):
+            copy(source, Path("raw") / source.relative_to(attempt / "raw"))
+    for source in (root / "dep").glob("*.yaml"):
+        copy(source, Path("raw/dep") / source.name)
+    failures = []
+    for role in (attempt / "state").glob("*"):
+        for log_root in (role / "logs", role / "state/logs"):
+            for source in log_root.rglob("*"):
+                copy(source, Path("raw/engine-logs") / role.name / source.relative_to(log_root))
+        if role.name not in ("s1", "s2", "srv"):
+            continue
+        db = role / ("srv.sqlite3" if role.name == "srv" else "server/srv.sqlite3")
+        if not db.is_file():
+            failures.append(role.name)
+            atomic_text(dest / f"raw/journal-{role.name}-error.txt", "expected coordinator database missing\n")
+        else:
+            try:
+                for label, query in (
+                    ("events", "SELECT sequence,recorded_at_ms,kind,deployment_id,payload_json FROM management_events ORDER BY sequence"),
+                    ("journal", "SELECT recorded_at,state,evidence FROM journal_entries ORDER BY recorded_at"),
+                ):
+                    entries = rows(db, query)
+                    atomic_text(dest / f"raw/{label}-{role.name}.jsonl",
+                                sanitize("".join(json.dumps(entry) + "\n" for entry in entries), secrets, a.host))
+            except sqlite3.Error as exc:
+                failures.append(role.name)
+                atomic_text(dest / f"raw/journal-{role.name}-error.txt", str(exc) + "\n")
+    for name in ("settings.json", "host-completion.json"):
+        copy(attempt / name, Path(name))
+    runner_alive = None
+    if (attempt / "runner.pid").is_file():
+        try:
+            pid = int((attempt / "runner.pid").read_text())
+            stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            runner_alive = stat[0] != "Z" and stat[19] == (attempt / "runner.ticks").read_text().strip()
+        except (OSError, ValueError, IndexError):
+            runner_alive = False
+    atomic_text(dest / "snapshot.json", json.dumps({"attempt": a.attempt, "copied_at": time.time(),
+                                                  "runner_alive": runner_alive, "errors": failures}) + "\n")
+    return 1 if failures else 0
+
+
+def cmd_redact(a):
+    for line in sys.stdin:
+        print(sanitize(line.rstrip("\n"), host=a.host), flush=True)
+    return 0
+
+
+def cmd_sanitize_tree(a):
+    for path in Path(a.root).rglob("*"):
+        if path.is_file() and not path.is_symlink() and not path.name.startswith("."):
+            text = path.read_text(errors="replace")
+            clean = sanitize(text, host=a.host)
+            if clean != text:
+                atomic_text(path, clean)
     return 0
 
 
@@ -570,6 +908,9 @@ def main():
     s.add_argument("db")
     s.add_argument("--kinds")
     s.add_argument("--after", type=int, default=0)
+    s = sub.add_parser("rank-exit")
+    s.add_argument("events")
+    s.add_argument("--rank", type=int, required=True)
     s = sub.add_parser("charge")
     s.add_argument("db")
     s.add_argument("name")
@@ -583,6 +924,22 @@ def main():
     s.add_argument("results")
     s.add_argument("out")
     s.add_argument("--settings")
+    s.add_argument("--only", default="all")
+    s.add_argument("--attempts")
+    s.add_argument("--host-status")
+    s.add_argument("--collection-status")
+    s = sub.add_parser("fit-check")
+    s.add_argument("log")
+    s.add_argument("charge")
+    s = sub.add_parser("snapshot")
+    s.add_argument("--root", required=True)
+    s.add_argument("--attempt", required=True)
+    s.add_argument("--host", default="")
+    s = sub.add_parser("redact")
+    s.add_argument("--host", default="")
+    s = sub.add_parser("sanitize-tree")
+    s.add_argument("root")
+    s.add_argument("--host", default="")
     s = sub.add_parser("find")
     s.add_argument("file")
     s.add_argument("key")
@@ -590,6 +947,7 @@ def main():
     s.add_argument("--engine", required=True, choices=["vllm", "sglang"])
     s.add_argument("log")
     s.add_argument("--argv")
+    s.add_argument("--pid", type=int)
     a = p.parse_args()
     return globals()["cmd_" + a.cmd.replace("-", "_")](a)
 

@@ -660,6 +660,31 @@ fn a_derived_request_larger_than_the_card_refuses_the_start_with_its_code() {
         }
         other => panic!("expected the device refusal, got {other:?}"),
     }
+    // MG14: the public start command places before accepting a launch.
+    // A measurement that refused every host must still return its diagnostic,
+    // not the generic capacity refusal of an empty candidate set.
+    for scope in [
+        crate::ordinary_lifecycle::placement::StartScope::All,
+        crate::ordinary_lifecycle::placement::StartScope::Instance(0),
+        crate::ordinary_lifecycle::placement::StartScope::OnDemand,
+    ] {
+        match store.accept_scoped_start_command(
+            &session,
+            "admin",
+            id,
+            scope,
+            1,
+            "start-big",
+            100,
+            100_100,
+            None,
+        ) {
+            Err(LifecycleError::CheckpointUnusable(reason)) => {
+                assert_eq!(reason, diagnostic);
+            }
+            other => panic!("expected the measured device refusal for {scope:?}, got {other:?}"),
+        }
+    }
 }
 
 // T33, owner decision 2026-09-22: a revision accepted before WE3 has no

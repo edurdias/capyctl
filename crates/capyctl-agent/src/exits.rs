@@ -35,8 +35,9 @@ pub struct ExitedLaunch {
 
 /// Every Ready or parked launch this host claims that has a member exited on
 /// this boot (a parked one is reported only; nothing changes its residency),
-/// with that exit journaled. The API process is named first when it exited,
-/// because it is the one this host's launcher reaps and so knows the status of.
+/// with the observed absences journaled. The API process is primary when it
+/// exited because the launcher can reap its status; all other absences from
+/// the same scan accompany it, without claiming an exit order.
 /// ADR 0028 §11: a group worker's launch is watched from its Launch on, and
 /// its exit is reported under the member's own roles (`worker-<r>`), the ones
 /// its Launch reported and the controller recorded. ADR 0033 §§3, 5: a
@@ -63,10 +64,8 @@ pub fn scan(journal: &Arc<HostJournal>, host_id: &str, now_ms: i64) -> Vec<Exite
                 .filter(|p| p.role == capyctl_domain::completion::LMCACHE_ROLE)
                 .cloned(),
         );
-        let Some(process) = watched
-            .iter()
-            .find(|p| capyctl_launchers::process_absence::exit_observed(p))
-        else {
+        watched.retain(capyctl_launchers::process_absence::exit_observed);
+        let Some((process, also_exited)) = watched.split_first() else {
             continue;
         };
         let handle = command.identity.command_id.clone();
@@ -80,6 +79,17 @@ pub fn scan(journal: &Arc<HostJournal>, host_id: &str, now_ms: i64) -> Vec<Exite
             (None, Some(signal)) if (1..=64).contains(&signal) => ExitStatus::Signal(signal),
             _ => ExitStatus::Unobserved,
         };
+        // Capture the complete scan before any report can trigger Terminate.
+        // Otherwise an API or lower-rank exit can hide a rank that also died.
+        // SPEC §13.2: retries retain journaled observation times. A batch
+        // advances only when it includes a newly observed process exit.
+        let Ok(observed_at_ms) = also_exited.iter().try_fold(observed_at_ms, |latest, p| {
+            journal
+                .record_member_exit(&handle, p, reaped(p), now_ms)
+                .map(|(_, _, observed)| latest.max(observed))
+        }) else {
+            continue;
+        };
         exited.push(ExitedLaunch {
             exit: MemberExit {
                 host_id: host_id.to_owned(),
@@ -87,6 +97,10 @@ pub fn scan(journal: &Arc<HostJournal>, host_id: &str, now_ms: i64) -> Vec<Exite
                 generation: command.identity.generation,
                 owned_handle: handle,
                 process: crate::journal::reported_identity(&command, process),
+                also_exited: also_exited
+                    .iter()
+                    .map(|p| crate::journal::reported_identity(&command, p))
+                    .collect(),
                 status,
                 observed_at_ms,
             },

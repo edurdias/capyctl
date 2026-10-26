@@ -1,18 +1,36 @@
 # Multi-GPU live rows
 
-`run.sh` runs the live rows of ADR 0035 (one model across several GPUs of one
-host, MG1–MG14) and a download bandwidth test on one rented x86_64 machine with
-two identical NVIDIA GPUs, in one session, and removes everything it created
-there at the end, so the machine can be shut down straight afterwards. Nothing
-here touches the lab hosts.
+`run.sh` runs ADR 0035's MG1–MG14 and bandwidth test on one rented x86_64
+machine with two identical NVIDIA GPUs. It is a foreground process: launch it
+under an independent rental supervisor, not an agent tool's lifetime. It copies
+evidence throughout setup and the rows, makes a complete verdict, and exits.
+Nothing here touches the lab hosts. Provider deletion belongs to the supervisor,
+not to this engine harness.
 
 ```bash
 scripts/live/multi-gpu/run.sh --dry-run                    # every step, local and remote; contacts nothing
-scripts/live/multi-gpu/run.sh --ssh ubuntu@203.0.113.7     # the whole session
-scripts/live/multi-gpu/run.sh --ssh ubuntu@203.0.113.7 --only MG1,MG12 --keep
-scripts/live/multi-gpu/run.sh --ssh ubuntu@203.0.113.7 --skip-setup --only MG8
-scripts/live/multi-gpu/run.sh --ssh ubuntu@203.0.113.7 --purge-only
+scripts/live/multi-gpu/run.sh --ssh ubuntu@203.0.113.7 --out "$OUT" # foreground; supervisor required
+scripts/live/multi-gpu/run.sh --ssh ubuntu@203.0.113.7 --out "$OUT" --only MG1,MG12 --keep
+scripts/live/multi-gpu/run.sh --ssh ubuntu@203.0.113.7 --out "$OUT" --skip-setup --only MG8
+scripts/live/multi-gpu/run.sh --ssh ubuntu@203.0.113.7 --out "$OUT" --purge-only
 ```
+
+For an authorized Shadeform instance, the parent launches this wrapper under a
+user systemd service (with provider auto-deletion configured independently):
+
+```bash
+systemd-run --user --unit="capyctl-mg-$RUN_ID" --collect \
+  --working-directory="$PWD" \
+  python3 scripts/live/shade_session.py \
+  --instance "$INSTANCE_UUID" --out "$OUT" --max-seconds 28800 -- \
+  bash scripts/live/multi-gpu/run.sh --ssh "$SSH_TARGET" --out "$OUT" \
+  --max-seconds 28200
+```
+
+The wrapper records `supervisor.json`, `session.log`, and the provider deletion
+receipt. It deletes the rental on success, failure, or deadline; `--keep` does
+not override that deletion. A machine or network outage can defeat a local
+supervisor, so the provider's spending/deletion cap remains required.
 
 ## The machine
 
@@ -55,7 +73,12 @@ CUDA change. Three CapyCTL binaries are built from the pushed trees:
 - `capyctl-old`: the `v0.1.8` tag, the older host of MG11 (no
   `local_tensor_parallel` capability).
 
-Uncommitted changes are not pushed: commit first.
+Uncommitted product changes are not pushed: commit first. The harness scripts
+themselves are copied and their combined SHA-256 is recorded. Setup invalidates
+current/qualification binaries when their recorded source commit differs;
+`--skip-setup` refuses that mismatch rather than attributing stale binaries to a
+new commit. Each attempt gets fresh role state, while approved engine installs
+and model downloads can be reused.
 
 ## Models
 
@@ -68,8 +91,11 @@ Uncommitted changes are not pushed: commit first.
 
 ## The rows
 
-Each row writes one or more lines to `results.tsv` (row, part, pass, fail or
-skip, evidence); `verdict.md` tabulates them.
+Each row writes its parts to `results.tsv`. `verdict.md` and `verdict.json`
+require every expected part, the supporting artifacts, version fingerprints,
+events/journal exports, and engine logs for serving rows. A missing row, skipped
+part, malformed record, empty required artifact, or failed part is not a pass.
+Fewer than five deep cycles or three host-backed cycles cannot qualify.
 
 | Row | Role | What the script does | Passes when |
 |---|---|---|---|
@@ -81,12 +107,12 @@ skip, evidence); `verdict.md` tabulates them.
 | MG8 | s1 | per engine: SIGSTOP to rank 1, then a streamed request | `tp_stalled` within the stall timeout (`--stall`, 30 s) plus the probe; the instance stops and every process goes |
 | MG9 | s1 | per engine: C1, C4, C8 × 256 tokens × 3 rounds through the router, then the same build launched by hand with the arguments the engine logged under CapyCTL and the loopback environment | the router's tokens per second within 10 % of the hand launch at every concurrency |
 | MG2 | s1 | SGLang, as MG1 | as MG1 |
-| MG3 | s1 | llama.cpp, the GGUF model, `tensor_parallel: 2` (layer split) | as MG1; llama.cpp's log shows model buffers on CUDA0 and CUDA1 (`MG3-fit.txt` beside `MG3-charge.json`) |
+| MG3 | s1 | llama.cpp, the GGUF model, `tensor_parallel: 2` (layer split) | as MG1; real, positive CUDA0 and CUDA1 model-buffer log lines each fit the corresponding grant (`MG3-fit.txt` beside `MG3-charge.json`); GPU readings never substitute for missing log lines |
 | MG4 | s2 | vLLM TP 2 `deep`: 5 park and wake cycles | every park reaches `parked` with both GPUs' bytes down; every wake answers the canary request with both GPUs' bytes back |
 | MG5 | s2 | SGLang TP 2 `deep`: 5 cycles | as MG4 |
 | MG6 | s2 | vLLM and SGLang TP 2 `host_backed`: 3 cycles each | as MG4, and nothing of the deployment left in the ledger after each stop |
 | MG10 | s2 | the 30B model (SGLang, TP 2, `deep`) parked; the 4B model on gpu0 with a 30 GiB KV cache; a request to the 30B model | the request answers, the 4B model is evicted, and the switch's events name gpu0 and gpu1 |
-| MG13 | s2 | `topology: auto`: the 4B model on vLLM (against a pinned single-GPU deployment of it), then the 30B model on SGLang with the 4B model serving, then the 30B model parked and woken | N = 1 and `TP auto (1)` with the same vLLM arguments as the pinned deployment; N = 2, `TP auto (2)`, the same SGLang arguments as MG9's launch, and the 4B model evicted; the wake keeps N = 2 on the same GPUs |
+| MG13 | s2 | `topology: auto`: the 4B model on vLLM (against an explicit single-GPU deployment), then the 30B model on SGLang with the 4B model serving, then park/wake | N = 1 and `TP auto (1)` with equal nonempty arguments; N = 2 and `TP auto (2)`, arguments equal MG2's captured baseline, and the 4B model evicted; the wake preserves N and devices and answers the canary |
 | MG11 | srv | a control-plane server, a host of this build and an older host (`v0.1.8`), all on loopback on the machine; MG1's deployment on each | Ready and answering through the server on the new host; on the older host refused `host_capability_missing:local_tensor_parallel` with no engine started |
 
 Role `s1` runs `capyctl`, role `s2` `capyctl-qualify`; each role has its own
@@ -106,18 +132,83 @@ On the machine above, about: setup 45 minutes (three CapyCTL builds, two
 engine installs, the llama.cpp build), the 30B download at the machine's
 bandwidth (61 GB; 10 minutes at 1 Gbit/s), then the rows about 2.5 hours, most
 of it engine starts of the 30B model. `--only` with `--keep` and later
-`--skip-setup` splits the session; `--purge-only` cleans up at the end.
+`--skip-setup` can split a session while the same supervised rental remains
+authorized. An MG13-only attempt also captures MG2's argument baseline.
+`--purge-only` copies existing exported evidence before removing the session.
 
 ## Output and cleanup
 
-Results go to `target/live/multi-gpu/<run>/` in the main checkout: `verdict.md`,
-`settings.json`, `preflight.txt` and `raw/` (progress log, `results.tsv`,
-`versions.txt`, status and ledger reads, engine logs, deployment files). The
-machine's address and home directory are replaced in everything copied back.
+The session directory defaults to
+`<main checkout>/target/live/multi-gpu/<unique-attempt>/`; use the same `--out`
+for related reruns. It contains:
 
-The host phases run detached (`setsid`), so a dropped connection does not stop
-them; rerun with `--skip-setup` to follow up. At the end `remote.sh purge`
-stops every role the session started and removes what `~/mg/created.txt`
-lists: `~/mg` (sources, builds, Rust, state), the three engine directories, and
-the caches under `~` the session created (uv, vLLM, FlashInfer, Triton, ...).
-Nothing that existed before the session is removed.
+- `completion.json`: atomically changes from `state: running` to `state:
+  complete` only after final collection and the purge decision. `exit_code`,
+  `host_exit`, `final_collection`, `purged`, and `reason` are machine-readable.
+  A completed process is not necessarily a successful qualification.
+- `verdict.md` and `verdict.json`: all MG1–MG14 plus BW, even for `--only`.
+- `attempts/<unique-id>/`: immutable attempt identity and source/settings,
+  preflight, transport/purge diagnostics, its verdict, and `raw/` containing
+  setup output, progress, results, versions, deployment files, per-start
+  output/status/events, per-cycle readings/status, engine logs (including
+  rotations), and read-only event and journal exports.
+
+Results are exported on each row part and copied locally every 15 seconds
+(`--poll-seconds`), starting before setup. Export uses a text allowlist:
+credentials, private state databases, join files and raw process argv are
+never copied. Credentials in logs are redacted before transfer; host addresses
+and home paths are also removed. Copies use atomic replacement and fsync;
+failed copies never delete the previous local evidence.
+
+Reruns append attempts rather than overwriting earlier failures. The latest
+selected attempt owns each row, including rows it failed to produce. Combining
+rows requires the same source commit, harness hash, qualification settings, and
+version/model fingerprints. An earlier pass cannot conceal a missing or failed
+rerun, and a different commit starts a new qualification. A bounded `--only`
+attempt still exits nonzero until the complete compatible all-row verdict passes.
+
+SSH calls are bounded at 25 seconds, copies at 30 seconds. A lost connection
+gets at most 300 seconds (`--disconnect-seconds`); a vanished remote runner is
+detected from its PID/start-time identity. The whole run is bounded at eight
+hours (`--max-seconds`), including a remote timeout. Final collection gets at
+most three attempts, or one after SIGTERM/SIGINT so the supervisor's 120-second
+termination grace can accommodate collection. A missing host completion
+marker or failed final copy is a nonzero exit, never an idle polling loop.
+
+Purge runs only after a successful final copy and a host completion marker.
+It stops session-owned roles and removes the paths `~/mg/created.txt` records:
+the session directory, approved engine installs, and caches this session
+created. It refuses to purge while engines remain. `--keep` preserves the
+remote session, but the provider supervisor still owns the rental's lifetime.
+On a failed copy the harness leaves remote evidence intact; the supervisor's
+deadline can nevertheless delete the rental, so the incremental local copies
+are the recovery record.
+
+## Local regression scenarios
+
+These tests use local transport fixtures, no SSH host, provider, or engine.
+Their scratch data lives under `~/.cache/capyctl-agent-tmp/mg-tests`.
+They exercise the real foreground runner:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
+  -s scripts/live/multi-gpu -p 'test_*.py'
+bash -n scripts/live/multi-gpu/run.sh scripts/live/multi-gpu/remote.sh
+scripts/live/multi-gpu/run.sh --dry-run
+```
+
+- **Connection interruption:** a snapshot arrives, then SSH fails. The runner
+  stops at the reconnect bound, retains the prior local results, does not purge,
+  and writes a nonzero completion.
+- **Failing row:** the remote process exits zero but MG5 reports failure.
+  Collection and purge complete; the runner still exits nonzero.
+- **Missing evidence:** all reported row parts pass but MG3's buffer log is
+  absent. The complete verdict and process exit fail. A separate fixture makes
+  final rsync fail and proves purge is not called.
+- **Successful completion:** every part and required artifact is present.
+  Final collection precedes purge, completion reports zero, and the runner exits.
+
+Helper regressions cover skip/failure masking, missing parts, malformed records,
+JSON server credentials for MG11, typed vLLM argv comparison without persisting
+keys, strict CUDA buffer/grant checks, log redaction, and failed rerun precedence.
+CPU fixtures establish harness behavior only, never native-engine qualification.

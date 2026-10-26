@@ -21,6 +21,9 @@ pub struct EngineExit {
     pub step_id: String,
     /// The recorded member that exited: PID, boot and start ticks.
     pub process: ProcessIdentity,
+    /// Other owned processes observed gone in the same scan, before cleanup.
+    /// Their exit statuses and the order of exits are unknown.
+    pub also_exited: Vec<ProcessIdentity>,
     /// A closed phrase for the journal, such as `exit code 1` or `signal 9`.
     pub status: String,
     pub observed_at_ms: i64,
@@ -161,10 +164,14 @@ impl crate::Store {
         // Ready, exited 90 s later and failed the instance): the server is
         // its group's leader, so only the `lmcache` leader's exit is the
         // server's. Cleanup still proves every recorded member gone.
-        if exit.process.is_helper()
-            || (exit.process.is_lmcache()
-                && exit.process.role != capyctl_domain::completion::LMCACHE_ROLE)
-            || !recorded.contains(&exit.process)
+        if std::iter::once(&exit.process)
+            .chain(&exit.also_exited)
+            .any(|process| {
+                process.is_helper()
+                    || (process.is_lmcache()
+                        && process.role != capyctl_domain::completion::LMCACHE_ROLE)
+                    || !recorded.contains(process)
+            })
         {
             return Ok(None);
         }
@@ -173,10 +180,16 @@ impl crate::Store {
         // recorded (`engine_rank_exited`, status only). The settlement is the
         // same stop of the whole instance; nothing is released until every
         // recorded process is gone and the group is empty.
-        let rank = match &member {
-            Some(_) => None,
-            None => capyctl_domain::local_tp::rank_of(&association.receipt, &exit.process),
-        };
+        let mut ranks = std::iter::once(&exit.process)
+            .chain(&exit.also_exited)
+            .filter_map(|process| {
+                if member.is_some() {
+                    return None;
+                }
+                capyctl_domain::local_tp::rank_of(&association.receipt, process)
+                    .map(|rank| (process, rank))
+            })
+            .peekable();
         // ADR 0033 §3 (lifecycle design §5): the LMCache server's exit, while
         // the instance serves or while it is parked, fails it the same way.
         let parked: bool = tx.query_row(
@@ -247,16 +260,27 @@ impl crate::Store {
                 ],
             )?;
         }
-        if let Some(rank) = &rank {
-            let detail = format!(
-                "{}: rank {} on {} ({} process {}) exited ({})",
-                capyctl_domain::local_tp::ENGINE_RANK_EXITED,
-                rank.rank,
-                rank.device,
-                exit.process.role,
-                exit.process.pid,
-                exit.status,
-            );
+        if ranks.peek().is_some() {
+            use std::fmt::Write as _;
+            let mut detail = format!("{}: ", capyctl_domain::local_tp::ENGINE_RANK_EXITED);
+            for (index, (process, rank)) in ranks.enumerate() {
+                if index > 0 {
+                    detail.push_str("; ");
+                }
+                let status = if process == &exit.process {
+                    exit.status.as_str()
+                } else {
+                    "exit status unobserved"
+                };
+                let _ = write!(
+                    detail,
+                    "rank {} on {} ({} process {}) exited ({status})",
+                    rank.rank, rank.device, process.role, process.pid,
+                );
+            }
+            if !exit.also_exited.is_empty() {
+                detail.push_str("; observed in the same scan; exit order unknown");
+            }
             let named: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM journal_entries WHERE operation_id=?1 AND state=?2)",
                 params![p.operation_id, capyctl_domain::local_tp::ENGINE_RANK_EXITED],
@@ -434,6 +458,7 @@ mod tests {
             generation,
             step_id: step.to_owned(),
             process,
+            also_exited: Vec::new(),
             status: "signal 9".into(),
             observed_at_ms: execution.issued_at_ms + 100,
         };
@@ -577,6 +602,7 @@ mod tests {
             generation: fence.generation,
             step_id: step.clone(),
             process,
+            also_exited: Vec::new(),
             status: "exit status unobserved".into(),
             observed_at_ms: execution.issued_at_ms + 100,
         };
@@ -679,6 +705,7 @@ mod tests {
             generation: fence.generation,
             step_id: step.clone(),
             process: identity("rank-1", 64),
+            also_exited: Vec::new(),
             status: "signal 9".into(),
             observed_at_ms: execution.issued_at_ms + 100,
         };
@@ -775,6 +802,96 @@ mod tests {
         assert_eq!(observed(&store, &fence.deployment_id), "failed");
     }
 
+    // T46: an API exit must not hide ranks observed gone in the same scan.
+    // Every identity is owned, no rank inherits the API's signal, and one
+    // journal event names all observed ranks without claiming a first cause.
+    #[test]
+    fn a_same_scan_collapse_names_every_observed_rank_without_exit_order() {
+        let recorded = vec![
+            identity("api", 61),
+            identity("worker-0", 62),
+            identity("rank-0", 63),
+            identity("rank-1", 64),
+        ];
+        for primary in [0, 2] {
+            let (store, session, fence, execution) = ready_local_receipt(
+                recorded.clone(),
+                "owned launch observed; tp ranks: 0=rank-0:63@gpu0 1=rank-1:64@gpu1",
+            );
+            let report = EngineExit {
+                deployment_id: fence.deployment_id.clone(),
+                generation: fence.generation,
+                step_id: execution.token.step_id.clone(),
+                process: recorded[primary].clone(),
+                also_exited: recorded
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != primary)
+                    .map(|(_, process)| process.clone())
+                    .collect(),
+                status: "signal 9".into(),
+                observed_at_ms: execution.issued_at_ms + 100,
+            };
+            let mut foreign = report.clone();
+            foreign.also_exited.push(identity("rank-2", 999));
+            assert_eq!(
+                store
+                    .record_engine_exit(&session, ExitSource::Embedded, &foreign)
+                    .unwrap(),
+                None,
+            );
+            assert!(dispatch(&store, &fence.deployment_id));
+            assert_eq!(exited(&store, &execution.token.operation_id), 0);
+            assert!(
+                store
+                    .record_engine_exit(&session, ExitSource::Embedded, &report)
+                    .unwrap()
+                    .unwrap()
+                    .first
+            );
+            assert!(
+                !store
+                    .record_engine_exit(&session, ExitSource::Embedded, &report)
+                    .unwrap()
+                    .unwrap()
+                    .first
+            );
+            let status: String = store
+                .conn
+                .query_row(
+                    "SELECT last_error FROM deployment_instances WHERE deployment_id=?1",
+                    [&fence.deployment_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(status.contains("rank 0 on gpu0"), "{status}");
+            assert!(
+                status
+                    .contains("rank 1 on gpu1 (rank-1 process 64) exited (exit status unobserved)"),
+                "{status}"
+            );
+            assert!(status.contains("exit order unknown"), "{status}");
+            if primary == 0 {
+                assert!(!status.contains("signal 9"), "{status}");
+            }
+            let events: i64 = store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM journal_entries WHERE state='engine_rank_exited'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(events, 1);
+            assert!(!dispatch(&store, &fence.deployment_id));
+            assert!(store
+                .resource_snapshot()
+                .unwrap()
+                .owners
+                .contains_key(&fence.deployment_id));
+        }
+    }
+
     /// ADR 0035 §7: an exit of a process the readiness receipt records no
     /// rank for (one GPU, or not a rank) names no rank.
     // T46
@@ -790,6 +907,7 @@ mod tests {
                     generation: fence.generation,
                     step_id: execution.token.step_id.clone(),
                     process: identity("worker-0", 62),
+                    also_exited: Vec::new(),
                     status: "exit code 1".into(),
                     observed_at_ms: execution.issued_at_ms + 100,
                 },

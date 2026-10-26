@@ -581,6 +581,30 @@ async fn a_rank_exit_of_a_ready_launch_on_several_gpus_is_reported() {
         !exited.is_empty()
     });
     assert_eq!(reported[0].process, rank1);
+    assert!(reported[0].also_exited.is_empty());
+
+    // A cascade can remove the API and both ranks before the next scan.
+    // Report one launch, retaining every absent identity even though the
+    // API sorts first; none of these observations releases its claim.
+    for process in &named[..2] {
+        unsafe {
+            libc::kill(process.pid as i32, libc::SIGKILL);
+        }
+    }
+    let gone_by = Instant::now() + Duration::from_secs(5);
+    while named
+        .iter()
+        .any(|p| !capyctl_launchers::process_absence::exit_observed(p))
+    {
+        assert!(Instant::now() < gone_by, "the whole engine exits");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let collapsed = capyctl_agent::exits::scan(&journal, "host", capyctl_protocol::now_unix_ms());
+    assert_eq!(collapsed.len(), 1);
+    assert_eq!(collapsed[0].exit.process, named[0]);
+    assert_eq!(collapsed[0].exit.also_exited.len(), 2);
+    assert!(collapsed[0].exit.also_exited.contains(&rank1));
+    assert!(collapsed[0].exit.also_exited.contains(&named[1]));
 
     drop(tools);
     let mut stop = command("stop-rank-launch");

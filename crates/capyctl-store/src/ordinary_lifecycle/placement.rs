@@ -611,6 +611,11 @@ pub(crate) fn prepare(
         [deployment_id],
         |r| r.get(0),
     )?;
+    // MG14: measurement can refuse every host's provisional revision.
+    // Check its recorded reason before placement turns the empty candidate
+    // set into a generic capacity block. Retained and joined launches above
+    // keep their existing behavior.
+    crate::checkpoint_digests::admit_start(tx, deployment_id, current)?;
     // ADR 0028 §5: a group has fixed hosts; placement only validates that
     // its member fits on every one of them.
     if let Some(shape) = super::worker::group_shape(tx, deployment_id, current)? {

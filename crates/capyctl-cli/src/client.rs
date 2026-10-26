@@ -1833,6 +1833,10 @@ mod tests {
                 "message": "insufficient_device_memory: the deployment needs 21 bytes"}}),
         );
         assert_eq!(device.exit_code(), ExitCode::INSUFFICIENT_RESOURCES);
+        assert_eq!(
+            device.message,
+            "capacity_blocked: insufficient_device_memory: the deployment needs 21 bytes"
+        );
     }
 
     /// SPEC §13: the override is part of a recovered command's intent.

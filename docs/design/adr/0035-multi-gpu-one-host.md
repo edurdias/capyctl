@@ -456,6 +456,12 @@ key guard, and no engine control path goes through ingress or the router. Status
   keeps the whole footprint charged. No rank is replaced or restarted alone: an NCCL group
   cannot re-admit a rank. Under `recovery: reconcile` the instance relaunches whole, as
   today.
+  If several recorded ranks are observed gone in one scan, the event names all
+  of them and explicitly says the exit order is unknown. A sampled observation
+  does not establish which rank initiated a cascading engine failure. The
+  report carries the observed process identities together so an API-process
+  exit cannot hide rank exits from the same scan; no exit status is inferred
+  for an additional process.
 - **A rank hangs.** A rank stuck in a collective (a GPU fault, a deadlock) does not exit and
   the other ranks wait for it. ADR 0028 §11's stall rule applies to every instance with
   N > 1: a request without a first token within the stall timeout (`groups.stall_timeout`,

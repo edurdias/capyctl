@@ -352,6 +352,7 @@ impl GroupHost {
                 generation: r.command.identity.generation,
                 owned_handle: r.command.identity.command_id.clone(),
                 process: r.identities[0].clone(),
+                also_exited: Vec::new(),
                 status: match self.group.ended(r.rank) {
                     Some(capyctl_testkit::RankEnd::Killed) => {
                         capyctl_protocol::reports::ExitStatus::Signal(9)

@@ -1,179 +1,207 @@
 #!/usr/bin/env bash
-# The multi-GPU live rows (ADR 0035 MG1-MG14) and the download bandwidth test, on
-# one rented x86_64 machine with two identical NVIDIA GPUs, in one session: push
-# this checkout, install the approved engines and build CapyCTL there, run the
-# rows detached, copy the results back, write the verdict, and remove everything
-# the session created on the machine.
-#
-# usage: scripts/live/multi-gpu/run.sh --ssh USER@ADDRESS [options]
-#
-#   --ssh TARGET       the rented machine (ssh destination; key authentication)
-#   --ssh-port N       its SSH port (22)
-#   --only LIST        rows to run, e.g. MG1,MG7,BW (all); BW is the bandwidth test
-#   --stall S          groups.stall_timeout of the roles, seconds (30; MG8 waits on it)
-#   --cycles N         MG4/MG5 park and wake cycles (5); --hb-cycles N for MG6 (3)
-#   --port N           the roles' inference port (18743); management N+1, engines 8740-8759
-#   --skip-setup       reuse the tools, builds and engines of an earlier run on the machine
-#   --keep             leave everything on the machine (no purge) for a follow-up run
-#   --purge-only       only remove what earlier runs created there
-#   --out DIR          local results (<main checkout>/target/live/multi-gpu/<run>)
-#   --dry-run          print every step, local and remote, and contact no machine
-#
-# The machine's address never reaches the output: it is replaced by `rented-host`.
-# One live session at a time: the host phases refuse to start while any engine runs.
+# Foreground ADR0035 qualification runner. A separate supervisor owns the rental.
+# Usage: run.sh --ssh USER@ADDRESS [--ssh-port N] [--only MG1,MG2,...,BW]
+#   --stall S --cycles N --hb-cycles N --port N
+#   --skip-setup   reuse builds only if their recorded commit matches this checkout
+#   --keep         do not purge after a successful final evidence copy
+#   --purge-only   collect existing evidence before removing the remote session
+#   --out DIR      durable session directory; reruns append unique attempts
+#   --max-seconds N --disconnect-seconds N --poll-seconds N
+#   --dry-run      print the remote plan without contacting a machine
 set -euo pipefail
-
+umask 077
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../../.." && pwd)
 REPO_MAIN=$(dirname "$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir)")
-usage() { sed -n '2,25p' "$0"; exit 2; }
-
-TARGET="" SSH_PORT=22 ONLY=ALL STALL=30 CYCLES=5 HB_CYCLES=3 PORT=18743
-SKIP_SETUP=0 KEEP=0 PURGE_ONLY=0 OUT="" DRY=0 OLD_TAG=v0.1.8
-ARGS=("$@")
+usage() { printf '%s\n' 'Usage: run.sh --ssh USER@ADDRESS [--only MG1,...,BW] [--out DIR] [--skip-setup] [--keep] [--dry-run]' >&2; exit 2; }
+TARGET='' SSH_PORT=22 ONLY=all STALL=30 CYCLES=5 HB_CYCLES=3 PORT=18743
+SKIP_SETUP=0 KEEP=0 PURGE_ONLY=0 OUT='' DRY=0 OLD_TAG=v0.1.8
+MAX_SECONDS=28800 DISCONNECT_SECONDS=300 POLL_SECONDS=15
 while [ $# -gt 0 ]; do
   case $1 in
-    --ssh) TARGET=$2; shift ;;
-    --ssh-port) SSH_PORT=$2; shift ;;
-    --only) ONLY=${2^^}; shift ;;
-    --stall) STALL=$2; shift ;;
-    --cycles) CYCLES=$2; shift ;;
-    --hb-cycles) HB_CYCLES=$2; shift ;;
-    --port) PORT=$2; shift ;;
-    --skip-setup) SKIP_SETUP=1 ;;
-    --keep) KEEP=1 ;;
-    --purge-only) PURGE_ONLY=1 ;;
-    --out) OUT=$2; shift ;;
-    --dry-run) DRY=1 ;;
-    -h|--help) usage ;;
-    *) echo "unknown option $1" >&2; usage ;;
+    --ssh|--ssh-port|--only|--stall|--cycles|--hb-cycles|--port|--out|--max-seconds|--disconnect-seconds|--poll-seconds)
+      [ $# -ge 2 ] || usage
+      case $1 in
+        --ssh) TARGET=$2 ;; --ssh-port) SSH_PORT=$2 ;; --only) ONLY=${2^^} ;;
+        --stall) STALL=$2 ;; --cycles) CYCLES=$2 ;; --hb-cycles) HB_CYCLES=$2 ;;
+        --port) PORT=$2 ;; --out) OUT=$2 ;; --max-seconds) MAX_SECONDS=$2 ;;
+        --disconnect-seconds) DISCONNECT_SECONDS=$2 ;; --poll-seconds) POLL_SECONDS=$2 ;;
+      esac
+      shift ;;
+    --skip-setup) SKIP_SETUP=1 ;; --keep) KEEP=1 ;; --purge-only) PURGE_ONLY=1 ;;
+    --dry-run) DRY=1 ;; -h|--help) usage ;; *) usage ;;
   esac
   shift
 done
-[ -n "$TARGET" ] || [ "$DRY" = 1 ] || { echo "--ssh is required" >&2; usage; }
-[ -n "$TARGET" ] || TARGET=user@rented-host
-for n in "$STALL" "$CYCLES" "$HB_CYCLES" "$PORT" "$SSH_PORT"; do
-  [[ $n =~ ^[1-9][0-9]*$ ]] || { echo "numbers only: $n" >&2; exit 2; }
+[ -n "$TARGET" ] || [ "$DRY" = 1 ] || usage
+TARGET=${TARGET:-user@rented-host}
+for n in "$SSH_PORT" "$STALL" "$CYCLES" "$HB_CYCLES" "$PORT" "$MAX_SECONDS" "$DISCONNECT_SECONDS" "$POLL_SECONDS"; do
+  [[ $n =~ ^[1-9][0-9]*$ ]] || usage
 done
-if [ "$ONLY" != ALL ]; then
-  for id in ${ONLY//,/ }; do
-    [[ $id =~ ^(MG([1-9]|1[0-4])|BW)$ ]] || { echo "--only takes MG1-MG14 and BW separated by commas, not '$id'" >&2; exit 2; }
-  done
-else
-  ONLY=all
+if [ "${ONLY^^}" = ALL ]; then ONLY=all; else
+  [[ $ONLY =~ ^(MG([1-9]|1[0-4])|BW)(,(MG([1-9]|1[0-4])|BW))*$ ]] || usage
 fi
 MPORT=$((PORT + 1))
-
-RUN_ID=$(date +%F-%H%M)-multi-gpu
-OUT=${OUT:-$REPO_MAIN/target/live/multi-gpu/$RUN_ID}
+ATTEMPT_ID=$(date -u +%Y%m%dT%H%M%S%N)-$$
+OUT=${OUT:-$REPO_MAIN/target/live/multi-gpu/$ATTEMPT_ID}
 HOST_ADDR=${TARGET#*@}
-SSH=(ssh -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 "$TARGET")
-step() { printf '\n== %s\n' "$*"; }
-redact() { sed -u -e "s#$HOST_ADDR#rented-host#g" -e "s#/home/[A-Za-z0-9._-]*/#~/#g" -e "s#/root/#~/#g"; }
-exec > >(redact) 2>&1
-x() { if [ "$DRY" = 1 ]; then printf '  $ %s\n' "$(printf '%q ' "$@")"; else "$@"; fi; }
-rsh() { x "${SSH[@]}" "$@"; }
-# Shown in a dry run only; the real commands expand ~ on the machine.
-# shellcheck disable=SC2088
-REMOTE_SRC='~/mg/src'
-
+SSH=(ssh -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 "$TARGET")
+RSYNC_SSH="ssh -p $SSH_PORT -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2"
+remote() { timeout --kill-after=2 25 "${SSH[@]}" "$@"; }
+copy() { timeout --kill-after=2 30 rsync --checksum --fsync --timeout=20 -e "$RSYNC_SSH" "$@"; }
+SCRATCH=$HOME/.cache/capyctl-agent-tmp/mg-run
+mkdir -p "$SCRATCH"
+WORK=$(mktemp -d "$SCRATCH/attempt.XXXXXX")
 if [ "$DRY" = 1 ]; then
-  step "dry run: the plan of every host phase, printed by remote.sh plan on this machine"
-  PLANDIR=$(mktemp -d "${XDG_CACHE_HOME:-$HOME/.cache}/capyctl-mg-plan.XXXXXX")
-  printf 'ONLY=%q\nSTALL=%q\nCYCLES=%q\nHB_CYCLES=%q\nPORT=%q\nMPORT=%q\n' "$ONLY" "$STALL" "$CYCLES" "$HB_CYCLES" "$PORT" "$MPORT" >"$PLANDIR/mg.env"
-  MG=$PLANDIR bash "$HERE/remote.sh" plan | sed -e "s#$PLANDIR#~/mg#g" -e "s#${PLANDIR/#$HOME/\~}#~/mg#g" ||
-    { rm -rf "$PLANDIR"; echo "dry run: the plan failed" >&2; exit 1; }
-  rm -rf "$PLANDIR"
+  trap 'rm -rf "$WORK"' EXIT
+  printf '%s=%q\n' ONLY "$ONLY" STALL "$STALL" CYCLES "$CYCLES" HB_CYCLES "$HB_CYCLES" PORT "$PORT" MPORT "$MPORT" >"$WORK/mg.env"
+  MG=$WORK bash "$HERE/remote.sh" plan
+  exit
 fi
-
+exec > >(trap '' INT TERM HUP; python3 "$HERE/mg.py" redact --host "$HOST_ADDR") 2>&1
+COMMIT=$(git -C "$REPO" rev-parse HEAD)
+git -C "$REPO" diff --quiet HEAD -- crates runtime ||
+  printf 'WARNING: uncommitted product changes are not deployed; source commit is %s\n' "$COMMIT" >&2
+HARNESS=$(sha256sum "$HERE/run.sh" "$HERE/remote.sh" "$HERE/mg.py" | sha256sum | cut -d' ' -f1)
+ATTEMPT=$OUT/attempts/$ATTEMPT_ID
+mkdir -p "$ATTEMPT/raw"
+# No command line, SSH destination, environment dump, or credentials in metadata.
+python3 - "$ATTEMPT/settings.json" "$COMMIT" "$HARNESS" "$ONLY" "$CYCLES" "$HB_CYCLES" "$STALL" "$ATTEMPT_ID" "$MAX_SECONDS" "$PORT" "$SKIP_SETUP" "$DISCONNECT_SECONDS" "$POLL_SECONDS" <<'PY'
+import datetime, json, os, sys
+path, commit, harness, only, cycles, hb_cycles, stall, attempt, deadline, port, skip, disconnect, poll = sys.argv[1:]
+with open(path, 'w') as f:
+    json.dump(dict(commit=commit, harness=harness, only=only, cycles=int(cycles), hb_cycles=int(hb_cycles),
+                   stall=int(stall), attempt=attempt, max_seconds=int(deadline), port=int(port),
+                   skip_setup=skip == "1", disconnect_seconds=int(disconnect), poll_seconds=int(poll),
+                   engines={"vllm": "0.32.0", "sglang": "0.5.22", "llama.cpp": "0.7.0"},
+                   started=datetime.datetime.now(datetime.timezone.utc).isoformat()), f, indent=2)
+    f.flush()
+    os.fsync(f.fileno())
+PY
+printf '%s=%q\n' ONLY "$ONLY" STALL "$STALL" CYCLES "$CYCLES" HB_CYCLES "$HB_CYCLES" PORT "$PORT" MPORT "$MPORT" \
+  OLD_TAG "$OLD_TAG" SKIP_SETUP "$SKIP_SETUP" CAPYCTL_COMMIT "$COMMIT" ATTEMPT_ID "$ATTEMPT_ID" >"$WORK/mg.env"
+REMOTE_READY=0 HOST_STATUS='' FINAL_COPY=0 PURGED=0 REASON=setup SIGNALLED=0
+collect() {
+  local snapshot_rc=0
+  remote "ATTEMPT_ID=$ATTEMPT_ID bash ~/mg/live/remote.sh collect" >>"$ATTEMPT/transport.log" 2>&1 || snapshot_rc=$?
+  # Only the remote sanitized allowlist crosses the connection, never raw state.
+  # All attempts are retained, and rsync never deletes the local last good copy.
+  copy -rltz "$TARGET:mg/evidence/" "$OUT/attempts/" >>"$ATTEMPT/transport.log" 2>&1 || return 1
+  python3 "$HERE/mg.py" sanitize-tree "$OUT/attempts" --host "$HOST_ADDR" || return 1
+  return "$snapshot_rc"
+}
+# Invoked by the EXIT trap, including failure and signal paths.
+# shellcheck disable=SC2329
+finish() {
+  local original=$? rc=1 tries=3 i verdict_rc=1
+  trap - EXIT
+  trap 'SIGNALLED=1; REASON=interrupted; tries=1' INT TERM HUP
+  set +e
+  [ "$SIGNALLED" = 0 ] || tries=1
+  if [ "$REMOTE_READY" = 1 ]; then
+    for ((i=0; i<tries; i++)); do
+      if collect; then FINAL_COPY=1; break; fi
+    done
+  fi
+  if [ -f "$ATTEMPT/host-completion.json" ]; then
+    HOST_STATUS=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$ATTEMPT/host-completion.json")
+  fi
+  python3 "$HERE/mg.py" verdict "$ATTEMPT/raw/results.tsv" "$OUT/verdict.md" --settings "$ATTEMPT/settings.json" --attempts "$OUT/attempts" --only "$ONLY" --host-status "$HOST_STATUS" --collection-status "$FINAL_COPY" >"$ATTEMPT/verdict.log" 2>&1
+  verdict_rc=$?
+  [ "$verdict_rc" = 0 ] || REASON=qualification_failed
+  cp "$OUT/verdict.md" "$OUT/verdict.json" "$ATTEMPT/" 2>/dev/null
+  if [ "$FINAL_COPY" = 1 ] && [ -n "$HOST_STATUS" ] && [ "$KEEP" = 0 ]; then
+    if remote "ATTEMPT_ID=$ATTEMPT_ID bash ~/mg/live/remote.sh purge" >>"$ATTEMPT/purge.log" 2>&1; then PURGED=1; else REASON=purge_failed; fi
+  fi
+  if [ "$SIGNALLED" = 0 ] && [ "$original" = 0 ] && [ "$HOST_STATUS" = 0 ] && [ "$FINAL_COPY" = 1 ] && [ "$verdict_rc" = 0 ] && { [ "$KEEP" = 1 ] || [ "$PURGED" = 1 ]; }; then
+    rc=0 REASON=complete
+  fi
+  [ "$FINAL_COPY" = 1 ] || REASON=final_collection_failed
+  if ! python3 "$HERE/mg.py" sanitize-tree "$OUT/attempts" --host "$HOST_ADDR"; then rc=1 REASON=redaction_failed; fi
+  python3 - "$OUT/completion.json" "$ATTEMPT_ID" "$rc" "$HOST_STATUS" "$FINAL_COPY" "$PURGED" "$REASON" <<'PY'
+import datetime, json, os, sys
+path, attempt, rc, host, copied, purged, reason = sys.argv[1:]
+doc = dict(state='complete', attempt=attempt, exit_code=int(rc), host_exit=int(host) if host.isdigit() else None,
+           final_collection=copied == '1', purged=purged == '1', reason=reason,
+           ended=datetime.datetime.now(datetime.timezone.utc).isoformat())
+with open(path + '.partial', 'w') as f:
+    json.dump(doc, f, indent=2); f.flush(); os.fsync(f.fileno())
+os.replace(path + '.partial', path)
+PY
+  cp "$OUT/completion.json" "$ATTEMPT/completion.json"
+  rm -rf "$WORK"
+  printf 'RUN_COMPLETE attempt=%s exit=%s evidence=%s\n' "$ATTEMPT_ID" "$rc" "$OUT"
+  exit "$rc"
+}
+trap 'finish' EXIT
+trap 'SIGNALLED=1; REASON=interrupted; exit 143' TERM HUP
+trap 'SIGNALLED=1; REASON=interrupted; exit 130' INT
+# A stale completion marker must never describe a newly running attempt.
+python3 - "$OUT/completion.json" "$ATTEMPT_ID" <<'PY'
+import json, os, sys
+path, attempt = sys.argv[1:]
+with open(path + '.partial', 'w') as f:
+    json.dump(dict(state='running', attempt=attempt), f); f.flush(); os.fsync(f.fileno())
+os.replace(path + '.partial', path)
+PY
 if [ "$PURGE_ONLY" = 1 ]; then
-  step "remove what earlier runs created on the machine"
-  rsh "bash ~/mg/live/remote.sh purge"
+  # Finalize stopped attempts and refresh their exports before destructive cleanup.
+  timeout --kill-after=2 660 "${SSH[@]}" 'bash ~/mg/live/remote.sh finalize'
+  copy -rltz "$TARGET:mg/evidence/" "$OUT/attempts/"
+  python3 "$HERE/mg.py" sanitize-tree "$OUT/attempts" --host "$HOST_ADDR"
+  # This mode never deletes a remote session when its evidence copy failed.
+  remote 'bash ~/mg/live/remote.sh purge'
+  python3 - "$OUT/completion.json" "$ATTEMPT_ID" <<'PY'
+import json, os, sys
+path, attempt = sys.argv[1:]
+with open(path + ".partial", "w") as stream:
+    json.dump(dict(state="complete", attempt=attempt, exit_code=0, final_collection=True, purged=True,
+                   reason="purge_only"), stream)
+    stream.flush()
+    os.fsync(stream.fileno())
+os.replace(path + ".partial", path)
+PY
+  trap - EXIT
+  rm -rf "$WORK"
   exit 0
 fi
-
-COMMIT=$(git -C "$REPO" rev-parse HEAD)
-step "multi-GPU live rows ($ONLY) from capyctl ${COMMIT:0:9} -> $OUT"
-git -C "$REPO" diff --quiet HEAD -- || echo "warning: uncommitted changes are not pushed; the machine builds ${COMMIT:0:9}"
-x mkdir -p "$OUT"
-
-step "preflight"
-rsh "mkdir -m 700 -p ~/mg/live"
-x rsync -e "ssh -p $SSH_PORT" -rlpz --chmod=Du=rwx,Dgo=,Fu=rwx,Fgo= "$HERE/remote.sh" "$HERE/mg.py" "$TARGET:mg/live/"
-if [ "$DRY" = 0 ]; then
-  "${SSH[@]}" "bash ~/mg/live/remote.sh preflight" | tee "$OUT/preflight.txt"
-  grep -q PREFLIGHT_OK "$OUT/preflight.txt" || { echo "preflight failed; nothing was installed"; exit 1; }
-else
-  rsh "bash ~/mg/live/remote.sh preflight"
-fi
-
+printf 'RUN_STARTED attempt=%s commit=%s evidence=%s\n' "$ATTEMPT_ID" "$COMMIT" "$OUT"
+remote "umask 077; mkdir -m 700 -p ~/mg/live ~/mg/attempts/$ATTEMPT_ID/raw"
+copy -rlpz --chmod=Du=rwx,Dgo=,Fu=rwx,Fgo= "$HERE/remote.sh" "$HERE/mg.py" "$TARGET:mg/live/"
+copy -z "$WORK/mg.env" "$ATTEMPT/settings.json" "$TARGET:mg/attempts/$ATTEMPT_ID/"
+REMOTE_READY=1
+remote "ATTEMPT_ID=$ATTEMPT_ID bash ~/mg/live/remote.sh preflight" | python3 "$HERE/mg.py" redact --host "$HOST_ADDR" | tee "$ATTEMPT/preflight.txt"
+grep -q PREFLIGHT_OK "$ATTEMPT/preflight.txt"
+collect
 if [ "$SKIP_SETUP" = 0 ]; then
-  step "push the source trees: ${COMMIT:0:9} and $OLD_TAG"
-  rsh "rm -rf ~/mg/src ~/mg/src-old && mkdir -p ~/mg/src ~/mg/src-old"
-  if [ "$DRY" = 1 ]; then
-    x git -C "$REPO" archive --format=tar HEAD '|' ssh rented-host tar -x -C "$REMOTE_SRC"
-    x git -C "$REPO" archive --format=tar "$OLD_TAG" '|' ssh rented-host tar -x -C "$REMOTE_SRC-old"
-  else
-    git -C "$REPO" archive --format=tar HEAD | "${SSH[@]}" "tar -x -C ~/mg/src"
-    git -C "$REPO" archive --format=tar "$OLD_TAG" | "${SSH[@]}" "tar -x -C ~/mg/src-old"
+  remote 'rm -rf ~/mg/src ~/mg/src-old && mkdir -p ~/mg/src ~/mg/src-old'
+  git -C "$REPO" archive --format=tar HEAD | remote 'tar -x -C ~/mg/src'
+  git -C "$REPO" archive --format=tar "$OLD_TAG" | remote 'tar -x -C ~/mg/src-old'
+fi
+# The remote process is detached from SSH, not from this runner's responsibility.
+# Setup output is copied on every poll, before any row has completed.
+remote "cd ~/mg && ATTEMPT_ID=$ATTEMPT_ID setsid nohup timeout --kill-after=10 $MAX_SECONDS bash live/remote.sh all >attempts/$ATTEMPT_ID/raw/all.log 2>&1 </dev/null &"
+start=$SECONDS
+last_contact=$SECONDS
+REASON=running
+while [ $((SECONDS - start)) -lt "$MAX_SECONDS" ]; do
+  if collect; then
+    last_contact=$SECONDS
+    if [ -f "$ATTEMPT/host-completion.json" ]; then
+      HOST_STATUS=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$ATTEMPT/host-completion.json")
+      REASON=host_finished
+      exit "$HOST_STATUS"
+    fi
+    alive=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("runner_alive"))' "$ATTEMPT/snapshot.json")
+    if [ "$alive" = False ] || { [ "$alive" = None ] && [ $((SECONDS - start)) -ge "$DISCONNECT_SECONDS" ]; }; then
+      REASON=remote_runner_missing
+      exit 1
+    fi
+  elif [ $((SECONDS - last_contact)) -ge "$DISCONNECT_SECONDS" ]; then
+    REASON=connection_lost
+    exit 1
   fi
-fi
-
-step "settings"
-ENVFILE=$(mktemp "${XDG_CACHE_HOME:-$HOME/.cache}/capyctl-mg-env.XXXXXX")
-printf '%s=%q\n' ONLY "$ONLY" STALL "$STALL" CYCLES "$CYCLES" HB_CYCLES "$HB_CYCLES" PORT "$PORT" MPORT "$MPORT" \
-  OLD_TAG "$OLD_TAG" SKIP_SETUP "$SKIP_SETUP" CAPYCTL_COMMIT "$COMMIT" >"$ENVFILE"
-cat "$ENVFILE"
-x rsync -e "ssh -p $SSH_PORT" -z "$ENVFILE" "$TARGET:mg/mg.env"
-rm -f "$ENVFILE"
-
-# The host phases run detached (setsid), so a dropped connection does not stop
-# them; this side follows the progress log until the done marker appears.
-step "setup and rows on the machine (progress below)"
-STARTED=$(date -u +%FT%TZ)
-rc=0
-if [ "$DRY" = 1 ]; then
-  rsh "cd ~/mg && MG=~/mg setsid nohup bash live/remote.sh all >all.log 2>&1 </dev/null &"
-else
-  "${SSH[@]}" "cd ~/mg && MG=\$HOME/mg setsid nohup bash live/remote.sh all >all.log 2>&1 </dev/null & echo started"
-  seen=0
-  while :; do
-    sleep 30
-    lines=$("${SSH[@]}" "tail -n +$((seen + 1)) ~/mg/res/progress.log 2>/dev/null; true" 2>/dev/null) || continue
-    if [ -n "$lines" ]; then printf '%s\n' "$lines"; seen=$((seen + $(printf '%s\n' "$lines" | wc -l))); fi
-    rc=$("${SSH[@]}" "cat ~/mg/done 2>/dev/null; true" 2>/dev/null) || continue
-    [ -z "$rc" ] || break
-  done
-fi
-ENDED=$(date -u +%FT%TZ)
-step "host phases ended with status $rc"
-
-step "copy the results back"
-x mkdir -p "$OUT/raw"
-x rsync -e "ssh -p $SSH_PORT" -rlz "$TARGET:mg/res/" "$OUT/raw/"
-x rsync -e "ssh -p $SSH_PORT" -rlz "$TARGET:mg/dep" "$TARGET:mg/all.log" "$OUT/raw/" || echo "warning: deployment files or all.log not copied (setup stopped before the rows?)"
-if [ "$DRY" = 0 ]; then
-  find "$OUT/raw" -type f \( -name '*.log' -o -name '*.txt' -o -name '*.tsv' -o -name '*.yaml' -o -name '*.json' -o -name '*.jsonl' -o -name '*.out' \) \
-    -exec sed -i -e "s#$HOST_ADDR#rented-host#g" -e "s#/home/[A-Za-z0-9._-]*/#~/#g" -e "s#/root/#~/#g" {} +
-fi
-
-step "verdict"
-if [ "$DRY" = 0 ]; then
-  MACHINE=$(grep -E '^[0-9]+, ' "$OUT/preflight.txt" | cut -d, -f2,3 | sort | uniq -c | tr -s ' ' | paste -sd';')
-  python3 -c 'import json, sys
-keys = ["commit", "machine", "command", "started", "ended", "host_status"]
-print(json.dumps(dict(zip(keys, sys.argv[1:])), indent=2))' \
-    "$COMMIT" "$MACHINE" "scripts/live/multi-gpu/run.sh $(printf '%q ' "${ARGS[@]}")" "$STARTED" "$ENDED" "$rc" >"$OUT/settings.json"
-  python3 "$HERE/mg.py" verdict "$OUT/raw/results.tsv" "$OUT/verdict.md" --settings "$OUT/settings.json"
-else
-  x python3 "$HERE/mg.py" verdict "$OUT/raw/results.tsv" "$OUT/verdict.md" --settings "$OUT/settings.json"
-fi
-
-if [ "$KEEP" = 1 ]; then
-  step "kept on the machine (--keep): run again with --skip-setup, or --purge-only when done"
-else
-  step "remove everything the session created on the machine"
-  rsh "bash ~/mg/live/remote.sh purge"
-  echo "The machine can be shut down now."
-fi
-exit "${rc:-1}"
+  sleep "$POLL_SECONDS"
+done
+REASON=deadline
+exit 1

@@ -183,6 +183,10 @@ message MemberExit {
   optional int32 exit_code = 6;
   optional int32 exit_signal = 7;
   int64 observed_at_unix_ms = 8;
+  // ADR 0035 §7: other owned processes observed gone in the same scan,
+  // before settlement. Their exit statuses and exit order are unknown.
+  // Absent on older senders; presence must be "gone" for every entry.
+  repeated OwnedProcessObservation also_exited = 9;
 }
 message Connect {
   string host_id = 1;

@@ -133,6 +133,46 @@ registration, charge and rank-identity readers, and direct-launch argument
 reconstruction. Before another paid session, the runner must preserve evidence
 incrementally and its completion must not depend on an agent remaining available.
 
+### Rerun preparation, 2026-10-26
+
+The owner authorized another qualification run and fixes for its findings.
+`scripts/live/shade_session.py` runs the qualification command under an
+independent user service, then requests deletion of the explicitly named
+Shadeform instance on success, failure, interruption or a bounded deadline.
+It records the command outcome and the provider's deletion receipt locally.
+Provider-side automatic deletion remains a separate backup for loss of the
+laptop or supervisor.
+
+Local smoke runs exercised the actual supervisor with a simulated provider:
+successful and failed commands, a deadline, and SIGTERM all ended with a
+confirmed deletion receipt. A user-systemd-service smoke also passed, and
+the user service authenticated to the real provider for a read-only inventory
+query. These checks do not establish hardware qualification.
+
+The runner now copies sanitized evidence during setup and after each row part,
+retains each attempt separately, and refuses a passing verdict if any required
+part or artifact is missing. A failed final copy prevents remote purge.
+Rotated engine logs are included; MG3 requires the engine's actual per-GPU
+model-buffer lines rather than substituting GPU readings. Twenty-two local checks,
+including real-runner transport fixtures for success, row failure, missing
+evidence, disconnection, failed final copy and purge recovery, passed. The full dry-run and
+ShellCheck 0.11.0 also passed; these are not native-engine qualification.
+
+Runtime corrections preserve the checkpoint's detailed memory refusal before
+cold placement and report every recorded rank observed gone in one scan, without
+inventing exit order or a signal for another process. Store, host-reporting,
+protocol and CLI regression checks passed locally; MG7 and MG14 still require
+the hardware rerun.
+
+Review also caught an enrolled-server database path error and historical-result
+selection that could reuse an earlier pass after an incomplete rerun. The
+exporter now reads each role's actual database, treats a missing coordinator
+database as failed collection, and requires completion and matching engine
+fingerprints from the latest selected historical attempt. Purge recovery first
+refuses an active runner, stops the remaining roles, and refreshes all exports
+before copying and deleting anything. Regression cases failed before those
+corrections and pass afterward. The integrated fast gate passed all eight steps.
+
 
 # Release note: Several GPUs
 
