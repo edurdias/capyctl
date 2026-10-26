@@ -283,6 +283,22 @@ unchanged. All 13 observation tests passed. A real, bounded CPU process-group
 smoke observed 19 stable snapshots and refused eight changing snapshots,
 with the corresponding membership diagnostics captured and the child reaped.
 
+The next run, on `0b2f72a0`, passed five deep-park cycles on each engine and
+three SGLang host-backed cycles. vLLM's first host-backed park exposed a
+deadline mismatch: its CPU copy took 31.327 seconds, but the generic HTTP
+control timeout expired at 30 seconds despite the persisted operation's
+longer deadline. Persisted sleep and weight-copy wake calls now use the
+remaining operation deadline, as checkpoint reload already does. Expiry
+still leaves the outcome uncertain, retains accounting and prevents replay.
+The regression failed at 30 seconds before the change; all 26 HTTP and
+residency tests passed afterward, including expiry without replay.
+
+MG10 woke the two-GPU model, answered its request and stopped the competing
+single-GPU model, but its switch event omitted the GPU names required by
+the row. Request-driven and explicit-start plans now retain their selected
+GPU sets for the planned-switch diagnostic. The qualification predicate
+is unchanged. Both corrections still require a native rerun.
+
 
 # Release note: Several GPUs
 

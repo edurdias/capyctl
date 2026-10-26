@@ -81,6 +81,9 @@ pub enum SwitchPlan {
         instance: u32,
         /// The instance is parked on `host` and wakes in place.
         wake: bool,
+        /// ADR 0035 / MG10: the chosen GPU set key, in rank order, retained
+        /// for switch diagnostics as well as placement accounting.
+        device: Option<String>,
         victims: Vec<SwitchVictim>,
         /// The host's bounded, non-resetting admission window (SPEC §10).
         admission_window_ms: i64,
@@ -112,6 +115,8 @@ pub struct StartStep {
     pub instance: u32,
     /// The instance is parked on `host` and wakes in place.
     pub wake: bool,
+    /// The GPU set this instance starts or wakes on, in rank order.
+    pub device: Option<String>,
     pub victims: Vec<SwitchVictim>,
     /// The host's bounded, non-resetting admission window (SPEC §10).
     pub admission_window_ms: i64,
@@ -155,7 +160,7 @@ enum Planned {
         device: Option<String>,
     },
     /// Release victims first; on a multi-GPU host, the GPU they free.
-    Evict(SwitchPlan, Option<String>),
+    Evict(SwitchPlan),
     /// It fits nowhere even with eviction.
     Impossible { code: String, detail: String },
 }
@@ -367,7 +372,7 @@ impl crate::Store {
             observed,
         )? {
             Planned::Settled | Planned::Fits { .. } => SwitchPlan::FitsNow,
-            Planned::Evict(plan, _) => plan,
+            Planned::Evict(plan) => plan,
             Planned::Impossible { code, .. } => SwitchPlan::Impossible(code),
         };
         tx.commit()?;
@@ -1581,16 +1586,14 @@ fn plan_in(
         .map_or(DEFAULT_ADMISSION_WINDOW_MS, |p| {
             p.controls.queue.admission_window_ms
         });
-    Ok(Planned::Evict(
-        SwitchPlan::Evict {
-            host: choice.host,
-            instance,
-            wake,
-            victims,
-            admission_window_ms,
-        },
-        parked_device.or(choice.device),
-    ))
+    Ok(Planned::Evict(SwitchPlan::Evict {
+        host: choice.host,
+        instance,
+        wake,
+        device: parked_device.or(choice.device),
+        victims,
+        admission_window_ms,
+    }))
 }
 
 /// ADR 0028 §5, SPEC §11: plan the release that lets group instance
@@ -1813,16 +1816,13 @@ fn plan_group_in(
                 }),
         );
     }
-    Ok(Planned::Evict(
-        SwitchPlan::EvictGroup {
-            hosts: hosts.to_vec(),
-            instance,
-            wake,
-            victims,
-            admission_window_ms,
-        },
-        None,
-    ))
+    Ok(Planned::Evict(SwitchPlan::EvictGroup {
+        hosts: hosts.to_vec(),
+        instance,
+        wake,
+        victims,
+        admission_window_ms,
+    }))
 }
 
 /// A group's plan when one named host refuses: the closed code (that host's,
@@ -1977,16 +1977,14 @@ fn plan_start_in(
         )? {
             Planned::Settled => continue,
             Planned::Fits { host, device } => host.map(|host| (host, device)),
-            Planned::Evict(
-                SwitchPlan::Evict {
-                    host,
-                    instance,
-                    wake,
-                    victims,
-                    admission_window_ms,
-                },
+            Planned::Evict(SwitchPlan::Evict {
+                host,
+                instance,
+                wake,
                 device,
-            ) => {
+                victims,
+                admission_window_ms,
+            }) => {
                 for v in &victims {
                     assumed.released.extend(victim_owners(tx, v)?);
                 }
@@ -1994,6 +1992,7 @@ fn plan_start_in(
                     host: host.clone(),
                     instance,
                     wake,
+                    device: device.clone(),
                     victims,
                     admission_window_ms,
                 });
@@ -2001,16 +2000,13 @@ fn plan_start_in(
             }
             // ADR 0028 §5: a group's victims are released per named host,
             // each victim once; the group is placed on its fixed hosts.
-            Planned::Evict(
-                SwitchPlan::EvictGroup {
-                    instance,
-                    wake,
-                    victims,
-                    admission_window_ms,
-                    ..
-                },
-                _,
-            ) => {
+            Planned::Evict(SwitchPlan::EvictGroup {
+                instance,
+                wake,
+                victims,
+                admission_window_ms,
+                ..
+            }) => {
                 for (host, victims) in victims {
                     for v in &victims {
                         assumed.released.extend(victim_owners(tx, v)?);
@@ -2019,6 +2015,7 @@ fn plan_start_in(
                         host,
                         instance,
                         wake,
+                        device: None,
                         victims,
                         admission_window_ms,
                     });
