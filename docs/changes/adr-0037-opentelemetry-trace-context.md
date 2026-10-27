@@ -1,6 +1,6 @@
 # Status: ADR 0037 proposed: OpenTelemetry trace context — 2026-10-24 (branch `docs/adr-otel`)
 
-ADR 0037 proposes, for 0.1.9 and for the owner to decide, how CapyCTL takes part in a
+ADR 0037 proposes, for 0.2.0 and for the owner to decide, how CapyCTL takes part in a
 distributed trace. Tracing stays off unless a role names an OTLP endpoint
 (`observability.tracing.endpoint`). With it on, the router reads W3C `traceparent` and
 `tracestate` after authentication on the inference endpoints, ignores malformed ones

@@ -1,6 +1,6 @@
 # ADR 0037 — OpenTelemetry trace context: W3C propagation, CapyCTL spans, opt-in OTLP export
 
-**Status:** Proposed (2026-10-24), for 0.1.9. Nothing here is decided or implemented; the
+**Status:** Proposed (2026-10-24), for 0.2.0 (retargeted from 0.1.9 on 2026-10-27, after 0.1.9 shipped with ADR 0035 only). Nothing here is decided or implemented; the
 owner decides the design and the open questions at the end.
 **Amends (if accepted, with the implementation):** `SPEC.md` §10 (the request-ID note:
 `traceparent` and `tracestate` are read after authentication, never refused, and replaced
@@ -142,7 +142,7 @@ weakening its privacy promises.
   `traceparent` and `opentelemetry` finds nothing).
 - **TensorFold.** No trace context support is known to CapyCTL's integration
   [INFERENCE: TensorFold's source was not read for this draft].
-- **TensorRT-LLM** (proposed as a native engine for 0.1.9). `trtllm-serve` has
+- **TensorRT-LLM** (proposed as a native engine for 0.2.0). `trtllm-serve` has
   `--otlp_traces_endpoint` and reads the trace headers of the OpenAI request
   ([tracing.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/tracing.py),
   `serve/openai_server.py`, default branch). Its ADR decides whether this ADR's engine
@@ -586,7 +586,7 @@ decisions on SGLang.
 | OT10 | Missing package: an engine environment without the OpenTelemetry SDK (determined in the row; [INFERENCE] the approved SGLang 0.5.22 environment may lack the `tracing` extra) runs with `engine tracing: off (not_installed)` and serves. |
 | OT11 | Refusals: `engines: on` with a non-loopback endpoint refuses the host's start; an extra `--otlp-traces-endpoint` or an `OTEL_EXPORTER_OTLP_ENDPOINT` in a profile is refused. |
 
-## Implementation plan (target 0.1.9)
+## Implementation plan (target 0.2.0)
 
 1. **Settings.** `observability.tracing` in the server, host and standalone schemas and
    `remote_roles.rs`, with validation, `config show` and the start refusals (§12).
@@ -654,6 +654,6 @@ engine part and 6) waits for its live rows.
     from the vLLM 0.32.0 environment, which has it [INFERENCE]). *Recommendation: (b)*:
     nothing new on the hosts, and the receiver only writes to the session's evidence
     directory.
-12. **Scope for 0.1.9.** (a) Everything here; (b) CapyCTL's spans and the ingress in
-    0.1.9, engine tracing in 0.1.10. *Recommendation: (a)*, with the plan's split as the
+12. **Scope for 0.2.0.** (a) Everything here; (b) CapyCTL's spans and the ingress in
+    0.2.0, engine tracing in a later release. *Recommendation: (a)*, with the plan's split as the
     fallback if OT5 or OT8 fails.
