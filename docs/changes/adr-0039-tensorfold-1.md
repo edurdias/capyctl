@@ -1,6 +1,6 @@
 # Status: ADR 0039 proposed: TensorFold 1.0 — 2026-10-25 (branch `docs/adr-tensorfold-1`)
 
-ADR 0039 (Proposed, for the owner to decide; target 0.1.9) designs TensorFold 1.0.0, the
+ADR 0039 (Proposed, for the owner to decide; target 0.2.0) designs TensorFold 1.0.0, the
 native Zig binary installed at `~/tensorfold-1.0.0` on host A (owner decision 2026-10-25),
 beside the TensorFold 0.6.x line, which stays supported. It was written from the v1.0.0
 source (commit `8b00301`), the Linux aarch64 release archive (read, not run) and the Nemotron

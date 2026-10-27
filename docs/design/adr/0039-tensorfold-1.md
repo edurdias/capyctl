@@ -1,6 +1,6 @@
 # ADR 0039 — TensorFold 1.0: the native binary beside the 0.6 line
 
-**Status:** Proposed (2026-10-25), for the owner to decide. Target release 0.1.9. Nothing
+**Status:** Proposed (2026-10-25), for the owner to decide. Target release 0.2.0 (retargeted from 0.1.9 on 2026-10-27, after 0.1.9 shipped with ADR 0035 only). Nothing
 is implemented; the SPEC, guide and operations texts this ADR lists change with the
 implementation, as for ADRs 0030 and 0033. The section "Open questions for the owner"
 lists what the owner has to decide, each with options and a recommendation.
@@ -19,7 +19,7 @@ proposed).
 
 ## Context
 
-Owner decisions of 2026-10-25 for CapyCTL 0.1.9: TensorFold 1.0.0, a native executable
+Owner decisions of 2026-10-25 for CapyCTL 0.2.0: TensorFold 1.0.0, a native executable
 written in Zig and not a pip upgrade, is installed at `~/tensorfold-1.0.0` on host A and is
 to be qualified `restart_only` with Nemotron 3.5 Lightning 30B-A3B. TensorFold 0.6.x stays
 supported. No lab host is reachable now, so this ADR is a design from the engine's
@@ -689,7 +689,7 @@ line that cannot be read or disagrees with `VERSION`. Resolution: `capability_mi
   versions, but 1.1's `--idle-unload` would let an extra argument make the engine drop its
   model behind CapyCTL's accounting.
 
-## Implementation plan (target 0.1.9)
+## Implementation plan (target 0.2.0)
 
 1. **Configuration.** `TensorfoldLine` (`python`, `native`) and the profile field `line`
    (`crates/capyctl-config/src/registration.rs`, profile parsing and publication); the
@@ -787,7 +787,7 @@ figures.
 4. **Context compaction.** 1.0 can rewrite a conversation's older turns into a note
    (`--compact-at`, `--compact-keep`) and keep the notes on disk (`--compact-memory`).
    Options: (a) `--compact-at` and `--compact-keep` need host approval by name,
-   `--compact-memory` reserved (§4); (b) all three reserved in 0.1.9; (c) all three
+   `--compact-memory` reserved (§4); (b) all three reserved in 0.2.0; (c) all three
    ordinary. Recommendation: (a): turning compaction on is an administrator's choice about
    what the model sees, while notes written to disk contradict zero data retention.
 5. **Listener check on the native line.** Options: (a) run ADR 0031 §7's check on every
