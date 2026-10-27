@@ -40,7 +40,7 @@ Reference: [CLI](/docs/reference/cli/), [configuration files](configuration.md),
 [data retention](../operations/data-retention.md),
 [installer options](installer.md), [exit codes and errors](errors.md).
 
-What changed in the latest release: [release notes for 0.1.8](../operations/release-notes-0.1.8.md).
+What changed in the latest release: [release notes for 0.1.9](../operations/release-notes-0.1.9.md).
 
 CapyCTL does not install engines or GPU drivers. Bring your own vLLM, SGLang or
 TensorFold installation, llama.cpp build or other server;
