@@ -1,6 +1,6 @@
 # Status: ADR 0034 proposed: LMCache by default — 2026-10-24 (branch `docs/adr-lmcache-default`)
 
-ADR 0034 (Proposed, for the owner to decide) plans "LMCache by default" for 0.1.9. In
+ADR 0034 (Proposed, for the owner to decide) plans "LMCache by default" for 0.2.0. In
 0.1.8 the qualified table for LMCache beside a parking residency is empty, so on a GB10,
 where every deployment parks deep, LMCache runs only for `restart_only` deployments. The
 ADR reads what a deep park does to the engine and the connector: vLLM's sleep mode and

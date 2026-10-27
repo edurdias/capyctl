@@ -1,6 +1,6 @@
 # ADR 0034 — LMCache by default: deep parking, pool sizing and `restart_only`
 
-**Status:** Proposed (2026-10-24), for 0.1.9. Nothing is implemented; the owner decides
+**Status:** Proposed (2026-10-24), for 0.2.0 (retargeted from 0.1.9 on 2026-10-27, after 0.1.9 shipped with ADR 0035 only). Nothing is implemented; the owner decides
 the open questions at the end.
 **Amends (on acceptance, with the implementation):** ADR 0033 §1 (the launch-time check
 reads the transfer-mode and eviction options), §3 (the server's argument vector), §4 (the
@@ -241,7 +241,7 @@ qualified table (§3), runs LMCache with engine-driven transfer:
   is measured before anything ships with one (and its segment is then charged and
   removed with the launch like A5's files).
 
-A `restart_only` launch keeps `lmcache_driven` transfer in 0.1.9 unless the owner
+A `restart_only` launch keeps `lmcache_driven` transfer in 0.2.0 unless the owner
 decides otherwise (open question 5). The launch-time check (ADR 0033 §1) also verifies,
 by shape, that the server declares `--supported-transfer-mode` with `engine_driven`, that
 vLLM's adapter reads `mp_transfer_mode` from its extra configuration and that SGLang's
@@ -255,7 +255,7 @@ CapyCTL's key guard.
 ### 2. The qualification plan
 
 LMCache reaches a deep-parking deployment only through `QUALIFIED_PARKING`, row by row,
-as ADR 0033 §7 says. 0.1.9 qualifies on host A (GB10), with the two approved environments
+as ADR 0033 §7 says. 0.2.0 qualifies on host A (GB10), with the two approved environments
 `~/vllm-0.32.0-lmcache-venv` and `~/sglang-0.5.22-lmcache-venv` (LMCache 0.5.6), Qwen3-4B
 (`qwen3`) as the required model type, and any other dense full-attention model type whose
 checkpoint is already on host A as optional rows. Rows LC12–LC17 (Live qualification
@@ -300,7 +300,7 @@ residency) enters the released table when, on that combination:
 - An engine that does not start with the connector (LC12 for today's rendering, or LC13
   on a model type the transport refuses) is the expected ADR 0033 §8 path and is recorded;
   it qualifies nothing.
-- If engine-driven transfer fails on both engines, 0.1.9 ships no table rows and
+- If engine-driven transfer fails on both engines, 0.2.0 ships no table rows and
   "LMCache by default" stays as in 0.1.8; the pool sizing (§4) still applies to
   `restart_only` deployments.
 
@@ -465,7 +465,7 @@ Added to ADR 0033 §14: the reasons `host_kv_room` and `multi_gpu_unqualified`
 - **Refuse or wait for an `auto` deployment whose pool does not fit**, as 0.1.8 does.
   Rejected for `auto` (open question 3): it turns a cache into a reason not to run.
 
-## Implementation plan (target 0.1.9)
+## Implementation plan (target 0.2.0)
 
 Each slice lands with CPU tests tagged T45 (and T14, T25 where they apply); none is
 qualification.
@@ -508,7 +508,7 @@ temperature 0, five repeats). "Off" is the same deployment with `lmcache: off`.
    (a) Yes, by default, documented beside ADR 0033's "Local reach", with the host's
    `lmcache: off` as the remedy and an upstream issue drafted (not filed) asking for a
    payload format that is not pickle; (b) only behind a host opt-in, so deep deployments
-   stay without LMCache unless the operator allows it; (c) not in 0.1.9.
+   stay without LMCache unless the operator allows it; (c) not in 0.2.0.
    **Recommendation: (a).** The port is loopback-only, the audience runs single-user
    machines, the engine keeps its own key guard, and ADR 0028 accepted a wider pickle
    exposure for groups. (b) would leave "LMCache by default" off by default again.
@@ -539,11 +539,11 @@ temperature 0, five repeats). "Off" is the same deployment with `lmcache: off`.
    **Recommendation: (b)**, as §5 says: the measurements show it slower after a park.
 7. **`host_backed` on a discrete GPU.** (a) Approve an LMCache environment on a
    maintainer's discrete-GPU machine and run LC13–LC16 with `host_backed`; (b) leave
-   `host_backed` unqualified in 0.1.9.
-   **Recommendation: (b)** for 0.1.9, (a) when a discrete machine runs vLLM 0.32.0 or
+   `host_backed` unqualified in 0.2.0.
+   **Recommendation: (b)** for 0.2.0, (a) when a discrete machine runs vLLM 0.32.0 or
    SGLang 0.5.22 anyway: the mechanism (sleep level 1, the KV discarded) is the one LC13
    tests, but the table is per GPU product.
-8. **Hybrid model types.** (a) Qualify dense full-attention types only in 0.1.9; (b) ask
+8. **Hybrid model types.** (a) Qualify dense full-attention types only in 0.2.0; (b) ask
    for an environment with the first stable LMCache release that has multi-group
    engine-driven transfer (PR #4410) and qualify a hybrid type too.
    **Recommendation: (a)**, and (b) as soon as such a release is stable; a release
