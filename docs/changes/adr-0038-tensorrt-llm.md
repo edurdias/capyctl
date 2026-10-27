@@ -1,6 +1,6 @@
 # Status: ADR 0038 proposed: TensorRT-LLM as a native engine — 2026-10-25 (branch `docs/adr-tensorrt-llm`)
 
-ADR 0038 (Proposed, for the owner to decide; target 0.1.9) designs TensorRT-LLM 1.2.1 as a
+ADR 0038 (Proposed, for the owner to decide; target 0.2.0) designs TensorRT-LLM 1.2.1 as a
 native engine, following the owner's decisions of 2026-10-25: a virtual environment on
 host A, `~/tensorrt-llm-1.2.1-venv`, built from NVIDIA's aarch64 wheel (pinned by URL and
 SHA-256) on the CUDA 13.1 stack with torch 2.9.1, chat qualified `restart_only`. Evidence

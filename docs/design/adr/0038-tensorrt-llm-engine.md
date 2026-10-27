@@ -1,6 +1,6 @@
 # ADR 0038 — TensorRT-LLM (`trtllm-serve`) as a native engine
 
-**Status:** Proposed (2026-10-25), for the owner to decide. Target release 0.1.9. Nothing
+**Status:** Proposed (2026-10-25), for the owner to decide. Target release 0.2.0 (retargeted from 0.1.9 on 2026-10-27, after 0.1.9 shipped with ADR 0035 only). Nothing
 is implemented; the SPEC, guide and operations texts this ADR lists change with the
 implementation, as for ADRs 0029 and 0033. The section "Open questions for the owner"
 lists what the owner has to decide, each with options and a recommendation.
@@ -23,7 +23,7 @@ ADR 0037 (trace context).
 
 ### The owner's decisions of 2026-10-25
 
-For 0.1.9 the owner chose TensorRT-LLM **1.2.1**, the current stable release, as a native
+For 0.2.0 the owner chose TensorRT-LLM **1.2.1**, the current stable release, as a native
 engine. It runs from a virtual environment on host A, `~/tensorrt-llm-1.2.1-venv`, built
 from NVIDIA's aarch64 wheel on the CUDA 13.1 stack with torch 2.9.1. Chat is to be
 qualified `restart_only`: TensorRT-LLM's sleep mode is a prototype. This ADR designs that
@@ -335,7 +335,7 @@ HMAC-authenticated control API; it is not the version chosen.)
 engine set (the kind name is open question 8). A deployment runs one `trtllm-serve` process
 serving one Hugging Face checkpoint on the PyTorch backend, on one GPU of one host, for
 `api: chat`. Its residency is `restart_only`; `deep` or `host_backed` fails resolution with
-`capability_missing:deep_park`. Out of scope in 0.1.9: the TensorRT engine backend and
+`capability_missing:deep_park`. Out of scope in 0.2.0: the TensorRT engine backend and
 `trtllm-build`, AutoDeploy, multimodal encoders, disaggregated serving, LoRA, speculative
 decoding, beam search, groups and several GPUs (§13).
 
@@ -634,7 +634,7 @@ TensorRT-LLM has no usage reporting of its own (evidence §9), so it takes the g
 convention of #188 (`engine_telemetry::DO_NOT_TRACK`): `DO_NOT_TRACK=1` under the host's
 `engine_telemetry: off`, which also covers the Hugging Face Hub it imports; nothing under
 `allow`. `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE` are set under both, because the
-checkpoint is always local. FlashInfer's kernel downloads are not blocked in 0.1.9 (open
+checkpoint is always local. FlashInfer's kernel downloads are not blocked in 0.2.0 (open
 question 9); TR8 records whether a start reaches them. The data-retention page gains: the
 engine keeps no conversation history (`TRTLLM_RESPONSES_API_DISABLE_STORE=1`); its KV block
 reuse is partitioned by the effective salt.
@@ -744,7 +744,7 @@ V3, V3.1 and V3.2 and Kimi K2 their tool parsers. The typed `tool_call_parser` a
   line, pin MPI or name the served model; the owner chose a native engine.
 - **The NGC container** (`nvcr.io/nvidia/tensorrt-llm/release:1.2.1`), NVIDIA's documented
   easy path. CapyCTL launches native installations; container launchers are a later
-  delivery (SPEC R03). Rejected for 0.1.9.
+  delivery (SPEC R03). Rejected for 0.2.0.
 - **The default MPI pool.** Matches NVIDIA's streaming advice, but with Open MPI 4.1.6 the
   daemon leaves the process group and its transports bind every interface (evidence §6),
   so a stop could not prove the GPU-holding process gone. Open question 1.
@@ -766,7 +766,7 @@ V3, V3.1 and V3.2 and Kimi K2 their tool parsers. The typed `tool_call_parser` a
 - **Choosing 1.4.0rc1** for its sleep API. A pre-release with a different CUDA (13.4) and
   torch; the owner chose the stable release.
 
-## Implementation plan (target 0.1.9)
+## Implementation plan (target 0.2.0)
 
 1. **Configuration** (`capyctl-config`): the `trtllm` kind in every closed set and in
    `engine_policy.rs`; `engine_config.trtllm` (`llm_api_options`); the option, key and
@@ -835,7 +835,7 @@ Qwen3-4B BF16, run unqualified until their own rows.
    stay its children. Recommendation: (a). It keeps ADR 0027's process-group proof and
    opens no network transport; TR10 measures what it costs, and (c) is the route to
    several GPUs later (§13).
-2. **An idle signal.** Options: (a) none in 0.1.9: cut requests settle at the next stop,
+2. **An idle signal.** Options: (a) none in 0.2.0: cut requests settle at the next stop,
    with ADR 0032's restart when they fill the limit (§7); (b) accept a quiet interval (two
    empty `/metrics` reads at least N seconds apart, both after the hang-up, for a request
    the engine produced output for, per SPEC §10's 2026-10-21 rule) as an idle reading
@@ -881,6 +881,6 @@ Qwen3-4B BF16, run unqualified until their own rows.
    when one is not cached (evidence §9). Options: (a) allow and document it, with TR8
    recording whether it happens; (b) point FlashInfer at no repository, so a missing kernel
    fails the start instead of fetching; (c) warm the caches once at `engine add`, which
-   would execute engine code during registration. Recommendation: (a) for 0.1.9: it is not
+   would execute engine code during registration. Recommendation: (a) for 0.2.0: it is not
    usage reporting and blocking it would fail starts unpredictably; revisit if TR8 finds a
    fetch on the qualified model.
