@@ -1,6 +1,6 @@
 # ADR 0036 — Embedding models (`api: embeddings`, `POST /v1/embeddings`)
 
-**Status:** Proposed (2026-10-24), for the owner to decide. Target release 0.1.9. Nothing
+**Status:** Proposed (2026-10-24), for the owner to decide. Target release 0.2.0 (retargeted from 0.1.9 on 2026-10-27, after 0.1.9 shipped with ADR 0035 only). Nothing
 is implemented; the SPEC, guide and operations texts this ADR lists change with the
 implementation, as for ADRs 0030 and 0033. The section "Open questions for the owner"
 lists what the owner has to decide, each with options and a recommendation.
@@ -427,7 +427,7 @@ same 8 MiB body limit. It relays the answer unchanged; the router bounds it (§4
   decision 6 of 2026-10-21: the request was never answered, so the engine may still run
   it.
 
-## Implementation plan (target 0.1.9)
+## Implementation plan (target 0.2.0)
 
 1. **Config.** `DeploymentApi::Embeddings` (`crates/capyctl-config/src/effective.rs`), a
    new `embeddings.rs` beside `decisions.rs` with the engine floors, the topology and
@@ -532,7 +532,7 @@ and its [Q8_0 GGUF](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF) on ll
    for.
 5. **Inputs beyond OpenAI's.** vLLM takes chat `messages` and images; SGLang and
    llama.cpp take multimodal objects; each has extras (truncation, normalization,
-   dtypes). Options: (a) OpenAI's text contract only in 0.1.9; (b) add the multimodal
+   dtypes). Options: (a) OpenAI's text contract only in 0.2.0; (b) add the multimodal
    object shape common to SGLang and llama.cpp; (c) per-engine extras. Recommendation:
    (a); multimodal embeddings can follow with their own contract, body limits and a
    multimodal model row.
@@ -549,7 +549,7 @@ and its [Q8_0 GGUF](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF) on ll
    (a) today's rule (next verified stop, restart when full) for every engine; (b) extend
    ADR 0032 to SGLang embeddings, settling on that error answer after the abort; (c) let
    a cut embedding run to its end and settle on its answer, which an embedding request
-   reaches in milliseconds to seconds. Recommendation: (a) for 0.1.9, with EM5 measuring
+   reaches in milliseconds to seconds. Recommendation: (a) for 0.2.0, with EM5 measuring
    how often a restart happens; (c) is worth a decision after EM5, since an embedding
    request is short and bounded, unlike a generation, and it would settle on the
    completion evidence SPEC §10 already accepts.
@@ -562,12 +562,12 @@ and its [Q8_0 GGUF](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF) on ll
    checkpoint (§1); (b) only checkpoints published as embedding models. Recommendation:
    (a); the operator chooses, and recipes list only trained embedding models.
 10. **`cache_salt`.** vLLM's embedding request takes it; SGLang's does not. Options: (a)
-    refused on embeddings in 0.1.9, and the guide says an embeddings deployment's
+    refused on embeddings in 0.2.0, and the guide says an embeddings deployment's
     engine prefix cache, where it keeps one, is shared by all its callers, so tenants
     who must not share one get their own deployment; (b) accepted on vLLM as the
     effective digest of SPEC §10 and refused on the others. Recommendation: (a), until a
     row shows whether a pooling server reuses prefixes at all.
 11. **Memory defaults.** Options: (a) today's sizing rules, with recipes declaring small
     requests; (b) a default for embeddings deployments from the checkpoint's weights and
-    `max_concurrent_requests` full-length inputs of KV. Recommendation: (a) for 0.1.9,
+    `max_concurrent_requests` full-length inputs of KV. Recommendation: (a) for 0.2.0,
     revisited with EM1's peaks.

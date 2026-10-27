@@ -1,6 +1,6 @@
 # Status: ADR 0036 proposed: embedding models — 2026-10-24 (branch `docs/adr-embeddings`)
 
-ADR 0036 (Proposed, for the owner to decide; target 0.1.9) designs `POST /v1/embeddings`.
+ADR 0036 (Proposed, for the owner to decide; target 0.2.0) designs `POST /v1/embeddings`.
 A deployment declares `api: embeddings` (a third value beside ADR 0030's `chat` and
 `decisions`, part of the frozen revision); resolution refuses it with
 `capability_missing:embeddings` except on vLLM 0.32.0 or newer (`--runner pooling`),
