@@ -3,6 +3,9 @@
 `matrix/` is the two-host matrix harness ([its README](matrix/README.md)).
 `engine-quick-check.sh` is the per-release engine check below, and
 `release-checks/run.sh` the live checks a CapyCTL release owes.
+`multi-gpu/run.sh` runs the one-host multi-GPU rows (MG1–MG14) and a download
+bandwidth test on a rented two-GPU machine in one session
+([its README](multi-gpu/README.md)).
 
 ## Engine quick check
 

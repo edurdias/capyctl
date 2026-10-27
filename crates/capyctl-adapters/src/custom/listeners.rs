@@ -6,6 +6,10 @@
 //! than `127.0.0.1` or `::1` fails the launch `custom_listener_exposed`. A
 //! listener opened before readiness and closed again, or opened later, is not
 //! seen: this narrows the exposure, it does not prove it absent.
+//!
+//! ADR 0035 §5: the same check runs on every built-in engine's launch on
+//! several GPUs of one host, which fails `engine_listener_exposed` naming the
+//! process role, address and port ([`engine_listener_exposed`]).
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
@@ -15,11 +19,21 @@ use capyctl_domain::completion::{Presence, ProcessIdentity};
 /// The kernel's `TCP_LISTEN` state in `/proc/net/tcp`.
 const TCP_LISTEN: &str = "0A";
 
+/// One TCP listener an owned process holds: the process (its recorded role
+/// and pid) and the address it listens on.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OwnedListener {
+    pub address: SocketAddr,
+    pub role: String,
+    pub pid: u32,
+}
+
 /// Why the check did not pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListenerCheck {
-    /// An owned process listens off loopback (ADR 0031 §10).
-    Exposed(SocketAddr),
+    /// An owned process listens off loopback (ADR 0031 §10); ADR 0035 §5:
+    /// with the process that holds it.
+    Exposed(OwnedListener),
     /// The sockets could not be read, or a process could not be established
     /// as the recorded one after they were: nothing is proven either way.
     Unreadable(String),
@@ -34,10 +48,11 @@ pub enum ListenerCheck {
 impl std::fmt::Display for ListenerCheck {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ListenerCheck::Exposed(address) => write!(
+            ListenerCheck::Exposed(listener) => write!(
                 f,
-                "{}: an owned process listens on {address}, not on loopback",
-                capyctl_config::custom::LISTENER_EXPOSED
+                "{}: an owned process listens on {}, not on loopback",
+                capyctl_config::custom::LISTENER_EXPOSED,
+                listener.address
             ),
             ListenerCheck::Unreadable(reason) => {
                 write!(f, "the engine's listeners could not be read: {reason}")
@@ -151,7 +166,7 @@ pub fn owned_listeners(
     proc_root: &Path,
     identities: &[ProcessIdentity],
     presence: &dyn Fn(&ProcessIdentity) -> Presence,
-) -> Result<Vec<SocketAddr>, ListenerCheck> {
+) -> Result<Vec<OwnedListener>, ListenerCheck> {
     if identities.is_empty() {
         return Err(ListenerCheck::Unreadable("no owned process to read".into()));
     }
@@ -188,7 +203,13 @@ pub fn owned_listeners(
                 Err(error) => return Err(unreadable("the socket table", error)),
             }
         }
-        listeners.extend(inodes.iter().filter_map(|inode| tables.get(inode).copied()));
+        listeners.extend(inodes.iter().filter_map(|inode| {
+            tables.get(inode).map(|address| OwnedListener {
+                address: *address,
+                role: identity.role.clone(),
+                pid: identity.pid,
+            })
+        }));
         match presence(identity) {
             Presence::Alive => {}
             // What was read may be another process's: it proves nothing.
@@ -213,11 +234,54 @@ pub fn check_loopback(
 ) -> Result<(), ListenerCheck> {
     match owned_listeners(proc_root, identities, presence)?
         .into_iter()
-        .find(|address| !is_loopback(address))
+        .find(|listener| !is_loopback(&listener.address))
     {
-        Some(address) => Err(ListenerCheck::Exposed(address)),
+        Some(listener) => Err(ListenerCheck::Exposed(listener)),
         None => Ok(()),
     }
+}
+
+/// How many times [`check_engine_launch`] lists a group again after a
+/// helper exited during the read.
+const HELPER_REREADS: usize = 8;
+
+/// ADR 0035 §5: the check on a built-in engine's launch on several GPUs of
+/// one host, over its owned processes. A helper (ADR 0027: a compile worker
+/// that exits on its own) found gone during the read is left out and the
+/// rest read again; any other process that vanished, or a group that keeps
+/// changing, is returned as it is (nothing is proven either way).
+pub fn check_engine_launch(
+    proc_root: &Path,
+    identities: &[ProcessIdentity],
+    presence: &dyn Fn(&ProcessIdentity) -> Presence,
+) -> Result<(), ListenerCheck> {
+    let mut checked = identities.to_vec();
+    let mut rereads = 0;
+    loop {
+        match check_loopback(proc_root, &checked, presence) {
+            Err(ListenerCheck::Vanished(identity))
+                if identity.is_helper() && rereads < HELPER_REREADS =>
+            {
+                rereads += 1;
+                checked.retain(|p| !p.same_process(&identity));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// ADR 0035 §5, §13: the launch failure of a built-in engine's launch whose
+/// owned process listens off loopback, naming the process role, address and
+/// port.
+pub fn engine_listener_exposed(listener: &OwnedListener) -> String {
+    format!(
+        "{}: the {} process {} listens on address {} port {}, not on loopback",
+        capyctl_domain::local_tp::ENGINE_LISTENER_EXPOSED,
+        listener.role,
+        listener.pid,
+        listener.address.ip(),
+        listener.address.port()
+    )
 }
 
 #[cfg(test)]
@@ -323,7 +387,11 @@ mod tests {
         assert_eq!(check_loopback(root.path(), &[identity(10)], &alive), Ok(()));
         assert_eq!(
             check_loopback(root.path(), &[identity(10), identity(11)], &alive),
-            Err(ListenerCheck::Exposed(at("0.0.0.0:8081")))
+            Err(ListenerCheck::Exposed(OwnedListener {
+                address: at("0.0.0.0:8081"),
+                role: "api".into(),
+                pid: 11,
+            }))
         );
         assert!(matches!(
             check_loopback(root.path(), &[identity(10)], &|_| Presence::Unknown),
@@ -334,8 +402,64 @@ mod tests {
             Err(ListenerCheck::Unreadable(_))
         ));
         assert_eq!(
-            ListenerCheck::Exposed(at("0.0.0.0:8081")).to_string(),
+            ListenerCheck::Exposed(OwnedListener {
+                address: at("0.0.0.0:8081"),
+                role: "api".into(),
+                pid: 11,
+            })
+            .to_string(),
             "custom_listener_exposed: an owned process listens on 0.0.0.0:8081, not on loopback"
+        );
+    }
+
+    // T46 (ADR 0035 §5): a built-in engine's launch on several GPUs names the
+    // process that listens off loopback (its role and pid), the address and
+    // the port; a helper that exited during the read is left out and the
+    // group read again; a rank that vanished proves nothing.
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn a_built_in_launch_names_the_exposed_process() {
+        let root = tempfile::tempdir().unwrap();
+        let named = |role: &str, pid: u32| ProcessIdentity {
+            role: role.into(),
+            ..identity(pid)
+        };
+        fake_proc(root.path(), 20, &[1111]);
+        fake_proc(root.path(), 21, &[5555]);
+        fake_proc(root.path(), 22, &[6666]);
+        let alive = |_: &ProcessIdentity| Presence::Alive;
+        let group = [named("api", 20), named("rank-0", 21), named("rank-1", 22)];
+        let Err(ListenerCheck::Exposed(listener)) =
+            check_engine_launch(root.path(), &group, &alive)
+        else {
+            panic!("exposed");
+        };
+        assert_eq!(
+            engine_listener_exposed(&listener),
+            "engine_listener_exposed: the rank-1 process 22 listens on address :: port 8084, \
+             not on loopback"
+        );
+        assert_eq!(
+            check_engine_launch(root.path(), &group[..2], &alive),
+            Ok(())
+        );
+        // A helper gone during the read is left out; a rank is not.
+        let gone_23 = |identity: &ProcessIdentity| {
+            if identity.pid == 23 {
+                Presence::Gone
+            } else {
+                Presence::Alive
+            }
+        };
+        let with_helper = [named("api", 20), named("rank-0", 21), named("helper-0", 23)];
+        assert_eq!(
+            check_engine_launch(root.path(), &with_helper, &gone_23),
+            Ok(())
+        );
+        let with_rank = [named("api", 20), named("rank-1", 23)];
+        assert_eq!(
+            check_engine_launch(root.path(), &with_rank, &gone_23),
+            Err(ListenerCheck::Vanished(named("rank-1", 23)))
         );
     }
 

@@ -516,6 +516,18 @@ pub struct NativeLaunchMetadata {
     /// native entry can assert placement against it; never a public field.
     pub placement_digest: Option<String>,
     pub device: NativeDeviceSelection,
+    /// ADR 0035 §4: on several GPUs of the host, every chosen one in rank
+    /// order (the first is `device`); empty on one GPU, whose descriptor is
+    /// unchanged. The engine runs one rank per entry (`tp_size`).
+    pub devices: Vec<NativeDeviceSelection>,
+}
+
+impl NativeLaunchMetadata {
+    /// ADR 0035 §4: the launch's tensor-parallel size, one rank per GPU of
+    /// its device list; 1 on one GPU.
+    pub fn tensor_parallel(&self) -> u32 {
+        u32::try_from(self.devices.len()).unwrap_or(u32::MAX).max(1)
+    }
 }
 
 /// Trusted, process-local projection of a persisted launch descriptor.

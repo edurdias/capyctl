@@ -1795,7 +1795,9 @@ async fn a_group_whose_profile_one_named_host_lacks_is_refused() {
 }
 
 /// ADR 0028 §2: standalone (the embedded host) is one host; a group is refused.
-// T03 T14
+/// ADR 0035 §1: a group names two or more hosts; a topology without them is
+/// one host's GPUs, not a group.
+// T03 T14 T46
 #[tokio::test]
 async fn an_embedded_group_deploy_is_refused_group_placement_required() {
     let (_directory, state, mut config, host) = fixture();
@@ -1803,6 +1805,7 @@ async fn an_embedded_group_deploy_is_refused_group_placement_required() {
     config.as_object_mut().unwrap().remove("host");
     config.as_object_mut().unwrap().remove("devices");
     config["topology"] = json!({"tensor_parallel": 2});
+    config["placement"] = json!({"hosts": ["host-a", "host-b"]});
     let response = router
         .oneshot(request(
             "POST",

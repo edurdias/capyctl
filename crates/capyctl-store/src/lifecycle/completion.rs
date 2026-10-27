@@ -32,6 +32,10 @@ pub(crate) fn check_session(
 /// 0033 §3: the launch's LMCache server group (`lmcache` and `lmcache-N`,
 /// numbered by start order) stands beside the engine as its own group, and is
 /// all a restart-parked launch holds (§7): members only with their leader.
+/// ADR 0035 §6: a launch on several GPUs of one host also records its rank
+/// processes that are neither `api` nor a worker as `rank-N` (N its rank, at
+/// most 63), named at readiness from the per-GPU readings; each is distinct
+/// and stands beside the workers like a helper, but is an engine process.
 pub(crate) fn canonical_members(
     ids: &[ProcessIdentity],
 ) -> Result<Vec<ProcessIdentity>, LifecycleError> {
@@ -69,14 +73,18 @@ pub(crate) fn canonical_members(
     // `helper-N` roles. They never stand in for the engine's own workers.
     let helpers = ids.iter().filter(|i| i.is_helper()).count();
     roles.retain(|role| !capyctl_domain::completion::is_helper_role(role));
+    let local_rank =
+        |role: &str| capyctl_domain::completion::rank_role(role).is_some_and(|r| r < 64);
+    let ranks = ids.iter().filter(|i| local_rank(&i.role)).count();
+    roles.retain(|role| !local_rank(role));
     // ADR 0033 §7: a restart-parked launch holds its server's group alone.
-    if server > 0 && helpers == 0 && roles.is_empty() {
+    if server > 0 && helpers == 0 && ranks == 0 && roles.is_empty() {
         return Ok(ids);
     }
     // Every role is distinct (checked above), so removing `api` and then every
     // expected `worker-i` in turn only succeeds, with nothing left over, when
     // the remaining role set is exactly {api, worker-0, ..., worker-(n-2)}.
-    let engine = ids.len() - helpers - server;
+    let engine = ids.len() - helpers - server - ranks;
     if !roles.remove("api") || (helpers > 0 && engine < 2) {
         return Err(LifecycleError::Invalid);
     }

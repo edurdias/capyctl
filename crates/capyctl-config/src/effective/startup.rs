@@ -76,7 +76,31 @@ pub enum StartupMeasure {
     /// processes: the card from the GPU memory the driver attributes to them,
     /// host RAM from their resident pages (`RssAnon` + `RssShmem`, ADR 0019
     /// §4), and each domain's estimate is replaced once it is measured.
+    ///
+    /// ADR 0035 §3: on N GPUs of one host, `device` is rank 0's domain, under
+    /// which the largest figure any of the GPUs showed is recorded (keyed by
+    /// N); it is applied to every GPU of a later start at that N
+    /// ([`startup_device_domains`]).
     Domains { device: String, host: String },
+}
+
+/// ADR 0035 §3: every device domain the cold phase charges, in rank order:
+/// one on a single GPU, N on N GPUs of one host, none on a unified host.
+pub fn startup_device_domains(effective: &EffectiveDeployment) -> Vec<String> {
+    effective
+        .resources
+        .cold
+        .allocations
+        .iter()
+        .filter(|a| {
+            effective
+                .host
+                .domains
+                .get(&a.domain)
+                .is_some_and(|d| d.memory == super::DomainMemory::Device)
+        })
+        .map(|a| a.domain.clone())
+        .collect()
 }
 
 /// How a measured peak may replace the frozen startup budget, if it may:
@@ -112,6 +136,21 @@ pub fn startup_measure(effective: &EffectiveDeployment) -> Option<StartupMeasure
             }),
             _ => None,
         },
+        // ADR 0035 §3: N GPUs (one rank each) and the host's RAM.
+        allocations if allocations.len() > 2 => {
+            let (devices, hosts): (Vec<&super::Allocation>, Vec<&super::Allocation>) = allocations
+                .iter()
+                .partition(|a| on_device(&a.domain) == Some(true));
+            match (devices.first(), hosts.as_slice()) {
+                (Some(device), [host]) if on_device(&host.domain) == Some(false) => {
+                    Some(StartupMeasure::Domains {
+                        device: device.domain.clone(),
+                        host: host.domain.clone(),
+                    })
+                }
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

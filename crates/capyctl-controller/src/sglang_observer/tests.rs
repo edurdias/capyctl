@@ -110,6 +110,7 @@ fn observer(
         "inc-1".into(),
         identities(),
         SAVER.into(),
+        1,
         Arc::new(Facts(milestones)),
         Arc::new(Work(outstanding)),
         Arc::new(Physical(physical)),
@@ -307,6 +308,7 @@ fn facts_from_another_binding_or_incarnation_are_unknown() {
         "inc-1".into(),
         identities(),
         SAVER.into(),
+        1,
         Arc::new(Facts(Ok(vec![Milestone::AllocationsRestored]))),
         Arc::new(Work(Ok(0))),
         Arc::new(Foreign),
@@ -326,6 +328,7 @@ fn construction_rejects_a_malformed_saver_digest() {
             "inc-1".into(),
             identities(),
             digest.into(),
+            1,
             Arc::new(Facts(Ok(vec![]))),
             Arc::new(Work(Ok(0))),
             Arc::new(Physical(None)),
@@ -370,9 +373,8 @@ async fn sglang_binding_carries_residency_through_unchanged() {
     assert_eq!(observed.binding_id, "bind-1");
 }
 
-/// Tensor parallelism is not in scope for the pinned recipe. A runtime spanning
-/// devices must read as unknown rather than letting one restored rank stand in for
-/// the whole group.
+/// A one-device launch whose map names a second device reads as unknown rather
+/// than letting one restored rank stand in for the whole group (ADR 0035 §9).
 #[test]
 fn multi_device_residency_is_unknown() {
     struct TwoDevices;
@@ -391,6 +393,7 @@ fn multi_device_residency_is_unknown() {
         "inc-1".into(),
         identities(),
         SAVER.into(),
+        1,
         Arc::new(Facts(Ok(vec![Milestone::AllocationsRestored]))),
         Arc::new(Work(Ok(0))),
         Arc::new(TwoDevices),
@@ -398,7 +401,141 @@ fn multi_device_residency_is_unknown() {
     )
     .unwrap()
     .residency();
-    assert!(o.unknown_work, "multi-rank evidence is not implemented");
+    assert!(o.unknown_work, "a second device is not this launch's");
+}
+
+/// Saver facts from one map row per device: `(device, weight bytes, KV bytes)`.
+struct PerDevice(Vec<(u32, u64, u64)>);
+impl PhysicalFacts for PerDevice {
+    fn observe(&self, _: Duration) -> Observed<AllocationFacts> {
+        let mut facts = facts_with(0, 0, SAVER);
+        facts.allocations.groups.clear();
+        for &(device, weights, kv) in &self.0 {
+            let mut w = group(AllocationTag::Weights, weights);
+            let mut c = group(AllocationTag::KvCache, kv);
+            w.device = device;
+            c.device = device;
+            facts.allocations.groups.extend([w, c]);
+        }
+        Ok(facts)
+    }
+}
+
+const W: u64 = 8 << 30;
+const KV: u64 = 4 << 30;
+
+fn on_devices(
+    devices: u32,
+    milestones: Vec<Milestone>,
+    rows: Vec<(u32, u64, u64)>,
+) -> RuntimeResidency {
+    NativeResidencyObserver::new(
+        token(),
+        "bind-1".into(),
+        "inc-1".into(),
+        identities(),
+        SAVER.into(),
+        devices,
+        Arc::new(Facts(Ok(milestones))),
+        Arc::new(Work(Ok(0))),
+        Arc::new(PerDevice(rows)),
+        Arc::new(Live(Ok(identities()))),
+    )
+    .unwrap()
+    .residency()
+}
+
+fn resident() -> Vec<Milestone> {
+    vec![
+        Milestone::AllocationsRestored,
+        Milestone::WeightsUsable,
+        Milestone::CacheValid,
+    ]
+}
+
+fn released() -> Vec<Milestone> {
+    let mut facts = resident();
+    facts.push(Milestone::MemoryReleased);
+    facts
+}
+
+// T46 T21 (ADR 0035 §9): a wake settles only when every GPU is mapped; with
+// both mapped under a committed restore the launch reads resident.
+#[test]
+fn every_device_mapped_under_a_committed_restore_is_resident() {
+    let o = on_devices(2, resident(), vec![(0, W, KV), (1, W, KV)]);
+    assert!(o.allocations && o.weights && o.cache);
+    assert!(!o.unknown_work);
+}
+
+// T46 T21 (ADR 0035 §9): a park settles only when every GPU is unmapped; with
+// both unmapped after a committed release the launch reads released.
+#[test]
+fn every_device_unmapped_after_a_committed_release_is_released() {
+    let o = on_devices(2, released(), vec![(0, 0, 0), (1, 0, 0)]);
+    assert!(!o.allocations && !o.weights && !o.cache);
+    assert!(!o.unknown_work);
+}
+
+// T46 T20 (ADR 0035 §9): one GPU mapped and the other dark is a disagreement,
+// whichever residency is committed: unknown, never released nor resident.
+#[test]
+fn one_device_mapped_and_another_unmapped_is_unknown() {
+    for milestones in [resident(), released()] {
+        for rows in [vec![(0, W, KV), (1, 0, 0)], vec![(0, 0, 0), (1, W, KV)]] {
+            let o = on_devices(2, milestones.clone(), rows);
+            assert!(o.unknown_work);
+            assert!(!o.allocations);
+        }
+    }
+}
+
+// T46 T20 (ADR 0035 §9): a GPU missing from the map is unread evidence, and
+// a device the launch does not have is not its evidence; both are unknown.
+#[test]
+fn a_missing_or_extra_device_is_unknown() {
+    for milestones in [resident(), released()] {
+        let missing = on_devices(2, milestones.clone(), vec![(0, 0, 0)]);
+        assert!(missing.unknown_work, "device 1 was never read");
+        let rows = vec![(0, 0, 0), (1, 0, 0), (2, 0, 0)];
+        let extra = on_devices(2, milestones, rows);
+        assert!(extra.unknown_work, "device 2 is not this launch's");
+    }
+    let missing = on_devices(2, resident(), vec![(0, W, KV)]);
+    assert!(missing.unknown_work);
+    let extra = on_devices(2, resident(), vec![(0, W, KV), (1, W, KV), (2, W, KV)]);
+    assert!(extra.unknown_work);
+}
+
+// T46 T20 (ADR 0035 §9): committed weights need weight bytes on every GPU; a
+// GPU whose weights region is unmapped is unknown, not usable weights.
+#[test]
+fn committed_weights_with_one_device_unweighted_is_unknown() {
+    let o = on_devices(2, resident(), vec![(0, W, KV), (1, 0, KV)]);
+    assert!(o.unknown_work);
+    assert!(!o.weights);
+    assert!(o.cache);
+}
+
+// T46 T20 (ADR 0035 §9): a launch on no GPU, or on more than one observer can
+// judge, is not a launch to observe.
+#[test]
+fn construction_rejects_an_impossible_device_count() {
+    for devices in [0, MAX_DEVICES + 1] {
+        let made = NativeResidencyObserver::new(
+            token(),
+            "bind-1".into(),
+            "inc-1".into(),
+            identities(),
+            SAVER.into(),
+            devices,
+            Arc::new(Facts(Ok(vec![]))),
+            Arc::new(Work(Ok(0))),
+            Arc::new(Physical(None)),
+            Arc::new(Live(Ok(vec![]))),
+        );
+        assert!(matches!(made, Err(RuntimeError::Unsupported)));
+    }
 }
 
 /// A source bound to one deployment must never answer for another. Returning zero

@@ -464,7 +464,13 @@ impl Switcher {
                 &format!(
                     "instance(s) {} of an explicit start activate on {host} after releasing {} instance(s); admission window {window} ms",
                     here.iter()
-                        .map(|s| format!("{}{}", s.instance, if s.wake { " (wakes)" } else { "" }))
+                        .map(|s| format!(
+                            "{}{}{}{}",
+                            s.instance,
+                            if s.wake { " (wakes)" } else { "" },
+                            if s.device.is_some() { " on GPU(s) " } else { "" },
+                            s.device.as_deref().unwrap_or_default()
+                        ))
                         .collect::<Vec<_>>()
                         .join(", "),
                     victims.len()
@@ -596,12 +602,15 @@ impl Switcher {
                 host,
                 instance,
                 wake,
+                device,
                 victims,
                 admission_window_ms,
             } => (
                 format!(
-                    "instance {instance} {} on {host} after releasing {} instance(s); admission window {admission_window_ms} ms",
+                    "instance {instance} {} on {host}{}{} after releasing {} instance(s); admission window {admission_window_ms} ms",
                     if wake { "wakes" } else { "starts" },
+                    if device.is_some() { " GPU(s) " } else { "" },
+                    device.as_deref().unwrap_or_default(),
                     victims.len()
                 ),
                 victims,

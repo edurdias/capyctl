@@ -48,6 +48,10 @@ mod local_adoption;
 #[path = "cleanup_adoption.rs"]
 mod cleanup_adoption;
 
+// ADR 0035 §§5, 6: readiness of an embedded launch on several GPUs.
+#[path = "local_ranks.rs"]
+mod local_ranks;
+
 // SPEC §10, ADR 0013 §8 (W10): request-driven switching commands.
 #[path = "switching.rs"]
 mod switching;
@@ -187,7 +191,8 @@ pub struct CoordinatorOptions {
     /// `switching.drain_timeout`.
     pub stop_drain_timeout: Duration,
     /// ADR 0028 §12 (found live 2026-10-15, MN4): how long a group park's or
-    /// wake's member evidence is awaited after the head's reply.
+    /// wake's member evidence is awaited after the head's reply. ADR 0035 §9:
+    /// and a vLLM launch's per-GPU readings on several GPUs of one host.
     pub group_member_evidence: crate::group_residency::MemberEvidence,
     /// ADR 0033 §§9, 10 (lifecycle design §9): the standalone host started
     /// with `lmcache: off` (`HostOff`) or `retention: zero`
@@ -477,6 +482,81 @@ impl CoordinatorCommands {
             .store()
             .record_group_stall(owner.session(), deployment_id, instance_index, generation)
             .map_err(|error| error.to_string())
+    }
+
+    /// ADR 0035 §7: the instance on several GPUs at `generation` stalled
+    /// and failed its probe: its dispatch closes and `tp_stalled` is
+    /// recorded ([`capyctl_store::Store::record_tp_stall`]). `Ok(false)`
+    /// when that generation is no longer its current Ready launch.
+    pub(crate) fn record_tp_stall(
+        &self,
+        deployment_id: &str,
+        instance_index: u32,
+        generation: i64,
+    ) -> Result<bool, String> {
+        let owner = self.owner_for_read().map_err(|error| error.to_string())?;
+        owner
+            .store()
+            .record_tp_stall(owner.session(), deployment_id, instance_index, generation)
+            .map_err(|error| error.to_string())
+    }
+
+    /// ADR 0035 §7: one completion probe of at most `max_tokens` tokens of
+    /// the Ready launch `local` names, through the instance's own endpoint:
+    /// its retained runtime's probe, on loopback with the launch's key for an
+    /// embedded engine and run by the host's agent on its loopback for a
+    /// remote one (never through ingress or the router), bounded by `bound`.
+    pub(crate) async fn probe_ready_launch(
+        &self,
+        local: &capyctl_store::ordinary_lifecycle::group_stall::StalledLocal,
+        max_tokens: u32,
+        bound: Duration,
+    ) -> crate::group_stall::LaunchProbe {
+        use crate::group_stall::LaunchProbe;
+        let driver = match self.shared.retained.lock() {
+            Ok(retained) => retained.get(&local.binding_id).cloned(),
+            Err(_) => None,
+        };
+        let Some(driver) = driver else {
+            return LaunchProbe::Unavailable(
+                "this coordinator retains no runtime for the launch".into(),
+            );
+        };
+        let Ok(now) = (self.shared.clock)() else {
+            return LaunchProbe::Unavailable("the coordinator's clock is unreadable".into());
+        };
+        let context = capyctl_domain::completion::StepExecutionContext {
+            token: capyctl_domain::completion::TransitionToken {
+                deployment_id: local.deployment_id.clone(),
+                revision: local.revision,
+                generation: local.generation,
+                operation_id: local.operation_id.clone(),
+                step_id: local.step_id.clone(),
+            },
+            binding_id: local.binding_id.clone(),
+            incarnation: local.incarnation.clone(),
+            issued_at_ms: now,
+            deadline_ms: now.saturating_add(i64::try_from(bound.as_millis()).unwrap_or(i64::MAX)),
+            identities: capyctl_domain::completion::ExecutionIdentities::Retained(
+                local.identities.clone(),
+            ),
+            completion_target: None,
+            grant_id: None,
+            launch_settings: None,
+        };
+        match tokio::time::timeout(
+            bound,
+            driver.engine.wake_canary(&context, max_tokens, bound),
+        )
+        .await
+        {
+            Ok(Ok(_)) => LaunchProbe::Answered,
+            Ok(Err(RuntimeError::Unsupported)) => LaunchProbe::Unavailable(
+                "the engine offers no completion probe of its launch".into(),
+            ),
+            Ok(Err(error)) => LaunchProbe::Failed(error.to_string()),
+            Err(_) => LaunchProbe::Failed(format!("the probe was not answered within {bound:?}")),
+        }
     }
 
     /// Commit Stop using a service-resolved generation. History is observation only.
@@ -2538,22 +2618,19 @@ impl StartupPeak {
                     })
                 };
                 for (domain, on_card) in [(device, true), (host, false)] {
-                    let held = |r: &ProcessResident| {
-                        if on_card {
-                            r.device_bytes
-                        } else {
-                            r.host_bytes
-                        }
-                    };
                     let most = self
                         .residents
                         .iter()
                         .filter(|(at, _)| outside(*at))
                         .filter_map(|(_, processes)| {
-                            processes
-                                .iter()
-                                .filter(ours)
-                                .try_fold(0_i64, |sum, r| sum.checked_add(held(r).max(0)))
+                            let held: Vec<&ProcessResident> =
+                                processes.iter().filter(ours).collect();
+                            if on_card {
+                                per_gpu_peak(&held)
+                            } else {
+                                held.iter()
+                                    .try_fold(0_i64, |sum, r| sum.checked_add(r.host_bytes.max(0)))
+                            }
                         })
                         .max()
                         .filter(|most| *most > 0);
@@ -2565,6 +2642,27 @@ impl StartupPeak {
         }
         peaks
     }
+}
+
+/// ADR 0035 §§3, 8: the device figure of one startup sample of the launch's
+/// own processes: the most any one GPU held, each GPU's bytes summed over the
+/// processes. A launch on N GPUs records the largest per-GPU peak (the GPUs
+/// are identical), never their sum. On one GPU this is today's figure; a
+/// reading without per-GPU figures (an older host) counts toward one GPU.
+fn per_gpu_peak(processes: &[&ProcessResident]) -> Option<i64> {
+    let mut per_gpu: BTreeMap<&str, i64> = BTreeMap::new();
+    for process in processes {
+        if process.per_device.is_empty() {
+            let held = per_gpu.entry("").or_default();
+            *held = held.checked_add(process.device_bytes.max(0))?;
+            continue;
+        }
+        for reading in &process.per_device {
+            let held = per_gpu.entry(reading.device.as_str()).or_default();
+            *held = held.checked_add(i64::try_from(reading.bytes).ok()?)?;
+        }
+    }
+    Some(per_gpu.into_values().max().unwrap_or(0))
 }
 
 async fn drive(
@@ -2764,6 +2862,14 @@ async fn drive(
         _ = stop.changed() => return Err(CoordinatorError::Stopped("shutdown during Initialize".into())),
         result = tokio::time::timeout(bound, driver.engine.execute_persisted(&command)) => result.map_err(|_| CoordinatorError::Service("Initialize timeout".into()))?.map_err(|e| CoordinatorError::Service(e.to_string()))?,
         _ = sampling => unreachable!("sampling never ends"),
+    };
+    // ADR 0035 §§5, 6: on several GPUs, the ranks are named and the
+    // listeners checked before anything is recorded; a failure here is a
+    // failed launch, stopped and settled on gone evidence.
+    let observation = tokio::select! {
+        biased;
+        _ = stop.changed() => return Err(CoordinatorError::Stopped("shutdown during Initialize".into())),
+        result = local_ranks::at_readiness(shared, work, source, &driver, observation) => result?,
     };
     let step = work.step_id().to_owned();
     let receipt = OwnedLaunchReceipt {
@@ -3137,7 +3243,7 @@ async fn drive_residency(
             return Ok(true);
         }
     }
-    execute_residency(shared, &driver, &work, context, stop).await?;
+    execute_residency(shared, source, &driver, &work, context, stop).await?;
     if work.kind == ResidencyKind::Park {
         measure_parked(shared, source, &work, stop).await;
     }
@@ -3528,9 +3634,18 @@ async fn retry_group_residency_stops(shared: &Arc<Shared>) -> Result<bool, Coord
 /// dispatch stays closed under its recorded reason and every member stays
 /// charged. Returns whether any stop was accepted.
 async fn retry_group_stall_stops(shared: &Arc<Shared>) -> Result<bool, CoordinatorError> {
-    let owed = shared
-        .read(|owner, _| owner.store().group_stall_stops_due(owner.session()))
+    let (mut owed, tp) = shared
+        .read(|owner, _| {
+            Ok((
+                owner.store().group_stall_stops_due(owner.session())?,
+                // ADR 0035 §7: and every instance on several GPUs that
+                // failed `tp_stalled`.
+                owner.store().tp_stall_stops_due(owner.session())?,
+            ))
+        })
         .await?;
+    let groups = owed.len();
+    owed.extend(tp);
     if owed.is_empty() {
         return Ok(false);
     }
@@ -3539,7 +3654,14 @@ async fn retry_group_stall_stops(shared: &Arc<Shared>) -> Result<bool, Coordinat
     };
     Ok(tokio::task::spawn_blocking(move || {
         owed.iter()
-            .filter(|owed| crate::group_stall::accept_stall_stop(&commands, owed).is_ok())
+            .enumerate()
+            .filter(|(index, owed)| {
+                if *index < groups {
+                    crate::group_stall::accept_stall_stop(&commands, owed).is_ok()
+                } else {
+                    crate::group_stall::accept_tp_stall_stop(&commands, owed).is_ok()
+                }
+            })
             .count()
             > 0
     })
@@ -3611,6 +3733,7 @@ const PARKED_SAMPLE_RETRY: Duration = Duration::from_secs(3);
 /// Send one armed park or restore exactly once and record what it proved.
 async fn execute_residency(
     shared: &Arc<Shared>,
+    source: &dyn ServiceObservation,
     driver: &Arc<Driver>,
     work: &ResidencyWork,
     context: capyctl_domain::completion::StepExecutionContext,
@@ -3707,26 +3830,41 @@ async fn execute_residency(
                     match after_canary(driver, observation, answered) {
                         Err(reason) => Some((WAKE_UNCERTAIN, reason)),
                         Ok(observation) => {
-                            let step = step.clone();
-                            let completed = shared
-                                .read(move |owner, now| {
-                                    owner.store().complete_residency(
-                                        owner.session(),
-                                        &step,
-                                        &observation,
-                                        now,
-                                    )
-                                })
-                                .await;
-                            match completed {
-                                Ok(()) => None,
-                                Err(error) if !shared.accepting.load(Ordering::Acquire) => {
-                                    return Err(error)
+                            match commit_residency(
+                                shared,
+                                source,
+                                work,
+                                observation,
+                                deadline,
+                                stop,
+                            )
+                            .await?
+                            {
+                                Committed::Done => None,
+                                Committed::Unproven(reason) => Some((WAKE_UNCERTAIN, reason)),
+                                Committed::Stopped => {
+                                    if restore {
+                                        record_wake_failure(
+                                            shared,
+                                            work,
+                                            &canary_context,
+                                            WAKE_UNCERTAIN,
+                                        )
+                                        .await;
+                                    }
+                                    let reason = format!(
+                                        "the controller stopped before every GPU's reading proved the {verb}"
+                                    );
+                                    uncertain(if restore {
+                                        format!("{WAKE_UNCERTAIN}: {reason}")
+                                    } else {
+                                        reason
+                                    })
+                                    .await?;
+                                    return Err(CoordinatorError::Stopped(format!(
+                                        "shutdown during a {verb}"
+                                    )));
                                 }
-                                Err(error) => Some((
-                                    WAKE_UNCERTAIN,
-                                    format!("its evidence was not accepted: {error}"),
-                                )),
                             }
                         }
                     }
@@ -3781,6 +3919,124 @@ async fn execute_residency(
     uncertain(format!("{code}: {reason}")).await?;
     retry_wake_stops(shared).await?;
     Ok(())
+}
+
+/// What committing a park's or wake's evidence came to.
+enum Committed {
+    Done,
+    /// The evidence did not settle the step: it reads uncertain.
+    Unproven(String),
+    /// The controller is stopping.
+    Stopped,
+}
+
+/// Commit a park's or wake's `observation` (the engine's reply, a wake's
+/// after its canary). ADR 0035 §9: a vLLM launch on several GPUs of its host
+/// settles only on a host sample, taken after this, in which every chosen
+/// GPU's bytes held by the launch's processes are at or below that GPU's
+/// parked budget (a park) or above it (a wake). The host is asked again
+/// until a sample proves it or the evidence window passes (the one a group
+/// member's evidence has, within the step's deadline); a GPU never read, or
+/// read on the wrong side of its budget, leaves the step unproven: uncertain,
+/// with every charge kept (AGENTS.md: uncertainty retains accounting).
+async fn commit_residency(
+    shared: &Arc<Shared>,
+    source: &dyn ServiceObservation,
+    work: &ResidencyWork,
+    observation: capyctl_domain::completion::EffectObservation,
+    deadline: tokio::time::Instant,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<Committed, CoordinatorError> {
+    let accepted = |completed: Result<(), CoordinatorError>| match completed {
+        Ok(()) => Ok(Committed::Done),
+        Err(error) if !shared.accepting.load(Ordering::Acquire) => Err(error),
+        Err(error) => Ok(Committed::Unproven(format!(
+            "its evidence was not accepted: {error}"
+        ))),
+    };
+    let step = work.step_id.clone();
+    let evidence = shared
+        .read(move |owner, _| {
+            owner
+                .store()
+                .residency_device_evidence(owner.session(), &step)
+        })
+        .await;
+    let evidence = match evidence {
+        Ok(evidence) => evidence,
+        Err(error) if !shared.accepting.load(Ordering::Acquire) => return Err(error),
+        Err(error) => {
+            return Ok(Committed::Unproven(format!(
+                "its per-GPU evidence could not be read: {error}"
+            )))
+        }
+    };
+    let Some(evidence) = evidence else {
+        let step = work.step_id.clone();
+        let completed = shared
+            .read(move |owner, now| {
+                owner
+                    .store()
+                    .complete_residency(owner.session(), &step, &observation, now)
+            })
+            .await;
+        return accepted(completed);
+    };
+    let timing = shared.options.group_member_evidence;
+    // A host's process sample may predate its report by up to `sample_lag`:
+    // only a reading observed that long after now was sampled after the
+    // engine's reply (and a wake's canary).
+    let not_before = (shared.clock)()?
+        .saturating_add(i64::try_from(timing.sample_lag.as_millis()).unwrap_or(i64::MAX));
+    let until = (tokio::time::Instant::now() + timing.window).min(
+        deadline
+            .checked_sub(crate::group_residency::EVIDENCE_MARGIN)
+            .unwrap_or(deadline),
+    );
+    let mut why = "no GPU was read".to_owned();
+    loop {
+        let sampled = tokio::select! {
+            biased;
+            _ = stop.changed() => return Ok(Committed::Stopped),
+            result = tokio::time::timeout_at(until, source.observe_with_residents(work.host.clone())) => result,
+        };
+        if let Ok(Ok((observed, residents))) = sampled {
+            let now = (shared.clock)()?;
+            match evidence.judge(&observed, &residents, not_before, now) {
+                Ok(_) => {
+                    let step = work.step_id.clone();
+                    let completed = shared
+                        .read(move |owner, now| {
+                            owner.store().complete_residency_on_gpus(
+                                owner.session(),
+                                &step,
+                                &observation,
+                                &capyctl_store::ordinary_lifecycle::park::GpuReadings {
+                                    observations: &observed,
+                                    residents: &residents,
+                                    since_ms: not_before,
+                                },
+                                now,
+                            )
+                        })
+                        .await;
+                    return accepted(completed);
+                }
+                Err(reason) => why = reason,
+            }
+        }
+        let poll = crate::group_residency::MEMBER_EVIDENCE_POLL;
+        if tokio::time::Instant::now() + poll >= until {
+            return Ok(Committed::Unproven(format!(
+                "not every GPU proved it within its evidence window: {why}"
+            )));
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => return Ok(Committed::Stopped),
+            _ = tokio::time::sleep(poll) => {}
+        }
+    }
 }
 
 /// Owner decision 2026-10-09: what a wake's canary proved.

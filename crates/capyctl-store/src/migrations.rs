@@ -11,8 +11,8 @@ use crate::schema::{
     SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
     SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
     SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V49, SCHEMA_V5, SCHEMA_V50, SCHEMA_V51, SCHEMA_V52,
-    SCHEMA_V53, SCHEMA_V54, SCHEMA_V55, SCHEMA_V56, SCHEMA_V57, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9,
+    SCHEMA_V53, SCHEMA_V54, SCHEMA_V55, SCHEMA_V56, SCHEMA_V57, SCHEMA_V58, SCHEMA_V6, SCHEMA_V7,
+    SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -99,6 +99,9 @@ pub const MIGRATIONS: &[&str] = &[
     // ADR 0033 §6 (amendment A15): the largest GPU reading of a server
     // above its charge, which every phase's charge holds.
     SCHEMA_V57,
+    // ADR 0035 §§2, 3: GPU-set resolutions, each instance's chosen set and N,
+    // and the measured peak and residue keyed by N.
+    SCHEMA_V58,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -123,7 +126,7 @@ pub fn apply(conn: &Connection) -> Result<(), StoreError> {
 
 /// [`apply`], stopping after version `last`. Tests use it to build a store as
 /// an older binary left it.
-fn apply_through(conn: &Connection, last: i64) -> Result<(), StoreError> {
+pub(crate) fn apply_through(conn: &Connection, last: i64) -> Result<(), StoreError> {
     let migrations_table: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
@@ -221,6 +224,10 @@ fn apply_through(conn: &Connection, last: i64) -> Result<(), StoreError> {
             // ADR 0033 §6 (amendment A15): the largest server GPU reading
             // above its charge.
             crate::ordinary_lifecycle::lmcache::migrate_v57(&tx)?;
+        }
+        if version == 58 {
+            // ADR 0035 §2: each instance's chosen GPU set and its N.
+            crate::instances::migrate_v58(&tx)?;
         }
         if version == 28 {
             // SPEC §6.5 (ADR 0013 amendment): the warm-residency flag.
@@ -406,6 +413,48 @@ mod tests {
         conn.execute(
             "INSERT INTO request_lease_cancellations(lease_id,cancelled_at_ms,engine_answered) VALUES('new',8,1)",
             [],
+        )
+        .unwrap();
+    }
+
+    // T46 T33 (ADR 0035 §§2, 3, v58): a peak and a residue recorded before
+    // v58 are the N = 1 record; an instance placed before v58 ran at N = 1,
+    // one never placed has no N; a GPU set's key may exceed 128 bytes.
+    #[test]
+    fn v58_reads_existing_rows_as_one_gpu_and_keys_figures_by_n() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        apply_through(&conn, 57).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version,revision) VALUES('a','a','model','ready',1,0,1,1,1);
+            INSERT INTO startup_measurements(deployment_id,revision,host_id,installation,domain,peak_bytes,step_id,measured_at_ms) VALUES('a',1,'host-a','vllm@1','gpu0',12,'s1',7);
+            INSERT INTO parked_measurements(deployment_id,revision,host_id,installation,domain,bytes,step_id,measured_at_ms) VALUES('a',1,'host-a','vllm@1','gpu0',3,'s1',7);
+            INSERT OR IGNORE INTO deployment_instances(deployment_id,instance_index) VALUES('a',0),('a',1);
+            UPDATE deployment_instances SET host_id='host-a',device='gpu0' WHERE deployment_id='a' AND instance_index=0;
+            UPDATE deployment_instances SET host_id=NULL,device=NULL WHERE deployment_id='a' AND instance_index=1;"#,
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let n = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(n("SELECT tensor_parallel FROM startup_measurements"), 1);
+        assert_eq!(n("SELECT tensor_parallel FROM parked_measurements"), 1);
+        let placed: Vec<Option<i64>> = conn
+            .prepare("SELECT tensor_parallel FROM deployment_instances ORDER BY instance_index")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(placed, vec![Some(1), None]);
+        // The same domain at N = 2 is its own record.
+        conn.execute_batch("INSERT INTO startup_measurements(deployment_id,revision,host_id,installation,tensor_parallel,domain,peak_bytes,step_id,measured_at_ms) VALUES('a',1,'host-a','vllm@1',2,'gpu0',30,'s2',8);").unwrap();
+        assert_eq!(n("SELECT COUNT(*) FROM startup_measurements"), 2);
+        let long = ["host/26:01HXXXXXXXXXXXXXXXXXXXXXXX/device/gpu0"; 4].join(",");
+        assert!(long.len() > 128);
+        conn.execute(
+            "UPDATE deployment_instances SET device_set=?1 WHERE instance_index=0",
+            [&long],
         )
         .unwrap();
     }

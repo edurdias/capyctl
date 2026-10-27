@@ -576,9 +576,10 @@ fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
     );
 }
 
-/// ADR 0028 §2: standalone is one host, so a deployment with a topology above
-/// world size one is refused `group_placement_required`.
-// T14
+/// ADR 0028 §2: standalone is one host, so a group topology (two or more
+/// `placement.hosts`) is refused `group_placement_required`. ADR 0035 §1,
+/// §1a: a topology without them, and `topology: auto`, run on the one host.
+// T14 T46
 #[test]
 fn a_standalone_deployment_with_a_group_topology_is_refused() {
     let mut deployment = deployment_document(
@@ -594,21 +595,17 @@ fn a_standalone_deployment_with_a_group_topology_is_refused() {
         "local",
     )
     .expect("the unified template");
+    deployment.as_object_mut().unwrap().remove("host");
     deployment["topology"] = serde_json::json!({"tensor_parallel": 2});
-    for placement in [
-        serde_json::json!({}),
-        serde_json::json!({"placement": {"hosts": ["a", "b"]}}),
-    ] {
-        let mut candidate = deployment.clone();
-        candidate.as_object_mut().unwrap().remove("host");
-        candidate
-            .as_object_mut()
-            .unwrap()
-            .extend(placement.as_object().unwrap().clone());
-        let error = capyctl_config::topology::refuse_in_standalone(&candidate)
-            .expect_err("a group is refused in standalone");
-        assert!(error.to_string().contains("group_placement_required"));
-    }
+    let mut group = deployment.clone();
+    group["placement"] = serde_json::json!({"hosts": ["a", "b"]});
+    let error = capyctl_config::topology::refuse_in_standalone(&group)
+        .expect_err("a group is refused in standalone");
+    assert!(error.to_string().contains("group_placement_required"));
+    // One host: several GPUs of it, or `auto`.
+    capyctl_config::topology::refuse_in_standalone(&deployment).expect("one host");
+    deployment["topology"] = serde_json::json!("auto");
+    capyctl_config::topology::refuse_in_standalone(&deployment).expect("auto");
     // World size one is the single-host path.
     deployment["topology"] = serde_json::json!({"tensor_parallel": 1});
     capyctl_config::topology::refuse_in_standalone(&deployment).expect("world size one");

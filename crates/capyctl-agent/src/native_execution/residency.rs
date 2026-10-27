@@ -27,10 +27,13 @@
 //! scheduler's saver map, SPEC §9.2), the journaled group's liveness, ingress
 //! in-flight counts and the engine's own running and waiting gauges. A release
 //! counts only when the saver shows every allocation unmapped, not when the
-//! release route answers; a partly mapped saver is unknown. A host with no
-//! saver observation source, or a launch that enrolled none, cannot prove
-//! release or restoration, so SGLang residency is refused there before any
-//! engine call rather than assumed.
+//! release route answers; a partly mapped saver is unknown. ADR 0035 §9: a
+//! launch on N > 1 GPUs is read one rank's map per GPU, and the release (or
+//! restoration) counts only when every rank shows it; a rank missing,
+//! unreadable or disagreeing is unknown. A host with no saver observation
+//! source, or a launch that enrolled none, cannot prove release or
+//! restoration, so SGLang residency is refused there before any engine call
+//! rather than assumed.
 use super::saver_source::{content, read_saver, saver_facts};
 use super::{fresh_probe, NativeHostExecution, PROBE_MARGIN_MS};
 use crate::{
@@ -64,7 +67,9 @@ use std::{
     },
 };
 
-/// Mapped and reserved saver bytes of one SGLang launch on its single device.
+/// Mapped and reserved saver bytes of one rank of an SGLang launch: its
+/// scheduler's map on its own device (the single device of a launch on one
+/// GPU; ADR 0035 §9: device r for rank r of a launch on N).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SaverMapped {
     /// The saver library is the approved one (by digest), not a stand-in.
@@ -101,6 +106,9 @@ pub struct SaverScope {
     pub admin_key: String,
     /// The installation interpreter the launch runs.
     pub executable: String,
+    /// ADR 0035 §9: the launch's ranks, one scheduler (and one saver map) per
+    /// GPU of its device list; 1 on one GPU.
+    pub ranks: u32,
 }
 
 /// SPEC §13.3: the admin credential is never formatted.
@@ -115,6 +123,7 @@ impl std::fmt::Debug for SaverScope {
                 &capyctl_adapters::traits::redacted(!self.admin_key.is_empty()),
             )
             .field("executable", &self.executable)
+            .field("ranks", &self.ranks)
             .finish()
     }
 }
@@ -124,6 +133,16 @@ impl std::fmt::Debug for SaverScope {
 /// process group, and fail when any of those does not match.
 pub trait SaverResidency: Send + Sync {
     fn mapped(&self, scope: &SaverScope) -> Result<SaverMapped, SaverUnavailable>;
+
+    /// ADR 0035 §9: one map per rank, in rank order. A source that reads one
+    /// rank only cannot prove a launch on several GPUs, so by default that is
+    /// unknown (fails closed); a launch on one GPU is its single map.
+    fn mapped_ranks(&self, scope: &SaverScope) -> Result<Vec<SaverMapped>, SaverUnavailable> {
+        if scope.ranks > 1 {
+            return Err(SaverUnavailable);
+        }
+        self.mapped(scope).map(|mapped| vec![mapped])
+    }
 
     /// The private directory launches enroll their observation in, if any.
     fn observation_dir(&self) -> Option<&std::path::Path> {
@@ -284,6 +303,8 @@ impl Run<'_> {
             members: Some(self.expected.to_vec()),
             admin_key: admin.clone(),
             executable: frozen.executable().into(),
+            // ADR 0035 §9: one saver map per GPU of the frozen device list.
+            ranks: frozen.metadata().tensor_parallel(),
         })
     }
 
@@ -311,7 +332,8 @@ impl Run<'_> {
         })
     }
 
-    /// SPEC §9.2 evidence: the saver's mapped bytes now, when readable.
+    /// SPEC §9.2 evidence: the saver's mapped bytes now, summed over every
+    /// rank (ADR 0035 §9), when readable.
     async fn saver_mapped_bytes(&self) -> Option<u64> {
         let Driver::Sglang {
             saver: Some(saver), ..
@@ -322,8 +344,9 @@ impl Run<'_> {
         let scope = self.saver_scope()?;
         read_saver(saver, scope)
             .await
-            .ok()
-            .map(|m| m.mapped_bytes())
+            .ok()?
+            .iter()
+            .try_fold(0u64, |sum, m| sum.checked_add(m.mapped_bytes()))
     }
 
     /// SPEC §10 step 4: engine quiescence, proven by the adapter's own
@@ -354,21 +377,27 @@ impl Run<'_> {
                 if !ready {
                     // Found live 2026-09-23 (M28): a refused SGLang park said
                     // only `unchanged`. Which fact failed, and the saver's
-                    // bytes per tag when readable, on the host's own log, and
-                    // (found live 2026-10-14) whether the launch never enrolled.
+                    // bytes per tag when readable (ADR 0035 §9: per rank, in
+                    // rank order), on the host's own log, and (found live
+                    // 2026-10-14) whether the launch never enrolled.
                     let unenrolled = saver.unenrolled(&self.plan.binding_id);
                     let saver = match self.saver_scope() {
                         Some(scope) => read_saver(saver, scope).await.ok(),
                         None => None,
                     }
-                    .map(|m| {
-                        serde_json::json!({
-                            "real_saver": m.real_saver,
-                            "weight_mapped": m.weight_bytes,
-                            "weight_virtual": m.weight_virtual_bytes,
-                            "kv_mapped": m.kv_bytes,
-                            "kv_virtual": m.kv_virtual_bytes,
-                        })
+                    .map(|ranks| {
+                        ranks
+                            .iter()
+                            .map(|m| {
+                                serde_json::json!({
+                                    "real_saver": m.real_saver,
+                                    "weight_mapped": m.weight_bytes,
+                                    "weight_virtual": m.weight_virtual_bytes,
+                                    "kv_mapped": m.kv_bytes,
+                                    "kv_virtual": m.kv_virtual_bytes,
+                                })
+                            })
+                            .collect::<Vec<_>>()
                     });
                     capyctl_domain::role_log::event(serde_json::json!({
                         "event": "sglang_park_not_quiescent",

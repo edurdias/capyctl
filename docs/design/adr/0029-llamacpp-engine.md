@@ -408,3 +408,15 @@ cover registration, rendering, reserved options, sizing, readiness, the idle gat
 park refusal and the metrics mapping. They are not qualification. Live rows LC1–LC6
 (plan slice L6) on a maintainer's discrete-GPU machine qualify it, and a GB10 row
 after the owner approves a lab-host build.
+
+## Amendment of 2026-10-25: a layer split across GPUs of one host (ADR 0035)
+
+Owner decision 5 of 2026-10-25 ([ADR 0035](0035-multi-gpu-one-host.md) §4).
+
+**§6.** With `topology: {tensor_parallel: N}` CapyCTL renders `--split-mode layer`,
+`--tensor-split` with one proportion per chosen GPU from the per-GPU grants (equal, since the
+GPUs are identical) and `--main-gpu 0`, the device list in `CUDA_VISIBLE_DEVICES`, and
+`NCCL_SOCKET_IFNAME=lo` in the launch environment, so a build that links NCCL stays on
+loopback. `--split-mode row` and `tensor`, and `--device`, stay reserved and are never
+rendered. A single-GPU launch renders none of them, as before. llama.cpp stays
+`restart_only`.

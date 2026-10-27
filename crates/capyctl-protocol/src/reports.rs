@@ -401,6 +401,9 @@ pub struct MemberExit {
     pub generation: i64,
     pub owned_handle: String,
     pub process: ProcessIdentity,
+    /// Other processes observed gone in the same scan, before settlement.
+    /// No exit status or ordering is inferred from their position.
+    pub also_exited: Vec<ProcessIdentity>,
     pub status: ExitStatus,
     pub observed_at_ms: i64,
 }
@@ -420,12 +423,16 @@ impl TryFrom<pb::MemberExit> for MemberExit {
             || exit.generation <= 0
             || !bounded_handle(&exit.owned_handle)
             || exit.observed_at_unix_ms < 0
+            // A readiness result carries at most 256 process identities.
+            || exit.also_exited.len() >= 256
             // PID plus start identity on one boot, never a PID alone.
-            || process.pid == 0
-            || process.start_ticks == 0
-            || !bounded_id(&process.role)
-            || !bounded_id(&process.boot_id)
-            || process.presence != "gone"
+            || std::iter::once(&process).chain(&exit.also_exited).any(|p| {
+                p.pid == 0
+                    || p.start_ticks == 0
+                    || !bounded_id(&p.role)
+                    || !bounded_id(&p.boot_id)
+                    || p.presence != "gone"
+            })
         {
             return Err(GroupIdentityError);
         }
@@ -440,6 +447,16 @@ impl TryFrom<pb::MemberExit> for MemberExit {
                 boot_id: process.boot_id,
                 start_ticks: process.start_ticks,
             },
+            also_exited: exit
+                .also_exited
+                .into_iter()
+                .map(|p| ProcessIdentity {
+                    role: p.role,
+                    pid: p.pid,
+                    boot_id: p.boot_id,
+                    start_ticks: p.start_ticks,
+                })
+                .collect(),
             status,
             observed_at_ms: exit.observed_at_unix_ms,
         })
@@ -464,7 +481,20 @@ impl MemberExit {
                 boot_id: self.process.boot_id.clone(),
                 start_ticks: self.process.start_ticks,
                 presence: "gone".into(),
+                rank: None,
             }),
+            also_exited: self
+                .also_exited
+                .iter()
+                .map(|p| pb::OwnedProcessObservation {
+                    role: p.role.clone(),
+                    pid: p.pid,
+                    boot_id: p.boot_id.clone(),
+                    start_ticks: p.start_ticks,
+                    presence: "gone".into(),
+                    rank: None,
+                })
+                .collect(),
             exit_code,
             exit_signal,
             observed_at_unix_ms: self.observed_at_ms,

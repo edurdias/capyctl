@@ -666,6 +666,32 @@ fn status(value: &Value, names: &HostNames) -> String {
             out.push_str(&block);
         }
     }
+    // ADR 0035 §1a, §5: an instance on several GPUs of one host, or under
+    // `topology: auto`: its tensor-parallel size and GPUs, and that its
+    // collectives listen on loopback, unauthenticated there.
+    let topology: Vec<String> = d["instances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(topology_line)
+        .collect();
+    if !topology.is_empty() {
+        out.push('\n');
+        for line in topology {
+            out.push_str(&line);
+        }
+        if d["instances"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|i| i["collectives"] == "loopback")
+        {
+            out.push_str(
+                "Collectives  loopback (the ranks' collective listeners are on this host's \
+                 loopback, unauthenticated there)\n",
+            );
+        }
+    }
     // ADR 0031 §6, SPEC §10: each instance's cancelled requests still charged,
     // and what settles them.
     let cancelling: Vec<String> = d["instances"]
@@ -773,6 +799,40 @@ fn cancelling_line(instance: &Value) -> Option<String> {
     };
     Some(format!(
         "Instance {}  cancelling: {count}{settles}\n",
+        text(&instance["index"])
+    ))
+}
+
+/// ADR 0035 §1a, §5: one instance's tensor-parallel line, absent on one GPU
+/// without `topology: auto`: `Instance 0  TP auto (2) on gpu0, gpu1` for a
+/// placed `auto` instance, `TP auto` before it is placed, `TP 2` for a
+/// stated size.
+fn topology_line(instance: &Value) -> Option<String> {
+    let topology = instance.get("topology").filter(|t| t.is_object())?;
+    // A group's flattened topology is a mapping of its own dimensions.
+    if instance.get("members").is_some() {
+        return None;
+    }
+    let placed = topology["tensor_parallel"].as_u64();
+    let size = match (&topology["requested"], placed) {
+        (Value::String(auto), Some(n)) => format!("{} ({n})", clean(auto)),
+        (Value::String(auto), None) => clean(auto),
+        (Value::Number(n), _) => n.to_string(),
+        (_, Some(n)) => n.to_string(),
+        _ => return None,
+    };
+    let on = topology["devices"]
+        .as_array()
+        .filter(|devices| !devices.is_empty())
+        .map(|devices| {
+            format!(
+                " on {}",
+                devices.iter().map(text).collect::<Vec<_>>().join(", ")
+            )
+        })
+        .unwrap_or_default();
+    Some(format!(
+        "Instance {}  TP {size}{on}\n",
         text(&instance["index"])
     ))
 }
@@ -1024,6 +1084,99 @@ mod tests {
             {"host_id": "01HOSTA", "name": "gpu-a"},
             {"host_id": "01HOSTB", "name": ""},
         ]}))
+    }
+
+    // T46 (ADR 0035 §§1a, 5): each instance on several GPUs or under
+    // `topology: auto` gets a line after the instances table, as status
+    // JSON gives its `topology` (`multi_gpu_placement.rs` pins that JSON):
+    // `TP auto (2) on gpu0, gpu1` for an `auto` instance placed at 2,
+    // `TP auto` for one not placed, `TP 2 on ...` for a stated size, and
+    // `TP auto (1) on gpu0` for an `auto` instance placed on one GPU. The
+    // Collectives line follows when any instance's collectives are on
+    // loopback, and only then.
+    #[test]
+    fn status_shows_each_instances_tensor_parallel_size_and_collectives() {
+        let instance = |index: u32, topology: Value, loopback: bool| {
+            let mut i = json!({"index": index, "host_id": "01HOSTA",
+                "observed_state": "ready", "lifecycle": "active", "topology": topology});
+            if loopback {
+                i["collectives"] = json!("loopback");
+            }
+            i
+        };
+        let status = |instances: Vec<Value>| {
+            render(
+                View::Status,
+                &json!({"name": "m", "observed_state": "ready", "revision": "1",
+                    "instances": instances}),
+                &names(),
+            )
+        };
+        let tail = |out: &str| -> Vec<String> {
+            out.lines()
+                .skip_while(|line| !line.starts_with("Instance "))
+                .map(str::to_owned)
+                .collect()
+        };
+        let auto_two = json!({"requested": "auto", "tensor_parallel": 2,
+            "devices": ["gpu0", "gpu1"]});
+        let unplaced = json!({"requested": "auto"});
+        let stated = json!({"requested": 2, "tensor_parallel": 2, "devices": ["gpu2", "gpu3"]});
+        let auto_one = json!({"requested": "auto", "tensor_parallel": 1, "devices": ["gpu0"]});
+        let out = status(vec![
+            instance(0, auto_two, true),
+            instance(1, unplaced.clone(), false),
+            instance(2, stated, true),
+            instance(3, auto_one.clone(), false),
+        ]);
+        assert_eq!(
+            tail(&out),
+            [
+                "Instance 0  TP auto (2) on gpu0, gpu1",
+                "Instance 1  TP auto",
+                "Instance 2  TP 2 on gpu2, gpu3",
+                "Instance 3  TP auto (1) on gpu0",
+                "Collectives  loopback (the ranks' collective listeners are on this host's \
+                 loopback, unauthenticated there)",
+            ],
+            "{out}"
+        );
+        let out = status(vec![
+            instance(0, auto_one, false),
+            instance(1, unplaced, false),
+        ]);
+        assert_eq!(
+            tail(&out),
+            ["Instance 0  TP auto (1) on gpu0", "Instance 1  TP auto"],
+            "no instance on several GPUs, no collectives: {out}"
+        );
+    }
+
+    // T46 (ADR 0035 §5): a deployment on one GPU without `auto` (status JSON
+    // with no `topology` and no `collectives`) prints exactly what it printed
+    // before: no TP line, no Collectives line.
+    #[test]
+    fn status_on_one_gpu_without_auto_is_unchanged() {
+        let out = render(
+            View::Status,
+            &json!({"name": "chat", "kind": "model", "desired_state": "running",
+                "observed_state": "ready", "ready_instances": 1, "desired_instances": 1,
+                "revision": "3", "startup": {"bytes": 14_i64 << 30},
+                "timeouts": {"initialize_ms": 600_000},
+                "latest_operation": {"kind": "initialize", "state": "succeeded"},
+                "instances": [{"index": 0, "host_id": "01HOSTA", "observed_state": "ready",
+                    "lifecycle": "active",
+                    "devices": [{"id": "gpu0", "sharing": "shared"}]}]}),
+            &names(),
+        );
+        assert_eq!(
+            out,
+            "NAME   STATE   READY   REVISION   STARTUP    INITIALIZE   LAST OPERATION\n\
+             chat   ready   1/1     3          14.0 GiB   600s         initialize succeeded\n\
+             \n\
+             INSTANCE   HOST    STATE   LIFECYCLE   DEVICES   LAST ERROR\n\
+             0          gpu-a   ready   active      gpu0      -\n"
+        );
     }
 
     #[test]

@@ -45,6 +45,8 @@ mod tensorfold;
 mod llamacpp;
 // ADR 0031: custom engines' plan, adapter and loopback check.
 mod custom;
+// ADR 0035 §§5, 6: launches on several GPUs of this host.
+mod local_tp;
 // ADR 0023 §6, ADR 0029 §10: the engines' own idle check before Terminate.
 mod idle_gate;
 // SPEC §§9.1, 10 (W4): remote Park and Restore of a retained launch.
@@ -654,16 +656,18 @@ impl NativeHostExecution {
         }
         // ADR 0019 §3: on a discrete GPU measured per domain, the card's and
         // host RAM's startup charges apart, each never below the steady
-        // charge this host resolved on that domain.
+        // charge this host resolved on that domain. ADR 0035 §3: on N GPUs
+        // the card's figure is per GPU and is laid over each of them.
         if let (
             Some(device_startup),
             Some(host_startup),
-            Some(capyctl_config::effective::StartupMeasure::Domains { device, host }),
+            Some(capyctl_config::effective::StartupMeasure::Domains { host, .. }),
         ) = (
             plan.startup_bytes,
             plan.startup_host_bytes,
             capyctl_config::effective::startup_measure(&effective),
         ) {
+            let devices = capyctl_config::effective::startup_device_domains(&effective);
             let steady = |domain: &str| {
                 effective
                     .resources
@@ -673,15 +677,15 @@ impl NativeHostExecution {
                     .filter(|ready| ready.domain == domain)
                     .fold(0_i64, |sum, ready| sum.saturating_add(ready.bytes))
             };
-            let (device_bytes, host_bytes) = (
-                device_startup.max(steady(&device)),
-                host_startup.max(steady(&host)),
-            );
+            let charges: Vec<(String, i64)> = devices
+                .iter()
+                .map(|device| (device.clone(), device_startup.max(steady(device))))
+                .chain([(host.clone(), host_startup.max(steady(&host)))])
+                .collect();
             for cold in &mut effective.resources.cold.allocations {
-                if cold.domain == device {
-                    cold.bytes = device_bytes;
-                } else if cold.domain == host {
-                    cold.bytes = host_bytes;
+                if let Some((_, bytes)) = charges.iter().find(|(domain, _)| *domain == cold.domain)
+                {
+                    cold.bytes = *bytes;
                 }
             }
         }
@@ -695,16 +699,27 @@ impl NativeHostExecution {
             }
         }
         // ADR 0028 §4, §8: a group member runs on exactly the plan's devices,
-        // `local_ranks` of them; a single launch on exactly one.
+        // `local_ranks` of them; a single launch on exactly one. ADR 0035 §4,
+        // §11: a single launch on several GPUs of this host runs on exactly
+        // its plan's device list, N of them.
         let group = group_member(command);
-        let devices = group.map_or(1, |(plan, _)| plan.topology().local_ranks as usize);
+        let devices = group.map_or(plan.devices.len().max(1), |(plan, _)| {
+            plan.topology().local_ranks as usize
+        });
         if effective.profile.build_fingerprint != command.identity.profile_fingerprint
             || effective.model.content_fingerprint != plan.checkpoint_fingerprint
             || effective.selected_devices.len() != devices
+            || effective.local_tensor_parallel() as usize != devices.max(1)
             // Discrete GPU design §7 (review decision): with a choice of
             // GPU the launch pins the selected one; one it cannot pin (no
             // published UUID, no `gpuN` index) is refused before any effect.
-            || effective.cuda_namespace().is_err()
+            // ADR 0035 §4: every GPU of a device list, each by its UUID or
+            // (every one) by its index.
+            || effective.cuda_namespaces().is_err()
+            // ADR 0035 §4: the plan's device list is the effective
+            // deployment's claims in rank order, each a GPU this host's
+            // accepted inventory publishes.
+            || !local_devices_match(plan, &effective)
             // ADR 0028 §8: a worker leases no service port; a SGLang worker
             // leases its loopback port from the same range.
             || leased_port(command).is_some_and(|port| {
@@ -1712,11 +1727,113 @@ impl NativeHostExecution {
             // and recorded processes are its whole answer.
             return Ok(());
         }
+        // ADR 0035 §§5, 6: a launch on several GPUs of this host names its
+        // ranks and checks its listeners before its readiness is journaled.
+        let observation = self
+            .local_tp_readiness(session, command, plan, &effective, observation)
+            .await?;
         let id = &command.identity;
         self.journal
             .record_launch_ready(session, &id.command_id, &observation)
             .map_err(|_| SessionError)?;
         Ok(self.publish_ready(session, &id.command_id, &id.command_id, &scope)?)
+    }
+
+    /// ADR 0035 §§5, 6: the readiness of a launch on several GPUs of this
+    /// host ([`local_tp`]): its rank processes named from this host's own
+    /// per-GPU samples and journaled under their roles, the ranks recorded
+    /// in its receipt, and its owned listeners checked. A launch that fails
+    /// either is stopped here with gone evidence, so its result carries the
+    /// closed code (`tp_rank_unobserved`, `engine_listener_exposed`); the
+    /// claim stays until the controller's Terminate settles it. A launch on
+    /// one GPU is returned as it is.
+    async fn local_tp_readiness(
+        &self,
+        session: u64,
+        command: &MemberCommand,
+        plan: &SingleLaunchPlan,
+        effective: &EffectiveDeployment,
+        mut observation: capyctl_domain::completion::EffectObservation,
+    ) -> Result<capyctl_domain::completion::EffectObservation, LaunchError> {
+        if plan.devices.len() < 2 {
+            return Ok(observation);
+        }
+        let id = command.identity.command_id.clone();
+        let stop_launch = |journal: Arc<HostJournal>, owner: String| {
+            let recorded: Vec<_> = journal
+                .inspect_owned(&owner)
+                .map(|seen| seen.into_iter().map(|(identity, _)| identity).collect())
+                .unwrap_or_default();
+            !recorded.is_empty() && custom::stop_exposed(&recorded)
+        };
+        // ADR 0035 §6 and its evidence table: vLLM and SGLang run one
+        // process per rank, named here. llama.cpp runs one process across
+        // every GPU of its layer split, so it has no rank processes to name
+        // (naming would always fail it `tp_rank_unobserved`).
+        if capyctl_domain::local_tp::names_ranks(effective.profile.engine.name()) {
+            let sampler = self.residency.clone();
+            let until = command.identity.deadline_ms - PROBE_MARGIN_MS;
+            let named =
+                local_tp::await_ranks(&observation.identities, &plan.devices, until, || {
+                    let sampler = sampler.clone();
+                    async move {
+                        let sampler = sampler?;
+                        tokio::task::spawn_blocking(move || sampler.sample_now())
+                            .await
+                            .ok()
+                            .filter(|sample| !sample.is_empty())
+                    }
+                })
+                .await;
+            let (identities, ranks) = match named {
+                Ok(named) => named,
+                Err(text) => {
+                    let journal = self.journal.clone();
+                    let owner = id.clone();
+                    let _ = tokio::task::spawn_blocking(move || stop_launch(journal, owner)).await;
+                    return Err(LaunchError { engine: Some(text) });
+                }
+            };
+            let journal = self.journal.clone();
+            let (owner, named) = (id.clone(), ranks.clone());
+            tokio::task::spawn_blocking(move || journal.record_rank_roles(session, &owner, &named))
+                .await
+                .map_err(|_| SessionError)?
+                .map_err(|_| SessionError)?;
+            observation.identities = identities;
+            observation.receipt = format!(
+                "{}; {}",
+                observation.receipt,
+                capyctl_domain::local_tp::ranks_receipt(&ranks)
+            );
+        }
+        let journal = self.journal.clone();
+        let checked = observation.identities.clone();
+        let verdict =
+            tokio::task::spawn_blocking(move || match local_tp::check_listeners(&checked) {
+                Ok(()) => Ok(()),
+                Err(capyctl_adapters::custom::ListenerCheck::Exposed(listener)) => {
+                    let stopped = stop_launch(journal, id);
+                    Err(Some(format!(
+                        "{}{}",
+                        capyctl_adapters::custom::engine_listener_exposed(&listener),
+                        if stopped {
+                            "; the engine was stopped"
+                        } else {
+                            ""
+                        }
+                    )))
+                }
+                Err(_) => Err(None),
+            })
+            .await
+            .map_err(|_| SessionError)?;
+        verdict.map_err(|engine| LaunchError { engine })?;
+        observation.receipt = format!(
+            "{}; every owned listener is on loopback",
+            observation.receipt
+        );
+        Ok(observation)
     }
 
     /// Register a retained launch's exact scope with its protected credentials.
@@ -1814,8 +1931,10 @@ impl NativeHostExecution {
         .await?;
         // ADR 0031 §7: a custom launch's listeners are checked again
         // whenever this host re-proves it, after the probe and before the
-        // gate reopens; one off loopback stops the launch.
-        if effective.profile.engine == Engine::Custom {
+        // gate reopens; one off loopback stops the launch. ADR 0035 §5: so
+        // are a built-in engine's on several GPUs.
+        let several_gpus = plan.devices.len() >= 2;
+        if effective.profile.engine == Engine::Custom || several_gpus {
             let journal = self.journal.clone();
             let owner = owned_handle.to_owned();
             let checked = tokio::task::spawn_blocking(move || {
@@ -1828,7 +1947,12 @@ impl NativeHostExecution {
                     })
                     .map(|(identity, _)| identity)
                     .collect();
-                match custom::check_listeners(&alive) {
+                let check = if several_gpus {
+                    local_tp::check_listeners(&alive)
+                } else {
+                    custom::check_listeners(&alive)
+                };
+                match check {
                     Ok(()) => Ok(()),
                     Err(capyctl_adapters::custom::ListenerCheck::Exposed(_)) => {
                         let recorded: Vec<_> = journal
@@ -2357,6 +2481,40 @@ fn group_member(command: &MemberCommand) -> Option<(&GroupPlan, &MemberPlan)> {
     Some((plan, member))
 }
 
+/// ADR 0035 §§4, 11: a single launch's device list corroborated against what
+/// this host resolved: empty for a launch on one GPU (and a group member,
+/// whose devices its group plan names); otherwise exactly the effective
+/// deployment's claims in rank order, each a GPU of this host's accepted
+/// inventory (a device whose domain is a device domain) with a published
+/// UUID or a `gpuN` index to pin it by.
+fn local_devices_match(plan: &SingleLaunchPlan, effective: &EffectiveDeployment) -> bool {
+    if plan.devices.is_empty() {
+        return effective.selected_devices.len() <= 1;
+    }
+    plan.devices.len() == effective.selected_devices.len()
+        && plan
+            .devices
+            .iter()
+            .zip(&effective.selected_devices)
+            .all(|(device, claim)| {
+                *device == claim.id
+                    && effective.host.devices.get(device).is_some_and(|policy| {
+                        let discrete =
+                            effective
+                                .host
+                                .domains
+                                .get(&policy.domain)
+                                .is_some_and(|domain| {
+                                    domain.memory == capyctl_config::effective::DomainMemory::Device
+                                });
+                        let index = device.strip_prefix("gpu").is_some_and(|n| {
+                            !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+                        });
+                        discrete && (policy.physical_gpu_uuid.is_some() || index)
+                    })
+            })
+}
+
 /// SPEC §3.1, ADR 0028 §5: the loopback port a launch leases: a single
 /// launch's or a group head's service port, a SGLang worker's loopback port,
 /// none for any other group worker (it serves nothing).
@@ -2410,7 +2568,15 @@ fn launch_failure(result: &pb::MemberExecutionResult, engine: Option<&str>) -> S
     use capyctl_adapters::launch_failure::{summary, EngineExit};
     if let Some(exposed) = engine
         .and_then(|text| text.lines().next())
-        .filter(|line| line.starts_with(capyctl_config::custom::LISTENER_EXPOSED))
+        .filter(|line| {
+            [
+                capyctl_config::custom::LISTENER_EXPOSED,
+                capyctl_domain::local_tp::ENGINE_LISTENER_EXPOSED,
+                capyctl_domain::local_tp::TP_RANK_UNOBSERVED,
+            ]
+            .iter()
+            .any(|code| line.starts_with(&format!("{code}:")))
+        })
         .filter(|line| capyctl_protocol::execution::is_launch_failure_text(line))
     {
         return exposed.to_owned();
@@ -2829,6 +2995,16 @@ impl SessionExecution for NativeHostExecution {
                 // the server credits each domain with its own memory.
                 device_bytes: p.device_bytes,
                 host_bytes: p.host_bytes,
+                // ADR 0035 §8 (`local_tensor_parallel`): the GPU memory per
+                // GPU, so the server credits each GPU's domain with its own.
+                per_device: p
+                    .per_device
+                    .into_iter()
+                    .map(|d| pb::DeviceResidency {
+                        device_id: d.device,
+                        bytes: d.bytes,
+                    })
+                    .collect(),
             })
             .collect();
         if !device.is_empty() {
@@ -3216,6 +3392,7 @@ mod tests {
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
+                devices: Vec::new(),
             }),
         };
         let legacy = command(&deployment);
@@ -3366,6 +3543,7 @@ mod tests {
             startup_bytes: None,
             startup_host_bytes: None,
             lmcache: None,
+            devices: Vec::new(),
         };
         let command = MemberCommand {
             identity: checkpoint_identity("launch", "reserved"),
@@ -5519,6 +5697,7 @@ mod tests {
             boot_id: "boot-that-never-reaped".into(),
             start_ticks: 7,
             presence: "gone".into(),
+            rank: None,
         };
         let result = pb::MemberExecutionResult {
             state: "launched".into(),
@@ -5552,6 +5731,7 @@ mod tests {
                 boot_id: "boot-that-never-reaped".into(),
                 start_ticks: 7,
                 presence: "gone".into(),
+                rank: None,
             }],
             ..Default::default()
         };
@@ -5562,6 +5742,337 @@ mod tests {
             "custom_listener_exposed: an owned process listens on 0.0.0.0:8081, not on loopback"
         );
         assert!(capyctl_protocol::execution::is_launch_failure_text(&text));
+    }
+
+    /// ADR 0035 §§5, 6, 13: a launch on several GPUs this host stopped at
+    /// readiness reports its closed code (`engine_listener_exposed` naming
+    /// the process, address and port, or `tp_rank_unobserved`) in one line
+    /// the wire validation accepts, never the exit summary.
+    // T46
+    #[test]
+    fn a_stopped_launch_on_several_gpus_reports_its_closed_code() {
+        let result = pb::MemberExecutionResult {
+            state: "launched".into(),
+            processes: vec![pb::OwnedProcessObservation {
+                role: "api".into(),
+                pid: 10,
+                boot_id: "boot-that-never-reaped".into(),
+                start_ticks: 7,
+                presence: "gone".into(),
+                rank: None,
+            }],
+            ..Default::default()
+        };
+        for engine in [
+            "engine_listener_exposed: the rank-1 process 13 listens on address 0.0.0.0 port \
+             29500, not on loopback; the engine was stopped",
+            "tp_rank_unobserved: no distinct rank process per GPU by the initialize timeout \
+             (no owned process holds memory on gpu1 (rank 1))",
+        ] {
+            let text = launch_failure(&result, Some(engine));
+            assert_eq!(text, engine);
+            assert!(capyctl_protocol::execution::is_launch_failure_text(&text));
+        }
+    }
+
+    /// ADR 0035 §§4, 11: a vLLM fixture host with two identical discrete
+    /// GPUs named `names`, each its own `device` domain beside host RAM, and
+    /// the fixture deployment restart-only with a 12 GiB request and no
+    /// stated resources (the host and the topology decide). `uuids` publishes
+    /// each GPU's physical UUID; without them a `gpuN` GPU is pinned by its
+    /// index.
+    fn two_gpu_fixture(
+        root: &std::path::Path,
+        identity_dir: &std::path::Path,
+        names: [&str; 2],
+        uuids: bool,
+    ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
+        let (executor, mut deployment, policy) =
+            checkpoint_fixture_with(root, identity_dir, |document| {
+                let mut domains = serde_json::json!({
+                    "system": {"memory": "distinct", "managed_limit": "200GiB",
+                               "free_reserve": "8GiB", "parked_limit": "64GiB"}
+                });
+                let mut devices = serde_json::json!({});
+                for (n, id) in names.into_iter().enumerate() {
+                    domains[id] = serde_json::json!({"memory": "device", "device": id,
+                        "managed_limit": "40GiB", "free_reserve": "1GiB", "parked_limit": "4GiB"});
+                    devices[id] = serde_json::json!({"domain": id, "sharing": "shared",
+                        "product_name": "NVIDIA RTX A6000"});
+                    if uuids {
+                        devices[id]["physical_gpu_uuid"] =
+                            format!("GPU-0000000{n}-0000-0000-0000-000000000000").into();
+                    }
+                }
+                document["resource_policy"]["domains"] = domains;
+                document["resource_policy"]["devices"] = devices;
+            });
+        deployment.as_object_mut().unwrap().remove("resources");
+        deployment["residency"] = "restart_only".into();
+        deployment["engine_config"] =
+            serde_json::json!({"memory": {"request": "12GiB", "kv_cache": "4GiB"}});
+        (executor, deployment, policy)
+    }
+
+    /// The fixture deployment pinned to `gpus`; on more than one, with the
+    /// `topology` that runs it on all of them (ADR 0035 §1).
+    fn pinned_to(deployment: &serde_json::Value, gpus: &[&str]) -> serde_json::Value {
+        let mut deployment = deployment.clone();
+        deployment["devices"] = serde_json::Value::Array(
+            gpus.iter()
+                .map(|id| serde_json::json!({"id": id, "sharing": "shared"}))
+                .collect(),
+        );
+        if gpus.len() > 1 {
+            deployment["topology"] = serde_json::json!({"tensor_parallel": gpus.len()});
+        }
+        deployment
+    }
+
+    /// The digest the fixture checkpoint measures to, so a launch is refused
+    /// only for what the test changes (ADR 0014 §7).
+    fn recorded_digest(root: &std::path::Path) -> String {
+        crate::checkpoint::CheckpointVerifier::in_memory()
+            .measure(&root.join("models"), &root.join("models/toy"))
+            .unwrap()
+            .manifest
+            .digest
+    }
+
+    /// A single Launch of `deployment` whose plan names `devices` in rank
+    /// order (ADR 0035 §§2, 11), its payload digest sealed.
+    fn launch_on(
+        deployment: &serde_json::Value,
+        policy: &str,
+        digest: &str,
+        devices: &[&str],
+    ) -> MemberCommand {
+        let (mut command, _) = launch_with(deployment, policy, digest);
+        if let MemberAction::LaunchSingle(plan) = &mut command.action {
+            plan.devices = devices.iter().map(|id| (*id).to_owned()).collect();
+        }
+        command.identity.payload_digest = command.canonical_digest();
+        command
+    }
+
+    /// ADR 0035 §§4, 11: `command` is refused before any effect: this host
+    /// does not authorize it, and the real entry answers a terminal
+    /// `unauthorized` refusal with nothing journaled, claimed or spawned.
+    async fn refused_before_any_effect(
+        executor: &Arc<NativeHostExecution>,
+        session: u64,
+        command: &MemberCommand,
+    ) {
+        let devices = command
+            .action
+            .launch_plan()
+            .map(|plan| plan.devices.clone());
+        assert!(executor.resolve(command).is_err(), "{devices:?}");
+        let result = executor.execute(session, command.clone()).await.unwrap();
+        capyctl_protocol::execution::validate_result(command, &result).unwrap();
+        assert_eq!(result.refused, "unauthorized", "{devices:?}");
+        assert_eq!(result.state, "completed");
+        assert!(!result.claim_retained && !result.model_usable);
+        assert!(result.processes.is_empty());
+        assert!(executor.journal.history(0, 100).unwrap().is_empty());
+        assert!(executor.journal.claimed_launches("").unwrap().is_empty());
+    }
+
+    /// ADR 0035 §§4, 11: on a host with two GPUs a single launch runs on
+    /// exactly its plan's device list, and that list is the effective
+    /// deployment's claims in rank order. The matching list is authorized,
+    /// each GPU pinned by its UUID. A list of the wrong length (none or one
+    /// GPU for a deployment on two, two for one on one), the right GPUs in the
+    /// wrong rank order, and a GPU this host does not publish are refused
+    /// before any effect. A plan on one GPU with no list is authorized as
+    /// before.
+    // T46 T26
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_single_launch_runs_on_exactly_its_resolved_device_list() {
+        use capyctl_config::effective::CudaNamespace;
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            two_gpu_fixture(root.path(), identity_dir.path(), ["gpu0", "gpu1"], true);
+        let digest = recorded_digest(root.path());
+        let two = pinned_to(&deployment, &["gpu0", "gpu1"]);
+        let one = pinned_to(&deployment, &["gpu0"]);
+        let effective = executor
+            .resolve(&launch_on(&two, &policy, &digest, &["gpu0", "gpu1"]))
+            .unwrap();
+        let claims: Vec<&str> = effective
+            .selected_devices
+            .iter()
+            .map(|claim| claim.id.as_str())
+            .collect();
+        assert_eq!(claims, ["gpu0", "gpu1"]);
+        assert_eq!(effective.local_tensor_parallel(), 2);
+        assert_eq!(
+            effective.cuda_namespaces().ok().flatten(),
+            Some(vec![
+                CudaNamespace::Uuid("GPU-00000000-0000-0000-0000-000000000000".into()),
+                CudaNamespace::Uuid("GPU-00000001-0000-0000-0000-000000000000".into()),
+            ])
+        );
+        // ADR 0035 §11: a launch on one GPU names no list, exactly as before.
+        let effective = executor
+            .resolve(&launch_on(&one, &policy, &digest, &[]))
+            .unwrap();
+        assert_eq!(effective.local_tensor_parallel(), 1);
+        let session = executor.journal.connect().unwrap();
+        executor.connected(session).unwrap();
+        let refused: [(&serde_json::Value, &[&str]); 6] = [
+            // Count: the plan's list is not the N GPUs the host resolved.
+            (&two, &[]),
+            (&two, &["gpu0"]),
+            (&one, &["gpu0", "gpu1"]),
+            // Rank order: the right GPUs, rank 0 on the wrong one.
+            (&two, &["gpu1", "gpu0"]),
+            // A GPU this host's accepted inventory does not publish.
+            (&two, &["gpu0", "gpu7"]),
+            (&two, &["gpu0", "gpu1", "gpu7"]),
+        ];
+        for (deployment, devices) in refused {
+            let command = launch_on(deployment, &policy, &digest, devices);
+            refused_before_any_effect(&executor, session, &command).await;
+        }
+    }
+
+    /// ADR 0035 §4: GPUs published without UUIDs are pinned by their `gpuN`
+    /// indices, every one of them, so the matching list is authorized.
+    // T46 T26
+    #[test]
+    fn a_device_list_without_uuids_is_pinned_by_index() {
+        use capyctl_config::effective::CudaNamespace;
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            two_gpu_fixture(root.path(), identity_dir.path(), ["gpu0", "gpu1"], false);
+        let digest = recorded_digest(root.path());
+        let two = pinned_to(&deployment, &["gpu0", "gpu1"]);
+        let effective = executor
+            .resolve(&launch_on(&two, &policy, &digest, &["gpu0", "gpu1"]))
+            .unwrap();
+        assert_eq!(effective.local_tensor_parallel(), 2);
+        assert_eq!(
+            effective.cuda_namespaces().ok().flatten(),
+            Some(vec![CudaNamespace::PciIndex(0), CudaNamespace::PciIndex(1)])
+        );
+    }
+
+    /// ADR 0035 §4, discrete GPU design §7: a device list naming GPUs this
+    /// host cannot pin (no published UUID, no `gpuN` index) is refused before
+    /// any effect, and so is a device whose domain is not a `device` domain
+    /// (the GPU of a unified-memory host), while that host's one-GPU launch
+    /// with no list keeps today's authorization.
+    // T46 T26
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_device_list_the_host_cannot_pin_is_refused_before_any_effect() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = two_gpu_fixture(
+            root.path(),
+            identity_dir.path(),
+            ["accel0", "accel1"],
+            false,
+        );
+        let digest = recorded_digest(root.path());
+        let two = pinned_to(&deployment, &["accel0", "accel1"]);
+        let session = executor.journal.connect().unwrap();
+        executor.connected(session).unwrap();
+        let command = launch_on(&two, &policy, &digest, &["accel0", "accel1"]);
+        refused_before_any_effect(&executor, session, &command).await;
+        // The fixture's unified host: `gpu0` lives in the `unified` domain.
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = checkpoint_fixture(root.path(), identity_dir.path());
+        let digest = recorded_digest(root.path());
+        executor
+            .resolve(&launch_on(&deployment, &policy, &digest, &[]))
+            .unwrap();
+        let session = executor.journal.connect().unwrap();
+        executor.connected(session).unwrap();
+        let command = launch_on(&deployment, &policy, &digest, &["gpu0"]);
+        refused_before_any_effect(&executor, session, &command).await;
+    }
+
+    /// ADR 0035 §§4, 11: `local_devices_match` alone, against one resolved
+    /// two-GPU deployment edited to isolate each rule: the list is the claims
+    /// in rank order, each a GPU the accepted inventory publishes, in a
+    /// `device` domain, with a UUID or a `gpuN` index; an empty list is a
+    /// launch on one GPU only.
+    // T46 T26
+    #[test]
+    fn the_device_list_is_the_claims_each_a_published_pinnable_gpu() {
+        use capyctl_config::effective::DomainMemory;
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            two_gpu_fixture(root.path(), identity_dir.path(), ["gpu0", "gpu1"], true);
+        let two = pinned_to(&deployment, &["gpu0", "gpu1"]);
+        let command = launch_on(&two, &policy, "", &["gpu0", "gpu1"]);
+        let effective = executor.resolve(&command).unwrap();
+        let base = command.action.launch_plan().unwrap().clone();
+        let plan = |devices: &[&str]| SingleLaunchPlan {
+            devices: devices.iter().map(|id| (*id).to_owned()).collect(),
+            ..base.clone()
+        };
+        assert!(local_devices_match(&plan(&["gpu0", "gpu1"]), &effective));
+        // Count and rank order.
+        let wrong: [&[&str]; 4] = [&[], &["gpu0"], &["gpu1", "gpu0"], &["gpu0", "gpu1", "gpu1"]];
+        for devices in wrong {
+            assert!(
+                !local_devices_match(&plan(devices), &effective),
+                "{devices:?}"
+            );
+        }
+        // A claim the accepted inventory does not publish, then published.
+        let mut unpublished = effective.clone();
+        unpublished.selected_devices[1].id = "gpu7".into();
+        assert!(!local_devices_match(&plan(&["gpu0", "gpu7"]), &unpublished));
+        let gpu1 = unpublished.host.devices["gpu1"].clone();
+        unpublished.host.devices.insert("gpu7".into(), gpu1);
+        assert!(local_devices_match(&plan(&["gpu0", "gpu7"]), &unpublished));
+        // A GPU whose domain is host RAM, a unified domain, or no domain.
+        let mut system = effective.clone();
+        system.host.devices.get_mut("gpu1").unwrap().domain = "system".into();
+        let mut unified = effective.clone();
+        unified.host.domains.get_mut("gpu1").unwrap().memory = DomainMemory::Unified;
+        let mut nowhere = effective.clone();
+        nowhere.host.devices.get_mut("gpu1").unwrap().domain = "nowhere".into();
+        for edited in [&system, &unified, &nowhere] {
+            assert!(!local_devices_match(&plan(&["gpu0", "gpu1"]), edited));
+        }
+        // A GPU with neither a published UUID nor a `gpuN` index; the same
+        // GPU with a UUID is pinnable.
+        for name in ["accel1", "gpu", "gpu1a", "gpu-1"] {
+            let mut renamed = effective.clone();
+            let mut device = renamed.host.devices["gpu1"].clone();
+            device.physical_gpu_uuid = None;
+            renamed.host.devices.insert(name.into(), device.clone());
+            renamed.selected_devices[1].id = name.into();
+            assert!(
+                !local_devices_match(&plan(&["gpu0", name]), &renamed),
+                "{name}"
+            );
+            device.physical_gpu_uuid = Some("GPU-00000007-0000-0000-0000-000000000000".into());
+            renamed.host.devices.insert(name.into(), device);
+            assert!(
+                local_devices_match(&plan(&["gpu0", name]), &renamed),
+                "{name}"
+            );
+        }
+        // `gpuN` indices stand in for UUIDs.
+        let mut indexed = effective.clone();
+        for device in indexed.host.devices.values_mut() {
+            device.physical_gpu_uuid = None;
+        }
+        assert!(local_devices_match(&plan(&["gpu0", "gpu1"]), &indexed));
+        // An empty list is a launch on one GPU, never on two.
+        let mut one = effective.clone();
+        one.selected_devices.truncate(1);
+        assert!(local_devices_match(&plan(&[]), &one));
+        assert!(!local_devices_match(&plan(&[]), &effective));
     }
 
     /// ADR 0028 §7 (owner decision 10): a group Prepare answers from this

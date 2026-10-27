@@ -97,6 +97,30 @@ pub(crate) fn migrate_v37(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Schema v58 data step (ADR 0035 §2): the GPU set an instance was placed on,
+/// in rank order, beside its `device` (rank 0's GPU), and the tensor-parallel
+/// size its placement chose. Every instance placed before v58 ran on one GPU
+/// (or one unified pool), so its size is 1; one never placed has none.
+/// Idempotent.
+pub(crate) fn migrate_v58(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    if !has_column(tx, "deployment_instances", "device_set")? {
+        tx.execute_batch(
+            "ALTER TABLE deployment_instances ADD COLUMN device_set TEXT CHECK(device_set IS NULL OR length(device_set) BETWEEN 1 AND 4096);",
+        )?;
+    }
+    if !has_column(tx, "deployment_instances", "tensor_parallel")? {
+        tx.execute_batch(
+            "ALTER TABLE deployment_instances ADD COLUMN tensor_parallel INTEGER CHECK(tensor_parallel IS NULL OR tensor_parallel>=1);
+             UPDATE deployment_instances SET tensor_parallel=1 WHERE host_id IS NOT NULL;",
+        )?;
+    }
+    Ok(())
+}
+
+/// ADR 0035 §2: the key an instance's frozen revision is looked up under on
+/// its host: its GPU set (rank order) on several GPUs, else its one GPU.
+pub(crate) const INSTANCE_DEVICE_KEY: &str = "COALESCE(device_set,device)";
+
 const INSTANCE_COLUMN: &str = "instance_index INTEGER NOT NULL DEFAULT 0 CHECK(instance_index>=0)";
 
 const HOST_NAME: &str = "CASE WHEN json_valid(e.effective_json) AND json_type(e.effective_json,'$.host.name')='text' THEN json_extract(e.effective_json,'$.host.name') END";
@@ -734,8 +758,10 @@ impl crate::Store {
                 warm,
                 activation,
                 // ADR 0028 §2: a group is read from the revision's config_json,
-                // never from these rows, so it is `None` here by design.
+                // never from these rows, so it is `None` here by design; so is
+                // ADR 0035's topology on one host.
                 group: None,
+                local: None,
             })
         })
         .transpose()

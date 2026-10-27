@@ -309,6 +309,7 @@ impl GroupHost {
                     "gone"
                 }
                 .into(),
+                rank: None,
             })
             .collect()
     }
@@ -351,6 +352,7 @@ impl GroupHost {
                 generation: r.command.identity.generation,
                 owned_handle: r.command.identity.command_id.clone(),
                 process: r.identities[0].clone(),
+                also_exited: Vec::new(),
                 status: match self.group.ended(r.rank) {
                     Some(capyctl_testkit::RankEnd::Killed) => {
                         capyctl_protocol::reports::ExitStatus::Signal(9)
@@ -631,6 +633,7 @@ impl GroupHost {
                             bytes: device_bytes + host_bytes,
                             device_bytes,
                             host_bytes,
+                            per_device: Vec::new(),
                         }
                     })
                 })
@@ -2395,6 +2398,7 @@ fn launch(host: &str, rank: u32, plan: &GroupPlan, command_id: &str) -> MemberCo
                 checkpoint_tables: None,
                 checkpoint_gguf: None,
                 lmcache: None,
+                devices: Vec::new(),
             },
         },
     )

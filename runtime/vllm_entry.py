@@ -120,12 +120,23 @@ GROUP_DESTS = ("nnodes", "node_rank", "master_addr", "master_port", "headless",
                "pipeline_parallel_size")
 _GROUP_CODES = frozenset("group_drift:" + dest for dest in GROUP_DESTS)
 
+# ADR 0035 §4: one model on several GPUs of this host is a single-host launch,
+# never a group. Its rendered tensor-parallel shape and the GPUs its namespace
+# was narrowed to (`CAPYCTL_TP_EXPECTED`, adapters' vllm/args.rs) must be what
+# vLLM's own parse resolved and what the process inherited, or the launch is
+# refused `tp_drift:<field>`, as a group member's are `group_drift:<field>`.
+TP_EXPECTED = "CAPYCTL_TP_EXPECTED"
+TP_DESTS = ("tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size",
+            "distributed_executor_backend")
+_TP_CODES = frozenset("tp_drift:" + field for field in (*TP_DESTS, "devices"))
+
 
 class LaunchError(Exception):
     """Closed, public failure category; never retains argument values."""
 
     def __init__(self, code):
-        self.code = code if code in _CODES or code in _GROUP_CODES else "startup_error"
+        self.code = (code if code in _CODES or code in _GROUP_CODES or code in _TP_CODES
+                     else "startup_error")
         super().__init__(self.code)
 
 
@@ -349,6 +360,49 @@ def check_group(expected, namespace):
             raise LaunchError("group_drift:" + dest)
 
 
+def check_tp(expected, namespace, environ):
+    """ADR 0035 §4: a launch on several GPUs keeps its frozen plan's shape.
+
+    `expected` is the decoded `CAPYCTL_TP_EXPECTED` object: every destination
+    of TP_DESTS must be what vLLM's parse resolved, exactly (value and type),
+    and the inherited `CUDA_VISIBLE_DEVICES` must list exactly its `devices`,
+    one per rank in rank order (with `CUDA_DEVICE_ORDER` when it names one).
+    A destination it lacks or the parse resolved differently is
+    `tp_drift:<dest>`; any other device namespace is `tp_drift:devices`.
+    """
+    missing = object()
+    for dest in TP_DESTS:
+        want = expected.get(dest, missing)
+        have = getattr(namespace, dest, missing)
+        if want is missing or have is missing or type(want) is not type(have) or want != have:
+            raise LaunchError("tp_drift:" + dest)
+    devices = expected.get("devices")
+    order = expected.get("cuda_device_order")
+    size = expected["tensor_parallel_size"]
+    visible = environ.get("CUDA_VISIBLE_DEVICES")
+    if (type(devices) is not list or len(devices) != size or size < 2
+            or any(type(device) is not str or not device for device in devices)
+            or len(set(devices)) != len(devices)
+            or type(visible) is not str or visible.split(",") != devices
+            or (order is not None and environ.get("CUDA_DEVICE_ORDER") != order)):
+        raise LaunchError("tp_drift:devices")
+
+
+def _tp_expected():
+    """The rendered tensor-parallel payload, removed so no engine child
+    inherits it; None for a launch on one GPU."""
+    raw = os.environ.pop(TP_EXPECTED, None)
+    if raw is None:
+        return None
+    try:
+        expected = json.loads(raw)
+    except ValueError:
+        expected = None
+    if type(expected) is not dict:
+        raise LaunchError("invalid_launch_arguments")
+    return expected
+
+
 def _group_expected():
     """The rendered group payload, removed so no engine child inherits it."""
     raw = os.environ.pop(GROUP_EXPECTED, None)
@@ -499,6 +553,11 @@ def main(argv=None, runtime=None, stderr=None):
         # interface; every other inherited transport input is stripped. The
         # loopback pin below is single-rank only (T39).
         group = os.environ.get(GROUP_MODE) == "1"
+        # ADR 0035 §4, §12: a launch on several GPUs of this host is never a
+        # group; it keeps the single-host loopback pin below.
+        expected_tp = _tp_expected()
+        if group and expected_tp is not None:
+            raise LaunchError("invalid_launch_arguments")
         if group:
             expected_group = _group_expected()
             group_ifname = expected_group.get("gloo_socket_ifname")
@@ -526,6 +585,8 @@ def main(argv=None, runtime=None, stderr=None):
         check_deep_park(args, parser, runtime)
         if group:
             check_group(expected_group, args)
+        if expected_tp is not None:
+            check_tp(expected_tp, args, os.environ)
         try:
             if group:
                 rendezvous.verify_group(os.environ, "VLLM_HOST_IP", group_address,

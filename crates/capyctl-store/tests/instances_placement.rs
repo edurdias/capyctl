@@ -1167,6 +1167,9 @@ fn the_router_reads_each_instance_and_leases_the_one_it_chose() {
         assert_eq!(row.host_id.as_deref(), Some(host.as_str()));
         assert_eq!(row.launch_command_id.as_deref(), Some(step.as_str()));
         assert!(row.dispatch_open);
+        // T46 (ADR 0035 §7): an instance on one GPU is never watched for a
+        // stall.
+        assert_eq!(row.local_tensor_parallel, 1);
         let (binding, open) = t
             .store
             .serving_binding_at(&id, row.generation)
@@ -1524,6 +1527,7 @@ fn a_failed_switch_reopens_only_its_own_closure() {
                 generation,
                 step_id: step.clone(),
                 process: identity("api", 100),
+                also_exited: Vec::new(),
                 status: "signal 9".into(),
                 observed_at_ms: NOW,
             },
@@ -2018,6 +2022,7 @@ fn closure_reasons_are_pruned_on_fence_move_and_cleanup() {
                 generation: exited,
                 step_id: step.clone(),
                 process: identity("api", 100),
+                also_exited: Vec::new(),
                 status: "signal 9".into(),
                 observed_at_ms: NOW,
             },

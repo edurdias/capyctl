@@ -457,6 +457,12 @@ pub(super) struct DeviceSizing {
     /// The card as the host policy declares it: managed limit plus free
     /// reserve (what the standalone host policy publishes as the card's total).
     pub(super) declared_total: i64,
+    /// ADR 0035 §3: the communication allowance each GPU of an instance on
+    /// several GPUs carries beside its rank's request; zero on one GPU.
+    pub(super) communication: i64,
+    /// Whether a charge above the managed limit is refused (resolution) or
+    /// derived as it is (ADR 0035 §1a's candidate table).
+    pub(super) enforce_limit: bool,
 }
 
 /// ADR 0014 amendment A16: the recurrent state a derived SGLang request
@@ -504,8 +510,13 @@ fn sglang_state_reserve(
         };
         let (charged, limit) = match inputs.device {
             Some(device) => (
-                crate::context_fit::derived_request_bytes(weights, kv, 0, state, true)
-                    .and_then(|request| request.checked_add(overhead)),
+                crate::context_fit::derived_request_bytes(weights, kv, 0, state, true).and_then(
+                    |request| {
+                        request
+                            .checked_add(overhead)?
+                            .checked_add(device.communication)
+                    },
+                ),
                 Some(device.managed_limit),
             ),
             None => (
@@ -687,15 +698,25 @@ fn device_request_from_weights(
         Engine::Sglang | Engine::Tensorfold | Engine::Llamacpp | Engine::Custom => 0,
     };
     let request = request.max(floor);
-    let charged = request.saturating_add(ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES);
-    if charged > device.managed_limit {
+    // ADR 0035 §3: on several GPUs each card also holds the communication
+    // allowance.
+    let charged = request
+        .saturating_add(ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES)
+        .saturating_add(device.communication);
+    if device.enforce_limit && charged > device.managed_limit {
+        let allowance = if device.communication > 0 {
+            ", the engine's CUDA context and graphs, and the communication allowance of a \
+             rank on several GPUs"
+        } else {
+            ", and the engine's CUDA context and graphs"
+        };
         return Err(invalid(
             "engine_config.memory.request",
             format!(
                 "insufficient_device_memory: the deployment needs {charged} bytes of device \
-                 memory (a request of {request} bytes, weights x 1.10 plus the KV cache, and \
-                 the engine's CUDA context and graphs), above the {} bytes the device domain \
-                 manages; use a smaller or quantized checkpoint",
+                 memory per GPU (a request of {request} bytes, weights x 1.10 plus the KV \
+                 cache{allowance}), above the {} bytes the device domain manages; use a \
+                 smaller or quantized checkpoint",
                 device.managed_limit
             ),
         ));
@@ -923,13 +944,25 @@ pub fn resolve_startup(
     Ok((Some(peak), Some(SettingSource::Derived)))
 }
 
+/// What derived phases charge beside the request on a card or unified pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Overheads {
+    /// The engine's CUDA context and graphs (ADR 0019 §3).
+    pub(super) device: i64,
+    /// ADR 0035 §3: each GPU's communication allowance on several GPUs.
+    pub(super) communication: i64,
+}
+
 /// ADR 0014 §5: derived phases. Ready, parking and wake equal the request and
 /// cold is the startup peak (never below the request);
 /// parked is the residual floor placeholder for a parking deployment and zero
 /// for one that restarts. Derivation needs one memory domain for the selected
 /// devices; anything else declares `resources:` explicitly. On a discrete host
 /// (the selected device's domain is a `device` domain) every phase charges the
-/// device domain and the system domain (discrete GPU design §3).
+/// device domain and the system domain (discrete GPU design §3). ADR 0035 §3:
+/// with several selected GPUs, each its own `device` domain, every phase
+/// charges each GPU one rank and the system domain once.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn derive_resources(
     request: i64,
     startup: Option<i64>,
@@ -937,15 +970,38 @@ pub(super) fn derive_resources(
     devices: &[DeviceClaim],
     host: &HostPolicy,
     weights_bytes: Option<i64>,
-    overhead: i64,
+    overheads: Overheads,
+    limits: Limits,
 ) -> Result<RecipeFootprints, ConfigError> {
+    let overhead = overheads.device;
     let mut domains = BTreeSet::new();
+    let mut ordered = Vec::with_capacity(devices.len());
     for claim in devices {
         let policy = host
             .devices
             .get(&claim.id)
             .ok_or_else(|| invalid("devices", "unknown device"))?;
-        domains.insert(policy.domain.clone());
+        if domains.insert(policy.domain.clone()) {
+            ordered.push(policy.domain.clone());
+        }
+    }
+    // Owner decision 2026-09-23: admission reserves the startup peak from arm
+    // until Ready (the cold phase, ADR 0007); Ready drops to the request.
+    let cold = startup.map_or(request, |peak| peak.max(request));
+    let on_device =
+        |domain: &String| host.domains.get(domain).map(|d| d.memory) == Some(DomainMemory::Device);
+    if ordered.len() > 1 && ordered.len() == devices.len() && ordered.iter().all(on_device) {
+        return derive_discrete(DiscreteInputs {
+            request,
+            cold,
+            residency,
+            devices,
+            host,
+            device_domains: ordered,
+            weights_bytes,
+            overheads,
+            limits,
+        });
     }
     let domain =
         match domains.len() {
@@ -961,19 +1017,17 @@ pub(super) fn derive_resources(
                 "the selected devices span several memory domains; declare resources explicitly",
             )),
         };
-    // Owner decision 2026-09-23: admission reserves the startup peak from arm
-    // until Ready (the cold phase, ADR 0007); Ready drops to the request.
-    let cold = startup.map_or(request, |peak| peak.max(request));
-    if host.domains.get(&domain).map(|d| d.memory) == Some(DomainMemory::Device) {
+    if on_device(&domain) {
         return derive_discrete(DiscreteInputs {
             request,
             cold,
             residency,
             devices,
             host,
-            device_domain: domain,
+            device_domains: vec![domain],
             weights_bytes,
-            overhead,
+            overheads,
+            limits,
         });
     }
     // Re-review (parity rule): the engine's CUDA context and graphs sit
@@ -1020,14 +1074,23 @@ struct DiscreteInputs<'a> {
     residency: Residency,
     devices: &'a [DeviceClaim],
     host: &'a HostPolicy,
-    device_domain: String,
+    /// The selected GPUs' device domains in rank order (one on one GPU).
+    device_domains: Vec<String>,
     weights_bytes: Option<i64>,
-    overhead: i64,
+    overheads: Overheads,
+    limits: Limits,
 }
 
 /// Discrete GPU design §3 (ADR 0019): VRAM in the device domain, the engine's host
 /// overhead (and the `host_backed` weights copy) in host RAM, the one `distinct`
 /// system domain. Every phase carries both allocations, `[device, system]`.
+///
+/// ADR 0035 §3: on N GPUs every phase carries one allocation per GPU's
+/// device domain, in rank order, then the system domain: each GPU one rank
+/// (its share of the weights in `request` and `cold`, the CUDA context and
+/// graphs, and the communication allowance), the system domain the engine's
+/// host overhead of 4 GiB plus 3 GiB per rank after the first, and a
+/// `host_backed` copy of every rank's share (`weights_bytes` is one rank's).
 fn derive_discrete(inputs: DiscreteInputs<'_>) -> Result<RecipeFootprints, ConfigError> {
     let DiscreteInputs {
         request,
@@ -1035,10 +1098,12 @@ fn derive_discrete(inputs: DiscreteInputs<'_>) -> Result<RecipeFootprints, Confi
         residency,
         devices,
         host,
-        device_domain,
+        device_domains,
         weights_bytes,
-        overhead: context_overhead,
+        overheads,
+        limits,
     } = inputs;
+    let ranks = u32::try_from(device_domains.len()).unwrap_or(u32::MAX);
     let systems: Vec<&String> = host
         .domains
         .iter()
@@ -1058,14 +1123,17 @@ fn derive_discrete(inputs: DiscreteInputs<'_>) -> Result<RecipeFootprints, Confi
     // provisional and re-resolves it with the measured weights, exactly as a
     // memory request derived from the weights.
     let copy = match residency {
-        Residency::HostBacked => weights_bytes.map(host_backed_copy_bytes).ok_or_else(|| {
-            ConfigError::new(
-                ConfigErrorCode::NotMaterializable,
-                "engine_config.memory",
-                "cannot charge the host_backed weights copy: the checkpoint's weight size \
+        Residency::HostBacked => weights_bytes
+            .and_then(|share| share.checked_mul(i64::from(ranks)))
+            .map(host_backed_copy_bytes)
+            .ok_or_else(|| {
+                ConfigError::new(
+                    ConfigErrorCode::NotMaterializable,
+                    "engine_config.memory",
+                    "cannot charge the host_backed weights copy: the checkpoint's weight size \
                  is not known yet",
-            )
-        })?,
+                )
+            })?,
         _ => 0,
     };
     // SGLang's --enable-weights-cpu-backup holds the copy for the engine's
@@ -1074,46 +1142,61 @@ fn derive_discrete(inputs: DiscreteInputs<'_>) -> Result<RecipeFootprints, Confi
     // live on a 16 GB discrete GPU: the process's shared memory stayed at the
     // copy's size after the wake), so both are charged it in every phase.
     let always = copy;
-    let overhead = ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES;
+    let overhead = super::multi_gpu::engine_host_overhead(ranks);
     // The engine holds its CUDA context and graphs on the card beside the
     // request (measured live: 13.2 GiB held against a 12.0 GiB request), so
     // the device domain is charged both, and planner, admission and the
-    // launch check judge the same figure.
+    // launch check judge the same figure. ADR 0035 §3: and on several GPUs
+    // the communication allowance.
     let on_card = |bytes: i64| {
         bytes
-            .checked_add(context_overhead)
+            .checked_add(overheads.device)
+            .and_then(|bytes| bytes.checked_add(overheads.communication))
             .ok_or_else(|| invalid("resources", "memory arithmetic overflows"))
     };
     let active = on_card(request)?;
     let cold = on_card(cold)?;
-    if let Some(limit) = host
-        .domains
-        .get(&device_domain)
-        .map(|domain| domain.managed_limit)
-        .filter(|limit| active > *limit)
-    {
-        return Err(invalid(
-            "engine_config.memory.request",
-            format!(
-                "insufficient_device_memory: the deployment needs {active} bytes of device \
-                 memory (a request of {request} bytes and the engine's CUDA context and \
-                 graphs), above the {limit} bytes the device domain manages"
-            ),
-        ));
+    for device_domain in device_domains.iter().filter(|_| limits == Limits::Enforce) {
+        if let Some(limit) = host
+            .domains
+            .get(device_domain)
+            .map(|domain| domain.managed_limit)
+            .filter(|limit| active > *limit)
+        {
+            return Err(invalid(
+                "engine_config.memory.request",
+                if ranks > 1 {
+                    format!(
+                        "insufficient_device_memory: the deployment needs {active} bytes of \
+                         device memory on each of its {ranks} GPUs (a rank's request of \
+                         {request} bytes, the engine's CUDA context and graphs, and the \
+                         communication allowance), above the {limit} bytes the device domain \
+                         `{device_domain}` manages"
+                    )
+                } else {
+                    format!(
+                        "insufficient_device_memory: the deployment needs {active} bytes of \
+                         device memory (a request of {request} bytes and the engine's CUDA \
+                         context and graphs), above the {limit} bytes the device domain manages"
+                    )
+                },
+            ));
+        }
     }
     let two = |device: i64, system_bytes: i64, devices: Vec<DeviceClaim>| PhaseFootprint {
-        allocations: vec![
-            Allocation {
-                domain: device_domain.clone(),
+        allocations: device_domains
+            .iter()
+            .map(|domain| Allocation {
+                domain: domain.clone(),
                 bytes: device,
                 host_kv_bytes: 0,
-            },
-            Allocation {
+            })
+            .chain(std::iter::once(Allocation {
                 domain: (*system).clone(),
                 bytes: system_bytes,
                 host_kv_bytes: 0,
-            },
-        ],
+            }))
+            .collect(),
         devices,
     };
     let add = |a: i64, b: i64| {
@@ -1122,7 +1205,17 @@ fn derive_discrete(inputs: DiscreteInputs<'_>) -> Result<RecipeFootprints, Confi
     };
     let steady = add(overhead, always)?;
     let with_copy = add(overhead, copy)?;
-    let residue = PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES.min(request);
+    // ADR 0035 §§3, 9: a rank parked on one of several GPUs keeps what its
+    // Ready charge carries beside its request there: the CUDA context and
+    // graphs and the communication buffers (NCCL, custom all-reduce, the
+    // contexts opened from its peers). Until a park measures it (ADR 0014
+    // A13), that is each GPU's parked charge, and so the bound its per-GPU
+    // park evidence is judged against; one GPU keeps its placeholder.
+    let residue = if ranks > 1 {
+        add(overheads.device, overheads.communication)?.min(active)
+    } else {
+        PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES.min(request)
+    };
     // The parked phase is what admission counts against each domain's
     // parked_limit, so the copy is charged there as parked residue. Parking and
     // wake are the transitions into and out of it: the copy exists while the

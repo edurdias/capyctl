@@ -97,8 +97,8 @@ lists those codes, plus CLI exit codes an operator is likely to meet; the
 |---|---|---|---|
 | 2 | Invalid configuration, including a standalone state directory started under another hostname (`host_name_changed`) | all | Fix the role document (`capyctl validate config`); for `host_name_changed`, start under the hostname the message names (see "Running in a container"). |
 | 3 | Unauthorized | all | Fix the identity or credentials. |
-| 4 | Insufficient resources, including a GPU that cannot hold the deployment (`insufficient_device_memory`) or has no fresh reading (`device_unobserved`) | none: a CLI command's exit | Free memory, use a smaller or quantized checkpoint, or wait for the GPU to be observed. |
-| 5 | Unsupported, including state written by a newer CapyCTL (`store_from_newer_version`), and on GPUs `unsupported_gpu_topology`, `multi_gpu_unsupported` and `host_backed_unavailable` | all | The newer binary or a restored backup (see "State and migrations"); for the GPU codes, see "Discrete NVIDIA GPUs". |
+| 4 | Insufficient resources, including a GPU that cannot hold the deployment (`insufficient_device_memory`), no machine with enough identical GPUs (`insufficient_gpus`) or a GPU with no fresh reading (`device_unobserved`) | none: a CLI command's exit | Free memory, use a smaller or quantized checkpoint, spread the model with the `topology` the message names, or wait for the GPU to be observed. |
+| 5 | Unsupported, including state written by a newer CapyCTL (`store_from_newer_version`), and on GPUs `unsupported_gpu_topology`, `multi_gpu_unsupported`, `multi_gpu_mixed_devices`, `tensor_parallel_indivisible` and `host_backed_unavailable` | all | The newer binary or a restored backup (see "State and migrations"); for the GPU codes, see "Discrete NVIDIA GPUs". |
 | 14 | The controller revoked this host (`host_revoked`) | host | Recovery under the same identity (below). |
 | 15 | No allowed host is eligible for placement (`host_ineligible`) | none: a CLI command's exit (`start`), never a role's, so no unit lists it | Upgrade, undrain, reconnect or re-enroll the host the message names, then start again. |
 | 16 | The path holds no `vllm`, `sglang` or `tensorfold` package and is no `llama-server` binary (`engine_not_found`) | none: `capyctl engine` exits, never a role's | Name the venv, its `bin/vllm`, `bin/tensorfold` or its `bin/python3`, or a `llama-server` binary or its directory, or scan more with `capyctl engine detect --path DIR`. |
@@ -588,10 +588,77 @@ The claim takes the sharing the host states for that GPU; add
 `gpuN` is the driver's index at start (`nvidia-smi -L`). The engine is started
 with only that GPU visible: `CUDA_VISIBLE_DEVICES` set to the GPU's UUID, or to
 its index with `CUDA_DEVICE_ORDER=PCI_BUS_ID` when no UUID is known. A
-deployment that names two GPUs on one machine is refused
-(`multi_gpu_unsupported`, exit 5). To spread one model over machines, give it a
-`topology` ([One model across machines](../guide/several-machines.md#one-model-across-machines)). An instance
+deployment that names two GPUs without a `topology` is refused
+(`multi_gpu_unsupported`, exit 5; the message names the `topology` to add). To
+spread one model over machines, give it a `topology` and `placement.hosts`
+([One model across machines](../guide/several-machines.md#one-model-across-machines)). An instance
 started through a path that does not place it runs on the lowest-index GPU.
+
+**One model across several GPUs.** A deployment with a `topology` and no
+`placement.hosts` runs on that many GPUs of one machine
+([One model on several GPUs](../guide/deploy.md#one-model-on-several-gpus)):
+
+```yaml
+topology: {tensor_parallel: 2}            # two GPUs; CapyCTL picks them
+devices: [{id: gpu0}, {id: gpu1}]         # optional: exactly that many, to pin them
+```
+
+- The GPUs must be the same product with the same memory (within 64 MiB);
+  pinned GPUs that differ are refused (`multi_gpu_mixed_devices`, exit 5), and a
+  machine whose cards differ is not chosen. More GPUs than any allowed machine
+  has is `insufficient_gpus` (exit 4). For vLLM and SGLang, `tensor_parallel`
+  must divide the model's attention heads (`tensor_parallel_indivisible`,
+  exit 5). A unified-memory machine, TensorFold and custom engines run one GPU
+  per model (`multi_gpu_unsupported`), and `pipeline_parallel` on one machine is
+  refused.
+- **Placement.** CapyCTL tries every set of that many identical GPUs and takes
+  the one whose fullest card still has the most room, then the lowest indices;
+  a stopped instance returns to its last set when it fits. When no set has
+  room, it parks or stops the fewest models across the cards of one set; a
+  model on several GPUs that has to make room goes whole.
+- **The charge per GPU.** Each card is charged one rank: its share of the
+  weights (the checkpoint's layer weights divided by N, plus the parts every
+  rank holds), its KV cache, the margin (share × 0.10), the CUDA context
+  (1.25 GiB) and 1 GiB for the buffers the cards use to talk to each other.
+  Host RAM is charged 4 GiB plus 3 GiB for each card after the first, one
+  engine process per card. The two allowances are estimates until measured on
+  a two-GPU machine, so a model may be refused on a machine where it would just
+  fit. A measured startup peak is kept per number of GPUs, and the largest card
+  of a start sets it for every card. `capyctl validate config --host` prints
+  the GPUs and the charge on each.
+- **`topology: auto`.** CapyCTL takes the smallest number of identical GPUs
+  whose per-GPU charge fits each card's managed limit (the cards' limits, not
+  what is free now, so the same model on the same machine always gets the
+  same number), keeps it until the model stops, and starts the engine exactly
+  as for that `tensor_parallel`. `capyctl status deployment` shows
+  `TP auto (2)`; a later start that takes another number records the event
+  `topology_auto_changed`. A stated `deep` or `host_backed`, or
+  `lmcache: required`, keeps `auto` on one GPU for now.
+- **What runs.** vLLM gets `--tensor-parallel-size N
+  --distributed-executor-backend mp`, SGLang `tp_size` N, llama.cpp
+  `--split-mode layer` with `--tensor-split` and `--main-gpu 0`, and
+  `CUDA_VISIBLE_DEVICES` lists the cards' UUIDs in rank order. Each card's
+  engine process is watched as part of the engine: if one exits, the whole
+  model stops and reads `failed` (`engine_rank_exited`), and its memory stays
+  charged on every card until all its processes are gone. A request with no
+  first output within `groups.stall_timeout` makes CapyCTL probe the model
+  once and stop it if the probe fails (`tp_stalled`).
+- **Listeners.** The cards' processes talk over sockets on `127.0.0.1` only,
+  without authentication, so another user of the same machine could reach
+  them, as with any engine API on loopback; status shows
+  `collectives: loopback`. After every start, and whenever the machine checks
+  the model again, CapyCTL lists the TCP listeners of the model's processes
+  and stops it if one listens on any other address
+  (`engine_listener_exposed`).
+- **Parking.** A model on several GPUs is `restart_only` for now; a stated
+  `deep` or `host_backed` is refused (`capability_missing:deep_park`). vLLM
+  and SGLang parking on several cards is built and is turned on per engine once
+  it passes on a two-GPU machine. LMCache is off for it
+  (`multi_gpu_unqualified`).
+- **Enrolled hosts.** Both the server and the host need this release: the host
+  declares the capability `local_tensor_parallel`, and the server never sends
+  a model on several GPUs to a host that does not
+  (`host_capability_missing:local_tensor_parallel`).
 
 **Residency tiers.** A deployment parks in one of three ways (its
 `residency`):

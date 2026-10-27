@@ -37,6 +37,18 @@ refuses only the dependent feature with the closed category
 Probes that pass are not evidence that a build serves a model or parks
 correctly.
 
+Before a memory-saver SGLang launch spawns children, the protected entry replaces
+`LD_LIBRARY_PATH` with CUDA runtime library directories recorded by the selected
+installation's `nvidia-cuda-runtime` wheels (including CUDA-suffixed distribution
+names). Canonical library paths must stay inside that installation; paths with
+loader separators or expansion tokens are excluded. No ambient loader path,
+guessed toolkit directory, package import or `.pth` hook is used. Without a
+wheel runtime, the variable is removed and the loader's normal system search
+remains. This is needed because the saver's `LD_PRELOAD` is resolved before a
+spawned Python interpreter can import torch and find its wheel-shipped CUDA
+dependencies. CPU ELF regression coverage exercises that pre-Python dependency
+load for two children; it is not GPU qualification or proof of parking.
+
 ## Shipped inside the binary
 
 Every `runtime/*.py` here (never `runtime/tests`) is compiled into the `capyctl`
@@ -120,6 +132,12 @@ The observation path composes an enrolled scheduler's existing saver instance,
 framing/authentication, and `sglang_observation_server` protected Unix listener.
 No helper imports an engine or converts allocation facts into Ready, idle,
 release, residency, or qualification evidence; the host fuses them with its own.
+
+On a launch across several GPUs, enrollment reads the scheduler's `tp_rank`
+when present. SGLang 0.5.22 instead keeps it in the initialized process-local
+`sglang.srt.runtime_context.get_parallel()` context. That already-loaded
+context supplies the rank when the scheduler has no such field. Missing,
+non-integer or out-of-plan ranks refuse enrollment; none defaults to rank zero.
 
 `SchedulerObservationServer.start(...)` requires the exact current scheduler
 identity and a separately enrolled live controller identity. It creates a new

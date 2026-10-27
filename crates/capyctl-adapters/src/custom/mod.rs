@@ -16,4 +16,6 @@ pub use adapter::CustomAdapter;
 pub use args::{engine_environment, render_command, CustomArgsError, PlanInputCustom};
 pub use frozen::{plan_from_effective, CustomPlanError};
 pub use http::{idle_reading, READ_TIMEOUT as HEALTH_READ_TIMEOUT};
-pub use listeners::{check_loopback, ListenerCheck};
+pub use listeners::{
+    check_engine_launch, check_loopback, engine_listener_exposed, ListenerCheck, OwnedListener,
+};

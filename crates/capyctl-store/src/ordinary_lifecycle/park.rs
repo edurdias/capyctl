@@ -44,6 +44,10 @@ use sha2::{Digest, Sha256};
 #[path = "group_park.rs"]
 mod group;
 pub use group::{ArmedMember, GroupResidencyStop, MemberResidency, MemberResidue};
+// ADR 0035 §9: a vLLM park or wake on several GPUs of one host, GPU by GPU.
+#[path = "park_devices.rs"]
+mod devices;
+pub use devices::{DeviceEvidence, GpuBudget, GpuReadings};
 
 /// ADR 0028 §12: each member host's parked budget when the instance's group
 /// at `generation` parks (every member host's resolution parks), keyed by
@@ -1667,7 +1671,7 @@ impl crate::Store {
     ) -> Result<(), LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
-        complete(&tx, s, id, observation, now)?;
+        complete(&tx, s, id, observation, None, now)?;
         tx.commit()?;
         Ok(())
     }
@@ -2190,6 +2194,7 @@ fn arm(
         context.observations,
         residents,
         &kinds,
+        &crate::resident_floors::domain_devices(&policy),
     )?;
     // Discrete GPU design §5 (found live on a 16 GB card): a park or a wake
     // is charged only what it adds beyond the owner's own charge.
@@ -2334,11 +2339,14 @@ fn fail(
     cancel(tx, s, p, code, why)
 }
 
+/// ADR 0035 §9: `readings` is the host sample a launch judged per GPU
+/// (`devices::judged_per_gpu`) settles on, which no other launch takes.
 fn complete(
     tx: &Transaction<'_>,
     s: &CoordinatorSession,
     id: &str,
     o: &EffectObservation,
+    readings: Option<&GpuReadings<'_>>,
     now: i64,
 ) -> Result<(), LifecycleError> {
     let (p, state) = read(tx, id)?;
@@ -2388,10 +2396,37 @@ fn complete(
             "residency evidence does not match the retained launch".into(),
         ));
     }
+    // ADR 0035 §9: on several GPUs the engine's reply is not the evidence;
+    // every GPU's own reading, after the step was armed and within the
+    // host's observation TTL, must prove it, and the step is then observed
+    // at its oldest GPU reading: those readings name the launch's own
+    // processes holding (or no longer holding) their memory, as a wake's
+    // canary answer names its engine alive (ADR 0028 note of 2026-10-16).
+    let observed_at_ms = match (
+        devices::evidence(tx, &source, &e, &identities, p.kind)?,
+        readings,
+    ) {
+        (None, None) => o.observed_at_ms,
+        (Some(evidence), Some(readings)) => {
+            let not_before = readings
+                .since_ms
+                .max(execution.issued_at_ms)
+                .max(now.saturating_sub(ttl));
+            evidence
+                .judge(readings.observations, readings.residents, not_before, now)
+                .map_err(LifecycleError::Rejected)?
+        }
+        (Some(_), None) => {
+            return Err(LifecycleError::Rejected(
+                "a launch on several GPUs settles only on every GPU's own reading".into(),
+            ))
+        }
+        (None, Some(_)) => return Err(LifecycleError::Conflict),
+    };
     fresh(
         execution.issued_at_ms,
         p.deadline_ms,
-        o.observed_at_ms,
+        observed_at_ms,
         now,
         ttl,
     )?;
@@ -2422,7 +2457,7 @@ fn complete(
     let evidence = encode(&completion_value(&CompletionEvidence {
         token: p.token(),
         identities: identities.clone(),
-        observed_at_ms: o.observed_at_ms,
+        observed_at_ms,
         control_receipt: Some(o.receipt.clone()),
         milestones: o.facts.clone(),
     })?)?;
@@ -2773,8 +2808,14 @@ impl crate::Store {
         let cold = super::startup::cold(&tx, &p, &e)?;
         // ADR 0019: each domain credited by its kind. A policy that does not
         // read here credits nothing; the start's own arm judges the policy.
-        let kinds = policy(&tx, &e)
+        let policy = policy(&tx, &e).ok();
+        let kinds = policy
+            .as_ref()
             .map(|policy| crate::resident_floors::domain_kinds(&policy.controls))
+            .unwrap_or_default();
+        let devices = policy
+            .as_ref()
+            .map(crate::resident_floors::domain_devices)
             .unwrap_or_default();
         let floors = crate::resident_floors::resident_floors(
             &tx,
@@ -2783,6 +2824,7 @@ impl crate::Store {
             context.observations,
             residents,
             &kinds,
+            &devices,
         )?;
         let context = AdmissionContext {
             resident_floors: &floors,

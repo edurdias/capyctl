@@ -111,9 +111,10 @@ pub struct PlanInputVllm {
     /// Discrete GPU design §§6–7: the selected GPU, from the host's own
     /// approved policy, that the child's CUDA namespace is narrowed to so the
     /// engine sees exactly that device as `cuda:0` (by its published UUID, or
-    /// by its index in PCI bus order). `None` keeps the agent's own
+    /// by its index in PCI bus order). ADR 0035 §4: on several GPUs, every
+    /// one in rank order (rank r is `cuda:r`). Empty keeps the agent's own
     /// pass-through (a one-device unified host).
-    pub cuda_namespace: Option<capyctl_config::effective::CudaNamespace>,
+    pub cuda_namespaces: Vec<capyctl_config::effective::CudaNamespace>,
     /// ADR 0028 §10: this member's multi-node arguments; `None` is a
     /// single-rank launch, rendered exactly as before (T39).
     pub group: Option<capyctl_domain::group::GroupMemberArgs>,
@@ -165,7 +166,7 @@ impl std::fmt::Debug for PlanInputVllm {
             .field("unified_ready_bytes", &self.unified_ready_bytes)
             .field("engine_log", &self.engine_log)
             .field("runtime_dir", &self.runtime_dir)
-            .field("cuda_namespace", &self.cuda_namespace)
+            .field("cuda_namespaces", &self.cuda_namespaces)
             .field("group", &self.group)
             .field("kv_transfer_config", &self.kv_transfer_config)
             .field("lmcache", &self.lmcache)
@@ -211,6 +212,9 @@ pub enum ArgsError {
     MissingRuntimeDir,
     #[error("the engine executable has no directory to find its interpreter in")]
     NoInterpreter,
+    /// ADR 0035 §4: a launch on several GPUs names one GPU per rank.
+    #[error("a launch on {ranks} GPUs must name {ranks} GPUs to run on, in rank order")]
+    DeviceList { ranks: u32 },
 }
 
 pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsError> {
@@ -351,6 +355,18 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
         "--pipeline-parallel-size",
         input.pipeline_parallel_size.to_string(),
     );
+    // ADR 0035 §4, §12: one model on several GPUs of this host is one
+    // single-host launch, never a group: vLLM's own multiprocessing executor,
+    // named explicitly (never ray), and no peer address or rendezvous port.
+    let local_tp = input.group.is_none() && input.tensor_parallel_size > 1;
+    if local_tp {
+        if input.cuda_namespaces.len() != input.tensor_parallel_size as usize {
+            return Err(ArgsError::DeviceList {
+                ranks: input.tensor_parallel_size,
+            });
+        }
+        push(&mut argv, "--distributed-executor-backend", "mp".into());
+    }
     if input.cpu_offload_bytes > 0 {
         push(
             &mut argv,
@@ -439,11 +455,19 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
     }
     // Discrete GPU design §7: the chosen device, by the UUID the host itself
     // published or its PCI-ordered index, replaces whatever namespace the
-    // agent was started with.
-    if let Some(namespace) = &input.cuda_namespace {
-        for (name, value) in namespace.environment() {
+    // agent was started with. ADR 0035 §4: every chosen GPU, in rank order.
+    if !input.cuda_namespaces.is_empty() {
+        for (name, value) in
+            capyctl_config::effective::CudaNamespace::environment_of(&input.cuda_namespaces)
+        {
             env.insert(name.into(), value);
         }
+    }
+    // ADR 0035 §4: what the protected entry checks a launch on several GPUs
+    // against after vLLM's own parse (`tp_drift:<field>`), as a group
+    // member's destinations are checked (`group_drift:<field>`).
+    if local_tp {
+        env.insert(TP_EXPECTED_ENV.into(), tp_expected(input, &env));
     }
     if let Some(approvals) = &input.extra_approvals {
         env.insert(
@@ -500,6 +524,31 @@ fn render_group(
             "pipeline_parallel_size": group.pipeline_parallel,
         })),
     );
+}
+
+/// ADR 0035 §4: the expected destinations and devices of a launch on several
+/// GPUs of this host, which `runtime/vllm_entry.py` reads (and removes) and
+/// checks after vLLM's own parse, refusing a difference as `tp_drift:<field>`.
+/// Must match `runtime/vllm_entry.py` `TP_EXPECTED`.
+pub const TP_EXPECTED_ENV: &str = "CAPYCTL_TP_EXPECTED";
+
+/// ADR 0035 §4: the frozen plan's tensor-parallel shape (N, pipeline 1, data
+/// parallel 1, the `mp` executor) and the GPU list the child's namespace was
+/// narrowed to, in rank order, with the device order an index list needs.
+fn tp_expected(input: &PlanInputVllm, env: &std::collections::BTreeMap<String, String>) -> String {
+    let devices: Vec<&str> = env
+        .get("CUDA_VISIBLE_DEVICES")
+        .map(|list| list.split(',').collect())
+        .unwrap_or_default();
+    serde_json::json!({
+        "tensor_parallel_size": input.tensor_parallel_size,
+        "pipeline_parallel_size": input.pipeline_parallel_size,
+        "data_parallel_size": 1,
+        "distributed_executor_backend": "mp",
+        "devices": devices,
+        "cuda_device_order": env.get("CUDA_DEVICE_ORDER"),
+    })
+    .to_string()
 }
 
 /// ADR 0014 §2: typed deployment fields in vLLM 0.29.0 spellings (verified in

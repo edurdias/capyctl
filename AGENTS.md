@@ -141,10 +141,22 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     (approved 2026-10-14), and basal 2.2.0 (~/basal-2.2.0-venv, torch 2.11.0
     cu130), approved 2026-10-20 for qualifying custom engines (ADR 0031), and vLLM
     0.32.0 (~/vllm-0.32.0-venv, approved 2026-10-21, for chat);
-  - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B.
+  - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B;
+  - the rented two-GPU machine of ADR 0035 §14 (owner decision 2026-10-25), for
+    its one session only: fresh x86_64 CUDA installs of vLLM 0.32.0
+    (~/vllm-0.32.0-venv), SGLang 0.5.22 (~/sglang-0.5.22-venv) and the llama.cpp
+    v0.7.0 build (~/llamacpp-v0.7.0), made and removed by
+    `scripts/live/multi-gpu/run.sh`, with their fingerprints recorded with the rows.
 
   Use these as they are. Do not create or modify any engine environment without the
   owner's explicit approval, and add each approved one to this list.
+- The rented machine (owner decision 2026-10-25, ADR 0035 §14): one x86_64 machine
+  with two RTX A6000 48 GB cards, rented by the owner when the implementation is
+  ready, is authorized as a live host for one session only: MG1–MG14 and the
+  download bandwidth test, run with `scripts/live/multi-gpu/run.sh`, which removes
+  everything it created; the owner shuts the machine down straight afterwards. The
+  other rules here apply to it (one live session at a time, fault injection only by
+  signals to CapyCTL-owned processes, no driver, CUDA or system-package change).
 - Only one live session runs on the hosts at a time.
 - Fault injection is limited to signals sent to CapyCTL-owned processes (PIDs taken
   from ownership evidence) and one bounded external memory allocation. Never change

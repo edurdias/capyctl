@@ -81,6 +81,9 @@ pub enum SwitchPlan {
         instance: u32,
         /// The instance is parked on `host` and wakes in place.
         wake: bool,
+        /// ADR 0035 / MG10: the chosen GPU set key, in rank order, retained
+        /// for switch diagnostics as well as placement accounting.
+        device: Option<String>,
         victims: Vec<SwitchVictim>,
         /// The host's bounded, non-resetting admission window (SPEC §10).
         admission_window_ms: i64,
@@ -112,6 +115,8 @@ pub struct StartStep {
     pub instance: u32,
     /// The instance is parked on `host` and wakes in place.
     pub wake: bool,
+    /// The GPU set this instance starts or wakes on, in rank order.
+    pub device: Option<String>,
     pub victims: Vec<SwitchVictim>,
     /// The host's bounded, non-resetting admission window (SPEC §10).
     pub admission_window_ms: i64,
@@ -155,7 +160,7 @@ enum Planned {
         device: Option<String>,
     },
     /// Release victims first; on a multi-GPU host, the GPU they free.
-    Evict(SwitchPlan, Option<String>),
+    Evict(SwitchPlan),
     /// It fits nowhere even with eviction.
     Impossible { code: String, detail: String },
 }
@@ -367,7 +372,7 @@ impl crate::Store {
             observed,
         )? {
             Planned::Settled | Planned::Fits { .. } => SwitchPlan::FitsNow,
-            Planned::Evict(plan, _) => plan,
+            Planned::Evict(plan) => plan,
             Planned::Impossible { code, .. } => SwitchPlan::Impossible(code),
         };
         tx.commit()?;
@@ -1126,10 +1131,15 @@ fn planning_floors<'a>(
     let Some((observations, residents)) = observed.get(&c.host_id) else {
         return Ok(None);
     };
-    let kinds = read_selected_policy(tx, &c.host_id)
-        .ok()
-        .flatten()
+    let policy = read_selected_policy(tx, &c.host_id).ok().flatten();
+    let kinds = policy
+        .as_ref()
         .map(|policy| crate::resident_floors::domain_kinds(&policy.controls))
+        .unwrap_or_default();
+    // ADR 0035 §8: each GPU's domain credited from the bytes on that GPU.
+    let devices = policy
+        .as_ref()
+        .map(crate::resident_floors::domain_devices)
         .unwrap_or_default();
     Ok(Some((
         observations,
@@ -1140,6 +1150,7 @@ fn planning_floors<'a>(
             observations,
             residents,
             &kinds,
+            &devices,
         )?,
     )))
 }
@@ -1266,6 +1277,19 @@ fn plan_in(
     let owner = instance_owner_id(target, instance);
     let spec = placement_spec(tx, target, revision)?;
     let mut hosts = placement::candidates(tx, target, revision, instance, eligible, true)?;
+    // ADR 0035 §1a, §2: a parked instance wakes on the GPU set it parked on,
+    // with the N it was started at; `topology: auto` chooses nothing again.
+    let parked_device: Option<String> = if wake {
+        tx.query_row(
+            "SELECT COALESCE(device_set,device) FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2",
+            params![target, instance],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten()
+    } else {
+        None
+    };
     if let Some((_, Some(parked_on))) = &parked {
         hosts.retain(|c| &c.host_id == parked_on);
         let (source, e, _) = launch(tx, target, instance)?;
@@ -1274,6 +1298,13 @@ fn plan_in(
             c.footprint = peak.clone();
             // ADR 0019: it wakes on the GPU it parked on, no other.
             c.device_options.clear();
+            if c.gate.is_some_and(|gate| {
+                gate != capyctl_config::topology::LOCAL_TP_CAPABILITY_MISSING
+                    && placement::PLACEMENT_REFUSALS.contains(&gate)
+            }) {
+                c.gate = None;
+                c.gate_detail = None;
+            }
         }
     }
     // Owner decision 2026-09-25: earlier instances of the same evicting start
@@ -1352,7 +1383,7 @@ fn plan_in(
             });
             return Ok(Planned::Fits {
                 host: Some(chosen),
-                device,
+                device: parked_device.or(device),
             });
         }
         let Offered {
@@ -1555,16 +1586,14 @@ fn plan_in(
         .map_or(DEFAULT_ADMISSION_WINDOW_MS, |p| {
             p.controls.queue.admission_window_ms
         });
-    Ok(Planned::Evict(
-        SwitchPlan::Evict {
-            host: choice.host,
-            instance,
-            wake,
-            victims,
-            admission_window_ms,
-        },
-        choice.device,
-    ))
+    Ok(Planned::Evict(SwitchPlan::Evict {
+        host: choice.host,
+        instance,
+        wake,
+        device: parked_device.or(choice.device),
+        victims,
+        admission_window_ms,
+    }))
 }
 
 /// ADR 0028 §5, SPEC §11: plan the release that lets group instance
@@ -1787,16 +1816,13 @@ fn plan_group_in(
                 }),
         );
     }
-    Ok(Planned::Evict(
-        SwitchPlan::EvictGroup {
-            hosts: hosts.to_vec(),
-            instance,
-            wake,
-            victims,
-            admission_window_ms,
-        },
-        None,
-    ))
+    Ok(Planned::Evict(SwitchPlan::EvictGroup {
+        hosts: hosts.to_vec(),
+        instance,
+        wake,
+        victims,
+        admission_window_ms,
+    }))
 }
 
 /// A group's plan when one named host refuses: the closed code (that host's,
@@ -1951,16 +1977,14 @@ fn plan_start_in(
         )? {
             Planned::Settled => continue,
             Planned::Fits { host, device } => host.map(|host| (host, device)),
-            Planned::Evict(
-                SwitchPlan::Evict {
-                    host,
-                    instance,
-                    wake,
-                    victims,
-                    admission_window_ms,
-                },
+            Planned::Evict(SwitchPlan::Evict {
+                host,
+                instance,
+                wake,
                 device,
-            ) => {
+                victims,
+                admission_window_ms,
+            }) => {
                 for v in &victims {
                     assumed.released.extend(victim_owners(tx, v)?);
                 }
@@ -1968,6 +1992,7 @@ fn plan_start_in(
                     host: host.clone(),
                     instance,
                     wake,
+                    device: device.clone(),
                     victims,
                     admission_window_ms,
                 });
@@ -1975,16 +2000,13 @@ fn plan_start_in(
             }
             // ADR 0028 §5: a group's victims are released per named host,
             // each victim once; the group is placed on its fixed hosts.
-            Planned::Evict(
-                SwitchPlan::EvictGroup {
-                    instance,
-                    wake,
-                    victims,
-                    admission_window_ms,
-                    ..
-                },
-                _,
-            ) => {
+            Planned::Evict(SwitchPlan::EvictGroup {
+                instance,
+                wake,
+                victims,
+                admission_window_ms,
+                ..
+            }) => {
                 for (host, victims) in victims {
                     for v in &victims {
                         assumed.released.extend(victim_owners(tx, v)?);
@@ -1993,6 +2015,7 @@ fn plan_start_in(
                         host,
                         instance,
                         wake,
+                        device: None,
                         victims,
                         admission_window_ms,
                     });

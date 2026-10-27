@@ -535,6 +535,7 @@ impl crate::remote_readiness::ReadinessHosts for ScriptedReadiness {
                     boot_id: p.boot_id.clone(),
                     start_ticks: p.start_ticks,
                     presence: "alive".into(),
+                    rank: None,
                 })
                 .collect(),
             observed_at_unix_ms: capyctl_protocol::now_unix_ms(),
@@ -1734,6 +1735,7 @@ async fn a_remote_cancelling_lease_settles_only_on_an_idle_sample_after_the_hang
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
+                devices: Vec::new(),
             },
             ingress_gate_key: [7; 32],
             instance_index: 0,
@@ -1895,6 +1897,7 @@ async fn a_remote_cancelling_lease_settles_while_a_stop_drains() {
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
+                devices: Vec::new(),
             },
             ingress_gate_key: [7; 32],
             instance_index: 0,

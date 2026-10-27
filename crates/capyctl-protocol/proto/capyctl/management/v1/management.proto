@@ -183,6 +183,10 @@ message MemberExit {
   optional int32 exit_code = 6;
   optional int32 exit_signal = 7;
   int64 observed_at_unix_ms = 8;
+  // ADR 0035 §7: other owned processes observed gone in the same scan,
+  // before settlement. Their exit statuses and exit order are unknown.
+  // Absent on older senders; presence must be "gone" for every entry.
+  repeated OwnedProcessObservation also_exited = 9;
 }
 message Connect {
   string host_id = 1;
@@ -289,6 +293,15 @@ message ProcessResidency {
   // domain only, through `resident_bytes`.
   int64 device_bytes = 5;
   int64 host_bytes = 6;
+  // ADR 0035 §8 (additive, capability `local_tensor_parallel`): the process's
+  // GPU memory per GPU, one entry per GPU it holds memory on; `device_bytes`
+  // is their sum. Empty from an older host, whose `device_bytes` credits only
+  // an owner with one device allocation.
+  repeated DeviceResidency per_device = 7;
+}
+message DeviceResidency {
+  string device_id = 1;  // host-local device id (`gpuN`)
+  uint64 bytes = 2;
 }
 message RuntimeProfileStatus {
   string name = 1;
@@ -488,6 +501,11 @@ message SingleLaunchPlan {
   // Absent when the store planned LMCache off. Sent only to a host that
   // declared `lmcache`.
   LmcacheGrant lmcache = 19;
+  // ADR 0035 §§2, 11 (additive, capability `local_tensor_parallel`): the
+  // host-local device ids (`gpuN`) of a launch on several GPUs of one host,
+  // in rank order (rank r on the r-th). Empty for a launch on one GPU, which
+  // encodes exactly as before.
+  repeated string devices = 20;
 }
 // ADR 0033 §§3, 6: the ports and the charge of one launch's LMCache server.
 message LmcacheGrant {
@@ -688,6 +706,11 @@ message OwnedProcessObservation {
   string boot_id = 3;
   uint64 start_ticks = 4;
   string presence = 5; // alive | gone | unknown
+  // ADR 0035 §6 (additive, capability `local_tensor_parallel`): the rank of a
+  // launch on several GPUs of one host this process is the rank process of
+  // (the position of its GPU in the plan's `devices`), as the host named it
+  // at readiness. Absent otherwise and from an older host.
+  optional uint32 rank = 6;
 }
 message MemberExecutionResult {
   CommandIdentity identity = 1;

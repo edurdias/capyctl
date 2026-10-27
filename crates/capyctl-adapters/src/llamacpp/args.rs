@@ -26,6 +26,10 @@ pub const ENGINE_ENV_ALLOWLIST: &[&str] = &[
     // host's `engine_telemetry: off` (engine_telemetry.rs).
     "DO_NOT_TRACK",
 ];
+/// ADR 0035 §4: a launch on several GPUs keeps NCCL on loopback, so a build
+/// that links NCCL stays there if a later version opens the `tensor` mode.
+/// Rendered, and let through the closed environment, for such a launch only.
+const NCCL_SOCKET_IFNAME: &str = "NCCL_SOCKET_IFNAME";
 /// Variables taken from the agent's own environment. `HOME` is not one:
 /// llama-server would find its user configuration and cache through it
 /// (ADR 0029 §6), and both are pointed at CapyCTL's own directories.
@@ -64,7 +68,13 @@ pub struct PlanInputLlamacpp {
     /// ADR 0029 §6: CapyCTL's private `LLAMA_CACHE`.
     pub cache_dir: String,
     pub engine_log: Option<String>,
-    pub cuda_namespace: Option<capyctl_config::effective::CudaNamespace>,
+    /// ADR 0019 §6, ADR 0035 §4: the GPUs the engine child's namespace is
+    /// narrowed to, in rank order; empty keeps the agent's own.
+    pub cuda_namespaces: Vec<capyctl_config::effective::CudaNamespace>,
+    /// ADR 0035 §4: on several GPUs, each GPU's share of the layers
+    /// (`--tensor-split`), proportional to its grant, in rank order; empty on
+    /// one GPU, which renders no split.
+    pub tensor_split: Vec<u64>,
 }
 
 /// ADR 0028 §2.1: `build_env` values may hold tokens, so Debug prints its names only.
@@ -88,7 +98,8 @@ impl std::fmt::Debug for PlanInputLlamacpp {
             .field("config_dir", &self.config_dir)
             .field("cache_dir", &self.cache_dir)
             .field("engine_log", &self.engine_log)
-            .field("cuda_namespace", &self.cuda_namespace)
+            .field("cuda_namespaces", &self.cuda_namespaces)
+            .field("tensor_split", &self.tensor_split)
             .finish()
     }
 }
@@ -111,6 +122,9 @@ pub enum LlamacppArgsError {
     RenderedReserved(String),
     #[error("llama-server splits --alias at commas and trims spaces, so it cannot serve the route {0:?}; name the route without them")]
     ServedName(String),
+    /// ADR 0035 §4: a layer split names one positive share per GPU.
+    #[error("a launch on several GPUs needs one positive layer share per GPU, in rank order")]
+    TensorSplit,
 }
 
 /// ADR 0029 §4–§6: the options CapyCTL renders, in this order, before the
@@ -161,8 +175,30 @@ fn reserved_block(input: &PlanInputLlamacpp, ctx_size: u32) -> Vec<String> {
     if let Some(projector) = &input.mmproj_file {
         argv.extend(["--mmproj".to_owned(), projector.clone()]);
     }
+    // ADR 0029 §6 as amended by ADR 0035 §4 (owner decision 5): on several
+    // GPUs the layers split across them (`layer`; `row` and `tensor` are
+    // never rendered), each GPU's share proportional to its grant, the
+    // first GPU of the namespace the main one. One GPU renders none of it.
+    if input.tensor_split.len() > 1 {
+        argv.extend([
+            "--split-mode".to_owned(),
+            SPLIT_MODE_LAYER.to_owned(),
+            "--tensor-split".to_owned(),
+            input
+                .tensor_split
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            "--main-gpu".to_owned(),
+            "0".to_owned(),
+        ]);
+    }
     argv
 }
+
+/// ADR 0035 §4: the one `--split-mode` CapyCTL renders.
+const SPLIT_MODE_LAYER: &str = "layer";
 
 fn pass_through_error(error: ProfileArgError) -> LlamacppArgsError {
     match error {
@@ -179,6 +215,14 @@ pub fn render_command(input: &PlanInputLlamacpp) -> Result<RenderedCommand, Llam
         slot_pool_tokens(input.context_length, input.slots).ok_or(LlamacppArgsError::NoContext)?;
     if !CACHE_TYPES.contains(&input.cache_type.as_str()) {
         return Err(LlamacppArgsError::CacheType(input.cache_type.clone()));
+    }
+    // ADR 0035 §4: a split names one positive share per GPU of the namespace.
+    let several = input.tensor_split.len() > 1;
+    if input.tensor_split.contains(&0)
+        || input.tensor_split.len() == 1
+        || (several && input.tensor_split.len() != input.cuda_namespaces.len())
+    {
+        return Err(LlamacppArgsError::TensorSplit);
     }
     // ADR 0029 §10: readiness waits for `/v1/models` to list the served name
     // as rendered; llama-server would split it at commas and trim it
@@ -204,10 +248,15 @@ pub fn render_command(input: &PlanInputLlamacpp) -> Result<RenderedCommand, Llam
         ("XDG_CONFIG_HOME".to_owned(), input.config_dir.clone()),
         ("LLAMA_CACHE".to_owned(), input.cache_dir.clone()),
     ]);
-    if let Some(namespace) = &input.cuda_namespace {
-        for (name, value) in namespace.environment() {
+    if !input.cuda_namespaces.is_empty() {
+        for (name, value) in
+            capyctl_config::effective::CudaNamespace::environment_of(&input.cuda_namespaces)
+        {
             env.insert(name.into(), value);
         }
+    }
+    if several {
+        env.insert(NCCL_SOCKET_IFNAME.into(), "lo".into());
     }
     Ok(RenderedCommand { argv, env })
 }
@@ -237,11 +286,14 @@ const RENDERED_ONCE: &[&str] = &[
 ];
 /// Rendered when the deployment names a projector.
 const RENDERED_AT_MOST_ONCE: &str = "--mmproj";
+/// ADR 0035 §4: rendered together on a launch on several GPUs, never alone.
+const RENDERED_SPLIT: &[&str] = &["--split-mode", "--tensor-split", "--main-gpu"];
 
 /// ADR 0029 §6, SPEC §8.2: the rendered-argument recheck. There is no
 /// in-process parser to ask, so the final vector (`argv[0]` the binary) is
 /// read as llama-server reads it: every option CapyCTL renders appears
-/// exactly once (`--mmproj` at most once), no other reserved option and no
+/// exactly once (`--mmproj` at most once; the split options all once or not
+/// at all, `--split-mode` only `layer`), no other reserved option and no
 /// `--name=value` spelling appears at all.
 pub fn recheck_rendered(argv: &[String]) -> Result<(), LlamacppArgsError> {
     let args = argv.get(1..).unwrap_or_default();
@@ -262,10 +314,17 @@ pub fn recheck_rendered(argv: &[String]) -> Result<(), LlamacppArgsError> {
             .iter()
             .find(|row| row.contains(&option.name.as_str()))
             .map(|row| row[0])
-            .filter(|head| RENDERED_ONCE.contains(head) || *head == RENDERED_AT_MOST_ONCE);
+            .filter(|head| {
+                RENDERED_ONCE.contains(head)
+                    || *head == RENDERED_AT_MOST_ONCE
+                    || RENDERED_SPLIT.contains(head)
+            });
         let Some(head) = rendered else {
             return Err(LlamacppArgsError::RenderedReserved(option.name.clone()));
         };
+        if head == "--split-mode" && option.value.as_deref() != Some(SPLIT_MODE_LAYER) {
+            return Err(LlamacppArgsError::RenderedReserved(option.name.clone()));
+        }
         *counts.entry(head).or_default() += 1;
     }
     let count = |head: &str| counts.get(head).copied().unwrap_or(0);
@@ -276,6 +335,13 @@ pub fn recheck_rendered(argv: &[String]) -> Result<(), LlamacppArgsError> {
         return Err(LlamacppArgsError::RenderedReserved(
             RENDERED_AT_MOST_ONCE.to_owned(),
         ));
+    }
+    let split = count(RENDERED_SPLIT[0]);
+    if let Some(head) = RENDERED_SPLIT
+        .iter()
+        .find(|head| count(head) > 1 || count(head) != split)
+    {
+        return Err(LlamacppArgsError::RenderedReserved((*head).to_owned()));
     }
     Ok(())
 }
@@ -324,9 +390,14 @@ pub fn engine_environment(
     // Owner decision 2026-10-22: llama-server has no usage reporting; the
     // convention is set all the same, as for every engine.
     crate::engine_telemetry::apply(&mut env, crate::engine_telemetry::DO_NOT_TRACK, telemetry);
+    // ADR 0035 §4: `NCCL_SOCKET_IFNAME=lo` only as rendered for a launch on
+    // several GPUs.
     env.retain(|name, _| {
         ENGINE_ENV_ALLOWLIST.contains(&name.as_str())
             || (plan.build_env.contains_key(name) && !refused_env_name(name))
+            || (name == NCCL_SOCKET_IFNAME
+                && plan.tensor_split.len() > 1
+                && rendered.get(name).is_some_and(|value| value == "lo"))
     });
     env
 }

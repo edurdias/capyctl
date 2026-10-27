@@ -126,6 +126,35 @@ def trusted_search_path(site_packages):
     return entries
 
 
+def prepare_saver_library_path(site_packages):
+    """Make the selected installation's CUDA runtime visible before child exec.
+
+    SGLang's saver sets LD_PRELOAD around scheduler spawning. Its library needs
+    libcudart before Python (and therefore torch's wheel loader) can start.
+    Discover that runtime from installed wheel records, not CUDA layout guesses
+    or ambient loader paths. Only canonical paths inside this installation are
+    admitted; no imports, .pth hooks, system toolkit search or driver loading.
+    A system-provided runtime still uses the dynamic loader's default search.
+    """
+    os.environ.pop("LD_LIBRARY_PATH", None)
+    root = os.path.realpath(site_packages)
+    directories = set()
+    for distribution in importlib.metadata.distributions(path=[root]):
+        name = re.sub(r"[-_.]+", "-", distribution.metadata.get("Name", "")).lower()
+        if re.fullmatch(r"nvidia-cuda-runtime(?:-cu[0-9]+)?", name) is None:
+            continue
+        for file in distribution.files or ():
+            if re.fullmatch(r"libcudart\.so(?:\.[0-9]+)*", file.name) is None:
+                continue
+            path = os.path.realpath(distribution.locate_file(file))
+            if (os.path.commonpath((root, path)) != root or not os.path.isfile(path)
+                    or any(char in path for char in ":;$")):
+                continue
+            directories.add(os.path.dirname(path))
+    if directories:
+        os.environ["LD_LIBRARY_PATH"] = ":".join(sorted(directories))
+
+
 
 def _required_plugin(point):
     """Whether an installed general plugin is one SGLang itself requires."""

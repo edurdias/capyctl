@@ -72,13 +72,16 @@ def server_arg(args, name):
     return values[name]
 
 
-def topology(scheduler, weight_restore="disk_reload", group=None):
+def topology(scheduler, weight_restore="disk_reload", group=None, tensor_parallel=None):
     """The recipe's topology, or BridgeError('topology').
 
     A single rank is pinned to 1/1. ADR 0028 §12 (R12): a group member's
     `group` is its descriptor's (tp, pp, nnodes); its scheduler's `tp_size`
     and `pp_size` must equal them, and the host must run exactly one scheduler
-    of the group (tp x pp == nnodes, one local rank). Nothing else changes.
+    of the group (tp x pp == nnodes, one local rank). ADR 0035 §9: a launch on
+    N GPUs of one host (`tensor_parallel`, its plan's N, 2 or more) runs N
+    schedulers on this host, each with `tp_size` N and pipeline 1. Nothing
+    else changes.
 
     ADR 0014 A17: speculative decoding (a named `speculative_algorithm`) is
     admitted only for a `resident` launch. SGLang 0.5.21 releases the draft
@@ -88,12 +91,18 @@ def topology(scheduler, weight_restore="disk_reload", group=None):
     """
     try:
         expected = dict(_TOPOLOGY)
+        if group is not None and tensor_parallel is not None:
+            raise BridgeError("topology")
         if group is not None:
             tp, pp, nnodes = group
             if (any(type(value) is not int or value < 1 for value in (tp, pp, nnodes))
                     or nnodes < 2 or tp * pp != nnodes):
                 raise BridgeError("topology")
             expected.update(tp_size=tp, pp_size=pp)
+        if tensor_parallel is not None:
+            if type(tensor_parallel) is not int or not 2 <= tensor_parallel <= 64:
+                raise BridgeError("topology")
+            expected.update(tp_size=tensor_parallel)
         args = saver._exact(saver._fields(scheduler).get("server_args"),
                             "sglang.srt.server_args", "ServerArgs")
         for name, value in expected.items():

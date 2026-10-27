@@ -228,6 +228,7 @@ fn observed(identities: &[ProcessIdentity], presence: &str) -> Vec<pb::OwnedProc
             boot_id: p.boot_id.clone(),
             start_ticks: p.start_ticks,
             presence: presence.into(),
+            rank: None,
         })
         .collect()
 }
@@ -1191,6 +1192,7 @@ async fn measured_then_started_again(
         bytes: gpu,
         device_bytes: gpu,
         host_bytes: 0,
+        per_device: Vec::new(),
     };
     let clock = host.clock.clone();
     let bound = host.clone();
@@ -1228,7 +1230,7 @@ async fn measured_then_started_again(
     if let Some(gpu) = running_gpu {
         let pid = server.pid;
         let sampler = capyctl_agent::process_residency::ResidencySampler::with_collector(Arc::new(
-            move || Some(vec![(pid, gpu)]),
+            move || Some(vec![(pid, "gpu0".into(), gpu)]),
         ));
         // The exit watch reads the latest sample without waiting for one.
         assert_eq!(sampler.sample_fresh().len(), 1);
@@ -1696,6 +1698,7 @@ fn restart_only_sglang(endpoint: String) -> capyctl_domain::launch::NativeLaunch
             served_name: "cached".into(),
             rendered_settings_digest: "a".repeat(64),
             placement_digest: None,
+            devices: Vec::new(),
             device: NativeDeviceSelection {
                 host_id: "lab".into(),
                 hardware_fingerprint: "hw-01".into(),

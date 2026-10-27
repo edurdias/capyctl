@@ -1233,6 +1233,72 @@ pub const SCHEMA_V56: &str = "-- held engine KV after a restart-park (lmcache::m
 pub const SCHEMA_V57: &str =
     "-- the largest server GPU reading above its charge (lmcache::migrate_v57)";
 
+/// v58 (ADR 0035 §§2, 3): one model on several GPUs of one host.
+///
+/// - The revision as resolved on a set of N GPUs is kept beside each single
+///   GPU's, keyed by the set's ids in rank order joined by `,`, so the key may
+///   now be as long as eight scoped GPU ids. The table is copied unchanged.
+/// - The startup peak (ADR 0019 A2) and the parked residue (ADR 0014 A13)
+///   gain the tensor-parallel size N in their key: a peak measured at N = 2
+///   never sizes a start at N = 1. Every row recorded before v58 is the N = 1
+///   record.
+/// - `deployment_instances.device_set` (the chosen set's key, rank order, for
+///   N > 1; null on one GPU, where `device` alone names it) and
+///   `deployment_instances.tensor_parallel` (the N its last placement chose;
+///   null for an instance never placed, 1 for every instance placed before
+///   v58) are added by `crate::instances::migrate_v58` only when missing.
+///
+/// Forward-only.
+pub const SCHEMA_V58: &str = r#"
+CREATE TABLE host_device_effective_revisions_v58(
+  deployment_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision>0),
+  host_id TEXT NOT NULL,
+  device TEXT NOT NULL CHECK(length(device) BETWEEN 1 AND 4096),
+  effective_json TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  source_json TEXT NOT NULL CHECK(json_valid(source_json)),
+  PRIMARY KEY(deployment_id,revision,host_id,device),
+  FOREIGN KEY(deployment_id,revision,host_id) REFERENCES host_effective_revisions(deployment_id,revision,host_id)
+);
+INSERT INTO host_device_effective_revisions_v58(deployment_id,revision,host_id,device,effective_json,fingerprint,source_json)
+  SELECT deployment_id,revision,host_id,device,effective_json,fingerprint,source_json FROM host_device_effective_revisions;
+DROP TABLE host_device_effective_revisions;
+ALTER TABLE host_device_effective_revisions_v58 RENAME TO host_device_effective_revisions;
+CREATE TABLE startup_measurements_v58(
+  deployment_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision>=1),
+  host_id TEXT NOT NULL,
+  installation TEXT NOT NULL,
+  tensor_parallel INTEGER NOT NULL DEFAULT 1 CHECK(tensor_parallel>=1),
+  domain TEXT NOT NULL CHECK(domain<>''),
+  peak_bytes INTEGER NOT NULL CHECK(peak_bytes>0),
+  step_id TEXT NOT NULL,
+  measured_at_ms INTEGER NOT NULL CHECK(measured_at_ms>=0),
+  PRIMARY KEY(deployment_id,revision,host_id,installation,tensor_parallel,domain)
+);
+INSERT INTO startup_measurements_v58(deployment_id,revision,host_id,installation,tensor_parallel,domain,peak_bytes,step_id,measured_at_ms)
+  SELECT deployment_id,revision,host_id,installation,1,domain,peak_bytes,step_id,measured_at_ms FROM startup_measurements;
+DROP TABLE startup_measurements;
+ALTER TABLE startup_measurements_v58 RENAME TO startup_measurements;
+CREATE TABLE parked_measurements_v58(
+  deployment_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision>=1),
+  host_id TEXT NOT NULL,
+  installation TEXT NOT NULL,
+  tensor_parallel INTEGER NOT NULL DEFAULT 1 CHECK(tensor_parallel>=1),
+  domain TEXT NOT NULL,
+  bytes INTEGER NOT NULL CHECK(bytes>0),
+  step_id TEXT NOT NULL,
+  measured_at_ms INTEGER NOT NULL CHECK(measured_at_ms>=0),
+  PRIMARY KEY(deployment_id,revision,host_id,installation,tensor_parallel,domain)
+);
+INSERT INTO parked_measurements_v58(deployment_id,revision,host_id,installation,tensor_parallel,domain,bytes,step_id,measured_at_ms)
+  SELECT deployment_id,revision,host_id,installation,1,domain,bytes,step_id,measured_at_ms FROM parked_measurements;
+DROP TABLE parked_measurements;
+ALTER TABLE parked_measurements_v58 RENAME TO parked_measurements;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

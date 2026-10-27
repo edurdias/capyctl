@@ -17,12 +17,13 @@
 //! [`REFRESH`], bounded by [`BOUND`]. A host without it reports no processes,
 //! which credits nothing (the behaviour before this existed).
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use capyctl_domain::resources::ProcessResident;
+use capyctl_domain::resources::{DeviceBytes, ProcessResident};
 
 /// How often a new sample is started when one is asked for.
 pub const REFRESH: Duration = Duration::from_secs(2);
@@ -33,8 +34,12 @@ pub const BOUND: Duration = Duration::from_secs(3);
 /// At most this many processes are reported per sample.
 pub const MAX_PROCESSES: usize = 256;
 
-/// Reads GPU memory per pid: `(pid, bytes)`.
-pub type GpuCollector = dyn Fn() -> Option<Vec<(u32, i64)>> + Send + Sync;
+/// ADR 0035 §8: one reading of GPU memory per (process, GPU): `(pid, device,
+/// bytes)`, the device by its host-local id (`gpuN`).
+pub type GpuReading = (u32, String, i64);
+
+/// Reads GPU memory per (process, GPU).
+pub type GpuCollector = dyn Fn() -> Option<Vec<GpuReading>> + Send + Sync;
 
 #[derive(Default)]
 struct State {
@@ -49,14 +54,25 @@ pub struct ResidencySampler {
 }
 
 impl ResidencySampler {
-    /// The production sampler: `nvidia-smi --query-compute-apps`.
+    /// The production sampler: `nvidia-smi --query-compute-apps`, each row's
+    /// GPU UUID mapped to its host device id through the host's GPU
+    /// inventory (ADR 0035 §8). The inventory is read again once when a row
+    /// names a UUID it does not hold; a UUID still unknown refuses the
+    /// sample.
     pub fn nvidia() -> Arc<Self> {
-        Self::with_collector(Arc::new(|| {
-            run_nvidia_smi().and_then(|text| parse_compute_apps(&text))
+        let inventory: Mutex<BTreeMap<String, String>> = Mutex::default();
+        Self::with_collector(Arc::new(move || {
+            let text = run_nvidia_smi()?;
+            let mut known = inventory.lock().ok()?;
+            if let Some(rows) = parse_compute_apps(&text, &known) {
+                return Some(rows);
+            }
+            *known = inventory_devices(&crate::gpu_memory::sample()?);
+            parse_compute_apps(&text, &known)
         }))
     }
 
-    /// A sampler reading GPU memory per pid through `collect`.
+    /// A sampler reading GPU memory per (process, GPU) through `collect`.
     pub fn with_collector(collect: Arc<GpuCollector>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::default(),
@@ -114,7 +130,9 @@ impl ResidencySampler {
         sample
     }
 
-    /// Take one sample now, on this thread.
+    /// Take one sample now, on this thread. ADR 0035 §8: one entry per
+    /// process, with its GPU memory per GPU (`per_device`) and their sum
+    /// (`device_bytes`); its host pages are read once, never per GPU.
     pub fn sample_now(&self) -> Vec<ProcessResident> {
         let Some(gpu) = (self.collect)() else {
             return Vec::new();
@@ -122,11 +140,33 @@ impl ResidencySampler {
         let Some(boot_id) = boot_id() else {
             return Vec::new();
         };
-        gpu.into_iter()
+        let mut processes: Vec<(u32, Vec<DeviceBytes>)> = Vec::new();
+        for (pid, device, bytes) in gpu {
+            let Ok(bytes) = u64::try_from(bytes) else {
+                return Vec::new();
+            };
+            let at = match processes.iter().position(|(p, _)| *p == pid) {
+                Some(at) => at,
+                None => {
+                    processes.push((pid, Vec::new()));
+                    processes.len() - 1
+                }
+            };
+            let per_device = &mut processes[at].1;
+            match per_device.iter_mut().find(|d| d.device == device) {
+                Some(entry) => entry.bytes = entry.bytes.saturating_add(bytes),
+                None => per_device.push(DeviceBytes { device, bytes }),
+            }
+        }
+        processes
+            .into_iter()
             .take(MAX_PROCESSES)
-            .filter_map(|(pid, gpu_bytes)| {
+            .filter_map(|(pid, per_device)| {
                 let start_ticks = start_ticks(pid)?;
                 let anonymous = anonymous_resident_bytes(pid)?;
+                let gpu_bytes = per_device.iter().try_fold(0_i64, |sum, d| {
+                    sum.checked_add(i64::try_from(d.bytes).ok()?)
+                })?;
                 // ADR 0019: the two figures stay separate so a discrete host
                 // credits each to its own domain; a unified host credits the
                 // sum (ADR 0007).
@@ -137,34 +177,63 @@ impl ResidencySampler {
                     bytes: gpu_bytes.checked_add(anonymous)?,
                     device_bytes: gpu_bytes,
                     host_bytes: anonymous,
+                    per_device,
                 })
             })
             .collect()
     }
 }
 
-/// Parse `nvidia-smi --query-compute-apps=pid,used_memory
-/// --format=csv,noheader,nounits` output (MiB). Rows whose memory the driver
-/// does not report (`[N/A]`, `[Not Supported]`) are skipped; anything else
-/// malformed refuses the whole sample (`None`).
-pub fn parse_compute_apps(text: &str) -> Option<Vec<(u32, i64)>> {
+/// ADR 0035 §8: the host device id (`gpuN`, N the driver's index) of each GPU
+/// UUID in an inventory sample.
+pub fn inventory_devices(sample: &crate::gpu_memory::GpuSample) -> BTreeMap<String, String> {
+    sample
+        .devices
+        .iter()
+        .map(|device| (device.uuid.clone(), format!("gpu{}", device.index)))
+        .collect()
+}
+
+/// Parse `nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory
+/// --format=csv,noheader,nounits` output (MiB). ADR 0035 §8: the driver
+/// returns one row per process and GPU; each GPU UUID is mapped to its host
+/// device id through `inventory` (UUID to `gpuN`), and repeated rows of one
+/// process on one GPU are one reading. Rows whose memory the driver does not
+/// report (`[N/A]`, `[Not Supported]`) are skipped; a UUID the inventory does
+/// not hold, or anything else malformed, refuses the whole sample (`None`).
+pub fn parse_compute_apps(
+    text: &str,
+    inventory: &BTreeMap<String, String>,
+) -> Option<Vec<GpuReading>> {
     if text.len() > 64 * 1024 {
         return None;
     }
-    let mut out = Vec::new();
+    let mut out: Vec<GpuReading> = Vec::new();
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let (pid, used) = line.split_once(',')?;
-        let pid: u32 = pid.trim().parse().ok()?;
-        let used = used.trim();
+        let mut fields = line.split(',').map(str::trim);
+        let (Some(pid), Some(uuid), Some(used), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return None;
+        };
+        let pid: u32 = pid.parse().ok()?;
+        if pid == 0 {
+            return None;
+        }
+        let device = inventory.get(uuid)?;
         if used.starts_with('[') {
             continue;
         }
         let mib: i64 = used.parse().ok()?;
-        if pid == 0 || mib < 0 {
+        if mib < 0 {
             return None;
         }
-        out.push((pid, mib.checked_mul(1 << 20)?));
-        if out.len() > MAX_PROCESSES {
+        let bytes = mib.checked_mul(1 << 20)?;
+        match out.iter_mut().find(|(p, d, _)| *p == pid && d == device) {
+            Some(reading) => reading.2 = reading.2.checked_add(bytes)?,
+            None => out.push((pid, device.clone(), bytes)),
+        }
+        if out.len() > MAX_PROCESSES * 8 {
             return None;
         }
     }
@@ -182,7 +251,7 @@ fn run_nvidia_smi() -> Option<String> {
     let program = crate::gpu_memory::nvidia_smi()?;
     let mut child = Command::new(program)
         .args([
-            "--query-compute-apps=pid,used_memory",
+            "--query-compute-apps=pid,gpu_uuid,used_memory",
             "--format=csv,noheader,nounits",
         ])
         .stdin(Stdio::null())
@@ -312,18 +381,76 @@ fn status_kib(status: &str, name: &str) -> Option<i64> {
 mod tests {
     use super::*;
 
-    // T26: the driver's per-process rows, in MiB; unreported rows are skipped
-    // and anything malformed refuses the whole sample.
+    fn inventory() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("GPU-aaaa".to_string(), "gpu0".to_string()),
+            ("GPU-bbbb".to_string(), "gpu1".to_string()),
+        ])
+    }
+
+    // T26 T46 (ADR 0035 §8): the driver's per-process rows, in MiB, each on
+    // its GPU by UUID, mapped to the host device id; unreported rows are
+    // skipped and anything malformed refuses the whole sample.
     #[test]
     fn compute_app_rows_parse_strictly() {
         assert_eq!(
-            parse_compute_apps("1234, 4290\n 99 , [N/A]\n5678, 0\n").unwrap(),
-            vec![(1234, 4290 << 20), (5678, 0)]
+            parse_compute_apps(
+                "1234, GPU-aaaa, 4290\n 99 , GPU-aaaa, [N/A]\n5678, GPU-bbbb, 0\n",
+                &inventory()
+            )
+            .unwrap(),
+            vec![(1234, "gpu0".into(), 4290 << 20), (5678, "gpu1".into(), 0)]
         );
-        assert_eq!(parse_compute_apps("").unwrap(), vec![]);
-        for bad in ["x, 1", "1, x", "1", "0, 5", "1, -5"] {
-            assert!(parse_compute_apps(bad).is_none(), "{bad}");
+        assert_eq!(parse_compute_apps("", &inventory()).unwrap(), vec![]);
+        for bad in [
+            "x, GPU-aaaa, 1",
+            "1, GPU-aaaa, x",
+            "1",
+            "1, 5",
+            "0, GPU-aaaa, 5",
+            "1, GPU-aaaa, -5",
+            "1, GPU-aaaa, 5, 6",
+        ] {
+            assert!(parse_compute_apps(bad, &inventory()).is_none(), "{bad}");
         }
+    }
+
+    // T46 (ADR 0035 §8): one process on two GPUs is two readings, one per
+    // GPU; repeated rows of one process on one GPU are one reading; a UUID the
+    // host's inventory does not hold refuses the whole sample, as a
+    // malformed row does.
+    #[test]
+    fn a_process_on_two_gpus_reads_per_gpu_and_unknown_uuids_refuse() {
+        let rows = parse_compute_apps(
+            "10, GPU-aaaa, 20000\n10, GPU-bbbb, 512\n11, GPU-bbbb, 100\n11, GPU-bbbb, 28\n",
+            &inventory(),
+        )
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (10, "gpu0".into(), 20000 << 20),
+                (10, "gpu1".into(), 512 << 20),
+                (11, "gpu1".into(), 128 << 20),
+            ]
+        );
+        assert!(parse_compute_apps("10, GPU-aaaa, 1\n11, GPU-cccc, 1\n", &inventory()).is_none());
+        assert!(parse_compute_apps("11, GPU-cccc, [N/A]\n", &inventory()).is_none());
+        // The inventory maps each UUID to `gpu<index>`.
+        let sample = crate::gpu_memory::GpuSample {
+            devices: vec![crate::gpu_memory::GpuDevice {
+                index: 3,
+                uuid: "GPU-dddd".into(),
+                pci_bus_id: "00000000:01:00.0".into(),
+                name: "card".into(),
+                memory: None,
+            }],
+            sampled_at_ms: 1,
+        };
+        assert_eq!(
+            inventory_devices(&sample),
+            BTreeMap::from([("GPU-dddd".to_string(), "gpu3".to_string())])
+        );
     }
 
     // T26: the host figure is anonymous plus shared resident memory (a
@@ -380,7 +507,10 @@ mod tests {
     fn a_sample_binds_each_process_to_its_identity() {
         let me = std::process::id();
         let sampler = ResidencySampler::with_collector(Arc::new(move || {
-            Some(vec![(me, 1 << 20), (u32::MAX - 1, 1 << 20)])
+            Some(vec![
+                (me, "gpu0".into(), 1 << 20),
+                (u32::MAX - 1, "gpu0".into(), 1 << 20),
+            ])
         }));
         let sample = sampler.sample_now();
         assert_eq!(sample.len(), 1);
@@ -397,12 +527,49 @@ mod tests {
         );
     }
 
+    // T46 (ADR 0035 §8): a process holding memory on two GPUs is one entry
+    // with a reading per GPU and their sum as its device bytes; its host
+    // pages are read once.
+    #[test]
+    fn a_process_on_two_gpus_is_one_entry_with_per_gpu_readings() {
+        let me = std::process::id();
+        let sampler = ResidencySampler::with_collector(Arc::new(move || {
+            Some(vec![
+                (me, "gpu0".into(), 3 << 20),
+                (me, "gpu1".into(), 1 << 20),
+            ])
+        }));
+        let sample = sampler.sample_now();
+        assert_eq!(sample.len(), 1);
+        assert_eq!(
+            sample[0].per_device,
+            vec![
+                DeviceBytes {
+                    device: "gpu0".into(),
+                    bytes: 3 << 20
+                },
+                DeviceBytes {
+                    device: "gpu1".into(),
+                    bytes: 1 << 20
+                },
+            ]
+        );
+        assert_eq!(sample[0].device_bytes, 4 << 20);
+        assert_eq!(
+            sample[0].bytes,
+            sample[0].device_bytes + sample[0].host_bytes
+        );
+        assert_eq!(sample[0].bytes_on("gpu1"), Some(1 << 20));
+        assert_eq!(sample[0].bytes_on("gpu2"), Some(0));
+    }
+
     // T26: `current` never blocks; the first call starts a sample and a later
     // one reports it.
     #[test]
     fn current_reports_a_background_sample() {
         let me = std::process::id();
-        let sampler = ResidencySampler::with_collector(Arc::new(move || Some(vec![(me, 0)])));
+        let sampler =
+            ResidencySampler::with_collector(Arc::new(move || Some(vec![(me, "gpu0".into(), 0)])));
         let first = sampler.current();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut seen = first;

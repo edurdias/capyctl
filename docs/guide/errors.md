@@ -11,8 +11,9 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 2 | `device_policy_mismatch` | A host's file describes a card that does not match the GPU it found. | Fix the `gpuN` entries of `resource_policy` to match `nvidia-smi -L`. |
 | 2 | `missing_system_allocation` | A deployment that lists its own `resources` on a discrete card leaves out host RAM (`system`). | Add the `system` entry, or leave `resources` out and let CapyCTL size it. |
 | 2 | `host_name_changed` | A standalone role's state belongs to the host it was first started under, named after the machine's hostname, and the hostname has changed since; a container gets a new hostname each time it is created. The message names the stored name and the current one. Nothing is changed. | Start it under the stored hostname: for a container, `docker run --hostname <stored name>` ([Running in a container](../operations/install.md#running-in-a-container)); on a machine, set the hostname back. |
-| 2 | `group_placement_required` | A deployment with a `topology` does not list its machines in `placement.hosts`, or also sets `host`, `selector`, `strategy` or `max_per_host`, or runs on a single-machine (standalone) role. | List the machines in `placement.hosts`, head first, and remove the other placement fields ([One model across machines](several-machines.md#one-model-across-machines)). |
-| 2 | `group_topology_invalid` | `placement.hosts` repeats a machine, a dimension of `topology` is zero, or the number of machines does not divide `tensor_parallel` × `pipeline_parallel`. | Fix `topology` or `placement.hosts`. |
+| 2 | `group_placement_required` | A deployment with a `topology` and two or more `placement.hosts` also sets `host`, `selector`, `strategy` or `max_per_host`. | List the machines in `placement.hosts`, head first, and remove the other placement fields ([One model across machines](several-machines.md#one-model-across-machines)). A `topology` without `placement.hosts` runs on several GPUs of one machine instead ([One model on several GPUs](deploy.md#one-model-on-several-gpus)). |
+| 2 | `group_topology_invalid` | `placement.hosts` repeats a machine, a dimension of `topology` is zero, the number of machines does not divide `tensor_parallel` × `pipeline_parallel`, or `topology: auto` names two or more machines (a group's shape is yours to state). | Fix `topology` or `placement.hosts`. |
+| 2 | `topology_devices_mismatch` | `devices` names a different number of GPUs than `topology.tensor_parallel`, or any GPU beside `topology: auto`. | Name exactly as many GPUs as `tensor_parallel`, or leave `devices` out and let CapyCTL pick them. |
 | 2 | `group_profile_mismatch` | The engine profile does not exist on one of the machines, or its build differs between them. | Register the same engine build under the same name on every machine. |
 | 2 | `group_checkpoint_mismatch` | The model's files differ between the machines; the message lists each machine's digest. | Make the copies identical, or let CapyCTL download the model on each machine. |
 | 2 | `group_model_path_mismatch` | A SGLang group with `residency: deep` has the model at different paths on its machines; the message names both. | Put the model at the same path on every machine, or use `residency: restart_only`. |
@@ -28,7 +29,8 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 2 | `declined` | `capyctl engine add --custom` asked for confirmation and the answer was not `y` or `yes`. Nothing was written. | Run it again and answer `y`, after checking what it prints. |
 | 3 | `unauthorized` | The credentials were refused. | Check the admin token or the host's identity. |
 | 4 | `insufficient_resources` | No host has the GPU memory the deployment needs. The message names each host's limit, for example `host a needs 64.0 GiB of gpu0 memory, 60.8 GiB free of its 60.8 GiB limit`. When the memory is there but the room for KV cache kept in host RAM (an LMCache pool) is not, it says `host_kv` with the numbers and the setting to raise, for example `host spark: insufficient_capacity: host_kv (needs 20.0 GiB, limit 12.2 GiB; raise host.resource_policy.memory.system.host_kv_limit or lower lmcache_pool)`. | Stop or park another deployment, start with `--evict`, or lower the deployment's memory. For `host_kv`, raise the setting it names ([Standalone host-KV limit](../operations/configuration.md#standalone-host-kv-limit); on a machine of several, its document's `resource_policy.domains.<domain>.host_kv_limit`) or lower `lmcache_pool`. |
-| 4 | `insufficient_device_memory` | The card cannot hold the model, or another program holds its memory now. | Use a smaller or quantized checkpoint, a smaller KV cache, or free the card. vLLM needs a card of about 10 GiB or more. |
+| 4 | `insufficient_device_memory` | The card cannot hold the model, or another program holds its memory now. On a machine with several GPUs the message names the `tensor_parallel` whose share would fit each card and how many GPUs that needs, or says that no number of the machine's GPUs fits and gives the share per GPU at that number. | Use a smaller or quantized checkpoint, a smaller KV cache, free the card, or spread the model with the `topology` the message names ([One model on several GPUs](deploy.md#one-model-on-several-gpus)). vLLM needs a card of about 10 GiB or more. |
+| 4 | `insufficient_gpus` | No allowed machine has as many identical GPUs as `tensor_parallel`; the message names the number needed, each machine's count, and the `tensor_parallel` that would fit. | Lower `tensor_parallel`, use `topology: auto`, or place the model on a machine with more GPUs. |
 | 4 | `device_unobserved` | `nvidia-smi` gave no fresh reading for that GPU, so nothing new starts on it. | Check that `nvidia-smi` works on that machine, then retry. |
 | 4 | `rendezvous_ports_exhausted` | Every rendezvous port of the head machine's range is held by another group. | Stop a group on that machine, or widen `--rendezvous-ports`. |
 | 4 | `rendezvous_port_in_use:<port>` | Another program holds the rendezvous port on the head machine. CapyCTL picks another port on the next start. | Retry; if it persists, find the program holding the port. |
@@ -36,14 +38,17 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 4 | `host_tuning_missing:<item>` | With `require_rdma: true`, a machine lacks `memlock` (unlimited locked memory) or `infiniband` (read-write `/dev/infiniband/uverbs*`). | Fix the item as root on that machine, or set `require_rdma: false`. |
 | 5 | `unsupported` | The request is valid but this release cannot do it. | Read the message; it names the missing capability. |
 | 5 | `store_from_newer_version` | The state directory was written by a newer CapyCTL. | Run the newer binary, or restore a backup taken before the upgrade. |
-| 5 | `multi_gpu_unsupported` | The deployment names two GPUs on one machine. | Use one GPU per machine; to spread one model over machines, give it a `topology` and `placement.hosts`. |
+| 5 | `multi_gpu_unsupported` | The deployment names two or more GPUs without a `topology`, or asks for several GPUs on a machine with one unified-memory GPU (such as a GB10) or on an engine that runs on one GPU only (TensorFold, a custom engine). | Add `topology: {tensor_parallel: N}` with N the number of GPUs you named ([One model on several GPUs](deploy.md#one-model-on-several-gpus)); otherwise use one GPU, or several machines with `placement.hosts`. |
+| 5 | `multi_gpu_mixed_devices` | The GPUs a deployment names differ in product or memory. | Name identical GPUs (`nvidia-smi -L` shows them). |
+| 5 | `tensor_parallel_indivisible` | On vLLM or SGLang, `tensor_parallel` does not divide the model's attention heads; the message names the head count and the numbers that divide it. | Use one of the numbers the message names, or `topology: auto`. |
 | 5 | `unsupported_gpu_topology` | The machine has both an integrated and a discrete GPU. | Not supported in this release. |
 | 5 | `host_backed_unavailable` | `residency: host_backed` on unified memory. | Use `deep`, or leave `residency` out. |
 | 5 | `capability_missing`, `capability_missing:deep_park` | `--deep-park enabled` on an engine that cannot park (TensorFold, llama.cpp, a custom engine), or a deployment asking such an engine to park (`residency: deep` or `host_backed`). | Leave `--deep-park` out; use `residency: restart_only`. |
-| 5 | `group_shape_unsupported`, `group_shape_unsupported:<engine>` | More than one rank per machine, or a shape the engine cannot run (TensorFold runs `tensor_parallel: 2` on exactly two machines; a custom engine, `group_shape_unsupported:custom`, runs on one machine only). | Use one machine per rank and a shape the engine supports ([Groups across machines](engines.md#groups-across-machines)); for a custom engine, remove `topology` and use `instances` for more copies. |
-| 5 | `group_instances_unsupported` | `instances` above 1 with a `topology`. | Deploy one group per deployment. |
-| 5 | `group_drift:<field>` | The engine changed a multi-machine setting CapyCTL rendered (the field is named). | Report it; the engine build behaves differently from the one CapyCTL supports. |
+| 5 | `group_shape_unsupported`, `group_shape_unsupported:<engine>` | More than one rank per machine in a group, `pipeline_parallel` above 1 on one machine, or a shape the engine cannot run (TensorFold runs `tensor_parallel: 2` on exactly two machines; a custom engine, `group_shape_unsupported:custom`, runs on one machine only). | Use one machine per rank and a shape the engine supports ([Groups across machines](engines.md#groups-across-machines)); on one machine use `tensor_parallel` only; for a custom engine, remove `topology` and use `instances` for more copies. |
+| 5 | `group_instances_unsupported` | `instances` above 1 with a `topology` across machines. | Deploy one group per deployment. |
+| 5 | `group_drift:<field>`, `tp_drift:<field>` | The engine changed a multi-machine or multi-GPU setting CapyCTL rendered (the field is named). | Report it; the engine build behaves differently from the one CapyCTL supports. |
 | 5 | `host_capability_missing:engine_groups` | A machine runs a CapyCTL too old for groups. | Upgrade CapyCTL on that machine. |
+| 5 | `host_capability_missing:local_tensor_parallel` | A deployment with a `topology` on one machine names a machine that runs a CapyCTL too old to run a model on several GPUs; nothing was sent to it. | Upgrade CapyCTL on that machine. |
 | 5 | `capability_missing:decisions` | A deployment with `api: decisions` names an engine that cannot serve decision models: vLLM (any version: 0.32.0 answers Clef and Clef-Flash from their text output instead of their decision head), TensorFold, llama.cpp before 0.7.0, SGLang before 0.5.22, an installation whose registered build names no version, or a custom engine whose manifest says `api: chat`. | Use llama.cpp 0.7.0 or newer or SGLang 0.5.22 or newer, registered with `capyctl engine add`, or a custom engine with `api: decisions` ([Decision models](deploy.md#decision-models)). |
 | 5 | `capability_missing:chat` | A chat deployment (no `api`, or `api: chat`) names a custom engine whose manifest says `api: decisions`. | Add `api: decisions` to the deployment, or use a chat engine. |
 | 5 | `host_capability_missing:decisions` | A machine runs a CapyCTL too old for decision models. | Upgrade CapyCTL on that machine. |
@@ -127,6 +132,23 @@ A deployment on one machine can show these codes the same way:
   or `::1`; the message names the address and port. CapyCTL stops the engine
   and the start fails. Make the manifest's `args` bind the engine to
   `"{host}"` ([The listener check](engines.md#the-listener-check)).
+- `engine_listener_exposed` (a model on several GPUs): once the engine was
+  ready, or when CapyCTL checked it again later, one of its processes
+  listened on an address other than `127.0.0.1` or `::1`; the message names
+  the process, the address and the port. CapyCTL stops the engine and the
+  start fails. Report it: the engine build opened a listener CapyCTL does not
+  expect.
+- `tp_rank_unobserved` (a model on several GPUs): the engine did not show one
+  process of its own on each of its GPUs within the start window
+  (`timeouts.initialize`). The start fails and nothing is served half-started.
+- `engine_rank_exited` (a model on several GPUs): one of the engine's rank
+  processes exited; the message names the rank and its GPU. CapyCTL stops the
+  whole model, which reads `failed`, and keeps every GPU charged until all its
+  processes are gone. The next request or `capyctl start deployment <name>`
+  starts it on all its GPUs again.
+- `tp_stalled` (a model on several GPUs): a request got no first output within
+  `groups.stall_timeout` (120 s) and a check request failed too, which is what
+  a rank stuck between the GPUs looks like. CapyCTL stops the model.
 
 The inference endpoint answers HTTP errors with a JSON body holding `code` and
 `message` ([Make a request](requests.md); waiting errors are listed under
@@ -196,8 +218,11 @@ or its launch fails with `lmcache_unavailable:<reason>` (exit 5). The reasons:
 - `check_failed`: the launch-time check of the LMCache installation found
   something missing; the detail names it. Reinstall LMCache in the engine's
   environment and register the engine again.
-- `group_unsupported`: the deployment has a `topology`; a group across
-  machines does not use LMCache.
+- `group_unsupported`: the deployment has a `topology` across machines; a
+  group does not use LMCache.
+- `multi_gpu_unqualified`: the model runs on several GPUs of one machine;
+  LMCache is not yet qualified there. Under `topology: auto`, `lmcache:
+  required` keeps the model on one GPU instead.
 - `park_unqualified`: the deployment parks with `residency: deep` (or
   `host_backed` on a discrete GPU) on an engine version, model and GPU not
   qualified for LMCache. Use `residency: restart_only` to keep LMCache.

@@ -14,6 +14,7 @@ fn instance(index: u32, generation: i64, host: &str) -> ServingInstance {
         engine_exited: false,
         load: None,
         group: false,
+        local_tensor_parallel: 1,
     }
 }
 

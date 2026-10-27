@@ -446,7 +446,7 @@ fn the_selected_gpu_narrows_the_namespace_only_where_there_is_a_choice() {
         let effective = resolve_effective(&deployment, &host).unwrap();
         let plan = plan_from_effective(&effective, 8123, "l".into(), "/r".into()).unwrap();
         (
-            plan.cuda_namespace.clone(),
+            plan.cuda_namespaces.first().cloned(),
             render_command(&plan)
                 .unwrap()
                 .env

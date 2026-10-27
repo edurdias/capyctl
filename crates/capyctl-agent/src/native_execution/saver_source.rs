@@ -5,19 +5,27 @@
 //! private directory (`runtime/sglang_observation_enrollment.py`): a key-mode
 //! Unix socket `<binding>.sock` and a record `<binding>.json` naming the
 //! binding, incarnation, the scheduler's process identity and the saver
-//! library's path and digest. Each read here:
+//! library's path and digest. ADR 0035 §9: a launch on N > 1 GPUs runs one
+//! scheduler per GPU, rank r on CUDA ordinal r, and each enrolls its own map:
+//! rank 0 under the binding's names, rank r > 0 under `<binding>.rank<r>.json`
+//! and `<binding>.rank<r>.sock`. Each rank's read here:
 //!
-//! 1. takes the record only from the private directory (0700, this service
-//!    user) as an owner-only regular file, scoped to exactly this binding and
-//!    incarnation;
+//! 1. takes that rank's record only from the private directory (0700, this
+//!    service user) as an owner-only regular file, scoped to exactly this
+//!    binding and incarnation and naming that rank's own socket;
 //! 2. requires the enrolled scheduler to be one of the launch's recorded
-//!    processes (or, before a step names them, a live process of this boot);
+//!    processes (or, before a step names them, a live process of this boot),
+//!    and no two ranks to be the same process;
 //! 3. hashes the saver library itself, which must be the preload build inside
 //!    the launch's own installation, and calls the saver real only when that
 //!    digest is the one the scheduler reported;
 //! 4. asks the scheduler over the socket with the launch's observation key
 //!    (derived from its admin credential, so a restarted host still can), and
-//!    sums mapped and virtual saver bytes per tag on its single device.
+//!    sums mapped and virtual saver bytes per tag on its own device: the single
+//!    device of a launch on one GPU, device r for rank r of a launch on N.
+//!
+//! A launch on N GPUs is read whole: every rank, in rank order, and any rank
+//! unreadable makes the whole read unknown (ADR 0035 §9).
 //!
 //! Nothing here is release, restoration or readiness evidence by itself: the
 //! observers below fuse it with process liveness, quiescence and the step
@@ -49,6 +57,9 @@ const OBSERVE_ATTEMPTS: usize = 3;
 const MAX_RECORD_BYTES: u64 = 4096;
 const MAX_LIBRARY_BYTES: u64 = 64 * 1024 * 1024;
 const PRELOAD_PREFIX: &str = "torch_memory_saver_hook_mode_preload";
+/// ADR 0035 §9: the most ranks one launch reads (one scheduler per GPU of one
+/// host).
+const MAX_RANKS: u32 = 64;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,12 +107,16 @@ impl EnrolledSaver {
         Ok(())
     }
 
-    fn record(&self, binding: &str) -> Result<Record, SaverUnavailable> {
+    /// The record of one enrollment (`enrollment_name`), never any other path.
+    fn record(&self, name: &str) -> Result<Record, SaverUnavailable> {
+        if !enrollment(name) {
+            return Err(SaverUnavailable);
+        }
         self.private_dir()?;
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(self.dir.join(format!("{binding}.json")))
+            .open(self.dir.join(format!("{name}.json")))
             .map_err(|_| SaverUnavailable)?;
         let metadata = file.metadata().map_err(|_| SaverUnavailable)?;
         if !metadata.is_file()
@@ -134,6 +149,98 @@ fn unavailable(stage: &'static str) -> SaverUnavailable {
 /// A binding or incarnation is a ULID-shaped token; never a path.
 fn token(value: &str) -> bool {
     (1..=128).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// ADR 0035 §9: the enrollment name of one rank's scheduler, as
+/// `runtime/sglang_observation_enrollment.py` (`enrollment_name`) writes it:
+/// the binding itself for rank 0 (and every launch on one GPU), and
+/// `<binding>.rank<r>` for rank r of a launch on several GPUs.
+fn enrollment_name(binding: &str, rank: u32) -> String {
+    if rank == 0 {
+        binding.to_owned()
+    } else {
+        format!("{binding}.rank{rank}")
+    }
+}
+
+/// An enrollment name is a binding token, alone or with the fixed `.rank<r>`
+/// suffix of a rank in 1..MAX_RANKS written as `enrollment_name` writes it;
+/// never a path.
+fn enrollment(name: &str) -> bool {
+    match name.split_once(".rank") {
+        None => token(name),
+        Some((binding, rank)) => {
+            token(binding)
+                && rank.parse::<u32>().is_ok_and(|rank| {
+                    (1..MAX_RANKS).contains(&rank) && enrollment_name(binding, rank) == name
+                })
+        }
+    }
+}
+
+/// The record names exactly this launch and this enrollment's own socket.
+fn record_matches(record: &Record, scope: &SaverScope, name: &str) -> bool {
+    record.version == 1
+        && record.binding_id == scope.binding_id
+        && record.incarnation_id == scope.incarnation
+        && record.hook_mode == "preload"
+        && record.socket == format!("{name}.sock")
+        && record.library_sha256.len() == 64
+}
+
+/// The enrolled scheduler must be one of the launch's own recorded processes;
+/// before a step names them, a live process of this boot.
+fn enrolled_owner(
+    record: &Record,
+    scope: &SaverScope,
+) -> Result<ProcessIdentity, SaverUnavailable> {
+    let matches = |identity: &ProcessIdentity| {
+        identity.pid == record.owner.pid
+            && identity.start_ticks == record.owner.start_ticks
+            && identity.boot_id == record.owner.boot_id
+    };
+    match &scope.members {
+        Some(members) => members
+            .iter()
+            .find(|identity| matches(identity))
+            .cloned()
+            .ok_or_else(|| unavailable("owner_not_a_launch_member")),
+        None => {
+            let owner = ProcessIdentity {
+                role: "scheduler".into(),
+                pid: record.owner.pid,
+                start_ticks: record.owner.start_ticks,
+                boot_id: record.owner.boot_id.clone(),
+            };
+            if capyctl_launchers::process_absence::presence(&owner) != Presence::Alive {
+                return Err(unavailable("owner_not_alive"));
+            }
+            Ok(owner)
+        }
+    }
+}
+
+/// One rank's map covers its own GPU only. On one GPU, at most one device
+/// (the single-rank recipe: a spread map cannot prove release or
+/// restoration). ADR 0035 §9: on N GPUs the engine sees only the launch's
+/// GPUs in rank order (`base_gpu_id` 0, step 1), so rank r's scheduler runs on
+/// CUDA ordinal r and every allocation group of its map must be on device r.
+fn rank_devices(
+    devices: impl IntoIterator<Item = u32>,
+    ranks: u32,
+    rank: u32,
+) -> Result<(), SaverUnavailable> {
+    let devices = devices
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    if ranks <= 1 {
+        if devices.len() > 1 {
+            return Err(unavailable("multiple_devices"));
+        }
+    } else if devices.iter().any(|device| *device != rank) {
+        return Err(unavailable("rank_device"));
+    }
+    Ok(())
 }
 
 /// The saver library must be the preload build inside the launch's own
@@ -188,50 +295,66 @@ fn library_is_real(record: &Record, executable: &str) -> Result<bool, SaverUnava
     Ok(hex::encode(digest.finalize()) == record.library_sha256)
 }
 
-impl SaverResidency for EnrolledSaver {
-    fn mapped(&self, scope: &SaverScope) -> Result<SaverMapped, SaverUnavailable> {
-        if !token(&scope.binding_id) || !token(&scope.incarnation) {
+impl EnrolledSaver {
+    /// One rank's enrollment, bound to this launch: its record (named for
+    /// that rank, naming that rank's own socket) and its scheduler, a launch
+    /// member (or, with no members yet, alive). No socket is touched.
+    fn enrolled(
+        &self,
+        scope: &SaverScope,
+        rank: u32,
+    ) -> Result<(Record, ProcessIdentity), SaverUnavailable> {
+        if !token(&scope.binding_id)
+            || !token(&scope.incarnation)
+            || !(1..=MAX_RANKS).contains(&scope.ranks)
+            || rank >= scope.ranks
+        {
             return Err(SaverUnavailable);
         }
+        let name = enrollment_name(&scope.binding_id, rank);
         let record = self
-            .record(&scope.binding_id)
+            .record(&name)
             .map_err(|_| unavailable("record_unreadable"))?;
-        if record.version != 1
-            || record.binding_id != scope.binding_id
-            || record.incarnation_id != scope.incarnation
-            || record.hook_mode != "preload"
-            || record.socket != format!("{}.sock", scope.binding_id)
-            || record.library_sha256.len() != 64
-        {
+        if !record_matches(&record, scope, &name) {
             return Err(unavailable("record_mismatch"));
         }
-        let matches = |identity: &ProcessIdentity| {
-            identity.pid == record.owner.pid
-                && identity.start_ticks == record.owner.start_ticks
-                && identity.boot_id == record.owner.boot_id
-        };
-        // The enrolled scheduler must be one of the launch's own recorded
-        // processes; before a step names them, a live process of this boot.
-        let owner = match &scope.members {
-            Some(members) => members
-                .iter()
-                .find(|identity| matches(identity))
-                .cloned()
-                .ok_or_else(|| unavailable("owner_not_a_launch_member"))?,
-            None => {
-                let owner = ProcessIdentity {
-                    role: "scheduler".into(),
-                    pid: record.owner.pid,
-                    start_ticks: record.owner.start_ticks,
-                    boot_id: record.owner.boot_id.clone(),
-                };
-                if capyctl_launchers::process_absence::presence(&owner) != Presence::Alive {
-                    return Err(unavailable("owner_not_alive"));
-                }
-                owner
-            }
-        };
-        let real_saver = library_is_real(&record, &scope.executable)
+        let owner = enrolled_owner(&record, scope)?;
+        Ok((record, owner))
+    }
+
+    /// ADR 0035 §9: every rank's enrollment, in rank order, before any rank is
+    /// asked. Any rank missing or unbound makes the whole launch unknown, and
+    /// so does one process enrolled under two ranks: each GPU's scheduler is
+    /// its own process, so a shared owner is not every GPU's evidence.
+    fn enrolled_ranks(
+        &self,
+        scope: &SaverScope,
+    ) -> Result<Vec<(Record, ProcessIdentity)>, SaverUnavailable> {
+        if !(1..=MAX_RANKS).contains(&scope.ranks) {
+            return Err(unavailable("ranks"));
+        }
+        let enrolled = (0..scope.ranks)
+            .map(|rank| self.enrolled(scope, rank))
+            .collect::<Result<Vec<_>, _>>()?;
+        let owners = enrolled
+            .iter()
+            .map(|(_, owner)| (owner.pid, owner.start_ticks, owner.boot_id.as_str()))
+            .collect::<std::collections::BTreeSet<_>>();
+        if owners.len() != enrolled.len() {
+            return Err(unavailable("shared_owner"));
+        }
+        Ok(enrolled)
+    }
+
+    /// Ask one enrolled rank's scheduler for its map, on its own device.
+    fn observe_rank(
+        &self,
+        scope: &SaverScope,
+        rank: u32,
+        record: &Record,
+        owner: ProcessIdentity,
+    ) -> Result<SaverMapped, SaverUnavailable> {
+        let real_saver = library_is_real(record, &scope.executable)
             .map_err(|_| unavailable("library_unverifiable"))?;
         let key = capyctl_adapters::sglang::observation::observation_key(
             &scope.admin_key,
@@ -251,17 +374,11 @@ impl SaverResidency for EnrolledSaver {
             .find_map(|_| client.observe(OBSERVE_TIMEOUT).ok())
             .map_or_else(|| client.observe(OBSERVE_TIMEOUT), Ok)
             .map_err(|_| unavailable("observe"))?;
-        // The recipe is one device (TP=1): a spread map cannot prove per-rank
-        // release or restoration.
-        let devices = facts
-            .allocations
-            .groups
-            .iter()
-            .map(|g| g.device)
-            .collect::<std::collections::BTreeSet<_>>();
-        if devices.len() > 1 {
-            return Err(unavailable("multiple_devices"));
-        }
+        rank_devices(
+            facts.allocations.groups.iter().map(|g| g.device),
+            scope.ranks,
+            rank,
+        )?;
         let sum = |tag: AllocationTag, mapped: bool| {
             facts
                 .allocations
@@ -286,6 +403,32 @@ impl SaverResidency for EnrolledSaver {
         })
     }
 
+    /// One rank's whole read: its enrollment, then its map.
+    fn read_rank(&self, scope: &SaverScope, rank: u32) -> Result<SaverMapped, SaverUnavailable> {
+        let (record, owner) = self.enrolled(scope, rank)?;
+        self.observe_rank(scope, rank, &record, owner)
+    }
+}
+
+impl SaverResidency for EnrolledSaver {
+    fn mapped(&self, scope: &SaverScope) -> Result<SaverMapped, SaverUnavailable> {
+        // ADR 0035 §9: one rank's map is never a launch on several GPUs.
+        if scope.ranks > 1 {
+            return Err(unavailable("multiple_ranks"));
+        }
+        self.read_rank(scope, 0)
+    }
+
+    /// ADR 0035 §9: every rank's map, in rank order; any rank unreadable makes
+    /// the whole read unknown.
+    fn mapped_ranks(&self, scope: &SaverScope) -> Result<Vec<SaverMapped>, SaverUnavailable> {
+        self.enrolled_ranks(scope)?
+            .into_iter()
+            .zip(0u32..)
+            .map(|((record, owner), rank)| self.observe_rank(scope, rank, &record, owner))
+            .collect()
+    }
+
     fn observation_dir(&self) -> Option<&Path> {
         Some(&self.dir)
     }
@@ -298,19 +441,23 @@ impl SaverResidency for EnrolledSaver {
     }
 
     fn retire(&self, binding_id: &str) {
-        // Only this user's own record and socket for exactly that binding;
-        // anything else in the directory is left as it is.
+        // Only this user's own records and sockets for exactly that binding,
+        // every rank's (ADR 0035 §9); anything else in the directory is left
+        // as it is.
         if !token(binding_id) || self.private_dir().is_err() {
             return;
         }
-        for name in [format!("{binding_id}.json"), format!("{binding_id}.sock")] {
-            let path = self.dir.join(name);
-            let owned = std::fs::symlink_metadata(&path).is_ok_and(|m| {
-                use std::os::unix::fs::FileTypeExt;
-                m.uid() == Self::uid() && (m.is_file() || m.file_type().is_socket())
-            });
-            if owned {
-                let _ = std::fs::remove_file(path);
+        for rank in 0..MAX_RANKS {
+            let name = enrollment_name(binding_id, rank);
+            for file in [format!("{name}.json"), format!("{name}.sock")] {
+                let path = self.dir.join(file);
+                let owned = std::fs::symlink_metadata(&path).is_ok_and(|m| {
+                    use std::os::unix::fs::FileTypeExt;
+                    m.uid() == Self::uid() && (m.is_file() || m.file_type().is_socket())
+                });
+                if owned {
+                    let _ = std::fs::remove_file(path);
+                }
             }
         }
     }
@@ -333,11 +480,31 @@ pub(super) struct SaverFacts {
 /// ADR 0014 amendment A17: a launch whose weights stay resident is released
 /// when its KV cache is unmapped and its weights are still fully mapped; for
 /// it, released weights are the partial map.
+///
+/// ADR 0035 §9: `mapped` holds one map per rank (one per GPU), each judged
+/// alone as above. The park settles only when, on every chosen GPU, the
+/// weights and KV regions are unmapped; the wake only when they are mapped on
+/// every GPU. No ranks, any rank unjudgeable, or ranks that disagree (some
+/// resident, some released) are unknown. The saver is real only when every
+/// rank's is.
 pub(super) fn saver_facts(
-    mapped: &Result<SaverMapped, SaverUnavailable>,
+    mapped: &Result<Vec<SaverMapped>, SaverUnavailable>,
     resident_weights: bool,
 ) -> Option<SaverFacts> {
-    let mapped = mapped.as_ref().ok()?;
+    let (first, rest) = mapped.as_ref().ok()?.split_first()?;
+    let mut facts = rank_facts(first, resident_weights)?;
+    for rank in rest {
+        let next = rank_facts(rank, resident_weights)?;
+        if (next.resident, next.released) != (facts.resident, facts.released) {
+            return None;
+        }
+        facts.real_saver &= next.real_saver;
+    }
+    Some(facts)
+}
+
+/// One rank's map judged alone (one GPU's whole map).
+fn rank_facts(mapped: &SaverMapped, resident_weights: bool) -> Option<SaverFacts> {
     if mapped.weight_virtual_bytes == 0
         || mapped.kv_virtual_bytes == 0
         || mapped.weight_bytes > mapped.weight_virtual_bytes
@@ -390,18 +557,19 @@ impl LaunchSglangObserver {
         Self { saver, dir }
     }
 
-    async fn saver(&self, scope: SaverScope) -> Result<SaverMapped, SaverUnavailable> {
+    async fn saver(&self, scope: SaverScope) -> Result<Vec<SaverMapped>, SaverUnavailable> {
         read_saver(&self.saver, scope).await
     }
 }
 
 /// One saver read off the async threads: it hashes a file and waits on a socket.
+/// ADR 0035 §9: every rank's map, in rank order (one on one GPU).
 pub(super) async fn read_saver(
     saver: &Arc<dyn SaverResidency>,
     scope: SaverScope,
-) -> Result<SaverMapped, SaverUnavailable> {
+) -> Result<Vec<SaverMapped>, SaverUnavailable> {
     let saver = saver.clone();
-    tokio::task::spawn_blocking(move || saver.mapped(&scope))
+    tokio::task::spawn_blocking(move || saver.mapped_ranks(&scope))
         .await
         .map_err(|_| SaverUnavailable)?
 }
@@ -418,6 +586,7 @@ fn scope(
         members,
         admin_key: access.admin_key.into(),
         executable: access.executable.into(),
+        ranks: access.ranks,
     }
 }
 

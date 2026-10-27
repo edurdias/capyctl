@@ -160,6 +160,7 @@ fn frozen_restoring(endpoint: String, executable: &str, weight_restore: &str) ->
             checkpoint_revision: "cdbee75f17c01a7cc42f958dc650907174af0554".into(),
             rendered_settings_digest: "a".repeat(64),
             placement_digest: None,
+            devices: Vec::new(),
             device: capyctl_domain::launch::NativeDeviceSelection {
                 host_id: "host".into(),
                 hardware_fingerprint: "hardware-v1".into(),
@@ -257,6 +258,7 @@ fn plan() -> SingleLaunchPlan {
         startup_bytes: None,
         startup_host_bytes: None,
         lmcache: None,
+        devices: Vec::new(),
     }
 }
 
@@ -770,6 +772,7 @@ fn a_saver_read_that_misses_its_bound_is_read_again() {
         members: Some(enrolled_group(&enrolled)),
         admin_key: "admin-key".into(),
         executable: venv.executable.clone(),
+        ranks: 1,
     };
     let saver = super::super::EnrolledSaver::new(venv.observation.clone());
     enrolled.send("stall");
@@ -851,8 +854,90 @@ fn saver_scope_debug_never_formats_the_admin_key() {
         members: None,
         admin_key: "deadbeefsecret".into(),
         executable: "/venv/bin/python".into(),
+        ranks: 2,
     };
     let shown = format!("{scope:?}");
     assert!(shown.contains("binding"));
+    assert!(shown.contains("ranks: 2"));
     assert!(!shown.contains("deadbeefsecret"));
+}
+
+/// A saver source over a launch on several GPUs: one map per rank.
+struct RankSaver(Vec<SaverMapped>);
+impl SaverResidency for RankSaver {
+    fn mapped(&self, _scope: &SaverScope) -> Result<SaverMapped, SaverUnavailable> {
+        Err(SaverUnavailable)
+    }
+    fn mapped_ranks(&self, scope: &SaverScope) -> Result<Vec<SaverMapped>, SaverUnavailable> {
+        if usize::try_from(scope.ranks).ok() != Some(self.0.len()) {
+            return Err(SaverUnavailable);
+        }
+        Ok(self.0.clone())
+    }
+}
+
+/// One rank's whole map: every allocation of both tags mapped, or none.
+fn rank_map(mapped: bool) -> SaverMapped {
+    let bytes = if mapped { 1 << 20 } else { 0 };
+    SaverMapped {
+        real_saver: true,
+        weight_bytes: bytes,
+        kv_bytes: bytes,
+        weight_virtual_bytes: 1 << 20,
+        kv_virtual_bytes: 1 << 20,
+    }
+}
+
+/// The host's observer of a Park step on a launch on two GPUs, quiescent and
+/// with its recorded group alive, over the given per-rank maps.
+fn two_rank_observer(ranks: Vec<SaverMapped>) -> HostSglangObserver {
+    HostSglangObserver {
+        token: TransitionToken {
+            deployment_id: "deployment".into(),
+            revision: 1,
+            generation: 1,
+            operation_id: "operation".into(),
+            step_id: "park.park".into(),
+        },
+        scope: SaverScope {
+            binding_id: BINDING.into(),
+            incarnation: INCARNATION.into(),
+            members: Some(identities()),
+            admin_key: "admin-key".into(),
+            executable: "/opt/sglang/python".into(),
+            ranks: 2,
+        },
+        saver: Arc::new(RankSaver(ranks)),
+        live: Arc::new(|| Ok(identities())),
+        in_flight: Arc::new(|| Ok(0)),
+        idle: Arc::new(|| Box::pin(async { Ok(true) })),
+        content: content(RuntimeAction::Park),
+        calls: AtomicUsize::new(0),
+        resident_weights: false,
+    }
+}
+
+/// ADR 0035 §9: on a launch on two GPUs the host's observer settles a release
+/// only when every GPU's map shows it. One GPU released and the other still
+/// mapped is unknown (the park stays uncertain, never released); both
+/// released is released.
+// T46 T20
+#[tokio::test]
+async fn a_two_gpu_release_counts_only_when_every_rank_is_released() {
+    let split = two_rank_observer(vec![rank_map(false), rank_map(true)])
+        .observation()
+        .await;
+    assert!(split.unknown_work);
+    assert!(!split.allocations);
+    assert!(!split.real_memory_saver);
+    let released = two_rank_observer(vec![rank_map(false), rank_map(false)])
+        .observation()
+        .await;
+    assert!(!released.unknown_work);
+    assert!(!released.allocations);
+    assert!(released.real_memory_saver && released.quiesced);
+    let resident = two_rank_observer(vec![rank_map(true), rank_map(true)])
+        .observation()
+        .await;
+    assert!(!resident.unknown_work && resident.allocations);
 }

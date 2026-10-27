@@ -66,7 +66,7 @@ impl GroupRefusal {
 }
 
 /// Far above any hardware in hand, low enough that `world_size` never overflows.
-const MAX_DIMENSION: u64 = 64;
+pub(crate) const MAX_DIMENSION: u64 = 64;
 
 fn dimension(raw: &Value, key: &str) -> Result<u32, ConfigError> {
     match raw.get(key) {
@@ -94,6 +94,49 @@ pub(crate) fn declares_group(deployment: &Value) -> bool {
     })
 }
 
+/// ADR 0035 §1a: the value of `topology` that asks CapyCTL for the smallest
+/// tensor-parallel size that fits one host's identical GPUs.
+pub const AUTO: &str = "auto";
+
+/// ADR 0035 §1, §1a: a topology on one host, which is not a group: a stated
+/// world size above one without two or more `placement.hosts` (`Fixed`), or
+/// `topology: auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalTopology {
+    Fixed(Topology),
+    Auto,
+}
+
+/// ADR 0035 §13: the closed codes of a model on several GPUs of one host,
+/// led into a refusal's detail as `<code>: ...`.
+pub const TOPOLOGY_DEVICES_MISMATCH: &str = "topology_devices_mismatch";
+pub const MULTI_GPU_UNSUPPORTED: &str = "multi_gpu_unsupported";
+pub const MULTI_GPU_MIXED_DEVICES: &str = "multi_gpu_mixed_devices";
+pub const TENSOR_PARALLEL_INDIVISIBLE: &str = "tensor_parallel_indivisible";
+pub const INSUFFICIENT_GPUS: &str = "insufficient_gpus";
+/// ADR 0035 §11: the ADR 0017 capability a host declares when it takes a
+/// launch on several of its GPUs (`capyctl_protocol::capabilities` names the
+/// same string), and the placement refusal of a host that does not.
+pub const LOCAL_TP_CAPABILITY: &str = "local_tensor_parallel";
+pub const LOCAL_TP_CAPABILITY_MISSING: &str = "host_capability_missing:local_tensor_parallel";
+
+fn named_hosts(spec: &InstanceSpec) -> usize {
+    spec.placement.hosts.as_ref().map_or(0, Vec::len)
+}
+
+/// `topology` as a string: `auto`, else refused.
+fn auto_value(raw: &Value) -> Result<Option<()>, ConfigError> {
+    match raw {
+        Value::String(text) if text == AUTO => Ok(Some(())),
+        Value::Object(_) => Ok(None),
+        _ => Err(GroupRefusal::TopologyInvalid.at(
+            "topology",
+            "is a mapping of tensor_parallel and pipeline_parallel, or `auto`",
+        )),
+    }
+}
+
 pub fn parse_group_shape(
     deployment: &Value,
     spec: &InstanceSpec,
@@ -101,12 +144,26 @@ pub fn parse_group_shape(
     let Some(raw) = deployment.get("topology").filter(|v| !v.is_null()) else {
         return Ok(None);
     };
+    if auto_value(raw)?.is_some() {
+        // ADR 0035 §1a: a group's shape is the operator's.
+        if named_hosts(spec) >= 2 {
+            return Err(GroupRefusal::TopologyInvalid.at(
+                "topology",
+                "`auto` chooses a size on one host; a group over two or more placement.hosts \
+                 states its tensor_parallel and pipeline_parallel",
+            ));
+        }
+        return Ok(None);
+    }
     let topology = Topology {
         tensor_parallel: dimension(raw, "tensor_parallel")?,
         pipeline_parallel: dimension(raw, "pipeline_parallel")?,
     };
     // ADR 0028 §2: world size 1 is the single-host path, no group rules.
-    if topology.world_size() == 1 {
+    // ADR 0035 §1: so is a world size above 1 without two or more named
+    // hosts, one instance on several GPUs of one host
+    // ([`parse_local_topology`]).
+    if topology.world_size() == 1 || named_hosts(spec) < 2 {
         return Ok(None);
     }
     // ADR 0028 §2 (owner decision 8): named hosts only, head first.
@@ -119,12 +176,7 @@ pub fn parse_group_shape(
         return Err(GroupRefusal::PlacementRequired
             .at("placement", "a group lists exact hosts only, head first"));
     }
-    let Some(hosts) = spec.placement.hosts.clone().filter(|h| h.len() >= 2) else {
-        return Err(GroupRefusal::PlacementRequired.at(
-            "placement.hosts",
-            "a group names at least two hosts, head first",
-        ));
-    };
+    let hosts = spec.placement.hosts.clone().unwrap_or_default();
     if hosts.iter().any(|h| h.trim() != h) {
         return Err(GroupRefusal::TopologyInvalid
             .at("placement.hosts", "host names have no surrounding space"));
@@ -155,12 +207,68 @@ pub fn parse_group_shape(
     }))
 }
 
-/// ADR 0028 §2: standalone is one host, so it cannot run a group.
+/// Whether the document asks for `topology: auto` (read as written, before
+/// any validation).
+pub(crate) fn declares_auto(deployment: &Value) -> bool {
+    deployment["topology"].as_str() == Some(AUTO)
+}
+
+/// ADR 0035 §1: the tensor-parallel size a document asks of one host, when
+/// above one, read as written: a stated `tensor_parallel` beside fewer than
+/// two `placement.hosts`. Validation is [`parse_local_topology`]'s.
+pub(crate) fn declared_local_size(deployment: &Value) -> Option<u32> {
+    let named = deployment["placement"]["hosts"]
+        .as_array()
+        .map_or(0, Vec::len);
+    let size = deployment["topology"]["tensor_parallel"].as_u64()?;
+    (named < 2 && (2..=MAX_DIMENSION).contains(&size)).then_some(size as u32)
+}
+
+/// ADR 0035 §1, §1a: the topology of a deployment that is not a group, one
+/// host's: `topology: auto`, or a world size above one without two or more
+/// `placement.hosts`. `None` for a world size of one, for no `topology` and
+/// for a group ([`parse_group_shape`] judges those).
+pub fn parse_local_topology(
+    deployment: &Value,
+    spec: &InstanceSpec,
+) -> Result<Option<LocalTopology>, ConfigError> {
+    let Some(raw) = deployment.get("topology").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    if named_hosts(spec) >= 2 {
+        return Ok(None);
+    }
+    if auto_value(raw)?.is_some() {
+        return Ok(Some(LocalTopology::Auto));
+    }
+    let topology = Topology {
+        tensor_parallel: dimension(raw, "tensor_parallel")?,
+        pipeline_parallel: dimension(raw, "pipeline_parallel")?,
+    };
+    Ok((topology.world_size() > 1).then_some(LocalTopology::Fixed(topology)))
+}
+
+/// ADR 0028 §2: standalone is one host, so it cannot run a group. ADR 0035
+/// §1: a topology on one host (no `placement.hosts`, or one), and `auto`,
+/// are accepted.
 pub fn refuse_in_standalone(deployment: &Value) -> Result<(), ConfigError> {
+    let named = deployment["placement"]["hosts"]
+        .as_array()
+        .map_or(0, Vec::len);
+    if named < 2 {
+        return Ok(());
+    }
+    if deployment["topology"].as_str() == Some(AUTO) {
+        return Err(GroupRefusal::TopologyInvalid.at(
+            "topology",
+            "`auto` chooses a size on one host; a group over two or more placement.hosts \
+             states its tensor_parallel and pipeline_parallel",
+        ));
+    }
     if declares_group(deployment) {
         return Err(GroupRefusal::PlacementRequired.at(
             "topology",
-            "standalone is one host; a group needs at least two",
+            "standalone is one host and cannot run a group over several placement.hosts",
         ));
     }
     Ok(())

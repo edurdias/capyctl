@@ -384,6 +384,12 @@ fn resolve_on_host(
             "parsers": capyctl_config::parsers::parsers_for_effective(&effective),
         },
     });
+    // ADR 0035 §1, §1a: the GPUs, the per-GPU charge and, under `auto`, the
+    // candidate table and the size this host would choose now (offline, no
+    // measured peak).
+    if let Some(view) = capyctl_config::effective::topology_view(&effective, &|_| None) {
+        out["effective"]["topology"] = view;
+    }
     if provisional {
         unknown_until_measured(&mut out["effective"], &effective);
     }

@@ -345,10 +345,14 @@ fn effective(
     fence: &DeploymentFence,
 ) -> Result<(String, EffectiveDeployment), LifecycleError> {
     // ADR 0013 §4: an instance runs the revision as resolved on its placed
-    // host, and (ADR 0019) on the GPU it was placed on there.
+    // host, and (ADR 0019) on the GPU it was placed on there, or (ADR 0035
+    // §2) on its GPU set.
     let (host, device): (Option<String>, Option<String>) = tx
         .query_row(
-            "SELECT host_id,device FROM deployment_instances WHERE deployment_id=?1 AND generation=?2",
+            &format!(
+                "SELECT host_id,{} FROM deployment_instances WHERE deployment_id=?1 AND generation=?2",
+                crate::instances::INSTANCE_DEVICE_KEY
+            ),
             params![fence.deployment_id, fence.generation],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -1188,6 +1192,7 @@ pub(crate) fn arm_with_context(
         context.observations,
         residents,
         &crate::resident_floors::domain_kinds(&policy.controls),
+        &crate::resident_floors::domain_devices(&policy),
     )?;
     let context = AdmissionContext {
         resident_floors: &floors,
@@ -1579,3 +1584,6 @@ fn event(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod multi_gpu_tests;

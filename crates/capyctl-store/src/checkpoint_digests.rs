@@ -802,7 +802,10 @@ impl crate::Store {
             // ADR 0013 §3: every host the revision resolved on was frozen with
             // the same placeholder; each is re-resolved with the same
             // measured facts. A multi-GPU host's own row is its first GPU
-            // that still resolves.
+            // that still resolves. ADR 0035 §1a: a `topology: auto` host's
+            // own row is re-resolved from itself, so its candidate table is
+            // sized from the measured weights; each set of each size beside
+            // it is re-resolved above, and one they no longer fit is dropped.
             let hosts: Vec<(String, String)> = tx
                 .prepare("SELECT host_id,effective_json FROM host_effective_revisions WHERE deployment_id=?1 AND revision=?2 AND outcome='resolved' ORDER BY host_id")?
                 .query_map(params![deployment, revision], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -810,7 +813,9 @@ impl crate::Store {
             let any_hosts = !hosts.is_empty();
             let mut canonical: Option<EffectiveDeployment> = None;
             for (host, frozen_json) in hosts {
-                let resolved = if multi_gpu.contains(&host) {
+                let auto = serde_json::from_str::<serde_json::Value>(&frozen_json)
+                    .is_ok_and(|frozen| frozen["topology"]["auto"].is_object());
+                let resolved = if multi_gpu.contains(&host) && !auto {
                     on_devices
                         .get(&host)
                         .and_then(|resolved| resolved.first())
@@ -907,7 +912,11 @@ impl crate::Store {
                     } else {
                         error.to_string()
                     };
-                    let diagnostic = capyctl_domain::diagnostics::bound_chars(&reason, 512);
+                    // ADR 0035 §§1, 13: a refusal for device memory names
+                    // what would fit after its own reason (the per-GPU charge
+                    // and the cards that would hold it), so the bound keeps
+                    // the whole hint.
+                    let diagnostic = capyctl_domain::diagnostics::bound_chars(&reason, 1024);
                     tx.execute(
                         "UPDATE checkpoint_digests SET state='unusable',digest=?3,host_id=?4,diagnostic=?6,updated_at_ms=?5,provenance=?7 WHERE deployment_id=?1 AND revision=?2",
                         params![deployment, revision, digest, host_id, now_ms, diagnostic, provenance.code()],

@@ -11,7 +11,7 @@ from unittest import mock
 
 from runtime import sglang_entry as entry
 from runtime import sglang_server_args as mapping
-from test_sglang_entry import LaunchFixture, group_public
+from test_sglang_entry import LaunchFixture, group_public, public_settings
 
 GIB = 1 << 30
 # A 128 GiB unified-memory baseline: the fixture's 8 GiB static share is 0.0625.
@@ -722,6 +722,116 @@ class GroupModeTests(LaunchFixture, unittest.TestCase):
         self.assertEqual((captured["tp_size"], captured["nnodes"], captured["node_rank"],
                           captured["pp_size"], captured["dist_init_addr"]), (1, 1, 0, 1, None))
         self.assertEqual(captured["api_key"], self.inference.decode())
+
+
+def tp_public(count=2):
+    """ADR 0035 §4: a launch on `count` GPUs of one host, rank r on gpu<r>."""
+    public = public_settings()
+    public["devices"] = [dict(public["device"], device_id="gpu%d" % rank)
+                         for rank in range(count)]
+    return public
+
+
+class LocalTensorParallelTests(LaunchFixture, unittest.TestCase):
+    UUIDS = ("GPU-selected", "GPU-second")
+
+    def setUp(self):
+        super().setUp()
+        self.public = tp_public()
+
+    def placement(self, **changes):
+        observation = mapping.ObservedPlacement(
+            binding_id=self.public["binding_id"], incarnation=self.public["incarnation"],
+            host_id="host-a", hardware_fingerprint="hardware-v1",
+            device_id="gpu0", memory_domain="uma", physical_gpu_uuid="GPU-selected",
+            cuda_visible_uuids=self.UUIDS, cuda_index=0, device_ids=("gpu0", "gpu1"))
+        return replace(observation, **changes)
+
+    def kwargs(self, constructor=synthetic_constructor):
+        captured = {}
+
+        def recording(**kwargs):
+            captured.update(kwargs)
+            return constructor(**kwargs)
+        recording.add_cli_args = SyntheticArgs.add_cli_args
+        recording.__struct_fields__ = SyntheticArgs.__struct_fields__
+        construct(self.build(), self.placement(), recording).revalidate()
+        return captured
+
+    # T46 (ADR 0035 §4): tp_size is the descriptor's GPU count, rank r on the
+    # r-th visible GPU (base 0, step 1); data, pipeline and expert parallel
+    # and DP attention keep their single-host constants.
+    def test_tp_size_and_base_come_from_the_device_list(self):
+        args = self.kwargs()
+        self.assertEqual(
+            {field: args[field] for field in mapping.TP_FIELDS},
+            {"tp_size": 2, "base_gpu_id": 0, "gpu_id_step": 1, "dp_size": 1, "pp_size": 1,
+             "ep_size": 1, "enable_dp_attention": False, "nnodes": 1})
+        self.public = tp_public(4)
+        self.UUIDS = ("GPU-selected", "GPU-b", "GPU-c", "GPU-d")
+        captured = {}
+
+        def recording(**kwargs):
+            captured.update(kwargs)
+            return synthetic_constructor(**kwargs)
+        recording.add_cli_args = SyntheticArgs.add_cli_args
+        construct(self.build(), self.placement(device_ids=("gpu0", "gpu1", "gpu2", "gpu3")),
+                  recording).revalidate()
+        self.assertEqual(captured["tp_size"], 4)
+
+    # T46: any tensor-parallel field SGLang's resolution changes is refused by name.
+    def test_tp_drift_is_refused_by_field(self):
+        for field, replacement in (("tp_size", 1), ("tp_size", 4), ("base_gpu_id", 1),
+                                   ("gpu_id_step", 2), ("dp_size", 2), ("pp_size", 2),
+                                   ("ep_size", 2), ("enable_dp_attention", True),
+                                   ("nnodes", 2)):
+            def drifted(**kwargs):
+                effective = synthetic_constructor(**kwargs)
+                effective.resolve_once()
+                effective.resolve_once = lambda: None
+                setattr(effective, field, replacement)
+                return effective
+            drifted.add_cli_args = SyntheticArgs.add_cli_args
+            with self.subTest(field=field, replacement=replacement), \
+                    self.assertRaises(mapping.ServerArgsError) as ctx:
+                self.kwargs(drifted)
+            self.assertEqual(ctx.exception.code, "tp_drift:" + field)
+
+    # T46 T22 (ADR 0035 §4): the observed namespace must list the plan's GPUs
+    # in rank order from index 0.
+    def test_device_list_drift_is_refused(self):
+        for changes in ({"device_ids": ("gpu1", "gpu0")}, {"device_ids": ("gpu0",)},
+                        {"device_ids": ()},
+                        {"cuda_visible_uuids": ("GPU-other", "GPU-selected"), "cuda_index": 1},
+                        {"cuda_visible_uuids": ("GPU-selected", "GPU-second", "GPU-third")}):
+            with self.subTest(changes=changes), self.assertRaises(mapping.ServerArgsError) as ctx:
+                construct(self.build(), self.placement(**changes),
+                          lambda **kw: self.fail("constructor reached"))
+            self.assertEqual(ctx.exception.code, "tp_drift:devices")
+        # One GPU with a device list observed is no placement of it.
+        self.public = public_settings()
+        with self.assertRaises(mapping.ServerArgsError) as ctx:
+            construct(self.build(), MappingTests.placement(self, device_ids=("gpu0", "gpu1")),
+                      lambda **kw: self.fail("constructor reached"))
+        self.assertEqual(ctx.exception.code, "placement_mismatch")
+
+    # T46 (ADR 0035 §§4, 12): the descriptor's list is 2 to 64 distinct GPUs of
+    # one host, rank 0 its device, never beside a group.
+    def test_malformed_device_lists_are_refused(self):
+        device = self.public["device"]
+        for devices in ([device], [dict(device, device_id="gpu1"), device],
+                        [device, device], [device, dict(device, host_id="host-b",
+                                                        device_id="gpu1")],
+                        [device, dict(device, device_id="gpu 1")], "gpu0,gpu1",
+                        [dict(device, device_id="gpu%d" % n) for n in range(65)]):
+            public = tp_public()
+            public["devices"] = devices
+            with self.subTest(devices=devices), self.assertRaises(entry.LaunchError):
+                self.build(self.argv(public), self.payloads(public))
+        public = group_public(0)
+        public["devices"] = tp_public()["devices"]
+        with self.assertRaises(entry.LaunchError):
+            self.build(self.argv(public), self.payloads(public))
 
 
 if __name__ == "__main__":

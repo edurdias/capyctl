@@ -160,6 +160,7 @@ fn frozen_with(endpoint: String, weight_restore: &str) -> NativeLaunch {
             checkpoint_revision: "cdbee75f17c01a7cc42f958dc650907174af0554".into(),
             rendered_settings_digest: "a".repeat(64),
             placement_digest: None,
+            devices: Vec::new(),
             device: capyctl_domain::launch::NativeDeviceSelection {
                 host_id: "host".into(),
                 hardware_fingerprint: "hardware-v1".into(),
@@ -401,16 +402,259 @@ fn weights_left_mapped_count_as_released_only_when_they_stay_resident() {
         weight_virtual_bytes: 1 << 20,
         kv_virtual_bytes: 1 << 20,
     };
-    let mapped = Ok(kept);
+    let mapped = Ok(vec![kept]);
     assert!(saver_facts(&mapped, false).is_none());
     assert!(saver_facts(&mapped, true).is_some_and(|f| f.released && !f.resident));
     // Weights released under a resident launch are not its park either.
-    let gone = Ok(SaverMapped {
+    let gone = Ok(vec![SaverMapped {
         weight_bytes: 0,
         ..kept
-    });
+    }]);
     assert!(saver_facts(&gone, true).is_none());
     assert!(saver_facts(&gone, false).is_some_and(|f| f.released));
+}
+
+/// One rank's whole map: every allocation of both tags mapped, or none.
+fn rank_map(real_saver: bool, mapped: bool) -> SaverMapped {
+    let bytes = if mapped { 1 << 20 } else { 0 };
+    SaverMapped {
+        real_saver,
+        weight_bytes: bytes,
+        kv_bytes: bytes,
+        weight_virtual_bytes: 1 << 20,
+        kv_virtual_bytes: 1 << 20,
+    }
+}
+
+/// ADR 0035 §9: the park settles only when every GPU's map is released, the
+/// wake only when every GPU's is mapped; no ranks, a rank that cannot be
+/// judged, or ranks that disagree are unknown, and the saver is real only
+/// when every rank's is.
+// T46 T20
+#[test]
+fn saver_facts_settle_only_when_every_rank_agrees() {
+    let (released, resident) = (rank_map(true, false), rank_map(true, true));
+    assert!(saver_facts(&Ok(vec![released, released]), false)
+        .is_some_and(|f| f.released && !f.resident && f.real_saver));
+    assert!(saver_facts(&Ok(vec![resident, resident]), false)
+        .is_some_and(|f| f.resident && !f.released && f.real_saver));
+    // One GPU released, the other still mapped.
+    assert_eq!(saver_facts(&Ok(vec![released, resident]), false), None);
+    assert_eq!(saver_facts(&Ok(vec![resident, released]), false), None);
+    // One rank with no weights pool at all.
+    let unjudgeable = SaverMapped {
+        weight_bytes: 0,
+        weight_virtual_bytes: 0,
+        ..released
+    };
+    assert_eq!(saver_facts(&Ok(vec![released, unjudgeable]), false), None);
+    assert_eq!(saver_facts(&Err(SaverUnavailable), false), None);
+    assert_eq!(saver_facts(&Ok(Vec::new()), false), None);
+    // One rank's saver is a stand-in.
+    assert!(
+        saver_facts(&Ok(vec![resident, rank_map(false, true)]), false)
+            .is_some_and(|f| f.resident && !f.real_saver)
+    );
+}
+
+/// A private observation directory (0700), as the role creates it.
+fn private_dir() -> (tempfile::TempDir, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("observation");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    (root, dir)
+}
+
+/// A recorded scheduler process (never read for liveness: the scope names it).
+fn scheduler(pid: u32) -> ProcessIdentity {
+    ProcessIdentity {
+        role: format!("worker-{pid}"),
+        pid,
+        start_ticks: 100 + u64::from(pid),
+        boot_id: "boot".into(),
+    }
+}
+
+/// One enrollment record, owner-only, as the enrollment writes it.
+fn write_record(dir: &Path, name: &str, socket: &str, pid: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let owner = scheduler(pid);
+    let path = dir.join(format!("{name}.json"));
+    let record = serde_json::json!({
+        "version": 1,
+        "binding_id": BINDING,
+        "incarnation_id": INCARNATION,
+        "owner": {"pid": owner.pid, "start_ticks": owner.start_ticks, "boot_id": owner.boot_id},
+        "library_path": "/opt/sglang/lib/python3.12/site-packages/torch_memory_saver_hook_mode_preload.so",
+        "library_sha256": "a".repeat(64),
+        "hook_mode": "preload",
+        "socket": socket,
+    });
+    std::fs::write(&path, record.to_string()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// A launch on `ranks` GPUs whose recorded schedulers are pids 31 and 32.
+fn ranks_scope(ranks: u32) -> SaverScope {
+    SaverScope {
+        binding_id: BINDING.into(),
+        incarnation: INCARNATION.into(),
+        members: Some(vec![scheduler(31), scheduler(32)]),
+        admin_key: "admin-key".into(),
+        executable: "/opt/sglang/bin/python".into(),
+        ranks,
+    }
+}
+
+/// ADR 0035 §9: an enrollment is the binding itself (rank 0) or the binding
+/// with the fixed `.rank<r>` suffix the enrollment writes; nothing else is
+/// ever opened.
+// T46 T20
+#[test]
+fn enrollment_names_are_the_binding_and_a_fixed_rank_suffix() {
+    assert_eq!(enrollment_name(BINDING, 0), BINDING);
+    assert_eq!(enrollment_name(BINDING, 3), format!("{BINDING}.rank3"));
+    assert!(enrollment(BINDING));
+    assert!(enrollment(&format!("{BINDING}.rank63")));
+    for name in [
+        "../escape".to_owned(),
+        format!("{BINDING}.rank0"),
+        format!("{BINDING}.rank01"),
+        format!("{BINDING}.rank+1"),
+        format!("{BINDING}.rank64"),
+        format!("{BINDING}.rank"),
+        format!("{BINDING}.rank1.json"),
+        format!("../{BINDING}.rank1"),
+    ] {
+        assert!(!enrollment(&name), "{name}");
+    }
+}
+
+/// ADR 0035 §9: a launch on two GPUs is bound rank by rank before any socket
+/// is asked: rank 1's record is `<binding>.rank1.json`, names rank 1's own
+/// socket and is enrolled by a recorded scheduler other than rank 0's.
+/// Anything else makes the whole read unknown. (The socket read itself needs
+/// a live enrolled scheduler per rank, which the fixture enrolls as rank 0
+/// only; the record, owner and device checks are proven here.)
+// T46 T20
+#[test]
+fn every_rank_is_bound_to_its_own_enrollment() {
+    let (_root, dir) = private_dir();
+    let saver = EnrolledSaver::new(dir.clone());
+    let rank1 = format!("{BINDING}.rank1");
+    write_record(&dir, BINDING, &format!("{BINDING}.sock"), 31);
+    assert!(saver
+        .enrolled_ranks(&ranks_scope(1))
+        .is_ok_and(|enrolled| enrolled.len() == 1));
+    // One rank's map is never a launch on two GPUs.
+    assert!(saver.mapped(&ranks_scope(2)).is_err());
+    // Rank 1 never enrolled.
+    assert!(saver.enrolled_ranks(&ranks_scope(2)).is_err());
+    assert!(saver.mapped_ranks(&ranks_scope(2)).is_err());
+    // Rank 1's record names rank 0's socket.
+    write_record(&dir, &rank1, &format!("{BINDING}.sock"), 32);
+    assert!(saver.enrolled_ranks(&ranks_scope(2)).is_err());
+    // Rank 1 enrolled by rank 0's own scheduler.
+    write_record(&dir, &rank1, &format!("{rank1}.sock"), 31);
+    assert!(saver.enrolled_ranks(&ranks_scope(2)).is_err());
+    // Rank 1 enrolled by a process outside the launch.
+    write_record(&dir, &rank1, &format!("{rank1}.sock"), 33);
+    assert!(saver.enrolled_ranks(&ranks_scope(2)).is_err());
+    // Its own record, socket and scheduler: bound, in rank order.
+    write_record(&dir, &rank1, &format!("{rank1}.sock"), 32);
+    let enrolled = saver.enrolled_ranks(&ranks_scope(2)).unwrap();
+    assert_eq!(
+        enrolled
+            .iter()
+            .map(|(record, owner)| (record.socket.clone(), owner.pid))
+            .collect::<Vec<_>>(),
+        [
+            (format!("{BINDING}.sock"), 31),
+            (format!("{rank1}.sock"), 32)
+        ]
+    );
+    // A third rank that never enrolled, and rank counts out of bounds.
+    for ranks in [0, 3, 65] {
+        assert!(
+            saver.enrolled_ranks(&ranks_scope(ranks)).is_err(),
+            "{ranks}"
+        );
+    }
+}
+
+/// ADR 0035 §9: rank r's scheduler runs on CUDA ordinal r, so each rank's map
+/// must be on its own GPU; on one GPU, at most one device as before.
+// T46 T20
+#[test]
+fn each_ranks_map_is_on_its_own_gpu() {
+    assert!(rank_devices([0], 2, 0).is_ok());
+    assert!(rank_devices([1], 2, 1).is_ok());
+    // Rank 1's map on rank 0's GPU.
+    assert!(rank_devices([0], 2, 1).is_err());
+    assert!(rank_devices([1, 0], 2, 1).is_err());
+    // No allocations is no device to disagree with; `saver_facts` finds no
+    // pools in it and calls it unknown.
+    assert!(rank_devices(Vec::<u32>::new(), 2, 1).is_ok());
+    assert!(rank_devices([0], 1, 0).is_ok());
+    assert!(rank_devices([0, 1], 1, 0).is_err());
+}
+
+/// ADR 0035 §9: a proven-gone launch's every rank's record and socket go, and
+/// nothing else in the directory: another launch's, a name outside the rank
+/// range, or an unrelated file.
+// T46 T20
+#[test]
+fn retiring_a_launch_removes_every_ranks_enrollment_only() {
+    let (_root, dir) = private_dir();
+    let records = [
+        format!("{BINDING}.json"),
+        format!("{BINDING}.rank1.json"),
+        format!("{BINDING}.rank63.json"),
+    ];
+    let foreign = [
+        format!("{INCARNATION}.json"),
+        format!("{INCARNATION}.rank1.json"),
+        format!("{BINDING}.rank64.json"),
+        format!("{BINDING}.rank01.json"),
+        "notes.txt".to_owned(),
+    ];
+    for name in records.iter().chain(&foreign) {
+        std::fs::write(dir.join(name), "{}").unwrap();
+    }
+    let sockets = [format!("{BINDING}.sock"), format!("{BINDING}.rank1.sock")]
+        .map(|name| std::os::unix::net::UnixListener::bind(dir.join(name)).unwrap());
+    EnrolledSaver::new(dir.clone()).retire(BINDING);
+    drop(sockets);
+    let mut left = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    left.sort();
+    let mut expected = foreign.to_vec();
+    expected.sort();
+    assert_eq!(left, expected);
+}
+
+/// A saver source that reads one map only.
+struct OneMap;
+impl SaverResidency for OneMap {
+    fn mapped(&self, _scope: &SaverScope) -> Result<SaverMapped, SaverUnavailable> {
+        Ok(rank_map(true, true))
+    }
+}
+
+/// ADR 0035 §9: a source that reads one map cannot prove a launch on several
+/// GPUs, so by default its per-rank read fails closed there.
+// T46 T20
+#[test]
+fn a_one_map_source_never_reads_a_launch_on_several_gpus() {
+    assert!(OneMap.mapped_ranks(&ranks_scope(2)).is_err());
+    assert_eq!(
+        OneMap.mapped_ranks(&ranks_scope(1)).ok(),
+        Some(vec![rank_map(true, true)])
+    );
 }
 
 /// W5: an embedded launch with engine work, or with no enrolled observation,

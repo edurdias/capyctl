@@ -627,6 +627,7 @@ impl World {
                         startup_bytes: None,
                         startup_host_bytes: None,
                         lmcache: None,
+                        devices: Vec::new(),
                     },
                 },
             };
@@ -891,7 +892,7 @@ fn member_host(
         Some(
             group_pids(leader)
                 .into_iter()
-                .map(|pid| (pid, bytes))
+                .map(|pid| (pid, "gpu0".to_owned(), bytes))
                 .collect(),
         )
     });

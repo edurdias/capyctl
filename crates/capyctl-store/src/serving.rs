@@ -45,6 +45,11 @@ pub struct ServingInstanceRow {
     /// ADR 0028 §9, §11: this incarnation is a multi-node group, served at
     /// its head's ingress (the router watches its requests' first token).
     pub group: bool,
+    /// ADR 0035 §§2, 7: the number of GPUs of its host this incarnation
+    /// runs on (its placed device list); 1 on one GPU and for a group. Above
+    /// 1, the router watches each request's first token (ADR 0028 §11's
+    /// stall rule) as for a group.
+    pub local_tensor_parallel: u32,
 }
 
 /// ADR 0032 §1, §2: what decides whether a retained binding's lane carries
@@ -87,7 +92,8 @@ impl crate::Store {
                             JOIN journal_entries j ON j.operation_id=o.id
                       WHERE x.binding_id=b.id AND o.kind='initialize' AND j.state='engine_exited'),
                     EXISTS(SELECT 1 FROM group_plans g WHERE g.deployment_id=i.deployment_id
-                      AND g.instance_index=i.instance_index AND g.generation=i.generation)
+                      AND g.instance_index=i.instance_index AND g.generation=i.generation),
+                    COALESCE(json_array_length(i.device_json),0)
                FROM deployment_instances i
                JOIN deployments d ON d.id=i.deployment_id
                JOIN runtime_bindings b ON b.deployment_id=i.deployment_id
@@ -112,6 +118,7 @@ impl crate::Store {
                     dispatch_open: r.get(8)?,
                     engine_exited: r.get(9)?,
                     group: r.get(10)?,
+                    local_tensor_parallel: r.get::<_, u32>(11)?.max(1),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -156,11 +163,12 @@ impl crate::Store {
     pub fn lane_engine(&self, binding_id: &str) -> Result<Option<LaneEngine>, LifecycleError> {
         // Read only; dropped without a commit.
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
-        // (deployment, revision, placed host, device, remote ingress host)
+        // (deployment, revision, placed host, device or GPU set (ADR 0035
+        // §2), remote ingress host)
         type Lane = (String, i64, Option<String>, Option<String>, Option<String>);
         let lane: Option<Lane> = tx
             .prepare_cached(
-                "SELECT b.deployment_id,b.revision,i.host_id,i.device,r.host_id
+                "SELECT b.deployment_id,b.revision,i.host_id,COALESCE(i.device_set,i.device),r.host_id
                    FROM runtime_bindings b
                    JOIN deployment_instances i ON i.deployment_id=b.deployment_id
                         AND i.instance_index=b.instance_index

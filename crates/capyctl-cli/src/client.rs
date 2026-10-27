@@ -602,7 +602,10 @@ fn replicas(deployment: &Value, seen: &mut std::collections::BTreeSet<u64>) -> R
 /// `capacity_blocked` is (exit 4); any other failure is `operation_failed`.
 fn failure_code(reason: &str) -> &'static str {
     match capyctl_domain::diagnostics::classify(None, reason) {
-        Some("insufficient_memory" | "insufficient_device_memory") => "insufficient_resources",
+        // ADR 0035 §13: too few identical GPUs is a capacity block too.
+        Some("insufficient_memory" | "insufficient_device_memory" | "insufficient_gpus") => {
+            "insufficient_resources"
+        }
         _ => "operation_failed",
     }
 }
@@ -1830,6 +1833,10 @@ mod tests {
                 "message": "insufficient_device_memory: the deployment needs 21 bytes"}}),
         );
         assert_eq!(device.exit_code(), ExitCode::INSUFFICIENT_RESOURCES);
+        assert_eq!(
+            device.message,
+            "capacity_blocked: insufficient_device_memory: the deployment needs 21 bytes"
+        );
     }
 
     /// SPEC §13: the override is part of a recovered command's intent.

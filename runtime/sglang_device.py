@@ -7,7 +7,8 @@ its policy revision, and guard imports/environment mutation through launch.
 The inventory digest is versioned evidence, NOT a reinterpretation of the
 existing opaque hardware_fingerprint. No model-name or ordinal inference occurs.
 
-The only supported inherited CUDA namespace is one complete verified UUID.
+The only supported inherited CUDA namespace is one complete verified UUID, or
+(ADR 0035 §4) the complete verified UUIDs of a launch's GPUs in rank order.
 Setting that environment before any CUDA import is an external guarded-service
 obligation. This module never changes it, imports native libraries, or opens the
 entrypoint. Reobserve immediately before use; results are not durable authority.
@@ -67,6 +68,9 @@ class TrustedDeviceMapping:
     memory_domain: str
     physical_gpu_uuid: str
     inventory_digest: str
+    # ADR 0035 §4: on several GPUs of the host, every authorized UUID in rank
+    # order (the first is physical_gpu_uuid); empty on one GPU.
+    physical_gpu_uuids: tuple = ()
 
 
 _UUID = re.compile(r"GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -213,21 +217,39 @@ def observe_placement(spec, trusted_mapping):
         uuid = trusted_mapping.physical_gpu_uuid
         if type(uuid) is not str or not _UUID.fullmatch(uuid):
             raise ValueError()
+        # ADR 0035 §4: a launch on several GPUs inherits every UUID of its
+        # device list in rank order, each a physical GPU of this inventory.
+        devices = public.get("devices")
+        if devices is None:
+            uuids = (uuid,)
+            if trusted_mapping.physical_gpu_uuids != ():
+                raise ValueError()
+        else:
+            uuids = trusted_mapping.physical_gpu_uuids
+            if (type(uuids) is not tuple or len(uuids) != len(devices) or uuids[0] != uuid
+                    or len(set(uuids)) != len(uuids)
+                    or any(type(each) is not str or not _UUID.fullmatch(each)
+                           for each in uuids)):
+                raise ValueError()
+        namespace = ",".join(uuids)
         before = collect_inventory()
         # SPEC §3 / T22: host_id in the launch is the enrolled logical name.
         # The inventory digest already binds the kernel hostname, boot and
         # physical devices. An alias must not replace that physical proof.
+        present = {d.physical_gpu_uuid for d in before.devices}
         if (before.digest != trusted_mapping.inventory_digest
-                or uuid not in {d.physical_gpu_uuid for d in before.devices}
-                or os.environ.get("CUDA_VISIBLE_DEVICES") != uuid):
+                or any(each not in present for each in uuids)
+                or os.environ.get("CUDA_VISIBLE_DEVICES") != namespace):
             raise ValueError()
         after = collect_inventory()
         if (after.digest != before.digest
-                or os.environ.get("CUDA_VISIBLE_DEVICES") != uuid):
+                or os.environ.get("CUDA_VISIBLE_DEVICES") != namespace):
             raise ValueError()
         return ObservedPlacement(
             binding_id=public["binding_id"], incarnation=public["incarnation"],
             **public["device"], physical_gpu_uuid=uuid,
-            cuda_visible_uuids=(uuid,), cuda_index=0)
+            cuda_visible_uuids=uuids, cuda_index=0,
+            device_ids=(() if devices is None
+                        else tuple(device["device_id"] for device in devices)))
     except Exception:
         raise DeviceObservationError() from None

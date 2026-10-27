@@ -158,6 +158,13 @@ pub struct DeploymentSnapshot {
     /// for `chat` and for a revision that does not decode.
     #[serde(skip_serializing_if = "capyctl_config::effective::DeploymentApi::is_chat")]
     pub api: capyctl_config::effective::DeploymentApi,
+    /// ADR 0035 §1, §1a: the current revision on several GPUs of one host or
+    /// under `topology: auto`, as resolved on its first host: its GPUs, the
+    /// charge on each GPU and on host RAM, and under `auto` the candidate
+    /// table and the size that host would choose now. Additive; absent on one
+    /// GPU without `auto`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<serde_json::Value>,
 }
 
 /// ADR 0014 §5 (owner decision 2026-09-25): the effective context of the
@@ -413,6 +420,33 @@ pub struct InstanceSnapshot {
     /// planned before ADR 0033 and an instance never started. Additive.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lmcache: Option<InstanceLmcache>,
+    /// ADR 0035 §1a, §5: an instance on several GPUs of one host, or under
+    /// `topology: auto`: what was asked for (`requested`: `"auto"` or N),
+    /// and once placed the size it runs at and its GPUs in rank order
+    /// (host-local ids). Absent on one GPU without `auto` and for a group,
+    /// so their JSON is unchanged. Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<InstanceTopology>,
+    /// ADR 0035 §5 (owner decision 7): `loopback` for an instance on two or
+    /// more GPUs, whose ranks' collectives listen on loopback only and are
+    /// unauthenticated there. Absent otherwise. Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collectives: Option<&'static str>,
+}
+
+/// ADR 0035 §1a, §5: an instance's tensor-parallel size on one host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InstanceTopology {
+    /// `"auto"`, or the stated `tensor_parallel` N; absent for a revision on
+    /// one GPU that is not `auto`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested: Option<serde_json::Value>,
+    /// The size it was placed at; absent until placed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tensor_parallel: Option<u32>,
+    /// Its GPUs in rank order, by their host-local ids; absent until placed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub devices: Option<Vec<String>>,
 }
 
 /// ADR 0033 §9: one instance's LMCache in status. The figures are the charge
@@ -865,6 +899,7 @@ impl Store {
                 context: None,
                 parsers: None,
                 api: Default::default(),
+                topology: None,
             })
         })?;
         let mut deployments = deployments;
@@ -901,6 +936,7 @@ impl Store {
             entry.timeouts = crate::lifecycle_windows::read(&tx, &entry.id)?;
             entry.startup = crate::ordinary_lifecycle::startup::status(&tx, &entry.id)?;
             entry.parked = crate::ordinary_lifecycle::parked_charge::status(&tx, &entry.id)?;
+            entry.topology = crate::ordinary_lifecycle::startup::topology_status(&tx, &entry.id)?;
             (entry.context, entry.parsers, entry.api) = context_status(&tx, &entry.id)?;
             entry.switch = crate::switch_state::status(&tx, &entry.id)?;
             entry.warm = crate::switch_state::is_warm(&tx, &entry.id)?;
@@ -1011,6 +1047,8 @@ impl Store {
                         }
                     },
                     lmcache: None,
+                    topology: None,
+                    collectives: None,
                 },
             ))
         })?;
@@ -1032,6 +1070,16 @@ impl Store {
                     .unwrap_or_else(|| entry.revision.clone());
                 instance.group = group_status(&tx, &deployment, instance.index, &revision)?;
                 instance.lmcache = instance_lmcache(&tx, &deployment, instance.index)?;
+                if instance.group.is_none() {
+                    instance.topology =
+                        instance_topology(&tx, &deployment, instance.index, &revision)?;
+                    instance.collectives = instance
+                        .topology
+                        .as_ref()
+                        .and_then(|t| t.tensor_parallel)
+                        .is_some_and(|n| n > 1)
+                        .then_some("loopback");
+                }
                 entry.instances.push(instance);
             }
         }
@@ -1246,6 +1294,89 @@ impl Store {
         tx.commit()?;
         Ok(snapshot)
     }
+}
+
+/// ADR 0035 §1a, §5: the instance's tensor-parallel size as status shows it:
+/// what its revision asked for (`auto`, or a stated N above 1, from the
+/// revision as resolved on its host or the deployment's own) and, while it
+/// is placed for a launch (anything but stopped or failed), the N and GPU set
+/// its placement recorded. `None` on one GPU without `auto`.
+fn instance_topology(
+    tx: &Transaction<'_>,
+    deployment: &str,
+    index: u32,
+    revision: &str,
+) -> Result<Option<InstanceTopology>, SnapshotError> {
+    use rusqlite::OptionalExtension;
+    let revision: i64 = revision.parse().map_err(|_| SnapshotError::CorruptData)?;
+    type Row = (
+        Option<String>,
+        Option<u32>,
+        Option<String>,
+        Option<String>,
+        String,
+    );
+    let Some((placed_on, n, devices, frozen, observed)): Option<Row> = tx
+        .query_row(
+            &format!(
+                "SELECT i.host_id,i.tensor_parallel,i.device_json,
+                        COALESCE((SELECT h.effective_json FROM host_effective_revisions h
+                                   WHERE h.deployment_id=i.deployment_id AND h.revision=?3
+                                     AND h.host_id=i.host_id AND h.outcome='resolved'),
+                                 (SELECT e.effective_json FROM effective_revisions e
+                                   WHERE e.deployment_id=i.deployment_id AND e.revision=?3)),
+                        {INSTANCE_OBSERVED_STATE}
+                   FROM deployment_instances i WHERE i.deployment_id=?1 AND i.instance_index=?2"
+            ),
+            rusqlite::params![deployment, index, revision],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let frozen: serde_json::Value = frozen
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default();
+    let topology = &frozen["topology"];
+    let requested = if topology["auto"].is_object() {
+        Some(serde_json::Value::from(capyctl_config::topology::AUTO))
+    } else {
+        topology["tensor_parallel"]
+            .as_u64()
+            .filter(|n| *n > 1)
+            .map(serde_json::Value::from)
+    };
+    let placed = placed_on.is_some() && !matches!(observed.as_str(), "stopped" | "failed");
+    let n = n.filter(|_| placed);
+    if requested.is_none() && n.is_none_or(|n| n <= 1) {
+        return Ok(None);
+    }
+    // The host-local id of a GPU an enrolled host's ledger key names.
+    let local = |id: &str| {
+        if id.starts_with("host/") {
+            id.rsplit('/').next().unwrap_or(id).to_owned()
+        } else {
+            id.to_owned()
+        }
+    };
+    let devices = devices
+        .filter(|_| n.is_some())
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .and_then(|claims| {
+            claims.as_array().map(|claims| {
+                claims
+                    .iter()
+                    .filter_map(|claim| claim["id"].as_str().map(local))
+                    .collect::<Vec<_>>()
+            })
+        });
+    Ok(Some(InstanceTopology {
+        requested,
+        tensor_parallel: n,
+        devices,
+    }))
 }
 
 /// ADR 0033 §9: the LMCache of the newest launch of the instance's current

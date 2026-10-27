@@ -207,6 +207,7 @@ fn group_member_launch(
         startup_bytes: None,
         startup_host_bytes: None,
         lmcache: None,
+        devices: Vec::new(),
     }
 }
 
@@ -248,6 +249,7 @@ fn single_host_launch_binds_local_resolution_and_retained_grant() {
         startup_bytes: None,
         startup_host_bytes: None,
         lmcache: None,
+        devices: Vec::new(),
     });
     typed.identity.payload_digest = typed.canonical_digest();
     typed.verify_digest().unwrap();
@@ -322,6 +324,7 @@ fn ready_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         boot_id: "boot".into(),
         start_ticks: 7,
         presence: "alive".into(),
+        rank: None,
     };
     pb::MemberExecutionResult {
         identity: command.to_wire().identity,
@@ -455,9 +458,100 @@ fn launch_single() -> MemberCommand {
         startup_bytes: None,
         startup_host_bytes: None,
         lmcache: None,
+        devices: Vec::new(),
     });
     typed.identity.payload_digest = typed.canonical_digest();
     typed
+}
+
+// T46 (ADR 0035 §§2, 11): a launch on several GPUs of one host carries its
+// rank-ordered device list, bound by the payload digest and kept in order
+// through the wire; an empty list encodes exactly as before; a list of one, a
+// repeated or malformed id, or a list on a group member's launch is refused.
+#[test]
+fn a_launch_on_several_gpus_carries_its_ordered_device_list() {
+    use capyctl_protocol::execution::{MemberAction, SingleLaunchPlan};
+    let single = launch_single();
+    let mut local = single.clone();
+    let MemberAction::LaunchSingle(plan) = &mut local.action else {
+        panic!("a single launch")
+    };
+    plan.devices = vec!["gpu1".into(), "gpu0".into()];
+    local.identity.payload_digest = local.canonical_digest();
+    assert_ne!(
+        local.identity.payload_digest,
+        single.identity.payload_digest
+    );
+    let recovered = MemberCommand::try_from(pb::ServerToAgent {
+        msg: Some(pb::server_to_agent::Msg::ExecuteMember(local.to_wire())),
+    })
+    .unwrap();
+    assert_eq!(recovered, local);
+    recovered.verify_digest().unwrap();
+    let wire_plan = |command: &MemberCommand| {
+        let Some(pb::execute_member::Action::LaunchSingle(plan)) = command.to_wire().action else {
+            panic!("a single launch")
+        };
+        plan
+    };
+    let one = wire_plan(&single);
+    let mut bare = one.clone();
+    bare.devices.clear();
+    assert_eq!(bare.encode_to_vec(), one.encode_to_vec());
+    for bad in [
+        vec!["gpu0"],
+        vec!["gpu0", "gpu0"],
+        vec!["gpu0", "card1"],
+        vec!["gpu0", "gpu"],
+    ] {
+        let mut plan = wire_plan(&local);
+        plan.devices = bad.iter().map(|d| (*d).to_owned()).collect();
+        assert!(SingleLaunchPlan::try_from(plan).is_err(), "{bad:?}");
+    }
+}
+
+// T46 (ADR 0035 §6): a launch result's ranks name GPUs of its plan's device
+// list, each once, and a `rank-N` process carries rank N; a result for a
+// launch on one GPU carries none.
+#[test]
+fn a_launch_result_names_each_rank_once_within_the_device_list() {
+    use capyctl_protocol::execution::{validate_result, MemberAction};
+    let mut command = launch_single();
+    let MemberAction::LaunchSingle(plan) = &mut command.action else {
+        panic!("a single launch")
+    };
+    plan.devices = vec!["gpu0".into(), "gpu1".into()];
+    command.identity.payload_digest = command.canonical_digest();
+    let mut ready = ready_result(&command);
+    ready.state = "launched".into();
+    ready.owned_handle = command.identity.command_id.clone();
+    ready.binding_id = "01K00000000000000000000001".into();
+    ready.incarnation = "01K00000000000000000000002".into();
+    ready.processes[1].rank = Some(0);
+    let mut rank = ready.processes[1].clone();
+    rank.role = "rank-1".into();
+    rank.pid = 12;
+    rank.rank = Some(1);
+    ready.processes.push(rank);
+    validate_result(&command, &ready).unwrap();
+    let mut twice = ready.clone();
+    twice.processes[2].rank = Some(0);
+    assert!(validate_result(&command, &twice).is_err());
+    let mut outside = ready.clone();
+    outside.processes[2].rank = Some(2);
+    outside.processes[2].role = "rank-2".into();
+    assert!(validate_result(&command, &outside).is_err());
+    let mut misnamed = ready.clone();
+    misnamed.processes[2].role = "rank-0".into();
+    assert!(validate_result(&command, &misnamed).is_err());
+    let single = launch_single();
+    let mut one = ready.clone();
+    one.identity = single.to_wire().identity;
+    one.processes.truncate(2);
+    one.processes[1].rank = None;
+    validate_result(&single, &one).unwrap();
+    one.processes[1].rank = Some(0);
+    assert!(validate_result(&single, &one).is_err());
 }
 
 // T20 T29 (SPEC §§6.4, 13.2): a launch whose engine exited before readiness
@@ -845,6 +939,7 @@ mod groups {
                     role: "api".into(),
                     boot_id: "boot".into(),
                     presence: "alive".into(),
+                    rank: None,
                 })
             }),
             ("owned_handle", |r| r.owned_handle = "command".into()),
@@ -904,13 +999,15 @@ mod groups {
             assert!(!decodes(wire));
         }
         type Edit = fn(&mut pb::SingleLaunchPlan);
-        let edits: [Edit; 6] = [
+        let edits: [Edit; 7] = [
             |m| m.profile_name = "other".into(),
             |m| m.checkpoint_digest = format!("sha256:{}", "cd".repeat(32)),
             |m| m.checkpoint_digest.clear(),
             |m| m.service_port = 30001,
             |m| m.service_port = 0,
             |m| m.binding_id = "binding".into(),
+            // T46 (ADR 0035 §12): a group keeps one device per host.
+            |m| m.devices = vec!["gpu0".into(), "gpu1".into()],
         ];
         for (index, edit) in edits.iter().enumerate() {
             let mut wire = head.to_wire();
@@ -973,6 +1070,7 @@ mod groups {
                     role: "api".into(),
                     boot_id: "boot".into(),
                     presence: "alive".into(),
+                    rank: None,
                 })
             },
         ];
@@ -998,6 +1096,7 @@ mod groups {
                 boot_id: "boot".into(),
                 start_ticks: 7,
                 presence: "alive".into(),
+                rank: None,
             };
             pb::MemberExecutionResult {
                 identity: command.to_wire().identity,

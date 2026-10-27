@@ -789,3 +789,105 @@ class GroupModeTests(unittest.TestCase):
         self.assertEqual(entry.main(GROUP_WORKER, runtime, error), 1)
         self.assertEqual(error.getvalue(), "vllm_startup_failed: group_drift:node_rank\n")
         self.assertNotIn("run", runtime.events)
+
+
+# ADR 0035 §4: a launch on two GPUs of one host, as adapters' vllm/args.rs
+# renders it: N in the reserved block with the `mp` executor, no group flag.
+TP2 = ["serve", "/models/qwen", "--host", "127.0.0.1", "--served-model-name", "route",
+       "--enable-per-request-metrics", "--no-enable-log-requests",
+       "--no-enable-log-outputs", "--tensor-parallel-size", "2",
+       "--pipeline-parallel-size", "1", "--distributed-executor-backend", "mp",
+       "--port", "20001", "--gpu-memory-utilization", "0.90",
+       "--kv-cache-memory-bytes", "4294967296", entry.MARKER]
+
+
+class LocalTensorParallelTests(unittest.TestCase):
+    EXPECTED = {"tensor_parallel_size": 2, "pipeline_parallel_size": 1,
+                "data_parallel_size": 1, "distributed_executor_backend": "mp",
+                "devices": ["GPU-a", "GPU-b"], "cuda_device_order": None}
+
+    def setUp(self):
+        environ = mock.patch.dict(os.environ)
+        environ.start()
+        self.addCleanup(environ.stop)
+
+    def namespace(self, **changes):
+        values = {dest: self.EXPECTED[dest] for dest in entry.TP_DESTS}
+        return argparse.Namespace(**{**values, **changes})
+
+    # T46 (ADR 0035 §4): every frozen tensor-parallel destination must be what
+    # the parse resolved, and the namespace the GPUs in rank order.
+    def test_tp_drift_is_refused_by_field(self):
+        environ = {"CUDA_VISIBLE_DEVICES": "GPU-a,GPU-b"}
+        entry.check_tp(self.EXPECTED, self.namespace(), environ)
+        for dest, bad in [("tensor_parallel_size", 1), ("pipeline_parallel_size", 2),
+                          ("data_parallel_size", 2), ("distributed_executor_backend", "ray"),
+                          ("distributed_executor_backend", None)]:
+            with self.assertRaises(entry.LaunchError) as ctx:
+                entry.check_tp(self.EXPECTED, self.namespace(**{dest: bad}), environ)
+            self.assertEqual(ctx.exception.code, "tp_drift:" + dest)
+        missing = {k: v for k, v in self.EXPECTED.items() if k != "data_parallel_size"}
+        with self.assertRaises(entry.LaunchError) as ctx:
+            entry.check_tp(missing, self.namespace(), environ)
+        self.assertEqual(ctx.exception.code, "tp_drift:data_parallel_size")
+
+    # T46 (ADR 0035 §4, ADR 0019 §6): the inherited namespace must list exactly
+    # the plan's GPUs in rank order, with the PCI order an index list needs.
+    def test_device_drift_is_refused(self):
+        for visible in (None, "GPU-a", "GPU-b,GPU-a", "GPU-a,GPU-b,GPU-c", "GPU-a, GPU-b"):
+            environ = {} if visible is None else {"CUDA_VISIBLE_DEVICES": visible}
+            with self.assertRaises(entry.LaunchError) as ctx:
+                entry.check_tp(self.EXPECTED, self.namespace(), environ)
+            self.assertEqual(ctx.exception.code, "tp_drift:devices")
+        indices = {**self.EXPECTED, "devices": ["1", "0"], "cuda_device_order": "PCI_BUS_ID"}
+        entry.check_tp(indices, self.namespace(),
+                       {"CUDA_VISIBLE_DEVICES": "1,0", "CUDA_DEVICE_ORDER": "PCI_BUS_ID"})
+        with self.assertRaises(entry.LaunchError) as ctx:
+            entry.check_tp(indices, self.namespace(), {"CUDA_VISIBLE_DEVICES": "1,0"})
+        self.assertEqual(ctx.exception.code, "tp_drift:devices")
+        short = {**self.EXPECTED, "devices": ["GPU-a"]}
+        with self.assertRaises(entry.LaunchError) as ctx:
+            entry.check_tp(short, self.namespace(), {"CUDA_VISIBLE_DEVICES": "GPU-a"})
+        self.assertEqual(ctx.exception.code, "tp_drift:devices")
+
+    # T46 T21 (ADR 0035 §§4, 12): the launch serves with the single-host
+    # loopback pin, no group mode, and the payload consumed.
+    def test_a_launch_on_two_gpus_serves_with_the_loopback_pin(self):
+        os.environ.update({"CUDA_VISIBLE_DEVICES": "GPU-a,GPU-b",
+                           "NCCL_SOCKET_IFNAME": "eth0",
+                           entry.TP_EXPECTED: json.dumps(self.EXPECTED)})
+        runtime = FakeRuntime()
+        seen = {}
+        run = runtime.run
+
+        def recording_run(args):
+            seen.update({name: os.environ.get(name) for name in (
+                "VLLM_HOST_IP", "GLOO_SOCKET_IFNAME", "NCCL_SOCKET_IFNAME")})
+            return run(args)
+
+        runtime.run = recording_run
+        error = io.StringIO()
+        self.assertEqual(entry.main(TP2, runtime, error), 0, error.getvalue())
+        self.assertEqual(seen, {"VLLM_HOST_IP": "127.0.0.1", "GLOO_SOCKET_IFNAME": "lo",
+                                "NCCL_SOCKET_IFNAME": "lo"})
+        self.assertNotIn(entry.TP_EXPECTED, os.environ)
+        self.assertEqual(runtime.served.tensor_parallel_size, 2)
+
+    # T46: a rendered vector or namespace that disagrees with the plan refuses
+    # before serving; a payload beside group mode is no launch this entry knows.
+    def test_drift_refuses_before_serving(self):
+        for environ, code in [
+                ({"CUDA_VISIBLE_DEVICES": "GPU-a,GPU-b",
+                  entry.TP_EXPECTED: json.dumps({**self.EXPECTED, "tensor_parallel_size": 4})},
+                 "tp_drift:tensor_parallel_size"),
+                ({"CUDA_VISIBLE_DEVICES": "GPU-b,GPU-a",
+                  entry.TP_EXPECTED: json.dumps(self.EXPECTED)}, "tp_drift:devices"),
+                ({entry.TP_EXPECTED: "{not json"}, "invalid_launch_arguments"),
+                ({"CAPYCTL_GROUP_MODE": "1", entry.TP_EXPECTED: json.dumps(self.EXPECTED)},
+                 "invalid_launch_arguments")]:
+            with mock.patch.dict(os.environ, environ):
+                runtime = FakeRuntime()
+                error = io.StringIO()
+                self.assertEqual(entry.main(TP2, runtime, error), 1)
+                self.assertEqual(error.getvalue(), "vllm_startup_failed: " + code + "\n")
+                self.assertNotIn("run", runtime.events)

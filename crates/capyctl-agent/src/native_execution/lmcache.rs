@@ -54,6 +54,7 @@ pub(super) fn required_refusal(reason: LmcacheOffReason) -> &'static str {
         R::VersionUnsupported => "lmcache_unavailable:version_unsupported",
         R::CheckFailed => "lmcache_unavailable:check_failed",
         R::GroupUnsupported => "lmcache_unavailable:group_unsupported",
+        R::MultiGpuUnqualified => "lmcache_unavailable:multi_gpu_unqualified",
         R::ParkUnqualified => "lmcache_unavailable:park_unqualified",
         R::KvTransferConfigSet => "lmcache_unavailable:kv_transfer_config_set",
         R::RetentionZero => "retention_zero:lmcache",
@@ -187,6 +188,8 @@ pub(super) fn lmcache_plan_in(
             engine_version: &effective.profile.build_fingerprint,
             api: effective.api,
             topology,
+            // ADR 0035 §9: LMCache stays off on several GPUs of one host.
+            multi_gpu: effective.local_tensor_parallel() > 1,
             residency: effective.residency,
             model_type: model_type.as_deref(),
             gpu: launch_gpu(effective),

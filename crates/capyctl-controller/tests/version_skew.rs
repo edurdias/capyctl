@@ -298,6 +298,7 @@ fn launch() -> MemberAction {
         startup_bytes: Some(2 << 30),
         startup_host_bytes: None,
         lmcache: None,
+        devices: Vec::new(),
     })
 }
 
@@ -970,6 +971,7 @@ fn resident(pid: u32, bytes: i64, device: i64, host: i64) -> pb::ProcessResidenc
         resident_bytes: bytes,
         device_bytes: device,
         host_bytes: host,
+        per_device: Vec::new(),
     }
 }
 
@@ -1433,6 +1435,7 @@ async fn a_device_observation_is_accepted() {
             bytes: 12 << 30,
             device_bytes: 9 << 30,
             host_bytes: 3 << 30,
+            per_device: Vec::new(),
         }]
     );
 

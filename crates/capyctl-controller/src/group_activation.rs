@@ -1110,6 +1110,8 @@ fn launch_commands(
                 checkpoint_gguf: None,
                 // ADR 0033 §2: a group runs no LMCache (`group_unsupported`).
                 lmcache: None,
+                // ADR 0035 §12: a group keeps one device per host.
+                devices: Vec::new(),
                 startup_bytes: None,
                 startup_host_bytes: None,
             };

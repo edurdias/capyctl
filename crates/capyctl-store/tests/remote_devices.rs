@@ -423,6 +423,7 @@ fn a_remote_unified_host_is_credited_the_resident_sum_as_before() {
             bytes: gib * GIB,
             device_bytes: if split { (gib - 1) * GIB } else { 0 },
             host_bytes: if split { GIB } else { 0 },
+            per_device: Vec::new(),
         };
         assert!(
             t.arm(&planned[1].0, &observations, &[]).is_err(),
@@ -492,6 +493,7 @@ fn a_remote_discrete_host_is_credited_per_domain() {
             bytes: (device + host) * GIB,
             device_bytes: if split { device * GIB } else { 0 },
             host_bytes: if split { host * GIB } else { 0 },
+            per_device: Vec::new(),
         };
         let residents = [resident(100, 11, 2), resident(101, 1, 1)];
         let armed = t.arm(&planned[1].0, &observations, &residents);
@@ -545,4 +547,154 @@ fn an_ordinary_start_leases_past_a_held_rendezvous_port() {
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(ports, vec![8101, 8102]);
+}
+
+/// The enrolled host with two identical cards (same product and total, ADR
+/// 0035 §1), 30 GiB managed each, and a deployment of `name` with a 12 GiB
+/// request on `n` of them, one instance.
+fn identical_gpus(name: &str, n: u32) -> (Remote, Value) {
+    let (mut config, mut host) = discrete_host();
+    for gpu in ["gpu0", "gpu1"] {
+        host["resource_policy"]["domains"][gpu]["managed_limit"] = json!("30GiB");
+        host["resource_policy"]["devices"][gpu]["product_name"] = json!("NVIDIA RTX A6000");
+    }
+    config.as_object_mut().unwrap().remove("resources");
+    config["devices"] = json!([]);
+    config["engine_config"] = json!({"memory": {"request": "12GiB", "kv_cache": "4GiB"}});
+    let t = remote_on(config, host, vec!["system", "gpu0", "gpu1"]);
+    let mut config = t.config.clone();
+    config["name"] = json!(name);
+    config["routes"] = json!([name]);
+    config["instances"] = json!(1);
+    if n > 1 {
+        config["topology"] = json!({"tensor_parallel": n});
+    }
+    (t, config)
+}
+
+impl Remote {
+    fn deploy_config(&self, config: &Value) -> String {
+        self.store
+            .create_managed_configuration_on_hosts(
+                &self.session,
+                "owner",
+                config["name"].as_str().unwrap(),
+                &json!({ "config": config }).to_string(),
+                std::slice::from_ref(&self.target),
+                &[],
+                NOW,
+            )
+            .unwrap()
+            .deployment_id
+    }
+
+    fn start(&self, id: &str, key: &str) -> Result<(), capyctl_store::lifecycle::LifecycleError> {
+        self.store
+            .accept_scoped_start_command(
+                &self.session,
+                "owner",
+                id,
+                StartScope::All,
+                self.store.current_revision(id).unwrap().unwrap(),
+                key,
+                NOW,
+                DEADLINE,
+                None,
+            )
+            .map(drop)
+    }
+
+    /// The host's latest session declared `capabilities` (ADR 0017).
+    fn declare(&self, capabilities: &[&str]) {
+        self.store
+            .record_host_version(
+                HOST.0,
+                &capyctl_store::host_versions::HostVersion {
+                    binary_version: "0.1.8".into(),
+                    compatibility: "supported".into(),
+                    reason: String::new(),
+                    capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+                    recorded_at_ms: 1,
+                },
+            )
+            .unwrap();
+    }
+}
+
+// T46 (ADR 0035 §§11, 13): a host whose latest session did not declare
+// `local_tensor_parallel` is refused a launch on several GPUs at placement,
+// `host_capability_missing:local_tensor_parallel`, before anything is
+// planned or sent; a launch on one GPU there needs nothing new. Once the
+// host declares it, the same start is placed on both GPUs, and the
+// document the server sends for that set resolves on the host to both
+// GPUs in rank order.
+#[test]
+fn an_older_host_is_refused_a_launch_on_several_gpus_at_placement() {
+    let (t, tp2) = identical_gpus("tp2", 2);
+    let mut one = tp2.clone();
+    one.as_object_mut().unwrap().remove("topology");
+    one["name"] = json!("one");
+    one["routes"] = json!(["one"]);
+    t.declare(&["heartbeats"]);
+    let id = t.deploy_config(&tp2);
+    match t.start(&id, "start").unwrap_err() {
+        capyctl_store::lifecycle::LifecycleError::PlacementRefused(reason) => {
+            assert!(
+                reason.starts_with("host_capability_missing:local_tensor_parallel: "),
+                "{reason}"
+            );
+            assert!(
+                reason.contains("host host-a: host_capability_missing:local_tensor_parallel"),
+                "{reason}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(t.planned(&id).is_empty(), "nothing is planned or sent");
+    let leases: i64 = t
+        .sql
+        .query_row("SELECT COUNT(*) FROM endpoint_leases", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(leases, 0);
+
+    let single = t.deploy_config(&one);
+    t.start(&single, "start-one").unwrap();
+    assert_eq!(t.planned(&single).len(), 1, "one GPU needs nothing new");
+
+    t.declare(&["heartbeats", capyctl_config::topology::LOCAL_TP_CAPABILITY]);
+    t.start(&id, "start-again").unwrap();
+    let rows: Vec<String> = t
+        .sql
+        .prepare(
+            "SELECT json_extract(json_extract(s.step_json,'$.effective_json'),'$.selected_devices')
+               FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id AND o.kind='initialize'
+              WHERE s.deployment_id=?1 AND s.state='planned'",
+        )
+        .unwrap()
+        .query_map([&id], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let (gpu0, gpu1) = (t.scoped("device", "gpu0"), t.scoped("device", "gpu1"));
+    let devices: Value = serde_json::from_str(&rows[0]).unwrap();
+    assert_eq!(devices[0]["id"], json!(gpu0));
+    assert_eq!(devices[1]["id"], json!(gpu1));
+    let revision = t.store.current_revision(&id).unwrap().unwrap();
+    let source = t
+        .store
+        .launch_configuration_source(&id, revision, HOST.0, Some(&format!("{gpu0},{gpu1}")))
+        .unwrap()
+        .expect("the set's document");
+    let local = local_deployment_document(HOST.0, &source).unwrap();
+    let host = capyctl_config::remote_resources::local_host_document(&t.host).unwrap();
+    let effective = capyctl_config::effective::resolve_effective(&local, &host).unwrap();
+    assert_eq!(effective.local_tensor_parallel(), 2);
+    assert_eq!(
+        effective
+            .selected_devices
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect::<Vec<_>>(),
+        ["gpu0", "gpu1"]
+    );
 }

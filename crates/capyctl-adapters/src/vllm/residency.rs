@@ -117,13 +117,22 @@ async fn step(
 ) -> Result<EffectObservation, RuntimeError> {
     let c = &command.context;
     let http = adapter.http();
+    // SPEC §8.3: the controller owns the deadline. A host-backed sleep or
+    // weights wake copies the model, so it can exceed the short HTTP control
+    // bound (MG6: a TP2 sleep took 31.3 s). The outer timeout still bounds
+    // the entire step, including its post-condition, without replay.
+    let remaining = || {
+        now_ms().map(|now| {
+            std::time::Duration::from_millis(c.deadline_ms.saturating_sub(now).max(0) as u64)
+        })
+    };
     let member = MemberRef {
         deployment_id: c.token.deployment_id.clone(),
         member_id: c.binding_id.clone(),
     };
     let fact = match command.action {
         RuntimeAction::Park => {
-            http.sleep(adapter.park_level() as u8)
+            http.sleep(adapter.park_level() as u8, remaining()?)
                 .await
                 .map_err(|e| uncertain("sleep", e))?;
             // The acknowledgement alone is not the post-condition.
@@ -140,7 +149,7 @@ async fn step(
             Milestone::MemoryReleased
         }
         RuntimeAction::Restore => {
-            http.wake_tag(WakeTag::Weights)
+            http.wake_tag(WakeTag::Weights, remaining()?)
                 .await
                 .map_err(|e| uncertain("weight wake", e))?;
             Milestone::AllocationsRestored
@@ -159,8 +168,7 @@ async fn step(
                 // window), not a fixed bound of its own: found live
                 // 2026-10-15, a 123 s lazy reload inside a 180 s window was
                 // cut at a fixed 120 s and left the wake uncertain.
-                let left = c.deadline_ms.saturating_sub(now_ms()?).max(0);
-                http.collective_rpc(std::time::Duration::from_millis(left as u64))
+                http.collective_rpc(remaining()?)
                     .await
                     .map_err(|e| match e {
                         // The engine answered: `reload_weights` raised. Its
@@ -175,7 +183,7 @@ async fn step(
             }
         }
         RuntimeAction::InvalidateCache => {
-            http.wake_tag(WakeTag::KvCache)
+            http.wake_tag(WakeTag::KvCache, remaining()?)
                 .await
                 .map_err(|e| uncertain("KV wake", e))?;
             // Discarded KV must never be reused through stale prefix metadata.

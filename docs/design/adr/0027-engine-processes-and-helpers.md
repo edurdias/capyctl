@@ -91,3 +91,19 @@ distinct `helper-N` roles, with gaps, beside `api` and contiguous `worker-N`.
 - A host and a server agree on roles because the host's own observation names them,
   and a host newer than its server is refused (ADR 0017). An older host names no
   helpers, which the newer server reads as before.
+
+## Amendment of 2026-10-25: rank processes are engine processes (ADR 0035)
+
+Owner decisions 2026-10-25 ([ADR 0035](0035-multi-gpu-one-host.md) §6, §7).
+
+- **§1.** On a launch whose model runs on N > 1 GPUs of one host, the host names the rank
+  processes at readiness from a fresh per-process, per-GPU reading: for each chosen GPU, the
+  owned process holding the most memory on it. A rank process that is `api` or `worker-N`
+  keeps its role and records its rank; any other (vLLM's workers, children of the engine
+  core) gets the role `rank-N`. Readiness waits until each GPU has one distinct rank process,
+  bounded by the initialize timeout (`tp_rank_unobserved`); one process that would be the
+  rank of two GPUs is no evidence. Ranks are identified by kernel facts (PID, boot id, start
+  ticks), never by process titles.
+- **§2.** `rank-N` joins `api` and `worker-N` as an engine process: the exit watchers judge it
+  (`engine_rank_exited` names the rank and its GPU), and every later liveness proof requires
+  it alive. Helpers keep this ADR's rule.

@@ -1301,6 +1301,7 @@ fn a_wake_beside_a_ready_engine_is_credited_its_resident_memory() {
             bytes: gib << 30,
             device_bytes: 0,
             host_bytes: 0,
+            per_device: Vec::new(),
         };
     // Without a sample, or with one naming other processes, nothing is
     // credited and the wake waits, as before.
@@ -1339,6 +1340,7 @@ fn resident_floors_are_bounded_lower_bounds() {
         bytes: gib << 30,
         device_bytes: 0,
         host_bytes: 0,
+        per_device: Vec::new(),
     };
     let unified = || {
         std::collections::BTreeMap::from([(
@@ -1354,6 +1356,7 @@ fn resident_floors_are_bounded_lower_bounds() {
             &observation(available),
             residents,
             &unified(),
+            &std::collections::BTreeMap::new(),
         )
         .unwrap()
     };
@@ -1372,6 +1375,7 @@ fn resident_floors_are_bounded_lower_bounds() {
         &observation(40),
         &[resident(20, 6)],
         &unified(),
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     assert!(own.is_empty());
@@ -1419,6 +1423,7 @@ fn a_two_domain_owner_is_credited_per_domain() {
         bytes: (9 << 30) + (3 << 30),
         device_bytes: 9 << 30,
         host_bytes: 3 << 30,
+        per_device: Vec::new(),
     }];
     let kinds = BTreeMap::from([
         ("gpu0".to_string(), DomainMemory::Device),
@@ -1434,6 +1439,7 @@ fn a_two_domain_owner_is_credited_per_domain() {
             observations,
             residents,
             kinds,
+            &BTreeMap::new(),
         )
         .unwrap()
         .into_iter()
@@ -1462,6 +1468,113 @@ fn a_two_domain_owner_is_credited_per_domain() {
     // So is a domain without an observation.
     let only_gpu = floors(&observations[..1], &residents, &kinds);
     assert_eq!(only_gpu.keys().collect::<Vec<_>>(), ["gpu0"]);
+}
+
+// T46 T26 (ADR 0035 §8): a process's GPU bytes are credited to the domain of
+// the GPU they are on, capped at the owner's allocation there: an owner on
+// two GPUs is credited each GPU's own bytes, never one process's sum on both.
+// A single-GPU owner gets the same figure as before, and a stray context on
+// another GPU no longer counts toward its card. A reading without per-GPU
+// figures (an older host) credits nothing to an owner on two GPUs.
+#[test]
+fn device_bytes_are_credited_to_the_domain_of_their_gpu() {
+    use capyctl_config::effective::DomainMemory;
+    use capyctl_domain::resources::{Allocation, DeviceBytes, ProcessResident};
+    use std::collections::BTreeMap;
+    let lab = Lab::new(|_| {});
+    let s = lab.deploy("s", |_| {});
+    lab.ready(&s, 1_000, 20);
+    let mut ledger = lab.store.resource_snapshot().unwrap();
+    let owner = crate::instances::instance_owner_id(&s.deployment_id, 0);
+    let allocation = |domain: &str, gib: i64| Allocation {
+        domain: domain.into(),
+        bytes: gib << 30,
+        host_kv_bytes: 0,
+    };
+    ledger.owners.get_mut(&owner).unwrap().allocations = vec![
+        allocation("gpu0", 20),
+        allocation("gpu1", 20),
+        allocation("system", 10),
+    ];
+    let observation = |domain: &str| MemoryObservation {
+        domain: domain.into(),
+        capacity_bytes: 48 << 30,
+        available_bytes: 20 << 30,
+        sampled_at_ms: 1_100,
+    };
+    let observations = vec![
+        observation("gpu0"),
+        observation("gpu1"),
+        observation("system"),
+    ];
+    // The recorded process (pid 20) holds 18 GiB on gpu0 and a 1 GiB context
+    // on gpu1.
+    let resident = |per_device: Vec<(&str, i64)>| {
+        let per_device: Vec<DeviceBytes> = per_device
+            .into_iter()
+            .map(|(device, gib)| DeviceBytes {
+                device: device.into(),
+                bytes: (gib as u64) << 30,
+            })
+            .collect();
+        let device_bytes = per_device.iter().map(|d| d.bytes as i64).sum::<i64>();
+        ProcessResident {
+            pid: 20,
+            boot_id: "boot-1".into(),
+            start_ticks: 1,
+            bytes: device_bytes + (2 << 30),
+            device_bytes,
+            host_bytes: 2 << 30,
+            per_device,
+        }
+    };
+    let kinds = BTreeMap::from([
+        ("gpu0".to_string(), DomainMemory::Device),
+        ("gpu1".to_string(), DomainMemory::Device),
+        ("system".to_string(), DomainMemory::Distinct),
+    ]);
+    let devices = BTreeMap::from([
+        ("gpu0".to_string(), "gpu0".to_string()),
+        ("gpu1".to_string(), "gpu1".to_string()),
+    ]);
+    let floors = |ledger: &LedgerSnapshot, residents: &[ProcessResident]| {
+        crate::resident_floors::resident_floors(
+            &lab.store.conn,
+            ledger,
+            "candidate",
+            &observations,
+            residents,
+            &kinds,
+            &devices,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|f| (f.domain, f.bytes))
+        .collect::<BTreeMap<_, _>>()
+    };
+    let two = floors(&ledger, &[resident(vec![("gpu0", 18), ("gpu1", 1)])]);
+    assert_eq!(two["gpu0"], 18 << 30);
+    assert_eq!(two["gpu1"], 1 << 30);
+    assert_eq!(two["system"], 2 << 30);
+    // Capped per GPU at the allocation there.
+    let capped = floors(&ledger, &[resident(vec![("gpu0", 25), ("gpu1", 1)])]);
+    assert_eq!(capped["gpu0"], 20 << 30);
+    // An older reading (no per-GPU figures) credits neither GPU of a
+    // two-GPU owner: which GPU holds the bytes is unknown.
+    let mut older = resident(vec![("gpu0", 18), ("gpu1", 1)]);
+    older.per_device.clear();
+    let unsplit = floors(&ledger, &[older.clone()]);
+    assert!(!unsplit.contains_key("gpu0") && !unsplit.contains_key("gpu1"));
+    // A single-GPU owner: today's figure from an older reading, and from a
+    // per-GPU one only the bytes on its own card.
+    let mut single = ledger.clone();
+    single.owners.get_mut(&owner).unwrap().allocations =
+        vec![allocation("gpu0", 20), allocation("system", 10)];
+    assert_eq!(floors(&single, &[older])["gpu0"], 19 << 30);
+    assert_eq!(
+        floors(&single, &[resident(vec![("gpu0", 18), ("gpu1", 1)])])["gpu0"],
+        18 << 30
+    );
 }
 
 // T16 T26: found live on the 16 GB discrete-GPU laptop host. A parked vLLM
@@ -1512,6 +1625,7 @@ fn a_parked_owner_is_credited_on_every_domain_kind() {
         bytes: (1600 << 20) + (10 << 30),
         device_bytes: 1600 << 20,
         host_bytes: 10 << 30,
+        per_device: Vec::new(),
     }];
     let discrete = BTreeMap::from([
         ("gpu0".to_string(), DomainMemory::Device),
@@ -1525,6 +1639,7 @@ fn a_parked_owner_is_credited_on_every_domain_kind() {
             &observations,
             &residents,
             kinds,
+            &BTreeMap::new(),
         )
         .unwrap()
         .into_iter()

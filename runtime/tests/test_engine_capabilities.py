@@ -16,9 +16,11 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 from runtime import engine_capabilities as capabilities
 from runtime import sglang_server_args
+from runtime import sglang_startup_guards
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -261,6 +263,8 @@ checked = mock.Mock()
 error = io.StringIO()
 with mock.patch.object(composition, "enforce_closed_plugins"), \
         mock.patch.object(entry, "_guarded_engine_import", side_effect=guarded_import), \
+        mock.patch.object(entry, "_trusted_package_root",
+                          return_value=os.path.join(tree, "sglang", "srt")), \
         mock.patch.object(server_args, "construct_server_args", return_value=checked):
     status = entry.main(fixture.argv(), fixture.payloads().__getitem__, error)
 launched = sys.modules.get("sglang.srt.entrypoints.http_server")
@@ -316,6 +320,101 @@ class SglangEntryCapabilityTests(unittest.TestCase):
         self.assertIn("restart_only", refused["stderr"])
         self.assertNotIn(str(self.tree), refused["stderr"])
         self.assertEqual(self.launch(False), {"status": 0, "stderr": "", "launched": 1})
+
+    # MG5 / T21: a saver preload's CUDA dependency must resolve before Python
+    # can import torch. Real ELF loading, synthetic CPU libraries, no CUDA.
+    def test_deep_spawn_resolves_wheel_runtime_before_python_imports(self):
+        sglang_tree(self.tree, saver_hooks=True)
+        library_dir = self.tree / "nvidia" / "cu13" / "lib"
+        library_dir.mkdir(parents=True)
+        # A private SONAME prevents a system toolkit from satisfying the control.
+        soname = "libcudart.so.135791"
+        source = Path(self.directory.name) / "runtime.c"
+        source.write_text("int capyctl_fixture_cuda(void) { return 37; }\n")
+        subprocess.run(["cc", "-shared", "-fPIC", "-Wl,-soname," + soname,
+                        "-o", str(library_dir / soname), str(source)],
+                       check=True, capture_output=True)
+        source.write_text(
+            "#include <unistd.h>\nextern int capyctl_fixture_cuda(void);\n"
+            "__attribute__((constructor)) static void ready(void) {\n"
+            "  if (capyctl_fixture_cuda() != 37) _exit(19);\n}\n")
+        preload = self.tree / "torch_memory_saver_hook_mode_preload_cu13.abi3.so"
+        subprocess.run(["cc", "-shared", "-fPIC", "-o", str(preload), str(source),
+                        "-L" + str(library_dir), "-l:" + soname],
+                       check=True, capture_output=True)
+        write(self.tree, "nvidia_cuda_runtime-13.0.dist-info/METADATA",
+              "Name: nvidia-cuda-runtime\nVersion: 13.0\n")
+        write(self.tree, "nvidia_cuda_runtime-13.0.dist-info/RECORD",
+              f"nvidia/cu13/lib/{soname},,\n")
+        control_env = {key: value for key, value in os.environ.items()
+                       if key not in ("LD_PRELOAD", "LD_LIBRARY_PATH")}
+        control_env["LD_PRELOAD"] = str(preload)
+        control = subprocess.run([sys.executable, "-IS", "-c", "pass"],
+                                 env=control_env, capture_output=True, timeout=15)
+        self.assertNotEqual(control.returncode, 0)
+        self.assertIn(soname.encode(), control.stderr)
+        launch = self.tree / "sglang/srt/entrypoints/http_server.py"
+        with launch.open("a") as stream:
+            stream.write(textwrap.dedent(f"""
+                import os, subprocess, sys
+                os.environ["LD_LIBRARY_PATH"] = "/untrusted::;$ORIGIN"
+                def launch_server(server_args, run_scheduler_process_func=None):
+                    assert os.environ.get("LD_LIBRARY_PATH") == {str(library_dir)!r}
+                    os.environ["LD_PRELOAD"] = {str(preload)!r}
+                    try:
+                        for rank in range(2):
+                            child = subprocess.run(
+                                [sys.executable, "-IS", "-c",
+                                 "import sys; assert 'torch' not in sys.modules; print('scheduler-ready')"],
+                                capture_output=True, timeout=15)
+                            assert child.returncode == 0, child.stderr
+                            assert child.stdout == b"scheduler-ready\\n"
+                    finally:
+                        os.environ.pop("LD_PRELOAD", None)
+                    LAUNCHED.append(server_args)
+                """))
+        self.assertEqual(self.launch(True), {"status": 0, "stderr": "", "launched": 1})
+
+    def test_saver_loader_path_uses_only_selected_runtime_wheel_records(self):
+        library = self.tree / "vendor-layout" / "libcudart.so.12"
+        library.parent.mkdir(parents=True)
+        library.write_bytes(b"fixture")
+        outside = Path(self.directory.name) / "outside" / "libcudart.so.13"
+        outside.parent.mkdir()
+        outside.write_bytes(b"not selected")
+        escaped = self.tree / "escape"
+        escaped.symlink_to(outside.parent, target_is_directory=True)
+        expanded = self.tree / "$ORIGIN" / "libcudart.so.13"
+        expanded.parent.mkdir()
+        expanded.write_bytes(b"not a literal loader path")
+        write(self.tree, "nvidia_cuda_runtime_cu12-12.0.dist-info/METADATA",
+              "Name: nvidia-cuda-runtime-cu12\nVersion: 12.0\n")
+        write(self.tree, "nvidia_cuda_runtime_cu12-12.0.dist-info/RECORD",
+              "vendor-layout/libcudart.so.12,,\nescape/libcudart.so.13,,\n"
+              "$ORIGIN/libcudart.so.13,,\n../../outside/libcudart.so.13,,\n")
+        # A non-runtime distribution cannot contribute a loader directory.
+        write(self.tree, "unrelated-1.0.dist-info/METADATA",
+              "Name: unrelated\nVersion: 1.0\n")
+        write(self.tree, "unrelated-1.0.dist-info/RECORD", "other/libcudart.so.13,,\n")
+        write(self.tree, "other/libcudart.so.13", "not the CUDA runtime wheel")
+        # Merely making another installation importable must not select it.
+        other = Path(self.directory.name) / "other-installation"
+        write(other, "nvidia_cuda_runtime-13.0.dist-info/METADATA",
+              "Name: nvidia-cuda-runtime\nVersion: 13.0\n")
+        write(other, "nvidia_cuda_runtime-13.0.dist-info/RECORD", "lib/libcudart.so.13,,\n")
+        write(other, "lib/libcudart.so.13", "not the selected installation")
+        write(self.tree, "nvidia/__init__.py", "raise AssertionError('imported vendor')\n")
+        write(self.tree, "runtime.pth", "import nowhere; raise AssertionError('ran hook')\n")
+        with mock.patch.dict(os.environ, {"LD_LIBRARY_PATH": "/ambient::;$ORIGIN"}), \
+                mock.patch.object(sys, "path", [str(other), *sys.path]):
+            sglang_startup_guards.prepare_saver_library_path(str(self.tree))
+            self.assertEqual(os.environ["LD_LIBRARY_PATH"], str(library.parent))
+
+    def test_saver_without_a_wheel_runtime_removes_ambient_loader_path(self):
+        self.tree.mkdir(parents=True)
+        with mock.patch.dict(os.environ, {"LD_LIBRARY_PATH": "/ambient::;$ORIGIN"}):
+            sglang_startup_guards.prepare_saver_library_path(str(self.tree))
+            self.assertNotIn("LD_LIBRARY_PATH", os.environ)
 
     # T22: a build missing an interface every launch needs is refused for any
     # tier with its own closed category.

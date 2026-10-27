@@ -198,6 +198,7 @@ fn process(role: &str, pid: u32) -> pb::OwnedProcessObservation {
         boot_id: "boot".into(),
         start_ticks: 7,
         presence: "alive".into(),
+        rank: None,
     }
 }
 fn residency(state: &str) -> pb::ResidencyEvidence {
@@ -501,6 +502,7 @@ fn exit() -> pb::MemberExit {
             presence: "gone".into(),
             ..process("worker-0", 11)
         }),
+        also_exited: Vec::new(),
         exit_code: None,
         exit_signal: Some(9),
         observed_at_unix_ms: 1_000,
@@ -533,6 +535,44 @@ fn member_exit_roundtrips_with_exact_status() {
             panic!()
         };
         assert_eq!(MemberExit::try_from(decoded).unwrap(), typed);
+    }
+}
+
+// T46: a same-scan collapse preserves every absent identity, without giving
+// the additional processes the primary process's exit status. Older senders
+// omit the additive field and retain the single-process interpretation.
+#[test]
+fn member_exit_preserves_same_scan_absences() {
+    let mut wire = exit();
+    assert!(MemberExit::try_from(wire.clone())
+        .unwrap()
+        .also_exited
+        .is_empty());
+    wire.also_exited = vec![
+        pb::OwnedProcessObservation {
+            presence: "gone".into(),
+            ..process("rank-0", 12)
+        },
+        pb::OwnedProcessObservation {
+            presence: "gone".into(),
+            ..process("rank-1", 13)
+        },
+    ];
+    let typed = MemberExit::try_from(wire.clone()).unwrap();
+    assert_eq!(typed.also_exited.len(), 2);
+    assert_eq!(typed.also_exited[1].role, "rank-1");
+    assert_eq!(typed.to_wire(), wire);
+    let edits: &[fn(&mut pb::OwnedProcessObservation)] = &[
+        |p| p.presence = "alive".into(),
+        |p| p.pid = 0,
+        |p| p.start_ticks = 0,
+        |p| p.boot_id.clear(),
+        |p| p.role.clear(),
+    ];
+    for edit in edits {
+        let mut invalid = wire.clone();
+        edit(&mut invalid.also_exited[1]);
+        assert!(MemberExit::try_from(invalid).is_err());
     }
 }
 

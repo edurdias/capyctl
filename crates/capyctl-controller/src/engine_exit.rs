@@ -99,6 +99,7 @@ impl EngineExits {
                 generation: exit.generation,
                 step_id: exit.owned_handle.clone(),
                 process: exit.process.clone(),
+                also_exited: exit.also_exited.clone(),
                 status: describe(exit.status),
                 observed_at_ms: exit.observed_at_ms,
             },
@@ -167,10 +168,11 @@ impl EngineExits {
             // (an idle compile worker) exits on its own; cleanup still ends it.
             let mut group = capyctl_domain::completion::engine_members(&launch.identities);
             group.sort_by_key(|p| (p.role != "api", p.role.clone(), p.pid));
-            let Some(process) = group
-                .into_iter()
-                .find(capyctl_launchers::process_absence::exit_observed)
-            else {
+            // Observe every member before settlement starts: a cascading
+            // failure can take the API and several ranks between scans.
+            group.retain(capyctl_launchers::process_absence::exit_observed);
+            let mut absent = group.into_iter();
+            let Some(process) = absent.next() else {
                 continue;
             };
             let status = local_status(&process);
@@ -181,6 +183,7 @@ impl EngineExits {
                     generation: launch.fence.generation,
                     step_id: launch.step_id.clone(),
                     process,
+                    also_exited: absent.collect(),
                     status,
                     observed_at_ms: capyctl_protocol::now_unix_ms(),
                 },
@@ -205,6 +208,7 @@ impl EngineExits {
                     generation: launch.fence.generation,
                     step_id: launch.step_id.clone(),
                     process,
+                    also_exited: Vec::new(),
                     status,
                     observed_at_ms: capyctl_protocol::now_unix_ms(),
                 },

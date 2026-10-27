@@ -140,6 +140,15 @@ pub const RETENTION: &str = capyctl_config::lmcache::RETENTION_CAPABILITY;
 /// `host_capability_missing:request_abort` before anything is sent and keeps
 /// today's settlement rule.
 pub const REQUEST_ABORT: &str = "request_abort";
+/// ADR 0035 §11: one model on several GPUs of one host. Covers a LaunchSingle
+/// plan's rank-ordered `devices` (sent only for a launch on two or more GPUs),
+/// the per-GPU process readings (`ProcessResidency.per_device`, ADR 0035 §8),
+/// the `rank-N` process role and a result's per-process `rank` (§6), and the
+/// listener check on built-in engines (§5). The server sends a launch on
+/// several GPUs only to a host that declared it; any other host is refused
+/// `host_capability_missing:local_tensor_parallel` before anything is sent.
+/// Any other launch needs nothing new.
+pub const LOCAL_TENSOR_PARALLEL: &str = "local_tensor_parallel";
 
 /// ADR 0018: bounds on the new messages' strings and lists.
 pub const MAX_REQUEST_ID: usize = 64;
@@ -190,6 +199,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (LMCACHE, Direction::ServerToHost),
     (RETENTION, Direction::ServerToHost),
     (REQUEST_ABORT, Direction::ServerToHost),
+    (LOCAL_TENSOR_PARALLEL, Direction::ServerToHost),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.
@@ -259,7 +269,13 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
             if plan.checkpoint_state_slot_bytes.is_some() {
                 needs.push(CHECKPOINT_STATE_SLOT);
             }
-            if plan.checkpoint_layout.is_some() {
+            // ADR 0035 §§11, 12: a launch on several GPUs of one host is a
+            // single-host launch, never a group: its device list (and the
+            // layout its rank share is sized with) needs
+            // `local_tensor_parallel`, never `engine_groups`.
+            if !plan.devices.is_empty() {
+                needs.push(LOCAL_TENSOR_PARALLEL);
+            } else if plan.checkpoint_layout.is_some() {
                 needs.push(ENGINE_GROUPS);
             }
             if plan.checkpoint_tables.is_some() {
@@ -426,6 +442,17 @@ pub fn lmcache_refusal(
         host_retention,
         |name| host_capabilities.contains(name),
     )
+}
+
+/// ADR 0035 §11: the typed refusal for placing a launch on `devices` GPUs of
+/// one host on a host that did not declare `local_tensor_parallel`, or `None`
+/// when it may be placed. A launch on one GPU needs nothing new.
+pub fn local_tensor_parallel_refusal(
+    host_capabilities: &BTreeSet<String>,
+    devices: usize,
+) -> Option<String> {
+    (devices > 1 && !host_capabilities.contains(LOCAL_TENSOR_PARALLEL))
+        .then(|| missing(LOCAL_TENSOR_PARALLEL))
 }
 
 /// ADR 0017: why `command` may not be sent to a host with this policy state

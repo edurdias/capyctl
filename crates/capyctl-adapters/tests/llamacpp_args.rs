@@ -217,9 +217,9 @@ fn a_served_name_llama_server_would_split_is_refused() {
 #[test]
 fn the_environment_is_closed() {
     let mut input = plan();
-    input.cuda_namespace = Some(capyctl_config::effective::CudaNamespace::Uuid(
+    input.cuda_namespaces = vec![capyctl_config::effective::CudaNamespace::Uuid(
         "GPU-1".into(),
-    ));
+    )];
     input.build_env = BTreeMap::from([
         ("RUST_LOG".to_owned(), "info".to_owned()),
         ("GGML_CUDA_NO_PINNED".to_owned(), "1".to_owned()),

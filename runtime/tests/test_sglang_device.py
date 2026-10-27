@@ -148,6 +148,44 @@ class DeviceTests(LaunchFixture, unittest.TestCase):
         with self.assertRaises(device.DeviceObservationError):
             self.collect()
 
+    # T46 T22 (ADR 0035 §4): a launch on two GPUs inherits both UUIDs in rank
+    # order; each must be in the fresh inventory and the namespace exactly them.
+    def test_a_device_list_is_observed_in_rank_order(self):
+        second = "GPU-19631200-fdff-a345-295f-a1a6f84b2f84"
+        other = self.info.parent.parent / "000f:02:00.0"
+        other.mkdir()
+        (other / "information").write_text(
+            self.info.read_text().replace(BDF, other.name).replace(UUID, second)
+            .replace("Minor: 0", "Minor: 1"))
+        pci = self.pci.parent / other.name
+        pci.mkdir()
+        (pci / "vendor").write_text("0x10de\n")
+        (pci / "device").write_text("0x2e12\n")
+        self.public["devices"] = [self.public["device"],
+                                  dict(self.public["device"], device_id="gpu1")]
+        policy = replace(self.policy(), physical_gpu_uuids=(UUID, second))
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": UUID + "," + second},
+                             clear=True):
+            observed = self.observe(policy)
+        self.assertEqual(observed.cuda_visible_uuids, (UUID, second))
+        self.assertEqual((observed.cuda_index, observed.device_ids), (0, ("gpu0", "gpu1")))
+        absent = "GPU-29631200-fdff-a345-295f-a1a6f84b2f84"
+        for namespace, uuids in ((second + "," + UUID, (UUID, second)),
+                                 (UUID, (UUID, second)),
+                                 (UUID + "," + absent, (UUID, absent)),
+                                 (UUID + "," + second, (second, UUID)),
+                                 (UUID + "," + UUID, (UUID, UUID)),
+                                 (UUID + "," + second, ())):
+            with self.subTest(namespace=namespace, uuids=uuids), \
+                    mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": namespace}, clear=True), \
+                    self.assertRaises(device.DeviceObservationError):
+                self.observe(replace(policy, physical_gpu_uuids=uuids))
+        # One GPU never carries a list.
+        del self.public["devices"]
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": UUID}, clear=True), \
+                self.assertRaises(device.DeviceObservationError):
+            self.observe(replace(self.policy(), physical_gpu_uuids=(UUID,)))
+
     def test_inventory_or_namespace_race_denied(self):
         policy = self.policy()
         def changing_collector():

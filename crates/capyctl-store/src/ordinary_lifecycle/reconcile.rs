@@ -278,11 +278,15 @@ fn act(
         return Ok(None);
     }
     match prepare(tx, &c.deployment_id, c.instance, eligible)? {
-        Prepared::Placed(fence) => {
+        Prepared::Placed(fence, changed) => {
             let deadline = bounded_deadline(tx, &fence, now, until)?;
             let start = crate::Store::accept_start_in_transaction(
                 tx, s, &fence, now, deadline, true, None,
             )?;
+            // ADR 0035 §1a: a changed `topology: auto` size is journaled.
+            if let Some(changed) = changed {
+                changed.record(tx, &c.deployment_id, &start.operation_id)?;
+            }
             Ok(Some(Reconciled::Started {
                 deployment_id: c.deployment_id.clone(),
                 instance: c.instance,

@@ -126,6 +126,7 @@ impl Authority {
             engine_exited: false,
             load: None,
             group: false,
+            local_tensor_parallel: 1,
         };
         Arc::new(Self {
             instances: Mutex::new(vec![instance(0, 5, "host-a"), instance(1, 6, "host-b")]),

@@ -6,6 +6,7 @@ mod current_policy;
 mod declared_resources;
 mod engine_config;
 mod legacy;
+mod multi_gpu;
 mod snapshot;
 mod startup;
 mod timeouts;
@@ -27,10 +28,18 @@ pub use legacy::{
     LegacyRefusal,
 };
 pub use snapshot::decode_effective_snapshot;
+// ADR 0035: one model on several GPUs of one host, and `topology: auto`.
+use multi_gpu::Limits;
+pub use multi_gpu::{
+    auto_gpus, auto_refusal, choose_tensor_parallel, communication_allowance, engine_host_overhead,
+    fit_hint, topology_view, AutoCandidate, AutoChoice, AutoExcluded, AutoGpu, AutoTable,
+    LocalTopologyRecord, PhaseCharges, LOCAL_TP_COMMUNICATION_PLACEHOLDER_BYTES,
+    LOCAL_TP_HOST_OVERHEAD_PER_RANK_BYTES,
+};
 // Owner decision 2026-09-23: the startup memory budget.
 pub use startup::{
-    startup_budget, startup_measure, validate_declared_startup, StartupBudget, StartupMeasure,
-    StartupProvenance,
+    startup_budget, startup_device_domains, startup_measure, validate_declared_startup,
+    StartupBudget, StartupMeasure, StartupProvenance,
 };
 // Owner decision 2026-09-22 (1), ADR 0014 amendment A1: lifecycle timeouts.
 pub use timeouts::{
@@ -199,6 +208,11 @@ pub struct EffectiveDeployment {
     pub residency: Residency,
     pub recovery: Recovery,
     pub selected_devices: Vec<DeviceClaim>,
+    /// ADR 0035 §1, §1a: the instance's tensor-parallel size on several GPUs
+    /// of one host, and the candidate table of `topology: auto`. Absent on
+    /// one GPU without `auto`, so every such revision encodes as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<LocalTopologyRecord>,
     pub resources: RecipeFootprints,
     pub request_deadline_ms: i64,
     /// ADR 0014 amendment A1: the Initialize and wake timeouts, declared or
@@ -904,16 +918,32 @@ impl EffectiveDeployment {
     /// A deployment that charges no device domain is left unchanged; one whose
     /// card the sample does not report is [`DeviceTotalUnknown`]: sizing it
     /// against anything else would size the engine against the wrong memory.
+    /// ADR 0035 §3: on several GPUs each rank sizes from one GPU; every card
+    /// must be reported, and the smallest total is stated.
     pub fn with_device_total(
         mut self,
         totals: impl Fn(u32) -> Option<i64>,
     ) -> Result<Self, DeviceTotalUnknown> {
-        let Some((index, _)) = self.ready_device_allocation() else {
-            return Ok(self);
+        let ranks = self.ready_device_allocations();
+        let indices: Vec<Option<u32>> = if ranks.len() > 1 {
+            ranks.into_iter().map(|(index, _)| index).collect()
+        } else {
+            match self.ready_device_allocation() {
+                Some((index, _)) => vec![index],
+                None => return Ok(self),
+            }
         };
-        let total = index
-            .and_then(totals)
-            .filter(|total| *total > 0)
+        let total = indices
+            .into_iter()
+            .map(|index| {
+                index
+                    .and_then(&totals)
+                    .filter(|total| *total > 0)
+                    .ok_or(DeviceTotalUnknown)
+            })
+            .collect::<Result<Vec<i64>, _>>()?
+            .into_iter()
+            .min()
             .ok_or(DeviceTotalUnknown)?;
         self.engine_config.memory_mut().device_total_bytes = Some(total);
         Ok(self)
@@ -1482,10 +1512,33 @@ pub fn resolve_effective(
 /// ADR 0014 §5, §7: resolve with what the checkpoint manifest says, so a memory
 /// request the deployment omitted can be derived from the weights' size. Both
 /// sides of a launch must resolve with the same facts to agree on the result.
+///
+/// ADR 0035 §1a: `topology: auto` resolves to the N this host's cards hold,
+/// with the candidate table recorded; ADR 0035 §1: a refusal for device
+/// memory or GPU count names what would fit this host.
 pub fn resolve_effective_with_checkpoint(
     deployment: &serde_json::Value,
     host: &serde_json::Value,
     facts: CheckpointFacts,
+) -> Result<EffectiveDeployment, ConfigError> {
+    let mut document = deployment.clone();
+    crate::deployment_defaults::expand(&mut document)?;
+    let spec = crate::instances::parse_instance_spec(&document)?;
+    if spec.local == Some(crate::topology::LocalTopology::Auto) {
+        return multi_gpu::resolve_auto(&document, host, facts);
+    }
+    resolve_with(deployment, host, facts, Limits::Enforce)
+        .map_err(|error| multi_gpu::with_fit_hint(error, &document, host, facts))
+}
+
+/// One resolution of an explicit deployment (no `auto`); with
+/// [`Limits::Ignore`] a charge above a device domain's managed limit is
+/// derived rather than refused (the candidate table, ADR 0035 §1a).
+fn resolve_with(
+    deployment: &serde_json::Value,
+    host: &serde_json::Value,
+    facts: CheckpointFacts,
+    limits: Limits,
 ) -> Result<EffectiveDeployment, ConfigError> {
     // Owner decision 2026-09-25 (ADR 0014 amendment): complete a minimal
     // document, first from itself, then from this host. A full document is
@@ -1499,6 +1552,19 @@ pub fn resolve_effective_with_checkpoint(
         (crate::deployment_defaults::for_host(&document, host)?, spec)
     };
     let deployment = &completed;
+    // ADR 0035 §1: a world size above one without two or more named hosts
+    // is one instance on N GPUs of this host.
+    let local = match instance_spec.local {
+        Some(crate::topology::LocalTopology::Fixed(topology)) => Some(topology),
+        Some(crate::topology::LocalTopology::Auto) => {
+            return Err(invalid(
+                "topology",
+                "`topology: auto` resolves through its candidate table",
+            ))
+        }
+        None => None,
+    };
+    let ranks = local.map_or(1, |topology| topology.tensor_parallel);
     let mut d: DeploymentInput = decode(deployment, "deployment")?;
     let h: HostInput = decode_host(host)?;
     if d.schema_version != 1 || d.kind != "deployment" {
@@ -1528,6 +1594,60 @@ pub fn resolve_effective_with_checkpoint(
     if d.api == DeploymentApi::Decisions {
         crate::decisions::check_engine(raw_profile.engine, &raw_profile.build_fingerprint)?;
     }
+    // ADR 0035 §1, §10: the engine's local multi-GPU mode, from its support
+    // data, before anything else is resolved.
+    let local_support = crate::group_support::local_support(raw_profile.engine.name());
+    if let Some(topology) = local {
+        let unsupported = |detail: String| invalid("topology", detail);
+        // ADR 0035 owner decision 9: no pipeline parallel on one host.
+        if topology.pipeline_parallel > 1 {
+            return Err(unsupported(format!(
+                "group_shape_unsupported:{}: pipeline_parallel above 1 on one host is not \
+                 supported in this version; use tensor_parallel alone",
+                raw_profile.engine.name()
+            )));
+        }
+        let Some(support) = local_support else {
+            return Err(unsupported(format!(
+                "{}: the {} engine has no mode that runs one model on several GPUs of one \
+                 host; remove `topology`",
+                crate::topology::MULTI_GPU_UNSUPPORTED,
+                raw_profile.engine.name()
+            )));
+        };
+        if support
+            .max_tensor_parallel
+            .is_some_and(|max| topology.tensor_parallel > max)
+        {
+            return Err(unsupported(format!(
+                "{}: the {} engine runs at most tensor_parallel: {} on one host",
+                crate::topology::MULTI_GPU_UNSUPPORTED,
+                raw_profile.engine.name(),
+                support.max_tensor_parallel.unwrap_or_default()
+            )));
+        }
+        // ADR 0035 §9: deep parking at N > 1 waits for the engine's live
+        // row; a stated parking tier is refused until then.
+        if let Some(tier @ (Residency::Deep | Residency::HostBacked)) = d.residency {
+            if !support.deep_park {
+                return Err(ConfigError::new(
+                    ConfigErrorCode::UnsupportedCombination,
+                    "residency",
+                    format!(
+                        "capability_missing:deep_park: the {} engine does not park on several \
+                         GPUs of one host yet (residency `{}`); declare `residency: \
+                         restart_only`",
+                        raw_profile.engine.name(),
+                        if tier == Residency::Deep {
+                            "deep"
+                        } else {
+                            "host_backed"
+                        }
+                    ),
+                ));
+            }
+        }
+    }
     // ADR 0023 §4: TensorFold has no memory cap, so its reservation is the
     // operator's explicit statement.
     if raw_profile.engine == Engine::Tensorfold && d.resources.is_none() {
@@ -1552,6 +1672,11 @@ pub fn resolve_effective_with_checkpoint(
     }
     let host = core::normalize_host(h)?;
     let devices = d.devices.take().unwrap_or_default();
+    // ADR 0035 §1: a unified host has one GPU domain; the N GPUs are N
+    // identical discrete GPUs of this host, pinned or chosen.
+    if let Some(topology) = local {
+        multi_gpu::check_local_devices(topology.tensor_parallel, &devices, &host)?;
+    }
     // Owner decision 2026-09-25: an undeclared residency follows the host
     // type and the checkpoint (`deployment_defaults::default_residency`); it
     // is named in the provenance so a re-resolution with the measured weights
@@ -1580,10 +1705,16 @@ pub fn resolve_effective_with_checkpoint(
     // request, startup peak, recurrent state, host copy, residency) applies
     // to that share as on a single host. Declared `resources` are the
     // member's as written, and the timeouts keep the whole checkpoint.
+    // ADR 0035 §3: each GPU of an instance on N GPUs of one host is charged
+    // one rank, its share by the same formula with `T = N`, `P = 1`.
     let member_of = instance_spec
         .group
         .as_ref()
         .map(|group| group.topology)
+        .or(local.map(|topology| crate::topology::Topology {
+            tensor_parallel: topology.tensor_parallel,
+            pipeline_parallel: 1,
+        }))
         .or(facts.member_of)
         .filter(|topology| topology.world_size() > 1 && d.resources.is_none());
     let overflow = || invalid("engine_config.memory", "memory arithmetic overflows");
@@ -1623,7 +1754,19 @@ pub fn resolve_effective_with_checkpoint(
         _ => None,
     };
     let weights_bytes = match (facts.weights_bytes, table_cache, facts.disk_tables) {
-        _ if gguf_sizing.is_some() => gguf_sizing.map(|sizing| sizing.facts.weights_bytes),
+        // ADR 0035 §3: llama.cpp's layer split puts a share of the GGUF on
+        // each GPU; its layout is not read, so the fallback allowance holds.
+        _ if gguf_sizing.is_some() => gguf_sizing
+            .map(|sizing| {
+                capyctl_domain::member_weights::member_weights_bytes(
+                    sizing.facts.weights_bytes,
+                    None,
+                    tensor_parallel,
+                    pipeline_parallel,
+                )
+                .ok_or_else(overflow)
+            })
+            .transpose()?,
         (Some(weights), Some(cache), Some(tables)) => {
             let (memory, cache_bytes) = capyctl_domain::disk_tables::disk_table_weights_bytes(
                 weights,
@@ -1660,10 +1803,20 @@ pub fn resolve_effective_with_checkpoint(
             .filter(|_| raw_profile.engine == Engine::Llamacpp),
         ..facts
     };
-    let device_sizing = core::derived_device_sizing(&devices, &host);
+    let device_sizing = core::derived_device_sizing(
+        &devices,
+        &host,
+        multi_gpu::communication_allowance(ranks),
+        limits,
+    );
     let residency = d.residency.unwrap_or_else(|| {
         // ADR 0030 §7: a decisions deployment restarts instead of parking.
         if d.api == DeploymentApi::Decisions {
+            return Residency::RestartOnly;
+        }
+        // ADR 0035 §9: on several GPUs an engine parks only once its live
+        // row passes; until then a deployment stating no residency restarts.
+        if ranks > 1 && !local_support.is_some_and(|support| support.deep_park) {
             return Residency::RestartOnly;
         }
         // A17: a speculative SGLang deployment never defaults to the host-RAM
@@ -1758,7 +1911,14 @@ pub fn resolve_effective_with_checkpoint(
             .permits(&draft.source)
             .map_err(core::as_draft)?;
     }
-    core::check_single_device(&devices, &host)?;
+    // ADR 0035 §1: N divides the attention heads (vLLM, SGLang), read from
+    // the checkpoint where this machine sees it.
+    multi_gpu::check_heads(
+        profile.engine,
+        ranks,
+        model.resolved_path.as_deref().map(Path::new),
+    )?;
+    core::check_single_device(&devices, &host, ranks)?;
     let declared_resources = d.resources.map(raw_recipe).transpose()?;
     if let Some(resources) = &declared_resources {
         core::check_system_allocation(resources, &host)?;
@@ -1812,6 +1972,9 @@ pub fn resolve_effective_with_checkpoint(
         retention: d.retention,
         api: d.api,
         topology: instance_spec.group.is_some(),
+        // ADR 0035 §9: LMCache stays off on several GPUs until a row
+        // qualifies it (`multi_gpu_unqualified`).
+        multi_gpu: ranks > 1,
         registration: profile.lmcache.as_ref(),
         kv_transfer_config_set: crate::engine_policy::kv_transfer_config_set(
             profile.engine,
@@ -1860,6 +2023,15 @@ pub fn resolve_effective_with_checkpoint(
             );
         }
     }
+    // ADR 0035 §1, §3: the tensor-parallel size of an instance on several
+    // GPUs of one host, with the communication allowance when derived.
+    let topology = (ranks > 1).then(|| LocalTopologyRecord {
+        tensor_parallel: ranks,
+        communication_bytes: declared_resources
+            .is_none()
+            .then(|| multi_gpu::communication_allowance(ranks)),
+        auto: None,
+    });
     let resources = match declared_resources {
         Some(resources) => resources,
         None => {
@@ -1878,7 +2050,11 @@ pub fn resolve_effective_with_checkpoint(
                 &devices,
                 &host,
                 sizing.weights_bytes,
-                overhead,
+                engine_config::Overheads {
+                    device: overhead,
+                    communication: multi_gpu::communication_allowance(ranks),
+                },
+                limits,
             )?;
             if !facts.legacy_overhead {
                 engine_config.memory_mut().overhead_bytes = Some(overhead);
@@ -1944,6 +2120,7 @@ pub fn resolve_effective_with_checkpoint(
         residency: recipe.residency,
         recovery: recipe.recovery,
         selected_devices: recipe.devices,
+        topology,
         resources: recipe.resources,
         request_deadline_ms: recipe.request_deadline_ms,
         timeouts,

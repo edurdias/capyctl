@@ -587,6 +587,8 @@ impl EngineAdapter for RemoteEngine {
             // before the launch is sent; nothing has been sent to the host yet.
             plan.checkpoint_digest = self.first_placement(c, &plan).await?;
         }
+        // ADR 0035 §6: the rank-ordered GPUs, for the ranks the host names.
+        let devices = plan.devices.clone();
         let mut command = MemberCommand {
             identity: CommandIdentity {
                 controller_id: b.controller_id.clone(),
@@ -638,6 +640,7 @@ impl EngineAdapter for RemoteEngine {
             self.lmcache.record(report);
         }
         launch_evidence(&result)?;
+        let receipt = remote_receipt(&result, &devices)?;
         // SPEC §13.2 (G2): this readiness belongs to the host session that
         // proved it; a later session must re-prove it before dispatch.
         self.readiness
@@ -655,7 +658,7 @@ impl EngineAdapter for RemoteEngine {
                 .map(process)
                 .collect(),
             observed_at_ms: result.observed_at_unix_ms,
-            receipt: "authenticated host native model probe".into(),
+            receipt,
             facts: vec![
                 Milestone::AllocationsRestored,
                 Milestone::WeightsUsable,
@@ -1269,194 +1272,11 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
         &self,
         work: &capyctl_store::ordinary_lifecycle::worker::InitializeWork,
     ) -> Result<ExecutionBinding, CoordinatorError> {
-        let denied = || CoordinatorError::Service("remote frozen binding unavailable".into());
-        let owner = self.owner.lock().map_err(|_| denied())?;
-        let host = &work.effective().host.name;
-        let publication = owner
-            .store()
-            .host_publication(host)
-            .map_err(|_| denied())?
-            .ok_or_else(denied)?;
-        if publication.host_id != *host {
-            return Err(denied());
-        }
-        let host_config = capyctl_config::remote_roles::HostConfig::parse(&publication.config_json)
-            .map_err(|_| denied())?;
-        let ingress = host_config.ingress.as_ref().ok_or_else(denied)?;
-        // ADR 0013 §3: the document as scoped to the host this instance was
-        // placed on and (ADR 0019) to the GPU placement chose there, which the
-        // frozen launch names as its one selected device.
-        let device = match work.effective().selected_devices.as_slice() {
-            [claim] => Some(claim.id.as_str()),
-            _ => None,
-        };
-        let source = owner
-            .store()
-            .launch_configuration_source(
-                &work.fence().deployment_id,
-                work.fence().revision,
-                host,
-                device,
-            )
-            .map_err(|_| denied())?
-            .ok_or_else(denied)?;
-        let scoped = source;
-        let local = capyctl_config::remote_resources::local_deployment_document(host, &scoped)
-            .map_err(|_| denied())?;
-        let profile_name = local["runtime_profile"]
-            .as_str()
-            .ok_or_else(denied)?
-            .to_owned();
-        let key = match owner
-            .store()
-            .engine_key(
-                work.binding_id(),
-                work.incarnation(),
-                capyctl_store::secrets::SecretRole::Inference,
-            )
-            .map_err(|_| denied())?
-        {
-            Some(key) => key,
-            None => {
-                let key = capyctl_store::secrets::new_engine_key();
-                owner
-                    .store()
-                    .store_engine_key(
-                        work.binding_id(),
-                        work.incarnation(),
-                        &key,
-                        capyctl_store::secrets::SecretRole::Inference,
-                    )
-                    .map_err(|_| denied())?;
-                key
-            }
-        };
-        owner
-            .store()
-            .bind_remote_ingress(work.binding_id(), host, &ingress.address)
-            .map_err(|_| denied())?;
-        // ADR 0014 §7 (WE3): the recorded digest, or empty when this is the
-        // revision's first placement (measured before the launch is sent).
-        let checkpoint_digest = owner
-            .store()
-            .recorded_checkpoint(&work.fence().deployment_id, work.fence().revision)
-            .map_err(|_| denied())?
-            .unwrap_or_default();
-        let reservation = work.startup_reservation();
-        let measured = capyctl_config::effective::StartupProvenance::Measured;
-        let (startup_bytes, startup_host_bytes) = match &reservation.split {
-            Some(split)
-                if split.device_provenance == measured || split.host_provenance == measured =>
-            {
-                (split.device_bytes, Some(split.host_bytes))
-            }
-            _ => (reservation.bytes, None),
-        };
-        let plan = SingleLaunchPlan {
-            // ADR 0014 §5: the host resolves with the facts this revision was
-            // frozen with, so both sides derive the same memory request: the
-            // whole checkpoint's weights, which the host verifies.
-            checkpoint_weights_bytes: work
-                .effective()
-                .engine_config
-                .memory()
-                .checkpoint_weights_bytes(),
-            // ADR 0014 amendment A16: and the hybrid state slot beside them.
-            checkpoint_state_slot_bytes: work.effective().engine_config.memory().state_slot_bytes,
-            // ADR 0028 §5: a single-host launch holds the whole checkpoint.
-            checkpoint_layout: None,
-            // ADR 0014 amendment A20: the tables an engine that keeps them on
-            // disk was sized without.
-            checkpoint_tables: work
-                .effective()
-                .engine_config
-                .memory()
-                .disk_tables
-                .map(|recorded| recorded.tables),
-            // ADR 0029 §9: the GGUF facts a llama.cpp revision was sized with.
-            checkpoint_gguf: work
-                .effective()
-                .engine_config
-                .memory()
-                .gguf
-                .map(|recorded| recorded.facts),
-            // Owner decision 2026-09-23: the peak this launch reserved. ADR
-            // 0019 §3: on a discrete GPU measured per domain, the card's and
-            // host RAM's apart, so the host charges each where it belongs.
-            startup_bytes: Some(startup_bytes),
-            startup_host_bytes,
-            // ADR 0033 §§3, 6 (lifecycle design §10): the store's LMCache
-            // grant, its ports and the charge it reserved, which the host lays
-            // over the same footprint. Absent when the store planned it off.
-            lmcache: work.lmcache().and_then(|plan| plan.grant()).map(|grant| {
-                capyctl_protocol::execution::LmcacheGrant {
-                    rpc_port: grant.rpc_port,
-                    http_port: grant.http_port,
-                    pool_bytes: grant.pool_bytes,
-                    overhead_bytes: grant.overhead_bytes,
-                    device_bytes: grant.device_bytes,
-                    held_kv_bytes: grant.held_kv_bytes,
-                }
-            }),
-            checkpoint_digest,
-            deployment_config: local.to_string(),
-            profile_name,
-            checkpoint_fingerprint: work.effective().model.content_fingerprint.clone(),
-            host_policy_fingerprint: publication.fingerprint,
-            binding_id: work.binding_id().into(),
-            incarnation: work.incarnation().into(),
-            // The real armed grant and issue time replace these before digesting.
-            grant_id: work.step_id().into(),
-            issued_at_ms: 0,
-            coordinator_session_id: owner.session().id().into(),
-            service_port: work
-                .endpoint()
-                .rsplit(':')
-                .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(denied)?,
-        };
-        // ADR 0013 §5: a host that fences per instance is told which instance
-        // this launch is; any other host fences per deployment and is sent
-        // instance 0, exactly the command it accepted before instances.
-        let instance_index = if owner
-            .store()
-            .host_has_per_instance_fencing(host)
-            .map_err(|_| denied())?
-        {
-            work.instance_index()
-        } else {
-            0
-        };
-        drop(owner);
+        let launch = remote_launch(&self.owner, &self.controller_id, work)?;
         Ok(binding(
             self.sessions.clone(),
             self.owner.clone(),
-            RemoteLaunchBinding {
-                controller_id: self.controller_id.clone(),
-                host_id: host.clone(),
-                member_id: "head".into(),
-                profile_fingerprint: work.effective().profile.build_fingerprint.clone(),
-                launch_command_id: work.step_id().into(),
-                plan,
-                ingress_gate_key: key,
-                instance_index,
-                // ADR 0019: the Ready footprint is charged to a device domain.
-                device_memory: work.effective().ready_device_allocation().is_some(),
-                // ADR 0030 §1: a decisions launch goes only to a host that
-                // declared it.
-                decisions: !work.effective().api.is_chat(),
-                // ADR 0031 §9: a custom engine's launch goes only to a host
-                // that declared it.
-                custom_engine: work.effective().profile.engine
-                    == capyctl_config::engine_policy::Engine::Custom,
-                // ADR 0033 §13: `lmcache: required` and `retention: zero`
-                // go only to a host that declared what honours them.
-                lmcache_required: work.effective().lmcache
-                    == capyctl_config::lmcache::LmcacheMode::Required,
-                retention_zero: work.effective().retention
-                    == capyctl_config::lmcache::Retention::Zero,
-            },
+            launch,
             self.readiness.clone(),
         ))
     }
@@ -1468,6 +1288,219 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
             self.readiness.clone(),
         )))
     }
+}
+
+/// The launch a remote instance's initialize work sends its host: the plan
+/// built from the store's frozen revision and the host's current approved
+/// publication, and what the command needs of the host's session.
+fn remote_launch(
+    owner: &SharedCoordinatorState,
+    controller_id: &str,
+    work: &capyctl_store::ordinary_lifecycle::worker::InitializeWork,
+) -> Result<RemoteLaunchBinding, CoordinatorError> {
+    let denied = || CoordinatorError::Service("remote frozen binding unavailable".into());
+    let owner = owner.lock().map_err(|_| denied())?;
+    let host = &work.effective().host.name;
+    let publication = owner
+        .store()
+        .host_publication(host)
+        .map_err(|_| denied())?
+        .ok_or_else(denied)?;
+    if publication.host_id != *host {
+        return Err(denied());
+    }
+    let host_config = capyctl_config::remote_roles::HostConfig::parse(&publication.config_json)
+        .map_err(|_| denied())?;
+    let ingress = host_config.ingress.as_ref().ok_or_else(denied)?;
+    // ADR 0013 §3: the document as scoped to the host this instance was
+    // placed on and (ADR 0019) to the GPU placement chose there, which the
+    // frozen launch names as its one selected device. ADR 0035 §2: on
+    // several GPUs, to the set it chose, keyed by its GPUs in rank order,
+    // so the host resolves the launch on all N of them.
+    let set: Vec<String> = work
+        .effective()
+        .selected_devices
+        .iter()
+        .map(|claim| claim.id.clone())
+        .collect();
+    let key = (!set.is_empty()).then(|| capyctl_config::instances::set_key(&set));
+    let device = key.as_deref();
+    let source = owner
+        .store()
+        .launch_configuration_source(
+            &work.fence().deployment_id,
+            work.fence().revision,
+            host,
+            device,
+        )
+        .map_err(|_| denied())?
+        .ok_or_else(denied)?;
+    let scoped = source;
+    let local = capyctl_config::remote_resources::local_deployment_document(host, &scoped)
+        .map_err(|_| denied())?;
+    let profile_name = local["runtime_profile"]
+        .as_str()
+        .ok_or_else(denied)?
+        .to_owned();
+    let key = match owner
+        .store()
+        .engine_key(
+            work.binding_id(),
+            work.incarnation(),
+            capyctl_store::secrets::SecretRole::Inference,
+        )
+        .map_err(|_| denied())?
+    {
+        Some(key) => key,
+        None => {
+            let key = capyctl_store::secrets::new_engine_key();
+            owner
+                .store()
+                .store_engine_key(
+                    work.binding_id(),
+                    work.incarnation(),
+                    &key,
+                    capyctl_store::secrets::SecretRole::Inference,
+                )
+                .map_err(|_| denied())?;
+            key
+        }
+    };
+    owner
+        .store()
+        .bind_remote_ingress(work.binding_id(), host, &ingress.address)
+        .map_err(|_| denied())?;
+    // ADR 0014 §7 (WE3): the recorded digest, or empty when this is the
+    // revision's first placement (measured before the launch is sent).
+    let checkpoint_digest = owner
+        .store()
+        .recorded_checkpoint(&work.fence().deployment_id, work.fence().revision)
+        .map_err(|_| denied())?
+        .unwrap_or_default();
+    let reservation = work.startup_reservation();
+    let measured = capyctl_config::effective::StartupProvenance::Measured;
+    let (startup_bytes, startup_host_bytes) = match &reservation.split {
+        Some(split) if split.device_provenance == measured || split.host_provenance == measured => {
+            (split.device_bytes, Some(split.host_bytes))
+        }
+        _ => (reservation.bytes, None),
+    };
+    let plan = SingleLaunchPlan {
+        // ADR 0014 §5: the host resolves with the facts this revision was
+        // frozen with, so both sides derive the same memory request: the
+        // whole checkpoint's weights, which the host verifies.
+        checkpoint_weights_bytes: work
+            .effective()
+            .engine_config
+            .memory()
+            .checkpoint_weights_bytes(),
+        // ADR 0014 amendment A16: and the hybrid state slot beside them.
+        checkpoint_state_slot_bytes: work.effective().engine_config.memory().state_slot_bytes,
+        // ADR 0028 §5: a single-host launch holds the whole checkpoint.
+        // ADR 0035 §3: on N GPUs of one host each rank's share is taken
+        // with the checkpoint's layout, as a group member's is, so the
+        // host derives the same per-GPU charge.
+        checkpoint_layout: (work.effective().local_tensor_parallel() > 1)
+            .then(|| {
+                work.effective()
+                    .engine_config
+                    .memory()
+                    .member
+                    .and_then(|member| member.layout)
+            })
+            .flatten(),
+        // ADR 0014 amendment A20: the tables an engine that keeps them on
+        // disk was sized without.
+        checkpoint_tables: work
+            .effective()
+            .engine_config
+            .memory()
+            .disk_tables
+            .map(|recorded| recorded.tables),
+        // ADR 0029 §9: the GGUF facts a llama.cpp revision was sized with.
+        checkpoint_gguf: work
+            .effective()
+            .engine_config
+            .memory()
+            .gguf
+            .map(|recorded| recorded.facts),
+        // Owner decision 2026-09-23: the peak this launch reserved. ADR
+        // 0019 §3: on a discrete GPU measured per domain, the card's and
+        // host RAM's apart, so the host charges each where it belongs.
+        startup_bytes: Some(startup_bytes),
+        startup_host_bytes,
+        // ADR 0033 §§3, 6 (lifecycle design §10): the store's LMCache
+        // grant, its ports and the charge it reserved, which the host lays
+        // over the same footprint. Absent when the store planned it off.
+        lmcache: work.lmcache().and_then(|plan| plan.grant()).map(|grant| {
+            capyctl_protocol::execution::LmcacheGrant {
+                rpc_port: grant.rpc_port,
+                http_port: grant.http_port,
+                pool_bytes: grant.pool_bytes,
+                overhead_bytes: grant.overhead_bytes,
+                device_bytes: grant.device_bytes,
+                held_kv_bytes: grant.held_kv_bytes,
+            }
+        }),
+        checkpoint_digest,
+        deployment_config: local.to_string(),
+        profile_name,
+        checkpoint_fingerprint: work.effective().model.content_fingerprint.clone(),
+        host_policy_fingerprint: publication.fingerprint,
+        binding_id: work.binding_id().into(),
+        incarnation: work.incarnation().into(),
+        // The real armed grant and issue time replace these before digesting.
+        grant_id: work.step_id().into(),
+        issued_at_ms: 0,
+        coordinator_session_id: owner.session().id().into(),
+        // ADR 0035 §§2, 11: a launch on several GPUs of this host names
+        // them in rank order, by the host's own ids; on one GPU none, so
+        // the command encodes exactly as before.
+        devices: local_devices(host, work.effective()),
+        service_port: work
+            .endpoint()
+            .rsplit(':')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(denied)?,
+    };
+    // ADR 0013 §5: a host that fences per instance is told which instance
+    // this launch is; any other host fences per deployment and is sent
+    // instance 0, exactly the command it accepted before instances.
+    let instance_index = if owner
+        .store()
+        .host_has_per_instance_fencing(host)
+        .map_err(|_| denied())?
+    {
+        work.instance_index()
+    } else {
+        0
+    };
+    drop(owner);
+    Ok(RemoteLaunchBinding {
+        controller_id: controller_id.into(),
+        host_id: host.clone(),
+        member_id: "head".into(),
+        profile_fingerprint: work.effective().profile.build_fingerprint.clone(),
+        launch_command_id: work.step_id().into(),
+        plan,
+        ingress_gate_key: key,
+        instance_index,
+        // ADR 0019: the Ready footprint is charged to a device domain.
+        device_memory: work.effective().ready_device_allocation().is_some(),
+        // ADR 0030 §1: a decisions launch goes only to a host that
+        // declared it.
+        decisions: !work.effective().api.is_chat(),
+        // ADR 0031 §9: a custom engine's launch goes only to a host
+        // that declared it.
+        custom_engine: work.effective().profile.engine
+            == capyctl_config::engine_policy::Engine::Custom,
+        // ADR 0033 §13: `lmcache: required` and `retention: zero`
+        // go only to a host that declared what honours them.
+        lmcache_required: work.effective().lmcache
+            == capyctl_config::lmcache::LmcacheMode::Required,
+        retention_zero: work.effective().retention == capyctl_config::lmcache::Retention::Zero,
+    })
 }
 
 /// ADR 0028 §8: the member hosts of a group through their authenticated
@@ -1640,6 +1673,76 @@ impl crate::group_activation::GroupHosts for AgentGroupHosts {
     }
 }
 
+/// ADR 0035 §§2, 11: the host-local ids (`gpuN`) of the GPUs a launch on
+/// several GPUs of `host` runs on, in rank order (rank r on the r-th claim of
+/// the frozen revision); empty for a launch on one GPU. Its size is the
+/// launch's local tensor-parallel size N.
+pub(crate) fn local_devices(
+    host: &str,
+    effective: &capyctl_config::effective::EffectiveDeployment,
+) -> Vec<String> {
+    if effective.local_tensor_parallel() < 2 {
+        return Vec::new();
+    }
+    let scoped = capyctl_config::remote_resources::ledger_key(host, "device", "");
+    effective
+        .selected_devices
+        .iter()
+        .map(|claim| {
+            claim
+                .id
+                .strip_prefix(&scoped)
+                .unwrap_or(&claim.id)
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The readiness receipt of a remote launch. ADR 0035 §6: the host's own
+/// observation names the rank processes of a launch on several GPUs (each
+/// alive process's `rank`, its GPU the plan's `devices[rank]`); the receipt
+/// records them, as an embedded launch's does, so a rank's exit is named by
+/// its rank and GPU. A host that names ranks names one per GPU, or the
+/// readiness proves nothing. llama.cpp runs one process on every GPU and
+/// names none.
+fn remote_receipt(
+    result: &pb::MemberExecutionResult,
+    devices: &[String],
+) -> Result<String, RuntimeError> {
+    use capyctl_domain::local_tp::{ranks_receipt, RankRecord};
+    const PROBED: &str = "authenticated host native model probe";
+    let mut ranks: Vec<RankRecord> = result
+        .processes
+        .iter()
+        .filter(|p| p.presence == "alive")
+        .filter_map(|p| {
+            let rank = p.rank?;
+            Some(RankRecord {
+                rank,
+                device: devices.get(usize::try_from(rank).ok()?)?.clone(),
+                process: process(p),
+            })
+        })
+        .collect();
+    if ranks.is_empty() && result.processes.iter().all(|p| p.rank.is_none()) {
+        return Ok(PROBED.into());
+    }
+    ranks.sort_by_key(|r| r.rank);
+    let covers = devices.len() >= 2
+        && ranks.len() == devices.len()
+        && ranks
+            .iter()
+            .enumerate()
+            .all(|(index, r)| usize::try_from(r.rank).ok() == Some(index));
+    if !covers {
+        return Err(RuntimeError::Uncertain(
+            "the host's readiness names rank processes that are not one per GPU of the launch"
+                .into(),
+        ));
+    }
+    Ok(format!("{PROBED}; {}", ranks_receipt(&ranks)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1671,6 +1774,7 @@ mod tests {
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
+                devices: Vec::new(),
             },
             ingress_gate_key: [7; 32],
             instance_index: 0,
@@ -1681,6 +1785,280 @@ mod tests {
             retention_zero: false,
         }
     }
+
+    /// ADR 0035 §§2, 3, 11: an enrolled host with two identical GPUs that
+    /// declared every capability, and the initialize work of a deployment
+    /// placed there with `topology` (none on one GPU), its 20 GiB of weights
+    /// and the checkpoint's `layout` measured. Returns the owned state, the
+    /// host's id and the work.
+    fn remote_work(
+        topology: Option<serde_json::Value>,
+        layout: capyctl_domain::member_weights::CheckpointLayout,
+    ) -> (
+        tempfile::TempDir,
+        SharedCoordinatorState,
+        String,
+        capyctl_store::ordinary_lifecycle::worker::InitializeWork,
+    ) {
+        use serde_json::json;
+        let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
+        let owned = Arc::new(Mutex::new(
+            crate::OwnedCoordinatorState::open(dir.path()).unwrap(),
+        ));
+        let golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+        ))
+        .unwrap();
+        let mut host = golden["input"]["host"].clone();
+        host["resource_policy"]["domains"] = json!({
+            "system": {"memory": "distinct", "managed_limit": "200GiB", "free_reserve": "8GiB",
+                       "parked_limit": "64GiB"},
+            "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "40GiB",
+                     "free_reserve": "1GiB", "parked_limit": "4GiB"},
+            "gpu1": {"memory": "device", "device": "gpu1", "managed_limit": "40GiB",
+                     "free_reserve": "1GiB", "parked_limit": "4GiB"}
+        });
+        host["resource_policy"]["devices"] = json!({
+            "gpu0": {"domain": "gpu0", "sharing": "shared", "product_name": "NVIDIA RTX A6000"},
+            "gpu1": {"domain": "gpu1", "sharing": "shared", "product_name": "NVIDIA RTX A6000"}
+        });
+        // The host's published role document: its policy, its state and its
+        // ingress.
+        let mut published = host.clone();
+        published["state_dir"] = json!("/home/operator/.local/state/capyctl");
+        published["identity_dir"] = json!("/home/operator/.local/state/capyctl/identity");
+        published["ingress"] = json!({
+            "transport": "trusted_private_link",
+            "address": "http://100.64.0.2:9443",
+            "bind": "100.64.0.2:9443"
+        });
+        let work = {
+            let owner = owned.lock().unwrap();
+            let (store, session) = (owner.store(), owner.session());
+            store
+                .create_host_invitation(&"b".repeat(64), "spark", 100, 0)
+                .unwrap();
+            let host_id = store
+                .redeem_host_invitation(
+                    &capyctl_store::enrollment::Redemption {
+                        invitation_digest: "b".repeat(64),
+                        transaction_id: "tx".into(),
+                        host_name: "spark".into(),
+                        key_digest: "c".repeat(64),
+                        csr_digest: "d".repeat(64),
+                    },
+                    1,
+                    |id| {
+                        Ok(capyctl_store::enrollment::CertificateRecord {
+                            host_id: id.into(),
+                            fingerprint: "bf".repeat(32),
+                            certificate_pem: "certificate".into(),
+                            expires_unix: 500,
+                        })
+                    },
+                )
+                .unwrap()
+                .host_id;
+            store
+                .record_host_version(
+                    &host_id,
+                    &capyctl_store::host_versions::HostVersion {
+                        binary_version: capyctl_protocol::version::BINARY_VERSION.into(),
+                        compatibility: "supported".into(),
+                        reason: String::new(),
+                        capabilities: capabilities::agent_capabilities(),
+                        recorded_at_ms: 1,
+                    },
+                )
+                .unwrap();
+            store
+                .publish_host_configuration(&capyctl_store::host_publication::HostPublication {
+                    host_id: host_id.clone(),
+                    config_json: published.to_string(),
+                    boot_id: "boot".into(),
+                    fingerprint: capyctl_config::remote_resources::policy_fingerprint(&published),
+                    received_at_ms: 1,
+                })
+                .unwrap();
+            let policy = capyctl_config::effective::normalize_host_policy(&host).unwrap();
+            let observed: Vec<_> = ["system", "gpu0", "gpu1"]
+                .map(|domain| capyctl_domain::resources::MemoryObservation {
+                    domain: domain.into(),
+                    capacity_bytes: 1 << 40,
+                    available_bytes: 1 << 40,
+                    sampled_at_ms: 1,
+                })
+                .to_vec();
+            store
+                .import_remote_resource_policy(session, &host_id, &policy, &observed, 1)
+                .unwrap();
+            let trusted =
+                capyctl_config::remote_resources::scope_host_document(&host_id, &host).unwrap();
+            let current = store.resource_policy(&host_id).unwrap().unwrap();
+            let target = capyctl_store::managed_configuration::HostTarget {
+                host_id: host_id.clone(),
+                host_name: "spark".into(),
+                trusted_host: capyctl_config::effective::compose_current_resource_controls(
+                    &trusted,
+                    &current.context,
+                    &current.controls,
+                )
+                .unwrap(),
+                scoped: true,
+            };
+            let mut config = golden["input"]["deployment"].clone();
+            let object = config.as_object_mut().unwrap();
+            object.remove("resources");
+            object.remove("host");
+            config["devices"] = json!([]);
+            config["engine_config"] = json!({"memory": {"kv_cache": "4GiB"}});
+            config["residency"] = json!("restart_only");
+            config["instances"] = json!(1);
+            config["placement"] = json!({"hosts": ["spark"]});
+            if let Some(topology) = topology {
+                config["topology"] = topology;
+            }
+            let receipt = store
+                .create_managed_configuration_on_hosts(
+                    session,
+                    "owner",
+                    "deploy",
+                    &json!({ "config": config }).to_string(),
+                    std::slice::from_ref(&target),
+                    &[],
+                    1000,
+                )
+                .unwrap();
+            let id = receipt.deployment_id;
+            let revision = store.current_revision(&id).unwrap().unwrap();
+            store
+                .record_checkpoint_measurement(
+                    session,
+                    &id,
+                    revision,
+                    &host_id,
+                    &format!("sha256:{}", "a".repeat(64)),
+                    20 << 30,
+                    None,
+                    Some(layout),
+                    capyctl_config::effective::DigestProvenance::Measured,
+                    None,
+                    None,
+                    None,
+                    1000,
+                )
+                .unwrap();
+            store
+                .accept_scoped_start_command(
+                    session,
+                    "owner",
+                    &id,
+                    capyctl_store::ordinary_lifecycle::placement::StartScope::All,
+                    revision,
+                    "start",
+                    1000,
+                    100_000,
+                    None,
+                )
+                .unwrap();
+            store.next_initialize(session).unwrap().unwrap()
+        };
+        let host_id = work.effective().host.name.clone();
+        (dir, owned, host_id, work)
+    }
+
+    fn layout() -> capyctl_domain::member_weights::CheckpointLayout {
+        capyctl_domain::member_weights::CheckpointLayout {
+            sharded_bytes: 18 << 30,
+            layer_count: 4,
+            largest_layer_bytes: 5 << 30,
+        }
+    }
+
+    /// The document the server keeps for the revision on `host` and `key`
+    /// (a GPU, or a set in rank order), as the host receives it.
+    fn local_source(
+        owned: &SharedCoordinatorState,
+        work_host: &str,
+        key: &str,
+        id: &str,
+    ) -> String {
+        let owner = owned.lock().unwrap();
+        let revision = owner.store().current_revision(id).unwrap().unwrap();
+        let source = owner
+            .store()
+            .launch_configuration_source(id, revision, work_host, Some(key))
+            .unwrap()
+            .unwrap();
+        capyctl_config::remote_resources::local_deployment_document(work_host, &source)
+            .unwrap()
+            .to_string()
+    }
+
+    // T46 (ADR 0035 §§2, 3, 11): a remote launch on two GPUs is sent the
+    // document the server keeps for its set (keyed by both GPUs in rank
+    // order), which names both claims; the plan lists the GPUs in rank order
+    // by the host's own ids and carries the checkpoint's layout, so the host
+    // derives the same per-GPU share.
+    #[test]
+    fn a_remote_launch_on_two_gpus_sends_its_sets_document_devices_and_layout() {
+        let (_dir, owned, host, work) =
+            remote_work(Some(serde_json::json!({"tensor_parallel": 2})), layout());
+        assert_eq!(work.effective().local_tensor_parallel(), 2);
+        let launch = remote_launch(&owned, "controller", &work).unwrap();
+        assert_eq!(launch.plan.devices, ["gpu0", "gpu1"]);
+        assert_eq!(launch.plan.checkpoint_layout, Some(layout()));
+        let set = work
+            .effective()
+            .selected_devices
+            .iter()
+            .map(|claim| claim.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            set,
+            ["gpu0", "gpu1"]
+                .map(|gpu| capyctl_config::remote_resources::ledger_key(&host, "device", gpu))
+        );
+        let key = capyctl_config::instances::set_key(&set);
+        assert_eq!(
+            launch.plan.deployment_config,
+            local_source(&owned, &host, &key, &work.fence().deployment_id)
+        );
+        let sent: serde_json::Value = serde_json::from_str(&launch.plan.deployment_config).unwrap();
+        assert_eq!(sent["topology"], serde_json::json!({"tensor_parallel": 2}));
+        let ids: Vec<&str> = sent["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|claim| claim["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["gpu0", "gpu1"], "all N claims, rank order");
+    }
+
+    // T46 (ADR 0035 §§2, 11, ADR 0019): a remote launch on one GPU is sent
+    // that GPU's document, as before, with no device list and no layout (an
+    // empty repeated field and an absent one encode no bytes), so its
+    // command encodes exactly as it did before this ADR.
+    #[test]
+    fn a_remote_launch_on_one_gpu_is_unchanged() {
+        let (_dir, owned, host, work) = remote_work(None, layout());
+        assert_eq!(work.effective().local_tensor_parallel(), 1);
+        let launch = remote_launch(&owned, "controller", &work).unwrap();
+        assert!(launch.plan.devices.is_empty());
+        assert_eq!(launch.plan.checkpoint_layout, None);
+        let [claim] = work.effective().selected_devices.as_slice() else {
+            panic!("one claim");
+        };
+        assert_eq!(
+            launch.plan.deployment_config,
+            local_source(&owned, &host, &claim.id, &work.fence().deployment_id)
+        );
+    }
     fn observed(role: &str, pid: u32, presence: &str) -> pb::OwnedProcessObservation {
         pb::OwnedProcessObservation {
             role: role.into(),
@@ -1688,6 +2066,7 @@ mod tests {
             boot_id: "boot".into(),
             start_ticks: 9,
             presence: presence.into(),
+            rank: None,
         }
     }
     fn result(processes: Vec<pb::OwnedProcessObservation>) -> pb::MemberExecutionResult {
@@ -2301,7 +2680,63 @@ mod tests {
                 boot_id: p.boot_id.clone(),
                 start_ticks: p.start_ticks,
                 presence: "alive".into(),
+                rank: None,
             })
             .collect()
+    }
+
+    // T46 (ADR 0035 §6): the remote readiness receipt records the ranks the
+    // host's own observation named, one per GPU in rank order; a launch
+    // naming none (one GPU, llama.cpp) keeps the plain receipt, and ranks
+    // that do not cover the GPUs prove nothing.
+    #[test]
+    fn the_remote_receipt_records_the_ranks_the_host_named() {
+        let observed = |role: &str, pid: u32, rank: Option<u32>| pb::OwnedProcessObservation {
+            role: role.into(),
+            pid,
+            boot_id: "boot".into(),
+            start_ticks: u64::from(pid),
+            presence: "alive".into(),
+            rank,
+        };
+        let devices = vec!["gpu0".to_owned(), "gpu1".to_owned()];
+        let result = |processes| pb::MemberExecutionResult {
+            processes,
+            ..Default::default()
+        };
+        let named = result(vec![
+            observed("api", 10, None),
+            observed("worker-0", 11, None),
+            observed("rank-1", 13, Some(1)),
+            observed("rank-0", 12, Some(0)),
+        ]);
+        let receipt = remote_receipt(&named, &devices).unwrap();
+        assert_eq!(
+            receipt,
+            "authenticated host native model probe; tp ranks: 0=rank-0:12@gpu0 1=rank-1:13@gpu1"
+        );
+        assert_eq!(
+            capyctl_domain::local_tp::rank_of(
+                &receipt,
+                &ProcessIdentity {
+                    role: "rank-1".into(),
+                    pid: 13,
+                    boot_id: "boot".into(),
+                    start_ticks: 13,
+                }
+            )
+            .map(|r| r.device),
+            Some("gpu1".into())
+        );
+        let plain = result(vec![observed("api", 10, None)]);
+        assert_eq!(
+            remote_receipt(&plain, &[]).unwrap(),
+            "authenticated host native model probe"
+        );
+        let partial = result(vec![
+            observed("api", 10, None),
+            observed("rank-0", 12, Some(0)),
+        ]);
+        assert!(remote_receipt(&partial, &devices).is_err());
     }
 }

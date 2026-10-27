@@ -10,8 +10,13 @@ pub fn decode_effective_snapshot(text: &str) -> Result<EffectiveDeployment, Conf
     // intrinsic rule; exact normalized equality rejects omitted/unknown fields,
     // changed fixed allocator settings, and untrusted fingerprint claims.
     let value = crate::strict_yaml::build_value(text)?;
-    let (engine_config, resources_derived, facts) =
+    let (engine_config, resources_derived, mut facts) =
         declared_engine_config(&value["engine_config"])?;
+    // ADR 0035 §1a: N=1 has no memory.member, but the automatic candidate
+    // table still depends on the measured tensor layout for larger N.
+    if let Some(layout) = value["topology"]["auto"].get("layout") {
+        facts.layout = Some(layout_facts(layout)?);
+    }
     let (deployment, host) = snapshot_inputs(&value, engine_config, resources_derived)?;
     let mut effective = resolve_effective_with_checkpoint(&deployment, &host, facts)?;
     // ADR 0014 amendment A7 (2026-10-02): a vLLM or SGLang revision frozen
@@ -128,6 +133,21 @@ pub(super) fn snapshot_inputs(
     // revision that states none serves chat, as every revision did before.
     if let Some(api) = value.get("api") {
         deployment["api"] = api.clone();
+    }
+    // ADR 0035 §1, §1a: a revision on several GPUs of one host restates its
+    // tensor-parallel size; one under `topology: auto` restates `auto`, whose
+    // resolution chooses its GPUs again, and the exact-equality check below
+    // proves the claim.
+    if let Some(record) = value.get("topology") {
+        if record.get("auto").is_some() {
+            deployment["topology"] = json!(crate::topology::AUTO);
+            deployment
+                .as_object_mut()
+                .expect("deployment is an object")
+                .remove("devices");
+        } else {
+            deployment["topology"] = json!({"tensor_parallel": record["tensor_parallel"]});
+        }
     }
     // ADR 0033 (contract decision 1): the LMCache settings are frozen only
     // when declared away from their defaults; restated as declared, and the
@@ -513,22 +533,30 @@ fn member_facts(member: &Value) -> Result<MemberFacts, ConfigError> {
                 .and_then(|w| (w >= 0).then_some(w).ok_or_else(bad))?,
         ),
     };
-    let layout = match member.get("layout") {
-        None => None,
-        Some(layout) => {
-            let parsed = capyctl_domain::member_weights::CheckpointLayout {
-                sharded_bytes: bytes(layout, "sharded_bytes")?,
-                layer_count: layout
-                    .get("layer_count")
-                    .and_then(Value::as_u64)
-                    .and_then(|n| u32::try_from(n).ok())
-                    .ok_or_else(bad)?,
-                largest_layer_bytes: bytes(layout, "largest_layer_bytes")?,
-            };
-            Some(parsed.is_valid().then_some(parsed).ok_or_else(bad)?)
-        }
-    };
+    let layout = member.get("layout").map(layout_facts).transpose()?;
     Ok((weights, layout, Some(topology)))
+}
+
+fn layout_facts(
+    layout: &Value,
+) -> Result<capyctl_domain::member_weights::CheckpointLayout, ConfigError> {
+    let bad = || invalid("snapshot", "checkpoint layout invalid");
+    let parsed = capyctl_domain::member_weights::CheckpointLayout {
+        sharded_bytes: layout
+            .get("sharded_bytes")
+            .and_then(Value::as_i64)
+            .ok_or_else(bad)?,
+        layer_count: layout
+            .get("layer_count")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(bad)?,
+        largest_layer_bytes: layout
+            .get("largest_layer_bytes")
+            .and_then(Value::as_i64)
+            .ok_or_else(bad)?,
+    };
+    parsed.is_valid().then_some(parsed).ok_or_else(bad)
 }
 
 /// ADR 0014 amendment A20: the whole checkpoint's weights and the tables a

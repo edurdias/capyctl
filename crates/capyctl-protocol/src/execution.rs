@@ -60,6 +60,10 @@ pub struct SingleLaunchPlan {
     /// launch, its leased ports and its charge. `None` when the store planned
     /// LMCache off (and in every command from a server that predates it).
     pub lmcache: Option<LmcacheGrant>,
+    /// ADR 0035 §§2, 11: the host-local device ids (`gpuN`) of a launch on
+    /// several GPUs of one host, in rank order (rank r on the r-th GPU),
+    /// distinct. Empty for a launch on one GPU (encoded exactly as before).
+    pub devices: Vec<String>,
 }
 
 /// ADR 0033 §§3, 6, 7: one launch's LMCache server as the store planned it:
@@ -285,6 +289,9 @@ impl SingleLaunchPlan {
             || plan.lmcache.as_ref().is_some_and(|grant| {
                 group_member || LmcacheGrant::from_wire(grant, plan.service_port).is_none()
             })
+            // ADR 0035 §§2, 12: two or more distinct `gpuN` ids, never for a
+            // group member (a group keeps one device per host).
+            || (!plan.devices.is_empty() && (group_member || !local_devices_ok(&plan.devices)))
         {
             return Err(GroupIdentityError);
         }
@@ -319,6 +326,7 @@ impl SingleLaunchPlan {
                 .lmcache
                 .as_ref()
                 .and_then(|grant| LmcacheGrant::from_wire(grant, plan.service_port)),
+            devices: plan.devices,
         })
     }
     fn to_wire(&self) -> pb::SingleLaunchPlan {
@@ -348,8 +356,22 @@ impl SingleLaunchPlan {
             checkpoint_tables: self.checkpoint_tables.as_ref().map(tables_to_wire),
             checkpoint_gguf: self.checkpoint_gguf.as_ref().map(gguf_to_wire),
             lmcache: self.lmcache.as_ref().map(LmcacheGrant::to_wire),
+            devices: self.devices.clone(),
         }
     }
+}
+
+/// ADR 0035 §§1, 2: a launch's device list: at least two and at most 64
+/// (ADR 0028's largest dimension) distinct host-local `gpuN` ids.
+pub fn local_devices_ok(devices: &[String]) -> bool {
+    let distinct: std::collections::BTreeSet<&String> = devices.iter().collect();
+    (2..=64).contains(&devices.len())
+        && distinct.len() == devices.len()
+        && devices.iter().all(|device| {
+            device.strip_prefix("gpu").is_some_and(|n| {
+                !n.is_empty() && n.len() <= 4 && n.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
 }
 
 /// ADR 0014 §7 (WE3): measure one deployment's checkpoint on its host. Like a
@@ -1158,6 +1180,26 @@ pub fn validate_result(
             || process.boot_id.len() > 128
             || !matches!(process.presence.as_str(), "alive" | "gone" | "unknown")
             || !seen.insert((process.pid, &process.boot_id, process.start_ticks))
+        {
+            return Err(GroupIdentityError);
+        }
+    }
+    // ADR 0035 §6: a rank names a GPU of a launch's device list, each rank at
+    // most once, and a `rank-N` role is the rank process of rank N. Results
+    // of other commands name a launch's processes by role alone.
+    let devices = command
+        .action
+        .launch_plan()
+        .map_or(0, |plan| plan.devices.len());
+    let mut ranks = std::collections::BTreeSet::new();
+    for process in &result.processes {
+        let Some(rank) = process.rank else {
+            continue;
+        };
+        if usize::try_from(rank).map_or(true, |rank| rank >= devices)
+            || !ranks.insert(rank)
+            || capyctl_domain::completion::rank_role(&process.role)
+                .is_some_and(|named| named != rank)
         {
             return Err(GroupIdentityError);
         }
