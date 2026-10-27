@@ -188,54 +188,19 @@ setup_tools() {
   [ "$PLAN" = 1 ] || { "$BIN/uv" --version; "$BIN/protoc" --version; cmake --version | head -1; } | tee -a "$RES/versions.txt"
 }
 
-# The qualification build (ADR 0035 §9, owner decision 3): the shipped support
-# data with `deep_park: true` for vLLM's and SGLang's local multi-GPU mode, which
-# is exactly the change MG4 and MG5 make when they pass. Refuses unless it flips
-# exactly those two entries.
-QUALIFY_PY='
-import re, sys
-path = sys.argv[1]
-text = open(path).read()
-start = text.index("pub fn local_support")
-end = text.index("\n}\n", start)
-body = text[start:end]
-flipped, n = re.subn(r"(\"(?:vllm|sglang)\"\s*=>\s*Some\(LocalSupport\s*\{[^}]*?deep_park:\s*)false", r"\1true", body)
-if n != 2:
-    sys.exit(f"qualify: expected to flip 2 deep_park entries in local_support, flipped {n}")
-open(path, "w").write(text[:start] + flipped + text[end:])
-print("qualify: vllm and sglang local deep_park set to true")
-'
-
 build_capyctl() {
-  phase "CapyCTL builds: this checkout (shipped support data), its qualification build, and $OLD_TAG (MG11's older host)"
+  phase "CapyCTL builds: this checkout and $OLD_TAG (MG11's older host)"
   local cargo=(cargo build --release --locked --bin capyctl -j 4)
   if [ "$PLAN" = 0 ] && [ "$(cat "$MG/build-commit" 2>/dev/null)" != "${CAPYCTL_COMMIT:-unknown}" ]; then
-    rm -f "$BIN/capyctl" "$BIN/capyctl-qualify"
+    rm -f "$BIN/capyctl"
   fi
   if [ ! -x "$BIN/capyctl" ]; then
     run bash -o pipefail -c "cd $MG/src && PROTOC=$BIN/protoc ${cargo[*]} && cp target/release/capyctl $BIN/capyctl"
   fi
-  if [ ! -x "$BIN/capyctl-qualify" ]; then
-    run rm -rf "$MG/src-qualify"
-    run cp -a "$MG/src" "$MG/src-qualify"
-    run python3 -c "$QUALIFY_PY" "$MG/src-qualify/crates/capyctl-config/src/group_support.rs"
-    run bash -o pipefail -c "cd $MG/src-qualify && PROTOC=$BIN/protoc ${cargo[*]} && cp target/release/capyctl $BIN/capyctl-qualify"
-  fi
-  # A dry run makes the qualification edit on a copy of this checkout's support
-  # data, so a plan that passes is one whose qualification build turns on deep
-  # parking at N > 1 for vLLM and SGLang (and for nothing else).
-  local support=$HERE/../../../crates/capyctl-config/src/group_support.rs
-  if [ "$PLAN" = 1 ] && [ -f "$support" ]; then
-    cp "$support" "$MG/group_support.rs"
-    python3 -c "$QUALIFY_PY" "$MG/group_support.rs" >/dev/null ||
-      { echo "qualify: this checkout's support data cannot make the qualification build" >&2; exit 1; }
-    show "qualification edit checked on this checkout: $(diff "$support" "$MG/group_support.rs" | grep -c '^>') line(s) set deep_park: true"
-    diff "$support" "$MG/group_support.rs" | grep '^>' | sed -e 's/^>/     +/' >&3
-  fi
   if [ ! -x "$BIN/capyctl-old" ] && [ -d "$MG/src-old" ]; then
     run bash -o pipefail -c "cd $MG/src-old && PROTOC=$BIN/protoc ${cargo[*]} && cp target/release/capyctl $BIN/capyctl-old"
   fi
-  [ "$PLAN" = 1 ] || for b in capyctl capyctl-qualify capyctl-old; do
+  [ "$PLAN" = 1 ] || for b in capyctl capyctl-old; do
     [ -x "$BIN/$b" ] && echo "$b $("$BIN/$b" --version 2>&1 | head -1) sha256 $(sha256sum "$BIN/$b" | cut -c1-64)"
   done | tee -a "$RES/versions.txt"
 }
@@ -319,7 +284,7 @@ setup() {
     { echo "Q30_REV=$("${HELPER[@]}" hf-rev "$Q30_REPO")"; echo "Q4_REV=$("${HELPER[@]}" hf-rev "$Q4_REPO")"; } >"$MG/revs.env"
     tee -a "$RES/versions.txt" <"$MG/revs.env"
     local missing="" f
-    for f in "$BIN/capyctl" "$BIN/capyctl-qualify" "$V32/bin/vllm" "$S22/bin/python" "$LCBIN"; do
+    for f in "$BIN/capyctl" "$V32/bin/vllm" "$S22/bin/python" "$LCBIN"; do
       [ -x "$f" ] || missing="$missing $f"
     done
     [ -s "$GGUF_DIR/$GGUF_FILE" ] || missing="$missing $GGUF_DIR/$GGUF_FILE"
@@ -862,7 +827,7 @@ bandwidth() {
 
 rows_shipped() {
   want BW MG1 MG2 MG3 MG4 MG5 MG6 MG7 MG8 MG9 MG10 MG11 MG12 MG13 MG14 || return 0
-  phase "role s1: the shipped build (deep parking at N > 1 off for every engine)"
+  phase "role s1: the shipped build, serving and failure checks"
   role_up s1 capyctl || { say "role s1 did not start"; return; }
   profiles
   bandwidth
@@ -885,8 +850,10 @@ engine_config: {memory: {kv_cache: 40GiB}}"
   fi
 
   dep mg-v v32 "$(q30)" "topology: {tensor_parallel: 2}
+residency: restart_only
 engine_config: {context_length: 32768}"
   dep mg-s s22 "$(q30)" "topology: {tensor_parallel: 2}
+residency: restart_only
 engine_config: {context_length: 32768}"
   dep mg-l lc "$GGUF_DIR" "topology: {tensor_parallel: 2}
 engine_config: {context_length: 16384}"
@@ -915,7 +882,7 @@ engine_config: {context_length: 16384}"
 
 rows_qualify() {
   want MG4 MG5 MG6 MG10 MG13 || return 0
-  phase "role s2: the qualification build (vLLM and SGLang deep parking at N > 1 on, as MG4/MG5 would set it)"
+  phase "role s2: the shipped build, qualified vLLM and SGLang multi-GPU parking"
   local -a host_weights_budget=()
   if want MG6; then
     # Qwen3-30B TP2 charges ~94.1 GiB of host RAM: 1.5x the full
@@ -929,7 +896,7 @@ rows_qualify() {
       --set host.resource_policy.memory.system.free_reserve=20%
     )
   fi
-  role_up s2 capyctl-qualify "${host_weights_budget[@]}" || { say "role s2 did not start"; return; }
+  role_up s2 capyctl "${host_weights_budget[@]}" || { say "role s2 did not start"; return; }
   profiles
   if want MG4; then
     phase "MG4 vLLM TP 2 deep"
@@ -1150,9 +1117,11 @@ PY
   pause 20
   dep mg11-new v32 "$(q30)" "host: mg-new
 topology: {tensor_parallel: 2}
+residency: restart_only
 engine_config: {context_length: 32768}"
   dep mg11-old v32 "$(q30)" "host: mg-old
 topology: {tensor_parallel: 2}
+residency: restart_only
 engine_config: {context_length: 32768}"
   c deploy model --file "$MG/dep/mg11-new.yaml" >"$RES/mg11-new-deploy.out" 2>&1
   serve_check MG11 mg11-new v32 remote mg11

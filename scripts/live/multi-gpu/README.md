@@ -65,22 +65,16 @@ byte copies of the lab hosts' aarch64 environments):
 
 and, under `~/mg`: `uv`, `protoc` 29.3 and Rust (the version
 `rust-toolchain.toml` pins) to build CapyCTL there. No system package, driver or
-CUDA change. Three CapyCTL binaries are built from the pushed trees:
+CUDA change. Two CapyCTL binaries are built from the pushed trees:
 
-- `capyctl`: this checkout's commit, as it ships (deep parking at N > 1 off for
-  every engine, ADR 0035 §9);
-- `capyctl-qualify`: the same commit with `deep_park: true` in vLLM's and
-  SGLang's local multi-GPU support data (`local_support` in
-  `crates/capyctl-config/src/group_support.rs`), which is exactly the change MG4
-  and MG5 make when they pass; the build refuses unless it flips those two
-  entries, and `--dry-run` makes the same edit on a copy of this checkout's
-  file and fails unless it flips exactly those two;
+- `capyctl`: this checkout's commit, as it ships. vLLM and SGLang multi-GPU
+  parking is enabled after the completed MG4/MG5 qualification (ADR 0035 §9);
 - `capyctl-old`: the `v0.1.8` tag, the older host of MG11 (no
   `local_tensor_parallel` capability).
 
 Uncommitted product changes are not pushed: commit first. The harness scripts
 themselves are copied and their combined SHA-256 is recorded. Setup invalidates
-current/qualification binaries when their recorded source commit differs;
+the current binary when its recorded source commit differs;
 `--skip-setup` refuses that mismatch rather than attributing stale binaries to a
 new commit. Each attempt gets fresh role state, while approved engine installs
 and model downloads can be reused.
@@ -129,7 +123,7 @@ Fewer than five deep cycles or three host-backed cycles cannot qualify.
 | MG13 | s2 | `topology: auto`: the 4B model on vLLM (against an explicit single-GPU deployment), then the 30B model on SGLang with the 4B model serving, then park/wake | N = 1 and `TP auto (1)` with equal nonempty arguments; N = 2 and `TP auto (2)`, arguments equal MG5's captured explicit TP 2 deep baseline with identical residency, and the 4B model evicted; the wake preserves N and devices and answers the canary |
 | MG11 | srv | a control-plane server, a host of this build and an older host (`v0.1.8`), all on loopback on the machine; MG1's deployment on each | Full MG1 serving evidence on the new host: Ready/chat, owned per-GPU use within reservations, loopback-only listeners and TP 2/loopback collectives status, measured startup peaks; on the older host refused `host_capability_missing:local_tensor_parallel` with no engine started |
 
-Role `s1` runs `capyctl`, role `s2` `capyctl-qualify`; each role has its own
+Roles `s1` and `s2` both run `capyctl`; each role has its own
 state and config directories under `~/mg`, listens on `127.0.0.1:--port` and
 runs one deployment at a time. Rank processes are found in the role's ledger
 (the identities each launch recorded, ADR 0035 §6), never by name, and are

@@ -150,9 +150,10 @@ no group.
   is `insufficient_gpus`; a model that does not fit is
   `insufficient_device_memory`, and both name the `tensor_parallel` that would
   fit ([errors](errors.md)).
-- **Parking.** For now a model on several GPUs stops instead of parking
-  (`restart_only`); a stated `deep` or `host_backed` is refused, and under
-  `auto` it keeps the model on one GPU ([Parking and switching](parking.md)).
+- **Parking.** vLLM and SGLang support `deep` and `host_backed` on several
+  GPUs, qualified at TP 2 on two RTX A6000 cards. Every chosen GPU must
+  confirm a park or wake. `topology: auto` can choose several GPUs with either
+  tier. llama.cpp stops instead of parking ([Parking and switching](parking.md)).
 - **Security.** The engine's ranks talk to each other over listeners on
   `127.0.0.1` only, without authentication, and status shows
   `collectives: loopback`. Another user logged in to the same machine could

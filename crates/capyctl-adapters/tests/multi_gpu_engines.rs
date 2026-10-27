@@ -11,10 +11,9 @@ use capyctl_adapters::llamacpp::{
 use capyctl_adapters::sglang::{frozen_from_effective, SglangLaunch};
 use capyctl_adapters::vllm::{plan_from_effective, render_command};
 use capyctl_config::effective::{
-    resolve_effective_with_checkpoint, resolve_effective_with_local_support, CheckpointFacts,
-    CudaNamespace, EffectiveDeployment, Residency,
+    resolve_effective_with_checkpoint, CheckpointFacts, CudaNamespace, EffectiveDeployment,
+    Residency,
 };
-use capyctl_config::group_support::{local_support, LocalSupport};
 use capyctl_domain::launch::LaunchSettings;
 use serde_json::{json, Value};
 
@@ -135,11 +134,6 @@ fn vllm_renders_the_device_list_and_n() {
                "data_parallel_size": 1, "distributed_executor_backend": "mp",
                "devices": [uuid(0), uuid(1)], "cuda_device_order": null})
     );
-    // Shipped support data: no residency stated resolves restart_only, so no
-    // development mode is rendered.
-    assert_eq!(effective.residency, Residency::RestartOnly);
-    assert!(plan.sleep_flags.is_empty());
-
     // One GPU of the same host: no executor flag, no expected payload.
     let one = resolve("vllm", 2, None, true);
     let rendered =
@@ -380,30 +374,14 @@ fn llamacpp_split_and_device_options_stay_reserved() {
     assert!(recheck_rendered(&twice).is_err());
 }
 
-/// The shipped support data with `deep_park` flipped for the tensor-parallel
-/// engines, as the qualification build's script rewrites it.
-fn flipped(engine: &str) -> Option<LocalSupport> {
-    local_support(engine).map(|support| LocalSupport {
-        deep_park: engine == "vllm" || engine == "sglang" || support.deep_park,
-        ..support
-    })
-}
-
-// T46 T21 (ADR 0035 §§9, 10): with the shipped data a stated deep residency
-// on two GPUs is refused `capability_missing:deep_park`; with only
-// `deep_park` flipped it resolves, and vLLM renders its sleep mode and SGLang
-// its memory saver, on two GPUs, as on one.
+// T46 T21 (ADR 0035 §§9, 10): qualified multi-GPU deep parking renders
+// vLLM's sleep mode and SGLang's memory saver through the shipped resolver.
 #[test]
-fn deep_parking_on_several_gpus_needs_only_the_flipped_support_data() {
+fn qualified_deep_parking_renders_each_engine_controls() {
     for engine in ["vllm", "sglang"] {
         let (mut d, h) = deployment(engine, 2, Some(2), true);
         d["residency"] = json!("deep");
-        let refused = resolve_effective_with_checkpoint(&d, &h, facts()).unwrap_err();
-        assert!(
-            refused.to_string().contains("capability_missing:deep_park"),
-            "{refused}"
-        );
-        let effective = resolve_effective_with_local_support(&d, &h, facts(), flipped)
+        let effective = resolve_effective_with_checkpoint(&d, &h, facts())
             .unwrap()
             .with_device_total(|_| Some(48 * GIB))
             .unwrap();

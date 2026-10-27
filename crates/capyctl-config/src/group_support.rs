@@ -110,13 +110,15 @@ pub fn local_support(engine: &str) -> Option<LocalSupport> {
         "vllm" => Some(LocalSupport {
             max_tensor_parallel: None,
             pipeline: false,
-            deep_park: false,
+            // ADR 0035 MG4/MG6: TP2 deep and host-backed cycles passed on RTX A6000.
+            deep_park: true,
             split_modes: &[],
         }),
         "sglang" => Some(LocalSupport {
             max_tensor_parallel: None,
             pipeline: false,
-            deep_park: false,
+            // ADR 0035 MG5/MG6: TP2 deep and host-backed cycles passed on RTX A6000.
+            deep_park: true,
             split_modes: &[],
         }),
         "llamacpp" => Some(LocalSupport {

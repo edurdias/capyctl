@@ -265,7 +265,9 @@ fn a_world_size_of_one_is_byte_identical() {
 fn each_gpu_is_charged_one_rank_and_the_host_the_ranks_overhead() {
     let h = host(4);
     for n in [2_u32, 4] {
-        let e = resolve(&deployment(tp(n)), &h).unwrap();
+        let mut d = deployment(tp(n));
+        d["residency"] = "restart_only".into();
+        let e = resolve(&d, &h).unwrap();
         assert_eq!(e.local_tensor_parallel(), n);
         let ids: Vec<&str> = e.selected_devices.iter().map(|c| c.id.as_str()).collect();
         let expected: Vec<String> = (0..n).map(|i| format!("gpu{i}")).collect();
@@ -289,11 +291,6 @@ fn each_gpu_is_charged_one_rank_and_the_host_the_ranks_overhead() {
         let phases = phase_domains(&e);
         assert_eq!(phases[0], gpus(cold), "cold at {n}");
         assert_eq!(phases[1], gpus(per_gpu), "ready at {n}");
-        // No stated residency: restart_only until the engine's row passes.
-        assert_eq!(
-            e.residency,
-            capyctl_config::effective::Residency::RestartOnly
-        );
         let restart: Vec<(String, i64)> = expected
             .iter()
             .map(|id| (id.clone(), 0))
@@ -404,16 +401,6 @@ fn refusals_carry_their_codes() {
     let error = refusal(&deployment(tp(8)), &h);
     assert!(error.contains("insufficient_gpus"), "{error}");
     assert!(error.contains("what would fit"), "{error}");
-    for tier in ["deep", "host_backed"] {
-        let mut stated = deployment(tp(2));
-        stated["residency"] = tier.into();
-        let error = refusal(&stated, &h);
-        assert!(
-            error.contains("capability_missing:deep_park"),
-            "{tier}: {error}"
-        );
-        assert!(error.contains("restart_only"), "{error}");
-    }
     // LMCache stays off on several GPUs, so `required` is refused.
     let mut required = deployment(tp(2));
     required["lmcache"] = "required".into();
@@ -581,10 +568,9 @@ fn auto_single_gpu_preserves_layout_for_snapshot_validation() {
     round_trips(&e);
 }
 
-// T46: a requirement only N = 1 meets narrows the table to N = 1: a stated
-// parking tier while the gate is closed, `lmcache: required`.
+// T46: required LMCache still narrows auto to one GPU after parking qualifies.
 #[test]
-fn auto_narrows_to_one_gpu() {
+fn auto_narrows_to_one_gpu_for_required_lmcache() {
     let mut h = host(4);
     h["runtime_profiles"]["local"]["lmcache"] = json!({"version": "0.5.6",
         "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"});
@@ -592,25 +578,17 @@ fn auto_narrows_to_one_gpu() {
         weights_bytes: Some(8 * GIB),
         ..CheckpointFacts::default()
     };
-    for (field, value, code) in [
-        ("residency", "deep", "capability_missing:deep_park"),
-        (
-            "lmcache",
-            "required",
-            "lmcache_unavailable:multi_gpu_unqualified",
-        ),
-    ] {
-        let mut d = deployment(Some(json!("auto")));
-        d[field] = value.into();
-        if field == "lmcache" {
-            d["residency"] = "restart_only".into();
-        }
-        let e = resolve_effective_with_checkpoint(&d, &h, small).unwrap();
-        let table = e.topology.as_ref().unwrap().auto.as_ref().unwrap();
-        assert_eq!(table_peaks(table).len(), 1, "{field}");
-        assert!(table.excluded.iter().all(|x| x.reason == code), "{field}");
-        assert_eq!(e.local_tensor_parallel(), 1);
-    }
+    let mut d = deployment(Some(json!("auto")));
+    d["lmcache"] = "required".into();
+    d["residency"] = "restart_only".into();
+    let e = resolve_effective_with_checkpoint(&d, &h, small).unwrap();
+    let table = e.topology.as_ref().unwrap().auto.as_ref().unwrap();
+    assert_eq!(table_peaks(table).len(), 1);
+    assert!(table
+        .excluded
+        .iter()
+        .all(|x| x.reason == "lmcache_unavailable:multi_gpu_unqualified"));
+    assert_eq!(e.local_tensor_parallel(), 1);
 }
 
 // T46: before the weights are measured no N is chosen; when no size fits,

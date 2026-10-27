@@ -1,4 +1,4 @@
-# Status: One model across several GPUs of one host (ADR 0035), implemented; live qualification incomplete — 2026-10-26 (branch `feat/multi-gpu-one-host`)
+# Status: One model across several GPUs of one host (ADR 0035), qualified on two RTX A6000 GPUs — 2026-10-26 (branch `feat/multi-gpu-one-host`)
 
 ADR 0035 (owner decisions 2026-10-25) is implemented for 0.1.9. A deployment with
 `topology: {tensor_parallel: N}` and no `placement.hosts` runs as one instance on N
@@ -42,10 +42,9 @@ pin exactly N GPUs, and `topology: auto` lets CapyCTL choose N.
   released before every process is gone; ADR 0028's stall rule covers every N > 1 instance
   (`tp_stalled`); ADR 0031's listener check runs after readiness and at every re-proof
   (`engine_listener_exposed`). Status shows `collectives: loopback` and `TP auto (N)`.
-- **Parking** (§9): vLLM and SGLang deep parking at N > 1 is built on per-GPU evidence and
-  ships off in the support data (owner decision 3): until MG4 and MG5 pass, a multi-GPU
-  deployment resolves `restart_only` and a stated `deep` or `host_backed` is refused
-  `capability_missing:deep_park`. With it on, a vLLM park settles only when, after the
+- **Parking** (§9): vLLM and SGLang parking at N > 1 is enabled after MG4 and MG5
+  passed five native park/wake cycles each (owner decision 3); MG6 also passed three
+  host-backed cycles per engine. A vLLM park settles only when, after the
   engine's reply, a host reading of every chosen GPU shows the launch's own processes at or
   below that GPU's parked charge (above it for a wake), awaited for the group evidence
   window; a GPU with no fresh reading, a reading without per-GPU figures or a GPU on the
@@ -62,12 +61,12 @@ pin exactly N GPUs, and `topology: auto` lets CapyCTL choose N.
   machine's one session and its engine environments.
 - **Live script set**: `scripts/live/multi-gpu/run.sh --ssh <user>@<host>` runs every row,
   MG1–MG14 and a download bandwidth test, on the rented two-GPU machine in one session,
-  installing only vLLM 0.32.0, SGLang 0.5.22 and the llama.cpp v0.7.0 build; MG4–MG6, MG10
-  and MG13 run on a qualification build with vLLM's and SGLang's `deep_park` at N > 1 turned
-  on (the change MG4 and MG5 make when they pass). At the end it writes `verdict.md` under
-  `target/live/multi-gpu/<run>/` and removes everything it created
-  ([its README](../../scripts/live/multi-gpu/README.md)). `--dry-run` prints the whole plan
-  and checks that this checkout's qualification edit flips exactly those two entries.
+  installing only vLLM 0.32.0, SGLang 0.5.22 and the llama.cpp v0.7.0 build.
+  After qualification, every current-build row runs the ordinary binary; the
+  temporary support-data rewrite and duplicate qualification build are removed.
+  At the end it writes `verdict.md` under `target/live/multi-gpu/<run>/`
+  and removes everything it created
+  ([its README](../../scripts/live/multi-gpu/README.md)). `--dry-run` prints the whole plan.
 
 Tests (T46), new in `capyctl-config` (`tests/multi_gpu.rs`), `capyctl-store`
 (`tests/multi_gpu_placement.rs`, the v58 migration, the per-GPU park and wake judgment and
@@ -78,17 +77,9 @@ observer per device), `capyctl-router`, `capyctl-protocol` and `capyctl-manageme
 `scripts/ci-local.sh --deep --ci-shape`, every step passed: unit 1708 passed,
 0 failed (1 ignored); runtime Python 384 passed; core 1795 passed, 0 failed;
 workspace 3833 passed, 0 failed (1 ignored). CPU and Fake-engine tests are not
-qualification. The rented session below ran on two GPUs but did not establish
-qualification. The complete live check remains required (ADR 0035 §14):
-
-```bash
-scripts/live/multi-gpu/run.sh --ssh <user>@<host>
-```
-
-MG1–MG14 and the bandwidth test; MG4 and MG5 decide whether vLLM's and SGLang's
-`deep_park` is turned on at N > 1 (the first park at N > 1 also shows whether each GPU's
-parked residue stays within its 2.25 GiB parked charge), and MG1–MG3, MG6–MG9 and MG13 must
-pass before the release notes call the feature qualified.
+qualification. The interrupted sessions below did not qualify the feature;
+the completed corrected run at the end of this record passed MG1–MG14 and
+the bandwidth check together, as ADR 0035 §14 requires.
 
 ## Interrupted qualification on two RTX A6000 GPUs, 2026-10-25
 
@@ -317,6 +308,43 @@ passed the complete `scripts/ci-local.sh --deep --ci-shape` gate, including
 the core and full-workspace suites. Scoped reviews found no actionable
 defects. These CPU checks do not establish native-engine qualification.
 
+## Completed corrected qualification
+
+Commit `354199f8`, attempt `20261027T002747520588460-2674047`, passed
+MG1–MG14 and BW in one rental session on two RTX A6000 48 GiB PCIe GPUs.
+The strict verdict is `qualified: true`, with no missing or invalid evidence.
+The complete evidence is retained under
+`target/live/multi-gpu/2026-10-26-rerun5/evidence/`.
+
+- MG4 and MG5 passed five deep-park/wake cycles per engine. Per GPU,
+  vLLM used 740 MiB parked and 34,238 MiB awake; SGLang used 2,710 MiB
+  parked and 34,320 MiB awake. Each wake passed its canary.
+- MG6 passed three host-backed cycles on each engine and confirmed no
+  reservation remained after either stop. The vLLM copy-deadline correction
+  now passes natively.
+- MG10 woke the two-GPU model, stopped its single-GPU competitor and
+  recorded both GPU names. MG13 selected N = 1 and N = 2 as expected,
+  matched explicit launch arguments and preserved both GPUs through wake.
+- MG11 passed enrolled-host serving, per-GPU accounting, loopback-only
+  listeners and measured TP2 host/GPU startup peaks. The older host was
+  refused. The corrected collector accepted the host-qualified measurements.
+- Rank-kill cleanup, stalled-rank handling, throughput comparisons,
+  configuration/capacity refusals and llama.cpp's own per-card allocation
+  fit all passed. The 56.89 GiB download averaged 108.8 MB/s.
+
+Final collection completed with runner and host exit codes 0, and the
+session was purged. The independent supervisor confirmed rental deletion
+at `2026-10-27T02:44:11.836347Z`; provider-reported cost was $2.59.
+Earlier failed verdicts remain unchanged.
+
+The live qualification binary differed from `354199f8` only by enabling
+the vLLM and SGLang local `deep_park` support entries. Those two entries
+now ship enabled, as ADR 0035 requires after MG4/MG5. llama.cpp remains
+restart-only and multi-GPU LMCache remains unqualified. This establishes
+TP2 qualification on this hardware and these engine versions, not native
+proof of every supported GPU count or model.
+
+
 
 # Release note: Several GPUs
 
@@ -326,6 +354,7 @@ defects. These CPU checks do not establish native-engine qualification.
   machine, with vLLM, SGLang or llama.cpp: one model, one route, each card charged its share,
   and the engine's traffic between the cards kept on loopback (`collectives: loopback` in
   status). `devices` can pin the cards. Refusals for memory or GPU count name the
-  `tensor_parallel` that would fit. For now such a model stops instead of parking, and it
-  runs without LMCache; this is not yet qualified on two-GPU hardware
+  `tensor_parallel` that would fit. Qualified on two RTX A6000 cards with vLLM 0.32.0,
+  SGLang 0.5.22 and llama.cpp v0.7.0. vLLM and SGLang support deep and host-backed
+  parking with every GPU checked; llama.cpp stops instead. LMCache remains off
   ([One model on several GPUs](../guide/deploy.md#one-model-on-several-gpus)).
