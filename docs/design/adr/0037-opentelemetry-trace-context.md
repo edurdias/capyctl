@@ -1,8 +1,12 @@
 # ADR 0037 — OpenTelemetry trace context: W3C propagation, CapyCTL spans, opt-in OTLP export
 
-**Status:** Proposed (2026-10-24), for 0.2.0 (retargeted from 0.1.9 on 2026-10-27, after 0.1.9 shipped with ADR 0035 only). Nothing here is decided or implemented; the
-owner decides the design and the open questions at the end.
-**Amends (if accepted, with the implementation):** `SPEC.md` §10 (the request-ID note:
+**Status:** Accepted (2026-10-27). Proposed 2026-10-24, for 0.2.0 (retargeted from 0.1.9
+on 2026-10-27, after 0.1.9 shipped with ADR 0035 only). The owner answered every open
+question on 2026-10-27, and the answers are recorded below ("Owner decisions of
+2026-10-27"). One answer differs from the recommendation: the live rows use the
+OpenTelemetry Collector release binary on host A and host B instead of a receiver script
+(question 11). Nothing is implemented yet.
+**Amends (with the implementation):** `SPEC.md` §10 (the request-ID note:
 `traceparent` and `tracestate` are read after authentication, never refused, and replaced
 rather than relayed), §13.1 (a host capability `trace_context`; trace context on ingress
 requests and in the lifecycle command envelope, outside the journaled payload), §13.3 (the
@@ -187,12 +191,12 @@ Parsing follows W3C Trace Context Level 1:
 - `tracestate` is read only with a valid `traceparent`; repeated headers are joined with
   commas; a combined value over 512 bytes, over 32 list members or not parseable is
   dropped whole;
-- the request is **never refused** for its trace headers (open question 2), unlike
+- the request is **never refused** for its trace headers (owner decision 2026-10-27, question 2), unlike
   `X-Request-Id`: trace context is best effort by design, and an intermediary the caller
   does not control may add it.
 
 What the router does with a valid caller context is `observability.tracing.caller_context`
-(open question 3): `parent` (the default) makes it the parent of the request span;
+(owner decision 2026-10-27, question 3): `parent` (the default) makes it the parent of the request span;
 `link` starts a new trace whose request span links to it; `ignore` reads neither header.
 
 ### 3. Spans
@@ -338,15 +342,15 @@ Rules:
   and `TRACESTATE` become reserved (`engine_env_reserved:<name>`). vLLM reads a
   `traceparent` from its own environment as a fallback parent (`tracing/otel.py`), and
   the OpenTelemetry Python SDK reads `OTEL_*` for endpoint, headers, sampler and
-  resource. An existing approval of `--otlp-traces-endpoint` stops working (open
-  question 7).
+  resource. An existing approval of `--otlp-traces-endpoint` stops working (owner
+  decision 2026-10-27, question 7).
 - **Groups.** Multi-node groups (ADR 0028) run without engine tracing (`group`) until a
   live row covers them; on-host multi-GPU launches are single launches and follow the
   rules above.
 - **SGLang's machine ID.** SGLang's thread spans export `/etc/machine-id` verbatim
   (Context). With the endpoint on loopback, that ID reaches the operator's own collector;
-  the guide says so and shows a collector rule that deletes `host_id`. Open question 9
-  offers keeping SGLang out instead.
+  the guide says so and shows a collector rule that deletes `host_id`, and an upstream
+  report is drafted (owner decision 2026-10-27, question 9).
 
 `engine_tracing_off` reasons: `host_off`, `engine_unsupported`, `not_installed`,
 `group`, `retention_zero` (§11).
@@ -393,7 +397,7 @@ caller can force sampling of its own requests; the bounded queue limits what tha
   one request ID across failover attempts and has one trace; a caller's trace may span
   many requests.
 - The caller's `X-Request-Id` stays what SPEC §10 says: echoed, in role logs, nowhere
-  else; it is not a span attribute (open question 5).
+  else; it is not a span attribute (owner decision 2026-10-27, question 5).
 - CapyCTL returns no trace header on the answer (W3C defines none for responses): a
   caller that sent `traceparent` knows its trace ID, and any
   request's spans can be found by `capyctl.request_id`.
@@ -405,7 +409,7 @@ codes and token counts, never content (§5). Like role logs, they are not covere
 `retention: zero`. Engine spans are produced by code CapyCTL does not control, so a
 deployment with `retention: zero` (its own or its host's) gets **no engine tracing**
 (`engine_tracing_off:retention_zero`) and no trace header reaches its engine; CapyCTL's
-own spans for its requests are kept (open question 6 offers stricter rules).
+own spans for its requests are kept (owner decision 2026-10-27, question 6).
 
 `engine_telemetry` is unchanged: it concerns the engines' own usage reports to their
 vendors. Engine tracing is a separate host choice, and its export never leaves the
@@ -487,7 +491,7 @@ deployment or profile field changes them.
 - A host capability, `trace_context`, and an additive command-envelope field.
 - The engines' tracing options move from approval to owned: a deployment that passes an
   approved `--otlp-traces-endpoint` today is refused after the upgrade and must use the
-  host setting (release note, open question 7).
+  host setting (release note; owner decision 2026-10-27, question 7).
 - The data retention page gains a category that leaves the role: spans exported to an
   endpoint the operator named. The default stays: nothing.
 - Operator names (deployments, hosts, instances) reach the collector.
@@ -505,8 +509,8 @@ deployment or profile field changes them.
 - **Pass-through only** (forward the caller's headers to engines, no CapyCTL spans).
   Rejected: the time CapyCTL adds (queue, wake, switch) is what callers cannot see, and
   SPEC §13.3 asks for internal headers to be replaced, not relayed.
-- **Refuse malformed trace headers with 400**, as for `X-Request-Id`. Rejected for the
-  recommendation: W3C says to restart the trace, and proxies add these headers (open
+- **Refuse malformed trace headers with 400**, as for `X-Request-Id`. Rejected: W3C says to
+  restart the trace, and proxies add these headers (owner decision 2026-10-27,
   question 2).
 - **Activation spans as children of the first waiting request.** Rejected: the activation
   serves every joined request, and an operator's switch has no request; links express
@@ -518,10 +522,9 @@ deployment or profile field changes them.
   HTTP does not cover; a collector accepts both.
 - **Honour `OTEL_*` environment variables.** Rejected: tracing could turn on silently from
   a unit's environment; CapyCTL's settings already have a precedence chain.
-- **Engine tracing through host approval of extras (today).** Rejected for the
-  recommendation: CapyCTL would not know which launches trace, so it could not decide
-  where to send `traceparent`, and an approved endpoint can be off the host (open
-  question 7).
+- **Engine tracing through host approval of extras (today).** Rejected: CapyCTL would not know which launches trace, so it could not decide
+  where to send `traceparent`, and an approved endpoint can be off the host (owner
+  decision 2026-10-27, question 7).
 - **Traces written to a local file.** Rejected: unbounded disk growth of request
   metadata, against the data retention page's shape; a local collector does this if
   wanted.
@@ -568,8 +571,13 @@ T43 and T45 where they apply.
 Run in a live session the owner schedules (one live session on the hosts at a time), on
 host A (and host B for the remote rows), with the approved environments
 (`~/vllm-0.32.0-venv`, the approved SGLang 0.5.22 environment, llama.cpp v0.7.0) and an
-OpenTelemetry Collector on loopback writing what it receives to a file (open question 11:
-which collector, and its approval). Qwen3-4B for chat on each engine, Clef-Flash for
+OpenTelemetry Collector on loopback writing what it receives to a file. The collector is
+the OpenTelemetry Collector release binary, placed in the home directory on host A and on
+host B (owner decision 2026-10-27, question 11: the owner approved this new program on the
+lab hosts; it is not an engine environment). Each runs with an OTLP HTTP receiver bound to
+loopback and a file exporter writing into the session's evidence directory; the binary's
+release version and checksum are recorded in the evidence. It is stopped at the end of the
+session. No receiver script is added to `scripts/live/`. Qwen3-4B for chat on each engine, Clef-Flash for
 decisions on SGLang.
 
 | Row | What it shows |
@@ -602,58 +610,40 @@ decisions on SGLang.
    lifecycle spans.
 6. **Adapters.** Engine tracing rendering for vLLM and SGLang, the launch-time check, the
    owned options and reserved names, reasons, status.
-7. **Docs.** §13's pages, SPEC amendments, the engine flags tables, the release note.
-8. **Live rows** OT1–OT11, then the change file's status entry.
+7. **Docs.** §13's pages, SPEC amendments, the engine flags tables, the release note,
+   and a draft upstream report on SGLang's `host_id` attribute (question 9).
+8. **Live rows** OT1–OT11, with the collector of the live qualification section (the
+   live harness starts and stops it on host A and host B and collects its file), then the
+   change file's status entry.
 
-Steps 1–4 do not depend on any engine and can ship even if engine tracing (steps 5's
-engine part and 6) waits for its live rows.
+Everything here ships in 0.2.0 (owner decision 2026-10-27, question 12). Steps 1–4 do
+not depend on any engine. Only if OT5 or OT8 fails does engine tracing (step 5's engine
+part and step 6) move to a later release, with CapyCTL's spans and the ingress shipping in
+0.2.0 without it.
 
-## Open questions for the owner
+## Owner decisions of 2026-10-27
 
-1. **Default.** (a) Off until an endpoint is named; (b) on with a default local endpoint.
-   *Recommendation: (a).* Nothing leaves a role unless the operator names where it goes,
-   as with `engine_telemetry`.
-2. **Malformed `traceparent`.** (a) Ignore it and start a new trace; (b) refuse with 400
-   like `X-Request-Id`. *Recommendation: (a)*, which W3C requires; a proxy the caller
-   does not control may add the header.
-3. **Trusting the caller's context.** (a) `parent` by default; (b) `link` by default;
-   (c) `parent` by default, but `link` when inference authentication is `none` on a
-   network bind. *Recommendation: (a)*, with `link` and `ignore` available: inference
-   callers hold the API key, and a caller's trace is the point.
-4. **Sampling default.** (a) Ratio 1.0 (every request, the OpenTelemetry default);
-   (b) 0.1. *Recommendation: (a)*: home and prosumer request rates are low, and a partial
-   trace set hides the slow request someone is looking for.
-5. **The caller's `X-Request-Id` in spans.** (a) Never (SPEC §10 unchanged); (b) as
-   `capyctl.caller_request_id` on the request span. *Recommendation: (a)*: the caller
-   has its own trace to put it in, and the SPEC note stays simple.
-6. **Zero retention.** (a) CapyCTL's spans kept, engine tracing off (§11); (b) no spans
-   at all for a zero-retention deployment's requests; (c) a host with `retention: zero`
-   and an endpoint refuses to start. *Recommendation: (a)*: spans hold what role logs
-   hold, which zero retention keeps; (b) would need the router to know a remote host's
-   retention before it creates a request's first span.
-7. **Existing approvals of engine tracing options.** (a) Owned by CapyCTL, refused in
-   extras (§7), a release note for anyone who approved one; (b) keep the approval path
-   beside the host setting. *Recommendation: (a)*: one way to turn engine tracing on,
-   and CapyCTL then knows where to send `traceparent`.
-8. **Engine export endpoint.** (a) Loopback only; (b) any endpoint the host names.
-   *Recommendation: (a)*: both engines export without TLS over gRPC by default, and an
-   engine reaching off the machine is what SPEC §13.3 and `engine_telemetry` keep closed.
-9. **SGLang's machine ID.** (a) Support SGLang engine tracing, document the `host_id`
-   attribute and the collector rule that removes it, and report it upstream; (b) leave
-   SGLang out of engine tracing until upstream stops exporting the raw ID.
-   *Recommendation: (a)*: the export stays on the operator's machine, and the operator
-   decides what the collector forwards; the upstream report is evidence, not filed in
-   this PR.
-10. **Activation traces.** (a) Their own trace, linked from waiting requests, always
-    recorded when tracing is on; (b) children of the request that started them, sampled
-    with it. *Recommendation: (a).*
-11. **Collector for the live rows.** (a) The OpenTelemetry Collector release binary in the
-    home directory on host A and host B (a new program on the lab hosts, not an engine
-    environment, needing approval); (b) a small receiver in `scripts/live/`, using the
-    OpenTelemetry protobuf package in an approved environment (none is created; it runs
-    from the vLLM 0.32.0 environment, which has it [INFERENCE]). *Recommendation: (b)*:
-    nothing new on the hosts, and the receiver only writes to the session's evidence
-    directory.
-12. **Scope for 0.2.0.** (a) Everything here; (b) CapyCTL's spans and the ingress in
-    0.2.0, engine tracing in a later release. *Recommendation: (a)*, with the plan's split as the
-    fallback if OT5 or OT8 fails.
+The proposal of 2026-10-24 asked twelve questions; the owner answered all of them on
+2026-10-27. The decision sections above already read as decided.
+
+1. **Default:** off until an endpoint is named, as proposed (§1).
+2. **Malformed `traceparent`:** ignored, and a new trace starts; the request is never
+   refused for it (§2).
+3. **Trusting the caller's context:** `caller_context: parent` by default, with `link`
+   and `ignore` available (§2).
+4. **Sampling default:** ratio 1.0 (§9).
+5. **The caller's `X-Request-Id`:** never in spans; SPEC §10 unchanged (§10).
+6. **Zero retention:** CapyCTL's spans kept, engine tracing off (§11).
+7. **Existing approvals of engine tracing options:** owned by CapyCTL, refused in
+   extras, with a release note for anyone who approved one (§7).
+8. **Engine export endpoint:** loopback only (§7).
+9. **SGLang's machine ID:** SGLang engine tracing is supported; the guide documents the
+   `host_id` attribute and the collector rule that removes it, and an upstream report is
+   drafted (§7, implementation plan step 7).
+10. **Activation traces:** their own trace, linked from waiting requests (§4).
+11. **Collector for the live rows (changed from the recommendation):** the OpenTelemetry
+    Collector release binary in the home directory on host A and host B. The owner
+    approved this new program on the lab hosts. The recommended receiver script in
+    `scripts/live/` is not written (live qualification, implementation plan step 8).
+12. **Scope for 0.2.0:** everything here ships in 0.2.0; engine tracing moves to a later
+    release only if OT5 or OT8 fails (implementation plan).
