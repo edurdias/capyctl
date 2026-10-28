@@ -135,7 +135,7 @@ pub enum LmcacheOffReason {
 }
 
 impl LmcacheOffReason {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::Disabled,
         Self::HostOff,
         Self::EngineUnsupported,
