@@ -1283,6 +1283,7 @@ async fn an_embeddings_launch_needs_the_capability() {
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,
+            tensorfold_native: false,
         },
         Default::default(),
     );
@@ -1445,6 +1446,7 @@ async fn a_native_tensorfold_launch_needs_the_capability() {
             instance_index: 0,
             device_memory: false,
             decisions: false,
+            embeddings: false,
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,
