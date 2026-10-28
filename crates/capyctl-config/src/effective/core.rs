@@ -102,6 +102,13 @@ pub(super) fn normalize_profile(
             return Err(invalid("runtime_profiles.env", reason));
         }
     }
+    // ADR 0038 §3: TensorRT-LLM, its MPI runtime and its libraries read these
+    // names, so a TensorRT-LLM profile may not set them, whatever it approves.
+    if raw_profile.engine == Engine::TensorrtLlm {
+        if let Some(reason) = crate::tensorrt_llm::refused_env(raw_profile.env.keys()) {
+            return Err(invalid("runtime_profiles.env", reason));
+        }
+    }
     // Spec §3: `--trust-remote-code` makes the engine execute Python that arrived
     // with the checkpoint. There are models that need it, but a profile may only
     // pass it where the host has said so in as many words.
@@ -133,6 +140,17 @@ pub(super) fn normalize_profile(
             ConfigErrorCode::UnsupportedCombination,
             "residency",
             "capability_missing: llama.cpp supports restart_only only",
+        ));
+    }
+    // ADR 0038 §1, §8: TensorRT-LLM's sleep is a prototype its server cannot
+    // reach, so it is restart-only.
+    if raw_profile.engine == Engine::TensorrtLlm && residency.parks() {
+        return Err(ConfigError::new(
+            ConfigErrorCode::UnsupportedCombination,
+            "residency",
+            "capability_missing:deep_park: TensorRT-LLM supports restart_only only (its sleep \
+             mode is a prototype the server does not expose); declare `residency: \
+             restart_only` or leave it out",
         ));
     }
     // SPEC §9.1 / T21 / ADR 0012: deep park is on unless the host opts out. A

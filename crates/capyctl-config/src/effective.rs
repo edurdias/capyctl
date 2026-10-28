@@ -1608,11 +1608,19 @@ fn resolve_with(
             )));
         }
         let Some(support) = local_support else {
+            // ADR 0038 §13: tensor parallelism needs the MPI pool the single
+            // process model refuses.
+            let reason = if raw_profile.engine == Engine::TensorrtLlm {
+                "TensorRT-LLM runs on one GPU in this version".to_owned()
+            } else {
+                format!(
+                    "the {} engine has no mode that runs one model on several GPUs of one host",
+                    raw_profile.engine.name()
+                )
+            };
             return Err(unsupported(format!(
-                "{}: the {} engine has no mode that runs one model on several GPUs of one \
-                 host; remove `topology`",
+                "{}: {reason}; remove `topology`",
                 crate::topology::MULTI_GPU_UNSUPPORTED,
-                raw_profile.engine.name()
             )));
         };
         if support
@@ -1668,6 +1676,25 @@ fn resolve_with(
     if raw_profile.engine == Engine::Llamacpp {
         if let Some(reason) = crate::llamacpp::refused_env(d.engine_config.env().keys()) {
             return Err(invalid("engine_config.env", reason));
+        }
+    }
+    // ADR 0038 §3: the same names on a TensorRT-LLM deployment, and the
+    // served name the per-launch link is named after (owner decision
+    // 2026-10-27, question 3).
+    if raw_profile.engine == Engine::TensorrtLlm {
+        if let Some(reason) = crate::tensorrt_llm::refused_env(d.engine_config.env().keys()) {
+            return Err(invalid("engine_config.env", reason));
+        }
+        if let Some(reason) = d
+            .routes
+            .first()
+            .and_then(|name| crate::tensorrt_llm::served_name_refusal(name))
+        {
+            return Err(ConfigError::new(
+                ConfigErrorCode::UnsupportedCombination,
+                "routes",
+                reason,
+            ));
         }
     }
     let host = core::normalize_host(h)?;
@@ -1824,13 +1851,14 @@ fn resolve_with(
         let discrete = device_sizing
             .filter(|_| !sglang_speculative)
             .map(|_| (sizing.weights_bytes, core::system_parked_limit(&host)));
-        // ADR 0023 §6, ADR 0029 §1, ADR 0031 §4: TensorFold, llama.cpp and
-        // custom engines never park, so their default is restart_only.
+        // ADR 0023 §6, ADR 0029 §1, ADR 0031 §4, ADR 0038 §1: TensorFold,
+        // llama.cpp, TensorRT-LLM and custom engines never park, so their
+        // default is restart_only.
         crate::deployment_defaults::default_residency(
             raw_profile.security.deep_park.is_enabled()
                 && !matches!(
                     raw_profile.engine,
-                    Engine::Tensorfold | Engine::Llamacpp | Engine::Custom
+                    Engine::Tensorfold | Engine::Llamacpp | Engine::TensorrtLlm | Engine::Custom
                 ),
             discrete,
         )

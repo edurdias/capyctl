@@ -519,7 +519,13 @@ pub fn is_verified_in(table: &[(Engine, &str)], engine: Engine, version: &str) -
             Some(build) => build.release().to_owned(),
             None => return false,
         },
-        Engine::Vllm | Engine::Sglang | Engine::Tensorfold => version.to_owned(),
+        // ADR 0038 §2: the checked `tensorrt_llm` version. No TensorRT-LLM
+        // entry is in the set until its live rows pass (TR1–TR11 for 1.2.1,
+        // TR1a–TR11a and TR1b–TR11b for the pre-releases); until then every
+        // version lists `custom` and runs as an uncertified custom setup.
+        Engine::Vllm | Engine::Sglang | Engine::Tensorfold | Engine::TensorrtLlm => {
+            version.to_owned()
+        }
         // ADR 0031 §1: no custom engine is ever in the verified set.
         Engine::Custom => return false,
     };
@@ -548,13 +554,15 @@ pub fn listed_version(
 
 /// ADR 0018 §5: the profile names standalone gives its environment-variable
 /// installations (`CAPYCTL_VLLM_BIN`, `CAPYCTL_SGLANG_BIN`,
-/// `CAPYCTL_TENSORFOLD_BIN` and, ADR 0029 §2, `CAPYCTL_LLAMACPP_BIN`).
+/// `CAPYCTL_TENSORFOLD_BIN`, ADR 0029 §2, `CAPYCTL_LLAMACPP_BIN` and, ADR
+/// 0038 §2, `CAPYCTL_TENSORRT_LLM_BIN`).
 pub const ENVIRONMENT_PROFILES: &[&str] = &[
     "local",
     "local-vllm",
     "local-sglang",
     "local-tensorfold",
     "local-llamacpp",
+    "local-tensorrt-llm",
 ];
 
 /// ADR 0018 §1: short lowercase identifiers, safe in a JSON path and a

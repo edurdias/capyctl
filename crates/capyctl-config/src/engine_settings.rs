@@ -500,6 +500,7 @@ impl EngineSettings {
                     Engine::Sglang => "local-sglang",
                     Engine::Tensorfold => "local-tensorfold",
                     Engine::Llamacpp => "local-llamacpp",
+                    Engine::TensorrtLlm => "local-tensorrt-llm",
                     // ADR 0031 §1: a custom engine is registered only with
                     // `engine add --custom`; the list above never holds one.
                     Engine::Custom => unreachable!("no role-local custom engine"),
@@ -622,7 +623,9 @@ pub fn apply_to_host_with(
         }
         // ADR 0014 §1: SGLang's protected entry takes no argument vector.
         let args = match engine {
-            Engine::Vllm | Engine::Tensorfold | Engine::Llamacpp => settings.args.clone(),
+            Engine::Vllm | Engine::Tensorfold | Engine::Llamacpp | Engine::TensorrtLlm => {
+                settings.args.clone()
+            }
             // ADR 0031 §1: `installations` never yields a custom engine.
             Engine::Sglang | Engine::Custom => Vec::new(),
         };
@@ -630,10 +633,13 @@ pub fn apply_to_host_with(
             engine,
             executable,
             build_fingerprint,
-            // ADR 0023 §6, ADR 0029 §2: TensorFold and llama.cpp never park,
-            // whatever local_engine.deep_park says.
+            // ADR 0023 §6, ADR 0029 §2, ADR 0038 §2: TensorFold, llama.cpp and
+            // TensorRT-LLM never park, whatever local_engine.deep_park says.
             deep_park: settings.deep_park
-                && !matches!(engine, Engine::Tensorfold | Engine::Llamacpp),
+                && !matches!(
+                    engine,
+                    Engine::Tensorfold | Engine::Llamacpp | Engine::TensorrtLlm
+                ),
             installation_drift: settings.installation_drift,
             args,
             cuda_home: settings.cuda_home.clone(),

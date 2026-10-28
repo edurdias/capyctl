@@ -1430,6 +1430,8 @@ impl NativeHostExecution {
                     .map_err(|_| SessionError)?,
             ))),
             Engine::Custom => Err(SessionError),
+            // TRTLLM-WIRING: replaced by the integration slice.
+            Engine::TensorrtLlm => Err(SessionError),
         }
     }
 
@@ -1564,6 +1566,8 @@ impl NativeHostExecution {
             Engine::Vllm => Box::new(self.vllm_adapter(effective, plan, Some(keys), served)?),
             Engine::Tensorfold => Box::new(self.tensorfold_adapter(effective, plan, served)?),
             Engine::Llamacpp => Box::new(self.llamacpp_adapter(effective, plan, served)?),
+            // TRTLLM-WIRING: replaced by the integration slice.
+            Engine::TensorrtLlm => return Err(SessionError),
             Engine::Custom => Box::new(self.custom_adapter(effective, plan, Some(keys), served)?),
         })
     }
@@ -2790,6 +2794,8 @@ impl LocalExecutionPolicy for NativeHostExecution {
             Engine::Tensorfold => Err(JournalError::Unauthorized),
             // ADR 0029 §1, §10: llama.cpp is restart-only and never parks.
             Engine::Llamacpp => Err(JournalError::Unauthorized),
+            // ADR 0038 §1, §8: TensorRT-LLM is restart-only and never parks.
+            Engine::TensorrtLlm => Err(JournalError::Unauthorized),
             // ADR 0031 §4: a custom engine is restart-only and never parks.
             Engine::Custom => Err(JournalError::Unauthorized),
         }

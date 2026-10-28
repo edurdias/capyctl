@@ -88,6 +88,11 @@ pub enum FieldSpec {
     MapOf(&'static FieldSpec),
     /// Sequence of items, each validated against the given spec.
     Seq(&'static FieldSpec),
+    /// Any mapping, passed whole to the code that reads it, which checks its
+    /// keys and values (ADR 0038 §3: TensorRT-LLM's `llm_api_options`, whose
+    /// reserved keys resolution refuses and whose other keys the engine's
+    /// strict models check).
+    Mapping,
     /// A field that used to live here and has moved (SPEC §15.3 strictness).
     /// It is refused like an unknown field, with a message naming where the
     /// setting lives now, so an old document fails with a pointer rather than
@@ -408,6 +413,15 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("n_gpu_layers", SCALAR),
                 ("gguf_file", SCALAR),
                 ("mmproj_file", SCALAR),
+            ]),
+        ),
+        // ADR 0038 §3, §14: TensorRT-LLM's parser fields and LLM API options.
+        (
+            "tensorrt-llm",
+            FieldSpec::Struct(&[
+                ("tool_call_parser", SCALAR),
+                ("reasoning_parser", SCALAR),
+                ("llm_api_options", FieldSpec::Mapping),
             ]),
         ),
         ("accept_extra_args", SCALAR),

@@ -700,6 +700,9 @@ pub fn engine_gate(engine: Engine, build_fingerprint: &str) -> Option<LmcacheOff
     let (name, floor) = match engine {
         Engine::Llamacpp => return unsupported("llama.cpp has no LMCache integration"),
         Engine::Tensorfold => return unsupported("TensorFold has no LMCache integration"),
+        // ADR 0038 §12 (ADR 0033 §2's table): off; its connector API is a
+        // prototype CapyCTL does not render.
+        Engine::TensorrtLlm => return unsupported("LMCache is not qualified with TensorRT-LLM"),
         Engine::Custom => {
             return unsupported("CapyCTL does not render options for a custom engine")
         }
@@ -1262,6 +1265,7 @@ fn engine_display(engine: Engine) -> &'static str {
         Engine::Sglang => "SGLang",
         Engine::Tensorfold => "TensorFold",
         Engine::Llamacpp => "llama.cpp",
+        Engine::TensorrtLlm => "TensorRT-LLM",
         Engine::Custom => "custom engine",
     }
 }

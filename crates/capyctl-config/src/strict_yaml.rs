@@ -459,6 +459,9 @@ fn check_value(value: &Value, spec: &FieldSpec, path: &str) -> Result<(), Config
             }
             Ok(())
         }
+        FieldSpec::Mapping => value.as_object().map(|_| ()).ok_or_else(|| {
+            ConfigError::new(ConfigErrorCode::SchemaVersion, path, "expected a mapping")
+        }),
         FieldSpec::Moved(pointer) => Err(ConfigError::new(
             ConfigErrorCode::UnknownField,
             path,

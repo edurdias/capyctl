@@ -99,8 +99,9 @@ const CANCELLING: &str = "FROM request_lease_cancellations c
 /// ADR 0031 §6: whether the engine of instance lane (`deployment`, `index`),
 /// SQL expressions, reports no idle signal: its retained revision (the
 /// instance's own, else the deployment's), as resolved on its host when it
-/// was, profiles `engine: custom` with no `custom.manifest.idle`. Every
-/// built-in engine reports one; a configuration that does not decode is
+/// was, profiles `engine: custom` with no `custom.manifest.idle`, or (ADR
+/// 0038 §7) `engine: tensorrt-llm`, whose `/metrics` never reads idle. Every
+/// other built-in engine reports one; a configuration that does not decode is
 /// treated as reporting one, so it keeps the conservative built-in rules.
 pub(crate) fn lane_without_idle_signal(deployment: &str, index: &str) -> String {
     let chosen = "COALESCE(nh.effective_json,ne.effective_json)";
@@ -110,8 +111,9 @@ pub(crate) fn lane_without_idle_signal(deployment: &str, index: &str) -> String 
            LEFT JOIN host_effective_revisions nh ON nh.deployment_id=nd.id AND nh.revision=COALESCE(ni.revision,nd.revision)
              AND nh.host_id=ni.host_id AND nh.outcome='resolved'
           WHERE ni.deployment_id={deployment} AND ni.instance_index={index}
-            AND CASE WHEN json_valid({chosen}) THEN json_extract({chosen},'$.profile.engine')='custom'
-                  AND json_type({chosen},'$.profile.custom.manifest.idle') IS NULL ELSE 0 END)"
+            AND CASE WHEN json_valid({chosen}) THEN json_extract({chosen},'$.profile.engine')='tensorrt-llm'
+                  OR (json_extract({chosen},'$.profile.engine')='custom'
+                  AND json_type({chosen},'$.profile.custom.manifest.idle') IS NULL) ELSE 0 END)"
     )
 }
 

@@ -50,6 +50,8 @@ pub enum LaunchSettings {
     Sglang(SglangLaunchSettings),
     Tensorfold(TensorfoldLaunchSettings),
     Llamacpp(LlamacppLaunchSettings),
+    #[serde(rename = "tensorrt-llm")]
+    TensorrtLlm(TensorrtLlmLaunchSettings),
     Custom(CustomLaunchSettings),
 }
 
@@ -60,6 +62,7 @@ impl LaunchSettings {
             Self::Sglang(settings) => &settings.common,
             Self::Tensorfold(settings) => &settings.common,
             Self::Llamacpp(settings) => &settings.common,
+            Self::TensorrtLlm(settings) => &settings.common,
             Self::Custom(settings) => &settings.common,
         }
     }
@@ -70,6 +73,7 @@ impl LaunchSettings {
             Self::Sglang(settings) => &settings.memory,
             Self::Tensorfold(settings) => &settings.memory,
             Self::Llamacpp(settings) => &settings.memory,
+            Self::TensorrtLlm(settings) => &settings.memory,
             Self::Custom(settings) => &settings.memory,
         }
     }
@@ -80,6 +84,7 @@ impl LaunchSettings {
             Self::Sglang(settings) => &mut settings.memory,
             Self::Tensorfold(settings) => &mut settings.memory,
             Self::Llamacpp(settings) => &mut settings.memory,
+            Self::TensorrtLlm(settings) => &mut settings.memory,
             Self::Custom(settings) => &mut settings.memory,
         }
     }
@@ -90,6 +95,7 @@ impl LaunchSettings {
             Self::Sglang(settings) => &settings.extra_args,
             Self::Tensorfold(settings) => &settings.extra_args,
             Self::Llamacpp(settings) => &settings.extra_args,
+            Self::TensorrtLlm(settings) => &settings.extra_args,
             // ADR 0031 §4: the manifest is the whole command.
             Self::Custom(_) => &[],
         }
@@ -101,6 +107,7 @@ impl LaunchSettings {
             Self::Sglang(settings) => &mut settings.provenance,
             Self::Tensorfold(settings) => &mut settings.provenance,
             Self::Llamacpp(settings) => &mut settings.provenance,
+            Self::TensorrtLlm(settings) => &mut settings.provenance,
             Self::Custom(settings) => &mut settings.provenance,
         }
     }
@@ -111,6 +118,7 @@ impl LaunchSettings {
             Self::Sglang(settings) => &settings.provenance,
             Self::Tensorfold(settings) => &settings.provenance,
             Self::Llamacpp(settings) => &settings.provenance,
+            Self::TensorrtLlm(settings) => &settings.provenance,
             Self::Custom(settings) => &settings.provenance,
         }
     }
@@ -415,6 +423,40 @@ impl LlamacppLaunchSettings {
         self.common
             .max_concurrent_requests
             .unwrap_or(LLAMACPP_DEFAULT_PARALLEL)
+    }
+}
+
+/// ADR 0038 §3: a TensorRT-LLM deployment's resolved settings. TensorRT-LLM
+/// has no park strategy (restart-only), so nothing here is derived from
+/// residency. `max_batch_size` is `common.max_concurrent_requests`, else
+/// [`MAX_REQUESTS_PER_DEPLOYMENT`] (owner decision 2026-10-27, question 5);
+/// `common.kv_cache_dtype` is `auto` or `fp8`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TensorrtLlmLaunchSettings {
+    pub common: CommonEngineSettings,
+    pub memory: MemoryRequest,
+    /// ADR 0024, ADR 0038 §14: the deployment's tool-call and reasoning
+    /// parser choice, in TensorRT-LLM's names, or `none`. `None` is `auto`:
+    /// chosen by model family where the checkpoint is read, at launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_parser: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_parser: Option<String>,
+    /// ADR 0038 §3 (owner decision 2026-10-27, question 6):
+    /// `engine_config.tensorrt-llm.llm_api_options`, merged under CapyCTL's
+    /// keys into the file it writes; no reserved key.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    pub llm_api_options: serde_json::Map<String, serde_json::Value>,
+    pub extra_args: Vec<String>,
+    pub provenance: BTreeMap<String, SettingSource>,
+}
+
+impl TensorrtLlmLaunchSettings {
+    /// ADR 0038 §3: the `--max_batch_size` a launch runs.
+    pub fn max_batch_size(&self) -> u32 {
+        self.common
+            .max_concurrent_requests
+            .unwrap_or(MAX_REQUESTS_PER_DEPLOYMENT)
     }
 }
 

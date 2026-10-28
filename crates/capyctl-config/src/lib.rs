@@ -56,6 +56,9 @@ pub mod setting_overrides;
 pub mod standalone;
 pub mod strict_yaml;
 pub mod yaml_emit;
+// ADR 0038: TensorRT-LLM's registration constants, option, key and
+// environment tables, served-name rule, KV tokens and configuration file.
+pub mod tensorrt_llm;
 // ADR 0023 §2: TensorFold's build toolchain on the closed launch PATH.
 pub mod toolchain;
 // ADR 0028 §2: a deployment's multi-node topology and group shape.
