@@ -8,8 +8,8 @@
   import Models from '../routes/models/Models.svelte';
   import NotFound from '../routes/NotFound.svelte';
   import Overview from '../routes/overview/Overview.svelte';
-  import Playground from '../routes/Playground.svelte';
-  import Settings from '../routes/Settings.svelte';
+  import Playground from '../routes/playground/Playground.svelte';
+  import Settings from '../routes/settings/Settings.svelte';
   import Brand from './Brand.svelte';
   import ReconnectingIndicator from './ReconnectingIndicator.svelte';
   import Sidebar from './Sidebar.svelte';
