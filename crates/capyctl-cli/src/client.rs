@@ -2226,7 +2226,9 @@ mod tests {
         let off = InstanceLmcache {
             state: "off".into(),
             reason: Some("park_unqualified".into()),
-            message: Some("not qualified with deep park on vLLM 0.32.0 / llama / NVIDIA GB10".into()),
+            message: Some(
+                "not qualified with deep park on vLLM 0.32.0 / llama / NVIDIA GB10".into(),
+            ),
             server: None,
             pool_bytes: None,
             overhead_bytes: None,

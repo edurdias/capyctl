@@ -406,7 +406,10 @@ fn refusals_carry_their_codes() {
     let mut required = deployment(tp(2));
     required["lmcache"] = "required".into();
     let error = refusal(&required, &h);
-    assert!(error.contains("lmcache_unavailable:not_installed"), "{error}");
+    assert!(
+        error.contains("lmcache_unavailable:not_installed"),
+        "{error}"
+    );
     // A decisions deployment keeps its own refusal of any topology.
     let mut decisions = deployment(Some(json!("auto")));
     decisions["api"] = "decisions".into();

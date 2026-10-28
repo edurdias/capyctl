@@ -665,10 +665,7 @@ mod tests {
         for table in ["checkpoint_digests", "checkpoint_sizes"] {
             for bad in [0, -1] {
                 assert!(conn
-                    .execute(
-                        &format!("UPDATE {table} SET kv_bytes_per_token=?1"),
-                        [bad]
-                    )
+                    .execute(&format!("UPDATE {table} SET kv_bytes_per_token=?1"), [bad])
                     .is_err());
             }
         }

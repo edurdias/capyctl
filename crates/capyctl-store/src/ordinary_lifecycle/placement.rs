@@ -225,14 +225,8 @@ pub(super) fn candidates(
         // Owner decision 2026-09-23: the instance's own startup peak
         // (declared, measured on this host, or the placeholder), or the whole
         // managed limit for a solo first start.
-        let (footprint, whole_host) = super::startup::startup_footprint(
-            tx,
-            deployment_id,
-            revision,
-            instance,
-            &host,
-            &e,
-        )?;
+        let (footprint, whole_host) =
+            super::startup::startup_footprint(tx, deployment_id, revision, instance, &host, &e)?;
         let (device_options, preferred_device) =
             device_options(tx, deployment_id, revision, instance, &host)?;
         // ADR 0035 §1a: under `topology: auto` this host's N is chosen now,

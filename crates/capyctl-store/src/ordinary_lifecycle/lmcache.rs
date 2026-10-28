@@ -16,8 +16,8 @@ use crate::events::{
 };
 use crate::lifecycle::completion::identities;
 use capyctl_config::lmcache::{
-    self as lc, ChargeDomains, LmcacheCharge, LmcacheMode, LmcacheOff, LmcacheOffReason, PlanInputs,
-    PoolSizing,
+    self as lc, ChargeDomains, LmcacheCharge, LmcacheMode, LmcacheOff, LmcacheOffReason,
+    PlanInputs, PoolSizing,
 };
 use capyctl_domain::completion::ProcessIdentity;
 

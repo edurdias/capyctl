@@ -1286,7 +1286,12 @@ mod tests {
         ] {
             assert!(note(&bad, LmcacheNote::PoolShort, "short").is_err());
         }
-        assert!(note(&launch("01BX5ZZKBKACTAV9WEVGEMMVS6", 3), LmcacheNote::PoolShort, " ").is_err());
+        assert!(note(
+            &launch("01BX5ZZKBKACTAV9WEVGEMMVS6", 3),
+            LmcacheNote::PoolShort,
+            " "
+        )
+        .is_err());
         let events = lmcache_events(&s);
         let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
         assert_eq!(

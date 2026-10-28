@@ -689,8 +689,9 @@ impl PoolBasis {
 pub fn pool_cap(host_kv_limit: Option<i64>, declared_host_kv_bytes: i64) -> u64 {
     match host_kv_limit {
         None => DEFAULT_POOL_GIB * GIB,
-        Some(limit) => floor_gib(limit.saturating_sub(declared_host_kv_bytes.max(0)))
-            .max(MIN_POOL_GIB * GIB),
+        Some(limit) => {
+            floor_gib(limit.saturating_sub(declared_host_kv_bytes.max(0))).max(MIN_POOL_GIB * GIB)
+        }
     }
 }
 
@@ -809,15 +810,13 @@ pub fn size_pool(stated: Option<u64>, basis: Result<PoolBasis, String>, cap: u64
             unknown: None,
             shrunk_from: None,
         },
-        (None, Ok(basis)) if basis.bytes_per_token > 0 && basis.context_tokens > 0 => {
-            PoolSizing {
-                pool_bytes: basis.needed_bytes().max(floor).min(cap),
-                source: PoolSource::Auto,
-                basis: Some(basis),
-                unknown: None,
-                shrunk_from: None,
-            }
-        }
+        (None, Ok(basis)) if basis.bytes_per_token > 0 && basis.context_tokens > 0 => PoolSizing {
+            pool_bytes: basis.needed_bytes().max(floor).min(cap),
+            source: PoolSource::Auto,
+            basis: Some(basis),
+            unknown: None,
+            shrunk_from: None,
+        },
         (None, basis) => PoolSizing {
             pool_bytes: floor.min(cap),
             source: PoolSource::Default,
@@ -2666,10 +2665,13 @@ mod tests {
     // both pass, and the released rows have passed neither.
     #[test]
     fn the_transfer_mode_follows_the_residency_and_the_rows() {
-        assert_eq!(ENGINE_DRIVEN_ROWS, EngineDrivenRows {
-            lc16_passed: false,
-            lc18_passed: false,
-        });
+        assert_eq!(
+            ENGINE_DRIVEN_ROWS,
+            EngineDrivenRows {
+                lc16_passed: false,
+                lc18_passed: false,
+            }
+        );
         assert_eq!(transfer_mode(Residency::Deep), TransferMode::EngineDriven);
         assert_eq!(
             transfer_mode(Residency::HostBacked),

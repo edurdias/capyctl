@@ -2804,7 +2804,10 @@ fn admission_shrinks_an_automatic_pool_to_the_room_left_or_runs_without_lmcache(
     );
     let warning = "the LMCache pool (3 GiB) was reduced from 4 GiB to the host-KV room left on \
                    the host: raise host_kv_limit or set lmcache_pool";
-    assert_eq!(instance_status(&lab, &second)["lmcache"]["warning"], warning);
+    assert_eq!(
+        instance_status(&lab, &second)["lmcache"]["warning"],
+        warning
+    );
     let short = lab.events("lmcache_pool_short", &second.deployment_id);
     assert_eq!(short.len(), 1, "{short:?}");
     assert_eq!(short[0]["detail"], warning);
@@ -2947,7 +2950,10 @@ fn a_remote_pool_uses_the_basis_its_host_reported() {
         .unwrap());
     let sized = remote_plan(&lab, &fence);
     let sizing = sized.sizing.unwrap();
-    assert_eq!((sizing.pool_bytes, sizing.source), (8 << 30, lc::PoolSource::Auto));
+    assert_eq!(
+        (sizing.pool_bytes, sizing.source),
+        (8 << 30, lc::PoolSource::Auto)
+    );
     assert_eq!(
         sizing.basis_text(sized.model_type.as_deref()),
         "auto: one 32,768-token context of qwen3 at 144 KiB per token"

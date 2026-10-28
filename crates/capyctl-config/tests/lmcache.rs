@@ -173,8 +173,14 @@ fn an_auto_pool_is_the_default() {
         deployment_command_fingerprint(&auto, 300_000).unwrap(),
         deployment_command_fingerprint(&deployment, 300_000).unwrap()
     );
-    let off = with(&deployment, json!({"lmcache": "off", "lmcache_pool": "auto"}));
-    assert_eq!(resolve_effective(&off, &host).unwrap().lmcache_pool_bytes, None);
+    let off = with(
+        &deployment,
+        json!({"lmcache": "off", "lmcache_pool": "auto"}),
+    );
+    assert_eq!(
+        resolve_effective(&off, &host).unwrap().lmcache_pool_bytes,
+        None
+    );
 }
 
 // T45 (ADR 0034 §4): B and C come from the checkpoint the launch reads: the
@@ -197,9 +203,11 @@ fn the_pool_basis_comes_from_the_checkpoint_and_the_context() {
     )
     .unwrap();
     let resolve = |engine_config: Value| {
-        let mut effective =
-            resolve_effective(&with(&deployment, json!({"engine_config": engine_config})), &host)
-                .unwrap();
+        let mut effective = resolve_effective(
+            &with(&deployment, json!({"engine_config": engine_config})),
+            &host,
+        )
+        .unwrap();
         effective.model.resolved_path = Some(dir.path().to_string_lossy().into_owned());
         effective
     };
@@ -242,7 +250,10 @@ fn invalid_pools_modes_and_a_pool_beside_off_are_refused() {
         let stated = with(&deployment, json!({ "lmcache_pool": pool }));
         let error = resolve_effective(&stated, &host).unwrap_err();
         assert_eq!(error.path, "lmcache_pool", "{pool}: {error}");
-        assert!(error.detail.contains("`auto` or a whole number of GiB"), "{error}");
+        assert!(
+            error.detail.contains("`auto` or a whole number of GiB"),
+            "{error}"
+        );
         assert!(deployment_command_fingerprint(&stated, 300_000).is_err());
     }
     for fields in [json!({"lmcache": "on"}), json!({"retention": "none"})] {
