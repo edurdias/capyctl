@@ -22,6 +22,8 @@ parking and its protections), ADR 0013 (instances), ADR 0014 (engine configurati
 measured startup peak), ADR 0017 (capability gating), ADR 0018 (registration), ADR 0019
 (memory domains), ADR 0028 (groups), ADR 0029 (llama.cpp), ADR 0030 (decision models),
 ADR 0031 (custom engines; its loopback listener check).
+**Amended by:** ADR 0038 (2026-10-28): §2's table gains a TensorRT-LLM row, LMCache
+off (`engine_unsupported`).
 
 ## Context
 
@@ -158,6 +160,7 @@ start with the connector (§8) are the live checks, and the LC rows the qualific
 | llama.cpp | no | `engine_unsupported`: "llama.cpp has no LMCache integration" |
 | TensorFold | no | `engine_unsupported`: "TensorFold has no LMCache integration" |
 | custom engine | no | `engine_unsupported`: "CapyCTL does not render options for a custom engine" |
+| TensorRT-LLM (ADR 0038 §12) | no | `engine_unsupported`: "LMCache is not qualified with TensorRT-LLM" |
 | SGLang, a decision deployment or `--disable-radix-cache` (A10) | no | `engine_unsupported`: "decision deployments on SGLang run without LMCache: …" or "SGLang with --disable-radix-cache runs without LMCache: …" |
 
 vLLM 0.32.0 and SGLang 0.5.22 are the qualified versions (the LC rows); a newer one is

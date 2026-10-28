@@ -1515,7 +1515,11 @@ pub const CHECKPOINT_REFUSALS: &[&str] = &[
 /// launch's allocation there with its free reserve kept, now or beside every
 /// claimed launch. ADR 0029 §6: `engine_config_file`: a llama.cpp launch on a
 /// host where `/etc/llama.cpp/config.ini` exists (llama-server would fill
-/// every option the command leaves unset from it).
+/// every option the command leaves unset from it). ADR 0038 §16:
+/// `kv_geometry_unsupported`: a TensorRT-LLM launch whose checkpoint, read on
+/// the launching host, has a KV geometry CapyCTL cannot size its pool from;
+/// `served_name_unsupported`: a TensorRT-LLM launch whose served name is not
+/// one path component.
 pub const POLICY_REFUSALS: &[&str] = &[
     "checkpoint_mismatch",
     "checkpoint_unverified",
@@ -1530,6 +1534,8 @@ pub const POLICY_REFUSALS: &[&str] = &[
     "capability_missing:deep_park",
     "capability_missing:core",
     "engine_config_file",
+    capyctl_config::tensorrt_llm::KV_GEOMETRY_UNSUPPORTED,
+    capyctl_config::tensorrt_llm::SERVED_NAME_UNSUPPORTED,
 ];
 
 /// Whether `reason` is one of the closed [`POLICY_REFUSALS`].

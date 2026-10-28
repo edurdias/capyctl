@@ -61,6 +61,9 @@ pub fn required_files(engine: Engine, sleep_mode: bool) -> &'static [&'static st
         // ADR 0029 §2: llama-server imports nothing of CapyCTL's and is never
         // probed.
         Engine::Llamacpp => &[],
+        // ADR 0038 §2, §3: `trtllm-serve` imports nothing of CapyCTL's (its
+        // configuration is a YAML file CapyCTL writes) and is never probed.
+        Engine::TensorrtLlm => &[],
         // ADR 0031 §4: a custom engine imports nothing of CapyCTL's.
         Engine::Custom => &[],
     }

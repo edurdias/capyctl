@@ -118,8 +118,9 @@ impl NativeHostExecution {
     /// llama.cpp, answers 503), or the bound (`ENGINE_IDLE_BOUND` or the
     /// command's remaining time) passed without a busy answer. A launch whose
     /// engine keeps no such counters (vLLM and SGLang drain on CapyCTL's own
-    /// leases, a custom engine without an idle signal) is clear by this check.
-    /// A launch whose approved profile is no longer held is not: its
+    /// leases, a custom engine without an idle signal, TensorRT-LLM, whose
+    /// `/metrics` is never idle evidence, ADR 0038 §7) is clear by this
+    /// check. A launch whose approved profile is no longer held is not: its
     /// idleness is unknown, so it waits the whole bound, as an idle signal
     /// that never answers does.
     pub(crate) async fn idle_before_terminate(
@@ -143,6 +144,11 @@ impl NativeHostExecution {
                 // ADR 0031 §6: without an idle signal the stop proceeds on
                 // CapyCTL's own drain.
                 Engine::Custom if idle_signal.is_some() => {}
+                // ADR 0038 §7: TensorRT-LLM reports no idle signal, so its
+                // stop proceeds on CapyCTL's own drain too; reading
+                // `/metrics` here would also consume the load sampler's
+                // entries.
+                Engine::TensorrtLlm => return true,
                 _ => return true,
             }
         }

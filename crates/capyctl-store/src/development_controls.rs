@@ -85,6 +85,28 @@ pub const LLAMACPP_UNAUTHENTICATED_LOCAL_SURFACES: UnauthenticatedSurfaces =
         access: "inference",
     };
 
+/// ADR 0038 §8, §9: `trtllm-serve` has no API key; every route it registers
+/// (1.2.1, `serve/openai_server.py`) is unauthenticated on loopback, reached
+/// only through capyctl's routed path, which forwards chat alone.
+pub const TENSORRT_LLM_UNAUTHENTICATED_LOCAL_SURFACES: UnauthenticatedSurfaces =
+    UnauthenticatedSurfaces {
+        surface: &[
+            "/v1",
+            "/health",
+            "/health_generate",
+            "/version",
+            "/metrics",
+            "/perf_metrics",
+            "/steady_clock_offset",
+            "/kv_cache_events",
+            "/release_memory",
+            "/resume_memory",
+            "/update_weights",
+        ],
+        listener: "loopback",
+        access: "inference",
+    };
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExposureState {
@@ -175,6 +197,9 @@ fn classify(
     if engine == Engine::Llamacpp {
         controls.unauthenticated_local_surfaces = Some(LLAMACPP_UNAUTHENTICATED_LOCAL_SURFACES);
     }
+    if engine == Engine::TensorrtLlm {
+        controls.unauthenticated_local_surfaces = Some(TENSORRT_LLM_UNAUTHENTICATED_LOCAL_SURFACES);
+    }
     if engine != Engine::Vllm {
         return controls;
     }
@@ -203,6 +228,7 @@ pub fn for_effective(effective: &EffectiveDeployment) -> DevelopmentControls {
         LaunchSettings::Sglang(_)
         | LaunchSettings::Tensorfold(_)
         | LaunchSettings::Llamacpp(_)
+        | LaunchSettings::TensorrtLlm(_)
         | LaunchSettings::Custom(_) => None,
     };
     classify(

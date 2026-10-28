@@ -784,6 +784,86 @@ fn an_environment_llamacpp_is_checked_and_never_parks() {
     }
 }
 
+/// ADR 0038 §2: a role's own TensorRT-LLM is declared by
+/// CAPYCTL_TENSORRT_LLM_BIN and built as `engine add` builds it: the version
+/// and companion versions read by the metadata-only check under the
+/// environment's interpreter (never `trtllm-serve`), deep park off whatever
+/// the default says, the companions published with the profile, and
+/// `local-tensorrt-llm` beside another engine.
+// T49 T03
+#[test]
+fn an_environment_tensorrt_llm_is_checked_and_never_parks() {
+    use crate::roles::EngineProvider as _;
+    let Some(_guard) = isolated("an_environment_tensorrt_llm_is_checked_and_never_parks") else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("a temporary installation");
+    std::env::set_var("CAPYCTL_MODELS_ROOT", dir.path());
+    std::env::set_var("CAPYCTL_RUNTIME_DIR", private_runtime(dir.path()));
+    std::env::remove_var("CAPYCTL_DEEP_PARK");
+    std::env::remove_var("CAPYCTL_ENGINE_FINGERPRINT");
+    let venv = dir.path().join("tensorrt-llm-1.2.1-venv");
+    let site = venv.join("lib/python3.12/site-packages");
+    let dist = site.join("tensorrt_llm-1.2.1.dist-info");
+    std::fs::create_dir_all(&dist).expect("a dist-info");
+    std::fs::create_dir_all(site.join("tensorrt_llm")).expect("the package");
+    std::fs::write(
+        dist.join("METADATA"),
+        "Name: tensorrt_llm\nVersion: 1.2.1\n",
+    )
+    .expect("the metadata");
+    std::fs::create_dir_all(venv.join("bin")).expect("a bin directory");
+    let marker = dir.path().join("served");
+    let bin = venv.join("bin/trtllm-serve");
+    capyctl_config::test_support::write_executable(
+        &bin,
+        format!("#!/bin/sh\ntouch {}\n", marker.display()),
+        0o700,
+    )
+    .expect("the console script");
+    capyctl_config::test_support::write_executable(
+        &venv.join("bin/python3"),
+        "#!/bin/sh\n[ \"$1\" = -I ] || exit 9\nprintf 'tensorrt_llm 1.2.1\\ntorch 2.9.1+cu130\\n\
+         tensorrt 10.14.1.48\\nflashinfer-python 0.6.4\\ntransformers 4.57.3\\nmpi4py 4.1.1\\n'\n",
+        0o700,
+    )
+    .expect("the interpreter");
+    std::env::set_var("CAPYCTL_TENSORRT_LLM_BIN", &bin);
+    let named = crate::roles::EnvEngineProvider::new()
+        .installations(&Default::default())
+        .expect("the environment declares an installation");
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0].profile, "local");
+    let installation = &named[0].installation;
+    assert_eq!(installation.engine, Engine::TensorrtLlm);
+    assert_eq!(installation.build_fingerprint, "1.2.1");
+    assert!(!installation.deep_park);
+    let host = host_policy(&named, "env-1", CAPACITY, None, &HostShape::NoGpu, PORTS);
+    let profile = &host["runtime_profiles"]["local"];
+    assert_eq!(profile["engine"], "tensorrt-llm");
+    assert_eq!(profile["security"]["deep_park"], "disabled");
+    assert_eq!(profile["companions"]["torch"], "2.9.1+cu130");
+    assert_eq!(profile["companions"]["mpi4py"], "4.1.1");
+    capyctl_config::registration::check_profile("local", profile)
+        .expect("the published profile passes the resolution rules");
+
+    std::env::set_var("CAPYCTL_VLLM_BIN", fake_engine_bin(dir.path()));
+    let named = crate::roles::EnvEngineProvider::new()
+        .installations(&Default::default())
+        .expect("two installations");
+    let profiles: Vec<&str> = named.iter().map(|n| n.profile.as_str()).collect();
+    assert_eq!(profiles, ["local-vllm", "local-tensorrt-llm"]);
+    std::env::remove_var("CAPYCTL_VLLM_BIN");
+    assert!(!marker.exists(), "trtllm-serve ran");
+    for name in [
+        "CAPYCTL_TENSORRT_LLM_BIN",
+        "CAPYCTL_MODELS_ROOT",
+        "CAPYCTL_RUNTIME_DIR",
+    ] {
+        std::env::remove_var(name);
+    }
+}
+
 /// Spec §7: the host policy built from the environment carries the model store,
 /// the deep-park switch and the flags the profile passes, and the deployment
 /// standalone generates carries the engine configuration (ADR 0014 §1) — and

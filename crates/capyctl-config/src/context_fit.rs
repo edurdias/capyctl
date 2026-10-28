@@ -508,6 +508,15 @@ pub fn fit_for_launch(
         LaunchSettings::Sglang(s) => (&s.common, &s.memory, None, 0),
         LaunchSettings::Tensorfold(s) => (&s.common, &s.memory, None, 0),
         LaunchSettings::Llamacpp(s) => (&s.common, &s.memory, None, 0),
+        // ADR 0038 §3, §4: TensorRT-LLM's pool is `kv_cache_config.max_tokens`
+        // in blocks of `tokens_per_block`; a fitted `--max_seq_len` is held to
+        // whole blocks so the built pool holds one window.
+        LaunchSettings::TensorrtLlm(s) => (
+            &s.common,
+            &s.memory,
+            Some(crate::tensorrt_llm::tokens_per_block(&s.llm_api_options)),
+            0,
+        ),
         // ADR 0031 §4: CapyCTL fits nothing for a custom engine; a declared
         // context reaches it only through its placeholder, and otherwise the
         // manifest, the host's own command, decides.
@@ -669,6 +678,15 @@ fn launch_streams(
 ) -> Option<Streams> {
     match settings {
         LaunchSettings::Llamacpp(s) => Some(llamacpp_streams(s)),
+        LaunchSettings::TensorrtLlm(s) => Some(Streams {
+            count: Some(s.max_batch_size()),
+            source: if s.common.max_concurrent_requests.is_some() {
+                StreamsSource::Declared
+            } else {
+                StreamsSource::Default
+            },
+            reason: None,
+        }),
         _ => tensorfold_streams(settings, profile_args, config),
     }
 }
@@ -840,6 +858,7 @@ pub fn fit_on_remote_host(effective: &crate::effective::EffectiveDeployment) -> 
         LaunchSettings::Sglang(s) => s.common.context_length,
         LaunchSettings::Tensorfold(s) => s.common.context_length,
         LaunchSettings::Llamacpp(s) => s.common.context_length,
+        LaunchSettings::TensorrtLlm(s) => s.common.context_length,
         LaunchSettings::Custom(s) => s.common.context_length,
     };
     let fit = fit_for_launch(
@@ -961,7 +980,9 @@ pub fn max_running_for_effective(
             (None, None) if remote => MaxRunning::of(None, MaxRunningSource::OnHost),
             (None, None) => MaxRunning::of(None, MaxRunningSource::EngineDefault),
         },
-        LaunchSettings::Tensorfold(_) | LaunchSettings::Llamacpp(_) => match &fit.streams {
+        LaunchSettings::Tensorfold(_)
+        | LaunchSettings::Llamacpp(_)
+        | LaunchSettings::TensorrtLlm(_) => match &fit.streams {
             Some(streams) => MaxRunning {
                 count: streams.count,
                 source: match streams.source {

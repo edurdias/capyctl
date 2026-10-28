@@ -38,18 +38,19 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 4 | `host_tuning_missing:<item>` | With `require_rdma: true`, a machine lacks `memlock` (unlimited locked memory) or `infiniband` (read-write `/dev/infiniband/uverbs*`). | Fix the item as root on that machine, or set `require_rdma: false`. |
 | 5 | `unsupported` | The request is valid but this release cannot do it. | Read the message; it names the missing capability. |
 | 5 | `store_from_newer_version` | The state directory was written by a newer CapyCTL. | Run the newer binary, or restore a backup taken before the upgrade. |
-| 5 | `multi_gpu_unsupported` | The deployment names two or more GPUs without a `topology`, or asks for several GPUs on a machine with one unified-memory GPU (such as a GB10) or on an engine that runs on one GPU only (TensorFold, a custom engine). | Add `topology: {tensor_parallel: N}` with N the number of GPUs you named ([One model on several GPUs](deploy.md#one-model-on-several-gpus)); otherwise use one GPU, or several machines with `placement.hosts`. |
+| 5 | `multi_gpu_unsupported` | The deployment names two or more GPUs without a `topology`, or asks for several GPUs on a machine with one unified-memory GPU (such as a GB10) or on an engine that runs on one GPU only (TensorFold, TensorRT-LLM, a custom engine). | Add `topology: {tensor_parallel: N}` with N the number of GPUs you named ([One model on several GPUs](deploy.md#one-model-on-several-gpus)); otherwise use one GPU, or several machines with `placement.hosts`. |
 | 5 | `multi_gpu_mixed_devices` | The GPUs a deployment names differ in product or memory. | Name identical GPUs (`nvidia-smi -L` shows them). |
 | 5 | `tensor_parallel_indivisible` | On vLLM or SGLang, `tensor_parallel` does not divide the model's attention heads; the message names the head count and the numbers that divide it. | Use one of the numbers the message names, or `topology: auto`. |
 | 5 | `unsupported_gpu_topology` | The machine has both an integrated and a discrete GPU. | Not supported in this release. |
 | 5 | `host_backed_unavailable` | `residency: host_backed` on unified memory. | Use `deep`, or leave `residency` out. |
-| 5 | `capability_missing`, `capability_missing:deep_park` | `--deep-park enabled` on an engine that cannot park (TensorFold, llama.cpp, a custom engine), or a deployment asking such an engine to park (`residency: deep` or `host_backed`). | Leave `--deep-park` out; use `residency: restart_only`. |
+| 5 | `capability_missing`, `capability_missing:deep_park` | `--deep-park enabled` on an engine that cannot park (TensorFold, llama.cpp, TensorRT-LLM, a custom engine), or a deployment asking such an engine to park (`residency: deep` or `host_backed`). | Leave `--deep-park` out; use `residency: restart_only`. |
 | 5 | `group_shape_unsupported`, `group_shape_unsupported:<engine>` | More than one rank per machine in a group, `pipeline_parallel` above 1 on one machine, or a shape the engine cannot run (TensorFold runs `tensor_parallel: 2` on exactly two machines; a custom engine, `group_shape_unsupported:custom`, runs on one machine only). | Use one machine per rank and a shape the engine supports ([Groups across machines](engines.md#groups-across-machines)); on one machine use `tensor_parallel` only; for a custom engine, remove `topology` and use `instances` for more copies. |
 | 5 | `group_instances_unsupported` | `instances` above 1 with a `topology` across machines. | Deploy one group per deployment. |
 | 5 | `group_drift:<field>`, `tp_drift:<field>` | The engine changed a multi-machine or multi-GPU setting CapyCTL rendered (the field is named). | Report it; the engine build behaves differently from the one CapyCTL supports. |
 | 5 | `host_capability_missing:engine_groups` | A machine runs a CapyCTL too old for groups. | Upgrade CapyCTL on that machine. |
 | 5 | `host_capability_missing:local_tensor_parallel` | A deployment with a `topology` on one machine names a machine that runs a CapyCTL too old to run a model on several GPUs; nothing was sent to it. | Upgrade CapyCTL on that machine. |
-| 5 | `capability_missing:decisions` | A deployment with `api: decisions` names an engine that cannot serve decision models: vLLM (any version: 0.32.0 answers Clef and Clef-Flash from their text output instead of their decision head), TensorFold, llama.cpp before 0.7.0, SGLang before 0.5.22, an installation whose registered build names no version, or a custom engine whose manifest says `api: chat`. | Use llama.cpp 0.7.0 or newer or SGLang 0.5.22 or newer, registered with `capyctl engine add`, or a custom engine with `api: decisions` ([Decision models](deploy.md#decision-models)). |
+| 5 | `capability_missing:decisions` | A deployment with `api: decisions` names an engine that cannot serve decision models: vLLM (any version: 0.32.0 answers Clef and Clef-Flash from their text output instead of their decision head), TensorFold, TensorRT-LLM, llama.cpp before 0.7.0, SGLang before 0.5.22, an installation whose registered build names no version, or a custom engine whose manifest says `api: chat`. | Use llama.cpp 0.7.0 or newer or SGLang 0.5.22 or newer, registered with `capyctl engine add`, or a custom engine with `api: decisions` ([Decision models](deploy.md#decision-models)). |
+| 5 | `served_name_unsupported` | On TensorRT-LLM, the deployment's served name (its first route) is empty, `.` or `..`, holds `/` or a NUL byte, or is longer than 255 bytes. TensorRT-LLM serves the name of the model directory it is given, so CapyCTL links the checkpoint under the served name. | Use a served name that is one path component ([TensorRT-LLM](engines.md#tensorrt-llm)). |
 | 5 | `capability_missing:chat` | A chat deployment (no `api`, or `api: chat`) names a custom engine whose manifest says `api: decisions`. | Add `api: decisions` to the deployment, or use a chat engine. |
 | 5 | `host_capability_missing:decisions` | A machine runs a CapyCTL too old for decision models. | Upgrade CapyCTL on that machine. |
 | 5 | `host_capability_missing:custom_engines` | The deployment's engine is a custom engine and a machine it names runs a CapyCTL too old for custom engines. | Upgrade CapyCTL on that machine. |
@@ -127,17 +128,41 @@ A deployment on one machine can show these codes the same way:
   different slot count or window, or its `/metrics` or `/slots` page off, than
   CapyCTL started it with. CapyCTL stops it. Report it: the build behaves
   differently from llama.cpp v0.6.0.
+- `kv_geometry_unsupported` (TensorRT-LLM): the checkpoint's `config.json`
+  describes a model whose KV cache CapyCTL cannot size for TensorRT-LLM in
+  this version (sliding or per-layer attention windows, multi-head latent
+  attention, recurrent or hybrid layers, an encoder-decoder model, or a shape
+  or dtype it cannot read); the message names what. Nothing starts. Use
+  another engine for that model.
+- `kv_cache_short` (TensorRT-LLM): once started, the KV pool TensorRT-LLM
+  built holds less than one request's window (`context_length`); the message
+  names both figures. On a GB10 the engine sizes its pool from what the
+  machine has free at start, so other programs can make it smaller than the
+  grant. CapyCTL stops it; free memory, or lower `context_length`, and start
+  it again.
+- `effective_args_mismatch` (TensorRT-LLM): once started, TensorRT-LLM listed
+  another served name than CapyCTL gave it, or built a KV pool larger than
+  CapyCTL's `max_tokens` by more than one block. CapyCTL stops it. Report it:
+  the build behaves differently from the version CapyCTL renders for.
+- `installation_drift` (TensorRT-LLM): `/version` reported another version
+  than the one the engine profile registered. CapyCTL stops it; register the
+  installation again with `capyctl engine add`.
+- `engine_process_escaped` (TensorRT-LLM): once the engine was ready, or when
+  CapyCTL checked it again later, one of its descendant processes ran in
+  another process group than the engine's (as an MPI daemon that detaches
+  would); the message names the process. CapyCTL stops it and waits until
+  both the group and that process are gone, then fails the start.
 - `custom_listener_exposed` (custom engine): once the engine passed its
   check, one of its processes listened on an address other than `127.0.0.1`
   or `::1`; the message names the address and port. CapyCTL stops the engine
   and the start fails. Make the manifest's `args` bind the engine to
   `"{host}"` ([The listener check](engines.md#the-listener-check)).
-- `engine_listener_exposed` (a model on several GPUs): once the engine was
-  ready, or when CapyCTL checked it again later, one of its processes
-  listened on an address other than `127.0.0.1` or `::1`; the message names
-  the process, the address and the port. CapyCTL stops the engine and the
-  start fails. Report it: the engine build opened a listener CapyCTL does not
-  expect.
+- `engine_listener_exposed` (TensorRT-LLM on every launch, and a model on
+  several GPUs): once the engine was ready, or when CapyCTL checked it again
+  later, one of its processes listened on an address other than `127.0.0.1`
+  or `::1`; the message names the process, the address and the port. CapyCTL
+  stops the engine and the start fails. Report it: the engine build opened a
+  listener CapyCTL does not expect.
 - `tp_rank_unobserved` (a model on several GPUs): the engine did not show one
   process of its own on each of its GPUs within the start window
   (`timeouts.initialize`). The start fails and nothing is served half-started.

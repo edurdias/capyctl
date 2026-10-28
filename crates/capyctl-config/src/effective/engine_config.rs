@@ -11,7 +11,7 @@ use crate::engine_policy::{
 use capyctl_domain::launch::{
     CommonEngineSettings, CustomLaunchSettings, LaunchSettings, LlamacppGpuLayers,
     LlamacppLaunchSettings, MemoryRequest, SafetensorsLoadStrategy, SettingSource,
-    SglangLaunchSettings, TensorfoldLaunchSettings, VllmLaunchSettings,
+    SglangLaunchSettings, TensorfoldLaunchSettings, TensorrtLlmLaunchSettings, VllmLaunchSettings,
 };
 
 /// ADR 0014 §5: conservative placeholder overhead margins, per engine family,
@@ -23,6 +23,9 @@ pub const TENSORFOLD_OVERHEAD_MARGIN_BYTES: i64 = 0;
 // ADR 0029 §9: a placeholder, as for vLLM and SGLang, until the live rows
 // measure llama-server's peak minus weights minus KV.
 pub const LLAMACPP_OVERHEAD_MARGIN_BYTES: i64 = 8 << 30;
+// ADR 0038 §4: the unified-memory placeholder's floor (A18), as for vLLM and
+// SGLang, until TR3 measures TensorRT-LLM's peak minus weights minus KV.
+pub const TENSORRT_LLM_OVERHEAD_MARGIN_BYTES: i64 = 8 << 30;
 
 /// ADR 0014 §5: the parked phase is the engine's residual floor, also to be
 /// measured. Until then a parking deployment reserves this placeholder (or its
@@ -133,7 +136,9 @@ pub const STARTUP_GRAPH_ALLOWANCE_BYTES: i64 = 5 << 28;
 /// and SGLang, nothing for TensorFold (which declares its resources).
 pub fn startup_graph_allowance(engine: Engine, draft_model: bool) -> i64 {
     match engine {
-        Engine::Vllm | Engine::Sglang => {
+        // ADR 0038 §4: TensorRT-LLM captures CUDA graphs after it builds its
+        // pool (`cuda_graph_config` is on by default), as vLLM and SGLang do.
+        Engine::Vllm | Engine::Sglang | Engine::TensorrtLlm => {
             STARTUP_GRAPH_ALLOWANCE_BYTES * if draft_model { 2 } else { 1 }
         }
         Engine::Tensorfold | Engine::Llamacpp | Engine::Custom => 0,
@@ -188,6 +193,7 @@ pub fn overhead_margin(engine: Engine) -> i64 {
         Engine::Sglang => SGLANG_OVERHEAD_MARGIN_BYTES,
         Engine::Tensorfold => TENSORFOLD_OVERHEAD_MARGIN_BYTES,
         Engine::Llamacpp => LLAMACPP_OVERHEAD_MARGIN_BYTES,
+        Engine::TensorrtLlm => TENSORRT_LLM_OVERHEAD_MARGIN_BYTES,
         // ADR 0031 §4: a custom engine declares its resources; nothing is
         // derived beside them.
         Engine::Custom => 0,
@@ -340,6 +346,10 @@ pub(super) struct RawEngineConfig {
     tensorfold: Option<RawTensorfoldFields>,
     #[serde(default)]
     llamacpp: Option<RawLlamacppFields>,
+    // ADR 0038 §3: the block is named after the kind (owner decision
+    // 2026-10-27, questions 6 and 8).
+    #[serde(default, rename = "tensorrt-llm")]
+    tensorrt_llm: Option<RawTensorrtLlmFields>,
     #[serde(default)]
     accept_extra_args: Option<bool>,
     #[serde(default)]
@@ -445,6 +455,21 @@ struct RawLlamacppFields {
     gguf_file: Option<String>,
     #[serde(default)]
     mmproj_file: Option<String>,
+}
+
+/// ADR 0038 §3, §14: `engine_config.tensorrt-llm`.
+#[derive(Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTensorrtLlmFields {
+    // ADR 0024: `auto` (the default), `none`, or TensorRT-LLM's parser name.
+    #[serde(default)]
+    tool_call_parser: Option<String>,
+    #[serde(default)]
+    reasoning_parser: Option<String>,
+    // Owner decision 2026-10-27, question 6: LLM API arguments merged under
+    // CapyCTL's keys; a reserved key is refused.
+    #[serde(default)]
+    llm_api_options: Option<serde_json::Map<String, Value>>,
 }
 
 /// Review decision (discrete GPU design §3): how a memory request derived from
@@ -695,7 +720,11 @@ fn device_request_from_weights(
         .ok_or_else(|| invalid("engine_config.memory", "memory arithmetic overflows"))?;
     let floor = match engine {
         Engine::Vllm => device.declared_total / 100 * 75,
-        Engine::Sglang | Engine::Tensorfold | Engine::Llamacpp | Engine::Custom => 0,
+        Engine::Sglang
+        | Engine::Tensorfold
+        | Engine::Llamacpp
+        | Engine::TensorrtLlm
+        | Engine::Custom => 0,
     };
     let request = request.max(floor);
     // ADR 0035 §3: on several GPUs each card also holds the communication
@@ -1316,7 +1345,7 @@ fn refuse_custom_fields(raw: &RawEngineConfig) -> Result<(), ConfigError> {
         .sglang
         .as_ref()
         .and_then(|b| parser(b.tool_call_parser.is_some(), b.reasoning_parser.is_some()));
-    let stated: [(&str, bool); 15] = [
+    let stated: [(&str, bool); 16] = [
         ("extra_args", raw.extra_args.is_some()),
         ("accept_extra_args", raw.accept_extra_args.is_some()),
         (
@@ -1348,6 +1377,7 @@ fn refuse_custom_fields(raw: &RawEngineConfig) -> Result<(), ConfigError> {
             },
             raw.tensorfold.is_some() || raw.llamacpp.is_some(),
         ),
+        ("tensorrt-llm", raw.tensorrt_llm.is_some()),
     ];
     if let Some((field, _)) = stated.iter().find(|(_, set)| *set) {
         return Err(invalid(
@@ -1386,6 +1416,7 @@ pub(super) fn normalize_engine_config(
         ("sglang", raw.sglang.is_some()),
         ("tensorfold", raw.tensorfold.is_some()),
         ("llamacpp", raw.llamacpp.is_some()),
+        ("tensorrt-llm", raw.tensorrt_llm.is_some()),
     ];
     for (block, present) in foreign {
         if *present && *block != engine.name() {
@@ -1397,7 +1428,7 @@ pub(super) fn normalize_engine_config(
     if let Some(family) = match engine {
         Engine::Tensorfold => Some("TensorFold"),
         Engine::Llamacpp => Some("llama.cpp"),
-        Engine::Vllm | Engine::Sglang | Engine::Custom => None,
+        Engine::Vllm | Engine::Sglang | Engine::TensorrtLlm | Engine::Custom => None,
     } {
         for (field, set) in [
             ("dtype", raw.dtype.is_some()),
@@ -1429,6 +1460,48 @@ pub(super) fn normalize_engine_config(
                     }
                 },
             ));
+        }
+    }
+    // ADR 0038 §3: the checkpoint carries its quantization, and 1.2.1 has no
+    // switch that serves the language model alone; the KV cache dtypes are
+    // the ones CapyCTL sizes (§4).
+    if engine == Engine::TensorrtLlm {
+        for (field, set, why) in [
+            (
+                "quantization",
+                raw.quantization.is_some(),
+                "TensorRT-LLM reads the quantization from the checkpoint",
+            ),
+            (
+                "language_model_only",
+                raw.language_model_only == Some(true),
+                "TensorRT-LLM has no switch that serves the language model alone",
+            ),
+        ] {
+            if set {
+                return Err(invalid(
+                    format!("engine_config.{field}"),
+                    format!("{why}; remove it"),
+                ));
+            }
+        }
+        if let Some(kind) = raw
+            .kv_cache_dtype
+            .as_deref()
+            .filter(|kind| !crate::tensorrt_llm::KV_CACHE_DTYPES.contains(kind))
+        {
+            return Err(invalid(
+                "engine_config.kv_cache_dtype",
+                format!(
+                    "`{kind}` is not a KV cache dtype CapyCTL sizes for TensorRT-LLM; use {}",
+                    crate::tensorrt_llm::KV_CACHE_DTYPES.join(" or ")
+                ),
+            ));
+        }
+        let block = raw.tensorrt_llm.clone().unwrap_or_default();
+        if let Some(options) = &block.llm_api_options {
+            crate::tensorrt_llm::check_options(options, raw.cuda_graphs.is_some())
+                .map_err(|reason| invalid("engine_config.tensorrt-llm.llm_api_options", reason))?;
         }
     }
     // ADR 0029 §5: one of llama.cpp's cache types, for keys and values both.
@@ -1527,6 +1600,7 @@ pub(super) fn normalize_engine_config(
     let vllm = raw.vllm.clone().unwrap_or_default();
     let sglang = raw.sglang.clone().unwrap_or_default();
     let tensorfold = raw.tensorfold.clone().unwrap_or_default();
+    let tensorrt_llm = raw.tensorrt_llm.clone().unwrap_or_default();
     let declared: [(&str, bool); 16] = [
         ("dtype", raw.dtype.is_some()),
         ("quantization", raw.quantization.is_some()),
@@ -1677,6 +1751,12 @@ pub(super) fn normalize_engine_config(
             "sglang",
             sglang.tool_call_parser.clone(),
             sglang.reasoning_parser.clone(),
+        )),
+        // ADR 0038 §14: TensorRT-LLM's own parser names (ADR 0024's column).
+        Engine::TensorrtLlm => Some((
+            "tensorrt-llm",
+            tensorrt_llm.tool_call_parser.clone(),
+            tensorrt_llm.reasoning_parser.clone(),
         )),
         // ADR 0029 §12: llama-server derives its parsers from the chat template.
         Engine::Tensorfold | Engine::Llamacpp | Engine::Custom => None,
@@ -2161,6 +2241,17 @@ pub(super) fn normalize_engine_config(
                 provenance,
             })
         }
+        // ADR 0038 §3: the typed fields render into the command and the file
+        // CapyCTL writes; the deployment's mapping is merged under them.
+        Engine::TensorrtLlm => LaunchSettings::TensorrtLlm(TensorrtLlmLaunchSettings {
+            common,
+            memory,
+            tool_call_parser,
+            reasoning_parser,
+            llm_api_options: tensorrt_llm.llm_api_options.unwrap_or_default(),
+            extra_args,
+            provenance,
+        }),
         // ADR 0031 §4: the declared `resources` and, at most, the context
         // its placeholder renders.
         Engine::Custom => LaunchSettings::Custom(CustomLaunchSettings {
@@ -2207,6 +2298,14 @@ pub(super) fn declared_engine_config(raw: &RawEngineConfig) -> Result<Value, Con
             "n_gpu_layers": l.n_gpu_layers, "gguf_file": l.gguf_file,
             "mmproj_file": l.mmproj_file,
         })),
+        // ADR 0038 §3, §14.
+        "tensorrt-llm": raw.tensorrt_llm.as_ref().map(|t| {
+            let mut block = with_parsers(serde_json::json!({}), &t.tool_call_parser, &t.reasoning_parser);
+            if let Some(options) = &t.llm_api_options {
+                block["llm_api_options"] = Value::Object(options.clone());
+            }
+            block
+        }),
         "accept_extra_args": raw.accept_extra_args,
         "extra_args": raw.extra_args,
     });
@@ -2218,6 +2317,9 @@ pub(super) fn declared_engine_config(raw: &RawEngineConfig) -> Result<Value, Con
         }
         if raw.llamacpp.is_none() {
             object.remove("llamacpp");
+        }
+        if raw.tensorrt_llm.is_none() {
+            object.remove("tensorrt-llm");
         }
     }
     // ADR 0028 §2.1: likewise the environment, only when declared.

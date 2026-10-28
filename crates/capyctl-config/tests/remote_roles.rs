@@ -624,7 +624,7 @@ fn a_host_states_its_engine_settings_three_ways() {
         HostConfig::parse(&document.to_string())
             .unwrap()
             .with_engines(flags, env, &|_, path| {
-                Ok(format!("probed {}", path.display()))
+                Ok(format!("probed {}", path.display()).into())
             })
             .unwrap()
     };

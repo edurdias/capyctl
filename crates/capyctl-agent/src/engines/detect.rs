@@ -3,6 +3,10 @@
 //! scanned, and is bounded in environments, depth and directory entries.
 //! ADR 0029 §2: llama.cpp's bare `llama-server` binary is a second source,
 //! found by file name, its version read from a `libllama.so.X.Y.Z` name.
+//! ADR 0038 §2: TensorRT-LLM is found by its `tensorrt_llm-*.dist-info`
+//! beside `bin/trtllm-serve`, with the same roots and bounds; its `custom`
+//! marking reads the environment's `torch-*.dist-info` too, and nothing is
+//! executed (running `trtllm-serve` or importing the package starts MPI).
 use super::{packages, resolve::entry, resolve::library_dirs, site_packages};
 use capyctl_config::engine_policy::Engine;
 use capyctl_config::llamacpp::EXECUTABLE;
@@ -127,7 +131,7 @@ impl Scan<'_> {
             if std::fs::symlink_metadata(&entry).is_err() {
                 continue;
             }
-            let custom = !capyctl_config::registration::is_verified(engine, &version);
+            let custom = !super::verified_in_env(engine, &version, env);
             self.found.push(Candidate {
                 engine,
                 version,

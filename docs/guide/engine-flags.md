@@ -14,7 +14,7 @@ Engines take many options. CapyCTL treats each one in one of four ways:
   spelling, abbreviations included. The table names the setting to use
   instead.
 
-These rules cover vLLM, SGLang, TensorFold and llama.cpp. A
+These rules cover vLLM, SGLang, TensorFold, llama.cpp and TensorRT-LLM. A
 [custom engine](engines.md#custom-engines) takes its options from its
 manifest, and CapyCTL checks none of them; a deployment on it cannot add any.
 
@@ -33,8 +33,8 @@ count memory it makes the engine use, such as a CPU KV offload. Size
 ## The ownership table
 
 `capyctl engine flags <family>` prints every option and environment name the
-checks know for an engine family (`vllm`, `sglang`, `tensorfold` or
-`llamacpp`), with its class and the reason. It is built from the same tables
+checks know for an engine family (`vllm`, `sglang`, `tensorfold`, `llamacpp`
+or `tensorrt-llm`), with its class and the reason. It is built from the same tables
 the checks read, so it cannot drift from them. It prints text by default;
 `--format json` (or `--json`) prints one object. `--version V` records the
 engine version in the output; the policy is the same for every version of a
@@ -260,6 +260,113 @@ option, and `--name=value` is refused because llama-server takes only
 | Devices | `--device`, `--split-mode`, `--tensor-split`, `--main-gpu` | reserved | `devices` and `topology`. On several GPUs CapyCTL renders `--split-mode layer`, `--tensor-split` and `--main-gpu 0`; `row` and `tensor` are not supported. |
 | Built-in tools and agent | `--tools`, `--agent` | reserved | They run code on the host. |
 | Embeddings and reranking | `--embedding`, `--rerank`, `--pooling` | reserved | A llama.cpp deployment serves chat. |
+
+## TensorRT-LLM 1.2.1, 1.3.0rc29 and 1.4.0rc1
+
+The options of `trtllm-serve serve` and the fields of its LLM API
+configuration, read from three tags: v1.2.1, v1.3.0rc29 and v1.4.0rc1
+(`crates/capyctl-config/src/tensorrt_llm.rs`). An option or key
+reserved on any of the three is refused on all three; `trtllm-serve` refuses
+an option its version lacks anyway. A version outside the three uses the
+tables of the qualified version of its minor line, else 1.2.1's.
+
+`trtllm-serve` matches option names exactly, so CapyCTL does too: no
+abbreviation stands for an option, `_` and `-` are the same, every alias is
+the same option, and `--name=value` is compared by its name. Short options and
+positional arguments (a model path, a subcommand other than `serve`) are
+refused.
+
+| Need | Option | Class | CapyCTL |
+|---|---|---|---|
+| Context length | `--max_seq_len` | typed | `engine_config.context_length` |
+| Max running requests | `--max_batch_size` | typed | `engine_config.max_concurrent_requests`, 32 when not set. |
+| KV cache dtype | `--kv_cache_dtype` | typed | `engine_config.kv_cache_dtype` (`auto` or `fp8`), rendered as `kv_cache_config.dtype`. The option exists on 1.3 and 1.4. |
+| Remote code | `--trust_remote_code` | typed | `engine_config.trust_remote_code` (the installation must allow it). |
+| Reasoning parser | `--reasoning_parser` | typed | `engine_config.tensorrt-llm.reasoning_parser`. The model family picks one when not set ([Tool calls and reasoning](engines.md#tool-calls-and-reasoning)). |
+| Tool-call parser | `--tool_parser` | typed | `engine_config.tensorrt-llm.tool_call_parser`. The model family picks one when not set. |
+| Weight dtype | none | — | `engine_config.dtype`, rendered as `dtype` in the configuration file, `auto` when not set. |
+| CUDA graphs | none | — | `engine_config.cuda_graphs`: `false` renders `cuda_graph_config: null`. Not set, `cuda_graph_config` is an ordinary key of `llm_api_options`. |
+| Quantization, text only | none | — | `engine_config.quantization` and `engine_config.language_model_only` are refused on a TensorRT-LLM profile: the checkpoint carries its quantization, and 1.2.1 has no text-only switch. |
+| Batched tokens per step | `--max_num_tokens` | extra | |
+| Chunked prefill | `--enable_chunked_prefill` | extra | |
+| Attention window check | `--fail_fast_on_attention_window_too_large` | extra | |
+| Media loading | `--media_io_kwargs` | extra | |
+| Generation defaults | `--generation-config` | extra | 1.3 and later. It takes `auto` or `trtllm`, not a file. |
+| Chat template | `--chat_template` | approval | A file value must be inside `security.approved_paths`. |
+| Listener | `--host`, `--port` | reserved | CapyCTL listens for the engine on `127.0.0.1` and a leased port. |
+| Backend | `--backend` | reserved | CapyCTL renders `--backend pytorch`. |
+| Parallel sizes | `--tensor_parallel_size`, `--tp_size`, `--pipeline_parallel_size`, `--pp_size`, `--gpus_per_node`, `--context_parallel_size`, `--cp_size`, `--moe_expert_parallel_size`, `--ep_size`, `--moe_cluster_parallel_size`, `--cluster_size`, `--enable_attention_dp` | reserved | One GPU: CapyCTL renders `--tp_size 1 --pp_size 1 --gpus_per_node 1`. A deployment with `topology` is refused `multi_gpu_unsupported`. |
+| GPU memory fraction | `--free_gpu_memory_fraction`, `--kv_cache_free_gpu_memory_fraction` | reserved | Rendered at 0.9, a ceiling only. The KV pool is `kv_cache_config.max_tokens`, from `engine_config.memory` ([Memory](#the-configuration-file)). |
+| Configuration file | `--config`, `--extra_llm_api_options`, `--set` | reserved | CapyCTL writes the only configuration file the engine reads. Use `engine_config.tensorrt-llm.llm_api_options`. `--set` is 1.4's. |
+| Log level | `--log_level` | reserved | Rendered `info`. |
+| Beam search | `--max_beam_width` | reserved | CapyCTL's chat contract has no beam search. |
+| Tokenizers and code | `--tokenizer`, `--custom_tokenizer`, `--custom_module_dirs`, `--post_processor_hook`, `--middleware` | reserved | They load code or another tokenizer than the checkpoint's. |
+| Revision | `--revision`, `--hf_revision` | reserved | The checkpoint is local. |
+| Served name | `--served_model_name` | reserved | CapyCTL links the checkpoint under the served name, which the engine then lists. |
+| Disaggregated serving, tracing | `--metadata_server_config_file`, `--server_role`, `--disagg_cluster_uri`, `--otlp_traces_endpoint` | reserved | Out of scope. |
+| Post-processing, frontends | `--num_postprocess_workers`, `--num_serve_frontends` | reserved | More processes CapyCTL does not own. |
+| Usage reporting | `--telemetry`, `--no-telemetry` | reserved | The host's `engine_telemetry` decides (1.3 and later). |
+| Other listeners | `--grpc`, `--grpc-protocol`, `--openengine-enable-load-metrics`, `--report_addr` | reserved | 1.3 and later. CapyCTL owns the one listener. |
+| Visual generation, agent scheduling | `--enable_visual_gen`, `--visual_gen_args`, `--agent_percentage`, `--agent_types` | reserved | 1.3 and later. Out of scope; the agent scheduler reaches the search services it names. |
+| Client chat templates | `--allow_request_chat_template` | reserved | 1.3 and later. |
+| Sleep | `--enable_sleep_mode` | reserved | 1.4. TensorRT-LLM is restart-only ([Parking](parking.md)). |
+
+### The configuration file
+
+CapyCTL writes `llm_api_options.yaml` (mode 0600) into a private directory for
+each launch and passes it with `--config`. The file overrides the command
+line, so CapyCTL owns it whole:
+
+```yaml
+kv_cache_config:
+  max_tokens: <from the grant>
+  free_gpu_memory_fraction: 0.9
+  dtype: <kv_cache_dtype, or auto>
+enable_iter_perf_stats: true
+iter_stats_max_iterations: 1000
+return_perf_metrics: false
+enable_sleep: false            # 1.2 only; 1.3 and 1.4 removed the field
+dtype: <dtype, or auto>
+# cuda_graph_config: null      when cuda_graphs: false
+```
+
+`max_tokens` is `memory.kv_cache` divided by the bytes of KV one token takes,
+`2 × layers × KV heads × head dimension × bytes of the KV dtype`, from the
+checkpoint's `config.json`. A model whose KV CapyCTL cannot size this way
+(sliding or per-layer attention windows, multi-head latent attention,
+recurrent or hybrid layers, encoder-decoder models) is refused
+`kv_geometry_unsupported`.
+
+A deployment adds LLM API arguments as
+`engine_config.tensorrt-llm.llm_api_options`, a mapping of at most 64 KiB as
+JSON whose keys are lower-case field names. CapyCTL merges it under its own
+keys (one level deep for `kv_cache_config`) and refuses, at deploy time and
+again when it writes the file, a mapping that names a reserved key, nested
+keys included. Keys it does not reserve reach the engine, whose strict models
+refuse unknown ones at start.
+
+| Keys | Class | Why |
+|---|---|---|
+| `model`, `backend`, `max_seq_len`, `max_batch_size`, `tensor_parallel_size`, `pipeline_parallel_size`, `gpus_per_node`, `kv_cache_config.max_tokens`, `kv_cache_config.free_gpu_memory_fraction`, `kv_cache_config.dtype`, `enable_iter_perf_stats`, `enable_iter_req_stats`, `iter_stats_max_iterations`, `return_perf_metrics`, `perf_metrics_max_requests`, `enable_sleep`, `dtype`, `trust_remote_code`, `reasoning_parser` | reserved | CapyCTL renders them, or a typed field does. |
+| `cuda_graph_config` | reserved when `engine_config.cuda_graphs` is set | The typed field renders it. |
+| `kv_cache_config.host_cache_size`, `kv_cache_config.max_gpu_total_bytes`, `kv_cache_config.use_uvm`, `kv_cache_config.disk_cache_path`, `kv_cache_config.disk_cache_size`, `kv_cache_config.disk_prefetch_num_reqs`, `kv_cache_config.cross_kv_cache_fraction`, `kv_cache_config.iteration_stats_interval`, `kv_cache_config.max_attention_window`, `kv_cache_config.sink_token_length` | reserved | They move the pool off the GPU or change the geometry CapyCTL sized it from. |
+| `context_parallel_size`, `cp_config`, `moe_expert_parallel_size`, `moe_cluster_parallel_size`, `moe_tensor_parallel_size`, `enable_lm_head_tp_in_adp`, `attention_dp_config`, `enable_attention_dp`, `pp_partition`, `orchestrator_type`, `mpi_session`, every `ray_*` key | reserved | One GPU, one process. |
+| `kv_connector_config`, `cache_transceiver_config`, every `disagg*` key | reserved | LMCache is off; disaggregated serving is out of scope. |
+| `max_beam_width`, `speculative_config`, `lora_config`, `enable_lora`, `peft_cache_config`, `mm_encoder_only`, `encode_only` | reserved | Out of scope in this release. |
+| `tokenizer`, `custom_tokenizer`, `tokenizer_revision`, `revision`, `skip_tokenizer_init`, `load_format`, `checkpoint_format`, `checkpoint_loader`, `model_kwargs` | reserved | The checkpoint is the verified local one; `load_format: dummy` serves random weights. |
+| `env_overrides`, `post_processor_hook`, `num_serve_frontends`, `num_postprocess_workers`, `postprocess_tokenizer_dir` | reserved | They set the engine's environment, load code or start processes. |
+| `otlp_traces_endpoint`, `telemetry_config`, `prometheus_metrics_config`, `perf_metrics_output_dir`, `iter_perf_stats_interval`, `mx_config`, `gms_config`, `dwdp_config`, `sleep_config` | reserved | Connections, files, the statistics CapyCTL reads, or sleep. |
+| Everything else, such as `enable_chunked_prefill`, `max_num_tokens`, `kv_cache_config.enable_block_reuse`, `kv_cache_config.tokens_per_block`, `scheduler_config`, `sampler_type`, `attn_backend`, `moe_config`, `guided_decoding_backend`, `torch_compile_config`, `enable_autotuner`, `stream_interval` | ordinary | Passed unchanged. |
+
+The engine's environment is closed too: a profile or deployment `env` may not
+name a `TLLM_`, `TRTLLM_`, `TRT_LLM_`, `OMPI_`, `PMIX_`, `PRTE_`, `UCX_`,
+`NCCL_`, `MPI4PY_`, `HF_`, `TRANSFORMERS_`, `FLASHINFER_`, `RAY_` or `SLURM_`
+variable, nor `CUDA_VISIBLE_DEVICES`, `NVIDIA_VISIBLE_DEVICES`,
+`DISABLE_TORCH_DEVICE_SET`, `CUDA_MPS_PIPE_DIRECTORY`, `TMPDIR`, `HOME`,
+`RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT`,
+`PROMETHEUS_MULTIPROC_DIR`, `DG_JIT_CACHE_DIR`, `MX_TRANSFER_LOG_DIR`,
+`MODEL_EXPRESS_URL`, `TELEMETRY_DISABLED` or `DO_NOT_TRACK`, even when
+`security.approved_env` lists it (`engine_env_reserved:<name>`).
 
 ## Reaching an SGLang memory fraction
 

@@ -503,3 +503,199 @@ fn the_llama_server_version_is_read_from_standard_error() {
         VersionCheckError::Output
     );
 }
+
+/// ADR 0038 §2: a TensorRT-LLM environment: the `tensorrt_llm` and `torch`
+/// dist-infos, `bin/trtllm-serve` and `bin/python3`, both scripts that leave
+/// `ran` behind if they are ever executed.
+fn trtllm_env(root: &Path, version: &str) -> PathBuf {
+    let env = fake_env(root, &[("tensorrt_llm", version), ("torch", "2.9.1+cu130")]);
+    let ran = format!("touch {}", root.join("ran").display());
+    script(&env.join("bin/trtllm-serve"), &ran);
+    script(&env.join("bin/python3"), &ran);
+    env
+}
+
+/// What the companion query prints for 1.2.1's recipe, mpi4py not installed.
+const TRTLLM_VERSIONS: &str = "tensorrt_llm 1.2.1\ntorch 2.9.1+cu130\ntensorrt 10.14.1.48\n\
+                               flashinfer-python 0.6.4\ntransformers 4.57.3\nmpi4py \n";
+
+// T49 T37 (ADR 0038 §2): TensorRT-LLM is detected from its
+// `tensorrt_llm-*.dist-info` beside `bin/trtllm-serve` in a home-level venv
+// and under `--path`, with its version from METADATA, listed `custom` (no
+// entry is verified yet), and nothing in the environment is executed.
+#[test]
+fn tensorrt_llm_detection_reads_metadata_and_executes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let env = trtllm_env(&home.join("tensorrt-llm-1.2.1-venv"), "1.2.1");
+    let listed = trtllm_env(&dir.path().join("opt/trt"), "1.4.0rc1");
+    let mut roots = empty_roots(&home);
+    roots.extra = vec![dir.path().join("opt")];
+    let found = detect(&roots, &ScanBounds::default());
+    let trt: Vec<_> = found
+        .iter()
+        .filter(|c| c.engine == Engine::TensorrtLlm)
+        .collect();
+    assert_eq!(trt.len(), 2, "{found:?}");
+    assert_eq!(trt[0].env, env);
+    assert_eq!(trt[0].entry, env.join("bin/trtllm-serve"));
+    assert_eq!(trt[0].version, "1.2.1");
+    assert_eq!(trt[0].source, "home");
+    assert_eq!(trt[1].env, listed);
+    assert_eq!(trt[1].version, "1.4.0rc1");
+    assert_eq!(trt[1].source, "path");
+    assert!(trt.iter().all(|c| c.custom), "no TensorRT-LLM entry yet");
+    // Without its console script the environment is not an installation.
+    std::fs::remove_file(env.join("bin/trtllm-serve")).unwrap();
+    assert!(!detect(&roots, &ScanBounds::default())
+        .iter()
+        .any(|c| c.env == env));
+    for root in [&env, &listed] {
+        assert!(!root.join("ran").exists(), "detection executed {root:?}");
+    }
+}
+
+// T49 T37 (ADR 0038 §2): `engine add`'s check resolves the venv lexically,
+// reads the version from the dist-info, and runs the environment's own
+// interpreter in isolated mode on the installed metadata of `tensorrt_llm`
+// and its companions: the exact command line is asserted, `trtllm-serve`
+// never runs, and the environment is cleared. The version is the build
+// fingerprint and the companions are recorded; an unlisted version resolves
+// and checks all the same and is `custom`.
+#[test]
+fn the_tensorrt_llm_check_never_imports_the_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = trtllm_env(&dir.path().join("venv"), "1.2.1");
+    let args = dir.path().join("args");
+    std::fs::create_dir_all(&args).unwrap();
+    std::env::set_var("CAPYCTL_TEST_TRT_LEAK", "leaked");
+    script(
+        &env.join("bin/python3"),
+        &format!(
+            "i=0; for a in \"$@\"; do i=$((i+1)); printf '%s' \"$a\" > {args}/$i; done\n\
+             printf '%s' \"${{CAPYCTL_TEST_TRT_LEAK:-}}\" > {args}/env\n\
+             printf '{}'",
+            TRTLLM_VERSIONS.replace('\n', "\\n"),
+            args = args.display()
+        ),
+    );
+    for named in [env.clone(), env.join("bin/trtllm-serve")] {
+        let resolved = resolve(&named).unwrap();
+        assert_eq!(resolved.engine, Engine::TensorrtLlm);
+        assert_eq!(resolved.version, "1.2.1");
+        assert_eq!(resolved.env, env);
+        assert_eq!(resolved.executable, env.join("bin/trtllm-serve"));
+        assert!(resolved.custom(), "no TensorRT-LLM entry is verified yet");
+    }
+    let resolved = resolve(&env).unwrap();
+    let reported = check_version(&resolved, Duration::from_secs(5)).unwrap();
+    assert_eq!(reported.version, "1.2.1");
+    assert_eq!(reported.build_fingerprint, "1.2.1");
+    let expected: std::collections::BTreeMap<String, String> = [
+        ("torch", "2.9.1+cu130"),
+        ("tensorrt", "10.14.1.48"),
+        ("flashinfer-python", "0.6.4"),
+        ("transformers", "4.57.3"),
+    ]
+    .into_iter()
+    .map(|(name, version)| (name.to_owned(), version.to_owned()))
+    .collect();
+    assert_eq!(reported.companions, expected, "mpi4py is not installed");
+    let argv: Vec<String> = (1..)
+        .map(|i: usize| args.join(i.to_string()))
+        .take_while(|path| path.exists())
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .collect();
+    let mut wanted = vec!["-I", "-B", "-c", TENSORRT_LLM_VERSIONS, "tensorrt_llm"];
+    wanted.extend([
+        "torch",
+        "tensorrt",
+        "flashinfer-python",
+        "transformers",
+        "mpi4py",
+    ]);
+    assert_eq!(argv, wanted);
+    assert_eq!(tensorrt_llm_check_args(), wanted);
+    assert!(!TENSORRT_LLM_VERSIONS.contains("import tensorrt_llm"));
+    assert_eq!(std::fs::read_to_string(args.join("env")).unwrap(), "");
+    assert!(!env.join("ran").exists(), "trtllm-serve ran");
+
+    // An unlisted version registers as an uncertified custom setup.
+    let other = trtllm_env(&dir.path().join("other"), "9.9.9");
+    script(
+        &other.join("bin/python3"),
+        "printf 'tensorrt_llm 9.9.9\\ntorch 2.9.1+cu130\\ntensorrt \\nflashinfer-python \\n\
+         transformers \\nmpi4py \\n'",
+    );
+    let resolved = resolve(&other.join("bin/trtllm-serve")).unwrap();
+    assert!(resolved.custom());
+    let reported = check_version(&resolved, Duration::from_secs(5)).unwrap();
+    assert_eq!(reported.build_fingerprint, "9.9.9");
+    assert_eq!(reported.companions.len(), 1);
+    assert!(!other.join("ran").exists(), "trtllm-serve ran");
+}
+
+// T49 T37 (ADR 0038 §2): the companion query's output parses strictly; a
+// malformed answer, an oversized one, a failing one and a version that
+// disagrees with the dist-info each refuse the check.
+#[test]
+fn tensorrt_llm_versions_parse_strictly() {
+    let (version, companions) = parse_tensorrt_llm_versions(TRTLLM_VERSIONS).unwrap();
+    assert_eq!(version, "1.2.1");
+    assert_eq!(companions["torch"], "2.9.1+cu130");
+    assert!(!companions.contains_key("mpi4py"));
+    let rest = "torch \ntensorrt \nflashinfer-python \ntransformers \nmpi4py \n";
+    for bad in [
+        String::new(),
+        "tensorrt_llm 1.2.1\n".to_owned(),
+        format!("tensorrt_llm \n{rest}"),
+        format!("torch 2.9.1\ntensorrt_llm 1.2.1\n{rest}"),
+        format!("tensorrt_llm 1.2.1 extra\n{rest}"),
+        format!("tensorrt_llm 1.2.1\n{rest}numpy 1.26\n"),
+        format!("tensorrt_llm\t1.2.1\n{rest}"),
+        format!(
+            "tensorrt_llm 1.2.1\ntorch {}\n{}",
+            "9".repeat(129),
+            &rest[7..]
+        ),
+        "Traceback (most recent call last):\n".to_owned(),
+    ] {
+        assert_eq!(parse_tensorrt_llm_versions(&bad), None, "{bad:?}");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let env = trtllm_env(&dir.path().join("venv"), "1.2.1");
+    let resolved = resolve(&env).unwrap();
+    let python = env.join("bin/python3");
+    script(&python, "echo 'tensorrt_llm 1.2.1'");
+    assert_eq!(
+        check_version(&resolved, Duration::from_secs(5)).unwrap_err(),
+        VersionCheckError::Output
+    );
+    script(&python, "yes 'tensorrt_llm 1.2.1' | head -c 100000");
+    assert_eq!(
+        check_version(&resolved, Duration::from_secs(5)).unwrap_err(),
+        VersionCheckError::Output
+    );
+    script(&python, "exit 1");
+    assert_eq!(
+        check_version(&resolved, Duration::from_secs(5)).unwrap_err(),
+        VersionCheckError::Failed
+    );
+    script(
+        &python,
+        &format!(
+            "printf '{}'",
+            TRTLLM_VERSIONS
+                .replace("1.2.1", "1.2.0")
+                .replace('\n', "\\n")
+        ),
+    );
+    let error = check_version(&resolved, Duration::from_secs(5)).unwrap_err();
+    assert!(
+        matches!(error, VersionCheckError::Mismatch { .. }),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), "engine_version_failed");
+    assert!(!env.join("ran").exists(), "trtllm-serve ran");
+}

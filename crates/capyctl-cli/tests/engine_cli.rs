@@ -1543,3 +1543,198 @@ fn list_shows_lmcache_on_or_off_with_the_reason() {
         "engine list ran a program of an environment"
     );
 }
+
+/// ADR 0038 §2: a TensorRT-LLM venv: the `tensorrt_llm` dist-info and its
+/// import packages, `bin/trtllm-serve` (which leaves `marker` behind if it is
+/// ever run) and an interpreter that answers only the metadata-only version
+/// query (`-I ... tensorrt_llm <companions>`), anything else leaving
+/// `marker` too.
+fn trtllm_env(root: &Path, version: &str, marker: &Path) -> PathBuf {
+    let site = root.join("lib/python3.12/site-packages");
+    for package in ["tensorrt_llm", "triton_kernels"] {
+        std::fs::create_dir_all(site.join(package)).unwrap();
+        std::fs::write(site.join(package).join("__init__.py"), "").unwrap();
+    }
+    let dist = site.join(format!("tensorrt_llm-{version}.dist-info"));
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(
+        dist.join("METADATA"),
+        format!("Name: tensorrt_llm\nVersion: {version}\n"),
+    )
+    .unwrap();
+    std::fs::write(root.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    let ran = format!("touch {}", marker.display());
+    script(&root.join("bin/trtllm-serve"), &ran);
+    script(
+        &root.join("bin/python3"),
+        &format!(
+            "[ \"$1\" = -I ] && [ \"$5\" = tensorrt_llm ] || {{ {ran}; exit 9; }}\n\
+             printf 'tensorrt_llm {version}\\ntorch 2.9.1+cu130\\ntensorrt 10.14.1.48\\n\
+             flashinfer-python 0.6.4\\ntransformers 4.57.3\\nmpi4py 4.1.1\\n'"
+        ),
+    );
+    root.to_path_buf()
+}
+
+/// An engine command with a CUDA toolkit of the test's own as the default
+/// and no `CUDA_HOME`, so the machine running the tests decides nothing.
+async fn engine_with_cuda(
+    command: &Command,
+    document: &Path,
+    cuda: &Path,
+) -> Result<Value, capyctl_cli::output::StructuredError> {
+    let search = capyctl_config::toolchain::ToolchainSearch {
+        default_cuda_home: cuda.to_path_buf(),
+        ..Default::default()
+    };
+    let process_env = |key: &str| {
+        (key != "CUDA_HOME")
+            .then(|| std::env::var(key).ok())
+            .flatten()
+            .filter(|v| !v.is_empty())
+    };
+    execute_with(
+        command,
+        Some(document),
+        document.parent().unwrap(),
+        &process_env,
+        &search,
+    )
+    .await
+}
+
+// T49 T07 T21 T37 (ADR 0038 §2): `engine add` registers TensorRT-LLM as
+// `tensorrt-llm` from its venv: the version from the dist-info and the
+// metadata-only check (never `trtllm-serve`, never a probe), the version as
+// the build fingerprint, deep park disabled, the CUDA toolkit recorded and the
+// companion versions written beside it; it lists `custom` (no entry is
+// verified yet) and is not refused. `engine list` shows the companions,
+// `idle signal: none` and `engine key: none`, for a registered profile and
+// for a role's own installation alike.
+#[tokio::test]
+async fn add_registers_tensorrt_llm_with_its_companions() {
+    let dir = private_dir();
+    let marker = dir.path().join("ran");
+    let env = trtllm_env(
+        &dir.path().join("tensorrt-llm-1.2.1-venv"),
+        "1.2.1",
+        &marker,
+    );
+    let cuda = dir.path().join("cuda-13.1");
+    std::fs::create_dir_all(cuda.join("bin")).unwrap();
+    std::fs::write(cuda.join("bin/nvcc"), "").unwrap();
+    let document = host_doc(dir.path());
+    let (_role, stop) = role(&document, json!({"ok": true, "published": "published"})).await;
+    let out = engine_with_cuda(&add(&env.join("bin/trtllm-serve")), &document, &cuda)
+        .await
+        .unwrap();
+    assert_eq!(out["profile"], "tensorrt-llm");
+    assert_eq!(out["engine"], "tensorrt-llm");
+    assert_eq!(out["version"], "1.2.1");
+    assert_eq!(out["build_fingerprint"], "1.2.1");
+    assert_eq!(out["custom"], true, "no TensorRT-LLM entry is verified yet");
+    assert_eq!(out["deep_park"], "disabled");
+    assert_eq!(out["deep_park_probe"], "capability_missing");
+    assert_eq!(out["cuda_home"], cuda.to_string_lossy().as_ref());
+    assert_eq!(out["companions"]["torch"], "2.9.1+cu130");
+    assert!(out["fingerprint"]["digest"]
+        .as_str()
+        .is_some_and(|d| d.starts_with("sha256:")));
+    assert_eq!(out["published"], "published");
+    let profile = engines_of(&document).profiles["tensorrt-llm"].clone();
+    assert_eq!(
+        profile["executable"],
+        env.join("bin/trtllm-serve").to_string_lossy().as_ref()
+    );
+    assert_eq!(profile["build_fingerprint"], "1.2.1");
+    assert_eq!(profile["security"]["deep_park"], "disabled");
+    assert_eq!(profile["cuda_home"], cuda.to_string_lossy().as_ref());
+    assert_eq!(
+        profile["companions"],
+        json!({"torch": "2.9.1+cu130", "tensorrt": "10.14.1.48",
+            "flashinfer-python": "0.6.4", "transformers": "4.57.3", "mpi4py": "4.1.1"})
+    );
+    assert!(!marker.exists(), "trtllm-serve or a probe ran");
+
+    stop.send(true).unwrap();
+    until_role_stopped(&document).await;
+    let own = json!({"engine": "tensorrt-llm", "executable": "/t/bin/trtllm-serve",
+        "build_fingerprint": "1.4.0rc1",
+        "installation": {"version": "1.4.0rc1", "digest": "sha256:00", "state": "recorded"},
+        "deep_park": "disabled", "deep_park_probe": "capability_missing",
+        "companions": {"torch": "2.10.0+cu134"}});
+    let (_role, _stop) = role(
+        &document,
+        json!({"ok": true, "connected": true, "live_profile_update": true,
+        "accepted": {"local-tensorrt-llm": own}, "users": {}}),
+    )
+    .await;
+    let listed = execute(&Command::EngineList, Some(&document), dir.path())
+        .await
+        .unwrap();
+    let rows = listed["engines"].as_array().unwrap();
+    let row = |name: &str| {
+        rows.iter()
+            .find(|r| r["profile"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} missing from {listed}"))
+    };
+    let registered = row("tensorrt-llm");
+    assert_eq!(registered["engine"], "tensorrt-llm");
+    assert_eq!(registered["version"], "1.2.1");
+    assert_eq!(registered["custom"], true);
+    assert_eq!(registered["companions"], profile["companions"]);
+    assert_eq!(registered["idle_signal"], "none");
+    assert_eq!(registered["engine_key"], "none");
+    let environment = row("local-tensorrt-llm");
+    assert_eq!(environment["source"], "environment");
+    assert_eq!(environment["version"], "1.4.0rc1");
+    assert_eq!(environment["custom"], true);
+    assert_eq!(environment["companions"]["torch"], "2.10.0+cu134");
+    assert_eq!(environment["idle_signal"], "none");
+    assert_eq!(environment["engine_key"], "none");
+    assert!(
+        !marker.exists(),
+        "engine list ran a program of an environment"
+    );
+}
+
+// T49 T21 T37 (ADR 0038 §2): `--deep-park enabled` is refused
+// `capability_missing` before anything runs or is written; an unlisted
+// version registers all the same as an uncertified custom setup.
+#[tokio::test]
+async fn add_refuses_tensorrt_llm_deep_park_and_registers_any_version() {
+    let dir = private_dir();
+    let marker = dir.path().join("ran");
+    let env = trtllm_env(&dir.path().join("trt"), "9.9.9", &marker);
+    let cuda = dir.path().join("no-cuda");
+    let document = host_doc(dir.path());
+    let deep = Command::EngineAdd {
+        path: Some(env.clone()),
+        name: None,
+        deep_park: Some(DeepParkChoice::Enabled),
+        drift: DriftChoice::Warn,
+        args: vec![],
+        approved_options: vec![],
+        approved_paths: vec![],
+        env: vec![],
+        approved_env: vec![],
+        allow_remote_code: false,
+    };
+    let error = engine_with_cuda(&deep, &document, &cuda).await.unwrap_err();
+    assert_eq!(error.code, "capability_missing", "{error:?}");
+    assert!(!engines_beside(&document).exists());
+    let out = engine_with_cuda(&add(&env), &document, &cuda)
+        .await
+        .unwrap();
+    assert_eq!(out["build_fingerprint"], "9.9.9");
+    assert_eq!(out["custom"], true);
+    assert_eq!(out["published"], "role_not_running");
+    assert_eq!(out["cuda_home"], Value::Null);
+    assert_eq!(
+        engines_of(&document).profiles["tensorrt-llm"]["build_fingerprint"],
+        "9.9.9"
+    );
+    assert!(!marker.exists(), "trtllm-serve or a probe ran");
+}

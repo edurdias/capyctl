@@ -247,10 +247,22 @@ fn lmcache_unavailable(reason: &str) -> Option<String> {
 
 /// ADR 0035 §13: the closed code a launch on several GPUs failed with at
 /// readiness, as its reason names it (embedded, or the host's report):
-/// `tp_rank_unobserved` or `engine_listener_exposed`.
+/// `tp_rank_unobserved` or `engine_listener_exposed` (ADR 0038 §9: a
+/// TensorRT-LLM launch's listeners are checked on one GPU too).
 fn local_tp_failure(reason: &str) -> Option<String> {
     use capyctl_domain::local_tp::{ENGINE_LISTENER_EXPOSED, TP_RANK_UNOBSERVED};
     [TP_RANK_UNOBSERVED, ENGINE_LISTENER_EXPOSED]
+        .into_iter()
+        .find(|code| reason.contains(&format!("{code}:")))
+        .map(str::to_owned)
+}
+
+/// ADR 0038 §16: the closed code a TensorRT-LLM launch failed with at
+/// readiness, as its reason names it (embedded, or the host's report):
+/// `kv_cache_short` or `engine_process_escaped`.
+fn tensorrt_llm_failure(reason: &str) -> Option<String> {
+    use capyctl_config::tensorrt_llm::{ENGINE_PROCESS_ESCAPED, KV_CACHE_SHORT};
+    [KV_CACHE_SHORT, ENGINE_PROCESS_ESCAPED]
         .into_iter()
         .find(|code| reason.contains(&format!("{code}:")))
         .map(str::to_owned)
@@ -337,6 +349,7 @@ async fn conclude(
     };
     let code = lmcache_unavailable(reason)
         .or_else(|| local_tp_failure(reason))
+        .or_else(|| tensorrt_llm_failure(reason))
         .unwrap_or_else(|| "launch_failed".to_owned());
     let fallback_deployment = deployment_id.clone();
     let relaunched = shared
@@ -628,5 +641,43 @@ mod lmcache_tests {
             None
         );
         assert_eq!(super::lmcache_unavailable("engine exited"), None);
+    }
+
+    // T49 (ADR 0038 §16): a TensorRT-LLM launch that failed at readiness
+    // keeps its closed code, named by its reason (embedded or the host's
+    // report); a listener off loopback keeps `engine_listener_exposed` on one
+    // GPU too; anything else is `launch_failed`.
+    #[test]
+    fn a_tensorrt_llm_readiness_failure_keeps_its_code() {
+        assert_eq!(
+            super::tensorrt_llm_failure(
+                "launch failed: kv_cache_short: TensorRT-LLM built a KV pool of 3200 tokens, \
+                 less than one request's window of 16384 tokens (max_seq_len)"
+            )
+            .as_deref(),
+            Some("kv_cache_short")
+        );
+        assert_eq!(
+            super::tensorrt_llm_failure(
+                "engine_process_escaped: process 102 (a descendant of the engine's api process \
+                 100) runs in process group 102, outside the launch's process group 100"
+            )
+            .as_deref(),
+            Some("engine_process_escaped")
+        );
+        assert_eq!(
+            super::local_tp_failure(
+                "engine_listener_exposed: the api process 100 listens on address 0.0.0.0 port \
+                 8101, not on loopback; the engine was stopped"
+            )
+            .as_deref(),
+            Some("engine_listener_exposed")
+        );
+        // A code named in prose without its colon is not the code.
+        assert_eq!(
+            super::tensorrt_llm_failure("the kv_cache_short check"),
+            None
+        );
+        assert_eq!(super::tensorrt_llm_failure("engine exited"), None);
     }
 }

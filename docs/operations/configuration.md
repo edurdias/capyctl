@@ -168,7 +168,7 @@ model:
 
 These describe the role's own engine installation. One executable is published
 as the runtime profile `local`; several as `local-vllm`, `local-sglang`,
-`local-tensorfold` and `local-llamacpp`. On a
+`local-tensorfold`, `local-llamacpp` and `local-tensorrt-llm`. On a
 host the profile is added to the document the host publishes, beside the
 profiles in `runtime_profiles` and the ones registered with `capyctl engine add`;
 a name stated twice is refused. The switches below apply to the `local`
@@ -181,6 +181,7 @@ block.
 | SGLang interpreter | `local_engine.sglang` | `--sglang-bin <path>` | `CAPYCTL_SGLANG_BIN` | none | host, standalone |
 | TensorFold executable | `local_engine.tensorfold` | `--tensorfold-bin <path>` | `CAPYCTL_TENSORFOLD_BIN` | none | host, standalone |
 | llama.cpp `llama-server` binary | `local_engine.llamacpp` | `--llamacpp-bin <path>` | `CAPYCTL_LLAMACPP_BIN` | none | host, standalone |
+| TensorRT-LLM `trtllm-serve` | `local_engine.tensorrt-llm` | `--tensorrt-llm-bin <path>` | `CAPYCTL_TENSORRT_LLM_BIN` | none | host, standalone |
 | Build fingerprint | `local_engine.build_fingerprint` | `--engine-fingerprint <text>` | `CAPYCTL_ENGINE_FINGERPRINT` | what `<engine> --version` prints | host, standalone |
 | Host-fixed vLLM arguments | `local_engine.args` (a list) | `--engine-args "<args>"` | `CAPYCTL_ENGINE_ARGS` (space-separated) | none | host, standalone |
 | KV cache of generated deployments | `local_engine.kv_cache` | `--kv-cache <size>` | `CAPYCTL_KV_CACHE_BYTES` | `16GiB` (unified), sized from the GPU (discrete) | standalone |
@@ -216,6 +217,24 @@ not set), `engine_config.kv_cache_dtype` (`f16` when not set) and the block
 directory); see [llama.cpp](../guide/engines.md#llamacpp). The role's own
 llama.cpp never parks, as a registered one does not, and is refused while
 `/etc/llama.cpp/config.ini` exists.
+
+A TensorRT-LLM deployment takes `engine_config.context_length`,
+`engine_config.max_concurrent_requests` (32 when not set), `dtype`,
+`kv_cache_dtype` (`auto` or `fp8`), `cuda_graphs`, `trust_remote_code` and the
+block `engine_config.tensorrt-llm`: `reasoning_parser`, `tool_call_parser`
+and `llm_api_options`, a mapping of LLM API arguments (at most 64 KiB as JSON,
+lower-case keys) that CapyCTL merges into the configuration file it writes.
+A key CapyCTL renders or keeps off is refused at deploy time and again at
+launch; see [Engine options](../guide/engine-flags.md#the-configuration-file).
+The role's own TensorRT-LLM never parks and runs on one GPU, as a registered
+one does.
+
+A TensorRT-LLM profile, from `engine add` or written in `runtime_profiles`,
+may carry `companions`: a mapping from the distributions `torch`, `tensorrt`,
+`flashinfer-python`, `transformers` and `mpi4py` to the versions the version
+check read (1–128 printable characters each). Any other name, or the field on
+a profile of another engine, is refused. A TensorRT-LLM version is verified
+only beside the `torch` build its entry names, read from `companions`.
 
 A running host or standalone takes its engine and model settings at start. A
 live `capyctl engine add` or `remove` changes runtime profiles only; any other

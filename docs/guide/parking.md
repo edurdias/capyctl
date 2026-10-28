@@ -36,6 +36,14 @@ for them:
 - Nemotron 3.5 Super VL on vLLM: after a park and a wake, vLLM 0.31.0 answers
   wrongly.
 
+TensorRT-LLM never parks: its deployments are `restart_only`.
+`residency: deep` or `host_backed` is refused
+(`capability_missing:deep_park`), and so is `--deep-park enabled` when you add
+it. Parking a TensorRT-LLM model stops `trtllm-serve` and waits until its
+process group has exited; waking it starts the same pinned launch again; `capyctl park
+deployment` does that stop. CapyCTL never turns on the engine's own sleep, on
+any version, the 1.4 pre-release's included.
+
 ### A model on several GPUs
 
 A model spread over several GPUs of one machine

@@ -520,10 +520,131 @@ pub fn is_verified_in(table: &[(Engine, &str)], engine: Engine, version: &str) -
             None => return false,
         },
         Engine::Vllm | Engine::Sglang | Engine::Tensorfold => version.to_owned(),
+        // ADR 0038 §2: a TensorRT-LLM version alone is never verified; its
+        // entries name the torch build beside it ([`is_verified_with_torch`]).
+        Engine::TensorrtLlm => return false,
         // ADR 0031 §1: no custom engine is ever in the verified set.
         Engine::Custom => return false,
     };
     table.iter().any(|(e, v)| *e == engine && *v == release)
+}
+
+/// ADR 0038 §2: TensorRT-LLM's verified set, each entry the checked
+/// `tensorrt_llm` version and the `torch` build beside it. Empty until the
+/// live rows pass: TR1–TR11 for 1.2.1 (with `2.9.1+cu130`), TR1a–TR11a for
+/// the 1.3 pre-release and TR1b–TR11b for 1.4.0rc1, each with the torch build
+/// its TR1 row records. Until then every version lists `custom` and runs as
+/// an uncertified custom setup; none is refused for being uncertified (owner
+/// decision 2026-10-27, question 7).
+pub const TENSORRT_LLM_VERIFIED: &[(&str, &str)] = &[];
+
+/// ADR 0018 §1, ADR 0038 §2: whether `version` is verified, with, for
+/// TensorRT-LLM, the `torch` build its environment holds: a qualified
+/// version beside another torch build (or none recorded) is uncertified.
+/// For every other engine `torch` is ignored and this is [`is_verified`].
+pub fn is_verified_with_torch(engine: Engine, version: &str, torch: Option<&str>) -> bool {
+    is_verified_with_torch_in(TENSORRT_LLM_VERIFIED, engine, version, torch)
+}
+
+/// [`is_verified_with_torch`] against `tensorrt_llm` (a test states its own
+/// TensorRT-LLM entries).
+pub fn is_verified_with_torch_in(
+    tensorrt_llm: &[(&str, &str)],
+    engine: Engine,
+    version: &str,
+    torch: Option<&str>,
+) -> bool {
+    match engine {
+        Engine::TensorrtLlm => torch.is_some_and(|torch| {
+            tensorrt_llm
+                .iter()
+                .any(|(v, t)| *v == version && *t == torch)
+        }),
+        _ => is_verified(engine, version),
+    }
+}
+
+/// ADR 0018 §1, ADR 0038 §2: whether a listed profile shows `custom`: a kind
+/// this release does not know, or a version outside the verified set (for
+/// TensorRT-LLM, beside the torch build the profile's `companions` record).
+pub fn listed_custom(engine: Option<Engine>, version: &str, profile: &Value) -> bool {
+    engine.is_none_or(|engine| {
+        !is_verified_with_torch(
+            engine,
+            version,
+            profile["companions"][crate::tensorrt_llm::TORCH].as_str(),
+        )
+    })
+}
+
+/// ADR 0038 §2: what a version check read: the profile's `build_fingerprint`
+/// and, for TensorRT-LLM, the versions of its companion distributions
+/// ([`crate::tensorrt_llm::COMPANIONS`]) the same query read, recorded as the
+/// profile's `companions`. Every other engine has none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckedVersion {
+    pub build_fingerprint: String,
+    pub companions: BTreeMap<String, String>,
+}
+
+impl From<String> for CheckedVersion {
+    fn from(build_fingerprint: String) -> Self {
+        Self {
+            build_fingerprint,
+            companions: BTreeMap::new(),
+        }
+    }
+}
+
+impl From<&str> for CheckedVersion {
+    fn from(build_fingerprint: &str) -> Self {
+        build_fingerprint.to_owned().into()
+    }
+}
+
+/// ADR 0038 §2: a companion version as a version check may report it and a
+/// profile may record it: 1-128 printable ASCII characters.
+pub fn valid_companion_version(version: &str) -> bool {
+    !version.is_empty() && version.len() <= 128 && version.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// ADR 0038 §2: a profile's `companions`, stated only when non-empty so
+/// every other profile is unchanged.
+pub fn put_companions(profile: &mut Value, companions: &BTreeMap<String, String>) {
+    if !companions.is_empty() {
+        profile["companions"] = serde_json::json!(companions);
+    }
+}
+
+/// ADR 0038 §2: `companions` belong to a TensorRT-LLM profile only, name
+/// distributions of [`crate::tensorrt_llm::COMPANIONS`], and hold versions.
+pub fn check_companions(
+    engine: Engine,
+    companions: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if companions.is_empty() {
+        return Ok(());
+    }
+    if engine != Engine::TensorrtLlm {
+        return Err(format!(
+            "companions are recorded for TensorRT-LLM only, not {}",
+            engine.name()
+        ));
+    }
+    for (name, version) in companions {
+        if !crate::tensorrt_llm::COMPANIONS.contains(&name.as_str()) {
+            return Err(format!(
+                "{name:?} is not one of the companions {}",
+                crate::tensorrt_llm::COMPANIONS.join(", ")
+            ));
+        }
+        if !valid_companion_version(version) {
+            return Err(format!(
+                "{name}'s version must be 1-128 printable characters"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// ADR 0018 §1: the version an engines listing shows and derives `custom`
@@ -548,13 +669,15 @@ pub fn listed_version(
 
 /// ADR 0018 §5: the profile names standalone gives its environment-variable
 /// installations (`CAPYCTL_VLLM_BIN`, `CAPYCTL_SGLANG_BIN`,
-/// `CAPYCTL_TENSORFOLD_BIN` and, ADR 0029 §2, `CAPYCTL_LLAMACPP_BIN`).
+/// `CAPYCTL_TENSORFOLD_BIN`, ADR 0029 §2, `CAPYCTL_LLAMACPP_BIN` and, ADR
+/// 0038 §2, `CAPYCTL_TENSORRT_LLM_BIN`).
 pub const ENVIRONMENT_PROFILES: &[&str] = &[
     "local",
     "local-vllm",
     "local-sglang",
     "local-tensorfold",
     "local-llamacpp",
+    "local-tensorrt-llm",
 ];
 
 /// ADR 0018 §1: short lowercase identifiers, safe in a JSON path and a

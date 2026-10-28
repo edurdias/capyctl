@@ -17,6 +17,12 @@
 //! from usage on both the 0.30.0 and 0.31.0 shapes and stays absent when the
 //! engine reported none.
 //!
+//! TensorRT-LLM 1.2.1 (ADR 0038 §6) reports `cached_tokens` at the same
+//! usage path and no time to first token, prefill or queue time (its
+//! `/prometheus/metrics` stays off), so `ttft_ms` and the decode rate are
+//! the router's and the others are absent. Its load is the host's `/metrics`
+//! read, never per-request figures.
+//!
 //! An engine figure wins; the router derives `ttft_ms` and
 //! `decode_tokens_per_second` from its own clock only when the engine sent
 //! none, and labels them `router`. A figure nobody measured is absent, never
@@ -428,6 +434,30 @@ mod tests {
         let figures = engine_only(&json!({"usage": {"prompt_tokens": 12,
             "completion_tokens": 8, "prompt_tokens_details": null}}));
         assert_eq!(figures, json!({}));
+    }
+
+    // T49 (ADR 0038 §6): TensorRT-LLM reports cached tokens in `usage` and
+    // no timing of its own; its time to first token and decode rate are the
+    // router's, and nobody's queue or prefill time is shown.
+    #[test]
+    fn tensorrt_llm_reports_cached_tokens_and_the_router_times_it() {
+        let answer = json!({
+            "id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "qwen3-4b",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi",
+                "reasoning_content": null}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 12, "total_tokens": 20, "completion_tokens": 8,
+                "prompt_tokens_details": {"cached_tokens": 8}}
+        });
+        assert_eq!(
+            engine_only(&answer),
+            json!({"cached_tokens": {"value": 8, "source": "engine"}})
+        );
+        let mut answer = answer;
+        attach(&mut answer, &router_clock());
+        let figures = &answer["capyctl"]["metrics"];
+        assert_eq!(figures["ttft_ms"]["source"], "router");
+        assert!(figures.get("queue_ms").is_none() && figures.get("prefill_ms").is_none());
+        assert_eq!(figures["cached_tokens"]["source"], "engine");
     }
 
     // T40: chunks that carry nothing are not parsed; the ones that do are.

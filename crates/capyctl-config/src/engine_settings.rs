@@ -12,6 +12,7 @@
 //! | SGLang executable | `local_engine.sglang` | `--sglang-bin` | `CAPYCTL_SGLANG_BIN` |
 //! | TensorFold executable | `local_engine.tensorfold` | `--tensorfold-bin` | `CAPYCTL_TENSORFOLD_BIN` |
 //! | llama.cpp `llama-server` (ADR 0029 §2) | `local_engine.llamacpp` | `--llamacpp-bin` | `CAPYCTL_LLAMACPP_BIN` |
+//! | TensorRT-LLM `trtllm-serve` (ADR 0038 §2) | `local_engine.tensorrt-llm` | `--tensorrt-llm-bin` | `CAPYCTL_TENSORRT_LLM_BIN` |
 //! | build fingerprint | `local_engine.build_fingerprint` | `--engine-fingerprint` | `CAPYCTL_ENGINE_FINGERPRINT` |
 //! | host-fixed vLLM args | `local_engine.args` | `--engine-args` | `CAPYCTL_ENGINE_ARGS` |
 //! | KV cache (standalone) | `local_engine.kv_cache` | `--kv-cache` | `CAPYCTL_KV_CACHE_BYTES` |
@@ -27,8 +28,9 @@
 //!
 //! The `local_engine` executables declare the role's unnamed installation:
 //! one of them is the runtime profile `local`; several are `local-vllm`,
-//! `local-sglang`, `local-tensorfold` and `local-llamacpp` (ADR 0018 §5, ADR 0023 §2,
-//! ADR 0029 §2). The switches in `local_engine` apply to
+//! `local-sglang`, `local-tensorfold`, `local-llamacpp` and
+//! `local-tensorrt-llm` (ADR 0018 §5, ADR 0023 §2, ADR 0029 §2, ADR 0038 §2).
+//! The switches in `local_engine` apply to
 //! those profiles only; a profile declared in `runtime_profiles` or
 //! registered with `capyctl engine add` states its own. `CAPYCTL_ENGINE_PORTS`
 //! replaces the standalone-only `CAPYCTL_STANDALONE_ENGINE_PORTS`, which is
@@ -46,6 +48,7 @@ pub const VLLM_BIN_ENV: &str = "CAPYCTL_VLLM_BIN";
 pub const SGLANG_BIN_ENV: &str = "CAPYCTL_SGLANG_BIN";
 pub const TENSORFOLD_BIN_ENV: &str = "CAPYCTL_TENSORFOLD_BIN";
 pub const LLAMACPP_BIN_ENV: &str = "CAPYCTL_LLAMACPP_BIN";
+pub const TENSORRT_LLM_BIN_ENV: &str = "CAPYCTL_TENSORRT_LLM_BIN";
 pub const ENGINE_FINGERPRINT_ENV: &str = "CAPYCTL_ENGINE_FINGERPRINT";
 pub const ENGINE_ARGS_ENV: &str = "CAPYCTL_ENGINE_ARGS";
 pub const KV_CACHE_ENV: &str = "CAPYCTL_KV_CACHE_BYTES";
@@ -84,6 +87,8 @@ pub struct EngineOverrides {
     pub sglang: Option<PathBuf>,
     pub tensorfold: Option<PathBuf>,
     pub llamacpp: Option<PathBuf>,
+    /// ADR 0038 §2: the role's own `trtllm-serve`.
+    pub tensorrt_llm: Option<PathBuf>,
     pub build_fingerprint: Option<String>,
     pub args: Option<Vec<String>>,
     pub kv_cache: Option<String>,
@@ -107,6 +112,7 @@ impl EngineOverrides {
             sglang: self.sglang.or(lower.sglang),
             tensorfold: self.tensorfold.or(lower.tensorfold),
             llamacpp: self.llamacpp.or(lower.llamacpp),
+            tensorrt_llm: self.tensorrt_llm.or(lower.tensorrt_llm),
             build_fingerprint: self.build_fingerprint.or(lower.build_fingerprint),
             args: self.args.or(lower.args),
             kv_cache: self.kv_cache.or(lower.kv_cache),
@@ -128,6 +134,7 @@ impl EngineOverrides {
             || self.sglang.is_some()
             || self.tensorfold.is_some()
             || self.llamacpp.is_some()
+            || self.tensorrt_llm.is_some()
     }
 
     /// The environment's layer, read through `get` (the raw value; `None`
@@ -152,6 +159,7 @@ impl EngineOverrides {
             sglang: text(SGLANG_BIN_ENV).map(PathBuf::from),
             tensorfold: text(TENSORFOLD_BIN_ENV).map(PathBuf::from),
             llamacpp: text(LLAMACPP_BIN_ENV).map(PathBuf::from),
+            tensorrt_llm: text(TENSORRT_LLM_BIN_ENV).map(PathBuf::from),
             build_fingerprint: text(ENGINE_FINGERPRINT_ENV),
             args: text(ENGINE_ARGS_ENV).map(|value| split_args(&value)),
             kv_cache: text(KV_CACHE_ENV)
@@ -278,6 +286,7 @@ impl EngineOverrides {
             sglang: path_of(local.get("sglang"), "local_engine.sglang")?,
             tensorfold: path_of(local.get("tensorfold"), "local_engine.tensorfold")?,
             llamacpp: path_of(local.get("llamacpp"), "local_engine.llamacpp")?,
+            tensorrt_llm: path_of(local.get("tensorrt-llm"), "local_engine.tensorrt-llm")?,
             build_fingerprint: text_of("build_fingerprint")?,
             args,
             kv_cache: text_of("kv_cache")?
@@ -414,7 +423,9 @@ pub struct EngineSettings {
     pub sglang: Option<PathBuf>,
     pub tensorfold: Option<PathBuf>,
     pub llamacpp: Option<PathBuf>,
-    /// Stated, or `None`: the role asks the engine (`<engine> --version`).
+    pub tensorrt_llm: Option<PathBuf>,
+    /// Stated, or `None`: the role asks the engine (`<engine> --version`; ADR
+    /// 0038 §2: TensorRT-LLM's metadata-only check).
     pub build_fingerprint: Option<String>,
     pub args: Vec<String>,
     /// Stated, or `None`: the role's own default.
@@ -452,6 +463,7 @@ pub fn resolve(
         sglang: merged.sglang,
         tensorfold: merged.tensorfold,
         llamacpp: merged.llamacpp,
+        tensorrt_llm: merged.tensorrt_llm,
         build_fingerprint: merged.build_fingerprint,
         args: merged.args.unwrap_or_default(),
         kv_cache: merged.kv_cache,
@@ -477,14 +489,16 @@ impl EngineSettings {
         }
     }
 
-    /// ADR 0018 §5, ADR 0023 §2, ADR 0029 §2: the role's own installations and
-    /// their profile names: one executable is `local`; several are `local-<engine>`.
+    /// ADR 0018 §5, ADR 0023 §2, ADR 0029 §2, ADR 0038 §2: the role's own
+    /// installations and their profile names: one executable is `local`;
+    /// several are `local-<engine>`.
     pub fn installations(&self) -> Vec<(&'static str, Engine, PathBuf)> {
         let named: Vec<(Engine, PathBuf)> = [
             (Engine::Vllm, &self.vllm),
             (Engine::Sglang, &self.sglang),
             (Engine::Tensorfold, &self.tensorfold),
             (Engine::Llamacpp, &self.llamacpp),
+            (Engine::TensorrtLlm, &self.tensorrt_llm),
         ]
         .into_iter()
         .filter_map(|(engine, path)| path.clone().map(|path| (engine, path)))
@@ -500,6 +514,7 @@ impl EngineSettings {
                     Engine::Sglang => "local-sglang",
                     Engine::Tensorfold => "local-tensorfold",
                     Engine::Llamacpp => "local-llamacpp",
+                    Engine::TensorrtLlm => "local-tensorrt-llm",
                     // ADR 0031 §1: a custom engine is registered only with
                     // `engine add --custom`; the list above never holds one.
                     Engine::Custom => unreachable!("no role-local custom engine"),
@@ -516,9 +531,12 @@ impl EngineSettings {
 /// - `runtime_dir` and `resource_policy.endpoint_port_range` are stated when a
 ///   layer names them;
 /// - the `local_engine` executables become the runtime profiles `local` (or
-///   `local-vllm`, `local-sglang`, `local-tensorfold` and `local-llamacpp`), built exactly as `capyctl engine add`
-///   builds a profile ([`crate::registration::profile_document`]), with the
-///   fingerprint stated or read by `probe` from `<engine> --version`. A name
+///   `local-vllm`, `local-sglang`, `local-tensorfold`, `local-llamacpp` and
+///   `local-tensorrt-llm`), built exactly as `capyctl engine add` builds a
+///   profile ([`crate::registration::profile_document`]), with the
+///   fingerprint stated or read by `probe` from `<engine> --version` (ADR
+///   0038 §2: for TensorRT-LLM, the metadata-only check, whose companion
+///   versions the profile records). A name
 ///   the document already declares is refused (`profile_exists`);
 /// - the `local_engine` block itself is removed: what the host publishes is
 ///   the profiles it made from it.
@@ -528,7 +546,7 @@ impl EngineSettings {
 pub fn apply_to_host(
     document: &mut Value,
     settings: &EngineSettings,
-    probe: &dyn Fn(Engine, &Path) -> Result<String, String>,
+    probe: &dyn Fn(Engine, &Path) -> Result<crate::registration::CheckedVersion, String>,
 ) -> Result<(), ConfigError> {
     apply_to_host_with(document, settings, probe, &Default::default())
 }
@@ -538,7 +556,7 @@ pub fn apply_to_host(
 pub fn apply_to_host_with(
     document: &mut Value,
     settings: &EngineSettings,
-    probe: &dyn Fn(Engine, &Path) -> Result<String, String>,
+    probe: &dyn Fn(Engine, &Path) -> Result<crate::registration::CheckedVersion, String>,
     search: &crate::toolchain::ToolchainSearch,
 ) -> Result<(), ConfigError> {
     if settings.kv_cache.is_some() {
@@ -580,8 +598,8 @@ pub fn apply_to_host_with(
                 format!("runtime_profiles.{name}"),
                 format!(
                     "profile_exists: {name} is declared in runtime_profiles (or engines.yaml) \
-                     and also named by local_engine, --vllm-bin/--sglang-bin/--tensorfold-bin/--llamacpp-bin or \
-                     CAPYCTL_VLLM_BIN/CAPYCTL_SGLANG_BIN/CAPYCTL_TENSORFOLD_BIN/CAPYCTL_LLAMACPP_BIN; remove one"
+                     and also named by local_engine, --vllm-bin/--sglang-bin/--tensorfold-bin/--llamacpp-bin/--tensorrt-llm-bin or \
+                     CAPYCTL_VLLM_BIN/CAPYCTL_SGLANG_BIN/CAPYCTL_TENSORFOLD_BIN/CAPYCTL_LLAMACPP_BIN/CAPYCTL_TENSORRT_LLM_BIN; remove one"
                 ),
             ));
         }
@@ -597,8 +615,8 @@ pub fn apply_to_host_with(
                 ));
             }
         }
-        let build_fingerprint = match &settings.build_fingerprint {
-            Some(stated) => stated.clone(),
+        let checked = match &settings.build_fingerprint {
+            Some(stated) => crate::registration::CheckedVersion::from(stated.clone()),
             None => probe(engine, &executable).map_err(|detail| {
                 refuse(
                     &format!("runtime_profiles.{name}"),
@@ -622,30 +640,38 @@ pub fn apply_to_host_with(
         }
         // ADR 0014 §1: SGLang's protected entry takes no argument vector.
         let args = match engine {
-            Engine::Vllm | Engine::Tensorfold | Engine::Llamacpp => settings.args.clone(),
+            Engine::Vllm | Engine::Tensorfold | Engine::Llamacpp | Engine::TensorrtLlm => {
+                settings.args.clone()
+            }
             // ADR 0031 §1: `installations` never yields a custom engine.
             Engine::Sglang | Engine::Custom => Vec::new(),
         };
-        let profile = crate::registration::profile_document(&crate::registration::ProfileSpec {
-            engine,
-            executable,
-            build_fingerprint,
-            // ADR 0023 §6, ADR 0029 §2: TensorFold and llama.cpp never park,
-            // whatever local_engine.deep_park says.
-            deep_park: settings.deep_park
-                && !matches!(engine, Engine::Tensorfold | Engine::Llamacpp),
-            installation_drift: settings.installation_drift,
-            args,
-            cuda_home: settings.cuda_home.clone(),
-            approved_options: Vec::new(),
-            approved_paths: Vec::new(),
-            env: Default::default(),
-            approved_env: Vec::new(),
-            trust_remote_code: settings.trust_remote_code,
-            // ADR 0033 §1: only `engine add` registers LMCache; a role's own
-            // installation runs without it (`not_installed`).
-            lmcache: None,
-        });
+        let mut profile =
+            crate::registration::profile_document(&crate::registration::ProfileSpec {
+                engine,
+                executable,
+                build_fingerprint: checked.build_fingerprint,
+                // ADR 0023 §6, ADR 0029 §2, ADR 0038 §2: TensorFold, llama.cpp and
+                // TensorRT-LLM never park, whatever local_engine.deep_park says.
+                deep_park: settings.deep_park
+                    && !matches!(
+                        engine,
+                        Engine::Tensorfold | Engine::Llamacpp | Engine::TensorrtLlm
+                    ),
+                installation_drift: settings.installation_drift,
+                args,
+                cuda_home: settings.cuda_home.clone(),
+                approved_options: Vec::new(),
+                approved_paths: Vec::new(),
+                env: Default::default(),
+                approved_env: Vec::new(),
+                trust_remote_code: settings.trust_remote_code,
+                // ADR 0033 §1: only `engine add` registers LMCache; a role's own
+                // installation runs without it (`not_installed`).
+                lmcache: None,
+            });
+        // ADR 0038 §2: the companion versions TensorRT-LLM's check read.
+        crate::registration::put_companions(&mut profile, &checked.companions);
         crate::registration::check_profile(name, &profile)?;
         profiles.insert(name.to_owned(), profile);
     }
@@ -822,6 +848,23 @@ mod tests {
                     "Some(\"/flag/llama-server\")",
                     "Some(\"/env/llama-server\")",
                     "Some(\"/yaml/llama-server\")",
+                    "None",
+                ],
+            ),
+            // T49 (ADR 0038 §2): `local_engine.tensorrt-llm` three ways.
+            (
+                "tensorrt-llm",
+                EngineOverrides {
+                    tensorrt_llm: Some("/flag/trtllm-serve".into()),
+                    ..Default::default()
+                },
+                vec![(TENSORRT_LLM_BIN_ENV, "/env/trtllm-serve")],
+                json!({"local_engine": {"tensorrt-llm": "/yaml/trtllm-serve"}}),
+                |s| format!("{:?}", s.tensorrt_llm),
+                [
+                    "Some(\"/flag/trtllm-serve\")",
+                    "Some(\"/env/trtllm-serve\")",
+                    "Some(\"/yaml/trtllm-serve\")",
                     "None",
                 ],
             ),
@@ -1261,7 +1304,7 @@ mod tests {
         };
         let probe = |engine: Engine, _: &Path| {
             assert_eq!(engine, Engine::Llamacpp);
-            Ok("0.6.0+d812350".to_owned())
+            Ok("0.6.0+d812350".into())
         };
         let config = crate::llamacpp::system_config_file(dir.path());
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
@@ -1279,6 +1322,57 @@ mod tests {
         assert_eq!(profile["engine"], "llamacpp");
         assert_eq!(profile["build_fingerprint"], "0.6.0+d812350");
         assert_eq!(profile["security"]["deep_park"], "disabled");
+    }
+
+    // T49 T03 (ADR 0038 §2): TensorRT-LLM's own installation is `local` alone
+    // and `local-tensorrt-llm` beside another engine; built as `engine add`
+    // builds it, with the checked version and its companions, and it never
+    // parks, whatever deep_park says.
+    #[test]
+    fn a_host_tensorrt_llm_is_named_checked_and_never_parks() {
+        let executable = "/home/u/tensorrt-llm-1.2.1-venv/bin/trtllm-serve";
+        let one = EngineSettings {
+            tensorrt_llm: Some(executable.into()),
+            deep_park: true,
+            ..defaults()
+        };
+        assert_eq!(
+            one.installations(),
+            vec![("local", Engine::TensorrtLlm, executable.into())]
+        );
+        let two = EngineSettings {
+            vllm: Some("/v/bin/vllm".into()),
+            ..one.clone()
+        };
+        assert_eq!(
+            two.installations(),
+            vec![
+                ("local-vllm", Engine::Vllm, "/v/bin/vllm".into()),
+                ("local-tensorrt-llm", Engine::TensorrtLlm, executable.into()),
+            ]
+        );
+        let probe = |engine: Engine, path: &Path| {
+            assert_eq!(engine, Engine::TensorrtLlm);
+            assert_eq!(path, Path::new(executable));
+            Ok(crate::registration::CheckedVersion {
+                build_fingerprint: "1.2.1".into(),
+                companions: [("torch", "2.9.1+cu130"), ("mpi4py", "4.1.1")]
+                    .into_iter()
+                    .map(|(name, version)| (name.to_owned(), version.to_owned()))
+                    .collect(),
+            })
+        };
+        let mut document = json!({});
+        apply_to_host(&mut document, &one, &probe).unwrap();
+        let profile = &document["runtime_profiles"]["local"];
+        assert_eq!(profile["engine"], "tensorrt-llm");
+        assert_eq!(profile["executable"], executable);
+        assert_eq!(profile["build_fingerprint"], "1.2.1");
+        assert_eq!(profile["security"]["deep_park"], "disabled");
+        assert_eq!(
+            profile["companions"],
+            json!({"torch": "2.9.1+cu130", "mpi4py": "4.1.1"})
+        );
     }
 
     // T03 (ADR 0018 §3): a live reload keeps what the host resolved at start.

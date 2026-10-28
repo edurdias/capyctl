@@ -51,7 +51,21 @@ fn metadata_version(info: &Path) -> Option<String> {
         .filter(|v| !v.is_empty() && v.len() <= 128 && v.bytes().all(|b| b.is_ascii_graphic()))
 }
 
-/// ADR 0018 §1: the vLLM, SGLang and TensorFold packages an environment holds, from
+/// ADR 0038 §2: whether detection or resolution counts `version` of `engine`
+/// in `env` as verified: for TensorRT-LLM, beside the `torch` build the
+/// environment's `torch-*.dist-info` names (metadata only; nothing runs).
+pub(crate) fn verified_in_env(engine: Engine, version: &str, env: &Path) -> bool {
+    let torch = match engine {
+        Engine::TensorrtLlm => site_packages(env).iter().find_map(|site| {
+            crate::installation::dist_info_version(site, capyctl_config::tensorrt_llm::TORCH)
+        }),
+        _ => None,
+    };
+    capyctl_config::registration::is_verified_with_torch(engine, version, torch.as_deref())
+}
+
+/// ADR 0018 §1: the vLLM, SGLang, TensorFold and (ADR 0038 §2) TensorRT-LLM
+/// packages an environment holds, from
 /// `<name>-<version>.dist-info` directories (not symlinks) and their
 /// `METADATA` `Version:` line. Metadata only; bounded.
 pub fn packages(env: &Path) -> Vec<(Engine, String)> {

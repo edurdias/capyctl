@@ -377,6 +377,46 @@ impl ProfileBindings {
         )
         .map_err(|error| refuse(error.to_string()))
     }
+
+    /// ADR 0038 §3: the embedded TensorRT-LLM plan through the shared
+    /// builder. The launch directory is the launch's own in the role's
+    /// private per-launch root (`<state>/rendezvous/<incarnation>`, 0700),
+    /// which Initialize creates and the verified stop removes
+    /// ([`EngineBindings::launch_gone`]); without a private root nothing is
+    /// launched.
+    fn tensorrt_llm_plan(
+        &self,
+        work: &InitializeWork,
+        effective: &capyctl_config::effective::EffectiveDeployment,
+        endpoint: &reqwest::Url,
+    ) -> Result<capyctl_adapters::tensorrt_llm::PlanInputTensorrtLlm, CoordinatorError> {
+        let refuse = |what: String| {
+            CoordinatorError::Service(format!("cannot build a TensorRT-LLM launch plan: {what}"))
+        };
+        let port = endpoint
+            .port()
+            .ok_or_else(|| refuse("the leased endpoint names no port".into()))?;
+        let launch_dir = self
+            .rendezvous
+            .as_ref()
+            .and_then(|root| root.launch_dir(work.incarnation()))
+            .ok_or_else(|| {
+                refuse("the private per-launch directory is not this user's with mode 0700".into())
+            })?;
+        capyctl_adapters::tensorrt_llm::plan_from_effective(
+            effective,
+            port,
+            crate::engine_logs::standalone_log_path(
+                &self.log_dir,
+                &work.fence().deployment_id,
+                work.incarnation(),
+            )
+            .to_string_lossy()
+            .into_owned(),
+            &launch_dir,
+        )
+        .map_err(|error| refuse(error.to_string()))
+    }
 }
 
 /// ADR 0023 §3: before a TensorFold launch, clear the build locks a killed
@@ -638,6 +678,23 @@ impl EngineBindings for ProfileBindings {
                     endpoint,
                     launch: Some(launch),
                     api_key,
+                })
+            }
+            Engine::TensorrtLlm => {
+                let endpoint = crate::port::engine_url(work.endpoint()).ok_or_else(|| {
+                    CoordinatorError::Service(format!(
+                        "frozen binding endpoint names no address: {}",
+                        work.endpoint()
+                    ))
+                })?;
+                // ADR 0038 §3, §9: no key; the engine listens on loopback.
+                let launch = self.tensorrt_llm_plan(work, &self.sized(work)?, &endpoint)?;
+                Ok(AdapterSpec::TensorrtLlm {
+                    endpoint,
+                    fingerprint: profile.build_fingerprint.clone(),
+                    // ADR 0038 §5: readiness waits for the route served.
+                    model_id: launch.served_model_name.clone(),
+                    launch: Some(launch),
                 })
             }
         }

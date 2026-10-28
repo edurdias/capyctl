@@ -131,6 +131,8 @@ impl crate::Store {
     /// code: ADR 0033 §9, a `lmcache: required` launch that failed for a
     /// launch-time reason fails `lmcache_unavailable:<reason>`; ADR 0035 §13,
     /// a launch on several GPUs fails `tp_rank_unobserved` or
+    /// `engine_listener_exposed`; ADR 0038 §16, a TensorRT-LLM launch fails
+    /// `kv_cache_short`, `engine_process_escaped` or
     /// `engine_listener_exposed`. Any other code than these or
     /// `launch_failed` is refused.
     #[allow(clippy::too_many_arguments)]
@@ -192,7 +194,12 @@ pub(super) fn release_with_code(
         capyctl_domain::local_tp::ENGINE_LISTENER_EXPOSED,
     ]
     .contains(&error_code);
-    if error_code != "launch_failed" && !lmcache_code && !local_tp_code {
+    let tensorrt_llm_code = [
+        capyctl_config::tensorrt_llm::KV_CACHE_SHORT,
+        capyctl_config::tensorrt_llm::ENGINE_PROCESS_ESCAPED,
+    ]
+    .contains(&error_code);
+    if error_code != "launch_failed" && !lmcache_code && !local_tp_code && !tensorrt_llm_code {
         return Err(LifecycleError::Invalid);
     }
     if !is_ordinary(tx, id)? {
@@ -630,5 +637,56 @@ mod tests {
             store.release_failed_launch(&session, &step, &evidence, now, ttl + 1),
             Err(LifecycleError::Invalid)
         ));
+    }
+
+    /// ADR 0038 §16: a TensorRT-LLM launch stopped at readiness fails with
+    /// its closed code (`kv_cache_short`, `engine_process_escaped`, or
+    /// `engine_listener_exposed` on one GPU), recorded on its operation; a
+    /// code outside the closed set is refused and nothing is released.
+    // T49
+    #[test]
+    fn a_tensorrt_llm_launch_failure_keeps_its_closed_code() {
+        for code in [
+            "kv_cache_short",
+            "engine_process_escaped",
+            "engine_listener_exposed",
+        ] {
+            let (store, session, _, execution) = armed_ordinary();
+            let step = execution.token.step_id.clone();
+            let ttl = store.observation_ttl_for_step(&step).unwrap();
+            let now = execution.issued_at_ms + 10;
+            let evidence = CleanupEvidence {
+                binding_id: execution.binding_id.clone(),
+                incarnation: execution.incarnation.clone(),
+                identities: vec![],
+                observed_at_ms: now,
+                receipt: "observed gone".into(),
+            };
+            assert!(matches!(
+                store.release_failed_launch_coded(
+                    &session,
+                    &step,
+                    &evidence,
+                    now,
+                    ttl,
+                    "kv_geometry_unsupported"
+                ),
+                Err(LifecycleError::Invalid)
+            ));
+            assert_eq!(step_state(&store, &step), "armed");
+            store
+                .release_failed_launch_coded(&session, &step, &evidence, now, ttl, code)
+                .unwrap();
+            assert_eq!(step_state(&store, &step), "cancelled", "{code}");
+            assert_eq!(
+                text(
+                    &store,
+                    "SELECT error_code FROM operations WHERE id=(SELECT operation_id FROM \
+                     lifecycle_steps WHERE id=?1)",
+                    &step
+                ),
+                code
+            );
+        }
     }
 }

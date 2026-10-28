@@ -88,6 +88,11 @@ pub enum FieldSpec {
     MapOf(&'static FieldSpec),
     /// Sequence of items, each validated against the given spec.
     Seq(&'static FieldSpec),
+    /// Any mapping, passed whole to the code that reads it, which checks its
+    /// keys and values (ADR 0038 §3: TensorRT-LLM's `llm_api_options`, whose
+    /// reserved keys resolution refuses and whose other keys the engine's
+    /// strict models check).
+    Mapping,
     /// A field that used to live here and has moved (SPEC §15.3 strictness).
     /// It is refused like an unknown field, with a message naming where the
     /// setting lives now, so an old document fails with a pointer rather than
@@ -280,6 +285,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("tensorfold", SCALAR),
         // ADR 0029 §2: the role's own `llama-server`.
         ("llamacpp", SCALAR),
+        // ADR 0038 §2: the role's own `trtllm-serve`.
+        ("tensorrt-llm", SCALAR),
         ("build_fingerprint", SCALAR),
         ("args", FieldSpec::Seq(&SCALAR)),
         ("kv_cache", BYTES),
@@ -410,6 +417,15 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("mmproj_file", SCALAR),
             ]),
         ),
+        // ADR 0038 §3, §14: TensorRT-LLM's parser fields and LLM API options.
+        (
+            "tensorrt-llm",
+            FieldSpec::Struct(&[
+                ("tool_call_parser", SCALAR),
+                ("reasoning_parser", SCALAR),
+                ("llm_api_options", FieldSpec::Mapping),
+            ]),
+        ),
         ("accept_extra_args", SCALAR),
         ("extra_args", FieldSpec::Seq(&SCALAR)),
         // ADR 0028 §2.1: engine environment, names approved by the profile.
@@ -434,6 +450,10 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ),
         // ADR 0033 §1: the LMCache package `engine add` registered.
         ("lmcache", LMCACHE_REGISTRATION),
+        // ADR 0038 §2: the companion versions `engine add` read beside
+        // TensorRT-LLM's (torch, tensorrt, flashinfer-python, transformers,
+        // mpi4py), which `engine list` shows.
+        ("companions", FieldSpec::MapOf(&SCALAR)),
     ]);
     // ADR 0033 §1, contract decision 3: the LMCache package `engine add`
     // found in the registered environment, with its ADR 0008 digest.
@@ -477,6 +497,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             FieldSpec::Struct(&[("max_file_bytes", BYTES), ("retained_files", SCALAR)]),
         ),
         ("lmcache", LMCACHE_REGISTRATION),
+        // ADR 0038 §2: as in [`PROFILE`]; a host publishes its engines.yaml
+        // profiles and its own TensorRT-LLM's in its document.
+        ("companions", FieldSpec::MapOf(&SCALAR)),
         (
             "custom",
             // ADR 0031 §8: the installation digest the operator approved.

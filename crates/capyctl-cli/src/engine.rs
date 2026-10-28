@@ -17,8 +17,8 @@ use capyctl_config::engine_env::{is_owned, ApprovedEnv, EnvRefusal};
 use capyctl_config::engine_policy::Engine;
 use capyctl_config::registration::{
     check_profile, custom_engines_beside, custom_profile_document, lock_engines_for,
-    profile_document, valid_profile_name, write_engines, CustomProfileSpec, EnginesFile,
-    ProfileSpec, ENGINES_FILE, ENVIRONMENT_PROFILES,
+    profile_document, put_companions, valid_profile_name, write_engines, CustomProfileSpec,
+    EnginesFile, ProfileSpec, ENGINES_FILE, ENVIRONMENT_PROFILES,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -280,7 +280,7 @@ fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, Struc
                 .ok()
                 .flatten()
         }
-        Engine::Tensorfold | Engine::Llamacpp | Engine::Custom => None,
+        Engine::Tensorfold | Engine::Llamacpp | Engine::TensorrtLlm | Engine::Custom => None,
     };
     // review decision 2026-09-25: `engine add` before any role has started
     // is the first run. The state root the role will use is created
@@ -387,13 +387,20 @@ fn declared_by_operator(
 
 /// ADR 0018 §2: lock engines.yaml, re-check the name against both files,
 /// validate, write. The role document is never written. The revision written.
-fn write_profile(target: &Target, name: &str, spec: &ProfileSpec) -> Result<u64, StructuredError> {
+/// ADR 0038 §2: `companions` are the versions TensorRT-LLM's check read.
+fn write_profile(
+    target: &Target,
+    name: &str,
+    spec: &ProfileSpec,
+    companions: &BTreeMap<String, String>,
+) -> Result<u64, StructuredError> {
     let lock = lock_engines_for(&target.engines, service_owner(target))
         .map_err(|e| error("internal", format!("{}: {}", e.path, e.detail)))?;
     let mut engines =
         EnginesFile::load(&target.engines).map_err(|e| error("invalid_config", e.detail))?;
     refuse_existing(target, name)?;
-    let profile = profile_document(spec);
+    let mut profile = profile_document(spec);
+    put_companions(&mut profile, companions);
     check_profile(name, &profile)
         .map_err(|e| error("invalid_config", format!("{}: {}", e.path, e.detail)))?;
     engines.profiles.insert(name.to_owned(), profile);
@@ -490,16 +497,18 @@ async fn add(
     // Owner rule 2026-09-25: on a host as in standalone, these names are the
     // role's own installation (`local_engine`, `--vllm-bin`, `CAPYCTL_VLLM_BIN`).
     if ENVIRONMENT_PROFILES.contains(&name.as_str()) {
-        return Err(error("profile_exists", format!("{name} is reserved for the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin / --llamacpp-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN / CAPYCTL_LLAMACPP_BIN or local_engine); use --name")));
+        return Err(error("profile_exists", format!("{name} is reserved for the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin / --llamacpp-bin / --tensorrt-llm-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN / CAPYCTL_LLAMACPP_BIN / CAPYCTL_TENSORRT_LLM_BIN or local_engine); use --name")));
     }
     // Checked before anything runs, and again under the lock when writing.
     refuse_existing(target, &name)?;
     // SPEC §13.3 amendment (owner decision 2026-09-25). ADR 0029 §2: nothing
     // compiles at run time for llama.cpp, so no toolkit is recorded for it.
+    // ADR 0038 §2: TensorRT-LLM records one as the other Python engines do;
+    // nothing about it is checked here.
     let cuda_home = match resolved.engine {
         // ADR 0031 §1: `--custom` registers through its own path.
         Engine::Llamacpp | Engine::Custom => None,
-        Engine::Vllm | Engine::Sglang | Engine::Tensorfold => {
+        Engine::Vllm | Engine::Sglang | Engine::Tensorfold | Engine::TensorrtLlm => {
             capyctl_config::registration::detect_cuda_home_in(
                 toolchain.cuda_home_env.as_deref(),
                 &toolchain.search.default_cuda_home,
@@ -514,7 +523,7 @@ async fn add(
         if let Some(family) = match resolved.engine {
             Engine::Tensorfold => Some("TensorFold"),
             Engine::Llamacpp => Some("llama.cpp"),
-            Engine::Vllm | Engine::Sglang => None,
+            Engine::Vllm | Engine::Sglang | Engine::TensorrtLlm => None,
             // ADR 0031 §1: `--custom` registers through its own path.
             Engine::Custom => Some("a custom engine"),
         } {
@@ -566,6 +575,16 @@ async fn add(
             ));
         }
     }
+    // ADR 0038 §2, §8: TensorRT-LLM is restart-only; a request to park is
+    // refused before anything runs or is written. Nothing about its toolchain
+    // is checked: the first start's kernel builds are ADR 0014 A12's.
+    if resolved.engine == Engine::TensorrtLlm && deep_park == Some(DeepParkChoice::Enabled) {
+        return Err(error(
+            "capability_missing",
+            "TensorRT-LLM's sleep mode is a prototype its server does not expose; it runs \
+             restart_only, so --deep-park enabled is refused and nothing was written",
+        ));
+    }
     let (r, state) = (resolved.clone(), target.state_dir.clone());
     let registration = tokio::task::spawn_blocking(move || register(&r, &state))
         .await
@@ -579,11 +598,13 @@ async fn add(
     let deep = match deep_park {
         Some(DeepParkChoice::Enabled) => true,
         Some(DeepParkChoice::Disabled) => false,
-        // ADR 0023 §2, ADR 0029 §2: TensorFold and llama.cpp are disabled even
-        // when the probe could not run.
+        // ADR 0023 §2, ADR 0029 §2, ADR 0038 §2: TensorFold, llama.cpp and
+        // TensorRT-LLM are disabled even when the probe could not run.
         None => {
-            !matches!(resolved.engine, Engine::Tensorfold | Engine::Llamacpp)
-                && registration.deep_park_missing != Some(true)
+            !matches!(
+                resolved.engine,
+                Engine::Tensorfold | Engine::Llamacpp | Engine::TensorrtLlm
+            ) && registration.deep_park_missing != Some(true)
         }
     };
     let spec = ProfileSpec {
@@ -612,12 +633,22 @@ async fn add(
             .as_ref()
             .map(capyctl_agent::lmcache_install::LmcacheMeasurement::registration),
     };
-    let revision = write_profile(target, &name, &spec)?;
-    let out = json!({
+    let companions = &registration.reported.companions;
+    let revision = write_profile(target, &name, &spec, companions)?;
+    // ADR 0038 §2: TensorRT-LLM's version counts beside its torch build;
+    // anything else is an uncertified custom setup, written all the same.
+    let custom = !capyctl_config::registration::is_verified_with_torch(
+        resolved.engine,
+        &spec.build_fingerprint,
+        companions
+            .get(capyctl_config::tensorrt_llm::TORCH)
+            .map(String::as_str),
+    );
+    let mut out = json!({
         "profile": name, "engine": resolved.engine.name(),
         "version": registration.reported.version,
         "build_fingerprint": spec.build_fingerprint,
-        "custom": !capyctl_config::registration::is_verified(resolved.engine, &spec.build_fingerprint),
+        "custom": custom,
         "executable": resolved.executable,
         "fingerprint": registration.fingerprint.map(|f| json!({"version": f.version, "digest": f.digest})),
         "deep_park": if deep { "enabled" } else { "disabled" }, "deep_park_probe": probe,
@@ -627,6 +658,10 @@ async fn add(
         // ADR 0033 §1: what was recorded, or null when LMCache was not found.
         "lmcache": spec.lmcache,
     });
+    // ADR 0038 §2: the companion versions recorded beside TensorRT-LLM's.
+    if resolved.engine == Engine::TensorrtLlm {
+        out["companions"] = json!(companions);
+    }
     publish(target, out, revision, &target.engines).await
 }
 
@@ -1016,10 +1051,12 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
             if known.contains(name) {
                 continue;
             }
+            // ADR 0038 §2: a role's own TensorRT-LLM lists its companions.
             let profile = json!({
                 "engine": entry["engine"], "executable": entry["executable"],
                 "build_fingerprint": entry["build_fingerprint"],
                 "security": {"deep_park": entry["deep_park"]},
+                "companions": entry["companions"],
             });
             all.push((name.clone(), profile, "environment"));
         }
@@ -1041,13 +1078,26 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
                 profile["build_fingerprint"].as_str(),
             );
             // ADR 0031 §6, §7: a custom engine's idle signal (or `none`) and
-            // whether its launches carry a per-launch engine key.
+            // whether its launches carry a per-launch engine key. ADR 0038
+            // §2, §7: TensorRT-LLM reports no idle signal and takes no engine
+            // key.
             let manifest = capyctl_agent::installation::custom_manifest(&profile);
+            let tensorrt_llm = kind == Some(Engine::TensorrtLlm);
+            let companions = &profile["companions"];
             json!({
                 "profile": name, "source": source, "engine": profile["engine"], "version": version,
-                "custom": !capyctl_config::registration::is_verified(engine, &version),
-                "idle_signal": manifest.as_ref().map(|m| m.idle.as_ref().map_or_else(|| "none".to_owned(), |idle| idle.describe())),
-                "engine_key": manifest.as_ref().map(engine_key),
+                // ADR 0038 §2: TensorRT-LLM's version counts beside its torch build.
+                "custom": !capyctl_config::registration::is_verified_with_torch(
+                    engine,
+                    &version,
+                    companions[capyctl_config::tensorrt_llm::TORCH].as_str(),
+                ),
+                "idle_signal": manifest
+                    .as_ref()
+                    .map(|m| m.idle.as_ref().map_or_else(|| "none".to_owned(), |idle| idle.describe()))
+                    .or_else(|| tensorrt_llm.then(|| "none".to_owned())),
+                "engine_key": manifest.as_ref().map(engine_key).or(tensorrt_llm.then_some("none")),
+                "companions": tensorrt_llm.then(|| companions.clone()),
                 "api": manifest.as_ref().map(|m| m.api),
                 "executable": profile["executable"],
                 "fingerprint": accepted.clone().flatten().map(|a| a["installation"].clone()),
@@ -1175,7 +1225,7 @@ fn listed_lmcache(
 async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, StructuredError> {
     if ENVIRONMENT_PROFILES.contains(&name) && !registered_or_declared(target, name)? {
         return Err(error("invalid_config", format!(
-            "{name} comes from the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin / --llamacpp-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN / CAPYCTL_LLAMACPP_BIN or local_engine); unset it and restart the role instead"
+            "{name} comes from the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin / --llamacpp-bin / --tensorrt-llm-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN / CAPYCTL_LLAMACPP_BIN / CAPYCTL_TENSORRT_LLM_BIN or local_engine); unset it and restart the role instead"
         )));
     }
     // ADR 0031 amendment A1: the profile is in engines.yaml or in

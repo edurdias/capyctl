@@ -99,8 +99,9 @@ const CANCELLING: &str = "FROM request_lease_cancellations c
 /// ADR 0031 §6: whether the engine of instance lane (`deployment`, `index`),
 /// SQL expressions, reports no idle signal: its retained revision (the
 /// instance's own, else the deployment's), as resolved on its host when it
-/// was, profiles `engine: custom` with no `custom.manifest.idle`. Every
-/// built-in engine reports one; a configuration that does not decode is
+/// was, profiles `engine: custom` with no `custom.manifest.idle`, or (ADR
+/// 0038 §7) `engine: tensorrt-llm`, whose `/metrics` never reads idle. Every
+/// other built-in engine reports one; a configuration that does not decode is
 /// treated as reporting one, so it keeps the conservative built-in rules.
 pub(crate) fn lane_without_idle_signal(deployment: &str, index: &str) -> String {
     let chosen = "COALESCE(nh.effective_json,ne.effective_json)";
@@ -110,8 +111,9 @@ pub(crate) fn lane_without_idle_signal(deployment: &str, index: &str) -> String 
            LEFT JOIN host_effective_revisions nh ON nh.deployment_id=nd.id AND nh.revision=COALESCE(ni.revision,nd.revision)
              AND nh.host_id=ni.host_id AND nh.outcome='resolved'
           WHERE ni.deployment_id={deployment} AND ni.instance_index={index}
-            AND CASE WHEN json_valid({chosen}) THEN json_extract({chosen},'$.profile.engine')='custom'
-                  AND json_type({chosen},'$.profile.custom.manifest.idle') IS NULL ELSE 0 END)"
+            AND CASE WHEN json_valid({chosen}) THEN json_extract({chosen},'$.profile.engine')='tensorrt-llm'
+                  OR (json_extract({chosen},'$.profile.engine')='custom'
+                  AND json_type({chosen},'$.profile.custom.manifest.idle') IS NULL) ELSE 0 END)"
     )
 }
 
@@ -394,6 +396,91 @@ mod tests {
         assert!(!events
             .iter()
             .any(|e| e.kind == "request_cancellation_acknowledged"));
+    }
+
+    /// Retain `effective` as the fixture instance's effective revision.
+    fn retain_effective(f: &Fixture, effective: &serde_json::Value) {
+        f.store
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO deployment_instances(deployment_id,instance_index) VALUES(?1,0)",
+                [&f.dep],
+            )
+            .unwrap();
+        f.store
+            .conn
+            .execute(
+                "UPDATE deployment_instances SET revision=1 WHERE deployment_id=?1",
+                [&f.dep],
+            )
+            .unwrap();
+        f.store
+            .conn
+            .execute(
+                "INSERT INTO effective_revisions(deployment_id,revision,effective_json,fingerprint) VALUES(?1,1,?2,'f')",
+                rusqlite::params![f.dep, effective.to_string()],
+            )
+            .unwrap();
+    }
+
+    /// Whether the fixture's cancelling lease settles only at its instance's
+    /// verified stop.
+    fn settles_at_stop(f: &Fixture) -> bool {
+        f.store
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM request_leases l WHERE l.id=?1",
+                    super::cancelling_settled_at_stop("l")
+                ),
+                [f.ticket.id()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    // T49 T17 (ADR 0038 §7): a TensorRT-LLM engine reports no idle signal, so
+    // a cancellation it answered is never settled by an idle reading; only the
+    // instance's verified stop settles it. A custom engine with an idle
+    // signal and a built-in engine with one keep the reading; a custom engine
+    // without one does not.
+    #[test]
+    fn a_tensorrt_llm_cancellation_is_never_settled_by_an_idle_reading() {
+        use serde_json::json;
+        for (effective, without_signal) in [
+            (json!({"profile": {"engine": "tensorrt-llm"}}), true),
+            (
+                json!({"profile": {"engine": "custom", "custom": {"manifest": {"idle": {"metric": "x"}}}}}),
+                false,
+            ),
+            (
+                json!({"profile": {"engine": "custom", "custom": {"manifest": {}}}}),
+                true,
+            ),
+            (json!({"profile": {"engine": "vllm"}}), false),
+        ] {
+            let f = ready_instance_with_lease();
+            retain_effective(&f, &effective);
+            cancel(&f, true);
+            assert_eq!(settles_at_stop(&f), without_signal, "{effective}");
+            assert_eq!(
+                f.store.cancelling_bindings(&f.session).unwrap().is_empty(),
+                without_signal,
+                "{effective}"
+            );
+            assert_eq!(
+                f.store
+                    .settle_cancelled_leases(&f.session, &f.binding, i64::MAX, "r")
+                    .unwrap(),
+                usize::from(!without_signal),
+                "{effective}"
+            );
+            assert_eq!(
+                f.store.binding_outstanding_leases(&f.binding).unwrap(),
+                Some(0),
+                "{effective}"
+            );
+        }
     }
 
     // T17: only cancellations at or before the quiescence question close.
