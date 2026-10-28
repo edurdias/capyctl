@@ -425,6 +425,14 @@ fn engine_of(effective: &EffectiveDeployment) -> Result<GroupEngine, GroupActiva
                 "llamacpp: no multi-node mode",
             ))
         }
+        // ADR 0038 §13: tensor parallelism needs MPI's spawned workers, which
+        // the one-process model refuses; TensorRT-LLM runs on one GPU.
+        Engine::TensorrtLlm => {
+            return Err(GroupActivationError::refused(
+                "group_shape_unsupported",
+                "tensorrt-llm: one GPU, no multi-rank mode",
+            ))
+        }
         // ADR 0031 §4: a custom engine runs one process per instance.
         Engine::Custom => {
             return Err(GroupActivationError::refused(

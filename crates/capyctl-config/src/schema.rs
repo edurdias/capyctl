@@ -285,6 +285,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("tensorfold", SCALAR),
         // ADR 0029 §2: the role's own `llama-server`.
         ("llamacpp", SCALAR),
+        // ADR 0038 §2: the role's own `trtllm-serve`.
+        ("tensorrt-llm", SCALAR),
         ("build_fingerprint", SCALAR),
         ("args", FieldSpec::Seq(&SCALAR)),
         ("kv_cache", BYTES),
@@ -448,6 +450,10 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ),
         // ADR 0033 §1: the LMCache package `engine add` registered.
         ("lmcache", LMCACHE_REGISTRATION),
+        // ADR 0038 §2: the companion versions `engine add` read beside
+        // TensorRT-LLM's (torch, tensorrt, flashinfer-python, transformers,
+        // mpi4py), which `engine list` shows.
+        ("companions", FieldSpec::MapOf(&SCALAR)),
     ]);
     // ADR 0033 §1, contract decision 3: the LMCache package `engine add`
     // found in the registered environment, with its ADR 0008 digest.
@@ -491,6 +497,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             FieldSpec::Struct(&[("max_file_bytes", BYTES), ("retained_files", SCALAR)]),
         ),
         ("lmcache", LMCACHE_REGISTRATION),
+        // ADR 0038 §2: as in [`PROFILE`]; a host publishes its engines.yaml
+        // profiles and its own TensorRT-LLM's in its document.
+        ("companions", FieldSpec::MapOf(&SCALAR)),
         (
             "custom",
             // ADR 0031 §8: the installation digest the operator approved.

@@ -109,6 +109,9 @@ pub(super) fn normalize_profile(
             return Err(invalid("runtime_profiles.env", reason));
         }
     }
+    // ADR 0038 §2: the companion versions a TensorRT-LLM profile records.
+    crate::registration::check_companions(raw_profile.engine, &raw_profile.companions)
+        .map_err(|reason| invalid("runtime_profiles.companions", reason))?;
     // Spec §3: `--trust-remote-code` makes the engine execute Python that arrived
     // with the checkpoint. There are models that need it, but a profile may only
     // pass it where the host has said so in as many words.

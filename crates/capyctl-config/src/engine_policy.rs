@@ -554,7 +554,7 @@ pub const LLAMACPP_DECLARED_DRAFTER: &str = "llama.cpp takes its draft model as 
      `model.draft` is not supported for llama.cpp";
 /// ADR 0038 §1: TensorRT-LLM's speculative decoding is out of scope.
 pub const TENSORRT_LLM_DECLARED_DRAFTER: &str = "TensorRT-LLM's speculative decoding is not \
-     supported in this version (ADR 0038 §1), so `model.draft` is refused";
+     supported in this version, so `model.draft` is refused";
 
 /// Whether `args` set `option` (abbreviations and the `=` spelling included).
 fn names_option(args: &[String], option: &str) -> Result<bool, ProfileArgError> {

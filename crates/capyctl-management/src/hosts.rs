@@ -248,7 +248,7 @@ fn engine_row(row: EngineRow<'_>) -> serde_json::Value {
     let engine = profile["engine"].as_str().unwrap_or("unknown").to_owned();
     use capyctl_config::{
         engine_policy::Engine,
-        registration::{is_verified, listed_version},
+        registration::{listed_custom, listed_version},
     };
     let kind = Engine::from_name(&engine);
     // ADR 0029 §2: a llama.cpp row shows its `<version>+<commit>` fingerprint.
@@ -257,8 +257,9 @@ fn engine_row(row: EngineRow<'_>) -> serde_json::Value {
         row.reported_version.as_deref(),
         profile["build_fingerprint"].as_str(),
     );
-    // ADR 0018 §1: `custom` is derived, never declared.
-    let custom = kind.is_none_or(|e| !is_verified(e, &version));
+    // ADR 0018 §1: `custom` is derived, never declared. ADR 0038 §2: a
+    // TensorRT-LLM version counts beside the torch build its profile records.
+    let custom = listed_custom(kind, &version, profile);
     let mut row_value = serde_json::json!({
         "host_id": row.host_id, "host": row.host_name,
         "online": row.online,
@@ -278,6 +279,15 @@ fn engine_row(row: EngineRow<'_>) -> serde_json::Value {
     if kind == Some(Engine::Custom) {
         if let Some(object) = row_value.as_object_mut() {
             object.extend(custom_engine_view(profile));
+        }
+    }
+    // ADR 0038 §2, §7: TensorRT-LLM's companion versions, no idle signal and
+    // no engine key.
+    if kind == Some(Engine::TensorrtLlm) {
+        if let Some(object) = row_value.as_object_mut() {
+            object.insert("companions".into(), profile["companions"].clone());
+            object.insert("idle_signal".into(), "none".into());
+            object.insert("engine_key".into(), "none".into());
         }
     }
     row_value
@@ -682,6 +692,40 @@ mod tests {
         for field in ["manifest", "idle_signal", "engine_key"] {
             assert!(known.get(field).is_none(), "{known}");
         }
+    }
+
+    // T49 (ADR 0038 §2, §7): the server's engines row of TensorRT-LLM shows
+    // the companion versions its profile records, `idle_signal: none` and
+    // `engine_key: none`, and `custom` for every version until an entry beside
+    // its torch build is verified; LMCache is off (`engine_unsupported`).
+    #[test]
+    fn a_tensorrt_llm_row_shows_its_companions_and_no_idle_signal() {
+        let profile = serde_json::json!({"engine": "tensorrt-llm",
+            "executable": "/home/u/tensorrt-llm-1.2.1-venv/bin/trtllm-serve",
+            "build_fingerprint": "1.2.1",
+            "companions": {"torch": "2.9.1+cu130", "mpi4py": "4.1.1"},
+            "security": {"deep_park": "disabled"}});
+        let row = super::engine_row(super::EngineRow {
+            host_id: "h",
+            host_name: "h",
+            online: true,
+            profile_name: "tensorrt-llm",
+            profile: &profile,
+            reported_version: Some("1.2.1".into()),
+            fingerprint: None,
+            deep_park_missing: true,
+            retiring: false,
+            deployments: vec![],
+            host_lmcache: Default::default(),
+        });
+        assert_eq!(row["version"], "1.2.1");
+        assert_eq!(row["custom"], true);
+        assert_eq!(row["companions"], profile["companions"]);
+        assert_eq!(row["idle_signal"], "none");
+        assert_eq!(row["engine_key"], "none");
+        assert_eq!(row["deep_park"], "disabled");
+        assert_eq!(row["lmcache"]["state"], "off");
+        assert_eq!(row["lmcache"]["reason"], "engine_unsupported");
     }
 
     // T45 (ADR 0033 §9): the server's engines row carries `lmcache`: the

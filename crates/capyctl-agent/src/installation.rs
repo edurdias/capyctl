@@ -67,22 +67,53 @@ pub fn capability_names(engine: Engine) -> &'static [&'static str] {
         Engine::Tensorfold => &["core", "deep_park", "metrics"],
         // ADR 0029 §2: nothing is probed; deep parking is reported missing.
         Engine::Llamacpp => &["deep_park"],
+        // ADR 0038 §2: importing TensorRT-LLM starts MPI and CUDA, so it is
+        // never probed; it is restart-only and deep parking is reported missing.
+        Engine::TensorrtLlm => &["deep_park"],
         // ADR 0031 §1, §4: nothing is ever executed or probed; it cannot park.
         Engine::Custom => &["deep_park"],
     }
 }
 
 /// The installed Python package that is the engine; none for llama.cpp, a
-/// bare binary (ADR 0029 §2).
+/// bare binary (ADR 0029 §2). ADR 0038 §2: TensorRT-LLM's is its
+/// distribution, `tensorrt_llm`.
 pub fn package_name(engine: Engine) -> Option<&'static str> {
     match engine {
         Engine::Sglang => Some("sglang"),
         Engine::Vllm => Some("vllm"),
         Engine::Tensorfold => Some("tensorfold"),
+        Engine::TensorrtLlm => Some(capyctl_config::tensorrt_llm::DISTRIBUTION),
         Engine::Llamacpp => None,
         // ADR 0031 §3: a custom engine is measured from its executable and
         // environment, never through a package of its own.
         Engine::Custom => None,
+    }
+}
+
+/// Whether the capability probe (`runtime/engine_capabilities.py`, which
+/// imports the engine) runs for `engine`. ADR 0029 §2, ADR 0031 §4: nothing is
+/// probed for llama.cpp or a custom engine. ADR 0038 §2: nor for
+/// TensorRT-LLM, whose import initializes MPI and CUDA.
+fn probed(engine: Engine) -> bool {
+    match engine {
+        Engine::Sglang | Engine::Vllm | Engine::Tensorfold => true,
+        Engine::Llamacpp | Engine::TensorrtLlm | Engine::Custom => false,
+    }
+}
+
+/// ADR 0008: the import packages one installation's digest covers, under
+/// its `site-packages`: the engine package alone, or, ADR 0038 §2, every
+/// import package of TensorRT-LLM's distribution (`tensorrt_llm/` and
+/// `triton_kernels/`; the wheel's top-level `examples/` is never imported by
+/// the server and is left out).
+fn import_packages(engine: Engine) -> &'static [&'static str] {
+    match engine {
+        Engine::Sglang => &["sglang"],
+        Engine::Vllm => &["vllm"],
+        Engine::Tensorfold => &["tensorfold"],
+        Engine::TensorrtLlm => capyctl_config::tensorrt_llm::IMPORT_PACKAGES,
+        Engine::Llamacpp | Engine::Custom => &[],
     }
 }
 
@@ -275,7 +306,10 @@ impl InstallationMeasurer {
             return self.measure_binary(executable);
         };
         let site = site_packages(engine, executable)?;
-        let (digest, files, bytes) = self.measure_tree(&site.join(package))?;
+        let (digest, files, bytes) = match import_packages(engine) {
+            [_] => self.measure_tree(&site.join(package))?,
+            packages => self.measure_packages(&site, packages)?,
+        };
         Ok(InstallationFingerprint {
             version: version(&site, package),
             digest,
@@ -296,6 +330,38 @@ impl InstallationMeasurer {
         // Forget files that left the installation, so the cache stays bounded.
         if let Ok(mut cache) = self.cache.lock() {
             cache.retain(|path, _| !path.starts_with(root) || collected.seen.contains(path));
+        }
+        let digest = manifest_digest(&mut collected.entries)?;
+        Ok((digest, collected.entries.len(), collected.total))
+    }
+
+    /// ADR 0008, ADR 0038 §2: one canonical manifest over several import
+    /// packages of `site`, each file named `<package>/<relative path>`
+    /// (bytecode caches left out, a link by its target text), within the
+    /// installation bounds. A package that is absent contributes nothing (its
+    /// absence changes the digest); one that is not a directory is refused.
+    fn measure_packages(
+        &self,
+        site: &Path,
+        packages: &[&str],
+    ) -> Result<(String, usize, u64), FingerprintError> {
+        let mut collected = Collected::default();
+        let mut roots = Vec::new();
+        for package in packages {
+            let root = site.join(package);
+            match std::fs::symlink_metadata(&root) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Ok(_) => return Err(FingerprintError::UnsafeFile),
+                Err(_) => return Err(FingerprintError::Io),
+            }
+            self.walk(&root, package.as_bytes(), &mut collected)?;
+            roots.push(root);
+        }
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.retain(|path, _| {
+                !roots.iter().any(|root| path.starts_with(root)) || collected.seen.contains(path)
+            });
         }
         let digest = manifest_digest(&mut collected.entries)?;
         Ok((digest, collected.entries.len(), collected.total))
@@ -762,21 +828,23 @@ impl CapabilityReport {
 /// run or answered (no probe helper in the runtime directory, no interpreter,
 /// no package, a timeout, a malformed report). `None` is unknown: it refuses
 /// nothing and grants nothing. ADR 0029 §2: a llama.cpp binary has no deep-park
-/// capability and nothing is run for it; its report says so.
+/// capability and nothing is run for it; its report says so. ADR 0038 §2: nor
+/// is anything run for TensorRT-LLM, whose import starts MPI and CUDA.
 pub fn probe_capabilities(
     engine: Engine,
     executable: &Path,
     runtime_dir: &Path,
     timeout: Duration,
 ) -> Option<CapabilityReport> {
-    let Some(package) = package_name(engine) else {
+    if !probed(engine) {
         return Some(CapabilityReport {
             missing: capability_names(engine)
                 .iter()
                 .map(|name| ((*name).to_owned(), vec!["unsupported".to_owned()]))
                 .collect(),
         });
-    };
+    }
+    let package = package_name(engine)?;
     let script = runtime_dir.join(PROBE_SCRIPT);
     if !std::fs::symlink_metadata(&script).is_ok_and(|m| m.is_file()) {
         return None;
@@ -1626,6 +1694,95 @@ mod tests {
             measurer.measure(Engine::Llamacpp, &binary).unwrap().digest,
             installed.digest
         );
+    }
+
+    // T49 T22 (ADR 0038 §2, ADR 0008): TensorRT-LLM's digest covers both import
+    // packages of its distribution, compiled libraries included, and leaves
+    // out bytecode, the top-level `examples/` and every other package; its
+    // version is the dist-info's. Nothing is probed: the probe would import
+    // the package, which starts MPI and CUDA, so deep parking is reported
+    // missing and the interpreter never runs.
+    #[test]
+    fn a_tensorrt_llm_digest_covers_both_import_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let marker = dir.path().join("ran");
+        capyctl_config::test_support::write_executable(
+            &bin.join("python3"),
+            &format!("#!/bin/sh\ntouch {}\n", marker.display()),
+            0o755,
+        )
+        .unwrap();
+        let executable = bin.join("trtllm-serve");
+        std::fs::write(&executable, "#!/bin/sh\n").unwrap();
+        let site = dir.path().join("lib/python3.12/site-packages");
+        let trt = site.join("tensorrt_llm");
+        std::fs::create_dir_all(trt.join("libs")).unwrap();
+        std::fs::create_dir_all(trt.join("__pycache__")).unwrap();
+        std::fs::write(trt.join("__init__.py"), "from ._utils import *\n").unwrap();
+        std::fs::write(trt.join("libs/libtensorrt_llm.so"), "elf").unwrap();
+        std::fs::write(trt.join("__pycache__/version.cpython-312.pyc"), "x").unwrap();
+        let kernels = site.join("triton_kernels");
+        std::fs::create_dir_all(&kernels).unwrap();
+        std::fs::write(kernels.join("__init__.py"), "").unwrap();
+        std::fs::create_dir_all(site.join("examples")).unwrap();
+        std::fs::write(site.join("examples/quickstart.py"), "print()\n").unwrap();
+        std::fs::create_dir_all(site.join("torch")).unwrap();
+        std::fs::write(site.join("torch/__init__.py"), "").unwrap();
+        let dist = site.join("tensorrt_llm-1.2.1.dist-info");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(
+            dist.join("METADATA"),
+            "Name: tensorrt_llm\nVersion: 1.2.1\n",
+        )
+        .unwrap();
+        let measurer = InstallationMeasurer::new();
+        let first = measurer.measure(Engine::TensorrtLlm, &executable).unwrap();
+        assert_eq!(first.version, "1.2.1");
+        assert_eq!(
+            first.files, 3,
+            "two tensorrt_llm files and one triton_kernels file"
+        );
+        // Bytecode, examples and other packages are not the installation.
+        std::fs::write(trt.join("__pycache__/other.cpython-312.pyc"), "y").unwrap();
+        std::fs::write(trt.join("_utils.pyc"), "y").unwrap();
+        std::fs::write(site.join("examples/quickstart.py"), "changed\n").unwrap();
+        std::fs::write(site.join("torch/__init__.py"), "changed\n").unwrap();
+        assert_eq!(
+            InstallationMeasurer::new()
+                .measure(Engine::TensorrtLlm, &executable)
+                .unwrap(),
+            first
+        );
+        // A rebuilt library, a changed kernel and a removed package each count.
+        std::fs::write(trt.join("libs/libtensorrt_llm.so"), "rebuilt").unwrap();
+        let rebuilt = measurer.measure(Engine::TensorrtLlm, &executable).unwrap();
+        assert_ne!(rebuilt.digest, first.digest, "a rebuilt library");
+        std::fs::write(kernels.join("__init__.py"), "# patched\n").unwrap();
+        let patched = measurer.measure(Engine::TensorrtLlm, &executable).unwrap();
+        assert_ne!(patched.digest, rebuilt.digest, "a changed triton_kernels");
+        std::fs::remove_dir_all(&kernels).unwrap();
+        let without = measurer.measure(Engine::TensorrtLlm, &executable).unwrap();
+        assert_ne!(without.digest, patched.digest, "triton_kernels removed");
+        assert_eq!(without.files, 2);
+        // A `triton_kernels` that is not a directory is refused.
+        std::fs::write(&kernels, "not a package").unwrap();
+        assert_eq!(
+            measurer.measure(Engine::TensorrtLlm, &executable),
+            Err(FingerprintError::UnsafeFile)
+        );
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::write(runtime.path().join(PROBE_SCRIPT), "# probes\n").unwrap();
+        let report = probe_capabilities(
+            Engine::TensorrtLlm,
+            &executable,
+            runtime.path(),
+            PROBE_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(report.missing_capabilities(), vec!["deep_park"]);
+        assert!(!marker.exists(), "the interpreter ran");
     }
 
     /// ADR 0031 §3: a virtual environment holding the console script

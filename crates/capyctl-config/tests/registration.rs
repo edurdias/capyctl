@@ -648,3 +648,112 @@ fn profile_without_flags_is_unchanged() {
     });
     assert_eq!(profile_document(&fixture), before);
 }
+
+// T49 T14 (ADR 0038 §2): a TensorRT-LLM version is verified only beside the
+// torch build its entry names; a qualified version beside another torch
+// build, or with none recorded, lists `custom`. The shipped set has no
+// TensorRT-LLM entry until TR1–TR11 (and the pre-releases' rows) pass.
+#[test]
+fn a_tensorrt_llm_version_is_verified_only_beside_its_torch_build() {
+    let table = [("1.2.1", "2.9.1+cu130"), ("1.4.0rc1", "2.10.0+cu134")];
+    let verified = |version: &str, torch: Option<&str>| {
+        is_verified_with_torch_in(&table, Engine::TensorrtLlm, version, torch)
+    };
+    assert!(verified("1.2.1", Some("2.9.1+cu130")));
+    assert!(verified("1.4.0rc1", Some("2.10.0+cu134")));
+    assert!(
+        !verified("1.2.1", Some("2.9.1+cu128")),
+        "another torch build"
+    );
+    assert!(
+        !verified("1.2.1", Some("2.10.0+cu134")),
+        "another entry's torch"
+    );
+    assert!(!verified("1.2.1", None), "no torch recorded");
+    assert!(
+        !verified("1.3.0rc1", Some("2.9.1+cu130")),
+        "an unlisted version"
+    );
+    // A version alone never counts, whatever the general table holds.
+    assert!(!is_verified_in(
+        &[(Engine::TensorrtLlm, "1.2.1")],
+        Engine::TensorrtLlm,
+        "1.2.1"
+    ));
+    // Every other engine ignores torch.
+    assert!(is_verified_with_torch_in(
+        &table,
+        Engine::Vllm,
+        "0.29.0",
+        None
+    ));
+    assert!(!is_verified_with_torch_in(
+        &table,
+        Engine::Vllm,
+        "1.2.1",
+        Some("2.9.1+cu130")
+    ));
+    // Shipped: no entry yet, so every version lists custom.
+    assert!(TENSORRT_LLM_VERIFIED.is_empty());
+    assert!(!is_verified_with_torch(
+        Engine::TensorrtLlm,
+        "1.2.1",
+        Some("2.9.1+cu130")
+    ));
+    let profile = serde_json::json!({"companions": {"torch": "2.9.1+cu130"}});
+    assert!(listed_custom(Some(Engine::TensorrtLlm), "1.2.1", &profile));
+    assert!(listed_custom(None, "1.2.1", &profile), "an unknown kind");
+    assert!(!listed_custom(Some(Engine::Vllm), "0.29.0", &profile));
+}
+
+// T49 T14 (ADR 0038 §2): a TensorRT-LLM profile records its companion
+// versions and deep park disabled, passes the resolution rules and the
+// engines file's schema, and an unlisted version is written all the same;
+// companions on another engine, an unknown companion or a malformed version
+// are refused.
+#[test]
+fn a_tensorrt_llm_profile_records_its_companions() {
+    let companions: std::collections::BTreeMap<String, String> = [
+        ("torch", "2.9.1+cu130"),
+        ("tensorrt", "10.14.1.48"),
+        ("flashinfer-python", "0.6.4"),
+        ("transformers", "4.57.3"),
+        ("mpi4py", "4.1.1"),
+    ]
+    .into_iter()
+    .map(|(name, version)| (name.to_owned(), version.to_owned()))
+    .collect();
+    let mut profile = profile_document(&ProfileSpec {
+        build_fingerprint: "9.9.9".into(),
+        deep_park: false,
+        ..spec(Engine::TensorrtLlm)
+    });
+    put_companions(&mut profile, &companions);
+    assert_eq!(profile["engine"], "tensorrt-llm");
+    assert_eq!(profile["security"]["deep_park"], "disabled");
+    assert_eq!(profile["companions"]["torch"], "2.9.1+cu130");
+    check_profile("tensorrt-llm", &profile).unwrap();
+    let text = serde_json::json!({"schema_version": 1, "kind": "engines",
+        "runtime_profiles": {"tensorrt-llm": profile.clone()}})
+    .to_string();
+    EnginesFile::parse(Path::new("engines.yaml"), &text).unwrap();
+    // Nothing recorded: the field is left out.
+    let mut bare = profile_document(&spec(Engine::Vllm));
+    put_companions(&mut bare, &Default::default());
+    assert!(bare.get("companions").is_none());
+    let mut on_vllm = profile.clone();
+    on_vllm["engine"] = "vllm".into();
+    on_vllm["executable"] = "/home/u/venv/bin/vllm".into();
+    let mut unknown = profile.clone();
+    unknown["companions"] = serde_json::json!({"numpy": "1.26.4"});
+    let mut malformed = profile.clone();
+    malformed["companions"] = serde_json::json!({"torch": "2.9.1 cu130"});
+    for (bad, what) in [
+        (on_vllm, "another engine"),
+        (unknown, "an unknown companion"),
+        (malformed, "a malformed version"),
+    ] {
+        let error = check_profile("tensorrt-llm", &bad).unwrap_err();
+        assert_eq!(error.path, "runtime_profiles.companions", "{what}: {error}");
+    }
+}

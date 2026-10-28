@@ -970,11 +970,12 @@ fn engines(value: &Value) -> String {
                 clean(host),
                 text(&e["profile"]),
                 text(&e["engine"]),
-                text(&e["version"]),
+                version_cell(e),
                 text(&e["custom"]),
                 text(&e["deep_park"]),
                 lmcache_cell(&e["lmcache"]),
-                // ADR 0031 §6, §7: a custom engine's idle signal and engine key.
+                // ADR 0031 §6, §7, ADR 0038 §2: a custom engine's idle signal
+                // and engine key; TensorRT-LLM's are `none`.
                 text(&e["idle_signal"]),
                 text(&e["engine_key"]),
                 state.into(),
@@ -1013,6 +1014,24 @@ fn lmcache_cell(view: &Value) -> String {
     }
 }
 
+/// ADR 0038 §2: the listed version, followed for TensorRT-LLM by the
+/// companion versions its registration recorded, so a changed torch or
+/// TensorRT shows in the listing.
+fn version_cell(row: &Value) -> String {
+    let version = text(&row["version"]);
+    let companions: Vec<String> = row["companions"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, version)| format!("{} {}", clean(name), text(version)))
+        .collect();
+    if companions.is_empty() {
+        version
+    } else {
+        format!("{version} ({})", companions.join(", "))
+    }
+}
+
 fn local_engines(value: &Value) -> String {
     let rows: Vec<Vec<String>> = value["engines"]
         .as_array()
@@ -1023,11 +1042,12 @@ fn local_engines(value: &Value) -> String {
                 text(&e["profile"]),
                 text(&e["source"]),
                 text(&e["engine"]),
-                text(&e["version"]),
+                version_cell(e),
                 text(&e["custom"]),
                 text(&e["deep_park"]),
                 lmcache_cell(&e["lmcache"]),
-                // ADR 0031 §6, §7: a custom engine's idle signal and engine key.
+                // ADR 0031 §6, §7, ADR 0038 §2: a custom engine's idle signal
+                // and engine key; TensorRT-LLM's are `none`.
                 text(&e["idle_signal"]),
                 text(&e["engine_key"]),
                 text(&e["published"]),
@@ -1876,6 +1896,28 @@ mod tests {
         assert!(row.contains("/metrics gauges running"), "{server}");
         assert!(row.contains("per-launch"), "{server}");
         assert!(row.contains(" yes "), "{server}");
+    }
+
+    // T49 (ADR 0038 §2): a TensorRT-LLM row shows its companion versions
+    // beside its own, `CUSTOM yes`, and `none` for its idle signal and engine
+    // key, locally and on the server.
+    #[test]
+    fn engine_views_show_tensorrt_llm_companions() {
+        let row = json!({"profile": "tensorrt-llm", "source": "engines.yaml",
+            "host_id": "01HOSTA", "host": "gpu-a", "online": true, "retiring": false,
+            "engine": "tensorrt-llm", "version": "1.2.1", "custom": true,
+            "companions": {"mpi4py": "4.1.1", "torch": "2.9.1+cu130"},
+            "deep_park": "disabled", "idle_signal": "none", "engine_key": "none",
+            "published": "published", "deployments": []});
+        for view in [View::LocalEngines, View::Engines] {
+            let out = render(view, &json!({"engines": [row.clone()]}), &HostNames::new());
+            let line = out.lines().nth(1).unwrap();
+            assert!(
+                line.contains("1.2.1 (mpi4py 4.1.1, torch 2.9.1+cu130)   yes"),
+                "{out}"
+            );
+            assert!(line.contains("   none          none   "), "{out}");
+        }
     }
 
     /// `status deployment --format json` of a Ready two-host vLLM group as

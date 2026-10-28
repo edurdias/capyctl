@@ -797,12 +797,16 @@ impl HostConfig {
     /// (`crate::engine_settings`), to its document before it is published:
     /// the runtime directory, the engines' port range and the `local_engine`
     /// executables as the `local` runtime profiles. `probe` reads an
-    /// executable's version when no fingerprint is stated.
+    /// executable's version (ADR 0038 §2: with TensorRT-LLM's companion
+    /// versions) when no fingerprint is stated.
     pub fn with_engines(
         self,
         flags: &crate::engine_settings::EngineOverrides,
         env: &crate::engine_settings::EngineOverrides,
-        probe: &dyn Fn(crate::engine_policy::Engine, &Path) -> Result<String, String>,
+        probe: &dyn Fn(
+            crate::engine_policy::Engine,
+            &Path,
+        ) -> Result<crate::registration::CheckedVersion, String>,
     ) -> Result<Self, ConfigError> {
         let stated = crate::engine_settings::EngineOverrides::from_document(&self.document)?;
         let settings = crate::engine_settings::resolve(flags, env, &stated);

@@ -640,6 +640,10 @@ impl EngineBindings for ProfileBindings {
                     api_key,
                 })
             }
+            // TRTLLM-WIRING: replaced by the integration slice.
+            Engine::TensorrtLlm => Err(CoordinatorError::Service(
+                "TensorRT-LLM launches are not wired in this build".into(),
+            )),
         }
     }
 }

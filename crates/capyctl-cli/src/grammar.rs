@@ -724,6 +724,11 @@ struct RoleSettingsArgs {
     /// profile. Wins over CAPYCTL_LLAMACPP_BIN and local_engine.llamacpp.
     #[arg(long, value_name = "PATH", value_parser = parse_engine_path)]
     llamacpp_bin: Option<PathBuf>,
+    /// The TensorRT-LLM `trtllm-serve` console script
+    /// (`<venv>/bin/trtllm-serve`) this role runs as its `local` profile.
+    /// Wins over CAPYCTL_TENSORRT_LLM_BIN and local_engine.tensorrt-llm.
+    #[arg(long, value_name = "PATH", value_parser = parse_engine_path)]
+    tensorrt_llm_bin: Option<PathBuf>,
     /// The build fingerprint the local engine publishes (default: what
     /// `<engine> --version` prints). Wins over CAPYCTL_ENGINE_FINGERPRINT and
     /// local_engine.build_fingerprint.
@@ -814,6 +819,7 @@ impl RoleSettingsArgs {
             sglang: self.sglang_bin.clone(),
             tensorfold: self.tensorfold_bin.clone(),
             llamacpp: self.llamacpp_bin.clone(),
+            tensorrt_llm: self.tensorrt_llm_bin.clone(),
             build_fingerprint: self.engine_fingerprint.clone(),
             args: self
                 .engine_args

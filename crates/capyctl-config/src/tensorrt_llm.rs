@@ -448,9 +448,10 @@ pub fn check_options(options: &Map<String, Value>, cuda_graphs: bool) -> Result<
         ));
     }
     if let Some(key) = first_reserved_key(options, cuda_graphs) {
+        // ADR 0038 §3: rendered by CapyCTL or out of scope.
         return Err(format!(
             "key `{key}` is reserved: CapyCTL renders it, or it is out of scope for \
-             TensorRT-LLM in this version (ADR 0038 §3); remove it"
+             TensorRT-LLM in this version; remove it"
         ));
     }
     if let Some(key) = keys(options).find(|key| !plain_key(key)) {

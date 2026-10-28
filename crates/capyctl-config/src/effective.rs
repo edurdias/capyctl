@@ -1277,6 +1277,10 @@ struct RawProfile {
     /// ADR 0033 §1: the LMCache package `engine add` registered.
     #[serde(default)]
     lmcache: Option<LmcacheRegistration>,
+    /// ADR 0038 §2: the companion versions `engine add` read beside
+    /// TensorRT-LLM's; listed, never launched with.
+    #[serde(default)]
+    companions: BTreeMap<String, String>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
