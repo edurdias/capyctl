@@ -447,15 +447,15 @@ pub fn check_options(options: &Map<String, Value>, cuda_graphs: bool) -> Result<
             "the mapping is {size} bytes of JSON; at most {MAX_OPTIONS_BYTES} are accepted"
         ));
     }
-    if let Some(key) = keys(options).find(|key| !plain_key(key)) {
-        return Err(format!(
-            "key `{key}` is not an LLM API field name (lower-case letters, digits and `_`)"
-        ));
-    }
     if let Some(key) = first_reserved_key(options, cuda_graphs) {
         return Err(format!(
             "key `{key}` is reserved: CapyCTL renders it, or it is out of scope for \
              TensorRT-LLM in this version (ADR 0038 §3); remove it"
+        ));
+    }
+    if let Some(key) = keys(options).find(|key| !plain_key(key)) {
+        return Err(format!(
+            "key `{key}` is not an LLM API field name (lower-case letters, digits and `_`)"
         ));
     }
     Ok(())
