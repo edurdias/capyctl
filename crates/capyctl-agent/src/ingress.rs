@@ -724,6 +724,7 @@ impl IngressTrace {
             span.set(Attr::Endpoint(match kind {
                 Kind::Chat => capyctl_trace::Endpoint::Chat,
                 Kind::Decision => capyctl_trace::Endpoint::Decisions,
+                Kind::Embedding => capyctl_trace::Endpoint::Embeddings,
             }));
             span.set(Attr::Deployment(scope.deployment_id.clone()));
             span.set(Attr::Instance(scope.instance_index.to_string()));
