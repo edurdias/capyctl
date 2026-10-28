@@ -354,11 +354,12 @@ residency) enters the released table when, on that combination:
 Rows are written as ADR 0033 A12 reads them: the registered engine version (`0.32.0`,
 `0.5.22`), the checkpoint's `model_type` (`qwen3`), the GPU's product name as `nvidia-smi`
 reports it (`NVIDIA GB10`), and the residency (`deep`; `host_backed` for the discrete
-GPU's rows). The discrete GPU qualified in 0.2.0 is the laptop's or the rented VM's, under
-the product name `nvidia-smi` reports there, for the engine installed there (owner
-decision 7); every other discrete GPU product, and the other engine on that machine, stays
-outside the table. A hybrid model type is not added while the approved LMCache lacks
-multi-group engine-driven transfer (owner decision 8); under `lmcache: auto` it stays
+GPU's rows). The discrete GPU qualified in 0.2.0 is the laptop's (`NVIDIA GeForce RTX
+4090 Laptop GPU`) or, if the laptop is not enough, the rented VM's, under the product name
+`nvidia-smi` reports there, for the engine installed there (owner decision 7); every other
+discrete GPU product, and the other engine on that machine, stays outside the table.
+A hybrid model type is not added while the approved LMCache lacks multi-group
+engine-driven transfer (owner decision 8); under `lmcache: auto` it stays
 `park_unqualified`, so no start fails on it.
 
 ### 3a. Outside the table: uncertified, never refused (owner rule of 2026-10-27)
@@ -625,14 +626,32 @@ host_backed` on one discrete-GPU machine: the maintainer's RTX 4090 laptop, or a
 rented from Shadeform with the `shade` CLI and shut down as soon as the rows finish, so it
 costs nothing idle. The owner approved one environment there, vLLM 0.32.0 or SGLang
 0.5.22, with LMCache 0.5.6, installed fresh as host A's were (approved versions only); the
-machine is a live host for that session only. The rows use Qwen3-4B and each type of the
-model list that fits that GPU, the same prompts and method, and the same deployment with
+machine is a live host for that session only. The rows use Qwen3-4B and each listed type
+that fits the machine (below), the same prompts and method, and the same deployment with
 `lmcache: off` on the same machine as "off"; LC15 there enrolls the machine to a control
 host. The table rows name the GPU product `nvidia-smi` reports there and the engine that
-ran. If that machine's derived `host_kv_limit` (10 % of its memory) cannot hold the 8 GiB
-pool a 32k context needs, it is raised for the session and the value recorded
-[INFERENCE: the laptop's GPU memory and RAM, and the VM's shape, are not recorded here, so
-which types fit there is known only when the list is compiled].
+ran.
+
+*The laptop* (observed 2026-10-27 with `nvidia-smi` and `free`): an NVIDIA GeForce RTX
+4090 Laptop GPU with 16,376 MiB of GPU memory, and 61 GiB of system RAM. Standalone
+derives its `host_kv_limit` as about 6.1 GiB (10 % of 61 GiB), so the pool cap is 6 GiB,
+below the 8 GiB pool one 32k context of Qwen3-4B needs; the limit is raised to 8 GiB for
+the session and the value recorded. Which listed types fit, with the rows' 5 GiB KV
+grant and 32,768-token context:
+
+- **Qwen3-4B (`qwen3`) fits:** about 7.5 GiB of BF16 weights (4.0 billion parameters ×
+  2 bytes) plus the 5 GiB grant is about 12.5 GiB, leaving about 3.5 GiB of the
+  16,376 MiB for the engine's own allocations [INFERENCE: arithmetic, not run]. In
+  `host_backed` the parked weights go to host RAM, which 61 GiB holds.
+- **Another listed type fits only with a BF16 checkpoint of about 4 billion parameters or
+  fewer** (at most about 9 GiB of weights beside the grant and the engine's allocations).
+  A type whose checkpoints start at 7 or 8 billion parameters (14–15 GiB in BF16) does not
+  fit beside the grant [INFERENCE: arithmetic, not run]. The compiled list marks each type
+  as fitting the laptop or not by this rule, before the owner sees it.
+
+*The Shadeform VM*: its shape is not specified. It is chosen when rented, only if the
+laptop is not enough (for the listed types that do not fit it), and its GPU product,
+memory and RAM are recorded with the rows.
 
 ## Owner decisions of 2026-10-27
 

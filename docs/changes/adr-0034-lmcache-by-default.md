@@ -25,8 +25,10 @@ LMCache is dropped (owner decision 6); only dense full-attention model types qua
 
 Decisions that changed the design: `host_backed` on a discrete GPU is qualified in 0.2.0,
 with a vLLM 0.32.0 or SGLang 0.5.22 environment on a maintainer's discrete-GPU machine (the
-RTX 4090 laptop) or a VM rented from Shadeform, where LC13–LC16 run with `host_backed`
-(owner decision 7); the model types beyond `qwen3` are the most-used open-weight dense chat
+RTX 4090 laptop: 16,376 MiB of GPU memory, 61 GiB of RAM, where Qwen3-4B and listed types
+of about 4 billion parameters or fewer in BF16 fit) or, if the laptop is not enough, a VM
+rented from Shadeform, where LC13–LC16 run with `host_backed` (owner decision 7); the
+model types beyond `qwen3` are the most-used open-weight dense chat
 model types on OpenRouter that fit the hosts, a list compiled when the implementation is
 built and shown to the owner before the live rows (owner decision 9); and, under the
 owner's rule of 2026-10-27 on certified combinations, the qualified table is the certified
