@@ -245,6 +245,13 @@ pub const CAPABILITY: &str = "lmcache";
 /// deployment's `retention: zero`. `capyctl_protocol::capabilities::RETENTION`
 /// is this name.
 pub const RETENTION_CAPABILITY: &str = "retention";
+/// ADR 0034 §1 (ADR 0017): the host capability that says the host renders
+/// engine-driven transfer for a parking residency (and its launch-time
+/// check verifies it). A host without it predates ADR 0034: its own plan
+/// keeps a parking residency's LMCache off, so the store plans it off too
+/// (`host_capability_missing`). `capyctl_protocol::capabilities::LMCACHE_ENGINE_DRIVEN`
+/// is this name.
+pub const ENGINE_DRIVEN_CAPABILITY: &str = "lmcache_engine_driven";
 
 /// ADR 0033 §§9, 14: `lmcache: required` on a host whose `lmcache` is `off`.
 pub const REFUSED_HOST_OFF: &str = "lmcache_unavailable:host_off";
@@ -1182,6 +1189,8 @@ pub struct PlanInputs<'a> {
     /// and the `retention` one.
     pub host_declares_lmcache: bool,
     pub host_declares_retention: bool,
+    /// ADR 0034 §1: whether the host declared [`ENGINE_DRIVEN_CAPABILITY`].
+    pub host_declares_engine_driven: bool,
     pub engine: Engine,
     /// The registered build (`build_fingerprint`), the engine's version.
     pub engine_version: &'a str,
@@ -1229,6 +1238,7 @@ impl<'a> PlanInputs<'a> {
             host_retention: Retention::Standard,
             host_declares_lmcache: true,
             host_declares_retention: true,
+            host_declares_engine_driven: true,
             engine,
             engine_version,
             api: DeploymentApi::Chat,
@@ -1612,6 +1622,14 @@ fn decide(
     if !inputs.host_declares_lmcache {
         return Err(LmcacheOff::new(R::HostCapabilityMissing));
     }
+    // ADR 0034 §1: a parking residency's LMCache is engine-driven, which a
+    // host from before ADR 0034 does not render.
+    if inputs.residency.parks() && !inputs.host_declares_engine_driven {
+        return Err(LmcacheOff::with_detail(
+            R::HostCapabilityMissing,
+            "the host predates engine-driven transfer, which a parking residency needs",
+        ));
+    }
     if let Some(off) = engine_gate(inputs.engine, inputs.engine_version) {
         return Err(off);
     }
@@ -1713,6 +1731,7 @@ pub fn deployment_refusal(inputs: &PlanInputs<'_>, table: &[QualifiedParking]) -
         host_retention: Retention::Standard,
         host_declares_lmcache: true,
         host_declares_retention: true,
+        host_declares_engine_driven: true,
         engine_start_failed: false,
         ..*inputs
     };
@@ -2578,6 +2597,42 @@ mod tests {
             sticky.off().map(|off| off.reason),
             Some(LmcacheOffReason::EngineStartFailed)
         );
+    }
+
+    // T45 (ADR 0034 §1): a host that does not declare engine-driven
+    // transfer keeps a parking residency's LMCache off (and `required` is
+    // refused for it), while a restart_only launch there is unaffected.
+    #[test]
+    fn a_parking_residency_needs_a_host_with_engine_driven_transfer() {
+        let registration = registered();
+        let deep = PlanInputs {
+            residency: Residency::Deep,
+            model_type: Some("qwen3"),
+            gpu: Some("NVIDIA GB10"),
+            host_declares_engine_driven: false,
+            ..on(&registration)
+        };
+        let planned = plan_with_table(&deep, &[QWEN_ON_GB10]);
+        assert_eq!(
+            planned.off().map(|off| off.reason),
+            Some(LmcacheOffReason::HostCapabilityMissing)
+        );
+        let required = plan_with_table(
+            &PlanInputs {
+                mode: LmcacheMode::Required,
+                ..deep
+            },
+            &[QWEN_ON_GB10],
+        );
+        assert_eq!(
+            required.refusal().as_deref(),
+            Some("host_capability_missing:lmcache")
+        );
+        assert!(plan(&PlanInputs {
+            residency: Residency::RestartOnly,
+            ..deep
+        })
+        .is_on());
     }
 
     // T45 (ADR 0034 §2): a recorded failure is found for its combination
