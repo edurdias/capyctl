@@ -19,7 +19,7 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 2 | `group_model_path_mismatch` | A SGLang group with `residency: deep` has the model at different paths on its machines; the message names both. | Put the model at the same path on every machine, or use `residency: restart_only`. |
 | 2 | `peer_address_missing` | A machine named in `placement.hosts` declares no peer address. | Set `resource_policy.groups.peer_address` (or `--peer-address`) on that machine and restart CapyCTL there. |
 | 2 | `peer_address_not_local` | The declared peer address is not on any network interface of that machine. | Declare an address the machine holds on its direct link. |
-| 2 | `engine_env_reserved:<name>` | An engine environment variable CapyCTL sets itself (for example `NCCL_*`, `GLOO_*`, `MASTER_*`, `VLLM_HOST_IP`, `CUDA_VISIBLE_DEVICES`), or any `LMCACHE_*` variable, which LMCache would read as configuration. | Remove it; CapyCTL renders these names ([the full list](../operations/configuration.md#engine-environment)). |
+| 2 | `engine_env_reserved:<name>` | An engine environment variable CapyCTL sets itself (for example `NCCL_*`, `GLOO_*`, `MASTER_*`, `VLLM_HOST_IP`, `CUDA_VISIBLE_DEVICES`), any `LMCACHE_*` variable, which LMCache would read as configuration, or an engine tracing variable: `OTEL_*`, `SGLANG_TRACE_*`, `SGLANG_OTLP_*`, `TRACEPARENT` or `TRACESTATE`, in any case. | Remove it; CapyCTL renders these names ([the full list](../operations/configuration.md#engine-environment)). For engine tracing set `observability.tracing.engines: on` on the host ([Engine tracing](engines.md#engine-tracing)). |
 | 2 | `engine_env_not_approved:<name>` | A deployment sets an engine variable the engine profile does not approve (on some machine of a group). | Approve it with `capyctl engine add ... --approve-env <name>` on every machine, or remove it ([Engine variables](engines.md#engine-variables)). |
 | 2 | `engine_env_conflict:<name>` | The same variable is in the file and on the command line. | Give it one way only. |
 | 2 | `custom_field_unsupported:<field>` | A deployment on a custom engine states something the engine's manifest owns: `extra_args`, `accept_extra_args`, a tool-call or reasoning parser, `memory`, a draft model or a typed engine field such as `dtype` or `max_concurrent_requests`. | Remove it; a custom engine's deployment states only `engine_config.context_length` and `engine_config.env` ([Custom engines](engines.md#custom-engines)). |
@@ -259,6 +259,54 @@ On a machine of several it names that machine's
 `resource_policy.domains.<domain>.host_kv_limit` instead. A second copy of a
 model (`instances`) that waits for that room shows the same words in its
 `LAST ERROR`.
+
+## Tracing
+
+`capyctl status deployment <name>` shows `engine tracing: off (<reason>)` for
+an instance whose engine runs without its own spans (`engine_tracing` with
+`state: off` and `reason` in JSON). It is a status, not an error: the model
+serves, and CapyCTL's own spans are recorded as usual. The reasons
+([Engine tracing](engines.md#engine-tracing)):
+
+- `host_off`: the machine's `observability.tracing.engines` is `off` (the
+  default) or it names no endpoint.
+- `engine_unsupported`: llama.cpp, TensorFold, a custom engine, vLLM before
+  0.31.0 or SGLang before 0.5.22.
+- `group`: the model runs across machines.
+- `retention_zero`: the deployment or the machine sets `retention: zero`.
+- `not_installed`: the engine's environment lacks the OpenTelemetry packages a
+  traced engine imports. Install them there (for SGLang, its `tracing` extra).
+
+An engine tracing option in `extra_args` or a profile's arguments is refused
+with ``reserved option `<option>` is rendered by capyctl and cannot be
+passed``, whatever the host approves: vLLM `--otlp-traces-endpoint` and
+`--collect-detailed-traces`, SGLang `--enable-trace`,
+`--otlp-traces-endpoint`, `--otlp-service-name` and `--trace-modules`, in
+every spelling. A deployment that relied on an approved
+`--otlp-traces-endpoint` before this release is refused the same way: remove
+it and set `observability.tracing.engines: on` on the host.
+
+These tracing settings refuse the role's start, with a message naming the
+field ([Tracing](../operations/configuration.md#tracing)):
+
+- a field `observability.tracing` does not take (a standalone
+  `host.observability.tracing` takes only `engines`);
+- an `endpoint` that is not an `http://` or `https://` URL naming a host, or
+  one with a user or password in it;
+- a relative `headers_file`, or one without an `endpoint`;
+- a `headers_file` that cannot be opened, is a symbolic link or not a regular
+  file, is owned by another user, has group or other permissions, is larger
+  than 64 KiB, or has a line that is not `Name: value` (the message gives the
+  line number, never its text);
+- a `sample_ratio` that is not a number from 0.0 to 1.0;
+- a `caller_context` other than `parent`, `link` or `ignore`;
+- an `engines` other than `off` or `on`, or `engines: on` without an endpoint
+  on loopback (`localhost`, `127.0.0.0/8` or `::1`).
+
+`tracing: on → <endpoint>, spans dropped <n>, last export error: <error>`
+in `capyctl status deployment <name>` means the collector could not take everything. Requests
+are not affected. Check that the collector runs and that the endpoint and
+`headers_file` are right; the role log has a notice at most once a minute.
 
 ## Troubleshooting
 

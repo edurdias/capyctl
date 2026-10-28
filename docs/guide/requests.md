@@ -465,6 +465,48 @@ A decision's answer carries its figures in `capyctl.metrics`, in the same
 A decision generates no text, so it has no `ttft_ms` or
 `decode_tokens_per_second`. A figure nobody measured is left out.
 
+### Trace context
+
+If the operator has turned tracing on
+([Tracing](../operations/configuration.md#tracing)), CapyCTL joins your
+distributed trace. Send the W3C `traceparent` header (and `tracestate` if you
+have one) as your OpenTelemetry SDK already does:
+
+```bash
+curl -s http://127.0.0.1:8443/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' \
+  -d '{"model": "my-model", "messages": [{"role": "user", "content": "hi"}]}'
+```
+
+CapyCTL reads the headers only after your key is accepted, on
+`/v1/chat/completions` and `/v1/systemone`. By default its `capyctl.request`
+span becomes a child of your span, with spans under it for admission, the
+wait for a free slot (`capyctl.queue_wait`), the wait for a model to start or
+wake (`capyctl.activation_wait`), each dispatch and forward to the engine, and
+the request's settlement. The forward span has a `first_progress` event at
+the first output, so the trace shows time to first token. A model start, wake
+or switch is its own trace (`capyctl.activation`), linked from the
+`activation_wait` of every request that waited for it. The operator can make
+CapyCTL link to your trace instead of joining it, or ignore your headers.
+
+A `traceparent` that is malformed, given twice, or has an all-zero ID is
+ignored, not refused: the request is answered as usual and starts a new
+trace, and `tracestate` is then dropped too. A `tracestate` over 512 bytes or
+32 entries is dropped. Your sampled flag decides whether the request is
+recorded.
+
+The answer carries no trace header. To find a request's spans, search the
+collector for `capyctl.request_id` equal to the answer's
+`X-CapyCTL-Request-Id`. On an SGLang model with engine tracing
+([Engine tracing](engines.md#engine-tracing)), SGLang's own span carries the
+same ID as `gen_ai.request.id` when SGLang runs one tokenizer worker.
+Your `X-Request-Id` is never put in a span. Spans hold no prompt or answer
+text ([Traces](../operations/data-retention.md#traces)).
+
+Without tracing on, the headers are not read and change nothing; they never
+reach the engine.
+
 ## When the model is parked
 
 A request for a parked model waits while CapyCTL wakes it, then answers. It

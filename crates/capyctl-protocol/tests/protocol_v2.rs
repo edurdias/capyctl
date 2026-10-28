@@ -34,6 +34,7 @@ fn base() -> MemberCommand {
             group_member_launch: None,
             probe_max_tokens: 0,
             probe_decision: false,
+            trace_parent: String::new(),
         })),
     })
     .unwrap()
@@ -233,6 +234,7 @@ fn parked_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         probe_text: String::new(),
         probe_decision: None,
         lmcache: None,
+        engine_tracing: String::new(),
     }
 }
 

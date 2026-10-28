@@ -271,6 +271,8 @@ pub fn plan_from_effective(
         // the launch builder attaches the state (`AdapterSpec::Vllm.lmcache`).
         kv_transfer_config: None,
         lmcache: None,
+        // ADR 0037 §7: set by the launch builder from the launch's decision.
+        engine_tracing: None,
     })
 }
 

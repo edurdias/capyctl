@@ -353,6 +353,8 @@ impl ForwarderSource for Engines {
         Ok(Lane {
             forward: self.by_generation[&generation].clone(),
             request_abort: false,
+            engine_trace: false,
+            trace_context: false,
         })
     }
 }
@@ -386,6 +388,7 @@ fn fixture(delay_ms: u64) -> Fixture {
         api_key: None,
         inflight: Arc::new(capyctl_router::admission::InFlight::default()),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: capyctl_trace::Tracing::off(),
     };
     Fixture {
         deps,

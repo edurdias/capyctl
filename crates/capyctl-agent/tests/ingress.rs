@@ -1063,3 +1063,248 @@ async fn the_capyctl_request_id_becomes_rid_only_on_a_capable_chat_launch() {
     task.abort();
     native_task.abort();
 }
+
+/// ADR 0037 §6 fixture: a native engine that records each request's trace
+/// headers, and an ingress with two open launches of one deployment:
+/// `traced` (gate 1, engine tracing on) and `plain` (gate 3, off).
+type TraceSeen = Arc<Mutex<Vec<(Option<String>, Option<String>)>>>;
+async fn trace_fixture(
+    tracing: capyctl_trace::Tracing,
+) -> (
+    std::net::SocketAddr,
+    TraceSeen,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    let seen: TraceSeen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let native = Router::new().fallback(move |request: Request<Body>| {
+        let seen = recorded.clone();
+        async move {
+            let header = |name: &str| {
+                request
+                    .headers()
+                    .get(name)
+                    .map(|v| v.to_str().unwrap().to_owned())
+            };
+            seen.lock()
+                .unwrap()
+                .push((header("traceparent"), header("tracestate")));
+            Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap()
+        }
+    });
+    let (native_addr, native_task) = serve(native).await;
+    let ingress = Ingress::traced(tracing).unwrap();
+    let traced = IngressScope {
+        deployment_id: "traced".into(),
+        ..scope(1)
+    };
+    let plain = IngressScope {
+        deployment_id: "plain".into(),
+        ..scope(1)
+    };
+    for (scope, gate, native, engine_trace) in
+        [(&traced, 1u8, 2u8, true), (&plain, 3u8, 4u8, false)]
+    {
+        ingress
+            .register(
+                scope.clone(),
+                native_addr,
+                "model".into(),
+                [gate; 32],
+                [native; 32],
+            )
+            .unwrap();
+        ingress
+            .bind_handle(
+                scope,
+                &format!("launch-{gate}"),
+                EngineAccess::builtin().with_engine_trace(engine_trace),
+            )
+            .unwrap();
+        ingress.open(scope).unwrap();
+    }
+    let (address, task) = serve(ingress.clone().router()).await;
+    (address, seen, vec![task, native_task])
+}
+
+/// The router's forward span as its `traceparent` carries it.
+const ROUTER_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+const ROUTER_SPAN: &str = "b7ad6b7169203331";
+fn router_parent() -> String {
+    format!("00-{ROUTER_TRACE}-{ROUTER_SPAN}-01")
+}
+
+/// Post a chat request through the ingress and read its whole answer.
+async fn post_traced(
+    address: std::net::SocketAddr,
+    gate: u8,
+    headers: &[(&str, &str)],
+) -> StatusCode {
+    let mut request = reqwest::Client::new()
+        .post(format!("http://{address}/v1/chat/completions"))
+        .bearer_auth(hex::encode([gate; 32]))
+        .header("x-capyctl-request-id", "01JAAAAAAAAAAAAAAAAAAAAAAA");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = request
+        .json(&serde_json::json!({"model":"model","messages":[]}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    response.bytes().await.unwrap();
+    status
+}
+
+/// The ingress spans recorded so far, once `count` have ended (a relayed
+/// body's span ends when the server polls its end).
+async fn ingress_spans(
+    capture: &capyctl_trace::testing::Capture,
+    count: usize,
+) -> Vec<capyctl_trace::testing::Recorded> {
+    for _ in 0..200 {
+        let spans = capture.named("capyctl.ingress");
+        if spans.len() >= count {
+            return spans;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    capture.named("capyctl.ingress")
+}
+
+fn hex_bytes<const N: usize>(text: &str) -> [u8; N] {
+    hex::decode(text).unwrap().try_into().unwrap()
+}
+
+// T48, T19 (ADR 0037 §6): a request that fails the ingress's authentication
+// creates no span and its trace headers are never read or forwarded.
+#[tokio::test]
+async fn an_unauthenticated_request_ignores_trace_headers_and_makes_no_span() {
+    let (tracing, capture) = capyctl_trace::testing::capture(
+        1.0,
+        capyctl_trace::CallerMode::Parent,
+        capyctl_trace::Service::Host,
+    );
+    let (address, seen, tasks) = trace_fixture(tracing).await;
+    let parent = router_parent();
+    let status = post_traced(
+        address,
+        9,
+        &[("traceparent", &parent), ("tracestate", "vendor=1")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(capture.spans().is_empty(), "{:?}", capture.spans());
+    assert!(seen.lock().unwrap().is_empty());
+    tasks.iter().for_each(|t| t.abort());
+}
+
+// T48 (ADR 0037 §§3, 5, 6): with host tracing on, `capyctl.ingress` (server
+// kind) is the child of the router's forward span; a launch with engine
+// tracing is sent a rebuilt `traceparent` naming the ingress span as parent
+// (sampled flag kept) with the router's `tracestate`; a launch without it
+// is sent neither header. A malformed context is ignored: a new trace.
+#[tokio::test]
+async fn the_ingress_span_parents_to_the_router_and_only_a_traced_engine_gets_context() {
+    let (tracing, capture) = capyctl_trace::testing::capture(
+        1.0,
+        capyctl_trace::CallerMode::Parent,
+        capyctl_trace::Service::Host,
+    );
+    let (address, seen, tasks) = trace_fixture(tracing).await;
+    let parent = router_parent();
+    let context = [("traceparent", parent.as_str()), ("tracestate", "vendor=1")];
+
+    // Engine tracing on: the ingress span is the engine's parent.
+    assert_eq!(post_traced(address, 1, &context).await, StatusCode::OK);
+    let spans = ingress_spans(&capture, 1).await;
+    assert_eq!(spans.len(), 1);
+    let span = &spans[0];
+    assert_eq!(span.kind, capyctl_trace::Kind::Server);
+    assert_eq!(span.cx.trace_id, hex_bytes::<16>(ROUTER_TRACE));
+    assert_eq!(span.parent, Some(hex_bytes::<8>(ROUTER_SPAN)));
+    assert_eq!(span.attr("capyctl.deployment"), Some("traced"));
+    assert_eq!(span.attr("capyctl.outcome"), Some("completed"));
+    assert_eq!(span.attr("http.route"), Some("/v1/chat/completions"));
+    assert_eq!(
+        span.attr("capyctl.request_id"),
+        Some("01JAAAAAAAAAAAAAAAAAAAAAAA")
+    );
+    let sent = std::mem::take(&mut *seen.lock().unwrap());
+    assert_eq!(
+        sent,
+        [(
+            Some(format!(
+                "00-{ROUTER_TRACE}-{}-01",
+                hex::encode(span.cx.span_id)
+            )),
+            Some("vendor=1".to_owned()),
+        )]
+    );
+
+    // An unsampled router context: still propagated, flag clear.
+    let unsampled = format!("00-{ROUTER_TRACE}-{ROUTER_SPAN}-00");
+    assert_eq!(
+        post_traced(address, 1, &[("traceparent", &unsampled)]).await,
+        StatusCode::OK
+    );
+    let (header, state) = seen.lock().unwrap().remove(0);
+    let header = header.unwrap();
+    assert!(header.starts_with(&format!("00-{ROUTER_TRACE}-")) && header.ends_with("-00"));
+    assert_ne!(header, unsampled, "the ingress span is the parent");
+    assert_eq!(state, None);
+
+    // Engine tracing off: the span is recorded, the engine gets nothing.
+    capture.clear();
+    assert_eq!(post_traced(address, 3, &context).await, StatusCode::OK);
+    let spans = ingress_spans(&capture, 1).await;
+    assert_eq!(spans[0].parent, Some(hex_bytes::<8>(ROUTER_SPAN)));
+    assert_eq!(spans[0].attr("capyctl.deployment"), Some("plain"));
+    assert_eq!(std::mem::take(&mut *seen.lock().unwrap()), [(None, None)]);
+
+    // Malformed (uppercase hex): ignored, never refused; a new trace.
+    capture.clear();
+    let malformed = router_parent().to_uppercase();
+    assert_eq!(
+        post_traced(
+            address,
+            1,
+            &[("traceparent", &malformed), ("tracestate", "vendor=1")]
+        )
+        .await,
+        StatusCode::OK
+    );
+    let spans = ingress_spans(&capture, 1).await;
+    assert_eq!(spans[0].parent, None);
+    assert_ne!(spans[0].cx.trace_id, hex_bytes::<16>(ROUTER_TRACE));
+    let (header, state) = seen.lock().unwrap().remove(0);
+    assert_eq!(header, Some(spans[0].cx.traceparent()));
+    assert_eq!(state, None);
+    assert!(capture.disallowed_keys().is_empty());
+    tasks.iter().for_each(|t| t.abort());
+}
+
+// T48 (ADR 0037 §6): a host without an endpoint records nothing and passes
+// the router's context on unchanged, and only to a launch with engine
+// tracing.
+#[tokio::test]
+async fn a_host_without_an_endpoint_passes_the_router_context_on_unchanged() {
+    let (address, seen, tasks) = trace_fixture(capyctl_trace::Tracing::off()).await;
+    let parent = router_parent();
+    let context = [("traceparent", parent.as_str()), ("tracestate", "vendor=1")];
+    assert_eq!(post_traced(address, 1, &context).await, StatusCode::OK);
+    assert_eq!(post_traced(address, 3, &context).await, StatusCode::OK);
+    assert_eq!(
+        std::mem::take(&mut *seen.lock().unwrap()),
+        [
+            (Some(parent.clone()), Some("vendor=1".to_owned())),
+            (None, None)
+        ]
+    );
+    tasks.iter().for_each(|t| t.abort());
+}

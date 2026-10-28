@@ -975,6 +975,113 @@ variables are reserved. A deployment that passes another KV connector runs
 without LMCache (`kv_transfer_config_set`)
 ([engine options](engine-flags.md)).
 
+## Engine tracing
+
+With [tracing](../operations/configuration.md#tracing) on, CapyCTL's own
+spans end at its forward to the engine. vLLM and SGLang can add their own
+spans below it, sent to the same collector, when the host allows it:
+
+```yaml
+# host.yaml (standalone: host.observability.tracing.engines, with the
+# endpoint in server.observability.tracing)
+observability:
+  tracing:
+    endpoint: http://127.0.0.1:4318/v1/traces
+    engines: on
+```
+
+`engines: on` needs the endpoint on loopback (`localhost`, `127.0.0.0/8` or
+`::1`), usually an OpenTelemetry Collector on the same machine, which can
+forward over TLS with its own credentials. The engines export without TLS, and
+keeping their export on the machine keeps the promise that engines report
+nothing off the host by CapyCTL's doing. Any other endpoint refuses the
+host's start.
+
+What CapyCTL renders on a launch with engine tracing:
+
+| Engine | Options | Variables |
+|---|---|---|
+| vLLM 0.31.0 or newer | `--otlp-traces-endpoint <endpoint>` (never `--collect-detailed-traces`) | `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf`, `OTEL_SERVICE_NAME=vllm`, `OTEL_RESOURCE_ATTRIBUTES=capyctl.deployment=<name>,capyctl.instance=<index>` |
+| SGLang 0.5.22 or newer | `--enable-trace --otlp-traces-endpoint <endpoint> --otlp-service-name sglang` | `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf`, `SGLANG_TRACE_LEVEL=1` |
+
+The endpoint is passed exactly as the host states it. SGLang runs at trace
+level 1 (important steps only), because its documentation warns that finer
+levels cost throughput at large batch sizes; `SGLANG_TRACE_ASYNC` stays off,
+so no exporter process joins the launch. The engine receives `traceparent`
+(and the caller's `tracestate`) with each request, with CapyCTL's forward
+span as parent, or the host ingress's span on another machine. No other
+engine, and no launch without engine tracing, receives a trace header.
+
+Each instance says what it runs with: `engine tracing: on`, or
+`engine tracing: off (<reason>)` in `capyctl status deployment <name>`
+(`engine_tracing` with `state` and `reason` in JSON). The decision is made
+when the instance launches and holds for that launch. The reasons, in the
+order CapyCTL checks them:
+
+- `host_off`: the host's `engines` is `off` (the default), or it names no
+  endpoint.
+- `engine_unsupported`: llama.cpp, TensorFold, a custom engine, vLLM before
+  0.31.0 or SGLang before 0.5.22.
+- `group`: the model runs across machines; groups run without engine tracing
+  until a live check covers them. A model on several GPUs of one machine is
+  one launch and can trace.
+- `retention_zero`: the deployment or the machine sets `retention: zero`
+  ([zero data retention](../operations/data-retention.md#zero-data-retention)).
+- `not_installed`: the engine's environment lacks a package a traced engine
+  imports: `opentelemetry-api`, `opentelemetry-sdk`, `opentelemetry-proto`,
+  `opentelemetry-exporter-otlp-proto-common`, and the HTTP and gRPC OTLP
+  exporters with their transports (`requests`, `grpcio`). Both engines import
+  the two exporters together, so the gRPC one is needed even though CapyCTL
+  uses HTTP. CapyCTL checks the installed files and runs nothing; the engine
+  starts without tracing rather than failing. For SGLang the packages are its
+  `tracing` extra.
+
+**Owned options and names.** CapyCTL renders engine tracing itself, so the
+engines' tracing options are refused in `extra_args` and in a profile's
+arguments, in every spelling, whatever the host approves: vLLM
+`--otlp-traces-endpoint` and `--collect-detailed-traces`; SGLang
+`--enable-trace`, `--otlp-traces-endpoint`, `--otlp-service-name` and
+`--trace-modules`. The variables `OTEL_*`, `SGLANG_TRACE_*`, `SGLANG_OTLP_*`,
+`TRACEPARENT` and `TRACESTATE` (in any case) are refused in a profile or a
+deployment (`engine_env_reserved:<name>`), on every engine. An installation
+that approved `--otlp-traces-endpoint` before this release no longer admits
+it: remove it from the deployment and set `observability.tracing.engines: on`
+on the host instead ([engine options](engine-flags.md)).
+
+**SGLang's machine ID.** SGLang's per-thread spans carry the machine's
+`/etc/machine-id` in full as the attribute `host_id`, and its first 8
+characters in the span name (`... (host:0123abcd | pid:4242)`). With the
+endpoint on loopback, the ID reaches your own collector and goes wherever the
+collector sends it. The machine-id manual asks that the ID not be exposed on
+the network. To remove it before the collector forwards anything, use the
+`attributes` and `transform` processors of the OpenTelemetry Collector
+contrib distribution:
+
+```yaml
+processors:
+  attributes/drop-host-id:
+    actions:
+      - key: host_id
+        action: delete
+  transform/drop-host-id:
+    trace_statements:
+      - context: span
+        statements:
+          - replace_pattern(name, "host:[0-9a-f]+ \\| ", "")
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [attributes/drop-host-id, transform/drop-host-id]
+      exporters: [otlphttp]
+```
+
+Neither engine's spans hold prompt
+or output text; they carry token counts, sampling parameters, the served
+model name, finish reasons and the engine's request ID
+([Traces](../operations/data-retention.md#traces)).
+
 ## Tool calls and reasoning
 
 vLLM and SGLang return structured `tool_calls` and a separate reasoning trace

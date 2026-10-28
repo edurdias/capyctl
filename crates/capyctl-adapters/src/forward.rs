@@ -590,6 +590,10 @@ impl ChatSink for Collecting<'_> {
     fn request_id(&self) -> Option<&str> {
         self.observer.request_id()
     }
+    /// ADR 0037 §6: and its trace headers.
+    fn trace_headers(&self) -> Option<&crate::traits::TraceHeaders> {
+        self.observer.trace_headers()
+    }
     async fn send(&mut self, chunk: String) -> Result<(), DeliveryFailed> {
         self.observer.collected(&chunk);
         self.chunks.push(chunk);
@@ -793,12 +797,15 @@ impl ChatHttp {
     /// `Rejected`, and its complete error answer is `EngineError`. Any other
     /// transport error is `unverified()`. The caller judges every other
     /// response. `request_id` goes as [`CAPYCTL_REQUEST_ID_HEADER`] (ADR 0032
-    /// §2: to a host ingress only).
+    /// §2: to a host ingress only). `trace` goes as the W3C `traceparent` and
+    /// `tracestate` headers (ADR 0037 §6: the router decided this lane
+    /// carries them).
     async fn post(
         &self,
         url: &reqwest::Url,
         request: &Value,
         request_id: Option<&str>,
+        trace: Option<&crate::traits::TraceHeaders>,
         unverified: fn() -> AdapterError,
     ) -> Result<reqwest::Response, AdapterError> {
         let mut send = self.client.post(url.clone()).json(request);
@@ -807,6 +814,12 @@ impl ChatHttp {
         }
         if let Some(id) = request_id {
             send = send.header(CAPYCTL_REQUEST_ID_HEADER, id);
+        }
+        if let Some(trace) = trace {
+            send = send.header("traceparent", &trace.traceparent);
+            if let Some(state) = &trace.tracestate {
+                send = send.header("tracestate", state);
+            }
         }
         let response = send.send().await.map_err(|error| {
             // SPEC §10, ADR 0013 §10: a connection that was never established
@@ -846,6 +859,15 @@ impl ChatHttp {
     /// since the engine may have run the request. No wall-clock bound of its
     /// own: the router bounds the whole exchange by the request deadline.
     pub(crate) async fn decide(&self, body: &Value) -> Result<Value, AdapterError> {
+        self.decide_traced(body, None).await
+    }
+
+    /// As [`ChatHttp::decide`], carrying `trace` (ADR 0037 §6).
+    pub(crate) async fn decide_traced(
+        &self,
+        body: &Value,
+        trace: Option<&crate::traits::TraceHeaders>,
+    ) -> Result<Value, AdapterError> {
         validate_decision_request(body)?;
         let public = body
             .get("model")
@@ -855,7 +877,7 @@ impl ChatHttp {
         let mut request = body.clone();
         request["model"] = json!(self.model);
         let response = self
-            .post(&self.decisions, &request, None, decision_uncertain)
+            .post(&self.decisions, &request, None, trace, decision_uncertain)
             .await?;
         if !response.status().is_success() || !content_type_is(&response, "application/json") {
             return Err(decision_uncertain());
@@ -930,7 +952,13 @@ impl ChatHttp {
             _ => None,
         };
         let response = self
-            .post(&self.endpoint, &request, header, uncertain)
+            .post(
+                &self.endpoint,
+                &request,
+                header,
+                sink.trace_headers(),
+                uncertain,
+            )
             .await?;
         if !response.status().is_success() || !content_type_is(&response, "text/event-stream") {
             return Err(uncertain());
@@ -1249,6 +1277,13 @@ impl crate::traits::ChatForward for EngineForward {
     }
     async fn forward_decision(&self, body: &Value) -> Result<Value, AdapterError> {
         self.0.decide(body).await
+    }
+    async fn forward_decision_traced(
+        &self,
+        body: &Value,
+        trace: Option<&crate::traits::TraceHeaders>,
+    ) -> Result<Value, AdapterError> {
+        self.0.decide_traced(body, trace).await
     }
     async fn forward_chat_stream(
         &self,
@@ -3133,6 +3168,96 @@ mod tests {
             Err(AdapterError::PolicyDenied)
         ));
         assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
+    }
+
+    /// ADR 0037 §6: a sink handing the forwarder trace headers.
+    struct Tracing {
+        trace: Option<crate::traits::TraceHeaders>,
+    }
+    #[async_trait::async_trait]
+    impl crate::traits::ChatSink for Tracing {
+        fn trace_headers(&self) -> Option<&crate::traits::TraceHeaders> {
+            self.trace.as_ref()
+        }
+        async fn send(&mut self, _chunk: String) -> Result<(), crate::traits::DeliveryFailed> {
+            Ok(())
+        }
+    }
+
+    // T48 (ADR 0037 §6): the trace headers the router hands a forward are sent
+    // as `traceparent` and `tracestate` on a stream, a collected answer and a
+    // decision; without them nothing is sent, and the request is otherwise
+    // the same.
+    #[tokio::test]
+    async fn trace_headers_are_sent_only_when_given() {
+        type Headers = std::sync::Arc<std::sync::Mutex<Vec<axum::http::HeaderMap>>>;
+        let seen: Headers = Default::default();
+        let record = seen.clone();
+        let record_decision = seen.clone();
+        let router = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move |headers: axum::http::HeaderMap| {
+                    record.lock().unwrap().push(headers);
+                    async {
+                        (
+                            [("content-type", "text/event-stream")],
+                            completed_sse("stop"),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1/systemone",
+                axum::routing::post(move |headers: axum::http::HeaderMap| {
+                    record_decision.lock().unwrap().push(headers);
+                    async { axum::Json(json!({"model": "m", "answers": {}})) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let forward = super::engine_forwarder(
+            format!("http://{address}").parse().unwrap(),
+            "m".into(),
+            None,
+            crate::forward::CacheSalt::for_launch(Some("sglang"), "dep-1", 1),
+        );
+        let trace = crate::traits::TraceHeaders {
+            traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into(),
+            tracestate: Some("vendor=1".into()),
+        };
+        let request = json!({"model":"public","messages":[]});
+        for given in [Some(trace.clone()), None] {
+            seen.lock().unwrap().clear();
+            let mut sink = Tracing {
+                trace: given.clone(),
+            };
+            forward
+                .forward_chat_stream_async(&request, &mut sink)
+                .await
+                .unwrap();
+            forward
+                .forward_chat_observed(&request, &mut sink)
+                .await
+                .unwrap();
+            let _ = forward
+                .forward_decision_traced(&decision(json!({})), given.as_ref())
+                .await;
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 3);
+            for headers in &seen {
+                let header = |name: &str| headers.get(name).map(|v| v.to_str().unwrap().to_owned());
+                assert_eq!(
+                    header("traceparent"),
+                    given.as_ref().map(|t| t.traceparent.clone())
+                );
+                assert_eq!(
+                    header("tracestate"),
+                    given.as_ref().and_then(|t| t.tracestate.clone())
+                );
+            }
+        }
     }
 
     // T17 (ADR 0032 §4): SGLang's graceful abort ends a request with a final

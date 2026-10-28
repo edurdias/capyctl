@@ -68,3 +68,38 @@ async fn the_inference_listener_view_is_authenticated() {
         .unwrap();
     assert_eq!(query.status(), 400);
 }
+
+// T48 (ADR 0037 §13): the same read carries the role's tracing status, read
+// live at each request; null until the role sets where it is read.
+#[tokio::test]
+async fn the_view_carries_the_roles_live_tracing_status() {
+    let view = Arc::new(InferenceListenerView::default());
+    let router = inference_listener_router(
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+        view.clone(),
+    );
+    const PATH: &str = "/management/v1/inference-listener";
+    let read = || async {
+        body(
+            router
+                .clone()
+                .oneshot(get(PATH, Some(MANAGEMENT)))
+                .await
+                .unwrap(),
+        )
+        .await["tracing"]
+            .clone()
+    };
+    assert!(read().await.is_null());
+    let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let dropped = dropped.clone();
+        view.set_tracing(Arc::new(move || {
+            serde_json::json!({"on": true, "endpoint": "http://127.0.0.1:4318/v1/traces",
+                "spans_dropped": dropped.load(std::sync::atomic::Ordering::Relaxed)})
+        }));
+    }
+    assert_eq!(read().await["spans_dropped"], 0);
+    dropped.store(7, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(read().await["spans_dropped"], 7);
+}

@@ -289,6 +289,13 @@ fn hosts(value: &Value) -> String {
                 text(&profile["installation"]["lmcache"]["observed_digest"])
             ));
         }
+        // ADR 0037 §13: a host role whose latest report says tracing is on
+        // gets its line; off (the default) stays out of the table and is in
+        // the JSON output.
+        if host["tracing"]["on"] == true {
+            let line = crate::role_tracing::status_line(host).unwrap_or_default();
+            out.push_str(&format!("{}: {line}\n", clean(name)));
+        }
     }
     out
 }
@@ -720,6 +727,24 @@ fn status(value: &Value, names: &HostNames) -> String {
             out.push_str(&line);
         }
     }
+    // ADR 0037 §13: each instance's engine tracing, on or off with why.
+    let tracing: Vec<String> = d["instances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(engine_tracing_line)
+        .collect();
+    if !tracing.is_empty() {
+        out.push('\n');
+        for line in tracing {
+            out.push_str(&line);
+        }
+    }
+    // ADR 0037 §13: the role's own tracing, `tracing: off` or on with its
+    // endpoint, spans dropped and the last export error.
+    if let Some(line) = crate::role_tracing::status_line(d) {
+        out.push_str(&format!("\n{line}\n"));
+    }
     if let Some(engine) = d["engine"].as_str() {
         out.push_str(&format!("\nEngine  {engine}\n"));
     } else if d["installation"].is_object() {
@@ -835,6 +860,20 @@ fn topology_line(instance: &Value) -> Option<String> {
         "Instance {}  TP {size}{on}\n",
         text(&instance["index"])
     ))
+}
+
+/// ADR 0037 §13: one instance's engine tracing line, absent when status has
+/// none: `Instance 0  engine tracing: on` or `... off (<reason>)`.
+fn engine_tracing_line(instance: &Value) -> Option<String> {
+    let tracing = instance.get("engine_tracing").filter(|t| t.is_object())?;
+    let index = text(&instance["index"]);
+    Some(match tracing["state"].as_str() {
+        Some("on") => format!("Instance {index}  engine tracing: on\n"),
+        _ => format!(
+            "Instance {index}  engine tracing: off ({})\n",
+            text(&tracing["reason"])
+        ),
+    })
 }
 
 /// ADR 0033 §9: one instance's LMCache line, absent when status has none:
@@ -1403,6 +1442,79 @@ mod tests {
             )),
             "{out}"
         );
+    }
+
+    // T48 (ADR 0037 §13): each instance whose status carries
+    // `engine_tracing` gets `engine tracing: on` or `off (<reason>)`, after
+    // the instances table; an instance without it gets no line.
+    #[test]
+    fn status_shows_each_instances_engine_tracing() {
+        let instance = |index: u32, tracing: Option<Value>| {
+            let mut i = json!({"index": index, "host_id": "01HOSTA",
+                "observed_state": "ready", "lifecycle": "active"});
+            if let Some(tracing) = tracing {
+                i["engine_tracing"] = tracing;
+            }
+            i
+        };
+        let d = json!({"name": "m", "observed_state": "ready", "instances": [
+            instance(0, Some(json!({"state": "on"}))),
+            instance(1, Some(json!({"state": "off", "reason": "retention_zero"}))),
+            instance(2, None),
+        ]});
+        let out = render(View::Status, &d, &names());
+        assert!(
+            out.contains(
+                "\nInstance 0  engine tracing: on\n\
+                 Instance 1  engine tracing: off (retention_zero)\n"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("Instance 2  engine tracing"), "{out}");
+        let none = json!({"name": "m", "observed_state": "ready",
+            "instances": [instance(0, None)]});
+        assert!(!render(View::Status, &none, &names()).contains("engine tracing"));
+    }
+
+    // T48 (ADR 0037 §13): status shows the role's tracing line when the
+    // server reports one, and nothing when it does not (an older server).
+    #[test]
+    fn status_shows_the_roles_tracing() {
+        let mut d = json!({"name": "m", "observed_state": "ready", "instances": []});
+        assert!(!render(View::Status, &d, &names()).contains("tracing:"));
+        d["tracing"] = json!({"on": false});
+        assert!(render(View::Status, &d, &names()).contains("\ntracing: off\n"));
+        d["tracing"] = json!({"on": true, "endpoint": "http://127.0.0.1:4318/v1/traces",
+            "spans_dropped": 2, "last_export_error": "timeout"});
+        let out = render(View::Status, &d, &names());
+        assert!(
+            out.contains(
+                "\ntracing: on → http://127.0.0.1:4318/v1/traces, spans dropped 2, last export error: timeout\n"
+            ),
+            "{out}"
+        );
+    }
+
+    // T48 (ADR 0037 §13): `hosts` shows each host role's tracing below the
+    // table, from the `tracing` its latest report carried; none without it.
+    #[test]
+    fn hosts_show_each_hosts_tracing() {
+        let out = render(
+            View::Hosts,
+            &json!({"hosts": [
+                {"host_id": "01A", "name": "a", "tracing": {"on": true,
+                    "endpoint": "http://127.0.0.1:4318/v1/traces", "spans_dropped": 0}},
+                {"host_id": "01B", "name": "b", "tracing": {"on": false}},
+                {"host_id": "01C", "name": "c", "tracing": null},
+            ]}),
+            &HostNames::new(),
+        );
+        assert!(
+            out.contains("a: tracing: on → http://127.0.0.1:4318/v1/traces, spans dropped 0\n"),
+            "{out}"
+        );
+        assert!(!out.contains("b: tracing"), "{out}");
+        assert!(!out.contains("c: tracing"), "{out}");
     }
 
     #[test]

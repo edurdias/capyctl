@@ -17,7 +17,7 @@ use std::{
 };
 use tower::ServiceExt;
 
-// T06 T33: the listing carries the server's version, and per host the
+// T06 T33 T48: the listing carries the server's version, and per host the
 // recorded version, compatibility and reason; a host never seen since the
 // policy shows none.
 #[tokio::test]
@@ -113,4 +113,10 @@ async fn list_hosts_shows_versions_and_upgrade_required() {
     let unseen = host("host-b");
     assert!(unseen["compatibility"].is_null());
     assert!(unseen["binary_version"].is_null());
+    // T48 (ADR 0037 §13): every row names the host's tracing status, null
+    // while no session of the host reported one.
+    for row in [&old, &unseen] {
+        assert!(row.as_object().unwrap().contains_key("tracing"), "{row}");
+        assert!(row["tracing"].is_null());
+    }
 }

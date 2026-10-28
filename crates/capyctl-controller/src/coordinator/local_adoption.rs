@@ -194,6 +194,9 @@ pub(super) fn factory(
             tools: Some(tools),
             settle: None,
             lmcache,
+            // ADR 0037 §7: an adopted launch's decision was recorded when it
+            // launched; adoption decides nothing again.
+            engine_tracing: None,
         }))
     })
 }

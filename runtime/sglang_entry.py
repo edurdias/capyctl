@@ -106,8 +106,11 @@ _PARSER_SETTINGS = ("tool_call_parser", "reasoning_parser")
 # ADR 0033 §4: `lmcache_config_file`, the launch's owner-only LMCache
 # connector file, is present only on a launch whose LMCache server is up; it
 # turns on the reserved `enable_lmcache` (sglang_server_args.py).
+# ADR 0037 §7: `trace_endpoint`, the host's loopback OTLP/HTTP endpoint, is
+# present only on a traced single launch; it turns on the reserved
+# `enable_trace`, `otlp_traces_endpoint` and `otlp_service_name`.
 _OPTIONAL_SETTINGS = _PARSER_SETTINGS + ("max_mamba_cache_size", "group", "draft_model_path",
-                                         "lmcache_config_file")
+                                         "lmcache_config_file", "trace_endpoint")
 # ADR 0028 §10: a member's group object (crates/capyctl-adapters/src/sglang/
 # args.rs `public_group`); `gloo_socket_ifname` only when the host resolved one.
 _GROUP_KEYS = ("tp_size", "pp_size", "nnodes", "node_rank", "dist_init_addr", "host_ip")
@@ -242,6 +245,13 @@ def _validate_settings(settings):
         # ADR 0033 §2: one private server on one machine; never a group member.
         if (not config.startswith("/") or "group" in settings
                 or any(part in (".", "..") for part in config.split("/"))):
+            _reject()
+    if "trace_endpoint" in settings:
+        endpoint = _text(settings["trace_endpoint"], 4096)
+        # ADR 0037 §7: an http(s) URL without whitespace; never a group
+        # member (groups run without engine tracing).
+        if (not endpoint.startswith(("http://", "https://")) or "group" in settings
+                or any(char.isspace() for char in endpoint)):
             _reject()
     for name in _PARSER_SETTINGS:
         if name in settings:

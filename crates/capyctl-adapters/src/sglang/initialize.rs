@@ -168,6 +168,11 @@ async fn launch(
                 .map_err(|e| RuntimeError::Uncertain(format!("LMCache configuration: {e}")))?;
         launch.rendered = launch.rendered.with_lmcache_config_file(&file)?;
     }
+    // ADR 0037 §7: a launch decided traced names its collector in the
+    // public descriptor; the entry renders and pins the owned options.
+    if let Some(endpoint) = adapter.trace_endpoint() {
+        launch.rendered = launch.rendered.with_trace_endpoint(endpoint)?;
+    }
 
     // SPEC §13.3: the private descriptor and the two credentials ride protected
     // descriptors the launcher hands the child; nothing enters argv or env.

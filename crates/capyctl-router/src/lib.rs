@@ -22,6 +22,8 @@ pub mod switch;
 pub mod engine_metrics;
 // SPEC §17 (M80): per-request timings and their bounded distributions.
 pub mod timing;
+// ADR 0037 §§2, 3: one request's spans.
+pub(crate) mod trace;
 
 pub use switch::WakeJoin;
 
@@ -60,6 +62,9 @@ pub struct RouterDeps {
     /// the same non-READY deployment join ONE wake — no double-spawn, no
     /// duplicate Start operations.
     pub activation_join: Arc<WakeJoin<(StatusCode, Json<serde_json::Value>)>>,
+    /// ADR 0037 §1: the role's tracing; off unless its document names an
+    /// endpoint, and then nothing is read, recorded or sent.
+    pub tracing: capyctl_trace::Tracing,
 }
 
 #[derive(Clone)]
@@ -194,6 +199,10 @@ async fn receive(
             "missing or valid api key required",
         ));
     }
+    // ADR 0037 §2: the trace headers are read only after authentication, so
+    // an unauthenticated client cannot make CapyCTL record or export
+    // anything; a malformed one is ignored, never refused.
+    ids.begin_trace(&deps.tracing, headers, endpoint);
     // SPEC §10 (owner decision 2026-10-19): a malformed `X-Request-Id` is the
     // client's error, refused before the body is read.
     ids.check()?;
@@ -233,6 +242,9 @@ async fn chat_completions(
 ) -> axum::response::Response {
     let ids = Arc::new(request_id::RequestIds::read(&headers));
     let outcome = chat_completion(&state.deps, &headers, body, &ids).await;
+    // ADR 0037 §3: the request span ends with the answer (a stream's at its
+    // own end).
+    ids.end_trace(&outcome);
     ids.stamp(outcome)
 }
 
@@ -257,8 +269,16 @@ async fn chat_completion(
         // slot in arrival order within its deadline. Accounting is registered
         // before the response is built; the stream guard releases when the
         // backend stream ends.
-        let (deployment_id, guard, view) =
-            chat::admit_timed(deps, endpoint, &model, body_bytes, received, &mut timing).await?;
+        let (deployment_id, guard, view) = chat::admit_timed(
+            deps,
+            endpoint,
+            &model,
+            body_bytes,
+            received,
+            &mut timing,
+            ids,
+        )
+        .await?;
         // ADR 0013 §10 (I3): choose an instance; SPEC §10: its durable lease is
         // held from before the first byte reaches the engine until the backend
         // stream ends. Refusals before any offer are ordinary HTTP errors.
@@ -274,6 +294,10 @@ async fn chat_completion(
         let header = timing.header_enabled().then(|| timing.header_value());
         let bounds = stream::StreamBounds::for_request(received, &deps.inflight.waiting.limits());
         let sse = stream::stream_planned_timed(first, Some(plan), v, guard, timing, bounds);
+        // ADR 0037 §3: the stream ends the request span at its last byte.
+        if let Some(trace) = ids.trace() {
+            trace.defer();
+        }
         let mut response = sse.into_response();
         if let Some(value) = header.and_then(|h| h.parse().ok()) {
             response.headers_mut().insert(timing::TIMING_HEADER, value);
@@ -291,6 +315,8 @@ async fn chat_completion(
         ids.clone(),
     )
     .await?;
+    // ADR 0037 §5: the answer's token counts and finish reasons.
+    trace::record_answer(ids, &json);
     // SPEC §17 (owner decision 2026-10-09): every answer carries its figures.
     engine_metrics::attach(&mut json, &timing);
     Ok(with_timing(Json(json).into_response(), &timing))
@@ -311,6 +337,7 @@ async fn systemone(
 ) -> axum::response::Response {
     let ids = Arc::new(request_id::RequestIds::read(&headers));
     let outcome = decision(&state.deps, &headers, body, &ids).await;
+    ids.end_trace(&outcome);
     ids.stamp(outcome)
 }
 
@@ -333,6 +360,7 @@ async fn decision(
         ids.clone(),
     )
     .await?;
+    trace::record_answer(ids, &json);
     engine_metrics::attach_decision(&mut json, &timing);
     Ok(with_timing(Json(json).into_response(), &timing))
 }

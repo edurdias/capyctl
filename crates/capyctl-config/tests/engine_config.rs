@@ -468,10 +468,8 @@ fn sensitive_options_need_named_host_approval() {
         ("vllm", json!(["--worker-extension-cls", "pkg.Ext"])),
         ("vllm", json!(["--tool-parser-plugin", "/srv/plugins/p.py"])),
         ("vllm", json!(["--hf-token", "hf_secret_token_value"])),
-        (
-            "vllm",
-            json!(["--otlp-traces-endpoint", "http://collector:4317"]),
-        ),
+        // ADR 0037 §7 (owner decision 2026-10-27 q7): `--otlp-traces-endpoint`
+        // is owned now, refused whatever the host approves (not listed here).
         ("vllm", json!(["--load-format", "runai_streamer"])),
         ("vllm", json!(["--download-dir", "/srv/cache"])),
         ("vllm", json!(["--future-sidecar-port", "9100"])),
@@ -523,6 +521,42 @@ fn sensitive_options_need_named_host_approval() {
     resolve_effective(&deployment, &host).expect("ordinary");
     // Its abbreviation of the sensitive one is not.
     extra_args_error("vllm", json!(["--reasoning-parser-plug", "x"]));
+}
+
+/// ADR 0037 §7 (owner decision 2026-10-27, question 7): the engines' tracing
+/// options are CapyCTL's; an approval that admitted `--otlp-traces-endpoint`
+/// before no longer does. Messages name the option, never the value.
+// T48 T21
+#[test]
+fn an_approved_tracing_endpoint_is_refused_as_owned() {
+    for (engine, args) in [
+        (
+            "vllm",
+            json!(["--otlp-traces-endpoint", "http://collector:4317"]),
+        ),
+        (
+            "vllm",
+            json!(["--otlp_traces_endpoint=http://collector:4317"]),
+        ),
+        ("vllm", json!(["--collect-detailed-traces", "all"])),
+        (
+            "sglang",
+            json!(["--otlp-traces-endpoint", "http://collector:4317"]),
+        ),
+        ("sglang", json!(["--enable-trace"])),
+    ] {
+        let (deployment, mut host) = with_extra_args(engine, args.clone());
+        host["runtime_profiles"]["local"]["security"]["approved_options"] = json!([
+            "--otlp-traces-endpoint",
+            "--collect-detailed-traces",
+            "--enable-trace"
+        ]);
+        let error = resolve_effective(&deployment, &host).unwrap_err();
+        assert_eq!(error.path, "engine_config.extra_args", "{args}: {error}");
+        let text = error.to_string();
+        assert!(text.contains("reserved option"), "{args}: {text}");
+        assert!(!text.contains("collector"), "{text}");
+    }
 }
 
 /// ADR 0014 §8: vLLM `--speculative-config` is a JSON object. With named

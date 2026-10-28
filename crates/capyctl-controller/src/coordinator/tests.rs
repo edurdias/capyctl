@@ -271,6 +271,7 @@ fn spawn_fake(
                 tools: None,
                 settle: None,
                 lmcache: None,
+                engine_tracing: None,
             }))
         }),
     )
@@ -314,6 +315,7 @@ fn test_driver(gate: Arc<Gate>) -> Arc<Driver> {
         tools: None,
         settle: None,
         lmcache: None,
+        engine_tracing: None,
     })
 }
 async fn stopped(worker: &OwnedCoordinator) -> WorkerStatus {
@@ -2391,6 +2393,7 @@ mod native {
             tools: Some(tools),
             settle: None,
             lmcache: None,
+            engine_tracing: None,
         })
     }
 

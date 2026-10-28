@@ -84,6 +84,13 @@ Every `LMCACHE_*` variable is reserved on every engine: LMCache's
 vLLM helper reads its configuration from the environment after any file, and
 CapyCTL renders LMCache's settings itself.
 
+The engines' tracing variables are reserved on every engine too: `OTEL_*`,
+which the OpenTelemetry SDK reads for its endpoint, headers, sampler and
+resource, `SGLANG_TRACE_*`, `SGLANG_OTLP_*`, and `TRACEPARENT` and
+`TRACESTATE` (vLLM reads a `traceparent` from its environment as the parent
+of every request). CapyCTL renders engine tracing from the host's
+`observability.tracing.engines` ([Engine tracing](engines.md#engine-tracing)).
+
 ## vLLM 0.30 and 0.31
 
 | Need | Option | Class | CapyCTL |
@@ -118,6 +125,7 @@ CapyCTL renders LMCache's settings itself.
 | CPU KV offload | `--kv-offloading-backend`, `--kv-offloading-size` | extra | Uses host memory that CapyCTL does not count. |
 | Plugins | `--io-processor-plugin`, `--worker-extension-cls`, `--logits-processors` | approval | They load code. `VLLM_PLUGINS` is set by CapyCTL and cannot be changed. |
 | Compilation settings | `--compilation-config` | approval | A JSON value that no check reads. |
+| Tracing | `--otlp-traces-endpoint`, `--collect-detailed-traces` | reserved | CapyCTL renders `--otlp-traces-endpoint` on vLLM 0.31.0 or newer when the host sets `observability.tracing.engines: on`, and never `--collect-detailed-traces` ([Engine tracing](engines.md#engine-tracing)). Refused whatever the host approves, including an earlier approval of `--otlp-traces-endpoint`; `capyctl engine flags` lists them as owned. |
 
 ## SGLang 0.5.21
 
@@ -157,6 +165,7 @@ CapyCTL renders LMCache's settings itself.
 | Plugins, custom code | `--custom-weight-loader`, `--enable-custom-logit-processor` | approval | They load code. `SGLANG_PLUGINS` is set by CapyCTL and cannot be changed: SGLang loads no plugin. |
 | Loader settings | `--model-loader-extra-config` | approval | A JSON value that no check reads. |
 | Dumps to disk, watermark key | `--watermark-config`, `--debug-tensor-dump-output-folder`, `--debug-tensor-dump-layers`, `--debug-tensor-dump-input-file`, `--msprobe-dump-config`, `--export-metrics-to-file`, `--export-metrics-to-file-dir`, `--spec-trace-dir` | reserved | Not supported, whatever the host approves. They write requests, tensors or debug data to disk, or (0.5.22) read the key that marks every answer. Every `--debug-tensor-dump-*` option is reserved too, and so are the `DUMPER_*`, `SGLANG_DUMP*`, `SGLANG_KERNEL_API_*` and `SGLANG_CUDA_COREDUMP*` variables and `SGLANG_DSPARK_DEBUG_DUMP`, `SGLANG_DSPARK_ENABLE_SPS_RECORD`, `SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR` and `SGLANG_TORCH_PROFILER_DIR`. |
+| Tracing | `--enable-trace`, `--otlp-traces-endpoint`, `--otlp-service-name`, `--trace-modules` | reserved | CapyCTL renders the first three on SGLang 0.5.22 or newer when the host sets `observability.tracing.engines: on`; `--trace-modules` keeps SGLang's default ([Engine tracing](engines.md#engine-tracing)). Refused whatever the host approves, including an earlier approval of `--otlp-traces-endpoint`; `capyctl engine flags` lists them as owned. |
 
 **`--enable-linear-replayssm-spec`.** This option exists in SGLang 0.5.21.
 It was checked in the published wheel

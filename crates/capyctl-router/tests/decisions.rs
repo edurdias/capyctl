@@ -109,6 +109,7 @@ impl capyctl_controller::LifecyclePort for Authority {
                 deployment_id: DEPLOYMENT.into(),
                 revision: 1,
                 request_abort: false,
+                engine_trace: false,
             }),
         )
     }
@@ -314,6 +315,7 @@ fn stack(api: DeploymentApi, endpoint: &str) -> (Arc<Authority>, RouterDeps, axu
         api_key: None,
         inflight: Arc::new(capyctl_router::admission::InFlight::default()),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: capyctl_trace::Tracing::off(),
     };
     let router = capyctl_router::serve_router(deps.clone());
     (authority, deps, router)
@@ -347,6 +349,7 @@ async fn a_fake_decision_model_becomes_ready_and_answers_through_the_router() {
         api_key: None,
         inflight: Arc::new(capyctl_router::admission::InFlight::default()),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: capyctl_trace::Tracing::off(),
     });
     let (status, body) = send(
         &router,

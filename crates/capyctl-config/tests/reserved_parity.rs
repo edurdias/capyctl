@@ -118,6 +118,8 @@ fn sglang_reserved_names_match_the_argument_mapper() {
     python.extend(quoted_block(&source, "_RESERVED_BOUND = (", ")"));
     // SPEC §8.2, T21: the dump destinations, on both sides too.
     python.extend(quoted_block(&source, "_RESERVED_DUMP = (", ")"));
+    // ADR 0037 §7: the tracing fields, on both sides too.
+    python.extend(quoted_block(&source, "_RESERVED_TRACING = (", ")"));
     let python_families = quoted_block(&source, "_RESERVED_FAMILIES = (", ")");
     let rust: BTreeSet<String> = reserved_options(Engine::Sglang, false)
         .iter()
@@ -139,6 +141,7 @@ fn sglang_reserved_names_match_the_argument_mapper() {
                 .iter()
                 .map(|(field, _)| field),
         )
+        .chain(capyctl_config::engine_policy::SGLANG_TRACING_FIELDS)
     {
         assert!(
             python.contains(*field)

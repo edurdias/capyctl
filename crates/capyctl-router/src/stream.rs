@@ -48,19 +48,33 @@ impl StreamBounds {
 }
 
 /// When the backend last produced an event, shared between the sink the
-/// adapter writes to and the watchdog that bounds the stream.
+/// adapter writes to and the watchdog that bounds the stream; and when it
+/// first did, for the forward span's `first_progress` event (ADR 0037 §3).
 #[derive(Clone)]
-pub(crate) struct Progress(Arc<tokio::sync::watch::Sender<Option<tokio::time::Instant>>>);
+pub(crate) struct Progress(
+    Arc<tokio::sync::watch::Sender<Option<tokio::time::Instant>>>,
+    Arc<std::sync::OnceLock<std::time::SystemTime>>,
+);
 
 impl Default for Progress {
     fn default() -> Self {
-        Self(Arc::new(tokio::sync::watch::Sender::new(None)))
+        Self(
+            Arc::new(tokio::sync::watch::Sender::new(None)),
+            Arc::default(),
+        )
     }
 }
 
 impl Progress {
     fn mark(&self) {
         self.0.send_replace(Some(tokio::time::Instant::now()));
+        let _ = self.1.set(std::time::SystemTime::now());
+    }
+
+    /// ADR 0037 §3: when the first backend-progress chunk arrived (SPEC
+    /// §10's definition), for the forward span's `first_progress` event.
+    pub(crate) fn first_at(&self) -> Option<std::time::SystemTime> {
+        self.1.get().copied()
     }
 
     /// SPEC §10 (amended 2026-10-21): whether the backend produced output for
@@ -171,6 +185,8 @@ pub(crate) struct ProgressOnly {
     pub(crate) generated: Option<std::time::Instant>,
     /// ADR 0032 §1: CapyCTL's request ID, on a capable lane only.
     request_id: Option<String>,
+    /// ADR 0037 §6: the trace headers, on a lane that carries them only.
+    trace: Option<capyctl_adapters::traits::TraceHeaders>,
     /// ADR 0032 §3: set at a cut on a capable lane; from then on the response
     /// read after the abort is discarded and records nothing.
     discard: Arc<std::sync::atomic::AtomicBool>,
@@ -182,6 +198,7 @@ impl ProgressOnly {
             progress,
             generated: None,
             request_id: None,
+            trace: None,
             discard: Arc::default(),
         }
     }
@@ -189,6 +206,12 @@ impl ProgressOnly {
     /// ADR 0032 §1: name `request_id` to the forwarder (a capable lane's).
     pub(crate) fn carrying(mut self, request_id: Option<String>) -> Self {
         self.request_id = request_id;
+        self
+    }
+
+    /// ADR 0037 §6: hand the forwarder these trace headers.
+    pub(crate) fn tracing(mut self, trace: Option<capyctl_adapters::traits::TraceHeaders>) -> Self {
+        self.trace = trace;
         self
     }
 
@@ -207,6 +230,10 @@ impl ProgressOnly {
 impl ChatSink for ProgressOnly {
     fn request_id(&self) -> Option<&str> {
         self.request_id.as_deref()
+    }
+
+    fn trace_headers(&self) -> Option<&capyctl_adapters::traits::TraceHeaders> {
+        self.trace.as_ref()
     }
 
     fn progressed(&mut self) {
@@ -242,6 +269,12 @@ struct ResponseSink {
     /// ADR 0032 §1: CapyCTL's request ID while the attempt's lane is capable,
     /// `None` elsewhere.
     request_id: Option<String>,
+    /// ADR 0037 §6: the trace headers of the attempt being forwarded, on a
+    /// lane that carries them only.
+    trace: Option<capyctl_adapters::traits::TraceHeaders>,
+    /// ADR 0037 §5: the stream's token counts and finish reasons, read only
+    /// when the request is traced (§14: off costs nothing).
+    usage: Option<crate::trace::Usage>,
     /// ADR 0032 §3: set when a stream on a capable lane is cut, by the router
     /// or by this sink's own failed delivery. From then on nothing more
     /// reaches the client, and what the forward reads is discarded.
@@ -282,6 +315,10 @@ impl ChatSink for ResponseSink {
         self.request_id.as_deref()
     }
 
+    fn trace_headers(&self) -> Option<&capyctl_adapters::traits::TraceHeaders> {
+        self.trace.as_ref()
+    }
+
     fn progressed(&mut self) {
         if !self.discarding() {
             self.progress.mark();
@@ -310,6 +347,13 @@ impl ChatSink for ResponseSink {
         if crate::engine_metrics::EngineReport::may_carry(&chunk) {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&chunk) {
                 self.report.observe(&value);
+            }
+        }
+        if let Some(usage) = self.usage.as_mut() {
+            if crate::trace::Usage::may_carry(&chunk) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&chunk) {
+                    usage.observe(&value);
+                }
             }
         }
         // Set failure before awaiting so cancellation by the adapter's delivery
@@ -376,6 +420,16 @@ impl CutBy {
             Self::Delivery => "delivery",
             Self::Deadline => "deadline",
             Self::Idle => "idle",
+        }
+    }
+
+    /// ADR 0037 §5: the cut's `capyctl.cancel_cause`. A failed or slow
+    /// delivery is the client's side of the connection, as a hang-up is.
+    pub(crate) fn cause(self) -> capyctl_trace::CancelCause {
+        match self {
+            Self::HangUp | Self::Delivery => capyctl_trace::CancelCause::ClientHangup,
+            Self::Deadline => capyctl_trace::CancelCause::Deadline,
+            Self::Idle => capyctl_trace::CancelCause::StreamIdle,
         }
     }
 }
@@ -461,7 +515,16 @@ impl AfterCut {
             .acknowledge_cancelled_request(&self.lease_id)
             .await
         {
-            Ok(true) => Ok(()),
+            Ok(true) => {
+                // ADR 0037 §3: the cancellation settled by the request's
+                // final output; its `capyctl.settle` span ends.
+                if let Some(trace) = self.ids.trace() {
+                    trace
+                        .tracing()
+                        .settled(&self.lease_id, capyctl_trace::Outcome::Completed);
+                }
+                Ok(())
+            }
             Ok(false) => Err("lease_not_cancelling"),
             // A failed write leaves the lease charged, which is the
             // conservative outcome; it is reported as a failed close is.
@@ -564,9 +627,13 @@ pub fn stream_planned_timed(
             progress: progress.clone(),
             report: Default::default(),
             request_id: None,
+            trace: None,
+            usage: None,
             cut: cut.clone(),
         };
         let mut attempt = first;
+        // ADR 0037 §3: the request's IDs and trace outlive any one attempt.
+        let ids = attempt.ids();
         let mut durable = false;
         // SPEC §10 (owner decision 2026-10-18): a completed stream's attempt,
         // whose lease is closed only after the client has the whole stream.
@@ -578,6 +645,12 @@ pub fn stream_planned_timed(
             // ID, which the forwarder sends to the engine.
             sink.request_id = attempt.request_id();
             let capable = sink.request_id.is_some();
+            // ADR 0037 §3, §6: the attempt's forward span, and the trace
+            // headers its lane carries.
+            sink.trace = attempt.begin_forward();
+            if sink.usage.is_none() && attempt.request_trace().is_some() {
+                sink.usage = Some(crate::trace::Usage::default());
+            }
             let stall = attempt.stall.take();
             // SPEC §10 (found live 2026-10-22): the client's hang-up is
             // noticed when its response body is dropped, not at the next
@@ -588,7 +661,7 @@ pub fn stream_planned_timed(
             // same moment still ends with that end.
             let gone = sink.tx.clone();
             let mut delivery_cut = cut.subscribe();
-            let result = {
+            let (result, cut_by) = {
                 let forwarder = attempt.forward.clone();
                 let mut forward =
                     std::pin::pin!(forwarder.forward_chat_stream_async(&body, &mut sink));
@@ -616,6 +689,8 @@ pub fn stream_planned_timed(
                 if let Some((cut_by, after_cut)) =
                     cut_by.and_then(|cut_by| Some((cut_by, attempt.after_cut()?)))
                 {
+                    // ADR 0037 §3: the cut, with its cause.
+                    crate::chat::cut_spans(&mut attempt, cut_by, &progress);
                     let end = stream_lease_end(&result, progress.produced());
                     let durable = attempt.settle(end).await;
                     cut.send_replace(true);
@@ -629,13 +704,35 @@ pub fn stream_planned_timed(
                         .await;
                     return;
                 }
-                result
+                (result, cut_by)
             };
             if matches!(result, Ok(Ok(StreamEnded::Completed))) {
+                attempt.end_forward(
+                    capyctl_trace::Outcome::Completed,
+                    None,
+                    None,
+                    progress.first_at(),
+                );
                 completed = Some(attempt);
                 break (result, None);
             }
             let end = stream_lease_end(&result, progress.produced());
+            match (cut_by, &result) {
+                // ADR 0037 §3: the cut, with its cause.
+                (Some(cut_by), _) => crate::chat::cut_spans(&mut attempt, cut_by, &progress),
+                (None, Ok(Err(error))) => attempt.end_forward(
+                    crate::balance::lease_outcome(&end),
+                    Some(crate::chat::forward_code(error)),
+                    None,
+                    progress.first_at(),
+                ),
+                (None, _) => attempt.end_forward(
+                    crate::balance::lease_outcome(&end),
+                    None,
+                    None,
+                    progress.first_at(),
+                ),
+            }
             durable = attempt.settle(end).await;
             // SPEC §10, T19: a deterministic refusal decided before sending is
             // answered in-band; another instance would refuse it the same way.
@@ -704,6 +801,16 @@ pub fn stream_planned_timed(
                 sink.tx.send(Ok(Event::default().data(refusal.to_string()))),
             )
             .await;
+            // ADR 0037 §3: the stream answered in-band; its request span ends.
+            end_request(
+                ids.as_deref(),
+                if code == "engine_error" {
+                    capyctl_trace::Outcome::Failed
+                } else {
+                    capyctl_trace::Outcome::Refused
+                },
+                Some(&code),
+            );
             return;
         }
         if matches!(result, Ok(Ok(StreamEnded::Completed))) {
@@ -756,6 +863,14 @@ pub fn stream_planned_timed(
                 )
                 .await;
             }
+            // ADR 0037 §3: the request span ends at the stream's last byte.
+            if let (Some(trace), Some(usage)) = (
+                ids.as_deref().and_then(|ids| ids.trace()),
+                sink.usage.take(),
+            ) {
+                usage.record(trace);
+            }
+            end_request(ids.as_deref(), capyctl_trace::Outcome::Completed, None);
         }
         // SPEC §10, T17: an uncertain end — an error, a premature close, a cut
         // for missing the bounds, a hang-up — cannot establish backend quiescence. With a
@@ -764,8 +879,13 @@ pub fn stream_planned_timed(
         // uncertain stream would shrink the deployment's bound for the life of
         // the process. Without a durable ledger the slot is the only record
         // and stays taken. A panic retains it either way.
-        else if durable {
-            guard.release();
+        else {
+            if durable {
+                guard.release();
+            }
+            // ADR 0037 §3: a stream that ended uncertain (a cut has already
+            // ended its request span, as cancelling).
+            end_request(ids.as_deref(), capyctl_trace::Outcome::Uncertain, None);
         }
         drop(sink);
     });
@@ -797,4 +917,25 @@ pub fn stream_planned_timed(
         let _ = pump.is_finished();
     };
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// ADR 0037 §3: end a streamed request's span. The answer's status was 200:
+/// the stream had started. A request already ended (a cut) is left as it is.
+fn end_request(
+    ids: Option<&crate::request_id::RequestIds>,
+    outcome: capyctl_trace::Outcome,
+    code: Option<&str>,
+) {
+    let Some(ids) = ids else { return };
+    if let Some(trace) = ids.trace() {
+        trace.end(
+            ids.capyctl(),
+            crate::trace::Ending {
+                status: Some(200),
+                outcome,
+                code,
+                cause: None,
+            },
+        );
+    }
 }

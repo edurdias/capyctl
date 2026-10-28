@@ -9,6 +9,7 @@ use axum::{
     Json, Router,
 };
 use capyctl_domain::latency::Histogram;
+use capyctl_trace::{Attr, Incoming, Name, Outbound, Outcome, Parent, Span, Tracing};
 use futures::StreamExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -67,6 +68,10 @@ pub struct EngineAccess {
     /// version and settings it was approved with. Only then does a chat
     /// request carry the router's ID to the engine; otherwise it is dropped.
     pub request_abort: bool,
+    /// ADR 0037 §§6, 7: whether the launch's engine was started with engine
+    /// tracing (its launch-time decision was on). Only then may the ingress
+    /// send the engine a trace context; every other launch gets none.
+    pub engine_trace: bool,
 }
 impl EngineAccess {
     /// A built-in engine: read by its family's `/metrics`, always keyed.
@@ -76,6 +81,7 @@ impl EngineAccess {
             signal: crate::load::LaunchSignal::Builtin,
             keyed: true,
             request_abort: false,
+            engine_trace: false,
         }
     }
     /// ADR 0031 §6, §7: a custom engine, read by its manifest's idle signal
@@ -86,6 +92,7 @@ impl EngineAccess {
             signal: crate::load::LaunchSignal::Custom(custom.manifest.idle.clone()),
             keyed: custom.manifest.uses_api_key(),
             request_abort: false,
+            engine_trace: false,
         }
     }
     /// ADR 0031 §6, AGENTS.md (uncertainty must retain accounting): a launch
@@ -97,6 +104,7 @@ impl EngineAccess {
             signal: crate::load::LaunchSignal::Unknown,
             keyed: false,
             request_abort: false,
+            engine_trace: false,
         }
     }
     /// ADR 0032 §2: the same access, with whether the launch's engine takes
@@ -104,6 +112,13 @@ impl EngineAccess {
     pub fn with_request_abort(self, request_abort: bool) -> Self {
         Self {
             request_abort,
+            ..self
+        }
+    }
+    /// ADR 0037 §7: the same access, with whether the launch's engine traces.
+    pub fn with_engine_trace(self, engine_trace: bool) -> Self {
+        Self {
+            engine_trace,
             ..self
         }
     }
@@ -210,9 +225,20 @@ pub struct Ingress {
     registry: Mutex<Registry>,
     client: reqwest::Client,
     capacity: Arc<Semaphore>,
+    /// ADR 0037 §6: the tracing this ingress records with; `None` reads the
+    /// host role's installed tracing ([`crate::host_tracing::get`]).
+    tracing: Option<Tracing>,
 }
 impl Ingress {
     pub fn new() -> Result<Arc<Self>, IngressError> {
+        Self::build(None)
+    }
+    /// An ingress that records its spans with `tracing` instead of the host
+    /// role's installed tracing (a test's capture, or tracing off).
+    pub fn traced(tracing: Tracing) -> Result<Arc<Self>, IngressError> {
+        Self::build(Some(tracing))
+    }
+    fn build(tracing: Option<Tracing>) -> Result<Arc<Self>, IngressError> {
         Ok(Arc::new(Self {
             registry: Mutex::new(Registry::default()),
             client: reqwest::Client::builder()
@@ -222,7 +248,13 @@ impl Ingress {
                 .build()
                 .map_err(|_| IngressError)?,
             capacity: Arc::new(Semaphore::new(64)),
+            tracing,
         }))
+    }
+    fn tracing(&self) -> Tracing {
+        self.tracing
+            .clone()
+            .unwrap_or_else(crate::host_tracing::get)
     }
     pub fn register(
         &self,
@@ -526,10 +558,18 @@ impl Drop for InFlight {
         self.entry.current.fetch_sub(1, Ordering::SeqCst);
     }
 }
+/// ADR 0037 §5: the CapyCTL code of an answer the ingress made itself, for
+/// its `capyctl.ingress` span. A response extension: never sent.
+#[derive(Clone, Copy)]
+struct AnswerCode(&'static str);
 /// The ingress's own failure. Its code tells the router's forwarder that the
 /// answer is not the engine's (SPEC §10, amended 2026-10-17).
 fn failure(status: StatusCode) -> Response {
-    (status,[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"error":{"code":capyctl_adapters::forward::INGRESS_FAILURE_CODE,"message":"Inference request is not authorized or could not complete"}}))).into_response()
+    let mut response = (status,[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"error":{"code":capyctl_adapters::forward::INGRESS_FAILURE_CODE,"message":"Inference request is not authorized or could not complete"}}))).into_response();
+    response
+        .extensions_mut()
+        .insert(AnswerCode(capyctl_adapters::forward::INGRESS_FAILURE_CODE));
+    response
 }
 /// Relay an engine's complete answer, read in full within bounds, as `code`
 /// with the engine's status and its message as `message_of` reads it: an
@@ -569,12 +609,14 @@ async fn engine_answer(
     let (Some(message), Ok(status)) = (message, StatusCode::from_u16(status.as_u16())) else {
         return failure(StatusCode::BAD_GATEWAY);
     };
-    (
+    let mut response = (
         status,
         [(header::CACHE_CONTROL, "no-store")],
         Json(serde_json::json!({"error":{"code":code,"message":message}})),
     )
-        .into_response()
+        .into_response();
+    response.extensions_mut().insert(AnswerCode(code));
+    response
 }
 async fn forward_chat(State(ingress): State<Arc<Ingress>>, request: Request) -> Response {
     forward(ingress, request, Kind::Chat).await
@@ -595,6 +637,162 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
         entry: entry.clone(),
         _capacity: capacity,
     };
+    // ADR 0031 §7 / amendment A1: the native key is sent only to an engine
+    // that takes it; a custom engine whose manifest does not use `{api_key}`
+    // gets no `Authorization` header. An entry no launch is bound to yet
+    // keeps the key it was registered with, takes no request ID and is sent
+    // no trace context.
+    let access = entry
+        .handle
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map_or((true, false, false), |(_, engine)| {
+            (engine.keyed, engine.request_abort, engine.engine_trace)
+        });
+    // ADR 0037 §6: the trace headers are read only now, on a request that
+    // authenticated as the router's; a request that did not has no span.
+    let mut trace = IngressTrace::start(
+        &ingress.tracing(),
+        request.headers(),
+        &entry.scope,
+        kind,
+        access.2,
+    );
+    let response = relay(
+        &ingress,
+        request,
+        kind,
+        guard,
+        (access.0, access.1),
+        received,
+        &mut trace,
+    )
+    .await;
+    trace.answered(&response);
+    response
+}
+/// ADR 0037 §§3, 6: one forwarded request's trace at the ingress: its
+/// `capyctl.ingress` span (empty when the host's tracing is off) and the
+/// trace headers its engine is sent, if any.
+struct IngressTrace {
+    span: Span,
+    engine: Option<Outbound>,
+}
+impl IngressTrace {
+    fn start(
+        tracing: &Tracing,
+        headers: &axum::http::HeaderMap,
+        scope: &IngressScope,
+        kind: Kind,
+        engine_trace: bool,
+    ) -> Self {
+        // ADR 0037 §1: with the host's tracing off and a launch without
+        // engine tracing, no trace header is read at all.
+        if !tracing.is_on() && !engine_trace {
+            return Self {
+                span: Span::none(),
+                engine: None,
+            };
+        }
+        // ADR 0037 §2: a malformed context is ignored (`None`), never refused.
+        let incoming = Incoming::read(headers);
+        // ADR 0037 §3: server kind, the router's `capyctl.forward` its parent.
+        let mut span = tracing.span(
+            Name::Ingress,
+            incoming.as_ref().map_or(Parent::Root, Parent::Remote),
+            &[],
+        );
+        if span.is_recording() {
+            // ADR 0037 §5: CapyCTL's own names and the fixed route only.
+            span.set(Attr::HttpMethod("POST"));
+            span.set(Attr::HttpRoute(kind.path()));
+            span.set(Attr::Endpoint(match kind {
+                Kind::Chat => capyctl_trace::Endpoint::Chat,
+                Kind::Decision => capyctl_trace::Endpoint::Decisions,
+            }));
+            span.set(Attr::Deployment(scope.deployment_id.clone()));
+            span.set(Attr::Instance(scope.instance_index.to_string()));
+            span.set(Attr::Host(scope.host_id.clone()));
+            span.set(Attr::Generation(scope.generation));
+            span.set(Attr::Revision(scope.revision.to_string()));
+        }
+        // ADR 0037 §6: an engine is sent a context only on a launch with
+        // engine tracing: the ingress span as its parent when the host traces,
+        // otherwise the router's context passed on unchanged (W3C forwarding).
+        let engine = if !engine_trace {
+            None
+        } else if tracing.is_on() {
+            span.outbound()
+        } else {
+            incoming.map(|incoming| Outbound {
+                traceparent: incoming.parent.traceparent(),
+                tracestate: incoming.tracestate,
+            })
+        };
+        Self { span, engine }
+    }
+    /// ADR 0037 §§5, 10: CapyCTL's request ID, as the router sent it.
+    fn request_id(&mut self, id: &str) {
+        if self.span.is_recording() {
+            self.span.set(Attr::RequestId(id.to_owned()));
+        }
+    }
+    /// End the span of an answer that is not a relayed stream (a relayed
+    /// stream took the span with it).
+    fn answered(&mut self, response: &Response) {
+        let mut span = std::mem::take(&mut self.span);
+        if !span.is_recording() {
+            return;
+        }
+        let status = response.status();
+        let code = response.extensions().get::<AnswerCode>().map(|c| c.0);
+        span.set(Attr::HttpStatus(status.as_u16()));
+        span.set(Attr::Outcome(answer_outcome(status, code)));
+        if !status.is_success() {
+            span.fail(code.unwrap_or(capyctl_adapters::forward::INGRESS_FAILURE_CODE));
+        }
+        span.end();
+    }
+}
+/// ADR 0037 §5: how an answer the ingress gave ended: the engine refused an
+/// invalid request (nothing ran), the engine answered an error (it may have
+/// run), the ingress refused or failed before or after the engine.
+fn answer_outcome(status: StatusCode, code: Option<&str>) -> Outcome {
+    match code {
+        _ if status.is_success() => Outcome::Completed,
+        Some("engine_rejected") => Outcome::Refused,
+        Some("engine_error") => Outcome::Uncertain,
+        _ if status == StatusCode::BAD_GATEWAY => Outcome::Failed,
+        _ => Outcome::Refused,
+    }
+}
+/// A relayed stream's `capyctl.ingress` span: it ends with the stream, and a
+/// stream dropped before its end (the router went away) ends as `cancelling`.
+struct StreamSpan(Option<Span>);
+impl StreamSpan {
+    fn end(&mut self, outcome: Outcome) {
+        if let Some(mut span) = self.0.take() {
+            span.set(Attr::Outcome(outcome));
+            span.end();
+        }
+    }
+}
+impl Drop for StreamSpan {
+    fn drop(&mut self) {
+        self.end(Outcome::Cancelling);
+    }
+}
+async fn relay(
+    ingress: &Ingress,
+    request: Request,
+    kind: Kind,
+    guard: InFlight,
+    (keyed, request_abort): (bool, bool),
+    received: Instant,
+    trace: &mut IngressTrace,
+) -> Response {
+    let entry = guard.entry.clone();
     let content = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -614,6 +812,9 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
     let Ok(request_id) = request_id(request.headers()) else {
         return failure(StatusCode::BAD_REQUEST);
     };
+    if let Some(id) = &request_id {
+        trace.request_id(id);
+    }
     // ADR 0030 §2: one bound for every kind; a decision's images count in it.
     let body = match tokio::time::timeout(
         Duration::from_secs(15),
@@ -653,18 +854,6 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
     // router's connection goes away (its client hung up or its deadline cut
     // the request, streamed, collected or a decision) the server drops them
     // and with them the engine connection, before the engine's head as after.
-    // ADR 0031 §7 / amendment A1: the native key is sent only to an engine
-    // that takes it; a custom engine whose manifest does not use `{api_key}`
-    // gets no `Authorization` header. An entry no launch is bound to yet
-    // keeps the key it was registered with.
-    let (keyed, request_abort) = entry
-        .handle
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .as_ref()
-        .map_or((true, false), |(_, engine)| {
-            (engine.keyed, engine.request_abort)
-        });
     // ADR 0032 §1, §2: on a launch whose engine takes it, a chat request
     // carries CapyCTL's request ID as SGLang's `rid`, set only here, after
     // the allowlist above refused any `rid` of the caller's. A decision never
@@ -692,6 +881,17 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
         upstream.bearer_auth(hex::encode(entry.native))
     } else {
         upstream
+    };
+    // ADR 0037 §6: the trace context only to an engine that traces.
+    let upstream = match &trace.engine {
+        Some(outbound) => {
+            let upstream = upstream.header(capyctl_trace::TRACEPARENT, &outbound.traceparent);
+            match &outbound.tracestate {
+                Some(state) => upstream.header(capyctl_trace::TRACESTATE, state),
+                None => upstream,
+            }
+        }
+        None => upstream,
     };
     let response = match tokio::time::timeout(
         Duration::from_secs(900),
@@ -745,21 +945,29 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
         .status(response.status())
         .header(header::CONTENT_TYPE, content)
         .header(header::CACHE_CONTROL, "no-store");
+    // ADR 0037 §3: the ingress span runs until the relayed body ends.
+    let mut span = std::mem::take(&mut trace.span);
+    span.set(Attr::HttpStatus(response.status().as_u16()));
+    let span = StreamSpan(Some(span));
     // SPEC §17 (M80): first and last engine body byte, on the ingress clock. A
     // stream that fails or is dropped before its end records no last byte.
     let stream = futures::stream::unfold(
-        (response.bytes_stream(), guard, false),
-        move |(mut stream, guard, mut seen)| async move {
+        (response.bytes_stream(), guard, false, span),
+        move |(mut stream, guard, mut seen, mut span)| async move {
             let item = stream.next().await;
             match &item {
                 Some(Ok(_)) if !seen => {
                     seen = true;
                     guard.entry.record(Mark::FirstByte, received);
                 }
-                None => guard.entry.record(Mark::LastByte, received),
+                Some(Err(_)) => span.end(Outcome::Failed),
+                None => {
+                    guard.entry.record(Mark::LastByte, received);
+                    span.end(Outcome::Completed);
+                }
                 _ => {}
             }
-            item.map(|item| (item, (stream, guard, seen)))
+            item.map(|item| (item, (stream, guard, seen, span)))
         },
     );
     builder

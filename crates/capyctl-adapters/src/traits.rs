@@ -599,6 +599,15 @@ pub enum StreamEnded {
 #[derive(Debug, Clone, Copy)]
 pub struct DeliveryFailed;
 
+/// ADR 0037 §6: the W3C trace headers one forward carries, decided by the
+/// router: to a host's ingress that declared `trace_context`, or to an engine
+/// launched with engine tracing; no other forward carries any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceHeaders {
+    pub traceparent: String,
+    pub tracestate: Option<String>,
+}
+
 /// A bounded, backpressure-aware destination for one decoded payload.
 #[async_trait]
 pub trait ChatSink: Send {
@@ -615,6 +624,10 @@ pub trait ChatSink: Send {
     /// never the caller's) for a forwarder whose lane carries it to the engine
     /// as SGLang's `rid`. `None` sends no ID.
     fn request_id(&self) -> Option<&str> {
+        None
+    }
+    /// ADR 0037 §6: the trace headers this forward sends. `None` sends none.
+    fn trace_headers(&self) -> Option<&TraceHeaders> {
         None
     }
 }
@@ -673,6 +686,16 @@ pub trait ChatForward: Send + Sync {
         _body: &serde_json::Value,
     ) -> Result<serde_json::Value, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
+    }
+    /// ADR 0037 §6: as [`ChatForward::forward_decision`], sending `trace` as
+    /// the request's W3C trace headers. The default sends none.
+    async fn forward_decision_traced(
+        &self,
+        body: &serde_json::Value,
+        trace: Option<&TraceHeaders>,
+    ) -> Result<serde_json::Value, AdapterError> {
+        let _ = trace;
+        self.forward_decision(body).await
     }
     /// Streaming chat completion: yields data payloads in order; the final
     /// `[DONE]` marker is consumed by the forwarder.

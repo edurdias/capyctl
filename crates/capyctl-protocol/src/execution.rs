@@ -1051,6 +1051,9 @@ impl MemberCommand {
             },
             // ADR 0030 §4: false (every other probe) is not encoded.
             probe_decision: matches!(self.action, MemberAction::Probe { decision: true, .. }),
+            // ADR 0037 §6: the trace context is envelope, never command: the
+            // typed command (journaled and digested) never carries one.
+            trace_parent: String::new(),
         }
     }
 
@@ -1080,6 +1083,56 @@ impl MemberCommand {
         }
         Ok(())
     }
+}
+
+/// ADR 0037 §6: a lifecycle command as a host receives it: the typed command,
+/// exactly as [`MemberCommand::try_from`] decodes it, and the envelope's
+/// trace context. The context is not part of the command: the command's
+/// digest, its journal record and its replay never carry it, so a command
+/// replayed after a restart has none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TracedCommand {
+    pub command: MemberCommand,
+    /// The server step's W3C `traceparent`, when the envelope carried a
+    /// well-formed one; a malformed value is ignored, never an error.
+    pub trace_parent: Option<String>,
+}
+
+impl TryFrom<pb::ServerToAgent> for TracedCommand {
+    type Error = GroupIdentityError;
+    fn try_from(mut message: pb::ServerToAgent) -> Result<Self, Self::Error> {
+        let trace_parent = match &mut message.msg {
+            Some(pb::server_to_agent::Msg::ExecuteMember(command)) => {
+                Some(std::mem::take(&mut command.trace_parent)).filter(|t| is_traceparent(t))
+            }
+            _ => None,
+        };
+        Ok(Self {
+            command: MemberCommand::try_from(message)?,
+            trace_parent,
+        })
+    }
+}
+
+/// ADR 0037 §6: a version-00 W3C `traceparent` as the server writes it:
+/// `00-<32 hex>-<16 hex>-<2 hex>`, lowercase, neither ID all zeros.
+pub fn is_traceparent(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let hex = |range: std::ops::Range<usize>| {
+        bytes[range.clone()]
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+            && bytes[range].iter().any(|b| *b != b'0')
+    };
+    bytes.len() == 55
+        && bytes.starts_with(b"00-")
+        && bytes[35] == b'-'
+        && bytes[52] == b'-'
+        && hex(3..35)
+        && hex(36..52)
+        && bytes[53..55]
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
 }
 
 fn group_wire(plan: &GroupPlan) -> pb::GroupLaunchPlan {
@@ -1118,6 +1171,18 @@ fn group_wire(plan: &GroupPlan) -> pb::GroupLaunchPlan {
 
 /// ADR 0014 amendment A12: the most kernel build spans one launch reports.
 pub const MAX_KERNEL_BUILDS: usize = 64;
+
+/// ADR 0037 §7: the states a LaunchSingle result reports for its engine
+/// tracing: `on`, or why it is off
+/// (`capyctl_adapters::engine_tracing::TracingOutcome::code`).
+pub const ENGINE_TRACING_STATES: [&str; 6] = [
+    "on",
+    "host_off",
+    "engine_unsupported",
+    "not_installed",
+    "group",
+    "retention_zero",
+];
 
 /// ADR 0028 §9 (decided 2026-10-06): the most tokens a completion probe may
 /// ask for. Readiness asks for 1 and the wake canary for 8; the probe stays a
@@ -1214,6 +1279,14 @@ pub fn validate_result(
                 .kernel_builds
                 .iter()
                 .any(|b| b.from_unix_ms < 0 || b.from_unix_ms > b.until_unix_ms))
+    {
+        return Err(GroupIdentityError);
+    }
+    // ADR 0037 §7: a LaunchSingle's engine tracing decision, one closed
+    // state; nothing on any other result.
+    if !result.engine_tracing.is_empty()
+        && !(matches!(command.action, MemberAction::LaunchSingle(_))
+            && ENGINE_TRACING_STATES.contains(&result.engine_tracing.as_str()))
     {
         return Err(GroupIdentityError);
     }

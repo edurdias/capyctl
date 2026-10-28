@@ -153,6 +153,7 @@ async fn stack(seen: Arc<Mutex<Vec<Value>>>, heard: Heard) -> SocketAddr {
         api_key: Some("test-key".into()),
         inflight: Arc::new(capyctl_router::admission::InFlight::default()),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: capyctl_trace::Tracing::off(),
     };
     let id = controller
         .submit_deploy(capyctl_controller::DeployRequest {

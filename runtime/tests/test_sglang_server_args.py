@@ -73,6 +73,11 @@ class SyntheticArgs(SimpleNamespace):
         parser.add_argument("--export-metrics-to-file", action="store_true")
         parser.add_argument("--export-metrics-to-file-dir", default=None)
         parser.add_argument("--spec-trace-dir", default=None)
+        # ADR 0037 §7: tracing (0.5.22 arg_groups/fields/observability.py).
+        parser.add_argument("--enable-trace", action="store_true")
+        parser.add_argument("--otlp-traces-endpoint", default="localhost:4317")
+        parser.add_argument("--otlp-service-name", default="sglang")
+        parser.add_argument("--trace-modules", default="request")
 
 
 SyntheticArgs.__struct_fields__ = (
@@ -84,7 +89,8 @@ SyntheticArgs.__struct_fields__ = (
     "max_mamba_cache_size", "mamba_full_memory_ratio", "speculative_draft_model_path",
     "watermark_config", "debug_tensor_dump_output_folder", "debug_tensor_dump_layers",
     "msprobe_dump_config", "export_metrics_to_file", "export_metrics_to_file_dir",
-    "spec_trace_dir")
+    "spec_trace_dir", "enable_trace", "otlp_traces_endpoint", "otlp_service_name",
+    "trace_modules")
 
 
 def synthetic_constructor(**kwargs):
@@ -361,6 +367,61 @@ class MappingTests(LaunchFixture, unittest.TestCase):
                     construct(self.spec_with(extra_args=extra), self.placement(),
                               unreachable)
                 self.assertEqual(caught.exception.code, "effective_args_mismatch")
+
+    # T48 T21 (ADR 0037 §7, owner decision 2026-10-27 q7): the tracing
+    # destinations are CapyCTL's, refused however spelled and whatever the
+    # host approves, before construction.
+    def test_tracing_destinations_are_refused_however_spelled(self):
+        from runtime import extra_args_policy as policy
+
+        def unreachable(**_):
+            self.fail("constructor reached")
+
+        unreachable.add_cli_args = SyntheticArgs.add_cli_args
+        unreachable.__struct_fields__ = SyntheticArgs.__struct_fields__
+        approved = policy.parse_approvals(
+            '{"options": ["--enable-trace", "--otlp-traces-endpoint", '
+            '"--otlp-service-name", "--trace-modules"], "paths": [], '
+            '"trust_remote_code": false}')
+        for extra in (["--enable-trace"], ["--enable-tr"],
+                      ["--otlp-traces-endpoint", "http://collector:4317"],
+                      ["--otlp-traces=http://collector:4317"],
+                      ["--otlp-service-name", "mine"], ["--otlp-serv=mine"],
+                      ["--trace-modules", "all"], ["--trace-mod=all"]):
+            with self.subTest(extra=extra):
+                with self.assertRaises(mapping.ServerArgsError) as caught:
+                    mapping.construct_server_args(
+                        self.spec_with(extra_args=extra), self.placement(), unreachable,
+                        AVAILABLE, approved)
+                self.assertEqual(caught.exception.code, "effective_args_mismatch")
+                self.assertNotIn("collector", str(caught.exception))
+
+    # T48 (ADR 0037 §7): a traced launch's descriptor names the endpoint, and
+    # tracing is rendered and pinned as reserved values; without it nothing
+    # is rendered. A resolution changing any pinned value is a mismatch.
+    def test_a_trace_endpoint_turns_tracing_on_as_reserved_values(self):
+        endpoint = "http://127.0.0.1:4318/v1/traces"
+        kwargs = self.seen(self.spec_with(trace_endpoint=endpoint))
+        self.assertIs(kwargs["enable_trace"], True)
+        self.assertEqual(kwargs["otlp_traces_endpoint"], endpoint)
+        self.assertEqual(kwargs["otlp_service_name"], "sglang")
+        self.assertNotIn("trace_modules", kwargs)
+        kwargs = self.seen(self.build_without("trace_endpoint"))
+        for name in ("enable_trace", "otlp_traces_endpoint", "otlp_service_name"):
+            self.assertNotIn(name, kwargs)
+        for key, replacement in (("enable_trace", False),
+                                 ("otlp_traces_endpoint", "http://elsewhere:4318"),
+                                 ("otlp_service_name", "other")):
+            def changed(**kwargs):
+                effective = synthetic_constructor(**kwargs)
+                effective.resolve_once()
+                effective.resolve_once = lambda: None
+                setattr(effective, key, replacement)
+                return effective
+            changed.add_cli_args = SyntheticArgs.add_cli_args
+            with self.subTest(key=key), self.assertRaises(mapping.ServerArgsError) as caught:
+                construct(self.spec_with(trace_endpoint=endpoint), self.placement(), changed)
+            self.assertEqual(caught.exception.code, "effective_args_mismatch")
 
     # T21 T22: ADR 0014 §8, SPEC §8.2. A sensitive destination is refused on
     # what the installed parser resolved, so an abbreviation the deploy-time

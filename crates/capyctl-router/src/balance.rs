@@ -350,6 +350,20 @@ pub struct Attempt {
     /// ID and the authority can ask its engine to abort a request by it.
     abort: Option<AbortLane>,
     _slot: Option<InstanceSlot>,
+    /// ADR 0037 §3: this attempt's number and `capyctl.forward` span, and
+    /// whether its lane carries trace headers (§6).
+    trace: AttemptTrace,
+}
+
+/// ADR 0037 §§3, 6: one attempt's part of the request's trace.
+#[derive(Default)]
+pub(crate) struct AttemptTrace {
+    number: i64,
+    /// Its lane carries the trace headers: a host's ingress that declared
+    /// `trace_context`, or an engine launched with engine tracing.
+    carries: bool,
+    host: Option<String>,
+    forward: Option<capyctl_trace::Span>,
 }
 
 /// ADR 0032 §3: the instance incarnation an abort is sent to.
@@ -373,7 +387,71 @@ impl Attempt {
             ids: None,
             abort: None,
             _slot: None,
+            trace: AttemptTrace::default(),
         }
+    }
+
+    /// ADR 0037 §3: open this attempt's `capyctl.forward` span (client kind)
+    /// as its request is sent, and return the trace headers its lane carries
+    /// with that span as the parent (§6); `None` on any other lane.
+    pub(crate) fn begin_forward(&mut self) -> Option<capyctl_adapters::traits::TraceHeaders> {
+        let ids = self.ids.as_ref()?;
+        ids.trace()?;
+        let mut span = ids.span(capyctl_trace::Name::Forward);
+        span.set(capyctl_trace::Attr::Attempt(self.trace.number));
+        if let Some(generation) = self.generation {
+            span.set(capyctl_trace::Attr::Generation(generation));
+        }
+        if let Some(instance) = self.instance {
+            span.set(capyctl_trace::Attr::Instance(instance.to_string()));
+        }
+        if let Some(host) = &self.trace.host {
+            span.set(capyctl_trace::Attr::Host(host.clone()));
+        }
+        let headers = crate::trace::headers_for(&span, self.trace.carries);
+        self.trace.forward = Some(span);
+        headers
+    }
+
+    /// ADR 0037 §3: end the `capyctl.forward` span when the engine's
+    /// response ended, was cut or failed; `first_progress` is when the first
+    /// backend-progress chunk arrived.
+    pub(crate) fn end_forward(
+        &mut self,
+        outcome: capyctl_trace::Outcome,
+        code: Option<&str>,
+        cause: Option<capyctl_trace::CancelCause>,
+        first_progress: Option<std::time::SystemTime>,
+    ) {
+        let Some(mut span) = self.trace.forward.take() else {
+            return;
+        };
+        if let Some(at) = first_progress {
+            span.first_progress_at(at);
+        }
+        span.set(capyctl_trace::Attr::Outcome(outcome));
+        if let Some(cause) = cause {
+            span.set(capyctl_trace::Attr::CancelCause(cause));
+        }
+        if let Some(code) = code {
+            span.fail(code);
+        }
+        span.end();
+    }
+
+    /// The request's trace, when it has one.
+    pub(crate) fn request_trace(&self) -> Option<&crate::trace::RequestTrace> {
+        self.ids.as_ref()?.trace()
+    }
+
+    /// CapyCTL's request ID, for the request span.
+    pub(crate) fn capyctl_request_id(&self) -> Option<&str> {
+        Some(self.ids.as_ref()?.capyctl())
+    }
+
+    /// The request's IDs, which outlive this attempt.
+    pub(crate) fn ids(&self) -> Option<Arc<RequestIds>> {
+        self.ids.clone()
     }
 
     /// ADR 0032 §1: CapyCTL's request ID (the first granted lease's, never the
@@ -409,9 +487,30 @@ impl Attempt {
     /// a durable lease accounted for this attempt: when it did, an uncertain
     /// end stays charged in the ledger, so the caller's in-memory slot is not
     /// the only record of it.
-    pub async fn settle(self, end: LeaseEnd) -> bool {
+    pub async fn settle(mut self, end: LeaseEnd) -> bool {
+        // ADR 0037 §3: a forward still open ends with its lease's evidence.
+        self.end_forward(lease_outcome(&end), None, None, None);
+        // ADR 0037 §3: `capyctl.settle` is the lease close; a cancelled
+        // request's ends when its cancellation settles, possibly after the
+        // request span (the router keeps it in memory until then).
+        let settle = match self.ids.as_deref().and_then(|ids| {
+            let trace = ids.trace()?;
+            Some((trace.tracing().clone(), trace.cx()?))
+        }) {
+            Some((tracing, parent)) => {
+                let mut span = tracing.span(
+                    capyctl_trace::Name::Settle,
+                    capyctl_trace::Parent::Cx(parent),
+                    &[],
+                );
+                span.set(capyctl_trace::Attr::Attempt(self.trace.number));
+                Some((tracing, span))
+            }
+            None => None,
+        };
         match self.lease {
             Some((controller, lease)) => {
+                let lease_id = lease.id().to_owned();
                 crate::chat::close_lease(
                     controller.as_ref(),
                     Some(lease),
@@ -419,10 +518,34 @@ impl Attempt {
                     self.ids.as_deref(),
                 )
                 .await;
+                if let Some((tracing, mut span)) = settle {
+                    if matches!(end, LeaseEnd::Cancelling { .. }) {
+                        tracing.hold(&lease_id, span);
+                    } else {
+                        span.set(capyctl_trace::Attr::Outcome(lease_outcome(&end)));
+                        span.end();
+                    }
+                }
                 true
             }
-            None => false,
+            None => {
+                if let Some((_, mut span)) = settle {
+                    span.set(capyctl_trace::Attr::Outcome(lease_outcome(&end)));
+                    span.end();
+                }
+                false
+            }
         }
+    }
+}
+
+/// ADR 0037 §5: the outcome a lease's evidence names.
+pub(crate) fn lease_outcome(end: &LeaseEnd) -> capyctl_trace::Outcome {
+    match end {
+        LeaseEnd::Completed => capyctl_trace::Outcome::Completed,
+        LeaseEnd::NotAccepted => capyctl_trace::Outcome::Refused,
+        LeaseEnd::Uncertain => capyctl_trace::Outcome::Uncertain,
+        LeaseEnd::Cancelling { .. } => capyctl_trace::Outcome::Cancelling,
     }
 }
 
@@ -624,10 +747,17 @@ impl Plan {
                         })
                         .into());
                 }
-                let forward = deps
-                    .forwards
-                    .forwarder(&deployment)
-                    .map_err(crate::chat::map_forwarder)?;
+                // ADR 0037 §3: one `capyctl.dispatch` per attempt.
+                let number = self.ids.trace().map_or(0, |t| t.next_attempt());
+                let mut dispatch = dispatch_span(&self.ids, number, None, None, None);
+                let forward = match deps.forwards.forwarder(&deployment) {
+                    Ok(forward) => forward,
+                    Err(error) => {
+                        let refusal = crate::chat::map_forwarder(error);
+                        dispatch.fail(crate::chat::code_of(&refusal));
+                        return Err(refusal.into());
+                    }
+                };
                 let lease = match deps
                     .controller
                     .open_request_lease(&deployment, deps.limits.max_requests_per_deployment)
@@ -636,11 +766,19 @@ impl Plan {
                     Ok(lease) => lease,
                     // ADR 0032 §7: the caller asks for a restart first, then
                     // routes the request afresh.
-                    Err(LeaseRefused::Full) => return Err(Unoffered::Full),
+                    Err(LeaseRefused::Full) => {
+                        dispatch.fail("queue_full");
+                        return Err(Unoffered::Full);
+                    }
                     Err(refused) => {
-                        return Err(crate::chat::lease_refusal(&deployment, refused).into())
+                        let refusal = crate::chat::lease_refusal(&deployment, refused);
+                        dispatch.fail(crate::chat::code_of(&refusal));
+                        return Err(refusal.into());
                     }
                 };
+                dispatch.set(capyctl_trace::Attr::Outcome(
+                    capyctl_trace::Outcome::Completed,
+                ));
                 Ok(Attempt {
                     forward,
                     lease: lease.map(|lease| (deps.controller.clone(), lease)),
@@ -650,6 +788,14 @@ impl Plan {
                     ids: Some(self.ids.clone()),
                     abort: None,
                     _slot: None,
+                    trace: AttemptTrace {
+                        number,
+                        // ADR 0037 §6: a dispatch to the deployment whole
+                        // names no launch whose engine traces.
+                        carries: false,
+                        host: None,
+                        forward: None,
+                    },
                 })
             }
             Route::Instances {
@@ -671,6 +817,15 @@ impl Plan {
                         deployment: deployment.clone(),
                         generation: candidate.generation,
                     };
+                    // ADR 0037 §3: one `capyctl.dispatch` per attempt.
+                    let number = self.ids.trace().map_or(0, |t| t.next_attempt());
+                    let mut dispatch = dispatch_span(
+                        &self.ids,
+                        number,
+                        Some(candidate.generation),
+                        Some(candidate.instance_index),
+                        candidate.host.as_deref(),
+                    );
                     // SPEC §10: the lease names this incarnation, and is granted
                     // only while its gate is open.
                     let lease = match deps
@@ -684,6 +839,7 @@ impl Plan {
                     {
                         Ok(lease) => lease,
                         Err(LeaseRefused::Closed) => {
+                            dispatch.fail("unavailable");
                             log_for(
                                 &self.ids,
                                 &mut self.pending,
@@ -699,9 +855,13 @@ impl Plan {
                         }
                         // ADR 0032 §7: the caller asks for a restart before it
                         // answers `queue_full`.
-                        Err(LeaseRefused::Full) => return Err(Unoffered::Full),
+                        Err(LeaseRefused::Full) => {
+                            dispatch.fail("queue_full");
+                            return Err(Unoffered::Full);
+                        }
                         Err(LeaseRefused::Unavailable(reason)) => {
-                            return Err(crate::chat::refusal("unavailable", &reason).into())
+                            dispatch.fail("unavailable");
+                            return Err(crate::chat::refusal("unavailable", &reason).into());
                         }
                     };
                     // ADR 0013 §10: resolve exactly the incarnation the lease
@@ -732,6 +892,18 @@ impl Plan {
                                 deployment: deployment.clone(),
                                 generation: candidate.generation,
                             });
+                            dispatch.set(capyctl_trace::Attr::Outcome(
+                                capyctl_trace::Outcome::Completed,
+                            ));
+                            // ADR 0037 §6: a host's ingress gets the trace
+                            // headers when it declared `trace_context`; an
+                            // engine reached directly, when its launch runs
+                            // with engine tracing.
+                            let carries = if candidate.remote {
+                                lane.trace_context
+                            } else {
+                                lane.engine_trace
+                            };
                             return Ok(Attempt {
                                 forward: lane.forward,
                                 lease: lease.map(|lease| (deps.controller.clone(), lease)),
@@ -741,9 +913,16 @@ impl Plan {
                                 ids: Some(self.ids.clone()),
                                 abort,
                                 _slot: Some(slot),
+                                trace: AttemptTrace {
+                                    number,
+                                    carries,
+                                    host: candidate.host.clone(),
+                                    forward: None,
+                                },
                             });
                         }
                         Err(error) => {
+                            dispatch.fail("unavailable");
                             crate::chat::close_lease(
                                 deps.controller.as_ref(),
                                 lease,
@@ -809,6 +988,29 @@ fn failover(deployment: &str, candidate: &Scored, reason: &str) -> serde_json::V
         "instance": candidate.instance_index,
         "reason": reason,
     })
+}
+
+/// ADR 0037 §3: one attempt's `capyctl.dispatch` span, from instance
+/// selection to its durable lease granted or refused.
+fn dispatch_span(
+    ids: &RequestIds,
+    number: i64,
+    generation: Option<i64>,
+    instance: Option<u32>,
+    host: Option<&str>,
+) -> capyctl_trace::Span {
+    let mut span = ids.span(capyctl_trace::Name::Dispatch);
+    span.set(capyctl_trace::Attr::Attempt(number));
+    if let Some(generation) = generation {
+        span.set(capyctl_trace::Attr::Generation(generation));
+    }
+    if let Some(instance) = instance {
+        span.set(capyctl_trace::Attr::Instance(instance.to_string()));
+    }
+    if let Some(host) = host {
+        span.set(capyctl_trace::Attr::Host(host.to_owned()));
+    }
+    span
 }
 
 /// See [`Plan::log`]: by field, so it can be called while the route is borrowed.

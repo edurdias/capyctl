@@ -62,6 +62,7 @@ pub async fn resolve_timed(
         body_bytes,
         tokio::time::Instant::now(),
         timing,
+        &crate::request_id::RequestIds::untracked(),
     )
     .await
     .map(|(deployment, _)| deployment)
@@ -71,8 +72,10 @@ pub async fn resolve_timed(
 enum Resolution {
     /// At once, on this read of its instances.
     Now(InstanceView),
-    /// After waiting, holding this place in the waiting queue.
-    Waited(crate::queue::WaitTicket),
+    /// After waiting, holding this place in the waiting queue, with the
+    /// request's `capyctl.queue_wait` span (ADR 0037 §3), open from when the
+    /// ticket was taken.
+    Waited(crate::queue::WaitTicket, Box<capyctl_trace::Span>),
 }
 
 /// As [`resolve_timed`] for `endpoint`, returning the waiting-queue ticket the
@@ -87,6 +90,7 @@ async fn resolve_held(
     body_bytes: usize,
     received: tokio::time::Instant,
     timing: &mut RequestTiming,
+    ids: &crate::request_id::RequestIds,
 ) -> Result<(String, Resolution), (StatusCode, Json<serde_json::Value>)> {
     let row = deps
         .controller
@@ -103,6 +107,11 @@ async fn resolve_held(
     // refused here, before the request waits or anything activates.
     crate::endpoint::check_api(deps, &deployment_id, model, endpoint)?;
     timing.resolved(&deployment_id, &row.kind);
+    // ADR 0037 §3: admission ends here; CapyCTL's names go on spans only
+    // from now on (§5).
+    if let Some(trace) = ids.trace() {
+        trace.resolved(&deployment_id, &row.kind);
+    }
     if let Some(view) = serves_now(deps, &deployment_id, row.observed_state)? {
         timing.queued(std::time::Duration::ZERO, None);
         return Ok((deployment_id, Resolution::Now(view)));
@@ -114,11 +123,18 @@ async fn resolve_held(
     // A deployment no request may start (an operator's stop, an explicit
     // activation; SPEC §6.3, §6.5) is answered with that refusal instead: a
     // retry would not help.
+    // ADR 0037 §3: the deployment is not servable; this request's wait for
+    // its activation starts.
+    let mut activation_wait = ids.span(capyctl_trace::Name::ActivationWait);
     if deps.inflight.waiting.limits().max_pending_per_deployment == 0 {
-        deps.controller
-            .refuse_inactive(&deployment_id)
-            .map_err(map_controller)?;
-        let _ = futures::FutureExt::now_or_never(join_activation(deps, &deployment_id));
+        if let Err(fault) = deps.controller.refuse_inactive(&deployment_id) {
+            let refusal = map_controller(fault);
+            activation_wait.fail(code_of(&refusal));
+            return Err(refusal);
+        }
+        let (joined, _) = join_activation(deps, &deployment_id);
+        link_activation(&mut activation_wait, joined);
+        activation_wait.fail("queue_full");
         return Err(err(
             "queue_full",
             &format!(
@@ -128,52 +144,83 @@ async fn resolve_held(
     }
     // SPEC §17: the W10 wait, measured from entering the queue.
     let waited = std::time::Instant::now();
-    let ticket = enter_queue(deps, &deployment_id, body_bytes)?;
+    let ticket = match enter_queue(deps, &deployment_id, body_bytes) {
+        Ok(ticket) => ticket,
+        Err(refusal) => {
+            activation_wait.fail(code_of(&refusal));
+            return Err(refusal);
+        }
+    };
+    // ADR 0037 §3: the queue wait runs from the ticket to the in-flight slot.
+    let mut queue_wait = ids.span(capyctl_trace::Name::QueueWait);
     let deadline = received + deps.inflight.waiting.limits().deadline;
-    let joined = join_activation(deps, &deployment_id);
+    let (joined, wait) = join_activation(deps, &deployment_id);
+    link_activation(&mut activation_wait, joined);
     let joined_at = std::time::Instant::now();
-    match tokio::time::timeout_at(deadline, joined).await {
+    let refused = match tokio::time::timeout_at(deadline, wait.outcome()).await {
         Ok(Ok(_)) => {
             timing.queued(waited.elapsed(), Some(joined_at.elapsed()));
-            Ok((deployment_id, Resolution::Waited(ticket)))
+            activation_wait.set(capyctl_trace::Attr::Outcome(capyctl_trace::Outcome::Completed));
+            return Ok((deployment_id, Resolution::Waited(ticket, Box::new(queue_wait))));
         }
-        Ok(Err(refusal)) => Err(refusal),
+        Ok(Err(refusal)) => refusal,
         // The activation keeps running for whoever waits next; this request
         // gives up without having reached any engine.
-        Err(_) => Err(err(
+        Err(_) => err(
             "unavailable",
             &format!(
                 "deployment {deployment_id} did not become servable within the queue deadline; retry shortly"
             ),
-        )),
+        ),
+    };
+    activation_wait.fail(code_of(&refused));
+    queue_wait.fail(code_of(&refused));
+    Err(refused)
+}
+
+/// ADR 0037 §4: a request's `activation_wait` links to the activation's own
+/// trace and says whether this request started it.
+fn link_activation(span: &mut capyctl_trace::Span, joined: crate::switch::Joined) {
+    if let Some(activation) = joined.activation {
+        span.link(activation);
     }
+    span.set(capyctl_trace::Attr::ActivationStarted(joined.started));
+}
+
+/// The CapyCTL code of a refusal answer.
+pub(crate) fn code_of(refusal: &(StatusCode, Json<serde_json::Value>)) -> &str {
+    refusal.1 .0["code"].as_str().unwrap_or("internal")
 }
 
 /// SPEC §10 step 2 (T15, W10): join (or start) the deployment's one
 /// activation. It runs as its own task, so no caller that stops waiting (a
-/// deadline, a disconnect, a refusal) cancels it for the others.
-async fn join_activation(
+/// deadline, a disconnect, a refusal) cancels it for the others. ADR 0037
+/// §4: the caller that starts it opens the activation's own trace, which the
+/// lifecycle authority records its steps under.
+fn join_activation(
     deps: &RouterDeps,
     deployment_id: &str,
-) -> Result<u64, (StatusCode, Json<serde_json::Value>)> {
+) -> (
+    crate::switch::Joined,
+    crate::switch::JoinWait<(StatusCode, Json<serde_json::Value>)>,
+) {
     let controller = deps.controller.clone();
     let id = deployment_id.to_owned();
-    deps.activation_join
-        .join_detached(
-            deployment_id,
-            move || async move {
-                controller
-                    .activate_for_request(&id)
-                    .await
-                    .map(|()| 0)
-                    .map_err(map_controller)
-            },
-            err(
-                "activation_uncertain",
-                "the activation task ended without an outcome; retry shortly",
-            ),
-        )
-        .await
+    deps.activation_join.join_detached_traced(
+        deployment_id,
+        move |activation| async move {
+            controller
+                .activate_for_request_traced(&id, activation)
+                .await
+                .map(|()| 0)
+                .map_err(map_controller)
+        },
+        err(
+            "activation_uncertain",
+            "the activation task ended without an outcome; retry shortly",
+        ),
+        &deps.tracing,
+    )
 }
 
 /// SPEC §10 step 1 (T19): hold a place in the bounded waiting queue.
@@ -210,6 +257,7 @@ fn enter_queue(
 /// rather than read again (ADR 0013 §10: the lease grant re-checks the gate,
 /// so a view is only ever a hint). After any wait it returns none, and the
 /// planner reads the instances afresh.
+#[allow(clippy::too_many_arguments)]
 pub async fn admit_timed(
     deps: &RouterDeps,
     endpoint: Endpoint,
@@ -217,20 +265,27 @@ pub async fn admit_timed(
     body_bytes: usize,
     received: tokio::time::Instant,
     timing: &mut RequestTiming,
+    ids: &crate::request_id::RequestIds,
 ) -> Result<(String, StaticStreamGuard, Option<InstanceView>), (StatusCode, Json<serde_json::Value>)>
 {
     let (deployment_id, resolution) =
-        resolve_held(deps, model, endpoint, body_bytes, received, timing).await?;
+        resolve_held(deps, model, endpoint, body_bytes, received, timing, ids).await?;
     let (ticket, view) = match resolution {
         Resolution::Now(view) => (None, Some(view)),
-        Resolution::Waited(ticket) => (Some(ticket), None),
+        Resolution::Waited(ticket, queue_wait) => (Some((ticket, *queue_wait)), None),
     };
     let max = deps.limits.max_requests_per_deployment;
     if let Some(guard) = deps.inflight.try_guard_arc(&deployment_id, max) {
+        // ADR 0037 §3: a waiting request's queue wait ends with its slot.
+        if let Some((_, mut queue_wait)) = ticket {
+            queue_wait.set(capyctl_trace::Attr::Outcome(
+                capyctl_trace::Outcome::Completed,
+            ));
+        }
         return Ok((deployment_id, guard, view));
     }
-    let _ticket = match ticket {
-        Some(ticket) => ticket,
+    let (_ticket, mut queue_wait) = match ticket {
+        Some(held) => held,
         // SPEC §10 (owner decision 2026-10-08): no request waits for a slot.
         None if deps.inflight.waiting.limits().max_pending_per_deployment == 0 => {
             return Err(err(
@@ -240,7 +295,10 @@ pub async fn admit_timed(
                 ),
             ));
         }
-        None => enter_queue(deps, &deployment_id, body_bytes)?,
+        None => {
+            let ticket = enter_queue(deps, &deployment_id, body_bytes)?;
+            (ticket, ids.span(capyctl_trace::Name::QueueWait))
+        }
     };
     let deadline = received + deps.inflight.waiting.limits().deadline;
     match deps
@@ -248,13 +306,21 @@ pub async fn admit_timed(
         .acquire_arc(&deployment_id, max, deadline)
         .await
     {
-        Some(guard) => Ok((deployment_id, guard, None)),
-        None => Err(err(
-            "queue_full",
-            &format!(
-                "deployment {deployment_id} stayed at its in-flight bound for the queue deadline"
-            ),
-        )),
+        Some(guard) => {
+            queue_wait.set(capyctl_trace::Attr::Outcome(
+                capyctl_trace::Outcome::Completed,
+            ));
+            Ok((deployment_id, guard, None))
+        }
+        None => {
+            queue_wait.fail("queue_full");
+            Err(err(
+                "queue_full",
+                &format!(
+                    "deployment {deployment_id} stayed at its in-flight bound for the queue deadline"
+                ),
+            ))
+        }
     }
 }
 
@@ -340,8 +406,16 @@ pub async fn dispatch_timed(
     ids: std::sync::Arc<crate::request_id::RequestIds>,
 ) -> Result<(serde_json::Value, RequestTiming), (StatusCode, Json<serde_json::Value>)> {
     // SPEC §10 step 1 and T19: resolve, wait if needed, take an in-flight slot.
-    let (deployment_id, guard, view) =
-        admit_timed(deps, endpoint, model, body_bytes, received, &mut timing).await?;
+    let (deployment_id, guard, view) = admit_timed(
+        deps,
+        endpoint,
+        model,
+        body_bytes,
+        received,
+        &mut timing,
+        &ids,
+    )
+    .await?;
     // ADR 0013 §10 (I3): choose an instance, open its lease and resolve its
     // forwarder. Nothing has been sent yet: a refusal releases the guard on drop.
     let started = std::time::Instant::now();
@@ -379,10 +453,14 @@ pub async fn dispatch_timed(
             let generation = attempt.generation;
             timing.forwarding(attempt.instance, generation);
             let progress = crate::stream::Progress::default();
+            // ADR 0037 §3, §6: the attempt's forward span, and the trace
+            // headers its lane carries.
+            let trace_headers = attempt.begin_forward();
             // ADR 0032 §1: on a capable lane the observer names CapyCTL's
             // request ID, which the forwarder sends to the engine.
-            let mut observer =
-                crate::stream::ProgressOnly::new(progress.clone()).carrying(attempt.request_id());
+            let mut observer = crate::stream::ProgressOnly::new(progress.clone())
+                .carrying(attempt.request_id())
+                .tracing(trace_headers.clone());
             let discard = observer.discard_switch();
             // ADR 0028 §11: a request to a group's head is watched for its
             // first token; the watch holds nothing of the response.
@@ -412,6 +490,8 @@ pub async fn dispatch_timed(
                             } else {
                                 crate::stream::CutBy::bound(answered)
                             };
+                            // ADR 0037 §3: the cut, with its cause.
+                            cut_spans(&mut attempt, cut_by, &progress);
                             if attempt.settle(LeaseEnd::Cancelling { answered }).await {
                                 guard.release();
                             }
@@ -427,7 +507,9 @@ pub async fn dispatch_timed(
                 Endpoint::Decisions => {
                     unless_hung_up(
                         crate::stream::bounded(
-                            attempt.forward.forward_decision(&body),
+                            attempt
+                                .forward
+                                .forward_decision_traced(&body, trace_headers.as_ref()),
                             &progress,
                             &bounds,
                             stall,
@@ -446,6 +528,15 @@ pub async fn dispatch_timed(
             // answer comes whole, so a cut decision was never answered.
             let cut = bounded.is_err();
             let answered = progress.produced();
+            if cut {
+                // ADR 0037 §3: the cut, with its cause.
+                let cut_by = if reply.is_closed() {
+                    crate::stream::CutBy::HangUp
+                } else {
+                    crate::stream::CutBy::bound(answered)
+                };
+                cut_spans(&mut attempt, cut_by, &progress);
+            }
             let result = bounded.unwrap_or_else(|()| {
                 Err(AdapterError::Uncertain(
                     "the client went away, or the backend missed the request's deadline or \
@@ -455,6 +546,12 @@ pub async fn dispatch_timed(
             });
             let error = match result {
                 Ok(response) => {
+                    attempt.end_forward(
+                        capyctl_trace::Outcome::Completed,
+                        None,
+                        None,
+                        progress.first_at(),
+                    );
                     timing.response();
                     // SPEC §17: the first generated text, for time to first
                     // token and decode speed; a decision generates none (ADR
@@ -478,6 +575,12 @@ pub async fn dispatch_timed(
             } else {
                 lease_end(Some(&error))
             };
+            attempt.end_forward(
+                crate::balance::lease_outcome(&end),
+                Some(forward_code(&error)),
+                None,
+                progress.first_at(),
+            );
             let durable = attempt.settle(end).await;
             match error {
                 // SPEC §10, T38: nothing reached the engine, so the request may
@@ -615,6 +718,49 @@ pub(crate) fn refusal(code: &str, message: &str) -> (StatusCode, Json<serde_json
     err(code, message)
 }
 
+/// ADR 0037 §5: the CapyCTL code a forward error is answered by, for its
+/// span. Never the engine's own text.
+pub(crate) fn forward_code(error: &AdapterError) -> &'static str {
+    match error {
+        AdapterError::NotAccepted(reason) if reason.contains("shutting down") => "shutting_down",
+        AdapterError::NotAccepted(_) => "unavailable",
+        AdapterError::Rejected { .. } => "engine_rejected",
+        AdapterError::EngineError { .. } => "engine_error",
+        AdapterError::PolicyDenied => "invalid_request",
+        AdapterError::CacheSaltUnsupported => "cache_salt_unsupported",
+        error if refused_before_sending(error) => "unsupported",
+        _ => "engine_error",
+    }
+}
+
+/// ADR 0037 §3: a cut request: its forward span and its request span end
+/// `cancelling`, with the cut's cause (§5). The request's later settlement
+/// is its `capyctl.settle`.
+pub(crate) fn cut_spans(
+    attempt: &mut crate::balance::Attempt,
+    cut_by: crate::stream::CutBy,
+    progress: &crate::stream::Progress,
+) {
+    let cause = cut_by.cause();
+    attempt.end_forward(
+        capyctl_trace::Outcome::Cancelling,
+        None,
+        Some(cause),
+        progress.first_at(),
+    );
+    if let (Some(trace), Some(id)) = (attempt.request_trace(), attempt.capyctl_request_id()) {
+        trace.end(
+            id,
+            crate::trace::Ending {
+                status: None,
+                outcome: capyctl_trace::Outcome::Cancelling,
+                code: None,
+                cause: Some(cause),
+            },
+        );
+    }
+}
+
 /// How the evidence from one forward ends its lease.
 pub(crate) fn lease_end(error: Option<&AdapterError>) -> LeaseEnd {
     match error {
@@ -726,7 +872,8 @@ pub(crate) async fn restart_when_full(
             return Err(queue_full());
         }
     }
-    match tokio::time::timeout_at(deadline, join_activation(deps, deployment)).await {
+    let (_, wait) = join_activation(deps, deployment);
+    match tokio::time::timeout_at(deadline, wait.outcome()).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(refusal)) => Err(refusal),
         Err(_) => Err(err(

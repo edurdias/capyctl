@@ -510,6 +510,15 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         )
     })?;
     let credentials = load_credentials(&config)?;
+    // ADR 0037 §§1, 8: the server's tracing, from its own settings only; off
+    // unless the document names an endpoint.
+    let tracing = crate::role_tracing::start(
+        config.tracing.export.as_ref(),
+        config.tracing.sample_ratio,
+        config.tracing.caller_context,
+        capyctl_trace::Service::Server,
+    )
+    .map_err(|detail| error(&format!("Server configuration: {detail}")))?;
     let ca = enrollment::load_controller_ca(&storage)
         .map_err(|_| error("Server CA is missing or invalid; explicit recovery is required"))?;
     let key = HostKey::generate().map_err(|_| unavailable())?;
@@ -665,7 +674,10 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         capyctl_controller::CoordinatorLifecycle::new(coordinator.commands())
             .with_routing(capyctl_controller::RoutingSignals::from_sessions(&sessions))
             .with_switcher(switcher.clone())
-            .with_group_stall_timeout(config.groups.stall_timeout),
+            .with_group_stall_timeout(config.groups.stall_timeout)
+            // ADR 0037 §4: activation traces, their steps and the context
+            // lifecycle commands carry to hosts.
+            .with_tracing(tracing.clone()),
     );
     let inflight = Arc::new(capyctl_router::admission::InFlight::default());
     // SPEC §17 (M80): `observability.timing_header`, off unless set.
@@ -724,6 +736,7 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         },
         inflight,
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: tracing.clone(),
     });
     // SPEC §4.3: the explicit drain of an enrolled host. Owner decision 4: an
     // offline host's drain is accepted at once with its Stops pending.
@@ -779,6 +792,9 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
                             config.inference,
                             config.inference_auth,
                         ));
+                        // ADR 0037 §13: the server's tracing, read live by status.
+                        let tracing = tracing.clone();
+                        view.set_tracing(Arc::new(move || crate::role_tracing::status(&tracing)));
                         view
                     },
                 ),
@@ -894,6 +910,8 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
             .shutdown(crate::shutdown::SUPERVISION_JOIN_BOUND)
             .await;
         let _ = coordinator.shutdown().await;
+        // ADR 0037 §8: the queue is flushed for at most 2 seconds.
+        tracing.shutdown().await;
         result.map_err(|_| unavailable())??;
         return Err(unavailable());
     }
@@ -916,6 +934,8 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         .shutdown(crate::shutdown::SUPERVISION_JOIN_BOUND)
         .await;
     coordinator.shutdown().await.map_err(|_| unavailable())?;
+    // ADR 0037 §8: a stopping role flushes its spans for at most 2 seconds.
+    tracing.shutdown().await;
     drop(storage);
     Ok(
         json!({"role":"server","stopped":true,"engines":"retained","drain":drain.to_json(),
@@ -1041,6 +1061,18 @@ async fn serve_host(
     identity.control_endpoint(now()).map_err(|_| {
         error("Host certificate is invalid or expired; explicit identity recovery is required")
     })?;
+    // ADR 0037 §§1, 4, 6, 8: the host's own spans (ingress, lifecycle steps),
+    // off unless the document names an endpoint. Installed once for the
+    // process; the host follows the router's and server's sampled flags.
+    capyctl_agent::host_tracing::install(
+        crate::role_tracing::start(
+            config.tracing.export.as_ref(),
+            capyctl_config::tracing::DEFAULT_SAMPLE_RATIO,
+            capyctl_config::CallerContext::Parent,
+            capyctl_trace::Service::Host,
+        )
+        .map_err(|detail| error(&format!("Invalid host configuration: {detail}")))?,
+    );
     private_dir(&config.state_dir.join("journal"))?;
     let journal = HostJournal::open(
         &config.state_dir.join("journal"),
@@ -1100,6 +1132,9 @@ async fn serve_host(
         launch_claims: String::new(),
         // ADR 0028 §12: saver maps are sampled by the executor's refreshes.
         member_savers: Vec::new(),
+        // ADR 0037 §13: the host session fills its tracing status on every
+        // report it sends.
+        tracing: None,
     };
     let ingress = capyctl_agent::ingress::Ingress::new().map_err(|_| unavailable())?;
     let (execution, ingress_listener) = if let Some(settings) = &config.ingress {
@@ -1304,6 +1339,8 @@ async fn serve_host(
         None => session.await,
     }
     .map_err(|_| host_revoked(&host))?;
+    // ADR 0037 §8: a stopping role flushes its spans for at most 2 seconds.
+    capyctl_agent::host_tracing::get().shutdown().await;
     Ok(
         json!({"role":"host","host_id":host,"stopped":true,"engines":"retained","drain":drain.to_json(),
         "dispatch_suspension":announced.as_str(),
@@ -1521,6 +1558,16 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 // Owner decision 2026-10-22: `engine_telemetry` holds for
                 // every launch from here on.
                 capyctl_adapters::engine_telemetry::set_host_setting(host.engine_telemetry);
+                // ADR 0037 §7: `observability.tracing.engines` holds for every
+                // launch from here on; engines export to the host's loopback
+                // endpoint (checked at load).
+                capyctl_adapters::engine_tracing::set_host_setting(
+                    capyctl_adapters::engine_tracing::HostEngineTracing {
+                        engines_on: host.tracing.engines
+                            == capyctl_config::EngineTracingSetting::On,
+                        endpoint: host.tracing.export.as_ref().map(|e| e.endpoint.clone()),
+                    },
+                );
                 // Owner decision 2026-09-26: a command run later on this
                 // machine without --config (`capyctl engine`, `config show`)
                 // finds this host's document.

@@ -5,7 +5,7 @@ members = [
   "crates/capyctl-protocol", "crates/capyctl-controller", "crates/capyctl-router",
   "crates/capyctl-agent", "crates/capyctl-adapters", "crates/capyctl-launchers",
   "crates/capyctl-config", "crates/capyctl-cli", "crates/capyctl-management",
-  "crates/capyctl-testkit", "tests/harness",
+  "crates/capyctl-testkit", "crates/capyctl-trace", "tests/harness",
 ]
 
 [workspace.package]
@@ -39,6 +39,7 @@ capyctl-adapters = { path = "crates/capyctl-adapters" }
 capyctl-agent = { path = "crates/capyctl-agent" }
 capyctl-controller = { path = "crates/capyctl-controller" }
 capyctl-testkit = { path = "crates/capyctl-testkit" }
+capyctl-trace = { path = "crates/capyctl-trace" }
 
 [profile.dev]
 debug = 1

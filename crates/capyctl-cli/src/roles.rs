@@ -325,7 +325,10 @@ impl App {
         self.switcher
             .shutdown(crate::shutdown::SUPERVISION_JOIN_BOUND)
             .await;
-        self._coordinator.shutdown().await
+        let worker = self._coordinator.shutdown().await;
+        // ADR 0037 §8: a stopping role flushes its spans for at most 2 seconds.
+        self.deps.tracing.shutdown().await;
+        worker
     }
 }
 
@@ -1766,6 +1769,7 @@ async fn start_standalone_in(
         inference_auth,
         stated_host,
         group_stall_timeout,
+        (server_tracing, host_tracing),
     ) = {
         let path = match &outcome {
             LoadOutcome::Loaded(path) => PathBuf::from(path),
@@ -1841,6 +1845,12 @@ async fn start_standalone_in(
                 .and_then(|groups| groups.with_overrides(None, &|name| std::env::var(name).ok()))
                 .map_err(|error| StartError::Deploy(format!("standalone configuration: {error}")))?
                 .stall_timeout,
+            // ADR 0037 §12, T03: `server.observability.tracing` covers the
+            // whole process; `host.observability.tracing` takes only
+            // `engines`, exporting to the server block's loopback endpoint.
+            capyctl_config::tracing::standalone_tracing(&document).map_err(|error| {
+                StartError::Deploy(format!("standalone configuration: {error}"))
+            })?,
         )
     };
     // Owner decision 2026-10-20: `host.engine_logs` (validated by
@@ -1858,6 +1868,26 @@ async fn start_standalone_in(
         capyctl_config::remote_roles::engine_telemetry(&stated_host)
             .map_err(|error| StartError::Deploy(format!("standalone configuration: {error}")))?,
     );
+    // ADR 0037 §7: `host.observability.tracing.engines` holds for every
+    // launch from here on.
+    capyctl_adapters::engine_tracing::set_host_setting(
+        capyctl_adapters::engine_tracing::HostEngineTracing {
+            engines_on: host_tracing.engines == capyctl_config::EngineTracingSetting::On,
+            endpoint: host_tracing.export.as_ref().map(|e| e.endpoint.clone()),
+        },
+    );
+    // ADR 0037 §§1, 8: one tracing for the whole process (router and its
+    // embedded host), off unless the server block names an endpoint.
+    let tracing = crate::role_tracing::start(
+        server_tracing.export.as_ref(),
+        server_tracing.sample_ratio,
+        server_tracing.caller_context,
+        capyctl_trace::Service::Standalone,
+    )
+    .map_err(|detail| StartError::Deploy(format!("standalone configuration: {detail}")))?;
+    if tracing.is_on() {
+        capyctl_agent::host_tracing::install(tracing.clone());
+    }
     let db_path = state_dir.join("server").join("srv.sqlite3");
     // SPEC §15.2: an explicit document is operator configuration, not state,
     // so it does not bring the credentials a generated default would. A state
@@ -2362,6 +2392,11 @@ async fn start_standalone_in(
     // the caller serves it (`App::inference_router`), for status.
     let inference_listener =
         Arc::new(capyctl_management::inference_listener::InferenceListenerView::default());
+    // ADR 0037 §13: the role's tracing, read live by status.
+    {
+        let tracing = tracing.clone();
+        inference_listener.set_tracing(Arc::new(move || crate::role_tracing::status(&tracing)));
+    }
     let inference_listener_view = capyctl_management::inference_listener::inference_listener_router(
         capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
             .map_err(|_| StartError::MissingCredentials)?,
@@ -2379,7 +2414,9 @@ async fn start_standalone_in(
         CoordinatorLifecycle::new(coordinator.commands())
             .with_switcher(switcher.clone())
             .with_embedded_load(engine_load)
-            .with_group_stall_timeout(group_stall_timeout),
+            .with_group_stall_timeout(group_stall_timeout)
+            // ADR 0037 §4: activation traces and their steps.
+            .with_tracing(tracing.clone()),
     );
     let deps = capyctl_router::RouterDeps {
         controller: controller.clone(),
@@ -2397,6 +2434,7 @@ async fn start_standalone_in(
         api_key: Some(api_key.clone()),
         inflight,
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing,
     };
     let router = capyctl_router::serve_router(deps.clone());
     // Publish the ceiling before anything can be admitted against it. A deployment

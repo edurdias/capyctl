@@ -81,6 +81,9 @@ struct RemoteEngine {
     /// ADR 0033 (lifecycle design §10): what the host reported about the
     /// launch's LMCache, shared with the coordinator's driver of the launch.
     lmcache: Arc<capyctl_adapters::lmcache::LmcacheState>,
+    /// ADR 0037 §7: the launch's engine tracing as its host reported it,
+    /// shared with the coordinator's driver of the launch.
+    engine_tracing: Arc<capyctl_adapters::engine_tracing::TracingReport>,
 }
 /// The caller resolves this frozen plan from the selected enrolled host's
 /// approved configuration. This is construction only, never permission to send.
@@ -92,14 +95,18 @@ pub fn binding(
 ) -> ExecutionBinding {
     let binding = Arc::new(binding);
     let lmcache = Arc::new(capyctl_adapters::lmcache::LmcacheState::default());
+    let engine_tracing = Arc::new(capyctl_adapters::engine_tracing::TracingReport::default());
     let engine = Arc::new(RemoteEngine {
         sessions: sessions.clone(),
         owner,
         binding: binding.clone(),
         readiness,
         lmcache: lmcache.clone(),
+        engine_tracing: engine_tracing.clone(),
     });
-    remote_binding(engine, sessions, binding).with_lmcache(lmcache)
+    remote_binding(engine, sessions, binding)
+        .with_lmcache(lmcache)
+        .with_engine_tracing(engine_tracing)
 }
 
 /// The engine half of [`binding`] alone: the adapter the coordinator drives
@@ -117,6 +124,7 @@ pub fn engine(
         binding: Arc::new(binding),
         readiness,
         lmcache: Arc::default(),
+        engine_tracing: Arc::default(),
     })
 }
 
@@ -638,6 +646,13 @@ impl EngineAdapter for RemoteEngine {
         // and its fallback, exactly as an embedded launch reports it.
         if let Some(report) = lmcache_report(&result) {
             self.lmcache.record(report);
+        }
+        // ADR 0037 §7: the launch's engine tracing as the host decided it
+        // (nothing from an older host, which traces no engine).
+        if let Some(outcome) =
+            capyctl_adapters::engine_tracing::TracingOutcome::parse(&result.engine_tracing)
+        {
+            self.engine_tracing.record(outcome);
         }
         launch_evidence(&result)?;
         let receipt = remote_receipt(&result, &devices)?;

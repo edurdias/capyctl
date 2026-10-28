@@ -5,7 +5,11 @@ on 2026-10-27, after 0.1.9 shipped with ADR 0035 only). The owner answered every
 question on 2026-10-27, and the answers are recorded below ("Owner decisions of
 2026-10-27"). One answer differs from the recommendation: the live rows use the
 OpenTelemetry Collector release binary on host A and host B instead of a receiver script
-(question 11). Nothing is implemented yet.
+(question 11). Implemented on branch `feat/otel-trace-context` (2026-10-28); the live rows
+OT1–OT11 have not run. Implementation note: the export encodes with `opentelemetry-proto`
+0.33.1 and posts with the workspace's `reqwest` instead of `opentelemetry-otlp`, whose HTTP
+exporter reads `OTEL_EXPORTER_OTLP_*` from the environment whatever is configured (against
+§8) and would add a second `reqwest`.
 **Amends (with the implementation):** `SPEC.md` §10 (the request-ID note:
 `traceparent` and `tracestate` are read after authentication, never refused, and replaced
 rather than relayed), §13.1 (a host capability `trace_context`; trace context on ingress

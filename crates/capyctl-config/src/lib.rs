@@ -60,6 +60,9 @@ pub mod yaml_emit;
 pub mod toolchain;
 // ADR 0028 §2: a deployment's multi-node topology and group shape.
 pub mod topology;
+// ADR 0037 §12: a role's `observability.tracing` settings and the collector's
+// headers file.
+pub mod tracing;
 // Tests across the workspace write executables through this.
 #[doc(hidden)]
 pub mod test_support;
@@ -68,3 +71,4 @@ pub use defaults::{generate_default, resolve_startup, LoadOutcome};
 pub use error::{ConfigError, ConfigErrorCode};
 pub use schema::ConfigKind;
 pub use strict_yaml::{parse_document, parse_strict, parse_strict_value, validate};
+pub use tracing::{CallerContext, EngineTracingSetting, HostTracing, ServerTracing, TracingExport};

@@ -1311,6 +1311,10 @@ pub async fn execute_with_start_options(
                 if status.is_success() && body["inference_listener"].is_object() {
                     view["inference_listener"] = body["inference_listener"].clone();
                 }
+                // ADR 0037 §13: the role's tracing status, per role.
+                if status.is_success() && body["tracing"].is_object() {
+                    view["tracing"] = body["tracing"].clone();
+                }
             }
             // SPEC §17 (M80): the deployment's latency distributions (router,
             // host ingress and engine tiers). A server without the view, or an

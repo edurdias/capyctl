@@ -1467,3 +1467,153 @@ async fn a_settled_failed_launch_closes_only_its_own_instance() {
     assert_eq!(lab.worker.status(), WorkerStatus::Running);
     lab.worker.shutdown().await.unwrap();
 }
+
+/// ADR 0037 §4: the names of `root`'s recorded children, sorted; each is
+/// checked to be in `root`'s trace.
+fn trace_of(
+    spans: &capyctl_trace::testing::Capture,
+    root: &capyctl_trace::testing::Recorded,
+) -> Vec<String> {
+    let mut children: Vec<String> = spans
+        .spans()
+        .into_iter()
+        .filter(|s| s.parent == Some(root.cx.span_id))
+        .inspect(|s| assert_eq!(s.cx.trace_id, root.cx.trace_id, "{}", s.name))
+        .map(|s| s.name)
+        .collect();
+    children.sort();
+    children
+}
+
+// T48 T16 (ADR 0037 §4, §9): a request-driven switch is one activation
+// trace, rooted at the router's `capyctl.activation` (recorded at ratio 0),
+// with the switch's drain and release and the start's reserve, launch and
+// readiness as its children; the root names a switch and its victim, the
+// release the victim and its park tier. Switching back wakes A in place:
+// reserve, wake, canary and readiness under the next root.
+#[tokio::test]
+async fn a_request_driven_switch_is_one_activation_trace_with_its_steps() {
+    use capyctl_trace::{CallerMode, Name, Parent, Service};
+    let lab = lab(15, 2_000).await;
+    lab.ready(&lab.a).await;
+    let b = lab.deploy("sglang-b", SGLANG, |_| {});
+    let (tracing, spans) =
+        capyctl_trace::testing::capture(0.0, CallerMode::Parent, Service::Server);
+    let port = lab
+        .port(Duration::from_secs(5))
+        .with_tracing(tracing.clone());
+    let root = tracing.span(Name::Activation, Parent::Root, &[]);
+    let root_cx = root
+        .cx()
+        .expect("an activation root is recorded at ratio 0");
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        port.activate_for_request_traced(&b, root),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(lab.state(&b), "ready");
+    until("the start's steps", || {
+        !spans.named("capyctl.readiness").is_empty()
+    })
+    .await;
+    let roots = spans.named("capyctl.activation");
+    assert_eq!(roots.len(), 1, "no second root: the start is the request's");
+    let root = &roots[0];
+    assert_eq!(root.cx.span_id, root_cx.span_id);
+    assert_eq!(root.parent, None);
+    assert_eq!(root.attr("capyctl.activation.kind"), Some("switch"));
+    assert_eq!(
+        root.attr("capyctl.victim"),
+        Some(lab.a.deployment_id.as_str())
+    );
+    assert_eq!(root.attr("capyctl.outcome"), Some("completed"));
+    assert_eq!(
+        trace_of(&spans, root),
+        [
+            "capyctl.drain",
+            "capyctl.launch",
+            "capyctl.readiness",
+            "capyctl.release",
+            "capyctl.reserve"
+        ]
+    );
+    let release = &spans.named("capyctl.release")[0];
+    assert_eq!(
+        release.attr("capyctl.victim"),
+        Some(lab.a.deployment_id.as_str())
+    );
+    assert_eq!(release.attr("capyctl.park_tier"), Some("deep"));
+    for step in spans.spans().iter().filter(|s| s.parent.is_some()) {
+        assert_eq!(
+            step.attr("capyctl.outcome"),
+            Some("completed"),
+            "{}",
+            step.name
+        );
+    }
+
+    // A -> B -> A: A wakes in place under the next request's root.
+    spans.clear();
+    let root = tracing.span(Name::Activation, Parent::Root, &[]);
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        port.activate_for_request_traced(&lab.a.deployment_id, root),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    until("the wake's steps", || {
+        !spans.named("capyctl.readiness").is_empty()
+    })
+    .await;
+    let root = &spans.named("capyctl.activation")[0];
+    assert_eq!(root.attr("capyctl.victim"), Some(b.as_str()));
+    assert_eq!(
+        trace_of(&spans, root),
+        [
+            "capyctl.canary",
+            "capyctl.drain",
+            "capyctl.readiness",
+            "capyctl.release",
+            "capyctl.reserve",
+            "capyctl.wake"
+        ]
+    );
+    assert!(spans.disallowed_keys().is_empty());
+    lab.worker.shutdown().await.unwrap();
+}
+
+// T48 (ADR 0037 §4): an activation nothing waits for (an operator's start)
+// is traced the same way, as its own trace: the worker opens its root, kind
+// `cold_start`, and its steps hang under it.
+#[tokio::test]
+async fn an_operator_start_is_its_own_activation_trace() {
+    use capyctl_trace::{CallerMode, Service};
+    let lab = lab(15, 2_000).await;
+    let (tracing, spans) =
+        capyctl_trace::testing::capture(0.0, CallerMode::Parent, Service::Server);
+    let _port = lab.port(Duration::from_secs(5)).with_tracing(tracing);
+    lab.ready(&lab.a).await;
+    until("the operator's activation root", || {
+        !spans.named("capyctl.activation").is_empty()
+    })
+    .await;
+    let roots = spans.named("capyctl.activation");
+    assert_eq!(roots.len(), 1);
+    let root = &roots[0];
+    assert_eq!(root.parent, None, "its own trace");
+    assert_eq!(root.attr("capyctl.activation.kind"), Some("cold_start"));
+    assert_eq!(
+        root.attr("capyctl.deployment"),
+        Some(lab.a.deployment_id.as_str())
+    );
+    assert_eq!(root.attr("capyctl.outcome"), Some("completed"));
+    assert_eq!(
+        trace_of(&spans, root),
+        ["capyctl.launch", "capyctl.readiness", "capyctl.reserve"]
+    );
+    assert!(spans.disallowed_keys().is_empty());
+    lab.worker.shutdown().await.unwrap();
+}

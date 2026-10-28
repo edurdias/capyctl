@@ -220,6 +220,7 @@ fn fixture(limits: WaitLimits) -> Fixture {
             limits,
         )),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: capyctl_trace::Tracing::off(),
     };
     Fixture {
         deps,

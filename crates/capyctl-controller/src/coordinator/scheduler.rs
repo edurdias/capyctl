@@ -1099,10 +1099,33 @@ async fn residency_task(
     work: ResidencyWork,
     mut stop: watch::Receiver<bool>,
 ) -> Outcome {
-    match AssertUnwindSafe(drive_residency(&shared, &*observations, work, &mut stop))
-        .catch_unwind()
-        .await
-    {
+    // ADR 0037 §4: a wake's steps hang under the activation bound to its
+    // deployment, else under its own root (an operator's wake); a park only
+    // under a bound switch release, whose context its command carries.
+    let trace = shared.traces.enter(
+        &work.deployment_id,
+        &work.operation_id,
+        (work.kind == capyctl_store::ordinary_lifecycle::park::ResidencyKind::Restore)
+            .then_some(capyctl_trace::ActivationKind::Wake),
+    );
+    let result = AssertUnwindSafe(drive_residency(
+        &shared,
+        &*observations,
+        work,
+        &mut stop,
+        &trace,
+    ))
+    .catch_unwind()
+    .await;
+    trace.finish(match &result {
+        // A wake that failed recorded its own outcome.
+        Ok(Ok(true)) => Some(trace.outcome().unwrap_or(capyctl_trace::Outcome::Completed)),
+        // Not armed now: it runs again.
+        Ok(Ok(false)) => None,
+        Ok(Err(CoordinatorError::Stopped(_))) => Some(capyctl_trace::Outcome::Uncertain),
+        _ => Some(capyctl_trace::Outcome::Failed),
+    });
+    match result {
         // Shutdown or a store failure: the loop's own checks decide.
         Ok(_) => Outcome::Done,
         Err(_) => Outcome::Halt(WorkerStatus::Failed(
@@ -1119,14 +1142,32 @@ async fn initialize_task(
     mut stop: watch::Receiver<bool>,
     contended: Arc<AtomicBool>,
 ) -> Outcome {
+    // ADR 0037 §4: the start's steps hang under the activation bound to its
+    // deployment (a request's or a switch's), else under its own root: an
+    // operator's start is an activation traced the same way.
+    let trace = shared.traces.enter(
+        &work.fence().deployment_id,
+        work.operation_id(),
+        Some(capyctl_trace::ActivationKind::ColdStart),
+    );
     // Catch both service and adapter panics. If an arm exists, the fenced
     // annotation below preserves it; otherwise no effect has been allowed.
     // ADR 0028 §5: a start whose revision runs as a group activates its
     // members instead of one engine.
     let result = if work.group().is_some() {
-        AssertUnwindSafe(super::drive_group(&shared, &work, &mut stop))
-            .catch_unwind()
-            .await
+        // ADR 0037 §4: a group's reserve, prepare, launch and proof run as
+        // one `capyctl.launch` step, whose context its member commands carry.
+        let launch = trace.step(capyctl_trace::Name::Launch);
+        let result = crate::activation_trace::within(
+            launch.cx(),
+            AssertUnwindSafe(super::drive_group(&shared, &work, &mut stop)).catch_unwind(),
+        )
+        .await;
+        match &result {
+            Ok(inner) => launch.close(inner, super::step_code),
+            Err(_) => launch.fail("panicked"),
+        }
+        result
     } else {
         AssertUnwindSafe(drive(
             &shared,
@@ -1135,10 +1176,19 @@ async fn initialize_task(
             &factory,
             &mut stop,
             &contended,
+            &trace,
         ))
         .catch_unwind()
         .await
     };
+    trace.finish(match &result {
+        Ok(Ok(())) => Some(capyctl_trace::Outcome::Completed),
+        // SPEC §6.5 (W5): deferred without effect; it runs again.
+        Ok(Err(CoordinatorError::Deferred(_))) => None,
+        Ok(Err(CoordinatorError::Stopped(_))) => Some(capyctl_trace::Outcome::Uncertain),
+        _ => Some(capyctl_trace::Outcome::Failed),
+    });
+    drop(trace);
     match AssertUnwindSafe(conclude_initialize(&shared, &work, result, &stop))
         .catch_unwind()
         .await
