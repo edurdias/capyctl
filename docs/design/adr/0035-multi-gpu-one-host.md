@@ -21,6 +21,8 @@ measured startup peak, A13 measured parked residue, A19 parked growth), ADR 0017
 (capability gating), ADR 0025 (standalone memory limits, TensorFold's cap), ADR 0030
 (decision models stay on one machine and one GPU), ADR 0031 §7 (the loopback listener
 check), ADR 0033 and ADR 0034 (LMCache), ADR 0036 (embeddings stay on one GPU).
+**Amended by:** ADR 0038 (2026-10-28): §10, TensorRT-LLM has no local multi-GPU entry;
+`topology` on one host is refused `multi_gpu_unsupported`.
 
 ## Context
 
@@ -522,7 +524,8 @@ One function per engine, beside `group_support` (`crates/capyctl-config/src/grou
 declares the local multi-GPU shape: `max_tensor_parallel` (none for vLLM and SGLang, which
 accept any N up to the host's GPU count; llama.cpp the same), `pipeline` (false in this
 version), `deep_park` (false until MG4/MG5 pass, §9) and `split_modes` (llama.cpp:
-`layer`). TensorFold and custom engines have no entry. The configuration layer reads it for
+`layer`). TensorFold, TensorRT-LLM (ADR 0038 §13: its tensor parallelism needs the MPI
+pool, which ADR 0038 §9 refuses) and custom engines have no entry. The configuration layer reads it for
 §1's checks, as ADR 0028 §10's `GroupSupport` is read.
 
 ### 11. Protocol and capability

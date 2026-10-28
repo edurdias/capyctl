@@ -126,7 +126,7 @@ are written nowhere and die with the engine process.
 
 To stop requests from different users sharing cached prefixes, send a
 `cache_salt` field with each request. CapyCTL does not send the salt itself:
-it sends an engine that honours salts (vLLM, SGLang) a SHA-256 digest of the
+it sends an engine that honours salts (vLLM, SGLang, TensorRT-LLM) a SHA-256 digest of the
 deployment, the revision serving the request and the salt (up to 1024 bytes),
 and the engine passes that digest on to LMCache. It refuses the request on an
 engine that would ignore the salt, rather than serve it from a shared cache. A
@@ -134,6 +134,12 @@ request without a salt is sent without one and shares the cache with every
 other unsalted request to that deployment. CapyCTL does not set a salt on its
 own, and never logs or stores the digest. A salt partitions a cache; it
 authorizes nothing.
+
+TensorRT-LLM partitions its KV block reuse by that digest, so
+requests with different salts never reuse each other's blocks. It keeps no
+conversation history: CapyCTL starts it with
+`TRTLLM_RESPONSES_API_DISABLE_STORE=1`, which turns off the store behind its
+own Responses API, and no deployment can change that variable.
 
 ## LMCache
 
@@ -213,9 +219,13 @@ unless the host allows it. By default (`engine_telemetry: off`) every engine
 starts with `DO_NOT_TRACK=1`, and vLLM also with `VLLM_DO_NOT_TRACK=1` and
 `VLLM_NO_USAGE_STATS=1`, so vLLM does not post its usage report (the platform,
 the model architecture and the engine settings, sent to `stats.vllm.ai` at
-start, and a short report every ten minutes after). SGLang, llama.cpp and TensorFold have no usage
+start, and a short report every ten minutes after). SGLang, llama.cpp, TensorFold and TensorRT-LLM 1.2.1 have no usage
 reporting of their own; `DO_NOT_TRACK=1` also turns off the Hugging Face Hub
 library's telemetry, and TensorFold's release check is off on every launch.
+The usage reporting switches TensorRT-LLM's 1.3 and 1.4 pre-releases add
+(`--telemetry`, `telemetry_config`, `TELEMETRY_DISABLED`) are reserved, so a
+deployment cannot change them. FlashInfer may download prebuilt kernels over
+the network when TensorRT-LLM first starts; that connection is allowed.
 A custom engine is a program CapyCTL does not know: it gets `DO_NOT_TRACK=1`,
 and whether it honours it is up to the program.
 

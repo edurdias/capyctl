@@ -21,6 +21,10 @@ const SECTIONS: &[(&str, Engine)] = &[
     ("## SGLang 0.5.21", Engine::Sglang),
     ("## TensorFold 0.6.6", Engine::Tensorfold),
     ("## llama.cpp v0.6.0", Engine::Llamacpp),
+    (
+        "## TensorRT-LLM 1.2.1, 1.3.0rc29 and 1.4.0rc1",
+        Engine::TensorrtLlm,
+    ),
 ];
 
 const HEADER: &str = "| Need | Option | Class | CapyCTL |";

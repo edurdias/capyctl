@@ -6,8 +6,9 @@ question on 2026-10-27, and the answers are recorded below ("Owner decisions of
 toolkit are installed system-wide on host A (decision 4), the 1.3 and 1.4 pre-releases are
 qualified with their own rows in 0.2.0 (decision 7, §2a), and the engine kind is
 `tensorrt-llm` (decision 8). Target release 0.2.0 (retargeted from 0.1.9 on 2026-10-27,
-after 0.1.9 shipped with ADR 0035 only). Nothing is implemented; the SPEC, guide and
-operations texts this ADR lists change with the implementation, as for ADRs 0029 and 0033.
+after 0.1.9 shipped with ADR 0035 only). Implemented for 0.2.0 with the SPEC, guide and
+operations texts this ADR lists; the live rows TR1–TR11, TR1a–TR11a and TR1b–TR11b have not
+run, so no version is in the verified set yet.
 **Amends (with the implementation):** `SPEC.md` §1.1 (R01, supported engines), §9.4 (later
 backends), §20 (T49, live rows TR1–TR11 for 1.2.1, TR1a–TR11a for the 1.3 pre-release and
 TR1b–TR11b for the 1.4 pre-release); ADR 0018 §1 (a sixth installation kind: detection, the

@@ -442,6 +442,115 @@ choose.
 
 llama.cpp has run on a discrete NVIDIA GPU so far; a GB10 has not run it yet.
 
+## TensorRT-LLM
+
+CapyCTL runs NVIDIA TensorRT-LLM's `trtllm-serve`, engine kind
+`tensorrt-llm`: one Hugging Face checkpoint on the PyTorch backend, on one GPU
+of one host, for chat. Three versions are being qualified: 1.2.1, the 1.3
+pre-release (the tables were read from 1.3.0rc29) and 1.4.0rc1. Install one in
+its own Python environment ([Install an
+engine](install-engines.md#tensorrt-llm-121-13-pre-release-or-140rc1)) and
+name its `trtllm-serve`:
+
+```bash
+capyctl engine add ~/tensorrt-llm-1.2.1-venv/bin/trtllm-serve
+```
+
+The profile is named `tensorrt-llm` unless you pass `--name`.
+
+`engine add` never imports TensorRT-LLM and never runs `trtllm-serve`:
+importing it starts MPI and CUDA, and Open MPI could leave a daemon behind.
+It runs the environment's Python on `importlib.metadata` instead, which reads
+the version of `tensorrt_llm` and, beside it, of `torch`, `tensorrt`,
+`flashinfer-python`, `transformers` and `mpi4py`. The profile records those
+as its `companions`, and `engine list` shows them, so a changed torch or
+FlashInfer shows there. `engine detect` finds the environment by its
+`tensorrt_llm-*.dist-info` without running anything. The fingerprint covers
+the `tensorrt_llm/` and `triton_kernels/` packages, their compiled libraries
+included; torch, TensorRT, FlashInfer and the MPI library are outside it.
+
+No TensorRT-LLM version is verified yet. A verified entry names the version
+and the torch build beside it, and each is added only once its live rows pass
+(TR1–TR11 for 1.2.1, TR1a–TR11a and TR1b–TR11b for the pre-releases). Until
+then every TensorRT-LLM installation lists as `CUSTOM yes` and runs as an
+uncertified custom setup; it is never refused for being uncertified, and the
+checks below apply to it all the same. A version outside the three uses the
+option tables of the qualified version of its minor line, else 1.2.1's
+([Engine options](engine-flags.md#tensorrt-llm-121-130rc29-and-140rc1)).
+
+### A TensorRT-LLM deployment
+
+The settings TensorRT-LLM takes from the deployment:
+
+| Setting | What it does | Default |
+|---|---|---|
+| `engine_config.context_length` | Each request's window (`--max_seq_len`). | none |
+| `engine_config.max_concurrent_requests` | How many requests run together (`--max_batch_size`). | 32 |
+| `engine_config.dtype` | The weights' dtype. | `auto` |
+| `engine_config.kv_cache_dtype` | The KV cache dtype: `auto` (the model's) or `fp8`. | `auto` |
+| `engine_config.cuda_graphs` | `false` turns CUDA graphs off. | the engine's |
+| `engine_config.tensorrt-llm.reasoning_parser`, `engine_config.tensorrt-llm.tool_call_parser` | The parsers, in TensorRT-LLM's names. | by model family |
+| `engine_config.tensorrt-llm.llm_api_options` | More LLM API arguments, a mapping merged under CapyCTL's own keys. | none |
+
+CapyCTL writes the engine's configuration file itself and refuses a mapping
+that names a key it sets or keeps off
+([the configuration file](engine-flags.md#the-configuration-file)). The served
+name must be one path component (not empty, `.` or `..`, no `/`, at most 255
+bytes), because TensorRT-LLM serves the name of the model directory and
+CapyCTL links the checkpoint under it; another name is refused
+`served_name_unsupported`.
+
+The KV cache comes from the grant: CapyCTL turns `memory.kv_cache` into a
+token count from the checkpoint's `config.json` and renders it as
+`kv_cache_config.max_tokens`. A model it cannot size that way (sliding or
+per-layer attention windows, multi-head latent attention, recurrent or hybrid
+layers, encoder-decoder models) is refused `kv_geometry_unsupported`. Once the
+engine is up, CapyCTL reads the pool it built: one that cannot hold a single
+request's window stops the launch with `kv_cache_short`, and one larger than
+the rendered figure by more than a block fails it `effective_args_mismatch`.
+
+Refused for TensorRT-LLM, with the reason:
+
+- `residency: deep` or `host_backed` (`capability_missing:deep_park`), and
+  `--deep-park enabled` at `engine add`: TensorRT-LLM parks by stopping
+  ([Parking](parking.md)).
+- `topology`, on one host or across machines (`multi_gpu_unsupported`):
+  TensorRT-LLM runs on one GPU in this version.
+- `api: decisions` and embeddings (`capability_missing`).
+- `quantization` (the checkpoint carries it), `language_model_only`, and
+  `model.draft` (speculative decoding is out of scope).
+- `lmcache: required` (`engine_unsupported`): LMCache is not qualified with
+  TensorRT-LLM, and an `auto` deployment shows LMCache off with that reason.
+- Options and keys CapyCTL renders or keeps off, and the engine variables of
+  [Engine options](engine-flags.md#tensorrt-llm-121-130rc29-and-140rc1)
+  (`engine_env_reserved:<name>`), even when `approved_env` lists them.
+
+Every launch runs the model in the `trtllm-serve` process
+(`TLLM_WORKER_USE_SINGLE_PROCESS=1`) and pins Open MPI to one local process
+with no daemon and no network transport. At readiness and whenever a host
+re-proves the launch, CapyCTL checks two things: that no process the engine
+started has left its process group (else the launch stops,
+`engine_process_escaped`, naming the process), and that no process of the
+launch listens anywhere but loopback (else `engine_listener_exposed`).
+
+`trtllm-serve` listens on `127.0.0.1` with no key; `engine list` shows
+`engine key: none`. It is reached only through CapyCTL's endpoint, which
+checks your API key, but any local user can reach its port, as with llama.cpp
+and TensorFold.
+
+TensorRT-LLM reports no idle signal CapyCTL accepts (`engine list` shows
+`idle signal: none`), so a cancelled request is settled as for a custom
+engine without one ([Cancelled requests](#cancelled-requests)): it stays
+`cancelling` until the engine's next stop or restart. CapyCTL reads the
+engine's `/metrics` for load only.
+
+On first start FlashInfer may download prebuilt kernels over the network; CapyCTL
+allows this. With the host's `engine_telemetry: off`, CapyCTL sets
+`DO_NOT_TRACK=1`; TensorRT-LLM has no usage reporting of its own in 1.2.1.
+
+No TensorRT-LLM live check has passed yet. CPU and Fake-engine tests are not
+qualification.
+
 ## Custom engines
 
 A custom engine is a program CapyCTL has no integration for, such as a model's
