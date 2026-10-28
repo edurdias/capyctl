@@ -298,6 +298,9 @@ whatever an approval says (`engine_env_reserved:<name>`):
   `VLLM_ALLOW_INSECURE_SERIALIZATION`, and the usage-reporting opt-outs
   `DO_NOT_TRACK`, `VLLM_DO_NOT_TRACK` and `VLLM_NO_USAGE_STATS`, which only
   the host's [`engine_telemetry`](#engine-usage-reporting) decides.
+- the engines' tracing families `OTEL_*`, `SGLANG_TRACE_*` and `SGLANG_OTLP_*`,
+  and `TRACEPARENT` and `TRACESTATE` (in any case), which only the host's
+  [`observability.tracing.engines`](#tracing) decides.
 
 CapyCTL starts every SGLang process with `SGLANG_PLUGINS=capyctl-loads-no-plugins`,
 a plugin selection that names no plugin, so SGLang loads none. SGLang 0.5.22
@@ -456,6 +459,7 @@ a run with `--set` or `CAPYCTL_SET__…` (next section), and restart the role.
 | LMCache: `auto` (default), or `off`, which keeps LMCache off for every deployment on the machine ([below](#lmcache-and-zero-retention)) | host: `lmcache` (standalone: `host.lmcache`) |
 | Retention: `standard` (default), or `zero`: engine logs in memory, no core dumps, no LMCache ([below](#lmcache-and-zero-retention)) | host: `retention` (standalone: `host.retention`) |
 | Engines' own usage reporting: `off` (default), or `allow`, which leaves each engine's own default ([below](#engine-usage-reporting)) | host: `engine_telemetry` (standalone: `host.engine_telemetry`) |
+| Tracing: off (default) until an OTLP endpoint is named; sampling, the caller's trace context, engine spans ([below](#tracing)) | server and host: `observability.tracing` (standalone: `server.observability.tracing`, and `host.observability.tracing.engines`) |
 
 `lifecycle.activation` follows the server's lifecycle settings: the document,
 `--set lifecycle.activation=explicit` on `capyctl start host` (or
@@ -563,6 +567,114 @@ with `CAPYCTL_SET__ENGINE_TELEMETRY=allow`
 refuses the start. It applies to launches from the next start; an engine
 already running keeps the environment it started with. See
 [data retention](data-retention.md#nothing-reported-off-the-host).
+
+### Tracing
+
+CapyCTL can take part in a distributed trace: it reads a caller's W3C
+`traceparent` and `tracestate`, records its own spans for each request (wait,
+wake, dispatch, the forward to the engine) and exports them over OTLP/HTTP
+with protobuf encoding to a collector you name. It is off until a role's
+document names an endpoint. Off, CapyCTL reads no trace header, builds no
+exporter, opens no connection and sends no trace header to a host or an
+engine. What a caller sends and gets: [Trace context](../guide/requests.md#trace-context).
+What the spans hold: [Traces](data-retention.md#traces).
+
+A server document (standalone: under `server:`, covering the whole process,
+router and embedded host):
+
+```yaml
+observability:
+  tracing:
+    endpoint: https://collector.example.internal:4318/v1/traces
+    headers_file: /etc/capyctl/otlp-headers   # optional
+    sample_ratio: 1.0                         # 0.0 to 1.0
+    caller_context: parent                    # parent | link | ignore
+```
+
+A host document:
+
+```yaml
+observability:
+  tracing:
+    endpoint: http://127.0.0.1:4318/v1/traces
+    headers_file: /etc/capyctl/otlp-headers   # optional
+    engines: off                              # off | on
+```
+
+| Field | Roles | Default | Meaning |
+|---|---|---|---|
+| `endpoint` | server, host | none: tracing off | The collector's OTLP/HTTP traces URL, used exactly as written (include the path, usually `/v1/traces`). An `http://` or `https://` URL naming a host, with no user or password in it. On a host, without it the host records no spans and passes the router's trace context on unchanged. |
+| `headers_file` | server, host | none | Headers the collector needs, such as an API key. An absolute path; refused without `endpoint`. |
+| `sample_ratio` | server | `1.0` | The share of new traces recorded, from `0.0` to `1.0`. A request that arrives with a caller's context follows the caller's sampled flag instead. An unsampled request records nothing, but still passes its context on with the sampled flag clear. Activation traces (a cold start, a wake, a switch) are recorded at every ratio. |
+| `caller_context` | server | `parent` | What the router does with a caller's valid `traceparent`: `parent` puts CapyCTL's request span in the caller's trace; `link` starts a new trace whose request span links to the caller's; `ignore` reads neither header. |
+| `engines` | host (standalone: `host.observability.tracing.engines`) | `off` | `on` lets vLLM 0.31.0 or newer and SGLang 0.5.22 or newer export their own spans to the host's endpoint ([Engine tracing](../guide/engines.md#engine-tracing)). |
+
+**Standalone.** `server.observability.tracing` takes `endpoint`,
+`headers_file`, `sample_ratio` and `caller_context` and covers the router and
+the embedded host. `host.observability.tracing` takes only `engines`; any
+other field there refuses the start. The engines export to the server block's
+endpoint, so `engines: on` needs that endpoint on loopback.
+
+**The headers file.** One `Name: value` header per line; blank lines and lines
+starting with `#` are skipped:
+
+```text
+# Collector credentials
+Authorization: Bearer 0123456789abcdef
+X-Scope-OrgID: lab
+```
+
+It must be a regular file (not a symbolic link) owned by the user CapyCTL
+runs as, with no group or other permissions (`chmod 600`), and at most 64 KiB.
+A file that breaks these rules, a line that is not `Name: value`, a name that
+is not a valid HTTP header name, an empty value or a control character in a
+value refuses the start. The message names the path and the line number,
+never the line's text. The values are never logged and never shown by
+`config show` or status, which show the path only. The file is read once,
+when the role starts.
+
+**Refused at start.** A field the block does not take; an `endpoint` that is
+not an `http` or `https` URL naming a host, or carries a user or password
+(credentials go in `headers_file`); a relative `headers_file`, or one without
+an `endpoint`; a `sample_ratio` that is not a number from 0.0 to 1.0; a
+`caller_context` other than `parent`, `link` or `ignore`; an `engines` other
+than `off` or `on`; and `engines: on` unless the endpoint is on loopback
+(`localhost`, `127.0.0.0/8` or `::1`): engines export without TLS, and their
+spans stay on the machine. An `http://` endpoint that is not on loopback is
+accepted with a warning at start:
+
+```text
+warning: tracing exports over plain HTTP to http://collector.lan:4318/v1/traces (not loopback); spans travel unencrypted
+```
+
+**Environment.** CapyCTL ignores `OTEL_*` variables in its own environment.
+Tracing never turns on, or goes to another collector, because a unit file
+carries one; the settings here are the only way in.
+
+**Export.** Spans wait in a queue in memory of at most 2048 spans and are
+sent every 5 seconds, at most 512 per request. When the queue is full, new
+spans are dropped and counted. An export that cannot reach the collector, or
+gets a retryable answer, is tried up to three more times, backing off; then the batch
+is dropped and counted. None of this delays or changes a request, a readiness check
+or a lifecycle step. A role log notice reports dropped spans and export
+failures at most once a minute. A stopping role sends what is queued for at
+most 2 seconds.
+
+**Status.** `capyctl status deployment <name>` shows the role's `tracing: off`, or
+`tracing: on → <endpoint>, spans dropped <n>` with the last export error
+since the start; `capyctl list hosts` shows the same line for each host, from
+its latest report. Each instance shows `engine tracing: on` or
+`engine tracing: off (<reason>)`. The JSON output carries the same fields
+(`tracing`, and `engine_tracing` per instance).
+
+Every field is settable by path, like any setting: `--set
+observability.tracing.endpoint=http://127.0.0.1:4318/v1/traces` on `capyctl
+start server` or `capyctl start host`, or
+`CAPYCTL_SET__OBSERVABILITY__TRACING__ENDPOINT=...`; standalone with the
+`server.` or `host.` prefix (`--set host.observability.tracing.engines=on`,
+`CAPYCTL_SET__SERVER__OBSERVABILITY__TRACING__SAMPLE_RATIO=0.1`). The settings
+belong to the role: no deployment or profile field changes them, and a change
+takes a restart.
 
 ## Any setting by its path
 
@@ -890,6 +1002,10 @@ For TensorFold it also writes `TENSORFOLD_NO_UPDATE_CHECK`, `HF_HUB_OFFLINE`,
 service user). Under `engine_telemetry: off` (the default) it writes
 `DO_NOT_TRACK=1` for every engine and `VLLM_DO_NOT_TRACK=1` and
 `VLLM_NO_USAGE_STATS=1` for vLLM ([Engine usage reporting](#engine-usage-reporting)).
+On a launch with engine tracing ([Tracing](#tracing)) it writes
+`OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf` for vLLM and SGLang,
+`OTEL_SERVICE_NAME=vllm` and `OTEL_RESOURCE_ATTRIBUTES` (the deployment and
+instance) for vLLM, and `SGLANG_TRACE_LEVEL=1` for SGLang.
 Other variables in CapyCTL's own environment do not reach an engine. The CUDA
 toolkit is the exception by design: a profile's `cuda_home` (stated as above
 for the role's own installation, detected by `capyctl engine add`, or written in
