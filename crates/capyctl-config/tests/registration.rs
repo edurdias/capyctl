@@ -820,6 +820,22 @@ fn a_tensorrt_llm_version_is_verified_only_beside_its_torch_build() {
     assert!(!listed_custom(Some(Engine::Vllm), "0.29.0", &profile));
 }
 
+// T41 T49 (ADR 0039 §3, ADR 0038 §2): a host listing reads a native
+// TensorFold profile against the native certified set, never the 0.6 set.
+#[test]
+fn a_listed_native_tensorfold_profile_is_read_against_its_own_set() {
+    let native = serde_json::json!({"engine": "tensorfold", "line": "native"});
+    let python = serde_json::json!({"engine": "tensorfold"});
+    assert!(listed_custom(Some(Engine::Tensorfold), "0.6.6", &native));
+    assert!(!listed_custom(Some(Engine::Tensorfold), "0.6.6", &python));
+    for version in ["1.0.0", "1.1.5"] {
+        assert_eq!(
+            listed_custom(Some(Engine::Tensorfold), version, &native),
+            !capyctl_config::tensorfold_native::is_certified(version)
+        );
+    }
+}
+
 // T49 T14 (ADR 0038 §2): a TensorRT-LLM profile records its companion
 // versions and deep park disabled, passes the resolution rules and the
 // engines file's schema, and an unlisted version is written all the same;

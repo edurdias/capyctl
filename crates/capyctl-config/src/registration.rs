@@ -620,13 +620,15 @@ pub fn is_verified_profile(
     }
 }
 
-/// ADR 0018 §1, ADR 0038 §2: whether a listed profile shows `custom`: a kind
-/// this release does not know, or a version outside the verified set (for
-/// TensorRT-LLM, beside the torch build the profile's `companions` record).
+/// ADR 0018 §1, ADR 0038 §2, ADR 0039 §3: whether a listed profile shows
+/// `custom`: a kind this release does not know, or a version outside its
+/// verified set (for TensorRT-LLM, beside the torch build the profile's
+/// `companions` record; for TensorFold's native line, its certified set).
 pub fn listed_custom(engine: Option<Engine>, version: &str, profile: &Value) -> bool {
     engine.is_none_or(|engine| {
-        !is_verified_with_torch(
+        !is_verified_profile(
             engine,
+            profile_line(profile),
             version,
             profile["companions"][crate::tensorrt_llm::TORCH].as_str(),
         )
