@@ -1336,6 +1336,26 @@ DROP TABLE wake_canaries;
 ALTER TABLE wake_canaries_v59 RENAME TO wake_canaries;
 "#;
 
+/// v60 (ADR 0034 §§3a, 4): LMCache by default.
+///
+/// - `checkpoint_sizes` and `checkpoint_digests` gain `kv_bytes_per_token`
+///   and `pool_context_tokens`, B and C as the host that read the checkpoint
+///   reported them with its sizing or its digest (as v55 added the model
+///   type), so the store sizes an automatic pool for an enrolled host's
+///   launch. A row written before v60, or by a host from before ADR 0034,
+///   reads null: an unknown basis, the 4 GiB default.
+/// - `launch_lmcache` gains how its pool was sized (`pool_source`, B and C,
+///   why they were unknown, the size before admission shrank it, the
+///   warning, the model type its basis names) and `uncertified`, the detail
+///   of a `lmcache: required` launch
+///   run outside the qualified table. A row written before v60 reads null:
+///   a pool of unknown source, certified.
+///
+/// The columns are added by `checkpoint_digests::migrate_v60` and
+/// `lmcache::migrate_v60` only when missing. Additive and forward-only.
+pub const SCHEMA_V60: &str =
+    "-- LMCache pool basis and uncertified runs (checkpoint_digests::migrate_v60, lmcache::migrate_v60)";
+
 #[cfg(test)]
 mod tests {
     use super::*;

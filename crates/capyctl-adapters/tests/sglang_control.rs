@@ -1117,6 +1117,7 @@ async fn a_restart_park_is_quiescent_on_the_engines_own_gauges() {
                 start_bound: Duration::from_secs(30),
                 proc_root: "/proc".into(),
                 required: false,
+                transfer: capyctl_config::lmcache::TransferMode::LmcacheDriven,
             },
         )
     };

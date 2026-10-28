@@ -334,7 +334,8 @@ impl InstallationGate {
     }
 
     /// ADR 0033 §1 (lifecycle design §2.3): a launch that is to start a
-    /// server has LMCache checked in its environment first. Drift is the
+    /// server has LMCache checked in its environment first, for the transfer
+    /// mode its server plan renders (ADR 0034 §1). Drift is the
     /// engine's: journaled once per digest, refused `installation_drift`
     /// under `refuse`. A failing check refuses `lmcache_unavailable:<reason>`
     /// under `required`; otherwise LMCache is off for the launch with the
@@ -343,16 +344,15 @@ impl InstallationGate {
         let Some(lmcache) = &self.lmcache else {
             return Ok(());
         };
-        if !matches!(
-            lmcache.state.launch(),
-            Some(capyctl_adapters::lmcache::LmcacheLaunch::Start(_))
-        ) {
+        let Some(capyctl_adapters::lmcache::LmcacheLaunch::Start(plan)) = lmcache.state.launch()
+        else {
             return Ok(());
-        }
-        let (engine, executable, registered) = (
+        };
+        let (engine, executable, registered, transfer) = (
             self.installation.engine,
             self.installation.executable.clone(),
             lmcache.registered.clone(),
+            plan.transfer,
         );
         let checked = tokio::task::spawn_blocking(move || {
             capyctl_agent::lmcache_install::check_lmcache(
@@ -360,6 +360,7 @@ impl InstallationGate {
                 engine,
                 &executable,
                 registered.as_ref(),
+                transfer,
             )
         })
         .await
@@ -941,6 +942,7 @@ mod tests {
             start_bound: std::time::Duration::from_secs(30),
             proc_root: "/proc".into(),
             required: false,
+            transfer: capyctl_config::lmcache::TransferMode::LmcacheDriven,
         }
     }
 
@@ -1246,6 +1248,83 @@ mod tests {
         assert!(required.report().is_none(), "a refusal reports nothing");
         assert!(installation.view().get("lmcache").is_none());
         assert!(drift_events(&owner).is_empty());
+    }
+
+    // T45 (ADR 0034 §1): the embedded launch-time check verifies the transfer
+    // mode the launch's server plan renders. On a release whose server
+    // offers no engine-driven transfer, a `restart_only` launch
+    // (lmcache-driven) starts its server, while a deep launch's
+    // (engine-driven) LMCache is off `check_failed` naming what is missing
+    // under `auto`, and refused `lmcache_unavailable:check_failed` under
+    // `required`.
+    #[tokio::test]
+    async fn the_lmcache_check_verifies_the_transfer_mode_the_launch_renders() {
+        use capyctl_adapters::lmcache::{LmcacheLaunch, LmcacheReport, LmcacheState, ServerPlan};
+        use capyctl_config::lmcache::{LmcacheOffReason, TransferMode};
+        let (_state_dir, owner) = owned_state();
+        let (env, executable, site) = lmcache_venv();
+        let config = site.join("lmcache/v1/multiprocess/config.py");
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(text.contains("\"--supported-transfer-mode\""));
+        std::fs::write(
+            &config,
+            text.replace("\"--supported-transfer-mode\"", "\"--mode\""),
+        )
+        .unwrap();
+        let registered = capyctl_agent::lmcache_install::measure_lmcache(
+            &capyctl_agent::installation::InstallationMeasurer::new(),
+            &executable,
+        )
+        .unwrap()
+        .expect("LMCache is installed")
+        .registration();
+        let installation = Arc::new(EmbeddedInstallation::register(
+            "local",
+            Engine::Vllm,
+            &executable,
+            None,
+        ));
+        let launch = |transfer: TransferMode, required: bool| {
+            let state = LmcacheState::new(LmcacheLaunch::Start(ServerPlan {
+                transfer,
+                ..server_plan(env.path())
+            }));
+            let gate = InstallationGate {
+                inner: Arc::new(NeverInitialized),
+                owner: owner.clone(),
+                installation: installation.clone(),
+                policy: InstallationDrift::Refuse,
+                host: "host-a".into(),
+                lmcache: Some(LmcacheCheck {
+                    state: state.clone(),
+                    required,
+                    registered: Some(registered.clone()),
+                }),
+            };
+            async move { (gate.admitted().await, state) }
+        };
+        let (verdict, restart_only) = launch(TransferMode::LmcacheDriven, true).await;
+        assert!(verdict.is_ok(), "{verdict:?}");
+        assert!(matches!(
+            restart_only.launch(),
+            Some(LmcacheLaunch::Start(_))
+        ));
+        let (verdict, deep) = launch(TransferMode::EngineDriven, false).await;
+        assert!(verdict.is_ok(), "{verdict:?}");
+        assert_eq!(deep.launch(), None, "no server is started");
+        match deep.report() {
+            Some(LmcacheReport::Off { reason, detail, .. }) => {
+                assert_eq!(reason, LmcacheOffReason::CheckFailed);
+                assert!(detail.contains("--supported-transfer-mode"), "{detail}");
+            }
+            other => panic!("LMCache must be off for the deep launch, got {other:?}"),
+        }
+        match launch(TransferMode::EngineDriven, true).await.0 {
+            Err(RuntimeError::Refused(code)) => {
+                assert_eq!(code, "lmcache_unavailable:check_failed")
+            }
+            other => panic!("required engine-driven LMCache must refuse, got {other:?}"),
+        }
     }
 
     /// An inner adapter the LMCache check tests never reach.

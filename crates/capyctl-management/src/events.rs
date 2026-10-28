@@ -564,6 +564,17 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
             ("host_id", Token),
             ("detail", Text),
         ],
+        // ADR 0034 §3a, §6: a `lmcache: required` launch runs LMCache
+        // uncertified; §4: a launch's automatic pool is short of one full
+        // context or was shrunk to the room left. Once per launch each.
+        "lmcache_uncertified" | "lmcache_pool_short" => &[
+            ("deployment_id", Id),
+            ("instance_index", Number),
+            ("generation", Number),
+            ("binding_id", Token),
+            ("host_id", Token),
+            ("detail", Text),
+        ],
         // ADR 0032 §7: an instance restarted because requests held until its
         // next stop alone filled the deployment's limit; its stop settles them.
         "instance_restarted_for_held_requests" => &[

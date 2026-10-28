@@ -149,6 +149,24 @@ impl HostKvShort {
     }
 }
 
+/// ADR 0033 §6, ADR 0034 §4: the host-KV bytes owners other than `owner`
+/// hold on the ledger domain `domain`, less the owners `released` would
+/// free. What [`host_kv_short`] counts against a limit, and what an
+/// automatic LMCache pool's room at admission is left after.
+pub fn host_kv_held(
+    ledger: &LedgerSnapshot,
+    owner: &str,
+    domain: &str,
+    released: &dyn Fn(&str) -> bool,
+) -> i64 {
+    ledger
+        .owners
+        .iter()
+        .filter(|(id, _)| id.as_str() != owner && !released(id))
+        .map(|(_, f)| amount(f, domain).1)
+        .fold(0, i64::saturating_add)
+}
+
 /// ADR 0033 §6: the host-KV limit `footprint` overruns on the ledger as it
 /// stands, less the owners `released` would free, or `None` when every
 /// host-KV limit takes it. With several, the one overrun the most.
@@ -164,12 +182,7 @@ pub fn host_kv_short(
         .filter_map(|limit| {
             let max = limit.host_kv_bytes?;
             let needs = amount(footprint, &limit.domain).1;
-            let held: i64 = ledger
-                .owners
-                .iter()
-                .filter(|(id, _)| id.as_str() != owner && !released(id))
-                .map(|(_, f)| amount(f, &limit.domain).1)
-                .fold(0, i64::saturating_add);
+            let held = host_kv_held(ledger, owner, &limit.domain, released);
             (needs > 0 && needs.saturating_add(held) > max).then(|| HostKvShort {
                 domain: limit.domain.clone(),
                 needs,

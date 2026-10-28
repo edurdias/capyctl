@@ -647,11 +647,12 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 // ADR 0030 §1: the API the deployment serves, `chat` (the
                 // default) or `decisions`.
                 ("api", SCALAR),
-                // ADR 0033 §9, §6, §10: `auto` (the default), `off` or
-                // `required`; the pool, a whole number of GiB; `standard`
-                // (the default) or `zero`.
+                // ADR 0033 §9, §6, §10, ADR 0034 §4: `auto` (the default),
+                // `off` or `required`; the pool, `auto` (the default) or a
+                // whole number of GiB, checked by resolution
+                // (`invalid_config`); `standard` (the default) or `zero`.
                 ("lmcache", SCALAR),
-                ("lmcache_pool", BYTES),
+                ("lmcache_pool", SCALAR),
                 ("retention", SCALAR),
                 // ADR 0013 §2: `host` is shorthand for `placement.hosts: [host]`.
                 ("host", SCALAR),

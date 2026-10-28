@@ -101,6 +101,9 @@ struct Target {
     /// ADR 0035 §5: a built-in engine's launch on several GPUs; its owned
     /// listeners are checked at every re-proof.
     several_gpus: bool,
+    /// ADR 0034 §1: the transfer mode the launch's LMCache server serves,
+    /// from the frozen revision's residency.
+    transfer: capyctl_config::lmcache::TransferMode,
 }
 
 pub struct LocalReadiness {
@@ -309,6 +312,16 @@ impl LocalReadiness {
                     .identities
                     .iter()
                     .any(|identity| identity.rank_role().is_some()));
+        // ADR 0034 §1: the transfer mode of the residency the launch was
+        // rendered with (the re-proof reads only the server's ports and
+        // `/proc`, so an unreadable residency changes no proof).
+        let transfer = serde_json::from_value::<capyctl_config::effective::Residency>(
+            effective["residency"].clone(),
+        )
+        .map_or(
+            capyctl_config::lmcache::TransferMode::LmcacheDriven,
+            capyctl_config::lmcache::transfer_mode,
+        );
         Ok(Target {
             url,
             key,
@@ -316,6 +329,7 @@ impl LocalReadiness {
             api,
             custom,
             several_gpus,
+            transfer,
         })
     }
 
@@ -391,6 +405,7 @@ impl LocalReadiness {
         &self,
         launch: &LocalReadyLaunch,
         server: &[ProcessIdentity],
+        transfer: capyctl_config::lmcache::TransferMode,
     ) -> Result<(), String> {
         if self.lmcache_forbidden {
             return Err(
@@ -426,6 +441,7 @@ impl LocalReadiness {
             start_bound: Duration::from_millis(capyctl_config::lmcache::SERVER_START_BOUND_MS),
             proc_root: std::path::PathBuf::from("/proc"),
             required: false,
+            transfer,
         };
         let tools: Arc<dyn capyctl_adapters::traits::OwnedProcessLaunch> = Arc::new(
             capyctl_launchers::DurableProcessLaunch::new(Arc::new(ProveOnly)),
@@ -448,7 +464,7 @@ impl LocalReadiness {
         // that is gone or exposed is never re-admitted.
         let server = capyctl_domain::completion::lmcache_members(&launch.identities);
         if !server.is_empty() {
-            self.prove_lmcache(launch, &server).await?;
+            self.prove_lmcache(launch, &server, target.transfer).await?;
         }
         match &target.custom {
             Some(custom) => self.prove_custom(launch, &target, custom).await?,

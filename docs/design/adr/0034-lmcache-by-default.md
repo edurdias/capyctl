@@ -7,9 +7,11 @@ question on 2026-10-27, and the answers are recorded below ("Owner decisions of
 is qualified in 0.2.0 (§2, §3, owner decision 7), and the model types beyond `qwen3` are
 the most-used open-weight dense chat model types on OpenRouter that fit the hosts (§2,
 owner decision 9). The owner's rule of the same day on certified combinations changes what
-`lmcache: required` does outside the qualified table (§3a, §6). Nothing is implemented
-yet; the SPEC, ADR, guide and operations texts listed in §8 change with the
-implementation.
+`lmcache: required` does outside the qualified table (§3a, §6). Implemented on
+2026-10-28 (branch `feat/lmcache-default`, store schema v60), with the texts of §8; the
+live rows LC12–LC18 have not run, so `QUALIFIED_PARKING` and the LC16/LC18 results that
+move `restart_only` to engine-driven transfer are still empty, and the model list of §2 is
+compiled and awaits the owner.
 **Amends (with the implementation):** ADR 0033 §1 (the launch-time check reads the
 transfer-mode and eviction options), §3 (the server's argument vector), §4 (the rendered
 connector), §6 (the pool size), §7 (parking residencies and the qualified table;

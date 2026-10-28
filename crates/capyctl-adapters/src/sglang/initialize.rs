@@ -158,14 +158,17 @@ async fn launch(
     if let Some(connector) = &connector {
         // ADR 0033 §4: the owner-only connector file, named by the public
         // settings; the entry renders `enable_lmcache` and the file and pins
-        // both after SGLang resolved its arguments.
+        // both after SGLang resolved its arguments. ADR 0034 §1: the file
+        // names the transfer mode the server serves.
         let dir = connector.plan().config_dir.clone();
         let port = connector.rpc_port();
-        let file =
-            tokio::task::spawn_blocking(move || crate::lmcache::write_sglang_config(&dir, port))
-                .await
-                .map_err(|_| RuntimeError::Uncertain("LMCache configuration task failed".into()))?
-                .map_err(|e| RuntimeError::Uncertain(format!("LMCache configuration: {e}")))?;
+        let transfer = connector.plan().transfer;
+        let file = tokio::task::spawn_blocking(move || {
+            crate::lmcache::write_sglang_config(&dir, port, transfer)
+        })
+        .await
+        .map_err(|_| RuntimeError::Uncertain("LMCache configuration task failed".into()))?
+        .map_err(|e| RuntimeError::Uncertain(format!("LMCache configuration: {e}")))?;
         launch.rendered = launch.rendered.with_lmcache_config_file(&file)?;
     }
 

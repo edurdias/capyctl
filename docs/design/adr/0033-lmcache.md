@@ -8,6 +8,8 @@ the measured defaults of §6, the server's command line and log, the SGLang salt
 stopped and after the wake until a reading shows it released (A13), `restart_only`
 decision deployments parking with LMCache, and decision deployments on SGLang running
 without LMCache until LC7 passes on a release (A10).
+**Amended by:** [ADR 0034](0034-lmcache-by-default.md) (implemented 2026-10-28): §1, §3, §4, §6, §7, §9, §14
+and the Verification, as that ADR lists.
 **Amends (with the implementation):** `SPEC.md` §7.4 (a private cache service per
 instance), §8.2 (the rendered connector is owned), §9.1 and §9.2 (LMCache beside a
 parking residency only where qualified), §10 (`cache_salt` is no longer forwarded
@@ -370,6 +372,14 @@ records it. A deployment that wants LMCache there declares `residency: restart_o
 Under `lmcache: required` such a deployment is refused
 `lmcache_unavailable:park_unqualified`. A later release that adds the combination to the
 table turns LMCache on for it at the next launch.
+
+*Amended 2026-10-28 by [ADR 0034](0034-lmcache-by-default.md) (§§1, 3a, 5; owner decisions and rule of 2026-10-27):* a
+parking residency runs LMCache with engine-driven transfer, which the table's rows certify
+(LC13–LC16); under `lmcache: required` a combination outside the table runs LMCache as an
+uncertified setup instead of being refused `lmcache_unavailable:park_unqualified`; and the
+advice to declare `residency: restart_only` for LMCache is withdrawn: `restart_only` is for
+models that cannot park deep. The pool of §6 is sized automatically by default
+(ADR 0034 §4, `lmcache_pool: auto`).
 
 ### 8. The engine fails to start with the connector
 

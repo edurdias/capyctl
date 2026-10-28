@@ -312,10 +312,9 @@ fn draft_shape(inputs: &FitInputs<'_>) -> Result<Option<KvShape>, String> {
     }
 }
 
-/// The largest block-aligned context the grant holds for `shape` (and the
-/// draft model's `draft`, whose KV shares the grant), capped at the model's
-/// maximum position.
-fn fitted_tokens(
+/// Key plus value bytes for one token of `shape` (and the draft model's
+/// `draft`, whose KV shares the grant), at the launch's element width.
+fn per_token_bytes(
     inputs: &FitInputs<'_>,
     shape: &KvShape,
     draft: Option<&KvShape>,
@@ -331,6 +330,18 @@ fn fitted_tokens(
             .and_then(|bytes| bytes.checked_add(per_token))
             .ok_or("the KV bytes per token overflow")?;
     }
+    Ok(per_token)
+}
+
+/// The largest block-aligned context the grant holds for `shape` (and the
+/// draft model's `draft`, whose KV shares the grant), capped at the model's
+/// maximum position.
+fn fitted_tokens(
+    inputs: &FitInputs<'_>,
+    shape: &KvShape,
+    draft: Option<&KvShape>,
+) -> Result<u64, String> {
+    let per_token = per_token_bytes(inputs, shape, draft)?;
     let grant = u64::try_from(inputs.kv_cache_bytes)
         .ok()
         .filter(|bytes| *bytes > 0)
@@ -800,6 +811,63 @@ pub fn fit_for_effective(effective: &crate::effective::EffectiveDeployment) -> C
         effective.model.resolved_path.as_deref().map(Path::new),
         draft_root(effective),
     )
+}
+
+/// ADR 0034 §4: the KV bytes per token the fit sizes a vLLM or SGLang launch
+/// of `effective` with, on the machine that reads its checkpoint: the
+/// checkpoint's (sliding-window and hybrid layers counted as full
+/// attention, SGLang's gated-delta-net hybrids by their attention layers as
+/// amendment A14 sizes them) plus a draft model's, at the launch's element
+/// width. Any engine without LMCache, or a shape the fit cannot read, is an
+/// error naming why.
+pub fn bytes_per_token_for_effective(
+    effective: &crate::effective::EffectiveDeployment,
+) -> Result<u64, String> {
+    let engine = effective.profile.engine;
+    let (common, memory) = match &effective.engine_config {
+        LaunchSettings::Vllm(s) => (&s.common, &s.memory),
+        LaunchSettings::Sglang(s) => (&s.common, &s.memory),
+        _ => return Err("CapyCTL sizes no KV cache for this engine".into()),
+    };
+    let root = effective
+        .model
+        .resolved_path
+        .as_deref()
+        .map(Path::new)
+        .ok_or("the deployment resolves to no checkpoint directory")?;
+    let config = read_model_config(root)?;
+    let mut shape = KvShape::from_config(&config)?;
+    if engine == Engine::Sglang {
+        if let Some(layers) = sglang_pool::gated_delta_attention_layers(&config) {
+            shape.layers = layers;
+        }
+    }
+    let args: Vec<String> = effective
+        .profile
+        .args
+        .iter()
+        .chain(effective.engine_config.extra_args())
+        .cloned()
+        .collect();
+    let draft = draft_root(effective)
+        .map(Path::to_path_buf)
+        .or_else(|| crate::engine_policy::draft_model_path(engine, &args).map(Into::into))
+        .map(|path| read_model_config(&path));
+    let inputs = FitInputs {
+        declared: None,
+        kv_cache_bytes: memory.kv_cache_bytes,
+        kv_cache_dtype: common.kv_cache_dtype.as_deref(),
+        dtype: common.dtype.as_deref(),
+        block_tokens: None,
+        reserved_blocks: 0,
+        draft: draft
+            .as_ref()
+            .map(|config| config.as_ref().map_err(String::as_str)),
+        vllm: None,
+        sglang: engine == Engine::Sglang,
+    };
+    let draft = draft_shape(&inputs)?;
+    per_token_bytes(&inputs, &shape, draft.as_ref())
 }
 
 /// ADR 0008 amendment 2026-10-08: a declared drafter's directory on the

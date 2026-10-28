@@ -1107,6 +1107,22 @@ fn store_shaped(kind: &str) -> (serde_json::Value, Option<String>, Option<String
             "detail":"the LMCache server exited"}),
             (Some(DEP.to_owned()), None),
         ),
+        // T45 (ADR 0034 §3a, §6): a `lmcache: required` launch outside the
+        // certified set.
+        "lmcache_uncertified" => (
+            serde_json::json!({"version":"1","deployment_id":DEP,"instance_index":0,
+            "generation":3,"binding_id":"01BX5ZZKBKACTAV9WEVGEMMVS4","host_id":"host-a",
+            "detail":"vLLM 0.32.0 / qwen3 / NVIDIA GB10 / deep is not in the qualified table"}),
+            (Some(DEP.to_owned()), None),
+        ),
+        // T45 (ADR 0034 §4): an automatic pool short of one full context.
+        "lmcache_pool_short" => (
+            serde_json::json!({"version":"1","deployment_id":DEP,"instance_index":0,
+            "generation":3,"binding_id":"01BX5ZZKBKACTAV9WEVGEMMVS4","host_id":"host-a",
+            "detail":"the LMCache pool (12 GiB) keeps about 55,900 tokens after eviction; \
+            one full context of 65,536 tokens needs 15 GiB: raise host_kv_limit or set lmcache_pool"}),
+            (Some(DEP.to_owned()), None),
+        ),
         "instance_restarted_for_held_requests" => (
             serde_json::json!({"version":"1","deployment_id":DEP,"operation_id":OP,
             "instance_index":0,"generation":3,"count":32}),

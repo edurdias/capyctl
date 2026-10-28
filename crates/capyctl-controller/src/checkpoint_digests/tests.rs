@@ -155,6 +155,7 @@ async fn the_supervisor_records_measurements_and_backs_off_after_refusals() {
             tables: None,
             gguf: None,
             model_type: None,
+            pool_basis: None,
         }),
         calls: AtomicUsize::new(0),
     });
@@ -186,6 +187,7 @@ async fn a_recorded_digest_keeps_where_it_came_from() {
             tables: None,
             gguf: None,
             model_type: None,
+            pool_basis: None,
         }),
         calls: AtomicUsize::new(0),
     });
@@ -206,6 +208,7 @@ async fn a_recorded_digest_keeps_where_it_came_from() {
             tables: None,
             gguf: None,
             model_type: None,
+            pool_basis: None,
         }),
         calls: AtomicUsize::new(0),
     });
@@ -342,6 +345,7 @@ impl DigestSource for SizedFirst {
             Ok(SizedCheckpoint {
                 weights_bytes: 7,
                 model_type: None,
+                pool_basis: None,
             })
         })
     }
@@ -758,6 +762,7 @@ async fn a_legacy_wake_measures_and_records_the_digest_first() {
                 tables: None,
                 gguf: None,
                 model_type: None,
+                pool_basis: None,
             })
         }
     };
@@ -824,6 +829,7 @@ async fn a_legacy_wake_is_refused_on_mismatch_or_without_a_measurement() {
                 tables: None,
                 gguf: None,
                 model_type: None,
+                pool_basis: None,
             })
         },
     )
@@ -859,6 +865,7 @@ async fn a_first_placement_mismatch_is_refused_as_checkpoint_mismatch() {
                 tables: None,
                 gguf: None,
                 model_type: None,
+                pool_basis: None,
             })
         },
     )
@@ -903,6 +910,7 @@ async fn a_first_placement_mismatch_is_refused_as_checkpoint_mismatch() {
                     tables: None,
                     gguf: None,
                     model_type: None,
+                    pool_basis: None,
                 })
             }
         },
@@ -1015,4 +1023,37 @@ async fn an_aborted_supervisor_aborts_its_measurements() {
     .await
     .expect("the measurement outlived its supervisor");
     assert_eq!(record_of(&f).state, DigestState::Pending);
+}
+
+// T45 (ADR 0034 §4): a remote host's sizing and digest evidence carry B and
+// C of an automatic LMCache pool to the store; an older host's (both zero)
+// carries none.
+#[test]
+fn remote_evidence_carries_the_pool_basis_it_names() {
+    let basis = capyctl_config::lmcache::PoolBasis {
+        bytes_per_token: 147_456,
+        context_tokens: 32_768,
+    };
+    let result = |state: &str, bytes: u64, tokens: u64| pb::MemberExecutionResult {
+        checkpoint: Some(pb::CheckpointDigestEvidence {
+            state: state.into(),
+            digest: format!("sha256:{}", "1".repeat(64)),
+            weights_bytes: 7,
+            total_bytes: 7,
+            provenance: "measured".into(),
+            kv_bytes_per_token: bytes,
+            pool_context_tokens: tokens,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let measured = measured_from(&result("computed", 147_456, 32_768)).unwrap();
+    assert_eq!(measured.pool_basis, Some(basis));
+    let sized = sized_from(&result("sized", 147_456, 32_768)).unwrap();
+    assert_eq!(sized.pool_basis, Some(basis));
+    assert_eq!(
+        measured_from(&result("computed", 0, 0)).unwrap().pool_basis,
+        None
+    );
+    assert_eq!(sized_from(&result("sized", 0, 0)).unwrap().pool_basis, None);
 }

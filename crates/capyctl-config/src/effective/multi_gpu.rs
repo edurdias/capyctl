@@ -615,8 +615,9 @@ fn leading_code(error: &ConfigError) -> String {
 /// resolves, with no managed limit refused (the table records the charge;
 /// [`choose_tensor_parallel`] judges it). A size the explicit deployment is
 /// refused at (the engine's support data, the attention heads, a declared
-/// `deep` or `host_backed` while the engine's N > 1 parking gate is closed,
-/// `lmcache: required`) is left out with its code. N = 1's refusal is the
+/// `deep` or `host_backed` while the engine's N > 1 parking gate is closed)
+/// is left out with its code; ADR 0034 §6: `lmcache: required` no longer
+/// is, since several GPUs run LMCache uncertified. N = 1's refusal is the
 /// deployment's.
 pub(super) fn candidate_table(
     document: &Value,
