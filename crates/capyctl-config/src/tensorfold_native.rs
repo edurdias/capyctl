@@ -629,6 +629,7 @@ mod tests {
         let approved = BTreeSet::new();
         let context = ExtraArgsContext {
             engine: crate::engine_policy::Engine::Tensorfold,
+            api: crate::effective::DeploymentApi::Chat,
             line: TensorfoldLine::Native,
             sleep_mode: false,
             approved_options: &approved,
