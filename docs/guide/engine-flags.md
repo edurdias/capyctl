@@ -219,6 +219,46 @@ checkpoint.
 | Background priority by served name | `--name-priority` | extra | 0.6.6 and later, CUDA only: `ID=background`, where `ID` is the served name or an alias. CapyCTL passes no `--name` to the follower of a two-GPU group, so the option may fail there. |
 | Authentication | `--api-key`, `--api-key-file`, `--metrics-open` | reserved | CapyCTL owns authentication. The `TENSORFOLD_API_KEY` variable is reserved too. |
 
+## TensorFold native 1.0.0 and 1.1.5
+
+The options of `tensorfold-native serve` (`zig/src/server/cli.zig` at v1.0.0
+and v1.1.5), TensorFold's native line ([TensorFold](engines.md#tensorfold)).
+The native parser matches option names exactly and expands no abbreviation,
+so CapyCTL compares exact names too: a reserved option is refused as written
+and as `--name=value`, and an abbreviation is not refused by CapyCTL (the
+engine refuses it, as it refuses any flag this release does not serve: the
+start fails and the launch failure names the flag). These refusals apply to
+every native version, certified or not.
+
+| Need | Option | Class | CapyCTL |
+|---|---|---|---|
+| Served name and listener | `--host`, `--port`, `--name`, `--alias` | reserved | CapyCTL renders the served name and the loopback listener. |
+| Backend | `--backend` | reserved | CapyCTL renders `cuda`. |
+| Context length | `--context` | reserved | `engine_config.context_length`. CapyCTL always renders it. |
+| Snapshots | `--snapshot-dir`, `--max-snapshots` | reserved | CapyCTL renders `--snapshot-dir none`. |
+| Release check | `--no-update-check` | reserved | CapyCTL always renders it; 1.0 and 1.1.5 have no release check. |
+| GPU | `--device` | reserved | CapyCTL pins the GPU with `CUDA_VISIBLE_DEVICES`; the engine's ordinal 0 is that GPU. |
+| Authentication | `--api-key`, `--api-key-file`, `--metrics-open` | reserved | CapyCTL owns authentication. The `TENSORFOLD_API_KEY` variable is refused too. |
+| Two-Mac pairing and the dashboard | `--speed-up`, `--dashboard` | reserved | A topology CapyCTL does not run, and an extra page on the engine's port. |
+| Idle unloading (1.1.5) | `--idle-unload` | reserved | The idle policy is CapyCTL's (`ready_idle_timeout`); CapyCTL renders nothing and the engine's default `0` stays. |
+| Host and origin admission (1.1.5) | `--allowed-host`, `--allowed-origin` | reserved | CapyCTL is the engine's only client, at `127.0.0.1`. |
+| Web search (1.1.5) | `--cortheon` | reserved | It makes web requests from the engine. `BRAVE_SEARCH_API_KEY` is refused too. |
+| Groups (1.1.5) | `--tp`, `--rank`, `--master`, `--master-port` | reserved | The native line serves no group; a `topology` is refused. |
+| Draft model | `--drafter` | reserved | Refused `capability_missing`: the native engine drafts with the checkpoint's own MTP head, and CapyCTL renders no drafter. |
+| No drafts | `--no-drafts` | extra | |
+| Reasoning | `--thinking`, `--no-thinking` | typed | `engine_config.tensorfold.thinking` |
+| Reasoning budget | `--thinking-budget`, `--reasoning-effort` | extra | |
+| Max tokens a reply | `--max-tokens` | typed | `engine_config.tensorfold.max_tokens` |
+| Max running requests | `--parallel` | extra | Or `engine_config.max_concurrent_requests`, which renders it (8 when neither says). Not both. With a number the engine refuses to start rather than serve fewer streams. |
+| Sampling defaults | `--temperature`, `--top-p`, `--top-k`, `--min-p` | extra | |
+| Loop guard | `--loop-guard` | extra | |
+| Prompt chunks a call | `--segments` | extra | The `TF_CUDA_SEGMENTS` variable is refused; use the option. |
+| Context compaction | `--compact-at`, `--compact-keep`, `--compact-memory` | extra | Refused `retention_zero:compaction` under `retention: zero`. |
+| Recording, learning and recall (1.1.5) | `--record`, `--learn`, `--learn-dir`, `--learn-conversations`, `--recall`, `--recall-dir` | extra | They write request state to disk: refused `retention_zero:engine_disk` under `retention: zero`, with every other `--learn-*` and `--recall-*` option. |
+| Metal only | `--keep-warm`, `--prompt-cache-gib`, `--prompt-cache-over-cap` | extra | They do nothing on CUDA. |
+| KV cache dtype | none | — | The native engine has no option; `engine_config.kv_cache_dtype` is refused (its KV cache is BF16). |
+| Memory limit | none | — | CapyCTL sets `TENSORFOLD_CUDA_MEMORY_LIMIT_GB` to the declared Ready memory and `TENSORFOLD_MEMORY_RESERVE_GIB` to 2. Neither can be changed. |
+
 ## llama.cpp v0.6.0
 
 The options of `llama-server` at the v0.6.0 tag (`common/arg.cpp`). llama-server

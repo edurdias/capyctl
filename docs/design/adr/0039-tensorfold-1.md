@@ -5,9 +5,11 @@ answered every open question on 2026-10-27, and the answers are recorded below (
 decisions of 2026-10-27"). Four answers differ from the recommendations: 1.0.0 and 1.1.5
 are both certified and every other native version runs uncertified (§3), no checkpoint is
 refused for being uncertified (§7), the compaction options are ordinary except under zero
-data retention (§4), and the default profile name is `tensorfold` (§2). Nothing is
-implemented yet; the SPEC, guide and operations texts this ADR lists change with the
-implementation, as for ADRs 0030 and 0033.
+data retention (§4), and the default profile name is `tensorfold` (§2). Implemented on
+2026-10-28 (branch `feat/tensorfold-native`, no store migration), with the texts of §17;
+the live rows TF1 to TF14 have not run, so neither 1.0.0 nor 1.1.5 is in the certified
+set yet (each joins once its rows pass, §3) and the native line is not yet the documented
+path for Nemotron 3.5 Lightning on a GB10 (owner decision 7).
 **Amends (with the implementation):** `SPEC.md` §9.3 (a second TensorFold line), §10 (the
 idle reading of a native TensorFold engine), §20 (T41); ADR 0023 §1 to §8 (each gains the
 native line beside the Python one); ADR 0018 §1 (a third installation form: a release

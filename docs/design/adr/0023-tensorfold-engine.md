@@ -19,6 +19,9 @@ extensions with `torch.utils.cpp_extension`.
 
 ### 1. Engine kind
 
+*TensorFold native 1.x:* this section describes the Python (0.6) line; the native line
+of the same engine kind is [ADR 0039](0039-tensorfold-1.md) §1.
+
 `tensorfold` joins `vllm` and `sglang` in every closed engine set. The default
 profile name is `tensorfold`; the entry point is `<env>/bin/tensorfold`; the
 version check is `<env>/bin/tensorfold --version`. Detection reads
@@ -29,6 +32,10 @@ the verified set also gains 0.6.6, whose only upstream change from 0.6.5 is the
 `--name-priority` option.
 
 ### 2. Registration
+
+*TensorFold native 1.x:* a release directory holding `bin/tensorfold-native` registers
+without a toolchain, by its version line, `SHA256SUMS` and capabilities document
+([ADR 0039](0039-tensorfold-1.md) §2, §3).
 
 `capyctl engine add` refuses a TensorFold installation with `toolchain_missing`
 (exit 26) unless `ninja`, `nvcc` and `c++` or `g++` are on the engine's closed
@@ -47,6 +54,9 @@ same toolchain check and profile names (`local`, or `local-tensorfold` beside
 another engine).
 
 ### 3. Launch
+
+*TensorFold native 1.x:* the native command, its exact-name reserved options and its
+closed environment are [ADR 0039](0039-tensorfold-1.md) §4 and §5.
 
 `<env>/bin/tensorfold serve <model dir> --name <served> --host 127.0.0.1
 --port <port> --no-update-check --backend cuda --snapshot-dir none --context <n>
@@ -79,6 +89,9 @@ is what re-verifies them. `--vision-urls`, `--lane-kernels` and `--drafter` need
 host approval by name; `--vision` is ordinary.
 
 ### 4. Deployment configuration
+
+*TensorFold native 1.x:* the native line's refusals, checkpoint notes and memory figure
+are [ADR 0039](0039-tensorfold-1.md) §6 to §8.
 
 `context_length` is required and renders `--context`; `kv_cache_dtype` renders
 `--kv-dtype`; `engine_config.tensorfold` takes `max_tokens` and `thinking`. The common fields TensorFold has no flag for are refused; `max_concurrent_requests` renders `--parallel` (amendment below). A
@@ -152,6 +165,9 @@ offline, by domain with `--host`.
 
 ### 5. Drafter
 
+*TensorFold native 1.x:* CapyCTL renders no drafter on the native line
+([ADR 0039](0039-tensorfold-1.md) §6).
+
 A drafter is handled as vLLM's and SGLang's draft models are (ADR 0014 §8 and
 Amendment A3): `--drafter <dir>` is an extra argument the host approves by name,
 whose directory must lie inside `security.approved_paths`, checked lexically at
@@ -160,6 +176,9 @@ CapyCTL neither fetches a drafter nor records its digest, as for the other
 engines' draft models.
 
 ### 6. Readiness, drain, park and wake
+
+*TensorFold native 1.x:* the native line's readiness, `/metrics` idle signal and stop are
+[ADR 0039](0039-tensorfold-1.md) §9, §10 and §12.
 
 Ready is `GET /health` with `"ok": true` and the served name in `/v1/models`, then
 the chat probe; a non-empty `content` or `reasoning_content` is an answer. The
@@ -181,11 +200,17 @@ checked again when redelivered (owner decision 2026-10-01). Waking is a fresh la
 
 ### 7. Requests
 
+*TensorFold native 1.x:* requests and cancellation on the native line are
+[ADR 0039](0039-tensorfold-1.md) §10.
+
 Routing selects the deployment; the forwarded request carries the served name.
 Responses pass through unchanged, including `reasoning_content` and the
 `tensorfold` object, in both streaming and collected form.
 
 ### 8. Load reports
+
+*TensorFold native 1.x:* the native line's load reports are not folded with `/health`
+([ADR 0039](0039-tensorfold-1.md) §11).
 
 The host scrapes `tensorfold:requests_running`, `tensorfold:requests_waiting` and
 `tensorfold:kv_cache_usage_ratio`, and forwards `tensorfold:time_to_first_token_seconds`

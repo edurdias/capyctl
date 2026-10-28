@@ -91,30 +91,36 @@ CapyCTL relays each chunk unchanged except `model`, and checks it first: a
 field never reaches a client. Fields beside `delta` in a
 choice, and `usage` with its details, are relayed as the engine sent them.
 
-| Field | Where | vLLM 0.29–0.31 | SGLang 0.5.18–0.5.21 | TensorFold 0.6.x | llama.cpp v0.6.0 |
-|---|---|---|---|---|---|
-| `role` | delta | yes | yes (may be `null`) | yes | yes (opening chunk) |
-| `content` | delta | yes | yes | yes | yes (`null` on the opening chunk) |
-| `reasoning` | delta | yes | — | — | — |
-| `reasoning_content` | delta | — | yes | yes | yes |
-| `tool_calls` | delta | yes | yes | yes | yes |
-| `index`, `finish_reason`, `logprobs` | choice | yes | yes | `index`, `finish_reason` | yes |
-| `stop_reason`, `token_ids` | choice | yes | — | — | — |
-| `matched_stop` | choice | — | yes | — | — |
-| `prompt_tokens`, `completion_tokens`, `total_tokens` | usage | yes | yes | yes | yes |
-| `prompt_tokens_details.cached_tokens` | usage | yes (`--enable-prompt-tokens-details`) | yes (when any were cached) | yes | yes |
-| `completion_tokens_details.reasoning_tokens` | usage | yes | — | yes | — |
-| `reasoning_tokens` | usage | — | yes | — | — |
-| `metrics` | chunk | yes (usage chunk) | — | — | — |
-| `exact_mode`, `tensorfold`, `speculative` | chunk | — | — | yes (finish chunk) | — |
-| `system_fingerprint`, `timings` | chunk | — | — | — | yes (`timings` on the last chunk) |
+| Field | Where | vLLM 0.29–0.31 | SGLang 0.5.18–0.5.21 | TensorFold 0.6.x | TensorFold native 1.0.0 | llama.cpp v0.6.0 |
+|---|---|---|---|---|---|---|
+| `role` | delta | yes | yes (may be `null`) | yes | yes (opening chunk when the request sends no tools) | yes (opening chunk) |
+| `content` | delta | yes | yes | yes | yes | yes (`null` on the opening chunk) |
+| `reasoning` | delta | yes | — | — | — | — |
+| `reasoning_content` | delta | — | yes | yes | yes | yes |
+| `tool_calls` | delta | yes | yes | yes | yes | yes |
+| `index`, `finish_reason`, `logprobs` | choice | yes | yes | `index`, `finish_reason` | `index`, `finish_reason` | yes |
+| `stop_reason`, `token_ids` | choice | yes | — | — | — | — |
+| `matched_stop` | choice | — | yes | — | — | — |
+| `prompt_tokens`, `completion_tokens`, `total_tokens` | usage | yes | yes | yes | yes | yes |
+| `prompt_tokens_details.cached_tokens` | usage | yes (`--enable-prompt-tokens-details`) | yes (when any were cached) | yes | yes | yes |
+| `completion_tokens_details.reasoning_tokens` | usage | yes | — | yes | yes | — |
+| `reasoning_tokens` | usage | — | yes | — | — | — |
+| `metrics` | chunk | yes (usage chunk) | — | — | — | — |
+| `exact_mode`, `tensorfold`, `speculative` | chunk | — | — | yes (finish chunk) | yes (finish chunk) | — |
+| `system_fingerprint`, `timings` | chunk | — | — | — | — | yes (`timings` on the last chunk) |
 
 Not relayed: SGLang's `hidden_states` delta (sent only for
 `return_hidden_states`, a request field CapyCTL refuses) and vLLM's `citations`
 delta (its Cohere endpoint only). The table was read from the vLLM 0.29.0,
-SGLang 0.5.20 and TensorFold 0.6.0 and 0.6.3 sources; vLLM 0.30's `reasoning`
+SGLang 0.5.20 and TensorFold 0.6.0 and 0.6.3 sources, and from TensorFold
+native 1.0.0's source (`zig/src/server/openai.zig`, `chat.zig` and
+`tool_streaming.zig` at tag `v1.0.0`). TensorFold native 1.0.0 puts usage on
+the finish chunk, or in its own chunk with empty `choices` when the request
+sets `stream_options.include_usage`, and adds `stop_sequence` to the finish
+chunk when a stop sequence ended the answer. vLLM 0.30's `reasoning`
 was confirmed live, vLLM 0.31.0's streamed answers were relayed live, and the
-other listed versions are assumed to match until run against them.
+other listed versions, TensorFold native 1.0.0 among them, are assumed to
+match until run against them.
 
 ### When a request is cut short
 
@@ -185,6 +191,8 @@ At one reading every 100 ms, 0.1 s is the smallest figure this can show.
 | vLLM 0.32.0 | Qwen3-4B-Instruct-2507, BF16 | 0.10 / 0.10 | 0.10 / 0.10 | `vllm:num_requests_running`, `vllm:num_requests_waiting` |
 | llama.cpp v0.7.0 | Qwen3-4B, Q4_K_M GGUF | 0.10 / 0.10 | 0.10 / 0.10 | `llamacpp:requests_processing`, `llamacpp:requests_deferred` |
 | TensorFold 0.6.6 | FrogNano-4B-2609, NVFP4 | 0.10 / 0.10 | 0.10 / 0.10 | `/health`: `requests_running`, `busy` |
+| TensorFold native 1.0.0 | Nemotron 3.5 Lightning 30B-A3B, MLX 4-bit | not measured yet (TF6) | not measured yet (TF6) | `/metrics`: `tensorfold:requests_running`, `tensorfold:requests_waiting` |
+| TensorFold native 1.1.5 | Nemotron 3.5 Lightning 30B-A3B, MLX 4-bit | not measured yet (TF14) | not measured yet (TF14) | `/metrics`: `tensorfold:requests_running`, `tensorfold:requests_waiting` |
 
 All four requests stopped together on every engine; none started again
 within 5 s. CapyCTL asks the engine for a stream even when your client did
@@ -249,13 +257,17 @@ the prompt. A router `decode_tokens_per_second` is the completion tokens
 after the first, over the time from that first text to the last chunk. A
 figure nobody measured is left out, never shown as zero.
 
-| Figure | vLLM 0.30, 0.31 | SGLang 0.5.21 | TensorFold 0.6.x | llama.cpp v0.6.0 |
-|---|---|---|---|---|
-| `ttft_ms` | engine: queue plus prompt | router | engine, from when it received the request; router on CUDA Qwen models | router |
-| `queue_ms` | engine | — | — | — |
-| `prefill_ms` | engine, from when it scheduled the request | — | engine, from when it queued the request (CUDA Qwen models: `prefill_s`, from when it started the request) | engine (`timings.prompt_ms`, from when a slot took the request) |
-| `decode_tokens_per_second` | engine, from its mean time between tokens | router | engine; router when it timed no decode, and on CUDA Qwen models | engine (`timings.predicted_per_second`); router when it timed no decode |
-| `cached_tokens` | engine, only with `--enable-prompt-tokens-details` | engine, only when some were cached | engine | engine |
+| Figure | vLLM 0.30, 0.31 | SGLang 0.5.21 | TensorFold 0.6.x | TensorFold native 1.0.0 | llama.cpp v0.6.0 |
+|---|---|---|---|---|---|
+| `ttft_ms` | engine: queue plus prompt | router | engine, from when it received the request; router on CUDA Qwen models | engine (`time_to_first_token`), from when it received the request; router when it sent none | router |
+| `queue_ms` | engine | — | — | — | — |
+| `prefill_ms` | engine, from when it scheduled the request | — | engine, from when it queued the request (CUDA Qwen models: `prefill_s`, from when it started the request) | engine (`prefill_seconds`) when it timed the prompt; absent when it sent `null` | engine (`timings.prompt_ms`, from when a slot took the request) |
+| `decode_tokens_per_second` | engine, from its mean time between tokens | router | engine; router when it timed no decode, and on CUDA Qwen models | engine (`tokens_per_second`: tokens after the first, over the time from the end of the prompt to the end); router when it sent 0 | engine (`timings.predicted_per_second`); router when it timed no decode |
+| `cached_tokens` | engine, only with `--enable-prompt-tokens-details` | engine, only when some were cached | engine | engine | engine |
+
+The TensorFold native 1.0.0 column is read from its source (`chat.zig` at tag
+`v1.0.0`) and from how CapyCTL reads the `tensorfold` object, which is the
+same for both TensorFold lines; it is not yet confirmed live (TF7).
 
 CapyCTL starts vLLM with `--enable-per-request-metrics` and SGLang with
 `--enable-cache-report`, and a deployment cannot turn either off (see
@@ -339,11 +351,12 @@ passes the same value to LMCache. So:
 
 CapyCTL never logs or stores the effective salt.
 
-TensorFold and llama.cpp ignore the field, so a request with a `cache_salt` for a
-model that runs on either is refused rather than served without the isolation it asks
-for. The answer is `400` with code `cache_salt_unsupported` (on a stream, an
-error event with that code), and nothing reaches the engine. The same request
-without `cache_salt` is served.
+TensorFold (0.6 and the native line) and llama.cpp do not partition their
+prefix cache by the field, so a request with a `cache_salt` for a model that
+runs on any of them is refused rather than served without the isolation it
+asks for. The answer is `400` with code `cache_salt_unsupported` (on a
+stream, an error event with that code), and nothing reaches the engine. The
+same request without `cache_salt` is served.
 
 ```text
 {"code":"cache_salt_unsupported","message":"this deployment's engine does not partition its prefix cache by cache_salt"}
