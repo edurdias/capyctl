@@ -1305,7 +1305,7 @@ ALTER TABLE parked_measurements_v58 RENAME TO parked_measurements;
 /// ADR 0037; number v61 reserved (embeddings v59, LMCache-by-default v60);
 /// the orchestrator renumbers at rebase.
 pub const SCHEMA_V61: &str = r#"
-CREATE TABLE launch_engine_tracing(
+CREATE TABLE IF NOT EXISTS launch_engine_tracing(
   binding_id TEXT PRIMARY KEY REFERENCES runtime_bindings(id),
   state TEXT NOT NULL CHECK(state IN ('on','off')),
   reason TEXT CHECK((state='on' AND reason IS NULL) OR (state='off' AND reason IS NOT NULL AND reason IN
