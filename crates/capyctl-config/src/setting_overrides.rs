@@ -936,6 +936,10 @@ pub fn defaults(
             ("retention", Value::from("standard")),
             // Owner decision 2026-10-22: engines report no usage off the host.
             ("engine_telemetry", Value::from("off")),
+            // ADR 0037 §7: no engine tracing. The endpoint is absent (off) and
+            // so not listed; stated, it shows as written, `headers_file` by
+            // its path only (the file is never read here).
+            ("observability.tracing.engines", Value::from("off")),
         ];
         if let Some(root) = crate::model_settings::default_models_root(home) {
             out.push((
@@ -954,6 +958,16 @@ pub fn defaults(
                 secs(DEFAULT_SWITCH_DRAIN_TIMEOUT),
             ),
             ("observability.timing_header", Value::from(false)),
+            // ADR 0037 §9, §2 (owner decisions 2026-10-27, questions 3 and 4).
+            // Tracing itself is off until an endpoint is named.
+            (
+                "observability.tracing.sample_ratio",
+                Value::from(crate::tracing::DEFAULT_SAMPLE_RATIO),
+            ),
+            (
+                "observability.tracing.caller_context",
+                Value::from(crate::tracing::CallerContext::default().as_str()),
+            ),
             // ADR 0028 §11 (decided 2026-10-06).
             ("groups.stall_timeout", secs(DEFAULT_GROUP_STALL_TIMEOUT)),
             (

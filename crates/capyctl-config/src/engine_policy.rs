@@ -144,6 +144,38 @@ const VLLM_RESERVED_FAMILIES: &[&str] = &["--ssl-", "--data-parallel-", "--capyc
 /// 2026-10-15).
 const VLLM_SLEEP_RESERVED: &[&str] = &["--safetensors-load-strategy"];
 
+/// ADR 0037 §7 (owner decision 2026-10-27, question 7): vLLM's tracing
+/// options are CapyCTL's in every spelling, whatever the host approves. With
+/// engine tracing on the adapter renders `--otlp-traces-endpoint` in the
+/// reserved block; `--collect-detailed-traces` is never rendered. An earlier
+/// approval of `--otlp-traces-endpoint` no longer admits it.
+pub const VLLM_TRACING_OPTIONS: &[&str] = &["--otlp-traces-endpoint", "--collect-detailed-traces"];
+
+/// ADR 0037 §7 (owner decision 2026-10-27, question 7): SGLang's tracing
+/// `ServerArgs` fields (`arg_groups/fields/observability.py`), CapyCTL's in
+/// every spelling, whatever the host approves. The option is the field with
+/// `_` spelled `-`.
+pub const SGLANG_TRACING_FIELDS: &[&str] = &[
+    "enable_trace",
+    "otlp_traces_endpoint",
+    "otlp_service_name",
+    "trace_modules",
+];
+
+/// ADR 0037 §7: why the tracing options are owned, for the flag table.
+const TRACING_OWNED: &str = "CapyCTL renders engine tracing from the host's \
+     `observability.tracing.engines`, exporting only to a loopback endpoint";
+
+fn tracing_option(engine: Engine, name: &str) -> bool {
+    match engine {
+        Engine::Vllm => VLLM_TRACING_OPTIONS.contains(&name),
+        Engine::Sglang => SGLANG_TRACING_FIELDS
+            .iter()
+            .any(|field| sglang_field_option(field) == name),
+        _ => false,
+    }
+}
+
 /// ADR 0014 §3: SGLang `ServerArgs` fields capyctl owns. The option spelling is the
 /// field with `_` replaced by `-`; [`SGLANG_RESERVED_ALIASES`] adds the other
 /// spellings SGLang's parser accepts for the same fields.
@@ -758,7 +790,8 @@ const VLLM_SENSITIVE: &[(&str, Sensitivity)] = &[
             checkpoint_exempt: false,
         },
     ),
-    ("--otlp-traces-endpoint", Sensitivity::ListenerOrEgress),
+    // ADR 0037 §7: `--otlp-traces-endpoint` is owned now
+    // ([`VLLM_TRACING_OPTIONS`]), not approval-gated.
     ("--kv-transfer-config", Sensitivity::ListenerOrEgress),
     ("--kv-events-config", Sensitivity::ListenerOrEgress),
     ("--load-format", Sensitivity::ListenerOrEgress),
@@ -803,7 +836,8 @@ const SGLANG_SENSITIVE: &[(&str, Sensitivity)] = &[
             checkpoint_exempt: false,
         },
     ),
-    ("--otlp-traces-endpoint", Sensitivity::ListenerOrEgress),
+    // ADR 0037 §7: `--otlp-traces-endpoint` is owned now
+    // ([`SGLANG_TRACING_FIELDS`]), not approval-gated.
     ("--tool-server", Sensitivity::ListenerOrEgress),
     ("--kv-events-config", Sensitivity::ListenerOrEgress),
     ("--load-format", Sensitivity::ListenerOrEgress),
@@ -853,7 +887,6 @@ const SGLANG_SHAPED: &[&str] = &[
     "--gated-launch-port",
     "--file-storage-path",
     "--load-publish-endpoint",
-    "--otlp-traces-endpoint",
     "--cuda-graph-config",
     "--uno-lora-path",
     "--speculative-draft-model-path",
@@ -909,7 +942,6 @@ const VLLM_SHAPED: &[&str] = &[
     "--numa-bind",
     "--numa-bind-cpus",
     "--numa-bind-nodes",
-    "--otlp-traces-endpoint",
     "--override-generation-config",
     "--pooler-config",
     "--profiler-config",
@@ -1040,12 +1072,14 @@ pub fn reserved_options(engine: Engine, sleep_mode: bool) -> Vec<String> {
     match engine {
         Engine::Vllm => VLLM_RESERVED_FLAGS
             .iter()
+            .chain(VLLM_TRACING_OPTIONS)
             .chain(if sleep_mode { VLLM_SLEEP_RESERVED } else { &[] })
             .map(|name| (*name).to_owned())
             .collect(),
         Engine::Sglang => SGLANG_RESERVED_FIELDS
             .iter()
             .chain(SGLANG_DUMP_RESERVED.iter().map(|(field, _)| field))
+            .chain(SGLANG_TRACING_FIELDS)
             .map(|field| sglang_field_option(field))
             .chain(
                 SGLANG_RESERVED_ALIASES
@@ -1852,6 +1886,7 @@ pub fn flag_table(engine: Engine) -> Vec<FlagRow> {
                 format!("CapyCTL renders it from the typed field `{field}`")
             }
             _ if lmcache_option(&name) => LMCACHE_OWNED.to_owned(),
+            _ if tracing_option(engine, &name) => TRACING_OWNED.to_owned(),
             _ => "CapyCTL renders or closes it".to_owned(),
         };
         add_row(
@@ -1945,4 +1980,93 @@ pub fn flag_table(engine: Engine) -> Vec<FlagRow> {
         );
     }
     rows
+}
+
+#[cfg(test)]
+mod tracing_tests {
+    use super::*;
+
+    fn extras(engine: Engine, args: &[&str], approved: &[&str]) -> Result<(), ProfileArgError> {
+        let approved_options: BTreeSet<String> =
+            approved.iter().map(|name| (*name).to_owned()).collect();
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        validate_extra_args(
+            &args,
+            &ExtraArgsContext {
+                engine,
+                sleep_mode: false,
+                approved_options: &approved_options,
+                approved_paths: &[],
+                checkpoint_root: None,
+                host_fixed: &BTreeSet::new(),
+            },
+        )
+    }
+
+    // T48 T03 T21 (ADR 0037 §7, owner decision 2026-10-27 q7): the engines'
+    // tracing options are owned in every spelling, whatever the host
+    // approves; an earlier approval of `--otlp-traces-endpoint` no longer
+    // admits it. The refusal names the option, never the value.
+    #[test]
+    fn tracing_options_are_owned_in_every_spelling_even_when_approved() {
+        let endpoint = "http://collector.example:4317";
+        let vllm: &[&[&str]] = &[
+            &["--otlp-traces-endpoint", endpoint],
+            &["--otlp_traces_endpoint", endpoint],
+            &["--otlp-traces-endpoint=http://collector.example:4317"],
+            &["--OTLP-Traces-Endpoint", endpoint],
+            &["--otlp-traces", endpoint],
+            &["--collect-detailed-traces", "all"],
+            &["--collect_detailed_traces=all"],
+        ];
+        let sglang: &[&[&str]] = &[
+            &["--enable-trace"],
+            &["--enable_trace"],
+            &["--otlp-traces-endpoint", endpoint],
+            &["--otlp_traces_endpoint=http://collector.example:4317"],
+            &["--otlp-service-name", "mine"],
+            &["--otlp_service_name=mine"],
+            &["--trace-modules", "request"],
+            &["--trace_modules=all"],
+        ];
+        let approvals = [
+            "--otlp-traces-endpoint",
+            "--collect-detailed-traces",
+            "--enable-trace",
+            "--otlp-service-name",
+            "--trace-modules",
+        ];
+        for (engine, cases) in [(Engine::Vllm, vllm), (Engine::Sglang, sglang)] {
+            for args in cases {
+                for approved in [&[][..], &approvals[..]] {
+                    let error = extras(engine, args, approved).unwrap_err();
+                    assert!(
+                        matches!(error, ProfileArgError::Reserved(_)),
+                        "{engine:?} {args:?}: {error}"
+                    );
+                    assert!(!error.to_string().contains("collector"), "{error}");
+                }
+            }
+        }
+        // Host-fixed vLLM arguments cannot state them either.
+        let fixed = vec!["--otlp-traces-endpoint".to_owned(), endpoint.to_owned()];
+        assert!(matches!(
+            validate_profile_args(Engine::Vllm, &fixed, false),
+            Err(ProfileArgError::Reserved(_))
+        ));
+        // Neither is a sensitive (approvable) option any more.
+        for (engine, option) in [
+            (Engine::Vllm, "--otlp-traces-endpoint"),
+            (Engine::Sglang, "--otlp-traces-endpoint"),
+        ] {
+            let table = flag_table(engine);
+            let rows: Vec<_> = table.iter().filter(|row| row.name == option).collect();
+            assert_eq!(rows.len(), 1, "{engine:?} {option}");
+            assert_eq!(rows[0].class, FlagClass::Owned, "{engine:?} {option}");
+            assert_eq!(rows[0].reason, TRACING_OWNED);
+        }
+        // Unrelated options beside them stay as they were.
+        extras(Engine::Sglang, &["--enable-torch-compile"], &[]).unwrap();
+        extras(Engine::Vllm, &["--seed", "1"], &[]).unwrap();
+    }
 }
