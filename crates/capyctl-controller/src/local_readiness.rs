@@ -95,6 +95,9 @@ struct Target {
     /// ADR 0035 §5: a built-in engine's launch on several GPUs; its owned
     /// listeners are checked at every re-proof.
     several_gpus: bool,
+    /// ADR 0039 §14: a launch of TensorFold's native line; its owned
+    /// listeners are checked at every re-proof.
+    tensorfold_native: bool,
 }
 
 pub struct LocalReadiness {
@@ -304,6 +307,7 @@ impl LocalReadiness {
                     .identities
                     .iter()
                     .any(|identity| identity.rank_role().is_some()));
+        let tensorfold_native = tensorfold_native(&effective);
         Ok(Target {
             url,
             key,
@@ -311,6 +315,7 @@ impl LocalReadiness {
             decisions,
             custom,
             several_gpus,
+            tensorfold_native,
         })
     }
 
@@ -360,7 +365,7 @@ impl LocalReadiness {
                 return Err("the engine answered the chat probe with empty content".into());
             }
         }
-        check_owned_listeners(launch, false).await
+        check_owned_listeners(launch, Listeners::Custom).await
     }
 
     /// ADR 0033 §§3, 9, 10 (lifecycle design §5): re-prove the launch's
@@ -436,9 +441,13 @@ impl LocalReadiness {
         }
         // ADR 0035 §5: a built-in engine's launch on several GPUs is checked
         // for listeners off loopback whenever it is re-proved; one is stopped
-        // and the proof fails `engine_listener_exposed`.
-        if target.several_gpus {
-            check_owned_listeners(launch, true).await?;
+        // and the proof fails `engine_listener_exposed`. ADR 0039 §14: so is
+        // every launch of TensorFold's native line, which fails
+        // `tensorfold_listener_exposed`.
+        if target.tensorfold_native {
+            check_owned_listeners(launch, Listeners::TensorfoldNative).await?;
+        } else if target.several_gpus {
+            check_owned_listeners(launch, Listeners::SeveralGpus).await?;
         }
         // SPEC §6.1: the answer must come from the recorded group, so the group is
         // proven alive on both sides of it.
@@ -469,7 +478,7 @@ impl LocalReadiness {
                     } else {
                         ""
                     },
-                    if target.several_gpus {
+                    if target.several_gpus || target.tensorfold_native {
                         "; every owned listener is on loopback"
                     } else {
                         ""
@@ -685,22 +694,62 @@ impl capyctl_launchers::LaunchAssociation for ProveOnly {
     }
 }
 
-/// ADR 0031 §7, ADR 0035 §5: the loopback check of every live owned process
-/// of an adopted launch (`built_in`: a built-in engine's launch on several
-/// GPUs, where a helper that exited during the read is left out). One that
-/// listens off loopback is stopped, with gone evidence, and the proof fails
-/// `custom_listener_exposed`, or for a built-in engine
-/// `engine_listener_exposed` naming the process role, address and port.
-async fn check_owned_listeners(launch: &LocalReadyLaunch, built_in: bool) -> Result<(), String> {
+/// Whose owned listeners are checked, which names the failure.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Listeners {
+    /// ADR 0031 §7: a custom engine, `custom_listener_exposed`.
+    Custom,
+    /// ADR 0035 §5: a built-in engine on several GPUs, where a helper that
+    /// exited during the read is left out; `engine_listener_exposed`.
+    SeveralGpus,
+    /// ADR 0039 §14: TensorFold's native line, read as a built-in launch;
+    /// `tensorfold_listener_exposed`.
+    TensorfoldNative,
+}
+
+/// ADR 0039 §14: the frozen revision is a TensorFold profile of the native
+/// line. A revision that cannot be read is not (the 0.6 line is the default).
+pub(crate) fn tensorfold_native(effective: &serde_json::Value) -> bool {
+    effective["profile"]["engine"].as_str()
+        == Some(capyctl_config::engine_policy::Engine::Tensorfold.name())
+        && effective["profile"]["line"].as_str()
+            == Some(capyctl_config::tensorfold_native::TensorfoldLine::Native.name())
+}
+
+/// ADR 0039 §14: the failure of a native TensorFold launch whose owned
+/// process listens off loopback, naming the address (as its host names it).
+pub(crate) fn tensorfold_listener_exposed(
+    listener: &capyctl_adapters::custom::OwnedListener,
+) -> String {
+    format!(
+        "{}: an owned process listens on {}, not on loopback",
+        capyctl_config::tensorfold_native::LISTENER_EXPOSED,
+        listener.address
+    )
+}
+
+/// ADR 0031 §7, ADR 0035 §5, ADR 0039 §14: the loopback check of every live
+/// owned process of an adopted launch. One that listens off loopback is
+/// stopped, with gone evidence, and the proof fails with the code of
+/// `kind`.
+async fn check_owned_listeners(launch: &LocalReadyLaunch, kind: Listeners) -> Result<(), String> {
+    check_listeners_in(std::path::Path::new("/proc"), launch, kind).await
+}
+
+async fn check_listeners_in(
+    root: &std::path::Path,
+    launch: &LocalReadyLaunch,
+    kind: Listeners,
+) -> Result<(), String> {
     use capyctl_adapters::custom::ListenerCheck;
     let live = alive(&launch.identities)?;
+    let root = root.to_path_buf();
     let checked = tokio::task::spawn_blocking(move || {
-        let root = std::path::Path::new("/proc");
         let presence = &capyctl_launchers::process_absence::presence;
-        if built_in {
-            capyctl_adapters::custom::check_engine_launch(root, &live, presence)
+        if kind == Listeners::Custom {
+            capyctl_adapters::custom::check_loopback(&root, &live, presence)
         } else {
-            capyctl_adapters::custom::check_loopback(root, &live, presence)
+            capyctl_adapters::custom::check_engine_launch(&root, &live, presence)
         }
     })
     .await
@@ -708,10 +757,12 @@ async fn check_owned_listeners(launch: &LocalReadyLaunch, built_in: bool) -> Res
     match checked {
         Ok(()) => Ok(()),
         Err(ListenerCheck::Exposed(listener)) => {
-            let exposed = if built_in {
-                capyctl_adapters::custom::engine_listener_exposed(&listener)
-            } else {
-                ListenerCheck::Exposed(listener).to_string()
+            let exposed = match kind {
+                Listeners::Custom => ListenerCheck::Exposed(listener).to_string(),
+                Listeners::SeveralGpus => {
+                    capyctl_adapters::custom::engine_listener_exposed(&listener)
+                }
+                Listeners::TensorfoldNative => tensorfold_listener_exposed(&listener),
             };
             let recorded = launch.identities.clone();
             let stopped = tokio::task::spawn_blocking(move || {
@@ -866,5 +917,118 @@ mod tests {
             .unwrap();
         assert!(joined.load(Ordering::SeqCst), "joined before returning");
         assert_eq!(supervisor.children.running(), 0);
+    }
+
+    /// A fake `/proc` where process `pid` holds one TCP listener on
+    /// `address:port`.
+    fn fake_proc(pid: u32, address: [u8; 4], port: u16) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let process = root.path().join(pid.to_string());
+        std::fs::create_dir_all(process.join("fd")).unwrap();
+        std::fs::create_dir_all(process.join("net")).unwrap();
+        std::os::unix::fs::symlink("socket:[777]", process.join("fd/3")).unwrap();
+        std::fs::write(
+            process.join("net/tcp"),
+            format!(
+                "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+                 \x20  0: {:08X}:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 777 1 0 100 0 0 10 0\n",
+                u32::from_ne_bytes(address)
+            ),
+        )
+        .unwrap();
+        std::fs::write(process.join("net/tcp6"), "  sl  local_address\n").unwrap();
+        root
+    }
+
+    /// A real child process in its own group, recorded as the engine's
+    /// `api`, as an adopted launch records it. A thread reaps it once it
+    /// exits, as the role's subreaper would, so its stop is proven.
+    fn engine() -> (std::thread::JoinHandle<()>, LocalReadyLaunch) {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let start_ticks = stat[stat.rfind(')').unwrap() + 2..]
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .to_owned();
+        let launch = LocalReadyLaunch {
+            fence: capyctl_store::lifecycle::DeploymentFence {
+                deployment_id: "native".into(),
+                revision: 1,
+                generation: 1,
+            },
+            instance_index: 0,
+            operation_id: "op".into(),
+            step_id: "step".into(),
+            binding_id: "binding".into(),
+            incarnation: "inc".into(),
+            identities: vec![ProcessIdentity {
+                role: "api".into(),
+                pid,
+                boot_id,
+                start_ticks,
+            }],
+            dispatch_enabled: false,
+        };
+        let reaper = std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        (reaper, launch)
+    }
+
+    // T41 T21 (ADR 0039 §14): an adopted launch of TensorFold's native line
+    // whose owned process listens off loopback is stopped, with gone
+    // evidence, and its re-proof fails `tensorfold_listener_exposed` naming
+    // the address; one on loopback only passes the check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_native_launch_listening_off_loopback_is_stopped_at_its_re_proof() {
+        let (reaper, launch) = engine();
+        let loopback = fake_proc(launch.identities[0].pid, [127, 0, 0, 1], 8080);
+        check_listeners_in(loopback.path(), &launch, Listeners::TensorfoldNative)
+            .await
+            .unwrap();
+
+        let exposed = fake_proc(launch.identities[0].pid, [0, 0, 0, 0], 8080);
+        let failed = check_listeners_in(exposed.path(), &launch, Listeners::TensorfoldNative)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failed,
+            "tensorfold_listener_exposed: an owned process listens on 0.0.0.0:8080, \
+             not on loopback; the engine was stopped"
+        );
+        reaper.join().unwrap();
+        assert_eq!(
+            capyctl_launchers::process_absence::presence(&launch.identities[0]),
+            Presence::Gone
+        );
+    }
+
+    // T41 (ADR 0039 §14): the revisions whose re-proof checks listeners as
+    // TensorFold's native line: only a TensorFold profile of that line.
+    #[test]
+    fn only_the_native_tensorfold_line_is_checked_as_native() {
+        use serde_json::json;
+        let native = json!({"profile": {"engine": "tensorfold", "line": "native"}});
+        assert!(tensorfold_native(&native));
+        for other in [
+            json!({"profile": {"engine": "tensorfold"}}),
+            json!({"profile": {"engine": "tensorfold", "line": "python"}}),
+            json!({"profile": {"engine": "vllm", "line": "native"}}),
+            serde_json::Value::Null,
+        ] {
+            assert!(!tensorfold_native(&other), "{other}");
+        }
     }
 }

@@ -247,13 +247,19 @@ fn lmcache_unavailable(reason: &str) -> Option<String> {
 
 /// ADR 0035 §13: the closed code a launch on several GPUs failed with at
 /// readiness, as its reason names it (embedded, or the host's report):
-/// `tp_rank_unobserved` or `engine_listener_exposed`.
-fn local_tp_failure(reason: &str) -> Option<String> {
+/// `tp_rank_unobserved` or `engine_listener_exposed`. ADR 0039 §14: a launch
+/// of TensorFold's native line listening off loopback fails
+/// `tensorfold_listener_exposed`.
+pub(super) fn readiness_failure(reason: &str) -> Option<String> {
     use capyctl_domain::local_tp::{ENGINE_LISTENER_EXPOSED, TP_RANK_UNOBSERVED};
-    [TP_RANK_UNOBSERVED, ENGINE_LISTENER_EXPOSED]
-        .into_iter()
-        .find(|code| reason.contains(&format!("{code}:")))
-        .map(str::to_owned)
+    [
+        TP_RANK_UNOBSERVED,
+        ENGINE_LISTENER_EXPOSED,
+        capyctl_config::tensorfold_native::LISTENER_EXPOSED,
+    ]
+    .into_iter()
+    .find(|code| reason.contains(&format!("{code}:")))
+    .map(str::to_owned)
 }
 
 /// Release the failed launch against `proven`, or retain it `Uncertain`.
@@ -336,7 +342,7 @@ async fn conclude(
         _ => None,
     };
     let code = lmcache_unavailable(reason)
-        .or_else(|| local_tp_failure(reason))
+        .or_else(|| readiness_failure(reason))
         .unwrap_or_else(|| "launch_failed".to_owned());
     let fallback_deployment = deployment_id.clone();
     let relaunched = shared

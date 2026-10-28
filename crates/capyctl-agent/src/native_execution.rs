@@ -1400,8 +1400,14 @@ impl NativeHostExecution {
             ))),
             Engine::Tensorfold => {
                 // ADR 0023 §3: a build killed mid way left its lock; cleared
-                // only while no claimed launch here may still run.
-                if let Some(cache) = &self.engine_cache {
+                // only while no claimed launch here may still run. ADR 0039
+                // §2: the native line builds nothing, so it has no extensions
+                // directory and clears no lock.
+                if let Some(cache) = self
+                    .engine_cache
+                    .as_ref()
+                    .filter(|_| effective.profile.line.is_python())
+                {
                     let dir = cache
                         .torch_extensions(&effective.profile.build_fingerprint)
                         .map_err(|_| SessionError)?;
@@ -1674,6 +1680,7 @@ impl NativeHostExecution {
                     &command.identity.command_id,
                     custom::engine_access(
                         effective.profile.engine,
+                        effective.profile.line,
                         effective.profile.custom.as_ref(),
                     )
                     .with_request_abort(request_abort::request_abort_capable(&effective)),
@@ -1727,6 +1734,11 @@ impl NativeHostExecution {
             // and recorded processes are its whole answer.
             return Ok(());
         }
+        // ADR 0039 §14: a native TensorFold launch checks its listeners once
+        // its probe passed, before its readiness is journaled.
+        let observation = self
+            .tensorfold_native_listeners(command, &effective, observation)
+            .await?;
         // ADR 0035 §§5, 6: a launch on several GPUs of this host names its
         // ranks and checks its listeners before its readiness is journaled.
         let observation = self
@@ -1932,9 +1944,13 @@ impl NativeHostExecution {
         // ADR 0031 §7: a custom launch's listeners are checked again
         // whenever this host re-proves it, after the probe and before the
         // gate reopens; one off loopback stops the launch. ADR 0035 §5: so
-        // are a built-in engine's on several GPUs.
+        // are a built-in engine's on several GPUs. ADR 0039 §14: and a
+        // native TensorFold launch's, on every native version.
         let several_gpus = plan.devices.len() >= 2;
-        if effective.profile.engine == Engine::Custom || several_gpus {
+        if effective.profile.engine == Engine::Custom
+            || several_gpus
+            || tensorfold::native_line(&effective)
+        {
             let journal = self.journal.clone();
             let owner = owned_handle.to_owned();
             let checked = tokio::task::spawn_blocking(move || {
@@ -2563,7 +2579,8 @@ fn dp_attention(deployment_config: &str) -> bool {
 /// all exited before readiness, with the exit status this host's launcher
 /// reaped (the api process first) when it knows it. ADR 0031 §7, §10: a
 /// custom launch this host stopped for listening off loopback reports that,
-/// with its closed code and the address and port (never a path or a value).
+/// with its closed code and the address and port (never a path or a value);
+/// ADR 0039 §14, §16: so does a native TensorFold launch.
 fn launch_failure(result: &pb::MemberExecutionResult, engine: Option<&str>) -> String {
     use capyctl_adapters::launch_failure::{summary, EngineExit};
     if let Some(exposed) = engine
@@ -2571,6 +2588,7 @@ fn launch_failure(result: &pb::MemberExecutionResult, engine: Option<&str>) -> S
         .filter(|line| {
             [
                 capyctl_config::custom::LISTENER_EXPOSED,
+                capyctl_config::tensorfold_native::LISTENER_EXPOSED,
                 capyctl_domain::local_tp::ENGINE_LISTENER_EXPOSED,
                 capyctl_domain::local_tp::TP_RANK_UNOBSERVED,
             ]
@@ -4397,14 +4415,31 @@ mod tests {
         root: &std::path::Path,
         identity_dir: &std::path::Path,
     ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
+        tensorfold_fixture_on(root, identity_dir, false)
+    }
+
+    /// [`tensorfold_fixture`], on the Python line (0.6.0) or, with
+    /// `native`, on the native line (ADR 0039: `line: native`, a release
+    /// root's `bin/tensorfold-native` at 1.0.0).
+    fn tensorfold_fixture_on(
+        root: &std::path::Path,
+        identity_dir: &std::path::Path,
+        native: bool,
+    ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
         let (executor, mut deployment, policy) =
             sglang_fixture_with(root, identity_dir, "restart_only", |document| {
                 document["resource_policy"]["endpoint_port_range"] =
                     serde_json::json!({"start": 1024, "end": 65535});
                 let profile = &mut document["runtime_profiles"]["local"];
                 profile["engine"] = "tensorfold".into();
-                profile["executable"] = "/opt/tf/bin/tensorfold".into();
-                profile["build_fingerprint"] = "0.6.0".into();
+                if native {
+                    profile["line"] = "native".into();
+                    profile["executable"] = "/opt/tensorfold-1.0.0/bin/tensorfold-native".into();
+                    profile["build_fingerprint"] = "1.0.0".into();
+                } else {
+                    profile["executable"] = "/opt/tf/bin/tensorfold".into();
+                    profile["build_fingerprint"] = "0.6.0".into();
+                }
                 profile["args"] = serde_json::json!([]);
                 profile["security"]["deep_park"] = "disabled".into();
                 profile["security"]
@@ -4426,10 +4461,20 @@ mod tests {
         policy: &str,
         port: u16,
     ) -> (MemberCommand, SingleLaunchPlan) {
+        tensorfold_launch_of(deployment, policy, port, "0.6.0")
+    }
+
+    /// [`tensorfold_launch`] for a profile at `fingerprint`.
+    fn tensorfold_launch_of(
+        deployment: &serde_json::Value,
+        policy: &str,
+        port: u16,
+        fingerprint: &str,
+    ) -> (MemberCommand, SingleLaunchPlan) {
         let (mut launch, mut plan) = launch_with(deployment, policy, "");
         plan.service_port = port;
         launch.action = MemberAction::LaunchSingle(plan.clone());
-        launch.identity.profile_fingerprint = "0.6.0".into();
+        launch.identity.profile_fingerprint = fingerprint.into();
         launch.identity.payload_digest = launch.canonical_digest();
         (launch, plan)
     }
@@ -4760,6 +4805,325 @@ mod tests {
         }
         assert_eq!(presence_of(&api), Presence::Alive);
         assert!(executor.journal.retained_command("launch").is_ok());
+    }
+
+    // T41 (ADR 0039 §2, ADR 0023 §3): a native launch builds nothing. Its
+    // plan carries no extensions directory, preparing it creates none and
+    // clears no lock (a killed 0.6 build's lock under the same root stays),
+    // and it launches without a private root for one.
+    #[test]
+    fn a_native_launch_creates_no_extensions_directory_and_clears_no_lock() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            tensorfold_fixture_on(root.path(), identity_dir.path(), true);
+        let (launch, plan) = tensorfold_launch_of(&deployment, &policy, closed_port(), "1.0.0");
+        let effective = executor.resolve(&launch).unwrap();
+        assert!(effective.profile.line.is_native());
+        let (input, built) = executor.tensorfold_plan(&effective, &plan, None).unwrap();
+        assert!(!built);
+        assert_eq!(input.extensions_dir, None);
+        assert!(matches!(
+            executor.prepare(&effective, &plan, "toy", None),
+            Ok(PreparedLaunch::Tensorfold(..))
+        ));
+        let tensorfold = root.path().join("engines/tensorfold");
+        assert!(!tensorfold.exists(), "no extensions directory");
+        // The lock a killed 0.6 build of the same version would leave, in a
+        // directory the 0.6 path would clear it from.
+        let extensions = tensorfold.join("1.0.0/torch_extensions");
+        let extension = extensions.join("tensorfold_qmm_v5");
+        std::fs::create_dir_all(&extension).unwrap();
+        for dir in [
+            tensorfold.clone(),
+            tensorfold.join("1.0.0"),
+            extensions,
+            extension.clone(),
+        ] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::write(extension.join("lock"), "").unwrap();
+        assert!(matches!(
+            executor.prepare(&effective, &plan, "toy", None),
+            Ok(PreparedLaunch::Tensorfold(..))
+        ));
+        assert!(extension.join("lock").exists(), "no lock is cleared");
+        // No private root is needed: a widened one refuses 0.6, not native.
+        std::fs::set_permissions(
+            root.path().join("engines"),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        assert!(executor.resolve(&launch).is_ok());
+    }
+
+    // T41 T37 (ADR 0039 §11): the ingress binds a native launch to be
+    // sampled by its `/metrics` alone; a 0.6 launch stays a built-in one,
+    // whose sample folds `/health`.
+    #[test]
+    fn a_native_launch_is_sampled_by_its_metrics_alone() {
+        use crate::load::LaunchSignal;
+        for (native, fingerprint, signal) in [
+            (true, "1.0.0", LaunchSignal::TensorfoldNative),
+            (false, "0.6.0", LaunchSignal::Builtin),
+        ] {
+            let root = directory();
+            let identity_dir = directory();
+            let (executor, deployment, policy) =
+                tensorfold_fixture_on(root.path(), identity_dir.path(), native);
+            let (launch, _) =
+                tensorfold_launch_of(&deployment, &policy, closed_port(), fingerprint);
+            let effective = executor.resolve(&launch).unwrap();
+            let access = custom::engine_access(
+                effective.profile.engine,
+                effective.profile.line,
+                effective.profile.custom.as_ref(),
+            );
+            assert_eq!(access.signal, signal);
+            assert!(access.keyed);
+            assert_eq!(executor.retained_access(&launch).signal, signal);
+        }
+    }
+
+    // T41 (ADR 0039 §10): a native launch's stop reads `/metrics`, never
+    // `/health`: a refused connection is signalled at once, 0 and 0 at
+    // once, work at the bound is not signalled, an unanswered `/metrics` is
+    // signalled at the bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminate_reads_a_native_engines_metrics() {
+        use capyctl_testkit::tensorfold_native::{FakeTensorfoldNative, NativeRelease};
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            tensorfold_fixture_on(root.path(), identity_dir.path(), true);
+        let engine = FakeTensorfoldNative::new(NativeRelease::V1_0_0, "toy", 8);
+        let (launch, _) = tensorfold_launch_of(&deployment, &policy, engine.port(), "1.0.0");
+        let quick = std::time::Duration::from_secs(3);
+        // Still loading (no listener yet): refused, so signalled at once.
+        let started = std::time::Instant::now();
+        assert!(
+            executor
+                .idle_before_terminate(&launch, capyctl_protocol::now_unix_ms() + 10_000)
+                .await
+        );
+        assert!(started.elapsed() < quick);
+        engine.load().await;
+        engine.set_work(0, 0);
+        let started = std::time::Instant::now();
+        assert!(
+            executor
+                .idle_before_terminate(&launch, capyctl_protocol::now_unix_ms() + 10_000)
+                .await
+        );
+        assert!(started.elapsed() < quick);
+        // Work at the bound: not signalled.
+        engine.set_work(1, 2);
+        assert!(
+            !executor
+                .idle_before_terminate(&launch, capyctl_protocol::now_unix_ms() + 1_200)
+                .await
+        );
+        // `/metrics` unanswered: signalled once the bound passes.
+        engine.set_work(0, 0);
+        engine.hold_metrics(true);
+        let started = std::time::Instant::now();
+        assert!(
+            executor
+                .idle_before_terminate(
+                    &launch,
+                    capyctl_protocol::now_unix_ms() + idle_gate::IDLE_MARGIN_MS + 1_500
+                )
+                .await
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(1_300));
+        assert_eq!(
+            engine.health_reads(),
+            0,
+            "the native stop never reads /health"
+        );
+    }
+
+    /// The python3 on this test's PATH, for a stand-in that opens sockets.
+    fn python3() -> std::path::PathBuf {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|dir| dir.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .expect("python3 on PATH for the stand-in engine")
+    }
+
+    /// Renders a stand-in for the TensorFold process that listens on
+    /// `address`, writes `ready` once it does, and exits after a minute.
+    struct Listens {
+        address: &'static str,
+        ready: std::path::PathBuf,
+    }
+    impl LocalExecutionPolicy for Listens {
+        fn authorize(&self, _: &MemberCommand) -> Result<(), JournalError> {
+            Ok(())
+        }
+        fn render_launch(&self, _: &MemberCommand) -> Result<ApprovedLaunch, JournalError> {
+            let script = format!(
+                "import socket, time\ns = socket.socket()\ns.bind(({:?}, 0))\ns.listen()\n\
+                 open({:?}, 'w').close()\ntime.sleep(60)\n",
+                self.address,
+                self.ready.display().to_string()
+            );
+            Ok(ApprovedLaunch {
+                command: capyctl_adapters::traits::RenderedCommand {
+                    argv: vec![python3().display().to_string(), "-c".into(), script],
+                    env: Default::default(),
+                },
+                descriptors: None,
+            })
+        }
+    }
+
+    /// A TensorFold launch of either line, resolved, accepted and owned by
+    /// the journal, its stand-in process listening on `address`.
+    async fn owned_listening(
+        native: bool,
+        address: &'static str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<NativeHostExecution>,
+        MemberCommand,
+        EffectiveDeployment,
+        capyctl_domain::completion::ProcessIdentity,
+    ) {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            tensorfold_fixture_on(root.path(), identity_dir.path(), native);
+        let fingerprint = if native { "1.0.0" } else { "0.6.0" };
+        let (launch, plan) = tensorfold_launch_of(&deployment, &policy, closed_port(), fingerprint);
+        let effective = executor.resolve(&launch).unwrap();
+        let session = executor.journal.connect().unwrap();
+        executor.connected(session).unwrap();
+        let ready = root.path().join("listening");
+        let stand_in = Arc::new(Listens {
+            address,
+            ready: ready.clone(),
+        });
+        let now = capyctl_protocol::now_unix_ms();
+        let Acceptance::Fresh(ticket) = executor
+            .journal
+            .accept(session, &launch, now, stand_in.as_ref())
+            .unwrap()
+        else {
+            panic!("a fresh launch");
+        };
+        let tools = executor
+            .journal
+            .launch_tools(ticket, now, stand_in.clone(), Default::default())
+            .unwrap();
+        let command = stand_in.render_launch(&launch).unwrap().command;
+        let api = tools.spawn_durable(&plan.incarnation, &command).unwrap();
+        let by = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(std::time::Instant::now() < by, "the stand-in listens");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        (root, identity_dir, executor, launch, effective, api)
+    }
+
+    /// What the adapter's Initialize reports for `api` once its probe passed.
+    fn probed(
+        api: &capyctl_domain::completion::ProcessIdentity,
+    ) -> capyctl_domain::completion::EffectObservation {
+        capyctl_domain::completion::EffectObservation {
+            token: TransitionToken {
+                deployment_id: "deployment".into(),
+                revision: 1,
+                generation: 1,
+                operation_id: "operation".into(),
+                step_id: "launch".into(),
+            },
+            binding_id: "01K00000000000000000000001".into(),
+            incarnation: "01K00000000000000000000002".into(),
+            identities: vec![api.clone()],
+            observed_at_ms: 1,
+            receipt: "tensorfold ready; probe answered".into(),
+            facts: Vec::new(),
+            kernel_builds: Vec::new(),
+        }
+    }
+
+    // T41 T21 (ADR 0039 §14, ADR 0031 §7): once its probe passed, a native
+    // launch whose owned process listens off loopback is stopped with gone
+    // evidence and fails `tensorfold_listener_exposed` naming the address,
+    // reported as it is; one listening on loopback only passes, the check
+    // in its receipt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_native_launch_listening_off_loopback_is_stopped_and_fails() {
+        let (_root, _ids, executor, launch, effective, api) =
+            owned_listening(true, "0.0.0.0").await;
+        let _kill = KillOnDrop(api.pid);
+        let Err(failed) = executor
+            .tensorfold_native_listeners(&launch, &effective, probed(&api))
+            .await
+        else {
+            panic!("an exposed native launch fails");
+        };
+        let text = failed.engine.expect("the failure names its reason");
+        assert!(
+            text.starts_with(&format!(
+                "{}: an owned process listens on 0.0.0.0:",
+                capyctl_config::tensorfold_native::LISTENER_EXPOSED
+            )),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(", not on loopback; the engine was stopped"),
+            "{text}"
+        );
+        assert_eq!(presence_of(&api), Presence::Gone);
+        let reported = launch_failure(&pb::MemberExecutionResult::default(), Some(&text));
+        assert_eq!(reported, text);
+        assert!(capyctl_protocol::execution::is_launch_failure_text(
+            &reported
+        ));
+
+        let (_root, _ids, executor, launch, effective, api) =
+            owned_listening(true, "127.0.0.1").await;
+        let _kill = KillOnDrop(api.pid);
+        let Ok(ready) = executor
+            .tensorfold_native_listeners(&launch, &effective, probed(&api))
+            .await
+        else {
+            panic!("a loopback-only native launch passes");
+        };
+        assert!(ready
+            .receipt
+            .ends_with("; every owned listener is on loopback"));
+        assert_eq!(presence_of(&api), Presence::Alive);
+    }
+
+    // T41 T21 (ADR 0039 §14): the Python line is unchanged: no listener
+    // check runs after its probe, or on its re-proof.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_python_line_launch_never_runs_the_listener_check() {
+        let (_root, _ids, executor, launch, effective, api) =
+            owned_listening(false, "0.0.0.0").await;
+        let _kill = KillOnDrop(api.pid);
+        assert!(!tensorfold::native_line(&effective));
+        let Ok(unchanged) = executor
+            .tensorfold_native_listeners(&launch, &effective, probed(&api))
+            .await
+        else {
+            panic!("a 0.6 launch is never checked");
+        };
+        assert_eq!(unchanged, probed(&api));
+        assert_eq!(presence_of(&api), Presence::Alive);
+    }
+
+    // T41 (ADR 0039 §15): the session's `Connect` declares what this build
+    // implements (`session.rs` sends `agent_capabilities()`), so the server
+    // places native-line launches on this host.
+    #[test]
+    fn the_session_declares_tensorfold_native() {
+        assert!(capyctl_protocol::capabilities::agent_capabilities()
+            .contains(&capyctl_protocol::capabilities::TENSORFOLD_NATIVE.to_owned()));
     }
 
     /// A llama.cpp host document and deployment on the SGLang lab fixture,
