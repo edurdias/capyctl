@@ -6,8 +6,9 @@
 //!   vLLM, SGLang, llama.cpp and custom engines whose manifest says
 //!   `api: embeddings`. The versions qualified live are shown `certified`, any
 //!   other runs as an uncertified custom setup and is never refused for it
-//!   (owner decision 2026-10-27, question 1). TensorFold has no embeddings
-//!   route and is refused `capability_missing:embeddings`.
+//!   (owner decision 2026-10-27, question 1). TensorFold and (ADR 0038 §11)
+//!   TensorRT-LLM have no embeddings route and are refused
+//!   `capability_missing:embeddings`.
 //! - One GPU on one machine (§7.1): a deployment declaring a `topology` is
 //!   refused.
 //! - Parking (§7.2): vLLM and SGLang park `deep` while their support data
@@ -65,13 +66,16 @@ impl Certification {
 /// ADR 0036 §1: the certification of `engine` at the build its
 /// `build_fingerprint` names. Only the certified release itself is
 /// certified (not a pre-release, an older or a newer one, nor a fingerprint
-/// that names no version); custom engines and TensorFold never are.
+/// that names no version); custom engines, TensorFold and TensorRT-LLM
+/// never are.
 pub fn certification(engine: Engine, build_fingerprint: &str) -> Certification {
     let certified = match engine {
         Engine::Vllm => VLLM_CERTIFIED,
         Engine::Sglang => SGLANG_CERTIFIED,
         Engine::Llamacpp => LLAMACPP_CERTIFIED,
-        Engine::Tensorfold | Engine::Custom => return Certification::Uncertified,
+        Engine::Tensorfold | Engine::TensorrtLlm | Engine::Custom => {
+            return Certification::Uncertified
+        }
     };
     match EngineVersion::parse(build_fingerprint.trim()) {
         Some(version) if version == certified => Certification::Certified,
@@ -80,15 +84,19 @@ pub fn certification(engine: Engine, build_fingerprint: &str) -> Certification {
 }
 
 /// ADR 0036 §1: why `engine` cannot serve embedding models, or `None` when it
-/// can. Only TensorFold is refused: it has no embeddings route. The version
-/// is never a reason (owner decision 2026-10-27).
+/// can. TensorFold and (ADR 0038 §11) TensorRT-LLM are refused: neither has
+/// an embeddings route. The version is never a reason (owner decision
+/// 2026-10-27).
 pub fn engine_refusal(engine: Engine) -> Option<String> {
-    (engine == Engine::Tensorfold).then(|| {
-        format!(
-            "{CAPABILITY_MISSING}: TensorFold has no embeddings route to forward to; serve \
-             embedding models on vLLM, SGLang, llama.cpp or a custom engine"
-        )
-    })
+    let name = match engine {
+        Engine::Tensorfold => "TensorFold",
+        Engine::TensorrtLlm => "TensorRT-LLM",
+        _ => return None,
+    };
+    Some(format!(
+        "{CAPABILITY_MISSING}: {name} has no embeddings route to forward to; serve \
+         embedding models on vLLM, SGLang, llama.cpp or a custom engine"
+    ))
 }
 
 /// [`engine_refusal`] as the configuration error resolution returns, at `api`.
@@ -110,13 +118,13 @@ pub struct EmbeddingSupport {
 
 /// ADR 0036 §7.2: the support data of each engine that can park an
 /// embeddings deployment; `None` for one that never parks (llama.cpp,
-/// custom engines, TensorFold).
+/// custom engines, TensorFold, TensorRT-LLM).
 pub fn support(engine: Engine) -> Option<EmbeddingSupport> {
     match engine {
         // Owner decision 2026-10-27, question 2: deep parking in 0.2.0,
         // qualified per engine by row EM9.
         Engine::Vllm | Engine::Sglang => Some(EmbeddingSupport { deep_park: true }),
-        Engine::Llamacpp | Engine::Custom | Engine::Tensorfold => None,
+        Engine::Llamacpp | Engine::Custom | Engine::Tensorfold | Engine::TensorrtLlm => None,
     }
 }
 
@@ -198,5 +206,24 @@ mod tests {
         assert_eq!(certification(Engine::Llamacpp, "unknown"), Uncertified);
         assert_eq!(certification(Engine::Custom, "0.32.0"), Uncertified);
         assert_eq!(Certified.name(), "certified");
+    }
+
+    // T47 T49 (ADR 0036 §1, ADR 0038 §11): TensorRT-LLM has no embeddings
+    // route: refused `capability_missing:embeddings`, never certified, and
+    // never parks an embeddings deployment.
+    #[test]
+    fn tensorrt_llm_serves_no_embeddings() {
+        let refusal = engine_refusal(Engine::TensorrtLlm).unwrap();
+        assert!(
+            refusal.starts_with("capability_missing:embeddings: TensorRT-LLM"),
+            "{refusal}"
+        );
+        assert!(engine_refusal(Engine::Tensorfold).is_some());
+        assert!(engine_refusal(Engine::Vllm).is_none());
+        assert_eq!(
+            certification(Engine::TensorrtLlm, "1.2.1"),
+            Certification::Uncertified
+        );
+        assert_eq!(support(Engine::TensorrtLlm), None);
     }
 }

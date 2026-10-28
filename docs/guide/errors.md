@@ -53,7 +53,7 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 5 | `served_name_unsupported` | On TensorRT-LLM, the deployment's served name (its first route) is empty, `.` or `..`, holds `/` or a NUL byte, or is longer than 255 bytes. TensorRT-LLM serves the name of the model directory it is given, so CapyCTL links the checkpoint under the served name. | Use a served name that is one path component ([TensorRT-LLM](engines.md#tensorrt-llm)). |
 | 5 | `capability_missing:chat` | A chat deployment (no `api`, or `api: chat`) names a custom engine whose manifest says `api: decisions`. | Add `api: decisions` to the deployment, or use a chat engine. |
 | 5 | `host_capability_missing:decisions` | A machine runs a CapyCTL too old for decision models. | Upgrade CapyCTL on that machine. |
-| 5 | `capability_missing:embeddings` | A deployment with `api: embeddings` names an engine that has no embeddings route (TensorFold), or a custom engine whose manifest names another `api`. | Use vLLM, SGLang or llama.cpp, or a custom engine with `api: embeddings`. |
+| 5 | `capability_missing:embeddings` | A deployment with `api: embeddings` names an engine that has no embeddings route (TensorFold, TensorRT-LLM), or a custom engine whose manifest names another `api`. | Use vLLM, SGLang or llama.cpp, or a custom engine with `api: embeddings`. |
 | 5 | `host_capability_missing:embeddings` | A machine runs a CapyCTL too old for embedding models. | Upgrade CapyCTL on that machine. |
 | 5 | `host_capability_missing:custom_engines` | The deployment's engine is a custom engine and a machine it names runs a CapyCTL too old for custom engines. | Upgrade CapyCTL on that machine. |
 | 5 | `host_capability_missing:tensorfold_native` | The deployment's engine profile is TensorFold's native line (`line: native`) and a machine it names runs a CapyCTL too old for it; nothing was sent to it. | Upgrade CapyCTL on that machine. |
@@ -356,8 +356,8 @@ A deployment with `api: embeddings` ([Embedding models](deploy.md#embedding-mode
 is refused when it asks for something an embedding model cannot do in this
 release. The message is the one shown here:
 
-- On TensorFold, exit 5, `capability_missing:embeddings`:
-  "TensorFold has no embeddings route to forward to; serve embedding models
+- On TensorFold or TensorRT-LLM, exit 5, `capability_missing:embeddings`:
+  "<engine> has no embeddings route to forward to; serve embedding models
   on vLLM, SGLang, llama.cpp or a custom engine".
 - With `residency: deep` on llama.cpp or a custom engine, exit 5,
   `capability_missing:deep_park`: "an embeddings deployment on <engine> does

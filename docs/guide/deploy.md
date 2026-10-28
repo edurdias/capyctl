@@ -289,8 +289,9 @@ release an `embeddings` deployment:
 
 - runs on vLLM, SGLang, llama.cpp or a
   [custom engine](engines.md#custom-engines) whose manifest says
-  `api: embeddings`. TensorFold has no embeddings endpoint and is refused with
-  `capability_missing:embeddings` ([Exit codes and errors](errors.md));
+  `api: embeddings`. TensorFold and TensorRT-LLM have no embeddings endpoint
+  and are refused with `capability_missing:embeddings`
+  ([Exit codes and errors](errors.md));
 - runs on one GPU of one machine: a `topology` is refused;
 - parks `deep` on vLLM and SGLang when it states no `residency` (on a
   discrete GPU too, unless the engine profile turned deep parking off), and
