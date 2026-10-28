@@ -63,6 +63,7 @@ use crate::engine_policy::{
 use crate::lmcache::{HostLmcache, LmcacheMode, LmcacheRegistration, Retention};
 pub use crate::parked_growth::ParkedGrowthLimit;
 use crate::resource_controls::{ResourceContext, ResourceControls};
+pub use crate::tensorfold_native::{NativeRegistration, TensorfoldLine};
 use crate::{ConfigError, ConfigErrorCode};
 use capyctl_domain::launch::LaunchSettings;
 use capyctl_domain::resources as domain;
@@ -431,6 +432,16 @@ pub struct RuntimeProfile {
     /// Absent when none is, so such a profile serializes exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lmcache: Option<LmcacheRegistration>,
+    /// ADR 0039 §1: the TensorFold line of the installation, fixed at
+    /// registration from its form. Absent means `python`, so every existing
+    /// profile serializes and fingerprints exactly as before; a profile that
+    /// changes line changes its build fingerprint (drift, ADR 0008).
+    #[serde(default, skip_serializing_if = "TensorfoldLine::is_python")]
+    pub line: TensorfoldLine,
+    /// ADR 0039 §2, §7: what `engine add` recorded from a native release
+    /// (the capabilities document's families, the publisher's checksums).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeRegistration>,
 }
 
 /// Whether this profile may park at all.
@@ -1277,6 +1288,12 @@ struct RawProfile {
     /// ADR 0033 §1: the LMCache package `engine add` registered.
     #[serde(default)]
     lmcache: Option<LmcacheRegistration>,
+    /// ADR 0039 §1: `native` for a TensorFold native release.
+    #[serde(default)]
+    line: TensorfoldLine,
+    /// ADR 0039 §2, §7: the native registration's record.
+    #[serde(default)]
+    native: Option<NativeRegistration>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2137,6 +2154,8 @@ fn resolve_with(
             log_policy: profile.log_policy,
             custom: profile.custom,
             lmcache: profile.lmcache,
+            line: profile.line,
+            native: profile.native,
         },
         engine_env,
         host,

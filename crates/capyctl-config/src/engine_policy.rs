@@ -1019,6 +1019,9 @@ pub enum ProfileArgError {
          name an LMCache connector (`lmcache`); pass a JSON object"
     )]
     LmcacheUnreadable(String),
+    /// ADR 0039 §6: CapyCTL renders no drafter on TensorFold's native line.
+    #[error("{refusal} (option `{0}`)", refusal = crate::tensorfold_native::DRAFTER_REFUSAL)]
+    NativeDrafter(String),
 }
 
 /// Lowercase long-option name with `_` spelled `-`, without any `=value`.

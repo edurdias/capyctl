@@ -434,6 +434,15 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ),
         // ADR 0033 §1: the LMCache package `engine add` registered.
         ("lmcache", LMCACHE_REGISTRATION),
+        // ADR 0039 §1, §2: TensorFold's line, and a native release's record.
+        ("line", SCALAR),
+        (
+            "native",
+            FieldSpec::Struct(&[
+                ("families", FieldSpec::MapOf(&FieldSpec::Seq(&SCALAR))),
+                ("checksums_verified", SCALAR),
+            ]),
+        ),
     ]);
     // ADR 0033 §1, contract decision 3: the LMCache package `engine add`
     // found in the registered environment, with its ADR 0008 digest.

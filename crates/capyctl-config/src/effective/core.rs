@@ -15,6 +15,9 @@ pub(super) struct NormalizedProfile {
     pub(super) custom: Option<crate::custom::CustomProfile>,
     /// ADR 0033 §1: the LMCache package `engine add` registered.
     pub(super) lmcache: Option<LmcacheRegistration>,
+    /// ADR 0039 §1: the TensorFold line; `python` for every other engine.
+    pub(super) line: TensorfoldLine,
+    pub(super) native: Option<NativeRegistration>,
 }
 
 pub(super) struct NormalizedRecipe {
@@ -237,6 +240,20 @@ pub(super) fn normalize_profile(
             .check()
             .map_err(|detail| invalid("runtime_profiles.lmcache", detail))?;
     }
+    // ADR 0039 §1, §2: only a TensorFold profile names a line, and only a
+    // native one carries what `engine add` recorded from the release.
+    if raw_profile.line.is_native() && raw_profile.engine != Engine::Tensorfold {
+        return Err(invalid(
+            "runtime_profiles.line",
+            "only a profile of engine `tensorfold` names a line",
+        ));
+    }
+    if raw_profile.native.is_some() && !raw_profile.line.is_native() {
+        return Err(invalid(
+            "runtime_profiles.native",
+            "only a TensorFold profile of `line: native` carries a native registration",
+        ));
+    }
     let profile = NormalizedProfile {
         engine: raw_profile.engine,
         revision: raw_profile.revision,
@@ -252,6 +269,8 @@ pub(super) fn normalize_profile(
         },
         custom,
         lmcache: raw_profile.lmcache.clone(),
+        line: raw_profile.line,
+        native: raw_profile.native.clone(),
     };
     Ok(profile)
 }
