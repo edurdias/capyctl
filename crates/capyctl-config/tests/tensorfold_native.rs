@@ -58,6 +58,7 @@ fn strings(tokens: &[&str]) -> Vec<String> {
 fn context<'a>(line: TensorfoldLine, none: &'a BTreeSet<String>) -> ExtraArgsContext<'a> {
     ExtraArgsContext {
         engine: Engine::Tensorfold,
+        api: capyctl_config::effective::DeploymentApi::Chat,
         line,
         sleep_mode: false,
         approved_options: none,

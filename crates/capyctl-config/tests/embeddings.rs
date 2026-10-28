@@ -316,6 +316,7 @@ fn llamacpp_extra(api: DeploymentApi, list: &[&str]) -> Result<(), ProfileArgErr
         &ExtraArgsContext {
             engine: Engine::Llamacpp,
             api,
+            line: capyctl_config::tensorfold_native::TensorfoldLine::Python,
             sleep_mode: false,
             approved_options: &none,
             approved_paths: &[],
@@ -356,6 +357,7 @@ fn llamacpp_pooling_is_ordinary_on_embeddings_only() {
     assert!(matches!(
         capyctl_config::engine_policy::validate_profile_args(
             Engine::Llamacpp,
+            capyctl_config::tensorfold_native::TensorfoldLine::Python,
             &["--pooling".to_owned(), "mean".to_owned()],
             false
         ),
