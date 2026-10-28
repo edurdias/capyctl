@@ -812,13 +812,37 @@ async fn check_tensorrt_llm_ownership(launch: &LocalReadyLaunch) -> Result<(), S
     let set = failure.stop_set(&launch.identities);
     let stopped = tokio::task::spawn_blocking(move || {
         capyctl_launchers::owned_launch::terminate_recorded(&set, EXPOSED_GRACE)
+            .map(drop)
+            .map_err(|error| error.to_string())
     })
     .await
-    .map_err(|_| format!("{failure}; the stop did not run"))?;
-    Err(match stopped {
-        Ok(_) => format!("{failure}; the engine was stopped"),
-        Err(error) => format!("{failure}; the stop is unproven: {error}"),
-    })
+    .unwrap_or_else(|_| Err("the stop did not run".to_owned()));
+    Err(ownership_failure_text(&failure, stopped))
+}
+
+/// ADR 0038 §9: a failed ownership check, as the proof reports it. Only a
+/// stop that proved every process gone (the escaped ones included) names the
+/// closed failure; an unproven stop names no code, so the launch stays
+/// uncertain and its claim and reservations stay.
+fn ownership_failure_text(
+    failure: &capyctl_adapters::tensorrt_llm::OwnershipFailure,
+    stopped: Result<(), String>,
+) -> String {
+    match stopped {
+        Ok(()) => format!("{failure}; the engine was stopped"),
+        Err(error) => {
+            let text = failure.to_string();
+            let detail = match failure.code() {
+                Some(code) => text
+                    .replace(&format!("{code}: "), "")
+                    .replace(&format!("{code}:"), ""),
+                None => text,
+            };
+            format!(
+                "the engine failed its ownership check ({detail}); the stop is unproven: {error}"
+            )
+        }
+    }
 }
 
 /// Every recorded engine process is alive as recorded; `Unknown` is not alive.
@@ -959,5 +983,54 @@ mod tests {
             .unwrap();
         assert!(joined.load(Ordering::SeqCst), "joined before returning");
         assert_eq!(supervisor.children.running(), 0);
+    }
+
+    fn escape(pid: u32) -> capyctl_adapters::process_tree::EscapedProcess {
+        capyctl_adapters::process_tree::EscapedProcess {
+            identity: ProcessIdentity {
+                role: format!("escaped-{pid}"),
+                pid,
+                boot_id: "boot".into(),
+                start_ticks: 7,
+            },
+            group: pid,
+            launch_group: 100,
+            leader: 100,
+        }
+    }
+
+    // T49 (ADR 0038 §9): a proven stop of an escaped launch names the closed
+    // failure; an unproven one names no code, so the coordinator never
+    // settles the launch on it and its claim and reservations stay.
+    #[test]
+    fn only_a_proven_stop_names_the_ownership_failure() {
+        use capyctl_adapters::tensorrt_llm::OwnershipFailure;
+        use capyctl_config::tensorrt_llm::ENGINE_PROCESS_ESCAPED;
+        let failure = OwnershipFailure::Escaped(vec![escape(102), escape(103)]);
+        let stopped = ownership_failure_text(&failure, Ok(()));
+        assert!(stopped.starts_with(&format!("{ENGINE_PROCESS_ESCAPED}:")));
+        assert!(stopped.ends_with("; the engine was stopped"));
+        let unproven = ownership_failure_text(&failure, Err("process 102 survived".into()));
+        assert!(!unproven.contains(ENGINE_PROCESS_ESCAPED), "{unproven}");
+        assert!(unproven.contains("process 102"), "{unproven}");
+        assert!(unproven.contains("process 103"), "{unproven}");
+        assert!(unproven.ends_with("the stop is unproven: process 102 survived"));
+        let unreadable = OwnershipFailure::Unreadable("no /proc".into());
+        assert!(ownership_failure_text(&unreadable, Err("x".into())).contains("no /proc"));
+    }
+
+    // T49 (ADR 0038 §9): a TensorRT-LLM launch with no live recorded process
+    // fails its ownership check without a closed code.
+    #[test]
+    fn an_ownership_check_without_live_processes_names_no_code() {
+        assert_eq!(alive(&[]).unwrap_err(), "the launch recorded no processes");
+        let gone = ProcessIdentity {
+            role: "api".into(),
+            pid: u32::MAX - 1,
+            boot_id: "boot".into(),
+            start_ticks: 1,
+        };
+        let error = alive(&[gone]).unwrap_err();
+        assert!(!error.contains("engine_"), "{error}");
     }
 }

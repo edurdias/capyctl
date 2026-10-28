@@ -198,8 +198,7 @@ fn classify(
         controls.unauthenticated_local_surfaces = Some(LLAMACPP_UNAUTHENTICATED_LOCAL_SURFACES);
     }
     if engine == Engine::TensorrtLlm {
-        controls.unauthenticated_local_surfaces =
-            Some(TENSORRT_LLM_UNAUTHENTICATED_LOCAL_SURFACES);
+        controls.unauthenticated_local_surfaces = Some(TENSORRT_LLM_UNAUTHENTICATED_LOCAL_SURFACES);
     }
     if engine != Engine::Vllm {
         return controls;

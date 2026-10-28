@@ -88,6 +88,13 @@ fn read_stat(proc_root: &Path, pid: u32) -> std::io::Result<Option<ProcStat>> {
     Ok(parse_stat(&text).filter(|stat| stat.pid == pid))
 }
 
+/// A stat read that failed because the process exited between the listing
+/// and the read: its entry is gone (`NotFound`), or the kernel reaped it
+/// while the file was open (`ESRCH`).
+fn exited(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(nix::libc::ESRCH)
+}
+
 /// The leader as recorded, read now: its stat must parse and carry the
 /// recorded start ticks, or the pid is another process's.
 fn leader_stat(proc_root: &Path, leader: &ProcessIdentity) -> Result<ProcStat, TreeUnreadable> {
@@ -129,7 +136,7 @@ pub fn escaped_descendants(
         match read_stat(proc_root, pid) {
             Ok(Some(stat)) => children.entry(stat.parent).or_default().push(stat),
             // Exited between the listing and the read.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if exited(&error) => {}
             Ok(None) => {
                 return Err(TreeUnreadable(format!(
                     "process {pid}'s stat does not parse"
@@ -234,5 +241,15 @@ mod tests {
         write(root.path(), 100, &stat(100, 1, 100, 9));
         assert!(escaped_descendants(root.path(), &leader()).is_err());
         assert!(escaped_descendants(tempfile::tempdir().unwrap().path(), &leader()).is_err());
+    }
+
+    // T49 (ADR 0038 §9): a process that exits during the read, its entry
+    // gone or reaped with the file open, is skipped; another error is not.
+    #[test]
+    fn a_process_that_exits_during_the_read_is_skipped() {
+        use std::io::{Error, ErrorKind};
+        assert!(exited(&Error::from(ErrorKind::NotFound)));
+        assert!(exited(&Error::from_raw_os_error(nix::libc::ESRCH)));
+        assert!(!exited(&Error::from_raw_os_error(nix::libc::EACCES)));
     }
 }

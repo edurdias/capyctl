@@ -1724,10 +1724,7 @@ impl NativeHostExecution {
                 let engine = self
                     .stop_failed_tensorrt_llm(&command.identity.command_id, &error)
                     .await
-                    .or(match error {
-                        capyctl_adapters::traits::RuntimeError::LaunchFailed(text) => Some(text),
-                        _ => None,
-                    });
+                    .or_else(|| tensorrt_llm::unstopped_report(&error));
                 return Err(LaunchError { engine });
             }
             Err(capyctl_adapters::traits::RuntimeError::LaunchFailed(text)) => {
@@ -5150,7 +5147,11 @@ mod tests {
         let rendezvous = root.join("rendezvous");
         std::fs::create_dir(&rendezvous).unwrap();
         std::fs::set_permissions(&rendezvous, std::fs::Permissions::from_mode(0o700)).unwrap();
-        (executor.with_rendezvous_root(rendezvous), deployment, policy)
+        (
+            executor.with_rendezvous_root(rendezvous),
+            deployment,
+            policy,
+        )
     }
 
     /// A TensorRT-LLM launch command for the fixture under `root`, on
@@ -5178,8 +5179,7 @@ mod tests {
     fn a_tensorrt_llm_launch_prepares_from_local_policy() {
         let root = directory();
         let identity_dir = directory();
-        let (executor, deployment, policy) =
-            tensorrt_llm_fixture(root.path(), identity_dir.path());
+        let (executor, deployment, policy) = tensorrt_llm_fixture(root.path(), identity_dir.path());
         let port = closed_port();
         let (launch, plan) = tensorrt_llm_launch(root.path(), &deployment, &policy, port);
         let effective = executor.resolve(&launch).unwrap();
@@ -5238,8 +5238,7 @@ mod tests {
     async fn an_unsized_kv_geometry_is_a_closed_launch_refusal() {
         let root = directory();
         let identity_dir = directory();
-        let (executor, deployment, policy) =
-            tensorrt_llm_fixture(root.path(), identity_dir.path());
+        let (executor, deployment, policy) = tensorrt_llm_fixture(root.path(), identity_dir.path());
         let (launch, _) = tensorrt_llm_launch(root.path(), &deployment, &policy, closed_port());
         let effective = executor.resolve(&launch).unwrap();
         assert_eq!(executor.admit_tensorrt_llm(&effective), Ok(()));
@@ -5270,8 +5269,7 @@ mod tests {
         assert!(!result.claim_retained && !result.model_usable);
         let other = directory();
         let other_identity = directory();
-        let (llamacpp, deployment, policy) =
-            llamacpp_fixture(other.path(), other_identity.path());
+        let (llamacpp, deployment, policy) = llamacpp_fixture(other.path(), other_identity.path());
         let (launch, _) = llamacpp_launch(other.path(), &deployment, &policy, closed_port());
         let effective = llamacpp.resolve(&launch).unwrap();
         assert_eq!(llamacpp.admit_tensorrt_llm(&effective), Ok(()));

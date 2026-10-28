@@ -97,7 +97,13 @@ fn tensorrt_llm_is_a_named_engine() {
         serde_json::from_value::<Engine>(json!("tensorrt-llm")).unwrap(),
         Engine::TensorrtLlm
     );
-    for spelling in ["trtllm", "trtllm-serve", "tensorrt_llm", "tensorrtllm", "TensorRT-LLM"] {
+    for spelling in [
+        "trtllm",
+        "trtllm-serve",
+        "tensorrt_llm",
+        "tensorrtllm",
+        "TensorRT-LLM",
+    ] {
         assert_eq!(Engine::from_name(spelling), None, "{spelling}");
     }
     assert!(Engine::ALL.contains(&Engine::TensorrtLlm));
@@ -226,7 +232,10 @@ fn resolution_refuses_what_tensorrt_llm_cannot_do() {
     for name in ["a/b", "..", "."] {
         deployment["routes"] = json!([name]);
         let error = resolve(&deployment, &host).unwrap_err();
-        assert!(error.detail.contains("served_name_unsupported"), "{name}: {error}");
+        assert!(
+            error.detail.contains("served_name_unsupported"),
+            "{name}: {error}"
+        );
     }
     deployment["routes"] = json!(["toy"]);
     // Another family's block, and TensorRT-LLM's on another family.
@@ -271,7 +280,10 @@ fn hidden_inputs_in_the_environment_are_refused() {
         let (deployment, mut host) = fixture();
         host["runtime_profiles"]["local"]["env"] = json!({ name: "1" });
         let error = resolve(&deployment, &host).unwrap_err();
-        assert!(error.detail.contains("engine_env_reserved"), "{name}: {error}");
+        assert!(
+            error.detail.contains("engine_env_reserved"),
+            "{name}: {error}"
+        );
         let (mut deployment, mut host) = fixture();
         host["runtime_profiles"]["local"]["security"]["approved_env"] = json!([name]);
         deployment["engine_config"]["env"] = json!({ name: "1" });
@@ -313,7 +325,11 @@ fn every_reserved_spelling_is_refused() {
     // Subcommands and the positional model.
     assert!(extra(&["disaggregated"], &[]).is_err());
     // Ordinary options pass in both spellings.
-    extra(&["--max_num_tokens", "4096", "--enable_chunked_prefill"], &[]).unwrap();
+    extra(
+        &["--max_num_tokens", "4096", "--enable_chunked_prefill"],
+        &[],
+    )
+    .unwrap();
     extra(&["--max_num_tokens=4096"], &[]).unwrap();
     // A duplicate is refused.
     assert!(matches!(
@@ -337,8 +353,12 @@ fn every_reserved_spelling_is_refused() {
     ));
     // Host-fixed arguments follow the same names.
     assert!(validate_profile_args(Engine::TensorrtLlm, &args(&["--tp_size", "2"]), false).is_err());
-    validate_profile_args(Engine::TensorrtLlm, &args(&["--max_num_tokens", "8192"]), false)
-        .unwrap();
+    validate_profile_args(
+        Engine::TensorrtLlm,
+        &args(&["--max_num_tokens", "8192"]),
+        false,
+    )
+    .unwrap();
 }
 
 // T49 T21 (ADR 0038 §3, ADR 0021): the flag table names every reserved

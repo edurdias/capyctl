@@ -674,7 +674,10 @@ mod lmcache_tests {
             Some("engine_listener_exposed")
         );
         // A code named in prose without its colon is not the code.
-        assert_eq!(super::tensorrt_llm_failure("the kv_cache_short check"), None);
+        assert_eq!(
+            super::tensorrt_llm_failure("the kv_cache_short check"),
+            None
+        );
         assert_eq!(super::tensorrt_llm_failure("engine exited"), None);
     }
 }

@@ -1572,9 +1572,11 @@ fn validate_tensorrt_llm_args(
         // ADR 0014 §8: an approval of any spelling approves the option.
         let spellings = tensorrt_llm::sensitive(&name).map_or(&[][..], |(row, _)| row);
         let approved = context.approved_options.contains(&name)
-            || spellings
-                .iter()
-                .any(|spelling| context.approved_options.contains(&normalize_option_name(spelling)));
+            || spellings.iter().any(|spelling| {
+                context
+                    .approved_options
+                    .contains(&normalize_option_name(spelling))
+            });
         if !approved {
             return Err(ProfileArgError::Sensitive(name));
         }
@@ -2058,7 +2060,12 @@ pub fn flag_table(engine: Engine) -> Vec<FlagRow> {
         };
         add_row(
             &mut rows,
-            row(name, NameMatch::Name, FlagClass::Ordinary, reason.to_owned()),
+            row(
+                name,
+                NameMatch::Name,
+                FlagClass::Ordinary,
+                reason.to_owned(),
+            ),
         );
     }
     rows

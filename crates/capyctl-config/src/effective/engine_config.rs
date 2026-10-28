@@ -1500,9 +1500,8 @@ pub(super) fn normalize_engine_config(
         }
         let block = raw.tensorrt_llm.clone().unwrap_or_default();
         if let Some(options) = &block.llm_api_options {
-            crate::tensorrt_llm::check_options(options, raw.cuda_graphs.is_some()).map_err(
-                |reason| invalid("engine_config.tensorrt-llm.llm_api_options", reason),
-            )?;
+            crate::tensorrt_llm::check_options(options, raw.cuda_graphs.is_some())
+                .map_err(|reason| invalid("engine_config.tensorrt-llm.llm_api_options", reason))?;
         }
     }
     // ADR 0029 §5: one of llama.cpp's cache types, for keys and values both.

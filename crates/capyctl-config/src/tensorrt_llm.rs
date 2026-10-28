@@ -730,31 +730,35 @@ pub fn kv_geometry(
             _ => return refuse("config.json gives no `head_dim` and no whole `hidden_size`"),
         },
     };
-    let element_bytes = match kv_cache_dtype.filter(|kind| *kind != "auto") {
-        Some("fp8") => 1,
-        Some(other) => {
-            return refuse(&format!("the KV cache dtype `{other}` is not one CapyCTL sizes"))
-        }
-        None => {
-            let model_dtype = dtype.filter(|kind| *kind != "auto").map(str::to_owned).or_else(|| {
-                text.get("torch_dtype")
-                    .or_else(|| text.get("dtype"))
-                    .or_else(|| top.get("torch_dtype"))
-                    .or_else(|| top.get("dtype"))
-                    .and_then(Value::as_str)
+    let element_bytes =
+        match kv_cache_dtype.filter(|kind| *kind != "auto") {
+            Some("fp8") => 1,
+            Some(other) => {
+                return refuse(&format!(
+                    "the KV cache dtype `{other}` is not one CapyCTL sizes"
+                ))
+            }
+            None => {
+                let model_dtype = dtype
+                    .filter(|kind| *kind != "auto")
                     .map(str::to_owned)
-            });
-            match model_dtype.as_deref().and_then(dtype_bytes) {
-                Some(bytes) => bytes,
-                None => {
-                    return refuse(
+                    .or_else(|| {
+                        text.get("torch_dtype")
+                            .or_else(|| text.get("dtype"))
+                            .or_else(|| top.get("torch_dtype"))
+                            .or_else(|| top.get("dtype"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    });
+                match model_dtype.as_deref().and_then(dtype_bytes) {
+                    Some(bytes) => bytes,
+                    None => return refuse(
                         "the model's dtype (`torch_dtype`) is not bfloat16, float16 or float32; \
                          declare engine_config.dtype",
-                    )
+                    ),
                 }
             }
-        }
-    };
+        };
     let geometry = KvGeometry {
         layers,
         kv_heads,
@@ -863,8 +867,14 @@ mod tests {
     #[test]
     fn geometry_refusals() {
         for (patch, what) in [
-            (json!({"use_sliding_window": true, "sliding_window": 4096}), "sliding"),
-            (json!({"layer_types": ["full_attention", "sliding_attention"]}), "layer_types"),
+            (
+                json!({"use_sliding_window": true, "sliding_window": 4096}),
+                "sliding",
+            ),
+            (
+                json!({"layer_types": ["full_attention", "sliding_attention"]}),
+                "layer_types",
+            ),
             (json!({"kv_lora_rank": 512}), "kv_lora_rank"),
             (json!({"model_type": "nemotron_h"}), "recurrent"),
             (json!({"mamba_d_state": 128}), "recurrent"),
@@ -877,7 +887,10 @@ mod tests {
                 config[key] = value.clone();
             }
             let reason = kv_geometry(&config, None, None).unwrap_err();
-            assert!(reason.starts_with(KV_GEOMETRY_UNSUPPORTED), "{what}: {reason}");
+            assert!(
+                reason.starts_with(KV_GEOMETRY_UNSUPPORTED),
+                "{what}: {reason}"
+            );
             assert!(reason.contains(what), "{what}: {reason}");
         }
         let reason = kv_geometry(&qwen3_4b(), None, Some("nvfp4")).unwrap_err();
@@ -916,7 +929,10 @@ mod tests {
         }
         for key in ["ray_placement_config", "disaggregated_params"] {
             let options = json!({ key: {} });
-            assert!(check_options(options.as_object().unwrap(), false).is_err(), "{key}");
+            assert!(
+                check_options(options.as_object().unwrap(), false).is_err(),
+                "{key}"
+            );
         }
         let graphs = json!({"cuda_graph_config": {"max_batch_size": 8}});
         assert!(check_options(graphs.as_object().unwrap(), false).is_ok());
@@ -970,7 +986,8 @@ mod tests {
             assert_eq!(document["cuda_graph_config"], Value::Null);
         }
         // The deployment's mapping merges under CapyCTL's keys.
-        let options = json!({"kv_cache_config": {"enable_block_reuse": false}, "stream_interval": 4});
+        let options =
+            json!({"kv_cache_config": {"enable_block_reuse": false}, "stream_interval": 4});
         let document = llm_api_document(&LlmApiInputs {
             line: version_line("1.2.1"),
             max_tokens: 10,
@@ -1010,7 +1027,10 @@ mod tests {
             }
         }
         assert!(!is_reserved(&fold("--max_num_tokens")));
-        assert_eq!(typed_field(&fold("--max_batch_size")), Some("max_concurrent_requests"));
+        assert_eq!(
+            typed_field(&fold("--max_batch_size")),
+            Some("max_concurrent_requests")
+        );
         assert!(sensitive(&fold("--chat_template")).is_some());
         for name in [
             "TLLM_WORKER_USE_SINGLE_PROCESS",
