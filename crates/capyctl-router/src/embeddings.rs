@@ -174,6 +174,7 @@ pub(crate) async fn dispatch(
         body_bytes,
         received,
         &mut timing,
+        &ids,
     )
     .await?;
     // ADR 0013 §10 (I3): choose an instance and open its lease. Nothing has

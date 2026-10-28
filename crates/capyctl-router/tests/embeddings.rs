@@ -123,6 +123,7 @@ impl capyctl_controller::LifecyclePort for Authority {
                 deployment_id: DEPLOYMENT.into(),
                 revision: 1,
                 request_abort: false,
+                engine_trace: false,
             }),
         )
     }
@@ -405,6 +406,7 @@ fn stack_on(authority: Arc<Authority>) -> (Arc<Authority>, RouterDeps, axum::Rou
         api_key: None,
         inflight: Arc::new(capyctl_router::admission::InFlight::default()),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: capyctl_trace::Tracing::off(),
     };
     let router = capyctl_router::serve_router(deps.clone());
     (authority, deps, router)

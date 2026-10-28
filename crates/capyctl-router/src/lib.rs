@@ -383,6 +383,7 @@ async fn embeddings_handler(
 ) -> axum::response::Response {
     let ids = Arc::new(request_id::RequestIds::read(&headers));
     let outcome = embedding(&state.deps, &headers, body, &ids).await;
+    ids.end_trace(&outcome);
     ids.stamp(outcome)
 }
 

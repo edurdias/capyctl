@@ -68,6 +68,7 @@ impl RequestTrace {
         let (name, route) = match endpoint {
             Endpoint::ChatCompletions => (TraceEndpoint::Chat, "/v1/chat/completions"),
             Endpoint::Decisions => (TraceEndpoint::Decisions, "/v1/systemone"),
+            Endpoint::Embeddings => (TraceEndpoint::Embeddings, "/v1/embeddings"),
         };
         request.set(Attr::Endpoint(name));
         request.set(Attr::HttpMethod("POST"));
