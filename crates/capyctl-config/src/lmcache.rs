@@ -123,10 +123,13 @@ pub enum LmcacheOffReason {
     ListenerExposed,
     /// The engine did not start with the connector.
     EngineStartFailed,
+    /// ADR 0036 §2: an embeddings deployment (no generated prefix to reuse,
+    /// no pooling runner qualified with the connector).
+    EmbeddingsUnsupported,
 }
 
 impl LmcacheOffReason {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::Disabled,
         Self::HostOff,
         Self::EngineUnsupported,
@@ -144,6 +147,7 @@ impl LmcacheOffReason {
         Self::ServerStartFailed,
         Self::ListenerExposed,
         Self::EngineStartFailed,
+        Self::EmbeddingsUnsupported,
     ];
 
     pub fn code(self) -> &'static str {
@@ -165,6 +169,7 @@ impl LmcacheOffReason {
             Self::ServerStartFailed => "server_start_failed",
             Self::ListenerExposed => "listener_exposed",
             Self::EngineStartFailed => "engine_start_failed",
+            Self::EmbeddingsUnsupported => crate::embeddings::LMCACHE_OFF_REASON,
         }
     }
 
@@ -217,6 +222,7 @@ impl LmcacheOffReason {
             Self::ServerStartFailed => "the LMCache server did not start",
             Self::ListenerExposed => "the LMCache server listened off loopback",
             Self::EngineStartFailed => "the engine did not start with LMCache",
+            Self::EmbeddingsUnsupported => "an embeddings deployment does not use LMCache",
         }
     }
 }
@@ -1133,6 +1139,11 @@ fn off_reason(inputs: &PlanInputs<'_>, table: &[QualifiedParking]) -> Option<Lmc
     if inputs.mode == LmcacheMode::Off {
         return Some(LmcacheOff::new(R::Disabled));
     }
+    // ADR 0036 §2: an embeddings deployment never runs LMCache, whatever the
+    // host says.
+    if inputs.api == DeploymentApi::Embeddings {
+        return Some(LmcacheOff::new(R::EmbeddingsUnsupported));
+    }
     if inputs.host_retention == Retention::Zero {
         return Some(LmcacheOff::with_detail(
             R::RetentionZero,
@@ -1231,7 +1242,8 @@ pub fn deployment_refusal(inputs: &PlanInputs<'_>, table: &[QualifiedParking]) -
     };
     let off = off_reason(&neutral, table)?;
     let known = match off.reason {
-        R::EngineUnsupported
+        R::EmbeddingsUnsupported
+        | R::EngineUnsupported
         | R::EngineVersionUnsupported
         | R::GroupUnsupported
         | R::MultiGpuUnqualified

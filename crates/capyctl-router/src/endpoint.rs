@@ -34,11 +34,14 @@ impl Endpoint {
         }
     }
 
-    /// The endpoint a deployment serving `api` answers.
-    pub const fn serving(api: DeploymentApi) -> Self {
+    /// The path a deployment serving `api` answers. ADR 0036 §3: an
+    /// embeddings deployment answers `POST /v1/embeddings`, which no endpoint
+    /// here serves yet, so every request to it is `api_mismatch`.
+    pub const fn serving_path(api: DeploymentApi) -> &'static str {
         match api {
-            DeploymentApi::Chat => Self::ChatCompletions,
-            DeploymentApi::Decisions => Self::Decisions,
+            DeploymentApi::Chat => Self::ChatCompletions.path(),
+            DeploymentApi::Decisions => Self::Decisions.path(),
+            DeploymentApi::Embeddings => "/v1/embeddings",
         }
     }
 
@@ -81,7 +84,7 @@ pub(crate) fn check_api(
             "model {model} serves the {} API, which {} does not answer; send its requests to POST {}",
             api.name(),
             endpoint.path(),
-            Endpoint::serving(api).path(),
+            Endpoint::serving_path(api),
         ),
     ))
 }

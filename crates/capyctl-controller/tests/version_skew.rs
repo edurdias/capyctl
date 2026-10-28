@@ -519,6 +519,7 @@ async fn a_park_refused_before_sending_forgets_readiness_so_a_probe_reopens_disp
             instance_index: 0,
             device_memory: false,
             decisions: false,
+            embeddings: false,
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,
@@ -1073,6 +1074,7 @@ async fn device_domains_need_the_capability() {
             instance_index: 0,
             device_memory: true,
             decisions: false,
+            embeddings: false,
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,
@@ -1164,6 +1166,7 @@ async fn a_decisions_launch_needs_the_capability() {
             instance_index: 0,
             device_memory: false,
             decisions: true,
+            embeddings: false,
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,
@@ -1238,6 +1241,99 @@ async fn a_decisions_launch_needs_the_capability() {
     h.server.abort();
 }
 
+// T47 T34 (ADR 0036 §1): a host without `embeddings` stays placeable for
+// every other deployment, but a launch, park or wake of an embeddings
+// deployment there is refused `host_capability_missing:embeddings` before
+// anything is sent, so an older host never runs a chat probe against an
+// embedding server.
+#[tokio::test]
+async fn an_embeddings_launch_needs_the_capability() {
+    let h = enrolled().await;
+    let mut declared = all();
+    declared.retain(|c| c != capabilities::EMBEDDINGS);
+    let (_send, mut stream) = h
+        .published(declared, inventory(&h.host))
+        .await
+        .expect("the host connects");
+    assert!(h.sessions.inspect(&h.host).unwrap().eligible);
+    let MemberAction::LaunchSingle(plan) = launch() else {
+        unreachable!()
+    };
+    let binding_id = plan.binding_id.clone();
+    let incarnation = plan.incarnation.clone();
+    let engine = remote_execution::engine(
+        h.sessions.clone(),
+        h.state.clone(),
+        RemoteLaunchBinding {
+            controller_id: h.authority.controller_id(),
+            host_id: h.host.clone(),
+            member_id: "head".into(),
+            profile_fingerprint: "vllm-0.32.0".into(),
+            launch_command_id: "01K00000000000000000000005".into(),
+            plan,
+            ingress_gate_key: [7; 32],
+            instance_index: 0,
+            device_memory: false,
+            decisions: false,
+            embeddings: true,
+            custom_engine: false,
+            lmcache_required: false,
+            retention_zero: false,
+        },
+        Default::default(),
+    );
+    let context = |step_id: &str, identities, grant_id: Option<String>| StepExecutionContext {
+        token: TransitionToken {
+            deployment_id: "deployment".into(),
+            revision: 1,
+            generation: 1,
+            operation_id: "01K00000000000000000000006".into(),
+            step_id: step_id.into(),
+        },
+        binding_id: binding_id.clone(),
+        incarnation: incarnation.clone(),
+        issued_at_ms: 1,
+        deadline_ms: capyctl_protocol::now_unix_ms() + 20_000,
+        identities,
+        completion_target: None,
+        grant_id,
+        launch_settings: None,
+    };
+    for action in [RuntimeAction::Park, RuntimeAction::Restore] {
+        let command = RuntimeCommand {
+            action,
+            context: context(
+                "01K00000000000000000000007",
+                ExecutionIdentities::Retained(vec![recorded()]),
+                None,
+            ),
+        };
+        assert_eq!(
+            engine.execute_persisted(&command).await.unwrap_err(),
+            RuntimeError::Refused("host_capability_missing:embeddings".into())
+        );
+    }
+    let launch = RuntimeCommand {
+        action: RuntimeAction::Initialize,
+        context: context(
+            "01K00000000000000000000005",
+            ExecutionIdentities::OwnedLaunch,
+            Some("grant".into()),
+        ),
+    };
+    assert_eq!(
+        engine.execute_persisted(&launch).await.unwrap_err(),
+        RuntimeError::Refused("host_capability_missing:embeddings".into())
+    );
+    assert!(
+        next_command(&mut stream, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "nothing was sent"
+    );
+    h.server.abort();
+}
+
 // T44 T34 (ADR 0031 §9): a host without `custom_engines` stays placeable for
 // every other deployment, but a launch on a custom engine there is refused
 // `host_capability_missing:custom_engines` before anything is sent.
@@ -1270,6 +1366,7 @@ async fn a_custom_engine_launch_needs_the_capability() {
             instance_index: 0,
             device_memory: false,
             decisions: false,
+            embeddings: false,
             custom_engine: true,
             lmcache_required: false,
             retention_zero: false,
@@ -1347,6 +1444,7 @@ async fn an_lmcache_required_or_zero_retention_launch_needs_the_capability() {
                 instance_index: 0,
                 device_memory: false,
                 decisions: false,
+                embeddings: false,
                 custom_engine: false,
                 lmcache_required,
                 retention_zero,
@@ -1561,6 +1659,7 @@ async fn a_request_abort_is_sent_only_to_a_host_that_declared_it() {
                 instance_index: 0,
                 device_memory: false,
                 decisions: false,
+                embeddings: false,
                 custom_engine: false,
                 lmcache_required: false,
                 retention_zero: false,

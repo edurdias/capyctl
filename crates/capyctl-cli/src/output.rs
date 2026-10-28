@@ -273,6 +273,12 @@ const GROUP_CODES: &[(&str, Named, Option<ExitCode>)] = &[
         Named::Bare,
         Some(ExitCode::UNSUPPORTED),
     ),
+    // ADR 0036 §1: a host too old to serve embedding models.
+    (
+        "host_capability_missing:embeddings",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
     // ADR 0031 §9: a host too old to run custom engines.
     (
         "host_capability_missing:custom_engines",

@@ -204,6 +204,7 @@ fn extra(
         &args(list),
         &ExtraArgsContext {
             engine: Engine::Llamacpp,
+            api: capyctl_config::effective::DeploymentApi::Chat,
             sleep_mode: false,
             approved_options: &approved,
             approved_paths: &paths,

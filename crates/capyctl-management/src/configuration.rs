@@ -692,8 +692,11 @@ fn registry_targets(
     fail_fast: bool,
 ) -> Result<(Vec<HostTarget>, Vec<HostRefusal>), ConfigurationFailure> {
     let config = capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, config_json)?;
-    let decisions = capyctl_config::decisions::check_document(&config)?
-        == capyctl_config::effective::DeploymentApi::Decisions;
+    let api = capyctl_config::decisions::check_document(&config)?;
+    let decisions = api == capyctl_config::effective::DeploymentApi::Decisions;
+    // ADR 0036 §1: an embeddings deployment goes only to a host that
+    // declared `embeddings`.
+    let embeddings = api == capyctl_config::effective::DeploymentApi::Embeddings;
     let spec = capyctl_config::instances::parse_instance_spec(&config)?;
     let group = spec.group.as_ref();
     let allowed: Vec<String> = match &spec.placement.hosts {
@@ -808,7 +811,7 @@ fn registry_targets(
                 original["runtime_profiles"][&name]["engine"].as_str()
                     == Some(capyctl_config::engine_policy::Engine::Custom.name())
             });
-        if decisions || custom {
+        if decisions || embeddings || custom {
             let declared: std::collections::BTreeSet<String> = store
                 .host_version(&publication.host_id)
                 .map_err(|_| ConfigurationFailure::Internal)?
@@ -822,6 +825,17 @@ fn registry_targets(
                         "{code}: host `{selector}` cannot serve decision models; upgrade its agent"
                     );
                     (code, "api", detail)
+                })
+                .or_else(|| {
+                    embeddings
+                        .then(|| capyctl_protocol::capabilities::embeddings_refusal(&declared))
+                        .flatten()
+                        .map(|code| {
+                            let detail = format!(
+                                "{code}: host `{selector}` cannot serve embedding models; upgrade its agent"
+                            );
+                            (code, "api", detail)
+                        })
                 })
                 .or_else(|| {
                     custom

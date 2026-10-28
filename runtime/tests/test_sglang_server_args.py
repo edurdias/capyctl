@@ -73,6 +73,8 @@ class SyntheticArgs(SimpleNamespace):
         parser.add_argument("--export-metrics-to-file", action="store_true")
         parser.add_argument("--export-metrics-to-file-dir", default=None)
         parser.add_argument("--spec-trace-dir", default=None)
+        # ADR 0036 §2: the embedding-server switch.
+        parser.add_argument("--is-embedding", action="store_true")
 
 
 SyntheticArgs.__struct_fields__ = (
@@ -140,6 +142,7 @@ class MappingTests(LaunchFixture, unittest.TestCase):
             "nnodes": 1, "node_rank": 0, "gpu_id_step": 1,
             "mem_fraction_static": 0.0625, "enable_memory_saver": True,
             "enable_weights_cpu_backup": False, "enable_draft_weights_cpu_backup": False,
+            "is_embedding": False,
             "cpu_offload_gb": 0, "disaggregation_mode": "null",
             "enable_hierarchical_cache": False, "enable_lmcache": False,
             "enable_flexkv": False, "grpc_port": None, "grpc_mode": False,
@@ -234,6 +237,30 @@ class MappingTests(LaunchFixture, unittest.TestCase):
                     construct(self.spec_with(max_mamba_cache_size=40, extra_args=extra),
                               self.placement(), constructor)
                 self.assertEqual(caught.exception.code, "effective_args_mismatch")
+
+    # T47 T14 (ADR 0036 §2): capyctl renders `is_embedding` for an embeddings
+    # deployment; no extra argument may set it, chat or embeddings.
+    def test_is_embedding_is_rendered_by_capyctl_only(self):
+        constructor = mock.Mock(side_effect=AssertionError("constructed"))
+        constructor.add_cli_args = SyntheticArgs.add_cli_args
+        constructor.__struct_fields__ = SyntheticArgs.__struct_fields__
+        for embedding in (False, True):
+            with self.subTest(embedding=embedding):
+                settings = {"extra_args": ["--is-embedding"]}
+                if embedding:
+                    settings["is_embedding"] = True
+                with self.assertRaises(mapping.ServerArgsError) as caught:
+                    construct(self.spec_with(**settings), self.placement(), constructor)
+                self.assertEqual(caught.exception.code, "effective_args_mismatch")
+        self.public["settings"]["extra_args"] = []
+        kwargs = self.seen(self.spec_with(is_embedding=True))
+        self.assertIs(kwargs["is_embedding"], True)
+        kwargs = self.seen(self.build_without("is_embedding"))
+        self.assertIs(kwargs["is_embedding"], False)
+        # The descriptor carries the setting only as `true`.
+        with self.assertRaises(entry.LaunchError) as caught:
+            self.spec_with(is_embedding=False)
+        self.assertEqual(caught.exception.code, "invalid_descriptor")
 
     # T14: ADR 0008 amendment 2026-10-08. A declared drafter's directory,
     # which capyctl materialized, reaches the constructor as the draft model

@@ -370,6 +370,7 @@ fn every_post_baseline_field_names_its_capability() {
             CHECKPOINT_TABLES,
             CHECKPOINT_GGUF,
             DECISIONS,
+            EMBEDDINGS,
             CUSTOM_ENGINES,
             STARTUP_HOST_BYTES,
             LMCACHE,
@@ -596,6 +597,51 @@ fn decisions_gates_only_decision_deployments() {
         decisions_refusal(&agent_capabilities().into_iter().collect()),
         None
     );
+}
+
+// T47 T34 (ADR 0036 §1): `embeddings` is a capability every current agent
+// declares. It is no placement requirement for other deployments: only an
+// embeddings deployment is refused, typed, on a host without it, at
+// placement and as its launch's own requirement, so an older host never
+// runs a chat probe against an embedding server.
+#[test]
+fn embeddings_gates_only_embedding_deployments() {
+    use capabilities::*;
+    assert_eq!(EMBEDDINGS, "embeddings");
+    assert!(CATALOGUE.contains(&(EMBEDDINGS, Direction::ServerToHost)));
+    assert!(agent_capabilities().contains(&EMBEDDINGS.to_owned()));
+    assert!(agent_capabilities().len() <= MAX_DECLARED);
+    assert!(!PLACEMENT_REQUIRED.contains(&EMBEDDINGS));
+    assert!(is_gate_refusal(&missing(EMBEDDINGS)));
+    let current: BTreeSet<String> = agent_capabilities().into_iter().collect();
+    let older: BTreeSet<String> = current
+        .iter()
+        .filter(|name| *name != EMBEDDINGS)
+        .cloned()
+        .collect();
+    assert_eq!(
+        embeddings_refusal(&older).as_deref(),
+        Some("host_capability_missing:embeddings")
+    );
+    assert_eq!(embeddings_refusal(&current), None);
+    assert_eq!(decisions_refusal(&older), None);
+    assert_eq!(custom_engines_refusal(&older), None);
+
+    let embeddings = launch_with(serde_json::json!({"api": "embeddings"}));
+    assert_eq!(required(&embeddings), vec![CHECKPOINT_DIGEST, EMBEDDINGS]);
+    assert_eq!(
+        refusal_for(&older, &embeddings).as_deref(),
+        Some("host_capability_missing:embeddings")
+    );
+    assert_eq!(refusal_for(&current, &embeddings), None);
+    for api in ["chat", "decisions"] {
+        let other = launch_with(serde_json::json!({ "api": api }));
+        assert_eq!(required(&other), vec![CHECKPOINT_DIGEST], "{api}");
+        assert_eq!(refusal_for(&older, &other), None, "{api}");
+    }
+    // A value merely mentioning the word is no embeddings deployment.
+    let named = launch_with(serde_json::json!({"description": "embeddings"}));
+    assert_eq!(required(&named), vec![CHECKPOINT_DIGEST]);
 }
 
 // T44 T34 (ADR 0031 §9): `custom_engines` is a capability every current

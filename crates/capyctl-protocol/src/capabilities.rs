@@ -101,6 +101,14 @@ pub const CHECKPOINT_GGUF: &str = "checkpoint_gguf";
 /// refused `host_capability_missing:decisions` before anything is sent, so an
 /// older host never receives a deployment whose checks it would run as chat.
 pub const DECISIONS: &str = capyctl_config::decisions::HOST_CAPABILITY;
+/// ADR 0036 §1: the host serves embedding models (`api: embeddings`): it
+/// resolves the field, proves such a deployment ready with a fixed embedding
+/// rather than generated text, and forwards `/v1/embeddings`. The server
+/// places an embeddings deployment only on a host that declared it; any
+/// other host is refused `host_capability_missing:embeddings` before
+/// anything is sent, so an older host never runs a chat probe against an
+/// embedding server.
+pub const EMBEDDINGS: &str = capyctl_config::embeddings::HOST_CAPABILITY;
 /// ADR 0031 §9: the host runs custom engines (a profile of kind `custom`:
 /// the manifest's command, its placeholders, the loopback check). The server
 /// places a deployment whose selected profile is a custom engine only on a
@@ -194,6 +202,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (CHECKPOINT_TABLES, Direction::ServerToHost),
     (CHECKPOINT_GGUF, Direction::ServerToHost),
     (DECISIONS, Direction::ServerToHost),
+    (EMBEDDINGS, Direction::ServerToHost),
     (CUSTOM_ENGINES, Direction::ServerToHost),
     (STARTUP_HOST_BYTES, Direction::ServerToHost),
     (LMCACHE, Direction::ServerToHost),
@@ -289,6 +298,7 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
                 needs.push(LMCACHE);
             }
             lmcache_needs(&plan.deployment_config, &mut needs);
+            api_needs(&plan.deployment_config, &mut needs);
         }
         // ADR 0028 §14: a group plan carries fields an older host would drop.
         Some(Action::Prepare(_) | Action::Launch(_)) => needs.push(ENGINE_GROUPS),
@@ -336,6 +346,7 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
             needs.push(LMCACHE);
         }
         lmcache_needs(&plan.deployment_config, &mut needs);
+        api_needs(&plan.deployment_config, &mut needs);
     }
     needs.sort_by_key(|need| CATALOGUE.iter().position(|(name, _)| name == need));
     // ADR 0033: a grant and `lmcache: required` both name `lmcache`.
@@ -363,6 +374,25 @@ fn lmcache_needs(deployment_config: &str, needs: &mut Vec<&'static str>) {
     }
     if retention == Retention::Zero {
         needs.push(RETENTION);
+    }
+}
+
+/// ADR 0036 §1: a launch whose deployment document declares
+/// `api: embeddings` needs `embeddings`; an older host would launch it as
+/// chat and prove it with a chat probe. A document that does not parse
+/// needs nothing here; the host refuses it on its own.
+fn api_needs(deployment_config: &str, needs: &mut Vec<&'static str>) {
+    // Only a document that names the value is parsed.
+    if !deployment_config.contains("embeddings") {
+        return;
+    }
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(deployment_config) else {
+        return;
+    };
+    if document.get("api").and_then(serde_json::Value::as_str)
+        == Some(capyctl_config::effective::DeploymentApi::Embeddings.name())
+    {
+        needs.push(EMBEDDINGS);
     }
 }
 
@@ -416,6 +446,12 @@ pub fn group_refusal(host_capabilities: &BTreeSet<String>) -> Option<String> {
 /// host that did not declare `decisions`, or `None` when it may be placed.
 pub fn decisions_refusal(host_capabilities: &BTreeSet<String>) -> Option<String> {
     (!host_capabilities.contains(DECISIONS)).then(|| missing(DECISIONS))
+}
+
+/// ADR 0036 §1: the typed refusal for placing an embeddings deployment on a
+/// host that did not declare `embeddings`, or `None` when it may be placed.
+pub fn embeddings_refusal(host_capabilities: &BTreeSet<String>) -> Option<String> {
+    (!host_capabilities.contains(EMBEDDINGS)).then(|| missing(EMBEDDINGS))
 }
 
 /// ADR 0031 §9: the typed refusal for placing a deployment on a custom

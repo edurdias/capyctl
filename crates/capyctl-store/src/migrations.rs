@@ -11,8 +11,8 @@ use crate::schema::{
     SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
     SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
     SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V49, SCHEMA_V5, SCHEMA_V50, SCHEMA_V51, SCHEMA_V52,
-    SCHEMA_V53, SCHEMA_V54, SCHEMA_V55, SCHEMA_V56, SCHEMA_V57, SCHEMA_V58, SCHEMA_V6, SCHEMA_V7,
-    SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V53, SCHEMA_V54, SCHEMA_V55, SCHEMA_V56, SCHEMA_V57, SCHEMA_V58, SCHEMA_V59, SCHEMA_V6,
+    SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -102,6 +102,8 @@ pub const MIGRATIONS: &[&str] = &[
     // ADR 0035 §§2, 3: GPU-set resolutions, each instance's chosen set and N,
     // and the measured peak and residue keyed by N.
     SCHEMA_V58,
+    // ADR 0036 §§5, 6: an embeddings launch's wake canary reference.
+    SCHEMA_V59,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -1535,8 +1537,10 @@ mod tests {
              VALUES('a',0,3,'inc','Say ready.','[1,2]','ok',7,'op-w');",
         )
         .unwrap();
-        apply(&conn).unwrap();
-        apply(&conn).unwrap();
+        // Stop at v49: its own row shape is what this test checks (v59
+        // widens the table).
+        apply_through(&conn, 49).unwrap();
+        apply_through(&conn, 49).unwrap();
         let row: (String, String, Option<String>, String, Option<f64>) = conn
             .query_row(
                 "SELECT incarnation||'|'||prompt||'|'||tokens_json||'|'||text||'|'||recorded_at_ms,
@@ -1570,6 +1574,69 @@ mod tests {
             "INSERT INTO wake_canaries VALUES('a',0,4,'i','decision/v1','[]','',1,NULL,'decision',1,'{}',0.05);",
         )
         .unwrap();
+    }
+
+    // T47, T20 (ADR 0036 §6): completion and decision references of a v58
+    // store are carried to v59 unchanged with no vector; the rebuilt table
+    // accepts an embedding reference only with its tolerance and a vector of
+    // four bytes per dimension.
+    #[test]
+    fn v59_carries_canaries_and_types_embedding_references() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_through(&conn, 58).unwrap();
+        conn.execute_batch(
+            "INSERT INTO wake_canaries VALUES('a',0,3,'inc','Say ready.','[1,2]','ok',7,'op-w','completion',1,NULL,NULL);
+             INSERT INTO wake_canaries VALUES('a',1,3,'inc','decision/v1','[]','',8,NULL,'decision',1,'{}',0.05);",
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let rows: Vec<String> = conn
+            .prepare(
+                "SELECT kind||'|'||prompt||'|'||tokens_json||'|'||text||'|'||recorded_at_ms||'|'||coalesce(mismatch_operation_id,'')
+                        ||'|'||coalesce(decision_json,'')||'|'||coalesce(tolerance,'')||'|'||coalesce(dimension,'')||'|'||coalesce(hex(vector),'')
+                   FROM wake_canaries ORDER BY instance_index",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                "completion|Say ready.|[1,2]|ok|7|op-w||||".to_string(),
+                "decision|decision/v1|[]||8||{}|0.05||".to_string(),
+            ]
+        );
+        let insert = |values: &str| {
+            conn.execute_batch(&format!("INSERT INTO wake_canaries VALUES({values});"))
+        };
+        // A vector of the wrong length, no vector, no tolerance, or a
+        // decision answer: refused.
+        assert!(insert(
+            "'a',2,3,'i','embedding/v1','[]','',1,NULL,'embedding',1,NULL,0.02,2,x'0000803f'"
+        )
+        .is_err());
+        assert!(
+            insert("'a',2,3,'i','embedding/v1','[]','',1,NULL,'embedding',1,NULL,0.02,1,NULL")
+                .is_err()
+        );
+        assert!(insert(
+            "'a',2,3,'i','embedding/v1','[]','',1,NULL,'embedding',1,NULL,NULL,1,x'0000803f'"
+        )
+        .is_err());
+        assert!(insert(
+            "'a',2,3,'i','embedding/v1','[]','',1,NULL,'embedding',1,'{}',0.02,1,x'0000803f'"
+        )
+        .is_err());
+        // A completion row may not carry a vector.
+        assert!(
+            insert("'a',2,3,'i','p','[1]','',1,NULL,'completion',1,NULL,NULL,1,x'0000803f'")
+                .is_err()
+        );
+        insert("'a',2,3,'i','embedding/v1','[]','',1,NULL,'embedding',1,NULL,0.02,1,x'0000803f'")
+            .unwrap();
     }
 
     /// v50 (SPEC §17, owner decision 2026-10-18): a v49 store gains the two

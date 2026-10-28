@@ -17,6 +17,7 @@ fn check(engine: Engine, option: &str, value: &str) -> Result<(), ProfileArgErro
     let paths: Vec<PathBuf> = Vec::new();
     let context = ExtraArgsContext {
         engine,
+        api: capyctl_config::effective::DeploymentApi::Chat,
         sleep_mode: false,
         approved_options: &none,
         approved_paths: &paths,

@@ -52,6 +52,8 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 5 | `capability_missing:decisions` | A deployment with `api: decisions` names an engine that cannot serve decision models: vLLM (any version: 0.32.0 answers Clef and Clef-Flash from their text output instead of their decision head), TensorFold, llama.cpp before 0.7.0, SGLang before 0.5.22, an installation whose registered build names no version, or a custom engine whose manifest says `api: chat`. | Use llama.cpp 0.7.0 or newer or SGLang 0.5.22 or newer, registered with `capyctl engine add`, or a custom engine with `api: decisions` ([Decision models](deploy.md#decision-models)). |
 | 5 | `capability_missing:chat` | A chat deployment (no `api`, or `api: chat`) names a custom engine whose manifest says `api: decisions`. | Add `api: decisions` to the deployment, or use a chat engine. |
 | 5 | `host_capability_missing:decisions` | A machine runs a CapyCTL too old for decision models. | Upgrade CapyCTL on that machine. |
+| 5 | `capability_missing:embeddings` | A deployment with `api: embeddings` names an engine that has no embeddings route (TensorFold), or a custom engine whose manifest names another `api`. | Use vLLM, SGLang or llama.cpp, or a custom engine with `api: embeddings`. |
+| 5 | `host_capability_missing:embeddings` | A machine runs a CapyCTL too old for embedding models. | Upgrade CapyCTL on that machine. |
 | 5 | `host_capability_missing:custom_engines` | The deployment's engine is a custom engine and a machine it names runs a CapyCTL too old for custom engines. | Upgrade CapyCTL on that machine. |
 | 5 | `lmcache_unavailable:<reason>` | A deployment with `lmcache: required` cannot use LMCache, for the reason named after the colon ([LMCache](#lmcache) lists them). A reason known before anything starts (the machine's `lmcache: off`, the engine or its version, a missing or unsupported LMCache package, a `topology`, a parking residency not qualified, the deployment's own `--kv-transfer-config`) refuses it at deploy or start; one found when the launch runs (the launch-time check, the server's start, its listener check, the engine's start with LMCache) fails the launch, and nothing is left running. | Remove the reason ([LMCache](#lmcache) says how for each), or set `lmcache: auto`, which runs without LMCache where it cannot be used. |
 | 5 | `retention_zero:lmcache` | `lmcache: required` beside `retention: zero`, the deployment's own or that of a machine it names. Zero retention never runs LMCache. | Drop `lmcache: required` or the deployment's `retention: zero`, or place it on a machine without `retention: zero`. |
@@ -237,6 +239,8 @@ or its launch fails with `lmcache_unavailable:<reason>` (exit 5). The reasons:
   started it once more without LMCache, and later launches of the same
   revision on the same engine skip LMCache. The detail holds the end of the
   engine log.
+- `embeddings_unsupported`: the deployment serves embeddings (`api:
+  embeddings`), which never run LMCache. Set `lmcache: auto` or leave it out.
 
 The event `lmcache_server_exited` records that an instance's LMCache server
 exited while its engine served. The instance fails, CapyCTL stops its engine

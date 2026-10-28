@@ -106,8 +106,10 @@ _PARSER_SETTINGS = ("tool_call_parser", "reasoning_parser")
 # ADR 0033 §4: `lmcache_config_file`, the launch's owner-only LMCache
 # connector file, is present only on a launch whose LMCache server is up; it
 # turns on the reserved `enable_lmcache` (sglang_server_args.py).
+# ADR 0036 §2: `is_embedding`, always `true`, is present only on an
+# embeddings deployment's launch; it turns on the reserved `is_embedding`.
 _OPTIONAL_SETTINGS = _PARSER_SETTINGS + ("max_mamba_cache_size", "group", "draft_model_path",
-                                         "lmcache_config_file")
+                                         "lmcache_config_file", "is_embedding")
 # ADR 0028 §10: a member's group object (crates/capyctl-adapters/src/sglang/
 # args.rs `public_group`); `gloo_socket_ifname` only when the host resolved one.
 _GROUP_KEYS = ("tp_size", "pp_size", "nnodes", "node_rank", "dist_init_addr", "host_ip")
@@ -237,6 +239,8 @@ def _validate_settings(settings):
         if not draft.startswith("/") or any(part in (".", "..")
                                             for part in draft.split("/")):
             _reject()
+    if "is_embedding" in settings:
+        _literal(settings["is_embedding"], True)
     if "lmcache_config_file" in settings:
         config = _text(settings["lmcache_config_file"], 4096)
         # ADR 0033 §2: one private server on one machine; never a group member.

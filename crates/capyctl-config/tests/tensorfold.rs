@@ -33,6 +33,7 @@ fn context<'a>(
 ) -> ExtraArgsContext<'a> {
     ExtraArgsContext {
         engine: Engine::Tensorfold,
+        api: capyctl_config::effective::DeploymentApi::Chat,
         sleep_mode: false,
         approved_options: approved,
         approved_paths: &[],

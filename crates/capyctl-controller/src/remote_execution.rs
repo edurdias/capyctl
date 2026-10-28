@@ -43,6 +43,9 @@ pub struct RemoteLaunchBinding {
     /// Every launch, park and wake of it then needs the host's `decisions`;
     /// a host without it is refused typed before anything is sent.
     pub decisions: bool,
+    /// ADR 0036 §1: the launch serves embedding models (`api: embeddings`);
+    /// its launch and wake need the host's `embeddings`.
+    pub embeddings: bool,
     /// ADR 0031 §9: the launch runs a custom engine. Every command of it then
     /// needs the host's `custom_engines`; a host without it is refused typed
     /// before anything is sent.
@@ -344,6 +347,9 @@ impl RemoteEngine {
         if b.decisions {
             needs.push(capabilities::DECISIONS);
         }
+        if b.embeddings {
+            needs.push(capabilities::EMBEDDINGS);
+        }
         if b.custom_engine {
             needs.push(capabilities::CUSTOM_ENGINES);
         }
@@ -550,6 +556,9 @@ impl EngineAdapter for RemoteEngine {
         }
         if b.decisions {
             needs.push(capabilities::DECISIONS);
+        }
+        if b.embeddings {
+            needs.push(capabilities::EMBEDDINGS);
         }
         // ADR 0031 §9: a custom engine's launch goes only to a host that
         // declared `custom_engines`.
@@ -1490,7 +1499,9 @@ fn remote_launch(
         device_memory: work.effective().ready_device_allocation().is_some(),
         // ADR 0030 §1: a decisions launch goes only to a host that
         // declared it.
-        decisions: !work.effective().api.is_chat(),
+        decisions: work.effective().api == capyctl_config::effective::DeploymentApi::Decisions,
+        // ADR 0036 §1: likewise an embeddings launch.
+        embeddings: work.effective().api == capyctl_config::effective::DeploymentApi::Embeddings,
         // ADR 0031 §9: a custom engine's launch goes only to a host
         // that declared it.
         custom_engine: work.effective().profile.engine
@@ -1780,6 +1791,7 @@ mod tests {
             instance_index: 0,
             device_memory: false,
             decisions: false,
+            embeddings: false,
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,

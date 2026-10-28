@@ -1092,6 +1092,7 @@ fn tokens(reference: WakeCanaryReference) -> Vec<u32> {
     match reference {
         WakeCanaryReference::Completion(reference) => reference.tokens,
         WakeCanaryReference::Decision(_) => panic!("a decision reference"),
+        WakeCanaryReference::Embedding(_) => panic!("an embedding reference"),
     }
 }
 
