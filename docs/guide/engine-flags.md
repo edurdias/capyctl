@@ -262,7 +262,7 @@ option, and `--name=value` is refused because llama-server takes only
 | Devices | `--device`, `--split-mode`, `--tensor-split`, `--main-gpu` | reserved | `devices` and `topology`. On several GPUs CapyCTL renders `--split-mode layer`, `--tensor-split` and `--main-gpu 0`; `row` and `tensor` are not supported. |
 | Built-in tools and agent | `--tools`, `--agent` | reserved | They run code on the host. |
 | Embeddings and reranking | `--embedding`, `--embeddings`, `--rerank` | reserved | `api: embeddings`: CapyCTL renders `--embeddings` for an embedding deployment ([Embedding models](engines.md#embedding-models)). Reranking is not supported. |
-| Pooling | `--pooling` | reserved on chat, extra on embeddings | An embedding deployment may pass one `--pooling <type>`; `none` is refused, since llama.cpp serves no embeddings without pooling. |
+| Pooling | `--pooling` | reserved | Reserved on chat and decision deployments. An embedding deployment may pass one `--pooling <type>` in its extra arguments; `none` is refused, since llama.cpp serves no embeddings without pooling. |
 
 ## Reaching an SGLang memory fraction
 
