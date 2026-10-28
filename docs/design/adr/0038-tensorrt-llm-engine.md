@@ -1,14 +1,19 @@
 # ADR 0038 — TensorRT-LLM (`trtllm-serve`) as a native engine
 
-**Status:** Proposed (2026-10-25), for the owner to decide. Target release 0.2.0 (retargeted from 0.1.9 on 2026-10-27, after 0.1.9 shipped with ADR 0035 only). Nothing
-is implemented; the SPEC, guide and operations texts this ADR lists change with the
-implementation, as for ADRs 0029 and 0033. The section "Open questions for the owner"
-lists what the owner has to decide, each with options and a recommendation.
+**Status:** Accepted (2026-10-27). Proposed 2026-10-25; the owner answered every open
+question on 2026-10-27, and the answers are recorded below ("Owner decisions of
+2026-10-27"). Three answers differ from the recommendations: Open MPI and the CUDA 13.1
+toolkit are installed system-wide on host A (decision 4), the 1.3 and 1.4 pre-releases are
+qualified with their own rows in 0.2.0 (decision 7, §2a), and the engine kind is
+`tensorrt-llm` (decision 8). Target release 0.2.0 (retargeted from 0.1.9 on 2026-10-27,
+after 0.1.9 shipped with ADR 0035 only). Nothing is implemented; the SPEC, guide and
+operations texts this ADR lists change with the implementation, as for ADRs 0029 and 0033.
 **Amends (with the implementation):** `SPEC.md` §1.1 (R01, supported engines), §9.4 (later
-backends), §20 (T49 and live rows TR1–TR11); ADR 0018 §1 (a sixth installation kind:
-detection, the version check that never imports the engine, the fingerprint); ADR 0033 §2
-(the supported-engine table gains a TensorRT-LLM row, off); ADR 0035 §10 (TensorRT-LLM has
-no local multi-GPU entry).
+backends), §20 (T49, live rows TR1–TR11 for 1.2.1, TR1a–TR11a for the 1.3 pre-release and
+TR1b–TR11b for the 1.4 pre-release); ADR 0018 §1 (a sixth installation kind: detection, the
+version check that never imports the engine, the fingerprint); ADR 0033 §2 (the
+supported-engine table gains a TensorRT-LLM row, off); ADR 0035 §10 (TensorRT-LLM has no
+local multi-GPU entry).
 **Related:** ADR 0008 (installations and fingerprints), ADR 0012 (deep parking and its
 protections), ADR 0014 (§2 typed parameters, §3 reserved settings, §5 memory request, §6
 extra arguments, §8 sensitive options, A1, A2, A8, A12, A18), ADR 0017 (version skew and
@@ -31,6 +36,12 @@ integration. No host is reachable while it is written, so nothing below was run;
 fact about the engine is read from its source, its wheel or its documentation, and the live
 rows at the end are what qualifies it.
 
+On 2026-10-27 the owner answered this ADR's open questions (recorded at the end) and widened
+the version scope: beside 1.2.1, the 1.3 and 1.4 pre-releases are qualified in 0.2.0, each
+in its own environment on host A with its own rows (decision 7, §2a). Every other version
+runs as an uncertified custom setup and is never refused for being uncertified (the owner's
+rule of 2026-10-27).
+
 ### What was read
 
 - TensorRT-LLM [v1.2.1](https://github.com/NVIDIA/TensorRT-LLM/tree/v1.2.1), commit
@@ -52,9 +63,13 @@ rows at the end are what qualifies it.
   (updated 2026-10-21), for unified-memory reporting.
 - Open MPI [v4.1.6](https://github.com/open-mpi/ompi/tree/v4.1.6), the version Ubuntu 24.04
   ships (`openmpi 4.1.6-7ubuntu2`), for what the MPI runtime TensorRT-LLM loads does at
-  start. Which MPI library host A's environment will load is not known yet (open question 4).
+  start. The owner approved installing it on host A with `libopenmpi-dev` (owner decision
+  2026-10-27, question 4); TR1 confirms that mpi4py loads it.
 - FlashInfer [v0.6.4](https://github.com/flashinfer-ai/flashinfer/tree/v0.6.4), the version
   the wheel pins, for its kernel downloads.
+- For the 1.3 and 1.4 pre-releases, nothing beyond the 1.4.0rc1 facts cited in evidence §8
+  and under "Alternatives considered" was read. What else differs from 1.2.1 is established
+  by reading their tags at implementation and by their own live rows (§2a).
 
 ## Evidence
 
@@ -272,7 +287,7 @@ loading", `llmapi/llm_args.py:2964-2969`). The server registers `/release_memory
 and each begins with `assert isinstance(self.llm, AsyncLLM)` (`:1114-1127`). `trtllm-serve`
 constructs `LLM`, never `AsyncLLM` (`commands/serve.py:199-210`), so 1.2.1's server has no
 usable sleep or wake. (The 1.4.0rc1 pre-release adds `--enable_sleep_mode` with an
-HMAC-authenticated control API; it is not the version chosen.)
+HMAC-authenticated control API; 1.4 is qualified restart-only all the same, §2a.)
 
 ### 9. Usage reporting and outbound connections
 
@@ -329,32 +344,39 @@ HMAC-authenticated control API; it is not the version chosen.)
 
 ## Decision
 
-### 1. Scope: `trtllm`, chat, restart-only, one GPU
+### 1. Scope: `tensorrt-llm`, chat, restart-only, one GPU
 
-`trtllm` joins `vllm`, `sglang`, `tensorfold`, `llamacpp` and `custom` in every closed
-engine set (the kind name is open question 8). A deployment runs one `trtllm-serve` process
-serving one Hugging Face checkpoint on the PyTorch backend, on one GPU of one host, for
-`api: chat`. Its residency is `restart_only`; `deep` or `host_backed` fails resolution with
-`capability_missing:deep_park`. Out of scope in 0.2.0: the TensorRT engine backend and
-`trtllm-build`, AutoDeploy, multimodal encoders, disaggregated serving, LoRA, speculative
-decoding, beam search, groups and several GPUs (§13).
+`tensorrt-llm` joins `vllm`, `sglang`, `tensorfold`, `llamacpp` and `custom` in every closed
+engine set. The kind is spelled after the product, not after its command (owner decision
+2026-10-27, question 8); the engine's command stays `trtllm-serve`. A deployment runs one
+`trtllm-serve` process serving one Hugging Face checkpoint on the PyTorch backend, on one
+GPU of one host, for `api: chat`. Its residency is `restart_only`; `deep` or `host_backed`
+fails resolution with `capability_missing:deep_park`. The versions qualified in 0.2.0 are
+1.2.1 and the 1.3 and 1.4 pre-releases (§2a). Out of scope in 0.2.0: the TensorRT engine
+backend and `trtllm-build`, AutoDeploy, multimodal encoders, disaggregated serving, LoRA,
+speculative decoding, beam search, sleep in any version, groups and several GPUs (§13).
 
 ### 2. Installation and registration
 
 The installation is a Python virtual environment holding the `tensorrt_llm` distribution.
 
 - **The recipe** (recorded in the operations install guide and run by TR1; making the
-  environment on host A is the owner's approval of 2026-10-25, and AGENTS.md gains the
-  entry when it is made):
-  1. `python3.12 -m venv ~/tensorrt-llm-1.2.1-venv`;
-  2. `pip install torch==2.9.1 torchvision --index-url https://download.pytorch.org/whl/cu130`,
+  environment on host A is the owner's approval of 2026-10-25, the system packages of step
+  1 are the owner's approval of 2026-10-27 (question 4), and AGENTS.md gains both entries
+  when they are made):
+  1. on host A, once: `sudo apt-get -y install libopenmpi-dev` (Ubuntu 24.04's Open MPI
+     4.1.6, which mpi4py loads at run time) and the CUDA 13.1 toolkit from NVIDIA's
+     packages, as the 1.2.1 installation guide asks; `CUDA_HOME` is the toolkit's
+     directory, which TR1 records;
+  2. `python3.12 -m venv ~/tensorrt-llm-1.2.1-venv`;
+  3. `pip install torch==2.9.1 torchvision --index-url https://download.pytorch.org/whl/cu130`,
      then a constraints file pinning the installed `torch==2.9.1+cu130`;
-  3. the wheel by URL with its hash, so nothing else can be substituted:
+  4. the wheel by URL with its hash, so nothing else can be substituted:
      `pip install -c constraints.txt "tensorrt_llm @ https://pypi.nvidia.com/tensorrt-llm/tensorrt_llm-1.2.1-cp312-cp312-linux_aarch64.whl#sha256=4c4cf7c00e0e54fe1038ffeb4247b66664d585d054c67810ce04d1c7a018f57a"`,
      with `--extra-index-url https://pypi.nvidia.com/` for its NVIDIA dependencies
-     (`tensorrt`, `nvidia-*`);
-  4. the MPI library and the CUDA 13.1 toolkit as open question 4 decides; TR1 records
-     what was used.
+     (`tensorrt`, `nvidia-*`).
+
+  The pre-releases' environments follow the same shape with their own guides (§2a).
 - **Detect** reads `tensorrt_llm-*.dist-info` under a `site-packages` directory with ADR
   0018 §1's roots and bounds, and executes nothing.
 - **Add** resolves the environment lexically and reads the name and version from the
@@ -366,20 +388,61 @@ The installation is a Python virtual environment holding the `tensorrt_llm` dist
   The same query reads the versions of `torch`, `tensorrt`, `flashinfer-python`,
   `transformers` and `mpi4py`, which `engine list` shows. The entry point is
   `<env>/bin/trtllm-serve`; `build_fingerprint` is the checked version. The default
-  profile name is `trtllm`; the role's own engine is `local_engine.trtllm`,
-  `--trtllm-bin`, `CAPYCTL_TRTLLM_BIN`, with the shared precedence.
+  profile name is `tensorrt-llm`; the role's own engine is `local_engine.tensorrt-llm`,
+  `--tensorrt-llm-bin`, `CAPYCTL_TENSORRT_LLM_BIN`, with the shared precedence.
 - **Fingerprint** (ADR 0008): the canonical manifest over the distribution's import
   packages, `tensorrt_llm/` and `triton_kernels/` (its compiled libraries included),
   excluding bytecode, as the other Python engines' package trees. `examples/` is not
   imported by the server and is left out. torch, TensorRT, FlashInfer and the MPI library
   are outside the digest, as vLLM's dependencies are; their versions are recorded instead,
   and a change shows in `engine list`.
-- **Verified set** (ADR 0017): `(trtllm, "1.2.1")` with `torch` `2.9.1+cu130`, once TR1–TR11
-  pass. Another TensorRT-LLM version, or 1.2.1 beside another torch build, registers and
-  lists as `custom` and runs unqualified.
+- **Verified set** (ADR 0017): `(tensorrt-llm, "1.2.1")` with `torch` `2.9.1+cu130`, once
+  TR1–TR11 pass, and one entry for each pre-release, with its own torch build, once its own
+  rows pass (§2a). Any other TensorRT-LLM version, or a qualified version beside another
+  torch build, registers, lists as `custom` and runs as an uncertified custom setup: it is
+  never refused for being uncertified (the owner's rule of 2026-10-27, question 7), and
+  `engine list` and status show it uncertified. The safety refusals of §3, §9 and §16 apply
+  to it unchanged.
 - **Deep park:** the profile is written `security.deep_park: disabled`, and `--deep-park
   enabled` is refused `capability_missing`. Nothing about the toolchain is checked at add;
   the first start's kernel builds are handled as ADR 0014 A12 handles them.
+
+### 2a. Versions: 1.2.1, and the 1.3 and 1.4 pre-releases (owner decision 2026-10-27, question 7)
+
+1.2.1 stays the version this ADR was designed from and the stable one. The owner also
+qualifies the 1.3 and 1.4 pre-releases in 0.2.0, each with its own rows; the decision
+approves an environment for each on host A.
+
+- **Which builds.** For 1.4 that is 1.4.0rc1, the pre-release this ADR cites. The 1.3
+  pre-release was not read; its exact version, wheel URL and SHA-256 are fixed when its
+  environment is made and recorded by TR1a, as 1.4's are by TR1b. A later pre-release or
+  release of either line is another version: it runs as an uncertified custom setup until
+  its own rows pass.
+- **Environments.** `~/tensorrt-llm-<version>-venv` on host A, built with §2's recipe
+  shape (torch first, a constraints file, the wheel by URL and hash) from the version's own
+  installation guide; AGENTS.md gains each entry when it is made.
+- **What is known to differ in 1.4** (evidence §8 and the reading behind "Alternatives
+  considered"): it needs CUDA 13.4 instead of 13.1 and a different torch, it changes the
+  backend option, and it adds `--enable_sleep_mode` with an HMAC-authenticated control
+  API. So: the 1.4 environment uses the CUDA 13.4 toolkit, installed beside 13.1 under the
+  approval of question 7 [INFERENCE: that 1.4's guide asks for the full toolkit, as
+  1.2.1's does, was not read; TR1b records what it needed]; the verified-set entry names
+  1.4's torch build as TR1b records it; the backend that §3 renders as `--backend pytorch`
+  is rendered in 1.4's spelling, read from its `commands/serve.py` at implementation and
+  checked by TR2b; `--enable_sleep_mode` and every option or key of its control API are
+  reserved, never rendered, and 1.4 stays `restart_only`, because §8 asks for sleep in a
+  stable release with its own ADR and rows.
+- **What is not known for 1.3, nor for the rest of 1.4.** Its options and YAML fields, the
+  environment variables it reads, its process model and MPI start, `/metrics`, cancellation
+  and kernel downloads. The implementation reads each version's tag as it reads 1.2.1's
+  (the option, key and environment tables of §3 are kept per qualified version) and the
+  version's live rows establish the rest. Where a row shows a difference from 1.2.1's
+  design, that version's table or check changes, not 1.2.1's; a difference that breaks a
+  rule of §3–§13 (a listener off loopback, a process outside the group, no way to bound
+  the pool) fails the row and the version stays uncertified.
+- **An uncertified version** is rendered with the tables of the qualified version of the
+  same minor line, else 1.2.1's; the readiness checks of §5 (`/version`, `/v1/models`, the
+  built pool) and TensorRT-LLM's strict YAML models catch what moved.
 
 ### 3. Launch
 
@@ -402,9 +465,12 @@ The installation is a Python virtual environment holding the `tensorrt_llm` dist
   runtime directory. `model/<served name>` is a symbolic link to the verified checkpoint
   directory, so the served ID TensorRT-LLM lists is the name CapyCTL routes (evidence §2).
   A served name that is not one path component (empty, `.`, `..`, containing `/` or NUL,
-  or longer than 255 bytes) is refused at resolution, `served_name_unsupported` (open
-  question 3).
-- `<slots>` is `max_concurrent_requests`, 32 when undeclared (open question 5).
+  or longer than 255 bytes) is refused at resolution, `served_name_unsupported` (owner
+  decision 2026-10-27, question 3).
+- `<slots>` is `max_concurrent_requests`, 32 when undeclared (owner decision 2026-10-27,
+  question 5).
+- `--backend pytorch` is 1.2.1's spelling; each pre-release renders the spelling read from
+  its own tag (§2a).
 - The fraction is rendered explicitly so no engine default can move; on its own it is not
   the pool's size (§4).
 
@@ -426,9 +492,10 @@ dtype: <dtype, or auto>
 # <the deployment's llm_api_options, merged under the reserved keys>
 ```
 
-A deployment may add LLM API arguments as `engine_config.trtllm.llm_api_options`, a
-mapping (open question 6). CapyCTL merges it under its own keys and refuses, at deploy
-time and again when it renders the file, a mapping that names a reserved key:
+A deployment may add LLM API arguments as `engine_config.tensorrt-llm.llm_api_options`, a
+mapping (owner decision 2026-10-27, question 6; the key follows the kind's name, question
+8). CapyCTL merges it under its own keys and refuses, at deploy time and again when it
+renders the file, a mapping that names a reserved key:
 
 - **Reserved, rendered by CapyCTL:** `model`, `backend`, `max_seq_len`, `max_batch_size`,
   `tensor_parallel_size`, `pipeline_parallel_size`, `gpus_per_node`,
@@ -477,11 +544,12 @@ field `quantization` is refused on a TensorRT-LLM profile (the checkpoint carrie
 `language_model_only` is refused (no switch in 1.2.1).
 
 **The closed environment** (SPEC §13.3): `PATH` (the environment's `bin` first, then the
-fixed system directories), `HOME`, `CUDA_VISIBLE_DEVICES` (ADR 0019 §6), `CUDA_HOME` when
-open question 4 makes one, `TMPDIR=<launch dir>/tmp` (so the stats socket and every
-temporary file are private to the launch), `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`
-(the checkpoint is local), `TRTLLM_RESPONSES_API_DISABLE_STORE=1` (the engine keeps no
-conversation history, §10), `TLLM_WORKER_USE_SINGLE_PROCESS=1` and the MPI settings of §9,
+fixed system directories), `HOME`, `CUDA_VISIBLE_DEVICES` (ADR 0019 §6), `CUDA_HOME` (the
+toolkit TR1 recorded for the version: 13.1 for 1.2.1, owner decision 2026-10-27, question
+4), `TMPDIR=<launch dir>/tmp` (so the stats socket and every temporary file are private to
+the launch), `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` (the checkpoint is local),
+`TRTLLM_RESPONSES_API_DISABLE_STORE=1` (the engine keeps no conversation history, §10),
+`TLLM_WORKER_USE_SINGLE_PROCESS=1` and the MPI settings of §9,
 `DO_NOT_TRACK=1` under the host's `engine_telemetry: off` (§10), and the log metadata. A
 profile or deployment environment may not name `TLLM_*`, `TRTLLM_*`, `OMPI_*`, `PMIX_*`,
 `PRTE_*`, `UCX_*`, `NCCL_*`, `MPI4PY_*`, `HF_*`, `TRANSFORMERS_*`, `FLASHINFER_*`,
@@ -577,8 +645,9 @@ unchanged:
 
 Why nothing weaker is accepted: the engine's abort log line and the closed socket prove
 dispatch of an abort, not its effect (ADR 0032 §5); `/metrics` cannot show 0 running and 0
-waiting (evidence §4); the Prometheus counter never sees a cut stream. Open question 2
-asks whether a quiet-interval reading should become an idle signal after TR5 measures it.
+waiting (evidence §4); the Prometheus counter never sees a cut stream. The owner kept this
+for 0.2.0 (owner decision 2026-10-27, question 2); TR5 records the quiet-interval data a
+later amendment would need before such a reading could become an idle signal.
 
 ### 8. Parking
 
@@ -602,15 +671,17 @@ host copy could still qualify `host_backed` on a discrete GPU, with its own rows
 
 ### 9. Ownership, MPI and listeners
 
-- **One process.** Every launch sets `TLLM_WORKER_USE_SINGLE_PROCESS=1`, so the model runs
-  in the `trtllm-serve` process (evidence §6), and pins the MPI runtime to a single local
-  process. For Open MPI that is `OMPI_MCA_ess_singleton_isolated=1` (no daemon,
-  `ess_singleton_module.c:163-166`) and, as proposed, `OMPI_MCA_btl=self` with
-  `OMPI_MCA_pml=ob1` (no network transport) [INFERENCE: the transport settings are read
-  from Open MPI's parameters, not run; TR1 and TR9 confirm them]. The exact set follows
-  TR1's record of the MPI library loaded (open question 4); a launch whose library is not
-  the one TR1 qualified still starts, and the checks below decide. The
-  process is `api` (ADR 0027); compilers and compile workers that JIT kernels are helpers.
+- **One process** (owner decision 2026-10-27, question 1). Every launch sets
+  `TLLM_WORKER_USE_SINGLE_PROCESS=1`, so the model runs in the `trtllm-serve` process
+  (evidence §6), and pins the MPI runtime to a single local process. For Open MPI that is
+  `OMPI_MCA_ess_singleton_isolated=1` (no daemon, `ess_singleton_module.c:163-166`) and, as
+  proposed, `OMPI_MCA_btl=self` with `OMPI_MCA_pml=ob1` (no network transport)
+  [INFERENCE: the transport settings are read from Open MPI's parameters, not run; TR1 and
+  TR9 confirm them]. The expected library is Ubuntu's Open MPI 4.1.6, installed by owner
+  decision 2026-10-27, question 4; the exact set follows TR1's record of the library mpi4py
+  loads (TR1a's and TR1b's for the pre-releases). A launch whose library is not the one its
+  version's TR1 qualified still starts, and the checks below decide. The process is `api`
+  (ADR 0027); compilers and compile workers that JIT kernels are helpers.
 - **No process outside the group.** At readiness and at every re-proof the host lists the
   leader's descendants (`/proc/<pid>/stat` parent links). Any descendant whose process
   group differs from the launch's (as an Open MPI daemon started with `--set-sid` would)
@@ -634,10 +705,11 @@ TensorRT-LLM has no usage reporting of its own (evidence §9), so it takes the g
 convention of #188 (`engine_telemetry::DO_NOT_TRACK`): `DO_NOT_TRACK=1` under the host's
 `engine_telemetry: off`, which also covers the Hugging Face Hub it imports; nothing under
 `allow`. `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE` are set under both, because the
-checkpoint is always local. FlashInfer's kernel downloads are not blocked in 0.2.0 (open
-question 9); TR8 records whether a start reaches them. The data-retention page gains: the
-engine keeps no conversation history (`TRTLLM_RESPONSES_API_DISABLE_STORE=1`); its KV block
-reuse is partitioned by the effective salt.
+checkpoint is always local. FlashInfer's kernel downloads are allowed and documented in
+0.2.0 (owner decision 2026-10-27, question 9); TR8 records whether a start reaches them.
+The data-retention page gains: the engine keeps no conversation history
+(`TRTLLM_RESPONSES_API_DISABLE_STORE=1`); its KV block reuse is partitioned by the
+effective salt.
 
 ### 11. APIs
 
@@ -707,17 +779,20 @@ V3, V3.1 and V3.2 and Kimi K2 their tool parsers. The typed `tool_call_parser` a
 ### 17. Texts that change with the implementation
 
 - **SPEC** §1.1 R01: "... llama.cpp's `llama-server` fourth (ADR 0029), TensorRT-LLM's
-  `trtllm-serve` (ADR 0038), restart-only on one GPU." §9.4: a note that TensorRT-LLM
-  begins restart-only (its 1.2.1 sleep is a prototype the server cannot reach), reports no
-  idle signal (ADR 0031 §6 settlement), and runs one process with its MPI runtime pinned.
-  §20: T49.
+  `trtllm-serve` (ADR 0038, kind `tensorrt-llm`), restart-only on one GPU." §9.4: a note
+  that TensorRT-LLM begins restart-only (its 1.2.1 sleep is a prototype the server cannot
+  reach, and the 1.4 pre-release's sleep is not qualified), reports no idle signal (ADR
+  0031 §6 settlement), and runs one process with its MPI runtime pinned. §20: T49 and the
+  live rows TR1–TR11, TR1a–TR11a and TR1b–TR11b.
 - **ADR 0018** §1, **ADR 0033** §2, **ADR 0035** §10: the amendments in the header.
-- **Guide**: `engines.md` and `install-engines.md` (the recipe, the verified set, `engine
-  key: none`, no idle signal, one GPU), `engine-flags.md` (the option and key tables),
-  `parking.md` (restart only), `errors.md` (the new codes).
-- **Operations**: `install.md` (the environment), `configuration.md`
-  (`engine_config.trtllm.llm_api_options`, `local_engine.trtllm`), `data-retention.md`
-  (§10).
+- **Guide**: `engines.md` and `install-engines.md` (the recipe with its system packages,
+  the three qualified versions and the verified set, uncertified versions running as
+  custom setups, `engine key: none`, no idle signal, one GPU, FlashInfer's kernel
+  downloads), `engine-flags.md` (the option and key tables), `parking.md` (restart only),
+  `errors.md` (the new codes).
+- **Operations**: `install.md` (`libopenmpi-dev`, the CUDA toolkits and the environments),
+  `configuration.md` (`engine_config.tensorrt-llm.llm_api_options`,
+  `local_engine.tensorrt-llm`), `data-retention.md` (§10).
 
 ## Consequences
 
@@ -731,8 +806,14 @@ V3, V3.1 and V3.2 and Kimi K2 their tool parsers. The typed `tool_call_parser` a
   warning); TR10 measures it. In exchange the process tree is one process CapyCTL owns.
 - The pool can be smaller than granted on a crowded machine, never larger; status shows
   the difference.
-- Host A gains a 2.6 GB engine package plus torch and TensorRT in a new environment, the
-  first engine whose installation also depends on an MPI library.
+- Host A gains, per qualified version, a 2.6 GB engine package (1.2.1's size; the
+  pre-releases' are recorded by their TR1 rows) plus torch and TensorRT in its own
+  environment, three environments in all; and system-wide `libopenmpi-dev` and the CUDA
+  13.1 toolkit (owner decision 2026-10-27, question 4), plus the CUDA 13.4 toolkit for 1.4
+  (§2a). It is the first engine whose installation depends on an MPI library and on system
+  packages.
+- Three versions are qualified, each by its own eleven rows, so a live session for
+  TensorRT-LLM runs 33 rows; the option, key and environment tables are kept per version.
 - Out of scope: deep and host-backed residency, several GPUs, groups, the TensorRT engine
   backend, LoRA, speculative decoding, embeddings, decisions, LMCache, disaggregated
   serving.
@@ -747,7 +828,8 @@ V3, V3.1 and V3.2 and Kimi K2 their tool parsers. The typed `tool_call_parser` a
   delivery (SPEC R03). Rejected for 0.2.0.
 - **The default MPI pool.** Matches NVIDIA's streaming advice, but with Open MPI 4.1.6 the
   daemon leaves the process group and its transports bind every interface (evidence §6),
-  so a stop could not prove the GPU-holding process gone. Open question 1.
+  so a stop could not prove the GPU-holding process gone. Rejected (owner decision
+  2026-10-27, question 1).
 - **Sizing by `--kv_cache_free_gpu_memory_fraction` alone**, computing a fraction from the
   grant. On GB10 the fraction applies to what the machine has free at start, other tenants
   included, so the same fraction gives different pools; `max_tokens` gives the granted one.
@@ -756,31 +838,48 @@ V3, V3.1 and V3.2 and Kimi K2 their tool parsers. The typed `tool_call_parser` a
   CapyCTL writes the file and merges the deployment's mapping into it instead.
 - **An idle signal from `/metrics`**, or from the Prometheus counter compared with CapyCTL's
   dispatch count. The first never reads 0 and 0; the second misses cancelled streams and
-  counts other local clients' requests. Open question 2 keeps the quiet-interval reading
-  for later.
+  counts other local clients' requests. Owner decision 2026-10-27, question 2 keeps the
+  quiet-interval reading for later.
 - **A protected Python entry** (as `runtime/vllm_entry.py`) that parses the command line and
   YAML with the installed parser and checks the reserved values before serving. Stronger
   against hidden defaults, but it imports TensorRT-LLM in a CapyCTL script and must track
   `commands/serve.py`'s internals. The readiness checks of §5 (`/version`, `/v1/models`,
   the built KV pool) verify the values that matter after the engine's own parsing.
-- **Choosing 1.4.0rc1** for its sleep API. A pre-release with a different CUDA (13.4) and
-  torch; the owner chose the stable release.
+- **1.4.0rc1 instead of 1.2.1**, for its sleep API. A pre-release with a different CUDA
+  (13.4) and torch; the owner kept the stable release as the base and qualifies 1.4 beside
+  it, restart-only (§2a).
+- **Only 1.2.1 qualified, every other version custom** (the proposal's recommendation for
+  question 7). Overruled by owner decision 2026-10-27, question 7: the 1.3 and 1.4
+  pre-releases get their own rows in 0.2.0.
+- **Refusing versions other than the qualified ones.** Rejected by the owner's rule of
+  2026-10-27: an uncertified version runs as a custom setup and is never refused for being
+  uncertified.
+- **The MPI library inside the environment, and no system toolkit** (the proposal's
+  recommendation for question 4, PyPI's `openmpi` or `mpich` wheel and the CUDA runtime
+  from the wheels). Overruled by owner decision 2026-10-27, question 4: NVIDIA's documented
+  prerequisites are installed on host A instead.
+- **`trtllm` as the kind name** (the proposal's recommendation for question 8), matching
+  the engine's commands. Overruled by owner decision 2026-10-27, question 8:
+  `tensorrt-llm`.
 
 ## Implementation plan (target 0.2.0)
 
-1. **Configuration** (`capyctl-config`): the `trtllm` kind in every closed set and in
-   `engine_policy.rs`; `engine_config.trtllm` (`llm_api_options`); the option, key and
-   environment policies of §3; the KV token derivation and the geometry refusal (§4); the
-   served-name check; the refusals of §1, §11–§13; the ADR 0024 column.
+1. **Configuration** (`capyctl-config`): the `tensorrt-llm` kind in every closed set and in
+   `engine_policy.rs`; `engine_config.tensorrt-llm` (`llm_api_options`); the option, key
+   and environment policies of §3, per qualified version (§2a); the KV token derivation and
+   the geometry refusal (§4); the served-name check; the refusals of §1, §11–§13; the ADR
+   0024 column.
 2. **Registration** (`capyctl-agent` engines, `capyctl-cli` engine): detection of
    `tensorrt_llm-*.dist-info`; the metadata-only version check with the companion versions;
-   the fingerprint over `tensorrt_llm/` and `triton_kernels/`; the verified set; `engine
-   list` showing companions, `idle signal: none` and `engine key: none`.
-3. **Adapter** (`capyctl-adapters/src/trtllm/`): rendering of the command, the launch
-   directory, the served-name link and the YAML; the closed environment with the MPI pins;
-   readiness (§5); the `/metrics` reader and load mapping (§6); `cancel_work` answering
-   `Uncertain` and the adapter declaring no idle signal, so ADR 0031 §6's path applies;
-   stop by SIGTERM to the group, then the bound, then SIGKILL, then verified exit.
+   the fingerprint over `tensorrt_llm/` and `triton_kernels/`; the verified set's entry per
+   qualified version and the uncertified marking (§2); `engine list` showing companions,
+   `idle signal: none` and `engine key: none`.
+3. **Adapter** (`capyctl-adapters/src/tensorrt_llm/`, the Rust module spelling of the
+   kind): rendering of the command per qualified version, the launch directory, the
+   served-name link and the YAML; the closed environment with the MPI pins; readiness (§5);
+   the `/metrics` reader and load mapping (§6); `cancel_work` answering `Uncertain` and the
+   adapter declaring no idle signal, so ADR 0031 §6's path applies; stop by SIGTERM to the
+   group, then the bound, then SIGKILL, then verified exit.
 4. **Ownership** (`capyctl-launchers`, `capyctl-adapters`): the descendant check
    (`engine_process_escaped`) and the listener check (`custom/listeners.rs`, reused) on
    every TensorRT-LLM launch and re-proof.
@@ -792,95 +891,103 @@ Tests, tagged T49 (with T14, T17, T21 and T37 where they apply), against stub en
 detection executes nothing; `add` never imports the package (the check's command line is
 asserted); version and companion parsing; every reserved option, alias and `=` spelling
 refused, and every reserved YAML key, nested ones included; the rendered command and YAML
-for a minimal deployment byte for byte; `max_tokens` from the grant for Qwen3-4B's
-geometry and the geometry refusals; the served-name link and refusals; readiness failing on
-each step, including a `/metrics` read with no entry and a built pool below one window or
-above `max_tokens`; an empty `/metrics` read reported unknown, never idle; a cancelling
-lease never settled while the stub runs and settled by the verified stop; the restart when
-held requests fill the limit; a descendant outside the group and a listener off loopback
-each failing the launch; `DO_NOT_TRACK` under `off` only and the offline switches under
-both; the refusals of deep residency, decisions, embeddings, `topology` and `lmcache:
-required`. CPU and Fake-engine tests are not qualification.
+for a minimal deployment byte for byte, for each qualified version's tables (1.4's
+`--enable_sleep_mode` refused); an unlisted version registered as `custom`, shown
+uncertified and launched, never refused for its version; `max_tokens` from the grant for
+Qwen3-4B's geometry and the geometry refusals; the served-name link and refusals; readiness
+failing on each step, including a `/metrics` read with no entry and a built pool below one
+window or above `max_tokens`; an empty `/metrics` read reported unknown, never idle; a
+cancelling lease never settled while the stub runs and settled by the verified stop; the
+restart when held requests fill the limit; a descendant outside the group and a listener
+off loopback each failing the launch; `DO_NOT_TRACK` under `off` only and the offline
+switches under both; the refusals of deep residency, decisions, embeddings, `topology` and
+`lmcache: required`. CPU and Fake-engine tests are not qualification.
 
-## Live qualification (host A, TensorRT-LLM 1.2.1)
+## Live qualification (host A, TensorRT-LLM 1.2.1 and the 1.3 and 1.4 pre-releases)
 
 Run in a live session the owner schedules (one live session on the hosts at a time), in
 `~/tensorrt-llm-1.2.1-venv` once it exists, with Qwen3-4B in BF16 from the host's model
-store. Signals go only to CapyCTL-owned processes.
+store. Signals go only to CapyCTL-owned processes. The rows below qualify 1.2.1; the
+pre-releases' rows follow the table.
 
 | Row | What | Passes when |
 |---|---|---|
-| TR1 | Environment and registration: the environment made by §2's recipe; `engine detect`; `engine add`; then, by hand, `python -c "from mpi4py import MPI; print(MPI.Get_library_version())"` | the wheel's hash matches; torch is `2.9.1+cu130`; detect lists it and executes nothing; add records 1.2.1, the digest and the companion versions, and no `orted` or CUDA context appears during add; the MPI library, its version and the CUDA toolkit used are recorded, and §9's MPI settings are fixed from them |
+| TR1 | Environment and registration: `libopenmpi-dev` and the CUDA 13.1 toolkit installed on host A (owner decision 2026-10-27, question 4); the environment made by §2's recipe; `engine detect`; `engine add`; then, by hand, `python -c "from mpi4py import MPI; print(MPI.Get_library_version())"` | the wheel's hash matches; torch is `2.9.1+cu130`; detect lists it and executes nothing; add records 1.2.1, the digest and the companion versions, and no `orted` or CUDA context appears during add; mpi4py loads Ubuntu's Open MPI 4.1.6, else the library it loads is recorded and §9's MPI settings are fixed from it before TR2; the CUDA toolkit's version and `CUDA_HOME` are recorded |
 | TR2 | Start and readiness: a Qwen3-4B deployment with `memory.kv_cache: 4GiB` | the rendered command and YAML match the plan; readiness passes each step of §5; `/v1/models` lists the served name; `/version` is 1.2.1; a chat with a tool and with reasoning returns `tool_calls` and `reasoning_content` through the Qwen3 parsers |
 | TR3 | Memory and start time: cold start (empty kernel caches) and three warm starts, then 30 minutes of mixed traffic | the per-process peak during start, the steady figure, the weights as loaded and the built pool are recorded; peak minus weights minus KV sets the margin and the startup figure (§4); the built pool equals `max_tokens` rounded to blocks; time to ready is recorded for both start kinds and sets the derived Initialize window; repeated with a 20 GiB resident allocation beside it, the pool is unchanged |
 | TR4 | Metrics: a burst of concurrent streams, then a lull | load reports show running, waiting and KV usage during the burst; reads during the lull return no entries and report unknown; a second reader is never started |
-| TR5 | Cancellation: a client hang-up mid-stream under steady traffic; a deadline cut before output; then 32 requests cut before output on an otherwise idle deployment | the engine logs the abort within about a second and its next entries show the request gone; the leases stay `cancelling` and status says they settle at the next stop; a stop does not wait for them and its verified exit settles them; the 32 trigger one restart, journaled, whose exit settles all 32. Also recorded for open question 2: across the run, every interval of two empty `/metrics` reads at least 2 s apart, and whether any request was active in it |
+| TR5 | Cancellation: a client hang-up mid-stream under steady traffic; a deadline cut before output; then 32 requests cut before output on an otherwise idle deployment | the engine logs the abort within about a second and its next entries show the request gone; the leases stay `cancelling` and status says they settle at the next stop; a stop does not wait for them and its verified exit settles them; the 32 trigger one restart, journaled, whose exit settles all 32. Also recorded, as data for a later idle-signal amendment (owner decision 2026-10-27, question 2): across the run, every interval of two empty `/metrics` reads at least 2 s apart, and whether any request was active in it |
 | TR6 | Park and wake, restart only: five idle parks and wakes | each park is a stop with verified exit and the instance's per-process memory reads gone; each wake is a fresh launch that passes readiness; `deep` is refused `capability_missing:deep_park` |
 | TR7 | Refusals: `deep`; `api: decisions`; `api: embeddings`; `topology: {tensor_parallel: 2}`; `lmcache: required`; extra arguments `--host`, `--config=x.yaml`, `--tp_size 2`, `--kv_cache_free_gpu_memory_fraction 0.5`, `--custom_module_dirs`; `llm_api_options` with `enable_sleep`, `orchestrator_type`, `kv_connector_config`, `kv_cache_config.max_tokens`; a served name with `/` | each is refused before anything starts, with its code |
-| TR8 | Usage reporting and outbound connections: a cold start and a run under `engine_telemetry: off`, the engine's sockets sampled every second | the environment has `DO_NOT_TRACK=1` and the offline switches; any outbound connection of an owned process is recorded with its destination (FlashInfer's kernel host or none) for open question 9 |
+| TR8 | Usage reporting and outbound connections: a cold start and a run under `engine_telemetry: off`, the engine's sockets sampled every second | the environment has `DO_NOT_TRACK=1` and the offline switches; any outbound connection of an owned process is recorded with its destination (FlashInfer's kernel host or none), and the guide's note on kernel downloads (owner decision 2026-10-27, question 9) states what was found |
 | TR9 | Ownership and listeners: during TR2 and after a SIGKILL of the engine process | the launch is one process (helpers only while compiling), no descendant outside the group, the only listener is `127.0.0.1:<port>` (the check and `ss -ltnp`); after the SIGKILL the instance fails, nothing is released before gone evidence, and the next start serves |
-| TR10 | Single process versus the MPI pool: decode tokens per second and time to first token at 1, 8 and 32 concurrent streams under CapyCTL, then the same command without the single-process switch run by hand outside CapyCTL | both throughputs are recorded; the by-hand run's process tree, process groups and listeners are recorded (whether an `orted` with its own session and listeners on every interface appears), as evidence for open question 1 |
+| TR10 | Single process versus the MPI pool: decode tokens per second and time to first token at 1, 8 and 32 concurrent streams under CapyCTL, then the same command without the single-process switch run by hand outside CapyCTL | both throughputs are recorded; the by-hand run's process tree, process groups and listeners are recorded (whether an `orted` with its own session and listeners on every interface appears), as evidence for the process model chosen by owner decision 2026-10-27, question 1 |
 | TR11 | Enrolled host: host A as a host of the control-plane server | TR2's deployment serves through the host's ingress, and a hang-up there settles as in TR5 |
 
-A pass adds `(trtllm, "1.2.1")` to the verified set and records the measured margin,
-startup figure and Initialize window. A discrete-GPU row, and any model other than
-Qwen3-4B BF16, run unqualified until their own rows.
+A pass adds `(tensorrt-llm, "1.2.1")` with `torch` `2.9.1+cu130` to the verified set and
+records the measured margin, startup figure and Initialize window. A discrete-GPU row, and
+any model other than Qwen3-4B BF16, run as uncertified setups until their own rows.
 
-## Open questions for the owner
+### Rows for the pre-releases (owner decision 2026-10-27, question 7)
 
-1. **Process model.** Options: (a) one process (`TLLM_WORKER_USE_SINGLE_PROCESS=1`, MPI
-   pinned to an isolated singleton), §9; (b) TensorRT-LLM's default MPI pool, with a new
-   ownership rule that follows processes by parentage across sessions and accepts MPI
-   listeners on every interface; (c) CapyCTL launching `mpirun -n 1` itself so the ranks
-   stay its children. Recommendation: (a). It keeps ADR 0027's process-group proof and
-   opens no network transport; TR10 measures what it costs, and (c) is the route to
-   several GPUs later (§13).
-2. **An idle signal.** Options: (a) none in 0.2.0: cut requests settle at the next stop,
-   with ADR 0032's restart when they fill the limit (§7); (b) accept a quiet interval (two
-   empty `/metrics` reads at least N seconds apart, both after the hang-up, for a request
-   the engine produced output for, per SPEC §10's 2026-10-21 rule) as an idle reading
-   once TR5 shows it never coincided with an active request; (c) keep the engine
-   connection open after a cut and let the request run to its end, settling on its final
-   output, at the cost of generating for nobody. Recommendation: (a), with TR5 recording
-   the data for (b). An empty read cannot tell idle from a failed fetch, so (b) would need
-   that row and its own amendment.
-3. **Served name.** Options: (a) a per-launch symbolic link named after the served name,
-   refusing names that are not one path component (§3); (b) serve under the checkpoint
-   directory's own name and let the router translate; (c) the same as (a), with names
-   containing `/` mapped to a safe spelling. Recommendation: (a): one rule, nothing
-   rewritten in requests or responses, and the refusal names the problem. Public model
-   IDs with `/` can use another route name.
-4. **MPI library and CUDA toolkit on host A.** The wheel needs an MPI library for mpi4py and
-   NVIDIA's guide installs `libopenmpi-dev` with apt and the CUDA 13.1 toolkit; AGENTS.md
-   forbids system changes without approval. Options: (a) use what host A already has, if
-   TR1 finds both; (b) put the MPI library inside the environment (PyPI's `openmpi` or
-   `mpich` wheel) and use the driver's CUDA 13 runtime from the torch and NVIDIA wheels,
-   so nothing outside the home directory changes; (c) the owner approves the apt packages
-   and the toolkit on host A. Recommendation: (a) if present, else (b); (c) only if TR2
-   shows a kernel build that needs the full toolkit.
-5. **Default concurrency.** `max_batch_size` when `max_concurrent_requests` is undeclared.
-   Options: (a) 32, the router's per-deployment limit, so the engine never queues what
-   CapyCTL admitted; (b) 8, as SGLang hybrids default; (c) TensorRT-LLM's 2048.
-   Recommendation: (a). The KV pool is shared and sized from the grant, so concurrency
-   does not change its size; CUDA graph and activation memory count in the margin TR3
-   measures.
-6. **LLM API options.** Options: (a) a deployment mapping
-   `engine_config.trtllm.llm_api_options` merged into CapyCTL's file with the reserved keys
-   refused (§3); (b) typed fields and ordinary command-line options only, no mapping; (c)
-   an allow-list of a few keys. Recommendation: (a). Many useful settings exist only in the
-   YAML (block reuse, CUDA graph sizes, scheduler), TensorRT-LLM's strict models refuse
-   unknown keys, and the reserved list is what CapyCTL must own.
-7. **Other versions.** Options: (a) only 1.2.1 is verified; any other version registers as
-   `custom` and runs unqualified (ADR 0017); (b) refuse versions other than 1.2.1; (c) also
-   admit the 1.3 and 1.4 pre-releases with their own rows now. Recommendation: (a), as for
-   every engine; 1.4 changes CUDA, torch and the backend option and would get its own rows.
-8. **Kind name.** Options: (a) `trtllm`, matching the engine's own commands; (b)
-   `tensorrt-llm`; (c) `tensorrt_llm`, the Python package. Recommendation: (a): short, no
-   punctuation, and the name operators type after `trtllm-serve`.
-9. **Kernel downloads at run time.** FlashInfer may fetch precompiled kernels from NVIDIA
-   when one is not cached (evidence §9). Options: (a) allow and document it, with TR8
-   recording whether it happens; (b) point FlashInfer at no repository, so a missing kernel
-   fails the start instead of fetching; (c) warm the caches once at `engine add`, which
-   would execute engine code during registration. Recommendation: (a) for 0.2.0: it is not
-   usage reporting and blocking it would fail starts unpredictably; revisit if TR8 finds a
-   fetch on the qualified model.
+Rows TR1a–TR11a qualify the 1.3 pre-release and TR1b–TR11b the 1.4 pre-release (1.4.0rc1).
+Each is the row of the same number above, run in that version's own environment
+(`~/tensorrt-llm-<version>-venv`, §2a) with the same model and deployment, and passes on
+the same terms with the version's own figures, except:
+
+- **TR1a, TR1b:** the environment follows the version's installation guide; the wheel's
+  URL and hash, the torch build, the CUDA toolkit (13.4 for 1.4, installed beside 13.1) and
+  the MPI library mpi4py loads are recorded, and the version's MPI settings (§9) are fixed
+  from them; add records the version.
+- **TR2a, TR2b:** `/version` reports the version; the rendered command and YAML match the
+  version's tables, read from its tag at implementation; for 1.4 that includes the backend
+  in its own spelling.
+- **TR3a, TR3b:** the margin, startup figure and Initialize window are the version's own,
+  not 1.2.1's.
+- **TR6b, TR7b:** 1.4 is restart-only like the others; TR7b also refuses
+  `--enable_sleep_mode` and the options and keys of its control API.
+- **TR10a, TR10b:** the by-hand MPI pool run records whether the version's process model and
+  MPI start still match evidence §6; a difference is recorded for its §9 settings, and the
+  single-process launch must still pass TR9a or TR9b.
+
+A version whose eleven rows pass adds `(tensorrt-llm, "<version>")` with its torch build to
+the verified set and records its own margin, startup figure and Initialize window. Until
+then, and if any row fails, the version runs as an uncertified custom setup; it is not
+refused.
+
+## Owner decisions of 2026-10-27
+
+The proposal of 2026-10-25 asked nine questions; the owner answered all of them on
+2026-10-27. The decision sections above already read as decided. Throughout, the owner's
+rule of 2026-10-27 applies: certified engine, version and checkpoint combinations are
+advertised as certified; anything else runs as an uncertified custom setup and is never
+refused for being uncertified. Safety refusals (reserved options and keys, loopback-only
+controls, malformed requests) are unaffected.
+
+1. **Process model:** one process, as proposed: `TLLM_WORKER_USE_SINGLE_PROCESS=1` with
+   MPI pinned to an isolated singleton (§9). TR10 measures what it costs.
+2. **Idle signal:** none in 0.2.0, as proposed. Cut requests settle at the next verified
+   stop, with ADR 0032's restart when they fill a deployment (§7); TR5 records the
+   quiet-interval data for a later amendment.
+3. **Served name:** a per-launch symbolic link named after the served name, as proposed;
+   names that are not one path component are refused `served_name_unsupported` (§3).
+4. **MPI library and CUDA toolkit on host A (changed from the recommendation):** the owner
+   approves installing `libopenmpi-dev` with apt and the CUDA 13.1 toolkit on host A. The
+   recipe installs them first (§2), `CUDA_HOME` names the toolkit (§3), §9's MPI settings
+   expect Ubuntu's Open MPI 4.1.6, and TR1 installs and records both.
+5. **Default concurrency:** `max_batch_size` 32 when `max_concurrent_requests` is
+   undeclared, as proposed (§3).
+6. **LLM API options:** a deployment mapping merged into CapyCTL's file with the reserved
+   keys refused, as proposed (§3). Under decision 8 its key is
+   `engine_config.tensorrt-llm.llm_api_options`.
+7. **Other versions (changed from the recommendation):** the 1.3 and 1.4 pre-releases are
+   also qualified in 0.2.0, each with its own rows (TR1a–TR11a, TR1b–TR11b) and its own
+   environment on host A, which this decision approves (§2a). Every other version runs as
+   an uncertified custom setup under the owner's rule (§2); none is refused for its
+   version.
+8. **Kind name (changed from the recommendation):** `tensorrt-llm`. The kind, the default
+   profile name, `local_engine.tensorrt-llm`, `--tensorrt-llm-bin`,
+   `CAPYCTL_TENSORRT_LLM_BIN`, `engine_config.tensorrt-llm` and the verified-set entries use
+   it (§1, §2, §3); the engine's own command stays `trtllm-serve`.
+9. **Kernel downloads at run time:** allowed and documented, as proposed; TR8 records
+   whether a start reaches FlashInfer's kernel host (§10).
