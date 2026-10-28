@@ -382,7 +382,7 @@ lower `max_concurrent_requests` or `context_length`, or raise `resources`;
 nothing grows past the start's admission later. CapyCTL starts it with
 `TENSORFOLD_CUDA_MEMORY_LIMIT_GB` set to the declared allocation and
 `TENSORFOLD_MEMORY_RESERVE_GIB=2`, so the engine's own reserve does not
-refuse a start CapyCTL's ledger admitted.
+refuse a start CapyCTL's memory accounting admitted.
 
 Refused on the native line: `kv_cache_dtype` (its KV cache is BF16),
 `model.draft` and `--drafter` (it drafts with the checkpoint's own MTP head;
