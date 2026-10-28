@@ -133,6 +133,7 @@ fn admit_measured(
                 None,
                 Some(gguf),
                 None,
+                None,
                 1750,
             )
             .expect("record the checkpoint measurement");

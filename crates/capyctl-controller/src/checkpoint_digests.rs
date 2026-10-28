@@ -65,6 +65,10 @@ pub struct Measured {
     /// ADR 0033 §7 (amendment A12): the checkpoint's `config.json`
     /// `model_type`, which a remote launch's LMCache plan compares.
     pub model_type: Option<String>,
+    /// ADR 0034 §4: B and C of an automatic LMCache pool, as the host that
+    /// read the checkpoint computed them; `None` from a host before ADR 0034
+    /// or when the fit cannot read them.
+    pub pool_basis: Option<capyctl_config::lmcache::PoolBasis>,
 }
 
 /// Why a measurement produced no digest.
@@ -79,11 +83,13 @@ pub enum MeasureError {
 pub type MeasureFuture = Pin<Box<dyn Future<Output = Result<Measured, MeasureError>> + Send>>;
 
 /// The weights a sizing found (owner decision 2026-09-23, solo first start),
-/// and (ADR 0033 amendment A12) the checkpoint's model type.
+/// and (ADR 0033 amendment A12) the checkpoint's model type, and (ADR 0034
+/// §4) B and C of an automatic LMCache pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SizedCheckpoint {
     pub weights_bytes: i64,
     pub model_type: Option<String>,
+    pub pool_basis: Option<capyctl_config::lmcache::PoolBasis>,
 }
 
 pub type SizeFuture = Pin<Box<dyn Future<Output = Result<SizedCheckpoint, MeasureError>> + Send>>;
@@ -130,6 +136,7 @@ pub fn measured_from(result: &pb::MemberExecutionResult) -> Result<Measured, Mea
                 .as_ref()
                 .and_then(capyctl_protocol::execution::gguf_from_wire),
             model_type: model_type(evidence),
+            pool_basis: capyctl_protocol::execution::pool_basis_from_wire(evidence),
         }),
         "refused" => Err(MeasureError::Refused(evidence.reason.clone())),
         _ => Err(MeasureError::Unavailable),
@@ -147,6 +154,7 @@ pub fn sized_from(result: &pb::MemberExecutionResult) -> Result<SizedCheckpoint,
         "sized" => Ok(SizedCheckpoint {
             weights_bytes: evidence.weights_bytes,
             model_type: model_type(evidence),
+            pool_basis: capyctl_protocol::execution::pool_basis_from_wire(evidence),
         }),
         "refused" => Err(MeasureError::Refused(evidence.reason.clone())),
         _ => Err(MeasureError::Unavailable),
@@ -183,6 +191,7 @@ pub fn record(
             measured.tables,
             measured.gguf,
             measured.model_type.as_deref(),
+            measured.pool_basis,
             capyctl_protocol::now_unix_ms(),
         )
         .map_err(|_| MeasureError::Unavailable)
@@ -539,6 +548,10 @@ impl DigestSource for LocalDigests {
                 tables,
                 gguf,
                 model_type,
+                // ADR 0034 §4: B and C travel only from a remote host; the
+                // embedded host's store computes them from the launch's own
+                // effective revision, on this machine.
+                pool_basis: None,
             })
         })
     }
@@ -567,6 +580,7 @@ impl DigestSource for LocalDigests {
             Ok(SizedCheckpoint {
                 weights_bytes,
                 model_type,
+                pool_basis: None,
             })
         })
     }
@@ -676,6 +690,7 @@ impl CheckpointDigests {
                                 &host,
                                 sized.weights_bytes,
                                 sized.model_type.as_deref(),
+                                sized.pool_basis,
                                 capyctl_protocol::now_unix_ms(),
                             );
                         }
@@ -842,6 +857,7 @@ impl CheckpointGate {
                         tables,
                         gguf,
                         model_type,
+                        pool_basis: None,
                     },
                 )
                 .map_err(|_| unrecorded())?;

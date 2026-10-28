@@ -112,6 +112,8 @@ fn evidence(state: &str, digest: &str) -> pb::CheckpointDigestEvidence {
         tables: None,
         gguf: None,
         model_type: String::new(),
+        kv_bytes_per_token: 0,
+        pool_context_tokens: 0,
     }
 }
 
@@ -716,6 +718,121 @@ fn a_checkpoint_result_names_its_model_type_as_a_table_key() {
         ..Default::default()
     };
     assert!(validate_result(&open, &result(&open, refusal)).is_err());
+}
+
+// T45 (ADR 0034 §4): a computed, mismatch or sized result may name B and C
+// of an automatic LMCache pool, both known or both unknown (zero, as from an
+// older host), each within the store's integers; a refusal names neither.
+// They read back from the wire as the host computed them.
+#[test]
+fn a_checkpoint_result_names_both_or_neither_of_the_pool_basis() {
+    use capyctl_config::lmcache::PoolBasis;
+    use capyctl_protocol::execution::{pool_basis_from_wire, pool_basis_to_wire};
+    let open = digest_command("");
+    let expecting = digest_command(DIGEST);
+    let mut wire = request("");
+    wire.size_only = true;
+    let mut sizing = decode(pb::execute_member::Action::DigestCheckpoint(wire)).unwrap();
+    sizing.identity.payload_digest = sizing.canonical_digest();
+    let sized = pb::CheckpointDigestEvidence {
+        state: "sized".into(),
+        weights_bytes: 10,
+        file_count: 2,
+        total_bytes: 12,
+        ..Default::default()
+    };
+    let basis =
+        |evidence: pb::CheckpointDigestEvidence, bytes, tokens| pb::CheckpointDigestEvidence {
+            kv_bytes_per_token: bytes,
+            pool_context_tokens: tokens,
+            ..evidence
+        };
+    let too_large = i64::MAX as u64 + 1;
+    for (command, evidence) in [
+        (&open, evidence("computed", DIGEST)),
+        (&expecting, evidence("mismatch", OTHER)),
+        (&sizing, sized.clone()),
+    ] {
+        let known = basis(evidence.clone(), 147_456, 32_768);
+        validate_result(command, &result(command, known.clone())).unwrap();
+        assert_eq!(
+            pool_basis_from_wire(&known),
+            Some(PoolBasis {
+                bytes_per_token: 147_456,
+                context_tokens: 32_768
+            })
+        );
+        validate_result(command, &result(command, evidence.clone())).unwrap();
+        assert_eq!(pool_basis_from_wire(&evidence), None);
+        for (bytes, tokens) in [
+            (147_456, 0),
+            (0, 32_768),
+            (too_large, 32_768),
+            (147_456, too_large),
+        ] {
+            let bad = basis(evidence.clone(), bytes, tokens);
+            assert!(
+                validate_result(command, &result(command, bad)).is_err(),
+                "{bytes} {tokens}"
+            );
+        }
+    }
+    let refusal = pb::CheckpointDigestEvidence {
+        state: "refused".into(),
+        reason: "unsafe_file".into(),
+        ..Default::default()
+    };
+    validate_result(&open, &result(&open, refusal.clone())).unwrap();
+    assert!(validate_result(&open, &result(&open, basis(refusal, 147_456, 32_768))).is_err());
+    // The host's side: an unknown basis, or one out of range, is both zero.
+    let known = PoolBasis {
+        bytes_per_token: 147_456,
+        context_tokens: 32_768,
+    };
+    assert_eq!(pool_basis_to_wire(Ok(known)), (147_456, 32_768));
+    assert_eq!(
+        pool_basis_to_wire(Err("the context is unknown".into())),
+        (0, 0)
+    );
+    assert_eq!(
+        pool_basis_to_wire(Ok(PoolBasis {
+            context_tokens: too_large,
+            ..known
+        })),
+        (0, 0)
+    );
+}
+
+// T45 T34 (ADR 0034 §4, ADR 0017): B and C on a checkpoint result are
+// additive fields: zero (an older host) encodes exactly as before, and an
+// older host's result reads both as zero, which records no basis.
+#[test]
+fn the_pool_basis_fields_are_additive() {
+    let older = pb::CheckpointDigestEvidence {
+        state: "sized".into(),
+        weights_bytes: 7,
+        model_type: "qwen3".into(),
+        ..Default::default()
+    };
+    let mut tail = Vec::new();
+    prost::encoding::uint64::encode(14, &147_456, &mut tail);
+    prost::encoding::uint64::encode(15, &32_768, &mut tail);
+    let reported = pb::CheckpointDigestEvidence {
+        kv_bytes_per_token: 147_456,
+        pool_context_tokens: 32_768,
+        ..older.clone()
+    };
+    assert_eq!(
+        reported.encode_to_vec(),
+        [older.encode_to_vec(), tail].concat(),
+        "B and C are only fields 14 and 15, appended"
+    );
+    let decoded = pb::CheckpointDigestEvidence::decode(older.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded, older);
+    assert_eq!(
+        capyctl_protocol::execution::pool_basis_from_wire(&decoded),
+        None
+    );
 }
 
 // T42 (ADR 0029 §9): a llama.cpp launch plan carries the GGUF facts its

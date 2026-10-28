@@ -229,6 +229,38 @@ pub fn gguf_to_wire(gguf: &GgufFacts) -> pb::CheckpointGguf {
     wire
 }
 
+/// ADR 0034 §4: one of B and C as the wire carries a known value: positive
+/// and within the store's integers.
+fn pool_basis_value(value: u64) -> Option<u64> {
+    (value > 0 && i64::try_from(value).is_ok()).then_some(value)
+}
+
+/// ADR 0034 §4: B and C a host reported with its checkpoint sizing or
+/// digest, `None` when either is unknown (zero, and from an older host).
+pub fn pool_basis_from_wire(
+    evidence: &pb::CheckpointDigestEvidence,
+) -> Option<capyctl_config::lmcache::PoolBasis> {
+    Some(capyctl_config::lmcache::PoolBasis {
+        bytes_per_token: pool_basis_value(evidence.kv_bytes_per_token)?,
+        context_tokens: pool_basis_value(evidence.pool_context_tokens)?,
+    })
+}
+
+/// ADR 0034 §4: B and C on the wire as `(kv_bytes_per_token,
+/// pool_context_tokens)`; both zero when the host could not compute them,
+/// or either is out of range.
+pub fn pool_basis_to_wire(basis: Result<capyctl_config::lmcache::PoolBasis, String>) -> (u64, u64) {
+    basis
+        .ok()
+        .and_then(|basis| {
+            Some((
+                pool_basis_value(basis.bytes_per_token)?,
+                pool_basis_value(basis.context_tokens)?,
+            ))
+        })
+        .unwrap_or((0, 0))
+}
+
 impl TryFrom<pb::SingleLaunchPlan> for SingleLaunchPlan {
     type Error = GroupIdentityError;
     fn try_from(plan: pb::SingleLaunchPlan) -> Result<Self, Self::Error> {
@@ -1885,12 +1917,17 @@ fn validate_checkpoint(
     let model_type = evidence.model_type.is_empty()
         || capyctl_config::lmcache::table_key(&evidence.model_type)
             == Some(evidence.model_type.as_str());
+    // ADR 0034 §4: B and C come together: both known (positive, within the
+    // store's integers) or both unknown (zero, and from an older host).
+    let pool_basis = pool_basis_from_wire(evidence).is_some()
+        || (evidence.kv_bytes_per_token == 0 && evidence.pool_context_tokens == 0);
     let measured = capyctl_config::effective::is_checkpoint_digest(&evidence.digest)
         && evidence.weights_bytes >= 0
         && u64::try_from(evidence.weights_bytes).is_ok_and(|w| w <= evidence.total_bytes)
         && evidence.file_count <= 65_536
         && evidence.reason.is_empty()
         && model_type
+        && pool_basis
         && evidence.state_slot_bytes.is_none_or(|bytes| bytes > 0)
         // ADR 0028 §5: a layout splits no more than the weights measured.
         && evidence.layout.as_ref().is_none_or(|layout| {
@@ -1924,6 +1961,7 @@ fn validate_checkpoint(
                 && evidence.file_count <= 65_536
                 && evidence.reason.is_empty()
                 && model_type
+                && pool_basis
                 && !evidence.full_rehash
                 && evidence.state_slot_bytes.is_none()
                 && evidence.layout.is_none()
@@ -1957,6 +1995,8 @@ fn validate_checkpoint(
                 && evidence.tables.is_none()
                 && evidence.gguf.is_none()
                 && evidence.model_type.is_empty()
+                && evidence.kv_bytes_per_token == 0
+                && evidence.pool_context_tokens == 0
                 && CHECKPOINT_REFUSALS.contains(&evidence.reason.as_str())
         }
         _ => false,

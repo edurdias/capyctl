@@ -839,6 +839,13 @@ message CheckpointDigestEvidence {
   // (`lmcache::table_key`); computed, mismatch and sized only. Empty when
   // unreadable, and from an older host.
   string model_type = 13;
+  // ADR 0034 §4 (additive): B and C of an automatic LMCache pool, as this
+  // host computes them for the deployment (`lmcache::pool_basis_for_effective`):
+  // the KV bytes per token and the launch's context, declared or fitted.
+  // Computed, mismatch and sized only; both zero when either is unknown,
+  // and from an older host.
+  uint64 kv_bytes_per_token = 14;
+  uint64 pool_context_tokens = 15;
 }
 message ResidencyEvidence {
   string state = 1;                      // parked | restored | unchanged | unknown

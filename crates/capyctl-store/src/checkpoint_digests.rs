@@ -57,6 +57,22 @@ fn valid_model_type(model_type: Option<&str>) -> bool {
         .is_none_or(|model_type| capyctl_config::lmcache::table_key(model_type) == Some(model_type))
 }
 
+/// ADR 0034 §4: B and C as the v60 columns hold them, both positive (a
+/// basis naming zero, or beyond SQLite's integers, is refused as invalid);
+/// `None` (an older host, or a shape the fit cannot read) writes NULL.
+fn pool_basis_columns(
+    basis: Option<capyctl_config::lmcache::PoolBasis>,
+) -> Option<(Option<i64>, Option<i64>)> {
+    let Some(basis) = basis else {
+        return Some((None, None));
+    };
+    let positive = |value: u64| i64::try_from(value).ok().filter(|value| *value > 0);
+    Some((
+        Some(positive(basis.bytes_per_token)?),
+        Some(positive(basis.context_tokens)?),
+    ))
+}
+
 /// ADR 0033 §7 (amendment A12): the checkpoint model type a host reported
 /// for this revision: with its recorded digest, else with its sizing while
 /// the digest is pending. `None` before either names one.
@@ -615,9 +631,11 @@ impl crate::Store {
     /// a first start's startup estimate uses them before the digest exists,
     /// and (ADR 0033 §7, amendment A12) the checkpoint's model type the host
     /// read, which a remote launch's LMCache plan compares before the digest
-    /// exists. The digest stays pending; its own measurement later records the
-    /// weights it hashed. Returns whether anything was recorded (only a
-    /// pending revision with no weights yet takes them).
+    /// exists, and (ADR 0034 §4) the KV bytes per token and the context the
+    /// host computed, which an automatic pool is sized from. The digest stays
+    /// pending; its own measurement later records the weights it hashed.
+    /// Returns whether anything was recorded (only a pending revision with no
+    /// weights yet takes them).
     #[allow(clippy::too_many_arguments)]
     pub fn record_checkpoint_weights(
         &self,
@@ -627,18 +645,22 @@ impl crate::Store {
         host_id: &str,
         weights_bytes: i64,
         model_type: Option<&str>,
+        pool_basis: Option<capyctl_config::lmcache::PoolBasis>,
         now_ms: i64,
     ) -> Result<bool> {
+        let Some((bytes_per_token, context_tokens)) = pool_basis_columns(pool_basis) else {
+            return Err(CheckpointDigestError::Invalid);
+        };
         if weights_bytes < 0 || now_ms < 0 || host_id.is_empty() || !valid_model_type(model_type) {
             return Err(CheckpointDigestError::Invalid);
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, session).map_err(|_| CheckpointDigestError::StaleSession)?;
         let changed = tx.execute(
-            "INSERT OR IGNORE INTO checkpoint_sizes(deployment_id,revision,host_id,weights_bytes,sized_at_ms,model_type)
-             SELECT ?1,?2,?4,?3,?5,?6 WHERE EXISTS(SELECT 1 FROM checkpoint_digests
+            "INSERT OR IGNORE INTO checkpoint_sizes(deployment_id,revision,host_id,weights_bytes,sized_at_ms,model_type,kv_bytes_per_token,pool_context_tokens)
+             SELECT ?1,?2,?4,?3,?5,?6,?7,?8 WHERE EXISTS(SELECT 1 FROM checkpoint_digests
                WHERE deployment_id=?1 AND revision=?2 AND host_id=?4 AND state='pending')",
-            params![deployment, revision, weights_bytes, host_id, now_ms, model_type],
+            params![deployment, revision, weights_bytes, host_id, now_ms, model_type, bytes_per_token, context_tokens],
         )?;
         tx.commit()?;
         Ok(changed == 1)
@@ -676,6 +698,7 @@ impl crate::Store {
             None,
             None,
             None,
+            None,
             now_ms,
         )
     }
@@ -696,7 +719,10 @@ impl crate::Store {
     /// digest is refused as invalid and records nothing. `model_type` is the
     /// checkpoint's `config.json` `model_type` the host read (ADR 0033 §7,
     /// amendment A12), kept with the recorded digest for a remote launch's
-    /// LMCache plan.
+    /// LMCache plan, and `pool_basis` the KV bytes per token and context the
+    /// host computed (ADR 0034 §4), kept with it for an automatic pool; a
+    /// digest recorded without them takes them from the same measurement
+    /// later, as for the model type.
     #[allow(clippy::too_many_arguments)]
     pub fn record_checkpoint_measurement(
         &self,
@@ -712,8 +738,12 @@ impl crate::Store {
         tables: Option<capyctl_domain::disk_tables::CheckpointTables>,
         gguf: Option<capyctl_domain::gguf::GgufFacts>,
         model_type: Option<&str>,
+        pool_basis: Option<capyctl_config::lmcache::PoolBasis>,
         now_ms: i64,
     ) -> Result<RecordOutcome> {
+        let Some((bytes_per_token, context_tokens)) = pool_basis_columns(pool_basis) else {
+            return Err(CheckpointDigestError::Invalid);
+        };
         if !is_checkpoint_digest(digest)
             || weights_bytes < 0
             || state_slot_bytes.is_some_and(|bytes| bytes <= 0)
@@ -763,6 +793,13 @@ impl crate::Store {
                     tx.execute(
                         "UPDATE checkpoint_digests SET model_type=?3 WHERE deployment_id=?1 AND revision=?2 AND model_type IS NULL",
                         params![deployment, revision, model_type],
+                    )?;
+                }
+                // ADR 0034 §4: likewise B and C, both at once.
+                if same && pool_basis.is_some() {
+                    tx.execute(
+                        "UPDATE checkpoint_digests SET kv_bytes_per_token=?3,pool_context_tokens=?4 WHERE deployment_id=?1 AND revision=?2 AND (kv_bytes_per_token IS NULL OR pool_context_tokens IS NULL)",
+                        params![deployment, revision, bytes_per_token, context_tokens],
                     )?;
                 }
                 tx.commit()?;
@@ -985,8 +1022,8 @@ impl crate::Store {
             }
         }
         tx.execute(
-            "UPDATE checkpoint_digests SET state='recorded',digest=?3,weights_bytes=?4,host_id=?5,provisional=0,diagnostic=NULL,updated_at_ms=?6,state_slot_bytes=?7,provenance=?8,model_type=?9 WHERE deployment_id=?1 AND revision=?2",
-            params![deployment, revision, digest, weights_bytes, host_id, now_ms, state_slot_bytes, provenance.code(), model_type],
+            "UPDATE checkpoint_digests SET state='recorded',digest=?3,weights_bytes=?4,host_id=?5,provisional=0,diagnostic=NULL,updated_at_ms=?6,state_slot_bytes=?7,provenance=?8,model_type=?9,kv_bytes_per_token=?10,pool_context_tokens=?11 WHERE deployment_id=?1 AND revision=?2",
+            params![deployment, revision, digest, weights_bytes, host_id, now_ms, state_slot_bytes, provenance.code(), model_type, bytes_per_token, context_tokens],
         )?;
         tx.commit()?;
         Ok(RecordOutcome::Recorded {

@@ -927,30 +927,43 @@ impl NativeHostExecution {
             Err(reason) => refused(reason),
             // Owner decision 2026-09-23 (solo first start): a size-only
             // request walks the checkpoint and hashes nothing.
-            Ok(location) if plan.size_only => {
+            Ok((location, documents)) if plan.size_only => {
                 let checkpoints = self.checkpoints.clone();
                 let sized = tokio::task::spawn_blocking(move || {
                     let size = checkpoints.size(&location.model_store, &location.checkpoint)?;
                     let weights = with_drafter(&checkpoints, &location, size.weights_bytes)?;
                     // ADR 0033 amendment A12: the model type the server's
-                    // LMCache plan compares, known before the digest.
-                    Ok::<_, CheckpointError>((size, weights, location.model_type()))
+                    // LMCache plan compares, known before the digest, and
+                    // ADR 0034 §4: B and C, which its automatic pool is
+                    // sized from.
+                    let basis = documents.pool_basis(capyctl_config::effective::CheckpointFacts {
+                        weights_bytes: Some(weights),
+                        ..Default::default()
+                    });
+                    Ok::<_, CheckpointError>((size, weights, location.model_type(), basis))
                 })
                 .await
                 .map_err(|_| SessionError)?;
                 match sized {
-                    Ok((size, weights_bytes, model_type)) => pb::CheckpointDigestEvidence {
+                    Ok((
+                        size,
+                        weights_bytes,
+                        model_type,
+                        (kv_bytes_per_token, pool_context_tokens),
+                    )) => pb::CheckpointDigestEvidence {
                         state: "sized".into(),
                         weights_bytes,
                         file_count: size.file_count,
                         total_bytes: size.total_bytes,
                         model_type: model_type.unwrap_or_default(),
+                        kv_bytes_per_token,
+                        pool_context_tokens,
                         ..Default::default()
                     },
                     Err(error) => refused(error.code()),
                 }
             }
-            Ok(location) => {
+            Ok((location, documents)) => {
                 let checkpoints = self.checkpoints.clone();
                 let measured = tokio::task::spawn_blocking(move || {
                     let verified = checkpoints.measure_declared(
@@ -968,17 +981,29 @@ impl NativeHostExecution {
                     let (layout, tables) = location.header_facts();
                     let layout = layout.filter(|layout| layout.sharded_bytes <= weights);
                     let tables = tables.filter(|tables| tables.bytes <= weights);
+                    let state_slot_bytes = location.state_slot_bytes();
+                    let gguf = location.gguf_facts();
+                    // ADR 0034 §4: B and C, resolved with what was measured.
+                    let basis = documents.pool_basis(capyctl_config::effective::CheckpointFacts {
+                        weights_bytes: Some(weights),
+                        state_slot_bytes,
+                        layout,
+                        disk_tables: tables,
+                        gguf,
+                        ..Default::default()
+                    });
                     Ok::<_, CheckpointError>((
                         verified,
                         weights,
-                        location.state_slot_bytes(),
+                        state_slot_bytes,
                         layout,
                         tables,
                         // ADR 0029 §9: what a llama.cpp launch loads, and
                         // its GGUF header.
-                        location.gguf_facts(),
+                        gguf,
                         // ADR 0033 amendment A12: the model type.
                         location.model_type(),
+                        basis,
                     ))
                 })
                 .await
@@ -992,6 +1017,7 @@ impl NativeHostExecution {
                         tables,
                         gguf,
                         model_type,
+                        (kv_bytes_per_token, pool_context_tokens),
                     )) => {
                         let manifest = verified.manifest;
                         let mismatch = plan
@@ -1016,6 +1042,8 @@ impl NativeHostExecution {
                                 .map(capyctl_protocol::execution::tables_to_wire),
                             gguf: gguf.as_ref().map(capyctl_protocol::execution::gguf_to_wire),
                             model_type: model_type.unwrap_or_default(),
+                            kv_bytes_per_token,
+                            pool_context_tokens,
                         }
                     }
                     Err(error) => refused(error.code()),
@@ -1305,11 +1333,18 @@ impl NativeHostExecution {
     }
 
     /// Where a digest request's checkpoint lives on this host, from this host's
-    /// approved document only.
+    /// approved document only, with the deployment and host documents it was
+    /// located from (ADR 0034 §4: the pool basis is computed from them).
     fn locate(
         &self,
         plan: &DigestCheckpointPlan,
-    ) -> Result<capyctl_config::effective::CheckpointLocation, &'static str> {
+    ) -> Result<
+        (
+            capyctl_config::effective::CheckpointLocation,
+            DigestDocuments,
+        ),
+        &'static str,
+    > {
         // ADR 0018 §3: the document the plan names, as for a launch.
         let Some(set) = self.profiles.for_fingerprint(&plan.host_policy_fingerprint) else {
             return Err("unauthorized");
@@ -1321,13 +1356,16 @@ impl NativeHostExecution {
         .map_err(|_| "unauthorized")?;
         let host = capyctl_config::remote_resources::local_host_document(&set.config.document)
             .map_err(|_| "unauthorized")?;
-        capyctl_config::effective::checkpoint_location(&deployment, &host).map_err(|error| {
-            if error.code == capyctl_config::ConfigErrorCode::NotMaterializable {
-                "not_materializable"
-            } else {
-                "unauthorized"
-            }
-        })
+        let location = capyctl_config::effective::checkpoint_location(&deployment, &host).map_err(
+            |error| {
+                if error.code == capyctl_config::ConfigErrorCode::NotMaterializable {
+                    "not_materializable"
+                } else {
+                    "unauthorized"
+                }
+            },
+        )?;
+        Ok((location, DigestDocuments { deployment, host }))
     }
 
     fn scope(&self, command: &MemberCommand) -> Result<IngressScope, JournalError> {
@@ -3112,6 +3150,38 @@ fn with_drafter(
         .drafter_weights(location.drafter.as_ref())?
         .checked_add(weights)
         .ok_or(CheckpointError::TooLarge)
+}
+
+/// The deployment and this host's documents a digest request was located
+/// from.
+struct DigestDocuments {
+    deployment: serde_json::Value,
+    host: serde_json::Value,
+}
+
+impl DigestDocuments {
+    /// ADR 0034 §4: B and C of the deployment's automatic LMCache pool as
+    /// this host computes them (`lmcache::pool_basis_for_effective`, the
+    /// function the store shares), the deployment resolved here with the
+    /// facts just measured, as the store re-resolves it; on the wire as
+    /// `(kv_bytes_per_token, pool_context_tokens)`, both zero when it does
+    /// not resolve or the fit cannot read them. Reads the checkpoint's
+    /// configuration: call it off the async runtime.
+    fn pool_basis(&self, facts: capyctl_config::effective::CheckpointFacts) -> (u64, u64) {
+        capyctl_protocol::execution::pool_basis_to_wire(
+            capyctl_config::effective::resolve_effective_with_checkpoint(
+                &self.deployment,
+                &self.host,
+                capyctl_config::effective::CheckpointFacts {
+                    // The server accepted this revision before asking.
+                    accepted_revision: true,
+                    ..facts
+                },
+            )
+            .map_err(|error| error.to_string())
+            .and_then(|effective| capyctl_config::lmcache::pool_basis_for_effective(&effective)),
+        )
+    }
 }
 
 #[cfg(test)]
