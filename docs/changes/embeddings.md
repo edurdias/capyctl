@@ -1,7 +1,7 @@
 # Status: Embedding models: `api: embeddings` and `POST /v1/embeddings` (ADR 0036) — 2026-10-28 (branch `feat/embeddings`)
 
 ADR 0036 (accepted 2026-10-27, owner decisions of that day) is implemented in commits
-`f5d6b32e..6516d7ab` with its SPEC texts (§6.1, §6.2, §9.1, §9.2, §10, §15.1, §20 T47) and
+`3acba9a7..50676ce6` with its SPEC texts (§6.1, §6.2, §9.1, §9.2, §10, §15.1, §20 T47) and
 guide pages. A deployment declares `api: embeddings`, part of the frozen revision. vLLM
 renders `--runner pooling`, SGLang `--is-embedding` and llama.cpp `--embeddings` with
 `--ubatch-size` and `--batch-size` equal to the per-slot context unless the arguments
@@ -24,7 +24,8 @@ rewritten to the public name; `capyctl.metrics` (`total_ms`, `time_to_response_m
 `input_tokens`, `inputs`) and the closing brace are written only after the last check, so a
 malformed or broken answer reaches the client as an incomplete body and the request is
 uncertain. A cut request keeps its engine connection, is read to its end and settles on a
-complete answer; one whose answer never completes settles at the next verified stop.
+complete answer, or on the engine's next idle reading when it answered with a complete error;
+one whose answer never completes settles at the next verified stop.
 CapyCTL's request ID is never sent to the engine. Readiness is the fixed embedding (kind
 `embedding`, version 1); the wake canary compares vectors by relative distance after every
 wake and restart, with a provisional tolerance of 0.02 until row EM3 sets it. The host

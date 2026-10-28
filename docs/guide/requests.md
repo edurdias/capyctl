@@ -503,7 +503,9 @@ your client hangs up, or the request runs past its deadline, CapyCTL keeps
 the engine connection open, lets the engine finish, and reads and checks the
 rest of the answer without sending it anywhere. The request counts against
 its model's memory and its 32 places until then, and is finished as soon as
-a complete answer has been read. Only a cut request whose answer never
+a complete answer has been read. If the engine answers with a complete error
+instead, the request is finished once the engine next reports itself idle.
+Only a cut request whose answer never
 completes (the engine closes the connection, the answer is malformed, or the
 instance stops first) waits for the instance's next stop, as described in
 [When a request is cut short](#when-a-request-is-cut-short), including the
