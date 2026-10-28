@@ -131,9 +131,11 @@ pub(super) fn factory(
                         *api_key = Some(recorded(SecretRole::Inference)?);
                     }
                 }
-                // ADR 0023 §3, ADR 0029 §4: TensorFold and llama.cpp hold no
-                // key to recover.
-                AdapterSpec::Tensorfold { .. } | AdapterSpec::Llamacpp { .. } => {}
+                // ADR 0023 §3, ADR 0029 §4, ADR 0038 §9: TensorFold,
+                // llama.cpp and TensorRT-LLM hold no key to recover.
+                AdapterSpec::Tensorfold { .. }
+                | AdapterSpec::Llamacpp { .. }
+                | AdapterSpec::TensorrtLlm { .. } => {}
             }
             // ADR 0033 §§3, 7: an adopted launch runs on the server its
             // Initialize started (recorded beside its engine), never a new

@@ -854,6 +854,91 @@ fn a_custom_profile_builds_a_custom_spec() {
     assert_eq!(idle, None);
 }
 
+/// A TensorRT-LLM deployment on the lab fixture, shaped as the config
+/// crate's TensorRT-LLM fixture shapes it, its checkpoint `checkpoint`.
+fn tensorrt_llm_work(checkpoint: &std::path::Path) -> InitializeWork {
+    let all: Value = serde_json::from_str(include_str!(
+        "../../../capyctl-config/tests/fixtures/f2-deployment.json"
+    ))
+    .expect("fixture JSON parses");
+    let (mut deployment, mut host) = (all["deployment"].clone(), all["host"].clone());
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["engine"] = json!("tensorrt-llm");
+    profile["executable"] = json!("/home/u/tensorrt-llm-1.2.1-venv/bin/trtllm-serve");
+    profile["build_fingerprint"] = json!("1.2.1");
+    profile["args"] = json!([]);
+    profile["env"] = json!({});
+    profile["security"]["deep_park"] = json!("disabled");
+    deployment["residency"] = json!("restart_only");
+    deployment["model"]["path"] = json!(checkpoint);
+    deployment["engine_config"] = json!({"memory": {"kv_cache": "4GiB"}});
+    admit_measured(&deployment, &host, None)
+}
+
+// T49 T16 (ADR 0038 §3, §9): the embedded path builds the plan the host
+// agent builds, through the shared builder: no key, the served route, the
+// grant's `max_tokens`, and the launch's own directory in the role's
+// private per-launch root, removed once the launch is proved gone. Without
+// a private root nothing launches.
+#[test]
+fn a_tensorrt_llm_profile_builds_a_tensorrt_llm_spec() {
+    use std::os::unix::fs::DirBuilderExt;
+    let checkpoint = tempfile::tempdir().unwrap();
+    std::fs::write(
+        checkpoint.path().join("config.json"),
+        json!({
+            "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3",
+            "num_hidden_layers": 36, "num_attention_heads": 32, "num_key_value_heads": 8,
+            "head_dim": 128, "hidden_size": 2560, "torch_dtype": "bfloat16",
+            "max_position_embeddings": 40960, "use_sliding_window": false,
+            "max_window_layers": 36, "vocab_size": 151936
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let work = tensorrt_llm_work(checkpoint.path());
+    let state = tempfile::tempdir().unwrap();
+    let without = ProfileBindings::new(state.path().join("logs"), state.path().join("runtime"));
+    assert!(
+        without.spec(&work).is_err(),
+        "no private per-launch root, no launch"
+    );
+    let root = state.path().join("rendezvous");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .unwrap();
+    let bindings = ProfileBindings::new(state.path().join("logs"), state.path().join("runtime"))
+        .with_rendezvous_root(root.clone());
+    let AdapterSpec::TensorrtLlm {
+        endpoint,
+        fingerprint,
+        model_id,
+        launch: Some(launch),
+    } = bindings.spec(&work).unwrap()
+    else {
+        panic!("a TensorRT-LLM spec");
+    };
+    assert_eq!(fingerprint, "1.2.1");
+    assert_eq!(model_id, launch.served_model_name);
+    assert_eq!(Some(launch.port), endpoint.port());
+    assert_eq!(launch.max_tokens, 29_127, "Qwen3-4B in BF16 with 4 GiB");
+    assert_eq!(launch.version, "1.2.1");
+    let dir = std::path::PathBuf::from(&launch.launch_dir);
+    assert_eq!(dir, root.join(work.incarnation()));
+    assert!(!dir.exists(), "Initialize creates it");
+    let rendered = capyctl_adapters::tensorrt_llm::render_command(&launch).unwrap();
+    assert!(!rendered.env.keys().any(|name| name.contains("KEY")));
+    // Initialize makes it; stop evidence removes it, never the checkpoint
+    // its link names.
+    capyctl_adapters::tensorrt_llm::prepare_launch_dir(&launch).unwrap();
+    assert!(launch.model_link().is_symlink());
+    bindings.launch_gone(work.incarnation());
+    assert!(!dir.exists());
+    assert!(checkpoint.path().join("config.json").is_file());
+    assert!(root.is_dir(), "the root itself stays");
+}
+
 /// A `restart_only` vLLM deployment on a profile that registered LMCache
 /// (vLLM 0.32.0, LMCache 0.5.6), so the store plans its server.
 fn lmcache_work(edit: impl FnOnce(&mut Value)) -> InitializeWork {

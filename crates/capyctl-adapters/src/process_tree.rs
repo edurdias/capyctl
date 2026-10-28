@@ -14,7 +14,7 @@ use capyctl_domain::completion::ProcessIdentity;
 
 /// ADR 0038 §16: the closed launch failure of a descendant outside the
 /// launch's process group.
-pub const ENGINE_PROCESS_ESCAPED: &str = "engine_process_escaped";
+pub use capyctl_config::tensorrt_llm::ENGINE_PROCESS_ESCAPED;
 
 /// The role an escaped process is named by when it joins the set a stop must
 /// prove gone (`escaped-N`, N in the order found). It is neither the `api`

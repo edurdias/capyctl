@@ -17,6 +17,11 @@
 //! sources; a missing, malformed or ambiguous gauge makes the sample
 //! `scrape_ok = false` rather than a guess. Metrics are read on loopback only
 //! and are never reachable through ingress or the router (SPEC §13.3, M08).
+//! ADR 0038 §6: a TensorRT-LLM `/metrics` body is a JSON array of iteration
+//! entries, not an exposition; the newest entry's figures are its load, and
+//! a read with no entry (or one lacking a figure) carries none: unknown,
+//! never 0 and never idle (the controller never settles its cancelling
+//! requests on a sample either way, since it reports no idle signal).
 //!
 //! ADR 0031 §4, §6: a custom engine has no load reports. Its `/metrics` is
 //! never read; with a manifest idle signal, its sample carries 0 running and
@@ -247,6 +252,22 @@ pub fn parse_llamacpp_load(text: &str, kv_usage_ppm: Option<u32>) -> Option<Engi
         ("llamacpp", gauges, _) => gauges.with_kv(kv_usage_ppm),
         _ => None,
     }
+}
+
+/// ADR 0038 §6: a TensorRT-LLM sample from one `/metrics` body (a read
+/// consumes the entries; the host is its only reader): running is the
+/// newest entry's `numActiveRequests`, waiting its `numQueuedRequests`, KV
+/// usage `usedNumBlocks / maxNumBlocks`. `None` unless the body is an array
+/// of iteration entries whose newest carries all three within the gauge
+/// bound: a read with no entry is unknown, never 0.
+pub fn parse_tensorrt_llm_load(body: &[u8]) -> Option<EngineLoad> {
+    let entries = capyctl_adapters::tensorrt_llm::parse_iteration_stats(body)?;
+    let load = capyctl_adapters::tensorrt_llm::newest_load(&entries)?;
+    (load.running <= MAX_LOAD_GAUGE && load.waiting <= MAX_LOAD_GAUGE).then_some(EngineLoad {
+        running: load.running,
+        waiting: load.waiting,
+        kv_usage_ppm: load.kv_usage_ppm.min(KV_USAGE_PPM_FULL),
+    })
 }
 
 /// ADR 0029 §11: where llama.cpp lists its slots (on by default; CapyCTL never
@@ -1085,7 +1106,10 @@ impl LoadReporter {
                             SideRead::Health(health) => parse_engine_load(body)
                                 .map(|load| fold_tensorfold_health(load, health.as_ref())),
                             SideRead::KvUsage(kv) => parse_llamacpp_load(body, kv),
-                            SideRead::None => parse_engine_load(body),
+                            // ADR 0038 §6: no exposition family matched; a
+                            // TensorRT-LLM body is its iteration entries.
+                            SideRead::None => parse_engine_load(body)
+                                .or_else(|| parse_tensorrt_llm_load(body.as_bytes())),
                         }),
                     };
                     let latency = self.latency(&target, body.as_deref(), &mut baselines);

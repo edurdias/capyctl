@@ -8,6 +8,11 @@
 //! inside a private root it owns (`<root>/<incarnation>`), and removes it once
 //! its own evidence proves the launch's group gone, the same point a gone
 //! launch's saver enrollment is retired.
+//!
+//! ADR 0038 §3: a TensorRT-LLM launch keeps its launch directory (the
+//! served-name link, `llm_api_options.yaml` and its `TMPDIR`) in the same
+//! root under its own incarnation, created by its Initialize and removed on
+//! the same evidence.
 use std::{
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},

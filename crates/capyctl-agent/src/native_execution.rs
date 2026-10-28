@@ -45,6 +45,8 @@ mod tensorfold;
 mod llamacpp;
 // ADR 0031: custom engines' plan, adapter and loopback check.
 mod custom;
+// ADR 0038: TensorRT-LLM's plan, adapter and ownership checks.
+mod tensorrt_llm;
 // ADR 0035 §§5, 6: launches on several GPUs of this host.
 mod local_tp;
 // ADR 0023 §6, ADR 0029 §10: the engines' own idle check before Terminate.
@@ -212,6 +214,8 @@ enum PreparedLaunch {
     Llamacpp(Box<capyctl_adapters::llamacpp::PlanInputLlamacpp>),
     /// ADR 0031: the plan, keyed when the manifest uses `{api_key}`.
     Custom(Box<capyctl_adapters::custom::PlanInputCustom>),
+    /// ADR 0038: the plan, with its launch directory in the private root.
+    TensorrtLlm(Box<capyctl_adapters::tensorrt_llm::PlanInputTensorrtLlm>),
 }
 
 impl NativeHostExecution {
@@ -1430,7 +1434,12 @@ impl NativeHostExecution {
                     .map_err(|_| SessionError)?,
             ))),
             Engine::Custom => Err(SessionError),
-            // TRTLLM-WIRING: replaced by the integration slice.
+            // ADR 0038 §13: one GPU, one process; a group member is never
+            // built (no group entry, `resolve_as`).
+            Engine::TensorrtLlm if group.is_none() => Ok(PreparedLaunch::TensorrtLlm(Box::new(
+                self.tensorrt_llm_plan(effective, plan)
+                    .map_err(|_| SessionError)?,
+            ))),
             Engine::TensorrtLlm => Err(SessionError),
         }
     }
@@ -1541,6 +1550,11 @@ impl NativeHostExecution {
                     .and_then(|custom| custom::custom_key(custom, keys));
                 Box::new(adapter.with_launch(input).with_tools(tools))
             }
+            PreparedLaunch::TensorrtLlm(input) => Box::new(
+                self.tensorrt_llm_adapter(effective, plan, served)?
+                    .with_launch(*input)
+                    .with_tools(tools),
+            ),
         })
     }
 
@@ -1566,8 +1580,7 @@ impl NativeHostExecution {
             Engine::Vllm => Box::new(self.vllm_adapter(effective, plan, Some(keys), served)?),
             Engine::Tensorfold => Box::new(self.tensorfold_adapter(effective, plan, served)?),
             Engine::Llamacpp => Box::new(self.llamacpp_adapter(effective, plan, served)?),
-            // TRTLLM-WIRING: replaced by the integration slice.
-            Engine::TensorrtLlm => return Err(SessionError),
+            Engine::TensorrtLlm => Box::new(self.tensorrt_llm_adapter(effective, plan, served)?),
             Engine::Custom => Box::new(self.custom_adapter(effective, plan, Some(keys), served)?),
         })
     }
@@ -1703,6 +1716,20 @@ impl NativeHostExecution {
         }
         let observation = match initialized {
             Ok(observation) => observation,
+            // ADR 0038 §4, §9: a TensorRT-LLM launch the adapter could not
+            // stop (the launch tools confer no cleanup authority) is stopped
+            // here, the escaped processes with it, before the failure is
+            // reported.
+            Err(error) if effective.profile.engine == Engine::TensorrtLlm => {
+                let engine = self
+                    .stop_failed_tensorrt_llm(&command.identity.command_id, &error)
+                    .await
+                    .or(match error {
+                        capyctl_adapters::traits::RuntimeError::LaunchFailed(text) => Some(text),
+                        _ => None,
+                    });
+                return Err(LaunchError { engine });
+            }
             Err(capyctl_adapters::traits::RuntimeError::LaunchFailed(text)) => {
                 if text.starts_with(capyctl_config::custom::LISTENER_EXPOSED) {
                     // ADR 0031 §7: an engine listening off loopback is
@@ -1936,9 +1963,23 @@ impl NativeHostExecution {
         // ADR 0031 §7: a custom launch's listeners are checked again
         // whenever this host re-proves it, after the probe and before the
         // gate reopens; one off loopback stops the launch. ADR 0035 §5: so
-        // are a built-in engine's on several GPUs.
+        // are a built-in engine's on several GPUs. ADR 0038 §9: and a
+        // TensorRT-LLM launch's descendants and listeners, on every launch.
         let several_gpus = plan.devices.len() >= 2;
-        if effective.profile.engine == Engine::Custom || several_gpus {
+        if effective.profile.engine == Engine::TensorrtLlm {
+            let journal = self.journal.clone();
+            let owner = owned_handle.to_owned();
+            let proven = tokio::task::spawn_blocking(move || {
+                journal
+                    .inspect_owned(&owner)
+                    .is_ok_and(|recorded| tensorrt_llm::reprove_ownership(&recorded))
+            })
+            .await
+            .map_err(|_| SessionError)?;
+            if !proven {
+                return Err(SessionError);
+            }
+        } else if effective.profile.engine == Engine::Custom || several_gpus {
             let journal = self.journal.clone();
             let owner = owned_handle.to_owned();
             let checked = tokio::task::spawn_blocking(move || {
@@ -2568,6 +2609,8 @@ fn dp_attention(deployment_config: &str) -> bool {
 /// reaped (the api process first) when it knows it. ADR 0031 §7, §10: a
 /// custom launch this host stopped for listening off loopback reports that,
 /// with its closed code and the address and port (never a path or a value).
+/// ADR 0038 §16: so does a TensorRT-LLM launch this host stopped for a short
+/// KV pool, an escaped process or a listener off loopback.
 fn launch_failure(result: &pb::MemberExecutionResult, engine: Option<&str>) -> String {
     use capyctl_adapters::launch_failure::{summary, EngineExit};
     if let Some(exposed) = engine
@@ -2577,6 +2620,8 @@ fn launch_failure(result: &pb::MemberExecutionResult, engine: Option<&str>) -> S
                 capyctl_config::custom::LISTENER_EXPOSED,
                 capyctl_domain::local_tp::ENGINE_LISTENER_EXPOSED,
                 capyctl_domain::local_tp::TP_RANK_UNOBSERVED,
+                capyctl_config::tensorrt_llm::KV_CACHE_SHORT,
+                capyctl_config::tensorrt_llm::ENGINE_PROCESS_ESCAPED,
             ]
             .iter()
             .any(|code| line.starts_with(&format!("{code}:")))
@@ -5070,6 +5115,202 @@ mod tests {
         assert_eq!(custom::custom_key(&unkeyed, Some(&keys)), None);
     }
 
+    /// ADR 0038 §4: Qwen3-4B's `config.json`, a full-attention decoder.
+    const QWEN3_4B_CONFIG: &str = r#"{"architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3", "num_hidden_layers": 36, "num_attention_heads": 32,
+        "num_key_value_heads": 8, "head_dim": 128, "hidden_size": 2560,
+        "torch_dtype": "bfloat16", "max_position_embeddings": 40960,
+        "use_sliding_window": false, "max_window_layers": 36, "vocab_size": 151936}"#;
+
+    /// ADR 0038: the fixture host with its `local` profile a TensorRT-LLM
+    /// 1.2.1 environment, Qwen3-4B's geometry in the checkpoint, a
+    /// restart-only chat deployment with a 4 GiB KV cache, and the host's
+    /// private per-launch root.
+    fn tensorrt_llm_fixture(
+        root: &std::path::Path,
+        identity_dir: &std::path::Path,
+    ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
+        let (executor, mut deployment, policy) =
+            sglang_fixture_with(root, identity_dir, "restart_only", |document| {
+                let profile = &mut document["runtime_profiles"]["local"];
+                profile["engine"] = "tensorrt-llm".into();
+                profile["executable"] = "/home/u/tensorrt-llm-1.2.1-venv/bin/trtllm-serve".into();
+                profile["build_fingerprint"] = "1.2.1".into();
+                profile["args"] = serde_json::json!([]);
+                profile["env"] = serde_json::json!({});
+                profile["security"]["deep_park"] = "disabled".into();
+                profile["security"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("admin_credential_ref");
+            });
+        std::fs::write(root.join("models/toy/config.json"), QWEN3_4B_CONFIG).unwrap();
+        deployment.as_object_mut().unwrap().remove("resources");
+        deployment["engine_config"] = serde_json::json!({"memory": {"kv_cache": "4GiB"}});
+        let rendezvous = root.join("rendezvous");
+        std::fs::create_dir(&rendezvous).unwrap();
+        std::fs::set_permissions(&rendezvous, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (executor.with_rendezvous_root(rendezvous), deployment, policy)
+    }
+
+    /// A TensorRT-LLM launch command for the fixture under `root`, on
+    /// `port`, with the checkpoint's recorded digest and the profile's
+    /// version.
+    fn tensorrt_llm_launch(
+        root: &std::path::Path,
+        deployment: &serde_json::Value,
+        policy: &str,
+        port: u16,
+    ) -> (MemberCommand, SingleLaunchPlan) {
+        let (mut launch, plan) = llamacpp_launch(root, deployment, policy, port);
+        launch.identity.profile_fingerprint = "1.2.1".into();
+        launch.identity.payload_digest = launch.canonical_digest();
+        (launch, plan)
+    }
+
+    // T49 T16 (ADR 0038 §3, §13): the host resolves and prepares a
+    // TensorRT-LLM launch from its own document: the shared builder's plan
+    // with the grant's `max_tokens`, the launch's own directory in the
+    // private per-launch root (not yet made: Initialize makes it), never a
+    // group member, and an adapter for a retained one. A host without a
+    // private root never launches it.
+    #[test]
+    fn a_tensorrt_llm_launch_prepares_from_local_policy() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            tensorrt_llm_fixture(root.path(), identity_dir.path());
+        let port = closed_port();
+        let (launch, plan) = tensorrt_llm_launch(root.path(), &deployment, &policy, port);
+        let effective = executor.resolve(&launch).unwrap();
+        assert_eq!(effective.profile.engine, Engine::TensorrtLlm);
+        let input = executor.tensorrt_llm_plan(&effective, &plan).unwrap();
+        assert_eq!(input.port, port);
+        assert_eq!(input.served_model_name, "toy");
+        assert_eq!(input.version, "1.2.1");
+        assert_eq!(input.max_tokens, 29_127, "Qwen3-4B in BF16 with 4 GiB");
+        let dir = std::path::PathBuf::from(&input.launch_dir);
+        assert_eq!(dir, root.path().join("rendezvous").join(&plan.incarnation));
+        assert!(!dir.exists(), "Initialize creates it");
+        assert!(matches!(
+            executor.prepare(&effective, &plan, "toy", None),
+            Ok(PreparedLaunch::TensorrtLlm(..))
+        ));
+        let args = capyctl_domain::group::GroupMemberArgs {
+            tensor_parallel: 2,
+            pipeline_parallel: 1,
+            nnodes: 2,
+            node_rank: 1,
+            head_address: std::net::Ipv4Addr::LOCALHOST.into(),
+            rendezvous_port: 29500,
+            own_address: std::net::Ipv4Addr::LOCALHOST.into(),
+            worker_port: None,
+            own_interface: None,
+        };
+        assert!(
+            executor
+                .prepare(&effective, &plan, "toy", Some(args))
+                .is_err(),
+            "no TensorRT-LLM group member"
+        );
+        let keys = NativeCredentials {
+            gate: [1; 32],
+            inference: [2; 32],
+            admin: [3; 32],
+        };
+        assert!(executor
+            .probe_adapter(&effective, &plan, &keys, "toy")
+            .is_ok());
+        // A root another user could enter is not private: nothing launches.
+        let shared = root.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let unprivate = executor.clone().with_rendezvous_root(shared);
+        assert!(unprivate.tensorrt_llm_plan(&effective, &plan).is_err());
+        assert!(unprivate.prepare(&effective, &plan, "toy", None).is_err());
+    }
+
+    // T49 T21 (ADR 0038 §4, §16): a checkpoint whose KV geometry CapyCTL
+    // cannot size the pool from is refused `kv_geometry_unsupported` before
+    // any effect, a closed policy refusal the wire accepts; Qwen3-4B's is
+    // admitted, and any other engine passes the check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unsized_kv_geometry_is_a_closed_launch_refusal() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            tensorrt_llm_fixture(root.path(), identity_dir.path());
+        let (launch, _) = tensorrt_llm_launch(root.path(), &deployment, &policy, closed_port());
+        let effective = executor.resolve(&launch).unwrap();
+        assert_eq!(executor.admit_tensorrt_llm(&effective), Ok(()));
+        let mut sliding: serde_json::Value = serde_json::from_str(QWEN3_4B_CONFIG).unwrap();
+        sliding["sliding_window"] = 4096.into();
+        sliding["use_sliding_window"] = true.into();
+        std::fs::write(
+            root.path().join("models/toy/config.json"),
+            sliding.to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            executor.admit_tensorrt_llm(&effective),
+            Err(LaunchVerdict::Refused("kv_geometry_unsupported"))
+        );
+        assert!(capyctl_protocol::execution::is_policy_refusal(
+            "kv_geometry_unsupported"
+        ));
+        assert!(capyctl_protocol::execution::is_policy_refusal(
+            "served_name_unsupported"
+        ));
+        let result = executor
+            .refused(&launch, Some("kv_geometry_unsupported".into()))
+            .await
+            .unwrap();
+        capyctl_protocol::execution::validate_result(&launch, &result).unwrap();
+        assert_eq!(result.refused, "kv_geometry_unsupported");
+        assert!(!result.claim_retained && !result.model_usable);
+        let other = directory();
+        let other_identity = directory();
+        let (llamacpp, deployment, policy) =
+            llamacpp_fixture(other.path(), other_identity.path());
+        let (launch, _) = llamacpp_launch(other.path(), &deployment, &policy, closed_port());
+        let effective = llamacpp.resolve(&launch).unwrap();
+        assert_eq!(llamacpp.admit_tensorrt_llm(&effective), Ok(()));
+    }
+
+    // T49 (ADR 0038 §9): ownership that cannot be proven fails the re-proof
+    // closed and stops nothing: no api process recorded, or none alive.
+    // A failure the adapter already settled, or one that names no stopping
+    // code, is left as it is; one with nothing recorded has nothing to stop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unproven_tensorrt_llm_ownership_fails_closed() {
+        use capyctl_adapters::traits::RuntimeError;
+        use capyctl_domain::completion::{Presence, ProcessIdentity};
+        assert!(!tensorrt_llm::reprove_ownership(&[]));
+        let gone = ProcessIdentity {
+            role: "api".into(),
+            pid: u32::MAX - 1,
+            boot_id: "boot".into(),
+            start_ticks: 1,
+        };
+        assert!(!tensorrt_llm::reprove_ownership(&[(gone, Presence::Gone)]));
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, ..) = tensorrt_llm_fixture(root.path(), identity_dir.path());
+        for error in [
+            RuntimeError::LaunchFailed("the engine exited before readiness".into()),
+            RuntimeError::Uncertain("readiness deadline reached with the engine alive".into()),
+            RuntimeError::LaunchFailed(
+                "kv_cache_short: TensorRT-LLM built a KV pool of 3200 tokens".into(),
+            ),
+        ] {
+            assert_eq!(
+                executor.stop_failed_tensorrt_llm("unknown", &error).await,
+                None,
+                "{error}"
+            );
+        }
+    }
+
     async fn gauge_stub(running: u64) -> u16 {
         let app = axum::Router::new().route(
             "/metrics",
@@ -5774,6 +6015,42 @@ mod tests {
              29500, not on loopback; the engine was stopped",
             "tp_rank_unobserved: no distinct rank process per GPU by the initialize timeout \
              (no owned process holds memory on gpu1 (rank 1))",
+        ] {
+            let text = launch_failure(&result, Some(engine));
+            assert_eq!(text, engine);
+            assert!(capyctl_protocol::execution::is_launch_failure_text(&text));
+        }
+    }
+
+    /// ADR 0038 §16: a TensorRT-LLM launch this host stopped at readiness
+    /// reports its closed code (`kv_cache_short` with both figures,
+    /// `engine_process_escaped` naming the process, `engine_listener_exposed`
+    /// naming the address and port) in one line the wire validation accepts,
+    /// never the exit summary.
+    // T49
+    #[test]
+    fn a_stopped_tensorrt_llm_launch_reports_its_closed_code() {
+        let result = pb::MemberExecutionResult {
+            state: "launched".into(),
+            processes: vec![pb::OwnedProcessObservation {
+                role: "api".into(),
+                pid: 10,
+                boot_id: "boot-that-never-reaped".into(),
+                start_ticks: 7,
+                presence: "gone".into(),
+                rank: None,
+            }],
+            ..Default::default()
+        };
+        for engine in [
+            "kv_cache_short: TensorRT-LLM built a KV pool of 3200 tokens, less than one \
+             request's window of 16384 tokens (max_seq_len); capyctl rendered max_tokens 29127; \
+             the engine was stopped",
+            "engine_process_escaped: process 102 (a descendant of the engine's api process 100) \
+             runs in process group 102, outside the launch's process group 100; the engine and \
+             the escaped process were stopped",
+            "engine_listener_exposed: the api process 100 listens on address 0.0.0.0 port 8101, \
+             not on loopback; the engine was stopped",
         ] {
             let text = launch_failure(&result, Some(engine));
             assert_eq!(text, engine);

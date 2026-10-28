@@ -127,3 +127,23 @@ fn a_llamacpp_spec_resolves_only_as_llamacpp() {
         Err(RuntimeError::Unsupported)
     ));
 }
+
+fn tensorrt_llm() -> AdapterSpec {
+    AdapterSpec::TensorrtLlm {
+        endpoint: "http://127.0.0.1:8000".parse().unwrap(),
+        fingerprint: "1.2.1".into(),
+        model_id: "m".into(),
+        launch: None,
+    }
+}
+
+// T49 (ADR 0038 §1): TensorRT-LLM resolves for its own family only.
+#[test]
+fn a_tensorrt_llm_spec_resolves_only_as_tensorrt_llm() {
+    assert_eq!(tensorrt_llm().engine(), Engine::TensorrtLlm);
+    assert!(resolve(Engine::TensorrtLlm, tensorrt_llm(), None).is_ok());
+    assert!(matches!(
+        resolve(Engine::Custom, tensorrt_llm(), None),
+        Err(RuntimeError::Unsupported)
+    ));
+}

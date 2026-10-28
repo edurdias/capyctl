@@ -463,7 +463,10 @@ approves an environment for each on host A.
 
 - `serve` is always named, so no model path is read as a subcommand.
 - `<launch dir>` is a CapyCTL-owned directory per launch, mode 0700, under the role's
-  runtime directory. `model/<served name>` is a symbolic link to the verified checkpoint
+  private rendezvous root (`<state>/rendezvous/<incarnation>`; amended at implementation:
+  the runtime directory is walked by the runtime-integrity check, which refuses symbolic
+  links, and the rendezvous root is already private, cleaned at role start and removed on
+  a verified stop). `model/<served name>` is a symbolic link to the verified checkpoint
   directory, so the served ID TensorRT-LLM lists is the name CapyCTL routes (evidence §2).
   A served name that is not one path component (empty, `.`, `..`, containing `/` or NUL,
   or longer than 255 bytes) is refused at resolution, `served_name_unsupported` (owner

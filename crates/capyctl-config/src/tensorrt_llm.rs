@@ -501,9 +501,21 @@ pub fn tokens_per_block(options: &Map<String, Value>) -> u32 {
         .unwrap_or(DEFAULT_TOKENS_PER_BLOCK)
 }
 
+/// ADR 0038 §3, §16: the closed resolution code of a served name that is
+/// not one path component.
+pub const SERVED_NAME_UNSUPPORTED: &str = "served_name_unsupported";
+
+/// ADR 0038 §4, §16: the closed launch failure of a launch whose built KV
+/// pool holds less than one request's window.
+pub const KV_CACHE_SHORT: &str = "kv_cache_short";
+
+/// ADR 0038 §9, §16: the closed launch failure of a launch with a
+/// descendant of its engine outside the launch's process group.
+pub const ENGINE_PROCESS_ESCAPED: &str = "engine_process_escaped";
+
 /// ADR 0038 §3: why a served name cannot be the name of the per-launch link,
 /// or `None`: it must be one path component (owner decision 2026-10-27,
-/// question 3). The reason leads with `served_name_unsupported`.
+/// question 3). The reason leads with [`SERVED_NAME_UNSUPPORTED`].
 pub fn served_name_refusal(name: &str) -> Option<String> {
     let problem = if name.is_empty() {
         "is empty"
@@ -519,7 +531,7 @@ pub fn served_name_refusal(name: &str) -> Option<String> {
         return None;
     };
     Some(format!(
-        "served_name_unsupported: the served name `{}` {problem}; TensorRT-LLM serves the \
+        "{SERVED_NAME_UNSUPPORTED}: the served name `{}` {problem}; TensorRT-LLM serves the \
          name of the model directory it is given, so CapyCTL links the checkpoint under the \
          served name, which must be one path component",
         name.escape_debug()

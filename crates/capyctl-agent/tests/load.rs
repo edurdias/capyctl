@@ -1262,3 +1262,67 @@ async fn a_custom_launch_reads_quiescent_only_on_its_idle_signal() {
         .iter()
         .all(|s| s.latency.as_ref().is_none_or(|l| l.engine.is_none())));
 }
+
+/// ADR 0038 §6: one TensorRT-LLM 1.2.1 `/metrics` read, two iteration
+/// entries oldest first (`cpp/tensorrt_llm/executor/jsonSerialization.cpp`).
+const TENSORRT_LLM_METRICS: &str = r#"[
+  {"iter": 41, "numActiveRequests": 1, "numQueuedRequests": 0, "gpuMemUsage": 1,
+   "kvCacheStats": {"maxNumBlocks": 910, "usedNumBlocks": 91, "freeNumBlocks": 819,
+     "tokensPerBlock": 32, "reusedBlocks": 0}},
+  {"iter": 42, "numActiveRequests": 3, "numQueuedRequests": 2, "gpuMemUsage": 1,
+   "kvCacheStats": {"maxNumBlocks": 910, "usedNumBlocks": 455, "freeNumBlocks": 455,
+     "tokensPerBlock": 32, "reusedBlocks": 0}}
+]"#;
+
+// T49 T17 (ADR 0038 §6, §7): a TensorRT-LLM sample is the newest iteration
+// entry's figures; a read with no entry, or whose newest entry lacks a
+// figure, carries none: unknown, never 0 running and 0 waiting, so it never
+// reads quiescent. No latency family is read from its body.
+#[tokio::test]
+async fn a_tensorrt_llm_sample_is_its_newest_iteration_entry_and_never_guessed() {
+    let newest = load::parse_tensorrt_llm_load(TENSORRT_LLM_METRICS.as_bytes()).unwrap();
+    assert_eq!(
+        (newest.running, newest.waiting, newest.kv_usage_ppm),
+        (3, 2, 500_000)
+    );
+    for unknown in [
+        "[]",
+        r#"[{"iter": 1, "numActiveRequests": 1, "numQueuedRequests": 0}]"#,
+        r#"[{"numActiveRequests": 1, "kvCacheStats": {"maxNumBlocks": 1, "usedNumBlocks": 0}}]"#,
+        "vllm:num_requests_running 0\n",
+        "not json",
+    ] {
+        assert!(
+            load::parse_tensorrt_llm_load(unknown.as_bytes()).is_none(),
+            "{unknown}"
+        );
+    }
+    let native = [7; 32];
+    let read = engine(native, TENSORRT_LLM_METRICS, Duration::ZERO).await;
+    let empty = engine(native, "[]", Duration::ZERO).await;
+    let source = std::sync::Arc::new(Launches(vec![
+        ("a-trtllm", read, native, load::LaunchSignal::Builtin),
+        ("b-trtllm-empty", empty, native, load::LaunchSignal::Builtin),
+    ]));
+    let reporter = LoadReporter::new(source, "host".into()).unwrap();
+    let all = samples(reporter.reports().await);
+    let engines: Vec<_> = all
+        .iter()
+        .map(|s| {
+            (
+                s.deployment_id.as_str(),
+                s.engine.map(|e| (e.running, e.waiting, e.kv_usage_ppm)),
+            )
+        })
+        .collect();
+    assert_eq!(
+        engines,
+        [
+            ("a-trtllm", Some((3, 2, 500_000))),
+            ("b-trtllm-empty", None)
+        ]
+    );
+    assert!(all
+        .iter()
+        .all(|s| s.latency.as_ref().is_none_or(|l| l.engine.is_none())));
+}

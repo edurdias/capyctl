@@ -18,7 +18,10 @@
 //! - ADR 0033 §3: a launch's LMCache server is alive, answers `GET /status`
 //!   and listens on loopback only (an exposed one is stopped), and none is
 //!   re-proved while the host's settings say `lmcache: off` or
-//!   `retention: zero` (§§9, 10), so its dispatch stays closed.
+//!   `retention: zero` (§§9, 10), so its dispatch stays closed;
+//! - ADR 0038 §9: a TensorRT-LLM launch has no descendant of its engine
+//!   outside its process group and no owned listener off loopback; one that
+//!   fails either is stopped, the escaped process proven gone beside it.
 //!
 //! Only then does the store reopen dispatch, with a readiness receipt in the
 //! journal. A failed proof leaves the deployment charged, closed and owned; an
@@ -47,8 +50,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// ADR 0030 §3: the bound on the fixed decision probe of an adopted
 /// decisions launch (an engine's first decision can be slow).
 const DECISION_TIMEOUT: Duration = Duration::from_secs(60);
-/// ADR 0031 §7: how long an exposed custom engine's processes get on
-/// SIGTERM before SIGKILL.
+/// ADR 0031 §7, ADR 0038 §9: how long an exposed custom engine's or an
+/// unowned TensorRT-LLM launch's processes get on SIGTERM before SIGKILL.
 const EXPOSED_GRACE: Duration = Duration::from_secs(5);
 /// The first wait after a failed proof, doubled per failure up to the cap.
 const FIRST_RETRY: Duration = Duration::from_millis(500);
@@ -92,6 +95,10 @@ struct Target {
     /// ADR 0031: a custom engine's manifest; its proof is the port, the
     /// health path, the API probe and the loopback check, never a model list.
     custom: Option<capyctl_config::custom::CustomProfile>,
+    /// ADR 0038: a TensorRT-LLM launch, with its profile's version; its
+    /// proof is `/health` and the served name listed, then the descendant
+    /// and listener checks (§9).
+    tensorrt_llm: Option<String>,
     /// ADR 0035 §5: a built-in engine's launch on several GPUs; its owned
     /// listeners are checked at every re-proof.
     several_gpus: bool,
@@ -294,6 +301,14 @@ impl LocalReadiness {
             ),
             _ => None,
         };
+        let tensorrt_llm = (effective["profile"]["engine"].as_str()
+            == Some(capyctl_config::engine_policy::Engine::TensorrtLlm.name()))
+        .then(|| {
+            effective["profile"]["build_fingerprint"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        });
         // ADR 0035 §5: the frozen revision's device list, rank-ordered, or
         // the rank processes the launch recorded.
         let several_gpus = custom.is_none()
@@ -310,6 +325,7 @@ impl LocalReadiness {
             served,
             decisions,
             custom,
+            tensorrt_llm,
             several_gpus,
         })
     }
@@ -361,6 +377,38 @@ impl LocalReadiness {
             }
         }
         check_owned_listeners(launch, false).await
+    }
+
+    /// ADR 0038 §5, §9: a TensorRT-LLM engine's proof: `/health` answers 200
+    /// and `/v1/models` lists the served name, then no descendant of the
+    /// engine runs outside the launch's process group and every owned
+    /// listener is on loopback. A launch that fails either is stopped, the
+    /// escaped processes proven gone beside the group, and the proof fails
+    /// `engine_process_escaped` or `engine_listener_exposed`.
+    async fn prove_tensorrt_llm(
+        &self,
+        launch: &LocalReadyLaunch,
+        target: &Target,
+        version: &str,
+    ) -> Result<(), String> {
+        use capyctl_adapters::traits::{EngineAdapter, MemberRef, Readiness};
+        let adapter = capyctl_adapters::tensorrt_llm::TensorrtLlmAdapter::new(
+            target.url.clone(),
+            version.to_owned(),
+            target.served.clone(),
+        );
+        let member = MemberRef {
+            deployment_id: launch.fence.deployment_id.clone(),
+            member_id: launch.binding_id.clone(),
+        };
+        let ready = tokio::time::timeout(PROBE_TIMEOUT, adapter.check_readiness(&member))
+            .await
+            .map_err(|_| "the engine's health and model list did not answer in time".to_owned())?
+            .map_err(|error| format!("the engine's readiness could not be read: {error}"))?;
+        if ready != Readiness::Ready {
+            return Err("the engine's health or model list does not name the route".into());
+        }
+        check_tensorrt_llm_ownership(launch).await
     }
 
     /// ADR 0033 §§3, 9, 10 (lifecycle design §5): re-prove the launch's
@@ -430,9 +478,10 @@ impl LocalReadiness {
         if !server.is_empty() {
             self.prove_lmcache(launch, &server).await?;
         }
-        match &target.custom {
-            Some(custom) => self.prove_custom(launch, &target, custom).await?,
-            None => self.prove_listed(&target).await?,
+        match (&target.custom, &target.tensorrt_llm) {
+            (Some(custom), _) => self.prove_custom(launch, &target, custom).await?,
+            (None, Some(version)) => self.prove_tensorrt_llm(launch, &target, version).await?,
+            (None, None) => self.prove_listed(&target).await?,
         }
         // ADR 0035 §5: a built-in engine's launch on several GPUs is checked
         // for listeners off loopback whenever it is re-proved; one is stopped
@@ -462,14 +511,21 @@ impl LocalReadiness {
                 ),
                     None => format!(
                     "every recorded engine process alive with its recorded start ticks and boot; \
-                     the engine answered an authenticated model list naming {}{}{}",
+                     the engine answered {} model list naming {}{}{}",
+                    if target.tensorrt_llm.is_some() {
+                        "its health and a"
+                    } else {
+                        "an authenticated"
+                    },
                     target.served,
                     if target.decisions {
                         " and the fixed decision probe"
                     } else {
                         ""
                     },
-                    if target.several_gpus {
+                    if target.tensorrt_llm.is_some() {
+                        "; no process outside the group and every owned listener is on loopback"
+                    } else if target.several_gpus {
                         "; every owned listener is on loopback"
                     } else {
                         ""
@@ -571,6 +627,11 @@ impl LocalReadiness {
             )
         };
         let receipt = match &target.custom {
+            // ADR 0038 §7: TensorRT-LLM reports no idle signal (no
+            // `/metrics` entry reads 0 and 0, and an empty read is
+            // ambiguous), so the leases are never settled while the engine
+            // runs, as for a custom engine without one below.
+            None if target.tensorrt_llm.is_some() => return Ok(()),
             // ADR 0031 §6: a custom engine's only account of its work is its
             // manifest's idle signal, read now with its key. Without one the
             // leases are never settled while the engine runs: they stay
@@ -726,6 +787,38 @@ async fn check_owned_listeners(launch: &LocalReadyLaunch, built_in: bool) -> Res
         }
         Err(unreadable) => Err(unreadable.to_string()),
     }
+}
+
+/// ADR 0038 §9: the descendant and listener checks of an adopted
+/// TensorRT-LLM launch's live processes. A launch that fails either is
+/// stopped with gone evidence required for every recorded process and, for
+/// an escape, for each escaped process (a group stop cannot reach it).
+async fn check_tensorrt_llm_ownership(launch: &LocalReadyLaunch) -> Result<(), String> {
+    let live = alive(&launch.identities)?;
+    let checked = tokio::task::spawn_blocking(move || {
+        capyctl_adapters::tensorrt_llm::check_ownership(
+            std::path::Path::new("/proc"),
+            &live,
+            &capyctl_launchers::process_absence::presence,
+        )
+    })
+    .await
+    .map_err(|_| "the ownership check did not run".to_owned())?;
+    let failure = match checked {
+        Ok(()) => return Ok(()),
+        Err(failure) if failure.code().is_some() => failure,
+        Err(unreadable) => return Err(unreadable.to_string()),
+    };
+    let set = failure.stop_set(&launch.identities);
+    let stopped = tokio::task::spawn_blocking(move || {
+        capyctl_launchers::owned_launch::terminate_recorded(&set, EXPOSED_GRACE)
+    })
+    .await
+    .map_err(|_| format!("{failure}; the stop did not run"))?;
+    Err(match stopped {
+        Ok(_) => format!("{failure}; the engine was stopped"),
+        Err(error) => format!("{failure}; the stop is unproven: {error}"),
+    })
 }
 
 /// Every recorded engine process is alive as recorded; `Unknown` is not alive.

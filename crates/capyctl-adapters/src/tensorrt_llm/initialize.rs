@@ -42,7 +42,7 @@ pub const EFFECTIVE_ARGS_MISMATCH: &str = "effective_args_mismatch";
 pub const INSTALLATION_DRIFT: &str = "installation_drift";
 /// ADR 0038 §4, §16: the closed failure of a launch whose built KV pool
 /// holds less than one request's window.
-pub const KV_CACHE_SHORT: &str = "kv_cache_short";
+pub use capyctl_config::tensorrt_llm::KV_CACHE_SHORT;
 
 fn now_ms() -> Result<i64, RuntimeError> {
     SystemTime::now()

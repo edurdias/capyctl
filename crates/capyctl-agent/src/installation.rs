@@ -1710,7 +1710,7 @@ mod tests {
         let marker = dir.path().join("ran");
         capyctl_config::test_support::write_executable(
             &bin.join("python3"),
-            &format!("#!/bin/sh\ntouch {}\n", marker.display()),
+            format!("#!/bin/sh\ntouch {}\n", marker.display()),
             0o755,
         )
         .unwrap();
