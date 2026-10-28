@@ -11,8 +11,8 @@ use crate::schema::{
     SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
     SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
     SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V49, SCHEMA_V5, SCHEMA_V50, SCHEMA_V51, SCHEMA_V52,
-    SCHEMA_V53, SCHEMA_V54, SCHEMA_V55, SCHEMA_V56, SCHEMA_V57, SCHEMA_V58, SCHEMA_V6, SCHEMA_V7,
-    SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V53, SCHEMA_V54, SCHEMA_V55, SCHEMA_V56, SCHEMA_V57, SCHEMA_V58, SCHEMA_V59, SCHEMA_V6,
+    SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -102,6 +102,8 @@ pub const MIGRATIONS: &[&str] = &[
     // ADR 0035 §§2, 3: GPU-set resolutions, each instance's chosen set and N,
     // and the measured peak and residue keyed by N.
     SCHEMA_V58,
+    // ADR 0040 §§4, 5, 7: browser sessions and one-time sign-in links.
+    SCHEMA_V59,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -457,6 +459,45 @@ mod tests {
             [&long],
         )
         .unwrap();
+    }
+
+    // T33 (ADR 0040 §§4, 5, 7, v59): migrating a v58 store keeps every existing
+    // row, adds the session and sign-in link tables empty, and stamps the
+    // store at `MIGRATIONS.len()`.
+    #[test]
+    fn v59_adds_ui_sessions_and_keeps_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        apply_through(&conn, 58).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version,revision) VALUES('a','a','model','ready',1,0,4,1,2);
+            INSERT INTO startup_measurements(deployment_id,revision,host_id,installation,tensor_parallel,domain,peak_bytes,step_id,measured_at_ms) VALUES('a',2,'host-a','vllm@1',2,'gpu0',12,'s1',7);
+            INSERT INTO enrolled_hosts(host_id,host_name,key_digest) VALUES('h1','lab','k1');"#,
+        )
+        .unwrap();
+        let rows = |conn: &Connection| -> (i64, i64, i64, i64) {
+            conn.query_row(
+                "SELECT (SELECT current_generation FROM deployments WHERE id='a'),
+                        (SELECT revision FROM deployments WHERE id='a'),
+                        (SELECT peak_bytes FROM startup_measurements WHERE tensor_parallel=2),
+                        (SELECT COUNT(*) FROM enrolled_hosts WHERE host_name='lab')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        };
+        let before = rows(&conn);
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(rows(&conn), before);
+        assert_eq!(before, (4, 2, 12, 1));
+        let n = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(n("SELECT COUNT(*) FROM ui_sessions"), 0);
+        assert_eq!(n("SELECT COUNT(*) FROM ui_signin_links"), 0);
+        assert_eq!(
+            n("SELECT MAX(version) FROM schema_migrations"),
+            MIGRATIONS.len() as i64
+        );
     }
 
     /// ADR 0019 §3 (v52): a startup peak recorded before the per-domain key

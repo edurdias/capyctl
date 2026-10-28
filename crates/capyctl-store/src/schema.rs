@@ -1299,6 +1299,38 @@ DROP TABLE parked_measurements;
 ALTER TABLE parked_measurements_v58 RENAME TO parked_measurements;
 "#;
 
+/// v59 (ADR 0040 §§4, 5, 7): browser sessions and one-time sign-in links.
+///
+/// - Both are keyed by the SHA-256 digest (32 bytes) of a 256-bit random
+///   token; the token itself is never stored.
+/// - Each records the fingerprint (32 bytes) of the admin token's digest it
+///   was issued under, so a role started with another admin token deletes
+///   them (§7).
+/// - A session's id is a random ULID, never its digest. Its label is a short
+///   name derived from the browser's user agent.
+/// - A link is spent by setting `consumed_at_ms`; it stays until pruned after
+///   its expiry, so a second use reads as used.
+///
+/// Additive and forward-only.
+pub const SCHEMA_V59: &str = r#"
+CREATE TABLE IF NOT EXISTS ui_signin_links(
+  token_digest BLOB PRIMARY KEY CHECK(typeof(token_digest)='blob' AND length(token_digest)=32),
+  admin_fingerprint BLOB NOT NULL CHECK(typeof(admin_fingerprint)='blob' AND length(admin_fingerprint)=32),
+  expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms>=0),
+  consumed_at_ms INTEGER CHECK(consumed_at_ms IS NULL OR consumed_at_ms>=0)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ui_signin_links_expiry ON ui_signin_links(expires_at_ms);
+CREATE TABLE IF NOT EXISTS ui_sessions(
+  session_id TEXT PRIMARY KEY CHECK(length(session_id)=26),
+  token_digest BLOB NOT NULL UNIQUE CHECK(typeof(token_digest)='blob' AND length(token_digest)=32),
+  admin_fingerprint BLOB NOT NULL CHECK(typeof(admin_fingerprint)='blob' AND length(admin_fingerprint)=32),
+  label TEXT NOT NULL CHECK(length(label)<=128),
+  created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0),
+  last_seen_at_ms INTEGER NOT NULL CHECK(last_seen_at_ms>=0),
+  cookie_refreshed_at_ms INTEGER NOT NULL CHECK(cookie_refreshed_at_ms>=0)
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
