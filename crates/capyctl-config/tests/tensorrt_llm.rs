@@ -13,8 +13,8 @@ use capyctl_config::engine_policy::{
 };
 use capyctl_config::lmcache::{engine_gate, LmcacheOffReason};
 use capyctl_config::registration::{is_verified, ENVIRONMENT_PROFILES};
-use capyctl_config::tensorrt_llm::{RESERVED_NEVER_RENDERED, RESERVED_RENDERED, TYPED_OPTIONS};
 use capyctl_config::tensorfold_native::TensorfoldLine;
+use capyctl_config::tensorrt_llm::{RESERVED_NEVER_RENDERED, RESERVED_RENDERED, TYPED_OPTIONS};
 use capyctl_config::ConfigErrorCode;
 use capyctl_domain::launch::{LaunchSettings, TensorrtLlmLaunchSettings};
 use serde_json::{json, Value};
@@ -355,7 +355,13 @@ fn every_reserved_spelling_is_refused() {
         Err(ProfileArgError::PathNotApproved(_))
     ));
     // Host-fixed arguments follow the same names.
-    assert!(validate_profile_args(Engine::TensorrtLlm, TensorfoldLine::Python, &args(&["--tp_size", "2"]), false).is_err());
+    assert!(validate_profile_args(
+        Engine::TensorrtLlm,
+        TensorfoldLine::Python,
+        &args(&["--tp_size", "2"]),
+        false
+    )
+    .is_err());
     validate_profile_args(
         Engine::TensorrtLlm,
         TensorfoldLine::Python,
