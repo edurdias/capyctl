@@ -35,7 +35,10 @@ Only the owner publishes a release. Contributors and automation stop at a draft.
      `scripts/verify-packaging.sh`, and uploads a `release-assets` artifact
      holding both tarballs, `install.sh` and `SHA256SUMS`. It never publishes.
    - Or build locally on one x86_64 and one aarch64 Linux machine with the same
-     Rust version: `packaging/release.sh dist` on each, copy both tarballs and
+     Rust version. First build the web UI from the same commit with Node 22
+     (`cd web && npm ci && npm run build`); `release.sh` refuses to package
+     when `web/dist/index.html` is missing or was built from another commit.
+     Then run `packaging/release.sh dist` on each, copy both tarballs and
      their `.sha256` files into one directory with `install.sh`, then run
      `packaging/release.sh --sums <dir>`.
 

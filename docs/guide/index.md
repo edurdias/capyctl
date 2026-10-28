@@ -29,6 +29,8 @@ Tasks:
 - [Parking and switching](parking.md): more models than your GPU holds.
 - [How requests wait and models switch](parking.md#how-requests-wait-and-models-switch):
   two apps, two models, one GPU.
+- [The web UI](web-ui.md): watch and run your setup from a browser on your
+  desktop or phone; sign in with `capyctl open ui`.
 - [Driving CapyCTL from a controller](controller.md): the management API
   from a program: create, start, watch, retry.
 - [Run in a container](../operations/install.md#running-in-a-container): a

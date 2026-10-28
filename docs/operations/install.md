@@ -187,6 +187,12 @@ Building needs stable Rust and the Protocol Buffers compiler `protoc` on
 distribution's package). A build over non-interactive SSH must see the same
 `PATH` as your login shell.
 
+A release also embeds the [web UI](../guide/web-ui.md). Build it in `web/`
+first, with Node 22, from the same commit: `npm ci && npm run build`.
+`release.sh` refuses to package when `web/dist/index.html` is missing or was
+built from another commit, and records the bundle's digest in `BUILDINFO`.
+A development build without it serves a page saying the build has no web UI.
+
 ## Installing with install.sh
 
 The project site serves the installer; each release also publishes a copy
@@ -752,6 +758,23 @@ The inference endpoint listens on `0.0.0.0:8443` and requires the API key.
 [Network access](network-access.md) shows where the key is, how to narrow the
 address to loopback or a Tailscale address, how to turn the key off (and why
 not to), and how to put a TLS reverse proxy in front for the internet.
+
+## Opening the web UI
+
+A server or standalone role serves the [web UI](../guide/web-ui.md) at `/ui/`
+on its management address. Sign a browser in from the machine, with the same
+state directory as the role:
+
+```bash
+sudo -u capyctl env CAPYCTL_STATE_DIR=/var/lib/capyctl/standalone capyctl open ui
+```
+
+It prints a one-time sign-in link and a QR code; the link works once, for 10
+minutes. On the default loopback address only a browser on the machine can
+use it. To reach the UI from a phone or laptop, allow the management listener
+off the machine with `remote: true` and bind a Tailscale address, or keep it
+on loopback behind `tailscale serve` with `public_address`
+([network access](network-access.md#web-ui-off-the-machine)).
 
 ## Command output
 
@@ -1402,6 +1425,9 @@ know. So:
   with the old binary. A restored store does not know about engines launched
   after the backup was taken; drain the affected hosts first (`capyctl drain
   host`), then stop the role, restore, and start it.
+- A restored store also brings back web UI sessions you revoked after the
+  backup was taken. After a restore, select **Revoke all sessions** in the
+  UI's **Settings**, then sign in again with `capyctl open ui`.
 - Never copy state between hosts or reuse a host's state under a different
   name: identities are bound to it. Losing a host's identity
   requires re-enrollment, not a copied directory.

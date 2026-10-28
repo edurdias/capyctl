@@ -1,0 +1,40 @@
+# Status: ADR 0040: a web UI built into the role, with browser sessions and off-box management — 2026-10-28 (branch `feat/web-ui`)
+
+ADR 0040 (owner decisions of 2026-10-27) adds a CapyCTL-branded web UI to the server and
+standalone roles, served under `/ui/` on the management listener and acting only through the
+management API. It amends ADR 0019 §10 and SPEC §16.5 (an opt-in off-box management
+listener: `remote: true`, `--management-remote`, `CAPYCTL_MANAGEMENT_REMOTE`, with
+`public_address` for sign-in links and the extra accepted origin), SPEC §13.3 and ADR 0031 §8
+(custom engines confirmed from the browser), ADR 0017 (host administration carried from the
+server to a host behind the `host_admin` capability) and ADR 0008 (deployment pinning and a
+fit check on the server). What changed: one composition point authorizes every management
+route for the admin token or a browser session; the admin token is accepted only from
+loopback or the connection's own local address and never with forwarding headers; sessions
+and one-time sign-in links live in the store by SHA-256 digest, with the `capyctl_session`
+cookie and the `X-CapyCTL-UI` and `Origin` request checks for plain HTTP; `capyctl open ui`
+prints a 10-minute sign-in link and a QR code; revoking a session ends its event streams,
+playground forwards and host-admin waits; rotating the admin token by restart ends every
+session and link; supported-action hints, a deployment check endpoint, host administration
+on standalone and server roles, and a playground route authorized by a session; the Svelte
+app in `web/`, embedded with `rust-embed`, built only by the release workflow, with
+`release.sh` refusing a missing or stale `web/dist/`. Tests land with each unit: the
+conformance tests ADR 0040 §Verification names, including the all-routes authorization
+test, the session store and rotation sweep, the cookie and request checks, and the web
+app's unit tests. CPU and Fake-engine tests are not qualification. The live
+check still needed: on the lab hosts, a server with a host against at least one native
+engine, signed in from a phone over a non-loopback address, before a release ships the UI.
+
+# Release note: New features
+
+- **A web UI.** A standalone role and a server now serve a web UI at `/ui/` on their
+  management address: watch models, hosts, engines and memory live; start, park, wake,
+  stop and delete models; add and edit deployments with a memory fit check; manage
+  engines, hosts, invitations and model copies; and chat with or test a model in the
+  playground. Sign a browser in with `capyctl open ui`, which prints a one-time link and a
+  QR code ([The web UI](../guide/web-ui.md)). The management listener stays on loopback
+  unless you set `remote: true` (`--management-remote`, `CAPYCTL_MANAGEMENT_REMOTE`); from
+  another machine only a signed-in browser is accepted, and `public_address` names the
+  address for sign-in links, for example behind `tailscale serve`
+  ([network access](../operations/network-access.md#web-ui-off-the-machine)). The store
+  moves to a new schema version, so an older binary refuses it; revoke all sessions after
+  restoring a state backup ([data retention](../operations/data-retention.md#web-ui-sessions-and-sign-in-links)).

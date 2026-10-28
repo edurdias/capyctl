@@ -78,7 +78,12 @@ A missing fixture is an unmet prerequisite, not a passing full runtime suite.
 For installer changes run `scripts/test-install.sh`. For packaging changes run
 `CAPYCTL_VERIFY_STRICT=1 scripts/verify-packaging.sh`; this additionally needs
 ShellCheck, `systemd-analyze` and the tools used by
-[the release script](packaging/release.sh). For website changes use Node as
+[the release script](packaging/release.sh). A local `packaging/release.sh` run
+or packaging check needs the web UI built first from the same commit, with
+Node 22: `cd web && npm ci && npm run build` (`release.sh` refuses to package
+without `web/dist/index.html` from that commit). For web UI changes run
+`npm ci`, `npm run check`, `npm run lint`, `npm test` and `npm run build` in
+`web/`. For website changes use Node as
 specified in `site/.nvmrc`, then run:
 
 ```bash
