@@ -1,11 +1,20 @@
 # ADR 0036 — Embedding models (`api: embeddings`, `POST /v1/embeddings`)
 
-**Status:** Proposed (2026-10-24), for the owner to decide. Target release 0.2.0 (retargeted from 0.1.9 on 2026-10-27, after 0.1.9 shipped with ADR 0035 only). Nothing
-is implemented; the SPEC, guide and operations texts this ADR lists change with the
-implementation, as for ADRs 0030 and 0033. The section "Open questions for the owner"
-lists what the owner has to decide, each with options and a recommendation.
+**Status:** Accepted (2026-10-27). Proposed 2026-10-24; the owner answered every open
+question on 2026-10-27 and named the models to qualify, and the answers are recorded below
+("Owner decisions of 2026-10-27"). Four answers differ from the recommendation: an older
+vLLM, SGLang or llama.cpp version runs embeddings as an uncertified custom setup instead of
+being refused (§1); vLLM and SGLang deployments park `deep` in 0.2.0 (§7.2); the answer is
+streamed through to the client, validated as it passes, with no size limit (§4); and a
+cut request runs to its end and settles on its answer (§4). Target release 0.2.0
+(retargeted from 0.1.9 on 2026-10-27, after 0.1.9 shipped with ADR 0035 only). Nothing is
+implemented; the SPEC, guide and operations texts this ADR lists change with the
+implementation, as for ADRs 0030 and 0033.
 **Amends (with the implementation):** `SPEC.md` §6.1 (readiness of a model that answers
-with a vector), §10 (the inference surface, request IDs, settlement of a cut request),
+with a vector, and its canary after every wake and restart), §6.2 (an embeddings
+deployment parks `deep` on vLLM and SGLang and restarts on llama.cpp), §9.1 and §9.2 (deep
+parking of a pooling server), §10 (the inference surface, an answer streamed through and
+validated as it passes, request IDs, settlement of a cut request on its answer),
 §15.1/§16 (a third `api` value), §20 (T47); ADR 0030 §1 (`api` gains `embeddings`); ADR
 0029 §6 (`--embedding` and `--pooling` stop being reserved for embeddings deployments);
 ADR 0014 §3 (vLLM's `--runner` and `--convert` and SGLang's `--is-embedding` become
@@ -156,16 +165,43 @@ embeddings (vLLM converts a generative checkpoint with `--convert embed`) is two
 revisions, and a revision that omits `api` keeps its fingerprint. An embeddings
 deployment gets no reasoning or tool-call parser (ADR 0024 applies to chat).
 
-Resolution refuses `api: embeddings` with `capability_missing:embeddings` on an
-installation that cannot serve it, read from the registered build:
+Resolution refuses `api: embeddings` with `capability_missing:embeddings` only on an
+installation that has no embeddings route to forward to, read from the registered build.
+Owner decision 2026-10-27, question 1, with the owner rule of that day: the combinations
+qualified live are advertised as certified, and any other version of an engine that serves
+embeddings runs as an uncertified custom setup; it is never refused for being uncertified.
 
-- **vLLM 0.32.0 or newer:** served, once row EM1 passes on 0.32.0 (open question 1).
-- **SGLang 0.5.22 or newer:** served, once row EM1 passes.
-- **llama.cpp v0.7.0 (b11669) or newer:** served, once row EM1 passes.
-- **TensorFold, every version:** refused. Neither 0.6.6 nor 1.1.4 documents an
-  embeddings route; TensorFold 1.0 is not yet an engine CapyCTL runs either.
+- **vLLM:** every version, rendered with `--runner pooling` (§2). 0.32.0 is certified once
+  the EM rows pass on it; 0.29.0 to 0.31.0 (0.30.0 and 0.31.0 are also on the hosts and
+  serve embeddings) and builds CapyCTL does not know run uncertified.
+- **SGLang:** every version, rendered with `--is-embedding`. 0.5.22 is certified once the
+  EM rows pass on it; 0.5.20, 0.5.21 and unknown builds run uncertified.
+- **llama.cpp:** every build, rendered with `--embeddings`. v0.7.0 (b11669) is certified
+  once the EM rows pass on it; every other build runs uncertified (`engine list` already
+  shows every llama.cpp build as custom).
+- **TensorFold, every version:** refused. Neither 0.6.6 nor 1.1.4 documents an embeddings
+  route, so there is nothing to forward to and no option to render; this is a missing
+  capability, not a refusal for being uncertified. TensorFold 1.0 is not yet an engine
+  CapyCTL runs either.
 - **Custom engines (ADR 0031):** a manifest's `api` gains `embeddings`, and a
-  deployment's `api` must equal it, as today (open question 8).
+  deployment's `api` must equal it, as today (owner decision 2026-10-27, question 8). The
+  probe of §5 and the canary of §6 apply as for native engines. A custom engine is never
+  certified; it runs as an uncertified custom setup.
+
+A build whose engine lacks the rendered option fails its start as any failed start does;
+CapyCTL does not refuse it in advance. [INFERENCE: no version below the certified ones
+was read or run for this ADR.]
+
+Certification is per engine version and checkpoint revision. The ten models of the live
+qualification, each at its pinned revision and on each engine that serves it, are
+certified once their rows pass; any other checkpoint runs uncertified, including a chat
+checkpoint served as embeddings, which is allowed as two revisions of the checkpoint
+(owner decision 2026-10-27, question 9). The combinations the engines' source shows
+unsupported are documented (Live qualification) and not refused: the engine fails to load
+the checkpoint and the start fails. Status shows an embeddings deployment `certified` or
+`uncertified`. The safety refusals of this ADR (the reserved options of §2, the closed
+request contract of §3, the residency and topology rules of §7) apply to every version and
+checkpoint alike.
 
 A host advertises the capability `embeddings` (ADR 0017). A server never places an
 embeddings deployment on a host without it (`host_capability_missing:embeddings`), so
@@ -217,66 +253,92 @@ The request has its own closed contract, OpenAI's:
   Matryoshka sizes and refuse it otherwise. llama.cpp ignores it, so on llama.cpp the
   router refuses a `dimensions` other than the deployment's native dimension (recorded
   at readiness, §5) with `400 invalid_request` saying llama.cpp returns full vectors
-  (open question 4).
+  (owner decision 2026-10-27, question 4).
 - `user`: a string, forwarded as chat forwards it.
 
 Any other field is refused with `400 invalid_request` naming it: `stream`, `cache_salt`
-(open question 10), vLLM's `messages`, `truncate_prompt_tokens`, `request_id`,
-`embed_dtype`, `endianness`, `use_activation`, SGLang's `rid`, `priority`, `lora_path`,
-`embed_overrides`, llama.cpp's `content` and `embd_normalize`, and multimodal input
-objects (open question 5). The router does not tokenize, truncate, normalize or batch
-(SPEC §10).
+(owner decision 2026-10-27, question 10), vLLM's `messages`, `truncate_prompt_tokens`,
+`request_id`, `embed_dtype`, `endianness`, `use_activation`, SGLang's `rid`, `priority`,
+`lora_path`, `embed_overrides`, llama.cpp's `content` and `embd_normalize`, and multimodal
+input objects (owner decision 2026-10-27, question 5). The router does not tokenize,
+truncate, normalize or batch (SPEC §10).
 
 The request goes to the engine's `/v1/embeddings` as one JSON body with `model` replaced
-by the served name, and the answer comes back whole with `model` replaced by the public
-name; nothing else in it is rewritten (vLLM's `id` and `created` stay, SGLang's and
-llama.cpp's absence of them stays).
+by the served name. The answer is streamed back to the client as it arrives, with `model`
+replaced by the public name on the way (§4); nothing else in it is rewritten (vLLM's `id`
+and `created` stay, SGLang's and llama.cpp's absence of them stays).
 
-### 4. Evidence, answer size and settlement
+### 4. A streamed answer, its evidence and settlement
 
-**Completion.** An answer is completion when it is a whole JSON object, read within the
-answer limit below, with `object: "list"` and a `data` array holding exactly one entry
-per input, whose `index` values are 0 to n−1 each once, whose `embedding` values are, for
-`float`, arrays of finite numbers all of one length, or, for `base64`, strings all
-decoding to the same whole number of 4-byte values, and, when `dimensions` was
-asked, of that length. `usage.prompt_tokens`, when present, is a non-negative integer.
-An engine 400, 413 or 422 with a complete JSON body is a rejection, relayed as
-`engine_rejected` (SPEC §10): an input longer than the model's limit, a `dimensions` the
-model does not support. Anything else, including a whole answer that fails these checks,
-leaves the request uncertain, as for decisions: the engine may have run it, so it is not
-replayed.
+**The answer is streamed through** (owner decision 2026-10-27, question 6). A batch of
+2048 inputs of 4096 floats is up to about 200 MB as JSON text, so the router neither reads
+the answer whole nor caps its size. When the engine answers HTTP 200, the router relays the
+answer to the client as its bytes arrive, through an incremental parser that knows one
+fixed JSON shape and keeps only its own state, never the answer:
 
-**Answer size.** A batch of 2048 inputs of 4096 floats is up to about 200 MB as JSON
-text, so the decision limit of 16 MiB is not enough and nothing larger may be read
-unbounded. The answer is read whole up to a fixed `EMBEDDING_RESPONSE_LIMIT` of 64 MiB
-(open question 6). To keep an engine from computing an answer the router will then
-refuse to read, the router refuses before forwarding, with `413 request_too_large`, a
-request whose answer could exceed the limit: number of inputs × dimension × the worst
-case per value (24 bytes for `float`, 6 for `base64`), plus 256 bytes per input. The
-dimension is `dimensions` when given, else the native dimension recorded at readiness.
-The message names the limit and suggests `base64` or fewer inputs. With 1024-dimension
-vectors every batch the contract allows fits (2048 inputs in `float` are at most about
-51 MB); with 2560 dimensions a `float` batch is refused above 1,087 inputs, and with 4096
-above 680, while 2048 inputs fit in `base64` at either size. [INFERENCE: arithmetic,
-64 MiB ÷ (dimension × 24 + 256).]
+- a top-level object with `object`, `data`, `model` and `usage`, in any order;
+- `data`, an array of entry objects, each with `object`, `index` and `embedding`;
+- `model`, a string, replaced by the public name on the fly whether it comes before or
+  after `data`: the parser drops the engine's value as it passes (SGLang's is its model
+  path, not the served name) and writes the public name in its place;
+- `usage`, an object whose `prompt_tokens` and `total_tokens`, when present, are
+  non-negative integers.
+
+Other members, at the top level or in an entry (vLLM's `id` and `created`, llama.cpp's
+per-entry `encoding_format`), are relayed unchanged once they parse as JSON values.
+While the bytes pass, the parser checks each entry: its `index` is one of 0 to n−1 and not
+seen before (one bit per input); a `float` embedding is an array of finite numbers, of the
+first vector's length and, when `dimensions` was asked, of that length; a `base64`
+embedding is a string of the base64 alphabet that decodes to a whole number of 4-byte
+values, the same number for every entry. A number longer than 64 bytes, a member name
+longer than 256 bytes or nesting deeper than 32 levels is malformed, so the parser's state
+stays bounded whatever the engine sends. The response to the client carries no
+`Content-Length`, since the rewritten `model` and the added `capyctl.metrics` (§9) change
+the length.
+
+**Completion.** An answer is completion when it has ended and every check has passed:
+`object` is `"list"`, `data` held exactly one entry per input with every index seen, and
+the JSON is whole. The router withholds the top-level object's closing brace until then,
+and writes `capyctl.metrics` and the brace only after the last check, so a client receives
+a whole JSON document only for an answer that passed. An engine 400, 413 or 422 with a
+complete JSON body is a rejection, read whole as engine error answers are today and
+relayed as `engine_rejected` (SPEC §10): an input longer than the model's limit, a
+`dimensions` the model does not support. Anything else leaves the request uncertain, as
+for decisions: the engine may have run it, so it is not replayed.
+
+**The consequence of streaming.** A malformed answer is detected only after part of it
+has reached the client. The router then stops relaying and ends the response without the
+closing brace; the client already has HTTP 200 and receives an incomplete JSON body, which
+no JSON parser accepts. The request is uncertain, as before. The same holds when the
+engine closes the connection before the answer ends. In exchange, no batch the contract
+allows is refused for its answer's size, in `float` or in `base64`, and the router's
+memory does not grow with the answer. The proposal's 64 MiB `EMBEDDING_RESPONSE_LIMIT`
+and its `413 request_too_large` refusal before forwarding are dropped.
 
 **Request IDs.** The caller's `X-Request-Id` is checked, echoed on the answer or error,
 and never forwarded, exactly as for chat and decisions (SPEC §10, note of 2026-10-19).
-CapyCTL's own request ID is not sent to the engine in the first version, on any engine:
-SGLang needs one `rid` per input of a batch, and the settlement below does not use one
-(open question 7). The ingress consumes CapyCTL's request ID header and does not set `rid` on
+CapyCTL's own request ID is not sent to the engine, on any engine: SGLang needs one `rid`
+per input of a batch, and the settlement below needs none (owner decision 2026-10-27,
+question 7). The ingress consumes CapyCTL's request ID header and does not set `rid` on
 embeddings.
 
-**Cancellation and settlement.** There is no stream: a client that hangs up, or a
-request cut by its deadline, drops the engine request, which closes the engine
-connection; vLLM (`with_cancellation`), SGLang (its tokenizer's disconnect check) and
-llama.cpp (`should_stop`) then abort it. The lease is `cancelling`. An embedding answer
-is all or nothing, so a cut embedding request was never answered: it settles only at its
-instance's next verified stop (SPEC §10, amendment of 2026-10-21, owner decision 6),
-and when such requests alone fill the deployment's 32 places CapyCTL restarts the
-instance and journals `instance_restarted_for_held_requests` (ADR 0032 §7). A complete
-engine error answer is answered, as today, and settles on the engine's idle reading.
-Park, idle park and switch drains treat embedding requests as they treat decisions.
+**Cancellation and settlement** (owner decision 2026-10-27, question 7). A cut embedding
+request runs to its end and settles on its answer. A client that hangs up, or a request
+cut by its deadline, no longer drops the engine request: the router keeps the engine
+connection open and keeps reading and checking the answer to its end, relaying nothing
+more to the client. vLLM's `with_cancellation`, SGLang's disconnect check and llama.cpp's
+`should_stop` therefore do not fire, and the engine finishes the request. The lease is
+`cancelling` meanwhile. When the answer is completion by the rules above, the request
+settles on it, the completion evidence SPEC §10 already accepts, and its place and charge
+are released then. A complete engine error answer is answered, as today, and settles on
+the engine's idle reading. Only a cut request whose answer never completes (the engine
+closes the connection, the answer is malformed, or the instance stops first) keeps
+today's rule: it settles at its instance's next verified stop (SPEC §10, amendment of
+2026-10-21, owner decision 6 of that date), and when such requests alone fill the
+deployment's 32 places CapyCTL restarts the instance and journals
+`instance_restarted_for_held_requests` (ADR 0032 §7). Park, idle park and switch drains
+treat an embedding request as they treat a decision, and a cut one whose answer is still
+being read as in flight until it settles.
 
 ### 5. Readiness is a fixed embedding
 
@@ -298,30 +360,31 @@ with `index` 0 and an `embedding` of at least one finite number whose Euclidean 
 finite and above 1e-6. The vector does not have to be normalized (vLLM and llama.cpp
 normalize by default, a pooler setting can turn that off). The answer's length is
 recorded as the instance's native dimension, used by §3 and §4. This holds at start,
-after a restart, and when a host or a restarted standalone role re-proves a retained
-launch; `/health` and `/v1/models` alone are never readiness (SPEC §6.1), and an
-embeddings deployment is never sent a chat probe in place of it. The kind and version are
-recorded with the reference (§6); any change to the request is a new version, and a
-reference recorded by another version is never compared with it.
+after a restart, after a wake (§7.2), and when a host or a restarted standalone role
+re-proves a retained launch; `/health` and `/v1/models` alone are never readiness (SPEC
+§6.1), and an embeddings deployment is never sent a chat probe in place of it. The kind
+and version are recorded with the reference (§6); any change to the request is a new
+version, and a reference recorded by another version is never compared with it.
 
 ### 6. The wake canary compares vectors with a tolerance
 
 The first ready answer is recorded as the reference: the dimension and the vector, stored
-as little-endian float32 (4 KiB for 1024 dimensions) beside the kind, version and
-tolerance (a new stored form beside `StoredDecisionCanary`). A later check passes when the
-dimension is the same and the relative distance `‖v − r‖ / ‖r‖` is at most the tolerance;
-otherwise it fails `wake_mismatch` and the instance is stopped, as today. For unit
-vectors a relative distance `d` is a cosine similarity of `1 − d²/2`.
+as little-endian float32 (10 KiB for Qwen3-Embedding-4B's 2560 dimensions) beside the
+kind, version and tolerance (a new stored form beside `StoredDecisionCanary`). A later
+check passes when the dimension is the same and the relative distance `‖v − r‖ / ‖r‖` is
+at most the tolerance; otherwise it fails `wake_mismatch` and the instance is stopped, as
+today. For unit vectors a relative distance `d` is a cosine similarity of `1 − d²/2`.
 
-The tolerance is set from row EM3's measurements plus a stated margin, and no number is
-committed before that (open question 3). The proposal to measure against is 0.02 (cosine
-0.9998 for unit vectors): the probe goes to an engine with no other traffic at start and
-after a restart, BF16 vectors of one input move slightly with batching and kernel choice
-[INFERENCE, not measured], and a model loaded wrong gives an unrelated vector, far beyond
-that.
+The tolerance is set from row EM3's largest measured distance plus a stated margin, and no
+number is committed before that; the figure EM3 is checked against is 0.02 (cosine 0.9998
+for unit vectors) (owner decision 2026-10-27, question 3). The probe goes to an engine with
+no other traffic at start, after a restart and after a wake; BF16 vectors of one input
+move slightly with batching and kernel choice [INFERENCE, not measured], and a model
+loaded wrong gives an unrelated vector, far beyond that.
 
-With §7.2, an embeddings deployment does not park, so in the first version the check runs
-after a restart of a deployment that has a reference, and is the basis for parking later.
+The check runs after every wake of a parked vLLM or SGLang deployment (§7.2), before the
+woken instance takes a request, and after every restart of a deployment that has a
+reference, on every engine.
 
 ### 7. Scope of the first version
 
@@ -329,12 +392,24 @@ after a restart of a deployment that has a reference, and is the basis for parki
    it is not combined with ADR 0035's several GPUs on one host: the embedding models in
    this release fit one GB10 or one discrete card, and group readiness, stall detection
    and the group canary would each need an embedding form.
-2. **Restart instead of park.** An embeddings deployment resolves `restart_only`, and
-   `deep` or `host_backed` is refused. The models start in seconds, llama.cpp cannot
-   park, and neither vLLM's sleep mode nor SGLang's memory release has been read or run
-   with a pooling server (open question 2).
+2. **Deep parking on vLLM and SGLang, restart on llama.cpp** (owner decision 2026-10-27,
+   question 2; the owner first answered `restart_only` and then reversed it). A vLLM or
+   SGLang embeddings deployment parks `deep` with the calls a chat deployment's `deep`
+   park uses (vLLM's sleep and wake, SGLang's release, resume and reload) and their
+   protections (ADR 0012), and the canary of §6 runs after every wake. A deployment that
+   states no residency resolves `deep` on vLLM and SGLang, on a discrete host too;
+   `host_backed` is refused, since row EM9 qualifies `deep` on host A, a unified GB10,
+   where `host_backed` does not apply. Neither engine's sleep path has been read or run
+   with a pooling server; row EM9 (park and wake with the canary after every wake)
+   qualifies it per engine. If EM9 fails on an engine, that engine's embeddings
+   deployments resolve `restart_only` in 0.2.0 and a stated `deep` is refused
+   `capability_missing:deep_park`, as ADR 0035 §9 gates deep parking per engine: a failed
+   row is a known fault, not a missing certification. An uncertified version of vLLM or
+   SGLang (§1) parks as the certified one does, and the wake canary checks every wake.
+   llama.cpp, which cannot park, and custom engines resolve `restart_only`, and `deep` or
+   `host_backed` is refused there as for chat.
 3. **Text only.** Multimodal inputs (vLLM's `messages`, SGLang's and llama.cpp's content
-   objects) are refused (open question 5).
+   objects) are refused (owner decision 2026-10-27, question 5).
 
 ### 8. Accounting
 
@@ -342,11 +417,12 @@ An embedding request generates nothing: no output tokens, no decode. Admission a
 reserves no generated tokens, so nothing changes there. Memory is sized as for the same
 checkpoint today (weights, KV and margin): the engine holds KV only while it reads each
 input, so the KV an embeddings deployment needs is about its concurrent inputs times
-their length, small beside a chat model's. For Qwen3-Embedding-0.6B (28 layers, 8 KV
-heads of 128, BF16) that is 112 KiB a token, 3.5 GiB for one full 32,768-token input.
-CapyCTL keeps today's sizing rules and the recipes declare small requests (open question
-11). [INFERENCE: encoder-only checkpoints may need no KV at all on vLLM; row EM1 records
-the peak.]
+their length, small beside a chat model's. For Qwen3-Embedding-8B (36 layers, 8 KV heads
+of 128, BF16, per its `config.json`) that is 144 KiB a token, 4.5 GiB for one full
+32,768-token input. CapyCTL keeps today's sizing rules and the recipes declare small
+requests, revisited with EM1's peaks (owner decision 2026-10-27, question 11).
+[INFERENCE: arithmetic, 36 × 8 × 128 × 2 × 2 bytes a token; encoder-only checkpoints may
+need no KV at all on vLLM; row EM1 records the peak.]
 
 Waiting accounts a request's body bytes as for chat; an embeddings deployment's requests
 count against the same per-deployment bound of 32.
@@ -357,10 +433,11 @@ The router records embedding requests in its latency series
 (`crates/capyctl-router/src/timing.rs:47-58`, published as JSON at
 `GET /management/v1/metrics/latency`) as it records decisions: queue wait, activation
 wait, selection, lease grant, pre-forward, first byte and total; not time to first
-content or to the last chunk, which have no meaning without a stream. The answer carries
-`capyctl.metrics` with the figures that describe an embedding, each labelled with its
-source: `total_ms` and `time_to_response_ms` (router), `input_tokens` (engine: the
-answer's `usage.prompt_tokens`) and `inputs` (router: the number of inputs). A figure
+content or to the last chunk, which have no meaning for an answer that is not a stream of
+tokens. The answer carries, written before its closing brace (§4), `capyctl.metrics` with
+the figures that describe an embedding, each labelled with its source: `total_ms` and
+`time_to_response_ms` (router), `input_tokens` (engine: the answer's
+`usage.prompt_tokens`) and `inputs` (router: the number of inputs). A figure
 nobody measured is absent, never zero; time to first token, decode speed, `queue_ms`,
 `prefill_ms` and `cached_tokens` are not reported for embeddings, since no engine puts
 them in its embedding answer. Whether each engine's running and waiting gauges count
@@ -373,31 +450,42 @@ requests through the same scheduler or slots as generation, so they should be co
 
 The ingress permits `POST /v1/embeddings` besides chat and decisions, with its own
 closed validator (the contract of §3, the `model` equal to the bound served name) and the
-same 8 MiB body limit. It relays the answer unchanged; the router bounds it (§4).
+same 8 MiB body limit. It relays the answer unchanged as its bytes arrive, without reading
+it whole; the router checks it and rewrites `model` (§4).
 
 ## Consequences
 
 - Clients that embed documents and questions can use the same CapyCTL endpoint and API
   key as their chat model, and an embedding model shares a GPU with a chat model through
-  the ordinary switching of SPEC §10.
+  the ordinary switching of SPEC §10: on vLLM and SGLang it parks `deep` and wakes on
+  request, checked by the canary after every wake; on llama.cpp it is stopped and
+  restarted.
 - Every place that proves readiness gains an embedding branch (adapters, agent,
-  controller, the stored canary); the fake engine gains an embeddings mode, so CPU tests
-  cover routing, accounting, readiness and the canary. CPU and Fake-engine tests are not
-  qualification.
-- A cut embedding request settles only at the next verified stop. A client that times out
-  often can fill the deployment's 32 places with held requests, and ADR 0032 §7 then
-  restarts the instance; for a model that starts in seconds that is short, but it is a
-  restart (open question 7).
-- A large `float` batch is refused before it runs (§4); clients that embed thousands of
-  documents at once batch in smaller requests or use `base64`, which the OpenAI Python
-  client already sends when the caller names no format, and decodes as float32
-  ([`lib/_parsing/_embeddings.py`](https://github.com/openai/openai-python/blob/main/src/openai/lib/_parsing/_embeddings.py),
+  controller, the wake path, the stored canary); the fake engine gains an embeddings mode
+  with sleep and wake, so CPU tests cover routing, the streamed answer, accounting,
+  readiness, parking and the canary. CPU and Fake-engine tests are not qualification.
+- A malformed answer is detected only after part of it has reached the client (§4): the
+  client has HTTP 200 and an incomplete body that no JSON parser accepts, and the request
+  is uncertain, as before. In exchange, no batch the contract allows is refused for the
+  size of its answer, and the router's memory does not grow with the answer.
+- A cut embedding request keeps running on the engine, which spends that work for nobody;
+  the waste is bounded by one request, and the request settles on its answer instead of
+  holding its place until the next verified stop. ADR 0032 §7's restart for held requests
+  remains only for cut requests whose answer never completes.
+- An older engine version, a custom engine or a checkpoint outside the ten runs as an
+  uncertified custom setup: CapyCTL serves it with the same safety refusals and checks,
+  promises nothing about it, and status shows it `uncertified`. A fault there shows as a
+  failed start, an uncertain answer or `wake_mismatch`; it is not prevented in advance.
+- The OpenAI Python client sends `base64` when the caller names no format, and decodes it
+  as float32 ([`lib/_parsing/_embeddings.py`](https://github.com/openai/openai-python/blob/main/src/openai/lib/_parsing/_embeddings.py),
   lines 34-38 and 55-56, read 2026-10-24). Most clients therefore exercise the `base64`
-  path first.
-- Recipes gain an embedding form: latency at p50 and p95 by batch size and input length,
-  inputs per second as users increase, peak memory, start time, and a retrieval score on
-  a pinned public set, without tokens per second. `capyctl-bench` (in the recipes
-  repository) gains an embeddings mode.
+  path first; `float` batches of any size stream as well.
+- Recipes gain an embedding form: one recipe per certified model and engine, pinning the
+  checkpoint revision (and, on llama.cpp, the GGUF), with latency at p50 and p95 by batch
+  size and input length, inputs per second as users increase, peak memory, start time,
+  park and wake times on vLLM and SGLang, and a retrieval score on a pinned public set,
+  without tokens per second. The combinations an engine does not support are listed with
+  the reason. `capyctl-bench` (in the recipes repository) gains an embeddings mode.
 - vLLM's `--runner` and `--convert` and SGLang's `--is-embedding` become reserved for
   chat deployments too; a profile or deployment that passes them today is refused with
   the existing reserved-option reason after the upgrade.
@@ -420,154 +508,235 @@ same 8 MiB body limit. It relays the answer unchanged; the router bounds it (§4
 - **Cosine similarity as the canary measure.** Equivalent for normalized vectors, but it
   ignores a change of scale on a deployment that turned normalization off; the relative
   distance catches both.
-- **Reading an answer of any size.** Rejected: the router holds the whole answer in
-  memory; a limit with a refusal before forwarding keeps the engine from running work
-  nobody will receive.
+- **The qualified versions as floors, older ones refused** (the proposal's
+  recommendation). Rejected by the owner (decision 2026-10-27, question 1, and the owner
+  rule of that day): an older version that serves embeddings runs uncertified.
+- **`restart_only` in the first version** (the proposal's recommendation). Rejected by the
+  owner (decision 2026-10-27, question 2): vLLM and SGLang park `deep`, qualified by EM9.
+- **Reading the answer whole up to a fixed 64 MiB, and refusing before forwarding a
+  request whose answer could exceed it** (the proposal's recommendation). Rejected by the
+  owner (decision 2026-10-27, question 6): it refused ordinary `float` batches of large
+  vectors (above 680 inputs at 4096 dimensions) and held the whole answer in memory.
+  Its one advantage, that a malformed answer never reached the client, is lost (§4).
+- **The decision limit of 16 MiB, or a role setting for the limit.** Rejected with the
+  limit itself (question 6).
+- **Reading an answer of any size whole.** Rejected: the router would hold an unbounded
+  answer in memory; streaming it through needs no limit and holds none of it.
+- **Settling a cut embedding only at the next verified stop** (the proposal's
+  recommendation). Rejected by the owner (decision 2026-10-27, question 7): an embedding
+  request is short and bounded, unlike a generation, so running it to its end settles it
+  on completion evidence instead of holding it, and restarting, until a stop. It remains
+  the fallback for a cut request whose answer never completes.
+- **Extending ADR 0032's abort to SGLang embeddings**, with `rid` as `<request ID>_<i>`
+  per input. Not taken (question 7): on 0.5.22 the abort echo carries no `embedding`
+  (`managers/tokenizer_manager.py:3624-3640`), so the handler, which reads
+  `ret_item["embedding"]` (`serving_embedding.py:292`), fails rather than answering a
+  final output [INFERENCE: probably an HTTP 500 from its error path, not run].
 - **Settling a cut embedding on the engine's idle reading.** Unsound under owner
-  decision 6 of 2026-10-21: the request was never answered, so the engine may still run
-  it.
+  decision 6 of 2026-10-21: an idle reading does not show that this request's answer
+  ended.
 
 ## Implementation plan (target 0.2.0)
 
 1. **Config.** `DeploymentApi::Embeddings` (`crates/capyctl-config/src/effective.rs`), a
-   new `embeddings.rs` beside `decisions.rs` with the engine floors, the topology and
-   residency refusals and `restart_only`; vLLM `--runner`/`--convert` and SGLang
-   `--is-embedding` reserved (`engine_policy.rs`); llama.cpp `--pooling` ordinary on
-   embeddings deployments, `none` refused (`llamacpp.rs`); LMCache off with
-   `embeddings_unsupported` (`lmcache.rs`); the custom manifest's `api` gains
-   `embeddings` (`custom.rs`).
+   new `embeddings.rs` beside `decisions.rs` with the certified engine versions (for
+   status, never a refusal), the TensorFold refusal, the topology refusal and the
+   residency rules of §7.2 (`deep` on vLLM and SGLang behind each engine's support data,
+   `host_backed` refused, `restart_only` on llama.cpp and custom engines); vLLM
+   `--runner`/`--convert` and SGLang `--is-embedding` reserved (`engine_policy.rs`);
+   llama.cpp `--pooling` ordinary on embeddings deployments, `none` refused
+   (`llamacpp.rs`); LMCache off with `embeddings_unsupported` (`lmcache.rs`); the custom
+   manifest's `api` gains `embeddings` (`custom.rs`).
 2. **Protocol.** The host capability `embeddings`, the embedding probe requirement and
    `host_capability_missing:embeddings` (`crates/capyctl-protocol/src/capabilities.rs`).
-3. **Adapters.** Rendering per §2 (vLLM `args.rs`, SGLang and llama.cpp launch); in
-   `forward.rs`, `EMBEDDING_REQUEST_FIELDS`, `validate_embedding_request`, `embed()`,
-   `embedding_answered` and `EMBEDDING_RESPONSE_LIMIT`; `embedding_probe.rs`; each
-   adapter's initialize chooses the probe by API.
-4. **Router.** A third `Endpoint` (`endpoint.rs`), the route (`lib.rs`), the collected
-   path shared with decisions (`chat.rs`), the pre-forward answer-size refusal, the
-   llama.cpp `dimensions` refusal, and `capyctl.metrics` (`engine_metrics.rs`).
-5. **Agent and controller.** The ingress path and validator (`ingress.rs`); the retained
-   re-proof by API (`native_execution.rs`, `local_readiness.rs`); the native dimension
-   recorded with the launch's readiness.
+3. **Adapters.** Rendering per §2, with the sleep-mode and memory-saver options a `deep`
+   chat deployment renders on vLLM and SGLang; in `forward.rs`,
+   `EMBEDDING_REQUEST_FIELDS`, `validate_embedding_request`, `embed()`, the incremental
+   answer parser and `model` rewriter of §4, and `embedding_answered`;
+   `embedding_probe.rs`; each adapter's initialize and wake choose the probe by API.
+4. **Router.** A third `Endpoint` (`endpoint.rs`), the route (`lib.rs`), a streamed path
+   beside the collected one of decisions (`chat.rs`) that withholds the closing brace
+   until the answer passed, the llama.cpp `dimensions` refusal, a cut request read to its
+   end and settled on its answer, and `capyctl.metrics` (`engine_metrics.rs`).
+5. **Agent and controller.** The ingress path, its validator and its streamed relay
+   (`ingress.rs`); the retained re-proof by API (`native_execution.rs`,
+   `local_readiness.rs`); the native dimension recorded with the launch's readiness;
+   park and wake of embeddings deployments with the canary after every wake.
 6. **Store.** `StoredEmbeddingCanary` (dimension, vector, tolerance, kind, version) and
    its comparison (`crates/capyctl-store/src/wake_canary.rs`,
-   `crates/capyctl-controller/src/wake_canary.rs`), with a migration.
+   `crates/capyctl-controller/src/wake_canary.rs`), with a migration; the settlement of a
+   cut embedding request on its answer.
 7. **Fake engine.** An embeddings mode in `crates/capyctl-testkit/src/fake_engine.rs`
-   returning set vectors, refusing chat and decisions.
-8. **Docs.** The SPEC texts below; `docs/guide/requests.md` ("Embedding requests"),
-   `docs/guide/deploy.md` ("Embedding models"), `docs/guide/engines.md` (each engine's
-   flags and limits), `docs/guide/errors.md` (`api_mismatch`, `invalid_request` and
-   `request_too_large` on `/v1/embeddings`), `docs/operations/configuration.md` (`api`,
-   the manifest value), `docs/operations/network-access.md` (the ingress paths); one
-   change file with the release note.
+   returning set vectors in chunks, with `model` before or after `data`, malformed or
+   broken answers on demand, sleep and wake, and refusing chat and decisions.
+8. **Docs.** The SPEC texts below; `docs/guide/requests.md` ("Embedding requests", the
+   incomplete body of an answer that failed its checks), `docs/guide/deploy.md`
+   ("Embedding models", parking per engine), `docs/guide/engines.md` (each engine's flags
+   and limits, the certified combinations and the documented unsupported ones),
+   `docs/guide/errors.md` (`api_mismatch` and `invalid_request` on `/v1/embeddings`),
+   `docs/operations/configuration.md` (`api`, the manifest value),
+   `docs/operations/network-access.md` (the ingress paths); one change file with the
+   release note. In the recipes repository, the recipes and `capyctl-bench` mode of the
+   Consequences.
 
 SPEC texts to land with the implementation: §6.1 (an embeddings deployment is ready on
-the fixed embedding of ADR 0036 §5, its canary compares vectors within a tolerance,
-restart only); §10 (the inference surface includes non-streaming `POST /v1/embeddings`
-for `api: embeddings`, its closed contract, the answer limit and the refusal before
-forwarding, settlement of a cut request at the next verified stop); §15.1 (`api`:
-`chat`, `decisions` or `embeddings`); §20 (T47).
+the fixed embedding of ADR 0036 §5, and its canary compares vectors within a tolerance
+after every wake and restart); §6.2 (an embeddings deployment parks `deep` on vLLM and
+SGLang, `host_backed` refused, `restart_only` on llama.cpp and custom engines); §9.1 and
+§9.2 (deep parking of a pooling server); §10 (the inference surface includes non-streaming
+`POST /v1/embeddings` for `api: embeddings`, its closed contract, the answer streamed
+through with incremental checks and `model` rewritten, with no answer limit, and a cut
+request run to its end and settled on its answer, at the next verified stop only when no
+complete answer arrives); §15.1 (`api`: `chat`, `decisions` or `embeddings`); §20 (T47).
 
 Tests, tagged **T47 — embedding models**: `api: embeddings` resolves and round-trips
-through the frozen revision, and is refused on an engine without the capability
-(`capability_missing:embeddings`, TensorFold and versions below the floors), with a
-`topology`, with a parking residency, with a stated parser and with `lmcache:
-required`; the reserved vLLM and SGLang options are refused on every deployment and
-`--pooling none` on llama.cpp; each engine renders its option and llama.cpp its batch
-sizes; `POST /v1/embeddings` accepts each input shape and refuses every other field,
-empty inputs, mixed arrays, more than 2048 inputs, negative or oversized token IDs,
-`bytes` and `stream`; it is routed, admitted, leased and settled like decisions; the
-mismatched endpoints are refused before activation; `model` is rewritten both ways and
-nothing else; an answer with the wrong count, a repeated index, ragged vectors, a
-non-finite value or the wrong `dimensions` is uncertain, an engine 400 is
-`engine_rejected`; the answer-size refusal fires at the limit and not one input below,
-for `float` and `base64`; llama.cpp refuses a non-native `dimensions`; a cut request
-settles at the verified stop and a full deployment of them restarts; the deployment is
-ready only on a well-formed fixed embedding and never on a chat probe; the canary passes
-within the tolerance and fails on a changed dimension or a vector beyond it; a reference
-from another kind or version is not compared; an old host never receives an embeddings
-deployment (`host_capability_missing:embeddings`); `capyctl.metrics` holds only measured
-figures. Tests also tag T17 (settlement) and T43 (`api_mismatch`) where they apply. CPU
-and Fake-engine tests are not qualification.
+through the frozen revision; it resolves on vLLM, SGLang and llama.cpp at every version,
+the certified versions shown certified and the others uncertified, and is refused on
+TensorFold (`capability_missing:embeddings`), with a `topology`, with `host_backed`, with
+`deep` on llama.cpp and custom engines, with a stated parser and with `lmcache:
+required`; a vLLM or SGLang deployment that states no residency resolves `deep`, and
+`restart_only` with a stated `deep` refused while that engine's support data has
+embeddings parking off; the reserved vLLM and SGLang options are refused on every
+deployment and `--pooling none` on llama.cpp; each engine renders its option and
+llama.cpp its batch sizes; `POST /v1/embeddings` accepts each input shape and refuses
+every other field, empty inputs, mixed arrays, more than 2048 inputs, negative or
+oversized token IDs, `bytes` and `stream`; it is routed, admitted and leased like
+decisions; the mismatched endpoints are refused before activation; the answer reaches
+the client before the engine has finished it; `model` is rewritten when it comes before
+`data`, after it and split across chunks, and nothing else is; a 2048-input `float` answer
+of 4096-dimension vectors streams through and the router's memory does not grow with it;
+an answer with the wrong count, a repeated index, ragged vectors, a non-finite value, the
+wrong `dimensions`, an oversized token, invalid JSON or a closed connection is uncertain
+and reaches the client without its closing brace; an engine 400 is `engine_rejected`;
+llama.cpp refuses a non-native `dimensions`; a cut request keeps its engine connection
+open, is read to its end and settles on a complete answer and not before; a cut request
+whose answer breaks settles at the verified stop, and a full deployment of them restarts;
+the deployment is ready only on a well-formed fixed embedding and never on a chat probe;
+a vLLM or SGLang deployment parks and wakes, and the canary runs after every wake and
+every restart, passes within the tolerance and fails on a changed dimension or a vector
+beyond it; a reference from another kind or version is not compared; an old host never
+receives an embeddings deployment (`host_capability_missing:embeddings`);
+`capyctl.metrics` holds only measured figures and comes before the closing brace. Tests
+also tag T17 (settlement) and T43 (`api_mismatch`) where they apply. CPU and Fake-engine
+tests are not qualification.
 
 ## Live qualification
 
 Run in a live session the owner schedules (one live session on the hosts at a time), on
-host A unless stated, in the approved environments as they are (`~/vllm-0.32.0-venv`,
-SGLang 0.5.22 and the llama.cpp v0.7.0 build; no new environment is needed), with
-[Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) (BF16, revision
-`97b0c61`; Matryoshka from 32 to 1024 dimensions, per its model card) on vLLM and SGLang,
-and its [Q8_0 GGUF](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF) on llama.cpp:
+host A unless stated, in the approved engine environments as they are
+(`~/vllm-0.32.0-venv`, SGLang 0.5.22 and the llama.cpp v0.7.0 build).
+
+**Models** (owner decision 2026-10-27, item 12): the ten open-weight embedding models with
+the most weekly tokens on OpenRouter on 2026-10-27, each on every engine that can run it,
+at the revision Hugging Face served on 2026-10-27. NVIDIA's Nemotron 3 Embed 1B has
+public weights (`nvidia/Nemotron-3-Embed-1B-BF16`: `model.safetensors`, not gated,
+OpenMDW-1.1 license, read 2026-10-27), so it is qualified and the owner's fallback,
+all-MiniLM-L12-v2, is not needed. The architecture, pooling and dimension are each
+checkpoint's `config.json`, `1_Pooling/config.json` and model card. The engine columns
+are each engine's source at the certified version, read on GitHub on 2026-10-27, and no
+engine was run: "registered" means the architecture is in vLLM's model registry
+(`vllm/model_executor/models/registry.py`), among SGLang's model entry classes
+(`python/sglang/srt/models/`), or among llama.cpp's converter registrations
+(`conversion/`). Whether an engine serves a model correctly is to be established by EM1
+in every cell.
+
+| Model | Revision | Architecture, pooling | Dimension | vLLM 0.32.0 | SGLang 0.5.22 | llama.cpp b11669 |
+|---|---|---|---|---|---|---|
+| [Qwen3-Embedding-8B](https://huggingface.co/Qwen/Qwen3-Embedding-8B) | `1d8ad4c` | `Qwen3ForCausalLM`, last token | 4096 (MRL 32 to 4096) | registered; converted to an embedding model by `--convert auto` | registered; `--is-embedding` | registered; Qwen's [GGUF](https://huggingface.co/Qwen/Qwen3-Embedding-8B-GGUF) Q8_0 |
+| [Qwen3-Embedding-4B](https://huggingface.co/Qwen/Qwen3-Embedding-4B) | `5cf2132` | `Qwen3ForCausalLM`, last token | 2560 (MRL 32 to 2560) | registered; as above | registered; SGLang's embedding page uses it as its example | registered; Qwen's [GGUF](https://huggingface.co/Qwen/Qwen3-Embedding-4B-GGUF) Q8_0 |
+| [bge-m3](https://huggingface.co/BAAI/bge-m3) | `5617a9f` | `XLMRobertaModel`, CLS | 1024 | registered | registered | registered; converted GGUF |
+| [pplx-embed-v1-0.6b](https://huggingface.co/perplexity-ai/pplx-embed-v1-0.6b) | `2c4d510` | `PPLXQwen3Model`, code shipped with the checkpoint (`auto_map`), bidirectional, mean | 1024 (MRL) | not registered; only through the Transformers backend with remote code, to be established by EM1 | not registered; as for vLLM | not supported: the converter registers no `PPLXQwen3Model` |
+| [pplx-embed-v1-4b](https://huggingface.co/perplexity-ai/pplx-embed-v1-4b) | `0645649` | as above | 2560 (MRL) | as above | as above | not supported, as above |
+| [multilingual-e5-large](https://huggingface.co/intfloat/multilingual-e5-large) | `3d7cfbd` | `XLMRobertaModel`, mean | 1024 | registered | registered | registered; converted GGUF |
+| [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | `a5beb1e` | `BertModel`, CLS | 768 | registered | registered | registered; converted GGUF |
+| [all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) | `1110a24` | `BertModel`, mean | 384 | registered | registered | registered; converted GGUF |
+| [all-mpnet-base-v2](https://huggingface.co/sentence-transformers/all-mpnet-base-v2) | `e8c3b32` | `MPNetForMaskedLM`, mean | 768 | not registered; only through the Transformers backend, to be established by EM1 | not registered; as for vLLM | not supported: the converter registers no MPNet architecture |
+| [Nemotron-3-Embed-1B-BF16](https://huggingface.co/nvidia/Nemotron-3-Embed-1B-BF16) | `c0c9fea` | `Ministral3Model`, bidirectional, mean | 2048 (truncation from the start, per its card) | not registered (only `Ministral3ForCausalLM`); its card names vLLM 0.20.0 to 0.25.0, not 0.32.0; to be established by EM1 | not registered (only `Ministral3ForCausalLM` is an entry class); to be established by EM1 | not supported: the converter registers `Ministral3ForCausalLM` only |
+
+Notes on the table:
+
+- **Not supported** marks a combination the engine's source cannot run; it is documented
+  in `docs/guide/engines.md` and the recipes, and not refused (§1). Each "to be
+  established by EM1" cell, and each "registered" cell, becomes certified when its EM1
+  passes, or documented unsupported with the engine's error when it fails. Whether vLLM's
+  and SGLang's Transformers backends serve the unregistered architectures as embedding
+  models, with bidirectional attention and mean pooling where the model needs them, is
+  [INFERENCE] until EM1.
+- **Remote code.** The pplx-embed checkpoints ship their own Python, so on vLLM and
+  SGLang they need a profile added with `--allow-remote-code` (`security.trust_remote_code`,
+  ADR 0014 §8) and `engine_config.trust_remote_code: true`; the row runs the pinned
+  revision's code. Their card says they produce unnormalized int8-quantized embeddings
+  through Sentence Transformers; what the engines answer is recorded by EM1, and the
+  canary's relative distance (§6) does not need normalized vectors.
+- **GGUFs.** Qwen publishes GGUFs of Qwen3-Embedding-4B and 8B, used at Q8_0. For the
+  other models llama.cpp runs a GGUF converted from the pinned revision with b11669's
+  `convert_hf_to_gguf.py`, recorded with its digest and the environment the conversion
+  ran in [INFERENCE: the converter needs Python with torch and `gguf-py`; no engine
+  environment changes].
+
+**Reference model.** Rows EM2 to EM9 run on Qwen3-Embedding-4B (BF16 on vLLM and SGLang,
+Qwen's Q8_0 GGUF on llama.cpp; Matryoshka from 32 to 2560 dimensions, per its model card),
+which is among the ten and registered on all three engines. The proposal's
+Qwen3-Embedding-0.6B is not among the ten and is dropped.
+
+A combination is certified when its EM1 passes and rows EM2 to EM8, and on vLLM and
+SGLang EM9, pass on its engine.
 
 | Row | What it shows |
 |---|---|
-| EM1 | Start per engine: the deployment starts with its rendered option, becomes ready on the fixed embedding (native dimension 1024 recorded), shows `api: embeddings` in status and `capyctl.api` in `/v1/models`, and LMCache off with `embeddings_unsupported`; peak memory, start time and the charge recorded, llama.cpp with the rendered batch sizes. |
-| EM2 | Contract per engine: a string, an array of strings, a token array and an array of token arrays each answer one vector per input in order; `base64` decodes to the `float` answer's values (within float32 rounding); `dimensions: 256` answers 256-length vectors on vLLM and SGLang (with the Matryoshka override in the arguments if the checkpoint needs it) and is refused on llama.cpp; `stream`, an unknown field and an empty input are refused by CapyCTL; an input over the model's length is the engine's `engine_rejected`; `model` in the answer is the public name. |
-| EM3 | Tolerance: the probe text sent 20 times alone after start, 20 times after a restart, and 20 times inside 64-input batches under 8 concurrent clients; the largest relative distance and smallest cosine from the reference, per engine, set the canary tolerance with its margin. Cross-engine agreement on 100 pinned sentences (vLLM against SGLang, BF16; llama.cpp Q8_0 against both) is recorded, not required. |
+| EM1 | Each model on each engine of the table not marked unsupported: the deployment starts with its rendered option, becomes ready on the fixed embedding with the native dimension of the table recorded, answers a string and a 16-input batch with one vector per input in order, shows `api: embeddings` and `certified` in status and `capyctl.api` in `/v1/models`, and LMCache off with `embeddings_unsupported`; peak memory, start time and the charge recorded, llama.cpp with the rendered batch sizes. A failure is recorded with the engine's error and documents the combination unsupported. |
+| EM2 | Contract per engine: a string, an array of strings, a token array and an array of token arrays each answer one vector per input in order; `base64` decodes to the `float` answer's values (within float32 rounding); `dimensions: 256` answers 256-length vectors on vLLM and SGLang (with the Matryoshka override in the arguments if the checkpoint needs it) and is refused on llama.cpp; `stream`, an unknown field and an empty input are refused by CapyCTL; an input over the model's length is the engine's `engine_rejected`; `model` in the answer is the public name, and whether the engine writes `model` before or after `data` is recorded. |
+| EM3 | Tolerance: the probe text sent 20 times alone after start, 20 times after a restart, 20 times after a wake on vLLM and SGLang, and 20 times inside 64-input batches under 8 concurrent clients; the largest relative distance and smallest cosine from the reference, per engine, set the canary tolerance with its margin, checked against 0.02. Cross-engine agreement on 100 pinned sentences (vLLM against SGLang, BF16; llama.cpp Q8_0 against both) is recorded, not required. |
 | EM4 | Restart canary: stop and start each deployment; the check compares with the reference and passes, and the event names the verdict. |
-| EM5 | Cut requests and gauges: during a 2048-input batch each engine's running gauge reads the request; a client hang-up mid-batch leaves the lease `cancelling` until the next verified stop; 32 cut batches fill the deployment and CapyCTL restarts the instance, journals the restart and settles all 32; the next request is served. |
-| EM6 | Host path: host A as a host of a server on the control host; a request through its ingress is validated, relayed and answered, `X-Request-Id` echoed and never seen by the engine. |
-| EM7 | Switching: on one GPU, an embeddings deployment and a chat deployment that do not fit together; a request for each in turn switches the pool per SPEC §10 and both answer. |
-| EM8 | Size and load: `capyctl-bench`'s embeddings mode for p50 and p95 by batch size (1, 16, 256) and input length (32, 512, 8,192 tokens), inputs per second at 1, 4 and 16 clients, and a retrieval score on a pinned public set; then, on vLLM with [Qwen3-Embedding-4B](https://huggingface.co/Qwen/Qwen3-Embedding-4B) (2560 dimensions), a 2048-input `float` batch is refused `request_too_large` before the engine sees it, and the same batch in `base64` answers. |
+| EM5 | Cut requests and gauges: during a 2048-input batch each engine's running gauge reads the request; a client hang-up mid-batch and a deadline cut each leave the engine connection open, the engine finishes the request, the lease is `cancelling` until the answer has been read whole, and it then settles on it; the time from the cut to the settlement is recorded; 32 cut batches in a row each settle on their answer and no restart happens; an engine killed mid-answer leaves its cut request to the next verified stop; the next request is served. |
+| EM6 | Host path: host A as a host of a server on the control host; a request through its ingress is validated, relayed and answered, the answer relayed as it arrives, `X-Request-Id` echoed and never seen by the engine. |
+| EM7 | Switching: on one GPU, an embeddings deployment and a chat deployment that do not fit together; a request for each in turn switches the pool per SPEC §10 and both answer; on vLLM and SGLang the embeddings deployment parks `deep` and its wake passes the canary, on llama.cpp it restarts. |
+| EM8 | Size and load: `capyctl-bench`'s embeddings mode for p50 and p95 by batch size (1, 16, 256) and input length (32, 512, 8,192 tokens), inputs per second at 1, 4 and 16 clients, and a retrieval score on a pinned public set; then, on vLLM with Qwen3-Embedding-8B (4096 dimensions), a 2048-input `float` batch and the same batch in `base64` each stream through whole to the client with `model` the public name, and the router's resident memory is recorded before and during each to show it does not hold the answer. |
+| EM9 | Park and wake (owner decision 2026-10-27, question 2), on vLLM and SGLang, `deep`: 5 park and wake cycles each; every park settles on the engine's evidence (vLLM: the launch's GPU bytes at or below the parked budget; SGLang: its saver map unmapped) and its residue is recorded; the canary runs after every wake and passes, and a request after every wake is answered; a request that arrives while the deployment is parked wakes it. Park and wake times recorded. |
 
-## Open questions for the owner
+## Owner decisions of 2026-10-27
 
-1. **Engine versions.** vLLM 0.30.0 and 0.31.0 and SGLang 0.5.20 and 0.5.21 are also on
-   the hosts and also serve embeddings. Options: (a) only the versions EM1 qualifies,
-   vLLM 0.32.0, SGLang 0.5.22 and llama.cpp v0.7.0, as floors; (b) every installed
-   version, unqualified ones shown as such. Recommendation: (a), as ADR 0030 did for
-   decisions; an older version can be added with its own EM1 row.
-2. **Parking.** Options: (a) `restart_only` in the first version (§7.2); (b) deep parking
-   on vLLM and SGLang now, qualified by a park-and-wake row with the canary. Recommend
-   (a): the models start in seconds and neither engine's sleep path has been read with a
-   pooling server. An EM row can measure vLLM's sleep levels with `--runner pooling` for a
-   later decision, as ADR 0030's amendment did for decisions.
-3. **Canary tolerance.** Options: (a) set from EM3's largest distance plus a stated
-   margin, nothing committed before; (b) fix 0.02 relative distance now; (c) cosine
-   similarity at least 0.999. Recommendation: (a), with 0.02 as the figure EM3 is checked
-   against, the way ADR 0033 set LMCache's allowances from LC1.
-4. **`dimensions` on llama.cpp,** which ignores it. Options: (a) refuse any value other
-   than the native dimension (§3); (b) refuse it always; (c) forward it and let the
-   client receive full vectors. Recommendation: (a): a client that asks for the native
-   size gets what it asked, and no client silently gets a different length than it asked
-   for.
-5. **Inputs beyond OpenAI's.** vLLM takes chat `messages` and images; SGLang and
-   llama.cpp take multimodal objects; each has extras (truncation, normalization,
-   dtypes). Options: (a) OpenAI's text contract only in 0.2.0; (b) add the multimodal
-   object shape common to SGLang and llama.cpp; (c) per-engine extras. Recommendation:
-   (a); multimodal embeddings can follow with their own contract, body limits and a
-   multimodal model row.
-6. **Answer limit.** Options: (a) a fixed 64 MiB with the refusal before forwarding
-   (§4); (b) the decision limit of 16 MiB; (c) a role setting. Recommendation: (a): 16
-   MiB refuses ordinary `float` batches of about 680 1024-dimension vectors, and a
-   setting can follow if users need more.
-7. **Cut embeddings on SGLang.** ADR 0032's per-request settlement could extend to
-   embeddings: CapyCTL sends `rid` as `<request ID>_<i>` per input, aborts by its prefix
-   and reads the response. But on 0.5.22 the abort echo carries no `embedding`
-   (`managers/tokenizer_manager.py:3624-3640`), so the handler, which reads
-   `ret_item["embedding"]` (`serving_embedding.py:292`), fails rather than answering a
-   final output [INFERENCE: probably an HTTP 500 from its error path, not run]. Options:
-   (a) today's rule (next verified stop, restart when full) for every engine; (b) extend
-   ADR 0032 to SGLang embeddings, settling on that error answer after the abort; (c) let
-   a cut embedding run to its end and settle on its answer, which an embedding request
-   reaches in milliseconds to seconds. Recommendation: (a) for 0.2.0, with EM5 measuring
-   how often a restart happens; (c) is worth a decision after EM5, since an embedding
-   request is short and bounded, unlike a generation, and it would settle on the
-   completion evidence SPEC §10 already accepts.
-8. **Custom engines.** Options: (a) the manifest's `api` gains `embeddings` and the
-   probe and canary apply as for native engines; (b) custom engines serve chat and
-   decisions only. Recommendation: (a): the contract is the endpoint, which ADR 0031
-   already makes the manifest's to declare.
-9. **Chat checkpoints served as embeddings.** vLLM converts a generative checkpoint with
-   `--convert embed` (last-token pooling). Options: (a) allowed, as two revisions of the
-   checkpoint (§1); (b) only checkpoints published as embedding models. Recommendation:
-   (a); the operator chooses, and recipes list only trained embedding models.
-10. **`cache_salt`.** vLLM's embedding request takes it; SGLang's does not. Options: (a)
-    refused on embeddings in 0.2.0, and the guide says an embeddings deployment's
-    engine prefix cache, where it keeps one, is shared by all its callers, so tenants
-    who must not share one get their own deployment; (b) accepted on vLLM as the
-    effective digest of SPEC §10 and refused on the others. Recommendation: (a), until a
-    row shows whether a pooling server reuses prefixes at all.
-11. **Memory defaults.** Options: (a) today's sizing rules, with recipes declaring small
-    requests; (b) a default for embeddings deployments from the checkpoint's weights and
-    `max_concurrent_requests` full-length inputs of KV. Recommendation: (a) for 0.2.0,
-    revisited with EM1's peaks.
+The proposal of 2026-10-24 asked eleven questions; the owner answered all of them on
+2026-10-27 and named the models to qualify. The decision sections above already read as
+decided. The owner's rule of the same day applies throughout: certified engine, version
+and checkpoint combinations are advertised as certified, anything else runs as an
+uncertified custom setup and is never refused for being uncertified, and the safety
+refusals (reserved options, loopback-only controls, malformed requests) are unaffected.
+
+1. **Engine versions (changed from the recommendation, by the owner rule):** vLLM 0.32.0,
+   SGLang 0.5.22 and llama.cpp v0.7.0, the latest approved installs, are certified; older
+   versions that serve embeddings run uncertified instead of being refused below a floor
+   (§1).
+2. **Parking (changed from the recommendation):** (b) deep parking in 0.2.0 on vLLM and
+   SGLang, qualified by a park-and-wake row with the canary (EM9); llama.cpp stays
+   `restart_only`. The owner first answered `restart_only` and then reversed it (§7.2).
+3. **Canary tolerance:** (a) set from EM3's largest distance plus a stated margin,
+   checked against 0.02, as proposed (§6).
+4. **`dimensions` on llama.cpp:** (a) accepted only at the native dimension, as proposed
+   (§3).
+5. **Inputs beyond OpenAI's:** (a) OpenAI's text contract only, as proposed (§3, §7.3).
+6. **Answer limit (a new option):** the answer is streamed through to the client with
+   incremental validation and `model` rewritten on the way, with no answer cap; it
+   replaces the proposed read-whole 64 MiB limit and its refusal before forwarding. A
+   malformed answer is then detected after part of it has reached the client, and the
+   request is uncertain as before (§4).
+7. **Cut embeddings (changed from the recommendation):** (c) a cut embedding request runs
+   to its end and settles on its answer, SPEC §10's completion evidence; today's rule
+   remains only for a cut request whose answer never completes (§4, EM5).
+8. **Custom engines:** (a) a custom engine's manifest may declare `api: embeddings`, as
+   proposed (§1).
+9. **Chat checkpoints served as embeddings:** (a) allowed, as proposed, as two revisions
+   of the checkpoint; they run uncertified (§1).
+10. **`cache_salt`:** (a) refused on embeddings for now, as proposed, and the guide says
+    an embeddings deployment's engine prefix cache, where it keeps one, is shared by all
+    its callers (§3).
+11. **Memory defaults:** (a) today's sizing rules, with recipes declaring requests,
+    revisited with EM1's peaks, as proposed (§8).
+12. **Models:** qualify the ten open-weight embedding models with the most weekly tokens
+    on OpenRouter on 2026-10-27: Qwen3-Embedding-8B, Qwen3-Embedding-4B, BAAI/bge-m3,
+    perplexity-ai/pplx-embed-v1-0.6b, perplexity-ai/pplx-embed-v1-4b,
+    intfloat/multilingual-e5-large, BAAI/bge-base-en-v1.5,
+    sentence-transformers/all-MiniLM-L6-v2, sentence-transformers/all-mpnet-base-v2, and
+    NVIDIA Nemotron 3 Embed 1B, or all-MiniLM-L12-v2 if its weights are not public (they
+    are). Each runs on every engine that can run it, and the unsupported combinations are
+    documented (Live qualification).
