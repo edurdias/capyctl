@@ -291,6 +291,7 @@ impl Fixture {
                 owned_handle: "launch".into(),
                 max_tokens: None,
                 decision: false,
+                embedding: false,
             },
         })
     }
