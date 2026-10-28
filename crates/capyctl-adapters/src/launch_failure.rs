@@ -38,8 +38,10 @@ fn option_name(token: &str) -> Option<String> {
 
 /// The option names the engine's own output says it refused: an argument
 /// parser's `argument --name: ...` and `unrecognized arguments: --name ...`,
-/// and llama-server's `error: invalid argument: --name` (ADR 0029 §6,
-/// `common/arg.cpp`). Values that follow them are never read.
+/// llama-server's `error: invalid argument: --name` (ADR 0029 §6,
+/// `common/arg.cpp`), and Click's `No such option: --name` and `Invalid
+/// value for '--name'` (`trtllm-serve`, ADR 0038 §3). Values that follow
+/// them are never read.
 pub fn rejected_options(engine_output: &str) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut push = |name: String| {
@@ -59,6 +61,17 @@ pub fn rejected_options(engine_output: &str) -> Vec<String> {
             .and_then(option_name)
         {
             push(name);
+        }
+        // ADR 0038 §3: Click names one option and may suggest another
+        // (`Did you mean --x?`), which is not the refused one.
+        for marker in ["No such option:", "Invalid value for "] {
+            if let Some(name) = line
+                .split_once(marker)
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .and_then(option_name)
+            {
+                push(name);
+            }
         }
         let mut rest = line;
         while let Some(at) = rest.find("argument ") {
@@ -138,6 +151,19 @@ pub fn summary(engine_output: &str, exit: Option<EngineExit>) -> String {
             "; TensorFold's memory cap cannot hold context_length beside its streams: \
              lower max_concurrent_requests or context_length, or raise the ready \
              allocation in resources",
+        );
+        return text;
+    }
+    // ADR 0038 §3: TensorRT-LLM's LLM API models are strict (pydantic
+    // `extra="forbid"`), so a key of the deployment's mapping that this
+    // version lacks stops the start; the line names the key and its value,
+    // so the summary names the fix in fixed words instead.
+    if engine_output.lines().any(|line| {
+        line.contains("extra_forbidden") || line.contains("Extra inputs are not permitted")
+    }) {
+        text.push_str(
+            "; TensorRT-LLM refused a key of engine_config.tensorrt-llm.llm_api_options that \
+             this version does not have: remove or correct it",
         );
         return text;
     }
@@ -254,6 +280,35 @@ mod tests {
              context_length, or raise the ready allocation in resources"
         );
         assert!(!text.contains("20480"));
+        assert!(text.len() <= MAX_SUMMARY_BYTES);
+    }
+
+    // T49 T29 (ADR 0038 §3): `trtllm-serve`'s Click parser names the refused
+    // option, never the one it suggests or a value; a key its strict LLM API
+    // model refuses is named as a fix in fixed words, never with its value.
+    #[test]
+    fn trtllm_serve_rejections_name_the_option_or_the_fix() {
+        assert_eq!(
+            rejected_options("Error: No such option: --bogus_flag Did you mean --backend?"),
+            vec!["--bogus_flag"]
+        );
+        assert_eq!(
+            rejected_options(
+                "Error: Invalid value for '--log_level': 'secret' is not one of 'info'."
+            ),
+            vec!["--log_level"]
+        );
+        let output = "pydantic_core._pydantic_core.ValidationError: 1 validation error for \
+                      TorchLlmArgs\nmystery_key\n  Extra inputs are not permitted \
+                      [type=extra_forbidden, input_value=42, input_type=int]\n";
+        let text = summary(output, Some(EngineExit::Code(1)));
+        assert_eq!(
+            text,
+            "the engine exited before readiness with exit code 1; TensorRT-LLM refused a key \
+             of engine_config.tensorrt-llm.llm_api_options that this version does not have: \
+             remove or correct it"
+        );
+        assert!(!text.contains("mystery") && !text.contains("42"));
         assert!(text.len() <= MAX_SUMMARY_BYTES);
     }
 }

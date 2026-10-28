@@ -24,6 +24,12 @@
 //! - TensorFold (0.6.6): no usage reporting; its release check, which asks
 //!   GitHub for a newer version, is off on every launch whatever this
 //!   setting says (`TENSORFOLD_NO_UPDATE_CHECK`, `--no-update-check`).
+//! - TensorRT-LLM (`trtllm-serve`, ADR 0038 §10): 1.2.1 has no usage
+//!   reporting of its own; `DO_NOT_TRACK=1` turns off the Hugging Face Hub's
+//!   telemetry it imports. The 1.3 and 1.4 pre-releases add
+//!   `usage/usage_lib.py`, which posts usage to NVIDIA unless
+//!   `TRTLLM_NO_USAGE_STATS=1`, `TELEMETRY_DISABLED=1` or `DO_NOT_TRACK=1`,
+//!   so all three are set on every line.
 //! - Custom engines: unknown programs, so the general convention.
 //!
 //! `DO_NOT_TRACK=1` (<https://donottrack.sh>) is set for every engine.
@@ -42,6 +48,16 @@ pub const VLLM: &[(&str, &str)] = &[
 
 /// SGLang, llama.cpp, TensorFold and custom engines: the general convention.
 pub const DO_NOT_TRACK: &[(&str, &str)] = &[("DO_NOT_TRACK", "1")];
+
+/// ADR 0038 §10: TensorRT-LLM's opt-outs (1.3 and 1.4 `usage/usage_lib.py`)
+/// and the general convention. A TensorRT-LLM profile or deployment cannot
+/// set them (`capyctl_config::tensorrt_llm::REFUSED_ENV_NAMES` and the
+/// `TRTLLM_` family).
+pub const TENSORRT_LLM: &[(&str, &str)] = &[
+    ("DO_NOT_TRACK", "1"),
+    ("TRTLLM_NO_USAGE_STATS", "1"),
+    ("TELEMETRY_DISABLED", "1"),
+];
 
 /// Whether this role's host allows the engines' own usage reporting.
 static ALLOWED: AtomicBool = AtomicBool::new(false);
@@ -78,18 +94,24 @@ pub fn apply(
 mod tests {
     use super::*;
 
-    // T21 (owner decision 2026-10-22): `off` writes every opt-out over any
-    // value; `allow` writes nothing. Every opt-out is a name the profile and
-    // the deployment cannot set.
+    // T21 T49 (owner decision 2026-10-22, ADR 0038 §10): `off` writes every
+    // opt-out over any value; `allow` writes nothing. Every opt-out is a name
+    // the profile and the deployment cannot set (TensorRT-LLM's through its
+    // own refused names).
     #[test]
     fn off_writes_the_opt_outs_and_allow_leaves_the_environment() {
         let before = BTreeMap::from([("DO_NOT_TRACK".to_owned(), "0".to_owned())]);
-        for opt_outs in [VLLM, DO_NOT_TRACK] {
+        for opt_outs in [VLLM, DO_NOT_TRACK, TENSORRT_LLM] {
             let mut env = before.clone();
             apply(&mut env, opt_outs, EngineTelemetry::Off);
             for (name, value) in opt_outs {
                 assert_eq!(env[*name], *value, "{name}");
-                assert!(capyctl_config::engine_env::is_owned(name), "{name}");
+                assert!(
+                    capyctl_config::engine_env::is_owned(name)
+                        || (opt_outs == TENSORRT_LLM
+                            && capyctl_config::tensorrt_llm::refused_env_name(name)),
+                    "{name}"
+                );
             }
             assert_eq!(env.len(), opt_outs.len());
             let mut env = before.clone();

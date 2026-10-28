@@ -23,12 +23,16 @@ pub mod lmcache;
 // SPEC §9.1, §13.3 / T21 T37: the owner-only rule for capyctl's runtime helpers.
 pub mod owner_only;
 pub mod policy;
+// ADR 0038 §9: a launch's descendants outside its process group.
+pub mod process_tree;
 pub mod protected;
 pub mod resolve;
 pub mod sglang;
 // SPEC §13.2 / T20: the once-only guard of a launch's residency steps.
 pub(crate) mod step_fence;
 pub mod tensorfold;
+// ADR 0038: TensorRT-LLM's `trtllm-serve` (kind `tensorrt-llm`).
+pub mod tensorrt_llm;
 pub mod traits;
 pub mod vllm;
 
