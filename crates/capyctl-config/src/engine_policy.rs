@@ -2160,6 +2160,8 @@ mod tracing_tests {
             &args,
             &ExtraArgsContext {
                 engine,
+                api: crate::effective::DeploymentApi::Chat,
+                line: crate::tensorfold_native::TensorfoldLine::Python,
                 sleep_mode: false,
                 approved_options: &approved_options,
                 approved_paths: &[],
@@ -2217,7 +2219,12 @@ mod tracing_tests {
         // Host-fixed vLLM arguments cannot state them either.
         let fixed = vec!["--otlp-traces-endpoint".to_owned(), endpoint.to_owned()];
         assert!(matches!(
-            validate_profile_args(Engine::Vllm, &fixed, false),
+            validate_profile_args(
+                Engine::Vllm,
+                crate::tensorfold_native::TensorfoldLine::Python,
+                &fixed,
+                false
+            ),
             Err(ProfileArgError::Reserved(_))
         ));
         // Neither is a sensitive (approvable) option any more.
