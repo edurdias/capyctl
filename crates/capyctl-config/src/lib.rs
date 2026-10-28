@@ -59,6 +59,9 @@ pub mod strict_yaml;
 pub mod yaml_emit;
 // ADR 0039: TensorFold's native 1.x line beside the 0.6 Python line.
 pub mod tensorfold_native;
+// ADR 0038: TensorRT-LLM's registration constants, option, key and
+// environment tables, served-name rule, KV tokens and configuration file.
+pub mod tensorrt_llm;
 // ADR 0023 §2: TensorFold's build toolchain on the closed launch PATH.
 pub mod toolchain;
 // ADR 0028 §2: a deployment's multi-node topology and group shape.

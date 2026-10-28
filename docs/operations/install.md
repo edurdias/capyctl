@@ -738,9 +738,10 @@ format.
 
 CapyCTL uses engines you install yourself. Register them on the machine that runs them:
 
-    capyctl engine detect [--path DIR]        # lists vLLM/SGLang/TensorFold environments and llama-server binaries; runs nothing
+    capyctl engine detect [--path DIR]        # lists vLLM/SGLang/TensorFold/TensorRT-LLM environments and llama-server binaries; runs nothing
     capyctl engine add ~/venvs/vllm           # or its bin/vllm, or bin/python3 for SGLang
     capyctl engine add ~/llama.cpp/build/bin/llama-server   # llama.cpp: the binary or its directory
+    capyctl engine add ~/tensorrt-llm-1.2.1-venv/bin/trtllm-serve   # TensorRT-LLM
     capyctl engine add ~/sglang/bin/python3 --name sglang-patched --drift refuse
     capyctl engine list
     capyctl engine remove vllm [--drain]
@@ -794,6 +795,11 @@ The file keeps the profile. Upgrade CapyCTL to use it, or remove it with
 `capyctl engine remove <name>`. Releases before 0.1.2 refuse to start
 (`invalid_config` at `runtime_profiles.engine`); remove the profile with the
 newer binary, or edit `engines.yaml`, before starting the older one.
+
+A TensorRT-LLM profile records the versions of the distributions beside the
+engine in a `companions` field. A release before 0.2.0 does not know that
+field and refuses an `engines.yaml` that holds it; remove the TensorRT-LLM
+profile with the newer binary before starting an older one on the same file.
 
 In standalone, `CAPYCTL_VLLM_BIN` or `CAPYCTL_SGLANG_BIN` alone gives the profile
 `local`; both give `local-vllm` and `local-sglang`. Profiles you add coexist
@@ -890,6 +896,48 @@ Every launch runs llama-server on loopback with a closed environment: no
 pointed at empty private directories under `<state dir>/engines/llamacpp/`.
 llama-server takes no key; it is reached only through CapyCTL's
 inference endpoint.
+
+### Registering a TensorRT-LLM environment
+
+TensorRT-LLM needs two system packages that its Python
+environment does not carry. Install them once, as an administrator:
+
+- `libopenmpi-dev` (`sudo apt-get -y install libopenmpi-dev` on Ubuntu 24.04,
+  Open MPI 4.1.6), which `mpi4py` loads when the engine starts;
+- the CUDA toolkit from NVIDIA's packages: 13.1 for 1.2.1 and 13.4 for the
+  1.4 pre-release, installed side by side. Name the version's toolkit as the
+  profile's `cuda_home` (`CUDA_HOME` when you run `engine add`).
+
+Each version lives in its own environment, `~/tensorrt-llm-<version>-venv`,
+built as [Install an engine](../guide/install-engines.md#tensorrt-llm-121-13-pre-release-or-140rc1)
+shows: torch first, a constraints file pinning it, then the wheel by URL and
+hash. The versions being qualified are 1.2.1, the 1.3 pre-release and
+1.4.0rc1; none has passed its live rows yet, so every TensorRT-LLM profile
+lists as custom and runs as an uncertified custom setup, never refused for
+its version.
+
+`detect` finds the environment by its `tensorrt_llm-*.dist-info` and runs
+nothing. `engine add` takes `<env>/bin/trtllm-serve` and never imports the
+engine or runs `trtllm-serve`, because an import initialises MPI and CUDA and
+Open MPI could start a daemon outside the check's process group. Its bounded
+version check runs the environment's Python in isolated mode on
+`importlib.metadata`, and records the version as `build_fingerprint` and the
+versions of `torch`, `tensorrt`, `flashinfer-python`, `transformers` and
+`mpi4py` as `companions`, which `engine list` shows with `idle signal: none`
+and `engine key: none`. The installation fingerprint covers `tensorrt_llm/`
+and `triton_kernels/`, their compiled libraries included; torch, TensorRT,
+FlashInfer and the MPI library are outside it, and a change in one shows in
+the companions. The profile is `security.deep_park: disabled`;
+`--deep-park enabled` is `capability_missing`.
+
+The role's own TensorRT-LLM is `local_engine.tensorrt-llm`,
+`--tensorrt-llm-bin` or `CAPYCTL_TENSORRT_LLM_BIN`
+([Settings](configuration.md#engine-installation)).
+
+Every launch runs `trtllm-serve` on loopback in one process, with Open MPI
+pinned to an isolated singleton with no network transport, a private
+`TMPDIR`, and `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`. FlashInfer may
+download kernels on the first start; that outbound connection is allowed.
 
 ## Engine logs and troubleshooting
 

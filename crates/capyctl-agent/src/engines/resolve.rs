@@ -3,10 +3,14 @@
 //! ADR 0029 §2: a llama.cpp installation is a bare `llama-server` binary.
 //! ADR 0039 §2: a native TensorFold installation is a release root holding
 //! `bin/tensorfold-native`.
+//! ADR 0038 §2: a TensorRT-LLM installation is a virtual environment holding
+//! the `tensorrt_llm` distribution; its version check reads metadata only.
 use super::{packages, release_version, release_version_text, ReleaseVersion};
 use capyctl_config::engine_policy::Engine;
 use capyctl_config::llamacpp::{LlamacppBuild, EXECUTABLE};
 use capyctl_config::tensorfold_native::{self, TensorfoldLine};
+use capyctl_config::tensorrt_llm;
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
@@ -20,6 +24,38 @@ pub const VERSION_OUTPUT_LIMIT: usize = 4096;
 /// importing the engine.
 const SGLANG_VERSION: &str =
     "import importlib.metadata,sys;print(importlib.metadata.version(sys.argv[1]))";
+/// ADR 0038 §2: one `<name> <version>` line per distribution named after the
+/// script (`<name> ` alone when it is not installed), from the installed
+/// metadata only. Nothing imports `tensorrt_llm`, whose import initializes
+/// MPI and CUDA.
+pub const TENSORRT_LLM_VERSIONS: &str = concat!(
+    "import importlib.metadata as m,sys\n",
+    "for n in sys.argv[1:]:\n",
+    " try:v=m.version(n)\n",
+    " except m.PackageNotFoundError:v=''\n",
+    " print(n,v)\n",
+);
+
+/// ADR 0038 §2: the interpreter the version check runs, the environment's
+/// own (never resolved through its link, so it keeps its environment).
+pub fn tensorrt_llm_interpreter(env: &Path) -> PathBuf {
+    env.join("bin/python3")
+}
+
+/// ADR 0038 §2: the version check's arguments after the interpreter:
+/// isolated mode, no bytecode, the metadata script, then `tensorrt_llm` and
+/// each companion distribution.
+pub fn tensorrt_llm_check_args() -> Vec<&'static str> {
+    let mut args = vec![
+        "-I",
+        "-B",
+        "-c",
+        TENSORRT_LLM_VERSIONS,
+        tensorrt_llm::DISTRIBUTION,
+    ];
+    args.extend_from_slice(tensorrt_llm::COMPANIONS);
+    args
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
@@ -36,9 +72,18 @@ pub struct Resolved {
 
 impl Resolved {
     /// ADR 0018 §1: outside the verified set. ADR 0039 §3: a native
-    /// TensorFold version outside the certified set.
+    /// TensorFold version outside the certified set. ADR 0038 §2:
+    /// TensorRT-LLM's counts beside the torch build its environment's
+    /// metadata names.
     pub fn custom(&self) -> bool {
-        !capyctl_config::registration::is_verified_line(self.engine, self.line, &self.version)
+        if self.engine == Engine::Tensorfold && self.line.is_native() {
+            return !capyctl_config::registration::is_verified_line(
+                self.engine,
+                self.line,
+                &self.version,
+            );
+        }
+        !super::verified_in_env(self.engine, &self.version, &self.env)
     }
 }
 
@@ -72,6 +117,8 @@ pub(crate) fn entry(env: &Path, engine: Engine) -> PathBuf {
         Engine::Tensorfold => env.join("bin/tensorfold"),
         // ADR 0029 §2: `env` is the directory holding the binary.
         Engine::Llamacpp => env.join(EXECUTABLE),
+        // ADR 0038 §2: the console script `<env>/bin/trtllm-serve`.
+        Engine::TensorrtLlm => env.join("bin").join(tensorrt_llm::EXECUTABLE),
         // ADR 0031 §1: a custom engine's executable is named, never derived;
         // `env` is it.
         Engine::Custom => env.to_path_buf(),
@@ -198,6 +245,8 @@ fn stray_tensorfold(path: &Path, env: &Path) -> ResolveError {
 /// ADR 0029 §2: or a `llama-server` binary, or the directory holding one.
 /// ADR 0039 §2: or a `tensorfold-native` binary, its `bin` directory, or the
 /// release root holding `bin/tensorfold-native`.
+/// ADR 0038 §2: or a TensorRT-LLM environment's `bin/trtllm-serve`; the name
+/// and version are read from its `tensorrt_llm` dist-info.
 pub fn resolve(path: &Path) -> Result<Resolved, ResolveError> {
     let path = std::path::absolute(path).map_err(|_| {
         ResolveError::Unsupported(format!("{} cannot be made absolute", path.display()))
@@ -258,11 +307,14 @@ pub fn resolve(path: &Path) -> Result<Resolved, ResolveError> {
             Engine::Vllm
         } else if name == "tensorfold" {
             Engine::Tensorfold
+        } else if name == tensorrt_llm::EXECUTABLE {
+            Engine::TensorrtLlm
         } else if name == "python" || name == "python3" || name.starts_with("python3.") {
             Engine::Sglang
         } else {
             return Err(ResolveError::Unsupported(format!(
-                "{} is not bin/vllm, bin/tensorfold, bin/python3 or llama-server",
+                "{} is not bin/vllm, bin/tensorfold, bin/trtllm-serve, bin/python3 or \
+                 llama-server",
                 path.display()
             )));
         };
@@ -292,7 +344,7 @@ pub fn resolve(path: &Path) -> Result<Resolved, ResolveError> {
     }
     if found.is_empty() {
         return Err(ResolveError::NotFound(format!(
-            "{} holds no vllm, sglang or tensorfold package",
+            "{} holds no vllm, sglang, tensorfold or tensorrt_llm package",
             env.display()
         )));
     }
@@ -468,11 +520,45 @@ impl std::fmt::Display for VersionCheckError {
 
 /// What the version check read: the version, and the profile's
 /// `build_fingerprint` (the version itself, or, ADR 0029 §2, `<v>+<commit>`
-/// for llama.cpp).
+/// for llama.cpp). ADR 0038 §2: for TensorRT-LLM, the companion versions the
+/// same query read (a companion that is not installed is left out); empty
+/// for every other engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportedVersion {
     pub version: String,
     pub build_fingerprint: String,
+    pub companions: BTreeMap<String, String>,
+}
+
+/// ADR 0038 §2: what [`TENSORRT_LLM_VERSIONS`] printed for `tensorrt_llm`
+/// and [`tensorrt_llm::COMPANIONS`], strictly: one `<name> <version>` line
+/// per distribution in the order asked, `<name> ` for a companion that is
+/// not installed, nothing else. `tensorrt_llm` itself must be installed and
+/// every version is 1-128 printable characters; anything else is `None`.
+pub fn parse_tensorrt_llm_versions(text: &str) -> Option<(String, BTreeMap<String, String>)> {
+    let mut lines = text.lines();
+    let mut version = None;
+    let mut companions = BTreeMap::new();
+    for name in
+        std::iter::once(tensorrt_llm::DISTRIBUTION).chain(tensorrt_llm::COMPANIONS.iter().copied())
+    {
+        let value = lines.next()?.strip_prefix(name)?.strip_prefix(' ')?;
+        if value.is_empty() && name != tensorrt_llm::DISTRIBUTION {
+            continue;
+        }
+        if !capyctl_config::registration::valid_companion_version(value) {
+            return None;
+        }
+        if name == tensorrt_llm::DISTRIBUTION {
+            version = Some(value.to_owned());
+        } else {
+            companions.insert(name.to_owned(), value.to_owned());
+        }
+    }
+    if lines.any(|line| !line.trim().is_empty()) {
+        return None;
+    }
+    Some((version?, companions))
 }
 
 /// Why a bounded run of an installation ([`run_bounded`]) gave no output.
@@ -559,21 +645,35 @@ pub(crate) fn run_bounded(
 /// and its version line is parsed; there is no dist-info to compare with.
 /// ADR 0039 §2: the native TensorFold binary prints `tensorfold-native
 /// <version>` on standard output, which must agree with the release's
-/// `VERSION` file when it has one.
+/// `VERSION` file when it has one. ADR 0038 §2: TensorRT-LLM's check runs
+/// the environment's interpreter in isolated mode on the installed metadata
+/// of `tensorrt_llm` and its companions; it never imports `tensorrt_llm` or
+/// runs `trtllm-serve`, either of which would start MPI (and, with Open MPI,
+/// a daemon outside the group).
 pub fn check_version(
     resolved: &Resolved,
     timeout: Duration,
 ) -> Result<ReportedVersion, VersionCheckError> {
-    let args: &[&str] = match resolved.engine {
-        Engine::Vllm | Engine::Tensorfold | Engine::Llamacpp => &["--version"],
-        Engine::Sglang => &["-I", "-B", "-c", SGLANG_VERSION, "sglang"],
+    let trtllm_args;
+    let (executable, args): (PathBuf, &[&str]) = match resolved.engine {
+        Engine::Vllm | Engine::Tensorfold | Engine::Llamacpp => {
+            (resolved.executable.clone(), &["--version"])
+        }
+        Engine::Sglang => (
+            resolved.executable.clone(),
+            &["-I", "-B", "-c", SGLANG_VERSION, "sglang"],
+        ),
+        Engine::TensorrtLlm => {
+            trtllm_args = tensorrt_llm_check_args();
+            (tensorrt_llm_interpreter(&resolved.env), &trtllm_args)
+        }
         // ADR 0031 §1: a custom engine is never executed to ask its version;
         // its version is its manifest's.
         Engine::Custom => return Err(VersionCheckError::Spawn),
     };
     let reads_stderr = resolved.engine == Engine::Llamacpp;
     let (status, output) = run_bounded(
-        &resolved.executable,
+        &executable,
         args,
         reads_stderr,
         timeout,
@@ -597,14 +697,22 @@ pub fn check_version(
         return Ok(ReportedVersion {
             build_fingerprint: build.fingerprint(),
             version: build.version,
+            companions: BTreeMap::new(),
         });
     }
-    let line = text
-        .lines()
-        .map(str::trim)
-        .rfind(|l| !l.is_empty())
-        .ok_or(VersionCheckError::Output)?;
-    let reported = line.rsplit(' ').next().unwrap_or(line).to_owned();
+    let (reported, companions) = if resolved.engine == Engine::TensorrtLlm {
+        parse_tensorrt_llm_versions(&text).ok_or(VersionCheckError::Output)?
+    } else {
+        let line = text
+            .lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty())
+            .ok_or(VersionCheckError::Output)?;
+        (
+            line.rsplit(' ').next().unwrap_or(line).to_owned(),
+            BTreeMap::new(),
+        )
+    };
     if reported != resolved.version {
         return Err(VersionCheckError::Mismatch {
             reported,
@@ -614,6 +722,7 @@ pub fn check_version(
     Ok(ReportedVersion {
         build_fingerprint: reported.clone(),
         version: reported,
+        companions,
     })
 }
 
@@ -652,5 +761,6 @@ fn native_version(
     Ok(ReportedVersion {
         build_fingerprint: reported.clone(),
         version: reported,
+        companions: BTreeMap::new(),
     })
 }

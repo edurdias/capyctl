@@ -11,6 +11,7 @@ more than one, each in its own environment.
 | SGLang | 0.5.21, 0.5.20 | `~/venvs/sglang` |
 | TensorFold | 0.6.6, 0.6.5, 0.6.3, 0.6.2, 0.6.1, 0.6.0 | `~/venvs/tensorfold` |
 | llama.cpp | v0.6.0 (every build lists as `CUSTOM yes` for now) | `~/llama.cpp` (a build, no environment) |
+| TensorRT-LLM | 1.2.1, the 1.3 pre-release, 1.4.0rc1 (every installation lists as `CUSTOM yes` for now) | `~/tensorrt-llm-<version>-venv` |
 
 Another version still runs, but `capyctl engine detect` shows it as
 `CUSTOM yes` ([Custom builds](engines.md#custom-builds)). Pin the version as
@@ -226,6 +227,74 @@ CapyCTL refuses to register or start llama.cpp on a machine that has it.
 llama.cpp's own guide: the
 [server README](https://github.com/ggml-org/llama.cpp/blob/v0.6.0/tools/server/README.md)
 at the release tag.
+
+## TensorRT-LLM 1.2.1, 1.3 pre-release or 1.4.0rc1
+
+CapyCTL runs TensorRT-LLM's `trtllm-serve` on one GPU. Three
+versions are being qualified, each with its own live rows: 1.2.1, a 1.3
+pre-release (the option tables were read from 1.3.0rc29) and 1.4.0rc1. No
+version has passed its rows yet, so the verified set is empty: every
+TensorRT-LLM installation lists as `CUSTOM yes` and runs as an uncertified
+custom setup. CapyCTL never refuses one for being uncertified.
+
+TensorRT-LLM needs two things outside its environment, installed once by an
+administrator:
+
+- Open MPI, which `mpi4py` loads at run time. On Ubuntu 24.04:
+
+  ```bash
+  sudo apt-get -y install libopenmpi-dev
+  ```
+
+- The CUDA toolkit from NVIDIA's packages: 13.1 for 1.2.1, 13.4 for 1.4.
+  The toolkits install side by side.
+
+The steps for 1.2.1 on ARM64 (a DGX Spark); the pre-releases follow the same
+shape from their own installation guides:
+
+1. Create the environment:
+
+   ```bash
+   python3.12 -m venv ~/tensorrt-llm-1.2.1-venv
+   ```
+
+2. Install PyTorch first, then pin it so the wheel cannot replace it:
+
+   ```bash
+   ~/tensorrt-llm-1.2.1-venv/bin/pip install torch==2.9.1 torchvision \
+     --index-url https://download.pytorch.org/whl/cu130
+   echo "torch==2.9.1+cu130" > constraints.txt
+   ```
+
+3. Install the wheel by URL with its hash, so nothing else can be substituted:
+
+   ```bash
+   ~/tensorrt-llm-1.2.1-venv/bin/pip install -c constraints.txt \
+     --extra-index-url https://pypi.nvidia.com/ \
+     "tensorrt_llm @ https://pypi.nvidia.com/tensorrt-llm/tensorrt_llm-1.2.1-cp312-cp312-linux_aarch64.whl#sha256=4c4cf7c00e0e54fe1038ffeb4247b66664d585d054c67810ce04d1c7a018f57a"
+   ```
+
+   The extra index supplies its NVIDIA dependencies (`tensorrt`, `nvidia-*`).
+
+4. Check it without importing it (an import starts MPI and CUDA):
+
+   ```bash
+   ~/tensorrt-llm-1.2.1-venv/bin/python -I -c \
+     'import importlib.metadata as m; print(m.version("tensorrt_llm"), m.version("torch"))'
+   ```
+
+   It prints `1.2.1 2.9.1+cu130`.
+
+5. Get a Hugging Face checkpoint in BF16 into a directory under `~/models`.
+   TensorRT-LLM on CapyCTL serves full-attention decoders; a model with
+   sliding windows, latent attention or recurrent layers is refused
+   (`kv_geometry_unsupported`).
+
+On its first start FlashInfer may download prebuilt kernels over the network.
+CapyCTL allows these downloads.
+
+Register it by naming `~/tensorrt-llm-1.2.1-venv/bin/trtllm-serve`
+([TensorRT-LLM](engines.md#tensorrt-llm)).
 
 ## Register it with CapyCTL
 

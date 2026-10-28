@@ -220,7 +220,13 @@ pub(super) fn resolve_timeouts(
         // ADR 0029 §9: llama.cpp follows ADR 0014 A1 and A7 until its live
         // rows measure its start. ADR 0039 §6: so does TensorFold's native
         // line, whose first start is not a build (TF2 measures it).
-        Engine::Vllm | Engine::Sglang | Engine::Llamacpp | Engine::Tensorfold => match weights {
+        // ADR 0038 §5: TensorRT-LLM too, until its live rows (TR3) measure
+        // its start.
+        Engine::Vllm
+        | Engine::Sglang
+        | Engine::Llamacpp
+        | Engine::Tensorfold
+        | Engine::TensorrtLlm => match weights {
             None => derived_initialize_ms(None),
             Some(_) => derived_initialize_ms(weights)
                 .saturating_add(STARTUP_WARMUP_MS)

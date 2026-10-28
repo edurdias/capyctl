@@ -499,12 +499,14 @@ impl CacheSalt {
 }
 
 /// SPEC §10: whether an engine family partitions its prefix cache by
-/// `cache_salt`. vLLM and SGLang do; TensorFold ignores the field on both
+/// `cache_salt`. vLLM and SGLang do, and so does TensorRT-LLM (ADR 0038
+/// §11: the server accepts the field, passes it to its generation call and
+/// salts its KV block reuse with it); TensorFold ignores the field on both
 /// lines (0.6, and the native line, ADR 0039 Evidence §6: no server code
 /// reads it), and an unrecorded family is treated as not honouring it, so a
 /// requested isolation is never silently absent.
 pub fn engine_honours_cache_salt(engine: Option<&str>) -> bool {
-    matches!(engine, Some("vllm" | "sglang"))
+    matches!(engine, Some("vllm" | "sglang" | "tensorrt-llm"))
 }
 
 impl ChatHttp {
@@ -2972,9 +2974,10 @@ pub(crate) mod tests {
         }
     }
 
-    // SPEC §10 (`cache_salt_unsupported`): only vLLM and SGLang honour the
-    // partition; a forwarder for any other engine refuses a request carrying
-    // one before connecting (the endpoint here accepts no connection).
+    // SPEC §10 (`cache_salt_unsupported`): only vLLM, SGLang and TensorRT-LLM
+    // honour the partition; a forwarder for any other engine refuses a request
+    // carrying one before connecting (the endpoint here accepts no connection).
+    // T49 (ADR 0038 §11): TensorRT-LLM salts its KV block reuse by the field.
     #[tokio::test]
     async fn a_forwarder_for_an_engine_ignoring_cache_salt_refuses_it_before_sending() {
         use super::engine_honours_cache_salt;
@@ -2983,6 +2986,7 @@ pub(crate) mod tests {
         assert!(!engine_honours_cache_salt(Some("tensorfold")));
         // T42 T37 (ADR 0029 §11): llama-server never reads the field.
         assert!(!engine_honours_cache_salt(Some("llamacpp")));
+        assert!(engine_honours_cache_salt(Some("tensorrt-llm")));
         assert!(!engine_honours_cache_salt(None));
         // ADR 0033 §5: the launch policy follows the same answer.
         use crate::forward::CacheSalt;
@@ -2993,7 +2997,7 @@ pub(crate) mod tests {
                 "{engine:?}"
             );
         }
-        for engine in ["vllm", "sglang"] {
+        for engine in ["vllm", "sglang", "tensorrt-llm"] {
             assert_eq!(
                 CacheSalt::for_launch(Some(engine), "dep-1", 3),
                 CacheSalt::Namespaced {

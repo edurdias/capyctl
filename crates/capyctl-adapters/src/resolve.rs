@@ -152,6 +152,14 @@ pub enum AdapterSpec {
         /// ADR 0031 §5: the manifest's health path.
         health: Option<String>,
     },
+    /// ADR 0038 §3, §9: `trtllm-serve` listens on loopback without a key
+    /// and serves chat only; an owned launch carries its plan.
+    TensorrtLlm {
+        endpoint: reqwest::Url,
+        fingerprint: String,
+        model_id: String,
+        launch: Option<crate::tensorrt_llm::PlanInputTensorrtLlm>,
+    },
 }
 
 impl AdapterSpec {
@@ -164,6 +172,7 @@ impl AdapterSpec {
             Self::Tensorfold { .. } => Engine::Tensorfold,
             Self::Llamacpp { .. } => Engine::Llamacpp,
             Self::Custom { .. } => Engine::Custom,
+            Self::TensorrtLlm { .. } => Engine::TensorrtLlm,
         }
     }
 
@@ -356,6 +365,22 @@ pub fn resolve(
                     .with_idle(idle);
             if let Some(mut launch) = launch {
                 launch.values.api_key = api_key;
+                adapter = adapter.with_launch(launch);
+            }
+            if let Some(tools) = tools {
+                adapter = adapter.with_tools(tools);
+            }
+            Box::new(adapter)
+        }
+        AdapterSpec::TensorrtLlm {
+            endpoint,
+            fingerprint,
+            model_id,
+            launch,
+        } => {
+            let mut adapter =
+                crate::tensorrt_llm::TensorrtLlmAdapter::new(endpoint, fingerprint, model_id);
+            if let Some(launch) = launch {
                 adapter = adapter.with_launch(launch);
             }
             if let Some(tools) = tools {

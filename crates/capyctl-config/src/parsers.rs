@@ -8,9 +8,9 @@
 //! the checkpoint's `config.json` (`model_type`, else `architectures`) and its
 //! chat template, which says what markup the model emits:
 //!
-//! | Family | `model_type` | tool calls (vLLM / SGLang) | reasoning |
+//! | Family | `model_type` | tool calls (vLLM / SGLang / TensorRT-LLM) | reasoning |
 //! |---|---|---|---|
-//! | Qwen3 | `qwen3`, `qwen3_moe` | `hermes` / `qwen25` | `qwen3` |
+//! | Qwen3 | `qwen3`, `qwen3_moe` | `hermes` / `qwen25` / `qwen3` | `qwen3` |
 //! | Qwen3.5 (also Qwen3.6, Qwen3.8) | `qwen3_5`, `qwen3_5_moe` | `qwen3_coder` | `qwen3` |
 //!
 //! The template picks the tool-call format: the XML markup (`<function=`)
@@ -118,6 +118,9 @@ struct Family {
     architectures: &'static [&'static str],
     vllm_json_tools: &'static str,
     sglang_json_tools: &'static str,
+    /// ADR 0038 §14: TensorRT-LLM's JSON tool parser (`--tool_parser`), read
+    /// from 1.2.1's `tool_parser_factory.py` (also in the 1.3 and 1.4 tags).
+    trtllm_json_tools: &'static str,
 }
 
 const FAMILIES: &[Family] = &[
@@ -127,6 +130,7 @@ const FAMILIES: &[Family] = &[
         architectures: &["Qwen3ForCausalLM", "Qwen3MoeForCausalLM"],
         vllm_json_tools: "hermes",
         sglang_json_tools: "qwen25",
+        trtllm_json_tools: "qwen3",
     },
     Family {
         name: "qwen3_5",
@@ -139,6 +143,7 @@ const FAMILIES: &[Family] = &[
         ],
         vllm_json_tools: "hermes",
         sglang_json_tools: "qwen25",
+        trtllm_json_tools: "qwen3",
     },
 ];
 
@@ -169,6 +174,8 @@ fn declared(settings: &LaunchSettings, kind: Kind) -> Option<Option<&str>> {
     let (tool, reasoning) = match settings {
         LaunchSettings::Vllm(s) => (&s.tool_call_parser, &s.reasoning_parser),
         LaunchSettings::Sglang(s) => (&s.tool_call_parser, &s.reasoning_parser),
+        // ADR 0038 §14: TensorRT-LLM's own parser names.
+        LaunchSettings::TensorrtLlm(s) => (&s.tool_call_parser, &s.reasoning_parser),
         // ADR 0029 §12: llama-server derives its parsers from the chat template.
         LaunchSettings::Tensorfold(_) | LaunchSettings::Llamacpp(_) => return None,
         // ADR 0031 §4: no parser is ever rendered for a custom engine.
@@ -314,6 +321,7 @@ fn from_family(
         Kind::ToolCall if template.contains("<function=") => XML_TOOLS,
         Kind::ToolCall => match engine {
             Engine::Sglang => family.sglang_json_tools,
+            Engine::TensorrtLlm => family.trtllm_json_tools,
             _ => family.vllm_json_tools,
         },
         Kind::Reasoning if !template.contains("<think>") => {
@@ -339,7 +347,7 @@ pub fn parsers_for_launch(
     profile_args: &[String],
     checkpoint_root: Option<&Path>,
 ) -> Option<Parsers> {
-    if !matches!(engine, Engine::Vllm | Engine::Sglang) {
+    if !matches!(engine, Engine::Vllm | Engine::Sglang | Engine::TensorrtLlm) {
         return None;
     }
     declared(settings, Kind::ToolCall)?;

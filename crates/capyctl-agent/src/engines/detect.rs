@@ -5,6 +5,10 @@
 //! found by file name, its version read from a `libllama.so.X.Y.Z` name.
 //! ADR 0039 §2: TensorFold's native release is a third, found by its
 //! `bin/tensorfold-native`, its version read from the root's `VERSION` file.
+//! ADR 0038 §2: TensorRT-LLM is found by its `tensorrt_llm-*.dist-info`
+//! beside `bin/trtllm-serve`, with the same roots and bounds; its `custom`
+//! marking reads the environment's `torch-*.dist-info` too, and nothing is
+//! executed (running `trtllm-serve` or importing the package starts MPI).
 use super::{packages, release_version, resolve::entry, resolve::library_dirs, site_packages};
 use capyctl_config::engine_policy::Engine;
 use capyctl_config::llamacpp::EXECUTABLE;
@@ -134,7 +138,7 @@ impl Scan<'_> {
             if std::fs::symlink_metadata(&entry).is_err() {
                 continue;
             }
-            let custom = !capyctl_config::registration::is_verified(engine, &version);
+            let custom = !super::verified_in_env(engine, &version, env);
             self.found.push(Candidate {
                 engine,
                 version,

@@ -277,6 +277,9 @@ impl NativeHostExecution {
                 crate::runtime_integrity::launch_required_files(&effective),
             )
             .map_err(|_| refused("runtime_integrity"))?;
+            // ADR 0038 §3, §4: the TensorRT-LLM checkpoint's geometry, read
+            // again here, as the full admission reads it.
+            self.admit_tensorrt_llm(&effective)?;
             return self.admit_memory(&effective, command, reading);
         }
         self.admit_launch_full(command, plan, reading)
@@ -332,6 +335,10 @@ impl NativeHostExecution {
         // placement or any change).
         self.verify_checkpoint(&effective, plan)
             .map_err(|error| refused(checkpoint_refusal(error)))?;
+        // ADR 0038 §3, §4: a TensorRT-LLM checkpoint, measured as recorded,
+        // whose KV geometry CapyCTL cannot size the pool from (or a served
+        // name that cannot name its link) is refused before any effect.
+        self.admit_tensorrt_llm(&effective)?;
         self.admit_memory(&effective, command, reading)
     }
 

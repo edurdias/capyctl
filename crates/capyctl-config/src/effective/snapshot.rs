@@ -347,6 +347,8 @@ fn restate_engine_fields(
         ],
         Some("tensorfold") => &["max_tokens", "thinking"],
         Some("llamacpp") => &["n_gpu_layers", "gguf_file", "mmproj_file"],
+        // ADR 0038 §3, §14.
+        Some("tensorrt-llm") => &["tool_call_parser", "reasoning_parser", "llm_api_options"],
         _ => return Err(invalid("snapshot.engine_config", "unsupported engine")),
     };
     let prefix = engine.expect("engine checked above");

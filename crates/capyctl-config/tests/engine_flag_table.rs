@@ -40,6 +40,11 @@ const SECTIONS: &[(&str, Engine, TensorfoldLine)] = &[
         Engine::Llamacpp,
         TensorfoldLine::Python,
     ),
+    (
+        "## TensorRT-LLM 1.2.1, 1.3.0rc29 and 1.4.0rc1",
+        Engine::TensorrtLlm,
+        TensorfoldLine::Python,
+    ),
 ];
 
 const HEADER: &str = "| Need | Option | Class | CapyCTL |";
