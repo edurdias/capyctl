@@ -60,6 +60,10 @@ refused, and the start fails naming it, as on a host.
 
 ### 2. TensorFold launched with its declared allocation as its cap
 
+*Amended by [ADR 0039](0039-tensorfold-1.md) §8:* the native line is launched with the
+same cap and with `TENSORFOLD_MEMORY_RESERVE_GIB=2`; it admits every stream at its full
+window at start, so nothing grows past the cap by use.
+
 CapyCTL launches TensorFold with `TENSORFOLD_CUDA_MEMORY_LIMIT_GB` set to the
 deployment's declared Ready allocation on the memory its GPU allocates from (the
 `unified` or `device` domain), in GiB, rounded down to a whole MiB. Ready is the

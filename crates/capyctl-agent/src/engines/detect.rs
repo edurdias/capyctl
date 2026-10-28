@@ -3,9 +3,12 @@
 //! scanned, and is bounded in environments, depth and directory entries.
 //! ADR 0029 §2: llama.cpp's bare `llama-server` binary is a second source,
 //! found by file name, its version read from a `libllama.so.X.Y.Z` name.
-use super::{packages, resolve::entry, resolve::library_dirs, site_packages};
+//! ADR 0039 §2: TensorFold's native release is a third, found by its
+//! `bin/tensorfold-native`, its version read from the root's `VERSION` file.
+use super::{packages, release_version, resolve::entry, resolve::library_dirs, site_packages};
 use capyctl_config::engine_policy::Engine;
 use capyctl_config::llamacpp::EXECUTABLE;
+use capyctl_config::tensorfold_native::{self, TensorfoldLine};
 use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -18,8 +21,12 @@ pub struct Candidate {
     pub entry: PathBuf,
     /// Where it was found: `PATH`, `conda`, `home`, `venv`, `uv`, `pipx`,
     /// `opt`, `system` (ADR 0029 §2: `/usr/local/bin`) or `path`. For a bare
-    /// binary, `env` is the directory holding it.
+    /// binary, `env` is the directory holding it; for a native TensorFold
+    /// release (ADR 0039 §2), its root, the directory above `bin`.
     pub source: &'static str,
+    /// ADR 0039 §1: the TensorFold line (`native` for a release root,
+    /// `python` for every environment and every other engine).
+    pub line: TensorfoldLine,
     pub custom: bool,
 }
 
@@ -134,6 +141,7 @@ impl Scan<'_> {
                 env: env.to_path_buf(),
                 entry,
                 source,
+                line: TensorfoldLine::Python,
                 custom,
             });
         }
@@ -179,6 +187,63 @@ impl Scan<'_> {
             env: bin,
             entry: file,
             source,
+            line: TensorfoldLine::Python,
+            custom,
+        });
+    }
+
+    /// ADR 0039 §2: an executable regular file named `tensorfold-native` in
+    /// `dir`, a release's `bin` directory. A link is followed only to a file
+    /// inside `root`; the release root is the directory above `bin`, and the
+    /// version is its `VERSION` file, else `unknown` until `engine add`.
+    /// Metadata only: nothing is executed.
+    fn native(&mut self, dir: &Path, root: &Path, source: &'static str) {
+        if self.examined >= self.bounds.max_envs {
+            return;
+        }
+        let named = dir.join(tensorfold_native::EXECUTABLE);
+        let Ok(meta) = std::fs::symlink_metadata(&named) else {
+            return;
+        };
+        let file = if meta.file_type().is_symlink() {
+            match (named.canonicalize(), root.canonicalize()) {
+                (Ok(target), Ok(root)) if target.starts_with(&root) => target,
+                _ => return,
+            }
+        } else {
+            named
+        };
+        let regular_executable = std::fs::symlink_metadata(&file)
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+        let Some(release) = file
+            .parent()
+            .filter(|bin| bin.file_name().is_some_and(|name| name == "bin"))
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+        else {
+            return;
+        };
+        let Ok(key) = file.canonicalize() else { return };
+        if !regular_executable || !self.seen.insert(key) {
+            return;
+        }
+        self.examined += 1;
+        let version = match release_version(&release) {
+            super::ReleaseVersion::Stated(version) => version,
+            super::ReleaseVersion::Absent | super::ReleaseVersion::Unreadable => "unknown".into(),
+        };
+        let custom = !capyctl_config::registration::is_verified_line(
+            Engine::Tensorfold,
+            TensorfoldLine::Native,
+            &version,
+        );
+        self.found.push(Candidate {
+            engine: Engine::Tensorfold,
+            version,
+            env: release,
+            entry: file,
+            source,
+            line: TensorfoldLine::Native,
             custom,
         });
     }
@@ -210,10 +275,12 @@ impl Scan<'_> {
         children
     }
 
-    /// `--path`: the directory itself, or environments and `llama-server`
-    /// binaries below it, to `depth`. A link leads nowhere outside `top`.
+    /// `--path`: the directory itself, or environments, `llama-server`
+    /// binaries and (ADR 0039 §2) `tensorfold-native` binaries below it, to
+    /// `depth`. A link leads nowhere outside `top`.
     fn tree(&mut self, root: &Path, top: &Path, depth: usize) {
         self.binary(root, top, "path");
+        self.native(root, top, "path");
         if !site_packages(root).is_empty() {
             self.env(root, "path");
             return;
@@ -242,8 +309,10 @@ pub fn detect(roots: &ScanRoots, bounds: &ScanBounds) -> Vec<Candidate> {
                 scan.env(env, "PATH");
             }
         }
-        // ADR 0029 §2: a `llama-server` in any PATH entry.
+        // ADR 0029 §2: a `llama-server` in any PATH entry; ADR 0039 §2: a
+        // `tensorfold-native` too.
         scan.binary(dir, dir, "PATH");
+        scan.native(dir, dir, "PATH");
     }
     if let Some(home) = &roots.home {
         let listed = home.join(".conda/environments.txt");
@@ -271,6 +340,8 @@ pub fn detect(roots: &ScanRoots, bounds: &ScanBounds) -> Vec<Candidate> {
             if std::fs::symlink_metadata(child.join("pyvenv.cfg")).is_ok_and(|m| m.is_file()) {
                 scan.env(&child, "home");
             }
+            // ADR 0039 §2: `~/*/bin/tensorfold-native` (`~/tensorfold-1.0.0`).
+            scan.native(&child.join("bin"), &child, "home");
         }
         scan.env(&home.join(".venv"), "venv");
         for parent in ["venvs", ".virtualenvs"] {
@@ -307,12 +378,15 @@ pub fn detect(roots: &ScanRoots, bounds: &ScanBounds) -> Vec<Candidate> {
             scan.env(&child, "opt");
             scan.env(&child.join("venv"), "opt");
             scan.env(&child.join(".venv"), "opt");
-            // ADR 0029 §2: `/opt/*/bin/llama-server`.
+            // ADR 0029 §2: `/opt/*/bin/llama-server`; ADR 0039 §2:
+            // `/opt/*/bin/tensorfold-native`.
             scan.binary(&child.join("bin"), &child, "opt");
+            scan.native(&child.join("bin"), &child, "opt");
         }
     }
     for dir in &roots.system_bins {
         scan.binary(dir, dir, "system");
+        scan.native(dir, dir, "system");
     }
     for extra in &roots.extra {
         scan.tree(extra, extra, bounds.max_depth);

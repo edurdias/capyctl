@@ -2121,6 +2121,129 @@ async fn a_host_without_custom_engines_never_takes_a_custom_deployment() {
     assert_eq!(state.lock().unwrap().store().deployment_count().unwrap(), 1);
 }
 
+/// Two enrolled hosts publishing one TensorFold native 1.0.0 profile as
+/// `local` (ADR 0039 §1, §2); each declares `tensorfold_native` when
+/// `capable` says so.
+fn native_hosts(
+    state: &Arc<Mutex<OwnedCoordinatorState>>,
+    capable: [bool; 2],
+) -> (axum::Router, Vec<String>) {
+    let profile = json!({
+        "engine": "tensorfold",
+        "line": "native",
+        "native": {"families": {"nemotron_h": ["mlx-q4g64"]}, "checksums_verified": true},
+        "revision": 7,
+        "executable": "/opt/tensorfold-1.0.0/bin/tensorfold-native",
+        "build_fingerprint": "1.0.0",
+        "args": [],
+        "env": {},
+        "security": {
+            "deep_park": "disabled",
+            "trust_remote_code": false,
+            "credential_ref": "secret://engine-key",
+            "admin_credential_ref": "secret://admin-key",
+        },
+        "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3},
+    });
+    let mut ids = Vec::new();
+    for (index, (name, digest)) in [("host-a", 'e'), ("host-b", 'f')].into_iter().enumerate() {
+        let id = publish_host(state, name, digest, json!({}));
+        let owner = state.lock().unwrap();
+        let mut document: Value = serde_json::from_str(
+            &owner
+                .store()
+                .host_publication(&id)
+                .unwrap()
+                .unwrap()
+                .config_json,
+        )
+        .unwrap();
+        document["runtime_profiles"]["local"] = profile.clone();
+        owner
+            .store()
+            .publish_host_configuration(&capyctl_store::host_publication::HostPublication {
+                host_id: id.clone(),
+                config_json: document.to_string(),
+                boot_id: format!("boot-{name}"),
+                fingerprint: capyctl_config::remote_resources::policy_fingerprint(&document),
+                received_at_ms: 2000,
+            })
+            .unwrap();
+        let mut capabilities = vec!["heartbeats".to_owned()];
+        if capable[index] {
+            capabilities.push("tensorfold_native".into());
+        }
+        owner
+            .store()
+            .record_host_version(
+                &id,
+                &capyctl_store::host_versions::HostVersion {
+                    binary_version: "0.2.0".into(),
+                    compatibility: "supported".into(),
+                    reason: String::new(),
+                    capabilities,
+                    recorded_at_ms: 2000,
+                },
+            )
+            .unwrap();
+        ids.push(id);
+    }
+    let router = configuration_router(
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+        Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+    );
+    (router, ids)
+}
+
+/// ADR 0039 §15 (ADR 0017): a host that does not declare `tensorfold_native`
+/// is never a candidate for a deployment on a TensorFold native profile:
+/// among several allowed hosts it is recorded refused with the typed reason,
+/// and named alone it refuses the deploy, storing nothing; so an older agent
+/// never renders a native installation with the 0.6 command.
+// T41 T37
+#[tokio::test]
+async fn a_host_without_tensorfold_native_never_takes_a_native_deployment() {
+    let (_directory, state, config, _host) = fixture();
+    let (router, ids) = native_hosts(&state, [false, true]);
+    let native = |hosts: &[&str]| {
+        let mut config = custom_config(config.clone(), hosts);
+        config["engine_config"] = json!({"context_length": 8192});
+        config
+    };
+    let (status, body) = deploy(&router, "both", &native(&["host-a", "host-b"])).await;
+    assert_eq!(status, 202, "{body}");
+    let id = body["deployment_id"].as_str().unwrap().to_owned();
+    let snapshot = state.lock().unwrap().store().snapshot().unwrap();
+    let deployment = snapshot.deployments.iter().find(|d| d.id == id).unwrap();
+    let hosts: Vec<_> = deployment
+        .hosts
+        .iter()
+        .map(|h| (h.host_id.clone(), h.outcome.clone(), h.diagnostic.clone()))
+        .collect();
+    assert!(
+        hosts.contains(&(
+            "host-a".into(),
+            "refused".into(),
+            Some("host_capability_missing:tensorfold_native".into())
+        )),
+        "{hosts:?}"
+    );
+    assert!(
+        hosts.contains(&(ids[1].clone(), "resolved".into(), None)),
+        "{hosts:?}"
+    );
+
+    let (status, body) = deploy(&router, "alone", &native(&["host-a"])).await;
+    assert_eq!(status, 400, "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("host_capability_missing:tensorfold_native"),
+        "{message}"
+    );
+    assert!(message.contains("host-a"), "{message}");
+    assert_eq!(state.lock().unwrap().store().deployment_count().unwrap(), 1);
+}
+
 /// Two enrolled hosts whose `local` profile is vLLM 0.32.0 with LMCache
 /// 0.5.6 registered (ADR 0033 §§1, 2); each publishes `settings[i]` at its
 /// document's root (its `lmcache`, its `retention`) and declares

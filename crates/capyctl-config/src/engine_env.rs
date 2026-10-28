@@ -179,6 +179,55 @@ pub fn is_owned(name: &str) -> bool {
         || reserved(&upper)
 }
 
+/// ADR 0039 §5: the names CapyCTL renders into the native TensorFold line's
+/// closed environment. All but the engine's memory reserve are owned on
+/// every engine already ([`OWNED_NAMES`], the `CAPYCTL_` family); the reserve
+/// is owned on the native line alone, so the Python line keeps its meaning.
+pub const TENSORFOLD_NATIVE_RENDERED: &[&str] = &[
+    "PATH",
+    "HOME",
+    "CUDA_VISIBLE_DEVICES",
+    "CUDA_DEVICE_ORDER",
+    "HF_HUB_OFFLINE",
+    "TENSORFOLD_NO_UPDATE_CHECK",
+    "TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
+    "TENSORFOLD_MEMORY_RESERVE_GIB",
+    "CAPYCTL_ENGINE_LOG",
+    "DO_NOT_TRACK",
+];
+
+/// ADR 0039 §5: why a native TensorFold profile may not name `name` in its
+/// `env`, its `security.approved_env` or a deployment's `engine_config.env`,
+/// as the closed reason `engine_env_reserved:<name>` with why: a name the
+/// native line renders, or one of `tensorfold_native::REFUSED_ENV`, which
+/// the native engine reads and CapyCTL never carries. `None` for any other
+/// name. Compared upper-cased, as [`is_owned`] is.
+pub fn tensorfold_native_refusal(name: &str) -> Option<String> {
+    let upper = name.to_ascii_uppercase();
+    if let Some(why) = crate::tensorfold_native::refused_env(&upper) {
+        return Some(format!(
+            "engine_env_reserved:{name}: TensorFold native never carries it: {why}"
+        ));
+    }
+    TENSORFOLD_NATIVE_RENDERED
+        .contains(&upper.as_str())
+        .then(|| {
+            format!("engine_env_reserved:{name}: CapyCTL renders it on the TensorFold native line")
+        })
+}
+
+/// [`tensorfold_native_refusal`] of the first refused name among `names`.
+/// An approval glob (`TF_*`) is not a name: the concrete names it admits are
+/// checked where a deployment sets them.
+pub fn tensorfold_native_refused<'a>(
+    names: impl IntoIterator<Item = &'a String>,
+) -> Option<String> {
+    names
+        .into_iter()
+        .filter(|name| !name.ends_with('*'))
+        .find_map(|name| tensorfold_native_refusal(name))
+}
+
 /// Why an engine environment was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvRefusal {

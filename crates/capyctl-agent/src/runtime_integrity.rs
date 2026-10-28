@@ -27,7 +27,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use capyctl_adapters::owner_only::PrivateGroup;
-use capyctl_config::effective::Engine;
+use capyctl_config::effective::{Engine, TensorfoldLine};
 
 /// The modules a vLLM launch imports from the runtime directory.
 pub const VLLM_RUNTIME_FILES: &[&str] = &["capyctl_vllm_guard.py", "vllm_entry.py"];
@@ -50,12 +50,20 @@ pub const SGLANG_RUNTIME_FILES: &[&str] = &[
 ];
 
 /// The files one engine requires. `sleep_mode` is whether a vLLM launch renders
-/// sleep mode (deep parking); an SGLang launch always needs its probes.
-pub fn required_files(engine: Engine, sleep_mode: bool) -> &'static [&'static str] {
+/// sleep mode (deep parking); an SGLang launch always needs its probes. ADR
+/// 0039 §2: `line` is TensorFold's (`python` for every other engine).
+pub fn required_files(
+    engine: Engine,
+    line: TensorfoldLine,
+    sleep_mode: bool,
+) -> &'static [&'static str] {
     match engine {
         Engine::Vllm if sleep_mode => VLLM_SLEEP_RUNTIME_FILES,
         Engine::Vllm => VLLM_RUNTIME_FILES,
         Engine::Sglang => SGLANG_RUNTIME_FILES,
+        // ADR 0039 §2: the native binary imports nothing of CapyCTL's and
+        // its capabilities document replaces the probe.
+        Engine::Tensorfold if line.is_native() => &[],
         // ADR 0023 §2: TensorFold needs only the capability probe.
         Engine::Tensorfold => &[CAPABILITY_PROBE],
         // ADR 0029 §2: llama-server imports nothing of CapyCTL's and is never
@@ -68,7 +76,7 @@ pub fn required_files(engine: Engine, sleep_mode: bool) -> &'static [&'static st
 
 /// The files one resolved launch requires: sleep mode is what its effective
 /// configuration renders (`enable_sleep_mode`, derived from its residency and
-/// the host's deep-park switch).
+/// the host's deep-park switch); the line is its profile's (ADR 0039 §1).
 pub fn launch_required_files(
     effective: &capyctl_config::effective::EffectiveDeployment,
 ) -> &'static [&'static str] {
@@ -76,7 +84,7 @@ pub fn launch_required_files(
         &effective.engine_config,
         capyctl_domain::launch::LaunchSettings::Vllm(settings) if settings.enable_sleep_mode
     );
-    required_files(effective.profile.engine, sleep_mode)
+    required_files(effective.profile.engine, effective.profile.line, sleep_mode)
 }
 
 /// Why a runtime directory is not trusted. Names the path and the defect;
@@ -201,6 +209,9 @@ mod tests {
     use capyctl_adapters::owner_only::system_private_group;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+    /// Every engine but TensorFold's native line.
+    const PY: TensorfoldLine = TensorfoldLine::Python;
+
     fn runtime(files: &[&str]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -220,10 +231,10 @@ mod tests {
     #[test]
     fn a_private_runtime_directory_is_trusted() {
         let dir = runtime(&["capyctl_vllm_guard.py", "vllm_entry.py", "README.md"]);
-        verify(dir.path(), required_files(Engine::Vllm, false)).unwrap();
+        verify(dir.path(), required_files(Engine::Vllm, PY, false)).unwrap();
         // A non-module file's mode is not the engine's import surface.
         chmod(&dir.path().join("README.md"), 0o666);
-        verify(dir.path(), required_files(Engine::Vllm, false)).unwrap();
+        verify(dir.path(), required_files(Engine::Vllm, PY, false)).unwrap();
     }
 
     fn private(_gid: u32, _uid: u32) -> Option<bool> {
@@ -244,23 +255,50 @@ mod tests {
     #[test]
     fn the_capability_probe_is_required_where_an_entry_imports_it() {
         let vllm = runtime(&["capyctl_vllm_guard.py", "vllm_entry.py"]);
-        verify(vllm.path(), required_files(Engine::Vllm, false)).unwrap();
-        let error = verify(vllm.path(), required_files(Engine::Vllm, true)).unwrap_err();
+        verify(vllm.path(), required_files(Engine::Vllm, PY, false)).unwrap();
+        let error = verify(vllm.path(), required_files(Engine::Vllm, PY, true)).unwrap_err();
         assert_eq!(error.path, vllm.path().join(CAPABILITY_PROBE));
         assert_eq!(error.problem, "missing");
         std::fs::write(vllm.path().join(CAPABILITY_PROBE), "# probes\n").unwrap();
         chmod(&vllm.path().join(CAPABILITY_PROBE), 0o644);
-        verify(vllm.path(), required_files(Engine::Vllm, true)).unwrap();
+        verify(vllm.path(), required_files(Engine::Vllm, PY, true)).unwrap();
 
         let sglang = runtime(&["sglang_entry.py", "pinned_file_observation.py"]);
         for sleep_mode in [false, true] {
-            let error =
-                verify(sglang.path(), required_files(Engine::Sglang, sleep_mode)).unwrap_err();
+            let error = verify(
+                sglang.path(),
+                required_files(Engine::Sglang, PY, sleep_mode),
+            )
+            .unwrap_err();
             assert_eq!(error.path, sglang.path().join(CAPABILITY_PROBE));
         }
         std::fs::write(sglang.path().join(CAPABILITY_PROBE), "# probes\n").unwrap();
         chmod(&sglang.path().join(CAPABILITY_PROBE), 0o644);
-        verify(sglang.path(), required_files(Engine::Sglang, false)).unwrap();
+        verify(sglang.path(), required_files(Engine::Sglang, PY, false)).unwrap();
+    }
+
+    // T41 (ADR 0039 §2): a native TensorFold launch imports nothing of
+    // CapyCTL's and needs no capability probe; the 0.6 line still does.
+    #[test]
+    fn a_native_tensorfold_launch_requires_no_runtime_file() {
+        let empty = runtime(&[]);
+        for sleep_mode in [false, true] {
+            assert!(
+                required_files(Engine::Tensorfold, TensorfoldLine::Native, sleep_mode).is_empty()
+            );
+            verify(
+                empty.path(),
+                required_files(Engine::Tensorfold, TensorfoldLine::Native, sleep_mode),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            required_files(Engine::Tensorfold, PY, false),
+            &[CAPABILITY_PROBE]
+        );
+        let error =
+            verify(empty.path(), required_files(Engine::Tensorfold, PY, false)).unwrap_err();
+        assert_eq!(error.path, empty.path().join(CAPABILITY_PROBE));
     }
 
     // T21 T37: owner decision 2026-09-22. A module group-writable only by the
@@ -369,12 +407,17 @@ mod tests {
             "engine_capabilities.py",
             "sglang_saver_binding.py",
         ]);
-        verify(dir.path(), required_files(Engine::Sglang, true)).unwrap();
+        verify(dir.path(), required_files(Engine::Sglang, PY, true)).unwrap();
         chmod(&dir.path().join("sglang_saver_binding.py"), 0o664);
-        assert!(verify_with(dir.path(), required_files(Engine::Sglang, true), &shared).is_err());
+        assert!(verify_with(
+            dir.path(),
+            required_files(Engine::Sglang, PY, true),
+            &shared
+        )
+        .is_err());
         chmod(&dir.path().join("sglang_saver_binding.py"), 0o644);
         chmod(&dir.path().join("pinned_file_observation.py"), 0o666);
-        assert!(verify(dir.path(), required_files(Engine::Sglang, true)).is_err());
+        assert!(verify(dir.path(), required_files(Engine::Sglang, PY, true)).is_err());
     }
 
     // T21 T37: SPEC §9.1. Python imports compiled and extension files, and

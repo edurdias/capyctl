@@ -1,7 +1,8 @@
 //! Spec §5, ADR 0023 §6, ADR 0029 §10, ADR 0031 §6: before a Terminate
-//! signals a launch whose engine counts its own work (TensorFold's `/health`,
-//! llama.cpp's `/metrics`, a custom engine's idle signal), the host waits for
-//! those counters to read idle, bounded, after CapyCTL's own drain.
+//! signals a launch whose engine counts its own work (TensorFold 0.6's
+//! `/health`, TensorFold native's and llama.cpp's `/metrics` (ADR 0039 §10),
+//! a custom engine's idle signal), the host waits for those counters to read
+//! idle, bounded, after CapyCTL's own drain.
 use super::NativeHostExecution;
 use crate::session::SessionError;
 use capyctl_adapters::llamacpp::LlamacppAdapter;
@@ -51,6 +52,30 @@ impl NativeHostExecution {
             }
         }
         super::custom::frozen_profile(set.as_deref()?, &plan.profile_name)
+    }
+
+    /// ADR 0039 §1, §10: the TensorFold line a retained launch was approved
+    /// under, which decides its idle read (`/health` on 0.6, `/metrics` on
+    /// the native line): from its resolution, else from the profile its plan
+    /// names in the document it was approved under (no `line` there is the
+    /// Python line).
+    pub(super) fn frozen_line(
+        &self,
+        owned: &MemberCommand,
+        plan: &SingleLaunchPlan,
+    ) -> capyctl_config::tensorfold_native::TensorfoldLine {
+        if let Ok(effective) = self.resolve_retained(owned) {
+            return effective.profile.line;
+        }
+        self.profiles
+            .for_fingerprint(&plan.host_policy_fingerprint)
+            .and_then(|set| {
+                serde_json::from_value(
+                    set.config.document["runtime_profiles"][&plan.profile_name]["line"].clone(),
+                )
+                .ok()
+            })
+            .unwrap_or_default()
     }
 
     /// Spec §5, ADR 0023 §6: whether a Terminate of `owned_handle` may signal.
@@ -197,7 +222,10 @@ impl NativeHostExecution {
                     Err(_) => return false,
                 }
             }
-            _ => Box::new(TensorfoldAdapter::new(endpoint, fingerprint, String::new())),
+            _ => Box::new(
+                TensorfoldAdapter::new(endpoint, fingerprint, String::new())
+                    .with_line(self.frozen_line(owned, plan)),
+            ),
         };
         let member = MemberRef {
             deployment_id: owned.identity.deployment_id.clone(),

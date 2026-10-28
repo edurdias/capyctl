@@ -81,19 +81,31 @@ pub fn plan_from_effective(
     // `--drafter none`; resolution refused arguments naming another drafter
     // or `--no-drafts`. CapyCTL chose the directory, so it needs no approval.
     let mut engine_args = profile.args.clone();
+    let native = profile.line.is_native();
     if let Some(draft) = &effective.model.draft {
+        // ADR 0039 §6: resolution refuses `model.draft` on the native line,
+        // which drafts with the checkpoint's own MTP head; a plan that
+        // carries one anyway is refused again.
+        if native {
+            return Err(TensorfoldPlanError::Unresolved(
+                capyctl_config::tensorfold_native::DRAFTER_REFUSAL.into(),
+            ));
+        }
         let dir = draft.resolved_path.clone().ok_or_else(|| {
             TensorfoldPlanError::Unresolved("the drafter resolves to no directory".into())
         })?;
         engine_args.extend(["--drafter".to_owned(), dir]);
     }
     Ok(PlanInputTensorfold {
+        line: profile.line,
         engine_bin: profile.executable.clone(),
+        // ADR 0039 §2, §5: the native binary runs nothing and builds nothing,
+        // so its PATH names neither the installation's `bin` nor a CUDA home.
         engine_path_extra: Path::new(&profile.executable)
             .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
+            .filter(|parent| !native && !parent.as_os_str().is_empty())
             .map(|parent| parent.to_string_lossy().into_owned()),
-        cuda_home: profile.cuda_home.clone(),
+        cuda_home: profile.cuda_home.clone().filter(|_| !native),
         build_env: effective.engine_env.values(),
         unified_ready_bytes: crate::engine_env::unified_ready_bytes(effective),
         model_path,
@@ -111,11 +123,13 @@ pub fn plan_from_effective(
         // run them; a host-fixed or extra `--parallel` wins.
         parallel: capyctl_config::context_fit::tensorfold_parallel(
             &effective.engine_config,
+            profile.line,
             &profile.args,
         ),
         engine_args,
         extra_args: settings.extra_args.clone(),
-        extensions_dir,
+        // ADR 0039 §2: no extensions directory on the native line.
+        extensions_dir: extensions_dir.filter(|_| !native),
         engine_log: Some(engine_log),
         cuda_namespace: effective
             .cuda_namespace()

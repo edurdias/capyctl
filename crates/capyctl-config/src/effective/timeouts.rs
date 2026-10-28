@@ -37,6 +37,7 @@ pub const WAKE_CAP_MS: i64 = 900_000;
 pub const STARTUP_WARMUP_MS: i64 = 480_000;
 /// ADR 0023 §4: the first TensorFold start builds its CUDA extensions; the
 /// host gives up earlier once a build exists (`capyctl-adapters::tensorfold`).
+/// ADR 0039 §6: the Python line's alone; the native line builds nothing.
 pub const TENSORFOLD_FIRST_BUILD_MS: i64 = 1_800_000;
 /// While the checkpoint digest (and so the weights bytes) is pending, the
 /// conservative Initialize timeout. Wake uses its cap: nothing wakes before a
@@ -182,6 +183,7 @@ pub(super) fn resolve_timeouts(
     request_deadline_ms: i64,
     facts: CheckpointFacts,
     engine: Engine,
+    line: crate::tensorfold_native::TensorfoldLine,
     residency: Residency,
 ) -> Result<DeploymentTimeouts, ConfigError> {
     let raw = raw.cloned().unwrap_or_default();
@@ -214,10 +216,11 @@ pub(super) fn resolve_timeouts(
         }
     };
     let derived_initialize = match engine {
-        Engine::Tensorfold => TENSORFOLD_FIRST_BUILD_MS,
+        Engine::Tensorfold if line.is_python() => TENSORFOLD_FIRST_BUILD_MS,
         // ADR 0029 §9: llama.cpp follows ADR 0014 A1 and A7 until its live
-        // rows measure its start.
-        Engine::Vllm | Engine::Sglang | Engine::Llamacpp => match weights {
+        // rows measure its start. ADR 0039 §6: so does TensorFold's native
+        // line, whose first start is not a build (TF2 measures it).
+        Engine::Vllm | Engine::Sglang | Engine::Llamacpp | Engine::Tensorfold => match weights {
             None => derived_initialize_ms(None),
             Some(_) => derived_initialize_ms(weights)
                 .saturating_add(STARTUP_WARMUP_MS)
@@ -262,6 +265,7 @@ pub fn validate_declared_timeouts(deployment: &serde_json::Value) -> Result<(), 
         ceiling,
         CheckpointFacts::default(),
         Engine::Vllm,
+        crate::tensorfold_native::TensorfoldLine::Python,
         Residency::Deep,
     )
     .map(|_| ())
@@ -282,6 +286,7 @@ pub fn lifecycle_windows(request_deadline_ms: i64, initialize_ms: Option<i64>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensorfold_native::TensorfoldLine::{Native, Python};
 
     const GIB: i64 = 1 << 30;
 
@@ -314,6 +319,7 @@ mod tests {
                     ..Default::default()
                 },
                 engine,
+                Python,
                 Residency::Deep,
             )
             .unwrap();
@@ -329,6 +335,7 @@ mod tests {
             3_600_000,
             CheckpointFacts::default(),
             Engine::Vllm,
+            Python,
             Residency::Deep,
         )
         .unwrap();
@@ -346,6 +353,7 @@ mod tests {
                 ..Default::default()
             },
             Engine::Vllm,
+            Python,
             Residency::Deep,
         )
         .unwrap();
@@ -366,7 +374,7 @@ mod tests {
             ..Default::default()
         };
         let window = |raw: Option<&RawTimeouts>, residency| {
-            resolve_timeouts(raw, 3_600_000, qwen, Engine::Sglang, residency).unwrap()
+            resolve_timeouts(raw, 3_600_000, qwen, Engine::Sglang, Python, residency).unwrap()
         };
         let deep = window(None, Residency::Deep);
         assert_eq!(deep.wake_ms, 105_000);
@@ -394,8 +402,15 @@ mod tests {
         assert_eq!(restart.wake_ms, 150_000);
         assert_eq!(restart.provenance["wake"], TimeoutSource::Declared);
         // Lowered to the request deadline with the Initialize window.
-        let short =
-            resolve_timeouts(None, 300_000, qwen, Engine::Sglang, Residency::RestartOnly).unwrap();
+        let short = resolve_timeouts(
+            None,
+            300_000,
+            qwen,
+            Engine::Sglang,
+            Python,
+            Residency::RestartOnly,
+        )
+        .unwrap();
         assert_eq!((short.initialize_ms, short.wake_ms), (300_000, 300_000));
     }
 
@@ -418,6 +433,7 @@ mod tests {
                 600_000,
                 CheckpointFacts::default(),
                 Engine::Vllm,
+                Python,
                 Residency::Deep,
             )
             .unwrap_err();
@@ -436,6 +452,7 @@ mod tests {
                 ..Default::default()
             },
             Engine::Vllm,
+            Python,
             Residency::Deep,
         )
         .unwrap();
@@ -458,6 +475,7 @@ mod tests {
                 deadline,
                 CheckpointFacts::default(),
                 Engine::Vllm,
+                Python,
                 Residency::Deep,
             )
             .unwrap_err();
@@ -469,6 +487,7 @@ mod tests {
             MIN_INITIALIZE_MS,
             CheckpointFacts::default(),
             Engine::Vllm,
+            Python,
             Residency::Deep,
         )
         .unwrap();
@@ -495,5 +514,45 @@ mod tests {
             (PENDING_INITIALIZE_MS, STOP_WINDOW_MS)
         );
         assert_eq!(lifecycle_windows(20_000, Some(20_000)), (20_000, 20_000));
+    }
+
+    // T41 T14: ADR 0039 §6: the native TensorFold line builds nothing at its
+    // first start, so its derived Initialize window is the weights-based one
+    // (A1 and A7); the Python line keeps its 1800 s first-build bound.
+    #[test]
+    fn the_native_tensorfold_line_has_no_first_build_bound() {
+        let nemotron = CheckpointFacts {
+            weights_bytes: Some(18_527_064_363),
+            ..Default::default()
+        };
+        let resolve = |line| {
+            resolve_timeouts(
+                None,
+                3_600_000,
+                nemotron,
+                Engine::Tensorfold,
+                line,
+                Residency::RestartOnly,
+            )
+            .unwrap()
+        };
+        assert_eq!(resolve(Python).initialize_ms, TENSORFOLD_FIRST_BUILD_MS);
+        let native = resolve(Native);
+        assert_eq!(
+            native.initialize_ms,
+            derived_initialize_ms(nemotron.weights_bytes) + STARTUP_WARMUP_MS
+        );
+        assert_eq!(native.initialize_ms, 790_000);
+        assert_eq!(native.wake_ms, native.initialize_ms);
+        let pending = resolve_timeouts(
+            None,
+            3_600_000,
+            CheckpointFacts::default(),
+            Engine::Tensorfold,
+            Native,
+            Residency::RestartOnly,
+        )
+        .unwrap();
+        assert_eq!(pending.initialize_ms, PENDING_INITIALIZE_MS);
     }
 }

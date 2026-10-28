@@ -437,12 +437,13 @@ fn every_documented_example_passes_validate_config() {
         // The quickstart's standalone deployment names standalone's `local`
         // engine, which host.yaml does not publish; `site_quickstart.rs`
         // places it on a fresh standalone instead.
-        // The TensorFold and llama.cpp examples name the `tensorfold` and
-        // `llamacpp` profiles, which host.yaml does not declare either; they
-        // are checked on their own.
+        // The TensorFold and llama.cpp examples name the `tensorfold`,
+        // `tensorfold-1-0-0` and `llamacpp` profiles, which host.yaml does
+        // not declare either; they are checked on their own.
         let standalone = file.file_name().is_some_and(|n| {
             n == "deployment-standalone.yaml"
                 || n == "deployment-tensorfold.yaml"
+                || n == "deployment-tensorfold-native.yaml"
                 || n == "deployment-llamacpp.yaml"
         });
         // ADR 0028 §2 (OD8): the group example resolves on both hosts it

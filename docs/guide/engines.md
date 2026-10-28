@@ -144,6 +144,12 @@ requests and about 61 GiB for 32. Set `max_concurrent_requests` to run more.
 
 ## TensorFold
 
+TensorFold comes in two lines, both the engine `tensorfold` in a deployment:
+the Python line, 0.6.x, installed in a venv (this section), and the native
+line, 1.x, a single binary from a release archive
+([TensorFold native](#tensorfold-native-1x) below). Which one a deployment
+runs is a property of the engine profile it names.
+
 CapyCTL runs TensorFold 0.6.0 to 0.6.3, 0.6.5 and 0.6.6 from a plain venv. TensorFold builds
 CUDA kernels the first time it starts, so the machine needs `nvcc`, `ninja` and
 a C++ compiler where the engine can find them: the venv's `bin`, the CUDA
@@ -304,6 +310,102 @@ minutes; CapyCTL allows it up to 30 minutes, and later starts reuse the build.
 
 TensorFold is checked on NVIDIA GB10 (unified memory) in this release. On a
 discrete GPU it runs, but no live check has passed there yet.
+
+### TensorFold native (1.x)
+
+TensorFold 1.0 and later is a native binary, `bin/tensorfold-native`, shipped
+as a release archive; `pip install` stops at 1.0 and the Python engine stays
+on 0.6. Unpack the archive and keep its `bin`, `lib` and `share` together;
+the directory it unpacks to is the installation:
+
+```bash
+capyctl engine add ~/tensorfold-1.0.0
+```
+
+`engine add` takes the release directory, its `bin` or the binary itself.
+It runs `tensorfold-native --version` and checks the answer against the
+`VERSION` file, checks every file `SHA256SUMS` lists (a release changed after
+it was unpacked is refused `engine_unsupported`; a release without the file
+registers, and `engine list` says the publisher's list was absent), and reads
+`tensorfold-native capabilities --json` for the flags CapyCTL renders, the
+memory cap variable and the model families the build reads. No compiler or
+CUDA toolkit is needed: nothing is built at run time, and the first start
+is an ordinary one. The fingerprint covers every file of the release,
+the CUDA kernel set under `share/tensorfold/cuda` included, so a replaced
+kernel is drift. The profile is written with `line: native`.
+
+The profile is named `tensorfold` when no profile has that name. With a
+0.6 profile already named `tensorfold`, `engine add` writes nothing and asks
+for `--name`; the two profiles live side by side, and a deployment picks one
+with `engine:`:
+
+```bash
+capyctl engine add ~/tensorfold-1.1.5 --name tensorfold-1-1-5
+```
+
+`capyctl engine detect` lists `tensorfold-native` binaries on `PATH`, in
+`~/*/bin`, `/opt/*/bin`, `/usr/local/bin` and every `--path`, with the
+version their `VERSION` file names; it runs nothing. The role's own engine
+(`--tensorfold-bin`, `local_engine.tensorfold`, `CAPYCTL_TENSORFOLD_BIN`)
+takes a `tensorfold-native` path as well.
+
+**Certified and uncertified.** CapyCTL certifies TensorFold native 1.0.0 and
+1.1.5 with Nemotron 3.5 Lightning 30B-A3B 4-bit
+(`TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit` at revision
+`d9d758fb83953437f7263256b0d96157e2a348b8`, or its earlier repository id at
+the same revision) on a GB10, each version once its live rows pass; until
+then both run as uncertified setups and say which rows certify them. Any
+other native version registers and runs as an uncertified custom setup: it is
+never refused for its version, and `engine list`, `capyctl status
+deployment` and `capyctl validate config` say it is not certified. Any other
+checkpoint runs uncertified too, with the note "not certified: TensorFold
+native certifies only Nemotron 3.5 Lightning at revision d9d758f on a GB10".
+When the checkpoint's `config.json` names a family or weight format the
+installation's capabilities document does not list, the note adds that the
+engine is expected to refuse it at start; if it does, the start fails with
+that note and points to the 0.6 line. Until the native rows pass, 0.6.6 stays
+the documented way to run Nemotron 3.5 Lightning on a GB10; once they pass,
+the native line is, and 0.6.6 stays the way for every other TensorFold model.
+
+**Deployments.** A native deployment states `resources` and
+`context_length` as a 0.6 one does, and `max_concurrent_requests` renders
+`--parallel` (8 when not set; `--parallel` in `extra_args` instead works, not
+both). The native engine reserves every stream at its full window when it
+starts, so `resources` must cover the weights plus `max_concurrent_requests`
+streams at `context_length`, plus scratch buffers, CUDA graphs and the CUDA
+context. For Nemotron 3.5 Lightning 4-bit the weights are 17.25 GiB and each
+stream at a 32768-token window about 0.29 GiB (2.3 GiB for 8), as computed
+from the engine's source; the live rows measure the rest, and the example's
+`{gpu: 30GiB, ram: 2GiB}` is the 0.6.6 figure until then. A start that does
+not fit is refused by the engine, and `capyctl status deployment` says to
+lower `max_concurrent_requests` or `context_length`, or raise `resources`;
+nothing grows past the start's admission later. CapyCTL starts it with
+`TENSORFOLD_CUDA_MEMORY_LIMIT_GB` set to the declared allocation and
+`TENSORFOLD_MEMORY_RESERVE_GIB=2`, so the engine's own reserve does not
+refuse a start CapyCTL's ledger admitted.
+
+Refused on the native line: `kv_cache_dtype` (its KV cache is BF16),
+`model.draft` and `--drafter` (it drafts with the checkpoint's own MTP head;
+`--no-drafts` turns that off), a `topology` (one GPU, no group), `api:
+decisions`, and `residency: deep` or `host_backed`. Its option checks compare
+exact names, as the binary does ([Engine options](engine-flags.md#tensorfold-native-100-and-115));
+1.1.5's `--idle-unload` is reserved, since the idle policy is CapyCTL's.
+`--compact-at`, `--compact-keep` and `--compact-memory` are ordinary options,
+refused under `retention: zero`, as are 1.1.5's `--record`, `--learn*` and
+`--recall*`, which write request state to disk
+([Data retention](../operations/data-retention.md#zero-data-retention)).
+
+**Running.** The engine opens its port only once the model is loaded, so
+CapyCTL waits through refused connections, then needs `/health` to answer
+`status: ok` with the served name and `max_batch_size` equal to the
+rendered `--parallel` (`effective_args_mismatch` otherwise), the name in
+`/v1/models` and an answer to the chat probe. It is idle when `/metrics`
+reads `tensorfold:requests_running` and `tensorfold:requests_waiting` both 0;
+a stop waits for that, as on 0.6. After the probe, and whenever CapyCTL
+checks the engine again, any listener of the engine's process off
+`127.0.0.1` and `::1` stops it (`tensorfold_listener_exposed`). It never
+parks: `capyctl park deployment` is refused, and a stop and the next start
+are the restart. LMCache is off, as on 0.6.
 
 ## llama.cpp
 
@@ -1253,6 +1355,27 @@ curl -s http://127.0.0.1:8443/v1/chat/completions \
 ```text
 Jupiter is the largest planet in our solar system.
 ```
+
+### TensorFold native 1.0.0 and 1.1.5: Nemotron 3.5 Lightning 30B-A3B 4-bit
+
+The same checkpoint on TensorFold's native line
+([TensorFold native](#tensorfold-native-1x)), registered beside the 0.6.6
+profile, which keeps the name `tensorfold`:
+
+<!-- include: ../examples/deployment-tensorfold-native.yaml -->
+
+```bash
+capyctl engine add ~/tensorfold-1.0.0 --name tensorfold-1-0-0
+capyctl deploy model --file docs/examples/deployment-tensorfold-native.yaml
+capyctl start deployment nemotron-30b-native --wait
+```
+
+For 1.1.5, register `~/tensorfold-1.1.5 --name tensorfold-1-1-5` and name
+that profile in `engine:`. This release has not run either version on a
+GB10 yet: the live rows that certify them (TF1 to TF14) are still to run,
+so both start as uncertified setups and 0.6.6 above stays the documented
+way to run this model until they pass. The commands and the request are the
+same as for 0.6.6.
 
 To clean up after each one, `capyctl delete deployment <name> --stop`, then
 `capyctl engine remove <profile>` once the stop has finished. Neither touches

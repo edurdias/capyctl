@@ -798,17 +798,24 @@ fn registry_targets(
         // on a host that did not declare `decisions`, nor one on a custom
         // engine on a host that did not declare `custom_engines` (ADR 0017);
         // such a host is recorded refused, typed, and is sent nothing. A
-        // decisions custom engine needs both.
-        let custom = config["runtime_profile"]
-            .as_str()
-            .and_then(|requested| {
-                capyctl_config::deployment_defaults::profile_on_host(requested, &original)
-            })
-            .is_some_and(|name| {
-                original["runtime_profiles"][&name]["engine"].as_str()
-                    == Some(capyctl_config::engine_policy::Engine::Custom.name())
-            });
-        if decisions || custom {
+        // decisions custom engine needs both. ADR 0039 §15: nor one on a
+        // TensorFold native profile on a host that did not declare
+        // `tensorfold_native`.
+        let host_profile = config["runtime_profile"].as_str().and_then(|requested| {
+            capyctl_config::deployment_defaults::profile_on_host(requested, &original)
+        });
+        let published = |name: &String| &original["runtime_profiles"][name];
+        let custom = host_profile.as_ref().is_some_and(|name| {
+            published(name)["engine"].as_str()
+                == Some(capyctl_config::engine_policy::Engine::Custom.name())
+        });
+        let native = host_profile.as_ref().is_some_and(|name| {
+            published(name)["engine"].as_str()
+                == Some(capyctl_config::engine_policy::Engine::Tensorfold.name())
+                && published(name)["line"].as_str()
+                    == Some(capyctl_config::tensorfold_native::TensorfoldLine::Native.name())
+        });
+        if decisions || custom || native {
             let declared: std::collections::BTreeSet<String> = store
                 .host_version(&publication.host_id)
                 .map_err(|_| ConfigurationFailure::Internal)?
@@ -830,6 +837,16 @@ fn registry_targets(
                         .map(|code| {
                             let detail = format!(
                                 "{code}: host `{selector}` cannot run custom engines; upgrade its agent"
+                            );
+                            (code, "runtime_profile", detail)
+                        })
+                })
+                .or_else(|| {
+                    capyctl_protocol::capabilities::tensorfold_native_refusal(&declared, native)
+                        .map(|code| {
+                            let detail = format!(
+                                "{code}: host `{selector}` cannot run TensorFold's native line; \
+                                 upgrade its agent"
                             );
                             (code, "runtime_profile", detail)
                         })

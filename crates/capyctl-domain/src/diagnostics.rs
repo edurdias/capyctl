@@ -119,13 +119,34 @@ const HINTS: &[(&str, &str)] = &[
     // parsing its command line are not the rendered ones.
     (
         "effective_args_mismatch",
-        "the engine reported other slot settings than capyctl rendered (slot count, context window, or its metrics and slots endpoints); check the engine version and the end of the instance's engine log",
+        "the engine reported other settings than capyctl rendered (llama.cpp: slot count, context window, or its metrics and slots endpoints; TensorFold native: /health max_batch_size against --parallel); check the engine version and the end of the instance's engine log",
     ),
     // ADR 0028 §10 (found live 2026-10-15, MN3): TensorFold loads libnccl at
     // run time; a group member's installation must hold it.
     (
         "nccl_library_missing",
         "the TensorFold installation holds no libnccl, which a multi-node group needs; install the nvidia-nccl wheel into the engine's environment (pip install nvidia-nccl-cu12, or the build matching its CUDA), then start again",
+    ),
+    // ADR 0039 §4: zero data retention refuses the native TensorFold line's
+    // compaction and disk-writing options (the deployment's at resolution,
+    // the host's at placement).
+    (
+        "retention_zero:compaction",
+        "`retention: zero` does not allow TensorFold native's compaction options (--compact-at, --compact-keep, --compact-memory); remove them from the arguments, or run without `retention: zero`",
+    ),
+    (
+        "retention_zero:engine_disk",
+        "`retention: zero` does not allow TensorFold native's options that write request state to disk (--compact-memory, --record, --learn*, --recall*); remove them from the arguments, or run without `retention: zero`",
+    ),
+    // ADR 0039 §15: an older host cannot run the native line.
+    (
+        "host_capability_missing:tensorfold_native",
+        "the host's agent predates TensorFold's native line; upgrade the host agent, or run the deployment on a TensorFold 0.6 profile",
+    ),
+    // ADR 0039 §14: the custom engine's loopback check on the native line.
+    (
+        "tensorfold_listener_exposed",
+        "the TensorFold native engine listened on an address other than 127.0.0.1 or ::1, so the launch was stopped; remove the engine arguments that open another listener and start again",
     ),
 ];
 
@@ -364,5 +385,37 @@ mod tests {
         assert!(!is_closed_code("SECRET-ERROR"));
         assert!(!is_closed_code(""));
         assert!(!is_closed_code(&"a".repeat(65)));
+    }
+
+    // T41 (ADR 0039 §§4, 14, 15): the native TensorFold line's codes are
+    // classified from a recorded reason and carry their fix.
+    #[test]
+    fn the_native_tensorfold_codes_have_hints() {
+        for (reason, code, fix) in [
+            (
+                "retention_zero:compaction: no allowed host can run the deployment as declared",
+                "retention_zero:compaction",
+                "--compact-at",
+            ),
+            (
+                "retention_zero:engine_disk: `--record` writes request state to disk",
+                "retention_zero:engine_disk",
+                "--record",
+            ),
+            (
+                "host_capability_missing:tensorfold_native: no allowed host",
+                "host_capability_missing:tensorfold_native",
+                "upgrade the host agent",
+            ),
+            (
+                "tensorfold_listener_exposed: 0.0.0.0:9000",
+                "tensorfold_listener_exposed",
+                "127.0.0.1",
+            ),
+        ] {
+            assert_eq!(classify(None, reason), Some(code), "{reason}");
+            assert!(is_closed_code(code));
+            assert!(operator_hint(code).unwrap().contains(fix), "{code}");
+        }
     }
 }

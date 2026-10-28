@@ -101,6 +101,23 @@ fn runtime_profile(installation: &EngineInstallation) -> Value {
                 .remove("cuda_home");
         }
     }
+    // ADR 0039 §1, §2: stated only for TensorFold's native line, whose
+    // executable is the release's `tensorfold-native` (resolution names no
+    // other), so a Python-line document is unchanged. A registered native
+    // profile keeps the `native` record `engine add` wrote; any other
+    // profile states neither.
+    let object = profile.as_object_mut().expect("an object");
+    if capyctl_config::registration::executable_line(installation.engine, &installation.executable)
+        .is_native()
+    {
+        object.insert(
+            "line".into(),
+            json!(capyctl_config::tensorfold_native::TensorfoldLine::Native.name()),
+        );
+    } else {
+        object.remove("line");
+        object.remove("native");
+    }
     let security = profile["security"]
         .as_object_mut()
         .expect("security is a mapping");

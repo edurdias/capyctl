@@ -18,6 +18,7 @@ fn private_dir() -> tempfile::TempDir {
 }
 
 fn script(path: &Path, body: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     capyctl_config::test_support::write_executable(path, format!("#!/bin/sh\n{body}\n"), 0o755)
         .unwrap();
 }
@@ -1541,5 +1542,450 @@ fn list_shows_lmcache_on_or_off_with_the_reason() {
     assert!(
         !marker.exists(),
         "engine list ran a program of an environment"
+    );
+}
+
+// ---- ADR 0039 §2: TensorFold's native release ----
+
+/// The cubin a fake release ships.
+const CUBIN: &str = "share/tensorfold/cuda/sm121/kernels.cubin";
+
+/// What `tensorfold-native capabilities --json` writes (`server/cli.zig`).
+fn native_caps(version: &str) -> Value {
+    let mut flags = serde_json::Map::new();
+    for (flag, _) in capyctl_config::tensorfold_native::REQUIRED_FLAGS {
+        flags.insert((*flag).into(), json!({}));
+    }
+    flags.insert("--backend".into(), json!({"values": ["auto", "cuda"]}));
+    json!({"schema": 1, "engine": "zig", "version": version, "chip": "nvidia-sm121",
+        "backends": ["cuda"], "families": {"nemotron_h": ["mlx-q4g64"]},
+        "serve": {"flags": flags}, "env": ["TENSORFOLD_CUDA_MEMORY_LIMIT_GB"]})
+}
+
+/// `bin/tensorfold-native` printing `printed` for `--version` and `caps` for
+/// `capabilities --json`, touching `marker` whenever it runs.
+fn native_binary(root: &Path, printed: &str, caps: &Value, marker: &Path) {
+    script(
+        &root.join("bin/tensorfold-native"),
+        &format!(
+            "touch {}; case \"$1\" in --version) echo '{printed}';; \
+             capabilities) printf '%s\\n' '{caps}';; *) exit 2;; esac",
+            marker.display()
+        ),
+    );
+}
+
+/// `SHA256SUMS` over the files a fake release lists.
+fn native_sums(root: &Path) {
+    use sha2::Digest as _;
+    let text: String = ["bin/tensorfold-native", "VERSION", CUBIN, "NOTICE"]
+        .iter()
+        .map(|file| {
+            let digest = sha2::Sha256::digest(std::fs::read(root.join(file)).unwrap());
+            format!("{digest:x}  {file}\n")
+        })
+        .collect();
+    std::fs::write(root.join("SHA256SUMS"), text).unwrap();
+}
+
+/// A native release root (`<root>/bin/tensorfold-native`, `VERSION`, a
+/// cubin, a notice and `SHA256SUMS`), its binary touching `<root>.ran`.
+fn native_release(root: &Path, version: &str) -> PathBuf {
+    let marker = root.with_extension("ran");
+    native_binary(
+        root,
+        &format!("tensorfold-native {version}"),
+        &native_caps(version),
+        &marker,
+    );
+    std::fs::write(root.join("VERSION"), format!("{version}\n")).unwrap();
+    std::fs::create_dir_all(root.join(CUBIN).parent().unwrap()).unwrap();
+    std::fs::write(root.join(CUBIN), b"cubin v1").unwrap();
+    std::fs::write(root.join("NOTICE"), "TensorFold\n").unwrap();
+    native_sums(root);
+    root.to_path_buf()
+}
+
+/// `engine add` on a machine with no build toolchain: no system directory
+/// is searched and no default CUDA toolkit exists, while `CUDA_HOME` names a
+/// toolkit (`bin/nvcc`) that the native line must not record.
+async fn add_native(
+    command: &Command,
+    document: &Path,
+) -> Result<Value, capyctl_cli::output::StructuredError> {
+    let dir = document.parent().unwrap();
+    let cuda = dir.join("cuda");
+    script(&cuda.join("bin/nvcc"), "exit 0");
+    let search = capyctl_config::toolchain::ToolchainSearch {
+        system: String::new(),
+        default_cuda_home: dir.join("no-cuda"),
+        system_root: dir.to_path_buf(),
+    };
+    let cuda_home = cuda.to_string_lossy().into_owned();
+    let env = move |key: &str| match key {
+        "CUDA_HOME" => Some(cuda_home.clone()),
+        _ => std::env::var(key).ok().filter(|v| !v.is_empty()),
+    };
+    execute_with(command, Some(document), dir, &env, &search).await
+}
+
+fn named(command: Command, profile: &str) -> Command {
+    let mut command = command;
+    if let Command::EngineAdd { name, .. } = &mut command {
+        *name = Some(profile.into());
+    }
+    command
+}
+
+// T41 T17 T07 (ADR 0039 §2): a native release registers from its root as
+// `tensorfold`, on a machine with no toolchain, reading its version from
+// standard output: `line: native`, its families and checked SHA256SUMS
+// recorded, no CUDA toolkit, deep parking disabled, not certified (a note).
+#[tokio::test]
+async fn add_registers_a_native_release_without_a_toolchain() {
+    let dir = private_dir();
+    let root = native_release(&dir.path().join("tensorfold-1.0.0"), "1.0.0");
+    let document = host_doc(dir.path());
+    let (_role, _stop) = role(&document, json!({"ok": true, "published": "published"})).await;
+    let out = add_native(&add(&root), &document).await.unwrap();
+    assert_eq!(out["profile"], "tensorfold", "{out}");
+    assert_eq!(out["engine"], "tensorfold");
+    assert_eq!(out["line"], "native");
+    assert_eq!(out["version"], "1.0.0");
+    assert_eq!(out["build_fingerprint"], "1.0.0");
+    assert_eq!(
+        out["custom"],
+        !capyctl_config::tensorfold_native::is_certified("1.0.0")
+    );
+    assert_eq!(
+        out["note"].as_str().map(str::to_owned),
+        capyctl_config::tensorfold_native::version_note("1.0.0")
+    );
+    assert_eq!(out["checksums_verified"], true);
+    assert_eq!(out["families"]["nemotron_h"][0], "mlx-q4g64");
+    assert_eq!(out["cuda_home"], Value::Null);
+    assert_eq!(out["deep_park"], "disabled");
+    assert_eq!(out["deep_park_probe"], "unknown");
+    assert!(out["fingerprint"]["digest"]
+        .as_str()
+        .is_some_and(|d| d.starts_with("sha256:")));
+    assert_eq!(out["published"], "published");
+    let profile = &engines_of(&document).profiles["tensorfold"];
+    assert_eq!(profile["line"], "native");
+    assert_eq!(
+        profile["executable"],
+        root.join("bin/tensorfold-native")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(profile["native"]["checksums_verified"], true);
+    assert_eq!(profile["native"]["families"]["nemotron_h"][0], "mlx-q4g64");
+    assert!(profile.get("cuda_home").is_none(), "{profile}");
+    assert_eq!(profile["security"]["deep_park"], "disabled");
+}
+
+// T41 T07 (ADR 0039 §2, owner decision 2026-10-27, question 6): the native
+// profile is `tensorfold` only when that name is free; beside the 0.6
+// profile `add` asks for --name, naming the checked version, and writes
+// nothing; with --name both profiles coexist and both publish.
+#[tokio::test]
+async fn a_native_release_is_named_tensorfold_only_when_free() {
+    let dir = private_dir();
+    let env = tensorfold_env(&dir.path().join("tf"), "0.6.6", &["ninja", "nvcc", "c++"]);
+    let root = native_release(&dir.path().join("tensorfold-1.1.5"), "1.1.5");
+    let document = host_doc(dir.path());
+    let (_role, _stop) = role(&document, json!({"ok": true, "published": "published"})).await;
+    execute(&add(&env), Some(&document), dir.path())
+        .await
+        .unwrap();
+    let before = std::fs::read(engines_beside(&document)).unwrap();
+    let error = add_native(&add(&root), &document).await.unwrap_err();
+    assert_eq!(error.code, "profile_exists", "{error:?}");
+    assert!(
+        error.message.contains("--name tensorfold-1-1-5"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        std::fs::read(engines_beside(&document)).unwrap(),
+        before,
+        "nothing was written"
+    );
+    let out = add_native(&named(add(&root), "tensorfold-1-1-5"), &document)
+        .await
+        .unwrap();
+    assert_eq!(out["published"], "published");
+    let engines = engines_of(&document);
+    assert!(engines.profiles["tensorfold"].get("line").is_none());
+    assert_eq!(engines.profiles["tensorfold"]["build_fingerprint"], "0.6.6");
+    assert_eq!(engines.profiles["tensorfold-1-1-5"]["line"], "native");
+    // Both publish: the host merges both and each passes the rules.
+    let mut host = capyctl_config::parse_strict(
+        capyctl_config::ConfigKind::Host,
+        &std::fs::read_to_string(&document).unwrap(),
+    )
+    .unwrap();
+    capyctl_config::registration::merge_into_host(&mut host, &engines).unwrap();
+    for name in ["tensorfold", "tensorfold-1-1-5"] {
+        capyctl_config::registration::check_profile(name, &host["runtime_profiles"][name]).unwrap();
+    }
+}
+
+// T41 T17 (ADR 0039 §2, §16): `add` refuses what it cannot drive, and
+// writes nothing: a VERSION mismatch and an unreadable version line (18), a
+// changed or missing file under SHA256SUMS, a capabilities document without
+// a rendered flag, the cuda backend or the cap variable, and a stray
+// bin/tensorfold outside a Python environment (17).
+#[tokio::test]
+async fn add_refuses_a_native_release_it_cannot_drive() {
+    use capyctl_cli::output::ExitCode;
+    /// What breaks the release, what the refusal names, and its exit code.
+    type Case = (&'static str, Box<dyn Fn(&Path)>, &'static str, ExitCode);
+    let cases: Vec<Case> = vec![
+        (
+            "version mismatch",
+            Box::new(|root| std::fs::write(root.join("VERSION"), "1.0.1\n").unwrap()),
+            "VERSION",
+            ExitCode::ENGINE_VERSION_FAILED,
+        ),
+        (
+            "unreadable version line",
+            Box::new(|root| {
+                native_binary(
+                    root,
+                    "tensorfold 1.0.0",
+                    &native_caps("1.0.0"),
+                    &root.join("m"),
+                )
+            }),
+            "tensorfold-native <MAJOR.MINOR.PATCH>",
+            ExitCode::ENGINE_VERSION_FAILED,
+        ),
+        (
+            "changed cubin",
+            Box::new(|root| std::fs::write(root.join(CUBIN), b"cubin v2").unwrap()),
+            CUBIN,
+            ExitCode::ENGINE_UNSUPPORTED,
+        ),
+        (
+            "missing listed file",
+            Box::new(|root| std::fs::remove_file(root.join("NOTICE")).unwrap()),
+            "NOTICE",
+            ExitCode::ENGINE_UNSUPPORTED,
+        ),
+        (
+            "missing rendered flag",
+            Box::new(|root| {
+                let mut caps = native_caps("1.0.0");
+                caps["serve"]["flags"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("--snapshot-dir");
+                native_binary(root, "tensorfold-native 1.0.0", &caps, &root.join("m"));
+                native_sums(root);
+            }),
+            "--snapshot-dir",
+            ExitCode::ENGINE_UNSUPPORTED,
+        ),
+        (
+            "no cuda backend",
+            Box::new(|root| {
+                let mut caps = native_caps("1.0.0");
+                caps["backends"] = json!(["metal"]);
+                native_binary(root, "tensorfold-native 1.0.0", &caps, &root.join("m"));
+                native_sums(root);
+            }),
+            "cuda",
+            ExitCode::ENGINE_UNSUPPORTED,
+        ),
+        (
+            "no cap variable",
+            Box::new(|root| {
+                let mut caps = native_caps("1.0.0");
+                caps["env"] = json!([]);
+                native_binary(root, "tensorfold-native 1.0.0", &caps, &root.join("m"));
+                native_sums(root);
+            }),
+            "TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
+            ExitCode::ENGINE_UNSUPPORTED,
+        ),
+    ];
+    for (case, break_it, named, exit) in cases {
+        let dir = private_dir();
+        let root = native_release(&dir.path().join("tensorfold-1.0.0"), "1.0.0");
+        break_it(&root);
+        let document = host_doc(dir.path());
+        let error = add_native(&add(&root), &document).await.unwrap_err();
+        assert_eq!(error.exit_code(), exit, "{case}: {error:?}");
+        assert!(error.message.contains(named), "{case}: {}", error.message);
+        assert!(error.message.contains("nothing was written"), "{case}");
+        assert!(
+            !engines_beside(&document).exists(),
+            "{case}: nothing written"
+        );
+    }
+    let dir = private_dir();
+    let stray = dir.path().join("stray");
+    script(&stray.join("bin/tensorfold"), "echo tensorfold 0.6.6");
+    let document = host_doc(dir.path());
+    let error = add_native(&add(&stray.join("bin/tensorfold")), &document)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "engine_unsupported");
+    assert_eq!(error.exit_code(), ExitCode::ENGINE_UNSUPPORTED);
+    assert!(
+        error.message.contains("tensorfold-native"),
+        "{}",
+        error.message
+    );
+    assert!(!engines_beside(&document).exists());
+}
+
+// T41 (ADR 0039 §2, §5, §12): before anything runs or is written, the
+// native line refuses --deep-park enabled and --allow-remote-code
+// (`capability_missing`) and an --approve-env name it never carries.
+#[tokio::test]
+async fn the_native_line_refuses_parking_remote_code_and_refused_env_before_running() {
+    let dir = private_dir();
+    let root = native_release(&dir.path().join("tensorfold-1.0.0"), "1.0.0");
+    let marker = root.with_extension("ran");
+    let document = host_doc(dir.path());
+    let mut deep = add(&root);
+    if let Command::EngineAdd { deep_park, .. } = &mut deep {
+        *deep_park = Some(DeepParkChoice::Enabled);
+    }
+    let error = add_native(&deep, &document).await.unwrap_err();
+    assert_eq!(error.code, "capability_missing");
+    assert!(error.message.contains("park path"), "{}", error.message);
+    let error = add_native(&add_allowing_remote_code(&root, None), &document)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "capability_missing");
+    let mut approve = add(&root);
+    if let Command::EngineAdd { approved_env, .. } = &mut approve {
+        *approved_env = vec!["TENSORFOLD_REQUEST_LOG".into()];
+    }
+    let error = add_native(&approve, &document).await.unwrap_err();
+    assert_eq!(error.code, "invalid_config");
+    assert!(
+        error.message.contains("TENSORFOLD_REQUEST_LOG") && error.message.contains("request body"),
+        "{}",
+        error.message
+    );
+    assert!(!marker.exists(), "refused before the binary ran");
+    assert!(!engines_beside(&document).exists());
+}
+
+// T41 (ADR 0039 §3): a native version outside the certified set registers
+// as custom with the note; it is never refused for its version.
+#[tokio::test]
+async fn uncertified_native_versions_register_as_custom_with_a_note() {
+    for version in ["1.0.3", "1.2.0", "1.0.0", "1.1.5"] {
+        let dir = private_dir();
+        let root = native_release(&dir.path().join("release"), version);
+        let document = host_doc(dir.path());
+        let (_role, _stop) = role(&document, json!({"ok": true, "published": "published"})).await;
+        let out = add_native(&add(&root), &document).await.unwrap();
+        let certified = capyctl_config::tensorfold_native::is_certified(version);
+        assert_eq!(out["custom"], !certified, "{version}: {out}");
+        if !certified {
+            let note = out["note"].as_str().unwrap();
+            assert!(note.contains(version), "{note}");
+        }
+        if matches!(version, "1.0.3" | "1.2.0") {
+            assert!(
+                out["note"].as_str().unwrap().contains("custom setup"),
+                "{out}"
+            );
+        }
+    }
+}
+
+// T41 (ADR 0039 §2, §3, §13): a root without SHA256SUMS registers with
+// `checksums_verified: false`; `engine list` shows the native line, the
+// absent checksum list and the version note, with LMCache off.
+#[tokio::test]
+async fn a_release_without_sha256sums_registers_and_list_says_so() {
+    let dir = private_dir();
+    let root = native_release(&dir.path().join("tensorfold-1.0.3"), "1.0.3");
+    std::fs::remove_file(root.join("SHA256SUMS")).unwrap();
+    let document = host_doc(dir.path());
+    let (_role, _stop) = role(&document, json!({"ok": true, "published": "published"})).await;
+    let out = add_native(&add(&root), &document).await.unwrap();
+    assert_eq!(out["checksums_verified"], false);
+    assert_eq!(
+        engines_of(&document).profiles["tensorfold"]["native"]["checksums_verified"],
+        false
+    );
+    let list = execute(&Command::EngineList, Some(&document), dir.path())
+        .await
+        .unwrap();
+    let row = list["engines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["profile"] == "tensorfold")
+        .unwrap()
+        .clone();
+    assert_eq!(row["line"], "native", "{row}");
+    assert_eq!(row["version"], "1.0.3");
+    assert_eq!(row["custom"], true);
+    assert_eq!(row["checksums_verified"], false);
+    let notes: Vec<&str> = row["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        notes.iter().any(|n| n.contains("SHA256SUMS) was absent")),
+        "{notes:?}"
+    );
+    assert!(notes.iter().any(|n| n.contains("1.0.3")), "{notes:?}");
+    assert_eq!(row["lmcache"]["state"], "off");
+    assert_eq!(row["lmcache"]["reason"], "engine_unsupported");
+    let table = capyctl_cli::table::render(
+        capyctl_cli::table::View::LocalEngines,
+        &list,
+        &Default::default(),
+    );
+    assert!(table.contains("tensorfold (native)"), "{table}");
+    assert!(
+        table.contains("note: tensorfold: the publisher's checksum list"),
+        "{table}"
+    );
+}
+
+// T41 T07 T37 (ADR 0039 §2): `engine detect` lists a native release with
+// its line and version note, and runs nothing.
+#[tokio::test]
+async fn detect_lists_a_native_release_with_its_line() {
+    let dir = private_dir();
+    let releases = dir.path().join("releases");
+    let root = native_release(&releases.join("tensorfold-1.2.0"), "1.2.0");
+    let out = execute(
+        &Command::EngineDetect {
+            paths: vec![releases.clone()],
+        },
+        None,
+        dir.path(),
+    )
+    .await
+    .unwrap();
+    let candidate = out["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["env"] == root.to_string_lossy().as_ref())
+        .unwrap_or_else(|| panic!("{out}"))
+        .clone();
+    assert_eq!(candidate["engine"], "tensorfold");
+    assert_eq!(candidate["line"], "native");
+    assert_eq!(candidate["version"], "1.2.0");
+    assert_eq!(candidate["custom"], true);
+    assert!(candidate["note"].as_str().unwrap().contains("custom setup"));
+    assert!(
+        !root.with_extension("ran").exists(),
+        "detection runs nothing"
     );
 }

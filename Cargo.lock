@@ -562,6 +562,7 @@ name = "capyctl-testkit"
 version = "0.1.9"
 dependencies = [
  "async-trait",
+ "axum",
  "capyctl-adapters",
  "capyctl-config",
  "capyctl-controller",

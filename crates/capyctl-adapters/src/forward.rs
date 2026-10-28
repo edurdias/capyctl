@@ -484,9 +484,10 @@ impl CacheSalt {
 }
 
 /// SPEC §10: whether an engine family partitions its prefix cache by
-/// `cache_salt`. vLLM and SGLang do; TensorFold ignores the field, and an
-/// unrecorded family is treated as not honouring it, so a requested isolation
-/// is never silently absent.
+/// `cache_salt`. vLLM and SGLang do; TensorFold ignores the field on both
+/// lines (0.6, and the native line, ADR 0039 Evidence §6: no server code
+/// reads it), and an unrecorded family is treated as not honouring it, so a
+/// requested isolation is never silently absent.
 pub fn engine_honours_cache_salt(engine: Option<&str>) -> bool {
     matches!(engine, Some("vllm" | "sglang"))
 }

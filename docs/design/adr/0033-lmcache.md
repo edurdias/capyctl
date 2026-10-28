@@ -444,6 +444,11 @@ and the JSON view `lmcache` (`state`, `reason`, `pool_bytes`, `used_bytes`,
   `retention_zero:lmcache` at placement;
 - engine and LMCache processes start with `RLIMIT_CORE` 0, so a crash writes no core dump
   of request data;
+- on TensorFold's native line ([ADR 0039](0039-tensorfold-1.md) §4), the compaction
+  options (`--compact-at`, `--compact-keep`, `--compact-memory`) are refused
+  `retention_zero:compaction` and the options that write request state to disk
+  (`--record`, `--learn*`, `--recall*`) `retention_zero:engine_disk` (exit 5), at
+  resolution for a deployment's `retention: zero` and at placement for a host's;
 - turning it on stops existing LMCache servers. A role that starts with `retention: zero`
   and finds LMCache servers it owns drains each instance using one, stops its engine and
   its server (verified gone), and relaunches it without LMCache; a parked instance using

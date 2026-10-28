@@ -1,10 +1,14 @@
 //! ADR 0023: the TensorFold adapter. Ready is `/health` `ok` plus the served
 //! name listed (SPEC §6.1); there is no park, restore or reload path.
+//! ADR 0039 §9, §10: on the native line, ready is `/health` `status: ok`
+//! with the served name in `model_ids` and in `/v1/models`, and the idle
+//! read is `/metrics`.
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use capyctl_config::tensorfold_native::TensorfoldLine;
 
-use super::http::{Http, Read};
+use super::http::{Http, NativeHealth, Read};
 use super::{args::PlanInputTensorfold, HealthReport};
 use crate::traits::*;
 
@@ -12,12 +16,32 @@ pub struct TensorfoldAdapter {
     endpoint: reqwest::Url,
     fingerprint: String,
     model_id: String,
+    /// ADR 0039 §1: the installation's line; the readiness and idle reads
+    /// branch on it.
+    line: TensorfoldLine,
     http: Http,
     forward: Arc<dyn ChatForward>,
     launch: Option<PlanInputTensorfold>,
     tools: Option<Arc<dyn OwnedProcessLaunch>>,
     extensions_built: bool,
     claimed: Mutex<Option<(String, String)>>,
+}
+
+/// ADR 0039 §9: where a native engine stands on its way to ready.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum NativeReadiness {
+    /// The connection was refused: still loading (or exited, which the
+    /// Initialize step learns from the process).
+    Loading,
+    /// `/health` answered 503 (1.1.5's `draining` or `unavailable`), with
+    /// the start of its body.
+    Unavailable(String),
+    /// `/health` answered without `status: ok` and the served name in
+    /// `model_ids` (a key-configured engine's bare `{"status": "ok"}`
+    /// included), or `/v1/models` does not list the served name.
+    Unlisted,
+    /// Ready, with the stream count `/health` reported.
+    Ready { max_batch_size: Option<u64> },
 }
 
 impl TensorfoldAdapter {
@@ -35,6 +59,7 @@ impl TensorfoldAdapter {
             endpoint,
             fingerprint,
             model_id,
+            line: TensorfoldLine::default(),
             launch: None,
             tools: None,
             extensions_built: false,
@@ -42,9 +67,22 @@ impl TensorfoldAdapter {
         }
     }
 
+    /// ADR 0039 §1: the installation's line, for an adapter that reads an
+    /// engine without launching it (an owned launch takes its plan's).
+    pub fn with_line(mut self, line: TensorfoldLine) -> Self {
+        self.line = line;
+        self
+    }
+
+    /// The launch plan; the adapter takes the plan's line (ADR 0039 §1).
     pub fn with_launch(mut self, launch: PlanInputTensorfold) -> Self {
+        self.line = launch.line;
         self.launch = Some(launch);
         self
+    }
+
+    pub fn line(&self) -> TensorfoldLine {
+        self.line
     }
 
     pub fn with_tools(mut self, tools: Arc<dyn OwnedProcessLaunch>) -> Self {
@@ -104,6 +142,30 @@ impl TensorfoldAdapter {
     pub(super) fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
+
+    /// ADR 0039 §9: the native line's readiness read: a connection
+    /// accepted, `/health` 200 with `status` `"ok"` and the served name in
+    /// `model_ids`, then the served name in `/v1/models`. A 503 is not
+    /// ready and keeps its body for the failure at the start bound.
+    pub(super) async fn native_readiness(&self) -> Result<NativeReadiness, AdapterError> {
+        let health = self.http.native_health().await?;
+        let max_batch_size = match &health {
+            NativeHealth::Refused => return Ok(NativeReadiness::Loading),
+            NativeHealth::Unavailable(body) => {
+                return Ok(NativeReadiness::Unavailable(body.clone()))
+            }
+            NativeHealth::Answer { max_batch_size, .. } if health.serves(&self.model_id) => {
+                *max_batch_size
+            }
+            NativeHealth::Answer { .. } => return Ok(NativeReadiness::Unlisted),
+        };
+        Ok(match self.http.models().await? {
+            Read::Answer(ids) if ids.contains(&self.model_id) => {
+                NativeReadiness::Ready { max_batch_size }
+            }
+            _ => NativeReadiness::Unlisted,
+        })
+    }
 }
 
 #[async_trait]
@@ -136,6 +198,12 @@ impl EngineAdapter for TensorfoldAdapter {
     }
 
     async fn check_readiness(&self, _member: &MemberRef) -> Result<Readiness, AdapterError> {
+        if self.line.is_native() {
+            return Ok(match self.native_readiness().await? {
+                NativeReadiness::Ready { .. } => Readiness::Ready,
+                _ => Readiness::Initializing,
+            });
+        }
         // SPEC §6.1: liveness of an HTTP server is not model readiness.
         let healthy = matches!(
             self.http.health().await?,
@@ -191,11 +259,24 @@ impl EngineAdapter for TensorfoldAdapter {
     }
 
     async fn engine_quiescent(&self, member: &MemberRef, _after_ms: i64) -> bool {
-        // SPEC §10 (amended 2026-10-01): /health read now.
+        // SPEC §10 (amended 2026-10-01): the engine's own counters read now
+        // (`/health` on 0.6, `/metrics` on the native line, ADR 0039 §10).
         self.idle_before_signal(member).await == Some(EngineWork::Idle)
     }
 
     async fn idle_before_signal(&self, _member: &MemberRef) -> Option<EngineWork> {
+        // ADR 0039 §10: the native line's one `/metrics` read, both gauges
+        // from one status snapshot. Refused: nothing listens (exited or
+        // still loading), signalled at once; unanswered or unreadable:
+        // signalled at the bound; work: held back at the bound.
+        if self.line.is_native() {
+            return Some(match self.http.native_work().await {
+                Ok(Read::NotYet) => EngineWork::NotListening,
+                Ok(Read::Answer(work)) if work.idle() => EngineWork::Idle,
+                Ok(Read::Answer(_)) => EngineWork::Busy,
+                Err(_) => EngineWork::Unanswered,
+            });
+        }
         // Spec §5: counters that disagree are not idle; either one reporting
         // work is busy.
         Some(match self.http.health().await {

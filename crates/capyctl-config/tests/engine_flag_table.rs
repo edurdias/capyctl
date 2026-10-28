@@ -13,14 +13,33 @@ use std::path::PathBuf;
 use capyctl_config::engine_policy::{
     typed_options, validate_extra_args, Engine, ExtraArgsContext, ProfileArgError,
 };
+use capyctl_config::tensorfold_native::TensorfoldLine;
 
 const PAGE: &str = include_str!("../../../docs/guide/engine-flags.md");
 
-const SECTIONS: &[(&str, Engine)] = &[
-    ("## vLLM 0.30 and 0.31", Engine::Vllm),
-    ("## SGLang 0.5.21", Engine::Sglang),
-    ("## TensorFold 0.6.6", Engine::Tensorfold),
-    ("## llama.cpp v0.6.0", Engine::Llamacpp),
+const SECTIONS: &[(&str, Engine, TensorfoldLine)] = &[
+    (
+        "## vLLM 0.30 and 0.31",
+        Engine::Vllm,
+        TensorfoldLine::Python,
+    ),
+    ("## SGLang 0.5.21", Engine::Sglang, TensorfoldLine::Python),
+    (
+        "## TensorFold 0.6.6",
+        Engine::Tensorfold,
+        TensorfoldLine::Python,
+    ),
+    // ADR 0039 §4: the native line's exact-name table.
+    (
+        "## TensorFold native 1.0.0 and 1.1.5",
+        Engine::Tensorfold,
+        TensorfoldLine::Native,
+    ),
+    (
+        "## llama.cpp v0.6.0",
+        Engine::Llamacpp,
+        TensorfoldLine::Python,
+    ),
 ];
 
 const HEADER: &str = "| Need | Option | Class | CapyCTL |";
@@ -42,9 +61,9 @@ fn code_spans(cell: &str) -> Vec<String> {
 }
 
 /// The rows of each engine's table, keyed by engine.
-fn tables(page: &str) -> BTreeMap<&'static str, (Engine, Vec<Row>)> {
+fn tables(page: &str) -> BTreeMap<&'static str, (Engine, TensorfoldLine, Vec<Row>)> {
     let mut tables = BTreeMap::new();
-    for (heading, engine) in SECTIONS {
+    for (heading, engine, line) in SECTIONS {
         let start = page
             .lines()
             .position(|line| line == *heading)
@@ -75,17 +94,18 @@ fn tables(page: &str) -> BTreeMap<&'static str, (Engine, Vec<Row>)> {
             })
             .collect();
         assert!(!rows.is_empty(), "`{heading}` table is empty");
-        tables.insert(*heading, (*engine, rows));
+        tables.insert(*heading, (*engine, *line, rows));
     }
     tables
 }
 
 /// The class and, for a typed option, the field the policy gives `option`.
-fn classify(engine: Engine, option: &str) -> (&'static str, Option<String>) {
+fn classify(engine: Engine, line: TensorfoldLine, option: &str) -> (&'static str, Option<String>) {
     let none = BTreeSet::new();
     let paths: Vec<PathBuf> = Vec::new();
     let context = ExtraArgsContext {
         engine,
+        line,
         sleep_mode: false,
         approved_options: &none,
         approved_paths: &paths,
@@ -103,13 +123,15 @@ fn classify(engine: Engine, option: &str) -> (&'static str, Option<String>) {
         Err(ProfileArgError::Sensitive(_) | ProfileArgError::PathNotApproved(_)) => {
             ("approval", None)
         }
+        // ADR 0039 §6: CapyCTL renders no drafter on the native line.
+        Err(ProfileArgError::NativeDrafter(_)) => ("reserved", None),
         Err(other) => panic!("{option}: unexpected refusal {other}"),
     }
 }
 
 fn mismatches(page: &str) -> Vec<String> {
     let mut wrong = Vec::new();
-    for (heading, (engine, rows)) in tables(page) {
+    for (heading, (engine, line, rows)) in tables(page) {
         let mut listed = BTreeSet::new();
         for row in &rows {
             if row.options.is_empty() {
@@ -121,7 +143,7 @@ fn mismatches(page: &str) -> Vec<String> {
             }
             for option in &row.options {
                 listed.insert(option.clone());
-                let (class, field) = classify(engine, option);
+                let (class, field) = classify(engine, line, option);
                 if class != row.class {
                     wrong.push(format!(
                         "{heading}: `{option}` is {class}, the table says {}",
@@ -143,7 +165,12 @@ fn mismatches(page: &str) -> Vec<String> {
                 }
             }
         }
-        for (option, field) in typed_options(engine) {
+        let typed = if line.is_native() {
+            capyctl_config::tensorfold_native::TYPED_OPTIONS
+        } else {
+            typed_options(engine)
+        };
+        for (option, field) in typed {
             if !listed.contains(*option) {
                 wrong.push(format!(
                     "{heading}: typed option `{option}` (`engine_config.{field}`) is missing"

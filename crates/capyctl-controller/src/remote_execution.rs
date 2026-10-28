@@ -55,6 +55,10 @@ pub struct RemoteLaunchBinding {
     /// command of it then needs the host's `retention`; a host without it
     /// would not honour it, and is refused typed before anything is sent.
     pub retention_zero: bool,
+    /// ADR 0039 §15: the launch's effective profile is TensorFold's native
+    /// line. Every command of it then needs the host's `tensorfold_native`; a
+    /// host without it is refused typed before anything is sent.
+    pub tensorfold_native: bool,
     /// ADR 0013 §5: the instance every command of this launch names, so the
     /// host fences it by that instance's own generation. Zero on a host that
     /// does not advertise per-instance fencing: its journal fences per
@@ -347,6 +351,9 @@ impl RemoteEngine {
         if b.custom_engine {
             needs.push(capabilities::CUSTOM_ENGINES);
         }
+        if b.tensorfold_native {
+            needs.push(capabilities::TENSORFOLD_NATIVE);
+        }
         b.lmcache_needs(&mut needs);
         self.sessions
             .preflight(&b.host_id, &needs, true)
@@ -555,6 +562,11 @@ impl EngineAdapter for RemoteEngine {
         // declared `custom_engines`.
         if b.custom_engine {
             needs.push(capabilities::CUSTOM_ENGINES);
+        }
+        // ADR 0039 §15: a native TensorFold launch goes only to a host that
+        // declared `tensorfold_native`.
+        if b.tensorfold_native {
+            needs.push(capabilities::TENSORFOLD_NATIVE);
         }
         // ADR 0033 §13: `lmcache: required` and `retention: zero` go only to
         // a host that declared what honours them.
@@ -1500,6 +1512,11 @@ fn remote_launch(
         lmcache_required: work.effective().lmcache
             == capyctl_config::lmcache::LmcacheMode::Required,
         retention_zero: work.effective().retention == capyctl_config::lmcache::Retention::Zero,
+        // ADR 0039 §15: a native TensorFold launch goes only to a host that
+        // declared it.
+        tensorfold_native: work.effective().profile.engine
+            == capyctl_config::engine_policy::Engine::Tensorfold
+            && work.effective().profile.line.is_native(),
     })
 }
 
@@ -1783,6 +1800,7 @@ mod tests {
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,
+            tensorfold_native: false,
         }
     }
 

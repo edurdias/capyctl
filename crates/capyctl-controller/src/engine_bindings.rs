@@ -286,15 +286,26 @@ impl ProfileBindings {
         let port = endpoint
             .port()
             .ok_or_else(|| refuse("the leased endpoint names no port".into()))?;
-        // ADR 0023 §3, SPEC §13.3: without a private root nothing is launched.
-        let cache = self
-            .engine_cache
-            .as_ref()
-            .ok_or_else(|| refuse("no private engine cache".into()))?;
-        let dir = cache
-            .torch_extensions(&effective.profile.build_fingerprint)
-            .map_err(|error| refuse(error.to_string()))?;
-        let built = capyctl_agent::engine_cache::has_build(&dir);
+        // ADR 0039 §2: the native line compiles nothing, so it gets no
+        // extensions directory and needs no private root for one.
+        let dir = if effective.profile.line.is_native() {
+            None
+        } else {
+            // ADR 0023 §3, SPEC §13.3: without a private root nothing is
+            // launched.
+            let cache = self
+                .engine_cache
+                .as_ref()
+                .ok_or_else(|| refuse("no private engine cache".into()))?;
+            Some(
+                cache
+                    .torch_extensions(&effective.profile.build_fingerprint)
+                    .map_err(|error| refuse(error.to_string()))?,
+            )
+        };
+        let built = dir
+            .as_deref()
+            .is_some_and(capyctl_agent::engine_cache::has_build);
         let plan = capyctl_adapters::tensorfold::plan_from_effective(
             effective,
             port,
@@ -305,7 +316,7 @@ impl ProfileBindings {
             )
             .to_string_lossy()
             .into_owned(),
-            Some(dir.to_string_lossy().into_owned()),
+            dir.map(|dir| dir.to_string_lossy().into_owned()),
         )
         .map_err(|error| refuse(error.to_string()))?;
         Ok((plan, built))
@@ -581,6 +592,7 @@ impl EngineBindings for ProfileBindings {
                         .first()
                         .cloned()
                         .unwrap_or_else(|| effective.name.clone()),
+                    line: profile.line,
                     launch: Some(launch),
                     extensions_built,
                 })

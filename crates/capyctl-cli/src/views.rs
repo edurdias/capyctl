@@ -270,7 +270,7 @@ fn invite(value: &Value) -> String {
 }
 
 fn validate(value: &Value) -> String {
-    let mut text = Detail::new(format!(
+    let mut detail = Detail::new(format!(
         "{} is a valid {} document",
         s(&value["file"]),
         s(&value["kind"])
@@ -278,8 +278,12 @@ fn validate(value: &Value) -> String {
     .row_opt(
         "Resolved against",
         resolved_against(&value["resolved_against"]),
-    )
-    .render();
+    );
+    // ADR 0039 §3, §7: the uncertified version and checkpoint notes.
+    for note in value["notes"].as_array().into_iter().flatten() {
+        detail = detail.note(s(note));
+    }
+    let mut text = detail.render();
     text.push_str(&resource_phases(value));
     text.push_str(&topology(&value["effective"]["topology"]));
     // SPEC §15.3: without a host, say what was not checked.
@@ -993,6 +997,25 @@ mod tests {
         );
         value["effective"]["topology"] = auto_view(json!(1));
         assert_eq!(validate(&value), format!("{plain}{}", auto_block()));
+    }
+
+    // T41 (ADR 0039 §3, §7): validate prints a native TensorFold
+    // deployment's uncertified notes after the rows.
+    #[test]
+    fn validate_prints_the_native_tensorfold_notes() {
+        let value = json!({"file": "tf.yaml", "kind": "deployment",
+            "resolved_against": "host-a", "effective": {},
+            "notes": [capyctl_config::tensorfold_native::CHECKPOINT_NOTE]});
+        assert_eq!(
+            validate(&value),
+            block(&[
+                "tf.yaml is a valid deployment document",
+                "",
+                "  Resolved against   host-a",
+                "",
+                capyctl_config::tensorfold_native::CHECKPOINT_NOTE,
+            ])
+        );
     }
 
     // T02 (ADR 0021): the results `delete` and `drain --wait` really return.

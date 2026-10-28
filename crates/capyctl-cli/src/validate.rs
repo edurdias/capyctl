@@ -393,6 +393,13 @@ fn resolve_on_host(
     if provisional {
         unknown_until_measured(&mut out["effective"], &effective);
     }
+    // ADR 0039 §3, §7: a native TensorFold deployment that is not the
+    // certified version and checkpoint runs as an uncertified setup, said
+    // here as notes, never as a refusal.
+    let notes = capyctl_config::tensorfold_native::deployment_notes(&effective, true);
+    if !notes.is_empty() {
+        out["notes"] = json!(notes);
+    }
     Ok((out, effective))
 }
 

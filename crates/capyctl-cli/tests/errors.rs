@@ -637,3 +637,55 @@ fn lmcache_codes_map_to_exit_5() {
     };
     assert_eq!(bare.exit_code(), ExitCode(2));
 }
+
+// T41 T36 (ADR 0039 §§4, 15, 16): the native line's zero-retention refusals
+// and its missing host capability exit 5 and show their own closed code, as
+// `retention_zero:lmcache` does; the listener code decides no exit.
+#[test]
+fn tensorfold_native_codes_map_to_exit_5() {
+    for code in [
+        capyctl_config::tensorfold_native::RETENTION_ZERO_COMPACTION,
+        capyctl_config::tensorfold_native::RETENTION_ZERO_ENGINE_DISK,
+        capyctl_config::tensorfold_native::HOST_CAPABILITY_MISSING,
+    ] {
+        for (carrier, message) in [
+            (
+                "invalid_config",
+                format!(
+                    "deployment.yaml: deployment document: unsupported_combination at \
+                     `engine_config.extra_args`: {code}: `--compact-at` compacts conversations"
+                ),
+            ),
+            (
+                "invalid_config",
+                format!(
+                    "invalid_config: Invalid deployment configuration: {code}: no allowed host \
+                     can run the deployment as declared (host host-a: {code}: the host has \
+                     `retention: zero`)"
+                ),
+            ),
+            ("command_rejected", format!("{code}: refused")),
+        ] {
+            let error = StructuredError {
+                code: carrier,
+                message,
+            };
+            assert_eq!(error.exit_code(), ExitCode(5), "{carrier} {code}");
+            assert_eq!(error.closed_code(), code, "{carrier} {code}");
+        }
+        let direct = StructuredError {
+            code,
+            message: "refused".into(),
+        };
+        assert_eq!(direct.exit_code(), ExitCode(5), "{code}");
+    }
+    let listener = StructuredError {
+        code: "operation_failed",
+        message: format!(
+            "Operation 01J failed: {}: the engine listens on 0.0.0.0:9000",
+            capyctl_config::tensorfold_native::LISTENER_EXPOSED
+        ),
+    };
+    assert_eq!(listener.closed_code(), "operation_failed");
+    assert_eq!(listener.exit_code(), ExitCode(13));
+}

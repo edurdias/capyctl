@@ -1262,3 +1262,167 @@ async fn a_custom_launch_reads_quiescent_only_on_its_idle_signal() {
         .iter()
         .all(|s| s.latency.as_ref().is_none_or(|l| l.engine.is_none())));
 }
+
+/// TensorFold native 1.0.0's `/metrics` with no live stream, as
+/// `server/metrics.zig` (`Metrics.render`, `:112-136`) writes it: the two
+/// gauges from one status read, the KV ratio's one `pool="0"` row, and the
+/// vLLM-named mirrors under the `tensorfold:` prefix.
+const TENSORFOLD_NATIVE_IDLE: &str = "\
+# HELP tensorfold:requests_running Requests in prefill or decode.
+# TYPE tensorfold:requests_running gauge
+tensorfold:requests_running 0
+# HELP tensorfold:requests_waiting Requests queued or held until a lane is free.
+# TYPE tensorfold:requests_waiting gauge
+tensorfold:requests_waiting 0
+# HELP tensorfold:generation_tokens_running Generated tokens held by live streams.
+# TYPE tensorfold:generation_tokens_running gauge
+tensorfold:generation_tokens_running 0
+# HELP tensorfold:kv_cache_usage_ratio Tokens in a stream cache divided by that stream's context window.
+# TYPE tensorfold:kv_cache_usage_ratio gauge
+tensorfold:kv_cache_usage_ratio{pool=\"0\"} 0
+# HELP tensorfold:num_requests_running Requests in prefill or decode. A mirror of tensorfold:requests_running.
+# TYPE tensorfold:num_requests_running gauge
+tensorfold:num_requests_running 0
+# HELP tensorfold:num_requests_waiting Requests queued or held until a lane is free. A mirror of tensorfold:requests_waiting.
+# TYPE tensorfold:num_requests_waiting gauge
+tensorfold:num_requests_waiting 0
+# HELP tensorfold:kv_cache_usage_perc A stream's cache occupancy under vLLM's name; same streams and ratios as tensorfold:kv_cache_usage_ratio.
+# TYPE tensorfold:kv_cache_usage_perc gauge
+tensorfold:kv_cache_usage_perc{stream=\"0\"} 0
+";
+
+/// The same engine under work: two streams admitted, one waiting.
+const TENSORFOLD_NATIVE_BUSY: &str = "\
+# TYPE tensorfold:requests_running gauge
+tensorfold:requests_running 2
+# TYPE tensorfold:requests_waiting gauge
+tensorfold:requests_waiting 1
+# TYPE tensorfold:kv_cache_usage_ratio gauge
+tensorfold:kv_cache_usage_ratio{pool=\"0\"} 0.25
+tensorfold:kv_cache_usage_ratio{pool=\"1\"} 0.5
+# TYPE tensorfold:num_requests_running gauge
+tensorfold:num_requests_running 2
+# TYPE tensorfold:num_requests_waiting gauge
+tensorfold:num_requests_waiting 1
+# TYPE tensorfold:kv_cache_usage_perc gauge
+tensorfold:kv_cache_usage_perc{stream=\"0\"} 0.25
+tensorfold:kv_cache_usage_perc{stream=\"1\"} 0.5
+";
+
+/// TensorFold native 1.0.0's `GET /health` (`server/status_routes.zig`): no
+/// `ok`, no `busy`, no `requests_running`.
+const TENSORFOLD_NATIVE_HEALTH: &str = r#"{"status":"ok","model":"toy","model_ids":["toy"],"max_batch_size":8,"warming":false,"memory":{"active":0,"cache":0,"peak":0},"live":{"connections":0,"waiting":0,"decode_tokens_per_second":0.0,"prefill_tokens_per_second":0.0}}"#;
+
+// T41 T37 (ADR 0039 §11): a native engine's `/metrics` gives the same
+// `tensorfold:` sample as 0.6's; only TensorFold's own body is one.
+#[test]
+fn a_native_tensorfold_body_parses_its_gauges() {
+    let idle = load::parse_tensorfold_native_load(TENSORFOLD_NATIVE_IDLE).unwrap();
+    assert_eq!((idle.running, idle.waiting, idle.kv_usage_ppm), (0, 0, 0));
+    let busy = load::parse_tensorfold_native_load(TENSORFOLD_NATIVE_BUSY).unwrap();
+    assert_eq!(
+        (busy.running, busy.waiting, busy.kv_usage_ppm),
+        (2, 1, 500_000)
+    );
+    assert_eq!(load::parse_engine_load(TENSORFOLD_NATIVE_BUSY), Some(busy));
+    assert!(load::parse_tensorfold_native_load(VLLM_METRICS).is_none());
+    assert!(load::parse_tensorfold_native_load("").is_none());
+}
+
+/// A fake TensorFold native engine: unkeyed `/metrics` as given, and the
+/// 1.0 `/health`, whose reads are counted.
+async fn tensorfold_native(
+    metrics: &'static str,
+) -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = reads.clone();
+    let router = Router::new()
+        .route("/metrics", get(move || async move { metrics }))
+        .route(
+            "/health",
+            get(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    (
+                        StatusCode::OK,
+                        [("content-type", "application/json")],
+                        TENSORFOLD_NATIVE_HEALTH,
+                    )
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (address, reads)
+}
+
+// T41 T37 T17 (ADR 0039 §11): a launch of TensorFold's native line reads
+// idle on its `/metrics` 0 and 0 without `/health` (a 1.0 `/health` has no
+// `busy`, and it is never read), and busy under work. A 0.6 launch still
+// folds `/health`: busy health keeps a running request, idle health agrees;
+// and the same 1.0 engine read as 0.6 would never read idle, which is why
+// the native line is not folded.
+#[tokio::test]
+async fn a_native_tensorfold_sample_reads_idle_without_health() {
+    use load::LaunchSignal;
+    let native = [7; 32];
+    let (native_idle, idle_reads) = tensorfold_native(TENSORFOLD_NATIVE_IDLE).await;
+    let (native_busy, busy_reads) = tensorfold_native(TENSORFOLD_NATIVE_BUSY).await;
+    let (folded, folded_reads) = tensorfold_native(TENSORFOLD_NATIVE_IDLE).await;
+    let python_busy = tensorfold(native, r#"{"ok":true,"busy":true,"requests_running":0}"#).await;
+    let python_idle = tensorfold(native, r#"{"ok":true,"busy":false,"requests_running":0}"#).await;
+    let source = std::sync::Arc::new(Launches(vec![
+        (
+            "a-native-idle",
+            native_idle,
+            native,
+            LaunchSignal::TensorfoldNative,
+        ),
+        (
+            "b-native-busy",
+            native_busy,
+            native,
+            LaunchSignal::TensorfoldNative,
+        ),
+        ("c-python-busy", python_busy, native, LaunchSignal::Builtin),
+        ("d-python-idle", python_idle, native, LaunchSignal::Builtin),
+        (
+            "e-native-read-as-python",
+            folded,
+            native,
+            LaunchSignal::Builtin,
+        ),
+    ]));
+    let reporter = LoadReporter::new(source, "host".into()).unwrap();
+    let all = samples(reporter.reports().await);
+    let engines: Vec<_> = all
+        .iter()
+        .map(|s| {
+            (
+                s.deployment_id.as_str(),
+                s.engine.map(|e| (e.running, e.waiting, e.kv_usage_ppm)),
+            )
+        })
+        .collect();
+    assert_eq!(
+        engines,
+        [
+            ("a-native-idle", Some((0, 0, 0))),
+            ("b-native-busy", Some((2, 1, 500_000))),
+            ("c-python-busy", Some((1, 0, 0))),
+            ("d-python-idle", Some((0, 0, 0))),
+            ("e-native-read-as-python", Some((1, 0, 0))),
+        ]
+    );
+    let reads = |r: &std::sync::Arc<std::sync::atomic::AtomicUsize>| {
+        r.load(std::sync::atomic::Ordering::SeqCst)
+    };
+    assert_eq!((reads(&idle_reads), reads(&busy_reads)), (0, 0));
+    assert_eq!(reads(&folded_reads), 1);
+    // The native sample still names its engine's latency family.
+    assert!(all[0]
+        .latency
+        .as_ref()
+        .is_none_or(|l| l.engine.as_deref() == Some("tensorfold")));
+}

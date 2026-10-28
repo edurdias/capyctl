@@ -141,6 +141,10 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     (approved 2026-10-14), and basal 2.2.0 (~/basal-2.2.0-venv, torch 2.11.0
     cu130), approved 2026-10-20 for qualifying custom engines (ADR 0031), and vLLM
     0.32.0 (~/vllm-0.32.0-venv, approved 2026-10-21, for chat);
+  - host A only, for qualifying TensorFold's native line (ADR 0039): TensorFold
+    1.0.0 at ~/tensorfold-1.0.0 (the release archive as installed, owner decision
+    2026-10-25) and TensorFold 1.1.5 at ~/tensorfold-1.1.5 (the release archive,
+    unpacked with its checksum file checked, owner decision 2026-10-27);
   - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B;
   - the rented two-GPU machine of ADR 0035 §14 (owner decision 2026-10-25), for
     its one session only: fresh x86_64 CUDA installs of vLLM 0.32.0

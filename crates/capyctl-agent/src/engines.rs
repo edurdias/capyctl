@@ -1,7 +1,8 @@
 //! ADR 0018 §1: engine installations the operator registers. Detection and
 //! resolution read package metadata (and, ADR 0029 §2, a bare binary's file
-//! names) only; nothing found here is executed until the operator names or
-//! picks it (ADR 0008 carve-out 2, SPEC §4.2).
+//! names; ADR 0039 §2, a native TensorFold release's `VERSION` file) only;
+//! nothing found here is executed until the operator names or picks it (ADR
+//! 0008 carve-out 2, SPEC §4.2).
 use capyctl_config::engine_policy::Engine;
 use std::path::{Path, PathBuf};
 
@@ -82,4 +83,55 @@ pub fn packages(env: &Path) -> Vec<(Engine, String)> {
     found.sort_by(|a, b| (a.0 as u8, &a.1).cmp(&(b.0 as u8, &b.1)));
     found.dedup();
     found
+}
+
+/// ADR 0039 §2: what a native TensorFold release root's `VERSION` file says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseVersion {
+    /// The root holds no `VERSION` file.
+    Absent,
+    /// One `MAJOR.MINOR.PATCH` line.
+    Stated(String),
+    /// A `VERSION` that is not one such line within the bound (or not a
+    /// regular file).
+    Unreadable,
+}
+
+/// ADR 0039 §2: `text` is a `MAJOR.MINOR.PATCH` version (digits only, at most
+/// [`capyctl_config::tensorfold_native::VERSION_FILE_LIMIT`] bytes).
+pub(crate) fn release_version_text(text: &str) -> Option<String> {
+    let parts: Vec<&str> = text.split('.').collect();
+    (text.len() as u64 <= capyctl_config::tensorfold_native::VERSION_FILE_LIMIT
+        && parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())))
+    .then(|| text.to_owned())
+}
+
+/// ADR 0039 §2: the root's `VERSION` file, one `MAJOR.MINOR.PATCH` line of at
+/// most 32 bytes (a trailing newline allowed), read without following a
+/// symbolic link. Nothing is executed.
+pub fn release_version(root: &Path) -> ReleaseVersion {
+    use std::io::Read as _;
+    let path = root.join(capyctl_config::tensorfold_native::VERSION_FILE);
+    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        return ReleaseVersion::Absent;
+    };
+    if !meta.is_file() {
+        return ReleaseVersion::Unreadable;
+    }
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(&path).and_then(|file| {
+        file.take(capyctl_config::tensorfold_native::VERSION_FILE_LIMIT + 1)
+            .read_to_end(&mut bytes)
+    });
+    if read.is_err() || bytes.len() as u64 > capyctl_config::tensorfold_native::VERSION_FILE_LIMIT {
+        return ReleaseVersion::Unreadable;
+    }
+    let Ok(text) = String::from_utf8(bytes) else {
+        return ReleaseVersion::Unreadable;
+    };
+    let line = text.strip_suffix('\n').unwrap_or(&text);
+    release_version_text(line).map_or(ReleaseVersion::Unreadable, ReleaseVersion::Stated)
 }

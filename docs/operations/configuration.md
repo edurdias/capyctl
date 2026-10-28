@@ -179,7 +179,7 @@ block.
 |---|---|---|---|---|---|
 | vLLM executable | `local_engine.vllm` | `--vllm-bin <path>` | `CAPYCTL_VLLM_BIN` | none | host, standalone |
 | SGLang interpreter | `local_engine.sglang` | `--sglang-bin <path>` | `CAPYCTL_SGLANG_BIN` | none | host, standalone |
-| TensorFold executable | `local_engine.tensorfold` | `--tensorfold-bin <path>` | `CAPYCTL_TENSORFOLD_BIN` | none | host, standalone |
+| TensorFold executable (a 0.6 venv's `bin/tensorfold`, or a native release's `bin/tensorfold-native`) | `local_engine.tensorfold` | `--tensorfold-bin <path>` | `CAPYCTL_TENSORFOLD_BIN` | none | host, standalone |
 | llama.cpp `llama-server` binary | `local_engine.llamacpp` | `--llamacpp-bin <path>` | `CAPYCTL_LLAMACPP_BIN` | none | host, standalone |
 | Build fingerprint | `local_engine.build_fingerprint` | `--engine-fingerprint <text>` | `CAPYCTL_ENGINE_FINGERPRINT` | what `<engine> --version` prints | host, standalone |
 | Host-fixed vLLM arguments | `local_engine.args` (a list) | `--engine-args "<args>"` | `CAPYCTL_ENGINE_ARGS` (space-separated) | none | host, standalone |
@@ -196,6 +196,17 @@ A host generates no deployment of its own, so `--kv-cache` exists only on
 deployment states `engine_config.memory.kv_cache`. SGLang takes no host-fixed
 arguments, so `args` applies to the vLLM and TensorFold profiles only. Name `runtime_dir` only
 to run from a directory you maintain yourself; CapyCTL never writes to it.
+
+A TensorFold profile has a `line`: `python` (TensorFold 0.6, a venv; the
+default, so a profile without `line` is a 0.6 profile) or `native` (TensorFold
+1.x, a release directory holding `bin/tensorfold-native`). `capyctl engine
+add` writes it from the installation's form, with the native release's
+recorded `native` block (the model families its capabilities document lists,
+and whether its `SHA256SUMS` was checked); for the role's own engine the line
+follows the file name `--tensorfold-bin` names. The line is part of the
+installation's fingerprint: a profile that changes line is drift. The native
+line needs no CUDA toolkit, so `cuda_home` does not apply to it
+([TensorFold](../guide/engines.md#tensorfold)).
 
 Engine tuning such as vLLM's loader under deep parking
 (`engine_config.vllm.safetensors_load_strategy`: `eager` or `lazy`) is a deployment
@@ -298,6 +309,12 @@ whatever an approval says (`engine_env_reserved:<name>`):
   `VLLM_ALLOW_INSECURE_SERIALIZATION`, and the usage-reporting opt-outs
   `DO_NOT_TRACK`, `VLLM_DO_NOT_TRACK` and `VLLM_NO_USAGE_STATS`, which only
   the host's [`engine_telemetry`](#engine-usage-reporting) decides.
+
+On a TensorFold native profile CapyCTL also owns `TENSORFOLD_MEMORY_RESERVE_GIB`,
+and never passes `TENSORFOLD_API_KEY`, `TENSORFOLD_REQUEST_LOG`,
+`TENSORFOLD_CUDA_KERNELS`, `TF_CUDA_DEVICE`, `TF_CUDA_SEGMENTS` or
+`BRAVE_SEARCH_API_KEY`: a profile or deployment naming one is refused
+(`engine_env_reserved:<name>`), with the reason in the message.
 
 CapyCTL starts every SGLang process with `SGLANG_PLUGINS=capyctl-loads-no-plugins`,
 a plugin selection that names no plugin, so SGLang loads none. SGLang 0.5.22
@@ -884,10 +901,13 @@ CapyCTL starts each engine with a closed environment. `CAPYCTL_ENGINE_LOG`,
 `CAPYCTL_EXTRA_APPROVALS`, `CAPYCTL_RENDEZVOUS_DIR`, `CAPYCTL_OBSERVATION_DIR`,
 `CAPYCTL_VLLM_ADMIN_KEY`, `CAPYCTL_ENGINE_API_KEY` and `CAPYCTL_DEBUG_ENGINE_LOGS` are
 written by CapyCTL for the engine process; setting them yourself has no effect.
-For TensorFold it also writes `TENSORFOLD_NO_UPDATE_CHECK`, `HF_HUB_OFFLINE`,
+For TensorFold 0.6 it also writes `TENSORFOLD_NO_UPDATE_CHECK`, `HF_HUB_OFFLINE`,
 `TRANSFORMERS_OFFLINE` and `TORCH_EXTENSIONS_DIR`
 (`<state dir>/engines/tensorfold/<version>/torch_extensions`, private to the
-service user). Under `engine_telemetry: off` (the default) it writes
+service user); for TensorFold native, `TENSORFOLD_NO_UPDATE_CHECK`,
+`HF_HUB_OFFLINE`, `TENSORFOLD_CUDA_MEMORY_LIMIT_GB` (the declared allocation)
+and `TENSORFOLD_MEMORY_RESERVE_GIB=2`, and its PATH is the system's alone.
+Under `engine_telemetry: off` (the default) it writes
 `DO_NOT_TRACK=1` for every engine and `VLLM_DO_NOT_TRACK=1` and
 `VLLM_NO_USAGE_STATS=1` for vLLM ([Engine usage reporting](#engine-usage-reporting)).
 Other variables in CapyCTL's own environment do not reach an engine. The CUDA

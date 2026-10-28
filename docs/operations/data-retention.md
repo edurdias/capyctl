@@ -124,6 +124,13 @@ only its weights in host memory. CapyCTL also starts llama.cpp with its host
 RAM prompt cache off. Zero data retention does not turn these caches off: they
 are written nowhere and die with the engine process.
 
+On TensorFold's native line (1.x), CapyCTL never passes the engine
+`TENSORFOLD_REQUEST_LOG` (which appends every request body to a file) and
+renders none of its compaction or disk options: `--compact-at`,
+`--compact-keep` and `--compact-memory`, and TensorFold 1.1.5's `--record`,
+`--learn*` and `--recall*` options, run only when a deployment or the engine
+profile passes them, and never under zero data retention (below).
+
 To stop requests from different users sharing cached prefixes, send a
 `cache_salt` field with each request. CapyCTL does not send the salt itself:
 it sends an engine that honours salts (vLLM, SGLang) a SHA-256 digest of the
@@ -180,6 +187,12 @@ it:
   and `lmcache: required` is refused `retention_zero:lmcache`;
 - starts engine and LMCache processes with no core dumps (`RLIMIT_CORE` 0), so
   a crash writes no dump of request data.
+- on TensorFold's native line, refuses a deployment whose own or engine
+  arguments carry `--compact-at`, `--compact-keep` or `--compact-memory`
+  (`retention_zero:compaction`), or an option that writes request state to
+  disk, `--record`, `--learn*` or `--recall*` (`retention_zero:engine_disk`):
+  at deploy for the deployment's `retention: zero`, at placement for the
+  host's. The option is refused, never silently dropped.
 
 Turning it on for a host stops the LMCache servers already running there: each
 instance using one is drained, stopped with its server, and started again
