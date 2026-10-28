@@ -950,11 +950,14 @@ impl EnvEngineProvider {
         // SPEC §9.1 / T21 / ADR 0012: deep parking is on unless the host opts
         // out. Sleep mode follows the same switch as deep parking.
         let mut deep_park = deep_park.unwrap_or(settings.deep_park);
+        // ADR 0039 §2: the line follows the file name.
+        let line = capyctl_config::registration::executable_line(engine, &executable);
         // ADR 0023 §2, §6: an environment TensorFold install is checked
         // for its build toolchain as `engine add` checks it, and never parks.
+        // ADR 0039 §2: the toolchain check runs for the Python line only.
         if engine == Engine::Tensorfold {
             deep_park = false;
-            if fingerprint.is_none() {
+            if fingerprint.is_none() && line.is_python() {
                 let bin = executable.parent().unwrap_or(Path::new(""));
                 capyctl_config::toolchain::check(
                     bin,
@@ -1003,7 +1006,7 @@ impl EnvEngineProvider {
         // ADR 0014 §2, §5: the generated standalone deployment states its KV
         // cache; its memory request is the Ready allocation it declares.
         let engine_config = serde_json::json!({"memory": {"kv_cache": kv_cache_bytes}});
-        verify_runtime(&role.runtime_dir, engine, deep_park)?;
+        verify_runtime(&role.runtime_dir, engine, line, deep_park)?;
         Ok(EngineInstallation {
             engine,
             executable,
@@ -1016,7 +1019,8 @@ impl EnvEngineProvider {
             runtime_dir: role.runtime_dir,
             args,
             installation_drift,
-            cuda_home: role.cuda_home,
+            // ADR 0039 §2: no CUDA toolkit is recorded for the native line.
+            cuda_home: role.cuda_home.filter(|_| line.is_python()),
             engine_ports: role.engine_ports,
             registered: None,
         })
@@ -1237,14 +1241,20 @@ fn runtime_dir(
 /// The runtime modules one installation of `engine` imports from `dir`.
 /// `deep_park` is the host's switch: with it on, a parking vLLM deployment
 /// renders sleep mode, whose entry imports the capability probes (ADR 0008).
-fn verify_runtime(dir: &Path, engine: Engine, deep_park: bool) -> Result<(), ProviderError> {
+/// ADR 0039 §2: a native TensorFold installation (`line`) imports none.
+fn verify_runtime(
+    dir: &Path,
+    engine: Engine,
+    line: capyctl_config::tensorfold_native::TensorfoldLine,
+    deep_park: bool,
+) -> Result<(), ProviderError> {
     // SPEC §9.1, §13.3 / T21 T37: the same integrity the host agent requires
     // before a launch. The engine imports capyctl's modules from this directory,
     // so one another account could rewrite is refused here, before anything
     // is served.
     capyctl_agent::runtime_integrity::verify(
         dir,
-        capyctl_agent::runtime_integrity::required_files(engine, deep_park),
+        capyctl_agent::runtime_integrity::required_files(engine, line, deep_park),
     )
     .map_err(|error| {
         no_installation(format!(
@@ -1268,6 +1278,12 @@ pub(crate) fn engine_version(engine: Engine, executable: &Path) -> Result<String
 /// A probe that fails or hangs is a refusal: an engine that cannot print its own
 /// version is not one this host should publish.
 fn probe_fingerprint(executable: &Path, engine: Engine) -> Result<String, ProviderError> {
+    // ADR 0039 §2: the native TensorFold binary's version is read by the
+    // bounded standard-output check `engine add` runs (cleared environment,
+    // own process group), and must agree with the release's `VERSION`.
+    if capyctl_config::registration::executable_line(engine, executable).is_native() {
+        return native_fingerprint(executable);
+    }
     // ADR 0029 §2: `llama-server --version` writes to standard error.
     let reads_stderr = engine == Engine::Llamacpp;
     let (stdout, stderr) = if reads_stderr {
@@ -1344,6 +1360,23 @@ fn probe_fingerprint(executable: &Path, engine: Engine) -> Result<String, Provid
         )));
     }
     Ok(fingerprint)
+}
+
+/// ADR 0039 §2: the checked version of a native TensorFold binary, the
+/// profile's `build_fingerprint`; a binary that is not a release's
+/// `bin/tensorfold-native`, or whose version line cannot be read, is refused.
+fn native_fingerprint(executable: &Path) -> Result<String, ProviderError> {
+    let refused = |detail: String| {
+        no_installation(format!(
+            "{}: {detail}; set {ENGINE_FINGERPRINT} if this host publishes one another way",
+            executable.display()
+        ))
+    };
+    let resolved = capyctl_agent::engines::resolve(executable)
+        .map_err(|error| refused(format!("{}: {error}", error.code())))?;
+    capyctl_agent::engines::check_version(&resolved, capyctl_agent::engines::VERSION_CHECK_TIMEOUT)
+        .map(|reported| reported.build_fingerprint)
+        .map_err(|error| refused(format!("{}: {error}", error.code())))
 }
 
 /// Boot the embedded standalone graph (SPEC §15.2 no-config matrix) against the

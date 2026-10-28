@@ -606,9 +606,13 @@ pub fn apply_to_host_with(
                 )
             })?,
         };
+        // ADR 0039 §2: the line follows the file name (`tensorfold-native`
+        // is the native release's binary).
+        let line = crate::registration::executable_line(engine, &executable);
         // ADR 0023 §2: the first start builds CUDA extensions, so the
-        // toolchain is checked here as `engine add` checks it.
-        if engine == Engine::Tensorfold {
+        // toolchain is checked here as `engine add` checks it. ADR 0039 §2:
+        // nothing compiles at run time on the native line.
+        if engine == Engine::Tensorfold && line.is_python() {
             let bin = executable.parent().unwrap_or(Path::new(""));
             crate::toolchain::check(bin, settings.cuda_home.as_deref(), &search.system).map_err(
                 |missing| {
@@ -636,7 +640,9 @@ pub fn apply_to_host_with(
                 && !matches!(engine, Engine::Tensorfold | Engine::Llamacpp),
             installation_drift: settings.installation_drift,
             args,
-            cuda_home: settings.cuda_home.clone(),
+            // ADR 0039 §2: the native line runs no CUDA toolkit; none is
+            // recorded for it.
+            cuda_home: settings.cuda_home.clone().filter(|_| line.is_python()),
             approved_options: Vec::new(),
             approved_paths: Vec::new(),
             env: Default::default(),
@@ -645,6 +651,10 @@ pub fn apply_to_host_with(
             // ADR 0033 §1: only `engine add` registers LMCache; a role's own
             // installation runs without it (`not_installed`).
             lmcache: None,
+            line,
+            // ADR 0039 §2: only `engine add` reads the capabilities document
+            // and `SHA256SUMS`; the role's own installation records neither.
+            native: None,
         });
         crate::registration::check_profile(name, &profile)?;
         profiles.insert(name.to_owned(), profile);
@@ -1213,6 +1223,54 @@ mod tests {
         let profile = &document["runtime_profiles"]["local"];
         assert_eq!(profile["engine"], "tensorfold");
         assert_eq!(profile["security"]["deep_park"], "disabled");
+    }
+
+    // T41 (ADR 0039 §2): `local_engine.tensorfold` naming a native release's
+    // `tensorfold-native` is the native line: no toolchain is asked (none
+    // exists here), the version comes from the probe, and the profile says
+    // `line: native` with no CUDA toolkit and deep parking off.
+    #[test]
+    fn a_host_native_tensorfold_needs_no_toolchain() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("tensorfold-1.0.0/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let settings = EngineSettings {
+            tensorfold: Some(bin.join("tensorfold-native")),
+            deep_park: true,
+            cuda_home: Some("/usr/local/cuda".into()),
+            ..defaults()
+        };
+        let search = crate::toolchain::ToolchainSearch {
+            system: String::new(),
+            default_cuda_home: dir.path().join("no-cuda"),
+            system_root: dir.path().to_path_buf(),
+        };
+        let probed = std::cell::Cell::new(false);
+        let probe = |engine: Engine, executable: &Path| {
+            assert_eq!(engine, Engine::Tensorfold);
+            assert_eq!(executable, bin.join("tensorfold-native"));
+            probed.set(true);
+            Ok("1.0.0".to_owned())
+        };
+        let mut document = json!({});
+        apply_to_host_with(&mut document, &settings, &probe, &search).unwrap();
+        assert!(probed.get());
+        let profile = &document["runtime_profiles"]["local"];
+        assert_eq!(profile["engine"], "tensorfold");
+        assert_eq!(profile["line"], "native");
+        assert_eq!(profile["build_fingerprint"], "1.0.0");
+        assert_eq!(profile["security"]["deep_park"], "disabled");
+        assert!(profile.get("cuda_home").is_none(), "{profile}");
+        assert!(profile.get("native").is_none(), "{profile}");
+        // The 0.6 line beside it still asks for its toolchain.
+        let python = EngineSettings {
+            tensorfold: Some(bin.join("tensorfold")),
+            build_fingerprint: Some("0.6.0".into()),
+            ..defaults()
+        };
+        let error = apply_to_host_with(&mut json!({}), &python, &|_, _| unreachable!(), &search)
+            .unwrap_err();
+        assert!(error.detail.contains("toolchain_missing"), "{error}");
     }
 
     // T42 T03 (ADR 0029 §2): llama.cpp's own installation is `local` alone and

@@ -219,6 +219,8 @@ fn spec(engine: Engine) -> ProfileSpec {
         approved_env: vec![],
         trust_remote_code: false,
         lmcache: None,
+        line: Default::default(),
+        native: None,
     }
 }
 
@@ -286,6 +288,118 @@ fn the_verified_set_marks_custom_builds() {
     assert!(!is_verified(Engine::Sglang, "0.5.22"));
     assert!(!is_verified(Engine::Sglang, "0.5.20+custom"));
     assert!(!is_verified(Engine::Vllm, "0.5.20"));
+}
+
+/// A native TensorFold release's profile as `engine add` builds it.
+fn native_spec(version: &str, checksums_verified: bool) -> ProfileSpec {
+    use capyctl_config::tensorfold_native::{NativeRegistration, TensorfoldLine};
+    ProfileSpec {
+        executable: format!("/home/u/tensorfold-{version}/bin/tensorfold-native").into(),
+        build_fingerprint: version.into(),
+        deep_park: false,
+        line: TensorfoldLine::Native,
+        native: Some(NativeRegistration {
+            families: [("nemotron_h".to_owned(), vec!["mlx-q4g64".to_owned()])].into(),
+            checksums_verified,
+        }),
+        ..spec(Engine::Tensorfold)
+    }
+}
+
+// T41 T17 (ADR 0039 §1, §2): a native profile is written with `line: native`
+// and its `native` record and passes the resolution rules; a 0.6 profile is
+// written exactly as before (no `line`, no `native`), and the two coexist in
+// one engines.yaml under their own names.
+#[test]
+fn a_native_profile_states_its_line_and_the_06_one_is_unchanged() {
+    let native = profile_document(&native_spec("1.1.5", true));
+    assert_eq!(native["line"], "native");
+    assert_eq!(native["native"]["checksums_verified"], true);
+    assert_eq!(native["native"]["families"]["nemotron_h"][0], "mlx-q4g64");
+    assert_eq!(native["security"]["deep_park"], "disabled");
+    check_profile("tensorfold-1-1-5", &native).unwrap();
+    let mut python_spec = spec(Engine::Tensorfold);
+    python_spec.build_fingerprint = "0.6.6".into();
+    python_spec.deep_park = false;
+    let python = profile_document(&python_spec);
+    assert!(python.get("line").is_none(), "{python}");
+    assert!(python.get("native").is_none(), "{python}");
+    check_profile("tensorfold", &python).unwrap();
+    // A Python-line spec carrying a native record writes neither field.
+    let stray = profile_document(&ProfileSpec {
+        line: Default::default(),
+        ..native_spec("1.0.0", false)
+    });
+    assert!(stray.get("line").is_none() && stray.get("native").is_none());
+
+    let dir = tempfile::tempdir().unwrap();
+    let document = host_doc(dir.path());
+    let engines = engines_beside(&document);
+    let lock = lock_engines(&engines).unwrap();
+    let mut file = EnginesFile::load(&engines).unwrap();
+    file.profiles.insert("tensorfold".into(), python);
+    file.profiles
+        .insert("tensorfold-1-1-5".into(), native.clone());
+    write_engines(&file, &lock, Some(&host_value(&document))).unwrap();
+    let loaded = EnginesFile::load(&engines).unwrap();
+    assert_eq!(loaded.profiles["tensorfold-1-1-5"], native);
+    let mut host = host_value(&document);
+    merge_into_host(&mut host, &loaded).unwrap();
+    assert_eq!(
+        host["runtime_profiles"]["tensorfold-1-1-5"]["line"],
+        "native"
+    );
+    assert!(host["runtime_profiles"]["tensorfold"].get("line").is_none());
+}
+
+// T41 (ADR 0039 §1, §3): the line-aware verified set: the native line reads
+// its own certified set, never 0.6's; the file name decides a role's own
+// installation's line.
+#[test]
+fn the_line_decides_which_verified_set_a_tensorfold_version_reads() {
+    use capyctl_config::tensorfold_native::TensorfoldLine;
+    assert!(is_verified_line(
+        Engine::Tensorfold,
+        TensorfoldLine::Python,
+        "0.6.6"
+    ));
+    assert!(!is_verified_line(
+        Engine::Tensorfold,
+        TensorfoldLine::Native,
+        "0.6.6"
+    ));
+    for version in ["1.0.3", "1.2.0"] {
+        assert!(!is_verified_line(
+            Engine::Tensorfold,
+            TensorfoldLine::Native,
+            version
+        ));
+    }
+    // ADR 0039 §3: 1.0.0 and 1.1.5 are certified once their rows pass.
+    for version in ["1.0.0", "1.1.5"] {
+        assert_eq!(
+            is_verified_line(Engine::Tensorfold, TensorfoldLine::Native, version),
+            capyctl_config::tensorfold_native::is_certified(version)
+        );
+    }
+    assert!(is_verified_line(
+        Engine::Vllm,
+        TensorfoldLine::Native,
+        "0.29.0"
+    ));
+    assert_eq!(
+        executable_line(Engine::Tensorfold, Path::new("/r/bin/tensorfold-native")),
+        TensorfoldLine::Native
+    );
+    assert_eq!(
+        executable_line(Engine::Tensorfold, Path::new("/v/bin/tensorfold")),
+        TensorfoldLine::Python
+    );
+    assert_eq!(
+        profile_line(&profile_document(&native_spec("1.0.0", true))),
+        TensorfoldLine::Native
+    );
+    assert_eq!(profile_line(&profile()), TensorfoldLine::Python);
 }
 
 // ADR 0018 §3: only a change confined to runtime profiles is live.

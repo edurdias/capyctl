@@ -83,12 +83,22 @@ impl EmbeddedInstallation {
             name: profile.to_owned(),
             ..Default::default()
         };
-        capyctl_agent::installation::registration(&measurer, Some(engine), executable, custom)
-            .write(&mut registration);
+        // ADR 0039 §2: a native TensorFold release (its `tensorfold-native`
+        // binary) is measured from its root, at registration and at launch.
+        let line = capyctl_config::registration::executable_line(engine, executable);
+        capyctl_agent::installation::registration(
+            &measurer,
+            Some(engine),
+            line,
+            executable,
+            custom,
+        )
+        .write(&mut registration);
         let mut registry = InstallationRegistry::from_inventory(&pb::ReportInventory {
             profiles: vec![registration.clone()],
             ..Default::default()
-        });
+        })
+        .with_line(profile, line);
         if let Some(custom) = custom {
             registry = registry.with_custom(profile, custom.manifest.clone());
         }
@@ -784,7 +794,12 @@ mod tests {
         let python = dir.path().join("bin/python3");
         let unpinned = custom(None);
         let approved = capyctl_agent::installation::InstallationMeasurer::new()
-            .measure_profile(Engine::Custom, &python, Some(&unpinned.manifest))
+            .measure_profile(
+                Engine::Custom,
+                capyctl_config::tensorfold_native::TensorfoldLine::Python,
+                &python,
+                Some(&unpinned.manifest),
+            )
             .unwrap()
             .digest;
         let mut pinned = unpinned.clone();

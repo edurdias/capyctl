@@ -273,6 +273,8 @@ fn with_vllm(host: &str) -> pb::ReportInventory {
             approved_env: vec![],
             trust_remote_code: false,
             lmcache: None,
+            line: Default::default(),
+            native: None,
         },
     );
     inventory.approved_host_config_json = document.to_string();

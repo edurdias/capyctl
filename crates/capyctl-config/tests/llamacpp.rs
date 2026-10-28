@@ -45,6 +45,8 @@ fn spec(deep_park: bool) -> ProfileSpec {
         approved_env: vec![],
         trust_remote_code: false,
         lmcache: None,
+        line: Default::default(),
+        native: None,
     }
 }
 
@@ -204,6 +206,7 @@ fn extra(
         &args(list),
         &ExtraArgsContext {
             engine: Engine::Llamacpp,
+            line: Default::default(),
             sleep_mode: false,
             approved_options: &approved,
             approved_paths: &paths,
@@ -231,6 +234,7 @@ fn every_reserved_spelling_is_refused() {
                     reserved_refusal(extra(list, &[], &[], &[]))
                         && reserved_refusal(validate_profile_args(
                             Engine::Llamacpp,
+                            Default::default(),
                             &args(list),
                             false,
                         ))
@@ -314,7 +318,10 @@ fn the_equals_spelling_is_refused() {
             "{error}"
         );
         assert!(error.to_string().contains("llama.cpp refuses"), "{error}");
-        assert!(validate_profile_args(Engine::Llamacpp, &args(list), false).is_err());
+        assert!(
+            validate_profile_args(Engine::Llamacpp, Default::default(), &args(list), false)
+                .is_err()
+        );
     }
 }
 
@@ -343,7 +350,7 @@ fn cache_reuse_is_ordinary() {
         &["--cache-prompt"],
     ] {
         extra(list, &[], &[], &[]).unwrap_or_else(|error| panic!("{list:?}: {error}"));
-        validate_profile_args(Engine::Llamacpp, &args(list), false)
+        validate_profile_args(Engine::Llamacpp, Default::default(), &args(list), false)
             .unwrap_or_else(|error| panic!("{list:?}: {error}"));
     }
     // One option, however it is spelled, is passed once.
@@ -448,6 +455,7 @@ fn sensitive_options_need_approval_and_approved_paths() {
     // The host writes its own arguments: no approval needed there.
     validate_profile_args(
         Engine::Llamacpp,
+        Default::default(),
         &args(&["--model-draft", "/anywhere/d.gguf"]),
         false,
     )

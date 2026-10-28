@@ -506,8 +506,10 @@ enum EngineArgs {
     },
     /// Register an installation as a runtime profile and publish it.
     Add {
-        /// A venv directory, its bin/vllm, bin/tensorfold or bin/python3, or a llama-server
-        /// binary or the directory holding it. Omit to pick interactively.
+        /// A venv directory, its bin/vllm, bin/tensorfold or bin/python3; a llama-server
+        /// binary or the directory holding it; or a TensorFold native release: its
+        /// bin/tensorfold-native, its bin directory or the release directory. Omit to
+        /// pick interactively.
         #[arg(conflicts_with = "custom")]
         path: Option<PathBuf>,
         /// A custom engine: the program to run, started with the arguments
@@ -715,9 +717,10 @@ struct RoleSettingsArgs {
     /// over CAPYCTL_SGLANG_BIN and local_engine.sglang.
     #[arg(long, value_name = "PATH", value_parser = parse_engine_path)]
     sglang_bin: Option<PathBuf>,
-    /// The TensorFold executable (`<venv>/bin/tensorfold`) this role runs as
-    /// its `local` profile. Wins over CAPYCTL_TENSORFOLD_BIN and
-    /// local_engine.tensorfold.
+    /// The TensorFold executable this role runs as its `local` profile: a
+    /// 0.6 venv's `<venv>/bin/tensorfold`, or a native release's
+    /// `<release>/bin/tensorfold-native` (the line follows the file name).
+    /// Wins over CAPYCTL_TENSORFOLD_BIN and local_engine.tensorfold.
     #[arg(long, value_name = "PATH", value_parser = parse_engine_path)]
     tensorfold_bin: Option<PathBuf>,
     /// The llama.cpp `llama-server` binary this role runs as its `local`
