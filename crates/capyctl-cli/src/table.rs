@@ -289,6 +289,10 @@ fn hosts(value: &Value) -> String {
                 text(&profile["installation"]["lmcache"]["observed_digest"])
             ));
         }
+        // ADR 0037 §13: each host role's tracing, as its latest report says.
+        if let Some(line) = crate::role_tracing::status_line(host) {
+            out.push_str(&format!("{}: {line}\n", clean(name)));
+        }
     }
     out
 }
@@ -732,6 +736,11 @@ fn status(value: &Value, names: &HostNames) -> String {
         for line in tracing {
             out.push_str(&line);
         }
+    }
+    // ADR 0037 §13: the role's own tracing, `tracing: off` or on with its
+    // endpoint, spans dropped and the last export error.
+    if let Some(line) = crate::role_tracing::status_line(d) {
+        out.push_str(&format!("\n{line}\n"));
     }
     if let Some(engine) = d["engine"].as_str() {
         out.push_str(&format!("\nEngine  {engine}\n"));
@@ -1462,6 +1471,47 @@ mod tests {
         let none = json!({"name": "m", "observed_state": "ready",
             "instances": [instance(0, None)]});
         assert!(!render(View::Status, &none, &names()).contains("engine tracing"));
+    }
+
+    // T48 (ADR 0037 §13): status shows the role's tracing line when the
+    // server reports one, and nothing when it does not (an older server).
+    #[test]
+    fn status_shows_the_roles_tracing() {
+        let mut d = json!({"name": "m", "observed_state": "ready", "instances": []});
+        assert!(!render(View::Status, &d, &names()).contains("tracing:"));
+        d["tracing"] = json!({"on": false});
+        assert!(render(View::Status, &d, &names()).contains("\ntracing: off\n"));
+        d["tracing"] = json!({"on": true, "endpoint": "http://127.0.0.1:4318/v1/traces",
+            "spans_dropped": 2, "last_export_error": "timeout"});
+        let out = render(View::Status, &d, &names());
+        assert!(
+            out.contains(
+                "\ntracing: on → http://127.0.0.1:4318/v1/traces, spans dropped 2, last export error: timeout\n"
+            ),
+            "{out}"
+        );
+    }
+
+    // T48 (ADR 0037 §13): `hosts` shows each host role's tracing below the
+    // table, from the `tracing` its latest report carried; none without it.
+    #[test]
+    fn hosts_show_each_hosts_tracing() {
+        let out = render(
+            View::Hosts,
+            &json!({"hosts": [
+                {"host_id": "01A", "name": "a", "tracing": {"on": true,
+                    "endpoint": "http://127.0.0.1:4318/v1/traces", "spans_dropped": 0}},
+                {"host_id": "01B", "name": "b", "tracing": {"on": false}},
+                {"host_id": "01C", "name": "c", "tracing": null},
+            ]}),
+            &HostNames::new(),
+        );
+        assert!(
+            out.contains("a: tracing: on → http://127.0.0.1:4318/v1/traces, spans dropped 0\n"),
+            "{out}"
+        );
+        assert!(out.contains("b: tracing: off\n"), "{out}");
+        assert!(!out.contains("c: tracing"), "{out}");
     }
 
     #[test]

@@ -18,6 +18,8 @@ ulid = { workspace = true }
 capyctl-store = { workspace = true }
 capyctl-router = { path = "../capyctl-router" }
 capyctl-adapters = { workspace = true }
+# ADR 0037: each role's tracing, built from its settings.
+capyctl-trace = { workspace = true }
 capyctl-launchers = { path = "../capyctl-launchers" }
 axum = { workspace = true }
 reqwest = { workspace = true }
