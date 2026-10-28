@@ -149,7 +149,7 @@ fn native_dimensions(
     else {
         return Ok(());
     };
-    capyctl_adapters::forward::validate_native_dimensions(body, native)
+    capyctl_adapters::embedding_request::validate_native_dimensions(body, native)
         .map_err(|refused| refusal("invalid_request", &refused.to_string()))
 }
 

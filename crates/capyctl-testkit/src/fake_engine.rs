@@ -817,7 +817,7 @@ impl capyctl_adapters::traits::ChatForward for FakeEngine {
         body: &serde_json::Value,
         sink: &mut dyn capyctl_adapters::traits::EmbeddingSink,
     ) -> Result<capyctl_adapters::traits::EmbeddingAnswered, AdapterError> {
-        capyctl_adapters::forward::validate_embedding_request(body)?;
+        capyctl_adapters::embedding_request::validate_embedding_request(body)?;
         let chunk_bytes = match self.embeddings.lock().unwrap().as_ref() {
             Some(script) => script.chunk_bytes.max(1),
             None => return Err(AdapterError::UnsupportedCapability),
@@ -831,8 +831,9 @@ impl capyctl_adapters::traits::ChatForward for FakeEngine {
                 client_gone = true;
             }
         }
-        let mut answered = capyctl_adapters::forward::embedding_answered(body, &answer)
-            .ok_or_else(|| AdapterError::Uncertain("embeddings answer unverified".into()))?;
+        let mut answered =
+            capyctl_adapters::embedding_request::embedding_answered(body, &answer)
+                .ok_or_else(|| AdapterError::Uncertain("embeddings answer unverified".into()))?;
         answered.client_gone = client_gone;
         Ok(answered)
     }

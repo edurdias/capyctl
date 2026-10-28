@@ -61,8 +61,10 @@ impl Endpoint {
             Self::ChatCompletions => crate::chat::validate_request(body),
             Self::Decisions => capyctl_adapters::forward::validate_decision_request(body)
                 .map_err(|refusal| crate::chat::refusal("invalid_request", &refusal.to_string())),
-            Self::Embeddings => capyctl_adapters::forward::validate_embedding_request(body)
-                .map_err(|refusal| crate::chat::refusal("invalid_request", &refusal.to_string())),
+            Self::Embeddings => capyctl_adapters::embedding_request::validate_embedding_request(
+                body,
+            )
+            .map_err(|refusal| crate::chat::refusal("invalid_request", &refusal.to_string())),
         }
     }
 }

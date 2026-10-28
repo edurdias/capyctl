@@ -517,7 +517,7 @@ impl Kind {
         match self {
             Self::Chat => capyctl_adapters::forward::chat_request_allowed(body),
             Self::Decision => capyctl_adapters::forward::decision_request_allowed(body),
-            Self::Embedding => capyctl_adapters::forward::embedding_request_allowed(body),
+            Self::Embedding => capyctl_adapters::embedding_request::embedding_request_allowed(body),
         }
     }
     /// Whether the engine's answer has a media type this kind relays: a chat

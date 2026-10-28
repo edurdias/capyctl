@@ -6,6 +6,7 @@ pub mod custom;
 pub mod decision_probe;
 mod embedding_answer;
 pub mod embedding_probe;
+pub mod embedding_request;
 pub mod engine_env;
 // SPEC §13.3 / T21: engine logs redacted as written, read back as a bounded tail.
 pub mod engine_log;
