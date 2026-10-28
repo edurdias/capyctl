@@ -267,6 +267,28 @@ pub(super) fn candidates(
         let serves_api = (e.api.is_chat() || declared(capyctl_config::decisions::HOST_CAPABILITY)?)
             && (e.profile.engine != capyctl_config::engine_policy::Engine::Custom
                 || declared(capyctl_config::custom::CAPABILITY)?);
+        // ADR 0039 §§4, 15: a native TensorFold revision is placed only on a
+        // host that declared `tensorfold_native`, and a host with `retention:
+        // zero` refuses its compaction and disk-writing options.
+        let native_gate = if e.profile.engine == capyctl_config::engine_policy::Engine::Tensorfold
+            && e.profile.line.is_native()
+        {
+            use capyctl_config::tensorfold_native::{placement_refusal, HOST_CAPABILITY};
+            let (_, host_retention) = host_lmcache_settings(tx, &host, &e)?;
+            let has_native = declared(HOST_CAPABILITY)?;
+            let args: Vec<String> = e
+                .profile
+                .args
+                .iter()
+                .chain(e.engine_config.extra_args())
+                .cloned()
+                .collect();
+            placement_refusal(&args, host_retention, |name| {
+                name == HOST_CAPABILITY && has_native
+            })
+        } else {
+            None
+        };
         // ADR 0033 §§9, 10, 13: `lmcache: required` and `retention: zero`
         // are placed only where they can run, judged again here against the
         // host's current published settings and latest declaration; the host
@@ -289,6 +311,7 @@ pub(super) fn candidates(
             )
         }
         .map(|code| (code, None))
+        .or(native_gate)
         // ADR 0035 §1a: `topology: auto` refused on this host for its GPUs.
         .or(pick.refusal)
         // ADR 0035 §11: a launch on several GPUs goes only to a host that
@@ -1089,6 +1112,7 @@ impl crate::Store {
                     needs_empty_host &= code == "startup_requires_empty_host";
                     only_ineligible &= code == "host_ineligible";
                     let gate = (capyctl_config::lmcache::PLACEMENT_REFUSALS.contains(&code)
+                        || capyctl_config::tensorfold_native::PLACEMENT_REFUSALS.contains(&code)
                         || PLACEMENT_REFUSALS.contains(&code))
                     .then_some(code);
                     gated = match gated {

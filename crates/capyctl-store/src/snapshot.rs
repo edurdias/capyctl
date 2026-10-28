@@ -165,6 +165,12 @@ pub struct DeploymentSnapshot {
     /// GPU without `auto`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topology: Option<serde_json::Value>,
+    /// ADR 0039 §3, §7: what the current revision runs as when it is not a
+    /// certified combination (a TensorFold native version or checkpoint the
+    /// owner has not certified). Notes, never a refusal. Additive; absent
+    /// when there is none or the revision does not decode.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// ADR 0014 §5 (owner decision 2026-09-25): the effective context of the
@@ -175,28 +181,33 @@ type LaunchStatus = (
     Option<capyctl_config::context_fit::ContextFit>,
     Option<capyctl_config::parsers::Parsers>,
     capyctl_config::effective::DeploymentApi,
+    Vec<String>,
 );
 
 /// ADR 0024: the parsers are chosen where the context is fitted, the same way.
-/// ADR 0030 §1: the revision's API is read from the same decode.
+/// ADR 0030 §1: the revision's API is read from the same decode. ADR 0039 §7:
+/// so are the native TensorFold notes; a remote host's checkpoint is never
+/// read here, so its notes say nothing of the checkpoint's `config.json`.
 fn context_status(
     conn: &rusqlite::Connection,
     deployment_id: &str,
 ) -> rusqlite::Result<LaunchStatus> {
     let Some((effective, remote)) = current_effective(conn, deployment_id)? else {
-        return Ok((None, None, Default::default()));
+        return Ok((None, None, Default::default(), Vec::new()));
     };
     Ok(if remote {
         (
             Some(capyctl_config::context_fit::fit_on_remote_host(&effective)),
             capyctl_config::parsers::parsers_on_remote_host(&effective),
             effective.api,
+            capyctl_config::tensorfold_native::deployment_notes(&effective, false),
         )
     } else {
         (
             Some(capyctl_config::context_fit::fit_for_effective(&effective)),
             capyctl_config::parsers::parsers_for_effective(&effective),
             effective.api,
+            capyctl_config::tensorfold_native::deployment_notes(&effective, true),
         )
     })
 }
@@ -900,6 +911,7 @@ impl Store {
                 parsers: None,
                 api: Default::default(),
                 topology: None,
+                notes: Vec::new(),
             })
         })?;
         let mut deployments = deployments;
@@ -937,7 +949,8 @@ impl Store {
             entry.startup = crate::ordinary_lifecycle::startup::status(&tx, &entry.id)?;
             entry.parked = crate::ordinary_lifecycle::parked_charge::status(&tx, &entry.id)?;
             entry.topology = crate::ordinary_lifecycle::startup::topology_status(&tx, &entry.id)?;
-            (entry.context, entry.parsers, entry.api) = context_status(&tx, &entry.id)?;
+            (entry.context, entry.parsers, entry.api, entry.notes) =
+                context_status(&tx, &entry.id)?;
             entry.switch = crate::switch_state::status(&tx, &entry.id)?;
             entry.warm = crate::switch_state::is_warm(&tx, &entry.id)?;
             if crate::switch_state::is_explicit_activation(&tx, &entry.id)? {

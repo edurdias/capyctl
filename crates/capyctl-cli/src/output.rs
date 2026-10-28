@@ -310,6 +310,25 @@ const GROUP_CODES: &[(&str, Named, Option<ExitCode>)] = &[
         Named::Bare,
         Some(ExitCode::UNSUPPORTED),
     ),
+    // ADR 0039 §§4, 15, 16: a host too old to run TensorFold's native line,
+    // and the native line's compaction and disk-writing options under a
+    // deployment's or a host's `retention: zero`, refused at resolution or
+    // placement as `retention_zero:lmcache` is.
+    (
+        "host_capability_missing:tensorfold_native",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
+    (
+        "retention_zero:compaction",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
+    (
+        "retention_zero:engine_disk",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
     // ADR 0031 §10: a manifest refused at `engine add` (or a profile's copy
     // refused at role start), and resolution's custom engine refusals.
     (
@@ -342,6 +361,9 @@ const GROUP_CODES: &[(&str, Named, Option<ExitCode>)] = &[
         Some(ExitCode::INVALID_CONFIG),
     ),
     ("custom_listener_exposed", Named::Bare, None),
+    // ADR 0039 §14: the custom engine's loopback check under a TensorFold
+    // reason; a launch failure, never a refusal with its own exit.
+    ("tensorfold_listener_exposed", Named::Bare, None),
     // ADR 0023 §2: an existing code keeps its exit when a configuration
     // refusal carries it (`capability_missing:deep_park`).
     (
