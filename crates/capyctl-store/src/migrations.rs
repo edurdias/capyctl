@@ -1747,6 +1747,60 @@ mod tests {
             .unwrap();
     }
 
+    // T20 T45 T47 T48 (ADR 0036 §§5, 6, ADR 0034 §§3a, 4, ADR 0037 §7): a
+    // v58 store upgrades through v59 (embeddings canary), v60 (LMCache pool
+    // basis and certification) and v61 (engine tracing) in that order, in
+    // one open: its canaries carry no vector, its LMCache rows read an
+    // unknown pool basis and a certified run, and each launch's engine
+    // tracing table exists, empty.
+    #[test]
+    fn a_v58_store_upgrades_through_v61() {
+        assert_eq!(latest_version(), 61);
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        apply_through(&conn, 58).unwrap();
+        conn.execute_batch(
+            "INSERT INTO wake_canaries VALUES('a',0,3,'inc','Say ready.','[1,2]','ok',7,'op-w','completion',1,NULL,NULL);
+             INSERT INTO launch_lmcache(binding_id,deployment_id,instance_index,generation,revision,host_id,mode,planned,planned_reason)
+               VALUES('b','a',0,1,1,'h','auto','off','disabled');",
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        let versions: Vec<i64> = conn
+            .prepare("SELECT version FROM schema_migrations WHERE version > 58 ORDER BY version")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(versions, [59, 60, 61]);
+        let canary: (Option<i64>, Option<Vec<u8>>) = conn
+            .query_row("SELECT dimension, vector FROM wake_canaries", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(canary, (None, None));
+        let lmcache: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT pool_source, uncertified FROM launch_lmcache",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lmcache, (None, None));
+        let traced: i64 = conn
+            .query_row("SELECT count(*) FROM launch_engine_tracing", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(traced, 0);
+        conn.execute(
+            "INSERT INTO launch_engine_tracing(binding_id,state,reason) VALUES('b','off','engine_unsupported')",
+            [],
+        )
+        .unwrap();
+    }
+
     /// v50 (SPEC §17, owner decision 2026-10-18): a v49 store gains the two
     /// history indexes the router's serving-instance read searches, keeping
     /// its rows, and the lookups by binding and by operation use them.
