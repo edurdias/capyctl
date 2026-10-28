@@ -1293,7 +1293,7 @@ mod tests {
             assert_eq!(engine, Engine::Tensorfold);
             assert_eq!(executable, bin.join("tensorfold-native"));
             probed.set(true);
-            Ok("1.0.0".to_owned())
+            Ok(crate::registration::CheckedVersion::from("1.0.0"))
         };
         let mut document = json!({});
         apply_to_host_with(&mut document, &settings, &probe, &search).unwrap();
