@@ -195,8 +195,8 @@ pub struct EffectiveDeployment {
     /// while `auto` so every revision frozen before it keeps its encoding.
     #[serde(skip_serializing_if = "LmcacheMode::is_auto")]
     pub lmcache: LmcacheMode,
-    /// ADR 0033 §6: the declared `lmcache_pool` in bytes; omitted unless
-    /// stated (the default is 4 GiB).
+    /// ADR 0033 §6, ADR 0034 §4: a stated `lmcache_pool` in bytes; omitted
+    /// for `auto` (the default: sized from the model and its context).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lmcache_pool_bytes: Option<u64>,
     /// ADR 0033 §10: the declared `retention`, omitted while `standard`.
@@ -1469,10 +1469,11 @@ fn check_custom_deployment(
     Ok(())
 }
 
-/// ADR 0033 §6, §9, §10, §14: what a deployment's `lmcache`, `lmcache_pool`
-/// and `retention` say by themselves. The pool, in bytes, when stated: a whole
-/// number of GiB, at least 1 GiB, and never beside `lmcache: off`; `lmcache:
-/// required` beside `retention: zero` is `retention_zero:lmcache`.
+/// ADR 0033 §6, §9, §10, §14, ADR 0034 §4: what a deployment's `lmcache`,
+/// `lmcache_pool` and `retention` say by themselves. The pool, in bytes,
+/// when stated: a whole number of GiB, at least 1 GiB, and never beside
+/// `lmcache: off`; `auto` (the default) is `None`. `lmcache: required` beside
+/// `retention: zero` is `retention_zero:lmcache`.
 fn lmcache_declaration(
     lmcache: LmcacheMode,
     lmcache_pool: Option<&str>,
@@ -1481,7 +1482,8 @@ fn lmcache_declaration(
     let pool = lmcache_pool
         .map(crate::lmcache::parse_pool)
         .transpose()
-        .map_err(|detail| invalid("lmcache_pool", detail))?;
+        .map_err(|detail| invalid("lmcache_pool", detail))?
+        .flatten();
     if pool.is_some() && lmcache == LmcacheMode::Off {
         return Err(invalid(
             "lmcache_pool",
@@ -1972,8 +1974,9 @@ fn resolve_with(
         retention: d.retention,
         api: d.api,
         topology: instance_spec.group.is_some(),
-        // ADR 0035 §9: LMCache stays off on several GPUs until a row
-        // qualifies it (`multi_gpu_unqualified`).
+        // ADR 0035 §9, ADR 0034 §6: several GPUs keep LMCache off under
+        // `auto` (`multi_gpu_unqualified`) and run it uncertified under
+        // `required`, which is not refused for it.
         multi_gpu: ranks > 1,
         registration: profile.lmcache.as_ref(),
         kv_transfer_config_set: crate::engine_policy::kv_transfer_config_set(
