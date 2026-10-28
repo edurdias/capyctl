@@ -349,6 +349,55 @@ pub(crate) fn migrate_v57(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// v60 (ADR 0034 §§3a, 4): add to `launch_lmcache`, each unless a store
+/// rolled back from v60 or later still has it: how the launch's pool was
+/// sized (`pool_source`; B and C, `pool_bytes_per_token` and
+/// `pool_context_tokens`; `pool_unknown`, why they were unknown;
+/// `pool_shrunk_from`, the pool before admission shrank it to the room
+/// left; `pool_warning`) and `uncertified`, the detail of a `lmcache:
+/// required` launch run outside the qualified table.
+pub(crate) fn migrate_v60(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    for (column, definition) in [
+        (
+            "pool_source",
+            "TEXT CHECK(pool_source IN('auto','stated','default'))",
+        ),
+        (
+            "pool_bytes_per_token",
+            "INTEGER CHECK(pool_bytes_per_token>0)",
+        ),
+        (
+            "pool_context_tokens",
+            "INTEGER CHECK(pool_context_tokens>0)",
+        ),
+        (
+            "pool_unknown",
+            "TEXT CHECK(length(pool_unknown) BETWEEN 1 AND 2048)",
+        ),
+        ("pool_shrunk_from", "INTEGER CHECK(pool_shrunk_from>0)"),
+        (
+            "pool_warning",
+            "TEXT CHECK(length(pool_warning) BETWEEN 1 AND 2048)",
+        ),
+        (
+            "uncertified",
+            "TEXT CHECK(length(uncertified) BETWEEN 1 AND 2048)",
+        ),
+    ] {
+        let present: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('launch_lmcache') WHERE name=?1)",
+            [column],
+            |r| r.get(0),
+        )?;
+        if !present {
+            tx.execute_batch(&format!(
+                "ALTER TABLE launch_lmcache ADD COLUMN {column} {definition};"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 /// ADR 0033 §6, amendment A15 (found live on SGLang 0.5.22, 2026-10-23: a
 /// server kept every stopped engine's KV mapped while no new KV was stored,
 /// 53,624 MiB of GPU memory where its launch was charged 18.8 GiB): the

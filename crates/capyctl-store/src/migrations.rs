@@ -11,8 +11,8 @@ use crate::schema::{
     SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
     SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
     SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V49, SCHEMA_V5, SCHEMA_V50, SCHEMA_V51, SCHEMA_V52,
-    SCHEMA_V53, SCHEMA_V54, SCHEMA_V55, SCHEMA_V56, SCHEMA_V57, SCHEMA_V58, SCHEMA_V6, SCHEMA_V7,
-    SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V53, SCHEMA_V54, SCHEMA_V55, SCHEMA_V56, SCHEMA_V57, SCHEMA_V58, SCHEMA_V59, SCHEMA_V6,
+    SCHEMA_V60, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -102,6 +102,11 @@ pub const MIGRATIONS: &[&str] = &[
     // ADR 0035 §§2, 3: GPU-set resolutions, each instance's chosen set and N,
     // and the measured peak and residue keyed by N.
     SCHEMA_V58,
+    // ADR 0036 (embeddings): its own step, merged separately.
+    SCHEMA_V59,
+    // ADR 0034 §§3a, 4: the reported pool basis per checkpoint, and how each
+    // launch's LMCache pool was sized and whether it runs uncertified.
+    SCHEMA_V60,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -228,6 +233,12 @@ pub(crate) fn apply_through(conn: &Connection, last: i64) -> Result<(), StoreErr
         if version == 58 {
             // ADR 0035 §2: each instance's chosen GPU set and its N.
             crate::instances::migrate_v58(&tx)?;
+        }
+        if version == 60 {
+            // ADR 0034 §§3a, 4: the reported pool basis, and each launch's
+            // pool sizing and certification.
+            crate::checkpoint_digests::migrate_v60(&tx)?;
+            crate::ordinary_lifecycle::lmcache::migrate_v60(&tx)?;
         }
         if version == 28 {
             // SPEC §6.5 (ADR 0013 amendment): the warm-residency flag.
@@ -610,6 +621,104 @@ mod tests {
             assert!(conn
                 .execute("UPDATE launch_lmcache SET observed_device_bytes=?1", [bad])
                 .is_err());
+        }
+    }
+
+    /// ADR 0034 §§3a, 4 (v60): a sizing, a digest and a launch recorded
+    /// before v60 read an unknown pool basis, an unknown pool source and a
+    /// certified run; the columns take positive figures, a closed source and
+    /// bounded text only; applying v60 again changes nothing; a reported
+    /// basis reads back from the digest before the sizing.
+    // T45
+    #[test]
+    fn v60_adds_the_pool_basis_and_certification_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        apply_through(&conn, 59).unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        conn.execute(
+            "INSERT INTO checkpoint_digests(deployment_id,revision,state,host_id,expected,digest,weights_bytes,provisional,diagnostic,updated_at_ms) VALUES('a',1,'recorded','h',NULL,?1,1,0,NULL,1)",
+            [&digest],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO checkpoint_sizes(deployment_id,revision,host_id,weights_bytes,sized_at_ms) VALUES('a',1,'h',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO launch_lmcache(binding_id,deployment_id,instance_index,generation,revision,host_id,mode,planned,planned_reason) VALUES('b','a',0,1,1,'h','auto','off','disabled')",
+            [],
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            crate::checkpoint_digests::migrate_v60(&tx).unwrap();
+            crate::ordinary_lifecycle::lmcache::migrate_v60(&tx).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            crate::checkpoint_digests::recorded_pool_basis(&conn, "a", 1).unwrap(),
+            None
+        );
+        for table in ["checkpoint_digests", "checkpoint_sizes"] {
+            for bad in [0, -1] {
+                assert!(conn
+                    .execute(
+                        &format!("UPDATE {table} SET kv_bytes_per_token=?1"),
+                        [bad]
+                    )
+                    .is_err());
+            }
+        }
+        conn.execute(
+            "UPDATE checkpoint_sizes SET kv_bytes_per_token=147456,pool_context_tokens=8192",
+            [],
+        )
+        .unwrap();
+        let basis = |tokens| capyctl_config::lmcache::PoolBasis {
+            bytes_per_token: 147_456,
+            context_tokens: tokens,
+        };
+        assert_eq!(
+            crate::checkpoint_digests::recorded_pool_basis(&conn, "a", 1).unwrap(),
+            Some(basis(8_192))
+        );
+        conn.execute(
+            "UPDATE checkpoint_digests SET kv_bytes_per_token=147456,pool_context_tokens=32768",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            crate::checkpoint_digests::recorded_pool_basis(&conn, "a", 1).unwrap(),
+            Some(basis(32_768))
+        );
+        let read: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT pool_source,uncertified FROM launch_lmcache",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(read, (None, None));
+        conn.execute(
+            "UPDATE launch_lmcache SET pool_source='auto',pool_bytes_per_token=1,pool_context_tokens=1,pool_shrunk_from=1,pool_warning='w',uncertified='u',pool_unknown='x'",
+            [],
+        )
+        .unwrap();
+        for bad in [
+            "pool_source='guessed'",
+            "pool_bytes_per_token=0",
+            "pool_shrunk_from=-1",
+            "pool_warning=''",
+            "uncertified=''",
+        ] {
+            assert!(
+                conn.execute(&format!("UPDATE launch_lmcache SET {bad}"), [])
+                    .is_err(),
+                "{bad}"
+            );
         }
     }
 

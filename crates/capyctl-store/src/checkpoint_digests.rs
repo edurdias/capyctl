@@ -75,6 +75,64 @@ pub(crate) fn recorded_model_type(
     )
 }
 
+/// v60 (ADR 0034 §4): add `kv_bytes_per_token` and `pool_context_tokens`
+/// to `checkpoint_digests` and `checkpoint_sizes`, each unless a store
+/// rolled back from v60 or later still has it.
+pub(crate) fn migrate_v60(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    for table in ["checkpoint_digests", "checkpoint_sizes"] {
+        for column in ["kv_bytes_per_token", "pool_context_tokens"] {
+            let present: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+                params![table, column],
+                |r| r.get(0),
+            )?;
+            if !present {
+                tx.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} INTEGER
+                       CHECK({column} IS NULL OR {column}>0);"
+                ))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// ADR 0034 §4: B and C for an enrolled host's launch of this revision, as
+/// the host that read the checkpoint reported them: with its recorded
+/// digest, else with its sizing while the digest is pending. `None` before
+/// either names both (a host from before ADR 0034 never does), which sizes
+/// the 4 GiB default.
+pub(crate) fn recorded_pool_basis(
+    conn: &rusqlite::Connection,
+    deployment: &str,
+    revision: i64,
+) -> rusqlite::Result<Option<capyctl_config::lmcache::PoolBasis>> {
+    let read = |sql: &str| -> rusqlite::Result<Option<(i64, i64)>> {
+        Ok(conn
+            .query_row(sql, params![deployment, revision], |r| {
+                Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?))
+            })
+            .optional()?
+            .and_then(|(bytes, tokens)| bytes.zip(tokens)))
+    };
+    let found = match read(
+        "SELECT kv_bytes_per_token,pool_context_tokens FROM checkpoint_digests
+          WHERE deployment_id=?1 AND revision=?2 AND state='recorded'",
+    )? {
+        Some(found) => Some(found),
+        None => read(
+            "SELECT kv_bytes_per_token,pool_context_tokens FROM checkpoint_sizes
+              WHERE deployment_id=?1 AND revision=?2",
+        )?,
+    };
+    Ok(found.and_then(|(bytes, tokens)| {
+        Some(capyctl_config::lmcache::PoolBasis {
+            bytes_per_token: u64::try_from(bytes).ok().filter(|b| *b > 0)?,
+            context_tokens: u64::try_from(tokens).ok().filter(|t| *t > 0)?,
+        })
+    }))
+}
+
 /// The closed diagnostic categories a pending digest may carry.
 const REASONS: &[&str] = &[
     "invalid_root",
