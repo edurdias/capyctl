@@ -218,6 +218,15 @@ impl Fixture {
         Self::with_settings(capyctl_testkit::sglang_launch_settings()).await
     }
     async fn with_settings(settings: capyctl_domain::launch::SglangLaunchSettings) -> Self {
+        Self::build(settings, capyctl_config::effective::DeploymentApi::Chat).await
+    }
+    async fn with_api(api: capyctl_config::effective::DeploymentApi) -> Self {
+        Self::build(capyctl_testkit::sglang_launch_settings(), api).await
+    }
+    async fn build(
+        settings: capyctl_domain::launch::SglangLaunchSettings,
+        api: capyctl_config::effective::DeploymentApi,
+    ) -> Self {
         let observer = Arc::new(Observer(
             Mutex::new(SglangRuntimeObservation {
                 token: command(RuntimeAction::Park, "park").context.token,
@@ -264,7 +273,8 @@ impl Fixture {
         let adapter = Arc::new(
             SglangAdapter::from_frozen(&frozen_with(endpoint, settings), Some(observer))
                 .unwrap()
-                .with_credentials("inference-secret".into(), "admin-secret".into()),
+                .with_credentials("inference-secret".into(), "admin-secret".into())
+                .with_api(api),
         );
         Self {
             adapter,
@@ -405,6 +415,64 @@ async fn restore_is_separate_from_reload_flush_and_accounted_probe() {
     assert!(requests[..3]
         .iter()
         .all(|r| r.authorization == "Bearer admin-secret"));
+}
+
+/// ADR 0036 §5, §7.2: an embeddings launch woken on SGLang is proven usable
+/// by the fixed embedding, with the inference key, never by a chat answer; a
+/// malformed embedding leaves the wake uncertain. ADR 0036 §6: its wake
+/// canary is the same embedding.
+// T47 T20
+#[tokio::test]
+async fn a_woken_embeddings_launch_is_proven_by_the_fixed_embedding() {
+    use capyctl_adapters::completion_probe::CanaryEvidence;
+    use capyctl_config::effective::DeploymentApi;
+    let answer = |vector: Value| {
+        json!({"object": "list", "model": "/private/checkpoint",
+            "data": [{"object": "embedding", "index": 0, "embedding": vector}],
+            "usage": {"prompt_tokens": 17, "total_tokens": 17}})
+        .to_string()
+    };
+    let f = Fixture::with_api(DeploymentApi::Embeddings).await;
+    f.reply(StatusCode::OK, &answer(json!([0.6, 0.8])));
+    let result = f
+        .adapter
+        .execute_persisted(&f.next(RuntimeAction::Probe, "probe"))
+        .await
+        .unwrap();
+    assert_eq!(result.facts, vec![Milestone::ModelUsable]);
+    let requests = f.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1/embeddings");
+    assert_eq!(requests[0].authorization, "Bearer inference-secret");
+    assert_eq!(
+        requests[0].body,
+        capyctl_adapters::embedding_probe::request(MODEL)
+    );
+    let canary = f
+        .adapter
+        .wake_canary(
+            &command(RuntimeAction::Probe, "canary").context,
+            8,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    let CanaryEvidence::Embedding(embedded) = canary.answer else {
+        panic!("an embeddings launch's canary is its embedding");
+    };
+    assert_eq!(embedded.vector, vec![0.6, 0.8]);
+    assert_eq!(f.requests()[1].path, "/v1/embeddings");
+
+    for malformed in [answer(json!([0.0, 0.0])), answer(json!([])), "{}".into()] {
+        let f = Fixture::with_api(DeploymentApi::Embeddings).await;
+        f.reply(StatusCode::OK, &malformed);
+        uncertain(
+            f.adapter
+                .execute_persisted(&f.next(RuntimeAction::Probe, "probe"))
+                .await,
+        );
+        assert!(f.requests().iter().all(|r| r.path == "/v1/embeddings"));
+    }
 }
 
 /// Discrete GPU design §5, ADR 0019: a `host_backed` launch parks to host RAM

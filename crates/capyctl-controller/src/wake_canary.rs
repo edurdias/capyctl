@@ -22,16 +22,34 @@
 //! of one kind or version is never compared with an answer of another: that
 //! answer finds no usable reference.
 //!
+//! ADR 0036 §6: an embeddings deployment's canary is its fixed embedding
+//! probe (`capyctl_adapters::embedding_probe`). Its reference keeps the
+//! probe's kind and version, the vector's dimension, the vector and the
+//! tolerance ([`EMBEDDING_TOLERANCE`]); a later answer matches when its
+//! dimension is the same and its relative distance `‖v − r‖ / ‖r‖` is within
+//! the tolerance (`compare_embedding_canary`).
+//!
 //! [`EngineAdapter::wake_canary`]: capyctl_adapters::traits::EngineAdapter::wake_canary
 use crate::group_residency::{canary_matches, CanaryReference};
 use capyctl_adapters::completion_probe::{CanaryEvidence, ProbeAnswer, PROMPT};
 use capyctl_adapters::decision_probe::{self, DecisionAnswer};
-use capyctl_store::wake_canary::{StoredDecisionCanary, StoredWakeCanary, WakeCanaryReference};
+use capyctl_adapters::embedding_probe;
+use capyctl_store::wake_canary::{
+    compare_embedding_canary, EmbeddingCanaryOutcome, StoredDecisionCanary, StoredEmbeddingCanary,
+    StoredWakeCanary, WakeCanaryReference,
+};
 
 pub use crate::group_residency::{CANARY_DEADLINE, CANARY_TOKENS};
 pub use capyctl_store::wake_canary::{
     DECISION_TOLERANCE, WAKE_MISMATCH, WAKE_RELOAD_FAILED, WAKE_UNCERTAIN,
 };
+
+/// ADR 0036 §6 (owner decision 2026-10-27, question 3): the relative
+/// distance an embedding canary may move by and still match. Provisional:
+/// row EM3 sets the figure (its largest measured distance plus a stated
+/// margin), and 0.02 is the figure EM3 is checked against (cosine 0.9998 for
+/// unit vectors); EM3's figure replaces this one.
+pub const EMBEDDING_TOLERANCE: f64 = 0.02;
 
 /// What a wake's canary proves against its launch's reference.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,7 +65,9 @@ pub enum Verdict {
 }
 
 /// The reference a probe answer records. ADR 0030 §4: a decision answer
-/// records its probe's version and the comparison rule with it.
+/// records its probe's version and the comparison rule with it; ADR 0036 §6
+/// an embedding answer its probe's kind and version, its dimension, the
+/// vector and the tolerance.
 pub fn reference(answer: &CanaryEvidence) -> WakeCanaryReference {
     match answer {
         CanaryEvidence::Generated(answer) => WakeCanaryReference::Completion(StoredWakeCanary {
@@ -61,6 +81,17 @@ pub fn reference(answer: &CanaryEvidence) -> WakeCanaryReference {
             probabilities: answer.probabilities.clone(),
             tolerance: DECISION_TOLERANCE,
         }),
+        CanaryEvidence::Embedding(answer) => {
+            WakeCanaryReference::Embedding(StoredEmbeddingCanary {
+                probe_kind: embedding_probe::KIND.to_owned(),
+                probe_version: embedding_probe::VERSION,
+                // A vector longer than u32 dimensions is not one an engine
+                // answers; saturating keeps it from ever matching a reference.
+                dimension: u32::try_from(answer.dimension()).unwrap_or(u32::MAX),
+                vector: answer.vector.clone(),
+                tolerance: EMBEDDING_TOLERANCE,
+            })
+        }
     }
 }
 
@@ -70,6 +101,8 @@ pub fn reference(answer: &CanaryEvidence) -> WakeCanaryReference {
 /// answer that shares neither form with its reference cannot be shown to
 /// match and differs. ADR 0030 §4: a decision answer is compared only with a
 /// decision reference of the same probe version, by [`decision_matches`].
+/// ADR 0036 §6: an embedding answer only with an embedding reference of the
+/// same probe kind and version, by `compare_embedding_canary`.
 pub fn verdict(reference: Option<&WakeCanaryReference>, observed: &CanaryEvidence) -> Verdict {
     let matched = match (reference, observed) {
         (Some(WakeCanaryReference::Completion(reference)), CanaryEvidence::Generated(observed))
@@ -81,6 +114,18 @@ pub fn verdict(reference: Option<&WakeCanaryReference>, observed: &CanaryEvidenc
             if reference.probe_version == decision_probe::VERSION =>
         {
             decision_matches(reference, observed)
+        }
+        (Some(WakeCanaryReference::Embedding(reference)), CanaryEvidence::Embedding(observed)) => {
+            match compare_embedding_canary(
+                reference,
+                embedding_probe::KIND,
+                embedding_probe::VERSION,
+                &observed.vector,
+            ) {
+                EmbeddingCanaryOutcome::Matches => true,
+                EmbeddingCanaryOutcome::Differs => false,
+                EmbeddingCanaryOutcome::NotComparable => return Verdict::Unreferenced,
+            }
         }
         _ => return Verdict::Unreferenced,
     };
@@ -256,5 +301,97 @@ mod tests {
             ),
             Verdict::Unreferenced
         );
+    }
+
+    fn embedded(vector: &[f32]) -> CanaryEvidence {
+        CanaryEvidence::Embedding(capyctl_adapters::embedding_probe::EmbeddingAnswer {
+            vector: vector.to_vec(),
+        })
+    }
+
+    // T47 T20 (ADR 0036 §6): the first ready embedding is recorded with the
+    // probe's kind and version, its dimension, the exact vector and the
+    // tolerance checked against 0.02.
+    #[test]
+    fn an_embedding_records_its_vector_and_tolerance() {
+        let WakeCanaryReference::Embedding(recorded) = reference(&embedded(&[0.6, 0.0, -0.8]))
+        else {
+            panic!("an embedding answer records an embedding reference");
+        };
+        assert_eq!(
+            recorded,
+            StoredEmbeddingCanary {
+                probe_kind: "embedding".into(),
+                probe_version: 1,
+                dimension: 3,
+                vector: vec![0.6, 0.0, -0.8],
+                tolerance: 0.02,
+            }
+        );
+        assert_eq!(verdict(None, &embedded(&[0.6, 0.8])), Verdict::Unreferenced);
+    }
+
+    // T47 T20 (ADR 0036 §6): a vector within a relative distance of 0.02 of
+    // the reference passes; one beyond it, or of another dimension, differs
+    // (`wake_mismatch`).
+    #[test]
+    fn an_embedding_matches_within_tolerance_and_differs_beyond_it() {
+        let recorded = reference(&embedded(&[0.6, 0.8]));
+        for close in [&[0.6, 0.8][..], &[0.619, 0.8], &[0.6, 0.781]] {
+            assert_eq!(
+                verdict(Some(&recorded), &embedded(close)),
+                Verdict::Matches,
+                "{close:?}"
+            );
+        }
+        for far in [
+            &[0.621, 0.8][..],
+            &[0.8, 0.6],
+            &[-0.6, -0.8],
+            &[0.6, 0.8, 0.0],
+            &[0.6],
+        ] {
+            assert_eq!(
+                verdict(Some(&recorded), &embedded(far)),
+                Verdict::Differs,
+                "{far:?}"
+            );
+        }
+    }
+
+    // T47 (ADR 0036 §5): an embedding reference of another probe kind or
+    // version is never compared, nor an embedding with a reference of
+    // another kind of probe.
+    #[test]
+    fn embedding_references_are_never_compared_across() {
+        let chat = reference(&answer(&[1, 2, 3], "Ready."));
+        let decision = reference(&decided("billing", 0.9, 0.05, 0.05));
+        for other in [&chat, &decision] {
+            assert_eq!(
+                verdict(Some(other), &embedded(&[0.6, 0.8])),
+                Verdict::Unreferenced
+            );
+        }
+        let recorded = reference(&embedded(&[0.6, 0.8]));
+        assert_eq!(
+            verdict(Some(&recorded), &answer(&[1, 2, 3], "Ready.")),
+            Verdict::Unreferenced
+        );
+        let WakeCanaryReference::Embedding(older) = recorded else {
+            unreachable!()
+        };
+        let mut later = older.clone();
+        later.probe_version = capyctl_adapters::embedding_probe::VERSION + 1;
+        let mut kind = older;
+        kind.probe_kind = "decision".into();
+        for unusable in [later, kind] {
+            assert_eq!(
+                verdict(
+                    Some(&WakeCanaryReference::Embedding(unusable)),
+                    &embedded(&[0.0, 1.0])
+                ),
+                Verdict::Unreferenced
+            );
+        }
     }
 }

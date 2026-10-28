@@ -396,6 +396,30 @@ async fn launch(
                 "engine listed the model but did not answer the decision probe: {e}"
             )))
         })?;
+    } else if adapter.embeddings() {
+        // ADR 0036 §5, SPEC §6.1: an embedding model is ready when it answers
+        // the fixed embedding with one finite vector whose norm is above
+        // 1e-6. Never a chat probe in its place: a pooling server generates
+        // nothing.
+        tokio::time::timeout(
+            probe_budget,
+            crate::traits::ChatForward::embedding_probe(
+                adapter,
+                &plan.served_model_name,
+                probe_budget,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            failed(RuntimeError::Uncertain(
+                "probe deadline reached with the engine alive".into(),
+            ))
+        })?
+        .map_err(|e| {
+            RuntimeError::Uncertain(redact_text(&format!(
+                "engine listed the model but did not answer the embedding probe: {e}"
+            )))
+        })?;
     } else {
         let body = json!({
             "model": plan.served_model_name,

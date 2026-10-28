@@ -59,4 +59,27 @@ impl ChatForward for SglangAdapter {
             .ok_or(AdapterError::UnsupportedCapability)?;
         http.decision_probe(bound).await
     }
+    /// ADR 0036 §3-§4: an embeddings request, streamed through the shared
+    /// forwarder's incremental checks with `model` rewritten both ways
+    /// (SGLang answers its model path, which never reaches the client).
+    async fn forward_embedding(
+        &self,
+        body: &serde_json::Value,
+        sink: &mut dyn crate::traits::EmbeddingSink,
+    ) -> Result<crate::traits::EmbeddingAnswered, AdapterError> {
+        self.forward.embed(body, sink).await
+    }
+    /// ADR 0036 §5: through the keyed control client, as the completion
+    /// probe; an adapter built without the launch's credentials cannot probe.
+    async fn embedding_probe(
+        &self,
+        _served: &str,
+        bound: std::time::Duration,
+    ) -> Result<crate::embedding_probe::EmbeddingAnswer, AdapterError> {
+        let http = self
+            .http
+            .as_ref()
+            .ok_or(AdapterError::UnsupportedCapability)?;
+        http.embedding_probe(bound).await
+    }
 }

@@ -1,6 +1,9 @@
 //! Shared, bounded text-chat transport. Terminal success is not lifecycle or
 //! readiness evidence; cancellation and partial output never prove idle.
-use crate::traits::{AdapterError, ChatSink, DeliveryFailed, StreamEnded};
+use crate::embedding_answer::{AnswerParser, Encoding, Expected};
+use crate::traits::{
+    AdapterError, ChatSink, DeliveryFailed, EmbeddingAnswered, EmbeddingSink, StreamEnded,
+};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -351,12 +354,210 @@ pub fn decision_answered(answer: &Value) -> bool {
 /// probabilities per question, so a larger one is not an answer.
 pub const DECISION_RESPONSE_LIMIT: usize = STREAM_LIMIT;
 
+/// ADR 0036 §3, SPEC §10: the top-level fields of an embeddings request
+/// (`POST /v1/embeddings`), OpenAI's contract. The list is closed: an engine
+/// extension (vLLM's `truncate_prompt_tokens` or `embed_dtype`, SGLang's
+/// `rid` or `lora_path`, llama.cpp's `content` or `embd_normalize`),
+/// `stream` and `cache_salt` (owner decision 2026-10-27, question 10) are
+/// refused, never forwarded.
+pub const EMBEDDING_REQUEST_FIELDS: &[&str] =
+    &["model", "input", "encoding_format", "dimensions", "user"];
+
+/// ADR 0036 §3: the most inputs one embeddings request carries.
+pub const MAX_EMBEDDING_INPUTS: usize = 2048;
+
+/// ADR 0036 §3: the largest token ID an input may hold, 2³¹−1.
+pub const MAX_TOKEN_ID: u64 = (1 << 31) - 1;
+
+/// Why an embeddings request is refused before anything is sent to an engine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EmbeddingRequestRefusal {
+    /// Not a JSON object, no non-empty `model`, or a field of the wrong shape.
+    Malformed(&'static str),
+    /// A top-level field outside [`EMBEDDING_REQUEST_FIELDS`]. Refused, never
+    /// dropped.
+    Field(String),
+    /// ADR 0036 §3 (owner decision 2026-10-27, question 4): llama.cpp ignores
+    /// `dimensions`, so on llama.cpp only its native dimension is accepted.
+    Dimensions { native: usize },
+}
+
+impl std::fmt::Display for EmbeddingRequestRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(what) => write!(f, "malformed embeddings request: {what}"),
+            Self::Field(name) => write!(f, "embeddings request field `{name}` is not accepted"),
+            Self::Dimensions { native } => write!(
+                f,
+                "dimensions must be {native}: llama.cpp returns full vectors of the model's native dimension"
+            ),
+        }
+    }
+}
+
+impl From<EmbeddingRequestRefusal> for AdapterError {
+    fn from(refusal: EmbeddingRequestRefusal) -> Self {
+        match refusal {
+            EmbeddingRequestRefusal::Field(_) => AdapterError::PolicyDenied,
+            EmbeddingRequestRefusal::Malformed(_) | EmbeddingRequestRefusal::Dimensions { .. } => {
+                AdapterError::UnsupportedCapability
+            }
+        }
+    }
+}
+
+/// ADR 0036 §3: validate an embeddings request against its closed contract
+/// before anything is sent, so every refusal is a deterministic client error
+/// with nothing reaching an engine (SPEC §10, T47). Shapes only: whether a
+/// token ID is in the vocabulary, whether an input fits the model's length
+/// and whether the model supports a `dimensions` are the engine's to judge.
+pub fn validate_embedding_request(body: &Value) -> Result<(), EmbeddingRequestRefusal> {
+    embedding_expected(body).map(drop)
+}
+
+/// Whether `body` is an embeddings request the host ingress may forward.
+pub fn embedding_request_allowed(body: &Value) -> bool {
+    validate_embedding_request(body).is_ok()
+}
+
+/// ADR 0036 §3 (owner decision 2026-10-27, question 4): on llama.cpp, which
+/// ignores `dimensions` and returns full vectors, a request asking for other
+/// than `native` (the dimension recorded at readiness, §5) is refused. The
+/// router calls this for llama.cpp deployments only; vLLM and SGLang judge
+/// `dimensions` themselves.
+pub fn validate_native_dimensions(
+    body: &Value,
+    native: usize,
+) -> Result<(), EmbeddingRequestRefusal> {
+    match body.get("dimensions").and_then(Value::as_u64) {
+        Some(asked) if usize::try_from(asked) != Ok(native) => {
+            Err(EmbeddingRequestRefusal::Dimensions { native })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// ADR 0036 §3: what a valid request makes its answer owe.
+fn embedding_expected(body: &Value) -> Result<Expected, EmbeddingRequestRefusal> {
+    use EmbeddingRequestRefusal::Malformed;
+    let Some(fields) = body.as_object() else {
+        return Err(Malformed("the body is not a JSON object"));
+    };
+    if let Some(name) = fields
+        .keys()
+        .find(|name| !EMBEDDING_REQUEST_FIELDS.contains(&name.as_str()))
+    {
+        return Err(EmbeddingRequestRefusal::Field(name.clone()));
+    }
+    if !fields
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|model| !model.is_empty())
+    {
+        return Err(Malformed("model is required"));
+    }
+    let token_ids = |ids: &[Value]| {
+        ids.iter()
+            .all(|id| id.as_u64().is_some_and(|id| id <= MAX_TOKEN_ID))
+    };
+    let inputs = match fields.get("input") {
+        Some(Value::String(text)) if !text.is_empty() => 1,
+        Some(Value::Array(items)) if !items.is_empty() => {
+            let batch = match &items[0] {
+                // A token array is one input, however many tokens it holds.
+                Value::Number(_) => false,
+                Value::String(_) | Value::Array(_) => true,
+                _ => {
+                    return Err(Malformed(
+                        "each input must be a string, a token ID or an array of token IDs",
+                    ))
+                }
+            };
+            if batch && items.len() > MAX_EMBEDDING_INPUTS {
+                return Err(Malformed("input holds more than 2048 inputs"));
+            }
+            let shaped = match &items[0] {
+                Value::Number(_) => token_ids(items),
+                Value::String(_) => items
+                    .iter()
+                    .all(|item| item.as_str().is_some_and(|text| !text.is_empty())),
+                _ => items.iter().all(|item| {
+                    item.as_array()
+                        .is_some_and(|ids| !ids.is_empty() && token_ids(ids))
+                }),
+            };
+            if !shaped {
+                return Err(Malformed(
+                    "input must be non-empty strings, token IDs from 0 to 2147483647 or non-empty arrays of them, never mixed",
+                ));
+            }
+            if batch {
+                items.len()
+            } else {
+                1
+            }
+        }
+        _ => {
+            return Err(Malformed(
+                "input is required: a non-empty string or a non-empty array",
+            ))
+        }
+    };
+    let encoding = match fields.get("encoding_format").map(Value::as_str) {
+        None | Some(Some("float")) => Encoding::Float,
+        Some(Some("base64")) => Encoding::Base64,
+        Some(_) => return Err(Malformed("encoding_format must be float or base64")),
+    };
+    let dimensions = match fields.get("dimensions") {
+        None => None,
+        Some(dimensions) => Some(
+            dimensions
+                .as_u64()
+                .filter(|dimensions| *dimensions > 0)
+                .and_then(|dimensions| usize::try_from(dimensions).ok())
+                .ok_or(Malformed("dimensions must be a positive integer"))?,
+        ),
+    };
+    if fields.get("user").is_some_and(|user| !user.is_string()) {
+        return Err(Malformed("user must be a string"));
+    }
+    Ok(Expected {
+        inputs,
+        encoding,
+        dimensions,
+    })
+}
+
+/// ADR 0036 §4: completion evidence for a whole embeddings answer to
+/// `request`: the same checks the streamed answer passes through
+/// (`ChatForward::forward_embedding`), on bytes already read. `None` when the request is
+/// not valid or the answer fails a check.
+pub fn embedding_answered(request: &Value, answer: &[u8]) -> Option<EmbeddingAnswered> {
+    let expected = embedding_expected(request).ok()?;
+    let mut parser = AnswerParser::new(expected, "");
+    let mut relayed = Vec::new();
+    for chunk in answer.chunks(64 * 1024) {
+        relayed.clear();
+        parser.feed(chunk, &mut relayed).ok()?;
+    }
+    let complete = parser.finish().ok()?;
+    Some(EmbeddingAnswered {
+        inputs: expected.inputs,
+        prompt_tokens: complete.prompt_tokens,
+        client_gone: false,
+    })
+}
+
 fn uncertain() -> AdapterError {
     AdapterError::Uncertain("chat terminal result unverified".into())
 }
 
 fn decision_uncertain() -> AdapterError {
     AdapterError::Uncertain("decision answer unverified".into())
+}
+
+fn embedding_uncertain() -> AdapterError {
+    AdapterError::Uncertain("embeddings answer unverified".into())
 }
 
 /// The only upstream paths a forwarder may reach on an engine.
@@ -366,8 +567,14 @@ fn decision_uncertain() -> AdapterError {
 /// and reaching any of it on a client's behalf would put engine control behind the
 /// inference port, where none of the lifecycle authority's accounting applies. The
 /// list is closed rather than filtered so a new path has to be added deliberately.
-/// ADR 0030 §2 adds the decision endpoint, for decisions deployments.
-const FORWARDED_PATHS: [&str; 3] = ["/v1/models", "/v1/chat/completions", "/v1/systemone"];
+/// ADR 0030 §2 adds the decision endpoint, for decisions deployments, and ADR
+/// 0036 §3 the embeddings endpoint, for embeddings deployments.
+const FORWARDED_PATHS: [&str; 4] = [
+    "/v1/models",
+    "/v1/chat/completions",
+    "/v1/systemone",
+    "/v1/embeddings",
+];
 
 /// Resolve one upstream URL, or refuse the path.
 ///
@@ -407,6 +614,8 @@ pub(crate) struct ChatHttp {
     endpoint: reqwest::Url,
     /// ADR 0030 §2: the engine's decision endpoint.
     decisions: reqwest::Url,
+    /// ADR 0036 §3: the engine's embeddings endpoint.
+    embeddings: reqwest::Url,
     model: String,
     key: Option<String>,
     client: reqwest::Client,
@@ -501,6 +710,7 @@ impl ChatHttp {
         Self {
             endpoint: upstream(&base, "/v1/chat/completions").expect("a forwarded path"),
             decisions: upstream(&base, "/v1/systemone").expect("a forwarded path"),
+            embeddings: upstream(&base, crate::embedding_probe::PATH).expect("a forwarded path"),
             model,
             key,
             cache_salt,
@@ -872,6 +1082,64 @@ impl ChatHttp {
         }
         answer["model"] = json!(public);
         Ok(answer)
+    }
+
+    /// ADR 0036 §3-§4: forward one embeddings request and stream its answer
+    /// into `sink`. The request goes as one JSON body with `model` replaced
+    /// by the served name. On HTTP 200 the answer is relayed as its bytes
+    /// arrive, through the parser of [`crate::embedding_answer`]: the
+    /// engine's `model` becomes the public name, every check of §4 is applied
+    /// as the bytes pass, and the top-level closing brace is withheld for the
+    /// caller to write after `capyctl.metrics`. Nothing holds the answer, and
+    /// there is no size cap. A malformed answer, or one the engine ends
+    /// early, stops the relay and is uncertain: the engine may have run the
+    /// request. A client gone (`sink.send` failed) stops the relay only: the
+    /// answer is read and checked to its end (owner decision 2026-10-27,
+    /// question 7). No wall-clock bound of its own: the router bounds the
+    /// exchange, measuring idleness from [`EmbeddingSink::progressed`].
+    pub(crate) async fn embed(
+        &self,
+        body: &Value,
+        sink: &mut dyn EmbeddingSink,
+    ) -> Result<EmbeddingAnswered, AdapterError> {
+        let expected = embedding_expected(body)?;
+        let public = body
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or(AdapterError::UnsupportedCapability)?;
+        let mut request = body.clone();
+        request["model"] = json!(self.model);
+        let response = self
+            .post(&self.embeddings, &request, None, embedding_uncertain)
+            .await?;
+        if !response.status().is_success() || !content_type_is(&response, "application/json") {
+            return Err(embedding_uncertain());
+        }
+        let malformed = |malformed: crate::embedding_answer::Malformed| {
+            AdapterError::Uncertain(format!("embeddings answer malformed: {}", malformed.0))
+        };
+        let mut parser = AnswerParser::new(expected, public);
+        let mut client_gone = false;
+        let mut stream = response.bytes_stream();
+        while let Some(bytes) = stream.next().await {
+            let bytes = bytes.map_err(|_| embedding_uncertain())?;
+            sink.progressed();
+            // The bytes before a break are relayed whatever the transport's
+            // chunking; nothing from the break on ever is.
+            let mut relayed = Vec::with_capacity(bytes.len());
+            let checked = parser.feed(&bytes, &mut relayed);
+            if !client_gone && !relayed.is_empty() {
+                client_gone = sink.send(relayed).await.is_err();
+            }
+            checked.map_err(malformed)?;
+        }
+        let complete = parser.finish().map_err(malformed)?;
+        Ok(EmbeddingAnswered {
+            inputs: expected.inputs,
+            prompt_tokens: complete.prompt_tokens,
+            client_gone,
+        })
     }
 
     async fn stream_inner(
@@ -1249,6 +1517,13 @@ impl crate::traits::ChatForward for EngineForward {
     }
     async fn forward_decision(&self, body: &Value) -> Result<Value, AdapterError> {
         self.0.decide(body).await
+    }
+    async fn forward_embedding(
+        &self,
+        body: &Value,
+        sink: &mut dyn EmbeddingSink,
+    ) -> Result<EmbeddingAnswered, AdapterError> {
+        self.0.embed(body, sink).await
     }
     async fn forward_chat_stream(
         &self,
@@ -2590,7 +2865,14 @@ mod tests {
     fn a_forwarder_reaches_the_chat_and_model_paths_and_refuses_every_other() {
         let base: reqwest::Url = "http://127.0.0.1:8000".parse().unwrap();
         // T43 (ADR 0030 §2): the decision endpoint, for decisions deployments.
-        for path in ["/v1/models", "/v1/chat/completions", "/v1/systemone"] {
+        // T47 (ADR 0036 §3): the embeddings endpoint, for embeddings
+        // deployments.
+        for path in [
+            "/v1/models",
+            "/v1/chat/completions",
+            "/v1/systemone",
+            "/v1/embeddings",
+        ] {
             assert_eq!(
                 upstream(&base, path).map(String::from),
                 Some(format!("http://127.0.0.1:8000{path}")),
@@ -2603,7 +2885,8 @@ mod tests {
             "/collective_rpc",
             "/v1/load_lora_adapter",
             "/tokenize",
-            "/v1/embeddings",
+            "/v1/embeddings/",
+            "/v1/embeddings?x=1",
             "/v1/completions",
             "/health",
             "",
@@ -3231,5 +3514,610 @@ mod tests {
                 Err(AdapterError::Uncertain(_))
             ));
         }
+    }
+
+    fn embeddings(extra: Value) -> Value {
+        let mut body = json!({"model": "public", "input": "a quiet library"});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    }
+
+    /// ADR 0036 §3: an embeddings request is held to OpenAI's closed contract
+    /// before anything is sent: each input shape is accepted, every other
+    /// field is refused by name, and empty, mixed, oversized or out-of-range
+    /// inputs are refused.
+    // T47
+    #[test]
+    fn an_embeddings_request_is_held_to_its_own_closed_contract() {
+        use super::{
+            embedding_expected, embedding_request_allowed, validate_chat_request,
+            validate_decision_request, validate_embedding_request as validate,
+            EmbeddingRequestRefusal as Refusal, MAX_EMBEDDING_INPUTS, MAX_TOKEN_ID,
+        };
+        use crate::embedding_answer::Encoding;
+        let texts = |n: usize| Value::Array((0..n).map(|i| json!(format!("text {i}"))).collect());
+        let token_arrays = |n: usize| Value::Array((0..n).map(|_| json!([1, 2])).collect());
+        for (input, inputs) in [
+            (json!("one"), 1),
+            (json!(["one", "two"]), 2),
+            (texts(MAX_EMBEDDING_INPUTS), MAX_EMBEDDING_INPUTS),
+            (json!([0, 17, MAX_TOKEN_ID]), 1),
+            (json!([[0], [17, MAX_TOKEN_ID]]), 2),
+            (token_arrays(MAX_EMBEDDING_INPUTS), MAX_EMBEDDING_INPUTS),
+        ] {
+            let body = embeddings(json!({ "input": input }));
+            assert_eq!(validate(&body), Ok(()), "{body}");
+            assert!(embedding_request_allowed(&body));
+            assert_eq!(embedding_expected(&body).unwrap().inputs, inputs, "{body}");
+        }
+        for (extra, encoding, dimensions) in [
+            (json!({}), Encoding::Float, None),
+            (json!({"encoding_format": "float"}), Encoding::Float, None),
+            (json!({"encoding_format": "base64"}), Encoding::Base64, None),
+            (json!({"dimensions": 256}), Encoding::Float, Some(256)),
+            (json!({"user": "user-7"}), Encoding::Float, None),
+        ] {
+            let expected = embedding_expected(&embeddings(extra.clone())).unwrap();
+            assert_eq!(
+                (expected.encoding, expected.dimensions),
+                (encoding, dimensions),
+                "{extra}"
+            );
+        }
+        for field in [
+            "stream",
+            "cache_salt",
+            "messages",
+            "truncate_prompt_tokens",
+            "request_id",
+            "embed_dtype",
+            "endianness",
+            "use_activation",
+            "rid",
+            "priority",
+            "lora_path",
+            "embed_overrides",
+            "content",
+            "embd_normalize",
+            "normalize",
+        ] {
+            assert_eq!(
+                validate(&embeddings(json!({ field: false }))),
+                Err(Refusal::Field(field.into())),
+                "{field}"
+            );
+        }
+        for extra in [
+            json!({"input": ""}),
+            json!({"input": []}),
+            json!({"input": [""]}),
+            json!({"input": ["a", ""]}),
+            json!({"input": [[]]}),
+            json!({"input": [[1], []]}),
+            json!({ "input": texts(MAX_EMBEDDING_INPUTS + 1) }),
+            json!({ "input": token_arrays(MAX_EMBEDDING_INPUTS + 1) }),
+            json!({"input": ["a", 1]}),
+            json!({"input": [1, "a"]}),
+            json!({"input": [[1], 2]}),
+            json!({"input": [1, [2]]}),
+            json!({"input": ["a", [1]]}),
+            json!({"input": [["a"]]}),
+            json!({"input": [-1]}),
+            json!({"input": [[-1]]}),
+            json!({ "input": [MAX_TOKEN_ID + 1] }),
+            json!({ "input": [[MAX_TOKEN_ID + 1]] }),
+            json!({"input": [1.5]}),
+            json!({"input": null}),
+            json!({"input": 5}),
+            json!({"input": {"type": "image_url", "image_url": {"url": "x"}}}),
+            json!({"input": [{"type": "text", "text": "a"}]}),
+            json!({"encoding_format": "bytes"}),
+            json!({"encoding_format": "bytes_only"}),
+            json!({"encoding_format": null}),
+            json!({"dimensions": 0}),
+            json!({"dimensions": -1}),
+            json!({"dimensions": 1.5}),
+            json!({"dimensions": "256"}),
+            json!({"user": 7}),
+            json!({"model": ""}),
+            json!({"model": 1}),
+        ] {
+            assert!(
+                matches!(
+                    validate(&embeddings(extra.clone())),
+                    Err(Refusal::Malformed(_))
+                ),
+                "{extra}"
+            );
+        }
+        for missing in ["model", "input"] {
+            let mut body = embeddings(json!({}));
+            body.as_object_mut().unwrap().remove(missing);
+            assert!(
+                matches!(validate(&body), Err(Refusal::Malformed(_))),
+                "{missing}"
+            );
+        }
+        assert!(validate(&json!(["a"])).is_err());
+        // Each endpoint keeps its own contract.
+        assert!(validate_chat_request(&embeddings(json!({}))).is_err());
+        assert!(validate_decision_request(&embeddings(json!({}))).is_err());
+        assert!(matches!(
+            validate(&decision(json!({}))),
+            Err(Refusal::Field(_))
+        ));
+        assert!(matches!(
+            AdapterError::from(Refusal::Field("stream".into())),
+            AdapterError::PolicyDenied
+        ));
+    }
+
+    /// ADR 0036 §3 (owner decision 2026-10-27, question 4): llama.cpp ignores
+    /// `dimensions`, so the router refuses any but the native dimension.
+    // T47
+    #[test]
+    fn only_the_native_dimensions_pass_on_llama_cpp() {
+        use super::{validate_native_dimensions, EmbeddingRequestRefusal};
+        assert_eq!(
+            validate_native_dimensions(&embeddings(json!({})), 2560),
+            Ok(())
+        );
+        assert_eq!(
+            validate_native_dimensions(&embeddings(json!({"dimensions": 2560})), 2560),
+            Ok(())
+        );
+        let refusal =
+            validate_native_dimensions(&embeddings(json!({"dimensions": 256})), 2560).unwrap_err();
+        assert_eq!(
+            refusal,
+            EmbeddingRequestRefusal::Dimensions { native: 2560 }
+        );
+        assert!(refusal
+            .to_string()
+            .contains("llama.cpp returns full vectors"));
+    }
+
+    type Received = std::sync::Arc<std::sync::Mutex<Vec<Value>>>;
+
+    /// An engine answering `/v1/embeddings` with `status`, the media type
+    /// `media` and `chunks` in turn, where `None` fails the transfer once
+    /// what came before had time to arrive; it records each request body.
+    async fn embedding_engine(
+        status: u16,
+        media: &'static str,
+        chunks: Vec<Option<String>>,
+    ) -> (reqwest::Url, Received) {
+        let received: Received = Default::default();
+        let record = received.clone();
+        let status = axum::http::StatusCode::from_u16(status).unwrap();
+        let router = axum::Router::new().route(
+            "/v1/embeddings",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                record.lock().unwrap().push(body);
+                let chunks = chunks.clone();
+                async move {
+                    use futures::StreamExt;
+                    let stream = futures::stream::iter(chunks).then(|chunk| async move {
+                        match chunk {
+                            Some(text) => Ok(axum::body::Bytes::from(text)),
+                            None => {
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                Err(std::io::Error::other("the engine went away"))
+                            }
+                        }
+                    });
+                    axum::response::Response::builder()
+                        .status(status)
+                        .header("content-type", media)
+                        .body(axum::body::Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        (format!("http://{address}").parse().unwrap(), received)
+    }
+
+    fn embedding_forwarder(url: reqwest::Url) -> std::sync::Arc<dyn crate::traits::ChatForward> {
+        crate::forward::engine_forwarder(
+            url,
+            "served".into(),
+            None,
+            crate::forward::CacheSalt::Refused,
+        )
+    }
+
+    /// What reached the client: the bytes, the sends tried and the progress
+    /// reports. With `gone`, every send fails: the client went away.
+    #[derive(Default)]
+    struct Relayed {
+        bytes: Vec<u8>,
+        sends: usize,
+        progressed: usize,
+        gone: bool,
+    }
+    #[async_trait::async_trait]
+    impl crate::traits::EmbeddingSink for Relayed {
+        async fn send(&mut self, bytes: Vec<u8>) -> Result<(), crate::traits::DeliveryFailed> {
+            self.sends += 1;
+            if self.gone {
+                return Err(crate::traits::DeliveryFailed);
+            }
+            self.bytes.extend(bytes);
+            Ok(())
+        }
+        fn progressed(&mut self) {
+            self.progressed += 1;
+        }
+    }
+
+    const EMBEDDING_ANSWER: &str = r#"{"id":"embd-9","object":"list","created":1,"model":"/srv/Qwen3-Embedding-4B","data":[{"index":0,"object":"embedding","embedding":[0.5,-0.25]},{"index":1,"object":"embedding","embedding":[1e-2,3]}],"usage":{"prompt_tokens":7,"total_tokens":7}}"#;
+
+    /// ADR 0036 §3-§4: the engine receives the served name; the client
+    /// receives the answer as it streams, with the public name in `model`,
+    /// nothing else rewritten, and without the closing brace, which the
+    /// caller writes after `capyctl.metrics`.
+    // T47
+    #[tokio::test]
+    async fn an_embeddings_answer_is_relayed_with_the_public_model_and_without_its_brace() {
+        // Split inside the engine's `model` value and inside a vector.
+        let at = EMBEDDING_ANSWER.find("Qwen3").unwrap();
+        let chunks = vec![
+            Some(EMBEDDING_ANSWER[..at].to_owned()),
+            Some(EMBEDDING_ANSWER[at..at + 70].to_owned()),
+            Some(EMBEDDING_ANSWER[at + 70..].to_owned()),
+        ];
+        let (url, received) = embedding_engine(200, "application/json", chunks).await;
+        let request = json!({"model": "public", "input": ["a", "b"], "user": "u-1"});
+        let mut sink = Relayed::default();
+        let answered = embedding_forwarder(url)
+            .forward_embedding(&request, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            answered,
+            crate::traits::EmbeddingAnswered {
+                inputs: 2,
+                prompt_tokens: Some(7),
+                client_gone: false,
+            }
+        );
+        assert_eq!(
+            received.lock().unwrap().as_slice(),
+            [json!({"model": "served", "input": ["a", "b"], "user": "u-1"})]
+        );
+        let relayed = String::from_utf8(sink.bytes).unwrap();
+        let expected = EMBEDDING_ANSWER.replace("/srv/Qwen3-Embedding-4B", "public");
+        assert_eq!(relayed, expected.strip_suffix('}').unwrap());
+        assert!(sink.progressed >= 1);
+        let whole: Value = serde_json::from_str(&format!("{relayed}}}")).unwrap();
+        assert_eq!(whole["model"], "public");
+        assert_eq!(whole["id"], "embd-9");
+        // The same checks judge a whole answer.
+        assert_eq!(
+            super::embedding_answered(&request, EMBEDDING_ANSWER.as_bytes()),
+            Some(answered)
+        );
+        assert_eq!(
+            super::embedding_answered(&request, &EMBEDDING_ANSWER.as_bytes()[..100]),
+            None
+        );
+    }
+
+    /// ADR 0036 §4: an answer that fails a check, is not JSON, or ends early
+    /// is uncertain; the client holds a prefix of it that no JSON parser
+    /// accepts, never the closing brace.
+    // T47
+    #[tokio::test]
+    async fn a_broken_embeddings_answer_is_uncertain_and_never_reaches_the_client_whole() {
+        let entry = |index: usize, vector: &str| {
+            format!(r#"{{"index":{index},"object":"embedding","embedding":{vector}}}"#)
+        };
+        let answer = |entries: &[String]| {
+            format!(
+                r#"{{"object":"list","model":"m","data":[{}],"usage":{{"prompt_tokens":2,"total_tokens":2}}}}"#,
+                entries.join(",")
+            )
+        };
+        let whole = answer(&[entry(0, "[1,2]"), entry(1, "[3,4]")]);
+        let long = format!("[0.{},2]", "1".repeat(63));
+        let cases: Vec<(&str, Value, Vec<Option<String>>)> = vec![
+            (
+                "wrong count",
+                json!({}),
+                vec![Some(answer(&[entry(0, "[1,2]")]))],
+            ),
+            (
+                "repeated index",
+                json!({}),
+                vec![Some(answer(&[entry(0, "[1,2]"), entry(0, "[3,4]")]))],
+            ),
+            (
+                "ragged vectors",
+                json!({}),
+                vec![Some(answer(&[entry(0, "[1,2]"), entry(1, "[3]")]))],
+            ),
+            (
+                "non-finite value",
+                json!({}),
+                vec![Some(answer(&[entry(0, "[1,2]"), entry(1, "[3,1e999]")]))],
+            ),
+            (
+                "wrong dimensions",
+                json!({"dimensions": 3}),
+                vec![Some(whole.clone())],
+            ),
+            (
+                "oversized number",
+                json!({}),
+                vec![Some(answer(&[entry(0, "[1,2]"), entry(1, &long)]))],
+            ),
+            (
+                "invalid JSON",
+                json!({}),
+                vec![Some(whole.replace("],\"usage", ",],\"usage"))],
+            ),
+            (
+                "closed connection",
+                json!({}),
+                vec![Some(whole[..90].to_owned()), None],
+            ),
+            (
+                "ended early",
+                json!({}),
+                vec![Some(whole[..whole.len() - 1].to_owned())],
+            ),
+        ];
+        let rewritten = whole.replace(r#""model":"m""#, r#""model":"public""#);
+        for (what, extra, chunks) in cases {
+            let (url, _) = embedding_engine(200, "application/json", chunks).await;
+            let mut request = json!({"model": "public", "input": ["a", "b"]});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let mut sink = Relayed::default();
+            let result = embedding_forwarder(url)
+                .forward_embedding(&request, &mut sink)
+                .await;
+            assert!(
+                matches!(result, Err(AdapterError::Uncertain(_))),
+                "{what}: {result:?}"
+            );
+            let relayed = String::from_utf8(sink.bytes).unwrap();
+            assert!(serde_json::from_str::<Value>(&relayed).is_err(), "{what}");
+            assert!(
+                !relayed.is_empty(),
+                "{what}: the answer streamed before the break"
+            );
+            if matches!(
+                what,
+                "wrong dimensions" | "closed connection" | "ended early"
+            ) {
+                assert!(rewritten.starts_with(&relayed), "{what}: {relayed}");
+                assert_ne!(relayed, rewritten, "{what}");
+            }
+        }
+    }
+
+    /// ADR 0036 §4, SPEC §10: an engine's complete invalid-request answer is
+    /// its rejection and its complete error answer its error, read whole as
+    /// for chat and decisions; any other answer is uncertain, and a refused
+    /// request reaches no engine.
+    // T47
+    #[tokio::test]
+    async fn engine_answers_to_an_embeddings_request_keep_their_meaning() {
+        let request = json!({"model": "public", "input": "a"});
+        let error = |message: &str| Some(json!({"error": {"message": message}}).to_string());
+        let (url, _) = embedding_engine(
+            400,
+            "application/json",
+            vec![error("input (9000 tokens) is longer than the model's 8192")],
+        )
+        .await;
+        let result = embedding_forwarder(url)
+            .forward_embedding(&request, &mut Relayed::default())
+            .await;
+        assert!(
+            matches!(&result, Err(AdapterError::Rejected { status: 400, message }) if message.contains("9000 tokens")),
+            "{result:?}"
+        );
+        let (url, _) = embedding_engine(500, "application/json", vec![error("CUDA error")]).await;
+        let result = embedding_forwarder(url)
+            .forward_embedding(&request, &mut Relayed::default())
+            .await;
+        assert!(
+            matches!(&result, Err(AdapterError::EngineError { status: 500, message }) if message == "CUDA error"),
+            "{result:?}"
+        );
+        let (url, _) =
+            embedding_engine(200, "text/plain", vec![Some(EMBEDDING_ANSWER.to_owned())]).await;
+        let mut sink = Relayed::default();
+        let result = embedding_forwarder(url)
+            .forward_embedding(&request, &mut sink)
+            .await;
+        assert!(
+            matches!(result, Err(AdapterError::Uncertain(_))),
+            "{result:?}"
+        );
+        assert_eq!(sink.sends, 0);
+        let (url, received) = embedding_engine(200, "application/json", vec![]).await;
+        let result = embedding_forwarder(url)
+            .forward_embedding(
+                &embeddings(json!({"stream": true})),
+                &mut Relayed::default(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AdapterError::PolicyDenied)),
+            "{result:?}"
+        );
+        assert!(received.lock().unwrap().is_empty());
+    }
+
+    /// ADR 0036 §4 (owner decision 2026-10-27, question 7): a client that
+    /// went away stops the relay, never the reading: the answer is read and
+    /// checked to its end, and a complete one is `Ok` with the client gone; a
+    /// broken one is still uncertain.
+    // T47 T17
+    #[tokio::test]
+    async fn a_client_gone_leaves_the_answer_read_and_checked_to_its_end() {
+        let request = json!({"model": "public", "input": ["a", "b"]});
+        let chunks = EMBEDDING_ANSWER
+            .as_bytes()
+            .chunks(40)
+            .map(|chunk| Some(String::from_utf8(chunk.to_vec()).unwrap()))
+            .collect::<Vec<_>>();
+        let (url, _) = embedding_engine(200, "application/json", chunks).await;
+        let mut sink = Relayed {
+            gone: true,
+            ..Relayed::default()
+        };
+        let answered = embedding_forwarder(url)
+            .forward_embedding(&request, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            answered,
+            crate::traits::EmbeddingAnswered {
+                inputs: 2,
+                prompt_tokens: Some(7),
+                client_gone: true,
+            }
+        );
+        assert_eq!(sink.sends, 1, "nothing is sent after the client went away");
+        let broken = EMBEDDING_ANSWER.replace(r#""index":1"#, r#""index":0"#);
+        let (url, _) = embedding_engine(200, "application/json", vec![Some(broken)]).await;
+        let mut sink = Relayed {
+            gone: true,
+            ..Relayed::default()
+        };
+        let result = embedding_forwarder(url)
+            .forward_embedding(&request, &mut sink)
+            .await;
+        assert!(
+            matches!(result, Err(AdapterError::Uncertain(_))),
+            "{result:?}"
+        );
+    }
+
+    /// Counts what reached the client without keeping it, and lets the
+    /// engine go on once the client has the first bytes.
+    struct Streaming {
+        first: std::sync::Arc<tokio::sync::Notify>,
+        bytes: usize,
+        sends: usize,
+        largest: usize,
+        head: Vec<u8>,
+        tail: Vec<u8>,
+    }
+    #[async_trait::async_trait]
+    impl crate::traits::EmbeddingSink for Streaming {
+        async fn send(&mut self, bytes: Vec<u8>) -> Result<(), crate::traits::DeliveryFailed> {
+            if self.sends == 0 {
+                self.first.notify_one();
+            }
+            self.sends += 1;
+            self.bytes += bytes.len();
+            self.largest = self.largest.max(bytes.len());
+            if self.head.len() < 64 {
+                let take = (64 - self.head.len()).min(bytes.len());
+                self.head.extend_from_slice(&bytes[..take]);
+            }
+            self.tail
+                .extend_from_slice(&bytes[bytes.len().saturating_sub(64)..]);
+            let excess = self.tail.len().saturating_sub(64);
+            self.tail.drain(..excess);
+            Ok(())
+        }
+    }
+
+    /// ADR 0036 §4 (owner decision 2026-10-27, question 6): a 2048-input
+    /// `float` answer of 4096-dimension vectors (about 33 MB of JSON) streams
+    /// through with no cap: the client has its first bytes before the engine
+    /// has finished (the engine waits for them), and every relay is one
+    /// transport chunk, so nothing holds the answer.
+    // T47
+    #[tokio::test]
+    async fn a_large_float_answer_streams_through_before_the_engine_has_finished() {
+        const INPUTS: usize = 2048;
+        const WIDTH: usize = 4096;
+        let first = std::sync::Arc::new(tokio::sync::Notify::new());
+        let engine_waits = first.clone();
+        let vector = std::sync::Arc::new(format!("[{}0.5]", "0.5,".repeat(WIDTH - 1)));
+        let router = axum::Router::new().route(
+            "/v1/embeddings",
+            axum::routing::post(move || {
+                let waits = engine_waits.clone();
+                let vector = vector.clone();
+                async move {
+                    use futures::StreamExt;
+                    let bytes = |text: String| Ok::<_, std::io::Error>(axum::body::Bytes::from(text));
+                    let head = futures::stream::iter([bytes(
+                        r#"{"object":"list","model":"/srv/Qwen3-Embedding-8B","data":["#.into(),
+                    )]);
+                    let entries = futures::stream::unfold(0, move |index| {
+                        let waits = waits.clone();
+                        let vector = vector.clone();
+                        async move {
+                            if index == INPUTS {
+                                return None;
+                            }
+                            if index == 1 {
+                                // The engine has not finished until the client
+                                // has the start of the answer.
+                                waits.notified().await;
+                            }
+                            let comma = if index == 0 { "" } else { "," };
+                            let entry = format!(
+                                r#"{comma}{{"object":"embedding","index":{index},"embedding":{vector}}}"#
+                            );
+                            Some((bytes(entry), index + 1))
+                        }
+                    });
+                    let tail = futures::stream::iter([bytes(
+                        r#"],"usage":{"prompt_tokens":4096,"total_tokens":4096}}"#.into(),
+                    )]);
+                    axum::response::Response::builder()
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from_stream(head.chain(entries).chain(tail)))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let inputs: Vec<String> = (0..INPUTS).map(|i| format!("text {i}")).collect();
+        let request = json!({"model": "public", "input": inputs});
+        let mut sink = Streaming {
+            first,
+            bytes: 0,
+            sends: 0,
+            largest: 0,
+            head: vec![],
+            tail: vec![],
+        };
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            embedding_forwarder(format!("http://{address}").parse().unwrap())
+                .forward_embedding(&request, &mut sink),
+        )
+        .await
+        .expect("the client has the answer's start before the engine finishes")
+        .unwrap();
+        assert_eq!(answered.inputs, INPUTS);
+        assert_eq!(answered.prompt_tokens, Some(4096));
+        assert!(sink.bytes > INPUTS * WIDTH * 4, "{}", sink.bytes);
+        assert!(sink.sends > 1);
+        assert!(sink.largest <= 1024 * 1024, "{}", sink.largest);
+        assert!(sink
+            .head
+            .starts_with(br#"{"object":"list","model":"public","data":[{"#));
+        assert!(sink.tail.ends_with(br#""total_tokens":4096}"#));
     }
 }

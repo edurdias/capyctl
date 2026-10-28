@@ -223,6 +223,16 @@ impl Http {
     ) -> Result<crate::decision_probe::DecisionAnswer, AdapterError> {
         crate::decision_probe::probe(&self.client, &self.base, None, served, bound).await
     }
+
+    /// ADR 0036 §5: the fixed embedding probe, `POST /v1/embeddings`, on the
+    /// loopback endpoint (no key, ADR 0029 §4).
+    pub(crate) async fn embedding_probe(
+        &self,
+        served: &str,
+        bound: Duration,
+    ) -> Result<crate::embedding_probe::EmbeddingAnswer, AdapterError> {
+        crate::embedding_probe::probe(&self.client, &self.base, None, served, bound).await
+    }
 }
 
 /// One unlabelled sample of `name` in a Prometheus text exposition, as

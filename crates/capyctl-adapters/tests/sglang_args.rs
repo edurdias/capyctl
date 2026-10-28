@@ -152,6 +152,22 @@ fn a_launch_with_lmcache_renders_its_telemetry_off() {
     );
 }
 
+// T47 T14 (ADR 0036 §2): an embeddings launch adds `is_embedding: true` to
+// its public settings, which the entry renders as the reserved
+// `is_embedding`; nothing else in the descriptor changes, and a launch
+// without it carries no such setting.
+#[test]
+fn an_embeddings_launch_carries_is_embedding_and_nothing_else() {
+    let chat = SglangLaunch::from_frozen(&frozen(metadata(1), settings())).unwrap();
+    assert!(public_args(&chat)["settings"].get("is_embedding").is_none());
+    let mut expected = public_args(&chat);
+    expected["settings"]["is_embedding"] = serde_json::json!(true);
+    let embedding = SglangLaunch::from_frozen(&frozen(metadata(1), settings()))
+        .unwrap()
+        .with_embedding();
+    assert_eq!(public_args(&embedding), expected);
+}
+
 #[test]
 fn wrapper_rejects_relative_symlink_nonregular_and_untrusted_writes() {
     use std::os::unix::fs::{symlink, PermissionsExt};
