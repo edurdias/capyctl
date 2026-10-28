@@ -141,6 +141,15 @@ pub fn summary(engine_output: &str, exit: Option<EngineExit>) -> String {
         );
         return text;
     }
+    if let Some(native) = native_summary(engine_output) {
+        // A long exit status could push the fixed words over the bound;
+        // the family name is then left out (`native_summary`'s second form).
+        let named = format!("{text}{}", native.0);
+        if named.len() <= MAX_SUMMARY_BYTES {
+            return named;
+        }
+        return format!("{text}{}", native.1);
+    }
     // Name as many refused options as the bound allows.
     let mut options = rejected_options(engine_output);
     while !options.is_empty() {
@@ -155,6 +164,101 @@ pub fn summary(engine_output: &str, exit: Option<EngineExit>) -> String {
         options.pop();
     }
     text
+}
+
+/// ADR 0039 §4: the native engine's refusal of a flag it does not serve, at
+/// start with exit 2 (`tensorfold serve: error: ...`). 1.0.0
+/// (`server/cli.zig:174-177`): "`<flag>` is not served by the native engine
+/// yet; serve this command with --engine python", and for a value it serves
+/// only in part "`<flag> <value>` is not served by the native engine; serve
+/// this command with --engine python". 1.1.5 (`server/cli.zig:281-284`): the
+/// same two forms ending "the Python engine 0.6.6 serves it: python -m pip
+/// install git+https://github.com/ashhart/TensorFold.git@v0.6.6". All four
+/// share this text, and the flag is the first word before it.
+const NATIVE_UNSERVED: &str = " is not served by the native engine";
+
+/// ADR 0039 §8: the native engine's start refusals when its memory budget
+/// does not hold the streams (1.0.0 `native/cuda.zig:352-353`): "the CUDA
+/// memory budget fits no stream: ... lower --context, or free device memory"
+/// and "--parallel N needs X GiB for its streams at a W-token window, and the
+/// CUDA memory budget leaves Y GiB: serve --parallel M, or lower --context".
+const NATIVE_NO_STREAM: &str = "the CUDA memory budget fits no stream";
+const NATIVE_STREAMS: &str = "for its streams at a";
+const NATIVE_BUDGET_LEAVES: &str = "the CUDA memory budget leaves";
+/// ADR 0039 §8: "the checkpoint's X GiB of weights do not fit the Y GiB the
+/// CUDA memory budget grants (...)" (1.0.0 `native/cuda.zig:339`).
+const NATIVE_WEIGHTS: &str = "GiB of weights do not fit the";
+const NATIVE_BUDGET_GRANTS: &str = "the CUDA memory budget grants";
+/// ADR 0039 §7: "the native CUDA engine has no backend for X checkpoints yet"
+/// (1.0.0 `native/cuda.zig:289`).
+const NATIVE_NO_BACKEND: &str = "the native CUDA engine has no backend for ";
+const NATIVE_NO_BACKEND_END: &str = " checkpoints yet";
+
+/// A checkpoint family as a summary may name it: 1 to 32 of `[a-z0-9_.-]`
+/// (a `config.json` `model_type` such as `nemotron_h`).
+fn family_name(text: &str) -> Option<&str> {
+    let valid = !text.is_empty()
+        && text.len() <= 32
+        && text.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-')
+        });
+    valid.then_some(text)
+}
+
+/// ADR 0039 §4, §7, §8: the summary's tail for a native-line start refusal,
+/// in fixed words: the flag the release does not serve (never its value),
+/// the settings that fit memory, or the unlisted family with the checkpoint
+/// note. The second form leaves out the family name, for the bound.
+fn native_summary(engine_output: &str) -> Option<(String, String)> {
+    let fixed = |text: String| Some((text.clone(), text));
+    for line in engine_output.lines() {
+        if let Some((head, _)) = line.split_once(NATIVE_UNSERVED) {
+            let head = head.rsplit_once("error: ").map_or(head, |(_, rest)| rest);
+            let flag = head.split_whitespace().next().and_then(option_name);
+            return fixed(match flag {
+                Some(flag) => format!(
+                    "; this TensorFold native release does not serve {flag}; a TensorFold 0.6 \
+                     installation may"
+                ),
+                None => "; this TensorFold native release does not serve an option of the \
+                         command; a TensorFold 0.6 installation may"
+                    .to_owned(),
+            });
+        }
+        if line.contains(NATIVE_NO_STREAM)
+            || (line.contains(NATIVE_STREAMS) && line.contains(NATIVE_BUDGET_LEAVES))
+        {
+            return fixed(
+                "; TensorFold native's memory budget cannot hold its streams: lower \
+                 max_concurrent_requests or context_length, or raise resources"
+                    .to_owned(),
+            );
+        }
+        if line.contains(NATIVE_WEIGHTS) && line.contains(NATIVE_BUDGET_GRANTS) {
+            return fixed(
+                "; TensorFold native's memory budget cannot hold the checkpoint's weights: \
+                 raise resources or free device memory"
+                    .to_owned(),
+            );
+        }
+        if let Some((_, rest)) = line.split_once(NATIVE_NO_BACKEND) {
+            let note = capyctl_config::tensorfold_native::CHECKPOINT_NOTE;
+            let unnamed = format!(
+                "; {note}; this native release does not serve its family; TensorFold 0.6 may"
+            );
+            let named = rest
+                .split_once(NATIVE_NO_BACKEND_END)
+                .and_then(|(family, _)| family_name(family))
+                .map(|family| {
+                    format!(
+                        "; {note}; family {family} is not served by this native release; \
+                         TensorFold 0.6 may serve it"
+                    )
+                });
+            return Some((named.unwrap_or_else(|| unnamed.clone()), unnamed));
+        }
+    }
+    None
 }
 
 #[cfg(test)]

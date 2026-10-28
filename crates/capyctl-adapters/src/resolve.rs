@@ -108,6 +108,9 @@ pub enum AdapterSpec {
         endpoint: reqwest::Url,
         fingerprint: String,
         model_id: String,
+        /// ADR 0039 §1: the profile's line, which decides the readiness and
+        /// idle reads; a launch plan carries the same line.
+        line: capyctl_config::tensorfold_native::TensorfoldLine,
         launch: Option<crate::tensorfold::PlanInputTensorfold>,
         /// ADR 0023 §4: whether a kernel build existed when the launch was
         /// prepared; decides the startup bound.
@@ -272,13 +275,20 @@ pub fn resolve(
             endpoint,
             fingerprint,
             model_id,
+            line,
             launch,
             extensions_built,
         } => {
             let mut adapter =
                 crate::tensorfold::TensorfoldAdapter::new(endpoint, fingerprint, model_id)
+                    .with_line(line)
                     .with_extensions_built(extensions_built);
             if let Some(launch) = launch {
+                // ADR 0039 §1: one profile, one line; a plan of the other
+                // line is not this binding's launch.
+                if launch.line != line {
+                    return Err(RuntimeError::Unsupported);
+                }
                 adapter = adapter.with_launch(launch);
             }
             if let Some(tools) = tools {

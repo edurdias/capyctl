@@ -91,6 +91,7 @@ fn tensorfold() -> AdapterSpec {
         endpoint: "http://127.0.0.1:8000".parse().unwrap(),
         fingerprint: "0.6.0".into(),
         model_id: "m".into(),
+        line: capyctl_config::tensorfold_native::TensorfoldLine::Python,
         launch: None,
         extensions_built: false,
     }
@@ -103,6 +104,38 @@ fn a_tensorfold_spec_resolves_only_as_tensorfold() {
     assert!(resolve(Engine::Tensorfold, tensorfold(), None).is_ok());
     assert!(matches!(
         resolve(Engine::Vllm, tensorfold(), None),
+        Err(RuntimeError::Unsupported)
+    ));
+}
+
+// T41 (ADR 0039 §1): a TensorFold spec resolves its line; a launch plan of
+// the other line than the spec's is not this binding's launch.
+#[test]
+fn a_tensorfold_spec_and_its_plan_share_one_line() {
+    use capyctl_config::tensorfold_native::TensorfoldLine;
+    let with = |line: TensorfoldLine, plan_line: TensorfoldLine| AdapterSpec::Tensorfold {
+        endpoint: "http://127.0.0.1:8000".parse().unwrap(),
+        fingerprint: "1.0.0".into(),
+        model_id: "m".into(),
+        line,
+        launch: Some(crate::tensorfold::PlanInputTensorfold {
+            line: plan_line,
+            ..Default::default()
+        }),
+        extensions_built: false,
+    };
+    assert!(resolve(
+        Engine::Tensorfold,
+        with(TensorfoldLine::Native, TensorfoldLine::Native),
+        None
+    )
+    .is_ok());
+    assert!(matches!(
+        resolve(
+            Engine::Tensorfold,
+            with(TensorfoldLine::Native, TensorfoldLine::Python),
+            None
+        ),
         Err(RuntimeError::Unsupported)
     ));
 }
