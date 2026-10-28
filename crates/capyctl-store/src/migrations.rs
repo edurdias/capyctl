@@ -694,16 +694,16 @@ mod tests {
             crate::checkpoint_digests::recorded_pool_basis(&conn, "a", 1).unwrap(),
             Some(basis(32_768))
         );
-        let read: (Option<String>, Option<String>) = conn
+        let read: (Option<String>, Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT pool_source,uncertified FROM launch_lmcache",
+                "SELECT pool_source,uncertified,pool_model_type FROM launch_lmcache",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(read, (None, None));
+        assert_eq!(read, (None, None, None));
         conn.execute(
-            "UPDATE launch_lmcache SET pool_source='auto',pool_bytes_per_token=1,pool_context_tokens=1,pool_shrunk_from=1,pool_warning='w',uncertified='u',pool_unknown='x'",
+            "UPDATE launch_lmcache SET pool_source='auto',pool_bytes_per_token=1,pool_context_tokens=1,pool_shrunk_from=1,pool_warning='w',uncertified='u',pool_unknown='x',pool_model_type='qwen3'",
             [],
         )
         .unwrap();
@@ -713,6 +713,8 @@ mod tests {
             "pool_shrunk_from=-1",
             "pool_warning=''",
             "uncertified=''",
+            "pool_model_type=''",
+            "pool_model_type=replace(hex(zeroblob(129)),'00','x')",
         ] {
             assert!(
                 conn.execute(&format!("UPDATE launch_lmcache SET {bad}"), [])

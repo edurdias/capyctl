@@ -1996,6 +1996,12 @@ mod tests {
             held_kv_bytes: None,
             charge_bytes: Some(4 * GIB + 800 * MIB),
             measured: Some(true),
+            certified: Some(true),
+            uncertified: None,
+            pool_source: None,
+            pool_tokens: None,
+            pool_basis: None,
+            warning: None,
         };
         let off = InstanceLmcache {
             state: "off".into(),
@@ -2008,6 +2014,12 @@ mod tests {
             held_kv_bytes: None,
             charge_bytes: None,
             measured: None,
+            certified: None,
+            uncertified: None,
+            pool_source: None,
+            pool_tokens: None,
+            pool_basis: None,
+            warning: None,
         };
         // The snapshot carries an instance's generation as a decimal string.
         let instance = |index: u32, generation: i64, host: &str, lmcache: &InstanceLmcache| {

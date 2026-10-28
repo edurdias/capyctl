@@ -1314,7 +1314,8 @@ pub const SCHEMA_V59: &str = "-- reserved for ADR 0036 (embeddings)";
 ///   reads null: an unknown basis, the 4 GiB default.
 /// - `launch_lmcache` gains how its pool was sized (`pool_source`, B and C,
 ///   why they were unknown, the size before admission shrank it, the
-///   warning) and `uncertified`, the detail of a `lmcache: required` launch
+///   warning, the model type its basis names) and `uncertified`, the detail
+///   of a `lmcache: required` launch
 ///   run outside the qualified table. A row written before v60 reads null:
 ///   a pool of unknown source, certified.
 ///

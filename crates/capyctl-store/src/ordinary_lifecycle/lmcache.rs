@@ -11,10 +11,13 @@
 //! deployment's own `disabled`) journals `lmcache_off` once. The host's report
 //! (on, or off with a launch-time reason) is recorded at Ready or failure.
 use super::*;
-use crate::events::{lmcache_off_in, lmcache_server_exited_in, LmcacheLaunch};
+use crate::events::{
+    lmcache_launch_note_in, lmcache_off_in, lmcache_server_exited_in, LmcacheLaunch, LmcacheNote,
+};
 use crate::lifecycle::completion::identities;
 use capyctl_config::lmcache::{
     self as lc, ChargeDomains, LmcacheCharge, LmcacheMode, LmcacheOff, LmcacheOffReason, PlanInputs,
+    PoolSizing,
 };
 use capyctl_domain::completion::ProcessIdentity;
 
@@ -354,8 +357,9 @@ pub(crate) fn migrate_v57(tx: &Transaction<'_>) -> rusqlite::Result<()> {
 /// sized (`pool_source`; B and C, `pool_bytes_per_token` and
 /// `pool_context_tokens`; `pool_unknown`, why they were unknown;
 /// `pool_shrunk_from`, the pool before admission shrank it to the room
-/// left; `pool_warning`) and `uncertified`, the detail of a `lmcache:
-/// required` launch run outside the qualified table.
+/// left; `pool_warning`; `pool_model_type`, the checkpoint's model type the
+/// basis names) and `uncertified`, the detail of a `lmcache: required`
+/// launch run outside the qualified table.
 pub(crate) fn migrate_v60(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     for (column, definition) in [
         (
@@ -382,6 +386,10 @@ pub(crate) fn migrate_v60(tx: &Transaction<'_>) -> rusqlite::Result<()> {
         (
             "uncertified",
             "TEXT CHECK(length(uncertified) BETWEEN 1 AND 2048)",
+        ),
+        (
+            "pool_model_type",
+            "TEXT CHECK(length(pool_model_type) BETWEEN 1 AND 128)",
         ),
     ] {
         let present: bool = tx.query_row(
@@ -561,14 +569,17 @@ fn model_type_on(
 /// registration, residency, engine options, and the product name of the GPU
 /// the host published for its devices), the host's published settings and
 /// declared capabilities, the sticky fallback and, for a parking residency,
-/// the checkpoint's model type ([`model_type_on`]), which the qualified table
-/// compares (ADR 0033 §7, amendment A12).
-pub(super) fn plan_on(
+/// the checkpoint's `model_type` ([`model_type_on`]; `None` for a residency
+/// that does not park, which compares none), which the qualified table
+/// compares (ADR 0033 §7, amendment A12). Its pool is the stated one or the
+/// 4 GiB default; [`sized_plan`] sizes it for a launch (ADR 0034 §4).
+fn plan_for(
     conn: &rusqlite::Connection,
     deployment_id: &str,
     revision: i64,
     host: &str,
     e: &EffectiveDeployment,
+    model_type: Option<&str>,
 ) -> Result<lc::LmcachePlan, LifecycleError> {
     let (host_lmcache, host_retention) = super::placement::host_lmcache_settings(conn, host, e)?;
     let declared = |capability: &str| -> Result<bool, LifecycleError> {
@@ -580,21 +591,18 @@ pub(super) fn plan_on(
             |r| r.get(0),
         )?)
     };
-    // Only a parking residency compares the model type.
-    let model_type = if e.residency.parks() {
-        model_type_on(conn, deployment_id, revision, host, e)?
-    } else {
-        None
-    };
-    let pool_bytes = e.lmcache_pool_bytes;
     let inputs = PlanInputs {
         mode: e.lmcache,
-        pool_bytes,
+        pool_bytes: e.lmcache_pool_bytes,
         retention: e.retention,
         host_lmcache,
         host_retention,
         host_declares_lmcache: declared(lc::CAPABILITY)?,
         host_declares_retention: declared(lc::RETENTION_CAPABILITY)?,
+        // ADR 0034 §1 (ADR 0017): a parking residency's LMCache is
+        // engine-driven, which only a host declaring it renders; the embedded
+        // host is this build.
+        host_declares_engine_driven: declared(lc::ENGINE_DRIVEN_CAPABILITY)?,
         api: e.api,
         // ADR 0035 §9: a model on several GPUs of one host records its rank
         // share in `memory.member` too, and is not a group.
@@ -616,11 +624,136 @@ pub(super) fn plan_on(
         ),
         engine_start_failed: fallback_recorded(conn, deployment_id, revision, host, e)?,
         discrete_gpu: domains(e).is_ok_and(|d| d.device.is_some()),
-        model_type: model_type.as_deref(),
+        model_type,
         gpu: lc::launch_gpu(e),
         ..PlanInputs::for_profile(e.profile.engine, &e.profile.build_fingerprint, e.residency)
     };
     Ok(lc::plan_with_table(&inputs, qualified_parking()))
+}
+
+/// ADR 0034 §4: a launch's plan with its pool sized, and the checkpoint's
+/// model type the basis names.
+#[derive(Debug)]
+pub(super) struct SizedPlan {
+    pub(super) plan: lc::LmcachePlan,
+    /// The pool and how it was sized, when the plan is on.
+    pub(super) sizing: Option<PoolSizing>,
+    pub(super) model_type: Option<String>,
+}
+
+/// ADR 0034 §4: the plan for a start of `instance` of this revision on
+/// `host`, its pool sized as the host will reserve it: the stated
+/// `lmcache_pool`, else one full context of the model after eviction from
+/// B and C (read from the checkpoint on the embedded host, as an enrolled
+/// host reported them), within the cap of the system domain's
+/// `host_kv_limit` less the host KV the revision declares there. Owner
+/// decision 3: under `lmcache: auto`, an automatic pool the host-KV room
+/// left cannot hold shrinks to it, and with less than 1 GiB left the plan is
+/// off, `host_kv_room`; a stated pool or `lmcache: required` keeps its size
+/// (its start waits or is refused for the limit, #201). A host without a
+/// limit leaves no room to judge.
+pub(super) fn sized_plan(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    revision: i64,
+    instance: u32,
+    host: &str,
+    e: &EffectiveDeployment,
+) -> Result<SizedPlan, LifecycleError> {
+    let model_type = model_type_on(tx, deployment_id, revision, host, e)?;
+    let mut plan = plan_for(
+        tx,
+        deployment_id,
+        revision,
+        host,
+        e,
+        model_type.as_deref().filter(|_| e.residency.parks()),
+    )?;
+    if !plan.is_on() {
+        return Ok(SizedPlan {
+            plan,
+            sizing: None,
+            model_type,
+        });
+    }
+    let basis = if enrolled(tx, host)? {
+        crate::checkpoint_digests::recorded_pool_basis(tx, deployment_id, revision)?
+            .ok_or_else(|| "the host has not reported the checkpoint's KV size yet".to_owned())
+    } else {
+        lc::pool_basis_for_effective(e)
+    };
+    let system = domains(e)?.system;
+    let limit = read_selected_policy(tx, &e.host.name)
+        .map_err(resource)?
+        .and_then(|policy| {
+            policy
+                .controls
+                .domains
+                .get(&system)
+                .and_then(|domain| domain.host_kv_limit)
+        });
+    let declared = phase(&e.resources.cold, ResourcePhase::Cold)
+        .allocations
+        .iter()
+        .filter(|a| a.domain == system)
+        .map(|a| a.host_kv_bytes.max(0))
+        .fold(0, i64::saturating_add);
+    let mut sizing = lc::size_pool(e.lmcache_pool_bytes, basis, lc::pool_cap(limit, declared));
+    if let (Some(limit), LmcacheMode::Auto) = (limit, plan.mode) {
+        let held = host_kv_held(tx, deployment_id, instance, &e.host.name, &system)?;
+        let room = limit.saturating_sub(held).saturating_sub(declared);
+        match sizing.within_room(room) {
+            Some(within) => sizing = within,
+            None => {
+                plan.state = lc::LmcacheState::Off(LmcacheOff::new(LmcacheOffReason::HostKvRoom));
+                return Ok(SizedPlan {
+                    plan,
+                    sizing: None,
+                    model_type,
+                });
+            }
+        }
+    }
+    plan.pool_bytes = sizing.pool_bytes;
+    Ok(SizedPlan {
+        plan,
+        sizing: Some(sizing),
+        model_type,
+    })
+}
+
+/// Whether `host` is an enrolled host (else the embedded one).
+fn enrolled(conn: &rusqlite::Connection, host: &str) -> Result<bool, LifecycleError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM enrolled_hosts WHERE host_id=?1)",
+        [host],
+        |r| r.get(0),
+    )?)
+}
+
+/// ADR 0034 §4 (owner decision 3): the host KV every owner but `instance`'s
+/// holds on the ledger domain `domain` of the host named `host_name`, as
+/// placement counts it: the ledger, and every start accepted there but not
+/// yet armed.
+fn host_kv_held(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    instance: u32,
+    host_name: &str,
+    domain: &str,
+) -> Result<i64, LifecycleError> {
+    let mut ledger = crate::resource_ledger::read_snapshot(tx).map_err(resource)?;
+    for (on, owner, footprint) in super::placement::pending_charges(tx)? {
+        if on == host_name {
+            ledger.owners.entry(owner).or_insert(footprint);
+        }
+    }
+    Ok(capyctl_scheduler::placement::host_kv_held(
+        &ledger,
+        &crate::instances::instance_owner_id(deployment_id, instance),
+        domain,
+        &|_| false,
+    ))
 }
 
 /// The charge a plan reserves, with the revision's measured figures where
@@ -649,18 +782,21 @@ fn plan_charge(
         }))
 }
 
-/// ADR 0013 §4 (placement): `footprint` with the charge a start of this
-/// revision on `host` would reserve.
+/// ADR 0013 §4 (placement): `footprint` with the charge a start of
+/// `instance` of this revision on `host` would reserve, its pool sized as
+/// the start would size it (ADR 0034 §4: an automatic pool within the room
+/// left, none when it is off for the room).
 pub(super) fn prospective(
-    conn: &rusqlite::Connection,
+    tx: &Transaction<'_>,
     deployment_id: &str,
     revision: i64,
+    instance: u32,
     host: &str,
     e: &EffectiveDeployment,
     footprint: PhaseFootprint,
 ) -> Result<PhaseFootprint, LifecycleError> {
-    let plan = plan_on(conn, deployment_id, revision, host, e)?;
-    match plan_charge(conn, &plan, deployment_id, revision, host, e)? {
+    let sized = sized_plan(tx, deployment_id, revision, instance, host, e)?;
+    match plan_charge(tx, &sized.plan, deployment_id, revision, host, e)? {
         Some((charge, _)) => lay(e, &footprint, &charge, false, false),
         None => Ok(footprint),
     }
@@ -741,8 +877,30 @@ fn off_event(
     lmcache_off_in(tx, launch, reason, detail).map_err(event_error)
 }
 
-/// At accept: plan the new binding's LMCache, lease its ports and record it.
-/// `force_off` (ADR 0033 §8) keeps it off whatever the plan says.
+/// Journal `kind` (`lmcache_uncertified`, `lmcache_pool_short`) for a launch
+/// whose host key names one, once per launch.
+fn note_event(
+    tx: &Transaction<'_>,
+    launch: &LmcacheLaunch<'_>,
+    kind: LmcacheNote,
+    detail: &str,
+) -> Result<(), LifecycleError> {
+    if launch.host_id.is_empty() {
+        return Ok(());
+    }
+    lmcache_launch_note_in(tx, launch, kind, detail).map_err(event_error)?;
+    Ok(())
+}
+
+/// `text` as a `launch_lmcache` column keeps it: at most 2048 characters,
+/// `None` when empty.
+fn column_text(text: &str) -> Option<String> {
+    Some(capyctl_domain::diagnostics::bound_chars(text, 2048)).filter(|t| !t.trim().is_empty())
+}
+
+/// At accept: plan the new binding's LMCache, size its pool (ADR 0034 §4),
+/// lease its ports and record it. `force_off` (ADR 0033 §8) keeps it off
+/// whatever the plan says.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan_launch(
     tx: &Transaction<'_>,
@@ -754,7 +912,11 @@ pub(super) fn plan_launch(
     force_off: Option<LmcacheOffReason>,
     now: i64,
 ) -> Result<(), LifecycleError> {
-    let mut plan = plan_on(tx, &f.deployment_id, f.revision, host, e)?;
+    let SizedPlan {
+        mut plan,
+        sizing,
+        model_type,
+    } = sized_plan(tx, &f.deployment_id, f.revision, instance, host, e)?;
     if let (Some(reason), true) = (force_off, plan.is_on()) {
         plan.state = lc::LmcacheState::Off(LmcacheOff::new(reason));
     }
@@ -782,11 +944,20 @@ pub(super) fn plan_launch(
         && e.residency == capyctl_config::effective::Residency::RestartOnly
         && e.engine_config.memory().member.is_none();
     let off = plan.off().cloned();
+    // ADR 0034 §§3a, 4: how a launch that runs LMCache got its pool, and
+    // whether it runs uncertified; a later launch computes it again.
+    let sizing = sizing.filter(|_| plan.is_on());
+    let uncertified = plan.uncertified.as_ref().filter(|_| plan.is_on());
+    let warning = sizing.as_ref().and_then(PoolSizing::warning);
+    let figure = |n: u64| i64::try_from(n).ok();
     tx.execute(
         "INSERT INTO launch_lmcache(binding_id,deployment_id,instance_index,generation,revision,host_id,
             mode,retention_zero,planned,planned_reason,planned_detail,rpc_port,http_port,pool_bytes,
-            overhead_bytes,device_bytes,held_kv_bytes,measured,restart_park)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+            overhead_bytes,device_bytes,held_kv_bytes,measured,restart_park,pool_source,
+            pool_bytes_per_token,pool_context_tokens,pool_unknown,pool_shrunk_from,pool_warning,
+            uncertified,pool_model_type)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,
+            ?24,?25,?26,?27)",
         params![
             binding_id,
             f.deployment_id,
@@ -807,8 +978,32 @@ pub(super) fn plan_launch(
             charge.map(|c| c.0.held_kv_bytes),
             charge.is_some_and(|c| c.1),
             restart_park,
+            sizing.as_ref().map(|s| s.source.code()),
+            sizing
+                .as_ref()
+                .and_then(|s| s.basis)
+                .and_then(|b| figure(b.bytes_per_token)),
+            sizing
+                .as_ref()
+                .and_then(|s| s.basis)
+                .and_then(|b| figure(b.context_tokens)),
+            sizing
+                .as_ref()
+                .and_then(|s| s.unknown.as_deref())
+                .and_then(column_text),
+            sizing
+                .as_ref()
+                .and_then(|s| s.shrunk_from)
+                .and_then(figure),
+            warning.as_deref().and_then(column_text),
+            uncertified.and_then(|u| column_text(&u.detail)),
+            sizing
+                .as_ref()
+                .and(model_type.as_deref())
+                .and_then(lc::table_key),
         ],
     )?;
+    let launch = launch_of(&f.deployment_id, instance, f.generation, binding_id, host);
     // ADR 0033 §9: a reason known before launch is journaled once; the
     // deployment's own `lmcache: off` is the operator's choice, not news, and
     // a relaunch forced off (ADR 0033 §8) repeats what its failed launch's
@@ -816,13 +1011,22 @@ pub(super) fn plan_launch(
     if let Some(off) =
         off.filter(|off| off.reason != LmcacheOffReason::Disabled && force_off.is_none())
     {
-        let launch = launch_of(&f.deployment_id, instance, f.generation, binding_id, host);
         if off_event(tx, &launch, off.reason, &off.detail)? {
             tx.execute(
                 "UPDATE launch_lmcache SET off_event=1,reported_at_ms=?2 WHERE binding_id=?1",
                 params![binding_id, now],
             )?;
         }
+    }
+    // ADR 0034 §3a, §6: a `lmcache: required` launch outside the certified
+    // set runs uncertified, journaled once per launch.
+    if let Some(uncertified) = uncertified {
+        note_event(tx, &launch, LmcacheNote::Uncertified, &uncertified.detail)?;
+    }
+    // ADR 0034 §4: a pool that keeps less than one full context, or that
+    // admission shrank to the room left, is a warning; the launch runs.
+    if let Some(warning) = &warning {
+        note_event(tx, &launch, LmcacheNote::PoolShort, warning)?;
     }
     Ok(())
 }
