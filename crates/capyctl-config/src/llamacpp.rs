@@ -295,6 +295,16 @@ pub fn is_reserved(name: &str) -> bool {
     row_of(RESERVED_RENDERED, name).is_some() || row_of(RESERVED_NEVER_RENDERED, name).is_some()
 }
 
+/// ADR 0036 §2: the option CapyCTL renders on an embeddings deployment
+/// (never passed by the user: `--embedding`/`--embeddings` stay reserved).
+pub const EMBEDDINGS_OPTION: &str = "--embeddings";
+
+/// ADR 0036 §2: whether `name` (normalized) is `--pooling`, ordinary on an
+/// embeddings deployment (any value but `none`) and reserved elsewhere.
+pub fn is_pooling(name: &str) -> bool {
+    name == "--pooling"
+}
+
 /// ADR 0014 open issue 5: llama-server options whose name has a sensitive
 /// shape but whose value is none of those things: `--no-host` turns off a
 /// host memory buffer and opens nothing.

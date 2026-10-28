@@ -358,6 +358,7 @@ pub fn probe_command(
             owned_handle: head.owned_handle.clone(),
             max_tokens: Some(max_tokens),
             decision: false,
+            embedding: false,
         },
     };
     command.identity.payload_digest = command.canonical_digest();

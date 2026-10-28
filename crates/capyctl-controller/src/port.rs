@@ -188,6 +188,21 @@ pub trait LifecyclePort: Send + Sync {
         self.runtime_endpoint(deployment)
     }
 
+    /// ADR 0036 §§3, 5: the native dimension of the embeddings instance
+    /// incarnation `generation`: the length of the vector its embedding
+    /// probe answered at readiness, as its recorded wake canary reference
+    /// holds it. `None` when that launch recorded no embedding reference yet
+    /// (or holds no runtime). The router refuses a llama.cpp request whose
+    /// `dimensions` differs from it. The default is an authority that
+    /// records no references.
+    fn embedding_dimension(
+        &self,
+        _deployment: &str,
+        _generation: i64,
+    ) -> Result<Option<usize>, LifecycleFault> {
+        Ok(None)
+    }
+
     /// SPEC §10, ADR 0013 §10: open a durable lease charged to exactly the
     /// instance incarnation `generation` names, only while its gate is open.
     async fn open_instance_lease(
@@ -317,6 +332,36 @@ pub trait LifecyclePort: Send + Sync {
     /// is no longer an open cancelling lease of the current session (already
     /// settled, or uncertain): nothing changes. An error leaves it charged.
     async fn acknowledge_cancelled_request(
+        &self,
+        _lease_id: &str,
+    ) -> Result<bool, crate::request_leases::LeaseRefused> {
+        Ok(false)
+    }
+
+    /// ADR 0036 §4 (owner decision 2026-10-27, question 7): close the
+    /// cancelling lease `lease_id` of a cut embeddings request that the
+    /// router read to its end and whose answer was completion, journaling
+    /// `request_cancellation_acknowledged` with the embeddings receipt (no
+    /// abort was sent). `Ok(false)` when the lease is no longer an open
+    /// cancelling lease of the current session (already settled on the
+    /// engine's idle reading, or uncertain): nothing changes. An error leaves
+    /// it charged. The default is an authority with no ledger to settle.
+    async fn settle_answered_cut(
+        &self,
+        _lease_id: &str,
+    ) -> Result<bool, crate::request_leases::LeaseRefused> {
+        Ok(false)
+    }
+
+    /// ADR 0036 §4: "A complete engine error answer is answered, as today,
+    /// and settles on the engine's idle reading." Record the cancelling lease
+    /// `lease_id` of a cut embeddings request, cancelled before the engine
+    /// answered it, as answered now that its complete error answer was read,
+    /// so only an idle reading taken after that answer settles it. `Ok(false)`
+    /// when the lease is no longer an open cancelling lease of the current
+    /// session: nothing changes, and it keeps today's rule. An error leaves it
+    /// charged. The default is an authority with no ledger to record it in.
+    async fn answer_cut(
         &self,
         _lease_id: &str,
     ) -> Result<bool, crate::request_leases::LeaseRefused> {

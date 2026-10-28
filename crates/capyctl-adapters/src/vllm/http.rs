@@ -200,6 +200,21 @@ impl EngineHttp {
         crate::decision_probe::probe(&self.client, &self.base, key.as_ref(), served, bound).await
     }
 
+    /// ADR 0036 §5: the fixed embedding probe, `POST /v1/embeddings`, on this
+    /// engine's loopback endpoint with its inference key (the guard admits it
+    /// on `/v1`), answering the served model `served`.
+    pub async fn embedding_probe(
+        &self,
+        served: &str,
+        bound: Duration,
+    ) -> Result<crate::embedding_probe::EmbeddingAnswer, crate::traits::AdapterError> {
+        let key = self
+            .api_key
+            .as_deref()
+            .and_then(crate::completion_probe::bearer);
+        crate::embedding_probe::probe(&self.client, &self.base, key.as_ref(), served, bound).await
+    }
+
     /// Served model ids from `/v1/models`. Presence of the deployment's
     /// model id is the readiness signal.
     pub async fn list_models(&self) -> Result<Vec<String>, HttpError> {

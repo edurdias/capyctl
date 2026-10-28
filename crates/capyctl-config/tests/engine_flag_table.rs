@@ -86,6 +86,7 @@ fn classify(engine: Engine, option: &str) -> (&'static str, Option<String>) {
     let paths: Vec<PathBuf> = Vec::new();
     let context = ExtraArgsContext {
         engine,
+        api: capyctl_config::effective::DeploymentApi::Chat,
         sleep_mode: false,
         approved_options: &none,
         approved_paths: &paths,

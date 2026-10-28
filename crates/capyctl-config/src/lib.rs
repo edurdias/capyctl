@@ -10,6 +10,7 @@ pub mod custom;
 pub mod defaults;
 // ADR 0030 §1, §7: what a deployment serving decision models may resolve to.
 pub mod decisions;
+pub mod embeddings;
 // Owner decision 2026-09-25 (ADR 0014 amendment): the minimal deployment file
 // and the defaults that complete it, shared by every role.
 pub mod deployment_defaults;

@@ -53,6 +53,39 @@ fn lifecycle_deadline(
         .ok_or_else(|| LifecycleFault::Unavailable("clock overflow".into()))
 }
 
+/// ADR 0036 §§3, 5: the native dimension of the instance incarnation
+/// `generation` of `deployment`, read from the wake canary reference its
+/// launch recorded at readiness. Only an embedding reference holds one; a
+/// completion or decision reference, no reference yet, or an incarnation that
+/// holds no runtime is `None`.
+fn embedding_dimension_in(
+    store: &capyctl_store::Store,
+    deployment: &str,
+    generation: i64,
+) -> Result<Option<usize>, LifecycleFault> {
+    // The instance row names the incarnation's retained binding and launch.
+    let Some(instance) = store
+        .serving_instances(deployment)
+        .map_err(LifecycleFault::from)?
+        .into_iter()
+        .find(|row| row.generation == generation)
+    else {
+        return Ok(None);
+    };
+    let reference = store.wake_canary(
+        deployment,
+        instance.instance_index,
+        generation,
+        &instance.incarnation,
+    )?;
+    Ok(match reference {
+        Some(capyctl_store::wake_canary::WakeCanaryReference::Embedding(embedding)) => {
+            usize::try_from(embedding.dimension).ok()
+        }
+        _ => None,
+    })
+}
+
 /// SPEC §6.3 (W5): a wake is given the deployment's `timeouts.wake` (its
 /// Initialize window when none is recorded), within the request deadline.
 fn wake_deadline(commands: &CoordinatorCommands, deployment: &str) -> Result<i64, LifecycleFault> {
@@ -938,6 +971,17 @@ impl LifecyclePort for CoordinatorLifecycle {
         Ok(Some(self.with_abort(projected)))
     }
 
+    /// ADR 0036 §§3, 5: the dimension the incarnation's recorded embedding
+    /// reference holds ([`embedding_dimension_in`]).
+    fn embedding_dimension(
+        &self,
+        deployment: &str,
+        generation: i64,
+    ) -> Result<Option<usize>, LifecycleFault> {
+        let owner = self.commands.owner_for_read()?;
+        embedding_dimension_in(owner.store(), deployment, generation)
+    }
+
     async fn open_instance_lease(
         &self,
         deployment: &str,
@@ -998,7 +1042,30 @@ impl LifecyclePort for CoordinatorLifecycle {
         &self,
         lease_id: &str,
     ) -> Result<bool, crate::request_leases::LeaseRefused> {
-        self.leases.acknowledge(lease_id).await
+        use capyctl_store::request_lease_cancellations::CancelledEvidence;
+        self.leases
+            .acknowledge(lease_id, CancelledEvidence::Aborted)
+            .await
+    }
+
+    /// ADR 0036 §4: the same acknowledgement, with the embeddings receipt.
+    async fn settle_answered_cut(
+        &self,
+        lease_id: &str,
+    ) -> Result<bool, crate::request_leases::LeaseRefused> {
+        use capyctl_store::request_lease_cancellations::CancelledEvidence;
+        self.leases
+            .acknowledge(lease_id, CancelledEvidence::Answered)
+            .await
+    }
+
+    /// ADR 0036 §4: the complete error answer of a cut embeddings request,
+    /// group-committed.
+    async fn answer_cut(
+        &self,
+        lease_id: &str,
+    ) -> Result<bool, crate::request_leases::LeaseRefused> {
+        self.leases.answer_cut(lease_id).await
     }
 
     /// ADR 0032 §7: against the deployment limit the router grants under
@@ -1358,3 +1425,90 @@ impl LifecyclePort for CoordinatorLifecycle {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod embedding_dimension_tests {
+    use super::embedding_dimension_in;
+    use capyctl_store::wake_canary::{
+        StoredDecisionCanary, StoredEmbeddingCanary, StoredWakeCanary, WakeCanaryReference,
+    };
+    use capyctl_testkit::fixture;
+
+    /// Before the fixture's admission reading (1200), after its observations.
+    const NOW: i64 = 1_100;
+
+    /// One started launch of a fresh deployment, with `reference` recorded
+    /// for it when given: its deployment and generation.
+    fn launch(reference: Option<WakeCanaryReference>) -> (fixture::Fixture, String, i64) {
+        let f = fixture::fixture();
+        let fence = fixture::managed(&f, "embed");
+        let accepted = f
+            .store
+            .accept_start(&f.session, &fence, NOW, NOW + 100_000)
+            .unwrap();
+        f.store
+            .arm_step(&f.session, &accepted.step_id, f.admission())
+            .unwrap();
+        let context = f
+            .store
+            .initialize_execution(&f.session, &accepted.step_id)
+            .unwrap();
+        let generation = context.token.generation;
+        if let Some(reference) = reference {
+            assert!(f
+                .store
+                .record_wake_canary(
+                    &fence.deployment_id,
+                    0,
+                    generation,
+                    &context.incarnation,
+                    &reference,
+                    NOW,
+                )
+                .unwrap());
+        }
+        (f, fence.deployment_id, generation)
+    }
+
+    // T47 (ADR 0036 §§3, 5): an incarnation's recorded embedding reference
+    // gives its native dimension; no reference, a completion or a decision
+    // reference, or another incarnation gives none.
+    #[test]
+    fn the_native_dimension_is_the_embedding_references() {
+        let embedding = WakeCanaryReference::Embedding(StoredEmbeddingCanary {
+            probe_kind: "embedding".into(),
+            probe_version: 1,
+            dimension: 3,
+            vector: vec![0.6, 0.0, -0.8],
+            tolerance: 0.02,
+        });
+        let (f, deployment, generation) = launch(Some(embedding));
+        assert_eq!(
+            embedding_dimension_in(&f.store, &deployment, generation).unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            embedding_dimension_in(&f.store, &deployment, generation + 1).unwrap(),
+            None
+        );
+        let completion = WakeCanaryReference::Completion(StoredWakeCanary {
+            prompt: "Say ready.".into(),
+            tokens: vec![1, 2],
+            text: "ready".into(),
+        });
+        let decision = WakeCanaryReference::Decision(StoredDecisionCanary {
+            probe_version: 1,
+            choice: "yes".into(),
+            probabilities: vec![("yes".into(), 0.6), ("no".into(), 0.4)],
+            tolerance: 0.05,
+        });
+        for reference in [None, Some(completion), Some(decision)] {
+            let (f, deployment, generation) = launch(reference.clone());
+            assert_eq!(
+                embedding_dimension_in(&f.store, &deployment, generation).unwrap(),
+                None,
+                "{reference:?}"
+            );
+        }
+    }
+}

@@ -2,13 +2,16 @@
 //! admission, queue bounds, and dispatch; it never chooses models or runs a
 //! second scheduler (SPEC §10), and never imports engine crates — dispatch
 //! reaches engines through adapters behind `ChatForward`. It answers chat
-//! completions and, for decisions deployments, decision requests (ADR 0030).
+//! completions and, for decisions deployments, decision requests (ADR 0030),
+//! and for embeddings deployments, embedding requests (ADR 0036).
 
 pub mod admission;
 pub mod balance;
 // SPEC §§10, 17 (owner decision 2026-10-08): the management load read.
 pub mod capacity;
 pub mod chat;
+// ADR 0036 §§3-4: embedding requests, their answers streamed through.
+mod embeddings;
 // ADR 0030 §2: the inference endpoints and the API each answers.
 pub mod endpoint;
 pub mod forwarders;
@@ -74,6 +77,8 @@ pub fn serve_router(deps: RouterDeps) -> axum::Router {
         .route("/v1/chat/completions", post(chat_completions))
         // ADR 0030 §2: decision requests, for `api: decisions` deployments.
         .route("/v1/systemone", post(systemone))
+        // ADR 0036 §3: embedding requests, for `api: embeddings` deployments.
+        .route("/v1/embeddings", post(embeddings_handler))
         .layer(axum::middleware::map_response(retry_after))
         .with_state(state)
 }
@@ -335,6 +340,42 @@ async fn decision(
     .await?;
     engine_metrics::attach_decision(&mut json, &timing);
     Ok(with_timing(Json(json).into_response(), &timing))
+}
+
+/// `POST /v1/embeddings` — ADR 0036 §§3-4: an embedding request, admitted,
+/// leased and failed over exactly as a decision, for `api: embeddings`
+/// deployments only. Its answer is streamed through as it arrives, checked
+/// as it passes, with `model` the public name; `capyctl.metrics` (§9) and the
+/// closing brace come only after the last check passed. It carries the
+/// request's IDs as a chat answer does (SPEC §10).
+async fn embeddings_handler(
+    state: axum::extract::State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> axum::response::Response {
+    let ids = Arc::new(request_id::RequestIds::read(&headers));
+    let outcome = embedding(&state.deps, &headers, body, &ids).await;
+    ids.stamp(outcome)
+}
+
+async fn embedding(
+    deps: &RouterDeps,
+    headers: &HeaderMap,
+    body: axum::body::Body,
+    ids: &Arc<request_id::RequestIds>,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    let endpoint = endpoint::Endpoint::Embeddings;
+    let received = receive(deps, headers, ids, body, endpoint).await?;
+    embeddings::dispatch(
+        deps,
+        &received.model,
+        received.request,
+        received.body_bytes,
+        received.at,
+        received.timing,
+        ids.clone(),
+    )
+    .await
 }
 
 /// SPEC §17: the request's timing header, when the operator enabled it.

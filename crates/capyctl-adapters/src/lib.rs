@@ -4,6 +4,9 @@ pub mod completion_probe;
 pub mod custom;
 // ADR 0030 §3: the fixed decision probe of a decisions deployment.
 pub mod decision_probe;
+mod embedding_answer;
+pub mod embedding_probe;
+pub mod embedding_request;
 pub mod engine_env;
 // SPEC §13.3 / T21: engine logs redacted as written, read back as a bounded tail.
 pub mod engine_log;

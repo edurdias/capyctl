@@ -126,6 +126,10 @@ pub struct PlanInputVllm {
     /// ADR 0033: the launch's LMCache server and its report; `None` for a
     /// launch that never uses LMCache.
     pub lmcache: Option<std::sync::Arc<crate::lmcache::LmcacheState>>,
+    /// ADR 0036 §2: the API the deployment serves. An embeddings deployment
+    /// renders `--runner pooling` in the reserved block; every other renders
+    /// nothing, and vLLM's own `auto` applies.
+    pub api: capyctl_config::effective::DeploymentApi,
 }
 
 /// SPEC §13.3: the engine key is never formatted.
@@ -170,6 +174,7 @@ impl std::fmt::Debug for PlanInputVllm {
             .field("group", &self.group)
             .field("kv_transfer_config", &self.kv_transfer_config)
             .field("lmcache", &self.lmcache)
+            .field("api", &self.api)
             .finish()
     }
 }
@@ -343,6 +348,14 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
     // any argument that resolves either destination differently.
     argv.push("--no-enable-log-requests".into());
     argv.push("--no-enable-log-outputs".into());
+    // ADR 0036 §2: an embeddings deployment runs vLLM's pooling runner.
+    // vLLM picks the conversion itself (`--convert auto`), turning a
+    // generative architecture into an embedding model. Both are reserved for
+    // every deployment (`runtime/vllm_entry.py`), so nothing after the marker
+    // changes them.
+    if input.api == capyctl_config::effective::DeploymentApi::Embeddings {
+        push(&mut argv, "--runner", "pooling".into());
+    }
     // The five validated launch settings, rendered unconditionally except
     // the CPU-offload budget, which is omitted rather than sent as zero.
     push(

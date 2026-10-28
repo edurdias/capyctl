@@ -52,6 +52,8 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 5 | `capability_missing:decisions` | A deployment with `api: decisions` names an engine that cannot serve decision models: vLLM (any version: 0.32.0 answers Clef and Clef-Flash from their text output instead of their decision head), TensorFold, llama.cpp before 0.7.0, SGLang before 0.5.22, an installation whose registered build names no version, or a custom engine whose manifest says `api: chat`. | Use llama.cpp 0.7.0 or newer or SGLang 0.5.22 or newer, registered with `capyctl engine add`, or a custom engine with `api: decisions` ([Decision models](deploy.md#decision-models)). |
 | 5 | `capability_missing:chat` | A chat deployment (no `api`, or `api: chat`) names a custom engine whose manifest says `api: decisions`. | Add `api: decisions` to the deployment, or use a chat engine. |
 | 5 | `host_capability_missing:decisions` | A machine runs a CapyCTL too old for decision models. | Upgrade CapyCTL on that machine. |
+| 5 | `capability_missing:embeddings` | A deployment with `api: embeddings` names an engine that has no embeddings route (TensorFold), or a custom engine whose manifest names another `api`. | Use vLLM, SGLang or llama.cpp, or a custom engine with `api: embeddings`. |
+| 5 | `host_capability_missing:embeddings` | A machine runs a CapyCTL too old for embedding models. | Upgrade CapyCTL on that machine. |
 | 5 | `host_capability_missing:custom_engines` | The deployment's engine is a custom engine and a machine it names runs a CapyCTL too old for custom engines. | Upgrade CapyCTL on that machine. |
 | 5 | `lmcache_unavailable:<reason>` | A deployment with `lmcache: required` cannot use LMCache, for the reason named after the colon ([LMCache](#lmcache) lists them). A reason known before anything starts (the machine's `lmcache: off`, the engine or its version, a missing or unsupported LMCache package, a `topology`, a parking residency not qualified, the deployment's own `--kv-transfer-config`) refuses it at deploy or start; one found when the launch runs (the launch-time check, the server's start, its listener check, the engine's start with LMCache) fails the launch, and nothing is left running. | Remove the reason ([LMCache](#lmcache) says how for each), or set `lmcache: auto`, which runs without LMCache where it cannot be used. |
 | 5 | `retention_zero:lmcache` | `lmcache: required` beside `retention: zero`, the deployment's own or that of a machine it names. Zero retention never runs LMCache. | Drop `lmcache: required` or the deployment's `retention: zero`, or place it on a machine without `retention: zero`. |
@@ -106,6 +108,10 @@ A deployment on one machine can show these codes the same way:
   back intact. The wake fails and CapyCTL stops the instance;
   `capyctl status deployment <name>` shows the code as its last error. The
   next request or `capyctl start deployment <name>` loads it fresh.
+  For an embedding model (`api: embeddings`) the same check runs after every
+  wake and every restart: the fixed embedding must come back with the same
+  length and within a small relative distance of the first answer
+  ([Embedding models](deploy.md#embedding-models)).
 - `wake_reload_failed` (vLLM): during a wake, the engine reported that
   reloading the model's weights failed. The wake fails and CapyCTL stops the
   instance, as for `wake_mismatch`; the next request or
@@ -168,6 +174,9 @@ The inference endpoint answers HTTP errors with a JSON body holding `code` and
   engine's next stop; when they alone fill all 32, CapyCTL restarts the
   instance instead ([When a request is cut short](requests.md#when-a-request-is-cut-short)),
   but not while an unverified request is among them.
+  An embedding answer that fails CapyCTL's checks after part of it was sent
+  does not end with this error: you get HTTP 200 and an incomplete JSON body
+  that no JSON parser accepts ([The answer arrives as it is made](requests.md#the-answer-arrives-as-it-is-made)).
 
 For decision models:
 
@@ -184,6 +193,27 @@ For decision models:
   the engine's. Some custom engines answer every failure this way, an engine
   failure included: when a request you believe valid is rejected, read the
   instance's engine log ([Example: basal decision models](engines.md#example-basal-decision-models)).
+
+For embedding models:
+
+- `api_mismatch` (400): a chat or decision model asked on
+  `POST /v1/embeddings`, or an embedding model (`api: embeddings`) asked on
+  `POST /v1/chat/completions` or `POST /v1/systemone`. Nothing was woken or
+  sent; the message names the endpoint to use, for example `model my-embedder
+  serves the embeddings API, which /v1/chat/completions does not answer; send
+  its requests to POST /v1/embeddings`
+  ([Embedding requests](requests.md#embedding-requests)).
+- `invalid_request` (400) on `POST /v1/embeddings`: the body is outside the
+  embedding request's fields or shapes. The message is
+  ``embeddings request field `<name>` is not accepted`` for a field such as
+  `stream` or `cache_salt`, or `malformed embeddings request: <what>` for a
+  bad shape (an empty input, more than 2048 inputs, mixed or out-of-range
+  token IDs, an `encoding_format` other than `float` or `base64`). On
+  llama.cpp, `dimensions must be <N>: llama.cpp returns full vectors of the
+  model's native dimension` refuses a `dimensions` other than the model's own.
+- `engine_rejected` (400, 413 or 422): the engine refused the request, for
+  example an input longer than the model takes or a `dimensions` the model
+  does not support; the message is the engine's.
 
 ## LMCache
 
@@ -237,6 +267,8 @@ or its launch fails with `lmcache_unavailable:<reason>` (exit 5). The reasons:
   started it once more without LMCache, and later launches of the same
   revision on the same engine skip LMCache. The detail holds the end of the
   engine log.
+- `embeddings_unsupported`: the deployment serves embeddings (`api:
+  embeddings`), which never run LMCache. Set `lmcache: auto` or leave it out.
 
 The event `lmcache_server_exited` records that an instance's LMCache server
 exited while its engine served. The instance fails, CapyCTL stops its engine
@@ -259,6 +291,31 @@ On a machine of several it names that machine's
 `resource_policy.domains.<domain>.host_kv_limit` instead. A second copy of a
 model (`instances`) that waits for that room shows the same words in its
 `LAST ERROR`.
+
+## Embedding models
+
+A deployment with `api: embeddings` ([Embedding models](deploy.md#embedding-models))
+is refused when it asks for something an embedding model cannot do in this
+release. The message is the one shown here:
+
+- On TensorFold, exit 5, `capability_missing:embeddings`:
+  "TensorFold has no embeddings route to forward to; serve embedding models
+  on vLLM, SGLang, llama.cpp or a custom engine".
+- With `residency: deep` on llama.cpp or a custom engine, exit 5,
+  `capability_missing:deep_park`: "an embeddings deployment on <engine> does
+  not park in this version, so residency `deep` is refused; declare
+  `restart_only` or leave it out".
+- With a `topology`, `invalid_config` (exit 2): "an embeddings deployment runs
+  on one GPU of one machine in this version; remove `topology`".
+- With `residency: host_backed`, `invalid_config` (exit 2): "an embeddings
+  deployment parks `deep` or restarts in this version, so residency
+  `host_backed` is refused; declare `deep` or `restart_only`, or leave it
+  out".
+- With `--pooling none` in a llama.cpp deployment's `extra_args`,
+  `invalid_config` (exit 2): "option `--pooling` is `none`, and llama.cpp
+  serves no embeddings without pooling; pick another pooling or leave it out
+  (the model's own is used)"
+  ([Embedding models on each engine](engines.md#embedding-models)).
 
 ## Troubleshooting
 

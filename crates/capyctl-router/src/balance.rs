@@ -404,6 +404,15 @@ impl Attempt {
         })
     }
 
+    /// ADR 0036 §4: what settling a cut embeddings request on its answer
+    /// needs, taken before [`Attempt::settle`] consumes the lease: the
+    /// authority and this attempt's own lease ID. `None` without a durable
+    /// lease.
+    pub(crate) fn cut_lease(&self) -> Option<(Arc<dyn LifecyclePort>, String)> {
+        let (authority, lease) = self.lease.as_ref()?;
+        Some((authority.clone(), lease.id().to_owned()))
+    }
+
     /// Close or retain the lease on the evidence (SPEC §10) and drop the
     /// routing count. A failed write leaves the lease charged. Returns whether
     /// a durable lease accounted for this attempt: when it did, an uncertain

@@ -197,10 +197,16 @@ pub fn check_document(deployment: &Value) -> Result<DeploymentApi, ConfigError> 
     let api = match deployment.get("api") {
         None | Some(Value::Null) => DeploymentApi::Chat,
         Some(value) => serde_json::from_value(value.clone())
-            .map_err(|_| invalid("api", "must be chat or decisions"))?,
+            .map_err(|_| invalid("api", "must be chat, decisions or embeddings"))?,
     };
-    if api == DeploymentApi::Chat {
-        return Ok(api);
+    match api {
+        DeploymentApi::Chat => return Ok(api),
+        // ADR 0036 §7: an embeddings deployment's own document refusals.
+        DeploymentApi::Embeddings => {
+            crate::embeddings::check_document(deployment)?;
+            return Ok(api);
+        }
+        DeploymentApi::Decisions => {}
     }
     if deployment.get("topology").is_some_and(|t| !t.is_null()) {
         return Err(invalid(
@@ -223,12 +229,13 @@ pub fn check_document(deployment: &Value) -> Result<DeploymentApi, ConfigError> 
     Ok(api)
 }
 
-/// ADR 0030 §1 (amending ADR 0024 §1): a decisions deployment gets no
-/// tool-call or reasoning parser, so one it states is refused: a parser
-/// setting other than `auto` in its engine configuration, or the parser
-/// options in its extra arguments. The installation's host-fixed arguments
-/// are the operator's, as for every deployment on it.
-pub fn check_parsers(settings: &LaunchSettings) -> Result<(), ConfigError> {
+/// ADR 0030 §1, ADR 0036 §1 (amending ADR 0024 §1): a decisions or
+/// embeddings deployment gets no tool-call or reasoning parser, so one it
+/// states is refused: a parser setting other than `auto` in its engine
+/// configuration, or the parser options in its extra arguments. The
+/// installation's host-fixed arguments are the operator's, as for every
+/// deployment on it.
+pub fn check_parsers(settings: &LaunchSettings, api: DeploymentApi) -> Result<(), ConfigError> {
     let (block, tool, reasoning) = match settings {
         LaunchSettings::Vllm(s) => ("vllm", &s.tool_call_parser, &s.reasoning_parser),
         LaunchSettings::Sglang(s) => ("sglang", &s.tool_call_parser, &s.reasoning_parser),
@@ -241,8 +248,9 @@ pub fn check_parsers(settings: &LaunchSettings) -> Result<(), ConfigError> {
         Err(invalid(
             &path,
             format!(
-                "a decisions deployment has no tool-call or reasoning parser (they apply to \
-                 chat deployments); remove {what}"
+                "a {} deployment has no tool-call or reasoning parser (they apply to \
+                 chat deployments); remove {what}",
+                api.name()
             ),
         ))
     };

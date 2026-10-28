@@ -261,6 +261,57 @@ pub fn attach_decision(response: &mut Value, timing: &RequestTiming) {
     }
 }
 
+/// ADR 0036 §9: the figures of one embeddings request, each labelled with its
+/// source as a decision's are: `total_ms` (the router's clock, from arrival)
+/// and `time_to_response_ms` (`to_response`, from the forward to the whole
+/// answer), `input_tokens` from the engine's `usage.prompt_tokens` when it
+/// sent one, and `inputs` counted by the router from the request. A figure
+/// nobody measured is absent, never zero.
+pub fn embedding_metrics(
+    answered: &capyctl_adapters::traits::EmbeddingAnswered,
+    timing: &RequestTiming,
+    to_response: Option<std::time::Duration>,
+) -> Value {
+    let mut out = Map::new();
+    let ms = |took: std::time::Duration| took.as_secs_f64() * 1000.0;
+    let mut put = |name: &str, value: Option<f64>| {
+        if let Some(value) = value {
+            out.insert(
+                name.to_owned(),
+                json!({"value": rounded(value), "source": "router"}),
+            );
+        }
+    };
+    put("total_ms", timing.phases().total.map(ms));
+    put("time_to_response_ms", to_response.map(ms));
+    if let Some(tokens) = answered.prompt_tokens {
+        out.insert(
+            "input_tokens".to_owned(),
+            json!({"value": tokens, "source": "engine"}),
+        );
+    }
+    out.insert(
+        "inputs".to_owned(),
+        json!({"value": answered.inputs, "source": "router"}),
+    );
+    Value::Object(out)
+}
+
+/// ADR 0036 §4, §9: what closes an embeddings answer that passed every check:
+/// its `capyctl.metrics` member and the top-level closing brace the forwarder
+/// withheld. Written only after the last check passed.
+pub fn embedding_tail(
+    answered: &capyctl_adapters::traits::EmbeddingAnswered,
+    timing: &RequestTiming,
+    to_response: Option<std::time::Duration>,
+) -> Vec<u8> {
+    format!(
+        ",\"{BODY_KEY}\":{}}}",
+        json!({ "metrics": embedding_metrics(answered, timing, to_response) })
+    )
+    .into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,5 +690,37 @@ mod tests {
         let mut bare = json!({"answers": {}});
         attach_decision(&mut bare, &RequestTiming::untracked());
         assert_eq!(bare["capyctl"]["metrics"], json!({}));
+    }
+
+    // T47 (ADR 0036 §§4, 9): the tail closes the withheld object with
+    // `capyctl.metrics`: the engine's prompt tokens and the router's input
+    // count, each labelled; no engine count, no `input_tokens`; nothing about
+    // generated text, and no router clock figure that was not measured.
+    #[test]
+    fn an_embedding_tail_closes_the_answer_with_its_figures() {
+        let answered = capyctl_adapters::traits::EmbeddingAnswered {
+            inputs: 2,
+            prompt_tokens: Some(7),
+            client_gone: false,
+        };
+        let head = r#"{"object":"list","data":[],"model":"m""#;
+        let to_response = Some(std::time::Duration::from_micros(12_500));
+        let tail = embedding_tail(&answered, &RequestTiming::untracked(), to_response);
+        let whole: Value =
+            serde_json::from_slice(&[head.as_bytes(), &tail].concat()).expect("a whole document");
+        assert_eq!(
+            whole["capyctl"]["metrics"],
+            json!({
+                "time_to_response_ms": {"value": 12.5, "source": "router"},
+                "input_tokens": {"value": 7, "source": "engine"},
+                "inputs": {"value": 2, "source": "router"},
+            })
+        );
+        let uncounted = capyctl_adapters::traits::EmbeddingAnswered {
+            prompt_tokens: None,
+            ..answered
+        };
+        let figures = embedding_metrics(&uncounted, &RequestTiming::untracked(), None);
+        assert_eq!(figures, json!({"inputs": {"value": 2, "source": "router"}}));
     }
 }

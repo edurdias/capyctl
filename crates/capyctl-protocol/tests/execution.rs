@@ -26,6 +26,7 @@ fn command() -> pb::ServerToAgent {
             group_member_launch: None,
             probe_max_tokens: 0,
             probe_decision: false,
+            probe_embedding: false,
         })),
     }
 }
@@ -312,6 +313,7 @@ fn probe(handle: &str) -> MemberCommand {
         owned_handle: handle.into(),
         max_tokens: None,
         decision: false,
+        embedding: false,
     };
     command.identity.payload_digest = command.canonical_digest();
     command
@@ -347,6 +349,7 @@ fn ready_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         engine_log: None,
         probe_text: String::new(),
         probe_decision: None,
+        probe_embedding: None,
         lmcache: None,
     }
 }
@@ -371,6 +374,7 @@ fn probe_names_one_retained_launch_and_is_digest_bound() {
         owned_handle: "other-launch".into(),
         max_tokens: None,
         decision: false,
+        embedding: false,
     };
     assert_ne!(moved.canonical_digest(), command.canonical_digest());
     assert!(moved.verify_digest().is_err());
@@ -380,6 +384,7 @@ fn probe_names_one_retained_launch_and_is_digest_bound() {
             owned_handle: handle.to_string(),
             max_tokens: None,
             decision: false,
+            embedding: false,
         };
         bad.identity.payload_digest = bad.canonical_digest();
         assert!(bad.verify_digest().is_err(), "{handle:?}");

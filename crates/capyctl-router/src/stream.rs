@@ -59,7 +59,7 @@ impl Default for Progress {
 }
 
 impl Progress {
-    fn mark(&self) {
+    pub(crate) fn mark(&self) {
         self.0.send_replace(Some(tokio::time::Instant::now()));
     }
 
@@ -370,7 +370,7 @@ impl CutBy {
         }
     }
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::HangUp => "hang_up",
             Self::Delivery => "delivery",

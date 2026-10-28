@@ -131,6 +131,12 @@ pub const VLLM_RESERVED_FLAGS: &[&str] = &[
     // beside HTTP (`FrontendArgs.grpc_port`, with its Rust frontend); capyctl
     // owns every listener.
     "--grpc-port",
+    // ADR 0036 §2: CapyCTL renders `--runner pooling` on an embeddings
+    // deployment and nothing on any other, so neither a chat deployment's
+    // extra arguments nor an embeddings one's may choose the runner or the
+    // conversion (vLLM picks `--convert auto` itself).
+    "--runner",
+    "--convert",
 ];
 
 /// Whole option families reserved for vLLM: any option whose name starts here.
@@ -207,6 +213,9 @@ pub const SGLANG_RESERVED_FIELDS: &[&str] = &[
     "enable_flexkv",
     "flexkv_config_file",
     "quantize_and_serve",
+    // ADR 0036 §2: rendered `--is-embedding` on an embeddings deployment only,
+    // so no deployment's extra arguments may set it.
+    "is_embedding",
 ];
 
 /// Other spellings SGLang's parser accepts for reserved fields.
@@ -1019,6 +1028,12 @@ pub enum ProfileArgError {
          name an LMCache connector (`lmcache`); pass a JSON object"
     )]
     LmcacheUnreadable(String),
+    /// ADR 0036 §2: llama.cpp's embeddings route refuses pooling `none`.
+    #[error(
+        "option `{0}` is `none`, and llama.cpp serves no embeddings without pooling; pick \
+         another pooling or leave it out (the model's own is used)"
+    )]
+    PoolingNone(String),
 }
 
 /// Lowercase long-option name with `_` spelled `-`, without any `=value`.
@@ -1295,6 +1310,9 @@ pub(crate) fn path_within(value: &str, root: &Path) -> bool {
 #[derive(Debug, Clone)]
 pub struct ExtraArgsContext<'a> {
     pub engine: Engine,
+    /// ADR 0036 §2: the deployment's API; llama.cpp's `--pooling` is
+    /// ordinary on an embeddings deployment only.
+    pub api: crate::effective::DeploymentApi,
     /// Whether capyctl renders sleep mode for this launch (ADR 0014 §4).
     pub sleep_mode: bool,
     /// The installation's `security.approved_options`, normalized.
@@ -1436,7 +1454,15 @@ fn validate_llamacpp_args(
                 field: field.to_owned(),
             });
         }
-        if llamacpp::is_reserved(&name) {
+        // ADR 0036 §2: `--pooling` is the deployment's on an embeddings
+        // deployment, except `none`, which the OpenAI route refuses; it stays
+        // reserved on chat and decisions deployments and in host-fixed args.
+        let pooling = llamacpp::is_pooling(&name)
+            && context.is_some_and(|c| c.api == crate::effective::DeploymentApi::Embeddings);
+        if pooling && option.value.as_deref() == Some("none") {
+            return Err(ProfileArgError::PoolingNone(name));
+        }
+        if llamacpp::is_reserved(&name) && !pooling {
             return Err(ProfileArgError::Reserved(name));
         }
         let key = llamacpp::option_key(&name);

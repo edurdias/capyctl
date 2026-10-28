@@ -747,12 +747,20 @@ fn status(value: &Value, names: &HostNames) -> String {
         out.push_str(&line);
     }
     // ADR 0030 §1: a deployment serving decision models says so; chat, the
-    // default, adds no line.
+    // default, adds no line. ADR 0036 §1: an embeddings deployment adds its
+    // engine version's certification: `API     embeddings (certified)`.
     if let Some(api) = d["api"].as_str() {
         if !(d["engine"].is_string() || d["installation"].is_object() || d["parsers"].is_object()) {
             out.push('\n');
         }
-        out.push_str(&format!("API     {}\n", clean(api)));
+        match d["certification"].as_str() {
+            Some(certification) => out.push_str(&format!(
+                "API     {} ({})\n",
+                clean(api),
+                clean(certification)
+            )),
+            None => out.push_str(&format!("API     {}\n", clean(api))),
+        }
     }
     // ADR 0014 amendment A14: a hybrid model's state cache holds fewer
     // running requests than the deployment asked for.
@@ -1499,6 +1507,31 @@ mod tests {
         let engine = out.find("Engine").expect("the engine line");
         let api = out.find("API").expect("the api line");
         assert!(api > engine && out[api..].contains("decisions"), "{out}");
+    }
+
+    // T47 (ADR 0036 §1, §2): status names an embeddings deployment's API with
+    // its engine version's certification, and an instance's LMCache off
+    // with the embeddings reason where other reasons show.
+    #[test]
+    fn status_names_an_embeddings_api_and_its_certification() {
+        for certification in ["certified", "uncertified"] {
+            let d = json!({"name": "m", "observed_state": "ready", "api": "embeddings",
+                "certification": certification,
+                "installation": {"profile": "vllm", "version": "0.32.0",
+                    "executable": "/opt/vllm/bin/vllm"},
+                "instances": [{"index": 0, "observed_state": "ready",
+                    "lmcache": {"state": "off", "reason": "embeddings_unsupported",
+                        "message": "LMCache does not serve embedding models"}}]});
+            let out = render(View::Status, &d, &HostNames::new());
+            assert!(
+                out.contains(&format!("API     embeddings ({certification})\n")),
+                "{out}"
+            );
+            assert!(
+                out.contains("LMCache   instance 0 off: LMCache does not serve embedding models"),
+                "{out}"
+            );
+        }
     }
 
     // T44 T17 (ADR 0031 §6, SPEC §10 amended 2026-10-21): status says how

@@ -275,6 +275,7 @@ fn context<'a>(
 ) -> ExtraArgsContext<'a> {
     ExtraArgsContext {
         engine: Engine::Vllm,
+        api: capyctl_config::effective::DeploymentApi::Chat,
         sleep_mode: false,
         approved_options: approved,
         approved_paths: paths,

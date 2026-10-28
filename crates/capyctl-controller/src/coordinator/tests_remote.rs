@@ -554,6 +554,7 @@ impl crate::remote_readiness::ReadinessHosts for ScriptedReadiness {
             engine_log: None,
             probe_text: String::new(),
             probe_decision: None,
+            probe_embedding: None,
             lmcache: None,
         };
         Box::pin(async move { session.map(|s| (s, result)).ok_or(()) })
@@ -649,6 +650,7 @@ async fn host_session_loss_closes_dispatch_until_a_fresh_probe_passes() {
             owned_handle: launch.step_id.clone(),
             max_tokens: None,
             decision: false,
+            embedding: false,
         }
     );
     assert_eq!(probe.identity.expected_state, "ready");
@@ -1741,6 +1743,7 @@ async fn a_remote_cancelling_lease_settles_only_on_an_idle_sample_after_the_hang
             instance_index: 0,
             device_memory: false,
             decisions: false,
+            embeddings: false,
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,
@@ -1903,6 +1906,7 @@ async fn a_remote_cancelling_lease_settles_while_a_stop_drains() {
             instance_index: 0,
             device_memory: false,
             decisions: false,
+            embeddings: false,
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,

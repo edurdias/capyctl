@@ -70,7 +70,12 @@ impl LlamacppAdapter {
 
     /// ADR 0030 §3: whether readiness is the fixed decision probe.
     pub(super) fn decisions(&self) -> bool {
-        !self.api.is_chat()
+        self.api == capyctl_config::effective::DeploymentApi::Decisions
+    }
+
+    /// ADR 0036 §5: whether readiness is the fixed embedding probe.
+    pub(super) fn embeddings(&self) -> bool {
+        self.api == capyctl_config::effective::DeploymentApi::Embeddings
     }
 
     /// ADR 0029 §6: look for `etc/llama.cpp/config.ini` under `root` instead
@@ -226,32 +231,49 @@ impl EngineAdapter for LlamacppAdapter {
     }
 
     /// ADR 0030 §4: a decisions launch's canary is the fixed decision probe,
+    /// and ADR 0036 §6 an embeddings launch's the fixed embedding probe,
     /// observed when its answer arrived. llama.cpp never parks (ADR 0029
-    /// §10), so for a decisions launch only the reference at its first
-    /// readiness is ever asked; a chat launch has no canary.
+    /// §10), so only the reference at first readiness and the check after a
+    /// restart ever ask; a chat launch has no canary.
     async fn wake_canary(
         &self,
         _context: &capyctl_domain::completion::StepExecutionContext,
         _max_tokens: u32,
         bound: std::time::Duration,
     ) -> Result<crate::completion_probe::CanaryAnswer, RuntimeError> {
-        if !self.decisions() {
+        use crate::completion_probe::{CanaryAnswer, CanaryEvidence};
+        let answer = if self.decisions() {
+            CanaryEvidence::Decision(
+                self.http
+                    .decision_probe(&self.model_id, bound)
+                    .await
+                    .map_err(|e| {
+                        RuntimeError::Uncertain(format!(
+                            "llama.cpp did not answer the decision probe: {e}"
+                        ))
+                    })?,
+            )
+        } else if self.embeddings() {
+            CanaryEvidence::Embedding(
+                self.http
+                    .embedding_probe(&self.model_id, bound)
+                    .await
+                    .map_err(|e| {
+                        RuntimeError::Uncertain(format!(
+                            "llama.cpp did not answer the embedding probe: {e}"
+                        ))
+                    })?,
+            )
+        } else {
             return Err(RuntimeError::Unsupported);
-        }
-        let answer = self
-            .http
-            .decision_probe(&self.model_id, bound)
-            .await
-            .map_err(|e| {
-                RuntimeError::Uncertain(format!("llama.cpp did not answer the decision probe: {e}"))
-            })?;
+        };
         let observed_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
             .ok_or_else(|| RuntimeError::Uncertain("the clock is before the epoch".into()))?;
-        Ok(crate::completion_probe::CanaryAnswer {
-            answer: crate::completion_probe::CanaryEvidence::Decision(answer),
+        Ok(CanaryAnswer {
+            answer,
             observed_at_ms,
         })
     }
@@ -305,5 +327,25 @@ impl ChatForward for LlamacppAdapter {
         bound: std::time::Duration,
     ) -> Result<crate::decision_probe::DecisionAnswer, AdapterError> {
         self.http.decision_probe(served, bound).await
+    }
+
+    /// ADR 0036 §3-§4: an embeddings request through the launch's
+    /// forwarder, streamed with its incremental checks.
+    async fn forward_embedding(
+        &self,
+        body: &serde_json::Value,
+        sink: &mut dyn crate::traits::EmbeddingSink,
+    ) -> Result<crate::traits::EmbeddingAnswered, AdapterError> {
+        self.forward.forward_embedding(body, sink).await
+    }
+
+    /// ADR 0036 §5: the fixed embedding on the loopback endpoint, with no
+    /// key (ADR 0029 §4).
+    async fn embedding_probe(
+        &self,
+        served: &str,
+        bound: std::time::Duration,
+    ) -> Result<crate::embedding_probe::EmbeddingAnswer, AdapterError> {
+        self.http.embedding_probe(served, bound).await
     }
 }

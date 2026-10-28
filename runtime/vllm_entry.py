@@ -61,6 +61,10 @@ RESERVED = (
     "log_config_file", "uvicorn_log_level", "disable_uvicorn_access_log",
     "distributed_executor_backend", "headless", "api_server_count", "revision",
     "code_revision", "enable_ssl_refresh", "config", "grpc",
+    # ADR 0036 §2: capyctl renders `--runner pooling` on an embeddings
+    # deployment and nothing on any other; vLLM picks the conversion itself.
+    # Both are defined in 0.29.0 through 0.32.0.
+    "runner", "convert",
 )
 # SPEC §8.2 / T21: multi-node rendezvous (0.26+ `ParallelConfig`). Compared
 # whenever the installed parser defines them; unlike RESERVED, a build without

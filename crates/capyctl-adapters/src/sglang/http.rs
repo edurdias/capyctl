@@ -230,6 +230,23 @@ impl ControlHttp {
         .await
     }
 
+    /// ADR 0036 §5: the fixed embedding probe, `POST /v1/embeddings`, on
+    /// this engine's loopback endpoint with its inference key, answering the
+    /// served model.
+    pub(super) async fn embedding_probe(
+        &self,
+        bound: Duration,
+    ) -> Result<crate::embedding_probe::EmbeddingAnswer, AdapterError> {
+        crate::embedding_probe::probe(
+            &self.client,
+            &self.base,
+            Some(&self.inference),
+            &self.model,
+            bound,
+        )
+        .await
+    }
+
     /// ADR 0032 §3: ask the engine to abort request `rid`, `POST
     /// /abort_request` with `{"rid": rid}` on this engine's loopback endpoint
     /// with its admin key (SGLang 0.5.22 guards the route `ADMIN_OPTIONAL`,

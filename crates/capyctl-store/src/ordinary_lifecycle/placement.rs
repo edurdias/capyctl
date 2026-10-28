@@ -250,7 +250,9 @@ pub(super) fn candidates(
             },
         };
         // ADR 0030 §1: a decisions revision is placed only on a host that
-        // declared `decisions` (ADR 0017), as its latest session recorded it;
+        // declared `decisions` (ADR 0017), and ADR 0036 §1 an embeddings
+        // revision only on one that declared `embeddings`, as its latest
+        // session recorded it;
         // the live session's own declaration still gates the launch before
         // anything is sent. The embedded host is this build and serves them.
         // ADR 0031 §9: likewise a revision on a custom engine needs
@@ -264,7 +266,7 @@ pub(super) fn candidates(
                 |r| r.get::<_, bool>(0),
             )
         };
-        let serves_api = (e.api.is_chat() || declared(capyctl_config::decisions::HOST_CAPABILITY)?)
+        let serves_api = api_capability(e.api).map_or(Ok(true), declared)?
             && (e.profile.engine != capyctl_config::engine_policy::Engine::Custom
                 || declared(capyctl_config::custom::CAPABILITY)?);
         // ADR 0033 §§9, 10, 13: `lmcache: required` and `retention: zero`
@@ -1150,4 +1152,33 @@ pub(crate) fn bounded_deadline(
 ) -> Result<i64, LifecycleError> {
     let (_, e) = effective(tx, fence)?;
     Ok(deadline.min(now.saturating_add(e.request_deadline_ms)))
+}
+
+/// The host capability a revision's API needs to be placed (ADR 0030 §1,
+/// ADR 0036 §1); chat needs none.
+fn api_capability(api: capyctl_config::effective::DeploymentApi) -> Option<&'static str> {
+    use capyctl_config::effective::DeploymentApi;
+    match api {
+        DeploymentApi::Chat => None,
+        DeploymentApi::Decisions => Some(capyctl_config::decisions::HOST_CAPABILITY),
+        DeploymentApi::Embeddings => Some(capyctl_config::embeddings::HOST_CAPABILITY),
+    }
+}
+
+#[cfg(test)]
+mod api_capability_tests {
+    use super::api_capability;
+    use capyctl_config::effective::DeploymentApi;
+
+    // T47 (ADR 0036 §1): an embeddings revision is placed only on a host
+    // that declared `embeddings`, not one that declared only `decisions`.
+    #[test]
+    fn each_api_needs_its_own_host_capability() {
+        assert_eq!(api_capability(DeploymentApi::Chat), None);
+        assert_eq!(api_capability(DeploymentApi::Decisions), Some("decisions"));
+        assert_eq!(
+            api_capability(DeploymentApi::Embeddings),
+            Some("embeddings")
+        );
+    }
 }

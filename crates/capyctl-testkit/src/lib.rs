@@ -28,7 +28,10 @@ pub mod ports;
 mod provider;
 mod scripted_tool;
 
-pub use fake_engine::{FakeEngine, BUFFER_RESIDUE, FULL_RESIDENT_BYTES, LEVEL1_RETAINED_BYTES};
+pub use fake_engine::{
+    EmbeddingFault, FakeEmbeddings, FakeEngine, BUFFER_RESIDUE, FULL_RESIDENT_BYTES,
+    LEVEL1_RETAINED_BYTES,
+};
 pub use fake_group::{FakeGroup, JournalState, RankEnd};
 pub use fake_launcher::FakeLauncher;
 pub use held_engine::HeldEngine;

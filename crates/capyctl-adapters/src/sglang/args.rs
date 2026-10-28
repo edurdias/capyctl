@@ -200,6 +200,16 @@ impl SglangLaunch {
         Ok(self)
     }
 
+    /// ADR 0036 §2: an embeddings deployment's launch, a public setting
+    /// (`is_embedding`, always `true`) the entry validates and renders as the
+    /// reserved `is_embedding=True`, pinned after SGLang resolved its
+    /// arguments. Absent, the entry keeps the constant pin off, so no extra
+    /// argument makes a chat launch an embedding server.
+    pub fn with_embedding(mut self) -> Self {
+        self.public["settings"]["is_embedding"] = json!(true);
+        self
+    }
+
     /// The final launcher substitutes three distinct protected descriptor numbers
     /// (for a group worker, the private launch descriptor and, when deep, its
     /// observation credential) only after resolving the private frozen inputs

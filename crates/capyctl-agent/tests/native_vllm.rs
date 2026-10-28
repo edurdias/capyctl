@@ -882,6 +882,7 @@ impl Fixture {
                 owned_handle: "launch".into(),
                 max_tokens: None,
                 decision: false,
+                embedding: false,
             },
         })
     }
@@ -983,6 +984,7 @@ async fn a_restarted_host_serves_again_only_after_a_fresh_probe() {
         owned_handle: "never-launched".into(),
         max_tokens: None,
         decision: false,
+        embedding: false,
     };
     let unknown = sign(unknown);
     let nothing = host

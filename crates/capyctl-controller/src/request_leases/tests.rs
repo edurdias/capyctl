@@ -323,6 +323,64 @@ async fn closing_as_cancelling_keeps_the_lease_charged() {
     );
 }
 
+// T47 T17 (ADR 0036 §4): a cut embeddings request cancelled before the engine
+// answered becomes answered when its complete error answer is read, and then
+// the engine's idle reading settles it; a lease never cancelled, already
+// settled, or unknown is left alone.
+#[tokio::test]
+async fn answering_a_cut_lets_the_idle_reading_settle_it() {
+    let f = fixture();
+    // Fixture-only binding: production records it from launch evidence.
+    rusqlite::Connection::open(&f.path)
+        .unwrap()
+        .execute(
+            "INSERT INTO runtime_bindings(id,deployment_id,revision,incarnation,ownership,binding_json,identities_json,state,instance_index) VALUES('binding-a',?1,1,'incarnation-a','managed','{}','[]','live',0)",
+            [&f.deployment],
+        )
+        .unwrap();
+    let writer = RequestLeaseWriter::spawn(f.backend(Default::default()));
+    let cut = writer.open(&f.deployment, 8).await.unwrap();
+    let live = writer.open(&f.deployment, 8).await.unwrap();
+    let cut_id = cut.id().to_owned();
+    writer
+        .close(cut, LeaseEnd::Cancelling { answered: false })
+        .await
+        .unwrap();
+    assert!(
+        !writer.answer_cut(live.id()).await.unwrap(),
+        "never cancelled"
+    );
+    assert!(!writer
+        .answer_cut("01K00000000000000000000X99")
+        .await
+        .unwrap());
+    assert!(f
+        .store
+        .lock()
+        .unwrap()
+        .cancelling_bindings(&f.session)
+        .unwrap()
+        .is_empty());
+    assert!(writer.answer_cut(&cut_id).await.unwrap());
+    {
+        let store = f.store.lock().unwrap();
+        let cancelling = store.cancelling_bindings(&f.session).unwrap();
+        assert_eq!(cancelling.len(), 1);
+        assert_eq!(cancelling[0].leases, 1);
+        assert_eq!(
+            store
+                .settle_cancelled_leases(&f.session, "binding-a", i64::MAX, "r")
+                .unwrap(),
+            1
+        );
+    }
+    assert!(
+        !writer.answer_cut(&cut_id).await.unwrap(),
+        "already settled"
+    );
+    assert_eq!(f.leases().len(), 1);
+}
+
 // T17 T19, SPEC §10: the writer sent the grant, but the caller's future was
 // dropped before it polled the reply (a client disconnect while the answer
 // was in flight). The ticket never reached the router, so its lease is closed

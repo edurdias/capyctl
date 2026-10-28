@@ -653,6 +653,13 @@ message ExecuteMember {
   // retained launch, on loopback with the launch's own key, and answers in
   // `MemberExecutionResult.probe_decision`. False encodes exactly as before.
   bool probe_decision = 18;
+  // ADR 0036 §§5, 6, ADR 0017 (additive): with `probe_owned_handle` only, and
+  // never with `probe_max_tokens` or `probe_decision`, the embedding probe of
+  // an embeddings launch. The host sends the fixed `/v1/embeddings` probe
+  // request to the retained launch, on loopback with the launch's own key,
+  // and answers in `MemberExecutionResult.probe_embedding`. Sent only to a
+  // host whose Connect declared `embeddings`. False encodes exactly as before.
+  bool probe_embedding = 20;
 }
 // ADR 0030 §4 (additive): one option's probability in a decision probe's answer.
 message DecisionProbability {
@@ -664,6 +671,12 @@ message DecisionProbeEvidence {
   uint32 probe_version = 1;
   string choice = 2;
   repeated DecisionProbability probabilities = 3;
+}
+// ADR 0036 §§5, 6 (additive): the answer to the fixed embedding probe: the
+// probe's version and the vector, whose length is the native dimension.
+message EmbeddingProbeEvidence {
+  uint32 probe_version = 1;
+  repeated float vector = 2;
 }
 // ADR 0016: one process identity as the server recorded it.
 message RecordedProcess {
@@ -774,6 +787,10 @@ message MemberExecutionResult {
   // ADR 0033 §§8, 9 (additive): LaunchSingle and Restore results only, what
   // became of the launch's LMCache. Absent otherwise and from an older host.
   LaunchLmcacheReport lmcache = 21;
+  // ADR 0036 §§5, 6 (additive): a completed embedding probe only, the vector
+  // it returned. Absent otherwise and from an older host, which encodes
+  // exactly as before.
+  EmbeddingProbeEvidence probe_embedding = 22;
 }
 // ADR 0033 §§3, 8, 9: `on` names the server's ports and pool; `off` names a
 // closed reason and its detail (at most 2048 bytes: the redacted engine log

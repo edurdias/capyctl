@@ -271,6 +271,8 @@ pub fn plan_from_effective(
         // the launch builder attaches the state (`AdapterSpec::Vllm.lmcache`).
         kv_transfer_config: None,
         lmcache: None,
+        // ADR 0036 §2: an embeddings deployment renders the pooling runner.
+        api: effective.api,
     })
 }
 

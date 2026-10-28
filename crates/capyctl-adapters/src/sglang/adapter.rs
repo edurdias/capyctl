@@ -287,7 +287,13 @@ impl SglangAdapter {
 
     /// ADR 0030 §3: whether readiness is the fixed decision probe.
     pub(super) fn decisions(&self) -> bool {
-        !self.api.is_chat()
+        self.api == capyctl_config::effective::DeploymentApi::Decisions
+    }
+
+    /// ADR 0036 §2, §5: whether this launch is an embedding server, made
+    /// ready and checked after a wake by the fixed embedding probe alone.
+    pub(super) fn embeddings(&self) -> bool {
+        self.api == capyctl_config::effective::DeploymentApi::Embeddings
     }
 
     /// SPEC §9.2: the host's private directory (0700, service-owned) where a
@@ -570,7 +576,12 @@ impl SglangAdapter {
         let (Some(launch), Some(tools)) = (&self.launch, &self.tools) else {
             return Err(RuntimeError::Unsupported);
         };
-        let rendered = SglangLaunch::from_frozen(launch)?;
+        let mut rendered = SglangLaunch::from_frozen(launch)?;
+        // ADR 0036 §2: an embeddings deployment launches SGLang as an
+        // embedding server, the launch and a restart-park's wake alike.
+        if self.embeddings() {
+            rendered = rendered.with_embedding();
+        }
         let credentials = if rendered.is_group_worker() {
             LaunchCredentials::Worker {
                 observation: match (rendered.worker_observes(), &self.observation_credential) {
@@ -712,6 +723,12 @@ impl SglangAdapter {
                 // ADR 0030 §3, SPEC §6.1: a decisions launch is usable after
                 // a wake only on the fixed decision, never a chat answer.
                 http.decision_probe(timeout)
+                    .await
+                    .map_err(|_| uncertain())?;
+            } else if command.action == RuntimeAction::Probe && self.embeddings() {
+                // ADR 0036 §5, §7.2: an embeddings launch is usable after a
+                // wake only on the fixed embedding, never a generation.
+                http.embedding_probe(timeout)
                     .await
                     .map_err(|_| uncertain())?;
             } else {
@@ -932,7 +949,8 @@ impl EngineAdapter for SglangAdapter {
     /// Owner decision 2026-10-09: the wake canary of an embedded launch, the
     /// completion probe on this engine's own loopback endpoint and key,
     /// observed when its answer arrived. ADR 0030 §4: a decisions launch's
-    /// canary is the fixed decision probe instead, and it never answers
+    /// canary is the fixed decision probe instead, and ADR 0036 §6 an
+    /// embeddings launch's the fixed embedding probe; neither ever answers
     /// `Unsupported` (that would pass a wake unchecked).
     async fn wake_canary(
         &self,
@@ -949,6 +967,17 @@ impl EngineAdapter for SglangAdapter {
                 }),
                 Err(e) => Err(RuntimeError::Uncertain(format!(
                     "SGLang did not answer the decision probe: {e}"
+                ))),
+            };
+        }
+        if self.embeddings() {
+            return match ChatForward::embedding_probe(self, &self.served_name, bound).await {
+                Ok(answer) => Ok(CanaryAnswer {
+                    answer: CanaryEvidence::Embedding(answer),
+                    observed_at_ms: clock_ms()?,
+                }),
+                Err(e) => Err(RuntimeError::Uncertain(format!(
+                    "SGLang did not answer the embedding probe: {e}"
                 ))),
             };
         }

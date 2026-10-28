@@ -136,6 +136,15 @@ fn group_codes_are_documented_with_their_exit_code() {
             "host_capability_missing:decisions",
             "host_capability_missing:decisions",
         ),
+        // T47 (ADR 0036 §1).
+        (
+            "capability_missing:embeddings",
+            "capability_missing:embeddings",
+        ),
+        (
+            "host_capability_missing:embeddings",
+            "host_capability_missing:embeddings",
+        ),
         // T45 (ADR 0033 §14).
         (
             "lmcache_unavailable:<reason>",

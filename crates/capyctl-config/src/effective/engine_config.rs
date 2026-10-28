@@ -727,6 +727,8 @@ fn device_request_from_weights(
 /// Everything besides the block itself that resolution needs.
 pub(super) struct EngineInputs<'a> {
     pub(super) engine: Engine,
+    /// ADR 0036 §2: the API, which decides llama.cpp's `--pooling`.
+    pub(super) api: DeploymentApi,
     pub(super) residency: Residency,
     pub(super) security: &'a Security,
     pub(super) profile_args: &'a [String],
@@ -1635,6 +1637,7 @@ pub(super) fn normalize_engine_config(
             &extra_args,
             &ExtraArgsContext {
                 engine,
+                api: inputs.api,
                 sleep_mode: engine == Engine::Vllm && sleep_mode,
                 approved_options: &approved_options,
                 approved_paths: &approved_paths,

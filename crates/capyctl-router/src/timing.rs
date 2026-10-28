@@ -324,6 +324,22 @@ impl RequestTiming {
         );
     }
 
+    /// ADR 0036 §9: an embeddings answer passed its last check. Stamp the
+    /// total and record the request as a decision's phases are, but without
+    /// a time to first content or to the last chunk, which have no meaning
+    /// for an answer that is not a stream of tokens. Returns the time from
+    /// the forward to the whole answer, for its `time_to_response_ms`.
+    pub(crate) fn finish_answer(&mut self) -> Option<Duration> {
+        let to_response = self
+            .phases
+            .pre_forward
+            .and_then(|sent| self.received.elapsed().checked_sub(sent));
+        self.phases.time_to_first_content = None;
+        self.phases.time_to_last_chunk = None;
+        self.finish();
+        to_response
+    }
+
     /// Whether this request's timings go on its response.
     pub(crate) fn header_enabled(&self) -> bool {
         self.recorder.as_ref().is_some_and(|r| r.timing_header())

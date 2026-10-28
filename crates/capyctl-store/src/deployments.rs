@@ -82,6 +82,8 @@ fn api_column(
     match value.as_deref() {
         None | Some("chat") => Ok(DeploymentApi::Chat),
         Some("decisions") => Ok(DeploymentApi::Decisions),
+        // ADR 0036 §1.
+        Some("embeddings") => Ok(DeploymentApi::Embeddings),
         Some(_) => Err(invalid_column("api")),
     }
 }
@@ -1306,7 +1308,9 @@ mod tests {
                  INSERT INTO deployment_routes(route,deployment_id) VALUES('r',  '{id}');
                  INSERT INTO effective_revisions VALUES('{id}',1,'{{\"api\":\"decisions\"}}','f1'),
                                                        ('{id}',2,'{{\"name\":\"chat\"}}','f2'),
-                                                       ('{id}',3,'not json','f3');"
+                                                       ('{id}',3,'not json','f3'),
+                                                       ('{id}',4,'{{\"api\":\"embeddings\"}}','f4'),
+                                                       ('{id}',5,'{{\"api\":\"bogus\"}}','f5');"
             ))
             .unwrap();
         let api = |store: &Store| {
@@ -1317,7 +1321,12 @@ mod tests {
             api
         };
         assert_eq!(api(&store), DeploymentApi::Decisions);
-        for (revision, expected) in [(2, DeploymentApi::Chat), (3, DeploymentApi::Chat)] {
+        // T47 (ADR 0036 §1): an embeddings revision reads as embeddings.
+        for (revision, expected) in [
+            (2, DeploymentApi::Chat),
+            (3, DeploymentApi::Chat),
+            (4, DeploymentApi::Embeddings),
+        ] {
             store
                 .conn
                 .execute(
@@ -1327,6 +1336,12 @@ mod tests {
                 .unwrap();
             assert_eq!(api(&store), expected, "revision {revision}");
         }
+        // A value no revision can carry is corruption, never chat.
+        store
+            .conn
+            .execute("UPDATE deployments SET revision=5 WHERE id=?1", params![id])
+            .unwrap();
+        assert!(store.deployment_api(&id).is_err());
         assert_eq!(store.deployment_api("absent").unwrap(), None);
     }
 

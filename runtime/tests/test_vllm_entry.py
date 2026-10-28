@@ -96,6 +96,9 @@ def _fake_parser(drop=(), nested=False, grpc_port=False):
     option("--enable-ssl-refresh", action="store_true")
     option("--config", default=None)
     option("--grpc", action="store_true")
+    # ADR 0036 §2: vLLM's pooling runner and conversion (0.29.0 to 0.32.0).
+    option("--runner", default="auto")
+    option("--convert", default="auto")
     option("--ssl-keyfile", default=None)
     option("--ssl-ciphers", default=None)
     option("--data-parallel-size", "-dp", type=int, default=1)
@@ -239,7 +242,9 @@ class ResolveTests(unittest.TestCase):
                      ["--revision", "main"], ["--distributed-executor-backend", "ray"],
                      ["--enable-log-requests"], ["--enable-log-req"],
                      ["--enable-log-outputs"], ["--enable-log-o"],
-                     ["--uvicorn-log-level", "debug"]):
+                     ["--uvicorn-log-level", "debug"],
+                     # T47 (ADR 0036 §2): no deployment picks the runner.
+                     ["--runner", "pooling"], ["--convert", "embed"]):
             with self.subTest(user=user):
                 self.refused(user)
 

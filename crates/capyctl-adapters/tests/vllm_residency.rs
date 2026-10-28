@@ -227,10 +227,35 @@ async fn systemone(State(engine): State<Shared>, headers: HeaderMap) -> axum::re
     .into_response()
 }
 
+/// ADR 0036 §5: `/v1/embeddings` on a pooling server, answering the fixed
+/// embedding only when awake with its weights reloaded, as the chat surface
+/// does.
+async fn embeddings(State(engine): State<Shared>, headers: HeaderMap) -> axum::response::Response {
+    if !keyed(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Err(status) = record(&engine, "embedding") {
+        return status.into_response();
+    }
+    {
+        let e = engine.lock().unwrap();
+        if e.sleeping || (e.weights_awake && !e.weights_loaded) {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    Json(json!({
+        "object": "list", "model": "m",
+        "data": [{"object": "embedding", "index": 0, "embedding": [0.6, 0.8]}],
+        "usage": {"prompt_tokens": 17, "total_tokens": 17}
+    }))
+    .into_response()
+}
+
 async fn serve(engine: Shared) -> u16 {
     let app = axum::Router::new()
         .route("/v1/chat/completions", post(chat))
         .route("/v1/systemone", post(systemone))
+        .route("/v1/embeddings", post(embeddings))
         .route("/sleep", post(sleep))
         .route("/wake_up", post(wake))
         .route("/collective_rpc", post(collective))
@@ -607,6 +632,30 @@ async fn a_woken_decisions_launch_is_proven_by_the_fixed_decision() {
     let calls = engine.lock().unwrap().calls.clone();
     assert_eq!(calls.last().map(String::as_str), Some("decision"));
     assert!(!calls.contains(&"chat".to_string()), "{calls:?}");
+}
+
+/// ADR 0036 §5, §7.2: an embeddings launch parks deep on vLLM, and once
+/// woken it is proven usable by the fixed embedding, never by a chat answer.
+// T47 T20
+#[tokio::test]
+async fn a_woken_embeddings_launch_is_proven_by_the_fixed_embedding() {
+    let engine = Shared::default();
+    let port = serve(engine.clone()).await;
+    let vllm = adapter(port, ParkPolicy::Enabled)
+        .with_api(capyctl_config::effective::DeploymentApi::Embeddings);
+    for (action, id) in [
+        (RuntimeAction::Park, "p"),
+        (RuntimeAction::Restore, "w"),
+        (RuntimeAction::ReloadWeights, "r"),
+        (RuntimeAction::InvalidateCache, "c"),
+        (RuntimeAction::Probe, "probe"),
+    ] {
+        vllm.execute_persisted(&step(action, id)).await.unwrap();
+    }
+    let calls = engine.lock().unwrap().calls.clone();
+    assert_eq!(calls.last().map(String::as_str), Some("embedding"));
+    assert!(!calls.contains(&"chat".to_string()), "{calls:?}");
+    assert!(!calls.contains(&"decision".to_string()), "{calls:?}");
 }
 
 /// Discrete GPU design §5 (ADR 0010): a `host_backed` deployment parks at
