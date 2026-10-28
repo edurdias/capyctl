@@ -46,6 +46,12 @@ const MANAGEMENT_CODES = [
   'forbidden',
   'observation_stale',
   'snapshot_unavailable',
+  // ADR 0040 §§10, 11: host administration (crates/capyctl-agent/src/host_admin.rs).
+  'host_capability_missing:host_admin',
+  'host_upgrade_required',
+  'outcome_unknown',
+  'confirmation_stale',
+  'agent_unreachable',
 ];
 
 // Every code the router envelope carries (crates/capyctl-router/src/chat.rs).

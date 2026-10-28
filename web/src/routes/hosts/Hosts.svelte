@@ -2,9 +2,10 @@
   import { onMount } from 'svelte';
   import HostCard from '../../components/HostCard.svelte';
   import { livePoll } from '../../lib/poll';
-  import { readHosts, type HostRow } from '../../lib/reads';
+  import { readHosts, readRoleKind, type HostRow, type RoleKind } from '../../lib/reads';
   import { route } from '../../lib/router';
   import HostDetail from './HostDetail.svelte';
+  import Invitation from './Invitation.svelte';
 
   // `/hosts` and `/hosts/<host id>`.
   const id = $derived(decodeURIComponent($route.split('/')[2] ?? ''));
@@ -17,6 +18,15 @@
       }
     }, 5000),
   );
+
+  // SPEC R26: a standalone role has one host and no invitations.
+  let role = $state<RoleKind | null>(null);
+  onMount(() => {
+    readRoleKind().then(
+      (kind) => (role = kind),
+      () => {},
+    );
+  });
 </script>
 
 {#if id !== ''}
@@ -34,6 +44,9 @@
           <HostCard {host} />
         {/each}
       </div>
+    {/if}
+    {#if role === 'server'}
+      <Invitation />
     {/if}
   </section>
 {/if}

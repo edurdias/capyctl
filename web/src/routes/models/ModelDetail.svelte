@@ -132,6 +132,8 @@
     <div class="title">
       <h1>{deployment.name}</h1>
       <StateBadge state={deployment.observed_state} suspended={deployment.suspended} />
+      <!-- SPEC R23 -->
+      <a href={href(`/models/${deployment.id}/edit`)} use:link>Edit</a>
     </div>
     <ActionBar {deployment} />
 

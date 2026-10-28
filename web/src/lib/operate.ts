@@ -28,10 +28,14 @@ export interface Attempt {
 const LEGACY_WINDOW_MS = 900_000;
 const DRAIN_WINDOW_MS = 900_000;
 
+// What an action needs from a deployment. A model just added has no snapshot
+// entry yet, only its id and revision, and takes the CLI's default windows.
+export type ActionTarget = Pick<DeploymentSnapshot, 'id' | 'revision'> & Partial<Pick<DeploymentSnapshot, 'timeouts'>>;
+
 // ADR 0014 amendment A1, as client.rs `window` computes it: a start takes the
 // Initialize window, a preinitialize the request deadline, anything else the
 // Stop window.
-function windowMs(deployment: DeploymentSnapshot, action: HintedAction): number {
+function windowMs(deployment: ActionTarget, action: HintedAction): number {
   const windows = deployment.timeouts;
   if (action === 'preinitialize') {
     return windows?.request_deadline_ms ?? LEGACY_WINDOW_MS;
@@ -42,7 +46,7 @@ function windowMs(deployment: DeploymentSnapshot, action: HintedAction): number 
   return windows?.stop_ms ?? LEGACY_WINDOW_MS;
 }
 
-function actionBody(deployment: DeploymentSnapshot, action: HintedAction, evict: boolean): ActionBody {
+function actionBody(deployment: ActionTarget, action: HintedAction, evict: boolean): ActionBody {
   const body: ActionBody = {
     action,
     expected_revision: Number(deployment.revision),
@@ -57,7 +61,7 @@ function actionBody(deployment: DeploymentSnapshot, action: HintedAction, evict:
 
 const DEPLOYMENTS = '/management/v1/deployments';
 
-export function deploymentAttempt(deployment: DeploymentSnapshot, action: HintedAction, evict = false): Attempt {
+export function deploymentAttempt(deployment: ActionTarget, action: HintedAction, evict = false): Attempt {
   return {
     path: `${DEPLOYMENTS}/${encodeURIComponent(deployment.id)}/actions`,
     body: actionBody(deployment, action, evict),

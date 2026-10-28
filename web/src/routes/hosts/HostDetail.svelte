@@ -3,6 +3,8 @@
   import HostActions from '../../components/HostActions.svelte';
   import HostCard from '../../components/HostCard.svelte';
   import StateBadge from '../../components/StateBadge.svelte';
+  import HostConfig from './HostConfig.svelte';
+  import ModelCopies from './ModelCopies.svelte';
   import { livePoll } from '../../lib/poll';
   import { readEngines, readHosts, readRoleKind, type EngineRow, type HostRow, type RoleKind } from '../../lib/reads';
   import { href, link } from '../../lib/router';
@@ -83,6 +85,9 @@
         {/each}
       </ul>
     {/if}
+
+    <ModelCopies host={host.host_id} />
+    <HostConfig host={host.host_id} />
   </section>
 {/if}
 

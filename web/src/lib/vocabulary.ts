@@ -199,6 +199,27 @@ export const MANAGEMENT_REFUSALS: Record<string, Refusal> = {
     reason: 'CapyCTL could not read its current state.',
     action: 'Wait a moment and try again.',
   },
+  // ADR 0040 §§10, 11: host administration.
+  'host_capability_missing:host_admin': {
+    reason: 'This host runs an older CapyCTL that cannot be managed from here.',
+    action: 'Update CapyCTL on the host and restart it, then try again.',
+  },
+  host_upgrade_required: {
+    reason: 'This host runs a CapyCTL too old to talk to this server.',
+    action: 'Update CapyCTL on the host and restart it, then try again.',
+  },
+  outcome_unknown: {
+    reason: 'The host disconnected before it answered, so the change may or may not have happened.',
+    action: 'Check the host’s engines list once it reconnects before trying again.',
+  },
+  confirmation_stale: {
+    reason: 'The engine changed on the host after you reviewed it.',
+    action: 'Review the new command below and confirm again.',
+  },
+  agent_unreachable: {
+    reason: 'CapyCTL could not reach the role on the host, so the outcome is unknown.',
+    action: 'Check the host’s engines list before trying again.',
+  },
 };
 
 // Every code the router envelope carries today
@@ -302,3 +323,10 @@ export function describeRefusal(error: { code: string | null; message: string; e
   }
   return { reason: error.message || 'CapyCTL refused the request.', action: null, details: error.message };
 }
+
+// ADR 0040 §9: why a fit check could not decide, in guide wording.
+export const UNKNOWN_FIT_REASONS: Record<string, string> = {
+  host_offline: 'The host is not connected, so CapyCTL cannot tell whether the model fits.',
+  no_observations: 'The host has not reported its memory yet, so CapyCTL cannot tell whether the model fits.',
+  weights_unknown: 'The model’s size is not known until it is measured on the host, so CapyCTL cannot tell whether it fits.',
+};
