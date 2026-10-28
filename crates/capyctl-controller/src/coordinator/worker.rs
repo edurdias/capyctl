@@ -287,6 +287,9 @@ struct Shared {
     /// ADR 0028 §11 (decided 2026-10-06): the request-stall probes running
     /// now, one per group generation, which concurrent reports share.
     stalls: crate::group_stall::StallChecks,
+    /// ADR 0037 §4: the activation traces the worker's steps hang under, and
+    /// the role's tracing (off until the lifecycle authority sets it).
+    traces: crate::activation_trace::ActivationTraces,
     // Drop retained adapters and queues before releasing process ownership.
     owner: SharedCoordinatorState,
 }
@@ -465,6 +468,12 @@ impl CoordinatorCommands {
     /// now, which concurrent reports for one group generation share.
     pub(crate) fn stall_checks(&self) -> &crate::group_stall::StallChecks {
         &self.shared.stalls
+    }
+
+    /// ADR 0037 §4: the activation traces this coordinator's steps hang
+    /// under, shared with the lifecycle authority and the switcher.
+    pub fn traces(&self) -> &crate::activation_trace::ActivationTraces {
+        &self.shared.traces
     }
 
     /// ADR 0028 §11: the group at `generation` stalled and failed its head
@@ -1971,6 +1980,7 @@ impl OwnedCoordinator {
             options,
             groups,
             stalls: Default::default(),
+            traces: Default::default(),
         });
         let (stop, stop_rx) = watch::channel(false);
         let (status_tx, status) = watch::channel(WorkerStatus::Running);
@@ -2690,6 +2700,33 @@ fn per_gpu_peak(processes: &[&ProcessResident]) -> Option<i64> {
     Some(per_gpu.into_values().max().unwrap_or(0))
 }
 
+/// ADR 0037 §5: a failed lifecycle effect's closed code, never its text (a
+/// host's refusal or an engine's summary may quote what it was given).
+fn runtime_code(error: &RuntimeError) -> &'static str {
+    match error {
+        RuntimeError::Missing => "runtime_missing",
+        RuntimeError::StaleRevision => "stale_revision",
+        RuntimeError::Unsupported => "unsupported",
+        RuntimeError::Uncertain(_) => "uncertain",
+        RuntimeError::Refused(_) => "refused",
+        RuntimeError::LaunchFailed(_) => "launch_failed",
+        RuntimeError::ReloadFailed(_) => crate::wake_canary::WAKE_RELOAD_FAILED,
+    }
+}
+
+/// ADR 0037 §5: a failed step's closed code, never the error's text.
+pub(super) fn step_code(error: &CoordinatorError) -> &'static str {
+    match error {
+        CoordinatorError::Stopped(_) => "stopped",
+        CoordinatorError::Paused(_) => "paused",
+        CoordinatorError::Busy => "busy",
+        CoordinatorError::CallerTimeout => "caller_timeout",
+        CoordinatorError::Service(_) => "service_failed",
+        CoordinatorError::Invalid => "invalid",
+        CoordinatorError::Deferred(_) => "deferred",
+    }
+}
+
 async fn drive(
     shared: &Arc<Shared>,
     work: &InitializeWork,
@@ -2697,7 +2734,12 @@ async fn drive(
     factory: &DriverFactory,
     stop: &mut watch::Receiver<bool>,
     contended: &AtomicBool,
+    trace: &crate::activation_trace::StepParent,
 ) -> Result<(), CoordinatorError> {
+    // ADR 0037 §4: `capyctl.reserve` is the start's admission: the host's
+    // fresh observation, reclaiming parked instances, and the armed
+    // reservation. A step left by an early return ends failed.
+    let reserve = trace.step(capyctl_trace::Name::Reserve);
     let bound = remaining(shared, work.deadline_ms())?;
     let (observed, residents) = tokio::select! {
         biased;
@@ -2765,6 +2807,7 @@ async fn drive(
         })
         .await?
     {
+        reserve.fail("deferred");
         return Err(CoordinatorError::Deferred(reason));
     }
     let arm_observed = observed.clone();
@@ -2793,6 +2836,7 @@ async fn drive(
             "recorded arm is not replay permission".into(),
         ));
     }
+    reserve.completed();
     // The immutable runtime survives completion and dropped observers. Cleanup
     // must establish durable release authority before removing it.
     if shared
@@ -2882,19 +2926,27 @@ async fn drive(
     };
     // No child task is spawned: timeout/cancellation drops this effect future
     // before recording uncertainty, so an effect task cannot outlive ownership.
+    // ADR 0037 §4, §6: `capyctl.launch` is the engine's start; a remote
+    // host's launch command carries its context.
+    let launch = trace.step(capyctl_trace::Name::Launch);
     let observation = tokio::select! {
         biased;
         _ = stop.changed() => return Err(CoordinatorError::Stopped("shutdown during Initialize".into())),
-        result = tokio::time::timeout(bound, driver.engine.execute_persisted(&command)) => result.map_err(|_| CoordinatorError::Service("Initialize timeout".into()))?.map_err(|e| CoordinatorError::Service(e.to_string()))?,
+        result = crate::activation_trace::within(launch.cx(), tokio::time::timeout(bound, driver.engine.execute_persisted(&command))) => result.map_err(|_| CoordinatorError::Service("Initialize timeout".into()))?.map_err(|e| CoordinatorError::Service(e.to_string()))?,
         _ = sampling => unreachable!("sampling never ends"),
     };
+    launch.completed();
+    // ADR 0037 §4: `capyctl.readiness` is the launch's readiness proved and
+    // recorded: its ranks and listeners checked, the owned launch and the
+    // step's completion to Ready recorded.
+    let readiness = trace.step(capyctl_trace::Name::Readiness);
     // ADR 0035 §§5, 6: on several GPUs, the ranks are named and the
     // listeners checked before anything is recorded; a failure here is a
     // failed launch, stopped and settled on gone evidence.
     let observation = tokio::select! {
         biased;
         _ = stop.changed() => return Err(CoordinatorError::Stopped("shutdown during Initialize".into())),
-        result = local_ranks::at_readiness(shared, work, source, &driver, observation) => result?,
+        result = crate::activation_trace::within(readiness.cx(), local_ranks::at_readiness(shared, work, source, &driver, observation)) => result?,
     };
     let step = work.step_id().to_owned();
     let receipt = OwnedLaunchReceipt {
@@ -2969,6 +3021,7 @@ async fn drive(
             Ok(())
         })
         .await?;
+    readiness.completed();
     // Owner decision 2026-10-09: the launch's wake canary reference, recorded
     // at its first readiness. A probe that fails records nothing and the
     // launch stays Ready; its first wake records the reference instead.
@@ -3185,6 +3238,7 @@ async fn drive_residency(
     source: &dyn ServiceObservation,
     work: ResidencyWork,
     stop: &mut watch::Receiver<bool>,
+    trace: &crate::activation_trace::StepParent,
 ) -> Result<bool, CoordinatorError> {
     if *stop.borrow() || !shared.accepting.load(Ordering::Acquire) {
         return Err(CoordinatorError::Stopped(
@@ -3205,7 +3259,13 @@ async fn drive_residency(
                     .group_residency_members(owner.session(), &step)
             })
             .await?;
-        return drive_group_residency(shared, source, work, members, hosts, stop).await;
+        // ADR 0037 §6: the head's command carries the activation's (or the
+        // release's) context.
+        return crate::activation_trace::within(
+            trace.cx(),
+            drive_group_residency(shared, source, work, members, hosts, stop),
+        )
+        .await;
     }
     let driver = shared
         .retained
@@ -3237,6 +3297,15 @@ async fn drive_residency(
         work.observation_ttl_ms,
         work.max_parked,
     );
+    // ADR 0037 §4: a wake's `capyctl.reserve` is its armed reservation on
+    // the host's fresh observation. A park has no steps of its own: it is a
+    // switch's `capyctl.release`.
+    let restore = work.kind == ResidencyKind::Restore;
+    let reserve = if restore {
+        trace.step(capyctl_trace::Name::Reserve)
+    } else {
+        Default::default()
+    };
     let armed = shared
         .read(move |owner, now| {
             owner.store().arm_residency_with_residents(
@@ -3250,8 +3319,14 @@ async fn drive_residency(
         })
         .await;
     let context = match armed {
-        Ok(ResidencyArm::New(context)) => *context,
-        Ok(ResidencyArm::Reclaiming(_) | ResidencyArm::Refused(_)) => return Ok(true),
+        Ok(ResidencyArm::New(context)) => {
+            reserve.completed();
+            *context
+        }
+        Ok(ResidencyArm::Reclaiming(_) | ResidencyArm::Refused(_)) => {
+            reserve.end(capyctl_trace::Outcome::Refused);
+            return Ok(true);
+        }
         Ok(ResidencyArm::Draining) => return Ok(false),
         Ok(ResidencyArm::Blocked(why)) => {
             log_blocked_residency(&work.step_id, &why);
@@ -3286,7 +3361,7 @@ async fn drive_residency(
             return Ok(true);
         }
     }
-    execute_residency(shared, source, &driver, &work, context, stop).await?;
+    execute_residency(shared, source, &driver, &work, context, stop, trace).await?;
     if work.kind == ResidencyKind::Park {
         measure_parked(shared, source, &work, stop).await;
     }
@@ -3781,6 +3856,7 @@ async fn execute_residency(
     work: &ResidencyWork,
     context: capyctl_domain::completion::StepExecutionContext,
     stop: &mut watch::Receiver<bool>,
+    trace: &crate::activation_trace::StepParent,
 ) -> Result<(), CoordinatorError> {
     use crate::wake_canary::{WAKE_MISMATCH, WAKE_RELOAD_FAILED, WAKE_UNCERTAIN};
     let now = (shared.clock)()?;
@@ -3792,17 +3868,30 @@ async fn execute_residency(
             .min(shared.options.initialize_timeout);
     let deadline = tokio::time::Instant::now() + bound;
     let canary_context = context.clone();
+    let restore = work.kind == ResidencyKind::Restore;
+    // ADR 0037 §4, §6: a wake's `capyctl.wake` is the restore itself; a
+    // park's command carries the switch release's context.
+    let effect = if restore {
+        trace.step(capyctl_trace::Name::Wake)
+    } else {
+        Default::default()
+    };
     let outcome = tokio::select! {
         biased;
         _ = stop.changed() => None,
-        result = tokio::time::timeout_at(deadline, residency_effect(driver, work.kind, context)) => Some(result),
+        result = crate::activation_trace::within(effect.cx().or(trace.cx()), tokio::time::timeout_at(deadline, residency_effect(driver, work.kind, context))) => Some(result),
     };
+    match &outcome {
+        Some(Ok(Ok(_))) => effect.completed(),
+        Some(Ok(Err(error))) => effect.fail(runtime_code(error)),
+        Some(Err(_)) => effect.fail("deadline"),
+        None => effect.end(capyctl_trace::Outcome::Uncertain),
+    }
     let step = work.step_id.clone();
     let verb = match work.kind {
         ResidencyKind::Park => "park",
         ResidencyKind::Restore => "restore",
     };
-    let restore = work.kind == ResidencyKind::Restore;
     let uncertain = |reason: String| {
         let step = step.clone();
         async move {
@@ -3843,13 +3932,18 @@ async fn execute_residency(
             // it did at the launch's first readiness before it completes,
             // within the restore's own deadline (found live 2026-10-15).
             let canary = if restore {
-                tokio::time::timeout_at(
-                    deadline,
-                    wake_canary_check(
-                        shared,
-                        driver,
-                        work,
-                        &woken_context(&canary_context, &observation),
+                // ADR 0037 §4: `capyctl.canary`, the wake's canary probe.
+                let step = trace.step(capyctl_trace::Name::Canary);
+                let canary = crate::activation_trace::within(
+                    step.cx(),
+                    tokio::time::timeout_at(
+                        deadline,
+                        wake_canary_check(
+                            shared,
+                            driver,
+                            work,
+                            &woken_context(&canary_context, &observation),
+                        ),
                     ),
                 )
                 .await
@@ -3857,7 +3951,13 @@ async fn execute_residency(
                     CanaryCheck::Unanswered(
                         "the wake canary was not answered before the wake's deadline".into(),
                     )
-                })
+                });
+                match &canary {
+                    CanaryCheck::Passed(_) => step.completed(),
+                    CanaryCheck::Differs => step.fail(WAKE_MISMATCH),
+                    CanaryCheck::Unanswered(_) => step.end(capyctl_trace::Outcome::Uncertain),
+                }
+                canary
             } else {
                 CanaryCheck::Passed(None)
             };
@@ -3873,16 +3973,21 @@ async fn execute_residency(
                     match after_canary(driver, observation, answered) {
                         Err(reason) => Some((WAKE_UNCERTAIN, reason)),
                         Ok(observation) => {
-                            match commit_residency(
-                                shared,
-                                source,
-                                work,
-                                observation,
-                                deadline,
-                                stop,
-                            )
-                            .await?
-                            {
+                            // ADR 0037 §4: a wake's `capyctl.readiness` is its
+                            // evidence proved and recorded.
+                            let readiness = if restore {
+                                trace.step(capyctl_trace::Name::Readiness)
+                            } else {
+                                Default::default()
+                            };
+                            let committed =
+                                commit_residency(shared, source, work, observation, deadline, stop)
+                                    .await?;
+                            match &committed {
+                                Committed::Done => readiness.completed(),
+                                _ => readiness.end(capyctl_trace::Outcome::Uncertain),
+                            }
+                            match committed {
                                 Committed::Done => None,
                                 Committed::Unproven(reason) => Some((WAKE_UNCERTAIN, reason)),
                                 Committed::Stopped => {
@@ -3930,6 +4035,8 @@ async fn execute_residency(
                         .refuse_residency(owner.session(), &step, &reason)
                 })
                 .await?;
+            // ADR 0037 §4: refused before any effect.
+            trace.finish(Some(capyctl_trace::Outcome::Refused));
             None
         }
         Some(Ok(Err(RuntimeError::Uncertain(reason)))) => Some((WAKE_UNCERTAIN, reason)),
@@ -3944,6 +4051,12 @@ async fn execute_residency(
     let Some((code, reason)) = failed else {
         return Ok(());
     };
+    // ADR 0037 §4: the activation did not complete; its root says how.
+    trace.finish(Some(if code == WAKE_UNCERTAIN {
+        capyctl_trace::Outcome::Uncertain
+    } else {
+        capyctl_trace::Outcome::Failed
+    }));
     if !restore {
         // SPEC §13.2, T20: an uncertain park keeps everything until a stop
         // proves the group gone.
@@ -4606,6 +4719,8 @@ async fn settle_quiescent(
     } else {
         LOCAL_CANCELLATION_RECEIPT
     };
+    let binding = answer.binding_id.clone();
+    let before = cancelling_leases(shared, &binding).await;
     let settled = shared
         .read(move |owner, _| {
             owner
@@ -4619,7 +4734,40 @@ async fn settle_quiescent(
                 .map_err(lease_store_error)
         })
         .await?;
+    if settled > 0 && !before.is_empty() {
+        // ADR 0037 §3: the engine's idle reading settled these cancellations.
+        let after = cancelling_leases(shared, &binding).await;
+        settled_leases(shared, before.into_iter().filter(|l| !after.contains(l)));
+    }
     Ok(settled > 0)
+}
+
+/// ADR 0037 §3: the cancelling leases on `binding`'s lane, read beside a
+/// settlement only while tracing is on (nothing is read otherwise).
+async fn cancelling_leases(shared: &Arc<Shared>, binding: &str) -> Vec<String> {
+    if !shared.traces.is_on() {
+        return Vec::new();
+    }
+    let binding = binding.to_owned();
+    shared
+        .read(move |owner, _| {
+            owner
+                .store()
+                .cancelling_lease_ids(&binding)
+                .map_err(lease_store_error)
+        })
+        .await
+        .unwrap_or_default()
+}
+
+/// ADR 0037 §3 (ADR 0032 settlement): these requests' cancellations settled
+/// (the engine's idle reading, or the instance's verified exit): the router's
+/// held `capyctl.settle` span of each ends now.
+fn settled_leases(shared: &Arc<Shared>, leases: impl IntoIterator<Item = String>) {
+    let tracing = shared.traces.tracing();
+    for lease in leases {
+        tracing.settled(&lease, capyctl_trace::Outcome::Completed);
+    }
 }
 
 /// SPEC §6.3: a Stop drains before it terminates. Admission to the instance
@@ -4789,10 +4937,12 @@ async fn drive_group_cleanup(
         operation_id: work.operation_id.clone(),
         plan: bound.plan,
     };
+    // ADR 0037 §6: a switch release's stop carries the release's context.
+    let release = shared.traces.bound(&target.deployment_id);
     let settlement = tokio::select! {
         biased;
         _ = stop.changed() => return Err(CoordinatorError::Stopped("shutdown during group stop".into())),
-        settlement = stop_group(&ctx, &target, reason) => settlement,
+        settlement = crate::activation_trace::within(release, stop_group(&ctx, &target, reason)) => settlement,
     };
     if let capyctl_store::groups::GroupSettlement::Partial { unsettled } = settlement {
         return Err(CoordinatorError::Service(format!(
@@ -4813,13 +4963,18 @@ async fn drive_group_cleanup(
         receipt: "every group member settled on its own host's gone evidence".into(),
     };
     let step = work.step_id.clone();
+    let cancelling = cancelling_leases(shared, &work.binding_id).await;
     shared
         .read(move |owner, now| {
             owner
                 .store()
                 .complete_cleanup(owner.session(), &step, &evidence, now, ttl)
         })
-        .await
+        .await?;
+    // ADR 0037 §3: the verified exit settled every cancellation on the head's
+    // lane.
+    settled_leases(shared, cancelling);
+    Ok(())
 }
 
 async fn drive_cleanup(
@@ -4910,12 +5065,15 @@ async fn drive_cleanup(
     }
     let bound = Duration::from_millis((context.deadline_ms - now) as u64)
         .min(shared.options.protocol_timeout);
+    // ADR 0037 §6: a switch release's stop carries the release's context.
+    let release = shared.traces.bound(&context.fence.deployment_id);
     let evidence = tokio::select! {
         biased;
         _ = stop.changed() => return Err(CoordinatorError::Stopped("shutdown during cleanup".into())),
-        result = tokio::time::timeout(bound, (driver.cleanup)(context)) => result.map_err(|_| CoordinatorError::Service("cleanup timeout".into()))??,
+        result = crate::activation_trace::within(release, tokio::time::timeout(bound, (driver.cleanup)(context))) => result.map_err(|_| CoordinatorError::Service("cleanup timeout".into()))??,
     };
     let step = work.step_id.clone();
+    let cancelling = cancelling_leases(shared, &work.binding_id).await;
     shared
         .read(move |owner, now| {
             owner
@@ -4923,6 +5081,9 @@ async fn drive_cleanup(
                 .complete_cleanup(owner.session(), &step, &evidence, now, ttl)
         })
         .await?;
+    // ADR 0037 §3, ADR 0032: the instance's verified exit settled every
+    // cancellation on its lane; their held settle spans end.
+    settled_leases(shared, cancelling);
     shared
         .retained
         .lock()

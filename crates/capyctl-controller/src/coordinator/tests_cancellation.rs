@@ -721,3 +721,71 @@ async fn other_sglang_launches_are_not_offered_the_abort() {
         lab.worker.shutdown().await.unwrap();
     }
 }
+
+/// ADR 0037 §3: the router's tracing with a held `capyctl.settle` span for
+/// `lease`, as the router holds one for a cut request, shared with the lab's
+/// coordinator.
+fn held_settle(h: &Harness, lease: &str) -> capyctl_trace::testing::Capture {
+    use capyctl_trace::{CallerMode, Name, Parent, Service};
+    let (tracing, spans) =
+        capyctl_trace::testing::capture(1.0, CallerMode::Parent, Service::Server);
+    let _ = h
+        .lab
+        .port(Duration::from_secs(10))
+        .with_tracing(tracing.clone());
+    tracing.hold(lease, tracing.span(Name::Settle, Parent::Root, &[]));
+    spans
+}
+
+// T48 T17 (ADR 0037 §3, ADR 0032): the engine's idle reading settles an
+// answered cancellation, and the router's held `capyctl.settle` span for
+// its lease ends then, completed; not while the engine reads busy.
+#[tokio::test]
+async fn an_idle_reading_ends_the_held_settle_span() {
+    let h = harness_with_ready_instance(false).await;
+    let lease = h.open_lease().await;
+    let spans = held_settle(&h, lease.id());
+    h.close_lease(lease, ANSWERED).await;
+    tokio::time::sleep(TICKS).await;
+    assert!(spans.named("capyctl.settle").is_empty(), "busy: still held");
+    h.set_quiet(true);
+    h.until_outstanding(0).await;
+    until("the settle span", || {
+        !spans.named("capyctl.settle").is_empty()
+    })
+    .await;
+    let settle = spans.named("capyctl.settle");
+    assert_eq!(settle.len(), 1);
+    assert_eq!(settle[0].attr("capyctl.outcome"), Some("completed"));
+    h.lab.worker.shutdown().await.unwrap();
+}
+
+// T48 T17 (ADR 0037 §3, SPEC §10 amended 2026-10-21): a cancellation the
+// engine never answered settles only at the instance's verified exit; its
+// held settle span ends then, completed.
+#[tokio::test]
+async fn a_verified_exit_ends_the_held_settle_span() {
+    let h = harness_with_ready_instance(true).await;
+    let lease = h.open_lease().await;
+    let spans = held_settle(&h, lease.id());
+    h.close_lease(lease, UNANSWERED).await;
+    tokio::time::sleep(TICKS).await;
+    assert!(spans.named("capyctl.settle").is_empty(), "still held");
+    let id = h.lab.a.deployment_id.clone();
+    let stop = h
+        .lab
+        .worker
+        .commands()
+        .administrative_stop("operator", &id, h.lab.a.revision, "stop", 100_000)
+        .unwrap();
+    until_succeeded(&h.lab, stop.operation_id(), &id).await;
+    assert_eq!(h.outstanding(), 0);
+    until("the settle span", || {
+        !spans.named("capyctl.settle").is_empty()
+    })
+    .await;
+    let settle = spans.named("capyctl.settle");
+    assert_eq!(settle.len(), 1, "ended with the verified exit");
+    assert_eq!(settle[0].attr("capyctl.outcome"), Some("completed"));
+    h.lab.worker.shutdown().await.unwrap();
+}

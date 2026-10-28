@@ -237,6 +237,18 @@ message ReportInventory {
   // partial or not the approved saver's is not listed; nothing here falls
   // back to process sampling. Absent from a host without the capability.
   repeated MemberSaver member_savers = 9;
+  // ADR 0037 §13 (additive): the host role's tracing status, so the server's
+  // status shows it. Absent from an older host, which shows as not reported.
+  HostTracingStatus tracing = 10;
+}
+// ADR 0037 §13: a role's tracing status. `endpoint` is the configured OTLP
+// URL, empty when tracing is off; `spans_dropped` and `last_export_error`
+// (empty for none) count since the role started.
+message HostTracingStatus {
+  bool on = 1;
+  string endpoint = 2;
+  uint64 spans_dropped = 3;
+  string last_export_error = 4;
 }
 // ADR 0028 §14: the host's group-relevant facts. `peer_address` is the
 // address this host offers to group peers; `findings` are the preflight
@@ -653,6 +665,13 @@ message ExecuteMember {
   // retained launch, on loopback with the launch's own key, and answers in
   // `MemberExecutionResult.probe_decision`. False encodes exactly as before.
   bool probe_decision = 18;
+  // ADR 0037 §6 (additive, capability `trace_context`): the W3C `traceparent`
+  // of the server's lifecycle step this command belongs to, so the host's
+  // spans are its children. Empty for none. Envelope only: it is not part of
+  // the command, so the canonical digest leaves it out, neither side
+  // journals it, and a command replayed after a restart carries none. Sent
+  // only to a host whose Connect declared `trace_context`.
+  string trace_parent = 20;
 }
 // ADR 0030 §4 (additive): one option's probability in a decision probe's answer.
 message DecisionProbability {

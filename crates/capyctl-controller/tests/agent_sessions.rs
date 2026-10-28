@@ -395,6 +395,7 @@ async fn certificate_expiry_closes_existing_stream_and_backpressure_is_bounded()
             group_member_launch: None,
             probe_max_tokens: 0,
             probe_decision: false,
+            trace_parent: String::new(),
         })),
     })
     .unwrap();
@@ -1678,6 +1679,15 @@ async fn raw_session_reporting(
     host: &str,
     domains: Vec<pb::DomainObservation>,
 ) -> Result<RawSession, Box<tonic::Status>> {
+    raw_session_declaring(identity, host, domains, vec![]).await
+}
+/// As [`raw_session_reporting`], its Connect declaring `capabilities`.
+async fn raw_session_declaring(
+    identity: &PendingEnrollment,
+    host: &str,
+    domains: Vec<pb::DomainObservation>,
+    capabilities: Vec<String>,
+) -> Result<RawSession, Box<tonic::Status>> {
     let channel = identity
         .control_endpoint(now())
         .unwrap()
@@ -1689,6 +1699,7 @@ async fn raw_session_reporting(
         msg: Some(agent_to_server::Msg::Connect(pb::Connect {
             host_id: host.into(),
             protocol_version: capyctl_protocol::PROTOCOL_VERSION.into(),
+            capabilities,
             ..Default::default()
         })),
     })
@@ -2191,5 +2202,159 @@ async fn a_memory_source_with_a_control_character_or_too_long_is_refused() {
         assert_eq!(refused.code(), tonic::Code::PermissionDenied, "{source:?}");
         assert_eq!(refused.message(), "host session authorization failed");
     }
+    server.abort();
+}
+
+// T48 (ADR 0037 §6, ADR 0017, SPEC §13.1): a lifecycle command sent within
+// an activation step carries the step's `traceparent` in its envelope to a
+// host that declared `trace_context`, and none to a host that did not. The
+// command itself is unchanged either way: the same typed command, the same
+// canonical digest, the same encoding a host journals.
+#[tokio::test]
+async fn a_step_context_rides_the_envelope_only_to_a_declaring_host() {
+    use capyctl_protocol::capabilities::TRACE_CONTEXT;
+    use capyctl_trace::{CallerMode, Name, Parent, Service};
+    let Enrolled {
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs,
+    } = enrolled_host().await;
+    let (tracing, _spans) =
+        capyctl_trace::testing::capture(1.0, CallerMode::Parent, Service::Server);
+    for declares in [true, false] {
+        let capabilities = if declares {
+            vec![TRACE_CONTEXT.to_owned()]
+        } else {
+            vec![]
+        };
+        let mut raw = raw_session_declaring(&identity, &host, vec![], capabilities)
+            .await
+            .unwrap();
+        assert_eq!(sessions.supports_trace_context(&host), declares);
+        let step = tracing.span(Name::Wake, Parent::Root, &[]);
+        let cx = step.cx().unwrap();
+        let command = inspect_command(
+            identity.controller_id(),
+            &host,
+            &format!("traced-{declares}"),
+            capyctl_protocol::now_unix_ms() + 10_000,
+        );
+        let execution = {
+            let (sessions, command) = (sessions.clone(), command.clone());
+            tokio::spawn(async move {
+                capyctl_controller::activation_trace::within(Some(cx), sessions.execute(command))
+                    .await
+            })
+        };
+        let wire = next_command(&mut raw.stream).await;
+        if declares {
+            assert_eq!(wire.trace_parent, cx.traceparent());
+        } else {
+            assert!(wire.trace_parent.is_empty(), "an older host gets none");
+        }
+        let received = capyctl_protocol::execution::TracedCommand::try_from(pb::ServerToAgent {
+            msg: Some(pb::server_to_agent::Msg::ExecuteMember(wire.clone())),
+        })
+        .unwrap();
+        assert_eq!(received.trace_parent.is_some(), declares);
+        assert_eq!(received.command, command);
+        assert_eq!(
+            received.command.canonical_digest(),
+            command.canonical_digest()
+        );
+        received.command.verify_digest().unwrap();
+        let mut journaled = wire;
+        journaled.trace_parent.clear();
+        assert_eq!(journaled, command.to_wire(), "only the envelope differs");
+        raw.send
+            .send(completed(&command, capyctl_protocol::now_unix_ms()))
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), execution)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.state, "completed");
+        step.end();
+    }
+    server.abort();
+}
+
+// T48 (ADR 0037 §13): the server keeps the latest tracing status each host
+// reports on its inventory, as status shows it: control characters dropped
+// and long text cut, never refused.
+#[tokio::test]
+async fn the_latest_host_tracing_status_is_kept() {
+    use capyctl_controller::agent_sessions::{HostTracingView, MAX_TRACING_ENDPOINT};
+    let Enrolled {
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs,
+    } = enrolled_host().await;
+    let raw = raw_session(&identity, &host).await;
+    assert_eq!(
+        sessions.inspect(&host).unwrap().tracing,
+        None,
+        "none reported"
+    );
+    let report = |endpoint: String, dropped: u64, error: &str| pb::AgentToServer {
+        msg: Some(agent_to_server::Msg::ReportInventory(pb::ReportInventory {
+            envelope: Some(pb::Envelope {
+                host_id: host.clone(),
+                protocol_version: capyctl_protocol::PROTOCOL_VERSION.into(),
+                ..Default::default()
+            }),
+            tracing: Some(pb::HostTracingStatus {
+                on: true,
+                endpoint,
+                spans_dropped: dropped,
+                last_export_error: error.into(),
+            }),
+            ..Default::default()
+        })),
+    };
+    let endpoint = "http://127.0.0.1:4318/v1/traces".to_owned();
+    raw.send
+        .send(report(endpoint.clone(), 0, ""))
+        .await
+        .unwrap();
+    let tracing = || sessions.inspect(&host).and_then(|s| s.tracing);
+    eventually(|| tracing().is_some()).await;
+    assert_eq!(
+        tracing().unwrap(),
+        HostTracingView {
+            on: true,
+            endpoint: Some(endpoint.clone()),
+            spans_dropped: 0,
+            last_export_error: None,
+        }
+    );
+    raw.send
+        .send(report(
+            "h".repeat(3000),
+            7,
+            "export\nfailed: connection refused",
+        ))
+        .await
+        .unwrap();
+    eventually(|| tracing().is_some_and(|t| t.spans_dropped == 7)).await;
+    let latest = tracing().unwrap();
+    assert_eq!(latest.endpoint.unwrap().len(), MAX_TRACING_ENDPOINT);
+    assert_eq!(
+        latest.last_export_error.as_deref(),
+        Some("exportfailed: connection refused")
+    );
+    assert_eq!(
+        sessions.current_session(&host).as_deref(),
+        Some(raw.session_id.as_str()),
+        "a long status never ends the session"
+    );
+    let shown = serde_json::to_value(sessions.inspect(&host).unwrap()).unwrap();
+    assert_eq!(shown["tracing"]["spans_dropped"], 7);
     server.abort();
 }

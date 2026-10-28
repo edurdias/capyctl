@@ -149,6 +149,13 @@ pub const REQUEST_ABORT: &str = "request_abort";
 /// `host_capability_missing:local_tensor_parallel` before anything is sent.
 /// Any other launch needs nothing new.
 pub const LOCAL_TENSOR_PARALLEL: &str = "local_tensor_parallel";
+/// ADR 0037 §6: the host reads W3C trace context: `traceparent` and
+/// `tracestate` on the router's forward to its ingress, and
+/// `ExecuteMember.trace_parent` on a lifecycle command. Neither is part of a
+/// command's digest, so a host without it is never refused anything: the
+/// server simply sends it neither (ADR 0017), and the trace ends at the
+/// server's span.
+pub const TRACE_CONTEXT: &str = "trace_context";
 
 /// ADR 0018: bounds on the new messages' strings and lists.
 pub const MAX_REQUEST_ID: usize = 64;
@@ -200,6 +207,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (RETENTION, Direction::ServerToHost),
     (REQUEST_ABORT, Direction::ServerToHost),
     (LOCAL_TENSOR_PARALLEL, Direction::ServerToHost),
+    (TRACE_CONTEXT, Direction::ServerToHost),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.

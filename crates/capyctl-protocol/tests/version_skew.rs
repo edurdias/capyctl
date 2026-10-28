@@ -376,6 +376,7 @@ fn every_post_baseline_field_names_its_capability() {
             RETENTION,
             REQUEST_ABORT,
             LOCAL_TENSOR_PARALLEL,
+            TRACE_CONTEXT,
         ]
         .contains(name)
         {

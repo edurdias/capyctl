@@ -50,6 +50,7 @@ fn wire(owned_handle: &str, request_id: &str) -> pb::ExecuteMember {
         group_member_launch: None,
         probe_max_tokens: 0,
         probe_decision: false,
+        trace_parent: String::new(),
     }
 }
 

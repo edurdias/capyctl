@@ -1395,7 +1395,7 @@ async fn an_expired_drain_stop_is_reissued_when_its_host_reconnects() {
 /// session liveness and the load that host reported for exactly this launch.
 /// A lease and its endpoint are resolved for exactly that generation; once the
 /// gate closes both are refused, so the router fails over before sending.
-// T18 T33 T38
+// T18 T33 T38 T48
 #[tokio::test]
 async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence() {
     use crate::port::LifecyclePort;
@@ -1414,6 +1414,7 @@ async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence()
     let launch = ready_launch(&owner);
     let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let load = Arc::new(crate::load_table::LoadTable::new());
+    let traced = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let signals = crate::coordinator_port::RoutingSignals {
         load: load.clone(),
         host_live: {
@@ -1422,6 +1423,10 @@ async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence()
         },
         host_unresponsive: Arc::new(|_: &str| false),
         host_request_abort: Arc::new(|_: &str| false),
+        host_trace_context: {
+            let traced = traced.clone();
+            Arc::new(move |host: &str| host == "lab" && traced.load(Ordering::SeqCst))
+        },
     };
     let lifecycle =
         crate::coordinator_port::CoordinatorLifecycle::new(w.commands()).with_routing(signals);
@@ -1463,6 +1468,14 @@ async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence()
         Some(launch.step_id.as_str())
     );
     assert!(only.dispatch_open && only.host_live);
+    // T48 (ADR 0037 §6, ADR 0017): trace headers go to this instance's
+    // ingress only while its host's session declares `trace_context`, and
+    // only for the incarnation it serves.
+    assert!(!lifecycle.trace_context(&fence.deployment_id, fence.generation));
+    traced.store(true, Ordering::SeqCst);
+    assert!(lifecycle.trace_context(&fence.deployment_id, fence.generation));
+    assert!(!lifecycle.trace_context(&fence.deployment_id, fence.generation + 1));
+    assert!(!lifecycle.trace_context("another-deployment", fence.generation));
     let view = only.load.as_ref().expect("a fresh sample for this launch");
     assert_eq!(view.engine_queue(), Some(4));
     assert_eq!(view.owned_handle, launch.step_id);

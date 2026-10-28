@@ -190,6 +190,22 @@ impl crate::Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// ADR 0037 §3: the IDs of the cancelling leases on the instance lane a
+    /// retained binding serves, of any session, still in flight. Read beside
+    /// a settlement so the controller can end each settled request's held
+    /// `capyctl.settle` span; it decides nothing.
+    pub fn cancelling_lease_ids(&self, binding_id: &str) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT l.id FROM request_lease_cancellations c
+               JOIN request_leases l ON l.id=c.lease_id
+               JOIN runtime_bindings b ON b.deployment_id=l.deployment_id
+                 AND b.instance_index=l.instance_index AND b.state!='released'
+              WHERE b.id=?1 AND l.disposition='inflight' ORDER BY l.id",
+        )?;
+        let rows = statement.query_map([binding_id], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Close this session's cancelling leases on the binding cancelled at or
     /// before `asked_at_ms`; journals one event with `receipt`. Returns the count.
     /// SPEC §10 (amended 2026-10-21), ADR 0031 §6: never a cancellation settled
