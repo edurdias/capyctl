@@ -30,6 +30,8 @@ rusqlite.workspace = true
 prost.workspace = true
 capyctl-launchers = { path = "../capyctl-launchers" }
 capyctl-adapters.workspace = true
+# ADR 0037: the host's spans (ingress, lifecycle steps) and trace headers.
+capyctl-trace = { workspace = true }
 
 tokio = { workspace = true }
 tokio-stream = "0.1"

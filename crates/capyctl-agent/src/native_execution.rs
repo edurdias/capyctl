@@ -71,6 +71,8 @@ mod lmcache;
 mod request_abort;
 // ADR 0037 §7: a launch's engine tracing, decided and frozen when it launches.
 mod engine_tracing;
+// ADR 0037 §4: the host's lifecycle steps as spans under the server's step.
+mod host_spans;
 
 /// The longest one fresh `/v1/models` readiness read may take.
 const PROBE_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -160,6 +162,9 @@ pub struct NativeHostExecution {
     lmcache_verdicts: Arc<lmcache::LmcacheVerdicts>,
     /// ADR 0033 §12: the load source that samples the LMCache servers.
     host_load: Arc<crate::load::HostLoad>,
+    /// ADR 0037 §4: the tracing the host's lifecycle steps are recorded
+    /// with; `None` reads the host role's installed tracing.
+    tracing: Option<capyctl_trace::Tracing>,
 }
 
 /// A GPU sample taken for one command before the journal was locked, and when.
@@ -301,6 +306,7 @@ impl NativeHostExecution {
             lmcache_dirs: None,
             lmcache_verdicts: Arc::default(),
             host_load,
+            tracing: None,
         });
         this.prime_gpu();
         this
@@ -546,6 +552,37 @@ impl NativeHostExecution {
     pub fn with_saver_residency(mut self: Arc<Self>, saver: Arc<dyn SaverResidency>) -> Arc<Self> {
         Arc::make_mut(&mut self).saver = Some(saver);
         self
+    }
+    /// ADR 0037 §4: record the host's lifecycle steps with `tracing` instead
+    /// of the host role's installed tracing (a test's capture).
+    pub fn with_tracing(mut self: Arc<Self>, tracing: capyctl_trace::Tracing) -> Arc<Self> {
+        Arc::make_mut(&mut self).tracing = Some(tracing);
+        self
+    }
+    fn tracing(&self) -> capyctl_trace::Tracing {
+        self.tracing
+            .clone()
+            .unwrap_or_else(crate::host_tracing::get)
+    }
+    /// ADR 0037 §§4, 6: a command's effect with its host steps recorded as
+    /// children of the server step its envelope named. A launch, wake or
+    /// park is one step around the whole effect, ending with the outcome its
+    /// result shows; a Terminate records its own steps inside.
+    async fn traced_effect(
+        self,
+        session: u64,
+        command: MemberCommand,
+        trace_parent: Option<String>,
+    ) -> Result<pb::MemberExecutionResult, SessionError> {
+        let trace = host_spans::StepTrace::new(self.tracing(), trace_parent.as_deref());
+        let mut step =
+            host_spans::whole_step(&command.action).map(|name| (name, trace.step(name, &command)));
+        let result = self.effect(session, command, trace).await;
+        if let (Some((name, step)), Ok(result)) = (step.as_mut(), &result) {
+            let (outcome, code) = host_spans::whole_outcome(*name, result);
+            step.end(outcome, code);
+        }
+        result
     }
     /// SPEC §§9.1, 13.2: a launch leaving residency loses its readiness
     /// authority, so no replay of an earlier launch or probe reopens its gate.
@@ -2133,6 +2170,7 @@ impl NativeHostExecution {
         self,
         session: u64,
         command: MemberCommand,
+        trace: host_spans::StepTrace,
     ) -> Result<pb::MemberExecutionResult, SessionError> {
         if let MemberAction::DigestCheckpoint(plan) = &command.action {
             return self.digest_checkpoint(&command, plan).await;
@@ -2204,9 +2242,14 @@ impl NativeHostExecution {
                 Err(LaunchVerdict::Uncertain) => return Err(SessionError),
             }
         }
+        // ADR 0037 §4: a fresh Terminate's stop, from closing its gate to its
+        // signalled processes, as `capyctl.host.stop`. One held back by the
+        // engine's idle gate signals nothing and ends `uncertain`.
+        let mut stop: Option<host_spans::Step> = None;
         if let MemberAction::Terminate { owned_handle, .. } = &command.action {
             match fresh {
                 Ok(true) => {
+                    stop = Some(trace.step(capyctl_trace::Name::HostStop, &command));
                     // A restarted host has no in-memory gate. Re-register the
                     // exact retained scope closed using its protected
                     // credentials. A handle this host never launched has no
@@ -2321,6 +2364,9 @@ impl NativeHostExecution {
                     .await
                     .map_err(|_| SessionError)?
                     .map_err(|_| SessionError)?;
+                    if let Some(stop) = stop.as_mut() {
+                        stop.end(capyctl_trace::Outcome::Completed, None);
+                    }
                 }
                 MemberAction::Inspect => {
                     let journal = self.journal.clone();
@@ -2377,6 +2423,11 @@ impl NativeHostExecution {
                 _ => return Err(SessionError),
             },
         }
+        // ADR 0037 §4: a Terminate's (or its resend's) check that the launch's
+        // processes are gone, as `capyctl.host.verify_release`: `completed`
+        // only on gone evidence for every process, `uncertain` otherwise.
+        let mut verify = matches!(command.action, MemberAction::Terminate { .. })
+            .then(|| trace.step(capyctl_trace::Name::HostVerifyRelease, &command));
         let now = capyctl_protocol::now_unix_ms();
         let mut result = self
             .journal
@@ -2423,6 +2474,14 @@ impl NativeHostExecution {
             let gone = result.state == "completed"
                 && !result.claim_retained
                 && result.processes.iter().all(|p| p.presence == "gone");
+            if let Some(verify) = verify.as_mut() {
+                let outcome = if gone {
+                    capyctl_trace::Outcome::Completed
+                } else {
+                    capyctl_trace::Outcome::Uncertain
+                };
+                verify.end(outcome, None);
+            }
             if gone {
                 if let Ok(scope) = self
                     .journal
@@ -2861,7 +2920,18 @@ impl LocalExecutionPolicy for NativeHostExecution {
 }
 impl SessionExecution for NativeHostExecution {
     fn execute(&self, session: u64, command: MemberCommand) -> ExecutionFuture {
-        Box::pin(self.clone().effect(session, command))
+        Box::pin(
+            self.clone()
+                .effect(session, command, host_spans::StepTrace::none()),
+        )
+    }
+    fn execute_traced(
+        &self,
+        session: u64,
+        command: MemberCommand,
+        trace_parent: Option<String>,
+    ) -> ExecutionFuture {
+        Box::pin(self.clone().traced_effect(session, command, trace_parent))
     }
     fn provision(
         &self,
@@ -4425,6 +4495,119 @@ mod tests {
         let (mut owner, _) = launch_with(&deployment, &policy, "");
         owner.identity.payload_digest = owner.canonical_digest();
         deep.authorize_residency(&park, &owner).unwrap();
+    }
+
+    /// The server step a lifecycle command's envelope names (ADR 0037 §6).
+    const SERVER_TRACE: [u8; 16] = [0x4b; 16];
+    const SERVER_STEP: [u8; 8] = [0x5c; 8];
+    fn server_step() -> String {
+        capyctl_trace::SpanCx {
+            trace_id: SERVER_TRACE,
+            span_id: SERVER_STEP,
+            flags: capyctl_trace::SpanCx::SAMPLED,
+        }
+        .traceparent()
+    }
+    fn host_capture() -> (capyctl_trace::Tracing, capyctl_trace::testing::Capture) {
+        // Ratio 0: a host step follows its server step's sampled flag.
+        capyctl_trace::testing::capture(
+            0.0,
+            capyctl_trace::CallerMode::Parent,
+            capyctl_trace::Service::Host,
+        )
+    }
+
+    /// ADR 0037 §§4, 6: with host tracing on, a lifecycle command's host step
+    /// (`capyctl.host.park`) is the child of the server step its envelope
+    /// named, with its outcome and closed code; a command whose envelope
+    /// carried none (a replay after a restart) records nothing.
+    // T48 T21
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_step_span_parents_to_the_envelope_context() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            sglang_fixture(root.path(), identity_dir.path(), "restart_only");
+        let (tracing, capture) = host_capture();
+        let executor = executor.with_tracing(tracing);
+        let (mut launch, _) = launch_with(&deployment, &policy, "");
+        launch.identity.payload_digest = launch.canonical_digest();
+        let session = executor.journal.connect().unwrap();
+        executor.connected(session).unwrap();
+        executor
+            .journal
+            .accept(session, &launch, capyctl_protocol::now_unix_ms(), &Admit)
+            .unwrap();
+        let mut park = MemberCommand {
+            identity: checkpoint_identity("park", "ready"),
+            action: MemberAction::Park {
+                owned_handle: "launch".into(),
+            },
+        };
+        park.identity.payload_digest = park.canonical_digest();
+
+        let refused = executor
+            .execute_traced(session, park.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(refused.refused, "residency_tier");
+        assert!(capture.spans().is_empty(), "no context, no span");
+
+        let refused = executor
+            .execute_traced(session, park.clone(), Some(server_step()))
+            .await
+            .unwrap();
+        assert_eq!(refused.refused, "residency_tier");
+        let spans = capture.spans();
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        let step = &spans[0];
+        assert_eq!(step.name, "capyctl.host.park");
+        assert_eq!(step.kind, capyctl_trace::Kind::Internal);
+        assert_eq!(step.cx.trace_id, SERVER_TRACE);
+        assert_eq!(step.parent, Some(SERVER_STEP));
+        assert_eq!(step.attr("capyctl.outcome"), Some("refused"));
+        assert_eq!(step.attr("capyctl.code"), Some("residency_tier"));
+        assert_eq!(step.error.as_deref(), Some("residency_tier"));
+        assert_eq!(
+            step.attr("capyctl.deployment"),
+            Some(park.identity.deployment_id.as_str())
+        );
+        assert_eq!(step.attr("capyctl.host"), Some("host"));
+        assert!(capture.disallowed_keys().is_empty());
+    }
+
+    /// ADR 0037 §4: a Terminate records `capyctl.host.stop` and
+    /// `capyctl.host.verify_release` under the server's step; the release is
+    /// `completed` on gone evidence for every process.
+    // T48 T41
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminate_records_its_stop_and_release_check_under_the_server_step() {
+        let port = health_stub(false).await;
+        let (_root, _ids, executor, session, api) = owned_tensorfold(port).await;
+        let (tracing, capture) = host_capture();
+        let executor = executor.with_tracing(tracing);
+        unsafe { libc::kill(api.pid as i32, libc::SIGKILL) };
+        let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while presence_of(&api) != Presence::Gone {
+            assert!(std::time::Instant::now() < gone_by, "the stand-in exits");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let result = executor
+            .execute_traced(
+                session,
+                tensorfold_terminate("terminate", 20_000),
+                Some(server_step()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.state, "completed");
+        let names: Vec<_> = capture.spans().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["capyctl.host.stop", "capyctl.host.verify_release"]);
+        for step in capture.spans() {
+            assert_eq!(step.cx.trace_id, SERVER_TRACE);
+            assert_eq!(step.parent, Some(SERVER_STEP));
+            assert_eq!(step.attr("capyctl.outcome"), Some("completed"));
+        }
     }
 
     /// A TensorFold profile on the lab document, restart_only, with a cache root.

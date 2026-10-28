@@ -2221,11 +2221,11 @@ impl HostJournal {
             .is_some_and(|report| report.state == LaunchLmcacheState::On))
     }
 
-    /// ADR 0037 §7: journal the engine tracing decision of the LaunchSingle
-    /// `command_id` (`on` or the off reason's code), before its engine
-    /// starts, so a replay reports it and a restarted host binds the
-    /// launch's ingress with it. The first decision stands: it was frozen
-    /// with the launch.
+    /// ADR 0037 §7: journal the engine tracing decision of the launch
+    /// `command_id` (`on` or the off reason's code; a group member's is
+    /// `group`), before its engine starts, so a replay reports it and a
+    /// restarted host binds the launch's ingress with it. The first decision
+    /// stands: it was frozen with the launch.
     pub fn record_launch_engine_tracing(
         &self,
         command_id: &str,
@@ -2237,7 +2237,10 @@ impl HostJournal {
         }
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         let command = load_command(&db, command_id)?;
-        if !matches!(command.action, MemberAction::LaunchSingle(_)) {
+        if !matches!(
+            command.action,
+            MemberAction::LaunchSingle(_) | MemberAction::Launch { .. }
+        ) {
             return Err(JournalError::Unauthorized);
         }
         db.execute(
