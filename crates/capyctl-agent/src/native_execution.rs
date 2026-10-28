@@ -69,6 +69,8 @@ mod member_savers;
 mod lmcache;
 // ADR 0032 §3: the request abort of a retained SGLang launch, on loopback.
 mod request_abort;
+// ADR 0037 §7: a launch's engine tracing, decided and frozen when it launches.
+mod engine_tracing;
 
 /// The longest one fresh `/v1/models` readiness read may take.
 const PROBE_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1439,6 +1441,9 @@ impl NativeHostExecution {
     /// its saver observation credential (ADR 0028 §12, R12); other workers
     /// hold none (ADR 0012: the keyed surfaces are the head's). ADR 0033 §3:
     /// `lmcache` is what a vLLM or SGLang Initialize does about LMCache.
+    /// ADR 0037 §7: `tracing` is the launch's engine tracing decision, which
+    /// a vLLM or SGLang launch renders when on (`instance` names the
+    /// deployment's instance in vLLM's resource attributes).
     #[allow(clippy::too_many_arguments)]
     fn launch_adapter(
         &self,
@@ -1449,6 +1454,8 @@ impl NativeHostExecution {
         served: &str,
         tools: Arc<dyn OwnedProcessLaunch>,
         lmcache: Option<Arc<capyctl_adapters::lmcache::LmcacheState>>,
+        tracing: &capyctl_adapters::engine_tracing::EngineTracing,
+        instance: u32,
     ) -> Result<Box<dyn EngineAdapter>, SessionError> {
         Ok(match prepared {
             PreparedLaunch::Sglang(frozen) => {
@@ -1497,6 +1504,9 @@ impl NativeHostExecution {
                 if let Some(state) = lmcache {
                     adapter = adapter.with_lmcache(state);
                 }
+                if let Some(endpoint) = tracing.endpoint() {
+                    adapter = adapter.with_trace_endpoint(endpoint);
+                }
                 Box::new(
                     adapter
                         .with_launch(*frozen)
@@ -1508,6 +1518,11 @@ impl NativeHostExecution {
             }
             PreparedLaunch::Vllm(mut launch) => {
                 launch.lmcache = lmcache;
+                launch.engine_tracing = capyctl_adapters::engine_tracing::VllmTrace::for_launch(
+                    tracing,
+                    &effective.name,
+                    instance,
+                );
                 Box::new(
                     self.vllm_adapter(effective, plan, keys, served)?
                         .with_launch(*launch)
@@ -1623,6 +1638,23 @@ impl NativeHostExecution {
         };
         let served = effective.routes.first().cloned().ok_or(SessionError)?;
         let group = self.group_args(command).map_err(|_| SessionError)?;
+        // ADR 0037 §§7, 11: the launch's engine tracing, decided once here
+        // (the shape check reads the environment) and journaled before
+        // anything starts, so its result, a replay and a restarted host's
+        // ingress all carry this one answer. A group member never traces.
+        let host = self.clone();
+        let resolved = effective.clone();
+        let grouped = group.is_some();
+        let tracing = tokio::task::spawn_blocking(move || host.engine_tracing(&resolved, grouped))
+            .await
+            .map_err(|_| SessionError)?;
+        let journal = self.journal.clone();
+        let id = command.identity.command_id.clone();
+        let state = tracing.outcome().code();
+        tokio::task::spawn_blocking(move || journal.record_launch_engine_tracing(&id, state))
+            .await
+            .map_err(|_| SessionError)?
+            .map_err(|_| SessionError)?;
         let prepared = self.prepare(&effective, plan, &served, group)?;
         // ADR 0033 §§1, 3, 9: what Initialize does about LMCache, from the
         // grant and this host's own plan; a launch-time check that failed
@@ -1653,6 +1685,8 @@ impl NativeHostExecution {
             &served,
             tools,
             lmcache.clone(),
+            &tracing,
+            command.identity.instance_index,
         )?;
         if let Some(keys) = keys.as_ref().filter(|_| serves) {
             self.ingress
@@ -1676,7 +1710,8 @@ impl NativeHostExecution {
                         effective.profile.engine,
                         effective.profile.custom.as_ref(),
                     )
-                    .with_request_abort(request_abort::request_abort_capable(&effective)),
+                    .with_request_abort(request_abort::request_abort_capable(&effective))
+                    .with_engine_trace(tracing.is_on()),
                 )
                 .map_err(|_| SessionError)?;
         }

@@ -1119,6 +1119,18 @@ fn group_wire(plan: &GroupPlan) -> pb::GroupLaunchPlan {
 /// ADR 0014 amendment A12: the most kernel build spans one launch reports.
 pub const MAX_KERNEL_BUILDS: usize = 64;
 
+/// ADR 0037 §7: the states a LaunchSingle result reports for its engine
+/// tracing: `on`, or why it is off
+/// (`capyctl_adapters::engine_tracing::TracingOutcome::code`).
+pub const ENGINE_TRACING_STATES: [&str; 6] = [
+    "on",
+    "host_off",
+    "engine_unsupported",
+    "not_installed",
+    "group",
+    "retention_zero",
+];
+
 /// ADR 0028 §9 (decided 2026-10-06): the most tokens a completion probe may
 /// ask for. Readiness asks for 1 and the wake canary for 8; the probe stays a
 /// short, bounded request either way.
@@ -1214,6 +1226,14 @@ pub fn validate_result(
                 .kernel_builds
                 .iter()
                 .any(|b| b.from_unix_ms < 0 || b.from_unix_ms > b.until_unix_ms))
+    {
+        return Err(GroupIdentityError);
+    }
+    // ADR 0037 §7: a LaunchSingle's engine tracing decision, one closed
+    // state; nothing on any other result.
+    if !result.engine_tracing.is_empty()
+        && !(matches!(command.action, MemberAction::LaunchSingle(_))
+            && ENGINE_TRACING_STATES.contains(&result.engine_tracing.as_str()))
     {
         return Err(GroupIdentityError);
     }

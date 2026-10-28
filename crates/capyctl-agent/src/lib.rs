@@ -36,6 +36,9 @@ pub mod lmcache_install;
 // ADR 0033 §4: per-launch private LMCache directories (SGLang's connector
 // configuration), removed on gone evidence and swept at role start.
 pub mod lmcache_dir;
+// ADR 0037 §7: engine tracing's launch-time check by shape and the
+// launch's decision, executing nothing.
+pub mod tracing_install;
 // ADR 0018 §1: resolving a named engine installation and its bounded
 // version check.
 pub mod engines;

@@ -9,6 +9,8 @@ pub mod deployments;
 pub mod development_controls;
 pub mod dispatch;
 pub mod enrollment;
+// ADR 0037 §7: each launch's engine tracing decision, for the lane and status.
+pub mod engine_tracing;
 pub mod events;
 // ADR 0028 §5, §11: multi-node group plans, member owners and settlement.
 pub mod groups;

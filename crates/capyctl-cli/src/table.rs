@@ -720,6 +720,19 @@ fn status(value: &Value, names: &HostNames) -> String {
             out.push_str(&line);
         }
     }
+    // ADR 0037 §13: each instance's engine tracing, on or off with why.
+    let tracing: Vec<String> = d["instances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(engine_tracing_line)
+        .collect();
+    if !tracing.is_empty() {
+        out.push('\n');
+        for line in tracing {
+            out.push_str(&line);
+        }
+    }
     if let Some(engine) = d["engine"].as_str() {
         out.push_str(&format!("\nEngine  {engine}\n"));
     } else if d["installation"].is_object() {
@@ -835,6 +848,20 @@ fn topology_line(instance: &Value) -> Option<String> {
         "Instance {}  TP {size}{on}\n",
         text(&instance["index"])
     ))
+}
+
+/// ADR 0037 §13: one instance's engine tracing line, absent when status has
+/// none: `Instance 0  engine tracing: on` or `... off (<reason>)`.
+fn engine_tracing_line(instance: &Value) -> Option<String> {
+    let tracing = instance.get("engine_tracing").filter(|t| t.is_object())?;
+    let index = text(&instance["index"]);
+    Some(match tracing["state"].as_str() {
+        Some("on") => format!("Instance {index}  engine tracing: on\n"),
+        _ => format!(
+            "Instance {index}  engine tracing: off ({})\n",
+            text(&tracing["reason"])
+        ),
+    })
 }
 
 /// ADR 0033 §9: one instance's LMCache line, absent when status has none:
@@ -1403,6 +1430,38 @@ mod tests {
             )),
             "{out}"
         );
+    }
+
+    // T48 (ADR 0037 §13): each instance whose status carries
+    // `engine_tracing` gets `engine tracing: on` or `off (<reason>)`, after
+    // the instances table; an instance without it gets no line.
+    #[test]
+    fn status_shows_each_instances_engine_tracing() {
+        let instance = |index: u32, tracing: Option<Value>| {
+            let mut i = json!({"index": index, "host_id": "01HOSTA",
+                "observed_state": "ready", "lifecycle": "active"});
+            if let Some(tracing) = tracing {
+                i["engine_tracing"] = tracing;
+            }
+            i
+        };
+        let d = json!({"name": "m", "observed_state": "ready", "instances": [
+            instance(0, Some(json!({"state": "on"}))),
+            instance(1, Some(json!({"state": "off", "reason": "retention_zero"}))),
+            instance(2, None),
+        ]});
+        let out = render(View::Status, &d, &names());
+        assert!(
+            out.contains(
+                "\nInstance 0  engine tracing: on\n\
+                 Instance 1  engine tracing: off (retention_zero)\n"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("Instance 2  engine tracing"), "{out}");
+        let none = json!({"name": "m", "observed_state": "ready",
+            "instances": [instance(0, None)]});
+        assert!(!render(View::Status, &none, &names()).contains("engine tracing"));
     }
 
     #[test]

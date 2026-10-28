@@ -72,6 +72,7 @@ fn only_sglang_0_5_22_with_one_tokenizer_worker_aborts_requests() {
             build_fingerprint: Some(build.into()),
             tokenizer_workers: workers,
             remote_host: None,
+            engine_trace: false,
         };
     assert!(launch_aborts_requests(&lane("sglang", "0.5.22", Some(1))));
     assert!(!launch_aborts_requests(&lane("sglang", "0.5.22", Some(2))));
@@ -84,6 +85,7 @@ fn only_sglang_0_5_22_with_one_tokenizer_worker_aborts_requests() {
         build_fingerprint: None,
         tokenizer_workers: None,
         remote_host: None,
+        engine_trace: false,
     };
     assert!(!launch_aborts_requests(&unknown));
 }

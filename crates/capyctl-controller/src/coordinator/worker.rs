@@ -1231,6 +1231,7 @@ pub struct ExecutionBinding {
     cleanup: CleanupExecutor,
     settle: Option<SettlementExecutor>,
     lmcache: Option<Arc<capyctl_adapters::lmcache::LmcacheState>>,
+    engine_tracing: Option<Arc<capyctl_adapters::engine_tracing::TracingReport>>,
 }
 impl ExecutionBinding {
     /// Remote bindings deliberately have no local process tools. Their cleanup
@@ -1241,6 +1242,7 @@ impl ExecutionBinding {
             cleanup,
             settle: None,
             lmcache: None,
+            engine_tracing: None,
         }
     }
 
@@ -1257,6 +1259,16 @@ impl ExecutionBinding {
     /// as an embedded launch's (the record before Ready, the fallback).
     pub fn with_lmcache(mut self, state: Arc<capyctl_adapters::lmcache::LmcacheState>) -> Self {
         self.lmcache = Some(state);
+        self
+    }
+
+    /// ADR 0037 §7: the report the binding's engine fills with its host's
+    /// engine tracing decision, recorded before Ready.
+    pub fn with_engine_tracing(
+        mut self,
+        report: Arc<capyctl_adapters::engine_tracing::TracingReport>,
+    ) -> Self {
+        self.engine_tracing = Some(report);
         self
     }
 }
@@ -1317,6 +1329,11 @@ struct Driver {
     /// what Initialize did about the server, read at Ready and at failure.
     /// `None` for a launch planned before ADR 0033 and a group.
     lmcache: Option<Arc<capyctl_adapters::lmcache::LmcacheState>>,
+    /// ADR 0037 §7: the launch's engine tracing decision, from its spec
+    /// (embedded) or its host's result (remote), recorded before Ready so
+    /// the router's lane and status read it. `None` when nothing decides it
+    /// (an adopted launch, a test driver): nothing is recorded.
+    engine_tracing: Option<Arc<capyctl_adapters::engine_tracing::TracingReport>>,
 }
 
 /// Builds the process tools for one launch around the association that records its
@@ -1582,6 +1599,7 @@ impl OwnedCoordinator {
                     tools: None,
                     settle: binding.settle,
                     lmcache: binding.lmcache,
+                    engine_tracing: binding.engine_tracing,
                 }))
             }),
             true,
@@ -1793,6 +1811,12 @@ impl OwnedCoordinator {
                 // ADR 0033 (lifecycle design §2.3): the one state the adapter,
                 // the launch-time check and this driver share.
                 let lmcache = spec_lmcache(&spec);
+                // ADR 0037 §7: the embedded launch's decision, from its spec.
+                let engine_tracing = Some(Arc::new(
+                    capyctl_adapters::engine_tracing::TracingReport::of(
+                        spec.engine_tracing().outcome(),
+                    ),
+                ));
                 let engine = bindings.adapter(declared, spec, tools.clone())?;
                 // ADR 0014 §7 (WE3): the embedded host verifies the checkpoint
                 // against the recorded digest before Initialize and Restore,
@@ -1833,6 +1857,7 @@ impl OwnedCoordinator {
                     tools: Some(tools),
                     settle: None,
                     lmcache,
+                    engine_tracing,
                 }))
             }),
             false,
@@ -2899,6 +2924,24 @@ async fn drive(
                 owner
                     .store()
                     .record_launch_lmcache(owner.session(), &binding, &outcome, now)
+            })
+            .await?;
+    }
+    // ADR 0037 §7: the launch's engine tracing decision, recorded before
+    // Ready so the router's lane and status never see the launch without it.
+    if let Some(outcome) = driver
+        .engine_tracing
+        .as_ref()
+        .and_then(|report| report.get())
+    {
+        let binding = work.binding_id().to_owned();
+        shared
+            .read(move |owner, _| {
+                owner.store().record_launch_engine_tracing(
+                    owner.session(),
+                    &binding,
+                    outcome.code(),
+                )
             })
             .await?;
     }

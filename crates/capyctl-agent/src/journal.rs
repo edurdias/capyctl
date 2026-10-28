@@ -485,6 +485,11 @@ impl HostJournal {
         // `LaunchLmcacheReport`). Evidence only, same schema version like
         // member_exits: an older journal simply has no report.
         tx.execute_batch("CREATE TABLE IF NOT EXISTS launch_lmcache(command_id TEXT PRIMARY KEY REFERENCES commands(command_id),report BLOB NOT NULL);")?;
+        // ADR 0037 §7: a LaunchSingle's engine tracing decision, frozen when
+        // it launched (`on` or the off reason's code). Evidence only, same
+        // schema version like member_exits: an older journal has none, and
+        // its launches are reported and re-bound untraced.
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS launch_engine_tracing(command_id TEXT PRIMARY KEY REFERENCES commands(command_id),state TEXT NOT NULL);")?;
         let bound: (String, String) = tx.query_row(
             "SELECT controller,host FROM authority WHERE singleton=1",
             [],
@@ -1984,6 +1989,15 @@ impl HostJournal {
                 }
                 _ => None,
             },
+            // ADR 0037 §7: a LaunchSingle's engine tracing, as journaled
+            // when it launched; empty for every other command.
+            engine_tracing: match command.action {
+                MemberAction::LaunchSingle(_) => {
+                    let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+                    engine_tracing_state(&db, command_id)?.unwrap_or_default()
+                }
+                _ => String::new(),
+            },
         };
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         // A launch that is not resident (parking, parked, restoring or
@@ -2207,6 +2221,43 @@ impl HostJournal {
             .is_some_and(|report| report.state == LaunchLmcacheState::On))
     }
 
+    /// ADR 0037 §7: journal the engine tracing decision of the LaunchSingle
+    /// `command_id` (`on` or the off reason's code), before its engine
+    /// starts, so a replay reports it and a restarted host binds the
+    /// launch's ingress with it. The first decision stands: it was frozen
+    /// with the launch.
+    pub fn record_launch_engine_tracing(
+        &self,
+        command_id: &str,
+        state: &str,
+    ) -> Result<(), JournalError> {
+        self.validate()?;
+        if !capyctl_protocol::execution::ENGINE_TRACING_STATES.contains(&state) {
+            return Err(JournalError::Unauthorized);
+        }
+        let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+        let command = load_command(&db, command_id)?;
+        if !matches!(command.action, MemberAction::LaunchSingle(_)) {
+            return Err(JournalError::Unauthorized);
+        }
+        db.execute(
+            "INSERT INTO launch_engine_tracing(command_id,state) VALUES(?1,?2) ON CONFLICT(command_id) DO NOTHING",
+            params![command_id, state],
+        )?;
+        Ok(())
+    }
+
+    /// ADR 0037 §7: the journaled engine tracing decision of the launch
+    /// `owned_handle`, if one was journaled.
+    pub fn launch_engine_tracing(
+        &self,
+        owned_handle: &str,
+    ) -> Result<Option<String>, JournalError> {
+        self.validate()?;
+        let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+        engine_tracing_state(&db, owned_handle)
+    }
+
     /// ADR 0033 §4 (lifecycle design §1.8): the incarnation of every launch
     /// this host still claims, whose private LMCache directory a role start
     /// keeps.
@@ -2375,6 +2426,17 @@ fn lmcache_report(
                 .ok_or(JournalError::Storage)
         })
         .transpose()
+}
+
+/// ADR 0037 §7: the journaled engine tracing state of `command_id`, if any.
+fn engine_tracing_state(db: &Connection, command_id: &str) -> Result<Option<String>, JournalError> {
+    Ok(db
+        .query_row(
+            "SELECT state FROM launch_engine_tracing WHERE command_id=?1",
+            [command_id],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 /// ADR 0027, ADR 0033 §3: `current` is still the launch `expected` names:

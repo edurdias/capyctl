@@ -420,6 +420,12 @@ pub struct InstanceSnapshot {
     /// planned before ADR 0033 and an instance never started. Additive.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lmcache: Option<InstanceLmcache>,
+    /// ADR 0037 §13: the engine tracing of the instance's retained launch,
+    /// as decided when it launched: `on`, or `off` with its reason. Absent
+    /// for a launch recorded before engine tracing, a group instance and an
+    /// instance not running. Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_tracing: Option<crate::engine_tracing::InstanceEngineTracing>,
     /// ADR 0035 §1a, §5: an instance on several GPUs of one host, or under
     /// `topology: auto`: what was asked for (`requested`: `"auto"` or N),
     /// and once placed the size it runs at and its GPUs in rank order
@@ -1047,6 +1053,7 @@ impl Store {
                         }
                     },
                     lmcache: None,
+                    engine_tracing: None,
                     topology: None,
                     collectives: None,
                 },
@@ -1070,6 +1077,11 @@ impl Store {
                     .unwrap_or_else(|| entry.revision.clone());
                 instance.group = group_status(&tx, &deployment, instance.index, &revision)?;
                 instance.lmcache = instance_lmcache(&tx, &deployment, instance.index)?;
+                instance.engine_tracing = crate::engine_tracing::instance_engine_tracing(
+                    &tx,
+                    &deployment,
+                    instance.index,
+                )?;
                 if instance.group.is_none() {
                     instance.topology =
                         instance_topology(&tx, &deployment, instance.index, &revision)?;

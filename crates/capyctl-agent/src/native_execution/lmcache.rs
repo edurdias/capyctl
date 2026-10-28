@@ -551,6 +551,9 @@ impl NativeHostExecution {
                 let served = effective.routes.first().cloned().ok_or(SessionError)?;
                 let state = LmcacheState::attached(server.clone(), server_plan);
                 let prepared = self.prepare(&effective, plan, &served, None)?;
+                // ADR 0037 §7: the engine starts again with its launch's
+                // frozen decision (on only while this role still exports).
+                let tracing = self.restored_engine_tracing(&owner.identity.command_id);
                 let adapter = self.launch_adapter(
                     prepared,
                     &effective,
@@ -559,6 +562,8 @@ impl NativeHostExecution {
                     &served,
                     tools,
                     Some(state.clone()),
+                    &tracing,
+                    owner.identity.instance_index,
                 )?;
                 let id = &command.identity;
                 let step = RuntimeCommand {

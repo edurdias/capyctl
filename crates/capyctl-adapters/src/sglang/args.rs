@@ -200,6 +200,27 @@ impl SglangLaunch {
         Ok(self)
     }
 
+    /// ADR 0037 §7: the launch's engine tracing, a public setting
+    /// (`trace_endpoint`, the collector's OTLP/HTTP traces URL) the entry
+    /// validates and renders as the reserved `enable_trace=True,
+    /// otlp_traces_endpoint=<endpoint>, otlp_service_name="sglang"`, pinned
+    /// after SGLang resolved its arguments. Absent, the entry renders none of
+    /// them. A group member never traces (`group`).
+    pub fn with_trace_endpoint(mut self, endpoint: &str) -> Result<Self, RuntimeError> {
+        if self.public["settings"].get("group").is_some()
+            || endpoint.is_empty()
+            || endpoint.len() > 4096
+            || !(endpoint.starts_with("http://") || endpoint.starts_with("https://"))
+            || endpoint
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(RuntimeError::Unsupported);
+        }
+        self.public["settings"]["trace_endpoint"] = json!(endpoint);
+        Ok(self)
+    }
+
     /// The final launcher substitutes three distinct protected descriptor numbers
     /// (for a group worker, the private launch descriptor and, when deep, its
     /// observation credential) only after resolving the private frozen inputs
@@ -262,6 +283,11 @@ impl SglangLaunch {
             for (name, value) in crate::lmcache::NO_USAGE_TRACKING {
                 env.insert(name.into(), value.into());
             }
+        }
+        // ADR 0037 §7: a traced launch's protocol and span level; never
+        // `SGLANG_TRACE_ASYNC`.
+        if self.public["settings"].get("trace_endpoint").is_some() {
+            crate::engine_tracing::render_sglang_env(&mut env);
         }
         Ok(RenderedCommand { argv, env })
     }

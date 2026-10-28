@@ -222,6 +222,9 @@ pub struct SglangAdapter {
     /// ADR 0033: the launch's LMCache server and report, shared with the
     /// caller; `None` for a launch that never uses LMCache.
     lmcache: Option<Arc<crate::lmcache::LmcacheState>>,
+    /// ADR 0037 §7: the collector endpoint of a launch with engine tracing,
+    /// decided when it launched; `None` renders nothing.
+    trace_endpoint: Option<String>,
 }
 
 impl SglangAdapter {
@@ -276,6 +279,7 @@ impl SglangAdapter {
             ranks: metadata.tensor_parallel(),
             api: capyctl_config::effective::DeploymentApi::Chat,
             lmcache: None,
+            trace_endpoint: None,
         })
     }
 
@@ -442,6 +446,18 @@ impl SglangAdapter {
 
     pub(super) fn lmcache(&self) -> Option<&Arc<crate::lmcache::LmcacheState>> {
         self.lmcache.as_ref()
+    }
+
+    /// ADR 0037 §7: the launch traces to `endpoint` (its decision was on).
+    /// Initialize names it in the public descriptor (`trace_endpoint`), which
+    /// the protected entry renders as the owned tracing options.
+    pub fn with_trace_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.trace_endpoint = Some(endpoint.into());
+        self
+    }
+
+    pub(super) fn trace_endpoint(&self) -> Option<&str> {
+        self.trace_endpoint.as_deref()
     }
 
     /// ADR 0033 §7: whether a Park or Restore of this launch is the

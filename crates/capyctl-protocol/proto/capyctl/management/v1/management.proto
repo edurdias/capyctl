@@ -774,6 +774,12 @@ message MemberExecutionResult {
   // ADR 0033 §§8, 9 (additive): LaunchSingle and Restore results only, what
   // became of the launch's LMCache. Absent otherwise and from an older host.
   LaunchLmcacheReport lmcache = 21;
+  // ADR 0037 §7 (additive): LaunchSingle results only, the launch's engine
+  // tracing decision, frozen when it launched: `on`, or why it is off
+  // (`host_off`, `engine_unsupported`, `not_installed`, `group`,
+  // `retention_zero`). Empty otherwise and from an older host, which encodes
+  // exactly as before.
+  string engine_tracing = 22;
 }
 // ADR 0033 §§3, 8, 9: `on` names the server's ports and pool; `off` names a
 // closed reason and its detail (at most 2048 bytes: the redacted engine log

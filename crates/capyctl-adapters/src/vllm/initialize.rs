@@ -136,6 +136,9 @@ fn engine_environment(
     // telemetry switches `render_command` rendered for it.
     // ADR 0035 §4: a launch on several GPUs keeps the expected shape
     // `render_command` rendered for the entry's `tp_drift` check.
+    // ADR 0037 §7: a traced launch keeps the tracing variables
+    // `render_command` rendered; they are reserved names a profile or a
+    // deployment cannot set, so only the rendered values ever get here.
     env.retain(|name, _| {
         ENGINE_ENV_ALLOWLIST.contains(&name.as_str())
             || plan.build_env.contains_key(name)
@@ -150,6 +153,9 @@ fn engine_environment(
                 && crate::lmcache::NO_USAGE_TRACKING
                     .iter()
                     .any(|(tracking, _)| tracking == name)
+                && rendered.contains_key(name))
+            || (plan.engine_tracing.is_some()
+                && crate::engine_tracing::VLLM_ENV.contains(&name.as_str())
                 && rendered.contains_key(name))
     });
     env
@@ -641,6 +647,67 @@ mod tests {
         for (name, _) in crate::engine_telemetry::VLLM {
             assert!(!env.contains_key(*name), "{name}");
         }
+    }
+
+    // T48 T21 (ADR 0037 §7): a traced launch renders the endpoint in the
+    // reserved block and spawns with exactly the three tracing variables; an
+    // untraced one renders no tracing option and spawns with no `OTEL_*`
+    // name, even when the agent's own environment has some.
+    #[test]
+    fn a_traced_launch_spawns_with_the_tracing_options_and_variables() {
+        let mut plan = input(None);
+        let spawn = |plan: &PlanInputVllm| {
+            engine_environment(
+                &render_command(plan).unwrap().env,
+                plan,
+                "engine-key",
+                None,
+                &|name: &str| name.starts_with("OTEL_").then(|| "inherited".to_owned()),
+                &BTreeMap::new(),
+                crate::engine_telemetry::EngineTelemetry::Off,
+            )
+        };
+        let argv = render_command(&plan).unwrap().argv;
+        assert!(!argv
+            .iter()
+            .any(|a| a.contains("otlp") || a.contains("detailed-traces")));
+        assert!(!spawn(&plan).keys().any(|k| k.starts_with("OTEL_")));
+        plan.engine_tracing = crate::engine_tracing::VllmTrace::for_launch(
+            &crate::engine_tracing::EngineTracing::On {
+                endpoint: "http://127.0.0.1:4318/v1/traces".into(),
+            },
+            "chat",
+            0,
+        );
+        let argv = render_command(&plan).unwrap().argv;
+        let marker = argv
+            .iter()
+            .position(|a| a == crate::vllm::args::USER_ARGS_MARKER)
+            .unwrap();
+        let flag = argv
+            .iter()
+            .position(|a| a == "--otlp-traces-endpoint")
+            .unwrap();
+        assert!(flag < marker, "rendered in the reserved block");
+        assert_eq!(argv[flag + 1], "http://127.0.0.1:4318/v1/traces");
+        assert!(!argv.iter().any(|a| a.contains("detailed-traces")));
+        let env = spawn(&plan);
+        let tracing: BTreeMap<_, _> = env
+            .iter()
+            .filter(|(k, _)| k.starts_with("OTEL_"))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            tracing,
+            BTreeMap::from([
+                ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf"),
+                (
+                    "OTEL_RESOURCE_ATTRIBUTES",
+                    "capyctl.deployment=chat,capyctl.instance=0"
+                ),
+                ("OTEL_SERVICE_NAME", "vllm"),
+            ])
+        );
     }
 
     // T21 (owner decision 2026-10-22): under `engine_telemetry: off` every

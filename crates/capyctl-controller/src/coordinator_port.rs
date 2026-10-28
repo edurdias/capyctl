@@ -358,6 +358,9 @@ impl CoordinatorLifecycle {
                 revision,
                 // Decided by the caller once the owner lock is released.
                 request_abort: false,
+                // ADR 0037 §7: the launch's own decision, recorded before its
+                // Ready; untraced when its record is unknown.
+                engine_trace: lane.as_ref().is_some_and(|lane| lane.engine_trace),
             },
             lane,
         ))

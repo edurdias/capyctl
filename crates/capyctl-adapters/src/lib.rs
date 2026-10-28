@@ -10,6 +10,8 @@ pub mod engine_log;
 // Owner decision 2026-10-22: the engines' own usage reporting, off unless
 // the host allows it.
 pub mod engine_telemetry;
+// ADR 0037 §§7, 11: the engines' own spans, off unless the host turns them on.
+pub mod engine_tracing;
 pub mod forward;
 // ADR 0028 §10: the engine-neutral arguments of a multi-node group member.
 pub mod group;

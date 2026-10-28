@@ -405,6 +405,24 @@ pub(crate) fn clear_stale_build_locks(
     }
 }
 
+/// ADR 0037 §§7, 11: an embedded launch's engine tracing, from this role's
+/// host setting, its engine and registered build, the deployment's or the
+/// embedded host's zero retention, and (only when everything else would
+/// trace) the shape of its environment. An embedded launch is never a
+/// multi-node group member.
+fn embedded_engine_tracing(
+    effective: &capyctl_config::effective::EffectiveDeployment,
+) -> capyctl_adapters::engine_tracing::EngineTracing {
+    use capyctl_config::lmcache::Retention;
+    capyctl_agent::tracing_install::decide_launch(
+        effective.profile.engine,
+        &effective.profile.build_fingerprint,
+        std::path::Path::new(&effective.profile.executable),
+        effective.retention == Retention::Zero || effective.host.retention == Retention::Zero,
+        false,
+    )
+}
+
 impl EngineBindings for ProfileBindings {
     /// SPEC §8.2 / T21: a signalled stop never runs the entry's exit handler,
     /// so the gone launch's rendezvous directory is removed here, on the same
@@ -439,6 +457,16 @@ impl EngineBindings for ProfileBindings {
                         work.endpoint()
                     ))
                 })?;
+                // ADR 0037 §§7, 11: the embedded launch's engine tracing, decided
+                // here as a host agent decides its own, and rendered by its plan.
+                let engine_tracing = embedded_engine_tracing(effective);
+                // Discrete GPU design §6: sized against the card's total.
+                let mut launch = self.vllm_plan(work, &self.sized(work)?)?;
+                launch.engine_tracing = capyctl_adapters::engine_tracing::VllmTrace::for_launch(
+                    &engine_tracing,
+                    &effective.name,
+                    work.instance_index(),
+                );
                 Ok(AdapterSpec::Vllm {
                     endpoint,
                     // The adapter talks to the engine with the same per-launch key
@@ -459,8 +487,7 @@ impl EngineBindings for ProfileBindings {
                         .first()
                         .cloned()
                         .unwrap_or_else(|| effective.name.clone()),
-                    // Discrete GPU design §6: sized against the card's total.
-                    launch: Some(self.vllm_plan(work, &self.sized(work)?)?),
+                    launch: Some(launch),
                     // SPEC §13.3: local-only is not unauthenticated. One fresh key
                     // per launch, hex so it survives an environment variable; the
                     // driver factory seals it under the binding before the builder
@@ -481,6 +508,7 @@ impl EngineBindings for ProfileBindings {
                     api: effective.api,
                     // ADR 0033 §§3, 6: the store's grant (or its reason off).
                     lmcache: self.lmcache(work, effective)?,
+                    engine_tracing,
                 })
             }
             Engine::Sglang => {
@@ -517,6 +545,9 @@ impl EngineBindings for ProfileBindings {
                     _ => None,
                 };
                 Ok(AdapterSpec::Sglang {
+                    // ADR 0037 §§7, 11: on, Initialize names the collector in
+                    // the descriptor.
+                    engine_tracing: embedded_engine_tracing(effective),
                     frozen,
                     // SPEC §13.3: one fresh key per role, hex so it survives the
                     // factory's decode-and-seal; the resolved-spawn factory

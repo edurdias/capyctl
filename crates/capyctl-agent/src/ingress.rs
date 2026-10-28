@@ -67,6 +67,10 @@ pub struct EngineAccess {
     /// version and settings it was approved with. Only then does a chat
     /// request carry the router's ID to the engine; otherwise it is dropped.
     pub request_abort: bool,
+    /// ADR 0037 §§6, 7: whether the launch's engine was started with engine
+    /// tracing (its launch-time decision was on). Only then may the ingress
+    /// send the engine a trace context; every other launch gets none.
+    pub engine_trace: bool,
 }
 impl EngineAccess {
     /// A built-in engine: read by its family's `/metrics`, always keyed.
@@ -76,6 +80,7 @@ impl EngineAccess {
             signal: crate::load::LaunchSignal::Builtin,
             keyed: true,
             request_abort: false,
+            engine_trace: false,
         }
     }
     /// ADR 0031 §6, §7: a custom engine, read by its manifest's idle signal
@@ -86,6 +91,7 @@ impl EngineAccess {
             signal: crate::load::LaunchSignal::Custom(custom.manifest.idle.clone()),
             keyed: custom.manifest.uses_api_key(),
             request_abort: false,
+            engine_trace: false,
         }
     }
     /// ADR 0031 §6, AGENTS.md (uncertainty must retain accounting): a launch
@@ -97,6 +103,7 @@ impl EngineAccess {
             signal: crate::load::LaunchSignal::Unknown,
             keyed: false,
             request_abort: false,
+            engine_trace: false,
         }
     }
     /// ADR 0032 §2: the same access, with whether the launch's engine takes
@@ -104,6 +111,13 @@ impl EngineAccess {
     pub fn with_request_abort(self, request_abort: bool) -> Self {
         Self {
             request_abort,
+            ..self
+        }
+    }
+    /// ADR 0037 §7: the same access, with whether the launch's engine traces.
+    pub fn with_engine_trace(self, engine_trace: bool) -> Self {
+        Self {
+            engine_trace,
             ..self
         }
     }
