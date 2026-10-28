@@ -17,6 +17,8 @@ use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
+// ADR 0040 §8: the snapshot's supported-action hints, as handler codes.
+mod action_hints;
 pub mod actions;
 pub mod configuration;
 mod credentials;
@@ -304,7 +306,9 @@ async fn snapshot(State(state): State<Arc<AppState>>, request: Request) -> Respo
     let source = state.source.clone();
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        source.snapshot()
+        let mut snapshot = source.snapshot()?;
+        action_hints::map_reasons(&mut snapshot);
+        Ok::<_, SnapshotUnavailable>(snapshot)
     })
     .await
     {

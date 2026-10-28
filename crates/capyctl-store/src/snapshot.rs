@@ -165,6 +165,12 @@ pub struct DeploymentSnapshot {
     /// GPU without `auto`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topology: Option<serde_json::Value>,
+    /// ADR 0040 §8: each lifecycle action the management API takes on this
+    /// deployment, whether the current state lets it through and, when not,
+    /// why ([`deployment_actions`]). Additive; absent for a kind the
+    /// lifecycle actions refuse whatever its state.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ActionHint>,
 }
 
 /// ADR 0014 §5 (owner decision 2026-09-25): the effective context of the
@@ -432,6 +438,75 @@ pub struct InstanceSnapshot {
     /// unauthenticated there. Absent otherwise. Additive.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collectives: Option<&'static str>,
+    /// ADR 0040 §8: `start` and `stop` of this instance, as for its
+    /// deployment ([`instance_actions`]). Additive.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ActionHint>,
+}
+
+/// ADR 0040 §8: an action the management API takes on a deployment (all of
+/// them) or on one instance (`start` and `stop`). Suspend and resume, which
+/// the API refuses as unsupported, are not among them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HintedAction {
+    Start,
+    Stop,
+    Park,
+    Preinitialize,
+    Delete,
+}
+
+/// ADR 0040 §8: why the current state alone refuses an action, named by the
+/// store refusal the action's acceptance returns for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionRefusal {
+    /// `LifecycleError::Conflict`: the lifecycle state does not permit it.
+    Conflict,
+    /// `LifecycleError::RuntimeRetained`: what it acts on still holds a
+    /// runtime (nothing left to start; a delete waits for verified cleanup).
+    RuntimeRetained,
+    /// `LifecycleError::Stale`: the instance's incarnation is already being
+    /// replaced by a stop in flight.
+    Stale,
+}
+
+/// ADR 0040 §8: one action and whether the current state lets it through.
+/// Serialized as `action`, `available` and, when refused, `reason`. A hint is
+/// not authority: refusals that depend on runtime conditions (room, sources,
+/// the worker) are left to the handlers, which still decide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionHint {
+    pub action: HintedAction,
+    /// `None` when the state alone does not refuse it.
+    pub refusal: Option<ActionRefusal>,
+    /// The management API's error code for `refusal`, the one the action's
+    /// handler answers with. The store leaves it unset; the API fills it in.
+    pub reason: Option<&'static str>,
+}
+
+impl ActionHint {
+    fn new(action: HintedAction, refusal: Option<ActionRefusal>) -> Self {
+        Self {
+            action,
+            refusal,
+            reason: None,
+        }
+    }
+}
+
+impl Serialize for ActionHint {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut hint = serializer.serialize_struct("ActionHint", 3)?;
+        hint.serialize_field("action", &self.action)?;
+        hint.serialize_field("available", &self.refusal.is_none())?;
+        match self.reason {
+            Some(reason) => hint.serialize_field("reason", reason)?,
+            None => hint.skip_field("reason")?,
+        }
+        hint.end()
+    }
 }
 
 /// ADR 0035 §1a, §5: an instance's tensor-parallel size on one host.
@@ -900,6 +975,7 @@ impl Store {
                 parsers: None,
                 api: Default::default(),
                 topology: None,
+                actions: Vec::new(),
             })
         })?;
         let mut deployments = deployments;
@@ -1049,6 +1125,7 @@ impl Store {
                     lmcache: None,
                     topology: None,
                     collectives: None,
+                    actions: Vec::new(),
                 },
             ))
         })?;
@@ -1132,6 +1209,14 @@ impl Store {
             }
             if let Some(state) = aggregate_state(&entry.instances) {
                 entry.observed_state = state.into();
+            }
+            // ADR 0040 §8: what the derived states let through. Every action
+            // refuses a deployment that is not a managed model (ADR 0011).
+            if entry.kind == "model" {
+                for instance in &mut entry.instances {
+                    instance.actions = instance_actions(instance);
+                }
+                entry.actions = deployment_actions(entry);
             }
         }
         let routes = budget.read(
@@ -1751,6 +1836,83 @@ fn aggregate_state(instances: &[InstanceSnapshot]) -> Option<&'static str> {
     None
 }
 
+/// Derived instance states whose runtime is not a start in flight: a start
+/// finds nothing to start or wake there and refuses `RuntimeRetained`
+/// (`placement::prepare`; a parked or waking instance is woken instead).
+const RUNNING: [&str; 4] = ["ready", "reconciling", "stopping", "parking"];
+
+/// ADR 0040 §8: the deployment's lifecycle actions and the refusals its
+/// derived instance states (and its own admission and dispatch gates) decide
+/// alone, each as the action's acceptance refuses it. A state that does not
+/// decide (`uncertain`, a stop hidden behind `queued`) hints nothing, and
+/// a refusal that depends on configuration (a deployment that never parks)
+/// or runtime conditions is left to the handler. `suspended` is not an input:
+/// a deployment marked suspended reads as stopped.
+pub fn deployment_actions(deployment: &DeploymentSnapshot) -> Vec<ActionHint> {
+    use ActionRefusal::*;
+    let all = &deployment.instances;
+    let active = || all.iter().filter(|i| i.lifecycle == "active");
+    let is = |i: &InstanceSnapshot, states: &[&str]| states.contains(&i.observed_state.as_str());
+    // SPEC §6.3: a start starts every active instance, waking a parked one;
+    // refused when each already runs.
+    let start =
+        (active().next().is_some() && active().all(|i| is(i, &RUNNING))).then_some(RuntimeRetained);
+    // SPEC §6.3: an operator's Stop of a deployment holding nothing is
+    // recorded; refused when every instance holding a runtime is already
+    // stopping (`stop_in_transaction`).
+    let stop = (all.iter().any(|i| i.observed_state == "stopping")
+        && all
+            .iter()
+            .all(|i| is(i, &["stopping", "stopped", "failed"])))
+    .then_some(Conflict);
+    // SPEC §6.3: a park parks every READY instance (joining a park in
+    // flight); refused when no active instance is, or may be, either.
+    let park = active()
+        .all(|i| {
+            is(
+                i,
+                &[
+                    "stopped", "failed", "queued", "starting", "stopping", "parked", "waking",
+                ],
+            )
+        })
+        .then_some(Conflict);
+    // SPEC §6.3 (W6): a delete follows verified cleanup; anything an
+    // instance in another state holds, or an open gate, refuses it.
+    let delete = (deployment.admission_enabled
+        || deployment.dispatch_enabled
+        || all.iter().any(|i| !is(i, &["stopped", "failed"])))
+    .then_some(RuntimeRetained);
+    vec![
+        ActionHint::new(HintedAction::Start, start),
+        ActionHint::new(HintedAction::Stop, stop),
+        ActionHint::new(HintedAction::Park, park),
+        // SPEC §6.5: accepted in any state; it waits while work is in flight.
+        ActionHint::new(HintedAction::Preinitialize, None),
+        ActionHint::new(HintedAction::Delete, delete),
+    ]
+}
+
+/// ADR 0040 §8: `start` and `stop` of one instance (owner decision Q7), as
+/// [`deployment_actions`]. A retiring instance takes no start
+/// (`placement::prepare`); a stop of an instance whose stop is in flight
+/// finds its incarnation already replaced.
+pub fn instance_actions(instance: &InstanceSnapshot) -> Vec<ActionHint> {
+    let state = instance.observed_state.as_str();
+    let start = if instance.lifecycle != "active" {
+        Some(ActionRefusal::Conflict)
+    } else {
+        RUNNING
+            .contains(&state)
+            .then_some(ActionRefusal::RuntimeRetained)
+    };
+    let stop = (state == "stopping").then_some(ActionRefusal::Stale);
+    vec![
+        ActionHint::new(HintedAction::Start, start),
+        ActionHint::new(HintedAction::Stop, stop),
+    ]
+}
+
 struct SizeLimit(usize);
 impl std::io::Write for SizeLimit {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -1803,5 +1965,150 @@ mod capacity_tests {
             .collect();
         assert_eq!(instances, [(0, Some(4), "ready"), (1, None, "stopped")]);
         assert!(store.capacity(Some("missing")).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod action_tests {
+    use super::{
+        deployment_actions, instance_actions, ActionHint, ActionRefusal, DeploymentSnapshot,
+        HintedAction,
+    };
+    use crate::Store;
+    use ActionRefusal::*;
+
+    /// A stopped two-instance model as the snapshot reads it, its instances
+    /// then given `states` (`observed_state`, `lifecycle`).
+    fn deployment(states: [(&str, &str); 2]) -> DeploymentSnapshot {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute_batch(
+                r#"INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version,revision) VALUES('d','chat','model','stopped',0,0,1,1,1);
+                INSERT INTO effective_revisions VALUES('d',1,'{}','f');
+                INSERT INTO deployment_revision_instances(deployment_id,revision,instances,placement_json) VALUES('d',1,2,'{"hosts":null,"selector":{},"strategy":"spread","max_per_host":null}');
+                INSERT INTO deployment_instances(deployment_id,instance_index) VALUES('d',1);"#,
+            )
+            .unwrap();
+        let mut d = store.snapshot().unwrap().deployments.remove(0);
+        assert_eq!(d.instances.len(), 2);
+        for (instance, (state, lifecycle)) in d.instances.iter_mut().zip(states) {
+            instance.observed_state = state.into();
+            instance.lifecycle = lifecycle.into();
+        }
+        d
+    }
+
+    fn refusals(hints: &[ActionHint]) -> Vec<Option<ActionRefusal>> {
+        hints.iter().map(|hint| hint.refusal).collect()
+    }
+
+    // ADR 0040 §8: the snapshot of a managed model carries the hints of its
+    // stopped state, typed, in the order the actions are listed.
+    #[test]
+    fn a_stopped_model_snapshot_lists_its_action_hints() {
+        let d = deployment([("stopped", "active"), ("stopped", "active")]);
+        let actions: Vec<HintedAction> = d.actions.iter().map(|hint| hint.action).collect();
+        assert_eq!(
+            actions,
+            [
+                HintedAction::Start,
+                HintedAction::Stop,
+                HintedAction::Park,
+                HintedAction::Preinitialize,
+                HintedAction::Delete
+            ]
+        );
+        assert_eq!(
+            refusals(&d.actions),
+            [None, None, Some(Conflict), None, None]
+        );
+        assert!(d.actions.iter().all(|hint| hint.reason.is_none()));
+        assert_eq!(refusals(&d.instances[1].actions), [None, None]);
+    }
+
+    // ADR 0040 §8, for the states the Fake cannot hold in-process: a parked
+    // instance is woken by a start and stopped by a stop, and a start is
+    // refused only when every active instance already runs.
+    #[test]
+    fn hints_follow_every_instance_state() {
+        let cases = [
+            // (states, start, stop, park, delete)
+            (
+                [("parked", "active"), ("parked", "active")],
+                [None, None, Some(Conflict), None, Some(RuntimeRetained)],
+            ),
+            (
+                [("ready", "active"), ("stopped", "active")],
+                [None, None, None, None, Some(RuntimeRetained)],
+            ),
+            (
+                [("ready", "active"), ("parking", "active")],
+                [
+                    Some(RuntimeRetained),
+                    None,
+                    None,
+                    None,
+                    Some(RuntimeRetained),
+                ],
+            ),
+            (
+                [("reconciling", "active"), ("waking", "active")],
+                [None, None, None, None, Some(RuntimeRetained)],
+            ),
+            (
+                [("stopping", "active"), ("failed", "active")],
+                [
+                    None,
+                    Some(Conflict),
+                    Some(Conflict),
+                    None,
+                    Some(RuntimeRetained),
+                ],
+            ),
+            (
+                [("uncertain", "active"), ("stopped", "active")],
+                [None, None, None, None, Some(RuntimeRetained)],
+            ),
+            // A retiring instance is no start's target.
+            (
+                [("stopped", "active"), ("ready", "retiring")],
+                [None, None, Some(Conflict), None, Some(RuntimeRetained)],
+            ),
+        ];
+        for (states, expected) in cases {
+            let hints = deployment_actions(&deployment(states));
+            let expected = [expected[0], expected[1], expected[2], None, expected[4]];
+            assert_eq!(refusals(&hints), expected, "{states:?}");
+        }
+    }
+
+    // ADR 0040 §8: a delete waits while the deployment admits or dispatches,
+    // whatever its instances read.
+    #[test]
+    fn an_open_gate_refuses_a_delete() {
+        let mut d = deployment([("stopped", "active"), ("stopped", "active")]);
+        d.admission_enabled = true;
+        assert_eq!(deployment_actions(&d)[4].refusal, Some(RuntimeRetained));
+    }
+
+    // Owner decision Q7: one instance's start and stop.
+    #[test]
+    fn instance_hints_follow_its_state_and_lifecycle() {
+        let d = deployment([("parked", "active"), ("ready", "retiring")]);
+        assert_eq!(refusals(&instance_actions(&d.instances[0])), [None, None]);
+        assert_eq!(
+            refusals(&instance_actions(&d.instances[1])),
+            [Some(Conflict), None]
+        );
+        let d = deployment([("stopping", "active"), ("reconciling", "active")]);
+        assert_eq!(
+            refusals(&instance_actions(&d.instances[0])),
+            [Some(RuntimeRetained), Some(Stale)]
+        );
+        assert_eq!(
+            refusals(&instance_actions(&d.instances[1])),
+            [Some(RuntimeRetained), None]
+        );
     }
 }
