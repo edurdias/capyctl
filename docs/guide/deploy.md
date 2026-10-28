@@ -261,6 +261,114 @@ whichever team it picks. Any change to the request is a new version of the
 check, and a wake reference recorded with an older version is never compared
 with the new answers.
 
+## Embedding models
+
+An embedding model turns text into a vector of numbers, for search,
+retrieval and finding near-duplicates. It is served at `POST /v1/embeddings`
+([Embedding requests](requests.md#embedding-requests)) rather than at chat
+completions. Say so with `api`:
+
+```yaml title="embedder.yaml"
+name: embedder
+engine: vllm
+model: Qwen/Qwen3-Embedding-4B
+api: embeddings
+```
+
+`api: embeddings` is part of the deployment's revision, as `decisions` is.
+CapyCTL starts the engine as an embedding server: vLLM with
+`--runner pooling`, SGLang with `--is-embedding`, llama.cpp with
+`--embeddings` and batch sizes that fit any input
+([Embedding models on each engine](engines.md#embedding-models)). In this
+release an `embeddings` deployment:
+
+- runs on vLLM, SGLang, llama.cpp or a
+  [custom engine](engines.md#custom-engines) whose manifest says
+  `api: embeddings`. TensorFold has no embeddings endpoint and is refused with
+  `capability_missing:embeddings` ([Exit codes and errors](errors.md));
+- runs on one GPU of one machine: a `topology` is refused;
+- parks `deep` on vLLM and SGLang when it states no `residency` (on a
+  discrete GPU too, unless the engine profile turned deep parking off), and
+  restarts on llama.cpp and custom engines. `host_backed` is refused
+  everywhere, and `deep` is refused on llama.cpp and custom engines with
+  `capability_missing:deep_park`;
+- runs without [LMCache](engines.md#lmcache): status shows it off with the
+  reason `embeddings_unsupported`, and `lmcache: required` is refused;
+- has no tool-call or reasoning parser: `tool_call_parser`,
+  `reasoning_parser` and those options in `extra_args` are refused;
+- runs only on machines whose CapyCTL serves embedding models; an older one
+  is never chosen, and naming it is refused with
+  `host_capability_missing:embeddings`.
+
+Memory is sized as for any deployment of the same checkpoint. An embedding
+model holds little KV cache, since the engine keeps it only while it reads
+each input, so a deployment that states `resources` from its measured peak
+(`capyctl status deployment embedder --json`, `startup.measured`) often needs
+far less than the default.
+
+### Certified and uncertified
+
+`capyctl status deployment <name>` shows the API with its certification,
+`API     embeddings (certified)` or `API     embeddings (uncertified)`. CapyCTL
+shows `certified` on vLLM 0.32.0, SGLang 0.5.22 and llama.cpp 0.7.0, the
+versions the embedding live rows run on, and `uncertified` on every other
+version and on custom engines. A certified combination is a model, at a
+pinned revision, on one of those engine versions once its live rows have
+passed. Those rows have not run yet, so no model is certified on any engine
+in this release; [Embedding models on each engine](engines.md#embedding-models)
+lists the models they cover.
+
+An uncertified setup is never refused for being uncertified. An older vLLM
+or SGLang that serves embeddings, another checkpoint, or a custom engine runs
+with the same request checks, readiness check and wake check, and parks as
+the certified version would. CapyCTL promises nothing more about it: a fault
+shows as a failed start, a failed request or a failed wake check.
+
+### Chat checkpoints served as embeddings
+
+A generative checkpoint can be served as embeddings too. vLLM converts it
+itself (it pools the last token's hidden state), and SGLang serves
+decoder-style models with `--is-embedding`. The same weights served as `chat`
+and as `embeddings` are two revisions, two deployments with their own names,
+and the embeddings one runs uncertified. Whether the vectors are any good for
+retrieval depends on the model: a checkpoint trained for embeddings usually
+does far better.
+
+### The readiness check
+
+An embedding model generates no text, so CapyCTL proves it ready with an
+embedding instead. It sends this exact request, with `model` set to the name
+the engine serves the model under, straight to the engine on its private
+port:
+
+```json
+{
+  "model": "<the engine's served model name>",
+  "input": "CapyCTL readiness check: a quiet library with tall shelves of old books.",
+  "encoding_format": "float"
+}
+```
+
+The model is ready when it answers one vector of finite numbers that is not
+all zeros (its length above 1e-6); it does not have to be of length 1. The
+vector's length is recorded as the model's dimension, which llama.cpp
+deployments use to check `dimensions`. A model that answers malformed, or not
+at all, never becomes ready, and CapyCTL never sends it a chat request in
+place of the embedding. The same check runs after a restart, after every
+wake, and when a machine reconnects or CapyCTL restarts with the model still
+running.
+
+The first answer is kept as the reference for the wake check
+([Parking](parking.md#park-and-wake)). After every wake and every restart
+CapyCTL sends the same request again and compares the new vector with the
+reference: the same length, and a relative distance (`‖v − r‖ / ‖r‖`) within
+a tolerance. A model that fails is stopped with `wake_mismatch`. The
+tolerance is 0.02 for now (for vectors of length 1, a cosine similarity of
+0.9998); it is provisional, and a live measurement still to be made sets the
+final figure. Any change to
+the request is a new version of the check, and a reference recorded with
+another version is never compared with the new answers.
+
 ## Deploy and start
 
 ```bash

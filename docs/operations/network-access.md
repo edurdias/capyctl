@@ -157,9 +157,12 @@ Open only port 443 to the internet, never 8443.
   each get a key generated for that launch and checked by CapyCTL's guard;
   TensorFold has no key. The router
   is the only path from the network to an engine, and it forwards only the
-  allowlisted inference routes: `POST /v1/chat/completions`, and
-  `POST /v1/systemone` for decision models. A model running across machines
-  also opens peer ports; see below.
+  allowlisted inference routes: `POST /v1/chat/completions`,
+  `POST /v1/systemone` for decision models and `POST /v1/embeddings` for
+  embedding models. A host's ingress checks each request against the same
+  closed contract the router uses, refuses a body over 8 MiB, and passes an
+  embedding answer on as it arrives without holding it whole. A model running
+  across machines also opens peer ports; see below.
 
 ## Multi-node groups
 

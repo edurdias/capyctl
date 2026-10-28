@@ -471,7 +471,7 @@ health: /health
 | Field | What it holds | Required |
 |---|---|---|
 | `kind`, `schema_version` | `custom_engine` and `1`. | yes |
-| `api` | What every deployment on the engine serves: `chat` (`POST /v1/chat/completions`) or `decisions` (`POST /v1/systemone`, [Decision models](deploy.md#decision-models)). | yes |
+| `api` | What every deployment on the engine serves: `chat` (`POST /v1/chat/completions`), `decisions` (`POST /v1/systemone`, [Decision models](deploy.md#decision-models)) or `embeddings` (`POST /v1/embeddings`, [Embedding models](deploy.md#embedding-models)). | yes |
 | `args` | The whole argument list after the executable, with placeholders (below). | yes |
 | `version` | A version string, shown as the engine's version. Without it the engine shows `unversioned`. CapyCTL never runs the program to ask. | no |
 | `environment` | An absolute directory to fingerprint in place of the default ([Fingerprint and drift](#fingerprint-and-drift)). | no |
@@ -611,8 +611,9 @@ CapyCTL keeps, as for every engine:
   port; CapyCTL's endpoint is the only way to it from the network.
 - **Requests.** Lookup by model name, your API key, waiting, starting on
   demand, the 32 running requests per deployment and fairness between models.
-  A request has the same shape as for any engine: chat completions, or
-  CapyCTL's decision request ([Decision requests](requests.md#decision-requests)).
+  A request has the same shape as for any engine: chat completions,
+  CapyCTL's decision request ([Decision requests](requests.md#decision-requests))
+  or an embedding request ([Embedding requests](requests.md#embedding-requests)).
 - **Readiness** (below).
 - **Memory.** You state `resources`; CapyCTL derives nothing. It watches the
   engine's memory and shows the startup peak (`startup.measured` in
@@ -650,17 +651,21 @@ CapyCTL refuses:
   count of running requests.
 
 A deployment's `api` must be the manifest's: `api: decisions` on a chat engine
-is refused `capability_missing:decisions`, and a chat deployment on a decisions
-engine `capability_missing:chat`. For a decision model, a `topology` or a
-parking `residency` is refused by the decision-model rules first, with their
-message ("runs on one machine", "restarts instead of parking").
+is refused `capability_missing:decisions`, `api: embeddings` on another
+engine `capability_missing:embeddings`, and a chat deployment on a decisions
+engine `capability_missing:chat`. For a decision or embedding model, a
+`topology` or a parking `residency` is refused by that model kind's rules
+first, with their message ("runs on one machine", "restarts instead of
+parking", "runs on one GPU of one machine"). An embeddings custom engine is
+never certified ([Certified and uncertified](deploy.md#certified-and-uncertified)).
 
 ### Readiness
 
 A custom engine is ready when, in order, its port accepts a connection, its
 `health` path (when the manifest has one) answers 200, and the model answers
 the same check as on any engine: a short chat request for `chat`, the fixed
-decision for `decisions` ([Decision models](deploy.md#decision-models)), sent
+decision for `decisions` ([Decision models](deploy.md#decision-models)), the
+fixed embedding for `embeddings` ([Embedding models](deploy.md#embedding-models)), sent
 with the served name and the engine key when there is one. The engine's own
 `/v1/models` is not read; its shape differs from program to program. Without
 `timeouts.initialize`, the start gets the bound CapyCTL derives for every
@@ -844,6 +849,7 @@ The engine connects to it: vLLM through LMCache's `LMCacheMPConnector`
 | SGLang, a decision deployment or `--disable-radix-cache` | off: `engine_unsupported` (below) |
 | SGLang before 0.5.22 | off: "LMCache needs SGLang 0.5.22 or newer" |
 | llama.cpp, TensorFold | off: the engine has no LMCache integration |
+| any engine, an embedding deployment | off: `embeddings_unsupported` |
 | custom engine | off: CapyCTL does not render options for it |
 
 vLLM 0.32.0 and SGLang 0.5.22 with LMCache 0.5.6 are the qualified versions
@@ -1018,6 +1024,68 @@ parses tool calls and reasoning from the model's chat template, with no setting.
 [Engine options](engine-flags.md) lists, for each engine, which options are
 typed fields, which pass in `extra_args`, which need host approval and which
 CapyCTL reserves.
+
+## Embedding models
+
+A deployment with `api: embeddings` ([Embedding models](deploy.md#embedding-models))
+starts its engine as an embedding server. What CapyCTL renders, and what it
+refuses, on each engine:
+
+| Engine | Rendered | Your options | Limits |
+|---|---|---|---|
+| vLLM | `--runner pooling`; vLLM picks the conversion itself, so a generative architecture becomes an embedding model | `--pooler-config`, `--hf-overrides` (for example `{"is_matryoshka": true}` for a model that can shorten its vectors) | `dimensions` only for a model vLLM knows can shorten its vectors; `base64` and `float` only (CapyCTL refuses vLLM's `bytes` forms) |
+| SGLang | `--is-embedding` | `--json-model-override-args` | `dimensions` checked against the model's sizes |
+| llama.cpp | `--embeddings`, and `--ubatch-size` and `--batch-size` equal to the context of one slot, so any input that fits the context fits one batch | one `--pooling <type>`, never `none`; your own `--ubatch-size` or `--batch-size` wins over CapyCTL's | `dimensions` ignored by llama.cpp, so CapyCTL refuses any but the model's own |
+| TensorFold | nothing | | refused, `capability_missing:embeddings`: neither 0.6.6 nor 1.1.4 has an embeddings endpoint |
+| custom engine | whatever the manifest says (`api: embeddings`) | | restarts instead of parking |
+
+vLLM's `--runner` and `--convert` and SGLang's `--is-embedding` are reserved
+on every deployment, chat ones included, so `extra_args` cannot turn a chat
+deployment into an embedding server that would never pass its chat check. A
+profile or deployment that passed them before this release is refused with
+the usual reserved-option message. On llama.cpp `--embedding`, `--embeddings`
+and `--rerank` stay reserved everywhere, and `--pooling` on chat deployments
+([Engine options](engine-flags.md)). The larger batch sizes on llama.cpp cost
+memory; state `resources` from the measured peak, as for
+[decision models](deploy.md#decision-models).
+
+vLLM and SGLang embedding deployments park `deep` with the same calls as chat
+ones, and llama.cpp restarts. Parking an embedding server is checked by a
+live row on each engine; if it fails on an engine, that engine's embedding
+deployments restart instead.
+
+### Certified combinations
+
+CapyCTL shows `certified` on vLLM 0.32.0, SGLang 0.5.22 and llama.cpp 0.7.0
+(b11669), and runs every other version uncertified, never refused for it
+([Certified and uncertified](deploy.md#certified-and-uncertified)). A model on
+one of these engines is certified once the embedding live rows (EM1 to EM9)
+pass for it. They cover ten open-weight embedding models at pinned revisions,
+on every engine that can run each. None has run yet, so this release
+certifies no model on any engine; the table below records what each engine's
+source supports, not what has been run.
+
+| Model | Dimension | vLLM 0.32.0 | SGLang 0.5.22 | llama.cpp 0.7.0 |
+|---|---|---|---|---|
+| [Qwen3-Embedding-8B](https://huggingface.co/Qwen/Qwen3-Embedding-8B) | 4096 (shortens from 32) | registered, converted by vLLM | registered | registered, Qwen's Q8_0 GGUF |
+| [Qwen3-Embedding-4B](https://huggingface.co/Qwen/Qwen3-Embedding-4B) | 2560 (shortens from 32) | registered, converted by vLLM | registered | registered, Qwen's Q8_0 GGUF |
+| [bge-m3](https://huggingface.co/BAAI/bge-m3) | 1024 | registered | registered | registered, converted GGUF |
+| [pplx-embed-v1-0.6b](https://huggingface.co/perplexity-ai/pplx-embed-v1-0.6b) | 1024 | not registered; remote code, to be tried live | not registered; remote code, to be tried live | not supported |
+| [pplx-embed-v1-4b](https://huggingface.co/perplexity-ai/pplx-embed-v1-4b) | 2560 | not registered; remote code, to be tried live | not registered; remote code, to be tried live | not supported |
+| [multilingual-e5-large](https://huggingface.co/intfloat/multilingual-e5-large) | 1024 | registered | registered | registered, converted GGUF |
+| [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | 768 | registered | registered | registered, converted GGUF |
+| [all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) | 384 | registered | registered | registered, converted GGUF |
+| [all-mpnet-base-v2](https://huggingface.co/sentence-transformers/all-mpnet-base-v2) | 768 | not registered; to be tried live | not registered; to be tried live | not supported |
+| [Nemotron-3-Embed-1B-BF16](https://huggingface.co/nvidia/Nemotron-3-Embed-1B-BF16) | 2048 | not registered; to be tried live | not registered; to be tried live | not supported |
+
+"Registered" means the engine's source lists the architecture; whether it
+serves the model correctly is what the live rows establish. **Not
+supported** marks a combination the engine cannot run: llama.cpp's converter
+has no `PPLXQwen3Model` (pplx-embed), no MPNet (all-mpnet-base-v2) and only
+the causal form of Nemotron 3 Embed's architecture. CapyCTL does not refuse
+these; the engine fails to load the checkpoint and the start fails. The
+pplx-embed checkpoints ship their own code, so on vLLM and SGLang they need a
+profile added with `--allow-remote-code` and `engine_config.trust_remote_code: true`.
 
 ## vLLM weight loading while parking
 

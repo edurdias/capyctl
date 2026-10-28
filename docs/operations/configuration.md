@@ -391,7 +391,7 @@ The manifest's fields:
 |---|---|---|
 | `kind` | `custom_engine` | required |
 | `schema_version` | `1` | required |
-| `api` | `chat` or `decisions`: what every deployment on the engine serves; a deployment's `api` must be the same | required |
+| `api` | `chat`, `decisions` or `embeddings`: what every deployment on the engine serves; a deployment's `api` must be the same ([Embedding models](../guide/deploy.md#embedding-models)) | required |
 | `args` | the argument list after the executable, run without a shell; must hold `{host}`, `{port}` and `{model_dir}`, and may hold `{served_name}`, `{context_length}` and `{api_key}` (`{{` and `}}` are literal braces) | required |
 | `version` | a version string, shown as the engine's version | `unversioned` |
 | `environment` | an absolute directory fingerprinted in place of the default (the executable's virtual environment, else the executable alone) | the default |
@@ -533,7 +533,8 @@ Apart from these settings, decision deployments (`api: decisions`) on SGLang,
 and SGLang deployments that state `--disable-radix-cache`, run without
 LMCache (`engine_unsupported`;
 [sgl-project/sglang#45929](https://github.com/sgl-project/sglang/issues/45929)),
-and `lmcache: required` is refused for them
+and embedding deployments (`api: embeddings`) run without it on every engine
+(`embeddings_unsupported`). `lmcache: required` is refused for all of them
 ([LMCache](../guide/engines.md#lmcache)).
 
 ### Engine usage reporting
