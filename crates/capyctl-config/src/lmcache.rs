@@ -859,7 +859,7 @@ pub fn pool_basis_for_effective(
 
 /// `bytes` as whole GiB (`12 GiB`), or GiB to one decimal.
 fn gib_text(bytes: u64) -> String {
-    if bytes % GIB == 0 {
+    if bytes.is_multiple_of(GIB) {
         format!("{} GiB", bytes / GIB)
     } else {
         format!("{:.1} GiB", bytes as f64 / GIB as f64)
@@ -868,7 +868,7 @@ fn gib_text(bytes: u64) -> String {
 
 /// `bytes` as KiB (`144 KiB`), to one decimal when not whole.
 fn kib_text(bytes: u64) -> String {
-    if bytes % 1024 == 0 {
+    if bytes.is_multiple_of(1024) {
         format!("{} KiB", bytes / 1024)
     } else {
         format!("{:.1} KiB", bytes as f64 / 1024.0)
@@ -880,7 +880,7 @@ fn thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             out.push(',');
         }
         out.push(digit);
