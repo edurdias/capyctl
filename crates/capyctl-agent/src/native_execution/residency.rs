@@ -836,7 +836,8 @@ impl NativeHostExecution {
                     deployment_id: owner.identity.deployment_id.clone(),
                     member_id: plan.binding_id.clone(),
                 };
-                // ADR 0030 §3: a decisions launch answers the fixed decision.
+                // ADR 0030 §3: a decisions launch answers the fixed decision;
+                // ADR 0036 §5: an embeddings launch the fixed embedding.
                 if fresh_probe(
                     probe.as_ref(),
                     &member,

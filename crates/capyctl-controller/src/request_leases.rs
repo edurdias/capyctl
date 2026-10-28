@@ -284,13 +284,20 @@ impl RequestLeaseWriter {
     }
 
     /// ADR 0032 §4: close the cancelling lease `lease_id` on its request's own
-    /// final output, read whole after the engine was asked to abort it.
-    /// `Ok(false)` when it is no longer an open cancelling lease of this
-    /// session; nothing changed. An error leaves it charged.
-    pub async fn acknowledge(&self, lease_id: &str) -> Result<bool, LeaseRefused> {
+    /// final output, read whole after the engine was asked to abort it; ADR
+    /// 0036 §4: or on the answer of a cut embeddings request read to its end.
+    /// `evidence` names which, for the journaled receipt. `Ok(false)` when it
+    /// is no longer an open cancelling lease of this session; nothing
+    /// changed. An error leaves it charged.
+    pub async fn acknowledge(
+        &self,
+        lease_id: &str,
+        evidence: capyctl_store::request_lease_cancellations::CancelledEvidence,
+    ) -> Result<bool, LeaseRefused> {
         match self
             .submit(LeaseWrite::AcknowledgeCancelled {
                 lease_id: lease_id.to_owned(),
+                evidence,
             })
             .await?
         {

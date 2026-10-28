@@ -336,6 +336,10 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
     if command.probe_decision {
         needs.push(DECISIONS);
     }
+    // ADR 0036 §§5, 6, ADR 0017: likewise for the embedding flag.
+    if command.probe_embedding {
+        needs.push(EMBEDDINGS);
+    }
     // ADR 0014 amendment A20: a group member's own launch carries the tables
     // as a single launch does.
     if let Some(plan) = command.group_member_launch.as_ref() {

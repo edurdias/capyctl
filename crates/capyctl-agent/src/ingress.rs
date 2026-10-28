@@ -446,6 +446,9 @@ impl Ingress {
             .route(Kind::Chat.path(), post(forward_chat))
             // ADR 0030 §2: decision requests, exactly this path besides chat.
             .route(Kind::Decision.path(), post(forward_decision))
+            // ADR 0036 §10: embeddings requests, exactly this path besides
+            // chat and decisions.
+            .route(Kind::Embedding.path(), post(forward_embedding))
             .fallback(|| async { failure(StatusCode::NOT_FOUND) })
             .method_not_allowed_fallback(|| async { failure(StatusCode::METHOD_NOT_ALLOWED) })
             .with_state(self)
@@ -482,14 +485,17 @@ impl Ingress {
         Ok(entry)
     }
 }
-/// SPEC §10, ADR 0030 §2: the inference requests the ingress forwards, each on
-/// its own fixed path with its own closed body contract. Nothing else crosses.
+/// SPEC §10, ADR 0030 §2, ADR 0036 §10: the inference requests the ingress
+/// forwards, each on its own fixed path with its own closed body contract.
+/// Nothing else crosses.
 #[derive(Clone, Copy)]
 enum Kind {
     /// `POST /v1/chat/completions`.
     Chat,
     /// `POST /v1/systemone`, a decision request.
     Decision,
+    /// `POST /v1/embeddings`, an embeddings request (ADR 0036 §10).
+    Embedding,
 }
 impl Kind {
     /// The one path this kind is accepted on and forwarded to.
@@ -497,21 +503,26 @@ impl Kind {
         match self {
             Self::Chat => "/v1/chat/completions",
             Self::Decision => "/v1/systemone",
+            Self::Embedding => capyctl_adapters::embedding_probe::PATH,
         }
     }
     /// SPEC §10 / T19 T21: the supported payload only; an engine-internal
     /// field (request id, adapter path, hidden states, custom logit
     /// processor, disaggregation bootstrap, KV transfer, engine extras,
     /// priority) is refused before anything reaches the engine. ADR 0030 §2:
-    /// a decision request has its own contract, never the chat one.
+    /// a decision request has its own contract, never the chat one. ADR 0036
+    /// §3, §10: an embeddings request has OpenAI's closed contract, never
+    /// either of the others.
     fn allowed(self, body: &serde_json::Value) -> bool {
         match self {
             Self::Chat => capyctl_adapters::forward::chat_request_allowed(body),
             Self::Decision => capyctl_adapters::forward::decision_request_allowed(body),
+            Self::Embedding => capyctl_adapters::forward::embedding_request_allowed(body),
         }
     }
     /// Whether the engine's answer has a media type this kind relays: a chat
-    /// completion is JSON or a stream, a decision is whole JSON.
+    /// completion is JSON or a stream, a decision and an embeddings answer
+    /// are JSON.
     fn relays(self, content: &str) -> bool {
         content.starts_with("application/json")
             || (matches!(self, Self::Chat) && content.starts_with("text/event-stream"))
@@ -582,6 +593,9 @@ async fn forward_chat(State(ingress): State<Arc<Ingress>>, request: Request) -> 
 async fn forward_decision(State(ingress): State<Arc<Ingress>>, request: Request) -> Response {
     forward(ingress, request, Kind::Decision).await
 }
+async fn forward_embedding(State(ingress): State<Arc<Ingress>>, request: Request) -> Response {
+    forward(ingress, request, Kind::Embedding).await
+}
 async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Response {
     // SPEC §17 (M80): the ingress clock starts when the request reaches it.
     let received = Instant::now();
@@ -614,7 +628,8 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
     let Ok(request_id) = request_id(request.headers()) else {
         return failure(StatusCode::BAD_REQUEST);
     };
-    // ADR 0030 §2: one bound for every kind; a decision's images count in it.
+    // ADR 0030 §2, ADR 0036 §10: one bound for every kind; a decision's
+    // images and an embeddings batch count in it.
     let body = match tokio::time::timeout(
         Duration::from_secs(15),
         to_bytes(request.into_body(), 8 * 1024 * 1024),
@@ -669,8 +684,10 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
     // carries CapyCTL's request ID as SGLang's `rid`, set only here, after
     // the allowlist above refused any `rid` of the caller's. A decision never
     // carries one (SGLang 0.5.22's `/v1/systemone` builds its request without
-    // a `rid`), and a launch without the capability gets none: the ID is
-    // dropped. The body is re-encoded only when the ID is set.
+    // a `rid`), nor does an embeddings request (ADR 0036 §4: SGLang needs one
+    // `rid` per input of a batch, and its settlement needs none), and a
+    // launch without the capability gets none: the ID is dropped. The body is
+    // re-encoded only when the ID is set.
     let body = match request_id.filter(|_| request_abort && matches!(kind, Kind::Chat)) {
         Some(id) => {
             let mut value = value;
@@ -747,6 +764,12 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
         .header(header::CACHE_CONTROL, "no-store");
     // SPEC §17 (M80): first and last engine body byte, on the ingress clock. A
     // stream that fails or is dropped before its end records no last byte.
+    // ADR 0036 §4, §10: every answer of 200, an embeddings answer of any size
+    // included, is relayed unchanged as its bytes arrive, never read whole
+    // and never capped; the router checks it and rewrites `model`. A cut
+    // embeddings request stays open here because the router keeps reading
+    // this body to its end (ADR 0036 §4): the engine connection closes only
+    // when the answer ends or the router's connection goes away.
     let stream = futures::stream::unfold(
         (response.bytes_stream(), guard, false),
         move |(mut stream, guard, mut seen)| async move {

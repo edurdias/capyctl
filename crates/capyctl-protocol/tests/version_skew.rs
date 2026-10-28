@@ -229,6 +229,7 @@ fn every_post_baseline_field_names_its_capability() {
                     owned_handle: handle(),
                     max_tokens: None,
                     decision: false,
+                    embedding: false,
                 },
                 0,
             ),
@@ -242,10 +243,25 @@ fn every_post_baseline_field_names_its_capability() {
                     owned_handle: handle(),
                     max_tokens: None,
                     decision: true,
+                    embedding: false,
                 },
                 0,
             ),
             vec![DECISIONS],
+        ),
+        // T34, T47 (ADR 0036 §§5, 6): likewise, only a host with `embeddings`
+        // is sent an embedding probe.
+        (
+            wire(
+                MemberAction::Probe {
+                    owned_handle: handle(),
+                    max_tokens: None,
+                    decision: false,
+                    embedding: true,
+                },
+                0,
+            ),
+            vec![EMBEDDINGS],
         ),
         (
             wire(
@@ -416,6 +432,7 @@ fn the_gate_refuses_typed_before_anything_is_sent() {
             owned_handle: "h".into(),
             max_tokens: None,
             decision: false,
+            embedding: false,
         },
         0,
     );

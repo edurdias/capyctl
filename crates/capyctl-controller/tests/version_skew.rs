@@ -469,6 +469,7 @@ async fn a_drain_only_host_refuses_start_but_allows_stop() {
             owned_handle: handle(),
             max_tokens: None,
             decision: false,
+            embedding: false,
         },
     );
     let sessions = h.sessions.clone();

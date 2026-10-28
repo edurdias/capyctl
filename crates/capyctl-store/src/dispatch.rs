@@ -399,9 +399,14 @@ pub enum LeaseWrite {
     /// ADR 0032 §4: the cancelling lease `lease_id` of this session closes on
     /// its request's own final output, read whole after the engine was asked
     /// to abort it, with `request_cancellation_acknowledged` and the
-    /// per-request receipt in the same transaction. Settled(false) when it is
+    /// per-request receipt in the same transaction. ADR 0036 §4: a cut
+    /// embeddings request read to its end closes the same way on its answer;
+    /// `evidence` names which receipt is journaled. Settled(false) when it is
     /// no longer an open cancelling lease of this session; nothing changes.
-    AcknowledgeCancelled { lease_id: String },
+    AcknowledgeCancelled {
+        lease_id: String,
+        evidence: crate::request_lease_cancellations::CancelledEvidence,
+    },
 }
 
 /// What one `LeaseWrite` in a batch produced.
@@ -488,11 +493,12 @@ impl crate::Store {
                     cancel_in(&transaction, session, ticket, *answered)
                         .map(LeaseWriteOutcome::Settled)
                 }
-                LeaseWrite::AcknowledgeCancelled { lease_id } => {
+                LeaseWrite::AcknowledgeCancelled { lease_id, evidence } => {
                     crate::request_lease_cancellations::acknowledge_in(
                         &transaction,
                         session,
                         lease_id,
+                        *evidence,
                     )
                     .map(LeaseWriteOutcome::Settled)
                 }

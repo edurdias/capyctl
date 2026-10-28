@@ -34,6 +34,7 @@ fn base() -> MemberCommand {
             group_member_launch: None,
             probe_max_tokens: 0,
             probe_decision: false,
+            probe_embedding: false,
         })),
     })
     .unwrap()
@@ -107,6 +108,7 @@ fn park_and_restore_roundtrip_and_are_digest_bound() {
             owned_handle: "launch".into(),
             max_tokens: None,
             decision: false,
+            embedding: false,
         })
         .canonical_digest(),
         with_action(MemberAction::Terminate {
@@ -232,6 +234,7 @@ fn parked_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         engine_log: None,
         probe_text: String::new(),
         probe_decision: None,
+        probe_embedding: None,
         lmcache: None,
     }
 }
@@ -346,6 +349,7 @@ fn residency_evidence_is_refused_on_other_actions() {
             owned_handle: "launch".into(),
             max_tokens: None,
             decision: false,
+            embedding: false,
         },
         MemberAction::Terminate {
             owned_handle: "launch".into(),
@@ -634,6 +638,7 @@ fn a_policy_refused_park_is_unchanged_with_a_closed_reason() {
         owned_handle: "launch".into(),
         max_tokens: None,
         decision: false,
+        embedding: false,
     });
     let mut result = parked_result(&probe);
     result.residency = None;
@@ -799,12 +804,14 @@ fn completion_probe_is_additive() {
         owned_handle: "launch".into(),
         max_tokens: None,
         decision: false,
+        embedding: false,
     });
     assert_eq!(plain.to_wire().encode_to_vec(), PLAIN_PROBE_BYTES);
     let probe = with_action(MemberAction::Probe {
         owned_handle: "launch".into(),
         max_tokens: Some(8),
         decision: false,
+        embedding: false,
     });
     assert_ne!(probe.canonical_digest(), plain.canonical_digest());
     assert_eq!(
@@ -850,6 +857,7 @@ fn probe_tokens_answer_a_completion_probe_only() {
         owned_handle: "launch".into(),
         max_tokens: Some(2),
         decision: false,
+        embedding: false,
     });
     validate_result(&probe, &answer(&probe, vec![7, 8])).unwrap();
     validate_result(&probe, &answer(&probe, Vec::new())).unwrap();
@@ -858,6 +866,7 @@ fn probe_tokens_answer_a_completion_probe_only() {
         owned_handle: "launch".into(),
         max_tokens: None,
         decision: false,
+        embedding: false,
     });
     validate_result(&plain, &answer(&plain, Vec::new())).unwrap();
     assert!(validate_result(&plain, &answer(&plain, vec![7])).is_err());
@@ -884,6 +893,7 @@ fn probe_text_answers_a_completion_probe_only() {
         owned_handle: "launch".into(),
         max_tokens: Some(8),
         decision: false,
+        embedding: false,
     });
     validate_result(&probe, &answer(&probe, "Ready.".into())).unwrap();
     let max = capyctl_protocol::execution::PROBE_TEXT_MAX_BYTES;
@@ -893,6 +903,7 @@ fn probe_text_answers_a_completion_probe_only() {
         owned_handle: "launch".into(),
         max_tokens: None,
         decision: false,
+        embedding: false,
     });
     assert!(validate_result(&plain, &answer(&plain, "Ready.".into())).is_err());
 }
@@ -902,6 +913,7 @@ fn decision_probe() -> MemberCommand {
         owned_handle: "launch".into(),
         max_tokens: None,
         decision: true,
+        embedding: false,
     })
 }
 
@@ -913,6 +925,7 @@ fn decision_probe_is_additive() {
         owned_handle: "launch".into(),
         max_tokens: None,
         decision: false,
+        embedding: false,
     });
     assert_eq!(plain.to_wire().encode_to_vec(), PLAIN_PROBE_BYTES);
     let probe = decision_probe();
@@ -982,11 +995,13 @@ fn decision_answer_belongs_to_a_completed_decision_probe_only() {
             owned_handle: "launch".into(),
             max_tokens: None,
             decision: false,
+            embedding: false,
         },
         MemberAction::Probe {
             owned_handle: "launch".into(),
             max_tokens: Some(8),
             decision: false,
+            embedding: false,
         },
     ] {
         let other = with_action(other);
@@ -1027,6 +1042,139 @@ fn decision_answer_belongs_to_a_completed_decision_probe_only() {
         evidence(&longer, &[(&longer, 1.0)]),
         evidence("yes", &[]),
         evidence("o0", &many),
+        wrong_version,
+    ] {
+        assert!(validate_result(&probe, &answer(&probe, malformed)).is_err());
+    }
+}
+
+fn embedding_probe() -> MemberCommand {
+    with_action(MemberAction::Probe {
+        owned_handle: "launch".into(),
+        max_tokens: None,
+        decision: false,
+        embedding: true,
+    })
+}
+
+// T47 (ADR 0036 §§5, 6, ADR 0017): the embedding probe is additive; a plain
+// probe encodes and digests as before, an older host's decoder (one that
+// does not know the flag) reads it as the plain probe, and only a host with
+// `embeddings` is sent one. The flag rides a probe only, never a completion
+// or decision probe.
+#[test]
+fn embedding_probe_is_additive() {
+    let plain = with_action(MemberAction::Probe {
+        owned_handle: "launch".into(),
+        max_tokens: None,
+        decision: false,
+        embedding: false,
+    });
+    assert_eq!(plain.to_wire().encode_to_vec(), PLAIN_PROBE_BYTES);
+    let probe = embedding_probe();
+    assert_ne!(probe.canonical_digest(), plain.canonical_digest());
+    assert_eq!(
+        decode(&probe.to_wire().encode_to_vec()).unwrap().action,
+        probe.action
+    );
+    probe.verify_digest().unwrap();
+    let mut wire = probe.to_wire();
+    assert!(wire.probe_embedding);
+    wire.probe_embedding = false;
+    assert_eq!(decode(&wire.encode_to_vec()).unwrap().action, plain.action);
+    let mut inspect = with_action(MemberAction::Inspect).to_wire();
+    inspect.probe_embedding = true;
+    assert!(decode(&inspect.encode_to_vec()).is_err());
+    let mut completion = probe.to_wire();
+    completion.probe_max_tokens = 8;
+    assert!(decode(&completion.encode_to_vec()).is_err());
+    let mut decision = probe.to_wire();
+    decision.probe_decision = true;
+    assert!(decode(&decision.encode_to_vec()).is_err());
+    use capyctl_protocol::capabilities::{required, EMBEDDINGS};
+    assert_eq!(required(&probe.to_wire()), vec![EMBEDDINGS]);
+    assert!(required(&plain.to_wire()).is_empty());
+}
+
+// T47 (ADR 0036 §§5, 6): an embedding answer belongs to a completed
+// embedding probe only, and must be well-formed: this probe version, a
+// bounded vector of finite values whose norm is above 1e-6. It round-trips
+// exactly, and a result without it (an older host's) still validates.
+#[test]
+fn embedding_answer_belongs_to_a_completed_embedding_probe_only() {
+    use capyctl_protocol::execution::{EMBEDDING_PROBE_MAX_DIMENSION, EMBEDDING_PROBE_VERSION};
+    let evidence = |vector: Vec<f32>| pb::EmbeddingProbeEvidence {
+        probe_version: EMBEDDING_PROBE_VERSION,
+        vector,
+    };
+    let answer =
+        |command: &MemberCommand, embedded: pb::EmbeddingProbeEvidence| pb::MemberExecutionResult {
+            identity: command.to_wire().identity,
+            state: "completed".into(),
+            owned_handle: "launch".into(),
+            observed_at_unix_ms: 1,
+            claim_retained: true,
+            binding_id: "binding".into(),
+            incarnation: "incarnation".into(),
+            probe_embedding: Some(embedded),
+            ..Default::default()
+        };
+    let good = evidence(vec![0.6, -0.8, 0.0]);
+    let probe = embedding_probe();
+    let result = answer(&probe, good.clone());
+    validate_result(&probe, &result).unwrap();
+    let decoded = pb::MemberExecutionResult::decode(result.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded.probe_embedding, Some(good.clone()));
+    let mut bare = answer(&probe, good.clone());
+    bare.probe_embedding = None;
+    validate_result(&probe, &bare).unwrap();
+    let mut failed = answer(&probe, good.clone());
+    failed.state = "attempted".into();
+    assert!(validate_result(&probe, &failed).is_err());
+    for other in [
+        MemberAction::Probe {
+            owned_handle: "launch".into(),
+            max_tokens: None,
+            decision: false,
+            embedding: false,
+        },
+        MemberAction::Probe {
+            owned_handle: "launch".into(),
+            max_tokens: None,
+            decision: true,
+            embedding: false,
+        },
+        MemberAction::Probe {
+            owned_handle: "launch".into(),
+            max_tokens: Some(8),
+            decision: false,
+            embedding: false,
+        },
+    ] {
+        let other = with_action(other);
+        assert!(validate_result(&other, &answer(&other, good.clone())).is_err());
+    }
+    let parked = park("launch");
+    assert!(validate_result(&parked, &answer(&parked, good.clone())).is_err());
+    // An embedding probe never carries another probe's answer.
+    let mut text = answer(&probe, good.clone());
+    text.probe_text = "Ready.".into();
+    assert!(validate_result(&probe, &text).is_err());
+    // Bounds: the longest vector passes; one value more fails.
+    validate_result(
+        &probe,
+        &answer(&probe, evidence(vec![0.5; EMBEDDING_PROBE_MAX_DIMENSION])),
+    )
+    .unwrap();
+    let mut wrong_version = good.clone();
+    wrong_version.probe_version = EMBEDDING_PROBE_VERSION + 1;
+    for malformed in [
+        evidence(vec![]),
+        evidence(vec![0.5; EMBEDDING_PROBE_MAX_DIMENSION + 1]),
+        evidence(vec![f32::NAN, 1.0]),
+        evidence(vec![f32::INFINITY]),
+        evidence(vec![0.0, 0.0]),
+        evidence(vec![1e-7, 1e-7]),
         wrong_version,
     ] {
         assert!(validate_result(&probe, &answer(&probe, malformed)).is_err());

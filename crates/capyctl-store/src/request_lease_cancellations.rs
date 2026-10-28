@@ -33,16 +33,46 @@ use crate::StoreError;
 pub const ABORTED_REQUEST_RECEIPT: &str =
     "the engine finished this request after it was asked to abort it";
 
+/// ADR 0036 §4 (owner decision 2026-10-27, question 7): the evidence of a cut
+/// embeddings request, which is never aborted: the router kept reading it and
+/// its answer passed every check.
+pub const ANSWERED_REQUEST_RECEIPT: &str =
+    "the engine finished this request after the client went away; it settled on its answer";
+
+/// What proved a cancelling lease's request finished, for its receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelledEvidence {
+    /// ADR 0032 §4: the request's own final output, read whole after the
+    /// engine was asked to abort it.
+    Aborted,
+    /// ADR 0036 §4: a cut embeddings request read to its end, whose answer
+    /// was completion.
+    Answered,
+}
+
+impl CancelledEvidence {
+    /// The receipt journaled with the acknowledgement.
+    pub const fn receipt(self) -> &'static str {
+        match self {
+            Self::Aborted => ABORTED_REQUEST_RECEIPT,
+            Self::Answered => ANSWERED_REQUEST_RECEIPT,
+        }
+    }
+}
+
 /// ADR 0032 §4: close the cancelling lease `lease_id` of this session on its
 /// own final output, journaling `request_cancellation_acknowledged` with the
-/// per-request receipt inside the caller's session-checked transaction.
-/// `Ok(false)` when it is not an open cancelling lease of this session: never
-/// cancelled, already settled, or uncertain (a previous session's). A lease
-/// held until its instance's stop closes too: the engine proved it finished.
+/// per-request receipt `evidence` names inside the caller's session-checked
+/// transaction. ADR 0036 §4: a cut embeddings request settles the same way on
+/// its answer. `Ok(false)` when it is not an open cancelling lease of this
+/// session: never cancelled, already settled, or uncertain (a previous
+/// session's). A lease held until its instance's stop closes too: the engine
+/// proved it finished.
 pub(crate) fn acknowledge_in(
     tx: &Transaction<'_>,
     session: &CoordinatorSession,
     lease_id: &str,
+    evidence: CancelledEvidence,
 ) -> Result<bool, DispatchError> {
     let lease: Option<(String, String)> = tx
         .prepare_cached(
@@ -65,7 +95,7 @@ pub(crate) fn acknowledge_in(
             deployment_id,
             binding_id,
             count: 1,
-            receipt: format!("{ABORTED_REQUEST_RECEIPT}; request lease {lease_id}"),
+            receipt: format!("{}; request lease {lease_id}", evidence.receipt()),
         },
     )
     .map_err(|error| match error {
@@ -483,10 +513,21 @@ mod tests {
         session: &CoordinatorSession,
         lease_id: &str,
     ) -> Result<bool, crate::dispatch::DispatchError> {
+        acknowledge_by(store, session, lease_id, super::CancelledEvidence::Aborted)
+    }
+
+    /// As [`acknowledge`], naming `evidence`.
+    fn acknowledge_by(
+        store: &Store,
+        session: &CoordinatorSession,
+        lease_id: &str,
+        evidence: super::CancelledEvidence,
+    ) -> Result<bool, crate::dispatch::DispatchError> {
         let mut outcome = store.apply_request_lease_batch(
             session,
             &[LeaseWrite::AcknowledgeCancelled {
                 lease_id: lease_id.to_owned(),
+                evidence,
             }],
         )?;
         match outcome.pop() {
@@ -570,6 +611,36 @@ mod tests {
         assert!(acknowledge(&f.store, &f.session, f.ticket.id()).unwrap());
         assert!(f.store.pending_dispatches(&f.dep).unwrap().is_empty());
         assert_eq!(acknowledgements(&f.store).len(), 1);
+    }
+
+    // T47 T17 (ADR 0036 §4, owner decision 2026-10-27, question 7): a cut
+    // embeddings request read to its end settles on its answer, closing its
+    // cancelling lease (even one held until the next stop) with the
+    // embeddings receipt, never the abort's.
+    #[test]
+    fn a_cut_embedding_settles_on_its_answer_with_its_own_receipt() {
+        for answered in [true, false] {
+            let f = ready_instance_with_lease();
+            cancel(&f, answered);
+            assert!(acknowledge_by(
+                &f.store,
+                &f.session,
+                f.ticket.id(),
+                super::CancelledEvidence::Answered
+            )
+            .unwrap());
+            assert!(f.store.pending_dispatches(&f.dep).unwrap().is_empty());
+            let acknowledged = acknowledgements(&f.store);
+            assert_eq!(acknowledged.len(), 1, "{acknowledged:?}");
+            assert_eq!(
+                acknowledged[0]["receipt"],
+                format!(
+                    "the engine finished this request after the client went away; it settled \
+                     on its answer; request lease {}",
+                    f.ticket.id()
+                )
+            );
+        }
     }
 
     // T17 (ADR 0032 §4): a lease that was never cancelled, or already settled

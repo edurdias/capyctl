@@ -62,6 +62,7 @@ fn decode(config: String) -> Result<MemberCommand, ()> {
             group_member_launch: None,
             probe_max_tokens: 0,
             probe_decision: false,
+            probe_embedding: false,
         })),
     })
     .map_err(|_| ())
