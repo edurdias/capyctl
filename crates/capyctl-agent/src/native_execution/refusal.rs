@@ -398,7 +398,9 @@ impl NativeHostExecution {
                 let mut result = owned.unwrap_or_default();
                 // ADR 0033 §§8, 9: the launch's own LMCache report is the
                 // launch's; a Park or Restore result carries only its own.
+                // ADR 0037 §7: likewise its engine tracing decision.
                 result.lmcache = None;
+                result.engine_tracing = String::new();
                 result.state = String::new();
                 result.model_usable = false;
                 result.owned_handle = owned_handle.clone();

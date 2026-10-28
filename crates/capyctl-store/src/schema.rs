@@ -1356,6 +1356,18 @@ ALTER TABLE wake_canaries_v59 RENAME TO wake_canaries;
 pub const SCHEMA_V60: &str =
     "-- LMCache pool basis and uncertified runs (checkpoint_digests::migrate_v60, lmcache::migrate_v60)";
 
+/// ADR 0037 §7: each launch's engine tracing decision, frozen when it
+/// launched: `on`, or the off reason's code. Read by the router's lane and by
+/// status; a launch recorded before engine tracing has no row (untraced).
+pub const SCHEMA_V61: &str = r#"
+CREATE TABLE IF NOT EXISTS launch_engine_tracing(
+  binding_id TEXT PRIMARY KEY REFERENCES runtime_bindings(id),
+  state TEXT NOT NULL CHECK(state IN ('on','off')),
+  reason TEXT CHECK((state='on' AND reason IS NULL) OR (state='off' AND reason IS NOT NULL AND reason IN
+    ('host_off','engine_unsupported','not_installed','group','retention_zero')))
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -67,6 +67,8 @@ pub struct LaneEngine {
     /// The enrolled host whose ingress serves the binding; `None` for an
     /// engine the embedded role runs itself.
     pub remote_host: Option<String>,
+    /// ADR 0037 §7: the launch's engine tracing decision was on.
+    pub engine_trace: bool,
 }
 
 /// The gate a dispatch needs, over `deployment_instances i` and `deployments d`.
@@ -208,11 +210,15 @@ impl crate::Store {
             .flatten()
             .and_then(serde_json::Value::as_u64)
             .and_then(|workers| u32::try_from(workers).ok());
+        // ADR 0037 §7: whether the launch was started with engine tracing,
+        // as recorded before its Ready.
+        let engine_trace = crate::engine_tracing::binding_traces(&tx, binding_id)?;
         Ok(Some(LaneEngine {
             engine,
             build_fingerprint: text("/profile/build_fingerprint"),
             tokenizer_workers,
             remote_host,
+            engine_trace,
         }))
     }
 }

@@ -394,6 +394,7 @@ fn every_post_baseline_field_names_its_capability() {
             LMCACHE_ENGINE_DRIVEN,
             REQUEST_ABORT,
             LOCAL_TENSOR_PARALLEL,
+            TRACE_CONTEXT,
         ]
         .contains(name)
         {

@@ -95,6 +95,49 @@ pub struct HostSessionView {
     /// is refused there until memory is freed. A warning only.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub memory_warnings: Vec<String>,
+    /// ADR 0037 §13: the host role's tracing status as its latest report
+    /// gave it. Absent from a host that reports none (an older host).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracing: Option<HostTracingView>,
+}
+/// ADR 0037 §13: a host role's tracing: off, or on with its endpoint, the
+/// spans it dropped and its last export error since it started.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct HostTracingView {
+    pub on: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    pub spans_dropped: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_export_error: Option<String>,
+}
+/// ADR 0037 §13: the longest endpoint and export error status shows; a
+/// longer one is cut, never refused.
+pub const MAX_TRACING_ENDPOINT: usize = 2048;
+pub const MAX_TRACING_ERROR: usize = capabilities::MAX_REASON;
+impl HostTracingView {
+    /// The tracing status one report carries; `None` when it carries none.
+    pub fn of(inventory: &pb::ReportInventory) -> Option<Self> {
+        let tracing = inventory.tracing.as_ref()?;
+        Some(Self {
+            on: tracing.on,
+            endpoint: bounded_text(&tracing.endpoint, MAX_TRACING_ENDPOINT),
+            spans_dropped: tracing.spans_dropped,
+            last_export_error: bounded_text(&tracing.last_export_error, MAX_TRACING_ERROR),
+        })
+    }
+}
+/// A host's text as status shows it: control characters dropped, cut to
+/// `max` bytes on a character boundary; `None` when nothing is left.
+fn bounded_text(text: &str, max: usize) -> Option<String> {
+    let mut kept = String::new();
+    for c in text.chars().filter(|c| !c.is_control()) {
+        if kept.len() + c.len_utf8() > max {
+            break;
+        }
+        kept.push(c);
+    }
+    (!kept.is_empty()).then_some(kept)
 }
 /// ADR 0028 §3: a host's group facts as its inventory reports them.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -928,6 +971,12 @@ impl AgentSessions {
     pub fn supports_request_abort(&self, host: &str) -> bool {
         self.supports(host, capabilities::REQUEST_ABORT)
     }
+    /// ADR 0037 §6 (ADR 0017): whether `host`'s current session declared
+    /// `trace_context`, so its ingress may be sent trace headers and its
+    /// lifecycle commands a step's context.
+    pub fn supports_trace_context(&self, host: &str) -> bool {
+        self.supports(host, capabilities::TRACE_CONTEXT)
+    }
     /// ADR 0032 §3: a slot for one request abort to `host`, or `None` when
     /// [`MAX_ABORTS_PER_HOST`] are already in flight there.
     pub fn abort_slot(&self, host: &str) -> Option<AbortSlot> {
@@ -993,7 +1042,11 @@ impl AgentSessions {
         self.dispatch_to(host, command).map(|_| ())
     }
     /// As `dispatch`, naming the session the command was queued on.
-    fn dispatch_to(&self, host: &str, command: pb::ExecuteMember) -> Result<String, Box<Status>> {
+    fn dispatch_to(
+        &self,
+        host: &str,
+        mut command: pb::ExecuteMember,
+    ) -> Result<String, Box<Status>> {
         let typed = capyctl_protocol::execution::MemberCommand::try_from(pb::ServerToAgent {
             msg: Some(server_to_agent::Msg::ExecuteMember(command.clone())),
         })
@@ -1030,6 +1083,12 @@ impl AgentSessions {
             capabilities::refusal(session.drain_only, &session.capabilities, &command)
         {
             return Err(Box::new(Status::failed_precondition(reason)));
+        }
+        // ADR 0037 §6, ADR 0017: the step's trace context goes only to a
+        // host that declared `trace_context`; it is never part of the command,
+        // so leaving it out changes nothing the host verifies.
+        if !session.capabilities.contains(capabilities::TRACE_CONTEXT) {
+            command.trace_parent.clear();
         }
         let queued = send_command(
             session.outgoing.as_ref().ok_or_else(denied)?,
@@ -1084,7 +1143,13 @@ impl AgentSessions {
         let host = command.identity.member.host_id.clone();
         let id = command.identity.command_id.clone();
         let deadline = command.identity.deadline_ms;
-        let wire = command.to_wire();
+        let mut wire = command.to_wire();
+        // ADR 0037 §6: the context of the activation step this command
+        // belongs to rides the envelope, outside the journaled command; every
+        // redelivery of it in this process carries the same.
+        if let Some(step) = crate::activation_trace::current_step() {
+            wire.trace_parent = step.traceparent();
+        }
         let (send, mut receive) = tokio::sync::watch::channel(None);
         {
             let mut pending = self.pending.lock().map_err(|_| denied())?;
@@ -1640,6 +1705,8 @@ impl AgentSessions {
                                 s.view.domains = DomainView::all(&inventory.domains);
                                 s.view.member_savers = MemberSaverView::of(&inventory);
                                 s.view.group = GroupInventoryView::of(&inventory);
+                                // ADR 0037 §13: the host's latest tracing status.
+                                s.view.tracing = HostTracingView::of(&inventory);
                                 s.view.profiles = inventory.profiles.iter().map(ProfileView::of).collect();
                                 s.view.memory_warnings = memory_warnings;
                                 // Only an inventory `publish` accepted reaches here.
@@ -1659,6 +1726,7 @@ impl AgentSessions {
                                 s.view.domains = DomainView::all(&inventory.domains);
                                 s.view.member_savers = MemberSaverView::of(&inventory);
                                 s.view.group = GroupInventoryView::of(&inventory);
+                                s.view.tracing = HostTracingView::of(&inventory);
                                 s.view.profiles = inventory.profiles.iter().map(ProfileView::of).collect();
                                 s.inventory = Some(*inventory);
                             }
@@ -2001,6 +2069,7 @@ impl AgentControl for AgentSessions {
                         member_savers: vec![],
                         group: None,
                         memory_warnings: vec![],
+                        tracing: None,
                     },
                     peer: peer.clone(),
                     outgoing: Some(outgoing.clone()),

@@ -12,7 +12,7 @@ use crate::schema::{
     SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
     SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V49, SCHEMA_V5, SCHEMA_V50, SCHEMA_V51, SCHEMA_V52,
     SCHEMA_V53, SCHEMA_V54, SCHEMA_V55, SCHEMA_V56, SCHEMA_V57, SCHEMA_V58, SCHEMA_V59, SCHEMA_V6,
-    SCHEMA_V60, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V60, SCHEMA_V61, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -107,6 +107,8 @@ pub const MIGRATIONS: &[&str] = &[
     // ADR 0034 §§3a, 4: the reported pool basis per checkpoint, and how each
     // launch's LMCache pool was sized and whether it runs uncertified.
     SCHEMA_V60,
+    // ADR 0037 §7: each launch's engine tracing decision.
+    SCHEMA_V61,
 ];
 
 /// The newest schema version this binary knows how to read and write.

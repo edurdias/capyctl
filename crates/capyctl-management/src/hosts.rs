@@ -108,12 +108,15 @@ async fn hosts(State(state): State<Arc<HostState>>) -> Response {
             Some(v) => (Some(v.binary_version.clone()), Some(v.compatibility.clone()), (!v.reason.is_empty()).then(|| v.reason.clone())),
             None => (None, None, None),
         };
+        // ADR 0037 §13: the host role's tracing status as its latest report
+        // gave it; null for a host that reported none.
+        let tracing = session.as_ref().and_then(|s| s.tracing.clone());
         serde_json::json!({"host_id":host.host_id,"name":host.host_name,"revoked":host.revoked,
             "online":session.as_ref().is_some_and(|s| s.online && !host.revoked),
             "eligible":session.as_ref().is_some_and(|s| s.eligible && !host.revoked),"session":session,
             "binary_version":binary_version,"compatibility":compatibility,"compatibility_reason":reason,
             "capabilities":version.map(|v| v.capabilities),
-            "development_controls":controls})
+            "development_controls":controls,"tracing":tracing})
     }).collect();
     Json(serde_json::json!({"api_version":"1","server_version":capyctl_controller::agent_sessions::SERVER_VERSION,"hosts":hosts})).into_response()
 }

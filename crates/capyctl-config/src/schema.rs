@@ -516,8 +516,53 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
     /// SPEC §10 (W10): request-driven and `--evict` switching bounds.
     const SWITCHING: &[(&str, FieldSpec)] = &[("drain_timeout", DURATION)];
     /// SPEC §17 (M80): router observability. `timing_header` adds the
-    /// `x-capyctl-timing` response header; off unless set.
-    const OBSERVABILITY: &[(&str, FieldSpec)] = &[("timing_header", SCALAR)];
+    /// `x-capyctl-timing` response header; off unless set. ADR 0037 §12:
+    /// `tracing`, the server's OTLP export, off unless an endpoint is named.
+    const OBSERVABILITY: &[(&str, FieldSpec)] = &[
+        ("timing_header", SCALAR),
+        ("tracing", FieldSpec::Struct(SERVER_TRACING)),
+    ];
+    /// ADR 0037 §12: a server's (or a standalone `server:` block's) tracing.
+    const SERVER_TRACING: &[(&str, FieldSpec)] = &[
+        ("endpoint", SCALAR),
+        ("headers_file", SCALAR),
+        ("sample_ratio", SCALAR),
+        ("caller_context", SCALAR),
+    ];
+    /// ADR 0037 §7, §12: a host's tracing. Role-local: never in the document
+    /// deployments are resolved against.
+    const HOST_OBSERVABILITY: &[(&str, FieldSpec)] = &[(
+        "tracing",
+        FieldSpec::Struct(&[
+            ("endpoint", SCALAR),
+            ("headers_file", SCALAR),
+            ("engines", SCALAR),
+        ]),
+    )];
+    /// ADR 0037 §12: a standalone `host:` block's tracing takes only
+    /// `engines`; the process exports through `server.observability.tracing`.
+    const STANDALONE_HOST_OBSERVABILITY: &[(&str, FieldSpec)] = &[(
+        "tracing",
+        FieldSpec::Struct(&[
+            ("engines", SCALAR),
+            (
+                "endpoint",
+                FieldSpec::Moved(crate::tracing::STANDALONE_HOST_TRACING),
+            ),
+            (
+                "headers_file",
+                FieldSpec::Moved(crate::tracing::STANDALONE_HOST_TRACING),
+            ),
+            (
+                "sample_ratio",
+                FieldSpec::Moved(crate::tracing::STANDALONE_HOST_TRACING),
+            ),
+            (
+                "caller_context",
+                FieldSpec::Moved(crate::tracing::STANDALONE_HOST_TRACING),
+            ),
+        ]),
+    )];
     /// ADR 0028 §11 (decided 2026-10-06): the group request-stall timeout.
     const SERVER_GROUPS: &[(&str, FieldSpec)] = &[("stall_timeout", DURATION)];
     const STANDALONE_HOST: &[(&str, FieldSpec)] = &[
@@ -547,6 +592,12 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         // Owner decision 2026-10-22: the engines' own usage reporting, as on
         // a host.
         ("engine_telemetry", SCALAR),
+        // ADR 0037 §7, §12: engine tracing; the endpoint is the server
+        // block's.
+        (
+            "observability",
+            FieldSpec::Struct(STANDALONE_HOST_OBSERVABILITY),
+        ),
     ];
     /// SPEC §6.5, §10: a host's activation policy, for every deployment that
     /// may run on it. Controller policy; never part of the document a
@@ -636,6 +687,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 // Role-local (owner decision 2026-10-22): `off` or `allow`,
                 // whether the engines' own usage reporting keeps its defaults.
                 ("engine_telemetry", SCALAR),
+                // Role-local (ADR 0037 §12): the host's OTLP export and
+                // engine tracing.
+                ("observability", FieldSpec::Struct(HOST_OBSERVABILITY)),
             ],
         },
         ConfigKind::Deployment => &KindSchema {

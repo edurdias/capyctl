@@ -60,6 +60,26 @@ class CheckTests(unittest.TestCase):
                      approvals(["--worker-extension-cls"]), "/srv/models/m")
         policy.check("vllm", {"reasoning_parser": "qwen3"}, approvals(), "/srv/models/m")
 
+    # T48 T21 (ADR 0037 §7, owner decision 2026-10-27 q7): the engines'
+    # tracing destinations are CapyCTL's; an approval admits none of them,
+    # and the refusal names no value.
+    def test_tracing_destinations_are_owned_whatever_approved(self):
+        expected = {
+            "vllm": {"otlp_traces_endpoint", "collect_detailed_traces"},
+            "sglang": {"enable_trace", "otlp_traces_endpoint", "otlp_service_name",
+                       "trace_modules"},
+        }
+        self.assertEqual({engine: set(dests) for engine, dests in policy.OWNED.items()},
+                         expected)
+        for engine, dests in expected.items():
+            for dest in dests:
+                approved = approvals(["--" + dest.replace("_", "-")])
+                with self.subTest(engine=engine, dest=dest):
+                    with self.assertRaises(policy.Refused) as refused:
+                        policy.check(engine, {dest: "http://collector:4317"}, approved,
+                                     "/srv/models/m")
+                    self.assertNotIn("collector", str(refused.exception))
+
     # T21: an approved path option must name a path inside an approved
     # directory; a checkpoint-exempt one may name one inside the checkpoint.
     def test_path_values_must_lie_inside_approved_directories(self):

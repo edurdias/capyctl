@@ -41,6 +41,7 @@ async fn app() -> (
         api_key: Some("test-key".into()),
         inflight: Arc::new(capyctl_router::admission::InFlight::default()),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: capyctl_trace::Tracing::off(),
     };
     let file_store = Store::open_in_memory().unwrap();
     (
@@ -392,6 +393,7 @@ impl StubAuthority {
                 deployment_id: deployment.into(),
                 revision: 1,
                 request_abort: false,
+                engine_trace: false,
             }),
             leases: Mutex::new(Vec::new()),
             refuse_leases: Mutex::new(None),
@@ -435,6 +437,7 @@ impl StubAuthority {
                 deployment_id: "dep-1".into(),
                 revision: 1,
                 request_abort,
+                engine_trace: false,
             }),
             leases: Mutex::new(Vec::new()),
             refuse_leases: Mutex::new(None),
@@ -846,6 +849,7 @@ async fn the_router_forwards_to_the_deployments_live_endpoint_with_its_key() {
             deployment_id: "dep-1".into(),
             revision: 1,
             request_abort: false,
+            engine_trace: false,
         }),
         leases: Mutex::new(Vec::new()),
         refuse_leases: Mutex::new(None),
@@ -864,6 +868,7 @@ async fn the_router_forwards_to_the_deployments_live_endpoint_with_its_key() {
         api_key: None,
         inflight: Arc::new(capyctl_router::admission::InFlight::default()),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: capyctl_trace::Tracing::off(),
     });
 
     let (status, body) = chat_once(&router, "public-alias").await;
@@ -950,6 +955,7 @@ fn stub_router_serving(
             deployment_id: deployment.into(),
             revision,
             request_abort: false,
+            engine_trace: false,
         }),
         leases: Mutex::new(Vec::new()),
         refuse_leases: Mutex::new(None),
@@ -968,6 +974,7 @@ fn stub_router_serving(
         api_key: None,
         inflight: Arc::new(capyctl_router::admission::InFlight::default()),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: capyctl_trace::Tracing::off(),
     };
     (authority, deps)
 }
@@ -2043,6 +2050,7 @@ fn router_with(authority: &Arc<StubAuthority>) -> TestRouter {
             api_key: None,
             inflight: Arc::new(capyctl_router::admission::InFlight::default()),
             activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+            tracing: capyctl_trace::Tracing::off(),
         }),
         authority: authority.clone(),
     }
@@ -2492,6 +2500,7 @@ fn deps_on(authority: &Arc<StubAuthority>) -> RouterDeps {
         api_key: None,
         inflight: Arc::new(capyctl_router::admission::InFlight::default()),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: capyctl_trace::Tracing::off(),
     }
 }
 

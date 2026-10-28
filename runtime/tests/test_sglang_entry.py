@@ -421,6 +421,24 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
         with self.assertRaises(entry.LaunchError):
             self.build_member(public)
 
+    # T48 (ADR 0037 §7): present only on a traced single launch: the host's
+    # http(s) OTLP endpoint, never on a group member.
+    def test_a_trace_endpoint_is_an_optional_http_url(self):
+        public = copy.deepcopy(self.public)
+        public["settings"]["trace_endpoint"] = "http://127.0.0.1:4318/v1/traces"
+        self.build(self.argv(public), self.payloads(public))
+        for value in (None, "", "127.0.0.1:4318", "ftp://127.0.0.1/x", 1, True,
+                      "http://127.0.0.1:4318/v1 traces", "http://a\nb",
+                      "http://" + "c" * 4096):
+            with self.subTest(value=value):
+                public = copy.deepcopy(self.public)
+                public["settings"]["trace_endpoint"] = value
+                self.rejects(self.argv(public), self.payloads(public))
+        public = group_public(0)
+        public["settings"]["trace_endpoint"] = "http://127.0.0.1:4318/v1/traces"
+        with self.assertRaises(entry.LaunchError):
+            self.build_member(public)
+
     def test_typed_settings_accept_any_model_values_and_refuse_bad_shapes(self):
         # E1 / ADR 0011: values pass as the engine spells them; only type,
         # range and closure are checked here.

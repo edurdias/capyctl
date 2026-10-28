@@ -130,6 +130,9 @@ pub struct PlanInputVllm {
     /// renders `--runner pooling` in the reserved block; every other renders
     /// nothing, and vLLM's own `auto` applies.
     pub api: capyctl_config::effective::DeploymentApi,
+    /// ADR 0037 §7: the launch's engine tracing, decided when it launched;
+    /// `None` renders nothing at all (no option, no variable).
+    pub engine_tracing: Option<crate::engine_tracing::VllmTrace>,
 }
 
 /// SPEC §13.3: the engine key is never formatted.
@@ -175,6 +178,7 @@ impl std::fmt::Debug for PlanInputVllm {
             .field("kv_transfer_config", &self.kv_transfer_config)
             .field("lmcache", &self.lmcache)
             .field("api", &self.api)
+            .field("engine_tracing", &self.engine_tracing)
             .finish()
     }
 }
@@ -451,6 +455,12 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
         for (name, value) in crate::lmcache::NO_USAGE_TRACKING {
             env.insert(name.into(), value.into());
         }
+    }
+    // ADR 0037 §7: engine tracing, in the reserved block like the connector:
+    // CapyCTL owns `--otlp-traces-endpoint` (refused in pass-through), so
+    // nothing after the marker sets it beside this one.
+    if let Some(trace) = &input.engine_tracing {
+        trace.render(&mut argv, &mut env);
     }
     // ADR 0014 §6: everything after the marker is parsed by vLLM, and the entry
     // refuses it if any reserved field above resolves differently.

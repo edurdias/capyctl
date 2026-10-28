@@ -478,6 +478,10 @@ pub fn check_honoured(
     // host; a malformed value is refused before any side effect.
     crate::remote_roles::engine_telemetry(host)
         .map_err(|error| refuse(&format!("host.{}", error.path), error.detail))?;
+    // ADR 0037 §12, T03: `server.observability.tracing` as a server's, and
+    // `host.observability.tracing` with only `engines`, which needs the
+    // server block's endpoint on loopback; refused with their paths.
+    crate::tracing::standalone_tracing(document)?;
     if let Some(policy) = host.get("resource_policy") {
         let mut policy = policy.clone();
         if let Some(map) = policy.as_object_mut() {

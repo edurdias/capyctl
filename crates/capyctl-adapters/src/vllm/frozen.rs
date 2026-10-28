@@ -273,6 +273,8 @@ pub fn plan_from_effective(
         lmcache: None,
         // ADR 0036 §2: an embeddings deployment renders the pooling runner.
         api: effective.api,
+        // ADR 0037 §7: set by the launch builder from the launch's decision.
+        engine_tracing: None,
     })
 }
 

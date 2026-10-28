@@ -65,6 +65,8 @@ impl NativeHostExecution {
     /// unknown when that profile is no longer held, never today's. ADR 0032
     /// §2: whether it takes CapyCTL's request ID, from its own resolution
     /// only (not capable when that no longer resolves), as its abort decides.
+    /// ADR 0037 §7: whether its engine traces, as journaled when it launched
+    /// (never decided again: the host's setting may have changed since).
     pub(super) fn retained_access(
         &self,
         owned: &capyctl_protocol::execution::MemberCommand,
@@ -80,6 +82,7 @@ impl NativeHostExecution {
                 engine_access(engine, custom.as_ref())
             })
             .with_request_abort(request_abort)
+            .with_engine_trace(self.frozen_engine_trace(&owned.identity.command_id))
     }
     /// ADR 0031 §2: the launch plan. The key is the adapter's to give it
     /// ([`Self::custom_adapter`]), from the launch's own credentials.

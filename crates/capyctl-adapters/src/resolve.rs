@@ -61,6 +61,10 @@ pub enum AdapterSpec {
         /// caller; `None` for a launch that never uses LMCache. It becomes
         /// the launch plan's `lmcache`.
         lmcache: Option<Arc<crate::lmcache::LmcacheState>>,
+        /// ADR 0037 §7: the launch's engine tracing, decided when it was
+        /// launched. The launch plan's `engine_tracing` renders it; this is
+        /// the decision the coordinator records for the router and status.
+        engine_tracing: crate::engine_tracing::EngineTracing,
     },
     /// SGLang refuses the un-fenced control path, so it takes the frozen launch
     /// it was verified against, the two per-launch credentials, and — when the
@@ -101,6 +105,9 @@ pub enum AdapterSpec {
         /// ADR 0033: the launch's LMCache server and report, shared with the
         /// caller; `None` for a launch that never uses LMCache.
         lmcache: Option<Arc<crate::lmcache::LmcacheState>>,
+        /// ADR 0037 §7: the launch's engine tracing, decided when it was
+        /// launched; on, Initialize names the collector in the descriptor.
+        engine_tracing: crate::engine_tracing::EngineTracing,
     },
     /// ADR 0023: TensorFold talks plain HTTP on loopback and has no key; an
     /// owned launch carries its plan.
@@ -156,6 +163,19 @@ impl AdapterSpec {
             Self::Custom { .. } => Engine::Custom,
         }
     }
+
+    /// ADR 0037 §7: the launch's engine tracing decision; every engine but
+    /// vLLM and SGLang is `engine_unsupported`.
+    pub fn engine_tracing(&self) -> crate::engine_tracing::EngineTracing {
+        match self {
+            Self::Vllm { engine_tracing, .. } | Self::Sglang { engine_tracing, .. } => {
+                engine_tracing.clone()
+            }
+            _ => crate::engine_tracing::EngineTracing::Off(
+                crate::engine_tracing::EngineTracingOff::EngineUnsupported,
+            ),
+        }
+    }
 }
 
 /// Build the adapter for a runtime profile's declared engine family.
@@ -189,6 +209,7 @@ pub fn resolve(
             residency,
             api,
             lmcache,
+            engine_tracing: _,
         } => {
             let mut adapter = VllmAdapter::new(endpoint, api_key, fingerprint, policy, model_id)
                 .with_residency(residency)
@@ -226,6 +247,7 @@ pub fn resolve(
             rendezvous,
             api,
             lmcache,
+            engine_tracing,
         } => {
             let mut adapter = SglangAdapter::from_frozen(&frozen, observer)
                 .map_err(|error| match error {
@@ -253,6 +275,9 @@ pub fn resolve(
             }
             if let Some(state) = lmcache {
                 adapter = adapter.with_lmcache(state);
+            }
+            if let Some(endpoint) = engine_tracing.endpoint() {
+                adapter = adapter.with_trace_endpoint(endpoint);
             }
             if let Some(session) = session {
                 adapter = adapter.with_session(session);

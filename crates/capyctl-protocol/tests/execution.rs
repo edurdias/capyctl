@@ -27,6 +27,7 @@ fn command() -> pb::ServerToAgent {
             probe_max_tokens: 0,
             probe_decision: false,
             probe_embedding: false,
+            trace_parent: String::new(),
         })),
     }
 }
@@ -351,6 +352,7 @@ fn ready_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         probe_decision: None,
         probe_embedding: None,
         lmcache: None,
+        engine_tracing: String::new(),
     }
 }
 

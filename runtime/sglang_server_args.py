@@ -145,6 +145,14 @@ _RESERVED_DUMP = ("watermark_config", "debug_tensor_dump_output_folder",
                   "debug_tensor_dump_layers", "debug_tensor_dump_input_file",
                   "msprobe_dump_config", "export_metrics_to_file",
                   "export_metrics_to_file_dir", "spec_trace_dir")
+# ADR 0037 §7 (owner decision 2026-10-27, question 7): SGLang's tracing fields
+# (0.5.22 arg_groups/fields/observability.py) are CapyCTL's, refused as extra
+# arguments whatever the host approves (engine_policy.rs SGLANG_TRACING_FIELDS).
+# A traced launch's descriptor names `trace_endpoint`, and construct_server_args
+# pins them; without it nothing is pinned, so a version without them is not a
+# drift.
+_RESERVED_TRACING = ("enable_trace", "otlp_traces_endpoint", "otlp_service_name",
+                     "trace_modules")
 # Whole reserved families (ADR 0014 §3), matched on the parsed destination.
 _RESERVED_FAMILIES = ("ssl_", "modelopt_", "disaggregation_", "hicache_storage_",
                       "lmcache_", "flexkv_", "debug_tensor_dump_")
@@ -159,7 +167,7 @@ _TYPED_DESTINATIONS = frozenset({
     "max_total_tokens", "chunked_prefill_size", "tokenizer_worker_num",
 })
 _FORBIDDEN_EXTRA = frozenset({*_RESERVED_CONSTANT, *_RESERVED_BOUND, *_RESERVED_DUMP,
-                              "config"})
+                              *_RESERVED_TRACING, "config"})
 # ADR 0014 §4: capyctl safe defaults the deployment may override with extra args.
 _SAFE_DEFAULTS = {"detokenizer_worker_num": 1}
 
@@ -525,6 +533,13 @@ def construct_server_args(spec, placement, guarded_constructor, available_bytes=
     # server; every other launch keeps the constant pin off.
     if "is_embedding" in settings:
         reserved.update(is_embedding=True)
+    # ADR 0037 §7: a traced launch exports to the host's loopback endpoint;
+    # `expected` (below) pins the three after resolution. `trace_modules`
+    # keeps SGLang's default. Absent, nothing is rendered or pinned.
+    if "trace_endpoint" in settings:
+        reserved.update(enable_trace=True,
+                        otlp_traces_endpoint=settings["trace_endpoint"],
+                        otlp_service_name="sglang")
     # ADR 0028 §10: a group member's parallelism and rendezvous come from its
     # descriptor's group, never the single-rank constants. On a worker the key
     # fields stay None (it is handed no credential, ADR 0012) and its health

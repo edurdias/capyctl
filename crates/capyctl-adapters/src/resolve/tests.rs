@@ -15,12 +15,28 @@ fn vllm() -> AdapterSpec {
         residency: capyctl_config::effective::Residency::Deep,
         api: capyctl_config::effective::DeploymentApi::Chat,
         lmcache: None,
+        engine_tracing: crate::engine_tracing::EngineTracing::Off(
+            crate::engine_tracing::EngineTracingOff::HostOff,
+        ),
     }
 }
 
 #[test]
 fn every_family_maps_to_its_own_spec() {
     assert_eq!(vllm().engine(), Engine::Vllm);
+    // T48 (ADR 0037 §7): only vLLM and SGLang specs carry a decision.
+    assert_eq!(
+        tensorfold().engine_tracing(),
+        crate::engine_tracing::EngineTracing::Off(
+            crate::engine_tracing::EngineTracingOff::EngineUnsupported
+        )
+    );
+    assert_eq!(
+        llamacpp().engine_tracing(),
+        crate::engine_tracing::EngineTracing::Off(
+            crate::engine_tracing::EngineTracingOff::EngineUnsupported
+        )
+    );
 }
 
 /// A profile's identity — build fingerprint, reserved-flag policy, verification

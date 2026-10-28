@@ -35,6 +35,18 @@ pub trait SessionExecution: Send + Sync {
         session: u64,
         command: capyctl_protocol::execution::MemberCommand,
     ) -> ExecutionFuture;
+    /// ADR 0037 §§4, 6: execute a command whose envelope carried the server
+    /// step's `traceparent` (never journaled; `None` for a command without
+    /// one, such as a replay after a restart). An executor that records no
+    /// lifecycle spans executes it as [`Self::execute`].
+    fn execute_traced(
+        &self,
+        session: u64,
+        command: capyctl_protocol::execution::MemberCommand,
+        _trace_parent: Option<String>,
+    ) -> ExecutionFuture {
+        self.execute(session, command)
+    }
     fn inventory(&self) -> Option<pb::ReportInventory> {
         None
     }
@@ -598,6 +610,8 @@ async fn connect_once(
         protocol_version: capyctl_protocol::PROTOCOL_VERSION.into(),
         ..Default::default()
     });
+    // ADR 0037 §13: every inventory report carries the role's tracing status.
+    inventory.tracing = Some(crate::host_tracing::status(&crate::host_tracing::get()));
     send.send(frame(agent_to_server::Msg::ReportInventory(inventory)))
         .await
         .map_err(end("outbound stream closed"))?;
@@ -839,6 +853,7 @@ async fn connect_once(
             _ = observations.tick(), if fence.is_some() && !updates.as_ref().is_some_and(|u| u.profiles.publishing()) => {
                 if let Some(mut inventory) = execution.as_ref().and_then(|e| e.inventory()) {
                     inventory.envelope = Some(pb::Envelope { host_id: host.clone(), protocol_version: capyctl_protocol::PROTOCOL_VERSION.into(), ..Default::default() });
+                    inventory.tracing = Some(crate::host_tracing::status(&crate::host_tracing::get()));
                     reports.try_send(frame(agent_to_server::Msg::ReportInventory(inventory))).map_err(end("outbound report queue is full"))?;
                 }
                 continue;
@@ -918,11 +933,15 @@ async fn connect_once(
                     .as_ref()
                     .ok_or(SessionEnd::fixed("host has no native execution"))?
                     .clone();
-                let command =
-                    capyctl_protocol::execution::MemberCommand::try_from(pb::ServerToAgent {
-                        msg: Some(server_to_agent::Msg::ExecuteMember(wire)),
-                    })
-                    .map_err(end("controller sent an invalid command"))?;
+                // ADR 0037 §6: the envelope's trace context rides beside the
+                // command, outside its digest, and is never journaled.
+                let capyctl_protocol::execution::TracedCommand {
+                    command,
+                    trace_parent,
+                } = capyctl_protocol::execution::TracedCommand::try_from(pb::ServerToAgent {
+                    msg: Some(server_to_agent::Msg::ExecuteMember(wire)),
+                })
+                .map_err(end("controller sent an invalid command"))?;
                 command
                     .verify_digest()
                     .map_err(end("controller sent an invalid command"))?;
@@ -942,7 +961,7 @@ async fn connect_once(
                     (
                         key,
                         executor
-                            .execute(session, command)
+                            .execute_traced(session, command, trace_parent)
                             .await
                             .map(agent_to_server::Msg::MemberResult),
                     )

@@ -25,6 +25,8 @@ pub mod revoke;
 // SPEC §§7.2, 13.2: a role reaps what it inherits and names its memory bound.
 pub mod role_process;
 pub mod role_text;
+// ADR 0037 §§1, 8, 13: a role's tracing, its start warning and status line.
+pub mod role_tracing;
 pub mod roles;
 // Owner decision 2026-09-25: the generic `--set` / `CAPYCTL_SET__…` overrides.
 pub mod settings;

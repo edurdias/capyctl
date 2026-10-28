@@ -134,15 +134,63 @@ pub const LMCACHE_RESERVED_PREFIX: (&str, &str) = (
      renders LMCache from the deployment's `lmcache` setting",
 );
 
-/// Every reserved family: the dump families and LMCache's.
+/// ADR 0037 §7 (owner decision 2026-10-27, question 7): the engines' tracing
+/// families. The OpenTelemetry Python SDK reads `OTEL_*` for its endpoint,
+/// headers, sampler and resource, and SGLang reads `SGLANG_TRACE_*` and
+/// `SGLANG_OTLP_*`; CapyCTL renders engine tracing from the host's
+/// `observability.tracing.engines`, exporting only on loopback. Reserved on
+/// every engine, as LMCache's family is: a custom engine never gets trace
+/// context (ADR 0037 §6), and a variable here must not make any engine
+/// export off the host. Refused as `engine_env_reserved:<name>`.
+pub const TRACING_RESERVED_PREFIXES: &[(&str, &str)] = &[
+    (
+        "OTEL_",
+        "the OpenTelemetry SDK reads its endpoint, headers, sampler and resource here; \
+         CapyCTL renders engine tracing from `observability.tracing.engines`",
+    ),
+    (
+        "SGLANG_TRACE_",
+        "SGLang's tracing settings; CapyCTL renders engine tracing from \
+         `observability.tracing.engines`",
+    ),
+    (
+        "SGLANG_OTLP_",
+        "SGLang's OTLP export settings; CapyCTL renders engine tracing from \
+         `observability.tracing.engines`",
+    ),
+];
+
+/// ADR 0037 §7: trace context as an environment variable. vLLM reads
+/// `traceparent` from its own environment as a fallback parent
+/// (`tracing/otel.py`). Compared upper-cased, so `traceparent` and
+/// `TRACEPARENT` are both reserved.
+pub const TRACING_RESERVED_NAMES: &[(&str, &str)] = &[
+    (
+        "TRACEPARENT",
+        "a fixed trace parent for every request the engine serves; CapyCTL passes trace \
+         context per request",
+    ),
+    (
+        "TRACESTATE",
+        "trace state beside a fixed trace parent; CapyCTL passes trace context per request",
+    ),
+];
+
+/// Every reserved family: the dump families, LMCache's and tracing's.
 fn reserved_prefixes() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
     DUMP_RESERVED_PREFIXES
         .iter()
         .chain(std::iter::once(&LMCACHE_RESERVED_PREFIX))
+        .chain(TRACING_RESERVED_PREFIXES)
+}
+
+/// Every reserved single name: the dump names and tracing's.
+fn reserved_names() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    DUMP_RESERVED_NAMES.iter().chain(TRACING_RESERVED_NAMES)
 }
 
 fn reserved(upper: &str) -> bool {
-    DUMP_RESERVED_NAMES.iter().any(|(name, _)| *name == upper)
+    reserved_names().any(|(name, _)| *name == upper)
         || reserved_prefixes().any(|(prefix, _)| upper.starts_with(prefix))
 }
 
@@ -164,9 +212,9 @@ const MAX_VALUE_BYTES: usize = 4096;
 pub(crate) const MAX_NAMES: usize = 64;
 const MAX_NAME_BYTES: usize = 128;
 
-/// Whether CapyCTL owns or reserves `name` (rule 1, the dump families and
-/// LMCache's, above). Compared upper-cased, so a lower-case spelling of an
-/// owned name is not a way around it.
+/// Whether CapyCTL owns or reserves `name` (rule 1, the dump families,
+/// LMCache's and tracing's, above). Compared upper-cased, so a lower-case
+/// spelling of an owned name is not a way around it.
 pub fn is_owned(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     if SAFE_NAMES.contains(&upper.as_str()) {
@@ -489,8 +537,7 @@ pub fn env_table() -> Vec<FlagRow> {
             }),
         )
         .chain(
-            DUMP_RESERVED_NAMES
-                .iter()
+            reserved_names()
                 .map(|(name, reason)| row(name, NameMatch::Name, FlagClass::Reserved, reason)),
         )
         .chain(SAFE_NAMES.iter().map(|name| {
@@ -502,4 +549,79 @@ pub fn env_table() -> Vec<FlagRow> {
             )
         }))
         .collect()
+}
+
+#[cfg(test)]
+mod tracing_tests {
+    use super::*;
+
+    // T48 T03 T21 (ADR 0037 §7, owner decision 2026-10-27 q7): the tracing
+    // names are reserved at every level and on every engine, whatever an
+    // approval says, refused as `engine_env_reserved:<name>` with the name as
+    // written; the value never appears.
+    #[test]
+    fn tracing_env_names_are_reserved() {
+        let names = [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "OTEL_SERVICE_NAME",
+            "OTEL_TRACES_SAMPLER",
+            "otel_resource_attributes",
+            "SGLANG_TRACE_LEVEL",
+            "SGLANG_TRACE_ASYNC",
+            "SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS",
+            "traceparent",
+            "tracestate",
+            "TRACEPARENT",
+            "TRACESTATE",
+        ];
+        let secret = "secret-header-value";
+        let none = BTreeMap::new();
+        for name in names {
+            assert!(is_owned(name), "{name}");
+            let env = BTreeMap::from([(name.to_owned(), secret.to_owned())]);
+            let approved = ApprovedEnv::parse(&["MY_*".to_owned()]).unwrap();
+            for refusal in [
+                resolve_engine_env(&env, &approved, &none).unwrap_err(),
+                resolve_engine_env(&none, &approved, &env).unwrap_err(),
+                // ADR 0031 §2: a custom engine's manifest, too.
+                resolve_engine_env_with_manifest(&env, &none, &approved, &none).unwrap_err(),
+            ] {
+                assert_eq!(refusal.code(), format!("engine_env_reserved:{name}"));
+                assert!(!refusal.to_string().contains(secret));
+            }
+        }
+        // An approval cannot name them, exactly or by glob.
+        for entry in [
+            "OTEL_*",
+            "OTEL_SERVICE_NAME",
+            "SGLANG_TRACE_*",
+            "TRACEPARENT",
+        ] {
+            assert_eq!(
+                ApprovedEnv::parse(&[entry.to_owned()]).unwrap_err().code(),
+                format!("engine_env_reserved:{entry}")
+            );
+        }
+        // The table lists them as reserved.
+        let table = env_table();
+        for name in [
+            "OTEL_",
+            "SGLANG_TRACE_",
+            "SGLANG_OTLP_",
+            "TRACEPARENT",
+            "TRACESTATE",
+        ] {
+            assert!(
+                table
+                    .iter()
+                    .any(|row| row.name == name && row.class == FlagClass::Reserved),
+                "{name}"
+            );
+        }
+        // Neighbouring names are untouched.
+        for name in ["OTELX", "SGLANG_TRACER", "TRACEPARENTS"] {
+            assert!(!is_owned(name), "{name}");
+        }
+    }
 }

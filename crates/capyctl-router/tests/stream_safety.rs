@@ -222,6 +222,7 @@ async fn ready_deps(pending: bool) -> (capyctl_router::RouterDeps, String) {
             api_key: None,
             inflight: Arc::new(InFlight::default()),
             activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+            tracing: capyctl_trace::Tracing::off(),
         },
         id.to_string(),
     )

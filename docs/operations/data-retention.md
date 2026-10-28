@@ -8,7 +8,8 @@ the engine's own output, and only if the engine prints it; see
 request-derived data outlives a request is the host RAM of a deployment's
 LMCache server; see [LMCache](#lmcache). The engines CapyCTL launches report
 nothing about their use off the host unless the host allows it; see
-[Nothing reported off the host](#nothing-reported-off-the-host).
+[Nothing reported off the host](#nothing-reported-off-the-host). Trace spans
+leave the machine only when you name a collector; see [Traces](#traces).
 
 ## Summary
 
@@ -20,6 +21,7 @@ nothing about their use off the host unless the host allows it; see
 | Journal | Lifecycle commands and their evidence; no request bodies, engine log tails or probe text | Server, standalone and host databases | Never pruned | Cannot be turned off |
 | Latency and load figures | Per-request timings and engine load samples | Memory only | Until the role restarts | Nothing to turn off; never written to disk |
 | Role logs | What each role does; no request bodies | The role's log (journald under systemd) | Your log system's retention | Set by your log system |
+| Traces | Span names, timings, CapyCTL's identifiers, codes and token counts; no request or response content | Memory only in CapyCTL (a queue of at most 2048 spans), then the collector you name | In CapyCTL until sent, normally within 5 seconds; at the collector, its own retention | Off by default: without `observability.tracing.endpoint` nothing is recorded |
 | Engine logs | The engine's own output, with credentials removed | A file per launch, or memory only | `files`: never deleted by CapyCTL. `memory`: 60 seconds after the engine exits | `engine_logs: memory` or `retention: zero` |
 | Engine caches | Prefix and KV cache of recent requests | GPU memory of the running engine | While the engine runs; discarded when it parks or stops | Partition with `cache_salt`; not covered by `retention: zero` |
 | LMCache | KV of recent request prefixes, keyed by a digest of the deployment, its revision and the request's salt | Host RAM of the instance's private loopback LMCache server | While the model runs or is parked; gone when it stops | `lmcache: off` on the deployment or the host, or `retention: zero` |
@@ -69,6 +71,49 @@ The server, host and standalone roles log what they do: operations, state
 changes, errors. They do not log request or response bodies. Where those logs
 end up, and for how long, is up to your log system (journald under the
 packaged systemd units).
+
+## Traces
+
+With an `observability.tracing.endpoint`
+([settings](configuration.md#tracing)), CapyCTL records spans for each
+request it serves and for each model start, wake or switch, and sends them to
+that collector and nowhere else. Without one, nothing is recorded.
+
+A span holds its name, its start and end times, and a fixed list of
+attributes: CapyCTL's request ID (`X-CapyCTL-Request-Id`), the endpoint
+(`chat`, `decisions`), the deployment, revision, instance and host names, the
+generation and attempt numbers, the engine and its version, whether the
+request streamed, its outcome and CapyCTL error code, the cancellation cause,
+the activation kind and park tier, the HTTP method, route and status, the
+engine's input and output token counts and its finish reasons. The resource
+names the service (`capyctl-server`, `capyctl-host` or `capyctl-standalone`),
+its version and its role, with no machine ID or address.
+
+A span never holds any part of a request or response body (messages, system
+prompts, tools and their arguments, reasoning, completions), the `model`
+string as the caller wrote it, `cache_salt` or its digest, the caller's
+`X-Request-Id`, a key or `Authorization` value, the client's address or user
+agent, an engine's error text or log line. Your deployment, instance and host
+names do reach the collector.
+
+Inside CapyCTL, spans wait in memory, in a queue of at most 2048, and are
+sent every 5 seconds; a full queue drops them, and a restart loses what was
+queued. How long the collector, and whatever it forwards to, keeps them is
+its own setting.
+
+**Engine spans.** With a host's `observability.tracing.engines: on`, vLLM and
+SGLang send their own spans to the host's collector, which must be on
+loopback. They carry token counts, sampling parameters, the served model
+name, finish reasons and the engine's request ID, and no prompt or output
+text. SGLang's spans also carry the machine's `/etc/machine-id` as `host_id`,
+in full, and its first 8 characters in some span names; the machine-id manual
+says that ID should not leave the machine. A collector rule that removes it:
+[Engine tracing](../guide/engines.md#engine-tracing).
+
+**Zero retention.** `retention: zero` turns engine tracing off for the
+deployment, because engine spans come from code CapyCTL does not control.
+CapyCTL's own spans for its requests are kept, as role logs are: they hold
+identifiers, timings and codes, not content.
 
 ## Engine logs
 
@@ -180,6 +225,9 @@ it:
   and `lmcache: required` is refused `retention_zero:lmcache`;
 - starts engine and LMCache processes with no core dumps (`RLIMIT_CORE` 0), so
   a crash writes no dump of request data.
+- turns engine tracing off for the deployment
+  (`engine tracing: off (retention_zero)`), and no trace header reaches its
+  engine.
 
 Turning it on for a host stops the LMCache servers already running there: each
 instance using one is drained, stopped with its server, and started again
@@ -193,6 +241,8 @@ What zero retention does not cover:
 - whatever a custom engine's manifest makes it write;
 - swap: the operating system may page any process's memory out; whether the
   machine has swap is yours to decide.
+- CapyCTL's own trace spans for the deployment's requests, which hold no
+  content ([Traces](#traces)).
 
 A host from before 0.1.7 cannot honour a deployment's `retention: zero`, so
 such a deployment is not placed there (`host_capability_missing:retention`).
