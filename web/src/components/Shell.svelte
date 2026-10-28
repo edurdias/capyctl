@@ -2,12 +2,12 @@
   import { onMount, type Component } from 'svelte';
   import { route } from '../lib/router';
   import { startLiveState } from '../lib/state';
-  import Activity from '../routes/Activity.svelte';
+  import Activity from '../routes/activity/Activity.svelte';
   import Engines from '../routes/Engines.svelte';
-  import Hosts from '../routes/Hosts.svelte';
-  import Models from '../routes/Models.svelte';
+  import Hosts from '../routes/hosts/Hosts.svelte';
+  import Models from '../routes/models/Models.svelte';
   import NotFound from '../routes/NotFound.svelte';
-  import Overview from '../routes/Overview.svelte';
+  import Overview from '../routes/overview/Overview.svelte';
   import Playground from '../routes/Playground.svelte';
   import Settings from '../routes/Settings.svelte';
   import Brand from './Brand.svelte';

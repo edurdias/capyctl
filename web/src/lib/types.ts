@@ -193,6 +193,17 @@ export interface GroupMember {
   last_error?: string | null;
 }
 
+// ADR 0040 §8 (crates/capyctl-store/src/snapshot.rs `ActionHint`): whether the
+// current state lets an action through and, when not, the error code its
+// handler would answer with. A hint is not authority; the handler decides.
+export type HintedAction = 'start' | 'stop' | 'park' | 'preinitialize' | 'delete';
+
+export interface ActionHint {
+  action: HintedAction;
+  available: boolean;
+  reason?: string;
+}
+
 export interface InstanceSnapshot {
   index: number;
   host_id?: string | null;
@@ -217,6 +228,8 @@ export interface InstanceSnapshot {
   lmcache?: InstanceLmcache;
   topology?: InstanceTopology | { tensor_parallel: number; pipeline_parallel: number };
   collectives?: 'loopback';
+  // ADR 0040 §8: `start` and `stop` of this instance.
+  actions?: ActionHint[];
 }
 
 export interface DeploymentSnapshot {
@@ -252,6 +265,9 @@ export interface DeploymentSnapshot {
   parsers?: Parsers;
   api?: 'decisions';
   topology?: unknown;
+  // ADR 0040 §8: supported-action hints; absent for a kind the lifecycle
+  // actions refuse whatever its state.
+  actions?: ActionHint[];
 }
 
 export interface RouteSnapshot {

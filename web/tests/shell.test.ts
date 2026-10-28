@@ -36,6 +36,10 @@ describe('app shell', () => {
       if (call.url === '/management/v1/snapshot') {
         return json(snapshot(cursor(5)));
       }
+      if (call.url !== '/management/v1/events') {
+        // The Overview's own reads (hosts, load) stay pending.
+        return new Promise<Response>(() => {});
+      }
       if (!online) {
         return Promise.reject(new TypeError('Failed to fetch'));
       }

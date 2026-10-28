@@ -28,6 +28,12 @@ export const streamState: Readable<StreamState> = { subscribe: streamStore.subsc
 // shows "Reconnecting…" and live values may be out of date.
 export const reconnecting: Readable<boolean> = { subscribe: reconnectingStore.subscribe };
 
+// Reads the snapshot now, outside the event stream: an action refused with
+// `revision_conflict` shows the current version at once (plan U14).
+export async function reloadSnapshot(): Promise<void> {
+  snapshotStore.set(await request<Snapshot>(SNAPSHOT_PATH));
+}
+
 // Starts the live state for a signed-in shell and returns its stop function.
 //
 // Each event is applied by reading the snapshot again rather than by
