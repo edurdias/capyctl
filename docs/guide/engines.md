@@ -820,9 +820,9 @@ process:
 - listening only on loopback, on two ports CapyCTL takes from the host's
   `endpoint_port_range`; a server found listening anywhere else is stopped
   and the model runs without it;
-- with a pool of host RAM (4 GiB by default, `lmcache_pool` to change it)
-  allocated when it starts, evicting least recently used entries, and no disk,
-  remote or peer tier;
+- with a pool of host RAM (by default sized to hold one full context of the
+  model, below; `lmcache_pool` to state a size) allocated when it starts,
+  evicting least recently used entries, and no disk, remote or peer tier;
 - with an environment of `PATH`, `HOME` and the instance's GPU only, and its
   script API off;
 - writing its output to its own log beside the engine's, through the same
@@ -831,8 +831,22 @@ process:
 The engine connects to it: vLLM through LMCache's `LMCacheMPConnector`
 (CapyCTL renders `--kv-transfer-config` with the connector's module path and
 `autostart: false`), SGLang through `--enable-lmcache --lmcache-config-file`
-(a private file holding only the server's address). The in-process
-`LMCacheConnectorV1` is never used: it ignores `cache_salt`.
+(a private file holding only the server's address and, for a parking model,
+its transfer mode). The in-process `LMCacheConnectorV1` is never used: it
+ignores `cache_salt`.
+
+**Transfer modes.** A model that parks (`deep` or `host_backed`) uses
+engine-driven transfer: the server runs with
+`--supported-transfer-mode engine_driven`, the engine's connector with
+`lmcache.mp.mp_transfer_mode: engine_driven`, and the engine copies each
+chunk of KV through host memory to the server, which never maps the engine's
+GPU memory. A park therefore releases the engine's KV, and the memory a wake
+allocates is what the next copy reads. A `restart_only` model keeps LMCache's
+default, LMCache-driven transfer, where the server maps the engine's KV
+through CUDA IPC (and, after a restart-park, can keep the stopped engine's
+KV, which CapyCTL counts; see [parking](parking.md#parking-with-lmcache));
+it moves to engine-driven transfer once the live rows measuring its cost and
+its restart-parks pass.
 
 **Which engines.**
 
@@ -849,7 +863,23 @@ The engine connects to it: vLLM through LMCache's `LMCacheMPConnector`
 vLLM 0.32.0 and SGLang 0.5.22 with LMCache 0.5.6 are the qualified versions
 (measured on a GB10); a newer engine or a later LMCache 0.5.x is used when
 the launch-time check below passes, and is not qualified until a live run
-covers it. A deployment with a `topology` runs without LMCache.
+covers it. A deployment with a `topology` across machines runs without
+LMCache. A model on several GPUs of one machine runs without it under
+`lmcache: auto` (`multi_gpu_unqualified`), and as an uncertified setup under
+`lmcache: required`.
+
+**Parking: the certified table.** A model that parks (`deep`, or
+`host_backed` on a discrete GPU) uses LMCache by default only on a
+combination certified live: an engine version, the checkpoint's
+`model_type`, the GPU as `nvidia-smi` names it, and the residency. Rows come
+from live runs on the GB10 (`deep`) and on one discrete GPU (`host_backed`);
+only dense models with full attention can be listed, since LMCache 0.5.6's
+engine-driven transfer refuses sliding-window, recurrent and indexer layers.
+
+This release certifies no combination yet: the live runs that add rows have
+not run. Until a row lists its combination, a parking model runs without
+LMCache (`park_unqualified`), and under `lmcache: required` with it,
+uncertified.
 
 **Decision deployments on SGLang run without LMCache**, and so does any SGLang
 deployment whose arguments state `--disable-radix-cache`: SGLang 0.5.22 fails
@@ -884,9 +914,13 @@ the engine again").
 **The launch-time check** reads files of the registered environment and runs
 nothing. It passes when LMCache is 0.5.6 or a later 0.5.x; its package holds
 the connector the engine needs, the `lmcache server` entry point and the
-server options CapyCTL renders; vLLM's KV transfer configuration accepts a
-connector module path; and SGLang declares its LMCache settings and selects
-its unified LMCache radix cache. On SGLang the check also verifies that the
+server options CapyCTL renders (the eviction watermark and ratio included);
+vLLM's KV transfer configuration accepts a connector module path; and SGLang
+declares its LMCache settings and selects its unified LMCache radix cache. For
+a parking model it also verifies engine-driven transfer: the server's
+`--supported-transfer-mode` offers `engine_driven`, vLLM's LMCache adapter
+reads `mp_transfer_mode`, and SGLang's unified connector reads
+`lmcache.mp.mp_transfer_mode`. On SGLang the check also verifies that the
 request's salt reaches LMCache: SGLang passes `cache_salt` to LMCache's
 unified connector, which puts it in the cache key, and SGLang does not use
 LMCache's older SGLang adapter (which dropped the salt, LMCache issue 4825).
@@ -899,14 +933,17 @@ or `off (<reason>)` for a profile that cannot use it.
 **Status.** `capyctl status deployment <name>` shows a line per instance:
 
 ```text
-LMCache   on: pool 4 GiB, used 1.3 GiB, overhead 0.8 GiB (measured), 212 hits / 260 lookups
-LMCache   off: LMCache needs vLLM 0.32.0 or newer
+LMCache   instance 0 on: pool 8 GiB (auto: one 32,768-token context of qwen3 at 144 KiB per token), used 1.3 GiB, overhead 0.8 GiB (measured), 212 hits / 260 lookups
+LMCache   instance 0 off: LMCache needs vLLM 0.32.0 or newer
 ```
 
 and `--json` an `lmcache` object (`state`, `reason`, `pool_bytes`,
-`used_bytes`, `overhead_bytes`, `measured`, `lookups`, `hits`; a figure
-CapyCTL could not read is `null`, never zero). The event `lmcache_off` records
-an instance and reason once per launch.
+`pool_source` (`auto`, `stated` or `default`), `pool_tokens`, `warning`,
+`certified`, `used_bytes`, `overhead_bytes`, `measured`, `lookups`, `hits`; a
+figure CapyCTL could not read is `null`, never zero). The event `lmcache_off`
+records an instance and reason once per launch, `lmcache_pool_short` a pool
+that keeps less than one context, and `lmcache_uncertified` a `required`
+launch outside the certified table.
 
 **Memory.** The memory CapyCTL sets aside for an instance covers the pool
 plus the server's own memory in host RAM (on a GB10, the memory the GPU uses
@@ -921,20 +958,46 @@ window is never the measurement. The charge is never less than the server's
 GPU memory as read: a larger reading raises it. `memory.request` stays the
 engine's own GPU memory.
 
-**Long prompts.** LMCache 0.5.6 starts evicting once its pool is 80 % full,
-so the pool has to hold the prompts you want back plus whatever passes
-through it in between. Measured on a GB10 with vLLM 0.32.0 and Qwen3-4B
-(144 KiB of KV per token, 4.5 GiB for a 32,000-token prompt), after other long
-prompts had pushed a 32,000-token prompt out of the engine's cache: with a
-12 GiB pool LMCache returned 17,000 to 28,000 of its tokens and the first
-token came in 4.66 s; with a 20 GiB pool it returned all of them, in 0.35 s
-instead of 7.85 s without LMCache. The pool counts against the machine's
-host-KV limit, a tenth of memory on standalone (12.17 GiB on a 128 GB GB10),
-so a larger pool needs that limit raised too:
+**Long prompts and the pool.** LMCache 0.5.6 starts evicting once its pool
+is 80 % full and then drops a fifth of what it holds, so about 64 % of the
+pool is sure to survive; CapyCTL renders those two settings
+(`--eviction-trigger-watermark 0.8 --eviction-ratio 0.2`) so a later LMCache
+cannot change them under it. With `lmcache_pool: auto`, the default, the pool
+holds one full context of the deployment's model after an eviction: the
+context (stated `context_length`, else the one CapyCTL fits) times the
+model's KV bytes per token, divided by 0.64, rounded up to a whole GiB, and
+never below 4 GiB. Measured on a GB10 with vLLM 0.32.0 and Qwen3-4B (144 KiB
+of KV per token), a 12 GiB pool returned only 17,000 to 28,000 tokens of a
+32,000-token prompt after other long prompts, and a 20 GiB pool all of them,
+in 0.35 s instead of 7.85 s. Examples on a GB10 standalone, whose
+`host_kv_limit` is 12.17 GiB:
+
+| Model, context | Pool | Tokens kept after an eviction |
+|---|---|---|
+| Qwen3-4B, 8,192 | 4 GiB | about 18,600 |
+| Qwen3-4B, 32,768 | 8 GiB | about 37,300 |
+| Qwen3-4B, 65,536 | 12 GiB, warning | about 55,900 |
+| Qwen3-32B, 32,768 | 12 GiB, warning | about 31,500 |
+
+The pool counts against the machine's host-KV limit (a tenth of the memory
+standalone observes at each start, 12.17 GiB on a 128 GB GB10, and
+settable), so an automatic pool never exceeds that limit less the
+deployment's own host KV. When it keeps less than one context, `deploy`,
+status and the effective configuration warn ("the LMCache pool (12 GiB)
+keeps about 55,900 tokens after eviction; one full context of 65,536 tokens
+needs 15 GiB: raise host_kv_limit or set lmcache_pool") and the event
+`lmcache_pool_short` records it once per launch; the model runs. When other
+models already hold the host-KV room, an automatic pool shrinks to the room
+left (whole GiB, at least 1 GiB) with the same warning, and with less than
+1 GiB left the model runs without LMCache (`host_kv_room`). A host with no
+`host_kv_limit` keeps automatic pools at 4 GiB. When CapyCTL cannot read the
+model's KV size or context (an unreadable configuration, or an enrolled host
+that has not sized the checkpoint yet), the pool is 4 GiB and status says
+why. A stated `lmcache_pool` is used as given, and waits for room or is
+refused like any reservation. To keep more:
 
 ```yaml
 # The deployment
-lmcache: required
 lmcache_pool: 20GiB
 ```
 
@@ -950,8 +1013,13 @@ document ([settings](../operations/configuration.md#standalone-host-kv-limit)).
 it and says why. With `required` it refuses to start instead:
 `lmcache_unavailable:<reason>` (`retention_zero:lmcache`,
 `host_capability_missing:lmcache`), and a failure found at launch leaves
-nothing running. A host's `lmcache: off` or `retention: zero` keeps it off
-on that machine ([settings](../operations/configuration.md#lmcache-and-zero-retention)).
+nothing running. `required` is never refused for being outside the
+certified table or for running on several GPUs: it runs LMCache as an
+uncertified setup, shown "LMCache on (uncertified: ...)" in status,
+`certified: false` in JSON, a warning from `deploy` and an
+`lmcache_uncertified` event once per launch. A host's `lmcache: off` or
+`retention: zero` keeps it off on that machine
+([settings](../operations/configuration.md#lmcache-and-zero-retention)).
 
 **When the engine does not start with it.** An engine that exits or does not
 become ready with the connector is stopped with its server and started once
@@ -965,8 +1033,14 @@ with a new, empty server (`lmcache_server_exited`).
 
 **Local reach.** Any process on the machine can reach the server's loopback
 ports, as it can reach a llama.cpp engine: read its configuration, list or
-clear its cache, and store or look up KV under any salt. On a machine with
-untrusted local users, set the host's `lmcache: off` or `retention: zero`.
+clear its cache, and store or look up KV under any salt. A parking model's
+server also accepts engine-driven transfer, whose chunks arrive pickled on
+the request port, and LMCache unpickles them: any local process that reaches
+that port can make the server run code as the role's service user (CapyCTL
+passes no shared-memory segment, so this is the path every chunk takes). A
+request to LMCache for a payload format that is not pickle is drafted, not
+yet filed. On a machine with untrusted local users, set the host's
+`lmcache: off` (or `retention: zero`), or the deployment's `lmcache: off`.
 
 **Options.** CapyCTL renders the LMCache options itself: SGLang's
 `--enable-lmcache` and `--lmcache-*` are refused in `extra_args`, so is a

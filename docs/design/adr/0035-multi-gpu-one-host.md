@@ -293,7 +293,9 @@ topology: auto
   `T = N` by §3. A unified host, TensorFold and custom engines have N = 1 only, so `auto`
   there is today's single-GPU deployment. A requirement only N = 1 can meet narrows the
   table to N = 1: a declared `deep` or `host_backed` while the engine's N > 1 parking gate
-  is closed (§9), and `lmcache: required` while LMCache is off for N > 1 (ADR 0034).
+  is closed (§9). (`lmcache: required` narrowed it to N = 1 too until [ADR 0034](0034-lmcache-by-default.md) §6
+  made a model on several GPUs run LMCache uncertified under `required`, implemented
+  2026-10-28.)
 - **Choice at placement, on capacity.** On each candidate host, N is the smallest candidate
   for which the host has N identical eligible GPUs whose managed limits each hold the
   per-GPU charge of every phase (the cold phase included: a measured peak for that N when
@@ -514,7 +516,9 @@ key guard, and no engine control path goes through ingress or the router. Status
   the candidates to N = 1 instead of being refused (§1a).
 - **llama.cpp, TensorFold, custom:** `restart_only`, unchanged.
 - **LMCache.** LMCache stays off for N > 1 with the reason `multi_gpu_unqualified` until an
-  LC row qualifies it (ADR 0034 owns the rule and the row).
+  LC row qualifies it (ADR 0034 owns the rule and the row). *Amended 2026-10-28 by
+  [ADR 0034](0034-lmcache-by-default.md) §6:* that holds under `lmcache: auto`; under `lmcache: required` the
+  instance runs LMCache, its ranks connected to its one server, as an uncertified setup.
 
 ### 10. Support data
 

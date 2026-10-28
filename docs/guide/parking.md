@@ -46,8 +46,10 @@ SGLang 0.5.22. CapyCTL settles a park or wake only after every chosen GPU's
 evidence agrees; a missing reading keeps the operation uncertain and its
 memory reserved. `topology: auto` can choose several GPUs with either tier.
 The engine and model restrictions above still apply. llama.cpp stops, on
-one GPU or several. LMCache remains off for a model on several GPUs
-(`multi_gpu_unqualified`); this run did not qualify that combination.
+one GPU or several. LMCache stays off for a model on several GPUs under
+`lmcache: auto` (`multi_gpu_unqualified`): no run has qualified it. Under
+`lmcache: required` it runs, its GPUs connected to one LMCache server, as an
+uncertified setup.
 
 Switching works on whole models: to make room for a model on GPUs 0 and 1,
 CapyCTL parks or stops whatever is on either card, and a model on two GPUs
@@ -99,10 +101,15 @@ A deployment that uses [LMCache](engines.md#lmcache) keeps its LMCache server,
 and the server's pool of host RAM stays reserved, while the model is parked;
 the server stops when the model stops.
 
-- **`restart_only`** (declared, or what a decision model or a machine with
-  deep parking turned off resolves to): parking stops the engine and keeps the
-  LMCache server; waking starts the engine again on the same server, so the
-  first request after the wake can be answered from the cache. The wake is a
+- **`restart_only`** is for models that cannot park deep (decision models,
+  machines with deep parking turned off, and the models
+  [above](#how-a-model-parks) that only restart): for them LMCache keeps a
+  warm cache across the restart, which is never slower than the stop they
+  would get without it. A model that can park deep wakes sooner parked deep
+  without LMCache than restarted with it, so declaring `restart_only` to get
+  LMCache does not pay. Parking stops the engine and keeps the LMCache
+  server; waking starts the engine again on the same server, so the first
+  request after the wake can be answered from the cache. The wake is a
   start, so unless the deployment states `timeouts.wake` it may take as long
   as a start (`timeouts.initialize`, or the window CapyCTL derives for a
   start). Without LMCache such a model stops instead of parking, as before.
@@ -119,14 +126,26 @@ the server stops when the model stops.
   with a new server. The first request after that start is not answered from
   the cache. A model parked and woken repeatedly therefore alternates between
   a park and a stop when its server does not release the old KV.
-- **`deep` and `host_backed`** use LMCache only on an engine version, model
-  type and GPU combination qualified live for parking with it. This release
-  qualifies none, so a deep-parking deployment keeps parking deep and runs
-  without LMCache, and status says "LMCache off: not qualified with deep park
-  on <engine version> / <model type> / <GPU>". Parking wins: CapyCTL never
-  switches it to `restart_only` for you. To have LMCache, declare
-  `residency: restart_only`; with `lmcache: required` and a parking residency
-  the deployment is refused (`lmcache_unavailable:park_unqualified`).
+- **`deep` and `host_backed`** use LMCache with engine-driven transfer: the
+  engine copies each piece of KV to the LMCache server itself, so the server
+  never holds the engine's GPU memory and a park releases all of it. By
+  default they use LMCache only on a certified combination: an engine
+  version, model type and GPU listed in the [qualified table](engines.md#lmcache),
+  `deep` on the GB10 and `host_backed` on the one discrete GPU qualified for
+  it. This release lists none yet: the live rows that add them have not
+  run. On any other combination the deployment keeps parking and runs
+  without LMCache, and status says "LMCache off: not qualified with deep
+  park on <engine version> / <model type> / <GPU>". Parking wins: CapyCTL
+  never switches it to `restart_only` for you. A model that can park deep
+  should; it gets LMCache once its combination is certified.
+- **`lmcache: required` outside the table** runs LMCache anyway, with the
+  same rendering, as an uncertified setup: `deploy` warns, status shows
+  "LMCache on (uncertified: <engine version> / <model type> / <GPU> /
+  <residency> is not in the qualified table)" and JSON `certified: false`.
+  It is never refused for being uncertified. If the engine then fails to
+  start with LMCache (a model type the transfer does not handle, for
+  example), the launch fails `lmcache_unavailable:engine_start_failed` and
+  nothing is left running.
 
 ## Switch between models
 
