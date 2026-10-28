@@ -221,7 +221,15 @@ struct Inner {
     endpoint: Option<String>,
     queue: Option<Arc<export::Queue>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// ADR 0037 §3: `capyctl.settle` spans of cancelled requests, open until
+    /// their cancellation settles, keyed by lease ID. Memory only: a role
+    /// restart loses them, and those settlements are then not traced.
+    pending: Mutex<std::collections::HashMap<String, Span>>,
 }
+
+/// At most this many cancelled requests' settlements are held open; past it a
+/// settlement span ends at once, as `cancelling`.
+pub const MAX_PENDING_SETTLES: usize = 4096;
 
 impl std::fmt::Debug for Tracing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -310,6 +318,7 @@ impl Tracing {
                 endpoint: Some(settings.endpoint),
                 queue: Some(queue),
                 task: Mutex::new(Some(task)),
+                pending: Mutex::default(),
             })),
         })
     }
@@ -341,6 +350,37 @@ impl Tracing {
             .is_err()
         {
             task.abort();
+        }
+    }
+
+    /// ADR 0037 §3: keep a cancelled request's open `capyctl.settle` span
+    /// until its cancellation settles ([`Tracing::settled`]).
+    pub fn hold(&self, lease: &str, mut span: Span) {
+        let Some(inner) = &self.inner else { return };
+        let mut pending = inner.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.len() >= MAX_PENDING_SETTLES {
+            drop(pending);
+            span.set(Attr::Outcome(Outcome::Cancelling));
+            span.end();
+            return;
+        }
+        pending.insert(lease.to_owned(), span);
+    }
+
+    /// ADR 0037 §3: the cancellation of the request holding `lease` settled
+    /// (its final output, the engine's idle reading, or the instance's
+    /// verified exit): its `capyctl.settle` span ends now. Nothing when no
+    /// span is held for it.
+    pub fn settled(&self, lease: &str, outcome: Outcome) {
+        let Some(inner) = &self.inner else { return };
+        let span = inner
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(lease);
+        if let Some(mut span) = span {
+            span.set(Attr::Outcome(outcome));
+            span.end();
         }
     }
 
@@ -479,6 +519,13 @@ impl Span {
     pub fn first_progress(&mut self) {
         if let Some(span) = &mut self.inner {
             span.add_event("first_progress", Vec::new());
+        }
+    }
+
+    /// As [`Span::first_progress`], at the time the chunk arrived.
+    pub fn first_progress_at(&mut self, at: std::time::SystemTime) {
+        if let Some(span) = &mut self.inner {
+            span.add_event_with_timestamp("first_progress", at, Vec::new());
         }
     }
 

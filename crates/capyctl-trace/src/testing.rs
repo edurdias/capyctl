@@ -82,6 +82,7 @@ pub fn capture(sample_ratio: f64, caller_mode: CallerMode, service: Service) -> 
             endpoint: None,
             queue: None,
             task: Mutex::new(None),
+            pending: Mutex::default(),
         })),
     };
     (

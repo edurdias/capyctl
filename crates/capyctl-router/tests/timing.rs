@@ -88,6 +88,7 @@ async fn app(header: bool) -> (axum::Router, Arc<InFlight>, String) {
         api_key: Some("test-key".into()),
         inflight: inflight.clone(),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: capyctl_trace::Tracing::off(),
     };
     let id = controller
         .submit_deploy(capyctl_controller::DeployRequest {

@@ -61,6 +61,10 @@ pub struct RuntimeEndpoint {
     /// ([`LifecyclePort::abort_request`]). Only an SGLang 0.5.22 launch with one
     /// tokenizer worker, on a host whose session declares the abort operation.
     pub request_abort: bool,
+    /// ADR 0037 §§6, 7: the launch was started with engine tracing (its
+    /// launch-time decision, recorded before Ready, was on). Only such a
+    /// launch's engine is sent a trace context.
+    pub engine_trace: bool,
 }
 
 /// ADR 0013 §10 (unit I3): one instance of a deployment that holds a runtime,
@@ -264,6 +268,34 @@ pub trait LifecyclePort: Send + Sync {
         }
         let op = self.auto_activate(deployment).await?;
         self.wait_terminal(&op).await.map(|_| ())
+    }
+
+    /// ADR 0037 §4: as [`LifecyclePort::activate_for_request`], recording
+    /// the activation's steps under `activation`, the root span of its own
+    /// trace, which the router opened for the waiting requests to link to.
+    /// The authority ends it. The default records no step: it ends the span
+    /// with the activation's outcome.
+    async fn activate_for_request_traced(
+        &self,
+        deployment: &str,
+        mut activation: capyctl_trace::Span,
+    ) -> Result<(), LifecycleFault> {
+        let result = self.activate_for_request(deployment).await;
+        activation.set(capyctl_trace::Attr::Outcome(match result {
+            Ok(()) => capyctl_trace::Outcome::Completed,
+            Err(LifecycleFault::Uncertain(_)) => capyctl_trace::Outcome::Uncertain,
+            Err(_) => capyctl_trace::Outcome::Failed,
+        }));
+        activation.end();
+        result
+    }
+
+    /// ADR 0037 §6 (ADR 0017): whether the host whose ingress serves this
+    /// instance incarnation declared the `trace_context` capability, so the
+    /// router may send it trace headers. The default is an authority with no
+    /// remote hosts: none.
+    fn trace_context(&self, _deployment: &str, _generation: i64) -> bool {
+        false
     }
 
     /// SPEC §6.3, §6.5, §10: the refusal a request gets when nothing runs or

@@ -71,6 +71,8 @@ pub trait ForwarderSource: Send + Sync {
         Ok(Lane {
             forward: self.forwarder(deployment)?,
             request_abort: false,
+            engine_trace: false,
+            trace_context: false,
         })
     }
 }
@@ -78,9 +80,18 @@ pub trait ForwarderSource: Send + Sync {
 /// ADR 0032 §1–§3: the forwarder for one instance incarnation, and whether its
 /// lane carries CapyCTL's request ID to the engine and the authority can ask
 /// the engine to abort a request by it (`RuntimeEndpoint::request_abort`).
+/// ADR 0037 §7: and whether the launch's engine was started with engine
+/// tracing (`RuntimeEndpoint::engine_trace`); ADR 0037 §6: and whether the
+/// host whose ingress serves it declared `trace_context`.
 pub struct Lane {
     pub forward: Arc<dyn ChatForward>,
     pub request_abort: bool,
+    /// True only for a launch whose engine tracing decision was on.
+    pub engine_trace: bool,
+    /// ADR 0037 §6 (ADR 0017): true only for an instance served through the
+    /// ingress of a host that declared the `trace_context` capability; an
+    /// older host gets no trace header.
+    pub trace_context: bool,
 }
 
 /// Forwarders built from what the lifecycle authority reports is running.
@@ -202,14 +213,20 @@ impl ForwarderSource for LiveForwarders {
         // `rid` to an engine reached directly and as a header to a host's
         // ingress; any other lane carries none.
         let request_abort = runtime.request_abort;
+        let engine_trace = runtime.engine_trace;
         let request_ids = match (request_abort, ingress) {
             (false, _) => RequestIdLane::Absent,
             (true, false) => RequestIdLane::Engine,
             (true, true) => RequestIdLane::Ingress,
         };
+        // ADR 0037 §6: the trace headers go to a host's ingress only when
+        // the host declared `trace_context`.
+        let trace_context = ingress && self.port.trace_context(deployment, generation);
         Ok(Lane {
             forward: self.build(deployment, Some(generation), runtime, request_ids)?,
             request_abort,
+            engine_trace,
+            trace_context,
         })
     }
 }
