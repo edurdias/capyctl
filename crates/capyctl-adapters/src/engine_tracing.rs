@@ -232,11 +232,15 @@ pub fn host_setting() -> HostEngineTracing {
 
 /// Whether `engine` at `engine_version` (the profile's registered build) has
 /// the tracing options CapyCTL renders. A pre-release of a floor is older.
+/// ADR 0038 §3: TensorRT-LLM's `otlp_traces_endpoint` stays reserved, so a
+/// TensorRT-LLM launch is `engine_unsupported`.
 pub fn engine_supported(engine: Engine, engine_version: &str) -> bool {
     let floor = match engine {
         Engine::Vllm => VLLM_FLOOR,
         Engine::Sglang => SGLANG_FLOOR,
-        Engine::Llamacpp | Engine::Tensorfold | Engine::Custom => return false,
+        Engine::Llamacpp | Engine::Tensorfold | Engine::TensorrtLlm | Engine::Custom => {
+            return false
+        }
     };
     EngineVersion::parse(engine_version.trim()).is_some_and(|version| version.at_least(&floor))
 }
