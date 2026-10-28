@@ -6359,12 +6359,13 @@ mod tests {
         assert!(executor.resolve(&launch).is_err(), "the service port");
     }
 
-    /// A vLLM 0.32.0 `restart_only` launch whose environment holds LMCache
+    /// A vLLM 0.32.0 launch of `residency` whose environment holds LMCache
     /// 0.5.6, registered, but none of the shape the check reads.
     fn lmcache_check_fixture(
         root: &std::path::Path,
         identity_dir: &std::path::Path,
         mode: &str,
+        residency: &str,
     ) -> (Arc<NativeHostExecution>, MemberCommand, SingleLaunchPlan) {
         let venv = root.join("venv");
         let site = venv.join("lib/python3.12/site-packages");
@@ -6398,7 +6399,7 @@ mod tests {
         std::fs::create_dir_all(&lmcache).unwrap();
         std::fs::set_permissions(&lmcache, std::fs::Permissions::from_mode(0o700)).unwrap();
         let executor = executor.with_lmcache_dirs(lmcache);
-        deployment["residency"] = "restart_only".into();
+        deployment["residency"] = residency.into();
         deployment["lmcache"] = mode.into();
         let (mut launch, plan) = granted(&deployment, &policy, grant());
         launch.identity.profile_fingerprint = "0.32.0".into();
@@ -6416,7 +6417,7 @@ mod tests {
         let root = directory();
         let identity_dir = directory();
         let (executor, launch, _) =
-            lmcache_check_fixture(root.path(), identity_dir.path(), "required");
+            lmcache_check_fixture(root.path(), identity_dir.path(), "required", "restart_only");
         assert_eq!(
             executor.pre_admit(&launch),
             Err(LaunchVerdict::Refused("lmcache_unavailable:check_failed"))
@@ -6432,7 +6433,7 @@ mod tests {
         let root = directory();
         let identity_dir = directory();
         let (executor, launch, plan) =
-            lmcache_check_fixture(root.path(), identity_dir.path(), "auto");
+            lmcache_check_fixture(root.path(), identity_dir.path(), "auto", "restart_only");
         // The launch goes on (refused here only by the fixture's checkpoint).
         assert_eq!(
             executor.pre_admit(&launch),
@@ -6449,6 +6450,59 @@ mod tests {
             Some(capyctl_adapters::lmcache::LmcacheReport::Off {
                 reason: capyctl_config::lmcache::LmcacheOffReason::CheckFailed,
                 connector_failed: false,
+                ..
+            })
+        ));
+    }
+
+    /// ADR 0034 §1, §3a (owner rule of 2026-10-27): this host's own plan
+    /// runs a deep `lmcache: required` launch outside the qualified table as
+    /// an uncertified setup with engine-driven transfer: it is not refused
+    /// for being uncertified, its server plan renders engine-driven
+    /// transfer, and only the launch-time check (here, an environment
+    /// without the shape) can still refuse it. Under `auto` the same launch
+    /// runs without LMCache, `park_unqualified`.
+    // T45
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_required_deep_launch_outside_the_table_runs_uncertified() {
+        use capyctl_config::lmcache::{LmcacheOffReason, TransferMode};
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, launch, plan) =
+            lmcache_check_fixture(root.path(), identity_dir.path(), "required", "deep");
+        let effective = executor.resolve(&launch).unwrap();
+        let host = executor.lmcache_plan(&effective, false);
+        assert!(host.is_on(), "{host:?}");
+        assert_eq!(host.transfer, TransferMode::EngineDriven);
+        assert_eq!(
+            host.uncertified.map(|uncertified| uncertified.reasons),
+            Some(vec![LmcacheOffReason::ParkUnqualified])
+        );
+        assert_eq!(
+            executor.server_plan(&effective, &plan).unwrap().transfer,
+            TransferMode::EngineDriven
+        );
+        // Not `park_unqualified`: the check, which also reads what
+        // engine-driven transfer needs, is what refuses it here.
+        assert_eq!(
+            executor.pre_admit(&launch),
+            Err(LaunchVerdict::Refused("lmcache_unavailable:check_failed"))
+        );
+
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, launch, plan) =
+            lmcache_check_fixture(root.path(), identity_dir.path(), "auto", "deep");
+        let effective = executor.resolve(&launch).unwrap();
+        let state = executor
+            .lmcache_state(&launch, &plan, &effective)
+            .unwrap()
+            .expect("a granted launch has LMCache state");
+        assert!(state.launch().is_none(), "no server starts");
+        assert!(matches!(
+            state.report(),
+            Some(capyctl_adapters::lmcache::LmcacheReport::Off {
+                reason: LmcacheOffReason::ParkUnqualified,
                 ..
             })
         ));

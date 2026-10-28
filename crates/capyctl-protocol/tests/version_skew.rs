@@ -374,6 +374,7 @@ fn every_post_baseline_field_names_its_capability() {
             STARTUP_HOST_BYTES,
             LMCACHE,
             RETENTION,
+            LMCACHE_ENGINE_DRIVEN,
             REQUEST_ABORT,
             LOCAL_TENSOR_PARALLEL,
         ]
@@ -709,6 +710,40 @@ fn lmcache_and_retention_gate_only_the_deployments_that_need_them() {
     assert_eq!(refusal_for(&older, &plain), None);
     assert_eq!(refusal_for(&current, &needs_lmcache), None);
     assert_eq!(refusal_for(&current, &zero), None);
+}
+
+// T45 T34 (ADR 0034 §1, ADR 0017): `lmcache_engine_driven` is a capability
+// every current agent declares beside `lmcache`. No command needs it and it
+// is no placement requirement: the server reads it to plan a parking
+// residency's LMCache (off `host_capability_missing` on a host without it),
+// so an older host is never sent anything new.
+#[test]
+fn engine_driven_lmcache_is_declared_and_needs_no_new_command_field() {
+    use capabilities::*;
+    assert_eq!(LMCACHE_ENGINE_DRIVEN, "lmcache_engine_driven");
+    assert_eq!(
+        LMCACHE_ENGINE_DRIVEN,
+        capyctl_config::lmcache::ENGINE_DRIVEN_CAPABILITY
+    );
+    assert!(CATALOGUE.contains(&(LMCACHE_ENGINE_DRIVEN, Direction::ServerToHost)));
+    assert!(agent_capabilities().contains(&LMCACHE_ENGINE_DRIVEN.to_owned()));
+    assert!(agent_capabilities().contains(&LMCACHE.to_owned()));
+    assert!(!PLACEMENT_REQUIRED.contains(&LMCACHE_ENGINE_DRIVEN));
+    assert!(agent_capabilities().len() <= MAX_DECLARED);
+    let current: BTreeSet<String> = agent_capabilities().into_iter().collect();
+    let older: BTreeSet<String> = current
+        .iter()
+        .filter(|name| *name != LMCACHE_ENGINE_DRIVEN)
+        .cloned()
+        .collect();
+    for settings in [
+        serde_json::json!({}),
+        serde_json::json!({"residency": "deep", "lmcache": "required"}),
+    ] {
+        let launch = launch_with(settings);
+        assert!(!required(&launch).contains(&LMCACHE_ENGINE_DRIVEN));
+        assert_eq!(refusal_for(&older, &launch), refusal_for(&current, &launch));
+    }
 }
 
 fn refusal_for(declared: &BTreeSet<String>, command: &pb::ExecuteMember) -> Option<String> {

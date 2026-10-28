@@ -41,7 +41,11 @@ const ENGINE_STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// ADR 0033 §14: the closed code a `lmcache: required` launch is refused
 /// with when its LMCache is off for `reason` (`reason.required_refusal()`,
-/// as the static text a refusal carries).
+/// as the static text a refusal carries). ADR 0034 §3a, §6 (owner rule of
+/// 2026-10-27): `park_unqualified` and `multi_gpu_unqualified` never keep a
+/// `required` launch off (the host's plan runs it uncertified), and
+/// `host_kv_room` is found only under `auto`; their codes stay for the
+/// closed set.
 pub(super) fn required_refusal(reason: LmcacheOffReason) -> &'static str {
     use LmcacheOffReason as R;
     match reason {
@@ -62,6 +66,7 @@ pub(super) fn required_refusal(reason: LmcacheOffReason) -> &'static str {
         R::ServerStartFailed => "lmcache_unavailable:server_start_failed",
         R::ListenerExposed => "lmcache_unavailable:listener_exposed",
         R::EngineStartFailed => "lmcache_unavailable:engine_start_failed",
+        R::HostKvRoom => "lmcache_unavailable:host_kv_room",
     }
 }
 
@@ -181,14 +186,18 @@ pub(super) fn lmcache_plan_in(
             retention: effective.retention,
             host_lmcache: effective.host.lmcache,
             host_retention: effective.host.retention,
-            // This host implements ADR 0033 and declares both capabilities.
+            // This host implements ADR 0033 and declares both capabilities,
+            // and ADR 0034 §1: it renders engine-driven transfer and its
+            // launch-time check verifies it.
             host_declares_lmcache: true,
             host_declares_retention: true,
+            host_declares_engine_driven: true,
             engine: effective.profile.engine,
             engine_version: &effective.profile.build_fingerprint,
             api: effective.api,
             topology,
-            // ADR 0035 §9: LMCache stays off on several GPUs of one host.
+            // ADR 0035 §9, ADR 0034 §6: several GPUs of one host keep LMCache
+            // off under `auto` and run it uncertified under `required`.
             multi_gpu: effective.local_tensor_parallel() > 1,
             residency: effective.residency,
             model_type: model_type.as_deref(),
@@ -254,7 +263,10 @@ impl NativeHostExecution {
 
     /// The launch-time verdict of a granted launch: `Ok(None)` when its
     /// server may start, `Ok(Some(off))` when LMCache is off for it, `Err`
-    /// with the closed refusal (`required`, or drift under `refuse`).
+    /// with the closed refusal (`required`, or drift under `refuse`). ADR
+    /// 0034 §1: the check verifies the transfer mode the launch renders, so
+    /// a launch with engine-driven transfer is checked for it (the verdict is
+    /// kept by the launch's own command digest, which names its residency).
     fn lmcache_verdict(
         &self,
         command: &MemberCommand,
@@ -274,6 +286,7 @@ impl NativeHostExecution {
                 effective.profile.engine,
                 Path::new(&effective.profile.executable),
                 effective.profile.lmcache.as_ref(),
+                host.transfer,
                 effective.profile.security.installation_drift,
             )? {
                 Ok(_) => None,
@@ -380,6 +393,9 @@ impl NativeHostExecution {
             start_bound: Duration::from_millis(SERVER_START_BOUND_MS),
             proc_root: "/proc".into(),
             required: effective.lmcache == LmcacheMode::Required,
+            // ADR 0034 §1: a parking residency's server serves engine-driven
+            // transfer (one GPU or several).
+            transfer: capyctl_config::lmcache::transfer_mode(effective.residency),
         })
     }
 
