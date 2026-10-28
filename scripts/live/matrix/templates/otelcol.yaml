@@ -1,0 +1,25 @@
+# OpenTelemetry Collector configuration of the ADR 0037 live rows (OT1-OT11).
+# otel_collector.sh renders it for one collector run: @LISTEN@ is the loopback
+# address of the OTLP/HTTP receiver (127.0.0.1:OTELCOL_PORT) and @FILE@ the file,
+# in the row's evidence directory on the host, that receives every span as it
+# arrived (OTLP JSON, one export request per line). Nothing else is configured:
+# no gRPC receiver, no processor (the file is unmodified evidence), no other
+# exporter, and the collector's own metrics endpoint is off, so the collector
+# opens one listening port, on loopback, and writes one file.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: "@LISTEN@"
+exporters:
+  file:
+    path: "@FILE@"
+    flush_interval: 1s
+service:
+  telemetry:
+    metrics:
+      level: none
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [file]
