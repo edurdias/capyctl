@@ -941,8 +941,10 @@ impl ChatHttp {
             .ok_or(AdapterError::UnsupportedCapability)?;
         let mut request = body.clone();
         request["model"] = json!(self.model);
+        // ADR 0037 §6: trace headers are threaded through chat and decisions
+        // forwards only; an embeddings forward sends none.
         let response = self
-            .post(&self.embeddings, &request, None, embedding_uncertain)
+            .post(&self.embeddings, &request, None, None, embedding_uncertain)
             .await?;
         if !response.status().is_success() || !content_type_is(&response, "application/json") {
             return Err(embedding_uncertain());
