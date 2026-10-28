@@ -514,7 +514,7 @@ impl Attempt {
                 crate::chat::close_lease(
                     controller.as_ref(),
                     Some(lease),
-                    end.clone(),
+                    end,
                     self.ids.as_deref(),
                 )
                 .await;

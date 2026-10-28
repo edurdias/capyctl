@@ -75,7 +75,7 @@ enum Resolution {
     /// After waiting, holding this place in the waiting queue, with the
     /// request's `capyctl.queue_wait` span (ADR 0037 §3), open from when the
     /// ticket was taken.
-    Waited(crate::queue::WaitTicket, capyctl_trace::Span),
+    Waited(crate::queue::WaitTicket, Box<capyctl_trace::Span>),
 }
 
 /// As [`resolve_timed`] for `endpoint`, returning the waiting-queue ticket the
@@ -161,7 +161,7 @@ async fn resolve_held(
         Ok(Ok(_)) => {
             timing.queued(waited.elapsed(), Some(joined_at.elapsed()));
             activation_wait.set(capyctl_trace::Attr::Outcome(capyctl_trace::Outcome::Completed));
-            return Ok((deployment_id, Resolution::Waited(ticket, queue_wait)));
+            return Ok((deployment_id, Resolution::Waited(ticket, Box::new(queue_wait))));
         }
         Ok(Err(refusal)) => refusal,
         // The activation keeps running for whoever waits next; this request
@@ -272,7 +272,7 @@ pub async fn admit_timed(
         resolve_held(deps, model, endpoint, body_bytes, received, timing, ids).await?;
     let (ticket, view) = match resolution {
         Resolution::Now(view) => (None, Some(view)),
-        Resolution::Waited(ticket, queue_wait) => (Some((ticket, queue_wait)), None),
+        Resolution::Waited(ticket, queue_wait) => (Some((ticket, *queue_wait)), None),
     };
     let max = deps.limits.max_requests_per_deployment;
     if let Some(guard) = deps.inflight.try_guard_arc(&deployment_id, max) {
