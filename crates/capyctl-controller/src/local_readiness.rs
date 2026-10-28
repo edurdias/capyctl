@@ -1164,6 +1164,9 @@ mod tests {
             api: DeploymentApi::Embeddings,
             custom: None,
             several_gpus: false,
+            tensorrt_llm: None,
+            transfer: capyctl_config::lmcache::TransferMode::LmcacheDriven,
+            tensorfold_native: false,
         };
         supervisor.prove_listed(&target).await.unwrap();
         assert_eq!(paths(&asked), ["/v1/models", "/v1/embeddings"]);
@@ -1209,6 +1212,9 @@ mod tests {
             api: DeploymentApi::Embeddings,
             custom: Some(custom.clone()),
             several_gpus: false,
+            tensorrt_llm: None,
+            transfer: capyctl_config::lmcache::TransferMode::LmcacheDriven,
+            tensorfold_native: false,
         };
         let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
         let close = stat.rfind(')').unwrap();
