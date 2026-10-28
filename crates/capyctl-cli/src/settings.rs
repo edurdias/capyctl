@@ -135,7 +135,7 @@ pub fn config_show(
     state_root: &std::path::Path,
 ) -> Result<serde_json::Value, crate::output::StructuredError> {
     use crate::grammar::Role;
-    use serde_json::{json, Value};
+    use serde_json::json;
     let invalid = |message: String| crate::output::StructuredError {
         code: "invalid_config",
         message,
@@ -215,48 +215,19 @@ pub fn config_show(
         .map_err(|e| located(overrides.annotate(e)))?;
     let env_values = env_layer().map_err(located)?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let mut effective: std::collections::BTreeMap<String, (Value, Source)> = Default::default();
-    let mut put = |path: String, value: Value, source: Source| {
-        effective.insert(path, (value, source));
-    };
-    for (path, value) in
-        capyctl_config::setting_overrides::defaults(kind, home.as_deref(), state_root)
-    {
-        put(path, value, Source::Default);
-    }
-    if let Some(document) = &stated {
-        for (path, value) in capyctl_config::setting_overrides::leaves(document) {
-            put(path, value, Source::Yaml);
-        }
-    }
-    for value in env_values.values(kind, Source::Env) {
-        put(value.path, value.value, value.source);
-    }
-    for value in flags.values(kind, Source::Flag) {
-        put(value.path, value.value, value.source);
-    }
-    for item in overrides
-        .effective()
-        .into_iter()
-        .filter(|item| item.source == Source::Env)
-        .chain(
-            overrides
-                .effective()
-                .into_iter()
-                .filter(|item| item.source == Source::Set),
-        )
-    {
-        put(item.path.clone(), item.value.clone(), item.source);
-    }
-    let settings: Vec<Value> = effective
-        .into_iter()
-        .map(|(path, (value, source))| json!({"path": path, "value": value, "source": source.as_str()}))
-        .collect();
-    Ok(json!({
-        "role": kind.as_str(),
-        "document": stated.as_ref().map(|_| path.display().to_string()),
-        "settings": settings,
-    }))
+    // ADR 0040 §10: the merge a host's configuration route shares.
+    Ok(capyctl_agent::host_admin::effective_config(
+        kind,
+        &path,
+        stated.as_ref(),
+        capyctl_agent::host_admin::ConfigLayers {
+            env: &env_values,
+            flags: &flags,
+            overrides: &overrides,
+        },
+        home.as_deref(),
+        state_root,
+    ))
 }
 
 /// `config show` as a table: SETTING, VALUE, SOURCE, after a line naming the

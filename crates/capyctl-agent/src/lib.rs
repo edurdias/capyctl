@@ -62,5 +62,8 @@ pub mod session;
 pub mod profiles;
 // ADR 0018 §3, §4: the host's answers to engine add, remove and list.
 pub mod host_control;
+// ADR 0040 §10, §11: host administration shared by the CLI and a role's
+// management routes (engines, custom engines, model copies, configuration).
+pub mod host_admin;
 
 pub mod native_execution;

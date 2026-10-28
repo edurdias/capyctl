@@ -5,23 +5,9 @@
 //! standalone alike, which is where the role looks too.
 use crate::output::StructuredError;
 use capyctl_agent::control_socket::SOCKET_NAME;
+pub use capyctl_agent::host_admin::{RoleKind, Target};
 use capyctl_config::registration::{config_home, engines_beside, engines_path};
 use std::path::{Path, PathBuf};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoleKind {
-    Host,
-    Standalone,
-}
-
-#[derive(Debug, Clone)]
-pub struct Target {
-    pub role_document: PathBuf,
-    pub kind: RoleKind,
-    pub engines: PathBuf,
-    pub state_dir: PathBuf,
-    pub socket: PathBuf,
-}
 
 pub(crate) fn invalid(message: impl Into<String>) -> StructuredError {
     StructuredError {
