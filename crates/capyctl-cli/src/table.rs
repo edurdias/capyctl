@@ -289,8 +289,11 @@ fn hosts(value: &Value) -> String {
                 text(&profile["installation"]["lmcache"]["observed_digest"])
             ));
         }
-        // ADR 0037 §13: each host role's tracing, as its latest report says.
-        if let Some(line) = crate::role_tracing::status_line(host) {
+        // ADR 0037 §13: a host role whose latest report says tracing is on
+        // gets its line; off (the default) stays out of the table and is in
+        // the JSON output.
+        if host["tracing"]["on"] == true {
+            let line = crate::role_tracing::status_line(host).unwrap_or_default();
             out.push_str(&format!("{}: {line}\n", clean(name)));
         }
     }
@@ -1510,7 +1513,7 @@ mod tests {
             out.contains("a: tracing: on → http://127.0.0.1:4318/v1/traces, spans dropped 0\n"),
             "{out}"
         );
-        assert!(out.contains("b: tracing: off\n"), "{out}");
+        assert!(!out.contains("b: tracing"), "{out}");
         assert!(!out.contains("c: tracing"), "{out}");
     }
 
