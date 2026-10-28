@@ -933,8 +933,10 @@ or `off (<reason>)` for a profile that cannot use it.
 **Status.** `capyctl status deployment <name>` shows a line per instance:
 
 ```text
-LMCache   instance 0 on: pool 8 GiB (auto: one 32,768-token context of qwen3 at 144 KiB per token), used 1.3 GiB, overhead 0.8 GiB (measured), 212 hits / 260 lookups
-LMCache   instance 0 off: LMCache needs vLLM 0.32.0 or newer
+LMCache   instance 0 on: pool 8.0 GiB (auto: one 32,768-token context of qwen3 at 144 KiB per token), used 1.3 GiB, overhead 0.8 GiB (measured), 212 hits / 260 lookups
+LMCache   instance 1 on (uncertified: vLLM 0.32.0 / qwen3 / NVIDIA GB10 / deep is not in the qualified table): pool 12.0 GiB (auto: one 65,536-token context of qwen3 at 144 KiB per token), used 0.2 GiB, overhead 0.8 GiB (allowance)
+warning: the LMCache pool (12 GiB) keeps about 55,900 tokens after eviction; one full context of 65,536 tokens needs 15 GiB: raise host_kv_limit or set lmcache_pool
+LMCache   instance 2 off: LMCache needs vLLM 0.32.0 or newer
 ```
 
 and `--json` an `lmcache` object (`state`, `reason`, `pool_bytes`,
@@ -985,7 +987,8 @@ settable), so an automatic pool never exceeds that limit less the
 deployment's own host KV. When it keeps less than one context, `deploy`,
 status and the effective configuration warn ("the LMCache pool (12 GiB)
 keeps about 55,900 tokens after eviction; one full context of 65,536 tokens
-needs 15 GiB: raise host_kv_limit or set lmcache_pool") and the event
+needs 15 GiB: raise host_kv_limit or set lmcache_pool"; `deploy` warns with
+`--wait`) and the event
 `lmcache_pool_short` records it once per launch; the model runs. When other
 models already hold the host-KV room, an automatic pool shrinks to the room
 left (whole GiB, at least 1 GiB) with the same warning, and with less than
@@ -1016,7 +1019,7 @@ it and says why. With `required` it refuses to start instead:
 nothing running. `required` is never refused for being outside the
 certified table or for running on several GPUs: it runs LMCache as an
 uncertified setup, shown "LMCache on (uncertified: ...)" in status,
-`certified: false` in JSON, a warning from `deploy` and an
+`certified: false` in JSON, a warning from `deploy --wait` and an
 `lmcache_uncertified` event once per launch. A host's `lmcache: off` or
 `retention: zero` keeps it off on that machine
 ([settings](../operations/configuration.md#lmcache-and-zero-retention)).

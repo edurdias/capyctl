@@ -139,7 +139,7 @@ the server stops when the model stops.
   never switches it to `restart_only` for you. A model that can park deep
   should; it gets LMCache once its combination is certified.
 - **`lmcache: required` outside the table** runs LMCache anyway, with the
-  same rendering, as an uncertified setup: `deploy` warns, status shows
+  same rendering, as an uncertified setup: `deploy --wait` warns, status shows
   "LMCache on (uncertified: <engine version> / <model type> / <GPU> /
   <residency> is not in the qualified table)" and JSON `certified: false`.
   It is never refused for being uncertified. If the engine then fails to

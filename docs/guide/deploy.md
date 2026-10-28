@@ -84,7 +84,7 @@ Add a field to choose something yourself, for example:
   KV cache in host RAM that every vLLM 0.32.0+ and SGLang 0.5.22+ deployment
   gets by default (decision deployments on SGLang excepted, for now), or
   `lmcache: required` to refuse to start without it (outside the certified
-  table, or on several GPUs, it runs uncertified, and `deploy` says so).
+  table, or on several GPUs, it runs uncertified, and `deploy --wait` says so).
   `lmcache_pool` is `auto` by default: a RAM pool that holds one full context
   of the model after LMCache's eviction, at least 4 GiB and within the
   machine's `host_kv_limit` (a tenth of the memory standalone observes at
