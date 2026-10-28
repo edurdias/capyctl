@@ -34,6 +34,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::engine_policy::{option_names, typed_field_option, Engine};
+use crate::tensorfold_native::TensorfoldLine;
 
 // ADR 0029 §9: llama.cpp's KV cache and request from the GGUF header.
 pub mod llamacpp;
@@ -493,6 +494,7 @@ pub fn read_model_config(checkpoint_root: &Path) -> Result<Value, String> {
 /// 0008 amendment 2026-10-08); without one, the arguments may name a draft.
 pub fn fit_for_launch(
     engine: Engine,
+    line: TensorfoldLine,
     settings: &LaunchSettings,
     profile_args: &[String],
     checkpoint_root: Option<&Path>,
@@ -614,7 +616,7 @@ pub fn fit_for_launch(
             Err(refusal) => fit.warning = Some(refusal),
         }
     }
-    fit.streams = launch_streams(settings, profile_args, config.as_ref().ok());
+    fit.streams = launch_streams(settings, line, profile_args, config.as_ref().ok());
     fit
 }
 
@@ -638,13 +640,18 @@ pub fn vllm_default_max_num_seqs(
 /// passes TensorFold: the deployment's `max_concurrent_requests`, else
 /// `TENSORFOLD_DEFAULT_PARALLEL`. `None` when the
 /// extra or host-fixed arguments pass `--parallel` themselves (they win;
-/// beside a declared count they are refused at resolution).
-pub fn tensorfold_parallel(settings: &LaunchSettings, profile_args: &[String]) -> Option<u32> {
+/// beside a declared count they are refused at resolution). ADR 0039 §4: on
+/// the native line `--parallel` is found by its exact name.
+pub fn tensorfold_parallel(
+    settings: &LaunchSettings,
+    line: TensorfoldLine,
+    profile_args: &[String],
+) -> Option<u32> {
     let LaunchSettings::Tensorfold(s) = settings else {
         return None;
     };
     let passed = |args: &[String]| {
-        crate::engine_policy::tensorfold_parallel(args).map_or(true, |found| found.is_some())
+        crate::tensorfold_native::parallel_on(line, args).map_or(true, |found| found.is_some())
     };
     if passed(profile_args) || passed(&s.extra_args) {
         return None;
@@ -657,19 +664,22 @@ pub fn tensorfold_parallel(settings: &LaunchSettings, profile_args: &[String]) -
 }
 
 /// The model families whose CUDA engine TensorFold 0.6.3 to 0.6.5 runs one request at
-/// a time whatever `--parallel` says (`families/nemotron_h`).
+/// a time whatever `--parallel` says (`families/nemotron_h`). ADR 0039
+/// Evidence §6: the native line shares each round among them, so this is the
+/// Python line's alone.
 const TENSORFOLD_ONE_AT_A_TIME: &[&str] = &["nemotron_h"];
 
 /// The streams a launch decodes together, for status: TensorFold's
 /// `--parallel` and llama.cpp's slots; `None` for the other engines.
 fn launch_streams(
     settings: &LaunchSettings,
+    line: TensorfoldLine,
     profile_args: &[String],
     config: Option<&Value>,
 ) -> Option<Streams> {
     match settings {
         LaunchSettings::Llamacpp(s) => Some(llamacpp_streams(s)),
-        _ => tensorfold_streams(settings, profile_args, config),
+        _ => tensorfold_streams(settings, line, profile_args, config),
     }
 }
 
@@ -692,13 +702,19 @@ fn llamacpp_streams(settings: &capyctl_domain::launch::LlamacppLaunchSettings) -
 /// this machine reads it.
 fn tensorfold_streams(
     settings: &LaunchSettings,
+    line: TensorfoldLine,
     profile_args: &[String],
     config: Option<&Value>,
 ) -> Option<Streams> {
     let LaunchSettings::Tensorfold(s) = settings else {
         return None;
     };
-    let mut streams = match tensorfold_parallel(settings, profile_args) {
+    let found = |args: &[String]| {
+        crate::tensorfold_native::parallel_on(line, args)
+            .ok()
+            .flatten()
+    };
+    let mut streams = match tensorfold_parallel(settings, line, profile_args) {
         Some(count) => Streams {
             count: Some(count),
             source: if s.common.max_concurrent_requests.is_some() {
@@ -709,22 +725,18 @@ fn tensorfold_streams(
             reason: None,
         },
         None => {
-            let extra = crate::engine_policy::tensorfold_parallel(&s.extra_args)
-                .ok()
-                .flatten();
-            let (value, source) = match extra {
+            let (value, source) = match found(&s.extra_args) {
                 Some(value) => (value, StreamsSource::ExtraArgs),
-                None => (
-                    crate::engine_policy::tensorfold_parallel(profile_args)
-                        .ok()
-                        .flatten()
-                        .flatten(),
-                    StreamsSource::HostFixed,
-                ),
+                None => (found(profile_args).flatten(), StreamsSource::HostFixed),
             };
-            // TensorFold's `auto` is one request at a time on CUDA.
+            // TensorFold 0.6's `auto` is one request at a time on CUDA;
+            // ADR 0039 Evidence §2: the native line's is up to eight.
+            let auto = match line {
+                TensorfoldLine::Python => 1,
+                TensorfoldLine::Native => crate::tensorfold_native::PARALLEL_AUTO,
+            };
             let count = value.and_then(|value| match value.trim().to_ascii_lowercase() {
-                auto if auto == "auto" => Some(1),
+                text if text == "auto" => Some(auto),
                 number => number
                     .parse::<i64>()
                     .ok()
@@ -737,7 +749,9 @@ fn tensorfold_streams(
             }
         }
     };
-    let family = config.and_then(|config| config["model_type"].as_str());
+    let family = config
+        .filter(|_| line.is_python())
+        .and_then(|config| config["model_type"].as_str());
     if let Some(family) = family.filter(|family| TENSORFOLD_ONE_AT_A_TIME.contains(family)) {
         if streams.count.is_some_and(|count| count > 1) {
             streams.count = Some(1);
@@ -795,6 +809,7 @@ fn speculative_tokens(args: &[String]) -> Option<u32> {
 pub fn fit_for_effective(effective: &crate::effective::EffectiveDeployment) -> ContextFit {
     fit_for_launch(
         effective.profile.engine,
+        effective.profile.line,
         &sized_on_device(effective),
         &effective.profile.args,
         effective.model.resolved_path.as_deref().map(Path::new),
@@ -844,6 +859,7 @@ pub fn fit_on_remote_host(effective: &crate::effective::EffectiveDeployment) -> 
     };
     let fit = fit_for_launch(
         effective.profile.engine,
+        effective.profile.line,
         &effective.engine_config,
         &effective.profile.args,
         None,
@@ -859,7 +875,12 @@ pub fn fit_on_remote_host(effective: &crate::effective::EffectiveDeployment) -> 
             ),
             warning: None,
             running_limit: None,
-            streams: launch_streams(&effective.engine_config, &effective.profile.args, None),
+            streams: launch_streams(
+                &effective.engine_config,
+                effective.profile.line,
+                &effective.profile.args,
+                None,
+            ),
         },
     }
 }

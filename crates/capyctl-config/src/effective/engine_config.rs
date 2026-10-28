@@ -727,6 +727,8 @@ fn device_request_from_weights(
 /// Everything besides the block itself that resolution needs.
 pub(super) struct EngineInputs<'a> {
     pub(super) engine: Engine,
+    /// ADR 0039 §1: the TensorFold line (`Python` for every other engine).
+    pub(super) line: crate::tensorfold_native::TensorfoldLine,
     pub(super) residency: Residency,
     pub(super) security: &'a Security,
     pub(super) profile_args: &'a [String],
@@ -1431,6 +1433,14 @@ pub(super) fn normalize_engine_config(
             ));
         }
     }
+    // ADR 0039 §6: the native line has no KV cache type option.
+    let native = engine == Engine::Tensorfold && inputs.line.is_native();
+    if native && raw.kv_cache_dtype.is_some() {
+        return Err(invalid(
+            "engine_config.kv_cache_dtype",
+            crate::tensorfold_native::KV_CACHE_DTYPE_REFUSAL,
+        ));
+    }
     // ADR 0029 §5: one of llama.cpp's cache types, for keys and values both.
     if engine == Engine::Llamacpp {
         if let Some(kind) = &raw.kv_cache_dtype {
@@ -1522,8 +1532,18 @@ pub(super) fn normalize_engine_config(
 
     // Host-fixed profile arguments and deployment typed fields must not both
     // set one engine option (ADR 0014 §2).
-    let host_fixed = option_names(inputs.profile_args)
+    let mut host_fixed = option_names(inputs.profile_args)
         .map_err(|error| invalid("runtime_profiles.args", error.to_string()))?;
+    // ADR 0039 §4: the native parser reads each name exactly as written, so
+    // a host-fixed name also counts in its own spelling (`--no-drafts`).
+    if native {
+        host_fixed.extend(
+            crate::engine_policy::parse_options(inputs.profile_args)
+                .map_err(|error| invalid("runtime_profiles.args", error.to_string()))?
+                .into_iter()
+                .map(|option| option.name),
+        );
+    }
     let vllm = raw.vllm.clone().unwrap_or_default();
     let sglang = raw.sglang.clone().unwrap_or_default();
     let tensorfold = raw.tensorfold.clone().unwrap_or_default();
@@ -1635,6 +1655,7 @@ pub(super) fn normalize_engine_config(
             &extra_args,
             &ExtraArgsContext {
                 engine,
+                line: inputs.line,
                 sleep_mode: engine == Engine::Vllm && sleep_mode,
                 approved_options: &approved_options,
                 approved_paths: &approved_paths,
@@ -1645,13 +1666,14 @@ pub(super) fn normalize_engine_config(
         .map_err(|error| invalid("engine_config.extra_args", error.to_string()))?;
     }
     // ADR 0023 §4 (amended 2026-10-03): a declared count renders TensorFold's
-    // `--parallel`; the same option passed beside it says it twice.
+    // `--parallel`; the same option passed beside it says it twice. ADR 0039
+    // §4: the native line finds it by exact name.
     if engine == Engine::Tensorfold && raw.max_concurrent_requests.is_some() {
         for (args, whose) in [
             (inputs.profile_args, "the installation's host-fixed args"),
             (extra_args.as_slice(), "engine_config.extra_args"),
         ] {
-            let passed = crate::engine_policy::tensorfold_parallel(args)
+            let passed = crate::tensorfold_native::parallel_on(inputs.line, args)
                 .map_err(|error| invalid("engine_config.extra_args", error.to_string()))?;
             if passed.is_some() {
                 return Err(invalid(
@@ -1701,8 +1723,10 @@ pub(super) fn normalize_engine_config(
         None => (None, None),
     };
     // ADR 0023 §5: drafts off and a named drafter contradict each other,
-    // whether the host-fixed or the extra arguments say either.
-    if engine == Engine::Tensorfold {
+    // whether the host-fixed or the extra arguments say either. ADR 0039 §6:
+    // the native line refuses `--drafter` itself, so there is nothing to
+    // contradict there.
+    if engine == Engine::Tensorfold && !native {
         let all: Vec<String> = inputs
             .profile_args
             .iter()
@@ -1722,6 +1746,13 @@ pub(super) fn normalize_engine_config(
     // to render, so the arguments may name no other draft model, and they
     // turn speculation on where the engine needs it (host-fixed or extra).
     if inputs.draft_declared {
+        // ADR 0039 §6: CapyCTL renders no drafter on the native line.
+        if native {
+            return Err(invalid(
+                "model.draft",
+                crate::tensorfold_native::DRAFTER_REFUSAL,
+            ));
+        }
         let all: Vec<String> = inputs
             .profile_args
             .iter()

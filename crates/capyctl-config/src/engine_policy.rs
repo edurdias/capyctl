@@ -1298,6 +1298,9 @@ pub(crate) fn path_within(value: &str, root: &Path) -> bool {
 #[derive(Debug, Clone)]
 pub struct ExtraArgsContext<'a> {
     pub engine: Engine,
+    /// ADR 0039 §4: the TensorFold line, whose native parser matches names
+    /// exactly (always `Python` for the other engines).
+    pub line: crate::tensorfold_native::TensorfoldLine,
     /// Whether capyctl renders sleep mode for this launch (ADR 0014 §4).
     pub sleep_mode: bool,
     /// The installation's `security.approved_options`, normalized.
@@ -1320,6 +1323,10 @@ pub fn validate_extra_args(
 ) -> Result<(), ProfileArgError> {
     if context.engine == Engine::Llamacpp {
         return validate_llamacpp_args(args, Some(context));
+    }
+    // ADR 0039 §4: exact names, the native tables, no prefix rule.
+    if context.engine == Engine::Tensorfold && context.line.is_native() {
+        return crate::tensorfold_native::validate_args(args, Some(context));
     }
     let mut seen = BTreeSet::new();
     for option in parse_options(args)? {
@@ -1493,9 +1500,12 @@ fn validate_llamacpp_args(
 /// Host-fixed profile arguments (ADR 0014 §1). The host operator writes these,
 /// so sensitive options are theirs to pass; reserved names, configuration files
 /// and malformed lists are still refused. SGLang's protected entry takes no
-/// argument vector, so an SGLang profile carries none.
+/// argument vector, so an SGLang profile carries none. ADR 0039 §4: a
+/// TensorFold profile of the native line is checked by exact name against the
+/// native tables.
 pub fn validate_profile_args(
     engine: Engine,
+    line: crate::tensorfold_native::TensorfoldLine,
     args: &[String],
     sleep_mode: bool,
 ) -> Result<(), ProfileArgError> {
@@ -1503,6 +1513,9 @@ pub fn validate_profile_args(
         return args.first().map_or(Ok(()), |arg| {
             Err(ProfileArgError::Unsupported(normalize_option_name(arg)))
         });
+    }
+    if engine == Engine::Tensorfold && line.is_native() {
+        return crate::tensorfold_native::validate_args(args, None);
     }
     validate_rendered_args(engine, args, sleep_mode)
 }

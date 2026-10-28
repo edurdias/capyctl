@@ -376,6 +376,7 @@ fn every_post_baseline_field_names_its_capability() {
             RETENTION,
             REQUEST_ABORT,
             LOCAL_TENSOR_PARALLEL,
+            TENSORFOLD_NATIVE,
         ]
         .contains(name)
         {
@@ -909,6 +910,33 @@ fn a_launch_on_several_gpus_needs_local_tensor_parallel() {
         local_tensor_parallel_refusal(&older, 2).as_deref(),
         Some("host_capability_missing:local_tensor_parallel")
     );
+}
+
+// T41 T34 (ADR 0039 §15, ADR 0017): the native TensorFold line is a
+// server-to-host feature this build's agent declares; a host without it is
+// refused a native-line revision, typed, and nothing else changes for it.
+#[test]
+fn a_native_tensorfold_revision_needs_tensorfold_native() {
+    use capabilities::*;
+    assert_eq!(TENSORFOLD_NATIVE, "tensorfold_native");
+    assert!(CATALOGUE.contains(&(TENSORFOLD_NATIVE, Direction::ServerToHost)));
+    assert!(agent_capabilities().contains(&TENSORFOLD_NATIVE.to_owned()));
+    assert!(!PLACEMENT_REQUIRED.contains(&TENSORFOLD_NATIVE));
+    assert!(is_gate_refusal("host_capability_missing:tensorfold_native"));
+    let everything: BTreeSet<String> = agent_capabilities().into_iter().collect();
+    let older: BTreeSet<String> = everything
+        .iter()
+        .filter(|c| *c != TENSORFOLD_NATIVE)
+        .cloned()
+        .collect();
+    assert_eq!(tensorfold_native_refusal(&everything, true), None);
+    assert_eq!(tensorfold_native_refusal(&older, false), None);
+    assert_eq!(
+        tensorfold_native_refusal(&older, true).as_deref(),
+        Some("host_capability_missing:tensorfold_native")
+    );
+    // Every other launch is sent to such a host as before.
+    assert_eq!(refusal(false, &older, &wire(launch(true, true), 0)), None);
 }
 
 // T46 (ADR 0035 §8): the per-GPU readings are additive: a resident without

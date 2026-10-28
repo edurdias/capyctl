@@ -175,10 +175,9 @@ pub const MEMORY_RESERVE_GIB: &str = "2";
 /// ADR 0039 §5: never carried, and refused as `--approve-env` names on a
 /// native profile, each with why.
 pub const REFUSED_ENV: &[(&str, &str)] = &[
-    (
-        "TENSORFOLD_API_KEY",
-        "CapyCTL owns authentication (ADR 0023 §3)",
-    ),
+    // ADR 0023 §3: the engine key is CapyCTL's (the reason text is shown to
+    // the operator, so it carries no citation).
+    ("TENSORFOLD_API_KEY", "CapyCTL owns authentication"),
     (
         "TENSORFOLD_REQUEST_LOG",
         "it writes every request body to a file",
@@ -263,6 +262,25 @@ pub fn parallel(args: &[String]) -> Result<Option<Option<String>>, ProfileArgErr
         .map(|option| option.value))
 }
 
+/// ADR 0039 §4: the `--parallel` among `args` as `line`'s parser reads it:
+/// by exact name on the native line ([`parallel`]), in any spelling 0.6's
+/// argparse expands on the Python line
+/// ([`crate::engine_policy::tensorfold_parallel`]).
+pub fn parallel_on(
+    line: TensorfoldLine,
+    args: &[String],
+) -> Result<Option<Option<String>>, ProfileArgError> {
+    match line {
+        TensorfoldLine::Python => crate::engine_policy::tensorfold_parallel(args),
+        TensorfoldLine::Native => parallel(args),
+    }
+}
+
+/// ADR 0039 Evidence §2 (`server/cli.zig:237-248` at v1.0.0): the native
+/// engine's `--parallel auto` serves up to this many requests at once, as
+/// many as fit (0.6's `auto` ran one at a time on CUDA).
+pub const PARALLEL_AUTO: u32 = 8;
+
 /// ADR 0039 §4 (owner decision 2026-10-27, question 4): under `retention:
 /// zero`, the first option of `args` that compaction or a disk write needs,
 /// as `(code, option)`: `retention_zero:compaction` for `--compact-at`,
@@ -296,6 +314,88 @@ pub fn retention_zero_message(code: &str, option: &str) -> String {
         "{code}: `{option}` {what}, which `retention: zero` does not allow on TensorFold \
          native; remove it, or run without `retention: zero`"
     )
+}
+
+/// ADR 0039 §15: what a host that runs native-line launches declares in its
+/// session (ADR 0017), `capyctl_protocol::capabilities::TENSORFOLD_NATIVE`.
+pub const HOST_CAPABILITY: &str = "tensorfold_native";
+/// ADR 0039 §15, §16: a native-line revision on a host that did not declare
+/// [`HOST_CAPABILITY`], so an older agent never renders a native installation
+/// with the 0.6 command.
+pub const HOST_CAPABILITY_MISSING: &str = "host_capability_missing:tensorfold_native";
+/// Every closed code [`placement_refusal`] returns.
+pub const PLACEMENT_REFUSALS: [&str; 3] = [
+    HOST_CAPABILITY_MISSING,
+    RETENTION_ZERO_COMPACTION,
+    RETENTION_ZERO_ENGINE_DISK,
+];
+
+/// ADR 0039 §4, §15: why a host may not take a native-line revision, before
+/// anything is sent to it, with a note naming the refused option; `None`
+/// when it may. `args` are the revision's host-fixed then extra arguments,
+/// `host_retention` the host's published `retention`, and `declared` answers
+/// whether the host declared a capability (ADR 0017). The deployment's own
+/// `retention: zero` is refused at resolution; this is the host's (ADR 0033
+/// §10's rule for `lmcache: required`).
+pub fn placement_refusal(
+    args: &[String],
+    host_retention: crate::lmcache::Retention,
+    declared: impl Fn(&str) -> bool,
+) -> Option<(&'static str, Option<String>)> {
+    if !declared(HOST_CAPABILITY) {
+        return Some((HOST_CAPABILITY_MISSING, None));
+    }
+    if host_retention != crate::lmcache::Retention::Zero {
+        return None;
+    }
+    let (code, option) = retention_zero_refusal(args)?;
+    let message = retention_zero_message(code, &option);
+    let note = message
+        .strip_prefix(code)
+        .and_then(|rest| rest.strip_prefix(": "))
+        .unwrap_or(&message);
+    Some((
+        code,
+        Some(format!("the host has `retention: zero`; {note}")),
+    ))
+}
+
+/// ADR 0039 §3, §7: what `validate config` and `status deployment` say about
+/// a resolved deployment of the native line: the uncertified version note
+/// ([`version_note`]) and the checkpoint notes ([`checkpoint_notes`]). With
+/// `read_checkpoint`, the checkpoint's `config.json` is read where this
+/// machine resolves the model (`model.resolved_path`); without it (a server
+/// never reads a remote host's path) or when the file cannot be read, the
+/// notes say nothing the file would add. Empty for every other profile and
+/// for the certified version and checkpoint. Never a refusal.
+pub fn deployment_notes(
+    effective: &crate::effective::EffectiveDeployment,
+    read_checkpoint: bool,
+) -> Vec<String> {
+    let profile = &effective.profile;
+    if profile.engine != crate::engine_policy::Engine::Tensorfold || !profile.line.is_native() {
+        return Vec::new();
+    }
+    let hf = match &effective.model.source {
+        crate::model_source::ModelSource::HuggingFace { repo, revision, .. } => {
+            Some((repo.as_str(), revision.as_str()))
+        }
+        _ => None,
+    };
+    let config = effective
+        .model
+        .resolved_path
+        .as_deref()
+        .filter(|_| read_checkpoint)
+        .and_then(|path| crate::context_fit::read_model_config(std::path::Path::new(path)).ok());
+    version_note(&profile.build_fingerprint)
+        .into_iter()
+        .chain(checkpoint_notes(
+            hf,
+            config.as_ref(),
+            profile.native.as_ref(),
+        ))
+        .collect()
 }
 
 /// ADR 0039 §3 (owner decision 2026-10-27, question 1): a native version the
@@ -529,6 +629,7 @@ mod tests {
         let approved = BTreeSet::new();
         let context = ExtraArgsContext {
             engine: crate::engine_policy::Engine::Tensorfold,
+            line: TensorfoldLine::Native,
             sleep_mode: false,
             approved_options: &approved,
             approved_paths: &[],

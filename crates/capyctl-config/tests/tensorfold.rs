@@ -33,6 +33,7 @@ fn context<'a>(
 ) -> ExtraArgsContext<'a> {
     ExtraArgsContext {
         engine: Engine::Tensorfold,
+        line: Default::default(),
         sleep_mode: false,
         approved_options: approved,
         approved_paths: &[],
@@ -471,6 +472,7 @@ fn the_streams_a_launch_decodes_together_are_shown_with_their_source() {
     let effective = resolve_effective(&deployment, &host).unwrap();
     let fit = fit_for_launch(
         Engine::Tensorfold,
+        Default::default(),
         &effective.engine_config,
         &effective.profile.args,
         Some(tmp.path()),

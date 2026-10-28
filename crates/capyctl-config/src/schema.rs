@@ -436,18 +436,17 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("lmcache", LMCACHE_REGISTRATION),
         // ADR 0039 §1, §2: TensorFold's line, and a native release's record.
         ("line", SCALAR),
-        (
-            "native",
-            FieldSpec::Struct(&[
-                ("families", FieldSpec::MapOf(&FieldSpec::Seq(&SCALAR))),
-                ("checksums_verified", SCALAR),
-            ]),
-        ),
+        ("native", NATIVE_REGISTRATION),
     ]);
     // ADR 0033 §1, contract decision 3: the LMCache package `engine add`
     // found in the registered environment, with its ADR 0008 digest.
     const LMCACHE_REGISTRATION: FieldSpec =
         FieldSpec::Struct(&[("version", SCALAR), ("digest", SCALAR)]);
+    // ADR 0039 §2, §7: what `engine add` recorded from a native release.
+    const NATIVE_REGISTRATION: FieldSpec = FieldSpec::Struct(&[
+        ("families", FieldSpec::MapOf(&FieldSpec::Seq(&SCALAR))),
+        ("checksums_verified", SCALAR),
+    ]);
     // ADR 0031 §2: the manifest as a profile carries it; its own validation
     // (placeholders, paths, the idle signal) runs at resolution.
     const CUSTOM_MANIFEST: FieldSpec = FieldSpec::Struct(&[
@@ -486,6 +485,10 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             FieldSpec::Struct(&[("max_file_bytes", BYTES), ("retained_files", SCALAR)]),
         ),
         ("lmcache", LMCACHE_REGISTRATION),
+        // ADR 0039 §1, §2: as in [`PROFILE`], so a role document (a host's
+        // own) may hold a TensorFold native profile.
+        ("line", SCALAR),
+        ("native", NATIVE_REGISTRATION),
         (
             "custom",
             // ADR 0031 §8: the installation digest the operator approved.

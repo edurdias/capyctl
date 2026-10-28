@@ -1519,6 +1519,72 @@ fn lmcache_declaration(
     Ok(pool)
 }
 
+/// ADR 0039 §4 (owner decision 2026-10-27, question 4), beside ADR 0033
+/// §10's [`lmcache_declaration`]: under the deployment's `retention: zero` a
+/// native TensorFold profile's host-fixed or extra arguments may name
+/// neither a compaction option (`retention_zero:compaction`) nor one that
+/// writes request state to disk (`retention_zero:engine_disk`): the option
+/// the operator asked for is refused, never silently dropped. The Python
+/// line has neither, and is unchanged.
+fn native_retention_refusal(
+    profile: &RawProfile,
+    extra_args: &[String],
+    retention: Retention,
+) -> Result<(), ConfigError> {
+    if profile.engine != Engine::Tensorfold
+        || !profile.line.is_native()
+        || retention != Retention::Zero
+    {
+        return Ok(());
+    }
+    for (args, path) in [
+        (profile.args.as_slice(), "runtime_profiles.args"),
+        (extra_args, "engine_config.extra_args"),
+    ] {
+        if let Some((code, option)) = crate::tensorfold_native::retention_zero_refusal(args) {
+            return Err(invalid(
+                path,
+                crate::tensorfold_native::retention_zero_message(code, &option),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// ADR 0039 §6, §13: the native TensorFold line serves one GPU and no group,
+/// so a `topology` is refused, naming the line and the fix, with the codes
+/// groups (ADR 0028 §16) and several GPUs (ADR 0035 §13) already use.
+fn native_topology_refusal(group: bool) -> ConfigError {
+    invalid(
+        "topology",
+        if group {
+            "group_shape_unsupported:tensorfold: the TensorFold native line has no multi-node \
+             mode; remove `topology`, or run the group on a TensorFold 0.6 profile"
+                .to_owned()
+        } else {
+            format!(
+                "{}: the TensorFold native line runs one model on one GPU; remove `topology`",
+                crate::topology::MULTI_GPU_UNSUPPORTED
+            )
+        },
+    )
+}
+
+/// Whether `document`'s runtime profile on `host` is a native TensorFold one.
+fn names_native_profile(document: &serde_json::Value, host: &serde_json::Value) -> bool {
+    let Some(name) = document
+        .get("runtime_profile")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    decode_host(host).is_ok_and(|host| {
+        host.runtime_profiles
+            .get(name)
+            .is_some_and(|profile| profile.engine == Engine::Tensorfold && profile.line.is_native())
+    })
+}
+
 pub fn resolve_effective(
     deployment: &serde_json::Value,
     host: &serde_json::Value,
@@ -1542,6 +1608,11 @@ pub fn resolve_effective_with_checkpoint(
     crate::deployment_defaults::expand(&mut document)?;
     let spec = crate::instances::parse_instance_spec(&document)?;
     if spec.local == Some(crate::topology::LocalTopology::Auto) {
+        // ADR 0039 §13: `auto` would resolve the native line to one GPU
+        // silently; a topology is refused there instead.
+        if names_native_profile(&document, host) {
+            return Err(native_topology_refusal(false));
+        }
         return multi_gpu::resolve_auto(&document, host, facts);
     }
     resolve_with(deployment, host, facts, Limits::Enforce)
@@ -1606,6 +1677,14 @@ fn resolve_with(
         .get(&d.runtime_profile)
         .ok_or_else(|| invalid("runtime_profile", "unknown runtime profile"))?
         .clone();
+    // ADR 0039 §4, beside `lmcache_declaration` above: the deployment's
+    // `retention: zero` refuses the native line's compaction and disk options.
+    native_retention_refusal(&raw_profile, d.engine_config.extra_args(), d.retention)?;
+    // ADR 0039 §6, §13: the native line runs no group and one GPU.
+    let native = raw_profile.engine == Engine::Tensorfold && raw_profile.line.is_native();
+    if native && (instance_spec.group.is_some() || local.is_some()) {
+        return Err(native_topology_refusal(instance_spec.group.is_some()));
+    }
     // ADR 0030 §1: only an installation that serves `/v1/systemone` takes a
     // decisions deployment, refused before anything else is resolved.
     if d.api == DeploymentApi::Decisions {
@@ -1684,6 +1763,15 @@ fn resolve_with(
     // whatever the profile approves.
     if raw_profile.engine == Engine::Llamacpp {
         if let Some(reason) = crate::llamacpp::refused_env(d.engine_config.env().keys()) {
+            return Err(invalid("engine_config.env", reason));
+        }
+    }
+    // ADR 0039 §5: a native TensorFold deployment's env names neither what
+    // the native line renders nor what it never carries.
+    if native {
+        if let Some(reason) =
+            crate::engine_env::tensorfold_native_refused(d.engine_config.env().keys())
+        {
             return Err(invalid("engine_config.env", reason));
         }
     }
@@ -1962,6 +2050,7 @@ fn resolve_with(
         d.engine_config,
         engine_config::EngineInputs {
             engine: profile.engine,
+            line: profile.line,
             residency,
             security: &profile.security,
             profile_args: &profile.args,
@@ -2085,8 +2174,9 @@ fn resolve_with(
     };
     // ADR 0023 §4: the first build's bound must not be lowered by
     // the request deadline, so a TensorFold deployment's deadline, undeclared,
-    // is at least that bound, and may be declared up to it.
-    let deadline_ceiling_ms = if raw_profile.engine == Engine::Tensorfold {
+    // is at least that bound, and may be declared up to it. ADR 0039 §6: the
+    // native line builds nothing at start, so it gets no such floor.
+    let deadline_ceiling_ms = if raw_profile.engine == Engine::Tensorfold && !native {
         host.queue
             .request_deadline_ms
             .max(timeouts::TENSORFOLD_FIRST_BUILD_MS)
@@ -2120,6 +2210,7 @@ fn resolve_with(
         recipe.request_deadline_ms,
         facts,
         raw_profile.engine,
+        raw_profile.line,
         recipe.residency,
     )?;
     let recipe_fingerprint =
