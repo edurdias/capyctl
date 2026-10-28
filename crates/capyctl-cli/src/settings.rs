@@ -28,6 +28,8 @@ pub fn flag_layer(invocation: &Invocation) -> NamedLayer {
         management_bind: invocation
             .management_listen
             .map(|address| address.to_string()),
+        // ADR 0040 §1: a switch; absent states nothing.
+        management_remote: invocation.management_remote.then_some(true),
         state_dir: invocation.state_dir.clone(),
         // ADR 0028 §11: in its YAML form, whole seconds as `<n>s`.
         group_stall_timeout: invocation.group_stall_timeout.map(duration_text),
@@ -56,6 +58,15 @@ pub fn env_layer() -> Result<NamedLayer, ConfigError> {
         inference_auth: env(crate::exposure::INFERENCE_AUTH_ENV),
         management_bind: env(crate::roles::MANAGEMENT_ADDR_ENV)
             .or_else(|| env(crate::roles::DEPRECATED_MANAGEMENT_ADDR_ENV)),
+        // ADR 0040 §1: a malformed value is refused with the variable's name.
+        management_remote: env(crate::roles::MANAGEMENT_REMOTE_ENV)
+            .map(|value| {
+                capyctl_config::engine_settings::boolean(
+                    crate::roles::MANAGEMENT_REMOTE_ENV,
+                    &value,
+                )
+            })
+            .transpose()?,
         state_dir: env(STATE_DIR_ENV).map(PathBuf::from),
         // ADR 0028 §11: a malformed value is refused with the variable's name.
         group_stall_timeout: env(capyctl_config::remote_roles::GROUP_STALL_TIMEOUT_ENV)

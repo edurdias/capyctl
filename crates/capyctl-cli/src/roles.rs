@@ -207,6 +207,8 @@ pub struct App {
     /// Owner decision 2026-09-25: the document's
     /// `server.listeners.management.bind`, or `127.0.0.1:7443`.
     management_bind: std::net::SocketAddr,
+    /// ADR 0040 §1: the document's `server.listeners.management.public_address`.
+    management_public_address: Option<String>,
     /// Design §9: the document's `server.listeners.inference.authentication`
     /// (`api_key` unless it states `none`).
     inference_auth: capyctl_config::standalone::InferenceAuth,
@@ -243,6 +245,13 @@ impl App {
     /// `CAPYCTL_MANAGEMENT_ADDR` overrides it ([`management_override`]).
     pub fn management_bind(&self) -> std::net::SocketAddr {
         self.management_bind
+    }
+
+    /// ADR 0040 §1: the origin the standalone document states for reaching
+    /// the management listener from off the box
+    /// (`server.listeners.management.public_address`), if any.
+    pub fn management_public_address(&self) -> Option<&str> {
+        self.management_public_address.as_deref()
     }
 
     /// Design §9: the inference authentication the standalone document
@@ -342,28 +351,66 @@ pub const INFERENCE_ADDR_ENV: &str = "CAPYCTL_INFERENCE_ADDR";
 /// it, with a deprecation warning.
 pub const DEPRECATED_INFERENCE_ADDR_ENV: &str = "CAPYCTL_STANDALONE_INFERENCE_ADDR";
 /// Owner decision 2026-09-25: the standalone management address for one
-/// run, for the role and its client commands alike (loopback only).
+/// run, for the role and its client commands alike (loopback only, unless
+/// this run's `remote` is set, ADR 0040 §1).
 pub const MANAGEMENT_ADDR_ENV: &str = "CAPYCTL_MANAGEMENT_ADDR";
 /// The standalone-only name [`MANAGEMENT_ADDR_ENV`] replaces. Still read,
 /// after it, with a deprecation warning.
 pub const DEPRECATED_MANAGEMENT_ADDR_ENV: &str = "CAPYCTL_STANDALONE_MANAGEMENT_ADDR";
+/// ADR 0040 §1: whether the management listener may bind off loopback for
+/// one run, on the server and standalone roles alike (`--management-remote`
+/// wins over it).
+pub const MANAGEMENT_REMOTE_ENV: &str = "CAPYCTL_MANAGEMENT_REMOTE";
+
+/// ADR 0040 §1: this run's `remote`, if a named form states it:
+/// `--management-remote` (`flag`), then `CAPYCTL_MANAGEMENT_REMOTE` (`true`,
+/// `false`, `1`, `0`, `on`, `off`; a malformed value is refused with its
+/// name). `None` leaves it to the document.
+pub fn management_remote_override(flag: bool) -> Result<Option<bool>, StartError> {
+    if flag {
+        return Ok(Some(true));
+    }
+    match std::env::var(MANAGEMENT_REMOTE_ENV) {
+        Ok(text) if !text.is_empty() => {
+            capyctl_config::engine_settings::boolean(MANAGEMENT_REMOTE_ENV, &text)
+                .map(Some)
+                .map_err(|error| StartError::Setting(crate::settings::describe(&error)))
+        }
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(StartError::Setting(format!(
+            "{MANAGEMENT_REMOTE_ENV} must be true or false"
+        ))),
+    }
+}
 
 /// SPEC §16.5, owner decision 2026-09-25: the run-time override of the
-/// standalone management bind, if any: `--management-listen`, then
+/// management bind, if any: `--management-listen`, then
 /// `CAPYCTL_MANAGEMENT_ADDR`, then the deprecated
-/// `CAPYCTL_STANDALONE_MANAGEMENT_ADDR`. Each must be a loopback address with a
-/// non-zero port; a bad one is refused with its name.
+/// `CAPYCTL_STANDALONE_MANAGEMENT_ADDR`. Each must be an address with a
+/// non-zero port, on loopback unless this run's `remote` is set (ADR 0040
+/// §1); a bad one is refused with its name.
 pub fn management_override(
     flag: Option<std::net::SocketAddr>,
+    remote: bool,
 ) -> Result<Option<std::net::SocketAddr>, StartError> {
     use capyctl_config::standalone::management_address;
+    let rule = if remote {
+        "an address with a non-zero port that is not multicast, e.g. 0.0.0.0:7443"
+    } else {
+        "a loopback address with a port, e.g. 127.0.0.1:7443"
+    };
     if let Some(address) = flag {
-        return management_address(&address.to_string())
+        return management_address(&address.to_string(), remote)
             .map(Some)
             .ok_or_else(|| {
-                StartError::Setting(format!(
-                    "--management-listen {address} must be a loopback address with a non-zero port"
-                ))
+                StartError::Setting(if remote {
+                    format!("--management-listen {address} must be {rule}")
+                } else {
+                    format!(
+                        "--management-listen {address} must be a loopback address with a \
+                         non-zero port"
+                    )
+                })
             });
     }
     let (variable, value) = match std::env::var_os(MANAGEMENT_ADDR_ENV) {
@@ -376,13 +423,81 @@ pub fn management_override(
     value
         .into_string()
         .ok()
-        .and_then(|text| management_address(&text))
+        .and_then(|text| management_address(&text, remote))
         .map(Some)
-        .ok_or_else(|| {
-            StartError::Setting(format!(
-                "{variable} must be a loopback address with a port, e.g. 127.0.0.1:7443"
-            ))
-        })
+        .ok_or_else(|| StartError::Setting(format!("{variable} must be {rule}")))
+}
+
+/// ADR 0040 §1: the address a client on this box connects to for a
+/// management listener bound at `bind`: an unspecified bind (`0.0.0.0`,
+/// `::`) is reached through loopback on the same port; any other address as
+/// it is.
+pub fn connectable(bind: std::net::SocketAddr) -> std::net::SocketAddr {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    match bind.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => (Ipv4Addr::LOCALHOST, bind.port()).into(),
+        IpAddr::V6(ip) if ip.is_unspecified() => (Ipv6Addr::LOCALHOST, bind.port()).into(),
+        _ => bind,
+    }
+}
+
+/// The management address a client command names with
+/// `CAPYCTL_MANAGEMENT_ADDR` (or its deprecated alias), if any: on loopback
+/// unless `CAPYCTL_MANAGEMENT_REMOTE` is set (ADR 0040 §1), and reached
+/// through loopback when unspecified ([`connectable`]).
+pub fn client_management_override() -> Result<Option<std::net::SocketAddr>, StartError> {
+    let remote = management_remote_override(false)?.unwrap_or(false);
+    Ok(management_override(None, remote)?.map(connectable))
+}
+
+/// SPEC §16.5, ADR 0040 §1: the management address a standalone role binds
+/// this run when a named form moves it, checked before the boot so a bad
+/// override refuses without side effects. The address is
+/// `--management-listen` (`listen`), else `CAPYCTL_MANAGEMENT_ADDR` (or its
+/// deprecated alias); `None` is the document's bind
+/// ([`App::management_bind`]). It is on loopback unless this run's `remote`
+/// is set: `--management-remote` (`remote_flag`), else
+/// `CAPYCTL_MANAGEMENT_REMOTE`, else the document's `remote`.
+///
+/// The document at `path`, with `overrides` applied, is read for its
+/// `remote` (a missing one is generated at the boot and states only the
+/// overrides); a document the role refuses is left to the boot, which names
+/// the refusal.
+pub fn standalone_management_override(
+    path: &Path,
+    overrides: &SettingOverrides,
+    listen: Option<std::net::SocketAddr>,
+    remote_flag: bool,
+) -> Result<Option<std::net::SocketAddr>, StartError> {
+    let document = match std::fs::read_to_string(path) {
+        Ok(text) => capyctl_config::parse_document(&text)
+            .and_then(|document| overrides.apply_and_validate(document))
+            .ok(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut document = serde_json::json!({});
+            overrides.apply(&mut document).ok().map(|()| document)
+        }
+        Err(_) => None,
+    };
+    let stated = document
+        .and_then(|document| capyctl_config::standalone::management_listener(&document).ok());
+    let named = management_remote_override(remote_flag)?;
+    let remote = named
+        .or(stated.as_ref().map(|listener| listener.remote))
+        .unwrap_or(false);
+    let address = management_override(listen, remote)?;
+    // ADR 0040 §1: `CAPYCTL_MANAGEMENT_REMOTE=false` takes an off-box
+    // document bind back to the loopback rule.
+    if let (None, Some(listener)) = (address, &stated) {
+        if !remote && !listener.bind.ip().is_loopback() {
+            return Err(StartError::Setting(format!(
+                "{MANAGEMENT_REMOTE_ENV} is false, so the management listener binds a \
+                 loopback address; server.listeners.management.bind is {}",
+                listener.bind
+            )));
+        }
+    }
+    Ok(address)
 }
 
 /// Print a role warning that may carry the legacy `warning: ` prefix; the sink
@@ -516,12 +631,13 @@ pub fn record_management_address(state_dir: &Path, address: std::net::SocketAddr
     }
 }
 
-/// The management address a role under `state_dir` recorded, when it is a
-/// loopback address (SPEC §16.5: management never leaves loopback, so a
-/// recorded value that is not one is ignored).
+/// The management address a role under `state_dir` recorded, as a client on
+/// this box reaches it. ADR 0040 §1: the role records only the address it
+/// was allowed to bind, so an off-box one is accepted, and an unspecified
+/// bind is reached through loopback ([`connectable`]).
 pub fn recorded_management_address(state_dir: &Path) -> Option<std::net::SocketAddr> {
     let text = std::fs::read_to_string(recorded_management_path(state_dir)).ok()?;
-    capyctl_config::standalone::management_address(text.trim())
+    capyctl_config::standalone::parse_management_address(text.trim()).map(connectable)
 }
 
 /// Owner decision 2026-09-25: the management address a client command uses
@@ -533,7 +649,7 @@ pub fn recorded_management_address(state_dir: &Path) -> Option<std::net::SocketA
 /// ([`recorded_management_address`]), so a role started with
 /// `--management-listen` is found without the variable.
 pub fn standalone_management_address(state_dir: &Path) -> Result<std::net::SocketAddr, StartError> {
-    if let Some(address) = management_override(None)? {
+    if let Some(address) = client_management_override()? {
         return Ok(address);
     }
     // Final review I8: the address the role serves on this run, which a
@@ -566,7 +682,9 @@ pub fn standalone_management_address(state_dir: &Path) -> Result<std::net::Socke
     let parsed = capyctl_config::parse_document(&text)
         .and_then(|parsed| overrides.apply_and_validate(parsed))
         .map_err(refused)?;
-    capyctl_config::standalone::management_bind(&parsed).map_err(refused)
+    capyctl_config::standalone::management_bind(&parsed)
+        .map(connectable)
+        .map_err(refused)
 }
 
 impl App {
@@ -1762,7 +1880,7 @@ async fn start_standalone_in(
         timing_header,
         config_notices,
         inference_bind,
-        management_bind,
+        management_listener,
         inference_auth,
         stated_host,
         group_stall_timeout,
@@ -1819,8 +1937,9 @@ async fn start_standalone_in(
             capyctl_config::standalone::inference_bind(&document).map_err(|error| {
                 StartError::Deploy(format!("standalone configuration: {error}"))
             })?,
-            // Owner decision 2026-09-25: validated by `check_honoured` above.
-            capyctl_config::standalone::management_bind(&document).map_err(|error| {
+            // Owner decision 2026-09-25, ADR 0040 §1: validated by
+            // `check_honoured` above.
+            capyctl_config::standalone::management_listener(&document).map_err(|error| {
                 StartError::Deploy(format!("standalone configuration: {error}"))
             })?,
             // Design §9: `server.listeners.inference.authentication`
@@ -2523,7 +2642,8 @@ async fn start_standalone_in(
         switcher,
         config_notices,
         inference_bind,
-        management_bind,
+        management_bind: management_listener.bind,
+        management_public_address: management_listener.public_address,
         inference_auth,
         inference_listener,
     })

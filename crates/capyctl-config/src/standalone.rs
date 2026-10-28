@@ -12,7 +12,8 @@
 //!
 //! What is accepted is exactly what the role does: the per-role state
 //! directories under the state root, the management listener on loopback (any
-//! port, owner decision 2026-09-25) with its admin token, the inference listener at any unicast
+//! port, owner decision 2026-09-25; off the box only with `remote: true`, ADR
+//! 0040 §1) with its admin token, the inference listener at any unicast
 //! address with a port (design §9: `0.0.0.0:8443` by default, as for a
 //! server) with `api_key` or the explicit `none` authentication, an `embedded` connection, `auto` resource values and no
 //! runtime profiles. The models directory and model sources, the engine
@@ -84,33 +85,144 @@ pub fn inference_bind(document: &Value) -> Result<SocketAddr, ConfigError> {
     })
 }
 
-/// SPEC §16.5 (owner decision 2026-09-25): the one rule for the standalone
-/// management address, whichever document, flag or variable states it: a
-/// loopback socket address with a non-zero port. Management carries the admin
-/// token and never leaves loopback.
-pub fn management_address(text: &str) -> Option<SocketAddr> {
+/// SPEC §16.5 (owner decision 2026-09-25), ADR 0040 §1: the one rule for
+/// parsing a management address, whichever role, document, flag or variable
+/// states it: a socket address with a non-zero port that is not multicast.
+/// The loopback check is separate ([`management_address`]).
+pub fn parse_management_address(text: &str) -> Option<SocketAddr> {
     text.parse::<SocketAddr>()
         .ok()
-        .filter(|address| address.port() != 0 && address.ip().is_loopback())
+        .filter(|address| address.port() != 0 && !address.ip().is_multicast())
+}
+
+/// SPEC §16.5 (owner decision 2026-09-25): a management address
+/// ([`parse_management_address`]) that is on loopback, unless `remote` is set.
+/// ADR 0040 §1: the loopback check applies only without `remote`, so the
+/// listener leaves the box only when its role states so.
+pub fn management_address(text: &str, remote: bool) -> Option<SocketAddr> {
+    parse_management_address(text).filter(|address| remote || address.ip().is_loopback())
 }
 
 /// The standalone management listener's default address.
 pub const DEFAULT_MANAGEMENT_BIND: &str = "127.0.0.1:7443";
 
-/// The management address a standalone `document` binds:
-/// `server.listeners.management.bind` when stated, else
-/// [`DEFAULT_MANAGEMENT_BIND`].
-pub fn management_bind(document: &Value) -> Result<SocketAddr, ConfigError> {
-    let Some(bind) = document["server"]["listeners"]["management"].get("bind") else {
-        return Ok(DEFAULT_MANAGEMENT_BIND.parse().expect("valid default"));
+/// What a document states for its management listener (ADR 0040 §1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagementListener {
+    /// The address it binds.
+    pub bind: SocketAddr,
+    /// `remote: true`: a non-loopback `bind` is allowed.
+    pub remote: bool,
+    /// The origin the listener is reached at from off the box (sign-in
+    /// links, the extra origin the request checks accept), when stated.
+    pub public_address: Option<String>,
+}
+
+/// ADR 0040 §1: `remote` of a management `listener` block: `false` when
+/// unstated, else a boolean. `path` names the field in errors.
+pub fn listener_remote(listener: &Value, path: &str) -> Result<bool, ConfigError> {
+    match listener.get("remote") {
+        None => Ok(false),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| refuse(path, "must be true or false")),
+    }
+}
+
+/// ADR 0040 §1: `public_address` of a management `listener` block, when
+/// stated: an origin ([`public_origin`]). `path` names the field in errors.
+pub fn listener_public_address(
+    listener: &Value,
+    path: &str,
+) -> Result<Option<String>, ConfigError> {
+    let Some(value) = listener.get("public_address") else {
+        return Ok(None);
     };
-    bind.as_str().and_then(management_address).ok_or_else(|| {
-        refuse(
-            "server.listeners.management.bind",
-            "the management listener binds a loopback address with a non-zero port, e.g. \
-             127.0.0.1:7443",
-        )
+    value
+        .as_str()
+        .filter(|text| public_origin(text))
+        .map(|text| Some(text.to_owned()))
+        .ok_or_else(|| {
+            refuse(
+                path,
+                "must be an origin: http:// or https://, a host and an optional port, with no \
+                 path, e.g. https://box.tail1234.ts.net or http://box:7443",
+            )
+        })
+}
+
+/// ADR 0040 §1: whether `text` is an origin as a browser sends it: `http://`
+/// or `https://`, a host (a DNS name, an IPv4 address or a bracketed IPv6
+/// address) and an optional non-zero port, and nothing after it.
+pub fn public_origin(text: &str) -> bool {
+    let Some(authority) = text
+        .strip_prefix("http://")
+        .or_else(|| text.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let (host_ok, port) = match authority.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((v6, port)) => (v6.parse::<std::net::Ipv6Addr>().is_ok(), port),
+            None => return false,
+        },
+        None => {
+            let (host, port) = authority.split_at(authority.find(':').unwrap_or(authority.len()));
+            let name = !host.is_empty()
+                && host.len() <= 253
+                && host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b));
+            (name, port)
+        }
+    };
+    let port_ok = port.is_empty()
+        || port.strip_prefix(':').is_some_and(|digits| {
+            digits.bytes().all(|b| b.is_ascii_digit())
+                && digits.parse::<u16>().is_ok_and(|port| port != 0)
+        });
+    host_ok && port_ok
+}
+
+/// SPEC §16.5, ADR 0040 §1: the management listener of a standalone
+/// `document`: `server.listeners.management.bind` when stated, else
+/// [`DEFAULT_MANAGEMENT_BIND`]; `remote` and `public_address` when stated.
+/// Without `remote` the bind is refused off loopback, with the message it
+/// always had.
+pub fn management_listener(document: &Value) -> Result<ManagementListener, ConfigError> {
+    const PATH: &str = "server.listeners.management";
+    let listener = &document["server"]["listeners"]["management"];
+    let remote = listener_remote(listener, &format!("{PATH}.remote"))?;
+    let public_address = listener_public_address(listener, &format!("{PATH}.public_address"))?;
+    let bind = match listener.get("bind") {
+        None => DEFAULT_MANAGEMENT_BIND.parse().expect("valid default"),
+        Some(bind) => bind
+            .as_str()
+            .and_then(|text| management_address(text, remote))
+            .ok_or_else(|| {
+                refuse(
+                    &format!("{PATH}.bind"),
+                    if remote {
+                        "the management listener binds an address with a non-zero port that is \
+                         not multicast, e.g. 0.0.0.0:7443 or a Tailscale address"
+                    } else {
+                        "the management listener binds a loopback address with a non-zero port, \
+                         e.g. 127.0.0.1:7443"
+                    },
+                )
+            })?,
+    };
+    Ok(ManagementListener {
+        bind,
+        remote,
+        public_address,
     })
+}
+
+/// The management address a standalone `document` binds
+/// ([`management_listener`]).
+pub fn management_bind(document: &Value) -> Result<SocketAddr, ConfigError> {
+    management_listener(document).map(|listener| listener.bind)
 }
 
 /// Design §9 (owner decision B): whether the inference listener requires the
@@ -414,10 +526,21 @@ pub fn check_honoured(
             if name == "inference" {
                 // Design §9: any unicast address, as for a server.
                 inference_bind(document)?;
+                // ADR 0040 §1: `remote` and `public_address` are the
+                // management listener's settings (SPEC §15.3: refused where
+                // they would be ignored).
+                for field in ["remote", "public_address"] {
+                    if listener.get(field).is_some() {
+                        return Err(refuse(
+                            &format!("{path}.{field}"),
+                            "only the management listener takes this setting",
+                        ));
+                    }
+                }
             } else {
                 // SPEC §16.5, owner decision 2026-09-25: management stays on
-                // loopback, at any port.
-                management_bind(document)?;
+                // loopback, at any port; ADR 0040 §1: unless `remote` is set.
+                management_listener(document)?;
             }
             if name == "inference" {
                 // Design §9: `api_key` (default) or the explicit `none`.

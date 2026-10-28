@@ -851,10 +851,19 @@ enum StartTarget {
         #[arg(long)]
         no_inference_auth: bool,
         /// Serve the management API on this loopback address for this run
-        /// (default 127.0.0.1:7443). Wins over CAPYCTL_MANAGEMENT_ADDR and
+        /// (default 127.0.0.1:7443), or on any address with
+        /// --management-remote. Wins over CAPYCTL_MANAGEMENT_ADDR and
         /// listeners.management.bind.
         #[arg(long, value_name = "ADDR:PORT", value_parser = parse_management_listen)]
         management_listen: Option<SocketAddr>,
+        // ADR 0040 §1. (A `//` comment: a doc comment would become
+        // user-facing help text.)
+        /// Allow the management API, and the web UI, on an address other
+        /// than loopback for this run, such as a Tailscale address or
+        /// 0.0.0.0. Served over plain HTTP. Wins over
+        /// CAPYCTL_MANAGEMENT_REMOTE and listeners.management.remote.
+        #[arg(long)]
+        management_remote: bool,
         // ADR 0028 §11 (decided 2026-10-06). (A `//` comment: a doc comment
         // would become user-facing help text.)
         /// How long a request to a multi-node group may wait for its first
@@ -901,10 +910,18 @@ enum StartTarget {
         #[arg(long, value_name = "SIZE", value_parser = parse_kv_cache)]
         kv_cache: Option<String>,
         /// Serve the management API on this loopback address for this run
-        /// (default 127.0.0.1:7443). Wins over CAPYCTL_MANAGEMENT_ADDR and
+        /// (default 127.0.0.1:7443), or on any address with
+        /// --management-remote. Wins over CAPYCTL_MANAGEMENT_ADDR and
         /// server.listeners.management.bind.
         #[arg(long, value_name = "ADDR:PORT", value_parser = parse_management_listen)]
         management_listen: Option<SocketAddr>,
+        // ADR 0040 §1.
+        /// Allow the management API, and the web UI, on an address other
+        /// than loopback for this run, such as a Tailscale address or
+        /// 0.0.0.0. Served over plain HTTP. Wins over
+        /// CAPYCTL_MANAGEMENT_REMOTE and server.listeners.management.remote.
+        #[arg(long)]
+        management_remote: bool,
         #[command(flatten)]
         overrides: SetArgs,
     },
@@ -1365,8 +1382,10 @@ pub struct Invocation {
     /// start, `validate config` or `config show`.
     pub sets: Vec<String>,
     /// Owner decision 2026-09-25: `--management-listen` on `start
-    /// standalone`.
+    /// standalone` and `start server`.
     pub management_listen: Option<SocketAddr>,
+    /// ADR 0040 §1: `--management-remote` on the same starts.
+    pub management_remote: bool,
     /// ADR 0028 §11 (decided 2026-10-06): `--group-stall-timeout` on `start
     /// server`.
     pub group_stall_timeout: Option<std::time::Duration>,
@@ -1525,19 +1544,49 @@ where
         _ => Vec::new(),
     };
     // Final review I8: `--management-listen` on both roles that serve the
-    // management API (a host has none).
-    let management_listen = match &cli.command {
+    // management API (a host has none); ADR 0040 §1: and `--management-remote`.
+    let (management_listen, management_remote) = match &cli.command {
         CliCommand::Start {
             target:
                 StartTarget::Standalone {
-                    management_listen, ..
+                    management_listen,
+                    management_remote,
+                    ..
                 }
                 | StartTarget::Server {
-                    management_listen, ..
+                    management_listen,
+                    management_remote,
+                    ..
                 },
-        } => *management_listen,
-        _ => None,
+        } => (*management_listen, *management_remote),
+        _ => (None, false),
     };
+    // SPEC §16.5: `--management-listen` is a loopback address. ADR 0040 §1:
+    // the loopback check runs once `remote` is known, and only when neither
+    // `--management-remote` nor CAPYCTL_MANAGEMENT_REMOTE sets it (the role
+    // checks the address again against its document's `remote`).
+    if let Some(address) = management_listen {
+        let remote = management_remote
+            || std::env::var(crate::roles::MANAGEMENT_REMOTE_ENV)
+                .ok()
+                .and_then(|text| {
+                    capyctl_config::engine_settings::boolean(
+                        crate::roles::MANAGEMENT_REMOTE_ENV,
+                        &text,
+                    )
+                    .ok()
+                })
+                .unwrap_or(false);
+        if !remote && !address.ip().is_loopback() {
+            return Err(CliError::Clap(clap::Error::raw(
+                clap::error::ErrorKind::ValueValidation,
+                format!(
+                    "invalid value '{address}' for '--management-listen <ADDR:PORT>': \
+                     {MANAGEMENT_LOOPBACK}\n"
+                ),
+            )));
+        }
+    }
     // ADR 0028 §11 (decided 2026-10-06): `--group-stall-timeout` on `start
     // server`, the role that runs groups.
     let group_stall_timeout = match &cli.command {
@@ -1624,6 +1673,7 @@ where
         state_dir: cli.state_dir.map(|dir| crate::engine::absolute(&dir)),
         sets,
         management_listen,
+        management_remote,
         group_stall_timeout,
     })
 }
@@ -1764,12 +1814,17 @@ fn parse_role(text: &str) -> Result<Role, String> {
     }
 }
 
-/// Owner decision 2026-09-25: `--management-listen`, a loopback address with
-/// a non-zero port (SPEC §16.5: management never leaves loopback).
+/// The refusal of a `--management-listen` that is not loopback, without
+/// `remote`.
+const MANAGEMENT_LOOPBACK: &str =
+    "must be a loopback address and port such as 127.0.0.1:7443 (non-zero port)";
+
+/// Owner decision 2026-09-25: `--management-listen`, an address with a
+/// non-zero port. ADR 0040 §1: parsing is split from the loopback check,
+/// which needs `remote` ([`parse_invocation`]).
 fn parse_management_listen(text: &str) -> Result<SocketAddr, String> {
-    capyctl_config::standalone::management_address(text).ok_or_else(|| {
-        "must be a loopback address and port such as 127.0.0.1:7443 (non-zero port)".to_owned()
-    })
+    capyctl_config::standalone::parse_management_address(text)
+        .ok_or_else(|| MANAGEMENT_LOOPBACK.to_owned())
 }
 
 /// ADR 0028 §11 (decided 2026-10-06): `--group-stall-timeout <duration>`.

@@ -474,8 +474,15 @@ async fn serve_standalone(
     }
     // Owner decision 2026-09-25: `--management-listen` >
     // CAPYCTL_MANAGEMENT_ADDR (or its deprecated alias) > the document, checked
-    // before the boot so a bad override refuses without side effects.
-    let management_override = roles::management_override(invocation.management_listen)?;
+    // before the boot so a bad override refuses without side effects. ADR 0040
+    // §1: off loopback only with this run's `remote` (`--management-remote` >
+    // CAPYCTL_MANAGEMENT_REMOTE > the document).
+    let management_override = roles::standalone_management_override(
+        config.unwrap_or(&implicit),
+        overrides,
+        invocation.management_listen,
+        invocation.management_remote,
+    )?;
     if let Some(warning) = roles::deprecated_management_env_warning(invocation.management_listen) {
         roles::role_warning(&warning);
     }

@@ -13,6 +13,14 @@ pub struct ServerConfig {
     pub state_dir: PathBuf,
     pub identity_dir: PathBuf,
     pub management: SocketAddr,
+    /// ADR 0040 §1: `listeners.management.remote`, whether the management
+    /// listener may bind off loopback. `--management-remote` and
+    /// `CAPYCTL_MANAGEMENT_REMOTE` override it for one run
+    /// ([`ServerConfig::with_management`]).
+    pub management_remote: bool,
+    /// ADR 0040 §1: `listeners.management.public_address`, the origin the
+    /// management listener is reached at from off the box, when stated.
+    pub management_public_address: Option<String>,
     pub inference: SocketAddr,
     /// Design §9: `listeners.inference.authentication`, `api_key` or the
     /// explicit `none`. `--no-inference-auth` and `CAPYCTL_INFERENCE_AUTH`
@@ -533,6 +541,13 @@ fn listener(v: &Value, name: &str, auth: &str, local: bool) -> Result<SocketAddr
     {
         return Err(invalid("listeners"));
     }
+    // ADR 0040 §1: `remote` and `public_address` belong to the management
+    // listener only.
+    if name != "management"
+        && (value.get("remote").is_some() || value.get("public_address").is_some())
+    {
+        return Err(invalid("listeners"));
+    }
     Ok(addr)
 }
 /// No two listeners share a port on overlapping addresses (an unspecified
@@ -577,7 +592,18 @@ impl ServerConfig {
         if identity_dir != state_dir.join("identity") {
             return Err(invalid("identity_dir"));
         }
-        let management = listener(&v, "management", "token", true)?;
+        // ADR 0040 §1: the management listener stays on loopback unless the
+        // document states `remote: true`; `public_address` is an origin.
+        let management_block = &v["listeners"]["management"];
+        let management_remote =
+            crate::standalone::listener_remote(management_block, "listeners.management.remote")
+                .map_err(|_| invalid("listeners.management.remote"))?;
+        let management_public_address = crate::standalone::listener_public_address(
+            management_block,
+            "listeners.management.public_address",
+        )
+        .map_err(|_| invalid("listeners.management.public_address"))?;
+        let management = listener(&v, "management", "token", !management_remote)?;
         // Design §9 (owner decision 5): the inference listener is not forced
         // to loopback; it keeps the API key unless the document states the
         // explicit `none` (design §9), and the router's allowlist (SPEC
@@ -609,6 +635,8 @@ impl ServerConfig {
             state_dir,
             identity_dir,
             management,
+            management_remote,
+            management_public_address,
             inference,
             inference_auth,
             bootstrap,
@@ -646,14 +674,24 @@ impl ServerConfig {
         self.state_dir = state_dir;
         self
     }
-    /// Final review I8: the management listener this run serves on
-    /// (`--management-listen` or `CAPYCTL_MANAGEMENT_ADDR`), a loopback address
-    /// with a non-zero port that no other server listener shares.
-    pub fn with_management(mut self, address: SocketAddr) -> Result<Self, ConfigError> {
-        crate::standalone::management_address(&address.to_string())
+    /// Final review I8, ADR 0040 §1: the management listener this run serves
+    /// on. `address` (`--management-listen` or `CAPYCTL_MANAGEMENT_ADDR`)
+    /// replaces the document's bind and `remote` (`--management-remote` or
+    /// `CAPYCTL_MANAGEMENT_REMOTE`) its `remote`. The bind is on loopback
+    /// unless this run's `remote` is set, has a non-zero port, and no other
+    /// server listener shares it.
+    pub fn with_management(
+        mut self,
+        address: Option<SocketAddr>,
+        remote: Option<bool>,
+    ) -> Result<Self, ConfigError> {
+        let remote = remote.unwrap_or(self.management_remote);
+        let address = address.unwrap_or(self.management);
+        crate::standalone::management_address(&address.to_string(), remote)
             .ok_or_else(|| invalid("listeners"))?;
         distinct_listeners(&[address, self.inference, self.bootstrap, self.control])?;
         self.management = address;
+        self.management_remote = remote;
         Ok(self)
     }
     pub fn with_inference(mut self, address: SocketAddr) -> Result<Self, ConfigError> {

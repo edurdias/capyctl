@@ -22,8 +22,9 @@
 //! with a host document named) the command is refused: this is a host; run
 //! this on the server.
 //!
-//! Every role serves its management API on loopback only, so another machine
-//! is managed by running the command there.
+//! Every role serves its management API on loopback unless its owner allows
+//! another address (ADR 0040 §1); a role bound on every interface is reached
+//! through loopback.
 
 use std::io::Write as _;
 use std::net::SocketAddr;
@@ -180,7 +181,7 @@ fn server_target(state_root: &Path, source: Source) -> Result<Target, Structured
         return document_target(state_root, &implicit, source);
     }
     let token = crate::remote_roles::server_admin_token(&state_root.join("identity"))?;
-    let address = crate::roles::management_override(None)
+    let address = crate::roles::client_management_override()
         .map_err(|e| invalid(e.to_string()))?
         .or_else(|| crate::roles::recorded_management_address(state_root))
         .unwrap_or_else(|| DEFAULT_MANAGEMENT.parse().expect("valid default"));

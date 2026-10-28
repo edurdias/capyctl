@@ -410,11 +410,12 @@ pub(crate) fn management_context(
 ) -> Result<(String, String), StructuredError> {
     // Final review I8: `CAPYCTL_MANAGEMENT_ADDR`, else the address the server
     // recorded when it started (a `--management-listen` start), else the
-    // document's, as for standalone.
-    let address = crate::roles::management_override(None)
+    // document's, as for standalone. ADR 0040 §1: an unspecified bind is
+    // reached through loopback.
+    let address = crate::roles::client_management_override()
         .map_err(|e| error(&e.to_string()))?
         .or_else(|| crate::roles::recorded_management_address(&config.state_dir))
-        .unwrap_or(config.management);
+        .unwrap_or(crate::roles::connectable(config.management));
     Ok((
         format!("http://{address}/management/v1"),
         load_credentials(config)?.admin_token,
@@ -1461,13 +1462,21 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 )?;
                 // Final review I8: `--management-listen` >
                 // CAPYCTL_MANAGEMENT_ADDR > the document, as for standalone.
-                if let Some(address) =
-                    crate::roles::management_override(invocation.management_listen)
-                        .map_err(|e| error(&e.to_string()))?
-                {
-                    config = config.with_management(address).map_err(|_| {
+                // ADR 0040 §1: off loopback only with this run's `remote`
+                // (`--management-remote` > CAPYCTL_MANAGEMENT_REMOTE > the
+                // document).
+                let remote = crate::roles::management_remote_override(invocation.management_remote)
+                    .map_err(|e| error(&e.to_string()))?;
+                let address = crate::roles::management_override(
+                    invocation.management_listen,
+                    remote.unwrap_or(config.management_remote),
+                )
+                .map_err(|e| error(&e.to_string()))?;
+                if address.is_some() || remote.is_some() {
+                    let shown = address.unwrap_or(config.management);
+                    config = config.with_management(address, remote).map_err(|_| {
                         error(&format!(
-                            "management address {address} collides with another server listener \
+                            "management address {shown} collides with another server listener \
                              or is not a loopback address with a non-zero port"
                         ))
                     })?;
