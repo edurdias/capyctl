@@ -256,6 +256,7 @@ fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
             None,
             None,
             None,
+            None,
             2
         ),
         Err(CheckpointDigestError::Invalid)
@@ -271,6 +272,7 @@ fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
             Some(slot),
             None,
             DigestProvenance::Measured,
+            None,
             None,
             None,
             None,
@@ -303,6 +305,7 @@ fn the_state_slot_is_recorded_and_sizes_a_derived_request() {
                 Some(slot + 1),
                 None,
                 DigestProvenance::Measured,
+                None,
                 None,
                 None,
                 None,
@@ -368,6 +371,7 @@ fn measured_tables_size_an_engine_that_keeps_them_on_disk() {
             Some(too_large),
             None,
             None,
+            None,
             2
         ),
         Err(CheckpointDigestError::Invalid)
@@ -384,6 +388,7 @@ fn measured_tables_size_an_engine_that_keeps_them_on_disk() {
             None,
             DigestProvenance::Measured,
             Some(tables),
+            None,
             None,
             None,
             2,
@@ -798,7 +803,7 @@ fn a_recorded_digest_keeps_its_provenance() {
     let declared = deploy(&store, &session, "declared", &config, &host);
     let record = |id: &str, digest: &str, provenance| {
         store.record_checkpoint_measurement(
-            &session, id, 1, "lab", digest, 7, None, None, provenance, None, None, None, 2,
+            &session, id, 1, "lab", digest, 7, None, None, provenance, None, None, None, None, 2,
         )
     };
     for (id, digest) in [
@@ -841,4 +846,108 @@ fn a_recorded_digest_keeps_its_provenance() {
         "{shown}"
     );
     assert!(shown.contains("\"provenance\":\"fetched\""), "{shown}");
+}
+
+// T45 (ADR 0034 §4): B and C a host reports with its sizing and with its
+// digest are recorded and read back; a host from before ADR 0034 reports
+// none and the revision has no basis (NULL), until the same measurement
+// names one. A recorded basis is never replaced, and a basis naming zero
+// records nothing.
+#[test]
+fn a_reported_pool_basis_is_recorded_with_the_sizing_and_the_digest() {
+    use capyctl_config::lmcache::PoolBasis;
+    let (store, session, mut config, host) = setup();
+    let sized = deploy(&store, &session, "sized", &config, &host);
+    config["name"] = json!("older");
+    config["routes"] = json!(["older"]);
+    let older = deploy(&store, &session, "older", &config, &host);
+    let basis = |bytes_per_token, context_tokens| PoolBasis {
+        bytes_per_token,
+        context_tokens,
+    };
+    let read = |id: &str| recorded_pool_basis(&store.conn, id, 1).unwrap();
+    let measure = |id: &str, pool_basis, now_ms| {
+        store.record_checkpoint_measurement(
+            &session,
+            id,
+            1,
+            "lab",
+            DIGEST,
+            7,
+            None,
+            None,
+            DigestProvenance::Measured,
+            None,
+            None,
+            Some("qwen3"),
+            pool_basis,
+            now_ms,
+        )
+    };
+    let id = &sized.deployment_id;
+    assert_eq!(read(id), None);
+    for zero in [basis(0, 8192), basis(147_456, 0)] {
+        assert!(matches!(
+            store.record_checkpoint_weights(&session, id, 1, "lab", 7, None, Some(zero), 2),
+            Err(CheckpointDigestError::Invalid)
+        ));
+        assert!(matches!(
+            measure(id, Some(zero), 2),
+            Err(CheckpointDigestError::Invalid)
+        ));
+    }
+    assert_eq!(read(id), None);
+    // While the digest is pending, the sizing's basis.
+    assert!(store
+        .record_checkpoint_weights(
+            &session,
+            id,
+            1,
+            "lab",
+            7,
+            Some("qwen3"),
+            Some(basis(147_456, 8192)),
+            2
+        )
+        .unwrap());
+    assert_eq!(read(id), Some(basis(147_456, 8192)));
+    // Once recorded, the digest's own.
+    assert!(matches!(
+        measure(id, Some(basis(147_456, 32_768)), 3).unwrap(),
+        RecordOutcome::Recorded { .. }
+    ));
+    assert_eq!(read(id), Some(basis(147_456, 32_768)));
+    // The same measurement again never replaces a recorded basis.
+    assert!(matches!(
+        measure(id, Some(basis(1, 1)), 4).unwrap(),
+        RecordOutcome::Recorded { .. }
+    ));
+    assert_eq!(read(id), Some(basis(147_456, 32_768)));
+
+    // A host from before ADR 0034: sized and recorded without a basis.
+    let id = &older.deployment_id;
+    assert!(store
+        .record_checkpoint_weights(&session, id, 1, "lab", 7, Some("qwen3"), None, 2)
+        .unwrap());
+    assert_eq!(read(id), None);
+    assert!(matches!(
+        measure(id, None, 3).unwrap(),
+        RecordOutcome::Recorded { .. }
+    ));
+    assert_eq!(read(id), None);
+    let columns: (Option<i64>, Option<i64>) = store
+        .conn
+        .query_row(
+            "SELECT kv_bytes_per_token,pool_context_tokens FROM checkpoint_digests WHERE deployment_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(columns, (None, None));
+    // The same measurement from an upgraded host fills it in.
+    assert!(matches!(
+        measure(id, Some(basis(147_456, 8192)), 4).unwrap(),
+        RecordOutcome::Recorded { .. }
+    ));
+    assert_eq!(read(id), Some(basis(147_456, 8192)));
 }

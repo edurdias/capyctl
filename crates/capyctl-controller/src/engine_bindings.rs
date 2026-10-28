@@ -199,6 +199,9 @@ impl ProfileBindings {
             ),
             proc_root: PathBuf::from("/proc"),
             required: plan.required(),
+            // ADR 0034 §1: a parking residency's server serves engine-driven
+            // transfer (one GPU or several).
+            transfer: capyctl_config::lmcache::transfer_mode(effective.residency),
         }))))
     }
 

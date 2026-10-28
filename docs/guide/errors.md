@@ -195,11 +195,16 @@ default) then runs as without LMCache; one with `lmcache: required` is refused
 or its launch fails with `lmcache_unavailable:<reason>` (exit 5). The reasons:
 
 - `disabled`: the deployment states `lmcache: off`.
+- `host_kv_room`: the deployment's automatic pool found less than 1 GiB of
+  host-KV room left on the machine (the pools of the models already running
+  hold the rest of its `host_kv_limit`); the model runs without LMCache.
+  Raise `host_kv_limit`, or stop another model, and start it again.
 - `host_off`: the machine sets `lmcache: off`. Use another machine, or set it
   back to `auto` there.
 - `retention_zero`: the deployment or the machine sets `retention: zero`
   (`retention_zero:lmcache` under `required`).
-- `host_capability_missing`: the machine runs a CapyCTL too old for LMCache
+- `host_capability_missing`: the machine runs a CapyCTL too old for LMCache,
+  or, for a parking deployment, too old for engine-driven transfer
   (`host_capability_missing:lmcache` under `required`). Upgrade it.
 - `engine_unsupported`: llama.cpp, TensorFold or a custom engine, which have
   no LMCache integration. Use vLLM or SGLang. On SGLang, also a decision
@@ -220,12 +225,13 @@ or its launch fails with `lmcache_unavailable:<reason>` (exit 5). The reasons:
   environment and register the engine again.
 - `group_unsupported`: the deployment has a `topology` across machines; a
   group does not use LMCache.
-- `multi_gpu_unqualified`: the model runs on several GPUs of one machine;
-  LMCache is not yet qualified there. Under `topology: auto`, `lmcache:
-  required` keeps the model on one GPU instead.
+- `multi_gpu_unqualified`: the model runs on several GPUs of one machine
+  under `lmcache: auto`; LMCache is not yet certified there. With `lmcache:
+  required` it runs uncertified instead.
 - `park_unqualified`: the deployment parks with `residency: deep` (or
-  `host_backed` on a discrete GPU) on an engine version, model and GPU not
-  qualified for LMCache. Use `residency: restart_only` to keep LMCache.
+  `host_backed` on a discrete GPU) under `lmcache: auto` on an engine
+  version, model type and GPU outside the certified table. It keeps parking
+  without LMCache; with `lmcache: required` it runs LMCache uncertified.
 - `kv_transfer_config_set`: the deployment passes its own
   `--kv-transfer-config`; the engine takes one connector. Remove it to use
   LMCache.
@@ -242,23 +248,39 @@ The event `lmcache_server_exited` records that an instance's LMCache server
 exited while its engine served. The instance fails, CapyCTL stops its engine
 and recovers it with a new server, whose cache starts empty.
 
-LMCache settings a deployment or a machine cannot state are refused
-`invalid_config` (exit 2): an `lmcache_pool` that is not a whole number of GiB
-of at least 1 GiB or that sits beside `lmcache: off`; an LMCache
-`--kv-transfer-config`, `--enable-lmcache` or `--lmcache-*` in `extra_args`
-(CapyCTL renders these itself); on a machine, `retention: zero` with
-`engine_logs: files`, or an `lmcache` other than `auto` or `off`.
+The event `lmcache_pool_short` records, once per launch, an automatic pool
+that keeps fewer tokens than one full context of the model after LMCache's
+eviction, or that was shrunk to the host-KV room left; its detail is the
+warning `deploy` and status show, for example "the LMCache pool (12 GiB)
+keeps about 55,900 tokens after eviction; one full context of 65,536 tokens
+needs 15 GiB: raise host_kv_limit or set lmcache_pool". The model runs.
 
-A model whose `lmcache_pool` does not fit the machine's host-KV limit, with
-the pools of the models already running there, is not started: the start
-exits 4 (`insufficient_resources`) and the message says `host_kv`, what the
-model needs, what other models already hold there, the limit and the setting
-to raise, for example
+The event `lmcache_uncertified` records, once per launch, a deployment with
+`lmcache: required` that runs LMCache outside the certified table, or on
+several GPUs of one machine. It is a custom setup no live run has
+certified, not an error; status shows "LMCache on (uncertified: ...)" with
+a failure recorded for that combination, if any.
+
+LMCache settings a deployment or a machine cannot state are refused
+`invalid_config` (exit 2): an `lmcache_pool` that is neither `auto` nor a
+whole number of GiB of at least 1 GiB, or a stated size beside
+`lmcache: off`; an LMCache `--kv-transfer-config`, `--enable-lmcache` or
+`--lmcache-*` in `extra_args` (CapyCTL renders these itself); on a machine,
+`retention: zero` with `engine_logs: files`, or an `lmcache` other than
+`auto` or `off`.
+
+A model with a stated `lmcache_pool` that does not fit the machine's host-KV
+limit, with the pools of the models already running there, is not started:
+the start exits 4 (`insufficient_resources`) and the message says `host_kv`,
+what the model needs, what other models already hold there, the limit and the
+setting to raise, for example
 `host_kv (needs 20.0 GiB, limit 12.2 GiB; raise host.resource_policy.memory.system.host_kv_limit or lower lmcache_pool)`.
 On a machine of several it names that machine's
 `resource_policy.domains.<domain>.host_kv_limit` instead. A second copy of a
 model (`instances`) that waits for that room shows the same words in its
-`LAST ERROR`.
+`LAST ERROR`. An automatic pool (`lmcache_pool: auto`, the default) is never
+refused this way: it shrinks to the room left, or the model runs without
+LMCache (`host_kv_room`).
 
 ## Troubleshooting
 

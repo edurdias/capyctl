@@ -106,10 +106,13 @@ pub enum LmcacheOffReason {
     CheckFailed,
     /// The deployment has a `topology`.
     GroupUnsupported,
-    /// ADR 0035 §9: an instance on several GPUs of one host, until an LC row
-    /// qualifies it (ADR 0034 owns the rule).
+    /// ADR 0035 §9, ADR 0034 §6: an instance on several GPUs of one host
+    /// under `lmcache: auto`, until an LC row qualifies it; `lmcache:
+    /// required` runs it uncertified instead (§3a).
     MultiGpuUnqualified,
-    /// A parking residency on a combination not qualified for it.
+    /// ADR 0033 §7, ADR 0034 §3a: a parking residency under `lmcache: auto`
+    /// on a combination outside the qualified table; `lmcache: required`
+    /// runs it uncertified instead.
     ParkUnqualified,
     /// An approved non-LMCache `--kv-transfer-config` is in `extra_args`.
     KvTransferConfigSet,
@@ -123,10 +126,13 @@ pub enum LmcacheOffReason {
     ListenerExposed,
     /// The engine did not start with the connector.
     EngineStartFailed,
+    /// ADR 0034 §4 (owner decision 3): an automatic pool under `lmcache:
+    /// auto` found less than 1 GiB of host-KV room left on the host.
+    HostKvRoom,
 }
 
 impl LmcacheOffReason {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::Disabled,
         Self::HostOff,
         Self::EngineUnsupported,
@@ -144,6 +150,7 @@ impl LmcacheOffReason {
         Self::ServerStartFailed,
         Self::ListenerExposed,
         Self::EngineStartFailed,
+        Self::HostKvRoom,
     ];
 
     pub fn code(self) -> &'static str {
@@ -165,6 +172,7 @@ impl LmcacheOffReason {
             Self::ServerStartFailed => "server_start_failed",
             Self::ListenerExposed => "listener_exposed",
             Self::EngineStartFailed => "engine_start_failed",
+            Self::HostKvRoom => "host_kv_room",
         }
     }
 
@@ -217,6 +225,9 @@ impl LmcacheOffReason {
             Self::ServerStartFailed => "the LMCache server did not start",
             Self::ListenerExposed => "the LMCache server listened off loopback",
             Self::EngineStartFailed => "the engine did not start with LMCache",
+            Self::HostKvRoom => {
+                "less than 1 GiB of host-KV room is left on this host for the LMCache pool"
+            }
         }
     }
 }
@@ -234,6 +245,13 @@ pub const CAPABILITY: &str = "lmcache";
 /// deployment's `retention: zero`. `capyctl_protocol::capabilities::RETENTION`
 /// is this name.
 pub const RETENTION_CAPABILITY: &str = "retention";
+/// ADR 0034 §1 (ADR 0017): the host capability that says the host renders
+/// engine-driven transfer for a parking residency (and its launch-time
+/// check verifies it). A host without it predates ADR 0034: its own plan
+/// keeps a parking residency's LMCache off, so the store plans it off too
+/// (`host_capability_missing`). `capyctl_protocol::capabilities::LMCACHE_ENGINE_DRIVEN`
+/// is this name.
+pub const ENGINE_DRIVEN_CAPABILITY: &str = "lmcache_engine_driven";
 
 /// ADR 0033 §§9, 14: `lmcache: required` on a host whose `lmcache` is `off`.
 pub const REFUSED_HOST_OFF: &str = "lmcache_unavailable:host_off";
@@ -477,9 +495,406 @@ pub struct QualifiedParking {
     pub residency: &'static str,
 }
 
-/// ADR 0033 §7: the released table. It starts with the combinations LC4
-/// passes; nothing else is in it.
+/// ADR 0033 §7, ADR 0034 §§2, 3: the released table, the certified set: the
+/// combinations LC13–LC16 pass (`deep` on GB10, `host_backed` on the one
+/// qualified discrete GPU). Nothing else is in it; CPU and Fake-engine tests
+/// add no row.
 pub const QUALIFIED_PARKING: &[QualifiedParking] = &[];
+
+/// ADR 0034 §2: a combination a live row failed, with what failed. It stays
+/// out of [`QUALIFIED_PARKING`]; `lmcache: required` still runs it, and
+/// status names the failure beside "uncertified".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedFailure {
+    pub combination: QualifiedParking,
+    /// What failed, in one sentence (for example "LC14: a wrong answer
+    /// after the ninth wake").
+    pub failure: &'static str,
+}
+
+/// ADR 0034 §2: the failures the live rows recorded. None has run yet.
+pub const RECORDED_FAILURES: &[RecordedFailure] = &[];
+
+/// The failure [`RECORDED_FAILURES`] holds for this combination, if any.
+pub fn recorded_failure(
+    failures: &[RecordedFailure],
+    engine: &str,
+    engine_version: &str,
+    model_type: Option<&str>,
+    gpu: Option<&str>,
+    residency: &str,
+) -> Option<&'static str> {
+    failures
+        .iter()
+        .find(|recorded| {
+            parking_qualified_in(
+                std::slice::from_ref(&recorded.combination),
+                engine,
+                engine_version,
+                model_type,
+                gpu,
+                residency,
+            )
+        })
+        .map(|recorded| recorded.failure)
+}
+
+/// ADR 0034 §1: how a launch's KV travels between the engine and its
+/// LMCache server. A server serves exactly one mode (never `auto`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferMode {
+    /// LMCache 0.5.6's default: the server maps the engine's KV through CUDA
+    /// IPC and pulls and pushes it itself (ADR 0033 §3).
+    LmcacheDriven,
+    /// The engine's worker copies each chunk through host memory and sends
+    /// it (pickled over the request socket, no `--shm-name`); the server
+    /// maps no engine memory, so a sleep releases the engine's KV.
+    EngineDriven,
+}
+
+impl TransferMode {
+    /// The value LMCache's `--supported-transfer-mode` and the connectors'
+    /// `lmcache.mp.mp_transfer_mode` take.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::LmcacheDriven => "lmcache_driven",
+            Self::EngineDriven => "engine_driven",
+        }
+    }
+}
+
+/// ADR 0034 §1 (owner decision 5): what the live rows that move every
+/// LMCache launch to engine-driven transfer showed. Both must pass; until
+/// then, and for good if either fails, a `restart_only` launch keeps
+/// `lmcache_driven` transfer with A13's charge and A15's bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineDrivenRows {
+    /// LC16: engine-driven transfer's cost within §2's bounds.
+    pub lc16_passed: bool,
+    /// LC18: 15 restart-park cycles with engine-driven transfer, no held KV
+    /// and no stop by A15's bound.
+    pub lc18_passed: bool,
+}
+
+/// ADR 0034 §1: the released results of LC16 and LC18. Neither has run.
+pub const ENGINE_DRIVEN_ROWS: EngineDrivenRows = EngineDrivenRows {
+    lc16_passed: false,
+    lc18_passed: false,
+};
+
+/// ADR 0034 §1: the transfer mode of a launch with this residency, under
+/// the released [`ENGINE_DRIVEN_ROWS`].
+pub fn transfer_mode(residency: Residency) -> TransferMode {
+    transfer_mode_with(residency, ENGINE_DRIVEN_ROWS)
+}
+
+/// [`transfer_mode`] under `rows`: a parking residency (`deep`,
+/// `host_backed`) is always engine-driven, since the server's CUDA IPC
+/// mapping cannot follow a sleep's release and the wake's new allocation;
+/// every other launch moves to it only once LC16 and LC18 both pass.
+pub fn transfer_mode_with(residency: Residency, rows: EngineDrivenRows) -> TransferMode {
+    if residency.parks() || (rows.lc16_passed && rows.lc18_passed) {
+        TransferMode::EngineDriven
+    } else {
+        TransferMode::LmcacheDriven
+    }
+}
+
+/// ADR 0034 §4: the eviction LMCache 0.5.6 does by default, rendered so a
+/// later 0.5.x that changes its defaults does not change what the automatic
+/// pool assumes: evict once the pool is 80 % full, dropping 20 % of it.
+pub const EVICTION_TRIGGER_WATERMARK: &str = "0.8";
+pub const EVICTION_RATIO: &str = "0.2";
+
+/// ADR 0034 §4: U, the share of the pool sure to survive an eviction,
+/// 0.8 × (1 − 0.2) = 0.64, as the fraction 16/25.
+const SURVIVING_NUMERATOR: u128 = 16;
+const SURVIVING_DENOMINATOR: u128 = 25;
+
+/// ADR 0034 §4 (owner decision 2): N, the full contexts an automatic pool
+/// holds after eviction.
+pub const POOL_CONTEXTS: u64 = 1;
+
+/// ADR 0034 §4: the smallest pool, stated or shrunk to the room left.
+pub const MIN_POOL_GIB: u64 = 1;
+
+/// ADR 0034 §4: where a launch's pool size came from (JSON `pool_source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolSource {
+    /// One full context of the deployment's model after eviction.
+    Auto,
+    /// The deployment's `lmcache_pool`.
+    Stated,
+    /// 4 GiB: the model's KV bytes per token or its context is unknown.
+    Default,
+}
+
+impl PoolSource {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Stated => "stated",
+            Self::Default => "default",
+        }
+    }
+
+    pub fn parse(code: &str) -> Option<Self> {
+        [Self::Auto, Self::Stated, Self::Default]
+            .into_iter()
+            .find(|source| source.code() == code)
+    }
+}
+
+/// ADR 0034 §4: B and C, what an automatic pool is sized from: the context
+/// fit's KV bytes per token for the checkpoint (and its draft model), and
+/// the launch's context (declared, else fitted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolBasis {
+    pub bytes_per_token: u64,
+    pub context_tokens: u64,
+}
+
+impl PoolBasis {
+    /// One full context's KV, C × B.
+    pub fn context_bytes(&self) -> u128 {
+        u128::from(self.context_tokens) * u128::from(self.bytes_per_token)
+    }
+
+    /// ADR 0034 §4: the pool that keeps [`POOL_CONTEXTS`] full contexts after
+    /// an eviction, `ceil_GiB(N × C × B / U)`, before the 4 GiB floor.
+    pub fn needed_bytes(&self) -> u64 {
+        let bytes = (u128::from(POOL_CONTEXTS) * self.context_bytes() * SURVIVING_DENOMINATOR)
+            .div_ceil(SURVIVING_NUMERATOR);
+        let gib = bytes.div_ceil(u128::from(GIB));
+        u64::try_from(gib.saturating_mul(u128::from(GIB))).unwrap_or(u64::MAX)
+    }
+
+    /// The tokens a pool of `pool_bytes` keeps for sure after an eviction,
+    /// `pool × U / B`.
+    pub fn tokens_kept(&self, pool_bytes: u64) -> u64 {
+        let kept = u128::from(pool_bytes) * SURVIVING_NUMERATOR
+            / SURVIVING_DENOMINATOR
+            / u128::from(self.bytes_per_token.max(1));
+        u64::try_from(kept).unwrap_or(u64::MAX)
+    }
+}
+
+/// ADR 0034 §4: the cap on an automatic pool: the placed host's
+/// system-domain `host_kv_limit` less the host-KV bytes the deployment's own
+/// resources declare, rounded down to a whole GiB and at least 1 GiB. A host
+/// that declares no limit caps it at the 4 GiB floor: the pool grows past it
+/// only against a stated bound.
+pub fn pool_cap(host_kv_limit: Option<i64>, declared_host_kv_bytes: i64) -> u64 {
+    match host_kv_limit {
+        None => DEFAULT_POOL_GIB * GIB,
+        Some(limit) => {
+            floor_gib(limit.saturating_sub(declared_host_kv_bytes.max(0))).max(MIN_POOL_GIB * GIB)
+        }
+    }
+}
+
+/// `bytes` rounded down to a whole GiB, zero for none.
+fn floor_gib(bytes: i64) -> u64 {
+    let bytes = u64::try_from(bytes).unwrap_or(0);
+    bytes - bytes % GIB
+}
+
+/// ADR 0034 §4: one launch's pool and how it was sized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolSizing {
+    pub pool_bytes: u64,
+    pub source: PoolSource,
+    /// B and C, when known (an automatic pool's basis; a stated pool's too,
+    /// for the tokens it keeps).
+    pub basis: Option<PoolBasis>,
+    /// Why B or C is unknown, for a `default` pool.
+    pub unknown: Option<String>,
+    /// The pool before admission shrank it to the room left (owner decision
+    /// 3), when it did.
+    pub shrunk_from: Option<u64>,
+}
+
+impl PoolSizing {
+    /// The tokens the pool keeps for sure after an eviction (JSON
+    /// `pool_tokens`), when B is known.
+    pub fn tokens_kept(&self) -> Option<u64> {
+        self.basis.map(|basis| basis.tokens_kept(self.pool_bytes))
+    }
+
+    /// ADR 0034 §4: the warning `deploy`, status and the effective
+    /// configuration show, and `lmcache_pool_short` records, for an
+    /// automatic pool that keeps fewer tokens than one full context
+    /// (`pool × U < C × B`) or that admission shrank to the room left. A
+    /// stated pool is the operator's choice and carries none.
+    pub fn warning(&self) -> Option<String> {
+        if self.source == PoolSource::Stated {
+            return None;
+        }
+        let pool = gib_text(self.pool_bytes);
+        if let Some(basis) = self.basis.filter(|basis| {
+            u128::from(self.pool_bytes) * SURVIVING_NUMERATOR
+                < basis.context_bytes() * SURVIVING_DENOMINATOR
+        }) {
+            return Some(format!(
+                "the LMCache pool ({pool}) keeps about {} tokens after eviction; one full \
+                 context of {} tokens needs {}: raise host_kv_limit or set lmcache_pool",
+                about(basis.tokens_kept(self.pool_bytes)),
+                thousands(basis.context_tokens),
+                gib_text(basis.needed_bytes()),
+            ));
+        }
+        self.shrunk_from.map(|from| {
+            format!(
+                "the LMCache pool ({pool}) was reduced from {} to the host-KV room left on the \
+                 host: raise host_kv_limit or set lmcache_pool",
+                gib_text(from)
+            )
+        })
+    }
+
+    /// ADR 0034 §4 (owner decision 3): this automatic pool within `room`,
+    /// the host-KV bytes left on the host for it: unchanged when it fits,
+    /// else shrunk to the room in whole GiB, and `None` when less than
+    /// 1 GiB is left (the launch runs without LMCache, `host_kv_room`). A
+    /// stated pool is returned unchanged: its start waits or is refused.
+    pub fn within_room(&self, room: i64) -> Option<Self> {
+        if self.source == PoolSource::Stated || i128::from(self.pool_bytes) <= i128::from(room) {
+            return Some(self.clone());
+        }
+        let room = floor_gib(room);
+        (room >= MIN_POOL_GIB * GIB).then(|| Self {
+            pool_bytes: room,
+            shrunk_from: Some(self.shrunk_from.unwrap_or(self.pool_bytes)),
+            ..self.clone()
+        })
+    }
+
+    /// The basis status shows after the pool: `auto: one 32,768-token
+    /// context of qwen3 at 144 KiB per token`, `stated`, or `default: <why>`.
+    pub fn basis_text(&self, model_type: Option<&str>) -> String {
+        match (self.source, self.basis) {
+            (PoolSource::Auto, Some(basis)) => format!(
+                "auto: one {}-token context{} at {} per token",
+                thousands(basis.context_tokens),
+                model_type
+                    .map(|model_type| format!(" of {model_type}"))
+                    .unwrap_or_default(),
+                kib_text(basis.bytes_per_token),
+            ),
+            (PoolSource::Stated, _) => "stated".into(),
+            _ => format!(
+                "default: {}",
+                self.unknown
+                    .as_deref()
+                    .unwrap_or("the model's KV bytes per token or its context is unknown")
+            ),
+        }
+    }
+}
+
+/// ADR 0034 §4: a launch's pool from the deployment's `lmcache_pool`
+/// (`stated`, used as given), else automatic from `basis` within `cap`:
+/// `min(max(4 GiB, ceil_GiB(N × C × B / U)), cap)`; an unknown basis gives
+/// the 4 GiB default, within `cap` too, so an `auto` deployment is never
+/// refused for a pool its host cannot hold.
+pub fn size_pool(stated: Option<u64>, basis: Result<PoolBasis, String>, cap: u64) -> PoolSizing {
+    let floor = DEFAULT_POOL_GIB * GIB;
+    let cap = cap.max(MIN_POOL_GIB * GIB);
+    match (stated, basis) {
+        (Some(pool_bytes), basis) => PoolSizing {
+            pool_bytes,
+            source: PoolSource::Stated,
+            basis: basis.ok(),
+            unknown: None,
+            shrunk_from: None,
+        },
+        (None, Ok(basis)) if basis.bytes_per_token > 0 && basis.context_tokens > 0 => PoolSizing {
+            pool_bytes: basis.needed_bytes().max(floor).min(cap),
+            source: PoolSource::Auto,
+            basis: Some(basis),
+            unknown: None,
+            shrunk_from: None,
+        },
+        (None, basis) => PoolSizing {
+            pool_bytes: floor.min(cap),
+            source: PoolSource::Default,
+            basis: None,
+            unknown: Some(match basis {
+                Err(why) => why,
+                Ok(_) => "the model's KV bytes per token or its context is zero".into(),
+            }),
+            shrunk_from: None,
+        },
+    }
+}
+
+/// ADR 0034 §4: B and C for `effective` on the machine that reads its
+/// checkpoint (the embedded host's store, or the remote host that reports
+/// them with its checkpoint sizing): the context fit's KV bytes per token
+/// and the launch's context, declared or fitted. A context the fit could not
+/// compute (a fallback, or one the installation fixes) is unknown.
+pub fn pool_basis_for_effective(
+    effective: &crate::effective::EffectiveDeployment,
+) -> Result<PoolBasis, String> {
+    use crate::context_fit::ContextSource;
+    let fit = crate::context_fit::fit_for_effective(effective);
+    let context_tokens = match (fit.source, fit.tokens) {
+        (ContextSource::Declared | ContextSource::Fitted, Some(tokens)) => u64::from(tokens),
+        _ => {
+            return Err(match fit.reason {
+                Some(reason) => format!("the context is unknown: {reason}"),
+                None => "the context is unknown".into(),
+            })
+        }
+    };
+    let bytes_per_token = crate::context_fit::bytes_per_token_for_effective(effective)?;
+    Ok(PoolBasis {
+        bytes_per_token,
+        context_tokens,
+    })
+}
+
+/// `bytes` as whole GiB (`12 GiB`), or GiB to one decimal.
+fn gib_text(bytes: u64) -> String {
+    if bytes.is_multiple_of(GIB) {
+        format!("{} GiB", bytes / GIB)
+    } else {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    }
+}
+
+/// `bytes` as KiB (`144 KiB`), to one decimal when not whole.
+fn kib_text(bytes: u64) -> String {
+    if bytes.is_multiple_of(1024) {
+        format!("{} KiB", bytes / 1024)
+    } else {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    }
+}
+
+/// `n` with thousands separators (`32,768`).
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// `n` to the nearest hundred, with separators (`about 55,900`), exact
+/// below a thousand.
+fn about(n: u64) -> String {
+    if n < 1000 {
+        return n.to_string();
+    }
+    thousands((n + 50) / 100 * 100)
+}
 
 /// Whether a parking residency may use LMCache on this combination.
 pub fn parking_qualified(
@@ -638,15 +1053,21 @@ impl LmcacheRegistration {
     }
 }
 
-/// ADR 0033 §6: a deployment's `lmcache_pool`, in bytes: a size in the
-/// configuration's byte syntax that is a whole number of GiB, at least 1 GiB.
-pub fn parse_pool(text: &str) -> Result<u64, &'static str> {
-    const REFUSAL: &str =
-        "lmcache_pool must be a whole number of GiB, at least 1GiB (for example `8GiB`)";
+/// ADR 0033 §6, ADR 0034 §4: a deployment's `lmcache_pool`: `auto` (the
+/// default, `None`: sized from the model and its context), or a stated size
+/// in bytes, in the configuration's byte syntax and a whole number of GiB,
+/// at least 1 GiB. Anything else is `invalid_config`.
+pub fn parse_pool(text: &str) -> Result<Option<u64>, &'static str> {
+    const REFUSAL: &str = "lmcache_pool must be `auto` or a whole number of GiB, at least 1GiB \
+                           (for example `8GiB`)";
+    if text.trim() == "auto" {
+        return Ok(None);
+    }
     let bytes = crate::effective::parse_bytes(text).map_err(|_| REFUSAL)?;
     u64::try_from(bytes)
         .ok()
         .filter(|bytes| *bytes >= GIB && bytes % GIB == 0)
+        .map(Some)
         .ok_or(REFUSAL)
 }
 
@@ -767,6 +1188,8 @@ pub struct PlanInputs<'a> {
     /// and the `retention` one.
     pub host_declares_lmcache: bool,
     pub host_declares_retention: bool,
+    /// ADR 0034 §1: whether the host declared [`ENGINE_DRIVEN_CAPABILITY`].
+    pub host_declares_engine_driven: bool,
     pub engine: Engine,
     /// The registered build (`build_fingerprint`), the engine's version.
     pub engine_version: &'a str,
@@ -814,6 +1237,7 @@ impl<'a> PlanInputs<'a> {
             host_retention: Retention::Standard,
             host_declares_lmcache: true,
             host_declares_retention: true,
+            host_declares_engine_driven: true,
             engine,
             engine_version,
             api: DeploymentApi::Chat,
@@ -835,7 +1259,8 @@ impl<'a> PlanInputs<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LmcachePlan {
     pub mode: LmcacheMode,
-    /// The pool in bytes: declared, else 4 GiB.
+    /// The pool in bytes: stated, else 4 GiB until the caller sizes it
+    /// ([`size_pool`], ADR 0034 §4).
     pub pool_bytes: u64,
     /// ADR 0033 §10: the host's or the deployment's `retention: zero`
     /// (engine output in memory, `RLIMIT_CORE` 0, LMCache never started).
@@ -846,6 +1271,31 @@ pub struct LmcachePlan {
     /// honour it.
     pub retention_unhonoured: bool,
     pub discrete_gpu: bool,
+    /// ADR 0034 §3a, §6: on, under `lmcache: required`, outside the
+    /// certified set.
+    pub uncertified: Option<Uncertified>,
+    /// ADR 0034 §1: how the launch's KV travels to and from the server.
+    pub transfer: TransferMode,
+}
+
+/// ADR 0034 §3a, §6 (owner rule of 2026-10-27): why a launch under `lmcache:
+/// required` runs LMCache as an uncertified setup rather than being refused:
+/// its parking combination is outside the qualified table
+/// (`park_unqualified`), or its model runs on several GPUs of one host
+/// (`multi_gpu_unqualified`). It runs with the rendering a certified row
+/// gets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Uncertified {
+    pub reasons: Vec<LmcacheOffReason>,
+    /// What status shows after "uncertified: ", a recorded failure included.
+    pub detail: String,
+}
+
+impl Uncertified {
+    /// The status text: `LMCache on (uncertified: <detail>)`.
+    pub fn message(&self) -> String {
+        format!("LMCache on (uncertified: {})", self.detail)
+    }
 }
 
 /// ADR 0033 §6: what an instance using LMCache reserves beside its engine.
@@ -1103,8 +1553,9 @@ pub fn apply_charge<F: ChargeFootprints + ?Sized>(
     }
 }
 
-/// ADR 0033 §§2, 7–11, 13, contract decision 2: whether LMCache runs for this
-/// deployment on this host, against the released qualified table.
+/// ADR 0033 §§2, 7–11, 13, contract decision 2, ADR 0034 §§1, 3a, 6:
+/// whether LMCache runs for this deployment on this host, against the
+/// released qualified table.
 pub fn plan(inputs: &PlanInputs<'_>) -> LmcachePlan {
     plan_with_table(inputs, QUALIFIED_PARKING)
 }
@@ -1113,64 +1564,97 @@ pub fn plan(inputs: &PlanInputs<'_>) -> LmcachePlan {
 pub fn plan_with_table(inputs: &PlanInputs<'_>, table: &[QualifiedParking]) -> LmcachePlan {
     let retention_zero =
         inputs.retention == Retention::Zero || inputs.host_retention == Retention::Zero;
+    let (state, uncertified) = match decide(inputs, table) {
+        Ok(uncertified) => (LmcacheState::On, uncertified),
+        Err(off) => (LmcacheState::Off(off), None),
+    };
     LmcachePlan {
         mode: inputs.mode,
         pool_bytes: inputs.pool_bytes.unwrap_or(DEFAULT_POOL_GIB * GIB),
         retention_zero,
-        state: match off_reason(inputs, table) {
-            Some(off) => LmcacheState::Off(off),
-            None => LmcacheState::On,
-        },
+        state,
         retention_unhonoured: inputs.retention == Retention::Zero
             && !inputs.host_declares_retention,
         discrete_gpu: inputs.discrete_gpu,
+        uncertified,
+        transfer: transfer_mode(inputs.residency),
     }
 }
 
 /// The first applicable reason, in contract decision 2's order.
 fn off_reason(inputs: &PlanInputs<'_>, table: &[QualifiedParking]) -> Option<LmcacheOff> {
+    decide(inputs, table).err()
+}
+
+/// Contract decision 2's order: the first reason LMCache is off, or, when
+/// it is on, whether it runs uncertified. ADR 0034 §3a, §6 (owner rule of
+/// 2026-10-27): under `lmcache: required`, a model on several GPUs and a
+/// parking combination outside `table` are no reasons to be off: the launch
+/// runs as an uncertified setup, unless a later reason (the deployment's
+/// own `--kv-transfer-config`, the registration, a sticky fallback) keeps it
+/// off. Under `auto` they keep LMCache off, as before.
+fn decide(
+    inputs: &PlanInputs<'_>,
+    table: &[QualifiedParking],
+) -> Result<Option<Uncertified>, LmcacheOff> {
     use LmcacheOffReason as R;
+    let required = inputs.mode == LmcacheMode::Required;
+    let mut uncertified: Vec<(LmcacheOffReason, String)> = Vec::new();
     if inputs.mode == LmcacheMode::Off {
-        return Some(LmcacheOff::new(R::Disabled));
+        return Err(LmcacheOff::new(R::Disabled));
     }
     if inputs.host_retention == Retention::Zero {
-        return Some(LmcacheOff::with_detail(
+        return Err(LmcacheOff::with_detail(
             R::RetentionZero,
             "zero data retention on this host",
         ));
     }
     if inputs.retention == Retention::Zero {
-        return Some(LmcacheOff::with_detail(
+        return Err(LmcacheOff::with_detail(
             R::RetentionZero,
             "the deployment keeps zero data retention",
         ));
     }
     if inputs.host_lmcache == HostLmcache::Off {
-        return Some(LmcacheOff::new(R::HostOff));
+        return Err(LmcacheOff::new(R::HostOff));
     }
     if !inputs.host_declares_lmcache {
-        return Some(LmcacheOff::new(R::HostCapabilityMissing));
+        return Err(LmcacheOff::new(R::HostCapabilityMissing));
+    }
+    // ADR 0034 §1: a parking residency's LMCache is engine-driven, which a
+    // host from before ADR 0034 does not render.
+    if inputs.residency.parks() && !inputs.host_declares_engine_driven {
+        return Err(LmcacheOff::with_detail(
+            R::HostCapabilityMissing,
+            "the host predates engine-driven transfer, which a parking residency needs",
+        ));
     }
     if let Some(off) = engine_gate(inputs.engine, inputs.engine_version) {
-        return Some(off);
+        return Err(off);
     }
     if let Some(off) = sglang_radix_gate(inputs) {
-        return Some(off);
+        return Err(off);
     }
     if inputs.topology {
-        return Some(LmcacheOff::new(R::GroupUnsupported));
+        return Err(LmcacheOff::new(R::GroupUnsupported));
     }
     if inputs.multi_gpu {
-        return Some(LmcacheOff::new(R::MultiGpuUnqualified));
+        if !required {
+            return Err(LmcacheOff::new(R::MultiGpuUnqualified));
+        }
+        uncertified.push((
+            R::MultiGpuUnqualified,
+            "a model on several GPUs of one host is not qualified".into(),
+        ));
     }
     if inputs.kv_transfer_config_set {
-        return Some(LmcacheOff::new(R::KvTransferConfigSet));
+        return Err(LmcacheOff::new(R::KvTransferConfigSet));
     }
     let Some(registration) = inputs.registration else {
-        return Some(LmcacheOff::new(R::NotInstalled));
+        return Err(LmcacheOff::new(R::NotInstalled));
     };
     if !lmcache_version_supported(&registration.version) {
-        return Some(LmcacheOff::with_detail(
+        return Err(LmcacheOff::with_detail(
             R::VersionUnsupported,
             format!(
                 "LMCache {} is registered; LMCache 0.5.6 or a later 0.5.x release is needed",
@@ -1178,6 +1662,7 @@ fn off_reason(inputs: &PlanInputs<'_>, table: &[QualifiedParking]) -> Option<Lmc
             ),
         ));
     }
+    let residency = residency_name(inputs.residency);
     if inputs.residency.parks()
         && !parking_qualified_in(
             table,
@@ -1185,37 +1670,56 @@ fn off_reason(inputs: &PlanInputs<'_>, table: &[QualifiedParking]) -> Option<Lmc
             inputs.engine_version,
             inputs.model_type,
             inputs.gpu,
-            residency_name(inputs.residency),
+            residency,
         )
     {
-        return Some(LmcacheOff::with_detail(
-            R::ParkUnqualified,
-            format!(
-                "not qualified with {} park on {} {} / {} / {}",
-                match inputs.residency {
-                    Residency::HostBacked => "host_backed",
-                    _ => "deep",
-                },
-                engine_display(inputs.engine),
-                inputs.engine_version,
-                inputs.model_type.unwrap_or("an unknown model type"),
-                inputs.gpu.unwrap_or("an unknown GPU"),
-            ),
-        ));
+        let combination = format!(
+            "{} {} / {} / {}",
+            engine_display(inputs.engine),
+            inputs.engine_version,
+            inputs.model_type.unwrap_or("an unknown model type"),
+            inputs.gpu.unwrap_or("an unknown GPU"),
+        );
+        if !required {
+            return Err(LmcacheOff::with_detail(
+                R::ParkUnqualified,
+                format!("not qualified with {residency} park on {combination}"),
+            ));
+        }
+        let mut detail = format!("{combination} / {residency} is not in the qualified table");
+        if let Some(failure) = recorded_failure(
+            RECORDED_FAILURES,
+            inputs.engine.name(),
+            inputs.engine_version,
+            inputs.model_type,
+            inputs.gpu,
+            residency,
+        ) {
+            detail.push_str(&format!("; its live qualification failed: {failure}"));
+        }
+        uncertified.push((R::ParkUnqualified, detail));
     }
     if inputs.engine_start_failed {
-        return Some(LmcacheOff::new(R::EngineStartFailed));
+        return Err(LmcacheOff::new(R::EngineStartFailed));
     }
-    None
+    Ok((!uncertified.is_empty()).then(|| Uncertified {
+        reasons: uncertified.iter().map(|(reason, _)| *reason).collect(),
+        detail: uncertified
+            .into_iter()
+            .map(|(_, detail)| detail)
+            .collect::<Vec<_>>()
+            .join("; "),
+    }))
 }
 
 /// ADR 0033 §9, §14: the refusal of a `lmcache: required` deployment that
 /// its declaration and its profile alone decide, so resolution gives it
 /// before any host is asked: the engine, its version, a topology, a
-/// `--kv-transfer-config`, the registration, and a parking residency no row
-/// of `table` qualifies on this engine version for any model or GPU. The
-/// host's settings and capabilities, the model type and the GPU are
-/// placement's; `inputs`' host fields are ignored.
+/// `--kv-transfer-config` and the registration. ADR 0034 §3a, §6: a parking
+/// residency outside `table` and a model on several GPUs are never refused
+/// (they run uncertified), so `topology: auto` no longer narrows to N = 1
+/// for `lmcache: required`. The host's settings and capabilities, the model
+/// type and the GPU are placement's; `inputs`' host fields are ignored.
 pub fn deployment_refusal(inputs: &PlanInputs<'_>, table: &[QualifiedParking]) -> Option<String> {
     use LmcacheOffReason as R;
     if inputs.mode != LmcacheMode::Required {
@@ -1226,25 +1730,20 @@ pub fn deployment_refusal(inputs: &PlanInputs<'_>, table: &[QualifiedParking]) -
         host_retention: Retention::Standard,
         host_declares_lmcache: true,
         host_declares_retention: true,
+        host_declares_engine_driven: true,
         engine_start_failed: false,
         ..*inputs
     };
     let off = off_reason(&neutral, table)?;
-    let known = match off.reason {
+    let known = matches!(
+        off.reason,
         R::EngineUnsupported
-        | R::EngineVersionUnsupported
-        | R::GroupUnsupported
-        | R::MultiGpuUnqualified
-        | R::KvTransferConfigSet
-        | R::NotInstalled
-        | R::VersionUnsupported => true,
-        R::ParkUnqualified => !table.iter().any(|row| {
-            row.engine == inputs.engine.name()
-                && row.engine_version == inputs.engine_version
-                && row.residency == residency_name(inputs.residency)
-        }),
-        _ => false,
-    };
+            | R::EngineVersionUnsupported
+            | R::GroupUnsupported
+            | R::KvTransferConfigSet
+            | R::NotInstalled
+            | R::VersionUnsupported
+    );
     known.then(|| format!("{}: {}", off.reason.required_refusal(), off.detail))
 }
 
@@ -1849,9 +2348,10 @@ mod tests {
             (
                 PlanInputs {
                     residency: Residency::Deep,
+                    host_lmcache: HostLmcache::Off,
                     ..required
                 },
-                "lmcache_unavailable:park_unqualified",
+                "lmcache_unavailable:host_off",
             ),
             (
                 PlanInputs {
@@ -1948,27 +2448,379 @@ mod tests {
                 },
                 "lmcache_unavailable:not_installed",
             ),
-            (
-                PlanInputs {
-                    residency: Residency::Deep,
-                    ..required
-                },
-                "lmcache_unavailable:park_unqualified",
-            ),
         ] {
             assert_eq!(code(inputs, &[]).as_deref(), Some(expected));
         }
-        let deep = PlanInputs {
-            residency: Residency::Deep,
-            ..required
-        };
-        assert_eq!(code(deep, &[QWEN_ON_GB10]), None, "a GPU may qualify it");
+        // T45 (ADR 0034 §3a, §6): neither a parking residency outside the
+        // table nor a model on several GPUs is refused.
+        for uncertified in [
+            PlanInputs {
+                residency: Residency::Deep,
+                ..required
+            },
+            PlanInputs {
+                residency: Residency::HostBacked,
+                ..required
+            },
+            PlanInputs {
+                multi_gpu: true,
+                ..required
+            },
+        ] {
+            assert_eq!(deployment_refusal(&uncertified, &[]), None);
+        }
         let auto = PlanInputs {
             mode: LmcacheMode::Auto,
             registration: None,
             ..required
         };
         assert_eq!(deployment_refusal(&auto, &[]), None);
+    }
+
+    // T45 (ADR 0034 §3a, §6, owner rule of 2026-10-27): under `required`, a
+    // parking combination outside the table and a model on several GPUs run
+    // LMCache as an uncertified setup with the certified rendering
+    // (engine-driven for a park); under `auto` both stay off with their
+    // reasons; a listed combination runs certified; a later reason still
+    // keeps `required` off; the safety and installation refusals stay.
+    #[test]
+    fn required_outside_the_table_runs_uncertified() {
+        let registration = registered();
+        let deep = PlanInputs {
+            mode: LmcacheMode::Required,
+            residency: Residency::Deep,
+            model_type: Some("qwen3"),
+            gpu: Some("NVIDIA GB10"),
+            ..on(&registration)
+        };
+        let planned = plan_with_table(&deep, &[]);
+        assert!(planned.is_on());
+        assert_eq!(planned.refusal(), None);
+        assert_eq!(planned.transfer, TransferMode::EngineDriven);
+        let uncertified = planned.uncertified.clone().unwrap();
+        assert_eq!(uncertified.reasons, [LmcacheOffReason::ParkUnqualified]);
+        assert_eq!(
+            uncertified.message(),
+            "LMCache on (uncertified: vLLM 0.32.0 / qwen3 / NVIDIA GB10 / deep is not in the \
+             qualified table)"
+        );
+        // The same launch, listed, is certified and rendered the same way.
+        let listed = plan_with_table(&deep, &[QWEN_ON_GB10]);
+        assert!(listed.is_on());
+        assert_eq!(listed.uncertified, None);
+        assert_eq!(listed.transfer, planned.transfer);
+        // Several GPUs under `required`, on a parking residency too.
+        let multi = plan_with_table(
+            &PlanInputs {
+                multi_gpu: true,
+                ..deep
+            },
+            &[],
+        );
+        assert!(multi.is_on());
+        assert_eq!(
+            multi.uncertified.unwrap().reasons,
+            [
+                LmcacheOffReason::MultiGpuUnqualified,
+                LmcacheOffReason::ParkUnqualified
+            ]
+        );
+        let multi_restart = plan(&PlanInputs {
+            multi_gpu: true,
+            residency: Residency::RestartOnly,
+            ..deep
+        });
+        assert_eq!(
+            multi_restart.uncertified.unwrap().detail,
+            "a model on several GPUs of one host is not qualified"
+        );
+        // `auto` keeps both off with their reasons.
+        let auto = PlanInputs {
+            mode: LmcacheMode::Auto,
+            ..deep
+        };
+        assert_eq!(reason(&auto), Some(LmcacheOffReason::ParkUnqualified));
+        assert_eq!(
+            reason(&PlanInputs {
+                multi_gpu: true,
+                ..auto
+            }),
+            Some(LmcacheOffReason::MultiGpuUnqualified)
+        );
+        // A later reason, and the refusals that describe the installation or
+        // a safety setting, still apply to `required`.
+        for (inputs, code) in [
+            (
+                PlanInputs {
+                    kv_transfer_config_set: true,
+                    ..deep
+                },
+                "lmcache_unavailable:kv_transfer_config_set",
+            ),
+            (
+                PlanInputs {
+                    registration: None,
+                    ..deep
+                },
+                "lmcache_unavailable:not_installed",
+            ),
+            (
+                PlanInputs {
+                    host_lmcache: HostLmcache::Off,
+                    ..deep
+                },
+                "lmcache_unavailable:host_off",
+            ),
+            (
+                PlanInputs {
+                    retention: Retention::Zero,
+                    ..deep
+                },
+                "retention_zero:lmcache",
+            ),
+            (
+                PlanInputs {
+                    topology: true,
+                    ..deep
+                },
+                "lmcache_unavailable:group_unsupported",
+            ),
+        ] {
+            assert_eq!(plan(&inputs).refusal().as_deref(), Some(code));
+        }
+        let sticky = plan(&PlanInputs {
+            engine_start_failed: true,
+            ..deep
+        });
+        assert_eq!(
+            sticky.off().map(|off| off.reason),
+            Some(LmcacheOffReason::EngineStartFailed)
+        );
+    }
+
+    // T45 (ADR 0034 §1): a host that does not declare engine-driven
+    // transfer keeps a parking residency's LMCache off (and `required` is
+    // refused for it), while a restart_only launch there is unaffected.
+    #[test]
+    fn a_parking_residency_needs_a_host_with_engine_driven_transfer() {
+        let registration = registered();
+        let deep = PlanInputs {
+            residency: Residency::Deep,
+            model_type: Some("qwen3"),
+            gpu: Some("NVIDIA GB10"),
+            host_declares_engine_driven: false,
+            ..on(&registration)
+        };
+        let planned = plan_with_table(&deep, &[QWEN_ON_GB10]);
+        assert_eq!(
+            planned.off().map(|off| off.reason),
+            Some(LmcacheOffReason::HostCapabilityMissing)
+        );
+        let required = plan_with_table(
+            &PlanInputs {
+                mode: LmcacheMode::Required,
+                ..deep
+            },
+            &[QWEN_ON_GB10],
+        );
+        assert_eq!(
+            required.refusal().as_deref(),
+            Some("host_capability_missing:lmcache")
+        );
+        assert!(plan(&PlanInputs {
+            residency: Residency::RestartOnly,
+            ..deep
+        })
+        .is_on());
+    }
+
+    // T45 (ADR 0034 §2): a recorded failure is found for its combination
+    // only, and the released list is empty (no live row has run).
+    #[test]
+    fn recorded_failures_name_their_combination() {
+        let failures = [RecordedFailure {
+            combination: QWEN_ON_GB10,
+            failure: "LC14: a wrong answer after the ninth wake",
+        }];
+        let find = |model_type| {
+            recorded_failure(
+                &failures,
+                "vllm",
+                "0.32.0",
+                Some(model_type),
+                Some("NVIDIA GB10"),
+                "deep",
+            )
+        };
+        assert_eq!(
+            find("qwen3"),
+            Some("LC14: a wrong answer after the ninth wake")
+        );
+        assert_eq!(find("llama"), None);
+        assert!(RECORDED_FAILURES.is_empty());
+    }
+
+    // T45 (ADR 0034 §1, owner decision 5): a parking residency is
+    // engine-driven; `restart_only` stays LMCache-driven until LC16 and LC18
+    // both pass, and the released rows have passed neither.
+    #[test]
+    fn the_transfer_mode_follows_the_residency_and_the_rows() {
+        assert_eq!(
+            ENGINE_DRIVEN_ROWS,
+            EngineDrivenRows {
+                lc16_passed: false,
+                lc18_passed: false,
+            }
+        );
+        assert_eq!(transfer_mode(Residency::Deep), TransferMode::EngineDriven);
+        assert_eq!(
+            transfer_mode(Residency::HostBacked),
+            TransferMode::EngineDriven
+        );
+        assert_eq!(
+            transfer_mode(Residency::RestartOnly),
+            TransferMode::LmcacheDriven
+        );
+        for (lc16_passed, lc18_passed, restart) in [
+            (true, false, TransferMode::LmcacheDriven),
+            (false, true, TransferMode::LmcacheDriven),
+            (true, true, TransferMode::EngineDriven),
+        ] {
+            let rows = EngineDrivenRows {
+                lc16_passed,
+                lc18_passed,
+            };
+            assert_eq!(transfer_mode_with(Residency::RestartOnly, rows), restart);
+            assert_eq!(
+                transfer_mode_with(Residency::Deep, rows),
+                TransferMode::EngineDriven
+            );
+        }
+        assert_eq!(TransferMode::EngineDriven.code(), "engine_driven");
+        assert_eq!(TransferMode::LmcacheDriven.code(), "lmcache_driven");
+    }
+
+    const QWEN3_4B: u64 = 147_456; // 2 × 36 layers × 8 KV heads × 128 × 2 bytes
+    const QWEN3_32B: u64 = 262_144; // 2 × 64 × 8 × 128 × 2
+
+    fn basis(bytes_per_token: u64, context_tokens: u64) -> Result<PoolBasis, String> {
+        Ok(PoolBasis {
+            bytes_per_token,
+            context_tokens,
+        })
+    }
+
+    // T45 (ADR 0034 §4): the table of examples, GB10 standalone with the
+    // cap of 12 GiB from the derived 12.17 GiB: the pool, the tokens it
+    // keeps after eviction and the warning.
+    #[test]
+    fn the_automatic_pool_follows_the_table_of_examples() {
+        let limit = (12.17 * GIB as f64) as i64;
+        let cap = pool_cap(Some(limit), 0);
+        assert_eq!(cap, 12 * GIB);
+        for (bytes_per_token, context, pool_gib, kept, warned) in [
+            (QWEN3_4B, 8_192, 4, 18_641, false),
+            (QWEN3_4B, 32_768, 8, 37_282, false),
+            (QWEN3_4B, 65_536, 12, 55_924, true),
+            (QWEN3_32B, 32_768, 12, 31_457, true),
+        ] {
+            let sizing = size_pool(None, basis(bytes_per_token, context), cap);
+            assert_eq!(sizing.source, PoolSource::Auto);
+            assert_eq!(sizing.pool_bytes, pool_gib * GIB, "{context}");
+            assert_eq!(sizing.tokens_kept(), Some(kept), "{context}");
+            assert_eq!(sizing.warning().is_some(), warned, "{context}");
+        }
+        let short = size_pool(None, basis(QWEN3_4B, 65_536), cap);
+        assert_eq!(
+            short.warning().unwrap(),
+            "the LMCache pool (12 GiB) keeps about 55,900 tokens after eviction; one full \
+             context of 65,536 tokens needs 15 GiB: raise host_kv_limit or set lmcache_pool"
+        );
+        assert_eq!(
+            size_pool(None, basis(QWEN3_32B, 32_768), cap)
+                .basis
+                .unwrap()
+                .needed_bytes(),
+            13 * GIB
+        );
+        assert_eq!(
+            size_pool(None, basis(QWEN3_4B, 32_768), cap).basis_text(Some("qwen3")),
+            "auto: one 32,768-token context of qwen3 at 144 KiB per token"
+        );
+        // Raised to 24 GiB, the 65,536-token context gets its full pool.
+        let raised = size_pool(None, basis(QWEN3_4B, 65_536), pool_cap(Some(24 << 30), 0));
+        assert_eq!(raised.pool_bytes, 15 * GIB);
+        assert_eq!(raised.warning(), None);
+    }
+
+    // T45 (ADR 0034 §4): the cap is the limit less the deployment's own
+    // host-KV bytes, a whole GiB and at least 1 GiB; no limit caps at the
+    // 4 GiB floor; a host whose limit is below 4 GiB gets a smaller pool
+    // with the warning instead of a refusal; an unknown basis is the 4 GiB
+    // default within the cap; a stated pool is used as given, unwarned.
+    #[test]
+    fn the_cap_and_the_default() {
+        assert_eq!(pool_cap(None, 0), 4 * GIB);
+        assert_eq!(pool_cap(Some(10 << 30), 3 << 30), 7 * GIB);
+        assert_eq!(pool_cap(Some((7 << 30) + 1), 0), 7 * GIB);
+        assert_eq!(pool_cap(Some(1 << 29), 0), GIB);
+        assert_eq!(pool_cap(Some(2 << 30), 4 << 30), GIB);
+        // A 32 GiB machine: 10 % is 3.2 GiB, so a 3 GiB cap.
+        let small = size_pool(
+            None,
+            basis(QWEN3_4B, 8_192),
+            pool_cap(Some((3.2 * GIB as f64) as i64), 0),
+        );
+        assert_eq!(small.pool_bytes, 3 * GIB);
+        assert_eq!(small.warning(), None, "3 GiB still keeps one 8k context");
+        let tight = size_pool(None, basis(QWEN3_4B, 32_768), 3 * GIB);
+        assert_eq!(tight.pool_bytes, 3 * GIB);
+        assert!(tight.warning().is_some());
+        let unknown = size_pool(None, Err("the context is unknown".into()), 12 * GIB);
+        assert_eq!(unknown.source, PoolSource::Default);
+        assert_eq!(unknown.pool_bytes, 4 * GIB);
+        assert_eq!(unknown.tokens_kept(), None);
+        assert_eq!(unknown.basis_text(None), "default: the context is unknown");
+        assert_eq!(
+            size_pool(None, Err("unknown".into()), 2 * GIB).pool_bytes,
+            2 * GIB
+        );
+        let stated = size_pool(Some(2 * GIB), basis(QWEN3_4B, 65_536), 12 * GIB);
+        assert_eq!(stated.source, PoolSource::Stated);
+        assert_eq!(stated.pool_bytes, 2 * GIB);
+        assert_eq!(stated.warning(), None);
+        assert_eq!(stated.basis_text(None), "stated");
+        assert_eq!(stated.tokens_kept(), Some(9_320));
+    }
+
+    // T45 (ADR 0034 §4, owner decision 3): an automatic pool that does not
+    // fit the room left shrinks to it in whole GiB with the warning; with
+    // less than 1 GiB left the launch runs without LMCache; a stated pool
+    // is left to admission.
+    #[test]
+    fn an_automatic_pool_shrinks_to_the_room_left() {
+        let pool = size_pool(None, basis(QWEN3_4B, 32_768), 12 * GIB);
+        assert_eq!(pool.within_room(9 << 30), Some(pool.clone()));
+        let shrunk = pool.within_room((3 << 30) + (1 << 29)).unwrap();
+        assert_eq!(shrunk.pool_bytes, 3 * GIB);
+        assert_eq!(shrunk.shrunk_from, Some(8 * GIB));
+        assert!(shrunk.warning().unwrap().contains("(3 GiB)"));
+        assert_eq!(pool.within_room((1 << 30) - 1), None);
+        assert_eq!(pool.within_room(-5), None);
+        // Shrunk but still holding one context: the warning says why.
+        let small = size_pool(None, basis(QWEN3_4B, 8_192), 12 * GIB)
+            .within_room(2 << 30)
+            .unwrap();
+        assert_eq!(
+            small.warning().unwrap(),
+            "the LMCache pool (2 GiB) was reduced from 4 GiB to the host-KV room left on the \
+             host: raise host_kv_limit or set lmcache_pool"
+        );
+        let stated = size_pool(Some(8 * GIB), Err("unknown".into()), 12 * GIB);
+        assert_eq!(stated.within_room(0), Some(stated.clone()));
+        assert_eq!(PoolSource::parse("auto"), Some(PoolSource::Auto));
+        assert_eq!(PoolSource::parse("stated"), Some(PoolSource::Stated));
+        assert_eq!(PoolSource::parse("default"), Some(PoolSource::Default));
     }
 
     // T45 T25 (ADR 0033 §6, A1): the charge is the pool plus the overhead
@@ -2251,14 +3103,16 @@ mod tests {
         assert_eq!(find(&no_device.parked, "gpu0"), None);
     }
 
-    // T45 (ADR 0033 §6): the pool is a whole number of GiB, at least 1 GiB.
+    // T45 (ADR 0033 §6, ADR 0034 §4, §7): the pool is `auto` or a whole
+    // number of GiB, at least 1 GiB; anything else is refused.
     #[test]
     fn pool_sizes() {
-        assert_eq!(parse_pool("8GiB"), Ok(8 * GIB));
-        assert_eq!(parse_pool("1GiB"), Ok(GIB));
-        assert_eq!(parse_pool("2048MiB"), Ok(2 * GIB));
+        assert_eq!(parse_pool("auto"), Ok(None));
+        assert_eq!(parse_pool("8GiB"), Ok(Some(8 * GIB)));
+        assert_eq!(parse_pool("1GiB"), Ok(Some(GIB)));
+        assert_eq!(parse_pool("2048MiB"), Ok(Some(2 * GIB)));
         for bad in [
-            "0GiB", "512MiB", "1.5GiB", "1536MiB", "8", "8GB", "-1GiB", "",
+            "0GiB", "512MiB", "1.5GiB", "1536MiB", "8", "8GB", "-1GiB", "", "Auto", "lots",
         ] {
             assert!(parse_pool(bad).is_err(), "{bad}");
         }

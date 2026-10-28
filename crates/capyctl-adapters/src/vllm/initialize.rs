@@ -225,10 +225,11 @@ async fn launch(
     )
     .await?;
     // ADR 0033 §4: the owned connector, rendered after the pass-through
-    // validation (which refuses an LMCache connector there).
-    plan.kv_transfer_config = connector
-        .as_ref()
-        .map(|connector| crate::lmcache::vllm_kv_transfer_config(connector.rpc_port()));
+    // validation (which refuses an LMCache connector there), in the transfer
+    // mode its server serves (ADR 0034 §1).
+    plan.kv_transfer_config = connector.as_ref().map(|connector| {
+        crate::lmcache::vllm_kv_transfer_config(connector.rpc_port(), connector.plan().transfer)
+    });
 
     // Spec §3: the key rides the environment, never argv.
     plan.api_key = None;
@@ -627,7 +628,10 @@ mod tests {
         for telemetry in [EngineTelemetry::Off, EngineTelemetry::Allow] {
             assert!(!spawn(&plan, telemetry).contains_key("LMCACHE_TRACK_USAGE"));
         }
-        plan.kv_transfer_config = Some(crate::lmcache::vllm_kv_transfer_config(25001));
+        plan.kv_transfer_config = Some(crate::lmcache::vllm_kv_transfer_config(
+            25001,
+            capyctl_config::lmcache::TransferMode::LmcacheDriven,
+        ));
         let env = spawn(&plan, EngineTelemetry::Off);
         assert_eq!(
             (

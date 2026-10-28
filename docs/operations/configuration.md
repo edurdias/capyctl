@@ -719,11 +719,18 @@ takes `--set` and `CAPYCTL_SET__…` the same way.
 KV cache kept in host RAM outside the engine counts against the host-KV
 limit; on standalone that is the [LMCache](../guide/engines.md#lmcache) pool
 of each model that uses it. Standalone sets the limit at a tenth of the memory
-it observes (on a discrete-GPU machine, of host RAM): 12.17 GiB on a 128 GB
-GB10. A model is not admitted while its pool, with the pools of the models
-already running, would exceed it, so on that machine no `lmcache_pool` above
-12 GiB fits. Such a start exits 4 (`insufficient_resources`) with a message
-that names the limit and this setting:
+it observes at each start (on a discrete-GPU machine, of host RAM), so it
+differs per machine and follows the machine, not the memory in use: 12.17 GiB
+on a 128 GB GB10, about 6.1 GiB on a laptop with 61 GiB of RAM. A model's
+automatic pool (`lmcache_pool: auto`, the default) is sized to one full
+context of the model and never exceeds this limit less the model's own host
+KV; when the pools of the models already running leave less room, it shrinks
+to the room left with a warning, and with less than 1 GiB left the model runs
+without LMCache (`host_kv_room`). A stated `lmcache_pool` is not shrunk: a
+model is not admitted while it, with the pools already running, would exceed
+the limit, so on that machine no stated `lmcache_pool` above 12 GiB fits.
+Such a start exits 4 (`insufficient_resources`) with a message that names
+the limit and this setting:
 `host_kv (needs 20.0 GiB, limit 12.2 GiB; raise host.resource_policy.memory.system.host_kv_limit or lower lmcache_pool)`
 (on a host role, it names that host's
 `resource_policy.domains.<domain>.host_kv_limit`). Raise the limit with a

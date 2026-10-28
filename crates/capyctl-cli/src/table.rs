@@ -838,7 +838,11 @@ fn topology_line(instance: &Value) -> Option<String> {
 }
 
 /// ADR 0033 §9: one instance's LMCache line, absent when status has none:
-/// `LMCache   instance 0 on: pool 4.0 GiB, ...` or `... off: <why>`.
+/// `LMCache   instance 0 on: pool 4.0 GiB, ...` or `... off: <why>`. ADR
+/// 0034 §4: the pool names its basis (`pool 8.0 GiB (auto: one
+/// 32,768-token context of qwen3 at 144 KiB per token)`), and its warning
+/// follows on its own line; §3a: an uncertified run says so, `on
+/// (uncertified: <why>)`. A launch planned before ADR 0034 shows neither.
 fn lmcache_line(instance: &Value) -> Option<String> {
     let lmcache = instance.get("lmcache").filter(|l| l.is_object())?;
     let index = text(&instance["index"]);
@@ -850,7 +854,11 @@ fn lmcache_line(instance: &Value) -> Option<String> {
     }
     let mut parts = Vec::new();
     if let Some(pool) = number(&lmcache["pool_bytes"]) {
-        parts.push(format!("pool {}", gib(pool)));
+        let basis = lmcache["pool_basis"]
+            .as_str()
+            .map(|basis| format!(" ({})", clean(basis)))
+            .unwrap_or_default();
+        parts.push(format!("pool {}{basis}", gib(pool)));
     }
     if let Some(used) = number(&lmcache["used_bytes"]) {
         parts.push(format!("used {}", gib(used)));
@@ -880,10 +888,37 @@ fn lmcache_line(instance: &Value) -> Option<String> {
         (Some(hits), None) => parts.push(format!("{hits} hits")),
         _ => {}
     }
-    Some(format!(
-        "LMCache   instance {index} on: {}\n",
-        parts.join(", ")
-    ))
+    let on = match lmcache["uncertified"].as_str() {
+        Some(why) => format!("on (uncertified: {})", clean(why)),
+        None => "on".to_owned(),
+    };
+    let mut line = format!("LMCache   instance {index} {on}: {}\n", parts.join(", "));
+    if let Some(warning) = lmcache["warning"].as_str() {
+        line.push_str(&format!("warning: {}\n", clean(warning)));
+    }
+    Some(line)
+}
+
+/// ADR 0034 §§3a, 4: what `deploy` warns about one instance's LMCache: an
+/// uncertified run, and a pool short of one full context or shrunk to the
+/// room left. Empty when there is nothing to warn about.
+pub fn lmcache_warnings(instance: &Value) -> Vec<String> {
+    let lmcache = &instance["lmcache"];
+    if lmcache["state"] != "on" {
+        return Vec::new();
+    }
+    let index = text(&instance["index"]);
+    let mut warnings = Vec::new();
+    if let Some(why) = lmcache["uncertified"].as_str() {
+        warnings.push(format!(
+            "instance {index}: LMCache runs uncertified: {}",
+            clean(why)
+        ));
+    }
+    if let Some(warning) = lmcache["warning"].as_str() {
+        warnings.push(format!("instance {index}: {}", clean(warning)));
+    }
+    warnings
 }
 
 /// ADR 0033 §1: LMCache drifted from the registration `engine add` made,

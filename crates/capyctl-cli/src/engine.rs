@@ -1149,11 +1149,15 @@ fn listed_lmcache(
             registration.as_ref(),
         ));
     };
+    // ADR 0034 §1: the listing checks what every LMCache launch needs
+    // (lmcache-driven transfer); a parking launch's engine-driven pieces
+    // are checked when it launches.
     match capyctl_agent::lmcache_install::check_lmcache(
         measurer,
         engine,
         Path::new(executable),
         registration.as_ref(),
+        capyctl_config::lmcache::TransferMode::LmcacheDriven,
     ) {
         Ok(install) => {
             let registered = registration.map_or(install.version, |r| r.version);

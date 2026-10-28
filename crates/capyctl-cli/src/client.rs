@@ -1363,14 +1363,20 @@ pub async fn execute_with_start_options(
             effective: true,
         } => {
             let snapshot = api.snapshot().await?;
-            let deployment_id = deployment(&snapshot, id)?["id"]
+            let view = deployment(&snapshot, id)?;
+            let deployment_id = view["id"]
                 .as_str()
                 .ok_or_else(|| error("internal", "Deployment has no id"))?
                 .to_owned();
             let path = format!("/deployments/{deployment_id}/effective-config");
-            let (status, body) = api.exchange(Method::GET, &path, None).await?;
+            let (status, mut body) = api.exchange(Method::GET, &path, None).await?;
             if !status.is_success() {
                 return Err(refusal(status, &body));
+            }
+            // ADR 0034 §4: each instance's LMCache pool as its launch got
+            // it, its basis and its warning, from the snapshot status reads.
+            if let Some(lmcache) = effective_lmcache(view) {
+                body["lmcache"] = lmcache;
             }
             Ok(body)
         }
@@ -1386,6 +1392,43 @@ pub async fn execute_with_start_options(
 
 /// What `status deployment` says on a role with no engine.
 pub const NO_ENGINE: &str = "none: run `capyctl engine add <path>`";
+
+/// ADR 0034 §4: `inspect deployment --effective-config` shows each
+/// instance's LMCache as its launch got it: on, its pool, where the size
+/// came from and on what basis, the tokens it keeps, its warning and
+/// whether it runs certified; or off and why. The same stored launch
+/// status reads; `None` when no instance has a launch with LMCache planned.
+fn effective_lmcache(deployment: &Value) -> Option<Value> {
+    const KEPT: [&str; 10] = [
+        "state",
+        "reason",
+        "message",
+        "pool_bytes",
+        "pool_source",
+        "pool_basis",
+        "pool_tokens",
+        "warning",
+        "certified",
+        "uncertified",
+    ];
+    let instances: Vec<Value> = deployment["instances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|instance| {
+            let lmcache = instance["lmcache"].as_object()?;
+            let mut kept = serde_json::Map::new();
+            kept.insert("instance".into(), instance["index"].clone());
+            for key in KEPT {
+                if let Some(value) = lmcache.get(key) {
+                    kept.insert(key.into(), value.clone());
+                }
+            }
+            Some(Value::Object(kept))
+        })
+        .collect();
+    (!instances.is_empty()).then_some(Value::Array(instances))
+}
 
 fn has_group_members(deployment: &Value) -> bool {
     deployment["instances"]
@@ -1996,6 +2039,12 @@ mod tests {
             held_kv_bytes: None,
             charge_bytes: Some(4 * GIB + 800 * MIB),
             measured: Some(true),
+            certified: Some(true),
+            uncertified: None,
+            pool_source: None,
+            pool_tokens: None,
+            pool_basis: None,
+            warning: None,
         };
         let off = InstanceLmcache {
             state: "off".into(),
@@ -2008,6 +2057,12 @@ mod tests {
             held_kv_bytes: None,
             charge_bytes: None,
             measured: None,
+            certified: None,
+            uncertified: None,
+            pool_source: None,
+            pool_tokens: None,
+            pool_basis: None,
+            warning: None,
         };
         // The snapshot carries an instance's generation as a decimal string.
         let instance = |index: u32, generation: i64, host: &str, lmcache: &InstanceLmcache| {
@@ -2131,5 +2186,146 @@ mod tests {
         assert!(!has_lmcache(
             &json!({"instances": [instance(0, 7, "h1", &off)]})
         ));
+    }
+
+    // T45 (ADR 0034 §§3a, 4, 5): status names an automatic pool's basis, says
+    // when LMCache runs uncertified, and shows the pool's warning on its own
+    // line below; an instance off with `park_unqualified` suggests nothing
+    // about `restart_only`. `inspect deployment --effective-config` carries
+    // each instance's pool, basis, warning and certification from the same
+    // status, and `deploy` warns of the uncertified run and the short pool.
+    #[test]
+    fn status_inspect_and_deploy_show_the_pool_basis_uncertified_run_and_warning() {
+        use capyctl_store::snapshot::InstanceLmcache;
+        const GIB: i64 = 1 << 30;
+        const MIB: i64 = 1 << 20;
+        let warning = "the LMCache pool (12 GiB) keeps about 55,900 tokens after eviction; one \
+                       full context of 65,536 tokens needs 15 GiB: raise host_kv_limit or set \
+                       lmcache_pool";
+        let why = "vLLM 0.32.0 / qwen3 / NVIDIA GB10 / deep is not in the qualified table";
+        let on = |pool: i64, basis: &str, tokens: u64, warning: Option<&str>, why: Option<&str>| {
+            InstanceLmcache {
+                state: "on".into(),
+                reason: None,
+                message: None,
+                server: Some("running".into()),
+                pool_bytes: Some(pool),
+                overhead_bytes: Some(1280 * MIB),
+                device_bytes: Some(0),
+                held_kv_bytes: None,
+                charge_bytes: Some(pool + 1280 * MIB),
+                measured: Some(false),
+                certified: Some(why.is_none()),
+                uncertified: why.map(str::to_owned),
+                pool_source: Some("auto".into()),
+                pool_tokens: Some(tokens),
+                pool_basis: Some(basis.into()),
+                warning: warning.map(str::to_owned),
+            }
+        };
+        let off = InstanceLmcache {
+            state: "off".into(),
+            reason: Some("park_unqualified".into()),
+            message: Some(
+                "not qualified with deep park on vLLM 0.32.0 / llama / NVIDIA GB10".into(),
+            ),
+            server: None,
+            pool_bytes: None,
+            overhead_bytes: None,
+            device_bytes: None,
+            held_kv_bytes: None,
+            charge_bytes: None,
+            measured: None,
+            certified: None,
+            uncertified: None,
+            pool_source: None,
+            pool_tokens: None,
+            pool_basis: None,
+            warning: None,
+        };
+        let instance = |index: u32, lmcache: &InstanceLmcache| {
+            json!({"index": index, "generation": "1", "host_id": "h1",
+                "observed_state": "ready", "lifecycle": "active",
+                "lmcache": serde_json::to_value(lmcache).unwrap()})
+        };
+        let view = json!({"id": "dep-1", "name": "chat", "observed_state": "ready",
+            "revision": "1", "ready_instances": 3, "desired_instances": 3,
+            "instances": [
+                instance(0, &on(8 * GIB,
+                    "auto: one 32,768-token context of qwen3 at 144 KiB per token",
+                    37_282, None, None)),
+                instance(1, &on(12 * GIB,
+                    "auto: one 65,536-token context of qwen3 at 144 KiB per token",
+                    55_924, Some(warning), Some(why))),
+                instance(2, &off)]});
+        let status = crate::table::render(
+            crate::table::View::Status,
+            &view,
+            &crate::table::HostNames::new(),
+        );
+        let lines: Vec<&str> = status
+            .lines()
+            .filter(|l| l.starts_with("LMCache") || l.starts_with("warning:"))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "LMCache   instance 0 on: pool 8.0 GiB (auto: one 32,768-token context of qwen3 \
+                 at 144 KiB per token), overhead 1.2 GiB (allowance), charged 9.2 GiB, server \
+                 running",
+                &format!(
+                    "LMCache   instance 1 on (uncertified: {why}): pool 12.0 GiB (auto: one \
+                     65,536-token context of qwen3 at 144 KiB per token), overhead 1.2 GiB \
+                     (allowance), charged 13.2 GiB, server running"
+                ),
+                &format!("warning: {warning}"),
+                "LMCache   instance 2 off: not qualified with deep park on vLLM 0.32.0 / llama / \
+                 NVIDIA GB10",
+            ],
+            "{status}"
+        );
+        assert!(!status.contains("restart_only"), "{status}");
+
+        let effective = effective_lmcache(&view).unwrap();
+        assert_eq!(effective[1]["instance"], 1);
+        assert_eq!(effective[1]["pool_bytes"], 12 * GIB);
+        assert_eq!(effective[1]["pool_source"], "auto");
+        assert_eq!(effective[1]["pool_tokens"], 55_924);
+        assert_eq!(effective[1]["warning"], warning);
+        assert_eq!(effective[1]["certified"], false);
+        assert_eq!(effective[1]["uncertified"], why);
+        assert_eq!(effective[0]["certified"], true);
+        assert!(effective[0].get("warning").is_none());
+        assert_eq!(effective[2]["state"], "off");
+        assert_eq!(effective[2]["reason"], "park_unqualified");
+        assert!(effective_lmcache(&json!({"instances": [{"index": 0}]})).is_none());
+
+        let deploy = crate::views::render(
+            &crate::grammar::Command::Deploy {
+                file: Some(std::path::PathBuf::from("chat.yaml")),
+                activate: true,
+                wait: true,
+                revision: None,
+                hf_endpoint: None,
+                engine_env: vec![],
+            },
+            &json!({"receipt": {}, "deployment": view}),
+            &crate::views::Context {
+                names: &crate::table::HostNames::new(),
+                deployment_name: None,
+            },
+        );
+        let warnings: Vec<&str> = deploy
+            .lines()
+            .filter(|l| l.starts_with("warning:"))
+            .collect();
+        assert_eq!(
+            warnings,
+            [
+                format!("warning: instance 1: LMCache runs uncertified: {why}"),
+                format!("warning: instance 1: {warning}"),
+            ],
+            "{deploy}"
+        );
     }
 }

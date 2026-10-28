@@ -494,6 +494,31 @@ pub struct InstanceLmcache {
     /// revision on its host rather than the allowances.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub measured: Option<bool>,
+    /// On only, ADR 0034 §3a, §6: `false` for a `lmcache: required` launch
+    /// run outside the certified (qualified) set, `true` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certified: Option<bool>,
+    /// On and uncertified only: why, as status shows it after
+    /// "uncertified: ".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uncertified: Option<String>,
+    /// On only, ADR 0034 §4: where the pool's size came from (`auto`,
+    /// `stated`, `default`); absent for a launch planned before ADR 0034.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_source: Option<String>,
+    /// On only: the tokens the pool keeps for sure after an eviction, when
+    /// the model's KV bytes per token is known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_tokens: Option<u64>,
+    /// On only: how the pool was sized, as status shows it (`auto: one
+    /// 32,768-token context of qwen3 at 144 KiB per token`, `stated`,
+    /// `default: <why>`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_basis: Option<String>,
+    /// On only: the pool keeps fewer tokens than one full context, or
+    /// admission shrank it to the host-KV room left; the remedy included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// ADR 0031 §6, SPEC §10: requests whose client hung up, whose deadline cut
@@ -1379,9 +1404,53 @@ fn instance_topology(
     }))
 }
 
+/// ADR 0034 §§3a, 4: how a launch's pool was sized and whether it runs
+/// uncertified, as `launch_lmcache` recorded it (all null for a launch
+/// planned before ADR 0034).
+struct PoolRow {
+    source: Option<String>,
+    bytes_per_token: Option<i64>,
+    context_tokens: Option<i64>,
+    unknown: Option<String>,
+    shrunk_from: Option<i64>,
+    warning: Option<String>,
+    uncertified: Option<String>,
+    model_type: Option<String>,
+}
+
+impl PoolRow {
+    /// The recorded sizing of a pool of `pool` bytes, `None` for a launch
+    /// planned before ADR 0034. A recorded source this build does not know
+    /// is corrupt.
+    fn sizing(
+        &self,
+        pool: i64,
+    ) -> Result<Option<capyctl_config::lmcache::PoolSizing>, SnapshotError> {
+        use capyctl_config::lmcache::{PoolBasis, PoolSizing, PoolSource};
+        let Some(source) = self.source.as_deref() else {
+            return Ok(None);
+        };
+        let figure = |n: Option<i64>| n.and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0);
+        Ok(Some(PoolSizing {
+            pool_bytes: u64::try_from(pool).map_err(|_| SnapshotError::CorruptData)?,
+            source: PoolSource::parse(source).ok_or(SnapshotError::CorruptData)?,
+            basis: figure(self.bytes_per_token)
+                .zip(figure(self.context_tokens))
+                .map(|(bytes_per_token, context_tokens)| PoolBasis {
+                    bytes_per_token,
+                    context_tokens,
+                }),
+            unknown: self.unknown.clone(),
+            shrunk_from: figure(self.shrunk_from),
+        }))
+    }
+}
+
 /// ADR 0033 §9: the LMCache of the newest launch of the instance's current
 /// incarnation: on or off (the host's report, else the store's plan), why it
-/// is off, the server's state and the charge the launch holds for it.
+/// is off, the server's state and the charge the launch holds for it. ADR
+/// 0034 §§3a, 4: on, whether it is certified, and how its pool was sized,
+/// with the pool's warning.
 fn instance_lmcache(
     tx: &Transaction<'_>,
     deployment: &str,
@@ -1403,6 +1472,7 @@ fn instance_lmcache(
         bool,
         bool,
         bool,
+        PoolRow,
     );
     let row: Option<Row> = tx
         .prepare_cached(
@@ -1412,7 +1482,9 @@ fn instance_lmcache(
                     EXISTS(SELECT 1 FROM management_events e WHERE e.kind='lmcache_server_exited'
                        AND e.deployment_id=l.deployment_id
                        AND json_extract(e.payload_json,'$.binding_id')=l.binding_id),
-                    i.observed_state='parked',l.held_kv_state IS 'held',l.observed_device_bytes
+                    i.observed_state='parked',l.held_kv_state IS 'held',l.observed_device_bytes,
+                    l.pool_source,l.pool_bytes_per_token,l.pool_context_tokens,l.pool_unknown,
+                    l.pool_shrunk_from,l.pool_warning,l.uncertified,l.pool_model_type
                FROM launch_lmcache l
                JOIN deployment_instances i ON i.deployment_id=l.deployment_id
                 AND i.instance_index=l.instance_index AND i.generation=l.generation
@@ -1435,6 +1507,16 @@ fn instance_lmcache(
                 r.get(13)?,
                 r.get(14)?,
                 r.get(15)?,
+                PoolRow {
+                    source: r.get(17)?,
+                    bytes_per_token: r.get(18)?,
+                    context_tokens: r.get(19)?,
+                    unknown: r.get(20)?,
+                    shrunk_from: r.get(21)?,
+                    warning: r.get(22)?,
+                    uncertified: r.get(23)?,
+                    model_type: r.get(24)?,
+                },
             ))
         })
         .optional()?;
@@ -1452,6 +1534,7 @@ fn instance_lmcache(
         exited,
         parked,
         kv_held,
+        pool_row,
     )) = row
     else {
         return Ok(None);
@@ -1489,6 +1572,12 @@ fn instance_lmcache(
             held_kv_bytes: None,
             charge_bytes: None,
             measured: None,
+            certified: None,
+            uncertified: None,
+            pool_source: None,
+            pool_tokens: None,
+            pool_basis: None,
+            warning: None,
         }));
     }
     let (Some(pool), Some(overhead), Some(device), Some(held_kv)) =
@@ -1511,6 +1600,7 @@ fn instance_lmcache(
     // server above what its charge held.
     let gpu = device.saturating_add(if held { held_kv } else { 0 });
     charge = charge.saturating_add(observed.unwrap_or(0).saturating_sub(gpu).max(0));
+    let sizing = pool_row.sizing(pool)?;
     Ok(Some(InstanceLmcache {
         state: "on".into(),
         reason: None,
@@ -1522,6 +1612,14 @@ fn instance_lmcache(
         held_kv_bytes: restart_park.then_some(held_kv),
         charge_bytes: (server != "stopped").then_some(charge),
         measured: Some(measured),
+        certified: Some(pool_row.uncertified.is_none()),
+        uncertified: pool_row.uncertified,
+        pool_source: sizing.as_ref().map(|s| s.source.code().to_owned()),
+        pool_tokens: sizing.as_ref().and_then(|s| s.tokens_kept()),
+        pool_basis: sizing
+            .as_ref()
+            .map(|s| s.basis_text(pool_row.model_type.as_deref())),
+        warning: pool_row.warning,
     }))
 }
 

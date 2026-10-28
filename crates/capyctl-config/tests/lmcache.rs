@@ -157,27 +157,104 @@ fn the_deployment_fields_are_frozen_only_when_not_default() {
     }
 }
 
-// T45 (ADR 0033 §6, §9): a pool that is not a whole number of GiB of at least
-// 1 GiB, a mode or retention outside the closed set, and a pool beside
-// `lmcache: off` are refused (invalid_config), naming the field, at
-// resolution and in the command fingerprint alike.
+// T45 (ADR 0034 §4): `lmcache_pool: auto` is the default: it resolves to no
+// stated pool, freezes and fingerprints as an omitted one, and may stand
+// beside `lmcache: off`.
+#[test]
+fn an_auto_pool_is_the_default() {
+    let (deployment, host) = fixture();
+    let plain = resolve_effective(&deployment, &host).unwrap();
+    let auto = with(&deployment, json!({"lmcache_pool": "auto"}));
+    capyctl_config::validate(&auto.to_string(), ConfigKind::Deployment).unwrap();
+    let effective = resolve_effective(&auto, &host).unwrap();
+    assert_eq!(effective.lmcache_pool_bytes, None);
+    assert_eq!(effective.recipe_fingerprint, plain.recipe_fingerprint);
+    assert_eq!(
+        deployment_command_fingerprint(&auto, 300_000).unwrap(),
+        deployment_command_fingerprint(&deployment, 300_000).unwrap()
+    );
+    let off = with(
+        &deployment,
+        json!({"lmcache": "off", "lmcache_pool": "auto"}),
+    );
+    assert_eq!(
+        resolve_effective(&off, &host).unwrap().lmcache_pool_bytes,
+        None
+    );
+}
+
+// T45 (ADR 0034 §4): B and C come from the checkpoint the launch reads: the
+// context fit's KV bytes per token (Qwen3-4B's 144 KiB at BF16) and the
+// declared context, else the fitted one; an unreadable checkpoint is an
+// unknown basis, which sizes the 4 GiB default.
+#[test]
+fn the_pool_basis_comes_from_the_checkpoint_and_the_context() {
+    use capyctl_config::lmcache::{pool_basis_for_effective, PoolBasis};
+    let (deployment, mut host) = fixture();
+    // The fixture's installation fixes `--max-model-len`; the fit needs it free.
+    host["runtime_profiles"]["local"]["args"] = json!([]);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.json"),
+        json!({"model_type": "qwen3", "num_hidden_layers": 36, "num_attention_heads": 32,
+            "num_key_value_heads": 8, "head_dim": 128, "hidden_size": 2560,
+            "max_position_embeddings": 40960, "torch_dtype": "bfloat16"})
+        .to_string(),
+    )
+    .unwrap();
+    let resolve = |engine_config: Value| {
+        let mut effective = resolve_effective(
+            &with(&deployment, json!({"engine_config": engine_config})),
+            &host,
+        )
+        .unwrap();
+        effective.model.resolved_path = Some(dir.path().to_string_lossy().into_owned());
+        effective
+    };
+    let declared = resolve(json!({"memory": {"kv_cache": "5GiB"}, "context_length": 32768}));
+    assert_eq!(
+        pool_basis_for_effective(&declared),
+        Ok(PoolBasis {
+            bytes_per_token: 147_456,
+            context_tokens: 32_768
+        })
+    );
+    // Fitted from the 4 GiB grant, as the launch fits it.
+    let fitted = resolve(json!({"memory": {"kv_cache": "4GiB"}}));
+    let basis = pool_basis_for_effective(&fitted).unwrap();
+    assert_eq!(basis.bytes_per_token, 147_456);
+    assert_eq!(
+        u64::from(
+            capyctl_config::context_fit::fit_for_effective(&fitted)
+                .tokens
+                .unwrap()
+        ),
+        basis.context_tokens
+    );
+    let mut missing = fitted.clone();
+    missing.model.resolved_path = Some("/nonexistent/capyctl/checkpoint".into());
+    assert!(pool_basis_for_effective(&missing).is_err());
+}
+
+// T45 (ADR 0033 §6, §9, ADR 0034 §4, §7): a pool that is neither `auto` nor
+// a whole number of GiB of at least 1 GiB, a mode or retention outside the
+// closed set, and a stated pool beside `lmcache: off` are refused
+// (invalid_config), naming the field, at resolution and in the command
+// fingerprint alike.
 #[test]
 fn invalid_pools_modes_and_a_pool_beside_off_are_refused() {
     let (deployment, host) = fixture();
-    for pool in ["512MiB", "0GiB", "1.5GiB", "1536MiB"] {
+    for pool in [
+        "512MiB", "0GiB", "1.5GiB", "1536MiB", "8 GiB", "8GB", "8", "lots", "Auto",
+    ] {
         let stated = with(&deployment, json!({ "lmcache_pool": pool }));
         let error = resolve_effective(&stated, &host).unwrap_err();
         assert_eq!(error.path, "lmcache_pool", "{pool}: {error}");
-        assert!(error.detail.contains("whole number of GiB"), "{error}");
-        assert!(deployment_command_fingerprint(&stated, 300_000).is_err());
-    }
-    for pool in ["8 GiB", "8GB", "8"] {
-        let stated = with(&deployment, json!({ "lmcache_pool": pool }));
         assert!(
-            capyctl_config::validate(&stated.to_string(), ConfigKind::Deployment).is_err(),
-            "{pool}"
+            error.detail.contains("`auto` or a whole number of GiB"),
+            "{error}"
         );
-        assert!(resolve_effective(&stated, &host).is_err(), "{pool}");
+        assert!(deployment_command_fingerprint(&stated, 300_000).is_err());
     }
     for fields in [json!({"lmcache": "on"}), json!({"retention": "none"})] {
         let error = resolve_effective(&with(&deployment, fields.clone()), &host).unwrap_err();
@@ -216,19 +293,23 @@ fn required_beside_zero_retention_is_refused() {
 // T45 T37 (ADR 0033 §9, §14): `required` is refused at resolution with
 // `lmcache_unavailable:<reason>` where the deployment and its profile alone
 // keep LMCache off; on a supported, registered, restarting deployment it
-// resolves.
+// resolves. ADR 0034 §3a: a parking residency is never refused for being
+// outside the qualified table; it runs uncertified.
 #[test]
 fn required_is_refused_at_resolution_for_what_the_profile_decides() {
     let (deployment, host) = fixture();
     let required = with(&deployment, json!({"lmcache": "required"}));
     resolve_effective(&required, &host).unwrap();
+    let mut deep = required.clone();
+    deep["residency"] = json!("deep");
+    resolve_effective(&deep, &host).unwrap();
     type Edit<'a> = &'a dyn Fn(&mut Value, &mut Value);
     let edit = |change: Edit<'_>| {
         let (mut deployment, mut host) = (required.clone(), host.clone());
         change(&mut deployment, &mut host);
         resolve_effective(&deployment, &host).unwrap_err()
     };
-    let cases: [(&str, Edit<'_>); 5] = [
+    let cases: [(&str, Edit<'_>); 4] = [
         ("lmcache_unavailable:engine_version_unsupported", &|_, h| {
             h["runtime_profiles"]["local"]["build_fingerprint"] = json!("0.31.0")
         }),
@@ -240,9 +321,6 @@ fn required_is_refused_at_resolution_for_what_the_profile_decides() {
         }),
         ("lmcache_unavailable:version_unsupported", &|_, h| {
             h["runtime_profiles"]["local"]["lmcache"]["version"] = json!("0.5.5")
-        }),
-        ("lmcache_unavailable:park_unqualified", &|d, _| {
-            d["residency"] = json!("deep")
         }),
         ("lmcache_unavailable:kv_transfer_config_set", &|d, h| {
             h["runtime_profiles"]["local"]["security"]["approved_options"] =

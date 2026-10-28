@@ -177,6 +177,16 @@ fn deploy(value: &Value, context: &Context) -> String {
         // ADR 0035 §1, §1a: the GPUs and the per-GPU charge, and under
         // `topology: auto` the candidate table and the size chosen now.
         text.push_str(&topology(&d["topology"]));
+        // ADR 0034 §§3a, 4: `deploy` warns of an uncertified LMCache run and
+        // of a pool short of one full context or shrunk to the room left.
+        for warning in d["instances"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(table::lmcache_warnings)
+        {
+            text.push_str(&format!("warning: {warning}\n"));
+        }
         return text;
     }
     let name = context

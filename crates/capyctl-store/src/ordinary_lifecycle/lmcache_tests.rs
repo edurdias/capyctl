@@ -474,7 +474,9 @@ fn the_charge_is_pool_plus_allowance_then_measured() {
     // in place of the allowances.
     let tx = lab.store.conn.unchecked_transaction().unwrap();
     let (_, e) = effective(&tx, &a).unwrap();
-    let plan = plan_on(&tx, &a.deployment_id, a.revision, "lab", &e).unwrap();
+    let plan = sized_plan(&tx, &a.deployment_id, a.revision, 0, "lab", &e)
+        .unwrap()
+        .plan;
     let (charge, measured) = plan_charge(&tx, &plan, &a.deployment_id, a.revision, "lab", &e)
         .unwrap()
         .unwrap();
@@ -507,22 +509,53 @@ fn the_charge_is_pool_plus_allowance_then_measured() {
     assert_eq!(lab.events("lmcache_off", &c.deployment_id).len(), 1);
 }
 
-// T45 T14: the pool counts against host_kv_limit: a 4 GiB pool beside the
-// engine's 1 GiB of host KV does not fit a 4 GiB limit, and the start is
-// refused at arm.
+// T45 T14 (ADR 0034 §4, owner decision 3): the pool counts against
+// host_kv_limit, and an automatic one never makes the start fail for it. On a
+// host whose limit (3 GiB) is below the 4 GiB default, the automatic pool is
+// capped at the limit less the engine's own 1 GiB of host KV, and the start
+// runs; with no room left beside the engine's host KV, it runs without
+// LMCache (`host_kv_room`, journaled once). A stated pool that does not fit
+// is still refused at arm.
 #[test]
 fn the_pool_counts_against_host_kv_limit() {
     let lab = Lab::new(|h| {
-        h["resource_policy"]["domains"]["unified"]["host_kv_limit"] = json!("4GiB");
+        h["resource_policy"]["domains"]["unified"]["host_kv_limit"] = json!("3GiB");
     });
-    let a = lab.deploy("a", |c| {
+    let auto = lab.deploy("auto", |c| {
         c.as_object_mut().unwrap().remove("lmcache_pool");
     });
+    let (_, context) = lab.start(&auto, 100);
+    let grant = lab
+        .store
+        .launch_lmcache_grant(&context.binding_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(grant.pool_bytes, 2 * GIB);
+    assert_eq!(unified(&lab.footprint(&auto)).1, 3 * GIB);
+    lab.release(&context, Vec::new(), 200);
+
+    let stated = lab.deploy("stated", |c| c["lmcache_pool"] = json!("4GiB"));
     let accepted = lab
         .store
-        .accept_start(&lab.session, &a, 100, 100_100)
+        .accept_start(&lab.session, &stated, 300, 300_100)
         .unwrap();
-    assert!(lab.arm_start(&accepted.step_id, 100).is_err());
+    assert!(lab.arm_start(&accepted.step_id, 300).is_err());
+
+    let lab = Lab::new(|h| {
+        h["resource_policy"]["domains"]["unified"]["host_kv_limit"] = json!("1GiB");
+    });
+    let auto = lab.deploy("auto", |c| {
+        c.as_object_mut().unwrap().remove("lmcache_pool");
+    });
+    let (_, context) = lab.start(&auto, 100);
+    assert_eq!(
+        planned(&lab, &context),
+        PlannedLmcache::Off(LmcacheOff::new(LmcacheOffReason::HostKvRoom))
+    );
+    assert_eq!(unified(&lab.footprint(&auto)), (10 * GIB, GIB));
+    let off = lab.events("lmcache_off", &auto.deployment_id);
+    assert_eq!(off.len(), 1);
+    assert_eq!(off[0]["reason"], "host_kv_room");
 }
 
 // T45 T23 (ADR 0033 §6, ADR 0025 amendment of 2026-10-23): a start the
@@ -900,7 +933,9 @@ fn held_kv_until_released(edit_host: impl FnOnce(&mut Value)) {
     // that counted the held KV.
     let tx = lab.store.conn.unchecked_transaction().unwrap();
     let (_, e) = effective(&tx, &a).unwrap();
-    let plan = plan_on(&tx, &a.deployment_id, a.revision, "lab", &e).unwrap();
+    let plan = sized_plan(&tx, &a.deployment_id, a.revision, 0, "lab", &e)
+        .unwrap()
+        .plan;
     let (charge, measured) = plan_charge(&tx, &plan, &a.deployment_id, a.revision, "lab", &e)
         .unwrap()
         .unwrap();
@@ -1820,7 +1855,9 @@ fn a_host_measurement_replaces_the_allowances_of_the_next_launch_there() {
     // The same revision on another host is charged the allowances.
     let tx = lab.store.conn.unchecked_transaction().unwrap();
     let (_, e) = effective(&tx, &a).unwrap();
-    let plan = plan_on(&tx, &a.deployment_id, a.revision, "other", &e).unwrap();
+    let plan = sized_plan(&tx, &a.deployment_id, a.revision, 0, "other", &e)
+        .unwrap()
+        .plan;
     let (charge, measured) = plan_charge(&tx, &plan, &a.deployment_id, a.revision, "other", &e)
         .unwrap()
         .unwrap();
@@ -1860,7 +1897,9 @@ fn a_host_measurement_without_a_gpu_reading_keeps_the_device_allowance() {
     let next = || {
         let tx = lab.store.conn.unchecked_transaction().unwrap();
         let (_, e) = effective(&tx, &a).unwrap();
-        let plan = plan_on(&tx, &a.deployment_id, a.revision, "lab", &e).unwrap();
+        let plan = sized_plan(&tx, &a.deployment_id, a.revision, 0, "lab", &e)
+            .unwrap()
+            .plan;
         let (charge, measured) = plan_charge(&tx, &plan, &a.deployment_id, a.revision, "lab", &e)
             .unwrap()
             .unwrap();
@@ -1891,7 +1930,8 @@ fn instance_status(lab: &Lab, fence: &DeploymentFence) -> Value {
 }
 
 /// The `lmcache` object status shows for a launch with LMCache on that was
-/// charged the allowances.
+/// charged the allowances: the Lab's stated 1 GiB pool, certified (ADR 0034
+/// §§3a, 4).
 fn on_with_allowances(server: &str, charge: i64) -> Value {
     json!({
         "state": "on",
@@ -1902,6 +1942,9 @@ fn on_with_allowances(server: &str, charge: i64) -> Value {
         "held_kv_bytes": 4 * GIB,
         "charge_bytes": charge,
         "measured": false,
+        "certified": true,
+        "pool_source": "stated",
+        "pool_basis": "stated",
     })
 }
 
@@ -2040,6 +2083,9 @@ fn status_marks_the_measured_overhead_of_the_next_launch() {
             "held_kv_bytes": 4 * GIB,
             "charge_bytes": measured,
             "measured": true,
+            "certified": true,
+            "pool_source": "stated",
+            "pool_basis": "stated",
         })
     );
     assert_eq!(unified(&lab.footprint(&a)).0, 10 * GIB + measured);
@@ -2212,6 +2258,9 @@ fn status_says_why_lmcache_is_off_and_when_its_server_exited() {
             "device_bytes": 512 * MIB,
             "held_kv_bytes": 4 * GIB,
             "measured": false,
+            "certified": true,
+            "pool_source": "stated",
+            "pool_basis": "stated",
         })
     );
     let owner = crate::instances::instance_owner_id(&released.deployment_id, 0);
@@ -2535,7 +2584,7 @@ fn a_remote_plan_compares_the_model_type_its_host_reported() {
         .conn
         .execute_batch(
             "INSERT INTO enrolled_hosts(host_id,host_name,key_digest,revoked) VALUES('lab','lab','key',0);
-             INSERT INTO host_versions VALUES('lab','0.1.6','supported','','[\"lmcache\"]',1);",
+             INSERT INTO host_versions VALUES('lab','0.1.6','supported','','[\"lmcache\",\"lmcache_engine_driven\"]',1);",
         )
         .unwrap();
     QUALIFIED_PARKING.set(QWEN3_ON_GB10);
@@ -2544,8 +2593,9 @@ fn a_remote_plan_compares_the_model_type_its_host_reported() {
         let (_, e) =
             crate::checkpoint_digests::frozen_revision(&tx, &fence.deployment_id, fence.revision)
                 .unwrap();
-        plan_on(&tx, &fence.deployment_id, fence.revision, "lab", &e)
+        sized_plan(&tx, &fence.deployment_id, fence.revision, 0, "lab", &e)
             .unwrap()
+            .plan
             .state
     };
     assert_eq!(
@@ -2565,6 +2615,7 @@ fn a_remote_plan_compares_the_model_type_its_host_reported() {
             "lab",
             7,
             Some("qwen3"),
+            None,
             200,
         )
         .unwrap());
@@ -2585,6 +2636,7 @@ fn a_remote_plan_compares_the_model_type_its_host_reported() {
                 None,
                 None,
                 Some("qwen3"),
+                None,
                 300,
             )
             .unwrap(),
@@ -2617,8 +2669,334 @@ fn a_remote_plan_compares_the_model_type_its_host_reported() {
             "lab",
             7,
             Some(" qwen3"),
+            None,
             400,
         )
         .is_err());
+    QUALIFIED_PARKING.set(lc::QUALIFIED_PARKING);
+}
+
+/// A Qwen3-4B checkpoint's `config.json`: 36 layers, 8 KV heads of
+/// dimension 128 in BF16, so 144 KiB of KV per token.
+fn qwen3_checkpoint() -> tempfile::TempDir {
+    let checkpoint = tempfile::tempdir().unwrap();
+    std::fs::write(
+        checkpoint.path().join("config.json"),
+        json!({"model_type": "qwen3", "num_hidden_layers": 36, "num_attention_heads": 32,
+            "num_key_value_heads": 8, "head_dim": 128, "hidden_size": 2560,
+            "max_position_embeddings": 131072, "torch_dtype": "bfloat16"})
+        .to_string(),
+    )
+    .unwrap();
+    checkpoint
+}
+
+/// Standalone's derived host-KV limit on a 128 GB GB10, 12.17 GiB.
+const GB10_HOST_KV_LIMIT: &str = "12462MiB";
+
+/// A Lab under the GB10's derived host-KV limit whose installation leaves
+/// the context free (the fixture's fixes `--max-model-len`).
+fn gb10_lab() -> Lab {
+    Lab::new(|h| {
+        h["runtime_profiles"]["local"]["args"] = json!([]);
+        h["resource_policy"]["domains"]["unified"]["host_kv_limit"] = json!(GB10_HOST_KV_LIMIT);
+    })
+}
+
+/// Every phase of `config` holding `bytes` (the parked phase 1 GiB) and
+/// `host_kv` of host KV (none parked).
+fn resources(config: &mut Value, bytes: &str, host_kv: &str) {
+    for phase in ["cold", "ready", "parking", "wake"] {
+        config["resources"][phase]["allocations"][0]["bytes"] = json!(bytes);
+        config["resources"][phase]["allocations"][0]["host_kv_bytes"] = json!(host_kv);
+    }
+    config["resources"]["parked"]["allocations"][0]["bytes"] = json!("1GiB");
+}
+
+// T45 (ADR 0034 §4, the table of examples, GB10 standalone): an automatic
+// pool holds one full context of the model after LMCache's eviction, at
+// least 4 GiB and at most the 12.17 GiB limit in whole GiB: Qwen3-4B at
+// 8,192 tokens gets the 4 GiB floor, at 32,768 tokens 8 GiB, and at 65,536
+// tokens the 12 GiB cap with the warning, journaled once as
+// `lmcache_pool_short`. The grant the host is sent is that pool; status
+// shows its source, basis and the tokens it keeps. CPU only: not
+// qualification.
+#[test]
+fn an_automatic_pool_holds_one_full_context_of_the_model() {
+    let checkpoint = qwen3_checkpoint();
+    for (context, written, pool, tokens) in [
+        (8_192, "8,192", 4, 18_641),
+        (32_768, "32,768", 8, 37_282),
+        (65_536, "65,536", 12, 55_924),
+    ] {
+        let lab = gb10_lab();
+        let fence = lab.deploy("qwen3", |c| {
+            c.as_object_mut().unwrap().remove("lmcache_pool");
+            c["model"]["path"] = json!(checkpoint.path().to_str().unwrap());
+            c["engine_config"]["context_length"] = json!(context);
+            resources(c, "10GiB", "0B");
+        });
+        let (_, started) = lab.start(&fence, 100);
+        let grant = lab
+            .store
+            .launch_lmcache_grant(&started.binding_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.pool_bytes, pool * GIB, "{context}");
+        assert_eq!(unified(&lab.footprint(&fence)).1, pool * GIB, "{context}");
+        let shown = instance_status(&lab, &fence)["lmcache"].clone();
+        assert_eq!(shown["pool_source"], "auto", "{context}");
+        assert_eq!(shown["pool_tokens"], tokens, "{context}");
+        assert_eq!(shown["certified"], true, "{context}");
+        assert_eq!(
+            shown["pool_basis"],
+            format!("auto: one {written}-token context of qwen3 at 144 KiB per token")
+        );
+        let short = lab.events("lmcache_pool_short", &fence.deployment_id);
+        if pool == 12 {
+            let warning = "the LMCache pool (12 GiB) keeps about 55,900 tokens after eviction; \
+                           one full context of 65,536 tokens needs 15 GiB: raise host_kv_limit \
+                           or set lmcache_pool";
+            assert_eq!(shown["warning"], warning);
+            assert_eq!(short.len(), 1, "{short:?}");
+            assert_eq!(short[0]["detail"], warning);
+            assert_eq!(short[0]["binding_id"], json!(started.binding_id));
+        } else {
+            assert!(shown.get("warning").is_none(), "{shown}");
+            assert!(short.is_empty(), "{short:?}");
+        }
+    }
+}
+
+// T45 T14 (ADR 0034 §4, owner decision 3; LC17's second deployment): with
+// `lmcache: auto` and an automatic pool, admission shrinks the pool to the
+// host-KV room left on the host, whole GiB, with the warning and one
+// `lmcache_pool_short`; with less than 1 GiB left the launch runs without
+// LMCache (`host_kv_room`, one `lmcache_off`). Placement never refuses
+// either for its pool.
+#[test]
+fn admission_shrinks_an_automatic_pool_to_the_room_left_or_runs_without_lmcache() {
+    let lab = Lab::new(|_| {});
+    // 1 GiB of engine host KV and a stated 3 GiB pool: 4 of the 8 GiB held.
+    let first = lab.deploy("first", |c| {
+        resources(c, "5GiB", "1GiB");
+        c["lmcache_pool"] = json!("3GiB");
+    });
+    lab.start(&first, 100);
+    // 3 GiB of room beside its own 1 GiB: the 4 GiB default shrinks to 3.
+    let second = lab.deploy("second", |c| {
+        resources(c, "5GiB", "1GiB");
+        c.as_object_mut().unwrap().remove("lmcache_pool");
+    });
+    let (_, context) = lab.start(&second, 200);
+    let grant = lab
+        .store
+        .launch_lmcache_grant(&context.binding_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(grant.pool_bytes, 3 * GIB);
+    assert_eq!(
+        lab.row::<i64>(
+            "SELECT pool_shrunk_from FROM launch_lmcache WHERE binding_id=?1",
+            &context.binding_id
+        ),
+        4 * GIB
+    );
+    let warning = "the LMCache pool (3 GiB) was reduced from 4 GiB to the host-KV room left on \
+                   the host: raise host_kv_limit or set lmcache_pool";
+    assert_eq!(
+        instance_status(&lab, &second)["lmcache"]["warning"],
+        warning
+    );
+    let short = lab.events("lmcache_pool_short", &second.deployment_id);
+    assert_eq!(short.len(), 1, "{short:?}");
+    assert_eq!(short[0]["detail"], warning);
+    // Nothing left: the third runs without LMCache.
+    let third = lab.deploy("third", |c| {
+        resources(c, "5GiB", "0B");
+        c.as_object_mut().unwrap().remove("lmcache_pool");
+    });
+    let (_, context) = lab.start(&third, 300);
+    assert_eq!(
+        planned(&lab, &context),
+        PlannedLmcache::Off(LmcacheOff::new(LmcacheOffReason::HostKvRoom))
+    );
+    let off = lab.events("lmcache_off", &third.deployment_id);
+    assert_eq!(off.len(), 1, "{off:?}");
+    assert_eq!(off[0]["reason"], "host_kv_room");
+    assert!(lab
+        .events("lmcache_pool_short", &third.deployment_id)
+        .is_empty());
+}
+
+// T45 (ADR 0034 §3a, owner rule of 2026-10-27): `lmcache: required` on a deep
+// combination outside the qualified table is not refused: it runs LMCache
+// with its server's ports leased, recorded uncertified with the combination
+// named, `lmcache_uncertified` journaled once, and status shows `certified:
+// false`. Under `lmcache: auto` the same combination still parks with
+// LMCache off (`park_unqualified`). CPU only: not qualification.
+#[test]
+fn lmcache_required_outside_the_table_runs_uncertified() {
+    let lab = Lab::new(|host| {
+        host["resource_policy"]["devices"]["gpu0"]["product_name"] = json!("NVIDIA GB10");
+    });
+    let checkpoint = tempfile::tempdir().unwrap();
+    std::fs::write(
+        checkpoint.path().join("config.json"),
+        json!({ "model_type": "qwen3" }).to_string(),
+    )
+    .unwrap();
+    let fence = lab.deploy("required", |c| {
+        c["residency"] = json!("deep");
+        c["lmcache"] = json!("required");
+        c["model"]["path"] = json!(checkpoint.path().to_str().unwrap());
+    });
+    let (_, context) = lab.start(&fence, 100);
+    assert!(
+        matches!(planned(&lab, &context), PlannedLmcache::On(_)),
+        "{:?}",
+        planned(&lab, &context)
+    );
+    let detail = "vLLM 0.32.0 / qwen3 / NVIDIA GB10 / deep is not in the qualified table";
+    assert_eq!(
+        lab.row::<String>(
+            "SELECT uncertified FROM launch_lmcache WHERE binding_id=?1",
+            &context.binding_id
+        ),
+        detail
+    );
+    let events = lab.events("lmcache_uncertified", &fence.deployment_id);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["detail"], detail);
+    assert_eq!(events[0]["binding_id"], json!(context.binding_id));
+    let shown = instance_status(&lab, &fence)["lmcache"].clone();
+    assert_eq!(shown["certified"], false);
+    assert_eq!(shown["uncertified"], detail);
+
+    let (lab, fence, _checkpoint) = deep_on_gb10("qwen3");
+    let (_, context) = lab.start(&fence, 100);
+    assert_eq!(planned(&lab, &context), unqualified("qwen3"));
+    assert!(lab
+        .events("lmcache_uncertified", &fence.deployment_id)
+        .is_empty());
+}
+
+/// The Lab's host enrolled, declaring `capabilities`.
+fn enroll(lab: &Lab, capabilities: &[&str]) {
+    lab.store
+        .conn
+        .execute(
+            "INSERT INTO enrolled_hosts(host_id,host_name,key_digest,revoked) VALUES('lab','lab','key',0)",
+            [],
+        )
+        .unwrap();
+    lab.store
+        .conn
+        .execute(
+            "INSERT INTO host_versions VALUES('lab','0.1.6','supported','',?1,1)",
+            [json!(capabilities).to_string()],
+        )
+        .unwrap();
+}
+
+/// What a start of instance 0 of `fence` on the enrolled `lab` would plan.
+fn remote_plan(lab: &Lab, fence: &DeploymentFence) -> SizedPlan {
+    let tx = lab.store.conn.unchecked_transaction().unwrap();
+    let (_, e) =
+        crate::checkpoint_digests::frozen_revision(&tx, &fence.deployment_id, fence.revision)
+            .unwrap();
+    sized_plan(&tx, &fence.deployment_id, fence.revision, 0, "lab", &e).unwrap()
+}
+
+// T45 (ADR 0034 §4): an enrolled host's checkpoint is not on the server's
+// machine, so its automatic pool is sized from the KV bytes per token and
+// the context that host reported with its sizing: the 4 GiB default, saying
+// why, until it has; then one full 32,768-token context of Qwen3-4B, 8 GiB.
+#[test]
+fn a_remote_pool_uses_the_basis_its_host_reported() {
+    let lab = Lab::new(|h| {
+        h["resource_policy"]["domains"]["unified"]["host_kv_limit"] = json!(GB10_HOST_KV_LIMIT);
+    });
+    let checkpoint = qwen3_checkpoint();
+    let fence = lab.deploy("remote", |c| {
+        c.as_object_mut().unwrap().remove("lmcache_pool");
+        c["model"]["path"] = json!(checkpoint.path().to_str().unwrap());
+    });
+    enroll(&lab, &[lc::CAPABILITY, lc::ENGINE_DRIVEN_CAPABILITY]);
+    let sizing = remote_plan(&lab, &fence).sizing.unwrap();
+    assert_eq!(
+        (sizing.pool_bytes, sizing.source, sizing.unknown.as_deref()),
+        (
+            4 << 30,
+            lc::PoolSource::Default,
+            Some("the host has not reported the checkpoint's KV size yet")
+        )
+    );
+    assert!(lab
+        .store
+        .record_checkpoint_weights(
+            &lab.session,
+            &fence.deployment_id,
+            fence.revision,
+            "lab",
+            7,
+            Some("qwen3"),
+            Some(lc::PoolBasis {
+                bytes_per_token: 147_456,
+                context_tokens: 32_768,
+            }),
+            200,
+        )
+        .unwrap());
+    let sized = remote_plan(&lab, &fence);
+    let sizing = sized.sizing.unwrap();
+    assert_eq!(
+        (sizing.pool_bytes, sizing.source),
+        (8 << 30, lc::PoolSource::Auto)
+    );
+    assert_eq!(
+        sizing.basis_text(sized.model_type.as_deref()),
+        "auto: one 32,768-token context of qwen3 at 144 KiB per token"
+    );
+}
+
+// T45 (ADR 0034 §1, ADR 0017): a parking residency's LMCache is
+// engine-driven, which a host from before ADR 0034 does not render: on an
+// enrolled host that does not declare `lmcache_engine_driven`, a deep launch
+// on a qualified combination keeps LMCache off (`host_capability_missing`);
+// once the host declares it, the same launch plans LMCache on.
+#[test]
+fn a_host_without_engine_driven_transfer_keeps_a_deep_launch_off() {
+    let (lab, fence, _checkpoint) = deep_on_gb10("qwen3");
+    enroll(&lab, &[lc::CAPABILITY]);
+    assert!(lab
+        .store
+        .record_checkpoint_weights(
+            &lab.session,
+            &fence.deployment_id,
+            fence.revision,
+            "lab",
+            7,
+            Some("qwen3"),
+            None,
+            200,
+        )
+        .unwrap());
+    QUALIFIED_PARKING.set(QWEN3_ON_GB10);
+    assert_eq!(
+        remote_plan(&lab, &fence).plan.state,
+        lc::LmcacheState::Off(LmcacheOff::with_detail(
+            LmcacheOffReason::HostCapabilityMissing,
+            "the host predates engine-driven transfer, which a parking residency needs",
+        ))
+    );
+    lab.store
+        .conn
+        .execute(
+            "UPDATE host_versions SET capabilities_json=?1 WHERE host_id='lab'",
+            [json!([lc::CAPABILITY, lc::ENGINE_DRIVEN_CAPABILITY]).to_string()],
+        )
+        .unwrap();
+    assert_eq!(remote_plan(&lab, &fence).plan.state, lc::LmcacheState::On);
     QUALIFIED_PARKING.set(lc::QUALIFIED_PARKING);
 }

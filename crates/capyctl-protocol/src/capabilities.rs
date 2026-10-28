@@ -132,6 +132,15 @@ pub const LMCACHE: &str = capyctl_config::lmcache::CAPABILITY;
 /// `host_capability_missing:retention` before anything is sent, since it
 /// would not honour it.
 pub const RETENTION: &str = capyctl_config::lmcache::RETENTION_CAPABILITY;
+/// ADR 0034 §1: the host renders engine-driven LMCache transfer for a
+/// parking residency (`--supported-transfer-mode engine_driven` on the
+/// server, `lmcache.mp.mp_transfer_mode` on the connector) and its
+/// launch-time check verifies the installation offers it. The server plans
+/// LMCache for a parking residency only on a host that declared it; on any
+/// other the launch runs with LMCache off (`host_capability_missing`), since
+/// an older host would render lmcache-driven transfer for it, which deep
+/// parking breaks. Nothing new travels on the wire for it.
+pub const LMCACHE_ENGINE_DRIVEN: &str = capyctl_config::lmcache::ENGINE_DRIVEN_CAPABILITY;
 /// ADR 0032 §2, §3: the host's ingress sets CapyCTL's request ID as SGLang's
 /// `rid` on a capable launch, and the host runs the AbortRequest action (an
 /// abort posted to a retained launch's engine on loopback). The server sends
@@ -198,6 +207,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (STARTUP_HOST_BYTES, Direction::ServerToHost),
     (LMCACHE, Direction::ServerToHost),
     (RETENTION, Direction::ServerToHost),
+    (LMCACHE_ENGINE_DRIVEN, Direction::ServerToHost),
     (REQUEST_ABORT, Direction::ServerToHost),
     (LOCAL_TENSOR_PARALLEL, Direction::ServerToHost),
 ];

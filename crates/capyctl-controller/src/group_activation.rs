@@ -644,7 +644,8 @@ async fn activate(
                 // ADR 0029 §1: llama.cpp runs no groups.
                 None,
                 // ADR 0033 §9: a group runs no LMCache, so its plan compares
-                // no model type.
+                // no model type and sizes no pool.
+                None,
                 None,
                 capyctl_protocol::now_unix_ms(),
             )

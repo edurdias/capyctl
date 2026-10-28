@@ -653,8 +653,8 @@ devices: [{id: gpu0}, {id: gpu1}]         # optional: exactly that many, to pin 
 - **Parking.** A model on several GPUs is `restart_only` for now; a stated
   `deep` or `host_backed` is refused (`capability_missing:deep_park`). vLLM
   and SGLang parking on several cards is built and is turned on per engine once
-  it passes on a two-GPU machine. LMCache is off for it
-  (`multi_gpu_unqualified`).
+  it passes on a two-GPU machine. LMCache is off for it under `lmcache: auto`
+  (`multi_gpu_unqualified`), and runs uncertified under `lmcache: required`.
 - **Enrolled hosts.** Both the server and the host need this release: the host
   declares the capability `local_tensor_parallel`, and the server never sends
   a model on several GPUs to a host that does not

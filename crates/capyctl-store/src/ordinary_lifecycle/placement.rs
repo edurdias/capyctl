@@ -75,7 +75,7 @@ pub(super) fn strategy(placement: &Placement) -> Strategy {
 /// 2026-09-23: it is charged its steady (Ready) footprint. Its startup peak is
 /// serialized behind other starts on that host by the activation gate, so
 /// placement only has to know the host can hold everything once Ready.
-fn pending_charges(
+pub(super) fn pending_charges(
     tx: &Transaction<'_>,
 ) -> Result<Vec<(String, String, PhaseFootprint)>, LifecycleError> {
     let rows: Vec<(String, String)> = tx
@@ -226,7 +226,7 @@ pub(super) fn candidates(
         // (declared, measured on this host, or the placeholder), or the whole
         // managed limit for a solo first start.
         let (footprint, whole_host) =
-            super::startup::startup_footprint(tx, deployment_id, revision, &host, &e)?;
+            super::startup::startup_footprint(tx, deployment_id, revision, instance, &host, &e)?;
         let (device_options, preferred_device) =
             device_options(tx, deployment_id, revision, instance, &host)?;
         // ADR 0035 §1a: under `topology: auto` this host's N is chosen now,
@@ -539,8 +539,14 @@ fn device_options(
             .map(|id| on_device.host.devices.get(id).map(|p| p.domain.clone()))
             .collect::<Option<Vec<_>>>()
             .ok_or(LifecycleError::CorruptStoredData)?;
-        let (footprint, _) =
-            super::startup::startup_footprint(tx, deployment_id, revision, host, &on_device)?;
+        let (footprint, _) = super::startup::startup_footprint(
+            tx,
+            deployment_id,
+            revision,
+            instance,
+            host,
+            &on_device,
+        )?;
         options.push(DeviceOption {
             device,
             domains,

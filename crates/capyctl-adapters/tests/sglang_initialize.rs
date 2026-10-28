@@ -1210,6 +1210,7 @@ async fn an_sglang_restart_park_retires_the_rendezvous_so_the_wake_starts() {
             start_bound: Duration::from_secs(5),
             proc_root,
             required: false,
+            transfer: capyctl_config::lmcache::TransferMode::LmcacheDriven,
         },
     );
     // The launch's rendezvous directory, as its first engine's entry made it.

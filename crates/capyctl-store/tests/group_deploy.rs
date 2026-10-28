@@ -234,6 +234,7 @@ fn a_measured_group_charges_each_member_its_share_of_the_weights() {
             None,
             None,
             None,
+            None,
             NOW,
         )
         .unwrap();
