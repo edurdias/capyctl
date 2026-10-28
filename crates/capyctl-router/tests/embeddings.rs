@@ -36,6 +36,9 @@ struct Authority {
     leases: Mutex<Vec<Option<LeaseEnd>>>,
     /// ADR 0036 §4: leases settled on their answer after a cut.
     settled: Mutex<Vec<String>>,
+    /// ADR 0036 §4: cut leases recorded as answered by the engine's complete
+    /// error answer, to settle on its idle reading.
+    answered: Mutex<Vec<String>>,
 }
 
 impl Authority {
@@ -61,6 +64,9 @@ impl Authority {
     }
     fn settled(&self) -> Vec<String> {
         self.settled.lock().unwrap().clone()
+    }
+    fn answered(&self) -> Vec<String> {
+        self.answered.lock().unwrap().clone()
     }
 }
 
@@ -191,6 +197,18 @@ impl capyctl_controller::LifecyclePort for Authority {
         self.settled.lock().unwrap().push(lease_id.to_owned());
         Ok(true)
     }
+    async fn answer_cut(&self, lease_id: &str) -> Result<bool, LeaseRefused> {
+        let index: usize = lease_id.parse().unwrap();
+        assert!(
+            matches!(
+                self.leases.lock().unwrap()[index],
+                Some(LeaseEnd::Cancelling { .. })
+            ),
+            "only a cancelling lease is answered"
+        );
+        self.answered.lock().unwrap().push(lease_id.to_owned());
+        Ok(true)
+    }
     async fn acknowledge_cancelled_request(&self, _lease: &str) -> Result<bool, LeaseRefused> {
         panic!("ADR 0036 §4: an embeddings request is never aborted")
     }
@@ -257,6 +275,12 @@ enum Reply {
         rest: Option<String>,
         gate: Arc<tokio::sync::Notify>,
     },
+    /// Nothing until the gate opens, then a status and JSON body, whole.
+    Late {
+        status: u16,
+        body: &'static str,
+        gate: Arc<tokio::sync::Notify>,
+    },
 }
 
 /// What reached the engine (path and body), and how its answers ended:
@@ -299,6 +323,10 @@ async fn engine(reply: Reply) -> (String, Seen) {
             ));
             let (status, media, body) = match reply {
                 Reply::Answer(status, media, body) => (status, media, axum::body::Body::from(body)),
+                Reply::Late { status, body, gate } => {
+                    gate.notified().await;
+                    (status, "application/json", axum::body::Body::from(body))
+                }
                 Reply::Paused { head, rest, gate } => {
                     let stream = async_stream::stream! {
                         let mut watch = Watch { seen, ended: false };
@@ -361,6 +389,7 @@ fn authority(api: DeploymentApi, engine: &'static str, endpoint: &str) -> Arc<Au
         endpoint: endpoint.into(),
         leases: Mutex::new(Vec::new()),
         settled: Mutex::new(Vec::new()),
+        answered: Mutex::new(Vec::new()),
     })
 }
 
@@ -941,6 +970,161 @@ async fn a_cut_answer_that_breaks_is_held_to_the_verified_stop() {
         vec![Some(LeaseEnd::Cancelling { answered: true })]
     );
     assert_eq!(deps.inflight.current(DEPLOYMENT), 0);
+}
+
+// T47 T17 (ADR 0036 §4): a request cut by its deadline before the engine
+// answered, whose engine then gives its complete error answer, is answered,
+// as today: its cancellation is recorded as answered so the engine's idle
+// reading settles it. It is never settled on that answer, and its lease stays
+// charged (cancelling) until the reading.
+#[tokio::test]
+async fn a_cut_answered_by_an_engine_error_settles_on_the_idle_reading() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let (endpoint, _seen) = engine(Reply::Late {
+        status: 500,
+        body: r#"{"error":{"message":"the engine ran out of memory"}}"#,
+        gate: gate.clone(),
+    })
+    .await;
+    let (authority, deps, router) = stack(DeploymentApi::Embeddings, &endpoint);
+    authority.ready.store(true, Ordering::SeqCst);
+    deps.inflight
+        .waiting
+        .set_limits(capyctl_router::queue::WaitLimits {
+            deadline: Duration::from_millis(300),
+            stream_idle: Duration::from_secs(600),
+            ..Default::default()
+        });
+    let (status, answer) =
+        tokio::time::timeout(Duration::from_secs(10), embed(&router, &embed_body()))
+            .await
+            .expect("cut at the request deadline");
+    assert_eq!(status, 500, "{answer}");
+    assert_eq!(
+        authority.ends(),
+        vec![Some(LeaseEnd::Cancelling { answered: false })]
+    );
+    assert!(authority.answered().is_empty(), "not before the answer");
+    gate.notify_one();
+    until("the cut is recorded as answered", || {
+        authority.answered() == vec!["0".to_owned()]
+    })
+    .await;
+    assert!(
+        authority.settled().is_empty(),
+        "an error answer is not completion"
+    );
+    assert_eq!(
+        authority.ends(),
+        vec![Some(LeaseEnd::Cancelling { answered: false })]
+    );
+}
+
+// T47 T17 (ADR 0036 §4): a request cut by the idle bound after its first
+// bytes reads on: silence is counted from the cut, so an engine that
+// finishes within the bound after it settles the lease on its answer.
+#[tokio::test]
+async fn an_idle_cut_reads_on_from_the_cut() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let (head, rest) = halves();
+    let (endpoint, seen) = engine(Reply::Paused {
+        head,
+        rest: Some(rest),
+        gate: gate.clone(),
+    })
+    .await;
+    let (authority, deps, router) = stack(DeploymentApi::Embeddings, &endpoint);
+    deps.inflight
+        .waiting
+        .set_limits(capyctl_router::queue::WaitLimits {
+            deadline: Duration::from_secs(60),
+            stream_idle: Duration::from_millis(500),
+            ..Default::default()
+        });
+    let request = tokio::spawn(async move {
+        send_raw(
+            &router,
+            "/v1/embeddings",
+            embed_body().to_string().into_bytes(),
+        )
+        .await
+    });
+    until("the idle bound cuts the request", || {
+        authority.ends() == vec![Some(LeaseEnd::Cancelling { answered: true })]
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        seen.dropped.load(Ordering::SeqCst),
+        0,
+        "the engine connection stays open after the cut"
+    );
+    gate.notify_one();
+    until("the lease settles on the answer", || {
+        authority.settled() == vec!["0".to_owned()]
+    })
+    .await;
+    assert_eq!(seen.finished.load(Ordering::SeqCst), 1);
+    let (status, _, body) = request.await.unwrap();
+    assert_eq!(status, 200);
+    assert!(
+        String::from_utf8(body)
+            .unwrap()
+            .starts_with(r#"{"id":"embd-1""#),
+        "the body ends after the relayed bytes"
+    );
+}
+
+// T47 T17 (ADR 0036 §4): a client that hangs up some time after the last
+// engine byte leaves the read the whole idle bound from its hang-up, not
+// from that byte.
+#[tokio::test]
+async fn a_hang_up_reads_on_for_the_idle_bound_from_the_cut() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let (head, rest) = halves();
+    let (endpoint, seen) = engine(Reply::Paused {
+        head,
+        rest: Some(rest),
+        gate: gate.clone(),
+    })
+    .await;
+    let (authority, deps, router) = stack(DeploymentApi::Embeddings, &endpoint);
+    deps.inflight
+        .waiting
+        .set_limits(capyctl_router::queue::WaitLimits {
+            deadline: Duration::from_secs(60),
+            stream_idle: Duration::from_millis(1000),
+            ..Default::default()
+        });
+    let address = serve(router).await;
+    let mut response = reqwest::Client::new()
+        .post(format!("http://{address}/v1/embeddings"))
+        .json(&embed_body())
+        .send()
+        .await
+        .unwrap();
+    response.chunk().await.unwrap().unwrap();
+    let first_byte = tokio::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    drop(response);
+    until("the lease is cancelling on the hang-up", || {
+        authority.ends() == vec![Some(LeaseEnd::Cancelling { answered: true })]
+    })
+    .await;
+    // Past the idle bound from the last engine byte, well within it from
+    // the hang-up.
+    tokio::time::sleep_until(first_byte + Duration::from_millis(1300)).await;
+    assert_eq!(
+        seen.dropped.load(Ordering::SeqCst),
+        0,
+        "the engine connection stays open"
+    );
+    gate.notify_one();
+    until("the lease settles on the answer", || {
+        authority.settled() == vec!["0".to_owned()]
+    })
+    .await;
+    assert_eq!(seen.finished.load(Ordering::SeqCst), 1);
 }
 
 // T47 (ADR 0036 §3): `/v1/models` names an embeddings deployment's API

@@ -407,6 +407,12 @@ pub enum LeaseWrite {
         lease_id: String,
         evidence: crate::request_lease_cancellations::CancelledEvidence,
     },
+    /// ADR 0036 §4: the engine gave its complete error answer to the cut
+    /// request of this session's cancelling lease `lease_id`. The cancellation
+    /// is recorded as answered, as of now, so it settles on an idle reading
+    /// taken after that answer. Settled(false) when it is no longer an open
+    /// cancelling lease of this session; nothing changes.
+    AnswerCancelled { lease_id: String },
 }
 
 /// What one `LeaseWrite` in a batch produced.
@@ -501,6 +507,10 @@ impl crate::Store {
                         *evidence,
                     )
                     .map(LeaseWriteOutcome::Settled)
+                }
+                LeaseWrite::AnswerCancelled { lease_id } => {
+                    crate::request_lease_cancellations::answer_in(&transaction, session, lease_id)
+                        .map(LeaseWriteOutcome::Settled)
                 }
             };
             // A storage error inside the transaction poisons the whole group.

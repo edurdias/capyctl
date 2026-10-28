@@ -9,9 +9,11 @@
 //! cut by its deadline, idle bound or a stalled delivery, never drops it (owner
 //! decision 2026-10-27, question 7): the lease is closed `cancelling` at the
 //! cut, the answer is read and checked to its end with nothing more relayed,
-//! and a complete answer settles the lease on it. Only an answer that never
-//! completes keeps today's rule (SPEC §10: the instance's next verified stop,
-//! and ADR 0032 §7's restart when such requests fill the deployment).
+//! and a complete answer settles the lease on it. The engine's complete error
+//! answer is answered and settles on the engine's idle reading, as today. Only
+//! an answer that never completes keeps today's rule (SPEC §10: the
+//! instance's next verified stop, and ADR 0032 §7's restart when such
+//! requests fill the deployment).
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -466,12 +468,16 @@ enum ReadOn<T> {
 
 /// ADR 0036 §4: read a cut request's answer to its end, relaying nothing.
 /// The engine is never held back by an unread connection; only silence past
-/// `idle` (counted from the cut, re-armed by progress) gives up on it.
+/// `idle` (counted from the cut, re-armed by progress) gives up on it. Called
+/// at the cut, once whether the engine answered was taken from `progress`.
 async fn read_to_end<F: Future>(
     forward: std::pin::Pin<&mut F>,
     progress: &Progress,
     idle: Duration,
 ) -> ReadOn<F::Output> {
+    // `bounded` counts silence from the last mark; an idle cut's last engine
+    // byte is already `idle` old, and a hang-up's or delivery's may be.
+    progress.mark();
     let bounds = StreamBounds {
         first_event_by: tokio::time::Instant::now() + idle,
         idle,
@@ -482,10 +488,25 @@ async fn read_to_end<F: Future>(
     }
 }
 
+/// A failed ledger write leaves the lease charged, the conservative outcome;
+/// reported as a failed close is.
+fn stays_charged(lease: &str, error: &capyctl_controller::LeaseRefused, ids: &RequestIds) {
+    capyctl_domain::role_log::notice(
+        capyctl_domain::role_log::Level::Warning,
+        &format!(
+            "request lease {lease} stays charged: {error}{}",
+            ids.log_suffix()
+        ),
+    );
+}
+
 /// ADR 0036 §4: settle a cut request on how its read ended. A complete
 /// answer (or the engine's complete invalid-request answer, SPEC §10's other
-/// completion) settles its cancelling lease on it; anything else leaves it
-/// to today's rule. Role-logged with the request's IDs and the lease.
+/// completion) settles its cancelling lease on it. The engine's complete
+/// error answer is answered, as today: its cancellation is recorded as
+/// answered and settles on the engine's idle reading, the lease charged
+/// until then. Anything else leaves it to today's rule. Role-logged with the
+/// request's IDs and the lease.
 async fn settle_cut(
     held: Option<(Arc<dyn capyctl_controller::LifecyclePort>, String)>,
     guard: Option<StaticStreamGuard>,
@@ -499,45 +520,51 @@ async fn settle_cut(
         outcome,
         ReadOn::Ended(Ok(_) | Err(AdapterError::Rejected { .. }))
     );
-    let reason = match &outcome {
-        ReadOn::Ended(Ok(_)) | ReadOn::Ended(Err(AdapterError::Rejected { .. })) => None,
-        ReadOn::Ended(Err(_)) => Some("answer_not_completion"),
-        ReadOn::Silent => Some("engine_silent"),
-    };
-    let settled = match (completed, &held) {
-        (true, Some((authority, lease))) => match authority.settle_answered_cut(lease).await {
-            Ok(true) => Ok(()),
-            // Already settled on the engine's idle reading, or uncertain.
-            Ok(false) => Err("lease_not_cancelling"),
-            // A failed write leaves the lease charged, the conservative
-            // outcome; reported as a failed close is.
-            Err(error) => {
-                capyctl_domain::role_log::notice(
-                    capyctl_domain::role_log::Level::Warning,
-                    &format!(
-                        "request lease {lease} stays charged: {error}{}",
-                        ids.log_suffix()
-                    ),
-                );
-                Err("settlement_failed")
+    let settled = match (&outcome, &held) {
+        (_, Some((authority, lease))) if completed => {
+            match authority.settle_answered_cut(lease).await {
+                Ok(true) => Ok("settled_on_answer"),
+                // Already settled on the engine's idle reading, or uncertain.
+                Ok(false) => Err("lease_not_cancelling"),
+                Err(error) => {
+                    stays_charged(lease, &error, ids);
+                    Err("settlement_failed")
+                }
             }
-        },
-        (true, None) => Ok(()),
-        (false, _) => Err(reason.unwrap_or("answer_not_completion")),
+        }
+        (_, None) if completed => Ok("settled_on_answer"),
+        // SPEC §10 (amended 2026-10-17): the engine's complete error answer
+        // does not show it stopped; its idle reading after the answer does.
+        (ReadOn::Ended(Err(AdapterError::EngineError { .. })), Some((authority, lease))) => {
+            match authority.answer_cut(lease).await {
+                Ok(true) => Ok("settles_on_idle_reading"),
+                Ok(false) => Err("lease_not_cancelling"),
+                Err(error) => {
+                    stays_charged(lease, &error, ids);
+                    Err("answer_record_failed")
+                }
+            }
+        }
+        (ReadOn::Ended(_), _) => Err("answer_not_completion"),
+        (ReadOn::Silent, _) => Err("engine_silent"),
     };
     // Without a durable ledger the slot is the only record: freed only on
     // the answer, else held for the life of the process (as today).
     if let (true, Some(guard)) = (completed, guard) {
         guard.release();
     }
+    let (outcome, reason) = match settled {
+        Ok(outcome) => (outcome, None),
+        Err(reason) => ("held", Some(reason)),
+    };
     let mut event = serde_json::json!({
         "event": "router_embedding_cut",
         "deployment": deployment,
         "generation": generation,
         "lease": held.as_ref().map(|(_, lease)| lease.clone()),
         "cut": cut.name(),
-        "outcome": if settled.is_ok() { "settled_on_answer" } else { "held" },
-        "reason": settled.err(),
+        "outcome": outcome,
+        "reason": reason,
     });
     ids.log_fields(&mut event);
     capyctl_domain::role_log::event(event);

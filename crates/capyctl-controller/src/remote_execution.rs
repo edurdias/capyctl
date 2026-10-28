@@ -1047,17 +1047,9 @@ fn canary_evidence(
                     "the engine did not answer the embedding probe for the wake canary".into(),
                 )
             })?;
-            let norm = evidence
-                .vector
-                .iter()
-                .map(|value| f64::from(*value).powi(2))
-                .sum::<f64>()
-                .sqrt();
+            // ADR 0036 §5: the shared vector rule of the probe itself.
             let well_formed = evidence.probe_version == embedding_probe::VERSION
-                && !evidence.vector.is_empty()
-                && evidence.vector.iter().all(|value| value.is_finite())
-                && norm.is_finite()
-                && norm > embedding_probe::MIN_NORM;
+                && embedding_probe::well_formed(&evidence.vector);
             if !well_formed {
                 return Err(RuntimeError::Uncertain(
                     "the host relayed a malformed embedding probe answer".into(),

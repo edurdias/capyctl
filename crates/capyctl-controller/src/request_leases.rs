@@ -306,6 +306,23 @@ impl RequestLeaseWriter {
         }
     }
 
+    /// ADR 0036 §4: record the cancelling lease `lease_id` of a cut
+    /// embeddings request as answered, now that the engine's complete error
+    /// answer was read, so it settles on an idle reading taken after it.
+    /// `Ok(false)` when it is no longer an open cancelling lease of this
+    /// session; nothing changed. An error leaves it as it was: charged.
+    pub async fn answer_cut(&self, lease_id: &str) -> Result<bool, LeaseRefused> {
+        match self
+            .submit(LeaseWrite::AnswerCancelled {
+                lease_id: lease_id.to_owned(),
+            })
+            .await?
+        {
+            Answer::Settled(changed) => Ok(changed),
+            Answer::Granted(_) => Err(LeaseRefused::Unavailable("unexpected ledger answer".into())),
+        }
+    }
+
     async fn submit(&self, write: LeaseWrite) -> Result<Answer, LeaseRefused> {
         let grant = is_grant(&write);
         let (reply, answer) = tokio::sync::oneshot::channel();

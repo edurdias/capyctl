@@ -353,6 +353,21 @@ pub trait LifecyclePort: Send + Sync {
         Ok(false)
     }
 
+    /// ADR 0036 §4: "A complete engine error answer is answered, as today,
+    /// and settles on the engine's idle reading." Record the cancelling lease
+    /// `lease_id` of a cut embeddings request, cancelled before the engine
+    /// answered it, as answered now that its complete error answer was read,
+    /// so only an idle reading taken after that answer settles it. `Ok(false)`
+    /// when the lease is no longer an open cancelling lease of the current
+    /// session: nothing changes, and it keeps today's rule. An error leaves it
+    /// charged. The default is an authority with no ledger to record it in.
+    async fn answer_cut(
+        &self,
+        _lease_id: &str,
+    ) -> Result<bool, crate::request_leases::LeaseRefused> {
+        Ok(false)
+    }
+
     /// ADR 0032 §7: the deployment's durable lease bound refused a grant as
     /// full. When every open lease of `deployment_id` is a cancelled request
     /// that settles only at its instance's next verified stop (and none is

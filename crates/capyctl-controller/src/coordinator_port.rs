@@ -1059,6 +1059,15 @@ impl LifecyclePort for CoordinatorLifecycle {
             .await
     }
 
+    /// ADR 0036 §4: the complete error answer of a cut embeddings request,
+    /// group-committed.
+    async fn answer_cut(
+        &self,
+        lease_id: &str,
+    ) -> Result<bool, crate::request_leases::LeaseRefused> {
+        self.leases.answer_cut(lease_id).await
+    }
+
     /// ADR 0032 §7: against the deployment limit the router grants under
     /// (`MAX_REQUESTS_PER_DEPLOYMENT`). Restarting also when every instance
     /// holding the requests is already stopping.

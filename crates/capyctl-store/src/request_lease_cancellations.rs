@@ -23,6 +23,11 @@
 //! alone ([`crate::dispatch::LeaseWrite::AcknowledgeCancelled`]), whatever the
 //! engine's counters read and whether or not it would otherwise settle at
 //! stop.
+//!
+//! ADR 0036 §4: a cut embeddings request is read on after its cut; when the
+//! engine's complete error answer arrives, its cancellation becomes answered
+//! as of then ([`crate::dispatch::LeaseWrite::AnswerCancelled`]) and settles
+//! on a later idle reading.
 
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
@@ -107,6 +112,34 @@ pub(crate) fn acknowledge_in(
     tx.prepare_cached("DELETE FROM request_leases WHERE id=?1")?
         .execute([lease_id])?;
     Ok(true)
+}
+
+/// ADR 0036 §4: "A complete engine error answer is answered, as today, and
+/// settles on the engine's idle reading." A cut embeddings request is
+/// cancelled before the engine answers it; when the engine's complete error
+/// answer is read afterwards, record its cancellation as answered and move
+/// its time to now, so only an idle reading taken after that answer settles
+/// it. `Ok(false)` when it is not an open cancelling lease of this session:
+/// never cancelled, already settled, or uncertain (a previous session's).
+pub(crate) fn answer_in(
+    tx: &Transaction<'_>,
+    session: &CoordinatorSession,
+    lease_id: &str,
+) -> Result<bool, DispatchError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    let changed = tx
+        .prepare_cached(
+            "UPDATE request_lease_cancellations
+                SET engine_answered=1,cancelled_at_ms=MAX(cancelled_at_ms,?3)
+              WHERE lease_id=?1 AND EXISTS(SELECT 1 FROM request_leases l
+                WHERE l.id=?1 AND l.session_id=?2 AND l.disposition='inflight')",
+        )?
+        .execute(params![lease_id, session.id(), now])?;
+    Ok(changed == 1)
 }
 
 /// A retained binding with at least one cancelling lease of this session.
@@ -693,5 +726,112 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert!(pending[0].uncertain);
         assert!(acknowledgements(&store).is_empty());
+    }
+
+    /// ADR 0036 §4: record `lease_id`'s cancellation as answered by the
+    /// engine's complete error answer under `session`; the batch's one outcome.
+    fn answer(
+        store: &Store,
+        session: &CoordinatorSession,
+        lease_id: &str,
+    ) -> Result<bool, crate::dispatch::DispatchError> {
+        let mut outcome = store.apply_request_lease_batch(
+            session,
+            &[LeaseWrite::AnswerCancelled {
+                lease_id: lease_id.to_owned(),
+            }],
+        )?;
+        match outcome.pop() {
+            Some(Ok(LeaseWriteOutcome::Settled(changed))) => Ok(changed),
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+
+    // T47 T17 (ADR 0036 §4): a cut embeddings request cancelled before the
+    // engine answered, whose complete error answer is read afterwards, is
+    // answered as of that answer: drains wait for it again, and only an idle
+    // reading taken after the answer settles it, never an earlier one.
+    #[test]
+    fn a_complete_error_answer_after_a_cut_settles_on_a_later_idle_reading() {
+        let f = ready_instance_with_lease();
+        cancel(&f, false);
+        f.store
+            .conn
+            .execute(
+                "UPDATE request_lease_cancellations SET cancelled_at_ms=1 WHERE lease_id=?1",
+                [f.ticket.id()],
+            )
+            .unwrap();
+        assert!(f.store.cancelling_bindings(&f.session).unwrap().is_empty());
+        assert!(answer(&f.store, &f.session, f.ticket.id()).unwrap());
+        let cancelling = f.store.cancelling_bindings(&f.session).unwrap();
+        assert_eq!(cancelling.len(), 1);
+        assert_eq!(cancelling[0].leases, 1);
+        let at = cancelling[0].newest_cancelled_at_ms;
+        assert!(at > 1, "the cancellation counts from the answer");
+        assert_eq!(f.store.switch_outstanding_leases(&f.dep, 0, 1).unwrap(), 1);
+        assert_eq!(
+            f.store
+                .settle_cancelled_leases(&f.session, &f.binding, at - 1, "r")
+                .unwrap(),
+            0,
+            "a reading before the answer settles nothing"
+        );
+        assert_eq!(
+            f.store
+                .settle_cancelled_leases(&f.session, &f.binding, at, "r")
+                .unwrap(),
+            1
+        );
+        assert!(f.store.pending_dispatches(&f.dep).unwrap().is_empty());
+    }
+
+    // T47 T17 T38 (ADR 0036 §4): only an open cancelling lease of this session
+    // is answered: a lease never cancelled, already settled, unknown, or
+    // uncertain after a restart is left alone, and the previous session can
+    // no longer write at all.
+    #[test]
+    fn answering_leaves_any_other_lease_alone() {
+        let f = ready_instance_with_lease();
+        assert!(!answer(&f.store, &f.session, f.ticket.id()).unwrap());
+        assert!(!answer(&f.store, &f.session, "01K00000000000000000000X99").unwrap());
+        cancel(&f, true);
+        assert_eq!(
+            f.store
+                .settle_cancelled_leases(&f.session, &f.binding, i64::MAX, "r")
+                .unwrap(),
+            1
+        );
+        assert!(!answer(&f.store, &f.session, f.ticket.id()).unwrap());
+
+        let f = ready_instance_with_lease();
+        cancel(&f, false);
+        let Fixture {
+            _directory,
+            path,
+            store,
+            session,
+            dep,
+            ticket,
+            ..
+        } = f;
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let next = store.begin_coordinator_session().unwrap();
+        assert!(!answer(&store, &next, ticket.id()).unwrap());
+        assert!(matches!(
+            answer(&store, &session, ticket.id()),
+            Err(crate::dispatch::DispatchError::StaleSession)
+        ));
+        let answered: bool = store
+            .conn
+            .query_row(
+                "SELECT engine_answered FROM request_lease_cancellations WHERE lease_id=?1",
+                [ticket.id()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!answered);
+        assert_eq!(store.pending_dispatches(&dep).unwrap().len(), 1);
     }
 }

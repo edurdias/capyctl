@@ -56,16 +56,35 @@ pub fn request(served: &str) -> Value {
     })
 }
 
+/// ADR 0036 §5: the smallest vector a ready instance answers: at least one
+/// number, every one finite, its Euclidean norm (measured in float64)
+/// finite and above [`MIN_NORM`]. The one rule the probe and the
+/// controller's check of a relayed wake canary share.
+pub fn well_formed(vector: &[f32]) -> bool {
+    let norm = vector
+        .iter()
+        .map(|value| f64::from(*value).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    !vector.is_empty()
+        && vector.iter().all(|value| value.is_finite())
+        && norm.is_finite()
+        && norm > MIN_NORM
+}
+
 /// ADR 0036 §5: the answer when it is completion by §4 for one input: a
-/// `list` whose `data` holds exactly one entry with `index` 0 and an
-/// `embedding` of at least one finite number, its Euclidean norm finite and
-/// above [`MIN_NORM`]; else an error naming what was wrong (never the
-/// answer's own content).
+/// `list` with a string `model` whose `data` holds exactly one entry with
+/// a string `object`, `index` 0 and an `embedding` that is
+/// [`well_formed`] (the members forwarding requires, ADR 0036 §4); else an
+/// error naming what was wrong (never the answer's own content).
 pub fn answer(response: &Value) -> Result<EmbeddingAnswer, AdapterError> {
     let failed =
         |what: &str| AdapterError::Uncertain(format!("the embedding probe answered {what}"));
     if response.get("object").and_then(Value::as_str) != Some("list") {
         return Err(failed("no list"));
+    }
+    if !response.get("model").is_some_and(Value::is_string) {
+        return Err(failed("no model"));
     }
     let [entry] = response
         .get("data")
@@ -75,13 +94,15 @@ pub fn answer(response: &Value) -> Result<EmbeddingAnswer, AdapterError> {
     else {
         return Err(failed("other than one entry"));
     };
+    if !entry.get("object").is_some_and(Value::is_string) {
+        return Err(failed("an entry without an object"));
+    }
     if entry.get("index").and_then(Value::as_u64) != Some(0) {
         return Err(failed("an entry that is not index 0"));
     }
     let values = entry
         .get("embedding")
         .and_then(Value::as_array)
-        .filter(|values| !values.is_empty())
         .ok_or_else(|| failed("no float vector"))?;
     let vector = values
         .iter()
@@ -89,17 +110,11 @@ pub fn answer(response: &Value) -> Result<EmbeddingAnswer, AdapterError> {
             value
                 .as_f64()
                 .map(|value| value as f32)
-                .filter(|value| value.is_finite())
-                .ok_or_else(|| failed("a value that is not a finite number"))
+                .ok_or_else(|| failed("a value that is not a number"))
         })
         .collect::<Result<Vec<f32>, _>>()?;
-    let norm = vector
-        .iter()
-        .map(|value| f64::from(*value).powi(2))
-        .sum::<f64>()
-        .sqrt();
-    if !norm.is_finite() || norm <= MIN_NORM {
-        return Err(failed("a vector whose norm is not above 1e-6"));
+    if !well_formed(&vector) {
+        return Err(failed("no finite vector whose norm is above 1e-6"));
     }
     Ok(EmbeddingAnswer { vector })
 }
@@ -227,6 +242,42 @@ mod tests {
         ] {
             assert!(answer(&bad).is_err(), "{bad}");
         }
+    }
+
+    // T47 (ADR 0036 §§4-5): readiness asks the same shape forwarding
+    // requires, so an answer without a string `model`, or with an entry
+    // without a string `object`, is not ready.
+    #[test]
+    fn an_answer_forwarding_would_refuse_is_not_ready() {
+        let good = entry(json!(0), json!([0.6, 0.8]));
+        let mut no_model = engine(json!([good.clone()]));
+        no_model.as_object_mut().unwrap().remove("model");
+        let mut numeric_model = engine(json!([good.clone()]));
+        numeric_model["model"] = json!(7);
+        let mut bare_entry = good.clone();
+        bare_entry.as_object_mut().unwrap().remove("object");
+        let mut numeric_entry = good;
+        numeric_entry["object"] = json!(1);
+        for bad in [
+            no_model,
+            numeric_model,
+            engine(json!([bare_entry])),
+            engine(json!([numeric_entry])),
+        ] {
+            assert!(answer(&bad).is_err(), "{bad}");
+        }
+    }
+
+    // T47 (ADR 0036 §5): the one vector rule every crate shares.
+    #[test]
+    fn well_formed_is_finite_nonempty_and_above_a_millionth() {
+        assert!(well_formed(&[0.6, -0.8]));
+        assert!(well_formed(&[f32::MAX; 4]));
+        assert!(!well_formed(&[]));
+        assert!(!well_formed(&[0.0, 0.0]));
+        assert!(!well_formed(&[1e-7, 1e-7]));
+        assert!(!well_formed(&[1.0, f32::NAN]));
+        assert!(!well_formed(&[f32::INFINITY]));
     }
 
     // T47: the norm is measured in float64, so float32 values at their
