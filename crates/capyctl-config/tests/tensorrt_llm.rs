@@ -14,6 +14,7 @@ use capyctl_config::engine_policy::{
 use capyctl_config::lmcache::{engine_gate, LmcacheOffReason};
 use capyctl_config::registration::{is_verified, ENVIRONMENT_PROFILES};
 use capyctl_config::tensorrt_llm::{RESERVED_NEVER_RENDERED, RESERVED_RENDERED, TYPED_OPTIONS};
+use capyctl_config::tensorfold_native::TensorfoldLine;
 use capyctl_config::ConfigErrorCode;
 use capyctl_domain::launch::{LaunchSettings, TensorrtLlmLaunchSettings};
 use serde_json::{json, Value};
@@ -74,6 +75,8 @@ fn extra(items: &[&str], approved: &[&str]) -> Result<(), ProfileArgError> {
         &args(items),
         &ExtraArgsContext {
             engine: Engine::TensorrtLlm,
+            api: capyctl_config::effective::DeploymentApi::Chat,
+            line: TensorfoldLine::Python,
             sleep_mode: false,
             approved_options: &approved_options,
             approved_paths: &approved_paths,
@@ -352,9 +355,10 @@ fn every_reserved_spelling_is_refused() {
         Err(ProfileArgError::PathNotApproved(_))
     ));
     // Host-fixed arguments follow the same names.
-    assert!(validate_profile_args(Engine::TensorrtLlm, &args(&["--tp_size", "2"]), false).is_err());
+    assert!(validate_profile_args(Engine::TensorrtLlm, TensorfoldLine::Python, &args(&["--tp_size", "2"]), false).is_err());
     validate_profile_args(
         Engine::TensorrtLlm,
+        TensorfoldLine::Python,
         &args(&["--max_num_tokens", "8192"]),
         false,
     )
@@ -411,6 +415,7 @@ fn the_context_is_fitted_to_whole_blocks() {
     let effective = resolve(&deployment, &host).unwrap();
     let fit = fit_for_launch(
         Engine::TensorrtLlm,
+        TensorfoldLine::Python,
         &effective.engine_config,
         &[],
         Some(dir.path()),
