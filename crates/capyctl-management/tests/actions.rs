@@ -1,3 +1,4 @@
+mod support;
 use axum::{
     body::{to_bytes, Body},
     http::Request,
@@ -72,9 +73,11 @@ async fn setup_with_observations(
         SharedConfigurationSource::new(owner.clone(), host["input"]["host"].clone(), "owner")
             .unwrap(),
     );
-    let app = lifecycle_router(
+    let app = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(OwnedActionSource::new(configuration, worker.commands()).unwrap()),
+        lifecycle_router(Arc::new(
+            OwnedActionSource::new(configuration, worker.commands()).unwrap(),
+        )),
     );
     (dir, owner, worker, source.fence.deployment_id.clone(), app)
 }

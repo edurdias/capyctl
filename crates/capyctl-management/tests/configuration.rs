@@ -1,3 +1,4 @@
+mod support;
 use axum::{
     body::{to_bytes, Body},
     http::Request,
@@ -55,9 +56,11 @@ fn fixture() -> (
 }
 
 fn app(state: Arc<Mutex<OwnedCoordinatorState>>, host: Value) -> axum::Router {
-    configuration_router(
+    support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(SharedConfigurationSource::new(state, host, "owner").unwrap()),
+        configuration_router(Arc::new(
+            SharedConfigurationSource::new(state, host, "owner").unwrap(),
+        )),
     )
 }
 fn request(method: &str, path: &str, key: &str, body: Value) -> Request<Body> {
@@ -249,9 +252,9 @@ impl capyctl_management::configuration::ConfigurationSource for RejectingSource 
     }
 }
 fn rejecting_app(source: Arc<RejectingSource>) -> axum::Router {
-    configuration_router(
+    support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        source,
+        configuration_router(source),
     )
 }
 fn raw_request(method: &str, path: &str, body: &str) -> Request<Body> {
@@ -876,9 +879,11 @@ async fn registry_configuration_freezes_selected_host_and_replays() {
             .unwrap();
         cert.host_id
     };
-    let router = configuration_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+        configuration_router(Arc::new(
+            SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap(),
+        )),
     );
     config["host"] = "host-a".into();
     let body = json!({"config":config,"activate":false});
@@ -1073,9 +1078,11 @@ async fn registry_resolves_every_allowed_host_the_selector_matches() {
     let (_directory, state, mut config, _) = fixture();
     let a = publish_host(&state, "host-a", 'e', json!({"gpu": "gb10"}));
     let b = publish_host(&state, "host-b", 'f', json!({"gpu": "other"}));
-    let router = configuration_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+        configuration_router(Arc::new(
+            SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap(),
+        )),
     );
     config["instances"] = json!(1);
     config["placement"] = json!({"hosts": ["host-a", "host-b"], "selector": {"gpu": "gb10"}});
@@ -1416,9 +1423,11 @@ async fn a_deploy_naming_an_unpublished_profile_fails_fast() {
     let (_directory, state, mut config, _) = fixture();
     publish_host(&state, "host-a", 'e', json!({}));
     publish_host(&state, "host-b", 'f', json!({}));
-    let router = configuration_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+        configuration_router(Arc::new(
+            SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap(),
+        )),
     );
     config["instances"] = json!(1);
     config["placement"] = json!({"hosts": ["host-a", "host-b"]});
@@ -1554,9 +1563,11 @@ async fn a_host_lacking_the_profile_is_refused_while_another_has_it() {
             })
             .unwrap();
     }
-    let router = configuration_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+        configuration_router(Arc::new(
+            SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap(),
+        )),
     );
     config["instances"] = json!(1);
     config["placement"] = json!({"hosts": ["host-a", "host-b"]});
@@ -1648,9 +1659,11 @@ fn group_hosts(
             .unwrap();
         ids.push(id);
     }
-    let router = configuration_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+        configuration_router(Arc::new(
+            SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap(),
+        )),
     );
     (router, ids)
 }
@@ -1880,9 +1893,11 @@ fn decisions_hosts(
             .unwrap();
         ids.push(id);
     }
-    let router = configuration_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+        configuration_router(Arc::new(
+            SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap(),
+        )),
     );
     (router, ids)
 }
@@ -2017,9 +2032,11 @@ fn custom_hosts(
             .unwrap();
         ids.push(id);
     }
-    let router = configuration_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+        configuration_router(Arc::new(
+            SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap(),
+        )),
     );
     (router, ids)
 }
@@ -2178,9 +2195,11 @@ fn lmcache_hosts(
             .unwrap();
         ids.push(id);
     }
-    let router = configuration_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+        configuration_router(Arc::new(
+            SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap(),
+        )),
     );
     (router, ids)
 }

@@ -340,31 +340,27 @@ impl Stream for Counted {
 
 /// Serve `router` until `stop` turns true, then stop accepting and let open
 /// connections finish; the caller bounds how long it waits for that.
+///
+/// SPEC §17: every accepted connection has Nagle's algorithm off
+/// ([`RoleListener`]). ADR 0040 §3: each request knows its connection's peer
+/// and local addresses, which decide whether a management request's admin
+/// token is accepted.
+///
+/// [`RoleListener`]: capyctl_management::compose::RoleListener
 pub async fn serve(
     listener: tokio::net::TcpListener,
     router: Router,
     mut stop: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    axum::serve(no_delay(listener), router)
-        .with_graceful_shutdown(async move {
-            let _ = stop.wait_for(|stopped| *stopped).await;
-        })
-        .await
-}
-
-/// SPEC §17: every accepted connection has Nagle's algorithm off. A response
-/// or stream event written while an earlier segment is unacknowledged would
-/// otherwise wait for the client's delayed acknowledgement (up to 40 ms on
-/// Linux), which is the order of a whole decision request. axum 0.8 no longer
-/// sets `TCP_NODELAY` itself. A socket that refuses the option is served as
-/// it is.
-fn no_delay(
-    listener: tokio::net::TcpListener,
-) -> impl axum::serve::Listener<Io = tokio::net::TcpStream, Addr = std::net::SocketAddr> {
-    use axum::serve::ListenerExt as _;
-    listener.tap_io(|stream| {
-        let _ = stream.set_nodelay(true);
+    use capyctl_management::compose::{ManagementPeer, RoleListener};
+    axum::serve(
+        RoleListener::new(listener),
+        router.into_make_service_with_connect_info::<ManagementPeer>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = stop.wait_for(|stopped| *stopped).await;
     })
+    .await
 }
 
 /// Wait for served listeners to wind down after `stop`, never longer than
@@ -462,7 +458,7 @@ mod tests {
         use axum::serve::Listener as _;
         let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = bound.local_addr().unwrap();
-        let mut listener = no_delay(bound);
+        let mut listener = capyctl_management::compose::RoleListener::new(bound);
         let client = tokio::net::TcpStream::connect(address).await.unwrap();
         assert!(
             !client.nodelay().unwrap(),

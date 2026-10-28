@@ -11,7 +11,6 @@
 //! in-process. Logs are redacted as they are written and again as they are
 //! read; a raw development log (`--debug-engine-logs`) is never served, and
 //! no answer names a file path.
-use crate::ManagementCredentials;
 use axum::{
     extract::{Path, Request, State},
     http::{header, StatusCode},
@@ -73,17 +72,12 @@ pub trait EngineLogSource: Send + Sync + 'static {
 }
 
 struct EngineLogState {
-    credentials: ManagementCredentials,
     source: Arc<dyn EngineLogSource>,
     reads: Arc<tokio::sync::Semaphore>,
 }
 
-pub fn engine_log_router(
-    credentials: ManagementCredentials,
-    source: Arc<dyn EngineLogSource>,
-) -> Router {
+pub fn engine_log_router(source: Arc<dyn EngineLogSource>) -> Router {
     let state = Arc::new(EngineLogState {
-        credentials,
         source,
         // At most two reads at once, like every other bounded read.
         reads: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -93,16 +87,13 @@ pub fn engine_log_router(
             "/management/v1/deployments/{id}/engine-log",
             get(engine_log),
         )
-        .layer(middleware::from_fn_with_state(state.clone(), authenticate))
+        .layer(middleware::from_fn(authenticate))
         .with_state(state)
 }
 
-async fn authenticate(
-    State(state): State<Arc<EngineLogState>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let mut response = if !state.credentials.accepts(&request) {
+/// ADR 0040 §2: the principal is the composition's.
+async fn authenticate(request: Request, next: Next) -> Response {
+    let mut response = if !crate::authorized(&request) {
         crate::error(StatusCode::UNAUTHORIZED, "unauthenticated", false)
     } else {
         next.run(request).await

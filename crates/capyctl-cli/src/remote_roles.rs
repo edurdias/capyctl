@@ -457,35 +457,29 @@ pub(crate) fn wait_limits(
 /// (reported by hosts, or sampled by standalone from its own engines). The
 /// store is read under the owner lock; the report is composed after it is
 /// released.
-pub(crate) fn load_view(
-    credentials: ManagementCredentials,
+pub(crate) fn load_source(
     owner: Arc<Mutex<capyctl_controller::OwnedCoordinatorState>>,
     inflight: Arc<capyctl_router::admission::InFlight>,
     loads: Arc<capyctl_controller::load_table::LoadTable>,
-) -> axum::Router {
+) -> Arc<dyn capyctl_management::metrics::LoadSource> {
     use capyctl_management::metrics::LoadRead;
-    capyctl_management::metrics::load_router(
-        credentials,
-        Arc::new(move |deployment: Option<&str>| {
-            let read = match owner.lock() {
-                Ok(owner) => owner.store().capacity(deployment),
-                Err(_) => return LoadRead::Unavailable,
-            };
-            match read {
-                Ok(found) if deployment.is_some() && found.is_empty() => {
-                    LoadRead::UnknownDeployment
-                }
-                Ok(found) => LoadRead::Report(capyctl_router::capacity::capacity_report(
-                    &found,
-                    &inflight,
-                    capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT as usize,
-                    Some(&loads),
-                    capyctl_protocol::now_unix_ms(),
-                )),
-                Err(_) => LoadRead::Unavailable,
-            }
-        }),
-    )
+    Arc::new(move |deployment: Option<&str>| {
+        let read = match owner.lock() {
+            Ok(owner) => owner.store().capacity(deployment),
+            Err(_) => return LoadRead::Unavailable,
+        };
+        match read {
+            Ok(found) if deployment.is_some() && found.is_empty() => LoadRead::UnknownDeployment,
+            Ok(found) => LoadRead::Report(capyctl_router::capacity::capacity_report(
+                &found,
+                &inflight,
+                capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT as usize,
+                Some(&loads),
+                capyctl_protocol::now_unix_ms(),
+            )),
+            Err(_) => LoadRead::Unavailable,
+        }
+    })
 }
 
 /// The control-plane server's durable state.
@@ -674,27 +668,19 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
     // SPEC §17 (M80): the timing header names the engine family the host reports.
     inflight.latency.set_host_latency(sessions.latency_table());
     // SPEC §17 (M80): router, host ingress and engine latency, read together.
-    let latency_view = {
+    let latency = {
         let (recorder, hosts) = (inflight.latency.clone(), sessions.latency_table());
-        capyctl_management::metrics::latency_router(
-            management_credentials(&credentials)?,
-            Arc::new(move |deployment: Option<&str>| {
-                capyctl_router::timing::latency_report(
-                    &recorder,
-                    &hosts.snapshot(deployment),
-                    deployment,
-                )
-            }),
-        )
+        Arc::new(move |deployment: Option<&str>| {
+            capyctl_router::timing::latency_report(
+                &recorder,
+                &hosts.snapshot(deployment),
+                deployment,
+            )
+        })
     };
     // SPEC §§10, 17 (owner decision 2026-10-08): live load, read by an
     // operator or an external router.
-    let load_view = load_view(
-        management_credentials(&credentials)?,
-        owner.clone(),
-        inflight.clone(),
-        sessions.load_table(),
-    );
+    let load = load_source(owner.clone(), inflight.clone(), sessions.load_table());
     // SPEC §10 step 1, §16.2 (W10 gap b): waiting requests are bounded by the
     // hosts' published `resource_policy.queue` (the tightest of them), read
     // again as hosts enroll and publish.
@@ -732,58 +718,46 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         let sessions = sessions.clone();
         Arc::new(move |host: &str| sessions.current_session(host).is_some())
     };
-    let drain = capyctl_management::drain::drain_router_with_presence(
+    // Design §9: the inference listener's bind and authentication.
+    let inference_listener_view =
+        Arc::new(capyctl_management::inference_listener::InferenceListenerView::default());
+    inference_listener_view.set(crate::exposure::listener_view(
+        config.inference,
+        config.inference_auth,
+    ));
+    // ADR 0040 §§2, 7: the role's one session verifier, on its own
+    // connection to the store the owner holds. Opening it deletes the
+    // sessions and sign-in links another admin token issued.
+    let session_verifier = capyctl_management::ui_sessions::SessionVerifier::open(
         management_credentials(&credentials)?,
-        actions.clone(),
-        Vec::new(),
-        presence,
-    );
-    let management =
-        capyctl_management::lifecycle_router(management_credentials(&credentials)?, actions)
-            .merge(drain)
-            .merge(
-                capyctl_management::enrollment::enrollment_router(
-                    management_credentials(&credentials)?,
-                    authority.clone(),
-                    config.bootstrap_address.clone(),
-                    config.control_address.clone(),
-                )
-                .map_err(|_| unavailable())?
-                .reset_fallback(),
-            )
+        capyctl_store::Store::open(&config.state_dir.join("srv.sqlite3"))
+            .map_err(|_| unavailable())?,
+    )
+    .map_err(|_| unavailable())?;
+    // ADR 0040 §2: every management route is authorized at one point.
+    let management = capyctl_management::compose::server(
+        session_verifier,
+        config.management_public_address.as_deref(),
+        capyctl_management::compose::ServerRoutes {
+            actions,
+            presence,
+            enrollment: authority.clone(),
+            bootstrap_address: config.bootstrap_address.clone(),
+            control_address: config.control_address.clone(),
             // SPEC §13.3 / T21: an instance's engine log, read on its host.
-            .merge(capyctl_management::engine_log::engine_log_router(
-                management_credentials(&credentials)?,
-                capyctl_management::engine_log::RemoteEngineLogs::new(
-                    owner.clone(),
-                    sessions.clone(),
-                    authority.controller_id(),
-                ),
-            ))
-            .merge(capyctl_management::hosts::hosts_router(
-                management_credentials(&credentials)?,
-                owner,
+            engine_logs: capyctl_management::engine_log::RemoteEngineLogs::new(
+                owner.clone(),
                 sessions.clone(),
-            ))
-            .merge(latency_view)
-            .merge(load_view)
-            // Design §9: the inference listener's bind and authentication.
-            .merge(
-                capyctl_management::inference_listener::inference_listener_router(
-                    management_credentials(&credentials)?,
-                    {
-                        let view = Arc::new(
-                            capyctl_management::inference_listener::InferenceListenerView::default(
-                            ),
-                        );
-                        view.set(crate::exposure::listener_view(
-                            config.inference,
-                            config.inference_auth,
-                        ));
-                        view
-                    },
-                ),
-            );
+                authority.controller_id(),
+            ),
+            owner,
+            sessions: sessions.clone(),
+            latency,
+            load,
+            inference_listener: inference_listener_view,
+        },
+    )
+    .map_err(|_| unavailable())?;
     let management_listener = tokio::net::TcpListener::bind(config.management)
         .await
         .map_err(|e| listen_failed("management", config.management, &e))?;

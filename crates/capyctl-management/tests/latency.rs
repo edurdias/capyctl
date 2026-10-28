@@ -1,5 +1,6 @@
 //! SPEC §17 (M80): `GET /management/v1/metrics/latency` is authenticated,
 //! accepts one bounded `deployment` filter and serves the composed report.
+mod support;
 use capyctl_management::{metrics::latency_router, ManagementCredentials};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -19,11 +20,11 @@ fn get(uri: &str, token: Option<&str>) -> axum::http::Request<axum::body::Body> 
 // filter reaches the source; anything else in the query is refused.
 #[tokio::test]
 async fn latency_view_is_authenticated_and_filtered() {
-    let router = latency_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(
+        latency_router(Arc::new(
             |deployment: Option<&str>| serde_json::json!({"deployments": [], "filter": deployment}),
-        ),
+        )),
     );
     let denied = router
         .clone()

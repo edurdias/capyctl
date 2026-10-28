@@ -167,6 +167,39 @@ impl Store {
         Ok(sessions)
     }
 
+    /// ADR 0040 §2: every session with its token digest, oldest first, for
+    /// the role's in-memory session table, loaded once at start.
+    pub fn ui_session_digests(&self) -> Result<Vec<(Digest, UiSession)>, StoreError> {
+        let mut query = self.conn.prepare(
+            "SELECT token_digest,session_id,label,created_at_ms,last_seen_at_ms,
+               cookie_refreshed_at_ms
+             FROM ui_sessions ORDER BY created_at_ms,session_id",
+        )?;
+        let sessions = query
+            .query_map([], |r| {
+                let digest: Vec<u8> = r.get(0)?;
+                let digest = Digest::try_from(digest.as_slice()).map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(
+                        0,
+                        "token_digest".into(),
+                        rusqlite::types::Type::Blob,
+                    )
+                })?;
+                Ok((
+                    digest,
+                    UiSession {
+                        id: r.get(1)?,
+                        label: r.get(2)?,
+                        created_at_ms: r.get(3)?,
+                        last_seen_at_ms: r.get(4)?,
+                        cookie_refreshed_at_ms: r.get(5)?,
+                    },
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(sessions)
+    }
+
     /// ADR 0040 §§4, 6: revoking a session deletes its row. Returns whether
     /// session `id` existed.
     pub fn revoke_ui_session(&self, id: &str) -> Result<bool, StoreError> {

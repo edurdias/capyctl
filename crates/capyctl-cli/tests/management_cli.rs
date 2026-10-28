@@ -97,7 +97,8 @@ async fn binary_deploys_starts_observes_and_stops_through_management() {
     let address = listener.local_addr().unwrap();
     std::env::set_var(capyctl_cli::roles::MANAGEMENT_ADDR_ENV, address.to_string());
     let router = app.management_router();
-    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let server =
+        tokio::spawn(async move { support::serve_management(listener, router).await.unwrap() });
     let denied = reqwest::Client::new()
         .get(format!("http://{address}/management/v1/snapshot"))
         .bearer_auth(app.api_key())

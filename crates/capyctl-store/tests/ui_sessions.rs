@@ -343,3 +343,26 @@ fn pruning_deletes_only_expired_links() {
     // Sessions are not links: pruning left the first one.
     assert!(store.ui_session(&digest(2)).unwrap().is_some());
 }
+
+// ADR 0040 §2: the role loads its in-memory session table at start, so the
+// load returns every session with its token digest.
+#[test]
+fn the_session_table_load_returns_each_session_with_its_digest() {
+    let (_dir, _path, store) = store();
+    let first = sign_in(&store, 1, 2, &ADMIN_A, 1_000);
+    let second = sign_in(&store, 3, 4, &ADMIN_A, 2_000);
+    let loaded = store.ui_session_digests().unwrap();
+    let rows: Vec<([u8; 32], &str, i64)> = loaded
+        .iter()
+        .map(|(digest, s)| (*digest, s.id.as_str(), s.created_at_ms))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (digest(2), first.as_str(), 1_000),
+            (digest(4), second.as_str(), 2_000)
+        ]
+    );
+    store.revoke_ui_session(&first).unwrap();
+    assert_eq!(store.ui_session_digests().unwrap().len(), 1);
+}

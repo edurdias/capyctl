@@ -6,6 +6,7 @@
 //!
 //! Fake-engine tests through the real handlers in-process. They are not
 //! qualification of any native engine recipe.
+mod support;
 use axum::{
     body::{to_bytes, Body},
     http::Request,
@@ -103,9 +104,11 @@ async fn setup() -> Setup {
         SharedConfigurationSource::new(owner.clone(), host["input"]["host"].clone(), "owner")
             .unwrap(),
     );
-    let app = lifecycle_router(
+    let app = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(OwnedActionSource::new(configuration, worker.commands()).unwrap()),
+        lifecycle_router(Arc::new(
+            OwnedActionSource::new(configuration, worker.commands()).unwrap(),
+        )),
     );
     Setup {
         _dir: dir,

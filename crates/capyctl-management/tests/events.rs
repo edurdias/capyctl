@@ -1,3 +1,4 @@
+mod support;
 use axum::{body::Body, http::Request};
 use capyctl_management::{read_only_router, ManagementCredentials, StoreSnapshotSource};
 use capyctl_store::Store;
@@ -36,9 +37,11 @@ async fn unarmed_stop_writer_events_replay_to_sse_without_cleanup_epoch() {
     writer
         .complete_unarmed_stop(&session, &stop.step_id)
         .unwrap();
-    let app = read_only_router(
+    let app = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(StoreSnapshotSource::new(Store::open(&path).unwrap())),
+        read_only_router(Arc::new(StoreSnapshotSource::new(
+            Store::open(&path).unwrap(),
+        ))),
     );
     let response = app
         .oneshot(
@@ -87,9 +90,11 @@ async fn expired_unarmed_writer_event_replays_and_stream_continues() {
     writer
         .expire_unarmed_initialize(&session, &accepted.step_id, 1900)
         .unwrap();
-    let app = read_only_router(
+    let app = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(StoreSnapshotSource::new(Store::open(&path).unwrap())),
+        read_only_router(Arc::new(StoreSnapshotSource::new(
+            Store::open(&path).unwrap(),
+        ))),
     );
     let response = app
         .oneshot(
@@ -124,9 +129,11 @@ async fn authenticated_replay_recovers_write_after_snapshot_and_follows_live() {
     let writer = Store::open(&path).unwrap();
     let cursor = writer.snapshot().unwrap().cursor.to_string();
     writer.begin_coordinator_session().unwrap();
-    let app = read_only_router(
+    let app = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(StoreSnapshotSource::new(Store::open(&path).unwrap())),
+        read_only_router(Arc::new(StoreSnapshotSource::new(
+            Store::open(&path).unwrap(),
+        ))),
     );
     let response = app
         .oneshot(
@@ -243,12 +250,10 @@ fn options() -> EventStreamOptions {
     }
 }
 fn fake_app(source: Arc<Fake>, options: EventStreamOptions) -> axum::Router {
-    read_only_router_with_event_options(
+    support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        source,
-        options,
+        read_only_router_with_event_options(source, options).unwrap(),
     )
-    .unwrap()
 }
 
 /// Opens event streams until one answers `status`. A stream slot is released
@@ -915,9 +920,9 @@ async fn managed_configuration_projection_rejects_corrupt_or_expanded_payloads()
 async fn malformed_duplicate_and_disagreeing_cursors_and_methods_fail_closed() {
     let store = Store::open_in_memory().unwrap();
     let cursor = store.snapshot().unwrap().cursor.to_string();
-    let app = read_only_router(
+    let app = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(StoreSnapshotSource::new(store)),
+        read_only_router(Arc::new(StoreSnapshotSource::new(store))),
     );
     for query in [
         "after=bad".to_string(),
@@ -984,9 +989,9 @@ async fn real_store_retention_and_incarnation_require_resnapshot() {
         .unwrap()
         .execute("UPDATE management_events SET recorded_at_ms=0", [])
         .unwrap();
-    let app = read_only_router(
+    let app = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(StoreSnapshotSource::new(store)),
+        read_only_router(Arc::new(StoreSnapshotSource::new(store))),
     );
     for cursor in [cursor, "00000000000000000000000000:0".into()] {
         let response = app
@@ -1215,9 +1220,9 @@ async fn lmcache_events_recorded_by_the_store_project_through_the_stream() {
     store
         .record_lmcache_server_exited(&launch, "exited with status 1")
         .unwrap();
-    let app = read_only_router(
+    let app = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(StoreSnapshotSource::new(store)),
+        read_only_router(Arc::new(StoreSnapshotSource::new(store))),
     );
     let response = app
         .oneshot(

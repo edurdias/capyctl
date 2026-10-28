@@ -1,3 +1,4 @@
+mod support;
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -19,13 +20,15 @@ async fn enrollment_mutations_require_admin_and_return_bounded_join_material() {
     let authority = Arc::new(EnrollmentAuthority::new(owned, ca));
     let admin = "a".repeat(32);
     let inference = "b".repeat(32);
-    let router = enrollment_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(&admin, &inference).unwrap(),
-        authority,
-        "https://controller.example:7444".into(),
-        "https://controller.example:7445".into(),
-    )
-    .unwrap();
+        enrollment_router(
+            authority,
+            "https://controller.example:7444".into(),
+            "https://controller.example:7445".into(),
+        )
+        .unwrap(),
+    );
     for token in [None, Some(inference.as_str())] {
         let mut request = Request::builder()
             .method("POST")
@@ -76,13 +79,15 @@ async fn enrollment_errors_are_structured_and_queries_methods_rejected() {
         capyctl_agent::identity::CertificateAuthority::generate(100).unwrap(),
     ));
     let admin = "a".repeat(32);
-    let router = enrollment_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(&admin, &"b".repeat(32)).unwrap(),
-        authority,
-        "https://controller.example:7444".into(),
-        "https://controller.example:7445".into(),
-    )
-    .unwrap();
+        enrollment_router(
+            authority,
+            "https://controller.example:7444".into(),
+            "https://controller.example:7445".into(),
+        )
+        .unwrap(),
+    );
     for (method, uri, authorized, body, status, code) in [
         (
             "POST",

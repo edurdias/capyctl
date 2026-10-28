@@ -18,6 +18,9 @@ libc = "0.2"
 futures.workspace = true
 ulid.workspace = true
 serde.workspace = true
+# ADR 0040 §4: 256-bit session and sign-in link tokens from the OS generator.
+rand_core = { version = "0.6", features = ["getrandom"] }
+hex.workspace = true
 http-body-util = "0.1"
 
 [dev-dependencies]

@@ -2280,9 +2280,14 @@ async fn start_standalone_in(
         .lines()
         .find_map(|line| line.strip_prefix("admin_token: "))
         .ok_or(StartError::MissingCredentials)?;
-    let management_credentials =
+    // ADR 0040 §§2, 7: the role's one session verifier, on its own store
+    // connection. Opening it deletes the sessions and sign-in links another
+    // admin token issued, then loads the session table.
+    let session_verifier = capyctl_management::ui_sessions::SessionVerifier::open(
         capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-            .map_err(|_| StartError::MissingCredentials)?;
+            .map_err(|_| StartError::MissingCredentials)?,
+        Store::open(&db_path)?,
+    )?;
     // SPEC §4.3 (P3): the Ready engines a previous run left running are adopted
     // by the coordinator at start; this supervisor re-proves each one locally
     // before dispatch reopens.
@@ -2338,29 +2343,11 @@ async fn start_standalone_in(
             .map_err(|_| StartError::Deploy("management actions unavailable".into()))?
             .with_switcher(switcher.clone()),
     );
-    // SPEC §4.3: the explicit drain of the embedded host, by its published name
-    // or the `standalone` alias the CLI uses.
-    let drain = capyctl_management::drain::drain_router(
-        capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-            .map_err(|_| StartError::MissingCredentials)?,
-        source.clone(),
-        vec![declared_host.name.clone(), "standalone".to_owned()],
-    );
-    // ADR 0008: the registered installation, shown by standalone status.
-    let installation_view = capyctl_management::installation::installation_router(
-        capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-            .map_err(|_| StartError::MissingCredentials)?,
-        embedded.installations(),
-    );
     // SPEC §13.3 / T21: an instance's engine log, read in-process from the
     // embedded host's log directory (no agent session in a standalone role).
-    let engine_log_view = capyctl_management::engine_log::engine_log_router(
-        capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-            .map_err(|_| StartError::MissingCredentials)?,
-        capyctl_management::engine_log::StandaloneEngineLogs::new(
-            owner.clone(),
-            state_dir.join("logs"),
-        ),
+    let engine_logs = capyctl_management::engine_log::StandaloneEngineLogs::new(
+        owner.clone(),
+        state_dir.join("logs"),
     );
     // SPEC §4.2: the same host and engine inventory a server serves, for the
     // one embedded host: its published document (so `engine add` shows at
@@ -2371,34 +2358,29 @@ async fn start_standalone_in(
     let load_owner = owner.clone();
     // SPEC §7.2: set once the policy is published below.
     let memory_warnings = Arc::new(std::sync::OnceLock::new());
-    let hosts_view = capyctl_management::hosts::standalone_hosts_router(
-        capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-            .map_err(|_| StartError::MissingCredentials)?,
-        owner,
-        capyctl_management::hosts::StandaloneHost {
-            host_id: declared_host.name.clone(),
-            document: {
-                let embedded = embedded.clone();
-                Arc::new(move || embedded.document())
-            },
-            installations: embedded.installations(),
-            domains: {
-                let observed = crate::host_observation::observed_domains(&declared_host.domains);
-                let (memory, gpu) = (memory.clone(), gpu.clone());
-                Arc::new(move || {
-                    let (observed, memory, gpu) = (observed.clone(), memory.clone(), gpu.clone());
-                    Box::pin(async move {
-                        let kinds = observed.clone();
-                        let Ok((observations, source)) =
-                            HostMemoryObservation::with_domains(observed)
-                                .with_memory_reader(memory)
-                                .with_gpu_sampler(gpu)
-                                .observe_sourced()
-                                .await
-                        else {
-                            return Vec::new();
-                        };
-                        observations
+    let standalone_host = capyctl_management::hosts::StandaloneHost {
+        host_id: declared_host.name.clone(),
+        document: {
+            let embedded = embedded.clone();
+            Arc::new(move || embedded.document())
+        },
+        installations: embedded.installations(),
+        domains: {
+            let observed = crate::host_observation::observed_domains(&declared_host.domains);
+            let (memory, gpu) = (memory.clone(), gpu.clone());
+            Arc::new(move || {
+                let (observed, memory, gpu) = (observed.clone(), memory.clone(), gpu.clone());
+                Box::pin(async move {
+                    let kinds = observed.clone();
+                    let Ok((observations, source)) = HostMemoryObservation::with_domains(observed)
+                        .with_memory_reader(memory)
+                        .with_gpu_sampler(gpu)
+                        .observe_sourced()
+                        .await
+                    else {
+                        return Vec::new();
+                    };
+                    observations
                             .into_iter()
                             .map(|o| {
                                 let device = kinds.iter().any(|d| {
@@ -2418,12 +2400,11 @@ async fn start_standalone_in(
                                 domain
                             })
                             .collect()
-                    })
                 })
-            },
-            memory_warnings: memory_warnings.clone(),
+            })
         },
-    );
+        memory_warnings: memory_warnings.clone(),
+    };
     // SPEC §17 (M80): the router's per-request latency distributions.
     let inflight = Arc::new(capyctl_router::admission::InFlight::default());
     inflight.latency.set_timing_header(timing_header);
@@ -2451,28 +2432,18 @@ async fn start_standalone_in(
     // names the engine family from the same table.
     let engine_latency = embedded_load.latency_table();
     inflight.latency.set_host_latency(engine_latency.clone());
-    let latency_view = {
+    let latency = {
         let recorder = inflight.latency.clone();
-        capyctl_management::metrics::latency_router(
-            capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-                .map_err(|_| StartError::MissingCredentials)?,
-            Arc::new(move |deployment: Option<&str>| {
-                capyctl_router::timing::latency_report(
-                    &recorder,
-                    &engine_latency.snapshot(deployment),
-                    deployment,
-                )
-            }),
-        )
+        Arc::new(move |deployment: Option<&str>| {
+            capyctl_router::timing::latency_report(
+                &recorder,
+                &engine_latency.snapshot(deployment),
+                deployment,
+            )
+        })
     };
     supervision.supervise(embedded_load.spawn_until(supervision.cancel_signal()));
-    let load_view = crate::remote_roles::load_view(
-        capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-            .map_err(|_| StartError::MissingCredentials)?,
-        load_owner,
-        inflight.clone(),
-        engine_load.clone(),
-    );
+    let load = crate::remote_roles::load_source(load_owner, inflight.clone(), engine_load.clone());
     // ADR 0018 §4, §5: removal retires through the store, as a server does.
     let retirements = Arc::new(capyctl_management::engines::StoreRetirements::new(
         source.clone(),
@@ -2481,19 +2452,25 @@ async fn start_standalone_in(
     // the caller serves it (`App::inference_router`), for status.
     let inference_listener =
         Arc::new(capyctl_management::inference_listener::InferenceListenerView::default());
-    let inference_listener_view = capyctl_management::inference_listener::inference_listener_router(
-        capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-            .map_err(|_| StartError::MissingCredentials)?,
-        inference_listener.clone(),
+    // ADR 0040 §2: every management route is authorized at one point.
+    let management = capyctl_management::compose::standalone(
+        session_verifier,
+        management_listener.public_address.as_deref(),
+        capyctl_management::compose::StandaloneRoutes {
+            actions: source,
+            // SPEC §4.3: the embedded host drains by its published name or
+            // the `standalone` alias the CLI uses.
+            host_names: vec![declared_host.name.clone(), "standalone".to_owned()],
+            // ADR 0008: the registered installation, shown by standalone status.
+            installations: embedded.installations(),
+            engine_logs,
+            owner,
+            host: standalone_host,
+            latency,
+            load,
+            inference_listener: inference_listener.clone(),
+        },
     );
-    let management = capyctl_management::lifecycle_router(management_credentials, source)
-        .merge(drain)
-        .merge(installation_view)
-        .merge(hosts_view)
-        .merge(engine_log_view)
-        .merge(latency_view)
-        .merge(load_view)
-        .merge(inference_listener_view);
     let controller = Arc::new(
         CoordinatorLifecycle::new(coordinator.commands())
             .with_switcher(switcher.clone())
