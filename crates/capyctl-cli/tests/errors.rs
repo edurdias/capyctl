@@ -495,6 +495,11 @@ fn group_codes_map_to_exits() {
         // decision models.
         ("capability_missing:decisions", 5),
         ("host_capability_missing:decisions", 5),
+        // T47 (ADR 0036 §1): TensorFold, which has no embeddings route, or a
+        // host too old for embedding models.
+        ("capability_missing:embeddings", 5),
+        ("host_capability_missing:embeddings", 5),
+        ("lmcache_unavailable:embeddings_unsupported", 5),
     ];
     for (code, exit) in cases {
         let direct = StructuredError {

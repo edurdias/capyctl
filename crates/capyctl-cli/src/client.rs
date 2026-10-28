@@ -1312,6 +1312,21 @@ pub async fn execute_with_start_options(
                     view["inference_listener"] = body["inference_listener"].clone();
                 }
             }
+            // ADR 0036 §1: an embeddings deployment's engine version,
+            // `certified` or `uncertified`, from its resolved configuration.
+            // A server without it leaves the view as it was.
+            if view["api"] == "embeddings" {
+                if let Some(id) = view["id"].as_str().map(str::to_owned) {
+                    let path = format!("/deployments/{id}/effective-config");
+                    if let Ok((status, body)) = api.exchange(Method::GET, &path, None).await {
+                        if let Some(certification) =
+                            certification(&body).filter(|_| status.is_success())
+                        {
+                            view["certification"] = certification;
+                        }
+                    }
+                }
+            }
             // SPEC §17 (M80): the deployment's latency distributions (router,
             // host ingress and engine tiers). A server without the view, or an
             // id the filter would refuse, leaves the view as it was.
@@ -1474,6 +1489,22 @@ pub fn add_member_warnings(deployment: &mut Value, inventory: &Value) {
             member["warnings"] = findings(&host);
         }
     }
+}
+
+/// ADR 0036 §1: the certification an embeddings deployment's resolved
+/// configuration names: the deployment's own, else the first host's that
+/// resolved it (a revision placed on enrolled hosts is resolved there).
+pub fn certification(effective_config: &Value) -> Option<Value> {
+    std::iter::once(&effective_config["effective"])
+        .chain(
+            effective_config["hosts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|host| &host["effective"]),
+        )
+        .find_map(|effective| effective.get("certification").filter(|c| c.is_string()))
+        .cloned()
 }
 
 /// The installation a deployment actually runs, from the embedded host's
@@ -1967,6 +1998,20 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(refused.code, "unauthorized");
+    }
+
+    // T47 (ADR 0036 §1): status takes an embeddings deployment's
+    // certification from its resolved configuration: the deployment's own,
+    // else the first host's; none when the server names none.
+    #[test]
+    fn status_reads_the_certification_from_the_resolved_configuration() {
+        let own = json!({"effective": {"certification": "certified"},
+            "hosts": [{"effective": {"certification": "uncertified"}}]});
+        assert_eq!(super::certification(&own), Some(json!("certified")));
+        let hosts = json!({"effective": {}, "hosts": [{"effective": null},
+            {"effective": {"certification": "uncertified"}}]});
+        assert_eq!(super::certification(&hosts), Some(json!("uncertified")));
+        assert_eq!(super::certification(&json!({"effective": {}})), None);
     }
 
     // T45: ADR 0033 §§9, 12. `status deployment` merges into each instance's

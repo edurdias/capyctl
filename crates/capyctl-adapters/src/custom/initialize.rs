@@ -187,16 +187,23 @@ pub(super) async fn initialize(
 }
 
 /// ADR 0031 §5: the existing probe of the profile's API, unchanged: the
-/// fixed decision of ADR 0030 §3 for `decisions` (never a chat probe in its
-/// place), the bounded startup chat probe for `chat`; the served name as
-/// `model`, the key when the manifest uses one. The reason it failed, if it
-/// did.
+/// fixed decision of ADR 0030 §3 for `decisions` and the fixed embedding of
+/// ADR 0036 §5 for `embeddings` (never a chat probe in their place), the
+/// bounded startup chat probe for `chat`; the served name as `model`, the
+/// key when the manifest uses one. The reason it failed, if it did.
 async fn probe(adapter: &CustomAdapter, served: &str, budget: Duration) -> Result<(), String> {
     if adapter.decisions() {
         return match tokio::time::timeout(budget, adapter.decide(served, budget)).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(format!("the decision probe was not answered: {e}")),
             Err(_) => Err("the decision probe outlasted the startup window".into()),
+        };
+    }
+    if adapter.embeddings() {
+        return match tokio::time::timeout(budget, adapter.embed_probe(served, budget)).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(format!("the embedding probe was not answered: {e}")),
+            Err(_) => Err("the embedding probe outlasted the startup window".into()),
         };
     }
     let body = json!({

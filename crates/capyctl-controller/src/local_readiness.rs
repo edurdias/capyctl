@@ -13,7 +13,9 @@
 //!   else might hold the port;
 //! - ADR 0030 §3: a decisions deployment also answers the fixed decision probe,
 //!   complete and well-formed, on the same key (it generates no text, and its
-//!   readiness is a decision, never a model list alone);
+//!   readiness is a decision, never a model list alone); ADR 0036 §5: an
+//!   embeddings deployment likewise answers the fixed embedding probe, never a
+//!   chat or decision probe;
 //! - every recorded process is still alive after the answer;
 //! - ADR 0033 §3: a launch's LMCache server is alive, answers `GET /status`
 //!   and listens on loopback only (an exposed one is stopped), and none is
@@ -29,6 +31,7 @@
 //! dispatch closed until, after a passing proof, the engine's own metrics show
 //! nothing running or waiting; only then are they closed as abandoned.
 use crate::ownership::SharedCoordinatorState;
+use capyctl_config::effective::DeploymentApi;
 use capyctl_domain::completion::{Presence, ProcessIdentity};
 use capyctl_store::ordinary_lifecycle::local_recovery::LocalReadyLaunch;
 use capyctl_store::ordinary_lifecycle::recovery::RemoteReadinessEvidence;
@@ -44,8 +47,9 @@ use tokio::time::Instant;
 const PASS_INTERVAL: Duration = Duration::from_millis(250);
 /// The bound on one authenticated model-list probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-/// ADR 0030 §3: the bound on the fixed decision probe of an adopted
-/// decisions launch (an engine's first decision can be slow).
+/// ADR 0030 §3, ADR 0036 §5: the bound on the fixed decision or embedding
+/// probe of an adopted decisions or embeddings launch (an engine's first
+/// answer can be slow).
 const DECISION_TIMEOUT: Duration = Duration::from_secs(60);
 /// ADR 0031 §7: how long an exposed custom engine's processes get on
 /// SIGTERM before SIGKILL.
@@ -87,8 +91,10 @@ struct Target {
     url: reqwest::Url,
     key: Option<String>,
     served: String,
-    /// ADR 0030 §1: the API the deployment serves.
-    decisions: bool,
+    /// ADR 0030 §1, ADR 0036 §1: the API the deployment serves, which picks
+    /// the probe that proves it: chat, the fixed decision or the fixed
+    /// embedding.
+    api: DeploymentApi,
     /// ADR 0031: a custom engine's manifest; its proof is the port, the
     /// health path, the API probe and the loopback check, never a model list.
     custom: Option<capyctl_config::custom::CustomProfile>,
@@ -280,11 +286,10 @@ impl LocalReadiness {
             .map_err(|error| format!("the deployment's revision is unreadable: {error}"))?
             .map(|configuration| configuration.effective)
             .unwrap_or(serde_json::Value::Null);
-        let decisions = match effective["api"].clone() {
-            serde_json::Value::Null => false,
-            api => !serde_json::from_value::<capyctl_config::effective::DeploymentApi>(api)
-                .map_err(|_| "the deployment's api is unreadable".to_owned())?
-                .is_chat(),
+        let api = match effective["api"].clone() {
+            serde_json::Value::Null => DeploymentApi::Chat,
+            api => serde_json::from_value(api)
+                .map_err(|_| "the deployment's api is unreadable".to_owned())?,
         };
         // ADR 0031: a custom engine's frozen manifest, re-validated.
         let custom = match effective["profile"]["engine"].as_str() {
@@ -308,7 +313,7 @@ impl LocalReadiness {
             url,
             key,
             served,
-            decisions,
+            api,
             custom,
             several_gpus,
         })
@@ -338,26 +343,41 @@ impl LocalReadiness {
         if ready != Readiness::Ready {
             return Err("the engine's port or health path is not answering".into());
         }
-        if target.decisions {
-            adapter
-                .decision_probe(&target.served, DECISION_TIMEOUT)
-                .await
-                .map_err(|error| {
-                    format!("the engine did not answer the decision probe: {error}")
-                })?;
-        } else {
-            let body = serde_json::json!({
-                "model": target.served,
-                "messages": [{"role": "user", "content": "Say ready."}],
-                "max_tokens": 8,
-                "temperature": 0,
-            });
-            let answer = tokio::time::timeout(DECISION_TIMEOUT, adapter.forward_chat(&body))
-                .await
-                .map_err(|_| "the engine did not answer the chat probe in time".to_owned())?
-                .map_err(|error| format!("the engine did not answer the chat probe: {error}"))?;
-            if !capyctl_adapters::forward::probe_answered(&answer) {
-                return Err("the engine answered the chat probe with empty content".into());
+        match target.api {
+            DeploymentApi::Decisions => {
+                adapter
+                    .decision_probe(&target.served, DECISION_TIMEOUT)
+                    .await
+                    .map_err(|error| {
+                        format!("the engine did not answer the decision probe: {error}")
+                    })?;
+            }
+            // ADR 0036 §5: an embeddings engine is proved by the fixed
+            // embedding, never a chat or decision probe.
+            DeploymentApi::Embeddings => {
+                adapter
+                    .embedding_probe(&target.served, DECISION_TIMEOUT)
+                    .await
+                    .map_err(|error| {
+                        format!("the engine did not answer the embedding probe: {error}")
+                    })?;
+            }
+            DeploymentApi::Chat => {
+                let body = serde_json::json!({
+                    "model": target.served,
+                    "messages": [{"role": "user", "content": "Say ready."}],
+                    "max_tokens": 8,
+                    "temperature": 0,
+                });
+                let answer = tokio::time::timeout(DECISION_TIMEOUT, adapter.forward_chat(&body))
+                    .await
+                    .map_err(|_| "the engine did not answer the chat probe in time".to_owned())?
+                    .map_err(|error| {
+                        format!("the engine did not answer the chat probe: {error}")
+                    })?;
+                if !capyctl_adapters::forward::probe_answered(&answer) {
+                    return Err("the engine answered the chat probe with empty content".into());
+                }
             }
         }
         check_owned_listeners(launch, false).await
@@ -446,28 +466,31 @@ impl LocalReadiness {
         let observed_at_ms = capyctl_protocol::now_unix_ms();
         self.settle_retired_leases(launch, &target, observed_at_ms)
             .await?;
-        let evidence =
-            RemoteReadinessEvidence {
-                binding_id: launch.binding_id.clone(),
-                incarnation: launch.incarnation.clone(),
-                identities: live,
-                observed_at_ms,
-                receipt: match &target.custom {
-                    Some(_) => format!(
+        let evidence = RemoteReadinessEvidence {
+            binding_id: launch.binding_id.clone(),
+            incarnation: launch.incarnation.clone(),
+            identities: live,
+            observed_at_ms,
+            receipt: match &target.custom {
+                Some(_) => format!(
                     "every recorded engine process alive with its recorded start ticks and boot; \
                      the custom engine's port and health answered, it answered the {} probe for \
                      {}, and every owned listener is on loopback",
-                    if target.decisions { "fixed decision" } else { "chat" },
+                    match target.api {
+                        DeploymentApi::Chat => "chat",
+                        DeploymentApi::Decisions => "fixed decision",
+                        DeploymentApi::Embeddings => "fixed embedding",
+                    },
                     target.served,
                 ),
-                    None => format!(
+                None => format!(
                     "every recorded engine process alive with its recorded start ticks and boot; \
                      the engine answered an authenticated model list naming {}{}{}",
                     target.served,
-                    if target.decisions {
-                        " and the fixed decision probe"
-                    } else {
-                        ""
+                    match target.api {
+                        DeploymentApi::Chat => "",
+                        DeploymentApi::Decisions => " and the fixed decision probe",
+                        DeploymentApi::Embeddings => " and the fixed embedding probe",
                     },
                     if target.several_gpus {
                         "; every owned listener is on loopback"
@@ -475,8 +498,8 @@ impl LocalReadiness {
                         ""
                     }
                 ),
-                },
-            };
+            },
+        };
         let owner = self
             .owner
             .lock()
@@ -493,7 +516,8 @@ impl LocalReadiness {
     }
 
     /// The known engines' proof: an authenticated model list naming the
-    /// route, and for a decisions deployment the fixed decision.
+    /// route, and for a decisions or embeddings deployment the fixed
+    /// decision or embedding.
     async fn prove_listed(&self, target: &Target) -> Result<(), String> {
         let mut request = self.client.get(
             target
@@ -526,16 +550,36 @@ impl LocalReadiness {
         }
         // ADR 0030 §3, SPEC §6.1: a decision model is usable only once it
         // answers the fixed decision; the model list alone is not readiness.
-        if target.decisions {
-            capyctl_adapters::decision_probe::probe_keyed(
-                &self.client,
-                &target.url,
-                target.key.as_deref(),
-                &target.served,
-                DECISION_TIMEOUT,
-            )
-            .await
-            .map_err(|error| format!("the engine did not answer the decision probe: {error}"))?;
+        // ADR 0036 §5: an embedding model likewise only once it answers the
+        // fixed embedding, never a chat or decision probe.
+        match target.api {
+            DeploymentApi::Chat => {}
+            DeploymentApi::Decisions => {
+                capyctl_adapters::decision_probe::probe_keyed(
+                    &self.client,
+                    &target.url,
+                    target.key.as_deref(),
+                    &target.served,
+                    DECISION_TIMEOUT,
+                )
+                .await
+                .map_err(|error| {
+                    format!("the engine did not answer the decision probe: {error}")
+                })?;
+            }
+            DeploymentApi::Embeddings => {
+                capyctl_adapters::embedding_probe::probe_keyed(
+                    &self.client,
+                    &target.url,
+                    target.key.as_deref(),
+                    &target.served,
+                    DECISION_TIMEOUT,
+                )
+                .await
+                .map_err(|error| {
+                    format!("the engine did not answer the embedding probe: {error}")
+                })?;
+            }
         }
         Ok(())
     }
@@ -866,5 +910,164 @@ mod tests {
             .unwrap();
         assert!(joined.load(Ordering::SeqCst), "joined before returning");
         assert_eq!(supervisor.children.running(), 0);
+    }
+
+    /// What an engine double was asked: each request's path and whether it
+    /// carried the launch's key.
+    type Asked = Arc<Mutex<Vec<(String, bool)>>>;
+
+    /// An engine double on loopback that lists `served`, answers
+    /// `/v1/embeddings` with what `embedding` holds and counts every request.
+    async fn embedding_engine(
+        embedding: Arc<Mutex<serde_json::Value>>,
+    ) -> (reqwest::Url, Asked, tokio::task::JoinHandle<()>) {
+        let asked: Asked = Arc::default();
+        let recorded = asked.clone();
+        let engine = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let recorded = recorded.clone();
+            let embedding = embedding.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                let keyed = request
+                    .headers()
+                    .get("authorization")
+                    .is_some_and(|value| value == "Bearer k3y");
+                recorded.lock().unwrap().push((path.clone(), keyed));
+                let answer = match path.as_str() {
+                    "/v1/models" => serde_json::json!({"data": [{"id": "served"}]}),
+                    "/v1/embeddings" => embedding.lock().unwrap().clone(),
+                    _ => serde_json::json!({}),
+                };
+                axum::Json(answer)
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, engine).await.unwrap() });
+        let url = reqwest::Url::parse(&format!("http://{address}/")).unwrap();
+        (url, asked, task)
+    }
+
+    fn embedded(vector: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"object": "list", "model": "served",
+            "data": [{"object": "embedding", "index": 0, "embedding": vector}],
+            "usage": {"prompt_tokens": 3, "total_tokens": 3}})
+    }
+
+    fn paths(asked: &Asked) -> Vec<String> {
+        asked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
+
+    // T47 T20 (ADR 0036 §5, SPEC §6.1): an adopted embeddings launch on a
+    // known engine is re-proved by its model list and then the fixed
+    // embedding, with its key; a malformed vector or a zero one fails the
+    // proof, and it is never sent a chat or decision probe.
+    #[tokio::test]
+    async fn a_listed_embeddings_launch_is_proved_by_the_fixed_embedding() {
+        use capyctl_config::effective::DeploymentApi;
+        let (_state, supervisor) = supervisor();
+        let answer = Arc::new(Mutex::new(embedded(serde_json::json!([0.6, 0.8]))));
+        let (url, asked, task) = embedding_engine(answer.clone()).await;
+        let target = Target {
+            url,
+            key: Some("k3y".into()),
+            served: "served".into(),
+            api: DeploymentApi::Embeddings,
+            custom: None,
+            several_gpus: false,
+        };
+        supervisor.prove_listed(&target).await.unwrap();
+        assert_eq!(paths(&asked), ["/v1/models", "/v1/embeddings"]);
+        assert!(asked.lock().unwrap().iter().all(|(_, keyed)| *keyed));
+        for broken in [
+            embedded(serde_json::json!([0.0, 0.0])),
+            embedded(serde_json::json!([])),
+            serde_json::json!({"object": "list", "data": [], "model": "served"}),
+        ] {
+            *answer.lock().unwrap() = broken.clone();
+            let error = supervisor.prove_listed(&target).await.unwrap_err();
+            assert!(error.contains("embedding probe"), "{broken}: {error}");
+        }
+        assert!(paths(&asked)
+            .iter()
+            .all(|path| path == "/v1/models" || path == "/v1/embeddings"));
+        task.abort();
+    }
+
+    // T47 T44 (ADR 0036 §§1, 5, ADR 0031 §5): an adopted custom engine whose
+    // manifest declares `api: embeddings` is re-proved by its port and the
+    // fixed embedding with its key, never a chat or decision probe, and then
+    // its owned listeners; a malformed vector fails the proof.
+    #[tokio::test]
+    async fn a_custom_embeddings_launch_is_proved_by_the_fixed_embedding() {
+        use capyctl_config::custom::{CustomManifest, CustomProfile};
+        use capyctl_config::effective::DeploymentApi;
+        let (_state, supervisor) = supervisor();
+        let answer = Arc::new(Mutex::new(embedded(serde_json::json!([0.6, 0.8]))));
+        let (url, asked, task) = embedding_engine(answer.clone()).await;
+        let custom = CustomProfile::new(
+            CustomManifest::parse(
+                "kind: custom_engine\nschema_version: 1\napi: embeddings\n\
+                 args: [--host, \"{host}\", --port, \"{port}\", --model, \"{model_dir}\"]\n\
+                 env: {SERVE_AUTH: \"{api_key}\"}\n",
+            )
+            .unwrap(),
+        );
+        let target = Target {
+            url,
+            key: Some("k3y".into()),
+            served: "served".into(),
+            api: DeploymentApi::Embeddings,
+            custom: Some(custom.clone()),
+            several_gpus: false,
+        };
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let close = stat.rfind(')').unwrap();
+        let launch = LocalReadyLaunch {
+            fence: capyctl_store::lifecycle::DeploymentFence {
+                deployment_id: "d".into(),
+                revision: 1,
+                generation: 1,
+            },
+            instance_index: 0,
+            operation_id: "o".into(),
+            step_id: "s".into(),
+            binding_id: "b".into(),
+            incarnation: "i".into(),
+            identities: vec![ProcessIdentity {
+                role: "api".into(),
+                pid: std::process::id(),
+                boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                    .unwrap()
+                    .trim()
+                    .to_owned(),
+                start_ticks: stat[close + 2..]
+                    .split_whitespace()
+                    .nth(19)
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+            }],
+            dispatch_enabled: false,
+        };
+        supervisor
+            .prove_custom(&launch, &target, &custom)
+            .await
+            .unwrap();
+        assert_eq!(paths(&asked), ["/v1/embeddings"]);
+        assert!(asked.lock().unwrap().iter().all(|(_, keyed)| *keyed));
+        *answer.lock().unwrap() = embedded(serde_json::json!([1.0, "x"]));
+        let error = supervisor
+            .prove_custom(&launch, &target, &custom)
+            .await
+            .unwrap_err();
+        assert!(error.contains("embedding probe"), "{error}");
+        assert_eq!(paths(&asked), ["/v1/embeddings", "/v1/embeddings"]);
+        task.abort();
     }
 }

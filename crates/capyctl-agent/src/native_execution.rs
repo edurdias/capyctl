@@ -2020,15 +2020,16 @@ impl NativeHostExecution {
     /// live, ready group its readiness recorded, and the engine answers the
     /// fixed decision on loopback with the launch's own key. Nothing is
     /// recorded and no gate moves. A launch that is not a decisions
-    /// deployment is never asked (it would answer as chat); any failure or
-    /// malformed answer is an error, which the result reports as no answer.
+    /// deployment is never asked (it would answer as chat or not at all); any
+    /// failure or malformed answer is an error, which the result reports as
+    /// no answer.
     async fn decide(
         &self,
         command: &MemberCommand,
         owned_handle: &str,
     ) -> Result<capyctl_adapters::decision_probe::DecisionAnswer, SessionError> {
         let (adapter, api, served, bound) = self.retained_probe(command, owned_handle).await?;
-        if api.is_chat() {
+        if api != capyctl_config::effective::DeploymentApi::Decisions {
             return Err(SessionError);
         }
         tokio::time::timeout(bound, adapter.decision_probe(&served, bound))
@@ -2037,9 +2038,36 @@ impl NativeHostExecution {
             .map_err(|_| SessionError)
     }
 
-    /// The retained launch a completion or decision probe names, bound by
-    /// the journal's `probe_target`, as an adapter that can only question
-    /// it, with its deployment's API, served name and the probe's bound.
+    /// ADR 0036 §§5, 6: the embedding probe of a retained embeddings launch,
+    /// as [`Self::decide`] runs the decision probe: the same live, ready
+    /// launch, the fixed embedding on loopback with the launch's own key,
+    /// nothing recorded and no gate moved. A launch that is not an embeddings
+    /// deployment is never asked; any failure or malformed answer is an
+    /// error, which the result reports as no answer.
+    async fn embed(
+        &self,
+        command: &MemberCommand,
+        owned_handle: &str,
+    ) -> Result<capyctl_adapters::embedding_probe::EmbeddingAnswer, SessionError> {
+        let (adapter, api, served, bound) = self.retained_probe(command, owned_handle).await?;
+        if api != capyctl_config::effective::DeploymentApi::Embeddings {
+            return Err(SessionError);
+        }
+        let answer = tokio::time::timeout(bound, adapter.embedding_probe(&served, bound))
+            .await
+            .map_err(|_| SessionError)?
+            .map_err(|_| SessionError)?;
+        // ADR 0036 §6: a vector the protocol would refuse is no answer.
+        if answer.dimension() > capyctl_protocol::execution::EMBEDDING_PROBE_MAX_DIMENSION {
+            return Err(SessionError);
+        }
+        Ok(answer)
+    }
+
+    /// The retained launch a completion, decision or embedding probe names,
+    /// bound by the journal's `probe_target`, as an adapter that can only
+    /// question it, with its deployment's API, served name and the probe's
+    /// bound.
     async fn retained_probe(
         &self,
         command: &MemberCommand,
@@ -2214,6 +2242,8 @@ impl NativeHostExecution {
         let mut probe = capyctl_adapters::completion_probe::ProbeAnswer::default();
         // ADR 0030 §4: what a decision probe answered.
         let mut decided: Option<capyctl_adapters::decision_probe::DecisionAnswer> = None;
+        // ADR 0036 §§5, 6: what an embedding probe answered.
+        let mut embedded: Option<capyctl_adapters::embedding_probe::EmbeddingAnswer> = None;
         let acceptance = match tokio::task::spawn_blocking(move || {
             journal.accept(
                 session,
@@ -2256,6 +2286,14 @@ impl NativeHostExecution {
                     ..
                 } => {
                     decided = self.decide(&command, owned_handle).await.ok();
+                }
+                // ADR 0036 §§5, 6: and an embedding probe.
+                MemberAction::Probe {
+                    owned_handle,
+                    embedding: true,
+                    ..
+                } => {
+                    embedded = self.embed(&command, owned_handle).await.ok();
                 }
                 _ => {}
             },
@@ -2301,6 +2339,7 @@ impl NativeHostExecution {
                     owned_handle,
                     max_tokens,
                     decision,
+                    embedding,
                 } => {
                     let journal = self.journal.clone();
                     let policy = Arc::new(self.clone());
@@ -2325,6 +2364,10 @@ impl NativeHostExecution {
                         // answers malformed carries no answer.
                         None if *decision => {
                             decided = self.decide(&command, owned_handle).await.ok();
+                        }
+                        // ADR 0036 §§5, 6: and an embedding probe.
+                        None if *embedding => {
+                            embedded = self.embed(&command, owned_handle).await.ok();
                         }
                         // An engine that does not answer is ordinary evidence:
                         // the result below reports it unusable with ownership
@@ -2367,6 +2410,10 @@ impl NativeHostExecution {
                         probability,
                     })
                     .collect(),
+            });
+            result.probe_embedding = embedded.map(|answer| pb::EmbeddingProbeEvidence {
+                probe_version: capyctl_adapters::embedding_probe::VERSION,
+                vector: answer.vector,
             });
         }
         if command.action.launch_plan().is_some()
@@ -2605,7 +2652,8 @@ fn launch_failure(result: &pb::MemberExecutionResult, engine: Option<&str>) -> S
 /// completion through the same authenticated path inference uses. HTTP liveness
 /// alone is never readiness. ADR 0030 §3: a decisions deployment answers the
 /// fixed decision instead, complete and well-formed, and is never sent a
-/// chat probe.
+/// chat probe. ADR 0036 §5: an embeddings deployment answers the fixed
+/// embedding, and is never sent a chat or decision probe.
 async fn fresh_probe(
     engine: &dyn NativeEngine,
     member: &MemberRef,
@@ -2628,13 +2676,23 @@ async fn fresh_probe(
     if listed != Readiness::Ready {
         return Err(SessionError);
     }
-    if !api.is_chat() {
-        let bound = remaining().min(PROBE_CHAT_TIMEOUT);
-        return tokio::time::timeout(bound, engine.decision_probe(served, bound))
-            .await
-            .map_err(|_| SessionError)?
-            .map(|_| ())
-            .map_err(|_| SessionError);
+    let bound = remaining().min(PROBE_CHAT_TIMEOUT);
+    match api {
+        capyctl_config::effective::DeploymentApi::Chat => {}
+        capyctl_config::effective::DeploymentApi::Decisions => {
+            return tokio::time::timeout(bound, engine.decision_probe(served, bound))
+                .await
+                .map_err(|_| SessionError)?
+                .map(|_| ())
+                .map_err(|_| SessionError);
+        }
+        capyctl_config::effective::DeploymentApi::Embeddings => {
+            return tokio::time::timeout(bound, engine.embedding_probe(served, bound))
+                .await
+                .map_err(|_| SessionError)?
+                .map(|_| ())
+                .map_err(|_| SessionError);
+        }
     }
     let body = serde_json::json!({
         "model": served,
@@ -3169,6 +3227,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(chat.chat_requests(), 1);
+    }
+    // T47 (ADR 0036 §5, SPEC §6.1): a host re-proves an embeddings launch
+    // (after a reconnect or a wake) with the fixed embedding only: a
+    // well-formed vector passes, a malformed answer or an engine without
+    // `/v1/embeddings` fails, and no chat or decision probe is ever sent.
+    #[tokio::test]
+    async fn an_embeddings_reproof_is_the_fixed_embedding_never_chat_or_decision() {
+        use capyctl_config::effective::DeploymentApi;
+        use capyctl_testkit::fake_engine::{EmbeddingFault, FakeEmbeddings};
+        use capyctl_testkit::FakeEngine;
+        let member = MemberRef {
+            deployment_id: "d".into(),
+            member_id: "b".into(),
+        };
+        let stop = || capyctl_protocol::now_unix_ms() + 10_000;
+        let embeddings = FakeEngine::new().with_embeddings();
+        fresh_probe(
+            &embeddings,
+            &member,
+            "served",
+            DeploymentApi::Embeddings,
+            stop(),
+        )
+        .await
+        .unwrap();
+        embeddings.set_embeddings(FakeEmbeddings {
+            fault: Some(EmbeddingFault::WrongCount),
+            ..Default::default()
+        });
+        assert!(fresh_probe(
+            &embeddings,
+            &member,
+            "served",
+            DeploymentApi::Embeddings,
+            stop()
+        )
+        .await
+        .is_err());
+        assert_eq!(embeddings.embedding_requests(), 2);
+        assert_eq!(embeddings.chat_requests(), 0);
+        assert_eq!(embeddings.decision_requests(), 0);
+        // An engine that serves chat or decisions is never ready as an
+        // embeddings deployment, and is sent neither probe.
+        let chat = FakeEngine::new();
+        let decisions = FakeEngine::new().with_decisions();
+        for engine in [&chat, &decisions] {
+            assert!(
+                fresh_probe(engine, &member, "served", DeploymentApi::Embeddings, stop())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(engine.chat_requests(), 0);
+            assert_eq!(engine.decision_requests(), 0);
+        }
+        // An embedding model is never ready as a chat or decisions one.
+        let embeddings = FakeEngine::new().with_embeddings();
+        for api in [DeploymentApi::Chat, DeploymentApi::Decisions] {
+            assert!(fresh_probe(&embeddings, &member, "served", api, stop())
+                .await
+                .is_err());
+        }
+        assert_eq!(embeddings.embedding_requests(), 0);
     }
     // T37: the host document's `load_report_interval` sets the period of the
     // agent's engine load reports; omitted, it is the 1 s default.

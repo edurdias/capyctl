@@ -341,16 +341,18 @@ impl Residency {
     }
 }
 
-/// ADR 0030 §1: the API a deployment serves. `chat` answers
+/// ADR 0030 §1, ADR 0036 §1: the API a deployment serves. `chat` answers
 /// `POST /v1/chat/completions`; `decisions` answers `POST /v1/systemone`
 /// (decision models: typed questions answered with probabilities, no
-/// generated text). The same checkpoint served both ways is two revisions.
+/// generated text); `embeddings` answers `POST /v1/embeddings` (a vector per
+/// input). The same checkpoint served two ways is two revisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DeploymentApi {
     #[default]
     Chat,
     Decisions,
+    Embeddings,
 }
 
 impl DeploymentApi {
@@ -365,6 +367,7 @@ impl DeploymentApi {
         match self {
             Self::Chat => "chat",
             Self::Decisions => "decisions",
+            Self::Embeddings => "embeddings",
         }
     }
 }
@@ -1424,15 +1427,14 @@ fn check_custom_deployment(
         ));
     }
     if d.api != manifest.api {
-        let (missing, serves) = match d.api {
-            DeploymentApi::Decisions => ("decisions", "chat"),
-            DeploymentApi::Chat => ("chat", "decisions"),
-        };
+        // ADR 0031 §2, ADR 0036 §1: the deployment's API is the one missing.
         return Err(invalid(
             "api",
             format!(
-                "capability_missing:{missing}: this custom engine's manifest serves `api: \
-                 {serves}`, and every deployment on it serves the same API"
+                "capability_missing:{}: this custom engine's manifest serves `api: {}`, and \
+                 every deployment on it serves the same API",
+                d.api.name(),
+                manifest.api.name()
             ),
         ));
     }
@@ -1590,9 +1592,14 @@ fn resolve_with(
         .ok_or_else(|| invalid("runtime_profile", "unknown runtime profile"))?
         .clone();
     // ADR 0030 §1: only an installation that serves `/v1/systemone` takes a
-    // decisions deployment, refused before anything else is resolved.
-    if d.api == DeploymentApi::Decisions {
-        crate::decisions::check_engine(raw_profile.engine, &raw_profile.build_fingerprint)?;
+    // decisions deployment; ADR 0036 §1: only one with an embeddings route
+    // takes an embeddings deployment. Refused before anything else resolves.
+    match d.api {
+        DeploymentApi::Decisions => {
+            crate::decisions::check_engine(raw_profile.engine, &raw_profile.build_fingerprint)?
+        }
+        DeploymentApi::Embeddings => crate::embeddings::check_engine(raw_profile.engine)?,
+        DeploymentApi::Chat => {}
     }
     // ADR 0035 §1, §10: the engine's local multi-GPU mode, from its support
     // data, before anything else is resolved.
@@ -1809,10 +1816,29 @@ fn resolve_with(
         multi_gpu::communication_allowance(ranks),
         limits,
     );
+    // ADR 0036 §7.2: an embeddings deployment parks only where its engine's
+    // support data says embeddings parking passed; a stated `deep` elsewhere
+    // is refused.
+    if d.api == DeploymentApi::Embeddings {
+        crate::embeddings::check_residency(
+            raw_profile.engine,
+            d.residency,
+            crate::embeddings::support(raw_profile.engine),
+        )?;
+    }
     let residency = d.residency.unwrap_or_else(|| {
         // ADR 0030 §7: a decisions deployment restarts instead of parking.
         if d.api == DeploymentApi::Decisions {
             return Residency::RestartOnly;
+        }
+        // ADR 0036 §7.2: an embeddings deployment that states no residency
+        // parks `deep` on vLLM and SGLang (discrete hosts too) while its
+        // engine's support data allows it, and restarts everywhere else.
+        if d.api == DeploymentApi::Embeddings {
+            return crate::embeddings::default_residency(
+                crate::embeddings::support(raw_profile.engine),
+                raw_profile.security.deep_park.is_enabled(),
+            );
         }
         // ADR 0035 §9: on several GPUs an engine parks only once its live
         // row passes; until then a deployment stating no residency restarts.
@@ -1945,6 +1971,7 @@ fn resolve_with(
         d.engine_config,
         engine_config::EngineInputs {
             engine: profile.engine,
+            api: d.api,
             residency,
             security: &profile.security,
             profile_args: &profile.args,
@@ -1959,9 +1986,10 @@ fn resolve_with(
             draft_declared: model.draft.is_some(),
         },
     )?;
-    // ADR 0030 §1 (amending ADR 0024 §1): parsers apply to chat deployments.
-    if d.api == DeploymentApi::Decisions {
-        crate::decisions::check_parsers(&engine_config)?;
+    // ADR 0030 §1, ADR 0036 §1 (amending ADR 0024 §1): parsers apply to chat
+    // deployments.
+    if d.api != DeploymentApi::Chat {
+        crate::decisions::check_parsers(&engine_config, d.api)?;
     }
     // ADR 0033 §9, §14: `lmcache: required` is refused here when the
     // deployment and its profile alone keep LMCache off; what the host

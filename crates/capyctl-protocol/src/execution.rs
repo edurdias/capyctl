@@ -634,10 +634,18 @@ pub enum MemberAction {
     /// its own key, and the result carries the answer in `probe_decision`.
     /// It never carries `max_tokens`. `false` is the readiness or completion
     /// probe and encodes and digests exactly as before.
+    ///
+    /// ADR 0036 §§5, 6 (additive): with `embedding`, the embedding probe of
+    /// an embeddings launch: the host's agent sends the fixed
+    /// `/v1/embeddings` probe request to the retained launch on loopback with
+    /// its own key, and the result carries the vector in `probe_embedding`.
+    /// It never carries `max_tokens` or `decision`. `false` encodes and
+    /// digests exactly as before.
     Probe {
         owned_handle: String,
         max_tokens: Option<u32>,
         decision: bool,
+        embedding: bool,
     },
     /// SPEC §§9.1, 10 (protocol version 2): park one retained, drained launch in
     /// place. The process group and its reservation stay owned; a park never
@@ -896,7 +904,17 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
         {
             return Err(GroupIdentityError);
         }
+        // ADR 0036 §§5, 6: the embedding flag rides a probe only, never a
+        // completion or decision probe.
+        if command.probe_embedding
+            && (probe_max_tokens.is_some()
+                || command.probe_decision
+                || !matches!(command.action, Some(Action::ProbeOwnedHandle(_))))
+        {
+            return Err(GroupIdentityError);
+        }
         let probe_decision = command.probe_decision;
+        let probe_embedding = command.probe_embedding;
         let action = match command.action.ok_or(GroupIdentityError)? {
             Action::Prepare(plan) => MemberAction::Prepare(plan.try_into()?),
             Action::Launch(plan) => MemberAction::Launch {
@@ -920,6 +938,7 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
                     owned_handle,
                     max_tokens: probe_max_tokens.take(),
                     decision: probe_decision,
+                    embedding: probe_embedding,
                 }
             }
             Action::ParkOwnedHandle(owned_handle) if owned_handle_ok(&owned_handle) => {
@@ -1051,6 +1070,14 @@ impl MemberCommand {
             },
             // ADR 0030 §4: false (every other probe) is not encoded.
             probe_decision: matches!(self.action, MemberAction::Probe { decision: true, .. }),
+            // ADR 0036 §§5, 6: false (every other probe) is not encoded.
+            probe_embedding: matches!(
+                self.action,
+                MemberAction::Probe {
+                    embedding: true,
+                    ..
+                }
+            ),
         }
     }
 
@@ -1137,6 +1164,15 @@ pub const DECISION_PROBE_OPTION_MAX_BYTES: usize = 64;
 /// ADR 0030 §4: the version of the fixed decision probe this protocol knows.
 pub const DECISION_PROBE_VERSION: u32 = 1;
 
+/// ADR 0036 §§5, 6: the version of the fixed embedding probe this protocol
+/// knows (the adapters' `embedding_probe::VERSION`).
+pub const EMBEDDING_PROBE_VERSION: u32 = 1;
+
+/// ADR 0036 §§5, 6: the longest vector an embedding probe's answer may carry.
+/// The largest model ADR 0036 qualifies answers 4096 values; the bound keeps
+/// a result small (256 KiB of float32) whatever a host relays.
+pub const EMBEDDING_PROBE_MAX_DIMENSION: usize = 65_536;
+
 /// ADR 0030 §4: a decision probe's answer is well-formed: this probe version,
 /// 1..=16 unique, non-empty, bounded option names, each probability finite
 /// within [0, 1], and the choice one of the options.
@@ -1152,6 +1188,23 @@ fn decision_evidence_ok(evidence: &pb::DecisionProbeEvidence) -> bool {
                 && seen.insert(p.option.as_str())
         })
         && seen.contains(evidence.choice.as_str())
+}
+
+/// ADR 0036 §5: an embedding probe's answer is well-formed: this probe
+/// version, 1..=[`EMBEDDING_PROBE_MAX_DIMENSION`] finite values whose
+/// Euclidean norm is finite and above 1e-6.
+fn embedding_evidence_ok(evidence: &pb::EmbeddingProbeEvidence) -> bool {
+    let norm = evidence
+        .vector
+        .iter()
+        .map(|value| f64::from(*value).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    evidence.probe_version == EMBEDDING_PROBE_VERSION
+        && (1..=EMBEDDING_PROBE_MAX_DIMENSION).contains(&evidence.vector.len())
+        && evidence.vector.iter().all(|value| value.is_finite())
+        && norm.is_finite()
+        && norm > 1e-6
 }
 
 /// SPEC §13: shape and exact command binding only. The caller must establish the
@@ -1258,6 +1311,21 @@ pub fn validate_result(
         if !(matches!(command.action, MemberAction::Probe { decision: true, .. })
             && result.state == "completed"
             && decision_evidence_ok(evidence))
+        {
+            return Err(GroupIdentityError);
+        }
+    }
+    // ADR 0036 §§5, 6: an embedding answer belongs to a completed embedding
+    // probe only, and must be well-formed.
+    if let Some(evidence) = &result.probe_embedding {
+        if !(matches!(
+            command.action,
+            MemberAction::Probe {
+                embedding: true,
+                ..
+            }
+        ) && result.state == "completed"
+            && embedding_evidence_ok(evidence))
         {
             return Err(GroupIdentityError);
         }

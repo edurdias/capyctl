@@ -125,6 +125,8 @@ struct Reported {
     reasoning_only: AtomicBool,
     /// ADR 0030: what `/v1/systemone` answers (a decision model).
     decision: std::sync::Mutex<Option<Value>>,
+    /// ADR 0036 §5: what `/v1/embeddings` answers (an embedding server).
+    embedding: std::sync::Mutex<Option<Value>>,
 }
 
 /// Take one from `counter` while it is positive.
@@ -141,6 +143,7 @@ struct Stub {
     health_reads: Arc<AtomicUsize>,
     chats: Arc<AtomicUsize>,
     decisions: Arc<AtomicUsize>,
+    embeddings: Arc<AtomicUsize>,
 }
 
 impl Stub {
@@ -288,6 +291,28 @@ async fn systemone(State(stub): State<Stub>, Json(body): Json<Value>) -> axum::r
     }
 }
 
+async fn embeddings(
+    State(stub): State<Stub>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    stub.embeddings.fetch_add(1, Ordering::SeqCst);
+    // ADR 0036 §5: the fixed version-1 request; ADR 0029 §4: no key.
+    assert_eq!(
+        body,
+        capyctl_adapters::embedding_probe::request(&stub.model)
+    );
+    assert!(headers.get("authorization").is_none());
+    match stub.reported.embedding.lock().unwrap().clone() {
+        Some(answer) => Json(answer).into_response(),
+        None => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": {"code": 501, "message": "This server does not support embeddings. Start it with `--embeddings`"}})),
+        )
+            .into_response(),
+    }
+}
+
 fn reported() -> Reported {
     let reported = Reported::default();
     reported.total_slots.store(4, SeqCst);
@@ -314,6 +339,7 @@ async fn stub_engine(change: impl FnOnce(&Reported)) -> (Stub, u16) {
         health_reads: Arc::default(),
         chats: Arc::default(),
         decisions: Arc::default(),
+        embeddings: Arc::default(),
     };
     let app = axum::Router::new()
         .route("/health", get(health))
@@ -322,6 +348,7 @@ async fn stub_engine(change: impl FnOnce(&Reported)) -> (Stub, u16) {
         .route("/metrics", get(metrics))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/systemone", post(systemone))
+        .route("/v1/embeddings", post(embeddings))
         .with_state(stub.clone());
     let port = serve(app).await;
     (stub, port)
@@ -521,6 +548,73 @@ async fn a_decisions_launch_is_ready_only_on_a_well_formed_decision() {
             assert!(matches!(canary.answer, CanaryEvidence::Decision(_)));
             assert_eq!(stub.chats.load(Ordering::SeqCst), 0);
         }
+    }
+}
+
+fn embedding(entries: Value) -> Value {
+    json!({"model": "qwen", "object": "list", "data": entries,
+        "usage": {"prompt_tokens": 17, "total_tokens": 17}})
+}
+
+// T47 (ADR 0036 §2, §5, SPEC §6.1): an embeddings launch renders
+// `--embeddings` and is ready only on a well-formed answer to the fixed
+// embedding, sent with no key, and is never sent a chat probe; its canary is
+// that embedding.
+#[tokio::test]
+async fn an_embeddings_launch_is_ready_only_on_a_well_formed_embedding() {
+    use capyctl_adapters::completion_probe::CanaryEvidence;
+    use capyctl_config::effective::DeploymentApi;
+    let entry = |vector: Value| json!({"index": 0, "embedding": vector, "object": "embedding", "encoding_format": "float"});
+    let cases = [
+        (Some(embedding(json!([entry(json!([0.6, 0.8]))]))), true),
+        (Some(embedding(json!([entry(json!([1e-8, 0.0]))]))), false),
+        (
+            Some(embedding(json!([entry(json!([0.6])), entry(json!([0.8]))]))),
+            false,
+        ),
+        (
+            Some(embedding(
+                json!([{"index": 1, "embedding": [0.6, 0.8], "object": "embedding"}]),
+            )),
+            false,
+        ),
+        (Some(json!({"object": "list", "data": []})), false),
+        (None, false),
+    ];
+    for (answer, ready) in cases {
+        let (stub, port) = stub_engine(|r| *r.embedding.lock().unwrap() = answer.clone()).await;
+        let root = tempfile::tempdir().unwrap();
+        let tool = ScriptedTool::new(Presence::Alive);
+        let adapter = adapter(port, root.path())
+            .with_launch(PlanInputLlamacpp {
+                api: DeploymentApi::Embeddings,
+                ..plan(port)
+            })
+            .with_tools(tool.clone())
+            .with_api(DeploymentApi::Embeddings);
+        let command = initialize_command(30_000);
+        let result = adapter.execute_persisted(&command).await;
+        assert_eq!(result.is_ok(), ready, "{answer:?}: {result:?}");
+        let argv = &tool.spawned.get().expect("one spawn").argv;
+        assert!(argv.iter().any(|a| a == "--embeddings"), "{argv:?}");
+        assert_eq!(stub.chats.load(Ordering::SeqCst), 0, "{answer:?}: no chat");
+        assert_eq!(stub.decisions.load(Ordering::SeqCst), 0, "{answer:?}");
+        assert_eq!(stub.embeddings.load(Ordering::SeqCst), 1, "{answer:?}");
+        let canary = adapter
+            .wake_canary(&command.context, 8, Duration::from_secs(5))
+            .await;
+        if ready {
+            let CanaryEvidence::Embedding(answer) = canary.unwrap().answer else {
+                panic!("an embeddings launch's canary is its embedding");
+            };
+            assert_eq!(answer.vector, vec![0.6, 0.8]);
+        } else {
+            assert!(
+                matches!(canary, Err(RuntimeError::Uncertain(_))),
+                "{canary:?}"
+            );
+        }
+        assert_eq!(stub.chats.load(Ordering::SeqCst), 0);
     }
 }
 

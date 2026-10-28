@@ -436,6 +436,10 @@ pub async fn dispatch_timed(
                     )
                     .await
                 }
+                // ADR 0036 §4: an embeddings answer is streamed through
+                // (`crate::embeddings`), never collected here; nothing is
+                // sent, so the request is refused before reaching an engine.
+                Endpoint::Embeddings => Ok(Err(AdapterError::UnsupportedCapability)),
             };
             // SPEC §10 (found live 2026-10-02): a cut drops the forward, which
             // closes the engine connection, so the lease is cancelling, as for

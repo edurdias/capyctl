@@ -337,6 +337,44 @@ fn a_restart_only_deployment_has_no_park_policy() {
     assert_eq!(park_policy(&effective), ParkPolicy::Disabled);
 }
 
+/// ADR 0036 §2, §7.2: an embeddings deployment renders `--runner pooling` in
+/// the reserved block, before the marker, and parks deep with the sleep
+/// mode a deep chat deployment renders; a chat deployment renders no runner.
+// T47 T14 T21
+#[test]
+fn an_embeddings_deployment_renders_the_pooling_runner_and_sleep_mode() {
+    let (mut deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["security"]["deep_park"] = json!("enabled");
+    deployment["api"] = json!("embeddings");
+    deployment.as_object_mut().unwrap().remove("residency");
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    assert_eq!(park_policy(&effective), ParkPolicy::Enabled);
+    let plan = plan_from_effective(&effective, 8123, "l".into(), "/r".into()).unwrap();
+    assert_eq!(
+        plan.api,
+        capyctl_config::effective::DeploymentApi::Embeddings
+    );
+    let argv = render_command(&plan).unwrap().argv;
+    let marker = argv
+        .iter()
+        .position(|a| a == capyctl_adapters::vllm::USER_ARGS_MARKER)
+        .unwrap();
+    let runner = argv
+        .windows(2)
+        .position(|w| w == ["--runner", "pooling"])
+        .unwrap();
+    assert!(runner < marker, "{argv:?}");
+    assert!(!argv.iter().any(|a| a == "--convert"));
+    assert!(argv[..marker].iter().any(|a| a == "--enable-sleep-mode"));
+
+    deployment.as_object_mut().unwrap().remove("api");
+    let chat = resolve_effective(&deployment, &host).unwrap();
+    let argv = render_command(&plan_from_effective(&chat, 8123, "l".into(), "/r".into()).unwrap())
+        .unwrap()
+        .argv;
+    assert!(!argv.iter().any(|a| a == "--runner"));
+}
+
 /// Spec §3: a plan is refused rather than invented when the frozen profile
 /// carries another family's settings or the deployment serves no route.
 // T14

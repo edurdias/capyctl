@@ -1975,6 +1975,7 @@ impl HostJournal {
             probe_text: String::new(),
             // ADR 0030 §4: nor a decision probe's answer.
             probe_decision: None,
+            probe_embedding: None,
             // ADR 0033 §§8, 9: a LaunchSingle's or a Restore's own LMCache
             // report, as journaled when its Initialize ended.
             lmcache: match command.action {

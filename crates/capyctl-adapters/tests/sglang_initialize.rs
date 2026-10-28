@@ -60,6 +60,8 @@ struct Stub {
     ready_after: usize,
     polls: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    /// ADR 0036 §5: what `POST /v1/embeddings` answers; 404 when `None`.
+    embedding: Arc<Mutex<Option<Value>>>,
 }
 
 struct RecordedRequest {
@@ -139,6 +141,32 @@ async fn chat(
     Sse::new(futures::stream::iter(events.collect::<Vec<_>>())).into_response()
 }
 
+/// ADR 0036 §5: SGLang's `/v1/embeddings` on an embedding server, guarded by
+/// the same key.
+async fn embeddings(
+    State(stub): State<Stub>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    let presented = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    stub.requests.lock().unwrap().push(RecordedRequest {
+        path: "/v1/embeddings".into(),
+        authorization: presented.clone(),
+        body,
+    });
+    if presented != format!("Bearer {}", stub.key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match stub.embedding.lock().unwrap().clone() {
+        Some(answer) => Json(answer).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn serve_stub(model: &str, ready_after: usize, key: &str, port: u16) -> (Stub, u16) {
     let stub = Stub {
         model: model.into(),
@@ -146,10 +174,12 @@ async fn serve_stub(model: &str, ready_after: usize, key: &str, port: u16) -> (S
         ready_after,
         polls: Arc::new(AtomicUsize::new(0)),
         requests: Arc::new(Mutex::new(Vec::new())),
+        embedding: Arc::new(Mutex::new(None)),
     };
     let app = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/embeddings", post(embeddings))
         .with_state(stub.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
@@ -868,6 +898,81 @@ async fn the_descriptor_contract_pin_holds() {
         scope["deadline_ms"].as_i64().unwrap() > scope["issued_at_ms"].as_i64().unwrap(),
         "the scope must bound its own issuance"
     );
+    std::fs::remove_file(&log).ok();
+}
+
+/// ADR 0036 §2, §5, SPEC §6.1: an embeddings launch is an embedding server
+/// (`is_embedding: true` in its public settings, nothing else changed) and
+/// is ready only on a well-formed answer to the fixed embedding, sent with
+/// the launch's key; it is never sent a chat probe. A chat launch carries no
+/// `is_embedding` and is never sent an embedding.
+// T47
+#[tokio::test]
+async fn an_embeddings_launch_is_an_embedding_server_ready_on_the_fixed_embedding() {
+    use capyctl_config::effective::DeploymentApi;
+    let answer = |entries: Value| {
+        json!({"object": "list", "model": CHECKPOINT, "data": entries,
+            "usage": {"prompt_tokens": 17, "total_tokens": 17}})
+    };
+    let entry = |vector: Value| json!({"object": "embedding", "index": 0, "embedding": vector});
+    let public = |tool: &ScriptedTool| -> Value {
+        serde_json::from_str(&tool.spawned.lock().unwrap()[0].argv[4]).unwrap()
+    };
+    let paths = |stub: &Stub| -> Vec<String> {
+        stub.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.path != "/v1/models")
+            .map(|request| request.path.clone())
+            .collect()
+    };
+    for (embedding, ready) in [
+        (Some(answer(json!([entry(json!([0.6, 0.8]))]))), true),
+        (Some(answer(json!([entry(json!([0.6, null]))]))), false),
+        (Some(answer(json!([]))), false),
+        (None, false),
+    ] {
+        let log = launch_log();
+        std::fs::write(&log, "").unwrap();
+        let (stub, port) = serve_stub(MODEL, 0, INFERENCE, 0).await;
+        *stub.embedding.lock().unwrap() = embedding.clone();
+        let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+        let adapter =
+            equipped(frozen_launch(port), tool.clone(), &log).with_api(DeploymentApi::Embeddings);
+        let result = adapter.execute_persisted(&initialize_command(30_000)).await;
+        assert_eq!(result.is_ok(), ready, "{embedding:?}: {result:?}");
+        let settings = &public(&tool)["settings"];
+        assert_eq!(settings["is_embedding"], true);
+        // ADR 0036 §7.2: the deep-park memory saver stays as the launch froze it.
+        assert_eq!(
+            settings["memory_saver"],
+            json!(self::settings().memory_saver)
+        );
+        assert_eq!(paths(&stub), ["/v1/embeddings"]);
+        let recorded = stub.requests.lock().unwrap();
+        let probe = recorded
+            .iter()
+            .find(|r| r.path == "/v1/embeddings")
+            .unwrap();
+        assert_eq!(probe.authorization, format!("Bearer {INFERENCE}"));
+        assert_eq!(
+            probe.body,
+            capyctl_adapters::embedding_probe::request(MODEL)
+        );
+        drop(recorded);
+        std::fs::remove_file(&log).ok();
+    }
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    let (stub, port) = serve_stub(MODEL, 0, INFERENCE, 0).await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    equipped(frozen_launch(port), tool.clone(), &log)
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+    assert!(public(&tool)["settings"].get("is_embedding").is_none());
+    assert_eq!(paths(&stub), ["/v1/chat/completions"]);
     std::fs::remove_file(&log).ok();
 }
 

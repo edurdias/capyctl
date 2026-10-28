@@ -262,6 +262,7 @@ fn a_launch_reports_its_lmcache_on_or_off_with_a_closed_reason() {
         owned_handle: "launch".into(),
         max_tokens: None,
         decision: false,
+        embedding: false,
     });
     let mut probed = launched(&probe, Some(on.to_wire()));
     probed.state = "completed".into();

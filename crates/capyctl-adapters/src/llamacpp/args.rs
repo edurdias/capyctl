@@ -3,11 +3,13 @@
 //! is the only way in, and every option CapyCTL owns is rendered here once.
 use std::collections::BTreeMap;
 
+use capyctl_config::effective::DeploymentApi;
 use capyctl_config::engine_policy::{
-    parse_options, validate_rendered_args, Engine, ProfileArgError,
+    normalize_option_name, parse_options, validate_rendered_args, Engine, ProfileArgError,
 };
 use capyctl_config::llamacpp::{
-    is_reserved, refused_env_name, slot_pool_tokens, CACHE_TYPES, RESERVED_RENDERED,
+    is_pooling, is_reserved, refused_env_name, slot_pool_tokens, CACHE_TYPES, EMBEDDINGS_OPTION,
+    RESERVED_NEVER_RENDERED, RESERVED_RENDERED,
 };
 use capyctl_domain::launch::LlamacppGpuLayers;
 
@@ -75,6 +77,11 @@ pub struct PlanInputLlamacpp {
     /// (`--tensor-split`), proportional to its grant, in rank order; empty on
     /// one GPU, which renders no split.
     pub tensor_split: Vec<u64>,
+    /// ADR 0036 §2: the API the deployment serves. An embeddings deployment
+    /// renders `--embeddings`, and `--ubatch-size` and `--batch-size` equal
+    /// to the slot window unless its arguments state them; its own
+    /// `--pooling` (never `none`) is ordinary.
+    pub api: DeploymentApi,
 }
 
 /// ADR 0028 §2.1: `build_env` values may hold tokens, so Debug prints its names only.
@@ -100,6 +107,7 @@ impl std::fmt::Debug for PlanInputLlamacpp {
             .field("engine_log", &self.engine_log)
             .field("cuda_namespaces", &self.cuda_namespaces)
             .field("tensor_split", &self.tensor_split)
+            .field("api", &self.api)
             .finish()
     }
 }
@@ -128,8 +136,14 @@ pub enum LlamacppArgsError {
 }
 
 /// ADR 0029 §4–§6: the options CapyCTL renders, in this order, before the
-/// host-fixed and the deployment's arguments.
-fn reserved_block(input: &PlanInputLlamacpp, ctx_size: u32) -> Vec<String> {
+/// host-fixed and the deployment's arguments. `stated` names the options
+/// those arguments set (normalized).
+fn reserved_block(
+    input: &PlanInputLlamacpp,
+    ctx_size: u32,
+    window: u32,
+    stated: &[String],
+) -> Vec<String> {
     let mut argv: Vec<String> = [
         "--host",
         LOOPBACK,
@@ -194,11 +208,58 @@ fn reserved_block(input: &PlanInputLlamacpp, ctx_size: u32) -> Vec<String> {
             "0".to_owned(),
         ]);
     }
+    // ADR 0036 §2: an embedding server, its physical batch the slot window,
+    // so any input that fits the context fits one batch (llama.cpp embeds
+    // an input in one ubatch). A size the arguments state wins.
+    if input.api == DeploymentApi::Embeddings {
+        argv.push(EMBEDDINGS_OPTION.to_owned());
+        for option in [UBATCH_SIZE, BATCH_SIZE] {
+            if !stated.iter().any(|name| name == option) {
+                argv.extend([option.to_owned(), window.to_string()]);
+            }
+        }
+    }
     argv
 }
 
 /// ADR 0035 §4: the one `--split-mode` CapyCTL renders.
 const SPLIT_MODE_LAYER: &str = "layer";
+
+/// ADR 0036 §2: the batch sizes an embeddings deployment renders unless its
+/// arguments state them.
+const UBATCH_SIZE: &str = "--ubatch-size";
+const BATCH_SIZE: &str = "--batch-size";
+
+/// ADR 0036 §2: an embeddings deployment's `--pooling <type>` taken out of
+/// its extra arguments, which are otherwise checked as host-fixed ones are
+/// (where `--pooling` stays reserved). At most one, with a value, never
+/// `none` (the OpenAI route refuses it). A `--pooling=<type>` spelling is
+/// left in place for the shape check to refuse.
+fn without_pooling(extra_args: &[String]) -> Result<Vec<String>, LlamacppArgsError> {
+    let mut rest = Vec::with_capacity(extra_args.len());
+    let mut tokens = extra_args.iter();
+    let mut seen = false;
+    while let Some(token) = tokens.next() {
+        let name = normalize_option_name(token);
+        if !token.starts_with("--") || token.contains('=') || !is_pooling(&name) {
+            rest.push(token.clone());
+            continue;
+        }
+        if std::mem::replace(&mut seen, true) {
+            return Err(LlamacppArgsError::Duplicate(name));
+        }
+        match tokens.next() {
+            Some(value) if value == "none" => return Err(LlamacppArgsError::Reserved(name)),
+            Some(value) if !value.starts_with('-') => {}
+            _ => {
+                return Err(LlamacppArgsError::Malformed(format!(
+                    "{name} needs a value"
+                )))
+            }
+        }
+    }
+    Ok(rest)
+}
 
 fn pass_through_error(error: ProfileArgError) -> LlamacppArgsError {
     match error {
@@ -213,6 +274,8 @@ fn pass_through_error(error: ProfileArgError) -> LlamacppArgsError {
 pub fn render_command(input: &PlanInputLlamacpp) -> Result<RenderedCommand, LlamacppArgsError> {
     let ctx_size =
         slot_pool_tokens(input.context_length, input.slots).ok_or(LlamacppArgsError::NoContext)?;
+    // ADR 0029 §5: each slot's window, `pad256(context_length)`.
+    let window = slot_pool_tokens(input.context_length, 1).ok_or(LlamacppArgsError::NoContext)?;
     if !CACHE_TYPES.contains(&input.cache_type.as_str()) {
         return Err(LlamacppArgsError::CacheType(input.cache_type.clone()));
     }
@@ -233,17 +296,34 @@ pub fn render_command(input: &PlanInputLlamacpp) -> Result<RenderedCommand, Llam
     }
     // ADR 0029 §6: no protected entry parses these, so the exact-name policy
     // is the check of the complete pass-through vector, again at render.
+    // ADR 0036 §2: an embeddings deployment's own `--pooling` is ordinary.
+    let extra_checked = if input.api == DeploymentApi::Embeddings {
+        without_pooling(&input.extra_args)?
+    } else {
+        input.extra_args.clone()
+    };
+    let checked: Vec<String> = input
+        .engine_args
+        .iter()
+        .chain(&extra_checked)
+        .cloned()
+        .collect();
+    validate_rendered_args(Engine::Llamacpp, &checked, false).map_err(pass_through_error)?;
     let pass_through: Vec<String> = input
         .engine_args
         .iter()
         .chain(&input.extra_args)
         .cloned()
         .collect();
-    validate_rendered_args(Engine::Llamacpp, &pass_through, false).map_err(pass_through_error)?;
+    let stated: Vec<String> = parse_options(&pass_through)
+        .map_err(|error| LlamacppArgsError::Malformed(error.to_string()))?
+        .into_iter()
+        .map(|option| option.name)
+        .collect();
     let mut argv = vec![input.engine_bin.clone()];
-    argv.extend(reserved_block(input, ctx_size));
+    argv.extend(reserved_block(input, ctx_size, window, &stated));
     argv.extend(pass_through);
-    recheck_rendered(&argv)?;
+    recheck_rendered(&argv, input.api)?;
     let mut env = BTreeMap::from([
         ("XDG_CONFIG_HOME".to_owned(), input.config_dir.clone()),
         ("LLAMA_CACHE".to_owned(), input.cache_dir.clone()),
@@ -288,14 +368,25 @@ const RENDERED_ONCE: &[&str] = &[
 const RENDERED_AT_MOST_ONCE: &str = "--mmproj";
 /// ADR 0035 §4: rendered together on a launch on several GPUs, never alone.
 const RENDERED_SPLIT: &[&str] = &["--split-mode", "--tensor-split", "--main-gpu"];
+/// ADR 0036 §2: the deployment's own option on an embeddings deployment.
+const POOLING: &str = "--pooling";
 
 /// ADR 0029 §6, SPEC §8.2: the rendered-argument recheck. There is no
 /// in-process parser to ask, so the final vector (`argv[0]` the binary) is
 /// read as llama-server reads it: every option CapyCTL renders appears
 /// exactly once (`--mmproj` at most once; the split options all once or not
 /// at all, `--split-mode` only `layer`), no other reserved option and no
-/// `--name=value` spelling appears at all.
-pub fn recheck_rendered(argv: &[String]) -> Result<(), LlamacppArgsError> {
+/// `--name=value` spelling appears at all. ADR 0036 §2: for `api`
+/// `embeddings`, `--embeddings` appears exactly once (in either spelling)
+/// and `--pooling` at most once, never `none`; for any other API neither
+/// appears.
+pub fn recheck_rendered(argv: &[String], api: DeploymentApi) -> Result<(), LlamacppArgsError> {
+    let embeddings = api == DeploymentApi::Embeddings;
+    let embedding_row = RESERVED_NEVER_RENDERED
+        .iter()
+        .find(|row| row.contains(&EMBEDDINGS_OPTION))
+        .copied()
+        .unwrap_or_default();
     let args = argv.get(1..).unwrap_or_default();
     if let Some(token) = args
         .iter()
@@ -308,6 +399,17 @@ pub fn recheck_rendered(argv: &[String]) -> Result<(), LlamacppArgsError> {
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     for option in &options {
         if !is_reserved(&option.name) {
+            continue;
+        }
+        if embeddings && embedding_row.contains(&option.name.as_str()) {
+            *counts.entry(EMBEDDINGS_OPTION).or_default() += 1;
+            continue;
+        }
+        if embeddings && is_pooling(&option.name) {
+            if option.value.as_deref() == Some("none") {
+                return Err(LlamacppArgsError::RenderedReserved(option.name.clone()));
+            }
+            *counts.entry(POOLING).or_default() += 1;
             continue;
         }
         let rendered = RESERVED_RENDERED
@@ -330,6 +432,14 @@ pub fn recheck_rendered(argv: &[String]) -> Result<(), LlamacppArgsError> {
     let count = |head: &str| counts.get(head).copied().unwrap_or(0);
     if let Some(head) = RENDERED_ONCE.iter().find(|head| count(head) != 1) {
         return Err(LlamacppArgsError::RenderedReserved((*head).to_owned()));
+    }
+    if embeddings && count(EMBEDDINGS_OPTION) != 1 {
+        return Err(LlamacppArgsError::RenderedReserved(
+            EMBEDDINGS_OPTION.to_owned(),
+        ));
+    }
+    if count(POOLING) > 1 {
+        return Err(LlamacppArgsError::RenderedReserved(POOLING.to_owned()));
     }
     if count(RENDERED_AT_MOST_ONCE) > 1 {
         return Err(LlamacppArgsError::RenderedReserved(

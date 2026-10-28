@@ -62,6 +62,8 @@ pub(super) fn required_refusal(reason: LmcacheOffReason) -> &'static str {
         R::ServerStartFailed => "lmcache_unavailable:server_start_failed",
         R::ListenerExposed => "lmcache_unavailable:listener_exposed",
         R::EngineStartFailed => "lmcache_unavailable:engine_start_failed",
+        // ADR 0036 §2.
+        R::EmbeddingsUnsupported => "lmcache_unavailable:embeddings_unsupported",
     }
 }
 
