@@ -354,6 +354,7 @@ fn context<'a>(
     ExtraArgsContext {
         engine: Engine::Vllm,
         api: capyctl_config::effective::DeploymentApi::Chat,
+        line: Default::default(),
         sleep_mode: false,
         approved_options: approved,
         approved_paths: paths,
@@ -426,7 +427,7 @@ fn an_lmcache_connector_is_refused_in_every_spelling() {
         }
         assert!(
             matches!(
-                validate_profile_args(Engine::Vllm, &list, false),
+                validate_profile_args(Engine::Vllm, Default::default(), &list, false),
                 Err(ProfileArgError::Lmcache(_))
             ),
             "{list:?}"
@@ -476,7 +477,7 @@ fn an_unreadable_connector_value_is_refused() {
             Err(ProfileArgError::Sensitive(_))
         ));
         assert!(matches!(
-            validate_profile_args(Engine::Vllm, &list, false),
+            validate_profile_args(Engine::Vllm, Default::default(), &list, false),
             Err(ProfileArgError::LmcacheUnreadable(_))
         ));
     }
@@ -654,6 +655,8 @@ fn the_lmcache_registration_round_trips_through_engines_yaml() {
         approved_env: vec![],
         trust_remote_code: false,
         lmcache: Some(LmcacheRegistration::new("0.5.6", DIGEST)),
+        line: Default::default(),
+        native: None,
     };
     let profile = profile_document(&spec);
     assert_eq!(

@@ -18,6 +18,7 @@ fn check(engine: Engine, option: &str, value: &str) -> Result<(), ProfileArgErro
     let context = ExtraArgsContext {
         engine,
         api: capyctl_config::effective::DeploymentApi::Chat,
+        line: Default::default(),
         sleep_mode: false,
         approved_options: &none,
         approved_paths: &paths,

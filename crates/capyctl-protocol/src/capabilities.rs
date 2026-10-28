@@ -173,6 +173,14 @@ pub const LOCAL_TENSOR_PARALLEL: &str = "local_tensor_parallel";
 /// server simply sends it neither (ADR 0017), and the trace ends at the
 /// server's span.
 pub const TRACE_CONTEXT: &str = "trace_context";
+/// ADR 0039 §15: the host runs TensorFold's native line (a release root's
+/// `tensorfold-native`: its render and environment, its readiness and idle
+/// reads, the loopback check). The server places a revision whose effective
+/// profile is `line: native` only on a host that declared it; any other is
+/// refused `host_capability_missing:tensorfold_native` before anything is
+/// sent, so an older host never renders a native installation with the 0.6
+/// command.
+pub const TENSORFOLD_NATIVE: &str = capyctl_config::tensorfold_native::HOST_CAPABILITY;
 
 /// ADR 0018: bounds on the new messages' strings and lists.
 pub const MAX_REQUEST_ID: usize = 64;
@@ -227,6 +235,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (REQUEST_ABORT, Direction::ServerToHost),
     (LOCAL_TENSOR_PARALLEL, Direction::ServerToHost),
     (TRACE_CONTEXT, Direction::ServerToHost),
+    (TENSORFOLD_NATIVE, Direction::ServerToHost),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.
@@ -511,6 +520,16 @@ pub fn local_tensor_parallel_refusal(
 ) -> Option<String> {
     (devices > 1 && !host_capabilities.contains(LOCAL_TENSOR_PARALLEL))
         .then(|| missing(LOCAL_TENSOR_PARALLEL))
+}
+
+/// ADR 0039 §15: the typed refusal for placing a revision of TensorFold's
+/// native line on a host that did not declare `tensorfold_native`, or `None`
+/// when it may be placed. Any other revision needs nothing new.
+pub fn tensorfold_native_refusal(
+    host_capabilities: &BTreeSet<String>,
+    native: bool,
+) -> Option<String> {
+    (native && !host_capabilities.contains(TENSORFOLD_NATIVE)).then(|| missing(TENSORFOLD_NATIVE))
 }
 
 /// ADR 0017: why `command` may not be sent to a host with this policy state

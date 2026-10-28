@@ -146,6 +146,89 @@ fn an_installation_cuda_home_is_published_only_when_named() {
         .is_none());
 }
 
+/// ADR 0039 §1, §2: TensorFold's native line is published as `line: native`
+/// (and a registered profile keeps its `native` record), like `cuda_home`,
+/// only for a `tensorfold-native` installation; the 0.6 profile beside it
+/// publishes neither, and every one passes the profile rules.
+// T41
+#[test]
+fn a_native_tensorfold_profile_publishes_its_line_beside_the_06_one() {
+    use capyctl_config::tensorfold_native::{NativeRegistration, TensorfoldLine};
+    let spec = |executable: &str, version: &str, line: TensorfoldLine| {
+        capyctl_config::registration::ProfileSpec {
+            engine: Engine::Tensorfold,
+            executable: executable.into(),
+            build_fingerprint: version.into(),
+            deep_park: false,
+            installation_drift: Default::default(),
+            args: vec![],
+            cuda_home: None,
+            approved_options: vec![],
+            approved_paths: vec![],
+            env: Default::default(),
+            approved_env: vec![],
+            trust_remote_code: false,
+            lmcache: None,
+            line,
+            native: line.is_native().then(|| NativeRegistration {
+                families: [("nemotron_h".to_owned(), vec!["mlx-q4g64".to_owned()])].into(),
+                checksums_verified: false,
+            }),
+        }
+    };
+    let registered = |executable: &str, version: &str, line: TensorfoldLine| {
+        let mut installation = installed(Engine::Tensorfold, executable);
+        installation.build_fingerprint = version.into();
+        installation.registered = Some(capyctl_config::registration::profile_document(&spec(
+            executable, version, line,
+        )));
+        installation
+    };
+    let python = registered("/opt/tf/bin/tensorfold", "0.6.6", TensorfoldLine::Python);
+    let native = registered(
+        "/opt/tensorfold-1.1.5/bin/tensorfold-native",
+        "1.1.5",
+        TensorfoldLine::Native,
+    );
+    let mut local = installed(
+        Engine::Tensorfold,
+        "/home/u/tensorfold-1.0.0/bin/tensorfold-native",
+    );
+    local.build_fingerprint = "1.0.0".into();
+    let host = host_policy(
+        &[
+            ("tensorfold", python),
+            ("tensorfold-1-1-5", native),
+            ("local-tensorfold", local),
+        ]
+        .map(|(profile, installation)| {
+            capyctl_controller::engine_provider::NamedInstallation {
+                profile: profile.into(),
+                installation,
+            }
+        }),
+        "env-1",
+        CAPACITY,
+        None,
+        &HostShape::NoGpu,
+        PORTS,
+    );
+    let profiles = &host["runtime_profiles"];
+    assert!(profiles["tensorfold"].get("line").is_none());
+    assert!(profiles["tensorfold"].get("native").is_none());
+    assert_eq!(profiles["tensorfold-1-1-5"]["line"], "native");
+    assert_eq!(
+        profiles["tensorfold-1-1-5"]["native"]["checksums_verified"],
+        false
+    );
+    assert_eq!(profiles["local-tensorfold"]["line"], "native");
+    assert!(profiles["local-tensorfold"].get("native").is_none());
+    for name in ["tensorfold", "tensorfold-1-1-5", "local-tensorfold"] {
+        capyctl_config::registration::check_profile(name, &profiles[name])
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+    }
+}
+
 /// Deep-park paths are the host's decision, not the adapter's (SPEC §9.1, T21), so
 /// the profile must carry the host's switch, including an opt-out, rather than
 /// leaving it to be re-derived.
@@ -705,6 +788,76 @@ fn an_environment_tensorfold_is_checked_and_never_parks() {
         "CAPYCTL_TENSORFOLD_BIN",
         "CAPYCTL_MODELS_ROOT",
         "CAPYCTL_RUNTIME_DIR",
+    ] {
+        std::env::remove_var(name);
+    }
+}
+
+/// ADR 0039 §2: `--tensorfold-bin` naming a native release's
+/// `tensorfold-native` is the native line: no toolchain check (none exists
+/// here), its version read by the standard-output check, no CUDA toolkit
+/// published, deep park off, and the published profile says `line: native`.
+// T41
+#[test]
+fn a_native_tensorfold_bin_needs_no_toolchain_and_publishes_line_native() {
+    use crate::roles::EngineProvider as _;
+    let Some(_guard) =
+        isolated("a_native_tensorfold_bin_needs_no_toolchain_and_publishes_line_native")
+    else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("a temporary installation");
+    std::env::set_var("CAPYCTL_MODELS_ROOT", dir.path());
+    std::env::set_var("CAPYCTL_RUNTIME_DIR", private_runtime(dir.path()));
+    std::env::set_var("CAPYCTL_CUDA_HOME", "/usr/local/cuda");
+    std::env::remove_var("CAPYCTL_DEEP_PARK");
+    let root = dir.path().join("tensorfold-1.0.0");
+    let bin = root.join("bin/tensorfold-native");
+    std::fs::create_dir_all(bin.parent().unwrap()).expect("a bin directory");
+    capyctl_config::test_support::write_executable(
+        &bin,
+        "#!/bin/sh\necho 'tensorfold-native 1.0.0'\n",
+        0o700,
+    )
+    .expect("the engine script");
+    std::fs::write(root.join("VERSION"), "1.0.0\n").expect("VERSION");
+    let named = crate::roles::EnvEngineProvider::new()
+        .with_flags(capyctl_config::engine_settings::EngineOverrides {
+            tensorfold: Some(bin.clone()),
+            ..Default::default()
+        })
+        .with_toolchain_search(capyctl_config::toolchain::ToolchainSearch {
+            system: String::new(),
+            default_cuda_home: dir.path().join("no-cuda"),
+            ..Default::default()
+        })
+        .installations(&Default::default())
+        .expect("a native release needs no toolchain");
+    assert_eq!(named.len(), 1);
+    let installation = &named[0].installation;
+    assert_eq!(installation.engine, Engine::Tensorfold);
+    assert_eq!(installation.build_fingerprint, "1.0.0");
+    assert!(!installation.deep_park);
+    assert_eq!(installation.cuda_home, None);
+    let host = host_policy(&named, "env-1", CAPACITY, None, &HostShape::NoGpu, PORTS);
+    let profile = &host["runtime_profiles"]["local"];
+    assert_eq!(profile["line"], "native");
+    assert!(profile.get("cuda_home").is_none(), "{profile}");
+    // A VERSION that disagrees with the binary refuses the start.
+    std::fs::write(root.join("VERSION"), "1.0.1\n").expect("VERSION");
+    let message = crate::roles::EnvEngineProvider::new()
+        .with_flags(capyctl_config::engine_settings::EngineOverrides {
+            tensorfold: Some(bin),
+            ..Default::default()
+        })
+        .installation()
+        .expect_err("a disagreeing VERSION refuses the start")
+        .to_string();
+    assert!(message.contains("engine_version_failed"), "{message}");
+    for name in [
+        "CAPYCTL_MODELS_ROOT",
+        "CAPYCTL_RUNTIME_DIR",
+        "CAPYCTL_CUDA_HOME",
     ] {
         std::env::remove_var(name);
     }
@@ -1311,6 +1464,8 @@ fn registered(executable: &std::path::Path) -> serde_json::Map<String, serde_jso
             approved_env: vec![],
             trust_remote_code: false,
             lmcache: None,
+            line: Default::default(),
+            native: None,
         },
     );
     [("vllm-patched".to_string(), profile)]
@@ -2098,6 +2253,8 @@ fn drafter_profile(options: &[&str], paths: &[&str]) -> serde_json::Value {
         approved_env: vec![],
         trust_remote_code: false,
         lmcache: None,
+        line: Default::default(),
+        native: None,
     })
 }
 

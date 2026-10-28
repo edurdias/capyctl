@@ -58,15 +58,22 @@ where
 /// ADR 0035 §5: what the listener check's answer means for the launch: the
 /// `engine_listener_exposed` failure naming the process, or a reading that
 /// proves nothing (which fails the launch too: its listeners are unknown).
+/// ADR 0039 §14: a launch of TensorFold's native line fails
+/// `tensorfold_listener_exposed` naming the address instead.
 pub(super) fn listener_verdict(
     check: Result<(), capyctl_adapters::custom::ListenerCheck>,
+    tensorfold_native: bool,
 ) -> Result<(), String> {
     use capyctl_adapters::custom::ListenerCheck;
     match check {
         Ok(()) => Ok(()),
         Err(ListenerCheck::Exposed(listener)) => Err(format!(
             "{}; the launch is stopped",
-            capyctl_adapters::custom::engine_listener_exposed(&listener)
+            if tensorfold_native {
+                crate::local_readiness::tensorfold_listener_exposed(&listener)
+            } else {
+                capyctl_adapters::custom::engine_listener_exposed(&listener)
+            }
         )),
         Err(unread) => Err(unread.to_string()),
     }
@@ -74,8 +81,10 @@ pub(super) fn listener_verdict(
 
 /// ADR 0035 §§5, 6: an embedded launch on several GPUs, after the engine's
 /// readiness: its ranks named and recorded in the receipt, its listeners
-/// checked. A launch on one GPU, or one without process tools (a remote
-/// launch, whose host does this), is returned as it is.
+/// checked. ADR 0039 §14: an embedded launch of TensorFold's native line has
+/// its listeners checked on any number of GPUs. Any other launch on one GPU,
+/// or one without process tools (a remote launch, whose host does this), is
+/// returned as it is.
 pub(super) async fn at_readiness(
     shared: &Arc<Shared>,
     work: &InitializeWork,
@@ -88,7 +97,10 @@ pub(super) async fn at_readiness(
     };
     let effective = work.effective();
     let devices = crate::remote_execution::local_devices(&effective.host.name, effective);
-    if devices.len() < 2 {
+    let tensorfold_native = effective.profile.engine
+        == capyctl_config::engine_policy::Engine::Tensorfold
+        && effective.profile.line.is_native();
+    if devices.len() < 2 && !tensorfold_native {
         return Ok(observation);
     }
     // ADR 0035 §6 and its evidence table: vLLM and SGLang run one process
@@ -96,7 +108,8 @@ pub(super) async fn at_readiness(
     // its layer split, so it has no rank processes to name (naming would
     // always fail it `tp_rank_unobserved`); its one process is already the
     // engine's `api`, judged by the exit watchers as today.
-    if capyctl_domain::local_tp::names_ranks(effective.profile.engine.name()) {
+    if devices.len() >= 2 && capyctl_domain::local_tp::names_ranks(effective.profile.engine.name())
+    {
         let now = (shared.clock)()?;
         let left = Duration::from_millis(u64::try_from(work.deadline_ms() - now).unwrap_or(0))
             .min(shared.options.initialize_timeout);
@@ -127,7 +140,7 @@ pub(super) async fn at_readiness(
     })
     .await
     .map_err(|_| CoordinatorError::Service("the listener check did not run".into()))?;
-    listener_verdict(check).map_err(CoordinatorError::Service)?;
+    listener_verdict(check, tensorfold_native).map_err(CoordinatorError::Service)?;
     observation.receipt = format!(
         "{}; every owned listener is on loopback",
         observation.receipt
@@ -250,19 +263,52 @@ mod tests {
     #[test]
     fn the_listener_verdict_names_the_exposed_process() {
         use capyctl_adapters::custom::{ListenerCheck, OwnedListener};
-        assert_eq!(listener_verdict(Ok(())), Ok(()));
-        let exposed = listener_verdict(Err(ListenerCheck::Exposed(OwnedListener {
-            address: "0.0.0.0:29500".parse().unwrap(),
-            role: "rank-1".into(),
-            pid: 13,
-        })))
+        assert_eq!(listener_verdict(Ok(()), false), Ok(()));
+        let exposed = listener_verdict(
+            Err(ListenerCheck::Exposed(OwnedListener {
+                address: "0.0.0.0:29500".parse().unwrap(),
+                role: "rank-1".into(),
+                pid: 13,
+            })),
+            false,
+        )
         .unwrap_err();
         assert_eq!(
             exposed,
             "engine_listener_exposed: the rank-1 process 13 listens on address 0.0.0.0 port \
              29500, not on loopback; the launch is stopped"
         );
-        let unread = listener_verdict(Err(ListenerCheck::Unreadable("no fd".into()))).unwrap_err();
+        let unread =
+            listener_verdict(Err(ListenerCheck::Unreadable("no fd".into())), false).unwrap_err();
         assert!(!unread.contains("engine_listener_exposed"));
+    }
+
+    // T41 T21 (ADR 0039 §14): an embedded launch of TensorFold's native line
+    // listening off loopback at its first readiness fails
+    // `tensorfold_listener_exposed` naming the address (the failed-launch
+    // settlement stops it with gone evidence), and the failure is recorded
+    // under that code.
+    #[test]
+    fn a_native_launch_listening_off_loopback_fails_tensorfold_listener_exposed() {
+        use capyctl_adapters::custom::{ListenerCheck, OwnedListener};
+        assert_eq!(listener_verdict(Ok(()), true), Ok(()));
+        let exposed = listener_verdict(
+            Err(ListenerCheck::Exposed(OwnedListener {
+                address: "0.0.0.0:8080".parse().unwrap(),
+                role: "api".into(),
+                pid: 13,
+            })),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            exposed,
+            "tensorfold_listener_exposed: an owned process listens on 0.0.0.0:8080, \
+             not on loopback; the launch is stopped"
+        );
+        assert_eq!(
+            super::super::native_failure::readiness_failure(&exposed).as_deref(),
+            Some("tensorfold_listener_exposed")
+        );
     }
 }

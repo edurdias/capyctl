@@ -10,8 +10,10 @@
 //!
 //! A sample is a routing hint, never readiness or admission evidence and never
 //! journaled, except as W12 and SPEC §10 (amended 2026-10-01) quiescence
-//! evidence after a restart or a hang-up. A TensorFold sample folds in the
-//! engine's unkeyed `/health`, so it reads idle only when both agree. A
+//! evidence after a restart or a hang-up. A TensorFold 0.6 sample folds in the
+//! engine's unkeyed `/health`, so it reads idle only when both agree; a sample
+//! of TensorFold's native line reads its `/metrics` gauges alone (ADR 0039
+//! §11: its `/health` carries no `busy`). A
 //! llama.cpp sample takes its KV usage from one bounded `/slots` read (ADR 0029
 //! §11), since llama.cpp exports no ratio. Metric names are pinned to the recorded engine
 //! sources; a missing, malformed or ambiguous gauge makes the sample
@@ -479,9 +481,11 @@ pub fn parse_engine_histograms(text: &str) -> Option<(&'static str, Vec<(String,
     Some((engine, histograms))
 }
 
-/// T41, ADR 0023 §6 (2026-10-01): TensorFold's gauges read idle only when
+/// T41, ADR 0023 §6 (2026-10-01): TensorFold 0.6's gauges read idle only when
 /// its `/health` agrees. Anything but an idle health (busy, disagreeing
 /// counters, unreadable) keeps at least one request running in the sample.
+/// ADR 0039 §11: the Python line only; a native-line sample is never folded
+/// ([`parse_tensorfold_native_load`]).
 pub fn fold_tensorfold_health(load: EngineLoad, health: Option<&HealthReport>) -> EngineLoad {
     if health.and_then(HealthReport::idle) == Some(true) {
         load
@@ -490,6 +494,19 @@ pub fn fold_tensorfold_health(load: EngineLoad, health: Option<&HealthReport>) -
             running: load.running.max(1),
             ..load
         }
+    }
+}
+
+/// T41 T37, ADR 0039 §11: a sample of TensorFold's native line, from its
+/// `/metrics` body alone: the same `tensorfold:` families as 0.6
+/// (`requests_running`, `requests_waiting`, `kv_cache_usage_ratio` per
+/// pool), never folded with `/health`, whose 1.x body carries no `busy` (the
+/// fold would keep every sample busy). `None` unless the body is
+/// TensorFold's and its three gauges are whole.
+pub fn parse_tensorfold_native_load(text: &str) -> Option<EngineLoad> {
+    match family_of(text)? {
+        ("tensorfold", gauges, _) => gauges.with_kv(None),
+        _ => None,
     }
 }
 
@@ -765,6 +782,10 @@ impl LoadSource for HostLoad {
 pub enum LaunchSignal {
     /// A built-in engine: its family is read from `/metrics`.
     Builtin,
+    /// ADR 0039 §11: TensorFold's native line, a built-in engine whose
+    /// `tensorfold:` family is read from `/metrics` alone, never folded with
+    /// `/health`.
+    TensorfoldNative,
     /// A custom engine, with its manifest's idle signal when it has one.
     Custom(Option<capyctl_config::custom::IdleSignal>),
     /// ADR 0031 §6, AGENTS.md (uncertainty must retain accounting): the
@@ -1021,7 +1042,7 @@ impl LoadReporter {
         let scraped =
             futures::future::join_all(targets.iter().zip(&signals).map(|(t, s)| async move {
                 match s {
-                    LaunchSignal::Builtin => self.scrape(t).await,
+                    LaunchSignal::Builtin | LaunchSignal::TensorfoldNative => self.scrape(t).await,
                     LaunchSignal::Custom(_) | LaunchSignal::Unknown => None,
                 }
             }))
@@ -1038,18 +1059,24 @@ impl LoadReporter {
             .iter()
             .map(|body| body.as_deref().and_then(family_of).map(|(name, ..)| name))
             .collect();
-        // Only a TensorFold scrape is folded with its health, and only a
-        // llama.cpp scrape reads `/slots` for its KV usage.
-        let side_reads = futures::future::join_all(targets.iter().zip(&families).map(
-            |(target, family)| async move {
-                match family {
-                    Some("tensorfold") => SideRead::Health(self.health(target).await),
-                    Some("llamacpp") => SideRead::KvUsage(self.llamacpp_kv_usage(target).await),
-                    _ => SideRead::None,
-                }
-            },
-        ))
-        .await;
+        // Only a TensorFold 0.6 scrape is folded with its health (ADR 0039
+        // §11: a native-line one never is), and only a llama.cpp scrape
+        // reads `/slots` for its KV usage.
+        let side_reads =
+            futures::future::join_all(targets.iter().zip(&families).zip(&signals).map(
+                |((target, family), signal)| async move {
+                    match (family, signal) {
+                        (Some("tensorfold"), LaunchSignal::Builtin) => {
+                            SideRead::Health(self.health(target).await)
+                        }
+                        (Some("llamacpp"), _) => {
+                            SideRead::KvUsage(self.llamacpp_kv_usage(target).await)
+                        }
+                        _ => SideRead::None,
+                    }
+                },
+            ))
+            .await;
         let limits = self.max_running(&targets, &families).await;
         let mut baselines = self.baselines.lock().unwrap_or_else(|p| p.into_inner());
         // SPEC §17: baselines of scopes no longer Ready are dropped.
@@ -1081,6 +1108,10 @@ impl LoadReporter {
                         // ADR 0031 §6, AGENTS.md: unknown idleness carries no
                         // engine figures, so it never reads quiescent.
                         LaunchSignal::Unknown => None,
+                        // ADR 0039 §11: the gauges alone, never `/health`.
+                        LaunchSignal::TensorfoldNative => {
+                            body.as_deref().and_then(parse_tensorfold_native_load)
+                        }
                         LaunchSignal::Builtin => body.as_deref().and_then(|body| match side_read {
                             SideRead::Health(health) => parse_engine_load(body)
                                 .map(|load| fold_tensorfold_health(load, health.as_ref())),

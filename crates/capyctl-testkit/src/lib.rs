@@ -27,6 +27,7 @@ mod lifecycle;
 pub mod ports;
 mod provider;
 mod scripted_tool;
+pub mod tensorfold_native;
 
 pub use fake_engine::{
     EmbeddingFault, FakeEmbeddings, FakeEngine, BUFFER_RESIDUE, FULL_RESIDENT_BYTES,
@@ -41,6 +42,7 @@ pub use provider::{
     fake_tools_factory, live_identity, spawn_fake_coordinator, NO_NETWORK_ORIGIN,
 };
 pub use scripted_tool::ScriptedTool;
+pub use tensorfold_native::{FakeTensorfoldNative, NativeHealthMode, NativeRelease};
 
 use capyctl_domain::launch::{
     CommonEngineSettings, LaunchSettings, MemoryRequest, SettingSource, SglangLaunchSettings,

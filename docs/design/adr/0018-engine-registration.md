@@ -28,6 +28,11 @@ where their engine environment lives.
 
 ### 1. Commands
 
+*Amended by [ADR 0039](0039-tensorfold-1.md) §2:* a third installation form joins the
+Python environment and the bare llama.cpp binary: a TensorFold native release root holding
+`bin/tensorfold-native`, its `VERSION` and `SHA256SUMS`, registered with `engine add` by
+its version line and capabilities document.
+
 `mllm engine detect [--path DIR]...`, `mllm engine add [PATH] [--name NAME] [--deep-park
 enabled|disabled] [--drift warn|refuse] [--arg ARG]...`, `mllm engine list`, `mllm engine
 remove NAME [--drain]`, and on the server `mllm list engines --config server.yaml`. They

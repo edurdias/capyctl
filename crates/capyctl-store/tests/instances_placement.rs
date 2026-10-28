@@ -2647,3 +2647,120 @@ fn zero_retention_is_placed_only_on_a_host_that_declared_retention() {
     }
     assert!(t.planned(&id).is_empty());
 }
+
+/// The golden deployment on a TensorFold native profile (ADR 0039) at an
+/// uncertified 1.0.3, with `args` as its host-fixed arguments.
+fn native_golden(args: Value) -> (Value, Value) {
+    let (mut deployment, mut host) = golden();
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["engine"] = json!("tensorfold");
+    profile["line"] = json!("native");
+    profile["executable"] = json!("/opt/tensorfold-1.0.3/bin/tensorfold-native");
+    profile["build_fingerprint"] = json!("1.0.3");
+    profile["args"] = args;
+    profile["security"]["deep_park"] = json!("disabled");
+    deployment["residency"] = json!("restart_only");
+    deployment["engine_config"] = json!({"context_length": 8192});
+    (deployment, host)
+}
+
+/// ADR 0039 §15: a native TensorFold revision is placed only on a host that
+/// declared `tensorfold_native`; with no such host the start is refused
+/// `host_capability_missing:tensorfold_native` and nothing is started.
+// T41 T34
+#[test]
+fn a_native_tensorfold_revision_is_placed_only_where_declared() {
+    let t = two_hosts_with(native_golden(json!([])), "32GiB", "shared");
+    t.declared("host-a", &["engine_groups"]);
+    t.declared("host-b", &["engine_groups", "tensorfold_native"]);
+    let id = t.deploy("deploy", json!({})).deployment_id;
+    t.start(&id, "start", StartScope::All, None);
+    assert_eq!(
+        t.planned(&id)
+            .iter()
+            .map(|(_, k, h)| (*k, h.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(0, "host-b")],
+    );
+
+    let t = two_hosts_with(native_golden(json!([])), "32GiB", "shared");
+    t.declared("host-a", &["engine_groups"]);
+    t.declared("host-b", &["engine_groups"]);
+    let id = t.deploy("deploy", json!({})).deployment_id;
+    match t.start_refused(&id) {
+        capyctl_store::lifecycle::LifecycleError::PlacementRefused(reason) => {
+            assert!(
+                reason.starts_with("host_capability_missing:tensorfold_native: "),
+                "{reason}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(t.planned(&id).is_empty());
+}
+
+/// ADR 0039 §4 (owner decision 2026-10-27, question 4), ADR 0033 §10: a
+/// host that publishes `retention: zero` refuses a native revision whose
+/// host-fixed or extra arguments compact (`retention_zero:compaction`) or
+/// write request state to disk (`retention_zero:engine_disk`), naming the
+/// option; a host with standard retention runs it.
+// T41 T21 T34
+#[test]
+fn a_zero_retention_host_refuses_native_compaction_and_disk_options() {
+    let all = ["engine_groups", "retention", "tensorfold_native"];
+    for (args, extra, code, option) in [
+        (
+            json!(["--compact-at", "auto"]),
+            json!({}),
+            "retention_zero:compaction",
+            "--compact-at",
+        ),
+        (
+            json!([]),
+            json!({"context_length": 8192, "accept_extra_args": true,
+                "extra_args": ["--learn-dir", "/srv/learn"]}),
+            "retention_zero:engine_disk",
+            "--learn-dir",
+        ),
+    ] {
+        let patch = if extra.as_object().unwrap().is_empty() {
+            json!({})
+        } else {
+            json!({ "engine_config": extra })
+        };
+        let t = two_hosts_with(native_golden(args.clone()), "32GiB", "shared");
+        t.declared("host-a", &all);
+        t.declared("host-b", &all);
+        let id = t.deploy("deploy", patch.clone()).deployment_id;
+        t.publish_settings("host-a", json!({"retention": "zero"}));
+        t.start(&id, "start", StartScope::All, None);
+        assert_eq!(
+            t.planned(&id)
+                .iter()
+                .map(|(_, k, h)| (*k, h.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "host-b")],
+            "{code}"
+        );
+
+        let t = two_hosts_with(native_golden(args), "32GiB", "shared");
+        t.declared("host-a", &all);
+        t.declared("host-b", &all);
+        let id = t.deploy("deploy", patch).deployment_id;
+        t.publish_settings("host-a", json!({"retention": "zero"}));
+        t.publish_settings("host-b", json!({"retention": "zero"}));
+        match t.start_refused(&id) {
+            capyctl_store::lifecycle::LifecycleError::PlacementRefused(reason) => {
+                assert!(reason.starts_with(&format!("{code}: ")), "{reason}");
+                assert!(
+                    reason.contains(&format!(
+                        "host host-a: {code}: the host has `retention: zero`; `{option}`"
+                    )),
+                    "{reason}"
+                );
+            }
+            other => panic!("{code}: {other:?}"),
+        }
+        assert!(t.planned(&id).is_empty());
+    }
+}

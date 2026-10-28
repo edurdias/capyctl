@@ -798,6 +798,11 @@ fn status(value: &Value, names: &HostNames) -> String {
     if let Some(line) = streams(&d["context"]["streams"]) {
         out.push_str(&line);
     }
+    // ADR 0039 §3, §7: an uncertified TensorFold native version or
+    // checkpoint runs with these notes; nothing is refused for them.
+    for note in d["notes"].as_array().into_iter().flatten() {
+        out.push_str(&format!("note: {}\n", text(note)));
+    }
     out
 }
 
@@ -1095,6 +1100,27 @@ fn lmcache_cell(view: &Value) -> String {
     }
 }
 
+/// ADR 0039 §1: a row's engine, with its TensorFold line when it states one
+/// (`tensorfold (native)`, `tensorfold (python)`).
+fn engine_cell(row: &Value) -> String {
+    match row["line"].as_str() {
+        Some(line) => format!("{} ({})", text(&row["engine"]), clean(line)),
+        None => text(&row["engine"]),
+    }
+}
+
+/// ADR 0039 §2, §3: each row's notes under the table, `note: <name>: <note>`
+/// (the uncertified native version, the absent checksum list).
+fn row_notes(rows: &Value, name: &str, notes: &str) -> String {
+    let mut out = String::new();
+    for row in rows.as_array().into_iter().flatten() {
+        for note in row[notes].as_array().into_iter().flatten() {
+            out.push_str(&format!("note: {}: {}\n", text(&row[name]), text(note)));
+        }
+    }
+    out
+}
+
 fn local_engines(value: &Value) -> String {
     let rows: Vec<Vec<String>> = value["engines"]
         .as_array()
@@ -1104,7 +1130,7 @@ fn local_engines(value: &Value) -> String {
             vec![
                 text(&e["profile"]),
                 text(&e["source"]),
-                text(&e["engine"]),
+                engine_cell(e),
                 text(&e["version"]),
                 text(&e["custom"]),
                 text(&e["deep_park"]),
@@ -1117,7 +1143,7 @@ fn local_engines(value: &Value) -> String {
             ]
         })
         .collect();
-    table(
+    let mut out = table(
         &[
             "PROFILE",
             "SOURCE",
@@ -1132,7 +1158,9 @@ fn local_engines(value: &Value) -> String {
             "DEPLOYMENTS",
         ],
         &rows,
-    )
+    );
+    out.push_str(&row_notes(&value["engines"], "profile", "notes"));
+    out
 }
 
 fn detected(value: &Value) -> String {
@@ -1142,7 +1170,7 @@ fn detected(value: &Value) -> String {
         .flatten()
         .map(|c| {
             vec![
-                text(&c["engine"]),
+                engine_cell(c),
                 text(&c["version"]),
                 text(&c["custom"]),
                 text(&c["env"]),
@@ -1150,10 +1178,21 @@ fn detected(value: &Value) -> String {
             ]
         })
         .collect();
-    table(
+    let mut out = table(
         &["ENGINE", "VERSION", "CUSTOM", "ENVIRONMENT", "SOURCE"],
         &rows,
-    )
+    );
+    // ADR 0039 §3: a detected native version that is not certified.
+    for candidate in value["candidates"].as_array().into_iter().flatten() {
+        if let Some(note) = candidate["note"].as_str() {
+            out.push_str(&format!(
+                "note: {}: {}\n",
+                text(&candidate["env"]),
+                clean(note)
+            ));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1770,6 +1809,29 @@ mod tests {
         d["context"].as_object_mut().unwrap().remove("streams");
         let out = render(View::Status, &d, &HostNames::new());
         assert!(!out.contains("Streams"), "{out}");
+    }
+
+    // T41 (ADR 0039 §3, §7): status shows a native TensorFold deployment's
+    // uncertified notes, one line each, and nothing without them.
+    #[test]
+    fn status_shows_the_native_tensorfold_notes() {
+        let mut d = json!({"name": "m", "observed_state": "ready", "instances": [],
+        "notes": [
+            "not certified: TensorFold native 1.0.3 is a custom setup; CapyCTL certifies TensorFold native 1.0.0 and 1.1.5",
+            capyctl_config::tensorfold_native::CHECKPOINT_NOTE,
+        ]});
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(
+            out.ends_with(&format!(
+                "note: not certified: TensorFold native 1.0.3 is a custom setup; CapyCTL \
+                 certifies TensorFold native 1.0.0 and 1.1.5\nnote: {}\n",
+                capyctl_config::tensorfold_native::CHECKPOINT_NOTE
+            )),
+            "{out}"
+        );
+        d.as_object_mut().unwrap().remove("notes");
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(!out.contains("note:"), "{out}");
     }
 
     // T02: status on a role with no engine names the command that adds one.

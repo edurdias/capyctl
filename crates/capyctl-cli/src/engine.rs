@@ -20,6 +20,7 @@ use capyctl_config::registration::{
     profile_document, valid_profile_name, write_engines, CustomProfileSpec, EnginesFile,
     ProfileSpec, ENGINES_FILE, ENVIRONMENT_PROFILES,
 };
+use capyctl_config::tensorfold_native::{NativeRegistration, TensorfoldLine};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -199,8 +200,15 @@ fn detected(paths: &[PathBuf]) -> Value {
     let rows: Vec<Value> = candidates(paths)
         .into_iter()
         .map(|c| {
+            // ADR 0039 §1, §3: a TensorFold candidate's line, and the note an
+            // uncertified native version runs with (never a refusal).
+            let line = (c.engine == Engine::Tensorfold).then(|| c.line.name());
+            let note =
+                (c.engine == Engine::Tensorfold && c.line.is_native() && c.version != "unknown")
+                    .then(|| capyctl_config::tensorfold_native::version_note(&c.version))
+                    .flatten();
             json!({"engine": c.engine.name(), "version": c.version, "custom": c.custom,
-            "env": c.env, "entry": c.entry, "source": c.source})
+            "env": c.env, "entry": c.entry, "source": c.source, "line": line, "note": note})
         })
         .collect();
     json!({"candidates": rows})
@@ -226,10 +234,11 @@ fn pick() -> Result<PathBuf, StructuredError> {
     for (i, c) in found.iter().enumerate() {
         let _ = writeln!(
             stderr,
-            "{:>3}  {} {}{}  {}",
+            "{:>3}  {} {}{}{}  {}",
             i + 1,
             c.engine.name(),
             c.version,
+            if c.line.is_native() { " (native)" } else { "" },
             if c.custom { " (custom)" } else { "" },
             c.env.display()
         );
@@ -256,9 +265,14 @@ struct Registration {
     deep_park_missing: Option<bool>,
     /// ADR 0033 §1: the LMCache of a vLLM or SGLang environment.
     lmcache: Option<capyctl_agent::lmcache_install::LmcacheMeasurement>,
+    /// ADR 0039 §2, §7: a native TensorFold release's capabilities families
+    /// and whether its `SHA256SUMS` was checked.
+    native: Option<NativeRegistration>,
 }
 
 /// ADR 0018 §1 step 3: executed only now, because the operator named it.
+/// ADR 0039 §2: a native TensorFold release then has its `SHA256SUMS` and
+/// its capabilities document checked; it has no Python probe.
 fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, StructuredError> {
     let reported = check_version(resolved, VERSION_CHECK_TIMEOUT).map_err(|e| {
         error(
@@ -270,6 +284,35 @@ fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, Struc
         )
     })?;
     let measurer = capyctl_agent::installation::InstallationMeasurer::new();
+    if resolved.engine == Engine::Tensorfold && resolved.line.is_native() {
+        let native = capyctl_agent::installation::check_native_release(
+            &resolved.executable,
+            &reported.version,
+            VERSION_CHECK_TIMEOUT,
+        )
+        .map_err(|e| {
+            error(
+                e.code(),
+                format!("{}: {e}; nothing was written", resolved.env.display()),
+            )
+        })?;
+        // ADR 0039 §2 step 4, ADR 0008: the whole release root.
+        let fingerprint = measurer
+            .measure_profile(
+                Engine::Tensorfold,
+                TensorfoldLine::Native,
+                &resolved.executable,
+                None,
+            )
+            .ok();
+        return Ok(Registration {
+            reported,
+            fingerprint,
+            deep_park_missing: None,
+            lmcache: None,
+            native: Some(native),
+        });
+    }
     let fingerprint = measurer.measure(resolved.engine, &resolved.executable).ok();
     // ADR 0033 §1: LMCache's version and digest, read from the environment's
     // files (nothing runs); recorded only when found and measurable, and
@@ -314,6 +357,7 @@ fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, Struc
         fingerprint,
         deep_park_missing: report.and_then(|r| r.available("deep_park")).map(|a| !a),
         lmcache,
+        native: None,
     })
 }
 
@@ -480,6 +524,9 @@ async fn add(
         None => pick()?,
     };
     let resolved = resolve(&path).map_err(|e| error(e.code(), e.to_string()))?;
+    // ADR 0039 §1: the line is the installation's form, fixed by resolution.
+    let native = resolved.engine == Engine::Tensorfold && resolved.line.is_native();
+    let named = name.is_some();
     let name = name.unwrap_or(resolved.engine.name()).to_owned();
     if !valid_profile_name(&name) {
         return Err(error(
@@ -492,13 +539,59 @@ async fn add(
     if ENVIRONMENT_PROFILES.contains(&name.as_str()) {
         return Err(error("profile_exists", format!("{name} is reserved for the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin / --llamacpp-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN / CAPYCTL_LLAMACPP_BIN or local_engine); use --name")));
     }
+    // ADR 0039 §2 (owner decision 2026-10-27, question 6): a native release
+    // is named `tensorfold` only when that name is free; otherwise `add`
+    // asks for `--name`, naming the checked version, and never renames or
+    // replaces the existing profile. Nothing is written.
+    if native && !named && registered_or_declared(target, &name)? {
+        let r = resolved.clone();
+        let version = tokio::task::spawn_blocking(move || check_version(&r, VERSION_CHECK_TIMEOUT))
+            .await
+            .map_err(|_| error("internal", "the version check failed"))?
+            .map_err(|e| {
+                error(
+                    e.code(),
+                    format!(
+                        "{}: {e}; nothing was written",
+                        resolved.executable.display()
+                    ),
+                )
+            })?
+            .version;
+        // A profile name holds no `.` (`valid_profile_name`), so the
+        // suggestion spells the version with `-`.
+        let suggested = format!("{name}-{}", version.replace('.', "-"));
+        return Err(error(
+            "profile_exists",
+            format!(
+                "profile {name} exists (typically the TensorFold 0.6 profile); name this native \
+                 release {version} with --name, for example --name {suggested}; nothing was \
+                 written"
+            ),
+        ));
+    }
     // Checked before anything runs, and again under the lock when writing.
     refuse_existing(target, &name)?;
+    // ADR 0039 §5: a native profile names neither what the native line
+    // renders nor what it never carries, refused with why before anything
+    // runs or is written.
+    if native {
+        if let Some(reason) = capyctl_config::engine_env::tensorfold_native_refused(
+            extras.approved_env.iter().chain(extras.env.keys()),
+        ) {
+            return Err(error(
+                "invalid_config",
+                format!("{reason}; nothing was written"),
+            ));
+        }
+    }
     // SPEC §13.3 amendment (owner decision 2026-09-25). ADR 0029 §2: nothing
-    // compiles at run time for llama.cpp, so no toolkit is recorded for it.
+    // compiles at run time for llama.cpp, so no toolkit is recorded for it;
+    // ADR 0039 §2: nor for TensorFold's native line.
     let cuda_home = match resolved.engine {
         // ADR 0031 §1: `--custom` registers through its own path.
         Engine::Llamacpp | Engine::Custom => None,
+        Engine::Tensorfold if native => None,
         Engine::Vllm | Engine::Sglang | Engine::Tensorfold => {
             capyctl_config::registration::detect_cuda_home_in(
                 toolchain.cuda_home_env.as_deref(),
@@ -528,23 +621,32 @@ async fn add(
         }
     }
     if resolved.engine == Engine::Tensorfold {
-        // ADR 0023 §2: TensorFold has no park path; refuse a request for one
-        // before anything runs or is written.
+        // ADR 0023 §2, ADR 0039 §12: TensorFold has no park path on either
+        // line; refuse a request for one before anything runs or is written.
         if deep_park == Some(DeepParkChoice::Enabled) {
             return Err(error(
                 "capability_missing",
-                "TensorFold has no sleep or release API; it runs restart_only, so \
-                 --deep-park enabled is refused and nothing was written",
+                if native {
+                    "TensorFold native has no park path; it runs restart_only, so \
+                     --deep-park enabled is refused and nothing was written"
+                } else {
+                    "TensorFold has no sleep or release API; it runs restart_only, so \
+                     --deep-park enabled is refused and nothing was written"
+                },
             ));
         }
-        let bin = resolved.executable.parent().unwrap_or(&resolved.env);
-        capyctl_config::toolchain::check(bin, cuda_home.as_deref(), &toolchain.search.system)
-            .map_err(|missing| {
+        // ADR 0039 §2: nothing compiles at run time on the native line, so
+        // its toolchain is never asked for.
+        if !native {
+            let bin = resolved.executable.parent().unwrap_or(&resolved.env);
+            capyctl_config::toolchain::check(bin, cuda_home.as_deref(), &toolchain.search.system)
+                .map_err(|missing| {
                 error(
                     "toolchain_missing",
                     format!("{}; nothing was written", missing.for_engine_add()),
                 )
             })?;
+        }
     }
     if resolved.engine == Engine::Llamacpp {
         // ADR 0029 §2: llama.cpp has no deep-park capability, and a
@@ -586,10 +688,12 @@ async fn add(
                 && registration.deep_park_missing != Some(true)
         }
     };
+    let line = resolved.line;
     let spec = ProfileSpec {
         engine: resolved.engine,
         executable: resolved.executable.clone(),
-        // ADR 0029 §2: llama.cpp's is `<version>+<commit>`.
+        // ADR 0029 §2: llama.cpp's is `<version>+<commit>`. ADR 0039 §2: a
+        // native release's is the checked version.
         build_fingerprint: registration.reported.build_fingerprint.clone(),
         deep_park: deep,
         installation_drift: match drift {
@@ -611,13 +715,21 @@ async fn add(
             .lmcache
             .as_ref()
             .map(capyctl_agent::lmcache_install::LmcacheMeasurement::registration),
+        line,
+        native: registration.native.clone(),
     };
     let revision = write_profile(target, &name, &spec)?;
-    let out = json!({
+    let view = native_view(
+        resolved.engine,
+        line,
+        &spec.build_fingerprint,
+        spec.native.as_ref(),
+    );
+    let mut out = json!({
         "profile": name, "engine": resolved.engine.name(),
         "version": registration.reported.version,
         "build_fingerprint": spec.build_fingerprint,
-        "custom": !capyctl_config::registration::is_verified(resolved.engine, &spec.build_fingerprint),
+        "custom": !capyctl_config::registration::is_verified_line(resolved.engine, line, &spec.build_fingerprint),
         "executable": resolved.executable,
         "fingerprint": registration.fingerprint.map(|f| json!({"version": f.version, "digest": f.digest})),
         "deep_park": if deep { "enabled" } else { "disabled" }, "deep_park_probe": probe,
@@ -627,8 +739,49 @@ async fn add(
         // ADR 0033 §1: what was recorded, or null when LMCache was not found.
         "lmcache": spec.lmcache,
     });
+    if let (Some(fields), Some(object)) = (view.as_object(), out.as_object_mut()) {
+        object.extend(fields.clone());
+    }
     publish(target, out, revision, &target.engines).await
 }
+
+/// ADR 0039 §1, §2, §3: what `engine add` and `engine list` say about a
+/// TensorFold profile beyond the common fields: its `line` and, on the
+/// native line, the uncertified-version note, whether the publisher's
+/// `SHA256SUMS` was checked, the capabilities document's families, and
+/// `notes` (the version note, and the absent checksum list). Empty for any
+/// other engine.
+fn native_view(
+    engine: Engine,
+    line: TensorfoldLine,
+    version: &str,
+    native: Option<&NativeRegistration>,
+) -> Value {
+    if engine != Engine::Tensorfold {
+        return json!({});
+    }
+    if line.is_python() {
+        return json!({"line": line.name()});
+    }
+    let note = capyctl_config::tensorfold_native::version_note(version);
+    let checksums_verified = native.map(|n| n.checksums_verified);
+    let mut notes: Vec<String> = note.iter().cloned().collect();
+    if checksums_verified == Some(false) {
+        notes.push(CHECKSUMS_ABSENT.to_owned());
+    }
+    json!({
+        "line": line.name(),
+        "note": note,
+        "checksums_verified": checksums_verified,
+        "families": native.map(|n| &n.families),
+        "notes": notes,
+    })
+}
+
+/// ADR 0039 §2: what `engine add` and `engine list` say of a native release
+/// registered without the publisher's checksum list.
+const CHECKSUMS_ABSENT: &str = "the publisher's checksum list (SHA256SUMS) was absent, so the \
+     release's files were not checked against it at registration";
 
 /// Found live 2026-10-03: a role cannot listen on a control socket whose
 /// path a Unix socket cannot hold, so nothing is saved for one it could
@@ -815,7 +968,12 @@ async fn add_custom(target: &Target, request: CustomAdd<'_>) -> Result<Value, St
             let layout =
                 capyctl_agent::installation::custom_installation(&executable, Some(&manifest));
             let measured = capyctl_agent::installation::InstallationMeasurer::new()
-                .measure_profile(Engine::Custom, &executable, Some(&manifest));
+                .measure_profile(
+                    Engine::Custom,
+                    TensorfoldLine::Python,
+                    &executable,
+                    Some(&manifest),
+                );
             (measured, layout)
         })
         .await
@@ -1016,11 +1174,19 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
             if known.contains(name) {
                 continue;
             }
-            let profile = json!({
+            let mut profile = json!({
                 "engine": entry["engine"], "executable": entry["executable"],
                 "build_fingerprint": entry["build_fingerprint"],
                 "security": {"deep_park": entry["deep_park"]},
             });
+            // ADR 0039 §2: the role's own installation takes its line from
+            // its file name.
+            if let Some(engine) = entry["engine"].as_str().and_then(Engine::from_name) {
+                let executable = Path::new(entry["executable"].as_str().unwrap_or_default());
+                if capyctl_config::registration::executable_line(engine, executable).is_native() {
+                    profile["line"] = json!(TensorfoldLine::Native.name());
+                }
+            }
             all.push((name.clone(), profile, "environment"));
         }
     }
@@ -1030,11 +1196,16 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
         .map(|(name, profile, source)| {
             let kind = profile["engine"].as_str().and_then(Engine::from_name);
             let engine = kind.unwrap_or(Engine::Vllm);
+            let line = capyctl_config::registration::profile_line(&profile);
             let accepted = role.as_ref().map(|r| r["accepted"].get(&name).cloned());
+            // ADR 0039 §2: a native release lists the version `engine add`
+            // checked (its `build_fingerprint`), as llama.cpp does; the
+            // host's measurement reads only the `VERSION` file.
             let reported = accepted
                 .clone()
                 .flatten()
-                .and_then(|a| a["installation"]["version"].as_str().map(str::to_owned));
+                .and_then(|a| a["installation"]["version"].as_str().map(str::to_owned))
+                .filter(|_| line.is_python());
             let version = capyctl_config::registration::listed_version(
                 kind,
                 reported.as_deref(),
@@ -1043,9 +1214,13 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
             // ADR 0031 §6, §7: a custom engine's idle signal (or `none`) and
             // whether its launches carry a per-launch engine key.
             let manifest = capyctl_agent::installation::custom_manifest(&profile);
-            json!({
+            let native = profile
+                .get("native")
+                .and_then(|n| serde_json::from_value::<NativeRegistration>(n.clone()).ok());
+            let view = native_view(engine, line, &version, native.as_ref());
+            let mut row = json!({
                 "profile": name, "source": source, "engine": profile["engine"], "version": version,
-                "custom": !capyctl_config::registration::is_verified(engine, &version),
+                "custom": !capyctl_config::registration::is_verified_line(engine, line, &version),
                 "idle_signal": manifest.as_ref().map(|m| m.idle.as_ref().map_or_else(|| "none".to_owned(), |idle| idle.describe())),
                 "engine_key": manifest.as_ref().map(engine_key),
                 "api": manifest.as_ref().map(|m| m.api),
@@ -1059,7 +1234,11 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
                     .map(|r| r["users"][&name].clone())
                     .filter(|users| !users.is_null())
                     .unwrap_or(json!([])),
-            })
+            });
+            if let (Some(fields), Some(object)) = (view.as_object(), row.as_object_mut()) {
+                object.extend(fields.clone());
+            }
+            row
         })
         .collect();
     // ADR 0033 §9: the host's `lmcache` and `retention` as the running role

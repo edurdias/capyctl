@@ -8,6 +8,7 @@
 //! record the revision on the first line (a comment the parser ignores).
 use crate::effective::InstallationDrift;
 use crate::engine_policy::Engine;
+use crate::tensorfold_native::{NativeRegistration, TensorfoldLine};
 use crate::{parse_strict, ConfigError, ConfigErrorCode, ConfigKind};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -526,6 +527,45 @@ pub fn is_verified_in(table: &[(Engine, &str)], engine: Engine, version: &str) -
     table.iter().any(|(e, v)| *e == engine && *v == release)
 }
 
+/// ADR 0018 §1, ADR 0039 §3: whether `version` is certified for `engine` on
+/// `line`. TensorFold's native line has its own set
+/// ([`crate::tensorfold_native::is_certified`], each version once its live
+/// rows pass); every other profile (`line` is `python` for them) reads
+/// [`is_verified`]. One helper for `engine add`, `engine list` and `engine
+/// detect`, so a native 1.x version is never read against the 0.6 set.
+pub fn is_verified_line(engine: Engine, line: TensorfoldLine, version: &str) -> bool {
+    if engine == Engine::Tensorfold && line.is_native() {
+        return crate::tensorfold_native::is_certified(version);
+    }
+    is_verified(engine, version)
+}
+
+/// ADR 0039 §1: a profile document's TensorFold line (`line: native`, else
+/// the Python line, which every other engine has too).
+pub fn profile_line(profile: &Value) -> TensorfoldLine {
+    match (profile["engine"].as_str(), profile["line"].as_str()) {
+        (Some("tensorfold"), Some("native")) => TensorfoldLine::Native,
+        _ => TensorfoldLine::Python,
+    }
+}
+
+/// ADR 0039 §2: the TensorFold line an executable is on, from its file name:
+/// `tensorfold-native` is the native release's binary (resolution names no
+/// other), anything else (`<venv>/bin/tensorfold`) the Python line, as is
+/// every other engine. The role's own installation (`local_engine`,
+/// `--tensorfold-bin`, `CAPYCTL_TENSORFOLD_BIN`) takes its line from this.
+pub fn executable_line(engine: Engine, executable: &Path) -> TensorfoldLine {
+    if engine == Engine::Tensorfold
+        && executable
+            .file_name()
+            .is_some_and(|name| name == crate::tensorfold_native::EXECUTABLE)
+    {
+        TensorfoldLine::Native
+    } else {
+        TensorfoldLine::Python
+    }
+}
+
 /// ADR 0018 §1: the version an engines listing shows and derives `custom`
 /// from: the one the host reports, else the profile's `build_fingerprint`.
 /// ADR 0029 §2: a llama.cpp host reports the version a `libllama.so.X.Y.Z`
@@ -601,6 +641,14 @@ pub struct ProfileSpec {
     /// found in the registered environment (version and ADR 0008 digest),
     /// written as `lmcache`; `None` when the environment holds none.
     pub lmcache: Option<crate::lmcache::LmcacheRegistration>,
+    /// ADR 0039 §1: the TensorFold line, written as `line: native` for the
+    /// native line only (absent means `python`, so every other profile is
+    /// written exactly as before).
+    pub line: TensorfoldLine,
+    /// ADR 0039 §2, §7: what `engine add` recorded from a native release
+    /// (the capabilities document's families, whether `SHA256SUMS` was
+    /// checked), written as `native` on the native line only.
+    pub native: Option<NativeRegistration>,
 }
 
 /// ADR 0014 §8: `security.approved_options` and `security.approved_paths`,
@@ -688,6 +736,14 @@ pub fn profile_document(spec: &ProfileSpec) -> Value {
     // is unchanged.
     if let Some(lmcache) = &spec.lmcache {
         profile["lmcache"] = serde_json::json!(lmcache);
+    }
+    // ADR 0039 §1: stated only for the native line, so a Python-line
+    // profile is written byte for byte as before.
+    if spec.engine == Engine::Tensorfold && spec.line.is_native() {
+        profile["line"] = TensorfoldLine::Native.name().into();
+        if let Some(native) = &spec.native {
+            profile["native"] = serde_json::json!(native);
+        }
     }
     profile
 }

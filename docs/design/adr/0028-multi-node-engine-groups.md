@@ -383,6 +383,10 @@ failover. The initialization timeout is the deployment's `timeouts.initialize`.
 
 ### 10. Engine adapters: one mechanism, three renderings
 
+*Amended by [ADR 0039](0039-tensorfold-1.md) §13:* TensorFold's group support below is
+its Python (0.6) line's; the native line serves no group, and a `topology` on it is
+refused `group_unsupported`.
+
 The controller, store, agent and protocol know only the group plan. Each adapter turns
 one member of a plan into its engine's command through one shared input,
 `GroupMemberArgs` (`tensor_parallel`, `pipeline_parallel`, `nnodes`, `node_rank`,

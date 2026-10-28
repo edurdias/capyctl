@@ -15,6 +15,9 @@ pub(super) struct NormalizedProfile {
     pub(super) custom: Option<crate::custom::CustomProfile>,
     /// ADR 0033 §1: the LMCache package `engine add` registered.
     pub(super) lmcache: Option<LmcacheRegistration>,
+    /// ADR 0039 §1: the TensorFold line; `python` for every other engine.
+    pub(super) line: TensorfoldLine,
+    pub(super) native: Option<NativeRegistration>,
 }
 
 pub(super) struct NormalizedRecipe {
@@ -83,10 +86,28 @@ pub(super) fn normalize_profile(
         ));
     }
     // ADR 0014 §1, §3: host-fixed arguments are the installation's own; they
-    // are free of the approved-flag list but never of the reserved one.
+    // are free of the approved-flag list but never of the reserved one. ADR
+    // 0039 §4: a native TensorFold profile's are checked by exact name.
     let sleep_mode = raw_profile.security.deep_park.is_enabled() && residency.parks();
-    validate_profile_args(raw_profile.engine, &raw_profile.args, sleep_mode)
-        .map_err(|e| invalid("runtime_profiles.args", e.to_string()))?;
+    validate_profile_args(
+        raw_profile.engine,
+        raw_profile.line,
+        &raw_profile.args,
+        sleep_mode,
+    )
+    .map_err(|e| invalid("runtime_profiles.args", e.to_string()))?;
+    // ADR 0039 §5: a native TensorFold profile names neither what the native
+    // line renders nor what it never carries, in its env or its approvals.
+    if raw_profile.engine == Engine::Tensorfold && raw_profile.line.is_native() {
+        if let Some(reason) =
+            crate::engine_env::tensorfold_native_refused(&raw_profile.security.approved_env)
+        {
+            return Err(invalid("runtime_profiles.security.approved_env", reason));
+        }
+        if let Some(reason) = crate::engine_env::tensorfold_native_refused(raw_profile.env.keys()) {
+            return Err(invalid("runtime_profiles.env", reason));
+        }
+    }
     // ADR 0028 §2.1: a malformed or owned-only approval entry is refused when
     // the profile is written, not at every deployment that uses it.
     crate::engine_env::ApprovedEnv::parse(&raw_profile.security.approved_env)
@@ -237,6 +258,20 @@ pub(super) fn normalize_profile(
             .check()
             .map_err(|detail| invalid("runtime_profiles.lmcache", detail))?;
     }
+    // ADR 0039 §1, §2: only a TensorFold profile names a line, and only a
+    // native one carries what `engine add` recorded from the release.
+    if raw_profile.line.is_native() && raw_profile.engine != Engine::Tensorfold {
+        return Err(invalid(
+            "runtime_profiles.line",
+            "only a profile of engine `tensorfold` names a line",
+        ));
+    }
+    if raw_profile.native.is_some() && !raw_profile.line.is_native() {
+        return Err(invalid(
+            "runtime_profiles.native",
+            "only a TensorFold profile of `line: native` carries a native registration",
+        ));
+    }
     let profile = NormalizedProfile {
         engine: raw_profile.engine,
         revision: raw_profile.revision,
@@ -252,6 +287,8 @@ pub(super) fn normalize_profile(
         },
         custom,
         lmcache: raw_profile.lmcache.clone(),
+        line: raw_profile.line,
+        native: raw_profile.native.clone(),
     };
     Ok(profile)
 }
