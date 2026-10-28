@@ -996,8 +996,8 @@ left (whole GiB, at least 1 GiB) with the same warning, and with less than
 `host_kv_limit` keeps automatic pools at 4 GiB. When CapyCTL cannot read the
 model's KV size or context (an unreadable configuration, or an enrolled host
 that has not sized the checkpoint yet), the pool is 4 GiB and status says
-why. A stated `lmcache_pool` is used as given, and waits for room or is
-refused like any reservation. To keep more:
+why. A stated `lmcache_pool` is used as given: a model whose stated pool
+does not fit waits for room or is refused. To keep more:
 
 ```yaml
 # The deployment
