@@ -614,6 +614,10 @@ The inference listener may be reachable from the network. It requires the API ke
 
 Every engine's output is kept at the engine's default level in its launch's private owner-only log, written through a redacting writer: the launch's own credentials (engine and admin keys, observation credentials, secret-named environment values) are replaced by value, and URL credentials, URL query strings and fragments (presigned URLs), secret-named assignments, Hugging Face tokens, bearer values and long credential-shaped runs by rule. The log rotates at a fixed size, so each launch's log is bounded. Request logging stays off for every engine, so prompts and completions are not logged by default. An authenticated management read returns a bounded, redacted tail of one instance's engine log. A log written under `--debug-engine-logs` is raw development output and is never served.
 
+> **Amended by [ADR 0040](design/adr/0040-web-ui.md)** (owner decisions 2026-10-27).
+
+A management API now introduces programs: a signed-in browser session may add or change a custom engine on a host, confirmed by the profile name over a server-enforced digest of a preview (`confirmation_stale` on any difference), with the CLI's terminal confirmation kept (ADR 0040 §11). Accepted risk: anyone holding a session who can reach the management bind can run any program as the CapyCTL user, on a server on every enrolled host.
+
 ## 14. Action-first CLI and interfaces
 
 Canonical grammar: `capyctl <action> <resource> [identifier] [options]`.
@@ -675,6 +679,10 @@ The management API is the source of semantics for CLI, future UI, and integratio
 > **Amended by [ADR 0018](design/adr/0018-engine-registration.md)** (owner decision 2026-09-25).
 
 `capyctl engine detect|add|list|remove` and `capyctl list engines` (§4.2) add nine closed codes to the error vocabulary, each with a stable CLI exit: `engine_not_found` (16, the named or picked path has no `vllm-*`/`sglang-*` `dist-info`), `engine_unsupported` (17, its engine family is not one CapyCTL integrates), `engine_version_failed` (18, the bounded version check failed or timed out), `profile_exists` (19, the name is already registered, declared in the role document, or reserved for a standalone environment profile), `profile_in_use` (20, `engine remove` without `--drain` while a deployment on this machine uses the profile, naming it), `publish_rejected` (21, the running role validated the profile like a startup publication and refused it; the previous approved snapshot is kept), `agent_unreachable` (22, a role is listening on `<state_dir>/control.sock` but did not take or answer the request; with no role listening, `add` and `remove` edit `engines.yaml` under its lock and succeed, and the role publishes the change at its next start, ADR 0018 amendment A3), `not_interactive` (23, `engine add` needs an operator choice — a name or a `detect` pick — and stdin is not a terminal). A deploy naming a `runtime_profile` that no allowed host publishes is refused at once, nothing stored: `profile_not_published` (HTTP 409, CLI exit 24), naming the profile, each allowed host with the profiles it publishes, and the fix (`capyctl engine add <path> --name <profile>` on a host, then deploy again). Exit code 9 stays unused.
+
+> **Amended by [ADR 0040](design/adr/0040-web-ui.md)** (owner decisions 2026-10-27).
+
+A web UI built into the server and standalone roles is served under `/ui/` on the management listener and acts only through the management API. Browser sessions, created from one-time sign-in links (`capyctl open ui`), are a second management credential with the admin token's authority; the admin bearer token is accepted only from loopback or the connection's own local address. The management API gains sign-in links and sessions, supported-action hints in the snapshot, `POST /management/v1/deployments/check`, host-scoped engine, model-copy and host-configuration routes (capability `host_admin`), custom-engine preview and confirmation, and a playground route (ADR 0040 §2–§12).
 
 ## 15. Configuration model and generated defaults
 
@@ -1023,6 +1031,10 @@ The generated shape states `inference.bind: "0.0.0.0:8443"` (with `authenticatio
 > **Amended by [ADR 0025](design/adr/0025-standalone-memory-limits-and-tensorfold-cap.md)** (owner decision 2026-10-03).
 
 `host.resource_policy.memory.system.managed_limit` and `free_reserve` take `auto` (50 % and 20 % of the observed memory), a size (`90GiB`) or a whole percentage (`75%`), by YAML, `--set` or `CAPYCTL_SET__…`. Together they must fit the observed memory. They apply to the `unified` domain, or to host RAM's `system` domain on a discrete machine, and the stored policy follows them at every start.
+
+> **Amended by [ADR 0040](design/adr/0040-web-ui.md)** (owner decisions 2026-10-27).
+
+The management listener stays on loopback unless the owner sets `server.listeners.management.remote: true` (`--management-remote`, `CAPYCTL_MANAGEMENT_REMOTE`), which allows a non-loopback `bind` over plain HTTP without a warning; optional `public_address` names the origin used in sign-in links (ADR 0040 §1).
 
 ## 17. Observability and benchmark evidence
 

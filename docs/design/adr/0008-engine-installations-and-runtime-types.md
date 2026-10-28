@@ -440,3 +440,11 @@ The safety argument of the 2026-10-19 amendment does not carry over, so:
 
 vLLM is started without `-S`, so its editable installs are unaffected. CPU
 tests only; this is not qualification.
+
+## Amended by ADR 0040 (owner decisions 2026-10-27): pinning on the server
+
+Owner decisions 2026-10-27 ([ADR 0040](0040-web-ui.md) §9). The deployment check endpoint
+pins model sources in the role, on the chosen host's terms: the Hugging Face endpoint and
+token come from that host's `model_sources`, not from a shell. A standalone role pins
+in-process; a server pins through a `host_admin` operation on the chosen host. The CLI's
+pinning code moves into `capyctl-config` and is shared; a `~/` path is refused there.
