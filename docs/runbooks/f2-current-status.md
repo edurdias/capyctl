@@ -1,5 +1,220 @@
 # Current implementation and launch status
 
+## The engine receives the caller's request bytes — 2026-10-29 (branch `fix/preserve-json-key-order`)
+
+Issue #220. The router parsed every inference request into `serde_json::Value`
+and forwarded it re-encoded. Without `serde_json`'s `preserve_order` a `Value`
+object is a sorted map, so every JSON object reached the engine with its keys in
+alphabetical order. SGLang's System One prompt numbers a decision's questions in
+the order of the `questions` object, so through CapyCTL the model saw a
+different prompt from the one the caller sent: measured on Clef-Flash FP8 with
+SGLang 0.5.22, 94 of 104 answers changed and 6 top answers flipped against the
+same engine called directly. The property order of a chat request's JSON
+schema (`response_format`, `tools`) was reordered the same way.
+
+SPEC §10: the router now keeps the bytes it received
+(`capyctl_adapters::request::InferenceRequest`, which `ChatForward` takes in
+place of `Value`). Validation still reads the parsed form; the forwarder sends
+the caller's members in their order and bytes, nested objects untouched, and
+writes only what CapyCTL sets (the served `model`, `stream`, the effective
+`cache_salt`, `stream_options` on a collected request, `rid`) in place, or
+after the caller's members when the caller did not send it. The host ingress
+adds `rid` the same way instead of re-encoding the body. A request with a
+duplicated key at any depth is now refused with `invalid_request` (400) by the
+router and the ingress, because the validated request and the bytes an
+engine's parser reads must be one request; it used to be accepted, last value
+winning.
+
+`preserve_order` was not turned on: it applies to the whole build, and
+configuration, receipt and command digests are computed over serialized
+`Value`s and compared with digests stored in ledgers and sent between versions
+(`managed_configuration.rs`, `current_policy.rs`, `execution.rs`), so it would
+have changed them.
+
+Tests: `capyctl-router` `decisions::the_engine_receives_the_callers_key_order`
+(T43 T19) sends a decision with questions `urgency`, `cause`, `doctor` and a
+chat request whose schema lists `zeta` before `alpha` through the router and
+the real forwarder to an engine double, and checks the bytes it receives. On
+`main` it fails (the engine receives `cause`, `doctor`, `urgency`); it passes
+here. `capyctl-agent` `ingress::the_capyctl_request_id_becomes_rid_only_on_a_capable_chat_launch`
+now checks the ingress forwards the router's bytes with `rid` appended, and
+refuses a duplicated key; `capyctl-adapters` `request::tests` cover splicing
+and refusal. CPU and Fake-engine tests are not qualification. Live check still
+needed: repeat the issue's 41-request comparison through CapyCTL and directly
+against SGLang 0.5.22 and expect bit-identical answers.
+
+## ADR 0036 accepted: embedding models — 2026-10-27 (branch `docs/adr-embeddings`)
+
+ADR 0036 records the owner's decisions of 2026-10-27 for serving embedding models at
+`POST /v1/embeddings` in 0.2.0. It was proposed on 2026-10-24, and the owner answered its
+eleven open questions and named the models to qualify. A deployment declares
+`api: embeddings` (a third value beside ADR 0030's `chat` and `decisions`, part of the
+frozen revision); vLLM renders `--runner pooling`, SGLang `--is-embedding` and llama.cpp
+`--embeddings`, with batch sizes rendered so each input fits one physical batch.
+TensorFold documents no embeddings route on 0.6.6 or 1.1.4 and is refused. The request has
+a closed OpenAI text contract (`model`, `input` as a string, strings, token IDs or arrays
+of token IDs, at most 2048 inputs, `encoding_format` `float` or `base64`, `dimensions`,
+`user`); llama.cpp, which ignores `dimensions`, is refused any other than the native
+dimension, and `cache_salt` is refused. Readiness is a fixed embedding (kind `embedding`,
+version 1), and the canary compares later vectors by relative distance, with a tolerance
+set from live row EM3 and checked against 0.02. Custom engines may declare
+`api: embeddings`, chat checkpoints may be served as embeddings, and today's sizing rules
+stay. Scope: one GPU, text only, LMCache off.
+
+Decisions that changed the design:
+
+- vLLM 0.32.0, SGLang 0.5.22 and llama.cpp v0.7.0 are certified; older versions, other
+  checkpoints and custom engines run as uncertified custom setups and are never refused
+  for being uncertified (owner rule of 2026-10-27).
+- vLLM and SGLang embeddings deployments park `deep` in 0.2.0, with the canary after every
+  wake, qualified by the new live row EM9; `host_backed` is refused, and llama.cpp stays
+  `restart_only`.
+- The answer is streamed through to the client and validated as it passes against one
+  fixed JSON shape, with `model` rewritten on the fly before or after `data`; there is no
+  answer cap, and the proposed 64 MiB limit and its refusal before forwarding are gone. A
+  malformed answer is detected after part of it reached the client, which then receives an
+  incomplete body, and the request is uncertain as before.
+- A cut embedding request runs to its end and settles on its answer; a cut request whose
+  answer never completes still settles at the next verified stop.
+- Live qualification covers ten open-weight embedding models (Qwen3-Embedding-8B and 4B,
+  bge-m3, pplx-embed-v1-0.6b and 4b, multilingual-e5-large, bge-base-en-v1.5,
+  all-MiniLM-L6-v2, all-mpnet-base-v2, Nemotron-3-Embed-1B) on every engine that can run
+  each, with the combinations the engines' source does not support documented; EM2 to EM9
+  run on Qwen3-Embedding-4B.
+
+The ADR gives the metrics, the ingress path, the docs, conformance row T47 and live rows
+EM1–EM9. Nothing is implemented; no code or tests change. CPU and Fake-engine tests are not
+qualification, and the EM rows are the live check still needed.
+
+## ADR 0038 accepted: TensorRT-LLM as a native engine — 2026-10-27 (branch `docs/adr-tensorrt-llm`)
+
+ADR 0038 (Accepted 2026-10-27; target 0.2.0) designs TensorRT-LLM as a native engine,
+following the owner's decisions of 2026-10-25 and the owner's answers of 2026-10-27 to
+the ADR's nine open questions. The base version is 1.2.1: a virtual environment on host A,
+`~/tensorrt-llm-1.2.1-venv`, built from NVIDIA's aarch64 wheel (pinned by URL and SHA-256)
+on the CUDA 13.1 stack with torch 2.9.1, chat qualified `restart_only`. Evidence was read
+from the v1.2.1 tag, the wheel itself (its metadata and all of its Python, over HTTP range
+requests, nothing installed) and NVIDIA's documentation; no host was used.
+
+Three answers changed the design:
+
+- **System packages on host A** (question 4): the owner approved installing
+  `libopenmpi-dev` with apt and the CUDA 13.1 toolkit on host A. The recipe installs them
+  first, `CUDA_HOME` names the toolkit, and the MPI pins expect Ubuntu's Open MPI 4.1.6,
+  which TR1 confirms.
+- **More versions** (question 7): the 1.3 and 1.4 pre-releases are also qualified in
+  0.2.0, each in its own environment on host A with its own live rows (TR1a–TR11a,
+  TR1b–TR11b). 1.4 needs CUDA 13.4 and another torch, renders the backend in its own
+  spelling and stays restart-only, with `--enable_sleep_mode` reserved. What else differs
+  is read from each tag at implementation and established by the rows. Every other
+  version runs as an uncertified custom setup and is never refused for its version.
+- **Kind name** (question 8): the kind is `tensorrt-llm` (profile default,
+  `local_engine.tensorrt-llm`, `--tensorrt-llm-bin`, `CAPYCTL_TENSORRT_LLM_BIN`,
+  `engine_config.tensorrt-llm.llm_api_options`); the engine's command stays `trtllm-serve`.
+
+The other answers kept the recommendations: one process with MPI pinned to an isolated
+singleton; no idle signal, so cut requests settle at the next verified stop with ADR
+0032's restart when they fill a deployment; a per-launch link named after the served name;
+`max_batch_size` 32 by default; a deployment mapping of LLM API options with reserved keys
+refused; FlashInfer's kernel downloads allowed and documented.
+
+Registration reads metadata only and never imports the package, because importing it
+initializes MPI and CUDA. CapyCTL runs `trtllm-serve serve` on `127.0.0.1` and a leased
+port, with the PyTorch backend, one GPU and a configuration file CapyCTL writes whole. The
+KV pool is bound by `kv_cache_config.max_tokens` from the grant. Every launch checks that
+no descendant left the process group and runs the loopback listener check. Decisions,
+embeddings, LMCache, several GPUs and groups are refused.
+
+The ADR adds conformance row T49 and 33 live rows on host A with Qwen3-4B. Nothing is
+implemented; no code or tests change. CPU and Fake-engine tests are not qualification, and
+the TR rows are the live check still needed.
+
+## ADR 0039 accepted: TensorFold native 1.x — 2026-10-27 (branch `docs/adr-tensorfold-1`)
+
+ADR 0039 (Accepted 2026-10-27; target 0.2.0) designs TensorFold's native line, the Zig
+binary registered from its release directory beside the TensorFold 0.6.x line, which stays
+supported. The owner answered all eight open questions on 2026-10-27, and the ADR records
+them. Decisions that changed the design: TensorFold 1.0.0 (at `~/tensorfold-1.0.0`) and
+1.1.5 (approved for install on host A at `~/tensorfold-1.1.5`) are both certified, and every
+other native version runs as an uncertified custom setup, never refused for its version;
+1.1.5 was read at v1.1.5 (commit `84e0d56`), and its `/health` 503 `unavailable` and
+`draining` bodies, its 20 s stop drain and `--idle-unload` are designed in, with
+`--idle-unload` reserved because the idle policy is CapyCTL's; no checkpoint is refused for
+being uncertified (only the pinned Nemotron 3.5 Lightning revision is certified, others run
+with a status note, and the engine itself refuses a family it cannot load); `--compact-at`,
+`--compact-keep` and `--compact-memory` are ordinary options, refused
+`retention_zero:compaction` under `retention: zero`, and the disk-writing options are refused
+`retention_zero:engine_disk` there; the default profile name is `tensorfold` when free, else
+the operator passes `--name`. As recommended: `TENSORFOLD_MEMORY_RESERVE_GIB=2` rendered, the
+loopback listener check on every native launch, the native line documented for Nemotron 3.5
+Lightning on a GB10 once the TF rows pass, host A only. Live rows TF11 to TF14 are added for
+1.1.5. Nothing is implemented; no code or tests change. CPU and Fake-engine tests are not
+qualification, and the TF rows are the live check still needed.
+
+## ADR 0037 accepted: OpenTelemetry trace context — 2026-10-27 (branch `docs/adr-otel`)
+
+ADR 0037, accepted by the owner on 2026-10-27 for 0.2.0, decides how CapyCTL takes part in a
+distributed trace. Tracing stays off unless a role names an OTLP endpoint
+(`observability.tracing.endpoint`). With it on, the router reads W3C `traceparent` and
+`tracestate` after authentication on the inference endpoints, ignores malformed ones
+(never refuses a request for them), and records fixed spans for admission, queue wait,
+activation wait, dispatch, the forward to the engine or ingress, and settlement; an
+activation (cold start, wake, switch) is its own trace, linked from each request that
+waited for it. Spans carry an allow-list of identifiers, timings, codes and token
+counts, never request or response content, the caller's `X-Request-Id`, salts or keys;
+`X-CapyCTL-Request-Id` is the join key. Remote hosts get the context through a
+`trace_context` capability and the command envelope, outside the journal. Engine spans
+(vLLM 0.31.0 or newer, SGLang 0.5.22 or newer) are a host opt-in with a loopback-only
+endpoint and a launch-time check; the engines' tracing options become owned. Export is
+OTLP over HTTP/protobuf with a bounded queue, never on the request path, ignoring
+`OTEL_*` variables. Zero retention keeps engine tracing off. The ADR lists T48, live rows
+OT1–OT11. The owner answered all twelve open questions; eleven follow the
+recommendations. One changed the plan: the live rows use the OpenTelemetry Collector
+release binary in the home directory on host A and host B (approved as a new program on
+the lab hosts) instead of a receiver script in `scripts/live/`. Everything ships in
+0.2.0; engine tracing moves to a later release only if OT5 or OT8 fails. Docs only; nothing implemented. CPU and Fake-engine
+tests are not qualification; the live rows have not run.
+
+## ADR 0034 accepted: LMCache by default — 2026-10-27 (branch `docs/adr-lmcache-default`)
+
+ADR 0034 (Accepted 2026-10-27, target 0.2.0, retargeted from 0.1.9) plans "LMCache by
+default". The owner answered its nine open questions on 2026-10-27; the answers are
+recorded in the ADR ("Owner decisions of 2026-10-27"). In 0.1.8 the qualified table for
+LMCache beside a parking residency is empty, so on a GB10, where every deployment parks
+deep, LMCache runs only for `restart_only` deployments. The ADR reads what a deep park
+does to the engine and the connector: vLLM's sleep mode and SGLang's memory saver allocate
+the KV cache through the CUDA virtual memory API, release it on a park and make new memory
+at the same address on a wake, while LMCache's default transfer has its server map the
+engine's KV through CUDA IPC handles, which LMCache's own code says do not work on such
+memory (an inference that live row LC12 checks). Parking residencies therefore use
+engine-driven transfer (the server never maps the engine's KV), with its pickle path on by
+default and documented beside ADR 0033's "Local reach", the host's `lmcache: off` as the
+remedy (owner decision 1). `lmcache_pool: auto` becomes the default: one full context of
+the deployment's model after LMCache's eviction, at least 4 GiB, capped at the host's
+`host_kv_limit`, with a warning when one context does not fit; an `auto` pool that does
+not fit the room left shrinks to it, or runs without LMCache (`host_kv_room`), and is
+never refused (owner decisions 2 and 3). Standalone's `host_kv_limit` stays at 10 % of the
+memory it observes at every start, and settable (owner decision 4). Every LMCache launch,
+`restart_only` included, moves to engine-driven transfer once LC16's cost bounds and a new
+restart-park row, LC18, pass (owner decision 5); the advice to declare `restart_only` for
+LMCache is dropped (owner decision 6); only dense full-attention model types qualify in
+0.2.0 (owner decision 8).
+
+Decisions that changed the design: `host_backed` on a discrete GPU is qualified in 0.2.0,
+with a vLLM 0.32.0 or SGLang 0.5.22 environment on a maintainer's discrete-GPU machine (the
+RTX 4090 laptop: 16,376 MiB of GPU memory, 61 GiB of RAM, where Qwen3-4B and listed types
+of about 4 billion parameters or fewer in BF16 fit) or, if the laptop is not enough, a VM
+rented from Shadeform, where LC13–LC16 run with `host_backed` (owner decision 7); the
+model types beyond `qwen3` are the most-used open-weight dense chat
+model types on OpenRouter that fit the hosts, a list compiled when the implementation is
+built and shown to the owner before the live rows (owner decision 9); and, under the
+owner's rule of 2026-10-27 on certified combinations, the qualified table is the certified
+set: `lmcache: required` outside it, or on a model across several GPUs, runs LMCache as an
+uncertified setup instead of being refused `lmcache_unavailable:park_unqualified` or
+`:multi_gpu_unqualified`, while `lmcache: auto` keeps LMCache off there. No code, SPEC or
+guide text changes yet; CPU and Fake-engine tests are not qualification, and LC12–LC18 on
+host A and LC13–LC16 on the discrete machine are the live checks still needed.
+
 ## One model across several GPUs of one host (ADR 0035), qualified on two RTX A6000 GPUs — 2026-10-26 (branch `feat/multi-gpu-one-host`)
 
 ADR 0035 (owner decisions 2026-10-25) is implemented for 0.1.9. A deployment with
