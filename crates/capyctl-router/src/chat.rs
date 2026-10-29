@@ -309,7 +309,7 @@ pub async fn dispatch(
         deps,
         Endpoint::ChatCompletions,
         model,
-        body.clone(),
+        body.clone().into(),
         bytes,
         tokio::time::Instant::now(),
         RequestTiming::untracked(),
@@ -333,7 +333,7 @@ pub async fn dispatch_timed(
     deps: &RouterDeps,
     endpoint: Endpoint,
     model: &str,
-    body: serde_json::Value,
+    body: capyctl_adapters::request::InferenceRequest,
     body_bytes: usize,
     received: tokio::time::Instant,
     mut timing: RequestTiming,
@@ -850,7 +850,7 @@ pub struct NoForward;
 impl capyctl_adapters::traits::ChatForward for NoForward {
     async fn forward_chat(
         &self,
-        _body: &serde_json::Value,
+        _body: &capyctl_adapters::request::InferenceRequest,
     ) -> Result<serde_json::Value, capyctl_adapters::traits::AdapterError> {
         Err(capyctl_adapters::traits::AdapterError::UnsupportedCapability)
     }

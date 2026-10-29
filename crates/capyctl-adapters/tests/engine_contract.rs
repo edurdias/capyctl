@@ -45,7 +45,7 @@ async fn backpressure_stops_parser_before_next_event_even_in_same_http_chunk() {
         };
         let task = tokio::spawn(async move {
             adapter
-                .forward_chat_stream_async(&json!({"model":"public"}), &mut sink)
+                .forward_chat_stream_async(&json!({"model":"public"}).into(), &mut sink)
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
@@ -87,7 +87,7 @@ async fn a_timed_out_sink_cancels_the_stream() {
             };
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(12),
-                adapter.forward_chat_stream_async(&json!({"model":"public"}), &mut sink),
+                adapter.forward_chat_stream_async(&json!({"model":"public"}).into(), &mut sink),
             )
             .await
             .unwrap();
@@ -134,7 +134,7 @@ async fn async_sink_waits_in_order_and_failure_cancels() {
                     fail,
                 };
                 let result = adapter
-                    .forward_chat_stream_async(&json!({"model":"public"}), &mut sink)
+                    .forward_chat_stream_async(&json!({"model":"public"}).into(), &mut sink)
                     .await;
                 if fail {
                     assert!(matches!(result, Ok(StreamEnded::Cancelled)), "{result:?}");
@@ -254,7 +254,7 @@ async fn collects_ordered_content_preserves_public_identity_and_terminal_reason(
         )
         .await;
         let result = adapter
-            .forward_chat(&json!({"model":"public", "messages":[]}))
+            .forward_chat(&json!({"model":"public", "messages":[]}).into())
             .await
             .unwrap();
         assert_eq!(result["model"], "public");
@@ -278,7 +278,7 @@ async fn rejects_malformed_mismatched_and_unfinished_streams() {
         ] {
             let (adapter, task) = engine(sglang, sse).await;
             assert!(adapter
-                .forward_chat(&json!({"model":"public"}))
+                .forward_chat(&json!({"model":"public"}).into())
                 .await
                 .is_err());
             task.abort();
@@ -292,7 +292,7 @@ async fn streams_in_order_and_reports_premature_close_without_completion() {
         let (adapter, task) = engine(sglang, chunk("partial", Value::Null)).await;
         let mut chunks = vec![];
         let end = adapter
-            .forward_chat_stream(&json!({"model":"public"}), &mut |s| {
+            .forward_chat_stream(&json!({"model":"public"}).into(), &mut |s| {
                 chunks.push(serde_json::from_str::<Value>(&s).unwrap())
             })
             .await;
@@ -337,7 +337,7 @@ async fn rejects_changed_response_identity_duplicate_fields_and_trailing_generat
         ] {
             let (adapter, task) = engine(sglang, bad).await;
             assert!(adapter
-                .forward_chat(&json!({"model":"public"}))
+                .forward_chat(&json!({"model":"public"}).into())
                 .await
                 .is_err());
             task.abort();
@@ -357,7 +357,7 @@ async fn completes_stream_with_ordered_chunks_and_optional_usage_event() {
         let (adapter, task) = engine(sglang, sse).await;
         let mut chunks = vec![];
         let end = adapter
-            .forward_chat_stream(&json!({"model":"public","stream":false}), &mut |s| {
+            .forward_chat_stream(&json!({"model":"public","stream":false}).into(), &mut |s| {
                 chunks.push(serde_json::from_str::<Value>(&s).unwrap())
             })
             .await
@@ -368,7 +368,7 @@ async fn completes_stream_with_ordered_chunks_and_optional_usage_event() {
         assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "β");
         assert!(chunks.iter().all(|c| c["model"] == "public"));
         let collected = adapter
-            .forward_chat(&json!({"model":"public"}))
+            .forward_chat(&json!({"model":"public"}).into())
             .await
             .unwrap();
         assert_eq!(collected["usage"]["total_tokens"], 3);
@@ -393,7 +393,7 @@ async fn unsupported_multi_choice_and_tool_requests_do_not_report_success() {
             json!({"model":""}),
             json!([]),
         ] {
-            assert!(adapter.forward_chat(&body).await.is_err());
+            assert!(adapter.forward_chat(&body.clone().into()).await.is_err());
         }
         task.abort();
     }
@@ -441,7 +441,7 @@ async fn canceled_stream_does_not_prove_backend_quiescence_or_sglang_readiness()
     for adapter in [&sglang as &dyn ChatForward, &vllm as &dyn ChatForward] {
         assert!(tokio::time::timeout(
             std::time::Duration::from_millis(30),
-            adapter.forward_chat_stream(&json!({"model":"public"}), &mut |_| panic!(
+            adapter.forward_chat_stream(&json!({"model":"public"}).into(), &mut |_| panic!(
                 "no chunks expected"
             ))
         )
@@ -515,7 +515,7 @@ async fn redirects_never_receive_the_inference_credential() {
     ];
     for adapter in adapters {
         let error = adapter
-            .forward_chat(&json!({"model":"public"}))
+            .forward_chat(&json!({"model":"public"}).into())
             .await
             .unwrap_err();
         assert!(!format!("{error:?}").contains("inference-secret"));
@@ -570,7 +570,9 @@ async fn split_utf8_and_crlf_survive_but_invalid_utf8_never_completes() {
                     MODEL.into(),
                 ))
             };
-            let result = adapter.forward_chat(&json!({"model":"public"})).await;
+            let result = adapter
+                .forward_chat(&json!({"model":"public"}).into())
+                .await;
             if invalid {
                 assert!(result.is_err());
             } else {
@@ -592,7 +594,7 @@ async fn bounded_stream_rejects_many_small_events_before_done() {
         );
         let (adapter, task) = engine(sglang, sse).await;
         assert!(adapter
-            .forward_chat_stream(&json!({"model":"public"}), &mut |_| {})
+            .forward_chat_stream(&json!({"model":"public"}).into(), &mut |_| {})
             .await
             .is_err());
         task.abort();
@@ -629,7 +631,7 @@ async fn a_reasoning_trace_streams_through_and_survives_collection() {
         let (adapter, task) = engine(sglang, sse).await;
         let mut chunks = vec![];
         let end = adapter
-            .forward_chat_stream(&json!({"model":"public","stream":true}), &mut |s| {
+            .forward_chat_stream(&json!({"model":"public","stream":true}).into(), &mut |s| {
                 chunks.push(serde_json::from_str::<Value>(&s).unwrap())
             })
             .await
@@ -643,7 +645,7 @@ async fn a_reasoning_trace_streams_through_and_survives_collection() {
         assert_eq!(chunks[2]["choices"][0]["delta"]["content"], "OK");
 
         let collected = adapter
-            .forward_chat(&json!({"model":"public"}))
+            .forward_chat(&json!({"model":"public"}).into())
             .await
             .unwrap();
         assert_eq!(collected["choices"][0]["message"]["content"], "OK");
@@ -680,7 +682,7 @@ async fn a_vllm_reasoning_trace_streams_through_under_its_own_name() {
     let (adapter, task) = engine(false, sse).await;
     let mut chunks = vec![];
     let end = adapter
-        .forward_chat_stream(&json!({"model":"public","stream":true}), &mut |s| {
+        .forward_chat_stream(&json!({"model":"public","stream":true}).into(), &mut |s| {
             chunks.push(serde_json::from_str::<Value>(&s).unwrap())
         })
         .await
@@ -692,7 +694,7 @@ async fn a_vllm_reasoning_trace_streams_through_under_its_own_name() {
         .get("reasoning_content")
         .is_none());
     let collected = adapter
-        .forward_chat(&json!({"model":"public"}))
+        .forward_chat(&json!({"model":"public"}).into())
         .await
         .unwrap();
     assert_eq!(collected["choices"][0]["message"]["content"], "OK");
@@ -715,7 +717,7 @@ async fn a_non_string_reasoning_delta_is_rejected() {
     );
     let (adapter, task) = engine(false, sse).await;
     assert!(adapter
-        .forward_chat_stream(&json!({"model":"public","stream":true}), &mut |_| {})
+        .forward_chat_stream(&json!({"model":"public","stream":true}).into(), &mut |_| {})
         .await
         .is_err());
     drop(task);
@@ -727,7 +729,7 @@ async fn a_response_without_a_trace_gains_no_reasoning_field() {
     let sse = format!("{}data:[DONE]\n\n", chunk("OK", json!("stop")));
     let (adapter, task) = engine(false, sse).await;
     let collected = adapter
-        .forward_chat(&json!({"model":"public"}))
+        .forward_chat(&json!({"model":"public"}).into())
         .await
         .unwrap();
     assert_eq!(collected["choices"][0]["message"]["content"], "OK");
@@ -747,7 +749,7 @@ async fn an_unknown_delta_field_is_still_rejected() {
     let (adapter, task) = engine(false, sse).await;
     assert!(
         adapter
-            .forward_chat_stream(&json!({"model":"public","stream":true}), &mut |_| {})
+            .forward_chat_stream(&json!({"model":"public","stream":true}).into(), &mut |_| {})
             .await
             .is_err(),
         "untested fields must not pass through"
@@ -793,7 +795,7 @@ async fn no_progress_is_reported_after_delivery_failed() {
             progressed: 0,
         };
         let result = adapter
-            .forward_chat_stream_async(&json!({"model":"public"}), &mut sink)
+            .forward_chat_stream_async(&json!({"model":"public"}).into(), &mut sink)
             .await;
         assert_eq!(result.unwrap(), StreamEnded::Cancelled);
         assert_eq!(sink.delivered, 1, "delivery stops at the first failure");
@@ -889,7 +891,7 @@ async fn a_failed_delivery_cancels_upstream_without_draining() {
     };
     let started = Instant::now();
     let ended = forward
-        .forward_chat_stream_async(&json!({"model": "m", "stream": true}), &mut sink)
+        .forward_chat_stream_async(&json!({"model": "m", "stream": true}).into(), &mut sink)
         .await;
     assert!(matches!(ended, Ok(StreamEnded::Cancelled)), "{ended:?}");
     assert_eq!(sink.delivered, 1);
@@ -918,7 +920,7 @@ async fn a_connected_stream_still_completes_on_its_terminator() {
         delivered: 0,
     };
     let ended = forward
-        .forward_chat_stream_async(&json!({"model": "m", "stream": true}), &mut sink)
+        .forward_chat_stream_async(&json!({"model": "m", "stream": true}).into(), &mut sink)
         .await;
     assert!(matches!(ended, Ok(StreamEnded::Completed)), "{ended:?}");
     assert_eq!(sink.delivered, 5);

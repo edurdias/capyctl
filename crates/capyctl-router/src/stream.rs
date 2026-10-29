@@ -493,7 +493,7 @@ impl AfterCut {
 
 pub fn stream_response(
     forward: Arc<dyn capyctl_adapters::traits::ChatForward>,
-    body: serde_json::Value,
+    body: capyctl_adapters::request::InferenceRequest,
     guard: StaticStreamGuard,
     // SPEC §10: the durable lease this stream holds until the backend ends, with
     // the authority that closes it. `None` when the authority keeps no ledger.
@@ -517,7 +517,7 @@ pub fn stream_response(
 pub fn stream_planned(
     first: crate::balance::Attempt,
     plan: Option<crate::balance::Plan>,
-    body: serde_json::Value,
+    body: capyctl_adapters::request::InferenceRequest,
     guard: StaticStreamGuard,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     stream_planned_timed(
@@ -538,7 +538,7 @@ pub fn stream_planned(
 pub fn stream_planned_timed(
     first: crate::balance::Attempt,
     mut plan: Option<crate::balance::Plan>,
-    body: serde_json::Value,
+    body: capyctl_adapters::request::InferenceRequest,
     guard: StaticStreamGuard,
     timing: crate::timing::RequestTiming,
     bounds: StreamBounds,

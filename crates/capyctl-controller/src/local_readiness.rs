@@ -352,7 +352,7 @@ impl LocalReadiness {
                 "max_tokens": 8,
                 "temperature": 0,
             });
-            let answer = tokio::time::timeout(DECISION_TIMEOUT, adapter.forward_chat(&body))
+            let answer = tokio::time::timeout(DECISION_TIMEOUT, adapter.forward_chat(&body.into()))
                 .await
                 .map_err(|_| "the engine did not answer the chat probe in time".to_owned())?
                 .map_err(|error| format!("the engine did not answer the chat probe: {error}"))?;

@@ -300,6 +300,7 @@ version = "0.1.9"
 dependencies = [
  "async-trait",
  "axum",
+ "bytes",
  "capyctl-config",
  "capyctl-domain",
  "capyctl-testkit",

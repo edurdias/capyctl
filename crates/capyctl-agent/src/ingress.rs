@@ -624,7 +624,10 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
         Ok(Ok(body)) => body,
         _ => return failure(StatusCode::BAD_REQUEST),
     };
-    let value: serde_json::Value = match serde_json::from_slice(&body) {
+    // Issue #220: the engine receives the router's bytes, with `rid` set in
+    // place when it goes; a duplicated key is refused, so what is checked
+    // here is what the engine reads.
+    let value = match capyctl_adapters::request::InferenceRequest::parse(body.clone()) {
         Ok(v) => v,
         Err(_) => return failure(StatusCode::BAD_REQUEST),
     };
@@ -670,19 +673,13 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
     // the allowlist above refused any `rid` of the caller's. A decision never
     // carries one (SGLang 0.5.22's `/v1/systemone` builds its request without
     // a `rid`), and a launch without the capability gets none: the ID is
-    // dropped. The body is re-encoded only when the ID is set.
+    // dropped. Only then is the body re-encoded, the router's members kept in
+    // their order and bytes.
     let body = match request_id.filter(|_| request_abort && matches!(kind, Kind::Chat)) {
-        Some(id) => {
-            let mut value = value;
-            let Some(fields) = value.as_object_mut() else {
-                return failure(StatusCode::BAD_REQUEST);
-            };
-            fields.insert("rid".into(), serde_json::Value::String(id));
-            match serde_json::to_vec(&value) {
-                Ok(encoded) => axum::body::Bytes::from(encoded),
-                Err(_) => return failure(StatusCode::BAD_REQUEST),
-            }
-        }
+        Some(id) => match value.encode(&[("rid", &serde_json::Value::String(id))]) {
+            Ok(encoded) => axum::body::Bytes::from(encoded),
+            Err(_) => return failure(StatusCode::BAD_REQUEST),
+        },
         None => body,
     };
     let upstream = ingress

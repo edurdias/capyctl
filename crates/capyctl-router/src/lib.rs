@@ -166,7 +166,7 @@ struct Received {
     /// SPEC §10: when the request arrived; its deadline counts from here.
     at: tokio::time::Instant,
     timing: timing::RequestTiming,
-    request: serde_json::Value,
+    request: capyctl_adapters::request::InferenceRequest,
     model: String,
     /// The size of the body as received.
     body_bytes: usize,
@@ -205,7 +205,11 @@ async fn receive(
     let body = axum::body::to_bytes(body, deps.limits.max_buffered_bytes_total)
         .await
         .map_err(|_| err_json("request_too_large", "request exceeds buffered-bytes bound"))?;
-    let request: serde_json::Value = serde_json::from_slice(&body)
+    // Issue #220: the engine receives these bytes, not a re-encoding, so the
+    // caller's key order survives; a duplicated key is refused, so what is
+    // validated here is what an engine reads.
+    let body_bytes = body.len();
+    let request = capyctl_adapters::request::InferenceRequest::parse(body)
         .map_err(|e| err_json("invalid_request", &format!("bad json: {e}")))?;
     let Some(model) = request["model"].as_str().map(str::to_owned) else {
         return Err(err_json("invalid_request", "model is required"));
@@ -213,13 +217,13 @@ async fn receive(
     // SPEC §10, T19 T21: a request that can never be forwarded is refused
     // before any accounting, activation or engine is touched.
     endpoint.validate(&request)?;
-    // The raw bytes drop here; only the parsed request is held from now on.
+    // The parsed request holds the bytes it was parsed from.
     Ok(Received {
         at,
         timing,
         request,
         model,
-        body_bytes: body.len(),
+        body_bytes,
     })
 }
 

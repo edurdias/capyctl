@@ -42,7 +42,7 @@ async fn standalone_boots_and_serves_router() {
         .forwards
         .forwarder(&id)
         .expect("a ready deployment has a forwarder")
-        .forward_chat(&serde_json::json!({"model": "wired-m", "messages": []}))
+        .forward_chat(&serde_json::json!({"model": "wired-m", "messages": []}).into())
         .await
         .unwrap();
     assert!(resp["choices"][0]["message"]["content"].is_string());

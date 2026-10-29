@@ -633,7 +633,7 @@ pub trait ChatForward: Send + Sync {
     /// No synchronous fallback: implementations must explicitly support this.
     async fn forward_chat_stream_async(
         &self,
-        _body: &serde_json::Value,
+        _body: &crate::request::InferenceRequest,
         _sink: &mut dyn ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
@@ -641,7 +641,7 @@ pub trait ChatForward: Send + Sync {
     /// Non-streaming chat completion: returns the engine's JSON response.
     async fn forward_chat(
         &self,
-        body: &serde_json::Value,
+        body: &crate::request::InferenceRequest,
     ) -> Result<serde_json::Value, AdapterError>;
     /// SPEC §10: non-streaming chat completion whose backend events are
     /// reported through [`ChatSink::progressed`] on `observer` (nothing is sent
@@ -651,7 +651,7 @@ pub trait ChatForward: Send + Sync {
     /// answers as [`ChatForward::forward_chat`].
     async fn forward_chat_observed(
         &self,
-        body: &serde_json::Value,
+        body: &crate::request::InferenceRequest,
         _observer: &mut dyn ChatSink,
     ) -> Result<serde_json::Value, AdapterError> {
         self.forward_chat(body).await
@@ -670,7 +670,7 @@ pub trait ChatForward: Send + Sync {
     /// sending.
     async fn forward_decision(
         &self,
-        _body: &serde_json::Value,
+        _body: &crate::request::InferenceRequest,
     ) -> Result<serde_json::Value, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
     }
@@ -678,7 +678,7 @@ pub trait ChatForward: Send + Sync {
     /// `[DONE]` marker is consumed by the forwarder.
     async fn forward_chat_stream(
         &self,
-        body: &serde_json::Value,
+        body: &crate::request::InferenceRequest,
         _on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<StreamEnded, AdapterError> {
         let _ = body;

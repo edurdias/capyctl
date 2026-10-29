@@ -83,14 +83,17 @@ impl Engine {
 
 #[async_trait::async_trait]
 impl ChatForward for Engine {
-    async fn forward_chat(&self, _body: &Value) -> Result<Value, AdapterError> {
+    async fn forward_chat(
+        &self,
+        _body: &capyctl_adapters::request::InferenceRequest,
+    ) -> Result<Value, AdapterError> {
         let content = self.run().await?;
         Ok(json!({"object": "chat.completion", "choices": [{"index": 0,
             "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}]}))
     }
     async fn forward_chat_stream_async(
         &self,
-        _body: &Value,
+        _body: &capyctl_adapters::request::InferenceRequest,
         sink: &mut dyn ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
         let content = self.run().await?;
