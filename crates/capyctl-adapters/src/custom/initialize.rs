@@ -205,7 +205,7 @@ async fn probe(adapter: &CustomAdapter, served: &str, budget: Duration) -> Resul
         "max_tokens": 8,
         "temperature": 0,
     });
-    match crate::forward::startup_probe(adapter, &body, budget).await {
+    match crate::forward::startup_probe(adapter, &body.into(), budget).await {
         None => Err("the chat probe outlasted the startup window".into()),
         Some(Err(e)) => Err(format!("the chat probe was not answered: {e}")),
         // ADR 0023 §6: a non-empty content or reasoning answers.

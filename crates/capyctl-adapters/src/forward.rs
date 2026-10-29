@@ -1,5 +1,6 @@
 //! Shared, bounded text-chat transport. Terminal success is not lifecycle or
 //! readiness evidence; cancellation and partial output never prove idle.
+use crate::request::{InferenceRequest, StrictValue};
 use crate::traits::{AdapterError, ChatSink, DeliveryFailed, StreamEnded};
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -524,7 +525,7 @@ impl ChatHttp {
     /// The callback path's collection, with the transport's own bounds (60 s
     /// between reads, 300 s overall), for callers that bound nothing
     /// themselves. The router uses [`ChatHttp::collect_observed`] instead.
-    pub(crate) async fn collect(&self, body: &Value) -> Result<Value, AdapterError> {
+    pub(crate) async fn collect(&self, body: &InferenceRequest) -> Result<Value, AdapterError> {
         tokio::time::timeout(
             Duration::from_secs(300),
             self.collect_observed(body, &mut NoObserver, Some(Duration::from_secs(60))),
@@ -539,25 +540,20 @@ impl ChatHttp {
     /// bound), instead of by a fixed wall-clock cap.
     pub(crate) async fn collect_observed(
         &self,
-        body: &Value,
+        body: &InferenceRequest,
         observer: &mut dyn ChatSink,
         read_idle: Option<Duration>,
     ) -> Result<Value, AdapterError> {
         let mut chunks = Vec::new();
-        // SPEC §10 (found live 2026-10-03): vLLM streams usage only when asked;
-        // the collected response must carry it as a non-streaming one does.
-        let mut body = body.clone();
-        if body.is_object() && body.get("stream_options").is_none_or(Value::is_null) {
-            body["stream_options"] = json!({"include_usage": true});
-        }
         let end = self
             .stream_inner(
-                &body,
+                body,
                 &mut Collecting {
                     chunks: &mut chunks,
                     observer,
                 },
                 read_idle,
+                Usage::Requested,
             )
             .await?;
         if end != StreamEnded::Completed {
@@ -565,6 +561,14 @@ impl ChatHttp {
         }
         assemble(chunks)
     }
+}
+
+/// Whether a forwarded stream asks the engine for usage when the caller did
+/// not say: a collected answer must carry it (SPEC §10).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Usage {
+    AsSent,
+    Requested,
 }
 
 /// Discards progress: the self-bounded collection path.
@@ -606,7 +610,7 @@ impl ChatSink for Collecting<'_> {
 /// when the budget passed first. Ordinary forwarding keeps its own bounds.
 pub(crate) async fn startup_probe(
     engine: &(dyn crate::traits::ChatForward + '_),
-    body: &Value,
+    body: &InferenceRequest,
     budget: Duration,
 ) -> Option<Result<Value, AdapterError>> {
     tokio::time::timeout(budget, engine.forward_chat_observed(body, &mut NoObserver))
@@ -760,7 +764,7 @@ impl ChatHttp {
     /// keep the transport's own: 60 s between reads and 300 s overall.
     pub(crate) async fn stream(
         &self,
-        body: &Value,
+        body: &InferenceRequest,
         on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<StreamEnded, AdapterError> {
         tokio::time::timeout(
@@ -769,6 +773,7 @@ impl ChatHttp {
                 body,
                 &mut CallbackSink(on_chunk),
                 Some(Duration::from_secs(60)),
+                Usage::AsSent,
             ),
         )
         .await
@@ -781,10 +786,10 @@ impl ChatHttp {
     /// uncertain (found live 2026-09-23, matrix M30 vLLM), so there is none.
     pub(crate) async fn stream_async(
         &self,
-        body: &Value,
+        body: &InferenceRequest,
         sink: &mut dyn ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
-        self.stream_inner(body, sink, None).await
+        self.stream_inner(body, sink, None, Usage::AsSent).await
     }
 
     /// Send one request to `url` and screen the answer's status: a connection
@@ -792,16 +797,21 @@ impl ChatHttp {
     /// (`NotAccepted`); an engine's complete invalid-request answer is
     /// `Rejected`, and its complete error answer is `EngineError`. Any other
     /// transport error is `unverified()`. The caller judges every other
-    /// response. `request_id` goes as [`CAPYCTL_REQUEST_ID_HEADER`] (ADR 0032
-    /// §2: to a host ingress only).
+    /// response. `body` is the encoded request ([`InferenceRequest::encode`]);
+    /// `request_id` goes as [`CAPYCTL_REQUEST_ID_HEADER`] (ADR 0032 §2: to a
+    /// host ingress only).
     async fn post(
         &self,
         url: &reqwest::Url,
-        request: &Value,
+        body: Vec<u8>,
         request_id: Option<&str>,
         unverified: fn() -> AdapterError,
     ) -> Result<reqwest::Response, AdapterError> {
-        let mut send = self.client.post(url.clone()).json(request);
+        let mut send = self
+            .client
+            .post(url.clone())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
         if let Some(key) = &self.key {
             send = send.bearer_auth(key);
         }
@@ -845,17 +855,20 @@ impl ChatHttp {
     /// a truncated, oversized, ambiguous or malformed body stays uncertain,
     /// since the engine may have run the request. No wall-clock bound of its
     /// own: the router bounds the whole exchange by the request deadline.
-    pub(crate) async fn decide(&self, body: &Value) -> Result<Value, AdapterError> {
+    pub(crate) async fn decide(&self, body: &InferenceRequest) -> Result<Value, AdapterError> {
         validate_decision_request(body)?;
         let public = body
             .get("model")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or(AdapterError::UnsupportedCapability)?;
-        let mut request = body.clone();
-        request["model"] = json!(self.model);
+        // Issue #220: the caller's questions go in the caller's order; SGLang
+        // numbers them in the prompt in that order.
+        let request = body
+            .encode(&[("model", &json!(self.model))])
+            .map_err(|_| AdapterError::UnsupportedCapability)?;
         let response = self
-            .post(&self.decisions, &request, None, decision_uncertain)
+            .post(&self.decisions, request, None, decision_uncertain)
             .await?;
         if !response.status().is_success() || !content_type_is(&response, "application/json") {
             return Err(decision_uncertain());
@@ -876,9 +889,10 @@ impl ChatHttp {
 
     async fn stream_inner(
         &self,
-        body: &Value,
+        body: &InferenceRequest,
         sink: &mut dyn ChatSink,
         read_idle: Option<Duration>,
+        usage: Usage,
     ) -> Result<StreamEnded, AdapterError> {
         // SPEC §10 / T21: engine-internal fields never reach the engine, and a
         // parameter the relay cannot answer faithfully is refused before
@@ -915,22 +929,37 @@ impl ChatHttp {
             RequestIdLane::Absent => None,
             RequestIdLane::Engine | RequestIdLane::Ingress => sink.request_id().map(str::to_owned),
         };
-        let mut request = body.clone();
-        request["model"] = json!(self.model);
-        request["stream"] = json!(true);
-        if let Some(effective) = effective {
-            request["cache_salt"] = json!(effective);
+        // Issue #220: the caller's members keep their order and bytes (the
+        // property order of a schema can matter); only these are set.
+        let model = json!(self.model);
+        let stream = json!(true);
+        let mut replace: Vec<(&str, &Value)> = vec![("model", &model), ("stream", &stream)];
+        let salt = effective.map(Value::String);
+        if let Some(salt) = &salt {
+            replace.push(("cache_salt", salt));
+        }
+        // SPEC §10 (found live 2026-10-03): vLLM streams usage only when asked;
+        // a collected response must carry it as a non-streaming one does.
+        let include_usage = json!({"include_usage": true});
+        if usage == Usage::Requested && body.get("stream_options").is_none_or(Value::is_null) {
+            replace.push(("stream_options", &include_usage));
+        }
+        let rid = match (self.request_ids, &request_id) {
+            (RequestIdLane::Engine, Some(id)) => Some(Value::String(id.clone())),
+            _ => None,
+        };
+        if let Some(rid) = &rid {
+            replace.push(("rid", rid));
         }
         let header = match (self.request_ids, &request_id) {
-            (RequestIdLane::Engine, Some(id)) => {
-                request["rid"] = json!(id);
-                None
-            }
             (RequestIdLane::Ingress, Some(id)) => Some(id.as_str()),
             _ => None,
         };
+        let request = body
+            .encode(&replace)
+            .map_err(|_| AdapterError::UnsupportedCapability)?;
         let response = self
-            .post(&self.endpoint, &request, header, uncertain)
+            .post(&self.endpoint, request, header, uncertain)
             .await?;
         if !response.status().is_success() || !content_type_is(&response, "text/event-stream") {
             return Err(uncertain());
@@ -1232,27 +1261,27 @@ struct EngineForward(ChatHttp);
 impl crate::traits::ChatForward for EngineForward {
     async fn forward_chat_stream_async(
         &self,
-        body: &Value,
+        body: &crate::request::InferenceRequest,
         sink: &mut dyn ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
         self.0.stream_async(body, sink).await
     }
-    async fn forward_chat(&self, body: &Value) -> Result<Value, AdapterError> {
+    async fn forward_chat(&self, body: &InferenceRequest) -> Result<Value, AdapterError> {
         self.0.collect(body).await
     }
     async fn forward_chat_observed(
         &self,
-        body: &Value,
+        body: &crate::request::InferenceRequest,
         observer: &mut dyn ChatSink,
     ) -> Result<Value, AdapterError> {
         self.0.collect_observed(body, observer, None).await
     }
-    async fn forward_decision(&self, body: &Value) -> Result<Value, AdapterError> {
+    async fn forward_decision(&self, body: &InferenceRequest) -> Result<Value, AdapterError> {
         self.0.decide(body).await
     }
     async fn forward_chat_stream(
         &self,
-        body: &Value,
+        body: &crate::request::InferenceRequest,
         on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<StreamEnded, AdapterError> {
         self.0.stream(body, on_chunk).await
@@ -1535,64 +1564,6 @@ fn fold_tool_calls(calls: &mut std::collections::BTreeMap<u64, Value>, deltas: &
     }
 }
 
-// serde_json::Value otherwise accepts duplicate keys with last-value-wins.
-// Identity and terminal fields must have one unambiguous interpretation.
-struct StrictValue(Value);
-impl<'de> serde::Deserialize<'de> for StrictValue {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = StrictValue;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("unambiguous JSON")
-            }
-            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
-                Ok(StrictValue(json!(v)))
-            }
-            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
-                Ok(StrictValue(json!(v)))
-            }
-            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
-                Ok(StrictValue(json!(v)))
-            }
-            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
-                Ok(StrictValue(json!(v)))
-            }
-            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                Ok(StrictValue(json!(v)))
-            }
-            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-                Ok(StrictValue(Value::Null))
-            }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut values = vec![];
-                while let Some(StrictValue(value)) = seq.next_element()? {
-                    values.push(value);
-                }
-                Ok(StrictValue(Value::Array(values)))
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut values = serde_json::Map::new();
-                while let Some((key, StrictValue(value))) =
-                    map.next_entry::<String, StrictValue>()?
-                {
-                    if values.insert(key, value).is_some() {
-                        return Err(serde::de::Error::custom("duplicate key"));
-                    }
-                }
-                Ok(StrictValue(Value::Object(values)))
-            }
-        }
-        deserializer.deserialize_any(Visitor)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{assemble, probe_answered, upstream};
@@ -1738,7 +1709,7 @@ mod tests {
             crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
         assert!(matches!(
-            forward.forward_chat(&request).await,
+            forward.forward_chat(&request.clone().into()).await,
             Err(AdapterError::NotAccepted(_))
         ));
         for body in [
@@ -1753,7 +1724,7 @@ mod tests {
                 crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
             );
             assert!(matches!(
-                forward.forward_chat(&request).await,
+                forward.forward_chat(&request.clone().into()).await,
                 Err(AdapterError::Uncertain(_))
             ));
         }
@@ -1765,7 +1736,7 @@ mod tests {
             crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
         assert!(matches!(
-            forward.forward_chat(&request).await,
+            forward.forward_chat(&request.clone().into()).await,
             Err(AdapterError::EngineError { status: 500, .. })
         ));
     }
@@ -1804,7 +1775,7 @@ mod tests {
                 None,
                 crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
             );
-            match forward.forward_chat(&request).await {
+            match forward.forward_chat(&request.clone().into()).await {
                 Err(AdapterError::Rejected {
                     status: got,
                     message,
@@ -1822,7 +1793,7 @@ mod tests {
             None,
             crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
-        match forward.forward_chat(&request).await {
+        match forward.forward_chat(&request.clone().into()).await {
             Err(AdapterError::Rejected { message, .. }) => {
                 assert!(message.len() <= 512, "{}", message.len())
             }
@@ -1841,7 +1812,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                    forward.forward_chat(&request).await,
+                    forward.forward_chat(&request.clone().into()).await,
                     Err(AdapterError::Uncertain(_))
                 ),
                 "status {status}"
@@ -1908,12 +1879,15 @@ mod tests {
             );
             let mut relayed = Vec::new();
             for result in [
-                forward.forward_chat(&chat).await.map(|_| ()),
+                forward.forward_chat(&chat.clone().into()).await.map(|_| ()),
                 forward
-                    .forward_chat_stream(&chat, &mut |chunk| relayed.push(chunk))
+                    .forward_chat_stream(&chat.clone().into(), &mut |chunk| relayed.push(chunk))
                     .await
                     .map(|_| ()),
-                forward.forward_decision(&decision).await.map(|_| ()),
+                forward
+                    .forward_decision(&decision.clone().into())
+                    .await
+                    .map(|_| ()),
             ] {
                 match result {
                     Err(AdapterError::EngineError {
@@ -1935,7 +1909,7 @@ mod tests {
             None,
             crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
-        match forward.forward_chat(&chat).await {
+        match forward.forward_chat(&chat.clone().into()).await {
             Err(AdapterError::EngineError { message, .. }) => {
                 assert!(message.len() <= 512, "{}", message.len())
             }
@@ -1961,8 +1935,11 @@ mod tests {
                 crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
             );
             for result in [
-                forward.forward_chat(&chat).await.map(|_| ()),
-                forward.forward_decision(&decision).await.map(|_| ()),
+                forward.forward_chat(&chat.clone().into()).await.map(|_| ()),
+                forward
+                    .forward_decision(&decision.clone().into())
+                    .await
+                    .map(|_| ()),
             ] {
                 assert!(
                     matches!(result, Err(AdapterError::Uncertain(_))),
@@ -1988,7 +1965,7 @@ mod tests {
             crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
         assert!(matches!(
-            forward.forward_chat(&request).await,
+            forward.forward_chat(&request.clone().into()).await,
             Err(AdapterError::NotAccepted(_))
         ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2008,7 +1985,7 @@ mod tests {
             crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
         assert!(matches!(
-            forward.forward_chat(&request).await,
+            forward.forward_chat(&request.clone().into()).await,
             Err(AdapterError::Uncertain(_))
         ));
     }
@@ -2058,7 +2035,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                    forward.forward_chat(&body).await,
+                    forward.forward_chat(&body.clone().into()).await,
                     Err(AdapterError::PolicyDenied)
                 ),
                 "{field}"
@@ -2130,7 +2107,7 @@ mod tests {
             crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
         let request = serde_json::json!({"model":"public","messages":[]});
-        let response = forward.forward_chat(&request).await.unwrap();
+        let response = forward.forward_chat(&request.clone().into()).await.unwrap();
         assert_eq!(response["usage"]["total_tokens"], 4, "{response}");
         assert_eq!(response["choices"][0]["message"]["content"], "hi");
         assert!(response.get("prompt_text").is_none(), "{response}");
@@ -2140,7 +2117,7 @@ mod tests {
         // A streaming caller's own stream options are relayed as sent.
         let mut relayed = Vec::new();
         forward
-            .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
+            .forward_chat_stream(&request.clone().into(), &mut |chunk| relayed.push(chunk))
             .await
             .unwrap();
         let sent = seen.lock().unwrap()[1].clone();
@@ -2175,7 +2152,7 @@ mod tests {
             "parameters":{"type":"object"}}}]);
         let request = serde_json::json!({"model":"public","messages":[],"tools":tools,
             "tool_choice":"auto","parallel_tool_calls":false});
-        let response = forward.forward_chat(&request).await.unwrap();
+        let response = forward.forward_chat(&request.clone().into()).await.unwrap();
         let message = &response["choices"][0]["message"];
         assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(message["content"], serde_json::Value::Null);
@@ -2189,7 +2166,7 @@ mod tests {
         assert_eq!(sent["tool_choice"], "auto");
         let mut relayed = Vec::new();
         let end = forward
-            .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
+            .forward_chat_stream(&request.clone().into(), &mut |chunk| relayed.push(chunk))
             .await
             .unwrap();
         assert_eq!(end, crate::traits::StreamEnded::Completed);
@@ -2230,12 +2207,12 @@ mod tests {
             "tool_choice":{"type":"function","function":{"name":"get_weather"}}});
         let mut relayed = Vec::new();
         let end = forward
-            .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
+            .forward_chat_stream(&request.clone().into(), &mut |chunk| relayed.push(chunk))
             .await
             .unwrap();
         assert_eq!(end, crate::traits::StreamEnded::Completed);
         assert_eq!(relayed.len(), 4);
-        let response = forward.forward_chat(&request).await.unwrap();
+        let response = forward.forward_chat(&request.clone().into()).await.unwrap();
         assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(
             response["choices"][0]["message"]["tool_calls"],
@@ -2268,7 +2245,7 @@ mod tests {
             "stream_options":{"include_usage":true}});
         let mut relayed = Vec::new();
         let end = forward
-            .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
+            .forward_chat_stream(&request.clone().into(), &mut |chunk| relayed.push(chunk))
             .await;
         (end, relayed)
     }
@@ -2429,7 +2406,7 @@ mod tests {
             None,
             crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
-        match forward.forward_chat(&request).await {
+        match forward.forward_chat(&request.clone().into()).await {
             Err(AdapterError::Rejected { status, message }) => {
                 assert_eq!(status, 400);
                 assert!(
@@ -2441,7 +2418,7 @@ mod tests {
         }
         let mut relayed = Vec::new();
         let streamed = forward
-            .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
+            .forward_chat_stream(&request.clone().into(), &mut |chunk| relayed.push(chunk))
             .await;
         assert!(
             matches!(streamed, Err(AdapterError::Rejected { status: 400, .. })),
@@ -2467,7 +2444,7 @@ mod tests {
                 None,
                 crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
             );
-            let result = forward.forward_chat(&request).await;
+            let result = forward.forward_chat(&request.clone().into()).await;
             assert!(
                 matches!(result, Err(AdapterError::Uncertain(_))),
                 "{:?}",
@@ -2484,7 +2461,7 @@ mod tests {
         );
         let mut relayed = Vec::new();
         let streamed = forward
-            .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
+            .forward_chat_stream(&request.clone().into(), &mut |chunk| relayed.push(chunk))
             .await;
         assert!(
             matches!(streamed, Err(AdapterError::EngineError { status: 500, .. })),
@@ -2519,7 +2496,7 @@ mod tests {
                 crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
             );
             let result = forward
-                .forward_chat(&serde_json::json!({"model":"p","messages":[]}))
+                .forward_chat(&serde_json::json!({"model":"p","messages":[]}).into())
                 .await;
             assert!(matches!(result, Err(AdapterError::Uncertain(_))), "{bad}");
         }
@@ -2559,7 +2536,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                    forward.forward_chat(&body).await,
+                    forward.forward_chat(&body.clone().into()).await,
                     Err(AdapterError::UnsupportedCapability)
                 ),
                 "{field}"
@@ -2773,7 +2750,7 @@ mod tests {
         let request = json!({"model":"public","messages":[]});
         let mut sink = Counting::default();
         let end = forward
-            .forward_chat_stream_async(&request, &mut sink)
+            .forward_chat_stream_async(&request.clone().into(), &mut sink)
             .await
             .unwrap();
         assert_eq!(end, crate::traits::StreamEnded::Completed);
@@ -2782,7 +2759,7 @@ mod tests {
         assert_eq!(sink.progressed, 3);
         let mut observer = Counting::default();
         let response = forward
-            .forward_chat_observed(&request, &mut observer)
+            .forward_chat_observed(&request.clone().into(), &mut observer)
             .await
             .unwrap();
         assert_eq!(response["choices"][0]["message"]["content"], "hi");
@@ -2886,18 +2863,20 @@ mod tests {
         );
         let request = json!({"model":"m","messages":[],"cache_salt":"tenant-a"});
         assert!(matches!(
-            forward.forward_chat(&request).await,
+            forward.forward_chat(&request.clone().into()).await,
             Err(AdapterError::CacheSaltUnsupported)
         ));
         let mut chunks = |_chunk: String| {};
         assert!(matches!(
-            forward.forward_chat_stream(&request, &mut chunks).await,
+            forward
+                .forward_chat_stream(&request.clone().into(), &mut chunks)
+                .await,
             Err(AdapterError::CacheSaltUnsupported)
         ));
         // Without the field the same forwarder sends (and here fails to connect).
         let plain = json!({"model":"m","messages":[]});
         assert!(!matches!(
-            forward.forward_chat(&plain).await,
+            forward.forward_chat(&plain.clone().into()).await,
             Err(AdapterError::CacheSaltUnsupported)
         ));
     }
@@ -3093,16 +3072,16 @@ mod tests {
             );
             let mut sink = Carrying { id, chunks: vec![] };
             let end = forward
-                .forward_chat_stream_async(&request, &mut sink)
+                .forward_chat_stream_async(&request.clone().into(), &mut sink)
                 .await
                 .unwrap();
             assert_eq!(end, crate::traits::StreamEnded::Completed, "{lane:?}");
             let mut observer = Carrying { id, chunks: vec![] };
             forward
-                .forward_chat_observed(&request, &mut observer)
+                .forward_chat_observed(&request.clone().into(), &mut observer)
                 .await
                 .unwrap();
-            let _ = forward.forward_decision(&decision(json!({}))).await;
+            let _ = forward.forward_decision(&decision(json!({})).into()).await;
             let seen = seen.lock().unwrap().clone();
             assert_eq!(seen.len(), 3, "{lane:?}");
             for (route, body, sent) in &seen[..2] {
@@ -3129,7 +3108,9 @@ mod tests {
         };
         let caller = json!({"model":"public","messages":[],"rid":"mine"});
         assert!(matches!(
-            forward.forward_chat_stream_async(&caller, &mut sink).await,
+            forward
+                .forward_chat_stream_async(&caller.clone().into(), &mut sink)
+                .await,
             Err(AdapterError::PolicyDenied)
         ));
         assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
@@ -3159,7 +3140,7 @@ mod tests {
         };
         assert_eq!(
             forward
-                .forward_chat_stream_async(&request, &mut sink)
+                .forward_chat_stream_async(&request.clone().into(), &mut sink)
                 .await
                 .unwrap(),
             crate::traits::StreamEnded::Completed
@@ -3169,7 +3150,7 @@ mod tests {
             chunks: vec![],
         };
         let answer = forward
-            .forward_chat_observed(&request, &mut observer)
+            .forward_chat_observed(&request.clone().into(), &mut observer)
             .await
             .unwrap();
         assert_eq!(answer["choices"][0]["finish_reason"], "abort");
@@ -3189,7 +3170,9 @@ mod tests {
             let mut sink = Carrying { id, chunks: vec![] };
             assert!(
                 matches!(
-                    forward.forward_chat_stream_async(&request, &mut sink).await,
+                    forward
+                        .forward_chat_stream_async(&request.clone().into(), &mut sink)
+                        .await,
                     Err(AdapterError::Uncertain(_))
                 ),
                 "{lane:?}"
@@ -3227,7 +3210,9 @@ mod tests {
                 chunks: vec![],
             };
             assert!(matches!(
-                forward.forward_chat_stream_async(&request, &mut sink).await,
+                forward
+                    .forward_chat_stream_async(&request.clone().into(), &mut sink)
+                    .await,
                 Err(AdapterError::Uncertain(_))
             ));
         }

@@ -543,7 +543,9 @@ async fn the_key_is_rendered_and_sent_on_every_request() {
     );
     assert!(!format!("{spawned:?}").contains(KEY));
     let answer = engine
-        .forward_chat(&json!({"model": "basal", "messages": [{"role": "user", "content": "hi"}]}))
+        .forward_chat(
+            &json!({"model": "basal", "messages": [{"role": "user", "content": "hi"}]}).into(),
+        )
         .await
         .unwrap();
     assert_eq!(answer["choices"][0]["message"]["content"], "Ready.");
@@ -775,13 +777,16 @@ async fn cache_salt_is_refused_and_a_4xx_is_rejected() {
     let request = json!({"model": "public", "messages": [{"role": "user", "content": "hi"}],
         "cache_salt": "tenant-a"});
     assert_eq!(
-        engine.forward_chat(&request).await.unwrap_err(),
+        engine
+            .forward_chat(&request.clone().into())
+            .await
+            .unwrap_err(),
         AdapterError::CacheSaltUnsupported
     );
     assert_eq!(stub.chats.load(SeqCst), 0);
     // basal answers 422 for every failure: relayed as a rejection.
     let refused = engine
-        .forward_decision(&capyctl_adapters::decision_probe::request("public"))
+        .forward_decision(&capyctl_adapters::decision_probe::request("public").into())
         .await
         .unwrap_err();
     assert!(

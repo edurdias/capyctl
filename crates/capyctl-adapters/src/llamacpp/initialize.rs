@@ -141,7 +141,7 @@ pub(super) async fn initialize(
             "max_tokens": 8,
             "temperature": 0,
         });
-        let answer = crate::forward::startup_probe(adapter, &body, budget)
+        let answer = crate::forward::startup_probe(adapter, &body.into(), budget)
             .await
             .ok_or_else(|| {
                 RuntimeError::Uncertain("probe deadline reached with the engine alive".into())

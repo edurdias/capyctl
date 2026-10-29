@@ -683,19 +683,24 @@ async fn cache_salt_is_refused_for_llamacpp() {
     let request = json!({"model": "public", "messages": [{"role": "user", "content": "hi"}],
         "cache_salt": "tenant-a"});
     assert_eq!(
-        engine.forward_chat(&request).await.unwrap_err(),
+        engine
+            .forward_chat(&request.clone().into())
+            .await
+            .unwrap_err(),
         AdapterError::CacheSaltUnsupported
     );
     let mut sink = Collect::default();
     assert!(matches!(
-        engine.forward_chat_stream_async(&request, &mut sink).await,
+        engine
+            .forward_chat_stream_async(&request.clone().into(), &mut sink)
+            .await,
         Err(AdapterError::CacheSaltUnsupported)
     ));
     assert_eq!(stub.chats.load(Ordering::SeqCst), 0);
     // Without it the request reaches the engine under the served name.
     let mut plain = request.clone();
     plain.as_object_mut().unwrap().remove("cache_salt");
-    let answer = engine.forward_chat(&plain).await.unwrap();
+    let answer = engine.forward_chat(&plain.clone().into()).await.unwrap();
     assert_eq!(answer["choices"][0]["message"]["content"], "Ready.");
     assert_eq!(stub.chats.load(Ordering::SeqCst), 1);
 }
@@ -768,7 +773,7 @@ async fn sse_pings_are_not_progress() {
     let mut sink = Collect::default();
     let ended = engine
         .forward_chat_stream_async(
-            &json!({"model": "public", "messages": [{"role": "user", "content": "hi"}]}),
+            &json!({"model": "public", "messages": [{"role": "user", "content": "hi"}]}).into(),
             &mut sink,
         )
         .await
@@ -847,7 +852,8 @@ async fn a_hang_up_is_quiescent_once_the_gauges_read_zero() {
         hang_up: Some(hang_up.clone()),
         ..Collect::default()
     };
-    let request = json!({"model": "public", "messages": [{"role": "user", "content": "hi"}]});
+    let request: capyctl_adapters::request::InferenceRequest =
+        json!({"model": "public", "messages": [{"role": "user", "content": "hi"}]}).into();
     // While the stream runs, the engine is busy; then the client hangs up.
     let watcher = async {
         while processing.load(SeqCst) == 0 {

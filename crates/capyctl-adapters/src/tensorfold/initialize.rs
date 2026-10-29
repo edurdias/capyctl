@@ -164,7 +164,7 @@ pub(super) async fn initialize(
     // ADR 0023 §4: the probe is part of startup, so the startup bound (the warm
     // bound, or the whole deadline on a first build) is its only bound.
     let budget = Duration::from_millis(u64::try_from(stop_at - now_ms()?).unwrap_or(0));
-    let answer = crate::forward::startup_probe(adapter, &body, budget)
+    let answer = crate::forward::startup_probe(adapter, &body.into(), budget)
         .await
         .ok_or_else(|| {
             RuntimeError::Uncertain("probe deadline reached with the engine alive".into())

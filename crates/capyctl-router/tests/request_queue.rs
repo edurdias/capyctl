@@ -183,7 +183,10 @@ struct Engine {
 
 #[async_trait::async_trait]
 impl ChatForward for Engine {
-    async fn forward_chat(&self, _body: &Value) -> Result<Value, AdapterError> {
+    async fn forward_chat(
+        &self,
+        _body: &capyctl_adapters::request::InferenceRequest,
+    ) -> Result<Value, AdapterError> {
         self.served.fetch_add(1, Ordering::SeqCst);
         Ok(json!({"object": "chat.completion", "choices": [{"index": 0,
             "message": {"role": "assistant", "content": "b"}, "finish_reason": "stop"}]}))

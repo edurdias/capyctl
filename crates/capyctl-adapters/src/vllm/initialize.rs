@@ -403,7 +403,7 @@ async fn launch(
             "max_tokens": 8,
             "temperature": 0,
         });
-        let answer = crate::forward::startup_probe(adapter, &body, probe_budget)
+        let answer = crate::forward::startup_probe(adapter, &body.into(), probe_budget)
             .await
             .ok_or_else(|| {
                 failed(RuntimeError::Uncertain(

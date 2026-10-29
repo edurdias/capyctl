@@ -35,14 +35,17 @@ struct Scripted {
 
 #[async_trait]
 impl ChatForward for Scripted {
-    async fn forward_chat(&self, _body: &Value) -> Result<Value, AdapterError> {
+    async fn forward_chat(
+        &self,
+        _body: &capyctl_adapters::request::InferenceRequest,
+    ) -> Result<Value, AdapterError> {
         Ok(self.whole.clone())
     }
 
     /// As a collecting forwarder does: every chunk is lent as it arrives.
     async fn forward_chat_observed(
         &self,
-        _body: &Value,
+        _body: &capyctl_adapters::request::InferenceRequest,
         observer: &mut dyn ChatSink,
     ) -> Result<Value, AdapterError> {
         for chunk in &self.chunks {
@@ -55,7 +58,7 @@ impl ChatForward for Scripted {
 
     async fn forward_chat_stream_async(
         &self,
-        _body: &Value,
+        _body: &capyctl_adapters::request::InferenceRequest,
         sink: &mut dyn ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
         for chunk in &self.chunks {

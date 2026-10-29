@@ -564,7 +564,7 @@ impl EngineAdapter for FakeEngine {
 impl capyctl_adapters::traits::ChatForward for FakeEngine {
     async fn forward_chat_stream_async(
         &self,
-        body: &serde_json::Value,
+        body: &capyctl_adapters::request::InferenceRequest,
         sink: &mut dyn capyctl_adapters::traits::ChatSink,
     ) -> Result<capyctl_adapters::traits::StreamEnded, AdapterError> {
         self.chat()?;
@@ -589,13 +589,13 @@ impl capyctl_adapters::traits::ChatForward for FakeEngine {
     /// as the engine would (a chat model has no such endpoint).
     async fn forward_decision(
         &self,
-        body: &serde_json::Value,
+        body: &capyctl_adapters::request::InferenceRequest,
     ) -> Result<serde_json::Value, AdapterError> {
         self.decision_response(body)
     }
     async fn forward_chat(
         &self,
-        body: &serde_json::Value,
+        body: &capyctl_adapters::request::InferenceRequest,
     ) -> Result<serde_json::Value, AdapterError> {
         self.chat()?;
         if let Some(state) = self.lifecycle.lock().unwrap().as_mut() {
@@ -611,7 +611,7 @@ impl capyctl_adapters::traits::ChatForward for FakeEngine {
 
     async fn forward_chat_stream(
         &self,
-        body: &serde_json::Value,
+        body: &capyctl_adapters::request::InferenceRequest,
         on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<capyctl_adapters::traits::StreamEnded, AdapterError> {
         self.chat()?;

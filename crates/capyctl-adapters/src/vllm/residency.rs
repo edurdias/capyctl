@@ -237,7 +237,7 @@ async fn step(
                     "max_tokens": 8,
                     "temperature": 0,
                 });
-                let answer = crate::traits::ChatForward::forward_chat(adapter, &body)
+                let answer = crate::traits::ChatForward::forward_chat(adapter, &body.into())
                     .await
                     .map_err(|e| {
                         RuntimeError::Uncertain(crate::vllm::args::redact_text(&format!(

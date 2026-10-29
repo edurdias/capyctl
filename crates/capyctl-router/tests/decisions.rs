@@ -210,18 +210,30 @@ enum Reply {
 type Seen = Arc<Mutex<Vec<(String, String, Value)>>>;
 
 async fn engine(reply: Reply) -> (String, Seen) {
+    let (base, seen, _) = engine_with_bodies(reply).await;
+    (base, seen)
+}
+
+/// As [`engine`], also keeping each request body as the engine received it.
+async fn engine_with_bodies(reply: Reply) -> (String, Seen, Arc<Mutex<Vec<String>>>) {
     let seen: Seen = Arc::default();
+    let bodies: Arc<Mutex<Vec<String>>> = Arc::default();
     let recorded = seen.clone();
+    let kept = bodies.clone();
     let app = axum::Router::new().fallback(
         move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: axum::body::Bytes| {
             let reply = reply.clone();
             let recorded = recorded.clone();
+            let kept = kept.clone();
             async move {
                 let authorization = headers
                     .get("authorization")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or_default()
                     .to_owned();
+                kept.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&body).into_owned());
                 recorded.lock().unwrap().push((
                     uri.path().to_owned(),
                     authorization,
@@ -255,7 +267,7 @@ async fn engine(reply: Reply) -> (String, Seen) {
     let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", socket.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
-    (base, seen)
+    (base, seen, bodies)
 }
 
 /// llama.cpp v0.7.0's answer for a decision model (observed live 2026-10-17).
@@ -443,6 +455,70 @@ async fn a_decision_is_admitted_forwarded_and_settled_like_chat() {
         "already serving"
     );
     assert_eq!(authority.ends(), vec![Some(LeaseEnd::Completed); 2]);
+}
+
+// T43 T19 (issue #220): the engine receives the caller's bytes with only
+// what CapyCTL sets written anew. A decision's questions keep the caller's
+// order (SGLang numbers them in its prompt in that order), and so does the
+// property order of a chat request's JSON schema. A body with a duplicated
+// key is refused before anything activates or is sent.
+#[tokio::test]
+async fn the_engine_receives_the_callers_key_order() {
+    let served = |sent: &str| {
+        sent.replace(
+            &format!(r#""model":"{ROUTE}""#),
+            &format!(r#""model":"{SERVED}""#),
+        )
+    };
+    let (endpoint, _, bodies) =
+        engine_with_bodies(Reply::Answer(200, "application/json", answer().to_string())).await;
+    let (authority, _deps, router) = stack(DeploymentApi::Decisions, &endpoint);
+    let decision = format!(
+        r#"{{"state":"Patient, 35, mild headache.","model":"{ROUTE}","questions":{{"urgency":{{"type":"score","instructions":"Triage urgency","criteria":["self-care","routine","urgent"]}},"cause":{{"type":"choice","instructions":"Most likely cause","criteria":{{"tension":null,"caffeine":null}}}},"doctor":{{"type":"noul","instructions":"See a doctor this week?"}}}}}}"#
+    );
+    let (status, body) = send(&router, "/v1/systemone", decision.clone().into_bytes()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(*bodies.lock().unwrap(), [served(&decision)]);
+
+    let duplicated = format!(
+        r#"{{"model":"{ROUTE}","state":"s","questions":{{"q":{{"type":"noul","type":"choice"}}}}}}"#
+    );
+    let (status, body) = send(&router, "/v1/systemone", duplicated.into_bytes()).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "invalid_request", "{body}");
+    assert_eq!(bodies.lock().unwrap().len(), 1, "nothing more was sent");
+    assert_eq!(authority.ends(), vec![Some(LeaseEnd::Completed)]);
+
+    let chunk = |delta: Value, finish: Value| {
+        format!(
+            "data: {}\n\n",
+            json!({"id": "c", "object": "chat.completion.chunk", "created": 1, "model": SERVED,
+                   "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+        )
+    };
+    let sse = [
+        chunk(json!({"role": "assistant", "content": "{}"}), Value::Null),
+        chunk(json!({}), json!("stop")),
+        "data: [DONE]\n\n".to_owned(),
+    ]
+    .concat();
+    let (endpoint, _, bodies) =
+        engine_with_bodies(Reply::Answer(200, "text/event-stream", sse)).await;
+    let (_, _deps, router) = stack(DeploymentApi::Chat, &endpoint);
+    let chat = format!(
+        r#"{{"messages":[{{"role":"user","content":"hi"}}],"model":"{ROUTE}","response_format":{{"type":"json_schema","json_schema":{{"name":"t","schema":{{"type":"object","properties":{{"zeta":{{"type":"string"}},"alpha":{{"type":"string"}}}},"required":["zeta","alpha"]}}}}}}}}"#
+    );
+    let (status, body) = send(&router, "/v1/chat/completions", chat.clone().into_bytes()).await;
+    assert_eq!(status, 200, "{body}");
+    // The caller's members first, as sent; what the collection adds follows.
+    let forwarded = bodies.lock().unwrap()[0].clone();
+    let caller = served(&chat);
+    assert!(
+        forwarded.starts_with(&caller[..caller.len() - 1]),
+        "{forwarded}"
+    );
+    let forwarded: Value = serde_json::from_str(&forwarded).unwrap();
+    assert_eq!(forwarded["stream"], true, "{forwarded}");
 }
 
 // T43 (ADR 0030 §2, SPEC §10): a request outside the decision contract is a

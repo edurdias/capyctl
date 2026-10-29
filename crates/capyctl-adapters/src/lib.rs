@@ -25,6 +25,8 @@ pub mod owner_only;
 pub mod policy;
 pub mod protected;
 pub mod resolve;
+// SPEC §10 (issue #220): an inference request as the caller sent it.
+pub mod request;
 pub mod sglang;
 // SPEC §13.2 / T20: the once-only guard of a launch's residency steps.
 pub(crate) mod step_fence;

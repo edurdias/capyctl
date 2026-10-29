@@ -2644,7 +2644,7 @@ async fn fresh_probe(
     });
     let answer = tokio::time::timeout(
         remaining().min(PROBE_CHAT_TIMEOUT),
-        engine.forward_chat(&body),
+        engine.forward_chat(&body.into()),
     )
     .await
     .map_err(|_| SessionError)?

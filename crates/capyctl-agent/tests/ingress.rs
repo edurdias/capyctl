@@ -906,14 +906,20 @@ async fn the_capyctl_request_id_becomes_rid_only_on_a_capable_chat_launch() {
     type Seen = Arc<Mutex<Vec<(String, axum::http::HeaderMap, serde_json::Value)>>>;
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
     let recorded = seen.clone();
+    let raw: Arc<Mutex<Vec<String>>> = Arc::default();
+    let kept = raw.clone();
     let native = Router::new().fallback(move |request: Request<Body>| {
         let seen = recorded.clone();
+        let kept = kept.clone();
         async move {
             let path = request.uri().path().to_owned();
             let headers = request.headers().clone();
             let body = axum::body::to_bytes(request.into_body(), 1 << 20)
                 .await
                 .unwrap();
+            kept.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&body).into_owned());
             let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
             seen.lock().unwrap().push((path.clone(), headers, value));
             let answer = if path == "/v1/systemone" {
@@ -1060,6 +1066,33 @@ async fn the_capyctl_request_id_becomes_rid_only_on_a_capable_chat_launch() {
         );
     }
     assert!(take().is_empty());
+    // Issue #220: the router's bytes reach the engine as sent, nested key
+    // order included, with `rid` added after them; a duplicated key is
+    // refused before the engine is reached.
+    raw.lock().unwrap().clear();
+    let sent = r#"{"model":"model","stream":true,"messages":[],"response_format":{"type":"json_schema","json_schema":{"name":"t","schema":{"properties":{"zeta":{},"alpha":{}}}}}}"#;
+    let send_raw = |text: &'static str| async move {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/chat/completions"))
+            .bearer_auth(hex::encode([1u8; 32]))
+            .header("x-capyctl-request-id", ID)
+            .header("content-type", "application/json")
+            .body(text)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+    assert_eq!(send_raw(sent).await, StatusCode::OK);
+    assert_eq!(
+        *raw.lock().unwrap(),
+        [format!(r#"{},"rid":"{ID}"}}"#, &sent[..sent.len() - 1])]
+    );
+    assert_eq!(
+        send_raw(r#"{"model":"model","messages":[],"messages":[]}"#).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(raw.lock().unwrap().len(), 1, "nothing more was sent");
     task.abort();
     native_task.abort();
 }

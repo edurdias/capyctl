@@ -33,7 +33,7 @@ struct DelayedEngine {
 impl ChatForward for DelayedEngine {
     async fn forward_chat(
         &self,
-        _body: &serde_json::Value,
+        _body: &capyctl_adapters::request::InferenceRequest,
     ) -> Result<serde_json::Value, AdapterError> {
         tokio::time::sleep(self.first + self.content + self.tail).await;
         Ok(serde_json::json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}))
@@ -41,7 +41,7 @@ impl ChatForward for DelayedEngine {
 
     async fn forward_chat_stream_async(
         &self,
-        _body: &serde_json::Value,
+        _body: &capyctl_adapters::request::InferenceRequest,
         sink: &mut dyn ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
         tokio::time::sleep(self.first).await;

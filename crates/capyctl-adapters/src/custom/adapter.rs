@@ -305,7 +305,7 @@ impl EngineAdapter for CustomAdapter {
 impl ChatForward for CustomAdapter {
     async fn forward_chat_stream_async(
         &self,
-        body: &serde_json::Value,
+        body: &crate::request::InferenceRequest,
         sink: &mut dyn ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
         self.forward.forward_chat_stream_async(body, sink).await
@@ -313,14 +313,14 @@ impl ChatForward for CustomAdapter {
 
     async fn forward_chat(
         &self,
-        body: &serde_json::Value,
+        body: &crate::request::InferenceRequest,
     ) -> Result<serde_json::Value, AdapterError> {
         self.forward.forward_chat(body).await
     }
 
     async fn forward_chat_observed(
         &self,
-        body: &serde_json::Value,
+        body: &crate::request::InferenceRequest,
         observer: &mut dyn ChatSink,
     ) -> Result<serde_json::Value, AdapterError> {
         self.forward.forward_chat_observed(body, observer).await
@@ -328,14 +328,14 @@ impl ChatForward for CustomAdapter {
 
     async fn forward_decision(
         &self,
-        body: &serde_json::Value,
+        body: &crate::request::InferenceRequest,
     ) -> Result<serde_json::Value, AdapterError> {
         self.forward.forward_decision(body).await
     }
 
     async fn forward_chat_stream(
         &self,
-        body: &serde_json::Value,
+        body: &crate::request::InferenceRequest,
         on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<StreamEnded, AdapterError> {
         self.forward.forward_chat_stream(body, on_chunk).await
