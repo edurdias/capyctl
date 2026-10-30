@@ -100,8 +100,8 @@ pub fn park_policy(effective: &EffectiveDeployment) -> ParkPolicy {
 /// request and KV cache are per GPU there, and the stated total is the
 /// smallest chosen card's.
 ///
-/// #225 (amends ADR 0019 §4's "at least 0.75"): a request CapyCTL derived
-/// keeps the floor ([`DEVICE_UTILIZATION_FLOOR_PCT`]); a request the
+/// ADR 0019 amendment of 2026-10-30 (proposed, #225): a request CapyCTL
+/// derived keeps the floor ([`DEVICE_UTILIZATION_FLOOR_PCT`]); a request the
 /// deployment declares is the card memory it may use, so vLLM is told its
 /// share and nothing more. With the floor, vLLM's start check asked for 75 %
 /// of the card free whatever the request, so a declared request below that

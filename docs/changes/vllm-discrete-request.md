@@ -31,7 +31,8 @@ is "the GPU memory it may use".
 Design decision for the owner: this amends ADR 0019 §4 ("vLLM renders
 `--gpu-memory-utilization` as the device request's share of the card ...
 between 0.75 and 0.99"): the 0.75 lower bound now applies only to a request
-CapyCTL derived. Admission and accounting do not change (a declared request
+CapyCTL derived, recorded as ADR 0019's proposed amendment of 2026-10-30.
+Admission and accounting do not change (a declared request
 was already charged as declared). The issue's other request, sizing a derived
 vLLM request from weights + KV + overheads without the floor, was not done:
 the floor guards a start failure whose cause is unknown, and dropping it for
@@ -79,4 +80,8 @@ floor is still needed.
   start beside another model. vLLM is now told the stated request's share of
   the card. To run two models on one large card, state the vLLM model's
   request from its measured peak (`startup.measured` in `capyctl status
-  deployment <name> --json`, less 1.25 GiB for the CUDA context).
+  deployment <name> --json`, less 1.25 GiB for the CUDA context). On
+  upgrade, a vLLM deployment already accepted with a stated request below
+  75 % of its card is told that smaller share at its next start; if the
+  model needs more it fails to start (`launch_failed`), and raising
+  `engine_config.memory.request` fixes it.

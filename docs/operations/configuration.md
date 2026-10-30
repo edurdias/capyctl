@@ -227,8 +227,10 @@ bytes either way. A deployment that states `engine_config.memory.request`
 gets exactly that request's share, with no floor, so vLLM's start check asks
 only for that much of the card to be free and another model can run beside
 it. State it from the startup peak measured on the card
-(`startup.measured`, less 1.25 GiB for the CUDA context); it must hold at
-least the weights × 1.10 plus the KV cache. Unified-memory machines are
+(`startup.measured`, less 1.25 GiB for the CUDA context). A request smaller
+than the weights plus the KV cache is refused; leave room for the engine's
+own memory beside them, the weights × 1.10 plus the KV cache as CapyCTL sizes
+it. Unified-memory machines are
 unchanged: vLLM gets a low fixed `--gpu-memory-utilization` there and the KV
 cache in bytes.
 

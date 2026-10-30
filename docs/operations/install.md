@@ -572,9 +572,11 @@ does not size it; on a large card it holds far more than the model uses (the
 request on a 96 GB card is 71.7 GiB). To take the floor off, state
 `engine_config.memory.request` yourself, for example from the startup peak
 CapyCTL measured on the card (`startup.measured` in `capyctl status deployment
-<name> --json`) less 1.25 GiB for the CUDA context, and at least the weights
-× 1.10 plus the KV cache: the card is then charged that request and vLLM is
-told its share of the card, so another model can start beside it. Below about
+<name> --json`) less 1.25 GiB for the CUDA context. A request smaller than
+the weights plus the KV cache is refused; the weights × 1.10 plus the KV
+cache, as CapyCTL sizes it, leaves room for the engine's own memory. The card
+is then charged that request and vLLM is told its share of the card, so
+another model can start beside it. Below about
 0.75 of a small card, check that the model still starts. With the floor and
 the CUDA context, a vLLM deployment that states no
 request needs a card of about 10 GiB or more. On a smaller card the host still

@@ -152,7 +152,8 @@ a discrete host must name the system domain too, or they are refused
   is taken before the host journal lock is acquired, never while holding it. A co-residence
   check covers every domain.
 - **Engine sizing.** vLLM renders `--gpu-memory-utilization` as the device request's share
-  of the card, rounded up to a whole percent, between 0.75 and 0.99, beside
+  of the card, rounded up to a whole percent, between 0.75 and 0.99 (for a declared request,
+  see the amendment of 2026-10-30), beside
   `--kv-cache-memory-bytes`. SGLang's static fraction is computed against the device total,
   passed in the launch as `device_total_bytes`, instead of `MemAvailable` (this closes ADR
   0014 open issue 2 for discrete devices, subject to live evidence).
@@ -493,3 +494,31 @@ Owner decisions 2026-10-25 ([ADR 0035](0035-multi-gpu-one-host.md)).
 - **Amendment A2, peaks.** The startup peak of a launch on N GPUs is the largest any chosen
   GPU showed, stored per revision, host, installation and N, and applied to every GPU of a
   later start at that N; a record from before ADR 0035 is the N = 1 record.
+
+## Amendment of 2026-10-30: a declared vLLM request is rendered as its own share (proposed, #225)
+
+Proposed for owner review with issue #225 (branch `fix/vllm-discrete-request`).
+
+Problem: found on a 96 GB RTX PRO 6000 with vLLM 0.32.0. §3's 0.75 floor was applied twice:
+to a request CapyCTL derives, and to the `--gpu-memory-utilization` §4 renders from any
+request. A deployment that declared `engine_config.memory.request` was charged that request,
+but vLLM was still told 0.75 of the card, and vLLM checks at start that its share of the card
+is free; a declared request below 0.75 could not start beside a model holding more than a
+quarter of the card. The floor does not size the KV cache (every launch passes
+`--kv-cache-memory-bytes`); it guards the start failure §3 records for vLLM 0.29, whose cause
+was not recorded.
+
+Rule:
+
+- **§3 and §4, the floor.** The 0.75 lower bound applies only to a request CapyCTL derives
+  (and to the standalone template, which states a derived request). Such a request is at
+  least 0.75 of the card and is rendered as its share, rounded up to a whole percent, at
+  least 0.75 and at most 0.99, as before.
+- **§4, a declared request.** A declared `memory.request` is rendered as its own share of the
+  card, rounded up to a whole percent, at most 0.99, with no lower bound beyond 0.01.
+  Admission is unchanged: a declared request was already charged as declared.
+- **Upgrade.** A revision already accepted with a declared request below 0.75 of its card is
+  told that smaller share at its next start; a model that needs more fails to start
+  (`launch_failed`) and its request has to be raised.
+
+Unified-memory hosts are unchanged. CPU and Fake-engine tests only; not yet checked live.
