@@ -87,10 +87,12 @@ pub fn instance_indexes(
     Ok(rows.into_iter().map(|row| row.index).collect())
 }
 
-/// The launch instance `index` of the deployment names now: its host and the
-/// retained binding of exactly its current generation, else (#226) that
-/// generation's newest released launch. A launch that failed before
-/// readiness is released at once, and its log is the only account of why.
+/// The launch instance `index` of the deployment names now: the retained
+/// binding of exactly its current generation on the instance's host, else
+/// (#226) that generation's newest released launch, on the host it ran on. A
+/// launch that failed before readiness is released at once, and its log is
+/// the only account of why; a retry of the same generation placed elsewhere
+/// must not send the read to the new host.
 pub fn launch_scope(
     store: &capyctl_store::Store,
     deployment_id: &str,
@@ -102,13 +104,13 @@ pub fn launch_scope(
         .into_iter()
         .find(|row| row.index == index)
         .ok_or(ScopeError::NotFound)?;
-    let (Some(host_id), Some(generation)) = (row.host_id, row.generation) else {
+    let Some(generation) = row.generation else {
         return Err(ScopeError::NoLaunch);
     };
     let retained = store
         .serving_binding_at(deployment_id, generation)
         .map_err(|_| ScopeError::Unavailable)?;
-    let (revision, incarnation) = match retained {
+    let (host_id, revision, incarnation) = match retained {
         Some((binding, _)) => {
             // ADR 0015: the binding realizes exactly this instance.
             let lane = store
@@ -117,12 +119,24 @@ pub fn launch_scope(
             if lane != Some((deployment_id.to_owned(), index)) {
                 return Err(ScopeError::NoLaunch);
             }
-            (binding.revision, binding.incarnation)
+            (row.host_id, binding.revision, binding.incarnation)
         }
-        None => store
-            .released_launch_at(deployment_id, index, generation)
-            .map_err(|_| ScopeError::Unavailable)?
-            .ok_or(ScopeError::NoLaunch)?,
+        None => {
+            let launch = store
+                .released_launch_at(deployment_id, index, generation)
+                .map_err(|_| ScopeError::Unavailable)?
+                .ok_or(ScopeError::NoLaunch)?;
+            // SPEC §§6, 15: a remote launch's host was frozen with its
+            // binding before it was sent; a local one ran on the instance's.
+            (
+                launch.remote_host.or(row.host_id),
+                launch.revision,
+                launch.incarnation,
+            )
+        }
+    };
+    let Some(host_id) = host_id else {
+        return Err(ScopeError::NoLaunch);
     };
     if !capyctl_protocol::execution::is_incarnation(&incarnation) {
         return Err(ScopeError::NoLaunch);

@@ -13,7 +13,10 @@ SPEC §13.3 / T21. The read now names the instance's latest launch:
 instance's current generation. When there is none, it takes the newest
 released binding of that generation (`Store::released_launch_at`, tied to the
 generation by a lifecycle step of a run at that generation, so an earlier
-generation's launch is never named). On a host, the `EngineLogTail` gate was
+generation's launch is never named). A released remote launch is read on the
+host its ingress was frozen to before it was sent (`remote_binding_ingress`),
+not the instance's current host, so a retry of the same generation placed on
+another host does not send the read there. On a host, the `EngineLogTail` gate was
 "a launch this host still claims". It is now "a launch this host accepted for
 the deployment": one it claims, or one at the command's generation whose claim
 a Terminate released (`Journal::accepted_launch`). Nothing else changed: the
