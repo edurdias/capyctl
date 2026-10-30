@@ -13,6 +13,10 @@ pub const MAX_SUMMARY_BYTES: usize = 256;
 /// At most this many refused option names are named.
 const MAX_OPTIONS: usize = 4;
 
+/// #198: the line `runtime/sglang_entry.py` ends a launch with when SGLang
+/// itself failed to import.
+const SGLANG_IMPORT_FAILED: &str = "sglang_startup_failed: engine_import_failed";
+
 /// How the engine process ended, when the host that reaped it knows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EngineExit {
@@ -141,6 +145,19 @@ pub fn summary(engine_output: &str, exit: Option<EngineExit>) -> String {
         );
         return text;
     }
+    // #198: the protected SGLang entry's closed line for an engine it could
+    // not import (an editable install, or a dependency failing at import).
+    // The code is closed; nothing else of the line or the log is named.
+    if engine_output
+        .lines()
+        .any(|line| line.contains(SGLANG_IMPORT_FAILED))
+    {
+        text.push_str(
+            "; engine_import_failed: SGLang could not be imported from its environment's \
+             site-packages, where CapyCTL never runs .pth files",
+        );
+        return text;
+    }
     // Name as many refused options as the bound allows.
     let mut options = rejected_options(engine_output);
     while !options.is_empty() {
@@ -255,5 +272,32 @@ mod tests {
         );
         assert!(!text.contains("20480"));
         assert!(text.len() <= MAX_SUMMARY_BYTES);
+    }
+
+    // T29 #198: the protected SGLang entry's import failure is named by its
+    // closed code, which picks its operator hint in status; the line's
+    // neighbours (a traceback, a path) are never quoted.
+    #[test]
+    fn an_sglang_import_failure_is_named_by_its_code() {
+        let output = "INFO loading\n/opt/sglang/lib/python3.12/site-packages: secret-path\n\
+                      sglang_startup_failed: engine_import_failed (SGLang could not be imported)\n";
+        let text = summary(output, None);
+        assert_eq!(
+            text,
+            "the engine exited before readiness; engine_import_failed: SGLang could not be \
+             imported from its environment's site-packages, where CapyCTL never runs .pth files"
+        );
+        assert!(!text.contains("/opt") && !text.contains("secret"), "{text}");
+        assert!(text.len() <= MAX_SUMMARY_BYTES);
+        let reason = format!("engine launch failed: {text}; log tail:\n{output}");
+        assert_eq!(
+            capyctl_domain::diagnostics::classify(Some("launch_failed"), &reason),
+            Some("engine_import_failed")
+        );
+        // Any other startup line keeps the plain summary.
+        assert_eq!(
+            summary("sglang_startup_failed: startup_error\n", None),
+            "the engine exited before readiness"
+        );
     }
 }

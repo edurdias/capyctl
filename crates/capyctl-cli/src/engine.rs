@@ -494,6 +494,25 @@ async fn add(
     }
     // Checked before anything runs, and again under the lock when writing.
     refuse_existing(target, &name)?;
+    // #198, ADR 0008 amendment 2026-10-30: an installation the engine's
+    // protected entry can never import (an editable SGLang, reached only
+    // through a .pth file the entry never runs) is refused before anything
+    // runs or is written; every launch refuses it too.
+    if let Some(refusal) =
+        capyctl_agent::installation::unsupported_installation(resolved.engine, &resolved.executable)
+    {
+        return Err(error(
+            refusal,
+            format!(
+                "{}: SGLang is installed in editable mode (pip install -e, as in the \
+                 lmsysorg/sglang image): its package is outside the environment's \
+                 site-packages, reachable only through a .pth file CapyCTL never runs. \
+                 Reinstall it without -e (pip install --no-deps --force-reinstall <the \
+                 source checkout's python directory>), then add it again; nothing was written",
+                resolved.env.display()
+            ),
+        ));
+    }
     // SPEC §13.3 amendment (owner decision 2026-09-25). ADR 0029 §2: nothing
     // compiles at run time for llama.cpp, so no toolkit is recorded for it.
     let cuda_home = match resolved.engine {

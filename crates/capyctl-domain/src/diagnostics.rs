@@ -54,6 +54,18 @@ const HINTS: &[(&str, &str)] = &[
         "installation_drift",
         "the installation changed since the host registered it and its host policy says installation_drift: refuse; restart the host agent to register it again",
     ),
+    // #198 (ADR 0008 amendment 2026-10-30): CapyCTL loads SGLang from the
+    // environment's site-packages and never runs a .pth file.
+    (
+        "installation_unsupported:editable",
+        "SGLang is installed in editable mode (pip install -e, as in the lmsysorg/sglang image), which CapyCTL cannot load: it never runs the .pth file that reaches the package; reinstall SGLang without -e (pip install --no-deps --force-reinstall <the source checkout's python directory>), then start again",
+    ),
+    // #198: the protected SGLang entry's own closed code, named by the
+    // launch failure summary.
+    (
+        "engine_import_failed",
+        "SGLang could not be imported from its environment's site-packages; check that the environment's python3 can import sglang.srt.entrypoints.http_server, repair what it names, and start again",
+    ),
     (
         "checkpoint_mismatch",
         "the checkpoint's digest is not the one declared or recorded for this revision. A declared model.content_fingerprint of the form sha256:<64 hex> is CapyCTL's checkpoint digest over every file under the model directory, not a file hash: `capyctl status deployment <name>` shows the measured one; set the field to it, or leave it out and CapyCTL measures it. Otherwise the checkpoint changed on the host: restore it, or deploy a new revision so it is measured again",
@@ -326,6 +338,24 @@ mod tests {
         assert!(operator_hint("startup_requires_empty_host")
             .unwrap()
             .contains("--evict"));
+        // #198: an editable SGLang refused before any effect, and an SGLang
+        // its entry could not import, each have their own hint.
+        let refused =
+            "host policy refused the launch before any effect: installation_unsupported:editable";
+        assert_eq!(
+            classify(Some("launch_failed"), refused),
+            Some("installation_unsupported:editable")
+        );
+        assert!(operator_hint("installation_unsupported:editable")
+            .unwrap()
+            .contains("without -e"));
+        assert_eq!(
+            classify(Some("launch_failed"), "engine launch failed: the engine exited before readiness; engine_import_failed: SGLang could not be imported"),
+            Some("engine_import_failed")
+        );
+        assert!(operator_hint("engine_import_failed")
+            .unwrap()
+            .contains("sglang.srt.entrypoints.http_server"));
     }
 
     // T16 (found live 2026-10-03; SPEC §13.3 amended 2026-10-08): every

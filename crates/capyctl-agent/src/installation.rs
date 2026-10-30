@@ -12,8 +12,11 @@
 //! different digest is drift, flagged in the host's status and in the
 //! controller's event journal, and refused only when the installation's host
 //! policy says `installation_drift: refuse` (default `warn`). An installation
-//! that cannot be measured (an editable install, a package outside the
-//! environment's `site-packages`) is `unmeasured`, never a refusal.
+//! that cannot be measured (a package outside the environment's
+//! `site-packages`) is `unmeasured`, never a refusal, with one exception
+//! (#198, ADR 0008 amendment 2026-10-30): an SGLang installed in editable
+//! mode is refused `installation_unsupported:editable` at `engine add` and at
+//! every launch, whatever the drift policy ([`unsupported_installation`]).
 //!
 //! **Capabilities.** A launch that depends on a gated feature (today: deep
 //! parking) runs `runtime/engine_capabilities.py` under the installation's own
@@ -167,6 +170,86 @@ pub fn site_packages_holding(
         1 => Ok(found.remove(0)),
         _ => Err(FingerprintError::Ambiguous),
     }
+}
+
+/// #198: the closed refusal of an SGLang installed in editable mode.
+pub const EDITABLE_REFUSAL: &str = "installation_unsupported:editable";
+
+/// #198, ADR 0008 amendment 2026-10-30: the closed refusal of an installation
+/// the engine's protected entry can never import, else `None`. SGLang's entry
+/// runs under `python -I -S` and puts only the environment's `site-packages`
+/// on its path (SPEC §9.2); it never runs a `.pth` file. An editable SGLang
+/// (`pip install -e`, the lmsysorg/sglang image's layout) leaves no package
+/// there, only a `.pth` hook pointing at a source checkout outside the
+/// environment, which the registered fingerprint and drift flag do not
+/// cover, so it is refused rather than added to the path. A package directory
+/// in `site-packages` is never refused, whatever else lies beside it, nor is
+/// a link to one: the entry imports it through the link (measurement still
+/// calls it `unmeasured`, since it never follows links). Reads directory
+/// entries and at most one small `direct_url.json`; nothing runs.
+pub fn unsupported_installation(engine: Engine, executable: &Path) -> Option<&'static str> {
+    if engine != Engine::Sglang {
+        return None;
+    }
+    let package = package_name(engine)?;
+    let prefix = interpreter(executable)?.parent()?.parent()?.to_path_buf();
+    let sites: Vec<PathBuf> = std::fs::read_dir(prefix.join("lib"))
+        .ok()?
+        .flatten()
+        .take(MAX_LIB_ENTRIES)
+        .filter(|entry| entry.file_name().as_bytes().starts_with(b"python3."))
+        .map(|entry| entry.path().join("site-packages"))
+        .collect();
+    if sites
+        .iter()
+        .any(|site| std::fs::metadata(site.join(package)).is_ok_and(|m| m.is_dir()))
+    {
+        return None;
+    }
+    sites
+        .iter()
+        .any(|site| editable_in(site, package))
+        .then_some(EDITABLE_REFUSAL)
+}
+
+/// Whether `site` records `package` as an editable install: setuptools'
+/// `__editable__.<package>-<version>.pth` or its
+/// `__editable___<package>_<version>_finder.py` (PEP 660; the version starts
+/// with a digit, so another distribution's, such as sgl-router's
+/// `__editable___sglang_router_<version>_finder.py`, is not this one), a
+/// legacy `<package>.egg-link`, or the package's own `direct_url.json`
+/// saying `"dir_info": {"editable": true}` (PEP 610, written by pip for any
+/// build backend).
+fn editable_in(site: &Path, package: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(site) else {
+        return false;
+    };
+    let (pth, finder, link) = (
+        format!("__editable__.{package}-"),
+        format!("__editable___{package}_"),
+        format!("{package}.egg-link"),
+    );
+    let versioned = |name: &str, prefix: &str, suffix: &str| {
+        name.strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+            && name.ends_with(suffix)
+    };
+    for entry in entries.flatten().take(MAX_SITE_ENTRIES) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if versioned(&name, &pth, ".pth") || versioned(&name, &finder, "_finder.py") || name == link
+        {
+            return true;
+        }
+    }
+    dist_info(site, package).is_some_and(|dist| {
+        let mut text = Vec::new();
+        std::fs::File::open(dist.join("direct_url.json"))
+            .and_then(|file| file.take(MAX_METADATA).read_to_end(&mut text))
+            .ok()
+            .and_then(|_| serde_json::from_slice::<serde_json::Value>(&text).ok())
+            .is_some_and(|url| url["dir_info"]["editable"] == true)
+    })
 }
 
 /// The package version from exactly one `<package>-<version>.dist-info`.
@@ -1054,7 +1137,9 @@ impl InstallationRegistry {
     /// registered again); it refuses only under `installation_drift: refuse`.
     /// Returns the digest measured now (empty when it could not be measured),
     /// which keys the capability cache. ADR 0031 §3: a custom engine is
-    /// measured with the manifest its profile carries.
+    /// measured with the manifest its profile carries. #198 (ADR 0008
+    /// amendment 2026-10-30): an installation its entry can never import is
+    /// refused [`EDITABLE_REFUSAL`] under either policy.
     pub fn verify(
         &self,
         profile: &str,
@@ -1068,6 +1153,12 @@ impl InstallationRegistry {
         } else {
             self.measurer.measure_profile(engine, executable, custom)
         };
+        // #198: only a package missing from site-packages can be editable.
+        if matches!(measured, Err(FingerprintError::NotFound)) {
+            if let Some(refusal) = unsupported_installation(engine, executable) {
+                return Err(refusal);
+            }
+        }
         let observed = measured
             .as_ref()
             .map_or_else(|_| UNMEASURED.to_owned(), |f| f.digest.clone());
@@ -1332,6 +1423,165 @@ mod tests {
         assert_eq!(
             InstallationMeasurer::new().measure(Engine::Sglang, &dir.path().join("bin/python3")),
             Err(FingerprintError::NotFound)
+        );
+    }
+
+    /// #198: an environment whose SGLang is installed in editable mode, as
+    /// the lmsysorg/sglang image leaves it: dist-info and `marker` in
+    /// site-packages, the package in a checkout outside the environment.
+    fn editable_venv(marker: &str, body: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        std::fs::write(dir.path().join("bin/python3"), "").unwrap();
+        let checkout = dir.path().join("sgl-workspace/sglang/python/sglang");
+        std::fs::create_dir_all(checkout.join("srt")).unwrap();
+        std::fs::write(checkout.join("__init__.py"), "").unwrap();
+        let site = dir.path().join("lib/python3.12/site-packages");
+        let dist = site.join("sglang-0.5.22.dist-info");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("METADATA"), "Name: sglang\nVersion: 0.5.22\n").unwrap();
+        std::fs::write(site.join(marker), body).unwrap();
+        dir
+    }
+
+    // T21 T22 #198 (ADR 0008 amendment 2026-10-30): an editable SGLang is
+    // refused `installation_unsupported:editable` at every launch, under
+    // either drift policy, registered or not; nothing else changes.
+    #[test]
+    fn an_editable_sglang_is_refused_at_every_launch_whatever_the_policy() {
+        let checkout = "/sgl-workspace/sglang/python";
+        for (marker, body) in [
+            (
+                "__editable__.sglang-0.5.22.pth",
+                "import __editable___sglang_0_5_22_finder; __editable___sglang_0_5_22_finder.install()\n".to_owned(),
+            ),
+            (
+                "__editable___sglang_0_5_22_finder.py",
+                format!("MAPPING = {{'sglang': '{checkout}/sglang'}}\n"),
+            ),
+            ("sglang.egg-link", format!("{checkout}\n.\n")),
+            (
+                "sglang-0.5.22.dist-info/direct_url.json",
+                format!(r#"{{"url": "file://{checkout}", "dir_info": {{"editable": true}}}}"#),
+            ),
+        ] {
+            let dir = editable_venv(marker, &body);
+            let executable = dir.path().join("bin/python3");
+            assert_eq!(
+                unsupported_installation(Engine::Sglang, &executable),
+                Some(EDITABLE_REFUSAL),
+                "{marker}"
+            );
+            let measurer = InstallationMeasurer::new();
+            assert_eq!(
+                measurer.measure(Engine::Sglang, &executable),
+                Err(FingerprintError::NotFound)
+            );
+            let mut status = capyctl_protocol::pb::RuntimeProfileStatus {
+                name: "local".into(),
+                ..Default::default()
+            };
+            register_profile(
+                &measurer,
+                &serde_json::json!({"engine": "sglang", "executable": executable}),
+                &mut status,
+            );
+            assert_eq!(status.installation_state, "unmeasured");
+            let registered = InstallationRegistry::from_inventory(&capyctl_protocol::pb::ReportInventory {
+                profiles: vec![status],
+                ..Default::default()
+            });
+            for policy in [InstallationDrift::Warn, InstallationDrift::Refuse] {
+                assert_eq!(
+                    registered.verify("local", Engine::Sglang, &executable, policy),
+                    Err(EDITABLE_REFUSAL),
+                    "{marker}"
+                );
+            }
+            // vLLM runs with site processing, so its editable install loads.
+            assert_eq!(unsupported_installation(Engine::Vllm, &executable), None);
+        }
+
+        // A non-editable direct URL (a local wheel or directory) is not one.
+        let dir = editable_venv(
+            "sglang-0.5.22.dist-info/direct_url.json",
+            r#"{"url": "file:///wheels", "dir_info": {}}"#,
+        );
+        let executable = dir.path().join("bin/python3");
+        assert_eq!(unsupported_installation(Engine::Sglang, &executable), None);
+        assert_eq!(
+            InstallationRegistry::from_inventory(&Default::default()).verify(
+                "local",
+                Engine::Sglang,
+                &executable,
+                InstallationDrift::Refuse
+            ),
+            Ok(String::new())
+        );
+
+        // A regular package in site-packages is what the entry imports; a
+        // stale editable hook beside it changes nothing.
+        let dir = venv(Engine::Sglang, "0.5.22");
+        let site = dir.path().join("lib/python3.12/site-packages");
+        std::fs::write(site.join("__editable__.sglang-0.5.21.pth"), "import x\n").unwrap();
+        let executable = dir.path().join("bin/python3");
+        assert_eq!(unsupported_installation(Engine::Sglang, &executable), None);
+        assert!(InstallationRegistry::from_inventory(&Default::default())
+            .verify(
+                "local",
+                Engine::Sglang,
+                &executable,
+                InstallationDrift::Refuse
+            )
+            .unwrap()
+            .starts_with(DIGEST_PREFIX));
+    }
+
+    // T21 #198 (review): sgl-router's editable hook names
+    // `__editable___sglang_router_<version>_finder.py`, which is not SGLang's;
+    // and a `site-packages/sglang` that is a link to a package directory is
+    // imported by the entry through the link, so neither is refused (the link
+    // is still `unmeasured`: measurement never follows links).
+    #[test]
+    fn another_distributions_hook_and_a_linked_package_are_not_refused() {
+        let router = [
+            ("__editable__.sglang_router-0.3.1.pth", "import x\n"),
+            (
+                "__editable___sglang_router_0_3_1_finder.py",
+                "MAPPING = {}\n",
+            ),
+        ];
+        let dir = editable_venv(router[0].0, router[0].1);
+        let site = dir.path().join("lib/python3.12/site-packages");
+        std::fs::write(site.join(router[1].0), router[1].1).unwrap();
+        let executable = dir.path().join("bin/python3");
+        assert_eq!(unsupported_installation(Engine::Sglang, &executable), None);
+
+        // SGLang's package linked into site-packages, beside sgl-router's
+        // hooks and even a stale SGLang one.
+        let checkout = dir.path().join("sgl-workspace/sglang/python/sglang");
+        std::os::unix::fs::symlink(&checkout, site.join("sglang")).unwrap();
+        std::fs::write(site.join("__editable__.sglang-0.5.21.pth"), "import x\n").unwrap();
+        assert_eq!(unsupported_installation(Engine::Sglang, &executable), None);
+        assert_eq!(
+            InstallationMeasurer::new().measure(Engine::Sglang, &executable),
+            Err(FingerprintError::NotFound)
+        );
+        assert_eq!(
+            InstallationRegistry::from_inventory(&Default::default()).verify(
+                "local",
+                Engine::Sglang,
+                &executable,
+                InstallationDrift::Refuse
+            ),
+            Ok(String::new())
+        );
+        // A link to nothing is no package: the stale hook is SGLang's own.
+        std::fs::remove_file(site.join("sglang")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone"), site.join("sglang")).unwrap();
+        assert_eq!(
+            unsupported_installation(Engine::Sglang, &executable),
+            Some(EDITABLE_REFUSAL)
         );
     }
 

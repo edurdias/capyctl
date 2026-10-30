@@ -488,6 +488,8 @@ impl StructuredError {
             "host_ineligible" => ExitCode::HOST_INELIGIBLE,
             "engine_not_found" => ExitCode::ENGINE_NOT_FOUND,
             "engine_unsupported" => ExitCode::ENGINE_UNSUPPORTED,
+            // #198: an installation `engine add` refuses (an editable SGLang).
+            "installation_unsupported:editable" => ExitCode::ENGINE_UNSUPPORTED,
             "engine_version_failed" => ExitCode::ENGINE_VERSION_FAILED,
             "profile_exists" => ExitCode::PROFILE_EXISTS,
             "profile_in_use" => ExitCode::PROFILE_IN_USE,

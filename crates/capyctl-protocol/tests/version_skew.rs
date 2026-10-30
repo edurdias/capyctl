@@ -533,10 +533,15 @@ fn live_profile_update_is_declared_both_ways() {
     use capabilities::*;
     assert!(CATALOGUE.contains(&(LIVE_PROFILE_UPDATE, Direction::ServerToHost)));
     assert!(agent_capabilities().contains(&LIVE_PROFILE_UPDATE.to_owned()));
-    // ADR 0033 §12: and `lmcache`, so a host sends its LMCache samples.
+    // ADR 0033 §12: and `lmcache`, so a host sends its LMCache samples;
+    // #198: and `installation_unsupported`, so a host reports that refusal.
     assert_eq!(
         server_capabilities(),
-        vec![LIVE_PROFILE_UPDATE.to_owned(), LMCACHE.to_owned()]
+        vec![
+            LIVE_PROFILE_UPDATE.to_owned(),
+            LMCACHE.to_owned(),
+            INSTALLATION_UNSUPPORTED.to_owned()
+        ]
     );
     let before = pb::SessionReady {
         controller_id: "c".into(),
@@ -571,6 +576,35 @@ fn live_profile_update_is_declared_both_ways() {
         pb::ServerToAgent::decode(retire.encode_to_vec().as_slice()).unwrap(),
         retire
     );
+}
+
+// T34 #198 (ADR 0017, ADR 0008 amendment 2026-10-30): a 0.1.10 controller's
+// refusal check does not know `installation_unsupported:editable` and would
+// end the whole control session on it. A host reports it only to a server
+// whose SessionReady lists `installation_unsupported`; every refusal an
+// earlier server knows still reaches it.
+#[test]
+fn installation_unsupported_reaches_only_a_server_that_takes_it() {
+    use capabilities::*;
+    use capyctl_protocol::execution::{is_policy_refusal, POLICY_REFUSALS};
+    const EDITABLE: &str = "installation_unsupported:editable";
+    assert_eq!(INSTALLATION_UNSUPPORTED, "installation_unsupported");
+    assert!(CATALOGUE.contains(&(INSTALLATION_UNSUPPORTED, Direction::HostToServer)));
+    assert!(agent_capabilities().contains(&INSTALLATION_UNSUPPORTED.to_owned()));
+    assert!(!PLACEMENT_REQUIRED.contains(&INSTALLATION_UNSUPPORTED));
+    assert!(is_policy_refusal(EDITABLE));
+    // What a 0.1.10 controller lists in its SessionReady, and none at all.
+    let older = vec![LIVE_PROFILE_UPDATE.to_owned(), LMCACHE.to_owned()];
+    for server in [older, Vec::new()] {
+        assert!(!server_takes_refusal(&server, EDITABLE), "{server:?}");
+        for reason in POLICY_REFUSALS.iter().filter(|reason| **reason != EDITABLE) {
+            assert!(server_takes_refusal(&server, reason), "{reason}");
+        }
+    }
+    let current = server_capabilities();
+    for reason in POLICY_REFUSALS {
+        assert!(server_takes_refusal(&current, reason), "{reason}");
+    }
 }
 
 // T43 T34 (ADR 0030 §1): `decisions` is a capability every current agent
