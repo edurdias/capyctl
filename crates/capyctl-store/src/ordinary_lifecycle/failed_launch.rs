@@ -371,6 +371,46 @@ mod tests {
         assert_ne!(retry.binding_id, execution.binding_id);
     }
 
+    /// #226 (SPEC §13.3 / T21): a launch released after it failed before
+    /// readiness is still named for its generation, so its engine log can be
+    /// read; a retained launch is not released, and another generation never
+    /// names it. A retry's reserved launch leaves the released one named.
+    // T21
+    #[test]
+    fn a_released_failed_launch_is_named_for_its_generation() {
+        let (store, session, fence, execution) = armed_ordinary();
+        let released = |generation| {
+            store
+                .released_launch_at(&fence.deployment_id, 0, generation)
+                .unwrap()
+        };
+        assert_eq!(released(fence.generation), None, "still retained");
+        let now = execution.issued_at_ms + 10;
+        let evidence = CleanupEvidence {
+            binding_id: execution.binding_id.clone(),
+            incarnation: execution.incarnation.clone(),
+            identities: vec![],
+            observed_at_ms: now,
+            receipt: "no process was associated".into(),
+        };
+        let ttl = store
+            .observation_ttl_for_step(&execution.token.step_id)
+            .unwrap();
+        store
+            .release_failed_launch(&session, &execution.token.step_id, &evidence, now, ttl)
+            .unwrap();
+        let named = Some((fence.revision, execution.incarnation.clone()));
+        assert_eq!(released(fence.generation), named);
+        assert_eq!(released(fence.generation + 1), None);
+        store
+            .set_admission_enabled(&fence.deployment_id, false)
+            .unwrap();
+        store
+            .accept_start(&session, &fence, now + 1, now + 1000)
+            .unwrap();
+        assert_eq!(released(fence.generation), named);
+    }
+
     /// Spec §6: a launch that failed after arm is released with gone evidence. The
     /// step is cancelled, the run and the operation fail, the binding, lease, grant
     /// and claim are released, the engine key row is deleted, and the deployment

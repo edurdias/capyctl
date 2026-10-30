@@ -935,13 +935,17 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 `kib` defaults to 64 and may be 1 to 256; `instance` (the index `status
 deployment` shows) may be left out when the deployment has one instance. The
+read names the instance's latest launch: the one it runs, or, when none runs,
+the last one CapyCTL started for it, such as a launch that failed before it
+was ready (a host running an earlier CapyCTL answers `404` for that one). The
 answer, `{deployment_id, instance, host_id, incarnation, kib, truncated, text,
 read_at_ms}`, holds at most `kib` KiB of whole lines, redacted again on the way
 out, and `truncated: true` when older output exists. The read continues into
 `<launch id>.log.1` when the current file is short. Refusals: `400
 invalid_request` (a bad query, or no `instance` for a deployment of several),
-`404 not_found` (unknown deployment or instance, no running launch, or no log
-yet), `403 forbidden` (a `--debug-engine-logs` log), `503
+`404 not_found` (unknown deployment or instance, no launch, or no log: none
+yet, or with `engine_logs: memory` more than 60 seconds after the engine
+exited), `403 forbidden` (a `--debug-engine-logs` log), `503
 unsupported_capability` (`host_capability_missing:engine_log_tail`: the host
 runs an older CapyCTL), `503 observation_stale` (the host is not connected),
 `504 deadline_exceeded` (no answer within 15 seconds) and `429 queue_full`
@@ -962,7 +966,8 @@ files would defeat the setting.
   instance's `LAST ERROR` column can still read `-`. `--format json` has the
   full record. A request for the deployment answers `activation_failed`, and
   each new request tries a fresh start. The engine log says why the engine
-  exited.
+  exited, and the management read above returns it after the launch failed
+  (with `engine_logs: memory`, for 60 seconds after the engine exited).
 - **SGLang saver permission warning.** Before an SGLang park, CapyCTL checks
   that the engine's `torch_memory_saver` library is not writable by other
   accounts. When that cannot be proven (for example, a group-writable

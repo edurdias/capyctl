@@ -1,8 +1,9 @@
 //! SPEC §13.3 / T21: reading the bounded, redacted end of one instance's
 //! engine log for the management surface.
 //!
-//! The instance's current launch is the retained (not released) binding of
-//! its generation; its incarnation names the log. A server asks the
+//! The instance's launch is the retained (not released) binding of its
+//! generation, else that generation's newest released one (#226: a launch
+//! that failed before readiness); its incarnation names the log. A server asks the
 //! instance's host with the read-only `EngineLogTail` action (sent only to a
 //! host that declared `engine_log_tail`, ADR 0017); a standalone role reads
 //! its embedded host's log in-process with the same bounded reader. Every
@@ -52,7 +53,7 @@ pub enum TailFailure {
     Unavailable,
 }
 
-/// The launch an instance runs now.
+/// The launch whose engine log an instance's read names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchScope {
     pub host_id: String,
@@ -66,8 +67,8 @@ pub struct LaunchScope {
 pub enum ScopeError {
     /// No such deployment or instance.
     NotFound,
-    /// The instance holds no retained launch now.
-    NotRunning,
+    /// The instance's current generation names no launch.
+    NoLaunch,
     /// The owned state could not be read.
     Unavailable,
 }
@@ -86,8 +87,10 @@ pub fn instance_indexes(
     Ok(rows.into_iter().map(|row| row.index).collect())
 }
 
-/// The launch instance `index` of the deployment runs now: its host and the
-/// retained binding of exactly its current generation.
+/// The launch instance `index` of the deployment names now: its host and the
+/// retained binding of exactly its current generation, else (#226) that
+/// generation's newest released launch. A launch that failed before
+/// readiness is released at once, and its log is the only account of why.
 pub fn launch_scope(
     store: &capyctl_store::Store,
     deployment_id: &str,
@@ -100,26 +103,35 @@ pub fn launch_scope(
         .find(|row| row.index == index)
         .ok_or(ScopeError::NotFound)?;
     let (Some(host_id), Some(generation)) = (row.host_id, row.generation) else {
-        return Err(ScopeError::NotRunning);
+        return Err(ScopeError::NoLaunch);
     };
-    let (binding, _) = store
+    let retained = store
         .serving_binding_at(deployment_id, generation)
-        .map_err(|_| ScopeError::Unavailable)?
-        .ok_or(ScopeError::NotRunning)?;
-    // ADR 0015: the binding realizes exactly this instance.
-    let lane = store
-        .binding_lane(&binding.id)
         .map_err(|_| ScopeError::Unavailable)?;
-    if lane != Some((deployment_id.to_owned(), index))
-        || !capyctl_protocol::execution::is_incarnation(&binding.incarnation)
-    {
-        return Err(ScopeError::NotRunning);
+    let (revision, incarnation) = match retained {
+        Some((binding, _)) => {
+            // ADR 0015: the binding realizes exactly this instance.
+            let lane = store
+                .binding_lane(&binding.id)
+                .map_err(|_| ScopeError::Unavailable)?;
+            if lane != Some((deployment_id.to_owned(), index)) {
+                return Err(ScopeError::NoLaunch);
+            }
+            (binding.revision, binding.incarnation)
+        }
+        None => store
+            .released_launch_at(deployment_id, index, generation)
+            .map_err(|_| ScopeError::Unavailable)?
+            .ok_or(ScopeError::NoLaunch)?,
+    };
+    if !capyctl_protocol::execution::is_incarnation(&incarnation) {
+        return Err(ScopeError::NoLaunch);
     }
     Ok(LaunchScope {
         host_id,
         generation,
-        revision: binding.revision,
-        incarnation: binding.incarnation,
+        revision,
+        incarnation,
     })
 }
 

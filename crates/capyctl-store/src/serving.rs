@@ -157,6 +157,33 @@ impl crate::Store {
         Ok(self.retained_binding(&id)?.map(|binding| (binding, open)))
     }
 
+    /// #226 (SPEC §13.3 / T21): the newest released launch of instance
+    /// `index` at `generation`, as its revision and incarnation. A launch that
+    /// failed before readiness, or exited or stopped since, is released but
+    /// wrote an engine log; a lifecycle step of a run at `generation` ties the
+    /// binding to it, so an earlier generation's launch is never named.
+    pub fn released_launch_at(
+        &self,
+        deployment_id: &str,
+        index: u32,
+        generation: i64,
+    ) -> Result<Option<(i64, String)>, LifecycleError> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT b.revision,b.incarnation FROM runtime_bindings b
+                  WHERE b.deployment_id=?1 AND b.instance_index=?2 AND b.state='released'
+                    AND EXISTS(SELECT 1 FROM lifecycle_steps s
+                                 JOIN lifecycle_runs r ON r.operation_id=s.operation_id
+                                WHERE s.binding_id=b.id AND r.generation=?3)
+                  ORDER BY b.rowid DESC LIMIT 1",
+            )?
+            .query_row(params![deployment_id, index, generation], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?)
+    }
+
     /// ADR 0032 §1, §2: the [`LaneEngine`] of retained binding `binding_id`,
     /// or `None` when it is released or its revision froze no effective
     /// configuration (treated as not capable).
