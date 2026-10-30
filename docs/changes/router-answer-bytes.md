@@ -65,7 +65,9 @@ one engine should match the same way.
 - **Answers come back exactly as the engine wrote them.** The router used to
   re-encode every answer, which could move a decision's probabilities or a
   chat answer's log probabilities by one unit in the last place, respell
-  numbers and sort keys. A `/v1/systemone` answer and each streamed chunk are
-  now the engine's bytes with only `model` set to the name you sent and
-  `capyctl` added; a collected chat answer carries the engine's log
+  numbers and sort keys. Each streamed chunk is now the engine's bytes with
+  only `model` set to the name you sent (a stream's figures still arrive as
+  the `: x-capyctl-metrics` comment line). A `/v1/systemone` answer is the
+  engine's bytes with `model` set and `capyctl` added, and a collected chat
+  answer, which also gains `capyctl`, carries the engine's log
   probabilities, `usage` and statistics as the engine sent them (issue #223).

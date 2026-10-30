@@ -6,7 +6,7 @@
 //! `serde_json::Value` is not always correctly rounded, and re-encoding writes
 //! the shortest form of what was parsed with the object keys sorted: a
 //! probability or a log probability came back one unit in the last place away
-//! from the engine's, or spelled differently (`1e-5` for Python's `1e-05`).
+//! from the engine's, or spelled differently (`0.00001` for Python's `1e-05`).
 //! Only the top-level members CapyCTL itself sets (the public `model`, the
 //! `capyctl` figures) are written anew, in place; every other member, nested
 //! objects included, goes byte for byte, as a request does
