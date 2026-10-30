@@ -363,9 +363,19 @@ apart) and later starts set that aside instead of the estimate; `--json` says
 where each figure came from (`startup.provenance`, and on a discrete GPU
 `startup.device_provenance` and `startup.host_provenance`: `measured`, or
 `default` for the estimate). Before a first start has measured it, a model
-whose estimated startup peak is above the machine's managed limit shows that
-limit: its first start runs alone on the machine and sets aside all of it
-(`--json` names this `whole_host`).
+whose estimated startup peak is above a unified-memory machine's managed limit
+shows that limit: its first start runs alone on the machine and sets aside all
+of it (`--json` names this `whole_host`). On a discrete GPU the estimate is the
+card's Ready figure (the memory request and 1.25 GiB for the engine's CUDA
+context), or `memory.startup` and the same 1.25 GiB when you state it. A card
+has no first start that runs alone, so a model whose figure is above the
+card's managed limit can never start: status says so under the table, and
+`capyctl validate config --host` says so before you deploy:
+
+```text
+Startup     a start needs 15.2 GiB of gpu0, above the 14.7 GiB it manages, so it can never start; on a card the start is charged engine_config.memory.startup (the request when unset) plus the engine's CUDA context
+```
+
 When a start fails, `LAST OPERATION` says so and the instance's `LAST ERROR`
 gives the reason:
 

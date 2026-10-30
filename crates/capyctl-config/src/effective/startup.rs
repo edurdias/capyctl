@@ -103,6 +103,42 @@ pub fn startup_device_domains(effective: &EffectiveDeployment) -> Vec<String> {
         .collect()
 }
 
+/// A cold phase that charges a discrete GPU more than the card's managed
+/// limit, while that limit is all admission may ever reserve there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StartupOverLimit {
+    /// The card's device domain.
+    pub domain: String,
+    /// What the first start charges the card.
+    pub bytes: i64,
+    /// The card's managed limit.
+    pub limit_bytes: i64,
+}
+
+/// #219 (ADR 0019 §3): the first card whose startup charge in the frozen
+/// cold phase is above its managed limit. Such a start is never admitted;
+/// unlike one pool (whose first start runs alone on the host, owner decision
+/// 2026-09-23) a card has no solo first start, so an estimate is never
+/// measured, and a declared peak is never replaced. `None` when every card
+/// holds its charge, and on a host without a device domain.
+pub fn startup_over_limit(effective: &EffectiveDeployment) -> Option<StartupOverLimit> {
+    effective
+        .resources
+        .cold
+        .allocations
+        .iter()
+        .find_map(|allocation| {
+            let domain = effective.host.domains.get(&allocation.domain)?;
+            (domain.memory == super::DomainMemory::Device
+                && allocation.bytes > domain.managed_limit)
+                .then(|| StartupOverLimit {
+                    domain: allocation.domain.clone(),
+                    bytes: allocation.bytes,
+                    limit_bytes: domain.managed_limit,
+                })
+        })
+}
+
 /// How a measured peak may replace the frozen startup budget, if it may:
 /// only a placeholder or a pre-budget request is replaced. The derived cold
 /// phase must be one allocation, or exactly one card and one host RAM

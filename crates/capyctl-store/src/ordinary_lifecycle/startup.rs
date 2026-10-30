@@ -40,7 +40,7 @@
 //! startup phase whatever the peaks (`sglang_startup_contended`).
 use super::*;
 use capyctl_config::effective::{
-    startup_budget, startup_measure, StartupMeasure, StartupProvenance,
+    startup_budget, startup_measure, StartupMeasure, StartupOverLimit, StartupProvenance,
 };
 use capyctl_scheduler::placement::{fits, HostRefusal};
 use std::collections::{BTreeMap, BTreeSet};
@@ -634,6 +634,36 @@ pub struct StartupStatus {
     pub split: Option<StartupSplit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub measured: Vec<StartupMeasurement>,
+    /// #219: the card whose part of `bytes` is above the managed limit its
+    /// host's policy states now: such a start is never admitted, and with
+    /// nothing measured the figure never drops. Absent when every card holds
+    /// it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub over_limit: Option<StartupOverLimit>,
+}
+
+/// #219 (ADR 0019 §3): the first card of `footprint` charged above the
+/// managed limit the host's current policy states for it. `None` when every
+/// card holds its charge, and when the policy cannot be read (status is a
+/// read; admission judges the start on its own).
+fn over_limit(
+    tx: &Transaction<'_>,
+    e: &EffectiveDeployment,
+    footprint: &PhaseFootprint,
+) -> Option<StartupOverLimit> {
+    let policy = read_selected_policy(tx, &e.host.name).ok()??;
+    footprint
+        .allocations
+        .iter()
+        .filter(|a| is_device(e, &a.domain))
+        .find_map(|a| {
+            let limit = policy.controls.domains.get(&a.domain)?.managed_limit;
+            (a.bytes > limit).then(|| StartupOverLimit {
+                domain: a.domain.clone(),
+                bytes: a.bytes,
+                limit_bytes: limit,
+            })
+        })
 }
 
 /// The current revision's startup budget and its measurements. `None` for an
@@ -709,6 +739,7 @@ pub(crate) fn status(
         provenance: overall(provenance, &split),
         split,
         measured,
+        over_limit: over_limit(tx, &e, &footprint),
     }))
 }
 

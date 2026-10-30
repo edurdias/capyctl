@@ -375,6 +375,21 @@ pub(crate) fn startup(startup: &Value) -> String {
     }
 }
 
+/// #219 (ADR 0019 §3): a card whose startup charge is above its managed
+/// limit (`over_limit`), on which no start is ever admitted.
+pub(crate) fn startup_over_limit(startup: &Value) -> Option<String> {
+    let over = &startup["over_limit"];
+    let (bytes, limit) = (number(&over["bytes"])?, number(&over["limit_bytes"])?);
+    Some(format!(
+        "a start needs {} of {}, above the {} it manages, so it can never start; on a card \
+         the start is charged engine_config.memory.startup (the request when unset) plus the \
+         engine's CUDA context",
+        gib(bytes),
+        clean(over["domain"].as_str()?),
+        gib(limit)
+    ))
+}
+
 pub(crate) fn operation(op: &Value) -> String {
     if !op.is_object() {
         return "-".into();
@@ -541,6 +556,10 @@ fn status(value: &Value, names: &HostNames) -> String {
         if let Some(reason) = op["reason"].as_str().and_then(|r| r.lines().next()) {
             notes.push(format!("Waiting     {}: {}", operation(op), clean(reason)));
         }
+    }
+    // #219: a start no card can ever admit says so before it is refused.
+    if let Some(note) = startup_over_limit(&d["startup"]) {
+        notes.push(format!("Startup     {note}"));
     }
     // ADR 0014 §7 (found live on a 16 GB card): a checkpoint that measured
     // to its digest but whose weights do not resolve the revision says why,
@@ -1666,6 +1685,31 @@ mod tests {
         );
         assert!(
             out.contains("Checkpoint  could not be measured (invalid_root)"),
+            "{out}"
+        );
+    }
+
+    // T16 (#219): a card whose startup charge is above its managed limit,
+    // which no start is ever admitted on, says so under the table.
+    #[test]
+    fn status_says_when_a_start_can_never_fit_its_card() {
+        let out = render(
+            View::Status,
+            &json!({"name": "fv", "kind": "model", "desired_state": "stopped",
+                "observed_state": "stopped", "ready_instances": 0, "desired_instances": 1,
+                "revision": "1",
+                "startup": {"bytes": 20_643_119_104_i64, "device_bytes": 16_374_562_816_i64,
+                    "host_bytes": 4_294_967_296_i64,
+                    "over_limit": {"domain": "gpu0", "bytes": 16_374_562_816_i64,
+                        "limit_bytes": 15_783_165_952_i64}},
+                "instances": []}),
+            &names(),
+        );
+        assert!(
+            out.contains(
+                "Startup     a start needs 15.2 GiB of gpu0, above the 14.7 GiB it manages, so \
+                 it can never start"
+            ),
             "{out}"
         );
     }

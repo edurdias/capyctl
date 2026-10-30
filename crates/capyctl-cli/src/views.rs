@@ -281,6 +281,10 @@ fn validate(value: &Value) -> String {
     )
     .render();
     text.push_str(&resource_phases(value));
+    // #219: a deployment no card can ever start is visible before its start.
+    if let Some(note) = table::startup_over_limit(&value["effective"]["startup"]) {
+        text.push_str(&format!("\nStartup\n  {note}\n"));
+    }
     text.push_str(&topology(&value["effective"]["topology"]));
     // SPEC §15.3: without a host, say what was not checked.
     if value["resolved_against"].is_null() {

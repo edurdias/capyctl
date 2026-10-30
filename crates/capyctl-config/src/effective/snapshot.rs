@@ -496,6 +496,9 @@ pub(super) fn declared_engine_config(
             // weights.
             legacy_family_margin: memory.get("margin_bytes").and_then(Value::as_i64)
                 == Some(super::engine_config::VLLM_OVERHEAD_MARGIN_BYTES),
+            // #219: a placeholder startup (it records its graph allowance)
+            // beside a request declared for a card is kept as frozen.
+            legacy_device_placeholder: memory.get("startup_graphs_bytes").is_some(),
             // ADR 0014 amendment A13: the graphs-off default beside the
             // memory saver, as frozen before it was dropped.
             legacy_sglang_graphs_off: engine == Some("sglang")

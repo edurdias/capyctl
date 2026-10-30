@@ -267,6 +267,11 @@ pub struct CheckpointFacts {
     /// weights (ADR 0014 amendment A18, 2026-10-07). Never set for a new
     /// resolution.
     pub legacy_family_margin: bool,
+    /// #219: a snapshot of a request declared for a discrete GPU that was
+    /// resolved without the checkpoint's weights took the unified startup
+    /// placeholder (it records `startup_graphs_bytes`); it re-resolves
+    /// exactly as it was. Never set for a new resolution.
+    pub legacy_device_placeholder: bool,
     /// ADR 0014 amendment A13: a snapshot frozen while CapyCTL turned SGLang's
     /// CUDA graphs off beside the memory saver records that default; it
     /// re-resolves exactly as it was. Never set for a new resolution.
@@ -1918,7 +1923,19 @@ pub(super) fn normalize_engine_config(
         }
         memory.state_bytes = Some(state);
     }
-    if declared_device_margin.is_some() && declared_startup.is_none() {
+    // ADR 0019 amendment A1: an undeclared startup peak beside a request
+    // declared for a card is the request. #219: whether or not the weights
+    // are known; acceptance resolves a declared request without them, and the
+    // unified placeholder's graph allowance then kept a first start whose
+    // Ready charge fits the card from ever starting. A revision frozen with
+    // that placeholder keeps it.
+    let declared_for_card = inputs.device.is_some()
+        && declared_request.is_some()
+        && inputs.declared_ready_total.is_none()
+        && inputs.facts.weights_bytes.is_none()
+        && !inputs.facts.legacy_startup
+        && !inputs.facts.legacy_device_placeholder;
+    if (declared_device_margin.is_some() || declared_for_card) && declared_startup.is_none() {
         // Design §3: the engine's use of the card is bounded by the fraction
         // capyctl renders from this request.
         declared_startup = Some(memory.request_bytes);

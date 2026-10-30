@@ -168,3 +168,86 @@ fn validate_shows_the_effective_context() {
         assert_eq!(value["effective"]["context"], expected, "{raw}");
     }
 }
+
+/// #219: the issue's 16 GB laptop card (a 15052 MiB managed limit, 14.7 GiB)
+/// as the host document's only GPU, with an SGLang profile.
+fn laptop_card(root: &Path) -> Value {
+    let mut host = host_document(root);
+    host["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "24GiB", "free_reserve": "8GiB",
+                   "parked_limit": "16GiB", "host_kv_limit": "4GiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "15052MiB",
+                 "free_reserve": "1324MiB", "parked_limit": "2GiB"}
+    });
+    host["resource_policy"]["devices"] = json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["engine"] = json!("sglang");
+    profile["args"] = json!([]);
+    profile["security"]["admin_credential_ref"] = json!("secret://admin-key");
+    host
+}
+
+/// `validate config` in text form, as an operator reads it.
+fn validate_text(args: &[&str]) -> String {
+    let out = support::capyctl()
+        .args(["validate", "config"])
+        .args(args)
+        .output()
+        .unwrap();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// #219 (ADR 0019 amendment A1, §3): on a discrete card `validate config
+/// --host` shows the first start's charge on the card. The issue's declared
+/// 12.86 GiB request starts at its Ready charge (14.1 GiB, within the
+/// card's 14.7 GiB); it was shown 15.4 GiB, the graph allowance on top, and
+/// could never start. A declared startup peak whose charge the card cannot
+/// hold is named, with the card and its limit, before any start is refused.
+// T14 T26
+#[test]
+fn validate_shows_the_first_start_on_a_card_and_one_that_can_never_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = write(dir.path(), "host.yaml", &laptop_card(dir.path()));
+    let overhead = capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
+    let request = 13169_i64 << 20;
+    let mut doc = derived(json!({"request": "13169MiB", "kv_cache": "1GiB"}));
+    doc["residency"] = json!("restart_only");
+    let deployment = write(dir.path(), "deployment.yaml", &doc);
+    let args = [
+        "--file",
+        deployment.to_str().unwrap(),
+        "--host",
+        host.to_str().unwrap(),
+    ];
+    let (code, value, raw) = validate(&args);
+    assert_eq!(code, 0, "{raw}");
+    let startup = &value["effective"]["startup"];
+    assert_eq!(startup["device_bytes"], json!(request + overhead), "{raw}");
+    assert_eq!(startup["provenance"], "default", "{raw}");
+    assert!(startup.get("over_limit").is_none(), "{raw}");
+    assert!(!validate_text(&args).contains("can never start"));
+
+    // The same file, now with a startup peak the card cannot hold.
+    doc["engine_config"]["memory"]["startup"] = json!("14GiB");
+    write(dir.path(), "deployment.yaml", &doc);
+    let (code, value, raw) = validate(&args);
+    assert_eq!(code, 0, "{raw}");
+    let startup = &value["effective"]["startup"];
+    assert_eq!(startup["provenance"], "declared", "{raw}");
+    assert_eq!(
+        startup["over_limit"],
+        json!({"domain": "gpu0", "bytes": (14_i64 << 30) + overhead, "limit_bytes": 15052_i64 << 20}),
+        "{raw}"
+    );
+    let text = validate_text(&args);
+    assert!(
+        text.contains(
+            "a start needs 15.2 GiB of gpu0, above the 14.7 GiB it manages, so it can never start"
+        ),
+        "{text}"
+    );
+}

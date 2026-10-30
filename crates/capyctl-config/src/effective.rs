@@ -38,8 +38,8 @@ pub use multi_gpu::{
 };
 // Owner decision 2026-09-23: the startup memory budget.
 pub use startup::{
-    startup_budget, startup_device_domains, startup_measure, validate_declared_startup,
-    StartupBudget, StartupMeasure, StartupProvenance,
+    startup_budget, startup_device_domains, startup_measure, startup_over_limit,
+    validate_declared_startup, StartupBudget, StartupMeasure, StartupOverLimit, StartupProvenance,
 };
 // Owner decision 2026-09-22 (1), ADR 0014 amendment A1: lifecycle timeouts.
 pub use timeouts::{

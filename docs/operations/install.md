@@ -572,6 +572,16 @@ deployment is refused with `insufficient_device_memory` and its numbers. A deplo
 name the `system` domain as well as the GPU's (`missing_system_allocation`
 otherwise); leaving them out and letting CapyCTL derive them is the portable form.
 
+**The first start is charged the Ready figure.** Until a first run measures
+the real peak on the card, a start is charged on the card the deployment's
+memory request plus the CUDA context (the Ready figure), or its
+`memory.startup` plus the CUDA context when it states one; host RAM is charged
+as when it runs. A card has no first start that runs alone on the machine, so a
+deployment whose startup charge on the card is above the card's managed limit
+can never start: `capyctl validate config --host` and `capyctl status
+deployment` name the card, the charge and the limit
+([configuration](configuration.md#engine-installation)).
+
 **One GPU per model; CapyCTL picks it.** On a machine with several GPUs, each GPU
 is its own domain. CapyCTL places a new instance on the GPU where it fits with the
 most room, and when none has room it parks or stops models on the GPU where the
