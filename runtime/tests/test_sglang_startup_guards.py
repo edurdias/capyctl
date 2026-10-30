@@ -594,5 +594,112 @@ class CutlassDslSearchPathTests(unittest.TestCase):
                              [str(site), str(vendor / "dsl_packages")])
 
 
+class EditableInstallationTests(unittest.TestCase):
+    """#198: an editable SGLang (the official lmsysorg/sglang image's layout)
+    is reachable only through its .pth hook, which the entry never runs.
+
+    Found 2026-10-23 on CapyCTL 0.1.7 with lmsysorg/sglang:v0.5.22: site-packages
+    holds `__editable__.sglang-0.5.22.pth` and its finder, the package lives under
+    /sgl-workspace/sglang/python/sglang, and every launch failed with the generic
+    `startup_error`. The entry's composition stays the verified site-packages
+    only (ADR 0008 amendment 2026-10-30: the fingerprint and drift flag cover no
+    tree outside it), and the failed import leaves through its own closed
+    `engine_import_failed`. CPU fakes only; never evidence a build serves.
+    """
+
+    def installation(self, root):
+        """A stdlib-only venv laid out as setuptools' editable install leaves it."""
+        environment = Path(root, "python")
+        venv.EnvBuilder(with_pip=False).create(environment)
+        python = str(environment / "bin" / "python")
+        site = Path(subprocess.run(
+            [python, "-I", "-B", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+            capture_output=True, text=True, timeout=15, check=True).stdout.strip())
+        # The source checkout, outside the environment, with a sibling module
+        # the checkout's parent directory would also expose.
+        checkout = Path(root, "sgl-workspace", "sglang", "python")
+        package = checkout / "sglang"
+        (package / "srt" / "entrypoints").mkdir(parents=True)
+        for module in ("__init__.py", "srt/__init__.py", "srt/entrypoints/__init__.py",
+                       "srt/entrypoints/http_server.py", "srt/server_args.py"):
+            (package / module).write_text("")
+        (checkout / "sibling.py").write_text("")
+        marker = Path(root, "pth-hook-executed")
+        # setuptools' PEP 660 finder, reduced to its mapping, with a marker write.
+        (site / "__editable___sglang_0_5_22_finder.py").write_text(textwrap.dedent(f'''
+            import importlib.util, pathlib, sys
+            MAPPING = {{"sglang": {str(package)!r}}}
+            class _EditableFinder:
+                @classmethod
+                def find_spec(cls, fullname, path=None, target=None):
+                    if fullname not in MAPPING:
+                        return None
+                    root = MAPPING[fullname]
+                    return importlib.util.spec_from_file_location(
+                        fullname, root + "/__init__.py", submodule_search_locations=[root])
+            def install():
+                pathlib.Path({str(marker)!r}).write_text("executed")
+                sys.meta_path.append(_EditableFinder)
+        '''))
+        (site / "__editable__.sglang-0.5.22.pth").write_text(
+            "import __editable___sglang_0_5_22_finder; "
+            "__editable___sglang_0_5_22_finder.install()\n")
+        dist = site / "sglang-0.5.22.dist-info"
+        dist.mkdir()
+        (dist / "METADATA").write_text("Metadata-Version: 2.1\nName: sglang\nVersion: 0.5.22\n")
+        (dist / "direct_url.json").write_text(json.dumps(
+            {"url": "file://" + str(checkout), "dir_info": {"editable": True}}))
+        return python, site, checkout, marker
+
+    # T21 #198
+    def test_an_editable_sglang_fails_with_its_own_code_and_its_pth_never_runs(self):
+        with tempfile.TemporaryDirectory() as root:
+            python, site, checkout, marker = self.installation(root)
+            # Positive control: with site processing the hook runs and SGLang imports.
+            control = subprocess.run(
+                [python, "-I", "-B", "-c", "from sglang.srt.entrypoints import http_server"],
+                capture_output=True, timeout=15)
+            self.assertEqual(control.returncode, 0, control.stderr)
+            self.assertTrue(marker.exists(), "positive control did not execute the hook")
+            marker.unlink()
+            body = textwrap.dedent(f'''
+                import json, sys, types
+                assert (sys.flags.isolated, sys.flags.no_site) == (1, 1)
+                package = types.ModuleType("runtime")
+                package.__path__ = [{str(Path(ROOT, "runtime"))!r}]
+                sys.modules["runtime"] = package
+                from runtime import sglang_entry as entry
+                before = list(sys.path)
+                entry._compose_search_path()
+                added = sys.path[len(before):]
+                try:
+                    entry._guarded_engine_import()
+                except entry.LaunchError as error:
+                    code = error.code
+                    context = error.__suppress_context__
+                assert "sglang" not in sys.modules
+                sys.__stdout__.write(json.dumps({{"added": added, "code": code,
+                                                  "suppressed": context,
+                                                  "hint": entry._hint(code)}}))
+            ''')
+            environment = {name: value for name, value in os.environ.items()
+                           if name not in ("SGLANG_PLUGINS", "SGLANG_PLATFORM")}
+            child = subprocess.run([python, "-IS", "-B", "-c", body], capture_output=True,
+                                   text=True, timeout=30,
+                                   env={**environment, "PYTHONDONTWRITEBYTECODE": "1"})
+            self.assertEqual(child.returncode, 0, child.stderr)
+            outcome = json.loads(child.stdout)
+            # The site-packages composed is the interpreter's own, never the
+            # checkout (the package root's grandparent) or its parent.
+            self.assertEqual(outcome["added"], [str(site)])
+            self.assertFalse(marker.exists(), "the .pth hook ran under the entry")
+            self.assertEqual(outcome["code"], "engine_import_failed")
+            self.assertTrue(outcome["suppressed"])
+            # Fixed operator text: no path, no exception detail.
+            self.assertTrue(outcome["hint"].startswith(" ("), outcome["hint"])
+            for detail in (str(checkout), str(site), "ModuleNotFoundError", "No module"):
+                self.assertNotIn(detail, outcome["hint"])
+
+
 if __name__ == "__main__":
     unittest.main()

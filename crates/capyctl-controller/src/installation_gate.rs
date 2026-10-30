@@ -62,7 +62,9 @@ pub struct DriftCheck {
     /// already reported (a new drift, a drift to a different digest, or one
     /// registration found and no launch reported yet).
     pub newly_drifted: Option<(String, String)>,
-    /// `Some(DRIFT_REFUSAL)` when the policy refuses the drifted launch.
+    /// `Some(DRIFT_REFUSAL)` when the policy refuses the drifted launch;
+    /// #198: `Some(installation_unsupported:editable)` for an editable
+    /// SGLang, whatever the policy.
     pub refused: Option<&'static str>,
 }
 
@@ -636,6 +638,69 @@ mod tests {
             EmbeddedInstallation::register("local", Engine::Vllm, &dir.path().join("vllm"), None);
         assert_eq!(installation.view()["state"], "unmeasured");
         assert_eq!(installation.check(InstallationDrift::Refuse).refused, None);
+    }
+
+    // T21 T22 #198 (ADR 0008 amendment 2026-10-30): standalone's own SGLang
+    // (`--sglang-bin`, `local_engine`, which `engine add` never checked)
+    // installed in editable mode, as the lmsysorg/sglang image does, is
+    // registered `unmeasured` and every Initialize is refused before any
+    // effect, `installation_unsupported:editable` with its hint, under either
+    // drift policy; nothing is journaled as drift.
+    #[tokio::test]
+    async fn an_editable_sglang_is_refused_before_any_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        std::fs::write(dir.path().join("bin/python3"), "").unwrap();
+        let site = dir.path().join("lib/python3.12/site-packages");
+        std::fs::create_dir_all(site.join("sglang-0.5.22.dist-info")).unwrap();
+        std::fs::write(
+            site.join("__editable__.sglang-0.5.22.pth"),
+            "import __editable___sglang_0_5_22_finder; __editable___sglang_0_5_22_finder.install()\n",
+        )
+        .unwrap();
+        let executable = dir.path().join("bin/python3");
+        let installation = Arc::new(EmbeddedInstallation::register(
+            "local",
+            Engine::Sglang,
+            &executable,
+            None,
+        ));
+        assert_eq!(installation.view()["state"], "unmeasured");
+        let (_state_dir, owner) = owned_state();
+        for policy in [InstallationDrift::Warn, InstallationDrift::Refuse] {
+            let check = installation.check(policy);
+            assert_eq!(
+                check,
+                DriftCheck {
+                    newly_drifted: None,
+                    refused: Some(capyctl_agent::installation::EDITABLE_REFUSAL)
+                }
+            );
+            let gate = InstallationGate {
+                inner: Arc::new(NeverInitialized),
+                owner: owner.clone(),
+                installation: installation.clone(),
+                policy,
+                host: "host-a".into(),
+                lmcache: None,
+            };
+            match gate.admitted().await {
+                Err(error @ RuntimeError::Refused(_)) => {
+                    let text = error.to_string();
+                    assert!(
+                        text.starts_with(
+                            "host policy refused the launch before any effect: \
+                             installation_unsupported:editable (SGLang is installed in editable mode"
+                        ),
+                        "{text}"
+                    );
+                    assert!(!text.contains(&dir.path().display().to_string()), "{text}");
+                }
+                other => panic!("an editable SGLang must be refused, got {other:?}"),
+            }
+        }
+        assert!(drift_events(&owner).is_empty());
+        assert_eq!(installation.view()["state"], "unmeasured");
     }
 
     // T21 T22 (ADR 0018 §5): the embedded host keeps one installation per
