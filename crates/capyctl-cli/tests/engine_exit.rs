@@ -29,7 +29,8 @@ use support::process::{free_port, free_ports, Guarded};
 /// streams for about 12 s. The worker starts one helper of its own before the
 /// engine serves (as a scheduler starts a compile worker pool), appended to
 /// `helpers.log`; the helper exits once `helper.exit` exists, and the worker
-/// lives on.
+/// lives on. While `fail.before.ready` exists, a start prints one line of
+/// engine output and exits 1 before it serves.
 const FAKE_VLLM: &str = r#"
 import json, os, sys, time, http.server
 args = sys.argv[1:]
@@ -37,6 +38,10 @@ here = os.path.dirname(os.path.abspath(__file__))
 key = os.environ.get("VLLM_API_KEY", "")
 with open(os.path.join(here, "launches.log"), "a") as f:
     f.write(str(os.getpid()) + "\n")
+if os.path.exists(os.path.join(here, "fail.before.ready")):
+    sys.stderr.write("torch.AcceleratorError: CUDA error: out of memory\n")
+    sys.stderr.flush()
+    sys.exit(1)
 port = int(args[args.index("--port") + 1])
 served = args[args.index("--served-model-name") + 1]
 ready_r, ready_w = os.pipe()
@@ -266,6 +271,27 @@ fn wait_gone(pid: i32, within: Duration) {
     }
 }
 
+/// `GET /management/v1/deployments/<id>/engine-log` on `management`.
+async fn engine_log(
+    management: &str,
+    token: &str,
+    deployment: &str,
+) -> (reqwest::StatusCode, Value) {
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://{management}/management/v1/deployments/{deployment}/engine-log"
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, response.json().await.unwrap_or(Value::Null))
+}
+
+/// What the fake engine prints when it fails before readiness.
+const FAILED_BEFORE_READY: &str = "CUDA error: out of memory";
+
 // ---------------------------------------------------------------- standalone
 
 struct Installation {
@@ -367,7 +393,8 @@ impl Installation {
         serde_json::from_slice(&out.stdout).unwrap_or(Value::Null)
     }
 
-    fn deploy(&self) -> String {
+    /// The deployment, accepted and activated; `wait` waits for it to serve.
+    fn deploy(&self, wait: bool) -> String {
         // Sized for the unified shape the binary publishes with its GPUs
         // pinned to none, from an explicit capacity rather than this
         // machine's (see `support::binary_template_memory`).
@@ -393,22 +420,35 @@ impl Installation {
         .expect("the unified template");
         let file = self.root.path().join("deployment.json");
         std::fs::write(&file, document.to_string()).unwrap();
-        let out = self.cli(&[
-            "deploy",
-            "model",
-            "--file",
-            file.to_str().unwrap(),
-            "--activate",
-            "--wait",
-            "--json",
-        ]);
+        let file = file.to_str().unwrap();
+        let mut args = vec!["deploy", "model", "--file", file, "--activate", "--json"];
+        if wait {
+            args.push("--wait");
+        }
+        let out = self.cli(&args);
         assert!(
             out.status.success(),
             "deploy: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         let deployed: Value = serde_json::from_slice(&out.stdout).unwrap();
-        deployed["deployment"]["id"].as_str().unwrap().to_owned()
+        // `--wait` prints the deployment; without it, the start's receipt.
+        deployed["deployment"]["id"]
+            .as_str()
+            .or(deployed["deployment_id"].as_str())
+            .unwrap_or_else(|| panic!("no deployment id: {deployed}"))
+            .to_owned()
+    }
+
+    /// `GET /management/v1/deployments/<id>/engine-log` with the admin token.
+    async fn engine_log(&self, deployment: &str) -> (reqwest::StatusCode, Value) {
+        let token = std::fs::read_to_string(self.state().join("identity/credentials"))
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("admin_token: "))
+            .unwrap()
+            .to_owned();
+        engine_log(&self.management, &token, deployment).await
     }
 }
 
@@ -445,7 +485,7 @@ async fn a_standalone_engine_exit_is_settled_and_relaunched_on_demand() {
         },
         Some("\"role\":\"standalone\""),
     );
-    let deployment = installation.deploy();
+    let deployment = installation.deploy(true);
     installation.served_within(Duration::from_secs(20)).await;
     let engine = installation.launches();
     assert_eq!(engine.len(), 1);
@@ -529,7 +569,7 @@ async fn a_helper_exit_after_ready_does_not_stop_a_standalone_engine() {
         },
         Some("\"role\":\"standalone\""),
     );
-    let deployment = installation.deploy();
+    let deployment = installation.deploy(true);
     installation.served_within(Duration::from_secs(20)).await;
     let (engine, worker) = (installation.launches()[0], installation.workers()[0]);
     let helper = installation.helpers()[0];
@@ -622,6 +662,53 @@ async fn a_helper_exit_after_ready_does_not_stop_a_standalone_engine() {
     wait_gone(helper, Duration::from_secs(5));
 }
 
+/// #226 (SPEC §13.3 / T21): a launch whose engine exits before readiness
+/// keeps its engine log readable through the management API once the
+/// launch is released, so its output tells a transient failure from a
+/// misfit. `files` reads the launch's file; `memory` reads the writer's
+/// buffer while it lingers after the engine exits.
+async fn a_standalone_launch_that_failed_before_ready_serves_its_engine_log(engine_logs: &str) {
+    let installation = Installation::new();
+    std::fs::write(
+        installation.root.path().join("engine/fail.before.ready"),
+        "",
+    )
+    .unwrap();
+    let setting = format!("host.engine_logs={engine_logs}");
+    let _role = Role::spawn(
+        {
+            let mut command = installation.command();
+            command.args(["start", "standalone", "--set", &setting]);
+            command
+        },
+        Some("\"role\":\"standalone\""),
+    );
+    let deployment = installation.deploy(false);
+    let (status, _) = status_until(
+        || installation.status(&deployment),
+        |state| state == "failed",
+        Duration::from_secs(30),
+    );
+    assert_eq!(installation.launches().len(), 1, "{status}");
+    let (code, body) = installation.engine_log(&deployment).await;
+    assert_eq!(code, 200, "{engine_logs}: {body}");
+    let text = body["text"].as_str().unwrap();
+    assert!(text.contains(FAILED_BEFORE_READY), "{engine_logs}: {text}");
+    assert!(body["incarnation"].is_string(), "{body}");
+}
+
+// T21
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_standalone_launch_that_failed_before_ready_serves_its_file_log() {
+    a_standalone_launch_that_failed_before_ready_serves_its_engine_log("files").await;
+}
+
+// T21
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_standalone_launch_that_failed_before_ready_serves_its_memory_log() {
+    a_standalone_launch_that_failed_before_ready_serves_its_engine_log("memory").await;
+}
+
 // -------------------------------------------------------------------- remote
 
 /// A server and one enrolled host on this machine.
@@ -632,6 +719,7 @@ struct TwoRoles {
     server_config: PathBuf,
     host_config: PathBuf,
     inference: String,
+    management: String,
 }
 
 impl TwoRoles {
@@ -645,6 +733,7 @@ impl TwoRoles {
             server_config: path.join("server.yaml"),
             host_config: path.join("host.yaml"),
             inference: String::new(),
+            management: String::new(),
             root,
         };
         for (state, role, config) in [
@@ -668,8 +757,10 @@ impl TwoRoles {
                 server["enrollment"][format!("{name}_address")] =
                     format!("https://{address}").into();
             }
-            if name == "inference" {
-                roles.inference = address;
+            match name {
+                "inference" => roles.inference = address,
+                "management" => roles.management = address,
+                _ => {}
             }
         }
         server["shutdown"] = json!({"drain_timeout": "10s"});
@@ -756,6 +847,116 @@ impl TwoRoles {
         credentials["api_key"].as_str().unwrap().to_owned()
     }
 
+    /// `GET /management/v1/deployments/<id>/engine-log` with the admin token.
+    async fn engine_log(&self, deployment: &str) -> (reqwest::StatusCode, Value) {
+        let credentials: Value = serde_json::from_slice(
+            &std::fs::read(self.server_state.join("identity/server-credentials.json")).unwrap(),
+        )
+        .unwrap();
+        let token = credentials["admin_token"].as_str().unwrap();
+        engine_log(&self.management, token, deployment).await
+    }
+
+    /// Start the server, enroll the host and start it: the two roles and the
+    /// host's id.
+    fn enrolled(&self) -> (Role, Role, String) {
+        let server = self.start("server");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !self
+            .manage(&["list", "hosts", "--format", "json"])
+            .status
+            .success()
+        {
+            assert!(Instant::now() < deadline, "the server never answered");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let invitation = self.root.path().join("host.join");
+        let out = self.manage(&[
+            "invite",
+            "host",
+            "--name",
+            "w13-host",
+            "--output",
+            invitation.to_str().unwrap(),
+        ]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = cli(
+            &self.host_state,
+            &[
+                "join",
+                "host",
+                "--join-file",
+                invitation.to_str().unwrap(),
+                "--config",
+                self.host_config.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let host = self.start("host");
+        let listed = self.hosts(1);
+        let host_id = listed["hosts"][0]["host_id"].as_str().unwrap().to_owned();
+        (server, host, host_id)
+    }
+
+    /// A deployment on `host_id`, accepted and activated; `wait` waits for it
+    /// to serve.
+    fn deploy(&self, host_id: &str, wait: bool) -> String {
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+        ))
+        .unwrap();
+        let mut deployment = golden["input"]["deployment"].clone();
+        deployment["host"] = host_id.into();
+        deployment["runtime_profile_revision"] =
+            golden["input"]["host"]["runtime_profiles"]["local"]["revision"].clone();
+        deployment["model"] = json!({
+            "source": {"type": "local", "path": self.root.path().join("models/toy")},
+            "content_fingerprint": "sha256:toy",
+            "revision": "r1"
+        });
+        deployment["residency"] = json!("restart_only");
+        deployment["engine_config"] = json!({"memory": {"kv_cache": "64MiB"}});
+        deployment["request_deadline"] = json!("900s");
+        for (phase, bytes) in [
+            ("cold", "256MiB"),
+            ("ready", "128MiB"),
+            ("parking", "128MiB"),
+            ("parked", "32MiB"),
+            ("wake", "256MiB"),
+        ] {
+            deployment["resources"][phase]["allocations"][0]["bytes"] = json!(bytes);
+            deployment["resources"][phase]["allocations"][0]["host_kv_bytes"] = json!("0B");
+        }
+        let file = self.root.path().join("deployment.json");
+        std::fs::write(&file, deployment.to_string()).unwrap();
+        let file = file.to_str().unwrap();
+        let mut args = vec!["deploy", "model", "--file", file, "--activate", "--json"];
+        if wait {
+            args.push("--wait");
+        }
+        let out = self.manage(&args);
+        assert!(
+            out.status.success(),
+            "deploy: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let deployed: Value = serde_json::from_slice(&out.stdout).unwrap();
+        // `--wait` prints the deployment; without it, the start's receipt.
+        deployed["deployment"]["id"]
+            .as_str()
+            .or(deployed["deployment_id"].as_str())
+            .unwrap_or_else(|| panic!("no deployment id: {deployed}"))
+            .to_owned()
+    }
+
     fn launches(&self) -> Vec<i32> {
         pids(&self.root.path().join("engine/launches.log"))
     }
@@ -835,94 +1036,8 @@ fn cli(state: &Path, args: &[&str]) -> std::process::Output {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_remote_engine_exit_is_reported_settled_and_relaunched_on_demand() {
     let roles = TwoRoles::new();
-    let _server = roles.start("server");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !roles
-        .manage(&["list", "hosts", "--format", "json"])
-        .status
-        .success()
-    {
-        assert!(Instant::now() < deadline, "the server never answered");
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let invitation = roles.root.path().join("host.join");
-    let out = roles.manage(&[
-        "invite",
-        "host",
-        "--name",
-        "w13-host",
-        "--output",
-        invitation.to_str().unwrap(),
-    ]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let out = cli(
-        &roles.host_state,
-        &[
-            "join",
-            "host",
-            "--join-file",
-            invitation.to_str().unwrap(),
-            "--config",
-            roles.host_config.to_str().unwrap(),
-        ],
-    );
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let _host = roles.start("host");
-    let listed = roles.hosts(1);
-    let host_id = listed["hosts"][0]["host_id"].as_str().unwrap().to_owned();
-
-    let golden: Value = serde_json::from_str(include_str!(
-        "../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
-    ))
-    .unwrap();
-    let mut deployment = golden["input"]["deployment"].clone();
-    deployment["host"] = host_id.clone().into();
-    deployment["runtime_profile_revision"] =
-        golden["input"]["host"]["runtime_profiles"]["local"]["revision"].clone();
-    deployment["model"] = json!({
-        "source": {"type": "local", "path": roles.root.path().join("models/toy")},
-        "content_fingerprint": "sha256:toy",
-        "revision": "r1"
-    });
-    deployment["residency"] = json!("restart_only");
-    deployment["engine_config"] = json!({"memory": {"kv_cache": "64MiB"}});
-    deployment["request_deadline"] = json!("900s");
-    for (phase, bytes) in [
-        ("cold", "256MiB"),
-        ("ready", "128MiB"),
-        ("parking", "128MiB"),
-        ("parked", "32MiB"),
-        ("wake", "256MiB"),
-    ] {
-        deployment["resources"][phase]["allocations"][0]["bytes"] = json!(bytes);
-        deployment["resources"][phase]["allocations"][0]["host_kv_bytes"] = json!("0B");
-    }
-    let file = roles.root.path().join("deployment.json");
-    std::fs::write(&file, deployment.to_string()).unwrap();
-    let out = roles.manage(&[
-        "deploy",
-        "model",
-        "--file",
-        file.to_str().unwrap(),
-        "--activate",
-        "--wait",
-        "--json",
-    ]);
-    assert!(
-        out.status.success(),
-        "deploy: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let deployed: Value = serde_json::from_slice(&out.stdout).unwrap();
-    let deployment = deployed["deployment"]["id"].as_str().unwrap().to_owned();
+    let (_server, _host, host_id) = roles.enrolled();
+    let deployment = roles.deploy(&host_id, true);
     roles.served_within(Duration::from_secs(30)).await;
     let engine = roles.launches();
     assert_eq!(engine.len(), 1);
@@ -979,4 +1094,28 @@ async fn a_remote_engine_exit_is_reported_settled_and_relaunched_on_demand() {
     let launches = roles.launches();
     assert_eq!(launches.len(), 2, "relaunched on demand: {launches:?}");
     assert!(alive(launches[1]));
+}
+
+/// #226 (SPEC §13.3 / T21): a remote launch whose engine exits before
+/// readiness keeps its engine log readable through the management API after
+/// the host's Terminate released its claim and the server released the
+/// launch.
+// T21
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_launch_that_failed_before_ready_serves_its_engine_log() {
+    let roles = TwoRoles::new();
+    std::fs::write(roles.root.path().join("engine/fail.before.ready"), "").unwrap();
+    let (_server, _host, host_id) = roles.enrolled();
+    let deployment = roles.deploy(&host_id, false);
+    let (status, _) = status_until(
+        || roles.status(&deployment),
+        |state| state == "failed",
+        Duration::from_secs(40),
+    );
+    assert_eq!(roles.launches().len(), 1, "{status}");
+    let (code, body) = roles.engine_log(&deployment).await;
+    assert_eq!(code, 200, "{body}");
+    let text = body["text"].as_str().unwrap();
+    assert!(text.contains(FAILED_BEFORE_READY), "{text}");
+    assert_eq!(body["host_id"], host_id.as_str(), "{body}");
 }
