@@ -182,33 +182,44 @@ pub const EDITABLE_REFUSAL: &str = "installation_unsupported:editable";
 /// (`pip install -e`, the lmsysorg/sglang image's layout) leaves no package
 /// there, only a `.pth` hook pointing at a source checkout outside the
 /// environment, which the registered fingerprint and drift flag do not
-/// cover, so it is refused rather than added to the path. A regular package
-/// in `site-packages` is never refused, whatever else lies beside it. Reads
-/// directory entries and at most one small `direct_url.json`; nothing runs.
+/// cover, so it is refused rather than added to the path. A package directory
+/// in `site-packages` is never refused, whatever else lies beside it, nor is
+/// a link to one: the entry imports it through the link (measurement still
+/// calls it `unmeasured`, since it never follows links). Reads directory
+/// entries and at most one small `direct_url.json`; nothing runs.
 pub fn unsupported_installation(engine: Engine, executable: &Path) -> Option<&'static str> {
     if engine != Engine::Sglang {
         return None;
     }
     let package = package_name(engine)?;
-    if site_packages_holding(package, executable) != Err(FingerprintError::NotFound) {
-        return None;
-    }
     let prefix = interpreter(executable)?.parent()?.parent()?.to_path_buf();
-    let entries = std::fs::read_dir(prefix.join("lib")).ok()?;
-    entries
+    let sites: Vec<PathBuf> = std::fs::read_dir(prefix.join("lib"))
+        .ok()?
         .flatten()
         .take(MAX_LIB_ENTRIES)
         .filter(|entry| entry.file_name().as_bytes().starts_with(b"python3."))
-        .any(|entry| editable_in(&entry.path().join("site-packages"), package))
+        .map(|entry| entry.path().join("site-packages"))
+        .collect();
+    if sites
+        .iter()
+        .any(|site| std::fs::metadata(site.join(package)).is_ok_and(|m| m.is_dir()))
+    {
+        return None;
+    }
+    sites
+        .iter()
+        .any(|site| editable_in(site, package))
         .then_some(EDITABLE_REFUSAL)
 }
 
 /// Whether `site` records `package` as an editable install: setuptools'
 /// `__editable__.<package>-<version>.pth` or its
-/// `__editable___<package>_<version>_finder.py` (PEP 660), a legacy
-/// `<package>.egg-link`, or the package's own `direct_url.json` saying
-/// `"dir_info": {"editable": true}` (PEP 610, written by pip for any build
-/// backend).
+/// `__editable___<package>_<version>_finder.py` (PEP 660; the version starts
+/// with a digit, so another distribution's, such as sgl-router's
+/// `__editable___sglang_router_<version>_finder.py`, is not this one), a
+/// legacy `<package>.egg-link`, or the package's own `direct_url.json`
+/// saying `"dir_info": {"editable": true}` (PEP 610, written by pip for any
+/// build backend).
 fn editable_in(site: &Path, package: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(site) else {
         return false;
@@ -218,12 +229,15 @@ fn editable_in(site: &Path, package: &str) -> bool {
         format!("__editable___{package}_"),
         format!("{package}.egg-link"),
     );
+    let versioned = |name: &str, prefix: &str, suffix: &str| {
+        name.strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+            && name.ends_with(suffix)
+    };
     for entry in entries.flatten().take(MAX_SITE_ENTRIES) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if (name.starts_with(&pth) && name.ends_with(".pth"))
-            || (name.starts_with(&finder) && name.ends_with("_finder.py"))
-            || name == link
+        if versioned(&name, &pth, ".pth") || versioned(&name, &finder, "_finder.py") || name == link
         {
             return true;
         }
@@ -1521,6 +1535,54 @@ mod tests {
             )
             .unwrap()
             .starts_with(DIGEST_PREFIX));
+    }
+
+    // T21 #198 (review): sgl-router's editable hook names
+    // `__editable___sglang_router_<version>_finder.py`, which is not SGLang's;
+    // and a `site-packages/sglang` that is a link to a package directory is
+    // imported by the entry through the link, so neither is refused (the link
+    // is still `unmeasured`: measurement never follows links).
+    #[test]
+    fn another_distributions_hook_and_a_linked_package_are_not_refused() {
+        let router = [
+            ("__editable__.sglang_router-0.3.1.pth", "import x\n"),
+            (
+                "__editable___sglang_router_0_3_1_finder.py",
+                "MAPPING = {}\n",
+            ),
+        ];
+        let dir = editable_venv(router[0].0, router[0].1);
+        let site = dir.path().join("lib/python3.12/site-packages");
+        std::fs::write(site.join(router[1].0), router[1].1).unwrap();
+        let executable = dir.path().join("bin/python3");
+        assert_eq!(unsupported_installation(Engine::Sglang, &executable), None);
+
+        // SGLang's package linked into site-packages, beside sgl-router's
+        // hooks and even a stale SGLang one.
+        let checkout = dir.path().join("sgl-workspace/sglang/python/sglang");
+        std::os::unix::fs::symlink(&checkout, site.join("sglang")).unwrap();
+        std::fs::write(site.join("__editable__.sglang-0.5.21.pth"), "import x\n").unwrap();
+        assert_eq!(unsupported_installation(Engine::Sglang, &executable), None);
+        assert_eq!(
+            InstallationMeasurer::new().measure(Engine::Sglang, &executable),
+            Err(FingerprintError::NotFound)
+        );
+        assert_eq!(
+            InstallationRegistry::from_inventory(&Default::default()).verify(
+                "local",
+                Engine::Sglang,
+                &executable,
+                InstallationDrift::Refuse
+            ),
+            Ok(String::new())
+        );
+        // A link to nothing is no package: the stale hook is SGLang's own.
+        std::fs::remove_file(site.join("sglang")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone"), site.join("sglang")).unwrap();
+        assert_eq!(
+            unsupported_installation(Engine::Sglang, &executable),
+            Some(EDITABLE_REFUSAL)
+        );
     }
 
     // T21 T22: drift is flagged in status and refused only when the host
