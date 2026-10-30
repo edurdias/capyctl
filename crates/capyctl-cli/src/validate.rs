@@ -372,8 +372,9 @@ fn resolve_on_host(
             "request_deadline_ms": effective.request_deadline_ms,
             "timeouts": effective.timeouts,
             // Owner decision 2026-09-23: what admission reserves from arm
-            // until Ready, before any measurement on the host.
-            "startup": capyctl_config::effective::startup_budget(&effective),
+            // until Ready, before any measurement on the host; #219: and the
+            // card it is above the managed limit of, when it can never start.
+            "startup": startup_view(&effective),
             // ADR 0014 §5 (owner decision 2026-09-25): the context the launch
             // passes, fitted to the KV grant when undeclared, read from the
             // checkpoint as this machine sees it (a remote host fits it again
@@ -474,6 +475,34 @@ fn resolve_group(
         "requires_server": requires_server,
         "hosts": resolved.into_iter().map(|(out, _)| out).collect::<Vec<_>>(),
     }))
+}
+
+/// Owner decision 2026-09-23: the startup reservation and its provenance.
+/// ADR 0019 §3: on a discrete GPU also the card's part (`device_bytes`, per
+/// GPU) and host RAM's (`host_bytes`), as status shows them. #219: and,
+/// when a card's part is above its managed limit, that card, its charge and
+/// its limit (`over_limit`): such a deployment can never start.
+fn startup_view(effective: &capyctl_config::effective::EffectiveDeployment) -> Value {
+    let mut view = json!(capyctl_config::effective::startup_budget(effective));
+    let devices = capyctl_config::effective::startup_device_domains(effective);
+    if !devices.is_empty() {
+        let (device, host) = effective.resources.cold.allocations.iter().fold(
+            (0_i64, 0_i64),
+            |(device, host), allocation| {
+                if devices.contains(&allocation.domain) {
+                    (device.max(allocation.bytes), host)
+                } else {
+                    (device, host.saturating_add(allocation.bytes))
+                }
+            },
+        );
+        view["device_bytes"] = json!(device);
+        view["host_bytes"] = json!(host);
+    }
+    if let Some(over) = capyctl_config::effective::startup_over_limit(effective) {
+        view["over_limit"] = json!(over);
+    }
+    view
 }
 
 /// Final review I10 (ADR 0014 §5, §7): a provisional resolution is sized
