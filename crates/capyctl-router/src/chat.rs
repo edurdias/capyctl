@@ -316,7 +316,7 @@ pub async fn dispatch(
         std::sync::Arc::new(crate::request_id::RequestIds::untracked()),
     )
     .await
-    .map(|(response, _)| response)
+    .map(|(response, _)| response.into_value())
 }
 
 /// As [`dispatch`], for `endpoint`, timing the request (SPEC §17). Returns the
@@ -338,7 +338,10 @@ pub async fn dispatch_timed(
     received: tokio::time::Instant,
     mut timing: RequestTiming,
     ids: std::sync::Arc<crate::request_id::RequestIds>,
-) -> Result<(serde_json::Value, RequestTiming), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<
+    (capyctl_adapters::answer::EngineAnswer, RequestTiming),
+    (StatusCode, Json<serde_json::Value>),
+> {
     // SPEC §10 step 1 and T19: resolve, wait if needed, take an in-flight slot.
     let (deployment_id, guard, view) =
         admit_timed(deps, endpoint, model, body_bytes, received, &mut timing).await?;
@@ -760,6 +763,23 @@ pub(crate) async fn close_lease(
     }
 }
 
+/// SPEC §10 (issue #223): a completed answer goes to the caller as the
+/// engine's bytes, with only the members CapyCTL set written anew. An answer
+/// is encoded from what was parsed from it, so this does not fail in practice.
+pub(crate) fn relay(
+    answer: &capyctl_adapters::answer::EngineAnswer,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    use axum::response::IntoResponse;
+    let body = answer
+        .encode()
+        .map_err(|_| err("engine_error", "the engine's answer could not be relayed"))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response())
+}
+
 fn err(code: &str, message: &str) -> (StatusCode, Json<serde_json::Value>) {
     (
         match code {
@@ -851,7 +871,8 @@ impl capyctl_adapters::traits::ChatForward for NoForward {
     async fn forward_chat(
         &self,
         _body: &capyctl_adapters::request::InferenceRequest,
-    ) -> Result<serde_json::Value, capyctl_adapters::traits::AdapterError> {
+    ) -> Result<capyctl_adapters::answer::EngineAnswer, capyctl_adapters::traits::AdapterError>
+    {
         Err(capyctl_adapters::traits::AdapterError::UnsupportedCapability)
     }
 }

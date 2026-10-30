@@ -284,7 +284,7 @@ async fn chat_completion(
         }
         return Ok(response);
     }
-    let (mut json, timing) = chat::dispatch_timed(
+    let (mut answer, timing) = chat::dispatch_timed(
         deps,
         endpoint,
         &model,
@@ -296,18 +296,18 @@ async fn chat_completion(
     )
     .await?;
     // SPEC §17 (owner decision 2026-10-09): every answer carries its figures.
-    engine_metrics::attach(&mut json, &timing);
-    Ok(with_timing(Json(json).into_response(), &timing))
+    engine_metrics::attach(&mut answer, &timing);
+    Ok(with_timing(chat::relay(&answer)?, &timing))
 }
 
 /// `POST /v1/systemone` — ADR 0030 §2: a decision request, admitted, leased
 /// and settled exactly as a chat completion, for `api: decisions` deployments
-/// only. It is never streamed. The answer is the engine's, with `model` the
-/// public name and its `usage` as the engine sent it, plus the request's
-/// figures in `capyctl.metrics` (SPEC §17, owner decision 2026-10-19; see
-/// [`engine_metrics::attach_decision`]). Its timings are recorded like any
-/// request's, and it carries the request's IDs as a chat answer does (SPEC
-/// §10).
+/// only. It is never streamed. The answer is the engine's bytes, with `model`
+/// the public name, plus the request's figures in `capyctl.metrics` (SPEC
+/// §17, owner decision 2026-10-19; see [`engine_metrics::attach_decision`]);
+/// everything else, `usage` and every probability, is as the engine wrote it
+/// (SPEC §10, issue #223). Its timings are recorded like any request's, and
+/// it carries the request's IDs as a chat answer does (SPEC §10).
 async fn systemone(
     state: axum::extract::State<AppState>,
     headers: HeaderMap,
@@ -326,7 +326,7 @@ async fn decision(
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     let endpoint = endpoint::Endpoint::Decisions;
     let received = receive(deps, headers, ids, body, endpoint).await?;
-    let (mut json, timing) = chat::dispatch_timed(
+    let (mut answer, timing) = chat::dispatch_timed(
         deps,
         endpoint,
         &received.model,
@@ -337,8 +337,8 @@ async fn decision(
         ids.clone(),
     )
     .await?;
-    engine_metrics::attach_decision(&mut json, &timing);
-    Ok(with_timing(Json(json).into_response(), &timing))
+    engine_metrics::attach_decision(&mut answer, &timing);
+    Ok(with_timing(chat::relay(&answer)?, &timing))
 }
 
 /// SPEC §17: the request's timing header, when the operator enabled it.

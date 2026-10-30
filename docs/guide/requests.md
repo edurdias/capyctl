@@ -44,11 +44,15 @@ curl -s http://127.0.0.1:8443/v1/chat/completions \
 ```
 
 ```text
-{"capyctl":{"metrics":{"ttft_ms":{"source":"router","value":212.4}}},"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Hello! How can I help you today?","role":"assistant"}}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion"}
+{"id":"chatcmpl-1","object":"chat.completion","created":1790466091,"model":"my-model","choices":[{"index":0,"message":{"content":"Hello! How can I help you today?","role":"assistant"},"finish_reason":"stop"}],"capyctl":{"metrics":{"ttft_ms":{"source":"router","value":212.4}}}}
 ```
 
 The answer text comes from your model; this one is an example. `capyctl`
-holds the request's [metrics](#per-request-metrics).
+holds the request's [metrics](#per-request-metrics). CapyCTL reads the
+engine's stream and collects it into this answer; what the engine reported
+(`id`, `created`, each token's log probabilities, `usage` and the engine's
+own statistics) keeps the engine's key order and its numbers exactly as the
+engine wrote them, and only `model` is set to the name you sent.
 
 ## Streaming
 
@@ -61,23 +65,23 @@ curl -s http://127.0.0.1:8443/v1/chat/completions \
 ```
 
 ```text
-data: {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":null,"index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1790466091,"model":"my-model","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
 
-data: {"choices":[{"delta":{"content":"Hello!"},"finish_reason":null,"index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1790466091,"model":"my-model","choices":[{"index":0,"delta":{"content":"Hello!"},"finish_reason":null}]}
 
-data: {"choices":[{"delta":{"content":" How"},"finish_reason":null,"index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1790466091,"model":"my-model","choices":[{"index":0,"delta":{"content":" How"},"finish_reason":null}]}
 
-data: {"choices":[{"delta":{"content":" can"},"finish_reason":null,"index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1790466091,"model":"my-model","choices":[{"index":0,"delta":{"content":" can"},"finish_reason":null}]}
 
-data: {"choices":[{"delta":{"content":" I"},"finish_reason":null,"index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1790466091,"model":"my-model","choices":[{"index":0,"delta":{"content":" I"},"finish_reason":null}]}
 
-data: {"choices":[{"delta":{"content":" help"},"finish_reason":null,"index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1790466091,"model":"my-model","choices":[{"index":0,"delta":{"content":" help"},"finish_reason":null}]}
 
-data: {"choices":[{"delta":{"content":" you"},"finish_reason":null,"index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1790466091,"model":"my-model","choices":[{"index":0,"delta":{"content":" you"},"finish_reason":null}]}
 
-data: {"choices":[{"delta":{"content":" today?"},"finish_reason":null,"index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1790466091,"model":"my-model","choices":[{"index":0,"delta":{"content":" today?"},"finish_reason":null}]}
 
-data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1790466091,"model":"my-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
 : x-capyctl-metrics {"ttft_ms":{"source":"router","value":212.4}}
 
@@ -90,6 +94,8 @@ CapyCTL relays each chunk unchanged except `model`, and checks it first: a
 `delta` key not in this table ends the stream as unverified, so an untested
 field never reaches a client. Fields beside `delta` in a
 choice, and `usage` with its details, are relayed as the engine sent them.
+A relayed chunk is the engine's own bytes: its keys keep the engine's order
+and its numbers, log probabilities included, the engine's digits.
 
 | Field | Where | vLLM 0.29–0.31 | SGLang 0.5.18–0.5.21 | TensorFold 0.6.x | llama.cpp v0.6.0 |
 |---|---|---|---|---|---|
@@ -370,7 +376,7 @@ curl -s http://127.0.0.1:8443/v1/systemone \
 ```
 
 ```text
-{"answers":{"angry":{"noul":0.6226,"type":"noul"},"route":{"choice":"billing","confidence":0.9255,"probabilities":{"billing":0.9503,"shipping":0.0157,"technical":0.0339},"type":"choice"},"urgency":{"confidence":0.48,"legend":{"0":"can wait","1":"this week","2":"today"},"probabilities":{"0":0.08,"1":0.71,"2":0.21},"score":1.1224,"type":"score"}},"capyctl":{"metrics":{"input_tokens":{"source":"engine","value":87},"time_to_response_ms":{"source":"router","value":41.2},"total_ms":{"source":"router","value":43.9}}},"model":"my-decider","usage":{"input_tokens":87,"output_tokens":0}}
+{"model":"my-decider","answers":{"route":{"type":"choice","choice":"billing","probabilities":{"billing":0.9503,"shipping":0.0157,"technical":0.0339},"confidence":0.9255},"angry":{"type":"noul","noul":0.6226},"urgency":{"type":"score","score":1.1224,"legend":{"0":"can wait","1":"this week","2":"today"},"probabilities":{"0":0.08,"1":0.71,"2":0.21},"confidence":0.48}},"usage":{"input_tokens":87,"output_tokens":0},"capyctl":{"metrics":{"input_tokens":{"source":"engine","value":87},"time_to_response_ms":{"source":"router","value":41.2},"total_ms":{"source":"router","value":43.9}}}}
 ```
 
 The probabilities come from your model; these are an example, and they can
@@ -391,9 +397,11 @@ Any other field (an engine's own extension included) is answered
 `400 invalid_request` before the model is woken; the engine judges the rest
 (how many questions or options, required `instructions`) and its refusal comes
 back as `engine_rejected` with its status. A decision is never streamed. The
-answer is the engine's, with `model` set to the name you sent and its `usage`
-as the engine reported it, plus the request's figures in `capyctl.metrics`
-(see [Request IDs and metrics](#request-ids-and-metrics)). A parked or stopped
+answer is the engine's own bytes, with `model` set to the name you sent, plus
+the request's figures in `capyctl.metrics`
+(see [Request IDs and metrics](#request-ids-and-metrics)); everything else,
+`usage` and every probability, keeps the engine's key order and digits, so it
+is identical to what the engine itself answers. A parked or stopped
 decision model wakes or starts for the request, as a chat model does.
 
 A decision request carries no `cache_salt`. On SGLang a decision model runs
