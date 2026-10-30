@@ -936,8 +936,9 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" \
 `kib` defaults to 64 and may be 1 to 256; `instance` (the index `status
 deployment` shows) may be left out when the deployment has one instance. The
 read names the instance's latest launch: the one it runs, or, when none runs,
-the last one CapyCTL started for it, such as a launch that failed before it
-was ready (a host running an earlier CapyCTL answers `404` for that one). The
+the last one its current start made, such as a launch that failed before it
+was ready (a host running an earlier CapyCTL answers `404` for that one). An
+instance an operator stopped names no launch until it starts again. The
 answer, `{deployment_id, instance, host_id, incarnation, kib, truncated, text,
 read_at_ms}`, holds at most `kib` KiB of whole lines, redacted again on the way
 out, and `truncated: true` when older output exists. The read continues into

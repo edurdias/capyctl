@@ -170,9 +170,10 @@ impl crate::Store {
 
     /// #226 (SPEC §13.3 / T21): the newest released launch of instance
     /// `index` at `generation`. A launch that failed before readiness, or
-    /// exited or stopped since, is released but wrote an engine log; a
-    /// lifecycle step of a run at `generation` ties the binding to it, so an
-    /// earlier generation's launch is never named.
+    /// exited since, is released but wrote an engine log. Only the initialize
+    /// step that launched it ties a binding to `generation`: a stop draws a
+    /// new generation and steps on the launch it ends, so a stopped launch
+    /// is never named for the stop's generation.
     pub fn released_launch_at(
         &self,
         deployment_id: &str,
@@ -187,7 +188,8 @@ impl crate::Store {
                   WHERE b.deployment_id=?1 AND b.instance_index=?2 AND b.state='released'
                     AND EXISTS(SELECT 1 FROM lifecycle_steps s
                                  JOIN lifecycle_runs r ON r.operation_id=s.operation_id
-                                WHERE s.binding_id=b.id AND r.generation=?3)
+                                 JOIN operations o ON o.id=s.operation_id
+                                WHERE s.binding_id=b.id AND r.generation=?3 AND o.kind='initialize')
                   ORDER BY b.rowid DESC LIMIT 1",
             )?
             .query_row(params![deployment_id, index, generation], |r| {

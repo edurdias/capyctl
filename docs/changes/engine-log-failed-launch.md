@@ -11,9 +11,10 @@ promised the log ("The engine log says why the engine exited"), and the
 SPEC §13.3 / T21. The read now names the instance's latest launch:
 `engine_logs::launch_scope` still prefers the retained binding of the
 instance's current generation. When there is none, it takes the newest
-released binding of that generation (`Store::released_launch_at`, tied to the
-generation by a lifecycle step of a run at that generation, so an earlier
-generation's launch is never named). A released remote launch is read on the
+released binding of that generation (`Store::released_launch_at`). Only the
+initialize step that launched a binding ties it to a generation: a stop draws
+a new generation and steps on the launch it ends, so a stopped instance names
+no launch and an earlier generation's launch is never named. A released remote launch is read on the
 host its ingress was frozen to before it was sent (`remote_binding_ingress`),
 not the instance's current host, so a retry of the same generation placed on
 another host does not send the read there. On a host, the `EngineLogTail` gate was
@@ -34,7 +35,9 @@ Tests, failing before and passing after:
 `a_remote_launch_that_failed_before_ready_serves_its_engine_log` (a fake vLLM
 that prints one line and exits 1 before serving; before the fix, all three
 got `404 not_found`); `capyctl-store`
-`a_released_failed_launch_is_named_for_its_generation`; `capyctl-agent`
+`a_released_failed_launch_is_named_for_its_generation`; `capyctl-controller`
+`a_stopped_launch_is_not_named_for_the_stops_generation` (before the
+initialize-only tie it named the stopped launch); `capyctl-agent`
 `engine_log_tail_serves_an_accepted_launch_bounded_and_redacted` (now also
 reads after the launch's Terminate, and refuses another generation).
 
