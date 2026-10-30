@@ -2077,6 +2077,72 @@ async fn a_slow_gpu_sample_never_holds_the_journal_lock() {
     assert_eq!(stopped.state, "completed");
 }
 
+/// #225: the issue's 96 GB card (an RTX PRO 6000, 97887 MiB) and a vLLM
+/// deployment that declares its memory request from the peak it measured
+/// (43 GiB, with a 12 GiB KV cache) instead of letting CapyCTL derive it.
+fn pro_6000_fixture() -> Fixture {
+    let mut fixture = Fixture::build(Some(false), true, |_, deployment| {
+        deployment.as_object_mut().unwrap().remove("resources");
+        deployment["engine_config"]["memory"] = json!({"request": "43GiB", "kv_cache": "12GiB"});
+    });
+    fixture.config.document["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "8GiB", "free_reserve": "16MiB",
+                   "parked_limit": "256MiB", "host_kv_limit": "64MiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "90056MiB",
+                 "free_reserve": "7831MiB", "parked_limit": "2GiB"}
+    });
+    fixture.config.document["resource_policy"]["devices"] =
+        json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+    fixture
+}
+
+/// #225 (ADR 0019 §4 as amended): a vLLM deployment that declares its memory
+/// request on a discrete card is told that request's share of the card
+/// (43 GiB of 97887 MiB rounds up to 0.45), not 0.75 of it. vLLM checks at
+/// start that its share of the card is free, so with 0.75 a model holding a
+/// quarter of the card (the issue's 22.6 GiB SGLang deployment) kept it from
+/// starting although CapyCTL charged it 44.25 GiB. The KV bytes are the
+/// declared cache.
+// T26 T14
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_request_on_a_card_is_rendered_as_its_share() {
+    let fixture = pro_6000_fixture();
+    let mut host = host(&fixture);
+    let sampler: Arc<capyctl_agent::gpu_memory::GpuSampler> = Arc::new(move || {
+        capyctl_agent::gpu_memory::parse_query_gpu(
+            "0, GPU-11111111-2222-3333-4444-555555555555, 00000000:01:00.0, RTX PRO 6000, 97887, 0, 97887\n",
+            now_ms(),
+        )
+    });
+    host.executor = host.executor.clone().with_gpu_sampler(sampler);
+    let launch = fixture.launch();
+    host.executor.provision(launch.clone(), GATE).await.unwrap();
+    let ready = host
+        .executor
+        .execute(host.session, launch.clone())
+        .await
+        .expect("the agent launches on the discrete card");
+    assert!(ready.model_usable && ready.claim_retained, "{ready:?}");
+    let record = fixture.record().expect("the engine recorded its launch");
+    let argv: Vec<String> = serde_json::from_value(record["argv"].clone()).unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|w| w == ["--gpu-memory-utilization", "0.45"]),
+        "{argv:?}"
+    );
+    assert!(
+        argv.windows(2)
+            .any(|w| w == ["--kv-cache-memory-bytes", "12884901888"]),
+        "{argv:?}"
+    );
+    let stopped = host
+        .executor
+        .execute(host.session, fixture.stop(&launch))
+        .await
+        .unwrap();
+    assert_eq!(stopped.state, "completed");
+}
+
 // --------------------------------------------------------------- ADR 0033
 // A remote launch's LMCache server: started with the launch, re-proved with
 // it, kept by a restart-park, watched for its exit and stopped with it.

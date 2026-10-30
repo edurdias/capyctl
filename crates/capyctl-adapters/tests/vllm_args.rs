@@ -639,18 +639,24 @@ fn swap_space_is_never_rendered() {
 
 /// Discrete GPU design §6 (ADR 0019): on a discrete device vLLM gets the KV
 /// bytes of the grant and a `--gpu-memory-utilization` that is the device
-/// request's share of the card, rounded up to 0.01, at least 0.75 (vLLM 0.29
-/// with CUDA graphs does not start a 4B model on a 16 GB card below it) and at
-/// most 0.99.
+/// request's share of the card, rounded up to 0.01, at least the floor given
+/// (0.75 for a derived request: vLLM 0.29 with CUDA graphs did not start a 4B
+/// model on a 16 GB card below it; none for a declared one, #225) and at most
+/// 0.99.
 // T26
 #[test]
 fn a_discrete_launch_renders_kv_bytes_and_utilization() {
-    use capyctl_adapters::vllm::device_utilization_pct;
-    assert_eq!(device_utilization_pct(12 << 30, 16376 << 20), 76);
-    assert_eq!(device_utilization_pct(2 << 30, 16376 << 20), 75);
-    assert_eq!(device_utilization_pct(20 << 30, 16376 << 20), 99);
+    use capyctl_adapters::vllm::{device_utilization_pct, DEVICE_UTILIZATION_FLOOR_PCT};
+    let floor = DEVICE_UTILIZATION_FLOOR_PCT;
+    assert_eq!(device_utilization_pct(12 << 30, 16376 << 20, floor), 76);
+    assert_eq!(device_utilization_pct(2 << 30, 16376 << 20, floor), 75);
+    assert_eq!(device_utilization_pct(20 << 30, 16376 << 20, floor), 99);
+    // #225: a declared request's share, as it is.
+    assert_eq!(device_utilization_pct(2 << 30, 16376 << 20, 1), 13);
+    assert_eq!(device_utilization_pct(0, 16376 << 20, 1), 1);
     // A card total that was never observed cannot divide anything.
-    assert_eq!(device_utilization_pct(12 << 30, 0), 99);
+    assert_eq!(device_utilization_pct(12 << 30, 0, floor), 99);
+    assert_eq!(device_utilization_pct(12 << 30, 0, 1), 99);
     let mut input = base_input();
     input.granted.gpu_utilization_pct = Some(76);
     input.granted.kv_cache_bytes = Some(4 << 30);
