@@ -232,6 +232,9 @@ impl ChatSink for ProgressOnly {
 struct ResponseSink {
     tx: tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
     failed: bool,
+    /// #213: whether any engine chunk was handed to the client's channel. An
+    /// attempted delivery counts, since it may have reached the client.
+    relayed: bool,
     /// SPEC §17 (M80): this request's clock; chunks mark it as they arrive.
     timing: crate::timing::RequestTiming,
     /// SPEC §10: backend progress, delivered or drained.
@@ -315,6 +318,7 @@ impl ChatSink for ResponseSink {
         // Set failure before awaiting so cancellation by the adapter's delivery
         // deadline cannot later append a successful terminal to partial output.
         self.failed = true;
+        self.relayed = true;
         let delivered =
             chunk.len() <= MAX_CHUNK_BYTES && self.deliver(Event::default().data(chunk)).await;
         if !delivered {
@@ -560,6 +564,7 @@ pub fn stream_planned_timed(
         let mut sink = ResponseSink {
             tx,
             failed: false,
+            relayed: false,
             timing,
             progress: progress.clone(),
             report: Default::default(),
@@ -764,8 +769,25 @@ pub fn stream_planned_timed(
         // uncertain stream would shrink the deployment's bound for the life of
         // the process. Without a durable ledger the slot is the only record
         // and stays taken. A panic retains it either way.
-        else if durable {
-            guard.release();
+        else {
+            if durable {
+                guard.release();
+            }
+            // #213: a forward that failed before anything reached the client
+            // is answered in-band, as a refusal is, rather than by closing an
+            // empty 200 stream. The answer is unverified, as the non-streamed
+            // one is, so it is not retryable; the accounting above is unchanged.
+            if !sink.relayed && !matches!(result, Ok(Ok(_))) {
+                let error = serde_json::json!({"error": {
+                    "code": "engine_error",
+                    "message": "backend completion unverified",
+                    "retryable": false}});
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    sink.tx.send(Ok(Event::default().data(error.to_string()))),
+                )
+                .await;
+            }
         }
         drop(sink);
     });

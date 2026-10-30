@@ -167,7 +167,14 @@ The inference endpoint answers HTTP errors with a JSON body holding `code` and
   before the engine answered them fill those places the same way until the
   engine's next stop; when they alone fill all 32, CapyCTL restarts the
   instance instead ([When a request is cut short](requests.md#when-a-request-is-cut-short)),
-  but not while an unverified request is among them.
+  but not while an unverified request is among them. On a stream that had
+  sent nothing yet, this arrives as an error event with the same code and
+  message and `retryable` set to `false`; the stream is never left empty.
+- `unavailable` (503, `retryable: true`): among other causes, a serving
+  host's ingress was already forwarding as many requests as it allows (64)
+  and refused this one before it reached the engine. CapyCTL first tries
+  another instance of the model; this answer means none could take it. On a
+  stream it arrives as an error event.
 
 For decision models:
 
