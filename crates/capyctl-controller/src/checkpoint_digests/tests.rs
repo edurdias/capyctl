@@ -635,6 +635,106 @@ async fn the_embedded_gate_refuses_a_grown_draft_model() {
     );
 }
 
+/// #226: the checkpoint files a gate advised to drop from the page cache;
+/// `fail` makes every advice fail.
+#[derive(Default)]
+struct Advised {
+    fail: bool,
+    files: Mutex<Vec<String>>,
+}
+
+impl capyctl_agent::page_cache::PageCacheAdvice for Advised {
+    fn dont_need(&self, path: &str, _: std::os::fd::BorrowedFd<'_>) -> std::io::Result<()> {
+        self.files.lock().unwrap().push(path.to_owned());
+        if self.fail {
+            return Err(std::io::Error::from_raw_os_error(5)); // EIO
+        }
+        Ok(())
+    }
+}
+
+/// #226: an embedded gate over `f`'s first Initialize that advises through
+/// `advised`, with the engine calls it lets through.
+fn advised_gate(f: &Fixture, advised: Arc<Advised>) -> (Arc<CheckpointGate>, Arc<Counting>) {
+    let work = {
+        let o = f.owner.lock().unwrap();
+        o.store()
+            .accept_start(o.session(), &f.fence, 100, 100_100)
+            .unwrap();
+        o.store().next_initialize(o.session()).unwrap().unwrap()
+    };
+    let inner = Arc::new(Counting::default());
+    let gate = CheckpointGate::with_page_cache_advice(
+        inner.clone(),
+        f.owner.clone(),
+        Arc::new(CheckpointVerifier::in_memory()),
+        &work,
+        advised,
+    );
+    (gate, inner)
+}
+
+// #226 (SPEC §7.2): on unified memory the embedded gate gives back the page
+// cache of every file of the checkpoint after it verified it, before the
+// engine is asked to start one. A parked engine's wake keeps its context and
+// is left alone; a restart-parked deployment's wake starts a new engine and
+// gives it back too. An advice that fails stops nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_embedded_gate_drops_the_checkpoint_page_cache_before_an_engine_starts() {
+    for (residency, fail) in [("deep", false), ("restart_only", false), ("deep", true)] {
+        let f = fixture(|deployment| deployment["residency"] = json!(residency));
+        let toy = f.models.path().join("toy");
+        std::fs::create_dir_all(toy.join("nested")).unwrap();
+        std::fs::write(toy.join("nested/vocab.txt"), "a b c").unwrap();
+        std::fs::write(toy.join(".download.lock"), "").unwrap();
+        let advised = Arc::new(Advised {
+            fail,
+            ..Default::default()
+        });
+        let (gate, inner) = advised_gate(&f, advised.clone());
+        let case = format!("{residency}, failing: {fail}");
+        let _ = gate
+            .execute_persisted(&step(&f, RuntimeAction::Initialize))
+            .await;
+        assert_eq!(inner.0.load(Ordering::SeqCst), 1, "{case}");
+        let files = ["config.json", "model.safetensors", "nested/vocab.txt"];
+        assert_eq!(*advised.files.lock().unwrap(), files, "{case}");
+        let _ = gate
+            .execute_persisted(&step(&f, RuntimeAction::Restore))
+            .await;
+        assert_eq!(inner.0.load(Ordering::SeqCst), 2, "{case}");
+        let restarted = if residency == "restart_only" { 2 } else { 1 };
+        assert_eq!(
+            advised.files.lock().unwrap().len(),
+            files.len() * restarted,
+            "{case}"
+        );
+    }
+}
+
+// T26 (#226, ADR 0019): on memory distinct from the GPU's the embedded gate
+// leaves the page cache alone. The store keeps one policy per fixture, so the
+// gate's resolved domain is turned `distinct` in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_embedded_gate_leaves_the_page_cache_alone_on_distinct_memory() {
+    let f = fixture(|_| {});
+    let advised = Arc::new(Advised::default());
+    let (mut gate, inner) = advised_gate(&f, advised.clone());
+    Arc::get_mut(&mut gate)
+        .unwrap()
+        .effective
+        .host
+        .domains
+        .get_mut("unified")
+        .unwrap()
+        .memory = capyctl_config::effective::DomainMemory::Distinct;
+    let _ = gate
+        .execute_persisted(&step(&f, RuntimeAction::Initialize))
+        .await;
+    assert_eq!(inner.0.load(Ordering::SeqCst), 1);
+    assert!(advised.files.lock().unwrap().is_empty());
+}
+
 // T37, ADR 0014 §7: a checkpoint that cannot be measured says why; only a
 // measured difference is a digest mismatch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

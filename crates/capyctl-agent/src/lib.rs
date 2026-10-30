@@ -43,6 +43,8 @@ pub mod load;
 pub mod memory;
 // ADR 0007: per-process resident memory, sampled beside availability.
 pub mod process_residency;
+// #226 (SPEC §7.2): a launch's checkpoint page cache, dropped on unified memory.
+pub mod page_cache;
 // SPEC §8.2 / T21: per-launch SGLang rendezvous directories, removed on gone.
 pub mod rendezvous;
 // ADR 0023 §3: the private per-version TensorFold build cache.
