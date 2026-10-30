@@ -314,7 +314,7 @@ impl ChatForward for CustomAdapter {
     async fn forward_chat(
         &self,
         body: &crate::request::InferenceRequest,
-    ) -> Result<serde_json::Value, AdapterError> {
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         self.forward.forward_chat(body).await
     }
 
@@ -322,14 +322,14 @@ impl ChatForward for CustomAdapter {
         &self,
         body: &crate::request::InferenceRequest,
         observer: &mut dyn ChatSink,
-    ) -> Result<serde_json::Value, AdapterError> {
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         self.forward.forward_chat_observed(body, observer).await
     }
 
     async fn forward_decision(
         &self,
         body: &crate::request::InferenceRequest,
-    ) -> Result<serde_json::Value, AdapterError> {
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         self.forward.forward_decision(body).await
     }
 

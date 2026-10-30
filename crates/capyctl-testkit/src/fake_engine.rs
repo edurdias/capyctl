@@ -590,23 +590,24 @@ impl capyctl_adapters::traits::ChatForward for FakeEngine {
     async fn forward_decision(
         &self,
         body: &capyctl_adapters::request::InferenceRequest,
-    ) -> Result<serde_json::Value, AdapterError> {
-        self.decision_response(body)
+    ) -> Result<capyctl_adapters::answer::EngineAnswer, AdapterError> {
+        self.decision_response(body).map(Into::into)
     }
     async fn forward_chat(
         &self,
         body: &capyctl_adapters::request::InferenceRequest,
-    ) -> Result<serde_json::Value, AdapterError> {
+    ) -> Result<capyctl_adapters::answer::EngineAnswer, AdapterError> {
         self.chat()?;
         if let Some(state) = self.lifecycle.lock().unwrap().as_mut() {
-            return state.forward(body);
+            return state.forward(body).map(Into::into);
         }
         let model = body["model"].as_str().unwrap_or("fake").to_string();
         Ok(serde_json::json!({
             "id": "fake-completion",
             "model": model,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}]
-        }))
+        })
+        .into())
     }
 
     async fn forward_chat_stream(

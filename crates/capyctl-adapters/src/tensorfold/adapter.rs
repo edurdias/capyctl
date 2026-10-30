@@ -220,7 +220,7 @@ impl ChatForward for TensorfoldAdapter {
     async fn forward_chat(
         &self,
         body: &crate::request::InferenceRequest,
-    ) -> Result<serde_json::Value, AdapterError> {
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         self.forward.forward_chat(body).await
     }
 
@@ -228,7 +228,7 @@ impl ChatForward for TensorfoldAdapter {
         &self,
         body: &crate::request::InferenceRequest,
         observer: &mut dyn ChatSink,
-    ) -> Result<serde_json::Value, AdapterError> {
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         self.forward.forward_chat_observed(body, observer).await
     }
 

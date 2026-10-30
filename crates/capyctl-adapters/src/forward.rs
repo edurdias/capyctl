@@ -1,8 +1,10 @@
 //! Shared, bounded text-chat transport. Terminal success is not lifecycle or
 //! readiness evidence; cancellation and partial output never prove idle.
-use crate::request::{InferenceRequest, StrictValue};
+use crate::answer::EngineAnswer;
+use crate::request::{splice, InferenceRequest, Members, StrictValue};
 use crate::traits::{AdapterError, ChatSink, DeliveryFailed, StreamEnded};
 use futures::StreamExt;
+use serde_json::value::RawValue;
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -525,7 +527,10 @@ impl ChatHttp {
     /// The callback path's collection, with the transport's own bounds (60 s
     /// between reads, 300 s overall), for callers that bound nothing
     /// themselves. The router uses [`ChatHttp::collect_observed`] instead.
-    pub(crate) async fn collect(&self, body: &InferenceRequest) -> Result<Value, AdapterError> {
+    pub(crate) async fn collect(
+        &self,
+        body: &InferenceRequest,
+    ) -> Result<EngineAnswer, AdapterError> {
         tokio::time::timeout(
             Duration::from_secs(300),
             self.collect_observed(body, &mut NoObserver, Some(Duration::from_secs(60))),
@@ -543,7 +548,7 @@ impl ChatHttp {
         body: &InferenceRequest,
         observer: &mut dyn ChatSink,
         read_idle: Option<Duration>,
-    ) -> Result<Value, AdapterError> {
+    ) -> Result<EngineAnswer, AdapterError> {
         let mut chunks = Vec::new();
         let end = self
             .stream_inner(
@@ -612,7 +617,7 @@ pub(crate) async fn startup_probe(
     engine: &(dyn crate::traits::ChatForward + '_),
     body: &InferenceRequest,
     budget: Duration,
-) -> Option<Result<Value, AdapterError>> {
+) -> Option<Result<EngineAnswer, AdapterError>> {
     tokio::time::timeout(budget, engine.forward_chat_observed(body, &mut NoObserver))
         .await
         .ok()
@@ -667,11 +672,48 @@ pub fn probe_answered(answer: &Value) -> bool {
         })
 }
 
+/// One streamed choice as a collected answer reads it: its delta and finish
+/// reason parsed, its log probabilities kept as the engine's bytes.
+#[derive(serde::Deserialize)]
+struct StreamedChoice<'a> {
+    #[serde(default)]
+    delta: Value,
+    #[serde(default)]
+    finish_reason: Value,
+    #[serde(borrow, default)]
+    logprobs: Option<&'a RawValue>,
+}
+
+/// A streamed choice's `logprobs` object, each token's entry as its bytes.
+#[derive(serde::Deserialize)]
+struct StreamedLogprobs<'a> {
+    #[serde(borrow, default)]
+    content: Option<Vec<&'a RawValue>>,
+}
+
+/// Append `"key":value` to the JSON object being written in `out`, which
+/// starts with its `{`; `value` goes as its bytes.
+fn member(out: &mut Vec<u8>, key: &str, value: &[u8]) -> Result<(), serde_json::Error> {
+    if out.len() > 1 {
+        out.push(b',');
+    }
+    serde_json::to_writer(&mut *out, key)?;
+    out.push(b':');
+    out.extend_from_slice(value);
+    Ok(())
+}
+
 /// Assemble one non-streaming response from a completed stream's chunks.
-fn assemble(chunks: Vec<String>) -> Result<Value, AdapterError> {
+///
+/// SPEC §10 (issue #223): what the engine sent is relayed as its bytes: the
+/// first chunk's members in their order (its `model` already the public
+/// name), each token's log probabilities, and the last `usage`,
+/// `tensorfold`, `metrics` and `timings` reported. Only what collecting
+/// builds (the message, the choice, `object`) is written anew.
+fn assemble(chunks: Vec<String>) -> Result<EngineAnswer, AdapterError> {
     // A completed stream always carried a chunk; never index blindly.
     let first = chunks.first().ok_or_else(uncertain)?;
-    let mut response = serde_json::from_str::<Value>(first).map_err(|_| uncertain())?;
+    let Members(head) = serde_json::from_str(first).map_err(|_| uncertain())?;
     let mut content = String::new();
     let mut reasoning = [String::new(), String::new()];
     let mut tool_calls = std::collections::BTreeMap::new();
@@ -680,56 +722,62 @@ fn assemble(chunks: Vec<String>) -> Result<Value, AdapterError> {
     // arrive one chunk at a time and are concatenated in stream order, so a
     // collected response carries what the stream carried. `None` until an
     // engine sends any, which keeps the field absent when none was asked for.
-    let mut logprobs: Option<Vec<Value>> = None;
-    for chunk in chunks {
-        let chunk: Value = serde_json::from_str(&chunk).map_err(|_| uncertain())?;
-        if let Some(text) = chunk["choices"][0]["delta"]["content"].as_str() {
-            content.push_str(text);
-        }
-        for (field, trace) in REASONING_FIELDS.iter().zip(reasoning.iter_mut()) {
-            if let Some(text) = chunk["choices"][0]["delta"][*field].as_str() {
-                trace.push_str(text);
-            }
-        }
-        fold_tool_calls(&mut tool_calls, &chunk["choices"][0]["delta"]["tool_calls"]);
-        match &chunk["choices"][0]["logprobs"] {
-            Value::Null => {}
-            Value::Object(block) => match block.get("content") {
-                Some(Value::Array(tokens)) => logprobs
-                    .get_or_insert_with(Vec::new)
-                    .extend(tokens.iter().cloned()),
-                None | Some(Value::Null) => {}
-                Some(_) => return Err(uncertain()),
-            },
-            _ => return Err(uncertain()),
-        }
-        if !chunk["choices"][0]["finish_reason"].is_null() {
-            finish = chunk["choices"][0]["finish_reason"].clone();
-        }
-        // SGLang sends `"usage": null` on tool-call deltas; only a present
-        // usage object replaces what was collected.
-        if chunk.get("usage").is_some_and(|usage| !usage.is_null()) {
-            response["usage"] = chunk["usage"].clone();
-        }
-        // ADR 0023 §7: TensorFold's statistics ride the final chunk; a
-        // collected response carries them as the engine's own would. vLLM's
-        // per-request `metrics` ride its final usage chunk the same way
-        // (0.30 `ChatCompletionStreamResponse.metrics`), and llama.cpp's
-        // `timings` ride its last chunk (ADR 0029 §11; found live 2026-10-09:
-        // a collected answer had lost them, so `prefill_ms` was missing).
-        for field in ["tensorfold", "metrics", "timings"] {
-            if let Some(stats) = chunk.get(field).filter(|v| v.is_object()) {
-                response[field] = stats.clone();
-            }
-        }
-    }
-    response["object"] = json!("chat.completion");
-    // vLLM's first chunk carries `prompt_text` and `prompt_token_ids` (null
-    // unless asked for); they describe the stream, not the completion.
-    if let Some(fields) = response.as_object_mut() {
-        for field in ["prompt_text", "prompt_token_ids"] {
-            if fields.get(field).is_some_and(Value::is_null) {
-                fields.remove(field);
+    let mut logprobs: Option<Vec<&RawValue>> = None;
+    // The last report of each, as the engine sent it. SGLang sends
+    // `"usage": null` on tool-call deltas; only a present usage replaces what
+    // was collected. ADR 0023 §7: TensorFold's statistics ride the final
+    // chunk; a collected response carries them as the engine's own would.
+    // vLLM's per-request `metrics` ride its final usage chunk the same way
+    // (0.30 `ChatCompletionStreamResponse.metrics`), and llama.cpp's
+    // `timings` ride its last chunk (ADR 0029 §11; found live 2026-10-09: a
+    // collected answer had lost them, so `prefill_ms` was missing). Those
+    // three are taken only as objects.
+    let mut reports: [(&str, Option<&RawValue>); 4] = [
+        ("usage", None),
+        ("tensorfold", None),
+        ("metrics", None),
+        ("timings", None),
+    ];
+    for chunk in &chunks {
+        let Members(members) = serde_json::from_str(chunk).map_err(|_| uncertain())?;
+        for (key, value) in members {
+            if key == "choices" {
+                let choices: Vec<StreamedChoice> =
+                    serde_json::from_str(value.get()).map_err(|_| uncertain())?;
+                let Some(choice) = choices.into_iter().next() else {
+                    continue;
+                };
+                if let Some(text) = choice.delta["content"].as_str() {
+                    content.push_str(text);
+                }
+                for (field, trace) in REASONING_FIELDS.iter().zip(reasoning.iter_mut()) {
+                    if let Some(text) = choice.delta[*field].as_str() {
+                        trace.push_str(text);
+                    }
+                }
+                fold_tool_calls(&mut tool_calls, &choice.delta["tool_calls"]);
+                if let Some(block) = choice.logprobs.map(RawValue::get) {
+                    if !block.starts_with('{') {
+                        return Err(uncertain());
+                    }
+                    let block: StreamedLogprobs =
+                        serde_json::from_str(block).map_err(|_| uncertain())?;
+                    if let Some(tokens) = block.content {
+                        logprobs.get_or_insert_with(Vec::new).extend(tokens);
+                    }
+                }
+                if !choice.finish_reason.is_null() {
+                    finish = choice.finish_reason;
+                }
+            } else if let Some((name, report)) = reports.iter_mut().find(|(name, _)| *name == key) {
+                let relayed = if *name == "usage" {
+                    value.get() != "null"
+                } else {
+                    value.get().starts_with('{')
+                };
+                if relayed {
+                    *report = Some(value);
+                }
             }
         }
     }
@@ -751,12 +799,53 @@ fn assemble(chunks: Vec<String>) -> Result<Value, AdapterError> {
         }
         message["tool_calls"] = Value::Array(tool_calls.into_values().collect());
     }
-    let mut choice = json!({"index":0,"message":message,"finish_reason":finish});
+    let written = |_| uncertain();
+    let mut choice = br#"[{"index":0,"message":"#.to_vec();
+    serde_json::to_writer(&mut choice, &message).map_err(written)?;
     if let Some(tokens) = logprobs {
-        choice["logprobs"] = json!({ "content": tokens });
+        choice.extend_from_slice(br#","logprobs":{"content":["#);
+        for (index, token) in tokens.iter().enumerate() {
+            if index > 0 {
+                choice.push(b',');
+            }
+            choice.extend_from_slice(token.get().as_bytes());
+        }
+        choice.extend_from_slice(b"]}");
     }
-    response["choices"] = json!([choice]);
-    Ok(response)
+    choice.extend_from_slice(br#","finish_reason":"#);
+    serde_json::to_writer(&mut choice, &finish).map_err(written)?;
+    choice.extend_from_slice(b"}]");
+    let object: &[u8] = br#""chat.completion""#;
+    let mut out = Vec::with_capacity(first.len() + choice.len());
+    out.push(b'{');
+    for (key, value) in &head {
+        let bytes = match key.as_str() {
+            "object" => object,
+            "choices" => &choice,
+            // vLLM's first chunk carries `prompt_text` and `prompt_token_ids`
+            // (null unless asked for); they describe the stream, not the
+            // completion.
+            "prompt_text" | "prompt_token_ids" if value.get() == "null" => continue,
+            _ => match reports.iter().find(|(name, _)| name == key) {
+                Some((_, Some(report))) => report.get().as_bytes(),
+                _ => value.get().as_bytes(),
+            },
+        };
+        member(&mut out, key, bytes).map_err(written)?;
+    }
+    let sent = |name: &str| head.iter().any(|(key, _)| key == name);
+    for (name, report) in reports {
+        if let Some(report) = report.filter(|_| !sent(name)) {
+            member(&mut out, name, report.get().as_bytes()).map_err(written)?;
+        }
+    }
+    for (name, bytes) in [("object", object), ("choices", &choice)] {
+        if !sent(name) {
+            member(&mut out, name, bytes).map_err(written)?;
+        }
+    }
+    out.push(b'}');
+    EngineAnswer::parse(out.into()).map_err(|_| uncertain())
 }
 
 impl ChatHttp {
@@ -849,13 +938,17 @@ impl ChatHttp {
 
     /// ADR 0030 §2: forward one decision request and read its answer whole.
     /// The request goes as one JSON body with `model` replaced by the served
-    /// name; the answer comes back with `model` replaced by the public name.
+    /// name; the answer comes back as the engine's bytes with `model`
+    /// replaced by the public name (issue #223).
     /// Only a complete JSON object of at most [`DECISION_RESPONSE_LIMIT`]
     /// bytes with an `answers` object ([`decision_answered`]) is completion;
     /// a truncated, oversized, ambiguous or malformed body stays uncertain,
     /// since the engine may have run the request. No wall-clock bound of its
     /// own: the router bounds the whole exchange by the request deadline.
-    pub(crate) async fn decide(&self, body: &InferenceRequest) -> Result<Value, AdapterError> {
+    pub(crate) async fn decide(
+        &self,
+        body: &InferenceRequest,
+    ) -> Result<EngineAnswer, AdapterError> {
         validate_decision_request(body)?;
         let public = body
             .get("model")
@@ -877,13 +970,13 @@ impl ChatHttp {
             .await
             .ok_or_else(decision_uncertain)?;
         // Identity and evidence must have one interpretation: a duplicated
-        // key is not an answer.
-        let StrictValue(mut answer) =
-            serde_json::from_slice(&body).map_err(|_| decision_uncertain())?;
+        // key is not an answer. SPEC §10 (issue #223): the caller receives
+        // the engine's bytes, its probabilities exactly as it wrote them.
+        let mut answer = EngineAnswer::parse(body.into()).map_err(|_| decision_uncertain())?;
         if !decision_answered(&answer) {
             return Err(decision_uncertain());
         }
-        answer["model"] = json!(public);
+        answer.set("model", json!(public));
         Ok(answer)
     }
 
@@ -1266,17 +1359,20 @@ impl crate::traits::ChatForward for EngineForward {
     ) -> Result<StreamEnded, AdapterError> {
         self.0.stream_async(body, sink).await
     }
-    async fn forward_chat(&self, body: &InferenceRequest) -> Result<Value, AdapterError> {
+    async fn forward_chat(&self, body: &InferenceRequest) -> Result<EngineAnswer, AdapterError> {
         self.0.collect(body).await
     }
     async fn forward_chat_observed(
         &self,
         body: &crate::request::InferenceRequest,
         observer: &mut dyn ChatSink,
-    ) -> Result<Value, AdapterError> {
+    ) -> Result<EngineAnswer, AdapterError> {
         self.0.collect_observed(body, observer, None).await
     }
-    async fn forward_decision(&self, body: &InferenceRequest) -> Result<Value, AdapterError> {
+    async fn forward_decision(
+        &self,
+        body: &InferenceRequest,
+    ) -> Result<EngineAnswer, AdapterError> {
         self.0.decide(body).await
     }
     async fn forward_chat_stream(
@@ -1327,7 +1423,8 @@ pub fn engine_forwarder_on(
 
 struct Parser<'a> {
     backend: &'a str,
-    public: &'a str,
+    /// The public name, which a relayed chunk carries as its `model`.
+    public: Value,
     line: Vec<u8>,
     data: String,
     total: usize,
@@ -1343,7 +1440,7 @@ impl<'a> Parser<'a> {
     fn new(backend: &'a str, public: &'a str, abort_finishes: bool) -> Self {
         Self {
             backend,
-            public,
+            public: Value::String(public.to_owned()),
             line: vec![],
             data: String::new(),
             total: 0,
@@ -1401,7 +1498,7 @@ impl<'a> Parser<'a> {
         data: &str,
         on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<(), AdapterError> {
-        let StrictValue(mut chunk) = serde_json::from_str(data).map_err(|_| uncertain())?;
+        let StrictValue(chunk) = serde_json::from_str(data).map_err(|_| uncertain())?;
         // SPEC §10, T19 (found live 2026-10-03): SGLang checks a prompt against
         // its KV pool after the stream opened and answers with one error event.
         // Before any chunk, that event is the engine's complete invalid-request
@@ -1497,8 +1594,13 @@ impl<'a> Parser<'a> {
                 _ => return Err(uncertain()),
             }
         }
-        chunk["model"] = json!(self.public);
-        on_chunk(chunk.to_string());
+        // SPEC §10 (issue #223): the chunk is relayed as the engine's bytes
+        // with only `model` written anew, its floats as the engine wrote them.
+        let relayed = splice(data.as_bytes(), &[("model", &self.public)])
+            .ok()
+            .and_then(|relayed| String::from_utf8(relayed).ok())
+            .ok_or_else(uncertain)?;
+        on_chunk(relayed);
         Ok(())
     }
 }
@@ -2107,7 +2209,8 @@ mod tests {
             crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
         let request = serde_json::json!({"model":"public","messages":[]});
-        let response = forward.forward_chat(&request.clone().into()).await.unwrap();
+        let answer = forward.forward_chat(&request.clone().into()).await.unwrap();
+        let response = answer.value();
         assert_eq!(response["usage"]["total_tokens"], 4, "{response}");
         assert_eq!(response["choices"][0]["message"]["content"], "hi");
         assert!(response.get("prompt_text").is_none(), "{response}");
