@@ -1518,7 +1518,8 @@ pub const CHECKPOINT_REFUSALS: &[&str] = &[
 /// every option the command leaves unset from it). #198 (ADR 0008 amendment
 /// 2026-10-30): `installation_unsupported:editable`: an SGLang installed in
 /// editable mode, which its protected entry can never import, whatever the
-/// drift policy.
+/// drift policy; a host sends it only to a server that listed
+/// `capabilities::INSTALLATION_UNSUPPORTED`.
 pub const POLICY_REFUSALS: &[&str] = &[
     "checkpoint_mismatch",
     "checkpoint_unverified",
