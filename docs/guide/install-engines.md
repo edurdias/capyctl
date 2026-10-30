@@ -105,6 +105,18 @@ vLLM's own guide:
    `--prerelease=allow` is needed with `uv` older than 0.12.0 and does nothing
    on newer ones.
 
+   Install SGLang as a regular package, never in editable mode (`pip install
+   -e`). CapyCTL loads SGLang only from the environment's `site-packages` and
+   never runs the `.pth` file an editable install puts there, so `capyctl
+   engine add` refuses such an environment with
+   `installation_unsupported:editable`. The official `lmsysorg/sglang` Docker
+   image installs SGLang this way, from `/sgl-workspace/sglang/python`;
+   reinstall it there without `-e` before adding it:
+
+   ```bash
+   /opt/sglang/bin/python3 -m pip install --no-deps --no-build-isolation --force-reinstall /sgl-workspace/sglang/python
+   ```
+
 3. Check it, and check that PyTorch sees the GPU with CUDA 13.0:
 
    ```bash
@@ -279,3 +291,13 @@ at the release tag.
 - **SGLang permissions warning in the engine log.** The environment is group-
   or world-writable; `chmod -R go-w ~/venvs/sglang` clears it
   ([errors](errors.md)).
+- **`installation_unsupported:editable` from `engine add`, or on a start.**
+  SGLang is installed in editable mode, as in the official `lmsysorg/sglang`
+  image: its package is in a source checkout, reached only through a `.pth`
+  file CapyCTL never runs. Reinstall it without `-e` (step 2 of SGLang), then
+  add the engine again.
+- **`engine_import_failed` at the end of the engine log (SGLang).** CapyCTL's
+  interpreter could not import SGLang from the environment's `site-packages`.
+  Check that `<environment>/bin/python3 -c "import sglang.srt.entrypoints.http_server"`
+  succeeds; if it fails, the message names the module that is missing or broken.
+  Repair the environment, then start the model again.

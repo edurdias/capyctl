@@ -755,6 +755,13 @@ in your home directory (for example `~/capyctl-vllm-venv2`).
 version check, the installation fingerprint and the deep-park probe), writes
 the profile into `engines.yaml`, and asks the running role to publish it
 without a restart. CapyCTL never rewrites `host.yaml` or `standalone.yaml`.
+An SGLang installed in editable mode (`pip install -e`, as in the official
+`lmsysorg/sglang` image) is refused before anything runs,
+`installation_unsupported:editable`: CapyCTL loads SGLang from the
+environment's `site-packages` without running `.pth` files, and such an
+installation is reached only through one. Every launch of one is refused with
+the same code, whatever `security.installation_drift` says. Reinstall SGLang
+without `-e` ([Install an engine](../guide/install-engines.md#sglang-0521-or-0520)).
 `engines.yaml` sits beside the role's configuration file (`--config
 dir/host.yaml` means `dir/engines.yaml`). Without `--config`, on a host machine
 it sits beside the document the host was started with (the host records it),

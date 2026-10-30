@@ -47,6 +47,15 @@ The profile is named after the engine: `vllm` or `sglang`. CapyCTL runs the
 engine once to check its version and whether it supports parking, and records
 the CUDA toolkit it finds for the engine's kernel builds.
 
+SGLang must be installed as a regular package in the environment's
+`site-packages`. CapyCTL starts it with the `.pth` files there left unrun, so
+an editable install (`pip install -e`, as in the official `lmsysorg/sglang`
+image) cannot load, and `engine add` refuses it before running anything:
+`installation_unsupported:editable`, exit 17. A start of such an installation,
+including one named with `--sglang-bin` or `local_engine`, is refused with the
+same code. Reinstall SGLang without `-e`
+([Install an engine](install-engines.md#sglang-0521-or-0520)).
+
 That output is from a first run, before CapyCTL was started: the engine is saved
 and used from the first start. If CapyCTL is running, it uses the engine at once
 and prints `Published      yes`, as below.

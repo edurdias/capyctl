@@ -68,6 +68,7 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 15 | `host_ineligible` | No allowed host can take the deployment: drained, revoked, offline or too old. | Undrain, reconnect, upgrade or re-enroll the host the message names. |
 | 16 | `engine_not_found` | The path holds no `vllm`, `sglang` or `tensorfold` package and is no `llama-server` binary; or, with `--custom`, the executable is missing or is not an executable file. | Name the environment, its `bin/vllm`, `bin/tensorfold` or `bin/python3`, or a `llama-server` binary or its directory, or search with `capyctl engine detect --path <dir>`; with `--custom`, name the program itself. |
 | 17 | `engine_unsupported` | The package is not a supported engine; or `llama-server --version` printed no version line CapyCTL reads; or the machine has `/etc/llama.cpp/config.ini`, which llama-server would read as options. | Register a vLLM, SGLang, TensorFold or llama.cpp installation; for llama.cpp, remove `/etc/llama.cpp/config.ini`. |
+| 17 | `installation_unsupported:editable` | `capyctl engine add` found SGLang installed in editable mode (`pip install -e`, as in the official `lmsysorg/sglang` image): its package is in a source checkout, reached only through a `.pth` file, and CapyCTL loads SGLang from the environment's `site-packages` without running `.pth` files. Nothing was written. | Reinstall SGLang without `-e` ([Install an engine](install-engines.md#sglang-0521-or-0520)), then add it again. |
 | 18 | `engine_version_failed` | The engine's version check failed or timed out; nothing was written. | Repair the installation until its version check succeeds, then add it again. |
 | 19 | `profile_exists` | The engine profile name is taken. | Pass `--name`, or remove the existing profile first. |
 | 20 | `profile_in_use` | Removing or replacing the engine would affect the deployments listed. | Stop them, or rerun with `--drain`. |
@@ -123,6 +124,19 @@ A deployment on one machine can show these codes the same way:
 - `engine_config_file` (llama.cpp): `/etc/llama.cpp/config.ini` exists on the
   machine, so llama-server would read options CapyCTL cannot check. Nothing
   starts until the file is removed.
+- `installation_unsupported:editable` (SGLang): the engine's SGLang is
+  installed in editable mode, which CapyCTL cannot load (the row for exit 17
+  above). The start is refused before anything runs, whatever the profile's
+  `installation_drift` says; this also covers an engine named with
+  `--sglang-bin` or `local_engine`, which `engine add` never checked.
+  Reinstall SGLang without `-e`.
+- `engine_import_failed` (SGLang): the engine exited before readiness because
+  CapyCTL's interpreter could not import SGLang from the environment's
+  `site-packages`. The last line of the engine log is
+  `sglang_startup_failed: engine_import_failed` with what to check; CapyCTL
+  prints no more of the error, since it can quote paths. Check that the
+  environment's `bin/python3 -c "import sglang.srt.entrypoints.http_server"`
+  succeeds, repair what it names, and start again.
 - `effective_args_mismatch` (llama.cpp): once started, llama-server reported a
   different slot count or window, or its `/metrics` or `/slots` page off, than
   CapyCTL started it with. CapyCTL stops it. Report it: the build behaves

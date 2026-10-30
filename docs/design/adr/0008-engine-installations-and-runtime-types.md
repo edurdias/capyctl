@@ -386,3 +386,43 @@ reasons the rest of the composition is:
 
 No other `.pth` path is honoured; a further one needs its own amendment. CPU
 tests only; this is not qualification.
+
+## Amendment 2026-10-30 (proposed, #198, for owner review): an editable SGLang is refused
+
+The official `lmsysorg/sglang` image (v0.5.22) installs SGLang in editable
+mode: `site-packages` holds `__editable__.sglang-0.5.22.pth` and setuptools'
+finder module, and the package lives in a source checkout,
+`/sgl-workspace/sglang/python/sglang`. Under `python -IS` the hook never
+runs, so `import sglang` failed in the protected entry and every launch
+ended with the generic `startup_error`, while `engine add` (whose version
+check reads metadata with site processing on) accepted the installation.
+
+Supporting the layout would mean adding the checkout's `python` directory
+to the search path. That directory is outside the installation the
+registered fingerprint and drift flag attest (they cover
+`site-packages/sglang`, which an editable install does not have, so it
+registers `unmeasured`), and it exposes every other top-level name there.
+The safety argument of the 2026-10-19 amendment does not carry over, so:
+
+- An SGLang whose package is not in any `lib/python3.*/site-packages` of its
+  environment and which that `site-packages` records as editable
+  (`__editable__.sglang-*.pth`, `__editable___sglang_*_finder.py`,
+  `sglang.egg-link`, or `"dir_info": {"editable": true}` in the
+  distribution's `direct_url.json`) is refused with the closed code
+  `installation_unsupported:editable`: by `capyctl engine add` before
+  anything runs (exit 17), and by the launch-time installation check of
+  every launch, on a host agent and in standalone, under either
+  `installation_drift` policy. This narrows the 2026-09-23 rule that an
+  installation that cannot be measured is `unmeasured`, never refused, for
+  this one case: such an installation can never be imported by the entry,
+  so the refusal only moves a certain failure before any effect.
+  Registration still publishes it `unmeasured`; a regular package in
+  `site-packages` is never refused, whatever lies beside it.
+- The refusal is a policy refusal (`POLICY_REFUSALS`), with a fixed operator
+  hint: reinstall SGLang without `-e`.
+- The entry's failed engine import gets its own closed code,
+  `engine_import_failed`, with a fixed hint and no exception text; the launch
+  failure summary names it, and status shows its hint.
+
+vLLM is started without `-S`, so its editable installs are unaffected. CPU
+tests only; this is not qualification.
