@@ -734,7 +734,9 @@ impl CheckpointDigests {
 /// around the embedded engine adapter. Before Initialize and before Restore the
 /// binding's checkpoint must measure to the recorded digest; a digest not yet
 /// recorded is measured and recorded first (first placement). A refusal
-/// happens before the engine is asked to do anything.
+/// happens before the engine is asked anything. #226: once verified, a step
+/// that starts an engine on unified memory first gives back the checkpoint's
+/// page cache, as a remote host does.
 pub struct CheckpointGate {
     inner: Arc<dyn EngineAdapter>,
     owner: SharedCoordinatorState,
@@ -742,6 +744,8 @@ pub struct CheckpointGate {
     effective: capyctl_config::effective::EffectiveDeployment,
     deployment_id: String,
     revision: i64,
+    /// #226 (SPEC §7.2): how the page cache is given back.
+    page_cache: Arc<dyn capyctl_agent::page_cache::PageCacheAdvice>,
 }
 
 impl CheckpointGate {
@@ -751,6 +755,24 @@ impl CheckpointGate {
         checkpoints: Arc<CheckpointVerifier>,
         work: &capyctl_store::ordinary_lifecycle::worker::InitializeWork,
     ) -> Arc<Self> {
+        Self::with_page_cache_advice(
+            inner,
+            owner,
+            checkpoints,
+            work,
+            Arc::new(capyctl_agent::page_cache::Fadvise),
+        )
+    }
+
+    /// [`Self::new`], giving back the page cache through `page_cache`
+    /// (tests observe the files a launch advised).
+    pub(crate) fn with_page_cache_advice(
+        inner: Arc<dyn EngineAdapter>,
+        owner: SharedCoordinatorState,
+        checkpoints: Arc<CheckpointVerifier>,
+        work: &capyctl_store::ordinary_lifecycle::worker::InitializeWork,
+        page_cache: Arc<dyn capyctl_agent::page_cache::PageCacheAdvice>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner,
             owner,
@@ -758,7 +780,21 @@ impl CheckpointGate {
             effective: work.effective().clone(),
             deployment_id: work.fence().deployment_id.clone(),
             revision: work.fence().revision,
+            page_cache,
         })
+    }
+
+    /// #226 (SPEC §7.2): right before a step that starts an engine, after the
+    /// checkpoint's last read here, give back its page cache when the engine
+    /// starts on unified memory. Best effort: it never fails the step.
+    async fn drop_page_cache(&self) {
+        let effective = self.effective.clone();
+        let advice = self.page_cache.clone();
+        let deployment = self.deployment_id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            capyctl_agent::page_cache::before_launch(&effective, advice.as_ref(), &deployment)
+        })
+        .await;
     }
 
     /// ADR 0014 §7: before Initialize a failure to verify is uncertain; the
@@ -873,10 +909,21 @@ impl EngineAdapter for CheckpointGate {
         command: &RuntimeCommand,
     ) -> Result<EffectObservation, RuntimeError> {
         match command.action {
-            RuntimeAction::Initialize => self.verified().await?,
+            RuntimeAction::Initialize => {
+                self.verified().await?;
+                self.drop_page_cache().await;
+            }
             // Owner decision 5: a launch parked before digests existed is
             // measured and recorded first, then woken.
-            RuntimeAction::Restore => self.verified_wake().await?,
+            RuntimeAction::Restore => {
+                self.verified_wake().await?;
+                // ADR 0033 §7: a deployment that does not park in place
+                // (`restart_only`) was restart-parked, and its wake starts a
+                // new engine; a parked engine keeps its context.
+                if !self.effective.residency.parks() {
+                    self.drop_page_cache().await;
+                }
+            }
             _ => {}
         }
         self.inner.execute_persisted(command).await

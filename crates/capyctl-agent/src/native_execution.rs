@@ -158,6 +158,9 @@ pub struct NativeHostExecution {
     lmcache_verdicts: Arc<lmcache::LmcacheVerdicts>,
     /// ADR 0033 §12: the load source that samples the LMCache servers.
     host_load: Arc<crate::load::HostLoad>,
+    /// #226 (SPEC §7.2): how a launch on unified memory gives back its
+    /// checkpoint's page cache before its engine starts.
+    page_cache: Arc<dyn crate::page_cache::PageCacheAdvice>,
 }
 
 /// A GPU sample taken for one command before the journal was locked, and when.
@@ -299,6 +302,7 @@ impl NativeHostExecution {
             lmcache_dirs: None,
             lmcache_verdicts: Arc::default(),
             host_load,
+            page_cache: Arc::new(crate::page_cache::Fadvise),
         });
         this.prime_gpu();
         this
@@ -497,6 +501,31 @@ impl NativeHostExecution {
         checkpoints.set_declared_trust(self.checkpoints.trusts_declared());
         Arc::make_mut(&mut self).checkpoints = Arc::new(checkpoints);
         self
+    }
+
+    /// #226: give back a launch's checkpoint page cache through `advice`
+    /// instead of `posix_fadvise` (tests observe the files a launch advised).
+    #[doc(hidden)]
+    pub fn with_page_cache_advice(
+        mut self: Arc<Self>,
+        advice: Arc<dyn crate::page_cache::PageCacheAdvice>,
+    ) -> Arc<Self> {
+        Arc::make_mut(&mut self).page_cache = advice;
+        self
+    }
+
+    /// #226 (SPEC §7.2): right before an engine starts, after its checkpoint
+    /// was last read here, give back that checkpoint's page cache when the
+    /// engine starts on unified memory (`crate::page_cache`). Best effort: it
+    /// never fails or refuses the launch.
+    pub(crate) async fn drop_page_cache(&self, effective: &EffectiveDeployment, deployment: &str) {
+        let effective = effective.clone();
+        let advice = self.page_cache.clone();
+        let deployment = deployment.to_owned();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::page_cache::before_launch(&effective, advice.as_ref(), &deployment)
+        })
+        .await;
     }
     /// ADR 0008: materialize model sources through this store instead of the
     /// one built from the host document (tests serve a loopback origin).
@@ -1680,6 +1709,11 @@ impl NativeHostExecution {
                 )
                 .map_err(|_| SessionError)?;
         }
+        // #226 (SPEC §7.2): admission has read the checkpoint (the recheck at
+        // the spawn reads its small files at most); on unified memory its page
+        // cache is given back before the engine starts.
+        self.drop_page_cache(&effective, &command.identity.deployment_id)
+            .await;
         let initialized = adapter
             .execute_persisted(&initialize_command(command, plan, &effective))
             .await;

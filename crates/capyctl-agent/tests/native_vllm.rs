@@ -1810,6 +1810,124 @@ async fn an_engine_that_exits_before_readiness_is_reported_not_a_lost_session() 
     assert!(stopped.processes.iter().all(|p| p.presence == "gone"));
 }
 
+/// #226: records each checkpoint file a launch advised to drop from the page
+/// cache: its checkpoint path, the file its descriptor is open on, and
+/// whether the engine had already started. `fail` makes every advice fail.
+struct Advised {
+    record: PathBuf,
+    fail: bool,
+    files: std::sync::Mutex<Vec<(String, PathBuf, bool)>>,
+}
+
+impl capyctl_agent::page_cache::PageCacheAdvice for Advised {
+    fn dont_need(&self, path: &str, fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let open = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap();
+        self.files
+            .lock()
+            .unwrap()
+            .push((path.to_owned(), open, self.record.exists()));
+        if self.fail {
+            return Err(std::io::Error::from_raw_os_error(5)); // EIO
+        }
+        Ok(())
+    }
+}
+
+/// #226: a checkpoint with a nested file, a link to a file inside the model
+/// store (the Hugging Face snapshot layout) and tool metadata, which is not
+/// part of a checkpoint. Returns the real files the walk names.
+fn checkpoint_files(fixture: &Fixture) -> Vec<(String, PathBuf)> {
+    let toy = fixture.root.path().join("models/toy");
+    std::fs::create_dir_all(toy.join("nested")).unwrap();
+    std::fs::create_dir_all(toy.join(".cache")).unwrap();
+    std::fs::write(toy.join("weights.dat"), vec![1u8; 4096]).unwrap();
+    std::fs::write(toy.join("nested/vocab.txt"), "a b c").unwrap();
+    std::fs::write(toy.join(".cache/download.lock"), "").unwrap();
+    std::os::unix::fs::symlink("weights.dat", toy.join("alias.dat")).unwrap();
+    let toy = toy.canonicalize().unwrap();
+    vec![
+        ("alias.dat".into(), toy.join("weights.dat")),
+        ("nested/vocab.txt".into(), toy.join("nested/vocab.txt")),
+        ("weights.dat".into(), toy.join("weights.dat")),
+    ]
+}
+
+/// Launch `fixture` on a host whose launches advise through a fresh
+/// [`Advised`], and return whether the model was proven usable with it.
+async fn launch_advised(fixture: &Fixture, fail: bool) -> (bool, Arc<Advised>, Host) {
+    let advised = Arc::new(Advised {
+        record: fixture.root.path().join("venv/bin/record.json"),
+        fail,
+        files: Default::default(),
+    });
+    let mut host = host(fixture);
+    host.executor = host
+        .executor
+        .clone()
+        .with_page_cache_advice(advised.clone());
+    let launch = fixture.launch();
+    host.executor.provision(launch.clone(), GATE).await.unwrap();
+    let ready = host
+        .executor
+        .execute(host.session, launch)
+        .await
+        .expect("a launch result");
+    (ready.model_usable, advised, host)
+}
+
+/// #226 (SPEC §7.2): on unified memory, a launch gives back the page cache of
+/// every regular file of its checkpoint once, after the checkpoint was
+/// verified and before its engine started: the files under their checkpoint
+/// paths, a link as the file it names, tool metadata left out. Fake-engine
+/// test: nothing here shows a GB10 context creation succeeding.
+// T26
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_unified_launch_drops_its_checkpoint_page_cache_before_the_engine_starts() {
+    let fixture = Fixture::new(false, true);
+    let expected = checkpoint_files(&fixture);
+    let (usable, advised, _host) = launch_advised(&fixture, false).await;
+    assert!(usable);
+    let files = advised.files.lock().unwrap().clone();
+    assert_eq!(
+        files
+            .iter()
+            .map(|(path, open, _)| (path.clone(), open.clone()))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(
+        files.iter().all(|(_, _, started)| !started),
+        "advised after the engine started: {files:?}"
+    );
+}
+
+/// #226 (ADR 0019): a launch on a discrete GPU (its memory apart from host
+/// RAM) leaves the page cache alone.
+// T26
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_discrete_launch_leaves_the_page_cache_alone() {
+    let fixture = Fixture::build(Some(false), true, |host, _| {
+        host["resource_policy"]["domains"]["unified"]["memory"] = json!("distinct");
+    });
+    checkpoint_files(&fixture);
+    let (usable, advised, _host) = launch_advised(&fixture, false).await;
+    assert!(usable);
+    assert!(advised.files.lock().unwrap().is_empty());
+}
+
+/// #226: dropping the page cache is best effort; a launch whose every advice
+/// fails still starts and is proven usable.
+// T26
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_page_cache_drop_does_not_fail_the_launch() {
+    let fixture = Fixture::new(false, true);
+    let expected = checkpoint_files(&fixture);
+    let (usable, advised, _host) = launch_advised(&fixture, true).await;
+    assert!(usable, "the launch went on");
+    assert_eq!(advised.files.lock().unwrap().len(), expected.len());
+}
+
 /// SPEC §13.2 (W13) / T20 T33: a parked engine that loses a member is
 /// reported too, so the controller never wakes a group that is no longer the
 /// one it parked. Report only: the claim and the parked state stay until a

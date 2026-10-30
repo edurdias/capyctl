@@ -57,7 +57,7 @@ use std::{
     io::Read,
     mem::MaybeUninit,
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
         unix::ffi::OsStrExt,
     },
     path::{Component, Path, PathBuf},
@@ -859,6 +859,57 @@ impl CheckpointVerifier {
             memory.insert(key.to_owned(), record);
         }
     }
+}
+
+/// What [`drop_page_cache`] did with one checkpoint's files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageCacheDrop {
+    /// Files handed to the advice.
+    pub advised: u64,
+    /// Files that could not be opened or advised.
+    pub failed: u64,
+    /// The OS error number of the first failure, when it had one.
+    pub first_errno: Option<i32>,
+}
+
+/// #226 (SPEC §7.2: on unified memory the page cache and the GPU draw on one
+/// pool): hand every regular file of `checkpoint` to `advise`, each opened
+/// read-only through the confined walk a measurement uses: inside the model
+/// store, or a checkpoint outside it inside its own root, links resolved
+/// only inside that root and never followed by the kernel, within the same
+/// file, directory and depth bounds. Nothing is read or hashed. A file that
+/// cannot be opened or advised is counted and the rest go on; only a
+/// checkpoint that cannot be opened or walked is an error.
+pub fn drop_page_cache(
+    model_store: &Path,
+    checkpoint: &Path,
+    advise: &dyn Fn(&str, BorrowedFd<'_>) -> std::io::Result<()>,
+) -> Result<PageCacheDrop, CheckpointError> {
+    let opened = open_checkpoint(model_store, checkpoint, Confinement::OwnRootOutside)?;
+    let mut outcome = PageCacheDrop::default();
+    for file in walk(&opened)? {
+        let advised = open_at(
+            file.parent.as_raw_fd(),
+            &file.name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+        .and_then(|fd| {
+            if fstat(fd.as_raw_fd())?.st_mode & libc::S_IFMT != libc::S_IFREG {
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            advise(&file.path, fd.as_fd())
+        });
+        match advised {
+            Ok(()) => outcome.advised += 1,
+            Err(error) => {
+                outcome.failed += 1;
+                if outcome.failed == 1 {
+                    outcome.first_errno = error.raw_os_error();
+                }
+            }
+        }
+    }
+    Ok(outcome)
 }
 
 /// The opened store and checkpoint, with the canonical text containment was

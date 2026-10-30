@@ -428,6 +428,75 @@ fn links_that_escape_the_store_or_name_directories_are_refused() {
     }
 }
 
+// #226: the page cache drop advises every file a measurement reads (a link
+// inside the store as the file it names, under the link's path) and nothing
+// else, with the real `posix_fadvise` as with any advice.
+#[test]
+fn the_page_cache_drop_advises_every_file_of_the_checkpoint() {
+    use crate::page_cache::PageCacheAdvice;
+    let store = Store::new();
+    let checkpoint = store.checkpoint("toy", FILES);
+    std::fs::create_dir_all(store.root.join("blobs")).unwrap();
+    std::fs::write(store.root.join("blobs/shared.bin"), b"shared").unwrap();
+    symlink("../blobs/shared.bin", checkpoint.join("linked.bin")).unwrap();
+    std::fs::write(checkpoint.join(".gitattributes"), b"metadata").unwrap();
+    let advised = Mutex::new(Vec::new());
+    let dropped = drop_page_cache(&store.root, &checkpoint, &|path, fd| {
+        advised.lock().unwrap().push(path.to_owned());
+        crate::page_cache::Fadvise.dont_need(path, fd)
+    })
+    .unwrap();
+    let mut expected: Vec<&str> = FILES.iter().map(|(name, _)| *name).collect();
+    expected.push("linked.bin");
+    expected.sort_unstable();
+    assert_eq!(*advised.lock().unwrap(), expected);
+    assert_eq!(
+        dropped,
+        PageCacheDrop {
+            advised: expected.len() as u64,
+            failed: 0,
+            first_errno: None,
+        }
+    );
+    // A failing advice is counted, with its error, and the rest go on.
+    let failing = drop_page_cache(&store.root, &checkpoint, &|_, _| {
+        Err(std::io::Error::from_raw_os_error(libc::EIO))
+    })
+    .unwrap();
+    assert_eq!(
+        failing,
+        PageCacheDrop {
+            advised: 0,
+            failed: expected.len() as u64,
+            first_errno: Some(libc::EIO),
+        }
+    );
+}
+
+// #226 (ADR 0014 §7): the page cache drop is confined exactly as a
+// measurement: a checkpoint with a link out of the store is refused whole,
+// and no file of it is advised.
+#[test]
+fn the_page_cache_drop_never_leaves_the_store() {
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret"), "not a checkpoint").unwrap();
+    let store = Store::new();
+    let checkpoint = store.checkpoint("toy", FILES);
+    symlink(
+        outside.path().join("secret"),
+        checkpoint.join("escape.json"),
+    )
+    .unwrap();
+    let advised = Mutex::new(0);
+    let error = drop_page_cache(&store.root, &checkpoint, &|_, _| {
+        *advised.lock().unwrap() += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert_eq!(error, CheckpointError::UnsafeFile);
+    assert_eq!(*advised.lock().unwrap(), 0);
+}
+
 // T37, SPEC §13.3: the checkpoint must be a directory; the model store itself,
 // a missing path and a relative path are refused.
 #[test]
