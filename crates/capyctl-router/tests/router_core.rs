@@ -1064,6 +1064,71 @@ async fn a_shutting_down_refusal_is_a_retryable_503_that_closes_the_lease() {
     );
 }
 
+// #213 (SPEC §10): a host ingress at its forward limit refuses with 429 and
+// its own `inference_unavailable` code before forwarding. With no other
+// instance the client gets a retryable refusal, in-band on a stream, never an
+// empty 200 stream, and the lease closes as not accepted.
+#[tokio::test]
+async fn an_ingress_at_capacity_is_a_retryable_refusal_never_an_empty_stream() {
+    let refusal = serde_json::json!({"error":{
+        "code":capyctl_adapters::forward::INGRESS_FAILURE_CODE,
+        "message":"Inference request is not authorized or could not complete"}});
+    let (endpoint, _) = scripted_engine(429, "application/json", refusal.to_string()).await;
+    let (authority, deps) = stub_router(&endpoint);
+    let router = capyctl_router::serve_router(deps.clone());
+    let (status, text) = chat_stream(&router, "public-alias").await;
+    assert_eq!(status, 200);
+    let event: serde_json::Value = serde_json::from_str(
+        text.lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap_or_else(|| panic!("no event: {text:?}")),
+    )
+    .unwrap();
+    assert_eq!(event["error"]["code"], "unavailable", "{text}");
+    assert_eq!(event["error"]["retryable"], true, "{text}");
+    assert!(!text.contains("[DONE]"), "{text}");
+    assert_eq!(
+        ends(&authority),
+        vec![Some(capyctl_controller::LeaseEnd::NotAccepted)]
+    );
+    assert_eq!(deps.inflight.current("dep-1"), 0, "nothing was accepted");
+    let (status, body) = chat_once(&router, "public-alias").await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["retryable"], true, "{body}");
+}
+
+// #213 (SPEC §10, T17): a stream whose forward fails uncertainly before its
+// first token (here an engine's own 429, which proves nothing about what it
+// accepted) ends with an in-band error event, never an empty 200 stream. The
+// lease stays uncertain.
+#[tokio::test]
+async fn an_uncertain_failure_before_the_first_token_is_an_in_band_error() {
+    let own = serde_json::json!({"error":{"message":"busy","type":"RateLimitError","code":429}});
+    for (status, content_type, body) in [
+        (429, "application/json", own.to_string()),
+        (200, "text/plain", "not a stream".to_owned()),
+    ] {
+        let (endpoint, _) = scripted_engine(status, content_type, body).await;
+        let (authority, deps) = stub_router(&endpoint);
+        let router = capyctl_router::serve_router(deps.clone());
+        let (status, text) = chat_stream(&router, "public-alias").await;
+        assert_eq!(status, 200);
+        let event: serde_json::Value = serde_json::from_str(
+            text.lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap_or_else(|| panic!("no event: {text:?}")),
+        )
+        .unwrap();
+        assert_eq!(event["error"]["code"], "engine_error", "{text}");
+        assert_eq!(event["error"]["retryable"], false, "{text}");
+        assert!(!text.contains("[DONE]"), "{text}");
+        assert_eq!(
+            ends(&authority),
+            vec![Some(capyctl_controller::LeaseEnd::Uncertain)]
+        );
+    }
+}
+
 // T17 T19 (SPEC §10, found live 2026-09-24): an engine rejection of an
 // invalid request is its complete answer. The router relays it with the
 // engine's status and message as `engine_rejected`, not retryable, never a
@@ -2792,6 +2857,38 @@ async fn a_deadline_cut_on_a_capable_lane_settles_on_its_own_final_output() {
     let (status, answer) = chat_once(&router, "public-alias").await;
     assert_eq!(status, 500, "{answer}");
     assert_eq!(answer["code"], "engine_error");
+    eventually(|| authority.acks() == vec!["lease-0".to_owned()]).await;
+    assert_eq!(authority.aborts(), one_abort());
+    assert_eq!(ends(&authority), cancelling(false));
+}
+
+// T17 #213 (ADR 0032 §3, SPEC §10): a stream cut at its deadline before any
+// output on a capable lane ends with the same in-band error event as on any
+// other lane, never an empty 200 stream; the lease is cancelling as unanswered
+// and settles on its own final output after the abort.
+#[tokio::test]
+async fn a_deadline_cut_stream_on_a_capable_lane_ends_with_an_error_event() {
+    let (authority, deps, _) =
+        sglang_lane(false, true, Script::AbortFinishes { content: false }).await;
+    deps.inflight
+        .waiting
+        .set_limits(capyctl_router::queue::WaitLimits {
+            deadline: std::time::Duration::from_millis(300),
+            ..Default::default()
+        });
+    let router = capyctl_router::serve_router(deps.clone());
+    let (status, text) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        chat_stream(&router, "public-alias"),
+    )
+    .await
+    .expect("the client's stream ends at the cut");
+    assert_eq!(status, 200);
+    assert!(
+        text.contains("\"engine_error\"") && text.contains("backend completion unverified"),
+        "{text:?}"
+    );
+    assert!(!text.contains("[DONE]"), "{text}");
     eventually(|| authority.acks() == vec!["lease-0".to_owned()]).await;
     assert_eq!(authority.aborts(), one_abort());
     assert_eq!(ends(&authority), cancelling(false));
