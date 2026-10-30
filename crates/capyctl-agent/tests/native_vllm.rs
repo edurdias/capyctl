@@ -1877,10 +1877,10 @@ async fn launch_advised(fixture: &Fixture, fail: bool) -> (bool, Arc<Advised>, H
 }
 
 /// #226 (SPEC §7.2): on unified memory, a launch gives back the page cache of
-/// every regular file of its checkpoint once, after the checkpoint was
-/// verified and before its engine started: the files under their checkpoint
-/// paths, a link as the file it names, tool metadata left out. Fake-engine
-/// test: nothing here shows a GB10 context creation succeeding.
+/// every regular file of its checkpoint, after the checkpoint was verified and
+/// before its engine started: each checkpoint path once (a link inside the
+/// store as the file it names, so that file twice), tool metadata left out.
+/// Fake-engine test: nothing here shows a GB10 context creation succeeding.
 // T26
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_unified_launch_drops_its_checkpoint_page_cache_before_the_engine_starts() {
@@ -1918,7 +1918,6 @@ async fn a_discrete_launch_leaves_the_page_cache_alone() {
 
 /// #226: dropping the page cache is best effort; a launch whose every advice
 /// fails still starts and is proven usable.
-// T26
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_page_cache_drop_does_not_fail_the_launch() {
     let fixture = Fixture::new(false, true);

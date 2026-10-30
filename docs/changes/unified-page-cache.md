@@ -5,8 +5,10 @@ running one failed creating its CUDA context (`CUDA_ERROR_OUT_OF_MEMORY` from
 `cuDevicePrimaryCtxRetain`, `NV_ERR_NO_MEMORY` from `kgrctxAllocMainCtxBuffer`)
 while `MemAvailable` read tens of GiB: most of it was page cache, which the
 driver does not wait to reclaim for a context's physically contiguous buffers.
-Part of that cache, all of it on a first placement, is the checkpoint CapyCTL
-itself reads to verify its digest (ADR 0014 §7). NVIDIA's DGX Spark known
+Some of that cache can be the launch's own checkpoint: CapyCTL reads it to
+verify its digest (in full on a first placement, unless a download's verified
+manifest or a trusted declaration stands in for the read; ADR 0014 §7), and
+earlier reads and engine loads may have left it cached. NVIDIA's DGX Spark known
 issues give flushing the buffer cache as the workaround on unified memory.
 
 What changed (SPEC §7.2; ADR 0019 for what a discrete GPU is):
@@ -43,26 +45,26 @@ Tests (failing before, passing after):
 - `crates/capyctl-agent/tests/native_vllm.rs`,
   `a_unified_launch_drops_its_checkpoint_page_cache_before_the_engine_starts`
   (T26): a full remote launch on the fake vLLM with an injected advice seam;
-  every regular file of the checkpoint (a nested file, a link inside the store
-  as the file it names, tool metadata left out) is advised once, before the
-  engine wrote its record. Before the fix the advice was never called
-  (`left: []`).
-- `a_failed_page_cache_drop_does_not_fail_the_launch` (T26): every advice
-  fails with EIO and the model is still proven usable. Before the fix: no file
-  advised (`left: 0, right: 3`).
+  each checkpoint path (a nested file, a link inside the store as the file it
+  names, so that file is advised twice; tool metadata left out) is advised
+  once, before the engine wrote its record. Before the fix the advice was
+  never called (`left: []`).
+- `a_failed_page_cache_drop_does_not_fail_the_launch`: every advice fails with
+  EIO and the model is still proven usable. Before the fix: no file advised
+  (`left: 0, right: 3`).
 - `a_discrete_launch_leaves_the_page_cache_alone` (T26): `memory: distinct`,
   nothing advised (passes before and after; guards the gate).
 - `crates/capyctl-controller/src/checkpoint_digests/tests.rs`,
-  `the_embedded_gate_drops_the_checkpoint_page_cache_before_an_engine_starts`
-  (T26): the standalone gate advises every file before Initialize, again
-  before a `restart_only` Restore, not before a `deep` Restore, and a failing
-  advice still reaches the engine. Before the fix: `left: []`.
+  `the_embedded_gate_drops_the_checkpoint_page_cache_before_an_engine_starts`:
+  the standalone gate advises every file before Initialize, again before a
+  `restart_only` Restore, not before a `deep` Restore, and a failing advice
+  still reaches the engine. Before the fix: `left: []`.
   `the_embedded_gate_leaves_the_page_cache_alone_on_distinct_memory` (T26).
 - `crates/capyctl-agent/src/checkpoint/tests.rs`:
   `the_page_cache_drop_advises_every_file_of_the_checkpoint` (with the real
   `posix_fadvise`, and failures counted with their errno) and
-  `the_page_cache_drop_never_leaves_the_store` (a link out of the store is
-  refused whole, nothing advised).
+  `the_page_cache_drop_never_leaves_the_store` (T37: a link out of the store
+  is refused whole, nothing advised).
 
 CPU and Fake-engine tests are not qualification: nothing here shows that a
 GB10 engine's CUDA context creation now succeeds.
@@ -82,7 +84,7 @@ intermittent, so repeat the start several times.
   model's checkpoint files right before its engine starts, without
   privileges and without touching the rest of the cache. An engine started
   beside a running one could fail creating its CUDA context with
-  `CUDA error: out of memory` while most of the memory was page cache, much
-  of it the checkpoint CapyCTL had just read to verify it. If the drop fails,
+  `CUDA error: out of memory` while most of the memory was page cache, some
+  of it the model's own checkpoint. If the drop fails,
   the host log says so once and the engine starts anyway. Discrete GPUs are
   unchanged. See [installation](../operations/install.md#discrete-nvidia-gpus).

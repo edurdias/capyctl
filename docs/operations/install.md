@@ -712,8 +712,8 @@ succeed when started again minutes later; NVIDIA's
 give flushing the buffer cache as the workaround on unified memory. So right
 before an engine starts there (a launch, or the wake of a `restart_only` model
 parked beside its LMCache server, which starts a new engine), CapyCTL drops
-the cached pages of that model's checkpoint files, which it has just read to
-verify the checkpoint (all of them on a first placement):
+the cached pages of that model's checkpoint files, which its own reads to
+verify the checkpoint, or earlier reads and engine loads, may have filled:
 `posix_fadvise(POSIX_FADV_DONTNEED)` on each file. It needs no privileges and
 leaves the rest of the page cache, and pages another running engine has
 mapped, alone. It is best effort: when it fails, the host log has one

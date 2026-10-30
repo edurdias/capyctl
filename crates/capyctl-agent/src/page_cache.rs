@@ -6,11 +6,11 @@
 //! cache as available, which is right for sizing, but the driver allocates a
 //! new CUDA context's first buffers physically contiguous without waiting for
 //! reclaim, so a context created while most of the pool is page cache can fail
-//! with `CUDA_ERROR_OUT_OF_MEMORY` (found live on a GB10, SGLang 0.5.22). Part
-//! of that cache, on a first placement all of it, is the checkpoint CapyCTL
-//! read to verify its digest. NVIDIA's DGX Spark known issues give flushing
-//! the buffer cache as the workaround on unified memory; here only the
-//! launch's own checkpoint is given back, with
+//! with `CUDA_ERROR_OUT_OF_MEMORY` (found live on a GB10, SGLang 0.5.22). Some
+//! of that cache can be the launch's own checkpoint, filled by CapyCTL's
+//! digest reads or by earlier reads and engine loads. NVIDIA's DGX Spark known
+//! issues give flushing the buffer cache as the workaround on unified memory;
+//! here only the launch's own checkpoint is given back, with
 //! `posix_fadvise(POSIX_FADV_DONTNEED)` on each of its files: unprivileged,
 //! and nothing else on the machine is touched.
 //!

@@ -674,8 +674,8 @@ fn advised_gate(f: &Fixture, advised: Arc<Advised>) -> (Arc<CheckpointGate>, Arc
     (gate, inner)
 }
 
-// T26 (#226, SPEC §7.2): on unified memory the embedded gate gives back the
-// page cache of every file of the checkpoint once it verified it, before the
+// #226 (SPEC §7.2): on unified memory the embedded gate gives back the page
+// cache of every file of the checkpoint after it verified it, before the
 // engine is asked to start one. A parked engine's wake keeps its context and
 // is left alone; a restart-parked deployment's wake starts a new engine and
 // gives it back too. An advice that fails stops nothing.

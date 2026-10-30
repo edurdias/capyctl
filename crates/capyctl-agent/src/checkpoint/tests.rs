@@ -473,7 +473,7 @@ fn the_page_cache_drop_advises_every_file_of_the_checkpoint() {
     );
 }
 
-// #226 (ADR 0014 §7): the page cache drop is confined exactly as a
+// T37 (#226, ADR 0014 §7): the page cache drop is confined exactly as a
 // measurement: a checkpoint with a link out of the store is refused whole,
 // and no file of it is advised.
 #[test]
