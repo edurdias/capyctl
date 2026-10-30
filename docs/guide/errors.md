@@ -129,7 +129,9 @@ A deployment on one machine can show these codes the same way:
   above). The start is refused before anything runs, whatever the profile's
   `installation_drift` says; this also covers an engine named with
   `--sglang-bin` or `local_engine`, which `engine add` never checked.
-  Reinstall SGLang without `-e`.
+  Reinstall SGLang without `-e`. A machine under a server older than its own
+  CapyCTL starts the engine instead, which then fails `engine_import_failed`
+  (below).
 - `engine_import_failed` (SGLang): the engine exited before readiness because
   CapyCTL's interpreter could not import SGLang from the environment's
   `site-packages`. The last line of the engine log is

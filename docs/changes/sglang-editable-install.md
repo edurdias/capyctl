@@ -24,17 +24,32 @@ What changed:
 
 - `capyctl engine add` refuses an SGLang whose package is not in its
   environment's `site-packages` and which `site-packages` records as editable
-  (`__editable__.sglang-*.pth`, setuptools' finder module, `sglang.egg-link`,
-  or `"dir_info": {"editable": true}` in `direct_url.json`). The code is
+  (`__editable__.sglang-<version>.pth`, setuptools' finder module
+  `__editable___sglang_<version>_finder.py`, `sglang.egg-link`, or
+  `"dir_info": {"editable": true}` in `direct_url.json`). The code is
   `installation_unsupported:editable`, exit 17; nothing runs and nothing is
-  written. A regular package in `site-packages` is never refused, whatever
-  lies beside it. vLLM, started without `-S`, is unaffected.
+  written. A package directory in `site-packages`, or a link to one (the
+  entry imports it through the link), is never refused, whatever lies
+  beside it; sgl-router's own editable hooks
+  (`__editable___sglang_router_<version>_finder.py`) are not SGLang's.
+  vLLM, started without `-S`, is unaffected.
 - The launch-time installation check (`InstallationRegistry::verify`, on a
   host agent and in standalone's embedded gate) refuses such an installation
   before any effect with the same code under either `installation_drift`
   policy, so a profile registered by an earlier release, or named with
   `--sglang-bin` or `local_engine`, is refused too. The code is added to the
   protocol's policy refusals and has a fixed operator hint in status.
+- Version skew (ADR 0017): a 0.1.10 controller's refusal check does not know
+  the code and would end the host's whole control session on it, at every
+  redelivery. The code therefore rides on a new capability,
+  `installation_unsupported`, which this server lists in
+  `SessionReady.capabilities` (and the host declares in `Connect`). A host
+  reports the refusal only to a server that listed it
+  (`capabilities::server_takes_refusal`); under an older server the launch
+  goes ahead unmeasured, exactly as before this change, and fails at the
+  engine's start with `engine_import_failed` in the free-text launch
+  failure, which every server takes. `engine add` and standalone's embedded
+  check involve no older server and refuse directly.
 - The entry reports a failed SGLang import as its own closed code,
   `engine_import_failed`, with a fixed hint and no exception text or path,
   instead of `startup_error`. The launch failure summary names the code, and
@@ -74,6 +89,26 @@ Tests, failing before and passing after:
   `capyctl-adapters` `launch_failure::tests::an_sglang_import_failure_is_named_by_its_code`;
   `capyctl-domain` `diagnostics::tests::classification_prefers_the_named_category`;
   `capyctl-cli` `site_errors_page` (the new exit 17 row).
+- `capyctl-agent`
+  `native_execution::tests::an_editable_sglang_is_refused_only_toward_a_server_that_takes_the_code`
+  (T21 T34): admission of an editable SGLang launch toward no SessionReady,
+  0.1.10's capability list, and this server's. With the capability gate
+  bypassed (the state before it) the older server got
+  `Refused("installation_unsupported:editable")`; with the gate it gets the
+  pre-#198 path (the fixture's next gate, `checkpoint_mismatch`), and only
+  the current server gets the new code.
+- `capyctl-protocol` `version_skew::installation_unsupported_reaches_only_a_server_that_takes_it`
+  (T34): the capability is catalogued, declared by the agent and advertised
+  by the server; toward 0.1.10's list or none the new code is withheld and
+  every older refusal still passes; toward the current server every refusal
+  passes. `live_profile_update_is_declared_both_ways` now expects the third
+  server capability.
+- `capyctl-agent` `installation::tests::another_distributions_hook_and_a_linked_package_are_not_refused`
+  (T21): with the earlier matching it failed (sgl-router's
+  `__editable___sglang_router_0_3_1_finder.py` refused a missing SGLang
+  `installation_unsupported:editable`); now neither sgl-router's hooks nor a
+  `site-packages/sglang` link to a package directory is refused, while a
+  link to nothing beside SGLang's own hook still is.
 
 CPU and Fake-engine tests are not qualification.
 
@@ -85,7 +120,10 @@ and write nothing. Then reinstall SGLang without `-e` inside the image
 --force-reinstall /sgl-workspace/sglang/python`), add it again, and launch a
 model: it must reach `ready` and serve. A launch whose SGLang import fails for
 another reason must end with `sglang_startup_failed: engine_import_failed`
-and show that code's hint in `capyctl status deployment`.
+and show that code's hint in `capyctl status deployment`. Mixed versions:
+with a 0.1.10 server and a host of this release, an editable launch must
+start, fail with `engine_import_failed`, and leave the host's control
+session up.
 
 # Release note: Fixes
 

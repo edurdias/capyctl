@@ -405,9 +405,12 @@ registers `unmeasured`), and it exposes every other top-level name there.
 The safety argument of the 2026-10-19 amendment does not carry over, so:
 
 - An SGLang whose package is not in any `lib/python3.*/site-packages` of its
-  environment and which that `site-packages` records as editable
-  (`__editable__.sglang-*.pth`, `__editable___sglang_*_finder.py`,
-  `sglang.egg-link`, or `"dir_info": {"editable": true}` in the
+  environment (neither a directory nor a link to one, which the entry would
+  import through the link) and which that `site-packages` records as
+  editable (`__editable__.sglang-<version>.pth`,
+  `__editable___sglang_<version>_finder.py` with a version starting with a
+  digit, so sgl-router's `__editable___sglang_router_*` hooks are not
+  SGLang's, `sglang.egg-link`, or `"dir_info": {"editable": true}` in the
   distribution's `direct_url.json`) is refused with the closed code
   `installation_unsupported:editable`: by `capyctl engine add` before
   anything runs (exit 17), and by the launch-time installation check of
@@ -420,6 +423,16 @@ The safety argument of the 2026-10-19 amendment does not carry over, so:
   `site-packages` is never refused, whatever lies beside it.
 - The refusal is a policy refusal (`POLICY_REFUSALS`), with a fixed operator
   hint: reinstall SGLang without `-e`.
+- Version skew (ADR 0017): a 0.1.10 or earlier server does not know the code,
+  and its refusal check ends the whole control session on an unknown one. So
+  the code rides on a new capability, `installation_unsupported`: the server
+  lists it in `SessionReady.capabilities` and the host declares it in
+  `Connect.capabilities`. A host reports the refusal only to a server that
+  listed it. Toward an older server the launch goes ahead unmeasured, as
+  before this amendment, and fails at the engine's start with
+  `engine_import_failed` in the launch failure, which every server takes.
+  `engine add` and standalone's embedded check refuse directly: no older
+  server is involved.
 - The entry's failed engine import gets its own closed code,
   `engine_import_failed`, with a fixed hint and no exception text; the launch
   failure summary names it, and status shows its hint.
