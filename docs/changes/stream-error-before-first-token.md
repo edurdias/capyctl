@@ -9,11 +9,15 @@ defects caused it.
   rejection, an engine error answer, a refusal before sending, a request not
   accepted). Any other error, such as an uncertain end, closed the stream
   silently. It now sends an error event when the forward ends in an error and
-  no engine chunk was handed to the client: code `engine_error`, message
+  no output chunk was handed to the client (a chunk that only opens the reply
+  does not count): code `engine_error`, message
   `backend completion unverified`, `retryable: false`, as the non-streamed
-  answer to the same failure. Lease accounting is unchanged: the lease stays
-  uncertain, and the per-process slot is released only with a durable lease,
-  as before.
+  answer to the same failure. A stream cut at its request deadline on a lane
+  that can abort requests (SGLang with CapyCTL's request IDs) gets the same
+  event before its stream ends. Only a client that hung up, or whose delivery
+  already failed, gets no event, since nothing can reach it. Lease accounting
+  is unchanged: the lease stays uncertain (cancelling for a cut), and the
+  per-process slot is released only with a durable lease, as before.
 - A host ingress at its 64-forward limit answers 429 with its own
   `inference_unavailable` code before anything reaches the engine. The
   forwarder passed that 429 through and the stream reader called it
@@ -37,6 +41,9 @@ Tests, failing before and passing after:
 - `instances::an_ingress_at_capacity_fails_over_to_another_instance` (a real
   forwarder against an ingress answering 429; before: no failover, the
   stream did not carry the other instance's answer).
+- `router_core::a_deadline_cut_stream_on_a_capable_lane_ends_with_an_error_event`
+  (SGLang-style lane with request IDs; before: the client saw only the
+  opening chunk, then the stream ended with no event).
 
 CPU and Fake-engine tests are not qualification. Live check still needed: on
 a host with several busy deployments whose requests together exceed the

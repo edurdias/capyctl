@@ -688,9 +688,6 @@ async fn an_ingress_at_capacity_fails_over_to_another_instance() {
         answer["choices"][0]["message"]["content"],
         "answer from host-b"
     );
-    assert!(f
-        .authority
-        .ends(5)
-        .iter()
-        .all(|end| *end == Some(LeaseEnd::NotAccepted)));
+    assert_eq!(f.authority.ends(5), vec![Some(LeaseEnd::NotAccepted); 2]);
+    assert_eq!(f.authority.ends(6), vec![Some(LeaseEnd::Completed); 2]);
 }

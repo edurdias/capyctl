@@ -232,8 +232,9 @@ impl ChatSink for ProgressOnly {
 struct ResponseSink {
     tx: tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
     failed: bool,
-    /// #213: whether any engine chunk was handed to the client's channel. An
-    /// attempted delivery counts, since it may have reached the client.
+    /// #213: whether an output chunk (not one that only opens the reply) was
+    /// handed to the client's channel. An attempted delivery counts, since it
+    /// may have reached the client.
     relayed: bool,
     /// SPEC §17 (M80): this request's clock; chunks mark it as they arrive.
     timing: crate::timing::RequestTiming,
@@ -318,7 +319,9 @@ impl ChatSink for ResponseSink {
         // Set failure before awaiting so cancellation by the adapter's delivery
         // deadline cannot later append a successful terminal to partial output.
         self.failed = true;
-        self.relayed = true;
+        if !capyctl_adapters::forward::opens_reply_only(&chunk) {
+            self.relayed = true;
+        }
         let delivered =
             chunk.len() <= MAX_CHUNK_BYTES && self.deliver(Event::default().data(chunk)).await;
         if !delivered {
@@ -592,6 +595,7 @@ pub fn stream_planned_timed(
             // the engine connection; a forward whose end is ready at the
             // same moment still ends with that end.
             let gone = sink.tx.clone();
+            let answer = sink.tx.clone();
             let mut delivery_cut = cut.subscribe();
             let result = {
                 let forwarder = attempt.forward.clone();
@@ -623,6 +627,18 @@ pub fn stream_planned_timed(
                 {
                     let end = stream_lease_end(&result, progress.produced());
                     let durable = attempt.settle(end).await;
+                    // #213: a cut at the deadline came before any output, so
+                    // the client is answered in-band, as on any other lane,
+                    // before its stream ends; a hang-up or a failed delivery
+                    // has no client left to tell.
+                    if matches!(cut_by, CutBy::Deadline) {
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            answer.send(Ok(unverified_event())),
+                        )
+                        .await;
+                    }
+                    drop(answer);
                     cut.send_replace(true);
                     if durable {
                         guard.release();
@@ -773,18 +789,15 @@ pub fn stream_planned_timed(
             if durable {
                 guard.release();
             }
-            // #213: a forward that failed before anything reached the client
+            // #213: a forward that failed before any output reached the client
             // is answered in-band, as a refusal is, rather than by closing an
             // empty 200 stream. The answer is unverified, as the non-streamed
             // one is, so it is not retryable; the accounting above is unchanged.
-            if !sink.relayed && !matches!(result, Ok(Ok(_))) {
-                let error = serde_json::json!({"error": {
-                    "code": "engine_error",
-                    "message": "backend completion unverified",
-                    "retryable": false}});
+            // A client whose delivery already failed has nothing to read it.
+            if !sink.relayed && !sink.failed && !matches!(result, Ok(Ok(_))) {
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(10),
-                    sink.tx.send(Ok(Event::default().data(error.to_string()))),
+                    sink.tx.send(Ok(unverified_event())),
                 )
                 .await;
             }
@@ -819,4 +832,15 @@ pub fn stream_planned_timed(
         let _ = pump.is_finished();
     };
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// #213, SPEC §10: the in-band answer to a stream that ended uncertainly
+/// before any output, as the non-streamed request's answer
+/// (`backend completion unverified`, not retryable).
+fn unverified_event() -> Event {
+    let error = serde_json::json!({"error": {
+        "code": "engine_error",
+        "message": "backend completion unverified",
+        "retryable": false}});
+    Event::default().data(error.to_string())
 }

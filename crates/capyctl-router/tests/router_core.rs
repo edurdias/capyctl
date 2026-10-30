@@ -2862,6 +2862,38 @@ async fn a_deadline_cut_on_a_capable_lane_settles_on_its_own_final_output() {
     assert_eq!(ends(&authority), cancelling(false));
 }
 
+// T17 #213 (ADR 0032 §3, SPEC §10): a stream cut at its deadline before any
+// output on a capable lane ends with the same in-band error event as on any
+// other lane, never an empty 200 stream; the lease is cancelling as unanswered
+// and settles on its own final output after the abort.
+#[tokio::test]
+async fn a_deadline_cut_stream_on_a_capable_lane_ends_with_an_error_event() {
+    let (authority, deps, _) =
+        sglang_lane(false, true, Script::AbortFinishes { content: false }).await;
+    deps.inflight
+        .waiting
+        .set_limits(capyctl_router::queue::WaitLimits {
+            deadline: std::time::Duration::from_millis(300),
+            ..Default::default()
+        });
+    let router = capyctl_router::serve_router(deps.clone());
+    let (status, text) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        chat_stream(&router, "public-alias"),
+    )
+    .await
+    .expect("the client's stream ends at the cut");
+    assert_eq!(status, 200);
+    assert!(
+        text.contains("\"engine_error\"") && text.contains("backend completion unverified"),
+        "{text:?}"
+    );
+    assert!(!text.contains("[DONE]"), "{text}");
+    eventually(|| authority.acks() == vec!["lease-0".to_owned()]).await;
+    assert_eq!(authority.aborts(), one_abort());
+    assert_eq!(ends(&authority), cancelling(false));
+}
+
 // T17 (ADR 0032 §3–§4): a stream cut at the idle bound after output on a
 // capable lane ends for its client without `[DONE]`, is cancelling as
 // answered, and settles on its own final output after the abort.
