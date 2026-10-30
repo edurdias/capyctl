@@ -217,11 +217,16 @@ first start is charged the Ready figure until a first run measures the real
 peak on the card, whether or not the checkpoint had been measured when the
 deployment was accepted. A declared `memory.startup` is the operator's and no
 measurement replaces it: state it without the CUDA context, at least the
-request. A deployment whose startup charge on the card is above the card's
-managed limit can never start, because a card has no first start that runs
-alone on the machine; `capyctl validate config --host` and
-`capyctl status deployment` say so and name the card, the charge and the limit
-(`startup.over_limit` in the JSON). A revision accepted by an earlier release
+request. A start whose charge on a card is above that card's managed limit is
+never admitted there, because a card has no first start that runs alone on the
+machine; `capyctl validate config --host` and `capyctl status deployment` say
+so and name the host, the card, the charge and the limit
+(`startup.over_limit` in the JSON). They judge the card the revision was
+resolved on (the lowest-index GPU, or the first host); placement tries every
+allowed host and GPU, so a larger card may still take it. On several GPUs of
+one host, each card is charged its Ready figure the same way, and a
+speculative deployment gets no graph allowance for its draft model either.
+A revision accepted by an earlier release
 keeps the startup figure it was accepted with; to start one that shows this,
 deploy it with `memory.startup` equal to its request.
 

@@ -107,6 +107,9 @@ pub fn startup_device_domains(effective: &EffectiveDeployment) -> Vec<String> {
 /// limit, while that limit is all admission may ever reserve there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StartupOverLimit {
+    /// The host the revision was resolved on. Another host, or another GPU
+    /// of the same host, may still hold the start.
+    pub host: String,
     /// The card's device domain.
     pub domain: String,
     /// What the first start charges the card.
@@ -115,12 +118,14 @@ pub struct StartupOverLimit {
     pub limit_bytes: i64,
 }
 
-/// #219 (ADR 0019 §3): the first card whose startup charge in the frozen
-/// cold phase is above its managed limit. Such a start is never admitted;
-/// unlike one pool (whose first start runs alone on the host, owner decision
-/// 2026-09-23) a card has no solo first start, so an estimate is never
-/// measured, and a declared peak is never replaced. `None` when every card
-/// holds its charge, and on a host without a device domain.
+/// #219 (ADR 0019 §3): the first card of this resolution whose startup
+/// charge in the frozen cold phase is above its managed limit. A start on
+/// that card is never admitted: unlike one pool (whose first start runs
+/// alone on the host, owner decision 2026-09-23) a card has no solo first
+/// start, so an estimate is never measured there, and a declared peak is
+/// never replaced. It names one host and card: placement resolves every
+/// allowed host and GPU on its own. `None` when every card holds its charge,
+/// and on a host without a device domain.
 pub fn startup_over_limit(effective: &EffectiveDeployment) -> Option<StartupOverLimit> {
     effective
         .resources
@@ -132,11 +137,62 @@ pub fn startup_over_limit(effective: &EffectiveDeployment) -> Option<StartupOver
             (domain.memory == super::DomainMemory::Device
                 && allocation.bytes > domain.managed_limit)
                 .then(|| StartupOverLimit {
+                    host: effective.host.name.clone(),
                     domain: allocation.domain.clone(),
                     bytes: allocation.bytes,
                     limit_bytes: domain.managed_limit,
                 })
         })
+}
+
+/// Owner decision 2026-09-23: lay the startup figures a launch plan carries
+/// (the peak the server reserved) over the cold phase a host resolved
+/// itself, each never below that host's steady charge on the domain. One
+/// allocation takes `startup_bytes`. ADR 0019 §3 (amendment A2): on a
+/// discrete GPU whose estimate may be replaced, `startup_bytes` is the
+/// card's (ADR 0035 §3: each GPU's) and `startup_host_bytes` host RAM's.
+/// #219: the server sends both for an unmeasured start too, so a host that
+/// resolves the startup estimate by an older rule charges the server's
+/// figure. A declared peak or declared `resources:` keep the host's own.
+pub fn apply_planned_startup(
+    effective: &mut EffectiveDeployment,
+    startup_bytes: Option<i64>,
+    startup_host_bytes: Option<i64>,
+) {
+    if let (Some(startup), [cold], [ready]) = (
+        startup_bytes,
+        effective.resources.cold.allocations.as_mut_slice(),
+        effective.resources.ready.allocations.as_slice(),
+    ) {
+        cold.bytes = startup.max(ready.bytes);
+    }
+    let (Some(device_startup), Some(host_startup), Some(StartupMeasure::Domains { host, .. })) = (
+        startup_bytes,
+        startup_host_bytes,
+        startup_measure(effective),
+    ) else {
+        return;
+    };
+    let devices = startup_device_domains(effective);
+    let steady = |domain: &str| {
+        effective
+            .resources
+            .ready
+            .allocations
+            .iter()
+            .filter(|ready| ready.domain == domain)
+            .fold(0_i64, |sum, ready| sum.saturating_add(ready.bytes))
+    };
+    let charges: Vec<(String, i64)> = devices
+        .iter()
+        .map(|device| (device.clone(), device_startup.max(steady(device))))
+        .chain([(host.clone(), host_startup.max(steady(&host)))])
+        .collect();
+    for cold in &mut effective.resources.cold.allocations {
+        if let Some((_, bytes)) = charges.iter().find(|(domain, _)| *domain == cold.domain) {
+            cold.bytes = *bytes;
+        }
+    }
 }
 
 /// How a measured peak may replace the frozen startup budget, if it may:

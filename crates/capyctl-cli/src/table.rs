@@ -376,16 +376,19 @@ pub(crate) fn startup(startup: &Value) -> String {
 }
 
 /// #219 (ADR 0019 §3): a card whose startup charge is above its managed
-/// limit (`over_limit`), on which no start is ever admitted.
-pub(crate) fn startup_over_limit(startup: &Value) -> Option<String> {
+/// limit (`over_limit`), on which no start is ever admitted. It names the
+/// host and card the revision was resolved on; another GPU or host may hold
+/// the start.
+pub(crate) fn startup_over_limit(startup: &Value, names: &HostNames) -> Option<String> {
     let over = &startup["over_limit"];
     let (bytes, limit) = (number(&over["bytes"])?, number(&over["limit_bytes"])?);
     Some(format!(
-        "a start needs {} of {}, above the {} it manages, so it can never start; on a card \
-         the start is charged engine_config.memory.startup (the request when unset) plus the \
-         engine's CUDA context",
-        gib(bytes),
+        "a start on {} of host {} needs {}, above the {} it manages, so it cannot start \
+         there; on a card the start is charged engine_config.memory.startup (the request \
+         when unset) plus the engine's CUDA context",
         clean(over["domain"].as_str()?),
+        clean(&host_label(over["host"].as_str()?, names)),
+        gib(bytes),
         gib(limit)
     ))
 }
@@ -557,8 +560,9 @@ fn status(value: &Value, names: &HostNames) -> String {
             notes.push(format!("Waiting     {}: {}", operation(op), clean(reason)));
         }
     }
-    // #219: a start no card can ever admit says so before it is refused.
-    if let Some(note) = startup_over_limit(&d["startup"]) {
+    // #219: a start the card it was resolved on can never admit says so
+    // before it is refused.
+    if let Some(note) = startup_over_limit(&d["startup"], names) {
         notes.push(format!("Startup     {note}"));
     }
     // ADR 0014 §7 (found live on a 16 GB card): a checkpoint that measured
@@ -1700,15 +1704,15 @@ mod tests {
                 "revision": "1",
                 "startup": {"bytes": 20_643_119_104_i64, "device_bytes": 16_374_562_816_i64,
                     "host_bytes": 4_294_967_296_i64,
-                    "over_limit": {"domain": "gpu0", "bytes": 16_374_562_816_i64,
-                        "limit_bytes": 15_783_165_952_i64}},
+                    "over_limit": {"host": "01HOSTA", "domain": "gpu0",
+                        "bytes": 16_374_562_816_i64, "limit_bytes": 15_783_165_952_i64}},
                 "instances": []}),
             &names(),
         );
         assert!(
             out.contains(
-                "Startup     a start needs 15.2 GiB of gpu0, above the 14.7 GiB it manages, so \
-                 it can never start"
+                "Startup     a start on gpu0 of host gpu-a needs 15.2 GiB, above the 14.7 GiB \
+                 it manages, so it cannot start there"
             ),
             "{out}"
         );

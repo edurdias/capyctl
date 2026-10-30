@@ -659,6 +659,7 @@ fn over_limit(
         .find_map(|a| {
             let limit = policy.controls.domains.get(&a.domain)?.managed_limit;
             (a.bytes > limit).then(|| StartupOverLimit {
+                host: e.host.name.clone(),
                 domain: a.domain.clone(),
                 bytes: a.bytes,
                 limit_bytes: limit,

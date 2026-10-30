@@ -646,49 +646,14 @@ impl NativeHostExecution {
                 .map_err(|_| JournalError::Unauthorized)?;
         // Owner decision 2026-09-23: the launch's starting phase is charged the
         // startup peak the server reserved (declared, measured or placeholder),
-        // never below the steady request this host resolved itself.
-        if let (Some(startup), [cold], [ready]) = (
-            plan.startup_bytes,
-            effective.resources.cold.allocations.as_mut_slice(),
-            effective.resources.ready.allocations.as_slice(),
-        ) {
-            cold.bytes = startup.max(ready.bytes);
-        }
-        // ADR 0019 §3: on a discrete GPU measured per domain, the card's and
-        // host RAM's startup charges apart, each never below the steady
-        // charge this host resolved on that domain. ADR 0035 §3: on N GPUs
-        // the card's figure is per GPU and is laid over each of them.
-        if let (
-            Some(device_startup),
-            Some(host_startup),
-            Some(capyctl_config::effective::StartupMeasure::Domains { host, .. }),
-        ) = (
+        // never below the steady request this host resolved itself. ADR 0019
+        // §3: on a discrete GPU the card's and host RAM's apart (ADR 0035 §3:
+        // per GPU), #219: measured or not.
+        capyctl_config::effective::apply_planned_startup(
+            &mut effective,
             plan.startup_bytes,
             plan.startup_host_bytes,
-            capyctl_config::effective::startup_measure(&effective),
-        ) {
-            let devices = capyctl_config::effective::startup_device_domains(&effective);
-            let steady = |domain: &str| {
-                effective
-                    .resources
-                    .ready
-                    .allocations
-                    .iter()
-                    .filter(|ready| ready.domain == domain)
-                    .fold(0_i64, |sum, ready| sum.saturating_add(ready.bytes))
-            };
-            let charges: Vec<(String, i64)> = devices
-                .iter()
-                .map(|device| (device.clone(), device_startup.max(steady(device))))
-                .chain([(host.clone(), host_startup.max(steady(&host)))])
-                .collect();
-            for cold in &mut effective.resources.cold.allocations {
-                if let Some((_, bytes)) = charges.iter().find(|(domain, _)| *domain == cold.domain)
-                {
-                    cold.bytes = *bytes;
-                }
-            }
-        }
+        );
         // ADR 0033 §§3, 6 (lifecycle design §7): the LMCache grant's ports are
         // this host's to lease, and its charge is laid over the phases after
         // the startup overrides, so admission, co-residence and retained

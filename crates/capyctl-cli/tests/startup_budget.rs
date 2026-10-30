@@ -229,7 +229,7 @@ fn validate_shows_the_first_start_on_a_card_and_one_that_can_never_start() {
     assert_eq!(startup["device_bytes"], json!(request + overhead), "{raw}");
     assert_eq!(startup["provenance"], "default", "{raw}");
     assert!(startup.get("over_limit").is_none(), "{raw}");
-    assert!(!validate_text(&args).contains("can never start"));
+    assert!(!validate_text(&args).contains("cannot start there"));
 
     // The same file, now with a startup peak the card cannot hold.
     doc["engine_config"]["memory"]["startup"] = json!("14GiB");
@@ -240,13 +240,15 @@ fn validate_shows_the_first_start_on_a_card_and_one_that_can_never_start() {
     assert_eq!(startup["provenance"], "declared", "{raw}");
     assert_eq!(
         startup["over_limit"],
-        json!({"domain": "gpu0", "bytes": (14_i64 << 30) + overhead, "limit_bytes": 15052_i64 << 20}),
+        json!({"host": "lab", "domain": "gpu0", "bytes": (14_i64 << 30) + overhead,
+               "limit_bytes": 15052_i64 << 20}),
         "{raw}"
     );
     let text = validate_text(&args);
     assert!(
         text.contains(
-            "a start needs 15.2 GiB of gpu0, above the 14.7 GiB it manages, so it can never start"
+            "a start on gpu0 of host lab needs 15.2 GiB, above the 14.7 GiB it manages, so it \
+             cannot start there"
         ),
         "{text}"
     );

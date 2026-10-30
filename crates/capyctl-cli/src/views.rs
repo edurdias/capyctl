@@ -281,8 +281,11 @@ fn validate(value: &Value) -> String {
     )
     .render();
     text.push_str(&resource_phases(value));
-    // #219: a deployment no card can ever start is visible before its start.
-    if let Some(note) = table::startup_over_limit(&value["effective"]["startup"]) {
+    // #219: a deployment the resolved card can never start is visible
+    // before its start; the host is named as the document names it.
+    if let Some(note) =
+        table::startup_over_limit(&value["effective"]["startup"], &table::HostNames::new())
+    {
         text.push_str(&format!("\nStartup\n  {note}\n"));
     }
     text.push_str(&topology(&value["effective"]["topology"]));

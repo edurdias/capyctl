@@ -947,6 +947,7 @@ fn status_names_a_card_whose_startup_charge_is_above_its_limit() {
     assert_eq!(
         startup.over_limit,
         Some(capyctl_config::effective::StartupOverLimit {
+            host: "lab".into(),
             domain: "gpu0".into(),
             bytes: 14 * GIB + OVERHEAD,
             limit_bytes: 15052 << 20,

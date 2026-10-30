@@ -752,6 +752,7 @@ fn a_declared_startup_on_a_card_is_charged_with_the_cuda_context_only() {
     assert_eq!(
         capyctl_config::effective::startup_over_limit(&effective),
         Some(capyctl_config::effective::StartupOverLimit {
+            host: "lab".into(),
             domain: "gpu0".into(),
             bytes: 14 * GIB + OVERHEAD,
             limit_bytes: limit,
