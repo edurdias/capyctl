@@ -149,6 +149,15 @@ pub const REQUEST_ABORT: &str = "request_abort";
 /// `host_capability_missing:local_tensor_parallel` before anything is sent.
 /// Any other launch needs nothing new.
 pub const LOCAL_TENSOR_PARALLEL: &str = "local_tensor_parallel";
+/// #198 (ADR 0008 amendment 2026-10-30, ADR 0017): the server takes the
+/// policy refusal `installation_unsupported:<kind>` (an editable SGLang,
+/// `installation_unsupported:editable`). An earlier server's refusal check
+/// does not know the code and ends the whole control session on it, so the
+/// host reports it only to a server whose SessionReady lists this name
+/// ([`server_takes_refusal`]); toward any other the launch goes ahead as
+/// before and fails at the engine's start. The host declares it too, so its
+/// feature set shows it.
+pub const INSTALLATION_UNSUPPORTED: &str = "installation_unsupported";
 
 /// ADR 0018: bounds on the new messages' strings and lists.
 pub const MAX_REQUEST_ID: usize = 64;
@@ -156,9 +165,23 @@ pub const MAX_RETIREMENT_DEPLOYMENTS: usize = 256;
 pub const MAX_REASON: usize = 512;
 
 /// ADR 0018: what this server advertises in `SessionReady.capabilities`.
-/// ADR 0033 §12: `lmcache`, so a host sends its LMCache samples.
+/// ADR 0033 §12: `lmcache`, so a host sends its LMCache samples. #198:
+/// `installation_unsupported`, so a host reports that refusal.
 pub fn server_capabilities() -> Vec<String> {
-    vec![LIVE_PROFILE_UPDATE.to_owned(), LMCACHE.to_owned()]
+    vec![
+        LIVE_PROFILE_UPDATE.to_owned(),
+        LMCACHE.to_owned(),
+        INSTALLATION_UNSUPPORTED.to_owned(),
+    ]
+}
+
+/// #198 (ADR 0017): whether a host may report the policy refusal `reason`
+/// to a server whose `SessionReady.capabilities` are `server`. Every refusal
+/// an earlier server knows may be; `installation_unsupported:<kind>` only to
+/// a server that listed [`INSTALLATION_UNSUPPORTED`].
+pub fn server_takes_refusal(server: &[String], reason: &str) -> bool {
+    !reason.starts_with("installation_unsupported:")
+        || server.iter().any(|name| name == INSTALLATION_UNSUPPORTED)
 }
 
 /// Which way a feature's messages flow.
@@ -200,6 +223,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (RETENTION, Direction::ServerToHost),
     (REQUEST_ABORT, Direction::ServerToHost),
     (LOCAL_TENSOR_PARALLEL, Direction::ServerToHost),
+    (INSTALLATION_UNSUPPORTED, Direction::HostToServer),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.
