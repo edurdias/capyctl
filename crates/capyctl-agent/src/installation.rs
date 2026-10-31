@@ -13,10 +13,11 @@
 //! controller's event journal, and refused only when the installation's host
 //! policy says `installation_drift: refuse` (default `warn`). An installation
 //! that cannot be measured (a package outside the environment's
-//! `site-packages`) is `unmeasured`, never a refusal, with one exception
-//! (#198, ADR 0008 amendment 2026-10-30): an SGLang installed in editable
-//! mode is refused `installation_unsupported:editable` at `engine add` and at
-//! every launch, whatever the drift policy ([`unsupported_installation`]).
+//! `site-packages`) is `unmeasured`, never a refusal here. #198 (ADR 0008
+//! amendment 2026-10-30): [`unsupported_installation`] names an SGLang
+//! installed in editable mode, which `engine add` and standalone's embedded
+//! installation check refuse; an enrolled host never sends that code over the
+//! protocol (ADR 0017 §2), and its launch fails at the engine's start.
 //!
 //! **Capabilities.** A launch that depends on a gated feature (today: deep
 //! parking) runs `runtime/engine_capabilities.py` under the installation's own
@@ -172,7 +173,9 @@ pub fn site_packages_holding(
     }
 }
 
-/// #198: the closed refusal of an SGLang installed in editable mode.
+/// #198: the closed refusal of an SGLang installed in editable mode, used by
+/// `engine add` and standalone's embedded check only; never sent over the
+/// host protocol, whose 0.1.x servers do not know it (ADR 0017 §2).
 pub const EDITABLE_REFUSAL: &str = "installation_unsupported:editable";
 
 /// #198, ADR 0008 amendment 2026-10-30: the closed refusal of an installation
@@ -1137,9 +1140,10 @@ impl InstallationRegistry {
     /// registered again); it refuses only under `installation_drift: refuse`.
     /// Returns the digest measured now (empty when it could not be measured),
     /// which keys the capability cache. ADR 0031 §3: a custom engine is
-    /// measured with the manifest its profile carries. #198 (ADR 0008
-    /// amendment 2026-10-30): an installation its entry can never import is
-    /// refused [`EDITABLE_REFUSAL`] under either policy.
+    /// measured with the manifest its profile carries. #198: an editable
+    /// SGLang is `unmeasured` here like any other package outside
+    /// `site-packages`, never refused: this check answers an enrolled host's
+    /// launches, whose server may not know [`EDITABLE_REFUSAL`].
     pub fn verify(
         &self,
         profile: &str,
@@ -1153,12 +1157,6 @@ impl InstallationRegistry {
         } else {
             self.measurer.measure_profile(engine, executable, custom)
         };
-        // #198: only a package missing from site-packages can be editable.
-        if matches!(measured, Err(FingerprintError::NotFound)) {
-            if let Some(refusal) = unsupported_installation(engine, executable) {
-                return Err(refusal);
-            }
-        }
         let observed = measured
             .as_ref()
             .map_or_else(|_| UNMEASURED.to_owned(), |f| f.digest.clone());
@@ -1445,10 +1443,11 @@ mod tests {
     }
 
     // T21 T22 #198 (ADR 0008 amendment 2026-10-30): an editable SGLang is
-    // refused `installation_unsupported:editable` at every launch, under
-    // either drift policy, registered or not; nothing else changes.
+    // named `installation_unsupported:editable` for `engine add` and the
+    // embedded check, but the shared launch-time check keeps the pre-#198
+    // rule: `unmeasured`, never refused, under either drift policy.
     #[test]
-    fn an_editable_sglang_is_refused_at_every_launch_whatever_the_policy() {
+    fn an_editable_sglang_is_named_but_the_shared_launch_check_never_refuses_it() {
         let checkout = "/sgl-workspace/sglang/python";
         for (marker, body) in [
             (
@@ -1494,7 +1493,7 @@ mod tests {
             for policy in [InstallationDrift::Warn, InstallationDrift::Refuse] {
                 assert_eq!(
                     registered.verify("local", Engine::Sglang, &executable, policy),
-                    Err(EDITABLE_REFUSAL),
+                    Ok(String::new()),
                     "{marker}"
                 );
             }

@@ -14,6 +14,12 @@
 //! first launch journals that drift. Adoption, Park and Restore are never
 //! refused on drift: a running engine loaded its code at launch.
 //!
+//! #198 (ADR 0008 amendment 2026-10-30): an SGLang installed in editable mode
+//! is refused `installation_unsupported:editable` before every Initialize,
+//! whatever the policy. This is the embedded host only: the refusal stays in
+//! this process and reaches status as the operation's reason text, never the
+//! host protocol (an enrolled host takes the pre-#198 path, ADR 0017 §2).
+//!
 //! Passing fingerprints are not qualification evidence (AGENTS.md).
 
 use std::path::{Path, PathBuf};
@@ -163,8 +169,12 @@ impl EmbeddedInstallation {
         view
     }
 
-    /// Measure the installation again for a launch under `policy`.
+    /// Measure the installation again for a launch under `policy`. #198: an
+    /// editable SGLang, which the entry can never import, is refused
+    /// [`capyctl_agent::installation::EDITABLE_REFUSAL`] whatever the policy.
     pub fn check(&self, policy: InstallationDrift) -> DriftCheck {
+        let editable =
+            capyctl_agent::installation::unsupported_installation(self.engine, &self.executable);
         let verdict = self
             .registry
             .verify(&self.profile, self.engine, &self.executable, policy);
@@ -188,7 +198,7 @@ impl EmbeddedInstallation {
             });
         DriftCheck {
             newly_drifted,
-            refused: verdict.err(),
+            refused: editable.or(verdict.err()),
         }
     }
 }
