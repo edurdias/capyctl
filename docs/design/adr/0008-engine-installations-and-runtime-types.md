@@ -412,27 +412,32 @@ The safety argument of the 2026-10-19 amendment does not carry over, so:
   digit, so sgl-router's `__editable___sglang_router_*` hooks are not
   SGLang's, `sglang.egg-link`, or `"dir_info": {"editable": true}` in the
   distribution's `direct_url.json`) is refused with the closed code
-  `installation_unsupported:editable`: by `capyctl engine add` before
-  anything runs (exit 17), and by the launch-time installation check of
-  every launch, on a host agent and in standalone, under either
-  `installation_drift` policy. This narrows the 2026-09-23 rule that an
-  installation that cannot be measured is `unmeasured`, never refused, for
-  this one case: such an installation can never be imported by the entry,
-  so the refusal only moves a certain failure before any effect.
-  Registration still publishes it `unmeasured`; a regular package in
-  `site-packages` is never refused, whatever lies beside it.
-- The refusal is a policy refusal (`POLICY_REFUSALS`), with a fixed operator
-  hint: reinstall SGLang without `-e`.
-- Version skew (ADR 0017): a 0.1.10 or earlier server does not know the code,
-  and its refusal check ends the whole control session on an unknown one. So
-  the code rides on a new capability, `installation_unsupported`: the server
-  lists it in `SessionReady.capabilities` and the host declares it in
+  `installation_unsupported:editable`, under either `installation_drift`
+  policy. This narrows the 2026-09-23 rule that an installation that cannot
+  be measured is `unmeasured`, never refused, for this one case: such an
+  installation can never be imported by the entry, so the refusal only
+  moves a certain failure before any effect. Registration still publishes it
+  `unmeasured`; a regular package in `site-packages` is never refused,
+  whatever lies beside it. The refusal has a fixed operator hint: reinstall
+  SGLang without `-e`.
+- Where it is refused, by release. In 0.1.11, a patch that by ADR 0017 §2
+  never changes the protocol, only where no protocol is involved:
+  `capyctl engine add` before anything runs (exit 17), and standalone's
+  embedded installation check before each launch, whose refusal reaches
+  status as the operation's reason text. An enrolled host there keeps the
+  path from before this amendment: the installation is `unmeasured`, the
+  launch starts, and the entry fails it with `engine_import_failed` in the
+  free-text launch failure. From 0.2.0 an enrolled host refuses it too, at
+  its launch-time installation check, as a policy refusal
+  (`POLICY_REFUSALS`).
+- Version skew (ADR 0017): a 0.1.x server does not know the code, and its
+  refusal check ends the whole control session on an unknown one. So from
+  0.2.0 the code rides on a new capability, `installation_unsupported`: the
+  server lists it in `SessionReady.capabilities` and the host declares it in
   `Connect.capabilities`. A host reports the refusal only to a server that
-  listed it. Toward an older server the launch goes ahead unmeasured, as
-  before this amendment, and fails at the engine's start with
-  `engine_import_failed` in the launch failure, which every server takes.
-  `engine add` and standalone's embedded check refuse directly: no older
-  server is involved.
+  listed it. Toward an older server the launch goes ahead unmeasured, as in
+  0.1.11, and fails at the engine's start with `engine_import_failed`, which
+  every server takes.
 - The entry's failed engine import gets its own closed code,
   `engine_import_failed`, with a fixed hint and no exception text; the launch
   failure summary names it, and status shows its hint.

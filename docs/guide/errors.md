@@ -126,12 +126,12 @@ A deployment on one machine can show these codes the same way:
   starts until the file is removed.
 - `installation_unsupported:editable` (SGLang): the engine's SGLang is
   installed in editable mode, which CapyCTL cannot load (the row for exit 17
-  above). The start is refused before anything runs, whatever the profile's
-  `installation_drift` says; this also covers an engine named with
+  above). Each launch is refused before anything runs, whatever the
+  profile's `installation_drift` says, in standalone and on a host enrolled
+  with a server of 0.2.0 or later; this also covers an engine named with
   `--sglang-bin` or `local_engine`, which `engine add` never checked.
-  Reinstall SGLang without `-e`. A machine under a server older than its own
-  CapyCTL starts the engine instead, which then fails `engine_import_failed`
-  (below).
+  Reinstall SGLang without `-e`. A host enrolled with a 0.1.x server starts
+  the engine instead, which then fails `engine_import_failed` (below).
 - `engine_import_failed` (SGLang): the engine exited before readiness because
   CapyCTL's interpreter could not import SGLang from the environment's
   `site-packages`. The last line of the engine log is
