@@ -174,17 +174,26 @@ impl std::fmt::Debug for PlanInputVllm {
     }
 }
 
+/// ADR 0019 §3: the floor of a vLLM request derived for a card, and of the
+/// utilization rendered from it: vLLM 0.29 with CUDA graphs did not start a
+/// 4B model on a 16 GB card below `--gpu-memory-utilization 0.75` (observed
+/// on the discrete-GPU laptop host, 2026-09-25; the cause was not recorded).
+/// CapyCTL passes the KV cache as explicit bytes on every launch, so the floor
+/// does not size the KV pool; it guards that start failure. #225: a request
+/// the deployment declares is rendered as it is, without this floor.
+pub const DEVICE_UTILIZATION_FLOOR_PCT: u8 = 75;
+
 /// Discrete GPU design §6 (ADR 0019): the `--gpu-memory-utilization` percent of
 /// a launch on a discrete device, the device request's share of the card's
 /// total rounded up to a whole percent. vLLM checks at start that this share
 /// of the card is free; the planner and the launch check already made that
-/// room. At least 75: vLLM 0.29 with CUDA graphs does not start a 4B model on a
-/// 16 GB card below 0.75 (design §3, observed on the discrete-GPU laptop host).
-/// At most 99: vLLM refuses a whole card.
-pub fn device_utilization_pct(request: i64, device_total: i64) -> u8 {
+/// room. At least `floor_pct` ([`DEVICE_UTILIZATION_FLOOR_PCT`] for a derived
+/// request, 1 for a declared one, #225). At most 99: vLLM refuses a whole
+/// card.
+pub fn device_utilization_pct(request: i64, device_total: i64, floor_pct: u8) -> u8 {
     let total = device_total.max(1);
     let pct = request.max(0).saturating_mul(100).saturating_add(total - 1) / total;
-    pct.clamp(75, 99) as u8
+    pct.clamp(i64::from(floor_pct.clamp(1, 99)), 99) as u8
 }
 
 #[derive(Debug, Clone, Default)]

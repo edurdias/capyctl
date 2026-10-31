@@ -74,7 +74,10 @@ Add a field to choose something yourself, for example:
   use: weights, KV cache and a margin for the engine's own memory. On a
   unified-memory machine such as a GB10 the margin is 8 GiB, or the weights
   x 0.15 plus 4 GiB for checkpoints above 26.7 GiB; on a discrete GPU it is
-  the weights x 0.10.
+  the weights x 0.10. On a discrete GPU vLLM is told exactly this request's
+  share of the card; without it, CapyCTL sizes a vLLM request at 75 % of the
+  card or more, which leaves little room for a second model on a large card
+  ([discrete GPUs](../operations/install.md#discrete-nvidia-gpus)).
 - `engine_config: {cuda_graphs: false}` on SGLang to turn its CUDA graphs off.
   They are on by default; on a 16 GB card FrogNano-4B decoded 61 tokens/s with
   them and 35 without, and kept about 0.7 GiB more of the card while parked.

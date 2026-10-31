@@ -217,6 +217,23 @@ directory); see [llama.cpp](../guide/engines.md#llamacpp). The role's own
 llama.cpp never parks, as a registered one does not, and is refused while
 `/etc/llama.cpp/config.ini` exists.
 
+A vLLM deployment on a discrete GPU gets `--gpu-memory-utilization` from its
+memory request: the request's share of the card, rounded up to a whole
+percent. When CapyCTL sizes the request (the deployment states only
+`engine_config.memory.kv_cache`, or no memory), the request is at least 75 % of
+the card and so is the share, a guard kept because vLLM 0.29 with CUDA graphs
+did not start a 4B model on a 16 GB card below 0.75; the KV cache is passed in
+bytes either way. A deployment that states `engine_config.memory.request`
+gets exactly that request's share, with no floor, so vLLM's start check asks
+only for that much of the card to be free and another model can run beside
+it. State it from the startup peak measured on the card
+(`startup.measured`, less 1.25 GiB for the CUDA context). A request smaller
+than the weights plus the KV cache is refused; leave room for the engine's
+own memory beside them, the weights × 1.10 plus the KV cache as CapyCTL sizes
+it. Unified-memory machines are
+unchanged: vLLM gets a low fixed `--gpu-memory-utilization` there and the KV
+cache in bytes.
+
 A running host or standalone takes its engine and model settings at start. A
 live `capyctl engine add` or `remove` changes runtime profiles only; any other
 change needs a restart.
