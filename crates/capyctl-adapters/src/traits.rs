@@ -56,12 +56,14 @@ pub enum RuntimeError {
 }
 
 /// ADR 0008 (owner decision 2026-09-23): the operator's next step for a
-/// capability or drift refusal. Fixed text per closed category, never detail.
+/// capability or drift refusal, or (#198) an installation the engine's entry
+/// cannot load. Fixed text per closed category, never detail.
 fn refusal_hint(reason: &str) -> String {
     match reason {
         "capability_missing:deep_park"
         | "capability_missing:core"
         | "installation_drift"
+        | "installation_unsupported:editable"
         | "nccl_library_missing"
         | "engine_config_file" => capyctl_domain::diagnostics::operator_hint(reason)
             .map(|hint| format!(" ({hint})"))
