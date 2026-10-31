@@ -166,6 +166,17 @@ pub(crate) fn charges_device(effective: &capyctl_config::effective::EffectiveDep
 }
 
 impl NativeHostExecution {
+    /// ADR 0017, #198: whether the connected server takes the policy refusal
+    /// `reason` (`capabilities::server_takes_refusal` over what its
+    /// SessionReady listed; nothing listed before a session is ready).
+    pub(super) fn server_takes_refusal(&self, reason: &str) -> bool {
+        let server = self
+            .server_capabilities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        capyctl_protocol::capabilities::server_takes_refusal(&server, reason)
+    }
+
     /// ADR 0008 (owner decision 2026-09-23): refuse a launch whose declared
     /// residency depends on a capability the installation's launch-time probe
     /// found missing. Both parking tiers depend on `deep_park` (controller
@@ -310,14 +321,20 @@ impl NativeHostExecution {
         // refuse`. Then the internals this launch depends on are probed.
         // ADR 0018 §3: the registry of the document the plan was approved under.
         let installations = self.installations_for(plan);
-        let installation = installations
-            .verify(
-                &plan.profile_name,
-                effective.profile.engine,
-                std::path::Path::new(&effective.profile.executable),
-                effective.profile.security.installation_drift,
-            )
-            .map_err(refused)?;
+        let installation = match installations.verify(
+            &plan.profile_name,
+            effective.profile.engine,
+            std::path::Path::new(&effective.profile.executable),
+            effective.profile.security.installation_drift,
+        ) {
+            // #198, ADR 0017: a server that did not list
+            // `installation_unsupported` (0.1.10 and earlier) would end the
+            // whole control session on that code. Toward it the launch goes
+            // ahead unmeasured, as before, and the entry fails it with
+            // `engine_import_failed` in the launch failure it does take.
+            Err(reason) if !self.server_takes_refusal(reason) => String::new(),
+            verdict => verdict.map_err(refused)?,
+        };
         // ADR 0033 §§1, 9: then the launch's LMCache, when it has a grant.
         self.admit_lmcache(command, plan, &effective, &installations)?;
         self.launch_capability(
