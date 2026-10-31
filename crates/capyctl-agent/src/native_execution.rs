@@ -1110,8 +1110,10 @@ impl NativeHostExecution {
 
     /// SPEC §13.3 / T21: the bounded, redacted end of one launch's engine
     /// log. Not journaled: it reads and changes nothing. The log is derived
-    /// from this host's own log directory and only for a launch it still
-    /// claims for the command's deployment; the wire never names a path. A
+    /// from this host's own log directory and only for a launch this host
+    /// accepted for the command's deployment: one it still claims, or (#226)
+    /// one of the command's generation whose claim was released, such as a
+    /// launch that failed before readiness; the wire never names a path. A
     /// failed read is a closed state in a completed result, never native
     /// error text, and never ends the session.
     async fn engine_log_tail(
@@ -1130,21 +1132,14 @@ impl NativeHostExecution {
         }
         let host = self.clone();
         let deployment = id.deployment_id.clone();
+        let generation = id.generation;
         let plan = plan.clone();
         let read = tokio::task::spawn_blocking(move || {
-            let claimed = host
+            let accepted = host
                 .journal
-                .claimed_launches("")
+                .accepted_launch(&deployment, generation, &plan.incarnation)
                 .map_err(|_| TailError::Unreadable(String::new()))?;
-            let owned = claimed.iter().any(|launch| {
-                launch.command.identity.deployment_id == deployment
-                    && launch
-                        .command
-                        .action
-                        .launch_plan()
-                        .is_some_and(|launch| launch.incarnation == plan.incarnation)
-            });
-            if !owned {
+            if !accepted {
                 return Err(TailError::Missing);
             }
             capyctl_adapters::engine_log::read_tail(
@@ -4125,13 +4120,14 @@ mod tests {
     }
 
     /// SPEC §13.3 / T21: an engine log tail reads this host's own log of a
-    /// launch it claims for the command's deployment, bounded and redacted.
-    /// A raw development log, an unclaimed incarnation and another
-    /// deployment's launch carry no text; none ends the session, and no
-    /// answer names a path.
+    /// launch it accepted for the command's deployment, bounded and redacted,
+    /// while it claims it and (#226) at its generation after the claim is
+    /// released. A raw development log, an unknown incarnation, another
+    /// generation's read of a released launch and another deployment's launch
+    /// carry no text; none ends the session, and no answer names a path.
     // T21 T34
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn engine_log_tail_serves_a_claimed_launch_bounded_and_redacted() {
+    async fn engine_log_tail_serves_an_accepted_launch_bounded_and_redacted() {
         let root = directory();
         let identity_dir = directory();
         let (executor, deployment, policy) = checkpoint_fixture(root.path(), identity_dir.path());
@@ -4197,11 +4193,32 @@ mod tests {
                 ("missing", "")
             );
         }
+        // #226: a launch whose claim a Terminate released (one that failed
+        // before readiness) still serves its log at its own generation, and
+        // at no other.
+        let mut terminate = MemberCommand {
+            identity: checkpoint_identity("terminate", "retained"),
+            action: MemberAction::Terminate {
+                owned_handle: "launch".into(),
+                recorded: Vec::new(),
+            },
+        };
+        terminate.identity.payload_digest = terminate.canonical_digest();
+        let terminated = executor.execute(session, terminate).await.unwrap();
+        assert!(!terminated.claim_retained, "{terminated:?}");
+        let released = run(tail("t7", "deployment", &plan.incarnation, 1024)).await;
+        assert_eq!(released.state, "served");
+        assert!(released.text.ends_with("ready\n"), "{}", released.text);
+        let mut later = tail("t8", "deployment", &plan.incarnation, 1024);
+        later.identity.generation = 2;
+        later.identity.payload_digest = later.canonical_digest();
+        let later = run(later).await;
+        assert_eq!((later.state.as_str(), later.text.as_str()), ("missing", ""));
         // SPEC §13.3: a log written under --debug-engine-logs is never served.
         std::fs::write(capyctl_adapters::engine_log::raw_marker(&log), "").unwrap();
         let raw = run(tail("t4", "deployment", &plan.incarnation, 1024)).await;
         assert_eq!((raw.state.as_str(), raw.text.as_str()), ("raw", ""));
-        // A claimed launch whose log is gone is `missing`.
+        // An accepted launch whose log is gone is `missing`.
         std::fs::remove_file(capyctl_adapters::engine_log::raw_marker(&log)).unwrap();
         std::fs::remove_file(&log).unwrap();
         let gone = run(tail("t5", "deployment", &plan.incarnation, 1024)).await;

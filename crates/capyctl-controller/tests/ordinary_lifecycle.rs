@@ -836,6 +836,43 @@ async fn started(
     }
     (f, fence, start, fake, evidence)
 }
+
+/// #226 (SPEC §13.3 / T21): a stop draws the next generation and steps on
+/// the launch it ends; once released, that launch is not named for the
+/// stop's generation, so the engine-log read does not serve a stopped
+/// launch as the instance's latest.
+// T21
+#[tokio::test]
+async fn a_stopped_launch_is_not_named_for_the_stops_generation() {
+    let (f, fence, _, fake, _) = started(true).await;
+    let stop = f
+        .store
+        .accept_ordinary_cleanup(&f.session, "owner", &fence, "stop", 2000, 10000)
+        .unwrap();
+    let (_, context) = f
+        .store
+        .arm_ordinary_cleanup_with_context(&f.session, &stop.step_id, 2050)
+        .unwrap();
+    let gone = collect_cleanup(&fake, &context.unwrap(), 2100).unwrap();
+    f.store
+        .complete_cleanup(&f.session, &stop.step_id, &gone, 2150, f.ttl)
+        .unwrap();
+    let generation = f.store.deployment_instances(&fence.deployment_id).unwrap()[0]
+        .generation
+        .unwrap();
+    assert!(generation > fence.generation, "the stop drew a generation");
+    assert_eq!(
+        f.store
+            .released_launch_at(&fence.deployment_id, 0, generation)
+            .unwrap(),
+        None
+    );
+    assert!(f
+        .store
+        .released_launch_at(&fence.deployment_id, 0, fence.generation)
+        .unwrap()
+        .is_some());
+}
 #[tokio::test]
 async fn ordinary_cleanup_exact_stop_replay_retains_then_releases_once() {
     let (f, fence, start, fake, _) = started(true).await;

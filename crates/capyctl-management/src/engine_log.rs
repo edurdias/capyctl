@@ -1,8 +1,10 @@
 //! SPEC §13.3 / T21: one instance's engine log on the management listener.
 //!
 //! `GET /management/v1/deployments/{id}/engine-log[?instance=<index>][&kib=<N>]`
-//! returns the bounded, redacted end of the log the instance's current launch
-//! writes. `kib` is 1..=256 (default 64); `instance` is the index status
+//! returns the bounded, redacted end of the log the instance's latest launch
+//! wrote: the one it runs, else (#226) the one its current generation
+//! released, such as a launch that failed before readiness, while that
+//! log is kept. `kib` is 1..=256 (default 64); `instance` is the index status
 //! shows, required when the deployment has more than one instance. A server
 //! asks the instance's host (ADR 0017: only a host that declared
 //! `engine_log_tail`); a standalone role reads its embedded host's log
@@ -42,8 +44,8 @@ pub struct EngineLog {
 pub enum EngineLogFailure {
     /// No such deployment or instance.
     NotFound,
-    /// The instance holds no running launch.
-    NotRunning,
+    /// The instance's current generation names no launch.
+    NoLaunch,
     /// The launch's log could not be served.
     Tail(TailFailure),
 }
@@ -52,7 +54,7 @@ impl From<ScopeError> for EngineLogFailure {
     fn from(error: ScopeError) -> Self {
         match error {
             ScopeError::NotFound => Self::NotFound,
-            ScopeError::NotRunning => Self::NotRunning,
+            ScopeError::NoLaunch => Self::NoLaunch,
             ScopeError::Unavailable => Self::Tail(TailFailure::Unavailable),
         }
     }
@@ -66,7 +68,7 @@ pub type EngineLogFuture =
 pub trait EngineLogSource: Send + Sync + 'static {
     /// The deployment's instance indexes; `NotFound` for an unknown one.
     fn instances(&self, deployment: &str) -> InstancesFuture;
-    /// At most `max_bytes` of the instance's current launch's log.
+    /// At most `max_bytes` of the log of the instance's latest launch.
     fn tail(&self, deployment: &str, instance: u32, max_bytes: usize) -> EngineLogFuture;
 }
 
@@ -181,10 +183,10 @@ fn failure(failure: EngineLogFailure, instance: Option<u32>) -> Response {
             "Deployment or instance not found",
             false,
         ),
-        EngineLogFailure::NotRunning => refusal(
+        EngineLogFailure::NoLaunch => refusal(
             StatusCode::NOT_FOUND,
             "not_found",
-            &format!("{which} has no running launch, so it has no engine log to read"),
+            &format!("{which} has no launch, so it has no engine log to read"),
             false,
         ),
         EngineLogFailure::Tail(TailFailure::Missing) => refusal(

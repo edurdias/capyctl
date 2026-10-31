@@ -371,6 +371,61 @@ mod tests {
         assert_ne!(retry.binding_id, execution.binding_id);
     }
 
+    /// #226 (SPEC §13.3 / T21): a launch released after it failed before
+    /// readiness is still named for its generation, with the host its ingress
+    /// was frozen to, so its engine log can be read there; a retained launch
+    /// is not released, and another generation never names it. A retry's
+    /// reserved launch leaves the released one named.
+    // T21
+    #[test]
+    fn a_released_failed_launch_is_named_for_its_generation() {
+        let (store, session, fence, execution) = armed_ordinary();
+        let released = |generation| {
+            store
+                .released_launch_at(&fence.deployment_id, 0, generation)
+                .unwrap()
+        };
+        assert_eq!(released(fence.generation), None, "still retained");
+        // SPEC §§6, 15: a remote launch's ingress (its host) is frozen with
+        // its binding before it is sent.
+        store
+            .conn
+            .execute_batch(&format!(
+                "INSERT OR IGNORE INTO enrolled_hosts(host_id,host_name,key_digest) VALUES('lab','lab','digest');
+                 INSERT INTO remote_binding_ingress VALUES('{}','lab','http://100.64.0.1:9443');",
+                execution.binding_id
+            ))
+            .unwrap();
+        let now = execution.issued_at_ms + 10;
+        let evidence = CleanupEvidence {
+            binding_id: execution.binding_id.clone(),
+            incarnation: execution.incarnation.clone(),
+            identities: vec![],
+            observed_at_ms: now,
+            receipt: "no process was associated".into(),
+        };
+        let ttl = store
+            .observation_ttl_for_step(&execution.token.step_id)
+            .unwrap();
+        store
+            .release_failed_launch(&session, &execution.token.step_id, &evidence, now, ttl)
+            .unwrap();
+        let named = Some(crate::serving::ReleasedLaunch {
+            revision: fence.revision,
+            incarnation: execution.incarnation.clone(),
+            remote_host: Some("lab".into()),
+        });
+        assert_eq!(released(fence.generation), named);
+        assert_eq!(released(fence.generation + 1), None);
+        store
+            .set_admission_enabled(&fence.deployment_id, false)
+            .unwrap();
+        store
+            .accept_start(&session, &fence, now + 1, now + 1000)
+            .unwrap();
+        assert_eq!(released(fence.generation), named);
+    }
+
     /// Spec §6: a launch that failed after arm is released with gone evidence. The
     /// step is cancelled, the run and the operation fail, the binding, lease, grant
     /// and claim are released, the engine key row is deleted, and the deployment
