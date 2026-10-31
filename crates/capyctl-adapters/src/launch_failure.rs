@@ -154,7 +154,7 @@ pub fn summary(engine_output: &str, exit: Option<EngineExit>) -> String {
     {
         text.push_str(
             "; engine_import_failed: SGLang could not be imported from its environment's \
-             site-packages, where CapyCTL never runs .pth files",
+             site-packages",
         );
         return text;
     }
@@ -285,7 +285,7 @@ mod tests {
         assert_eq!(
             text,
             "the engine exited before readiness; engine_import_failed: SGLang could not be \
-             imported from its environment's site-packages, where CapyCTL never runs .pth files"
+             imported from its environment's site-packages"
         );
         assert!(!text.contains("/opt") && !text.contains("secret"), "{text}");
         assert!(text.len() <= MAX_SUMMARY_BYTES);

@@ -51,8 +51,8 @@ SGLang must be installed as a regular package in the environment's
 `site-packages`. CapyCTL starts it with the `.pth` files there left unrun, so
 an editable install (`pip install -e`, as in the official `lmsysorg/sglang`
 image) cannot load, and `engine add` refuses it before running anything:
-`installation_unsupported:editable`, exit 17. `capyctl start standalone`
-refuses to start such an installation with the same code, including one named
+`installation_unsupported:editable`, exit 17. Standalone refuses each launch of
+such an installation with the same code, including one named
 with `--sglang-bin` or `local_engine`; on a GPU machine of several the engine
 starts and fails at once with `engine_import_failed`. Reinstall SGLang without
 `-e` ([Install an engine](install-engines.md#sglang-0521-or-0520)).

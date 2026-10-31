@@ -37,8 +37,8 @@ What changed:
   beside it; sgl-router's own editable hooks
   (`__editable___sglang_router_<version>_finder.py`) are not SGLang's.
   vLLM, started without `-S`, is unaffected.
-- `capyctl start standalone` refuses such an installation before every
-  Initialize, under either `installation_drift` policy, including one named
+- Standalone refuses each launch of such an installation (before its
+  Initialize), under either `installation_drift` policy, including one named
   with `--sglang-bin` or `local_engine`, in its embedded installation check.
   The refusal stays in that process: status shows it as the operation's
   reason text (`launch_failed`) with a fixed operator hint; nothing crosses

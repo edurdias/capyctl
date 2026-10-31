@@ -759,9 +759,9 @@ An SGLang installed in editable mode (`pip install -e`, as in the official
 `lmsysorg/sglang` image) is refused before anything runs,
 `installation_unsupported:editable`: CapyCTL loads SGLang from the
 environment's `site-packages` without running `.pth` files, and such an
-installation is reached only through one. Standalone refuses to start one with
-the same code, whatever `security.installation_drift` says. A host of several
-machines starts it as before, and the engine fails at once with
+installation is reached only through one. Standalone refuses each launch of one
+with the same code, whatever `security.installation_drift` says. A host enrolled
+with a server starts it as before, and the engine fails at once with
 `engine_import_failed`: a patch release does not change the protocol, and
 0.1.x servers do not know the new code (the host-side refusal is planned for
 0.2.0, behind a capability). Reinstall SGLang without
