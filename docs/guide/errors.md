@@ -124,21 +124,23 @@ A deployment on one machine can show these codes the same way:
 - `engine_config_file` (llama.cpp): `/etc/llama.cpp/config.ini` exists on the
   machine, so llama-server would read options CapyCTL cannot check. Nothing
   starts until the file is removed.
-- `installation_unsupported:editable` (SGLang): the engine's SGLang is
-  installed in editable mode, which CapyCTL cannot load (the row for exit 17
-  above). The start is refused before anything runs, whatever the profile's
-  `installation_drift` says; this also covers an engine named with
-  `--sglang-bin` or `local_engine`, which `engine add` never checked.
-  Reinstall SGLang without `-e`. A machine under a server older than its own
-  CapyCTL starts the engine instead, which then fails `engine_import_failed`
-  (below).
+- `installation_unsupported:editable` (SGLang, `capyctl start standalone`):
+  the engine's SGLang is installed in editable mode, which CapyCTL cannot
+  load (the row for exit 17 above). The start is refused before anything
+  runs, whatever the profile's `installation_drift` says; this also covers an
+  engine named with `--sglang-bin` or `local_engine`, which `engine add` never
+  checked. Reinstall SGLang without `-e`. A GPU machine of several starts the
+  engine instead, which then fails `engine_import_failed` (below).
 - `engine_import_failed` (SGLang): the engine exited before readiness because
   CapyCTL's interpreter could not import SGLang from the environment's
-  `site-packages`. The last line of the engine log is
+  `site-packages`: an editable install (`pip install -e`, as in the
+  `lmsysorg/sglang` image) on a GPU machine of several, or a module SGLang
+  imports that is missing or broken. The last line of the engine log is
   `sglang_startup_failed: engine_import_failed` with what to check; CapyCTL
-  prints no more of the error, since it can quote paths. Check that the
-  environment's `bin/python3 -c "import sglang.srt.entrypoints.http_server"`
-  succeeds, repair what it names, and start again.
+  prints no more of the error, since it can quote paths. Reinstall an
+  editable SGLang without `-e`; otherwise check that the environment's
+  `bin/python3 -c "import sglang.srt.entrypoints.http_server"` succeeds,
+  repair what it names, and start again.
 - `effective_args_mismatch` (llama.cpp): once started, llama-server reported a
   different slot count or window, or its `/metrics` or `/slots` page off, than
   CapyCTL started it with. CapyCTL stops it. Report it: the build behaves
