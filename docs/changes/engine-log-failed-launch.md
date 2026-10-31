@@ -41,9 +41,23 @@ initialize-only tie it named the stopped launch); `capyctl-agent`
 `engine_log_tail_serves_an_accepted_launch_bounded_and_redacted` (now also
 reads after the launch's Terminate, and refuses another generation).
 
-CPU and Fake-engine tests are not qualification. Live check still needed: on
-a GB10 host with `engine_logs: memory`, a launch that fails before readiness
-returns its tail from the read within 60 seconds of the failure.
+CPU and Fake-engine tests are not qualification. Live check, 2026-10-31, host
+A (GB10), a standalone role of `60c324d3` with SGLang 0.5.22 and
+`qwen3-4b-instruct`, nothing else running on the host:
+
+- `engine_logs: memory`, `quantization: awq` on that non-AWQ checkpoint, so
+  SGLang itself fails while loading: the deployment read `failed` 21 s after
+  the deploy, and the read 31 ms later answered 200 with the engine's 61-line
+  output ending in `ValueError: Cannot find the config file for awq`. 75 s
+  later (past the writer's 60 s linger) it answered `404 not_found`, "no
+  engine log exists for the launch of instance 0".
+- `engine_logs: memory` and `engine_logs: files`, an extra argument the SGLang
+  entry refuses (row M38's L8): 200 with `sglang_startup_failed:
+  invalid_extra_args`; with `memory`, 404 after the linger.
+
+Not checked live: a remote host (the remote path ran end to end only against
+the fake engine), and the issue's own trigger, CUDA context creation failing
+on a host whose memory is mostly page cache.
 
 # Release note: Fixes
 
