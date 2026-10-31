@@ -291,15 +291,13 @@ at the release tag.
 - **SGLang permissions warning in the engine log.** The environment is group-
   or world-writable; `chmod -R go-w ~/venvs/sglang` clears it
   ([errors](errors.md)).
-- **`installation_unsupported:editable` from `engine add`, or on a start
-  with `capyctl start standalone`.** SGLang is installed in editable mode, as
-  in the official `lmsysorg/sglang` image: its package is in a source
-  checkout, reached only through a `.pth` file CapyCTL never runs. Reinstall
-  it without `-e` (step 2 of SGLang), then add the engine again.
+- **`installation_unsupported:editable` from `engine add`, or on a start.**
+  SGLang is installed in editable mode, as in the official `lmsysorg/sglang`
+  image: its package is in a source checkout, reached only through a `.pth`
+  file CapyCTL never runs. Reinstall it without `-e` (step 2 of SGLang), then
+  add the engine again.
 - **`engine_import_failed` at the end of the engine log (SGLang).** CapyCTL's
   interpreter could not import SGLang from the environment's `site-packages`.
-  On a GPU machine of several this is also how an editable install shows:
-  reinstall it without `-e`. Otherwise check that
-  `<environment>/bin/python3 -c "import sglang.srt.entrypoints.http_server"`
+  Check that `<environment>/bin/python3 -c "import sglang.srt.entrypoints.http_server"`
   succeeds; if it fails, the message names the module that is missing or broken.
   Repair the environment, then start the model again.
