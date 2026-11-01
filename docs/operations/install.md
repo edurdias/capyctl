@@ -703,6 +703,23 @@ server never places a deployment charged on a GPU's domain on a host that does
 not, and reports `host_capability_missing:device_memory_domains` instead.
 Unified-memory hosts need nothing new.
 
+**The page cache on unified memory.** On a unified-memory machine (a GB10)
+the kernel's page cache lives in the same pool as the GPU's memory. An engine
+whose CUDA context is created while most of that memory is page cache can fail
+with `CUDA error: out of memory` although `MemAvailable` is large, and
+succeed when started again minutes later; NVIDIA's
+[DGX Spark known issues](https://docs.nvidia.com/dgx/dgx-spark/known-issues.html)
+give flushing the buffer cache as the workaround on unified memory. So right
+before an engine starts there (a launch, or the wake of a `restart_only` model
+parked beside its LMCache server, which starts a new engine), CapyCTL drops
+the cached pages of that model's checkpoint files, which its own reads to
+verify the checkpoint, or earlier reads and engine loads, may have filled:
+`posix_fadvise(POSIX_FADV_DONTNEED)` on each file. It needs no privileges and
+leaves the rest of the page cache, and pages another running engine has
+mapped, alone. It is best effort: when it fails, the host log has one
+`checkpoint_page_cache_kept` line for the launch, naming the deployment and
+the reason, and the engine starts anyway. Discrete GPUs are unchanged.
+
 ## Network access
 
 The inference endpoint listens on `0.0.0.0:8443` and requires the API key.

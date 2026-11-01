@@ -582,6 +582,10 @@ impl NativeHostExecution {
                         launch_settings: None,
                     },
                 };
+                // #226 (SPEC §7.2): the wake starts a new engine on the
+                // checkpoint just verified; on unified memory its page cache
+                // is given back first.
+                self.drop_page_cache(&effective, &id.deployment_id).await;
                 let woken = adapter.execute_persisted(&step).await;
                 // ADR 0033 §§8, 9: the Restore's own LMCache report.
                 if let Some(report) = state.report() {
