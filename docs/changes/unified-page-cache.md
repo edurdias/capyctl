@@ -66,16 +66,25 @@ Tests (failing before, passing after):
   `the_page_cache_drop_never_leaves_the_store` (T37: a link out of the store
   is refused whole, nothing advised).
 
-CPU and Fake-engine tests are not qualification: nothing here shows that a
-GB10 engine's CUDA context creation now succeeds.
+CPU and Fake-engine tests are not qualification.
 
-Live check still needed, on a GB10 (unified memory): with one SGLang engine
-serving and the page cache filled by reading model files (`MemFree` near the
-low watermark), start a second SGLang deployment and confirm it reaches Ready
-without `CUDA error: out of memory`, that the host log has no
-`checkpoint_page_cache_kept` line, and that `Cached` in `/proc/meminfo` drops
-by about the checkpoint's size just before the engine starts. The failure was
-intermittent, so repeat the start several times.
+Live check, 2026-11-01, host A (GB10), standalone, SGLang 0.5.22, nothing
+else on the host: deployment A (`qwen3-14b`) kept serving; deployment B
+(`qwen3-4b-instruct`, 7.5 GiB) started with its own checkpoint and 65 GiB of
+other model files just read into the cache (`MemFree` 11 to 16 GiB, `Cached`
+94 to 98 GiB). B's resident checkpoint pages were sampled every 0.7 s with
+`mincore(2)`.
+
+| Binary | B's checkpoint in the cache at start | Then | B Ready | Answer |
+|---|---|---|---|---|
+| this branch (`8cffbbce`), 2 starts | 7.50 GiB | 0.00 GiB within 0.75 s, back as the engine read its weights | 97.5 s, 98.5 s | correct (`42`) |
+| `main` + #227 (no drop), 1 start | 7.50 GiB | 7.50 GiB throughout | 97.6 s | correct (`42`) |
+
+So the drop happens, before the engine starts, and costs no start time
+here; the host log had no `checkpoint_page_cache_kept` line and no
+out-of-memory line. Not shown: that the drop prevents the issue's failure.
+The run did not recreate it (no CUDA allocation driving `MemFree` to the low
+watermark while contexts are created), and neither binary failed.
 
 # Release note: Fixes
 
