@@ -144,7 +144,10 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     0.47.0 environment (~/modelopt-0.47.0-venv: nvidia-modelopt 0.47.0, torch
     2.13.0 cu130, transformers 5.14.1) with a ModelOpt 0.47.0 source checkout
     (~/Model-Optimizer-0.47.0), approved 2026-11-03 for converting checkpoints for
-    capyctl-recipes (Qwen3.8-27B NVFP4); not an engine;
+    capyctl-recipes (Qwen3.8-27B NVFP4); not an engine; and MiaAI-Lab's exllamav3
+    fork (~/exllamav3-mia-venv, commit 63b32f00, torch 2.13.0 cu130) with their
+    deployment kit (~/mia-kit, commit 12421873), approved 2026-11-03 for comparing
+    their EXL3 Qwen3.8-27B checkpoint as a custom engine (ADR 0031);
   - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B;
   - the rented two-GPU machine of ADR 0035 §14 (owner decision 2026-10-25), for
     its one session only: fresh x86_64 CUDA installs of vLLM 0.32.0
