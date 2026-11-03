@@ -124,7 +124,7 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   above (no new environments beyond the listed exceptions) still apply to the lab
   hosts.
 - Do not change engine environments, drivers, or reboot hosts. The engine virtual
-  environments in use, all owner-approved (list updated 2026-10-22):
+  environments in use, all owner-approved (list updated 2026-11-03):
   - both hosts: SGLang 0.5.21, SGLang 0.5.22 (approved 2026-10-17, for decision
     models), vLLM 0.30.0, TensorFold 0.6.5 and TensorFold 0.6.6
     (on host B, each TensorFold venv is a byte-identical copy of host A's, made with
@@ -140,7 +140,14 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   - host A: vLLM 0.31.0 and a llama.cpp v0.6.0 build in the home directory
     (approved 2026-10-14), and basal 2.2.0 (~/basal-2.2.0-venv, torch 2.11.0
     cu130), approved 2026-10-20 for qualifying custom engines (ADR 0031), and vLLM
-    0.32.0 (~/vllm-0.32.0-venv, approved 2026-10-21, for chat);
+    0.32.0 (~/vllm-0.32.0-venv, approved 2026-10-21, for chat), and a ModelOpt
+    0.47.0 environment (~/modelopt-0.47.0-venv: nvidia-modelopt 0.47.0, torch
+    2.13.0 cu130, transformers 5.14.1) with a ModelOpt 0.47.0 source checkout
+    (~/Model-Optimizer-0.47.0), approved 2026-11-03 for converting checkpoints for
+    capyctl-recipes (Qwen3.8-27B NVFP4); not an engine; and MiaAI-Lab's exllamav3
+    fork (~/exllamav3-mia-venv, commit 63b32f00, torch 2.13.0 cu130) with their
+    deployment kit (~/mia-kit, commit 12421873), approved 2026-11-03 for comparing
+    their EXL3 Qwen3.8-27B checkpoint as a custom engine (ADR 0031);
   - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B;
   - the rented two-GPU machine of ADR 0035 §14 (owner decision 2026-10-25), for
     its one session only: fresh x86_64 CUDA installs of vLLM 0.32.0
