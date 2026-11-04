@@ -350,11 +350,17 @@ pub fn well_formed(answer: &Value, declared: &[FieldType]) -> Result<ExtractionA
     })
 }
 
+/// ADR 0041 §5 (ADR 0030 §4's tolerance): inclusive, with the decision
+/// canary's allowance for decimal answers read as binary floats, so a JSON
+/// move of exactly the tolerance (`0.85` to `0.90`) passes for extractions
+/// as it does for decisions.
+const ROUNDING: f64 = 1e-9;
+
 fn within(left: &Value, right: &Value, tolerance: f64) -> bool {
     match (finite(left), finite(right)) {
         (Some(left), Some(right)) => {
             let difference = (left - right).abs();
-            difference <= tolerance
+            difference <= tolerance + ROUNDING
         }
         _ => match (left.as_array(), right.as_array()) {
             (Some(left), Some(right)) => {
@@ -1025,11 +1031,8 @@ mod tests {
                 json!(0.0)
             };
             let reference = ready(&baseline);
-            for (delta, expected) in [
-                (0.05, true),
-                (f64::from_bits(0.05f64.to_bits() + 1), false),
-                (0.051, false),
-            ] {
+            for (delta, expected) in [(0.05, true), (0.05 + 2.0 * ROUNDING, false), (0.051, false)]
+            {
                 let mut later = baseline.clone();
                 later["answers"][field][member] = if field == "returns_next" {
                     json!([0.0, delta])
@@ -1071,14 +1074,17 @@ mod tests {
         .is_err());
     }
 
-    // T50 / ADR 0041 §5: inclusive means the exact tolerance, not an epsilon wider.
+    // T50 / ADR 0041 §5: inclusive with the decision canary's rounding
+    // allowance: a decimal move of exactly the tolerance passes, a move beyond
+    // the allowance fails.
     #[test]
-    fn numeric_tolerances_are_exactly_inclusive() {
+    fn numeric_tolerances_are_inclusive_of_decimal_moves() {
+        assert!(within(&json!(0.85), &json!(0.90), 0.05));
+        assert!(within(&json!([0.85]), &json!([0.90]), 0.05));
         for tolerance in [0.05_f64, 1.0] {
-            let outside = f64::from_bits(tolerance.to_bits() + 1);
+            let outside = tolerance + 2.0 * ROUNDING;
             assert!(within(&json!(0.0), &json!(tolerance), tolerance));
             assert!(!within(&json!(0.0), &json!(outside), tolerance));
-            assert!(within(&json!([0.0]), &json!([tolerance]), tolerance));
             assert!(!within(&json!([0.0]), &json!([outside]), tolerance));
         }
     }
@@ -1194,7 +1200,7 @@ mod tests {
             forecast[member] = json!(0.05);
             let boundary = ready(&with_forecast(forecast.clone()));
             assert!(matches(&reference.declared, &reference.answers, &boundary, 0.05).is_ok());
-            forecast[member] = json!(f64::from_bits(0.05f64.to_bits() + 1));
+            forecast[member] = json!(0.05 + 2.0 * ROUNDING);
             assert!(matches(
                 &reference.declared,
                 &reference.answers,
@@ -1235,8 +1241,7 @@ mod tests {
             let mut baseline = forecast_steps();
             baseline["steps"][1][member] = json!(0.0);
             let reference = ready(&with_forecast(baseline.clone()));
-            for (value, expected) in [(0.05, true), (f64::from_bits(0.05f64.to_bits() + 1), false)]
-            {
+            for (value, expected) in [(0.05, true), (0.05 + 2.0 * ROUNDING, false)] {
                 let mut forecast = baseline.clone();
                 forecast["steps"][1][member] = json!(value);
                 assert_eq!(

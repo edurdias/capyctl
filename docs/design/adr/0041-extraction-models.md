@@ -320,7 +320,9 @@ decisions. A later answer passes when, field by field:
   reference, ADR 0030 §4's tolerance; one present in one answer and absent in the other
   fails.
 
-Every tolerance is inclusive. Discrete answers must repeat exactly (owner decision
+Every tolerance is inclusive, with the decision canary's `1e-9` allowance for decimal
+answers read as binary floats (ADR 0030 §4, `wake_canary.rs`), so a move from `0.85` to
+`0.90` passes as it does for a decision. Discrete answers must repeat exactly (owner decision
 2026-11-04): they are a copied span or a value decoded from a class, not a regression,
 so batching noise moves their probabilities, not the value itself [INFERENCE: true of
 CapyCTL's own model (§9); measured on no engine yet].

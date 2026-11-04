@@ -26,9 +26,9 @@ engine, error and operations pages document the contract.
 Remote launches resolve the declared types from the frozen custom manifest and
 require both host capabilities. The router retains its System One lookup through
 admission instead of repeating it; chat and embeddings keep their existing
-validation order. Extraction wake comparisons use the stated tolerance without
-widening it, and readiness receipts distinguish the host's report from evidence
-observed by the server.
+validation order. Extraction wake comparisons apply the decision canary's
+inclusive tolerance with its `1e-9` rounding allowance, and readiness receipts
+distinguish the host's report from evidence observed by the server.
 
 Registration shows field types for administrator confirmation. Before
 downgrading to a release without extraction support, remove every extraction
@@ -36,13 +36,26 @@ engine with `capyctl engine remove`. Older releases refuse the whole
 `custom-engines.yaml` file if any manifest has `field_types`, preventing role
 startup.
 
-Verification for this landing is CPU tests only; no live run has been made.
-This documentation change did not run checks; the integrator records the CPU
-test results. CPU and fake-engine tests are not qualification. CapyCTL's own
-model is untrained and not qualified. The first live qualification still needs
-its own server (working name `capyctl-extract`) on host A, after approval and
-registration of its environment. Its public name and shipping release remain
-open in ADR 0041.
+Verification: `scripts/ci-local.sh` (fast) passed; `--deep` passed its core
+suite, and the workspace suite passed except one CLI test target that failed
+only because the runner's shell carried the smoke run's `CAPYCTL_MODELS_ROOT`
+(passes with a clean environment; also failed identically on the base
+commit). A local smoke on a maintainer laptop (RTX 4090 Laptop GPU, isolated
+standalone, `capyctl-extract` 0.1.0 from its own repository with a random
+tiny Qwen3.5-architecture checkpoint on CPU torch): `engine add --custom`
+showed the field types; the deployment became ready on the fixed extraction
+of all nine types, and again after a stop and start; a declared subset
+(`[number, text]`, stored as `text, number`) became ready on its smaller
+probe; through the router the fixed request answered 200 with nine answers
+and `capyctl.metrics`; `questions`, both keys and chat were `api_mismatch`,
+an unknown setting `invalid_request`, an undeclared `date`
+`field_type_unsupported`, an engine-side `min > max` `engine_rejected`, and
+`/v1/models` listed `capyctl.api` and `capyctl.field_types`. A random
+checkpoint proves the plumbing, not extraction quality. CPU tests and this
+smoke are not qualification. CapyCTL's own model is untrained. The first live
+qualification still needs its server (working name `capyctl-extract`) on host
+A, after approval and registration of its environment. Its public name and
+shipping release remain open in ADR 0041.
 
 # Release note: Extraction models
 

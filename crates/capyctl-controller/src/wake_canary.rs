@@ -490,8 +490,8 @@ mod tests {
     #[test]
     fn extraction_tolerances_are_inclusive_and_changes_beyond_them_fail() {
         let mut initial = extracted();
-        // Compare exact binary differences: decimal 0.9 - 0.85 is slightly
-        // larger than 0.05 and must not widen the production tolerance.
+        // Start from zero so each move below is exactly the tolerance; the
+        // decimal case (0.85 to 0.90) is covered with the comparison itself.
         initial.answers["amount_paid"]["p_null"] = 0.0.into();
         initial.answers["amount_paid"]["confidence"] = 0.0.into();
         initial.answers["returns_today"]["p_below"] = 0.0.into();
@@ -534,7 +534,7 @@ mod tests {
             Verdict::Matches
         );
         let mut probability = initial.clone();
-        probability.answers["amount_paid"]["p_null"] = f64::from_bits(0.05f64.to_bits() + 1).into();
+        probability.answers["amount_paid"]["p_null"] = (0.05 + 2e-9).into();
         let mut estimate = initial.clone();
         estimate.answers["returns_today"]["value"] = 15.into();
         let mut forecast = initial;
