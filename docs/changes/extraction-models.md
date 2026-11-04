@@ -36,11 +36,9 @@ engine with `capyctl engine remove`. Older releases refuse the whole
 `custom-engines.yaml` file if any manifest has `field_types`, preventing role
 startup.
 
-Verification: `scripts/ci-local.sh` (fast) passed; `--deep` passed its core
-suite, and the workspace suite passed except one CLI test target that failed
-only because the runner's shell carried the smoke run's `CAPYCTL_MODELS_ROOT`
-(passes with a clean environment; also failed identically on the base
-commit). A local smoke on a maintainer laptop (RTX 4090 Laptop GPU, isolated
+Verification: `scripts/ci-local.sh --deep` passed every step at `25ab2c80`
+(fmt, name, clippy, unit, runtime, shellcheck, installer, changes, core and
+workspace). A local smoke on a maintainer laptop (RTX 4090 Laptop GPU, isolated
 standalone, `capyctl-extract` 0.1.0 from its own repository with a random
 tiny Qwen3.5-architecture checkpoint on CPU torch): `engine add --custom`
 showed the field types; the deployment became ready on the fixed extraction
