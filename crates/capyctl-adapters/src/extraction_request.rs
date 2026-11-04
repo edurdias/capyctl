@@ -48,12 +48,9 @@ pub fn other_api_key(api: DeploymentApi, body: &Value) -> Option<&'static str> {
         .map(|_| key)
 }
 
-/// ADR 0041 §3: no per-answer judgement on the request path.
+/// ADR 0041 §3: extraction uses the same completion envelope as decisions.
 pub fn extraction_answered(answer: &Value) -> bool {
-    answer
-        .as_object()
-        .and_then(|answer| answer.get("answers"))
-        .is_some_and(Value::is_object)
+    crate::forward::decision_answered(answer)
 }
 
 /// Strict ISO calendar date, including Gregorian leap-year rules.
@@ -213,7 +210,9 @@ fn validate_spec(
 ) -> Result<(), ExtractionRequestRefusal> {
     use FieldType::*;
     let fail = |setting: &str| {
-        invalid(format!("field `{name}` setting `{setting}` is not accepted for type `{}` or has an invalid value", kind.name()))
+        invalid(format!(
+            "field `{name}` setting `{setting}` is unknown or has an invalid shape"
+        ))
     };
     if kind == List && !spec.contains_key("items") {
         return Err(fail("items"));
@@ -225,58 +224,29 @@ fn validate_spec(
             }
         }
     }
-    if kind == Forecast && !spec.contains_key("horizon") {
-        return Err(fail("horizon"));
-    }
-    let bounds = || -> Option<bool> {
-        let (min, max) = (spec.get("min")?, spec.get("max")?);
-        if let (Some(min), Some(max)) = (finite(min), finite(max)) {
-            return (min < max).then_some(false);
-        }
-        let (min, max) = (min.as_str()?, max.as_str()?);
-        (valid_date(min) && valid_date(max) && min < max).then_some(true)
-    };
     for (setting, value) in spec {
         let valid = match setting.as_str() {
             "type" => true,
             "instructions" => value.is_string(),
             "null_threshold" => finite(value).is_some_and(|n| n > 0.0 && n <= 1.0),
-            "unit" if matches!(kind, Number | Duration | Estimate | Forecast) => {
-                value.as_str().is_some_and(|unit| {
-                    kind != Duration
-                        || [
-                            "seconds", "minutes", "hours", "days", "weeks", "months", "years",
-                        ]
-                        .contains(&unit)
-                })
-            }
-            "integer" if matches!(kind, Number | Duration) => value.is_boolean(),
-            "decimals"
-                if matches!(kind, Number | Duration)
-                    || (kind == List
-                        && spec.get("items").and_then(Value::as_str) == Some("number")) =>
-            {
-                value.as_u64().is_some_and(|n| n <= 6)
-            }
-            "items" if kind == List => value
+            "unit" => value.is_string(),
+            "integer" => value.is_boolean(),
+            "decimals" => value.as_u64().is_some_and(|n| n <= 6),
+            "items" => value
                 .as_str()
                 .is_some_and(|s| ["text", "number", "date"].contains(&s)),
-            "min" | "max" if matches!(kind, Estimate | Forecast) => bounds().is_some(),
-            "step" if matches!(kind, Estimate | Forecast) => {
+            "min" | "max" => finite(value).is_some() || value.as_str().is_some_and(valid_date),
+            "step" => {
                 finite(value).is_some_and(|n| n > 0.0)
-                    || (bounds() == Some(true)
-                        && value
-                            .as_str()
-                            .is_some_and(|s| ["month", "year"].contains(&s)))
+                    || value
+                        .as_str()
+                        .is_some_and(|s| ["month", "year"].contains(&s))
             }
-            "scale" if matches!(kind, Estimate | Forecast) => value.as_str().is_some_and(|s| {
-                s == "linear"
-                    || (s == "log"
-                        && bounds() == Some(false)
-                        && spec.get("min").and_then(finite).is_some_and(|n| n > 0.0))
-            }),
-            "horizon" if kind == Forecast => value.as_u64().is_some_and(|n| (1..=64).contains(&n)),
-            "interval" if kind == Forecast => value.as_str().is_some_and(|s| {
+            "scale" => value
+                .as_str()
+                .is_some_and(|s| ["linear", "log"].contains(&s)),
+            "horizon" => value.as_u64().is_some_and(|n| (1..=64).contains(&n)),
+            "interval" => value.as_str().is_some_and(|s| {
                 [
                     "step", "minute", "hour", "day", "week", "month", "quarter", "year",
                 ]
@@ -346,39 +316,46 @@ mod tests {
         }
     }
 
-    // T50: the setting/type matrix is closed, including otherwise valid values.
+    // T50: semantic oddities are the engine's judgement, not the router's.
     #[test]
-    fn rejects_wrong_type_settings() {
-        let settings = [
-            (
-                "unit",
-                json!("USD"),
-                vec!["number", "duration", "estimate", "forecast"],
-            ),
-            ("integer", json!(true), vec!["number", "duration"]),
-            ("decimals", json!(2), vec!["number", "duration", "list"]),
-            ("items", json!("number"), vec!["list"]),
-            ("min", json!(0), vec!["estimate", "forecast"]),
-            ("max", json!(10), vec!["estimate", "forecast"]),
-            ("step", json!(1), vec!["estimate", "forecast"]),
-            ("scale", json!("linear"), vec!["estimate", "forecast"]),
-            ("horizon", json!(2), vec!["forecast"]),
-            ("interval", json!("day"), vec!["forecast"]),
-            ("unknown", json!(true), vec![]),
-        ];
+    fn accepts_settings_independently_of_type() {
         for kind in FieldType::ALL {
-            for (key, value, allowed) in &settings {
-                if allowed.contains(&kind.name()) {
-                    continue;
-                }
-                let mut spec = match kind {
-                    FieldType::List => json!({"type":kind.name(),"items":"text"}),
-                    FieldType::Estimate => json!({"type":kind.name(),"min":0,"max":10}),
-                    FieldType::Forecast => json!({"type":kind.name(),"min":0,"max":10,"horizon":1}),
-                    _ => json!({"type":kind.name()}),
-                };
-                spec[*key] = value.clone();
-                rejects(spec, key);
+            accepts(json!({
+                "type":kind.name(), "unit":"arbitrary", "integer":true,
+                "decimals":2, "items":"text", "min":10, "max":-1,
+                "step":"month", "scale":"log", "horizon":2, "interval":"day"
+            }));
+        }
+        accepts(json!({"type":"forecast","min":0,"max":10}));
+        accepts(json!({"type":"estimate","min":1,"max":1}));
+        accepts(json!({"type":"estimate","min":0,"max":"2026-01-01","scale":"log"}));
+        accepts(json!({"type":"estimate","min":"2026-01-01","max":"2025-01-01"}));
+        accepts(json!({"type":"list","items":"text","decimals":2}));
+        accepts(json!({"type":"duration","unit":"day"}));
+    }
+
+    // T50: every field accepts settings by shape, and rejects unknown names.
+    #[test]
+    fn malformed_standalone_settings_are_rejected_for_every_type() {
+        for kind in FieldType::ALL {
+            for (setting, value) in [
+                ("unknown", json!(true)),
+                ("instructions", json!(false)),
+                ("null_threshold", json!(0)),
+                ("unit", json!([])),
+                ("integer", json!(1)),
+                ("decimals", json!(7)),
+                ("items", json!("duration")),
+                ("min", json!("not-a-date")),
+                ("max", json!(null)),
+                ("step", json!("day")),
+                ("scale", json!("other")),
+                ("horizon", json!(65)),
+                ("interval", json!("seconds")),
+            ] {
+                let mut spec = json!({"type":kind.name(),"items":"text","min":0,"max":10});
+                spec[setting] = value;
+                rejects(spec, setting);
             }
         }
     }
@@ -401,34 +378,24 @@ mod tests {
         rejects(json!({"type":"text","instructions":false}), "instructions");
         rejects(json!({"type":"number","integer":1}), "integer");
         rejects(json!({"type":"number","unit":1}), "unit");
-        rejects(json!({"type":"duration","unit":"day"}), "unit");
         for value in [json!(-1), json!(7), json!(1.5), json!("2"), Value::Null] {
             rejects(json!({"type":"number","decimals":value}), "decimals");
         }
         rejects(json!({"type":"list"}), "items");
         rejects(json!({"type":"list","items":"duration"}), "items");
-        rejects(
-            json!({"type":"list","items":"text","decimals":2}),
-            "decimals",
-        );
         rejects(json!({"type":"estimate","max":10}), "min");
         rejects(json!({"type":"estimate","min":0}), "max");
-        for (min, max) in [
-            (json!(1), json!(1)),
-            (json!(2), json!(1)),
-            (json!(0), json!("2026-01-01")),
-            (json!("2026-01-01"), json!("2025-01-01")),
-            (json!("2025-02-29"), json!("2026-01-01")),
+        for (setting, value) in [
+            ("min", json!("2025-02-29")),
+            ("min", json!(null)),
+            ("max", json!(true)),
+            ("max", json!([])),
         ] {
-            rejects(json!({"type":"estimate","min":min,"max":max}), "max");
+            let mut spec = json!({"type":"estimate","min":0,"max":10});
+            spec[setting] = value;
+            rejects(spec, setting);
         }
-        for step in [
-            json!(0),
-            json!(-1),
-            json!("month"),
-            json!("year"),
-            Value::Null,
-        ] {
+        for step in [json!(0), json!(-1), Value::Null] {
             rejects(
                 json!({"type":"estimate","min":0,"max":10,"step":step}),
                 "step",
@@ -442,21 +409,10 @@ mod tests {
         }
         accepts(json!({"type":"estimate","min":"2024-01-01","max":"2025-01-01","step":"year"}));
         accepts(json!({"type":"estimate","min":"2024-01-01","max":"2025-01-01","step":1}));
-        for min in [-1, 0] {
-            rejects(
-                json!({"type":"estimate","min":min,"max":10,"scale":"log"}),
-                "scale",
-            );
-        }
-        rejects(
-            json!({"type":"estimate","min":"2024-01-01","max":"2025-01-01","scale":"log"}),
-            "scale",
-        );
         rejects(
             json!({"type":"estimate","min":0,"max":10,"scale":"other"}),
             "scale",
         );
-        rejects(json!({"type":"forecast","min":0,"max":10}), "horizon");
         for horizon in [json!(0), json!(65), json!(1.5), json!("1")] {
             rejects(
                 json!({"type":"forecast","min":0,"max":10,"horizon":horizon}),
@@ -640,12 +596,12 @@ mod tests {
         );
     }
 
-    // T50: whole object with an answers object is sufficient, even empty.
+    // T50: the shared completion envelope is nonempty and names each answer's type.
     #[test]
     fn completion_evidence() {
         for answer in [
-            json!({"answers":{}}),
-            json!({"answers":{"x":null},"extra":true}),
+            json!({"answers":{"x":{"type":"text"}}}),
+            json!({"answers":{"x":{"type":"unknown","value":null}},"extra":true}),
         ] {
             assert!(extraction_answered(&answer));
         }
@@ -653,6 +609,10 @@ mod tests {
             Value::Null,
             json!([]),
             json!({}),
+            json!({"answers":{}}),
+            json!({"answers":{"x":null}}),
+            json!({"answers":{"x":{}}}),
+            json!({"answers":{"x":{"type":1}}}),
             json!({"answers":[]}),
             json!({"answers":null}),
         ] {

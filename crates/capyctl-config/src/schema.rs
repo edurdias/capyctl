@@ -476,6 +476,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("kind", SCALAR),
         ("schema_version", SCALAR),
         ("api", SCALAR),
+        // ADR 0041 §2: the strict registration loader admits the declared type set.
+        ("field_types", FieldSpec::Seq(&SCALAR)),
         ("version", SCALAR),
         ("environment", SCALAR),
         ("args", FieldSpec::Seq(&SCALAR)),

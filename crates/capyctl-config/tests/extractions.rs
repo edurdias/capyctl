@@ -217,3 +217,37 @@ fn revisions_without_api_keep_their_fingerprint() {
         assert_eq!(effective, decoded);
     }
 }
+
+// T50: registration's strict custom-engines.yaml loader admits field_types.
+#[test]
+fn custom_engines_file_loads_and_round_trips_extraction_profiles() {
+    use capyctl_config::registration::{EnginesFile, CUSTOM_ENGINES_FILE, ENGINES_FILE};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join(CUSTOM_ENGINES_FILE);
+    let (_, host) = fixture("extractions");
+    let profile = host["runtime_profiles"]["local"].clone();
+    let source = json!({
+        "schema_version": 1,
+        "kind": "custom_engines",
+        "runtime_profiles": {"extract": profile},
+    });
+    std::fs::write(&path, source.to_string()).unwrap();
+    let loaded = EnginesFile::load(&path).unwrap();
+    assert_eq!(loaded.profiles["extract"], profile);
+    let rendered = loaded.render(1);
+    std::fs::write(&path, &rendered).unwrap();
+    let reread = EnginesFile::load(&path).unwrap();
+    assert_eq!(reread.revision, 1);
+    assert_eq!(reread.profiles, loaded.profiles);
+    let merged = EnginesFile::load_with_custom(&directory.path().join(ENGINES_FILE)).unwrap();
+    assert_eq!(merged.profiles["extract"], profile);
+    let stored = CustomProfile::from_value(&merged.profiles["extract"]["custom"]).unwrap();
+    assert_eq!(
+        stored.manifest.field_types,
+        Some(vec![
+            FieldType::Text,
+            FieldType::Number,
+            FieldType::Forecast
+        ]),
+    );
+}

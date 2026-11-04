@@ -80,7 +80,7 @@ fn probability(value: &Value) -> bool {
     finite(value).is_some_and(|number| (0.0..=1.0).contains(&number))
 }
 
-fn valid_time(value: &str) -> bool {
+fn valid_clock(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() < 5 || bytes[2] != b':' {
         return false;
@@ -103,24 +103,21 @@ fn valid_time(value: &str) -> bool {
                     && bytes[9..].iter().all(u8::is_ascii_digit))))
 }
 
-fn valid_datetime(value: &str) -> bool {
-    let Some((date, time)) = value.split_once('T') else {
-        return false;
-    };
-    if !crate::extraction_request::valid_date(date) {
-        return false;
+fn valid_time(value: &str) -> bool {
+    if let Some(clock) = value.strip_suffix('Z') {
+        return valid_clock(clock);
     }
-    if let Some(time) = time.strip_suffix('Z') {
-        return valid_time(time);
+    if let Some(offset) = value.find(['+', '-']) {
+        let zone = &value[offset + 1..];
+        return valid_clock(&value[..offset]) && zone.len() == 5 && valid_clock(zone);
     }
-    if let Some(offset) = time.find(['+', '-']) {
-        return valid_time(&time[..offset]) && valid_time_offset(&time[offset + 1..]);
-    }
-    valid_time(time)
+    valid_clock(value)
 }
 
-fn valid_time_offset(value: &str) -> bool {
-    value.len() == 5 && valid_time(value)
+fn valid_datetime(value: &str) -> bool {
+    value
+        .split_once('T')
+        .is_some_and(|(date, time)| crate::extraction_request::valid_date(date) && valid_time(time))
 }
 
 fn valid_span(value: &Value, text: &str) -> bool {
@@ -139,6 +136,52 @@ fn equal_value(left: &Value, right: &Value) -> bool {
         (Some(left), Some(right)) => left == right,
         _ => left == right,
     }
+}
+
+const COMPONENTS: [&str; 4] = ["value", "median", "p10", "p90"];
+
+fn validate_distribution(values: [&Value; 4], name: &str) -> Result<(), String> {
+    for (member, value) in COMPONENTS.iter().zip(values) {
+        if !finite(value)
+            .is_some_and(|number| (0.0..=100.0).contains(&number) && number.fract() == 0.0)
+        {
+            return Err(failure(name, member));
+        }
+    }
+    let [_, median, low, high] = values.map(|value| value.as_f64().unwrap());
+    if low > median || median > high {
+        return Err(failure(name, "interval"));
+    }
+    Ok(())
+}
+
+fn validate_estimate(answer: &Map<String, Value>, name: &str) -> Result<(), String> {
+    let component = |member| answer.get(member).ok_or_else(|| failure(name, member));
+    validate_distribution(
+        [
+            component("value")?,
+            component("median")?,
+            component("p10")?,
+            component("p90")?,
+        ],
+        name,
+    )
+}
+
+fn compare_probabilities(
+    left: &Value,
+    right: &Value,
+    tolerance: f64,
+    name: &str,
+) -> Result<(), String> {
+    for member in PROBABILITIES {
+        match (left.get(member), right.get(member)) {
+            (None, None) => {}
+            (Some(left), Some(right)) if within(left, right, tolerance) => {}
+            _ => return Err(failure(name, member)),
+        }
+    }
+    Ok(())
 }
 
 fn validate_answers(answers: &Map<String, Value>, declared: &[FieldType]) -> Result<(), String> {
@@ -171,7 +214,7 @@ fn validate_answers(answers: &Map<String, Value>, declared: &[FieldType]) -> Res
                     value
                         .as_array()
                         .is_some_and(|values| values.len() == 2 && values.iter().all(probability))
-                        || probability(value)
+                        || (!matches!(member, "p_below" | "p_above") && probability(value))
                 } else {
                     probability(value)
                 };
@@ -227,6 +270,12 @@ fn validate_answers(answers: &Map<String, Value>, declared: &[FieldType]) -> Res
                 }
             }
             FieldType::List => {
+                if answer.get("value").is_some_and(Value::is_null) {
+                    if answer.get("spans").is_some_and(|spans| !spans.is_null()) {
+                        return Err(failure(name, "spans"));
+                    }
+                    continue;
+                }
                 let values = answer
                     .get("value")
                     .and_then(Value::as_array)
@@ -236,48 +285,58 @@ fn validate_answers(answers: &Map<String, Value>, declared: &[FieldType]) -> Res
                     .and_then(Value::as_array)
                     .filter(|spans| spans.len() == values.len())
                     .ok_or_else(|| failure(name, "spans"))?;
-                let mut previous = 0;
                 for (value, span) in values.iter().zip(spans) {
                     if !value.as_str().is_some_and(|text| valid_span(span, text)) {
                         return Err(failure(name, "spans"));
                     }
-                    let start = span[0].as_u64().expect("validated span");
-                    if start < previous {
-                        return Err(failure(name, "spans"));
-                    }
-                    previous = start;
                 }
             }
-            FieldType::Estimate | FieldType::Forecast => {
-                for step in 0..if *kind == FieldType::Forecast { 2 } else { 1 } {
-                    let number = |member: &str| -> Result<f64, String> {
-                        let value = answer.get(member).ok_or_else(|| failure(name, member))?;
-                        let value = if *kind == FieldType::Forecast {
-                            &value
-                                .as_array()
-                                .filter(|values| values.len() == 2)
-                                .ok_or_else(|| failure(name, member))?[step]
-                        } else {
-                            value
-                        };
-                        finite(value)
-                            .filter(|number| {
-                                (0.0..=100.0).contains(number) && number.fract() == 0.0
-                            })
-                            .ok_or_else(|| failure(name, member))
-                    };
-                    number("value")?;
-                    let (low, median, high) = (number("p10")?, number("median")?, number("p90")?);
-                    if low > median || median > high {
-                        return Err(failure(name, "interval"));
+            FieldType::Estimate => {
+                validate_estimate(answer, name)?;
+                for member in ["p_below", "p_above"] {
+                    if !answer.get(member).is_some_and(probability) {
+                        return Err(failure(name, member));
                     }
                 }
-                if *kind == FieldType::Estimate {
-                    for member in ["p_below", "p_above"] {
-                        if !answer.get(member).is_some_and(probability) {
-                            return Err(failure(name, member));
+            }
+            FieldType::Forecast => {
+                // ADR 0041 §4: either representation suffices; every present
+                // representation must be valid, even if the other one is valid.
+                let arrays = COMPONENTS.iter().any(|member| answer.contains_key(*member));
+                if arrays {
+                    let component = |member| {
+                        answer
+                            .get(member)
+                            .and_then(Value::as_array)
+                            .filter(|values| values.len() == 2)
+                            .ok_or_else(|| failure(name, member))
+                    };
+                    let values = [
+                        component("value")?,
+                        component("median")?,
+                        component("p10")?,
+                        component("p90")?,
+                    ];
+                    for step in 0..2 {
+                        validate_distribution(values.map(|values| &values[step]), name)?;
+                    }
+                }
+                if let Some(steps) = answer.get("steps") {
+                    let steps = steps
+                        .as_array()
+                        .filter(|steps| steps.len() == 2)
+                        .ok_or_else(|| failure(name, "steps"))?;
+                    for step in steps {
+                        let step = step.as_object().ok_or_else(|| failure(name, "steps"))?;
+                        validate_estimate(step, name)?;
+                        for member in PROBABILITIES {
+                            if step.get(member).is_some_and(|value| !probability(value)) {
+                                return Err(failure(name, member));
+                            }
                         }
                     }
+                } else if !arrays {
+                    return Err(failure(name, "forecast representation"));
                 }
             }
         }
@@ -359,23 +418,42 @@ pub fn matches(
                 } else {
                     left["guess"] == right["guess"]
                 };
-                left["value"].is_null() == right["value"].is_null()
-                    && same_guess
-                    && (*kind != FieldType::Text || left["span"] == right["span"])
+                same_guess && (*kind != FieldType::Text || left["span"] == right["span"])
             }
             FieldType::List => left["value"] == right["value"] && left["spans"] == right["spans"],
-            FieldType::Estimate | FieldType::Forecast => ["value", "median", "p10", "p90"]
+            FieldType::Estimate => COMPONENTS
                 .iter()
                 .all(|member| within(&left[*member], &right[*member], 1.0)),
+            FieldType::Forecast => {
+                let arrays_match = !left.as_object().unwrap().contains_key("value")
+                    || COMPONENTS
+                        .iter()
+                        .all(|member| within(&left[*member], &right[*member], 1.0));
+                let steps_match = if let Some(steps) = left.get("steps").and_then(Value::as_array) {
+                    if let Some(later) = right.get("steps").and_then(Value::as_array) {
+                        steps.iter().zip(later).all(|(left, right)| {
+                            COMPONENTS
+                                .iter()
+                                .all(|member| within(&left[*member], &right[*member], 1.0))
+                        })
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                };
+                arrays_match && steps_match
+            }
         };
         if !same {
             return Err(failure(name, "wake_mismatch"));
         }
-        for member in PROBABILITIES {
-            match (left.get(member), right.get(member)) {
-                (None, None) => {}
-                (Some(left), Some(right)) if within(left, right, tolerance) => {}
-                _ => return Err(failure(name, member)),
+        compare_probabilities(left, right, tolerance, name)?;
+        if *kind == FieldType::Forecast {
+            if let Some(steps) = left.get("steps").and_then(Value::as_array) {
+                for (step, later) in steps.iter().zip(right["steps"].as_array().unwrap()) {
+                    compare_probabilities(step, later, tolerance, name)?;
+                }
             }
         }
     }
@@ -649,14 +727,23 @@ mod tests {
             ),
             (
                 "delivered_time",
-                vec!["00:00", "23:59:59", "01:02:03.123456789"],
+                vec![
+                    "00:00",
+                    "23:59:59",
+                    "01:02:03.123456789",
+                    "12:00Z",
+                    "12:00+05:30",
+                    "23:59:59.123-23:59",
+                ],
                 vec![
                     "24:00",
                     "12:60",
                     "12:00:60",
                     "1:02",
                     "12:00:00.",
-                    "12:00Z",
+                    "12:00+24:00",
+                    "12:00-05:60",
+                    "12:00+05:30Z",
                     "12:00:00.x",
                 ],
             ),
@@ -718,7 +805,7 @@ mod tests {
         assert!(well_formed(&body, &FieldType::ALL).is_ok());
     }
 
-    // T50: lists permit empty and overlapping spans, but not decreasing starts.
+    // T50: lists permit empty, overlapping and non-monotonic spans.
     #[test]
     fn list_items_spans_and_optional_confidence_are_checked() {
         let mut empty = engine();
@@ -743,7 +830,8 @@ mod tests {
         reversed["answers"]["damage"]["value"] = json!(["dented corner", "cracked screen"]);
         reversed["answers"]["damage"]["spans"] =
             json!([span("dented corner"), span("cracked screen")]);
-        assert!(well_formed(&reversed, &FieldType::ALL).is_err());
+        assert!(well_formed(&reversed, &FieldType::ALL).is_ok());
+        assert!(matches(&ready(&engine()), &ready(&reversed), 0.05).is_err());
     }
 
     // T50: all estimate components and every forecast step obey bounds and grid.
@@ -812,7 +900,7 @@ mod tests {
         assert!(matches(&reference, &ready(&later), 0.05).is_ok());
     }
 
-    // T50: scalar values retain nullness and exact guesses except numeric relative error.
+    // T50: scalar canaries compare guesses, not threshold-dependent value nullness.
     #[test]
     fn canary_detects_changed_scalar_evidence() {
         let reference = ready(&engine());
@@ -822,7 +910,7 @@ mod tests {
                 &ready(&changed(field, "value", Value::Null)),
                 0.05
             )
-            .is_err());
+            .is_ok());
         }
         for (field, guess) in [
             ("amount_paid", json!(650)),
@@ -951,5 +1039,155 @@ mod tests {
         corrupt.answers.get_mut("returns_next").unwrap()["median"] = json!([]);
         assert!(matches(&reference, &corrupt, 0.05).is_err());
         assert!(matches(&corrupt, &reference, 0.05).is_err());
+    }
+
+    fn forecast_steps() -> Value {
+        json!({
+            "type": "forecast",
+            "steps": [
+                {"value": 13, "median": 13, "p10": 10, "p90": 16, "p_below": 0.1, "p_above": 0.1},
+                {"value": 14, "median": 14, "p10": 11, "p90": 17, "p_below": 0.2, "p_above": 0.2}
+            ]
+        })
+    }
+
+    fn with_forecast(forecast: Value) -> Value {
+        let mut body = engine();
+        body["answers"]["returns_next"] = forecast;
+        body
+    }
+
+    // T50: null lists are ready with absent/null spans, never with an array.
+    #[test]
+    fn null_lists_are_well_formed() {
+        let mut body = engine();
+        body["answers"]["damage"] = json!({"type": "list", "value": null});
+        let absent = ready(&body);
+        body["answers"]["damage"]["spans"] = Value::Null;
+        let null = ready(&body);
+        assert!(matches(&absent, &null, 0.05).is_ok());
+        assert!(matches(&null, &absent, 0.05).is_ok());
+        assert!(matches(&null, &ready(&engine()), 0.05).is_err());
+        body["answers"]["damage"]["spans"] = json!([]);
+        assert!(well_formed(&body, &FieldType::ALL).is_err());
+    }
+
+    // T50: either forecast representation is ready; all present forms are judged.
+    #[test]
+    fn forecast_steps_and_dual_representations_are_checked() {
+        assert!(well_formed(&with_forecast(forecast_steps()), &FieldType::ALL).is_ok());
+        let mut without_probabilities = forecast_steps();
+        for step in without_probabilities["steps"].as_array_mut().unwrap() {
+            step.as_object_mut().unwrap().remove("p_below");
+            step.as_object_mut().unwrap().remove("p_above");
+        }
+        assert!(well_formed(&with_forecast(without_probabilities), &FieldType::ALL).is_ok());
+        let mut both = engine()["answers"]["returns_next"].clone();
+        both["steps"] = forecast_steps()["steps"].clone();
+        assert!(well_formed(&with_forecast(both.clone()), &FieldType::ALL).is_ok());
+        for invalid in [json!([]), json!([{}]), json!([{}, {}, {}]), Value::Null] {
+            let mut forecast = both.clone();
+            forecast["steps"] = invalid;
+            assert!(well_formed(&with_forecast(forecast), &FieldType::ALL).is_err());
+        }
+        for member in COMPONENTS {
+            let mut forecast = both.clone();
+            forecast[member] = json!([13]);
+            assert!(well_formed(&with_forecast(forecast), &FieldType::ALL).is_err());
+            let mut forecast = both.clone();
+            forecast["steps"][1].as_object_mut().unwrap().remove(member);
+            assert!(well_formed(&with_forecast(forecast), &FieldType::ALL).is_err());
+        }
+        for member in COMPONENTS {
+            for invalid in [json!(-1), json!(101), json!(1.5), json!("14"), Value::Null] {
+                let mut forecast = forecast_steps();
+                forecast["steps"][1][member] = invalid;
+                assert!(well_formed(&with_forecast(forecast), &FieldType::ALL).is_err());
+            }
+        }
+        for (member, value) in [
+            ("p10", json!(15)),
+            ("p90", json!(13)),
+            ("p_below", json!(-0.1)),
+            ("p_above", json!(1.1)),
+            ("confidence", Value::Null),
+        ] {
+            let mut forecast = forecast_steps();
+            forecast["steps"][1][member] = value;
+            assert!(well_formed(&with_forecast(forecast), &FieldType::ALL).is_err());
+        }
+        assert!(well_formed(&with_forecast(json!({"type": "forecast"})), &FieldType::ALL).is_err());
+        let mut partial = forecast_steps();
+        partial["value"] = json!([13, 14]);
+        assert!(well_formed(&with_forecast(partial), &FieldType::ALL).is_err());
+        for member in ["p_below", "p_above"] {
+            let mut forecast = forecast_steps();
+            forecast[member] = json!(0.2);
+            assert!(well_formed(&with_forecast(forecast), &FieldType::ALL).is_err());
+        }
+    }
+
+    // T50: each step component has the same one-step tolerance as array forecasts.
+    #[test]
+    fn forecast_step_canary_checks_values_and_probabilities() {
+        let reference = ready(&with_forecast(forecast_steps()));
+        for member in COMPONENTS {
+            for delta in [-1, 1, 2] {
+                let mut forecast = forecast_steps();
+                let previous = forecast["steps"][1][member].as_i64().unwrap();
+                forecast["steps"][1][member] = json!(previous + delta);
+                assert_eq!(
+                    matches(&reference, &ready(&with_forecast(forecast)), 0.05).is_ok(),
+                    delta != 2,
+                    "{member} delta {delta}"
+                );
+            }
+        }
+        for member in ["p_below", "p_above"] {
+            for (value, expected) in [(0.25, true), (0.251, false)] {
+                let mut forecast = forecast_steps();
+                forecast["steps"][1][member] = json!(value);
+                assert_eq!(
+                    matches(&reference, &ready(&with_forecast(forecast)), 0.05).is_ok(),
+                    expected,
+                    "{member}"
+                );
+            }
+            let mut forecast = forecast_steps();
+            forecast["steps"][1].as_object_mut().unwrap().remove(member);
+            assert!(matches(&reference, &ready(&with_forecast(forecast)), 0.05).is_err());
+        }
+        let mut extra_probability = forecast_steps();
+        extra_probability["steps"][0]["confidence"] = json!(0.5);
+        assert!(matches(&reference, &ready(&with_forecast(extra_probability)), 0.05).is_err());
+    }
+
+    // T50: later forecasts must retain every reference representation, while a newly
+    // added valid form is not compared against a form the reference never recorded.
+    #[test]
+    fn forecast_canary_uses_each_reference_representation() {
+        let arrays = ready(&engine());
+        let mut steps_forecast = forecast_steps();
+        steps_forecast["p_below"] = json!([0.1, 0.2]);
+        steps_forecast["p_above"] = json!([0.1, 0.2]);
+        let steps = ready(&with_forecast(steps_forecast));
+        let mut dual = engine()["answers"]["returns_next"].clone();
+        dual["steps"] = forecast_steps()["steps"].clone();
+        let both = ready(&with_forecast(dual.clone()));
+        assert!(matches(&arrays, &both, 0.05).is_ok());
+        assert!(matches(&steps, &both, 0.05).is_ok());
+        assert!(matches(&both, &arrays, 0.05).is_err());
+        assert!(matches(&both, &steps, 0.05).is_err());
+        assert!(matches(&arrays, &steps, 0.05).is_err());
+        assert!(matches(&steps, &arrays, 0.05).is_err());
+        dual["steps"][1]["value"] = json!(16);
+        let changed_steps = ready(&with_forecast(dual.clone()));
+        assert!(matches(&arrays, &changed_steps, 0.05).is_ok());
+        assert!(matches(&both, &changed_steps, 0.05).is_err());
+        dual["steps"] = forecast_steps()["steps"].clone();
+        dual["value"] = json!([13, 16]);
+        let changed_arrays = ready(&with_forecast(dual));
+        assert!(matches(&steps, &changed_arrays, 0.05).is_ok());
+        assert!(matches(&both, &changed_arrays, 0.05).is_err());
     }
 }
