@@ -397,6 +397,10 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
     if command.probe_decision {
         needs.push(DECISIONS);
     }
+    // ADR 0041 §1: older agents must never drop the extraction flag.
+    if command.probe_extraction {
+        needs.push(EXTRACTIONS);
+    }
     // ADR 0036 §§5, 6, ADR 0017: likewise for the embedding flag.
     if command.probe_embedding {
         needs.push(EMBEDDINGS);

@@ -396,6 +396,7 @@ async fn certificate_expiry_closes_existing_stream_and_backpressure_is_bounded()
             probe_max_tokens: 0,
             probe_decision: false,
             probe_embedding: false,
+            probe_extraction: false,
             trace_parent: String::new(),
         })),
     })

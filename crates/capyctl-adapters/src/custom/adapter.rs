@@ -28,6 +28,8 @@ pub struct CustomAdapter {
     claimed: Mutex<Option<(String, String)>>,
     /// ADR 0030 §1, ADR 0031 §2: the API the manifest serves.
     api: DeploymentApi,
+    /// ADR 0041 §4: the frozen manifest's declared extraction field types.
+    field_types: Vec<capyctl_config::extractions::FieldType>,
     /// ADR 0031 §5: the manifest's health path.
     health: Option<String>,
     /// ADR 0031 §6: the manifest's idle signal.
@@ -64,6 +66,7 @@ impl CustomAdapter {
             tools: None,
             claimed: Mutex::new(None),
             api: DeploymentApi::Chat,
+            field_types: Vec::new(),
             health: None,
             idle: None,
             proc_root: std::path::PathBuf::from("/proc"),
@@ -83,6 +86,15 @@ impl CustomAdapter {
     /// ADR 0031 §2: the API every deployment on the manifest serves.
     pub fn with_api(mut self, api: DeploymentApi) -> Self {
         self.api = api;
+        self
+    }
+
+    /// ADR 0041 §4: probe only the types approved in the launch's manifest.
+    pub fn with_field_types(
+        mut self,
+        field_types: Vec<capyctl_config::extractions::FieldType>,
+    ) -> Self {
+        self.field_types = field_types;
         self
     }
 
@@ -182,6 +194,23 @@ impl CustomAdapter {
             self.http.base(),
             self.http.key(),
             served,
+            bound,
+        )
+        .await
+    }
+
+    /// ADR 0041 §4: the fixed extraction, on loopback with the launch's key.
+    pub(super) async fn extract_probe(
+        &self,
+        served: &str,
+        bound: std::time::Duration,
+    ) -> Result<crate::extraction_probe::ExtractionAnswer, AdapterError> {
+        crate::extraction_probe::probe(
+            self.http.probes(),
+            self.http.base(),
+            self.http.key(),
+            served,
+            &self.field_types,
             bound,
         )
         .await
@@ -319,6 +348,15 @@ impl EngineAdapter for CustomAdapter {
                     ))
                 },
             )?)
+        } else if self.extractions() {
+            // ADR 0041 §5: never substitute another API's wake evidence.
+            CanaryEvidence::Extraction(self.extract_probe(&self.model_id, bound).await.map_err(
+                |e| {
+                    RuntimeError::Uncertain(format!(
+                        "the custom engine did not answer the extraction probe: {e}"
+                    ))
+                },
+            )?)
         } else {
             return Err(RuntimeError::Unsupported);
         };
@@ -369,6 +407,25 @@ impl ChatForward for CustomAdapter {
         self.forward.forward_decision(body).await
     }
 
+    // ADR 0041 §3: use the same collected transport as decisions.
+    async fn forward_extraction(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, AdapterError> {
+        self.forward_extraction_traced(body, None).await
+    }
+
+    async fn forward_extraction_traced(
+        &self,
+        body: &serde_json::Value,
+        trace: Option<&crate::traits::TraceHeaders>,
+    ) -> Result<serde_json::Value, AdapterError> {
+        if !self.extractions() {
+            return Err(AdapterError::UnsupportedCapability);
+        }
+        self.forward.forward_extraction_traced(body, trace).await
+    }
+
     async fn forward_chat_stream(
         &self,
         body: &crate::request::InferenceRequest,
@@ -413,5 +470,18 @@ impl ChatForward for CustomAdapter {
             return Err(AdapterError::UnsupportedCapability);
         }
         self.embed_probe(served, bound).await
+    }
+
+    /// ADR 0041 §4: use the frozen declaration, never all types from the API.
+    async fn extraction_probe(
+        &self,
+        served: &str,
+        declared: &[capyctl_config::extractions::FieldType],
+        bound: std::time::Duration,
+    ) -> Result<crate::extraction_probe::ExtractionAnswer, AdapterError> {
+        if !self.extractions() || declared != self.field_types {
+            return Err(AdapterError::UnsupportedCapability);
+        }
+        self.extract_probe(served, bound).await
     }
 }

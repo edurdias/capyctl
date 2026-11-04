@@ -35,10 +35,6 @@ pub(super) async fn initialize(
     adapter: &CustomAdapter,
     command: &RuntimeCommand,
 ) -> Result<EffectObservation, RuntimeError> {
-    // ADR 0041 §4: no launch becomes ready using another API's probe.
-    if adapter.extractions() {
-        return Err(RuntimeError::Unsupported);
-    }
     let context = &command.context;
     let (plan, tools) = adapter.launch_parts()?;
     if !matches!(
@@ -176,9 +172,14 @@ pub(super) async fn initialize(
         identities,
         observed_at_ms: now_ms()?,
         receipt: format!(
-            "custom engine {} ready on {}; probe answered; listeners on loopback",
+            "custom engine {} ready on {}; {} probe answered; listeners on loopback",
             adapter.fingerprint(),
-            adapter.endpoint()
+            adapter.endpoint(),
+            if adapter.extractions() {
+                "fixed extraction"
+            } else {
+                "API"
+            }
         ),
         facts: vec![
             Milestone::AllocationsRestored,
@@ -190,11 +191,10 @@ pub(super) async fn initialize(
     })
 }
 
-/// ADR 0031 §5: the existing probe of the profile's API, unchanged: the
-/// fixed decision of ADR 0030 §3 for `decisions` and the fixed embedding of
-/// ADR 0036 §5 for `embeddings` (never a chat probe in their place), the
-/// bounded startup chat probe for `chat`; the served name as `model`, the
-/// key when the manifest uses one. The reason it failed, if it did.
+/// ADR 0031 §5: the profile's own API probe, with its served name and key:
+/// a fixed decision (ADR 0030 §3), embedding (ADR 0036 §5), extraction of
+/// the declared types (ADR 0041 §4), or the bounded startup chat probe.
+/// Another API's answer never substitutes. Returns the failure reason.
 async fn probe(adapter: &CustomAdapter, served: &str, budget: Duration) -> Result<(), String> {
     if adapter.decisions() {
         return match tokio::time::timeout(budget, adapter.decide(served, budget)).await {
@@ -208,6 +208,15 @@ async fn probe(adapter: &CustomAdapter, served: &str, budget: Duration) -> Resul
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(format!("the embedding probe was not answered: {e}")),
             Err(_) => Err("the embedding probe outlasted the startup window".into()),
+        };
+    }
+    // ADR 0041 §4: port and manifest health have passed; now only extraction
+    // evidence of the declared types proves this launch ready.
+    if adapter.extractions() {
+        return match tokio::time::timeout(budget, adapter.extract_probe(served, budget)).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(format!("the extraction probe was not answered: {e}")),
+            Err(_) => Err("the extraction probe outlasted the startup window".into()),
         };
     }
     let body = json!({

@@ -46,6 +46,9 @@ pub struct RemoteLaunchBinding {
     /// ADR 0036 §1: the launch serves embedding models (`api: embeddings`);
     /// its launch and wake need the host's `embeddings`.
     pub embeddings: bool,
+    /// ADR 0041 §§2, 4: the extraction launch's frozen declaration; empty for
+    /// every other API. This declaration also selects its canary.
+    pub extraction_types: Vec<capyctl_config::extractions::FieldType>,
     /// ADR 0031 §9: the launch runs a custom engine. Every command of it then
     /// needs the host's `custom_engines`; a host without it is refused typed
     /// before anything is sent.
@@ -73,7 +76,9 @@ impl RemoteLaunchBinding {
     /// wake canary's probe.
     fn api(&self) -> capyctl_config::effective::DeploymentApi {
         use capyctl_config::effective::DeploymentApi;
-        if self.decisions {
+        if !self.extraction_types.is_empty() {
+            DeploymentApi::Extractions
+        } else if self.decisions {
             DeploymentApi::Decisions
         } else if self.embeddings {
             DeploymentApi::Embeddings
@@ -374,6 +379,9 @@ impl RemoteEngine {
         if b.embeddings {
             needs.push(capabilities::EMBEDDINGS);
         }
+        if !b.extraction_types.is_empty() {
+            needs.push(capabilities::EXTRACTIONS);
+        }
         if b.custom_engine {
             needs.push(capabilities::CUSTOM_ENGINES);
         }
@@ -596,6 +604,11 @@ impl EngineAdapter for RemoteEngine {
         if b.embeddings {
             needs.push(capabilities::EMBEDDINGS);
         }
+        // ADR 0041 §1: both the custom-engine and extraction capabilities
+        // are required before sending anything for this launch.
+        if !b.extraction_types.is_empty() {
+            needs.push(capabilities::EXTRACTIONS);
+        }
         // ADR 0031 §9: a custom engine's launch goes only to a host that
         // declared `custom_engines`.
         if b.custom_engine {
@@ -697,7 +710,12 @@ impl EngineAdapter for RemoteEngine {
             self.engine_tracing.record(outcome);
         }
         launch_evidence(&result)?;
-        let receipt = remote_receipt(&result, &devices)?;
+        let mut receipt = remote_receipt(&result, &devices)?;
+        // ADR 0041 §4: the receipt names the fixed extraction that proved
+        // readiness, rather than implying that port health alone sufficed.
+        if !b.extraction_types.is_empty() {
+            receipt.push_str("; fixed extraction of the declared field types answered");
+        }
         // SPEC §13.2 (G2): this readiness belongs to the host session that
         // proved it; a later session must re-prove it before dispatch.
         self.readiness
@@ -909,8 +927,18 @@ impl EngineAdapter for RemoteEngine {
         }
         let api = b.api();
         match api {
-            // ADR 0041 §5: no other API's canary can stand in for extraction evidence.
-            DeploymentApi::Extractions => return Err(RuntimeError::Unsupported),
+            // ADR 0041 §5: an old host must never receive this probe action.
+            DeploymentApi::Extractions => {
+                if !self
+                    .sessions
+                    .supports(&b.host_id, capabilities::EXTRACTIONS)
+                {
+                    return Err(RuntimeError::Uncertain(
+                        "the host no longer declares extractions; the extraction probe was not sent"
+                            .into(),
+                    ));
+                }
+            }
             DeploymentApi::Decisions => {
                 if !self.sessions.supports(&b.host_id, capabilities::DECISIONS) {
                     return Err(RuntimeError::Uncertain(
@@ -962,6 +990,7 @@ impl EngineAdapter for RemoteEngine {
                 max_tokens: (api == DeploymentApi::Chat).then_some(max_tokens),
                 decision: api == DeploymentApi::Decisions,
                 embedding: api == DeploymentApi::Embeddings,
+                extraction: api == DeploymentApi::Extractions,
             },
         };
         command.identity.payload_digest = command.canonical_digest();
@@ -973,7 +1002,7 @@ impl EngineAdapter for RemoteEngine {
             .map_err(|_| {
                 RuntimeError::Uncertain("the host did not answer the wake canary".into())
             })?;
-        let answer = canary_evidence(api, &result)?;
+        let answer = canary_evidence(api, &b.extraction_types, &result)?;
         canary_engine_alive(&c.identities, &result)?;
         Ok(CanaryAnswer {
             answer,
@@ -1036,6 +1065,7 @@ fn abort_outcome(result: &pb::MemberExecutionResult) -> Result<CancellationOutco
 /// and of a norm above 1e-6; never generated text for either.
 fn canary_evidence(
     api: capyctl_config::effective::DeploymentApi,
+    declared: &[capyctl_config::extractions::FieldType],
     result: &pb::MemberExecutionResult,
 ) -> Result<capyctl_adapters::completion_probe::CanaryEvidence, RuntimeError> {
     use capyctl_adapters::completion_probe::{CanaryEvidence, ProbeAnswer};
@@ -1047,8 +1077,35 @@ fn canary_evidence(
         ));
     }
     match api {
-        // ADR 0041 §5: extraction evidence must be checked by its own contract.
-        DeploymentApi::Extractions => Err(RuntimeError::Unsupported),
+        // ADR 0041 §§4–5: re-judge the relayed answer against the frozen
+        // declaration, not the host's claim that its probe passed.
+        DeploymentApi::Extractions => {
+            let malformed = || {
+                RuntimeError::Uncertain(
+                    "the host relayed a malformed extraction probe answer".into(),
+                )
+            };
+            let evidence = result.probe_extraction.as_ref().ok_or_else(malformed)?;
+            if evidence.probe_version != capyctl_adapters::extraction_probe::VERSION
+                || !evidence
+                    .declared_field_types
+                    .iter()
+                    .map(String::as_str)
+                    .eq(declared.iter().map(|kind| kind.name()))
+                || evidence.answers_json.len()
+                    > capyctl_protocol::execution::EXTRACTION_PROBE_MAX_BYTES
+            {
+                return Err(malformed());
+            }
+            let answers: serde_json::Value =
+                serde_json::from_slice(&evidence.answers_json).map_err(|_| malformed())?;
+            capyctl_adapters::extraction_probe::well_formed(
+                &serde_json::json!({"answers": answers}),
+                declared,
+            )
+            .map(CanaryEvidence::Extraction)
+            .map_err(|_| malformed())
+        }
         DeploymentApi::Chat => {
             if result.probe_tokens.is_empty() && result.probe_text.is_empty() {
                 return Err(RuntimeError::Uncertain(
@@ -1634,6 +1691,18 @@ fn remote_launch(
         decisions: work.effective().api == capyctl_config::effective::DeploymentApi::Decisions,
         // ADR 0036 §1: likewise an embeddings launch.
         embeddings: work.effective().api == capyctl_config::effective::DeploymentApi::Embeddings,
+        // ADR 0041 §4: use the frozen approved custom manifest, never the API
+        // alone, to select the readiness and wake probe's fields.
+        extraction_types: work
+            .effective()
+            .profile
+            .custom
+            .as_ref()
+            .filter(|custom| {
+                custom.manifest.api == capyctl_config::effective::DeploymentApi::Extractions
+            })
+            .and_then(|custom| custom.manifest.field_types.clone())
+            .unwrap_or_default(),
         // ADR 0031 §9: a custom engine's launch goes only to a host
         // that declared it.
         custom_engine: work.effective().profile.engine
@@ -1930,6 +1999,7 @@ mod tests {
             device_memory: false,
             decisions: false,
             embeddings: false,
+            extraction_types: Vec::new(),
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,
@@ -2390,7 +2460,7 @@ mod tests {
         let version = capyctl_adapters::decision_probe::VERSION;
         let good = decided("billing", [0.95, 0.02, 0.03], version);
         assert!(matches!(
-            canary_evidence(DeploymentApi::Decisions, &good),
+            canary_evidence(DeploymentApi::Decisions, &[], &good),
             Ok(CanaryEvidence::Decision(answer)) if answer.choice == "billing"
         ));
         let mut text_only = result(vec![observed("api", 10, "alive")]);
@@ -2405,15 +2475,15 @@ mod tests {
             decided("billing", [0.95, 0.02, 0.03], version + 1),
         ] {
             assert!(
-                canary_evidence(DeploymentApi::Decisions, &refused).is_err(),
+                canary_evidence(DeploymentApi::Decisions, &[], &refused).is_err(),
                 "{refused:?}"
             );
         }
         assert!(matches!(
-            canary_evidence(DeploymentApi::Chat, &text_only),
+            canary_evidence(DeploymentApi::Chat, &[], &text_only),
             Ok(CanaryEvidence::Generated(_))
         ));
-        assert!(canary_evidence(DeploymentApi::Chat, &good).is_err());
+        assert!(canary_evidence(DeploymentApi::Chat, &[], &good).is_err());
     }
 
     /// ADR 0036 §§5, 6: an embeddings launch's wake canary counts only the
@@ -2437,7 +2507,7 @@ mod tests {
         let version = capyctl_adapters::embedding_probe::VERSION;
         let good = embedded(vec![0.6, -0.8, 0.0, 0.0], version);
         assert_eq!(
-            canary_evidence(DeploymentApi::Embeddings, &good).unwrap(),
+            canary_evidence(DeploymentApi::Embeddings, &[], &good).unwrap(),
             CanaryEvidence::Embedding(capyctl_adapters::embedding_probe::EmbeddingAnswer {
                 vector: vec![0.6, -0.8, 0.0, 0.0],
             })
@@ -2469,13 +2539,57 @@ mod tests {
             embedded(vec![0.6, -0.8], version + 1),
         ] {
             assert!(
-                canary_evidence(DeploymentApi::Embeddings, &refused).is_err(),
+                canary_evidence(DeploymentApi::Embeddings, &[], &refused).is_err(),
                 "{refused:?}"
             );
         }
         // A chat or decisions launch never takes a vector as its canary.
-        assert!(canary_evidence(DeploymentApi::Chat, &good).is_err());
-        assert!(canary_evidence(DeploymentApi::Decisions, &good).is_err());
+        assert!(canary_evidence(DeploymentApi::Chat, &[], &good).is_err());
+        assert!(canary_evidence(DeploymentApi::Decisions, &[], &good).is_err());
+    }
+
+    // T50: ADR 0041 §§4–5: the server judges the bounded answer again using
+    // its frozen declaration. A host cannot choose a smaller type set.
+    #[test]
+    fn an_extraction_canary_is_rejudged_against_the_frozen_manifest() {
+        use capyctl_adapters::completion_probe::CanaryEvidence;
+        use capyctl_config::{effective::DeploymentApi, extractions::FieldType};
+        let declared = [FieldType::Number];
+        let answers = serde_json::json!({
+            "amount_paid": {"type":"number", "value":649, "guess":649,
+                "p_null":0.1, "confidence":0.9}
+        });
+        let mut good = result(vec![observed("api", 10, "alive")]);
+        good.probe_extraction = Some(pb::ExtractionProbeEvidence {
+            probe_version: capyctl_adapters::extraction_probe::VERSION,
+            declared_field_types: vec!["number".into()],
+            answers_json: serde_json::to_vec(&answers).unwrap(),
+        });
+        assert!(matches!(
+            canary_evidence(DeploymentApi::Extractions, &declared, &good),
+            Ok(CanaryEvidence::Extraction(answer)) if answer.declared == declared
+        ));
+        assert!(canary_evidence(DeploymentApi::Extractions, &[FieldType::Date], &good).is_err());
+        let mut malformed = good.clone();
+        malformed.probe_extraction.as_mut().unwrap().answers_json =
+            serde_json::to_vec(&serde_json::json!({
+                "amount_paid": {"type":"number", "value":649.001, "guess":649.001,
+                    "p_null":0.1, "confidence":0.9}
+            }))
+            .unwrap();
+        assert!(canary_evidence(DeploymentApi::Extractions, &declared, &malformed).is_err());
+        let mut future = good.clone();
+        future.probe_extraction.as_mut().unwrap().probe_version += 1;
+        assert!(canary_evidence(DeploymentApi::Extractions, &declared, &future).is_err());
+        let mut oversized = good.clone();
+        oversized.probe_extraction.as_mut().unwrap().answers_json = vec![b' '; 256 * 1024 + 1];
+        assert!(canary_evidence(DeploymentApi::Extractions, &declared, &oversized).is_err());
+        assert!(canary_evidence(
+            DeploymentApi::Extractions,
+            &declared,
+            &result(vec![observed("api", 10, "alive")])
+        )
+        .is_err());
     }
 
     /// ADR 0014 amendment A12: the host's kernel builds reach the coordinator

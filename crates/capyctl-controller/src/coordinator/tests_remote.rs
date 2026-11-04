@@ -555,6 +555,7 @@ impl crate::remote_readiness::ReadinessHosts for ScriptedReadiness {
             probe_text: String::new(),
             probe_decision: None,
             probe_embedding: None,
+            probe_extraction: None,
             lmcache: None,
             engine_tracing: String::new(),
         };
@@ -652,6 +653,7 @@ async fn host_session_loss_closes_dispatch_until_a_fresh_probe_passes() {
             max_tokens: None,
             decision: false,
             embedding: false,
+            extraction: false,
         }
     );
     assert_eq!(probe.identity.expected_state, "ready");
@@ -1759,6 +1761,7 @@ async fn a_remote_cancelling_lease_settles_only_on_an_idle_sample_after_the_hang
             device_memory: false,
             decisions: false,
             embeddings: false,
+            extraction_types: Vec::new(),
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,
@@ -1924,6 +1927,7 @@ async fn a_remote_cancelling_lease_settles_while_a_stop_drains() {
             device_memory: false,
             decisions: false,
             embeddings: false,
+            extraction_types: Vec::new(),
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,

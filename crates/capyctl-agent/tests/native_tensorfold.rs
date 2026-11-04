@@ -293,6 +293,7 @@ impl Fixture {
                 max_tokens: None,
                 decision: false,
                 embedding: false,
+                extraction: false,
             },
         })
     }

@@ -684,6 +684,9 @@ message ExecuteMember {
   // journals it, and a command replayed after a restart carries none. Sent
   // only to a host whose Connect declared `trace_context`.
   string trace_parent = 21;
+  // ADR 0041 §4: extraction only; mutually exclusive with all other probe flags.
+  // False preserves old command bytes. Requires the extractions capability.
+  bool probe_extraction = 22;
 }
 // ADR 0030 §4 (additive): one option's probability in a decision probe's answer.
 message DecisionProbability {
@@ -701,6 +704,12 @@ message DecisionProbeEvidence {
 message EmbeddingProbeEvidence {
   uint32 probe_version = 1;
   repeated float vector = 2;
+}
+// ADR 0041 §4: answers object bytes, bounded to 256 KiB, and canonical types.
+message ExtractionProbeEvidence {
+  uint32 probe_version = 1;
+  repeated string declared_field_types = 2;
+  bytes answers_json = 3;
 }
 // ADR 0016: one process identity as the server recorded it.
 message RecordedProcess {
@@ -821,6 +830,8 @@ message MemberExecutionResult {
   // `retention_zero`). Empty otherwise and from an older host, which encodes
   // exactly as before.
   string engine_tracing = 23;
+  // ADR 0041 §4: completed extraction probe only; absent preserves old bytes.
+  ExtractionProbeEvidence probe_extraction = 24;
 }
 // ADR 0033 §§3, 8, 9: `on` names the server's ports and pool; `off` names a
 // closed reason and its detail (at most 2048 bytes: the redacted engine log

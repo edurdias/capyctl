@@ -35,6 +35,7 @@ fn base() -> MemberCommand {
             probe_max_tokens: 0,
             probe_decision: false,
             probe_embedding: false,
+            probe_extraction: false,
             trace_parent: String::new(),
         })),
     })
@@ -110,6 +111,7 @@ fn park_and_restore_roundtrip_and_are_digest_bound() {
             max_tokens: None,
             decision: false,
             embedding: false,
+            extraction: false,
         })
         .canonical_digest(),
         with_action(MemberAction::Terminate {
@@ -236,6 +238,7 @@ fn parked_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         probe_text: String::new(),
         probe_decision: None,
         probe_embedding: None,
+        probe_extraction: None,
         lmcache: None,
         engine_tracing: String::new(),
     }
@@ -352,6 +355,7 @@ fn residency_evidence_is_refused_on_other_actions() {
             max_tokens: None,
             decision: false,
             embedding: false,
+            extraction: false,
         },
         MemberAction::Terminate {
             owned_handle: "launch".into(),
@@ -641,6 +645,7 @@ fn a_policy_refused_park_is_unchanged_with_a_closed_reason() {
         max_tokens: None,
         decision: false,
         embedding: false,
+        extraction: false,
     });
     let mut result = parked_result(&probe);
     result.residency = None;
@@ -807,6 +812,7 @@ fn completion_probe_is_additive() {
         max_tokens: None,
         decision: false,
         embedding: false,
+        extraction: false,
     });
     assert_eq!(plain.to_wire().encode_to_vec(), PLAIN_PROBE_BYTES);
     let probe = with_action(MemberAction::Probe {
@@ -814,6 +820,7 @@ fn completion_probe_is_additive() {
         max_tokens: Some(8),
         decision: false,
         embedding: false,
+        extraction: false,
     });
     assert_ne!(probe.canonical_digest(), plain.canonical_digest());
     assert_eq!(
@@ -860,6 +867,7 @@ fn probe_tokens_answer_a_completion_probe_only() {
         max_tokens: Some(2),
         decision: false,
         embedding: false,
+        extraction: false,
     });
     validate_result(&probe, &answer(&probe, vec![7, 8])).unwrap();
     validate_result(&probe, &answer(&probe, Vec::new())).unwrap();
@@ -869,6 +877,7 @@ fn probe_tokens_answer_a_completion_probe_only() {
         max_tokens: None,
         decision: false,
         embedding: false,
+        extraction: false,
     });
     validate_result(&plain, &answer(&plain, Vec::new())).unwrap();
     assert!(validate_result(&plain, &answer(&plain, vec![7])).is_err());
@@ -896,6 +905,7 @@ fn probe_text_answers_a_completion_probe_only() {
         max_tokens: Some(8),
         decision: false,
         embedding: false,
+        extraction: false,
     });
     validate_result(&probe, &answer(&probe, "Ready.".into())).unwrap();
     let max = capyctl_protocol::execution::PROBE_TEXT_MAX_BYTES;
@@ -906,6 +916,7 @@ fn probe_text_answers_a_completion_probe_only() {
         max_tokens: None,
         decision: false,
         embedding: false,
+        extraction: false,
     });
     assert!(validate_result(&plain, &answer(&plain, "Ready.".into())).is_err());
 }
@@ -916,6 +927,7 @@ fn decision_probe() -> MemberCommand {
         max_tokens: None,
         decision: true,
         embedding: false,
+        extraction: false,
     })
 }
 
@@ -928,6 +940,7 @@ fn decision_probe_is_additive() {
         max_tokens: None,
         decision: false,
         embedding: false,
+        extraction: false,
     });
     assert_eq!(plain.to_wire().encode_to_vec(), PLAIN_PROBE_BYTES);
     let probe = decision_probe();
@@ -998,12 +1011,14 @@ fn decision_answer_belongs_to_a_completed_decision_probe_only() {
             max_tokens: None,
             decision: false,
             embedding: false,
+            extraction: false,
         },
         MemberAction::Probe {
             owned_handle: "launch".into(),
             max_tokens: Some(8),
             decision: false,
             embedding: false,
+            extraction: false,
         },
     ] {
         let other = with_action(other);
@@ -1056,6 +1071,7 @@ fn embedding_probe() -> MemberCommand {
         max_tokens: None,
         decision: false,
         embedding: true,
+        extraction: false,
     })
 }
 
@@ -1071,6 +1087,7 @@ fn embedding_probe_is_additive() {
         max_tokens: None,
         decision: false,
         embedding: false,
+        extraction: false,
     });
     assert_eq!(plain.to_wire().encode_to_vec(), PLAIN_PROBE_BYTES);
     let probe = embedding_probe();
@@ -1139,18 +1156,21 @@ fn embedding_answer_belongs_to_a_completed_embedding_probe_only() {
             max_tokens: None,
             decision: false,
             embedding: false,
+            extraction: false,
         },
         MemberAction::Probe {
             owned_handle: "launch".into(),
             max_tokens: None,
             decision: true,
             embedding: false,
+            extraction: false,
         },
         MemberAction::Probe {
             owned_handle: "launch".into(),
             max_tokens: Some(8),
             decision: false,
             embedding: false,
+            extraction: false,
         },
     ] {
         let other = with_action(other);
@@ -1181,4 +1201,121 @@ fn embedding_answer_belongs_to_a_completed_embedding_probe_only() {
     ] {
         assert!(validate_result(&probe, &answer(&probe, malformed)).is_err());
     }
+}
+
+// T50
+#[test]
+fn extraction_probe_roundtrip_and_closed_evidence() {
+    // ADR 0041 §4: additive flags and evidence preserve every old encoding.
+    let plain = with_action(MemberAction::Probe {
+        owned_handle: "launch".into(),
+        max_tokens: None,
+        decision: false,
+        embedding: false,
+        extraction: false,
+    });
+    assert_eq!(plain.to_wire().encode_to_vec(), PLAIN_PROBE_BYTES);
+    // The pre-extraction result fields retain their original tags and bytes,
+    // not merely a round trip through this version's encoder.
+    let legacy_result = pb::MemberExecutionResult {
+        state: "completed".into(),
+        owned_handle: "launch".into(),
+        observed_at_unix_ms: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        legacy_result.encode_to_vec(),
+        b"\x12\x09completed\x1a\x06launch\x28\x01",
+    );
+    let probe = with_action(MemberAction::Probe {
+        owned_handle: "launch".into(),
+        max_tokens: None,
+        decision: false,
+        embedding: false,
+        extraction: true,
+    });
+    assert_eq!(
+        decode(&probe.to_wire().encode_to_vec()).unwrap().action,
+        probe.action
+    );
+    assert_eq!(
+        capyctl_protocol::capabilities::required(&probe.to_wire()),
+        vec![capyctl_protocol::capabilities::EXTRACTIONS]
+    );
+    for flag in 0..4 {
+        let mut wire = probe.to_wire();
+        match flag {
+            0 => wire.probe_max_tokens = 1,
+            1 => wire.probe_decision = true,
+            2 => wire.probe_embedding = true,
+            _ => wire.action = Some(pb::execute_member::Action::Inspect(true)),
+        }
+        assert!(decode(&wire.encode_to_vec()).is_err());
+    }
+    let good = pb::ExtractionProbeEvidence {
+        probe_version: 1,
+        declared_field_types: vec!["text".into(), "number".into()],
+        answers_json: b"{}".to_vec(),
+    };
+    let bare = pb::MemberExecutionResult {
+        identity: probe.to_wire().identity,
+        state: "completed".into(),
+        owned_handle: "launch".into(),
+        observed_at_unix_ms: 1,
+        ..Default::default()
+    };
+    validate_result(&probe, &bare).unwrap();
+    let bytes = bare.encode_to_vec();
+    let mut result = bare.clone();
+    result.probe_extraction = Some(good.clone());
+    validate_result(&probe, &result).unwrap();
+    assert_eq!(
+        pb::MemberExecutionResult::decode(result.encode_to_vec().as_slice()).unwrap(),
+        result
+    );
+    result.probe_extraction = None;
+    assert_eq!(result.encode_to_vec(), bytes);
+    for malformed in [
+        pb::ExtractionProbeEvidence {
+            probe_version: 2,
+            ..good.clone()
+        },
+        pb::ExtractionProbeEvidence {
+            declared_field_types: vec![],
+            ..good.clone()
+        },
+        pb::ExtractionProbeEvidence {
+            declared_field_types: vec!["text".into(), "text".into()],
+            ..good.clone()
+        },
+        pb::ExtractionProbeEvidence {
+            declared_field_types: vec!["number".into(), "text".into()],
+            ..good.clone()
+        },
+        pb::ExtractionProbeEvidence {
+            declared_field_types: vec!["unknown".into()],
+            ..good.clone()
+        },
+        pb::ExtractionProbeEvidence {
+            answers_json: b"[]".to_vec(),
+            ..good.clone()
+        },
+        pb::ExtractionProbeEvidence {
+            answers_json: b"{".to_vec(),
+            ..good.clone()
+        },
+        pb::ExtractionProbeEvidence {
+            answers_json: vec![b' '; 256 * 1024 + 1],
+            ..good.clone()
+        },
+    ] {
+        result.probe_extraction = Some(malformed);
+        assert!(validate_result(&probe, &result).is_err());
+    }
+    result.probe_extraction = Some(good);
+    result.state = "attempted".into();
+    assert!(validate_result(&probe, &result).is_err());
+    result.state = "completed".into();
+    result.identity = plain.to_wire().identity;
+    assert!(validate_result(&plain, &result).is_err());
 }

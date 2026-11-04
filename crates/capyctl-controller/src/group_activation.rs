@@ -360,6 +360,7 @@ pub fn probe_command(
             max_tokens: Some(max_tokens),
             decision: false,
             embedding: false,
+            extraction: false,
         },
     };
     command.identity.payload_digest = command.canonical_digest();

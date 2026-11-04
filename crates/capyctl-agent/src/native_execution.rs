@@ -215,6 +215,7 @@ type RetainedProbe = (
     capyctl_config::effective::DeploymentApi,
     String,
     Duration,
+    Vec<capyctl_config::extractions::FieldType>,
 );
 
 /// The engine-specific half of a launch, built from local policy before the
@@ -1805,6 +1806,7 @@ impl NativeHostExecution {
                         effective.profile.line,
                         effective.profile.custom.as_ref(),
                     )
+                    .with_api(effective.api)
                     .with_request_abort(request_abort::request_abort_capable(&effective))
                     .with_engine_trace(tracing.is_on()),
                 )
@@ -2077,6 +2079,12 @@ impl NativeHostExecution {
             &member,
             &served,
             effective.api,
+            &effective
+                .profile
+                .custom
+                .as_ref()
+                .and_then(|custom| custom.manifest.field_types.clone())
+                .unwrap_or_default(),
             command.identity.deadline_ms - PROBE_MARGIN_MS,
         )
         .await?;
@@ -2171,7 +2179,7 @@ impl NativeHostExecution {
         owned_handle: &str,
         max_tokens: u32,
     ) -> Result<capyctl_adapters::completion_probe::ProbeAnswer, SessionError> {
-        let (adapter, _, served, bound) = self.retained_probe(command, owned_handle).await?;
+        let (adapter, _, served, bound, _) = self.retained_probe(command, owned_handle).await?;
         let answer =
             tokio::time::timeout(bound, adapter.complete_probe(&served, max_tokens, bound))
                 .await
@@ -2198,7 +2206,7 @@ impl NativeHostExecution {
         command: &MemberCommand,
         owned_handle: &str,
     ) -> Result<capyctl_adapters::decision_probe::DecisionAnswer, SessionError> {
-        let (adapter, api, served, bound) = self.retained_probe(command, owned_handle).await?;
+        let (adapter, api, served, bound, _) = self.retained_probe(command, owned_handle).await?;
         if api != capyctl_config::effective::DeploymentApi::Decisions {
             return Err(SessionError);
         }
@@ -2219,7 +2227,7 @@ impl NativeHostExecution {
         command: &MemberCommand,
         owned_handle: &str,
     ) -> Result<capyctl_adapters::embedding_probe::EmbeddingAnswer, SessionError> {
-        let (adapter, api, served, bound) = self.retained_probe(command, owned_handle).await?;
+        let (adapter, api, served, bound, _) = self.retained_probe(command, owned_handle).await?;
         if api != capyctl_config::effective::DeploymentApi::Embeddings {
             return Err(SessionError);
         }
@@ -2232,6 +2240,37 @@ impl NativeHostExecution {
             return Err(SessionError);
         }
         Ok(answer)
+    }
+
+    // ADR 0041 §4: use the retained launch's approved manifest, not the API alone.
+    async fn extract(
+        &self,
+        command: &MemberCommand,
+        owned_handle: &str,
+    ) -> Result<pb::ExtractionProbeEvidence, SessionError> {
+        let (adapter, api, served, bound, declared) =
+            self.retained_probe(command, owned_handle).await?;
+        if api != capyctl_config::effective::DeploymentApi::Extractions || declared.is_empty() {
+            return Err(SessionError);
+        }
+        let answer =
+            tokio::time::timeout(bound, adapter.extraction_probe(&served, &declared, bound))
+                .await
+                .map_err(|_| SessionError)?
+                .map_err(|_| SessionError)?;
+        let bytes = serde_json::to_vec(&answer.answers).map_err(|_| SessionError)?;
+        if bytes.len() > capyctl_protocol::execution::EXTRACTION_PROBE_MAX_BYTES {
+            return Err(SessionError);
+        }
+        Ok(pb::ExtractionProbeEvidence {
+            probe_version: capyctl_adapters::extraction_probe::VERSION,
+            declared_field_types: answer
+                .declared
+                .iter()
+                .map(|kind| kind.name().to_owned())
+                .collect(),
+            answers_json: bytes,
+        })
     }
 
     /// The retained launch a completion, decision or embedding probe names,
@@ -2268,7 +2307,13 @@ impl NativeHostExecution {
             )
             .unwrap_or(0),
         );
-        Ok((adapter, effective.api, served, bound))
+        let declared = effective
+            .profile
+            .custom
+            .as_ref()
+            .and_then(|custom| custom.manifest.field_types.clone())
+            .unwrap_or_default();
+        Ok((adapter, effective.api, served, bound, declared))
     }
 
     /// SPEC §13 / §13.3: the terminal refusal of a command, and for a launch
@@ -2420,6 +2465,7 @@ impl NativeHostExecution {
         let mut decided: Option<capyctl_adapters::decision_probe::DecisionAnswer> = None;
         // ADR 0036 §§5, 6: what an embedding probe answered.
         let mut embedded: Option<capyctl_adapters::embedding_probe::EmbeddingAnswer> = None;
+        let mut extracted: Option<pb::ExtractionProbeEvidence> = None;
         let acceptance = match tokio::task::spawn_blocking(move || {
             journal.accept(
                 session,
@@ -2471,6 +2517,14 @@ impl NativeHostExecution {
                 } => {
                     embedded = self.embed(&command, owned_handle).await.ok();
                 }
+                // ADR 0041 §4: a replay questions the retained extraction anew.
+                MemberAction::Probe {
+                    owned_handle,
+                    extraction: true,
+                    ..
+                } => {
+                    extracted = self.extract(&command, owned_handle).await.ok();
+                }
                 _ => {}
             },
             Acceptance::Fresh(ticket) => match &command.action {
@@ -2519,6 +2573,7 @@ impl NativeHostExecution {
                     max_tokens,
                     decision,
                     embedding,
+                    extraction,
                 } => {
                     let journal = self.journal.clone();
                     let policy = Arc::new(self.clone());
@@ -2547,6 +2602,10 @@ impl NativeHostExecution {
                         // ADR 0036 §§5, 6: and an embedding probe.
                         None if *embedding => {
                             embedded = self.embed(&command, owned_handle).await.ok();
+                        }
+                        // ADR 0041 §4: failure carries no answer, never a fallback.
+                        None if *extraction => {
+                            extracted = self.extract(&command, owned_handle).await.ok();
                         }
                         // An engine that does not answer is ordinary evidence:
                         // the result below reports it unusable with ownership
@@ -2599,6 +2658,7 @@ impl NativeHostExecution {
                 probe_version: capyctl_adapters::embedding_probe::VERSION,
                 vector: answer.vector,
             });
+            result.probe_extraction = extracted;
         }
         if command.action.launch_plan().is_some()
             && result.state == "launched"
@@ -2857,6 +2917,7 @@ async fn fresh_probe(
     member: &MemberRef,
     served: &str,
     api: capyctl_config::effective::DeploymentApi,
+    declared: &[capyctl_config::extractions::FieldType],
     stop_at_ms: i64,
 ) -> Result<(), SessionError> {
     let remaining = || {
@@ -2877,7 +2938,13 @@ async fn fresh_probe(
     let bound = remaining().min(PROBE_CHAT_TIMEOUT);
     match api {
         // ADR 0041 §4: never replace an extraction probe with a chat probe.
-        capyctl_config::effective::DeploymentApi::Extractions => return Err(SessionError),
+        capyctl_config::effective::DeploymentApi::Extractions => {
+            return tokio::time::timeout(bound, engine.extraction_probe(served, declared, bound))
+                .await
+                .map_err(|_| SessionError)?
+                .map(|_| ())
+                .map_err(|_| SessionError);
+        }
         capyctl_config::effective::DeploymentApi::Chat => {}
         capyctl_config::effective::DeploymentApi::Decisions => {
             return tokio::time::timeout(bound, engine.decision_probe(served, bound))
@@ -3451,6 +3518,7 @@ mod tests {
             &member,
             "served",
             DeploymentApi::Decisions,
+            &[],
             stop(),
         )
         .await
@@ -3461,6 +3529,7 @@ mod tests {
             &member,
             "served",
             DeploymentApi::Decisions,
+            &[],
             stop()
         )
         .await
@@ -3468,13 +3537,18 @@ mod tests {
         assert_eq!(decisions.decision_requests(), 2);
         assert_eq!(decisions.chat_requests(), 0);
         let chat = FakeEngine::new();
-        assert!(
-            fresh_probe(&chat, &member, "served", DeploymentApi::Decisions, stop())
-                .await
-                .is_err()
-        );
+        assert!(fresh_probe(
+            &chat,
+            &member,
+            "served",
+            DeploymentApi::Decisions,
+            &[],
+            stop()
+        )
+        .await
+        .is_err());
         assert_eq!(chat.chat_requests(), 0);
-        fresh_probe(&chat, &member, "served", DeploymentApi::Chat, stop())
+        fresh_probe(&chat, &member, "served", DeploymentApi::Chat, &[], stop())
             .await
             .unwrap();
         assert_eq!(chat.chat_requests(), 1);
@@ -3499,6 +3573,7 @@ mod tests {
             &member,
             "served",
             DeploymentApi::Embeddings,
+            &[],
             stop(),
         )
         .await
@@ -3512,6 +3587,7 @@ mod tests {
             &member,
             "served",
             DeploymentApi::Embeddings,
+            &[],
             stop()
         )
         .await
@@ -3524,20 +3600,27 @@ mod tests {
         let chat = FakeEngine::new();
         let decisions = FakeEngine::new().with_decisions();
         for engine in [&chat, &decisions] {
-            assert!(
-                fresh_probe(engine, &member, "served", DeploymentApi::Embeddings, stop())
-                    .await
-                    .is_err()
-            );
+            assert!(fresh_probe(
+                engine,
+                &member,
+                "served",
+                DeploymentApi::Embeddings,
+                &[],
+                stop()
+            )
+            .await
+            .is_err());
             assert_eq!(engine.chat_requests(), 0);
             assert_eq!(engine.decision_requests(), 0);
         }
         // An embedding model is never ready as a chat or decisions one.
         let embeddings = FakeEngine::new().with_embeddings();
         for api in [DeploymentApi::Chat, DeploymentApi::Decisions] {
-            assert!(fresh_probe(&embeddings, &member, "served", api, stop())
-                .await
-                .is_err());
+            assert!(
+                fresh_probe(&embeddings, &member, "served", api, &[], stop())
+                    .await
+                    .is_err()
+            );
         }
         assert_eq!(embeddings.embedding_requests(), 0);
     }
@@ -7719,5 +7802,66 @@ mod tests {
                 .await
                 .is_ok());
         }
+    }
+}
+
+// T50
+#[cfg(test)]
+mod extraction_reproof_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn extraction_reproof_uses_only_the_declared_types() {
+        // ADR 0041 §4: neither API alone nor a chat answer proves extraction ready.
+        use capyctl_config::{effective::DeploymentApi, extractions::FieldType};
+        use capyctl_testkit::FakeEngine;
+        let member = MemberRef {
+            deployment_id: "model".into(),
+            member_id: "binding".into(),
+        };
+        let declared = [FieldType::Number];
+        let engine = FakeEngine::new().with_extractions(
+            declared.to_vec(),
+            serde_json::json!({
+                "answers": {"amount_paid": {
+                    "type": "number", "value": 649.0, "guess": 649.0,
+                    "p_null": 0.01, "confidence": 0.99
+                }}
+            }),
+        );
+        let stop = || capyctl_protocol::now_unix_ms() + 10_000;
+        fresh_probe(
+            &engine,
+            &member,
+            "served",
+            DeploymentApi::Extractions,
+            &declared,
+            stop(),
+        )
+        .await
+        .unwrap();
+        assert!(fresh_probe(
+            &engine,
+            &member,
+            "served",
+            DeploymentApi::Extractions,
+            &[],
+            stop()
+        )
+        .await
+        .is_err());
+        let chat = FakeEngine::new();
+        assert!(fresh_probe(
+            &chat,
+            &member,
+            "served",
+            DeploymentApi::Extractions,
+            &declared,
+            stop()
+        )
+        .await
+        .is_err());
+        assert_eq!(chat.chat_requests(), 0);
+        assert_eq!(engine.chat_requests(), 0);
     }
 }

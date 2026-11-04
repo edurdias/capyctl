@@ -110,6 +110,8 @@ struct Script {
     chat_loading: AtomicUsize,
     /// What `/v1/systemone` answers; 404 when `None`.
     decision: Mutex<Option<Value>>,
+    /// T50: assert the fixed extraction request uses exactly these declared types.
+    extraction_types: Option<Vec<capyctl_config::extractions::FieldType>>,
     /// What `/v1/embeddings` answers; 422 when `None`.
     embedding: Mutex<Option<Value>>,
     /// The idle route's status and body.
@@ -215,6 +217,12 @@ async fn systemone(
         return refused;
     }
     assert_eq!(body["model"], "basal", "the probe names the served model");
+    if let Some(declared) = &stub.script.extraction_types {
+        assert_eq!(
+            body,
+            capyctl_adapters::extraction_probe::request("basal", declared)
+        );
+    }
     match stub.script.decision.lock().unwrap().clone() {
         Some(answer) => Json(answer).into_response(),
         // basal answers every failure 422.
@@ -346,6 +354,7 @@ fn adapter(port: u16, manifest: &CustomManifest, key: Option<&str>) -> CustomAda
         key.map(str::to_owned),
     )
     .with_api(manifest.api)
+    .with_field_types(manifest.field_types.clone().unwrap_or_default())
     .with_health(manifest.health.clone())
     .with_idle(manifest.idle.clone())
 }
@@ -516,6 +525,75 @@ async fn a_decisions_engine_is_ready_only_after_the_fixed_decision() {
         .await
         .unwrap();
     assert!(matches!(&canary.answer, CanaryEvidence::Decision(d) if d.choice == "billing"));
+}
+
+// T50: ADR 0041 §4: health alone and a malformed extraction are not ready;
+// the frozen manifest's subset gets a smaller fixed request, never a chat probe.
+#[tokio::test]
+async fn an_extractions_engine_is_ready_only_after_its_declared_fixed_extraction() {
+    use capyctl_adapters::completion_probe::CanaryEvidence;
+    use capyctl_config::extractions::FieldType;
+    let script = Script {
+        key: Some("launch-key".into()),
+        extraction_types: Some(vec![FieldType::Number, FieldType::Date]),
+        decision: Mutex::new(Some(json!({"answers": {
+            "amount_paid": {"type":"number","guess":649.001,"value":649.001,
+                "p_null":0.1,"confidence":0.9},
+            "delivered_on": {"type":"date","guess":"2026-09-28","value":"2026-09-28",
+                "p_null":0.1,"confidence":0.9}
+        }}))),
+        ..Script::default()
+    };
+    let (stub, port) = stub_engine(script).await;
+    let proc_root = fake_proc([127, 0, 0, 1], port);
+    let manifest = manifest(
+        "kind: custom_engine\nschema_version: 1\napi: extractions\n\
+         field_types: [date, number]\n\
+         args: [--host, \"{host}\", --port, \"{port}\", --model, \"{model_dir}\"]\n\
+         env: {SERVE_AUTH: \"{api_key}\"}\nhealth: /health\n",
+    );
+    let engine = launching(
+        port,
+        &manifest,
+        Some("launch-key"),
+        ScriptedTool::new(Presence::Alive),
+        proc_root.path(),
+    );
+    let started = tokio::spawn({
+        let command = initialize_command(30_000);
+        async move {
+            let observation = engine.execute_persisted(&command).await?;
+            Ok::<_, RuntimeError>((engine, observation))
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert!(
+        !started.is_finished(),
+        "a number off the probe's grid is not readiness"
+    );
+    assert!(stub.decisions.load(SeqCst) >= 2);
+    *stub.script.decision.lock().unwrap() = Some(json!({"answers": {
+        "amount_paid": {"type":"number","guess":649.0,"value":null,
+            "p_null":0.1,"confidence":0.9},
+        "delivered_on": {"type":"date","guess":"2026-09-28","value":"2026-09-28",
+            "p_null":0.1,"confidence":0.9}
+    }}));
+    let (engine, observation) = started.await.unwrap().unwrap();
+    assert!(observation.receipt.contains("fixed extraction"));
+    assert_eq!(stub.chats.load(SeqCst), 0, "never a chat probe");
+    assert_eq!(stub.embeddings.load(SeqCst), 0, "never an embedding probe");
+    assert_eq!(stub.models.load(SeqCst), 0, "never a model list");
+    assert_eq!(stub.unauthorized.load(SeqCst), 0, "key on every read");
+    let canary = engine
+        .wake_canary(
+            &initialize_command(30_000).context,
+            8,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(canary.answer, CanaryEvidence::Extraction(answer)
+        if answer.declared == [FieldType::Number, FieldType::Date]));
 }
 
 // T47 T44 (ADR 0036 §1, §5, ADR 0031 §5): an embeddings custom engine is

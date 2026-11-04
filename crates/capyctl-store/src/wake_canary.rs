@@ -12,7 +12,9 @@
 //! that ended without its evidence (`wake_uncertain`) is never re-armed
 //! either, so every single launch's wake that ended uncertain owes the
 //! instance's stop, retried until accepted, also across a restart.
+use capyctl_config::extractions::FieldType;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use serde_json::{Map, Value};
 
 use crate::{Store, StoreError};
 
@@ -69,6 +71,19 @@ pub struct StoredEmbeddingCanary {
     pub tolerance: f64,
 }
 
+/// ADR 0041 §4: the fixed extraction readiness probe's kind.
+pub const EXTRACTION_PROBE_KIND: &str = "extraction";
+
+/// ADR 0041 §4: the launch's first complete extraction answer, scoped to
+/// the probe's kind, version and canonical declared type set.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredExtractionCanary {
+    pub probe_kind: String,
+    pub probe_version: u32,
+    pub declared: Vec<FieldType>,
+    pub answers: Map<String, Value>,
+}
+
 /// ADR 0036 §6: the outcome of comparing an embedding probe's answer with
 /// a launch's reference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,14 +129,14 @@ pub fn compare_embedding_canary(
     }
 }
 
-/// ADR 0030 §4, ADR 0036 §6: one launch's canary reference, by the probe
-/// that proved its readiness: a greedy completion, a decision or an
-/// embedding.
+/// ADR 0030 §4, ADR 0036 §6, ADR 0041 §4: one launch's reference, by the
+/// probe that proved its readiness.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WakeCanaryReference {
     Completion(StoredWakeCanary),
     Decision(StoredDecisionCanary),
     Embedding(StoredEmbeddingCanary),
+    Extraction(StoredExtractionCanary),
 }
 
 /// ADR 0036 §6: the vector as little-endian float32 bytes.
@@ -142,8 +157,9 @@ struct DecisionJson {
 }
 
 /// The stored columns of a reference: kind, probe version, prompt,
-/// tokens_json, text, decision_json, tolerance, dimension and vector. A
-/// malformed reference records nothing (`Conflict`).
+/// tokens_json, text, decision_json, tolerance, dimension, vector, declared
+/// field types and extraction answers. A malformed reference records
+/// nothing (`Conflict`).
 type Columns = (
     &'static str,
     u32,
@@ -154,6 +170,8 @@ type Columns = (
     Option<f64>,
     Option<u32>,
     Option<Vec<u8>>,
+    Option<String>,
+    Option<String>,
 );
 
 fn columns(reference: &WakeCanaryReference) -> Result<Columns, StoreError> {
@@ -169,6 +187,8 @@ fn columns(reference: &WakeCanaryReference) -> Result<Columns, StoreError> {
                 c.prompt.clone(),
                 tokens,
                 c.text.clone(),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -201,6 +221,8 @@ fn columns(reference: &WakeCanaryReference) -> Result<Columns, StoreError> {
                 String::new(),
                 Some(json),
                 Some(d.tolerance),
+                None,
+                None,
                 None,
                 None,
             ))
@@ -236,9 +258,62 @@ fn columns(reference: &WakeCanaryReference) -> Result<Columns, StoreError> {
                 Some(e.tolerance),
                 Some(e.dimension),
                 Some(vector_bytes(&e.vector)),
+                None,
+                None,
+            ))
+        }
+        WakeCanaryReference::Extraction(e) => {
+            // ADR 0041 §4: readiness validates answers in the adapter. The
+            // store has no adapter dependency, so enforce the reference's
+            // identity and fixed-field shape here without a second validator.
+            if !extraction_shape_valid(e) {
+                return Err(StoreError::Conflict);
+            }
+            let declared = serde_json::to_string(&e.declared).map_err(|_| StoreError::Conflict)?;
+            let answers = serde_json::to_string(&e.answers).map_err(|_| StoreError::Conflict)?;
+            Ok((
+                EXTRACTION_PROBE_KIND,
+                e.probe_version,
+                format!("extraction/v{}", e.probe_version),
+                "[]".into(),
+                String::new(),
+                None,
+                None,
+                None,
+                None,
+                Some(declared),
+                Some(answers),
             ))
         }
     }
+}
+
+fn extraction_shape_valid(reference: &StoredExtractionCanary) -> bool {
+    reference.probe_kind == EXTRACTION_PROBE_KIND
+        && reference.probe_version >= 1
+        && !reference.declared.is_empty()
+        && reference.declared.windows(2).all(|pair| pair[0] < pair[1])
+        && reference.answers.len() == reference.declared.len()
+        && reference.declared.iter().all(|kind| {
+            let name = match kind {
+                FieldType::Text => "order_id",
+                FieldType::Number => "amount_paid",
+                FieldType::Date => "delivered_on",
+                FieldType::Time => "delivered_time",
+                FieldType::Datetime => "delivered_at",
+                FieldType::Duration => "days_waited",
+                FieldType::List => "damage",
+                FieldType::Estimate => "returns_today",
+                FieldType::Forecast => "returns_next",
+            };
+            reference
+                .answers
+                .get(name)
+                .and_then(Value::as_object)
+                .and_then(|answer| answer.get("type"))
+                .and_then(Value::as_str)
+                == Some(kind.name())
+        })
 }
 
 /// A single-launch instance whose wake ended uncertain and whose stop is
@@ -261,7 +336,7 @@ impl Store {
     /// reference of an earlier generation of the instance is dropped. A
     /// generation that is not the instance's current one records nothing
     /// (`Conflict`), nor does an empty completion answer or a malformed
-    /// decision reference (ADR 0030 §4).
+    /// reference (ADR 0030 §4, ADR 0036 §6, ADR 0041 §4).
     pub fn record_wake_canary(
         &self,
         deployment_id: &str,
@@ -271,8 +346,19 @@ impl Store {
         reference: &WakeCanaryReference,
         now: i64,
     ) -> Result<bool, StoreError> {
-        let (kind, probe_version, prompt, tokens, text, decision, tolerance, dimension, vector) =
-            columns(reference)?;
+        let (
+            kind,
+            probe_version,
+            prompt,
+            tokens,
+            text,
+            decision,
+            tolerance,
+            dimension,
+            vector,
+            declared,
+            answers,
+        ) = columns(reference)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let current: Option<i64> = tx
             .query_row(
@@ -291,14 +377,15 @@ impl Store {
         let recorded = tx.execute(
             "INSERT INTO wake_canaries(deployment_id,instance_index,generation,incarnation,prompt,
                 tokens_json,text,recorded_at_ms,kind,probe_version,decision_json,tolerance,
-                dimension,vector)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+                dimension,vector,declared_field_types_json,answers_json)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
              ON CONFLICT(deployment_id,instance_index,generation) DO UPDATE SET
                 incarnation=excluded.incarnation,prompt=excluded.prompt,
                 tokens_json=excluded.tokens_json,text=excluded.text,
                 kind=excluded.kind,probe_version=excluded.probe_version,
                 decision_json=excluded.decision_json,tolerance=excluded.tolerance,
                 dimension=excluded.dimension,vector=excluded.vector,
+                declared_field_types_json=excluded.declared_field_types_json,answers_json=excluded.answers_json,
                 recorded_at_ms=excluded.recorded_at_ms,mismatch_operation_id=NULL
              WHERE wake_canaries.incarnation<>excluded.incarnation",
             params![
@@ -315,7 +402,9 @@ impl Store {
                 decision,
                 tolerance,
                 dimension,
-                vector
+                vector,
+                declared,
+                answers
             ],
         )? == 1;
         tx.commit()?;
@@ -341,11 +430,14 @@ impl Store {
             Option<f64>,
             Option<u32>,
             Option<Vec<u8>>,
+            Option<String>,
+            Option<String>,
         );
         let row: Option<Row> = self
             .conn
             .query_row(
-                "SELECT kind,probe_version,prompt,tokens_json,text,decision_json,tolerance,dimension,vector
+                "SELECT kind,probe_version,prompt,tokens_json,text,decision_json,tolerance,dimension,vector,
+                        declared_field_types_json,answers_json
                    FROM wake_canaries
                   WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3 AND incarnation=?4",
                 params![deployment_id, instance_index, generation, incarnation],
@@ -360,6 +452,8 @@ impl Store {
                         r.get(6)?,
                         r.get(7)?,
                         r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
                     ))
                 },
             )
@@ -374,6 +468,8 @@ impl Store {
             tolerance,
             dimension,
             vector,
+            declared,
+            answers,
         )) = row
         else {
             return Ok(None);
@@ -408,6 +504,21 @@ impl Store {
                     vector: vector_from_bytes(&bytes),
                     tolerance,
                 })
+            }
+            ("extraction", None, None) => {
+                let (Some(declared), Some(answers)) = (declared, answers) else {
+                    return Err(StoreError::Conflict);
+                };
+                let extraction = StoredExtractionCanary {
+                    probe_kind: EXTRACTION_PROBE_KIND.into(),
+                    probe_version,
+                    declared: serde_json::from_str(&declared).map_err(|_| StoreError::Conflict)?,
+                    answers: serde_json::from_str(&answers).map_err(|_| StoreError::Conflict)?,
+                };
+                if !extraction_shape_valid(&extraction) {
+                    return Err(StoreError::Conflict);
+                }
+                WakeCanaryReference::Extraction(extraction)
             }
             _ => return Err(StoreError::Conflict),
         };
@@ -850,6 +961,116 @@ mod tests {
             bad(|e| e.vector = vec![0.0, 0.0]),
             bad(|e| e.tolerance = -0.1),
             bad(|e| e.tolerance = f64::INFINITY),
+        ] {
+            assert!(matches!(
+                store.record_wake_canary("d", 0, 1, "inc", &reference, 1),
+                Err(StoreError::Conflict)
+            ));
+        }
+        assert_eq!(store.wake_canary("d", 0, 1, "inc").unwrap(), None);
+    }
+
+    fn extraction() -> StoredExtractionCanary {
+        StoredExtractionCanary {
+            probe_kind: "extraction".into(),
+            probe_version: 1,
+            declared: vec![FieldType::Number, FieldType::Estimate],
+            answers: serde_json::json!({
+                "amount_paid": {
+                    "type": "number", "value": 649.0, "guess": 649.0,
+                    "p_null": 0.1, "confidence": 0.9, "unit": "USD"
+                },
+                "returns_today": {
+                    "type": "estimate", "value": 13, "median": 13, "p10": 11, "p90": 15,
+                    "p_below": 0.0, "p_above": 0.0, "quantiles": {"50": 13}
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        }
+    }
+
+    // T50: ADR 0041 §4: retain the declared set, complete answers, kind and
+    // version once per launch, including through a controller restart.
+    #[test]
+    fn an_extraction_reference_round_trips_once_per_launch_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("srv.sqlite3");
+        let first = WakeCanaryReference::Extraction(extraction());
+        {
+            let store = Store::open(&path).unwrap();
+            set_instance(&store, 1);
+            assert!(store
+                .record_wake_canary("d", 0, 1, "inc-1", &first, 10)
+                .unwrap());
+            assert!(!store
+                .record_wake_canary("d", 0, 1, "inc-1", &reference(&[9], ""), 11)
+                .unwrap());
+            assert_eq!(
+                store.wake_canary("d", 0, 1, "inc-1").unwrap(),
+                Some(first.clone())
+            );
+            assert_eq!(store.wake_canary("d", 0, 0, "inc-1").unwrap(), None);
+            assert_eq!(store.wake_canary("d", 0, 1, "other").unwrap(), None);
+            let declared: String = store
+                .conn
+                .query_row(
+                    "SELECT declared_field_types_json FROM wake_canaries",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(declared, r#"["number","estimate"]"#);
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.wake_canary("d", 0, 1, "inc-1").unwrap(),
+            Some(first.clone())
+        );
+        // Replacing another kind clears its payload columns in both directions.
+        assert!(store
+            .record_wake_canary(
+                "d",
+                0,
+                1,
+                "inc-2",
+                &WakeCanaryReference::Embedding(embedding(&[1.0])),
+                12
+            )
+            .unwrap());
+        assert!(store
+            .record_wake_canary("d", 0, 1, "inc-3", &first, 13)
+            .unwrap());
+        assert_eq!(store.wake_canary("d", 0, 1, "inc-3").unwrap(), Some(first));
+    }
+
+    // T50: ADR 0041 §4: only a nonempty canonical declared set with exactly
+    // one correctly typed fixed field per type can be stored as a reference.
+    #[test]
+    fn a_malformed_extraction_reference_records_nothing() {
+        let store = store_with_instance(1);
+        let bad = |change: fn(&mut StoredExtractionCanary)| {
+            let mut e = extraction();
+            change(&mut e);
+            WakeCanaryReference::Extraction(e)
+        };
+        for reference in [
+            bad(|e| e.probe_kind = "decision".into()),
+            bad(|e| e.probe_version = 0),
+            bad(|e| e.declared.clear()),
+            bad(|e| e.declared.push(FieldType::Number)),
+            bad(|e| e.declared.reverse()),
+            bad(|e| e.answers.clear()),
+            bad(|e| {
+                e.answers.remove("amount_paid");
+            }),
+            bad(|e| {
+                let amount = e.answers.remove("amount_paid").unwrap();
+                e.answers.insert("other".into(), amount);
+            }),
+            bad(|e| e.answers["amount_paid"]["type"] = "text".into()),
+            bad(|e| e.answers["amount_paid"] = serde_json::Value::Null),
         ] {
             assert!(matches!(
                 store.record_wake_canary("d", 0, 1, "inc", &reference, 1),

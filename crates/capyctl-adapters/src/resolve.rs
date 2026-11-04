@@ -144,6 +144,8 @@ pub enum AdapterSpec {
         launch: Option<crate::custom::PlanInputCustom>,
         /// ADR 0031 §2: the manifest's API.
         api: capyctl_config::effective::DeploymentApi,
+        /// ADR 0041 §4: the launch's frozen manifest declaration.
+        field_types: Vec<capyctl_config::extractions::FieldType>,
         /// ADR 0031 §7: the per-launch engine key, only for a manifest that
         /// uses `{api_key}`.
         api_key: Option<String>,
@@ -354,6 +356,7 @@ pub fn resolve(
             model_id,
             launch,
             api,
+            field_types,
             api_key,
             idle,
             health,
@@ -361,6 +364,7 @@ pub fn resolve(
             let mut adapter =
                 crate::custom::CustomAdapter::new(endpoint, fingerprint, model_id, api_key.clone())
                     .with_api(api)
+                    .with_field_types(field_types)
                     .with_health(health)
                     .with_idle(idle);
             if let Some(mut launch) = launch {

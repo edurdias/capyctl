@@ -822,6 +822,7 @@ fn a_custom_profile_builds_a_custom_spec() {
         model_id,
         fingerprint,
         api,
+        field_types,
         api_key: Some(key),
         idle: Some(idle),
         health,
@@ -833,6 +834,10 @@ fn a_custom_profile_builds_a_custom_spec() {
     assert_eq!(model_id, launch.values.served_name);
     assert_eq!(fingerprint, "2.2.0");
     assert_eq!(api, capyctl_config::effective::DeploymentApi::Decisions);
+    assert!(
+        field_types.is_empty(),
+        "only extraction manifests declare types"
+    );
     assert_eq!(health.as_deref(), Some("/health"));
     assert_eq!(idle.json, vec!["queue.running"]);
     assert_eq!(key.len(), 64, "a fresh 32-byte key, hex");

@@ -43,6 +43,12 @@ pub(crate) struct LifecycleState {
     pub(crate) embeddings: Option<Vec<u8>>,
     /// Embedding probes the last step sent, collected by the Fake.
     pub(crate) embedding_probes: u64,
+    /// ADR 0041 §4: the declared types and raw answer used for every fresh probe.
+    pub(crate) extractions: Option<(
+        Vec<capyctl_config::extractions::FieldType>,
+        serde_json::Value,
+    )>,
+    pub(crate) extraction_probes: u64,
 }
 
 /// ADR 0036 §5: the fixed embedding probe's answer, judged as the real
@@ -372,7 +378,17 @@ impl LifecycleState {
                     && self.cache =>
             {
                 // ADR 0036 §5: an embedding model answers the fixed embedding.
-                if let Some(answer) = &self.embeddings {
+                if let Some((declared, answer)) = &self.extractions {
+                    // ADR 0041 §4: a wake never falls back to a chat completion.
+                    self.extraction_probes += 1;
+                    let request = capyctl_adapters::extraction_probe::request("fake", declared);
+                    capyctl_adapters::extraction_request::validate_extraction_request(
+                        &request, declared,
+                    )
+                    .map_err(|e| RuntimeError::Uncertain(e.to_string()))?;
+                    capyctl_adapters::extraction_probe::well_formed(answer, declared)
+                        .map_err(RuntimeError::Uncertain)?;
+                } else if let Some(answer) = &self.embeddings {
                     self.embedding_probes += 1;
                     embedding_ready(answer).ok_or_else(|| {
                         RuntimeError::Uncertain("Fake wake embedding probe failed".into())
@@ -401,7 +417,18 @@ impl LifecycleState {
         };
         if ordinary {
             let model = format!("candidate-{}", c.token.deployment_id);
-            if let Some(answer) = &self.embeddings {
+            if let Some((declared, answer)) = &self.extractions {
+                // ADR 0041 §4: Initialize must prove the declared extraction types.
+                self.extraction_probes += 1;
+                self.work_sequence += 1;
+                let request = capyctl_adapters::extraction_probe::request(&model, declared);
+                capyctl_adapters::extraction_request::validate_extraction_request(
+                    &request, declared,
+                )
+                .map_err(|e| RuntimeError::Uncertain(e.to_string()))?;
+                capyctl_adapters::extraction_probe::well_formed(answer, declared)
+                    .map_err(RuntimeError::Uncertain)?;
+            } else if let Some(answer) = &self.embeddings {
                 // ADR 0036 §5, SPEC §6.1: an embedding model is ready only on
                 // a complete, well-formed answer to the fixed embedding; it
                 // is never sent a chat probe.
@@ -486,6 +513,118 @@ mod tests {
             },
         }
     }
+    // T50
+    #[tokio::test]
+    async fn extraction_readiness_uses_only_the_declared_subset_and_rejects_bad_answers() {
+        use crate::FakeEngine;
+        use capyctl_adapters::traits::{ChatForward, EngineAdapter};
+        use capyctl_config::extractions::FieldType;
+        use capyctl_domain::resources::{Allocation, PhaseFootprint, ResourcePhase};
+        let response = serde_json::json!({"model":"fake","answers":{
+            "amount_paid":{"type":"number","guess":649.0,"value":649.0,
+                "p_null":0.01,"confidence":0.99}
+        }});
+        let engine = FakeEngine::with_lifecycle()
+            .with_extractions(vec![FieldType::Number], response.clone());
+        let mut c = command(RuntimeAction::Initialize, "extraction");
+        c.context.completion_target = Some(PhaseFootprint {
+            phase: ResourcePhase::Ready,
+            allocations: vec![Allocation {
+                domain: "unified".into(),
+                bytes: 8,
+                host_kv_bytes: 1,
+            }],
+            devices: vec![],
+        });
+        assert!(engine
+            .execute_persisted(&c)
+            .await
+            .unwrap()
+            .facts
+            .contains(&Milestone::ModelUsable));
+        assert_eq!(engine.extraction_requests(), 1);
+        assert_eq!(engine.chat_requests(), 0);
+        assert_eq!(engine.decision_requests(), 0);
+        assert_eq!(engine.embedding_requests(), 0);
+        let canary = engine
+            .wake_canary(&c.context, 16, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(matches!(canary.answer,
+            capyctl_adapters::completion_probe::CanaryEvidence::Extraction(answer)
+                if answer.declared == vec![FieldType::Number]));
+        assert_eq!(engine.extraction_requests(), 2);
+        for bad in [
+            serde_json::json!({"answers":{}}),
+            serde_json::json!({"answers":{"amount_paid":{"type":"number","guess":1.234,
+                "value":1.234,"p_null":0.0,"confidence":1.0}}}),
+        ] {
+            let engine =
+                FakeEngine::with_lifecycle().with_extractions(vec![FieldType::Number], bad);
+            assert!(matches!(
+                engine.execute_persisted(&c).await,
+                Err(RuntimeError::Uncertain(_))
+            ));
+            assert_eq!(engine.extraction_requests(), 1);
+            assert_eq!(engine.chat_requests(), 0);
+        }
+        let body = capyctl_adapters::extraction_probe::request("fake", &[FieldType::Text]);
+        assert!(engine.forward_extraction(&body).await.is_err());
+        assert_eq!(engine.extraction_requests(), 2);
+    }
+
+    // T50
+    #[test]
+    fn extraction_restore_probe_is_fresh_and_never_uses_chat() {
+        use capyctl_config::extractions::FieldType;
+        let members = vec![
+            ProcessIdentity {
+                role: "api".into(),
+                pid: 81,
+                boot_id: "boot".into(),
+                start_ticks: 1,
+            },
+            ProcessIdentity {
+                role: "worker-0".into(),
+                pid: 82,
+                boot_id: "boot".into(),
+                start_ticks: 2,
+            },
+        ];
+        let mut state = LifecycleState {
+            members_override: Some(members.clone()),
+            extractions: Some((
+                vec![FieldType::Number],
+                serde_json::json!({"answers":{
+                    "amount_paid":{"type":"number","guess":12,"value":null,
+                        "p_null":0.9,"confidence":0.5}
+                }}),
+            )),
+            ..Default::default()
+        };
+        state
+            .execute(&command(RuntimeAction::Initialize, "launch"))
+            .unwrap();
+        let mut action = command(RuntimeAction::Park, "park");
+        action.context.identities = ExecutionIdentities::Retained(members);
+        state.execute(&action).unwrap();
+        for step in [
+            RuntimeAction::Restore,
+            RuntimeAction::ReloadWeights,
+            RuntimeAction::InvalidateCache,
+            RuntimeAction::Probe,
+        ] {
+            action.action = step;
+            state.execute(&action).unwrap();
+        }
+        assert_eq!(state.extraction_probes, 1);
+        state.extractions.as_mut().unwrap().1 = serde_json::json!({"answers":{}});
+        assert!(state.execute(&action).is_err());
+        assert_eq!(state.extraction_probes, 2);
+        assert_eq!(state.decision_probes, 0);
+        assert_eq!(state.embedding_probes, 0);
+    }
+
     #[test]
     fn ordinary_initialize_proves_ready_with_real_fake_probe() {
         use capyctl_domain::resources::{Allocation, PhaseFootprint, ResourcePhase};

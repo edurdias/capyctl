@@ -29,14 +29,19 @@
 //! dimension is the same and its relative distance `‖v − r‖ / ‖r‖` is within
 //! the tolerance (`compare_embedding_canary`).
 //!
+//! ADR 0041 §4: an extraction reference keeps the probe kind, version,
+//! declared types and complete answers. ADR 0041 §5: a later answer uses
+//! the shared extraction probe comparison, never another type set.
+//!
 //! [`EngineAdapter::wake_canary`]: capyctl_adapters::traits::EngineAdapter::wake_canary
 use crate::group_residency::{canary_matches, CanaryReference};
 use capyctl_adapters::completion_probe::{CanaryEvidence, ProbeAnswer, PROMPT};
 use capyctl_adapters::decision_probe::{self, DecisionAnswer};
 use capyctl_adapters::embedding_probe;
+use capyctl_adapters::extraction_probe;
 use capyctl_store::wake_canary::{
     compare_embedding_canary, EmbeddingCanaryOutcome, StoredDecisionCanary, StoredEmbeddingCanary,
-    StoredWakeCanary, WakeCanaryReference,
+    StoredExtractionCanary, StoredWakeCanary, WakeCanaryReference,
 };
 
 pub use crate::group_residency::{CANARY_DEADLINE, CANARY_TOKENS};
@@ -59,15 +64,16 @@ pub enum Verdict {
     /// The answer differs from the reference: the wake fails `wake_mismatch`.
     Differs,
     /// No usable reference (none recorded, or one recorded for another
-    /// prompt, probe kind or probe version): the answer becomes the
-    /// reference.
+    /// prompt, probe kind, probe version or declared extraction type set):
+    /// the answer becomes the reference.
     Unreferenced,
 }
 
 /// The reference a probe answer records. ADR 0030 §4: a decision answer
 /// records its probe's version and the comparison rule with it; ADR 0036 §6
 /// an embedding answer its probe's kind and version, its dimension, the
-/// vector and the tolerance.
+/// vector and the tolerance. ADR 0041 §4: an extraction answer keeps its
+/// probe identity, declared types and complete answers.
 pub fn reference(answer: &CanaryEvidence) -> WakeCanaryReference {
     match answer {
         CanaryEvidence::Generated(answer) => WakeCanaryReference::Completion(StoredWakeCanary {
@@ -92,6 +98,15 @@ pub fn reference(answer: &CanaryEvidence) -> WakeCanaryReference {
                 tolerance: EMBEDDING_TOLERANCE,
             })
         }
+        // ADR 0041 §4: these types and answers belong to this probe identity.
+        CanaryEvidence::Extraction(answer) => {
+            WakeCanaryReference::Extraction(StoredExtractionCanary {
+                probe_kind: extraction_probe::KIND.to_owned(),
+                probe_version: extraction_probe::VERSION,
+                declared: answer.declared.clone(),
+                answers: answer.answers.clone(),
+            })
+        }
     }
 }
 
@@ -103,6 +118,8 @@ pub fn reference(answer: &CanaryEvidence) -> WakeCanaryReference {
 /// decision reference of the same probe version, by [`decision_matches`].
 /// ADR 0036 §6: an embedding answer only with an embedding reference of the
 /// same probe kind and version, by `compare_embedding_canary`.
+/// ADR 0041 §4: an extraction answer only with the same probe identity and
+/// declared types, using ADR 0041 §5's shared comparison.
 pub fn verdict(reference: Option<&WakeCanaryReference>, observed: &CanaryEvidence) -> Verdict {
     let matched = match (reference, observed) {
         (Some(WakeCanaryReference::Completion(reference)), CanaryEvidence::Generated(observed))
@@ -126,6 +143,25 @@ pub fn verdict(reference: Option<&WakeCanaryReference>, observed: &CanaryEvidenc
                 EmbeddingCanaryOutcome::Differs => false,
                 EmbeddingCanaryOutcome::NotComparable => return Verdict::Unreferenced,
             }
+        }
+        // ADR 0041 §4: an answer for a different probe identity or declared
+        // type set records a new reference instead of comparing across them.
+        (
+            Some(WakeCanaryReference::Extraction(reference)),
+            CanaryEvidence::Extraction(observed),
+        ) if reference.probe_kind == extraction_probe::KIND
+            && reference.probe_version == extraction_probe::VERSION
+            && reference.declared == observed.declared =>
+        {
+            // ADR 0041 §5: discrete guesses repeat; distributions may move
+            // one probe step, and probabilities by the inclusive 0.05.
+            extraction_probe::matches(
+                &reference.declared,
+                &reference.answers,
+                observed,
+                DECISION_TOLERANCE,
+            )
+            .is_ok()
         }
         _ => return Verdict::Unreferenced,
     };
@@ -390,6 +426,174 @@ mod tests {
                     Some(&WakeCanaryReference::Embedding(unusable)),
                     &embedded(&[0.0, 1.0])
                 ),
+                Verdict::Unreferenced
+            );
+        }
+    }
+
+    fn extracted() -> capyctl_adapters::extraction_probe::ExtractionAnswer {
+        use capyctl_config::extractions::FieldType;
+        let body = serde_json::json!({
+            "answers": {
+                "amount_paid": {
+                    "type": "number", "value": 649.0, "guess": 649.0,
+                    "p_null": 0.25, "confidence": 0.9
+                },
+                "delivered_on": {
+                    "type": "date", "value": "2026-09-28", "guess": "2026-09-28",
+                    "p_null": 0.25, "confidence": 0.9
+                },
+                "returns_today": {
+                    "type": "estimate", "value": 13, "median": 13, "p10": 11, "p90": 15,
+                    "p_below": 0.1, "p_above": 0.1
+                },
+                "returns_next": {
+                    "type": "forecast", "value": [13, 14], "median": [13, 14],
+                    "p10": [11, 12], "p90": [15, 16], "p_below": 0.1, "p_above": 0.1,
+                    "steps": [
+                        {"value": 13, "median": 13, "p10": 11, "p90": 15, "p_below": 0.1},
+                        {"value": 14, "median": 14, "p10": 12, "p90": 16, "p_above": 0.1}
+                    ]
+                }
+            }
+        });
+        capyctl_adapters::extraction_probe::well_formed(
+            &body,
+            &[
+                FieldType::Number,
+                FieldType::Date,
+                FieldType::Estimate,
+                FieldType::Forecast,
+            ],
+        )
+        .unwrap()
+    }
+
+    // T50: ADR 0041 §4: conversion preserves the complete first answer and
+    // records the probe kind, version and canonical declared type set.
+    #[test]
+    fn an_extraction_records_its_probe_identity_and_declared_answers() {
+        let answer = extracted();
+        let WakeCanaryReference::Extraction(recorded) =
+            reference(&CanaryEvidence::Extraction(answer.clone()))
+        else {
+            panic!("an extraction records an extraction reference");
+        };
+        assert_eq!(recorded.probe_kind, "extraction");
+        assert_eq!(recorded.probe_version, 1);
+        assert_eq!(recorded.declared, answer.declared);
+        assert_eq!(recorded.answers, answer.answers);
+    }
+
+    // T50: ADR 0041 §5: the shared comparison includes the one-step and
+    // 0.05 boundaries, and compares every forecast representation recorded.
+    #[test]
+    fn extraction_tolerances_are_inclusive_and_changes_beyond_them_fail() {
+        let initial = extracted();
+        let recorded = reference(&CanaryEvidence::Extraction(initial.clone()));
+        assert_eq!(
+            verdict(
+                Some(&recorded),
+                &CanaryEvidence::Extraction(initial.clone())
+            ),
+            Verdict::Matches
+        );
+        let mut close = initial.clone();
+        close.answers["amount_paid"]["p_null"] = 0.30.into();
+        close.answers["amount_paid"]["confidence"] = 0.85.into();
+        // Whether the scalar's value is null is not part of wake comparison.
+        close.answers["amount_paid"]["value"] = serde_json::Value::Null;
+        close.answers["returns_today"]["p_below"] = 0.15.into();
+        close.answers["returns_next"]["p_above"] = 0.15.into();
+        close.answers["returns_next"]["steps"][0]["p_below"] = 0.15.into();
+        for member in ["value", "median", "p10", "p90"] {
+            let estimate = &mut close.answers["returns_today"][member];
+            *estimate = (estimate.as_i64().unwrap() + 1).into();
+            for value in close.answers["returns_next"][member]
+                .as_array_mut()
+                .unwrap()
+            {
+                *value = (value.as_i64().unwrap() + 1).into();
+            }
+            for step in close.answers["returns_next"]["steps"]
+                .as_array_mut()
+                .unwrap()
+            {
+                step[member] = (step[member].as_i64().unwrap() + 1).into();
+            }
+        }
+        assert_eq!(
+            verdict(Some(&recorded), &CanaryEvidence::Extraction(close)),
+            Verdict::Matches
+        );
+        let mut probability = initial.clone();
+        probability.answers["amount_paid"]["p_null"] = 0.3001.into();
+        let mut estimate = initial.clone();
+        estimate.answers["returns_today"]["value"] = 15.into();
+        let mut forecast = initial;
+        forecast.answers["returns_next"]["steps"][0]["value"] = 15.into();
+        for far in [probability, estimate, forecast] {
+            assert_eq!(
+                verdict(Some(&recorded), &CanaryEvidence::Extraction(far)),
+                Verdict::Differs
+            );
+        }
+    }
+
+    // T50: ADR 0041 §5: a well-formed changed scalar guess fails even when
+    // its probabilities are unchanged, for both numeric and discrete types.
+    #[test]
+    fn extraction_changed_guesses_fail() {
+        let initial = extracted();
+        let recorded = reference(&CanaryEvidence::Extraction(initial.clone()));
+        let mut number = initial.clone();
+        number.answers["amount_paid"]["guess"] = 649.01.into();
+        number.answers["amount_paid"]["value"] = 649.01.into();
+        let mut date = initial;
+        date.answers["delivered_on"]["guess"] = "2026-09-29".into();
+        date.answers["delivered_on"]["value"] = "2026-09-29".into();
+        for changed in [number, date] {
+            assert_eq!(
+                verdict(Some(&recorded), &CanaryEvidence::Extraction(changed)),
+                Verdict::Differs
+            );
+        }
+    }
+
+    // T50: ADR 0041 §4: a reference for a different kind, version or
+    // declared type set is unreferenced, never compared with this answer.
+    #[test]
+    fn extraction_references_are_never_compared_across() {
+        let initial = extracted();
+        let observed = CanaryEvidence::Extraction(initial.clone());
+        assert_eq!(verdict(None, &observed), Verdict::Unreferenced);
+        let recorded = reference(&observed);
+        for other in [
+            reference(&answer(&[1], "Ready.")),
+            reference(&decided("billing", 0.9, 0.05, 0.05)),
+            reference(&embedded(&[1.0])),
+        ] {
+            assert_eq!(verdict(Some(&other), &observed), Verdict::Unreferenced);
+        }
+        assert_eq!(
+            verdict(Some(&recorded), &answer(&[1], "Ready.")),
+            Verdict::Unreferenced
+        );
+        let WakeCanaryReference::Extraction(original) = recorded else {
+            unreachable!()
+        };
+        let mut kind = original.clone();
+        kind.probe_kind = "decision".into();
+        let mut version = original.clone();
+        version.probe_version += 1;
+        let mut declared = original;
+        declared
+            .declared
+            .retain(|kind| *kind != capyctl_config::extractions::FieldType::Forecast);
+        declared.answers.remove("returns_next");
+        for unusable in [kind, version, declared] {
+            assert_eq!(
+                verdict(Some(&WakeCanaryReference::Extraction(unusable)), &observed),
                 Verdict::Unreferenced
             );
         }

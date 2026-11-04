@@ -685,6 +685,8 @@ pub enum MemberAction {
         max_tokens: Option<u32>,
         decision: bool,
         embedding: bool,
+        /// ADR 0041 §4: the fixed extraction probe, never a chat fallback.
+        extraction: bool,
     },
     /// SPEC §§9.1, 10 (protocol version 2): park one retained, drained launch in
     /// place. The process group and its reservation stay owned; a park never
@@ -954,6 +956,16 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
         }
         let probe_decision = command.probe_decision;
         let probe_embedding = command.probe_embedding;
+        // ADR 0041 §4: extraction is an exclusive probe action.
+        if command.probe_extraction
+            && (probe_max_tokens.is_some()
+                || probe_decision
+                || probe_embedding
+                || !matches!(command.action, Some(Action::ProbeOwnedHandle(_))))
+        {
+            return Err(GroupIdentityError);
+        }
+        let probe_extraction = command.probe_extraction;
         let action = match command.action.ok_or(GroupIdentityError)? {
             Action::Prepare(plan) => MemberAction::Prepare(plan.try_into()?),
             Action::Launch(plan) => MemberAction::Launch {
@@ -978,6 +990,7 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
                     max_tokens: probe_max_tokens.take(),
                     decision: probe_decision,
                     embedding: probe_embedding,
+                    extraction: probe_extraction,
                 }
             }
             Action::ParkOwnedHandle(owned_handle) if owned_handle_ok(&owned_handle) => {
@@ -1114,6 +1127,14 @@ impl MemberCommand {
                 self.action,
                 MemberAction::Probe {
                     embedding: true,
+                    ..
+                }
+            ),
+            // ADR 0041 §4: false is omitted, preserving existing digests.
+            probe_extraction: matches!(
+                self.action,
+                MemberAction::Probe {
+                    extraction: true,
                     ..
                 }
             ),
@@ -1311,6 +1332,32 @@ fn embedding_evidence_ok(evidence: &pb::EmbeddingProbeEvidence) -> bool {
         && norm > 1e-6
 }
 
+/// ADR 0041 §4: bounded object evidence and a nonempty canonical declared set.
+pub const EXTRACTION_PROBE_MAX_BYTES: usize = 256 * 1024;
+pub const EXTRACTION_PROBE_VERSION: u32 = 1;
+
+fn extraction_evidence_ok(evidence: &pb::ExtractionProbeEvidence) -> bool {
+    const TYPES: [&str; 9] = [
+        "text", "number", "date", "time", "datetime", "duration", "list", "estimate", "forecast",
+    ];
+    let mut previous = None;
+    evidence.probe_version == EXTRACTION_PROBE_VERSION
+        && !evidence.declared_field_types.is_empty()
+        && evidence.declared_field_types.iter().all(|name| {
+            let Some(index) = TYPES.iter().position(|candidate| candidate == name) else {
+                return false;
+            };
+            let ordered = previous.is_none_or(|last| last < index);
+            previous = Some(index);
+            ordered
+        })
+        && evidence.answers_json.len() <= EXTRACTION_PROBE_MAX_BYTES
+        && serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(
+            &evidence.answers_json,
+        )
+        .is_ok()
+}
+
 /// SPEC §13: shape and exact command binding only. The caller must establish the
 /// authenticated host/session and observation freshness before consuming evidence.
 pub fn validate_result(
@@ -1438,6 +1485,20 @@ pub fn validate_result(
             }
         ) && result.state == "completed"
             && embedding_evidence_ok(evidence))
+        {
+            return Err(GroupIdentityError);
+        }
+    }
+    // ADR 0041 §4: extraction evidence belongs only to its completed probe.
+    if let Some(evidence) = &result.probe_extraction {
+        if !(matches!(
+            command.action,
+            MemberAction::Probe {
+                extraction: true,
+                ..
+            }
+        ) && result.state == "completed"
+            && extraction_evidence_ok(evidence))
         {
             return Err(GroupIdentityError);
         }

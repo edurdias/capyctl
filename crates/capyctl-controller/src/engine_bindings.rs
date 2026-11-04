@@ -719,6 +719,8 @@ impl EngineBindings for ProfileBindings {
                     // ADR 0031 §5: the probe asks for the route served.
                     model_id: launch.values.served_name.clone(),
                     api: manifest.api,
+                    // ADR 0041 §4: readiness follows the frozen manifest.
+                    field_types: manifest.field_types.clone().unwrap_or_default(),
                     idle: manifest.idle.clone(),
                     health: manifest.health.clone(),
                     endpoint,

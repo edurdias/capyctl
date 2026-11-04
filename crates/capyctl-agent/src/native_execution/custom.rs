@@ -83,6 +83,16 @@ impl NativeHostExecution {
         &self,
         owned: &capyctl_protocol::execution::MemberCommand,
     ) -> EngineAccess {
+        // ADR 0041 §3: a retained launch's frozen document chooses the contract.
+        let api = owned
+            .action
+            .launch_plan()
+            .and_then(|plan| {
+                serde_json::from_str::<serde_json::Value>(&plan.deployment_config).ok()
+            })
+            .and_then(|document| document.get("api").cloned())
+            .and_then(|api| serde_json::from_value(api).ok())
+            .unwrap_or_default();
         let request_abort = self
             .resolve_retained(owned)
             .is_ok_and(|effective| super::request_abort::request_abort_capable(&effective));
@@ -99,6 +109,7 @@ impl NativeHostExecution {
                 Some(engine_access(engine, line, custom.as_ref()))
             })
             .unwrap_or_else(EngineAccess::unknown)
+            .with_api(api)
             .with_request_abort(request_abort)
             .with_engine_trace(self.frozen_engine_trace(&owned.identity.command_id))
     }
@@ -153,6 +164,7 @@ pub(super) fn custom_adapter_for(
     Ok(
         CustomAdapter::new(endpoint, fingerprint, served.into(), key)
             .with_api(custom.manifest.api)
+            .with_field_types(custom.manifest.field_types.clone().unwrap_or_default())
             .with_health(custom.manifest.health.clone())
             .with_idle(custom.manifest.idle.clone()),
     )

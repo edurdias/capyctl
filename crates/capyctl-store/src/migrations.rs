@@ -12,7 +12,7 @@ use crate::schema::{
     SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
     SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V49, SCHEMA_V5, SCHEMA_V50, SCHEMA_V51, SCHEMA_V52,
     SCHEMA_V53, SCHEMA_V54, SCHEMA_V55, SCHEMA_V56, SCHEMA_V57, SCHEMA_V58, SCHEMA_V59, SCHEMA_V6,
-    SCHEMA_V60, SCHEMA_V61, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V60, SCHEMA_V61, SCHEMA_V62, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -109,6 +109,8 @@ pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V60,
     // ADR 0037 §7: each launch's engine tracing decision.
     SCHEMA_V61,
+    // ADR 0041 §4: an extraction launch's wake canary reference.
+    SCHEMA_V62,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -1697,8 +1699,8 @@ mod tests {
              INSERT INTO wake_canaries VALUES('a',1,3,'inc','decision/v1','[]','',8,NULL,'decision',1,'{}',0.05);",
         )
         .unwrap();
-        apply(&conn).unwrap();
-        apply(&conn).unwrap();
+        apply_through(&conn, 59).unwrap();
+        apply_through(&conn, 59).unwrap();
         let rows: Vec<String> = conn
             .prepare(
                 "SELECT kind||'|'||prompt||'|'||tokens_json||'|'||text||'|'||recorded_at_ms||'|'||coalesce(mismatch_operation_id,'')
@@ -1755,7 +1757,6 @@ mod tests {
     // tracing table exists, empty.
     #[test]
     fn a_v58_store_upgrades_through_v61() {
-        assert_eq!(latest_version(), 61);
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         apply_through(&conn, 58).unwrap();
@@ -1765,7 +1766,7 @@ mod tests {
                VALUES('b','a',0,1,1,'h','auto','off','disabled');",
         )
         .unwrap();
-        apply(&conn).unwrap();
+        apply_through(&conn, 61).unwrap();
         let versions: Vec<i64> = conn
             .prepare("SELECT version FROM schema_migrations WHERE version > 58 ORDER BY version")
             .unwrap()
@@ -1799,6 +1800,112 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    // T50: ADR 0041 §4: v62 preserves every v61 reference byte-for-byte,
+    // including mismatch markers, while admitting only the extraction payload
+    // shape and keeping the existing kinds' constraints and primary-key index.
+    #[test]
+    fn v62_preserves_all_canary_kinds_and_types_extraction_payloads() {
+        assert_eq!(latest_version(), 62);
+        let conn = Connection::open_in_memory().unwrap();
+        apply_through(&conn, 61).unwrap();
+        conn.execute_batch(
+            "INSERT INTO wake_canaries VALUES('a',0,3,'chat','Say ready.','[1,2]','ok',7,'op-w','completion',1,NULL,NULL,NULL,NULL);
+             INSERT INTO wake_canaries VALUES('a',1,4,'decision','decision/v1','[]','',8,'op-d','decision',1,'{\"choice\":\"yes\",\"probabilities\":[[\"yes\",1.0]]}',0.05,NULL,NULL);
+             INSERT INTO wake_canaries VALUES('a',2,5,'embedding','embedding/v1','[]','',9,'op-e','embedding',1,NULL,0.02,1,x'0000803f');",
+        )
+        .unwrap();
+        let old_rows = || {
+            conn.prepare(
+                "SELECT json_array(deployment_id,instance_index,generation,incarnation,prompt,tokens_json,text,
+                        recorded_at_ms,mismatch_operation_id,kind,probe_version,decision_json,tolerance,dimension,hex(vector))
+                   FROM wake_canaries WHERE instance_index<3 ORDER BY instance_index",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        let before = old_rows();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(old_rows(), before);
+        let null_payloads: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM wake_canaries WHERE declared_field_types_json IS NULL AND answers_json IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_payloads, 3);
+        let primary_key: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('wake_canaries') WHERE pk>0 ORDER BY pk")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            primary_key,
+            ["deployment_id", "instance_index", "generation"]
+        );
+        let unique_indexes: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_index_list('wake_canaries') WHERE origin='pk' AND \"unique\"=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unique_indexes, 1);
+        let insert = |kind: &str, payload: &str| {
+            conn.execute_batch(&format!(
+                "INSERT INTO wake_canaries VALUES('a',3,6,'extract','extraction/v1','[]','',10,NULL,'{kind}',1,{payload});"
+            ))
+        };
+        for payload in [
+            "NULL,NULL,NULL,NULL,NULL,'{}'",
+            "NULL,NULL,NULL,NULL,'[]','{\"amount_paid\":{\"type\":\"number\"}}'",
+            "NULL,NULL,NULL,NULL,'[\"number\"]',NULL",
+            "NULL,NULL,NULL,NULL,'[\"number\"]','{}'",
+            "NULL,NULL,NULL,NULL,'[\"number\"]','[]'",
+            "NULL,NULL,NULL,NULL,'[\"number\"]','broken'",
+            "'{}',NULL,NULL,NULL,'[\"number\"]','{\"amount_paid\":{\"type\":\"number\"}}'",
+            "NULL,0.05,NULL,NULL,'[\"number\"]','{\"amount_paid\":{\"type\":\"number\"}}'",
+            "NULL,NULL,1,x'0000803f','[\"number\"]','{\"amount_paid\":{\"type\":\"number\"}}'",
+        ] {
+            assert!(insert("extraction", payload).is_err(), "{payload}");
+        }
+        // Extraction columns must be absent on every old kind.
+        for kind in ["completion", "decision", "embedding"] {
+            assert!(conn
+                .execute(
+                    "UPDATE wake_canaries SET declared_field_types_json='[\"number\"]',
+                            answers_json='{\"amount_paid\":{\"type\":\"number\"}}' WHERE kind=?1",
+                    [kind],
+                )
+                .is_err());
+        }
+        insert(
+            "extraction",
+            "NULL,NULL,NULL,NULL,'[\"number\"]','{\"amount_paid\":{\"type\":\"number\"}}'",
+        )
+        .unwrap();
+        // The original kind and common-column checks still apply after rebuild.
+        for sql in [
+            "UPDATE wake_canaries SET tokens_json='[]',text='' WHERE kind='completion'",
+            "UPDATE wake_canaries SET decision_json=NULL WHERE kind='decision'",
+            "UPDATE wake_canaries SET vector=x'00' WHERE kind='embedding'",
+            "UPDATE wake_canaries SET tolerance=NULL WHERE kind='embedding'",
+            "UPDATE wake_canaries SET probe_version=0 WHERE kind='extraction'",
+            "UPDATE wake_canaries SET instance_index=-1 WHERE kind='extraction'",
+            "UPDATE wake_canaries SET recorded_at_ms=-1 WHERE kind='extraction'",
+            "UPDATE wake_canaries SET kind='other' WHERE kind='extraction'",
+            "INSERT INTO wake_canaries SELECT * FROM wake_canaries WHERE kind='extraction'",
+        ] {
+            assert!(conn.execute_batch(sql).is_err(), "{sql}");
+        }
     }
 
     /// v50 (SPEC §17, owner decision 2026-10-18): a v49 store gains the two

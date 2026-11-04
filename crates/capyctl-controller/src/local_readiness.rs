@@ -379,9 +379,18 @@ impl LocalReadiness {
             return Err("the engine's port or health path is not answering".into());
         }
         match target.api {
-            // ADR 0041 §4: another API's probe is not extraction readiness.
+            // ADR 0041 §4: the fixed extraction of the frozen manifest's types.
             DeploymentApi::Extractions => {
-                return Err("extraction readiness is unsupported".into());
+                adapter
+                    .extraction_probe(
+                        &target.served,
+                        custom.manifest.field_types.as_deref().unwrap_or_default(),
+                        DECISION_TIMEOUT,
+                    )
+                    .await
+                    .map_err(|error| {
+                        format!("the engine did not answer the fixed extraction probe: {error}")
+                    })?;
             }
             DeploymentApi::Decisions => {
                 adapter
@@ -559,9 +568,7 @@ impl LocalReadiness {
                         DeploymentApi::Chat => "chat",
                         DeploymentApi::Decisions => "fixed decision",
                         DeploymentApi::Embeddings => "fixed embedding",
-                        // ADR 0041 §4: no readiness receipt without the extraction probe.
-                        DeploymentApi::Extractions =>
-                            return Err("extraction readiness is unsupported".into()),
+                        DeploymentApi::Extractions => "fixed extraction",
                     },
                     target.served,
                 ),
@@ -811,6 +818,7 @@ fn custom_adapter(
         target.key.clone(),
     )
     .with_api(custom.manifest.api)
+    .with_field_types(custom.manifest.field_types.clone().unwrap_or_default())
     .with_health(custom.manifest.health.clone())
     .with_idle(custom.manifest.idle.clone())
 }

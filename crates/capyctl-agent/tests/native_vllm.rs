@@ -884,6 +884,7 @@ impl Fixture {
                 max_tokens: None,
                 decision: false,
                 embedding: false,
+                extraction: false,
             },
         })
     }
@@ -986,6 +987,7 @@ async fn a_restarted_host_serves_again_only_after_a_fresh_probe() {
         max_tokens: None,
         decision: false,
         embedding: false,
+        extraction: false,
     };
     let unknown = sign(unknown);
     let nothing = host

@@ -843,6 +843,12 @@ impl NativeHostExecution {
                     &member,
                     &served,
                     effective.api,
+                    &effective
+                        .profile
+                        .custom
+                        .as_ref()
+                        .and_then(|custom| custom.manifest.field_types.clone())
+                        .unwrap_or_default(),
                     run.stop_at_ms,
                 )
                 .await

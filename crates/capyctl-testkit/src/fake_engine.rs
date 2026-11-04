@@ -73,6 +73,14 @@ pub struct FakeEngine {
     /// decisions; `None` has no such endpoint.
     embeddings: Mutex<Option<FakeEmbeddings>>,
     embedding_requests: AtomicU64,
+    /// ADR 0041 §4: declared types and the raw scripted extraction response.
+    extractions: Mutex<
+        Option<(
+            Vec<capyctl_config::extractions::FieldType>,
+            serde_json::Value,
+        )>,
+    >,
+    extraction_requests: AtomicU64,
 }
 
 /// ADR 0036 plan item 7: how a broken embeddings answer is broken.
@@ -205,6 +213,8 @@ impl FakeEngine {
             decision_requests: AtomicU64::new(0),
             embeddings: Mutex::new(None),
             embedding_requests: AtomicU64::new(0),
+            extractions: Mutex::new(None),
+            extraction_requests: AtomicU64::new(0),
         }
     }
 
@@ -220,6 +230,8 @@ impl FakeEngine {
     /// ADR 0030: the response the next `/v1/systemone` requests get, raw as
     /// an engine sends it: [`Self::decision_answer`], or anything malformed.
     pub fn set_decision(&self, response: serde_json::Value) {
+        *self.embeddings.lock().unwrap() = None;
+        *self.extractions.lock().unwrap() = None;
         *self.decisions.lock().unwrap() = Some(response);
     }
 
@@ -261,6 +273,8 @@ impl FakeEngine {
 
     /// ADR 0036: the script the next `/v1/embeddings` requests are answered by.
     pub fn set_embeddings(&self, script: FakeEmbeddings) {
+        *self.decisions.lock().unwrap() = None;
+        *self.extractions.lock().unwrap() = None;
         *self.embeddings.lock().unwrap() = Some(script);
     }
 
@@ -297,11 +311,59 @@ impl FakeEngine {
         }
         Ok(response)
     }
+    /// ADR 0041 §4: an extraction-only model, with an intentionally raw script
+    /// so tests can exercise malformed as well as well-formed engine answers.
+    pub fn with_extractions(
+        self,
+        declared: Vec<capyctl_config::extractions::FieldType>,
+        response: serde_json::Value,
+    ) -> Self {
+        self.set_extraction(declared, response);
+        self
+    }
+
+    pub fn set_extraction(
+        &self,
+        declared: Vec<capyctl_config::extractions::FieldType>,
+        response: serde_json::Value,
+    ) {
+        *self.decisions.lock().unwrap() = None;
+        *self.embeddings.lock().unwrap() = None;
+        *self.extractions.lock().unwrap() = Some((declared, response));
+    }
+
+    pub fn extraction_requests(&self) -> u64 {
+        self.extraction_requests.load(Ordering::SeqCst)
+    }
+
+    /// ADR 0041 §3: use the production closed request contract, not a fake
+    /// approximation; the answer remains unjudged on the request path.
+    pub fn extraction_response(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, AdapterError> {
+        let (declared, mut response) = self
+            .extractions
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(AdapterError::UnsupportedCapability)?;
+        capyctl_adapters::extraction_request::validate_extraction_request(body, &declared)
+            .map_err(|error| AdapterError::Uncertain(error.to_string()))?;
+        self.extraction_requests.fetch_add(1, Ordering::SeqCst);
+        if response.get("model").is_some() {
+            response["model"] = body["model"].clone();
+        }
+        Ok(response)
+    }
 
     /// A chat request: counted, and refused by a decision or embedding model.
     fn chat(&self) -> Result<(), AdapterError> {
         self.chat_requests.fetch_add(1, Ordering::SeqCst);
-        if self.decisions.lock().unwrap().is_some() || self.embeddings.lock().unwrap().is_some() {
+        if self.decisions.lock().unwrap().is_some()
+            || self.embeddings.lock().unwrap().is_some()
+            || self.extractions.lock().unwrap().is_some()
+        {
             return Err(AdapterError::PolicyDenied);
         }
         Ok(())
@@ -534,11 +596,16 @@ impl EngineAdapter for FakeEngine {
         // ADR 0030 §3: a decision model's readiness is its fixed decision.
         state.decisions = decisions;
         state.embeddings = embeddings;
+        state.extractions = self.extractions.lock().unwrap().clone();
         let result = state.execute_with_clock(command, self.lifecycle_clock.as_deref());
         self.decision_requests
             .fetch_add(std::mem::take(&mut state.decision_probes), Ordering::SeqCst);
         self.embedding_requests.fetch_add(
             std::mem::take(&mut state.embedding_probes),
+            Ordering::SeqCst,
+        );
+        self.extraction_requests.fetch_add(
+            std::mem::take(&mut state.extraction_probes),
             Ordering::SeqCst,
         );
         result
@@ -704,7 +771,20 @@ impl EngineAdapter for FakeEngine {
         bound: Duration,
     ) -> Result<capyctl_adapters::completion_probe::CanaryAnswer, RuntimeError> {
         use capyctl_adapters::completion_probe::CanaryEvidence;
-        let answer = if self.embeddings.lock().unwrap().is_some() {
+        let declared = self
+            .extractions
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(types, _)| types.clone());
+        let answer = if let Some(declared) = declared {
+            // ADR 0041 §5: the canary carries the declared set and complete answers.
+            CanaryEvidence::Extraction(
+                ChatForward::extraction_probe(self, "fake", &declared, bound)
+                    .await
+                    .map_err(|e| RuntimeError::Uncertain(format!("Fake extraction probe: {e}")))?,
+            )
+        } else if self.embeddings.lock().unwrap().is_some() {
             CanaryEvidence::Embedding(
                 ChatForward::embedding_probe(self, "fake", bound)
                     .await
@@ -762,6 +842,27 @@ impl capyctl_adapters::traits::ChatForward for FakeEngine {
     ) -> Result<capyctl_adapters::answer::EngineAnswer, AdapterError> {
         self.decision_response(body).map(Into::into)
     }
+    async fn forward_extraction(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, AdapterError> {
+        self.extraction_response(body)
+    }
+
+    // ADR 0041 §4: readiness judges the fixed request with production rules.
+    async fn extraction_probe(
+        &self,
+        served: &str,
+        declared: &[capyctl_config::extractions::FieldType],
+        _bound: Duration,
+    ) -> Result<capyctl_adapters::extraction_probe::ExtractionAnswer, AdapterError> {
+        let response = self.extraction_response(&capyctl_adapters::extraction_probe::request(
+            served, declared,
+        ))?;
+        capyctl_adapters::extraction_probe::well_formed(&response, declared)
+            .map_err(AdapterError::Uncertain)
+    }
+
     async fn forward_chat(
         &self,
         body: &capyctl_adapters::request::InferenceRequest,
@@ -860,6 +961,44 @@ mod tests {
     use super::*;
     use capyctl_adapters::completion_probe::CanaryEvidence;
     use capyctl_adapters::traits::{ChatForward, DeliveryFailed, EmbeddingSink};
+
+    // T50
+    #[tokio::test]
+    async fn extraction_mode_is_exclusive_and_validates_requests() {
+        use capyctl_config::extractions::FieldType;
+        let response = serde_json::json!({"model":"fake","answers":{
+            "amount_paid":{"type":"number","guess":1,"value":1,
+                "p_null":0.0,"confidence":1.0}
+        }});
+        let engine = FakeEngine::new()
+            .with_decisions()
+            .with_extractions(vec![FieldType::Number], response.clone());
+        let request = capyctl_adapters::extraction_probe::request("served", &[FieldType::Number]);
+        assert_eq!(
+            engine.forward_extraction(&request).await.unwrap()["model"],
+            "served"
+        );
+        assert_eq!(engine.extraction_requests(), 1);
+        assert!(engine
+            .forward_chat(&serde_json::json!({"model":"fake"}))
+            .await
+            .is_err());
+        assert!(engine
+            .decision_response(&capyctl_adapters::decision_probe::request("fake"))
+            .is_err());
+        assert!(engine
+            .embedding_response(&capyctl_adapters::embedding_probe::request("fake"))
+            .is_err());
+        let mut malformed = request.clone();
+        malformed["questions"] = serde_json::Value::Null;
+        assert!(engine.forward_extraction(&malformed).await.is_err());
+        assert_eq!(engine.extraction_requests(), 1);
+        engine.set_embeddings(FakeEmbeddings::default());
+        assert!(engine.forward_extraction(&request).await.is_err());
+        engine.set_extraction(vec![FieldType::Number], response);
+        engine.set_decision(FakeEngine::decision_answer("billing", [0.95, 0.02, 0.03]));
+        assert!(engine.forward_extraction(&request).await.is_err());
+    }
 
     /// A sink that keeps every chunk, or refuses them all once `gone`.
     #[derive(Default)]

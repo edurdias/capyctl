@@ -214,7 +214,7 @@ fn validate_answers(answers: &Map<String, Value>, declared: &[FieldType]) -> Res
                     value
                         .as_array()
                         .is_some_and(|values| values.len() == 2 && values.iter().all(probability))
-                        || (!matches!(member, "p_below" | "p_above") && probability(value))
+                        || probability(value)
                 } else {
                     probability(value)
                 };
@@ -383,24 +383,26 @@ fn within(left: &Value, right: &Value, tolerance: f64) -> bool {
 
 /// ADR 0041 §5: compare only the named evidence, using one grid step for
 /// distributions, relative 1e-9 for scalar numbers, and `tolerance` for probabilities.
+/// Borrow the stored reference directly, without copying its complete answers.
 pub fn matches(
-    reference: &ExtractionAnswer,
+    reference_declared: &[FieldType],
+    reference_answers: &Map<String, Value>,
     later: &ExtractionAnswer,
     tolerance: f64,
 ) -> Result<(), String> {
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err("extraction probe: invalid probability tolerance".into());
     }
-    if reference.declared != later.declared {
+    if reference_declared != later.declared.as_slice() {
         return Err("extraction probe: declared types changed".into());
     }
-    validate_answers(&reference.answers, &reference.declared)?;
+    validate_answers(reference_answers, reference_declared)?;
     validate_answers(&later.answers, &later.declared)?;
     for (kind, name) in &FIELDS {
-        if !reference.declared.contains(kind) {
+        if !reference_declared.contains(kind) {
             continue;
         }
-        let left = &reference.answers[*name];
+        let left = &reference_answers[*name];
         let right = &later.answers[*name];
         let same = match kind {
             FieldType::Text
@@ -831,7 +833,14 @@ mod tests {
         reversed["answers"]["damage"]["spans"] =
             json!([span("dented corner"), span("cracked screen")]);
         assert!(well_formed(&reversed, &FieldType::ALL).is_ok());
-        assert!(matches(&ready(&engine()), &ready(&reversed), 0.05).is_err());
+        let reference = ready(&engine());
+        assert!(matches(
+            &reference.declared,
+            &reference.answers,
+            &ready(&reversed),
+            0.05
+        )
+        .is_err());
     }
 
     // T50: all estimate components and every forecast step obey bounds and grid.
@@ -897,7 +906,13 @@ mod tests {
             later["answers"][field]["quantiles"] = Value::Null;
             later["answers"][field]["unit"] = json!(42);
         }
-        assert!(matches(&reference, &ready(&later), 0.05).is_ok());
+        assert!(matches(
+            &reference.declared,
+            &reference.answers,
+            &ready(&later),
+            0.05
+        )
+        .is_ok());
     }
 
     // T50: scalar canaries compare guesses, not threshold-dependent value nullness.
@@ -906,7 +921,8 @@ mod tests {
         let reference = ready(&engine());
         for (_, field) in &FIELDS[..6] {
             assert!(matches(
-                &reference,
+                &reference.declared,
+                &reference.answers,
                 &ready(&changed(field, "value", Value::Null)),
                 0.05
             )
@@ -919,22 +935,30 @@ mod tests {
             ("delivered_time", json!("14:31")),
             ("delivered_at", json!("2026-09-28T14:31")),
         ] {
-            assert!(matches(&reference, &ready(&scalar_guess(field, guess)), 0.05).is_err());
+            assert!(matches(
+                &reference.declared,
+                &reference.answers,
+                &ready(&scalar_guess(field, guess)),
+                0.05
+            )
+            .is_err());
         }
         let mut text = scalar_guess("order_id", json!("Order"));
         text["answers"]["order_id"]["span"] = json!([0, 5]);
-        assert!(matches(&reference, &ready(&text), 0.05).is_err());
+        assert!(matches(&reference.declared, &reference.answers, &ready(&text), 0.05).is_err());
         let null = ready(&changed("amount_paid", "value", Value::Null));
-        assert!(matches(&null, &null, 0.05).is_ok());
+        assert!(matches(&null.declared, &null.answers, &null, 0.05).is_ok());
         let large = ready(&scalar_guess("amount_paid", json!(1_000_000_000)));
         assert!(matches(
-            &large,
+            &large.declared,
+            &large.answers,
             &ready(&scalar_guess("amount_paid", json!(1_000_000_001))),
             0.05
         )
         .is_ok());
         assert!(matches(
-            &large,
+            &large.declared,
+            &large.answers,
             &ready(&scalar_guess("amount_paid", json!(1_000_000_002))),
             0.05
         )
@@ -949,11 +973,19 @@ mod tests {
         let mut second = first.clone();
         let offset = STATE.rfind("on").unwrap();
         second["answers"]["order_id"]["span"] = json!([offset, offset + 2]);
-        assert!(matches(&ready(&first), &ready(&second), 0.05).is_err());
+        let reference = ready(&first);
+        assert!(matches(
+            &reference.declared,
+            &reference.answers,
+            &ready(&second),
+            0.05
+        )
+        .is_err());
         let mut list = engine();
         list["answers"]["damage"]["value"] = json!(["cracked screen"]);
         list["answers"]["damage"]["spans"] = json!([span("cracked screen")]);
-        assert!(matches(&ready(&engine()), &ready(&list), 0.05).is_err());
+        let reference = ready(&engine());
+        assert!(matches(&reference.declared, &reference.answers, &ready(&list), 0.05).is_err());
     }
 
     // T50: each distribution component independently allows exactly one probe step.
@@ -970,7 +1002,13 @@ mod tests {
                         json!(original.as_i64().unwrap() + delta)
                     };
                     assert_eq!(
-                        matches(&reference, &ready(&changed(field, member, value)), 0.05).is_ok(),
+                        matches(
+                            &reference.declared,
+                            &reference.answers,
+                            &ready(&changed(field, member, value)),
+                            0.05
+                        )
+                        .is_ok(),
                         delta != 2,
                         "{field}.{member} delta {delta}"
                     );
@@ -1001,7 +1039,13 @@ mod tests {
                     json!(original.as_f64().unwrap() + delta)
                 };
                 assert_eq!(
-                    matches(&reference, &ready(&changed(field, member, value)), 0.05).is_ok(),
+                    matches(
+                        &reference.declared,
+                        &reference.answers,
+                        &ready(&changed(field, member, value)),
+                        0.05
+                    )
+                    .is_ok(),
                     expected,
                     "{field}.{member} delta {delta}"
                 );
@@ -1012,10 +1056,17 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("confidence");
-        assert!(matches(&reference, &ready(&absent), 0.05).is_err());
-        assert!(matches(&reference, &reference, 0.0).is_ok());
         assert!(matches(
-            &reference,
+            &reference.declared,
+            &reference.answers,
+            &ready(&absent),
+            0.05
+        )
+        .is_err());
+        assert!(matches(&reference.declared, &reference.answers, &reference, 0.0).is_ok());
+        assert!(matches(
+            &reference.declared,
+            &reference.answers,
             &ready(&changed("damage", "confidence", json!(0.500001))),
             0.0
         )
@@ -1031,14 +1082,20 @@ mod tests {
             &[FieldType::Text],
         )
         .unwrap();
-        assert!(matches(&reference, &subset, 0.05).is_err());
+        assert!(matches(&reference.declared, &reference.answers, &subset, 0.05).is_err());
         for tolerance in [-0.1, f64::NAN, f64::INFINITY] {
-            assert!(matches(&reference, &reference, tolerance).is_err());
+            assert!(matches(
+                &reference.declared,
+                &reference.answers,
+                &reference,
+                tolerance
+            )
+            .is_err());
         }
         let mut corrupt = reference.clone();
         corrupt.answers.get_mut("returns_next").unwrap()["median"] = json!([]);
-        assert!(matches(&reference, &corrupt, 0.05).is_err());
-        assert!(matches(&corrupt, &reference, 0.05).is_err());
+        assert!(matches(&reference.declared, &reference.answers, &corrupt, 0.05).is_err());
+        assert!(matches(&corrupt.declared, &corrupt.answers, &reference, 0.05).is_err());
     }
 
     fn forecast_steps() -> Value {
@@ -1065,9 +1122,9 @@ mod tests {
         let absent = ready(&body);
         body["answers"]["damage"]["spans"] = Value::Null;
         let null = ready(&body);
-        assert!(matches(&absent, &null, 0.05).is_ok());
-        assert!(matches(&null, &absent, 0.05).is_ok());
-        assert!(matches(&null, &ready(&engine()), 0.05).is_err());
+        assert!(matches(&absent.declared, &absent.answers, &null, 0.05).is_ok());
+        assert!(matches(&null.declared, &null.answers, &absent, 0.05).is_ok());
+        assert!(matches(&null.declared, &null.answers, &ready(&engine()), 0.05).is_err());
         body["answers"]["damage"]["spans"] = json!([]);
         assert!(well_formed(&body, &FieldType::ALL).is_err());
     }
@@ -1123,7 +1180,22 @@ mod tests {
         for member in ["p_below", "p_above"] {
             let mut forecast = forecast_steps();
             forecast[member] = json!(0.2);
-            assert!(well_formed(&with_forecast(forecast), &FieldType::ALL).is_err());
+            let reference = ready(&with_forecast(forecast.clone()));
+            forecast[member] = json!(0.25);
+            let boundary = ready(&with_forecast(forecast.clone()));
+            assert!(matches(&reference.declared, &reference.answers, &boundary, 0.05).is_ok());
+            forecast[member] = json!(0.251);
+            assert!(matches(
+                &reference.declared,
+                &reference.answers,
+                &ready(&with_forecast(forecast.clone())),
+                0.05
+            )
+            .is_err());
+            for invalid in [json!(-0.1), json!(1.1), Value::Null] {
+                forecast[member] = invalid;
+                assert!(well_formed(&with_forecast(forecast.clone()), &FieldType::ALL).is_err());
+            }
         }
     }
 
@@ -1137,7 +1209,13 @@ mod tests {
                 let previous = forecast["steps"][1][member].as_i64().unwrap();
                 forecast["steps"][1][member] = json!(previous + delta);
                 assert_eq!(
-                    matches(&reference, &ready(&with_forecast(forecast)), 0.05).is_ok(),
+                    matches(
+                        &reference.declared,
+                        &reference.answers,
+                        &ready(&with_forecast(forecast)),
+                        0.05
+                    )
+                    .is_ok(),
                     delta != 2,
                     "{member} delta {delta}"
                 );
@@ -1148,18 +1226,36 @@ mod tests {
                 let mut forecast = forecast_steps();
                 forecast["steps"][1][member] = json!(value);
                 assert_eq!(
-                    matches(&reference, &ready(&with_forecast(forecast)), 0.05).is_ok(),
+                    matches(
+                        &reference.declared,
+                        &reference.answers,
+                        &ready(&with_forecast(forecast)),
+                        0.05
+                    )
+                    .is_ok(),
                     expected,
                     "{member}"
                 );
             }
             let mut forecast = forecast_steps();
             forecast["steps"][1].as_object_mut().unwrap().remove(member);
-            assert!(matches(&reference, &ready(&with_forecast(forecast)), 0.05).is_err());
+            assert!(matches(
+                &reference.declared,
+                &reference.answers,
+                &ready(&with_forecast(forecast)),
+                0.05
+            )
+            .is_err());
         }
         let mut extra_probability = forecast_steps();
         extra_probability["steps"][0]["confidence"] = json!(0.5);
-        assert!(matches(&reference, &ready(&with_forecast(extra_probability)), 0.05).is_err());
+        assert!(matches(
+            &reference.declared,
+            &reference.answers,
+            &ready(&with_forecast(extra_probability)),
+            0.05
+        )
+        .is_err());
     }
 
     // T50: later forecasts must retain every reference representation, while a newly
@@ -1174,20 +1270,20 @@ mod tests {
         let mut dual = engine()["answers"]["returns_next"].clone();
         dual["steps"] = forecast_steps()["steps"].clone();
         let both = ready(&with_forecast(dual.clone()));
-        assert!(matches(&arrays, &both, 0.05).is_ok());
-        assert!(matches(&steps, &both, 0.05).is_ok());
-        assert!(matches(&both, &arrays, 0.05).is_err());
-        assert!(matches(&both, &steps, 0.05).is_err());
-        assert!(matches(&arrays, &steps, 0.05).is_err());
-        assert!(matches(&steps, &arrays, 0.05).is_err());
+        assert!(matches(&arrays.declared, &arrays.answers, &both, 0.05).is_ok());
+        assert!(matches(&steps.declared, &steps.answers, &both, 0.05).is_ok());
+        assert!(matches(&both.declared, &both.answers, &arrays, 0.05).is_err());
+        assert!(matches(&both.declared, &both.answers, &steps, 0.05).is_err());
+        assert!(matches(&arrays.declared, &arrays.answers, &steps, 0.05).is_err());
+        assert!(matches(&steps.declared, &steps.answers, &arrays, 0.05).is_err());
         dual["steps"][1]["value"] = json!(16);
         let changed_steps = ready(&with_forecast(dual.clone()));
-        assert!(matches(&arrays, &changed_steps, 0.05).is_ok());
-        assert!(matches(&both, &changed_steps, 0.05).is_err());
+        assert!(matches(&arrays.declared, &arrays.answers, &changed_steps, 0.05).is_ok());
+        assert!(matches(&both.declared, &both.answers, &changed_steps, 0.05).is_err());
         dual["steps"] = forecast_steps()["steps"].clone();
         dual["value"] = json!([13, 16]);
         let changed_arrays = ready(&with_forecast(dual));
-        assert!(matches(&steps, &changed_arrays, 0.05).is_ok());
-        assert!(matches(&both, &changed_arrays, 0.05).is_err());
+        assert!(matches(&steps.declared, &steps.answers, &changed_arrays, 0.05).is_ok());
+        assert!(matches(&both.declared, &both.answers, &changed_arrays, 0.05).is_err());
     }
 }

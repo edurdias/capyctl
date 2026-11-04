@@ -408,6 +408,7 @@ fn probe(launch: &MemberCommand, id: &str) -> MemberCommand {
             max_tokens: None,
             decision: false,
             embedding: false,
+            extraction: false,
         },
     )
 }

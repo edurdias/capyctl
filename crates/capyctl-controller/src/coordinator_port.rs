@@ -964,6 +964,14 @@ impl LifecyclePort for CoordinatorLifecycle {
             .read(|store| store.deployment_request_limit(deployment))
     }
 
+    fn deployment_field_types(
+        &self,
+        deployment: &str,
+    ) -> Result<Vec<capyctl_config::extractions::FieldType>, LifecycleFault> {
+        self.commands
+            .read(|store| store.deployment_field_types(deployment))
+    }
+
     fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, LifecycleFault> {
         self.commands.read(|store| store.get_deployment(id))
     }

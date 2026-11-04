@@ -46,15 +46,16 @@ pub struct CanaryAnswer {
     pub observed_at_ms: i64,
 }
 
-/// What a wake canary's probe answered: what a chat deployment generated,
-/// (ADR 0030 §4) a decisions deployment's answer to the fixed decision probe,
-/// or (ADR 0036 §6) an embeddings deployment's answer to the fixed embedding
-/// probe. No two of them are ever compared with each other.
+/// What a wake canary's probe answered: generated chat, a fixed decision
+/// (ADR 0030 §4), a fixed embedding (ADR 0036 §6), or the declared fixed
+/// extractions (ADR 0041 §5). Different probe kinds are never compared.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CanaryEvidence {
     Generated(ProbeAnswer),
     Decision(crate::decision_probe::DecisionAnswer),
     Embedding(crate::embedding_probe::EmbeddingAnswer),
+    /// ADR 0041 §§4–5: the declared types and their fixed extraction answers.
+    Extraction(crate::extraction_probe::ExtractionAnswer),
 }
 
 /// vLLM, TensorFold and llama.cpp: OpenAI `/v1/completions` asking for the

@@ -50,6 +50,7 @@ fn decode(action: pb::execute_member::Action) -> Result<MemberCommand, ()> {
             probe_max_tokens: 0,
             probe_decision: false,
             probe_embedding: false,
+            probe_extraction: false,
             trace_parent: String::new(),
         })),
     })
