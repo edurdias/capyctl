@@ -500,7 +500,8 @@ The manifest's fields:
 |---|---|---|
 | `kind` | `custom_engine` | required |
 | `schema_version` | `1` | required |
-| `api` | `chat`, `decisions` or `embeddings`: what every deployment on the engine serves; a deployment's `api` must be the same ([Embedding models](../guide/deploy.md#embedding-models)) | required |
+| `api` | `chat`, `decisions`, `embeddings` or `extractions`: what every deployment on the engine serves; a deployment's `api` must match. Extractions require a custom engine ([Extraction models](../guide/deploy.md#extraction-models)). | required |
+| `field_types` | Distinct names from `text`, `number`, `date`, `time`, `datetime`, `duration`, `list`, `estimate`, `forecast`, stored in this canonical order; required and non-empty for `api: extractions`, refused for every other API (`custom_manifest_invalid`). The set participates in the manifest digest. | required only for extractions |
 | `args` | the argument list after the executable, run without a shell; must hold `{host}`, `{port}` and `{model_dir}`, and may hold `{served_name}`, `{context_length}` and `{api_key}` (`{{` and `}}` are literal braces) | required |
 | `version` | a version string, shown as the engine's version | `unversioned` |
 | `environment` | an absolute directory fingerprinted in place of the default (the executable's virtual environment, else the executable alone) | the default |
@@ -513,6 +514,12 @@ The manifest's fields:
 No placeholder is allowed in `health` or `idle`, and `{api_key}` only in
 `args` and `env` values. A manifest is at most 64 KiB, and an unknown field is
 refused (`custom_manifest_invalid`).
+
+Registration shows an extraction manifest's `field_types` beside `api` for
+confirmation. Before downgrading to a release without extraction support,
+remove every extraction engine with `capyctl engine remove`: older releases
+refuse the whole `custom-engines.yaml` file when any manifest contains
+`field_types`, so the role will not start.
 
 **Drift.** `security.installation_drift` works as for every engine: each
 launch measures the installation again (for a custom engine, the executable

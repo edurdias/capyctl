@@ -55,6 +55,8 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 5 | `host_capability_missing:decisions` | A machine runs a CapyCTL too old for decision models. | Upgrade CapyCTL on that machine. |
 | 5 | `capability_missing:embeddings` | A deployment with `api: embeddings` names an engine that has no embeddings route (TensorFold, TensorRT-LLM), or a custom engine whose manifest names another `api`. | Use vLLM, SGLang or llama.cpp, or a custom engine with `api: embeddings`. |
 | 5 | `host_capability_missing:embeddings` | A machine runs a CapyCTL too old for embedding models. | Upgrade CapyCTL on that machine. |
+| 5 | `capability_missing:extractions` | An extraction deployment names a native engine, or a custom engine whose manifest declares another API. | Use a custom engine with `api: extractions` and declared `field_types`; no native engine is accepted. |
+| 5 | `host_capability_missing:extractions` | A machine does not advertise support for extraction models; nothing was placed on it. | Upgrade CapyCTL on that machine; an extraction custom engine needs both `custom_engines` and `extractions`. |
 | 5 | `host_capability_missing:custom_engines` | The deployment's engine is a custom engine and a machine it names runs a CapyCTL too old for custom engines. | Upgrade CapyCTL on that machine. |
 | 5 | `host_capability_missing:tensorfold_native` | The deployment's engine profile is TensorFold's native line (`line: native`) and a machine it names runs a CapyCTL too old for it; nothing was sent to it. | Upgrade CapyCTL on that machine. |
 | 5 | `host_capability_missing:cuda_graph_phases` | The deployment declares independent SGLang CUDA graph phases and a machine runs a CapyCTL too old for the object form; nothing was sent to it. | Upgrade CapyCTL on that machine, or use a scalar boolean policy. |
@@ -257,6 +259,30 @@ For decision models:
   the engine's. Some custom engines answer every failure this way, an engine
   failure included: when a request you believe valid is rejected, read the
   instance's engine log ([Example: basal decision models](engines.md#example-basal-decision-models)).
+
+For extraction models ([Extraction requests](requests.md#extraction-requests)):
+
+On `/v1/systemone`, lookup precedes contract validation: an unknown model is
+`unknown_model` before a malformed contract, for decisions too. The router
+then checks API mismatch and body shape before waiting or activation.
+
+- `api_mismatch` (400) also covers the wrong System One shape: `questions`
+  sent to an extraction deployment, or `fields` sent to a decision deployment,
+  whatever its value, including null. A body carrying both keys is refused too.
+  An extraction deployment asked on chat completions or embeddings is refused
+  with the same code, naming `POST /v1/systemone`. Nothing waits or wakes.
+- `invalid_request` (400): a member outside the closed extraction contract,
+  or a setting with an invalid shape or value. The message names the member,
+  or field and setting. A known setting is accepted on every field type;
+  cross-setting semantics are the engine's to judge.
+- `field_type_unsupported` (400): a field's type is absent from the frozen
+  custom profile's `field_types`. The message names the field and type;
+  nothing waits or wakes.
+- `engine_rejected`: an engine 400, 413 or 422 with a complete JSON body,
+  including the engine's own limits or setting semantics. CapyCTL does not
+  judge individual answers on the request path. Responses above 16 MiB are
+  uncertain, never replayed and held until verified stop; host ingress
+  refuses request bodies above 8 MiB with HTTP 400.
 
 For embedding models:
 

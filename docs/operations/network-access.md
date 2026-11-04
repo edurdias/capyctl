@@ -170,11 +170,18 @@ Open only port 443 to the internet, never 8443.
   TensorFold has no key. The router
   is the only path from the network to an engine, and it forwards only the
   allowlisted inference routes: `POST /v1/chat/completions`,
-  `POST /v1/systemone` for decision models and `POST /v1/embeddings` for
-  embedding models. A host's ingress checks each request against the same
-  closed contract the router uses, refuses a body over 8 MiB, and passes an
-  embedding answer on as it arrives without holding it whole. A model running
-  across machines also opens peer ports; see below.
+  `POST /v1/systemone` for decision and extraction models and
+  `POST /v1/embeddings` for embedding models. A host's ingress checks each
+  request against the same closed contract the router uses, choosing
+  `questions` or `fields` for `/v1/systemone` from the launch's `api`, never
+  from the body. It refuses a body over 8 MiB with HTTP 400. The extraction
+  contract accepts up to four images, checks setting shapes, and refuses
+  unknown settings; cross-setting semantics belong to the engine
+  ([Extraction requests](../guide/requests.md#extraction-requests)).
+  An embedding answer passes on as it arrives without being held whole;
+  decision and extraction responses are read whole up to 16 MiB, and a
+  longer response is uncertain, never replayed and held until verified stop.
+  A model running across machines also opens peer ports; see below.
 
 ## Multi-node groups
 

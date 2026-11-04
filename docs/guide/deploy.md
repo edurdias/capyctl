@@ -269,6 +269,88 @@ whichever team it picks. Any change to the request is a new version of the
 check, and a wake reference recorded with an older version is never compared
 with the new answers.
 
+## Extraction models
+
+An extraction model returns typed values from a text state and, optionally,
+images in one forward pass, without generating tokens. It answers `fields`
+on `POST /v1/systemone`, not a decision model's `questions`
+([Extraction requests](requests.md#extraction-requests)).
+
+Only a [custom engine](engines.md#custom-engines) with `api: extractions`
+can serve it. Every native engine at every version is refused with
+`capability_missing:extractions`. The manifest declares the types it answers:
+
+```yaml title="capyctl-extract.yaml"
+kind: custom_engine
+schema_version: 1
+api: extractions
+field_types: [text, number, date, time, datetime, duration, list, estimate, forecast]
+version: "0.1.0"
+args: [--host, "{host}", --port, "{port}", --model, "{model_dir}", --served-name, "{served_name}"]
+health: /health
+```
+
+For a registered profile named `capyctl-extract`, a deployment might be:
+
+```yaml title="extractor.yaml"
+name: my-extractor
+engine: capyctl-extract
+model: my-extraction-checkpoint
+api: extractions
+resources: {gpu: 16GiB, ram: 8GiB}
+```
+
+The model names a local checkpoint under your models directory; the resource
+figures illustrate the document shape, not a measured requirement. Set them
+from your checkpoint's measured peak before relying on the deployment.
+`api` is part of the frozen revision. `field_types` must be non-empty,
+distinct and drawn from the nine names above; it is stored in that order.
+Changing the set changes the manifest digest and creates a new profile.
+Other APIs must not declare `field_types`.
+
+`engine add --custom` shows the field types beside the API for confirmation.
+**Before downgrading** to a release without extraction support, remove every
+extraction engine with `capyctl engine remove`. Older releases refuse all of
+`custom-engines.yaml` when a manifest contains `field_types`, so their role
+will not start.
+
+An extraction deployment:
+
+- runs on one machine and refuses a `topology`, including several GPUs;
+- resolves `restart_only`; `deep` and `host_backed` are refused;
+- refuses tool-call and reasoning parsers; CapyCTL does no extraction readout;
+- has LMCache off, as every custom engine does;
+- requires both `custom_engines` and `extractions` on the host. A host without
+  the latter is never selected (`host_capability_missing:extractions`).
+
+### The readiness extraction
+
+After the port and optional health path answer, CapyCTL sends the exact
+[ADR 0041 §4 probe](../design/adr/0041-extraction-models.md#4-readiness-is-a-fixed-extraction)
+to the launch's own loopback endpoint, with its served name and its own key
+when present. It contains one field per declared type. Readiness requires
+exactly those answers, matching types and well-formed values; it does not
+check factual accuracy. Null scalar and list values are allowed; list order
+is the engine's. The probe accepts times with `Z` or `±HH:MM`, durations
+with no fractional part, and either forecast form (arrays or `steps`
+objects); every form present must be well-formed. `/health` and
+`/v1/models` alone are not readiness.
+
+The first answer becomes the launch's wake reference, with probe version and
+declared types. [ADR 0041 §5](../design/adr/0041-extraction-models.md#5-the-wake-check)
+compares scalar guesses (and text spans), not scalar value nullness; lists
+must repeat items and spans in order or be null in both. Estimates and
+forecasts have an inclusive one-step tolerance, probabilities an inclusive
+0.05 tolerance; a probability present in only one answer fails. A mismatch
+stops the instance. With restart-only residency and no LMCache, a restart
+records a new reference.
+
+**CapyCTL's own extraction model is untrained and not qualified.**
+Its server's working name is `capyctl-extract`; its model and server live in
+a separate repository. CPU and fake-engine tests are not qualification.
+No live run has qualified it; the first qualification needs its own server
+on host A after the environment is approved.
+
 ## Embedding models
 
 An embedding model turns text into a vector of numbers, for search,

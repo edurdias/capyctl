@@ -693,7 +693,8 @@ health: /health
 | Field | What it holds | Required |
 |---|---|---|
 | `kind`, `schema_version` | `custom_engine` and `1`. | yes |
-| `api` | What every deployment on the engine serves: `chat` (`POST /v1/chat/completions`), `decisions` (`POST /v1/systemone`, [Decision models](deploy.md#decision-models)) or `embeddings` (`POST /v1/embeddings`, [Embedding models](deploy.md#embedding-models)). | yes |
+| `api` | What every deployment on the engine serves: `chat` (`POST /v1/chat/completions`), `decisions` (`POST /v1/systemone`, `questions`), `embeddings` (`POST /v1/embeddings`) or `extractions` (`POST /v1/systemone`, `fields`; [Extraction models](deploy.md#extraction-models)). | yes |
+| `field_types` | Non-empty, distinct types from `text`, `number`, `date`, `time`, `datetime`, `duration`, `list`, `estimate`, `forecast`. Required for `extractions`, refused for other APIs (`custom_manifest_invalid`). Stored in this canonical order; changing the set changes the digest and creates a new profile. `list` covers text, number and date items. | only extractions |
 | `args` | The whole argument list after the executable, with placeholders (below). | yes |
 | `version` | A version string, shown as the engine's version. Without it the engine shows `unversioned`. CapyCTL never runs the program to ask. | no |
 | `environment` | An absolute directory to fingerprint in place of the default ([Fingerprint and drift](#fingerprint-and-drift)). | no |
@@ -872,10 +873,9 @@ CapyCTL refuses:
   the engine's `usage` passes through, and CapyCTL picks an instance by its own
   count of running requests.
 
-A deployment's `api` must be the manifest's: `api: decisions` on a chat engine
-is refused `capability_missing:decisions`, `api: embeddings` on another
-engine `capability_missing:embeddings`, and a chat deployment on a decisions
-engine `capability_missing:chat`. For a decision or embedding model, a
+A deployment's `api` must be the manifest's: a mismatch is refused with
+`capability_missing:<requested-api>` (`chat`, `decisions`, `embeddings` or
+`extractions`). For a decision, embedding or extraction model, a
 `topology` or a parking `residency` is refused by that model kind's rules
 first, with their message ("runs on one machine", "restarts instead of
 parking", "runs on one GPU of one machine"). An embeddings custom engine is
@@ -887,7 +887,9 @@ A custom engine is ready when, in order, its port accepts a connection, its
 `health` path (when the manifest has one) answers 200, and the model answers
 the same check as on any engine: a short chat request for `chat`, the fixed
 decision for `decisions` ([Decision models](deploy.md#decision-models)), the
-fixed embedding for `embeddings` ([Embedding models](deploy.md#embedding-models)), sent
+fixed embedding for `embeddings` ([Embedding models](deploy.md#embedding-models)),
+or the fixed extraction of the declared types for `extractions`
+([Extraction models](deploy.md#the-readiness-extraction)), sent
 with the served name and the engine key when there is one. The engine's own
 `/v1/models` is not read; its shape differs from program to program. Without
 `timeouts.initialize`, the start gets the bound CapyCTL derives for every
@@ -1031,6 +1033,74 @@ is rejected, read the end of the instance's engine log
 tell the two apart. A basal release that reports its running and queued
 requests can be given an `idle` entry in a new manifest, with no CapyCTL
 change.
+
+### Example: CapyCTL's extraction server
+
+CapyCTL's own model and server live in a separate repository, with the
+working name `capyctl-extract`. The model is untrained and the server is
+not live-qualified. This is the custom-engine contract for it, not an
+installation recipe or a claim that usable weights are available.
+
+```yaml title="capyctl-extract.yaml"
+kind: custom_engine
+schema_version: 1
+api: extractions
+field_types: [text, number, date, time, datetime, duration, list, estimate, forecast]
+version: "0.1.0"
+args: [--host, "{host}", --port, "{port}", --model, "{model_dir}", --served-name, "{served_name}"]
+health: /health
+```
+
+Once the server and a trained checkpoint are available in an approved
+environment, registration uses the normal custom-engine command:
+
+```bash
+capyctl engine add --custom ~/capyctl-extract-venv/bin/capyctl-extract \
+  --name capyctl-extract --manifest capyctl-extract.yaml
+```
+
+The confirmation shows `field_types` beside `api`, so the administrator
+approves both. **Before downgrading** to a release without extraction
+support, remove every extraction engine with `capyctl engine remove`.
+Older releases strictly read `custom-engines.yaml` and refuse the whole
+file if a manifest contains `field_types`, preventing role startup.
+
+The executable path illustrates an installation in a virtual environment;
+CapyCTL fingerprints that environment and its interpreter. The manifest
+passes loopback `{host}`, the assigned `{port}`, the checkpoint directory
+and the served name directly, never through a shell. This example has no
+`{api_key}` or `idle`: the engine listener is unauthenticated on loopback,
+and a cancelled request stays charged until verified stop or restart.
+The outer inference endpoint still requires CapyCTL's API key.
+A request cut before its whole answer settles only at verified stop, even
+if another extraction manifest supplies an idle signal. That signal can
+settle complete engine error answers; without it they also wait for stop.
+
+```yaml title="extractor.yaml"
+name: my-extractor
+engine: capyctl-extract
+model: my-extraction-checkpoint
+api: extractions
+resources: {gpu: 16GiB, ram: 8GiB}
+```
+
+These resources are illustrative, not measured requirements. The local
+checkpoint must be under your models directory, and resources must cover
+its measured peak. The launch's argument shape is:
+
+```text
+/home/me/capyctl-extract-venv/bin/capyctl-extract --host 127.0.0.1 --port <port> \
+    --model /home/me/models/my-extraction-checkpoint --served-name <served-name>
+```
+
+The port, `/health`, the fixed extraction of every declared type and the
+listener check must pass before requests are admitted. Extractions are
+restart-only on one machine, with no `topology`, parsers, parking or
+LMCache; the host needs `custom_engines` and `extractions`. No native engine
+is accepted. CPU and fake-engine tests are not qualification, and no live
+run has qualified this model. Its first qualification requires its own
+server on host A after approval of the environment
+([ADR 0041](../design/adr/0041-extraction-models.md)).
 
 ## LMCache
 

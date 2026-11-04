@@ -4,8 +4,9 @@ CapyCTL serves the OpenAI chat API on port 8443 of the machine that runs it (the
 server, with several machines), on every interface, with an API key. On that
 machine the endpoint is `http://127.0.0.1:8443/v1`. Send the deployment's
 `name` as `model`. A decision model answers
-[decision requests](#decision-requests) on the same port instead of chat, and
-an embedding model answers [embedding requests](#embedding-requests).
+[decision requests](#decision-requests) on the same port instead of chat,
+an embedding model answers [embedding requests](#embedding-requests), and
+an extraction model answers [extraction requests](#extraction-requests).
 
 ## The API key
 
@@ -434,6 +435,122 @@ waking anything; the message names the endpoint to use:
 ```text
 {"code":"api_mismatch","message":"model my-decider serves the decisions API, which /v1/chat/completions does not answer; send its requests to POST /v1/systemone"}
 ```
+
+## Extraction requests
+
+A deployment with `api: extractions`
+([Extraction models](deploy.md#extraction-models)) answers typed `fields` on
+`POST /v1/systemone`. The deployment's API selects the contract, not the body.
+
+```bash
+curl -s http://127.0.0.1:8443/v1/systemone \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{
+    "model": "my-extractor",
+    "state": "Order A-88412 cost 649.00 USD and arrived on 2026-09-28.",
+    "reference_date": "2026-10-09",
+    "fields": {
+      "order_id": {"type": "text", "instructions": "The order number"},
+      "amount": {"type": "number", "unit": "USD", "decimals": 2},
+      "delivered_on": {"type": "date", "instructions": "The delivery date"}
+    }
+  }'
+```
+
+On `/v1/systemone`, CapyCTL authenticates, checks `X-Request-Id`, reads the
+body under the bound and reads `model`, then looks up the deployment before
+validating the contract. An unknown model is therefore `unknown_model`
+before a malformed contract, for decisions too. API mismatches are checked
+next, then the body and declared types, before waiting, activation,
+admission and leasing. The API and types come from the current frozen revision.
+
+### The closed request contract
+
+Only these top-level members are accepted:
+
+| Member | Rule |
+|---|---|
+| `model` | Required non-empty string. |
+| `state` | Optional string; absent or empty only when `images` is non-empty. CapyCTL adds no default. Text answers are spans of this string. |
+| `fields` | Required object with at least one member. Each name matches `^[A-Za-z_][A-Za-z0-9_.\-]{0,63}$`; each value is a field spec. |
+| `images` | Optional array of at most four items: a string beginning `data:` (any case), or an object with exactly `content_type` and `base64`, both strings. CapyCTL does not decode them; their bytes count toward the body bound. |
+| `reference_date` | Optional ISO calendar date string, `YYYY-MM-DD`. |
+| `options` | Optional object containing only boolean `include_quantiles` and `return_state_text`. |
+
+Every field spec requires `type`, one of `text`, `number`, `date`, `time`,
+`datetime`, `duration`, `list`, `estimate`, `forecast`. Every type accepts
+any setting below; the router checks its shape, not whether it makes sense
+for that type or agrees with another setting:
+
+| Setting | Rule |
+|---|---|
+| `instructions` | String. |
+| `null_threshold` | Number, `0 < x ≤ 1`. |
+| `unit` | String. |
+| `integer` | Boolean. |
+| `decimals` | Integer 0–6. |
+| `items` | `text`, `number` or `date`; required on a `list`. |
+| `min`, `max` | Each a finite number or ISO date `YYYY-MM-DD`; both required on an `estimate` or `forecast`. |
+| `step` | Positive finite number, or `month` or `year`. A number with date bounds counts days; CapyCTL does not interpret it. |
+| `scale` | `linear` or `log`. |
+| `horizon` | Integer 1–64; optional. |
+| `interval` | `step`, `minute`, `hour`, `day`, `week`, `month`, `quarter` or `year`. |
+
+An unknown setting or a value outside its shape is refused before activation.
+A setting on a type it means nothing for is forwarded; cross-setting semantics
+belong to the engine and can return as `engine_rejected`. The router reads
+supported types from the frozen custom profile, never the engine. There is
+no field-count limit or image-size limit beyond the body bound; the image
+count is at most four, and an engine's own limits return as rejections.
+
+### Answers
+
+The engine returns an `answers` object keyed by field name. Scalars (`text`
+through `duration`) carry `type`, `value` (null if undetermined), `guess`,
+`p_null` and `confidence`; text carries `span: [start, end]` character offsets
+into `state`. A list's `value` can be null or an array; text lists have
+corresponding `spans`, in the engine's order. Estimates carry `value`,
+`median`, `p10`, `p90`, `p_below` and `p_above`. Forecasts have two published
+forms: arrays for `value`, `median`, `p10` and `p90`, or a `steps` array of
+estimate objects, one entry per future step. The median and 10th–90th
+percentiles describe an 80% interval. Extra engine members are preserved.
+
+CapyCTL forwards the body with the engine's served model name and returns
+the whole answer with the public name. Completion evidence follows decisions:
+a whole JSON object whose `answers` is a non-empty object of objects each
+naming a string `type`. The response is read whole up to 16 MiB; a longer
+answer is uncertain, never replayed and held until the instance stops.
+Ingress has its own 8 MiB request bound, returning HTTP 400 above it.
+Individual answers are not judged on the request path. The stricter typed
+checks in [ADR 0041 §4](../design/adr/0041-extraction-models.md#4-readiness-is-a-fixed-extraction)
+apply only to the fixed readiness probe. It accepts time zone suffixes
+`Z` or `±HH:MM`, durations with no fractional part, null lists, and either
+published forecast form (every form present must be well-formed).
+
+### Errors, discovery and metrics
+
+- `api_mismatch` (400): wrong endpoint, `questions` sent to an extraction
+  deployment, or `fields` sent to a decision deployment, whatever that
+  member's value (including null). A body with both keys is refused too.
+  Nothing waits or wakes; the message names what the model answers.
+- `invalid_request` (400): a body outside the closed contract, naming the
+  member or the field and setting.
+- `field_type_unsupported` (400): a field's type is not in the deployment's
+  declared types, naming the field and type before waiting or activation.
+- `engine_rejected`: a complete JSON engine rejection (HTTP 400, 413 or 422),
+  including the engine's own limits.
+
+`GET /v1/models` shows `capyctl.api: "extractions"` and
+`capyctl.field_types`, in canonical order, without waking the model.
+Answers carry `capyctl.metrics.total_ms`, `time_to_response_ms` and
+`input_tokens` from engine usage, as decisions do; there is no generated-text
+figure. Request IDs, trace context, waiting, admission, instance selection
+and leases are the same as for decisions. A request cut by a hang-up or
+deadline before its whole answer settles only at the next verified stop;
+the restart for held requests applies. A complete engine error leaves the
+request `cancelling`, settled on the manifest's idle signal when present,
+otherwise at the next verified stop
+([Cancelled requests](engines.md#cancelled-requests)).
 
 ## Embedding requests
 

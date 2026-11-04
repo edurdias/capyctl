@@ -11,6 +11,14 @@ nothing about their use off the host unless the host allows it; see
 [Nothing reported off the host](#nothing-reported-off-the-host). Trace spans
 leave the machine only when you name a collector; see [Traces](#traces).
 
+Extraction requests carry `state`, `fields` and optional images in the request
+body. The same rule covers these, including image data URLs and base64
+content: CapyCTL does not write them to its database, journal or role logs.
+It forwards images without decoding them, under the request body bound.
+An extraction engine is a custom engine, so what its own output contains
+depends on that program; review its logging settings as described below.
+Extraction deployments have LMCache off.
+
 ## Summary
 
 | What | Contents | Where | How long | Turn off or reduce |
@@ -90,7 +98,8 @@ names the service (`capyctl-server`, `capyctl-host` or `capyctl-standalone`),
 its version and its role, with no machine ID or address.
 
 A span never holds any part of a request or response body (messages, system
-prompts, tools and their arguments, reasoning, completions), the `model`
+prompts, tools and their arguments, reasoning, completions, extraction state,
+fields or images), the `model`
 string as the caller wrote it, `cache_salt` or its digest, the caller's
 `X-Request-Id`, a key or `Authorization` value, the client's address or user
 agent, an engine's error text or log line. Your deployment, instance and host
