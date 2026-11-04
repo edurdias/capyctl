@@ -1,7 +1,9 @@
 # ADR 0041 — Extraction models (`api: extractions`, `fields` on `POST /v1/systemone`)
 
 **Status:** Accepted (owner decisions 2026-11-04, recorded below in "Owner decisions of
-2026-11-04"). Target release: open (built on `integration/0.2.0`). The first engine is
+2026-11-04"). Target release: the first release after `capyctl-extract-4b` is trained
+(owner decision 2026-11-04; built on `integration/0.2.0`, rebased onto `main` before its
+pull request). The first engine is
 CapyCTL's own extraction server run as a custom engine (ADR 0031); no native engine
 serves extractions, and every native engine is refused until one does and is qualified.
 **Amends (with the implementation):** `SPEC.md` §6.1 (readiness of an extraction model and
@@ -366,7 +368,9 @@ fields the model answers without sending one.
 
 ### 9. CapyCTL's extraction model
 
-The model and its server live in their own repository (working name `capyctl-extract`).
+The model, `capyctl-extract-4b`, and its server live in their own repository,
+`capyctl-extract` (a private GitHub repository until weights ship; names decided by the
+owner 2026-11-04).
 CapyCTL depends only on its server speaking §3's contract and declaring its types in a
 custom-engine manifest (§2). The owner's decisions for it:
 
@@ -380,9 +384,11 @@ custom-engine manifest (§2). The owner's decisions for it:
 | Hardware | Pilot runs on host A (one approved training environment, scheduled around live sessions); full runs on rented GPUs, set up and removed by a script as ADR 0035 §14's machine is |
 | Serving | Its own server first (this ADR's custom engine), then a llama.cpp port of its output layers; both checked against the same test set |
 
-Each environment this needs (training on host A, the rented machine, the server on each
-host that runs it) is an engine environment under AGENTS.md's rules: it needs the owner's
-approval and an entry in its list before it is created.
+Each environment this needs is an engine environment under AGENTS.md's rules. Approved
+2026-11-04 and listed there, not yet made: the training environment and a separate
+serving environment on host A, and a rented machine in principle, whose GPU model,
+session length and set-up and removal script come back to the owner before it is rented.
+No copy on host B was approved.
 
 ## Consequences
 
@@ -439,9 +445,13 @@ approval and an entry in its list before it is created.
 9. Deployment: `api: extractions`; the endpoint `POST /v1/systemone` with `fields`.
 10. Readiness: one field per declared type (manifest `field_types`); the wake canary
     allows one grid step on estimates and forecasts and 0.05 on probabilities.
+11. Environments: training and serving environments on host A, and a rented machine in
+    principle (details first); no copy on host B.
+12. Names: the repository and server `capyctl-extract`, the model `capyctl-extract-4b`.
+13. Release: the first release after `capyctl-extract-4b` is trained.
+14. Branches: `feat/extraction-models` stays local until it is rebased onto `main`;
+    `capyctl-extract` is a private GitHub repository.
 
 ## Open questions
 
-- The model's name and the repository's public name.
-- The release that ships this ADR.
-- The environment approvals listed in §9.
+- The rented training machine's GPU model and session length (§9).

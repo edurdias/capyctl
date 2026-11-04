@@ -50,10 +50,10 @@ an unknown setting `invalid_request`, an undeclared `date`
 `field_type_unsupported`, an engine-side `min > max` `engine_rejected`, and
 `/v1/models` listed `capyctl.api` and `capyctl.field_types`. A random
 checkpoint proves the plumbing, not extraction quality. CPU tests and this
-smoke are not qualification. CapyCTL's own model is untrained. The first live
-qualification still needs its server (working name `capyctl-extract`) on host
-A, after approval and registration of its environment. Its public name and
-shipping release remain open in ADR 0041.
+smoke are not qualification. CapyCTL's own model, `capyctl-extract-4b`, is
+untrained. The first live qualification still needs its server, `capyctl-extract`,
+on host A, in the serving environment approved on 2026-11-04 once it is made.
+ADR 0041 ships in the first release after the model is trained.
 
 # Release note: Extraction models
 

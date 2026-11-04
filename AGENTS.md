@@ -160,6 +160,13 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   - the maintainer's discrete-GPU laptop, approved 2026-11-09: the official
     `lmsysorg/sglang:v0.5.22` Docker image, for the live check of #230 (an editable
     SGLang refused at `engine add`);
+  - host A, for CapyCTL's own extraction model (ADR 0041 §9), approved 2026-11-04,
+    not yet made: a training environment ~/capyctl-extract-train-venv (Python
+    3.12, an aarch64 CUDA 13.0 torch, transformers with Qwen3.5, peft, datasets
+    and capyctl-extract) for pilot runs, scheduled around live sessions, and a
+    separate serving environment ~/capyctl-extract-0.1.0-venv (the same runtime
+    and the server, no training tools) run as a custom engine; record the
+    versions installed here when each is made;
   - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B;
   - the rented two-GPU machine of ADR 0035 §14 (owner decision 2026-10-25), for
     its one session only: fresh x86_64 CUDA installs of vLLM 0.32.0
@@ -176,6 +183,10 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   everything it created; the owner shuts the machine down straight afterwards. The
   other rules here apply to it (one live session at a time, fault injection only by
   signals to CapyCTL-owned processes, no driver, CUDA or system-package change).
+- A rented machine for full training runs of CapyCTL's extraction model (owner
+  approval in principle 2026-11-04, ADR 0041 §9): its GPU model, session length
+  and the script that sets it up and removes everything it created come back to
+  the owner before anything is rented; the rules above apply to it.
 - Only one live session runs on the hosts at a time.
 - Fault injection is limited to signals sent to CapyCTL-owned processes (PIDs taken
   from ownership evidence) and one bounded external memory allocation. Never change

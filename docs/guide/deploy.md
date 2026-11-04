@@ -346,10 +346,10 @@ stops the instance. With restart-only residency and no LMCache, a restart
 records a new reference.
 
 **CapyCTL's own extraction model is untrained and not qualified.**
-Its server's working name is `capyctl-extract`; its model and server live in
+The model is `capyctl-extract-4b` and its server `capyctl-extract`; both live in
 a separate repository. CPU and fake-engine tests are not qualification.
 No live run has qualified it; the first qualification needs its own server
-on host A after the environment is approved.
+on host A.
 
 ## Embedding models
 

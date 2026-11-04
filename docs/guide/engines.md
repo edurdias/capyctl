@@ -1036,8 +1036,8 @@ change.
 
 ### Example: CapyCTL's extraction server
 
-CapyCTL's own model and server live in a separate repository, with the
-working name `capyctl-extract`. The model is untrained and the server is
+CapyCTL's own model, `capyctl-extract-4b`, and its server, `capyctl-extract`,
+live in a separate repository. The model is untrained and the server is
 not live-qualified. This is the custom-engine contract for it, not an
 installation recipe or a claim that usable weights are available.
 
