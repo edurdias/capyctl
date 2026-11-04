@@ -12,7 +12,7 @@
 //! that ended without its evidence (`wake_uncertain`) is never re-armed
 //! either, so every single launch's wake that ended uncertain owes the
 //! instance's stop, retried until accepted, also across a restart.
-use capyctl_config::extractions::FieldType;
+use capyctl_config::extractions::{FieldType, PROBE_FIELDS};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{Map, Value};
 
@@ -294,26 +294,23 @@ fn extraction_shape_valid(reference: &StoredExtractionCanary) -> bool {
         && !reference.declared.is_empty()
         && reference.declared.windows(2).all(|pair| pair[0] < pair[1])
         && reference.answers.len() == reference.declared.len()
-        && reference.declared.iter().all(|kind| {
-            let name = match kind {
-                FieldType::Text => "order_id",
-                FieldType::Number => "amount_paid",
-                FieldType::Date => "delivered_on",
-                FieldType::Time => "delivered_time",
-                FieldType::Datetime => "delivered_at",
-                FieldType::Duration => "days_waited",
-                FieldType::List => "damage",
-                FieldType::Estimate => "returns_today",
-                FieldType::Forecast => "returns_next",
-            };
-            reference
-                .answers
-                .get(name)
-                .and_then(Value::as_object)
-                .and_then(|answer| answer.get("type"))
-                .and_then(Value::as_str)
-                == Some(kind.name())
-        })
+        && PROBE_FIELDS
+            .iter()
+            .filter(|(kind, _)| reference.declared.contains(kind))
+            .all(|(kind, name)| {
+                let answer = if reference.probe_version == 1 {
+                    reference.answers.get(*name)
+                } else {
+                    reference.answers.values().find(|answer| {
+                        answer.get("type").and_then(Value::as_str) == Some(kind.name())
+                    })
+                };
+                answer
+                    .and_then(Value::as_object)
+                    .and_then(|answer| answer.get("type"))
+                    .and_then(Value::as_str)
+                    == Some(kind.name())
+            })
 }
 
 /// A single-launch instance whose wake ended uncertain and whose stop is
@@ -1078,6 +1075,40 @@ mod tests {
             ));
         }
         assert_eq!(store.wake_canary("d", 0, 1, "inc").unwrap(), None);
+    }
+
+    // T50 / ADR 0041 §4: future probes retain their own names, not version 1's.
+    #[test]
+    fn a_future_extraction_probe_uses_its_own_field_names() {
+        let store = store_with_instance(1);
+        let mut future = extraction();
+        future.probe_version = 2;
+        let amount = future.answers.remove("amount_paid").unwrap();
+        future.answers.insert("future_amount".into(), amount);
+        let reference = WakeCanaryReference::Extraction(future.clone());
+        assert!(store
+            .record_wake_canary("d", 0, 1, "inc", &reference, 1)
+            .unwrap());
+        assert_eq!(
+            store.wake_canary("d", 0, 1, "inc").unwrap(),
+            Some(reference)
+        );
+
+        // The version-independent shape and declared types still apply.
+        for invalid in [serde_json::json!({"type": "text"}), Value::Null] {
+            future.answers["future_amount"] = invalid;
+            assert!(matches!(
+                store.record_wake_canary(
+                    "d",
+                    0,
+                    1,
+                    "other-inc",
+                    &WakeCanaryReference::Extraction(future.clone()),
+                    2
+                ),
+                Err(StoreError::Conflict)
+            ));
+        }
     }
 
     // T47, T20 (ADR 0036 §6): a relative distance within the tolerance

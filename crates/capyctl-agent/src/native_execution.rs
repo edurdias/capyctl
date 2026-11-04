@@ -6076,6 +6076,101 @@ mod tests {
         assert_eq!(custom::custom_key(&unkeyed, Some(&keys)), None);
     }
 
+    // T50: a valid answer may retain unknown members, but the host must not
+    // turn more than 256 KiB of extraction evidence into a protocol result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn extraction_evidence_over_the_protocol_bound_is_refused() {
+        use capyctl_domain::completion::Milestone;
+        let answer = Arc::new(std::sync::Mutex::new(serde_json::json!({
+            "answers": {"amount_paid": {
+                "type": "number", "value": 649, "guess": 649,
+                "p_null": 0.01, "confidence": 0.99
+            }}
+        })));
+        let reply = answer.clone();
+        let app = axum::Router::new().route(
+            "/v1/systemone",
+            axum::routing::post(move || {
+                let body = reply.lock().unwrap().clone();
+                async move { axum::Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, mut deployment, policy) = custom_fixture(
+            root.path(),
+            identity_dir.path(),
+            "kind: custom_engine\nschema_version: 1\napi: extractions\n\
+             field_types: [number]\n\
+             args: [--host, \"{host}\", --port, \"{port}\", --model, \"{model_dir}\"]\n",
+        );
+        deployment["api"] = "extractions".into();
+        let (launch, _) = custom_launch(root.path(), &deployment, &policy, port);
+        let session = executor.journal.connect().unwrap();
+        executor.connected(session).unwrap();
+        let now = capyctl_protocol::now_unix_ms();
+        let Acceptance::Fresh(ticket) = executor
+            .journal
+            .accept(session, &launch, now, &Sleeper)
+            .unwrap()
+        else {
+            panic!("a fresh launch");
+        };
+        executor.journal.execute(ticket, now, &Sleeper).unwrap();
+        let processes: Vec<_> = executor
+            .journal
+            .inspect_owned("launch")
+            .unwrap()
+            .into_iter()
+            .map(|(identity, _)| identity)
+            .collect();
+        let _kill = KillOnDrop(processes[0].pid);
+        let mut ready = probed(&processes[0]);
+        ready.identities = processes;
+        ready.facts = vec![
+            Milestone::AllocationsRestored,
+            Milestone::WeightsUsable,
+            Milestone::CacheValid,
+            Milestone::ModelUsable,
+        ];
+        executor
+            .journal
+            .record_launch_ready(session, "launch", &ready)
+            .unwrap();
+        executor
+            .identities
+            .provision(
+                &executor.scope(&launch).unwrap(),
+                launch.identity.payload_digest,
+                [7; 32],
+            )
+            .unwrap();
+        let mut probe = MemberCommand {
+            identity: checkpoint_identity("extraction-probe", "ready"),
+            action: MemberAction::Probe {
+                owned_handle: "launch".into(),
+                max_tokens: None,
+                decision: false,
+                embedding: false,
+                extraction: true,
+            },
+        };
+        probe.identity.profile_fingerprint = launch.identity.profile_fingerprint.clone();
+        probe.identity.payload_digest = probe.canonical_digest();
+        let small = executor.extract(&probe, "launch").await.unwrap();
+        assert!(small.answers_json.len() < capyctl_protocol::execution::EXTRACTION_PROBE_MAX_BYTES);
+        answer.lock().unwrap()["answers"]["amount_paid"]["extra"] =
+            serde_json::json!("x".repeat(capyctl_protocol::execution::EXTRACTION_PROBE_MAX_BYTES));
+        assert!(matches!(
+            executor.extract(&probe, "launch").await,
+            Err(SessionError)
+        ));
+        server.abort();
+    }
+
     /// ADR 0038 §4: Qwen3-4B's `config.json`, a full-attention decoder.
     const QWEN3_4B_CONFIG: &str = r#"{"architectures": ["Qwen3ForCausalLM"],
         "model_type": "qwen3", "num_hidden_layers": 36, "num_attention_heads": 32,

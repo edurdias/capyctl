@@ -1106,6 +1106,11 @@ async fn add_custom(target: &Target, request: CustomAdd<'_>) -> Result<Value, St
         "deep_park": "disabled",
         "engines_file": written,
     });
+    // ADR 0041 §2: the declared field types are part of what the administrator
+    // approves, so they are shown beside the API.
+    if let Some(types) = &manifest.field_types {
+        out["field_types"] = json!(types);
+    }
     // ADR 0031 §8: the approval is this summary, confirmed on a terminal.
     let mut summary = format!(
         "custom engine {name}\n  executable:   {}\n  arguments:    {}\n  api:          {}\n  version:      {}\n  environment:  {}\n  approved env: {}\n  pinned root:  {}\n  interpreter:  {}\n  installation: {installation}\n  idle signal:  {}\n  engine key:   {}\n  drift:        {}\n",
@@ -1124,6 +1129,10 @@ async fn add_custom(target: &Target, request: CustomAdd<'_>) -> Result<Value, St
         if manifest.uses_api_key() { key.to_owned() } else { format!("none ({NO_KEY_CAVEAT})") },
         out["installation_drift"].as_str().unwrap_or_default(),
     );
+    if let Some(types) = &manifest.field_types {
+        let names: Vec<&str> = types.iter().map(|t| t.name()).collect();
+        summary.push_str(&format!("  field types:  {}\n", names.join(", ")));
+    }
     // ADR 0031 §7: a key in the argument vector is readable by every local user.
     if manifest.api_key_in_args() {
         let warning = "the engine key is in the argument list, visible to every local user in \

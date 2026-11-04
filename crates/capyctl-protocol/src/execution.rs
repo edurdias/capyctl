@@ -1337,14 +1337,15 @@ pub const EXTRACTION_PROBE_MAX_BYTES: usize = 256 * 1024;
 pub const EXTRACTION_PROBE_VERSION: u32 = 1;
 
 fn extraction_evidence_ok(evidence: &pb::ExtractionProbeEvidence) -> bool {
-    const TYPES: [&str; 9] = [
-        "text", "number", "date", "time", "datetime", "duration", "list", "estimate", "forecast",
-    ];
+    use capyctl_config::extractions::FieldType;
     let mut previous = None;
     evidence.probe_version == EXTRACTION_PROBE_VERSION
         && !evidence.declared_field_types.is_empty()
         && evidence.declared_field_types.iter().all(|name| {
-            let Some(index) = TYPES.iter().position(|candidate| candidate == name) else {
+            let Some(index) = FieldType::ALL
+                .iter()
+                .position(|candidate| candidate.name() == name)
+            else {
                 return false;
             };
             let ordered = previous.is_none_or(|last| last < index);

@@ -489,7 +489,14 @@ mod tests {
     // 0.05 boundaries, and compares every forecast representation recorded.
     #[test]
     fn extraction_tolerances_are_inclusive_and_changes_beyond_them_fail() {
-        let initial = extracted();
+        let mut initial = extracted();
+        // Compare exact binary differences: decimal 0.9 - 0.85 is slightly
+        // larger than 0.05 and must not widen the production tolerance.
+        initial.answers["amount_paid"]["p_null"] = 0.0.into();
+        initial.answers["amount_paid"]["confidence"] = 0.0.into();
+        initial.answers["returns_today"]["p_below"] = 0.0.into();
+        initial.answers["returns_next"]["p_above"] = 0.0.into();
+        initial.answers["returns_next"]["steps"][0]["p_below"] = 0.0.into();
         let recorded = reference(&CanaryEvidence::Extraction(initial.clone()));
         assert_eq!(
             verdict(
@@ -499,13 +506,13 @@ mod tests {
             Verdict::Matches
         );
         let mut close = initial.clone();
-        close.answers["amount_paid"]["p_null"] = 0.30.into();
-        close.answers["amount_paid"]["confidence"] = 0.85.into();
+        close.answers["amount_paid"]["p_null"] = 0.05.into();
+        close.answers["amount_paid"]["confidence"] = 0.05.into();
         // Whether the scalar's value is null is not part of wake comparison.
         close.answers["amount_paid"]["value"] = serde_json::Value::Null;
-        close.answers["returns_today"]["p_below"] = 0.15.into();
-        close.answers["returns_next"]["p_above"] = 0.15.into();
-        close.answers["returns_next"]["steps"][0]["p_below"] = 0.15.into();
+        close.answers["returns_today"]["p_below"] = 0.05.into();
+        close.answers["returns_next"]["p_above"] = 0.05.into();
+        close.answers["returns_next"]["steps"][0]["p_below"] = 0.05.into();
         for member in ["value", "median", "p10", "p90"] {
             let estimate = &mut close.answers["returns_today"][member];
             *estimate = (estimate.as_i64().unwrap() + 1).into();
@@ -527,7 +534,7 @@ mod tests {
             Verdict::Matches
         );
         let mut probability = initial.clone();
-        probability.answers["amount_paid"]["p_null"] = 0.3001.into();
+        probability.answers["amount_paid"]["p_null"] = f64::from_bits(0.05f64.to_bits() + 1).into();
         let mut estimate = initial.clone();
         estimate.answers["returns_today"]["value"] = 15.into();
         let mut forecast = initial;

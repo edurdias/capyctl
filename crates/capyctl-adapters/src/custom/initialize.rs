@@ -172,13 +172,13 @@ pub(super) async fn initialize(
         identities,
         observed_at_ms: now_ms()?,
         receipt: format!(
-            "custom engine {} ready on {}; {} probe answered; listeners on loopback",
+            "custom engine {} ready on {}; {}probe answered; listeners on loopback",
             adapter.fingerprint(),
             adapter.endpoint(),
             if adapter.extractions() {
-                "fixed extraction"
+                "fixed extraction "
             } else {
-                "API"
+                ""
             }
         ),
         facts: vec![

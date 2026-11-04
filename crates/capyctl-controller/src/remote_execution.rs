@@ -86,6 +86,22 @@ impl RemoteLaunchBinding {
             DeploymentApi::Chat
         }
     }
+    /// ADR 0030 §1, ADR 0036 §1, ADR 0041 §1: gate every launch and
+    /// residency command on its frozen API and custom-engine declaration.
+    fn api_needs(&self, needs: &mut Vec<&'static str>) {
+        if self.decisions {
+            needs.push(capabilities::DECISIONS);
+        }
+        if self.embeddings {
+            needs.push(capabilities::EMBEDDINGS);
+        }
+        if !self.extraction_types.is_empty() {
+            needs.push(capabilities::EXTRACTIONS);
+        }
+        if self.custom_engine {
+            needs.push(capabilities::CUSTOM_ENGINES);
+        }
+    }
     /// ADR 0033 §13: the capabilities the deployment's declared `lmcache`
     /// and `retention` need of the host.
     fn lmcache_needs(&self, needs: &mut Vec<&'static str>) {
@@ -373,18 +389,7 @@ impl RemoteEngine {
         if b.device_memory {
             needs.push(capabilities::DEVICE_MEMORY_DOMAINS);
         }
-        if b.decisions {
-            needs.push(capabilities::DECISIONS);
-        }
-        if b.embeddings {
-            needs.push(capabilities::EMBEDDINGS);
-        }
-        if !b.extraction_types.is_empty() {
-            needs.push(capabilities::EXTRACTIONS);
-        }
-        if b.custom_engine {
-            needs.push(capabilities::CUSTOM_ENGINES);
-        }
+        b.api_needs(&mut needs);
         if b.tensorfold_native {
             needs.push(capabilities::TENSORFOLD_NATIVE);
         }
@@ -598,22 +603,7 @@ impl EngineAdapter for RemoteEngine {
         if b.device_memory {
             needs.push(capabilities::DEVICE_MEMORY_DOMAINS);
         }
-        if b.decisions {
-            needs.push(capabilities::DECISIONS);
-        }
-        if b.embeddings {
-            needs.push(capabilities::EMBEDDINGS);
-        }
-        // ADR 0041 §1: both the custom-engine and extraction capabilities
-        // are required before sending anything for this launch.
-        if !b.extraction_types.is_empty() {
-            needs.push(capabilities::EXTRACTIONS);
-        }
-        // ADR 0031 §9: a custom engine's launch goes only to a host that
-        // declared `custom_engines`.
-        if b.custom_engine {
-            needs.push(capabilities::CUSTOM_ENGINES);
-        }
+        b.api_needs(&mut needs);
         // ADR 0039 §15: a native TensorFold launch goes only to a host that
         // declared `tensorfold_native`.
         if b.tensorfold_native {
@@ -711,10 +701,10 @@ impl EngineAdapter for RemoteEngine {
         }
         launch_evidence(&result)?;
         let mut receipt = remote_receipt(&result, &devices)?;
-        // ADR 0041 §4: the receipt names the fixed extraction that proved
-        // readiness, rather than implying that port health alone sufficed.
+        // ADR 0041 §4: readiness here is the authenticated host's report,
+        // not an extraction answer independently observed by the server.
         if !b.extraction_types.is_empty() {
-            receipt.push_str("; fixed extraction of the declared field types answered");
+            receipt.push_str("; host reported the fixed extraction probe answered");
         }
         // SPEC §13.2 (G2): this readiness belongs to the host session that
         // proved it; a later session must re-prove it before dispatch.
@@ -1472,12 +1462,6 @@ fn remote_launch(
     work: &capyctl_store::ordinary_lifecycle::worker::InitializeWork,
     host_takes_split: bool,
 ) -> Result<RemoteLaunchBinding, CoordinatorError> {
-    // ADR 0041 §§3–5: no extraction launch may use the chat-only remote binding.
-    if work.effective().api == capyctl_config::effective::DeploymentApi::Extractions {
-        return Err(CoordinatorError::Service(
-            "remote extraction execution is unsupported".into(),
-        ));
-    }
     let denied = || CoordinatorError::Service("remote frozen binding unavailable".into());
     let owner = owner.lock().map_err(|_| denied())?;
     let host = &work.effective().host.name;
@@ -2015,6 +1999,7 @@ mod tests {
     fn remote_work(
         topology: Option<serde_json::Value>,
         layout: capyctl_domain::member_weights::CheckpointLayout,
+        custom: Option<capyctl_config::custom::CustomProfile>,
     ) -> (
         tempfile::TempDir,
         SharedCoordinatorState,
@@ -2050,6 +2035,16 @@ mod tests {
         ))
         .unwrap();
         let mut host = golden["input"]["host"].clone();
+        if let Some(custom) = &custom {
+            let profile = &mut host["runtime_profiles"]["local"];
+            profile["engine"] = json!("custom");
+            profile["executable"] = json!("/opt/extract/bin/extract-serve");
+            profile["build_fingerprint"] = json!(custom.manifest.build_fingerprint());
+            profile["args"] = json!([]);
+            profile["env"] = json!({});
+            profile["security"]["deep_park"] = json!("disabled");
+            profile["custom"] = serde_json::to_value(custom).unwrap();
+        }
         host["resource_policy"]["domains"] = json!({
             "system": {"memory": "distinct", "managed_limit": "200GiB", "free_reserve": "8GiB",
                        "parked_limit": "64GiB"},
@@ -2155,6 +2150,12 @@ mod tests {
             config["residency"] = json!("restart_only");
             config["instances"] = json!(1);
             config["placement"] = json!({"hosts": ["spark"]});
+            if let Some(custom) = &custom {
+                config["api"] = json!(custom.manifest.api);
+                config["engine_config"] = json!({"context_length": 4096});
+                config["devices"] = json!([{"id": "gpu0", "sharing": "shared"}]);
+                config["resources"] = json!({"gpu": "10GiB", "ram": "1GiB"});
+            }
             if let Some(topology) = topology {
                 config["topology"] = topology;
             }
@@ -2243,8 +2244,11 @@ mod tests {
     // derives the same per-GPU share.
     #[test]
     fn a_remote_launch_on_two_gpus_sends_its_sets_document_devices_and_layout() {
-        let (_dir, owned, host, work) =
-            remote_work(Some(serde_json::json!({"tensor_parallel": 2})), layout());
+        let (_dir, owned, host, work) = remote_work(
+            Some(serde_json::json!({"tensor_parallel": 2})),
+            layout(),
+            None,
+        );
         assert_eq!(work.effective().local_tensor_parallel(), 2);
         let launch = remote_launch(&owned, "controller", &work, true).unwrap();
         assert_eq!(launch.plan.devices, ["gpu0", "gpu1"]);
@@ -2282,7 +2286,7 @@ mod tests {
     // command encodes exactly as it did before this ADR.
     #[test]
     fn a_remote_launch_on_one_gpu_is_unchanged() {
-        let (_dir, owned, host, work) = remote_work(None, layout());
+        let (_dir, owned, host, work) = remote_work(None, layout(), None);
         assert_eq!(work.effective().local_tensor_parallel(), 1);
         let launch = remote_launch(&owned, "controller", &work, true).unwrap();
         assert!(launch.plan.devices.is_empty());
@@ -2411,6 +2415,38 @@ mod tests {
         let mut effective = resolve();
         apply_planned_startup(&mut effective, old.plan.startup_bytes, None);
         assert!(startup_over_limit(&effective).is_some());
+    }
+    // T50: production resolution must carry the frozen manifest's canonical
+    // set into the launch, requiring both host capabilities before dispatch.
+    #[test]
+    fn a_remote_extraction_launch_uses_its_frozen_manifest_and_capabilities() {
+        use capyctl_config::custom::{CustomManifest, CustomProfile};
+        use capyctl_config::extractions::FieldType;
+        let custom = CustomProfile::new(
+            CustomManifest::parse(
+                "kind: custom_engine\nschema_version: 1\napi: extractions\n\
+                 field_types: [number, text]\n\
+                 args: [--host, \"{host}\", --port, \"{port}\", --model, \"{model_dir}\"]\n",
+            )
+            .unwrap(),
+        );
+        let (_dir, owned, _host, work) = remote_work(None, layout(), Some(custom));
+        let launch = remote_launch(&owned, "controller", &work).unwrap();
+        let frozen = work.effective().profile.custom.as_ref().unwrap();
+        assert_eq!(
+            launch.extraction_types,
+            frozen.manifest.field_types.as_ref().unwrap().as_slice()
+        );
+        assert_eq!(
+            launch.extraction_types,
+            [FieldType::Text, FieldType::Number]
+        );
+        let mut needs = Vec::new();
+        launch.api_needs(&mut needs);
+        assert_eq!(
+            needs,
+            [capabilities::EXTRACTIONS, capabilities::CUSTOM_ENGINES]
+        );
     }
     fn observed(role: &str, pid: u32, presence: &str) -> pb::OwnedProcessObservation {
         pb::OwnedProcessObservation {

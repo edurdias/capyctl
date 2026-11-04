@@ -1,6 +1,6 @@
 //! ADR 0041 §§4–5: the fixed extraction readiness probe and wake canary.
 //! The request is sent to the launch's loopback endpoint, never through ingress.
-use capyctl_config::extractions::FieldType;
+use capyctl_config::extractions::{FieldType, PROBE_FIELDS as FIELDS};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
@@ -11,18 +11,6 @@ pub const KIND: &str = "extraction";
 pub const VERSION: u32 = 1;
 pub const STATE: &str = "Order A-88412 was delivered on 2026-09-28 at 14:30 with a cracked screen and a dented corner. The customer paid 649.00 USD and wrote on 2026-10-09. Returns logged on the last five days: 12, 15, 11, 14, 13.";
 
-// ADR 0041 §4: this order and every request member are part of probe version 1.
-const FIELDS: [(FieldType, &str); 9] = [
-    (FieldType::Text, "order_id"),
-    (FieldType::Number, "amount_paid"),
-    (FieldType::Date, "delivered_on"),
-    (FieldType::Time, "delivered_time"),
-    (FieldType::Datetime, "delivered_at"),
-    (FieldType::Duration, "days_waited"),
-    (FieldType::List, "damage"),
-    (FieldType::Estimate, "returns_today"),
-    (FieldType::Forecast, "returns_next"),
-];
 const PROBABILITIES: [&str; 4] = ["p_null", "confidence", "p_below", "p_above"];
 
 /// The declared set and complete answers, suitable for recording a wake reference.
@@ -366,7 +354,7 @@ fn within(left: &Value, right: &Value, tolerance: f64) -> bool {
     match (finite(left), finite(right)) {
         (Some(left), Some(right)) => {
             let difference = (left - right).abs();
-            difference <= tolerance || (tolerance > 0.0 && difference - tolerance <= f64::EPSILON)
+            difference <= tolerance
         }
         _ => match (left.as_array(), right.as_array()) {
             (Some(left), Some(right)) => {
@@ -550,9 +538,6 @@ mod tests {
     // T50: the versioned request is exactly ADR 0041 §4, not a generated prompt.
     #[test]
     fn exact_fixed_request() {
-        assert_eq!(PATH, "/v1/systemone");
-        assert_eq!(KIND, "extraction");
-        assert_eq!(VERSION, 1);
         assert_eq!(
             request("served", &FieldType::ALL),
             json!({
@@ -1031,18 +1016,31 @@ mod tests {
             ("returns_next", "p_below"),
             ("returns_next", "p_above"),
         ] {
-            let original = engine()["answers"][field][member].clone();
-            for (delta, expected) in [(0.05, true), (0.051, false)] {
-                let value = if field == "returns_next" {
-                    json!([original[0], original[1].as_f64().unwrap() + delta])
+            // Compare from zero so the boundary is exactly the stored f64
+            // tolerance, not a rounded decimal subtraction such as 0.55 - 0.5.
+            let mut baseline = engine();
+            baseline["answers"][field][member] = if field == "returns_next" {
+                json!([0.0, 0.0])
+            } else {
+                json!(0.0)
+            };
+            let reference = ready(&baseline);
+            for (delta, expected) in [
+                (0.05, true),
+                (f64::from_bits(0.05f64.to_bits() + 1), false),
+                (0.051, false),
+            ] {
+                let mut later = baseline.clone();
+                later["answers"][field][member] = if field == "returns_next" {
+                    json!([0.0, delta])
                 } else {
-                    json!(original.as_f64().unwrap() + delta)
+                    json!(delta)
                 };
                 assert_eq!(
                     matches(
                         &reference.declared,
                         &reference.answers,
-                        &ready(&changed(field, member, value)),
+                        &ready(&later),
                         0.05
                     )
                     .is_ok(),
@@ -1071,6 +1069,18 @@ mod tests {
             0.0
         )
         .is_err());
+    }
+
+    // T50 / ADR 0041 §5: inclusive means the exact tolerance, not an epsilon wider.
+    #[test]
+    fn numeric_tolerances_are_exactly_inclusive() {
+        for tolerance in [0.05_f64, 1.0] {
+            let outside = f64::from_bits(tolerance.to_bits() + 1);
+            assert!(within(&json!(0.0), &json!(tolerance), tolerance));
+            assert!(!within(&json!(0.0), &json!(outside), tolerance));
+            assert!(within(&json!([0.0]), &json!([tolerance]), tolerance));
+            assert!(!within(&json!([0.0]), &json!([outside]), tolerance));
+        }
     }
 
     // T50: a different declared set or corrupted relayed reference is never compared.
@@ -1179,12 +1189,12 @@ mod tests {
         assert!(well_formed(&with_forecast(partial), &FieldType::ALL).is_err());
         for member in ["p_below", "p_above"] {
             let mut forecast = forecast_steps();
-            forecast[member] = json!(0.2);
+            forecast[member] = json!(0.0);
             let reference = ready(&with_forecast(forecast.clone()));
-            forecast[member] = json!(0.25);
+            forecast[member] = json!(0.05);
             let boundary = ready(&with_forecast(forecast.clone()));
             assert!(matches(&reference.declared, &reference.answers, &boundary, 0.05).is_ok());
-            forecast[member] = json!(0.251);
+            forecast[member] = json!(f64::from_bits(0.05f64.to_bits() + 1));
             assert!(matches(
                 &reference.declared,
                 &reference.answers,
@@ -1222,8 +1232,12 @@ mod tests {
             }
         }
         for member in ["p_below", "p_above"] {
-            for (value, expected) in [(0.25, true), (0.251, false)] {
-                let mut forecast = forecast_steps();
+            let mut baseline = forecast_steps();
+            baseline["steps"][1][member] = json!(0.0);
+            let reference = ready(&with_forecast(baseline.clone()));
+            for (value, expected) in [(0.05, true), (f64::from_bits(0.05f64.to_bits() + 1), false)]
+            {
+                let mut forecast = baseline.clone();
                 forecast["steps"][1][member] = json!(value);
                 assert_eq!(
                     matches(

@@ -650,8 +650,9 @@ impl EngineAdapter for VllmAdapter {
         bound: std::time::Duration,
     ) -> Result<crate::completion_probe::CanaryAnswer, RuntimeError> {
         use crate::completion_probe::{CanaryAnswer, CanaryEvidence};
-        let answer = if self.decisions() {
-            CanaryEvidence::Decision(
+        use capyctl_config::effective::DeploymentApi;
+        let answer = match self.api {
+            DeploymentApi::Decisions => CanaryEvidence::Decision(
                 crate::traits::ChatForward::decision_probe(self, self.served_model(), bound)
                     .await
                     .map_err(|e| {
@@ -659,9 +660,8 @@ impl EngineAdapter for VllmAdapter {
                             "vLLM did not answer the decision probe: {e}"
                         )))
                     })?,
-            )
-        } else if self.embeddings() {
-            CanaryEvidence::Embedding(
+            ),
+            DeploymentApi::Embeddings => CanaryEvidence::Embedding(
                 crate::traits::ChatForward::embedding_probe(self, self.served_model(), bound)
                     .await
                     .map_err(|e| {
@@ -669,9 +669,9 @@ impl EngineAdapter for VllmAdapter {
                             "vLLM did not answer the embedding probe: {e}"
                         )))
                     })?,
-            )
-        } else {
-            CanaryEvidence::Generated(
+            ),
+            DeploymentApi::Extractions => return Err(RuntimeError::Unsupported),
+            DeploymentApi::Chat => CanaryEvidence::Generated(
                 crate::traits::ChatForward::complete_probe(
                     self,
                     self.served_model(),
@@ -684,7 +684,7 @@ impl EngineAdapter for VllmAdapter {
                         "vLLM did not answer the wake canary: {e}"
                     )))
                 })?,
-            )
+            ),
         };
         let observed_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

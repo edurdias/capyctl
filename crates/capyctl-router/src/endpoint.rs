@@ -44,12 +44,12 @@ impl Endpoint {
     }
 
     /// The endpoint a deployment serving `api` answers.
-    pub const fn serving(api: DeploymentApi) -> Option<Self> {
+    pub const fn serving(api: DeploymentApi) -> Self {
         match api {
-            DeploymentApi::Chat => Some(Self::ChatCompletions),
-            DeploymentApi::Decisions => Some(Self::Decisions),
-            DeploymentApi::Embeddings => Some(Self::Embeddings),
-            DeploymentApi::Extractions => Some(Self::Extractions),
+            DeploymentApi::Chat => Self::ChatCompletions,
+            DeploymentApi::Decisions => Self::Decisions,
+            DeploymentApi::Embeddings => Self::Embeddings,
+            DeploymentApi::Extractions => Self::Extractions,
         }
     }
 
@@ -65,11 +65,10 @@ impl Endpoint {
             Self::ChatCompletions => crate::chat::validate_request(body),
             Self::Decisions => capyctl_adapters::forward::validate_decision_request(body)
                 .map_err(|refusal| crate::chat::refusal("invalid_request", &refusal.to_string())),
-            Self::Extractions => capyctl_adapters::extraction_request::validate_extraction_request(
-                body,
-                &capyctl_config::extractions::FieldType::ALL,
-            )
-            .map_err(|refusal| crate::chat::refusal("invalid_request", &refusal.to_string())),
+            Self::Extractions => Err(crate::chat::refusal(
+                "invalid_request",
+                "extraction validation requires the deployment's declared field types",
+            )),
             Self::Embeddings => capyctl_adapters::embedding_request::validate_embedding_request(
                 body,
             )
@@ -96,28 +95,21 @@ pub(crate) fn check_api(
     if api == endpoint.api() {
         return Ok(());
     }
-    Err(crate::chat::refusal(
+    Err(api_mismatch(api, model, endpoint))
+}
+
+pub(crate) fn api_mismatch(
+    api: DeploymentApi,
+    model: &str,
+    endpoint: Endpoint,
+) -> (StatusCode, Json<serde_json::Value>) {
+    crate::chat::refusal(
         "api_mismatch",
         &format!(
             "model {model} serves the {} API, which {} does not answer; send its requests to POST {}",
             api.name(),
             endpoint.path(),
-            Endpoint::serving(api).map_or("/v1/systemone", Endpoint::path),
+            Endpoint::serving(api).path(),
         ),
-    ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // T50 / ADR 0041 §3: the extraction API selects its own System One contract.
-    #[test]
-    fn extractions_select_systemone() {
-        assert_eq!(
-            Endpoint::serving(DeploymentApi::Extractions),
-            Some(Endpoint::Extractions)
-        );
-        assert_eq!(Endpoint::Extractions.path(), Endpoint::Decisions.path());
-    }
+    )
 }

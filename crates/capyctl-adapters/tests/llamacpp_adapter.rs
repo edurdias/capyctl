@@ -618,6 +618,29 @@ async fn an_embeddings_launch_is_ready_only_on_a_well_formed_embedding() {
     }
 }
 
+// T50 / ADR 0041 §1: a native extraction canary never falls back to chat.
+#[tokio::test]
+async fn an_extractions_canary_is_unsupported_without_an_engine_probe() {
+    use capyctl_config::effective::DeploymentApi;
+    let (stub, port) = stub_engine(|_| {}).await;
+    let root = tempfile::tempdir().unwrap();
+    let adapter = adapter(port, root.path()).with_api(DeploymentApi::Extractions);
+    let result = adapter
+        .wake_canary(
+            &initialize_command(30_000).context,
+            8,
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(RuntimeError::Unsupported)),
+        "{result:?}"
+    );
+    assert_eq!(stub.chats.load(Ordering::SeqCst), 0);
+    assert_eq!(stub.decisions.load(Ordering::SeqCst), 0);
+    assert_eq!(stub.embeddings.load(Ordering::SeqCst), 0);
+}
+
 // T42 (SPEC §6.4): an engine that exits before readiness fails the launch
 // with its summary, naming the option llama-server's parser refused.
 #[tokio::test]

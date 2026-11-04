@@ -739,18 +739,25 @@ impl SglangAdapter {
             && (self.cpu_weight_backup || self.resident_weights);
         if command.action != RuntimeAction::Drain && !host_restored {
             let http = self.http.as_ref().ok_or_else(uncertain)?;
-            if command.action == RuntimeAction::Probe && self.decisions() {
-                // ADR 0030 §3, SPEC §6.1: a decisions launch is usable after
-                // a wake only on the fixed decision, never a chat answer.
-                http.decision_probe(timeout)
-                    .await
-                    .map_err(|_| uncertain())?;
-            } else if command.action == RuntimeAction::Probe && self.embeddings() {
-                // ADR 0036 §5, §7.2: an embeddings launch is usable after a
-                // wake only on the fixed embedding, never a generation.
-                http.embedding_probe(timeout)
-                    .await
-                    .map_err(|_| uncertain())?;
+            if command.action == RuntimeAction::Probe {
+                use capyctl_config::effective::DeploymentApi;
+                match self.api {
+                    // ADR 0030 §3, SPEC §6.1: a decisions wake is proved
+                    // only by the fixed decision, never a chat answer.
+                    DeploymentApi::Decisions => {
+                        http.decision_probe(timeout)
+                            .await
+                            .map_err(|_| uncertain())?;
+                    }
+                    // ADR 0036 §§5, 7.2: embeddings never use a generation.
+                    DeploymentApi::Embeddings => {
+                        http.embedding_probe(timeout)
+                            .await
+                            .map_err(|_| uncertain())?;
+                    }
+                    DeploymentApi::Extractions => return Err(RuntimeError::Unsupported),
+                    DeploymentApi::Chat => http.execute(command.action, timeout).await?,
+                }
             } else {
                 http.execute(command.action, timeout).await?;
             }
@@ -979,37 +986,43 @@ impl EngineAdapter for SglangAdapter {
         bound: std::time::Duration,
     ) -> Result<crate::completion_probe::CanaryAnswer, RuntimeError> {
         use crate::completion_probe::{CanaryAnswer, CanaryEvidence};
-        if self.decisions() {
-            return match ChatForward::decision_probe(self, &self.served_name, bound).await {
-                Ok(answer) => Ok(CanaryAnswer {
-                    answer: CanaryEvidence::Decision(answer),
-                    observed_at_ms: clock_ms()?,
-                }),
-                Err(e) => Err(RuntimeError::Uncertain(format!(
-                    "SGLang did not answer the decision probe: {e}"
-                ))),
-            };
-        }
-        if self.embeddings() {
-            return match ChatForward::embedding_probe(self, &self.served_name, bound).await {
-                Ok(answer) => Ok(CanaryAnswer {
-                    answer: CanaryEvidence::Embedding(answer),
-                    observed_at_ms: clock_ms()?,
-                }),
-                Err(e) => Err(RuntimeError::Uncertain(format!(
-                    "SGLang did not answer the embedding probe: {e}"
-                ))),
-            };
-        }
-        match ChatForward::complete_probe(self, "", max_tokens, bound).await {
-            Ok(answer) => Ok(CanaryAnswer {
-                answer: CanaryEvidence::Generated(answer),
-                observed_at_ms: clock_ms()?,
-            }),
-            Err(AdapterError::UnsupportedCapability) => Err(RuntimeError::Unsupported),
-            Err(e) => Err(RuntimeError::Uncertain(format!(
-                "SGLang did not answer the wake canary: {e}"
-            ))),
+        use capyctl_config::effective::DeploymentApi;
+        match self.api {
+            DeploymentApi::Decisions => {
+                match ChatForward::decision_probe(self, &self.served_name, bound).await {
+                    Ok(answer) => Ok(CanaryAnswer {
+                        answer: CanaryEvidence::Decision(answer),
+                        observed_at_ms: clock_ms()?,
+                    }),
+                    Err(e) => Err(RuntimeError::Uncertain(format!(
+                        "SGLang did not answer the decision probe: {e}"
+                    ))),
+                }
+            }
+            DeploymentApi::Embeddings => {
+                match ChatForward::embedding_probe(self, &self.served_name, bound).await {
+                    Ok(answer) => Ok(CanaryAnswer {
+                        answer: CanaryEvidence::Embedding(answer),
+                        observed_at_ms: clock_ms()?,
+                    }),
+                    Err(e) => Err(RuntimeError::Uncertain(format!(
+                        "SGLang did not answer the embedding probe: {e}"
+                    ))),
+                }
+            }
+            DeploymentApi::Extractions => Err(RuntimeError::Unsupported),
+            DeploymentApi::Chat => {
+                match ChatForward::complete_probe(self, "", max_tokens, bound).await {
+                    Ok(answer) => Ok(CanaryAnswer {
+                        answer: CanaryEvidence::Generated(answer),
+                        observed_at_ms: clock_ms()?,
+                    }),
+                    Err(AdapterError::UnsupportedCapability) => Err(RuntimeError::Unsupported),
+                    Err(e) => Err(RuntimeError::Uncertain(format!(
+                        "SGLang did not answer the wake canary: {e}"
+                    ))),
+                }
+            }
         }
     }
 }

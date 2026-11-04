@@ -1082,6 +1082,28 @@ async fn an_embeddings_launch_is_ready_only_on_the_fixed_embedding() {
     assert_eq!(stub.chats.load(Ordering::SeqCst), 1);
 }
 
+// T50 / ADR 0041 §1: a native extraction canary never falls back to chat.
+#[tokio::test]
+async fn an_extractions_canary_is_unsupported_without_an_engine_probe() {
+    use capyctl_config::effective::DeploymentApi;
+    let (stub, port) = serve_stub_embedding("gate-m", "k3y", None).await;
+    let adapter = adapter(port, Some("k3y")).with_api(DeploymentApi::Extractions);
+    let result = adapter
+        .wake_canary(
+            &initialize_command(30_000).context,
+            8,
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(RuntimeError::Unsupported)),
+        "{result:?}"
+    );
+    assert_eq!(stub.chats.load(Ordering::SeqCst), 0);
+    assert_eq!(stub.decisions.load(Ordering::SeqCst), 0);
+    assert!(stub.embeddings.lock().unwrap().is_empty());
+}
+
 /// Actions other than Initialize are refused for a launch-shaped step: Stop and
 /// Probe have no persisted vLLM path, and Park and Restore (W4, `vllm_residency.rs`)
 /// require retained identities and no launch settings. An adapter must never

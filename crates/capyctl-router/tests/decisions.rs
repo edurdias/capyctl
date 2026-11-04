@@ -25,6 +25,8 @@ struct Authority {
     api: DeploymentApi,
     ready: AtomicBool,
     activations: AtomicUsize,
+    route_reads: AtomicUsize,
+    api_reads: AtomicUsize,
     endpoint: String,
     leases: Mutex<Vec<Option<LeaseEnd>>>,
     request_limit: Mutex<Option<usize>>,
@@ -63,10 +65,17 @@ fn refuse(what: &str) -> LifecycleFault {
 
 #[async_trait::async_trait]
 impl capyctl_controller::LifecyclePort for Authority {
+    fn deployment_field_types(
+        &self,
+        _: &str,
+    ) -> Result<Vec<capyctl_config::extractions::FieldType>, LifecycleFault> {
+        Ok(Vec::new())
+    }
     fn find_deployment_by_route(
         &self,
         route: &str,
     ) -> Result<Option<capyctl_store::deployments::DeploymentRow>, LifecycleFault> {
+        self.route_reads.fetch_add(1, Ordering::SeqCst);
         Ok((route == ROUTE).then(|| self.row()))
     }
     fn list_enabled_routes(
@@ -79,6 +88,7 @@ impl capyctl_controller::LifecyclePort for Authority {
         }])
     }
     fn deployment_api(&self, deployment: &str) -> Result<DeploymentApi, LifecycleFault> {
+        self.api_reads.fetch_add(1, Ordering::SeqCst);
         assert_eq!(deployment, DEPLOYMENT);
         Ok(self.api)
     }
@@ -320,6 +330,8 @@ fn stack(api: DeploymentApi, endpoint: &str) -> (Arc<Authority>, RouterDeps, axu
         api,
         ready: AtomicBool::new(false),
         activations: AtomicUsize::new(0),
+        route_reads: AtomicUsize::new(0),
+        api_reads: AtomicUsize::new(0),
         endpoint: endpoint.into(),
         leases: Mutex::new(Vec::new()),
         request_limit: Mutex::new(None),
@@ -403,6 +415,8 @@ async fn a_fake_decision_model_becomes_ready_and_answers_through_the_router() {
         api: DeploymentApi::Decisions,
         ready: AtomicBool::new(false),
         activations: AtomicUsize::new(0),
+        route_reads: AtomicUsize::new(0),
+        api_reads: AtomicUsize::new(0),
         endpoint: "http://127.0.0.1:9".into(),
         leases: Mutex::new(Vec::new()),
         request_limit: Mutex::new(None),
@@ -482,6 +496,9 @@ async fn a_decision_is_admitted_forwarded_and_settled_like_chat() {
     let (status, body) = decide(&router, &sent).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(authority.activations.load(Ordering::SeqCst), 1);
+    // T50 / ADR 0041 §3: contract selection and admission share one frozen lookup.
+    assert_eq!(authority.route_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(authority.api_reads.load(Ordering::SeqCst), 1);
     let mut expected = sent.clone();
     expected["model"] = json!(SERVED);
     assert_eq!(
@@ -1009,4 +1026,46 @@ async fn unknown_model_precedes_a_malformed_decision_contract() {
     assert_eq!(body["code"], "unknown_model");
     assert_eq!(authority.activations.load(Ordering::SeqCst), 0);
     assert!(authority.ends().is_empty());
+}
+
+// T50: the System One ordering change must not alter the chat contract.
+#[tokio::test]
+async fn chat_and_embeddings_keep_their_empty_model_contract_refusal() {
+    let (authority, _deps, router) = stack(DeploymentApi::Chat, "http://127.0.0.1:9");
+    let mut request = chat_body(false);
+    request["model"] = json!("");
+    let (status, body) = send(
+        &router,
+        "/v1/chat/completions",
+        request.to_string().into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(body["message"], "malformed chat request: model is required");
+    let (status, body) = send(
+        &router,
+        "/v1/embeddings",
+        json!({"model": "", "input": "hello"})
+            .to_string()
+            .into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(
+        body["message"],
+        "malformed embeddings request: model is required"
+    );
+    let (status, body) = send(
+        &router,
+        "/v1/chat/completions",
+        json!({"model": "missing", "messages": [], "unsupported": true})
+            .to_string()
+            .into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(authority.activations.load(Ordering::SeqCst), 0);
 }

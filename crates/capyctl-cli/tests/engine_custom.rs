@@ -155,6 +155,34 @@ fn add_vllm(env: &Path, name: Option<&str>) -> Command {
     }
 }
 
+// T50 (ADR 0041 §2): the registration summary shows the canonical field
+// types the administrator approves, beside the extraction API.
+#[tokio::test]
+async fn add_custom_reports_the_extraction_field_types_for_confirmation() {
+    let dir = private_dir();
+    let marker = dir.path().join("ran");
+    let venv = venv(dir.path(), &marker);
+    let document = host_doc(dir.path());
+    let manifest = manifest_file(
+        dir.path(),
+        &MANIFEST.replace(
+            "api: decisions",
+            "api: extractions\nfield_types: [number, text]",
+        ),
+    );
+    let (_role, _stop) = role(&document, json!({"ok": true, "published": "published"})).await;
+    let out = execute(
+        &add_custom(&venv.executable, "extract-serve", &manifest),
+        Some(&document),
+        dir.path(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["api"], "extractions");
+    assert_eq!(out["field_types"], json!(["text", "number"]));
+    assert!(!marker.exists(), "confirmation must not execute the engine");
+}
+
 // T44 T07 (ADR 0031 §1, §3, §8, amendment A1): `engine add --custom --yes`
 // executes nothing (neither the program nor its interpreter), writes the
 // manifest and its digest into custom-engines.yaml, never touches

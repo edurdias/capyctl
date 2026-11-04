@@ -1008,11 +1008,6 @@ impl ChatHttp {
         body: &Value,
         trace: Option<&crate::traits::TraceHeaders>,
     ) -> Result<Value, AdapterError> {
-        crate::extraction_request::validate_extraction_request(
-            body,
-            &capyctl_config::extractions::FieldType::ALL,
-        )
-        .map_err(|_| AdapterError::UnsupportedCapability)?;
         self.systemone_traced(body, trace).await
     }
 

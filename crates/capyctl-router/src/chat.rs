@@ -59,6 +59,7 @@ pub async fn resolve_timed(
         deps,
         model,
         Endpoint::ChatCompletions,
+        None,
         body_bytes,
         tokio::time::Instant::now(),
         timing,
@@ -83,29 +84,44 @@ enum Resolution {
 /// in-flight slot keeps its place against the queue's bounds, or the instance
 /// view that found it servable at once. The wait ends at the request's queue
 /// deadline counted from `received` (SPEC §10: activation included).
+#[allow(clippy::too_many_arguments)]
 async fn resolve_held(
     deps: &RouterDeps,
     model: &str,
     endpoint: Endpoint,
+    resolved: Option<(
+        capyctl_store::deployments::DeploymentRow,
+        capyctl_config::effective::DeploymentApi,
+    )>,
     body_bytes: usize,
     received: tokio::time::Instant,
     timing: &mut RequestTiming,
     ids: &crate::request_id::RequestIds,
 ) -> Result<(String, Resolution), (StatusCode, Json<serde_json::Value>)> {
-    let row = deps
-        .controller
-        .find_deployment_by_route(model)
-        .map_err(|e| err("internal", &format!("store: {e}")))?
-        .ok_or_else(|| {
-            err(
-                "unknown_model",
-                &format!("no deployment serves model id {model}"),
-            )
-        })?;
+    let row = match resolved {
+        Some((row, api)) => {
+            if api != endpoint.api() {
+                return Err(crate::endpoint::api_mismatch(api, model, endpoint));
+            }
+            row
+        }
+        None => {
+            let row = deps
+                .controller
+                .find_deployment_by_route(model)
+                .map_err(|e| err("internal", &format!("store: {e}")))?
+                .ok_or_else(|| {
+                    err(
+                        "unknown_model",
+                        &format!("no deployment serves model id {model}"),
+                    )
+                })?;
+            // ADR 0030 §2: refuse before waiting or activation.
+            crate::endpoint::check_api(deps, &row.id, model, endpoint)?;
+            row
+        }
+    };
     let deployment_id = row.id.clone();
-    // ADR 0030 §2: the endpoint that does not serve the deployment's API is
-    // refused here, before the request waits or anything activates.
-    crate::endpoint::check_api(deps, &deployment_id, model, endpoint)?;
     timing.resolved(&deployment_id, &row.kind);
     // ADR 0037 §3: admission ends here; CapyCTL's names go on spans only
     // from now on (§5).
@@ -281,8 +297,31 @@ pub async fn admit_timed(
     ids: &crate::request_id::RequestIds,
 ) -> Result<(String, StaticStreamGuard, Option<InstanceView>), (StatusCode, Json<serde_json::Value>)>
 {
-    let (deployment_id, resolution) =
-        resolve_held(deps, model, endpoint, body_bytes, received, timing, ids).await?;
+    admit_resolved_timed(
+        deps, endpoint, model, body_bytes, received, timing, ids, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn admit_resolved_timed(
+    deps: &RouterDeps,
+    endpoint: Endpoint,
+    model: &str,
+    body_bytes: usize,
+    received: tokio::time::Instant,
+    timing: &mut RequestTiming,
+    ids: &crate::request_id::RequestIds,
+    resolved: Option<(
+        capyctl_store::deployments::DeploymentRow,
+        capyctl_config::effective::DeploymentApi,
+    )>,
+) -> Result<(String, StaticStreamGuard, Option<InstanceView>), (StatusCode, Json<serde_json::Value>)>
+{
+    let (deployment_id, resolution) = resolve_held(
+        deps, model, endpoint, resolved, body_bytes, received, timing, ids,
+    )
+    .await?;
     let (ticket, view) = match resolution {
         Resolution::Now(view) => (None, Some(view)),
         Resolution::Waited(ticket, queue_wait) => (Some((ticket, *queue_wait)), None),
@@ -415,14 +454,39 @@ pub async fn dispatch_timed(
     body: capyctl_adapters::request::InferenceRequest,
     body_bytes: usize,
     received: tokio::time::Instant,
-    mut timing: RequestTiming,
+    timing: RequestTiming,
     ids: std::sync::Arc<crate::request_id::RequestIds>,
 ) -> Result<
     (capyctl_adapters::answer::EngineAnswer, RequestTiming),
     (StatusCode, Json<serde_json::Value>),
 > {
+    dispatch_resolved_timed(
+        deps, endpoint, model, body, body_bytes, received, timing, ids, None,
+    )
+    .await
+}
+
+/// ADR 0041 §3: reuse the frozen deployment selected during System One validation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dispatch_resolved_timed(
+    deps: &RouterDeps,
+    endpoint: Endpoint,
+    model: &str,
+    body: capyctl_adapters::request::InferenceRequest,
+    body_bytes: usize,
+    received: tokio::time::Instant,
+    mut timing: RequestTiming,
+    ids: std::sync::Arc<crate::request_id::RequestIds>,
+    resolved: Option<(
+        capyctl_store::deployments::DeploymentRow,
+        capyctl_config::effective::DeploymentApi,
+    )>,
+) -> Result<
+    (capyctl_adapters::answer::EngineAnswer, RequestTiming),
+    (StatusCode, Json<serde_json::Value>),
+> {
     // SPEC §10 step 1 and T19: resolve, wait if needed, take an in-flight slot.
-    let (deployment_id, guard, view) = admit_timed(
+    let (deployment_id, guard, view) = admit_resolved_timed(
         deps,
         endpoint,
         model,
@@ -430,6 +494,7 @@ pub async fn dispatch_timed(
         received,
         &mut timing,
         &ids,
+        resolved,
     )
     .await?;
     // ADR 0013 §10 (I3): choose an instance, open its lease and resolve its

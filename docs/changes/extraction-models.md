@@ -23,6 +23,13 @@ the wake reference uses ADR 0041's typed comparisons and inclusive tolerances.
 SPEC amendments cover §6.1, §10, §15.1/§16 and T50; deployment, request,
 engine, error and operations pages document the contract.
 
+Remote launches resolve the declared types from the frozen custom manifest and
+require both host capabilities. The router retains its System One lookup through
+admission instead of repeating it; chat and embeddings keep their existing
+validation order. Extraction wake comparisons use the stated tolerance without
+widening it, and readiness receipts distinguish the host's report from evidence
+observed by the server.
+
 Registration shows field types for administrator confirmation. Before
 downgrading to a release without extraction support, remove every extraction
 engine with `capyctl engine remove`. Older releases refuse the whole

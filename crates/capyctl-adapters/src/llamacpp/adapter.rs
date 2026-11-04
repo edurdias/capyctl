@@ -246,8 +246,9 @@ impl EngineAdapter for LlamacppAdapter {
         bound: std::time::Duration,
     ) -> Result<crate::completion_probe::CanaryAnswer, RuntimeError> {
         use crate::completion_probe::{CanaryAnswer, CanaryEvidence};
-        let answer = if self.decisions() {
-            CanaryEvidence::Decision(
+        use capyctl_config::effective::DeploymentApi;
+        let answer = match self.api {
+            DeploymentApi::Decisions => CanaryEvidence::Decision(
                 self.http
                     .decision_probe(&self.model_id, bound)
                     .await
@@ -256,9 +257,8 @@ impl EngineAdapter for LlamacppAdapter {
                             "llama.cpp did not answer the decision probe: {e}"
                         ))
                     })?,
-            )
-        } else if self.embeddings() {
-            CanaryEvidence::Embedding(
+            ),
+            DeploymentApi::Embeddings => CanaryEvidence::Embedding(
                 self.http
                     .embedding_probe(&self.model_id, bound)
                     .await
@@ -267,9 +267,9 @@ impl EngineAdapter for LlamacppAdapter {
                             "llama.cpp did not answer the embedding probe: {e}"
                         ))
                     })?,
-            )
-        } else {
-            return Err(RuntimeError::Unsupported);
+            ),
+            DeploymentApi::Extractions => return Err(RuntimeError::Unsupported),
+            DeploymentApi::Chat => return Err(RuntimeError::Unsupported),
         };
         let observed_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

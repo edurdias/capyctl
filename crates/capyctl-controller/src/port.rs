@@ -141,10 +141,8 @@ pub trait LifecyclePort: Send + Sync {
     /// ADR 0041 §3: field types declared by the current frozen custom manifest.
     fn deployment_field_types(
         &self,
-        _deployment: &str,
-    ) -> Result<Vec<capyctl_config::extractions::FieldType>, LifecycleFault> {
-        Ok(Vec::new())
-    }
+        deployment: &str,
+    ) -> Result<Vec<capyctl_config::extractions::FieldType>, LifecycleFault>;
 
     /// One deployment's current record.
     fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, LifecycleFault>;

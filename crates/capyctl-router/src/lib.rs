@@ -189,6 +189,10 @@ struct Received {
     /// The size of the body as received.
     body_bytes: usize,
     endpoint: endpoint::Endpoint,
+    resolved: Option<(
+        capyctl_store::deployments::DeploymentRow,
+        capyctl_config::effective::DeploymentApi,
+    )>,
 }
 
 /// Authenticate, check the caller's request ID, read the body under its
@@ -233,13 +237,13 @@ async fn receive(
     let body_bytes = body.len();
     let request = capyctl_adapters::request::InferenceRequest::parse(body)
         .map_err(|e| err_json("invalid_request", &format!("bad json: {e}")))?;
-    let Some(model) = request["model"]
-        .as_str()
-        .filter(|model| !model.is_empty())
-        .map(str::to_owned)
-    else {
+    let Some(model) = request["model"].as_str().map(str::to_owned) else {
         return Err(err_json("invalid_request", "model is required"));
     };
+    let mut resolved = None;
+    if endpoint == endpoint::Endpoint::Decisions && model.is_empty() {
+        return Err(err_json("invalid_request", "model is required"));
+    }
     // ADR 0041 §3: System One selects its contract only after looking up
     // the frozen deployment API; unknown_model precedes contract errors.
     let endpoint = if endpoint == endpoint::Endpoint::Decisions {
@@ -263,8 +267,7 @@ async fn receive(
             }
             capyctl_config::effective::DeploymentApi::Decisions => endpoint::Endpoint::Decisions,
             _ => {
-                endpoint::check_api(deps, &deployment.id, &model, endpoint)?;
-                unreachable!("a non-System-One API was admitted");
+                return Err(endpoint::api_mismatch(api, &model, endpoint));
             }
         };
         if api == capyctl_config::effective::DeploymentApi::Extractions {
@@ -298,6 +301,7 @@ async fn receive(
         } else {
             selected.validate(&request)?;
         }
+        resolved = Some((deployment, api));
         selected
     } else {
         endpoint.validate(&request)?;
@@ -311,6 +315,7 @@ async fn receive(
         model,
         body_bytes,
         endpoint,
+        resolved,
     })
 }
 
@@ -344,6 +349,7 @@ async fn chat_completion(
         model,
         body_bytes,
         endpoint: _,
+        resolved: _,
     } = receive(deps, headers, ids, body, endpoint).await?;
     if v["stream"].as_bool() == Some(true) {
         // Streaming path: resolve + activate, then bridge the engine's SSE.
@@ -430,7 +436,7 @@ async fn decision(
     let endpoint = endpoint::Endpoint::Decisions;
     let received = receive(deps, headers, ids, body, endpoint).await?;
     let endpoint = received.endpoint;
-    let (mut answer, timing) = chat::dispatch_timed(
+    let (mut answer, timing) = chat::dispatch_resolved_timed(
         deps,
         endpoint,
         &received.model,
@@ -439,6 +445,7 @@ async fn decision(
         received.at,
         received.timing,
         ids.clone(),
+        received.resolved,
     )
     .await?;
     trace::record_answer(ids, &answer);

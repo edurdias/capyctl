@@ -475,6 +475,29 @@ async fn a_woken_embeddings_launch_is_proven_by_the_fixed_embedding() {
     }
 }
 
+// T50 / ADR 0041 §1: neither a post-wake probe nor a canary may use chat
+// for an unsupported extraction launch.
+#[tokio::test]
+async fn extraction_probes_are_unsupported_without_engine_requests() {
+    use capyctl_config::effective::DeploymentApi;
+    let f = Fixture::with_api(DeploymentApi::Extractions).await;
+    let probe = f.next(RuntimeAction::Probe, "probe");
+    let result = f.adapter.execute_persisted(&probe).await;
+    assert!(
+        matches!(result, Err(RuntimeError::Unsupported)),
+        "{result:?}"
+    );
+    let canary = f
+        .adapter
+        .wake_canary(&probe.context, 8, Duration::from_secs(5))
+        .await;
+    assert!(
+        matches!(canary, Err(RuntimeError::Unsupported)),
+        "{canary:?}"
+    );
+    assert!(f.requests().is_empty());
+}
+
 /// Discrete GPU design §5, ADR 0019: a `host_backed` launch parks to host RAM
 /// with SGLang's weights CPU backup. Release and resume carry both tags as for
 /// `deep`; the resume restores the weights from the pinned copy, so the reload

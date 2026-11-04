@@ -48,6 +48,20 @@ impl FieldType {
         }
     }
 }
+
+/// ADR 0041 §4: the canonical type order and fixed field names of probe version 1.
+pub const PROBE_FIELDS: [(FieldType, &str); 9] = [
+    (FieldType::Text, "order_id"),
+    (FieldType::Number, "amount_paid"),
+    (FieldType::Date, "delivered_on"),
+    (FieldType::Time, "delivered_time"),
+    (FieldType::Datetime, "delivered_at"),
+    (FieldType::Duration, "days_waited"),
+    (FieldType::List, "damage"),
+    (FieldType::Estimate, "returns_today"),
+    (FieldType::Forecast, "returns_next"),
+];
+
 fn invalid(path: &str, detail: impl Into<String>) -> ConfigError {
     ConfigError::new(ConfigErrorCode::UnsupportedCombination, path, detail)
 }

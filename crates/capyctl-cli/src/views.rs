@@ -480,6 +480,8 @@ fn engine_add(value: &Value) -> String {
     // ADR 0031 §8: a custom engine's command, API, environment and identity.
     .row("Arguments", words(&value["args"], " "))
     .row("API", s(&value["api"]))
+    // ADR 0041 §2: an extraction engine's declared field types.
+    .row("Field types", words(&value["field_types"], ", "))
     .row("Environment", words(&value["environment"], ", "))
     .row("Pinned root", s(&value["root"]))
     .row("Interpreter", s(&value["interpreter"]))

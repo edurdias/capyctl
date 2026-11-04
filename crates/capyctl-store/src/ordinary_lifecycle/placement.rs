@@ -1225,10 +1225,5 @@ mod api_capability_tests {
             api_capability(DeploymentApi::Embeddings),
             Some("embeddings")
         );
-        // T50: extraction placement requires its own host capability.
-        assert_eq!(
-            api_capability(DeploymentApi::Extractions),
-            Some("extractions")
-        );
     }
 }

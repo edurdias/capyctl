@@ -891,21 +891,25 @@ impl crate::Store {
         &self,
         deployment: &str,
     ) -> Result<Vec<capyctl_config::extractions::FieldType>, StoreError> {
-        let json: Option<Option<String>> = self
+        let row: Option<(bool, Option<String>)> = self
             .conn
             .query_row(
-                "SELECT CASE WHEN json_valid(e.effective_json) THEN \
+                "SELECT e.effective_json IS NULL OR json_valid(e.effective_json), \
+             CASE WHEN json_valid(e.effective_json) THEN \
              json_extract(e.effective_json,'$.profile.custom.manifest.field_types') END \
              FROM deployments d LEFT JOIN effective_revisions e \
              ON e.deployment_id=d.id AND e.revision=d.revision WHERE d.id=?1",
                 [deployment],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        json.flatten()
-            .map(|json| serde_json::from_str(&json).map_err(|_| invalid_column("field_types")))
-            .transpose()
-            .map(Option::unwrap_or_default)
+        match row {
+            Some((false, _)) => Err(invalid_column("field_types")),
+            Some((true, Some(json))) => {
+                serde_json::from_str(&json).map_err(|_| invalid_column("field_types"))
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// Alias resolution: route_model_id → the deployment serving it (no
@@ -1426,6 +1430,32 @@ mod tests {
             .unwrap();
         assert!(store.deployment_api(&id).is_err());
         assert_eq!(store.deployment_api("absent").unwrap(), None);
+    }
+
+    // T50 / ADR 0041 §3: corrupt frozen JSON cannot become an empty declaration.
+    #[test]
+    fn deployment_field_types_refuses_malformed_frozen_json() {
+        let store = Store::open_in_memory().unwrap();
+        let accepted = store.accept_deployment(req("managed", "managed")).unwrap();
+        let id = accepted.deployment_id.to_string();
+        store
+            .conn
+            .execute(
+                "INSERT INTO effective_revisions \
+                 (deployment_id,revision,effective_json,fingerprint) \
+                 VALUES(?1,1,'not json','fp')",
+                [&id],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.deployment_field_types(&id),
+            Err(StoreError::Sql(rusqlite::Error::InvalidColumnType(
+                0,
+                name,
+                rusqlite::types::Type::Text
+            ))) if name == "field_types"
+        ));
     }
 
     /// SPEC §3: the engine is launched to answer to the frozen revision's first
