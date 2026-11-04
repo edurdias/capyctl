@@ -279,6 +279,12 @@ const GROUP_CODES: &[(&str, Named, Option<ExitCode>)] = &[
         Named::Bare,
         Some(ExitCode::UNSUPPORTED),
     ),
+    // ADR 0041 §7: extraction version skew is an unsupported operation.
+    (
+        "host_capability_missing:extractions",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
     // ADR 0031 §9: a host too old to run custom engines.
     (
         "host_capability_missing:custom_engines",
@@ -773,6 +779,27 @@ pub fn json_string(s: &str) -> String {
 mod format_tests {
     use super::OutputFormat;
 
+    // T50 (ADR 0041 §7): native refusal and old-host refusal preserve their
+    // closed codes in text and JSON and both exit as unsupported.
+    #[test]
+    fn extraction_refusals_keep_their_codes_and_exit() {
+        for code in [
+            "capability_missing:extractions",
+            "host_capability_missing:extractions",
+        ] {
+            let error = super::StructuredError {
+                code: "invalid_config",
+                message: format!("{code}: extraction models are unavailable"),
+            };
+            assert_eq!(error.closed_code(), code);
+            assert_eq!(error.exit_code(), super::ExitCode::UNSUPPORTED);
+            assert!(error.to_string().contains(code));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&error.to_json()).unwrap()["code"],
+                code
+            );
+        }
+    }
     // ADR 0021: a command result is indented on a terminal and one compact
     // line when piped or redirected.
     #[test]

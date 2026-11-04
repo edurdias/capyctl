@@ -355,6 +355,7 @@ pub enum DeploymentApi {
     Chat,
     Decisions,
     Embeddings,
+    Extractions,
 }
 
 impl DeploymentApi {
@@ -370,6 +371,7 @@ impl DeploymentApi {
             Self::Chat => "chat",
             Self::Decisions => "decisions",
             Self::Embeddings => "embeddings",
+            Self::Extractions => "extractions",
         }
     }
 }
@@ -1702,6 +1704,7 @@ fn resolve_with(
             crate::decisions::check_engine(raw_profile.engine, &raw_profile.build_fingerprint)?
         }
         DeploymentApi::Embeddings => crate::embeddings::check_engine(raw_profile.engine)?,
+        DeploymentApi::Extractions => crate::extractions::check_engine(raw_profile.engine)?,
         DeploymentApi::Chat => {}
     }
     // ADR 0035 §1, §10: the engine's local multi-GPU mode, from its support
@@ -1969,6 +1972,10 @@ fn resolve_with(
         // ADR 0030 §7: a decisions deployment restarts instead of parking.
         if d.api == DeploymentApi::Decisions {
             return Residency::RestartOnly;
+        }
+        // ADR 0041 §1: extraction deployments never park.
+        if d.api == DeploymentApi::Extractions {
+            return crate::extractions::default_residency();
         }
         // ADR 0036 §7.2: an embeddings deployment that states no residency
         // parks `deep` on vLLM and SGLang (discrete hosts too) while its

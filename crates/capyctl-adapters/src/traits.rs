@@ -727,6 +727,32 @@ pub trait ChatForward: Send + Sync {
         let _ = trace;
         self.forward_decision(body).await
     }
+    /// ADR 0041 §3: one collected extraction exchange; unsupported engines
+    /// refuse before sending, never falling back to chat.
+    async fn forward_extraction(
+        &self,
+        _body: &serde_json::Value,
+    ) -> Result<serde_json::Value, AdapterError> {
+        Err(AdapterError::UnsupportedCapability)
+    }
+    /// ADR 0037 §6: carry W3C context on the extraction exchange.
+    async fn forward_extraction_traced(
+        &self,
+        body: &serde_json::Value,
+        trace: Option<&TraceHeaders>,
+    ) -> Result<serde_json::Value, AdapterError> {
+        let _ = trace;
+        self.forward_extraction(body).await
+    }
+    /// ADR 0041 §4: readiness uses only the manifest's declared field types.
+    async fn extraction_probe(
+        &self,
+        _served: &str,
+        _declared: &[capyctl_config::extractions::FieldType],
+        _bound: std::time::Duration,
+    ) -> Result<crate::extraction_probe::ExtractionAnswer, AdapterError> {
+        Err(AdapterError::UnsupportedCapability)
+    }
     /// Streaming chat completion: yields data payloads in order; the final
     /// `[DONE]` marker is consumed by the forwarder.
     async fn forward_chat_stream(

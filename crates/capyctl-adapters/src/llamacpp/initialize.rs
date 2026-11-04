@@ -40,6 +40,10 @@ pub(super) async fn initialize(
     adapter: &LlamacppAdapter,
     command: &RuntimeCommand,
 ) -> Result<EffectObservation, RuntimeError> {
+    // ADR 0041 §1: no native engine is qualified for extractions.
+    if adapter.extractions() {
+        return Err(RuntimeError::Unsupported);
+    }
     let context = &command.context;
     let (plan, tools) = adapter.launch_parts()?;
     if !matches!(

@@ -35,6 +35,10 @@ pub(super) async fn initialize(
     adapter: &CustomAdapter,
     command: &RuntimeCommand,
 ) -> Result<EffectObservation, RuntimeError> {
+    // ADR 0041 §4: no launch becomes ready using another API's probe.
+    if adapter.extractions() {
+        return Err(RuntimeError::Unsupported);
+    }
     let context = &command.context;
     let (plan, tools) = adapter.launch_parts()?;
     if !matches!(

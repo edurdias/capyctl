@@ -2876,6 +2876,8 @@ async fn fresh_probe(
     }
     let bound = remaining().min(PROBE_CHAT_TIMEOUT);
     match api {
+        // ADR 0041 §4: never replace an extraction probe with a chat probe.
+        capyctl_config::effective::DeploymentApi::Extractions => return Err(SessionError),
         capyctl_config::effective::DeploymentApi::Chat => {}
         capyctl_config::effective::DeploymentApi::Decisions => {
             return tokio::time::timeout(bound, engine.decision_probe(served, bound))

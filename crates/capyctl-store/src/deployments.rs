@@ -102,6 +102,8 @@ fn api_column(
         Some("decisions") => Ok(DeploymentApi::Decisions),
         // ADR 0036 §1.
         Some("embeddings") => Ok(DeploymentApi::Embeddings),
+        // ADR 0041 §1: the frozen revision selects the extraction contract.
+        Some("extractions") => Ok(DeploymentApi::Extractions),
         Some(_) => Err(invalid_column("api")),
     }
 }
@@ -1335,7 +1337,8 @@ mod tests {
                                                        ('{id}',2,'{{\"name\":\"chat\"}}','f2'),
                                                        ('{id}',3,'not json','f3'),
                                                        ('{id}',4,'{{\"api\":\"embeddings\"}}','f4'),
-                                                       ('{id}',5,'{{\"api\":\"bogus\"}}','f5');"
+                                                       ('{id}',5,'{{\"api\":\"bogus\"}}','f5'),
+                                                       ('{id}',6,'{{\"api\":\"extractions\"}}','f6');"
             ))
             .unwrap();
         let api = |store: &Store| {
@@ -1351,6 +1354,8 @@ mod tests {
             (2, DeploymentApi::Chat),
             (3, DeploymentApi::Chat),
             (4, DeploymentApi::Embeddings),
+            // T50 (ADR 0041 §§1, 6): route lookup retains extraction identity.
+            (6, DeploymentApi::Extractions),
         ] {
             store
                 .conn

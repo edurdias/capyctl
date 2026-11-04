@@ -10,6 +10,9 @@ mod embedding_answer;
 pub mod embedding_probe;
 pub mod embedding_request;
 pub mod engine_env;
+// ADR 0041 §§3–5: extraction requests and readiness evidence.
+pub mod extraction_probe;
+pub mod extraction_request;
 // SPEC §13.3 / T21: engine logs redacted as written, read back as a bounded tail.
 pub mod engine_log;
 // Owner decision 2026-10-22: the engines' own usage reporting, off unless

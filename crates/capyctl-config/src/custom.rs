@@ -189,6 +189,13 @@ pub struct CustomManifest {
     pub kind: String,
     pub schema_version: u32,
     pub api: DeploymentApi,
+    // ADR 0041 §2: absent for existing APIs, preserving their manifest digests.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_field_types"
+    )]
+    pub field_types: Option<Vec<crate::extractions::FieldType>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,6 +243,14 @@ impl std::fmt::Display for ManifestError {
 
 impl std::error::Error for ManifestError {}
 
+fn deserialize_field_types<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<crate::extractions::FieldType>>, D::Error> {
+    let mut types = Vec::<crate::extractions::FieldType>::deserialize(deserializer)?;
+    types.sort_unstable();
+    Ok(Some(types))
+}
+
 impl CustomManifest {
     /// ADR 0031 §2: read a manifest file's text: YAML (duplicate keys
     /// refused), at most 64 KiB, closed, then [`Self::validate`]d.
@@ -282,6 +297,28 @@ impl CustomManifest {
                 "`schema_version` is {}; this release reads version {MANIFEST_SCHEMA_VERSION}",
                 self.schema_version
             )));
+        }
+        // ADR 0041 §2: a nonempty, distinct, closed type set belongs only to extractions.
+        match (self.api, &self.field_types) {
+            (DeploymentApi::Extractions, Some(types)) if !types.is_empty() => {
+                let distinct: std::collections::BTreeSet<_> = types.iter().collect();
+                if distinct.len() != types.len() {
+                    return Err(ManifestError::invalid(
+                        "`field_types` must contain distinct types",
+                    ));
+                }
+            }
+            (DeploymentApi::Extractions, _) => {
+                return Err(ManifestError::invalid(
+                    "`field_types` is required and non-empty with api: extractions",
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(ManifestError::invalid(
+                    "`field_types` is only accepted with api: extractions",
+                ))
+            }
+            (_, None) => {}
         }
         if let Some(version) = &self.version {
             if version.trim().is_empty()
@@ -500,7 +537,11 @@ pub struct CustomProfile {
 }
 
 impl CustomProfile {
-    pub fn new(manifest: CustomManifest) -> Self {
+    pub fn new(mut manifest: CustomManifest) -> Self {
+        // ADR 0041 §2: normalize hand-built manifests before profile identity.
+        if let Some(types) = &mut manifest.field_types {
+            types.sort_unstable();
+        }
         let manifest_digest = manifest.digest();
         Self {
             manifest,

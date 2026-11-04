@@ -909,6 +909,8 @@ impl EngineAdapter for RemoteEngine {
         }
         let api = b.api();
         match api {
+            // ADR 0041 §5: no other API's canary can stand in for extraction evidence.
+            DeploymentApi::Extractions => return Err(RuntimeError::Unsupported),
             DeploymentApi::Decisions => {
                 if !self.sessions.supports(&b.host_id, capabilities::DECISIONS) {
                     return Err(RuntimeError::Uncertain(
@@ -1045,6 +1047,8 @@ fn canary_evidence(
         ));
     }
     match api {
+        // ADR 0041 §5: extraction evidence must be checked by its own contract.
+        DeploymentApi::Extractions => Err(RuntimeError::Unsupported),
         DeploymentApi::Chat => {
             if result.probe_tokens.is_empty() && result.probe_text.is_empty() {
                 return Err(RuntimeError::Uncertain(
@@ -1411,6 +1415,12 @@ fn remote_launch(
     work: &capyctl_store::ordinary_lifecycle::worker::InitializeWork,
     host_takes_split: bool,
 ) -> Result<RemoteLaunchBinding, CoordinatorError> {
+    // ADR 0041 §§3–5: no extraction launch may use the chat-only remote binding.
+    if work.effective().api == capyctl_config::effective::DeploymentApi::Extractions {
+        return Err(CoordinatorError::Service(
+            "remote extraction execution is unsupported".into(),
+        ));
+    }
     let denied = || CoordinatorError::Service("remote frozen binding unavailable".into());
     let owner = owner.lock().map_err(|_| denied())?;
     let host = &work.effective().host.name;

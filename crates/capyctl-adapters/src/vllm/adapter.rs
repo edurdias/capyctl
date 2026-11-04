@@ -143,6 +143,10 @@ impl VllmAdapter {
         self.api == capyctl_config::effective::DeploymentApi::Decisions
     }
 
+    pub(super) fn extractions(&self) -> bool {
+        self.api == capyctl_config::effective::DeploymentApi::Extractions
+    }
+
     /// ADR 0036 §5: whether readiness, the post-wake probe and the wake
     /// canary are the fixed embedding probe, never a generation.
     pub(super) fn embeddings(&self) -> bool {

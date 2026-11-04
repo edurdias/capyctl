@@ -109,6 +109,9 @@ pub const DECISIONS: &str = capyctl_config::decisions::HOST_CAPABILITY;
 /// anything is sent, so an older host never runs a chat probe against an
 /// embedding server.
 pub const EMBEDDINGS: &str = capyctl_config::embeddings::HOST_CAPABILITY;
+/// ADR 0041 §1: extraction launches need a host that serves the fields contract
+/// and proves readiness with its declared extraction types.
+pub const EXTRACTIONS: &str = capyctl_config::extractions::HOST_CAPABILITY;
 /// ADR 0031 §9: the host runs custom engines (a profile of kind `custom`:
 /// the manifest's command, its placeholders, the loopback check). The server
 /// places a deployment whose selected profile is a custom engine only on a
@@ -253,6 +256,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (CHECKPOINT_GGUF, Direction::ServerToHost),
     (DECISIONS, Direction::ServerToHost),
     (EMBEDDINGS, Direction::ServerToHost),
+    (EXTRACTIONS, Direction::ServerToHost),
     (CUSTOM_ENGINES, Direction::ServerToHost),
     (STARTUP_HOST_BYTES, Direction::ServerToHost),
     (LMCACHE, Direction::ServerToHost),
@@ -468,22 +472,25 @@ fn lmcache_needs(deployment_config: &str, needs: &mut Vec<&'static str>) {
     }
 }
 
-/// ADR 0036 §1: a launch whose deployment document declares
-/// `api: embeddings` needs `embeddings`; an older host would launch it as
-/// chat and prove it with a chat probe. A document that does not parse
-/// needs nothing here; the host refuses it on its own.
+/// ADR 0036 §1, ADR 0041 §1: non-chat launch documents need their API's
+/// capability; an older host would otherwise prove them with a chat probe.
+/// A document that does not parse needs nothing here; the host refuses it.
 fn api_needs(deployment_config: &str, needs: &mut Vec<&'static str>) {
-    // Only a document that names the value is parsed.
-    if !deployment_config.contains("embeddings") {
+    // Only a document that names a gated API value is parsed.
+    if !deployment_config.contains("embeddings") && !deployment_config.contains("extractions") {
         return;
     }
     let Ok(document) = serde_json::from_str::<serde_json::Value>(deployment_config) else {
         return;
     };
-    if document.get("api").and_then(serde_json::Value::as_str)
-        == Some(capyctl_config::effective::DeploymentApi::Embeddings.name())
-    {
-        needs.push(EMBEDDINGS);
+    match document.get("api").and_then(serde_json::Value::as_str) {
+        Some("embeddings") => needs.push(EMBEDDINGS),
+        Some("extractions") => {
+            // ADR 0041 §1: extraction engines are custom and require both.
+            needs.push(EXTRACTIONS);
+            needs.push(CUSTOM_ENGINES);
+        }
+        _ => {}
     }
 }
 
@@ -543,6 +550,11 @@ pub fn decisions_refusal(host_capabilities: &BTreeSet<String>) -> Option<String>
 /// host that did not declare `embeddings`, or `None` when it may be placed.
 pub fn embeddings_refusal(host_capabilities: &BTreeSet<String>) -> Option<String> {
     (!host_capabilities.contains(EMBEDDINGS)).then(|| missing(EMBEDDINGS))
+}
+
+/// ADR 0041 §1: an old host must never receive an extraction deployment.
+pub fn extractions_refusal(host_capabilities: &BTreeSet<String>) -> Option<String> {
+    (!host_capabilities.contains(EXTRACTIONS)).then(|| missing(EXTRACTIONS))
 }
 
 /// ADR 0031 §9: the typed refusal for placing a deployment on a custom
@@ -606,4 +618,39 @@ pub fn refusal(
         .into_iter()
         .find(|need| !capabilities.contains(*need))
         .map(missing)
+}
+
+#[cfg(test)]
+mod extraction_tests {
+    use super::*;
+
+    // T50: the launch document gates extraction before anything reaches an old host.
+    #[test]
+    fn extraction_launch_requires_both_host_capabilities() {
+        let command = pb::ExecuteMember {
+            action: Some(pb::execute_member::Action::LaunchSingle(
+                pb::SingleLaunchPlan {
+                    deployment_config: r#"{"api":"extractions"}"#.into(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let needs = required(&command);
+        assert!(needs.contains(&EXTRACTIONS));
+        assert!(needs.contains(&CUSTOM_ENGINES));
+        for (declared, expected) in [
+            (vec![CUSTOM_ENGINES], Some(missing(EXTRACTIONS))),
+            (vec![EXTRACTIONS], Some(missing(CUSTOM_ENGINES))),
+            (vec![EXTRACTIONS, CUSTOM_ENGINES], None),
+        ] {
+            let declared = declared.into_iter().map(String::from).collect();
+            assert_eq!(refusal(false, &declared, &command), expected);
+        }
+        assert_eq!(
+            extractions_refusal(&BTreeSet::new()),
+            Some(missing(EXTRACTIONS))
+        );
+        assert!(is_gate_refusal(&missing(EXTRACTIONS)));
+    }
 }

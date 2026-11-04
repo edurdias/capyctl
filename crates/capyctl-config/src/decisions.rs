@@ -203,13 +203,18 @@ pub fn check_document(deployment: &Value) -> Result<DeploymentApi, ConfigError> 
     let api = match deployment.get("api") {
         None | Some(Value::Null) => DeploymentApi::Chat,
         Some(value) => serde_json::from_value(value.clone())
-            .map_err(|_| invalid("api", "must be chat, decisions or embeddings"))?,
+            .map_err(|_| invalid("api", "must be chat, decisions, embeddings or extractions"))?,
     };
     match api {
         DeploymentApi::Chat => return Ok(api),
         // ADR 0036 §7: an embeddings deployment's own document refusals.
         DeploymentApi::Embeddings => {
             crate::embeddings::check_document(deployment)?;
+            return Ok(api);
+        }
+        // ADR 0041 §1: extraction-specific document refusals.
+        DeploymentApi::Extractions => {
+            crate::extractions::check_document(deployment)?;
             return Ok(api);
         }
         DeploymentApi::Decisions => {}

@@ -165,6 +165,10 @@ pub(super) async fn initialize(
     adapter: &VllmAdapter,
     command: &RuntimeCommand,
 ) -> Result<EffectObservation, RuntimeError> {
+    // ADR 0041 §1: no native engine is qualified for extractions.
+    if adapter.extractions() {
+        return Err(RuntimeError::Unsupported);
+    }
     let context = &command.context;
     // Unsupported when any part is missing: a builder without its plan, its tools
     // or its key cannot launch anything, and must not half-run the step.
@@ -191,6 +195,10 @@ pub(super) async fn restore_engine(
     adapter: &VllmAdapter,
     command: &RuntimeCommand,
 ) -> Result<EffectObservation, RuntimeError> {
+    // ADR 0041 §1: an extraction launch cannot restart as a chat engine.
+    if adapter.extractions() {
+        return Err(RuntimeError::Unsupported);
+    }
     let (plan, tools, key) = adapter.launch_parts()?;
     crate::lmcache::restore_server(command)?;
     if !matches!(

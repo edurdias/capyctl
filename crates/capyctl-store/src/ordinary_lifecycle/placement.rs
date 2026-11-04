@@ -1205,6 +1205,8 @@ fn api_capability(api: capyctl_config::effective::DeploymentApi) -> Option<&'sta
         DeploymentApi::Chat => None,
         DeploymentApi::Decisions => Some(capyctl_config::decisions::HOST_CAPABILITY),
         DeploymentApi::Embeddings => Some(capyctl_config::embeddings::HOST_CAPABILITY),
+        // ADR 0041 §1: custom engine capability alone is insufficient.
+        DeploymentApi::Extractions => Some(capyctl_config::extractions::HOST_CAPABILITY),
     }
 }
 
@@ -1222,6 +1224,11 @@ mod api_capability_tests {
         assert_eq!(
             api_capability(DeploymentApi::Embeddings),
             Some("embeddings")
+        );
+        // T50: extraction placement requires its own host capability.
+        assert_eq!(
+            api_capability(DeploymentApi::Extractions),
+            Some("extractions")
         );
     }
 }

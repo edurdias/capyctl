@@ -41,11 +41,13 @@ impl Endpoint {
     }
 
     /// The endpoint a deployment serving `api` answers.
-    pub const fn serving(api: DeploymentApi) -> Self {
+    pub const fn serving(api: DeploymentApi) -> Option<Self> {
         match api {
-            DeploymentApi::Chat => Self::ChatCompletions,
-            DeploymentApi::Decisions => Self::Decisions,
-            DeploymentApi::Embeddings => Self::Embeddings,
+            DeploymentApi::Chat => Some(Self::ChatCompletions),
+            DeploymentApi::Decisions => Some(Self::Decisions),
+            DeploymentApi::Embeddings => Some(Self::Embeddings),
+            // ADR 0041 §3: extraction forwarding is not admitted by another API.
+            DeploymentApi::Extractions => None,
         }
     }
 
@@ -93,7 +95,25 @@ pub(crate) fn check_api(
             "model {model} serves the {} API, which {} does not answer; send its requests to POST {}",
             api.name(),
             endpoint.path(),
-            Endpoint::serving(api).path(),
+            Endpoint::serving(api).map_or("/v1/systemone", Endpoint::path),
         ),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // T50 / ADR 0041 §3: an extraction deployment cannot select another API's contract.
+    #[test]
+    fn extractions_do_not_select_an_existing_forwarder() {
+        assert_eq!(Endpoint::serving(DeploymentApi::Extractions), None);
+        for endpoint in [
+            Endpoint::ChatCompletions,
+            Endpoint::Decisions,
+            Endpoint::Embeddings,
+        ] {
+            assert_ne!(endpoint.api(), DeploymentApi::Extractions);
+        }
+    }
 }

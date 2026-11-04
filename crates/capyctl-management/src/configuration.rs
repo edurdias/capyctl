@@ -697,6 +697,8 @@ fn registry_targets(
     // ADR 0036 §1: an embeddings deployment goes only to a host that
     // declared `embeddings`.
     let embeddings = api == capyctl_config::effective::DeploymentApi::Embeddings;
+    // ADR 0041 §1: an extraction custom engine needs both host capabilities.
+    let extractions = api == capyctl_config::effective::DeploymentApi::Extractions;
     let spec = capyctl_config::instances::parse_instance_spec(&config)?;
     let group = spec.group.as_ref();
     let allowed: Vec<String> = match &spec.placement.hosts {
@@ -818,7 +820,7 @@ fn registry_targets(
                 && published(name)["line"].as_str()
                     == Some(capyctl_config::tensorfold_native::TensorfoldLine::Native.name())
         });
-        if decisions || embeddings || custom || native {
+        if decisions || embeddings || extractions || custom || native {
             let declared: std::collections::BTreeSet<String> = store
                 .host_version(&publication.host_id)
                 .map_err(|_| ConfigurationFailure::Internal)?
@@ -845,7 +847,18 @@ fn registry_targets(
                         })
                 })
                 .or_else(|| {
-                    custom
+                    extractions
+                        .then(|| capyctl_protocol::capabilities::extractions_refusal(&declared))
+                        .flatten()
+                        .map(|code| {
+                            let detail = format!(
+                                "{code}: host `{selector}` cannot serve extraction models; upgrade its agent"
+                            );
+                            (code, "api", detail)
+                        })
+                })
+                .or_else(|| {
+                    (custom || extractions)
                         .then(|| capyctl_protocol::capabilities::custom_engines_refusal(&declared))
                         .flatten()
                         .map(|code| {

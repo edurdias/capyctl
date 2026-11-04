@@ -73,6 +73,10 @@ impl LlamacppAdapter {
         self.api == capyctl_config::effective::DeploymentApi::Decisions
     }
 
+    pub(super) fn extractions(&self) -> bool {
+        self.api == capyctl_config::effective::DeploymentApi::Extractions
+    }
+
     /// ADR 0036 §5: whether readiness is the fixed embedding probe.
     pub(super) fn embeddings(&self) -> bool {
         self.api == capyctl_config::effective::DeploymentApi::Embeddings

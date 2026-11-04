@@ -379,6 +379,10 @@ impl LocalReadiness {
             return Err("the engine's port or health path is not answering".into());
         }
         match target.api {
+            // ADR 0041 §4: another API's probe is not extraction readiness.
+            DeploymentApi::Extractions => {
+                return Err("extraction readiness is unsupported".into());
+            }
             DeploymentApi::Decisions => {
                 adapter
                     .decision_probe(&target.served, DECISION_TIMEOUT)
@@ -555,6 +559,9 @@ impl LocalReadiness {
                         DeploymentApi::Chat => "chat",
                         DeploymentApi::Decisions => "fixed decision",
                         DeploymentApi::Embeddings => "fixed embedding",
+                        // ADR 0041 §4: no readiness receipt without the extraction probe.
+                        DeploymentApi::Extractions =>
+                            return Err("extraction readiness is unsupported".into()),
                     },
                     target.served,
                 ),
@@ -571,6 +578,9 @@ impl LocalReadiness {
                         DeploymentApi::Chat => "",
                         DeploymentApi::Decisions => " and the fixed decision probe",
                         DeploymentApi::Embeddings => " and the fixed embedding probe",
+                        // ADR 0041 §1: native engines do not serve extractions.
+                        DeploymentApi::Extractions =>
+                            return Err("capability_missing:extractions".into()),
                     },
                     if target.tensorrt_llm.is_some() {
                         "; no process outside the group and every owned listener is on loopback"
@@ -635,6 +645,10 @@ impl LocalReadiness {
         // ADR 0036 §5: an embedding model likewise only once it answers the
         // fixed embedding, never a chat or decision probe.
         match target.api {
+            // ADR 0041 §1: native engines cannot prove extraction readiness.
+            DeploymentApi::Extractions => {
+                return Err("capability_missing:extractions".into());
+            }
             DeploymentApi::Chat => {}
             DeploymentApi::Decisions => {
                 capyctl_adapters::decision_probe::probe_keyed(

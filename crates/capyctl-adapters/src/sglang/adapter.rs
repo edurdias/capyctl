@@ -294,6 +294,10 @@ impl SglangAdapter {
         self.api == capyctl_config::effective::DeploymentApi::Decisions
     }
 
+    pub(super) fn extractions(&self) -> bool {
+        self.api == capyctl_config::effective::DeploymentApi::Extractions
+    }
+
     /// ADR 0036 §2, §5: whether this launch is an embedding server, made
     /// ready and checked after a wake by the fixed embedding probe alone.
     pub(super) fn embeddings(&self) -> bool {

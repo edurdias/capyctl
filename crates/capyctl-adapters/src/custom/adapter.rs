@@ -109,6 +109,10 @@ impl CustomAdapter {
         self.api == DeploymentApi::Decisions
     }
 
+    pub(super) fn extractions(&self) -> bool {
+        self.api == DeploymentApi::Extractions
+    }
+
     /// ADR 0036 §1, §5: whether readiness is the fixed embedding probe.
     pub(super) fn embeddings(&self) -> bool {
         self.api == DeploymentApi::Embeddings

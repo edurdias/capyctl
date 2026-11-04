@@ -1738,6 +1738,21 @@ mod tests {
         assert!(api > engine && out[api..].contains("decisions"), "{out}");
     }
 
+    // T50 (ADR 0041 §6): status preserves the extraction API's public name.
+    #[test]
+    fn status_names_an_extractions_api() {
+        let deployment = json!({
+            "name": "extract", "observed_state": "ready", "api": "extractions",
+            "installation": {"profile": "extract", "version": "0.1.0",
+                "executable": "/opt/extract/server"},
+            "instances": []
+        });
+        let out = render(View::Status, &deployment, &HostNames::new());
+        let engine = out.find("ENGINE").expect("engine line");
+        let api = out.find("API").expect("API line");
+        assert!(api > engine && out[api..].contains("extractions"), "{out}");
+    }
+
     // T47 (ADR 0036 §1, §2): status names an embeddings deployment's API with
     // its engine version's certification, and an instance's LMCache off
     // with the embeddings reason where other reasons show.
