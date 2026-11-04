@@ -138,6 +138,14 @@ pub trait LifecyclePort: Send + Sync {
         Ok(None)
     }
 
+    /// ADR 0041 §3: field types declared by the current frozen custom manifest.
+    fn deployment_field_types(
+        &self,
+        _deployment: &str,
+    ) -> Result<Vec<capyctl_config::extractions::FieldType>, LifecycleFault> {
+        Ok(Vec::new())
+    }
+
     /// One deployment's current record.
     fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, LifecycleFault>;
 
@@ -458,6 +466,16 @@ impl LifecyclePort for Controller {
             .unwrap()
             .deployment_api(deployment)?
             .ok_or_else(|| LifecycleFault::NotFound(deployment.to_owned()))
+    }
+    fn deployment_field_types(
+        &self,
+        deployment: &str,
+    ) -> Result<Vec<capyctl_config::extractions::FieldType>, LifecycleFault> {
+        self.store_ref()
+            .lock()
+            .unwrap()
+            .deployment_field_types(deployment)
+            .map_err(Into::into)
     }
     fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, LifecycleFault> {
         self.store_ref()

@@ -6,6 +6,7 @@ use axum::{
     Router,
 };
 use capyctl_agent::ingress::{EngineAccess, Ingress, IngressScope};
+use capyctl_config::effective::DeploymentApi;
 use std::sync::{Arc, Mutex};
 fn scope(generation: i64) -> IngressScope {
     IngressScope {
@@ -614,6 +615,13 @@ async fn decision_requests_pass_only_on_their_own_path_and_contract() {
     ingress
         .register(live.clone(), native_addr, "model".into(), [1; 32], [2; 32])
         .unwrap();
+    ingress
+        .bind_handle(
+            &live,
+            "launch-decision",
+            EngineAccess::builtin().with_api(DeploymentApi::Decisions),
+        )
+        .unwrap();
     ingress.open(&live).unwrap();
     let (address, task) = serve(ingress.clone().router()).await;
     let post = |path: &'static str, body: serde_json::Value| async move {
@@ -638,10 +646,18 @@ async fn decision_requests_pass_only_on_their_own_path_and_contract() {
     let chat = serde_json::json!({"model": "model", "messages": []});
     let mut extended = decision("model", "hi");
     extended["chat_template_kwargs"] = serde_json::json!({});
+    // T50: ADR 0041 §3: extraction fields never select a different contract.
+    let fields = serde_json::json!({
+        "model": "model", "state": "hi", "fields": {"value": {"type": "text"}}
+    });
+    let mut both = decision("model", "hi");
+    both["fields"] = serde_json::Value::Null;
     for (path, body) in [
         ("/v1/systemone", decision("other", "hi")),
         ("/v1/systemone", chat.clone()),
         ("/v1/systemone", extended),
+        ("/v1/systemone", fields),
+        ("/v1/systemone", both),
         ("/v1/chat/completions", decision("model", "hi")),
     ] {
         assert_eq!(
@@ -677,6 +693,124 @@ async fn decision_requests_pass_only_on_their_own_path_and_contract() {
         .as_str()
         .unwrap()
         .contains("must be provided"));
+    task.abort();
+    native_task.abort();
+}
+
+// T50: ADR 0041 §3 chooses System One's contract from the frozen launch,
+// including its declared types, never from the body's fields or questions.
+#[tokio::test]
+async fn extraction_launch_accepts_only_fields_of_its_declared_types() {
+    use capyctl_config::custom::{CustomManifest, CustomProfile};
+    let custom = CustomProfile::new(
+        CustomManifest::parse(
+            &KEYED_MANIFEST.replace("api: chat", "api: extractions\nfield_types: [text]"),
+        )
+        .unwrap(),
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let native = Router::new().fallback(move |request: Request<Body>| {
+        let seen = recorded.clone();
+        async move {
+            let path = request.uri().path().to_owned();
+            let headers = request.headers().clone();
+            let body = axum::body::to_bytes(request.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            seen.lock().unwrap().push((path, headers, value));
+            Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"model","answers":{"order":{"type":"text","value":"A-88412"}}}"#,
+                ))
+                .unwrap()
+        }
+    });
+    let (native_addr, native_task) = serve(native).await;
+    let (tracing, capture) = capyctl_trace::testing::capture(
+        1.0,
+        capyctl_trace::CallerMode::Parent,
+        capyctl_trace::Service::Host,
+    );
+    let ingress = Ingress::traced(tracing).unwrap();
+    let live = scope(1);
+    ingress
+        .register(live.clone(), native_addr, "model".into(), [1; 32], [2; 32])
+        .unwrap();
+    ingress
+        .bind_handle(&live, "launch-extraction", EngineAccess::custom(&custom))
+        .unwrap();
+    // Re-registering without the frozen profile cannot replace its contract.
+    ingress
+        .bind_handle(&live, "launch-extraction", EngineAccess::unknown())
+        .unwrap();
+    ingress.open(&live).unwrap();
+    let (address, task) = serve(ingress.clone().router()).await;
+    let post = |path: &'static str, body: serde_json::Value| async move {
+        reqwest::Client::new()
+            .post(format!("http://{address}{path}"))
+            .bearer_auth(hex::encode([1; 32]))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    };
+    let extraction = serde_json::json!({
+        "model": "model", "state": "Order A-88412",
+        "fields": {"order": {"type": "text", "instructions": "Order number"}}
+    });
+    let response = post("/v1/systemone", extraction.clone()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let answer: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(answer["answers"]["order"]["value"], "A-88412");
+    let spans = ingress_spans(&capture, 1).await;
+    assert_eq!(spans[0].attr("http.route"), Some("/v1/systemone"));
+    assert_eq!(spans[0].attr("capyctl.endpoint"), Some("extractions"));
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "/v1/systemone");
+        assert_eq!(seen[0].2, extraction);
+        assert_eq!(
+            seen[0].1["authorization"],
+            format!("Bearer {}", hex::encode([2; 32]))
+        );
+    }
+    let mut both = extraction.clone();
+    both["questions"] = serde_json::Value::Null;
+    let mut undeclared = extraction.clone();
+    undeclared["fields"]["order"]["type"] = "number".into();
+    let mut other_model = extraction.clone();
+    other_model["model"] = "other".into();
+    let mut oversized = extraction.clone();
+    oversized["state"] = "x".repeat(8 * 1024 * 1024).into();
+    for (path, body) in [
+        (
+            "/v1/systemone",
+            serde_json::json!({
+                "model": "model", "state": "Order A-88412",
+                "questions": {"q": {"type": "noul", "instructions": "Order?"}}
+            }),
+        ),
+        ("/v1/systemone", both),
+        ("/v1/systemone", undeclared),
+        ("/v1/systemone", other_model),
+        ("/v1/systemone", oversized),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"model":"model","messages":[]}),
+        ),
+        (
+            "/v1/embeddings",
+            serde_json::json!({"model":"model","input":"Order"}),
+        ),
+    ] {
+        assert_eq!(post(path, body).await.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert_eq!(ingress.current_requests(&live).unwrap(), 0);
     task.abort();
     native_task.abort();
 }
@@ -1078,6 +1212,14 @@ async fn the_engine_connection_closes_when_the_upstream_goes_away() {
                 [2; 32],
             )
             .unwrap();
+        let api = match path {
+            "/v1/systemone" => DeploymentApi::Decisions,
+            "/v1/embeddings" => DeploymentApi::Embeddings,
+            _ => DeploymentApi::Chat,
+        };
+        ingress
+            .bind_handle(&live, "launch", EngineAccess::builtin().with_api(api))
+            .unwrap();
         ingress.open(&live).unwrap();
         let (address, task) = serve(ingress.clone().router()).await;
         let mut upstream = reqwest::Client::new()
@@ -1203,6 +1345,34 @@ async fn the_capyctl_request_id_becomes_rid_only_on_a_capable_chat_launch() {
         .bind_handle(&plain, "launch-plain", EngineAccess::builtin())
         .unwrap();
     ingress.open(&plain).unwrap();
+    for (deployment, api, gate) in [
+        ("decisions", DeploymentApi::Decisions, 5),
+        ("embeddings", DeploymentApi::Embeddings, 7),
+    ] {
+        let launch = IngressScope {
+            deployment_id: deployment.into(),
+            ..scope(1)
+        };
+        ingress
+            .register(
+                launch.clone(),
+                native_addr,
+                "model".into(),
+                [gate; 32],
+                [gate + 1; 32],
+            )
+            .unwrap();
+        ingress
+            .bind_handle(
+                &launch,
+                deployment,
+                EngineAccess::builtin()
+                    .with_api(api)
+                    .with_request_abort(true),
+            )
+            .unwrap();
+        ingress.open(&launch).unwrap();
+    }
     let (address, task) = serve(ingress.clone().router()).await;
     const ID: &str = "01JAAAAAAAAAAAAAAAAAAAAAAA";
     let post = |gate: u8, path: &'static str, ids: Vec<&'static str>, body: serde_json::Value| async move {
@@ -1257,7 +1427,7 @@ async fn the_capyctl_request_id_becomes_rid_only_on_a_capable_chat_launch() {
 
     // A decision, even on a capable launch: dropped.
     assert_eq!(
-        post(1, "/v1/systemone", vec![ID], decision.clone()).await,
+        post(5, "/v1/systemone", vec![ID], decision.clone()).await,
         StatusCode::OK
     );
     let (path, headers, body) = take().remove(0);
@@ -1268,7 +1438,7 @@ async fn the_capyctl_request_id_becomes_rid_only_on_a_capable_chat_launch() {
     // An embeddings request, even on a capable launch: dropped (ADR 0036 §4).
     let embedding = serde_json::json!({"model": "model", "input": ["a", "b"]});
     assert_eq!(
-        post(1, "/v1/embeddings", vec![ID], embedding.clone()).await,
+        post(7, "/v1/embeddings", vec![ID], embedding.clone()).await,
         StatusCode::OK
     );
     let (path, headers, body) = take().remove(0);
@@ -1294,8 +1464,8 @@ async fn the_capyctl_request_id_becomes_rid_only_on_a_capable_chat_launch() {
         ),
         (1, "/v1/chat/completions", vec![ID, ID], chat.clone()),
         (3, "/v1/chat/completions", vec!["not-a-ulid"], chat.clone()),
-        (1, "/v1/systemone", vec!["not-a-ulid"], decision.clone()),
-        (1, "/v1/embeddings", vec!["not-a-ulid"], embedding.clone()),
+        (5, "/v1/systemone", vec!["not-a-ulid"], decision.clone()),
+        (7, "/v1/embeddings", vec!["not-a-ulid"], embedding.clone()),
     ] {
         assert_eq!(
             post(gate, path, ids.clone(), body).await,

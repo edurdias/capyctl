@@ -44,6 +44,8 @@ pub enum Endpoint {
     Chat,
     Decisions,
     Embeddings,
+    /// ADR 0041 §3: extraction requests share the System One path.
+    Extractions,
 }
 
 impl Endpoint {
@@ -52,6 +54,7 @@ impl Endpoint {
             Endpoint::Chat => "chat",
             Endpoint::Decisions => "decisions",
             Endpoint::Embeddings => "embeddings",
+            Endpoint::Extractions => "extractions",
         }
     }
 }

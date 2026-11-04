@@ -75,6 +75,7 @@ impl capyctl_controller::LifecyclePort for Authority {
         Ok(vec![capyctl_store::deployments::PublicRoute {
             id: ROUTE.into(),
             api: self.api,
+            field_types: Vec::new(),
         }])
     }
     fn deployment_api(&self, deployment: &str) -> Result<DeploymentApi, LifecycleFault> {
@@ -992,4 +993,20 @@ async fn models_name_each_api_without_waking() {
         assert_eq!(listed["data"][0]["capyctl"]["api"], api.name(), "{listed}");
         assert_eq!(authority.activations.load(Ordering::SeqCst), 0);
     }
+}
+
+// T50
+// ADR 0041 §3: deployment lookup precedes contract validation on System One.
+#[tokio::test]
+async fn unknown_model_precedes_a_malformed_decision_contract() {
+    let (authority, _deps, router) = stack(DeploymentApi::Decisions, "http://127.0.0.1:9");
+    let (status, body) = decide(
+        &router,
+        &json!({"model": "missing", "questions": null, "unexpected": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "unknown_model");
+    assert_eq!(authority.activations.load(Ordering::SeqCst), 0);
+    assert!(authority.ends().is_empty());
 }

@@ -117,7 +117,10 @@ fn err_json(code: &str, message: &str) -> (StatusCode, Json<serde_json::Value>) 
             "queue_full" => StatusCode::TOO_MANY_REQUESTS,
             "request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
             // SPEC §14: a malformed request is the client's error, not a 500.
-            "invalid_request" => StatusCode::BAD_REQUEST,
+            // ADR 0041 §3: contract and shape refusals precede activation.
+            "invalid_request" | "api_mismatch" | "field_type_unsupported" => {
+                StatusCode::BAD_REQUEST
+            }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         },
         Json(if code == "queue_full" {
@@ -161,11 +164,16 @@ async fn list_models(
     let data: Vec<serde_json::Value> = routes
         .into_iter()
         .map(|route| {
-            serde_json::json!({
+            let mut entry = serde_json::json!({
                 "id": route.id,
                 "object": "model",
                 "capyctl": {"api": route.api.name()},
-            })
+            });
+            // ADR 0041 §6: other APIs retain their discovery shape.
+            if route.api == capyctl_config::effective::DeploymentApi::Extractions {
+                entry["capyctl"]["field_types"] = serde_json::json!(route.field_types);
+            }
+            entry
         })
         .collect();
     Ok(Json(serde_json::json!({ "object": "list", "data": data })))
@@ -180,12 +188,12 @@ struct Received {
     model: String,
     /// The size of the body as received.
     body_bytes: usize,
+    endpoint: endpoint::Endpoint,
 }
 
 /// Authenticate, check the caller's request ID, read the body under its
-/// bound, parse it and validate it against `endpoint`'s contract, before any
-/// accounting, activation or engine is touched (SPEC §10, T19 T21; ADR 0030
-/// §2).
+/// bound and parse it. ADR 0041 §3: System One looks up the frozen deployment
+/// before selecting and validating its contract, still before accounting or activation.
 async fn receive(
     deps: &RouterDeps,
     headers: &HeaderMap,
@@ -225,19 +233,84 @@ async fn receive(
     let body_bytes = body.len();
     let request = capyctl_adapters::request::InferenceRequest::parse(body)
         .map_err(|e| err_json("invalid_request", &format!("bad json: {e}")))?;
-    let Some(model) = request["model"].as_str().map(str::to_owned) else {
+    let Some(model) = request["model"]
+        .as_str()
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
+    else {
         return Err(err_json("invalid_request", "model is required"));
     };
-    // SPEC §10, T19 T21: a request that can never be forwarded is refused
-    // before any accounting, activation or engine is touched.
-    endpoint.validate(&request)?;
-    // The parsed request holds the bytes it was parsed from.
+    // ADR 0041 §3: System One selects its contract only after looking up
+    // the frozen deployment API; unknown_model precedes contract errors.
+    let endpoint = if endpoint == endpoint::Endpoint::Decisions {
+        let deployment = deps
+            .controller
+            .find_deployment_by_route(&model)
+            .map_err(chat::map_controller)?
+            .ok_or_else(|| {
+                err_json(
+                    "unknown_model",
+                    &format!("no deployment serves model id {model}"),
+                )
+            })?;
+        let api = deps
+            .controller
+            .deployment_api(&deployment.id)
+            .map_err(chat::map_controller)?;
+        let selected = match api {
+            capyctl_config::effective::DeploymentApi::Extractions => {
+                endpoint::Endpoint::Extractions
+            }
+            capyctl_config::effective::DeploymentApi::Decisions => endpoint::Endpoint::Decisions,
+            _ => {
+                endpoint::check_api(deps, &deployment.id, &model, endpoint)?;
+                unreachable!("a non-System-One API was admitted");
+            }
+        };
+        if api == capyctl_config::effective::DeploymentApi::Extractions {
+            if let Some(trace) = ids.trace() {
+                trace.extraction();
+            }
+        }
+        if let Some(key) = capyctl_adapters::extraction_request::other_api_key(api, &request) {
+            return Err(err_json(
+                "api_mismatch",
+                &format!(
+                    "model {model} answers {} requests with `{}`, not `{key}`; use POST /v1/systemone",
+                    api.name(),
+                    if api == capyctl_config::effective::DeploymentApi::Extractions { "fields" } else { "questions" },
+                ),
+            ));
+        }
+        if selected == endpoint::Endpoint::Extractions {
+            let types = deps
+                .controller
+                .deployment_field_types(&deployment.id)
+                .map_err(chat::map_controller)?;
+            capyctl_adapters::extraction_request::validate_extraction_request(&request, &types)
+                .map_err(|refusal| {
+                    let code = match refusal {
+                        capyctl_adapters::extraction_request::ExtractionRequestRefusal::FieldTypeUnsupported { .. } => "field_type_unsupported",
+                        _ => "invalid_request",
+                    };
+                    err_json(code, &refusal.to_string())
+                })?;
+        } else {
+            selected.validate(&request)?;
+        }
+        selected
+    } else {
+        endpoint.validate(&request)?;
+        endpoint
+    };
+    // The raw bytes drop here; only the parsed request is held from now on.
     Ok(Received {
         at,
         timing,
         request,
         model,
         body_bytes,
+        endpoint,
     })
 }
 
@@ -270,6 +343,7 @@ async fn chat_completion(
         request: v,
         model,
         body_bytes,
+        endpoint: _,
     } = receive(deps, headers, ids, body, endpoint).await?;
     if v["stream"].as_bool() == Some(true) {
         // Streaming path: resolve + activate, then bridge the engine's SSE.
@@ -331,14 +405,11 @@ async fn chat_completion(
     Ok(with_timing(chat::relay(&answer)?, &timing))
 }
 
-/// `POST /v1/systemone` — ADR 0030 §2: a decision request, admitted, leased
-/// and settled exactly as a chat completion, for `api: decisions` deployments
-/// only. It is never streamed. The answer is the engine's bytes, with `model`
-/// the public name, plus the request's figures in `capyctl.metrics` (SPEC
-/// §17, owner decision 2026-10-19; see [`engine_metrics::attach_decision`]);
-/// everything else, `usage` and every probability, is as the engine wrote it
-/// (SPEC §10, issue #223). Its timings are recorded like any request's, and
-/// it carries the request's IDs as a chat answer does (SPEC §10).
+/// `POST /v1/systemone` — ADR 0041 §3: decisions and extractions are admitted,
+/// leased and settled identically. The deployment selects the closed contract.
+/// The answer keeps the engine's bytes, with the public `model` and the same
+/// non-generative `capyctl.metrics`; usage and probabilities retain their spelling
+/// (SPEC §10, issue #223).
 async fn systemone(
     state: axum::extract::State<AppState>,
     headers: HeaderMap,
@@ -358,6 +429,7 @@ async fn decision(
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     let endpoint = endpoint::Endpoint::Decisions;
     let received = receive(deps, headers, ids, body, endpoint).await?;
+    let endpoint = received.endpoint;
     let (mut answer, timing) = chat::dispatch_timed(
         deps,
         endpoint,

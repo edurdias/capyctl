@@ -82,6 +82,8 @@ pub struct DeploymentRow {
 pub struct PublicRoute {
     pub id: String,
     pub api: capyctl_config::effective::DeploymentApi,
+    /// ADR 0041 §6: declared types from the current frozen custom manifest.
+    pub field_types: Vec<capyctl_config::extractions::FieldType>,
 }
 
 /// ADR 0030 §1: the frozen revision's `api` (`e` is its `effective_revisions`
@@ -815,7 +817,8 @@ impl crate::Store {
             // A managed configuration records its routes in `deployment_routes`
             // and clears the column, so both have to be read. The gate is the
             // same for either: admission open and the deployment not suspended.
-            "SELECT r.route, {API_COLUMN} FROM (\
+            "SELECT r.route, {API_COLUMN}, CASE WHEN json_valid(e.effective_json) \
+             THEN json_extract(e.effective_json,'$.profile.custom.manifest.field_types') END FROM (\
                SELECT route_model_id AS route, id AS deployment_id FROM deployments \
                  WHERE route_model_id IS NOT NULL \
                UNION \
@@ -829,14 +832,24 @@ impl crate::Store {
             .conn
             .prepare(&sql)?
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(id, api)| {
+            .map(|(id, api, types)| {
                 Ok(PublicRoute {
                     id,
                     api: api_column(api)?,
+                    field_types: types
+                        .map(|json| {
+                            serde_json::from_str(&json).map_err(|_| invalid_column("field_types"))
+                        })
+                        .transpose()?
+                        .unwrap_or_default(),
                 })
             })
             .collect()
@@ -871,6 +884,28 @@ impl crate::Store {
     /// limits are not deployment admission policy (ADR 0014 §§1–2).
     pub fn deployment_request_limit(&self, deployment: &str) -> Result<Option<usize>, StoreError> {
         Ok(request_limit(&self.conn, deployment)?)
+    }
+
+    /// ADR 0041 §3: contracts use the frozen manifest even when admission is closed.
+    pub fn deployment_field_types(
+        &self,
+        deployment: &str,
+    ) -> Result<Vec<capyctl_config::extractions::FieldType>, StoreError> {
+        let json: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT CASE WHEN json_valid(e.effective_json) THEN \
+             json_extract(e.effective_json,'$.profile.custom.manifest.field_types') END \
+             FROM deployments d LEFT JOIN effective_revisions e \
+             ON e.deployment_id=d.id AND e.revision=d.revision WHERE d.id=?1",
+                [deployment],
+                |row| row.get(0),
+            )
+            .optional()?;
+        json.flatten()
+            .map(|json| serde_json::from_str(&json).map_err(|_| invalid_column("field_types")))
+            .transpose()
+            .map(Option::unwrap_or_default)
     }
 
     /// Alias resolution: route_model_id → the deployment serving it (no
@@ -1283,6 +1318,7 @@ mod tests {
             vec![PublicRoute {
                 id: "managed-route".to_string(),
                 api: capyctl_config::effective::DeploymentApi::Chat,
+                field_types: Vec::new(),
             }],
             "a managed route is listed"
         );
@@ -1338,7 +1374,7 @@ mod tests {
                                                        ('{id}',3,'not json','f3'),
                                                        ('{id}',4,'{{\"api\":\"embeddings\"}}','f4'),
                                                        ('{id}',5,'{{\"api\":\"bogus\"}}','f5'),
-                                                       ('{id}',6,'{{\"api\":\"extractions\"}}','f6');"
+                                                       ('{id}',6,'{{\"api\":\"extractions\",\"profile\":{{\"custom\":{{\"manifest\":{{\"field_types\":[\"text\",\"number\"]}}}}}}}}','f6');"
             ))
             .unwrap();
         let api = |store: &Store| {
@@ -1366,6 +1402,23 @@ mod tests {
                 .unwrap();
             assert_eq!(api(&store), expected, "revision {revision}");
         }
+        // T50 / ADR 0041 §§3, 6: contracts and discovery use frozen types;
+        // closing admission removes discovery, not the declared contract.
+        let types = vec![
+            capyctl_config::extractions::FieldType::Text,
+            capyctl_config::extractions::FieldType::Number,
+        ];
+        assert_eq!(store.list_enabled_routes().unwrap()[0].field_types, types);
+        assert_eq!(store.deployment_field_types(&id).unwrap(), types);
+        store
+            .conn
+            .execute(
+                "UPDATE deployments SET admission_enabled=0 WHERE id=?1",
+                [&id],
+            )
+            .unwrap();
+        assert!(store.list_enabled_routes().unwrap().is_empty());
+        assert_eq!(store.deployment_field_types(&id).unwrap(), types);
         // A value no revision can carry is corruption, never chat.
         store
             .conn

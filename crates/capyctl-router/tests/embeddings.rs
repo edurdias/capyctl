@@ -88,6 +88,7 @@ impl capyctl_controller::LifecyclePort for Authority {
         Ok(vec![capyctl_store::deployments::PublicRoute {
             id: ROUTE.into(),
             api: self.api,
+            field_types: Vec::new(),
         }])
     }
     fn deployment_api(&self, deployment: &str) -> Result<DeploymentApi, LifecycleFault> {

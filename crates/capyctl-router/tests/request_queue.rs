@@ -76,6 +76,7 @@ impl capyctl_controller::LifecyclePort for Authority {
         Ok(vec![capyctl_store::deployments::PublicRoute {
             id: ROUTE.into(),
             api: capyctl_config::effective::DeploymentApi::Chat,
+            field_types: Vec::new(),
         }])
     }
     fn deployment_api(

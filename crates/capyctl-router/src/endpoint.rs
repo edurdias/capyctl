@@ -19,6 +19,8 @@ pub enum Endpoint {
     /// ADR 0036 §3: `POST /v1/embeddings`, answered by `api: embeddings`
     /// deployments.
     Embeddings,
+    /// ADR 0041 §3: the extraction contract on `POST /v1/systemone`.
+    Extractions,
 }
 
 impl Endpoint {
@@ -26,7 +28,7 @@ impl Endpoint {
     pub const fn path(self) -> &'static str {
         match self {
             Self::ChatCompletions => "/v1/chat/completions",
-            Self::Decisions => "/v1/systemone",
+            Self::Decisions | Self::Extractions => "/v1/systemone",
             Self::Embeddings => "/v1/embeddings",
         }
     }
@@ -37,6 +39,7 @@ impl Endpoint {
             Self::ChatCompletions => DeploymentApi::Chat,
             Self::Decisions => DeploymentApi::Decisions,
             Self::Embeddings => DeploymentApi::Embeddings,
+            Self::Extractions => DeploymentApi::Extractions,
         }
     }
 
@@ -46,8 +49,7 @@ impl Endpoint {
             DeploymentApi::Chat => Some(Self::ChatCompletions),
             DeploymentApi::Decisions => Some(Self::Decisions),
             DeploymentApi::Embeddings => Some(Self::Embeddings),
-            // ADR 0041 §3: extraction forwarding is not admitted by another API.
-            DeploymentApi::Extractions => None,
+            DeploymentApi::Extractions => Some(Self::Extractions),
         }
     }
 
@@ -63,6 +65,11 @@ impl Endpoint {
             Self::ChatCompletions => crate::chat::validate_request(body),
             Self::Decisions => capyctl_adapters::forward::validate_decision_request(body)
                 .map_err(|refusal| crate::chat::refusal("invalid_request", &refusal.to_string())),
+            Self::Extractions => capyctl_adapters::extraction_request::validate_extraction_request(
+                body,
+                &capyctl_config::extractions::FieldType::ALL,
+            )
+            .map_err(|refusal| crate::chat::refusal("invalid_request", &refusal.to_string())),
             Self::Embeddings => capyctl_adapters::embedding_request::validate_embedding_request(
                 body,
             )
@@ -104,16 +111,13 @@ pub(crate) fn check_api(
 mod tests {
     use super::*;
 
-    // T50 / ADR 0041 §3: an extraction deployment cannot select another API's contract.
+    // T50 / ADR 0041 §3: the extraction API selects its own System One contract.
     #[test]
-    fn extractions_do_not_select_an_existing_forwarder() {
-        assert_eq!(Endpoint::serving(DeploymentApi::Extractions), None);
-        for endpoint in [
-            Endpoint::ChatCompletions,
-            Endpoint::Decisions,
-            Endpoint::Embeddings,
-        ] {
-            assert_ne!(endpoint.api(), DeploymentApi::Extractions);
-        }
+    fn extractions_select_systemone() {
+        assert_eq!(
+            Endpoint::serving(DeploymentApi::Extractions),
+            Some(Endpoint::Extractions)
+        );
+        assert_eq!(Endpoint::Extractions.path(), Endpoint::Decisions.path());
     }
 }

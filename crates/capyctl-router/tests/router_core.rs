@@ -527,6 +527,7 @@ impl capyctl_controller::LifecyclePort for StubAuthority {
         Ok(vec![capyctl_store::deployments::PublicRoute {
             id: self.route.clone(),
             api: capyctl_config::effective::DeploymentApi::Chat,
+            field_types: Vec::new(),
         }])
     }
     fn deployment_api(

@@ -68,6 +68,7 @@ impl RequestTrace {
         let (name, route) = match endpoint {
             Endpoint::ChatCompletions => (TraceEndpoint::Chat, "/v1/chat/completions"),
             Endpoint::Decisions => (TraceEndpoint::Decisions, "/v1/systemone"),
+            Endpoint::Extractions => (TraceEndpoint::Extractions, "/v1/systemone"),
             Endpoint::Embeddings => (TraceEndpoint::Embeddings, "/v1/embeddings"),
         };
         request.set(Attr::Endpoint(name));
@@ -91,6 +92,13 @@ impl RequestTrace {
 
     pub(crate) fn tracing(&self) -> &Tracing {
         &self.tracing
+    }
+
+    /// ADR 0041 §3: the deployment, not the shared path, selects this category.
+    pub(crate) fn extraction(&self) {
+        self.state()
+            .request
+            .set(Attr::Endpoint(TraceEndpoint::Extractions));
     }
 
     /// ADR 0037 §3: admission ends when the request resolved to a

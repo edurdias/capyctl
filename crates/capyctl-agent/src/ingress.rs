@@ -72,6 +72,10 @@ pub struct EngineAccess {
     /// tracing (its launch-time decision was on). Only then may the ingress
     /// send the engine a trace context; every other launch gets none.
     pub engine_trace: bool,
+    /// ADR 0041 §3: the retained launch chooses the System One contract.
+    pub api: capyctl_config::effective::DeploymentApi,
+    /// ADR 0041 §2, §3: declared types from that launch's frozen manifest.
+    pub field_types: Option<Arc<[capyctl_config::extractions::FieldType]>>,
 }
 impl EngineAccess {
     /// A built-in engine: read by its family's `/metrics`, always keyed.
@@ -82,6 +86,8 @@ impl EngineAccess {
             keyed: true,
             request_abort: false,
             engine_trace: false,
+            api: capyctl_config::effective::DeploymentApi::Chat,
+            field_types: None,
         }
     }
     /// ADR 0031 §6, §7: a custom engine, read by its manifest's idle signal
@@ -93,6 +99,8 @@ impl EngineAccess {
             keyed: custom.manifest.uses_api_key(),
             request_abort: false,
             engine_trace: false,
+            api: custom.manifest.api,
+            field_types: custom.manifest.field_types.as_deref().map(Arc::from),
         }
     }
     /// ADR 0031 §6, AGENTS.md (uncertainty must retain accounting): a launch
@@ -105,6 +113,8 @@ impl EngineAccess {
             keyed: false,
             request_abort: false,
             engine_trace: false,
+            api: capyctl_config::effective::DeploymentApi::Chat,
+            field_types: None,
         }
     }
     /// ADR 0032 §2: the same access, with whether the launch's engine takes
@@ -121,6 +131,10 @@ impl EngineAccess {
             engine_trace,
             ..self
         }
+    }
+    /// ADR 0041 §3: bind the API resolved from the retained launch document.
+    pub fn with_api(self, api: capyctl_config::effective::DeploymentApi) -> Self {
+        Self { api, ..self }
     }
 }
 struct Entry {
@@ -476,7 +490,7 @@ impl Ingress {
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
             .route(Kind::Chat.path(), post(forward_chat))
-            // ADR 0030 §2: decision requests, exactly this path besides chat.
+            // ADR 0041 §3: the launch chooses decisions or extractions here.
             .route(Kind::Decision.path(), post(forward_decision))
             // ADR 0036 §10: embeddings requests, exactly this path besides
             // chat and decisions.
@@ -517,15 +531,16 @@ impl Ingress {
         Ok(entry)
     }
 }
-/// SPEC §10, ADR 0030 §2, ADR 0036 §10: the inference requests the ingress
-/// forwards, each on its own fixed path with its own closed body contract.
-/// Nothing else crosses.
+/// SPEC §10, ADR 0041 §3: only fixed inference paths cross this boundary.
+/// System One's two closed contracts are chosen by the retained launch API.
 #[derive(Clone, Copy)]
 enum Kind {
     /// `POST /v1/chat/completions`.
     Chat,
-    /// `POST /v1/systemone`, a decision request.
+    /// `POST /v1/systemone`, selected as decisions until a launch is read.
     Decision,
+    /// ADR 0041 §3: `POST /v1/systemone` for an extraction launch.
+    Extraction,
     /// `POST /v1/embeddings`, an embeddings request (ADR 0036 §10).
     Embedding,
 }
@@ -534,7 +549,7 @@ impl Kind {
     const fn path(self) -> &'static str {
         match self {
             Self::Chat => "/v1/chat/completions",
-            Self::Decision => "/v1/systemone",
+            Self::Decision | Self::Extraction => "/v1/systemone",
             Self::Embedding => capyctl_adapters::embedding_probe::PATH,
         }
     }
@@ -545,16 +560,35 @@ impl Kind {
     /// a decision request has its own contract, never the chat one. ADR 0036
     /// §3, §10: an embeddings request has OpenAI's closed contract, never
     /// either of the others.
-    fn allowed(self, body: &serde_json::Value) -> bool {
+    fn allowed(
+        self,
+        body: &serde_json::Value,
+        declared: Option<&[capyctl_config::extractions::FieldType]>,
+    ) -> bool {
         match self {
             Self::Chat => capyctl_adapters::forward::chat_request_allowed(body),
             Self::Decision => capyctl_adapters::forward::decision_request_allowed(body),
+            Self::Extraction => declared.is_some_and(|declared| {
+                capyctl_adapters::extraction_request::validate_extraction_request(body, declared)
+                    .is_ok()
+            }),
             Self::Embedding => capyctl_adapters::embedding_request::embedding_request_allowed(body),
         }
     }
-    /// Whether the engine's answer has a media type this kind relays: a chat
-    /// completion is JSON or a stream, a decision and an embeddings answer
-    /// are JSON.
+    /// ADR 0041 §3: choose by the retained launch, never by a body member.
+    fn for_launch(self, api: Option<capyctl_config::effective::DeploymentApi>) -> Option<Self> {
+        use capyctl_config::effective::DeploymentApi;
+        match (self, api) {
+            (Self::Decision, Some(DeploymentApi::Decisions)) => Some(Self::Decision),
+            (Self::Decision, Some(DeploymentApi::Extractions)) => Some(Self::Extraction),
+            (Self::Decision, _) => None,
+            (Self::Chat, None | Some(DeploymentApi::Chat)) => Some(Self::Chat),
+            (Self::Embedding, None | Some(DeploymentApi::Embeddings)) => Some(Self::Embedding),
+            _ => None,
+        }
+    }
+    /// A chat completion is JSON or a stream; decisions, extractions and
+    /// embeddings answer JSON.
     fn relays(self, content: &str) -> bool {
         content.starts_with("application/json")
             || (matches!(self, Self::Chat) && content.starts_with("text/event-stream"))
@@ -661,9 +695,18 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
-        .map_or((true, false, false), |(_, engine)| {
-            (engine.keyed, engine.request_abort, engine.engine_trace)
+        .map_or((true, false, false, None, None), |(_, engine)| {
+            (
+                engine.keyed,
+                engine.request_abort,
+                engine.engine_trace,
+                Some(engine.api),
+                engine.field_types.clone(),
+            )
         });
+    let Some(kind) = kind.for_launch(access.3) else {
+        return failure(StatusCode::BAD_REQUEST);
+    };
     // ADR 0037 §6: the trace headers are read only now, on a request that
     // authenticated as the router's; a request that did not has no span.
     let mut trace = IngressTrace::start(
@@ -678,7 +721,7 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
         request,
         kind,
         guard,
-        (access.0, access.1),
+        (access.0, access.1, access.4.as_deref()),
         received,
         &mut trace,
     )
@@ -724,6 +767,7 @@ impl IngressTrace {
             span.set(Attr::Endpoint(match kind {
                 Kind::Chat => capyctl_trace::Endpoint::Chat,
                 Kind::Decision => capyctl_trace::Endpoint::Decisions,
+                Kind::Extraction => capyctl_trace::Endpoint::Extractions,
                 Kind::Embedding => capyctl_trace::Endpoint::Embeddings,
             }));
             span.set(Attr::Deployment(scope.deployment_id.clone()));
@@ -803,7 +847,11 @@ async fn relay(
     request: Request,
     kind: Kind,
     guard: InFlight,
-    (keyed, request_abort): (bool, bool),
+    (keyed, request_abort, declared): (
+        bool,
+        bool,
+        Option<&[capyctl_config::extractions::FieldType]>,
+    ),
     received: Instant,
     trace: &mut IngressTrace,
 ) -> Response {
@@ -830,8 +878,8 @@ async fn relay(
     if let Some(id) = &request_id {
         trace.request_id(id);
     }
-    // ADR 0030 §2, ADR 0036 §10: one bound for every kind; a decision's
-    // images and an embeddings batch count in it.
+    // ADR 0041 §3: one 8 MiB bound for every kind; extraction images and
+    // fields count in it, just as decision images and embeddings batches do.
     let body = match tokio::time::timeout(
         Duration::from_secs(15),
         to_bytes(request.into_body(), 8 * 1024 * 1024),
@@ -851,7 +899,7 @@ async fn relay(
     if value.get("model").and_then(serde_json::Value::as_str) != Some(entry.model.as_str()) {
         return failure(StatusCode::BAD_REQUEST);
     }
-    if !kind.allowed(&value) {
+    if !kind.allowed(&value, declared) {
         return failure(StatusCode::BAD_REQUEST);
     }
     if !entry.open.load(Ordering::SeqCst) {
@@ -875,13 +923,12 @@ async fn relay(
     // and with them the engine connection, before the engine's head as after.
     // ADR 0032 §1, §2: on a launch whose engine takes it, a chat request
     // carries CapyCTL's request ID as SGLang's `rid`, set only here, after
-    // the allowlist above refused any `rid` of the caller's. A decision never
-    // carries one (SGLang 0.5.22's `/v1/systemone` builds its request without
-    // a `rid`), nor does an embeddings request (ADR 0036 §4: SGLang needs one
-    // `rid` per input of a batch, and its settlement needs none), and a
-    // launch without the capability gets none: the ID is dropped. Only then
-    // is the body re-encoded, the router's members kept in their order and
-    // bytes.
+    // the allowlist above refused any `rid` of the caller's. ADR 0041 §3:
+    // extractions, like decisions, carry none (SGLang 0.5.22's System One
+    // request takes no `rid`), nor do embeddings (ADR 0036 §4: SGLang needs
+    // one `rid` per batch input, and settlement needs none). A
+    // launch without the capability gets none: the ID is dropped. The body is
+    // re-encoded only when the ID is set, preserving member order and bytes.
     let body = match request_id.filter(|_| request_abort && matches!(kind, Kind::Chat)) {
         Some(id) => match value.encode(&[("rid", &serde_json::Value::String(id))]) {
             Ok(encoded) => axum::body::Bytes::from(encoded),

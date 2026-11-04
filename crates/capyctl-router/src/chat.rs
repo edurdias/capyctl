@@ -534,6 +534,22 @@ pub async fn dispatch_timed(
                     )
                     .await
                 }
+                // ADR 0041 §3: the same whole-answer cancellation and
+                // settlement path as decisions, with no progress on a cut.
+                Endpoint::Extractions => {
+                    unless_hung_up(
+                        crate::stream::bounded(
+                            attempt
+                                .forward
+                                .forward_extraction_traced(&body, trace_headers.as_ref()),
+                            &progress,
+                            &bounds,
+                            stall,
+                        ),
+                        &mut reply,
+                    )
+                    .await
+                }
                 // ADR 0036 §4: an embeddings answer is streamed through
                 // (`crate::embeddings`), never collected here; nothing is
                 // sent, so the request is refused before reaching an engine.

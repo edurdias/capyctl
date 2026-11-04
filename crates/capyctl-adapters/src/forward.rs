@@ -998,6 +998,29 @@ impl ChatHttp {
         trace: Option<&crate::traits::TraceHeaders>,
     ) -> Result<EngineAnswer, AdapterError> {
         validate_decision_request(body)?;
+        self.systemone_traced(body, trace).await
+    }
+
+    // ADR 0041 §3: extraction and decision exchanges share transport, bound,
+    // completion evidence and error accounting; only their contracts differ.
+    pub(crate) async fn extract_traced(
+        &self,
+        body: &Value,
+        trace: Option<&crate::traits::TraceHeaders>,
+    ) -> Result<Value, AdapterError> {
+        crate::extraction_request::validate_extraction_request(
+            body,
+            &capyctl_config::extractions::FieldType::ALL,
+        )
+        .map_err(|_| AdapterError::UnsupportedCapability)?;
+        self.systemone_traced(body, trace).await
+    }
+
+    async fn systemone_traced(
+        &self,
+        body: &Value,
+        trace: Option<&crate::traits::TraceHeaders>,
+    ) -> Result<Value, AdapterError> {
         let public = body
             .get("model")
             .and_then(Value::as_str)
@@ -1515,6 +1538,16 @@ impl crate::traits::ChatForward for EngineForward {
         body: &InferenceRequest,
     ) -> Result<EngineAnswer, AdapterError> {
         self.0.decide(body).await
+    }
+    async fn forward_extraction(&self, body: &Value) -> Result<Value, AdapterError> {
+        self.0.extract_traced(body, None).await
+    }
+    async fn forward_extraction_traced(
+        &self,
+        body: &Value,
+        trace: Option<&crate::traits::TraceHeaders>,
+    ) -> Result<Value, AdapterError> {
+        self.0.extract_traced(body, trace).await
     }
     async fn forward_embedding(
         &self,
