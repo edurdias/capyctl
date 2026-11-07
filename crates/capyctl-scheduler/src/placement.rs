@@ -563,9 +563,14 @@ pub fn shortfall(candidate: &HostCandidate, owner: &str) -> Option<String> {
             .map(|o| &o.footprint)
             .collect()
     };
-    // Within one footprint a domain above its whole limit decides, else the
-    // domain closest to fitting; on a host offering a device choice, the
-    // device closest to fitting, and none when one fits every managed limit.
+    // SPEC §14 (#241): a device option blocked by a non-settable card limit
+    // cannot be rescued by raising another limit. Prefer an option without
+    // that blocker; otherwise explain the card, not an ineffective setting.
+    // A merely full option still wins over any above a whole limit, and an
+    // option fitting every managed limit leaves other diagnostics to explain.
+    let derived_card_limit = |beyond: bool, limit: &MemoryLimit| {
+        beyond && candidate.host_kv_remedy.standalone && limit.reserve_absorbs_unmanaged
+    };
     let shorts: Option<Vec<_>> = footprints
         .into_iter()
         .map(|footprint| {
@@ -590,12 +595,16 @@ pub fn shortfall(candidate: &HostCandidate, owner: &str) -> Option<String> {
                         limit,
                     ))
                 })
-                .min_by_key(|(beyond, short, ..)| (!*beyond, *short))
+                .min_by_key(|(beyond, short, _, _, limit)| {
+                    (!*beyond, !derived_card_limit(*beyond, limit), *short)
+                })
         })
         .collect();
     shorts?
         .into_iter()
-        .min_by_key(|(beyond, short, ..)| (*beyond, *short))
+        .min_by_key(|(beyond, short, _, _, limit)| {
+            (*beyond, derived_card_limit(*beyond, limit), *short)
+        })
         .map(|(beyond, _, need, free, limit)| {
             if beyond {
                 format!(
@@ -1469,6 +1478,102 @@ mod tests {
             "host host-a: insufficient_capacity: host_kv (needs 8.0 GiB, limit 4.0 GiB; \
              raise host.resource_policy.memory.system.host_kv_limit or lower the \
              deployment's host_kv_bytes)"
+        );
+        assert!(!refused.beyond_limits(one));
+    }
+
+    // SPEC §14 (#241 review): name an editable limit when raising it would
+    // admit a device option, not another option's non-settable card limit.
+    // T23 T27
+    #[test]
+    fn a_device_option_with_only_an_editable_shortfall_names_that_setting() {
+        use crate::device_choice::DeviceOption;
+        let device = |id: &str| DeviceOption {
+            device: id.into(),
+            domains: vec![id.into()],
+            footprint: PhaseFootprint {
+                phase: ResourcePhase::Cold,
+                allocations: vec![
+                    Allocation {
+                        domain: id.into(),
+                        bytes: 10 * GIB,
+                        host_kv_bytes: 0,
+                    },
+                    Allocation {
+                        domain: "system".into(),
+                        bytes: 40 * GIB,
+                        host_kv_bytes: 0,
+                    },
+                ],
+                devices: vec![],
+            },
+        };
+        let limit = |domain: &str, managed: i64| MemoryLimit {
+            domain: domain.into(),
+            managed_bytes: managed,
+            free_reserve_bytes: 0,
+            reserve_absorbs_unmanaged: domain != "system",
+            host_kv_bytes: None,
+            parked_bytes: None,
+        };
+        let mut candidate = host("host-a", 100 * GIB, 0, &[]);
+        candidate.host_kv_remedy.standalone = true;
+        candidate.limits = vec![
+            limit("gpu0", 9 * GIB),
+            limit("gpu1", 12 * GIB),
+            limit("system", 36 * GIB),
+        ];
+        candidate.device_options = vec![device("gpu0"), device("gpu1")];
+        for _ in 0..2 {
+            let one = std::slice::from_ref(&candidate);
+            let refused = place(one, "d", Strategy::Spread, None, None).unwrap_err();
+            assert_eq!(
+                refused.detail(one, "d"),
+                "host host-a needs 40.0 GiB of system memory, above its whole 36.0 GiB limit \
+                 (raise host.resource_policy.memory.system.managed_limit)"
+            );
+            assert!(refused.beyond_limits(one));
+            candidate.device_options.reverse();
+        }
+        // Raising the named setting really does admit the other card.
+        candidate.limits[2].managed_bytes = 40 * GIB;
+        assert_eq!(
+            place(
+                std::slice::from_ref(&candidate),
+                "d",
+                Strategy::Spread,
+                None,
+                None
+            )
+            .unwrap()
+            .device
+            .as_deref(),
+            Some("gpu1")
+        );
+
+        // When every card is too small, raising system memory cannot help.
+        candidate.limits[1].managed_bytes = 8 * GIB;
+        candidate.limits[2].managed_bytes = GIB;
+        let one = std::slice::from_ref(&candidate);
+        let refused = place(one, "d", Strategy::Spread, None, None).unwrap_err();
+        assert_eq!(
+            refused.detail(one, "d"),
+            "host host-a needs 10.0 GiB of gpu0 memory, above its whole 9.0 GiB limit \
+             (a card's limit is derived from the card and is not settable)"
+        );
+        assert!(refused.beyond_limits(one));
+
+        // An option that is merely full still keeps ordinary capacity advice.
+        candidate.limits[1].managed_bytes = 12 * GIB;
+        candidate.limits[2].managed_bytes = 40 * GIB;
+        let mut charged = footprint(GIB, None);
+        charged.allocations[0].domain = "system".into();
+        candidate.ledger.owners.insert("other".into(), charged);
+        let one = std::slice::from_ref(&candidate);
+        let refused = place(one, "d", Strategy::Spread, None, None).unwrap_err();
+        assert_eq!(
+            refused.detail(one, "d"),
+            "host host-a needs 40.0 GiB of system memory, 39.0 GiB free of its 40.0 GiB limit"
         );
         assert!(!refused.beyond_limits(one));
     }

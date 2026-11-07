@@ -22,7 +22,11 @@ domain's whole managed limit, that domain is the one its reason names, as
 that its limit is derived from the card (`capyctl-scheduler`
 `placement::shortfall`). On a host offering a device choice, an option that
 fits every managed limit leaves the refusal to the limit that did refuse it
-(host-KV, parked, count), as no card's limit is to blame. When every refusing
+(host-KV, parked, count), as no card's limit is to blame. If every option is
+above a whole limit, an option that can fit after raising editable limits
+takes precedence over one blocked by a standalone card's non-settable limit.
+The card is named only when every option exceeds a non-settable card limit;
+raising system memory alone cannot then help. When every refusing
 host is above a whole limit (`Unplaceable::beyond_limits`), the store returns
 `LifecycleError::CapacityBeyondLimit` instead of `CapacityBlocked`; management
 answers it with the same `capacity_blocked` code (503) without the advice to
@@ -54,6 +58,13 @@ covers standalone, enrolled and card wording and a host that is only full;
 (T23 T27) a device choice where one GPU is above its card's limit and the other
 fits, both over a shared host-KV limit: the host-KV limit is named (on `main`
 the refusal named the first GPU's card instead);
+`a_device_option_with_only_an_editable_shortfall_names_that_setting` (T23 T27)
+covers a 40 GiB system need against 36 GiB alongside GPU needs/limits of
+10/9 and 10/12 GiB. Before the review fix it named the first card's
+non-settable limit; after the fix it names the system setting, in either
+device order, and raising that setting admits the second card. It also
+checks the refusal when every card is too small and the ordinary capacity
+reason when one option is merely full;
 `a_host_kv_refusal_names_the_limit_and_the_setting_to_raise` now expects the
 new wording for its need above the limit. `capyctl-management`
 `a_start_above_a_managed_limit_is_not_told_to_wait_or_evict` (T05 T23) checks
