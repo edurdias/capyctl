@@ -1572,3 +1572,205 @@ fn the_startup_peak_is_the_largest_per_gpu_figure() {
     );
     assert_eq!(peak(&[]), Some(0));
 }
+
+/// SPEC §14 (#241, found on a discrete GPU: vLLM's loader held 26.3 GiB of
+/// host RAM, recorded as the startup peak, against a 16 GiB system limit): a
+/// measured peak above a domain's whole managed limit is reserved by every
+/// later start, which no host can take even empty. The refusal is
+/// `CapacityBeyondLimit` and names the limit and the setting to raise, and
+/// nothing is reserved.
+// T14 T26
+#[tokio::test]
+async fn a_discrete_host_ram_peak_above_the_system_limit_is_refused_naming_the_setting() {
+    use crate::coordinator::CoordinatorCommandError;
+    use capyctl_config::effective::ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES as RAM;
+    use capyctl_store::lifecycle::LifecycleError;
+    let (dir, owner, fence, observations) = discrete_setup();
+    let gate = Gate::new(false);
+    let launches = Arc::new(Mutex::new(vec![gate.clone()]));
+    let host = Arc::new(ScriptedProcesses {
+        domains: observations.clone(),
+        residents: Mutex::new(Vec::new()),
+        sampled: AtomicI64::new(1000),
+    });
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        host.clone(),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions {
+            startup_sample_interval: Some(Duration::from_millis(10)),
+            ..Default::default()
+        },
+        Arc::new(move |_| match launches.lock().unwrap().pop() {
+            Some(gate) => Ok(test_driver(gate)),
+            None => Err(CoordinatorError::Service("no scripted engine left".into())),
+        }),
+    )
+    .unwrap();
+    // The first start is charged the host overhead in host RAM, and its two
+    // processes then hold 40 GiB there, above the 30 GiB system limit.
+    let first = w.start(&fence, 60_000).unwrap();
+    gate.entered().await;
+    assert_eq!(
+        on(&footprint(&owner, &fence.deployment_id).unwrap(), "system"),
+        RAM
+    );
+    host.hold(vec![
+        process(71, 10 * GIB, 20 * GIB),
+        process(72, 4 * GIB, 20 * GIB),
+    ]);
+    host.sampled(5).await;
+    gate.release.add_permits(1);
+    assert_eq!(
+        first.wait(Duration::from_secs(10)).await.unwrap(),
+        InitializeStatus::Completed
+    );
+    until("both measured peaks", || {
+        recorded_peaks(&dir, &fence).len() == 2
+    })
+    .await;
+    assert_eq!(recorded_peaks(&dir, &fence)[1], ("system".into(), 40 * GIB));
+    let stop = w.stop("owner", &fence, "stop-discrete", 60_000).unwrap();
+    assert_eq!(
+        stop.wait(Duration::from_secs(10)).await.unwrap(),
+        OrdinaryCleanupStatus::Completed
+    );
+    match w.commands().start(
+        "owner",
+        &fence.deployment_id,
+        fence.revision,
+        "start-discrete-again",
+        60_000,
+    ) {
+        Err(CoordinatorCommandError::Lifecycle(LifecycleError::CapacityBeyondLimit(detail))) => {
+            assert_eq!(
+                detail,
+                "host lab needs 40.0 GiB of system memory, above its whole 30.0 GiB limit \
+                 (raise host.resource_policy.memory.system.managed_limit)"
+            )
+        }
+        other => panic!("{:?}", other.map(|_| "accepted")),
+    }
+    assert!(footprint(&owner, &fence.deployment_id).is_none());
+    w.shutdown().await.unwrap();
+}
+
+/// SPEC §14 (#241): on unified memory a solo first start reserves the whole
+/// managed limit, but its measured drop in availability can still exceed it;
+/// the next start reserves that peak and is refused the same way, naming the
+/// setting to raise.
+// T26 T29
+#[tokio::test]
+async fn a_unified_peak_above_the_managed_limit_is_refused_naming_the_setting() {
+    use crate::coordinator::CoordinatorCommandError;
+    use capyctl_store::lifecycle::LifecycleError;
+    let (dir, owner, _, observations) = setup().await;
+    managed_limit(&owner, &observations, 36 * GIB);
+    let big = {
+        let o = owner.lock().unwrap();
+        let source: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+        ))
+        .unwrap();
+        let mut host = source["input"]["host"].clone();
+        host["runtime_profiles"]["local"]["build_fingerprint"] =
+            serde_json::json!("qualification-fake-v1");
+        host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
+            serde_json::json!("secret://another-admin");
+        host["resource_policy"]["domains"]["unified"]["managed_limit"] = serde_json::json!("36GiB");
+        let mut deployment = source["input"]["deployment"].clone();
+        deployment.as_object_mut().unwrap().remove("resources");
+        deployment["name"] = serde_json::json!("big");
+        deployment["routes"] = serde_json::json!(["big"]);
+        deployment["engine_config"]["memory"] = serde_json::json!({"kv_cache": "4GiB"});
+        let receipt = o
+            .store()
+            .create_stopped_managed_configuration(
+                o.session(),
+                "owner",
+                "big",
+                &serde_json::json!({ "config": deployment }).to_string(),
+                &host,
+                1700,
+            )
+            .unwrap();
+        o.store()
+            .record_checkpoint_digest(
+                o.session(),
+                &receipt.deployment_id,
+                receipt.revision,
+                "lab",
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                20 * GIB,
+                1700,
+            )
+            .unwrap();
+        receipt
+    };
+    let baseline = observations[0].available_bytes;
+    let available = Arc::new(AtomicI64::new(baseline));
+    let first = Gate::new(false);
+    let launches = Arc::new(Mutex::new(vec![first.clone()]));
+    let scripted = Arc::new(ScriptedAvailability {
+        domains: observations.clone(),
+        available: available.clone(),
+        sampled: AtomicI64::new(1000),
+    });
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        scripted.clone(),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions {
+            startup_sample_interval: Some(Duration::from_millis(10)),
+            ..Default::default()
+        },
+        Arc::new(move |_| match launches.lock().unwrap().pop() {
+            Some(gate) => Ok(test_driver(gate)),
+            None => Err(CoordinatorError::Service("no scripted engine left".into())),
+        }),
+    )
+    .unwrap();
+    let id = big.deployment_id.clone();
+    let start_big = |key: &str| w.commands().start("owner", &id, big.revision, key, 60_000);
+    // Alone on the host it holds the whole 36 GiB limit; its load drops
+    // availability by 40 GiB, then it settles at Ready.
+    start_big("start-alone").unwrap();
+    first.entered().await;
+    available.store(baseline - 40 * GIB, Ordering::SeqCst);
+    until_sampled(&scripted, 5).await;
+    available.store(baseline - 32 * GIB, Ordering::SeqCst);
+    until_sampled(&scripted, 5).await;
+    first.release.add_permits(1);
+    until("the solo start to reach Ready", || {
+        footprint(&owner, &id).is_some_and(|held| held.phase == ResourcePhase::Ready)
+    })
+    .await;
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    let peak = || -> Option<i64> {
+        sql.query_row(
+            "SELECT peak_bytes FROM startup_measurements WHERE deployment_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .ok()
+    };
+    until("the measured peak", || peak().is_some()).await;
+    assert_eq!(peak(), Some(40 * GIB));
+    available.store(baseline, Ordering::SeqCst);
+    w.commands()
+        .stop("owner", &id, big.revision, "stop-big", 60_000)
+        .unwrap();
+    until("the solo run to stop", || footprint(&owner, &id).is_none()).await;
+    match start_big("start-measured") {
+        Err(CoordinatorCommandError::Lifecycle(LifecycleError::CapacityBeyondLimit(detail))) => {
+            assert_eq!(
+                detail,
+                "host lab needs 40.0 GiB of unified memory, above its whole 36.0 GiB limit \
+                 (raise host.resource_policy.memory.system.managed_limit)"
+            )
+        }
+        other => panic!("{:?}", other.map(|_| "accepted")),
+    }
+    assert!(footprint(&owner, &id).is_none());
+    w.shutdown().await.unwrap();
+}

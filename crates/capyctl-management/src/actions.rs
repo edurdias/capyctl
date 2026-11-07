@@ -839,6 +839,12 @@ fn command_failure(error: CoordinatorCommandError) -> ConfigurationFailure {
             LifecycleError::CapacityBlocked(Some(detail)) => F::CapacityBlockedBecause(format!(
                 "Capacity is unavailable: {detail}; wait, stop another deployment, or start with --evict"
             )),
+            // SPEC §14 (#241): above a managed limit on every host, nothing a
+            // wait, a stop or --evict frees can place it; each host's reason
+            // names the setting to raise instead.
+            LifecycleError::CapacityBeyondLimit(detail) => {
+                F::CapacityBlockedBecause(format!("Capacity is unavailable: {detail}"))
+            }
             LifecycleError::CapacityBlocked(None) => F::CapacityBlocked,
             LifecycleError::StartupRequiresEmptyHost => F::StartupRequiresEmptyHost,
             // Explained with each host's reason by `OwnedActionSource::explain`.
@@ -1286,6 +1292,43 @@ mod tests {
             .starts_with("insufficient_device_memory:"));
         let (_, error) = body(LifecycleError::CheckpointMismatch).await;
         assert_eq!(error["code"], "checkpoint_mismatch", "{error}");
+    }
+
+    /// SPEC §14 (#241, found on a discrete GPU: a measured host-RAM peak above
+    /// the system limit): a start whose need is above a managed limit on every
+    /// host stays `capacity_blocked` (503), and its message names the limit and
+    /// the setting without telling the operator to wait, stop another
+    /// deployment or `--evict`, none of which can place it. A start blocked by
+    /// what others hold keeps that advice.
+    // T05 T23
+    #[tokio::test]
+    async fn a_start_above_a_managed_limit_is_not_told_to_wait_or_evict() {
+        let body = |error: LifecycleError| async move {
+            let response = command_failure(CoordinatorCommandError::Lifecycle(error)).response();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            (status, value["error"].clone())
+        };
+        let detail = "host lab needs 26.3 GiB of system memory, above its whole 16.0 GiB limit \
+                      (raise host.resource_policy.memory.system.managed_limit)";
+        let (status, error) = body(LifecycleError::CapacityBeyondLimit(detail.into())).await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error["code"], "capacity_blocked", "{error}");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains(detail), "{message}");
+        assert!(!message.contains("--evict"), "{message}");
+        assert!(!message.contains("wait"), "{message}");
+        let (_, error) = body(LifecycleError::CapacityBlocked(Some(
+            "host lab needs 10.0 GiB of unified memory, 7.0 GiB free of its 15.0 GiB limit".into(),
+        )))
+        .await;
+        assert!(
+            error["message"].as_str().unwrap().contains("--evict"),
+            "{error}"
+        );
     }
 
     /// SPEC §6.3: after an accepted wake, only "every instance already holds a

@@ -300,7 +300,7 @@ fn act(
             )?;
             Ok(None)
         }
-        Prepared::Unplaceable(_, _, reason) => {
+        Prepared::Unplaceable(_, _, reason, _) => {
             let changed: bool = tx.query_row(
                 "SELECT COALESCE(last_error,'')!=?3 FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2",
                 params![c.deployment_id, c.instance, format!("placement: {reason}")],
