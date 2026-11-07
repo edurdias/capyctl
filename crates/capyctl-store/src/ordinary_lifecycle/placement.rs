@@ -41,10 +41,11 @@ pub(crate) enum Prepared {
     /// is accepted (ADR 0035 §1a).
     Placed(DeploymentFence, Option<TopologyChange>),
     /// No allowed host can take it now; the closed diagnostic, each host's
-    /// reason naming the limit it hit, and the diagnostic as `last_error`
+    /// reason naming the limit it hit, the diagnostic as `last_error`
     /// records it (the code, naming the host-KV limit when that alone
-    /// refused every host).
-    Unplaceable(&'static str, String, String),
+    /// refused every host), and (#241) whether every refusing host refused
+    /// with the need above a managed limit, so no eviction can place it.
+    Unplaceable(&'static str, String, String, bool),
 }
 
 /// [`Prepared::Unplaceable`] for a refusal first judged `code`, as `refused`
@@ -60,7 +61,12 @@ fn unplaced(
     } else {
         code.to_owned()
     };
-    Prepared::Unplaceable(code, refused.detail(hosts, owner), reason)
+    Prepared::Unplaceable(
+        code,
+        refused.detail(hosts, owner),
+        reason,
+        refused.beyond_limits(hosts),
+    )
 }
 
 pub(super) fn strategy(placement: &Placement) -> Strategy {
@@ -1026,6 +1032,9 @@ impl crate::Store {
         // was refused with, when they all were; reported as that code, never
         // masked as a capacity block or a generic ineligible host.
         let mut gated: Option<Option<&'static str>> = None;
+        // SPEC §14 (#241): whether every instance that fit nowhere was
+        // refused with its need above a managed limit on every host.
+        let mut beyond_limits = true;
         for instance in targets {
             // Q5: on demand, one instance is brought up; the rest only fill in
             // where they fit, so a failure to fit is not queued for them.
@@ -1083,11 +1092,12 @@ impl crate::Store {
                         }
                     }
                 }
-                Prepared::Unplaceable(code, why, reason) => {
+                Prepared::Unplaceable(code, why, reason, beyond) => {
                     blocked = true;
                     detail.get_or_insert(why);
                     needs_empty_host &= code == "startup_requires_empty_host";
                     only_ineligible &= code == "host_ineligible";
+                    beyond_limits &= beyond;
                     let gate = (capyctl_config::lmcache::PLACEMENT_REFUSALS.contains(&code)
                         || PLACEMENT_REFUSALS.contains(&code))
                     .then_some(code);
@@ -1128,6 +1138,9 @@ impl crate::Store {
                     detail.unwrap_or_default()
                 )))
             }
+            None if blocked && refusal.is_none() && beyond_limits => Err(
+                LifecycleError::CapacityBeyondLimit(detail.unwrap_or_default()),
+            ),
             None if blocked && refusal.is_none() => Err(LifecycleError::CapacityBlocked(detail)),
             None => Err(refusal.unwrap_or(LifecycleError::CapacityBlocked(detail))),
         }

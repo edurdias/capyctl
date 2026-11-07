@@ -90,7 +90,8 @@ pub const INSUFFICIENT_DEVICE_MEMORY: &str = "insufficient_device_memory";
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HostKvRemedy {
     /// Standalone's embedded host: the limit is the standalone setting
-    /// `host.resource_policy.memory.system.host_kv_limit`. Otherwise the
+    /// `host.resource_policy.memory.system.host_kv_limit` (and a managed limit
+    /// `host.resource_policy.memory.system.managed_limit`, #241). Otherwise the
     /// enrolled host's own `resource_policy.domains.<domain>.host_kv_limit`.
     pub standalone: bool,
     /// The need includes the deployment's LMCache pool (`lmcache_pool`).
@@ -538,10 +539,13 @@ pub fn plan_group_eviction_within(
     Some(plan)
 }
 
-/// Why `candidate` cannot take the instance, in the operator's terms: on the
-/// domain short by the most, what the instance needs, what is free as the
-/// ledger stands and the host's limit there. `None` when no managed limit is
-/// short (the refusal was a host-KV, parked or count limit).
+/// Why `candidate` cannot take the instance, in the operator's terms: what the
+/// instance needs, what is free as the ledger stands and the host's limit
+/// there. SPEC §14 (#241): a domain whose whole limit is below the need is the
+/// one named, as above its whole limit with the setting to raise, since no
+/// eviction makes room there. `None` when no managed limit is short, on a host
+/// offering a device choice for some device (the refusal was a host-KV,
+/// parked or count limit, which other diagnostics name).
 pub fn shortfall(candidate: &HostCandidate, owner: &str) -> Option<String> {
     let bytes = |f: &PhaseFootprint, domain: &str| -> i64 {
         f.allocations
@@ -559,33 +563,103 @@ pub fn shortfall(candidate: &HostCandidate, owner: &str) -> Option<String> {
             .map(|o| &o.footprint)
             .collect()
     };
-    // On a host offering a device choice, the device closest to fitting.
-    footprints
+    // SPEC §14 (#241): a device option blocked by a non-settable card limit
+    // cannot be rescued by raising another limit. Prefer an option without
+    // that blocker; otherwise explain the card, not an ineffective setting.
+    // A merely full option still wins over any above a whole limit, and an
+    // option fitting every managed limit leaves other diagnostics to explain.
+    let derived_card_limit = |beyond: bool, limit: &MemoryLimit| {
+        beyond && candidate.host_kv_remedy.standalone && limit.reserve_absorbs_unmanaged
+    };
+    let shorts: Option<Vec<_>> = footprints
         .into_iter()
-        .flat_map(|footprint| {
-            candidate.limits.iter().filter_map(move |limit| {
-                let need = bytes(footprint, &limit.domain);
-                let used: i64 = candidate
-                    .ledger
-                    .owners
-                    .iter()
-                    .filter(|(id, _)| id.as_str() != owner)
-                    .map(|(_, f)| bytes(f, &limit.domain))
-                    .sum();
-                let free = (limit.managed_bytes - used).max(0);
-                (need > free).then_some((need - free, need, free, limit))
-            })
+        .map(|footprint| {
+            candidate
+                .limits
+                .iter()
+                .filter_map(|limit| {
+                    let need = bytes(footprint, &limit.domain);
+                    let used: i64 = candidate
+                        .ledger
+                        .owners
+                        .iter()
+                        .filter(|(id, _)| id.as_str() != owner)
+                        .map(|(_, f)| bytes(f, &limit.domain))
+                        .sum();
+                    let free = (limit.managed_bytes - used).max(0);
+                    (need > free).then_some((
+                        need > limit.managed_bytes,
+                        need - free,
+                        need,
+                        free,
+                        limit,
+                    ))
+                })
+                .min_by_key(|(beyond, short, _, _, limit)| {
+                    (!*beyond, !derived_card_limit(*beyond, limit), *short)
+                })
         })
-        .min_by_key(|(short, ..)| *short)
-        .map(|(_, need, free, limit)| {
-            format!(
-                "needs {} of {} memory, {} free of its {} limit",
-                gib(need),
-                limit.domain,
-                gib(free),
-                gib(limit.managed_bytes)
-            )
+        .collect();
+    shorts?
+        .into_iter()
+        .min_by_key(|(beyond, short, _, _, limit)| {
+            (*beyond, derived_card_limit(*beyond, limit), *short)
         })
+        .map(|(beyond, _, need, free, limit)| {
+            if beyond {
+                format!(
+                    "needs {} of {} memory, above its whole {} limit ({})",
+                    gib(need),
+                    limit.domain,
+                    gib(limit.managed_bytes),
+                    managed_limit_advice(candidate, limit)
+                )
+            } else {
+                format!(
+                    "needs {} of {} memory, {} free of its {} limit",
+                    gib(need),
+                    limit.domain,
+                    gib(free),
+                    gib(limit.managed_bytes)
+                )
+            }
+        })
+}
+
+/// SPEC §14 (#241): what an operator changes when `limit`, a managed limit on
+/// `candidate`, is below the instance's need: standalone's own setting, the
+/// enrolled host's domain setting, or nothing for a standalone card, whose
+/// limits standalone derives from the card.
+fn managed_limit_advice(candidate: &HostCandidate, limit: &MemoryLimit) -> String {
+    // ADR 0019 §2: `reserve_absorbs_unmanaged` is set on a device domain only.
+    match (
+        candidate.host_kv_remedy.standalone,
+        limit.reserve_absorbs_unmanaged,
+    ) {
+        (true, true) => "a card's limit is derived from the card and is not settable".into(),
+        (true, false) => "raise host.resource_policy.memory.system.managed_limit".into(),
+        (false, _) => format!(
+            "raise the host's resource_policy.domains.{}.managed_limit",
+            local_domain(&limit.domain)
+        ),
+    }
+}
+
+/// SPEC §14 (#241): whether `candidate` cannot take the instance even with
+/// nothing else charged there: every footprint it could run with needs more
+/// than some domain's whole managed limit. No eviction makes room for it.
+fn beyond_limit(candidate: &HostCandidate) -> bool {
+    let above = |footprint: &PhaseFootprint| {
+        candidate
+            .limits
+            .iter()
+            .any(|limit| amount(footprint, &limit.domain).0 > limit.managed_bytes)
+    };
+    if candidate.device_options.is_empty() {
+        above(&candidate.footprint)
+    } else {
+        candidate.device_options.iter().all(|o| above(&o.footprint))
+    }
 }
 
 /// ADR 0033 §6: when no managed limit is short but `candidate`'s host-KV
@@ -656,6 +730,20 @@ impl Unplaceable {
             })
             .collect::<Vec<_>>()
             .join("; ")
+    }
+
+    /// SPEC §14 (#241): whether every refusing host refused for capacity
+    /// with the instance's need above a domain's whole managed limit, so that
+    /// waiting, stopping another deployment or `--evict` cannot place it.
+    pub fn beyond_limits(&self, candidates: &[HostCandidate]) -> bool {
+        !self.refusals.is_empty()
+            && self.refusals.iter().all(|(host, refusal)| {
+                *refusal == HostRefusal::Insufficient
+                    && candidates
+                        .iter()
+                        .find(|c| &c.host_id == host)
+                        .is_some_and(beyond_limit)
+            })
     }
 
     /// The closed diagnostic as an instance's `last_error` records it:
@@ -795,6 +883,71 @@ mod tests {
         );
     }
 
+    // SPEC §14 (#241, found on a discrete GPU: a measured 26.3 GiB host-RAM
+    // peak against a 16 GiB system limit): a need above a domain's whole
+    // managed limit fits even an emptied host nowhere, so the refusal says so
+    // and names the setting to raise (standalone's own, the enrolled host's
+    // domain setting, or none for a card, whose limit standalone derives), and
+    // no eviction can place it. A host that is merely full still can be.
+    // T05 T23
+    #[test]
+    fn a_need_above_the_whole_limit_names_the_setting_and_no_eviction_helps() {
+        let mut standalone = host("spark", 36 * GIB, 0, &[("other", footprint(8 * GIB, None))]);
+        standalone.footprint.allocations[0].bytes = 40 * GIB;
+        standalone.host_kv_remedy.standalone = true;
+        let one = std::slice::from_ref(&standalone);
+        let refused = place(one, "d", Strategy::Spread, None, None).unwrap_err();
+        assert_eq!(
+            refused.detail(one, "d"),
+            "host spark needs 40.0 GiB of unified memory, above its whole 36.0 GiB limit \
+             (raise host.resource_policy.memory.system.managed_limit)"
+        );
+        assert!(refused.beyond_limits(one));
+
+        let mut enrolled = standalone.clone();
+        enrolled.host_id = "lab".into();
+        enrolled.host_kv_remedy.standalone = false;
+        let scoped = "host/1:lab/domain/system";
+        enrolled.footprint.allocations[0].domain = scoped.into();
+        enrolled.limits[0].domain = scoped.into();
+        enrolled.ledger.owners.clear();
+        let one = std::slice::from_ref(&enrolled);
+        let refused = place(one, "d", Strategy::Spread, None, None).unwrap_err();
+        assert_eq!(
+            refused.detail(one, "d"),
+            format!(
+                "host lab needs 40.0 GiB of {scoped} memory, above its whole 36.0 GiB limit \
+                 (raise the host's resource_policy.domains.system.managed_limit)"
+            )
+        );
+
+        let mut card = standalone.clone();
+        card.footprint.allocations[0].domain = "gpu0".into();
+        card.limits[0].domain = "gpu0".into();
+        card.limits[0].reserve_absorbs_unmanaged = true;
+        card.ledger.owners.clear();
+        let one = std::slice::from_ref(&card);
+        let refused = place(one, "d", Strategy::Spread, None, None).unwrap_err();
+        assert_eq!(
+            refused.detail(one, "d"),
+            "host spark needs 40.0 GiB of gpu0 memory, above its whole 36.0 GiB limit \
+             (a card's limit is derived from the card and is not settable)"
+        );
+        assert!(refused.beyond_limits(one));
+
+        let mut full = host("b", 100 * GIB, 0, &[("other", footprint(70 * GIB, None))]);
+        full.footprint.allocations[0].bytes = 40 * GIB;
+        let both = [standalone.clone(), full];
+        let refused = place(&both, "d", Strategy::Spread, None, None).unwrap_err();
+        assert_eq!(
+            refused.detail(&both, "d"),
+            "host b needs 40.0 GiB of unified memory, 30.0 GiB free of its 100.0 GiB limit; \
+             host spark needs 40.0 GiB of unified memory, above its whole 36.0 GiB limit \
+             (raise host.resource_policy.memory.system.managed_limit)"
+        );
+        assert!(!refused.beyond_limits(&both));
+    }
+
     fn with_host_kv(mut candidate: HostCandidate, need: i64, limit: i64) -> HostCandidate {
         candidate.footprint.allocations[0].host_kv_bytes = need;
         candidate.limits[0].host_kv_bytes = Some(limit);
@@ -878,7 +1031,7 @@ mod tests {
         );
 
         // Other constraints are unchanged: a managed limit short as well is
-        // named as before, and `reason` is the closed code alone.
+        // named with the setting to raise, and `reason` is the closed code alone.
         let mut both_short = standalone.clone();
         both_short.limits[0].managed_bytes = 15 * GIB;
         let refused = place(
@@ -891,7 +1044,8 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             refused.detail(std::slice::from_ref(&both_short), "d"),
-            "host spark needs 30.0 GiB of unified memory, 15.0 GiB free of its 15.0 GiB limit"
+            "host spark needs 30.0 GiB of unified memory, above its whole 15.0 GiB limit \
+             (raise host.resource_policy.memory.system.managed_limit)"
         );
         assert_eq!(
             refused.reason(std::slice::from_ref(&both_short), "d"),
@@ -1270,6 +1424,158 @@ mod tests {
                 .device,
             None
         );
+    }
+
+    // SPEC §14 (#241 review): on a host offering a device choice, an option
+    // that fits every managed limit means the managed limits are not what
+    // refused the host, so no device's limit is blamed: another option above
+    // its card's whole limit does not hide the host-KV limit both options
+    // overrun, and the host is not beyond its limits.
+    // T23 T27
+    #[test]
+    fn a_device_option_that_fits_the_managed_limits_leaves_the_other_limit_to_explain() {
+        use crate::device_choice::DeviceOption;
+        let device = |id: &str, bytes: i64| DeviceOption {
+            device: id.into(),
+            domains: vec![id.into()],
+            footprint: PhaseFootprint {
+                phase: ResourcePhase::Cold,
+                allocations: vec![
+                    Allocation {
+                        domain: id.into(),
+                        bytes,
+                        host_kv_bytes: 0,
+                    },
+                    Allocation {
+                        domain: "system".into(),
+                        bytes: 12 * GIB,
+                        host_kv_bytes: 8 * GIB,
+                    },
+                ],
+                devices: vec![],
+            },
+        };
+        let limit = |domain: &str, managed: i64, host_kv: Option<i64>| MemoryLimit {
+            domain: domain.into(),
+            managed_bytes: managed,
+            free_reserve_bytes: 0,
+            reserve_absorbs_unmanaged: domain != "system",
+            host_kv_bytes: host_kv,
+            parked_bytes: None,
+        };
+        let mut candidate = host("host-a", 100 * GIB, 0, &[]);
+        candidate.host_kv_remedy.standalone = true;
+        candidate.limits = vec![
+            limit("gpu0", 30 * GIB, None),
+            limit("gpu1", 30 * GIB, None),
+            limit("system", 100 * GIB, Some(4 * GIB)),
+        ];
+        candidate.device_options = vec![device("gpu0", 40 * GIB), device("gpu1", 20 * GIB)];
+        let one = std::slice::from_ref(&candidate);
+        let refused = place(one, "d", Strategy::Spread, None, None).unwrap_err();
+        assert_eq!(
+            refused.detail(one, "d"),
+            "host host-a: insufficient_capacity: host_kv (needs 8.0 GiB, limit 4.0 GiB; \
+             raise host.resource_policy.memory.system.host_kv_limit or lower the \
+             deployment's host_kv_bytes)"
+        );
+        assert!(!refused.beyond_limits(one));
+    }
+
+    // SPEC §14 (#241 review): name an editable limit when raising it would
+    // admit a device option, not another option's non-settable card limit.
+    // T23 T27
+    #[test]
+    fn a_device_option_with_only_an_editable_shortfall_names_that_setting() {
+        use crate::device_choice::DeviceOption;
+        let device = |id: &str| DeviceOption {
+            device: id.into(),
+            domains: vec![id.into()],
+            footprint: PhaseFootprint {
+                phase: ResourcePhase::Cold,
+                allocations: vec![
+                    Allocation {
+                        domain: id.into(),
+                        bytes: 10 * GIB,
+                        host_kv_bytes: 0,
+                    },
+                    Allocation {
+                        domain: "system".into(),
+                        bytes: 40 * GIB,
+                        host_kv_bytes: 0,
+                    },
+                ],
+                devices: vec![],
+            },
+        };
+        let limit = |domain: &str, managed: i64| MemoryLimit {
+            domain: domain.into(),
+            managed_bytes: managed,
+            free_reserve_bytes: 0,
+            reserve_absorbs_unmanaged: domain != "system",
+            host_kv_bytes: None,
+            parked_bytes: None,
+        };
+        let mut candidate = host("host-a", 100 * GIB, 0, &[]);
+        candidate.host_kv_remedy.standalone = true;
+        candidate.limits = vec![
+            limit("gpu0", 9 * GIB),
+            limit("gpu1", 12 * GIB),
+            limit("system", 36 * GIB),
+        ];
+        candidate.device_options = vec![device("gpu0"), device("gpu1")];
+        for _ in 0..2 {
+            let one = std::slice::from_ref(&candidate);
+            let refused = place(one, "d", Strategy::Spread, None, None).unwrap_err();
+            assert_eq!(
+                refused.detail(one, "d"),
+                "host host-a needs 40.0 GiB of system memory, above its whole 36.0 GiB limit \
+                 (raise host.resource_policy.memory.system.managed_limit)"
+            );
+            assert!(refused.beyond_limits(one));
+            candidate.device_options.reverse();
+        }
+        // Raising the named setting really does admit the other card.
+        candidate.limits[2].managed_bytes = 40 * GIB;
+        assert_eq!(
+            place(
+                std::slice::from_ref(&candidate),
+                "d",
+                Strategy::Spread,
+                None,
+                None
+            )
+            .unwrap()
+            .device
+            .as_deref(),
+            Some("gpu1")
+        );
+
+        // When every card is too small, raising system memory cannot help.
+        candidate.limits[1].managed_bytes = 8 * GIB;
+        candidate.limits[2].managed_bytes = GIB;
+        let one = std::slice::from_ref(&candidate);
+        let refused = place(one, "d", Strategy::Spread, None, None).unwrap_err();
+        assert_eq!(
+            refused.detail(one, "d"),
+            "host host-a needs 10.0 GiB of gpu0 memory, above its whole 9.0 GiB limit \
+             (a card's limit is derived from the card and is not settable)"
+        );
+        assert!(refused.beyond_limits(one));
+
+        // An option that is merely full still keeps ordinary capacity advice.
+        candidate.limits[1].managed_bytes = 12 * GIB;
+        candidate.limits[2].managed_bytes = 40 * GIB;
+        let mut charged = footprint(GIB, None);
+        charged.allocations[0].domain = "system".into();
+        candidate.ledger.owners.insert("other".into(), charged);
+        let one = std::slice::from_ref(&candidate);
+        let refused = place(one, "d", Strategy::Spread, None, None).unwrap_err();
+        assert_eq!(
+            refused.detail(one, "d"),
+            "host host-a needs 40.0 GiB of system memory, 39.0 GiB free of its 40.0 GiB limit"
+        );
+        assert!(!refused.beyond_limits(one));
     }
 }
 
