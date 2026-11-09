@@ -704,9 +704,11 @@ impl CoordinatorLifecycle {
         ) {
             Ok(receipt) => receipt,
             // ADR 0013 §8 rule 2 failed: no allowed host fits without
-            // eviction. W10 makes room instead of refusing.
+            // eviction. W10 makes room instead of refusing; a need above a
+            // managed limit (#241) finds no room and refuses there as before.
             Err(crate::coordinator::CoordinatorCommandError::Lifecycle(
-                capyctl_store::lifecycle::LifecycleError::CapacityBlocked(_),
+                capyctl_store::lifecycle::LifecycleError::CapacityBlocked(_)
+                | capyctl_store::lifecycle::LifecycleError::CapacityBeyondLimit(_),
             )) => return Ok(Activation::Capacity),
             // Owner decision 2026-09-23: a solo first start empties its host
             // through the same switching rules a request uses.
