@@ -51,8 +51,8 @@ fn a_plan_renders_the_frozen_profile_on_the_leased_port() {
     assert_eq!(plan.granted.kv_cache_bytes, Some(4 << 30));
     // ADR 0014 §3: the utilization gate is reserved and rendered by capyctl.
     assert_eq!(
-        plan.granted.gpu_utilization_pct,
-        Some(capyctl_adapters::vllm::GPU_UTILIZATION_GATE_PCT)
+        plan.granted.gpu_utilization_units,
+        Some(u64::from(capyctl_adapters::vllm::GPU_UTILIZATION_GATE_PCT) * 100_000_000)
     );
     assert_eq!(plan.granted.swap_space_bytes, None);
     assert!(plan.api_key.is_none());
@@ -516,8 +516,8 @@ fn a_discrete_plan_sizes_utilization_from_the_device_request() {
     // refuse such a launch before building it (`with_device_total`).
     let gated = plan_from_effective(&effective, 8123, "l".into(), "/r".into()).unwrap();
     assert_eq!(
-        gated.granted.gpu_utilization_pct,
-        Some(capyctl_adapters::vllm::GPU_UTILIZATION_GATE_PCT)
+        gated.granted.gpu_utilization_units,
+        Some(u64::from(capyctl_adapters::vllm::GPU_UTILIZATION_GATE_PCT) * 100_000_000)
     );
     assert!(effective.clone().with_device_total(|_| None).is_err());
     assert!(effective
@@ -528,12 +528,12 @@ fn a_discrete_plan_sizes_utilization_from_the_device_request() {
         .with_device_total(|index| (index == 0).then_some(16376 << 20))
         .unwrap();
     let plan = plan_from_effective(&sized, 8123, "l".into(), "/r".into()).unwrap();
-    assert_eq!(plan.granted.gpu_utilization_pct, Some(76));
+    assert_eq!(plan.granted.gpu_utilization_units, Some(7_503_663_899));
     assert_eq!(plan.granted.kv_cache_bytes, Some(4 << 30));
     let argv = render_command(&plan).unwrap().argv;
     assert!(argv
         .windows(2)
-        .any(|w| w == ["--gpu-memory-utilization", "0.76"]));
+        .any(|w| w == ["--gpu-memory-utilization", "0.7503663899"]));
     // A unified deployment is never given a device total.
     let unified = effective_with_deep_park_disabled();
     let same = unified.clone().with_device_total(|_| Some(1)).unwrap();
@@ -625,17 +625,34 @@ fn a_declared_request_takes_the_floor_off_the_cards_utilization() {
         derived.ready_device_allocation(),
         Some((Some(0), floor + overhead))
     );
-    assert_eq!(utilization(&derived), "0.75");
+    assert_eq!(utilization(&derived), "0.7500000000");
 
     let declared = pro_6000(json!({"request": "43GiB", "kv_cache": "12GiB"}));
     assert_eq!(declared.engine_config.memory().request_bytes, 43 * GIB);
     let charged = 43 * GIB + overhead;
     assert_eq!(declared.ready_device_allocation(), Some((Some(0), charged)));
-    assert_eq!(utilization(&declared), "0.45");
+    assert_eq!(utilization(&declared), "0.4498247980");
     let plan = plan_from_effective(&declared, 8123, "l".into(), "/r".into()).unwrap();
     assert_eq!(plan.granted.kv_cache_bytes, Some(12 * GIB));
     // The issue's second model (a 22.6 GiB request and its CUDA context)
     // fits beside it within the card's managed limit.
     let second = (226 * GIB) / 10 + overhead;
     assert!(charged + second <= 90056 << 20);
+}
+
+// T14 T26 — ADR 0014 §7: recorded revisions re-render without a schema migration.
+#[test]
+fn a_recorded_vllm_plan_decodes_and_renders_with_precise_utilization() {
+    let source: Value = serde_json::from_str(include_str!(
+        "../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+    ))
+    .unwrap();
+    let effective =
+        capyctl_config::effective::decode_effective_snapshot(&source["effective"].to_string())
+            .unwrap();
+    let plan = plan_from_effective(&effective, 8123, "l".into(), "/r".into()).unwrap();
+    let argv = render_command(&plan).unwrap().argv;
+    assert!(argv
+        .windows(2)
+        .any(|w| w == ["--gpu-memory-utilization", "0.1000000000"]));
 }

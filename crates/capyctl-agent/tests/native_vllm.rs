@@ -2132,7 +2132,7 @@ fn discrete_fixture() -> Fixture {
 /// sample. A slow sampler that looks at the journal from inside its own run
 /// always finds both locks free. The engine is sized from the same sample:
 /// its utilization is the device request's share of the card (12 GiB of
-/// 16376 MiB rounds up to 0.76), with the grant's KV bytes.
+/// 16376 MiB rounds up to 0.7503663899), with the grant's KV bytes.
 // T26 T16 T13
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_slow_gpu_sample_never_holds_the_journal_lock() {
@@ -2176,7 +2176,7 @@ async fn a_slow_gpu_sample_never_holds_the_journal_lock() {
     let argv: Vec<String> = serde_json::from_value(record["argv"].clone()).unwrap();
     assert!(
         argv.windows(2)
-            .any(|w| w == ["--gpu-memory-utilization", "0.76"]),
+            .any(|w| w == ["--gpu-memory-utilization", "0.7503663899"]),
         "{argv:?}"
     );
     assert!(
@@ -2215,7 +2215,7 @@ fn pro_6000_fixture() -> Fixture {
 
 /// #225 (ADR 0019 §4 as amended): a vLLM deployment that declares its memory
 /// request on a discrete card is told that request's share of the card
-/// (43 GiB of 97887 MiB rounds up to 0.45), not 0.75 of it. vLLM checks at
+/// (43 GiB of 97887 MiB rounds up to 0.4498247980), not 0.75 of it. vLLM checks at
 /// start that its share of the card is free, so with 0.75 a model holding a
 /// quarter of the card (the issue's 22.6 GiB SGLang deployment) kept it from
 /// starting although CapyCTL charged it 44.25 GiB. The KV bytes are the
@@ -2244,7 +2244,7 @@ async fn a_declared_request_on_a_card_is_rendered_as_its_share() {
     let argv: Vec<String> = serde_json::from_value(record["argv"].clone()).unwrap();
     assert!(
         argv.windows(2)
-            .any(|w| w == ["--gpu-memory-utilization", "0.45"]),
+            .any(|w| w == ["--gpu-memory-utilization", "0.4498247980"]),
         "{argv:?}"
     );
     assert!(
