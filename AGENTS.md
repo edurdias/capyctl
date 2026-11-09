@@ -124,7 +124,7 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   above (no new environments beyond the listed exceptions) still apply to the lab
   hosts.
 - Do not change engine environments, drivers, or reboot hosts. The engine virtual
-  environments in use, all owner-approved (list updated 2026-11-03):
+  environments in use, all owner-approved (list updated 2026-11-09):
   - both hosts: SGLang 0.5.21, SGLang 0.5.22 (approved 2026-10-17, for decision
     models), vLLM 0.30.0, TensorFold 0.6.5 and TensorFold 0.6.6
     (on host B, each TensorFold venv is a byte-identical copy of host A's, made with
@@ -148,6 +148,14 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     fork (~/exllamav3-mia-venv, commit 63b32f00, torch 2.13.0 cu130) with their
     deployment kit (~/mia-kit, commit 12421873), approved 2026-11-03 for comparing
     their EXL3 Qwen3.8-27B checkpoint as a custom engine (ADR 0031);
+  - host A, approved 2026-11-09: vLLM 0.33.0 (~/vllm-0.33.0-venv), for qualifying
+    it (#239) and the DFlash prefix-cache fix, to be copied byte-identical to host B
+    once qualified; and a llama.cpp build at b11556 or newer in the home directory,
+    for comparing PrismML's Ternary Bonsai 2 27B (Hadamard-rotated ternary GGUF) with
+    the NVFP4 builds;
+  - the maintainer's discrete-GPU laptop, approved 2026-11-09: the official
+    `lmsysorg/sglang:v0.5.22` Docker image, for the live check of #230 (an editable
+    SGLang refused at `engine add`);
   - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B;
   - the rented two-GPU machine of ADR 0035 §14 (owner decision 2026-10-25), for
     its one session only: fresh x86_64 CUDA installs of vLLM 0.32.0

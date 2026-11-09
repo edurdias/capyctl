@@ -423,9 +423,10 @@ on SGLang 0.5.21 (12.6 GiB in use); with `context_length: 16384` it did so on vL
 too. With another program listening on the first port of the range, the SGLang launch
 leased the next one.
 
-### Note of 2026-10-30 on amendment A1: the startup rule without the weights (proposed, #219)
+### Note of 2026-10-30 on amendment A1: the startup rule without the weights (accepted 2026-11-09, #219)
 
-Proposed for owner review with issue #219 (branch `fix/discrete-first-start`).
+Owner decision 2026-11-09: accepted as written (issue #219, PR #232), to be confirmed by a live
+check on a discrete card before 0.1.11 is published.
 
 Problem: A1's rule that an undeclared `memory.startup` beside a request declared for a card
 is the request was applied only when the checkpoint's weights were known at resolution.
@@ -526,9 +527,10 @@ Owner decisions 2026-10-25 ([ADR 0035](0035-multi-gpu-one-host.md)).
   GPU showed, stored per revision, host, installation and N, and applied to every GPU of a
   later start at that N; a record from before ADR 0035 is the N = 1 record.
 
-## Amendment of 2026-10-30: a declared vLLM request is rendered as its own share (proposed, #225)
+## Amendment of 2026-10-30: a declared vLLM request is rendered as its own share (accepted 2026-11-09, #225)
 
-Proposed for owner review with issue #225 (branch `fix/vllm-discrete-request`).
+Owner decision 2026-11-09: accepted as written (issue #225, PR #233); the 0.75 floor for a
+request CapyCTL derives stays until a live test on a 16 GB card shows whether it can go.
 
 Problem: found on a 96 GB RTX PRO 6000 with vLLM 0.32.0. §3's 0.75 floor was applied twice:
 to a request CapyCTL derives, and to the `--gpu-memory-utilization` §4 renders from any
