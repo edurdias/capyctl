@@ -1515,7 +1515,11 @@ pub const CHECKPOINT_REFUSALS: &[&str] = &[
 /// launch's allocation there with its free reserve kept, now or beside every
 /// claimed launch. ADR 0029 §6: `engine_config_file`: a llama.cpp launch on a
 /// host where `/etc/llama.cpp/config.ini` exists (llama-server would fill
-/// every option the command leaves unset from it).
+/// every option the command leaves unset from it). #198 (ADR 0008 amendment
+/// 2026-10-30): `installation_unsupported:editable`: an SGLang installed in
+/// editable mode, which its protected entry can never import, whatever the
+/// drift policy; a host sends it only to a server that listed
+/// `capabilities::INSTALLATION_UNSUPPORTED`.
 pub const POLICY_REFUSALS: &[&str] = &[
     "checkpoint_mismatch",
     "checkpoint_unverified",
@@ -1530,6 +1534,7 @@ pub const POLICY_REFUSALS: &[&str] = &[
     "capability_missing:deep_park",
     "capability_missing:core",
     "engine_config_file",
+    "installation_unsupported:editable",
 ];
 
 /// Whether `reason` is one of the closed [`POLICY_REFUSALS`].

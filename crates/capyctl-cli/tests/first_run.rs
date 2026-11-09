@@ -194,6 +194,88 @@ fn engine_add_with_a_state_dir_too_long_for_its_socket_writes_nothing() {
     );
 }
 
+// T07 T21 #198 (ADR 0008 amendment 2026-10-30): the official lmsysorg/sglang
+// image installs SGLang in editable mode, which the protected entry (`-I -S`,
+// no .pth files) can never import. `engine add` refuses it before anything
+// runs, `installation_unsupported:editable`, exit 17, and writes nothing; the
+// same environment reinstalled as a regular package is added.
+#[test]
+fn engine_add_refuses_an_editable_sglang_before_anything_runs() {
+    let root = private_dir();
+    mkdir(&root.path().join("home"));
+    let env = root.path().join("opt/sglang");
+    let site = env.join("lib/python3.12/site-packages");
+    std::fs::create_dir_all(site.join("sglang-0.5.22.dist-info")).unwrap();
+    std::fs::write(
+        site.join("sglang-0.5.22.dist-info/METADATA"),
+        "Name: sglang\nVersion: 0.5.22\n",
+    )
+    .unwrap();
+    std::fs::write(
+        site.join("__editable__.sglang-0.5.22.pth"),
+        "import __editable___sglang_0_5_22_finder; __editable___sglang_0_5_22_finder.install()\n",
+    )
+    .unwrap();
+    let checkout = root.path().join("sgl-workspace/sglang/python/sglang");
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::fs::write(
+        site.join("__editable___sglang_0_5_22_finder.py"),
+        format!("MAPPING = {{'sglang': '{}'}}\n", checkout.display()),
+    )
+    .unwrap();
+    std::fs::create_dir_all(env.join("bin")).unwrap();
+    // The interpreter would answer the version check and the probe; it must
+    // never be run for an installation that is refused.
+    let ran = root.path().join("interpreter-ran");
+    let report = json!({"schema": "capyctl/engine-capabilities/v1", "engine": "sglang",
+        "capabilities": {"core": [], "deep_park": [], "metrics": [], "observation": []}});
+    script(
+        &env.join("bin/python3"),
+        &format!(
+            "touch '{}'\ncase \"$*\" in *importlib.metadata*) echo 0.5.22 ;; *) echo '{report}' ;; esac",
+            ran.display()
+        ),
+    );
+    let engines = root.path().join("home/.config/capyctl/engines.yaml");
+    let output = capyctl(
+        root.path(),
+        root.path(),
+        &["engine", "add", env.to_str().unwrap(), "--json"],
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(17), "{}", text(&output));
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap_or_default();
+    assert_eq!(
+        error["code"],
+        "installation_unsupported:editable",
+        "{}",
+        text(&output)
+    );
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("editable") && message.contains("nothing was written"),
+        "{message}"
+    );
+    assert!(!ran.exists(), "the interpreter ran: {}", text(&output));
+    assert!(!engines.exists(), "{}", text(&output));
+
+    // Reinstalled without -e: the package is in site-packages, the hook gone.
+    std::fs::remove_file(site.join("__editable__.sglang-0.5.22.pth")).unwrap();
+    std::fs::remove_file(site.join("__editable___sglang_0_5_22_finder.py")).unwrap();
+    std::fs::create_dir_all(site.join("sglang/srt")).unwrap();
+    std::fs::write(site.join("sglang/__init__.py"), "").unwrap();
+    let output = capyctl(
+        root.path(),
+        root.path(),
+        &["engine", "add", env.to_str().unwrap(), "--json"],
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(std::fs::read_to_string(&engines)
+        .unwrap()
+        .contains("\"sglang\""));
+}
+
 struct Role(AtomicUsize);
 #[async_trait::async_trait]
 impl ControlHandler for Role {

@@ -158,6 +158,10 @@ pub struct NativeHostExecution {
     lmcache_verdicts: Arc<lmcache::LmcacheVerdicts>,
     /// ADR 0033 §12: the load source that samples the LMCache servers.
     host_load: Arc<crate::load::HostLoad>,
+    /// ADR 0017, #198: what the connected server's SessionReady listed; a
+    /// refusal it does not take is never reported to it
+    /// (`capabilities::server_takes_refusal`). Empty until a session is ready.
+    server_capabilities: Arc<Mutex<Vec<String>>>,
 }
 
 /// A GPU sample taken for one command before the journal was locked, and when.
@@ -299,6 +303,7 @@ impl NativeHostExecution {
             lmcache_dirs: None,
             lmcache_verdicts: Arc::default(),
             host_load,
+            server_capabilities: Arc::default(),
         });
         this.prime_gpu();
         this
@@ -2900,6 +2905,12 @@ impl SessionExecution for NativeHostExecution {
             let _ = self.ingress.close_all();
         }
     }
+    fn server_ready(&self, capabilities: &[String]) {
+        *self
+            .server_capabilities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = capabilities.to_vec();
+    }
     fn load_interval(&self) -> std::time::Duration {
         self.load
             .as_ref()
@@ -5338,6 +5349,67 @@ mod tests {
             assert_eq!(
                 profiles[0].installation_observed_digest,
                 crate::installation::UNMEASURED
+            );
+        }
+    }
+
+    /// T21 T34 #198 (ADR 0017, ADR 0008 amendment 2026-10-30): a launch of
+    /// an editable SGLang is refused `installation_unsupported:editable`
+    /// before any effect only toward a server whose SessionReady listed
+    /// `installation_unsupported`. Toward an older server (0.1.10's list, or
+    /// none before a session is ready), whose refusal check would end the
+    /// whole session on the code, admission goes on as before #198 (here to
+    /// the fixture's unrecorded checkpoint, the next gate) and the entry
+    /// fails the launch `engine_import_failed` instead.
+    #[test]
+    fn an_editable_sglang_is_refused_only_toward_a_server_that_takes_the_code() {
+        let older = vec![
+            capyctl_protocol::capabilities::LIVE_PROFILE_UPDATE.to_owned(),
+            capyctl_protocol::capabilities::LMCACHE.to_owned(),
+        ];
+        for (server, expected) in [
+            (None, "checkpoint_mismatch"),
+            (Some(older), "checkpoint_mismatch"),
+            (
+                Some(capyctl_protocol::capabilities::server_capabilities()),
+                crate::installation::EDITABLE_REFUSAL,
+            ),
+        ] {
+            let root = directory();
+            let identity_dir = directory();
+            let venv = root.path().join("opt/sglang");
+            let site = venv.join("lib/python3.12/site-packages");
+            std::fs::create_dir_all(site.join("sglang-0.5.22.dist-info")).unwrap();
+            std::fs::write(
+                site.join("__editable__.sglang-0.5.22.pth"),
+                "import __editable___sglang_0_5_22_finder; __editable___sglang_0_5_22_finder.install()\n",
+            )
+            .unwrap();
+            std::fs::create_dir_all(venv.join("bin")).unwrap();
+            std::fs::write(venv.join("bin/python3"), "").unwrap();
+            let executable = venv.join("bin/python3");
+            let (executor, deployment, policy) = sglang_fixture_with(
+                root.path(),
+                identity_dir.path(),
+                "restart_only",
+                |document| {
+                    document["runtime_profiles"]["local"]["executable"] =
+                        executable.to_string_lossy().into_owned().into();
+                },
+            );
+            sglang_runtime(root.path());
+            if let Some(server) = &server {
+                executor.server_ready(server);
+            }
+            let (mut launch, _) = launch_with(&deployment, &policy, "");
+            launch.identity.payload_digest = launch.canonical_digest();
+            let MemberAction::LaunchSingle(plan) = launch.action.clone() else {
+                panic!("a launch");
+            };
+            assert_eq!(
+                executor.admit_launch(&launch, &plan, GpuReading::Now),
+                Err(LaunchVerdict::Refused(expected)),
+                "{server:?}"
             );
         }
     }
