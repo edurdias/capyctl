@@ -610,3 +610,152 @@ fn a_revision_frozen_before_the_eager_cap_keeps_its_placeholder() {
         old_small
     );
 }
+
+/// #219: the issue's 16 GB laptop card (16376 MiB, a 14.7 GiB managed limit)
+/// as a discrete host: host RAM in `system`, the card in `gpu0`, an SGLang
+/// profile.
+fn laptop_card() -> (Value, Value) {
+    let (mut deployment, mut host) = fixture();
+    host["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "24GiB", "free_reserve": "8GiB",
+                   "parked_limit": "16GiB", "host_kv_limit": "4GiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "15052MiB",
+                 "free_reserve": "1324MiB", "parked_limit": "2GiB"}
+    });
+    host["resource_policy"]["devices"] = json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["engine"] = "sglang".into();
+    profile["args"] = json!([]);
+    profile["security"]["admin_credential_ref"] = "secret://admin-key".into();
+    deployment["residency"] = json!("restart_only");
+    // The issue's request: 12.86 GiB (FP8 weights of about 11.3 GiB and a
+    // 16k context), declared, so acceptance resolves it before the weights
+    // are known.
+    deployment["engine_config"]["memory"] = json!({"request": "13169MiB", "kv_cache": "1GiB"});
+    (deployment, host)
+}
+
+/// The card's part of a phase.
+fn on_card(phase: &capyctl_config::effective::PhaseFootprint) -> i64 {
+    phase
+        .allocations
+        .iter()
+        .find(|a| a.domain == "gpu0")
+        .map(|a| a.bytes)
+        .unwrap()
+}
+
+/// #219 (ADR 0019 amendment A1): a request declared for a discrete card has
+/// an undeclared startup peak equal to the request, whether or not the
+/// checkpoint's weights are known when the revision is resolved. Acceptance
+/// resolves a declared request without them, and the revision then took the
+/// unified placeholder (request plus the first-start graph allowance), so the
+/// issue's first start was charged 15.4 GiB of a card that manages 14.7 GiB
+/// and could never start, although its Ready charge (14.1 GiB) fits.
+// T14 T26
+#[test]
+fn a_request_declared_for_a_card_starts_at_its_ready_charge_before_the_weights_are_known() {
+    let (deployment, host) = laptop_card();
+    let request = 13169_i64 << 20;
+    let limit = 15052_i64 << 20;
+    for facts in [CheckpointFacts::default(), weights(11571 << 20)] {
+        let effective = resolve_effective_with_checkpoint(&deployment, &host, facts).unwrap();
+        assert_eq!(on_card(&effective.resources.ready), request + OVERHEAD);
+        assert_eq!(
+            on_card(&effective.resources.cold),
+            request + OVERHEAD,
+            "{facts:?}: the first start is charged the Ready figure, not the graph allowance on top"
+        );
+        assert!(on_card(&effective.resources.cold) <= limit);
+        assert_eq!(
+            effective.engine_config.memory().startup_bytes,
+            Some(request)
+        );
+        assert_eq!(effective.engine_config.memory().startup_graphs_bytes, None);
+        // An estimate, measured on the first run (ADR 0019 amendment A2).
+        assert_eq!(
+            startup_budget(&effective).provenance,
+            StartupProvenance::Default
+        );
+        assert!(capyctl_config::effective::startup_measure(&effective).is_some());
+        let snapshot = serde_json::to_string(&effective).unwrap();
+        assert_eq!(decode_effective_snapshot(&snapshot).unwrap(), effective);
+    }
+}
+
+/// #219: a revision frozen before the fix, which took the placeholder with
+/// its graph allowance (it records `startup_graphs_bytes`), re-resolves
+/// exactly as it was; a new revision of the same deployment gets the rule.
+// T14
+#[test]
+fn a_card_revision_frozen_with_the_placeholder_keeps_it() {
+    let (deployment, host) = laptop_card();
+    let request = 13169_i64 << 20;
+    // What the previous release froze: the placeholder, with its graph
+    // allowance recorded.
+    let frozen = CheckpointFacts {
+        legacy_device_placeholder: true,
+        ..Default::default()
+    };
+    let old = resolve_effective_with_checkpoint(&deployment, &host, frozen).unwrap();
+    let snapshot = serde_json::to_value(&old).unwrap();
+    assert_eq!(
+        snapshot["engine_config"]["memory"]["startup_graphs_bytes"],
+        json!(GRAPHS)
+    );
+    assert_eq!(
+        snapshot["engine_config"]["memory"]["startup_bytes"],
+        json!(request + GRAPHS)
+    );
+    let decoded = decode_effective_snapshot(&snapshot.to_string()).unwrap();
+    assert_eq!(decoded, old);
+    assert_eq!(
+        on_card(&decoded.resources.cold),
+        request + GRAPHS + OVERHEAD
+    );
+    // A new revision of the same deployment starts at its Ready charge, and
+    // its snapshot cannot claim the placeholder.
+    let new = resolve_effective(&deployment, &host).unwrap();
+    assert_eq!(on_card(&new.resources.cold), request + OVERHEAD);
+    let mut forged = serde_json::to_value(&new).unwrap();
+    forged["engine_config"]["memory"]["startup_bytes"] = json!(request + GRAPHS);
+    assert!(decode_effective_snapshot(&forged.to_string()).is_err());
+}
+
+/// #219: a declared `memory.startup` replaces the placeholder: the card is
+/// charged it and the engine's CUDA context, and nothing is added for the
+/// graphs, so a startup equal to the request starts at the Ready charge.
+/// A declared peak whose charge the card cannot hold is named by
+/// [`capyctl_config::effective::startup_over_limit`]: such a revision can
+/// never start, since a declared peak is never replaced by a measurement.
+// T14 T26
+#[test]
+fn a_declared_startup_on_a_card_is_charged_with_the_cuda_context_only() {
+    let (mut deployment, host) = laptop_card();
+    let request = 13169_i64 << 20;
+    let limit = 15052_i64 << 20;
+    deployment["engine_config"]["memory"]["startup"] = json!("13169MiB");
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    assert_eq!(on_card(&effective.resources.cold), request + OVERHEAD);
+    assert_eq!(
+        startup_budget(&effective).provenance,
+        StartupProvenance::Declared
+    );
+    assert_eq!(
+        capyctl_config::effective::startup_over_limit(&effective),
+        None
+    );
+
+    deployment["engine_config"]["memory"]["startup"] = json!("14GiB");
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    assert_eq!(on_card(&effective.resources.cold), 14 * GIB + OVERHEAD);
+    assert_eq!(
+        capyctl_config::effective::startup_over_limit(&effective),
+        Some(capyctl_config::effective::StartupOverLimit {
+            host: "lab".into(),
+            domain: "gpu0".into(),
+            bytes: 14 * GIB + OVERHEAD,
+            limit_bytes: limit,
+        })
+    );
+}

@@ -1349,12 +1349,17 @@ async fn a_discrete_startup_peak_is_measured_per_memory_domain() {
     .unwrap();
     let first = w.start(&fence, 60_000).unwrap();
     gate.entered().await;
-    // The placeholders: on the card the derived startup and the CUDA
-    // context, in host RAM the engine host overhead.
+    // The placeholders: on the card the request and the CUDA context (ADR
+    // 0019 amendment A1, #219: a declared request's startup peak is the
+    // request, so the first start is charged its Ready figure), in host RAM
+    // the engine host overhead.
     let cold = footprint(&owner, &fence.deployment_id).unwrap();
     assert_eq!(cold.phase, ResourcePhase::Cold);
     let estimate = on(&cold, "gpu0");
-    assert!(estimate > 14 * GIB, "{estimate}");
+    assert_eq!(
+        estimate,
+        12 * GIB + capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES
+    );
     assert_eq!(on(&cold, "system"), RAM);
     let placeholder = instance_startup(&owner, &fence.deployment_id);
     assert_eq!(placeholder["device_provenance"], "default", "{placeholder}");

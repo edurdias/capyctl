@@ -422,6 +422,37 @@ on SGLang 0.5.21 (12.6 GiB in use); with `context_length: 16384` it did so on vL
 too. With another program listening on the first port of the range, the SGLang launch
 leased the next one.
 
+### Note of 2026-10-30 on amendment A1: the startup rule without the weights (proposed, #219)
+
+Proposed for owner review with issue #219 (branch `fix/discrete-first-start`).
+
+Problem: A1's rule that an undeclared `memory.startup` beside a request declared for a card
+is the request was applied only when the checkpoint's weights were known at resolution.
+Acceptance resolves a declared request without them, so such a revision took the unified
+placeholder: the request plus ADR 0014 amendment A8's first-start graph allowance (1.25 GiB,
+doubled for a draft model), charged on the card beside the CUDA context. On a 16 GB card
+(14.7 GiB managed) a 12.86 GiB request was charged 15.4 GiB at every start and never started,
+since a card has no solo first start and nothing was ever measured.
+
+Rule:
+
+- **A1 applies whether or not the weights are known.** A request declared for a card,
+  without `memory.startup` or `resources:`, has a startup peak equal to the request, on one
+  GPU and on each of N GPUs of one host (ADR 0035 §3), a speculative deployment included: A8's
+  graph allowance no longer applies to a request declared for a card. The first start is
+  charged the Ready figure (provenance `default`) until amendment A2 measures it. A revision
+  frozen with the placeholder (it records `startup_graphs_bytes`) keeps it.
+- **The host charges the server's figure.** The server sends a launch on a card its startup
+  figures per domain (`startup_bytes`, `startup_host_bytes`, amendment A2) for an
+  unmeasured start too, whenever the host declares `startup_host_bytes`, so a host that
+  resolves the estimate by the earlier rule charges what the server reserved. A host without
+  the capability gets the plan it always got.
+- **A start a card can never admit is shown.** `validate config --host` and `status
+  deployment` name the host, the card, the startup charge and the managed limit
+  (`startup.over_limit`) for the card the revision was resolved on.
+
+CPU and Fake-engine tests only; not yet checked live.
+
 ## Amendment A2: the startup peak is measured per memory domain (owner decision 2026-10-21)
 
 Problem: found during the discrete container qualification (2026-10-21, the 16 GB laptop

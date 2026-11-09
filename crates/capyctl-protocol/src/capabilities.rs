@@ -107,11 +107,13 @@ pub const DECISIONS: &str = capyctl_config::decisions::HOST_CAPABILITY;
 /// host that declared it; any other is refused
 /// `host_capability_missing:custom_engines` before anything is sent.
 pub const CUSTOM_ENGINES: &str = capyctl_config::custom::CAPABILITY;
-/// ADR 0019 §3: a LaunchSingle plan's `startup_host_bytes`, sent only for a
-/// launch on a discrete GPU whose startup peak the server measured per memory
-/// domain. A host without it is refused
-/// `host_capability_missing:startup_host_bytes` for such a launch before
-/// anything is sent; every other launch needs nothing.
+/// ADR 0019 §3: a LaunchSingle plan's `startup_host_bytes`, sent for a launch
+/// on a discrete GPU whose startup peak the server measured per memory
+/// domain, and (#219) for an unmeasured one on a host that declared it, so
+/// the host charges the server's figure. A host without it is refused
+/// `host_capability_missing:startup_host_bytes` for a measured launch before
+/// anything is sent and gets an unmeasured one without the field; every other
+/// launch needs nothing.
 pub const STARTUP_HOST_BYTES: &str = "startup_host_bytes";
 /// ADR 0033 §13: the host runs LMCache (ADR 0033): it renders the connector,
 /// owns the private server per instance and reads the `lmcache` setting of

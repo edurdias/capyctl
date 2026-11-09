@@ -877,3 +877,110 @@ fn the_short_pin_form_is_accepted_and_placed_on_its_gpu() {
         .unwrap();
     assert_eq!(sharing, "shared");
 }
+
+// #219 (ADR 0019 amendment A1): the issue's first start on a 16 GB laptop
+// card (a 15052 MiB managed limit, 14.7 GiB): SGLang with a declared
+// 12.86 GiB request, accepted before the checkpoint's weights are known.
+// Its Ready charge (14.1 GiB with the CUDA context) fits the card; its first
+// start was charged the unified placeholder's graph allowance on top
+// (15.4 GiB) and was refused for room on every start. Now the first start is
+// placed, admitted and charged its Ready figure, and status shows the card's
+// startup figure as the estimate a first run measures.
+// T26 T14 T16
+#[test]
+fn a_request_declared_for_a_card_starts_when_its_ready_charge_fits() {
+    let mut t = gpus("15052MiB");
+    let profile = &mut t.host["runtime_profiles"]["local"];
+    profile["engine"] = "sglang".into();
+    profile["args"] = json!([]);
+    profile["security"]["admin_credential_ref"] = "secret://admin-key".into();
+    let request = 13169 * (1 << 20);
+    let id = t.deploy_as(
+        "issue",
+        json!({"devices": [{"id": "gpu0", "sharing": "shared"}], "instances": 1,
+               "engine_config": {"memory": {"request": "13169MiB", "kv_cache": "1GiB"}}}),
+    );
+    t.start(&id, "start-issue", StartScope::All);
+    let planned = t.planned(&id);
+    assert_eq!(planned.len(), 1, "the first start is placed");
+    assert_eq!(planned[0].2, "gpu0");
+    t.ready(&planned[0].0, 500);
+    assert_eq!(t.charged("gpu0"), request + OVERHEAD);
+    // Nothing was measured here: status shows the estimate a start reserves.
+    let snapshot = t.store.snapshot().unwrap();
+    let startup = snapshot
+        .deployments
+        .iter()
+        .find(|d| d.id == id)
+        .and_then(|d| d.startup.clone())
+        .unwrap();
+    let split = startup.split.unwrap();
+    assert_eq!(split.device_bytes, request + OVERHEAD);
+    assert_eq!(
+        split.device_provenance,
+        capyctl_config::effective::StartupProvenance::Default
+    );
+}
+
+// #219 (ADR 0019 §3): a declared startup peak whose charge on the card (the
+// peak and the engine's CUDA context) is above the card's managed limit is
+// never admitted, and a declared peak is never replaced by a measurement.
+// Status names the card, the charge and the limit, so a deployment that can
+// never start is visible before a start is refused.
+// T26 T14
+#[test]
+fn status_names_a_card_whose_startup_charge_is_above_its_limit() {
+    let t = gpus("15052MiB");
+    let id = t.deploy_as(
+        "too-big",
+        json!({"devices": [{"id": "gpu0", "sharing": "shared"}], "instances": 1,
+               "engine_config": {"memory": {"request": "13169MiB", "kv_cache": "1GiB",
+                                            "startup": "14GiB"}}}),
+    );
+    let snapshot = t.store.snapshot().unwrap();
+    let startup = snapshot
+        .deployments
+        .iter()
+        .find(|d| d.id == id)
+        .and_then(|d| d.startup.clone())
+        .unwrap();
+    assert_eq!(
+        startup.over_limit,
+        Some(capyctl_config::effective::StartupOverLimit {
+            host: "lab".into(),
+            domain: "gpu0".into(),
+            bytes: 14 * GIB + OVERHEAD,
+            limit_bytes: 15052 << 20,
+        })
+    );
+    let refused = t
+        .store
+        .accept_scoped_start_command(
+            &t.session,
+            "owner",
+            &id,
+            StartScope::All,
+            t.store.current_revision(&id).unwrap().unwrap(),
+            "start-too-big",
+            NOW,
+            DEADLINE,
+            None,
+        )
+        .unwrap_err();
+    assert!(format!("{refused:?}").contains("gpu0"), "{refused:?}");
+    // One that fits shows nothing.
+    let fits = t.deploy_as(
+        "fits",
+        json!({"devices": [{"id": "gpu0", "sharing": "shared"}], "instances": 1,
+               "engine_config": {"memory": {"request": "13169MiB", "kv_cache": "1GiB",
+                                            "startup": "13169MiB"}}}),
+    );
+    let snapshot = t.store.snapshot().unwrap();
+    let startup = snapshot
+        .deployments
+        .iter()
+        .find(|d| d.id == fits)
+        .and_then(|d| d.startup.clone())
+        .unwrap();
+    assert_eq!(startup.over_limit, None);
+}

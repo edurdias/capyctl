@@ -208,6 +208,28 @@ deployment that does not park gets no loader choice from
 CapyCTL either way. See
 [Add an engine](../guide/engines.md#vllm-weight-loading-while-parking).
 
+On a discrete GPU, a deployment's `engine_config.memory.request` is the card
+memory the engine may use (the weights, the KV cache and a margin of the
+weights x 0.10), and the card is charged it plus 1.25 GiB for the engine's CUDA
+context and graphs. Its first start is charged `engine_config.memory.startup`
+plus the same 1.25 GiB. Left unset, the startup peak is the request, so the
+first start is charged the Ready figure until a first run measures the real
+peak on the card, whether or not the checkpoint had been measured when the
+deployment was accepted. A declared `memory.startup` is the operator's and no
+measurement replaces it: state it without the CUDA context, at least the
+request. A start whose charge on a card is above that card's managed limit is
+never admitted there, because a card has no first start that runs alone on the
+machine; `capyctl validate config --host` and `capyctl status deployment` say
+so and name the host, the card, the charge and the limit
+(`startup.over_limit` in the JSON). They judge the card the revision was
+resolved on (the lowest-index GPU, or the first host); placement tries every
+allowed host and GPU, so a larger card may still take it. On several GPUs of
+one host, each card is charged its Ready figure the same way, and a
+speculative deployment gets no graph allowance for its draft model either.
+A revision accepted by an earlier release
+keeps the startup figure it was accepted with; to start one that shows this,
+deploy it with `memory.startup` equal to its request.
+
 A llama.cpp deployment's settings are `engine_config.context_length` (required:
 each request's window), `engine_config.max_concurrent_requests` (the slots, 4 when
 not set), `engine_config.kv_cache_dtype` (`f16` when not set) and the block

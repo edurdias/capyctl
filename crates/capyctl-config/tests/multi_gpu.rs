@@ -757,3 +757,33 @@ fn device_choices_are_sets_of_identical_gpus() {
     pinned["devices"] = json!([{"id": "gpu0"}, {"id": "gpu1"}]);
     assert!(device_choices(&pinned, &h).unwrap().is_empty());
 }
+
+/// #219 (ADR 0019 amendment A1, ADR 0035 §3): on two GPUs a request declared
+/// per GPU before the checkpoint's weights are known has a startup peak equal
+/// to the request, as on one GPU: each card's first start is charged its
+/// Ready figure (the request, the CUDA context and the communication
+/// allowance), with no first-start graph allowance on top. A first run
+/// measures each card's peak (ADR 0019 amendment A2).
+// T46 T14
+#[test]
+fn a_request_declared_per_gpu_starts_at_its_ready_charge_on_two_gpus() {
+    let mut d = deployment(tp(2));
+    d["residency"] = json!("restart_only");
+    d["engine_config"]["memory"] = json!({"request": "30GiB", "kv_cache": "4GiB"});
+    let e = resolve_effective_with_checkpoint(&d, &host(2), CheckpointFacts::default()).unwrap();
+    assert_eq!(e.local_tensor_parallel(), 2);
+    assert_eq!(e.engine_config.memory().startup_bytes, Some(30 * GIB));
+    assert_eq!(e.engine_config.memory().startup_graphs_bytes, None);
+    let per_gpu = 30 * GIB + OVERHEAD + COMM;
+    let cards = |phase: &capyctl_config::effective::PhaseFootprint| {
+        phase
+            .allocations
+            .iter()
+            .filter(|a| a.domain.starts_with("gpu"))
+            .map(|a| a.bytes)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(cards(&e.resources.ready), [per_gpu, per_gpu]);
+    assert_eq!(cards(&e.resources.cold), [per_gpu, per_gpu]);
+    assert!(capyctl_config::effective::startup_measure(&e).is_some());
+}

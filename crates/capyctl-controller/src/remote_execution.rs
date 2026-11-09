@@ -1272,7 +1272,12 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
         &self,
         work: &capyctl_store::ordinary_lifecycle::worker::InitializeWork,
     ) -> Result<ExecutionBinding, CoordinatorError> {
-        let launch = remote_launch(&self.owner, &self.controller_id, work)?;
+        // #219: whether the host takes the card/host RAM startup split.
+        let host_takes_split = self.sessions.supports(
+            &work.effective().host.name,
+            capabilities::STARTUP_HOST_BYTES,
+        );
+        let launch = remote_launch(&self.owner, &self.controller_id, work, host_takes_split)?;
         Ok(binding(
             self.sessions.clone(),
             self.owner.clone(),
@@ -1293,10 +1298,12 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
 /// The launch a remote instance's initialize work sends its host: the plan
 /// built from the store's frozen revision and the host's current approved
 /// publication, and what the command needs of the host's session.
+/// `host_takes_split`: the host declared `startup_host_bytes`.
 fn remote_launch(
     owner: &SharedCoordinatorState,
     controller_id: &str,
     work: &capyctl_store::ordinary_lifecycle::worker::InitializeWork,
+    host_takes_split: bool,
 ) -> Result<RemoteLaunchBinding, CoordinatorError> {
     let denied = || CoordinatorError::Service("remote frozen binding unavailable".into());
     let owner = owner.lock().map_err(|_| denied())?;
@@ -1379,8 +1386,19 @@ fn remote_launch(
         .unwrap_or_default();
     let reservation = work.startup_reservation();
     let measured = capyctl_config::effective::StartupProvenance::Measured;
+    // ADR 0019 §3 (amendment A2): a measured card and host RAM peak is sent
+    // apart, and a host without `startup_host_bytes` is refused it. #219: an
+    // unmeasured start on a card is sent apart too when the host takes it, so
+    // a host that resolves the startup estimate by an older rule (0.1.7 to
+    // 0.1.10: the request plus the graph allowance) charges the server's
+    // figure instead of refusing a start the server admitted. A host older
+    // than the field gets the plan it always got.
     let (startup_bytes, startup_host_bytes) = match &reservation.split {
-        Some(split) if split.device_provenance == measured || split.host_provenance == measured => {
+        Some(split)
+            if split.device_provenance == measured
+                || split.host_provenance == measured
+                || host_takes_split =>
+        {
             (split.device_bytes, Some(split.host_bytes))
         }
         _ => (reservation.bytes, None),
@@ -1800,6 +1818,20 @@ mod tests {
         String,
         capyctl_store::ordinary_lifecycle::worker::InitializeWork,
     ) {
+        remote_work_with(topology, layout, serde_json::json!({"kv_cache": "4GiB"}))
+    }
+
+    /// [`remote_work`] with the deployment's `engine_config.memory`.
+    fn remote_work_with(
+        topology: Option<serde_json::Value>,
+        layout: capyctl_domain::member_weights::CheckpointLayout,
+        memory: serde_json::Value,
+    ) -> (
+        tempfile::TempDir,
+        SharedCoordinatorState,
+        String,
+        capyctl_store::ordinary_lifecycle::worker::InitializeWork,
+    ) {
         use serde_json::json;
         let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
         std::fs::set_permissions(
@@ -1916,7 +1948,7 @@ mod tests {
             object.remove("resources");
             object.remove("host");
             config["devices"] = json!([]);
-            config["engine_config"] = json!({"memory": {"kv_cache": "4GiB"}});
+            config["engine_config"] = json!({ "memory": memory });
             config["residency"] = json!("restart_only");
             config["instances"] = json!(1);
             config["placement"] = json!({"hosts": ["spark"]});
@@ -2010,7 +2042,7 @@ mod tests {
         let (_dir, owned, host, work) =
             remote_work(Some(serde_json::json!({"tensor_parallel": 2})), layout());
         assert_eq!(work.effective().local_tensor_parallel(), 2);
-        let launch = remote_launch(&owned, "controller", &work).unwrap();
+        let launch = remote_launch(&owned, "controller", &work, true).unwrap();
         assert_eq!(launch.plan.devices, ["gpu0", "gpu1"]);
         assert_eq!(launch.plan.checkpoint_layout, Some(layout()));
         let set = work
@@ -2048,7 +2080,7 @@ mod tests {
     fn a_remote_launch_on_one_gpu_is_unchanged() {
         let (_dir, owned, host, work) = remote_work(None, layout());
         assert_eq!(work.effective().local_tensor_parallel(), 1);
-        let launch = remote_launch(&owned, "controller", &work).unwrap();
+        let launch = remote_launch(&owned, "controller", &work, true).unwrap();
         assert!(launch.plan.devices.is_empty());
         assert_eq!(launch.plan.checkpoint_layout, None);
         let [claim] = work.effective().selected_devices.as_slice() else {
@@ -2058,6 +2090,78 @@ mod tests {
             launch.plan.deployment_config,
             local_source(&owned, &host, &claim.id, &work.fence().deployment_id)
         );
+    }
+
+    // T26 T14 (#219, ADR 0017 version skew, ADR 0019 §3): an unmeasured
+    // first start on a card is sent the server's card and host RAM figures
+    // when the host takes `startup_host_bytes` (0.1.7 on). A host from 0.1.7
+    // to 0.1.10 resolves a declared request accepted before its weights were
+    // known by the old rule (the request plus the graph allowance and the
+    // CUDA context: 40.5 GiB of a 40 GiB card here), but lays the plan's
+    // figures over it and admits the start at the server's 39.25 GiB. A host
+    // older than the field gets the plan it always got.
+    #[test]
+    fn an_unmeasured_start_on_a_card_carries_the_servers_split() {
+        use capyctl_config::effective::{
+            apply_planned_startup, resolve_effective_with_checkpoint, startup_over_limit,
+            CheckpointFacts, ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES,
+            ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES,
+        };
+        let (_dir, owned, host, work) = remote_work_with(
+            None,
+            layout(),
+            serde_json::json!({"request": "38GiB", "kv_cache": "4GiB"}),
+        );
+        let card = (38_i64 << 30) + ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
+        let launch = remote_launch(&owned, "controller", &work, true).unwrap();
+        assert_eq!(launch.plan.startup_bytes, Some(card));
+        assert_eq!(
+            launch.plan.startup_host_bytes,
+            Some(ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES)
+        );
+        // The host's own resolution, as a 0.1.10 host makes it.
+        let host_document = {
+            let owner = owned.lock().unwrap();
+            let publication = owner.store().host_publication(&host).unwrap().unwrap();
+            let config =
+                capyctl_config::remote_roles::HostConfig::parse(&publication.config_json).unwrap();
+            capyctl_config::remote_resources::local_host_document(&config.document).unwrap()
+        };
+        let deployment: serde_json::Value =
+            serde_json::from_str(&launch.plan.deployment_config).unwrap();
+        let old_rule = CheckpointFacts {
+            legacy_device_placeholder: true,
+            accepted_revision: true,
+            ..Default::default()
+        };
+        let resolve =
+            || resolve_effective_with_checkpoint(&deployment, &host_document, old_rule).unwrap();
+        let mut effective = resolve();
+        let over = startup_over_limit(&effective).expect("the old rule is above the card");
+        assert_eq!(over.bytes, card + (5 << 28));
+        apply_planned_startup(
+            &mut effective,
+            launch.plan.startup_bytes,
+            launch.plan.startup_host_bytes,
+        );
+        assert_eq!(startup_over_limit(&effective), None);
+        assert_eq!(
+            effective
+                .resources
+                .cold
+                .allocations
+                .iter()
+                .map(|a| a.bytes)
+                .collect::<Vec<_>>(),
+            [card, ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES]
+        );
+        // Without the capability the plan is the old one: the host keeps its
+        // own figure.
+        let old = remote_launch(&owned, "controller", &work, false).unwrap();
+        assert_eq!(old.plan.startup_host_bytes, None);
+        let mut effective = resolve();
+        apply_planned_startup(&mut effective, old.plan.startup_bytes, None);
+        assert!(startup_over_limit(&effective).is_some());
     }
     fn observed(role: &str, pid: u32, presence: &str) -> pb::OwnedProcessObservation {
         pb::OwnedProcessObservation {
