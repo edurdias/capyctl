@@ -72,7 +72,9 @@ impl EngineReport {
     /// nothing, so most chunks are never parsed. llama.cpp v0.6.0 puts
     /// `timings` on its last chunk (the usage chunk, else the finish chunk).
     pub fn may_carry(chunk: &str) -> bool {
-        chunk.contains("\"tensorfold\"")
+        // SPEC §17: an escaped key in a raw chunk must reach the JSON parser.
+        chunk.contains("\\u")
+            || chunk.contains("\"tensorfold\"")
             || chunk.contains("\"metrics\"")
             || chunk.contains("\"timings\"")
             || (chunk.contains("\"usage\"")
@@ -449,6 +451,19 @@ mod tests {
         assert!(!EngineReport::may_carry(
             r#"{"choices":[{"index":0,"delta":{"content":"say \"timings\""}}]}"#
         ));
+    }
+
+    // T19: SPEC §17 figures must survive escaped keys in raw engine chunks.
+    #[test]
+    fn escaped_metric_keys_are_not_filtered_out() {
+        for chunk in [
+            r#"{"\u0075sage":{"completion_tokens":8}}"#,
+            r#"{"\u006detrics":{"queue_time_ms":2}}"#,
+            r#"{"\u0074ensorfold":{"time_to_first_token":0.1}}"#,
+            r#"{"\u0074imings":{"prompt_ms":2}}"#,
+        ] {
+            assert!(EngineReport::may_carry(chunk), "{chunk}");
+        }
     }
 
     /// llama.cpp v0.6.0 `server_slot_stats::to_json` as one answer carries it.

@@ -1129,6 +1129,34 @@ async fn an_uncertain_failure_before_the_first_token_is_an_in_band_error() {
     }
 }
 
+// T17 T19: SPEC §10 requires an error before the first token, even when a
+// role-only opener uses an escaped JSON key and is relayed without normalization.
+#[tokio::test]
+async fn an_escaped_role_only_chunk_then_disconnect_ends_with_an_error() {
+    let chunk = r#"{"id":"chat-1","object":"chat.completion.chunk","created":1,"model":"served-name","choices":[{"index":0,"delta":{"\u0072ole":"assistant"},"finish_reason":null}]}"#;
+    let (endpoint, _) =
+        scripted_engine(200, "text/event-stream", format!("data: {chunk}\n\n")).await;
+    let (authority, deps) = stub_router(&endpoint);
+    let router = capyctl_router::serve_router(deps.clone());
+    let (status, text) = chat_stream(&router, "public-alias").await;
+    assert_eq!(status, 200);
+    assert!(text.contains(r#""\u0072ole":"assistant""#), "{text}");
+    let event: serde_json::Value = serde_json::from_str(
+        text.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .next_back()
+            .unwrap_or_else(|| panic!("no event: {text:?}")),
+    )
+    .unwrap();
+    assert_eq!(event["error"]["code"], "engine_error", "{text}");
+    assert_eq!(event["error"]["retryable"], false, "{text}");
+    assert!(!text.contains("[DONE]"), "{text}");
+    assert_eq!(
+        ends(&authority),
+        vec![Some(capyctl_controller::LeaseEnd::Uncertain)]
+    );
+}
+
 // T17 T19 (SPEC §10, found live 2026-09-24): an engine rejection of an
 // invalid request is its complete answer. The router relays it with the
 // engine's status and message as `engine_rejected`, not retryable, never a
