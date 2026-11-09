@@ -564,11 +564,24 @@ the card (weights, KV cache, and the engine's CUDA context and graphs, 1.25 GiB
 until measured) and in host RAM (the engine process itself, 4 GiB until
 measured). A deployment that states no memory is sized from its checkpoint:
 `weights × 1.10` plus a KV cache of `min(4 GiB, 25 % of the card's managed
-limit)`. A vLLM deployment asks for at least 75 % of the card, because vLLM
-0.29 with CUDA graphs does not start a 4B model on a 16 GB card below
-`--gpu-memory-utilization 0.75`; for the same reason vLLM needs a card of
-about 10 GiB or more. On a smaller card the host still starts, and each vLLM
-deployment is refused with `insufficient_device_memory` and its numbers. A deployment that lists `resources:` itself must
+limit)`. A vLLM deployment whose request CapyCTL sizes asks for at least 75 %
+of the card, and vLLM is told `--gpu-memory-utilization 0.75` or the request's
+share above it: vLLM 0.29 with CUDA graphs did not start a 4B model on a 16 GB
+card below 0.75. The KV cache is always passed to vLLM in bytes, so the floor
+does not size it; on a large card it holds far more than the model uses (the
+request on a 96 GB card is 71.7 GiB). To take the floor off, state
+`engine_config.memory.request` yourself, for example from the startup peak
+CapyCTL measured on the card (`startup.measured` in `capyctl status deployment
+<name> --json`) less 1.25 GiB for the CUDA context. A request smaller than
+the weights plus the KV cache is refused; the weights × 1.10 plus the KV
+cache, as CapyCTL sizes it, leaves room for the engine's own memory. The card
+is then charged that request and vLLM is told its share of the card, so
+another model can start beside it. Below about
+0.75 of a small card, check that the model still starts. With the floor and
+the CUDA context, a vLLM deployment that states no
+request needs a card of about 10 GiB or more. On a smaller card the host still
+starts, and each such vLLM deployment is refused with
+`insufficient_device_memory` and its numbers. A deployment that lists `resources:` itself must
 name the `system` domain as well as the GPU's (`missing_system_allocation`
 otherwise); leaving them out and letting CapyCTL derive them is the portable form.
 

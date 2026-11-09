@@ -12,7 +12,9 @@ use capyctl_config::effective::EffectiveDeployment;
 use capyctl_domain::launch::{LaunchSettings, SafetensorsLoadStrategy, VllmLaunchSettings};
 
 use crate::policy::ParkPolicy;
-use crate::vllm::args::{device_utilization_pct, GrantedBudget, PlanInputVllm};
+use crate::vllm::args::{
+    device_utilization_pct, GrantedBudget, PlanInputVllm, DEVICE_UTILIZATION_FLOOR_PCT,
+};
 
 /// Reserved (ADR 0014 §3): the gate vLLM checks free memory against at start.
 /// Explicit KV bytes size the pool, so the gate only has to pass.
@@ -97,12 +99,30 @@ pub fn park_policy(effective: &EffectiveDeployment) -> ParkPolicy {
 /// so a launch on several GPUs renders them from one GPU's grant: the memory
 /// request and KV cache are per GPU there, and the stated total is the
 /// smallest chosen card's.
+///
+/// ADR 0019 amendment of 2026-10-30 (proposed, #225): a request CapyCTL
+/// derived keeps the floor ([`DEVICE_UTILIZATION_FLOOR_PCT`]); a request the
+/// deployment declares is the card memory it may use, so vLLM is told its
+/// share and nothing more. With the floor, vLLM's start check asked for 75 %
+/// of the card free whatever the request, so a declared request below that
+/// could not start beside a model holding more than a quarter of the card.
 fn utilization_pct(effective: &EffectiveDeployment, settings: &VllmLaunchSettings) -> u8 {
     match (
         effective.ready_device_allocation(),
         settings.memory.device_total_bytes,
     ) {
-        (Some(_), Some(total)) => device_utilization_pct(settings.memory.request_bytes, total),
+        (Some(_), Some(total)) => {
+            let declared = !effective
+                .engine_config
+                .provenance()
+                .contains_key("memory.request");
+            let floor = if declared {
+                1
+            } else {
+                DEVICE_UTILIZATION_FLOOR_PCT
+            };
+            device_utilization_pct(settings.memory.request_bytes, total, floor)
+        }
         _ => GPU_UTILIZATION_GATE_PCT,
     }
 }
