@@ -110,7 +110,7 @@ pub fn splice(raw: &[u8], replace: &[(&str, &Value)]) -> Result<Vec<u8>, serde_j
 }
 
 /// A JSON object's top-level members in their order, each value as its bytes.
-struct Members<'a>(Vec<(String, &'a RawValue)>);
+pub(crate) struct Members<'a>(pub(crate) Vec<(String, &'a RawValue)>);
 
 impl<'de: 'a, 'a> Deserialize<'de> for Members<'a> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {

@@ -86,10 +86,11 @@ impl ChatForward for Engine {
     async fn forward_chat(
         &self,
         _body: &capyctl_adapters::request::InferenceRequest,
-    ) -> Result<Value, AdapterError> {
+    ) -> Result<capyctl_adapters::answer::EngineAnswer, AdapterError> {
         let content = self.run().await?;
         Ok(json!({"object": "chat.completion", "choices": [{"index": 0,
-            "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}]}))
+            "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}]})
+        .into())
     }
     async fn forward_chat_stream_async(
         &self,

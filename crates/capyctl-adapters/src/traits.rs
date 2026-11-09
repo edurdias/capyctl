@@ -638,11 +638,12 @@ pub trait ChatForward: Send + Sync {
     ) -> Result<StreamEnded, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
     }
-    /// Non-streaming chat completion: returns the engine's JSON response.
+    /// Non-streaming chat completion: returns the engine's answer, relayed as
+    /// the engine's bytes but the members CapyCTL sets (SPEC §10, #223).
     async fn forward_chat(
         &self,
         body: &crate::request::InferenceRequest,
-    ) -> Result<serde_json::Value, AdapterError>;
+    ) -> Result<crate::answer::EngineAnswer, AdapterError>;
     /// SPEC §10: non-streaming chat completion whose backend events are
     /// reported through [`ChatSink::progressed`] on `observer` (nothing is sent
     /// to it), so the caller bounds it like a relayed stream: the request
@@ -653,7 +654,7 @@ pub trait ChatForward: Send + Sync {
         &self,
         body: &crate::request::InferenceRequest,
         _observer: &mut dyn ChatSink,
-    ) -> Result<serde_json::Value, AdapterError> {
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         self.forward_chat(body).await
     }
     /// ADR 0030 §2: one decision request (`POST /v1/systemone`), sent as one
@@ -671,7 +672,7 @@ pub trait ChatForward: Send + Sync {
     async fn forward_decision(
         &self,
         _body: &crate::request::InferenceRequest,
-    ) -> Result<serde_json::Value, AdapterError> {
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
     }
     /// Streaming chat completion: yields data payloads in order; the final

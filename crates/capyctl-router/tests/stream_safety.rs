@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::IntoResponse;
+use capyctl_adapters::answer::EngineAnswer;
 use capyctl_adapters::traits::StreamEnded;
 use capyctl_adapters::{AdapterError, ChatForward};
 use capyctl_router::{admission::InFlight, stream::stream_response};
@@ -24,7 +25,7 @@ impl ChatForward for Forward {
     async fn forward_chat(
         &self,
         _: &capyctl_adapters::request::InferenceRequest,
-    ) -> Result<Value, AdapterError> {
+    ) -> Result<EngineAnswer, AdapterError> {
         if let Some(gate) = &self.finish_gate {
             gate.notified().await;
         }
@@ -298,7 +299,7 @@ impl ChatForward for BeforeFirstToken {
     async fn forward_chat(
         &self,
         _: &capyctl_adapters::request::InferenceRequest,
-    ) -> Result<Value, AdapterError> {
+    ) -> Result<EngineAnswer, AdapterError> {
         std::future::pending().await
     }
 
@@ -383,7 +384,7 @@ impl ChatForward for PanicForward {
     async fn forward_chat(
         &self,
         _: &capyctl_adapters::request::InferenceRequest,
-    ) -> Result<Value, AdapterError> {
+    ) -> Result<EngineAnswer, AdapterError> {
         unreachable!()
     }
     async fn forward_chat_stream_async(
@@ -427,7 +428,7 @@ impl ChatForward for Paced {
     async fn forward_chat(
         &self,
         _: &capyctl_adapters::request::InferenceRequest,
-    ) -> Result<Value, AdapterError> {
+    ) -> Result<EngineAnswer, AdapterError> {
         unreachable!()
     }
     async fn forward_chat_stream_async(
@@ -542,7 +543,7 @@ impl ChatForward for Prefilling {
     async fn forward_chat(
         &self,
         _: &capyctl_adapters::request::InferenceRequest,
-    ) -> Result<Value, AdapterError> {
+    ) -> Result<EngineAnswer, AdapterError> {
         unreachable!()
     }
     async fn forward_chat_stream_async(

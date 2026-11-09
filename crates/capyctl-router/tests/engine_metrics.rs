@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use capyctl_adapters::answer::EngineAnswer;
 use capyctl_adapters::traits::{AdapterError, ChatForward, ChatSink, StreamEnded};
 use capyctl_controller::Controller;
 use capyctl_router::admission::InFlight;
@@ -38,8 +39,8 @@ impl ChatForward for Scripted {
     async fn forward_chat(
         &self,
         _body: &capyctl_adapters::request::InferenceRequest,
-    ) -> Result<Value, AdapterError> {
-        Ok(self.whole.clone())
+    ) -> Result<EngineAnswer, AdapterError> {
+        Ok(self.whole.clone().into())
     }
 
     /// As a collecting forwarder does: every chunk is lent as it arrives.
@@ -47,13 +48,13 @@ impl ChatForward for Scripted {
         &self,
         _body: &capyctl_adapters::request::InferenceRequest,
         observer: &mut dyn ChatSink,
-    ) -> Result<Value, AdapterError> {
+    ) -> Result<EngineAnswer, AdapterError> {
         for chunk in &self.chunks {
             tokio::time::sleep(STEP).await;
             observer.progressed();
             observer.collected(chunk);
         }
-        Ok(self.whole.clone())
+        Ok(self.whole.clone().into())
     }
 
     async fn forward_chat_stream_async(

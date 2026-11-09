@@ -15,14 +15,14 @@ impl ChatForward for SglangAdapter {
     async fn forward_chat(
         &self,
         body: &crate::request::InferenceRequest,
-    ) -> Result<serde_json::Value, AdapterError> {
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         self.forward.collect(body).await
     }
     async fn forward_chat_observed(
         &self,
         body: &crate::request::InferenceRequest,
         observer: &mut dyn crate::traits::ChatSink,
-    ) -> Result<serde_json::Value, AdapterError> {
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         self.forward.collect_observed(body, observer, None).await
     }
     async fn forward_chat_stream(

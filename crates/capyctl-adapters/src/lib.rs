@@ -1,3 +1,5 @@
+// SPEC §10 (issue #223): an engine's answer as the engine sent it.
+pub mod answer;
 // ADR 0028 §9 (decided 2026-10-06): the completion probe's request forms.
 pub mod completion_probe;
 // ADR 0031: custom engines, started from a host-approved manifest.
