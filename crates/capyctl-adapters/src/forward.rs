@@ -1130,7 +1130,8 @@ impl ChatHttp {
 /// chunk, but it is not progress: until the first output, the request deadline
 /// bounds the stream, whatever the engine sent first.
 pub fn opens_reply_only(chunk: &str) -> bool {
-    if !chunk.contains("\"role\"") {
+    // SPEC §10: raw engine keys can use Unicode escapes; parse those too.
+    if !chunk.contains("\"role\"") && !chunk.contains("\\u") {
         return false;
     }
     let Ok(value) = serde_json::from_str::<Value>(chunk) else {
