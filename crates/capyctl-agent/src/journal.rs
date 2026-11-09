@@ -760,6 +760,33 @@ impl HostJournal {
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         claimed_launches(&db, except)
     }
+    /// SPEC §13.3 / T21: whether this host accepted the launch `incarnation`
+    /// of `deployment`: one it still claims, or (#226) one at `generation`
+    /// whose claim a Terminate released, such as a launch that failed before
+    /// readiness. Its engine log outlives the claim.
+    pub fn accepted_launch(
+        &self,
+        deployment: &str,
+        generation: i64,
+        incarnation: &str,
+    ) -> Result<bool, JournalError> {
+        self.validate()?;
+        let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+        let bodies: Vec<Vec<u8>> = db
+            .prepare("SELECT body FROM commands WHERE deployment=?1 AND body IS NOT NULL AND (claim=1 OR generation=?2)")?
+            .query_map(params![deployment, generation], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for body in bodies {
+            if decode(&body)?
+                .action
+                .launch_plan()
+                .is_some_and(|launch| launch.incarnation == incarnation)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     /// ADR 0023 §3: run `f` over every process recorded for a launch this host
     /// still claims, holding the journal so no launch records a process (and
     /// so starts) until `f` returns. A claimed launch with no recorded process

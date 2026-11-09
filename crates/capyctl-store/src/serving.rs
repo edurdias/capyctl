@@ -19,6 +19,17 @@ use crate::lifecycle::{LifecycleError, StoredRuntimeBinding};
 /// 64 instances per deployment (`capyctl_config::instances::MAX_INSTANCES`).
 pub const MAX_SERVING_INSTANCES: usize = 64;
 
+/// #226: a released launch of an instance, as [`crate::Store::released_launch_at`]
+/// names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleasedLaunch {
+    pub revision: i64,
+    pub incarnation: String,
+    /// SPEC §§6, 15: the enrolled host its ingress was frozen to before the
+    /// launch was sent; `None` for a launch on the controller's own machine.
+    pub remote_host: Option<String>,
+}
+
 /// One instance of a deployment that holds a retained runtime binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServingInstanceRow {
@@ -155,6 +166,40 @@ impl crate::Store {
             return Ok(None);
         };
         Ok(self.retained_binding(&id)?.map(|binding| (binding, open)))
+    }
+
+    /// #226 (SPEC §13.3 / T21): the newest released launch of instance
+    /// `index` at `generation`. A launch that failed before readiness, or
+    /// exited since, is released but wrote an engine log. Only the initialize
+    /// step that launched it ties a binding to `generation`: a stop draws a
+    /// new generation and steps on the launch it ends, so a stopped launch
+    /// is never named for the stop's generation.
+    pub fn released_launch_at(
+        &self,
+        deployment_id: &str,
+        index: u32,
+        generation: i64,
+    ) -> Result<Option<ReleasedLaunch>, LifecycleError> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT b.revision,b.incarnation,ri.host_id FROM runtime_bindings b
+                   LEFT JOIN remote_binding_ingress ri ON ri.binding_id=b.id
+                  WHERE b.deployment_id=?1 AND b.instance_index=?2 AND b.state='released'
+                    AND EXISTS(SELECT 1 FROM lifecycle_steps s
+                                 JOIN lifecycle_runs r ON r.operation_id=s.operation_id
+                                 JOIN operations o ON o.id=s.operation_id
+                                WHERE s.binding_id=b.id AND r.generation=?3 AND o.kind='initialize')
+                  ORDER BY b.rowid DESC LIMIT 1",
+            )?
+            .query_row(params![deployment_id, index, generation], |r| {
+                Ok(ReleasedLaunch {
+                    revision: r.get(0)?,
+                    incarnation: r.get(1)?,
+                    remote_host: r.get(2)?,
+                })
+            })
+            .optional()?)
     }
 
     /// ADR 0032 §1, §2: the [`LaneEngine`] of retained binding `binding_id`,
