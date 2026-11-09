@@ -1,5 +1,702 @@
 # Current implementation and launch status
 
+## Owner decisions of 2026-11-09, and 0.1.11 prepared (branch `chore/release-0.1.11`)
+
+Before 0.1.11, the owner decided the open items of the fixes merged since 0.1.10 (#227–#233,
+#242):
+
+- **Accepted:** ADR 0019's note of 2026-10-30 on amendment A1 (a card request's first start is
+  charged request plus the CUDA context, #232) and its amendment of 2026-10-30 (a declared vLLM
+  request is rendered as its own share of the card, #233); #228's new SPEC §10 case (the
+  ingress's own marked 429 counts as not accepted; an engine's 429 stays uncertain); #230's
+  refusal of editable SGLang installs rather than support for them.
+- **Kept:** a start whose measured peak is above a whole managed limit stays refused, with the
+  setting named (#242); no run-alone start past the limit.
+- **For 0.2.0:** a discrete first start's host-RAM placeholder estimated from the weights, with
+  the run-alone rule above the limit (#244); the feature pull requests #214–#218 and #235.
+- **Open until measured:** the 0.75 floor on a derived vLLM request (#225) stays until a live test
+  on the 16 GB laptop shows whether a 4B model with CUDA graphs starts below it.
+- **Environments approved:** vLLM 0.33.0 and a llama.cpp build at b11556 or newer on host A; the
+  `lmsysorg/sglang:v0.5.22` image on the laptop (AGENTS.md).
+
+A combined review of everything merged since 0.1.10 found two interactions, fixed before the
+release: #245 (vLLM's card share rounded up to a whole percent could exceed the charged first
+start on a large card) and #243 (a literal `"role"` check missed escaped keys once #229 kept the
+engine's bytes, hiding #228's error event). `main` with all ten passed `scripts/ci-local.sh
+--deep` (7,446 tests). Live on the laptop, #230's refusal holds in the official SGLang image
+(exit 17, nothing written); #242's refusal was checked live on 2026-11-09. CPU and Fake-engine
+tests are not qualification; the remaining live checks (#232, #233, #225's floor, #229 on host B,
+the release's own install check) run against the draft.
+
+## vLLM share precision — 2026-11-09 (branch `fix/vllm-share-precision`)
+
+ADR 0019 §3: vLLM's discrete-device utilization now rounds upward to ten decimal places instead of a whole percent, retaining the derived-request floor and the 0.99 ceiling. The integer calculation avoids overflow and bounds rounding overhead below the 1.25 GiB first-start allowance even for an i64-sized card. No frozen configuration schema changes: recorded revisions decode and re-render with the corrected precision. The T26 regression for a 180 GiB card and 135.125 GiB declared request failed before the fix (136.8 GiB rendered versus 136.375 GiB charged) and passes afterward. CPU and Fake-engine tests are not qualification; a live vLLM 0.32 start with the declared request and 136.5 GiB free still needs checking.
+
+## Escaped stream keys retain their meaning — 2026-11-09 (branch `fix/escaped-role-chunk`)
+
+SPEC §10 and §17: role-only stream openers with Unicode-escaped keys no longer count as first output or progress. An engine disconnect before any token therefore ends with the expected error event. Router metric prefiltering also admits escaped keys for JSON classification. Engine payload bytes remain unchanged. The router regression `an_escaped_role_only_chunk_then_disconnect_ends_with_an_error` and metric regression `escaped_metric_keys_are_not_filtered_out` failed before the fix and passed afterward. CPU and Fake-engine tests are not qualification; a live engine stream with an escaped role-only opener followed by a disconnect before the first token still needs checking.
+
+## A ModelOpt environment and an exllamav3 fork on host A — 2026-11-03 (branch `docs/agents-modelopt-env`)
+
+Owner decisions 2026-11-03, both in the home directory of host A:
+
+- A ModelOpt 0.47.0 environment (`~/modelopt-0.47.0-venv`: nvidia-modelopt 0.47.0,
+  torch 2.13.0 cu130, transformers 5.14.1, with a ModelOpt 0.47.0 source checkout in
+  `~/Model-Optimizer-0.47.0` for `examples/hf_ptq`). It converts checkpoints for
+  capyctl-recipes, first a Qwen3.8-27B NVFP4 checkpoint with every large Linear in
+  NVFP4 (the DeltaNet and attention projections that `nvidia/Qwen3.8-27B-NVFP4` keeps
+  in FP8 included). It is not an engine.
+- MiaAI-Lab's exllamav3 fork (`~/exllamav3-mia-venv`, fork commit `63b32f00`) with
+  their deployment kit (`~/mia-kit`, commit `12421873`), to compare their EXL3
+  Qwen3.8-27B checkpoint with DFlash2 drafting against the NVFP4 builds. CapyCTL runs
+  it as a custom engine (ADR 0031).
+
+AGENTS.md lists both with the other approved environments. No existing engine
+environment changed. No code changed; there are no tests and nothing to qualify.
+
+## vLLM on a discrete GPU: a declared request is rendered as its own share of the card (#225) — 2026-10-30 (branch `fix/vllm-discrete-request`)
+
+Issue #225: on one RTX PRO 6000 (96 GB), a vLLM 0.32.0 deployment stating a
+12 GiB KV cache was reserved 71.69 GiB (Ready 72.94 GiB) and launched with
+`--gpu-memory-utilization 0.75`, while its measured peak was 44.15 GiB, so a
+second model that fit in the rest of the card was refused.
+
+Why the floor exists. It came in with discrete GPU support (design of
+2026-09-25, commits `cbbbee30`, `2a96fc0d`, `a514b783`; ADR 0019 §3 and §4):
+"vLLM 0.29 with CUDA graphs does not start a 4B model on a 16 GB card below
+`--gpu-memory-utilization 0.75`", observed on the discrete-GPU laptop host;
+the cause was not recorded. It is not there to size the KV cache: every vLLM
+launch gets the KV cache as explicit bytes (`--kv-cache-memory-bytes`,
+`plan_from_effective` always sets it), and on unified memory vLLM 0.29 to
+0.32 start with `--gpu-memory-utilization 0.10` beside those bytes. So the
+floor guards an observed start failure and is kept for a request CapyCTL
+derives (and in the standalone template), and it is now documented as such.
+
+The escape. The floor was applied twice: to a derived request
+(`device_request_from_weights`, unchanged) and to the utilization rendered
+from any request (`device_utilization_pct` clamped to 75..=99). A deployment
+that declared `engine_config.memory.request` was charged that request but vLLM
+was still told 0.75 of the card, and vLLM checks at start that its share of
+the card is free, so a declared request below 0.75 could not start beside a
+model holding more than a quarter of the card. Now a declared request is
+rendered as its own share (rounded up to a whole percent, at most 0.99), so an
+operator who measured a peak declares the request from it, and the card's
+charge and vLLM's start check agree. No new field: `memory.request` already
+is "the GPU memory it may use".
+
+Design decision for the owner: this amends ADR 0019 §4 ("vLLM renders
+`--gpu-memory-utilization` as the device request's share of the card ...
+between 0.75 and 0.99"): the 0.75 lower bound now applies only to a request
+CapyCTL derived, recorded as ADR 0019's proposed amendment of 2026-10-30.
+Admission and accounting do not change (a declared request
+was already charged as declared). The issue's other request, sizing a derived
+vLLM request from weights + KV + overheads without the floor, was not done:
+the floor guards a start failure whose cause is unknown, and dropping it for
+every deployment could stop small cards from starting models they start
+today. A vLLM deployment already accepted with a declared request below 0.75
+of its card is told a smaller fraction at its next start; if that model is
+one that needs more (the 0.29 observation), it fails to start
+(`launch_failed`) and its request has to be raised. Unified-memory hosts are
+unchanged (the fixed low gate).
+
+Tests (failing before, passing after):
+
+- `capyctl-adapters` `vllm_frozen::a_declared_request_takes_the_floor_off_the_cards_utilization`,
+  with the issue's card (97887 MiB) and numbers: a deployment stating only
+  its 12 GiB KV cache keeps the floor (71.69 GiB request, 72.94 GiB Ready,
+  0.75); the same deployment declaring a 43 GiB request (the measured 44.15 GiB
+  peak less the CUDA context) is charged 44.25 GiB and told 0.45, with 12 GiB
+  of KV bytes, and the issue's 22.6 GiB second model fits beside it. Before,
+  `0.75` was rendered instead of `0.45`.
+- `capyctl-agent` `native_vllm::a_declared_request_on_a_card_is_rendered_as_its_share`
+  (a remote host launches the Fake vLLM engine through the real launch path):
+  before, the engine's argv carried `--gpu-memory-utilization 0.75`; now
+  `0.45` and `--kv-cache-memory-bytes 12884901888`.
+- `vllm_args::a_discrete_launch_renders_kv_bytes_and_utilization` covers the
+  floor parameter (`DEVICE_UTILIZATION_FLOOR_PCT`, 75 for a derived request,
+  none for a declared one).
+
+CPU and Fake-engine tests are not qualification. Live check still needed: on
+a discrete card (the 96 GB card of the issue, or the 16 GB laptop with a
+smaller model), start a vLLM 0.32.0 deployment with a declared request below
+0.75 of the card and its KV cache, confirm the launch renders the request's
+share, the model starts and serves, and a second deployment then starts
+beside it; on the laptop, also check whether a 4B model with CUDA graphs
+starts below 0.75 on vLLM 0.30 to 0.32, which would show whether the derived
+floor is still needed.
+
+## Discrete GPU: a declared request's first start is charged its Ready figure (#219) — 2026-10-30 (branch `fix/discrete-first-start`)
+
+Issue #219: on a 16 GB laptop card (14.7 GiB managed), an SGLang deployment
+with a declared 12.86 GiB request was refused at every start (`host … needs
+15.4 GiB of gpu0 memory, 14.7 GiB free of its 14.7 GiB limit`, startup
+provenance `default`), although its Ready charge, 14.1 GiB, fits the card. It
+never started, so no measured peak ever replaced the estimate.
+
+Cause. ADR 0019 amendment A1 states that beside a request declared for a card
+an undeclared `memory.startup` is the request. The resolver applied that rule
+only when the checkpoint's weights were known at resolution, tying it to the
+device margin (weights x 0.10). Acceptance resolves a declared request without
+the weights (only a revision whose memory is derived from them is frozen
+provisional and re-resolved), so such a revision took the unified startup
+placeholder instead: the request plus ADR 0014 amendment A8's first-start graph
+allowance (1.25 GiB), and the card was charged that plus the CUDA context
+(another 1.25 GiB). A card has no solo first start (that rule is for one pool),
+so a first start above the card's limit was refused forever.
+
+What changed.
+
+- The A1 rule now applies whether or not the weights are known: a request
+  declared for a card, without `memory.startup` or `resources:`, has a startup
+  peak equal to the request (provenance `default`, an estimate the first run
+  measures per ADR 0019 amendment A2). The issue's first start is charged
+  14.1 GiB instead of 15.4 GiB. This is A1 as written; it narrows A8's graph
+  allowance, which no longer applies to a request declared for a card. The
+  derived request (weights x 1.10 + KV) already behaved this way. It covers a
+  model on N identical GPUs of one host (ADR 0035 §3) too: each card's first
+  start is charged its Ready figure (request, CUDA context and communication
+  allowance) without the per-GPU graph allowance, and a speculative
+  deployment's first start loses its doubled allowance (2.5 GiB) the same
+  way. ADR 0019 records this as a proposed amendment of 2026-10-30.
+- A revision frozen with the placeholder records `startup_graphs_bytes` and
+  re-resolves exactly as it was (new checkpoint fact
+  `legacy_device_placeholder`), so stored revisions still decode. Such a
+  revision keeps its figure; deploying it with `memory.startup` equal to its
+  request makes a revision that starts.
+- A declared `memory.startup` already replaced the placeholder (nothing is
+  added for graphs; the card is charged it plus the CUDA context, and
+  validation only requires it to be positive and at least the request), so
+  declaring it equal to the request was a working way around the issue. It is
+  documented as the figure without the CUDA context.
+- A start that cannot be admitted on the card it was resolved for is now
+  visible. `capyctl validate config --host` adds `startup.device_bytes` and
+  `startup.host_bytes` on a discrete host and `startup.over_limit` (host,
+  card, charge, managed limit) when that card's startup charge is above its
+  limit, with a `Startup` note in text; `capyctl status deployment` adds
+  `startup.over_limit` (against the host's current policy) and the same note
+  under the table. It names one host and card, the one the revision was
+  resolved on (validate: the lowest-index GPU; status: the revision's first
+  host and GPU), and says the start "cannot start there": placement resolves
+  every allowed host and GPU on its own, so another one may still hold it.
+  New `capyctl_config::effective::startup_over_limit`.
+- Not changed: the runtime guard. There is still no abort of a start whose
+  real peak exceeds its reservation (the issue's option 3). On a card the
+  engine is bounded by the fraction CapyCTL renders from the request, the
+  launch check requires the cold charge to be physically free, and the first
+  run's measured peak replaces the estimate for later starts (ADR 0019
+  amendment A2); a declared `memory.startup` is never measured or replaced.
+  Sizing the graph allowance from the deployment (option 2) was not done: on a
+  card the A1 rule already removes it.
+
+Owner review: this lowers the first-start reservation on a card for a
+declared request accepted before its weights were known, from request + 2.5 GiB
+to request + 1.25 GiB (ADR 0019 amendment A1 applied as written; ADR 0014
+amendment A8's graph allowance no longer applies there, on one GPU, on N
+GPUs, and for a draft model).
+
+Version skew (ADR 0017: every 0.1.x host is fully supported). A host
+re-resolves the deployment itself, and one from 0.1.10 or earlier resolves
+such a revision by the old rule (15.4 GiB on the issue's card) and would
+refuse a start the server admitted at 14.1 GiB. Hosts lay the plan's
+per-domain startup figures over their own estimate (`startup_bytes` for the
+card, `startup_host_bytes` for host RAM, ADR 0019 amendment A2), but the
+server sent them only for a measured peak. The server now sends both for an
+unmeasured start on a card too, whenever the host declares the
+`startup_host_bytes` capability, which every host from 0.1.7 on does
+(introduced by #175); those hosts charge the server's figure, and a host
+from 0.1.7 to 0.1.10 admits the start (checked against the old rule in a
+test). A host older than 0.1.7 gets the plan it always got and still
+resolves its own figure, so it refuses such a start where the old figure
+does not fit; upgrade it. The overlay the host applies moved, unchanged, into
+`capyctl_config::effective::apply_planned_startup`, which the agent and the
+test share.
+
+Tests (failing before, passing after):
+
+- `capyctl-config` `startup_budget::a_request_declared_for_a_card_starts_at_its_ready_charge_before_the_weights_are_known`:
+  before, the card's cold charge was 16493051904 bytes (15.4 GiB) against an
+  expected 15150874624 (14.1 GiB).
+- `capyctl-store` `device_placement::a_request_declared_for_a_card_starts_when_its_ready_charge_fits`
+  (deploy, start, arm and Ready through the store with the issue's numbers):
+  before, the start was refused `CapacityBlocked("host lab needs 15.4 GiB of
+  gpu0 memory, 14.7 GiB free of its 14.7 GiB limit")`, the issue's message.
+- `capyctl-cli` `startup_budget::validate_shows_the_first_start_on_a_card_and_one_that_can_never_start`
+  (the real binary): before, `startup_bytes` was the request plus the graph
+  allowance and no card figure or over-limit note was shown.
+- New guards: `a_card_revision_frozen_with_the_placeholder_keeps_it`,
+  `a_declared_startup_on_a_card_is_charged_with_the_cuda_context_only`,
+  `status_names_a_card_whose_startup_charge_is_above_its_limit`, the table
+  test `status_says_when_a_start_can_never_fit_its_card`,
+  `multi_gpu::a_request_declared_per_gpu_starts_at_its_ready_charge_on_two_gpus`
+  (TP 2: each card's cold equals its Ready figure), and the controller's
+  `an_unmeasured_start_on_a_card_carries_the_servers_split` (the plan of an
+  unmeasured first start carries the server's card and host RAM figures to a
+  host that takes them; a host resolving by the old rule, 40.5 GiB of a
+  40 GiB card, lays them over its own and fits at 39.25 GiB; without the
+  capability the plan is unchanged).
+
+CPU and Fake-engine tests are not qualification. Live check still needed: on
+the discrete-GPU laptop (16 GB card), deploy the issue's SGLang 0.5.22 model
+with a declared 12.86 GiB request, confirm `validate config --host` shows a
+14.1 GiB card figure without `over_limit`, that the first start is admitted
+and reaches Ready, and that the measured card peak (`startup.measured`) stays
+within the card; a deployment with `memory.startup: 14GiB` should show the
+`Startup` note in `validate` and `status`. With a remote host, check that a
+0.1.10 host admits the same first start from a 0.1.11 server.
+
+## Unified memory: a launch drops its checkpoint's page cache before the engine starts (#226) — 2026-10-30 (branch `fix/unified-page-cache`)
+
+Issue #226, third direction. On a GB10 an SGLang 0.5.22 engine started beside a
+running one failed creating its CUDA context (`CUDA_ERROR_OUT_OF_MEMORY` from
+`cuDevicePrimaryCtxRetain`, `NV_ERR_NO_MEMORY` from `kgrctxAllocMainCtxBuffer`)
+while `MemAvailable` read tens of GiB: most of it was page cache, which the
+driver does not wait to reclaim for a context's physically contiguous buffers.
+Some of that cache can be the launch's own checkpoint: CapyCTL reads it to
+verify its digest (in full on a first placement, unless a download's verified
+manifest or a trusted declaration stands in for the read; ADR 0014 §7), and
+earlier reads and engine loads may have left it cached. NVIDIA's DGX Spark known
+issues give flushing the buffer cache as the workaround on unified memory.
+
+What changed (SPEC §7.2; ADR 0019 for what a discrete GPU is):
+
+- New `capyctl_agent::page_cache`: when a launch's starting footprint (its
+  `cold` allocations) lands on a `memory: unified` domain, every regular file
+  of its checkpoint gets `posix_fadvise(POSIX_FADV_DONTNEED)`. Unprivileged;
+  nothing else on the machine is touched (no `/proc/sys/vm/drop_caches`), and
+  pages another engine has mapped stay. The files come from
+  `checkpoint::drop_page_cache`, the same confined walk the digest uses
+  (inside the model store or the checkpoint's own root, links resolved only
+  inside it and opened with `O_NOFOLLOW`, the same file, directory and depth
+  bounds); a checkpoint that cannot be walked is not advised at all.
+- Best effort: a failed file, or a checkpoint that cannot be walked, is logged
+  once per launch as the event `checkpoint_page_cache_kept` (deployment id,
+  counts, first errno or the closed reason; no path) and the launch goes on.
+- Enrolled host: in `launch_native`, after admission's verification and right
+  before the adapter's Initialize spawns the engine, and in the restart-park
+  wake (ADR 0033 §7, a new engine on the running LMCache server) right after
+  its checkpoint check. The recheck at the spawn, under the journal's lock,
+  reads at most the small files again, so the drop runs outside that lock.
+- Standalone: the embedded `CheckpointGate` does the same after it verifies
+  the checkpoint, before Initialize, and before a Restore of a deployment that
+  does not park in place (`restart_only`, whose wake starts a new engine). A
+  parked engine's wake keeps its context and is left alone.
+- Discrete hosts (`device` and `distinct` domains) are unchanged.
+
+No admission or accounting rule changes: memory is still admitted on
+`MemAvailable` as before; only the cache of the launch's own checkpoint is
+given back.
+
+Tests (failing before, passing after):
+
+- `crates/capyctl-agent/tests/native_vllm.rs`,
+  `a_unified_launch_drops_its_checkpoint_page_cache_before_the_engine_starts`
+  (T26): a full remote launch on the fake vLLM with an injected advice seam;
+  each checkpoint path (a nested file, a link inside the store as the file it
+  names, so that file is advised twice; tool metadata left out) is advised
+  once, before the engine wrote its record. Before the fix the advice was
+  never called (`left: []`).
+- `a_failed_page_cache_drop_does_not_fail_the_launch`: every advice fails with
+  EIO and the model is still proven usable. Before the fix: no file advised
+  (`left: 0, right: 3`).
+- `a_discrete_launch_leaves_the_page_cache_alone` (T26): `memory: distinct`,
+  nothing advised (passes before and after; guards the gate).
+- `crates/capyctl-controller/src/checkpoint_digests/tests.rs`,
+  `the_embedded_gate_drops_the_checkpoint_page_cache_before_an_engine_starts`:
+  the standalone gate advises every file before Initialize, again before a
+  `restart_only` Restore, not before a `deep` Restore, and a failing advice
+  still reaches the engine. Before the fix: `left: []`.
+  `the_embedded_gate_leaves_the_page_cache_alone_on_distinct_memory` (T26).
+- `crates/capyctl-agent/src/checkpoint/tests.rs`:
+  `the_page_cache_drop_advises_every_file_of_the_checkpoint` (with the real
+  `posix_fadvise`, and failures counted with their errno) and
+  `the_page_cache_drop_never_leaves_the_store` (T37: a link out of the store
+  is refused whole, nothing advised).
+
+CPU and Fake-engine tests are not qualification.
+
+Live check, 2026-11-01, host A (GB10), standalone, SGLang 0.5.22, nothing
+else on the host: deployment A (`qwen3-14b`) kept serving; deployment B
+(`qwen3-4b-instruct`, 7.5 GiB) started with its own checkpoint and 65 GiB of
+other model files just read into the cache (`MemFree` 11 to 16 GiB, `Cached`
+94 to 98 GiB). B's resident checkpoint pages were sampled every 0.7 s with
+`mincore(2)`.
+
+| Binary | B's checkpoint in the cache at start | Then | B Ready | Answer |
+|---|---|---|---|---|
+| this branch (`8cffbbce`), 2 starts | 7.50 GiB | 0.00 GiB within 0.75 s, back as the engine read its weights | 97.5 s, 98.5 s | correct (`42`) |
+| `main` + #227 (no drop), 1 start | 7.50 GiB | 7.50 GiB throughout | 97.6 s | correct (`42`) |
+
+So the drop happens, before the engine starts, and costs no start time
+here; the host log had no `checkpoint_page_cache_kept` line and no
+out-of-memory line. Not shown: that the drop prevents the issue's failure.
+The run did not recreate it (no CUDA allocation driving `MemFree` to the low
+watermark while contexts are created), and neither binary failed.
+
+## An editable SGLang is refused where it is added, and a failed SGLang import is named — 2026-10-30 (branch `fix/sglang-editable-install`)
+
+Issue #198. The official `lmsysorg/sglang:v0.5.22` image installs SGLang in
+editable mode: `site-packages` holds `__editable__.sglang-0.5.22.pth` and its
+finder, and the package lives in `/sgl-workspace/sglang/python/sglang`. The
+protected SGLang entry runs under `python -IS` and puts only the environment's
+`site-packages` on its path, so the `.pth` finder never ran, `import sglang`
+failed, and every launch ended about a second in with only
+`sglang_startup_failed: startup_error`. `capyctl engine add` and
+`capyctl validate config` accepted the installation.
+
+Design decision for the owner to review: the editable layout is refused, not
+supported. The registered fingerprint and drift flag cover only
+`site-packages/sglang` (an editable install has none, so it registers
+`unmeasured`); adding the checkout's `python` directory to the search path
+would load code those checks never attest and expose every other top-level
+name in that directory. This is proposed as an amendment to ADR 0008
+(Amendment 2026-10-30, in the ADR). It narrows the 2026-09-23 amendment's
+rule that an installation that cannot be measured is `unmeasured`, never
+refused, for this one case, and only where no protocol is involved.
+
+Owner decision: this ships in the 0.1.11 patch, and ADR 0017 §2 says a patch
+never changes the protocol. So an enrolled host never sends the new code; the
+host-side refusal, gated on a new capability, follows in 0.2.0 (kept on
+branch `feat/sglang-editable-host-refusal`).
+
+What changed:
+
+- `capyctl engine add` refuses an SGLang whose package is not in its
+  environment's `site-packages` and which `site-packages` records as editable
+  (`__editable__.sglang-<version>.pth`, setuptools' finder module
+  `__editable___sglang_<version>_finder.py`, `sglang.egg-link`, or
+  `"dir_info": {"editable": true}` in `direct_url.json`). The code is
+  `installation_unsupported:editable`, exit 17; nothing runs and nothing is
+  written. A package directory in `site-packages`, or a link to one (the
+  entry imports it through the link), is never refused, whatever lies
+  beside it; sgl-router's own editable hooks
+  (`__editable___sglang_router_<version>_finder.py`) are not SGLang's.
+  vLLM, started without `-S`, is unaffected.
+- Standalone refuses each launch of such an installation (before its
+  Initialize), under either `installation_drift` policy, including one named
+  with `--sglang-bin` or `local_engine`, in its embedded installation check.
+  The refusal stays in that process: status shows it as the operation's
+  reason text (`launch_failed`) with a fixed operator hint; nothing crosses
+  the host protocol and no closed code is stored for another binary to
+  parse.
+- An enrolled host is unchanged: its launch-time installation check calls an
+  editable SGLang `unmeasured` and refuses nothing, the launch starts, and
+  the entry fails it at once with `engine_import_failed` in the free-text
+  launch failure. The protocol (capabilities, policy refusals) is unchanged.
+- The entry reports a failed SGLang import as its own closed code,
+  `engine_import_failed`, with a fixed hint and no exception text or path,
+  instead of `startup_error`. The launch failure summary names the code, and
+  `capyctl status deployment` shows its hint.
+- Docs: `docs/guide/install-engines.md` (install SGLang without `-e`, the
+  reinstall command for the image, two troubleshooting entries),
+  `docs/guide/engines.md` (Add one), `docs/guide/errors.md` (the exit 17 row
+  and both launch codes), `docs/operations/install.md` (engine add), ADR
+  0008 (proposed amendment).
+
+Tests, failing before and passing after:
+
+- `runtime/tests/test_sglang_startup_guards.py`
+  `EditableInstallationTests.test_an_editable_sglang_fails_with_its_own_code_and_its_pth_never_runs`
+  (T21): a real stdlib venv with a fake editable SGLang (the `.pth` and finder
+  in `site-packages`, the package in a checkout elsewhere). The positive
+  control imports it with site processing on; under `-IS` the entry composes
+  only the interpreter's own `site-packages`, never runs the hook, and its
+  guarded import raised `ModuleNotFoundError: No module named 'sglang'`
+  before and fails `engine_import_failed` with a path-free hint after.
+- `runtime/tests/test_sglang_entry.py`
+  `test_failed_engine_import_surfaces_engine_import_failed` (replaces
+  `test_failed_engine_import_denies_through_startup_error`): a missing and a
+  raising SGLang printed `sglang_startup_failed: startup_error` before and
+  `engine_import_failed` with its hint and no exception detail after.
+- `crates/capyctl-cli/tests/first_run.rs`
+  `engine_add_refuses_an_editable_sglang_before_anything_runs` (T07 T21),
+  through the binary: before, `engine add` exited 0 and saved the profile
+  (`fingerprint: null`); after, it exits 17 with
+  `installation_unsupported:editable`, never runs the interpreter and writes
+  nothing, and the same environment reinstalled as a regular package is
+  added.
+- `capyctl-controller`
+  `installation_gate::tests::an_editable_sglang_is_refused_before_any_effect`
+  (T21 T22): standalone refuses with the code and its hint under either
+  policy, journals no drift, and keeps the installation `unmeasured`.
+- `capyctl-agent`
+  `native_execution::tests::a_host_never_refuses_an_editable_sglang_with_a_code_servers_do_not_know`
+  (T21 T34): an enrolled host's admission of an editable SGLang launch,
+  under `warn` and `refuse`. With the refusal in the shared launch-time
+  check it got `Refused("installation_unsupported:editable")`; now it takes
+  the pre-#198 path to the fixture's next gate (`checkpoint_mismatch`, a
+  refusal every server knows).
+- `capyctl-agent` `installation::tests::an_editable_sglang_is_named_but_the_shared_launch_check_never_refuses_it`
+  (T21 T22) and `another_distributions_hook_and_a_linked_package_are_not_refused`
+  (T21; with the earlier matching, sgl-router's
+  `__editable___sglang_router_0_3_1_finder.py` named a missing SGLang
+  editable); `capyctl-adapters`
+  `launch_failure::tests::an_sglang_import_failure_is_named_by_its_code`;
+  `capyctl-domain` `diagnostics::tests::classification_prefers_the_named_category`;
+  `capyctl-cli` `site_errors_page` (the new exit 17 row).
+
+CPU and Fake-engine tests are not qualification.
+
+Live check still needed: on a GB10 machine, run CapyCTL against the official
+`lmsysorg/sglang:v0.5.22` image as shipped: `capyctl engine add
+/opt/sglang/bin/python3` must exit 17 with `installation_unsupported:editable`
+and write nothing, and `capyctl start standalone --sglang-bin
+/opt/sglang/bin/python3` must refuse a start with the same code. On a host
+enrolled with a server, a start of that installation must fail at once with
+`engine_import_failed` and leave the host's control session up. Then
+reinstall SGLang without `-e` inside the image (`/opt/sglang/bin/python3 -m
+pip install --no-deps --no-build-isolation --force-reinstall
+/sgl-workspace/sglang/python`), add it again, and launch a model: it must
+reach `ready` and serve.
+
+## The caller receives the engine's answer bytes — 2026-10-30 (branch `fix/router-answer-bytes`)
+
+Issue #223, the response side of #220. The router parsed every engine answer
+into `serde_json::Value` and sent it re-encoded: `decide` wrote the public
+`model`, `engine_metrics::attach_decision` and `attach` added
+`capyctl.metrics`, each relayed stream chunk was re-encoded to write `model`,
+and a collected chat answer was rebuilt from parsed chunks. Without
+`serde_json`'s `float_roundtrip` feature, parsing a float is not always
+correctly rounded, so a probability or a log probability could come back one
+unit in the last place away from the engine's. The live check for #220 on
+0.1.10 (host B, SGLang 0.5.22, `clef-flash` as `api: decisions`) found 23 of
+37 answers identical through the router against 37 of 37 for the engine
+called twice, with differences up to 2.2e-16. Re-encoding also wrote numbers
+in serde_json's spelling (`1e-05` came back as `0.00001`, a non-shortest
+decimal as its shortest form) and sorted every object's keys.
+
+SPEC §10: the caller now receives the engine's bytes. A new
+`capyctl_adapters::answer::EngineAnswer`, which `ChatForward::forward_chat`,
+`forward_chat_observed` and `forward_decision` return in place of `Value`,
+keeps the bytes beside the parsed form. Validation and the metrics still read
+the parsed form; `EngineAnswer::set` records each top-level member CapyCTL
+writes (the public `model`, `capyctl`), and `encode` writes those in place, or
+after the engine's members when the engine sent none, with every other member
+byte for byte, using the same splice as the request side
+(`capyctl_adapters::request::splice`). The router answers with those bytes
+(`chat::relay`). A relayed stream chunk is spliced the same way, with only
+`model` written anew. A collected chat answer is assembled as bytes: the
+first chunk's members in their order, each token's log probabilities, and the
+last `usage`, `tensorfold`, `metrics` and `timings` the engine reported go as
+the engine sent them; only what collecting builds (the message, the choice,
+`object`) is written by CapyCTL. Validation is unchanged: an answer that is not
+one JSON object with distinct keys at every depth, or a decision without an
+`answers` object, is still uncertain.
+
+`float_roundtrip` was not turned on: like `preserve_order` it applies to the
+whole build and changes how every float is parsed, so configuration, receipt
+and command digests computed over parsed `Value`s and compared with stored ones
+would need an audit, and it would still not give the engine's bytes, since
+serde_json writes its own spelling of a number. With pass-through no float is
+parsed on the way to the caller, so no digest or stored value changes.
+
+Tests: `capyctl-router` `decisions::a_decision_answer_keeps_the_engines_bytes`
+(T43) has an engine double answer a decision whose floats serde_json's
+default parser does not read back exactly (`0.9856906946328695`,
+`0.21291890726713458`, `0.9259338926496359`, `4.332222558366402e-308`,
+`2.2250738585072011e-308`, `4.9406564584124654e-324`, `1.1224000000000001`,
+`1e-05`) with keys out of alphabetical order, and checks the router's answer is
+the engine's bytes with `model` replaced in place and `capyctl` appended.
+`decisions::a_chat_answer_keeps_the_engines_floats` does the same for a
+stream (each relayed chunk is the engine's with only `model` replaced) and a
+collected answer (the log probabilities and `timings` appear verbatim). On
+`main` both fail: the router answers
+`"tension":0.925933892649636`, `"confidence":4.3322225583664017e-308`,
+`"1":0.00001`, `"sleep":5e-324`, keys sorted, and a stream chunk carries
+`"logprob":-0.21291890726713456`. Both pass here. `capyctl-adapters`
+`answer::tests` cover the splice and the refusals. CPU and Fake-engine tests
+are not qualification. Live check still needed: repeat the #220 comparison
+(host B, SGLang 0.5.22, `clef-flash` as `api: decisions`, 12 requests with 37
+questions) through CapyCTL and directly, and expect 37 of 37 answers
+bit-identical; a chat request with `logprobs` through CapyCTL and directly on
+one engine should match the same way.
+
+## A stream that fails before its first token ends with an error event — 2026-10-30 (branch `fix/stream-empty-200`)
+
+Issue #213, SPEC §10. A streamed chat completion whose forward failed before
+anything reached the client could end as an HTTP 200 `text/event-stream` with
+no events at all: no content, no error event and no `data: [DONE]`. Two
+defects caused it.
+
+- The router's stream pump answered in-band only for refusals (an engine
+  rejection, an engine error answer, a refusal before sending, a request not
+  accepted). Any other error, such as an uncertain end, closed the stream
+  silently. It now sends an error event when the forward ends in an error and
+  no output chunk was handed to the client (a chunk that only opens the reply
+  does not count): code `engine_error`, message
+  `backend completion unverified`, `retryable: false`, as the non-streamed
+  answer to the same failure. A stream cut at its request deadline on a lane
+  that can abort requests (SGLang with CapyCTL's request IDs) gets the same
+  event before its stream ends. Only a client that hung up, or whose delivery
+  already failed, gets no event, since nothing can reach it. Lease accounting
+  is unchanged: the lease stays uncertain (cancelling for a cut), and the
+  per-process slot is released only with a durable lease, as before.
+- A host ingress at its 64-forward limit answers 429 with its own
+  `inference_unavailable` code before anything reaches the engine. The
+  forwarder passed that 429 through and the stream reader called it
+  uncertain. The forwarder now reads a 429 whose body carries the ingress's
+  code as not accepted, so the plan fails over to another instance, the
+  refused lease closes as not accepted, and with no other instance the client
+  gets a retryable `unavailable` (503, or an error event on a stream). No new
+  marker was needed: the ingress never relays an engine's 429 (it answers any
+  other engine status as its own 502), so a 429 with that code comes from the
+  ingress's capacity refusal alone. Any other 429, an engine's own included,
+  stays uncertain. This is a new not-accepted case under SPEC §10's rule that
+  only evidence the engine never saw a request closes it as not accepted, for
+  the owner to review.
+
+Tests, failing before and passing after:
+
+- `router_core::an_ingress_at_capacity_is_a_retryable_refusal_never_an_empty_stream`
+  (before: the stream body was empty, `no event: ""`).
+- `router_core::an_uncertain_failure_before_the_first_token_is_an_in_band_error`
+  (an engine's own 429, and a 200 that is not a stream; before: empty stream).
+- `instances::an_ingress_at_capacity_fails_over_to_another_instance` (a real
+  forwarder against an ingress answering 429; before: no failover, the
+  stream did not carry the other instance's answer).
+- `router_core::a_deadline_cut_stream_on_a_capable_lane_ends_with_an_error_event`
+  (SGLang-style lane with request IDs; before: the client saw only the
+  opening chunk, then the stream ended with no event).
+
+CPU and Fake-engine tests are not qualification. Live check still needed: on
+a host with several busy deployments whose requests together exceed the
+ingress's 64 forwards, a streaming client sees either output from another
+instance or a retryable error event, never an empty 200 stream, and the
+refused leases close as not accepted.
+
+## Engine log of a launch that failed before readiness — 2026-10-30 (branch `fix/engine-log-failed-launch`)
+
+Issue #226. `GET /management/v1/deployments/<id>/engine-log` answered
+`404 not_found` ("has no running launch") for a launch whose engine exited
+before readiness. A failed launch's binding is released when it fails, and the
+read looked only for a binding that had not been released. It did so with
+`engine_logs: files` or `memory`, standalone or remote. The operations guide
+promised the log ("The engine log says why the engine exited"), and the
+`engine_exited` diagnostic sends users to this read.
+
+SPEC §13.3 / T21. The read now names the instance's latest launch:
+`engine_logs::launch_scope` still prefers the retained binding of the
+instance's current generation. When there is none, it takes the newest
+released binding of that generation (`Store::released_launch_at`). Only the
+initialize step that launched a binding ties it to a generation: a stop draws
+a new generation and steps on the launch it ends, so a stopped instance names
+no launch and an earlier generation's launch is never named. A released remote launch is read on the
+host its ingress was frozen to before it was sent (`remote_binding_ingress`),
+not the instance's current host, so a retry of the same generation placed on
+another host does not send the read there. On a host, the `EngineLogTail` gate was
+"a launch this host still claims". It is now "a launch this host accepted for
+the deployment": one it claims, or one at the command's generation whose claim
+a Terminate released (`Journal::accepted_launch`). Nothing else changed: the
+engine log's redaction, bounds and closed refusals, the `--debug-engine-logs`
+refusal, and the 60-second linger of `engine_logs: memory`, after which the
+read answers `404` (no log). `ScopeError::NotRunning` and
+`EngineLogFailure::NotRunning` are renamed `NoLaunch`, and the refusal reads
+"has no launch". A host running an earlier CapyCTL still answers `missing` for
+a released launch, so the server answers `404` for it.
+
+Tests, failing before and passing after:
+`capyctl-cli/tests/engine_exit.rs`
+`a_standalone_launch_that_failed_before_ready_serves_its_file_log`,
+`…_serves_its_memory_log` and
+`a_remote_launch_that_failed_before_ready_serves_its_engine_log` (a fake vLLM
+that prints one line and exits 1 before serving; before the fix, all three
+got `404 not_found`); `capyctl-store`
+`a_released_failed_launch_is_named_for_its_generation`; `capyctl-controller`
+`a_stopped_launch_is_not_named_for_the_stops_generation` (before the
+initialize-only tie it named the stopped launch); `capyctl-agent`
+`engine_log_tail_serves_an_accepted_launch_bounded_and_redacted` (now also
+reads after the launch's Terminate, and refuses another generation).
+
+CPU and Fake-engine tests are not qualification. Live check, 2026-10-31, host
+A (GB10), a standalone role of `60c324d3` with SGLang 0.5.22 and
+`qwen3-4b-instruct`, nothing else running on the host:
+
+- `engine_logs: memory`, `quantization: awq` on that non-AWQ checkpoint, so
+  SGLang itself fails while loading: the deployment read `failed` 21 s after
+  the deploy, and the read 31 ms later answered 200 with the engine's 61-line
+  output ending in `ValueError: Cannot find the config file for awq`. 75 s
+  later (past the writer's 60 s linger) it answered `404 not_found`, "no
+  engine log exists for the launch of instance 0".
+- `engine_logs: memory` and `engine_logs: files`, an extra argument the SGLang
+  entry refuses (row M38's L8): 200 with `sglang_startup_failed:
+  invalid_extra_args`; with `memory`, 404 after the linger.
+
+Not checked live: a remote host (the remote path ran end to end only against
+the fake engine), and the issue's own trigger, CUDA context creation failing
+on a host whose memory is mostly page cache.
+
+## A start above a whole managed limit says so and names the setting — 2026-11-06 (branch `fix/241-discrete-system-startup`)
+
+Issue #241. On a discrete GPU (RTX 5090, vLLM 0.32.0, Qwen3.8-27B NVFP4) with a
+16 GiB system limit, a first start was charged the 4 GiB engine host overhead
+in host RAM, ran, and recorded a 26.3 GiB host-RAM startup peak (`RssAnon` plus
+`RssShmem`, memory no page-cache reclaim returns). Every later start reserves a
+measured peak (ADR 0015 amendment 2026-09-23, `ordinary_lifecycle/startup.rs`
+`frozen_startup`), so the next start needed 26.3 GiB against the whole 16 GiB
+limit and was refused `capacity_blocked` with `needs 26.3 GiB of system memory,
+16.0 GiB free of its 16.0 GiB limit; wait, stop another deployment, or start
+with --evict`. None of that advice can place it, and the setting that can,
+`host.resource_policy.memory.system.managed_limit`, was not named. The same
+happens on unified memory: a solo first start reserves the whole managed limit,
+but its measured drop in availability can exceed it, and the next start is then
+refused the same way.
+
+SPEC §14: when a host refuses a start because its need is above a memory
+domain's whole managed limit, that domain is the one its reason names, as
+`above its whole <limit> limit`, with the setting to raise: standalone's
+`host.resource_policy.memory.system.managed_limit`, an enrolled host's
+`resource_policy.domains.<domain>.managed_limit`, or, for a standalone card,
+that its limit is derived from the card (`capyctl-scheduler`
+`placement::shortfall`). On a host offering a device choice, an option that
+fits every managed limit leaves the refusal to the limit that did refuse it
+(host-KV, parked, count), as no card's limit is to blame. If every option is
+above a whole limit, an option that can fit after raising editable limits
+takes precedence over one blocked by a standalone card's non-settable limit.
+The card is named only when every option exceeds a non-settable card limit;
+raising system memory alone cannot then help. When every refusing
+host is above a whole limit (`Unplaceable::beyond_limits`), the store returns
+`LifecycleError::CapacityBeyondLimit` instead of `CapacityBlocked`; management
+answers it with the same `capacity_blocked` code (503) without the advice to
+wait, stop another deployment or `--evict`. Request-driven activation, fault
+classification and park deferral treat it exactly as `CapacityBlocked`. A host
+that is only full of other work keeps the old reason and advice.
+
+Not changed, for the owner: the first start on a discrete GPU is still charged
+only the host overhead in host RAM, so it can run past the system limit
+unnoticed before its peak is measured, and a measured peak above the limit
+still makes every later start refuse until the limit is raised. Whether such a
+start should run alone and reserve the whole limit, or a discrete first start
+should estimate its host-RAM peak from the weights, changes the startup budget
+rules (ADR 0014, ADR 0015 amendment 2026-09-23). #219 is the card-side mirror.
+
+Tests: `capyctl-controller`
+`a_discrete_host_ram_peak_above_the_system_limit_is_refused_naming_the_setting`
+(T14 T26) scripts a first start whose processes hold 40 GiB of host RAM against
+a 30 GiB system limit, and
+`a_unified_peak_above_the_managed_limit_is_refused_naming_the_setting` (T26
+T29) a solo first start whose load drops availability by 40 GiB against a 36 GiB
+limit; both check the next start is refused `CapacityBeyondLimit` with the
+setting named and reserves nothing. On `main` the same scenarios return
+`CapacityBlocked` with `needs 40.0 GiB of system memory, 30.0 GiB free of its
+30.0 GiB limit` (and of unified memory, 36.0). `capyctl-scheduler`
+`a_need_above_the_whole_limit_names_the_setting_and_no_eviction_helps` (T05 T23)
+covers standalone, enrolled and card wording and a host that is only full;
+`a_device_option_that_fits_the_managed_limits_leaves_the_other_limit_to_explain`
+(T23 T27) a device choice where one GPU is above its card's limit and the other
+fits, both over a shared host-KV limit: the host-KV limit is named (on `main`
+the refusal named the first GPU's card instead);
+`a_device_option_with_only_an_editable_shortfall_names_that_setting` (T23 T27)
+covers a 40 GiB system need against 36 GiB alongside GPU needs/limits of
+10/9 and 10/12 GiB. Before the review fix it named the first card's
+non-settable limit; after the fix it names the system setting, in either
+device order, and raising that setting admits the second card. It also
+checks the refusal when every card is too small and the ordinary capacity
+reason when one option is merely full;
+`a_host_kv_refusal_names_the_limit_and_the_setting_to_raise` now expects the
+new wording for its need above the limit. `capyctl-management`
+`a_start_above_a_managed_limit_is_not_told_to_wait_or_evict` (T05 T23) checks
+the code, status and message. CPU and Fake-engine tests are not qualification;
+the live check still needed is the reporter's sequence on a discrete GPU.
+
 ## The engine receives the caller's request bytes — 2026-10-29 (branch `fix/preserve-json-key-order`)
 
 Issue #220. The router parsed every inference request into `serde_json::Value`
