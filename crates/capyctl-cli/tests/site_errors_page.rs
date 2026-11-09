@@ -70,6 +70,8 @@ fn other_structured_codes_are_documented_with_their_exit_code() {
         "host_name_changed",
         "engine_not_found",
         "engine_unsupported",
+        // #198: an editable SGLang refused at `engine add`.
+        "installation_unsupported:editable",
         "engine_version_failed",
         "profile_exists",
         "profile_in_use",

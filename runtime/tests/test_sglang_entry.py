@@ -938,13 +938,45 @@ class StartupTests(LaunchFixture, unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(error.getvalue(), "sglang_startup_failed: placement_failed\n")
 
-    def test_failed_engine_import_denies_through_startup_error(self):
-        error = io.StringIO()
-        with mock.patch.object(composition, "enforce_closed_plugins", side_effect=lambda: None), \
-                mock.patch.object(entry, "_guarded_engine_import", side_effect=ImportError("sglang")):
-            result = entry.main(self.argv(), self.payloads().__getitem__, error)
-        self.assertEqual(result, 1)
-        self.assertEqual(error.getvalue(), "sglang_startup_failed: startup_error\n")
+    # #198: a failed SGLang import is its own closed category, with a fixed
+    # hint and no exception detail, never the blanket startup_error.
+    def test_failed_engine_import_surfaces_engine_import_failed(self):
+        class Broken(Exception):
+            pass
+
+        def raising_module(*_):
+            raise Broken("/private/path secret-detail")
+
+        for name, failure in (("missing", None), ("raising", raising_module)):
+            with self.subTest(name):
+                error = io.StringIO()
+                modules = {"sglang": None} if failure is None else {}
+                with mock.patch.object(composition, "enforce_closed_plugins",
+                                       side_effect=lambda: None), \
+                        mock.patch.object(entry, "_compose_search_path"), \
+                        mock.patch.object(guards, "preimport_guard"), \
+                        mock.patch.dict(sys.modules, modules), \
+                        mock.patch.object(builtins, "__import__",
+                                          side_effect=self._failing_import(failure)):
+                    result = entry.main(self.argv(), self.payloads().__getitem__, error)
+                self.assertEqual(result, 1)
+                text = error.getvalue()
+                self.assertTrue(text.startswith("sglang_startup_failed: engine_import_failed ("),
+                                text)
+                self.assertTrue(text.endswith(")\n"), text)
+                for detail in ("private", "secret", "Broken", "No module"):
+                    self.assertNotIn(detail, text)
+
+    @staticmethod
+    def _failing_import(failure):
+        """The real import, except SGLang's, which fails as `failure` says."""
+        real = builtins.__import__
+
+        def imported(name, *args, **kwargs):
+            if failure is not None and name.split(".")[0] == "sglang":
+                failure(name)
+            return real(name, *args, **kwargs)
+        return imported
 
     def run_with_contract(self, prepare):
         events = []

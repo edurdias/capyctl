@@ -5359,6 +5359,62 @@ mod tests {
         }
     }
 
+    /// T21 T34 #198 (ADR 0017 §2, ADR 0008 amendment 2026-10-30): an
+    /// enrolled host never refuses a launch with
+    /// `installation_unsupported:editable`, a code no 0.1.x server knows (its
+    /// refusal check would end the whole control session on it). An editable
+    /// SGLang takes the pre-#198 path under either drift policy: unmeasured,
+    /// admitted on (here to the fixture's unrecorded checkpoint, the next
+    /// gate), and failed at the engine's start by the entry's
+    /// `engine_import_failed` in the free-text launch failure.
+    #[test]
+    fn a_host_never_refuses_an_editable_sglang_with_a_code_servers_do_not_know() {
+        for policy in ["warn", "refuse"] {
+            let root = directory();
+            let identity_dir = directory();
+            let venv = root.path().join("opt/sglang");
+            let site = venv.join("lib/python3.12/site-packages");
+            std::fs::create_dir_all(site.join("sglang-0.5.22.dist-info")).unwrap();
+            std::fs::write(
+                site.join("__editable__.sglang-0.5.22.pth"),
+                "import __editable___sglang_0_5_22_finder; __editable___sglang_0_5_22_finder.install()\n",
+            )
+            .unwrap();
+            std::fs::create_dir_all(venv.join("bin")).unwrap();
+            std::fs::write(venv.join("bin/python3"), "").unwrap();
+            let executable = venv.join("bin/python3");
+            assert_eq!(
+                crate::installation::unsupported_installation(Engine::Sglang, &executable),
+                Some(crate::installation::EDITABLE_REFUSAL)
+            );
+            let (executor, deployment, policy_fingerprint) = sglang_fixture_with(
+                root.path(),
+                identity_dir.path(),
+                "restart_only",
+                |document| {
+                    let profile = &mut document["runtime_profiles"]["local"];
+                    profile["executable"] = executable.to_string_lossy().into_owned().into();
+                    profile["security"]["installation_drift"] = policy.into();
+                },
+            );
+            sglang_runtime(root.path());
+            let (mut launch, _) = launch_with(&deployment, &policy_fingerprint, "");
+            launch.identity.payload_digest = launch.canonical_digest();
+            let MemberAction::LaunchSingle(plan) = launch.action.clone() else {
+                panic!("a launch");
+            };
+            let verdict = executor.admit_launch(&launch, &plan, GpuReading::Now);
+            assert_eq!(
+                verdict,
+                Err(LaunchVerdict::Refused("checkpoint_mismatch")),
+                "{policy}"
+            );
+            if let Err(LaunchVerdict::Refused(reason)) = verdict {
+                assert!(capyctl_protocol::execution::is_policy_refusal(reason));
+            }
+        }
+    }
+
     /// A launch-time probe report with `deep_park` missing, as a build without
     /// the memory saver hooks answers (`runtime/engine_capabilities.py`).
     fn without_saver_hooks() -> crate::installation::CapabilityReport {

@@ -85,6 +85,10 @@ _CODES = frozenset({"invalid_descriptor", "invalid_credentials", "descriptor_io"
                     # SPEC §§6.4, 13.2: SGLang's launch raised after it started
                     # engine processes (a scheduler that exited before readiness).
                     "engine_launch_failed",
+                    # #198: SGLang itself could not be imported from the verified
+                    # site-packages (an editable install, or a dependency that
+                    # failed to import); no detail of the failure is rendered.
+                    "engine_import_failed",
                     # ADR 0028 §10: a group field SGLang's resolution changed.
                     "group_drift:tp_size", "group_drift:pp_size", "group_drift:nnodes",
                     "group_drift:node_rank", "group_drift:dist_init_addr"})
@@ -558,7 +562,8 @@ def _trusted_package_root():
     interpreter as argv[0]; under -IS no site processing selects a package
     root, so the path is composed explicitly from that executable's
     environment prefix. Nothing is discovered from PATH, PYTHONPATH, or .pth
-    hooks. A wrong composition fails closed at the guarded import.
+    hooks. A wrong composition fails closed at the guarded import
+    (`engine_import_failed`, #198).
     """
     prefix = os.path.dirname(os.path.dirname(sys.executable))
     return os.path.join(prefix, "lib", "python%d.%d" % sys.version_info[:2],
@@ -577,6 +582,14 @@ def _compose_search_path():
     scheduler and detokenizer are spawned, and CPython spawn hands each child
     this sys.path before it runs the protected main script, so they import
     from the same composition.
+
+    #198, ADR 0008 amendment 2026-10-30: an editable install's package root
+    (setuptools' `__editable__.<name>.pth` finder pointing outside the
+    environment, as in the lmsysorg/sglang image) is never added: the
+    registered fingerprint and drift flag attest only this tree, so such an
+    installation is refused at `engine add` and at the launch-time check
+    (`installation_unsupported:editable`), and one reaching this entry
+    anyway fails `engine_import_failed`.
     """
     from runtime.sglang_startup_guards import trusted_search_path
     site_packages = os.path.dirname(os.path.dirname(_trusted_package_root()))
@@ -659,14 +672,19 @@ def _guarded_engine_import():
     .pth hooks — and imports the engine startup modules inside this
     function only; every engine import in this process happens here. The
     search path is appended, so the stdlib and this protected package keep
-    precedence over the verified tree. Tests substitute this seam; a failed
-    import leaves through main's closed startup category.
+    precedence over the verified tree. Tests substitute this seam. #198: a
+    failed engine import (an editable SGLang, whose package only its .pth
+    finder reaches, or a dependency raising at import) leaves through the
+    closed `engine_import_failed`, never its exception text.
     """
     _compose_search_path()
     from runtime.sglang_startup_guards import preimport_guard
     preimport_guard()
-    from sglang.srt.entrypoints import http_server as launch
-    from sglang.srt import server_args as arguments
+    try:
+        from sglang.srt.entrypoints import http_server as launch
+        from sglang.srt import server_args as arguments
+    except Exception:
+        raise LaunchError("engine_import_failed") from None
     return arguments, launch
 
 
@@ -1327,6 +1345,12 @@ def _hint(code):
         return (" (SGLang's launch failed after it started its processes, for example a"
                 " scheduler that exited before readiness; every one was ended, and the"
                 " engine's own lines above say why)")
+    if code == "engine_import_failed":
+        return (" (SGLang could not be imported from its environment's site-packages, where"
+                " CapyCTL loads it without running .pth files; an editable install (pip"
+                " install -e, as in the lmsysorg/sglang image) is not supported: reinstall"
+                " SGLang without -e; otherwise a module SGLang imports failed, so check"
+                " that the environment's python3 can import sglang.srt.entrypoints.http_server)")
     return ""
 
 
