@@ -579,7 +579,7 @@ fn an_embedded_discrete_launch_is_sized_against_the_card() {
         panic!("fixture profile declares vllm");
     };
     let launch = launch.expect("an owned vllm binding carries a launch plan");
-    assert_eq!(launch.granted.gpu_utilization_pct, Some(76));
+    assert_eq!(launch.granted.gpu_utilization_units, Some(7_503_663_899));
     let sglang = discrete_work(include_str!(
         "../../../capyctl-config/tests/fixtures/effective-sglang-golden.json"
     ));
