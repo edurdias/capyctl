@@ -832,6 +832,13 @@ impl ChatHttp {
         if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
             return Err(refused_before_forwarding(response).await);
         }
+        // #213, SPEC §10: a host ingress at its forward limit answers 429 with
+        // its own failure code before anything reaches the engine; the request
+        // was not accepted, so the router may offer it elsewhere. Any other
+        // 429 (an engine's own) stays as uncertain as it was.
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(ingress_at_capacity(response, unverified).await);
+        }
         // SPEC §10 (found live 2026-09-24): an invalid-request answer is the
         // engine's complete reply, relayed as such rather than as uncertainty.
         let status = response.status().as_u16();
@@ -1082,8 +1089,9 @@ pub const REJECTION_BODY_LIMIT: usize = 16 * 1024;
 const REJECTION_MESSAGE_LIMIT: usize = 512;
 
 /// The code a host ingress answers its own failures with: a 502 when the
-/// engine could not be reached or its answer could not be relayed whole. It
-/// is not the engine's answer, so it stays uncertain.
+/// engine could not be reached or its answer could not be relayed whole,
+/// which is not the engine's answer and stays uncertain; a 429 at its forward
+/// limit, decided before forwarding, which is not accepted (#213).
 pub const INGRESS_FAILURE_CODE: &str = "inference_unavailable";
 
 /// The message of an engine's invalid-request answer: vLLM's `error.message`,
@@ -1248,6 +1256,28 @@ async fn refused_before_forwarding(response: reqwest::Response) -> AdapterError 
             AdapterError::NotAccepted("the serving role is shutting down".into())
         }
         _ => uncertain(),
+    }
+}
+
+/// #213: a 429 is the host ingress's own refusal at its forward limit, decided
+/// before forwarding, only when its body carries [`INGRESS_FAILURE_CODE`]: the
+/// ingress relays no engine 429 (it answers one as its own 502). Anything
+/// else, an engine's own 429 included, stays `unverified()`.
+async fn ingress_at_capacity(
+    response: reqwest::Response,
+    unverified: fn() -> AdapterError,
+) -> AdapterError {
+    let read =
+        tokio::time::timeout(Duration::from_secs(5), read_whole(response, REFUSAL_LIMIT)).await;
+    let Some(body) = read.ok().flatten() else {
+        return unverified();
+    };
+    let refusal = serde_json::from_slice::<Value>(&body).ok();
+    match refusal.as_ref().map(|v| &v["error"]["code"]) {
+        Some(Value::String(code)) if code == INGRESS_FAILURE_CODE => {
+            AdapterError::NotAccepted("the serving host's ingress is at capacity".into())
+        }
+        _ => unverified(),
     }
 }
 
