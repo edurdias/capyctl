@@ -229,6 +229,29 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(len(archived), 1)
         self.assertTrue((archived[0] / 'evidence/result-EM1.json').exists())
 
+    def test_unified_memory_uses_labelled_process_allocations_when_global_is_na(self):
+        from types import SimpleNamespace
+        ctx = v020.Context(self.root, {}, unified=True)
+        calls = []
+        def command(args):
+            calls.append(args)
+            return SimpleNamespace(stdout='[N/A]\n' if len(calls) == 1 else '12, 170\n13, 84613\n')
+        ctx.command = command
+        sample = ctx.sample()
+        self.assertEqual(sample['gpu_used_bytes'], (170 + 84613) * 2**20)
+        self.assertEqual(sample['gpu_memory_source'], 'nvml_compute_process_allocations')
+        self.assertIn('--query-compute-apps=pid,used_memory', calls[1])
+
+    def test_memory_sample_never_turns_unknown_process_allocations_into_zero(self):
+        from types import SimpleNamespace
+        ctx = v020.Context(self.root, {}, unified=True)
+        ctx.command = lambda args: SimpleNamespace(stdout='[N/A]\n')
+        with self.assertRaisesRegex(AssertionError, 'numeric unified-memory'):
+            ctx.sample()
+        ctx.unified = False
+        with self.assertRaisesRegex(AssertionError, 'numeric GPU memory'):
+            ctx.sample()
+
     def test_lmcache_latest_tuple_is_approved_on_unified_memory(self):
         from rows.lmcache import fixtures
         from types import SimpleNamespace

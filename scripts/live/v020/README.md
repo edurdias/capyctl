@@ -126,6 +126,11 @@ it never creates or changes engine environments. Session tools, missing models
 and the checksum-verified aarch64 old binary remain private setup artifacts.
 Supply `OTELCOL` and `CUDA_HOME` as read-only overrides too.
 
+GB10's unavailable global framebuffer counter is never converted to zero.
+Samples use numeric NVML per-process CUDA allocations and label their source
+`nvml_compute_process_allocations`, separately from physical framebuffer use.
+Host `MemAvailable` and process RSS remain separately recorded.
+
 If preparation already claimed the live marker, set
 `V020_SESSION_NAME=HostAFull` when invoking `run.sh`; the existing marker must
 contain exactly that name. The runner preserves exclusivity and removes only
