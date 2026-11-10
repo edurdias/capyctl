@@ -280,6 +280,25 @@ pub(crate) enum EventMetadata {
         generation: i64,
         count: usize,
     },
+    /// ADR 0036 §6, EM4: a restarted embedding launch compared its fixed
+    /// probe with the reference retained before stop, before dispatch opened.
+    #[serde(rename = "1")]
+    EmbeddingCanaryChecked {
+        deployment_id: String,
+        operation_id: String,
+        instance_index: u32,
+        generation: i64,
+        incarnation: String,
+        reference_generation: i64,
+        reference_incarnation: String,
+        probe_kind: String,
+        probe_version: u32,
+        reference_dimension: u32,
+        observed_dimension: u32,
+        relative_distance: Option<f64>,
+        tolerance: f64,
+        verdict: &'static str,
+    },
 }
 
 /// SPEC §10 (W10): what a request-driven switch recorded.
@@ -427,6 +446,7 @@ impl EventMetadata {
             Self::LmcachePoolShort { .. } => "lmcache_pool_short",
             Self::TopologyAutoChanged { .. } => "topology_auto_changed",
             Self::InstanceRestartedForHeldRequests { .. } => "instance_restarted_for_held_requests",
+            Self::EmbeddingCanaryChecked { .. } => "embedding_canary_checked",
         }
     }
 
@@ -484,6 +504,11 @@ impl EventMetadata {
             | Self::TopologyAutoChanged { deployment_id, .. } => {
                 (Some(deployment_id.as_str()), None)
             }
+            Self::EmbeddingCanaryChecked {
+                deployment_id,
+                operation_id,
+                ..
+            } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::InstanceRestartedForHeldRequests {
                 deployment_id,
                 operation_id,
