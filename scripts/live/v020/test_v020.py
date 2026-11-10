@@ -225,6 +225,29 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(len(archived), 1)
         self.assertTrue((archived[0] / 'evidence/result-EM1.json').exists())
 
+    def test_trt_driver_probe_compiles_for_the_detected_gpu(self):
+        import subprocess
+        (self.root / 'downloads').mkdir()
+        setup = Path(__file__).with_name('setup.sh')
+        script = '''
+source "$1"
+V020=$2
+CUDACXX=/unused/nvcc
+nvidia-smi() { printf '%s\\n' "$3"; }
+v020_cmd() { printf '%s\\n' "$*"; }
+v020_trt_availability() { :; }
+v020_trt_driver_probe TEST
+'''
+        # The probe must use portable PTX for this GPU, not sm_120 on an A100.
+        for capability, architecture in [('8.0', '80'), ('12.0', '120')]:
+            with self.subTest(capability=capability):
+                output = subprocess.run(
+                    ['bash', '-c', script.replace('"$3"', capability),
+                     'probe', str(setup), str(self.root)],
+                    check=True, capture_output=True, text=True).stdout
+                self.assertIn(
+                    f'arch=compute_{architecture},code=compute_{architecture}', output)
+
 
 if __name__ == '__main__':
     unittest.main()

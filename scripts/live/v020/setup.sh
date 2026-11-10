@@ -499,7 +499,7 @@ PY
 }
 
 v020_trt_driver_probe() {
-  local key=$1 source=$V020/downloads/$1-driver-probe.cu binary=$V020/downloads/$1-driver-probe
+  local key=$1 source=$V020/downloads/$1-driver-probe.cu binary=$V020/downloads/$1-driver-probe arch
   cat >"$source" <<'CU'
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -519,7 +519,9 @@ int main() {
          result == cudaErrorSystemDriverMismatch || result == cudaErrorCompatNotSupportedOnDevice ? 42 : 1;
 }
 CU
-  v020_cmd timeout 180 "$CUDACXX" -gencode arch=compute_120,code=compute_120 \
+  arch=$(v020_cuda_arch torch)
+  arch=${arch/./}
+  v020_cmd timeout 180 "$CUDACXX" -gencode "arch=compute_$arch,code=compute_$arch" \
     -ccbin "$(command -v c++)" "$source" -o "$binary"
   if v020_cmd timeout 60 env CUDA_FORCE_PTX_JIT=1 "$binary"; then
     v020_trt_availability "$key" true 'installed; toolkit13.4 forced-PTX kernel succeeded; model qualification still required'

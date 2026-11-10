@@ -6,10 +6,10 @@ qualify an engine from CPU tests. A separate supervisor must delete the rental.
 
 ## Rental and launch
 
-The approved shape is one x86_64 RTX PRO 6000 96 GB (Blackwell sm_120), 192 GB RAM,
-16 vCPU and 750 GB disk, image `ubuntu22.04_cuda13.0_shade_os`. The rate is $2.19/hour;
-eight hours cost $17.52. Configure provider `auto_delete.spend_threshold: 20` before
-launching. There are no lab-host connections in this mode.
+The rented x86_64 VM has one A100 80 GB (Ampere sm_80), 118 GiB RAM, 16 vCPU
+and 984 GB disk. The rate is $1.38/hour; eight hours cost $11.04. The initially
+selected RTX PRO 6000 was unavailable. Configure provider
+`auto_delete.spend_threshold: 20` before launch. There are no lab-host connections.
 
 Prepare the integration binary on the control machine:
 
@@ -66,8 +66,8 @@ The installed versions are vLLM 0.32.0/0.33.0, SGLang 0.5.22/0.5.23 plus an
 isolated editable 0.5.23, LMCache 0.5.7 built from its source tag in separate
 vLLM 0.33.0 and SGLang 0.5.23 environments, TensorFold native 1.2.6/1.1.5 and
 otelcol 0.164.0. LMCache builds keep the engine's torch pinned, use CUDA major
-13 and architecture 12.0, and do not reuse a wheel compiled against another
-engine's torch. The shared host may still supply its approved LMCache 0.5.6.
+13 and the detected GPU architecture (8.0 on the A100), and do not reuse a wheel
+compiled against another engine's torch. The shared host may supply LMCache 0.5.6.
 TensorFold 0.6.6 is an optional TF3 comparison: explicitly select TF3 to install
 it, or supply its mapping. It does not delay the default setup.
 
@@ -85,9 +85,10 @@ wrapper, but this harness uses a small local build function instead of shimming
 its SSH dependency. The pin comes from `scripts/live/llamacpp-build.sh` at
 `63f91fc8`: tag v0.9.0 must resolve exactly to
 `cd959bae99ff4bed22bef2604f45241c09bbb8c8`. The build selects CUDA, Release,
-`120a-real`, disables dev/Connect/UI/prebuilt UI, and builds `llama-server` with
-`nproc` jobs using the detected toolkit. Its version output and fingerprints
-are evidence. CUDA-toolkit wheels supply nvcc when the image does not.
+the detected GPU architecture (`80-real` on the A100), disables dev/Connect/UI/
+prebuilt UI, and builds `llama-server` with `nproc` jobs using the detected toolkit.
+CUDA-toolkit wheels supply nvcc when the image does not. The TensorRT forced-PTX
+preflight likewise targets the detected GPU rather than a fixed architecture.
 
 Models are downloaded with `hf` concurrently with installs. Supplied revision
 pins are resolved to full commits; plan entries without revisions resolve once
