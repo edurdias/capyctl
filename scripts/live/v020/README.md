@@ -70,6 +70,8 @@ otelcol 0.164.0. LMCache builds keep the engine's torch pinned, use CUDA major
 compiled against another engine's torch. The shared host may supply LMCache 0.5.6.
 TensorFold 0.6.6 is an optional TF3 comparison: explicitly select TF3 to install
 it, or supply its mapping. It does not delay the default setup.
+The editable SGLang fixture disables optional Rust extensions: #235 must refuse
+it before any engine launch, and setup does not install an extra Rust toolchain.
 
 TensorRT-LLM has separate row-gated no-apt installations: 1.2.1 with torch
 2.9.1+cu130, and 1.4.0rc3 with torch 2.14.0+cu132; pip Open MPI 4.1.8 and mpi4py

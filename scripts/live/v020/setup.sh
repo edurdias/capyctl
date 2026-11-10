@@ -277,7 +277,9 @@ v020_install_sglang() {
       commit=$(git -C "$source" rev-parse HEAD)
       [[ $commit =~ ^[0-9a-f]{40}$ ]] || return 1
       printf '%s\n' "$commit" >"$EVIDENCE/sglang-editable-commit.txt"
-      v020_cmd "$BIN/uv" pip install --python "$path/bin/python" --prerelease=allow --torch-backend=cu130 \
+      # #235 rejects this distribution before launch; its optional Rust kernels
+      # are unnecessary, and installing a new Rust toolchain is not authorized.
+      v020_cmd env SGLANG_BUILD_RUST_EXTS=none "$BIN/uv" pip install --python "$path/bin/python" --prerelease=allow --torch-backend=cu130 \
         --editable "$source/python[tracing]" torch-memory-saver==0.0.10
     else
       v020_cmd "$BIN/uv" pip install --python "$path/bin/python" --prerelease=allow --torch-backend=cu130 \
