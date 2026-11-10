@@ -96,7 +96,7 @@ pub fn vllm_launch_settings() -> LaunchSettings {
 pub fn sglang_launch_settings() -> SglangLaunchSettings {
     SglangLaunchSettings {
         common: CommonEngineSettings {
-            cuda_graphs: Some(false),
+            cuda_graphs: Some(false.into()),
             ..CommonEngineSettings::default()
         },
         // Request = weights (4 GiB here) + KV + margin (ADR 0014 §5), so the

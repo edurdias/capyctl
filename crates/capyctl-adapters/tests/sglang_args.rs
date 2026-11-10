@@ -382,7 +382,7 @@ fn typed_settings_and_extra_arguments_render_for_any_model() {
     config.common.kv_cache_dtype = Some("fp8_e4m3".into());
     config.common.context_length = Some(32768);
     config.common.max_concurrent_requests = Some(16);
-    config.common.cuda_graphs = Some(true);
+    config.common.cuda_graphs = Some(true.into());
     config.common.language_model_only = true;
     config.common.trust_remote_code = true;
     config.max_total_tokens = Some(65536);
@@ -407,6 +407,25 @@ fn typed_settings_and_extra_arguments_render_for_any_model() {
         settings["extra_args"],
         json!(["--reasoning-parser", "qwen3"])
     );
+}
+
+/// ADR 0014 §2 / SPEC §8.1 / #236: frozen launch descriptors preserve each
+/// phase, rather than collapsing either mixed policy to a boolean.
+// T14 T22
+#[test]
+fn frozen_cuda_graph_phases_reach_the_protected_descriptor() {
+    for prefill in [false, true] {
+        for decode in [false, true] {
+            let mut config = settings();
+            config.common.cuda_graphs =
+                Some(capyctl_domain::launch::CudaGraphs::Phases { prefill, decode });
+            let launch = SglangLaunch::from_frozen(&frozen(metadata(1), config)).unwrap();
+            assert_eq!(
+                public_args(&launch)["settings"]["cuda_graphs"],
+                json!({"prefill": prefill, "decode": decode})
+            );
+        }
+    }
 }
 
 /// Shapes the entry would refuse are refused before rendering; reserved

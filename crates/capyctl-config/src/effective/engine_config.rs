@@ -9,7 +9,7 @@ use crate::engine_policy::{
     option_names, typed_field_option, validate_extra_args, ExtraArgsContext, ExtraArgsPolicy,
 };
 use capyctl_domain::launch::{
-    CommonEngineSettings, CustomLaunchSettings, LaunchSettings, LlamacppGpuLayers,
+    CommonEngineSettings, CudaGraphs, CustomLaunchSettings, LaunchSettings, LlamacppGpuLayers,
     LlamacppLaunchSettings, MemoryRequest, SafetensorsLoadStrategy, SettingSource,
     SglangLaunchSettings, TensorfoldLaunchSettings, TensorrtLlmLaunchSettings, VllmLaunchSettings,
 };
@@ -336,7 +336,7 @@ pub(super) struct RawEngineConfig {
     #[serde(default)]
     max_concurrent_requests: Option<u32>,
     #[serde(default)]
-    cuda_graphs: Option<bool>,
+    cuda_graphs: Option<CudaGraphs>,
     #[serde(default)]
     language_model_only: Option<bool>,
     #[serde(default)]
@@ -1408,6 +1408,15 @@ pub(super) fn normalize_engine_config(
     inputs: EngineInputs<'_>,
 ) -> Result<LaunchSettings, ConfigError> {
     let engine = inputs.engine;
+    // ADR 0014 §2 / #236: phase policy has no equivalent in other engines;
+    // refuse it before family-specific checks can obscure the field's error.
+    if engine != Engine::Sglang && matches!(raw.cuda_graphs, Some(CudaGraphs::Phases { .. })) {
+        return Err(invalid(
+            "engine_config.cuda_graphs",
+            "the {prefill: bool, decode: bool} object is only supported by SGLang; \
+             use a boolean for other engines",
+        ));
+    }
     // ADR 0031 §4: CapyCTL renders none of a custom engine's options, so a
     // deployment states only `context_length` (for its placeholder) and
     // `env`; anything else would be silently ignored, and is refused by name.
@@ -2223,7 +2232,7 @@ pub(super) fn normalize_engine_config(
             // under the old default (graphs off beside the saver) keeps it.
             if common.cuda_graphs.is_none() && memory_saver && inputs.facts.legacy_sglang_graphs_off
             {
-                common.cuda_graphs = Some(false);
+                common.cuda_graphs = Some(false.into());
                 provenance.insert("cuda_graphs".into(), SettingSource::CapyctlDefault);
             }
             let tokenizer_workers = match sglang.tokenizer_workers {

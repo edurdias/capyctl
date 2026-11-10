@@ -278,8 +278,15 @@ def _validate_settings(settings):
         _integer(chunked, -1, _I32)
         if chunked == 0:
             _reject()
-    if settings["cuda_graphs"] is not None:
-        _boolean(settings["cuda_graphs"])
+    graphs = settings["cuda_graphs"]
+    if type(graphs) is dict:
+        # SPEC §15.3 / ADR 0014 §2 / #236: exactly two boolean phases.
+        if set(graphs) != {"prefill", "decode"}:
+            _reject()
+        for enabled in graphs.values():
+            _boolean(enabled)
+    elif graphs is not None:
+        _boolean(graphs)
     for name in ("language_model_only", "trust_remote_code", "memory_saver",
                  "cpu_weight_backup"):
         _boolean(settings[name])

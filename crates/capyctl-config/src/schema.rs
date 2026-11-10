@@ -377,7 +377,10 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("kv_cache_dtype", SCALAR),
         ("context_length", SCALAR),
         ("max_concurrent_requests", SCALAR),
-        ("cuda_graphs", SCALAR),
+        (
+            "cuda_graphs",
+            FieldSpec::ScalarOrStruct(&[("prefill", SCALAR), ("decode", SCALAR)]),
+        ),
         ("language_model_only", SCALAR),
         ("trust_remote_code", SCALAR),
         ("memory", ENGINE_MEMORY),

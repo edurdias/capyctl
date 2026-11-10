@@ -7,7 +7,7 @@
 //! (ports, devices, ranks, memory grants, keys) never appear here: adapters
 //! render them from the grant, placement and binding.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Owner decision 2026-10-02: the requests CapyCTL keeps in flight per
@@ -137,6 +137,22 @@ pub enum SettingSource {
     Derived,
 }
 
+/// ADR 0014 §2 / #236: scalar policy keeps its existing wire format.
+/// SGLang alone also accepts independent prefill/decode policy; `true`
+/// retains the engine's native policy rather than forcing a graph backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum CudaGraphs {
+    Boolean(bool),
+    Phases { prefill: bool, decode: bool },
+}
+
+impl From<bool> for CudaGraphs {
+    fn from(enabled: bool) -> Self {
+        Self::Boolean(enabled)
+    }
+}
+
 /// ADR 0014 §2: typed parameters common to every engine family. `None` means
 /// the engine's own default applies. capyctl validates type and range only; whether
 /// the engine supports a value on this checkpoint is the user's responsibility
@@ -154,7 +170,7 @@ pub struct CommonEngineSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent_requests: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cuda_graphs: Option<bool>,
+    pub cuda_graphs: Option<CudaGraphs>,
     pub language_model_only: bool,
     pub trust_remote_code: bool,
 }

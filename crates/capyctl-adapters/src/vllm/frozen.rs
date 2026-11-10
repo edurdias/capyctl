@@ -245,7 +245,7 @@ pub fn plan_from_effective(
         } else {
             None
         },
-        enforce_eager: common.cuda_graphs == Some(false),
+        enforce_eager: common.cuda_graphs == Some(false.into()),
         language_model_only: common.language_model_only,
         trust_remote_code: common.trust_remote_code,
         tool_call_parser,

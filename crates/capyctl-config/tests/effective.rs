@@ -696,7 +696,7 @@ fn sglang_settings_show_defaults_and_derivations_with_provenance() {
     let LaunchSettings::Sglang(settings) = &effective.engine_config else {
         panic!("sglang settings")
     };
-    assert_eq!(settings.common.cuda_graphs, Some(true));
+    assert_eq!(settings.common.cuda_graphs, Some(true.into()));
     assert_eq!(settings.tokenizer_workers, 2);
     assert!(!settings.provenance.contains_key("cuda_graphs"));
     assert!(!settings.provenance.contains_key("sglang.tokenizer_workers"));
@@ -708,7 +708,7 @@ fn sglang_settings_show_defaults_and_derivations_with_provenance() {
     let LaunchSettings::Sglang(settings) = &effective.engine_config else {
         panic!("sglang settings")
     };
-    assert_eq!(settings.common.cuda_graphs, Some(false));
+    assert_eq!(settings.common.cuda_graphs, Some(false.into()));
     assert!(!settings.provenance.contains_key("cuda_graphs"));
 }
 

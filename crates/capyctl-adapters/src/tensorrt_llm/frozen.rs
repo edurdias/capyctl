@@ -134,7 +134,15 @@ pub fn plan_from_effective(
         tokens_per_block: tokens_per_block(&settings.llm_api_options),
         dtype: common.dtype.clone(),
         kv_cache_dtype: common.kv_cache_dtype.clone(),
-        cuda_graphs: common.cuda_graphs,
+        cuda_graphs: match common.cuda_graphs {
+            Some(capyctl_domain::launch::CudaGraphs::Boolean(enabled)) => Some(enabled),
+            None => None,
+            Some(capyctl_domain::launch::CudaGraphs::Phases { .. }) => {
+                return Err(TensorrtLlmPlanError::Unresolved(
+                    "engine_config.cuda_graphs phase objects are only supported by SGLang".into(),
+                ));
+            }
+        },
         llm_api_options: settings.llm_api_options.clone(),
         reasoning_parser,
         tool_parser,

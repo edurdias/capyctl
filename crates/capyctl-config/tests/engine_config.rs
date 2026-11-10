@@ -100,6 +100,68 @@ fn strict_yaml_accepts_the_typed_block_and_refuses_unknown_fields() {
     assert_eq!(error.code, ConfigErrorCode::InvalidUnit);
 }
 
+/// SPEC §15.3 / ADR 0014 §2 / #236: phase policy is SGLang-only and is
+/// retained verbatim by effective snapshots and command identity.
+// T03 T09 T14
+#[test]
+fn sglang_cuda_graph_phases_round_trip_without_changing_booleans() {
+    for policy in [
+        json!(true),
+        json!(false),
+        json!({"prefill": true, "decode": true}),
+        json!({"prefill": true, "decode": false}),
+        json!({"prefill": false, "decode": true}),
+        json!({"prefill": false, "decode": false}),
+    ] {
+        let (mut deployment, mut host) = fixture();
+        sglang_profile(&mut host);
+        deployment["engine_config"]["cuda_graphs"] = policy.clone();
+        parse_strict(ConfigKind::Deployment, &deployment.to_string()).unwrap();
+        let effective = resolve_effective(&deployment, &host).unwrap();
+        let snapshot = serde_json::to_value(&effective).unwrap();
+        assert_eq!(snapshot["engine_config"]["common"]["cuda_graphs"], policy);
+        assert_eq!(
+            decode_effective_snapshot(&snapshot.to_string()).unwrap(),
+            effective
+        );
+        let fingerprint = deployment_command_fingerprint(&deployment, 300_000).unwrap();
+        deployment["engine_config"]["cuda_graphs"] = json!({"prefill": false, "decode": true});
+        if policy != deployment["engine_config"]["cuda_graphs"] {
+            assert_ne!(
+                fingerprint,
+                deployment_command_fingerprint(&deployment, 300_000).unwrap()
+            );
+        }
+    }
+}
+
+/// SPEC §15.3 / ADR 0014 §2 / #236: no partial or open phase objects.
+// T03 T14
+#[test]
+fn cuda_graph_phase_objects_are_closed_and_sglang_only() {
+    for policy in [
+        json!({}),
+        json!({"prefill": false}),
+        json!({"prefill": false, "decode": 1}),
+        json!({"prefill": false, "decode": true, "other": false}),
+    ] {
+        let (mut deployment, mut host) = fixture();
+        sglang_profile(&mut host);
+        deployment["engine_config"]["cuda_graphs"] = policy;
+        assert!(resolve_effective(&deployment, &host).is_err());
+    }
+    for engine in ["vllm", "tensorfold", "llamacpp", "tensorrt-llm"] {
+        let (mut deployment, mut host) = fixture();
+        host["runtime_profiles"]["local"]["engine"] = engine.into();
+        host["runtime_profiles"]["local"]["args"] = json!([]);
+        deployment["residency"] = "restart_only".into();
+        deployment["engine_config"]["cuda_graphs"] = json!({"prefill": false, "decode": true});
+        let error = resolve_effective(&deployment, &host).unwrap_err();
+        assert_eq!(error.path, "engine_config.cuda_graphs", "{engine}: {error}");
+        assert!(error.to_string().contains("only supported by SGLang"), "{error}");
+    }
+}
+
 /// ADR 0014 §6 (owner decision Q10): extra arguments pass only behind the
 /// deployment's explicit flag, and a host may deny them outright.
 // T14 T21

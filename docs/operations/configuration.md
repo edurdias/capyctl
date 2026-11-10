@@ -220,6 +220,16 @@ deployment that does not park gets no loader choice from
 CapyCTL either way. See
 [Add an engine](../guide/engines.md#vllm-weight-loading-while-parking).
 
+`engine_config.cuda_graphs` keeps its boolean behavior: `false` disables
+graphs (both prefill and decode for SGLang); `true` or omission leaves the
+engine's native graph policy in place. SGLang also accepts
+`cuda_graphs: {prefill: false, decode: true}`. Both keys are required booleans:
+`false` disables only that phase with `--disable-prefill-cuda-graph` or
+`--disable-decode-cuda-graph` (and its `disabled` backend); `true` leaves that
+phase's native policy unchanged. All four combinations are accepted.
+Other engines refuse the object form. The phase switches and backends remain
+owned by this typed field and cannot be passed through `extra_args`.
+
 On a discrete GPU, a deployment's `engine_config.memory.request` is the card
 memory the engine may use (the weights, the KV cache and a margin of the
 weights x 0.10), and the card is charged it plus 1.25 GiB for the engine's CUDA

@@ -24,11 +24,11 @@ class SyntheticArgs(SimpleNamespace):
     __struct_fields__ = ()  # replaced per class below
 
     def resolve_once(self):
-        disabled = getattr(self, "disable_decode_cuda_graph", False)
-        backend = "disabled" if disabled else "full"
-        self.cuda_graph_config = SimpleNamespace(
-            prefill=SimpleNamespace(backend=backend),
-            decode=SimpleNamespace(backend=backend))
+        self.cuda_graph_config = SimpleNamespace(**{
+            phase: SimpleNamespace(
+                backend="disabled" if getattr(self, "disable_" + phase + "_cuda_graph", False)
+                else "full")
+            for phase in ("prefill", "decode")})
 
     def resolved_dict(self):
         result = vars(self).copy()
@@ -189,6 +189,38 @@ class MappingTests(LaunchFixture, unittest.TestCase):
         for graph in ("disable_prefill_cuda_graph", "disable_decode_cuda_graph",
                       "cuda_graph_backend_prefill", "cuda_graph_backend_decode"):
             self.assertNotIn(graph, kwargs)
+
+    # T14 T22 / ADR 0014 §2 / SPEC §8.1 / #236: each disabled phase maps to
+    # its 0.5.22 CLI-equivalent keyword; enabled phases retain native defaults.
+    def test_cuda_graph_phases_render_independently(self):
+        for prefill in (False, True):
+            for decode in (False, True):
+                policy = dict(prefill=prefill, decode=decode)
+                with self.subTest(policy=policy):
+                    kwargs = self.seen(self.spec_with(cuda_graphs=policy))
+                    for phase, enabled in policy.items():
+                        disable = "disable_" + phase + "_cuda_graph"
+                        backend = "cuda_graph_backend_" + phase
+                        if enabled:
+                            self.assertNotIn(disable, kwargs)
+                            self.assertNotIn(backend, kwargs)
+                        else:
+                            self.assertIs(kwargs[disable], True)
+                            self.assertEqual(kwargs[backend], "disabled")
+
+    # T14 T22 / SPEC §8.1: resolved drift checks apply only to disabled phases.
+    def test_independent_disabled_phase_must_survive_resolution(self):
+        for phase in ("prefill", "decode"):
+            policy = dict(prefill=True, decode=True)
+            policy[phase] = False
+            def changed(**kwargs):
+                effective = synthetic_constructor(**kwargs)
+                effective.resolve_once()
+                effective.resolve_once = lambda: None
+                getattr(effective.cuda_graph_config, phase).backend = "full"
+                return effective
+            with self.subTest(phase=phase), self.assertRaises(mapping.ServerArgsError):
+                construct(self.spec_with(cuda_graphs=policy), self.placement(), changed)
 
     def test_residency_decides_saver_and_weight_backup(self):
         kwargs = self.seen(self.spec_with(memory_saver=True, cpu_weight_backup=True,

@@ -392,11 +392,21 @@ def typed_keywords(settings):
         keywords["speculative_draft_model_path"] = settings["draft_model_path"]
     if settings["language_model_only"]:
         keywords["language_model_only"] = True
-    if settings["cuda_graphs"] is False:
-        keywords.update(disable_prefill_cuda_graph=True, disable_decode_cuda_graph=True,
-                        cuda_graph_backend_prefill="disabled",
-                        cuda_graph_backend_decode="disabled")
+    # ADR 0014 §2 / #236: SGLang 0.5.22 ExecGraph's independent
+    # --disable-{prefill,decode}-cuda-graph switches and backend equivalents.
+    for phase in disabled_graph_phases(settings["cuda_graphs"]):
+        keywords["disable_" + phase + "_cuda_graph"] = True
+        keywords["cuda_graph_backend_" + phase] = "disabled"
     return keywords
+
+
+def disabled_graph_phases(policy):
+    """Scalar false disables both; true/None keep native phase defaults."""
+    if policy is False:
+        return ("prefill", "decode")
+    if type(policy) is dict:
+        return tuple(phase for phase in ("prefill", "decode") if policy[phase] is False)
+    return ()
 
 
 @dataclass(frozen=True, repr=False)
@@ -410,7 +420,7 @@ class CheckedServerArgs:
 
     _native: object = field(repr=False)
     _expected: tuple = field(repr=False)
-    _graphs_disabled: bool = field(default=False, repr=False)
+    _disabled_graph_phases: tuple = field(default=(), repr=False)
     # ADR 0028 §10: the group fields of a multi-node member, whose change is
     # named `group_drift:<field>`; empty for a single rank.
     _group_fields: tuple = field(default=(), repr=False)
@@ -445,9 +455,10 @@ class CheckedServerArgs:
                 value = resolved[key]
                 if type(value) is not type(expected) or value != expected:
                     raise ValueError()
-            if self._graphs_disabled:
+            if self._disabled_graph_phases:
                 config = resolved["cuda_graph_config"]
-                for phase in (config["prefill"], config["decode"]):
+                for name in self._disabled_graph_phases:
+                    phase = config[name]
                     if type(phase["backend"]) is not str or phase["backend"] != "disabled":
                         raise ValueError()
         except Exception:
@@ -572,7 +583,7 @@ def construct_server_args(spec, placement, guarded_constructor, available_bytes=
         _log_refusal(error)
         raise ServerArgsError("server_args_construction_failed") from None
     checked = CheckedServerArgs(native, tuple(expected.items()),
-                                settings["cuda_graphs"] is False,
+                                disabled_graph_phases(settings["cuda_graphs"]),
                                 GROUP_FIELDS if group is not None else (),
                                 TP_FIELDS if devices is not None else ())
     checked.revalidate()
