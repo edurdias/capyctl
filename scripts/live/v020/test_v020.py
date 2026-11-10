@@ -271,6 +271,53 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
             check=True, capture_output=True, text=True)
         self.assertEqual(result.stdout.strip(), shutil.which('c++'))
 
+    def test_private_toolkit_uses_the_existing_matched_host_compilers(self):
+        import shutil
+        import subprocess
+        toolkit = self.root / 'toolkit'
+        (toolkit / 'bin').mkdir(parents=True)
+        subprocess.run(
+            ['bash', '-c', 'source "$1"; v020_toolkit_compilers "$2"',
+             'compilers', str(Path(__file__).with_name('setup.sh')), str(toolkit)],
+            check=True, capture_output=True, text=True)
+        self.assertEqual((toolkit / 'bin/g++').resolve(), Path(shutil.which('c++')).resolve())
+        cc1plus = subprocess.run(
+            [str(toolkit / 'bin/gcc'), '-print-prog-name=cc1plus'],
+            check=True, capture_output=True, text=True).stdout.strip()
+        self.assertTrue(Path(cc1plus).is_file())
+
+    def test_no_floor_fixture_fits_its_explicit_two_gib_kv_pool(self):
+        from rows.regressions import no_floor
+        class Captured(Exception):
+            pass
+        class Context:
+            def deploy(self, name, engine, extra):
+                self.extra = extra
+                raise Captured
+        ctx = Context()
+        with self.assertRaises(Captured):
+            no_floor(ctx)
+        self.assertEqual(ctx.extra['engine_config']['memory']['kv_cache'], '2GiB')
+        self.assertEqual(ctx.extra['engine_config']['context_length'], 8192)
+
+    def test_failed_native_start_preserves_sanitized_engine_diagnostics(self):
+        ctx = v020.Context(self.root, {})
+        ctx.row_id = 'TEST'
+        ctx.role = lambda role: None
+        ctx.register = lambda engine, role: 'profile'
+        ctx.logs = lambda name: 'engine refused start; api_key: private-key'
+        ctx.secrets = ['private-key']
+        def cli(*args, **kwargs):
+            if args[0] == 'start':
+                raise AssertionError('operation failed')
+        ctx.cli = cli
+        with self.assertRaisesRegex(AssertionError, 'operation failed'):
+            ctx.deploy('sample', 'vllm033')
+        evidence = json.loads(
+            (ctx.evidence / 'TEST-sample-engine-failure.json').read_text())
+        self.assertIn('engine refused start', evidence['log'])
+        self.assertNotIn('private-key', evidence['log'])
+
 
 if __name__ == '__main__':
     unittest.main()

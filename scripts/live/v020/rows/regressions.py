@@ -29,6 +29,7 @@ def no_floor(ctx):
     for engine in ('VLLM_032', 'VLLM_033'):
         names = ['floor-' + engine.lower() + '-' + str(i) for i in range(2)]
         starts = [ctx.deploy(name, engine, extra={'engine_config': {'memory': {'kv_cache': '2GiB'},
+                                                                  'context_length': 8192,
                                                                   'max_concurrent_requests': 2}}) for name in names]
         settings = [ctx.engine_args(name) for name in names]
         for setting in settings:

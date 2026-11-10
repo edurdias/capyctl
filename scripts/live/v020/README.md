@@ -94,6 +94,10 @@ preflight likewise targets the detected GPU rather than a fixed architecture.
 The private toolkit includes the sparse/solver headers needed by torch extension
 builds; nvcc uses the preflight's existing C++ compiler. Concurrent uv installers
 share downloads with a 30-minute cache-lock timeout rather than failing at five.
+Private toolkit bins also expose the VM's existing matched GCC/G++ pair for
+managed engines' closed PATH; no system compiler or engine package is changed.
+The two-model ISSUE225 fixture uses 8192-token contexts so its explicit 2 GiB
+KV pools can admit a full request instead of inheriting a 32768-token context.
 
 Models are downloaded with `hf` concurrently with installs. Supplied revision
 pins are resolved to full commits; plan entries without revisions resolve once
@@ -163,6 +167,8 @@ does not pass that row.
 Embedding requests checkpoint their input and sanitized response before contract
 assertions, so a failed request retains its actual HTTP error. Multi-engine rows
 checkpoint each available engine before an unavailable installation skips the row.
+Failed managed starts checkpoint sanitized engine diagnostics before deployment
+cleanup, alongside the failed CLI operation.
 
 ## Evidence and verdicts
 

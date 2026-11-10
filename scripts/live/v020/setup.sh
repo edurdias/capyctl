@@ -212,6 +212,18 @@ v020_setup_tools() {
   v020_freeze "$V020/tools" tools
 }
 
+v020_toolkit_compilers() {
+  local toolkit=$1 cxx cc
+  cxx=$(command -v c++)
+  cc=$(command -v "gcc-$(c++ -dumpversion)") || {
+    v020_setup_error 'missing C compiler matching the existing C++ compiler'; return 1;
+  }
+  # Managed engines have a closed PATH. Put the already-installed matched pair
+  # beside this private nvcc so JIT builds do not pick the incomplete system gcc.
+  [ -e "$toolkit/bin/gcc" ] || ln -s "$cc" "$toolkit/bin/gcc"
+  [ -e "$toolkit/bin/g++" ] || ln -s "$cxx" "$toolkit/bin/g++"
+}
+
 v020_setup_cuda() {
   local nvcc toolkit library
   if [ -n "${V020_OVERRIDES[CUDA_HOME]:-}" ]; then
@@ -241,6 +253,7 @@ PY
       [ -e "$nvcc" ] || ln -s "$(basename "$library")" "$nvcc"
     done
     [ -e "$toolkit/lib64" ] || ln -s lib "$toolkit/lib64"
+    v020_toolkit_compilers "$toolkit"
     v020_freeze "$V020/cuda-venv" cuda
   fi
   [ -x "$toolkit/bin/nvcc" ] || { v020_setup_error 'CUDA compiler missing'; return 1; }
@@ -498,6 +511,7 @@ PY
       [ -e "$nvcc" ] || ln -s "$(basename "$library")" "$nvcc"
     done
     [ -e "$toolkit/lib64" ] || ln -s lib "$toolkit/lib64"
+    v020_toolkit_compilers "$toolkit"
     v020_freeze "$environment" "$key-cuda"
   fi
   [ -x "$toolkit/bin/nvcc" ] || { v020_setup_error 'TRT CUDA compiler missing'; return 1; }

@@ -355,7 +355,11 @@ class Context:
         self.cli('deploy', 'model', '--file', str(path), role=role)
         self.deployments.append((role, name))
         start = time.monotonic()
-        self.cli('start', 'deployment', name, '--wait', role=role)
+        try:
+            self.cli('start', 'deployment', name, '--wait', role=role)
+        except (AssertionError, OSError, subprocess.SubprocessError):
+            self.save(name + '-engine-failure', dict(log=self.logs(name)))
+            raise
         status = self.status(name, role)
         self.save(name + '-status', status)
         return dict(status=status) if self.functional_only else dict(status=status, start_s=time.monotonic() - start)
