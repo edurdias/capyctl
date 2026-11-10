@@ -167,6 +167,12 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     (~/vllm-0.32.0-venv), SGLang 0.5.22 (~/sglang-0.5.22-venv) and the llama.cpp
     v0.7.0 build (~/llamacpp-v0.7.0), made and removed by
     `scripts/live/multi-gpu/run.sh`, with their fingerprints recorded with the rows.
+  - the rented one-GPU machine for 0.2.0 (owner decision 2026-11-10), for its one
+    session only: fresh x86_64 CUDA installs of vLLM 0.32.0 and 0.33.0, SGLang 0.5.22
+    and 0.5.23 (and an editable SGLang 0.5.23 for #235), LMCache in a copy of one
+    engine's environment, the llama.cpp v0.9.0 build, TensorFold native 1.1.5 and
+    1.2.6 (x86_64 release archives) and TensorRT-LLM, made and removed by
+    `scripts/live/v020/run.sh`, with their fingerprints recorded with the rows.
 
   Use these as they are. Do not create or modify any engine environment without the
   owner's explicit approval, and add each approved one to this list.
@@ -177,6 +183,12 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   everything it created; the owner shuts the machine down straight afterwards. The
   other rules here apply to it (one live session at a time, fault injection only by
   signals to CapyCTL-owned processes, no driver, CUDA or system-package change).
+- The rented machine for 0.2.0 (owner decision 2026-11-10): one x86_64 machine with
+  one RTX PRO 6000 96 GB card, rented from Shadeform with a $20 spending cap and
+  supervised by `scripts/live/shade_session.py`, is authorized as a live host for one
+  session only: the 0.2.0 rows of `scripts/live/v020/`, including the timing and
+  memory rows (recorded as discrete-GPU evidence). The same rules apply to it as to
+  the ADR 0035 machine above.
 - Only one live session runs on the hosts at a time.
 - Fault injection is limited to signals sent to CapyCTL-owned processes (PIDs taken
   from ownership evidence) and one bounded external memory allocation. Never change
