@@ -3433,7 +3433,7 @@ pub(crate) mod tests {
                             tx.send(body).await.unwrap();
                             (
                                 [("content-type", "application/json")],
-                                r#"{"model":"m","answers":{"z":{"probability":0.100000000000000005},"a":{"score":1e-05}}}"#,
+                                r#"{"model":"m","answers":{"z":{"type":"noul","noul":0.100000000000000005},"a":{"type":"noul","noul":1e-05}}}"#,
                             )
                         }
                     },
@@ -3482,7 +3482,7 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 answer.encode().unwrap().as_slice(),
-                br#"{"model":"public","answers":{"z":{"probability":0.100000000000000005},"a":{"score":1e-05}}}"#
+                br#"{"model":"public","answers":{"z":{"type":"noul","noul":0.100000000000000005},"a":{"type":"noul","noul":1e-05}}}"#
             );
             let seen = seen.lock().unwrap().clone();
             assert_eq!(seen.len(), 3);
