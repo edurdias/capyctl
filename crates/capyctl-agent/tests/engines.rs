@@ -534,6 +534,7 @@ fn native_capabilities_doc(version: &str) -> serde_json::Value {
 /// `bin/tensorfold-native` answering `--version` and `capabilities --json`.
 fn native_binary(root: &Path, version: &str, capabilities: &serde_json::Value) -> PathBuf {
     let binary = root.join("bin/tensorfold-native");
+    let capabilities = capabilities.to_string().replace('\'', "'\\''");
     script(
         &binary,
         &format!(
