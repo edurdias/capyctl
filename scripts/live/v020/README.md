@@ -46,6 +46,8 @@ Everything created remotely lives in the home directory, principally
 refuses unmarked existing installations, and can resume from prior artifacts.
 Runtime profiles live under the attempt's archived state, so a resumed run does
 not collide with profile names left by a previous attempt.
+Sanitized native settings retain quoted placeholders, allowing graph-phase
+observations to parse ServerArgs without retaining its credential values.
 No apt, driver update, system CUDA modification or reboot is allowed. Missing
 compilers/tools are blocking preflight errors, not permission to install packages.
 
