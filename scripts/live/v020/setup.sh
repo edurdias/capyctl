@@ -151,7 +151,9 @@ v020_venv() {
   local path=$1
   v020_claim "$path"
   if [ ! -x "$path/bin/python" ]; then
-    v020_cmd "$BIN/uv" venv --python 3.12 --managed-python --seed "$path"
+    # UV_PYTHON_PREFERENCE=only-managed (v020_setup_tools) already selects the
+    # managed interpreter; uv 0.13 refuses --managed-python beside it.
+    v020_cmd "$BIN/uv" venv --python 3.12 --seed "$path"
   fi
 }
 
