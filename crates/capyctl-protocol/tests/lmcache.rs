@@ -83,6 +83,7 @@ fn plan(lmcache: Option<LmcacheGrant>) -> SingleLaunchPlan {
         startup_host_bytes: None,
         lmcache,
         devices: Vec::new(),
+        vllm_device_request_no_floor: false,
     }
 }
 

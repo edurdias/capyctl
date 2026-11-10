@@ -134,10 +134,7 @@ pub trait LifecyclePort: Send + Sync {
     /// bound. `None` keeps the router's default for an undeclared setting or
     /// an authority without managed configuration. This is durable policy,
     /// never an engine-load observation.
-    fn deployment_request_limit(
-        &self,
-        _deployment: &str,
-    ) -> Result<Option<usize>, LifecycleFault> {
+    fn deployment_request_limit(&self, _deployment: &str) -> Result<Option<usize>, LifecycleFault> {
         Ok(None)
     }
 

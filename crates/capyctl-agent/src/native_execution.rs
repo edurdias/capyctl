@@ -164,6 +164,9 @@ pub struct NativeHostExecution {
     lmcache_verdicts: Arc<lmcache::LmcacheVerdicts>,
     /// ADR 0033 §12: the load source that samples the LMCache servers.
     host_load: Arc<crate::load::HostLoad>,
+    /// ADR 0017 / #235: the connected server's advertised refusal support.
+    /// Empty until SessionReady; replaced before each session's commands.
+    server_capabilities: Arc<Mutex<Vec<String>>>,
     /// ADR 0037 §4: the tracing the host's lifecycle steps are recorded
     /// with; `None` reads the host role's installed tracing.
     tracing: Option<capyctl_trace::Tracing>,
@@ -313,6 +316,7 @@ impl NativeHostExecution {
             lmcache_dirs: None,
             lmcache_verdicts: Arc::default(),
             host_load,
+            server_capabilities: Arc::default(),
             tracing: None,
             page_cache: Arc::new(crate::page_cache::Fadvise),
         });
@@ -711,6 +715,9 @@ impl NativeHostExecution {
             // The server accepted this revision; it keeps the rules it was
             // accepted under (SPEC §7.3 device coverage applies to writes).
             accepted_revision: true,
+            // ADR 0019 §§3–4 / #225: absent on an old server's plan, so an
+            // accepted or retained revision keeps its historical derivation.
+            legacy_vllm_device_floor: !plan.vllm_device_request_no_floor,
             ..Default::default()
         };
         let mut effective =
@@ -3162,6 +3169,12 @@ impl SessionExecution for NativeHostExecution {
             let _ = self.ingress.close_all();
         }
     }
+    fn server_ready(&self, capabilities: &[String]) {
+        *self
+            .server_capabilities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = capabilities.to_vec();
+    }
     fn load_interval(&self) -> std::time::Duration {
         self.load
             .as_ref()
@@ -3745,6 +3758,7 @@ mod tests {
                 checkpoint_layout: None,
                 checkpoint_tables: None,
                 checkpoint_gguf: None,
+                vllm_device_request_no_floor: false,
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
@@ -3896,6 +3910,7 @@ mod tests {
             checkpoint_layout: None,
             checkpoint_tables: None,
             checkpoint_gguf: None,
+            vllm_device_request_no_floor: false,
             startup_bytes: None,
             startup_host_bytes: None,
             lmcache: None,
@@ -3906,6 +3921,81 @@ mod tests {
             action: MemberAction::LaunchSingle(plan.clone()),
         };
         (command, plan)
+    }
+
+    // T09 T14 T26 T34 — SPEC §§7.3, 13.2; ADR 0014 §7; ADR 0019
+    // §§3–4 (#225): the plan preserves the accepted derivation at both a new
+    // start and retained-launch resolution; rendering uses that request's share.
+    #[test]
+    fn a_vllm_device_plan_preserves_legacy_or_no_floor_derivation() {
+        use capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
+        use capyctl_domain::launch::LaunchSettings;
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, mut deployment, policy) =
+            checkpoint_fixture_with(root.path(), identity_dir.path(), |document| {
+                document["resource_policy"]["domains"] = serde_json::json!({
+                    "system": {"memory": "distinct", "managed_limit": "200GiB",
+                               "free_reserve": "8GiB", "parked_limit": "64GiB"},
+                    "gpu0": {"memory": "device", "device": "gpu0",
+                             "managed_limit": "14.5GiB", "free_reserve": "1.5GiB",
+                             "parked_limit": "2GiB"}
+                });
+                document["resource_policy"]["devices"] = serde_json::json!({
+                    "gpu0": {"domain": "gpu0", "sharing": "shared"}
+                });
+            });
+        deployment.as_object_mut().unwrap().remove("resources");
+        deployment["residency"] = "restart_only".into();
+        deployment["engine_config"] = serde_json::json!({"memory": {"kv_cache": "1GiB"}});
+        deployment["devices"] = serde_json::json!([{"id": "gpu0", "sharing": "shared"}]);
+        std::fs::File::create(root.path().join("models/toy/model.safetensors"))
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+        let measured = crate::checkpoint::CheckpointVerifier::in_memory()
+            .measure(&root.path().join("models"), &root.path().join("models/toy"))
+            .unwrap()
+            .manifest;
+        assert_eq!(measured.weights_bytes, 1 << 20);
+        for (no_floor, request, utilization) in [
+            (false, 12_884_901_825, "0.7499999964"),
+            (true, 1_074_895_174, "0.0625671339"),
+        ] {
+            let (mut command, mut plan) = launch_with(&deployment, &policy, &measured.digest);
+            plan.checkpoint_weights_bytes = Some(measured.weights_bytes);
+            plan.vllm_device_request_no_floor = no_floor;
+            command.action = MemberAction::LaunchSingle(plan.clone());
+            command.identity.payload_digest = command.canonical_digest();
+            for retained in [false, true] {
+                let effective = executor.resolve_as(&command, retained).unwrap();
+                executor.verify_checkpoint(&effective, &plan).unwrap();
+                assert_eq!(effective.engine_config.memory().request_bytes, request);
+                assert_eq!(
+                    effective.ready_device_allocation(),
+                    Some((Some(0), request + ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES))
+                );
+                let LaunchSettings::Vllm(settings) = &effective.engine_config else {
+                    panic!("vLLM settings");
+                };
+                assert_eq!(settings.device_request_floor_pct, no_floor.then_some(0));
+                let effective = effective.with_device_total(|_| Some(16 << 30)).unwrap();
+                let rendered = capyctl_adapters::vllm::render_command(
+                    &executor.vllm_plan(&effective, &plan, None).unwrap(),
+                )
+                .unwrap();
+                let flag = |name: &str| {
+                    rendered
+                        .argv
+                        .windows(2)
+                        .find(|pair| pair[0] == name)
+                        .unwrap()[1]
+                        .as_str()
+                };
+                assert_eq!(flag("--gpu-memory-utilization"), utilization);
+                assert_eq!(flag("--kv-cache-memory-bytes"), "1073741824");
+            }
+        }
     }
 
     /// ADR 0014 §7 (WE3): a launch and a wake verify the recorded digest on
@@ -6376,58 +6466,74 @@ mod tests {
         }
     }
 
-    /// T21 T34 #198 (ADR 0017 §2, ADR 0008 amendment 2026-10-30): an
-    /// enrolled host never refuses a launch with
-    /// `installation_unsupported:editable`, a code no 0.1.x server knows (its
-    /// refusal check would end the whole control session on it). An editable
-    /// SGLang takes the pre-#198 path under either drift policy: unmeasured,
-    /// admitted on (here to the fixture's unrecorded checkpoint, the next
-    /// gate), and failed at the engine's start by the entry's
-    /// `engine_import_failed` in the free-text launch failure.
+    /// T21 T34 — ADR 0017 / #235: editable SGLang is refused only toward a
+    /// server advertising the code. No SessionReady and every 0.1.x server
+    /// keep the import-failure path; a reconnect replaces the capability list.
     #[test]
-    fn a_host_never_refuses_an_editable_sglang_with_a_code_servers_do_not_know() {
-        for policy in ["warn", "refuse"] {
-            let root = directory();
-            let identity_dir = directory();
-            let venv = root.path().join("opt/sglang");
-            let site = venv.join("lib/python3.12/site-packages");
-            std::fs::create_dir_all(site.join("sglang-0.5.22.dist-info")).unwrap();
-            std::fs::write(
+    fn an_editable_sglang_is_refused_only_toward_a_server_that_takes_the_code() {
+        use capyctl_protocol::capabilities;
+        for (server, expected) in [
+            (None, "checkpoint_mismatch"),
+            (
+                Some(vec![
+                    capabilities::LIVE_PROFILE_UPDATE.to_owned(),
+                    capabilities::LMCACHE.to_owned(),
+                ]),
+                "checkpoint_mismatch",
+            ),
+            (
+                Some(capabilities::server_capabilities()),
+                crate::installation::EDITABLE_REFUSAL,
+            ),
+        ] {
+            for policy in ["warn", "refuse"] {
+                let root = directory();
+                let identity_dir = directory();
+                let venv = root.path().join("opt/sglang");
+                let site = venv.join("lib/python3.12/site-packages");
+                std::fs::create_dir_all(site.join("sglang-0.5.22.dist-info")).unwrap();
+                std::fs::write(
                 site.join("__editable__.sglang-0.5.22.pth"),
                 "import __editable___sglang_0_5_22_finder; __editable___sglang_0_5_22_finder.install()\n",
             )
             .unwrap();
-            std::fs::create_dir_all(venv.join("bin")).unwrap();
-            std::fs::write(venv.join("bin/python3"), "").unwrap();
-            let executable = venv.join("bin/python3");
-            assert_eq!(
-                crate::installation::unsupported_installation(Engine::Sglang, &executable),
-                Some(crate::installation::EDITABLE_REFUSAL)
-            );
-            let (executor, deployment, policy_fingerprint) = sglang_fixture_with(
-                root.path(),
-                identity_dir.path(),
-                "restart_only",
-                |document| {
-                    let profile = &mut document["runtime_profiles"]["local"];
-                    profile["executable"] = executable.to_string_lossy().into_owned().into();
-                    profile["security"]["installation_drift"] = policy.into();
-                },
-            );
-            sglang_runtime(root.path());
-            let (mut launch, _) = launch_with(&deployment, &policy_fingerprint, "");
-            launch.identity.payload_digest = launch.canonical_digest();
-            let MemberAction::LaunchSingle(plan) = launch.action.clone() else {
-                panic!("a launch");
-            };
-            let verdict = executor.admit_launch(&launch, &plan, GpuReading::Now);
-            assert_eq!(
-                verdict,
-                Err(LaunchVerdict::Refused("checkpoint_mismatch")),
-                "{policy}"
-            );
-            if let Err(LaunchVerdict::Refused(reason)) = verdict {
-                assert!(capyctl_protocol::execution::is_policy_refusal(reason));
+                std::fs::create_dir_all(venv.join("bin")).unwrap();
+                std::fs::write(venv.join("bin/python3"), "").unwrap();
+                let executable = venv.join("bin/python3");
+                assert_eq!(
+                    crate::installation::unsupported_installation(Engine::Sglang, &executable),
+                    Some(crate::installation::EDITABLE_REFUSAL)
+                );
+                let (executor, deployment, policy_fingerprint) = sglang_fixture_with(
+                    root.path(),
+                    identity_dir.path(),
+                    "restart_only",
+                    |document| {
+                        let profile = &mut document["runtime_profiles"]["local"];
+                        profile["executable"] = executable.to_string_lossy().into_owned().into();
+                        profile["security"]["installation_drift"] = policy.into();
+                    },
+                );
+                sglang_runtime(root.path());
+                if let Some(server) = &server {
+                    executor.server_ready(server);
+                }
+                let (mut launch, _) = launch_with(&deployment, &policy_fingerprint, "");
+                launch.identity.payload_digest = launch.canonical_digest();
+                let MemberAction::LaunchSingle(plan) = launch.action.clone() else {
+                    panic!("a launch");
+                };
+                let verdict = executor.admit_launch(&launch, &plan, GpuReading::Now);
+                assert_eq!(verdict, Err(LaunchVerdict::Refused(expected)), "{policy}");
+                if let Err(LaunchVerdict::Refused(reason)) = verdict {
+                    assert!(capyctl_protocol::execution::is_policy_refusal(reason));
+                }
+                executor.server_ready(&[]);
+                assert_eq!(
+                    executor.admit_launch(&launch, &plan, GpuReading::Now),
+                    Err(LaunchVerdict::Refused("checkpoint_mismatch")),
+                    "a newer session's capabilities never leak into an older one"
+                );
             }
         }
     }

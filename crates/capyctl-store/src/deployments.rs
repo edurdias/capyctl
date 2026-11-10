@@ -15,7 +15,7 @@ pub(crate) fn request_limit(
 ) -> rusqlite::Result<Option<usize>> {
     let declared: Option<Option<u32>> = conn
         .prepare_cached(
-            "SELECT json_extract(e.effective_json,'$.engine_config.common.max_concurrent_requests')
+            "SELECT CASE WHEN json_valid(e.effective_json) THEN json_extract(e.effective_json,'$.engine_config.common.max_concurrent_requests') END
              FROM deployments d LEFT JOIN effective_revisions e
                ON e.deployment_id=d.id AND e.revision=d.revision WHERE d.id=?1",
         )?
@@ -867,10 +867,7 @@ impl crate::Store {
     /// SPEC §10 (#240): this deployment's declared in-flight bound, or
     /// `None` when undeclared. Host-fixed engine arguments and sampled running
     /// limits are not deployment admission policy (ADR 0014 §§1–2).
-    pub fn deployment_request_limit(
-        &self,
-        deployment: &str,
-    ) -> Result<Option<usize>, StoreError> {
+    pub fn deployment_request_limit(&self, deployment: &str) -> Result<Option<usize>, StoreError> {
         Ok(request_limit(&self.conn, deployment)?)
     }
 

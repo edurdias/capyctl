@@ -670,7 +670,10 @@ async fn held_request_restarts_follow_the_deployments_declared_concurrency() {
             crate::port::HeldRestart::Restarting,
             "all {limit} configured slots are held"
         );
-        until("configured held requests settled", || leases(&lab, &id) == 0).await;
+        until("configured held requests settled", || {
+            leases(&lab, &id) == 0
+        })
+        .await;
         assert_eq!(restarts(&lab, &id)[0]["count"], json!(limit));
         lab.worker.shutdown().await.unwrap();
     }

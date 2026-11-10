@@ -244,6 +244,9 @@ engine's native graph policy in place. SGLang also accepts
 phase's native policy unchanged. All four combinations are accepted.
 Other engines refuse the object form. The phase switches and backends remain
 owned by this typed field and cannot be passed through `extra_args`.
+An enrolled host must advertise `cuda_graph_phases` for the object form;
+older hosts are refused before the command is sent. Scalar booleans need
+no new host capability.
 
 On a discrete GPU, a deployment's `engine_config.memory.request` is the card
 memory the engine may use (the weights, the KV cache and a margin of the
@@ -295,21 +298,24 @@ a profile of another engine, is refused. A TensorRT-LLM version is verified
 only beside the `torch` build its entry names, read from `companions`.
 
 A vLLM deployment on a discrete GPU gets `--gpu-memory-utilization` from its
-memory request: the request's share of the card, rounded up to a whole
-percent. When CapyCTL sizes the request (the deployment states only
-`engine_config.memory.kv_cache`, or no memory), the request is at least 75 % of
-the card and so is the share, a guard kept because vLLM 0.29 with CUDA graphs
-did not start a 4B model on a 16 GB card below 0.75; the KV cache is passed in
-bytes either way. A deployment that states `engine_config.memory.request`
-gets exactly that request's share, with no floor, so vLLM's start check asks
-only for that much of the card to be free and another model can run beside
-it. State it from the startup peak measured on the card
-(`startup.measured`, less 1.25 GiB for the CUDA context). A request smaller
-than the weights plus the KV cache is refused; leave room for the engine's
-own memory beside them, the weights × 1.10 plus the KV cache as CapyCTL sizes
-it. Unified-memory machines are
-unchanged: vLLM gets a low fixed `--gpu-memory-utilization` there and the KV
-cache in bytes.
+memory request: the request's share of the card, rounded up to ten-billionths
+between 0.01 and 0.99. When CapyCTL sizes the request (the deployment states
+only `engine_config.memory.kv_cache`, or no memory), it uses the weights × 1.10
+plus the KV cache, without the historical 75% card floor. A declared
+`engine_config.memory.request` renders its own share in the same way.
+The KV cache is passed in bytes either way. A request smaller than the weights
+plus the KV cache is refused; leave room for the engine's own memory beside
+them. State a declared request from the startup peak measured on the card
+(`startup.measured`, less 1.25 GiB for the CUDA context). Existing frozen
+revisions keep their accepted request; deploy a new revision to derive the
+smaller request. **Pending live confirmation on vLLM 0.32.0 and 0.33.0:**
+the historical vLLM 0.29 start failure below 0.75 on a 16 GB card remains
+unexplained. Unified-memory machines are unchanged: vLLM gets a low fixed
+`--gpu-memory-utilization` there and the KV cache in bytes.
+A newly derived no-floor request needs an enrolled host advertising
+`vllm_device_request_no_floor`; an older host is refused before launch.
+An absent launch-plan marker keeps the old derivation on an upgraded host,
+so a server-first or host-first upgrade cannot silently change the grant.
 
 A running host or standalone takes its engine and model settings at start. A
 live `capyctl engine add` or `remove` changes runtime profiles only; any other

@@ -166,6 +166,16 @@ pub(crate) fn charges_device(effective: &capyctl_config::effective::EffectiveDep
 }
 
 impl NativeHostExecution {
+    /// ADR 0017 / #235: only report refusal codes the connected server
+    /// advertised accepting; the list is empty before SessionReady.
+    pub(super) fn server_takes_refusal(&self, reason: &str) -> bool {
+        let server = self
+            .server_capabilities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        capyctl_protocol::capabilities::server_takes_refusal(&server, reason)
+    }
+
     /// ADR 0008 (owner decision 2026-09-23): refuse a launch whose declared
     /// residency depends on a capability the installation's launch-time probe
     /// found missing. Both parking tiers depend on `deep_park` (controller
@@ -313,14 +323,17 @@ impl NativeHostExecution {
         // refuse`. Then the internals this launch depends on are probed.
         // ADR 0018 §3: the registry of the document the plan was approved under.
         let installations = self.installations_for(plan);
-        let installation = installations
-            .verify(
-                &plan.profile_name,
-                effective.profile.engine,
-                std::path::Path::new(&effective.profile.executable),
-                effective.profile.security.installation_drift,
-            )
-            .map_err(refused)?;
+        let installation = match installations.verify(
+            &plan.profile_name,
+            effective.profile.engine,
+            std::path::Path::new(&effective.profile.executable),
+            effective.profile.security.installation_drift,
+        ) {
+            // ADR 0017 / #235: a 0.1.x server cannot decode this refusal.
+            // Preserve its import-failure path without ending the session.
+            Err(reason) if !self.server_takes_refusal(reason) => String::new(),
+            verdict => verdict.map_err(refused)?,
+        };
         // ADR 0033 §§1, 9: then the launch's LMCache, when it has a grant.
         self.admit_lmcache(command, plan, &effective, &installations)?;
         self.launch_capability(

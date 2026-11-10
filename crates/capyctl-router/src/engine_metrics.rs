@@ -503,7 +503,7 @@ mod tests {
             engine_only(&answer),
             json!({"cached_tokens": {"value": 8, "source": "engine"}})
         );
-        let mut answer = answer;
+        let mut answer = EngineAnswer::from(answer);
         attach(&mut answer, &router_clock());
         let figures = &answer["capyctl"]["metrics"];
         assert_eq!(figures["ttft_ms"]["source"], "router");

@@ -372,9 +372,14 @@ async fn decisions_use_the_declared_concurrency_for_admission_and_leases() {
             )
             .await
             .unwrap();
-            let mut plan =
-                Plan::new(&deps, &deployment, view, ids, received + Duration::from_secs(5))
-                    .unwrap();
+            let mut plan = Plan::new(
+                &deps,
+                &deployment,
+                view,
+                ids,
+                received + Duration::from_secs(5),
+            )
+            .unwrap();
             held.push((guard, plan.next().await.unwrap()));
         }
         let (status, body) = decide(&router, &decision_body()).await;

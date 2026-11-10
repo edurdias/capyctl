@@ -804,11 +804,10 @@ An SGLang installed in editable mode (`pip install -e`, as in the official
 `installation_unsupported:editable`: CapyCTL loads SGLang from the
 environment's `site-packages` without running `.pth` files, and such an
 installation is reached only through one. Standalone refuses each launch of one
-with the same code, whatever `security.installation_drift` says. A host enrolled
-with a server starts it as before, and the engine fails at once with
-`engine_import_failed`: a patch release does not change the protocol, and
-0.1.x servers do not know the new code (the host-side refusal is planned for
-0.2.0, behind a capability). Reinstall SGLang without
+with the same code, whatever `security.installation_drift` says. An enrolled
+host refuses it too when the server advertises `installation_unsupported`
+(0.2.0). Toward a 0.1.x server it starts the engine as before, which fails at
+once with `engine_import_failed`; the control session stays up. Reinstall SGLang without
 `-e` ([Install an engine](../guide/install-engines.md#sglang-0521-or-0520)).
 `engines.yaml` sits beside the role's configuration file (`--config
 dir/host.yaml` means `dir/engines.yaml`). Without `--config`, on a host machine

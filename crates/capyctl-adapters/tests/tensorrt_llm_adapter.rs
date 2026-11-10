@@ -715,7 +715,7 @@ async fn cancellation_is_uncertain_and_the_surface_restart_only() {
         engine.execute_persisted(&command).await.unwrap_err(),
         RuntimeError::Unsupported
     );
-    let request = json!({"model": SERVED, "messages": [], "cache_salt": "tenant-a"});
+    let request = json!({"model": SERVED, "messages": [], "cache_salt": "tenant-a"}).into();
     assert!(matches!(
         engine.forward_chat(&request).await,
         Err(AdapterError::CacheSaltUnsupported)

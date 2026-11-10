@@ -212,9 +212,9 @@ pub fn site_packages_holding(
     }
 }
 
-/// #198: the closed refusal of an SGLang installed in editable mode, used by
-/// `engine add` and standalone's embedded check only; never sent over the
-/// host protocol, whose 0.1.x servers do not know it (ADR 0017 §2).
+/// #198 / #235: the closed refusal of an editable SGLang. Engine add and
+/// standalone refuse it directly; an enrolled host reports it only toward
+/// a server advertising `installation_unsupported` (ADR 0017).
 pub const EDITABLE_REFUSAL: &str = "installation_unsupported:editable";
 
 /// #198, ADR 0008 amendment 2026-10-30: the closed refusal of an installation
@@ -1610,9 +1610,9 @@ impl InstallationRegistry {
     /// which keys the capability cache. ADR 0031 §3: a custom engine is
     /// measured with the manifest its profile carries. ADR 0039 §2: a native
     /// TensorFold profile's release root is measured, as at registration.
-    /// #198: an editable SGLang is `unmeasured` here like any other package
-    /// outside `site-packages`, never refused: this check answers an enrolled
-    /// host's launches, whose server may not know [`EDITABLE_REFUSAL`].
+    /// #235: an editable SGLang can never load through the protected entry,
+    /// so it is refused regardless of drift policy. The enrolled-host caller
+    /// withholds this code from a server that cannot accept it (ADR 0017).
     pub fn verify(
         &self,
         profile: &str,
@@ -1620,6 +1620,9 @@ impl InstallationRegistry {
         executable: &Path,
         policy: InstallationDrift,
     ) -> Result<String, &'static str> {
+        if let Some(reason) = unsupported_installation(engine, executable) {
+            return Err(reason);
+        }
         let custom = self.custom.get(profile);
         let measured = if engine == Engine::Custom && custom.is_none() {
             Err(FingerprintError::NotFound)
@@ -1924,12 +1927,11 @@ mod tests {
         dir
     }
 
-    // T21 T22 #198 (ADR 0008 amendment 2026-10-30): an editable SGLang is
-    // named `installation_unsupported:editable` for `engine add` and the
-    // embedded check, but the shared launch-time check keeps the pre-#198
-    // rule: `unmeasured`, never refused, under either drift policy.
+    // T21 T22 — ADR 0008 / #235: the shared launch check refuses editable
+    // SGLang under both drift policies; the enrolled-host caller gates the
+    // refusal against the connected server's capabilities (ADR 0017).
     #[test]
-    fn an_editable_sglang_is_named_but_the_shared_launch_check_never_refuses_it() {
+    fn an_editable_sglang_is_refused_at_every_launch_whatever_the_policy() {
         let checkout = "/sgl-workspace/sglang/python";
         for (marker, body) in [
             (
@@ -1975,7 +1977,13 @@ mod tests {
             for policy in [InstallationDrift::Warn, InstallationDrift::Refuse] {
                 assert_eq!(
                     registered.verify("local", Engine::Sglang, &executable, policy),
-                    Ok(String::new()),
+                    Err(EDITABLE_REFUSAL),
+                    "{marker}"
+                );
+                assert_eq!(
+                    InstallationRegistry::from_inventory(&Default::default())
+                        .verify("local", Engine::Sglang, &executable, policy),
+                    Err(EDITABLE_REFUSAL),
                     "{marker}"
                 );
             }

@@ -1911,10 +1911,12 @@ mod concurrency_tests {
                 });
             }
             pb::ExecuteMember {
-                action: Some(pb::execute_member::Action::LaunchSingle(pb::SingleLaunchPlan {
-                    deployment_config: deployment.to_string(),
-                    ..Default::default()
-                })),
+                action: Some(pb::execute_member::Action::LaunchSingle(
+                    pb::SingleLaunchPlan {
+                        deployment_config: deployment.to_string(),
+                        ..Default::default()
+                    },
+                )),
                 ..Default::default()
             }
         };

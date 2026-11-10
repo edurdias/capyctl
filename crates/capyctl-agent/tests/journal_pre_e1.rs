@@ -91,6 +91,7 @@ fn a_pre_e1_launch_command_re_decodes_from_the_journal_unchanged() {
             checkpoint_layout: None,
             checkpoint_tables: None,
             checkpoint_gguf: None,
+            vllm_device_request_no_floor: false,
             startup_bytes: None,
             startup_host_bytes: None,
             lmcache: None,

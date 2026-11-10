@@ -158,7 +158,10 @@ fn cuda_graph_phase_objects_are_closed_and_sglang_only() {
         deployment["engine_config"]["cuda_graphs"] = json!({"prefill": false, "decode": true});
         let error = resolve_effective(&deployment, &host).unwrap_err();
         assert_eq!(error.path, "engine_config.cuda_graphs", "{engine}: {error}");
-        assert!(error.to_string().contains("only supported by SGLang"), "{error}");
+        assert!(
+            error.to_string().contains("only supported by SGLang"),
+            "{error}"
+        );
     }
 }
 

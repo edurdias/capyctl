@@ -795,17 +795,18 @@ async fn remote_concurrency(api: &str, limit: usize) {
     let (server, roles) = cluster.boot();
     let id = cluster.deploy_two_with(api, Some(limit));
     cluster.ready_instances(&id, 2);
-    let configuration: Value = capyctl_config::parse_document(
-        &std::fs::read_to_string(&cluster.server_config).unwrap(),
-    )
-    .unwrap();
+    let configuration: Value =
+        capyctl_config::parse_document(&std::fs::read_to_string(&cluster.server_config).unwrap())
+            .unwrap();
     let management = configuration["listeners"]["management"]["bind"]
         .as_str()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let load: Value = reqwest::Client::new()
-            .get(format!("http://{management}/management/v1/metrics/load?deployment={id}"))
+            .get(format!(
+                "http://{management}/management/v1/metrics/load?deployment={id}"
+            ))
             .bearer_auth(cluster.credential("admin_token"))
             .send()
             .await
@@ -820,7 +821,10 @@ async fn remote_concurrency(api: &str, limit: usize) {
             assert_eq!(router["in_flight_limit"], limit);
             break;
         }
-        assert!(Instant::now() < deadline, "queue policy not published: {load}");
+        assert!(
+            Instant::now() < deadline,
+            "queue policy not published: {load}"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let before: usize = cluster.hosts.iter().map(HostRole::accepted).sum();
@@ -833,7 +837,10 @@ async fn remote_concurrency(api: &str, limit: usize) {
         let (path, body) = if api == "embeddings" {
             ("/v1/embeddings", json!({"model": "toy", "input": "hello"}))
         } else {
-            ("/v1/chat/completions", json!({"model": "toy", "messages": []}))
+            (
+                "/v1/chat/completions",
+                json!({"model": "toy", "messages": []}),
+            )
         };
         async move {
             let response = reqwest::Client::new()
@@ -849,14 +856,20 @@ async fn remote_concurrency(api: &str, limit: usize) {
     let pending: Vec<_> = (0..limit).map(|_| tokio::spawn(request())).collect();
     let deadline = Instant::now() + Duration::from_secs(20);
     while cluster.hosts.iter().map(HostRole::accepted).sum::<usize>() < before + limit {
-        assert!(Instant::now() < deadline, "not all {limit} configured slots reached an engine");
+        assert!(
+            Instant::now() < deadline,
+            "not all {limit} configured slots reached an engine"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let refused = tokio::time::timeout(Duration::from_secs(3), request())
         .await
         .expect("no waiting: the next request is refused promptly");
     assert_eq!(refused.0, 429, "{}", refused.1);
-    assert_eq!(serde_json::from_str::<Value>(&refused.1).unwrap()["code"], "queue_full");
+    assert_eq!(
+        serde_json::from_str::<Value>(&refused.1).unwrap()["code"],
+        "queue_full"
+    );
     for host in &cluster.hosts {
         host.set("hold", "0");
     }

@@ -64,6 +64,11 @@ pub struct SingleLaunchPlan {
     /// several GPUs of one host, in rank order (rank r on the r-th GPU),
     /// distinct. Empty for a launch on one GPU (encoded exactly as before).
     pub devices: Vec<String>,
+    /// ADR 0019 §§3–4, #225; ADR 0017 §3: derive a vLLM discrete request
+    /// from weights plus KV, without the historical 75% card floor. False
+    /// preserves pre-0.2.0 derivation and encodes no new field or digest bytes.
+    /// True is sent only to a host declaring `vllm_device_request_no_floor`.
+    pub vllm_device_request_no_floor: bool,
 }
 
 /// ADR 0033 §§3, 6, 7: one launch's LMCache server as the store planned it:
@@ -359,6 +364,7 @@ impl SingleLaunchPlan {
                 .as_ref()
                 .and_then(|grant| LmcacheGrant::from_wire(grant, plan.service_port)),
             devices: plan.devices,
+            vllm_device_request_no_floor: plan.vllm_device_request_no_floor,
         })
     }
     fn to_wire(&self) -> pb::SingleLaunchPlan {
@@ -389,6 +395,7 @@ impl SingleLaunchPlan {
             checkpoint_gguf: self.checkpoint_gguf.as_ref().map(gguf_to_wire),
             lmcache: self.lmcache.as_ref().map(LmcacheGrant::to_wire),
             devices: self.devices.clone(),
+            vllm_device_request_no_floor: self.vllm_device_request_no_floor,
         }
     }
 }
@@ -1693,6 +1700,8 @@ pub const CHECKPOINT_REFUSALS: &[&str] = &[
 /// the launching host, has a KV geometry CapyCTL cannot size its pool from;
 /// `served_name_unsupported`: a TensorRT-LLM launch whose served name is not
 /// one path component.
+/// ADR 0017 / #235: `installation_unsupported:editable` is sent only toward
+/// a server whose SessionReady advertises `installation_unsupported`.
 pub const POLICY_REFUSALS: &[&str] = &[
     "checkpoint_mismatch",
     "checkpoint_unverified",
@@ -1707,6 +1716,7 @@ pub const POLICY_REFUSALS: &[&str] = &[
     "capability_missing:deep_park",
     "capability_missing:core",
     "engine_config_file",
+    "installation_unsupported:editable",
     capyctl_config::tensorrt_llm::KV_GEOMETRY_UNSUPPORTED,
     capyctl_config::tensorrt_llm::SERVED_NAME_UNSUPPORTED,
 ];

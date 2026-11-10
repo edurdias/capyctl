@@ -957,10 +957,7 @@ impl LifecyclePort for CoordinatorLifecycle {
             .ok_or_else(|| LifecycleFault::NotFound(deployment.to_owned()))
     }
 
-    fn deployment_request_limit(
-        &self,
-        deployment: &str,
-    ) -> Result<Option<usize>, LifecycleFault> {
+    fn deployment_request_limit(&self, deployment: &str) -> Result<Option<usize>, LifecycleFault> {
         // ADR 0017 §§2–3: admission is server-owned; an N-1 host needs no
         // new field or capability to serve this pre-existing engine setting.
         self.commands

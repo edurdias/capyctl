@@ -318,15 +318,30 @@ impl Store {
             }
         }
         for entry in &mut deployments {
-            entry.request_limit = crate::deployments::request_limit(&tx, &entry.id)?;
-            entry.max_running = current_effective(&tx, &entry.id)?.map(|(effective, remote)| {
-                let fit = if remote {
-                    capyctl_config::context_fit::fit_on_remote_host(&effective)
-                } else {
-                    capyctl_config::context_fit::fit_for_effective(&effective)
-                };
-                capyctl_config::context_fit::max_running_for_effective(&effective, &fit, remote)
-            });
+            // SPEC §10 / #240: project the declared bound independently of
+            // snapshot decoding, in the same lookup already needed for capacity.
+            use rusqlite::OptionalExtension;
+            let row: Option<(Option<String>, bool, Option<u32>)> = tx
+                .query_row(
+                    "SELECT e.effective_json,EXISTS(SELECT 1 FROM host_effective_revisions h JOIN enrolled_hosts x ON x.host_id=h.host_id WHERE h.deployment_id=d.id AND h.revision=d.revision),
+                            CASE WHEN json_valid(e.effective_json) THEN json_extract(e.effective_json,'$.engine_config.common.max_concurrent_requests') END
+                       FROM deployments d LEFT JOIN effective_revisions e ON e.deployment_id=d.id AND e.revision=d.revision WHERE d.id=?1",
+                    [&entry.id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let (raw, remote, declared) = row.unwrap_or((None, false, None));
+            entry.request_limit = declared.map(|count| count as usize);
+            entry.max_running = raw
+                .and_then(|raw| capyctl_config::effective::decode_effective_snapshot(&raw).ok())
+                .map(|effective| {
+                    let fit = if remote {
+                        capyctl_config::context_fit::fit_on_remote_host(&effective)
+                    } else {
+                        capyctl_config::context_fit::fit_for_effective(&effective)
+                    };
+                    capyctl_config::context_fit::max_running_for_effective(&effective, &fit, remote)
+                });
         }
         Ok(deployments)
     }
@@ -1931,5 +1946,26 @@ mod capacity_tests {
             .collect();
         assert_eq!(instances, [(0, Some(4), "ready"), (1, None, "stopped")]);
         assert!(store.capacity(Some("missing")).unwrap().is_empty());
+        // T19 / SPEC §§10, 17: a declared bound remains independently
+        // readable when the rest of a revision is not decodable.
+        for (raw, expected) in [
+            (
+                r#"{"engine_config":{"common":{"max_concurrent_requests":48}}}"#,
+                Some(48),
+            ),
+            ("not json", None),
+        ] {
+            store
+                .conn
+                .execute(
+                    "UPDATE effective_revisions SET effective_json=?1 WHERE deployment_id='d'",
+                    [raw],
+                )
+                .unwrap();
+            let capacity = store.capacity(Some("d")).unwrap();
+            assert_eq!(capacity[0].request_limit, expected);
+            assert_eq!(capacity[0].max_running, None);
+            assert_eq!(store.deployment_request_limit("d").unwrap(), expected);
+        }
     }
 }

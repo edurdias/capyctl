@@ -96,6 +96,7 @@ fn launch_plan() -> pb::SingleLaunchPlan {
         startup_host_bytes: None,
         lmcache: None,
         devices: Vec::new(),
+        vllm_device_request_no_floor: false,
     }
 }
 

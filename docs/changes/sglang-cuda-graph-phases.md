@@ -16,6 +16,10 @@ conveniences for their respective `--cuda-graph-backend-*=disabled` settings.
 Snapshot reconstruction, command identity and frozen launch descriptors retain
 the object without reducing it to a scalar. Resolved-argument drift checks
 continue to require every explicitly disabled phase to stay disabled.
+The object form requires the enrolled host's `cuda_graph_phases` capability,
+so a supported older host is refused before a command is sent; scalar
+booleans keep their existing wire contract. Independent phases in a pre-E1
+SGLang revision migrate to the equivalent object without approximation.
 
 T03/T09/T14/T22 regression tests were authored before production changes for
 all four phase combinations, scalar compatibility, closed object validation,

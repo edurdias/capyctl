@@ -2398,6 +2398,7 @@ fn launch(host: &str, rank: u32, plan: &GroupPlan, command_id: &str) -> MemberCo
                 checkpoint_layout: None,
                 checkpoint_tables: None,
                 checkpoint_gguf: None,
+                vllm_device_request_no_floor: false,
                 lmcache: None,
                 devices: Vec::new(),
             },
@@ -2836,6 +2837,50 @@ async fn host_without_capability_is_refused() {
             world.wait_settled(&world.id("g")).await.last_error(),
             "host_capability_missing:engine_groups"
         );
+    }
+}
+
+// T14 T30 T34 — SPEC §13.1; ADR 0017 §§2–3; ADR 0028 §14;
+// ADR 0014 §2 (#236): one member lacking phase-specific graphs refuses the
+// whole group before either host receives a source, digest or Prepare.
+#[tokio::test]
+async fn group_graph_phases_need_every_members_capability_before_any_request() {
+    for missing in ["host-a", "host-b"] {
+        let world = GroupWorld::hosts(&["host-a", "host-b"])
+            .with_engine("sglang")
+            .without_capability(missing, capabilities::CUDA_GRAPH_PHASES);
+        let source: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+        ))
+        .unwrap();
+        let golden = &source["input"]["host"];
+        world.enroll(golden);
+        let mut deployment = group_document(
+            &source["input"]["deployment"],
+            "g",
+            &["host-a", "host-b"],
+            2,
+            1,
+        );
+        deployment["engine_config"]["cuda_graphs"] =
+            serde_json::json!({"prefill": false, "decode": true});
+        let fence = world
+            .create(
+                "g",
+                &deployment,
+                golden,
+                &[world.host("host-a").as_ref(), world.host("host-b").as_ref()],
+            )
+            .unwrap();
+        world.start_fence(&fence).unwrap();
+        let error = world
+            .activation_refusal(&fence.deployment_id)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "host_capability_missing:cuda_graph_phases");
+        assert_eq!(world.commands_sent_to("host-a"), 0);
+        assert_eq!(world.commands_sent_to("host-b"), 0);
+        assert!(world.group_plan("g").is_none(), "nothing is reserved");
     }
 }
 

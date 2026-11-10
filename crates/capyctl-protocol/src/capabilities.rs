@@ -183,6 +183,18 @@ pub const TRACE_CONTEXT: &str = "trace_context";
 /// sent, so an older host never renders a native installation with the 0.6
 /// command.
 pub const TENSORFOLD_NATIVE: &str = capyctl_config::tensorfold_native::HOST_CAPABILITY;
+/// ADR 0019 §§3–4, #225; ADR 0017 §3: a launch plan's true
+/// `vllm_device_request_no_floor` selects weights-plus-KV discrete request
+/// derivation. An older host would ignore it and rederive the historical
+/// 75% floor. False/absent needs no capability and keeps that old derivation.
+pub const VLLM_DEVICE_REQUEST_NO_FLOOR: &str = "vllm_device_request_no_floor";
+/// SPEC §15.3, #236; ADR 0017 §3: a launch deployment's SGLang-only
+/// `engine_config.cuda_graphs` phase object. Older hosts accept only scalar
+/// booleans, which continue to need no new capability.
+pub const CUDA_GRAPH_PHASES: &str = "cuda_graph_phases";
+/// ADR 0017 / #235: the server accepts the editable-SGLang policy refusal.
+/// A host sends it only after SessionReady advertises this capability.
+pub const INSTALLATION_UNSUPPORTED: &str = "installation_unsupported";
 
 /// ADR 0018: bounds on the new messages' strings and lists.
 pub const MAX_REQUEST_ID: usize = 64;
@@ -190,9 +202,21 @@ pub const MAX_RETIREMENT_DEPLOYMENTS: usize = 256;
 pub const MAX_REASON: usize = 512;
 
 /// ADR 0018: what this server advertises in `SessionReady.capabilities`.
-/// ADR 0033 §12: `lmcache`, so a host sends its LMCache samples.
+/// ADR 0033 §12: `lmcache`, so a host sends its LMCache samples; #235:
+/// `installation_unsupported`, so an upgraded host may report that refusal.
 pub fn server_capabilities() -> Vec<String> {
-    vec![LIVE_PROFILE_UPDATE.to_owned(), LMCACHE.to_owned()]
+    vec![
+        LIVE_PROFILE_UPDATE.to_owned(),
+        LMCACHE.to_owned(),
+        INSTALLATION_UNSUPPORTED.to_owned(),
+    ]
+}
+
+/// ADR 0017 / #235: unknown refusal codes must not end an older server's
+/// control session. Every pre-existing refusal still passes unchanged.
+pub fn server_takes_refusal(server: &[String], reason: &str) -> bool {
+    !reason.starts_with("installation_unsupported:")
+        || server.iter().any(|name| name == INSTALLATION_UNSUPPORTED)
 }
 
 /// Which way a feature's messages flow.
@@ -238,6 +262,9 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (LOCAL_TENSOR_PARALLEL, Direction::ServerToHost),
     (TRACE_CONTEXT, Direction::ServerToHost),
     (TENSORFOLD_NATIVE, Direction::ServerToHost),
+    (VLLM_DEVICE_REQUEST_NO_FLOOR, Direction::ServerToHost),
+    (CUDA_GRAPH_PHASES, Direction::ServerToHost),
+    (INSTALLATION_UNSUPPORTED, Direction::HostToServer),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.
@@ -328,6 +355,7 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
             }
             lmcache_needs(&plan.deployment_config, &mut needs);
             api_needs(&plan.deployment_config, &mut needs);
+            launch_feature_needs(plan, &mut needs);
         }
         // ADR 0028 §14: a group plan carries fields an older host would drop.
         Some(Action::Prepare(_) | Action::Launch(_)) => needs.push(ENGINE_GROUPS),
@@ -380,11 +408,41 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
         }
         lmcache_needs(&plan.deployment_config, &mut needs);
         api_needs(&plan.deployment_config, &mut needs);
+        launch_feature_needs(plan, &mut needs);
     }
     needs.sort_by_key(|need| CATALOGUE.iter().position(|(name, _)| name == need));
     // ADR 0033: a grant and `lmcache: required` both name `lmcache`.
     needs.dedup();
     needs
+}
+
+/// ADR 0017 §3: the 0.2.0 launch features apply equally to single launches
+/// and a group member's own launch.
+fn launch_feature_needs(plan: &pb::SingleLaunchPlan, needs: &mut Vec<&'static str>) {
+    if plan.vllm_device_request_no_floor {
+        needs.push(VLLM_DEVICE_REQUEST_NO_FLOOR);
+    }
+    if cuda_graph_phases_required(&plan.deployment_config) {
+        needs.push(CUDA_GRAPH_PHASES);
+    }
+}
+
+/// SPEC §15.3, #236; ADR 0017 §3: whether a deployment carries the
+/// SGLang-only graph phase object. Resolution validates the engine, which
+/// may be selected through a host profile rather than the deployment's type.
+/// Scalar booleans need no capability. Used by preflight and the send fence
+/// so an older host is refused before any preliminary request is sent.
+pub fn cuda_graph_phases_required(deployment_config: &str) -> bool {
+    if !deployment_config.contains("cuda_graphs") {
+        return false;
+    }
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(deployment_config) else {
+        return false;
+    };
+    document
+        .get("engine_config")
+        .and_then(|settings| settings.get("cuda_graphs"))
+        .is_some_and(serde_json::Value::is_object)
 }
 
 /// ADR 0033 §13: what a launch's deployment document needs of the host: a

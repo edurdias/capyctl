@@ -63,6 +63,9 @@ pub trait SessionExecution: Send + Sync {
         Ok(())
     }
     fn disconnected(&self, _session: u64) {}
+    /// ADR 0017 / #235: called on each SessionReady before its commands,
+    /// so a host reports only refusal codes the connected server accepts.
+    fn server_ready(&self, _capabilities: &[String]) {}
     /// SPEC §10, D9: one tick of engine load reports for this host's Ready
     /// scopes. `None` when the host reports no load. Sent only on a reconciled
     /// session; a full outbound queue drops the tick, never the session.
@@ -888,6 +891,9 @@ async fn connect_once(
                     execution
                         .connected(connected.session)
                         .map_err(end("host execution refused the session"))?;
+                }
+                if let Some(execution) = &execution {
+                    execution.server_ready(&ready.capabilities);
                 }
                 fence = Some(connected);
                 if ready.heartbeat_interval_ms > 0 && ready.heartbeat_lost_after_ms > 0 {

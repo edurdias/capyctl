@@ -566,6 +566,15 @@ impl EngineAdapter for RemoteEngine {
         if plan.checkpoint_gguf.is_some() {
             needs.push(capabilities::CHECKPOINT_GGUF);
         }
+        // ADR 0017 §§2–3; ADR 0019 §§3–4 / #225: a host deriving the
+        // historical floor must not receive the new request's semantics.
+        if plan.vllm_device_request_no_floor {
+            needs.push(capabilities::VLLM_DEVICE_REQUEST_NO_FLOOR);
+        }
+        // #236: scalar graphs remain compatible with N-1; phase objects do not.
+        if capabilities::cuda_graph_phases_required(&plan.deployment_config) {
+            needs.push(capabilities::CUDA_GRAPH_PHASES);
+        }
         if b.instance_index != 0 {
             needs.push(capabilities::INSTANCE_INDEX);
         }
@@ -1539,6 +1548,13 @@ fn remote_launch(
             .memory()
             .gguf
             .map(|recorded| recorded.facts),
+        // ADR 0019 §§3–4 / #225: only a newly derived discrete request
+        // records this marker; accepted historical revisions leave it absent.
+        vllm_device_request_no_floor: matches!(
+            &work.effective().engine_config,
+            capyctl_domain::launch::LaunchSettings::Vllm(settings)
+                if settings.device_request_floor_pct == Some(0)
+        ),
         // Owner decision 2026-09-23: the peak this launch reserved. ADR
         // 0019 §3: on a discrete GPU measured per domain, the card's and
         // host RAM's apart, so the host charges each where it belongs.
@@ -1893,6 +1909,7 @@ mod tests {
                 checkpoint_layout: None,
                 checkpoint_tables: None,
                 checkpoint_gguf: None,
+                vllm_device_request_no_floor: false,
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
@@ -2199,6 +2216,50 @@ mod tests {
         );
     }
 
+    // T09 T14 T26 T34 — SPEC §7.3; ADR 0014 §7; ADR 0019 §§3–4
+    // (#225): a newly derived discrete request carries its derivation to the
+    // host, rather than being silently re-derived with the historical floor.
+    #[test]
+    fn a_remote_vllm_device_launch_carries_its_no_floor_derivation() {
+        use capyctl_config::effective::{resolve_effective_with_checkpoint, CheckpointFacts};
+        let (_dir, owned, host, work) = remote_work(None, layout());
+        let launch = remote_launch(&owned, "controller", &work, true).unwrap();
+        assert!(launch.plan.vllm_device_request_no_floor);
+        let host_document = {
+            let owner = owned.lock().unwrap();
+            let publication = owner.store().host_publication(&host).unwrap().unwrap();
+            let config =
+                capyctl_config::remote_roles::HostConfig::parse(&publication.config_json).unwrap();
+            capyctl_config::remote_resources::local_host_document(&config.document).unwrap()
+        };
+        let deployment = serde_json::from_str(&launch.plan.deployment_config).unwrap();
+        let resolved = resolve_effective_with_checkpoint(
+            &deployment,
+            &host_document,
+            CheckpointFacts {
+                weights_bytes: launch.plan.checkpoint_weights_bytes,
+                accepted_revision: true,
+                legacy_vllm_device_floor: !launch.plan.vllm_device_request_no_floor,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.engine_config.memory().request_bytes,
+            27_917_287_336
+        );
+        assert_eq!(
+            resolved.engine_config.memory().request_bytes,
+            work.effective().engine_config.memory().request_bytes
+        );
+        assert_eq!(
+            resolved.ready_device_allocation().map(|(_, bytes)| bytes),
+            work.effective()
+                .ready_device_allocation()
+                .map(|(_, bytes)| bytes)
+        );
+    }
+
     // T26 T14 (#219, ADR 0017 version skew, ADR 0019 §3): an unmeasured
     // first start on a card is sent the server's card and host RAM figures
     // when the host takes `startup_host_bytes` (0.1.7 on). A host from 0.1.7
@@ -2221,6 +2282,7 @@ mod tests {
         );
         let card = (38_i64 << 30) + ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
         let launch = remote_launch(&owned, "controller", &work, true).unwrap();
+        assert!(!launch.plan.vllm_device_request_no_floor);
         assert_eq!(launch.plan.startup_bytes, Some(card));
         assert_eq!(
             launch.plan.startup_host_bytes,

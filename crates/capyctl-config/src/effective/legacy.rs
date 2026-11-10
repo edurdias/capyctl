@@ -205,12 +205,6 @@ pub fn legacy_engine_config(
             }
             let prefill = flag(settings, "prefill_cuda_graphs")?.unwrap_or(false);
             let decode = flag(settings, "decode_cuda_graphs")?.unwrap_or(false);
-            if prefill != decode {
-                return Err(refuse(
-                    "launch_settings enable CUDA graphs for only one of prefill and decode; \
-                     engine_config.cuda_graphs covers both",
-                ));
-            }
             if flag(settings, "trust_remote_code")? == Some(true) {
                 block.insert("trust_remote_code".into(), json!(true));
             }
@@ -228,7 +222,15 @@ pub fn legacy_engine_config(
                 "max_concurrent_requests".into(),
                 json!(number("max_running_requests", 8)),
             );
-            block.insert("cuda_graphs".into(), json!(prefill));
+            block.insert(
+                "cuda_graphs".into(),
+                if prefill == decode {
+                    json!(prefill)
+                } else {
+                    // ADR 0014 §2 / #236: preserve independent legacy phases.
+                    json!({"prefill": prefill, "decode": decode})
+                },
+            );
             block.insert(
                 "sglang".into(),
                 json!({

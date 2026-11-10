@@ -992,7 +992,7 @@ mod tests {
     #[tokio::test]
     async fn an_embedding_fake_answers_embeddings_alone() {
         let engine = FakeEngine::new().with_embeddings();
-        let chat = serde_json::json!({"model": "public", "messages": []});
+        let chat = request(serde_json::json!({"model": "public", "messages": []}));
         assert!(matches!(
             engine.forward_chat(&chat).await,
             Err(AdapterError::PolicyDenied)

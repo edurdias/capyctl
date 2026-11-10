@@ -53,8 +53,9 @@ an editable install (`pip install -e`, as in the official `lmsysorg/sglang`
 image) cannot load, and `engine add` refuses it before running anything:
 `installation_unsupported:editable`, exit 17. Standalone refuses each launch of
 such an installation with the same code, including one named
-with `--sglang-bin` or `local_engine`; on a GPU machine of several the engine
-starts and fails at once with `engine_import_failed`. Reinstall SGLang without
+with `--sglang-bin` or `local_engine`. An enrolled host refuses it too toward
+a 0.2.0 server. Toward an older server the engine starts and fails at once with
+`engine_import_failed`, without ending the control session. Reinstall SGLang without
 `-e` ([Install an engine](install-engines.md#sglang-0521-or-0520)).
 
 That output is from a first run, before CapyCTL was started: the engine is saved

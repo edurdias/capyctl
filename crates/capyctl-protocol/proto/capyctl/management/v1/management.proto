@@ -518,6 +518,11 @@ message SingleLaunchPlan {
   // in rank order (rank r on the r-th). Empty for a launch on one GPU, which
   // encodes exactly as before.
   repeated string devices = 20;
+  // ADR 0019 §§3–4, #225; ADR 0017 §3 (additive): derive a vLLM discrete
+  // device request from weights plus KV without the historical 75% floor.
+  // False/absent preserves pre-0.2.0 derivation and the exact old encoding
+  // and digest. True requires capability `vllm_device_request_no_floor`.
+  bool vllm_device_request_no_floor = 21;
 }
 // ADR 0033 §§3, 6: the ports and the charge of one launch's LMCache server.
 message LmcacheGrant {

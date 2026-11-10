@@ -842,11 +842,7 @@ impl Plan {
                     // only while its gate is open.
                     let lease = match deps
                         .controller
-                        .open_instance_lease(
-                            &deployment,
-                            candidate.generation,
-                            self.request_limit,
-                        )
+                        .open_instance_lease(&deployment, candidate.generation, self.request_limit)
                         .await
                     {
                         Ok(lease) => lease,

@@ -48,6 +48,7 @@ use capyctl_domain::{
         member_id, CommandIdentity, GroupEngine, GroupPlan, GroupTopology, MemberKey, MemberPlan,
         MemberRole,
     },
+    launch::{CudaGraphs, LaunchSettings},
     resources::MemoryLimit,
 };
 use capyctl_protocol::{
@@ -551,6 +552,25 @@ async fn activate(
                 reason,
                 format!("host {host} cannot honor the residency"),
             ));
+        }
+        // ADR 0017 §§2–3; ADR 0019 §§3–4 / #225: refuse incompatible
+        // derivation and #236 graph phases before any source or digest request.
+        let preflight = |capability| {
+            ctx.hosts
+                .preflight(&host, &[capability])
+                .map_err(|code| GroupActivationError::refused(code, format!("host {host}")))
+        };
+        if matches!(
+            &resolution.effective.engine_config,
+            LaunchSettings::Vllm(settings) if settings.device_request_floor_pct == Some(0)
+        ) {
+            preflight(capabilities::VLLM_DEVICE_REQUEST_NO_FLOOR)?;
+        }
+        if matches!(
+            resolution.effective.engine_config.common().cuda_graphs,
+            Some(CudaGraphs::Phases { .. })
+        ) {
+            preflight(capabilities::CUDA_GRAPH_PHASES)?;
         }
         let local =
             capyctl_config::remote_resources::local_deployment_document(&host, &resolution.source)
@@ -1118,6 +1138,12 @@ fn launch_commands(
                 checkpoint_tables: memory.disk_tables.map(|recorded| recorded.tables),
                 // ADR 0029 §1: llama.cpp runs no groups.
                 checkpoint_gguf: None,
+                // ADR 0019 §§3–4 / #225: preserve this member's accepted
+                // derivation, just as for a single-host launch.
+                vllm_device_request_no_floor: matches!(
+                    &effective.engine_config,
+                    LaunchSettings::Vllm(settings) if settings.device_request_floor_pct == Some(0)
+                ),
                 // ADR 0033 §2: a group runs no LMCache (`group_unsupported`).
                 lmcache: None,
                 // ADR 0035 §12: a group keeps one device per host.

@@ -210,6 +210,7 @@ fn group_member_launch(
         startup_host_bytes: None,
         lmcache: None,
         devices: Vec::new(),
+        vllm_device_request_no_floor: false,
     }
 }
 
@@ -252,6 +253,7 @@ fn single_host_launch_binds_local_resolution_and_retained_grant() {
         startup_host_bytes: None,
         lmcache: None,
         devices: Vec::new(),
+        vllm_device_request_no_floor: false,
     });
     typed.identity.payload_digest = typed.canonical_digest();
     typed.verify_digest().unwrap();
@@ -466,9 +468,104 @@ fn launch_single() -> MemberCommand {
         startup_host_bytes: None,
         lmcache: None,
         devices: Vec::new(),
+        vllm_device_request_no_floor: false,
     });
     typed.identity.payload_digest = typed.canonical_digest();
     typed
+}
+
+// T34 T26 (SPEC §20; ADR 0017 §3, ADR 0019 §§3–4): false is the 0.1.11
+// launch encoding and digest, not an explicitly encoded new field.
+#[test]
+fn a_legacy_vllm_launch_keeps_its_encoding_and_digest() {
+    use capyctl_protocol::execution::SingleLaunchPlan;
+    use sha2::{Digest, Sha256};
+    let legacy = launch_single();
+    let mut wire = legacy.to_wire();
+    let Some(pb::execute_member::Action::LaunchSingle(plan)) = wire.action.take() else {
+        panic!("a single launch")
+    };
+    assert!(!plan.vllm_device_request_no_floor);
+    // This fixture uses only the original ten plan fields. Encode those
+    // independently, so an accidentally present false field changes bytes.
+    let mut old_plan = Vec::new();
+    for (tag, value) in [
+        (1, &plan.deployment_config),
+        (2, &plan.profile_name),
+        (3, &plan.checkpoint_fingerprint),
+        (4, &plan.host_policy_fingerprint),
+        (5, &plan.binding_id),
+        (6, &plan.incarnation),
+        (7, &plan.grant_id),
+    ] {
+        prost::encoding::string::encode(tag, value, &mut old_plan);
+    }
+    prost::encoding::uint32::encode(8, &plan.service_port, &mut old_plan);
+    prost::encoding::int64::encode(9, &plan.issued_at_unix_ms, &mut old_plan);
+    prost::encoding::string::encode(10, &plan.coordinator_session_id, &mut old_plan);
+    assert_eq!(plan.encode_to_vec(), old_plan);
+    let recovered =
+        SingleLaunchPlan::try_from(pb::SingleLaunchPlan::decode(old_plan.as_slice()).unwrap())
+            .unwrap();
+    assert!(!recovered.vllm_device_request_no_floor);
+    let mut old_command = wire.encode_to_vec();
+    prost::encoding::bytes::encode(7, &old_plan, &mut old_command);
+    assert_eq!(legacy.to_wire().encode_to_vec(), old_command);
+    wire.identity.as_mut().unwrap().payload_digest.clear();
+    let mut old_digest_input = wire.encode_to_vec();
+    prost::encoding::bytes::encode(7, &old_plan, &mut old_digest_input);
+    let mut digest = Sha256::new();
+    digest.update(b"capyctl/member-command/v1\0");
+    digest.update(old_digest_input);
+    let old_digest: [u8; 32] = digest.finalize().into();
+    assert_eq!(legacy.canonical_digest(), old_digest);
+}
+
+// T34 T26 (SPEC §20; ADR 0017 §3, ADR 0019 §§3–4): true is additive
+// field 21, survives the typed wire boundary, and is bound by the digest.
+#[test]
+fn the_vllm_no_floor_marker_round_trips_and_binds_the_digest() {
+    use capyctl_protocol::execution::MemberAction;
+    let legacy = launch_single();
+    let mut current = legacy.clone();
+    let MemberAction::LaunchSingle(plan) = &mut current.action else {
+        panic!("a single launch")
+    };
+    plan.vllm_device_request_no_floor = true;
+    current.identity.payload_digest = current.canonical_digest();
+    assert_ne!(
+        current.identity.payload_digest,
+        legacy.identity.payload_digest
+    );
+    let plan_bytes = |command: &MemberCommand| {
+        let Some(pb::execute_member::Action::LaunchSingle(plan)) = command.to_wire().action else {
+            panic!("a single launch")
+        };
+        plan.encode_to_vec()
+    };
+    assert_eq!(
+        plan_bytes(&current),
+        [plan_bytes(&legacy), vec![0xa8, 0x01, 0x01]].concat()
+    );
+    let recovered = MemberCommand::try_from(
+        pb::ServerToAgent::decode(
+            pb::ServerToAgent {
+                msg: Some(pb::server_to_agent::Msg::ExecuteMember(current.to_wire())),
+            }
+            .encode_to_vec()
+            .as_slice(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(recovered, current);
+    recovered.verify_digest().unwrap();
+    let mut dropped = recovered;
+    let MemberAction::LaunchSingle(plan) = &mut dropped.action else {
+        panic!("a single launch")
+    };
+    plan.vllm_device_request_no_floor = false;
+    assert!(dropped.verify_digest().is_err());
 }
 
 // T46 (ADR 0035 §§2, 11): a launch on several GPUs of one host carries its
@@ -858,6 +955,77 @@ mod groups {
             assert_eq!(required(&command_with(action).to_wire()), [ENGINE_GROUPS]);
         }
         assert!(required(&command_with(MemberAction::Inspect).to_wire()).is_empty());
+    }
+
+    // T34 T14 T26 (SPEC §15.3, §20; ADR 0017 §3): a group's own member
+    // launch has the same feature gates as a single launch. Prepare and
+    // legacy/scalar group launches do not acquire either new requirement.
+    #[test]
+    fn group_member_launches_gate_only_the_new_launch_features() {
+        use capyctl_protocol::capabilities::{
+            refusal, CUDA_GRAPH_PHASES, VLLM_DEVICE_REQUEST_NO_FLOOR,
+        };
+        let current: BTreeSet<String> = agent_capabilities().into_iter().collect();
+        let older: BTreeSet<String> = current
+            .iter()
+            .filter(|name| {
+                name.as_str() != CUDA_GRAPH_PHASES && name.as_str() != VLLM_DEVICE_REQUEST_NO_FLOOR
+            })
+            .cloned()
+            .collect();
+        for prefill in [false, true] {
+            for decode in [false, true] {
+                let mut action = launch(sample_group_plan(GroupEngine::Sglang));
+                let MemberAction::Launch { member, .. } = &mut action else {
+                    unreachable!()
+                };
+                let mut document: serde_json::Value =
+                    serde_json::from_str(&member.deployment_config).unwrap();
+                document["engine"] = serde_json::json!({"type": "sglang"});
+                document["engine_config"] =
+                    serde_json::json!({"cuda_graphs": {"prefill": prefill, "decode": decode}});
+                member.deployment_config = document.to_string();
+                let wire = command_with(action).to_wire();
+                assert!(required(&wire).contains(&CUDA_GRAPH_PHASES));
+                assert_eq!(
+                    refusal(false, &older, &wire).as_deref(),
+                    Some("host_capability_missing:cuda_graph_phases")
+                );
+                assert_eq!(refusal(false, &current, &wire), None);
+            }
+        }
+        for graphs in [None, Some(false), Some(true)] {
+            let mut action = launch(sample_group_plan(GroupEngine::Sglang));
+            let MemberAction::Launch { member, .. } = &mut action else {
+                unreachable!()
+            };
+            let mut document: serde_json::Value =
+                serde_json::from_str(&member.deployment_config).unwrap();
+            document["engine"] = serde_json::json!({"type": "sglang"});
+            document["engine_config"] = serde_json::json!({"max_concurrent_requests": 16});
+            if let Some(graphs) = graphs {
+                document["engine_config"]["cuda_graphs"] = graphs.into();
+            }
+            member.deployment_config = document.to_string();
+            let wire = command_with(action).to_wire();
+            assert_eq!(required(&wire), [ENGINE_GROUPS]);
+            assert_eq!(refusal(false, &older, &wire), None);
+        }
+        let mut action = launch(sample_group_plan(GroupEngine::Vllm));
+        let MemberAction::Launch { member, .. } = &mut action else {
+            unreachable!()
+        };
+        member.vllm_device_request_no_floor = true;
+        let wire = command_with(action).to_wire();
+        assert!(required(&wire).contains(&VLLM_DEVICE_REQUEST_NO_FLOOR));
+        assert_eq!(
+            refusal(false, &older, &wire).as_deref(),
+            Some("host_capability_missing:vllm_device_request_no_floor")
+        );
+        assert_eq!(refusal(false, &current, &wire), None);
+        let prepare = command_with(MemberAction::Prepare(sample_group_plan(GroupEngine::Vllm)));
+        assert_eq!(required(&prepare.to_wire()), [ENGINE_GROUPS]);
+        assert_eq!(refusal(false, &older, &prepare.to_wire()), None);
     }
 
     // T34: drain-only hosts may terminate a member but never prepare or launch one.
