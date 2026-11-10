@@ -148,6 +148,27 @@ class HelperTests(unittest.TestCase):
         ctx.lifecycle('wake', 'parked-model')
         self.assertEqual(calls, [('start', 'deployment', 'parked-model')])
 
+    def test_cache_fixture_explicitly_requests_token_ids(self):
+        import contextlib
+        import io
+        import sys
+        import types
+        from unittest import mock
+        from rows.lmcache import TOKENIZER
+        class Tokenizer:
+            def encode(self, *args, **kwargs):
+                return [1] * 40000
+            def decode(self, *args, **kwargs):
+                return ''
+            def apply_chat_template(self, *args, **kwargs):
+                ids = [1] * 32064
+                return ids if kwargs.get('return_dict') is False else {'input_ids': ids, 'attention_mask': ids}
+        transformers = types.SimpleNamespace(AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *args, **kwargs: Tokenizer()))
+        stream = io.StringIO()
+        with mock.patch.dict(sys.modules, transformers=transformers), mock.patch('sys.argv', ['probe', 'model', '[["main",32000]]']), mock.patch('importlib.metadata.version', return_value='test'), contextlib.redirect_stdout(stream):
+            exec(TOKENIZER, {})
+        self.assertEqual(json.loads(stream.getvalue())['fixtures']['main']['prompt_tokens'], 32064)
+
     def test_process_identity_guards_against_pid_reuse(self):
         record = identity(os.getpid())
         self.assertTrue(matches(record))

@@ -47,7 +47,7 @@ for label, target in specifications:
     for _ in range(12):
         content = prefix + t.decode(filler[:count], skip_special_tokens=True) + suffix
         messages = [{"role": "user", "content": content}]
-        tokens = t.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+        tokens = t.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_dict=False)
         difference = target + 64 - len(tokens)
         if 0 <= len(tokens) - target < 256:
             break

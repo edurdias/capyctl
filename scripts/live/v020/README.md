@@ -148,6 +148,8 @@ resolved dictionary (including the effective graph backends), without opening
 protected descriptors or reading engine keys.
 The harness's logical `wake` operation uses `capyctl start deployment`, the
 supported CLI command for returning a parked deployment to ready.
+Cache fixtures explicitly request token-ID lists from Transformers; dictionary
+return defaults must not be mistaken for a two-token prompt.
 
 ## Evidence and verdicts
 
