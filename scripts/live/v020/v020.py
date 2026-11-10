@@ -365,7 +365,7 @@ class Context:
 
     def lifecycle(self, action, name, role='standalone'):
         start = time.monotonic()
-        self.cli(action, 'deployment', name, role=role)
+        self.cli('start' if action == 'wake' else action, 'deployment', name, role=role)
         target = dict(park='parked', wake='ready', stop='stopped', start='ready').get(action)
         while time.monotonic() < self.deadline:
             status = self.status(name, role)

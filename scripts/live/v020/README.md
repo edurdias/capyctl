@@ -146,6 +146,8 @@ SGLang's managed wrapper passes native `ServerArgs` keywords through a protected
 descriptor, not an engine CLI. ISSUE236 therefore observes the launch-scoped
 resolved dictionary (including the effective graph backends), without opening
 protected descriptors or reading engine keys.
+The harness's logical `wake` operation uses `capyctl start deployment`, the
+supported CLI command for returning a parked deployment to ready.
 
 ## Evidence and verdicts
 

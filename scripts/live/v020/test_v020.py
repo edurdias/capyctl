@@ -138,6 +138,16 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(settings['resolved']['cuda_graph_backend_decode'], 'full')
         self.assertNotIn('must-not-export', json.dumps(settings))
 
+    def test_wake_uses_start_deployment_cli(self):
+        ctx = v020.Context.__new__(v020.Context)
+        calls = []
+        ctx.cli = lambda *args, **kwargs: calls.append(args)
+        ctx.status = lambda *args: {'observed_state': 'ready'}
+        ctx.deadline = v020.time.monotonic() + 10
+        ctx.functional_only = True
+        ctx.lifecycle('wake', 'parked-model')
+        self.assertEqual(calls, [('start', 'deployment', 'parked-model')])
+
     def test_process_identity_guards_against_pid_reuse(self):
         record = identity(os.getpid())
         self.assertTrue(matches(record))
