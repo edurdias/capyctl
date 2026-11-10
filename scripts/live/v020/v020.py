@@ -24,6 +24,10 @@ MODULES = ('regressions', 'lmcache', 'measurements', 'engines', 'functional')
 class SessionInterrupted(BaseException):
     """Stop the session, rather than treating a signal as an individual row failure."""
 
+class UnavailableEngine(Exception):
+    """A supplied shared-host mapping explicitly leaves an installation absent."""
+
+
 
 def rows():
     order = {name: index for index, name in enumerate(('ISSUE225', 'LC13', 'LC14', 'LC15', 'LC16',
@@ -293,15 +297,23 @@ class Context:
             argv = [info['binary'], '--config', info['config']] if 'config' in info else [info['binary'], '--state-dir', info['state']]
         return self.command([*argv, *args], check=check, env=env)
 
+    def installation(self, key):
+        path = self.engines.get(key)
+        if not path:
+            if self.functional_only:
+                raise UnavailableEngine('not installed on this host; qualified on the VM')
+            raise AssertionError('engine installation unavailable: ' + key)
+        if not Path(path).exists():
+            raise AssertionError('mapped engine installation does not exist: ' + key)
+        return path
+
     def register(self, engine, role='standalone'):
         key = engine.upper().replace('.', '').replace('-', '_')
         aliases = {'VLLM033': 'VLLM_033', 'VLLM032': 'VLLM_032', 'SGLANG0522': 'SGLANG_0522',
                    'SGLANG0523': 'SGLANG_0523', 'LLAMACPP090': 'LLAMACPP',
                    'TENSORFOLD126': 'TENSORFOLD_126', 'TENSORFOLD115': 'TENSORFOLD_115'}
         key = aliases.get(key, key)
-        path = self.engines.get(key)
-        if not path or not Path(path).exists():
-            raise AssertionError('engine installation unavailable: ' + key)
+        path = self.installation(key)
         name = 'q-' + key.lower().replace('_', '-')
         if (role, name) not in self.registered:
             cuda_key = {'TENSORRT_LLM_121': 'CUDA_HOME_TRT121',
@@ -582,6 +594,8 @@ def main():
                 else:
                     try:
                         result = importlib.import_module('rows.' + row['module']).run(ctx, row)
+                    except UnavailableEngine as error:
+                        result = dict(verdict='skip', reason=str(error), evidence={})
                     except (AssertionError, OSError, ValueError, KeyError, TimeoutError, subprocess.SubprocessError) as error:
                         result = dict(verdict='fail', reason=ctx.clean(str(error))[:300] or type(error).__name__, evidence={})
                     finally:

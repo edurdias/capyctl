@@ -49,6 +49,7 @@ def run(ctx, row):
     residency = "deep" if engine.startswith(("vllm", "sglang")) else "restart_only"
     evidence = {"engine": engine, "requests": []}
     if engine == "TENSORRT_LLM_140RC3":
+        ctx.installation(engine)
         from .measurements import trt_preflight
         failure = trt_preflight(ctx)
         if failure:

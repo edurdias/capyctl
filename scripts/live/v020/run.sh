@@ -4,14 +4,15 @@ set -euo pipefail
 umask 077
 HERE=$(cd "$(dirname "$0")" && pwd)
 TARGET='' SSH_PORT=22 OUT='' ONLY=all SKIP_SETUP=0 KEEP=0 PURGE_ONLY=0 DRY=0
-MAX_SECONDS=28200 BINARY='' ENGINES='' FUNCTIONAL_ONLY=0
-usage() { echo 'usage: run.sh --ssh USER@ADDR --binary PATH --out DIR [--ssh-port N] [--only rows] [--skip-setup] [--keep] [--purge-only] [--dry-run] [--max-seconds N] [--engines FILE] [--functional-only]' >&2; exit 2; }
+MAX_SECONDS=28200 BINARY='' REMOTE_BINARY='' ENGINES='' FUNCTIONAL_ONLY=0
+usage() { echo 'usage: run.sh --ssh USER@ADDR (--binary PATH | --remote-binary PATH) --out DIR [--ssh-port N] [--only rows] [--skip-setup] [--keep] [--purge-only] [--dry-run] [--max-seconds N] [--engines FILE] [--functional-only]' >&2; exit 2; }
 while [ $# -gt 0 ]; do
   case $1 in
-    --ssh|--binary|--out|--ssh-port|--only|--max-seconds|--engines)
+    --ssh|--binary|--remote-binary|--out|--ssh-port|--only|--max-seconds|--engines)
       [ $# -ge 2 ] || usage
       case $1 in
         --ssh) TARGET=$2 ;; --binary) BINARY=$2 ;; --out) OUT=$2 ;;
+        --remote-binary) REMOTE_BINARY=$2 ;;
         --ssh-port) SSH_PORT=$2 ;; --only) ONLY=$2 ;; --max-seconds) MAX_SECONDS=$2 ;;
         --engines) ENGINES=$2 ;;
       esac; shift ;;
@@ -28,11 +29,14 @@ if [ "$DRY" = 1 ]; then
   exit 0
 fi
 [ -n "$TARGET" ] && [ -n "$OUT" ] || usage
-[[ $TARGET =~ ^[A-Za-z0-9_.-]+@[A-Za-z0-9_.:-]+$ ]] || usage
+[[ $TARGET =~ ^([A-Za-z0-9_.-]+@)?[A-Za-z0-9_.:-]+$ ]] || usage
 if [ "$FUNCTIONAL_ONLY" = 1 ]; then
   [ "$SKIP_SETUP" = 1 ] && [ -f "$ENGINES" ] || { echo 'functional-only requires --skip-setup --engines FILE' >&2; exit 2; }
 fi
-if [ "$PURGE_ONLY" = 0 ]; then [ -f "$BINARY" ] && [ -x "$BINARY" ] || usage; fi
+if [ "$PURGE_ONLY" = 0 ]; then
+  if [ -n "$REMOTE_BINARY" ]; then [ -z "$BINARY" ] || usage
+  else [ -f "$BINARY" ] && [ -x "$BINARY" ] || usage; fi
+fi
 SSH=(ssh -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 "$TARGET")
 RSYNC_SSH="ssh -p $SSH_PORT -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2"
 remote() { timeout --kill-after=5 210 "${SSH[@]}" "$@"; }
@@ -92,7 +96,14 @@ remote 'umask 077; if [ -e ~/LIVE-SESSION-IN-USE.txt ]; then exit 1; fi; mkdir -
 READY=1
 copy -rlpt "$HERE/" "$TARGET:capyctl-v020/live/" >/dev/null
 remote 'python3 ~/capyctl-v020/live/session.py begin --root ~/capyctl-v020'
-copy "$BINARY" "$TARGET:capyctl-v020/bin/capyctl" >/dev/null
+if [ -n "$REMOTE_BINARY" ]; then
+  printf -v source '%q' "$REMOTE_BINARY"
+  remote "test -f $source && test -x $source && cp -- $source ~/capyctl-v020/bin/capyctl"
+else
+  copy "$BINARY" "$TARGET:capyctl-v020/bin/capyctl" >/dev/null
+fi
+binary_digest=$(remote 'sha256sum ~/capyctl-v020/bin/capyctl')
+binary_digest=${binary_digest%% *}
 printf 'ONLY=%q\nFUNCTIONAL_ONLY=%q\nSKIP_SETUP=%q\nMAX_SECONDS=%q\n' "$ONLY" "$FUNCTIONAL_ONLY" "$SKIP_SETUP" "$MAX_SECONDS" >"$SCRATCH/session.env"
 if [ -n "$ENGINES" ]; then
   [ -f "$ENGINES" ] || usage
@@ -100,11 +111,10 @@ if [ -n "$ENGINES" ]; then
   printf '%s\n' "ENGINES_FILE=\$HOME/capyctl-v020/input-engines.env" >>"$SCRATCH/session.env"
 fi
 copy "$SCRATCH/session.env" "$TARGET:capyctl-v020/session.env" >/dev/null
-python3 - "$OUT/settings.json" "$BINARY" "$ONLY" "$FUNCTIONAL_ONLY" "$MAX_SECONDS" <<'PY'
-import hashlib,json,pathlib,sys
-path,binary,only,functional,seconds=sys.argv[1:]
+python3 - "$OUT/settings.json" "$binary_digest" "$ONLY" "$FUNCTIONAL_ONLY" "$MAX_SECONDS" <<'PY'
+import json,pathlib,sys
+path,digest,only,functional,seconds=sys.argv[1:]
 # Deliberately no command, path to binary, SSH target, environment, or credentials.
-digest=hashlib.sha256(pathlib.Path(binary).read_bytes()).hexdigest()
 pathlib.Path(path).write_text(json.dumps(dict(binary_sha256=digest,only=only,functional_only=functional=='1',max_seconds=int(seconds)),indent=2)+'\n')
 PY
 remote "umask 077; setsid nohup timeout --kill-after=180 $MAX_SECONDS bash ~/capyctl-v020/live/remote.sh all >~/capyctl-v020/session.log 2>&1 </dev/null &"

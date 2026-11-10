@@ -179,8 +179,7 @@ def native_registration(ctx,row,evidence):
     for key,version in (("TENSORFOLD_126","1.2.6"),("TENSORFOLD_115","1.1.5")):
         if row["id"]=="TF1" and key=="TENSORFOLD_115":
             continue
-        value=ctx.engines.get(key)
-        ctx.assertion(value,"missing approved native installation: "+key)
+        value=ctx.installation(key)
         binary=Path(value)
         if binary.is_dir():
             binary=binary/"bin/tensorfold-native"
@@ -226,8 +225,7 @@ def tracing_refusals(ctx,evidence):
         ("VLLM_033",["--arg=--otlp-traces-endpoint","--arg=http://127.0.0.1:14318/v1/traces"],"reserved"),
         ("SGLANG_0523",["--arg=--enable-trace"],"reserved"),
         ("VLLM_033",["--env=OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:14318"],"engine_env_reserved")):
-        path=ctx.engines.get(key)
-        ctx.assertion(path and Path(path).exists(),"missing engine for tracing refusal: "+key)
+        path=ctx.installation(key)
         result=ctx.cli("engine","add",path,"--name","ot11-refused",*flags,check=False)
         ctx.assertion(result.returncode!=0 and reason in (result.stdout+result.stderr),"reserved tracing profile setting accepted or wrong refusal")
         evidence.setdefault("profile_refusals",[]).append(dict(engine=key,exit_code=result.returncode,reason=reason))

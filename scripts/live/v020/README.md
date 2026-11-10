@@ -30,8 +30,9 @@ SSH and rsync have connection, liveness and overall time bounds. The runner poll
 sanitized evidence every 20 seconds. A five-minute disconnection ends the local
 run and triggers bounded cleanup; provider deletion is the final safety net.
 
-Flags: `--ssh`, `--ssh-port`, `--binary`, `--out`, `--only` (comma-separated row
-IDs), `--skip-setup`, `--keep`, `--purge-only`, `--dry-run`, `--max-seconds`,
+Flags: `--ssh`, `--ssh-port`, `--binary` (local executable) or `--remote-binary`
+(absolute path to an executable already built on the target), `--out`, `--only`
+(comma-separated row IDs), `--skip-setup`, `--keep`, `--purge-only`, `--dry-run`, `--max-seconds`,
 `--engines FILE`, `--functional-only`. `--dry-run` imports the row catalog and
 prints the full remote setup and acceptance plan without SSH or a binary.
 `--purge-only` first copies evidence, then removes the stopped session. A normal

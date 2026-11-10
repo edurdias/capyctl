@@ -116,6 +116,18 @@ class HelperTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             v020.load_env(path)
 
+    def test_absent_shared_host_engine_skips_without_hiding_bad_paths(self):
+        ctx = v020.Context(self.root, {'VLLM_033': ''}, functional_only=True)
+        with self.assertRaisesRegex(v020.UnavailableEngine, 'not installed on this host'):
+            ctx.installation('VLLM_033')
+        ctx.engines['VLLM_033'] = str(self.root / 'missing')
+        with self.assertRaisesRegex(AssertionError, 'does not exist'):
+            ctx.installation('VLLM_033')
+        ctx.functional_only = False
+        ctx.engines['VLLM_033'] = ''
+        with self.assertRaisesRegex(AssertionError, 'unavailable'):
+            ctx.installation('VLLM_033')
+
     def test_process_identity_guards_against_pid_reuse(self):
         record = identity(os.getpid())
         self.assertTrue(matches(record))

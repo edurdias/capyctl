@@ -118,6 +118,7 @@ def install_editable_profile(ctx, role):
 
 def editable(ctx):
     evidence = {}
+    ctx.installation('SGLANG_EDITABLE')
     # Registration must refuse without executing the engine in standalone.
     before = ctx.logs()
     result = ctx.cli('engine', 'add', ctx.engines['SGLANG_EDITABLE'], '--name', 'editable-refusal', check=False)
