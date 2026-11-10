@@ -253,24 +253,21 @@ class _ScrubbingStream:
 def install_log_scrubber():
     """SPEC §13.3 / T21: engine logs never carry a credential.
 
-    The engine formats its arguments (keys included) into log messages, so every
-    log record's message is scrubbed as it is created, and Python-level writes
-    to stdout and stderr are scrubbed too. Native writes to the descriptors are
-    redacted by capyctl's log writer on the other end of the pipe; under
+    Structured records retain their templates and arguments until their formatter
+    has consumed them. Scrub the formatted output, including exception text, and
+    Python-level writes to stdout and stderr. Native writes to the descriptors
+    are redacted by capyctl's log writer on the other end of the pipe; under
     --debug-engine-logs they are not, and the log file is private (0600).
     """
-    factory = logging.getLogRecordFactory()
+    # SPEC §13.3 / T21: redact after interpolation, not by flattening record.args.
+    # Uvicorn's access formatter unpacks its five structured arguments itself.
+    # Patching the base method also protects formatters created before this guard.
+    format_record = logging.Formatter.format
 
-    def scrubbed(*args, **kwargs):
-        record = factory(*args, **kwargs)
-        try:
-            message = scrub(record.getMessage())
-        except Exception:
-            message = "<unformattable log message>"
-        record.msg, record.args = message, None
-        return record
+    def scrubbed(formatter, record):
+        return scrub(format_record(formatter, record))
 
-    logging.setLogRecordFactory(scrubbed)
+    logging.Formatter.format = scrubbed
     sys.stdout = _ScrubbingStream(sys.stdout)
     sys.stderr = _ScrubbingStream(sys.stderr)
 
