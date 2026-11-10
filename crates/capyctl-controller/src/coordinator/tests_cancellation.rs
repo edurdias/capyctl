@@ -637,6 +637,45 @@ async fn held_requests_below_the_limit_or_beside_live_work_restart_nothing() {
     h.lab.worker.shutdown().await.unwrap();
 }
 
+// T17 T19 (SPEC §10, ADR 0032 §7, #240): the held-request restart uses the
+// same declared bound as admission, both below and above the default 32.
+#[tokio::test]
+async fn held_request_restarts_follow_the_deployments_declared_concurrency() {
+    for limit in [2usize, 48] {
+        let lab = lab(15, 50).await;
+        let id = lab.deploy_build("bounded", VLLM, "0.32.0", |document| {
+            document["engine_config"]["max_concurrent_requests"] = json!(limit);
+        });
+        let port = lab.port(Duration::from_secs(10));
+        port.activate_for_request(&id).await.unwrap();
+        lab.engine.quiet.store(false, Ordering::SeqCst);
+        let generation = lab.instance(&id, 0).2.unwrap();
+        for count in 1..=limit {
+            let lease = port
+                .open_instance_lease(&id, generation, limit)
+                .await
+                .unwrap()
+                .unwrap();
+            port.close_request_lease(lease, UNANSWERED).await.unwrap();
+            if count < limit {
+                assert_eq!(
+                    port.restart_for_held_requests(&id).await.unwrap(),
+                    crate::port::HeldRestart::NotHeld,
+                    "{count} held requests do not fill {limit} slots"
+                );
+            }
+        }
+        assert_eq!(
+            port.restart_for_held_requests(&id).await.unwrap(),
+            crate::port::HeldRestart::Restarting,
+            "all {limit} configured slots are held"
+        );
+        until("configured held requests settled", || leases(&lab, &id) == 0).await;
+        assert_eq!(restarts(&lab, &id)[0]["count"], json!(limit));
+        lab.worker.shutdown().await.unwrap();
+    }
+}
+
 // T17 (ADR 0032 §1–§3): an SGLang 0.5.22 launch with one tokenizer worker
 // carries the request ID and is aborted by it through its own retained
 // driver (the adapter's `cancel_work`, named by its binding); a vLLM lane is

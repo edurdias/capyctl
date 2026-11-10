@@ -6,6 +6,24 @@ use capyctl_domain::{DeploymentId, LifecycleState, OperationId};
 
 use crate::StoreError;
 
+/// SPEC §10, ADR 0014 §2 (#240): the declared router bound, projected from
+/// the pinned revision without re-resolving engine settings or reading a host.
+/// The field already exists in older snapshots; absence keeps the role's default.
+pub(crate) fn request_limit(
+    conn: &rusqlite::Connection,
+    deployment: &str,
+) -> rusqlite::Result<Option<usize>> {
+    let declared: Option<Option<u32>> = conn
+        .prepare_cached(
+            "SELECT json_extract(e.effective_json,'$.engine_config.common.max_concurrent_requests')
+             FROM deployments d LEFT JOIN effective_revisions e
+               ON e.deployment_id=d.id AND e.revision=d.revision WHERE d.id=?1",
+        )?
+        .query_row([deployment], |row| row.get(0))
+        .optional()?;
+    Ok(declared.flatten().map(|count| count as usize))
+}
+
 /// A request to accept (admit) a new deployment into the store.
 pub struct AcceptDeployment {
     pub id: DeploymentId,
@@ -844,6 +862,16 @@ impl crate::Store {
             .query_row([deployment_id], |row| row.get(0))
             .optional()?;
         api.map(api_column).transpose()
+    }
+
+    /// SPEC §10 (#240): this deployment's declared in-flight bound, or
+    /// `None` when undeclared. Host-fixed engine arguments and sampled running
+    /// limits are not deployment admission policy (ADR 0014 §§1–2).
+    pub fn deployment_request_limit(
+        &self,
+        deployment: &str,
+    ) -> Result<Option<usize>, StoreError> {
+        Ok(request_limit(&self.conn, deployment)?)
     }
 
     /// Alias resolution: route_model_id → the deployment serving it (no

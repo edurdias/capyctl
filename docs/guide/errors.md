@@ -217,14 +217,14 @@ The inference endpoint answers HTTP errors with a JSON body holding `code` and
   example llama.cpp refusing an input longer than its batch; the message is
   the engine's and `retryable` is `false`. On a stream it arrives as an error
   event. The request is not sent to another instance, and it counts against
-  the model's 32 running requests until the engine reports it is idle.
+  the model's configured running-request bound until the engine reports it is idle.
 - `engine_error` (500) with the message `backend completion unverified`:
   CapyCTL could not tell what the engine did with the request (the connection
   failed, or the answer was cut short or unreadable). The request stays
   counted until CapyCTL has evidence that it ended, so many of these in a row
   can fill the model's running requests (`429 queue_full`). Requests cut
   before the engine answered them fill those places the same way until the
-  engine's next stop; when they alone fill all 32, CapyCTL restarts the
+  engine's next stop; when they alone fill the configured bound, CapyCTL restarts the
   instance instead ([When a request is cut short](requests.md#when-a-request-is-cut-short)),
   but not while an unverified request is among them.
   An embedding answer that fails CapyCTL's checks after part of it was sent

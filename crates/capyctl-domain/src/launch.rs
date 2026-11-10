@@ -10,11 +10,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Owner decision 2026-10-02: the requests CapyCTL keeps in flight per
-/// deployment (the router's bound), and so the sequences vLLM is started for
-/// (`--max-num-seqs`) unless the deployment sets `max_concurrent_requests` or
-/// the installation's host-fixed arguments set it. One constant, so the
-/// router's bound and the engine's cannot drift apart.
+/// SPEC §10 (#240), owner decision 2026-10-02: the default requests CapyCTL
+/// keeps in flight per deployment when `engine_config.max_concurrent_requests`
+/// is unset. A declared count overrides this bound for every inference API.
+/// Also vLLM's default `--max-num-seqs` unless the deployment or host-fixed
+/// arguments set it; host-fixed arguments do not change router admission.
 pub const MAX_REQUESTS_PER_DEPLOYMENT: u32 = 32;
 
 /// ADR 0023 §4 (amended 2026-10-03, owner decision): the requests TensorFold

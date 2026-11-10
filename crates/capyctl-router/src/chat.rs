@@ -244,6 +244,19 @@ fn enter_queue(
         })
 }
 
+/// SPEC §10, ADR 0014 §2 (#240): every inference API and its durable lease
+/// use the deployment's declared bound, not a sampled engine running limit.
+pub(crate) fn request_limit(
+    deps: &RouterDeps,
+    deployment: &str,
+) -> Result<usize, (StatusCode, Json<serde_json::Value>)> {
+    Ok(deps
+        .controller
+        .deployment_request_limit(deployment)
+        .map_err(map_controller)?
+        .unwrap_or(deps.limits.max_requests_per_deployment))
+}
+
 /// SPEC §10 steps 1–2 and T19: resolve the route, refuse an `endpoint` the
 /// deployment does not answer (ADR 0030 §2), wait for the deployment to be
 /// servable, then take one of its in-flight slots. A request that finds the
@@ -274,7 +287,7 @@ pub async fn admit_timed(
         Resolution::Now(view) => (None, Some(view)),
         Resolution::Waited(ticket, queue_wait) => (Some((ticket, *queue_wait)), None),
     };
-    let max = deps.limits.max_requests_per_deployment;
+    let max = request_limit(deps, &deployment_id)?;
     if let Some(guard) = deps.inflight.try_guard_arc(&deployment_id, max) {
         // ADR 0037 §3: a waiting request's queue wait ends with its slot.
         if let Some((_, mut queue_wait)) = ticket {

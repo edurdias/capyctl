@@ -27,6 +27,7 @@ struct Authority {
     activations: AtomicUsize,
     endpoint: String,
     leases: Mutex<Vec<Option<LeaseEnd>>>,
+    request_limit: Mutex<Option<usize>>,
     /// ADR 0030 §3: an engine whose activation is proven by the fixed
     /// decision probe, as an adapter's Initialize proves it; `None` is ready
     /// on activation.
@@ -80,6 +81,9 @@ impl capyctl_controller::LifecyclePort for Authority {
         assert_eq!(deployment, DEPLOYMENT);
         Ok(self.api)
     }
+    fn deployment_request_limit(&self, _deployment: &str) -> Result<Option<usize>, LifecycleFault> {
+        Ok(*self.request_limit.lock().unwrap())
+    }
     fn get_deployment(
         &self,
         id: &str,
@@ -122,6 +126,9 @@ impl capyctl_controller::LifecyclePort for Authority {
             self.ready.load(Ordering::SeqCst),
             "SPEC §10: nothing is dispatched before the deployment is READY"
         );
+        if let Some(limit) = *self.request_limit.lock().unwrap() {
+            assert_eq!(_max, limit, "the durable lease uses the admission bound");
+        }
         let mut leases = self.leases.lock().unwrap();
         leases.push(None);
         Ok(Some(RequestLease::unrecorded(
@@ -314,6 +321,7 @@ fn stack(api: DeploymentApi, endpoint: &str) -> (Arc<Authority>, RouterDeps, axu
         activations: AtomicUsize::new(0),
         endpoint: endpoint.into(),
         leases: Mutex::new(Vec::new()),
+        request_limit: Mutex::new(None),
         fake: None,
     });
     let port = authority.clone() as Arc<dyn capyctl_controller::LifecyclePort>;
@@ -333,6 +341,52 @@ fn stack(api: DeploymentApi, endpoint: &str) -> (Arc<Authority>, RouterDeps, axu
     (authority, deps, router)
 }
 
+// T19 T43 (SPEC §10, ADR 0030 §2, #240): decision admission and whole-
+// deployment lease grants use the declared bound, including counts above 32.
+#[tokio::test]
+async fn decisions_use_the_declared_concurrency_for_admission_and_leases() {
+    use capyctl_router::balance::Plan;
+    use capyctl_router::endpoint::Endpoint;
+    use capyctl_router::request_id::RequestIds;
+    use capyctl_router::timing::RequestTiming;
+
+    for limit in [2, 48] {
+        let (authority, deps, router) = stack(DeploymentApi::Decisions, "http://127.0.0.1:9");
+        authority.ready.store(true, Ordering::SeqCst);
+        *authority.request_limit.lock().unwrap() = Some(limit);
+        let mut waiting = deps.inflight.waiting.limits();
+        waiting.max_pending_per_deployment = 0;
+        deps.inflight.waiting.set_limits(waiting);
+        let mut held = Vec::new();
+        for _ in 0..limit {
+            let ids = Arc::new(RequestIds::untracked());
+            let received = tokio::time::Instant::now();
+            let (deployment, guard, view) = capyctl_router::chat::admit_timed(
+                &deps,
+                Endpoint::Decisions,
+                ROUTE,
+                1,
+                received,
+                &mut RequestTiming::untracked(),
+                &ids,
+            )
+            .await
+            .unwrap();
+            let mut plan =
+                Plan::new(&deps, &deployment, view, ids, received + Duration::from_secs(5))
+                    .unwrap();
+            held.push((guard, plan.next().await.unwrap()));
+        }
+        let (status, body) = decide(&router, &decision_body()).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert_eq!(body["code"], "queue_full");
+        for (guard, attempt) in held {
+            assert!(attempt.settle(LeaseEnd::NotAccepted).await);
+            drop(guard);
+        }
+    }
+}
+
 // T43 (ADR 0030 §§2-3): a decisions deployment on the Fake engine becomes
 // ready on its fixed decision (never a chat request) and answers
 // `POST /v1/systemone` through the router, its lease closed completed.
@@ -345,6 +399,7 @@ async fn a_fake_decision_model_becomes_ready_and_answers_through_the_router() {
         activations: AtomicUsize::new(0),
         endpoint: "http://127.0.0.1:9".into(),
         leases: Mutex::new(Vec::new()),
+        request_limit: Mutex::new(None),
         fake: Some(fake.clone()),
     });
     let port = authority.clone() as Arc<dyn capyctl_controller::LifecyclePort>;

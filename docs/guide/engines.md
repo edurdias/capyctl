@@ -831,7 +831,7 @@ CapyCTL keeps, as for every engine:
 - **The port.** `{host}` and `{port}` give the engine a private loopback
   port; CapyCTL's endpoint is the only way to it from the network.
 - **Requests.** Lookup by model name, your API key, waiting, starting on
-  demand, the 32 running requests per deployment and fairness between models.
+  demand, the running-request bound per deployment (32 when unset) and fairness between models.
   A request has the same shape as for any engine: chat completions,
   CapyCTL's decision request ([Decision requests](requests.md#decision-requests))
   or an embedding request ([Embedding requests](requests.md#embedding-requests)).

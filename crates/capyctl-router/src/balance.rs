@@ -589,6 +589,8 @@ pub struct Plan {
     /// SPEC §10: the request's queue deadline (activation included), which
     /// also bounds waiting for a restart (ADR 0032 §7).
     deadline: tokio::time::Instant,
+    /// SPEC §10 (#240): the same deployment policy used for admission.
+    request_limit: usize,
 }
 
 /// Why an offer produced no attempt.
@@ -631,6 +633,7 @@ impl Plan {
             ids,
             pending: Vec::new(),
             deadline,
+            request_limit: crate::chat::request_limit(deps, deployment)?,
         };
         plan.set_route(view)?;
         Ok(plan)
@@ -769,7 +772,7 @@ impl Plan {
                 };
                 let lease = match deps
                     .controller
-                    .open_request_lease(&deployment, deps.limits.max_requests_per_deployment)
+                    .open_request_lease(&deployment, self.request_limit)
                     .await
                 {
                     Ok(lease) => lease,
@@ -842,7 +845,7 @@ impl Plan {
                         .open_instance_lease(
                             &deployment,
                             candidate.generation,
-                            deps.limits.max_requests_per_deployment,
+                            self.request_limit,
                         )
                         .await
                     {

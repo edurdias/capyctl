@@ -172,7 +172,8 @@ host. Decision requests are not covered: SGLang's decision endpoint takes no
 request ID.
 
 Requests that wait for the engine's next stop can add up. When they are the
-only requests a model holds and fill its 32 places, CapyCTL restarts the
+only requests a model holds and fill its configured running-request bound,
+CapyCTL restarts the
 instance holding them instead of answering new requests `429 queue_full`:
 the restart's stop settles them, the journal records
 `instance_restarted_for_held_requests` with the number of requests it
@@ -523,14 +524,14 @@ An embedding request is short and bounded, so a cut one is not stopped. If
 your client hangs up, or the request runs past its deadline, CapyCTL keeps
 the engine connection open, lets the engine finish, and reads and checks the
 rest of the answer without sending it anywhere. The request counts against
-its model's memory and its 32 places until then, and is finished as soon as
+its model's memory and running-request bound until then, and is finished as soon as
 a complete answer has been read. If the engine answers with a complete error
 instead, the request is finished once the engine next reports itself idle.
 Only a cut request whose answer never
 completes (the engine closes the connection, the answer is malformed, or the
 instance stops first) waits for the instance's next stop, as described in
 [When a request is cut short](#when-a-request-is-cut-short), including the
-restart when such requests fill the model's 32 places. CapyCTL never sends
+restart when such requests fill the model's running-request bound. CapyCTL never sends
 its own request ID to the engine for an embedding request, on any engine.
 
 ## Request IDs and metrics

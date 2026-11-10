@@ -724,6 +724,9 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         controller: controller.clone(),
         forwards: Arc::new(capyctl_router::forwarders::LiveForwarders::new(controller)),
         limits: capyctl_router::QueueLimits {
+            // SPEC §10 (#240), ADR 0017: only the undeclared-setting default;
+            // configured bounds come from the server's durable revision,
+            // without sending an older host a new protocol field.
             max_requests_per_deployment: capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT
                 as usize,
             max_buffered_bytes_total: 64 * 1024 * 1024,
@@ -1881,5 +1884,47 @@ mod ledger_tests {
             owned.store().request_ledger_sync(),
             capyctl_store::RequestLedgerSync::Full
         );
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    // T19 T34 (SPEC §§10, 13.1, ADR 0017 §§2–3, #240): the server owns the
+    // router's bound. Declaring it uses the existing deployment_config field;
+    // it must not need a new capability or exclude an N-1 host.
+    #[test]
+    fn deployment_concurrency_preserves_the_0_1_host_protocol() {
+        use capyctl_protocol::{capabilities, pb, version};
+        assert_eq!(
+            version::assess("0.1.11", "0.2.0").state,
+            version::Compatibility::UpgradeRecommended
+        );
+        let launch = |count: Option<u32>| {
+            let mut deployment = serde_json::json!({
+                "schema_version": 1, "kind": "deployment", "name": "bounded",
+                "model": {"source": {"type": "local", "path": "/models/bounded"}},
+                "engine": {"type": "vllm"}
+            });
+            if let Some(count) = count {
+                deployment["engine_config"] = serde_json::json!({
+                    "max_concurrent_requests": count
+                });
+            }
+            pb::ExecuteMember {
+                action: Some(pb::execute_member::Action::LaunchSingle(pb::SingleLaunchPlan {
+                    deployment_config: deployment.to_string(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }
+        };
+        assert!(capabilities::required(&launch(None)).is_empty());
+        for count in [2, 48] {
+            assert_eq!(
+                capabilities::required(&launch(Some(count))),
+                capabilities::required(&launch(None)),
+                "the pre-existing engine setting adds no wire feature"
+            );
+        }
     }
 }

@@ -19,6 +19,7 @@ fn deployment() -> DeploymentCapacity {
     DeploymentCapacity {
         id: "dep-1".into(),
         name: "chat".into(),
+        request_limit: None,
         max_running: Some(MaxRunning {
             count: Some(32),
             source: MaxRunningSource::Default,
@@ -154,6 +155,35 @@ fn the_load_read_reports_fresh_then_stale_then_no_sample() {
         instance["max_running"],
         json!({"count": 32, "source": "default"})
     );
+}
+
+// T19 (SPEC §§10, 17, #240): the router's bound follows the deployment,
+// never the engine's observed or fitted parallelism.
+#[test]
+fn router_capacity_uses_declared_concurrency_and_not_engine_running_limits() {
+    let inflight = InFlight::default();
+    let loads = LoadTable::new();
+    loads
+        .accept(
+            "h1",
+            LoadReport {
+                host_id: "h1".into(),
+                samples: vec![sample(7, Some(99))],
+                lmcache: Vec::new(),
+            },
+            NOW,
+        )
+        .unwrap();
+    for (declared, expected) in [(None, 32), (Some(2), 2), (Some(48), 48)] {
+        let mut deployment = deployment();
+        deployment.request_limit = declared;
+        deployment.max_running.as_mut().unwrap().count = Some(8);
+        let report = capacity_report(&[deployment], &inflight, 32, Some(&loads), NOW);
+        let deployment = &report["deployments"][0];
+        assert_eq!(deployment["router"]["in_flight_limit"], expected);
+        assert_eq!(deployment["max_running"]["count"], 8);
+        assert_eq!(deployment["instances"][0]["max_running"]["count"], 99);
+    }
 }
 
 // SPEC §10, §17: an engine scrape that failed is unknown load (`engine: null`),

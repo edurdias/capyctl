@@ -245,6 +245,9 @@ pub struct DeploymentCapacity {
     pub name: String,
     /// `None` when the current revision does not decode.
     pub max_running: Option<capyctl_config::context_fit::MaxRunning>,
+    /// SPEC §10 (#240): the current revision's declared router bound.
+    /// `None` keeps the router default, independently of engine running limits.
+    pub request_limit: Option<usize>,
     pub instances: Vec<InstanceCapacity>,
 }
 
@@ -280,6 +283,7 @@ impl Store {
                         id: r.get(0)?,
                         name: r.get(1)?,
                         max_running: None,
+                        request_limit: None,
                         instances: Vec::new(),
                     })
                 },
@@ -314,6 +318,7 @@ impl Store {
             }
         }
         for entry in &mut deployments {
+            entry.request_limit = crate::deployments::request_limit(&tx, &entry.id)?;
             entry.max_running = current_effective(&tx, &entry.id)?.map(|(effective, remote)| {
                 let fit = if remote {
                     capyctl_config::context_fit::fit_on_remote_host(&effective)

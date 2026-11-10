@@ -220,6 +220,21 @@ deployment that does not park gets no loader choice from
 CapyCTL either way. See
 [Add an engine](../guide/engines.md#vllm-weight-loading-while-parking).
 
+`engine_config.max_concurrent_requests` also sets the router's total
+in-flight request bound **per deployment**, shared by all its instances, for
+chat, decisions and embeddings. When unset, that router bound is 32, even
+when the engine's default parallelism is smaller. The declared count applies
+both below and above 32, to standalone and remote deployments. Host-fixed
+engine arguments and reported engine load do not change this admission bound;
+the engine can queue requests within it. Additional requests wait under the
+host's `resource_policy.queue` limits, or receive `429 queue_full` when no
+waiting is allowed. The management load read shows this as
+`router.in_flight_limit`. A remote host's existing ingress safeguard still
+allows at most 64 concurrent forwards in total across deployments.
+The server owns the deployment bound, so this setting needs no new host
+capability: a 0.2 server can use it with a supported 0.1 host under the
+[version-skew policy](../design/adr/0017-version-skew-and-capability-gating.md).
+
 `engine_config.cuda_graphs` keeps its boolean behavior: `false` disables
 graphs (both prefill and decode for SGLang); `true` or omission leaves the
 engine's native graph policy in place. SGLang also accepts
@@ -787,7 +802,7 @@ capyctl start server --set shutdown.drain_timeout=90s
 # A host that reports its engine load every 2 seconds, from its unit file.
 CAPYCTL_SET__LOAD_REPORT_INTERVAL=2s
 
-# A host where no request waits: one beyond a model's 32 running requests, or
+# A host where no request waits: one beyond a model's running-request bound, or
 # for a model not loaded, is refused 429 at once (see the parking guide).
 capyctl start host --set resource_policy.queue.max_pending_per_deployment=0
 

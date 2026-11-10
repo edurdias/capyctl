@@ -130,6 +130,17 @@ pub trait LifecyclePort: Send + Sync {
     /// router refuses the other endpoint for it before any activation.
     fn deployment_api(&self, deployment: &str) -> Result<DeploymentApi, LifecycleFault>;
 
+    /// SPEC §10, ADR 0014 §2 (#240): the deployment's declared in-flight
+    /// bound. `None` keeps the router's default for an undeclared setting or
+    /// an authority without managed configuration. This is durable policy,
+    /// never an engine-load observation.
+    fn deployment_request_limit(
+        &self,
+        _deployment: &str,
+    ) -> Result<Option<usize>, LifecycleFault> {
+        Ok(None)
+    }
+
     /// One deployment's current record.
     fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, LifecycleFault>;
 

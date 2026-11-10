@@ -957,6 +957,16 @@ impl LifecyclePort for CoordinatorLifecycle {
             .ok_or_else(|| LifecycleFault::NotFound(deployment.to_owned()))
     }
 
+    fn deployment_request_limit(
+        &self,
+        deployment: &str,
+    ) -> Result<Option<usize>, LifecycleFault> {
+        // ADR 0017 §§2–3: admission is server-owned; an N-1 host needs no
+        // new field or capability to serve this pre-existing engine setting.
+        self.commands
+            .read(|store| store.deployment_request_limit(deployment))
+    }
+
     fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, LifecycleFault> {
         self.commands.read(|store| store.get_deployment(id))
     }
@@ -1225,9 +1235,9 @@ impl LifecyclePort for CoordinatorLifecycle {
         self.leases.answer_cut(lease_id).await
     }
 
-    /// ADR 0032 §7: against the deployment limit the router grants under
-    /// (`MAX_REQUESTS_PER_DEPLOYMENT`). Restarting also when every instance
-    /// holding the requests is already stopping.
+    /// ADR 0032 §7, SPEC §10 (#240): restart against the deployment's
+    /// declared limit, or the default when undeclared, just as the router
+    /// grants. Also joins instances already stopping.
     async fn restart_for_held_requests(
         &self,
         deployment_id: &str,
@@ -1235,7 +1245,8 @@ impl LifecyclePort for CoordinatorLifecycle {
         use capyctl_store::ordinary_lifecycle::held_restart::HeldRestartDecision;
         let decision = self.commands.restart_for_held_requests(
             deployment_id,
-            capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT as usize,
+            self.deployment_request_limit(deployment_id)?
+                .unwrap_or(capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT as usize),
         )?;
         Ok(match decision {
             HeldRestartDecision::NotHeld => crate::port::HeldRestart::NotHeld,

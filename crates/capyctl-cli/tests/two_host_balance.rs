@@ -79,6 +79,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
     def do_POST(self):
         if not self.keyed(): return
+        if self.path == "/v1/embeddings":
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+            inputs = body.get("input")
+            count = len(inputs) if isinstance(inputs, list) and inputs and not isinstance(inputs[0], int) else 1
+            with open(os.path.join(here, "accepted.log"), "a") as f:
+                f.write("1\n")
+            while read("hold", "0") == "1":
+                time.sleep(0.01)
+            self.send_json({"object": "list", "model": served,
+                            "data": [{"object": "embedding", "index": i, "embedding": [0.5, -0.25, 0.125]} for i in range(count)],
+                            "usage": {"prompt_tokens": count, "total_tokens": count}})
+            return
         if self.path != "/v1/chat/completions":
             self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers(); return
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
@@ -87,6 +99,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         answer = "fake-vllm-answer from " + host
         with open(os.path.join(here, "accepted.log"), "a") as f:
             f.write("1\n")
+        while read("hold", "0") == "1":
+            time.sleep(0.01)
         time.sleep(float(read("delay", "0")))
         with open(os.path.join(here, "served.log"), "a") as f:
             f.write("1\n")
@@ -567,6 +581,10 @@ impl Cluster {
     /// Deploy one model with two instances spread over both hosts and return
     /// its deployment id.
     fn deploy_two(&self) -> String {
+        self.deploy_two_with("chat", None)
+    }
+
+    fn deploy_two_with(&self, api: &str, limit: Option<usize>) -> String {
         let golden: Value = serde_json::from_str(include_str!(
             "../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
         ))
@@ -587,6 +605,12 @@ impl Cluster {
         });
         deployment["residency"] = json!("restart_only");
         deployment["engine_config"] = json!({"memory": {"kv_cache": "64MiB"}});
+        if let Some(limit) = limit {
+            deployment["engine_config"]["max_concurrent_requests"] = json!(limit);
+        }
+        if api != "chat" {
+            deployment["api"] = json!(api);
+        }
         deployment["request_deadline"] = json!("900s");
         deployment["devices"] = json!([{"sharing": "shared"}]);
         for (phase, bytes) in [
@@ -754,6 +778,108 @@ async fn the_router_balances_two_instances_and_fails_over_on_host_loss() {
         role.stop();
     }
     server.stop();
+}
+
+// T19 T47 (SPEC §10, ADR 0014 §2, ADR 0036 §3, #240): both remote ingress
+// lanes share one deployment bound. The router must use all 48 configured chat
+// slots, and an embeddings deployment declaring two must refuse a third.
+async fn remote_concurrency(api: &str, limit: usize) {
+    let cluster = Cluster::new();
+    for host in &cluster.hosts {
+        let mut document: Value =
+            capyctl_config::parse_document(&std::fs::read_to_string(&host.config).unwrap())
+                .unwrap();
+        document["resource_policy"]["queue"]["max_pending_per_deployment"] = json!(0);
+        std::fs::write(&host.config, document.to_string()).unwrap();
+    }
+    let (server, roles) = cluster.boot();
+    let id = cluster.deploy_two_with(api, Some(limit));
+    cluster.ready_instances(&id, 2);
+    let configuration: Value = capyctl_config::parse_document(
+        &std::fs::read_to_string(&cluster.server_config).unwrap(),
+    )
+    .unwrap();
+    let management = configuration["listeners"]["management"]["bind"]
+        .as_str()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let load: Value = reqwest::Client::new()
+            .get(format!("http://{management}/management/v1/metrics/load?deployment={id}"))
+            .bearer_auth(cluster.credential("admin_token"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let router = &load["deployments"][0]["router"];
+        if router["waiting_limit"] == 0 {
+            assert_eq!(router["in_flight_limit"], limit);
+            break;
+        }
+        assert!(Instant::now() < deadline, "queue policy not published: {load}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let before: usize = cluster.hosts.iter().map(HostRole::accepted).sum();
+    for host in &cluster.hosts {
+        host.set("hold", "1");
+    }
+    let request = || {
+        let inference = cluster.inference.clone();
+        let key = cluster.api_key();
+        let (path, body) = if api == "embeddings" {
+            ("/v1/embeddings", json!({"model": "toy", "input": "hello"}))
+        } else {
+            ("/v1/chat/completions", json!({"model": "toy", "messages": []}))
+        };
+        async move {
+            let response = reqwest::Client::new()
+                .post(format!("http://{inference}{path}"))
+                .bearer_auth(key)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            (response.status().as_u16(), response.text().await.unwrap())
+        }
+    };
+    let pending: Vec<_> = (0..limit).map(|_| tokio::spawn(request())).collect();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while cluster.hosts.iter().map(HostRole::accepted).sum::<usize>() < before + limit {
+        assert!(Instant::now() < deadline, "not all {limit} configured slots reached an engine");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let refused = tokio::time::timeout(Duration::from_secs(3), request())
+        .await
+        .expect("no waiting: the next request is refused promptly");
+    assert_eq!(refused.0, 429, "{}", refused.1);
+    assert_eq!(serde_json::from_str::<Value>(&refused.1).unwrap()["code"], "queue_full");
+    for host in &cluster.hosts {
+        host.set("hold", "0");
+    }
+    for pending in pending {
+        let (status, body) = pending.await.unwrap();
+        assert_eq!(status, 200, "{body}");
+    }
+    for role in roles.into_iter().flatten() {
+        role.stop();
+    }
+    server.stop();
+}
+
+// T19 (SPEC §10, ADR 0014 §2): remote chat is not capped at 32.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_chat_uses_all_48_configured_slots() {
+    remote_concurrency("chat", 48).await;
+}
+
+// T19 T47 (SPEC §10, ADR 0036 §3): remote embeddings shares this bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_embeddings_obeys_its_two_slot_bound() {
+    remote_concurrency("embeddings", 2).await;
 }
 
 /// Lines of a role's log that contain `needle`.

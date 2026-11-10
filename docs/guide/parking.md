@@ -234,8 +234,8 @@ requests arrive for another, this is what happens:
    (`residency: restart_only`, TensorFold, or no room for a parked copy).
    The waiting model wakes or starts.
 5. All its waiting requests are released together and run at the same time,
-   up to 32 per model, not one by one in arrival order. Requests beyond 32
-   wait for a free slot, first come first served.
+   up to `engine_config.max_concurrent_requests` per model (32 when unset).
+   Requests beyond that bound wait for a free slot, first come first served.
 
 When several models wait, the one whose requests have waited longest goes
 next; a model with waiting requests is never the one parked to make room.
@@ -273,7 +273,7 @@ next switch.
 | Waiting requests per model | `host.resource_policy.queue.max_pending_per_deployment`, default 64, 0 to 4096 | host: `resource_policy.queue.max_pending_per_deployment`, default 64, 0 to 4096 |
 | Waiting requests in total | `host.resource_policy.queue.max_pending_total`, default 256 | host: `resource_policy.queue.max_pending_total`, default 256 |
 | Bodies of waiting requests, in total | `host.resource_policy.queue.max_buffered_bytes_total`, default 64 MiB | host: `resource_policy.queue.max_buffered_bytes_total`, default 64 MiB |
-| Requests running at once per model | 32, fixed | 32, fixed |
+| Requests running at once per model | `engine_config.max_concurrent_requests`, 32 when unset | `engine_config.max_concurrent_requests`, 32 when unset |
 
 The standalone bounds have the host ranges. A reply's opening chunk, which
 only names the assistant role, is not output: TensorFold sends it before it
@@ -306,8 +306,8 @@ Each is an HTTP error with a JSON body holding `code`, `message` and
 | 503 | `unavailable` | `dispatch to deployment <deployment id> is closed; retry shortly` | The model is finishing its work before it parks. |
 | 429 | `queue_full` | `too many requests are waiting for deployment <deployment id>` | A waiting-request limit is reached. |
 | 429 | `queue_full` | `waiting requests exceed the buffered-bytes bound` | The waiting bodies would pass the byte limit. |
-| 429 | `queue_full` | `deployment <deployment id> stayed at its in-flight bound for the queue deadline` | 32 requests kept running for the whole request deadline. |
-| 429 | `queue_full` | `deployment <deployment id> is at its in-flight bound and lets no request wait; retry shortly` | 32 requests are running and the waiting limit per model is 0. |
+| 429 | `queue_full` | `deployment <deployment id> stayed at its in-flight bound for the queue deadline` | The configured running-request bound stayed full for the whole request deadline. |
+| 429 | `queue_full` | `deployment <deployment id> is at its in-flight bound and lets no request wait; retry shortly` | The configured running-request bound is full and the waiting limit per model is 0. |
 | 429 | `queue_full` | `deployment <deployment id> is not servable now and lets no request wait; retry shortly` | The model is parked, stopped or switching and the waiting limit per model is 0. Its wake or start has been asked for. A model an operator stopped, or one whose activation is explicit, is answered 409 instead (`deployment_stopped`, `deployment_inactive`). |
 
 Every 429 carries `Retry-After: 1`.
@@ -316,14 +316,14 @@ Every 429 carries `Retry-After: 1`.
 
 A client that balances across several servers may rather be refused at once
 than wait: set the waiting limit per model to 0. A request then never waits in
-CapyCTL: one beyond the 32 running requests, or one for a model that is not
+CapyCTL: one beyond the model's running-request bound, or one for a model that is not
 loaded, is answered 429 `queue_full` with `Retry-After` straight away. A
 request for a model that is parked or stopped still wakes or starts it, so a
 retry after the hint finds it loaded; a model an operator stopped, or one
 whose activation is explicit, is answered 409 instead, since a retry would
-not help. The 32 running requests per model stay
-as they are; requests above what the engine itself runs at once wait in the
-engine, as before (its waiting count is in the load read below).
+not help. The running-request bound follows `engine_config.max_concurrent_requests`
+(32 when unset); requests above what the engine itself runs at once wait in the
+engine (its waiting count is in the load read below).
 
 ```yaml
 # host.yaml (standalone: under host:)
@@ -375,8 +375,8 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
 ```
 
 - `router`: requests CapyCTL is forwarding to the model now and its bound
-  (32), and requests waiting in CapyCTL for it (to load, or for one of the
-  32) and the waiting limit.
+  (`engine_config.max_concurrent_requests`, 32 when unset), and requests waiting
+  in CapyCTL for it (to load, or for a free place) and the waiting limit.
 - `max_running`: how many requests the engine runs at once. Per instance
   `source: engine` is the engine's own figure (SGLang reports it); otherwise it
   is what CapyCTL passed or expects, by source: `declared`

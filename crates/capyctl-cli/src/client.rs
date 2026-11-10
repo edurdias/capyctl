@@ -2169,6 +2169,7 @@ mod tests {
                 id: "dep-1".into(),
                 name: "chat".into(),
                 max_running: None,
+                request_limit: None,
                 instances: vec![
                     capacity(0, 7, "h1"),
                     capacity(1, 8, "h2"),
