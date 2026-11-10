@@ -200,6 +200,7 @@ fn an_engine_that_cannot_serve_decisions_is_refused() {
     for (engine, fingerprint) in [
         ("llamacpp", "0.7.0+abc1234"),
         ("llamacpp", "0.8.1+abc1234"),
+        ("llamacpp", "0.9.0+cd959ba"),
         ("sglang", "0.5.22"),
         ("sglang", "0.5.22.post1"),
         ("sglang", "0.6.0"),

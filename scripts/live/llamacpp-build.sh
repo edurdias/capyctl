@@ -4,6 +4,9 @@
 # or CUDA change).
 #
 #   scripts/live/llamacpp-build.sh [--host a|b] [--dry-run] <step>...
+# Select LLAMACPP_TAG=v0.9.0 and LLAMACPP_CUDA_ARCH=120a-real for RTX PRO 6000;
+# the CUDA architecture defaults to 121a-real for GB10. A known tag is not live
+# qualification or authorization to change an engine installation.
 #
 # Steps (each idempotent; run in this order):
 #   source    clone tag v0.6.0 into ~/llamacpp-v0.6.0 and build llama-server with
@@ -34,6 +37,7 @@ LLAMACPP_VERSION=${LLAMACPP_TAG#v}
 case $LLAMACPP_TAG in
   v0.6.0) LLAMACPP_COMMIT=d812350 ;;
   v0.7.0) LLAMACPP_COMMIT=620d222 ;;
+  v0.9.0) LLAMACPP_COMMIT=cd959ba ;;
   *) echo "llamacpp-build: no approved commit for $LLAMACPP_TAG" >&2; exit 2 ;;
 esac
 LLAMACPP_PREBUILT=b11429

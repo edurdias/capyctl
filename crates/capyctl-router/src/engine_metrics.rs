@@ -547,7 +547,7 @@ mod tests {
         }
     }
 
-    /// llama.cpp v0.6.0 `server_slot_stats::to_json` as one answer carries it.
+    /// llama.cpp v0.9.0 `server_slot_stats::to_json` (unchanged since v0.6.0).
     fn llamacpp_timings(predicted_per_second: f64) -> Value {
         json!({"cache_n": 8, "prompt_n": 4, "prompt_ms": 12.5,
             "prompt_per_token_ms": 3.125, "prompt_per_second": 320.0,
@@ -587,7 +587,7 @@ mod tests {
         let engine = json!({
             "choices": [{"finish_reason": "stop", "index": 0,
                 "message": {"role": "assistant", "content": "hi"}}],
-            "created": 1, "model": "m", "system_fingerprint": "b1-abc",
+            "created": 1, "model": "m", "system_fingerprint": "b12110-cd959ba",
             "object": "chat.completion", "usage": llamacpp_usage(), "id": "chatcmpl-1",
             "timings": llamacpp_timings(60.0)
         });
@@ -630,7 +630,7 @@ mod tests {
 
     fn llamacpp_chunk(delta: Value, finish: Value) -> Value {
         json!({"choices": [{"finish_reason": finish, "index": 0, "delta": delta}],
-            "created": 1, "id": "chatcmpl-1", "model": "m", "system_fingerprint": "b1-abc",
+            "created": 1, "id": "chatcmpl-1", "model": "m", "system_fingerprint": "b12110-cd959ba",
             "object": "chat.completion.chunk"})
     }
 

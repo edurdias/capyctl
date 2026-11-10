@@ -420,9 +420,10 @@ are the restart. LMCache is off, as on 0.6.
 
 ## llama.cpp
 
-CapyCTL runs llama.cpp's `llama-server` from v0.6.0, one GGUF model per
+CapyCTL runs llama.cpp's `llama-server` from v0.6.0 through the newest known
+release, v0.9.0, one GGUF model per
 deployment. llama.cpp is a single binary, not a Python environment: build it
-([Install an engine](install-engines.md#llamacpp-v060)) and name the binary, or
+([Install an engine](install-engines.md#llamacpp-v090)) and name the binary, or
 the directory that holds it:
 
 ```bash
@@ -456,6 +457,15 @@ the engine's configuration directory at an empty one of its own.
 
 Every llama.cpp build lists as `CUSTOM yes` for now. A build of v0.6.0 runs;
 `custom` only says this release has not finished checking llama.cpp.
+The newest known release is v0.9.0 (`cd959ba`); v0.7.0 (`620d222`) is also
+recognized. Neither recognition nor CPU tests qualify a build.
+
+For `api: decisions`, llama.cpp v0.7.0 or newer is required. MiniCPM OCR
+decision models are unsupported: their two-image binary OCR contract is not
+compatible with CapyCTL's fixed text readiness and wake probe. Do not deploy
+that family with `api: decisions`; ordinary choice models retain the existing
+probe and still need live qualification. Tunnel options `--connect` and
+`--connect-code`, and router option `--models-memory-margin`, are refused.
 
 ### A llama.cpp deployment
 

@@ -114,6 +114,31 @@ fn the_reserved_block_is_complete_and_in_order() {
 // is refused at render in every spelling, and so is `--name=value`.
 #[test]
 fn reserved_pass_through_options_are_refused_at_render() {
+    // T42 T14: v0.9.0 tunnel/router controls cannot cross either policy boundary.
+    for name in ["--connect", "--connect-code", "--models-memory-margin"] {
+        for spelling in [
+            name.to_owned(),
+            format!("--{}", name.trim_start_matches("--").replace('-', "_")),
+        ] {
+            for token in [spelling.clone(), format!("{spelling}=1")] {
+                for fixed in [false, true] {
+                    let mut input = plan();
+                    if fixed {
+                        input.engine_args = vec![token.clone()];
+                    } else {
+                        input.extra_args = vec![token.clone()];
+                    }
+                    assert!(render_command(&input).is_err(), "{token}");
+                }
+                let mut argv = strings(BLOCK);
+                argv.push(token.clone());
+                assert!(
+                    recheck_rendered(&argv, DeploymentApi::Chat).is_err(),
+                    "{token}"
+                );
+            }
+        }
+    }
     for (fixed, extra) in [
         (&[][..], &["--n_gpu_layers", "20"][..]),
         (&["--ctx-size", "4096"], &[]),

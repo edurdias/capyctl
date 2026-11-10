@@ -23,7 +23,11 @@ pub const SYSTEM_CONFIG_FILE: &str = "etc/llama.cpp/config.ini";
 /// ADR 0029 §2: each release's tag commit, so a build of the tag configured
 /// without `-DLLAMA_BUILD_IS_DEV=OFF` (which reports `<v>-dev`) counts as that
 /// release.
-pub const RELEASE_COMMITS: &[(&str, &str)] = &[("0.6.0", "d812350")];
+pub const RELEASE_COMMITS: &[(&str, &str)] = &[
+    ("0.6.0", "d812350"),
+    ("0.7.0", "620d222"),
+    ("0.9.0", "cd959ba"),
+];
 
 /// Git's shortest abbreviation; a commit compared with a tag's is at least
 /// this long.
@@ -188,6 +192,10 @@ pub const RESERVED_NEVER_RENDERED: &[&[&str]] = &[
     &["--models-preset"],
     &["--models-max"],
     &["--models-autoload", "--no-models-autoload"],
+    &["--models-memory-margin"],
+    // ADR 0029 §6: no secondary listener or tunnel around the loopback boundary.
+    &["--connect"],
+    &["--connect-code"],
     &["--rpc"],
     &["--slot-save-path"],
     &["--cache-idle-slots", "--no-cache-idle-slots"],
