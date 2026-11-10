@@ -120,6 +120,8 @@ fn sglang_reserved_names_match_the_argument_mapper() {
     python.extend(quoted_block(&source, "_RESERVED_DUMP = (", ")"));
     // ADR 0037 §7: the tracing fields, on both sides too.
     python.extend(quoted_block(&source, "_RESERVED_TRACING = (", ")"));
+    // SGLang 0.5.23's external cache linker, reserved where the build defines it.
+    python.extend(quoted_block(&source, "_RESERVED_EXTERNAL_LINKER = (", ")"));
     let python_families = quoted_block(&source, "_RESERVED_FAMILIES = (", ")");
     let rust: BTreeSet<String> = reserved_options(Engine::Sglang, false)
         .iter()
