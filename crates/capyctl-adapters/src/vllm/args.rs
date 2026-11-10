@@ -183,23 +183,32 @@ impl std::fmt::Debug for PlanInputVllm {
     }
 }
 
-/// Discrete GPU design §6 (ADR 0019): the `--gpu-memory-utilization` percent of
-/// a launch on a discrete device, the device request's share of the card's
-/// total rounded up to a whole percent. vLLM checks at start that this share
-/// of the card is free; the planner and the launch check already made that
-/// room. At least 75: vLLM 0.29 with CUDA graphs does not start a 4B model on a
-/// 16 GB card below 0.75 (design §3, observed on the discrete-GPU laptop host).
-/// At most 99: vLLM refuses a whole card.
-pub fn device_utilization_pct(request: i64, device_total: i64) -> u8 {
-    let total = device_total.max(1);
-    let pct = request.max(0).saturating_mul(100).saturating_add(total - 1) / total;
-    pct.clamp(75, 99) as u8
+/// ADR 0019 §3: the floor of a vLLM request derived for a card, and of the
+/// utilization rendered from it: vLLM 0.29 with CUDA graphs did not start a
+/// 4B model on a 16 GB card below `--gpu-memory-utilization 0.75` (observed
+/// on the discrete-GPU laptop host, 2026-09-25; the cause was not recorded).
+/// CapyCTL passes the KV cache as explicit bytes on every launch, so the floor
+/// does not size the KV pool; it guards that start failure. #225: a request
+/// the deployment declares is rendered as it is, without this floor.
+pub const DEVICE_UTILIZATION_FLOOR_PCT: u8 = 75;
+
+/// Discrete GPU design §6 (ADR 0019): round the request's share upward to
+/// ten-billionths of the card. Even an i64-sized card adds less than 1.25 GiB
+/// from rounding, keeping the gate inside the first-start device allowance.
+/// Derived requests retain their percent floor; vLLM refuses a whole card.
+pub fn device_utilization_units(request: i64, device_total: i64, floor_pct: u8) -> u64 {
+    let total = i128::from(device_total.max(1));
+    let share = (i128::from(request.max(0)) * 10_000_000_000 + total - 1) / total;
+    share.clamp(
+        i128::from(floor_pct.clamp(1, 99)) * 100_000_000,
+        9_900_000_000,
+    ) as u64
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct GrantedBudget {
     pub kv_cache_bytes: Option<i64>,
-    pub gpu_utilization_pct: Option<u8>,
+    pub gpu_utilization_units: Option<u64>,
     pub swap_space_bytes: Option<i64>,
 }
 
@@ -274,10 +283,10 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
         }
     }
     // Validate granted budgets are finite and in range.
-    if let Some(pct) = input.granted.gpu_utilization_pct {
-        if pct == 0 || pct > 100 {
+    if let Some(share) = input.granted.gpu_utilization_units {
+        if share == 0 || share > 10_000_000_000 {
             return Err(ArgsError::InvalidBudget(format!(
-                "gpu_utilization_pct {pct}"
+                "gpu_utilization_units {share}"
             )));
         }
     }
@@ -394,11 +403,11 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
     if !headless {
         push(&mut argv, "--port", input.port.to_string());
     }
-    if let Some(pct) = input.granted.gpu_utilization_pct {
+    if let Some(share) = input.granted.gpu_utilization_units {
         push(
             &mut argv,
             "--gpu-memory-utilization",
-            format!("{}.{:02}", pct / 100, pct % 100),
+            format!("{}.{:010}", share / 10_000_000_000, share % 10_000_000_000),
         );
     }
     if let Some(kv) = input.granted.kv_cache_bytes {

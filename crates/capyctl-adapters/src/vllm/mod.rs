@@ -14,9 +14,9 @@ pub use frozen::{
 
 pub use adapter::VllmAdapter;
 pub use args::{
-    device_utilization_pct, fingerprint_of, interpreter_for, redact_text, render_command,
-    ArgsError, GrantedBudget, PlanInputVllm, EXTRA_ARGS_MARKER, RESERVED_FLAGS, USER_ARGS_MARKER,
-    VLLM_ENTRY,
+    device_utilization_units, fingerprint_of, interpreter_for, redact_text, render_command,
+    ArgsError, GrantedBudget, PlanInputVllm, DEVICE_UTILIZATION_FLOOR_PCT, EXTRA_ARGS_MARKER,
+    RESERVED_FLAGS, USER_ARGS_MARKER, VLLM_ENTRY,
 };
 pub use http::{EngineHttp, HttpError, SleepOutcome, StreamChunk, StreamEnd, WakeOutcome, WakeTag};
 pub use initialize::ENGINE_ENV_ALLOWLIST;

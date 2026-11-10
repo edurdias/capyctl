@@ -7,27 +7,27 @@ use async_trait::async_trait;
 impl ChatForward for SglangAdapter {
     async fn forward_chat_stream_async(
         &self,
-        body: &serde_json::Value,
+        body: &crate::request::InferenceRequest,
         sink: &mut dyn crate::traits::ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
         self.forward.stream_async(body, sink).await
     }
     async fn forward_chat(
         &self,
-        body: &serde_json::Value,
-    ) -> Result<serde_json::Value, AdapterError> {
+        body: &crate::request::InferenceRequest,
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         self.forward.collect(body).await
     }
     async fn forward_chat_observed(
         &self,
-        body: &serde_json::Value,
+        body: &crate::request::InferenceRequest,
         observer: &mut dyn crate::traits::ChatSink,
-    ) -> Result<serde_json::Value, AdapterError> {
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         self.forward.collect_observed(body, observer, None).await
     }
     async fn forward_chat_stream(
         &self,
-        body: &serde_json::Value,
+        body: &crate::request::InferenceRequest,
         on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<StreamEnded, AdapterError> {
         self.forward.stream(body, on_chunk).await
@@ -64,7 +64,7 @@ impl ChatForward for SglangAdapter {
     /// (SGLang answers its model path, which never reaches the client).
     async fn forward_embedding(
         &self,
-        body: &serde_json::Value,
+        body: &crate::request::InferenceRequest,
         sink: &mut dyn crate::traits::EmbeddingSink,
     ) -> Result<crate::traits::EmbeddingAnswered, AdapterError> {
         self.forward.embed(body, sink).await

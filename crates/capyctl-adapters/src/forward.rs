@@ -1,10 +1,13 @@
 //! Shared, bounded text-chat transport. Terminal success is not lifecycle or
 //! readiness evidence; cancellation and partial output never prove idle.
+use crate::answer::EngineAnswer;
 use crate::embedding_answer::AnswerParser;
+use crate::request::{splice, InferenceRequest, Members, StrictValue};
 use crate::traits::{
     AdapterError, ChatSink, DeliveryFailed, EmbeddingAnswered, EmbeddingSink, StreamEnded,
 };
 use futures::StreamExt;
+use serde_json::value::RawValue;
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -543,7 +546,10 @@ impl ChatHttp {
     /// The callback path's collection, with the transport's own bounds (60 s
     /// between reads, 300 s overall), for callers that bound nothing
     /// themselves. The router uses [`ChatHttp::collect_observed`] instead.
-    pub(crate) async fn collect(&self, body: &Value) -> Result<Value, AdapterError> {
+    pub(crate) async fn collect(
+        &self,
+        body: &InferenceRequest,
+    ) -> Result<EngineAnswer, AdapterError> {
         tokio::time::timeout(
             Duration::from_secs(300),
             self.collect_observed(body, &mut NoObserver, Some(Duration::from_secs(60))),
@@ -558,25 +564,20 @@ impl ChatHttp {
     /// bound), instead of by a fixed wall-clock cap.
     pub(crate) async fn collect_observed(
         &self,
-        body: &Value,
+        body: &InferenceRequest,
         observer: &mut dyn ChatSink,
         read_idle: Option<Duration>,
-    ) -> Result<Value, AdapterError> {
+    ) -> Result<EngineAnswer, AdapterError> {
         let mut chunks = Vec::new();
-        // SPEC §10 (found live 2026-10-03): vLLM streams usage only when asked;
-        // the collected response must carry it as a non-streaming one does.
-        let mut body = body.clone();
-        if body.is_object() && body.get("stream_options").is_none_or(Value::is_null) {
-            body["stream_options"] = json!({"include_usage": true});
-        }
         let end = self
             .stream_inner(
-                &body,
+                body,
                 &mut Collecting {
                     chunks: &mut chunks,
                     observer,
                 },
                 read_idle,
+                Usage::Requested,
             )
             .await?;
         if end != StreamEnded::Completed {
@@ -584,6 +585,14 @@ impl ChatHttp {
         }
         assemble(chunks)
     }
+}
+
+/// Whether a forwarded stream asks the engine for usage when the caller did
+/// not say: a collected answer must carry it (SPEC §10).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Usage {
+    AsSent,
+    Requested,
 }
 
 /// Discards progress: the self-bounded collection path.
@@ -629,9 +638,9 @@ impl ChatSink for Collecting<'_> {
 /// when the budget passed first. Ordinary forwarding keeps its own bounds.
 pub(crate) async fn startup_probe(
     engine: &(dyn crate::traits::ChatForward + '_),
-    body: &Value,
+    body: &InferenceRequest,
     budget: Duration,
-) -> Option<Result<Value, AdapterError>> {
+) -> Option<Result<EngineAnswer, AdapterError>> {
     tokio::time::timeout(budget, engine.forward_chat_observed(body, &mut NoObserver))
         .await
         .ok()
@@ -686,11 +695,48 @@ pub fn probe_answered(answer: &Value) -> bool {
         })
 }
 
+/// One streamed choice as a collected answer reads it: its delta and finish
+/// reason parsed, its log probabilities kept as the engine's bytes.
+#[derive(serde::Deserialize)]
+struct StreamedChoice<'a> {
+    #[serde(default)]
+    delta: Value,
+    #[serde(default)]
+    finish_reason: Value,
+    #[serde(borrow, default)]
+    logprobs: Option<&'a RawValue>,
+}
+
+/// A streamed choice's `logprobs` object, each token's entry as its bytes.
+#[derive(serde::Deserialize)]
+struct StreamedLogprobs<'a> {
+    #[serde(borrow, default)]
+    content: Option<Vec<&'a RawValue>>,
+}
+
+/// Append `"key":value` to the JSON object being written in `out`, which
+/// starts with its `{`; `value` goes as its bytes.
+fn member(out: &mut Vec<u8>, key: &str, value: &[u8]) -> Result<(), serde_json::Error> {
+    if out.len() > 1 {
+        out.push(b',');
+    }
+    serde_json::to_writer(&mut *out, key)?;
+    out.push(b':');
+    out.extend_from_slice(value);
+    Ok(())
+}
+
 /// Assemble one non-streaming response from a completed stream's chunks.
-fn assemble(chunks: Vec<String>) -> Result<Value, AdapterError> {
+///
+/// SPEC §10 (issue #223): what the engine sent is relayed as its bytes: the
+/// first chunk's members in their order (its `model` already the public
+/// name), each token's log probabilities, and the last `usage`,
+/// `tensorfold`, `metrics` and `timings` reported. Only what collecting
+/// builds (the message, the choice, `object`) is written anew.
+fn assemble(chunks: Vec<String>) -> Result<EngineAnswer, AdapterError> {
     // A completed stream always carried a chunk; never index blindly.
     let first = chunks.first().ok_or_else(uncertain)?;
-    let mut response = serde_json::from_str::<Value>(first).map_err(|_| uncertain())?;
+    let Members(head) = serde_json::from_str(first).map_err(|_| uncertain())?;
     let mut content = String::new();
     let mut reasoning = [String::new(), String::new()];
     let mut tool_calls = std::collections::BTreeMap::new();
@@ -699,56 +745,62 @@ fn assemble(chunks: Vec<String>) -> Result<Value, AdapterError> {
     // arrive one chunk at a time and are concatenated in stream order, so a
     // collected response carries what the stream carried. `None` until an
     // engine sends any, which keeps the field absent when none was asked for.
-    let mut logprobs: Option<Vec<Value>> = None;
-    for chunk in chunks {
-        let chunk: Value = serde_json::from_str(&chunk).map_err(|_| uncertain())?;
-        if let Some(text) = chunk["choices"][0]["delta"]["content"].as_str() {
-            content.push_str(text);
-        }
-        for (field, trace) in REASONING_FIELDS.iter().zip(reasoning.iter_mut()) {
-            if let Some(text) = chunk["choices"][0]["delta"][*field].as_str() {
-                trace.push_str(text);
-            }
-        }
-        fold_tool_calls(&mut tool_calls, &chunk["choices"][0]["delta"]["tool_calls"]);
-        match &chunk["choices"][0]["logprobs"] {
-            Value::Null => {}
-            Value::Object(block) => match block.get("content") {
-                Some(Value::Array(tokens)) => logprobs
-                    .get_or_insert_with(Vec::new)
-                    .extend(tokens.iter().cloned()),
-                None | Some(Value::Null) => {}
-                Some(_) => return Err(uncertain()),
-            },
-            _ => return Err(uncertain()),
-        }
-        if !chunk["choices"][0]["finish_reason"].is_null() {
-            finish = chunk["choices"][0]["finish_reason"].clone();
-        }
-        // SGLang sends `"usage": null` on tool-call deltas; only a present
-        // usage object replaces what was collected.
-        if chunk.get("usage").is_some_and(|usage| !usage.is_null()) {
-            response["usage"] = chunk["usage"].clone();
-        }
-        // ADR 0023 §7: TensorFold's statistics ride the final chunk; a
-        // collected response carries them as the engine's own would. vLLM's
-        // per-request `metrics` ride its final usage chunk the same way
-        // (0.30 `ChatCompletionStreamResponse.metrics`), and llama.cpp's
-        // `timings` ride its last chunk (ADR 0029 §11; found live 2026-10-09:
-        // a collected answer had lost them, so `prefill_ms` was missing).
-        for field in ["tensorfold", "metrics", "timings"] {
-            if let Some(stats) = chunk.get(field).filter(|v| v.is_object()) {
-                response[field] = stats.clone();
-            }
-        }
-    }
-    response["object"] = json!("chat.completion");
-    // vLLM's first chunk carries `prompt_text` and `prompt_token_ids` (null
-    // unless asked for); they describe the stream, not the completion.
-    if let Some(fields) = response.as_object_mut() {
-        for field in ["prompt_text", "prompt_token_ids"] {
-            if fields.get(field).is_some_and(Value::is_null) {
-                fields.remove(field);
+    let mut logprobs: Option<Vec<&RawValue>> = None;
+    // The last report of each, as the engine sent it. SGLang sends
+    // `"usage": null` on tool-call deltas; only a present usage replaces what
+    // was collected. ADR 0023 §7: TensorFold's statistics ride the final
+    // chunk; a collected response carries them as the engine's own would.
+    // vLLM's per-request `metrics` ride its final usage chunk the same way
+    // (0.30 `ChatCompletionStreamResponse.metrics`), and llama.cpp's
+    // `timings` ride its last chunk (ADR 0029 §11; found live 2026-10-09: a
+    // collected answer had lost them, so `prefill_ms` was missing). Those
+    // three are taken only as objects.
+    let mut reports: [(&str, Option<&RawValue>); 4] = [
+        ("usage", None),
+        ("tensorfold", None),
+        ("metrics", None),
+        ("timings", None),
+    ];
+    for chunk in &chunks {
+        let Members(members) = serde_json::from_str(chunk).map_err(|_| uncertain())?;
+        for (key, value) in members {
+            if key == "choices" {
+                let choices: Vec<StreamedChoice> =
+                    serde_json::from_str(value.get()).map_err(|_| uncertain())?;
+                let Some(choice) = choices.into_iter().next() else {
+                    continue;
+                };
+                if let Some(text) = choice.delta["content"].as_str() {
+                    content.push_str(text);
+                }
+                for (field, trace) in REASONING_FIELDS.iter().zip(reasoning.iter_mut()) {
+                    if let Some(text) = choice.delta[*field].as_str() {
+                        trace.push_str(text);
+                    }
+                }
+                fold_tool_calls(&mut tool_calls, &choice.delta["tool_calls"]);
+                if let Some(block) = choice.logprobs.map(RawValue::get) {
+                    if !block.starts_with('{') {
+                        return Err(uncertain());
+                    }
+                    let block: StreamedLogprobs =
+                        serde_json::from_str(block).map_err(|_| uncertain())?;
+                    if let Some(tokens) = block.content {
+                        logprobs.get_or_insert_with(Vec::new).extend(tokens);
+                    }
+                }
+                if !choice.finish_reason.is_null() {
+                    finish = choice.finish_reason;
+                }
+            } else if let Some((name, report)) = reports.iter_mut().find(|(name, _)| *name == key) {
+                let relayed = if *name == "usage" {
+                    value.get() != "null"
+                } else {
+                    value.get().starts_with('{')
+                };
+                if relayed {
+                    *report = Some(value);
+                }
             }
         }
     }
@@ -770,12 +822,53 @@ fn assemble(chunks: Vec<String>) -> Result<Value, AdapterError> {
         }
         message["tool_calls"] = Value::Array(tool_calls.into_values().collect());
     }
-    let mut choice = json!({"index":0,"message":message,"finish_reason":finish});
+    let written = |_| uncertain();
+    let mut choice = br#"[{"index":0,"message":"#.to_vec();
+    serde_json::to_writer(&mut choice, &message).map_err(written)?;
     if let Some(tokens) = logprobs {
-        choice["logprobs"] = json!({ "content": tokens });
+        choice.extend_from_slice(br#","logprobs":{"content":["#);
+        for (index, token) in tokens.iter().enumerate() {
+            if index > 0 {
+                choice.push(b',');
+            }
+            choice.extend_from_slice(token.get().as_bytes());
+        }
+        choice.extend_from_slice(b"]}");
     }
-    response["choices"] = json!([choice]);
-    Ok(response)
+    choice.extend_from_slice(br#","finish_reason":"#);
+    serde_json::to_writer(&mut choice, &finish).map_err(written)?;
+    choice.extend_from_slice(b"}]");
+    let object: &[u8] = br#""chat.completion""#;
+    let mut out = Vec::with_capacity(first.len() + choice.len());
+    out.push(b'{');
+    for (key, value) in &head {
+        let bytes = match key.as_str() {
+            "object" => object,
+            "choices" => &choice,
+            // vLLM's first chunk carries `prompt_text` and `prompt_token_ids`
+            // (null unless asked for); they describe the stream, not the
+            // completion.
+            "prompt_text" | "prompt_token_ids" if value.get() == "null" => continue,
+            _ => match reports.iter().find(|(name, _)| name == key) {
+                Some((_, Some(report))) => report.get().as_bytes(),
+                _ => value.get().as_bytes(),
+            },
+        };
+        member(&mut out, key, bytes).map_err(written)?;
+    }
+    let sent = |name: &str| head.iter().any(|(key, _)| key == name);
+    for (name, report) in reports {
+        if let Some(report) = report.filter(|_| !sent(name)) {
+            member(&mut out, name, report.get().as_bytes()).map_err(written)?;
+        }
+    }
+    for (name, bytes) in [("object", object), ("choices", &choice)] {
+        if !sent(name) {
+            member(&mut out, name, bytes).map_err(written)?;
+        }
+    }
+    out.push(b'}');
+    EngineAnswer::parse(out.into()).map_err(|_| uncertain())
 }
 
 impl ChatHttp {
@@ -783,7 +876,7 @@ impl ChatHttp {
     /// keep the transport's own: 60 s between reads and 300 s overall.
     pub(crate) async fn stream(
         &self,
-        body: &Value,
+        body: &InferenceRequest,
         on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<StreamEnded, AdapterError> {
         tokio::time::timeout(
@@ -792,6 +885,7 @@ impl ChatHttp {
                 body,
                 &mut CallbackSink(on_chunk),
                 Some(Duration::from_secs(60)),
+                Usage::AsSent,
             ),
         )
         .await
@@ -804,10 +898,10 @@ impl ChatHttp {
     /// uncertain (found live 2026-09-23, matrix M30 vLLM), so there is none.
     pub(crate) async fn stream_async(
         &self,
-        body: &Value,
+        body: &InferenceRequest,
         sink: &mut dyn ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
-        self.stream_inner(body, sink, None).await
+        self.stream_inner(body, sink, None, Usage::AsSent).await
     }
 
     /// Send one request to `url` and screen the answer's status: a connection
@@ -815,19 +909,24 @@ impl ChatHttp {
     /// (`NotAccepted`); an engine's complete invalid-request answer is
     /// `Rejected`, and its complete error answer is `EngineError`. Any other
     /// transport error is `unverified()`. The caller judges every other
-    /// response. `request_id` goes as [`CAPYCTL_REQUEST_ID_HEADER`] (ADR 0032
-    /// §2: to a host ingress only). `trace` goes as the W3C `traceparent` and
+    /// response. `body` is the encoded request ([`InferenceRequest::encode`]);
+    /// `request_id` goes as [`CAPYCTL_REQUEST_ID_HEADER`] (ADR 0032 §2: to a
+    /// host ingress only). `trace` goes as the W3C `traceparent` and
     /// `tracestate` headers (ADR 0037 §6: the router decided this lane
     /// carries them).
     async fn post(
         &self,
         url: &reqwest::Url,
-        request: &Value,
+        body: Vec<u8>,
         request_id: Option<&str>,
         trace: Option<&crate::traits::TraceHeaders>,
         unverified: fn() -> AdapterError,
     ) -> Result<reqwest::Response, AdapterError> {
-        let mut send = self.client.post(url.clone()).json(request);
+        let mut send = self
+            .client
+            .post(url.clone())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
         if let Some(key) = &self.key {
             send = send.bearer_auth(key);
         }
@@ -854,6 +953,13 @@ impl ChatHttp {
         if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
             return Err(refused_before_forwarding(response).await);
         }
+        // #213, SPEC §10: a host ingress at its forward limit answers 429 with
+        // its own failure code before anything reaches the engine; the request
+        // was not accepted, so the router may offer it elsewhere. Any other
+        // 429 (an engine's own) stays as uncertain as it was.
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(ingress_at_capacity(response, unverified).await);
+        }
         // SPEC §10 (found live 2026-09-24): an invalid-request answer is the
         // engine's complete reply, relayed as such rather than as uncertainty.
         let status = response.status().as_u16();
@@ -871,32 +977,39 @@ impl ChatHttp {
 
     /// ADR 0030 §2: forward one decision request and read its answer whole.
     /// The request goes as one JSON body with `model` replaced by the served
-    /// name; the answer comes back with `model` replaced by the public name.
+    /// name; the answer comes back as the engine's bytes with `model`
+    /// replaced by the public name (issue #223).
     /// Only a complete JSON object of at most [`DECISION_RESPONSE_LIMIT`]
     /// bytes with an `answers` object ([`decision_answered`]) is completion;
     /// a truncated, oversized, ambiguous or malformed body stays uncertain,
     /// since the engine may have run the request. No wall-clock bound of its
     /// own: the router bounds the whole exchange by the request deadline.
-    pub(crate) async fn decide(&self, body: &Value) -> Result<Value, AdapterError> {
+    pub(crate) async fn decide(
+        &self,
+        body: &InferenceRequest,
+    ) -> Result<EngineAnswer, AdapterError> {
         self.decide_traced(body, None).await
     }
 
     /// As [`ChatHttp::decide`], carrying `trace` (ADR 0037 §6).
     pub(crate) async fn decide_traced(
         &self,
-        body: &Value,
+        body: &InferenceRequest,
         trace: Option<&crate::traits::TraceHeaders>,
-    ) -> Result<Value, AdapterError> {
+    ) -> Result<EngineAnswer, AdapterError> {
         validate_decision_request(body)?;
         let public = body
             .get("model")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or(AdapterError::UnsupportedCapability)?;
-        let mut request = body.clone();
-        request["model"] = json!(self.model);
+        // Issue #220: the caller's questions go in the caller's order; SGLang
+        // numbers them in the prompt in that order.
+        let request = body
+            .encode(&[("model", &json!(self.model))])
+            .map_err(|_| AdapterError::UnsupportedCapability)?;
         let response = self
-            .post(&self.decisions, &request, None, trace, decision_uncertain)
+            .post(&self.decisions, request, None, trace, decision_uncertain)
             .await?;
         if !response.status().is_success() || !content_type_is(&response, "application/json") {
             return Err(decision_uncertain());
@@ -905,13 +1018,13 @@ impl ChatHttp {
             .await
             .ok_or_else(decision_uncertain)?;
         // Identity and evidence must have one interpretation: a duplicated
-        // key is not an answer.
-        let StrictValue(mut answer) =
-            serde_json::from_slice(&body).map_err(|_| decision_uncertain())?;
+        // key is not an answer. SPEC §10 (issue #223): the caller receives
+        // the engine's bytes, its probabilities exactly as it wrote them.
+        let mut answer = EngineAnswer::parse(body.into()).map_err(|_| decision_uncertain())?;
         if !decision_answered(&answer) {
             return Err(decision_uncertain());
         }
-        answer["model"] = json!(public);
+        answer.set("model", json!(public));
         Ok(answer)
     }
 
@@ -930,7 +1043,7 @@ impl ChatHttp {
     /// exchange, measuring idleness from [`EmbeddingSink::progressed`].
     pub(crate) async fn embed(
         &self,
-        body: &Value,
+        body: &InferenceRequest,
         sink: &mut dyn EmbeddingSink,
     ) -> Result<EmbeddingAnswered, AdapterError> {
         let expected = crate::embedding_request::embedding_expected(body)?;
@@ -939,12 +1052,15 @@ impl ChatHttp {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or(AdapterError::UnsupportedCapability)?;
-        let mut request = body.clone();
-        request["model"] = json!(self.model);
+        // SPEC §10, issue #220: preserve the caller's members and bytes,
+        // including an embeddings batch; only the served name is replaced.
+        let request = body
+            .encode(&[("model", &json!(self.model))])
+            .map_err(|_| AdapterError::UnsupportedCapability)?;
         // ADR 0037 §6: trace headers are threaded through chat and decisions
         // forwards only; an embeddings forward sends none.
         let response = self
-            .post(&self.embeddings, &request, None, None, embedding_uncertain)
+            .post(&self.embeddings, request, None, None, embedding_uncertain)
             .await?;
         if !response.status().is_success() || !content_type_is(&response, "application/json") {
             return Err(embedding_uncertain());
@@ -977,9 +1093,10 @@ impl ChatHttp {
 
     async fn stream_inner(
         &self,
-        body: &Value,
+        body: &InferenceRequest,
         sink: &mut dyn ChatSink,
         read_idle: Option<Duration>,
+        usage: Usage,
     ) -> Result<StreamEnded, AdapterError> {
         // SPEC §10 / T21: engine-internal fields never reach the engine, and a
         // parameter the relay cannot answer faithfully is refused before
@@ -1016,24 +1133,39 @@ impl ChatHttp {
             RequestIdLane::Absent => None,
             RequestIdLane::Engine | RequestIdLane::Ingress => sink.request_id().map(str::to_owned),
         };
-        let mut request = body.clone();
-        request["model"] = json!(self.model);
-        request["stream"] = json!(true);
-        if let Some(effective) = effective {
-            request["cache_salt"] = json!(effective);
+        // Issue #220: the caller's members keep their order and bytes (the
+        // property order of a schema can matter); only these are set.
+        let model = json!(self.model);
+        let stream = json!(true);
+        let mut replace: Vec<(&str, &Value)> = vec![("model", &model), ("stream", &stream)];
+        let salt = effective.map(Value::String);
+        if let Some(salt) = &salt {
+            replace.push(("cache_salt", salt));
+        }
+        // SPEC §10 (found live 2026-10-03): vLLM streams usage only when asked;
+        // a collected response must carry it as a non-streaming one does.
+        let include_usage = json!({"include_usage": true});
+        if usage == Usage::Requested && body.get("stream_options").is_none_or(Value::is_null) {
+            replace.push(("stream_options", &include_usage));
+        }
+        let rid = match (self.request_ids, &request_id) {
+            (RequestIdLane::Engine, Some(id)) => Some(Value::String(id.clone())),
+            _ => None,
+        };
+        if let Some(rid) = &rid {
+            replace.push(("rid", rid));
         }
         let header = match (self.request_ids, &request_id) {
-            (RequestIdLane::Engine, Some(id)) => {
-                request["rid"] = json!(id);
-                None
-            }
             (RequestIdLane::Ingress, Some(id)) => Some(id.as_str()),
             _ => None,
         };
+        let request = body
+            .encode(&replace)
+            .map_err(|_| AdapterError::UnsupportedCapability)?;
         let response = self
             .post(
                 &self.endpoint,
-                &request,
+                request,
                 header,
                 sink.trace_headers(),
                 uncertain,
@@ -1108,7 +1240,8 @@ impl ChatHttp {
 /// chunk, but it is not progress: until the first output, the request deadline
 /// bounds the stream, whatever the engine sent first.
 pub fn opens_reply_only(chunk: &str) -> bool {
-    if !chunk.contains("\"role\"") {
+    // SPEC §10: raw engine keys can use Unicode escapes; parse those too.
+    if !chunk.contains("\"role\"") && !chunk.contains("\\u") {
         return false;
     }
     let Ok(value) = serde_json::from_str::<Value>(chunk) else {
@@ -1160,8 +1293,9 @@ pub const REJECTION_BODY_LIMIT: usize = 16 * 1024;
 const REJECTION_MESSAGE_LIMIT: usize = 512;
 
 /// The code a host ingress answers its own failures with: a 502 when the
-/// engine could not be reached or its answer could not be relayed whole. It
-/// is not the engine's answer, so it stays uncertain.
+/// engine could not be reached or its answer could not be relayed whole,
+/// which is not the engine's answer and stays uncertain; a 429 at its forward
+/// limit, decided before forwarding, which is not accepted (#213).
 pub const INGRESS_FAILURE_CODE: &str = "inference_unavailable";
 
 /// The message of an engine's invalid-request answer: vLLM's `error.message`,
@@ -1329,6 +1463,28 @@ async fn refused_before_forwarding(response: reqwest::Response) -> AdapterError 
     }
 }
 
+/// #213: a 429 is the host ingress's own refusal at its forward limit, decided
+/// before forwarding, only when its body carries [`INGRESS_FAILURE_CODE`]: the
+/// ingress relays no engine 429 (it answers one as its own 502). Anything
+/// else, an engine's own 429 included, stays `unverified()`.
+async fn ingress_at_capacity(
+    response: reqwest::Response,
+    unverified: fn() -> AdapterError,
+) -> AdapterError {
+    let read =
+        tokio::time::timeout(Duration::from_secs(5), read_whole(response, REFUSAL_LIMIT)).await;
+    let Some(body) = read.ok().flatten() else {
+        return unverified();
+    };
+    let refusal = serde_json::from_slice::<Value>(&body).ok();
+    match refusal.as_ref().map(|v| &v["error"]["code"]) {
+        Some(Value::String(code)) if code == INGRESS_FAILURE_CODE => {
+            AdapterError::NotAccepted("the serving host's ingress is at capacity".into())
+        }
+        _ => unverified(),
+    }
+}
+
 /// A forwarder bound to one engine incarnation.
 ///
 /// Intentionally no Debug, for the same reason as `ChatHttp`: the value it holds is
@@ -1339,41 +1495,44 @@ struct EngineForward(ChatHttp);
 impl crate::traits::ChatForward for EngineForward {
     async fn forward_chat_stream_async(
         &self,
-        body: &Value,
+        body: &crate::request::InferenceRequest,
         sink: &mut dyn ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
         self.0.stream_async(body, sink).await
     }
-    async fn forward_chat(&self, body: &Value) -> Result<Value, AdapterError> {
+    async fn forward_chat(&self, body: &InferenceRequest) -> Result<EngineAnswer, AdapterError> {
         self.0.collect(body).await
     }
     async fn forward_chat_observed(
         &self,
-        body: &Value,
+        body: &crate::request::InferenceRequest,
         observer: &mut dyn ChatSink,
-    ) -> Result<Value, AdapterError> {
+    ) -> Result<EngineAnswer, AdapterError> {
         self.0.collect_observed(body, observer, None).await
     }
-    async fn forward_decision(&self, body: &Value) -> Result<Value, AdapterError> {
+    async fn forward_decision(
+        &self,
+        body: &InferenceRequest,
+    ) -> Result<EngineAnswer, AdapterError> {
         self.0.decide(body).await
     }
     async fn forward_embedding(
         &self,
-        body: &Value,
+        body: &InferenceRequest,
         sink: &mut dyn EmbeddingSink,
     ) -> Result<EmbeddingAnswered, AdapterError> {
         self.0.embed(body, sink).await
     }
     async fn forward_decision_traced(
         &self,
-        body: &Value,
+        body: &InferenceRequest,
         trace: Option<&crate::traits::TraceHeaders>,
-    ) -> Result<Value, AdapterError> {
+    ) -> Result<EngineAnswer, AdapterError> {
         self.0.decide_traced(body, trace).await
     }
     async fn forward_chat_stream(
         &self,
-        body: &Value,
+        body: &crate::request::InferenceRequest,
         on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<StreamEnded, AdapterError> {
         self.0.stream(body, on_chunk).await
@@ -1419,7 +1578,8 @@ pub fn engine_forwarder_on(
 
 struct Parser<'a> {
     backend: &'a str,
-    public: &'a str,
+    /// The public name, which a relayed chunk carries as its `model`.
+    public: Value,
     line: Vec<u8>,
     data: String,
     total: usize,
@@ -1435,7 +1595,7 @@ impl<'a> Parser<'a> {
     fn new(backend: &'a str, public: &'a str, abort_finishes: bool) -> Self {
         Self {
             backend,
-            public,
+            public: Value::String(public.to_owned()),
             line: vec![],
             data: String::new(),
             total: 0,
@@ -1493,7 +1653,7 @@ impl<'a> Parser<'a> {
         data: &str,
         on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<(), AdapterError> {
-        let StrictValue(mut chunk) = serde_json::from_str(data).map_err(|_| uncertain())?;
+        let StrictValue(chunk) = serde_json::from_str(data).map_err(|_| uncertain())?;
         // SPEC §10, T19 (found live 2026-10-03): SGLang checks a prompt against
         // its KV pool after the stream opened and answers with one error event.
         // Before any chunk, that event is the engine's complete invalid-request
@@ -1589,8 +1749,13 @@ impl<'a> Parser<'a> {
                 _ => return Err(uncertain()),
             }
         }
-        chunk["model"] = json!(self.public);
-        on_chunk(chunk.to_string());
+        // SPEC §10 (issue #223): the chunk is relayed as the engine's bytes
+        // with only `model` written anew, its floats as the engine wrote them.
+        let relayed = splice(data.as_bytes(), &[("model", &self.public)])
+            .ok()
+            .and_then(|relayed| String::from_utf8(relayed).ok())
+            .ok_or_else(uncertain)?;
+        on_chunk(relayed);
         Ok(())
     }
 }
@@ -1656,67 +1821,10 @@ fn fold_tool_calls(calls: &mut std::collections::BTreeMap<u64, Value>, deltas: &
     }
 }
 
-// serde_json::Value otherwise accepts duplicate keys with last-value-wins.
-// Identity and terminal fields must have one unambiguous interpretation.
-struct StrictValue(Value);
-impl<'de> serde::Deserialize<'de> for StrictValue {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = StrictValue;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("unambiguous JSON")
-            }
-            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
-                Ok(StrictValue(json!(v)))
-            }
-            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
-                Ok(StrictValue(json!(v)))
-            }
-            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
-                Ok(StrictValue(json!(v)))
-            }
-            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
-                Ok(StrictValue(json!(v)))
-            }
-            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                Ok(StrictValue(json!(v)))
-            }
-            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-                Ok(StrictValue(Value::Null))
-            }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut values = vec![];
-                while let Some(StrictValue(value)) = seq.next_element()? {
-                    values.push(value);
-                }
-                Ok(StrictValue(Value::Array(values)))
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut values = serde_json::Map::new();
-                while let Some((key, StrictValue(value))) =
-                    map.next_entry::<String, StrictValue>()?
-                {
-                    if values.insert(key, value).is_some() {
-                        return Err(serde::de::Error::custom("duplicate key"));
-                    }
-                }
-                Ok(StrictValue(Value::Object(values)))
-            }
-        }
-        deserializer.deserialize_any(Visitor)
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{assemble, probe_answered, upstream};
+    use crate::request::InferenceRequest;
     use crate::traits::AdapterError;
     use serde_json::{json, Value};
 
@@ -1859,7 +1967,7 @@ pub(crate) mod tests {
             crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
         assert!(matches!(
-            forward.forward_chat(&request).await,
+            forward.forward_chat(&request.clone().into()).await,
             Err(AdapterError::NotAccepted(_))
         ));
         for body in [
@@ -1874,7 +1982,7 @@ pub(crate) mod tests {
                 crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
             );
             assert!(matches!(
-                forward.forward_chat(&request).await,
+                forward.forward_chat(&request.clone().into()).await,
                 Err(AdapterError::Uncertain(_))
             ));
         }
@@ -1886,7 +1994,7 @@ pub(crate) mod tests {
             crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
         assert!(matches!(
-            forward.forward_chat(&request).await,
+            forward.forward_chat(&request.clone().into()).await,
             Err(AdapterError::EngineError { status: 500, .. })
         ));
     }
@@ -1925,7 +2033,7 @@ pub(crate) mod tests {
                 None,
                 crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
             );
-            match forward.forward_chat(&request).await {
+            match forward.forward_chat(&request.clone().into()).await {
                 Err(AdapterError::Rejected {
                     status: got,
                     message,
@@ -1943,7 +2051,7 @@ pub(crate) mod tests {
             None,
             crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
-        match forward.forward_chat(&request).await {
+        match forward.forward_chat(&request.clone().into()).await {
             Err(AdapterError::Rejected { message, .. }) => {
                 assert!(message.len() <= 512, "{}", message.len())
             }
@@ -1962,7 +2070,7 @@ pub(crate) mod tests {
             );
             assert!(
                 matches!(
-                    forward.forward_chat(&request).await,
+                    forward.forward_chat(&request.clone().into()).await,
                     Err(AdapterError::Uncertain(_))
                 ),
                 "status {status}"
@@ -2029,12 +2137,15 @@ pub(crate) mod tests {
             );
             let mut relayed = Vec::new();
             for result in [
-                forward.forward_chat(&chat).await.map(|_| ()),
+                forward.forward_chat(&chat.clone().into()).await.map(|_| ()),
                 forward
-                    .forward_chat_stream(&chat, &mut |chunk| relayed.push(chunk))
+                    .forward_chat_stream(&chat.clone().into(), &mut |chunk| relayed.push(chunk))
                     .await
                     .map(|_| ()),
-                forward.forward_decision(&decision).await.map(|_| ()),
+                forward
+                    .forward_decision(&decision.clone().into())
+                    .await
+                    .map(|_| ()),
             ] {
                 match result {
                     Err(AdapterError::EngineError {
@@ -2056,7 +2167,7 @@ pub(crate) mod tests {
             None,
             crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
-        match forward.forward_chat(&chat).await {
+        match forward.forward_chat(&chat.clone().into()).await {
             Err(AdapterError::EngineError { message, .. }) => {
                 assert!(message.len() <= 512, "{}", message.len())
             }
@@ -2082,8 +2193,11 @@ pub(crate) mod tests {
                 crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
             );
             for result in [
-                forward.forward_chat(&chat).await.map(|_| ()),
-                forward.forward_decision(&decision).await.map(|_| ()),
+                forward.forward_chat(&chat.clone().into()).await.map(|_| ()),
+                forward
+                    .forward_decision(&decision.clone().into())
+                    .await
+                    .map(|_| ()),
             ] {
                 assert!(
                     matches!(result, Err(AdapterError::Uncertain(_))),
@@ -2109,7 +2223,7 @@ pub(crate) mod tests {
             crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
         assert!(matches!(
-            forward.forward_chat(&request).await,
+            forward.forward_chat(&request.clone().into()).await,
             Err(AdapterError::NotAccepted(_))
         ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2129,7 +2243,7 @@ pub(crate) mod tests {
             crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
         assert!(matches!(
-            forward.forward_chat(&request).await,
+            forward.forward_chat(&request.clone().into()).await,
             Err(AdapterError::Uncertain(_))
         ));
     }
@@ -2179,7 +2293,7 @@ pub(crate) mod tests {
             );
             assert!(
                 matches!(
-                    forward.forward_chat(&body).await,
+                    forward.forward_chat(&body.clone().into()).await,
                     Err(AdapterError::PolicyDenied)
                 ),
                 "{field}"
@@ -2251,7 +2365,8 @@ pub(crate) mod tests {
             crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
         let request = serde_json::json!({"model":"public","messages":[]});
-        let response = forward.forward_chat(&request).await.unwrap();
+        let answer = forward.forward_chat(&request.clone().into()).await.unwrap();
+        let response = answer.value();
         assert_eq!(response["usage"]["total_tokens"], 4, "{response}");
         assert_eq!(response["choices"][0]["message"]["content"], "hi");
         assert!(response.get("prompt_text").is_none(), "{response}");
@@ -2261,7 +2376,7 @@ pub(crate) mod tests {
         // A streaming caller's own stream options are relayed as sent.
         let mut relayed = Vec::new();
         forward
-            .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
+            .forward_chat_stream(&request.clone().into(), &mut |chunk| relayed.push(chunk))
             .await
             .unwrap();
         let sent = seen.lock().unwrap()[1].clone();
@@ -2296,7 +2411,7 @@ pub(crate) mod tests {
             "parameters":{"type":"object"}}}]);
         let request = serde_json::json!({"model":"public","messages":[],"tools":tools,
             "tool_choice":"auto","parallel_tool_calls":false});
-        let response = forward.forward_chat(&request).await.unwrap();
+        let response = forward.forward_chat(&request.clone().into()).await.unwrap();
         let message = &response["choices"][0]["message"];
         assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(message["content"], serde_json::Value::Null);
@@ -2310,7 +2425,7 @@ pub(crate) mod tests {
         assert_eq!(sent["tool_choice"], "auto");
         let mut relayed = Vec::new();
         let end = forward
-            .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
+            .forward_chat_stream(&request.clone().into(), &mut |chunk| relayed.push(chunk))
             .await
             .unwrap();
         assert_eq!(end, crate::traits::StreamEnded::Completed);
@@ -2351,12 +2466,12 @@ pub(crate) mod tests {
             "tool_choice":{"type":"function","function":{"name":"get_weather"}}});
         let mut relayed = Vec::new();
         let end = forward
-            .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
+            .forward_chat_stream(&request.clone().into(), &mut |chunk| relayed.push(chunk))
             .await
             .unwrap();
         assert_eq!(end, crate::traits::StreamEnded::Completed);
         assert_eq!(relayed.len(), 4);
-        let response = forward.forward_chat(&request).await.unwrap();
+        let response = forward.forward_chat(&request.clone().into()).await.unwrap();
         assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(
             response["choices"][0]["message"]["tool_calls"],
@@ -2389,7 +2504,7 @@ pub(crate) mod tests {
             "stream_options":{"include_usage":true}});
         let mut relayed = Vec::new();
         let end = forward
-            .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
+            .forward_chat_stream(&request.clone().into(), &mut |chunk| relayed.push(chunk))
             .await;
         (end, relayed)
     }
@@ -2550,7 +2665,7 @@ pub(crate) mod tests {
             None,
             crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
         );
-        match forward.forward_chat(&request).await {
+        match forward.forward_chat(&request.clone().into()).await {
             Err(AdapterError::Rejected { status, message }) => {
                 assert_eq!(status, 400);
                 assert!(
@@ -2562,7 +2677,7 @@ pub(crate) mod tests {
         }
         let mut relayed = Vec::new();
         let streamed = forward
-            .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
+            .forward_chat_stream(&request.clone().into(), &mut |chunk| relayed.push(chunk))
             .await;
         assert!(
             matches!(streamed, Err(AdapterError::Rejected { status: 400, .. })),
@@ -2588,7 +2703,7 @@ pub(crate) mod tests {
                 None,
                 crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
             );
-            let result = forward.forward_chat(&request).await;
+            let result = forward.forward_chat(&request.clone().into()).await;
             assert!(
                 matches!(result, Err(AdapterError::Uncertain(_))),
                 "{:?}",
@@ -2605,7 +2720,7 @@ pub(crate) mod tests {
         );
         let mut relayed = Vec::new();
         let streamed = forward
-            .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
+            .forward_chat_stream(&request.clone().into(), &mut |chunk| relayed.push(chunk))
             .await;
         assert!(
             matches!(streamed, Err(AdapterError::EngineError { status: 500, .. })),
@@ -2640,7 +2755,7 @@ pub(crate) mod tests {
                 crate::forward::CacheSalt::for_launch(Some("vllm"), "dep-1", 1),
             );
             let result = forward
-                .forward_chat(&serde_json::json!({"model":"p","messages":[]}))
+                .forward_chat(&serde_json::json!({"model":"p","messages":[]}).into())
                 .await;
             assert!(matches!(result, Err(AdapterError::Uncertain(_))), "{bad}");
         }
@@ -2680,7 +2795,7 @@ pub(crate) mod tests {
             );
             assert!(
                 matches!(
-                    forward.forward_chat(&body).await,
+                    forward.forward_chat(&body.clone().into()).await,
                     Err(AdapterError::UnsupportedCapability)
                 ),
                 "{field}"
@@ -2902,7 +3017,7 @@ pub(crate) mod tests {
         let request = json!({"model":"public","messages":[]});
         let mut sink = Counting::default();
         let end = forward
-            .forward_chat_stream_async(&request, &mut sink)
+            .forward_chat_stream_async(&request.clone().into(), &mut sink)
             .await
             .unwrap();
         assert_eq!(end, crate::traits::StreamEnded::Completed);
@@ -2911,7 +3026,7 @@ pub(crate) mod tests {
         assert_eq!(sink.progressed, 3);
         let mut observer = Counting::default();
         let response = forward
-            .forward_chat_observed(&request, &mut observer)
+            .forward_chat_observed(&request.clone().into(), &mut observer)
             .await
             .unwrap();
         assert_eq!(response["choices"][0]["message"]["content"], "hi");
@@ -3017,18 +3132,20 @@ pub(crate) mod tests {
         );
         let request = json!({"model":"m","messages":[],"cache_salt":"tenant-a"});
         assert!(matches!(
-            forward.forward_chat(&request).await,
+            forward.forward_chat(&request.clone().into()).await,
             Err(AdapterError::CacheSaltUnsupported)
         ));
         let mut chunks = |_chunk: String| {};
         assert!(matches!(
-            forward.forward_chat_stream(&request, &mut chunks).await,
+            forward
+                .forward_chat_stream(&request.clone().into(), &mut chunks)
+                .await,
             Err(AdapterError::CacheSaltUnsupported)
         ));
         // Without the field the same forwarder sends (and here fails to connect).
         let plain = json!({"model":"m","messages":[]});
         assert!(!matches!(
-            forward.forward_chat(&plain).await,
+            forward.forward_chat(&plain.clone().into()).await,
             Err(AdapterError::CacheSaltUnsupported)
         ));
     }
@@ -3224,16 +3341,16 @@ pub(crate) mod tests {
             );
             let mut sink = Carrying { id, chunks: vec![] };
             let end = forward
-                .forward_chat_stream_async(&request, &mut sink)
+                .forward_chat_stream_async(&request.clone().into(), &mut sink)
                 .await
                 .unwrap();
             assert_eq!(end, crate::traits::StreamEnded::Completed, "{lane:?}");
             let mut observer = Carrying { id, chunks: vec![] };
             forward
-                .forward_chat_observed(&request, &mut observer)
+                .forward_chat_observed(&request.clone().into(), &mut observer)
                 .await
                 .unwrap();
-            let _ = forward.forward_decision(&decision(json!({}))).await;
+            let _ = forward.forward_decision(&decision(json!({})).into()).await;
             let seen = seen.lock().unwrap().clone();
             assert_eq!(seen.len(), 3, "{lane:?}");
             for (route, body, sent) in &seen[..2] {
@@ -3260,7 +3377,9 @@ pub(crate) mod tests {
         };
         let caller = json!({"model":"public","messages":[],"rid":"mine"});
         assert!(matches!(
-            forward.forward_chat_stream_async(&caller, &mut sink).await,
+            forward
+                .forward_chat_stream_async(&caller.clone().into(), &mut sink)
+                .await,
             Err(AdapterError::PolicyDenied)
         ));
         assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
@@ -3280,16 +3399,17 @@ pub(crate) mod tests {
         }
     }
 
-    // T48 (ADR 0037 §6): the trace headers the router hands a forward are sent
-    // as `traceparent` and `tracestate` on a stream, a collected answer and a
-    // decision; without them nothing is sent, and the request is otherwise
-    // the same.
+    // T48 T43 (ADR 0037 §6, SPEC §10, issues #220/#223): the trace headers
+    // the router hands a forward are sent on streams, collected answers and
+    // decisions only when given. Traced decisions still preserve the caller's
+    // question order and the engine's exact probability bytes.
     #[tokio::test]
     async fn trace_headers_are_sent_only_when_given() {
         type Headers = std::sync::Arc<std::sync::Mutex<Vec<axum::http::HeaderMap>>>;
         let seen: Headers = Default::default();
         let record = seen.clone();
         let record_decision = seen.clone();
+        let (decision_tx, mut decision_rx) = tokio::sync::mpsc::channel(1);
         let router = axum::Router::new()
             .route(
                 "/v1/chat/completions",
@@ -3305,10 +3425,19 @@ pub(crate) mod tests {
             )
             .route(
                 "/v1/systemone",
-                axum::routing::post(move |headers: axum::http::HeaderMap| {
-                    record_decision.lock().unwrap().push(headers);
-                    async { axum::Json(json!({"model": "m", "answers": {}})) }
-                }),
+                axum::routing::post(
+                    move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                        record_decision.lock().unwrap().push(headers);
+                        let tx = decision_tx.clone();
+                        async move {
+                            tx.send(body).await.unwrap();
+                            (
+                                [("content-type", "application/json")],
+                                r#"{"model":"m","answers":{"z":{"probability":0.100000000000000005},"a":{"score":1e-05}}}"#,
+                            )
+                        }
+                    },
+                ),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3323,7 +3452,13 @@ pub(crate) mod tests {
             traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into(),
             tracestate: Some("vendor=1".into()),
         };
-        let request = json!({"model":"public","messages":[]});
+        let request: InferenceRequest = json!({"model":"public","messages":[]}).into();
+        let decision = InferenceRequest::parse(
+            br#"{"questions":{"z":{"type":"noul"},"a":{"type":"noul"}},"state":"hi","model":"public"}"#
+                .as_slice()
+                .into(),
+        )
+        .unwrap();
         for given in [Some(trace.clone()), None] {
             seen.lock().unwrap().clear();
             let mut sink = Tracing {
@@ -3337,9 +3472,18 @@ pub(crate) mod tests {
                 .forward_chat_observed(&request, &mut sink)
                 .await
                 .unwrap();
-            let _ = forward
-                .forward_decision_traced(&decision(json!({})), given.as_ref())
-                .await;
+            let answer = forward
+                .forward_decision_traced(&decision, given.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(
+                decision_rx.recv().await.unwrap().as_ref(),
+                br#"{"questions":{"z":{"type":"noul"},"a":{"type":"noul"}},"state":"hi","model":"m"}"#
+            );
+            assert_eq!(
+                answer.encode().unwrap().as_slice(),
+                br#"{"model":"public","answers":{"z":{"probability":0.100000000000000005},"a":{"score":1e-05}}}"#
+            );
             let seen = seen.lock().unwrap().clone();
             assert_eq!(seen.len(), 3);
             for headers in &seen {
@@ -3380,7 +3524,7 @@ pub(crate) mod tests {
         };
         assert_eq!(
             forward
-                .forward_chat_stream_async(&request, &mut sink)
+                .forward_chat_stream_async(&request.clone().into(), &mut sink)
                 .await
                 .unwrap(),
             crate::traits::StreamEnded::Completed
@@ -3390,7 +3534,7 @@ pub(crate) mod tests {
             chunks: vec![],
         };
         let answer = forward
-            .forward_chat_observed(&request, &mut observer)
+            .forward_chat_observed(&request.clone().into(), &mut observer)
             .await
             .unwrap();
         assert_eq!(answer["choices"][0]["finish_reason"], "abort");
@@ -3410,7 +3554,9 @@ pub(crate) mod tests {
             let mut sink = Carrying { id, chunks: vec![] };
             assert!(
                 matches!(
-                    forward.forward_chat_stream_async(&request, &mut sink).await,
+                    forward
+                        .forward_chat_stream_async(&request.clone().into(), &mut sink)
+                        .await,
                     Err(AdapterError::Uncertain(_))
                 ),
                 "{lane:?}"
@@ -3448,7 +3594,9 @@ pub(crate) mod tests {
                 chunks: vec![],
             };
             assert!(matches!(
-                forward.forward_chat_stream_async(&request, &mut sink).await,
+                forward
+                    .forward_chat_stream_async(&request.clone().into(), &mut sink)
+                    .await,
                 Err(AdapterError::Uncertain(_))
             ));
         }
@@ -3547,7 +3695,8 @@ pub(crate) mod tests {
             Some(EMBEDDING_ANSWER[at + 70..].to_owned()),
         ];
         let (url, received) = embedding_engine(200, "application/json", chunks).await;
-        let request = json!({"model": "public", "input": ["a", "b"], "user": "u-1"});
+        let request: InferenceRequest =
+            json!({"model": "public", "input": ["a", "b"], "user": "u-1"}).into();
         let mut sink = Relayed::default();
         let answered = embedding_forwarder(url)
             .forward_embedding(&request, &mut sink)
@@ -3583,6 +3732,43 @@ pub(crate) mod tests {
                 &EMBEDDING_ANSWER.as_bytes()[..100]
             ),
             None
+        );
+    }
+
+    // T47 T19 (ADR 0036 §4, SPEC §10, issue #220): embeddings use the same
+    // byte-preserving request boundary as chat and decisions. Only `model`
+    // changes; the caller's ordering and escaped input/user stay untouched.
+    #[tokio::test]
+    async fn an_embeddings_forward_preserves_the_callers_request_bytes() {
+        let (tx, mut received) = tokio::sync::mpsc::channel(1);
+        let app = axum::Router::new().route(
+            "/v1/embeddings",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let tx = tx.clone();
+                async move {
+                    tx.send(body).await.unwrap();
+                    ([("content-type", "application/json")], EMBEDDING_ANSWER)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let request = InferenceRequest::parse(
+            br#"{"user":"\u0075","input":["z","\u0061"],"model":"public"}"#
+                .as_slice()
+                .into(),
+        )
+        .unwrap();
+        embedding_forwarder(url)
+            .forward_embedding(&request, &mut Relayed::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            received.recv().await.unwrap().as_ref(),
+            br#"{"user":"\u0075","input":["z","\u0061"],"model":"served"}"#
         );
     }
 
@@ -3658,6 +3844,7 @@ pub(crate) mod tests {
                 .as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
+            let request: InferenceRequest = request.into();
             let mut sink = Relayed::default();
             let result = embedding_forwarder(url)
                 .forward_embedding(&request, &mut sink)
@@ -3689,7 +3876,7 @@ pub(crate) mod tests {
     // T47
     #[tokio::test]
     async fn engine_answers_to_an_embeddings_request_keep_their_meaning() {
-        let request = json!({"model": "public", "input": "a"});
+        let request: InferenceRequest = json!({"model": "public", "input": "a"}).into();
         let error = |message: &str| Some(json!({"error": {"message": message}}).to_string());
         let (url, _) = embedding_engine(
             400,
@@ -3726,7 +3913,7 @@ pub(crate) mod tests {
         let (url, received) = embedding_engine(200, "application/json", vec![]).await;
         let result = embedding_forwarder(url)
             .forward_embedding(
-                &crate::embedding_request::tests::embeddings(json!({"stream": true})),
+                &crate::embedding_request::tests::embeddings(json!({"stream": true})).into(),
                 &mut Relayed::default(),
             )
             .await;
@@ -3744,7 +3931,7 @@ pub(crate) mod tests {
     // T47 T17
     #[tokio::test]
     async fn a_client_gone_leaves_the_answer_read_and_checked_to_its_end() {
-        let request = json!({"model": "public", "input": ["a", "b"]});
+        let request: InferenceRequest = json!({"model": "public", "input": ["a", "b"]}).into();
         let chunks = EMBEDDING_ANSWER
             .as_bytes()
             .chunks(40)
@@ -3871,7 +4058,7 @@ pub(crate) mod tests {
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await });
         let inputs: Vec<String> = (0..INPUTS).map(|i| format!("text {i}")).collect();
-        let request = json!({"model": "public", "input": inputs});
+        let request: InferenceRequest = json!({"model": "public", "input": inputs}).into();
         let mut sink = Streaming {
             first,
             bytes: 0,

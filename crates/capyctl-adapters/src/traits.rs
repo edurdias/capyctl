@@ -56,12 +56,14 @@ pub enum RuntimeError {
 }
 
 /// ADR 0008 (owner decision 2026-09-23): the operator's next step for a
-/// capability or drift refusal. Fixed text per closed category, never detail.
+/// capability or drift refusal, or (#198) an installation the engine's entry
+/// cannot load. Fixed text per closed category, never detail.
 fn refusal_hint(reason: &str) -> String {
     match reason {
         "capability_missing:deep_park"
         | "capability_missing:core"
         | "installation_drift"
+        | "installation_unsupported:editable"
         | "nccl_library_missing"
         | "engine_config_file" => capyctl_domain::diagnostics::operator_hint(reason)
             .map(|hint| format!(" ({hint})"))
@@ -673,16 +675,17 @@ pub trait ChatForward: Send + Sync {
     /// No synchronous fallback: implementations must explicitly support this.
     async fn forward_chat_stream_async(
         &self,
-        _body: &serde_json::Value,
+        _body: &crate::request::InferenceRequest,
         _sink: &mut dyn ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
     }
-    /// Non-streaming chat completion: returns the engine's JSON response.
+    /// Non-streaming chat completion: returns the engine's answer, relayed as
+    /// the engine's bytes but the members CapyCTL sets (SPEC §10, #223).
     async fn forward_chat(
         &self,
-        body: &serde_json::Value,
-    ) -> Result<serde_json::Value, AdapterError>;
+        body: &crate::request::InferenceRequest,
+    ) -> Result<crate::answer::EngineAnswer, AdapterError>;
     /// SPEC §10: non-streaming chat completion whose backend events are
     /// reported through [`ChatSink::progressed`] on `observer` (nothing is sent
     /// to it), so the caller bounds it like a relayed stream: the request
@@ -691,9 +694,9 @@ pub trait ChatForward: Send + Sync {
     /// answers as [`ChatForward::forward_chat`].
     async fn forward_chat_observed(
         &self,
-        body: &serde_json::Value,
+        body: &crate::request::InferenceRequest,
         _observer: &mut dyn ChatSink,
-    ) -> Result<serde_json::Value, AdapterError> {
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         self.forward_chat(body).await
     }
     /// ADR 0030 §2: one decision request (`POST /v1/systemone`), sent as one
@@ -710,17 +713,17 @@ pub trait ChatForward: Send + Sync {
     /// sending.
     async fn forward_decision(
         &self,
-        _body: &serde_json::Value,
-    ) -> Result<serde_json::Value, AdapterError> {
+        _body: &crate::request::InferenceRequest,
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
     }
     /// ADR 0037 §6: as [`ChatForward::forward_decision`], sending `trace` as
     /// the request's W3C trace headers. The default sends none.
     async fn forward_decision_traced(
         &self,
-        body: &serde_json::Value,
+        body: &crate::request::InferenceRequest,
         trace: Option<&TraceHeaders>,
-    ) -> Result<serde_json::Value, AdapterError> {
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         let _ = trace;
         self.forward_decision(body).await
     }
@@ -728,7 +731,7 @@ pub trait ChatForward: Send + Sync {
     /// `[DONE]` marker is consumed by the forwarder.
     async fn forward_chat_stream(
         &self,
-        body: &serde_json::Value,
+        body: &crate::request::InferenceRequest,
         _on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<StreamEnded, AdapterError> {
         let _ = body;
@@ -776,7 +779,7 @@ pub trait ChatForward: Send + Sync {
     /// sending.
     async fn forward_embedding(
         &self,
-        _body: &serde_json::Value,
+        _body: &crate::request::InferenceRequest,
         _sink: &mut dyn EmbeddingSink,
     ) -> Result<EmbeddingAnswered, AdapterError> {
         Err(AdapterError::UnsupportedCapability)

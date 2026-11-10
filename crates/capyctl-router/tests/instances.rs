@@ -86,14 +86,18 @@ impl Engine {
 
 #[async_trait::async_trait]
 impl ChatForward for Engine {
-    async fn forward_chat(&self, _body: &Value) -> Result<Value, AdapterError> {
+    async fn forward_chat(
+        &self,
+        _body: &capyctl_adapters::request::InferenceRequest,
+    ) -> Result<capyctl_adapters::answer::EngineAnswer, AdapterError> {
         let content = self.run().await?;
         Ok(json!({"object": "chat.completion", "choices": [{"index": 0,
-            "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}]}))
+            "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}]})
+        .into())
     }
     async fn forward_chat_stream_async(
         &self,
-        _body: &Value,
+        _body: &capyctl_adapters::request::InferenceRequest,
         sink: &mut dyn ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
         let content = self.run().await?;
@@ -106,7 +110,7 @@ impl ChatForward for Engine {
     /// brace the router writes after `capyctl.metrics`.
     async fn forward_embedding(
         &self,
-        _body: &Value,
+        _body: &capyctl_adapters::request::InferenceRequest,
         sink: &mut dyn EmbeddingSink,
     ) -> Result<EmbeddingAnswered, AdapterError> {
         let content = self.run().await?;
@@ -361,6 +365,8 @@ struct Engines {
     by_generation: HashMap<i64, Arc<Engine>>,
     /// Every generation a forwarder was resolved for, in order.
     resolved: Mutex<Vec<i64>>,
+    /// Generations served by a real HTTP forwarder instead of a fake engine.
+    real: Mutex<HashMap<i64, Arc<dyn ChatForward>>>,
 }
 
 impl ForwarderSource for Engines {
@@ -377,8 +383,10 @@ impl ForwarderSource for Engines {
         if self.authority.moved.lock().unwrap().contains(&generation) {
             return Err(ForwarderError::NoRuntime(deployment.into()));
         }
+        let real = self.real.lock().unwrap().get(&generation).cloned();
+        let fake = || self.by_generation[&generation].clone() as Arc<dyn ChatForward>;
         Ok(Lane {
-            forward: self.by_generation[&generation].clone(),
+            forward: real.unwrap_or_else(fake),
             request_abort: false,
             engine_trace: false,
             trace_context: false,
@@ -404,6 +412,7 @@ fn fixture(delay_ms: u64) -> Fixture {
         authority: authority.clone(),
         by_generation: HashMap::from([(5, a.clone()), (6, b.clone())]),
         resolved: Mutex::new(Vec::new()),
+        real: Mutex::new(HashMap::new()),
     });
     let deps = RouterDeps {
         controller: authority.clone(),
@@ -737,4 +746,66 @@ async fn an_embedding_every_instance_refuses_is_unavailable() {
         f.deps.inflight.current(DEPLOYMENT) == 0
     })
     .await;
+}
+
+// T38 #213 (SPEC §10): a host ingress at its forward limit answers 429 with
+// its own code before anything reaches the engine. Streamed and collected
+// requests fail over, closing the refused lease as not accepted.
+#[tokio::test]
+async fn an_ingress_at_capacity_fails_over_to_another_instance() {
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(|| async {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("content-type", "application/json")],
+                json!({"error": {"code": capyctl_adapters::forward::INGRESS_FAILURE_CODE,
+                    "message": "Inference request is not authorized or could not complete"}})
+                .to_string(),
+            )
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", socket.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+    let f = fixture(5);
+    f.engines.real.lock().unwrap().insert(
+        5,
+        capyctl_adapters::forward::engine_forwarder(
+            base.parse().unwrap(),
+            "served".into(),
+            None,
+            capyctl_adapters::forward::CacheSalt::for_launch(Some("vllm"), DEPLOYMENT, 1),
+        ),
+    );
+    // Make host a the first choice so its ingress's refusal is exercised.
+    f.authority.report(6, 3, true);
+    let router = capyctl_router::serve_router(f.deps.clone());
+    let response = router
+        .oneshot(
+            axum::http::Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    json!({"model": ROUTE, "stream": true, "messages": []}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("answer from host-b"), "{text}");
+    assert_eq!(text.matches("[DONE]").count(), 1, "{text}");
+    assert_eq!(f.authority.ends(5), vec![Some(LeaseEnd::NotAccepted)]);
+    assert_eq!(f.authority.ends(6), vec![Some(LeaseEnd::Completed)]);
+    let answer = chat(&f).await.unwrap();
+    assert_eq!(
+        answer["choices"][0]["message"]["content"],
+        "answer from host-b"
+    );
+    assert_eq!(f.authority.ends(5), vec![Some(LeaseEnd::NotAccepted); 2]);
+    assert_eq!(f.authority.ends(6), vec![Some(LeaseEnd::Completed); 2]);
 }

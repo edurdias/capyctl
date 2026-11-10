@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::IntoResponse;
+use capyctl_adapters::answer::EngineAnswer;
 use capyctl_adapters::traits::StreamEnded;
 use capyctl_adapters::{AdapterError, ChatForward};
 use capyctl_router::{admission::InFlight, stream::stream_response};
@@ -21,7 +22,10 @@ struct Forward {
 
 #[async_trait]
 impl ChatForward for Forward {
-    async fn forward_chat(&self, _: &Value) -> Result<Value, AdapterError> {
+    async fn forward_chat(
+        &self,
+        _: &capyctl_adapters::request::InferenceRequest,
+    ) -> Result<EngineAnswer, AdapterError> {
         if let Some(gate) = &self.finish_gate {
             gate.notified().await;
         }
@@ -30,7 +34,7 @@ impl ChatForward for Forward {
 
     async fn forward_chat_stream_async(
         &self,
-        _: &Value,
+        _: &capyctl_adapters::request::InferenceRequest,
         sink: &mut dyn capyctl_adapters::traits::ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
         for index in 0..self.chunks {
@@ -58,7 +62,7 @@ impl ChatForward for Forward {
 fn response(forward: Forward, counts: &Arc<InFlight>) -> axum::response::Response {
     stream_response(
         Arc::new(forward),
-        json!({"model":"m"}),
+        json!({"model":"m"}).into(),
         counts.guard_arc("d"),
         None,
     )
@@ -293,13 +297,16 @@ impl Drop for MarkDropped {
 
 #[async_trait]
 impl ChatForward for BeforeFirstToken {
-    async fn forward_chat(&self, _: &Value) -> Result<Value, AdapterError> {
+    async fn forward_chat(
+        &self,
+        _: &capyctl_adapters::request::InferenceRequest,
+    ) -> Result<EngineAnswer, AdapterError> {
         std::future::pending().await
     }
 
     async fn forward_chat_stream_async(
         &self,
-        _: &Value,
+        _: &capyctl_adapters::request::InferenceRequest,
         _: &mut dyn capyctl_adapters::traits::ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
         let _mark = MarkDropped(self.dropped.clone());
@@ -319,7 +326,7 @@ async fn a_hang_up_before_the_first_token_drops_the_forward() {
         Arc::new(BeforeFirstToken {
             dropped: dropped.clone(),
         }),
-        json!({"model":"m"}),
+        json!({"model":"m"}).into(),
         counts.guard_arc("d"),
         None,
     )
@@ -375,12 +382,15 @@ async fn stalled_delivery_times_out_without_done_but_settles_verified_backend() 
 struct PanicForward;
 #[async_trait]
 impl ChatForward for PanicForward {
-    async fn forward_chat(&self, _: &Value) -> Result<Value, AdapterError> {
+    async fn forward_chat(
+        &self,
+        _: &capyctl_adapters::request::InferenceRequest,
+    ) -> Result<EngineAnswer, AdapterError> {
         unreachable!()
     }
     async fn forward_chat_stream_async(
         &self,
-        _: &Value,
+        _: &capyctl_adapters::request::InferenceRequest,
         _: &mut dyn capyctl_adapters::traits::ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
         panic!("backend task lost");
@@ -392,7 +402,7 @@ async fn backend_panic_keeps_abandoned_accounting() {
     let counts = Arc::new(InFlight::default());
     let response = stream_response(
         Arc::new(PanicForward),
-        json!({"model":"m"}),
+        json!({"model":"m"}).into(),
         counts.guard_arc("d"),
         None,
     )
@@ -416,12 +426,15 @@ struct Paced {
 
 #[async_trait]
 impl ChatForward for Paced {
-    async fn forward_chat(&self, _: &Value) -> Result<Value, AdapterError> {
+    async fn forward_chat(
+        &self,
+        _: &capyctl_adapters::request::InferenceRequest,
+    ) -> Result<EngineAnswer, AdapterError> {
         unreachable!()
     }
     async fn forward_chat_stream_async(
         &self,
-        _: &Value,
+        _: &capyctl_adapters::request::InferenceRequest,
         sink: &mut dyn capyctl_adapters::traits::ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
         for index in 0..self.chunks {
@@ -450,7 +463,7 @@ fn paced(
     capyctl_router::stream::stream_planned_timed(
         capyctl_router::balance::Attempt::direct(Arc::new(forward), None),
         None,
-        json!({"model":"m"}),
+        json!({"model":"m"}).into(),
         counts.guard_arc("d"),
         capyctl_router::timing::RequestTiming::untracked(),
         bounds,
@@ -528,12 +541,15 @@ struct Prefilling {
 
 #[async_trait]
 impl ChatForward for Prefilling {
-    async fn forward_chat(&self, _: &Value) -> Result<Value, AdapterError> {
+    async fn forward_chat(
+        &self,
+        _: &capyctl_adapters::request::InferenceRequest,
+    ) -> Result<EngineAnswer, AdapterError> {
         unreachable!()
     }
     async fn forward_chat_stream_async(
         &self,
-        _: &Value,
+        _: &capyctl_adapters::request::InferenceRequest,
         sink: &mut dyn capyctl_adapters::traits::ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
         let chunk = |delta: Value| {
@@ -569,7 +585,7 @@ async fn a_prefill_after_the_opening_chunk_is_bounded_by_the_deadline_not_the_id
             None,
         ),
         None,
-        json!({"model":"m"}),
+        json!({"model":"m"}).into(),
         counts.guard_arc("d"),
         capyctl_router::timing::RequestTiming::untracked(),
         bounds,

@@ -26,7 +26,8 @@
 //! An engine figure wins; the router derives `ttft_ms` and
 //! `decode_tokens_per_second` from its own clock only when the engine sent
 //! none, and labels them `router`. A figure nobody measured is absent, never
-//! zero. The engine's own fields are left as it sent them.
+//! zero. The engine's own fields are left as it sent them, byte for byte
+//! (SPEC §10, issue #223): the figures are added as one more member.
 //!
 //! A non-streaming answer carries the set in its body as `capyctl.metrics`; a
 //! stream carries it as one SSE comment line (`: x-capyctl-metrics {...}`)
@@ -39,6 +40,7 @@
 //! `cached_tokens` where it reported them (read as for chat), and the
 //! engine's `input_tokens` from its `usage`.
 
+use capyctl_adapters::answer::EngineAnswer;
 use serde_json::{json, Map, Value};
 
 use crate::timing::RequestTiming;
@@ -76,7 +78,9 @@ impl EngineReport {
     /// nothing, so most chunks are never parsed. llama.cpp v0.6.0 puts
     /// `timings` on its last chunk (the usage chunk, else the finish chunk).
     pub fn may_carry(chunk: &str) -> bool {
-        chunk.contains("\"tensorfold\"")
+        // SPEC §17: an escaped key in a raw chunk must reach the JSON parser.
+        chunk.contains("\\u")
+            || chunk.contains("\"tensorfold\"")
             || chunk.contains("\"metrics\"")
             || chunk.contains("\"timings\"")
             || (chunk.contains("\"usage\"")
@@ -204,13 +208,11 @@ pub fn metrics(report: &EngineReport, timing: &RequestTiming) -> Value {
 }
 
 /// A non-streaming answer: its figures go in the body as `capyctl.metrics`.
-pub fn attach(response: &mut Value, timing: &RequestTiming) {
+pub fn attach(response: &mut EngineAnswer, timing: &RequestTiming) {
     let mut report = EngineReport::default();
     report.observe(response);
     let figures = metrics(&report, timing);
-    if let Some(body) = response.as_object_mut() {
-        body.insert(BODY_KEY.to_owned(), json!({ "metrics": figures }));
-    }
+    response.set(BODY_KEY, json!({ "metrics": figures }));
 }
 
 /// ADR 0030 §2 (owner decision 2026-10-19): the figures of one decision, each
@@ -258,13 +260,11 @@ pub fn decision_metrics(report: &EngineReport, response: &Value, timing: &Reques
 }
 
 /// A decision's answer: its figures go in the body as `capyctl.metrics`.
-pub fn attach_decision(response: &mut Value, timing: &RequestTiming) {
+pub fn attach_decision(response: &mut EngineAnswer, timing: &RequestTiming) {
     let mut report = EngineReport::default();
     report.observe(response);
     let figures = decision_metrics(&report, response, timing);
-    if let Some(body) = response.as_object_mut() {
-        body.insert(BODY_KEY.to_owned(), json!({ "metrics": figures }));
-    }
+    response.set(BODY_KEY, json!({ "metrics": figures }));
 }
 
 /// ADR 0036 §9: the figures of one embeddings request, each labelled with its
@@ -534,6 +534,19 @@ mod tests {
         ));
     }
 
+    // T19: SPEC §17 figures must survive escaped keys in raw engine chunks.
+    #[test]
+    fn escaped_metric_keys_are_not_filtered_out() {
+        for chunk in [
+            r#"{"\u0075sage":{"completion_tokens":8}}"#,
+            r#"{"\u006detrics":{"queue_time_ms":2}}"#,
+            r#"{"\u0074ensorfold":{"time_to_first_token":0.1}}"#,
+            r#"{"\u0074imings":{"prompt_ms":2}}"#,
+        ] {
+            assert!(EngineReport::may_carry(chunk), "{chunk}");
+        }
+    }
+
     /// llama.cpp v0.6.0 `server_slot_stats::to_json` as one answer carries it.
     fn llamacpp_timings(predicted_per_second: f64) -> Value {
         json!({"cache_n": 8, "prompt_n": 4, "prompt_ms": 12.5,
@@ -571,14 +584,14 @@ mod tests {
     // router's `ttft_ms` and no `queue_ms`.
     #[test]
     fn llamacpp_answer_maps_timings_and_usage() {
-        let mut answer = json!({
+        let engine = json!({
             "choices": [{"finish_reason": "stop", "index": 0,
                 "message": {"role": "assistant", "content": "hi"}}],
             "created": 1, "model": "m", "system_fingerprint": "b1-abc",
             "object": "chat.completion", "usage": llamacpp_usage(), "id": "chatcmpl-1",
             "timings": llamacpp_timings(60.0)
         });
-        let engine = answer.clone();
+        let mut answer = EngineAnswer::from(engine.clone());
         let timing = router_clock();
         attach(&mut answer, &timing);
         let figures = &answer["capyctl"]["metrics"];
@@ -686,7 +699,7 @@ mod tests {
     fn attach_leaves_the_engine_fields() {
         let engine = json!({"choices": [], "metrics": {"queue_time_ms": 1.0},
             "tensorfold": {"seconds": 1.0}});
-        let mut answer = engine.clone();
+        let mut answer = EngineAnswer::from(engine.clone());
         attach(&mut answer, &RequestTiming::untracked());
         for key in ["choices", "metrics", "tensorfold"] {
             assert_eq!(answer[key], engine[key]);
@@ -705,7 +718,7 @@ mod tests {
         let engine = json!({"model": "m", "answers": {"q": {"type": "noul", "noul": 0.6}},
             "usage": {"input_tokens": 87, "output_tokens": 0},
             "timings": {"prompt_ms": 12.5, "predicted_per_second": 40.0}});
-        let mut answer = engine.clone();
+        let mut answer = EngineAnswer::from(engine.clone());
         attach_decision(&mut answer, &RequestTiming::untracked());
         for key in ["model", "answers", "usage", "timings"] {
             assert_eq!(answer[key], engine[key]);
@@ -717,7 +730,7 @@ mod tests {
                 "prefill_ms": {"value": 12.5, "source": "engine"},
             })
         );
-        let mut bare = json!({"answers": {}});
+        let mut bare = EngineAnswer::from(json!({"answers": {}}));
         attach_decision(&mut bare, &RequestTiming::untracked());
         assert_eq!(bare["capyctl"]["metrics"], json!({}));
     }

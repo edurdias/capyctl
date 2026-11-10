@@ -342,6 +342,13 @@ pub enum LifecycleError {
     /// reason, naming the memory limit it hit (SPEC §14).
     #[error("endpoint capacity exhausted")]
     CapacityBlocked(Option<String>),
+    /// SPEC §14 (#241): no allowed host can take the start as its limits
+    /// stand: on every host that refused it for capacity, its need is above a
+    /// memory domain's whole managed limit. Each host's reason names the
+    /// setting to raise; waiting, stopping another deployment or evicting
+    /// cannot place it.
+    #[error("start needs more memory than a managed limit allows")]
+    CapacityBeyondLimit(String),
     #[error("lifecycle command queue full")]
     QueueFull,
     #[error("resource policy requires reconciliation")]

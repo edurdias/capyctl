@@ -733,7 +733,7 @@ impl EngineAdapter for FakeEngine {
 impl capyctl_adapters::traits::ChatForward for FakeEngine {
     async fn forward_chat_stream_async(
         &self,
-        body: &serde_json::Value,
+        body: &capyctl_adapters::request::InferenceRequest,
         sink: &mut dyn capyctl_adapters::traits::ChatSink,
     ) -> Result<capyctl_adapters::traits::StreamEnded, AdapterError> {
         self.chat()?;
@@ -758,29 +758,30 @@ impl capyctl_adapters::traits::ChatForward for FakeEngine {
     /// as the engine would (a chat model has no such endpoint).
     async fn forward_decision(
         &self,
-        body: &serde_json::Value,
-    ) -> Result<serde_json::Value, AdapterError> {
-        self.decision_response(body)
+        body: &capyctl_adapters::request::InferenceRequest,
+    ) -> Result<capyctl_adapters::answer::EngineAnswer, AdapterError> {
+        self.decision_response(body).map(Into::into)
     }
     async fn forward_chat(
         &self,
-        body: &serde_json::Value,
-    ) -> Result<serde_json::Value, AdapterError> {
+        body: &capyctl_adapters::request::InferenceRequest,
+    ) -> Result<capyctl_adapters::answer::EngineAnswer, AdapterError> {
         self.chat()?;
         if let Some(state) = self.lifecycle.lock().unwrap().as_mut() {
-            return state.forward(body);
+            return state.forward(body).map(Into::into);
         }
         let model = body["model"].as_str().unwrap_or("fake").to_string();
         Ok(serde_json::json!({
             "id": "fake-completion",
             "model": model,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}]
-        }))
+        })
+        .into())
     }
 
     async fn forward_chat_stream(
         &self,
-        body: &serde_json::Value,
+        body: &capyctl_adapters::request::InferenceRequest,
         on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<capyctl_adapters::traits::StreamEnded, AdapterError> {
         self.chat()?;
@@ -814,7 +815,7 @@ impl capyctl_adapters::traits::ChatForward for FakeEngine {
     /// 2026-10-27, question 7).
     async fn forward_embedding(
         &self,
-        body: &serde_json::Value,
+        body: &capyctl_adapters::request::InferenceRequest,
         sink: &mut dyn capyctl_adapters::traits::EmbeddingSink,
     ) -> Result<capyctl_adapters::traits::EmbeddingAnswered, AdapterError> {
         capyctl_adapters::embedding_request::validate_embedding_request(body)?;
@@ -882,12 +883,12 @@ mod tests {
         }
     }
 
-    fn request(extra: serde_json::Value) -> serde_json::Value {
+    fn request(extra: serde_json::Value) -> capyctl_adapters::request::InferenceRequest {
         let mut body = serde_json::json!({"model": "public", "input": ["one", "two"]});
         body.as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
-        body
+        body.into()
     }
 
     /// ADR 0036 plan item 7 (T47): a well-formed answer streams to the sink

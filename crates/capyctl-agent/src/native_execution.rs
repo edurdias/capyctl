@@ -167,6 +167,9 @@ pub struct NativeHostExecution {
     /// ADR 0037 §4: the tracing the host's lifecycle steps are recorded
     /// with; `None` reads the host role's installed tracing.
     tracing: Option<capyctl_trace::Tracing>,
+    /// #226 (SPEC §7.2): how a launch on unified memory gives back its
+    /// checkpoint's page cache before its engine starts.
+    page_cache: Arc<dyn crate::page_cache::PageCacheAdvice>,
 }
 
 /// A GPU sample taken for one command before the journal was locked, and when.
@@ -311,6 +314,7 @@ impl NativeHostExecution {
             lmcache_verdicts: Arc::default(),
             host_load,
             tracing: None,
+            page_cache: Arc::new(crate::page_cache::Fadvise),
         });
         this.prime_gpu();
         this
@@ -510,6 +514,31 @@ impl NativeHostExecution {
         Arc::make_mut(&mut self).checkpoints = Arc::new(checkpoints);
         self
     }
+
+    /// #226: give back a launch's checkpoint page cache through `advice`
+    /// instead of `posix_fadvise` (tests observe the files a launch advised).
+    #[doc(hidden)]
+    pub fn with_page_cache_advice(
+        mut self: Arc<Self>,
+        advice: Arc<dyn crate::page_cache::PageCacheAdvice>,
+    ) -> Arc<Self> {
+        Arc::make_mut(&mut self).page_cache = advice;
+        self
+    }
+
+    /// #226 (SPEC §7.2): right before an engine starts, after its checkpoint
+    /// was last read here, give back that checkpoint's page cache when the
+    /// engine starts on unified memory (`crate::page_cache`). Best effort: it
+    /// never fails or refuses the launch.
+    pub(crate) async fn drop_page_cache(&self, effective: &EffectiveDeployment, deployment: &str) {
+        let effective = effective.clone();
+        let advice = self.page_cache.clone();
+        let deployment = deployment.to_owned();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::page_cache::before_launch(&effective, advice.as_ref(), &deployment)
+        })
+        .await;
+    }
     /// ADR 0008: materialize model sources through this store instead of the
     /// one built from the host document (tests serve a loopback origin).
     pub fn with_model_sources(
@@ -689,49 +718,14 @@ impl NativeHostExecution {
                 .map_err(|_| JournalError::Unauthorized)?;
         // Owner decision 2026-09-23: the launch's starting phase is charged the
         // startup peak the server reserved (declared, measured or placeholder),
-        // never below the steady request this host resolved itself.
-        if let (Some(startup), [cold], [ready]) = (
-            plan.startup_bytes,
-            effective.resources.cold.allocations.as_mut_slice(),
-            effective.resources.ready.allocations.as_slice(),
-        ) {
-            cold.bytes = startup.max(ready.bytes);
-        }
-        // ADR 0019 §3: on a discrete GPU measured per domain, the card's and
-        // host RAM's startup charges apart, each never below the steady
-        // charge this host resolved on that domain. ADR 0035 §3: on N GPUs
-        // the card's figure is per GPU and is laid over each of them.
-        if let (
-            Some(device_startup),
-            Some(host_startup),
-            Some(capyctl_config::effective::StartupMeasure::Domains { host, .. }),
-        ) = (
+        // never below the steady request this host resolved itself. ADR 0019
+        // §3: on a discrete GPU the card's and host RAM's apart (ADR 0035 §3:
+        // per GPU), #219: measured or not.
+        capyctl_config::effective::apply_planned_startup(
+            &mut effective,
             plan.startup_bytes,
             plan.startup_host_bytes,
-            capyctl_config::effective::startup_measure(&effective),
-        ) {
-            let devices = capyctl_config::effective::startup_device_domains(&effective);
-            let steady = |domain: &str| {
-                effective
-                    .resources
-                    .ready
-                    .allocations
-                    .iter()
-                    .filter(|ready| ready.domain == domain)
-                    .fold(0_i64, |sum, ready| sum.saturating_add(ready.bytes))
-            };
-            let charges: Vec<(String, i64)> = devices
-                .iter()
-                .map(|device| (device.clone(), device_startup.max(steady(device))))
-                .chain([(host.clone(), host_startup.max(steady(&host)))])
-                .collect();
-            for cold in &mut effective.resources.cold.allocations {
-                if let Some((_, bytes)) = charges.iter().find(|(domain, _)| *domain == cold.domain)
-                {
-                    cold.bytes = *bytes;
-                }
-            }
-        }
+        );
         // ADR 0033 §§3, 6 (lifecycle design §7): the LMCache grant's ports are
         // this host's to lease, and its charge is laid over the phases after
         // the startup overrides, so admission, co-residence and retained
@@ -1181,8 +1175,10 @@ impl NativeHostExecution {
 
     /// SPEC §13.3 / T21: the bounded, redacted end of one launch's engine
     /// log. Not journaled: it reads and changes nothing. The log is derived
-    /// from this host's own log directory and only for a launch it still
-    /// claims for the command's deployment; the wire never names a path. A
+    /// from this host's own log directory and only for a launch this host
+    /// accepted for the command's deployment: one it still claims, or (#226)
+    /// one of the command's generation whose claim was released, such as a
+    /// launch that failed before readiness; the wire never names a path. A
     /// failed read is a closed state in a completed result, never native
     /// error text, and never ends the session.
     async fn engine_log_tail(
@@ -1201,21 +1197,14 @@ impl NativeHostExecution {
         }
         let host = self.clone();
         let deployment = id.deployment_id.clone();
+        let generation = id.generation;
         let plan = plan.clone();
         let read = tokio::task::spawn_blocking(move || {
-            let claimed = host
+            let accepted = host
                 .journal
-                .claimed_launches("")
+                .accepted_launch(&deployment, generation, &plan.incarnation)
                 .map_err(|_| TailError::Unreadable(String::new()))?;
-            let owned = claimed.iter().any(|launch| {
-                launch.command.identity.deployment_id == deployment
-                    && launch
-                        .command
-                        .action
-                        .launch_plan()
-                        .is_some_and(|launch| launch.incarnation == plan.incarnation)
-            });
-            if !owned {
+            if !accepted {
                 return Err(TailError::Missing);
             }
             capyctl_adapters::engine_log::read_tail(
@@ -1814,6 +1803,11 @@ impl NativeHostExecution {
                 )
                 .map_err(|_| SessionError)?;
         }
+        // #226 (SPEC §7.2): admission has read the checkpoint (the recheck at
+        // the spawn reads its small files at most); on unified memory its page
+        // cache is given back before the engine starts.
+        self.drop_page_cache(&effective, &command.identity.deployment_id)
+            .await;
         let initialized = adapter
             .execute_persisted(&initialize_command(command, plan, &effective))
             .await;
@@ -2899,7 +2893,7 @@ async fn fresh_probe(
     });
     let answer = tokio::time::timeout(
         remaining().min(PROBE_CHAT_TIMEOUT),
-        engine.forward_chat(&body),
+        engine.forward_chat(&body.into()),
     )
     .await
     .map_err(|_| SessionError)?
@@ -4487,13 +4481,14 @@ mod tests {
     }
 
     /// SPEC §13.3 / T21: an engine log tail reads this host's own log of a
-    /// launch it claims for the command's deployment, bounded and redacted.
-    /// A raw development log, an unclaimed incarnation and another
-    /// deployment's launch carry no text; none ends the session, and no
-    /// answer names a path.
+    /// launch it accepted for the command's deployment, bounded and redacted,
+    /// while it claims it and (#226) at its generation after the claim is
+    /// released. A raw development log, an unknown incarnation, another
+    /// generation's read of a released launch and another deployment's launch
+    /// carry no text; none ends the session, and no answer names a path.
     // T21 T34
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn engine_log_tail_serves_a_claimed_launch_bounded_and_redacted() {
+    async fn engine_log_tail_serves_an_accepted_launch_bounded_and_redacted() {
         let root = directory();
         let identity_dir = directory();
         let (executor, deployment, policy) = checkpoint_fixture(root.path(), identity_dir.path());
@@ -4559,11 +4554,32 @@ mod tests {
                 ("missing", "")
             );
         }
+        // #226: a launch whose claim a Terminate released (one that failed
+        // before readiness) still serves its log at its own generation, and
+        // at no other.
+        let mut terminate = MemberCommand {
+            identity: checkpoint_identity("terminate", "retained"),
+            action: MemberAction::Terminate {
+                owned_handle: "launch".into(),
+                recorded: Vec::new(),
+            },
+        };
+        terminate.identity.payload_digest = terminate.canonical_digest();
+        let terminated = executor.execute(session, terminate).await.unwrap();
+        assert!(!terminated.claim_retained, "{terminated:?}");
+        let released = run(tail("t7", "deployment", &plan.incarnation, 1024)).await;
+        assert_eq!(released.state, "served");
+        assert!(released.text.ends_with("ready\n"), "{}", released.text);
+        let mut later = tail("t8", "deployment", &plan.incarnation, 1024);
+        later.identity.generation = 2;
+        later.identity.payload_digest = later.canonical_digest();
+        let later = run(later).await;
+        assert_eq!((later.state.as_str(), later.text.as_str()), ("missing", ""));
         // SPEC §13.3: a log written under --debug-engine-logs is never served.
         std::fs::write(capyctl_adapters::engine_log::raw_marker(&log), "").unwrap();
         let raw = run(tail("t4", "deployment", &plan.incarnation, 1024)).await;
         assert_eq!((raw.state.as_str(), raw.text.as_str()), ("raw", ""));
-        // A claimed launch whose log is gone is `missing`.
+        // An accepted launch whose log is gone is `missing`.
         std::fs::remove_file(capyctl_adapters::engine_log::raw_marker(&log)).unwrap();
         std::fs::remove_file(&log).unwrap();
         let gone = run(tail("t5", "deployment", &plan.incarnation, 1024)).await;
@@ -6357,6 +6373,62 @@ mod tests {
                 profiles[0].installation_observed_digest,
                 crate::installation::UNMEASURED
             );
+        }
+    }
+
+    /// T21 T34 #198 (ADR 0017 §2, ADR 0008 amendment 2026-10-30): an
+    /// enrolled host never refuses a launch with
+    /// `installation_unsupported:editable`, a code no 0.1.x server knows (its
+    /// refusal check would end the whole control session on it). An editable
+    /// SGLang takes the pre-#198 path under either drift policy: unmeasured,
+    /// admitted on (here to the fixture's unrecorded checkpoint, the next
+    /// gate), and failed at the engine's start by the entry's
+    /// `engine_import_failed` in the free-text launch failure.
+    #[test]
+    fn a_host_never_refuses_an_editable_sglang_with_a_code_servers_do_not_know() {
+        for policy in ["warn", "refuse"] {
+            let root = directory();
+            let identity_dir = directory();
+            let venv = root.path().join("opt/sglang");
+            let site = venv.join("lib/python3.12/site-packages");
+            std::fs::create_dir_all(site.join("sglang-0.5.22.dist-info")).unwrap();
+            std::fs::write(
+                site.join("__editable__.sglang-0.5.22.pth"),
+                "import __editable___sglang_0_5_22_finder; __editable___sglang_0_5_22_finder.install()\n",
+            )
+            .unwrap();
+            std::fs::create_dir_all(venv.join("bin")).unwrap();
+            std::fs::write(venv.join("bin/python3"), "").unwrap();
+            let executable = venv.join("bin/python3");
+            assert_eq!(
+                crate::installation::unsupported_installation(Engine::Sglang, &executable),
+                Some(crate::installation::EDITABLE_REFUSAL)
+            );
+            let (executor, deployment, policy_fingerprint) = sglang_fixture_with(
+                root.path(),
+                identity_dir.path(),
+                "restart_only",
+                |document| {
+                    let profile = &mut document["runtime_profiles"]["local"];
+                    profile["executable"] = executable.to_string_lossy().into_owned().into();
+                    profile["security"]["installation_drift"] = policy.into();
+                },
+            );
+            sglang_runtime(root.path());
+            let (mut launch, _) = launch_with(&deployment, &policy_fingerprint, "");
+            launch.identity.payload_digest = launch.canonical_digest();
+            let MemberAction::LaunchSingle(plan) = launch.action.clone() else {
+                panic!("a launch");
+            };
+            let verdict = executor.admit_launch(&launch, &plan, GpuReading::Now);
+            assert_eq!(
+                verdict,
+                Err(LaunchVerdict::Refused("checkpoint_mismatch")),
+                "{policy}"
+            );
+            if let Err(LaunchVerdict::Refused(reason)) = verdict {
+                assert!(capyctl_protocol::execution::is_policy_refusal(reason));
+            }
         }
     }
 

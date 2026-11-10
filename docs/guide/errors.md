@@ -28,7 +28,7 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 2 | `custom_credential_ref_missing` | A custom engine profile written by hand states no `security.credential_ref`, or a blank one. | Add `credential_ref: "secret://engine-key"` under the profile's `security` ([Custom engines](../operations/configuration.md#custom-engines)). |
 | 2 | `declined` | `capyctl engine add --custom` asked for confirmation and the answer was not `y` or `yes`. Nothing was written. | Run it again and answer `y`, after checking what it prints. |
 | 3 | `unauthorized` | The credentials were refused. | Check the admin token or the host's identity. |
-| 4 | `insufficient_resources` | No host has the GPU memory the deployment needs. The message names each host's limit, for example `host a needs 64.0 GiB of gpu0 memory, 60.8 GiB free of its 60.8 GiB limit`. When the memory is there but the room for KV cache kept in host RAM (an LMCache pool) is not, it says `host_kv` with the numbers and the setting to raise, for example `host spark: insufficient_capacity: host_kv (needs 20.0 GiB, limit 12.2 GiB; raise host.resource_policy.memory.system.host_kv_limit or lower lmcache_pool)`. | Stop or park another deployment, start with `--evict`, or lower the deployment's memory. For `host_kv`, raise the setting it names ([Standalone host-KV limit](../operations/configuration.md#standalone-host-kv-limit); on a machine of several, its document's `resource_policy.domains.<domain>.host_kv_limit`) or lower `lmcache_pool`. |
+| 4 | `insufficient_resources` | No host has the memory the deployment needs. The message names each host's limit, for example `host a needs 10.0 GiB of unified memory, 7.0 GiB free of its 15.0 GiB limit`. When the deployment needs more than a whole limit, so that it cannot start there even with nothing else running (a startup peak a first run measured can, for example host RAM on a discrete GPU), it says so and names the setting to raise, for example `host lab needs 26.3 GiB of system memory, above its whole 16.0 GiB limit (raise host.resource_policy.memory.system.managed_limit)`; when that is so on every host that refused it, the message does not suggest waiting or `--evict`. When the memory is there but the room for KV cache kept in host RAM (an LMCache pool) is not, it says `host_kv` with the numbers and the setting to raise, for example `host spark: insufficient_capacity: host_kv (needs 20.0 GiB, limit 12.2 GiB; raise host.resource_policy.memory.system.host_kv_limit or lower lmcache_pool)`. | Stop or park another deployment, start with `--evict`, or lower the deployment's memory. Above a whole limit, raise the setting it names ([Standalone memory limits](../operations/configuration.md#standalone-memory-limits); on a machine of several, its document's `resource_policy.domains.<domain>.managed_limit`) or lower the deployment's memory; on standalone a card's limit is derived from the card and cannot be raised. For `host_kv`, raise the setting it names ([Standalone host-KV limit](../operations/configuration.md#standalone-host-kv-limit); on a machine of several, its document's `resource_policy.domains.<domain>.host_kv_limit`) or lower `lmcache_pool`. |
 | 4 | `insufficient_device_memory` | The card cannot hold the model, or another program holds its memory now. On a machine with several GPUs the message names the `tensor_parallel` whose share would fit each card and how many GPUs that needs, or says that no number of the machine's GPUs fits and gives the share per GPU at that number. | Use a smaller or quantized checkpoint, a smaller KV cache, free the card, or spread the model with the `topology` the message names ([One model on several GPUs](deploy.md#one-model-on-several-gpus)). vLLM needs a card of about 10 GiB or more. |
 | 4 | `insufficient_gpus` | No allowed machine has as many identical GPUs as `tensor_parallel`; the message names the number needed, each machine's count, and the `tensor_parallel` that would fit. | Lower `tensor_parallel`, use `topology: auto`, or place the model on a machine with more GPUs. |
 | 4 | `device_unobserved` | `nvidia-smi` gave no fresh reading for that GPU, so nothing new starts on it. | Check that `nvidia-smi` works on that machine, then retry. |
@@ -74,6 +74,7 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 15 | `host_ineligible` | No allowed host can take the deployment: drained, revoked, offline or too old. | Undrain, reconnect, upgrade or re-enroll the host the message names. |
 | 16 | `engine_not_found` | The path holds no `vllm`, `sglang` or `tensorfold` package and is no `llama-server` or `tensorfold-native` binary; or, with `--custom`, the executable is missing or is not an executable file. | Name the environment, its `bin/vllm`, `bin/tensorfold` or `bin/python3`, a `llama-server` binary or its directory, or a TensorFold native release directory or its `bin/tensorfold-native`, or search with `capyctl engine detect --path <dir>`; with `--custom`, name the program itself. |
 | 17 | `engine_unsupported` | The package is not a supported engine; or `llama-server --version` printed no version line CapyCTL reads; or the machine has `/etc/llama.cpp/config.ini`, which llama-server would read as options; or a TensorFold native release changed after it was unpacked (a file listed in its `SHA256SUMS` is missing or different), or its `capabilities --json` document lacks a flag or variable CapyCTL renders; or a `bin/tensorfold` outside a Python environment. | Register a vLLM, SGLang, TensorFold or llama.cpp installation; for llama.cpp, remove `/etc/llama.cpp/config.ini`; for TensorFold native, unpack the release archive again and register its `tensorfold-native`. |
+| 17 | `installation_unsupported:editable` | `capyctl engine add` found SGLang installed in editable mode (`pip install -e`, as in the official `lmsysorg/sglang` image): its package is in a source checkout, reached only through a `.pth` file, and CapyCTL loads SGLang from the environment's `site-packages` without running `.pth` files. Nothing was written. | Reinstall SGLang without `-e` ([Install an engine](install-engines.md#sglang-0521-or-0520)), then add it again. |
 | 18 | `engine_version_failed` | The engine's version check failed or timed out, or TensorFold native's version line disagrees with its `VERSION` file; nothing was written. | Repair the installation until its version check succeeds, then add it again. |
 | 19 | `profile_exists` | The engine profile name is taken. | Pass `--name`, or remove the existing profile first. |
 | 20 | `profile_in_use` | Removing or replacing the engine would affect the deployments listed. | Stop them, or rerun with `--drain`. |
@@ -169,6 +170,22 @@ A deployment on one machine can show these codes the same way:
   another process group than the engine's (as an MPI daemon that detaches
   would); the message names the process. CapyCTL stops it and waits until
   both the group and that process are gone, then fails the start.
+- `installation_unsupported:editable` (SGLang): the engine's SGLang is installed
+  in editable mode, which CapyCTL cannot load (the row for exit 17 above).
+  Standalone refuses the start before anything runs, whatever the profile's
+  `installation_drift` says; this also covers `--sglang-bin` and `local_engine`.
+  An enrolled host refuses it too when the server accepts this code (0.2.0);
+  toward a 0.1.x server it starts the engine, which fails `engine_import_failed`,
+  and keeps the control session up. Reinstall SGLang without `-e`.
+- `engine_import_failed` (SGLang): the engine exited before readiness because
+  CapyCTL's interpreter could not import SGLang from the environment's
+  `site-packages`: an editable install on an enrolled host toward a 0.1.x
+  server, or a module SGLang imports that is missing or broken. The last line
+  of the engine log is `sglang_startup_failed: engine_import_failed` with what
+  to check; CapyCTL prints no more of the error, since it can quote paths.
+  Reinstall an editable SGLang without `-e`; otherwise check that the environment's
+  `bin/python3 -c "import sglang.srt.entrypoints.http_server"` succeeds,
+  repair what it names, and start again.
 - `custom_listener_exposed` (custom engine): once the engine passed its
   check, one of its processes listened on an address other than `127.0.0.1`
   or `::1`; the message names the address and port. CapyCTL stops the engine
@@ -213,6 +230,15 @@ The inference endpoint answers HTTP errors with a JSON body holding `code` and
   An embedding answer that fails CapyCTL's checks after part of it was sent
   does not end with this error: you get HTTP 200 and an incomplete JSON body
   that no JSON parser accepts ([The answer arrives as it is made](requests.md#the-answer-arrives-as-it-is-made)).
+  On a stream that had
+  sent no output yet, this arrives as an error event with the same code and
+  message and `retryable` set to `false`, also when the request is cut at its
+  deadline; such a stream never just ends without an event.
+- `unavailable` (503, `retryable: true`): among other causes, a serving
+  host's ingress was already forwarding as many requests as it allows (64)
+  and refused this one before it reached the engine. CapyCTL first tries
+  another instance of the model; this answer means none could take it. On a
+  stream it arrives as an error event.
 
 For decision models:
 

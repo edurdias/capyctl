@@ -206,7 +206,7 @@ curl -fsSL https://edurdias.github.io/capyctl/install.sh | sudo sh -s -- --syste
 A downloaded copy takes the same options: `sh install.sh --version <version>`.
 
 **Choosing a release.** `--version` is optional (for example
-`--version v0.1.9`; the leading `v` is optional). GitHub's "latest release"
+`--version v0.1.11`; the leading `v` is optional). GitHub's "latest release"
 never resolves to a pre-release or a draft, so a release candidate is
 installed only by naming it.
 
@@ -564,13 +564,39 @@ the card (weights, KV cache, and the engine's CUDA context and graphs, 1.25 GiB
 until measured) and in host RAM (the engine process itself, 4 GiB until
 measured). A deployment that states no memory is sized from its checkpoint:
 `weights × 1.10` plus a KV cache of `min(4 GiB, 25 % of the card's managed
-limit)`. A vLLM deployment asks for at least 75 % of the card, because vLLM
-0.29 with CUDA graphs does not start a 4B model on a 16 GB card below
-`--gpu-memory-utilization 0.75`; for the same reason vLLM needs a card of
-about 10 GiB or more. On a smaller card the host still starts, and each vLLM
-deployment is refused with `insufficient_device_memory` and its numbers. A deployment that lists `resources:` itself must
+limit)`. A vLLM deployment whose request CapyCTL sizes asks for at least 75 %
+of the card, and vLLM is told `--gpu-memory-utilization 0.75` or the request's
+share above it: vLLM 0.29 with CUDA graphs did not start a 4B model on a 16 GB
+card below 0.75. The KV cache is always passed to vLLM in bytes, so the floor
+does not size it; on a large card it holds far more than the model uses (the
+request on a 96 GB card is 71.7 GiB). To take the floor off, state
+`engine_config.memory.request` yourself, for example from the startup peak
+CapyCTL measured on the card (`startup.measured` in `capyctl status deployment
+<name> --json`) less 1.25 GiB for the CUDA context. A request smaller than
+the weights plus the KV cache is refused; the weights × 1.10 plus the KV
+cache, as CapyCTL sizes it, leaves room for the engine's own memory. The card
+is then charged that request and vLLM is told its share of the card, so
+another model can start beside it. Below about
+0.75 of a small card, check that the model still starts. With the floor and
+the CUDA context, a vLLM deployment that states no
+request needs a card of about 10 GiB or more. On a smaller card the host still
+starts, and each such vLLM deployment is refused with
+`insufficient_device_memory` and its numbers. A deployment that lists `resources:` itself must
 name the `system` domain as well as the GPU's (`missing_system_allocation`
 otherwise); leaving them out and letting CapyCTL derive them is the portable form.
+
+**The first start is charged the Ready figure.** Until a first run measures
+the real peak on the card, a start is charged on the card the deployment's
+memory request plus the CUDA context (the Ready figure), or its
+`memory.startup` plus the CUDA context when it states one; host RAM is charged
+as when it runs (on several GPUs, each card its Ready figure). A card has no
+first start that runs alone on the machine, so a start whose charge on a card
+is above that card's managed limit is never admitted there: `capyctl validate
+config --host` and `capyctl status deployment` name the host, the card, the
+charge and the limit for the card the revision was resolved on
+([configuration](configuration.md#engine-installation)). A host from 0.1.7
+on charges the server's figure for such a start; a host older than 0.1.7
+resolves its own figure and should be upgraded with the server.
 
 **One GPU per model; CapyCTL picks it.** On a machine with several GPUs, each GPU
 is its own domain. CapyCTL places a new instance on the GPU where it fits with the
@@ -703,6 +729,23 @@ server never places a deployment charged on a GPU's domain on a host that does
 not, and reports `host_capability_missing:device_memory_domains` instead.
 Unified-memory hosts need nothing new.
 
+**The page cache on unified memory.** On a unified-memory machine (a GB10)
+the kernel's page cache lives in the same pool as the GPU's memory. An engine
+whose CUDA context is created while most of that memory is page cache can fail
+with `CUDA error: out of memory` although `MemAvailable` is large, and
+succeed when started again minutes later; NVIDIA's
+[DGX Spark known issues](https://docs.nvidia.com/dgx/dgx-spark/known-issues.html)
+give flushing the buffer cache as the workaround on unified memory. So right
+before an engine starts there (a launch, or the wake of a `restart_only` model
+parked beside its LMCache server, which starts a new engine), CapyCTL drops
+the cached pages of that model's checkpoint files, which its own reads to
+verify the checkpoint, or earlier reads and engine loads, may have filled:
+`posix_fadvise(POSIX_FADV_DONTNEED)` on each file. It needs no privileges and
+leaves the rest of the page cache, and pages another running engine has
+mapped, alone. It is best effort: when it fails, the host log has one
+`checkpoint_page_cache_kept` line for the launch, naming the deployment and
+the reason, and the engine starts anyway. Discrete GPUs are unchanged.
+
 ## Network access
 
 The inference endpoint listens on `0.0.0.0:8443` and requires the API key.
@@ -756,6 +799,17 @@ in your home directory (for example `~/capyctl-vllm-venv2`).
 version check, the installation fingerprint and the deep-park probe), writes
 the profile into `engines.yaml`, and asks the running role to publish it
 without a restart. CapyCTL never rewrites `host.yaml` or `standalone.yaml`.
+An SGLang installed in editable mode (`pip install -e`, as in the official
+`lmsysorg/sglang` image) is refused before anything runs,
+`installation_unsupported:editable`: CapyCTL loads SGLang from the
+environment's `site-packages` without running `.pth` files, and such an
+installation is reached only through one. Standalone refuses each launch of one
+with the same code, whatever `security.installation_drift` says. A host enrolled
+with a server starts it as before, and the engine fails at once with
+`engine_import_failed`: a patch release does not change the protocol, and
+0.1.x servers do not know the new code (the host-side refusal is planned for
+0.2.0, behind a capability). Reinstall SGLang without
+`-e` ([Install an engine](../guide/install-engines.md#sglang-0521-or-0520)).
 `engines.yaml` sits beside the role's configuration file (`--config
 dir/host.yaml` means `dir/engines.yaml`). Without `--config`, on a host machine
 it sits beside the document the host was started with (the host records it),
@@ -983,13 +1037,18 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 `kib` defaults to 64 and may be 1 to 256; `instance` (the index `status
 deployment` shows) may be left out when the deployment has one instance. The
+read names the instance's latest launch: the one it runs, or, when none runs,
+the last one its current start made, such as a launch that failed before it
+was ready (a host running an earlier CapyCTL answers `404` for that one). An
+instance an operator stopped names no launch until it starts again. The
 answer, `{deployment_id, instance, host_id, incarnation, kib, truncated, text,
 read_at_ms}`, holds at most `kib` KiB of whole lines, redacted again on the way
 out, and `truncated: true` when older output exists. The read continues into
 `<launch id>.log.1` when the current file is short. Refusals: `400
 invalid_request` (a bad query, or no `instance` for a deployment of several),
-`404 not_found` (unknown deployment or instance, no running launch, or no log
-yet), `403 forbidden` (a `--debug-engine-logs` log), `503
+`404 not_found` (unknown deployment or instance, no launch, or no log: none
+yet, or with `engine_logs: memory` more than 60 seconds after the engine
+exited), `403 forbidden` (a `--debug-engine-logs` log), `503
 unsupported_capability` (`host_capability_missing:engine_log_tail`: the host
 runs an older CapyCTL), `503 observation_stale` (the host is not connected),
 `504 deadline_exceeded` (no answer within 15 seconds) and `429 queue_full`
@@ -1010,7 +1069,8 @@ files would defeat the setting.
   instance's `LAST ERROR` column can still read `-`. `--format json` has the
   full record. A request for the deployment answers `activation_failed`, and
   each new request tries a fresh start. The engine log says why the engine
-  exited.
+  exited, and the management read above returns it after the launch failed
+  (with `engine_logs: memory`, for 60 seconds after the engine exited).
 - **SGLang saver permission warning.** Before an SGLang park, CapyCTL checks
   that the engine's `torch_memory_saver` library is not writable by other
   accounts. When that cannot be proven (for example, a group-writable

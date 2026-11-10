@@ -1812,6 +1812,123 @@ async fn an_engine_that_exits_before_readiness_is_reported_not_a_lost_session() 
     assert!(stopped.processes.iter().all(|p| p.presence == "gone"));
 }
 
+/// #226: records each checkpoint file a launch advised to drop from the page
+/// cache: its checkpoint path, the file its descriptor is open on, and
+/// whether the engine had already started. `fail` makes every advice fail.
+struct Advised {
+    record: PathBuf,
+    fail: bool,
+    files: std::sync::Mutex<Vec<(String, PathBuf, bool)>>,
+}
+
+impl capyctl_agent::page_cache::PageCacheAdvice for Advised {
+    fn dont_need(&self, path: &str, fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let open = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap();
+        self.files
+            .lock()
+            .unwrap()
+            .push((path.to_owned(), open, self.record.exists()));
+        if self.fail {
+            return Err(std::io::Error::from_raw_os_error(5)); // EIO
+        }
+        Ok(())
+    }
+}
+
+/// #226: a checkpoint with a nested file, a link to a file inside the model
+/// store (the Hugging Face snapshot layout) and tool metadata, which is not
+/// part of a checkpoint. Returns the real files the walk names.
+fn checkpoint_files(fixture: &Fixture) -> Vec<(String, PathBuf)> {
+    let toy = fixture.root.path().join("models/toy");
+    std::fs::create_dir_all(toy.join("nested")).unwrap();
+    std::fs::create_dir_all(toy.join(".cache")).unwrap();
+    std::fs::write(toy.join("weights.dat"), vec![1u8; 4096]).unwrap();
+    std::fs::write(toy.join("nested/vocab.txt"), "a b c").unwrap();
+    std::fs::write(toy.join(".cache/download.lock"), "").unwrap();
+    std::os::unix::fs::symlink("weights.dat", toy.join("alias.dat")).unwrap();
+    let toy = toy.canonicalize().unwrap();
+    vec![
+        ("alias.dat".into(), toy.join("weights.dat")),
+        ("nested/vocab.txt".into(), toy.join("nested/vocab.txt")),
+        ("weights.dat".into(), toy.join("weights.dat")),
+    ]
+}
+
+/// Launch `fixture` on a host whose launches advise through a fresh
+/// [`Advised`], and return whether the model was proven usable with it.
+async fn launch_advised(fixture: &Fixture, fail: bool) -> (bool, Arc<Advised>, Host) {
+    let advised = Arc::new(Advised {
+        record: fixture.root.path().join("venv/bin/record.json"),
+        fail,
+        files: Default::default(),
+    });
+    let mut host = host(fixture);
+    host.executor = host
+        .executor
+        .clone()
+        .with_page_cache_advice(advised.clone());
+    let launch = fixture.launch();
+    host.executor.provision(launch.clone(), GATE).await.unwrap();
+    let ready = host
+        .executor
+        .execute(host.session, launch)
+        .await
+        .expect("a launch result");
+    (ready.model_usable, advised, host)
+}
+
+/// #226 (SPEC §7.2): on unified memory, a launch gives back the page cache of
+/// every regular file of its checkpoint, after the checkpoint was verified and
+/// before its engine started: each checkpoint path once (a link inside the
+/// store as the file it names, so that file twice), tool metadata left out.
+/// Fake-engine test: nothing here shows a GB10 context creation succeeding.
+// T26
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_unified_launch_drops_its_checkpoint_page_cache_before_the_engine_starts() {
+    let fixture = Fixture::new(false, true);
+    let expected = checkpoint_files(&fixture);
+    let (usable, advised, _host) = launch_advised(&fixture, false).await;
+    assert!(usable);
+    let files = advised.files.lock().unwrap().clone();
+    assert_eq!(
+        files
+            .iter()
+            .map(|(path, open, _)| (path.clone(), open.clone()))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(
+        files.iter().all(|(_, _, started)| !started),
+        "advised after the engine started: {files:?}"
+    );
+}
+
+/// #226 (ADR 0019): a launch on a discrete GPU (its memory apart from host
+/// RAM) leaves the page cache alone.
+// T26
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_discrete_launch_leaves_the_page_cache_alone() {
+    let fixture = Fixture::build(Some(false), true, |host, _| {
+        host["resource_policy"]["domains"]["unified"]["memory"] = json!("distinct");
+    });
+    checkpoint_files(&fixture);
+    let (usable, advised, _host) = launch_advised(&fixture, false).await;
+    assert!(usable);
+    assert!(advised.files.lock().unwrap().is_empty());
+}
+
+/// #226: dropping the page cache is best effort; a launch whose every advice
+/// fails still starts and is proven usable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_page_cache_drop_does_not_fail_the_launch() {
+    let fixture = Fixture::new(false, true);
+    let expected = checkpoint_files(&fixture);
+    let (usable, advised, _host) = launch_advised(&fixture, true).await;
+    assert!(usable, "the launch went on");
+    assert_eq!(advised.files.lock().unwrap().len(), expected.len());
+}
+
 /// SPEC §13.2 (W13) / T20 T33: a parked engine that loses a member is
 /// reported too, so the controller never wakes a group that is no longer the
 /// one it parked. Report only: the claim and the parked state stay until a
@@ -2017,7 +2134,7 @@ fn discrete_fixture() -> Fixture {
 /// sample. A slow sampler that looks at the journal from inside its own run
 /// always finds both locks free. The engine is sized from the same sample:
 /// its utilization is the device request's share of the card (12 GiB of
-/// 16376 MiB rounds up to 0.76), with the grant's KV bytes.
+/// 16376 MiB rounds up to 0.7503663899), with the grant's KV bytes.
 // T26 T16 T13
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_slow_gpu_sample_never_holds_the_journal_lock() {
@@ -2061,7 +2178,7 @@ async fn a_slow_gpu_sample_never_holds_the_journal_lock() {
     let argv: Vec<String> = serde_json::from_value(record["argv"].clone()).unwrap();
     assert!(
         argv.windows(2)
-            .any(|w| w == ["--gpu-memory-utilization", "0.76"]),
+            .any(|w| w == ["--gpu-memory-utilization", "0.7503663899"]),
         "{argv:?}"
     );
     assert!(
@@ -2071,6 +2188,72 @@ async fn a_slow_gpu_sample_never_holds_the_journal_lock() {
     );
     // Discrete GPU design §7: the discrete card is pinned by its index.
     assert_eq!(record["cuda_visible_devices"], "0");
+    let stopped = host
+        .executor
+        .execute(host.session, fixture.stop(&launch))
+        .await
+        .unwrap();
+    assert_eq!(stopped.state, "completed");
+}
+
+/// #225: the issue's 96 GB card (an RTX PRO 6000, 97887 MiB) and a vLLM
+/// deployment that declares its memory request from the peak it measured
+/// (43 GiB, with a 12 GiB KV cache) instead of letting CapyCTL derive it.
+fn pro_6000_fixture() -> Fixture {
+    let mut fixture = Fixture::build(Some(false), true, |_, deployment| {
+        deployment.as_object_mut().unwrap().remove("resources");
+        deployment["engine_config"]["memory"] = json!({"request": "43GiB", "kv_cache": "12GiB"});
+    });
+    fixture.config.document["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "8GiB", "free_reserve": "16MiB",
+                   "parked_limit": "256MiB", "host_kv_limit": "64MiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "90056MiB",
+                 "free_reserve": "7831MiB", "parked_limit": "2GiB"}
+    });
+    fixture.config.document["resource_policy"]["devices"] =
+        json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+    fixture
+}
+
+/// #225 (ADR 0019 §4 as amended): a vLLM deployment that declares its memory
+/// request on a discrete card is told that request's share of the card
+/// (43 GiB of 97887 MiB rounds up to 0.4498247980), not 0.75 of it. vLLM checks at
+/// start that its share of the card is free, so with 0.75 a model holding a
+/// quarter of the card (the issue's 22.6 GiB SGLang deployment) kept it from
+/// starting although CapyCTL charged it 44.25 GiB. The KV bytes are the
+/// declared cache.
+// T26 T14
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_request_on_a_card_is_rendered_as_its_share() {
+    let fixture = pro_6000_fixture();
+    let mut host = host(&fixture);
+    let sampler: Arc<capyctl_agent::gpu_memory::GpuSampler> = Arc::new(move || {
+        capyctl_agent::gpu_memory::parse_query_gpu(
+            "0, GPU-11111111-2222-3333-4444-555555555555, 00000000:01:00.0, RTX PRO 6000, 97887, 0, 97887\n",
+            now_ms(),
+        )
+    });
+    host.executor = host.executor.clone().with_gpu_sampler(sampler);
+    let launch = fixture.launch();
+    host.executor.provision(launch.clone(), GATE).await.unwrap();
+    let ready = host
+        .executor
+        .execute(host.session, launch.clone())
+        .await
+        .expect("the agent launches on the discrete card");
+    assert!(ready.model_usable && ready.claim_retained, "{ready:?}");
+    let record = fixture.record().expect("the engine recorded its launch");
+    let argv: Vec<String> = serde_json::from_value(record["argv"].clone()).unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|w| w == ["--gpu-memory-utilization", "0.4498247980"]),
+        "{argv:?}"
+    );
+    assert!(
+        argv.windows(2)
+            .any(|w| w == ["--kv-cache-memory-bytes", "12884901888"]),
+        "{argv:?}"
+    );
     let stopped = host
         .executor
         .execute(host.session, fixture.stop(&launch))

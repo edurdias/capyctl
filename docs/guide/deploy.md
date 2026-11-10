@@ -74,7 +74,10 @@ Add a field to choose something yourself, for example:
   use: weights, KV cache and a margin for the engine's own memory. On a
   unified-memory machine such as a GB10 the margin is 8 GiB, or the weights
   x 0.15 plus 4 GiB for checkpoints above 26.7 GiB; on a discrete GPU it is
-  the weights x 0.10.
+  the weights x 0.10. On a discrete GPU vLLM is told exactly this request's
+  share of the card; without it, CapyCTL sizes a vLLM request at 75 % of the
+  card or more, which leaves little room for a second model on a large card
+  ([discrete GPUs](../operations/install.md#discrete-nvidia-gpus)).
 - `engine_config: {cuda_graphs: false}` on SGLang to turn its CUDA graphs off.
   They are on by default; on a 16 GB card FrogNano-4B decoded 61 tokens/s with
   them and 35 without, and kept about 0.7 GiB more of the card while parked.
@@ -477,9 +480,21 @@ apart) and later starts set that aside instead of the estimate; `--json` says
 where each figure came from (`startup.provenance`, and on a discrete GPU
 `startup.device_provenance` and `startup.host_provenance`: `measured`, or
 `default` for the estimate). Before a first start has measured it, a model
-whose estimated startup peak is above the machine's managed limit shows that
-limit: its first start runs alone on the machine and sets aside all of it
-(`--json` names this `whole_host`).
+whose estimated startup peak is above a unified-memory machine's managed limit
+shows that limit: its first start runs alone on the machine and sets aside all
+of it (`--json` names this `whole_host`). On a discrete GPU the estimate is the
+card's Ready figure (the memory request and 1.25 GiB for the engine's CUDA
+context), or `memory.startup` and the same 1.25 GiB when you state it. A card
+has no first start that runs alone, so a model whose figure is above the
+card's managed limit cannot start on that card: status says so under the
+table, and `capyctl validate config --host` says so before you deploy, for
+the card the deployment was resolved on (another, larger card may still take
+it):
+
+```text
+Startup     a start on gpu0 of host gpu-box needs 15.2 GiB, above the 14.7 GiB it manages, so it cannot start there; on a card the start is charged engine_config.memory.startup (the request when unset) plus the engine's CUDA context
+```
+
 When a start fails, `LAST OPERATION` says so and the instance's `LAST ERROR`
 gives the reason:
 

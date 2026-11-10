@@ -161,7 +161,7 @@ fn native_dimensions(
 pub(crate) async fn dispatch(
     deps: &RouterDeps,
     model: &str,
-    body: serde_json::Value,
+    body: capyctl_adapters::request::InferenceRequest,
     body_bytes: usize,
     received: tokio::time::Instant,
     mut timing: RequestTiming,
@@ -258,7 +258,7 @@ struct Pump {
     deps: RouterDeps,
     deployment: String,
     plan: Plan,
-    body: serde_json::Value,
+    body: capyctl_adapters::request::InferenceRequest,
     /// The in-flight slot, until released on evidence.
     guard: Option<StaticStreamGuard>,
     timing: RequestTiming,

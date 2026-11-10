@@ -250,7 +250,7 @@ async fn a_raw_debug_log_is_refused() {
 }
 
 // T21: a missing log, an unknown deployment or instance and an instance with
-// no running launch are `not_found`; a choice is required among several.
+// no launch are `not_found`; a choice is required among several.
 #[tokio::test]
 async fn unknown_and_missing_are_not_found() {
     let directory = tempfile::tempdir().unwrap();
@@ -264,7 +264,7 @@ async fn unknown_and_missing_are_not_found() {
             (
                 "pair".to_owned(),
                 BTreeMap::from([
-                    (0, Answer::Fail(EngineLogFailure::NotRunning)),
+                    (0, Answer::Fail(EngineLogFailure::NoLaunch)),
                     (1, Answer::Log(missing.clone())),
                 ]),
             ),

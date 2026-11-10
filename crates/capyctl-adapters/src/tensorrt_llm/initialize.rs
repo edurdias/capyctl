@@ -177,7 +177,7 @@ pub(super) async fn initialize(
         "max_tokens": 8,
         "temperature": 0,
     });
-    let answer = crate::forward::startup_probe(adapter, &body, remaining(stop_at)?)
+    let answer = crate::forward::startup_probe(adapter, &body.into(), remaining(stop_at)?)
         .await
         .ok_or_else(past_deadline)?
         .map_err(|e| {

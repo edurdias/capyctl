@@ -1,3 +1,5 @@
+// SPEC §10 (issue #223): an engine's answer as the engine sent it.
+pub mod answer;
 // ADR 0028 §9 (decided 2026-10-06): the completion probe's request forms.
 pub mod completion_probe;
 // ADR 0031: custom engines, started from a host-approved manifest.
@@ -32,6 +34,8 @@ pub mod policy;
 pub mod process_tree;
 pub mod protected;
 pub mod resolve;
+// SPEC §10 (issue #220): an inference request as the caller sent it.
+pub mod request;
 pub mod sglang;
 // SPEC §13.2 / T20: the once-only guard of a launch's residency steps.
 pub(crate) mod step_fence;

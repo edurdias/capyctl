@@ -166,6 +166,7 @@ impl From<LifecycleError> for LifecycleFault {
             LifecycleError::RuntimeRetained
             | LifecycleError::HostPolicyDenied
             | LifecycleError::CapacityBlocked(_)
+            | LifecycleError::CapacityBeyondLimit(_)
             | LifecycleError::StartupRequiresEmptyHost
             | LifecycleError::HostIneligible
             | LifecycleError::QueueFull

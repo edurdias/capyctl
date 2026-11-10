@@ -176,7 +176,7 @@ struct Received {
     /// SPEC §10: when the request arrived; its deadline counts from here.
     at: tokio::time::Instant,
     timing: timing::RequestTiming,
-    request: serde_json::Value,
+    request: capyctl_adapters::request::InferenceRequest,
     model: String,
     /// The size of the body as received.
     body_bytes: usize,
@@ -219,7 +219,11 @@ async fn receive(
     let body = axum::body::to_bytes(body, deps.limits.max_buffered_bytes_total)
         .await
         .map_err(|_| err_json("request_too_large", "request exceeds buffered-bytes bound"))?;
-    let request: serde_json::Value = serde_json::from_slice(&body)
+    // Issue #220: the engine receives these bytes, not a re-encoding, so the
+    // caller's key order survives; a duplicated key is refused, so what is
+    // validated here is what an engine reads.
+    let body_bytes = body.len();
+    let request = capyctl_adapters::request::InferenceRequest::parse(body)
         .map_err(|e| err_json("invalid_request", &format!("bad json: {e}")))?;
     let Some(model) = request["model"].as_str().map(str::to_owned) else {
         return Err(err_json("invalid_request", "model is required"));
@@ -227,13 +231,13 @@ async fn receive(
     // SPEC §10, T19 T21: a request that can never be forwarded is refused
     // before any accounting, activation or engine is touched.
     endpoint.validate(&request)?;
-    // The raw bytes drop here; only the parsed request is held from now on.
+    // The parsed request holds the bytes it was parsed from.
     Ok(Received {
         at,
         timing,
         request,
         model,
-        body_bytes: body.len(),
+        body_bytes,
     })
 }
 
@@ -309,7 +313,7 @@ async fn chat_completion(
         }
         return Ok(response);
     }
-    let (mut json, timing) = chat::dispatch_timed(
+    let (mut answer, timing) = chat::dispatch_timed(
         deps,
         endpoint,
         &model,
@@ -321,20 +325,20 @@ async fn chat_completion(
     )
     .await?;
     // ADR 0037 §5: the answer's token counts and finish reasons.
-    trace::record_answer(ids, &json);
+    trace::record_answer(ids, &answer);
     // SPEC §17 (owner decision 2026-10-09): every answer carries its figures.
-    engine_metrics::attach(&mut json, &timing);
-    Ok(with_timing(Json(json).into_response(), &timing))
+    engine_metrics::attach(&mut answer, &timing);
+    Ok(with_timing(chat::relay(&answer)?, &timing))
 }
 
 /// `POST /v1/systemone` — ADR 0030 §2: a decision request, admitted, leased
 /// and settled exactly as a chat completion, for `api: decisions` deployments
-/// only. It is never streamed. The answer is the engine's, with `model` the
-/// public name and its `usage` as the engine sent it, plus the request's
-/// figures in `capyctl.metrics` (SPEC §17, owner decision 2026-10-19; see
-/// [`engine_metrics::attach_decision`]). Its timings are recorded like any
-/// request's, and it carries the request's IDs as a chat answer does (SPEC
-/// §10).
+/// only. It is never streamed. The answer is the engine's bytes, with `model`
+/// the public name, plus the request's figures in `capyctl.metrics` (SPEC
+/// §17, owner decision 2026-10-19; see [`engine_metrics::attach_decision`]);
+/// everything else, `usage` and every probability, is as the engine wrote it
+/// (SPEC §10, issue #223). Its timings are recorded like any request's, and
+/// it carries the request's IDs as a chat answer does (SPEC §10).
 async fn systemone(
     state: axum::extract::State<AppState>,
     headers: HeaderMap,
@@ -354,7 +358,7 @@ async fn decision(
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     let endpoint = endpoint::Endpoint::Decisions;
     let received = receive(deps, headers, ids, body, endpoint).await?;
-    let (mut json, timing) = chat::dispatch_timed(
+    let (mut answer, timing) = chat::dispatch_timed(
         deps,
         endpoint,
         &received.model,
@@ -365,9 +369,9 @@ async fn decision(
         ids.clone(),
     )
     .await?;
-    trace::record_answer(ids, &json);
-    engine_metrics::attach_decision(&mut json, &timing);
-    Ok(with_timing(Json(json).into_response(), &timing))
+    trace::record_answer(ids, &answer);
+    engine_metrics::attach_decision(&mut answer, &timing);
+    Ok(with_timing(chat::relay(&answer)?, &timing))
 }
 
 /// `POST /v1/embeddings` — ADR 0036 §§3-4: an embedding request, admitted,

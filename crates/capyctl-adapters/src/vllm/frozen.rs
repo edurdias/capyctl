@@ -12,7 +12,9 @@ use capyctl_config::effective::EffectiveDeployment;
 use capyctl_domain::launch::{LaunchSettings, SafetensorsLoadStrategy, VllmLaunchSettings};
 
 use crate::policy::ParkPolicy;
-use crate::vllm::args::{device_utilization_pct, GrantedBudget, PlanInputVllm};
+use crate::vllm::args::{
+    device_utilization_units, GrantedBudget, PlanInputVllm, DEVICE_UTILIZATION_FLOOR_PCT,
+};
 
 /// Reserved (ADR 0014 §3): the gate vLLM checks free memory against at start.
 /// Explicit KV bytes size the pool, so the gate only has to pass.
@@ -83,7 +85,7 @@ pub fn park_policy(effective: &EffectiveDeployment) -> ParkPolicy {
 
 /// Discrete GPU design §6 (ADR 0019): on a device domain vLLM's utilization is
 /// the device request's share of the card the launching host observed
-/// ([`device_utilization_pct`]); vLLM checks at start that this share is free.
+/// ([`device_utilization_units`]); vLLM checks at start that this share is free.
 /// Everywhere else, and before a host has stated the card's total (a plan built
 /// to check authority, not to launch), the low unified gate. A launch on a
 /// device domain states the total first (`EffectiveDeployment::with_device_total`)
@@ -97,13 +99,31 @@ pub fn park_policy(effective: &EffectiveDeployment) -> ParkPolicy {
 /// so a launch on several GPUs renders them from one GPU's grant: the memory
 /// request and KV cache are per GPU there, and the stated total is the
 /// smallest chosen card's.
-fn utilization_pct(effective: &EffectiveDeployment, settings: &VllmLaunchSettings) -> u8 {
+///
+/// ADR 0019 amendment of 2026-10-30 (proposed, #225): a request CapyCTL
+/// derived keeps the floor ([`DEVICE_UTILIZATION_FLOOR_PCT`]); a request the
+/// deployment declares is the card memory it may use, so vLLM is told its
+/// share and nothing more. With the floor, vLLM's start check asked for 75 %
+/// of the card free whatever the request, so a declared request below that
+/// could not start beside a model holding more than a quarter of the card.
+fn utilization_units(effective: &EffectiveDeployment, settings: &VllmLaunchSettings) -> u64 {
     match (
         effective.ready_device_allocation(),
         settings.memory.device_total_bytes,
     ) {
-        (Some(_), Some(total)) => device_utilization_pct(settings.memory.request_bytes, total),
-        _ => GPU_UTILIZATION_GATE_PCT,
+        (Some(_), Some(total)) => {
+            let declared = !effective
+                .engine_config
+                .provenance()
+                .contains_key("memory.request");
+            let floor = if declared {
+                1
+            } else {
+                DEVICE_UTILIZATION_FLOOR_PCT
+            };
+            device_utilization_units(settings.memory.request_bytes, total, floor)
+        }
+        _ => u64::from(GPU_UTILIZATION_GATE_PCT) * 100_000_000,
     }
 }
 
@@ -240,7 +260,7 @@ pub fn plan_from_effective(
         // previous deployment's memory is still being released.
         granted: GrantedBudget {
             kv_cache_bytes: Some(settings.memory.kv_cache_bytes),
-            gpu_utilization_pct: Some(utilization_pct(effective, settings)),
+            gpu_utilization_units: Some(utilization_units(effective, settings)),
             swap_space_bytes: None,
         },
         engine_args,
