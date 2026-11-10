@@ -160,13 +160,22 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   - the maintainer's discrete-GPU laptop, approved 2026-11-09: the official
     `lmsysorg/sglang:v0.5.22` Docker image, for the live check of #230 (an editable
     SGLang refused at `engine add`);
-  - host A, for CapyCTL's own extraction model (ADR 0041 §9), approved 2026-11-04,
-    not yet made: a training environment ~/capyctl-extract-train-venv (Python
-    3.12, an aarch64 CUDA 13.0 torch, transformers with Qwen3.5, peft, datasets
-    and capyctl-extract) for pilot runs, scheduled around live sessions, and a
-    separate serving environment ~/capyctl-extract-0.1.0-venv (the same runtime
-    and the server, no training tools) run as a custom engine; record the
-    versions installed here when each is made;
+  - host A, for CapyCTL's own extraction model (ADR 0041 §9), approved 2026-11-04:
+    the training environment ~/capyctl-extract-train-venv, made 2026-11-04 with
+    capyctl-extract's `scripts/spark/setup-train-venv.sh` (Python 3.12.3, torch
+    2.14.1+cu130, torchvision 0.29.1+cu130, transformers 5.22.1, peft 0.21.2,
+    datasets 5.1.0, pillow 13.0.0), then flash-linear-attention 0.6.0 and fla-core
+    0.6.0 added (owner approval 2026-11-04, for the Gated DeltaNet kernels); used
+    for pilot runs scheduled around live sessions;
+  - host B, the same training environment, made the same way (owner approval
+    2026-11-04: "use it as well"), so both hosts can train together over the
+    direct link;
+  - host A, approved 2026-11-10 for live qualification of the capyctl-extract
+    custom engine (`api: extractions`, T50): a dedicated serving environment
+    ~/capyctl-extract-serve-venv, approved but not yet created. Same pinned
+    versions as training, serving dependencies only: torch 2.14.1+cu130,
+    transformers 5.22.1, peft 0.21.2, pillow 13.0.0, flash-linear-attention 0.6.0
+    and fla-core 0.6.0;
   - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B;
   - the rented two-GPU machine of ADR 0035 §14 (owner decision 2026-10-25), for
     its one session only: fresh x86_64 CUDA installs of vLLM 0.32.0
