@@ -1,9 +1,8 @@
 # ADR 0041 — Extraction models (`api: extractions`, `fields` on `POST /v1/systemone`)
 
-**Status:** Accepted (owner decisions 2026-11-04, recorded below in "Owner decisions of
-2026-11-04"). Target release: the first release after `capyctl-extract-4b` is trained
-(owner decision 2026-11-04; built on `integration/0.2.0`, rebased onto `main` before its
-pull request). The first engine is
+**Status:** Accepted (owner decisions 2026-11-04 and amendment of 2026-11-10).
+Target release: 0.2.0, with `integration/0.2.0` landing first and extraction support
+on top, alongside `capyctl-extract-4b`. The first engine is
 CapyCTL's own extraction server run as a custom engine (ADR 0031); no native engine
 serves extractions, and every native engine is refused until one does and is qualified.
 **Amends (with the implementation):** `SPEC.md` §6.1 (readiness of an extraction model and
@@ -372,7 +371,8 @@ The model, `capyctl-extract-4b`, and its server live in their own repository,
 `capyctl-extract` (a private GitHub repository until weights ship; names decided by the
 owner 2026-11-04).
 CapyCTL depends only on its server speaking §3's contract and declaring its types in a
-custom-engine manifest (§2). The owner's decisions for it:
+custom-engine manifest (§2). The original decisions below are superseded where noted
+by the amendment of 2026-11-10:
 
 | Topic | Decision |
 |---|---|
@@ -384,11 +384,10 @@ custom-engine manifest (§2). The owner's decisions for it:
 | Hardware | Pilot runs on host A (one approved training environment, scheduled around live sessions); full runs on rented GPUs, set up and removed by a script as ADR 0035 §14's machine is |
 | Serving | Its own server first (this ADR's custom engine), then a llama.cpp port of its output layers; both checked against the same test set |
 
-Each environment this needs is an engine environment under AGENTS.md's rules. Approved
-2026-11-04 and listed there, not yet made: the training environment and a separate
-serving environment on host A, and a rented machine in principle, whose GPU model,
-session length and set-up and removal script come back to the owner before it is rented.
-No copy on host B was approved.
+Each environment this needs is an engine environment under AGENTS.md's rules. The
+original 2026-11-04 approval covered training and serving environments on host A
+and a rented machine in principle. Subsequent approvals and the installed training
+versions on both hosts are recorded in AGENTS.md; see the amendment below.
 
 ## Consequences
 
@@ -452,6 +451,81 @@ No copy on host B was approved.
 14. Branches: `feat/extraction-models` stays local until it is rebased onto `main`;
     `capyctl-extract` is a private GitHub repository.
 
-## Open questions
+## Amendment of 2026-11-10: initial model and release scope
 
-- The rented training machine's GPU model and session length (§9).
+The owner approved the following architecture after experiments E1–E10 in the
+`capyctl-extract` repository. It replaces the provisional rank-256 recipe in §9.
+**The wire contract is unchanged:** the nine field types, request and answer shapes,
+manifest declarations, discovery, readiness probe and wake comparisons in §§1–7
+remain as accepted. Model internals and evidence pointers are not additional API
+members, and CapyCTL does not execute arithmetic in the router.
+
+### Architecture
+
+- Freeze Qwen3.5-4B-Base; train rank-64 LoRA on the attention projections and
+  extraction output heads.
+- Put the schema first, including each field's schema before the state. The earlier
+  BIO list head failed qualifier selection until this layout was introduced.
+- Use the v7 span-set list head. Do not include the refinement layer: it gave no
+  gain at 15 million tokens.
+- Compute scalar values in the extraction server's code. Heads select operand
+  pointers, an operation and a unit; exact Decimal and calendar execution handles
+  copy plus 13 operations. Direct value heads remain auxiliary fallback heads.
+  A digit-wise year head represents years.
+- For estimates, point at comparable samples and execute exact empirical quantiles
+  in code. Forecast evidence can be per-step scenarios or ordered history; history
+  uses a seasonal-naive forecaster in code. Learned distribution heads remain the
+  fallback when evidence is unavailable. These pointers select evidence in the
+  input; they do not add a new response shape.
+
+### Recipe and hardware
+
+Data v8 mixes the compositional v6 generator (60%), commercially filtered
+tasksource data (30%) and rendered receipt images (10%). The optimizer is AdamW
+at `2e-4`, one parameter group, 20 warmup steps, warmup-stable-decay with a 20%
+decay phase, approximately 64K tokens per step, and bf16.
+
+Experiments used an RTX PRO 6000 rental and the two Spark hosts. Host B's training
+environment was subsequently approved on 2026-11-04 ("use it as well") and made
+the same way as host A's; installed versions, including flash-linear-attention
+and fla-core, are in AGENTS.md. Two-Spark DDP measured 1.73× one Spark. The rank-0
+resume broadcast fix made the distributed run crash-safe. This records completed
+experiments and approvals, not permission for another rental or live session.
+
+### Measured evidence and limits
+
+At 15 million training tokens, seeds 42 and 7 respectively, on the held-out
+compositional suite:
+
+| Metric | Seed 42 | Seed 7 |
+|---|---:|---:|
+| Text | 0.90 | 0.92 |
+| Number | 0.78 | 0.68 |
+| Duration | 0.75 | 0.75 |
+| Date | 0.91 | 0.84 |
+| Datetime | 0.84 | 0.74 |
+| Time | 0.91 | 0.82 |
+| Non-empty lists, exact | 0.44 | 0.46 |
+| Tasksource text | 0.66 | 0.64 |
+| Null accuracy | 0.997 | 0.976 |
+| Confidence ECE, uncalibrated | 0.14 | 0.18 |
+
+List item F1 was 0.88. Evidence-pointer estimates had 24% lower pinball loss
+than bounds-only estimates, and history forecasts improved by 61–65%.
+Per-step scenario forecasts were not learned: their improvements were −1% and
+−8%, so they are not a demonstrated strength of this release. These are pilot
+measurements, not results of the 100-million-token main run or live engine
+qualification. The main run is being launched separately; its results and serving
+qualification remain release gates.
+
+### Release boundary
+
+Extraction support ships with 0.2.0 after the integration line, preserving its
+embeddings and tracing support. This supersedes the original decisions 13–14;
+the extraction branch is `feat/extraction-models-0.2.0`, based on
+`integration/0.2.0-on-0.1.11`.
+
+Table/record extraction is deferred to a follow-up release. It is not another
+spelling of `list`, is not an accepted field type, and does not change this
+release's probes. The proposed contract, model approach and remaining decisions
+are in [Extraction records](../../specs/extraction-records.md).

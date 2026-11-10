@@ -1037,9 +1037,10 @@ change.
 ### Example: CapyCTL's extraction server
 
 CapyCTL's own model, `capyctl-extract-4b`, and its server, `capyctl-extract`,
-live in a separate repository. The model is untrained and the server is
-not live-qualified. This is the custom-engine contract for it, not an
-installation recipe or a claim that usable weights are available.
+live in a separate repository. Its recipe is selected after pilot training;
+the main run and live server qualification remain release gates. This is the
+custom-engine contract for it, not an installation recipe or a claim that
+released weights are available. Table/record extraction is deferred.
 
 ```yaml title="capyctl-extract.yaml"
 kind: custom_engine

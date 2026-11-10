@@ -345,11 +345,12 @@ forecasts have an inclusive one-step tolerance, probabilities an inclusive
 stops the instance. With restart-only residency and no LMCache, a restart
 records a new reference.
 
-**CapyCTL's own extraction model is untrained and not qualified.**
+**CapyCTL's own extraction model is not live-qualified.**
 The model is `capyctl-extract-4b` and its server `capyctl-extract`; both live in
-a separate repository. CPU and fake-engine tests are not qualification.
-No live run has qualified it; the first qualification needs its own server
-on host A.
+a separate repository. Its recipe is selected after pilot training; the main
+training run and first qualification on host A remain release gates. CPU and
+fake-engine tests are not qualification. Table/record extraction is deferred
+to a follow-up release.
 
 ## Embedding models
 

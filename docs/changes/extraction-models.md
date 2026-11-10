@@ -1,4 +1,4 @@
-# Status: Extraction models: `api: extractions` and `fields` on `POST /v1/systemone` (ADR 0041) — 2026-11-04 (branch `feat/extraction-models`)
+# Status: Extraction models: `api: extractions` and `fields` on `POST /v1/systemone` (ADR 0041) — 2026-11-10 (branch `feat/extraction-models-0.2.0`)
 
 ADR 0041 (owner decisions 2026-11-04) adds a fourth deployment API,
 `extractions`, with declared custom-engine `field_types`. It is part of the
@@ -36,9 +36,14 @@ engine with `capyctl engine remove`. Older releases refuse the whole
 `custom-engines.yaml` file if any manifest has `field_types`, preventing role
 startup.
 
-Verification: `scripts/ci-local.sh --deep` passed every step at `25ab2c80`
-(fmt, name, clippy, unit, runtime, shellcheck, installer, changes, core and
-workspace). A local smoke on a maintainer laptop (RTX 4090 Laptop GPU, isolated
+Verification on the 0.2.0 integration: `scripts/ci-local.sh` passed fmt, name,
+clippy, unit, runtime, shellcheck, installer and changes.
+`scripts/ci-local.sh --deep` passed those steps plus core and workspace.
+The extraction router suite passes all 10 tests, including the added
+raw-byte/numeric-spelling regression. CPU and Fake-engine tests are not
+qualification.
+
+A local smoke on a maintainer laptop (RTX 4090 Laptop GPU, isolated
 standalone, `capyctl-extract` 0.1.0 from its own repository with a random
 tiny Qwen3.5-architecture checkpoint on CPU torch): `engine add --custom`
 showed the field types; the deployment became ready on the fixed extraction
@@ -50,10 +55,30 @@ an unknown setting `invalid_request`, an undeclared `date`
 `field_type_unsupported`, an engine-side `min > max` `engine_rejected`, and
 `/v1/models` listed `capyctl.api` and `capyctl.field_types`. A random
 checkpoint proves the plumbing, not extraction quality. CPU tests and this
-smoke are not qualification. CapyCTL's own model, `capyctl-extract-4b`, is
-untrained. The first live qualification still needs its server, `capyctl-extract`,
-on host A, in the serving environment approved on 2026-11-04 once it is made.
-ADR 0041 ships in the first release after the model is trained.
+smoke are not qualification. The owner approved `capyctl-extract-4b`'s recipe
+after E1–E10: frozen Qwen3.5-4B-Base, rank-64 attention LoRA, schema-first
+layout, v7 span-set lists without refinement, exact computed scalars and
+evidence-pointer distributions executed in the extraction server. ADR 0041's
+2026-11-10 amendment records the two-seed 15M-token evidence, data v8, training
+recipe and RTX PRO 6000/two-Spark hardware. These are pilot results; the
+100M-token main run is launched separately and has no final results here.
+The approved training environments on hosts A and B, including their installed
+versions and flash-linear-attention, are recorded in AGENTS.md.
+
+The owner selected 0.2.0: land `integration/0.2.0` first, then extraction
+support with its embeddings/tracing integration retained. This branch is based
+on `integration/0.2.0-on-0.1.11` at `7e0774d6` and replays only the nine extraction
+commits above that base. Conflict resolution retains raw request/answer bytes
+and declared concurrency policy from the newer integration line. Schema v62
+follows its existing v61. The first live qualification still needs the trained
+model's server, `capyctl-extract`, on host A in the approved serving environment
+once it is made. CPU and Fake-engine tests are not qualification.
+
+Table/record extraction is explicitly deferred to a follow-up release. The
+proposed `records` contract, readiness implications, occurrence-conditioned
+column readout, data, metrics and open questions are in
+[Extraction records](../specs/extraction-records.md). This release keeps ADR 0041's
+nine-type wire contract unchanged.
 
 # Release note: Extraction models
 
@@ -66,7 +91,8 @@ ADR 0041 ships in the first release after the model is trained.
   machine, restart-only. Before downgrading to a release without extraction
   support, remove every extraction engine with `capyctl engine remove`;
   older releases refuse `custom-engines.yaml` containing `field_types`.
-  CapyCTL's own extraction model is untrained and has not been qualified live;
-  CPU tests are not qualification
+  This is part of 0.2.0; table/record extraction is deferred. The model recipe
+  is selected, but the main training run and live qualification remain release
+  gates; CPU and Fake-engine tests are not qualification
   ([Extraction models](../guide/deploy.md#extraction-models),
   [Extraction requests](../guide/requests.md#extraction-requests)).
