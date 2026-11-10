@@ -33,13 +33,23 @@ def stopped(ctx, name):
     ctx.assertion(not ctx.owned(name), "stop did not establish owned processes gone")
 
 
-def passing_canary(events):
-    for event in events:
-        text = json.dumps(event).lower().replace("_", " ")
-        if ("canary" in text and re.search(r'\b(pass|passed|success|succeeded|matched)\b', text)
-                and not re.search(r'\b(fail|failed|mismatch)\b', text)):
-            return True
-    return False
+def passing_canary(ctx, name, restore=True):
+    # As in LC15: successful restores journal "restored", not "canary_passed".
+    reference = ctx.sql("""SELECT w.generation,w.incarnation,w.kind,w.mismatch_operation_id
+        FROM wake_canaries w JOIN runtime_bindings b ON b.deployment_id=w.deployment_id
+          AND b.incarnation=w.incarnation AND b.state='live'
+        JOIN deployments d ON d.id=w.deployment_id WHERE d.name=?""", (name,))
+    ctx.assertion(bool(reference) and all(item["mismatch_operation_id"] is None for item in reference),
+                  "current launch lacks a matching canary reference")
+    evidence = dict(reference=reference)
+    if restore:
+        journal = ctx.sql("""SELECT j.state FROM journal_entries j JOIN operations o ON o.id=j.operation_id
+            JOIN deployments d ON d.id=o.deployment_id WHERE d.name=? AND o.kind='restore'
+            AND o.rowid=(SELECT MAX(o2.rowid) FROM operations o2 WHERE o2.deployment_id=d.id AND o2.kind='restore')""", (name,))
+        ctx.assertion(any(item["state"] == "restored" for item in journal),
+                      "wake lacks a completed restored journal entry")
+        evidence["journal"] = journal
+    return evidence
 
 
 def run(ctx, row):
@@ -99,7 +109,7 @@ def run(ctx, row):
                 evidence["requests"].append(response)
                 events = ctx.events()[event_offset:]
                 evidence["events"] = events
-                ctx.assertion(passing_canary(events), "wake has no passing canary evidence")
+                evidence["canary"] = passing_canary(ctx, name)
         stopped(ctx, name)
         return dict(verdict="pass", reason="Lifecycle and endpoint assertions passed", evidence=evidence)
     except (AssertionError, ValueError, KeyError, TypeError) as error:

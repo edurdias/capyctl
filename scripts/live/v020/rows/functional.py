@@ -75,7 +75,11 @@ def vectors(ctx, response, name, count):
 
 
 def embedding(ctx, name, inputs, **fields):
-    return ctx.request(name, path="/v1/embeddings", body={"model": name, "input": inputs, **fields})
+    body = {"model": name, "input": inputs, **fields}
+    response = ctx.request(name, path="/v1/embeddings", body=body)
+    ctx.index += 1
+    ctx.save("embedding-response-" + str(ctx.index), dict(path="/v1/embeddings", request=body, response=response))
+    return response
 
 
 def contract(ctx, name, engine):
@@ -132,8 +136,8 @@ def run(ctx, row):
                 ctx.lifecycle("start", name)
                 vectors(ctx, embedding(ctx, name, "qualification probe"), name, 1)
                 events = ctx.events()[before_events:]
-                evidence[engine] = {"events": events}
-                ctx.assertion(passing_canary(events), "restart missing passing reference-canary verdict")
+                evidence[engine] = {"events": events, "canary": passing_canary(ctx, name, restore=False)}
+            ctx.save(name + "-contract", evidence[engine])
             stopped(ctx, name)
         return dict(verdict="pass", reason="All three engine contracts passed", evidence=evidence)
     except (AssertionError, ValueError, TypeError, KeyError, struct.error) as error:
@@ -165,10 +169,10 @@ def embedding_cycles(ctx,evidence):
             distance=math.sqrt(sum((a-b)**2 for a,b in zip(vector,baseline)))/max(math.sqrt(sum(a*a for a in baseline)),1e-30)
             ctx.assertion(distance<=.02,"wake embedding exceeds provisional canary tolerance")
             events=ctx.events()[offset:]
-            ctx.assertion(passing_canary(events),"wake has no passing reference canary")
+            canary=passing_canary(ctx,name)
             ctx.assertion(pids=={item["pid"] for item in ctx.owned(name)},"deep wake replaced process")
             ctx.assertion(ctx.status(name).get("observed_state","").lower()=="ready","parked-arrival request did not wake deployment")
-            cycles.append(dict(cycle=cycle+1,parked=parked,events=events,relative_distance=distance,implicit_wake=cycle==5))
+            cycles.append(dict(cycle=cycle+1,parked=parked,events=events,canary=canary,relative_distance=distance,implicit_wake=cycle==5))
         stopped(ctx,name)
     return dict(verdict="skip",reason=("measurement not allowed on this host" if ctx.functional_only else "not implemented: parked GPU-budget/saver-map release measurement"),evidence=evidence)
 

@@ -169,6 +169,21 @@ class HelperTests(unittest.TestCase):
             exec(TOKENIZER, {})
         self.assertEqual(json.loads(stream.getvalue())['fixtures']['main']['prompt_tokens'], 32064)
 
+    def test_canary_uses_current_launch_reference_and_restored_journal(self):
+        from rows.engines import passing_canary
+        ctx = v020.Context.__new__(v020.Context)
+        reference = [dict(generation=1, incarnation='launch', kind='embedding', mismatch_operation_id=None)]
+        journal = [dict(state='restored')]
+        ctx.sql = lambda query, args: reference if 'wake_canaries' in query else journal
+        self.assertEqual(passing_canary(ctx, 'model')['reference'], reference)
+        journal.clear()
+        with self.assertRaisesRegex(AssertionError, 'restored'):
+            passing_canary(ctx, 'model')
+        self.assertEqual(passing_canary(ctx, 'model', restore=False)['reference'], reference)
+        reference[0]['mismatch_operation_id'] = 'failed'
+        with self.assertRaisesRegex(AssertionError, 'matching canary'):
+            passing_canary(ctx, 'model', restore=False)
+
     def test_process_identity_guards_against_pid_reuse(self):
         record = identity(os.getpid())
         self.assertTrue(matches(record))

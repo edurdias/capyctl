@@ -63,6 +63,7 @@ def graph_phases(ctx):
         ctx.assertion(resolved.get('disable_decode_cuda_graph') == 'False' and resolved.get('cuda_graph_backend_decode') != 'disabled',
                       'engine did not resolve native decode')
         evidence[engine] = dict(settings=setting, answer=answer(ctx, name))
+        ctx.save(name + '-functional', evidence[engine])
         ctx.cleanup()
     return evidence
 
