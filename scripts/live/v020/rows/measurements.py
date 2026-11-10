@@ -108,6 +108,12 @@ def validate_samples(ctx, samples):
         ctx.assertion(all(isinstance(sample.get(key), (int, float)) and sample[key] >= 0 for sample in samples), 'missing numeric samples: ' + key)
 
 
+def advertises_embeddings(response, name):
+    return response.get('status') == 200 and any(
+        model.get('id') == name and model.get('capyctl', {}).get('api') == 'embeddings'
+        for model in response.get('body', {}).get('data', []))
+
+
 def em1(ctx, evidence):
     for engine in ('vllm033', 'sglang0523', 'llamacpp090'):
         name = 'em1-' + engine
@@ -132,7 +138,7 @@ def em1(ctx, evidence):
         rendered = json.dumps(status)
         ctx.assertion('embeddings' in rendered and 'certified' in rendered, 'status lacks embeddings certification field')
         ctx.assertion('embeddings_unsupported' in rendered, 'LMCache off reason missing')
-        ctx.assertion('capyctl.api' in json.dumps(models) and 'embeddings' in json.dumps(models), '/v1/models missing embeddings API metadata')
+        ctx.assertion(advertises_embeddings(models, name), '/v1/models missing embeddings API metadata')
         ctx.assertion(any(word in rendered for word in ('charge', 'reservation', 'reserved')), 'memory charge evidence missing')
         if engine == 'llamacpp090':
             ctx.assertion(settings.get('embeddings') and settings.get('batch-size') == settings.get('ubatch-size') and str(settings.get('batch-size', '')).isdigit(), 'llama.cpp rendered embedding batch sizes missing/mismatched')

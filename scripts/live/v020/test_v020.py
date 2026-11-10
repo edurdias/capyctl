@@ -324,6 +324,13 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         self.assertTrue(
             Path(os.environ['XDG_CONFIG_HOME']).is_relative_to(self.root / 'state'))
 
+    def test_embedding_models_metadata_is_nested_and_matches_the_served_name(self):
+        from rows.measurements import advertises_embeddings
+        response = dict(status=200, body=dict(data=[
+            dict(id='embedding-model', capyctl=dict(api='embeddings'))]))
+        self.assertTrue(advertises_embeddings(response, 'embedding-model'))
+        self.assertFalse(advertises_embeddings(response, 'different-model'))
+
 
 if __name__ == '__main__':
     unittest.main()
