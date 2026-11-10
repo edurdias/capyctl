@@ -133,8 +133,8 @@ impl crate::Store {
     /// a launch on several GPUs fails `tp_rank_unobserved` or
     /// `engine_listener_exposed`; ADR 0038 §16, a TensorRT-LLM launch fails
     /// `kv_cache_short`, `engine_process_escaped` or
-    /// `engine_listener_exposed`. Any other code than these or
-    /// `launch_failed` is refused.
+    /// `engine_listener_exposed`; ADR 0036 §6, an embeddings restart fails
+    /// `wake_mismatch`. Any other code than these or `launch_failed` is refused.
     #[allow(clippy::too_many_arguments)]
     pub fn release_failed_launch_coded(
         &self,
@@ -199,7 +199,14 @@ pub(super) fn release_with_code(
         capyctl_config::tensorrt_llm::ENGINE_PROCESS_ESCAPED,
     ]
     .contains(&error_code);
-    if error_code != "launch_failed" && !lmcache_code && !local_tp_code && !tensorrt_llm_code {
+    // ADR 0036 §6, EM4: an embedding restart's mismatching canary owes the
+    // same verified termination as any failed Initialize.
+    if error_code != "launch_failed"
+        && error_code != crate::wake_canary::WAKE_MISMATCH
+        && !lmcache_code
+        && !local_tp_code
+        && !tensorrt_llm_code
+    {
         return Err(LifecycleError::Invalid);
     }
     if !is_ordinary(tx, id)? {

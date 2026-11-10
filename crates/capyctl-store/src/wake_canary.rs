@@ -12,6 +12,10 @@
 //! that ended without its evidence (`wake_uncertain`) is never re-armed
 //! either, so every single launch's wake that ended uncertain owes the
 //! instance's stop, retried until accepted, also across a restart.
+//!
+//! ADR 0036 §6: embeddings are the exception to launch-local references.
+//! `record_embedding_readiness` compares the retained pre-stop vector before
+//! Ready, then carries that same baseline into the new launch's row.
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::{Store, StoreError};
@@ -92,11 +96,22 @@ pub fn compare_embedding_canary(
     probe_version: u32,
     observed: &[f32],
 ) -> EmbeddingCanaryOutcome {
+    compare_embedding_canary_with_distance(reference, probe_kind, probe_version, observed).0
+}
+
+/// ADR 0036 §6, EM4: the same comparison with its measured distance for
+/// the durable verdict event. Different dimensions have no defined distance.
+fn compare_embedding_canary_with_distance(
+    reference: &StoredEmbeddingCanary,
+    probe_kind: &str,
+    probe_version: u32,
+    observed: &[f32],
+) -> (EmbeddingCanaryOutcome, Option<f64>) {
     if reference.probe_kind != probe_kind || reference.probe_version != probe_version {
-        return EmbeddingCanaryOutcome::NotComparable;
+        return (EmbeddingCanaryOutcome::NotComparable, None);
     }
     if observed.len() != reference.vector.len() || observed.len() != reference.dimension as usize {
-        return EmbeddingCanaryOutcome::Differs;
+        return (EmbeddingCanaryOutcome::Differs, None);
     }
     let mut difference = 0.0f64;
     let mut norm = 0.0f64;
@@ -107,11 +122,12 @@ pub fn compare_embedding_canary(
     }
     let distance = difference.sqrt() / norm.sqrt();
     // A NaN (a non-finite answer, or a zero reference) never passes.
-    if distance.is_finite() && distance <= reference.tolerance {
+    let outcome = if distance.is_finite() && distance <= reference.tolerance {
         EmbeddingCanaryOutcome::Matches
     } else {
         EmbeddingCanaryOutcome::Differs
-    }
+    };
+    (outcome, distance.is_finite().then_some(distance))
 }
 
 /// ADR 0030 §4, ADR 0036 §6: one launch's canary reference, by the probe
@@ -253,6 +269,172 @@ pub struct WakeStop {
     pub operation_id: String,
 }
 
+fn record_wake_canary_in(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    instance_index: u32,
+    generation: i64,
+    incarnation: &str,
+    reference: &WakeCanaryReference,
+    now: i64,
+) -> Result<bool, StoreError> {
+    let (kind, probe_version, prompt, tokens, text, decision, tolerance, dimension, vector) =
+        columns(reference)?;
+    let current: Option<i64> = tx
+        .query_row(
+            "SELECT generation FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2",
+            params![deployment_id, instance_index],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if current != Some(generation) {
+        return Err(StoreError::Conflict);
+    }
+    tx.execute(
+        "DELETE FROM wake_canaries WHERE deployment_id=?1 AND instance_index=?2 AND generation<?3",
+        params![deployment_id, instance_index, generation],
+    )?;
+    Ok(tx.execute(
+        "INSERT INTO wake_canaries(deployment_id,instance_index,generation,incarnation,prompt,
+            tokens_json,text,recorded_at_ms,kind,probe_version,decision_json,tolerance,
+            dimension,vector)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+         ON CONFLICT(deployment_id,instance_index,generation) DO UPDATE SET
+            incarnation=excluded.incarnation,prompt=excluded.prompt,
+            tokens_json=excluded.tokens_json,text=excluded.text,
+            kind=excluded.kind,probe_version=excluded.probe_version,
+            decision_json=excluded.decision_json,tolerance=excluded.tolerance,
+            dimension=excluded.dimension,vector=excluded.vector,
+            recorded_at_ms=excluded.recorded_at_ms,mismatch_operation_id=NULL
+         WHERE wake_canaries.incarnation<>excluded.incarnation",
+        params![
+            deployment_id,
+            instance_index,
+            generation,
+            incarnation,
+            prompt,
+            tokens,
+            text,
+            now.max(0),
+            kind,
+            probe_version,
+            decision,
+            tolerance,
+            dimension,
+            vector
+        ],
+    )? == 1)
+}
+
+/// ADR 0036 §6: retain the first comparable vector, rather than drifting
+/// the baseline with every restart. Chat and decision references remain
+/// launch-scoped in `record_wake_canary_in`.
+#[allow(clippy::too_many_arguments)]
+fn embedding_readiness_in(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    instance_index: u32,
+    generation: i64,
+    incarnation: &str,
+    operation_id: &str,
+    observed: StoredEmbeddingCanary,
+    now: i64,
+) -> Result<EmbeddingCanaryOutcome, StoreError> {
+    let baseline = tx
+        .query_row(
+            "SELECT generation,incarnation,probe_version,dimension,vector,tolerance
+           FROM wake_canaries
+          WHERE deployment_id=?1 AND instance_index=?2 AND generation<=?3 AND kind='embedding'
+          ORDER BY generation DESC LIMIT 1",
+            params![deployment_id, instance_index, generation],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, u32>(2)?,
+                    r.get::<_, u32>(3)?,
+                    r.get::<_, Vec<u8>>(4)?,
+                    r.get::<_, f64>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let mut retained = None;
+    let mut outcome = EmbeddingCanaryOutcome::NotComparable;
+    if let Some((
+        reference_generation,
+        reference_incarnation,
+        version,
+        dimension,
+        bytes,
+        tolerance,
+    )) = baseline
+    {
+        if bytes.len() != dimension as usize * 4 {
+            return Err(StoreError::Conflict);
+        }
+        let baseline = StoredEmbeddingCanary {
+            probe_kind: EMBEDDING_PROBE_KIND.into(),
+            probe_version: version,
+            dimension,
+            vector: vector_from_bytes(&bytes),
+            tolerance,
+        };
+        let (comparison, relative_distance) = compare_embedding_canary_with_distance(
+            &baseline,
+            &observed.probe_kind,
+            observed.probe_version,
+            &observed.vector,
+        );
+        outcome = comparison;
+        if outcome != EmbeddingCanaryOutcome::NotComparable {
+            crate::events::append_event(
+                tx,
+                &crate::events::EventMetadata::EmbeddingCanaryChecked {
+                    deployment_id: deployment_id.into(),
+                    operation_id: operation_id.into(),
+                    instance_index,
+                    generation,
+                    incarnation: incarnation.into(),
+                    reference_generation,
+                    reference_incarnation,
+                    probe_kind: observed.probe_kind.clone(),
+                    probe_version: observed.probe_version,
+                    reference_dimension: baseline.dimension,
+                    observed_dimension: observed.dimension,
+                    relative_distance,
+                    tolerance: baseline.tolerance,
+                    verdict: if outcome == EmbeddingCanaryOutcome::Matches {
+                        "pass"
+                    } else {
+                        "fail"
+                    },
+                },
+            )
+            .map_err(|_| StoreError::Conflict)?;
+            retained = Some(baseline);
+        }
+    }
+    if outcome == EmbeddingCanaryOutcome::Differs {
+        tx.execute(
+            "UPDATE deployment_instances SET last_error=?4
+              WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3",
+            params![deployment_id, instance_index, generation, WAKE_MISMATCH],
+        )?;
+    } else {
+        record_wake_canary_in(
+            tx,
+            deployment_id,
+            instance_index,
+            generation,
+            incarnation,
+            &WakeCanaryReference::Embedding(retained.unwrap_or(observed)),
+            now,
+        )?;
+    }
+    Ok(outcome)
+}
+
 impl Store {
     /// Record the canary reference of the launch `incarnation` at
     /// `generation`, once per launch. Returns whether this call recorded it:
@@ -271,55 +453,62 @@ impl Store {
         reference: &WakeCanaryReference,
         now: i64,
     ) -> Result<bool, StoreError> {
-        let (kind, probe_version, prompt, tokens, text, decision, tolerance, dimension, vector) =
-            columns(reference)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let current: Option<i64> = tx
-            .query_row(
-                "SELECT generation FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2",
-                params![deployment_id, instance_index],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if current != Some(generation) {
-            return Err(StoreError::Conflict);
-        }
-        tx.execute(
-            "DELETE FROM wake_canaries WHERE deployment_id=?1 AND instance_index=?2 AND generation<?3",
-            params![deployment_id, instance_index, generation],
+        let recorded = record_wake_canary_in(
+            &tx,
+            deployment_id,
+            instance_index,
+            generation,
+            incarnation,
+            reference,
+            now,
         )?;
-        let recorded = tx.execute(
-            "INSERT INTO wake_canaries(deployment_id,instance_index,generation,incarnation,prompt,
-                tokens_json,text,recorded_at_ms,kind,probe_version,decision_json,tolerance,
-                dimension,vector)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
-             ON CONFLICT(deployment_id,instance_index,generation) DO UPDATE SET
-                incarnation=excluded.incarnation,prompt=excluded.prompt,
-                tokens_json=excluded.tokens_json,text=excluded.text,
-                kind=excluded.kind,probe_version=excluded.probe_version,
-                decision_json=excluded.decision_json,tolerance=excluded.tolerance,
-                dimension=excluded.dimension,vector=excluded.vector,
-                recorded_at_ms=excluded.recorded_at_ms,mismatch_operation_id=NULL
-             WHERE wake_canaries.incarnation<>excluded.incarnation",
-            params![
-                deployment_id,
-                instance_index,
-                generation,
-                incarnation,
-                prompt,
-                tokens,
-                text,
-                now.max(0),
-                kind,
-                probe_version,
-                decision,
-                tolerance,
-                dimension,
-                vector
-            ],
-        )? == 1;
         tx.commit()?;
         Ok(recorded)
+    }
+
+    /// ADR 0036 §§5, 6, EM4: record the first embedding reference, or
+    /// compare with the reference retained before this launch. The verdict
+    /// and retained baseline commit together, before Ready can open dispatch.
+    pub fn record_embedding_readiness(
+        &self,
+        session: &crate::dispatch::CoordinatorSession,
+        context: &capyctl_domain::completion::StepExecutionContext,
+        instance_index: u32,
+        observed: StoredEmbeddingCanary,
+        now: i64,
+    ) -> Result<EmbeddingCanaryOutcome, StoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        crate::lifecycle::completion::check_session(&tx, session)
+            .map_err(|_| StoreError::Conflict)?;
+        let current: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lifecycle_steps s
+               JOIN lifecycle_runs r ON r.operation_id=s.operation_id
+               JOIN runtime_bindings b ON b.id=s.binding_id
+               JOIN deployment_instances i ON i.deployment_id=r.deployment_id AND i.instance_index=r.instance_index
+              WHERE s.id=?1 AND s.operation_id=?2 AND s.binding_id=?3 AND b.incarnation=?4
+                AND r.deployment_id=?5 AND r.generation=?6 AND r.instance_index=?7
+                AND i.generation=r.generation AND s.state='armed' AND r.session_id=?8)",
+            params![context.token.step_id, context.token.operation_id, context.binding_id,
+                context.incarnation, context.token.deployment_id, context.token.generation,
+                instance_index, session.id()],
+            |r| r.get(0),
+        )?;
+        if !current {
+            return Err(StoreError::Conflict);
+        }
+        let outcome = embedding_readiness_in(
+            &tx,
+            &context.token.deployment_id,
+            instance_index,
+            context.token.generation,
+            &context.incarnation,
+            &context.token.operation_id,
+            observed,
+            now,
+        )?;
+        tx.commit()?;
+        Ok(outcome)
     }
 
     /// The canary reference recorded for the launch `incarnation` at
@@ -797,6 +986,101 @@ mod tests {
             dimension: vector.len() as u32,
             vector: vector.to_vec(),
             tolerance: 0.02,
+        }
+    }
+
+    fn embedding_readiness(
+        store: &Store,
+        generation: i64,
+        incarnation: &str,
+        observed: StoredEmbeddingCanary,
+    ) -> EmbeddingCanaryOutcome {
+        let tx = Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate).unwrap();
+        let outcome = embedding_readiness_in(
+            &tx,
+            "d",
+            0,
+            generation,
+            incarnation,
+            "restart",
+            observed,
+            10,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        outcome
+    }
+
+    // T47 EM4 (ADR 0036 §§5, 6): a first launch records, without a verdict;
+    // a restart keeps that baseline across a new incarnation and generation.
+    // A changed probe version records a reference without comparing versions.
+    #[test]
+    fn an_embedding_restart_keeps_the_baseline_without_comparing_probe_versions() {
+        let store = store_with_instance(1);
+        let first = embedding(&[0.6, 0.8]);
+        assert_eq!(
+            embedding_readiness(&store, 1, "first", first.clone()),
+            EmbeddingCanaryOutcome::NotComparable
+        );
+        assert!(store.events_after(None, 100).unwrap().events.is_empty());
+        for (generation, incarnation) in [(1, "replacement"), (3, "restart")] {
+            set_instance(&store, generation);
+            assert_eq!(
+                embedding_readiness(&store, generation, incarnation, embedding(&[0.601, 0.799])),
+                EmbeddingCanaryOutcome::Matches
+            );
+            assert_eq!(
+                store.wake_canary("d", 0, generation, incarnation).unwrap(),
+                Some(WakeCanaryReference::Embedding(first.clone()))
+            );
+        }
+        assert_eq!(store.events_after(None, 100).unwrap().events.len(), 2);
+        set_instance(&store, 4);
+        let mut new_probe = embedding(&[1.0, 0.0, 0.0]);
+        new_probe.probe_version = 2;
+        assert_eq!(
+            embedding_readiness(&store, 4, "new-probe", new_probe.clone()),
+            EmbeddingCanaryOutcome::NotComparable
+        );
+        assert_eq!(store.events_after(None, 100).unwrap().events.len(), 2);
+        assert_eq!(
+            store.wake_canary("d", 0, 4, "new-probe").unwrap(),
+            Some(WakeCanaryReference::Embedding(new_probe))
+        );
+    }
+
+    // T47 EM4 (ADR 0036 §6): an out-of-tolerance or dimension-changing
+    // restart emits a failing measurement and never overwrites the baseline.
+    #[test]
+    fn a_failed_embedding_restart_never_replaces_the_baseline() {
+        for vector in [vec![0.8, 0.6], vec![0.6, 0.8, 0.0]] {
+            let store = store_with_instance(1);
+            let first = embedding(&[0.6, 0.8]);
+            embedding_readiness(&store, 1, "first", first.clone());
+            set_instance(&store, 2);
+            assert_eq!(
+                embedding_readiness(&store, 2, "bad", embedding(&vector)),
+                EmbeddingCanaryOutcome::Differs
+            );
+            assert_eq!(
+                store.wake_canary("d", 0, 1, "first").unwrap(),
+                Some(WakeCanaryReference::Embedding(first))
+            );
+            assert_eq!(store.wake_canary("d", 0, 2, "bad").unwrap(), None);
+            assert_eq!(last_error(&store).as_deref(), Some(WAKE_MISMATCH));
+            let events = store.events_after(None, 100).unwrap().events;
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].kind, "embedding_canary_checked");
+            assert_eq!(events[0].operation_id.as_deref(), Some("restart"));
+            let payload: serde_json::Value = serde_json::from_str(&events[0].payload_json).unwrap();
+            assert_eq!(payload["verdict"], "fail");
+            assert_eq!(payload["reference_generation"], 1);
+            assert_eq!(payload["reference_incarnation"], "first");
+            if vector.len() == 2 {
+                assert!(payload["relative_distance"].as_f64().unwrap() > 0.02);
+            } else {
+                assert!(payload["relative_distance"].is_null());
+            }
         }
     }
 

@@ -27,7 +27,8 @@
 //! probe's kind and version, the vector's dimension, the vector and the
 //! tolerance ([`EMBEDDING_TOLERANCE`]); a later answer matches when its
 //! dimension is the same and its relative distance `‖v − r‖ / ‖r‖` is within
-//! the tolerance (`compare_embedding_canary`).
+//! the tolerance (`compare_embedding_canary`). Restarts compare before Ready
+//! and carry the retained reference forward, rather than recording a new one.
 //!
 //! [`EngineAdapter::wake_canary`]: capyctl_adapters::traits::EngineAdapter::wake_canary
 use crate::group_residency::{canary_matches, CanaryReference};

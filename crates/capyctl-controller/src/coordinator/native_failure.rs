@@ -257,6 +257,9 @@ pub(super) fn readiness_failure(reason: &str) -> Option<String> {
         TP_RANK_UNOBSERVED,
         ENGINE_LISTENER_EXPOSED,
         capyctl_config::tensorfold_native::LISTENER_EXPOSED,
+        // ADR 0036 §6, EM4: a restarted embedding fails with the canary's
+        // closed code and is released only on verified stop evidence.
+        crate::wake_canary::WAKE_MISMATCH,
     ]
     .into_iter()
     .find(|code| reason.contains(&format!("{code}:")))

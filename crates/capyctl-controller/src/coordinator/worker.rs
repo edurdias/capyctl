@@ -2943,7 +2943,7 @@ async fn drive(
     // ADR 0035 §§5, 6: on several GPUs, the ranks are named and the
     // listeners checked before anything is recorded; a failure here is a
     // failed launch, stopped and settled on gone evidence.
-    let observation = tokio::select! {
+    let mut observation = tokio::select! {
         biased;
         _ = stop.changed() => return Err(CoordinatorError::Stopped("shutdown during Initialize".into())),
         result = crate::activation_trace::within(readiness.cx(), local_ranks::at_readiness(shared, work, source, &driver, observation)) => result?,
@@ -2963,6 +2963,22 @@ async fn drive(
                 .record_owned_launch(owner.session(), &step, &receipt, now)
         })
         .await?;
+    // ADR 0036 §§5, 6, EM4: unlike chat's launch-local reference, an
+    // embedding reference survives stop. Compare it before Ready opens
+    // dispatch, and let ordinary failed-launch settlement stop a mismatch.
+    let embedding = work.effective().api == capyctl_config::effective::DeploymentApi::Embeddings;
+    if embedding {
+        let mut context = command.context.clone();
+        context.identities = capyctl_domain::completion::ExecutionIdentities::Retained(
+            observation.identities.clone(),
+        );
+        let answered =
+            embedding_readiness_check(shared, &driver, work.instance_index(), context).await?;
+        // SPEC §6.1: readiness evidence remains fresh after the canary,
+        // and its owned engine must still be alive when dispatch opens.
+        engine_processes_alive(&driver, &mut observation.identities).map_err(service)?;
+        observation.observed_at_ms = answered;
+    }
     let builds = observation.kernel_builds.clone();
     let identities = observation.identities.clone();
     // ADR 0033 §§3, 8 (lifecycle design §10): what became of the launch's
@@ -3025,7 +3041,9 @@ async fn drive(
     // Owner decision 2026-10-09: the launch's wake canary reference, recorded
     // at its first readiness. A probe that fails records nothing and the
     // launch stays Ready; its first wake records the reference instead.
-    record_wake_canary(shared, &driver, work.instance_index(), &command.context).await;
+    if !embedding {
+        record_wake_canary(shared, &driver, work.instance_index(), &command.context).await;
+    }
     // Owner decision 2026-09-23: a peak measured while nothing else changed
     // the host's memory (no other activation or cleanup on it) is recorded
     // for later starts of this revision there, per memory domain. A failure
@@ -4249,6 +4267,47 @@ fn after_canary(
 
 fn service(error: impl std::fmt::Display) -> CoordinatorError {
     CoordinatorError::Service(error.to_string())
+}
+
+/// ADR 0036 §§5, 6: a complete embedding answer and its durable reference
+/// comparison are prerequisites of Ready, never best-effort after it.
+async fn embedding_readiness_check(
+    shared: &Arc<Shared>,
+    driver: &Arc<Driver>,
+    instance: u32,
+    context: capyctl_domain::completion::StepExecutionContext,
+) -> Result<i64, CoordinatorError> {
+    use crate::wake_canary::{CANARY_DEADLINE, CANARY_TOKENS};
+    let bound = remaining(shared, context.deadline_ms)?.min(CANARY_DEADLINE);
+    let answer = tokio::time::timeout(
+        bound,
+        driver.engine.wake_canary(&context, CANARY_TOKENS, bound),
+    )
+    .await
+    .map_err(|_| service("the embedding readiness canary timed out"))?
+    .map_err(service)?;
+    let capyctl_store::wake_canary::WakeCanaryReference::Embedding(reference) =
+        crate::wake_canary::reference(&answer.answer)
+    else {
+        return Err(service(
+            "the embedding readiness canary answered another probe kind",
+        ));
+    };
+    let now = (shared.clock)()?;
+    let outcome = shared
+        .with_owner(move |owner| {
+            owner
+                .store()
+                .record_embedding_readiness(owner.session(), &context, instance, reference, now)
+                .map_err(service)
+        })
+        .await?;
+    if outcome == capyctl_store::wake_canary::EmbeddingCanaryOutcome::Differs {
+        return Err(service(
+            "wake_mismatch: the restarted embedding differs from its reference",
+        ));
+    }
+    Ok(answer.observed_at_ms)
 }
 
 /// Owner decision 2026-10-09: record the launch `context` names' wake canary
