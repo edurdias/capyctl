@@ -78,9 +78,14 @@ RESERVED = (
 # parse must resolve both to what the reserved block alone resolved, so an
 # extra or host-fixed argument naming either is refused whatever the host
 # approves. `--collect-detailed-traces` is never rendered.
+# SPEC §8.2 / T21: 0.33.0 adds a pluggable sleep backend (ModelConfig,
+# model.py:379) and watchdog stack dumps (WatchdogConfig.dump_dir,
+# watchdog_config.py:28). Keep the built-in allocator and no dump path;
+# neither destination exists on older builds.
 RESERVED_IF_PRESENT = ("nnodes", "node_rank", "master_addr", "master_port",
                        "enable_scale_out", "grpc_port",
-                       "otlp_traces_endpoint", "collect_detailed_traces")
+                       "otlp_traces_endpoint", "collect_detailed_traces",
+                       "sleep_mode_backend", "watchdog_config")
 # ADR 0017 §2 (version skew): vLLM 0.31.0 moved logging into the nested
 # `--logging-config` dotted config (vllm/config/logging.py, `LoggingConfig`:
 # log_level, configure_logging, pylogging_config_file). The serve parser

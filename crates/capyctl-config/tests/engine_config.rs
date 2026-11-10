@@ -741,6 +741,21 @@ fn sensitive_shapes_and_abbreviations_need_approval() {
         // vLLM 0.32.0: a second, gRPC listener beside HTTP.
         json!(["--grpc-port", "50051"]),
         json!(["--grpc-port=0"]),
+        // T14 T21 / SPEC §8.2: vLLM 0.33.0's backend and stack dumps.
+        json!(["--sleep-mode-backend", "checkpoint"]),
+        json!(["--sleep_mode_backend=checkpoint"]),
+        json!(["--sleep-mode-b", "checkpoint"]),
+        json!(["--watchdog-config", "{\"dump_dir\":\"/tmp/dumps\"}"]),
+        json!(["--watchdog-config.dump_dir=/tmp/dumps"]),
+        json!(["--watchdog-c", "{}"]),
+        // T14 T21: 0.33.0's EnableDisableAction aliases keep reservations.
+        json!(["--disable-sleep-mode"]),
+        json!(["--disable-log-outputs"]),
+        json!(["--disable-per-request-metrics"]),
+        json!(["--enable-log-stats"]),
+        json!(["--enable-uvicorn-access-log"]),
+        json!(["--disable-ssl-refresh"]),
+        json!(["--disable-scale-out"]),
     ] {
         let text = extra_args_error("vllm", args.clone());
         assert!(text.contains("reserved"), "{args}: {text}");
