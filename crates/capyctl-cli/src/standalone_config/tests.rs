@@ -326,7 +326,6 @@ fn the_installation_drift_policy_is_carried_by_the_profile() {
             "d",
             "d",
             &local("/srv/models/d"),
-            Engine::Vllm,
             &TemplateMemory::Unified {
                 capacity_bytes: CAPACITY,
             },
@@ -431,7 +430,6 @@ fn every_phase_is_declared_and_the_peak_is_a_transition() {
         "m",
         "m",
         &local("/models/m"),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -470,7 +468,6 @@ fn a_parked_deployment_holds_no_device() {
         "m",
         "m",
         &local("/models/m"),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -500,7 +497,6 @@ fn the_deployment_names_its_installation() {
         "m",
         "route-m",
         &local("/models/m"),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -521,7 +517,6 @@ fn the_deployment_states_its_model_source() {
         "m",
         "m",
         &local("/models/m"),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -542,7 +537,6 @@ fn the_deployment_states_its_model_source() {
             files: vec![],
             token_ref: None,
         },
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -599,7 +593,6 @@ fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
         "m",
         "m",
         &local("/models/m"),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -638,7 +631,6 @@ fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
         "m",
         "m",
         &local("/models/m"),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -669,7 +661,6 @@ fn a_standalone_deployment_with_a_group_topology_is_refused() {
         "m",
         "m",
         &local("/models/m"),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -1068,7 +1059,6 @@ fn host_policy_from_env_is_complete() {
         "m",
         "m",
         &local(models.join("m").to_str().expect("a utf-8 path")),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -1371,7 +1361,6 @@ fn an_sglang_host_that_opts_out_of_deep_park_deploys_restart_only() {
         "m",
         "m",
         &local(models.join("m").to_str().expect("a utf-8 path")),
-        installation.engine,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -1406,12 +1395,11 @@ fn an_sglang_host_that_opts_out_of_deep_park_deploys_restart_only() {
 // T21
 #[test]
 fn the_residency_follows_the_deep_park_switch_for_every_engine() {
-    let residency = |engine, deep_park| {
+    let residency = |deep_park| {
         deployment_document(
             "m",
             "m",
             &local("/models/m"),
-            engine,
             &TemplateMemory::Unified {
                 capacity_bytes: CAPACITY,
             },
@@ -1422,10 +1410,8 @@ fn the_residency_follows_the_deep_park_switch_for_every_engine() {
         .expect("the unified template")["residency"]
             .clone()
     };
-    assert_eq!(residency(Engine::Sglang, true), "deep");
-    assert_eq!(residency(Engine::Sglang, false), "restart_only");
-    assert_eq!(residency(Engine::Vllm, true), "deep");
-    assert_eq!(residency(Engine::Vllm, false), "restart_only");
+    assert_eq!(residency(true), "deep");
+    assert_eq!(residency(false), "restart_only");
 }
 
 /// SPEC §3.3 / ADR 0001 (owner decision 2026-09-24): without
@@ -1736,7 +1722,6 @@ fn source() -> ModelSource {
 fn a_discrete_template_states_a_request_and_derives_phases() {
     let memory = TemplateMemory::Device {
         managed_limit: 15 << 30,
-        device_total: 16376 << 20,
         weights_bytes: Some(6 << 30),
         system_parked_limit: 15 << 30,
         kv_cache_bytes: None,
@@ -1745,7 +1730,6 @@ fn a_discrete_template_states_a_request_and_derives_phases() {
         "a",
         "a",
         &source(),
-        Engine::Sglang,
         &memory,
         DEFAULT_REQUEST_DEADLINE,
         true,
@@ -1756,7 +1740,7 @@ fn a_discrete_template_states_a_request_and_derives_phases() {
     // The picker chooses the GPU (discrete GPU design §7); the deployment
     // parser requires the key, so the template pins nothing with an empty list.
     assert_eq!(doc["devices"], serde_json::json!([]));
-    let (request, kv) = device_request(Engine::Sglang, 6 << 30, 15 << 30, 16376 << 20);
+    let (request, kv) = device_request(6 << 30, 15 << 30);
     assert_eq!(kv, (15i64 << 30) / 4); // min(4 GiB, 3.75 GiB)
     assert_eq!(
         doc["engine_config"]["memory"]["request"],
@@ -1766,14 +1750,11 @@ fn a_discrete_template_states_a_request_and_derives_phases() {
     assert_eq!(doc["residency"], "host_backed");
 }
 
-// T26: vLLM's request never falls below 0.75 of the card.
+// T26 — ADR 0019 §§3–4, #225: derived requests have no card-share floor.
 #[test]
-fn the_vllm_request_has_a_floor() {
-    let (small, _) = device_request(Engine::Vllm, 2 << 30, 15 << 30, 16376 << 20);
-    assert!(small >= (16376i64 << 20) / 100 * 75);
-    // SGLang has no floor: weights x 1.10 plus the KV cache.
-    let (sglang, kv) = device_request(Engine::Sglang, 2 << 30, 15 << 30, 16376 << 20);
-    assert_eq!(sglang, (2i64 << 30) / 100 * 110 + kv);
+fn the_vllm_request_follows_weights_and_kv_without_a_floor() {
+    let (small, kv) = device_request(2 << 30, 15 << 30);
+    assert_eq!(small, (2i64 << 30) / 100 * 110 + kv);
 }
 
 // Owner decision 2: host_backed is the discrete default when the copy fits.
@@ -1801,7 +1782,6 @@ fn the_default_tier_follows_the_host() {
 fn a_model_larger_than_the_device_is_refused() {
     let memory = TemplateMemory::Device {
         managed_limit: 15 << 30,
-        device_total: 16376 << 20,
         weights_bytes: Some(16 << 30),
         system_parked_limit: 15 << 30,
         kv_cache_bytes: None,
@@ -1810,7 +1790,6 @@ fn a_model_larger_than_the_device_is_refused() {
         "a",
         "a",
         &source(),
-        Engine::Vllm,
         &memory,
         DEFAULT_REQUEST_DEADLINE,
         true,
@@ -1822,7 +1801,7 @@ fn a_model_larger_than_the_device_is_refused() {
         TemplateError::InsufficientDeviceMemory { .. }
     ));
     assert!(error.to_string().starts_with("insufficient_device_memory"));
-    let (request, _) = device_request(Engine::Vllm, 16 << 30, 15 << 30, 16376 << 20);
+    let (request, _) = device_request(16 << 30, 15 << 30);
     let charged = request + capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
     assert!(error.to_string().contains(&charged.to_string()), "{error}");
     assert!(
@@ -1840,7 +1819,6 @@ fn the_unified_template_is_unchanged() {
         "a",
         "a",
         &source(),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: 128 << 30,
         },
@@ -1878,10 +1856,8 @@ fn the_discrete_template_resolves_and_fits_the_card() {
             "a",
             "a",
             &source(),
-            engine,
             &TemplateMemory::Device {
                 managed_limit: limits.managed_limit,
-                device_total: gpu.total_bytes,
                 weights_bytes: Some(6 * GIB),
                 system_parked_limit: system_parked,
                 kv_cache_bytes: None,
@@ -1947,7 +1923,6 @@ fn card_memory(weights_bytes: Option<i64>, kv_cache_bytes: Option<i64>) -> Templ
     let gpu = rtx(0, 16376, 1536).memory.unwrap();
     TemplateMemory::Device {
         managed_limit: device_limits(&gpu, MAX_PARKED).managed_limit,
-        device_total: gpu.total_bytes,
         weights_bytes,
         system_parked_limit: 61 * GIB / 100 * PARKED_FRACTION,
         kv_cache_bytes,
@@ -1966,7 +1941,6 @@ fn a_remote_source_on_a_discrete_host_is_sized_once_downloaded() {
             "a",
             "a",
             &hugging_face(),
-            engine,
             &card_memory(None, None),
             DEFAULT_REQUEST_DEADLINE,
             true,
@@ -2009,12 +1983,7 @@ fn a_remote_source_on_a_discrete_host_is_sized_once_downloaded() {
         .unwrap_or_else(|error| panic!("{engine:?}: {error}"));
         let (_, device) = sized.ready_device_allocation().expect("on the card");
         let gpu = rtx(0, 16376, 1536).memory.unwrap();
-        let (local, _) = device_request(
-            engine,
-            8 * GIB,
-            device_limits(&gpu, MAX_PARKED).managed_limit,
-            gpu.total_bytes,
-        );
+        let (local, _) = device_request(8 * GIB, device_limits(&gpu, MAX_PARKED).managed_limit);
         assert_eq!(
             device,
             local + capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES,
@@ -2026,7 +1995,6 @@ fn a_remote_source_on_a_discrete_host_is_sized_once_downloaded() {
         "a",
         "a",
         &hugging_face(),
-        Engine::Vllm,
         &card_memory(None, None),
         DEFAULT_REQUEST_DEADLINE,
         false,
@@ -2045,7 +2013,6 @@ fn a_declared_kv_cache_is_honoured_within_the_card_or_refused() {
         "a",
         "a",
         &source(),
-        Engine::Sglang,
         &card_memory(Some(8 * GIB), Some(2 * GIB)),
         DEFAULT_REQUEST_DEADLINE,
         true,
@@ -2065,7 +2032,6 @@ fn a_declared_kv_cache_is_honoured_within_the_card_or_refused() {
         "a",
         "a",
         &hugging_face(),
-        Engine::Sglang,
         &card_memory(None, Some(2 * GIB)),
         DEFAULT_REQUEST_DEADLINE,
         true,
@@ -2083,7 +2049,6 @@ fn a_declared_kv_cache_is_honoured_within_the_card_or_refused() {
             "a",
             "a",
             &source(),
-            Engine::Sglang,
             &card_memory(weights, Some(kv)),
             DEFAULT_REQUEST_DEADLINE,
             true,
@@ -2262,13 +2227,12 @@ fn a_discrete_charge_covers_what_vllm_holds_on_the_card() {
     let gpu = rtx(0, 16376, 1536).memory.unwrap();
     let limits = device_limits(&gpu, MAX_PARKED);
     let weights = 8_040_000_000;
-    let (request, _) = device_request(Engine::Vllm, weights, limits.managed_limit, gpu.total_bytes);
+    let (request, _) = device_request(weights, limits.managed_limit);
     assert!(request < MEASURED_HELD, "the request alone under-charges");
     let doc = deployment_document(
         "a",
         "a",
         &source(),
-        Engine::Vllm,
         &card_memory(Some(weights), None),
         DEFAULT_REQUEST_DEADLINE,
         true,
@@ -2361,7 +2325,6 @@ fn drafter_on_standalone(
         "d",
         "d",
         &local("/srv/models/d"),
-        Engine::Tensorfold,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },

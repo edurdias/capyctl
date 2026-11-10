@@ -12,9 +12,7 @@ use capyctl_config::effective::EffectiveDeployment;
 use capyctl_domain::launch::{LaunchSettings, SafetensorsLoadStrategy, VllmLaunchSettings};
 
 use crate::policy::ParkPolicy;
-use crate::vllm::args::{
-    device_utilization_units, GrantedBudget, PlanInputVllm, DEVICE_UTILIZATION_FLOOR_PCT,
-};
+use crate::vllm::args::{device_utilization_units, GrantedBudget, PlanInputVllm};
 
 /// Reserved (ADR 0014 §3): the gate vLLM checks free memory against at start.
 /// Explicit KV bytes size the pool, so the gate only has to pass.
@@ -100,29 +98,14 @@ pub fn park_policy(effective: &EffectiveDeployment) -> ParkPolicy {
 /// request and KV cache are per GPU there, and the stated total is the
 /// smallest chosen card's.
 ///
-/// ADR 0019 amendment of 2026-10-30 (proposed, #225): a request CapyCTL
-/// derived keeps the floor ([`DEVICE_UTILIZATION_FLOOR_PCT`]); a request the
-/// deployment declares is the card memory it may use, so vLLM is told its
-/// share and nothing more. With the floor, vLLM's start check asked for 75 %
-/// of the card free whatever the request, so a declared request below that
-/// could not start beside a model holding more than a quarter of the card.
+/// ADR 0019 §§3–4, #225 (owner decision 2026-11-09): both derived and
+/// declared requests render their own share without the historical 75% floor.
 fn utilization_units(effective: &EffectiveDeployment, settings: &VllmLaunchSettings) -> u64 {
     match (
         effective.ready_device_allocation(),
         settings.memory.device_total_bytes,
     ) {
-        (Some(_), Some(total)) => {
-            let declared = !effective
-                .engine_config
-                .provenance()
-                .contains_key("memory.request");
-            let floor = if declared {
-                1
-            } else {
-                DEVICE_UTILIZATION_FLOOR_PCT
-            };
-            device_utilization_units(settings.memory.request_bytes, total, floor)
-        }
+        (Some(_), Some(total)) => device_utilization_units(settings.memory.request_bytes, total),
         _ => u64::from(GPU_UTILIZATION_GATE_PCT) * 100_000_000,
     }
 }

@@ -9,7 +9,6 @@
 use crate::device_inventory::InventoryPublication;
 use capyctl_agent::gpu_memory::{GpuMemory, HostShape};
 use capyctl_config::effective::ModelSource;
-use capyctl_config::engine_policy::Engine;
 use capyctl_controller::engine_provider::NamedInstallation;
 use capyctl_controller::EngineInstallation;
 use serde_json::{json, Value};
@@ -479,17 +478,14 @@ pub const DEFAULT_REQUEST_DEADLINE: &str = "900s";
 /// deep parking is on by default and a host opts out, so the generated residency
 /// has to follow that switch rather than state a tier the host's profile refuses.
 /// The residency does not depend on the engine (vLLM sleeps, SGLang uses its
-/// memory saver). The engine decides only a discrete request's floor (vLLM's).
+/// memory saver).
 ///
 /// `profile` is the runtime profile the deployment runs on (ADR 0018 §5: the
 /// host may publish several; [`STANDALONE_PROFILE`] is the environment's).
-// Each argument is a separate field of the document.
-#[allow(clippy::too_many_arguments)]
 pub fn deployment_document(
     name: &str,
     route: &str,
     source: &ModelSource,
-    engine: Engine,
     memory: &TemplateMemory,
     request_deadline: &str,
     deep_park: bool,
@@ -499,7 +495,6 @@ pub fn deployment_document(
         TemplateMemory::Unified { capacity_bytes } => capacity_bytes,
         TemplateMemory::Device {
             managed_limit,
-            device_total,
             weights_bytes,
             system_parked_limit,
             kv_cache_bytes,
@@ -508,10 +503,8 @@ pub fn deployment_document(
                 name,
                 route,
                 source,
-                engine,
                 DiscreteTemplate {
                     managed_limit,
-                    device_total,
                     weights_bytes,
                     system_parked_limit,
                     kv_cache_bytes,
@@ -587,8 +580,6 @@ pub enum TemplateMemory {
     Device {
         /// The device domain's managed limit ([`device_limits`]).
         managed_limit: i64,
-        /// The card's total memory, which vLLM's floor is a fraction of.
-        device_total: i64,
         /// ADR 0014 §5: the sum of the checkpoint's weight-file sizes. `None`
         /// for a Hugging Face or HTTP source, whose weights are known only once
         /// downloaded (review decision): the template then states the KV
@@ -640,14 +631,9 @@ impl TemplateError {
 /// Spec §3: the device memory request and KV cache of a discrete deployment.
 ///
 /// The KV cache is `min(4 GiB, managed_limit / 4)` and the request is
-/// `weights x 1.10 + kv`. vLLM's request is at least 0.75 of the card.
-pub fn device_request(
-    engine: Engine,
-    weights_bytes: i64,
-    managed_limit: i64,
-    device_total: i64,
-) -> (i64, i64) {
-    device_request_with_kv(engine, weights_bytes, managed_limit, device_total, None)
+/// `weights x 1.10 + kv` for every engine (ADR 0019 §3, #225).
+pub fn device_request(weights_bytes: i64, managed_limit: i64) -> (i64, i64) {
+    device_request_with_kv(weights_bytes, managed_limit, None)
 }
 
 /// The default KV cache of a discrete template: `min(4 GiB, managed_limit / 4)`,
@@ -659,22 +645,15 @@ pub fn default_device_kv(managed_limit: i64) -> i64 {
 
 /// [`device_request`] with the KV cache the operator stated, when stated.
 pub fn device_request_with_kv(
-    engine: Engine,
     weights_bytes: i64,
     managed_limit: i64,
-    device_total: i64,
     kv_cache_bytes: Option<i64>,
 ) -> (i64, i64) {
     let kv = kv_cache_bytes.unwrap_or_else(|| default_device_kv(managed_limit));
     let request = (weights_bytes / 100).saturating_mul(110).saturating_add(kv);
-    // Spec §3: vLLM 0.29 with CUDA graphs starts a 4B model on a 16 GB card
-    // only at --gpu-memory-utilization >= 0.75.
-    let floor = if engine == Engine::Vllm {
-        device_total / 100 * 75
-    } else {
-        0
-    };
-    (request.max(floor), kv)
+    // ADR 0019 §3, #225: the derived request follows weights and explicit KV,
+    // without reserving a minimum fraction of the card.
+    (request, kv)
 }
 
 /// The residency the generated template declares.
@@ -721,7 +700,6 @@ pub fn discrete_template_memory(
     let limits = device_limits(largest, MAX_PARKED);
     Some(TemplateMemory::Device {
         managed_limit: limits.managed_limit,
-        device_total: largest.total_bytes,
         weights_bytes,
         system_parked_limit: system_parked_limit(host),
         kv_cache_bytes,
@@ -758,7 +736,6 @@ fn system_parked_limit(host: &Value) -> i64 {
 
 struct DiscreteTemplate {
     managed_limit: i64,
-    device_total: i64,
     weights_bytes: Option<i64>,
     system_parked_limit: i64,
     kv_cache_bytes: Option<i64>,
@@ -773,7 +750,6 @@ fn discrete_document(
     name: &str,
     route: &str,
     source: &ModelSource,
-    engine: Engine,
     sizing: DiscreteTemplate,
     request_deadline: &str,
     deep_park: bool,
@@ -814,13 +790,8 @@ fn discrete_document(
             json!({"kv_cache": format!("{kv}B")}),
         ));
     };
-    let (request, kv) = device_request_with_kv(
-        engine,
-        weights_bytes,
-        sizing.managed_limit,
-        sizing.device_total,
-        sizing.kv_cache_bytes,
-    );
+    let (request, kv) =
+        device_request_with_kv(weights_bytes, sizing.managed_limit, sizing.kv_cache_bytes);
     // Spec §3: a request the device domain can never hold is refused at
     // deploy, with the numbers, before anything is stored. A KV cache the
     // operator stated is named in the refusal (review decision).

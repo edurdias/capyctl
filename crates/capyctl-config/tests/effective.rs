@@ -1,9 +1,9 @@
 use capyctl_config::effective::{
-    binding_fingerprint, derive_default_managed_ceiling, normalize_host_policy, parse_bytes,
-    parse_duration_ms, resolve_effective, resolve_effective_with_checkpoint, CheckpointFacts,
-    DeepPark, DeepParkSource, DomainMemory, Engine, ModelSource, PhaseFootprint, Residency,
-    ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES, PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES,
-    PARKED_RESIDUAL_PLACEHOLDER_BYTES,
+    binding_fingerprint, decode_effective_snapshot, derive_default_managed_ceiling,
+    normalize_host_policy, parse_bytes, parse_duration_ms, resolve_effective,
+    resolve_effective_with_checkpoint, CheckpointFacts, DeepPark, DeepParkSource, DomainMemory,
+    Engine, ModelSource, PhaseFootprint, Residency, ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES,
+    PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES, PARKED_RESIDUAL_PLACEHOLDER_BYTES,
 };
 use capyctl_config::resource_controls::ResourceControls;
 use capyctl_config::{parse_strict, ConfigErrorCode, ConfigKind};
@@ -1841,8 +1841,8 @@ fn explicit_discrete_resources_size_the_engine_from_the_device_allocation() {
 // once downloaded) is not materializable until the checkpoint digest measures
 // the weights, which is what lets acceptance freeze it provisional (ADR 0014
 // §7). Once measured, it is sized as the standalone template sizes a local
-// checkpoint (design §3): weights x 1.10 plus the KV cache, at least 0.75 of the
-// card for vLLM, with the startup peak on the card equal to the request. A
+// checkpoint (ADR 0019 §3, #225): weights x 1.10 plus the KV cache, with no
+// card-share floor and the startup peak on the card equal to the request. A
 // request the device domain can never hold is refused with its code.
 #[test]
 fn a_discrete_request_derived_from_the_weights_is_sized_for_the_card() {
@@ -1855,8 +1855,8 @@ fn a_discrete_request_derived_from_the_weights_is_sized_for_the_card() {
         let e = resolve_weighing(&kv_only(engine), &discrete_host(), None).unwrap_err();
         assert_eq!(e.code, ConfigErrorCode::NotMaterializable, "{e}");
         assert!(e.path.starts_with("engine_config.memory"), "{e}");
-        // Acceptance's placeholder: zero weights resolve to the KV cache
-        // (vLLM: its floor), a bound nothing reserves until re-resolved.
+        // Acceptance's placeholder: zero weights resolve to the KV cache,
+        // a bound nothing reserves until re-resolved.
         resolve_weighing(&kv_only(engine), &discrete_host(), Some(0)).expect("placeholder");
     }
     // SGLang: 8 GiB of weights x 1.10 plus 1 GiB of KV.
@@ -1867,12 +1867,10 @@ fn a_discrete_request_derived_from_the_weights_is_sized_for_the_card() {
     let on_card = request + capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
     assert_eq!(sglang.ready_device_allocation(), Some((Some(0), on_card)));
     assert_eq!(phase(&sglang.resources.cold)[0], ("gpu0".into(), on_card));
-    // vLLM: at least 0.75 of the card the device domain declares (managed
-    // limit plus free reserve, 16 GiB here).
+    // ADR 0019 §§3–4: vLLM follows the same weights + KV request.
     let vllm = resolve(&kv_only("vllm"), &discrete_host()).unwrap();
-    let floor = 16 * GIB / 100 * 75;
-    assert_eq!(vllm.engine_config.memory().request_bytes, floor);
-    assert_eq!(vllm.engine_config.memory().startup_bytes, Some(floor));
+    assert_eq!(vllm.engine_config.memory().request_bytes, request);
+    assert_eq!(vllm.engine_config.memory().startup_bytes, Some(request));
     // 14 GiB of weights: 16.4 GiB, beyond the 14.5 GiB the card's domain manages.
     let e = resolve_weighing(&kv_only("sglang"), &discrete_host(), Some(14 * GIB)).unwrap_err();
     assert!(e.detail.starts_with("insufficient_device_memory:"), "{e}");
@@ -1882,6 +1880,51 @@ fn a_discrete_request_derived_from_the_weights_is_sized_for_the_card() {
         unified.engine_config.memory().request_bytes,
         8 * GIB + GIB + capyctl_config::effective::overhead_margin(Engine::Sglang)
     );
+}
+
+// T09 T14 T26 — ADR 0014 §7 / ADR 0019 §§3–4: accepted revisions retain
+// their derivation rule; new requests no longer inherit the historical floor.
+#[test]
+fn frozen_vllm_device_requests_keep_their_accepted_derivation() {
+    let mut deployment = deployment_with("deep", "vllm", "1GiB");
+    deployment["engine_config"] = serde_json::json!({"memory": {"kv_cache": "1GiB"}});
+    for legacy in [false, true] {
+        let effective = capyctl_config::effective::resolve_effective_with_checkpoint(
+            &deployment,
+            &discrete_host(),
+            capyctl_config::effective::CheckpointFacts {
+                weights_bytes: Some(8 * GIB),
+                legacy_vllm_device_floor: legacy,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let snapshot = serde_json::to_value(&effective).unwrap();
+        assert_eq!(
+            snapshot["engine_config"].get("device_request_floor_pct"),
+            (!legacy).then_some(&serde_json::json!(0))
+        );
+        let decoded = decode_effective_snapshot(&snapshot.to_string()).unwrap();
+        assert_eq!(decoded, effective);
+        let expected = if legacy {
+            16 * GIB / 100 * 75
+        } else {
+            8 * GIB / 100 * 110 + GIB
+        };
+        assert_eq!(decoded.engine_config.memory().request_bytes, expected);
+        let rebuilt = capyctl_config::effective::resolve_snapshot_with_checkpoint(
+            &snapshot.to_string(),
+            capyctl_config::effective::CheckpointFacts {
+                weights_bytes: Some(8 * GIB),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rebuilt.engine_config.memory().request_bytes, expected);
+        let mut tampered = snapshot;
+        tampered["engine_config"]["device_request_floor_pct"] = serde_json::json!(75);
+        assert!(decode_effective_snapshot(&tampered.to_string()).is_err());
+    }
 }
 
 // T26: a discrete host whose policy has no single distinct system domain cannot

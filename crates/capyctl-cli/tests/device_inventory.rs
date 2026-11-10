@@ -203,7 +203,6 @@ fn a_boot_with_an_inventory_publishes_the_digest_and_the_single_devices_uuid() {
             &capyctl_config::effective::ModelSource::Local {
                 path: "/srv/models/m".into(),
             },
-            Engine::Sglang,
             &capyctl_cli::standalone_config::TemplateMemory::Unified {
                 capacity_bytes: 1 << 40,
             },
@@ -537,7 +536,6 @@ fn a_unified_host_whose_sample_disagrees_publishes_no_uuid_and_still_resolves() 
                 &capyctl_config::effective::ModelSource::Local {
                     path: "/srv/models/m".into(),
                 },
-                Engine::Vllm,
                 &capyctl_cli::standalone_config::TemplateMemory::Unified {
                     capacity_bytes: 1 << 40,
                 },

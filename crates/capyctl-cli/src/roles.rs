@@ -639,7 +639,6 @@ impl App {
             name,
             name,
             &source,
-            first.installation.engine,
             &memory,
             request_deadline,
             first.installation.deep_park,

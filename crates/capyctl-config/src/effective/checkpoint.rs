@@ -387,6 +387,9 @@ pub fn resolve_snapshot_with_checkpoint(
         CheckpointFacts {
             member_of: frozen.member_of,
             accepted_revision: true,
+            // ADR 0019 §§3–4 / #225: checkpoint refresh keeps a frozen
+            // request's accepted derivation, just as snapshot decoding does.
+            legacy_vllm_device_floor: frozen.legacy_vllm_device_floor,
             ..facts
         },
     )

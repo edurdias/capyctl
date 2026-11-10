@@ -281,6 +281,11 @@ impl MemoryRequest {
 pub struct VllmLaunchSettings {
     pub common: CommonEngineSettings,
     pub memory: MemoryRequest,
+    /// ADR 0019 §§3–4 / #225: derivation marker, not an operator setting.
+    /// New derived device requests record zero; older snapshots omit it and
+    /// retain their accepted 75% floor. Declared and unified requests omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_request_floor_pct: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_size_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

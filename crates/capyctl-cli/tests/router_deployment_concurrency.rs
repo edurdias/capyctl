@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use capyctl_cli::roles::App;
 use capyctl_config::effective::{DeploymentApi, ModelSource};
-use capyctl_config::engine_policy::Engine;
 use capyctl_controller::{LeaseEnd, LifecyclePort as _};
 use capyctl_domain::LifecycleAction;
 use capyctl_router::balance::Plan;
@@ -26,7 +25,6 @@ async fn configured(app: &App, declared: Option<u32>, api: DeploymentApi) -> Str
         &ModelSource::Local {
             path: "/models/bounded".into(),
         },
-        Engine::Vllm,
         &capyctl_cli::standalone_config::TemplateMemory::Unified {
             capacity_bytes: support::TEST_CAPACITY_BYTES,
         },
@@ -74,7 +72,10 @@ async fn holds_exactly(declared: Option<u32>, api: DeploymentApi, expected: usiz
         None,
         capyctl_protocol::now_unix_ms(),
     );
-    assert_eq!(report["deployments"][0]["router"]["in_flight_limit"], expected);
+    assert_eq!(
+        report["deployments"][0]["router"]["in_flight_limit"],
+        expected
+    );
     app.deps().inflight.waiting.set_limits(waiting);
     let endpoint = Endpoint::serving(api);
     let mut held = Vec::new();

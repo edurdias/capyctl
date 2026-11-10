@@ -16,7 +16,7 @@ fn capyctl() -> std::process::Command {
 }
 
 use capyctl_cli::grammar::{parse_invocation, Command, LifecycleAction};
-use capyctl_config::effective::{Engine, ModelSource};
+use capyctl_config::effective::ModelSource;
 use serde_json::Value;
 
 // T10: the flag parses on both start forms, defaults off, and is refused
@@ -96,7 +96,6 @@ async fn start_evict_reports_victims_and_replays_by_request_id() {
         &ModelSource::Local {
             path: "/models/evict-model".into(),
         },
-        Engine::Vllm,
         // The capacity the app was booted with (`support::test_memory`), not
         // this machine's: the deployment must be sized against the same host.
         &capyctl_cli::standalone_config::TemplateMemory::Unified {

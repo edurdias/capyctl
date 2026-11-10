@@ -664,12 +664,8 @@ async fn a_discrete_standalone_sizes_its_deployment_from_the_checkpoint() {
             .expect("the deployment has an effective revision")
             .effective;
         assert_eq!(effective["residency"], residency, "{effective}");
-        let (request, _) = capyctl_cli::standalone_config::device_request(
-            capyctl_config::engine_policy::Engine::Vllm,
-            weights,
-            limits.managed_limit,
-            gpu.total_bytes,
-        );
+        let (request, _) =
+            capyctl_cli::standalone_config::device_request(weights, limits.managed_limit);
         // The card is charged the request and the engine's CUDA context and
         // graphs (ADR 0019).
         let on_card = request + capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;

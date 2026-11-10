@@ -58,6 +58,7 @@ use capyctl_domain::launch::{
 pub fn vllm_launch_settings() -> LaunchSettings {
     LaunchSettings::Vllm(VllmLaunchSettings {
         common: CommonEngineSettings::default(),
+        device_request_floor_pct: None,
         memory: MemoryRequest {
             request_bytes: 8 << 30,
             kv_cache_bytes: 4 << 30,

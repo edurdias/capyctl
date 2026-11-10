@@ -278,6 +278,9 @@ pub struct CheckpointFacts {
     /// placeholder (it records `startup_graphs_bytes`); it re-resolves
     /// exactly as it was. Never set for a new resolution.
     pub legacy_device_placeholder: bool,
+    /// ADR 0019 §§3–4 / #225: a frozen derived vLLM device request without
+    /// the new zero-floor marker keeps its accepted 75% derivation.
+    pub legacy_vllm_device_floor: bool,
     /// ADR 0014 amendment A13: a snapshot frozen while CapyCTL turned SGLang's
     /// CUDA graphs off beside the memory saver records that default; it
     /// re-resolves exactly as it was. Never set for a new resolution.
@@ -484,8 +487,8 @@ struct RawTensorrtLlmFields {
 pub(super) struct DeviceSizing {
     /// The device domain's managed limit: a request above it can never place.
     pub(super) managed_limit: i64,
-    /// The card as the host policy declares it: managed limit plus free
-    /// reserve (what the standalone host policy publishes as the card's total).
+    /// The card total from host policy, used only to reconstruct pre-0.2.0
+    /// derived vLLM requests without changing their accepted reservations.
     pub(super) declared_total: i64,
     /// ADR 0035 §3: the communication allowance each GPU of an instance on
     /// several GPUs carries beside its rank's request; zero on one GPU.
@@ -693,18 +696,17 @@ fn host_margin(inputs: &EngineInputs<'_>) -> i64 {
     }
 }
 
-/// Design §3: a device request is `weights x 1.10 + kv`, and vLLM's at least
-/// 0.75 of the card (vLLM 0.29 with CUDA graphs does not start a 4B model on a
-/// 16 GB card below `--gpu-memory-utilization 0.75`). Unknown weights are not
+/// ADR 0019 §3, #225: a device request is `weights x 1.10 + kv` for every
+/// engine, without a minimum card share. Unknown weights are not
 /// materializable yet: acceptance freezes the revision provisional and the
 /// checkpoint digest re-resolves it with the measured weights (ADR 0014 §7),
 /// which is how a Hugging Face or HTTP source is sized once downloaded. `None`
 /// without a declared KV cache (resolution then asks for one).
 fn device_request_from_weights(
     device: DeviceSizing,
-    engine: Engine,
     weights: Option<i64>,
     kv_cache: Option<i64>,
+    legacy_floor: bool,
 ) -> Result<Option<i64>, ConfigError> {
     let Some(kv) = kv_cache else {
         return Ok(None);
@@ -723,15 +725,11 @@ fn device_request_from_weights(
         .checked_mul(110)
         .and_then(|scaled| scaled.checked_add(kv))
         .ok_or_else(|| invalid("engine_config.memory", "memory arithmetic overflows"))?;
-    let floor = match engine {
-        Engine::Vllm => device.declared_total / 100 * 75,
-        Engine::Sglang
-        | Engine::Tensorfold
-        | Engine::Llamacpp
-        | Engine::TensorrtLlm
-        | Engine::Custom => 0,
+    let request = if legacy_floor {
+        request.max(device.declared_total / 100 * 75)
+    } else {
+        request
     };
-    let request = request.max(floor);
     // ADR 0035 §3: on several GPUs each card also holds the communication
     // allowance.
     let charged = request
@@ -1966,12 +1964,12 @@ pub(super) fn normalize_engine_config(
     let device_request = match (inputs.device, declared_request, inputs.declared_ready_total) {
         (Some(device), None, None) => device_request_from_weights(
             device,
-            engine,
             inputs
                 .facts
                 .weights_bytes
                 .map(|weights| weights.saturating_add(state_reserve.unwrap_or(0))),
             kv_cache,
+            engine == Engine::Vllm && inputs.facts.legacy_vllm_device_floor,
         )?,
         _ => None,
     };
@@ -2171,6 +2169,9 @@ pub(super) fn normalize_engine_config(
             LaunchSettings::Vllm(VllmLaunchSettings {
                 common,
                 memory,
+                device_request_floor_pct: (device_request.is_some()
+                    && !inputs.facts.legacy_vllm_device_floor)
+                    .then_some(0),
                 block_size_tokens: vllm.block_size_tokens,
                 max_num_batched_tokens: vllm.max_num_batched_tokens,
                 safetensors_load_strategy: vllm_strategy_resolved,

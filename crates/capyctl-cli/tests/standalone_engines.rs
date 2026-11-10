@@ -85,7 +85,6 @@ async fn deploy(
         &capyctl_config::effective::ModelSource::Local {
             path: format!("/models/{name}"),
         },
-        capyctl_config::engine_policy::Engine::Vllm,
         &capyctl_cli::standalone_config::TemplateMemory::Unified {
             capacity_bytes: support::TEST_CAPACITY_BYTES,
         },

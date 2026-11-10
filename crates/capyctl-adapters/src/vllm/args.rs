@@ -183,26 +183,15 @@ impl std::fmt::Debug for PlanInputVllm {
     }
 }
 
-/// ADR 0019 §3: the floor of a vLLM request derived for a card, and of the
-/// utilization rendered from it: vLLM 0.29 with CUDA graphs did not start a
-/// 4B model on a 16 GB card below `--gpu-memory-utilization 0.75` (observed
-/// on the discrete-GPU laptop host, 2026-09-25; the cause was not recorded).
-/// CapyCTL passes the KV cache as explicit bytes on every launch, so the floor
-/// does not size the KV pool; it guards that start failure. #225: a request
-/// the deployment declares is rendered as it is, without this floor.
-pub const DEVICE_UTILIZATION_FLOOR_PCT: u8 = 75;
-
 /// Discrete GPU design §6 (ADR 0019): round the request's share upward to
 /// ten-billionths of the card. Even an i64-sized card adds less than 1.25 GiB
 /// from rounding, keeping the gate inside the first-start device allowance.
-/// Derived requests retain their percent floor; vLLM refuses a whole card.
-pub fn device_utilization_units(request: i64, device_total: i64, floor_pct: u8) -> u64 {
+/// Derived and declared requests use the same share (ADR 0019 §§3–4, #225);
+/// vLLM accepts at least 0.01 and refuses a whole card.
+pub fn device_utilization_units(request: i64, device_total: i64) -> u64 {
     let total = i128::from(device_total.max(1));
     let share = (i128::from(request.max(0)) * 10_000_000_000 + total - 1) / total;
-    share.clamp(
-        i128::from(floor_pct.clamp(1, 99)) * 100_000_000,
-        9_900_000_000,
-    ) as u64
+    share.clamp(100_000_000, 9_900_000_000) as u64
 }
 
 #[derive(Debug, Clone, Default)]

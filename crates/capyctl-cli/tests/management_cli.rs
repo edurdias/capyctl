@@ -12,7 +12,7 @@ fn capyctl() -> std::process::Command {
     command
 }
 
-use capyctl_config::effective::{Engine, ModelSource};
+use capyctl_config::effective::ModelSource;
 use serde_json::Value;
 
 fn cli(state: &std::path::Path, args: &[&str]) -> Value {
@@ -111,7 +111,6 @@ async fn binary_deploys_starts_observes_and_stops_through_management() {
         &ModelSource::Local {
             path: "/models/cli-model".into(),
         },
-        Engine::Vllm,
         // The capacity the app was booted with (`support::test_memory`), not
         // this machine's: the deployment must be sized against the same host.
         &capyctl_cli::standalone_config::TemplateMemory::Unified {

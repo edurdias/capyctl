@@ -11,7 +11,7 @@
 mod support;
 
 use capyctl_cli::host_observation::fixed_memory;
-use capyctl_config::effective::{Engine, ModelSource};
+use capyctl_config::effective::ModelSource;
 use serde_json::Value;
 
 const GIB: i64 = 1 << 30;
@@ -85,7 +85,6 @@ impl Role {
             &ModelSource::Local {
                 path: "/models/near-limit".into(),
             },
-            Engine::Vllm,
             &capyctl_cli::standalone_config::TemplateMemory::Unified {
                 capacity_bytes: support::TEST_CAPACITY_BYTES,
             },

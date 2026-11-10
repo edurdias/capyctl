@@ -555,3 +555,27 @@ Rule:
   (`launch_failed`) and its request has to be raised.
 
 Unified-memory hosts are unchanged. CPU and Fake-engine tests only; not yet checked live.
+
+## Amendment of 2026-11-09: remove the derived vLLM floor for 0.2.0 (#225)
+
+Owner decision 2026-11-09 supersedes the derived-request floor retained by the
+2026-10-30 amendment. **Pending live confirmation on vLLM 0.32.0 and 0.33.0.**
+
+- **§3, derivation.** A vLLM request on a discrete GPU follows the same
+  `weights × 1.10 + kv_cache` rule as SGLang, without a minimum fraction of the
+  card. Standalone's generated request follows the same rule. The CUDA-context
+  charge, managed-limit admission and explicit KV bytes remain unchanged.
+- **§4, engine sizing.** Both derived and declared requests render their own
+  share of the observed card, rounded upward to ten-billionths, between 0.01
+  and 0.99. This keeps the precision fix of PR #245 inside the charged footprint.
+- **Upgrade.** Frozen revisions retain the memory request they were accepted
+  with. Deploy a new revision to derive the smaller request. Unified-memory
+  hosts keep their low fixed utilization gate and unchanged sizing.
+- **Remote launch.** The plan carries a default-false
+  `vllm_device_request_no_floor` bit. True requires the identically named
+  host capability; absence preserves the legacy derivation on an upgraded
+  host. Snapshot decoding and checkpoint refresh retain the same rule.
+
+The historical vLLM 0.29 start failure on a 16 GB card remains unexplained.
+CPU and Fake-engine tests are not qualification; live launches on vLLM 0.32.0
+and 0.33.0 and a discrete-card co-residence check are still owed.
