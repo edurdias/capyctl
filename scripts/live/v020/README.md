@@ -75,7 +75,9 @@ isolated editable 0.5.23, LMCache 0.5.7 built from its source tag in separate
 vLLM 0.33.0 and SGLang 0.5.23 environments, TensorFold native 1.2.6/1.1.5 and
 otelcol 0.164.0. LMCache builds keep the engine's torch pinned, use CUDA major
 13 and the detected GPU architecture (8.0 on the A100), and do not reuse a wheel
-compiled against another engine's torch. The shared host may supply LMCache 0.5.6.
+compiled against another engine's torch. Unified-memory cache rows accept the
+approved vLLM 0.33.0/LMCache 0.5.7 tuple as well as the existing 0.32.0/0.5.6 tuple;
+the GPU memory architecture does not select a package version.
 TensorFold 0.6.6 is an optional TF3 comparison: explicitly select TF3 to install
 it, or supply its mapping. It does not delay the default setup.
 The editable SGLang fixture disables optional Rust extensions: #235 must refuse

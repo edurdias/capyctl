@@ -70,11 +70,12 @@ def fixtures(ctx, specs):
                          env={**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
                               "TOKENIZERS_PARALLELISM": "false"})
     data = json.loads(result.stdout)
-    expected_lmcache = "0.5.6" if ctx.unified else "0.5.7"
-    ctx.assertion(data["versions"]["lmcache"] == expected_lmcache,
-                  "qualification LMCache version does not match the approved installation")
-    ctx.assertion(data["versions"]["vllm"] == ("0.32.0" if ctx.unified else "0.33.0"),
-                  "qualification engine version does not match the session plan")
+    approved = {("0.33.0", "0.5.7")}
+    if ctx.unified:
+        approved.add(("0.32.0", "0.5.6"))
+    actual = (data["versions"]["vllm"], data["versions"]["lmcache"])
+    ctx.assertion(actual in approved,
+                  "qualification engine/LMCache tuple does not match an approved installation")
     return data
 
 

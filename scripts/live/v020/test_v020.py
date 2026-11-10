@@ -229,6 +229,30 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(len(archived), 1)
         self.assertTrue((archived[0] / 'evidence/result-EM1.json').exists())
 
+    def test_lmcache_latest_tuple_is_approved_on_unified_memory(self):
+        from rows.lmcache import fixtures
+        from types import SimpleNamespace
+        def require(condition, reason):
+            if not condition:
+                raise AssertionError(reason)
+        for unified, vllm, lmcache, accepted in [
+                (True, '0.33.0', '0.5.7', True),
+                (True, '0.32.0', '0.5.6', True),
+                (False, '0.33.0', '0.5.7', True),
+                (False, '0.32.0', '0.5.6', False),
+                (True, '0.33.0', '0.5.6', False)]:
+            with self.subTest(unified=unified, vllm=vllm, lmcache=lmcache):
+                ctx = SimpleNamespace(
+                    engines={'LMCACHE': str(self.root), 'MODEL_CHAT': str(self.root)},
+                    unified=unified, assertion=require,
+                    command=lambda *a, **k: SimpleNamespace(stdout=json.dumps(
+                        {'versions': {'vllm': vllm, 'lmcache': lmcache}})))
+                if accepted:
+                    self.assertEqual(fixtures(ctx, [])['versions']['vllm'], vllm)
+                else:
+                    with self.assertRaisesRegex(AssertionError, 'approved installation'):
+                        fixtures(ctx, [])
+
     def test_aarch64_setup_requires_every_engine_override_before_tools(self):
         import subprocess
         mapping = self.root / 'lab.env'
