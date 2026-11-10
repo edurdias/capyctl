@@ -233,9 +233,10 @@ launch's `api`, never from the body.
 **Settlement.** An extraction request is settled as a decision is (SPEC §10, ADR 0032):
 the engine takes no request ID, so a request cut by a hang-up or a deadline before its
 whole answer settles only at the instance's next verified stop, and ADR 0032 §7's restart
-for held requests applies; a complete engine error answer leaves it `cancelling`, settled
-on the manifest's idle signal when it has one (ADR 0031 §6), otherwise at the next
-verified stop.
+for held requests applies. A complete JSON rejection (HTTP 400, 413 or 422)
+closes the lease as completed; a complete engine error answer (`engine_error`,
+HTTP 5xx other than 503) leaves it `cancelling`, settled on the manifest's idle
+signal when it has one (ADR 0031 §6), otherwise at the next verified stop.
 
 **Metrics.** An answer carries `capyctl.metrics` with the figures a decision carries
 (SPEC §10): `total_ms`, `time_to_response_ms`, and `input_tokens` from the engine's

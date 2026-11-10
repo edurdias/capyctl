@@ -1,5 +1,204 @@
 # Current implementation and launch status
 
+## Extraction-model live qualification outcome — 2026-11-10 (branch `feat/extraction-models-0.2.0`)
+
+**Plumbing PASS (bf16), model quality FAIL for rc1; T50 is not a release-gate
+pass.** The trained release candidate answered through the shipped router and
+host ingress on host A. A missing typed canary reference and a host-reconnect
+reproof failure also remain open. The owner will produce a new candidate in a
+quality phase and rerun T50; no PR was opened. The first failed serving attempt,
+source/binary/checkpoint hashes and cold refusal evidence are recorded below.
+
+The model repository fixed serving-device selection and internal-error
+classification in commit `2aae3ea`, then reinstalled only its own package in the
+approved serving environment. Dependency versions are unchanged and recorded
+in AGENTS.md. The engine was removed and re-added with `--yes --drift refuse`
+to pin the new installation:
+`sha256:d99d877e31bebe7497086481a75293d2200028b71591f8ce09b862c3c75f46d3`
+(23,377 files, 5,588,360,687 bytes). The authorized manifest is the original
+nine-type template plus arguments `[--dtype, bf16]`; its digest is
+`sha256:622dbdb7aba5ed2bc9755a1a5d2fc95369729252fa7879e91b124f6be855be72`.
+Its only engine listener was `127.0.0.1:8100`; the owned engine used 10,353 MiB
+of GPU memory when sampled. The model's `calibration.json` was present.
+
+The repaired server's first fp32 attempt with a 24 GiB deployment allocation
+exited on SIGTERM before readiness. The controller's exact persisted evidence
+is `"engine exited before readiness on signal 15"`; the redacted engine log ends
+after weight loading. Neither controller nor host evidence identifies the
+sender or establishes a memory-guard cause. A separately authorized fp32
+diagnostic with `resources: {gpu: 32GiB, ram: 16GiB}` became Ready and used
+19,365 MiB of GPU memory. No host-wide limit was raised. Its quality failures
+below reproduce the bf16 results; the allocation difference alone does not
+prove the earlier SIGTERM's cause.
+
+Every request below returned HTTP 200, a complete JSON answer of the requested
+type, public `"model":"t50-extract"` (or the diagnostic's `"t50-fp32"`), and
+`capyctl.metrics`. The fixed nine-field request reported `input_tokens: 729`,
+`output_tokens: 0`, `passes: 1`; its first routed response carried router
+`total_ms: 247.105`, `time_to_response_ms: 241.75`, and engine input-token
+attribution. Structural success is not a claim of factual accuracy.
+
+| Live answer case | Response excerpt | Quality judgment |
+|---|---|---|
+| Text, order number | `"guess":"A-88412","span":[6,13]` | PASS; exact copied span. |
+| Number, amount paid | `"value":649.0,"unit":"USD"` | PASS. |
+| Date, delivery | `"value":"2026-09-28"` | PASS. |
+| Time, delivery | `"value":"14:30:00"` | PASS. |
+| Datetime alone | `"value":"2026-09-28T00:00:00"` | FAIL; delivery time 14:30 was lost. An unsorted combined request instead returned the correct 14:30 datetime; the canonical sorted readiness request also returned midnight. |
+| Duration | `"value":11,"unit":"days"` | PASS; September 28 to October 9. |
+| Damage list | `"value":["dented corner"],"spans":[[79,92]]` | FAIL; omits the explicitly stated cracked screen. |
+| Estimate alone on the readiness state | `"median":43,"p10":6,"p90":91` | Structurally valid but broad; the exact day's count is not stated. The combined/canonical request instead returned a degenerate estimate at 1. No accuracy pass is claimed. |
+| Forecast alone on readiness history 12,15,11,14,13 | `"median":[12,11],"p10":[9,7],"p90":[16,17]` | Plausible in isolation; the combined/canonical request instead returned `[4,2]` with degenerate intervals and `p_below` of 2/3, not a plausible continuation. |
+| Computed number: quantity 3, unit price 20 USD, tax 10% | `"operation":"sum"` over the 20.00 span twice; `"value":40,"confidence":0` | FAIL; expected 66. Same wrong operation/value in fp32. |
+| Date offset: due in seven days; `reference_date: "2026-11-10"` | `"value":"2026-11-17"` | PASS; uses reference-date evidence and seven days. |
+| Qualified list: approved Alice/Bob, rejected Carol, pending David | `"value":["Alice","Bob"],"spans":[[10,15],[17,20]]` | PASS; excludes rejected and pending names. |
+| Comparable-price estimate: 90,100,110,120,130 USD, typical subject, bounds 0–200 | `"median":12,"p10":0,"p90":100` | FAIL; median is outside the supplied comparable range and the interval excludes its center of 110. Reproduces fp32. |
+| History forecast: 10,12,14,16,18; three daily steps | `"median":[20,22,24]` with matching p10/p90 | PASS for this deterministic history; both published forecast forms are present and agree. |
+| Image: newly code-rendered receipt, record T_99b396756b70_Z | Text ID correct; quantity 1, date 2071-03-06, time 06:23 correct; total 6040000 instead of 6048883 (`confidence:0`); datetime 2021-03-06T06:23:00 instead of 2071 | PARTIAL/FAIL; real image input reached the model, but amount and datetime are wrong. Reproduces fp32. Fixture: `generate_image_example(733194, seed=20261110, split="test")`, no downloaded image assets. |
+
+| Remaining T50 check | Result | Evidence |
+|---|---|---|
+| Positive fixed-extraction readiness | PASS | Both bf16 and larger-allocation fp32 become Ready only after the fixed extraction. The host receipt records fixed-extraction readiness and loopback listeners; `/health` alone did not suffice in the failed first attempt. |
+| Discovery | PASS | `GET /v1/models` lists `capyctl.api: "extractions"` and all nine types in canonical order. |
+| Stop/start | PASS | Verified stop removes reservations, owners, bindings, endpoints and leases; explicit start reaches Ready again. The same combined nine-field request's complete `answers` object is exactly equal before and after restart. |
+| Malformed/other-shape requests to a stopped deployment | PASS | Empty fields → 400 `invalid_request`; `questions:null` → 400 `api_mismatch`; desired and observed states remain stopped, no wake. |
+| Park/wake | NOT SUPPORTED, as specified | Ready custom extraction deployment's park returns exit 5 `unsupported`; no parking residency or LMCache was enabled. Restart-only establishes a new launch rather than a retained-state wake. |
+| Typed first-readiness reference | FAIL to preserve the initial answer; eventual second-probe persistence unestablished | Read-only `wake_canaries` lookup found no row while the bf16 deployment was Ready. The implementation permits a further asynchronous probe for up to 60 seconds; no post-bound lookup was captured before cleanup, so indefinite absence is not claimed. No reference was fabricated or inserted. Identical routed answers across restart do not establish that the lifecycle canary passed. |
+| Typed wake comparison / mismatch injection | NOT EXERCISED LIVE | There is no supported parking wake for this custom engine. A changed-answer mismatch cannot be injected using only signals; neither weights nor ledger were altered. CPU comparison tests are not substituted for live qualification. |
+| Complete engine rejection | PASS | Estimate `min:100,max:0` → 400 `engine_rejected`, `"min must be less than max"`; outstanding leases immediately empty. This is correct SPEC §10 completion evidence, not a no-idle cancellation defect. |
+| Uncertain request accounting and settlement | PASS | Signal-only fault on the fp32 engine's recorded PID/start ticks/boot ID: SIGSTOP, observe an `inflight` lease, SIGKILL; routed response 500 `engine_error`, `"backend completion unverified"`. The lease becomes `uncertain` and the owner remains charged. Explicit verified stop then empties leases, resource owners and retained bindings. |
+| Host-role restart/reproof | FAIL | SIGTERM to the run's recorded host-role identity retains the engine. After host restart the host is online/eligible, but the deployment remains `reconciling`, dispatch disabled, after 120 s. Its charge is retained, not released on uncertainty. Explicit stop successfully verifies cleanup. |
+| Final cleanup | PASS | Read-only final ledger has no reservations, resource owners, endpoint leases, claims, request leases or live/uncertain runtime bindings. Both run roles were stopped. Engine/ingress listeners are absent; no process started by this session remains. |
+
+**Conformance investigations and proposed fixes.**
+
+- The missing reference is not an intended restart-only exemption. ADR 0041 §5
+  requires a first-answer reference on every launch. In
+  `crates/capyctl-adapters/src/custom/initialize.rs:213–219`, the successful
+  extraction answer is discarded. `coordinator/worker.rs:3024–3028,4254–4305`
+  instead performs a second best-effort probe after Ready and silently ignores
+  probe or store failure. The first Ready lookup may precede the optional
+  probe's completion; the eventual persistence result and any failed gate in
+  this run were not established. Proposed fix: carry the validated initial extraction
+  answer through the remote launch result and persist it before successful
+  launch completion; regress a launch whose second probe fails. This crosses
+  adapter/agent/protocol/controller persistence, so it was reported rather
+  than patched as a small live-session change.
+- Immediate completion of a JSON 400/413/422 rejection is correct:
+  `crates/capyctl-router/src/chat.rs:865–880` distinguishes `Rejected` →
+  `Completed` from `EngineError` → `Cancelling`. The original concern was an
+  ADR misreading, not a runtime defect. ADR 0041 §3 now explicitly names this
+  existing distinction; no settlement behavior changed.
+- Host reconnect's failed reproof remains an observed failure with no proven
+  root cause. The retained-launch probing boundary is
+  `crates/capyctl-agent/src/native_execution.rs:2280–2316`; ownership and
+  credentials must not be bypassed to make it pass. No speculative fix was
+  applied.
+- The wrong values above are real model/decoder results, including fp32
+  reproduction, not a CapyCTL transformation: its request path forwards the
+  answer whole. The model boundary is `capyctl_extract/model.py:590` and
+  `capyctl_extract/decode.py:157` in the model repository. No small deterministic
+  code repair for the learned operation/span/evidence choices was established.
+
+**What remains on host A:** the release executable alone at
+`~/capyctl-extraction-models/target/release/capyctl`, and the authorized bf16
+registration context in `~/capyctl-t50-20261110/` (`custom-engines.yaml`,
+`host.yaml`, `capyctl-extract-bf16.yaml`, with normal CLI host-document discovery).
+The model materialization, diagnostic fp32/subset profiles, runtime identities,
+invitation, logs, PID files, build intermediates and synced source files were
+removed. The original checkpoint and owner jobs were not changed or signalled.
+The approved serving environment remains as reinstalled by the model-package
+repair. Non-secret raw evidence stays locally in `target/live/t50/evidence/`;
+the table and excerpts here are the committed qualification record.
+
+## Extraction-model live qualification, first attempt — 2026-11-10 (branch `feat/extraction-models-0.2.0`)
+
+**Not qualified.** The first live T50 attempt exposed a serving-device defect in
+`capyctl-extract`, not a successful extraction run. CPU and Fake-engine tests are
+not qualification. CapyCTL source: `035ce6017a75f4b1ac2e396300c24bc0976bed39`;
+clean snapshot digest:
+`001391e5b553bcc6781ea79bd397ec8b361dc7a22e7a44160f949289da35dc39`.
+The release binary was built on host A (aarch64) with the matrix harness's
+`cargo build --release --locked --bin capyctl` and passed
+`scripts/check-release-clean.sh`; SHA-256:
+`22edcdded916d06b78bf5a05d183c00a3ab7618b7bf6c90808258c3d4214950c`.
+It lives under `~/capyctl-extraction-models/target/release/capyctl`.
+
+The server ran on the control host, management/inference on loopback
+37443/38443, with only host A enrolled. This exercised the shipped router and
+remote-host path, not a direct-engine substitute. Both roles used the harness's
+owned-process launcher and isolated `~/capyctl-t50-20261110` state; no pre-existing
+role was stopped. Before work, `who` was empty, neither default nor matrix tmux
+had sessions, and the owner's evaluation process occupied 19,253 MiB. That
+evaluation was not stopped or signalled.
+
+The approved serving environment's setup completed. Its fingerprint records
+Python 3.12.3, capyctl-extract 0.1.0, torch 2.14.1+cu130, torchvision
+0.29.1+cu130, transformers 5.22.1, peft 0.21.2, Pillow 13.0.0,
+flash-linear-attention 0.6.0 and fla-core 0.6.0, noneditable installation;
+freeze SHA-256 `90cd18a137fbd6529b2c44c9da8c4b74907a64a6172fdaad498a8e05ac508fa6`.
+The model was the trained v7 release candidate with calibration, not a random
+or fake checkpoint.
+
+`engine add --custom ~/capyctl-extract-serve-venv/bin/capyctl-extract --name
+t50-extract --manifest capyctl-extract.yaml --drift refuse --yes` used the model
+repository's manifest, including the per-launch API-key argument. Confirmation
+listed all nine types, the complete argument template, the environment and its
+external `/usr/bin/python3.12` interpreter. The pinned installation was
+`sha256:6780cfdaeeef383b11ab9e03ff1be185be5b3cff841d50f7e39ec0aff9009e2b`
+(23,377 files, 5,588,359,233 bytes), `idle_signal: none`, `engine_key:
+per-launch`. No credential values were collected in the evidence.
+
+The original `~/capyctl-extract-runs/main-rental/release-candidate` directory
+was refused `unsafe_file`: its `backbone` is a symlink to `init-v6/backbone`.
+The original was left unchanged. A `cp -aL --reflink=auto` materialization under
+the isolated run root removed that symlink; all 13 immutable payload files
+(19,145,991,780 bytes, excluding evaluation outputs and logs) matched the source
+by SHA-256. CapyCTL recorded checkpoint digest
+`sha256:15b60b13018feaa4339c2cdb33b147ee49f9f18b6a46846ecfa0085c03ad5b57`,
+`weights_bytes: 19125836184`. The deployment declared `api: extractions`,
+`resources: {gpu: 16GiB, ram: 8GiB}` and `timeouts.initialize: 10m`;
+residency resolved `restart_only`, LMCache off.
+
+| T50 check | First-attempt result | Request/response or observed evidence |
+|---|---|---|
+| Declared types and pinned registration | PASS | Full manifest lists all nine types; `--yes --drift refuse` stores the confirmed installation digest. |
+| Type normalization and pre-activation unsupported-type refusal | PASS | Temporary manifest `[number, text]` registers canonically; `{"model":"t50-subset","state":"Date 2026-11-10","fields":{"day":{"type":"date"}}}` returns HTTP 400 `field_type_unsupported`, `"field `day`: type `date` is not supported"`; deployment stays stopped, zero ready instances. Temporary deployment and profile removed. |
+| Malformed fields before activation | PASS | Empty `fields`, unknown `bogus` setting, invalid field name, missing list `items`, invalid reference date and unknown type each return HTTP 400 `invalid_request`. Full deployment remains `desired_state: stopped`, `admission_enabled: false`, `dispatch_enabled: false`. |
+| Other System One shape before activation | PASS | `questions: null` alongside `fields` returns HTTP 400 `api_mismatch`, naming `fields` and `POST /v1/systemone`. |
+| Wrong endpoint | PASS | Otherwise well-formed chat (`messages`) and embeddings (`input`) requests return HTTP 400 `api_mismatch`, directing callers to `POST /v1/systemone`. Sending an extraction-shaped body to those endpoints instead hits their own shape validation first (`invalid_request`), not the API lookup. |
+| Parking-residency and topology refusal | PASS | Live deploy attempts with `deep`, `host_backed` or `topology: {tensor_parallel: 2}` return exit 2 `invalid_config`, naming restart-only or one-machine extraction scope. |
+| Parser refusal | PASS | `engine_config.vllm.tool_call_parser: qwen25` on the custom profile returns exit 2 `custom_field_unsupported:tool_call_parser`; nothing is deployed. |
+| Fixed extraction, not health alone, establishes readiness | PASS (negative case); positive case blocked | Real engine repeatedly answers `GET /health` 200 and the fixed nine-type `POST /v1/systemone` 400. It never becomes Ready; the ten-minute initialize fails closed with exit 13, `launch_failed: remote initialize remains unresolved`. |
+| All nine routed answers, computed number, relative date, qualified list, comparable estimate, history forecast and image | BLOCKED | No answers obtained: the fixed readiness request itself fails in the real serving implementation. No factual accuracy or plausibility claim is made. |
+| Restart, typed canary and discovery | BLOCKED | No Ready launch from which to record a successful reference. ADR 0041 §5 also makes a restart-only launch establish a new reference, not compare against the stopped launch; parking and a signal-only changed-answer mismatch are not supported for this custom engine. |
+| Failed-launch accounting and cleanup | PASS | Authenticated host reports the owned process group gone; `failed_launch_released` records its identity. Read-only ledger: empty resource owners, reservations, claims, request leases, retained bindings and endpoint leases; ownership view `[]`. |
+| Successful/rejected extraction lease settlement | BLOCKED | No routed inference can be admitted before readiness. |
+| Native-engine refusal, old-host exclusion, unchanged legacy fingerprints and typed comparison boundary cases | NOT EXERCISED LIVE | Existing CPU/integration coverage is not presented as live qualification. No host capability was falsified and no ledger data was modified. |
+
+**Defect and cause.** In the model repository's serving implementation,
+`capyctl_extract/server.py:98` loads `ExtractionModel.from_pretrained(args.model)`
+without selecting CUDA; `model.py:298,313–314` defaults to fp32 CPU loading.
+`model.py:589–595` uses inference mode without GPU autocast. A finite diagnostic
+loading the same real checkpoint in the approved serving environment and
+answering the exact fixed probe produced:
+
+```text
+fla/modules/norm/l2norm.py:136 -> triton/backends/nvidia/driver.py:331
+ValueError: Pointer argument cannot be accessed from Triton (cpu tensor?)
+```
+
+The installed FLA path attempts to execute its Triton kernel on CPU tensors.
+`server.py:75–77` catches that internal `ValueError` and incorrectly presents it
+as HTTP 400. This diagnostic is cause evidence, not a substitute for routed live
+qualification. The serving package needs GPU device/precision selection and
+appropriate internal-error classification before the remaining live gates can
+run. Neither the approved environment nor the model source was modified by this
+attempt. The failed deployment was deleted after its cleanup was recorded.
+Raw request/response, registration, redacted management-engine-log, checkpoint
+hash and read-only accounting evidence is retained locally under
+`target/live/t50/evidence/` (not committed).
+
 ## Owner decisions of 2026-11-09, and 0.1.11 prepared (branch `chore/release-0.1.11`)
 
 Before 0.1.11, the owner decided the open items of the fixes merged since 0.1.10 (#227–#233,

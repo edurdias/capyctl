@@ -70,9 +70,48 @@ support with its embeddings/tracing integration retained. This branch is based
 on `integration/0.2.0-on-0.1.11` at `7e0774d6` and replays only the nine extraction
 commits above that base. Conflict resolution retains raw request/answer bytes
 and declared concurrency policy from the newer integration line. Schema v62
-follows its existing v61. The first live qualification still needs the trained
-model's server, `capyctl-extract`, on host A in the approved serving environment
-once it is made. CPU and Fake-engine tests are not qualification.
+follows its existing v61.
+
+Live host-A qualification on 2026-11-10, using release binaries from
+`035ce601`: **plumbing PASS (bf16), model quality FAIL for rc1; not a T50
+release-gate pass**. The model server was repaired and reinstalled from
+`capyctl-extract` commit `2aae3ea` after its original CPU-device default failed
+the fixed extraction while `/health` stayed healthy. The repaired installation
+was re-confirmed and pinned. All nine types, computed numbers, reference-date
+offsets, qualified lists, comparable estimates, history forecasts and an image
+returned complete routed answers with metrics through the remote host ingress.
+Readiness, discovery, stopped-model pre-activation refusals, explicit restart,
+engine-rejection completion and signal-only uncertain-request retention through
+verified stop were exercised. No host-wide limits or owner jobs were changed.
+
+The candidate's answers are not consistently plausible: quantity 3 × price 20
+plus 10% tax returned 40 rather than 66; comparables 90–130 returned median 12;
+a delivery datetime lost its clock time; a damage list omitted a stated item;
+and the image amount/datetime were wrong. These failures reproduced with the
+evaluated fp32 configuration under a larger per-deployment allocation, so they
+are not attributable solely to bf16. The initial smaller-allocation fp32
+SIGTERM's sender/cause was not established by the available event evidence.
+
+Two conformance concerns were investigated. A Ready launch had no typed canary
+row at the sampled point: the initial successful extraction answer is discarded,
+then a second probe and reference write run best-effort after Ready with errors
+ignored. Preserving and persisting the initial answer needs a cross-layer fix,
+not a speculative live-session patch. Eventual persistence after the second
+probe's full bound was not established. Separately, immediate lease closure on
+a complete JSON 400 rejection is correct SPEC §10 behavior, not a defect;
+ADR 0041 §3 now clarifies rejections versus 5xx engine errors. An own host-role
+restart also left its online host's deployment reconciling after 120 seconds;
+the retained charge settled on explicit verified stop.
+
+The [live qualification record](../runbooks/f2-current-status.md#extraction-model-live-qualification-outcome--2026-11-10-branch-featextraction-models-020)
+contains pass/fail tables, requests/answers, source and binary/checkpoint hashes,
+defect locations/proposed fixes, and cleanup evidence. The final ledger had no
+live resources or leases; every started process was stopped. Only the installed
+release binary and authorized bf16 registration context remain on host A,
+alongside the separately repaired approved serving environment. AGENTS.md now
+records that environment as created, with its fingerprinted versions. The owner
+will produce a new candidate in a quality phase and rerun T50; CPU and
+Fake-engine tests are not qualification.
 
 Table/record extraction is explicitly deferred to a follow-up release. The
 proposed `records` contract, readiness implications, occurrence-conditioned
@@ -92,7 +131,8 @@ nine-type wire contract unchanged.
   support, remove every extraction engine with `capyctl engine remove`;
   older releases refuse `custom-engines.yaml` containing `field_types`.
   This is part of 0.2.0; table/record extraction is deferred. The model recipe
-  is selected, but the main training run and live qualification remain release
-  gates; CPU and Fake-engine tests are not qualification
+  is selected, but the rc1 live run failed model quality despite passing the
+  routed plumbing checks. A new candidate and T50 rerun remain release gates;
+  CPU and Fake-engine tests are not qualification
   ([Extraction models](../guide/deploy.md#extraction-models),
   [Extraction requests](../guide/requests.md#extraction-requests)).

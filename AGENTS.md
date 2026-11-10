@@ -172,10 +172,11 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     direct link;
   - host A, approved 2026-11-10 for live qualification of the capyctl-extract
     custom engine (`api: extractions`, T50): a dedicated serving environment
-    ~/capyctl-extract-serve-venv, approved but not yet created. Same pinned
-    versions as training, serving dependencies only: torch 2.14.1+cu130,
-    transformers 5.22.1, peft 0.21.2, pillow 13.0.0, flash-linear-attention 0.6.0
-    and fla-core 0.6.0;
+    ~/capyctl-extract-serve-venv, created 2026-11-10 with the model repository's
+    `scripts/spark/setup-train-venv.sh --profile serve` (noneditable install).
+    Its `environment-fingerprint.json` records Python 3.12.3, capyctl-extract
+    0.1.0, torch 2.14.1+cu130, torchvision 0.29.1+cu130, transformers 5.22.1,
+    peft 0.21.2, pillow 13.0.0, flash-linear-attention 0.6.0 and fla-core 0.6.0;
   - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B;
   - the rented two-GPU machine of ADR 0035 §14 (owner decision 2026-10-25), for
     its one session only: fresh x86_64 CUDA installs of vLLM 0.32.0
