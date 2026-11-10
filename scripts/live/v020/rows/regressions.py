@@ -10,7 +10,7 @@ ROWS = [
     dict(id='ISSUE225', priority=1, budget=1500, discrete=True,
          criteria='vLLM 0.32.0 and 0.33.0 each serve two co-resident models, each rendered utilization <0.75, with positive explicit KV bytes'),
     dict(id='ISSUE236', priority=1, budget=1200,
-         criteria='SGLang 0.5.22 and 0.5.23 answer with prefill disabled and decode native in rendered flags and resolved engine settings'),
+         criteria='SGLang 0.5.22 and 0.5.23 answer with prefill disabled and decode native in the managed native ServerArgs settings'),
     dict(id='ISSUE235', priority=1, budget=1500,
          criteria='editable SGLang refused before launch by new server/host; old server/new host records engine_import_failed without reconnect or harming another model'),
     dict(id='ISSUE240', priority=1, budget=1800,
@@ -52,8 +52,10 @@ def graph_phases(ctx):
         ctx.deploy(name, engine, extra={'engine_config': {'cuda_graphs': {'prefill': False, 'decode': True}}})
         setting = ctx.engine_args(name)
         flags, resolved = setting['flags'], setting['resolved']
-        ctx.assertion('disable-prefill-cuda-graph' in flags or flags.get('cuda-graph-backend-prefill') == 'disabled',
-                      'prefill disable flag missing')
+        ctx.save(name + '-graph-settings', setting)
+        ctx.assertion('disable-prefill-cuda-graph' in flags or flags.get('cuda-graph-backend-prefill') == 'disabled'
+                      or resolved.get('disable_prefill_cuda_graph') == 'True',
+                      'prefill disable setting missing from argv/native ServerArgs')
         ctx.assertion('disable-decode-cuda-graph' not in flags and flags.get('cuda-graph-backend-decode') != 'disabled',
                       'decode native policy overridden')
         ctx.assertion(resolved.get('disable_prefill_cuda_graph') == 'True' or resolved.get('cuda_graph_backend_prefill') == 'disabled',

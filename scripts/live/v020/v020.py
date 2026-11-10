@@ -495,10 +495,20 @@ class Context:
                 if arg.startswith('--') and key in allowed:
                     flags[key] = value or (args[index+1] if index+1 < len(args) and not args[index+1].startswith('--') else True)
         resolved = {}
-        for line in self.logs().splitlines():
+        for line in self.logs(name).splitlines():
             if 'server_args=ServerArgs(' in line:
                 for key, value in re.findall(r'(disable_prefill_cuda_graph|disable_decode_cuda_graph|cuda_graph_backend_prefill|cuda_graph_backend_decode)=([^, )]+)', line):
                     resolved[key] = value.strip("'\"")
+            if 'server_args={' in line:
+                try:
+                    doc = ast.literal_eval(line.split('server_args=', 1)[1].strip())
+                    resolved.update({key: str(value) for key, value in doc.items()
+                                     if key in {item.replace('-', '_') for item in allowed}})
+                    for phase, settings in doc.get('cuda_graph_config', {}).items():
+                        if phase in ('prefill', 'decode') and isinstance(settings, dict):
+                            resolved['cuda_graph_backend_' + phase] = settings.get('backend')
+                except (SyntaxError, ValueError):
+                    pass
             if 'non-default args:' in line:
                 try:
                     doc = ast.literal_eval(line.split('non-default args:', 1)[1].strip())

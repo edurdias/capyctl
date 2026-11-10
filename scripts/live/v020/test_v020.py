@@ -128,6 +128,16 @@ class HelperTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, 'unavailable'):
             ctx.installation('VLLM_033')
 
+    def test_graph_settings_read_native_server_args_dictionary_for_one_launch(self):
+        ctx = v020.Context.__new__(v020.Context)
+        ctx.owned = lambda name: []
+        ctx.logs = lambda name: "server_args={'disable_prefill_cuda_graph': True, 'disable_decode_cuda_graph': False, 'cuda_graph_backend_prefill': 'disabled', 'cuda_graph_config': {'prefill': {'backend': 'disabled'}, 'decode': {'backend': 'full'}}, 'api_key': 'must-not-export'}"
+        settings = ctx.engine_args('phase-test')
+        self.assertEqual(settings['resolved']['disable_prefill_cuda_graph'], 'True')
+        self.assertEqual(settings['resolved']['disable_decode_cuda_graph'], 'False')
+        self.assertEqual(settings['resolved']['cuda_graph_backend_decode'], 'full')
+        self.assertNotIn('must-not-export', json.dumps(settings))
+
     def test_process_identity_guards_against_pid_reuse(self):
         record = identity(os.getpid())
         self.assertTrue(matches(record))

@@ -142,6 +142,11 @@ The final GPU PID set must be a subset of the pre-session set, preserving the
 owner's pre-existing training processes. Failure leaves the marker and refuses
 purge for investigation.
 
+SGLang's managed wrapper passes native `ServerArgs` keywords through a protected
+descriptor, not an engine CLI. ISSUE236 therefore observes the launch-scoped
+resolved dictionary (including the effective graph backends), without opening
+protected descriptors or reading engine keys.
+
 ## Evidence and verdicts
 
 `summary.txt` gives exactly one `pass`, `fail` or `skip` plus reason per row;
@@ -188,7 +193,7 @@ Budgets are maximum seconds per row, not elapsed-time promises.
 | LC14 | P1 | 1100 | ADR0034 §2: 15 alternating-prompt park/wake cycles, off-reference answers, no held KV or server stops, covered charges and <=256MiB server GPU growth. |
 | LC15 | P1 | 600 | ADR0034 §2: enrolled host through the control server, 32k park/wake/hit and passing wake canary. |
 | LC16 | P1 | 900 | ADR0034 §2: five cold/engine-evicted/post-park trials at 8k/16k/32k; wake <=1.1x off, cold TTFT <=1.1x off, 32k post-wake TTFT <=0.25x off. |
-| ISSUE236 | P1 | 1200 | SGLang 0.5.22 and 0.5.23 answer with prefill disabled and decode native in rendered flags and resolved engine settings |
+| ISSUE236 | P1 | 1200 | SGLang 0.5.22 and 0.5.23 answer with prefill disabled and decode native in managed native ServerArgs settings |
 | ISSUE235 | P1 | 1500 | editable SGLang refused before launch by new server/host; old server/new host records engine_import_failed without reconnect or harming another model |
 | ISSUE240 | P1 | 1800 | 48 durable in-flight leases coexist on a managed engine; traffic survives server-first then host upgrade from 0.1.12 to 0.2.0 |
 | EM1 | P2 | 900 | Qwen3-Embedding-4B BF16/Q8_0: native 2560 dimensions, ordered batch, API/certification/LMCache evidence and memory/start/charge. |
