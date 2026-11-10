@@ -153,7 +153,7 @@ class Context:
             os.environ['CUDA_HOME'] = engines['CUDA_HOME']
         os.environ.update(HF_HOME=str(self.root / 'cache/hf'),
                           XDG_CACHE_HOME=str(self.root / 'cache'),
-                          XDG_CONFIG_HOME=str(self.root / 'config'),
+                          XDG_CONFIG_HOME=str(self.root / 'state/config'),
                           XDG_DATA_HOME=str(self.root / 'data'),
                           CUDA_CACHE_PATH=str(self.root / 'cache/cuda'),
                           VLLM_CACHE_ROOT=str(self.root / 'cache/vllm'),

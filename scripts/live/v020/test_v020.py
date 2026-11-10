@@ -318,6 +318,11 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         self.assertIn('engine refused start', evidence['log'])
         self.assertNotIn('private-key', evidence['log'])
 
+    def test_runtime_profiles_live_in_the_archived_attempt_state(self):
+        v020.Context(self.root, {})
+        self.assertTrue(
+            Path(os.environ['XDG_CONFIG_HOME']).is_relative_to(self.root / 'state'))
+
 
 if __name__ == '__main__':
     unittest.main()

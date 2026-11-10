@@ -44,6 +44,8 @@ of the evidence-bearing remote directory.
 Everything created remotely lives in the home directory, principally
 `~/capyctl-v020`. Each installer records ownership before creating directories,
 refuses unmarked existing installations, and can resume from prior artifacts.
+Runtime profiles live under the attempt's archived state, so a resumed run does
+not collide with profile names left by a previous attempt.
 No apt, driver update, system CUDA modification or reboot is allowed. Missing
 compilers/tools are blocking preflight errors, not permission to install packages.
 
