@@ -309,6 +309,29 @@ fn sglang_dump_destinations_are_reserved_in_every_spelling() {
     }
 }
 
+// T21: ADR 0033 §11 reserves external cache ownership even with approval.
+#[test]
+fn sglang_external_linker_is_reserved() {
+    for args in [
+        json!(["--enable-unified-cache-external-linker"]),
+        json!(["--enable-unified-cache-ext"]),
+        json!(["--unified-cache-external-linker-backend", "dynamic"]),
+        json!(["--unified-cache-external-linker-b=dynamic"]),
+        json!(["--unified-cache-external-linker-config", "{}"]),
+        json!(["--unified-cache-external-linker-c={}"]),
+    ] {
+        let (deployment, mut host) = with_extra_args("sglang", args.clone());
+        host["runtime_profiles"]["local"]["security"]["approved_options"] = json!([
+            "--enable-unified-cache-external-linker",
+            "--unified-cache-external-linker-backend",
+            "--unified-cache-external-linker-config"
+        ]);
+        let error = resolve_effective(&deployment, &host).unwrap_err();
+        assert_eq!(error.path, "engine_config.extra_args");
+        assert!(error.to_string().contains("reserved"), "{args}: {error}");
+    }
+}
+
 /// SPEC §8.2: rendezvous data is capyctl's. Found live 2026-09-23 (M08): the
 /// SGLang scheduler's torch TCP rendezvous listened on every interface, so a
 /// single rank now uses a private file store and neither the rendezvous

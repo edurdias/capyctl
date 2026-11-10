@@ -8,7 +8,7 @@ more than one, each in its own environment.
 | Engine | Versions this release knows | Environment used below |
 |---|---|---|
 | vLLM | 0.32.0, 0.31.0, 0.30.0, 0.29.0 | `~/venvs/vllm` |
-| SGLang | 0.5.21, 0.5.20 | `~/venvs/sglang` |
+| SGLang | newest known: 0.5.23 (not yet qualified); verified: 0.5.21, 0.5.20 | `~/venvs/sglang` |
 | TensorFold | 0.6.6, 0.6.5, 0.6.3, 0.6.2, 0.6.1, 0.6.0 | `~/venvs/tensorfold` |
 | llama.cpp | v0.9.0 (newest known), v0.7.0, v0.6.0 (every build lists as `CUSTOM yes` for now) | `~/llama.cpp` (a build, no environment) |
 | TensorRT-LLM | 1.2.1, the 1.3 pre-release, 1.4.0rc1 (every installation lists as `CUSTOM yes` for now) | `~/tensorrt-llm-<version>-venv` |
@@ -86,7 +86,7 @@ shown to get one CapyCTL knows.
 vLLM's own guide:
 [GPU installation](https://docs.vllm.ai/en/v0.32.0/getting_started/installation/gpu/).
 
-## SGLang 0.5.21 or 0.5.20
+## SGLang 0.5.23
 
 1. Create the environment:
 
@@ -94,17 +94,19 @@ vLLM's own guide:
    uv venv --python 3.12 --seed --managed-python ~/venvs/sglang
    ```
 
-2. Install SGLang. This is SGLang's own `uv` command, pinned to 0.5.21
-   (write `0.5.20` for that version):
+2. Install the noneditable SGLang wheel, with tracing dependencies and the
+   memory saver CapyCTL uses to park models:
 
    ```bash
-   uv pip install --python ~/venvs/sglang/bin/python --prerelease=allow "sglang==0.5.21"
+   uv pip install --python ~/venvs/sglang/bin/python --prerelease=allow "sglang[tracing]==0.5.23" "torch-memory-saver==0.0.10"
    ```
 
-   Both versions need CUDA 13 and install PyTorch 2.13.0 and
-   `torch_memory_saver`, which CapyCTL uses to park SGLang models.
-   `--prerelease=allow` is needed with `uv` older than 0.12.0 and does nothing
-   on newer ones.
+   This version needs CUDA 13 and installs PyTorch 2.14.1. Install the CUDA
+   13.0 toolkit and a C++ compiler separately if absent; the driver alone does
+   not provide `nvcc`. Set `CUDA_HOME=/usr/local/cuda-13.0` and include
+   `$CUDA_HOME/bin` in `PATH` when building native dependencies.
+   Version 0.5.23 is the newest known version, not a qualified version:
+   detection still lists it as `CUSTOM yes` pending live qualification.
 
    Install SGLang as a regular package, never in editable mode (`pip install
    -e`). CapyCTL loads SGLang only from the environment's `site-packages` and
@@ -125,7 +127,7 @@ vLLM's own guide:
    ~/venvs/sglang/bin/python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
    ```
 
-   The first prints `0.5.21`, the second `2.13.0`, `13.0` and `True` (the
+   The first prints `0.5.23`, the second `2.14.1`, `13.0` and `True` (the
    version can carry a `+cu130` suffix).
 
 SGLang's own guide: [Installation](https://docs.sglang.io/docs/get-started/install).

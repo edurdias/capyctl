@@ -56,7 +56,7 @@ such an installation with the same code, including one named
 with `--sglang-bin` or `local_engine`. An enrolled host refuses it too toward
 a 0.2.0 server. Toward an older server the engine starts and fails at once with
 `engine_import_failed`, without ending the control session. Reinstall SGLang without
-`-e` ([Install an engine](install-engines.md#sglang-0521-or-0520)).
+`-e` ([Install an engine](install-engines.md#sglang-0523)).
 
 That output is from a first run, before CapyCTL was started: the engine is saved
 and used from the first start. If CapyCTL is running, it uses the engine at once
@@ -72,6 +72,10 @@ setup, set both `--config` (or `XDG_CONFIG_HOME`) and `--state-dir`, and give
 the CLI and the running role the same ones.
 
 ## Custom builds
+
+The newest known SGLang release is 0.5.23. Its protected launch policy is
+covered by CPU tests, but it remains `CUSTOM yes` until live qualification;
+CPU tests are not qualification. See its [installation recipe](install-engines.md#sglang-0523).
 
 `CUSTOM yes` means a version other than vLLM 0.29.0 to 0.32.0, SGLang 0.5.20 and 0.5.21 or
 TensorFold 0.6.0 to 0.6.3, 0.6.5 and 0.6.6, the versions this release of CapyCTL knows; every

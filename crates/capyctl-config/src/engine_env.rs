@@ -55,6 +55,8 @@ pub const OWNED_NAMES: &[&str] = &[
     // ADR 0008 amendment 2026-10-17: SGLang's plugin and platform selection.
     "SGLANG_PLUGINS",
     "SGLANG_PLATFORM",
+    // SPEC §8.2 / T21: the protected HTTP application is not profile code.
+    "SGLANG_HTTP_SERVER_APP_PATH",
     "VLLM_SERVER_DEV_MODE",
     "VLLM_API_KEY",
     // TensorFold reads this key (`server/authentication.py`) and then refuses

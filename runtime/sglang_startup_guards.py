@@ -178,6 +178,11 @@ def enforce_closed_plugins():
     if any(name == root or name.startswith(root + ".")
            for name in sys.modules for root in native_roots):
         raise StartupGuardError("native_already_imported") from None
+    # SPEC §8.2 / T21: multi-tokenizer workers must use the protected app,
+    # never an environment-selected import target (SGLang 0.5.23).
+    if os.environ.get("SGLANG_HTTP_SERVER_APP_PATH",
+                      "sglang.srt.entrypoints.http_server:app") != "sglang.srt.entrypoints.http_server:app":
+        raise StartupGuardError("external_plugin_selection") from None
     selection = os.environ.get("SGLANG_PLUGINS")
     if (os.environ.get("SGLANG_PLATFORM")
             or (selection and selection != NO_PLUGINS_SELECTION)

@@ -252,6 +252,11 @@ pub const SGLANG_RESERVED_FIELDS: &[&str] = &[
     "lmcache_config_file",
     "enable_flexkv",
     "flexkv_config_file",
+    // ADR 0033 §11 / T21: external cache ownership is exclusive, including
+    // the 0.5.23 dynamic backend's module-loading configuration.
+    "enable_unified_cache_external_linker",
+    "unified_cache_external_linker_backend",
+    "unified_cache_external_linker_config",
     "quantize_and_serve",
     // ADR 0036 §2: rendered `--is-embedding` on an embeddings deployment only,
     // so no deployment's extra arguments may set it.
