@@ -80,6 +80,9 @@ class SyntheticArgs(SimpleNamespace):
         parser.add_argument("--otlp-traces-endpoint", default="localhost:4317")
         parser.add_argument("--otlp-service-name", default="sglang")
         parser.add_argument("--trace-modules", default="request")
+        parser.add_argument("--enable-unified-cache-external-linker", action="store_true")
+        parser.add_argument("--unified-cache-external-linker-backend", default="mooncake")
+        parser.add_argument("--unified-cache-external-linker-config", default=None)
 
 
 SyntheticArgs.__struct_fields__ = (
@@ -229,6 +232,30 @@ class MappingTests(LaunchFixture, unittest.TestCase):
         kwargs = self.seen(self.spec_with(memory_saver=False, cpu_weight_backup=False,
                                           weight_restore="disk_reload", cuda_graphs=None))
         self.assertIs(kwargs["enable_memory_saver"], False)
+
+    # T21: ADR 0033 §11. Parser destinations, not spelling or approval, own caches.
+    def test_external_linker_is_reserved_without_requiring_new_fields(self):
+        from runtime import extra_args_policy as policy
+        approved = policy.parse_approvals(
+            '{"options": ["--enable-unified-cache-external-linker",'
+            '"--unified-cache-external-linker-backend",'
+            '"--unified-cache-external-linker-config"], "paths": [],'
+            '"trust_remote_code": false}')
+        for extra in (["--enable-unified-cache-external-linker"],
+                      ["--enable-unified-cache-ext"],
+                      ["--unified-cache-external-linker-backend=dynamic"],
+                      ["--unified-cache-external-linker-b=dynamic"],
+                      ["--unified-cache-external-linker-config={}"],
+                      ["--unified-cache-external-linker-c={}"]):
+            with self.subTest(extra=extra):
+                with self.assertRaises(mapping.ServerArgsError) as caught:
+                    mapping.construct_server_args(self.spec_with(extra_args=extra),
+                                                  self.placement(), synthetic_constructor,
+                                                  AVAILABLE, approvals=approved)
+                self.assertEqual(caught.exception.code, "effective_args_mismatch")
+        # Old ServerArgs lacks every new struct field, yet still constructs.
+        self.public["settings"]["extra_args"] = []
+        self.seen(self.build())
 
     # T14: ADR 0024. Parsers chosen at launch reach the constructor under
     # their field names; absent, nothing is passed and the engine has none.
@@ -526,6 +553,11 @@ class MappingTests(LaunchFixture, unittest.TestCase):
                                       AVAILABLE, approvals=approved).revalidate()
 
     def test_malformed_or_unknown_extra_arguments_are_closed_failures(self):
+        # SGLang 0.5.23 removed this formerly valid deployment extra.
+        with self.assertRaises(mapping.ServerArgsError) as removed:
+            construct(self.spec_with(extra_args=["--speculative-skip-dp-mlp-sync"]),
+                      self.placement(), synthetic_constructor)
+        self.assertEqual(removed.exception.code, "invalid_extra_args")
         for extra in (["--no-such-option", "1"], ["--port"], ["positional"], ["--help"],
                       ["--context-length", "not-a-number"]):
             with self.subTest(extra=extra):

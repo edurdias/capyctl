@@ -18,6 +18,34 @@ NO_PLUGINS_SELECTION = "capyctl-loads-no-plugins"
 
 
 class StartupGuardsTests(unittest.TestCase):
+    # T21: SPEC §8.2 protects the app imported by multi-tokenizer workers.
+    def test_http_app_selection_is_closed_before_any_target_import(self):
+        for value, denied in (("untrusted_target:app", True), ("", True),
+                              ("sglang.srt.entrypoints.http_server:app", False)):
+            child = self.child(f'''
+                import os, sys
+                from unittest import mock
+                from runtime.sglang_startup_guards import enforce_closed_plugins, StartupGuardError
+                os.environ["SGLANG_HTTP_SERVER_APP_PATH"] = {value!r}
+                os.environ.pop("SGLANG_PLATFORM", None)
+                os.environ.pop("SGLANG_PLUGINS", None)
+                class NoTargetImports:
+                    def find_spec(self, fullname, path=None, target=None):
+                        if fullname.startswith(("sglang", "untrusted_target")):
+                            raise AssertionError("target import attempted")
+                sys.meta_path.insert(0, NoTargetImports())
+                with mock.patch("importlib.metadata.entry_points", return_value=()):
+                    try:
+                        enforce_closed_plugins()
+                    except StartupGuardError as error:
+                        assert {denied!r} and error.code == "external_plugin_selection"
+                    else:
+                        assert not {denied!r}
+                assert "untrusted_target" not in sys.modules
+                assert "sglang" not in sys.modules
+            ''')
+            self.assertEqual(child.returncode, 0, child.stderr)
+
     def test_no_site_flag_prevents_installed_hooks_before_protected_entry(self):
         # -I disables user site and environment paths, not installed .pth code.
         # Use only a fresh stdlib-only test environment, never an engine install.

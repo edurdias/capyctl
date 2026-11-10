@@ -145,6 +145,11 @@ _RESERVED_DUMP = ("watermark_config", "debug_tensor_dump_output_folder",
                   "debug_tensor_dump_layers", "debug_tensor_dump_input_file",
                   "msprobe_dump_config", "export_metrics_to_file",
                   "export_metrics_to_file_dir", "spec_trace_dir")
+# ADR 0033 §11 / T21: external cache ownership is exclusive. Refuse these
+# destinations without requiring their presence on older engine versions.
+_RESERVED_EXTERNAL_LINKER = ("enable_unified_cache_external_linker",
+                             "unified_cache_external_linker_backend",
+                             "unified_cache_external_linker_config")
 # ADR 0037 §7 (owner decision 2026-10-27, question 7): SGLang's tracing fields
 # (0.5.22 arg_groups/fields/observability.py) are CapyCTL's, refused as extra
 # arguments whatever the host approves (engine_policy.rs SGLANG_TRACING_FIELDS).
@@ -167,7 +172,7 @@ _TYPED_DESTINATIONS = frozenset({
     "max_total_tokens", "chunked_prefill_size", "tokenizer_worker_num",
 })
 _FORBIDDEN_EXTRA = frozenset({*_RESERVED_CONSTANT, *_RESERVED_BOUND, *_RESERVED_DUMP,
-                              *_RESERVED_TRACING, "config"})
+                              *_RESERVED_TRACING, *_RESERVED_EXTERNAL_LINKER, "config"})
 # ADR 0014 §4: capyctl safe defaults the deployment may override with extra args.
 _SAFE_DEFAULTS = {"detokenizer_worker_num": 1}
 
