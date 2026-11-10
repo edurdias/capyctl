@@ -30,11 +30,11 @@ Setup (rented x86_64 VM only; approximately 60 minutes, downloads/installations 
      and a separate editable SGLang 0.5.23 checkout/environment for #235.
   7. Recreate separate vLLM 0.33 and SGLang 0.5.23 environments from their freezes
      using uv; source-build LMCache ${LMCACHE_VERSION:-0.5.7} twice against each engine's exact torch.
-     Use no build isolation, CUDA arch 12.0 and CUDA major 13; preserve engine
+     Use no build isolation, the GPU's own CUDA arch and CUDA major 13; preserve engine
      constraints and disable built-wheel reuse across the different torch builds.
      Never copy a venv's absolute shebangs.
   8. Build llama.cpp v0.9.0, commit cd959bae99ff4bed22bef2604f45241c09bbb8c8
-     (pin source: scripts/live/llamacpp-build.sh at 63f91fc8), for 120a-real;
+     (pin source: scripts/live/llamacpp-build.sh at 63f91fc8), for the GPU's arch;
      CUDA ON, Release, IS_DEV/CONNECT/BUILD_UI/USE_PREBUILT_UI OFF; llama-server -j nproc.
   9. Download native TensorFold 1.2.6 and 1.1.5 x86_64 archives; verify SHA256:
      1.2.6 a8abf9b8d6b1109e716996eba18d5c5ce1dbe013a7808b603f81f218e0bcff3d
@@ -320,7 +320,7 @@ PY
     'setuptools>=77.0.3,<81' setuptools_scm ninja 'packaging>=24.2' wheel grpcio==1.78.0 grpcio-tools==1.78.0
   # uv's source wheel cache is not keyed by the baseline torch ABI. Each target
   # must compile independently, even though both source archives have one version.
-  v020_cmd env TORCH_CUDA_ARCH_LIST=12.0 BUILD_WITH_CUDA=1 LMCACHE_CUDA_MAJOR=13 \
+  v020_cmd env TORCH_CUDA_ARCH_LIST="$(v020_cuda_arch torch)" BUILD_WITH_CUDA=1 LMCACHE_CUDA_MAJOR=13 \
     SETUPTOOLS_SCM_PRETEND_VERSION="$version" "$BIN/uv" --no-cache pip install \
     --python "$destination/bin/python" --prerelease=allow --torch-backend=cu130 \
     --no-build-isolation --constraint "$constraints" \
@@ -365,6 +365,19 @@ v020_tensorfold_baseline() {
   printf '%s\n' 'configured: TensorFold 0.6.6 comparison baseline; live qualification still required' >"$EVIDENCE/tensorfold-066-availability.txt"
 }
 
+# The GPU's compute capability decides the kernels built here (8.0 on an A100,
+# 12.0 on an RTX PRO 6000): `torch` prints 8.0, `cmake` prints 80-real, or
+# 120a-real where the architecture-specific features need the `a` variant.
+v020_cuda_arch() {
+  local cap major
+  cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n 1 | tr -d ' ')
+  case "$cap" in [0-9]*.[0-9]) ;; *) v020_setup_error "unreadable compute capability: $cap"; return 1 ;; esac
+  major=${cap%%.*}
+  if [ "$1" = torch ]; then printf '%s\n' "$cap"
+  elif [ "$major" -ge 9 ]; then printf '%sa-real\n' "${cap/./}"
+  else printf '%s-real\n' "${cap/./}"; fi
+}
+
 v020_build_llamacpp() {
   [ -z "${V020_OVERRIDES[LLAMACPP]:-}" ] || return 0
   # Pin source: the v0.9.0 commit table in llamacpp-build.sh at 63f91fc8.
@@ -374,7 +387,7 @@ v020_build_llamacpp() {
   head=$(git -C "$source" rev-parse HEAD)
   [ "$head" = cd959bae99ff4bed22bef2604f45241c09bbb8c8 ] || { v020_setup_error 'llama.cpp tag commit mismatch'; return 1; }
   v020_cmd cmake -S "$source" -B "$source/build" \
-    -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a-real -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=$(v020_cuda_arch cmake)" -DCMAKE_BUILD_TYPE=Release \
     -DLLAMA_BUILD_IS_DEV=OFF -DLLAMA_CONNECT=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
     "-DCUDAToolkit_ROOT=$CUDA_HOME" "-DCMAKE_CUDA_COMPILER=$CUDACXX" \
     "-DCMAKE_CXX_COMPILER=$(command -v c++)" "-DCMAKE_CUDA_HOST_COMPILER=$(command -v c++)" \

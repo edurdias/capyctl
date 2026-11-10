@@ -184,7 +184,8 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   other rules here apply to it (one live session at a time, fault injection only by
   signals to CapyCTL-owned processes, no driver, CUDA or system-package change).
 - The rented machine for 0.2.0 (owner decision 2026-11-10): one x86_64 machine with
-  one RTX PRO 6000 96 GB card, rented from Shadeform with a $20 spending cap and
+  one A100 80 GB card and 160 GB of RAM (the RTX PRO 6000 first chosen was out of
+  stock; owner decision the same day), rented from Shadeform with a $20 spending cap and
   supervised by `scripts/live/shade_session.py`, is authorized as a live host for one
   session only: the 0.2.0 rows of `scripts/live/v020/`, including the timing and
   memory rows (recorded as discrete-GPU evidence). The same rules apply to it as to
