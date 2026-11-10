@@ -224,6 +224,10 @@ fn reserved_block(input: &PlanInputTensorrtLlm) -> Vec<String> {
     .into_iter()
     .map(str::to_owned)
     .collect();
+    // ADR 0038 §3: rc3 otherwise starts eight frontends, not our singleton.
+    if version_line(&input.version).supports_frontend_count {
+        argv.extend(["--num_serve_frontends".to_owned(), ONE.to_owned()]);
+    }
     if let Some(parser) = &input.reasoning_parser {
         argv.extend(["--reasoning_parser".to_owned(), parser.clone()]);
     }
@@ -267,7 +271,7 @@ pub fn render_command(
     ];
     argv.extend(reserved_block(input));
     argv.extend(pass_through);
-    recheck_rendered(&argv)?;
+    recheck_rendered(&argv, &input.version)?;
     let mut env = BTreeMap::from([("TMPDIR".to_owned(), display(&input.tmp_dir()))]);
     // ADR 0019 §6: an empty namespace list keeps the agent's own devices.
     if !input.cuda_namespaces.is_empty() {
@@ -306,7 +310,7 @@ const RENDERED_AT_MOST_ONCE: &[&str] =
 /// any spelling (the parsers and `--trust_remote_code` at most once); the
 /// listener is loopback and every parallel size 1; no other reserved option
 /// and no reserved `--name=value` spelling appears at all.
-pub fn recheck_rendered(argv: &[String]) -> Result<(), TensorrtLlmArgsError> {
+pub fn recheck_rendered(argv: &[String], version: &str) -> Result<(), TensorrtLlmArgsError> {
     if argv.get(1).map(String::as_str) != Some("serve") {
         return Err(TensorrtLlmArgsError::RenderedReserved("serve".into()));
     }
@@ -316,6 +320,7 @@ pub fn recheck_rendered(argv: &[String]) -> Result<(), TensorrtLlmArgsError> {
         ));
     }
     let args = argv.get(3..).unwrap_or_default();
+    let frontend_count = version_line(version).supports_frontend_count;
     if let Some(token) = args.iter().find(|token| {
         token.starts_with("--") && token.contains('=') && is_reserved(&normalize_option_name(token))
     }) {
@@ -333,6 +338,7 @@ pub fn recheck_rendered(argv: &[String]) -> Result<(), TensorrtLlmArgsError> {
             .iter()
             .chain(RENDERED_AT_MOST_ONCE)
             .any(|head| option_key(head) == key)
+            && !(frontend_count && key == option_key("--num_serve_frontends"))
         {
             return Err(TensorrtLlmArgsError::RenderedReserved(option.name.clone()));
         }
@@ -342,6 +348,7 @@ pub fn recheck_rendered(argv: &[String]) -> Result<(), TensorrtLlmArgsError> {
             "--tensor_parallel_size",
             "--pipeline_parallel_size",
             "--gpus_per_node",
+            "--num_serve_frontends",
         ]
         .iter()
         .any(|head| option_key(head) == key)
@@ -358,6 +365,11 @@ pub fn recheck_rendered(argv: &[String]) -> Result<(), TensorrtLlmArgsError> {
     let count = |head: &str| counts.get(&option_key(head)).copied().unwrap_or(0);
     if let Some(head) = RENDERED_ONCE.iter().find(|head| count(head) != 1) {
         return Err(TensorrtLlmArgsError::RenderedReserved((*head).to_owned()));
+    }
+    if frontend_count && count("--num_serve_frontends") != 1 {
+        return Err(TensorrtLlmArgsError::RenderedReserved(
+            "--num_serve_frontends".into(),
+        ));
     }
     if let Some(head) = RENDERED_AT_MOST_ONCE.iter().find(|head| count(head) > 1) {
         return Err(TensorrtLlmArgsError::RenderedReserved((*head).to_owned()));

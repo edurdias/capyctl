@@ -588,9 +588,9 @@ llama.cpp has run on a discrete NVIDIA GPU so far; a GB10 has not run it yet.
 CapyCTL runs NVIDIA TensorRT-LLM's `trtllm-serve`, engine kind
 `tensorrt-llm`: one Hugging Face checkpoint on the PyTorch backend, on one GPU
 of one host, for chat. Three versions are being qualified: 1.2.1, the 1.3
-pre-release (the tables were read from 1.3.0rc29) and 1.4.0rc1. Install one in
+pre-release (the tables were read from 1.3.0rc29) and 1.4.0rc3. Install one in
 its own Python environment ([Install an
-engine](install-engines.md#tensorrt-llm-121-13-pre-release-or-140rc1)) and
+engine](install-engines.md#tensorrt-llm-121-13-pre-release-or-140rc3)) and
 name its `trtllm-serve`:
 
 ```bash

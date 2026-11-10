@@ -404,14 +404,31 @@ impl Shape<'_> {
         }
         const API: &str = "lmcache/v1/distributed/api.py";
         if let Some(text) = self.required(site, API) {
-            if !class_declares_field(&text, "ObjectKey", "cache_salt") {
+            if !class_declares_field(&text, "ObjectKey", "cache_salt")
+                && !identity_backed_salt(&text)
+            {
                 self.note(format!(
                     "no cache_salt support: {API} declares no cache_salt field on ObjectKey"
                 ));
             }
             let copies = function_body(&text, "ipc_key_to_object_keys").is_some_and(|body| {
-                body.contains("ipc_key.cache_salt")
-                    && call_has_argument(body, "ObjectKey", "cache_salt")
+                body.lines().any(|line| {
+                    let Some((name, source)) =
+                        line.split('#').next().unwrap_or_default().split_once('=')
+                    else {
+                        return false;
+                    };
+                    let name = name.trim();
+                    source.trim() == "ipc_key.cache_salt"
+                        && !name.is_empty()
+                        && name.chars().all(is_identifier)
+                        && call_has_argument_value(body, "ObjectKey", "cache_salt", Some(name))
+                }) || call_has_argument_value(
+                    body,
+                    "ObjectKey",
+                    "cache_salt",
+                    Some("ipc_key.cache_salt"),
+                )
             });
             if !copies {
                 self.note(format!(
@@ -462,7 +479,31 @@ impl Shape<'_> {
                     "{CONNECTOR} defines no class UnifiedLMCacheMPConnector"
                 ));
             }
-            if !call_has_argument(&text, "IPCCacheServerKey", "cache_salt") {
+            let direct = call_has_argument_value(
+                &text,
+                "IPCCacheServerKey",
+                "cache_salt",
+                Some("operation.cache_salt"),
+            );
+            let factory = call_has_argument_value(
+                &text,
+                "IPCCacheServerKey.from_token_ids",
+                "cache_salt",
+                Some("operation.cache_salt"),
+            ) && self
+                .optional(site, "lmcache/v1/multiprocess/custom_types.py")
+                .and_then(|source| {
+                    let class = class_body(&source, "IPCCacheServerKey")?;
+                    let method = block_body(class, "    def from_token_ids")?;
+                    Some(call_has_argument_value(
+                        method,
+                        "cls",
+                        "cache_salt",
+                        Some("cache_salt"),
+                    ))
+                })
+                .unwrap_or(false);
+            if !direct && !factory {
                 self.note(format!(
                     "no cache_salt support: {CONNECTOR} builds no IPCCacheServerKey with cache_salt="
                 ));
@@ -676,11 +717,12 @@ fn function_body<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     block_body(text, &format!("def {name}"))
 }
 
-/// The text after a top-level line starting with `header` and then `(` or
-/// `:`, up to the next top-level line that is not the header's own
-/// continuation (`)`), a comment or blank.
+/// The text after a line starting with `header` and then `(` or `:`,
+/// up to the next statement at the header's indentation (excluding its
+/// own continuation, comments and blanks). Also handles class methods.
 fn block_body<'a>(text: &'a str, header: &str) -> Option<&'a str> {
     let mut offset = 0;
+    let indent = header.len() - header.trim_start().len();
     let mut start = None;
     for line in text.split_inclusive('\n') {
         let here = offset;
@@ -694,8 +736,9 @@ fn block_body<'a>(text: &'a str, header: &str) -> Option<&'a str> {
                 }
             }
             Some(begin) => {
-                let top_level = line.starts_with(|c: char| !c.is_whitespace());
-                if top_level && !line.starts_with(')') && !line.starts_with('#') {
+                let statement = line.trim_start();
+                let same_level = !statement.is_empty() && line.len() - statement.len() <= indent;
+                if same_level && !statement.starts_with(')') && !statement.starts_with('#') {
                     return Some(&text[begin..here]);
                 }
             }
@@ -706,7 +749,13 @@ fn block_body<'a>(text: &'a str, header: &str) -> Option<&'a str> {
 
 /// A field annotation `name:` in the class body (`cache_salt: str = ""`).
 fn class_declares_field(text: &str, class: &str, field: &str) -> bool {
-    class_body(text, class).is_some_and(|body| declares_field(body, field))
+    class_body(text, class).is_some_and(|body| {
+        body.lines().any(|line| {
+            line.strip_prefix("    ")
+                .filter(|statement| !statement.starts_with(char::is_whitespace))
+                .is_some_and(|statement| declares_field(statement, field))
+        })
+    })
 }
 
 /// A line whose statement is the annotation `name: ...`.
@@ -718,6 +767,39 @@ fn declares_field(text: &str, field: &str) -> bool {
     })
 }
 
+/// ADR 0033 §5: 0.5.7 moves matching fields into an immutable identity.
+/// A getter alone is not enough: flat construction and replacement must
+/// preserve the supplied salt in the identity that ObjectKey stores.
+fn identity_backed_salt(text: &str) -> bool {
+    if !class_declares_field(text, "ObjectKeyIdentity", "cache_salt")
+        || !class_declares_field(text, "ObjectKey", "identity")
+    {
+        return false;
+    }
+    let Some(class) = class_body(text, "ObjectKey") else {
+        return false;
+    };
+    let getter = class.contains("    @property\n    def cache_salt(")
+        && block_body(class, "    def cache_salt")
+            .is_some_and(|body| compact_code(body).contains("returnself.identity.cache_salt"));
+    let constructor = block_body(class, "    def __init__").is_some_and(|body| {
+        let code = compact_code(body);
+        call_has_argument_value(
+            body,
+            "ObjectKeyIdentity",
+            "cache_salt",
+            Some("cache_saltifcache_saltisnotNoneelse\"\""),
+        ) && call_has_argument_value(
+            body,
+            "replace",
+            "cache_salt",
+            Some("cache_saltifcache_saltisnotNoneelseidentity.cache_salt"),
+        ) && (code.contains("object.__setattr__(self,\"identity\",identity)")
+            || code.contains("object.__setattr__(self,'identity',identity)"))
+    });
+    getter && constructor
+}
+
 /// A top-level `def name(`.
 fn defines_function(text: &str, name: &str) -> bool {
     text.lines().any(|line| {
@@ -726,8 +808,8 @@ fn defines_function(text: &str, name: &str) -> bool {
     })
 }
 
-/// Whether some call `callee(...)` passes the keyword argument `argument=`.
-fn call_has_argument(text: &str, callee: &str, argument: &str) -> bool {
+/// Match a keyword's value as well when checking a salt-preserving hop.
+fn call_has_argument_value(text: &str, callee: &str, argument: &str, value: Option<&str>) -> bool {
     let opener = format!("{callee}(");
     let keyword = format!("{argument}=");
     let mut from = 0;
@@ -760,7 +842,38 @@ fn call_has_argument(text: &str, callee: &str, argument: &str) -> bool {
             .filter(|c| !c.is_whitespace())
             .collect();
         let named = arguments.match_indices(&keyword).any(|(index, _)| {
-            index == 0 || arguments[..index].ends_with(',') || arguments[..index].ends_with('(')
+            if index != 0 && !arguments[..index].ends_with(',') {
+                return false;
+            }
+            let depth = arguments[..index].chars().fold(0usize, |depth, c| match c {
+                '(' | '[' | '{' => depth + 1,
+                ')' | ']' | '}' => depth.saturating_sub(1),
+                _ => depth,
+            });
+            if depth != 0 {
+                return false;
+            }
+            let Some(value) = value else {
+                return true;
+            };
+            let rest = &arguments[index + keyword.len()..];
+            let mut depth = 0usize;
+            let end = rest
+                .char_indices()
+                .find_map(|(at, c)| match c {
+                    '(' | '[' | '{' => {
+                        depth += 1;
+                        None
+                    }
+                    ')' | ']' | '}' => {
+                        depth = depth.saturating_sub(1);
+                        None
+                    }
+                    ',' if depth == 0 => Some(at),
+                    _ => None,
+                })
+                .unwrap_or(rest.len());
+            rest[..end].trim_matches(['(', ')']) == value
         });
         if named {
             return true;
@@ -908,22 +1021,36 @@ mod tests {
         );
     }
 
+    // T45 (ADR 0033 §5): salt values, not just keyword presence, reach
+    // the direct constructor or factory; nested arguments stay separate.
     #[test]
-    fn lmcache_calls_are_matched_by_keyword_not_by_value() {
-        assert!(call_has_argument(
-            "k = IPCCacheServerKey(\n  model_name=m,\n  cache_salt=op.cache_salt,\n)",
+    fn lmcache_calls_match_salt_values() {
+        for callee in ["IPCCacheServerKey", "IPCCacheServerKey.from_token_ids"] {
+            for (arguments, expected) in [
+                ("model_name=m, cache_salt=op.cache_salt", true),
+                ("model_name=f(a,b), cache_salt=(op.cache_salt)", true),
+                ("model_name=m, salt=op.cache_salt", false),
+                ("model_name=m, cache_salt=\"\"", false),
+                ("nested=f(cache_salt=op.cache_salt), cache_salt=\"\"", false),
+            ] {
+                // The keyword belongs to the outer call, not a nested one.
+                assert_eq!(
+                    call_has_argument_value(
+                        &format!("k = {callee}({arguments})"),
+                        callee,
+                        "cache_salt",
+                        Some("op.cache_salt"),
+                    ),
+                    expected,
+                    "{callee}: {arguments}",
+                );
+            }
+        }
+        assert!(!call_has_argument_value(
+            "k = MyIPCCacheServerKey(cache_salt=op.cache_salt)",
             "IPCCacheServerKey",
-            "cache_salt"
-        ));
-        assert!(!call_has_argument(
-            "k = IPCCacheServerKey(model_name=m, salt=op.cache_salt)",
-            "IPCCacheServerKey",
-            "cache_salt"
-        ));
-        assert!(!call_has_argument(
-            "k = MyIPCCacheServerKey(cache_salt=s)",
-            "IPCCacheServerKey",
-            "cache_salt"
+            "cache_salt",
+            Some("op.cache_salt"),
         ));
     }
 
@@ -932,6 +1059,12 @@ mod tests {
         let text = "class A:\n    x: int\n\n@dataclass\nclass B:\n    cache_salt: str = \"\"\n";
         assert!(!class_declares_field(text, "A", "cache_salt"));
         assert!(class_declares_field(text, "B", "cache_salt"));
+        // T45: a constructor parameter is not a stored class field.
+        assert!(!class_declares_field(
+            "class C:\n    def __init__(\n        self,\n        cache_salt: str = \"\",\n    ):\n        pass\n",
+            "C",
+            "cache_salt",
+        ));
     }
 
     #[test]

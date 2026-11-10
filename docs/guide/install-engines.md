@@ -11,7 +11,7 @@ more than one, each in its own environment.
 | SGLang | newest known: 0.5.23 (not yet qualified); verified: 0.5.21, 0.5.20 | `~/venvs/sglang` |
 | TensorFold | 0.6.6, 0.6.5, 0.6.3, 0.6.2, 0.6.1, 0.6.0 | `~/venvs/tensorfold` |
 | llama.cpp | v0.9.0 (newest known), v0.7.0, v0.6.0 (every build lists as `CUSTOM yes` for now) | `~/llama.cpp` (a build, no environment) |
-| TensorRT-LLM | 1.2.1, the 1.3 pre-release, 1.4.0rc1 (every installation lists as `CUSTOM yes` for now) | `~/tensorrt-llm-<version>-venv` |
+| TensorRT-LLM | 1.2.1, the 1.3 pre-release, 1.4.0rc3 (every installation lists as `CUSTOM yes` for now) | `~/tensorrt-llm-<version>-venv` |
 
 Another version still runs, but `capyctl engine detect` shows it as
 `CUSTOM yes` ([Custom builds](engines.md#custom-builds)). Pin the version as
@@ -272,29 +272,30 @@ llama.cpp's own guide: the
 [server README](https://github.com/ggml-org/llama.cpp/blob/v0.9.0/tools/server/README.md)
 at the release tag.
 
-## TensorRT-LLM 1.2.1, 1.3 pre-release or 1.4.0rc1
+## TensorRT-LLM 1.2.1, 1.3 pre-release or 1.4.0rc3
 
 CapyCTL runs TensorRT-LLM's `trtllm-serve` on one GPU. Three
 versions are being qualified, each with its own live rows: 1.2.1, a 1.3
-pre-release (the option tables were read from 1.3.0rc29) and 1.4.0rc1. No
+pre-release (the option tables were read from 1.3.0rc29) and 1.4.0rc3. No
 version has passed its rows yet, so the verified set is empty: every
 TensorRT-LLM installation lists as `CUSTOM yes` and runs as an uncertified
 custom setup. CapyCTL never refuses one for being uncertified.
 
-TensorRT-LLM needs two things outside its environment, installed once by an
-administrator:
+TensorRT-LLM needs an MPI runtime and a complete CUDA developer toolkit.
+On Ubuntu, an administrator can install `libopenmpi-dev` (Open MPI 4.1.6
+on Ubuntu 24.04). On x86_64, the no-system-package alternative is the
+venv-local `openmpi==4.1.8` wheel with `mpi4py==4.1.2`.
+Keep Open MPI on the audited 4.1 line for isolated-singleton operation.
 
-- Open MPI, which `mpi4py` loads at run time. On Ubuntu 24.04:
+Use toolkit 13.1 for 1.2.1 and 13.4 for 1.4.0rc3, installed side by side.
+Without system packages, provision NVIDIA's toolkit in a user prefix, or
+assemble the complete pip toolkit components, and set `CUDA_HOME` to it.
+The engine wheel alone does not supply the developer toolkit. CUDA 13.x
+minor compatibility has PTX/JIT restrictions: an existing CUDA 13.0-capable
+driver is not proof that rc3/cu132 works. Driver or approved compatibility
+provisioning may be necessary; qualify the actual GPU and model.
 
-  ```bash
-  sudo apt-get -y install libopenmpi-dev
-  ```
-
-- The CUDA toolkit from NVIDIA's packages: 13.1 for 1.2.1, 13.4 for 1.4.
-  The toolkits install side by side.
-
-The steps for 1.2.1 on ARM64 (a DGX Spark); the pre-releases follow the same
-shape from their own installation guides:
+The steps below retain the 1.2.1 ARM64 baseline recipe:
 
 1. Create the environment:
 
@@ -319,6 +320,37 @@ shape from their own installation guides:
    ```
 
    The extra index supplies its NVIDIA dependencies (`tensorrt`, `nvidia-*`).
+
+   For the x86_64 pip-MPI recipe, first install
+   `openmpi==4.1.8 mpi4py==4.1.2` with this environment's pip. Use the
+   [NVIDIA index](https://pypi.nvidia.com/tensorrt-llm/) wheel matching
+   Python and architecture; the 1.2.1 cp312 x86_64 wheel has SHA-256
+   `21e38958649b8d1cfd63c7f8b0fb55f695066f206c521c32dcad563cce54797b`.
+
+   ```bash
+   ~/tensorrt-llm-1.2.1-venv/bin/python -m pip install \
+     openmpi==4.1.8 mpi4py==4.1.2
+   ```
+
+   For **1.4.0rc3 on x86_64**, create a separate environment, install
+   torch `2.14.0` from `https://download.pytorch.org/whl/cu132`, and pin
+   `torch==2.14.0+cu132` in its constraints file. Install
+   `openmpi==4.1.8 mpi4py==4.1.2`, then use:
+
+   ```bash
+   ~/tensorrt-llm-1.4.0rc3-venv/bin/python -m pip install \
+     openmpi==4.1.8 mpi4py==4.1.2
+   ~/tensorrt-llm-1.4.0rc3-venv/bin/pip install -c constraints.txt \
+     --extra-index-url https://pypi.nvidia.com/ \
+     "https://pypi.nvidia.com/tensorrt-llm/tensorrt_llm-1.4.0rc3-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=9f6e685bf5c60c17b0d15aba90272e6bc6484d2cec55155b05bde946d3e97fbd"
+   ```
+
+   Inspection of mpi4py 4.1.2 shows it searches `<venv>/lib` explicitly;
+   Open MPI 4.1.8 installs `libmpi.so.40` there with
+   `$ORIGIN:$ORIGIN/openmpi` RUNPATH. No `LD_LIBRARY_PATH` is needed for
+   this wheel pair, and CapyCTL still strips inherited `LD_*` variables.
+   Confirm the loaded MPI identity and isolated-singleton behavior in the
+   live rows; wheel inspection and CPU tests are not qualification.
 
 4. Check it without importing it (an import starts MPI and CUDA):
 

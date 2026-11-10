@@ -97,16 +97,20 @@ const YAML_1_3_AND_1_4: &str = "dtype: \"auto\"\n\
     return_perf_metrics: false\n";
 
 // T49 T14 (ADR 0038 §3, §2a): a minimal deployment's command and file, byte
-// for byte, on each qualified line (1.2.1, the 1.3 pre-release and 1.4.0rc1).
+// for byte, on each audited line (1.2.1, the 1.3 pre-release and 1.4.0rc3).
 #[test]
 fn the_command_and_the_file_per_line() {
     for (version, yaml) in [
         ("1.2.1", YAML_1_2),
         ("1.3.0rc29", YAML_1_3_AND_1_4),
-        ("1.4.0rc1", YAML_1_3_AND_1_4),
+        ("1.4.0rc3", YAML_1_3_AND_1_4),
     ] {
         let rendered = render_command(&plan(version)).unwrap();
-        assert_eq!(rendered.argv, strings(COMMAND), "{version}");
+        let mut expected = strings(COMMAND);
+        if version != "1.2.1" {
+            expected.extend(strings(&["--num_serve_frontends", "1"]));
+        }
+        assert_eq!(rendered.argv, expected, "{version}");
         assert_eq!(
             rendered.env,
             BTreeMap::from([("TMPDIR".to_owned(), format!("{LAUNCH_DIR}/tmp"))]),
@@ -237,7 +241,7 @@ fn every_reserved_option_alias_and_spelling_is_refused() {
 #[test]
 fn the_recheck_refuses_a_reserved_option_in_the_final_vector() {
     let command = strings(COMMAND);
-    recheck_rendered(&command).unwrap();
+    recheck_rendered(&command, "1.2.1").unwrap();
     for (tail, refused) in [
         (&["--cp_size", "2"][..], "--cp-size"),
         (&["--tp_size", "2"], "--tp-size"),
@@ -253,7 +257,7 @@ fn the_recheck_refuses_a_reserved_option_in_the_final_vector() {
         let mut argv = command.clone();
         argv.extend(strings(tail));
         assert_eq!(
-            recheck_rendered(&argv),
+            recheck_rendered(&argv, "1.2.1"),
             Err(TensorrtLlmArgsError::RenderedReserved(refused.into())),
             "{tail:?}"
         );
@@ -261,7 +265,7 @@ fn the_recheck_refuses_a_reserved_option_in_the_final_vector() {
     let mut exposed = command.clone();
     exposed[4] = "0.0.0.0".into();
     assert_eq!(
-        recheck_rendered(&exposed),
+        recheck_rendered(&exposed, "1.2.1"),
         Err(TensorrtLlmArgsError::RenderedReserved("--host".into()))
     );
     let without: Vec<String> = command
@@ -270,15 +274,38 @@ fn the_recheck_refuses_a_reserved_option_in_the_final_vector() {
         .cloned()
         .collect();
     assert_eq!(
-        recheck_rendered(&without),
+        recheck_rendered(&without, "1.2.1"),
         Err(TensorrtLlmArgsError::RenderedReserved("--config".into()))
     );
     let mut no_serve = command.clone();
     no_serve.remove(1);
     assert_eq!(
-        recheck_rendered(&no_serve),
+        recheck_rendered(&no_serve, "1.2.1"),
         Err(TensorrtLlmArgsError::RenderedReserved("serve".into()))
     );
+}
+
+// T49 T14: ADR 0038 §3 pins one frontend only on lines exposing the option.
+#[test]
+fn frontend_count_is_owned_and_rechecked_per_line() {
+    for version in ["1.3.0rc29", "1.4.0rc3"] {
+        let command = render_command(&plan(version)).unwrap().argv;
+        recheck_rendered(&command, version).unwrap();
+        let at = command
+            .iter()
+            .position(|arg| arg == "--num_serve_frontends")
+            .unwrap();
+        let mut missing = command.clone();
+        missing.drain(at..at + 2);
+        assert!(recheck_rendered(&missing, version).is_err());
+        let mut multiple = command.clone();
+        multiple[at + 1] = "8".into();
+        assert!(recheck_rendered(&multiple, version).is_err());
+        let mut duplicate = command.clone();
+        duplicate.extend(strings(&["--num_serve_frontends", "1"]));
+        assert!(recheck_rendered(&duplicate, version).is_err());
+        assert!(recheck_rendered(&command, "1.2.1").is_err());
+    }
 }
 
 /// ADR 0038 §4: Qwen3-4B's `config.json`.
