@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""CPU helper tests only; these never qualify a native engine."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+
+import v020
+from session import begin, identity, matches
+
+
+class HelperTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.catalog = [dict(id='A', priority=1, budget=10, criteria='criterion A'),
+                        dict(id='B', priority=2, budget=20, criteria='criterion B')]
+
+    def test_missing_selected_row_fails(self):
+        result = v020.aggregate(self.catalog, [], {'A'})
+        self.assertFalse(result['selected_pass'])
+        self.assertEqual(result['rows'][0]['verdict'], 'fail')
+        self.assertEqual(result['rows'][1]['reason'], 'not selected')
+
+    def test_subset_is_not_full_qualification(self):
+        result = v020.aggregate(self.catalog, [dict(id='A', verdict='pass', reason='observed')], {'A'})
+        self.assertTrue(result['selected_pass'])
+        self.assertFalse(result['qualified'])
+
+    def test_prior_failure_cannot_be_overwritten(self):
+        result = v020.aggregate(self.catalog, [dict(id='A', verdict='fail', reason='first'),
+                                dict(id='A', verdict='pass', reason='later')], {'A'})
+        self.assertEqual(result['rows'][0]['verdict'], 'fail')
+
+    def test_skip_is_not_pass(self):
+        result = v020.aggregate(self.catalog, [dict(id='A', verdict='skip', reason='unsupported')], {'A'})
+        self.assertFalse(result['selected_pass'])
+
+    def test_invalid_verdict_fails(self):
+        result = v020.aggregate(self.catalog, [dict(id='A', verdict='unknown', reason='bad')], {'A'})
+        self.assertEqual(result['rows'][0]['verdict'], 'fail')
+
+    def test_selection_is_case_insensitive_and_priority_ordered(self):
+        self.assertEqual([row['id'] for row in v020.select_rows('b,a', self.catalog)], ['A', 'B'])
+        self.assertEqual(v020.select_rows('ALL', self.catalog), self.catalog)
+
+    def test_unknown_selection_rejected(self):
+        with self.assertRaises(ValueError):
+            v020.select_rows('A,C', self.catalog)
+
+    def test_deadline_respects_row_and_session(self):
+        self.assertEqual(v020.row_deadline(100, 500, 10), 110)
+        self.assertEqual(v020.row_deadline(100, 105, 10), 105)
+        with self.assertRaises(ValueError):
+            v020.row_deadline(100, 105, 0)
+
+    def test_functional_measurement_skip(self):
+        self.assertEqual(v020.skip_reason(dict(measurement=True), True), 'measurement not allowed on this host')
+        self.assertIsNone(v020.skip_reason({}, True))
+
+    def test_discrete_skip_precedes_measurement(self):
+        self.assertEqual(v020.skip_reason(dict(measurement=True, discrete=True), True, True), 'needs a discrete GPU')
+        self.assertEqual(v020.skip_reason(dict(unified=True)), 'needs unified memory')
+
+    def test_manifest_hashes_bytes_and_excludes_itself(self):
+        (self.root / 'evidence').mkdir()
+        (self.root / 'evidence/a.json').write_bytes(b'{"ok": true}\n')
+        entries = v020.manifest(self.root)
+        expected = hashlib.sha256(b'{"ok": true}\n').hexdigest() + '  evidence/a.json'
+        self.assertEqual(entries, [expected])
+        self.assertEqual(v020.manifest(self.root), entries)
+
+    def test_manifest_does_not_follow_symlinks(self):
+        (self.root / 'link').symlink_to('/etc/passwd')
+        self.assertEqual(v020.manifest(self.root), [])
+
+    def test_manifest_changes_when_evidence_changes(self):
+        path = self.root / 'evidence.json'
+        path.write_text('one')
+        first = v020.manifest(self.root)
+        path.write_text('two')
+        self.assertNotEqual(first, v020.manifest(self.root))
+
+    def test_atomic_json_is_whole(self):
+        path = self.root / 'result.json'
+        v020.atomic_json(path, {'verdict': 'pass'})
+        self.assertEqual(json.loads(path.read_text()), {'verdict': 'pass'})
+        self.assertFalse(path.with_suffix('.json.partial').exists())
+
+    def test_standalone_credentials_use_equals(self):
+        path = self.root / 'credentials'
+        path.write_text('api_key=private-key\nadmin_token=private-token\n')
+        self.assertEqual(v020.credentials(path)['api_key'], 'private-key')
+
+    def test_server_credentials_use_json(self):
+        path = self.root / 'server-credentials.json'
+        path.write_text(json.dumps(dict(api_key='private-key', admin_token='private-token')))
+        self.assertEqual(v020.credentials(path)['admin_token'], 'private-token')
+
+    def test_missing_credential_rejected(self):
+        path = self.root / 'credentials'
+        path.write_text('api_key=key\n')
+        with self.assertRaises(ValueError):
+            v020.credentials(path)
+
+    def test_engine_env_is_parsed_not_executed(self):
+        path = self.root / 'engines.env'
+        path.write_text('VLLM_033=~/vllm-0.33.0-venv\nTENSORRT_LLM=\nMODEL_CHAT="/home/me/models/chat model"\n')
+        data = v020.load_env(path)
+        self.assertEqual(data['TENSORRT_LLM'], '')
+        self.assertEqual(data['MODEL_CHAT'], '/home/me/models/chat model')
+        path.write_text('VLLM_033=$(touch /tmp/unsafe)\n')
+        with self.assertRaises(ValueError):
+            v020.load_env(path)
+
+    def test_process_identity_guards_against_pid_reuse(self):
+        record = identity(os.getpid())
+        self.assertTrue(matches(record))
+        self.assertFalse(matches(dict(record, start_ticks=record['start_ticks'] + 1)))
+
+    def test_catalog_contains_all_required_rows(self):
+        catalog = v020.rows()
+        ids = [row['id'] for row in catalog]
+        self.assertEqual(len(ids), len(set(ids)))
+        for expected in ['ISSUE225', 'ISSUE235', 'ISSUE236', 'ISSUE240',
+                         *('LC' + str(i) for i in range(12, 19)),
+                         *('EM' + str(i) for i in range(1, 10)),
+                         *('OT' + str(i) for i in range(1, 12)),
+                         *('TF' + str(i) for i in range(1, 15)),
+                         *('TR' + str(i) for i in range(1, 12))]:
+            self.assertIn(expected, ids)
+        for row in catalog:
+            self.assertGreater(row['budget'], 0)
+            self.assertTrue(row['criteria'])
+        self.assertEqual([row['priority'] for row in catalog], sorted(row['priority'] for row in catalog))
+
+    def test_resume_archives_previous_role_state_and_results(self):
+        (self.root / 'completion.json').write_text('{}')
+        (self.root / 'state').mkdir()
+        (self.root / 'evidence').mkdir()
+        (self.root / 'evidence/result-EM1.json').write_text('{}')
+        (self.root / 'evidence/vllm.freeze.txt').write_text('vllm==0.33.0\n')
+        begin(self.root)
+        self.assertFalse((self.root / 'state').exists())
+        self.assertFalse((self.root / 'evidence/result-EM1.json').exists())
+        self.assertTrue((self.root / 'evidence/vllm.freeze.txt').exists())
+        archived = list((self.root / 'attempts').iterdir())
+        self.assertEqual(len(archived), 1)
+        self.assertTrue((archived[0] / 'evidence/result-EM1.json').exists())
+
+
+if __name__ == '__main__':
+    unittest.main()
