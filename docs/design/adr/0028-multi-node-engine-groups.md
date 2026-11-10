@@ -820,3 +820,281 @@ Owner decisions 2026-10-25 ([ADR 0035](0035-multi-gpu-one-host.md)).
   `groups.stall_timeout`; its failure is `tp_stalled`.
 - **Amendment of 2026-10-07.** The per-rank share (`ceil(sharded / T) + replicated`) sizes each
   GPU of a one-host instance with `T = N`, `P = 1`.
+
+## Proposed amendment 2026-11-09 — private-link ingress and group socket interfaces
+
+**Status: Proposed, for owner review.** The owner authorized starting this design
+on 2026-11-09, not its implementation or the decisions below.
+**Related:** [issue #178](https://github.com/edurdias/capyctl/issues/178).
+**Would amend on acceptance and implementation:** decisions 3 and 4, §§3, 7, 10,
+13 and 14 above; SPEC §15 and T03, T21, T30, T34 and T37; the exposure wording in
+[ADR 0012's amendment](0012-deep-park-default-on.md#amendment-2026-10-05--peer-exposure-of-engine-groups-adr-0028).
+The accepted text above remains the current contract until then. This amendment
+does not change [ADR 0019](0019-discrete-gpu-and-network-endpoint.md)'s public
+inference listener or [ADR 0035](0035-multi-gpu-one-host.md)'s single-host loopback
+collectives.
+
+### A1. Problem and evidence
+
+Two GB10 hosts joined by a cable should not need a tailnet merely to serve one
+group. A private cable address such as `10.42.0.2` is currently refused for host
+ingress, even with `transport: trusted_private_link`. Meanwhile NCCL can select a
+different interface from the one carrying the member's `peer_address`.
+
+The current implementation has three relevant boundaries:
+
+- `crates/capyctl-config/src/remote_roles.rs`, `private_ingress_endpoint` and
+  `HostConfig::parse`, accept numeric HTTP endpoints only on loopback or
+  `100.64.0.0/10`, require a nonzero port and require `ingress.bind` to equal the
+  advertised endpoint. `crates/capyctl-store/src/host_publication.rs` repeats the
+  endpoint check both when freezing a binding and when reading its destination.
+  Changing only the host parser would therefore leave the feature unusable.
+- `crates/capyctl-agent/src/host_checks.rs` resolves a peer IP through
+  `getifaddrs`. `native_execution.rs::group_args` uses it for vLLM and SGLang,
+  but skips TensorFold. The resolver currently takes the first matching interface.
+  Adapters render the head's peer IP for rendezvous and the member's own IP for
+  vLLM/SGLang broadcast traffic. An advertised rendezvous IP is not a bind
+  restriction on torch's wildcard TCP store.
+- `crates/capyctl-adapters/src/group.rs`, the vLLM/SGLang initializers,
+  TensorFold's argument renderer and `runtime/loopback_rendezvous.py` implement
+  decision 4: groups strip NCCL settings; vLLM and SGLang retain only the rendered
+  `GLOO_SOCKET_IFNAME`. The Python group guard also rejects NCCL settings, so
+  changing the Rust environment alone would not work.
+
+The runbook entries “Group listeners documented” (2026-10-08), “Multi-node live
+rows MN1-MN8” (2026-10-15), and “Group parks and wakes commit only fresh member
+reports” (2026-10-16) establish existing two-host bring-up, RDMA use, failure
+cleanup and deep park/wake evidence. They do not establish acceptance of RFC 1918
+ingress or enforcement of an NCCL interface pin. Their timings are not a baseline
+for this proposal.
+
+### A2. Options considered
+
+| Option | What it buys | Why propose or reject it |
+|---|---|---|
+| Fixed private-address allowlist, plus the existing explicit trust declaration | Accepts ordinary cable addresses without another copy of the network configuration | **Proposed.** Small, auditable rule; the declaration acknowledges trust, not proof of isolation. |
+| Require an operator-declared link CIDR, such as `ingress.link_cidr` | Detects an endpoint outside the operator's stated subnet | Not proposed. A CIDR neither authenticates peers nor proves that a private subnet is a cable; it duplicates interface configuration. If chosen instead, constrain the entire CIDR to the private allowlist and reject public endpoints even inside a declared CIDR. |
+| Require an operator-declared interface; bind sockets to the device | Expresses a device rather than an address and can narrow some traffic | Not proposed as the ingress contract. Interface names differ by host, address discovery still matters, and device binding requires privileges or engine support CapyCTL does not currently have. An exact NCCL interface selector is useful, but it is not `SO_BINDTODEVICE` or a firewall. |
+| Re-address the cable inside `100.64.0.0/10`, or keep a tailnet for ingress | Avoids the current ingress rejection | Reject as the required workflow: can conflict with an existing overlay and does not fix NCCL selection. |
+
+### A3. Proposed ingress rule and host document
+
+Keep the existing host fields; add no CIDR, interface or general-purpose NCCL
+environment escape hatch. This is a partial host document, not a runnable file:
+
+```yaml
+name: host-b
+ingress:
+  transport: trusted_private_link
+  address: "http://10.42.0.2:8444"
+  bind: "10.42.0.2:8444"
+resource_policy:
+  groups:
+    peer_address: "10.42.0.2"
+    rendezvous_port_range: {start: 25000, end: 25099}
+    require_rdma: false
+```
+
+With `transport: trusted_private_link`, accept a numeric unicast endpoint inside
+exactly these ranges: RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), IPv4 link-local
+(`169.254/16`), IPv6 ULA (`fc00::/7`), existing shared address space
+(`100.64/10`), and loopback (`127/8`, `::1`). Retain exact address/bind equality
+and a nonzero port. IPv6 HTTP URLs use brackets, for example
+`http://[fd42::2]:8444`. Canonicalize IPv4-mapped IPv6 before classification so
+it cannot bypass the IPv4 rule.
+
+Refuse public/global addresses, wildcard and multicast binds, IPv4 limited
+broadcast, DNS names, URL credentials, paths, queries and fragments. Reject
+subnet broadcast/network addresses when the host's actual interface prefix makes
+them non-unicast; `/31` point-to-point endpoints are usable unicast. IPv6
+link-local with scope IDs is not added: it needs a separate scoped-address
+contract across the server and hosts. The broad private ranges do not mean every
+reserved address within them is a usable interface address.
+
+The declaration is required even for a private address; no address is
+automatically “protected.” No generated document is widened and no running
+binding's destination changes. Ordinary document overrides keep their existing
+precedence and undergo the same validation.
+
+### A4. Proposed group rendering
+
+For every newly planned group, resolve each member's peer address to exactly one
+local interface, for TensorFold as well as vLLM and SGLang. Refuse a missing or
+ambiguous match rather than guessing from the default route or hostname. Recheck
+at Prepare and immediately before Launch; a changed interface requires a new
+plan, not silent rerouting.
+
+Render on every rank:
+
+- `NCCL_SOCKET_IFNAME` with the value `=<interface>`: the leading `=` requests an
+  exact match, so `link0` cannot also select `link01`.
+- `NCCL_SOCKET_FAMILY=AF_INET` or `AF_INET6`, matching the plan's peer-address
+  family, to avoid selecting the other family on a dual-stack interface.
+- `GLOO_SOCKET_IFNAME=<interface>` for vLLM and SGLang, as today. TensorFold
+  drives NCCL directly and needs no new Gloo setting.
+
+Keep the rendezvous destination at the head's peer address and all existing own-IP
+renderings. Validate one address family across the group, and render bracketed
+IPv6 host/port syntax wherever an engine expects a combined endpoint. Do not
+apply these rules to ADR 0035's one-host multi-GPU instances: their loopback pin
+is unchanged.
+
+The [NCCL environment contract](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-socket-ifname)
+documents exact interface selection and `NCCL_SOCKET_FAMILY`. It does not promise
+selection of one particular IP when several same-family IPs share that interface.
+Live evidence must therefore record the selected IP, not infer it from the env.
+
+CapyCTL continues owning all `NCCL_*` and `GLOO_*` names. Only the two rendered
+NCCL names survive group environment filtering and the Python entry guards;
+configured or inherited overrides stay refused or stripped as appropriate.
+Expected values participate in the protected launch contract and its fingerprint.
+Host-local interface names may differ between ranks.
+
+**RDMA is a separate decision.** `NCCL_SOCKET_IFNAME` selects bootstrap/socket
+interfaces, not RDMA HCAs, ports or GIDs. This proposal leaves NCCL's RDMA choice
+unchanged, including `require_rdma`'s existing tuning checks. It does not render
+`NCCL_IB_HCA`, force TCP, or claim that all collective payload traffic is confined
+to the cable. The owner must accept that bounded scope or require a larger
+transport policy before implementation: exact, validated HCA/port/GID selection
+for the link, or an explicit socket-only mode. Neither is silently substituted.
+
+### A5. Trust model and status
+
+`trusted_private_link` means the operator trusts the network carrying cleartext
+ingress. It does not add encryption, authentication of the cable, source-CIDR
+filtering or proof that the address is unreachable from another network.
+Routing, bridging or a VPN can make even a private destination reachable elsewhere.
+Binding an IP restricts the local destination, not necessarily the incoming device.
+
+Any machine able to route to host ingress can connect to its TCP listener.
+Existing per-binding ingress credentials, inference route/method allowlists and
+gate lifecycle still decide whether requests are accepted; no engine admin key or
+control route is exposed. A party observing the trusted cleartext path may observe
+requests and credentials. Server bootstrap/control TLS is unchanged; this is not
+ADR 0019's public inference listener and grants no permission for public ingress.
+
+Any party able to reach unauthenticated peer listeners is still inside the engine
+trust boundary. Compromising the other cable endpoint, a bridge or a routed peer
+can permit code execution as the engine user through pickled objects, theft of
+per-launch keys, or denial of service. A private range or NCCL pin is not peer
+authentication. Torch's wildcard rendezvous store and any other engine listener
+not constrained by its own address setting remain exposed on other interfaces.
+The operator's isolation/firewall responsibility in §13 stands. CapyCTL does not
+change or certify firewall rules, routes, interfaces or RDMA isolation.
+
+Status must retain `peer transport: unauthenticated`. Show the planned peer IP,
+resolved interface, NCCL socket family and that RDMA selection is automatic;
+do not replace the peer warning with “secure” or “all ports bound to the link.”
+Update the guide's per-listener table precisely: NCCL socket selection narrows,
+the torch store still binds wildcard, and RDMA remains separate.
+
+`validate config --host` can compare declared ingress and peer IPs, but cannot
+discover a remote host's interfaces. It warns `ingress_peer_address_differs` when
+both non-loopback addresses differ, without claiming they are on different NICs.
+The host reports `ingress_peer_interface_mismatch` only after a local comparison
+proves different interfaces. This is a warning, not a refusal: separate protected
+ingress and collective networks remain legitimate. Offline validation explicitly
+reports that interface locality and reachability are unverified.
+
+### A6. Validation, refusal codes and accounting
+
+The following table distinguishes existing codes from proposed additions:
+
+| Check | Result and stage |
+|---|---|
+| Endpoint outside the allowlist, malformed URL, missing transport declaration, unequal bind, zero port | Existing `invalid_config`, exit 2, at the precise `ingress` field; schema validation before side effects. Unknown fields retain the existing unknown-field refusal. |
+| Ingress IP absent locally or not usable unicast under the local prefix | New `ingress_address_not_local`, exit 2, at host start before opening ingress. Diagnostic distinguishes absent from non-unicast. |
+| Peer absent locally or differs from the host's declared peer | Existing `peer_address_not_local`, Prepare/Launch refusal. |
+| Peer IP assigned to more than one distinct interface, or interface changed since Prepare | New `group_peer_interface_ambiguous` or `group_peer_interface_changed`, Prepare/Launch refusal naming the host and peer IP. |
+| Mixed group peer-address families | New `group_peer_address_family_mismatch`, exit 2 at group validation, before reservation. |
+| Required new networking behavior unsupported by server/host | `host_capability_missing:private_link_networking`, before sending Prepare/Launch; normal ADR 0017 version-skew refusal takes precedence. |
+| Rendered address, interface or socket family differs at protected entry | Existing `group_drift:<field>` launch refusal. No fallback to an unpinned launch. |
+
+Apply the endpoint rule consistently in configuration, host publication, binding
+freeze and destination readback; do not weaken destination allowlists or let a
+mutable discovery record redirect a frozen binding. Missing interface data is a
+refusal, not “pick the first interface.” A failed preflight starts no member.
+A failure after fan-out uses §11: stop every launched member, retain each charge
+until its own gone-evidence, and never release merely because networking failed.
+
+### A7. Version skew, wire contract and rollout
+
+Add one ADR 0017 capability, `private_link_networking`, covering expanded private
+ingress validation and the new group socket contract. A new server requires it
+on every member for a newly created pinned group; an older host is never sent a
+plan it could execute without the pin. Ordinary version compatibility and
+drain-only rules remain in force.
+
+Use additive wire fields on new numbers for the group's networking-contract
+version and per-member resolved socket-interface evidence. The agent publishes
+the interface with its peer inventory; the server freezes it with the plan and
+the host revalidates it at Prepare and Launch. The negotiated launch contract,
+not merely the host's current binary, determines rendering. Publish expanded
+ingress only after the server negotiated the capability; an older server must
+not discover an endpoint it cannot validate. No protocol or command-encoding
+version bump is proposed.
+
+Existing frozen revisions, binding destinations and running processes retain
+their recorded contract. Recover/stop can handle a legacy unpinned plan without
+claiming the pin; never reinterpret or silently relaunch it as pinned. Moving to
+the new group contract requires an explicit revision update and a new generation.
+Omitted new fields retain legacy fingerprint/encoding bytes. The implementation
+must cover both store ingress checks, config publication, capability requirements,
+durable plans, environment fingerprints and runtime guards in one cutover.
+
+### A8. Tests and live qualification required
+
+Add tests under existing acceptance IDs rather than allocating a new T-ID:
+
+| ID | Required evidence |
+|---|---|
+| T03, T37 | Table-test every allowed range at its boundaries and adjacent disallowed addresses; loopback/CGNAT regression; ULA and mapped IPv6; public, wildcard, multicast, broadcast, scoped IPv6, DNS, URL components, port zero and unequal bind refusals. Cover host parsing and both store ingress call sites. |
+| T03, T30 | Inject no match, one match, duplicate interface entries, two distinct matching interfaces, non-unicast endpoints, an interface change between Prepare and Launch, and mixed address families. Refuse before spawn; repeated entries for one device are not ambiguity. Cover both warnings and honest offline validation. |
+| T21, T22, T30, T41 | Head and worker rendering for all three engines; exact `=link0` rather than prefix selection; address-family rendering; IPv6 rendezvous formatting; inherited/configured NCCL variables cannot override; Python guards retain only expected values and refuse drift; TensorFold now resolves an interface. |
+| T21, T37, T46 | Ingress still denies controls and unapproved destinations; engine API/controls remain loopback-only and keyed; single-host and local multi-GPU loopback contracts remain unchanged. |
+| T30, T31, T32 | A member's failed networking preflight or post-spawn failure opens no early route; partial launches stop; unreachable members stay charged until evidence permits settlement. |
+| T34, T39 | New server/old host, old server/new host, missing capability, drain-only host, frozen legacy plan read/stop/recovery and explicit contract update; no silent pin drop, destination rewrite or fingerprint reinterpretation. |
+
+After implementation and owner approval, add a direct-link variant of MN1–MN4
+on **two GB10 hosts with a cable**, using approved, recorded engine builds:
+
+1. Use a privately addressed cable, initially RFC 1918, with other host networks
+   still present. Put host ingress and peer IPs on the cable; the server must
+   have a route to ingress over that protected link. Do not require a tailnet.
+2. For vLLM, SGLang and TensorFold, reach READY and complete 20/20 requests
+   through the router. On both hosts record only the selected network variables,
+   owned TCP sockets and actual connection addresses; never dump an entire process
+   environment or keys. Check exact interface selection with similarly prefixed
+   interface names using fixtures, not by changing a lab interface.
+3. Record NCCL's actual bootstrap/socket interface and chosen transport. If RDMA
+   is active, identify its HCAs/ports from bounded read-only evidence; do not
+   label the payload “cable-confined” without that evidence. Exercise ULA
+   end-to-end before claiming native IPv6 qualification; parser tests alone
+   establish only config acceptance.
+4. Preserve the existing deep park/wake and stop behavior (vLLM/SGLang), and
+   restart-only behavior (TensorFold). Verify no owned listeners/processes remain
+   after cleanup. Failure injection, if needed, signals only recorded
+   CapyCTL-owned processes; missing-interface cases use deterministic fixtures,
+   never interface/firewall changes on the hosts.
+
+Acquire the normal per-host live-session marker, private state/prefix and
+non-default ports; stop every deployment and role started and remove the marker
+after cleanup. Do not touch unrelated training. While training is running, this
+is functional evidence only: record no timing or memory measurements. A later
+performance comparison requires an uncontended session. CPU and Fake-engine
+tests are not qualification. No live check was run for this proposed amendment.
+
+### A9. Decisions requested from the owner
+
+1. Accept the fixed private-unicast allowlist with the existing
+   `trusted_private_link` declaration, rather than require a new link CIDR?
+2. Accept exact, derived NCCL socket-interface and address-family pins for every
+   new group, including TensorFold, with no operator-settable NCCL variables?
+3. Accept socket/bootstrap pinning with RDMA selection unchanged, or require
+   validated HCA/port/GID selection or explicit socket-only operation before
+   implementation? The narrower proposal is not a claim that all traffic stays
+   on the cable.
+4. Retain §13's operator-managed isolation and known wildcard-listener risk, with
+   ingress/peer mismatch warnings rather than forced same-interface ingress?
+5. Accept capability-gated, explicit-revision rollout and the two-GB10 functional
+   qualification above before any new native-engine support claim?
