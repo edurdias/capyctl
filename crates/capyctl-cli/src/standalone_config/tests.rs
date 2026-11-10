@@ -2215,20 +2215,16 @@ fn the_standalone_installation_follows_flag_env_document_default() {
     }
 }
 
-// T26 (final review I3): found live on the discrete-GPU laptop host, vLLM
-// 0.29 held 13.2 GiB of the 16 GB card against a 12.0 GiB reservation (the
-// CUDA context and graphs sit outside the request). The device domain is now
-// charged the request plus that overhead, so the planner's figure and what
-// the launch check sees on the card agree; before, the ledger under-charged
-// the card by about 1.2 GiB.
+// T26 T11 (ADR 0019 §3–4, issue #225): removing the derived request's 75%
+// floor does not remove the separate CUDA-context charge. Historical held-byte
+// measurements from the old floored launch are not evidence for this smaller
+// launch; live confirmation on vLLM 0.32.0 and 0.33.0 remains pending.
 #[test]
-fn a_discrete_charge_covers_what_vllm_holds_on_the_card() {
-    const MEASURED_HELD: i64 = 13_516 << 20; // 13.2 GiB
+fn a_discrete_charge_adds_vllm_context_to_its_no_floor_request() {
     let gpu = rtx(0, 16376, 1536).memory.unwrap();
     let limits = device_limits(&gpu, MAX_PARKED);
     let weights = 8_040_000_000;
     let (request, _) = device_request(weights, limits.managed_limit);
-    assert!(request < MEASURED_HELD, "the request alone under-charges");
     let doc = deployment_document(
         "a",
         "a",
@@ -2253,7 +2249,10 @@ fn a_discrete_charge_covers_what_vllm_holds_on_the_card() {
         capyctl_config::effective::resolve_effective_with_checkpoint(&chosen, &host, facts)
             .unwrap();
     let (_, charged) = effective.ready_device_allocation().unwrap();
-    assert!(charged >= MEASURED_HELD, "{charged} < {MEASURED_HELD}");
+    assert_eq!(
+        charged,
+        request + capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES
+    );
     assert!(charged <= limits.managed_limit);
     // vLLM is still told the request, not the charge: the overhead is what it
     // holds beyond the fraction capyctl renders.
