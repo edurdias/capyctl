@@ -89,6 +89,9 @@ the detected GPU architecture (`80-real` on the A100), disables dev/Connect/UI/
 prebuilt UI, and builds `llama-server` with `nproc` jobs using the detected toolkit.
 CUDA-toolkit wheels supply nvcc when the image does not. The TensorRT forced-PTX
 preflight likewise targets the detected GPU rather than a fixed architecture.
+The private toolkit includes the sparse/solver headers needed by torch extension
+builds; nvcc uses the preflight's existing C++ compiler. Concurrent uv installers
+share downloads with a 30-minute cache-lock timeout rather than failing at five.
 
 Models are downloaded with `hf` concurrently with installs. Supplied revision
 pins are resolved to full commits; plan entries without revisions resolve once

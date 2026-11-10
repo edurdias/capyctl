@@ -248,6 +248,29 @@ v020_trt_driver_probe TEST
                 self.assertIn(
                     f'arch=compute_{architecture},code=compute_{architecture}', output)
 
+    def test_cuda_setup_binds_the_available_cpp_host_compiler(self):
+        import shutil
+        import subprocess
+        toolkit = self.root / 'toolkit'
+        (toolkit / 'bin').mkdir(parents=True)
+        compiler = toolkit / 'bin/nvcc'
+        compiler.touch()
+        compiler.chmod(0o700)
+        script = '''
+source "$1"
+declare -A V020_OVERRIDES=([CUDA_HOME]=1)
+CUDA_HOME=$2
+EVIDENCE=$3
+v020_cmd() { :; }
+v020_setup_cuda
+printf '%s\\n' "${NVCC_CCBIN:-unset}"
+'''
+        result = subprocess.run(
+            ['bash', '-c', script, 'cuda', str(Path(__file__).with_name('setup.sh')),
+             str(toolkit), str(self.root)],
+            check=True, capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), shutil.which('c++'))
+
 
 if __name__ == '__main__':
     unittest.main()

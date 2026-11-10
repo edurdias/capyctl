@@ -187,6 +187,9 @@ v020_setup_tools() {
   export UV_CACHE_DIR=$V020/cache/uv UV_PYTHON_INSTALL_DIR=$V020/data/python
   export UV_PYTHON_CACHE_DIR=$V020/cache/python UV_TOOL_DIR=$V020/data/uv-tools
   export UV_TOOL_BIN_DIR=$BIN UV_NO_MODIFY_PATH=1 UV_PYTHON_PREFERENCE=only-managed
+  # Large concurrent CUDA-wheel downloads can hold one cache lock beyond uv's
+  # five-minute default; wait for the shared download instead of failing a peer.
+  export UV_LOCK_TIMEOUT=1800
   export XDG_CACHE_HOME=$V020/cache XDG_DATA_HOME=$V020/data XDG_CONFIG_HOME=$V020/config
   export HF_HOME=$V020/cache/huggingface HUGGINGFACE_HUB_CACHE=$V020/cache/huggingface/hub
   export HF_HUB_DISABLE_TELEMETRY=1 HF_HUB_DISABLE_PROGRESS_BARS=1
@@ -221,7 +224,7 @@ v020_setup_cuda() {
   else
     v020_venv "$V020/cuda-venv"
     v020_cmd "$BIN/uv" pip install --python "$V020/cuda-venv/bin/python" \
-      'cuda-toolkit[nvcc,cccl,cudart,cublas,curand]==13.0.*'
+      'cuda-toolkit[nvcc,cccl,cudart,cublas,curand,cusparse,cusolver]==13.0.*'
     toolkit=$("$V020/tools/bin/python" - "$V020/cuda-venv" <<'PY'
 import pathlib,sys
 paths=sorted(pathlib.Path(sys.argv[1]).rglob("bin/nvcc"))
@@ -232,16 +235,20 @@ PY
 )
     # Only the session's wheel toolkit may be modified.
     case "$toolkit" in "$V020/cuda-venv/"*) ;; *) v020_setup_error 'CUDA wheel escaped session'; return 1 ;; esac
-    for library in libcudart libcublas libcublasLt libcurand; do
-      if [ ! -e "$toolkit/lib/$library.so" ] && [ -e "$toolkit/lib/$library.so.13" ]; then
-        ln -s "$library.so.13" "$toolkit/lib/$library.so"
-      fi
+    for library in "$toolkit"/lib/*.so.*; do
+      [ -f "$library" ] || continue
+      nvcc=${library%%.so.*}.so
+      [ -e "$nvcc" ] || ln -s "$(basename "$library")" "$nvcc"
     done
     [ -e "$toolkit/lib64" ] || ln -s lib "$toolkit/lib64"
     v020_freeze "$V020/cuda-venv" cuda
   fi
   [ -x "$toolkit/bin/nvcc" ] || { v020_setup_error 'CUDA compiler missing'; return 1; }
   export CUDA_HOME=$toolkit CUDACXX=$toolkit/bin/nvcc
+  # nvcc otherwise selects gcc, which may lack its matching cc1plus even when
+  # the separately installed c++ compiler passed preflight.
+  export NVCC_CCBIN
+  NVCC_CCBIN=$(command -v c++)
   export PATH=$toolkit/bin:$PATH
   export LD_LIBRARY_PATH=$toolkit/lib64:$toolkit/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
   printf '%s\n' "$CUDA_HOME" >"$EVIDENCE/cuda-home.txt"
