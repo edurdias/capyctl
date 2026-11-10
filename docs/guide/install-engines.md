@@ -7,7 +7,7 @@ more than one, each in its own environment.
 
 | Engine | Versions this release knows | Environment used below |
 |---|---|---|
-| vLLM | 0.32.0, 0.31.0, 0.30.0, 0.29.0 | `~/venvs/vllm` |
+| vLLM | 0.33.0 (audited; `CUSTOM yes` pending live qualification), 0.32.0, 0.31.0, 0.30.0, 0.29.0 | `~/venvs/vllm` |
 | SGLang | newest known: 0.5.23 (not yet qualified); verified: 0.5.21, 0.5.20 | `~/venvs/sglang` |
 | TensorFold | 0.6.6, 0.6.5, 0.6.3, 0.6.2, 0.6.1, 0.6.0 | `~/venvs/tensorfold` |
 | llama.cpp | v0.9.0 (newest known), v0.7.0, v0.6.0 (every build lists as `CUSTOM yes` for now) | `~/llama.cpp` (a build, no environment) |
@@ -55,7 +55,7 @@ shown to get one CapyCTL knows.
    as a DGX Spark. vLLM, SGLang's kernels and PyTorch 2.13.0 publish wheels
    for both, and so does the PyTorch CUDA 13.0 index.
 
-## vLLM 0.32.0, 0.31.0, 0.30.0 or 0.29.0
+## vLLM 0.33.0, 0.32.0, 0.31.0, 0.30.0 or 0.29.0
 
 1. Create the environment:
 
@@ -64,15 +64,15 @@ shown to get one CapyCTL knows.
    ```
 
 2. Install vLLM with PyTorch built for CUDA 13.0 (for an earlier version,
-   write `vllm==0.31.0`, `vllm==0.30.0` or `vllm==0.29.0`):
+   write `vllm==0.32.0`, `vllm==0.31.0`, `vllm==0.30.0` or `vllm==0.29.0`):
 
    ```bash
-   uv pip install --python ~/venvs/vllm/bin/python vllm==0.32.0 --torch-backend=cu130
+   uv pip install --python ~/venvs/vllm/bin/python vllm==0.33.0 --torch-backend=cu130
    ```
 
-   All four releases use PyTorch 2.13.0. `--torch-backend=cu130` makes `uv` take
-   PyTorch from its CUDA 13.0 index; `--torch-backend=auto` picks the index
-   from your driver instead.
+   vLLM 0.33.0 uses PyTorch 2.14.0; the earlier releases listed here use
+   PyTorch 2.13.0. `--torch-backend=cu130` makes `uv` take PyTorch from its
+   CUDA 13.0 index; `--torch-backend=auto` picks the index from your driver.
 
 3. Check it:
 
@@ -80,11 +80,13 @@ shown to get one CapyCTL knows.
    ~/venvs/vllm/bin/vllm --version
    ```
 
-   It prints the version, for example `0.32.0`. CapyCTL runs vLLM for chat;
-   [decision models](deploy.md#decision-models) need SGLang or llama.cpp.
+   It prints the version, for example `0.33.0`. This is the newest known
+   release, audited but not yet live-qualified; it still shows `CUSTOM yes`.
+   CapyCTL runs vLLM for chat, embeddings and decision models; readiness
+   checks the endpoint for the deployment's API.
 
 vLLM's own guide:
-[GPU installation](https://docs.vllm.ai/en/v0.32.0/getting_started/installation/gpu/).
+[GPU installation](https://docs.vllm.ai/en/v0.33.0/getting_started/installation/gpu/).
 
 ## SGLang 0.5.23
 

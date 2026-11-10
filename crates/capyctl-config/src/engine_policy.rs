@@ -139,6 +139,11 @@ pub const VLLM_RESERVED_FLAGS: &[&str] = &[
     // beside HTTP (`FrontendArgs.grpc_port`, with its Rust frontend); capyctl
     // owns every listener.
     "--grpc-port",
+    // SPEC §8.2 / T21: vLLM 0.33.0's sleep backend resolves a registered
+    // module/class; its watchdog can write stack dumps to `dump_dir`.
+    // CapyCTL owns parking and disk-writing controls, including dotted JSON.
+    "--sleep-mode-backend",
+    "--watchdog-config",
     // ADR 0036 §2: CapyCTL renders `--runner pooling` on an embeddings
     // deployment and nothing on any other, so neither a chat deployment's
     // extra arguments nor an embeddings one's may choose the runner or the
@@ -1210,12 +1215,25 @@ fn candidate_names(name: &str) -> Vec<String> {
 fn reserved_option(engine: Engine, name: &str, sleep_mode: bool) -> bool {
     let reserved = reserved_options(engine, sleep_mode);
     candidate_names(name).iter().any(|candidate| {
-        reserved
+        reserved.iter().any(|protected| {
+            matches_name(candidate, protected)
+                    // ADR 0017 §2 / T21: vLLM 0.33.0's EnableDisableAction
+                    // pairs --enable-x with --disable-x. Destinations stay
+                    // unchanged, so both spellings own the same reservation.
+                    || (engine == Engine::Vllm
+                        && [("--enable-", "--disable-"), ("--disable-", "--enable-")]
+                            .iter()
+                            .any(|(prefix, inverse)| {
+                                protected
+                                    .strip_prefix(*prefix)
+                                    .zip(candidate.strip_prefix(*inverse))
+                                    .is_some_and(|(tail, given)| {
+                                        !given.is_empty() && tail.starts_with(given)
+                                    })
+                            }))
+        }) || reserved_families(engine)
             .iter()
-            .any(|protected| matches_name(candidate, protected))
-            || reserved_families(engine)
-                .iter()
-                .any(|family| candidate.starts_with(family))
+            .any(|family| candidate.starts_with(family))
     })
 }
 

@@ -156,6 +156,24 @@ def fake_parser_0320(drop=()):
     return _fake_parser(drop, nested=True, grpc_port=True)
 
 
+def fake_parser_0330(drop=()):
+    """0.33.0 adds a watchdog dump path and a pluggable sleep backend."""
+    parser = fake_parser_0320(drop)
+    serve = next(action for action in parser._actions
+                 if isinstance(action, argparse._SubParsersAction)).choices["serve"]
+    serve.add_argument("--sleep-mode-backend", default="cumem")
+    serve.add_argument("--watchdog-config", type=json.loads, default={})
+    serve.add_argument("--watchdog-config.dump_dir", dest="watchdog_config",
+                       type=lambda value: {"dump_dir": value})
+    # utils/argparse_utils.py:121-152: EnableDisableAction aliases retain
+    # the original destination, alongside the legacy --no-* spellings.
+    serve.add_argument("--disable-per-request-metrics",
+                       dest="enable_per_request_metrics", action="store_false")
+    serve.add_argument("--enable-log-stats", dest="disable_log_stats",
+                       action="store_false")
+    return parser
+
+
 RESERVED = ["serve", "/models/qwen", "--host", "127.0.0.1", "--served-model-name", "route",
             "--enable-per-request-metrics",
             "--no-enable-log-requests", "--no-enable-log-outputs",
@@ -527,6 +545,29 @@ class VersionSkewTests(unittest.TestCase):
             with self.subTest(user=user):
                 self.refused(user, fake_parser_0320())
         self.resolve(parser=fake_parser_0310())
+
+    # T14 T21 / SPEC §8.2: new code-loading and disk-writing surfaces are
+    # owned even in host-fixed arguments; old builds need neither destination.
+    def test_the_0330_parser_keeps_the_builtin_sleep_backend_and_no_dump(self):
+        args = self.resolve(parser=fake_parser_0330())
+        self.assertEqual(args.sleep_mode_backend, "cumem")
+        self.assertEqual(args.watchdog_config, {})
+        for user in (["--sleep-mode-backend", "checkpoint"],
+                     ["--sleep-mode-backend=checkpoint"],
+                     ["--sleep-mode-b", "checkpoint"],
+                     ["--watchdog-config", '{"dump_dir":"/tmp/dumps"}'],
+                     ["--watchdog-config.dump_dir", "/tmp/dumps"]):
+            with self.subTest(user=user):
+                self.refused(user, fake_parser_0330())
+                self.refused([entry.EXTRA_MARKER, *user], fake_parser_0330())
+        self.resolve(parser=fake_parser_0320())
+
+    # T14 T21: inverse boolean aliases cannot disable required telemetry.
+    def test_the_0330_boolean_aliases_cannot_reverse_owned_destinations(self):
+        self.refused(["--disable-per-request-metrics"], fake_parser_0330())
+        self.refused(["--disable-per-request"], fake_parser_0330())
+        self.refused(["--enable-log-stats"], fake_parser_0330(),
+                     rendered=["--disable-log-stats"])
 
     # T21 / SPEC §13.3 (amended 2026-10-08; owner decision 2026-10-20): the
     # rendered block turns request and output logging off on every supported

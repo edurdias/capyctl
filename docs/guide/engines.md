@@ -81,7 +81,11 @@ CPU tests are not qualification. See its [installation recipe](install-engines.m
 TensorFold 0.6.0 to 0.6.3, 0.6.5 and 0.6.6, the versions this release of CapyCTL knows; every
 llama.cpp build shows `yes` for now ([llama.cpp](#llamacpp)). CapyCTL still runs it. A custom build is
 not a [custom engine](#custom-engines): CapyCTL still knows its options. Give it its own
-name so it does not replace your main one:
+name so it does not replace your main one.
+
+vLLM 0.33.0 is the newest known release: its launch interfaces have been
+audited, but it still shows `CUSTOM yes` until live qualification. CPU tests
+do not qualify an engine.
 
 ```bash
 capyctl engine add ~/venvs/vllm-nightly --name vllm-nightly
