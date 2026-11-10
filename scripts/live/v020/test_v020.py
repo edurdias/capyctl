@@ -90,15 +90,15 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text()), {'verdict': 'pass'})
         self.assertFalse(path.with_suffix('.json.partial').exists())
 
-    def test_standalone_credentials_use_equals(self):
+    def test_standalone_credentials_use_colons(self):
         path = self.root / 'credentials'
-        path.write_text('api_key=private-key\nadmin_token=private-token\n')
+        path.write_text('admin_token: private-token\napi_key: private-key\n')
         self.assertEqual(v020.credentials(path)['api_key'], 'private-key')
 
     def test_server_credentials_use_json(self):
         path = self.root / 'server-credentials.json'
-        path.write_text(json.dumps(dict(api_key='private-key', admin_token='private-token')))
-        self.assertEqual(v020.credentials(path)['admin_token'], 'private-token')
+        path.write_text(json.dumps(dict(version=1, api_key='private-key', admin_token='private-token')))
+        self.assertEqual(v020.credentials(path), dict(api_key='private-key', admin_token='private-token'))
 
     def test_missing_credential_rejected(self):
         path = self.root / 'credentials'

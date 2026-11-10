@@ -121,10 +121,11 @@ def credentials(path):
     if text.lstrip().startswith('{'):
         data = json.loads(text)
     else:
-        data = dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
-    if not all(data.get(name) for name in ('api_key', 'admin_token')):
+        data = dict((key.strip(), value.strip()) for line in text.splitlines()
+                    for key, separator, value in [line.partition(':')] if separator)
+    if not all(isinstance(data.get(name), str) and data[name] for name in ('api_key', 'admin_token')):
         raise ValueError('credentials file has missing fields')
-    return data
+    return {name: data[name] for name in ('api_key', 'admin_token')}
 
 
 def load_env(path):

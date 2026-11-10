@@ -161,9 +161,10 @@ changing the product's qualification table.
 The SHA256SUMS manifest covers durable evidence and settings, excluding itself
 and symlinks. `settings.json` stores the binary hash and nonsecret flags, never
 SSH targets, full command lines, environment dumps or credentials. Raw remote
-state/logs and credentials are not copied. Standalone credentials are parsed as
-`name=value`; server credentials are JSON. No engine key is read. The local
-transport completion records collection and purge separately from row success.
+state/logs and credentials are not copied. Standalone credentials use the native
+`name: value` format; server credentials are JSON. Only the two credential strings
+are loaded for sanitization; metadata fields are excluded. No engine key is read.
+The local transport completion records collection and purge separately from row success.
 
 Run the new CPU helper tests and shell checks only:
 
