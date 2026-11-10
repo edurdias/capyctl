@@ -1327,6 +1327,14 @@ fn a_native_tensorfold_body_parses_its_gauges() {
     assert_eq!(load::parse_engine_load(TENSORFOLD_NATIVE_BUSY), Some(busy));
     assert!(load::parse_tensorfold_native_load(VLLM_METRICS).is_none());
     assert!(load::parse_tensorfold_native_load("").is_none());
+    // T41 T37 (ADR 0039 §11): 1.2.6 parked engines omit work gauges.
+    // Remaining process metrics are not evidence of zero work.
+    let parked = "# TYPE tensorfold:prompt_tokens_total counter\n\
+                  tensorfold:prompt_tokens_total 42\n\
+                  # TYPE tensorfold:generation_tokens_total counter\n\
+                  tensorfold:generation_tokens_total 8\n";
+    assert!(load::parse_tensorfold_native_load(parked).is_none());
+    assert!(load::parse_engine_load(parked).is_none());
 }
 
 /// A fake TensorFold native engine: unkeyed `/metrics` as given, and the

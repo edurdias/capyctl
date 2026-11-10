@@ -534,6 +534,7 @@ fn native_capabilities_doc(version: &str) -> serde_json::Value {
 /// `bin/tensorfold-native` answering `--version` and `capabilities --json`.
 fn native_binary(root: &Path, version: &str, capabilities: &serde_json::Value) -> PathBuf {
     let binary = root.join("bin/tensorfold-native");
+    let capabilities = capabilities.to_string().replace('\'', "'\\''");
     script(
         &binary,
         &format!(
@@ -904,6 +905,46 @@ fn the_capabilities_document_must_list_what_capyctl_renders() {
     refused(&|d| d["schema"] = serde_json::json!(2), "schema");
     refused(&|d| d["engine"] = serde_json::json!("python"), "engine");
     assert!(parse_native_capabilities(b"not json", "1.1.5").is_err());
+}
+
+// T41 T22 T37 (ADR 0039 §2): the actual 1.2.6 capability document and
+// archive layout remain accepted without a separate CUDA capture tree.
+#[test]
+fn native_1_2_6_capabilities_and_grammar_library_are_supported() {
+    use capyctl_agent::installation::{check_native_release, InstallationMeasurer};
+    use capyctl_config::tensorfold_native::TensorfoldLine;
+    let document: serde_json::Value =
+        serde_json::from_str(include_str!("tensorfold-capabilities-1.2.6.json")).unwrap();
+    assert_eq!(document["schema"], 1);
+    let env = document["env"].as_array().unwrap();
+    for dead in ["HF_HUB_OFFLINE", "TENSORFOLD_NO_UPDATE_CHECK"] {
+        assert!(!env.contains(&serde_json::json!(dead)));
+    }
+    assert!(document.get("profiles").is_some());
+    assert!(document.get("decisions").is_some());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("tensorfold-1.2.6");
+    let binary = native_binary(&root, "1.2.6", &document);
+    std::fs::write(root.join("VERSION"), "1.2.6\n").unwrap();
+    std::fs::create_dir(root.join("lib")).unwrap();
+    let grammar = root.join("lib/libtfgrammar.so");
+    std::fs::write(&grammar, b"grammar v1").unwrap();
+    write_sha256sums(
+        &root,
+        &["bin/tensorfold-native", "VERSION", "lib/libtfgrammar.so"],
+    );
+    let record = check_native_release(&binary, "1.2.6", Duration::from_secs(5)).unwrap();
+    assert!(record.checksums_verified);
+    assert!(!record.families.is_empty());
+    assert!(!root.join("share").exists());
+    let measure = || {
+        InstallationMeasurer::new()
+            .measure_profile(Engine::Tensorfold, TensorfoldLine::Native, &binary, None)
+            .unwrap()
+    };
+    let first = measure();
+    std::fs::write(grammar, b"grammar v2").unwrap();
+    assert_ne!(measure().digest, first.digest);
 }
 
 // T41 T17 T37 (ADR 0039 §2): `capabilities --json` runs bounded, its

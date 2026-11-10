@@ -35,11 +35,12 @@ use axum::routing::{get, post};
 use axum::Json;
 use serde_json::{json, Value};
 
-/// The two releases whose source was read (ADR 0039 Evidence §2, §9).
+/// Releases whose native command and HTTP contracts are covered (ADR 0039).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeRelease {
     V1_0_0,
     V1_1_5,
+    V1_2_6,
 }
 
 impl NativeRelease {
@@ -47,6 +48,7 @@ impl NativeRelease {
         match self {
             Self::V1_0_0 => "1.0.0",
             Self::V1_1_5 => "1.1.5",
+            Self::V1_2_6 => "1.2.6",
         }
     }
 
@@ -55,7 +57,7 @@ impl NativeRelease {
     fn unserved_tail(self) -> &'static str {
         match self {
             Self::V1_0_0 => "serve this command with --engine python",
-            Self::V1_1_5 => {
+            Self::V1_1_5 | Self::V1_2_6 => {
                 "the Python engine 0.6.6 serves it: python -m pip install \
                  git+https://github.com/ashhart/TensorFold.git@v0.6.6"
             }
@@ -65,7 +67,7 @@ impl NativeRelease {
     fn flags(self) -> &'static [Flag] {
         match self {
             Self::V1_0_0 => FLAGS_1_0_0,
-            Self::V1_1_5 => FLAGS_1_1_5,
+            Self::V1_1_5 | Self::V1_2_6 => FLAGS_1_1_5,
         }
     }
 }
@@ -587,7 +589,7 @@ impl FakeTensorfoldNative {
     /// What `/health` answers from now on. The 503 bodies are 1.1.5's.
     pub fn set_health(&self, mode: NativeHealthMode) {
         assert!(
-            self.shared.release == NativeRelease::V1_1_5
+            self.shared.release != NativeRelease::V1_0_0
                 || !matches!(
                     mode,
                     NativeHealthMode::Unavailable | NativeHealthMode::Draining
@@ -666,7 +668,7 @@ async fn health(State(shared): State<Arc<Shared>>) -> Response {
                     "prefill_tokens_per_second": 0.0,
                 },
             });
-            if shared.release == NativeRelease::V1_1_5 {
+            if shared.release != NativeRelease::V1_0_0 {
                 body["version"] = json!(shared.release.version());
                 body["backend"] = json!("cuda");
             }
@@ -679,7 +681,17 @@ async fn models(State(shared): State<Arc<Shared>>) -> Json<Value> {
     let data: Vec<Value> = shared
         .model_ids
         .iter()
-        .map(|id| json!({"id": id, "object": "model", "created": 1, "owned_by": "tensorfold"}))
+        .map(|id| {
+            let mut model =
+                json!({"id": id, "object": "model", "created": 1, "owned_by": "tensorfold"});
+            // ADR 0039: 1.2.6 discovery extensions do not change model identity.
+            if shared.release == NativeRelease::V1_2_6 {
+                model["capabilities"] = json!({"reasoning": true, "tools": true});
+                model["context_length"] = json!(32768);
+                model["max_model_len"] = json!(32768);
+            }
+            model
+        })
         .collect();
     Json(json!({"object": "list", "data": data}))
 }

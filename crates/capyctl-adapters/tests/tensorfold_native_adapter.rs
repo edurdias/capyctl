@@ -103,7 +103,7 @@ fn launching(plan: PlanInputTensorfold, port: u16) -> (TensorfoldAdapter, Arc<Sc
 // needs `status: ok` with the served name in `model_ids` and `/v1/models`.
 #[tokio::test]
 async fn readiness_waits_through_refused_connections_and_503_bodies() {
-    let fake = FakeTensorfoldNative::new(NativeRelease::V1_1_5, SERVED, 8);
+    let fake = FakeTensorfoldNative::new(NativeRelease::V1_2_6, SERVED, 8);
     let adapter = reader(&fake, SERVED);
     let one = member();
     let ready = || adapter.check_readiness(&one);
