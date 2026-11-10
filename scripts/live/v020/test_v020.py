@@ -331,6 +331,18 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         self.assertTrue(advertises_embeddings(response, 'embedding-model'))
         self.assertFalse(advertises_embeddings(response, 'different-model'))
 
+    def test_tensorfold_native_startup_reports_rounded_gib_sizes(self):
+        from rows.measurements import tensorfold_startup_sizes
+        line = ("[tensorfold] CUDA sm_80 device 0 (NVIDIA A100-SXM4-80GB): "
+                "model 18.61 GiB; 8 streams at once, the engine's own at a "
+                "32768-token window (0.28 GiB, in the model's), 7 more taking "
+                "455 pages of 512 rows (1.56 GiB) as they need them")
+        sizing = tensorfold_startup_sizes(line)
+        self.assertEqual(sizing['stream_count'], 8)
+        self.assertAlmostEqual(sizing['model_bytes'] / 1024**3, 18.61)
+        self.assertAlmostEqual(sizing['stream_bytes'] / 1024**3, .28)
+        self.assertEqual(sizing['sizing_provenance'], 'rounded engine startup GiB')
+
 
 if __name__ == '__main__':
     unittest.main()

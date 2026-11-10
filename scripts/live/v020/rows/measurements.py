@@ -103,6 +103,18 @@ def number(log, names):
     raise AssertionError('missing numeric engine evidence: ' + '/'.join(names))
 
 
+def tensorfold_startup_sizes(log):
+    matches = re.findall(
+        r'\bmodel ([0-9.]+) GiB; (\d+) streams at once,.*?'
+        r'\(([0-9.]+) GiB, in the model', log)
+    if not matches:
+        raise AssertionError('missing native TensorFold startup GiB sizing line')
+    model, streams, stream = matches[-1]
+    return dict(model_bytes=float(model)*1024**3, stream_count=int(streams),
+                stream_bytes=float(stream)*1024**3,
+                sizing_provenance='rounded engine startup GiB')
+
+
 def validate_samples(ctx, samples):
     for key in ('gpu_used_bytes', 'mem_available_bytes', 'router_rss_bytes'):
         ctx.assertion(all(isinstance(sample.get(key), (int, float)) and sample[key] >= 0 for sample in samples), 'missing numeric samples: ' + key)
@@ -238,14 +250,14 @@ def tf2(ctx,evidence):
             metrics=metric_values(direct(ctx,name,'/metrics'))
         validate_samples(ctx,samples)
         logs=engine_logs(ctx,name)
-        model_bytes=number(logs,('model_bytes','model bytes','model_size_bytes'))
-        streams=number(logs,('stream_count','num_streams','streams'))
-        stream_bytes=number(logs,('stream_bytes','stream bytes'))
+        sizing=tensorfold_startup_sizes(logs)
+        model_bytes,streams,stream_bytes=(sizing[key] for key in ('model_bytes','stream_count','stream_bytes'))
+        ctx.save(name+'-'+kind+'-startup-sizing',dict(ready_s=ready_s,**sizing,metrics=metrics))
         peaks=[value for key,values in metrics.items() if 'device_memory_peak_bytes' in key for value in (values if isinstance(values,list) else [values])]
         ctx.assertion(peaks and max(peaks)>model_bytes and streams==8,'missing device peak/stream startup evidence')
         expected=.29*1024**3
         ctx.assertion(abs(stream_bytes-expected)<=.05*1024**3,'stream bytes outside 0.29 GiB rounding allowance')
-        evidence[kind]=dict(ready_s=ready_s,memory=samples,health=health,metrics=metrics,model_bytes=model_bytes,stream_count=streams,stream_bytes=stream_bytes,expected_stream_bytes=expected,host_available_drop_bytes=baseline['mem_available_bytes']-min(s['mem_available_bytes'] for s in samples),settings=argv_settings(ctx,name))
+        evidence[kind]=dict(ready_s=ready_s,memory=samples,health=health,metrics=metrics,**sizing,expected_stream_bytes=expected,host_available_drop_bytes=baseline['mem_available_bytes']-min(s['mem_available_bytes'] for s in samples),settings=argv_settings(ctx,name))
         settings=evidence[kind]['settings']
         ctx.assertion(settings.get('host')=='127.0.0.1' and settings.get('backend')=='cuda' and settings.get('snapshot-dir')=='none' and settings.get('parallel')=='8' and settings.get('no-update-check'),'native rendered command incomplete/mismatched')
         stopped(ctx,name)

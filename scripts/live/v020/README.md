@@ -50,6 +50,8 @@ Sanitized native settings retain quoted placeholders, allowing graph-phase
 observations to parse ServerArgs without retaining its credential values.
 Embedding discovery checks the served model's nested `capyctl.api` metadata,
 not a flattened JSON key.
+TensorFold memory sizing parses its native startup's model/stream GiB fields
+and labels those rounded diagnostics rather than claiming byte-exact counters.
 No apt, driver update, system CUDA modification or reboot is allowed. Missing
 compilers/tools are blocking preflight errors, not permission to install packages.
 
