@@ -731,16 +731,16 @@ pub trait ChatForward: Send + Sync {
     /// refuse before sending, never falling back to chat.
     async fn forward_extraction(
         &self,
-        _body: &serde_json::Value,
-    ) -> Result<serde_json::Value, AdapterError> {
+        _body: &crate::request::InferenceRequest,
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
     }
     /// ADR 0037 §6: carry W3C context on the extraction exchange.
     async fn forward_extraction_traced(
         &self,
-        body: &serde_json::Value,
+        body: &crate::request::InferenceRequest,
         trace: Option<&TraceHeaders>,
-    ) -> Result<serde_json::Value, AdapterError> {
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         let _ = trace;
         self.forward_extraction(body).await
     }

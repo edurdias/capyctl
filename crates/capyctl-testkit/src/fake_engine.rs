@@ -844,9 +844,9 @@ impl capyctl_adapters::traits::ChatForward for FakeEngine {
     }
     async fn forward_extraction(
         &self,
-        body: &serde_json::Value,
-    ) -> Result<serde_json::Value, AdapterError> {
-        self.extraction_response(body)
+        body: &capyctl_adapters::request::InferenceRequest,
+    ) -> Result<capyctl_adapters::answer::EngineAnswer, AdapterError> {
+        self.extraction_response(body).map(Into::into)
     }
 
     // ADR 0041 §4: readiness judges the fixed request with production rules.
@@ -975,12 +975,15 @@ mod tests {
             .with_extractions(vec![FieldType::Number], response.clone());
         let request = capyctl_adapters::extraction_probe::request("served", &[FieldType::Number]);
         assert_eq!(
-            engine.forward_extraction(&request).await.unwrap()["model"],
+            engine
+                .forward_extraction(&request.clone().into())
+                .await
+                .unwrap()["model"],
             "served"
         );
         assert_eq!(engine.extraction_requests(), 1);
         assert!(engine
-            .forward_chat(&serde_json::json!({"model":"fake"}))
+            .forward_chat(&serde_json::json!({"model":"fake"}).into())
             .await
             .is_err());
         assert!(engine
@@ -991,13 +994,16 @@ mod tests {
             .is_err());
         let mut malformed = request.clone();
         malformed["questions"] = serde_json::Value::Null;
-        assert!(engine.forward_extraction(&malformed).await.is_err());
+        assert!(engine.forward_extraction(&malformed.into()).await.is_err());
         assert_eq!(engine.extraction_requests(), 1);
         engine.set_embeddings(FakeEmbeddings::default());
-        assert!(engine.forward_extraction(&request).await.is_err());
+        assert!(engine
+            .forward_extraction(&request.clone().into())
+            .await
+            .is_err());
         engine.set_extraction(vec![FieldType::Number], response);
         engine.set_decision(FakeEngine::decision_answer("billing", [0.95, 0.02, 0.03]));
-        assert!(engine.forward_extraction(&request).await.is_err());
+        assert!(engine.forward_extraction(&request.into()).await.is_err());
     }
 
     /// A sink that keeps every chunk, or refuses them all once `gone`.

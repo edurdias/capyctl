@@ -1005,17 +1005,17 @@ impl ChatHttp {
     // completion evidence and error accounting; only their contracts differ.
     pub(crate) async fn extract_traced(
         &self,
-        body: &Value,
+        body: &InferenceRequest,
         trace: Option<&crate::traits::TraceHeaders>,
-    ) -> Result<Value, AdapterError> {
+    ) -> Result<EngineAnswer, AdapterError> {
         self.systemone_traced(body, trace).await
     }
 
     async fn systemone_traced(
         &self,
-        body: &Value,
+        body: &InferenceRequest,
         trace: Option<&crate::traits::TraceHeaders>,
-    ) -> Result<Value, AdapterError> {
+    ) -> Result<EngineAnswer, AdapterError> {
         let public = body
             .get("model")
             .and_then(Value::as_str)
@@ -1534,14 +1534,17 @@ impl crate::traits::ChatForward for EngineForward {
     ) -> Result<EngineAnswer, AdapterError> {
         self.0.decide(body).await
     }
-    async fn forward_extraction(&self, body: &Value) -> Result<Value, AdapterError> {
+    async fn forward_extraction(
+        &self,
+        body: &InferenceRequest,
+    ) -> Result<EngineAnswer, AdapterError> {
         self.0.extract_traced(body, None).await
     }
     async fn forward_extraction_traced(
         &self,
-        body: &Value,
+        body: &InferenceRequest,
         trace: Option<&crate::traits::TraceHeaders>,
-    ) -> Result<Value, AdapterError> {
+    ) -> Result<EngineAnswer, AdapterError> {
         self.0.extract_traced(body, trace).await
     }
     async fn forward_embedding(

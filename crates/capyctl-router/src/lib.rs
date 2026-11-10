@@ -307,7 +307,7 @@ async fn receive(
         endpoint.validate(&request)?;
         endpoint
     };
-    // The raw bytes drop here; only the parsed request is held from now on.
+    // The parsed request retains the caller's raw bytes for forwarding.
     Ok(Received {
         at,
         timing,

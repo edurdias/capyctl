@@ -410,16 +410,16 @@ impl ChatForward for CustomAdapter {
     // ADR 0041 §3: use the same collected transport as decisions.
     async fn forward_extraction(
         &self,
-        body: &serde_json::Value,
-    ) -> Result<serde_json::Value, AdapterError> {
+        body: &crate::request::InferenceRequest,
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         self.forward_extraction_traced(body, None).await
     }
 
     async fn forward_extraction_traced(
         &self,
-        body: &serde_json::Value,
+        body: &crate::request::InferenceRequest,
         trace: Option<&crate::traits::TraceHeaders>,
-    ) -> Result<serde_json::Value, AdapterError> {
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         if !self.extractions() {
             return Err(AdapterError::UnsupportedCapability);
         }

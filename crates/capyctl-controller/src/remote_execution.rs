@@ -2006,7 +2006,12 @@ mod tests {
         String,
         capyctl_store::ordinary_lifecycle::worker::InitializeWork,
     ) {
-        remote_work_with(topology, layout, serde_json::json!({"kv_cache": "4GiB"}))
+        remote_work_with(
+            topology,
+            layout,
+            serde_json::json!({"kv_cache": "4GiB"}),
+            custom,
+        )
     }
 
     /// [`remote_work`] with the deployment's `engine_config.memory`.
@@ -2014,6 +2019,7 @@ mod tests {
         topology: Option<serde_json::Value>,
         layout: capyctl_domain::member_weights::CheckpointLayout,
         memory: serde_json::Value,
+        custom: Option<capyctl_config::custom::CustomProfile>,
     ) -> (
         tempfile::TempDir,
         SharedCoordinatorState,
@@ -2306,7 +2312,7 @@ mod tests {
     #[test]
     fn a_remote_vllm_device_launch_carries_its_no_floor_derivation() {
         use capyctl_config::effective::{resolve_effective_with_checkpoint, CheckpointFacts};
-        let (_dir, owned, host, work) = remote_work(None, layout());
+        let (_dir, owned, host, work) = remote_work(None, layout(), None);
         let launch = remote_launch(&owned, "controller", &work, true).unwrap();
         assert!(launch.plan.vllm_device_request_no_floor);
         let host_document = {
@@ -2363,6 +2369,7 @@ mod tests {
             None,
             layout(),
             serde_json::json!({"request": "38GiB", "kv_cache": "4GiB"}),
+            None,
         );
         let card = (38_i64 << 30) + ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
         let launch = remote_launch(&owned, "controller", &work, true).unwrap();
@@ -2431,7 +2438,7 @@ mod tests {
             .unwrap(),
         );
         let (_dir, owned, _host, work) = remote_work(None, layout(), Some(custom));
-        let launch = remote_launch(&owned, "controller", &work).unwrap();
+        let launch = remote_launch(&owned, "controller", &work, true).unwrap();
         let frozen = work.effective().profile.custom.as_ref().unwrap();
         assert_eq!(
             launch.extraction_types,

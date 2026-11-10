@@ -366,6 +366,57 @@ async fn an_extraction_is_admitted_forwarded_and_settled_like_chat() {
     assert_eq!(authority.ends(), vec![Some(LeaseEnd::Completed); 2]);
 }
 
+// T50, SPEC §10 (#220, #223): extraction preserves the same byte contract
+// as decisions across the integration line's raw request/answer transport.
+#[tokio::test]
+async fn extraction_preserves_field_order_and_numeric_spelling() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let app = axum::Router::new().fallback(move |body: axum::body::Bytes| {
+        let captured = captured.clone();
+        async move {
+            *captured.lock().unwrap() = body.to_vec();
+            (
+                [("content-type", "application/json")],
+                r#"{"model":"served-clef","answers":{"z":{"type":"number","value":1.2500e1,"guess":12.500,"confidence":0.9000,"p_null":1e-1},"a":{"type":"text","value":"Paid"}},"usage":{"input_tokens":87,"output_tokens":0}}"#,
+            )
+        }
+    });
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", socket.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+    let (authority, _, router) = stack(DeploymentApi::Extractions, &endpoint);
+    let request = r#"{"model":"clef","state":"Paid 12.50 USD","fields":{"z":{"type":"number","instructions":"Amount"},"a":{"type":"text","instructions":"Action"}}}"#;
+    let response = router
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/systemone")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(request))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        request
+            .replacen("\"clef\"", "\"served-clef\"", 1)
+            .as_bytes()
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        body.contains(r#""value":1.2500e1,"guess":12.500,"confidence":0.9000,"p_null":1e-1"#),
+        "{body}"
+    );
+    assert!(body.find("\"z\"").unwrap() < body.find("\"a\"").unwrap());
+    assert_eq!(authority.ends(), vec![Some(LeaseEnd::Completed)]);
+}
+
 // T50
 // ADR 0041 §3: extraction requests retain decision forwarding and settlement.
 #[tokio::test]

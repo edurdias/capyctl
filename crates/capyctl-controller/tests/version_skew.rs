@@ -723,6 +723,7 @@ async fn new_memory_and_graph_semantics_are_refused_before_any_host_request() {
                 device_memory: false,
                 decisions: false,
                 embeddings: false,
+                extraction_types: Vec::new(),
                 custom_engine: false,
                 lmcache_required: false,
                 retention_zero: false,

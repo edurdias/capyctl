@@ -569,7 +569,7 @@ mod tests {
             assert_eq!(engine.chat_requests(), 0);
         }
         let body = capyctl_adapters::extraction_probe::request("fake", &[FieldType::Text]);
-        assert!(engine.forward_extraction(&body).await.is_err());
+        assert!(engine.forward_extraction(&body.into()).await.is_err());
         assert_eq!(engine.extraction_requests(), 2);
     }
 
