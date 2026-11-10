@@ -292,6 +292,56 @@ class StartupGuardsTests(unittest.TestCase):
                 self.assertIn(b"ordinary line", child.stdout)
                 self.assertIn(b"and plain", child.stdout)
 
+    # T21 / SPEC §13.3: structured access logs must format without leaking keys,
+    # including handlers bound before the startup guard and debug-log mode.
+    def test_access_log_preserves_structured_args_and_redacts_formatted_output(self):
+        for debug in ("1", "0"):
+            with self.subTest(debug=debug):
+                child = self.child(f'''
+                    import io, logging, os
+                    from copy import copy
+                    from runtime.sglang_startup_guards import install_log_scrubber
+                    os.environ["CAPYCTL_DEBUG_ENGINE_LOGS"] = {debug!r}
+                    key = "ab" * 32
+                    class AccessFormatter(logging.Formatter):
+                        def formatMessage(self, record):
+                            # Uvicorn copies the record and unpacks these five values.
+                            record = copy(record)
+                            client, method, path, version, status = record.args
+                            assert isinstance(record.args, tuple)
+                            assert isinstance(status, int)
+                            record.__dict__.update(
+                                client_addr=client, request_line=f"{{method}} {{path}} HTTP/{{version}}",
+                                status_code=status)
+                            return super().formatMessage(record)
+                    output = io.StringIO()
+                    handler = logging.StreamHandler(output)
+                    handler.setFormatter(AccessFormatter(
+                        '%(client_addr)s - "%(request_line)s" %(status_code)s'))
+                    logger = logging.getLogger("uvicorn.access")
+                    logger.addHandler(handler)
+                    logger.setLevel(logging.INFO)
+                    install_log_scrubber()
+                    logger.info('%s - "%s %s HTTP/%s" %d',
+                                "127.0.0.1:1234", "GET", "/v1/models/" + key, "1.1", 200)
+                    text = output.getvalue()
+                    assert "GET /v1/models/<redacted> HTTP/1.1" in text, text
+                    assert key not in text, text
+                    assert text.endswith('200\\n'), text
+                    # Redaction must also cover secrets assembled during interpolation.
+                    handler.setFormatter(logging.Formatter("%(message)s"))
+                    logger.info("Authorization: %s %s", "Bearer", "short-secret")
+                    logger.info("token=%(key)s count=%(count)d", {{"key": key, "count": 3}})
+                    text = output.getvalue()
+                    assert "short-secret" not in text, text
+                    assert key not in text, text
+                    assert "Bearer <redacted>" in text, text
+                    assert "count=3" in text, text
+                ''')
+                self.assertEqual(child.returncode, 0, child.stderr)
+                self.assertNotIn(b"Logging error", child.stderr)
+                self.assertNotIn(b"TypeError", child.stderr)
+
     # T37 (found live 2026-10-14): SGLang's `server_args` line keeps its model
     # paths. A `.` in a path (`.cache`, `capyctl-0.1.3`) used to end the path,
     # and the long run after it was blanked as a credential; a key, a
