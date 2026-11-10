@@ -113,6 +113,27 @@ and are locked in `models.lock.json` before download. No later attempt follows
 `main` again. TensorFold archives use the plan's exact SHA-256 digests; the old
 CapyCTL release verifies published SHA256SUMS and internal checksums.
 
+## Approved unified-memory qualification
+
+Measurements may run on an explicitly approved idle aarch64 host without
+`--functional-only` or `--skip-setup`. Provision only the owner-approved engine
+environments first, then supply `--engines FILE` with absolute read-only mappings
+for every engine key, including explicit empty values for unavailable engines.
+On aarch64, setup refuses an omitted engine mapping before installing tools;
+it never creates or changes engine environments. Session tools, missing models
+and the checksum-verified aarch64 old binary remain private setup artifacts.
+Supply `OTELCOL` and `CUDA_HOME` as read-only overrides too.
+
+If preparation already claimed the live marker, set
+`V020_SESSION_NAME=HostAFull` when invoking `run.sh`; the existing marker must
+contain exactly that name. The runner preserves exclusivity and removes only
+its own marker after successful teardown. An unset name retains the default
+refusal of any pre-existing marker.
+
+This harness currently enrolls a co-resident host role for LC15/LC15U, not an
+independent second machine. Rows whose catalog says remote observation is not
+implemented remain explicit skips; supplying another host cannot certify them.
+
 ## Existing shared host: functional only
 
 Never run setup on the shared unified-memory machine. Supply an untracked small

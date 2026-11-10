@@ -125,6 +125,9 @@ class HelperTests(unittest.TestCase):
             ctx.installation('VLLM_033')
         ctx.functional_only = False
         ctx.engines['VLLM_033'] = ''
+        with self.assertRaisesRegex(v020.UnavailableEngine, 'explicit unavailable mapping'):
+            ctx.installation('VLLM_033')
+        del ctx.engines['VLLM_033']
         with self.assertRaisesRegex(AssertionError, 'unavailable'):
             ctx.installation('VLLM_033')
 
@@ -225,6 +228,36 @@ class HelperTests(unittest.TestCase):
         archived = list((self.root / 'attempts').iterdir())
         self.assertEqual(len(archived), 1)
         self.assertTrue((archived[0] / 'evidence/result-EM1.json').exists())
+
+    def test_aarch64_setup_requires_every_engine_override_before_tools(self):
+        import subprocess
+        mapping = self.root / 'lab.env'
+        names = ('VLLM_032 VLLM_033 SGLANG_0522 SGLANG_0523 SGLANG_EDITABLE '
+                 'LMCACHE LMCACHE_SGLANG LLAMACPP TENSORFOLD_126 TENSORFOLD_115 '
+                 'TENSORFOLD_066 TENSORRT_LLM_121 TENSORRT_LLM_140RC3 OTELCOL CUDA_HOME').split()
+        script = '''
+source "$1"
+export HOME=$2 V020=$2/session BIN=$2/session/bin EVIDENCE=$2/session/evidence
+ENGINES_FILE=$2/lab.env
+mkdir -p "$V020"
+uname() { printf 'aarch64\\n'; }
+v020_setup_tools() { printf 'READ_ONLY_MAPPINGS_ACCEPTED\\n'; exit 0; }
+setup
+'''
+        for omitted in ('SGLANG_EDITABLE', None):
+            with self.subTest(omitted=omitted):
+                mapping.write_text(''.join(name + '=\n' for name in names if name != omitted))
+                result = subprocess.run(
+                    ['bash', '-c', script, 'lab',
+                     str(Path(__file__).with_name('setup.sh')), str(self.root)],
+                    capture_output=True, text=True)
+                if omitted:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('explicit read-only mapping: ' + omitted, result.stderr)
+                    self.assertNotIn('READ_ONLY_MAPPINGS_ACCEPTED', result.stdout)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('READ_ONLY_MAPPINGS_ACCEPTED', result.stdout)
 
     def test_trt_driver_probe_compiles_for_the_detected_gpu(self):
         import subprocess

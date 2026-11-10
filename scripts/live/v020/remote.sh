@@ -11,6 +11,7 @@ BIN=$V020/bin EVIDENCE=$V020/evidence
 export V020 BIN EVIDENCE
 ONLY=${ONLY:-all} FUNCTIONAL_ONLY=${FUNCTIONAL_ONLY:-0} SKIP_SETUP=${SKIP_SETUP:-0}
 MAX_SECONDS=${MAX_SECONDS:-25200} ENGINES_FILE=${ENGINES_FILE:-}
+SESSION_NAME=${SESSION_NAME:-}
 if [ "${1:-}" != plan ] && [ -f "$V020/session.env" ]; then
   # This file is generated locally from validated flags, never ambient credentials.
   # shellcheck disable=SC1091
@@ -73,7 +74,12 @@ PY
 all() {
   mkdir -p "$V020" "$EVIDENCE" "$BIN"
   chmod 700 "$V020" "$EVIDENCE" "$BIN"
-  ( set -o noclobber; printf '%s\n' "$V020" >"$marker" ) 2>/dev/null || { echo 'BLOCKED: another live session owns the marker'; return 1; }
+  local owner=${SESSION_NAME:-$V020}
+  if [ -e "$marker" ]; then
+    [ -n "$SESSION_NAME" ] && [ "$(cat "$marker")" = "$owner" ] || { echo 'BLOCKED: another live session owns the marker'; return 1; }
+  else
+    ( set -o noclobber; printf '%s\n' "$owner" >"$marker" ) 2>/dev/null || { echo 'BLOCKED: another live session owns the marker'; return 1; }
+  fi
   python3 - "$V020" <<'PY'
 import json, pathlib, subprocess, sys
 root=pathlib.Path(sys.argv[1])
@@ -91,7 +97,7 @@ import json,sys
 open(sys.argv[1],'w').write(json.dumps(dict(exit_code=int(sys.argv[2]),state='complete'))+'\n')
 PY
     collect || rc=1
-    if [ "$down_rc" = 0 ] && [ "$(cat "$marker" 2>/dev/null)" = "$V020" ]; then rm -f "$marker"; fi
+    if [ "$down_rc" = 0 ] && [ "$(cat "$marker" 2>/dev/null)" = "$owner" ]; then rm -f "$marker"; fi
     exit "$rc"
   }
   trap finish EXIT
@@ -102,7 +108,7 @@ PY
   fi
   if [ "$SKIP_SETUP" = 0 ]; then setup; fi
   local engines=$V020/engines.env
-  [ -z "$ENGINES_FILE" ] || engines=$ENGINES_FILE
+  if [ "$SKIP_SETUP" = 1 ] && [ -n "$ENGINES_FILE" ]; then engines=$ENGINES_FILE; fi
   [ -f "$engines" ] || { echo 'BLOCKED: engine locations are missing'; return 1; }
   local flags=()
   [ "$FUNCTIONAL_ONLY" = 0 ] || flags+=(--functional-only)

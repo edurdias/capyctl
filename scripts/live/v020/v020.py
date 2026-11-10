@@ -305,8 +305,8 @@ class Context:
     def installation(self, key):
         path = self.engines.get(key)
         if not path:
-            if self.functional_only:
-                raise UnavailableEngine('not installed on this host; qualified on the VM')
+            if key in self.engines:
+                raise UnavailableEngine('not installed on this host (explicit unavailable mapping): ' + key)
             raise AssertionError('engine installation unavailable: ' + key)
         if not Path(path).exists():
             raise AssertionError('mapped engine installation does not exist: ' + key)
