@@ -184,6 +184,12 @@ class HelperTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, 'matching canary'):
             passing_canary(ctx, 'model', restore=False)
 
+    def test_restart_row_still_requires_its_explicit_verdict_event(self):
+        from rows.functional import restart_canary_verdict
+        self.assertFalse(restart_canary_verdict([dict(kind='ready_committed')]))
+        self.assertTrue(restart_canary_verdict([dict(kind='embedding_canary', verdict='passed')]))
+        self.assertFalse(restart_canary_verdict([dict(kind='embedding_canary', verdict='failed')]))
+
     def test_process_identity_guards_against_pid_reuse(self):
         record = identity(os.getpid())
         self.assertTrue(matches(record))

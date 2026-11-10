@@ -2,6 +2,7 @@
 import base64
 import json
 import math
+import re
 import struct
 
 from .engines import document, passing_canary, stopped
@@ -112,6 +113,16 @@ def contract(ctx, name, engine):
     records.append({"model_before_data": keys.index("model") < keys.index("data"), "base64_max_abs_error": max(abs(a-b) for a,b in zip(reference, decoded))})
     return records
 
+def restart_canary_verdict(events):
+    # ADR 0036 EM4 explicitly requires a verdict event after stop/start.
+    for event in events:
+        text = json.dumps(event).lower().replace("_", " ")
+        if ("canary" in text and re.search(r"\b(pass|passed|success|succeeded|matched)\b", text)
+                and not re.search(r"\b(fail|failed|mismatch)\b", text)):
+            return True
+    return False
+
+
 
 def run(ctx, row):
     if row["id"] in SKIPS:
@@ -137,6 +148,8 @@ def run(ctx, row):
                 vectors(ctx, embedding(ctx, name, "qualification probe"), name, 1)
                 events = ctx.events()[before_events:]
                 evidence[engine] = {"events": events, "canary": passing_canary(ctx, name, restore=False)}
+                ctx.save(name + "-restart-evidence", evidence[engine])
+                ctx.assertion(restart_canary_verdict(events), "restart missing passing reference-canary verdict event (ADR0036 EM4)")
             ctx.save(name + "-contract", evidence[engine])
             stopped(ctx, name)
         return dict(verdict="pass", reason="All three engine contracts passed", evidence=evidence)

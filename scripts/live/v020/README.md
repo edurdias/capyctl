@@ -150,9 +150,10 @@ The harness's logical `wake` operation uses `capyctl start deployment`, the
 supported CLI command for returning a parked deployment to ready.
 Cache fixtures explicitly request token-ID lists from Transformers; dictionary
 return defaults must not be mistaken for a two-token prompt.
-Canary evidence follows the durable current-launch `wake_canaries` reference
-and, for a wake, the latest completed `restored` journal entry. Management events
-do not contain a separate `canary_passed` event.
+Wake canary evidence follows the durable current-launch `wake_canaries` reference
+and the latest completed `restored` journal entry. EM4 is different: ADR 0036
+explicitly requires a restart comparison verdict event; a fresh reference alone
+does not pass that row.
 Embedding requests checkpoint their input and sanitized response before contract
 assertions, so a failed request retains its actual HTTP error. Multi-engine rows
 checkpoint each available engine before an unavailable installation skips the row.
