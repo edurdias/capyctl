@@ -148,18 +148,19 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     fork (~/exllamav3-mia-venv, commit 63b32f00, torch 2.13.0 cu130) with their
     deployment kit (~/mia-kit, commit 12421873), approved 2026-11-03 for comparing
     their EXL3 Qwen3.8-27B checkpoint as a custom engine (ADR 0031);
-  - host A, approved 2026-11-09: vLLM 0.33.0 (~/vllm-0.33.0-venv), for qualifying
-    it (#239) and the DFlash prefix-cache fix, to be copied byte-identical to host B
-    once qualified; and a llama.cpp build at b11556 or newer in the home directory,
-    for comparing PrismML's Ternary Bonsai 2 27B (Hadamard-rotated ternary GGUF) with
-    the NVFP4 builds;
+  - host A, approved 2026-11-09, made 2026-11-10: vLLM 0.33.0 (~/vllm-0.33.0-venv,
+    torch 2.14.0+cu130), for qualifying it (#239) and the DFlash prefix-cache fix, to
+    be copied byte-identical to host B once qualified; and llama.cpp b12242 (commit
+    3b4d6ab3, CUDA architecture 121a, ~/llamacpp-b12242), for comparing PrismML's
+    Ternary Bonsai 2 27B (Hadamard-rotated ternary GGUF) with the NVFP4 builds;
   - host A only, for qualifying TensorFold's native line (ADR 0039): TensorFold
     1.0.0 at ~/tensorfold-1.0.0 (the release archive as installed, owner decision
     2026-10-25) and TensorFold 1.1.5 at ~/tensorfold-1.1.5 (the release archive,
     unpacked with its checksum file checked, owner decision 2026-10-27);
   - the maintainer's discrete-GPU laptop, approved 2026-11-09: the official
     `lmsysorg/sglang:v0.5.22` Docker image, for the live check of #230 (an editable
-    SGLang refused at `engine add`);
+    SGLang refused at `engine add`); removed after that check, to be pulled again for
+    #235's;
   - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B;
   - the rented two-GPU machine of ADR 0035 §14 (owner decision 2026-10-25), for
     its one session only: fresh x86_64 CUDA installs of vLLM 0.32.0

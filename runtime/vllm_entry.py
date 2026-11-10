@@ -457,7 +457,7 @@ def check_plugins(entry_points=None):
 
 
 class InstalledVllm:
-    """The installed build's own `vllm serve` parser and server (0.29.0, 0.30.0).
+    """The installed build's own `vllm serve` parser and server (0.29.0 to 0.33.0).
 
     Mirrors vllm/entrypoints/cli/main.py for the serve subcommand only:
     environment setup, a FlexibleArgumentParser with the serve subparser,
@@ -466,8 +466,14 @@ class InstalledVllm:
 
     def __init__(self):
         from vllm.entrypoints.cli import serve
-        from vllm.entrypoints.serve.utils.api_utils import cli_env_setup
         from vllm.utils.argparse_utils import FlexibleArgumentParser
+        # ADR 0017 §2 (version skew): vLLM 0.33.0 moved `cli_env_setup` to
+        # vllm.entrypoints.common.startup; 0.29.0 to 0.32.0 keep it in
+        # vllm.entrypoints.serve.utils.api_utils, and no build has both.
+        try:
+            from vllm.entrypoints.common.startup import cli_env_setup
+        except ImportError:
+            from vllm.entrypoints.serve.utils.api_utils import cli_env_setup
         self._serve = serve
         self._env_setup = cli_env_setup
         self._parser_class = FlexibleArgumentParser

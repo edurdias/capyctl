@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import unittest
 from unittest import mock
+import types
 import uuid
 
 from runtime import vllm_entry as entry
@@ -753,6 +754,27 @@ class MainTests(unittest.TestCase):
         with mock.patch.object(entry, "main", side_effect=AssertionError("ran")):
             exec(compile(wrapper.read_bytes(), str(wrapper), "exec"), namespace)
         self.assertIn("resolve", namespace)
+
+    # ADR 0017 §2: the build's own CLI environment setup is used wherever the
+    # supported vLLM keeps it; 0.33.0 moved it to vllm.entrypoints.common.startup.
+    def test_cli_env_setup_is_found_in_either_layout(self):
+        new = "vllm.entrypoints.common.startup"
+        old = "vllm.entrypoints.serve.utils.api_utils"
+        for present, absent in ((new, old), (old, new)):
+            with self.subTest(present=present):
+                modules = {name: types.ModuleType(name) for name in (
+                    "vllm", "vllm.entrypoints", "vllm.entrypoints.cli",
+                    "vllm.entrypoints.cli.serve", "vllm.entrypoints.common",
+                    "vllm.entrypoints.serve", "vllm.entrypoints.serve.utils",
+                    "vllm.utils", "vllm.utils.argparse_utils", present)}
+                modules[absent] = None
+                modules["vllm.entrypoints.cli"].serve = modules["vllm.entrypoints.cli.serve"]
+                modules["vllm.utils.argparse_utils"].FlexibleArgumentParser = argparse.ArgumentParser
+                calls = []
+                modules[present].cli_env_setup = lambda: calls.append(present)
+                with mock.patch.dict("sys.modules", modules):
+                    entry.InstalledVllm().env_setup()
+                self.assertEqual(calls, [present])
 
     def test_module_imports_nothing_from_the_engine(self):
         source = Path(entry.__file__).read_text()
