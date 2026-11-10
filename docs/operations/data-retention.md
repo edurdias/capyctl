@@ -173,7 +173,8 @@ On TensorFold's native line (1.x), CapyCTL never passes the engine
 `TENSORFOLD_REQUEST_LOG` (which appends every request body to a file) and
 renders none of its compaction or disk options: `--compact-at`,
 `--compact-keep` and `--compact-memory`, and TensorFold 1.1.5's `--record`,
-`--learn*` and `--recall*` options, run only when a deployment or the engine
+`--learn*` and `--recall*` options, plus 1.2.6's `--prompt-cache-disk` and
+`--spill-gib`, run only when a deployment or the engine
 profile passes them, and never under zero data retention (below).
 
 To stop requests from different users sharing cached prefixes, send a
@@ -244,7 +245,8 @@ it:
 - on TensorFold's native line, refuses a deployment whose own or engine
   arguments carry `--compact-at`, `--compact-keep` or `--compact-memory`
   (`retention_zero:compaction`), or an option that writes request state to
-  disk, `--record`, `--learn*` or `--recall*` (`retention_zero:engine_disk`):
+  disk, `--record`, `--learn*`, `--recall*`, `--prompt-cache-disk` or `--spill-gib`
+  (`retention_zero:engine_disk`):
   at deploy for the deployment's `retention: zero`, at placement for the
   host's. The option is refused, never silently dropped.
 

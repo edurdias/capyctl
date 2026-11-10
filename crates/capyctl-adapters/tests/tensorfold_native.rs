@@ -60,9 +60,13 @@ fn with_head(tail: &[&str]) -> Vec<String> {
     strings(&[HEAD, tail].concat())
 }
 
-/// The rendered command is one both releases' parsers accept.
-fn both_releases_accept(argv: &[String]) {
-    for release in [NativeRelease::V1_0_0, NativeRelease::V1_1_5] {
+/// The rendered command is accepted by every covered release.
+fn all_releases_accept(argv: &[String]) {
+    for release in [
+        NativeRelease::V1_0_0,
+        NativeRelease::V1_1_5,
+        NativeRelease::V1_2_6,
+    ] {
         parse_serve(release, &argv[2..]).unwrap_or_else(|e| panic!("{release:?}: {e}"));
     }
 }
@@ -73,7 +77,7 @@ fn both_releases_accept(argv: &[String]) {
 fn the_native_command_renders_exactly_as_section_4() {
     let argv = render_command(&native_plan()).unwrap().argv;
     assert_eq!(argv, with_head(&["--context", "32768", "--parallel", "8"]));
-    both_releases_accept(&argv);
+    all_releases_accept(&argv);
 }
 
 // T41 T14 (ADR 0039 §4): a declared `max_concurrent_requests` is the
@@ -104,7 +108,7 @@ fn typed_fields_host_args_and_extras_render_in_order() {
             "auto",
         ])
     );
-    both_releases_accept(&argv);
+    all_releases_accept(&argv);
     input.thinking = Some(true);
     let argv = render_command(&input).unwrap().argv;
     assert!(argv.contains(&"--thinking".to_owned()), "{argv:?}");
@@ -119,7 +123,7 @@ fn arguments_with_their_own_parallel_render_no_second_one() {
     input.extra_args = strings(&["--parallel=3"]);
     let argv = render_command(&input).unwrap().argv;
     assert_eq!(argv, with_head(&["--context", "32768", "--parallel=3"]));
-    both_releases_accept(&argv);
+    all_releases_accept(&argv);
     assert_eq!(expected_batch_size(&input), Some(3));
     input.extra_args = strings(&["--parallel", "auto"]);
     assert_eq!(expected_batch_size(&input), None, "auto is not a count");

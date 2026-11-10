@@ -92,6 +92,7 @@ pub const REQUIRED_ENV: &[&str] = &["TENSORFOLD_CUDA_MEMORY_LIMIT_GB"];
 /// the Python line does not apply. Safety and ownership refusals: they apply
 /// to every native version, certified or not.
 pub const RESERVED_FLAGS: &[&str] = &[
+    "--unix-socket",
     "--host",
     "--port",
     "--name",
@@ -158,7 +159,13 @@ pub const COMPACTION_OPTIONS: &[&str] = &["--compact-at", "--compact-keep", "--c
 /// and `--recall` are refused with every option of their families
 /// (`--learn-dir`, `--learn-conversations`, `--recall-dir`, ...): the owner's
 /// decision names them `--learn*` and `--recall*`.
-pub const ENGINE_DISK_OPTIONS: &[&str] = &["--record", "--learn", "--recall"];
+pub const ENGINE_DISK_OPTIONS: &[&str] = &[
+    "--record",
+    "--learn",
+    "--recall",
+    "--prompt-cache-disk",
+    "--spill-gib",
+];
 const ENGINE_DISK_FAMILIES: &[&str] = &["--learn-", "--recall-"];
 
 /// ADR 0039 §16: the zero-retention refusals (exit 5).

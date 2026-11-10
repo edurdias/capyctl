@@ -10,6 +10,28 @@ data retention (§4), and the default profile name is `tensorfold` (§2). Implem
 the live rows TF1 to TF14 have not run, so neither 1.0.0 nor 1.1.5 is in the certified
 set yet (each joins once its rows pass, §3) and the native line is not yet the documented
 path for Nemotron 3.5 Lightning on a GB10 (owner decision 7).
+
+**Amendment (2026-11-10), Proposed:** target native 1.2.6 alongside the
+existing releases. Upstream publishes both x86_64 (including sm_120 kernels)
+and aarch64 archives, so its TF rows may run on an x86_64 RTX PRO 6000,
+not only a GB10. The owner requested checking and updating latest engine
+versions on 2026-11-10; this amendment does not assert completed
+qualification or authorize a passed certification entry. CPU tests are not
+qualification; live rows on the rented RTX PRO 6000 x86 machine and host A
+remain owed.
+
+Read at [v1.2.6](https://github.com/ashhart/TensorFold/tree/v1.2.6),
+commit `6e9af930261a88bb28ac0bfb157ce8e57e9eea07`: schema 1 capabilities
+retain the required flags and memory cap while adding discovery metadata.
+The release root includes `lib/libtfgrammar.so` and embeds CUDA kernels;
+no adjacent `share/` capture tree is required. Reserve `--unix-socket`
+as listener ownership (§4), and refuse `--prompt-cache-disk` and `--spill-gib`
+under zero retention (§16). Parked metrics omit work gauges: missing work
+stays unknown, never zero or idle (§11). The
+[release](https://github.com/ashhart/TensorFold/releases/tag/v1.2.6) and
+[runtime requirements](https://github.com/ashhart/TensorFold/blob/v1.2.6/RUNTIME.md)
+are installation evidence, not CapyCTL live qualification.
+
 **Amends (with the implementation):** `SPEC.md` §9.3 (a second TensorFold line), §10 (the
 idle reading of a native TensorFold engine), §20 (T41); ADR 0023 §1 to §8 (each gains the
 native line beside the Python one); ADR 0018 §1 (a third installation form: a release

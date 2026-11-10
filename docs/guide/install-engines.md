@@ -190,6 +190,34 @@ TensorFold's own guide: the
 [runbook](https://github.com/ashhart/TensorFold/blob/v0.6.6/RUNBOOK.md)
 at the release tag.
 
+## TensorFold native 1.2.6 (qualification pending)
+
+Use the [native release archive](https://github.com/ashhart/TensorFold/releases/tag/v1.2.6),
+not pip. The x86_64 archive embeds sm_120 kernels for an RTX PRO 6000;
+an aarch64 archive is also available. The plain-text CUDA workload needs
+glibc 2.28 or later and an NVIDIA R580+ driver exposing CUDA 13.0, not
+Python, PyTorch, Triton or a CUDA compiler.
+
+```bash
+mkdir -p "$HOME/tensorfold-downloads"
+cd "$HOME/tensorfold-downloads"
+curl -fLO https://github.com/ashhart/TensorFold/releases/download/v1.2.6/tensorfold-1.2.6-linux-x86_64.tar.gz
+curl -fLO https://github.com/ashhart/TensorFold/releases/download/v1.2.6/tensorfold-1.2.6-linux-x86_64.tar.gz.sha256
+sha256sum -c tensorfold-1.2.6-linux-x86_64.tar.gz.sha256
+tar -xzf tensorfold-1.2.6-linux-x86_64.tar.gz -C "$HOME"
+cd "$HOME/tensorfold-1.2.6-linux-x86_64"
+sha256sum -c SHA256SUMS
+bin/tensorfold-native --version
+capyctl engine add "$HOME/tensorfold-1.2.6-linux-x86_64" --name tensorfold-1-2-6
+```
+
+Keep the whole root, including `lib/libtfgrammar.so`. Configure local model
+storage and `restart_only` as in [TensorFold native](engines.md#tensorfold-native-1x).
+Optional vision, Drama, TP and PDF workloads need additional libraries listed
+in upstream's [runtime requirements](https://github.com/ashhart/TensorFold/blob/v1.2.6/RUNTIME.md).
+CPU tests are not qualification; live checks on the rented x86_64 RTX PRO
+6000 machine and host A remain owed.
+
 ## llama.cpp v0.6.0
 
 llama.cpp is a C++ program: CapyCTL runs its `llama-server` binary, built from

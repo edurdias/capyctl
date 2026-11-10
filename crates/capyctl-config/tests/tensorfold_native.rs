@@ -113,11 +113,23 @@ fn zero_retention_refuses_compaction_and_disk_options() {
         (&["--learn-conversations"], RETENTION_ZERO_ENGINE_DISK),
         (&["--recall"], RETENTION_ZERO_ENGINE_DISK),
         (&["--recall-dir", "/srv/recall"], RETENTION_ZERO_ENGINE_DISK),
+        (
+            &["--prompt-cache-disk", "/srv/cache"],
+            RETENTION_ZERO_ENGINE_DISK,
+        ),
+        (
+            &["--prompt-cache-disk=/srv/cache"],
+            RETENTION_ZERO_ENGINE_DISK,
+        ),
+        (&["--spill-gib", "1"], RETENTION_ZERO_ENGINE_DISK),
+        (&["--spill-gib=1"], RETENTION_ZERO_ENGINE_DISK),
     ] {
         let (mut deployment, host) = native();
         deployment["retention"] = "zero".into();
         with_extra(&mut deployment, args);
-        let error = resolve_effective(&deployment, &host).unwrap_err();
+        let error = resolve_effective(&deployment, &host)
+            .err()
+            .unwrap_or_else(|| panic!("zero retention accepted {args:?}"));
         assert_eq!(error.path, "engine_config.extra_args", "{args:?}");
         assert!(
             error.detail.starts_with(&format!("{code}: `")),

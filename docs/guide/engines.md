@@ -354,6 +354,13 @@ with `engine:`:
 capyctl engine add ~/tensorfold-1.1.5 --name tensorfold-1-1-5
 ```
 
+Native 1.2.6 is also a target release, not yet certified. Its x86_64 archive
+includes sm_120 kernels for RTX PRO 6000; aarch64 archives remain available.
+Use the [1.2.6 archive installation recipe](install-engines.md#tensorfold-native-126-qualification-pending)
+and register the complete root as `tensorfold-1-2-6`. CPU tests are not
+qualification; live checks on the rented x86_64 RTX PRO 6000 machine and
+host A remain owed (ADR 0039's proposed 2026-11-10 amendment).
+
 `capyctl engine detect` lists `tensorfold-native` binaries on `PATH`, in
 `~/*/bin`, `/opt/*/bin`, `/usr/local/bin` and every `--path`, with the
 version their `VERSION` file names; it runs nothing. The role's own engine
@@ -405,6 +412,9 @@ exact names, as the binary does ([Engine options](engine-flags.md#tensorfold-nat
 refused under `retention: zero`, as are 1.1.5's `--record`, `--learn*` and
 `--recall*`, which write request state to disk
 ([Data retention](../operations/data-retention.md#zero-data-retention)).
+Native 1.2.6's `--unix-socket` is reserved because CapyCTL owns the listener.
+Its `--prompt-cache-disk` and `--spill-gib` are ordinary options except under
+`retention: zero`, where both are refused for writing request state to disk.
 
 **Running.** The engine opens its port only once the model is loaded, so
 CapyCTL waits through refused connections, then needs `/health` to answer
