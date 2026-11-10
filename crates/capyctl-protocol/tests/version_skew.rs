@@ -397,6 +397,8 @@ fn every_post_baseline_field_names_its_capability() {
             LOCAL_TENSOR_PARALLEL,
             TRACE_CONTEXT,
             TENSORFOLD_NATIVE,
+            VLLM_DEVICE_REQUEST_NO_FLOOR,
+            CUDA_GRAPH_PHASES,
         ]
         .contains(name)
         {
