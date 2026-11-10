@@ -64,5 +64,5 @@ environments they need are added to AGENTS.md when they are made.
   `engine_config.tensorrt-llm.llm_api_options`. Versions 1.2.1, the 1.3 pre-release and
   1.4.0rc1 are being qualified; until their live checks pass, every installation runs as
   an uncertified custom setup. See [TensorRT-LLM](../guide/engines.md#tensorrt-llm) and
-  [Install an engine](../guide/install-engines.md#tensorrt-llm-121-13-pre-release-or-140rc1).
+  [Install an engine](../guide/install-engines.md#tensorrt-llm-121-13-pre-release-or-140rc3).
   An `engines.yaml` with a TensorRT-LLM profile is refused by releases before 0.2.0.

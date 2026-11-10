@@ -1,6 +1,6 @@
 //! T45 (ADR 0033 §1): LMCache measured for `engine add` and checked by shape
 //! at launch, against fake environments built from excerpts of the real
-//! LMCache 0.5.6, vLLM 0.32.0 and SGLang 0.5.22 sources
+//! LMCache 0.5.6/0.5.7, vLLM 0.32.0 and SGLang 0.5.22 sources
 //! (`tests/fixtures/lmcache`). CPU tests only; they are not qualification.
 
 use capyctl_agent::installation::InstallationMeasurer;
@@ -32,7 +32,7 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
-/// A virtual environment with the engine and LMCache 0.5.6. Every program in
+/// A virtual environment with the engine and a versioned LMCache fixture. Every program in
 /// `bin` (the interpreter included) records that it ran and fails, so a
 /// check that executed anything is caught.
 struct Env {
@@ -45,6 +45,10 @@ struct Env {
 
 impl Env {
     fn new(engine: Engine) -> Self {
+        Self::with_lmcache(engine, "0.5.6")
+    }
+
+    fn with_lmcache(engine: Engine, version: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("venv");
         let site = root.join("lib/python3.12/site-packages");
@@ -67,7 +71,10 @@ impl Env {
             _ => "vllm-0.32.0",
         };
         copy_tree(&Path::new(FIXTURES).join(engine_fixture), &site);
-        copy_tree(&Path::new(FIXTURES).join("lmcache-0.5.6"), &site);
+        copy_tree(
+            &Path::new(FIXTURES).join(format!("lmcache-{version}")),
+            &site,
+        );
         let env = Self {
             _dir: dir,
             root,
@@ -75,7 +82,7 @@ impl Env {
             engine,
             measurer: InstallationMeasurer::new(),
         };
-        env.set_version("0.5.6");
+        env.set_version(version);
         env
     }
 
@@ -235,6 +242,83 @@ fn lmcache_check_passes_on_sglang_0522_with_lmcache_056() {
         let install = env.check_registered_as(transfer).unwrap();
         assert_eq!(install.version, "0.5.6");
         assert!(!install.drifted);
+    }
+}
+
+// T45 (ADR 0033 §5, ADR 0034 §1): both real release shapes preserve salt
+// isolation for both engines and both transfer modes, without executing Python.
+#[test]
+fn lmcache_versioned_source_fixtures_preserve_salt() {
+    for version in ["0.5.6", "0.5.7"] {
+        for engine in [Engine::Vllm, Engine::Sglang] {
+            let env = Env::with_lmcache(engine, version);
+            let registration = env.register();
+            assert_eq!(registration.version, version);
+            for transfer in BOTH_MODES {
+                let install = env.check_as(Some(&registration), transfer).unwrap();
+                assert_eq!(install.version, version);
+                assert_eq!(install.digest, registration.digest);
+                assert!(!install.drifted);
+            }
+        }
+    }
+}
+
+// T45 (ADR 0033 §5): accepting the 0.5.7 identity and factory shapes must
+// not accept a salt dropped at any new hop, including the factory's return.
+#[test]
+fn lmcache_057_refuses_dropped_salt() {
+    const API: &str = "lmcache/v1/distributed/api.py";
+    const IPC: &str = "lmcache/v1/multiprocess/custom_types.py";
+    const CONNECTOR: &str = "lmcache/integration/sglang/unified_lmcache_mp_connector.py";
+    let cases = [
+        (API, "    cache_salt: str = \"\"\n", ""),
+        (API, "    identity: ObjectKeyIdentity\n", ""),
+        (API, "return self.identity.cache_salt", "return \"\""),
+        (
+            API,
+            "    @property\n    def cache_salt(self)",
+            "    def cache_salt(self)",
+        ),
+        (
+            API,
+            "cache_salt=cache_salt if cache_salt is not None else \"\",",
+            "cache_salt=\"\",",
+        ),
+        (
+            API,
+            "cache_salt=cache_salt\n                if cache_salt is not None\n                else identity.cache_salt,",
+            "cache_salt=\"\",",
+        ),
+        (
+            API,
+            "object.__setattr__(self, \"identity\", identity)",
+            "object.__setattr__(self, \"identity\", None)",
+        ),
+        (API, "    cache_salt = ipc_key.cache_salt\n", "    cache_salt = \"\"\n"),
+        (API, "                cache_salt=cache_salt,\n", ""),
+        (IPC, "    cache_salt: str = \"\"\n", ""),
+        (IPC, "            cache_salt=cache_salt,\n", "            cache_salt=\"\",\n"),
+        (
+            CONNECTOR,
+            "            cache_salt=operation.cache_salt,\n",
+            "            cache_salt=\"\",\n",
+        ),
+    ];
+    for (file, from, to) in cases {
+        for engine in [Engine::Vllm, Engine::Sglang] {
+            if engine == Engine::Vllm
+                && (file == CONNECTOR || (file == IPC && from.contains("cache_salt=cache_salt")))
+            {
+                continue;
+            }
+            for transfer in BOTH_MODES {
+                let env = Env::with_lmcache(engine, "0.5.7");
+                env.edit(file, from, to);
+                let detail = check_failed_as(&env, transfer);
+                assert!(detail.contains("no cache_salt support"), "{file}: {detail}");
+            }
+        }
     }
 }
 

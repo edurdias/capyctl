@@ -952,20 +952,20 @@ inference endpoint.
 
 ### Registering a TensorRT-LLM environment
 
-TensorRT-LLM needs two system packages that its Python
-environment does not carry. Install them once, as an administrator:
-
-- `libopenmpi-dev` (`sudo apt-get -y install libopenmpi-dev` on Ubuntu 24.04,
-  Open MPI 4.1.6), which `mpi4py` loads when the engine starts;
-- the CUDA toolkit from NVIDIA's packages: 13.1 for 1.2.1 and 13.4 for the
-  1.4 pre-release, installed side by side. Name the version's toolkit as the
-  profile's `cuda_home` (`CUDA_HOME` when you run `engine add`).
+TensorRT-LLM needs an MPI runtime and a complete CUDA developer toolkit.
+Use system Open MPI 4.1.6 (`libopenmpi-dev` on Ubuntu 24.04), or on x86_64
+install `openmpi==4.1.8 mpi4py==4.1.2` inside the engine environment.
+The inspected wheel pair resolves MPI from the environment's own `lib`
+directory without inherited `LD_LIBRARY_PATH`; live loader identity still
+needs qualification. Use toolkit 13.1 for 1.2.1 and 13.4 for 1.4.0rc3.
+A user-prefix toolkit avoids system-package changes; set the profile's
+`cuda_home` (`CUDA_HOME` when running `engine add`) to its complete root.
 
 Each version lives in its own environment, `~/tensorrt-llm-<version>-venv`,
-built as [Install an engine](../guide/install-engines.md#tensorrt-llm-121-13-pre-release-or-140rc1)
+built as [Install an engine](../guide/install-engines.md#tensorrt-llm-121-13-pre-release-or-140rc3)
 shows: torch first, a constraints file pinning it, then the wheel by URL and
 hash. The versions being qualified are 1.2.1, the 1.3 pre-release and
-1.4.0rc1; none has passed its live rows yet, so every TensorRT-LLM profile
+1.4.0rc3; none has passed its live rows yet, so every TensorRT-LLM profile
 lists as custom and runs as an uncertified custom setup, never refused for
 its version.
 

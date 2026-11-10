@@ -9,7 +9,7 @@
 //! each line's tag: 1.2.1 at `376f7e1` (the version ADR 0038 was designed
 //! from), the 1.3 pre-release at `v1.3.0rc29` (`c76f4a8`, the newest 1.3
 //! pre-release when this was implemented; TR1a records the build the host
-//! runs) and the 1.4 pre-release at `v1.4.0rc1` (`0372799`). A name reserved
+//! runs) and the 1.4 pre-release at `v1.4.0rc3` (`9e334fb`). A name reserved
 //! on any line is refused on every line: `trtllm-serve` refuses an option its
 //! version lacks anyway, so the union only refuses earlier.
 use crate::engine_policy::Sensitivity;
@@ -95,6 +95,8 @@ pub struct VersionLine {
     /// renders `false` (§3, §8). The 1.3 and 1.4 pre-releases removed it (their
     /// sleep is `sleep_config`, reserved); their strict model would refuse it.
     pub renders_enable_sleep: bool,
+    /// ADR 0038 §3: pin one serving frontend where the CLI supports it.
+    pub supports_frontend_count: bool,
 }
 
 /// ADR 0038 §2a: the lines qualified in 0.2.0, oldest first.
@@ -104,18 +106,21 @@ pub const LINES: &[VersionLine] = &[
         tag: "v1.2.1",
         commit: "376f7e1",
         renders_enable_sleep: true,
+        supports_frontend_count: false,
     },
     VersionLine {
         line: (1, 3),
         tag: "v1.3.0rc29",
         commit: "c76f4a8",
         renders_enable_sleep: false,
+        supports_frontend_count: true,
     },
     VersionLine {
         line: (1, 4),
-        tag: "v1.4.0rc1",
-        commit: "0372799",
+        tag: "v1.4.0rc3",
+        commit: "9e334fb",
         renders_enable_sleep: false,
+        supports_frontend_count: true,
     },
 ];
 
@@ -158,6 +163,7 @@ pub const RESERVED_RENDERED: &[&[&str]] = &[
     &["--trust_remote_code"],
     &["--reasoning_parser"],
     &["--tool_parser"],
+    &["--num_serve_frontends"],
 ];
 
 /// ADR 0038 §3: options CapyCTL never renders and nobody may pass. Rows
@@ -180,11 +186,11 @@ pub const RESERVED_NEVER_RENDERED: &[&[&str]] = &[
     &["--server_role"],
     &["--disagg_cluster_uri"],
     &["--otlp_traces_endpoint"],
+    &["--openengine-metrics-host"],
+    &["--openengine-metrics-port"],
     &["--num_postprocess_workers"],
     // 1.3+: imports a post-processing hook (code).
     &["--post_processor_hook"],
-    // 1.3+: more frontend processes sharing the port.
-    &["--num_serve_frontends"],
     &["--enable_attention_dp"],
     // 1.3+: the engine's own usage reporting (§10, `engine_telemetry`).
     &["--telemetry", "--no-telemetry"],
@@ -378,6 +384,7 @@ pub const RESERVED_NEVER_KEYS: &[&str] = &[
     "telemetry_config",
     "post_processor_hook",
     "num_serve_frontends",
+    "serve_frontend_affinity_port_stride",
     "perf_metrics_output_dir",
     "prometheus_metrics_config",
     "mx_config",
@@ -1014,6 +1021,11 @@ mod tests {
         assert_eq!(version_line("1.4.0rc1").line, (1, 4));
         assert_eq!(version_line("1.5.0").line, (1, 2));
         assert_eq!(version_line("unknown").line, (1, 2));
+        assert!(!version_line("1.2.1").supports_frontend_count);
+        assert!(version_line("1.3.0rc29").supports_frontend_count);
+        let latest = version_line("1.4.0rc3");
+        assert!(latest.supports_frontend_count);
+        assert_eq!((latest.tag, latest.commit), ("v1.4.0rc3", "9e334fb"));
     }
 
     // T49 (ADR 0038 §3): every alias and spelling of a reserved option, and
