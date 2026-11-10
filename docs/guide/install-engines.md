@@ -10,7 +10,7 @@ more than one, each in its own environment.
 | vLLM | 0.32.0, 0.31.0, 0.30.0, 0.29.0 | `~/venvs/vllm` |
 | SGLang | 0.5.21, 0.5.20 | `~/venvs/sglang` |
 | TensorFold | 0.6.6, 0.6.5, 0.6.3, 0.6.2, 0.6.1, 0.6.0 | `~/venvs/tensorfold` |
-| llama.cpp | v0.6.0 (every build lists as `CUSTOM yes` for now) | `~/llama.cpp` (a build, no environment) |
+| llama.cpp | v0.9.0 (newest known), v0.7.0, v0.6.0 (every build lists as `CUSTOM yes` for now) | `~/llama.cpp` (a build, no environment) |
 | TensorRT-LLM | 1.2.1, the 1.3 pre-release, 1.4.0rc1 (every installation lists as `CUSTOM yes` for now) | `~/tensorrt-llm-<version>-venv` |
 
 Another version still runs, but `capyctl engine detect` shows it as
@@ -190,7 +190,7 @@ TensorFold's own guide: the
 [runbook](https://github.com/ashhart/TensorFold/blob/v0.6.6/RUNBOOK.md)
 at the release tag.
 
-## llama.cpp v0.6.0
+## llama.cpp v0.9.0
 
 llama.cpp is a C++ program: CapyCTL runs its `llama-server` binary, built from
 the release tag. The build needs `git`, `cmake`, a C++ compiler and a CUDA
@@ -199,13 +199,13 @@ toolkit with `nvcc` (`ls /usr/local/cuda/bin/nvcc` to check).
 1. Get the release tag:
 
    ```bash
-   git clone --branch v0.6.0 --depth 1 https://github.com/ggml-org/llama.cpp ~/llama.cpp
+   git clone --branch v0.9.0 --depth 1 https://github.com/ggml-org/llama.cpp ~/llama.cpp
    ```
 
 2. Build `llama-server` with CUDA. `-DLLAMA_BUILD_IS_DEV=OFF` makes the binary
-   report `0.6.0` rather than `0.6.0-dev`; `CMAKE_CUDA_ARCHITECTURES` limits
-   the kernels to your GPU (`89` for RTX 40 series; leave it out to build for
-   every architecture, which takes much longer):
+   report `0.9.0` rather than `0.9.0-dev`; `CMAKE_CUDA_ARCHITECTURES` limits
+   the kernels to your GPU (`89` for RTX 40 series, `120a-real` for RTX PRO
+   6000, `121a-real` for GB10; leave it out to build for every architecture):
 
    ```bash
    cd ~/llama.cpp
@@ -224,7 +224,7 @@ toolkit with `nvcc` (`ls /usr/local/cuda/bin/nvcc` to check).
    ~/llama.cpp/build/bin/llama-server --version
    ```
 
-   It prints `version: 0.6.0 (build 1, commit d81235049)` on standard error.
+   It prints a line such as `version: 0.9.0 (build 1, commit cd959bae9)` on standard error.
 
 4. Get a model as a GGUF file, in a directory of its own under `~/models`,
    for example:
@@ -237,7 +237,7 @@ Do not create `/etc/llama.cpp/config.ini`: llama-server reads it as options, so
 CapyCTL refuses to register or start llama.cpp on a machine that has it.
 
 llama.cpp's own guide: the
-[server README](https://github.com/ggml-org/llama.cpp/blob/v0.6.0/tools/server/README.md)
+[server README](https://github.com/ggml-org/llama.cpp/blob/v0.9.0/tools/server/README.md)
 at the release tag.
 
 ## TensorRT-LLM 1.2.1, 1.3 pre-release or 1.4.0rc1

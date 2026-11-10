@@ -520,6 +520,27 @@ async fn a_decision_is_admitted_forwarded_and_settled_like_chat() {
     assert_eq!(authority.ends(), vec![Some(LeaseEnd::Completed); 2]);
 }
 
+// T43 (ADR 0030 §2): v0.9.0's multi-question contract survives concurrent
+// shared-prefix requests. This fixture is not native-engine qualification.
+#[tokio::test]
+async fn concurrent_multi_question_decisions_keep_their_answers() {
+    let (endpoint, seen) =
+        engine(Reply::Answer(200, "application/json", answer().to_string())).await;
+    let (authority, deps, router) = stack(DeploymentApi::Decisions, &endpoint);
+    authority.ready.store(true, Ordering::SeqCst);
+    let first = decision_body();
+    let mut second = first.clone();
+    second["state"] = json!("I was charged twice for my order last week. Please help.");
+    let (left, right) = tokio::join!(decide(&router, &first), decide(&router, &second));
+    for (status, body) in [left, right] {
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["answers"], answer()["answers"]);
+    }
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(authority.ends(), vec![Some(LeaseEnd::Completed); 2]);
+    assert_eq!(deps.inflight.current(DEPLOYMENT), 0);
+}
+
 // T43 T19 (issue #220): the engine receives the caller's bytes with only
 // what CapyCTL sets written anew. A decision's questions keep the caller's
 // order (SGLang numbers them in its prompt in that order), and so does the

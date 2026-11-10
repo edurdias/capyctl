@@ -136,6 +136,29 @@ fn a_dev_build_of_the_tag_commit_lists_as_the_release() {
     assert!(!is_verified(Engine::Llamacpp, "0.6.0-dev+d812350"));
 }
 
+// T42 (ADR 0029 §2): exact release-tag dev builds normalize, not arbitrary devs.
+#[test]
+fn newer_tag_fingerprints_normalize_without_qualification() {
+    for (version, commit) in [
+        ("0.7.0", "620d2225cc436ab0b001e3200e590e3b286ef9ab"),
+        ("0.9.0", "cd959bae99ff4bed22bef2604f45241c09bbb8c8"),
+    ] {
+        let table = [(Engine::Llamacpp, version)];
+        for hash in [&commit[..7], &commit[..12], commit] {
+            for suffix in ["", "-dev"] {
+                let fingerprint = format!("{version}{suffix}+{hash}");
+                assert!(is_verified_in(&table, Engine::Llamacpp, &fingerprint));
+                assert!(!is_verified(Engine::Llamacpp, &fingerprint));
+            }
+        }
+        assert!(!is_verified_in(
+            &table,
+            Engine::Llamacpp,
+            &format!("{version}-dev+abcdef0")
+        ));
+    }
+}
+
 // T42 (ADR 0029 §2): a llama.cpp listing shows the fingerprint `engine add`
 // read, not the library version the host reports; the other engines keep
 // the reported version.
@@ -243,6 +266,14 @@ fn every_reserved_spelling_is_refused() {
                 };
                 assert!(refused(&[&spelling]), "{spelling}");
                 assert!(refused(&[&spelling, "1"]), "{spelling} 1");
+                assert!(extra(&[&format!("{spelling}=1")], &[], &[], &[]).is_err());
+                assert!(validate_profile_args(
+                    Engine::Llamacpp,
+                    Default::default(),
+                    &args(&[&format!("{spelling}=1")]),
+                    false,
+                )
+                .is_err());
             }
         }
     }
@@ -487,7 +518,12 @@ fn forbidden_options_are_refused_even_when_approved() {
 // and an option reserved or sensitive in one spelling is so in all of them.
 #[test]
 fn the_tables_cover_every_spelling_of_their_options() {
-    let known: BTreeSet<&str> = options().into_iter().flatten().collect();
+    // Upstream v0.9.0 adds these options to the v0.6.0 fixture inventory.
+    let known: BTreeSet<&str> = options()
+        .into_iter()
+        .flatten()
+        .chain(["--connect", "--connect-code", "--models-memory-margin"])
+        .collect();
     let tables: Vec<&[&str]> = RESERVED_RENDERED
         .iter()
         .chain(RESERVED_NEVER_RENDERED)
@@ -789,6 +825,9 @@ fn declared_llamacpp_resources_bound_the_kv_cache() {
 fn hidden_inputs_in_the_environment_are_refused() {
     for name in [
         "LLAMA_ARG_CTX_SIZE",
+        "LLAMA_ARG_CONNECT",
+        "LLAMA_ARG_CONNECT_CODE",
+        "LLAMA_ARG_MODELS_MEMORY_MARGIN",
         "LLAMA_API_KEY",
         "LLAMA_SERVER_SLOTS_DEBUG",
         "LLAMA_CACHE",

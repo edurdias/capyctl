@@ -2,7 +2,7 @@
 //! `/health`, `/v1/models` and `/props` with the rendered-value check, the
 //! `/metrics` idle gate and quiescence, the restart-only surface, the
 //! `cache_salt` refusal, SSE comments, and the launch-time `config.ini`
-//! refusal. Exercised against a local axum engine with llama-server 0.6.0's
+//! refusal. Exercised against a local axum engine with llama-server v0.9.0's
 //! shapes (`tools/server/server-context.cpp`, `server-http.cpp`,
 //! `server-task.cpp`) and a scripted process tool; nothing here qualifies a
 //! native engine recipe (only the live rows LC1–LC6 do).
@@ -194,6 +194,8 @@ async fn props(State(stub): State<Stub>) -> axum::response::Response {
         "model_path": "/srv/models/qwen/qwen-Q4_K_M.gguf", "endpoint_slots": true,
         "endpoint_props": false, "endpoint_metrics": reported.endpoint_metrics.load(SeqCst),
         "ui": false, "chat_template": "{{ messages }}", "build_info": "b1-d812350",
+        // T42: v0.9.0 server-context.cpp adds fields, not readiness requirements.
+        "connect_code": "", "voices": [],
         "is_sleeping": false}),
     )
     .into_response()
@@ -373,7 +375,7 @@ fn plan(port: u16) -> PlanInputLlamacpp {
 /// An adapter for `port` that looks for `etc/llama.cpp/config.ini` under
 /// `root`, never under the machine's own `/`.
 fn adapter(port: u16, root: &std::path::Path) -> LlamacppAdapter {
-    LlamacppAdapter::new(url(port), "0.6.0+d812350".into(), "qwen".into())
+    LlamacppAdapter::new(url(port), "0.9.0+cd959ba".into(), "qwen".into())
         .with_system_root(root.to_path_buf())
 }
 
