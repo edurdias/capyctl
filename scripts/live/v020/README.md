@@ -57,6 +57,10 @@ attempt state. Lifecycle fixtures use restart-only decisions and a llama.cpp
 chat context/slot count that fits their declared KV budget.
 SHA-256 manifests are generated for collected/exported evidence only, not for
 per-row summaries rooted above the private model and engine installations.
+The ADR 0034 sleep-clearing amendment is checked explicitly: `required` must
+refuse `sleep_clears_cache`, and `auto` must park/wake with LMCache off. Those
+guards leave LC13–LC16 unqualified, never passed; LC13 separately checks a
+32k external hit across restart-only parking.
 No apt, driver update, system CUDA modification or reboot is allowed. Missing
 compilers/tools are blocking preflight errors, not permission to install packages.
 

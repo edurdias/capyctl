@@ -387,6 +387,26 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         self.assertFalse(report['selected_pass'])
         self.assertTrue((self.root / 'summary.json').is_file())
 
+    def test_sleep_cache_refusal_proves_only_the_guard_not_qualification(self):
+        from unittest import mock
+        from rows.lmcache import Protocol, sleep_guard
+        ctx = v020.Context(self.root, {})
+        ctx.row_id, ctx.index = 'LC13', 1
+        ctx.save('operation-1', dict(stderr='sleep_clears_cache', stdout=''))
+        ctx.request = lambda *args, **kwargs: dict(status=200)
+        p = Protocol(ctx, dict(id='LC13'))
+        def deploy(suffix, mode):
+            if mode == 'required':
+                raise AssertionError('operation 1 failed')
+            return 'auto'
+        p.deploy = deploy
+        p.lifecycle = lambda action, name: dict(status=action)
+        p.retire = lambda name: None
+        with mock.patch('rows.lmcache.cache_ledger', return_value=dict(
+                planned='off', state='off', reason='sleep_clears_cache', planned_reason=None)):
+            self.assertTrue(sleep_guard(p))
+        self.assertTrue(any('not qualified' in reason for reason in p.failures))
+
 
 if __name__ == '__main__':
     unittest.main()

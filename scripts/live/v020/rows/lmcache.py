@@ -21,6 +21,8 @@ ROWS = [
          criteria="ADR0034 §2: enrolled host through the control server, 32k park/wake/hit and passing wake canary."),
     dict(id="LC16", priority=1, budget=900, discrete=True, measurement=True,
          criteria="ADR0034 §2: five cold/engine-evicted/post-park trials at 8k/16k/32k; wake <=1.1x off, cold TTFT <=1.1x off, 32k post-wake TTFT <=0.25x off.")]
+for row in ROWS:
+    row["criteria"] += " Sleep-clearing installations must refuse required and disable auto; this guard alone is not qualification (2026-11-10 amendment)."
 ROWS += [dict(row, id=row["id"] + "U", priority=4, discrete=False, unified=True,
               measurement=row["id"] == "LC16",
               criteria=row["criteria"].replace("host_backed", "deep") + " GB10 deep-parking counterpart.")
@@ -640,10 +642,61 @@ def costs(p, fixture_data):
             p.check(comparisons["postwake"]["ratio"] <= 0.25, "32k post-wake TTFT exceeds 0.25x off")
 
 
+def sleep_guard(p):
+    """ADR 0034 amendment: a compatible refusal never certifies cache retention."""
+    ctx = p.ctx
+    try:
+        probe = p.deploy("required-compatibility", "required")
+    except AssertionError:
+        operation = ctx.evidence / (ctx.row_id + "-operation-" + str(ctx.index) + ".json")
+        receipt = json.loads(operation.read_text()) if operation.is_file() else {}
+        diagnostic = receipt.get("stderr", "") + receipt.get("stdout", "")
+        if "sleep_clears_cache" not in diagnostic:
+            raise
+        p.record("required-sleep-refusal", reason="sleep_clears_cache", diagnostic=diagnostic)
+    else:
+        p.retire(probe)
+        return False
+    auto = p.deploy("auto-compatibility", "auto")
+    ledger = cache_ledger(ctx, auto, p.role)
+    p.check(ledger["planned"] == "off" and ledger["state"] == "off" and
+            (ledger["planned_reason"] or ledger["reason"]) == "sleep_clears_cache",
+            "auto sleep parking did not disable LMCache with sleep_clears_cache")
+    park = p.lifecycle("park", auto)
+    wake = p.lifecycle("wake", auto)
+    response = ctx.request(auto, role=p.role)
+    p.check(response.get("status") == 200, "auto LMCache-off deployment did not answer after wake")
+    p.record("auto-sleep-guard", ledger=ledger, park=park, wake=wake,
+             response_status=response.get("status"), external_hits_expected=False)
+    p.retire(auto)
+    p.check(False, "sleep_clears_cache: compatibility guard observed; sleep hit/memory/endurance/cost not qualified")
+    return True
+
+
+def restart_cache_check(p):
+    """Keep restart-only retention distinct from unsupported sleep retention."""
+    ctx = p.ctx
+    fixture = fixtures(ctx, [("restart", 32000)])["fixtures"]["restart"]
+    name = p.prefix + "-restart-cache"
+    ctx.deploy(name, "lmcache", residency="restart_only", role=p.role,
+               extra=dict(lmcache="required", engine_config=dict(
+                   accept_extra_args=True, extra_args=["--enable-prompt-tokens-details"])))
+    p.names.append(name)
+    seed = p.request(name, fixture, "restart-seed", cache=True, hit=False)
+    p.lifecycle("park", name)
+    p.lifecycle("wake", name)
+    p.request(name, fixture, "restart-post-wake", cache=True, hit=True, expected=seed["answer"])
+    p.retire(name)
+
+
 def run(ctx, row):
     row_id = row["id"].removesuffix("U")
     p = Protocol(ctx, row, role="server" if row_id == "LC15" else "standalone")
     try:
+        if sleep_guard(p):
+            if row_id == "LC13":
+                restart_cache_check(p)
+            return p.finish()
         if row_id in ("LC13", "LC15"):
             specs = [(label, 32000) for label in ("main", "salt", "race")]
         elif row_id == "LC14":
