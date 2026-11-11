@@ -519,6 +519,16 @@ impl ChatHttp {
         key: Option<String>,
         cache_salt: CacheSalt,
     ) -> Self {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(10));
+        // SPEC §10, ADR 0036 §4: the router owns request and idle bounds.
+        // A full engine receive window must not add reqwest's implicit
+        // 30-second TCP_USER_TIMEOUT to a legitimately backpressured upload.
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        let client = client.tcp_user_timeout(None);
         Self {
             endpoint: upstream(&base, "/v1/chat/completions").expect("a forwarded path"),
             decisions: upstream(&base, "/v1/systemone").expect("a forwarded path"),
@@ -527,13 +537,7 @@ impl ChatHttp {
             key,
             cache_salt,
             request_ids: RequestIdLane::Absent,
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .retry(reqwest::retry::never())
-                .no_proxy()
-                .connect_timeout(Duration::from_secs(10))
-                .build()
-                .expect("static client configuration"),
+            client: client.build().expect("static client configuration"),
         }
     }
 
@@ -3679,6 +3683,54 @@ pub(crate) mod tests {
     }
 
     const EMBEDDING_ANSWER: &str = r#"{"id":"embd-9","object":"list","created":1,"model":"/srv/Qwen3-Embedding-4B","data":[{"index":0,"object":"embedding","embedding":[0.5,-0.25]},{"index":1,"object":"embedding","embedding":[1e-2,3]}],"usage":{"prompt_tokens":7,"total_tokens":7}}"#;
+
+    /// T47 (ADR 0036 §4, EM8): an engine under load may stop reading a large
+    /// request while earlier batches run. Only the router's request deadline
+    /// bounds this wait, not reqwest's implicit 30-second TCP_USER_TIMEOUT.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_embeddings_upload_survives_engine_backpressure_beyond_thirty_seconds() {
+        use std::time::Duration;
+
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        // Inherited by accepted sockets: the upload cannot fit in the peer's
+        // receive buffer while its application is not reading.
+        socket.set_recv_buffer_size(16 * 1024).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(16).unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/v1/embeddings",
+                axum::routing::post(|body: axum::body::Bytes| async move {
+                    assert!(body.len() > 8 << 20);
+                    ([("content-type", "application/json")], EMBEDDING_ANSWER)
+                }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(16 << 20));
+        let engine = tokio::spawn(async move {
+            // A connected socket advertises a zero receive window once full.
+            // TCP_USER_TIMEOUT expires even on loopback without packet loss.
+            tokio::time::sleep(Duration::from_secs(35)).await;
+            axum::serve(listener, app).await.unwrap();
+        });
+        let request: InferenceRequest =
+            json!({"model": "public", "input": ["a".repeat(8 << 20), "b"]}).into();
+        let mut sink = Relayed::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            embedding_forwarder(format!("http://{address}").parse().unwrap())
+                .forward_embedding(&request, &mut sink),
+        )
+        .await;
+        engine.abort();
+        let answered = result
+            .expect("the upload completes within the caller's deadline")
+            .expect("engine backpressure must not impose an implicit 30-second deadline");
+        assert_eq!(answered.inputs, 2);
+        assert_eq!(answered.prompt_tokens, Some(7));
+        assert!(sink.bytes.ends_with(br#""total_tokens":7}"#));
+    }
 
     /// ADR 0036 §3-§4: the engine receives the served name; the client
     /// receives the answer as it streams, with the public name in `model`,

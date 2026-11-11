@@ -25,6 +25,62 @@ async fn serve(router: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle
     let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     (address, task)
 }
+
+// T47 T18 (ADR 0036 §10, SPEC §10): engine backpressure must not add a
+// hidden TCP deadline ahead of the ingress's head bound or router's bounds.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_ingress_embedding_upload_survives_engine_backpressure_beyond_thirty_seconds() {
+    use std::time::Duration;
+
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(16 * 1024).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(16).unwrap();
+    let native_addr = listener.local_addr().unwrap();
+    let native = Router::new()
+        .route(
+            "/v1/embeddings",
+            post(|body: axum::body::Bytes| async move {
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["input"].as_str().unwrap().len(), 4 << 20);
+                (
+                    [("content-type", "application/json")],
+                    r#"{"object":"list","model":"model","data":[{"object":"embedding","index":0,"embedding":[0.5]}]}"#,
+                )
+            }),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(8 << 20));
+    let native_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(35)).await;
+        axum::serve(listener, native).await.unwrap();
+    });
+    let ingress = Ingress::new().unwrap();
+    let first = scope(1);
+    ingress
+        .register(first.clone(), native_addr, "model".into(), [1; 32], [2; 32])
+        .unwrap();
+    ingress.open(&first).unwrap();
+    let (address, task) = serve(ingress.router()).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://{address}/v1/embeddings"))
+        .bearer_auth(hex::encode([1; 32]))
+        .json(&serde_json::json!({"model":"model","input":"a".repeat(4 << 20)}))
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let answer = response.json::<serde_json::Value>().await.unwrap();
+    task.abort();
+    native_task.abort();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "engine backpressure must not impose an implicit 30-second deadline: {answer}"
+    );
+    assert_eq!(answer["data"][0]["embedding"], serde_json::json!([0.5]));
+}
 // T18, T21, T37: generation-bound inference authority never exposes engine administration.
 #[tokio::test]
 async fn ingress_requires_current_open_generation_and_replaces_internal_headers() {
