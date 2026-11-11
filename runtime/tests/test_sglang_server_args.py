@@ -151,7 +151,6 @@ class MappingTests(LaunchFixture, unittest.TestCase):
             "nnodes": 1, "node_rank": 0, "gpu_id_step": 1,
             "mem_fraction_static": 0.0625, "enable_memory_saver": True,
             "enable_weights_cpu_backup": False, "enable_draft_weights_cpu_backup": False,
-            "is_embedding": False,
             "cpu_offload_gb": 0, "disaggregation_mode": "null",
             "enable_hierarchical_cache": False, "enable_lmcache": False,
             "enable_flexkv": False, "grpc_port": None, "grpc_mode": False,
@@ -303,8 +302,8 @@ class MappingTests(LaunchFixture, unittest.TestCase):
                               self.placement(), constructor)
                 self.assertEqual(caught.exception.code, "effective_args_mismatch")
 
-    # T47 T14 (ADR 0036 §2): capyctl renders `is_embedding` for an embeddings
-    # deployment; no extra argument may set it, chat or embeddings.
+    # T47 T14 (ADR 0036 §2): capyctl renders `is_embedding` only for an
+    # embeddings deployment; no extra argument may set it on any API.
     def test_is_embedding_is_rendered_by_capyctl_only(self):
         constructor = mock.Mock(side_effect=AssertionError("constructed"))
         constructor.add_cli_args = SyntheticArgs.add_cli_args
@@ -321,11 +320,41 @@ class MappingTests(LaunchFixture, unittest.TestCase):
         kwargs = self.seen(self.spec_with(is_embedding=True))
         self.assertIs(kwargs["is_embedding"], True)
         kwargs = self.seen(self.build_without("is_embedding"))
-        self.assertIs(kwargs["is_embedding"], False)
+        self.assertNotIn("is_embedding", kwargs)
         # The descriptor carries the setting only as `true`.
         with self.assertRaises(entry.LaunchError) as caught:
             self.spec_with(is_embedding=False)
         self.assertEqual(caught.exception.code, "invalid_descriptor")
+
+    # T43 T47 T22 / ADR 0030 §6, ADR 0036 §2: SGLang 0.5.23 resolves
+    # Clef/Clef-Flash joint heads and Kev pointer heads to embedding mode.
+    # That native prefill-only execution mode does not change the API.
+    def test_decision_head_may_resolve_to_embedding_mode(self):
+        def decision_head(**kwargs):
+            native = synthetic_constructor(**kwargs)
+            resolve = native.resolve_once
+            def resolve_decision_head():
+                resolve()
+                native.is_embedding = True
+                native.disable_radix_cache = True
+                native.chunked_prefill_size = -1
+            native.resolve_once = resolve_decision_head
+            return native
+
+        checked = construct(self.build(), self.placement(), decision_head)
+        checked.revalidate()
+        self.assertIs(checked._native.resolved_dict()["is_embedding"], True)
+
+    # T47 T22: an explicit embeddings deployment still pins its native mode.
+    def test_an_embeddings_launch_cannot_resolve_out_of_embedding_mode(self):
+        def not_embedding(**kwargs):
+            native = synthetic_constructor(**kwargs)
+            native.is_embedding = False
+            return native
+
+        with self.assertRaises(mapping.ServerArgsError) as caught:
+            construct(self.spec_with(is_embedding=True), self.placement(), not_embedding)
+        self.assertEqual(caught.exception.code, "effective_args_mismatch")
 
     # T14: ADR 0008 amendment 2026-10-08. A declared drafter's directory,
     # which capyctl materialized, reaches the constructor as the draft model

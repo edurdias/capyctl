@@ -127,10 +127,6 @@ _RESERVED_CONSTANT = {
     # is the typed `quantization` field, not modelopt export.
     "quantize_and_serve": False, "modelopt_checkpoint_restore_path": None,
     "modelopt_checkpoint_save_path": None, "modelopt_export_path": None,
-    # ADR 0036 §2: an embedding server only when capyctl renders one (an
-    # embeddings deployment's `is_embedding` setting, below); never from extra
-    # arguments.
-    "is_embedding": False,
 }
 _RESERVED_BOUND = ("host", "port", "api_key", "admin_api_key", "model_path",
                    "tokenizer_path", "served_model_name", "base_gpu_id",
@@ -172,7 +168,8 @@ _TYPED_DESTINATIONS = frozenset({
     "max_total_tokens", "chunked_prefill_size", "tokenizer_worker_num",
 })
 _FORBIDDEN_EXTRA = frozenset({*_RESERVED_CONSTANT, *_RESERVED_BOUND, *_RESERVED_DUMP,
-                              *_RESERVED_TRACING, *_RESERVED_EXTERNAL_LINKER, "config"})
+                              *_RESERVED_TRACING, *_RESERVED_EXTERNAL_LINKER,
+                              "is_embedding", "config"})
 # ADR 0014 §4: capyctl safe defaults the deployment may override with extra args.
 _SAFE_DEFAULTS = {"detokenizer_worker_num": 1}
 
@@ -545,8 +542,9 @@ def construct_server_args(spec, placement, guarded_constructor, available_bytes=
     if "lmcache_config_file" in settings:
         reserved.update(enable_lmcache=True,
                         lmcache_config_file=settings["lmcache_config_file"])
-    # ADR 0036 §2: an embeddings deployment launches SGLang as an embedding
-    # server; every other launch keeps the constant pin off.
+    # ADR 0036 §2: render and pin embedding mode only for embeddings.
+    # Otherwise SGLang chooses: Clef decision heads need embedding mode,
+    # while chat checkpoints serving label-scored decisions do not (ADR 0030 §6).
     if "is_embedding" in settings:
         reserved.update(is_embedding=True)
     # ADR 0037 §7: a traced launch exports to the host's loopback endpoint;

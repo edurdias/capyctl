@@ -203,8 +203,8 @@ impl SglangLaunch {
     /// ADR 0036 §2: an embeddings deployment's launch, a public setting
     /// (`is_embedding`, always `true`) the entry validates and renders as the
     /// reserved `is_embedding=True`, pinned after SGLang resolved its
-    /// arguments. Absent, the entry keeps the constant pin off, so no extra
-    /// argument makes a chat launch an embedding server.
+    /// arguments. Absent, SGLang chooses its native mode (including embedding
+    /// mode for Clef decisions); extra arguments may never select it.
     pub fn with_embedding(mut self) -> Self {
         self.public["settings"]["is_embedding"] = json!(true);
         self
