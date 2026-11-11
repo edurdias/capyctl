@@ -64,6 +64,10 @@ def argv_settings(ctx, name):
             key, _, value = arg.removeprefix('--').partition('=')
             if arg.startswith('--') and key in allowed:
                 result[key] = value or (args[index+1] if index+1 < len(args) and not args[index+1].startswith('--') else True)
+    if 'is-embedding' not in result:
+        resolved=ctx.engine_args(name)['resolved']
+        if 'is_embedding' in resolved:
+            result['is-embedding']=resolved['is_embedding']=='True'
     return result
 
 

@@ -62,6 +62,8 @@ refuse `sleep_clears_cache`, and `auto` must park/wake with LMCache off (an
 unqualified auto installation may instead report `park_unqualified`). Those
 guards leave LC13–LC16 unqualified, never passed; LC13 separately checks a
 32k external hit across restart-only parking.
+Embedding render observations accept SGLang's managed native `is_embedding`
+setting; its protected-descriptor launch does not expose an engine CLI flag.
 No apt, driver update, system CUDA modification or reboot is allowed. Missing
 compilers/tools are blocking preflight errors, not permission to install packages.
 

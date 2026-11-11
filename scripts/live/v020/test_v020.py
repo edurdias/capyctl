@@ -408,6 +408,13 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         self.assertTrue(any('not qualified' in reason for reason in p.failures))
         self.assertFalse(any('auto sleep parking did not disable' in reason for reason in p.failures))
 
+    def test_native_sglang_embedding_setting_does_not_require_cli_argv(self):
+        from rows.measurements import argv_settings
+        from types import SimpleNamespace
+        ctx = SimpleNamespace(owned=lambda name: [], engine_args=lambda name: dict(
+            resolved=dict(is_embedding='True')))
+        self.assertTrue(argv_settings(ctx, 'embedding-model')['is-embedding'])
+
 
 if __name__ == '__main__':
     unittest.main()

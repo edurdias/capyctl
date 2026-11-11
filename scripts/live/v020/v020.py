@@ -491,7 +491,7 @@ class Context:
         # Never export raw argv: only the owned settings tested by these rows.
         allowed = {'gpu-memory-utilization', 'kv-cache-memory-bytes', 'disable-prefill-cuda-graph',
                    'disable-decode-cuda-graph', 'cuda-graph-backend-prefill', 'cuda-graph-backend-decode',
-                   'supported-transfer-mode', 'kv-transfer-config'}
+                   'supported-transfer-mode', 'kv-transfer-config', 'is-embedding'}
         flags = {}
         for identity in self.owned(name):
             path = Path('/proc') / str(identity['pid']) / 'cmdline'
