@@ -124,7 +124,7 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   above (no new environments beyond the listed exceptions) still apply to the lab
   hosts.
 - Do not change engine environments, drivers, or reboot hosts. The engine virtual
-  environments in use, all owner-approved (list updated 2026-11-09):
+  environments in use, all owner-approved (list updated 2026-11-10):
   - both hosts: SGLang 0.5.21, SGLang 0.5.22 (approved 2026-10-17, for decision
     models), vLLM 0.30.0, TensorFold 0.6.5 and TensorFold 0.6.6
     (on host B, each TensorFold venv is a byte-identical copy of host A's, made with
@@ -157,6 +157,20 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     1.0.0 at ~/tensorfold-1.0.0 (the release archive as installed, owner decision
     2026-10-25) and TensorFold 1.1.5 at ~/tensorfold-1.1.5 (the release archive,
     unpacked with its checksum file checked, owner decision 2026-10-27);
+  - host A, approved 2026-11-10 for the measured 0.2.0 catalog: SGLang 0.5.23
+    (~/sglang-0.5.23-venv, torch 2.14.1+cu130), TensorFold native 1.2.6
+    (~/tensorfold-1.2.6, checksum-verified aarch64 release), llama.cpp v0.9.0
+    (~/llamacpp-v0.9.0, commit cd959bae99ff4bed22bef2604f45241c09bbb8c8,
+    CUDA architecture 121a-real), TensorRT-LLM 1.4.0rc3
+    (~/tensorrt-llm-1.4.0rc3-venv, aarch64 NVIDIA wheel, torch 2.14.0+cu132,
+    pip Open MPI 4.1.8 and mpi4py), and LMCache 0.5.7 source builds in copies
+    of the latest engine environments (~/vllm-0.33.0-lmcache057-venv,
+    torch 2.14.0+cu130; ~/sglang-0.5.23-lmcache057-venv, torch 2.14.1+cu130,
+    both TORCH_CUDA_ARCH_LIST=12.1). Existing environments remain read-only;
+    the new approved installations stay after session cleanup. Measurement
+    authorization requires an idle host; owner work takes precedence. Never
+    touch anything under ~/capyctl-extract* on either host. A busy host B may
+    run only GPU-less CapyCTL control roles, never an engine or measurements.
   - the maintainer's discrete-GPU laptop, approved 2026-11-09: the official
     `lmsysorg/sglang:v0.5.22` Docker image, for the live check of #230 (an editable
     SGLang refused at `engine add`); removed after that check, to be pulled again for
