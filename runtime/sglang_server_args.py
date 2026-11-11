@@ -167,9 +167,12 @@ _TYPED_DESTINATIONS = frozenset({
     "cuda_graph_backend_decode", "language_model_only", "trust_remote_code",
     "max_total_tokens", "chunked_prefill_size", "tokenizer_worker_num",
 })
+# ADR 0036 §2: embedding mode is CapyCTL's to set, pinned only for an embeddings
+# deployment (see below); an extra argument may never set it.
+_RESERVED_EMBEDDING_MODE = ("is_embedding",)
 _FORBIDDEN_EXTRA = frozenset({*_RESERVED_CONSTANT, *_RESERVED_BOUND, *_RESERVED_DUMP,
                               *_RESERVED_TRACING, *_RESERVED_EXTERNAL_LINKER,
-                              "is_embedding", "config"})
+                              *_RESERVED_EMBEDDING_MODE, "config"})
 # ADR 0014 §4: capyctl safe defaults the deployment may override with extra args.
 _SAFE_DEFAULTS = {"detokenizer_worker_num": 1}
 
