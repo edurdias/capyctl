@@ -135,6 +135,8 @@ def editable(ctx):
     evidence['standalone_refusal'] = dict(exit_code=result.returncode)
     for role, old in [('server', False), ('old-server', True)]:
         ctx.role(role, old=old)
+        # Publish the healthy profile in the fixture restart, including older hosts.
+        ctx.register('VLLM_033', role)
         name, path = install_editable_profile(ctx, role)
         # A separate real model must remain healthy across the failed start.
         good = 'control-' + role

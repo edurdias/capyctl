@@ -308,10 +308,16 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         ctx.cli = lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout='editable', stderr='')
         ctx.assertion = v020.Context.assertion
         ctx.role = lambda *args, **kwargs: None
-        with mock.patch('rows.regressions.install_editable_profile', return_value=('editable', 'fixture')):
+        actions = []
+        ctx.register = lambda *args: actions.append('register')
+        def installed(*args):
+            actions.append('restart')
+            return 'editable', 'fixture'
+        with mock.patch('rows.regressions.install_editable_profile', side_effect=installed):
             with self.assertRaises(Captured):
                 editable(ctx)
         self.assertEqual(ctx.extra['engine_config']['context_length'], 8192)
+        self.assertEqual(actions, ['register', 'restart'])
 
     def test_llama_embeddings_keep_required_context_and_derive_kv_from_gguf(self):
         ctx = v020.Context(self.root, {})
