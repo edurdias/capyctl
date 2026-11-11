@@ -8,6 +8,8 @@ The Fake-engine controller regression `an_embedding_restart_compares_before_read
 
 The standalone Fake installation now honors the frozen embeddings API instead of constructing a chat engine for every deployment. Its injected process tools observe the in-process engine's virtual identities, while native liveness checks continue through the owned binding's real process observer. `standalone_embeddings_record_and_compare_their_reference` reproduced the first-launch `launch_failed` regression before this correction; it now verifies first-reference recording and a passing restart through the standalone role. The three router concurrency regressions also pass, together with the full CLI package test suite.
 
+The embedded SGLang LMCache restart-park regression exposed a second fixture contract: its scripted process observer reported every identity gone despite recording live child processes. That observer now scripts the recorded identities as alive. Native presence still uses the same boot/PID/start-time check, and restart-park checks only the retained server after the old engine is verified stopped; enrolled-host evidence remains host-authoritative. The regression and the full controller library and CLI package suites pass.
+
 CPU and Fake-engine tests are not qualification. EM4 must still be rechecked on the qualification VM and the original unified-memory machine, on every supported embedding engine. EM3 must still establish the measured tolerance and margin; this fix does not change the existing provisional 0.02.
 
 # Release note: Fixes
