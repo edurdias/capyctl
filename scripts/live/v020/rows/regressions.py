@@ -12,7 +12,7 @@ ROWS = [
     dict(id='ISSUE236', priority=1, budget=1200,
          criteria='SGLang 0.5.22 and 0.5.23 answer with prefill disabled and decode native in the managed native ServerArgs settings'),
     dict(id='ISSUE235', priority=1, budget=1500,
-         criteria='editable SGLang refused before launch by new server/host; old server/new host records engine_import_failed without reconnect or harming another model'),
+         criteria='current server/current host refuse editable SGLang before launch; a 0.1.12 server refuses a 0.2.0 host with host_version_newer_than_server (ADR 0017 §2)'),
     dict(id='ISSUE240', priority=1, budget=1800,
          criteria='48 durable in-flight leases coexist on a managed engine; traffic survives server-first then host upgrade from 0.1.12 to 0.2.0'),
 ]
@@ -111,7 +111,7 @@ def install_editable_profile(ctx, role):
 '''.replace('EXECUTABLE', json.dumps(str(Path(ctx.engines['SGLANG_EDITABLE']) / 'bin/python')))
     ctx.assertion('runtime_profiles: {}' in text, 'host init config lacks empty runtime_profiles; cannot safely configure editable test')
     config.write_text(text.replace('runtime_profiles: {}', profile.rstrip()))
-    # Old hosts publish registry additions only when a control session starts.
+    # Publish both fixture profiles in the initial control inventory.
     ctx.register('VLLM_033', role)
     process = info['host_process']
     process.terminate()
@@ -135,31 +135,43 @@ def editable(ctx):
     result = ctx.cli('engine', 'add', ctx.engines['SGLANG_EDITABLE'], '--name', 'editable-refusal', check=False)
     ctx.assertion(result.returncode != 0 and 'editable' in result.stdout + result.stderr, 'standalone did not refuse editable add')
     evidence['standalone_refusal'] = dict(exit_code=result.returncode)
-    for role, old in [('server', False), ('old-server', True)]:
-        ctx.role(role, old=old)
-        name, path = install_editable_profile(ctx, role)
-        # A separate real model must remain healthy across the failed start.
-        good = 'control-' + role
-        ctx.deploy(good, 'VLLM_033', role=role, extra={'engine_config': {'context_length': 8192, 'memory': {'kv_cache': '2GiB'}}})
-        good_binding = ctx.owned(good, role)
-        events_before = ctx.events(role)
-        deploy = ctx.cli('deploy', 'model', '--file', str(path), role=role, check=False)
-        start = ctx.cli('start', 'deployment', name, '--wait', role=role, check=False)
-        ctx.deployments.append((role, name))
-        observed = start.stdout + start.stderr + deploy.stdout + deploy.stderr + json.dumps(ctx.events(role))
-        code = 'engine_import_failed' if old else 'installation_unsupported'
-        ctx.assertion(code in observed and start.returncode != 0, 'missing editable refusal code ' + code)
-        ctx.assertion(not ctx.owned(name, role), 'editable engine still has live ownership')
-        if not old:
-            ctx.assertion('editable' in observed, 'new server refusal did not name editable installation')
-        events_after = ctx.events(role)
-        new_events = events_after[len(events_before):]
-        ctx.assertion(not any('disconnect' in json.dumps(event).lower() or 'session_ready' in json.dumps(event).lower()
-                              for event in new_events), 'control session reconnected after editable refusal')
-        ctx.assertion(ctx.owned(good, role) == good_binding, 'other model ownership changed')
-        evidence[role] = dict(code=code, events=new_events, control_answer=answer(ctx, good, role))
-        ctx.cleanup()
-    ctx.assertion('sglang.launch_server' not in ctx.logs()[len(before):] or evidence['old-server'], 'unexpected editable launch')
+    role = 'server'
+    ctx.role(role)
+    name, path = install_editable_profile(ctx, role)
+    # A separate real model must remain healthy across the failed start.
+    good = 'control-' + role
+    ctx.deploy(good, 'VLLM_033', role=role, extra={'engine_config': {'context_length': 8192, 'memory': {'kv_cache': '2GiB'}}})
+    good_binding = ctx.owned(good, role)
+    events_before = ctx.events(role)
+    deploy = ctx.cli('deploy', 'model', '--file', str(path), role=role, check=False)
+    start = ctx.cli('start', 'deployment', name, '--wait', role=role, check=False)
+    ctx.deployments.append((role, name))
+    observed = start.stdout + start.stderr + deploy.stdout + deploy.stderr + json.dumps(ctx.events(role))
+    code = 'installation_unsupported'
+    ctx.assertion(code in observed and start.returncode != 0, 'missing editable refusal code ' + code)
+    ctx.assertion(not ctx.owned(name, role), 'editable engine still has live ownership')
+    ctx.assertion('editable' in observed, 'new server refusal did not name editable installation')
+    events_after = ctx.events(role)
+    new_events = events_after[len(events_before):]
+    ctx.assertion(not any('disconnect' in json.dumps(event).lower() or 'session_ready' in json.dumps(event).lower()
+                          for event in new_events), 'control session reconnected after editable refusal')
+    ctx.assertion(ctx.owned(good, role) == good_binding, 'other model ownership changed')
+    evidence[role] = dict(code=code, events=new_events, control_answer=answer(ctx, good, role))
+    ctx.cleanup()
+    ctx.assertion('sglang.launch_server' not in ctx.logs()[len(before):], 'unexpected editable launch')
+    # ADR 0017 §2: a newer host is refused before inventory reconciliation.
+    role = 'old-server'
+    ctx.role(role, old=True, host_old=False)
+    hosts = json.loads(ctx.cli('list', 'hosts', '--json', role=role).stdout)['hosts']
+    host = next(item for item in hosts if item.get('name') == 'qualification-host')
+    versions = ctx.sql('SELECT binary_version,compatibility,reason FROM host_versions', role=role)
+    ctx.save('old-server-version-refusal', dict(host=host, versions=versions, logs=ctx.logs()))
+    ctx.assertion(any(item['binary_version'] == '0.2.0' and item['compatibility'] == 'refused'
+                      and 'host_version_newer_than_server' in item['reason'] for item in versions),
+                  'old server did not record current-host version refusal')
+    ctx.assertion(not (host.get('session') or {}).get('reconciled'),
+                  'refused newer host established a reconciled session')
+    evidence[role] = dict(code='host_version_newer_than_server', host=host, versions=versions)
     return evidence
 
 

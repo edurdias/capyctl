@@ -329,8 +329,30 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         ctx.register = lambda engine, role: registered.append(engine)
         ctx.spawn_host = lambda *args: published.extend(registered)
         with mock.patch('rows.regressions.time.sleep'):
-            install_editable_profile(ctx, 'old-server')
+            install_editable_profile(ctx, 'server')
         self.assertEqual(published, ['VLLM_033'])
+
+    def test_em2_enrolls_vllm_matryoshka_without_changing_restart_fixtures(self):
+        from rows.functional import run
+        from types import SimpleNamespace
+        launches = []
+        class Captured(Exception):
+            pass
+        def deploy(*args, **kwargs):
+            launches.append(kwargs)
+            raise Captured
+        ctx = SimpleNamespace(deploy=deploy)
+        for row in ('EM2', 'EM4'):
+            with self.assertRaises(Captured):
+                run(ctx, dict(id=row))
+        config = launches[0]['extra']['engine_config']
+        self.assertTrue(config['accept_extra_args'])
+        self.assertEqual(config['extra_args'], ['--hf-overrides', '{"is_matryoshka":true}'])
+        self.assertEqual(launches[1]['extra'], {})
+        ctx = v020.Context(self.root, {})
+        ctx.owned = lambda name: []
+        ctx.logs = lambda name: "non-default args: {'hf_overrides': {'is_matryoshka': True}}"
+        self.assertEqual(ctx.engine_args('model')['resolved']['hf_overrides'], {'is_matryoshka': True})
 
     def test_llama_embeddings_keep_required_context_and_derive_kv_from_gguf(self):
         ctx = v020.Context(self.root, {})
@@ -347,7 +369,7 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         config = json.loads((self.root / 'python-embedding.json').read_text())
         self.assertEqual(config['engine_config']['memory']['kv_cache'], '5GiB')
 
-    def test_old_server_fixture_enrolls_an_old_host_not_a_newer_refused_host(self):
+    def test_old_server_defaults_to_old_host_but_accepts_explicit_generation_override(self):
         from types import SimpleNamespace
         from unittest import mock
         ctx = v020.Context(self.root, {})
@@ -364,6 +386,10 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         with mock.patch.object(ctx, 'enroll') as enroll:
             ctx.role('old-server', old=True)
         enroll.assert_called_once_with('old-server', old=True)
+        ctx.roles.clear()
+        with mock.patch.object(ctx, 'enroll') as enroll:
+            ctx.role('old-server', old=True, host_old=False)
+        enroll.assert_called_once_with('old-server', old=False)
 
     def test_failed_native_start_preserves_sanitized_engine_diagnostics(self):
         ctx = v020.Context(self.root, {})
