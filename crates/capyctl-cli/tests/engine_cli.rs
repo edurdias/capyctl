@@ -456,6 +456,52 @@ async fn add_version_mismatch_writes_nothing() {
     assert!(!engines_beside(&document).exists());
 }
 
+// T07 T21 T22: SGLang's sm_120 import loads DeepGEMM, which needs the
+// selected CUDA toolkit even when only the capability shapes are probed.
+#[tokio::test]
+async fn add_sglang_probes_with_the_cuda_home_it_records() {
+    let dir = private_dir();
+    let document = host_doc(dir.path());
+    let cuda = dir.path().join("cuda");
+    script(&cuda.join("bin/nvcc"), "exit 0");
+    for version in ["0.5.22", "0.5.23"] {
+        let env = dir.path().join(format!("sglang-{version}"));
+        let site = env.join("lib/python3.12/site-packages");
+        std::fs::create_dir_all(site.join("sglang")).unwrap();
+        let metadata = site.join(format!("sglang-{version}.dist-info"));
+        std::fs::create_dir_all(&metadata).unwrap();
+        std::fs::write(
+            metadata.join("METADATA"),
+            format!("Name: sglang\nVersion: {version}\n"),
+        )
+        .unwrap();
+        std::fs::write(env.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        let available = json!({"schema": "capyctl/engine-capabilities/v1", "engine": "sglang",
+            "capabilities": {"core": [], "deep_park": [], "metrics": [], "observation": []}});
+        let missing = json!({"schema": "capyctl/engine-capabilities/v1", "engine": "sglang",
+            "capabilities": {"core": ["http_server.launch_server"],
+                "deep_park": ["route:/release_memory_occupation"], "metrics": [], "observation": []}});
+        script(
+            &env.join("bin/python3"),
+            &format!(
+                "if [ \"$2\" != '-S' ]; then echo '{version}'; exit 0; fi\n\
+                 [ -z \"${{HOME+x}}${{PYTHONPATH+x}}${{LD_PRELOAD+x}}\" ] || exit 19\n\
+                 if [ \"${{CUDA_HOME-unset}}\" = '{}' ]; then\n\
+                 echo '{available}'\nelse\necho '{missing}'\nfi",
+                cuda.display()
+            ),
+        );
+        let mut command = add(&env);
+        if let Command::EngineAdd { name, .. } = &mut command {
+            *name = Some(format!("sglang-{}", version.replace('.', "-")));
+        }
+        let out = engine_with_cuda(&command, &document, &cuda).await.unwrap();
+        assert_eq!(out["cuda_home"], cuda.to_string_lossy().as_ref());
+        assert_eq!(out["deep_park_probe"], "available", "{out}");
+        assert_eq!(out["deep_park"], "enabled");
+    }
+}
+
 // T21 (owner decision 2026-09-25): a probe that reports deep park missing
 // writes it disabled, unless the operator asked for enabled.
 #[tokio::test]

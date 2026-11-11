@@ -205,6 +205,11 @@ impl NativeHostExecution {
             effective.profile.engine,
             std::path::Path::new(&effective.profile.executable),
             &self.runtime_dir,
+            effective
+                .profile
+                .cuda_home
+                .as_deref()
+                .map(std::path::Path::new),
         ) else {
             return Ok(());
         };
@@ -248,6 +253,11 @@ impl NativeHostExecution {
             effective.profile.engine,
             executable,
             &self.runtime_dir,
+            effective
+                .profile
+                .cuda_home
+                .as_deref()
+                .map(std::path::Path::new),
         )?;
         if report.available("deep_park") == Some(false) {
             return Some("capability_missing:deep_park");
