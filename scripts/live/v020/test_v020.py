@@ -332,6 +332,22 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
             install_editable_profile(ctx, 'server')
         self.assertEqual(published, ['VLLM_033'])
 
+    def test_tracing_refusal_accepts_the_actual_sglang_policy_diagnostic(self):
+        from rows.functional import tracing_refusals
+        from types import SimpleNamespace
+        def cli(*args, **kwargs):
+            reason = ('engine_env_reserved' if any('--env=' in arg for arg in args)
+                      else 'not accepted here' if '--arg=--enable-trace' in args else 'reserved')
+            return SimpleNamespace(returncode=2, stdout='', stderr=reason)
+        ctx = SimpleNamespace(root=self.root, binary=lambda: 'capyctl', cli=cli,
+                              installation=lambda key: '/fixture',
+                              command=lambda *args, **kwargs: SimpleNamespace(
+                                  returncode=13, stdout='', stderr='loopback'),
+                              assertion=v020.Context.assertion)
+        result = tracing_refusals(ctx, {})
+        self.assertEqual(result['verdict'], 'pass')
+        self.assertEqual(len(result['evidence']['profile_refusals']), 3)
+
     def test_embedding_load_declares_capacity_for_the_sixteen_client_cells(self):
         from rows.measurements import em8
         from types import SimpleNamespace
