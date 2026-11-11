@@ -57,6 +57,14 @@ impl ScriptedTool {
         Self::starts_nothing(None)
     }
 
+    /// An in-process Fake whose virtual engine identities are alive. No
+    /// operating-system process is spawned or signalled by these tools.
+    pub fn in_process() -> Arc<Self> {
+        let tools = Self::starts_nothing(None);
+        *tools.present.lock().unwrap() = Presence::Alive;
+        tools
+    }
+
     /// Tools that signal and then cannot prove the group gone.
     pub fn unprovable() -> Arc<Self> {
         Self::starts_nothing(Some("a recorded process could not be proven gone".into()))

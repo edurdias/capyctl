@@ -155,3 +155,81 @@ async fn chat_and_embeddings_keep_32_slots_when_concurrency_is_undeclared() {
         holds_exactly(None, api, 32).await;
     }
 }
+
+// T47 T37 EM4 (ADR 0036 §§5, 6): the standalone Fake installation must
+// honor the frozen embeddings API. Its first launch records the real
+// embedding reference; a restart compares that same reference before Ready.
+#[tokio::test]
+async fn standalone_embeddings_record_and_compare_their_reference() {
+    let state = support::safe_state_dir();
+    let app = support::boot(state.path()).await;
+    let id = configured(&app, Some(1), DeploymentApi::Embeddings).await;
+    let launched = app.store.serving_instances(&id).unwrap().remove(0);
+    let Some(capyctl_store::wake_canary::WakeCanaryReference::Embedding(baseline)) = app
+        .store
+        .wake_canary(
+            &id,
+            launched.instance_index,
+            launched.generation,
+            &launched.incarnation,
+        )
+        .unwrap()
+    else {
+        panic!("the first embedding launch must retain its reference");
+    };
+    let expected = capyctl_testkit::fake_engine::FakeEmbeddings::default().vector;
+    assert_eq!(baseline.dimension as usize, expected.len());
+    assert_eq!(baseline.vector, expected);
+    assert!(!app
+        .store
+        .events_after(None, 1000)
+        .unwrap()
+        .events
+        .iter()
+        .any(|event| event.deployment_id.as_deref() == Some(&id)
+            && event.kind == "embedding_canary_checked"));
+    for action in [LifecycleAction::Stop, LifecycleAction::Start] {
+        let operation = app
+            .controller
+            .request_transition(&id, action)
+            .await
+            .unwrap();
+        app.controller.wait_terminal(&operation).await.unwrap();
+    }
+    let events = app.store.events_after(None, 1000).unwrap().events;
+    let checked: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.deployment_id.as_deref() == Some(&id) && event.kind == "embedding_canary_checked"
+        })
+        .collect();
+    assert_eq!(checked.len(), 1);
+    let payload: serde_json::Value = serde_json::from_str(&checked[0].payload_json).unwrap();
+    assert_eq!(payload["verdict"], "pass");
+    assert_eq!(payload["relative_distance"], 0.0);
+    assert_eq!(payload["tolerance"], baseline.tolerance);
+    assert_eq!(payload["reference_generation"], launched.generation);
+    assert_eq!(payload["reference_incarnation"], launched.incarnation);
+    let ready = events
+        .iter()
+        .find(|event| {
+            event.kind == "ready_committed" && event.operation_id == checked[0].operation_id
+        })
+        .unwrap();
+    assert!(checked[0].cursor.sequence < ready.cursor.sequence);
+    let restarted = app.store.serving_instances(&id).unwrap().remove(0);
+    assert_eq!(
+        app.store
+            .wake_canary(
+                &id,
+                restarted.instance_index,
+                restarted.generation,
+                &restarted.incarnation,
+            )
+            .unwrap(),
+        Some(capyctl_store::wake_canary::WakeCanaryReference::Embedding(
+            baseline
+        ))
+    );
+    app.shutdown().await.unwrap();
+}
