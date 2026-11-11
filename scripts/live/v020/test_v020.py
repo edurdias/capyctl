@@ -332,6 +332,20 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
             install_editable_profile(ctx, 'server')
         self.assertEqual(published, ['VLLM_033'])
 
+    def test_embedding_load_declares_capacity_for_the_sixteen_client_cells(self):
+        from rows.measurements import em8
+        from types import SimpleNamespace
+        launches = []
+        class Captured(Exception):
+            pass
+        def deploy(*args, **kwargs):
+            launches.append(kwargs)
+            raise Captured
+        ctx = SimpleNamespace(engines={}, deploy=deploy)
+        with self.assertRaises(Captured):
+            em8(ctx, {})
+        self.assertEqual(launches[0]['extra']['engine_config']['max_concurrent_requests'], 16)
+
     def test_em2_enrolls_vllm_matryoshka_without_changing_restart_fixtures(self):
         from rows.functional import run
         from types import SimpleNamespace

@@ -195,7 +195,8 @@ def em8(ctx, evidence):
         ctx.assertion(data.get('revision') and data.get('source') and data.get('queries') and data.get('documents'), 'retrieval fixture needs source, revision, documents and queries with relevant indices')
     for engine in ('vllm033', 'sglang0523', 'llamacpp090'):
         name = 'em8-' + engine
-        ctx.deploy(name, engine, model='embedding', api='embeddings')
+        ctx.deploy(name, engine, model='embedding', api='embeddings',
+                   extra={'engine_config': {'max_concurrent_requests': 16}})
         matrix = []
         evidence[engine] = dict(matrix=matrix)
         for batch in (1,16,256):

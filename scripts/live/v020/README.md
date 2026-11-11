@@ -84,6 +84,8 @@ requested override and effective native settings. Both Python engines must
 return 256-length vectors; llama.cpp must refuse with `400 invalid_request`.
 EM8 failures retain sanitized router and engine logs before managed cleanup;
 per-request evidence includes the complete request, response and elapsed timing.
+EM8 declares 16 concurrent engine slots for its 16-client matrix cells; queue
+refusals and incomplete responses still fail the row rather than count as samples.
 No apt, driver update, system CUDA modification or reboot is allowed. Missing
 compilers/tools are blocking preflight errors, not permission to install packages.
 
