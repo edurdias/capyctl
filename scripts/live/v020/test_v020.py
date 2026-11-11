@@ -313,6 +313,25 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
                 editable(ctx)
         self.assertEqual(ctx.extra['engine_config']['context_length'], 8192)
 
+    def test_editable_fixture_registers_control_before_host_publication(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from rows.regressions import install_editable_profile
+        config = self.root / 'host.yaml'
+        config.write_text('runtime_profiles: {}\n')
+        published = []
+        registered = []
+        process = SimpleNamespace(terminate=lambda: None, wait=lambda timeout: None)
+        info = dict(host_config=config, host_process=process, host_binary='old')
+        ctx = SimpleNamespace(root=self.root, engines={'SGLANG_EDITABLE': '/fixture'},
+                              role=lambda role: info, remaining=lambda: 60,
+                              assertion=v020.Context.assertion)
+        ctx.register = lambda engine, role: registered.append(engine)
+        ctx.spawn_host = lambda *args: published.extend(registered)
+        with mock.patch('rows.regressions.time.sleep'):
+            install_editable_profile(ctx, 'old-server')
+        self.assertEqual(published, ['VLLM_033'])
+
     def test_llama_embeddings_keep_required_context_and_derive_kv_from_gguf(self):
         ctx = v020.Context(self.root, {})
         ctx.role = lambda role: None

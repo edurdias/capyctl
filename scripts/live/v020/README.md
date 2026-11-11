@@ -75,6 +75,8 @@ slots, deriving their native KV reservation from the GGUF rather than inheriting
 the Python-engine fixture's 5 GiB override.
 An old-server fixture enrolls the matching old host: a newer host is correctly
 refused by the server-first upgrade gate and cannot exercise editable refusal.
+Its healthy control profile is registered before the editable-fixture host
+restart, because 0.1.12 publishes registry additions only at session startup.
 EM8 failures retain sanitized router and engine logs before managed cleanup;
 per-request evidence includes the complete request, response and elapsed timing.
 No apt, driver update, system CUDA modification or reboot is allowed. Missing

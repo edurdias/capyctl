@@ -111,6 +111,8 @@ def install_editable_profile(ctx, role):
 '''.replace('EXECUTABLE', json.dumps(str(Path(ctx.engines['SGLANG_EDITABLE']) / 'bin/python')))
     ctx.assertion('runtime_profiles: {}' in text, 'host init config lacks empty runtime_profiles; cannot safely configure editable test')
     config.write_text(text.replace('runtime_profiles: {}', profile.rstrip()))
+    # Old hosts publish registry additions only when a control session starts.
+    ctx.register('VLLM_033', role)
     process = info['host_process']
     process.terminate()
     process.wait(timeout=min(60, ctx.remaining()))
