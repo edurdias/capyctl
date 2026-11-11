@@ -239,14 +239,18 @@ impl Ingress {
         Self::build(Some(tracing))
     }
     fn build(tracing: Option<Tracing>) -> Result<Arc<Self>, IngressError> {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5));
+        // SPEC §10, ADR 0036 §10: the head bound below and the router's
+        // request/idle bounds govern forwarding, not an implicit 30-second
+        // TCP_USER_TIMEOUT when a busy engine stops reading an upload.
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        let client = client.tcp_user_timeout(None);
         Ok(Arc::new(Self {
             registry: Mutex::new(Registry::default()),
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(5))
-                .build()
-                .map_err(|_| IngressError)?,
+            client: client.build().map_err(|_| IngressError)?,
             capacity: Arc::new(Semaphore::new(64)),
             tracing,
         }))
