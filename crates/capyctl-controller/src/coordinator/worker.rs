@@ -4579,18 +4579,19 @@ fn engine_processes_alive(
     driver: &Driver,
     identities: &mut Vec<capyctl_domain::completion::ProcessIdentity>,
 ) -> Result<(), String> {
-    if driver.tools.is_none() {
+    // SPEC §6.1: use the immutable binding's process observer. Native
+    // tools check the recorded boot, PID and start time, as at launch.
+    let Some(tools) = driver.tools.as_ref() else {
         return Ok(());
-    }
+    };
     identities.retain(|identity| {
         !identity.is_helper()
-            || capyctl_launchers::process_absence::presence(identity)
-                == capyctl_domain::completion::Presence::Alive
+            || tools.present(identity) == capyctl_domain::completion::Presence::Alive
     });
-    match identities.iter().find(|identity| {
-        capyctl_launchers::process_absence::presence(identity)
-            != capyctl_domain::completion::Presence::Alive
-    }) {
+    match identities
+        .iter()
+        .find(|identity| tools.present(identity) != capyctl_domain::completion::Presence::Alive)
+    {
         Some(identity) => Err(format!(
             "recorded {} process {} is not the one alive",
             identity.role, identity.pid
