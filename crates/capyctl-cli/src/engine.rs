@@ -1408,7 +1408,7 @@ fn listed_lmcache(
         engine,
         Path::new(executable),
         registration.as_ref(),
-        capyctl_config::lmcache::TransferMode::LmcacheDriven,
+        capyctl_config::effective::Residency::RestartOnly,
     ) {
         Ok(install) => {
             let registered = registration.map_or(install.version, |r| r.version);

@@ -1706,7 +1706,7 @@ impl InstallationRegistry {
 
     /// ADR 0033 §1: the launch-time check of `profile`'s LMCache
     /// ([`crate::lmcache_install::check_lmcache`]) for a launch rendering
-    /// `transfer` (ADR 0034 §1). A digest other than the
+    /// `residency` (ADR 0034 §1). A digest other than the
     /// registered one is drift, handled as the engine package's is (ADR
     /// 0008): flagged on the role log, and refused `installation_drift` only
     /// under `installation_drift: refuse`. The inner result is the check's
@@ -1717,7 +1717,7 @@ impl InstallationRegistry {
         engine: Engine,
         executable: &Path,
         registered: Option<&capyctl_config::lmcache::LmcacheRegistration>,
-        transfer: capyctl_config::lmcache::TransferMode,
+        residency: capyctl_config::effective::Residency,
         policy: InstallationDrift,
     ) -> Result<
         Result<crate::lmcache_install::LmcacheInstall, crate::lmcache_install::LmcacheCheckFailure>,
@@ -1728,7 +1728,7 @@ impl InstallationRegistry {
             engine,
             executable,
             registered,
-            transfer,
+            residency,
         );
         // ADR 0033 §1: the drift stands in status until a check measures
         // the registered digest again.

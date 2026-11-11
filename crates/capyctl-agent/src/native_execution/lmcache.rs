@@ -57,6 +57,7 @@ pub(super) fn required_refusal(reason: LmcacheOffReason) -> &'static str {
         R::NotRegistered => "lmcache_unavailable:not_registered",
         R::VersionUnsupported => "lmcache_unavailable:version_unsupported",
         R::CheckFailed => "lmcache_unavailable:check_failed",
+        R::SleepClearsCache => "lmcache_unavailable:sleep_clears_cache",
         R::GroupUnsupported => "lmcache_unavailable:group_unsupported",
         R::MultiGpuUnqualified => "lmcache_unavailable:multi_gpu_unqualified",
         R::ParkUnqualified => "lmcache_unavailable:park_unqualified",
@@ -288,7 +289,7 @@ impl NativeHostExecution {
                 effective.profile.engine,
                 Path::new(&effective.profile.executable),
                 effective.profile.lmcache.as_ref(),
-                host.transfer,
+                effective.residency,
                 effective.profile.security.installation_drift,
             )? {
                 Ok(_) => None,

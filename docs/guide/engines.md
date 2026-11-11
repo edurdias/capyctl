@@ -1182,6 +1182,12 @@ unified connector, which puts it in the cache key, and SGLang does not use
 LMCache's older SGLang adapter (which dropped the salt, LMCache issue 4825).
 A release without that path fails the check, and its deployments run without
 LMCache until a release has it. A failed check names what was missing.
+For vLLM `deep` and `host_backed` parking, it also detects the known sleep
+path that resets the external connector and clears the LMCache server.
+Such a launch runs without LMCache under `auto` (`sleep_clears_cache`) or
+refuses `lmcache_unavailable:sleep_clears_cache` under `required`, even if
+the combination is listed as certified. `restart_only` does not call sleep
+and is unaffected. Engine-driven transfer reserves no held engine KV.
 
 **`capyctl engine list`** shows an `LMCACHE` column: the registered version,
 or `off (<reason>)` for a profile that cannot use it.

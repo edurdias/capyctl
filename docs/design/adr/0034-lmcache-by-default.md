@@ -329,6 +329,12 @@ combination under test, as LC4 was meant to be.
 **Pass criteria.** A combination (exact engine version, `model_type`, GPU product name,
 residency) enters the released table when, on that combination:
 
+For sleep-based parking, the installation must first preserve the external cache through
+sleep (amendment of 2026-11-10 below). LC13–LC16, including the enrolled-host LC15 row,
+cannot pass on an installation whose sleep clears LMCache. A typed refusal or an
+`auto` fallback proves the compatibility guard only: it is not a passing hit, memory,
+endurance or cost qualification and must not add a row to `QUALIFIED_PARKING`.
+
 - **Correctness (LC13, LC14).** Every first request after a wake, at temperature 0, gives
   the answer a `lmcache: off` deployment of the same model and residency gives for the same prompt;
   LMCache's hit counter shows the prompt's whole 256-token chunks coming back (for a
@@ -718,3 +724,55 @@ malformed requests) are unaffected. Here it turns the qualified table into the c
 set: `lmcache: required` on a combination outside it, or on a model across several GPUs,
 runs uncertified instead of being refused (§3a, §6, §7); `lmcache: auto` keeps LMCache off
 there, and the refusals that describe the installation or a safety setting stay.
+
+## Amendment of 2026-11-10: sleep may clear the external cache
+
+LC15 on the rented discrete GPU, vLLM 0.33.0 with LMCache 0.5.7, used the intended
+`host_backed` rendering: engine-driven transfer on both sides, loopback-only listeners,
+and the same owned server throughout the wakes. Its 32k prompt was stored, but every
+post-sleep lookup missed. The engine log reports 5 GiB of KV discarded at sleep; the
+server's GPU reading stays at 416 MiB. The recorded 5 GiB `held_kv_bytes` was a CapyCTL
+accounting defect, not an IPC mapping: engine-driven launches must reserve zero held
+engine KV. LMCache-driven restart-parks retain A13's reserve and A15's guards.
+
+The installed vLLM 0.33.0 `v1/engine/core.py:993–1008` calls
+`pause_scheduler(clear_cache=True)` for sleep levels 1 and 2. Its
+`_finish_pause` and `_reset_caches` (`:932–953`) reset the external connector by default.
+The downloaded vLLM 0.32.0 wheel has the same chain (`:898–919`, `:959–974`), so this
+is not a 0.33.0-only version restriction. LMCache's
+[`LMCacheMPConnector.reset_cache`](https://github.com/LMCache/LMCache/blob/v0.5.7/lmcache/integration/vllm/lmcache_mp_connector.py)
+calls its scheduler adapter's
+[`reset_cache`](https://github.com/LMCache/LMCache/blob/v0.5.7/lmcache/integration/vllm/vllm_multi_process_adapter.py),
+which sends `CLEAR` to each server. The
+[`management.clear`](https://github.com/LMCache/LMCache/blob/v0.5.7/lmcache/v1/multiprocess/modules/management.py)
+handler clears the storage manager, with no client or model namespace. The corresponding
+0.5.6 sources have the same behavior.
+
+Neither engine's inspected sleep route exposes a preserve-external-cache argument:
+level 0 releases no GPU memory, and `release_kv_cache_memory` also resets the connector.
+LMCache 0.5.6 and 0.5.7 expose no server option to ignore `CLEAR`. Their custom server
+module extension is not a built-in preservation mode; CapyCTL does not override upstream
+cache-reset semantics with Python patches.
+
+The launch-time shape check therefore rejects this known sleep-reset chain for vLLM
+sleep-based parking with `sleep_clears_cache`. `lmcache: required` refuses
+`lmcache_unavailable:sleep_clears_cache`; `auto` keeps the requested parking residency
+and reports LMCache off with that reason and its explanation in status and events.
+Restart-only parking is unaffected: it stops the engine rather than calling sleep.
+The October checks in the status runbook
+("An enrolled host wakes a model parked with LMCache" and the held-KV bound check) used
+`restart_only`, LMCache-driven transfer and engine restarts. Their hits do not establish
+external-cache retention across sleep.
+
+LC13–LC16 still require real hits and the original memory and cost bounds on a
+compatible installation; LC15 additionally requires the enrolled-host wake canary.
+The observed parked system footprint also exceeded its bound by 677 MB: clearing the
+cache or fixing its accounting is not evidence that this memory bound now passes.
+The engine's parked RSS was 17,097,093,120 bytes with LMCache, against 14,768,627,712
+without it, while its parked GPU figure was identical (620 MiB). The selected async
+engine-driven transfer implementation returns pinned CPU staging tensors to a
+[`_staging_pool`](https://github.com/LMCache/LMCache/blob/v0.5.7/lmcache/v1/multiprocess/transfer_context/async_engine_driven.py)
+instead of freeing them after a transfer. This is consistent with the extra host RSS,
+not evidence of retained GPU KV. No live retest establishes a reduced host footprint.
+No sleep-based vLLM row is qualified by this investigation. CPU and Fake-engine tests
+are not qualification.
