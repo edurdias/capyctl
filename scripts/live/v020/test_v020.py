@@ -397,7 +397,9 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
             with self.assertRaises(Captured):
                 editable(ctx)
         self.assertEqual(ctx.extra['engine_config']['context_length'], 8192)
-        self.assertEqual(actions, ['register', 'restart'])
+        # The current/current editable path publishes the control profile in the
+        # fixture's own host restart; only the dropped old-host variant registered first.
+        self.assertEqual(actions, ['restart'])
 
     def test_editable_fixture_registers_control_before_host_publication(self):
         from types import SimpleNamespace
