@@ -93,6 +93,8 @@ requiring the word `reserved`; full sanitized refusal text remains in evidence.
 TensorRT-LLM 1.2.1 pins NumPy 1.26.4 and PyArrow 21: its NumPy `<2`
 requirement conflicts with PyArrow 26's import-time NumPy `>=2` requirement,
 which its wheel metadata does not declare. The rc3 environment is unchanged.
+TensorRT fixtures omit an implicit context length so the controller fits it to
+the fixed KV budget; TR3 expects the engine's whole-block floor, not a ceiling.
 No apt, driver update, system CUDA modification or reboot is allowed. Missing
 compilers/tools are blocking preflight errors, not permission to install packages.
 

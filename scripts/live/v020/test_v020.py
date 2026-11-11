@@ -416,6 +416,22 @@ v020_setup_tensorrt TENSORRT_LLM_140RC3 1.4.0rc3 2.14.0 cu132 13.4 CUDA_HOME_TRT
             em8(ctx, {})
         self.assertEqual(launches[0]['extra']['engine_config']['max_concurrent_requests'], 16)
 
+    def test_tensorrt_fixture_fits_context_to_its_fixed_kv_pool(self):
+        ctx = v020.Context(self.root, {})
+        ctx.role = lambda role: None
+        ctx.register = lambda engine, role: 'profile'
+        ctx.cli = lambda *args, **kwargs: None
+        ctx.status = lambda *args: {}
+        ctx.deploy('trt', 'TENSORRT_LLM_121', extra={
+            'engine_config': {'memory': {'kv_cache': '4GiB'}}})
+        config = json.loads((self.root / 'trt.json').read_text())['engine_config']
+        self.assertNotIn('context_length', config)
+        self.assertEqual(config['memory']['kv_cache'], '4GiB')
+        ctx.deploy('explicit', 'TENSORRT_LLM_121', extra={
+            'engine_config': {'context_length': 8192}})
+        config = json.loads((self.root / 'explicit.json').read_text())['engine_config']
+        self.assertEqual(config['context_length'], 8192)
+
     def test_em2_enrolls_python_matryoshka_without_changing_restart_fixtures(self):
         from rows.functional import run
         from types import SimpleNamespace

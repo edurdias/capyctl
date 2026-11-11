@@ -554,7 +554,7 @@ def tr3(ctx,evidence,engine='TENSORRT_LLM_121'):
             block=number(logs,('tokens_per_block','block_size'))
             kv=number(logs,('kv_cache_bytes','kv_cache_size_bytes'))
             requested=number(logs,('requested_max_tokens','rendered_max_tokens'))
-            ctx.assertion(pool==math.ceil(requested/block)*block,'built TensorRT pool differs from block-rounded rendered max_tokens')
+            ctx.assertion(pool==math.floor(requested/block)*block,'built TensorRT pool differs from whole-block floor of rendered max_tokens')
             # Prove the cold launch uses only the newly-created session cache.
             if index==0:
                 proved=False

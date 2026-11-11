@@ -349,6 +349,9 @@ class Context:
         if 'llamacpp' in engine.lower() and api == 'embeddings':
             # Preserve the qualification context/slots; GGUF metadata sizes native KV.
             config['engine_config'].pop('memory')
+        if engine.upper().startswith(('TENSORRT_LLM', 'TRT_LLM')):
+            # Let the controller fit context to the fixed, block-rounded KV pool.
+            config['engine_config'].pop('context_length')
         if role != 'standalone':
             config['host'] = 'qualification-host'
         if 'tensorfold' in engine.lower():
