@@ -529,7 +529,14 @@ fn inventory_shape_valid(inventory: &pb::ReportInventory, host: &str) -> bool {
         })
         && inventory.profiles.iter().all(|p| {
             bounded_name(&p.name)
-                && bounded_name(&p.build_fingerprint)
+                // SPEC §4.2 / ADR 0017: a build fingerprint is bounded display
+                // text (the example host documents include spaces), not a name.
+                // Reject control characters without blocking host registration.
+                && !p.build_fingerprint.is_empty()
+                && p.build_fingerprint.len() <= 256
+                && p.build_fingerprint
+                    .bytes()
+                    .all(|b| b.is_ascii_graphic() || b == b' ')
                 && matches!(
                     p.eligibility.as_str(),
                     "unknown" | "qualified" | "unsupported" | "disabled"
@@ -2705,6 +2712,25 @@ mod memory_source_tests {
                 ..Default::default()
             }),
             ..Default::default()
+        }
+    }
+
+    // T21 T22 T34 (ADR 0017, #235): documented build fingerprints are
+    // display text, not profile names. Registration must precede launch refusal.
+    #[test]
+    fn editable_profile_display_fingerprint_does_not_block_registration() {
+        let mut report = inventory("meminfo");
+        report.profiles.push(pb::RuntimeProfileStatus {
+            name: "editable-test".into(),
+            build_fingerprint: "sglang 0.5.23".into(),
+            eligibility: "unknown".into(),
+            installation_state: "unmeasured".into(),
+            ..Default::default()
+        });
+        assert!(inventory_shape_valid(&report, "host-a"));
+        for malformed in ["", "sglang\n0.5.23", "sglang\t0.5.23", &"x".repeat(257)] {
+            report.profiles[0].build_fingerprint = malformed.into();
+            assert!(!inventory_shape_valid(&report, "host-a"), "{malformed:?}");
         }
     }
 
