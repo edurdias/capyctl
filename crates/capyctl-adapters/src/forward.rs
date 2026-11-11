@@ -369,6 +369,82 @@ fn embedding_uncertain() -> AdapterError {
     AdapterError::Uncertain("embeddings answer unverified".into())
 }
 
+/// SPEC §§10, 13.3: diagnose uncertainty without logging a request, response,
+/// credential, URL or arbitrary upstream error text. Successful forwards
+/// allocate nothing for diagnostics.
+struct ForwardDiagnostic<'a> {
+    endpoint: &'a str,
+    started: std::time::Instant,
+    request_body_bytes: usize,
+}
+
+impl<'a> ForwardDiagnostic<'a> {
+    fn new(endpoint: &'a str, request_body_bytes: usize) -> Self {
+        Self {
+            endpoint,
+            started: std::time::Instant::now(),
+            request_body_bytes,
+        }
+    }
+
+    fn event(
+        &self,
+        phase: &str,
+        reason: &str,
+        received: usize,
+        error: Option<&reqwest::Error>,
+    ) -> Value {
+        use std::error::Error;
+
+        let mut io_kind = None;
+        let mut closed_by_peer = false;
+        let mut source = error.and_then(Error::source);
+        for _ in 0..16 {
+            let Some(cause) = source else { break };
+            if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+                io_kind = Some(format!("{:?}", io.kind()));
+                closed_by_peer |= matches!(
+                    io.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                );
+            }
+            // Hyper's incomplete-message error has no public reqwest
+            // category. Recognize its fixed wording, but never log the
+            // source's text: other errors may contain private URLs or data.
+            closed_by_peer |= cause.to_string() == "connection closed before message completed";
+            source = cause.source();
+        }
+        json!({
+            "event": "inference_forward_failed",
+            "endpoint": self.endpoint,
+            "phase": phase,
+            "reason": reason,
+            "elapsed_ms": self.started.elapsed().as_millis(),
+            "at_unix_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_millis()),
+            "request_body_bytes": self.request_body_bytes,
+            "bytes_received": received,
+            // reqwest does not expose socket-write progress or pool reuse.
+            // The supplied body length is not proof those bytes were sent.
+            "bytes_sent": null,
+            "connection_reused": null,
+            "timeout": error.is_some_and(reqwest::Error::is_timeout),
+            "connect": error.is_some_and(reqwest::Error::is_connect),
+            "body": error.is_some_and(reqwest::Error::is_body),
+            "request": error.is_some_and(reqwest::Error::is_request),
+            "closed_by_peer": closed_by_peer,
+            "io_kind": io_kind,
+        })
+    }
+
+    fn failed(&self, phase: &str, reason: &str, received: usize, error: Option<&reqwest::Error>) {
+        capyctl_domain::role_log::event(self.event(phase, reason, received, error));
+    }
+}
+
 /// The only upstream paths a forwarder may reach on an engine.
 ///
 /// SPEC §10: the router relays inference and nothing else. An engine also serves
@@ -519,9 +595,15 @@ impl ChatHttp {
         key: Option<String>,
         cache_salt: CacheSalt,
     ) -> Self {
+        // SPEC §10, ADR 0036 §4: inference is not replayed after acceptance
+        // becomes uncertain. Uvicorn's keepalive expiry can reset a reused
+        // socket before its protocol reads the new request's buffered bytes
+        // (vLLM 0.33.0, EM8 request 17). Keep the Client, but use one TCP
+        // connect per request: loopback here, or LAN to a host's ingress.
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
+            .pool_max_idle_per_host(0)
             .no_proxy()
             .connect_timeout(Duration::from_secs(10));
         // SPEC §10, ADR 0036 §4: the router owns request and idle bounds.
@@ -926,6 +1008,7 @@ impl ChatHttp {
         trace: Option<&crate::traits::TraceHeaders>,
         unverified: fn() -> AdapterError,
     ) -> Result<reqwest::Response, AdapterError> {
+        let diagnostic = ForwardDiagnostic::new(url.path(), body.len());
         let mut send = self
             .client
             .post(url.clone())
@@ -944,6 +1027,18 @@ impl ChatHttp {
             }
         }
         let response = send.send().await.map_err(|error| {
+            // reqwest's send covers both the upload and waiting for the
+            // response head; it cannot identify a finer phase here.
+            diagnostic.failed(
+                if error.is_connect() {
+                    "connect"
+                } else {
+                    "send_or_await_head"
+                },
+                "transport",
+                0,
+                Some(&error),
+            );
             // SPEC §10, ADR 0013 §10: a connection that was never established
             // carried no request, so nothing can be running for it and the
             // router may fail over. Any other transport error may follow a sent
@@ -1061,22 +1156,26 @@ impl ChatHttp {
         let request = body
             .encode(&[("model", &json!(self.model))])
             .map_err(|_| AdapterError::UnsupportedCapability)?;
+        let diagnostic = ForwardDiagnostic::new("/v1/embeddings", request.len());
         // ADR 0037 §6: trace headers are threaded through chat and decisions
         // forwards only; an embeddings forward sends none.
         let response = self
             .post(&self.embeddings, request, None, None, embedding_uncertain)
             .await?;
         if !response.status().is_success() || !content_type_is(&response, "application/json") {
+            diagnostic.failed("await_head", "unexpected_status_or_content_type", 0, None);
             return Err(embedding_uncertain());
         }
-        let malformed = |malformed: crate::embedding_answer::Malformed| {
-            AdapterError::Uncertain(format!("embeddings answer malformed: {}", malformed.0))
-        };
         let mut parser = AnswerParser::new(expected, public);
         let mut client_gone = false;
+        let mut received = 0;
         let mut stream = response.bytes_stream();
         while let Some(bytes) = stream.next().await {
-            let bytes = bytes.map_err(|_| embedding_uncertain())?;
+            let bytes = bytes.map_err(|error| {
+                diagnostic.failed("read_body", "transport", received, Some(&error));
+                embedding_uncertain()
+            })?;
+            received += bytes.len();
             sink.progressed();
             // The bytes before a break are relayed whatever the transport's
             // chunking; nothing from the break on ever is.
@@ -1085,9 +1184,15 @@ impl ChatHttp {
             if !client_gone && !relayed.is_empty() {
                 client_gone = sink.send(relayed).await.is_err();
             }
-            checked.map_err(malformed)?;
+            checked.map_err(|malformed| {
+                diagnostic.failed("validate_body", malformed.0, received, None);
+                AdapterError::Uncertain(format!("embeddings answer malformed: {}", malformed.0))
+            })?;
         }
-        let complete = parser.finish().map_err(malformed)?;
+        let complete = parser.finish().map_err(|malformed| {
+            diagnostic.failed("validate_end", malformed.0, received, None);
+            AdapterError::Uncertain(format!("embeddings answer malformed: {}", malformed.0))
+        })?;
         Ok(EmbeddingAnswered {
             inputs: expected.inputs,
             prompt_tokens: complete.prompt_tokens,
@@ -1831,6 +1936,93 @@ pub(crate) mod tests {
     use crate::request::InferenceRequest;
     use crate::traits::AdapterError;
     use serde_json::{json, Value};
+
+    // T47 T21 (SPEC §§10, 13.3): a peer closing before its response head
+    // stays uncertain, but the role log records the safe transport category.
+    #[tokio::test]
+    async fn forward_diagnostics_classify_a_peer_closed_before_its_head() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            socket.read(&mut request).await.unwrap();
+        });
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .retry(reqwest::retry::never())
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/private?key=must-not-log"))
+            .send()
+            .await
+            .unwrap_err();
+        peer.await.unwrap();
+        let event = super::ForwardDiagnostic::new("/v1/embeddings", 4096).event(
+            "send_or_await_head",
+            "transport",
+            0,
+            Some(&error),
+        );
+        assert_eq!(event["event"], "inference_forward_failed");
+        assert_eq!(event["closed_by_peer"], true);
+        assert_eq!(event["timeout"], false);
+        assert_eq!(event["request_body_bytes"], 4096);
+        assert_eq!(event["bytes_received"], 0);
+        assert!(event["bytes_sent"].is_null());
+        assert!(event["connection_reused"].is_null());
+        let logged = event.to_string();
+        assert!(!logged.contains("must-not-log"));
+        assert!(!logged.contains("/private"));
+        assert!(!logged.contains(&address.to_string()));
+    }
+
+    // T47 T21: timeout diagnostics report measured progress, not arbitrary
+    // error text, request contents, credentials or an invented sent count.
+    #[tokio::test]
+    async fn forward_diagnostics_report_timeout_without_upstream_secrets() {
+        use std::time::Duration;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap()
+            .post(format!("http://{address}/private?key=must-not-log"))
+            .bearer_auth("secret-credential")
+            .body("secret-input")
+            .send()
+            .await
+            .unwrap_err();
+        peer.abort();
+        let event = super::ForwardDiagnostic::new("/v1/embeddings", 12).event(
+            "read_body",
+            "transport",
+            128,
+            Some(&error),
+        );
+        assert_eq!(event["timeout"], true);
+        assert_eq!(event["bytes_received"], 128);
+        assert!(event["elapsed_ms"].is_number());
+        assert!(event["at_unix_ms"].is_number());
+        let logged = event.to_string();
+        for private in [
+            "must-not-log",
+            "secret-credential",
+            "secret-input",
+            "/private",
+        ] {
+            assert!(!logged.contains(private));
+        }
+    }
 
     // T41 (ADR 0023 §7): the final chunk's `tensorfold` object survives
     // collection, beside usage.
@@ -3683,6 +3875,37 @@ pub(crate) mod tests {
     }
 
     const EMBEDDING_ANSWER: &str = r#"{"id":"embd-9","object":"list","created":1,"model":"/srv/Qwen3-Embedding-4B","data":[{"index":0,"object":"embedding","embedding":[0.5,-0.25]},{"index":1,"object":"embedding","embedding":[1e-2,3]}],"usage":{"prompt_tokens":7,"total_tokens":7}}"#;
+
+    // T47 T17 (SPEC §10, ADR 0036 §4): an idle peer can expire a connection
+    // after the next upload begins but before its protocol reads those bytes.
+    // Use a fresh connection, never retry work whose acceptance is uncertain.
+    #[tokio::test]
+    async fn an_embeddings_upload_avoids_an_expired_keepalive_connection() {
+        use std::time::Duration;
+
+        let peer =
+            capyctl_testkit::held_engine::ExpiredKeepaliveEngine::start(EMBEDDING_ANSWER).await;
+        let forward = embedding_forwarder(format!("http://{}", peer.address()).parse().unwrap());
+        let first: InferenceRequest = json!({"model":"public","input":["a","b"]}).into();
+        forward
+            .forward_embedding(&first, &mut Relayed::default())
+            .await
+            .unwrap();
+        let large: InferenceRequest =
+            json!({"model":"public","input":["a".repeat(8 << 20),"b"]}).into();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            forward.forward_embedding(&large, &mut Relayed::default()),
+        )
+        .await
+        .expect("the fresh upload completes");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            peer.counts(),
+            (2, 2, 0),
+            "two fresh requests, with no reset or replay of a reused upload"
+        );
+    }
 
     /// T47 (ADR 0036 §4, EM8): an engine under load may stop reading a large
     /// request while earlier batches run. Only the router's request deadline
