@@ -510,6 +510,9 @@ pub(crate) struct ChatHttp {
     /// ADR 0032 §1–§2: how a chat request carries the ID its sink names
     /// ([`ChatSink::request_id`]).
     request_ids: RequestIdLane,
+    /// ADR 0038 §5, §11: `trtllm-serve` omits null finish reasons and
+    /// 1.2.1 assigns a fresh response ID to each chunk.
+    tensorrt_llm_stream: bool,
 }
 
 /// ADR 0033 §5: the domain separator of [`effective_cache_salt`]. A new
@@ -619,6 +622,7 @@ impl ChatHttp {
             key,
             cache_salt,
             request_ids: RequestIdLane::Absent,
+            tensorrt_llm_stream: false,
             client: client.build().expect("static client configuration"),
         }
     }
@@ -1287,7 +1291,12 @@ impl ChatHttp {
         // ADR 0032 §4: SGLang's graceful abort ends a request it was asked to
         // abort with a final chunk whose finish reason is `abort`; only a
         // request that carries CapyCTL's ID can have been asked.
-        let mut parser = Parser::new(&self.model, public, request_id.is_some());
+        let mut parser = Parser::new(
+            &self.model,
+            public,
+            request_id.is_some(),
+            self.tensorrt_llm_stream,
+        );
         loop {
             let next = match read_idle {
                 Some(idle) => tokio::time::timeout(idle, stream.next())
@@ -1667,22 +1676,25 @@ pub fn engine_forwarder(
     key: Option<String>,
     cache_salt: CacheSalt,
 ) -> std::sync::Arc<dyn crate::traits::ChatForward> {
-    engine_forwarder_on(base, model, key, cache_salt, RequestIdLane::Absent)
+    engine_forwarder_on(base, model, key, cache_salt, RequestIdLane::Absent, None)
 }
 
 /// As [`engine_forwarder`], for a lane that carries CapyCTL's request ID as
 /// `request_ids` says (ADR 0032 §1–§2): the router builds it from the
 /// endpoint's `request_abort` and whether the endpoint is a host ingress.
+/// ADR 0038 §5, §11: `engine` is the serving launch's family, selecting
+/// TensorRT-LLM's chunk shape only for that engine (also through ingress).
 pub fn engine_forwarder_on(
     base: reqwest::Url,
     model: String,
     key: Option<String>,
     cache_salt: CacheSalt,
     request_ids: RequestIdLane,
+    engine: Option<&str>,
 ) -> std::sync::Arc<dyn crate::traits::ChatForward> {
-    std::sync::Arc::new(EngineForward(
-        ChatHttp::new(base, model, key, cache_salt).with_request_ids(request_ids),
-    ))
+    let mut http = ChatHttp::new(base, model, key, cache_salt).with_request_ids(request_ids);
+    http.tensorrt_llm_stream = engine == Some("tensorrt-llm");
+    std::sync::Arc::new(EngineForward(http))
 }
 
 struct Parser<'a> {
@@ -1699,9 +1711,15 @@ struct Parser<'a> {
     /// abort, `entrypoints/openai/serving_chat.py` 0.5.22) finishes the
     /// stream: only on a lane that sent CapyCTL's request ID.
     abort_finishes: bool,
+    tensorrt_llm_stream: bool,
 }
 impl<'a> Parser<'a> {
-    fn new(backend: &'a str, public: &'a str, abort_finishes: bool) -> Self {
+    fn new(
+        backend: &'a str,
+        public: &'a str,
+        abort_finishes: bool,
+        tensorrt_llm_stream: bool,
+    ) -> Self {
         Self {
             backend,
             public: Value::String(public.to_owned()),
@@ -1712,6 +1730,7 @@ impl<'a> Parser<'a> {
             id: None,
             finished: false,
             abort_finishes,
+            tensorrt_llm_stream,
         }
     }
     fn byte(
@@ -1798,10 +1817,13 @@ impl<'a> Parser<'a> {
             .as_str()
             .filter(|id| !id.is_empty())
             .ok_or_else(uncertain)?;
-        if self.id.as_deref().is_some_and(|old| old != id) {
+        // ADR 0038 §5, §11: 1.2.1's postprocessor creates each chunk
+        // independently. The HTTP response binds the stream; its chunk IDs
+        // are preserved, not used as cross-chunk identity for this family.
+        if !self.tensorrt_llm_stream && self.id.as_deref().is_some_and(|old| old != id) {
             return Err(uncertain());
         }
-        self.id = Some(id.into());
+        self.id.get_or_insert_with(|| id.into());
         let choices = chunk["choices"].as_array().ok_or_else(uncertain)?;
         if choices.is_empty() && self.finished && chunk["usage"].is_object() {
             // Final usage event contains no generation delta.
@@ -1842,6 +1864,10 @@ impl<'a> Parser<'a> {
             }
             match choices[0].get("finish_reason") {
                 Some(Value::Null) => {}
+                // ADR 0038 §5: `exclude_none=True` omits non-terminal
+                // finish reasons. This is not terminal evidence: only an
+                // explicit valid finish below, then `[DONE]`, completes.
+                None if self.tensorrt_llm_stream => {}
                 Some(Value::String(s))
                     if matches!(
                         s.as_str(),
@@ -3534,6 +3560,7 @@ pub(crate) mod tests {
                 None,
                 crate::forward::CacheSalt::for_launch(Some("sglang"), "dep-1", 1),
                 lane,
+                Some("sglang"),
             );
             let mut sink = Carrying { id, chunks: vec![] };
             let end = forward
@@ -3566,6 +3593,7 @@ pub(crate) mod tests {
             None,
             crate::forward::CacheSalt::for_launch(Some("sglang"), "dep-1", 1),
             RequestIdLane::Engine,
+            Some("sglang"),
         );
         let mut sink = Carrying {
             id: Some(RID),
@@ -3713,6 +3741,7 @@ pub(crate) mod tests {
             None,
             crate::forward::CacheSalt::for_launch(Some("sglang"), "dep-1", 1),
             RequestIdLane::Engine,
+            Some("sglang"),
         );
         let mut sink = Carrying {
             id: Some(RID),
@@ -3746,6 +3775,7 @@ pub(crate) mod tests {
                 None,
                 crate::forward::CacheSalt::for_launch(Some("sglang"), "dep-1", 1),
                 lane,
+                Some("sglang"),
             );
             let mut sink = Carrying { id, chunks: vec![] };
             assert!(
@@ -3784,6 +3814,7 @@ pub(crate) mod tests {
                 None,
                 crate::forward::CacheSalt::for_launch(Some("sglang"), "dep-1", 1),
                 RequestIdLane::Engine,
+                Some("sglang"),
             );
             let mut sink = Carrying {
                 id: Some(RID),
