@@ -56,18 +56,20 @@ def run(ctx, row):
     engine = row["engine"]
     name = row["id"].lower().replace("_", "-")
     decisions = row.get("decisions", False)
-    residency = "deep" if engine.startswith(("vllm", "sglang")) else "restart_only"
+    residency = "deep" if not decisions and engine.startswith(("vllm", "sglang")) else "restart_only"
     evidence = {"engine": engine, "requests": []}
     if engine == "TENSORRT_LLM_140RC3":
-        ctx.installation(engine)
+        # Unavailable rc3 installations carry the real driver's skip receipt.
         from .measurements import trt_preflight
         failure = trt_preflight(ctx)
         if failure:
             return failure
+        ctx.installation(engine)
     try:
         profile = ctx.register(engine)
         model = "clef" if decisions else ("tensorfold" if engine == "tensorfold126" else "chat")
-        ctx.deploy(name, engine, model=model, api="decisions" if decisions else "chat", residency=residency)
+        extra = {"engine_config": {"context_length": 8192, "max_concurrent_requests": 2}} if engine == "llamacpp090" and not decisions else None
+        ctx.deploy(name, engine, model=model, api="decisions" if decisions else "chat", residency=residency, extra=extra)
         listing = ctx.cli("engine", "list", "--json")
         evidence["registration"] = json.loads(listing.stdout)
         ctx.assertion(profile in listing.stdout, "registered profile absent from engine list")

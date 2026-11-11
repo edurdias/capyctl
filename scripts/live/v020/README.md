@@ -52,6 +52,9 @@ Embedding discovery checks the served model's nested `capyctl.api` metadata,
 not a flattened JSON key.
 TensorFold memory sizing parses its native startup's model/stream GiB fields
 and labels those rounded diagnostics rather than claiming byte-exact counters.
+Isolated measurement arms keep separate profile registries inside archived
+attempt state. Lifecycle fixtures use restart-only decisions and a llama.cpp
+chat context/slot count that fits their declared KV budget.
 No apt, driver update, system CUDA modification or reboot is allowed. Missing
 compilers/tools are blocking preflight errors, not permission to install packages.
 

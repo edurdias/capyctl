@@ -326,8 +326,10 @@ def isolated_role(ctx, label, settings=(), environment=None):
     original = ctx.roles.get('standalone')
     registered = set(ctx.registered)
     deployments = list(ctx.deployments)
-    state = ctx.root / ('state-' + label)
-    state.mkdir(mode=0o700, exist_ok=False)
+    state = ctx.root / 'state' / ('isolated-' + label)
+    state.mkdir(mode=0o700, parents=True, exist_ok=False)
+    previous_config = os.environ['XDG_CONFIG_HOME']
+    profile_config = str(state/'config')
     binary = ctx.binary()
     argv = [str(binary), '--state-dir', str(state), 'start', 'standalone',
             '--listen', '127.0.0.1:19753', '--management-listen', '127.0.0.1:19754',
@@ -338,13 +340,14 @@ def isolated_role(ctx, label, settings=(), environment=None):
     log_path = ctx.root / (label + '.log')
     with log_path.open('ab', buffering=0) as log:
         process = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT,
-                                   env={**os.environ, **(environment or {})}, start_new_session=True)
+                                   env={**os.environ, **(environment or {}), 'XDG_CONFIG_HOME':profile_config}, start_new_session=True)
     info = dict(state=state,binary=binary,process=process,port=19753,
                 cred=state/'identity/credentials',db=state/'server/srv.sqlite3')
     ctx.roles['standalone'] = info
     ctx.registered = set()
     ctx.deployments = []
     try:
+        os.environ['XDG_CONFIG_HOME']=profile_config
         while not info['cred'].exists() or 'ready' not in log_path.read_text(errors='replace').lower():
             ctx.assertion(process.poll() is None, 'isolated role exited before ready')
             ctx.assertion(ctx.remaining() > 1, 'isolated role readiness deadline')
@@ -354,6 +357,7 @@ def isolated_role(ctx, label, settings=(), environment=None):
         try:
             ctx.cleanup()
         finally:
+            os.environ['XDG_CONFIG_HOME']=previous_config
             process.terminate()
             try:
                 process.wait(timeout=min(30,ctx.remaining()))

@@ -343,6 +343,43 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         self.assertAlmostEqual(sizing['stream_bytes'] / 1024**3, .28)
         self.assertEqual(sizing['sizing_provenance'], 'rounded engine startup GiB')
 
+    def test_isolated_measurement_profiles_and_state_are_attempt_local(self):
+        import sys
+        from rows.measurements import isolated_role
+        ctx = v020.Context(self.root, {})
+        (self.root / 'bin').mkdir()
+        binary = self.root / 'bin/capyctl'
+        binary.write_text(
+            '#!' + sys.executable + '\n'
+            'import pathlib,signal,sys\n'
+            'state=pathlib.Path(sys.argv[sys.argv.index("--state-dir")+1])\n'
+            '(state/"identity").mkdir(parents=True)\n'
+            '(state/"identity/credentials").write_text("fixture")\n'
+            'print("ready",flush=True)\n'
+            'signal.pause()\n')
+        binary.chmod(0o700)
+        previous = os.environ['XDG_CONFIG_HOME']
+        with isolated_role(ctx, 'test') as info:
+            self.assertTrue(info['state'].is_relative_to(self.root / 'state'))
+            self.assertEqual(os.environ['XDG_CONFIG_HOME'], str(info['state'] / 'config'))
+        self.assertEqual(os.environ['XDG_CONFIG_HOME'], previous)
+
+    def test_lifecycle_fixtures_respect_decisions_residency_and_llama_kv_budget(self):
+        from rows.engines import run
+        from types import SimpleNamespace
+        captured = {}
+        def deploy(*args, **kwargs):
+            captured.update(kwargs)
+            raise AssertionError('fixture captured')
+        ctx = SimpleNamespace(register=lambda engine: 'profile', deploy=deploy)
+        run(ctx, dict(id='P3-decisions-sglang0523', engine='sglang0523', decisions=True))
+        self.assertEqual(captured['residency'], 'restart_only')
+        captured.clear()
+        run(ctx, dict(id='P3-llamacpp090', engine='llamacpp090'))
+        settings = captured['extra']['engine_config']
+        self.assertEqual(settings['context_length'], 8192)
+        self.assertEqual(settings['max_concurrent_requests'], 2)
+
 
 if __name__ == '__main__':
     unittest.main()
