@@ -285,5 +285,6 @@ async fn step(
         receipt: format!("vllm-residency-v1:{:?}:{}", command.action, c.token.step_id),
         facts: vec![fact],
         kernel_builds: Vec::new(),
+        extraction_probe: None,
     })
 }

@@ -415,6 +415,7 @@ impl LifecycleState {
             }
             _ => return Err(RuntimeError::Unsupported),
         };
+        let mut extraction_probe = None;
         if ordinary {
             let model = format!("candidate-{}", c.token.deployment_id);
             if let Some((declared, answer)) = &self.extractions {
@@ -426,8 +427,12 @@ impl LifecycleState {
                     &request, declared,
                 )
                 .map_err(|e| RuntimeError::Uncertain(e.to_string()))?;
-                capyctl_adapters::extraction_probe::well_formed(answer, declared)
+                let answer = capyctl_adapters::extraction_probe::well_formed(answer, declared)
                     .map_err(RuntimeError::Uncertain)?;
+                extraction_probe = Some(
+                    capyctl_adapters::extraction_probe::evidence(&answer)
+                        .map_err(RuntimeError::Uncertain)?,
+                );
             } else if let Some(answer) = &self.embeddings {
                 // ADR 0036 §5, SPEC §6.1: an embedding model is ready only on
                 // a complete, well-formed answer to the fixed embedding; it
@@ -480,6 +485,7 @@ impl LifecycleState {
             receipt: format!("fake-lifecycle-v1:{:?}:{}", command.action, c.token.step_id),
             facts,
             kernel_builds: Vec::new(),
+            extraction_probe,
         })
     }
 }

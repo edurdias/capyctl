@@ -435,6 +435,7 @@ mod tests {
                         receipt: "fake host".into(),
                         facts: vec![Milestone::Quiesced, Milestone::MemoryReleased],
                         kernel_builds: Vec::new(),
+                        extraction_probe: None,
                     },
                     NOW,
                 )

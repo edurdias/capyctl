@@ -29,9 +29,10 @@
 //! dimension is the same and its relative distance `‖v − r‖ / ‖r‖` is within
 //! the tolerance (`compare_embedding_canary`).
 //!
-//! ADR 0041 §4: an extraction reference keeps the probe kind, version,
-//! declared types and complete answers. ADR 0041 §5: a later answer uses
-//! the shared extraction probe comparison, never another type set.
+//! ADR 0041 §§4–5: an extraction reference keeps the probe kind, version,
+//! declared types and complete answers from the actual startup extraction,
+//! persisted before Ready, without a second best-effort probe. A later answer
+//! uses the shared extraction comparison, never another type set.
 //!
 //! [`EngineAdapter::wake_canary`]: capyctl_adapters::traits::EngineAdapter::wake_canary
 use crate::group_residency::{canary_matches, CanaryReference};

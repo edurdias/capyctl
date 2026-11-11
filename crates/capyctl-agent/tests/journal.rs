@@ -368,9 +368,29 @@ fn independent_steps_replay_after_compaction_without_new_effects() {
         let t = fresh(j.accept(s, &c, 10, &Policy).unwrap());
         j.execute(t, 10, &Policy).unwrap();
     }
+    // T50 (ADR 0018 §3): full retained-policy payloads are kept only while
+    // their command is unresolved; identity tombstones need no snapshot.
+    let pending = command("pending");
+    let _pending = fresh(j.accept(s, &pending, 10, &Policy).unwrap());
+    let db = rusqlite::Connection::open(d.path().join("commands.sqlite")).unwrap();
+    for id in ["one", "two", "pending"] {
+        db.execute(
+            "INSERT INTO launch_profiles(command_id,config_json,inventory) VALUES(?1,'{}',X'')",
+            [id],
+        )
+        .unwrap();
+    }
     assert_eq!(j.history(0, 1).unwrap().len(), 1);
     assert!(j.history(0, 257).is_err());
     assert_eq!(j.compact_completed(i64::MAX).unwrap(), 2);
+    let remaining: Vec<String> = db
+        .prepare("SELECT command_id FROM launch_profiles")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(remaining, ["pending"]);
     assert!(
         matches!(j.accept(s,&command("one"),2000,&Policy).unwrap(),Acceptance::Replay(ref r) if r.state==capyctl_agent::journal::CommandState::Tombstone)
     );
@@ -778,6 +798,7 @@ async fn native_result_replay_retains_probe_timestamp_and_rejects_forged_identit
             from_ms: 12,
             until_ms: 18,
         }],
+        extraction_probe: None,
     };
     observation.identities[0].start_ticks += 1;
     assert!(journal

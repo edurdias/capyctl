@@ -952,6 +952,7 @@ pub(crate) async fn park_engine(
         ),
         facts: vec![Milestone::Quiesced, Milestone::MemoryReleased],
         kernel_builds: Vec::new(),
+        extraction_probe: None,
     })
 }
 

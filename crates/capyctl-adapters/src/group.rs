@@ -169,6 +169,7 @@ pub(crate) async fn worker_spawned(
         receipt,
         facts: Vec::new(),
         kernel_builds: builds.finish(),
+        extraction_probe: None,
     })
 }
 

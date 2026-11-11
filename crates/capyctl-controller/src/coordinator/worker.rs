@@ -2963,6 +2963,44 @@ async fn drive(
                 .record_owned_launch(owner.session(), &step, &receipt, now)
         })
         .await?;
+    // ADR 0041 §§4–5, SPEC §6.1: Ready and successful Initialize require
+    // the original fixed extraction answer to be durable. Never ask a
+    // second probe to reconstruct evidence that the launch discarded.
+    let initial_extraction = match observation.extraction_probe.as_ref() {
+        Some(evidence) => Some(
+            capyctl_adapters::extraction_probe::relayed_answer(
+                evidence.probe_version,
+                &evidence.declared_field_types,
+                &evidence.answers_json,
+            )
+            .map_err(|reason| {
+                service(format!(
+                    "invalid initial extraction readiness answer: {reason}"
+                ))
+            })?,
+        ),
+        None if work.effective().api == capyctl_config::effective::DeploymentApi::Extractions => {
+            return Err(service(
+                "the launch omitted its initial extraction readiness answer",
+            ));
+        }
+        None => None,
+    };
+    let extraction_reference = initial_extraction.is_some();
+    if let Some(answer) = initial_extraction {
+        store_wake_canary(
+            shared,
+            work.instance_index(),
+            &command.context,
+            &capyctl_adapters::completion_probe::CanaryEvidence::Extraction(answer),
+        )
+        .await
+        .map_err(|error| {
+            service(format!(
+                "could not persist the initial extraction canary reference: {error}"
+            ))
+        })?;
+    }
     let builds = observation.kernel_builds.clone();
     let identities = observation.identities.clone();
     // ADR 0033 §§3, 8 (lifecycle design §10): what became of the launch's
@@ -3022,10 +3060,11 @@ async fn drive(
         })
         .await?;
     readiness.completed();
-    // Owner decision 2026-10-09: the launch's wake canary reference, recorded
-    // at its first readiness. A probe that fails records nothing and the
-    // launch stays Ready; its first wake records the reference instead.
-    record_wake_canary(shared, &driver, work.instance_index(), &command.context).await;
+    // Other APIs retain their existing best-effort readiness canary.
+    // Extractions already persisted the actual startup answer before Ready.
+    if !extraction_reference {
+        record_wake_canary(shared, &driver, work.instance_index(), &command.context).await;
+    }
     // Owner decision 2026-09-23: a peak measured while nothing else changed
     // the host's memory (no other activation or cleanup on it) is recorded
     // for later starts of this revision there, per memory domain. A failure
@@ -4271,7 +4310,7 @@ async fn record_wake_canary(
     )
     .await
     {
-        store_wake_canary(shared, instance, context, &answer.answer).await;
+        let _ = store_wake_canary(shared, instance, context, &answer.answer).await;
     }
 }
 
@@ -4280,14 +4319,14 @@ async fn store_wake_canary(
     instance: u32,
     context: &capyctl_domain::completion::StepExecutionContext,
     answer: &capyctl_adapters::completion_probe::CanaryEvidence,
-) {
+) -> Result<(), CoordinatorError> {
     let reference = crate::wake_canary::reference(answer);
     let (deployment, generation, incarnation) = (
         context.token.deployment_id.clone(),
         context.token.generation,
         context.incarnation.clone(),
     );
-    let _ = shared
+    shared
         .with_owner(move |owner| {
             let now = capyctl_protocol::now_unix_ms();
             owner
@@ -4300,9 +4339,10 @@ async fn store_wake_canary(
                     &reference,
                     now,
                 )
+                .map(|_| ())
                 .map_err(service)
         })
-        .await;
+        .await
 }
 
 /// Owner decision 2026-10-09: after a wake's own steps succeeded, the same
@@ -4358,7 +4398,7 @@ async fn wake_canary_check(
         // The first readiness recorded none: this wake's answer becomes the
         // reference, as at first readiness (ADR 0028 §12's rule for groups).
         Verdict::Unreferenced => {
-            store_wake_canary(shared, work.instance, context, &answer.answer).await;
+            let _ = store_wake_canary(shared, work.instance, context, &answer.answer).await;
             CanaryCheck::Passed(Some(answer.observed_at_ms))
         }
     }

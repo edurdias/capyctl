@@ -1,4 +1,4 @@
-# Status: Extraction models: `api: extractions` and `fields` on `POST /v1/systemone` (ADR 0041) — 2026-11-10 (branch `feat/extraction-models-0.2.0`)
+# Status: Extraction models: `api: extractions` and `fields` on `POST /v1/systemone` (ADR 0041) — 2026-11-11 (branch `feat/extraction-models-0.2.0`)
 
 ADR 0041 (owner decisions 2026-11-04) adds a fourth deployment API,
 `extractions`, with declared custom-engine `field_types`. It is part of the
@@ -103,6 +103,49 @@ ADR 0041 §3 now clarifies rejections versus 5xx engine errors. An own host-role
 restart also left its online host's deployment reconciling after 120 seconds;
 the retained charge settled on explicit verified stop.
 
+The T50 controller fix now carries the validated startup extraction answer through
+the adapter observation and the host's durable launch result. The controller
+records that exact typed answer before completing Initialize or opening dispatch
+(SPEC §6.1, ADR 0041 §§4–5). A missing or malformed answer, or a failed reference
+write, fails the launch with a reason; extractions no longer run the optional
+second readiness canary. T50 regressions cover the original answer surviving a
+changed later answer, a second probe that would fail, reference-storage failure,
+bounded protocol evidence and its durable host replay.
+
+The reconnect investigation reproduced a retained-policy failure: a launch still
+resolves while its approved host document is the in-memory previous publication,
+but that document disappears when the host restarts with a newer publication.
+Reproof then fails before sending the fixed extraction. The host now journals
+the exact approved profile snapshot with the launch and can recover it for
+retained-launch checks after restart (ADR 0018 §3, ADR 0031 §§5, 7). Recovery
+requires the active profile and every non-profile host setting to remain
+unchanged; an unknown or changed ownership, installation, key or safety policy
+does not reopen ingress. T50 exercises the reopened host journal and ingress
+against the Fake engine's `/v1/systemone` mode, including failed health,
+malformed extraction and wrong-owner refusals. The saved live evidence does
+not identify its failed reproof stage, so this reproduced cause is not claimed
+as a confirmed diagnosis of that specific host-A attempt.
+
+Before the fix, the first-answer regression failed because the successful
+launch had no `wake_canaries` row. The retained-policy regression failed with
+zero extraction requests after reopening the host journal, where one fixed
+extraction was required. An unchanged-policy host restart already passed;
+the failure was lost approved context, not a missing extraction branch.
+Completed-command compaction removes the full saved policy payload, and a
+verified stop evicts its in-memory copy; neither happens on uncertainty.
+
+Verification for these fixes on 2026-11-11: both failing-before T50 regressions
+pass after the fixes. `scripts/ci-local.sh` passed fmt, name, clippy, unit,
+runtime, shellcheck, installer and changes. `scripts/ci-local.sh --deep`
+passed all eight steps plus core and workspace. The read-only correctness and
+security reviews found no remaining functional or security defect; the saved
+policy payloads now follow completed-command compaction, and an unreadable
+startup policy snapshot emits a bounded diagnostic while staying closed.
+
+Both startup-reference persistence and host reconnect need live T50
+re-qualification. No lab host was accessed for these fixes. CPU and Fake-engine
+tests are not qualification, and rc1's model-quality failures remain unchanged.
+
 The [live qualification record](../runbooks/f2-current-status.md#extraction-model-live-qualification-outcome--2026-11-10-branch-featextraction-models-020)
 contains pass/fail tables, requests/answers, source and binary/checkpoint hashes,
 defect locations/proposed fixes, and cleanup evidence. The final ledger had no
@@ -136,3 +179,9 @@ nine-type wire contract unchanged.
   CPU and Fake-engine tests are not qualification
   ([Extraction models](../guide/deploy.md#extraction-models),
   [Extraction requests](../guide/requests.md#extraction-requests)).
+- **Extraction startup and retained-host recovery.** The typed canary reference is
+  now the actual startup answer, persisted before a launch succeeds; persistence
+  failure leaves dispatch closed. A retained engine can recover its exact approved
+  profile after an unrelated profile publication and host restart, without
+  adopting changed engine credentials or safety policy. Live T50 re-qualification
+  remains pending.

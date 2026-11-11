@@ -802,6 +802,7 @@ impl SglangAdapter {
             ),
             facts: vec![fact],
             kernel_builds: Vec::new(),
+            extraction_probe: None,
         })
     }
 }

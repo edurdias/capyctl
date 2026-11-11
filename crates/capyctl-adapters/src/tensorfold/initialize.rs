@@ -302,5 +302,6 @@ pub(super) async fn initialize(
         kernel_builds: builds
             .map(crate::kernel_builds::BuildWatch::finish)
             .unwrap_or_default(),
+        extraction_probe: None,
     })
 }

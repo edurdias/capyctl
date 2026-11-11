@@ -287,6 +287,7 @@ impl Launch {
             receipt: "scripted host".into(),
             facts,
             kernel_builds: Vec::new(),
+            extraction_probe: None,
         }
     }
 

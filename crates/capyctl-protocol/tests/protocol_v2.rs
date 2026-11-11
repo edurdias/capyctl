@@ -1319,3 +1319,121 @@ fn extraction_probe_roundtrip_and_closed_evidence() {
     result.identity = plain.to_wire().identity;
     assert!(validate_result(&plain, &result).is_err());
 }
+
+// T50
+#[test]
+fn extraction_startup_evidence_belongs_to_successful_extraction_launch_only() {
+    // SPEC §6.1; ADR 0041 §§4–5: retain the first readiness answer, not a
+    // second probe, as the launch's wake reference.
+    let plan = capyctl_protocol::execution::SingleLaunchPlan {
+        deployment_config: r#"{"api":"extractions"}"#.into(),
+        profile_name: "extractor".into(),
+        checkpoint_fingerprint: "sha256:model".into(),
+        host_policy_fingerprint: "a".repeat(64),
+        binding_id: "binding".into(),
+        incarnation: "incarnation".into(),
+        grant_id: "grant".into(),
+        service_port: 30000,
+        issued_at_ms: 1,
+        coordinator_session_id: "session".into(),
+        checkpoint_digest: String::new(),
+        checkpoint_weights_bytes: None,
+        startup_bytes: None,
+        startup_host_bytes: None,
+        checkpoint_state_slot_bytes: None,
+        checkpoint_layout: None,
+        checkpoint_tables: None,
+        checkpoint_gguf: None,
+        lmcache: None,
+        devices: Vec::new(),
+        vllm_device_request_no_floor: false,
+    };
+    let command = with_action(MemberAction::LaunchSingle(plan.clone()));
+    let mut result = parked_result(&command);
+    result.state = "launched".into();
+    result.owned_handle = command.identity.command_id.clone();
+    result.model_usable = true;
+    result.residency = None;
+    // Old retained journals need not have recorded this additive field.
+    validate_result(&command, &result).unwrap();
+    let legacy_bytes = result.encode_to_vec();
+    let good = pb::ExtractionProbeEvidence {
+        probe_version: 1,
+        declared_field_types: vec!["text".into(), "number".into()],
+        answers_json: b"{}".to_vec(),
+    };
+    result.probe_extraction = Some(good.clone());
+    validate_result(&command, &result).unwrap();
+    assert_eq!(
+        pb::MemberExecutionResult::decode(result.encode_to_vec().as_slice()).unwrap(),
+        result,
+    );
+    let edits: &[fn(&mut pb::MemberExecutionResult)] = &[
+        |r| r.state = "completed".into(),
+        |r| r.state = "attempted".into(),
+        |r| r.model_usable = false,
+        |r| r.claim_retained = false,
+        |r| r.launch_failure = "failed".into(),
+        |r| r.refused = "failed".into(),
+    ];
+    for edit in edits {
+        let mut invalid = result.clone();
+        edit(&mut invalid);
+        assert!(validate_result(&command, &invalid).is_err());
+    }
+    for api in ["chat", "decisions", "embeddings", ""] {
+        let mut other_plan = plan.clone();
+        other_plan.deployment_config = if api.is_empty() {
+            "{}".into()
+        } else {
+            serde_json::json!({"api": api}).to_string()
+        };
+        let other = with_action(MemberAction::LaunchSingle(other_plan));
+        let mut invalid = result.clone();
+        invalid.identity = other.to_wire().identity;
+        assert!(validate_result(&other, &invalid).is_err());
+    }
+    for action in [
+        MemberAction::Inspect,
+        park("launch").action,
+        restore("launch").action,
+    ] {
+        let other = with_action(action);
+        let mut invalid = result.clone();
+        invalid.identity = other.to_wire().identity;
+        invalid.model_usable = false;
+        assert!(validate_result(&other, &invalid).is_err());
+    }
+    for malformed in [
+        pb::ExtractionProbeEvidence {
+            probe_version: 2,
+            ..good.clone()
+        },
+        pb::ExtractionProbeEvidence {
+            declared_field_types: vec![],
+            ..good.clone()
+        },
+        pb::ExtractionProbeEvidence {
+            declared_field_types: vec!["number".into(), "text".into()],
+            ..good.clone()
+        },
+        pb::ExtractionProbeEvidence {
+            answers_json: b"[]".to_vec(),
+            ..good.clone()
+        },
+        pb::ExtractionProbeEvidence {
+            answers_json: b"{".to_vec(),
+            ..good.clone()
+        },
+        pb::ExtractionProbeEvidence {
+            answers_json: vec![b' '; 256 * 1024 + 1],
+            ..good.clone()
+        },
+    ] {
+        let mut invalid = result.clone();
+        invalid.probe_extraction = Some(malformed);
+        assert!(validate_result(&command, &invalid).is_err());
+    }
+    result.probe_extraction = None;
+    assert_eq!(result.encode_to_vec(), legacy_bytes);
+}

@@ -119,6 +119,7 @@ impl EngineAdapter for Scripted {
             receipt: format!("scripted {:?}", command.action),
             facts,
             kernel_builds: Vec::new(),
+            extraction_probe: None,
         })
     }
     async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {

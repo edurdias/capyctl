@@ -210,6 +210,7 @@ pub(super) async fn initialize(
             Milestone::ModelUsable,
         ],
         kernel_builds: Vec::new(),
+        extraction_probe: None,
     })
 }
 

@@ -830,7 +830,9 @@ message MemberExecutionResult {
   // `retention_zero`). Empty otherwise and from an older host, which encodes
   // exactly as before.
   string engine_tracing = 23;
-  // ADR 0041 §4: completed extraction probe only; absent preserves old bytes.
+  // SPEC §6.1; ADR 0041 §§4–5: completed extraction probe or the original
+  // readiness answer of a successful, usable, claim-retaining LaunchSingle
+  // whose deployment API is extractions. Absent preserves old journal bytes.
   ExtractionProbeEvidence probe_extraction = 24;
 }
 // ADR 0033 §§3, 8, 9: `on` names the server's ports and pool; `off` names a

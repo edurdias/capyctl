@@ -34,9 +34,9 @@ impl NativeHostExecution {
     /// manifest, as it was approved: from its resolution, or, when that no
     /// longer resolves (a moved checkpoint, a changed port range), from the
     /// profile its plan names in the document it was approved under. Never
-    /// from the host's current profile set: `None` when that document is no
-    /// longer held, and the launch's idleness is then unknown (AGENTS.md:
-    /// uncertainty must retain accounting). A legacy retained launch, which
+    /// from the host's current profile set: an exact journal-bound set may
+    /// survive a restart (ADR 0018 §3), otherwise idleness is unknown and
+    /// accounting stays retained. A legacy retained launch, which
     /// resolves against today's document (owner decision 2026-09-22),
     /// predates custom engines, so a custom engine found that way is not
     /// taken as its own.
@@ -45,7 +45,7 @@ impl NativeHostExecution {
         owned: &MemberCommand,
         plan: &SingleLaunchPlan,
     ) -> Option<(Engine, Option<CustomProfile>)> {
-        let set = self.profiles.for_fingerprint(&plan.host_policy_fingerprint);
+        let set = self.retained_profile(owned).ok().flatten();
         if let Ok(effective) = self.resolve_retained(owned) {
             if set.is_some() || effective.profile.engine != Engine::Custom {
                 return Some((effective.profile.engine, effective.profile.custom));
@@ -67,8 +67,9 @@ impl NativeHostExecution {
         if let Ok(effective) = self.resolve_retained(owned) {
             return effective.profile.line;
         }
-        self.profiles
-            .for_fingerprint(&plan.host_policy_fingerprint)
+        self.retained_profile(owned)
+            .ok()
+            .flatten()
             .and_then(|set| {
                 serde_json::from_value(
                     set.config.document["runtime_profiles"][&plan.profile_name]["line"].clone(),

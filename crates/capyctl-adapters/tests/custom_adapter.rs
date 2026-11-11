@@ -584,6 +584,25 @@ async fn an_extractions_engine_is_ready_only_after_its_declared_fixed_extraction
     assert_eq!(stub.embeddings.load(SeqCst), 0, "never an embedding probe");
     assert_eq!(stub.models.load(SeqCst), 0, "never a model list");
     assert_eq!(stub.unauthorized.load(SeqCst), 0, "key on every read");
+    let evidence = observation
+        .extraction_probe
+        .as_ref()
+        .expect("the initial extraction answer");
+    assert_eq!(
+        evidence.probe_version,
+        capyctl_adapters::extraction_probe::VERSION
+    );
+    assert_eq!(evidence.declared_field_types, ["number", "date"]);
+    let initial: Value = serde_json::from_slice(&evidence.answers_json).unwrap();
+    assert_eq!(
+        initial,
+        stub.script.decision.lock().unwrap().as_ref().unwrap()["answers"]
+    );
+    // The startup result remains the first answer when a later probe changes.
+    stub.script.decision.lock().unwrap().as_mut().unwrap()["answers"]["amount_paid"]["guess"] =
+        json!(650.0);
+    stub.script.decision.lock().unwrap().as_mut().unwrap()["answers"]["amount_paid"]["value"] =
+        json!(650.0);
     let canary = engine
         .wake_canary(
             &initialize_command(30_000).context,
@@ -593,7 +612,9 @@ async fn an_extractions_engine_is_ready_only_after_its_declared_fixed_extraction
         .await
         .unwrap();
     assert!(matches!(canary.answer, CanaryEvidence::Extraction(answer)
-        if answer.declared == [FieldType::Number, FieldType::Date]));
+        if answer.declared == [FieldType::Number, FieldType::Date]
+            && answer.answers["amount_paid"]["guess"] == 650.0));
+    assert_eq!(initial["amount_paid"]["guess"], 649.0);
 }
 
 // T47 T44 (ADR 0036 §1, §5, ADR 0031 §5): an embeddings custom engine is

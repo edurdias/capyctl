@@ -1333,7 +1333,8 @@ fn embedding_evidence_ok(evidence: &pb::EmbeddingProbeEvidence) -> bool {
 }
 
 /// ADR 0041 §4: bounded object evidence and a nonempty canonical declared set.
-pub const EXTRACTION_PROBE_MAX_BYTES: usize = 256 * 1024;
+pub const EXTRACTION_PROBE_MAX_BYTES: usize =
+    capyctl_domain::completion::EXTRACTION_PROBE_MAX_BYTES;
 pub const EXTRACTION_PROBE_VERSION: u32 = 1;
 
 fn extraction_evidence_ok(evidence: &pb::ExtractionProbeEvidence) -> bool {
@@ -1490,17 +1491,27 @@ pub fn validate_result(
             return Err(GroupIdentityError);
         }
     }
-    // ADR 0041 §4: extraction evidence belongs only to its completed probe.
+    // SPEC §6.1; ADR 0041 §§4–5: the first startup answer is the wake
+    // reference; subsequent answers belong to completed extraction probes.
+    // Absence remains valid for journals retained by older hosts.
     if let Some(evidence) = &result.probe_extraction {
-        if !(matches!(
-            command.action,
+        let action_ok = match &command.action {
             MemberAction::Probe {
-                extraction: true,
-                ..
+                extraction: true, ..
+            } => result.state == "completed",
+            MemberAction::LaunchSingle(plan) => {
+                result.state == "launched"
+                    && result.model_usable
+                    && result.claim_retained
+                    && result.launch_failure.is_empty()
+                    && result.refused.is_empty()
+                    && serde_json::from_str::<serde_json::Value>(&plan.deployment_config)
+                        .ok()
+                        .is_some_and(|config| config["api"] == "extractions")
             }
-        ) && result.state == "completed"
-            && extraction_evidence_ok(evidence))
-        {
+            _ => false,
+        };
+        if !(action_ok && extraction_evidence_ok(evidence)) {
             return Err(GroupIdentityError);
         }
     }

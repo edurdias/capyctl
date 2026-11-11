@@ -466,6 +466,7 @@ impl RemoteEngine {
             ),
             facts,
             kernel_builds: Vec::new(),
+            extraction_probe: None,
         })
     }
 }
@@ -681,7 +682,7 @@ impl EngineAdapter for RemoteEngine {
             owner: self.owner.clone(),
             binding: c.binding_id.clone(),
         });
-        let (session, result) = self
+        let (session, mut result) = self
             .sessions
             .execute_on_session(command, Some(observer))
             .await
@@ -701,11 +702,33 @@ impl EngineAdapter for RemoteEngine {
         }
         launch_evidence(&result)?;
         let mut receipt = remote_receipt(&result, &devices)?;
-        // ADR 0041 §4: readiness here is the authenticated host's report,
-        // not an extraction answer independently observed by the server.
-        if !b.extraction_types.is_empty() {
-            receipt.push_str("; host reported the fixed extraction probe answered");
-        }
+        // ADR 0041 §§4–5: carry the original readiness answer, bound to the
+        // frozen declaration, for validation and persistence before Ready.
+        let extraction_probe = if !b.extraction_types.is_empty() {
+            let evidence = result.probe_extraction.take().ok_or_else(|| {
+                RuntimeError::LaunchFailed(
+                    "the host omitted the initial extraction readiness answer".into(),
+                )
+            })?;
+            if !evidence
+                .declared_field_types
+                .iter()
+                .map(String::as_str)
+                .eq(b.extraction_types.iter().map(|kind| kind.name()))
+            {
+                return Err(RuntimeError::LaunchFailed(
+                    "the host's initial extraction answer names different declared types".into(),
+                ));
+            }
+            receipt.push_str("; initial fixed extraction answer retained");
+            Some(capyctl_domain::completion::ExtractionProbeEvidence {
+                probe_version: evidence.probe_version,
+                declared_field_types: evidence.declared_field_types,
+                answers_json: evidence.answers_json,
+            })
+        } else {
+            None
+        };
         // SPEC §13.2 (G2): this readiness belongs to the host session that
         // proved it; a later session must re-prove it before dispatch.
         self.readiness
@@ -731,6 +754,7 @@ impl EngineAdapter for RemoteEngine {
                 Milestone::ModelUsable,
             ],
             kernel_builds: kernel_builds(&result),
+            extraction_probe,
         })
     }
     async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {
@@ -1076,22 +1100,18 @@ fn canary_evidence(
                 )
             };
             let evidence = result.probe_extraction.as_ref().ok_or_else(malformed)?;
-            if evidence.probe_version != capyctl_adapters::extraction_probe::VERSION
-                || !evidence
-                    .declared_field_types
-                    .iter()
-                    .map(String::as_str)
-                    .eq(declared.iter().map(|kind| kind.name()))
-                || evidence.answers_json.len()
-                    > capyctl_protocol::execution::EXTRACTION_PROBE_MAX_BYTES
+            if !evidence
+                .declared_field_types
+                .iter()
+                .map(String::as_str)
+                .eq(declared.iter().map(|kind| kind.name()))
             {
                 return Err(malformed());
             }
-            let answers: serde_json::Value =
-                serde_json::from_slice(&evidence.answers_json).map_err(|_| malformed())?;
-            capyctl_adapters::extraction_probe::well_formed(
-                &serde_json::json!({"answers": answers}),
-                declared,
+            capyctl_adapters::extraction_probe::relayed_answer(
+                evidence.probe_version,
+                &evidence.declared_field_types,
+                &evidence.answers_json,
             )
             .map(CanaryEvidence::Extraction)
             .map_err(|_| malformed())

@@ -21,6 +21,54 @@ pub struct ExtractionAnswer {
     pub answers: Map<String, Value>,
 }
 
+/// ADR 0041 §§4–5: retain the answer from readiness, not a later probe.
+pub fn evidence(
+    answer: &ExtractionAnswer,
+) -> Result<capyctl_domain::completion::ExtractionProbeEvidence, String> {
+    let answers_json = serde_json::to_vec(&answer.answers).map_err(|error| error.to_string())?;
+    if answers_json.len() > capyctl_domain::completion::EXTRACTION_PROBE_MAX_BYTES {
+        return Err("the extraction readiness answer exceeds the evidence bound".into());
+    }
+    Ok(capyctl_domain::completion::ExtractionProbeEvidence {
+        probe_version: VERSION,
+        declared_field_types: answer
+            .declared
+            .iter()
+            .map(|kind| kind.name().to_owned())
+            .collect(),
+        answers_json,
+    })
+}
+
+/// ADR 0041 §§4–5: judge a relayed startup or canary answer by this probe's
+/// identity and typed rules, retaining all answer members.
+pub fn relayed_answer(
+    probe_version: u32,
+    declared_field_types: &[String],
+    answers_json: &[u8],
+) -> Result<ExtractionAnswer, String> {
+    if probe_version != VERSION
+        || answers_json.len() > capyctl_domain::completion::EXTRACTION_PROBE_MAX_BYTES
+    {
+        return Err("the extraction probe evidence has an unsupported version or size".into());
+    }
+    let declared = declared_field_types
+        .iter()
+        .map(|name| {
+            FieldType::ALL
+                .iter()
+                .copied()
+                .find(|kind| kind.name() == name)
+                .ok_or_else(|| "the extraction probe evidence names an unknown type".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if declared.is_empty() || !declared.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err("the extraction probe evidence has no canonical declared types".into());
+    }
+    let answers: Value = serde_json::from_slice(answers_json).map_err(|error| error.to_string())?;
+    well_formed(&json!({"answers": answers}), &declared)
+}
+
 /// ADR 0041 §4: exactly one fixed field per declared type, in canonical order.
 pub fn request(served: &str, declared: &[FieldType]) -> Value {
     let mut fields = Map::new();
@@ -539,6 +587,36 @@ mod tests {
         let mut body = changed(field, "guess", guess.clone());
         body["answers"][field]["value"] = guess;
         body
+    }
+
+    // T50 (ADR 0041 §§4–5): startup evidence retains all typed answers and
+    // unrecognized metadata, and rejects unsupported or malformed payloads.
+    #[test]
+    fn initial_extraction_evidence_round_trips_without_substituting_an_answer() {
+        let answer = ready(&changed("amount_paid", "extra", json!({"kept": true})));
+        let mut saved = evidence(&answer).unwrap();
+        let decode = |saved: &capyctl_domain::completion::ExtractionProbeEvidence| {
+            relayed_answer(
+                saved.probe_version,
+                &saved.declared_field_types,
+                &saved.answers_json,
+            )
+        };
+        assert_eq!(decode(&saved).unwrap(), answer);
+        saved.probe_version += 1;
+        assert!(decode(&saved).is_err());
+        saved.probe_version = VERSION;
+        saved.declared_field_types.reverse();
+        assert!(decode(&saved).is_err());
+        saved.declared_field_types = vec!["unknown".into()];
+        assert!(decode(&saved).is_err());
+        saved.declared_field_types = vec!["number".into()];
+        saved.answers_json = br#"{"amount_paid":{"type":"number"}}"#.to_vec();
+        assert!(decode(&saved).is_err());
+        let mut oversized = answer;
+        oversized.answers.get_mut("amount_paid").unwrap()["extra"] =
+            json!("x".repeat(capyctl_domain::completion::EXTRACTION_PROBE_MAX_BYTES));
+        assert!(evidence(&oversized).is_err());
     }
 
     // T50: the versioned request is exactly ADR 0041 §4, not a generated prompt.

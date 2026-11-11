@@ -219,6 +219,7 @@ async fn an_exited_member_of_a_ready_launch_is_reported_with_its_status() {
                     Milestone::ModelUsable,
                 ],
                 kernel_builds: Vec::new(),
+                extraction_probe: None,
             },
         )
         .unwrap();
@@ -385,6 +386,7 @@ async fn a_helper_exit_of_a_ready_launch_is_not_reported() {
                     Milestone::ModelUsable,
                 ],
                 kernel_builds: Vec::new(),
+                extraction_probe: None,
             },
         )
         .unwrap();
@@ -556,6 +558,7 @@ async fn a_rank_exit_of_a_ready_launch_on_several_gpus_is_reported() {
                     Milestone::ModelUsable,
                 ],
                 kernel_builds: Vec::new(),
+                extraction_probe: None,
             },
         )
         .unwrap();

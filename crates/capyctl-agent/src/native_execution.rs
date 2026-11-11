@@ -108,6 +108,11 @@ pub struct NativeHostExecution {
     /// (ADR 0008: installation fingerprints, drift, launch-time probes).
     /// `config` above keeps the role-local settings only.
     profiles: Arc<crate::profiles::HostProfiles>,
+    /// ADR 0018 §3; SPEC §13.2: journal-bound approved sets for retained
+    /// launches, keyed by their exact command digest. Load before policy
+    /// callbacks: admission calls them while holding the journal's DB lock.
+    launch_profiles:
+        Arc<Mutex<std::collections::BTreeMap<[u8; 32], Arc<crate::profiles::ProfileSet>>>>,
     authority: Arc<Mutex<SessionAuthority>>,
     /// SGLang saver-map observation for residency evidence. Without one the
     /// host cannot prove an SGLang release or restoration and refuses both.
@@ -259,6 +264,27 @@ impl NativeHostExecution {
             config.clone(),
             inventory,
         ));
+        let mut launch_profiles = std::collections::BTreeMap::new();
+        match journal.claimed_launches("") {
+            Ok(claims) => {
+                for claim in claims {
+                    match journal.launch_profile(&claim.command) {
+                        Ok(Some(set)) => {
+                            launch_profiles.insert(claim.command.identity.payload_digest, Arc::new(set));
+                        }
+                        Ok(None) => {}
+                        Err(_) => capyctl_domain::role_log::notice(
+                            capyctl_domain::role_log::Level::Notice,
+                            &format!("retained launch {}: approved policy snapshot could not be read; readiness stays unproven", claim.command.identity.command_id),
+                        ),
+                    }
+                }
+            }
+            Err(_) => capyctl_domain::role_log::notice(
+                capyctl_domain::role_log::Level::Notice,
+                "retained launch policy snapshots could not be read; readiness stays unproven",
+            ),
+        }
         // The host document's period, bounded when it was parsed (D9: 250 ms
         // to 5 s), so a reporter is never refused for it here. ADR 0031 §6:
         // a custom engine's load is its manifest's idle signal, never a
@@ -300,6 +326,7 @@ impl NativeHostExecution {
             runtime_dir,
             log_dir,
             profiles,
+            launch_profiles: Arc::new(Mutex::new(launch_profiles)),
             authority: Arc::new(Mutex::new(SessionAuthority::default())),
             saver: None,
             checkpoints: Arc::new(checkpoints),
@@ -650,6 +677,77 @@ impl NativeHostExecution {
     fn resolve(&self, command: &MemberCommand) -> Result<EffectiveDeployment, JournalError> {
         self.resolve_as(command, false)
     }
+    /// ADR 0018 §3; SPEC §13.2: persist only the exact locally approved set
+    /// the accepted launch names, before its durable process attempt.
+    fn record_launch_profile(
+        &self,
+        session: u64,
+        command: &MemberCommand,
+    ) -> Result<(), JournalError> {
+        let plan = command
+            .action
+            .launch_plan()
+            .ok_or(JournalError::Unauthorized)?;
+        let set = self
+            .profiles
+            .for_fingerprint(&plan.host_policy_fingerprint)
+            .ok_or(JournalError::Unauthorized)?;
+        self.journal.record_launch_profile(session, command, &set)?;
+        self.launch_profiles
+            .lock()
+            .map_err(|_| JournalError::Storage)?
+            .insert(command.identity.payload_digest, set);
+        Ok(())
+    }
+
+    /// A retained launch may recover its own approved set after the host
+    /// loses its accepted/pending/previous sets. Never use this for admission.
+    fn retained_profile(
+        &self,
+        owned: &MemberCommand,
+    ) -> Result<Option<Arc<crate::profiles::ProfileSet>>, JournalError> {
+        let plan = owned
+            .action
+            .launch_plan()
+            .ok_or(JournalError::Unauthorized)?;
+        if owned.identity.controller_id != self.controller_id
+            || owned.identity.member.host_id != self.host_id
+        {
+            return Err(JournalError::Unauthorized);
+        }
+        if let Some(set) = self.profiles.for_fingerprint(&plan.host_policy_fingerprint) {
+            return Ok(Some(set));
+        }
+        let Some(saved) = self
+            .launch_profiles
+            .lock()
+            .map_err(|_| JournalError::Storage)?
+            .get(&owned.identity.payload_digest)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        if saved.fingerprint != plan.host_policy_fingerprint {
+            return Err(JournalError::Conflict);
+        }
+        let current = self.profiles.accepted();
+        let Some(profile) = saved.config.document["runtime_profiles"].get(&plan.profile_name)
+        else {
+            return Err(JournalError::Conflict);
+        };
+        // ADR 0018 §§3–4; ADR 0031 §7: an unrelated profile publication
+        // cannot strand this launch, but its active profile, credentials,
+        // installation and every outside host policy must still be approved.
+        if !capyctl_config::registration::only_profiles_differ(
+            &saved.config.document,
+            &current.config.document,
+        ) || current.config.document["runtime_profiles"].get(&plan.profile_name) != Some(profile)
+        {
+            return Ok(None);
+        }
+        Ok(Some(saved))
+    }
+
     /// The approved configuration of a launch this host already owns, for
     /// probing, parking or restoring it; never for rendering a launch.
     ///
@@ -682,9 +780,13 @@ impl NativeHostExecution {
         let legacy = retained
             .then(|| capyctl_config::effective::legacy_retained_deployment(&config))
             .flatten();
-        // ADR 0018 §3: authorized against the document the plan names:
-        // accepted, being published, or the one before.
-        let set = self.profiles.for_fingerprint(&plan.host_policy_fingerprint);
+        // ADR 0018 §3: new work needs a held approved document; retained
+        // work may recover its own exact durable set after a host restart.
+        let set = if retained {
+            self.retained_profile(command)?
+        } else {
+            self.profiles.for_fingerprint(&plan.host_policy_fingerprint)
+        };
         if command.identity.controller_id != self.controller_id
             || command.identity.member.host_id != self.host_id
             || (legacy.is_none() && set.is_none())
@@ -1763,6 +1865,12 @@ impl NativeHostExecution {
                 .map_err(|code| LaunchError {
                     engine: Some(code.into()),
                 })?;
+        let host = self.clone();
+        let approved = command.clone();
+        tokio::task::spawn_blocking(move || host.record_launch_profile(session, &approved))
+            .await
+            .map_err(|_| SessionError)?
+            .map_err(|_| SessionError)?;
         let tools = self
             .journal
             .launch_tools(
@@ -2699,6 +2807,12 @@ impl NativeHostExecution {
                         let _ = self
                             .identities
                             .retire(&scope, owned.identity.payload_digest);
+                        // SPEC §13.3: only verified release evicts the live
+                        // profile cache; the journal keeps its audit evidence.
+                        self.launch_profiles
+                            .lock()
+                            .map_err(|_| SessionError)?
+                            .remove(&owned.identity.payload_digest);
                     }
                     // SPEC §9.2: a gone launch's saver enrollment is stale.
                     if let Some(saver) = &self.saver {
@@ -2741,6 +2855,12 @@ impl NativeHostExecution {
             };
             let scope = self.register_retained(&owned)?;
             self.ingress.open(&scope).map_err(|_| SessionError)?;
+        }
+        // SPEC §§6.1, 13.2; ADR 0041 §4: a stale or previous-session
+        // launch reply cannot carry its successful startup reference. A
+        // dedicated extraction Probe keeps its answer without moving a gate.
+        if command.action.launch_plan().is_some() && !result.model_usable {
+            result.probe_extraction = None;
         }
         Ok(result)
     }
@@ -5694,6 +5814,7 @@ mod tests {
             receipt: "tensorfold ready; probe answered".into(),
             facts: Vec::new(),
             kernel_builds: Vec::new(),
+            extraction_probe: None,
         }
     }
 
@@ -6074,6 +6195,378 @@ mod tests {
             capyctl_config::custom::CustomManifest::parse(CUSTOM_NO_IDLE).unwrap(),
         );
         assert_eq!(custom::custom_key(&unkeyed, Some(&keys)), None);
+    }
+
+    // T50 (SPEC §§6.1, 13.2; ADR 0041 §4; ADR 0031 §§5, 7): a restarted
+    // host reopens its gate only after an all-false readiness Probe re-proves
+    // the retained launch with its own key, health path and declared fields.
+    // A malformed answer or mismatched owner stays closed without releasing
+    // the claim; neither a replay nor HTTP liveness grants readiness.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restarted_host_reproves_retained_custom_extraction_before_opening_its_gate() {
+        use capyctl_adapters::extraction_probe;
+        use capyctl_config::extractions::FieldType;
+        use capyctl_domain::completion::Milestone;
+        use capyctl_testkit::FakeEngine;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, mut deployment, policy) = custom_fixture(
+            root.path(),
+            identity_dir.path(),
+            "kind: custom_engine\nschema_version: 1\napi: extractions\n\
+             field_types: [number]\nhealth: /health\n\
+             args: [--host, \"{host}\", --port, \"{port}\", --model, \"{model_dir}\"]\n\
+             env: {SERVE_AUTH: \"{api_key}\"}\n",
+        );
+        deployment["api"] = "extractions".into();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (launch, _) = custom_launch(root.path(), &deployment, &policy, port);
+        let scope = executor.scope(&launch).unwrap();
+        executor
+            .identities
+            .provision(&scope, launch.identity.payload_digest, [7; 32])
+            .unwrap();
+        let keys = executor
+            .identities
+            .load(&scope, launch.identity.payload_digest)
+            .unwrap();
+        let authorization = format!("Bearer {}", hex::encode(keys.inference));
+        let answer = serde_json::json!({"answers": {"amount_paid": {
+            "type": "number", "value": 649, "guess": 649,
+            "p_null": 0.01, "confidence": 0.99
+        }}});
+        let engine =
+            Arc::new(FakeEngine::new().with_extractions(vec![FieldType::Number], answer.clone()));
+        let healthy = Arc::new(AtomicBool::new(true));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = engine.clone();
+        let health = healthy.clone();
+        let requests = seen.clone();
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method,
+                  uri: axum::http::Uri,
+                  headers: axum::http::HeaderMap,
+                  body: axum::body::Bytes| {
+                let engine = backend.clone();
+                let healthy = health.clone();
+                let authorized = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .is_some_and(|header| header == authorization.as_str());
+                requests.lock().unwrap().push(uri.path().to_owned());
+                async move {
+                    use axum::http::StatusCode;
+                    let (status, body) = if !authorized {
+                        (StatusCode::UNAUTHORIZED, serde_json::json!({}))
+                    } else if method == axum::http::Method::GET && uri.path() == "/health" {
+                        let status = if healthy.load(Ordering::SeqCst) {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        };
+                        (status, serde_json::json!({}))
+                    } else if method == axum::http::Method::POST && uri.path() == "/v1/systemone" {
+                        let body = serde_json::from_slice(&body).unwrap();
+                        assert_eq!(body, extraction_probe::request("toy", &[FieldType::Number]));
+                        (StatusCode::OK, engine.extraction_response(&body).unwrap())
+                    } else {
+                        (StatusCode::NOT_FOUND, serde_json::json!({}))
+                    };
+                    (status, axum::Json(body))
+                }
+            },
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // The startup evidence and exact process identity survive the host,
+        // while its in-memory ingress and readiness authority do not.
+        let session = executor.journal.connect().unwrap();
+        executor.connected(session).unwrap();
+        let now = capyctl_protocol::now_unix_ms();
+        let Acceptance::Fresh(ticket) = executor
+            .journal
+            .accept(session, &launch, now, &Sleeper)
+            .unwrap()
+        else {
+            panic!("a fresh launch");
+        };
+        executor.record_launch_profile(session, &launch).unwrap();
+        executor.journal.execute(ticket, now, &Sleeper).unwrap();
+        let processes: Vec<_> = executor
+            .journal
+            .inspect_owned("launch")
+            .unwrap()
+            .into_iter()
+            .map(|(identity, _)| identity)
+            .collect();
+        let _kill = KillOnDrop(processes[0].pid);
+        let mut ready = probed(&processes[0]);
+        ready.identities = processes.clone();
+        ready.observed_at_ms = capyctl_protocol::now_unix_ms();
+        ready.facts = vec![
+            Milestone::AllocationsRestored,
+            Milestone::WeightsUsable,
+            Milestone::CacheValid,
+            Milestone::ModelUsable,
+        ];
+        ready.extraction_probe = Some(
+            extraction_probe::evidence(
+                &extraction_probe::well_formed(&answer, &[FieldType::Number]).unwrap(),
+            )
+            .unwrap(),
+        );
+        executor
+            .journal
+            .record_launch_ready(session, "launch", &ready)
+            .unwrap();
+        let startup = executor
+            .journal
+            .execution_result("launch", capyctl_protocol::now_unix_ms())
+            .unwrap()
+            .probe_extraction
+            .expect("the startup answer is persisted with native readiness");
+        let mut conflicting = launch.clone();
+        conflicting.identity.profile_fingerprint = "another-approved-build".into();
+        conflicting.identity.payload_digest = conflicting.canonical_digest();
+        assert!(executor.journal.launch_profile(&conflicting).is_err());
+        executor.register_retained(&launch).unwrap();
+        executor
+            .publish_ready(session, "launch", "launch", &scope)
+            .unwrap();
+        // ADR 0018 §3: publishing an unrelated profile keeps this launch's
+        // approved document as the previous set only until the host restarts.
+        let approved = executor.profiles.accepted();
+        let mut changed = approved.config.document.clone();
+        changed["runtime_profiles"]["unrelated"] = changed["runtime_profiles"]["local"].clone();
+        let mut inventory = approved.inventory.clone();
+        inventory.policy_fingerprint =
+            capyctl_config::remote_resources::policy_fingerprint(&changed);
+        executor
+            .profiles
+            .stage(
+                "unrelated-profile",
+                crate::profiles::ProfileSet::new(
+                    HostConfig::parse(&changed.to_string()).unwrap(),
+                    inventory,
+                ),
+            )
+            .unwrap();
+        assert!(executor.profiles.settle("unrelated-profile", true));
+        assert!(executor.resolve_retained(&launch).is_ok());
+        let config = executor.profiles.accepted().config.document.to_string();
+        executor.disconnected(session);
+        executor.journal.disconnect(session).unwrap();
+        drop(executor);
+
+        let restarted = NativeHostExecution::new(
+            HostJournal::open(root.path(), "controller", "host").unwrap(),
+            Ingress::new().unwrap(),
+            IngressIdentities::new(
+                crate::identity_storage::IdentityDirectory::open(identity_dir.path()).unwrap(),
+            ),
+            HostConfig::parse(&config).unwrap(),
+            "host".into(),
+            "controller".into(),
+            root.path().join("runtime"),
+            root.path().join("logs"),
+            Default::default(),
+        );
+        let fresh_session = restarted.journal.connect().unwrap();
+        assert_ne!(session, fresh_session);
+        restarted.connected(fresh_session).unwrap();
+        assert_eq!(
+            restarted
+                .journal
+                .execution_result("launch", capyctl_protocol::now_unix_ms())
+                .unwrap()
+                .probe_extraction,
+            Some(startup),
+            "reopening the journal retains the same startup answer"
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ingress_address = listener.local_addr().unwrap();
+        let ingress = restarted.ingress.clone();
+        let ingress_server =
+            tokio::spawn(async move { axum::serve(listener, ingress.router()).await.unwrap() });
+        let client = reqwest::Client::new();
+        let request = || {
+            client
+                .post(format!("http://{ingress_address}/v1/systemone"))
+                .bearer_auth(hex::encode([7; 32]))
+                .json(&extraction_probe::request("toy", &[FieldType::Number]))
+        };
+        let replay = restarted
+            .execute(fresh_session, launch.clone())
+            .await
+            .unwrap();
+        assert!(!replay.model_usable);
+        assert!(replay.probe_extraction.is_none());
+        capyctl_protocol::execution::validate_result(&launch, &replay).unwrap();
+        assert_eq!(
+            request().send().await.unwrap().status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        let probe = |id: &str| {
+            let mut command = MemberCommand {
+                identity: checkpoint_identity(id, "ready"),
+                action: MemberAction::Probe {
+                    owned_handle: "launch".into(),
+                    max_tokens: None,
+                    decision: false,
+                    embedding: false,
+                    extraction: false,
+                },
+            };
+            command.identity.deadline_ms = capyctl_protocol::now_unix_ms() + 90_000;
+            command.identity.profile_fingerprint = launch.identity.profile_fingerprint.clone();
+            command.identity.payload_digest = command.canonical_digest();
+            command
+        };
+        engine.set_extraction(vec![FieldType::Number], serde_json::json!({"answers": {}}));
+        let failed = restarted
+            .execute(fresh_session, probe("malformed"))
+            .await
+            .unwrap();
+        assert!(!failed.model_usable && failed.claim_retained);
+        assert_eq!(
+            request().send().await.unwrap().status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            engine.extraction_requests(),
+            1,
+            "reproof must retain the launch's approved profile across restart"
+        );
+        engine.set_extraction(vec![FieldType::Number], answer);
+        healthy.store(false, Ordering::SeqCst);
+        let failed = restarted
+            .execute(fresh_session, probe("unhealthy"))
+            .await
+            .unwrap();
+        assert!(!failed.model_usable && failed.claim_retained);
+        assert_eq!(
+            engine.extraction_requests(),
+            1,
+            "health precedes extraction"
+        );
+        healthy.store(true, Ordering::SeqCst);
+        let mut wrong_owner = probe("wrong-owner");
+        wrong_owner.identity.profile_fingerprint = "another-profile".into();
+        wrong_owner.identity.payload_digest = wrong_owner.canonical_digest();
+        let failed = restarted.execute(fresh_session, wrong_owner).await.unwrap();
+        assert!(!failed.model_usable && failed.claim_retained);
+        assert_eq!(engine.extraction_requests(), 1, "ownership precedes HTTP");
+        let command = probe("reprove");
+        let result = tokio::time::timeout(
+            Duration::from_secs(90),
+            restarted.execute(fresh_session, command.clone()),
+        )
+        .await
+        .expect("a retained extraction is re-proven within the normal readiness bound")
+        .unwrap();
+        assert!(result.model_usable && result.claim_retained);
+        capyctl_protocol::execution::validate_result(&command, &result).unwrap();
+        assert_eq!(result.binding_id, scope.binding_id);
+        assert_eq!(result.incarnation, scope.incarnation);
+        assert!(
+            restarted
+                .journal
+                .execution_result("reprove", capyctl_protocol::now_unix_ms())
+                .unwrap()
+                .model_usable
+        );
+        assert_eq!(engine.extraction_requests(), 2);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "/health",
+                "/v1/systemone",
+                "/health",
+                "/health",
+                "/v1/systemone"
+            ]
+        );
+        assert_eq!(
+            request().send().await.unwrap().status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(engine.chat_requests(), 0);
+        assert_eq!(engine.decision_requests(), 0);
+        assert_eq!(
+            restarted.journal.inspect_owned("launch").unwrap(),
+            processes
+                .into_iter()
+                .map(|identity| (identity, Presence::Alive))
+                .collect::<Vec<_>>()
+        );
+        restarted.disconnected(fresh_session);
+        assert_eq!(
+            request().send().await.unwrap().status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert!(
+            restarted
+                .journal
+                .execution_result("launch", capyctl_protocol::now_unix_ms())
+                .unwrap()
+                .claim_retained
+        );
+        restarted.journal.disconnect(fresh_session).unwrap();
+        // A durable document is not a policy bypass: a changed active key,
+        // a changed host safety setting, or removal of this profile refuses
+        // reproof before HTTP while preserving the launch's charge.
+        let published = restarted.profiles.accepted();
+        let mut changed_key = published.config.document.clone();
+        changed_key["runtime_profiles"]["local"]["security"]["credential_ref"] =
+            "secret://changed-engine-key".into();
+        let mut changed_host = published.config.document.clone();
+        changed_host["resource_policy"]["max_parked"] = 3.into();
+        let mut removed = published.config.document.clone();
+        removed["runtime_profiles"]
+            .as_object_mut()
+            .unwrap()
+            .remove("local");
+        let extraction_requests = engine.extraction_requests();
+        for (id, document) in [
+            ("changed-active-key", changed_key),
+            ("changed-host-policy", changed_host),
+            ("removed-active-profile", removed),
+        ] {
+            let mut inventory = published.inventory.clone();
+            inventory.policy_fingerprint =
+                capyctl_config::remote_resources::policy_fingerprint(&document);
+            restarted
+                .profiles
+                .stage(
+                    id,
+                    crate::profiles::ProfileSet::new(
+                        HostConfig::parse(&document.to_string()).unwrap(),
+                        inventory,
+                    ),
+                )
+                .unwrap();
+            assert!(restarted.profiles.settle(id, true));
+            assert!(
+                restarted.resolve(&launch).is_err(),
+                "no new launch from a snapshot"
+            );
+            let session = restarted.journal.connect().unwrap();
+            restarted.connected(session).unwrap();
+            let denied = restarted.execute(session, probe(id)).await.unwrap();
+            assert!(!denied.model_usable && denied.claim_retained, "{id}");
+            assert_eq!(engine.extraction_requests(), extraction_requests, "{id}");
+            assert_eq!(
+                request().send().await.unwrap().status(),
+                reqwest::StatusCode::FORBIDDEN,
+                "{id}"
+            );
+            restarted.disconnected(session);
+            restarted.journal.disconnect(session).unwrap();
+        }
+        ingress_server.abort();
+        server.abort();
     }
 
     // T50: a valid answer may retain unknown members, but the host must not
