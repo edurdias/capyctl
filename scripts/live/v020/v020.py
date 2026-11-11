@@ -277,7 +277,7 @@ class Context:
         else:
             raise TimeoutError('role readiness deadline')
         if role != 'standalone':
-            self.enroll(role)
+            self.enroll(role, old=old)
         return info
 
     def enroll(self, role, old=False):

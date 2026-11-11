@@ -73,6 +73,8 @@ The ISSUE235 control model also declares an 8192-token context for its explicit
 llama.cpp embedding fixtures retain the required 32768-token context and eight
 slots, deriving their native KV reservation from the GGUF rather than inheriting
 the Python-engine fixture's 5 GiB override.
+An old-server fixture enrolls the matching old host: a newer host is correctly
+refused by the server-first upgrade gate and cannot exercise editable refusal.
 No apt, driver update, system CUDA modification or reboot is allowed. Missing
 compilers/tools are blocking preflight errors, not permission to install packages.
 

@@ -328,6 +328,24 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         config = json.loads((self.root / 'python-embedding.json').read_text())
         self.assertEqual(config['engine_config']['memory']['kv_cache'], '5GiB')
 
+    def test_old_server_fixture_enrolls_an_old_host_not_a_newer_refused_host(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        ctx = v020.Context(self.root, {})
+        state = self.root / 'state/old-server'
+        (state / 'identity').mkdir(parents=True)
+        (state / 'identity/server-credentials.json').write_text(
+            '{"api_key":"fixture","admin_token":"fixture-admin"}')
+        (self.root / 'old-server.log').write_text('ready')
+        def initialize(argv, **kwargs):
+            v020.atomic_json(Path(argv[argv.index('--output') + 1]), dict(
+                listeners={kind: {} for kind in ('inference', 'management', 'bootstrap', 'control')}))
+        ctx.command = initialize
+        ctx.spawn = lambda *args: SimpleNamespace(poll=lambda: None)
+        with mock.patch.object(ctx, 'enroll') as enroll:
+            ctx.role('old-server', old=True)
+        enroll.assert_called_once_with('old-server', old=True)
+
     def test_failed_native_start_preserves_sanitized_engine_diagnostics(self):
         ctx = v020.Context(self.root, {})
         ctx.row_id = 'TEST'
