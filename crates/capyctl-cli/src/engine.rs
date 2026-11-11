@@ -273,7 +273,11 @@ struct Registration {
 /// ADR 0018 §1 step 3: executed only now, because the operator named it.
 /// ADR 0039 §2: a native TensorFold release then has its `SHA256SUMS` and
 /// its capabilities document checked; it has no Python probe.
-fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, StructuredError> {
+fn register(
+    resolved: &Resolved,
+    state_dir: &Path,
+    cuda_home: Option<&Path>,
+) -> Result<Registration, StructuredError> {
     let reported = check_version(resolved, VERSION_CHECK_TIMEOUT).map_err(|e| {
         error(
             e.code(),
@@ -350,6 +354,7 @@ fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, Struc
         resolved.engine,
         &resolved.executable,
         &runtime,
+        cuda_home,
         capyctl_agent::installation::PROBE_TIMEOUT,
     );
     Ok(Registration {
@@ -707,9 +712,11 @@ async fn add(
         ));
     }
     let (r, state) = (resolved.clone(), target.state_dir.clone());
-    let registration = tokio::task::spawn_blocking(move || register(&r, &state))
-        .await
-        .map_err(|_| error("internal", "registration failed"))??;
+    let (registration, cuda_home) = tokio::task::spawn_blocking(move || {
+        register(&r, &state, cuda_home.as_deref()).map(|registration| (registration, cuda_home))
+    })
+    .await
+    .map_err(|_| error("internal", "registration failed"))??;
     let probe = match registration.deep_park_missing {
         Some(true) => "capability_missing",
         Some(false) => "available",

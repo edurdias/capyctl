@@ -1284,10 +1284,13 @@ impl CapabilityReport {
 /// nothing and grants nothing. ADR 0029 §2: a llama.cpp binary has no deep-park
 /// capability and nothing is run for it; its report says so. ADR 0038 §2: nor
 /// is anything run for TensorRT-LLM, whose import starts MPI and CUDA.
+/// `cuda_home` is the selected profile's toolkit, as rendered for its launch;
+/// it is never inherited from the agent's environment.
 pub fn probe_capabilities(
     engine: Engine,
     executable: &Path,
     runtime_dir: &Path,
+    cuda_home: Option<&Path>,
     timeout: Duration,
 ) -> Option<CapabilityReport> {
     if !probed(engine) {
@@ -1328,6 +1331,12 @@ pub fn probe_capabilities(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .process_group(0);
+    // SGLang on sm_120 imports DeepGEMM while discovering its HTTP routes.
+    // DeepGEMM requires CUDA_HOME when nvcc is outside the system search path,
+    // so admission must see the same selected toolkit as the actual launch.
+    if let Some(cuda_home) = cuda_home {
+        command.env("CUDA_HOME", cuda_home);
+    }
     // ADR 0008 amendment 2026-10-17: the probe's guard runs the launch's plugin
     // closure, which accepts SGLang's own plugins only under this selection.
     if matches!(engine, Engine::Sglang) {
@@ -1658,6 +1667,7 @@ impl InstallationRegistry {
         engine: Engine,
         executable: &Path,
         runtime_dir: &Path,
+        cuda_home: Option<&Path>,
     ) -> Option<CapabilityReport> {
         if let Some((cached, report)) = self.capabilities.lock().ok()?.get(profile) {
             if cached == key {
@@ -1667,7 +1677,13 @@ impl InstallationRegistry {
         let report = if engine == Engine::Tensorfold && self.line(profile).is_native() {
             native_capability_report()
         } else {
-            probe_capabilities(engine, executable, runtime_dir, self.probe_timeout)?
+            probe_capabilities(
+                engine,
+                executable,
+                runtime_dir,
+                cuda_home,
+                self.probe_timeout,
+            )?
         };
         self.capabilities
             .lock()
@@ -2196,14 +2212,26 @@ mod tests {
         std::fs::write(&script, "# helper\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o666)).unwrap();
         assert_eq!(
-            probe_capabilities(Engine::Sglang, &executable, runtime.path(), PROBE_TIMEOUT),
+            probe_capabilities(
+                Engine::Sglang,
+                &executable,
+                runtime.path(),
+                None,
+                PROBE_TIMEOUT
+            ),
             None
         );
         assert!(!marker.exists(), "an unverified helper was executed");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::write(runtime.path().join("stale.pyc"), "x").unwrap();
         assert_eq!(
-            probe_capabilities(Engine::Sglang, &executable, runtime.path(), PROBE_TIMEOUT),
+            probe_capabilities(
+                Engine::Sglang,
+                &executable,
+                runtime.path(),
+                None,
+                PROBE_TIMEOUT
+            ),
             None
         );
         assert!(!marker.exists(), "an unverified helper was executed");
@@ -2217,7 +2245,13 @@ mod tests {
         let runtime = tempfile::tempdir().unwrap();
         let executable = dir.path().join("bin/python3");
         assert_eq!(
-            probe_capabilities(Engine::Sglang, &executable, runtime.path(), PROBE_TIMEOUT),
+            probe_capabilities(
+                Engine::Sglang,
+                &executable,
+                runtime.path(),
+                None,
+                PROBE_TIMEOUT
+            ),
             None,
             "no probe helper in the runtime directory"
         );
@@ -2238,8 +2272,14 @@ mod tests {
             0o755,
         )
         .unwrap();
-        let report =
-            probe_capabilities(Engine::Sglang, &executable, runtime.path(), PROBE_TIMEOUT).unwrap();
+        let report = probe_capabilities(
+            Engine::Sglang,
+            &executable,
+            runtime.path(),
+            None,
+            PROBE_TIMEOUT,
+        )
+        .unwrap();
         assert_eq!(report.available("deep_park"), Some(false));
         capyctl_config::test_support::write_executable(&executable, "#!/bin/sh\nsleep 5\n", 0o755)
             .unwrap();
@@ -2248,6 +2288,7 @@ mod tests {
                 Engine::Sglang,
                 &executable,
                 runtime.path(),
+                None,
                 Duration::from_millis(200)
             ),
             None,
@@ -2286,10 +2327,56 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                probe_capabilities(engine, &executable, runtime.path(), PROBE_TIMEOUT),
+                probe_capabilities(engine, &executable, runtime.path(), None, PROBE_TIMEOUT),
                 None
             );
             assert_eq!(std::fs::read_to_string(&seen).unwrap(), expected);
+        }
+    }
+
+    // T21 T22: launch and Park admission use the selected profile's toolkit,
+    // including when the capability report is obtained through the registry.
+    #[test]
+    fn sglang_capability_admission_probes_with_the_selected_cuda_home() {
+        let dir = venv(Engine::Sglang, "0.5.23");
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(runtime.path().join(PROBE_SCRIPT), "# helper\n").unwrap();
+        std::fs::set_permissions(
+            runtime.path().join(PROBE_SCRIPT),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let executable = dir.path().join("bin/python3");
+        let cuda_home = dir.path().join("selected-cuda");
+        capyctl_config::test_support::write_executable(
+            &executable,
+            format!(
+                "#!/bin/sh\n\
+                 [ -z \"${{HOME+x}}${{PYTHONPATH+x}}${{LD_PRELOAD+x}}\" ] || exit 19\n\
+                 if [ \"${{CUDA_HOME-unset}}\" = '{}' ]; then missing=''; \
+                 else missing='\"route:/release_memory_occupation\"'; fi\n\
+                 printf '%s\\n' '{{\"schema\":\"capyctl/engine-capabilities/v1\",\
+                 \"engine\":\"sglang\",\"capabilities\":{{\"core\":[],\"deep_park\":['\
+                 \"$missing\"'],\"metrics\":[],\"observation\":[]}}}}'\n",
+                cuda_home.display()
+            ),
+            0o755,
+        )
+        .unwrap();
+        let registry = InstallationRegistry::from_inventory(&Default::default());
+        for (profile, toolkit) in [("without", None), ("selected", Some(cuda_home.as_path()))] {
+            let report = registry
+                .capabilities(
+                    profile,
+                    "digest",
+                    Engine::Sglang,
+                    &executable,
+                    runtime.path(),
+                    toolkit,
+                )
+                .unwrap();
+            assert_eq!(report.available("deep_park"), Some(toolkit.is_some()));
         }
     }
 
@@ -2338,7 +2425,7 @@ mod tests {
         );
         // Nothing to probe: deep parking is reported missing, nothing runs.
         let report =
-            probe_capabilities(Engine::Llamacpp, &binary, dir.path(), PROBE_TIMEOUT).unwrap();
+            probe_capabilities(Engine::Llamacpp, &binary, dir.path(), None, PROBE_TIMEOUT).unwrap();
         assert_eq!(report.available("deep_park"), Some(false));
         assert_eq!(report.missing_capabilities(), vec!["deep_park"]);
     }
@@ -2449,6 +2536,7 @@ mod tests {
             Engine::TensorrtLlm,
             &executable,
             runtime.path(),
+            None,
             PROBE_TIMEOUT,
         )
         .unwrap();
