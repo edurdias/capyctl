@@ -288,17 +288,29 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         self.assertTrue(Path(cc1plus).is_file())
 
     def test_no_floor_fixture_fits_its_explicit_two_gib_kv_pool(self):
-        from rows.regressions import no_floor
+        from rows.regressions import no_floor, editable
+        from types import SimpleNamespace
+        from unittest import mock
         class Captured(Exception):
             pass
         class Context:
-            def deploy(self, name, engine, extra):
+            def deploy(self, name, engine, extra, **kwargs):
                 self.extra = extra
                 raise Captured
         ctx = Context()
         with self.assertRaises(Captured):
             no_floor(ctx)
         self.assertEqual(ctx.extra['engine_config']['memory']['kv_cache'], '2GiB')
+        self.assertEqual(ctx.extra['engine_config']['context_length'], 8192)
+        ctx.installation = lambda key: None
+        ctx.logs = lambda: ''
+        ctx.engines = dict(SGLANG_EDITABLE='fixture')
+        ctx.cli = lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout='editable', stderr='')
+        ctx.assertion = v020.Context.assertion
+        ctx.role = lambda *args, **kwargs: None
+        with mock.patch('rows.regressions.install_editable_profile', return_value=('editable', 'fixture')):
+            with self.assertRaises(Captured):
+                editable(ctx)
         self.assertEqual(ctx.extra['engine_config']['context_length'], 8192)
 
     def test_failed_native_start_preserves_sanitized_engine_diagnostics(self):

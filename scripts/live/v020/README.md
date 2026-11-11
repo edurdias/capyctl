@@ -68,6 +68,8 @@ Every managed host configuration is validated before its process starts;
 editable profiles include log policy and distinct credential references.
 OT8 reads JSON timing headers and the complete timing SSE comment, not a
 Server-Timing-style string. TRT kernel caches are archived per attempt.
+The ISSUE235 control model also declares an 8192-token context for its explicit
+2 GiB KV pool, so an impossible control launch cannot mask editable refusal.
 No apt, driver update, system CUDA modification or reboot is allowed. Missing
 compilers/tools are blocking preflight errors, not permission to install packages.
 

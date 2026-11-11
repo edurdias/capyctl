@@ -138,7 +138,7 @@ def editable(ctx):
         name, path = install_editable_profile(ctx, role)
         # A separate real model must remain healthy across the failed start.
         good = 'control-' + role
-        ctx.deploy(good, 'VLLM_033', role=role, extra={'engine_config': {'memory': {'kv_cache': '2GiB'}}})
+        ctx.deploy(good, 'VLLM_033', role=role, extra={'engine_config': {'context_length': 8192, 'memory': {'kv_cache': '2GiB'}}})
         good_binding = ctx.owned(good, role)
         events_before = ctx.events(role)
         deploy = ctx.cli('deploy', 'model', '--file', str(path), role=role, check=False)
