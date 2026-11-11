@@ -353,8 +353,11 @@ Tests (failing before, passing after):
 CPU and Fake-engine tests are not qualification.
 
 Live check, 2026-11-01, host A (GB10), standalone, SGLang 0.5.22, nothing
-else on the host: deployment A (`qwen3-14b`) kept serving; deployment B
-(`qwen3-4b-instruct`, 7.5 GiB) started with its own checkpoint and 65 GiB of
+else on the host: deployment A (`qwen3-14b`) was serving when deployment B
+(`qwen3-4b-instruct`, 7.5 GiB) was first requested; that request's switch
+parked A (deep) to make room, so B's measured starts below ran beside A
+parked, in both runs (corrected 2026-11-11; this entry first said A kept
+serving). B started with its own checkpoint and 65 GiB of
 other model files just read into the cache (`MemFree` 11 to 16 GiB, `Cached`
 94 to 98 GiB). B's resident checkpoint pages were sampled every 0.7 s with
 `mincore(2)`.
