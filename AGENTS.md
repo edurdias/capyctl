@@ -163,6 +163,12 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     (~/vllm-0.32.0-venv), SGLang 0.5.22 (~/sglang-0.5.22-venv) and the llama.cpp
     v0.7.0 build (~/llamacpp-v0.7.0), made and removed by
     `scripts/live/multi-gpu/run.sh`, with their fingerprints recorded with the rows.
+  - a rented single-L40S machine (owner decision 2026-11-11, while the lab hosts
+    trained), for its one session only: fresh x86_64 installs of vLLM 0.32.0,
+    vLLM 0.33.0 (both `--torch-backend=cu130`), SGLang 0.5.22 and NVIDIA's CUDA
+    13.0 toolkit wheels (as `cuda_home`), all in the home directory and deleted
+    with the machine (Shadeform, supervised by `scripts/live/shade_session.py`;
+    results in `docs/changes/live-checks-l40s-2026-11-11.md`).
 
   Use these as they are. Do not create or modify any engine environment without the
   owner's explicit approval, and add each approved one to this list.
