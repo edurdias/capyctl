@@ -679,8 +679,8 @@ devices: [{id: gpu0}, {id: gpu1}]         # optional: exactly that many, to pin 
 - **Parking.** A model on several GPUs is `restart_only` for now; a stated
   `deep` or `host_backed` is refused (`capability_missing:deep_park`). vLLM
   and SGLang parking on several cards is built and is turned on per engine once
-  it passes on a two-GPU machine. LMCache is off for it
-  (`multi_gpu_unqualified`).
+  it passes on a two-GPU machine. LMCache is off for it under `lmcache: auto`
+  (`multi_gpu_unqualified`), and runs uncertified under `lmcache: required`.
 - **Enrolled hosts.** Both the server and the host need this release: the host
   declares the capability `local_tensor_parallel`, and the server never sends
   a model on several GPUs to a host that does not
@@ -781,9 +781,10 @@ format.
 
 CapyCTL uses engines you install yourself. Register them on the machine that runs them:
 
-    capyctl engine detect [--path DIR]        # lists vLLM/SGLang/TensorFold environments and llama-server binaries; runs nothing
+    capyctl engine detect [--path DIR]        # lists vLLM/SGLang/TensorFold/TensorRT-LLM environments and llama-server binaries; runs nothing
     capyctl engine add ~/venvs/vllm           # or its bin/vllm, or bin/python3 for SGLang
     capyctl engine add ~/llama.cpp/build/bin/llama-server   # llama.cpp: the binary or its directory
+    capyctl engine add ~/tensorrt-llm-1.2.1-venv/bin/trtllm-serve   # TensorRT-LLM
     capyctl engine add ~/sglang/bin/python3 --name sglang-patched --drift refuse
     capyctl engine list
     capyctl engine remove vllm [--drain]
@@ -803,11 +804,10 @@ An SGLang installed in editable mode (`pip install -e`, as in the official
 `installation_unsupported:editable`: CapyCTL loads SGLang from the
 environment's `site-packages` without running `.pth` files, and such an
 installation is reached only through one. Standalone refuses each launch of one
-with the same code, whatever `security.installation_drift` says. A host enrolled
-with a server starts it as before, and the engine fails at once with
-`engine_import_failed`: a patch release does not change the protocol, and
-0.1.x servers do not know the new code (the host-side refusal is planned for
-0.2.0, behind a capability). Reinstall SGLang without
+with the same code, whatever `security.installation_drift` says. An enrolled
+host refuses it too when the server advertises `installation_unsupported`
+(0.2.0). Toward a 0.1.x server it starts the engine as before, which fails at
+once with `engine_import_failed`; the control session stays up. Reinstall SGLang without
 `-e` ([Install an engine](../guide/install-engines.md#sglang-0521-or-0520)).
 `engines.yaml` sits beside the role's configuration file (`--config
 dir/host.yaml` means `dir/engines.yaml`). Without `--config`, on a host machine
@@ -848,6 +848,11 @@ The file keeps the profile. Upgrade CapyCTL to use it, or remove it with
 `capyctl engine remove <name>`. Releases before 0.1.2 refuse to start
 (`invalid_config` at `runtime_profiles.engine`); remove the profile with the
 newer binary, or edit `engines.yaml`, before starting the older one.
+
+A TensorRT-LLM profile records the versions of the distributions beside the
+engine in a `companions` field. A release before 0.2.0 does not know that
+field and refuses an `engines.yaml` that holds it; remove the TensorRT-LLM
+profile with the newer binary before starting an older one on the same file.
 
 In standalone, `CAPYCTL_VLLM_BIN` or `CAPYCTL_SGLANG_BIN` alone gives the profile
 `local`; both give `local-vllm` and `local-sglang`. Profiles you add coexist
@@ -944,6 +949,48 @@ Every launch runs llama-server on loopback with a closed environment: no
 pointed at empty private directories under `<state dir>/engines/llamacpp/`.
 llama-server takes no key; it is reached only through CapyCTL's
 inference endpoint.
+
+### Registering a TensorRT-LLM environment
+
+TensorRT-LLM needs an MPI runtime and a complete CUDA developer toolkit.
+Use system Open MPI 4.1.6 (`libopenmpi-dev` on Ubuntu 24.04), or on x86_64
+install `openmpi==4.1.8 mpi4py==4.1.2` inside the engine environment.
+The inspected wheel pair resolves MPI from the environment's own `lib`
+directory without inherited `LD_LIBRARY_PATH`; live loader identity still
+needs qualification. Use toolkit 13.1 for 1.2.1 and 13.4 for 1.4.0rc3.
+A user-prefix toolkit avoids system-package changes; set the profile's
+`cuda_home` (`CUDA_HOME` when running `engine add`) to its complete root.
+
+Each version lives in its own environment, `~/tensorrt-llm-<version>-venv`,
+built as [Install an engine](../guide/install-engines.md#tensorrt-llm-121-13-pre-release-or-140rc3)
+shows: torch first, a constraints file pinning it, then the wheel by URL and
+hash. The versions being qualified are 1.2.1, the 1.3 pre-release and
+1.4.0rc3; none has passed its live rows yet, so every TensorRT-LLM profile
+lists as custom and runs as an uncertified custom setup, never refused for
+its version.
+
+`detect` finds the environment by its `tensorrt_llm-*.dist-info` and runs
+nothing. `engine add` takes `<env>/bin/trtllm-serve` and never imports the
+engine or runs `trtllm-serve`, because an import initialises MPI and CUDA and
+Open MPI could start a daemon outside the check's process group. Its bounded
+version check runs the environment's Python in isolated mode on
+`importlib.metadata`, and records the version as `build_fingerprint` and the
+versions of `torch`, `tensorrt`, `flashinfer-python`, `transformers` and
+`mpi4py` as `companions`, which `engine list` shows with `idle signal: none`
+and `engine key: none`. The installation fingerprint covers `tensorrt_llm/`
+and `triton_kernels/`, their compiled libraries included; torch, TensorRT,
+FlashInfer and the MPI library are outside it, and a change in one shows in
+the companions. The profile is `security.deep_park: disabled`;
+`--deep-park enabled` is `capability_missing`.
+
+The role's own TensorRT-LLM is `local_engine.tensorrt-llm`,
+`--tensorrt-llm-bin` or `CAPYCTL_TENSORRT_LLM_BIN`
+([Settings](configuration.md#engine-installation)).
+
+Every launch runs `trtllm-serve` on loopback in one process, with Open MPI
+pinned to an isolated singleton with no network transport, a private
+`TMPDIR`, and `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`. FlashInfer may
+download kernels on the first start; that outbound connection is allowed.
 
 ## Engine logs and troubleshooting
 

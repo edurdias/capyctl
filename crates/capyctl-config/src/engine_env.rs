@@ -55,6 +55,8 @@ pub const OWNED_NAMES: &[&str] = &[
     // ADR 0008 amendment 2026-10-17: SGLang's plugin and platform selection.
     "SGLANG_PLUGINS",
     "SGLANG_PLATFORM",
+    // SPEC §8.2 / T21: the protected HTTP application is not profile code.
+    "SGLANG_HTTP_SERVER_APP_PATH",
     "VLLM_SERVER_DEV_MODE",
     "VLLM_API_KEY",
     // TensorFold reads this key (`server/authentication.py`) and then refuses
@@ -134,15 +136,63 @@ pub const LMCACHE_RESERVED_PREFIX: (&str, &str) = (
      renders LMCache from the deployment's `lmcache` setting",
 );
 
-/// Every reserved family: the dump families and LMCache's.
+/// ADR 0037 §7 (owner decision 2026-10-27, question 7): the engines' tracing
+/// families. The OpenTelemetry Python SDK reads `OTEL_*` for its endpoint,
+/// headers, sampler and resource, and SGLang reads `SGLANG_TRACE_*` and
+/// `SGLANG_OTLP_*`; CapyCTL renders engine tracing from the host's
+/// `observability.tracing.engines`, exporting only on loopback. Reserved on
+/// every engine, as LMCache's family is: a custom engine never gets trace
+/// context (ADR 0037 §6), and a variable here must not make any engine
+/// export off the host. Refused as `engine_env_reserved:<name>`.
+pub const TRACING_RESERVED_PREFIXES: &[(&str, &str)] = &[
+    (
+        "OTEL_",
+        "the OpenTelemetry SDK reads its endpoint, headers, sampler and resource here; \
+         CapyCTL renders engine tracing from `observability.tracing.engines`",
+    ),
+    (
+        "SGLANG_TRACE_",
+        "SGLang's tracing settings; CapyCTL renders engine tracing from \
+         `observability.tracing.engines`",
+    ),
+    (
+        "SGLANG_OTLP_",
+        "SGLang's OTLP export settings; CapyCTL renders engine tracing from \
+         `observability.tracing.engines`",
+    ),
+];
+
+/// ADR 0037 §7: trace context as an environment variable. vLLM reads
+/// `traceparent` from its own environment as a fallback parent
+/// (`tracing/otel.py`). Compared upper-cased, so `traceparent` and
+/// `TRACEPARENT` are both reserved.
+pub const TRACING_RESERVED_NAMES: &[(&str, &str)] = &[
+    (
+        "TRACEPARENT",
+        "a fixed trace parent for every request the engine serves; CapyCTL passes trace \
+         context per request",
+    ),
+    (
+        "TRACESTATE",
+        "trace state beside a fixed trace parent; CapyCTL passes trace context per request",
+    ),
+];
+
+/// Every reserved family: the dump families, LMCache's and tracing's.
 fn reserved_prefixes() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
     DUMP_RESERVED_PREFIXES
         .iter()
         .chain(std::iter::once(&LMCACHE_RESERVED_PREFIX))
+        .chain(TRACING_RESERVED_PREFIXES)
+}
+
+/// Every reserved single name: the dump names and tracing's.
+fn reserved_names() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    DUMP_RESERVED_NAMES.iter().chain(TRACING_RESERVED_NAMES)
 }
 
 fn reserved(upper: &str) -> bool {
-    DUMP_RESERVED_NAMES.iter().any(|(name, _)| *name == upper)
+    reserved_names().any(|(name, _)| *name == upper)
         || reserved_prefixes().any(|(prefix, _)| upper.starts_with(prefix))
 }
 
@@ -164,9 +214,9 @@ const MAX_VALUE_BYTES: usize = 4096;
 pub(crate) const MAX_NAMES: usize = 64;
 const MAX_NAME_BYTES: usize = 128;
 
-/// Whether CapyCTL owns or reserves `name` (rule 1, the dump families and
-/// LMCache's, above). Compared upper-cased, so a lower-case spelling of an
-/// owned name is not a way around it.
+/// Whether CapyCTL owns or reserves `name` (rule 1, the dump families,
+/// LMCache's and tracing's, above). Compared upper-cased, so a lower-case
+/// spelling of an owned name is not a way around it.
 pub fn is_owned(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     if SAFE_NAMES.contains(&upper.as_str()) {
@@ -177,6 +227,55 @@ pub fn is_owned(name: &str) -> bool {
             .iter()
             .any(|prefix| upper.starts_with(prefix))
         || reserved(&upper)
+}
+
+/// ADR 0039 §5: the names CapyCTL renders into the native TensorFold line's
+/// closed environment. All but the engine's memory reserve are owned on
+/// every engine already ([`OWNED_NAMES`], the `CAPYCTL_` family); the reserve
+/// is owned on the native line alone, so the Python line keeps its meaning.
+pub const TENSORFOLD_NATIVE_RENDERED: &[&str] = &[
+    "PATH",
+    "HOME",
+    "CUDA_VISIBLE_DEVICES",
+    "CUDA_DEVICE_ORDER",
+    "HF_HUB_OFFLINE",
+    "TENSORFOLD_NO_UPDATE_CHECK",
+    "TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
+    "TENSORFOLD_MEMORY_RESERVE_GIB",
+    "CAPYCTL_ENGINE_LOG",
+    "DO_NOT_TRACK",
+];
+
+/// ADR 0039 §5: why a native TensorFold profile may not name `name` in its
+/// `env`, its `security.approved_env` or a deployment's `engine_config.env`,
+/// as the closed reason `engine_env_reserved:<name>` with why: a name the
+/// native line renders, or one of `tensorfold_native::REFUSED_ENV`, which
+/// the native engine reads and CapyCTL never carries. `None` for any other
+/// name. Compared upper-cased, as [`is_owned`] is.
+pub fn tensorfold_native_refusal(name: &str) -> Option<String> {
+    let upper = name.to_ascii_uppercase();
+    if let Some(why) = crate::tensorfold_native::refused_env(&upper) {
+        return Some(format!(
+            "engine_env_reserved:{name}: TensorFold native never carries it: {why}"
+        ));
+    }
+    TENSORFOLD_NATIVE_RENDERED
+        .contains(&upper.as_str())
+        .then(|| {
+            format!("engine_env_reserved:{name}: CapyCTL renders it on the TensorFold native line")
+        })
+}
+
+/// [`tensorfold_native_refusal`] of the first refused name among `names`.
+/// An approval glob (`TF_*`) is not a name: the concrete names it admits are
+/// checked where a deployment sets them.
+pub fn tensorfold_native_refused<'a>(
+    names: impl IntoIterator<Item = &'a String>,
+) -> Option<String> {
+    names
+        .into_iter()
+        .filter(|name| !name.ends_with('*'))
+        .find_map(|name| tensorfold_native_refusal(name))
 }
 
 /// Why an engine environment was refused.
@@ -489,8 +588,7 @@ pub fn env_table() -> Vec<FlagRow> {
             }),
         )
         .chain(
-            DUMP_RESERVED_NAMES
-                .iter()
+            reserved_names()
                 .map(|(name, reason)| row(name, NameMatch::Name, FlagClass::Reserved, reason)),
         )
         .chain(SAFE_NAMES.iter().map(|name| {
@@ -502,4 +600,79 @@ pub fn env_table() -> Vec<FlagRow> {
             )
         }))
         .collect()
+}
+
+#[cfg(test)]
+mod tracing_tests {
+    use super::*;
+
+    // T48 T03 T21 (ADR 0037 §7, owner decision 2026-10-27 q7): the tracing
+    // names are reserved at every level and on every engine, whatever an
+    // approval says, refused as `engine_env_reserved:<name>` with the name as
+    // written; the value never appears.
+    #[test]
+    fn tracing_env_names_are_reserved() {
+        let names = [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "OTEL_SERVICE_NAME",
+            "OTEL_TRACES_SAMPLER",
+            "otel_resource_attributes",
+            "SGLANG_TRACE_LEVEL",
+            "SGLANG_TRACE_ASYNC",
+            "SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS",
+            "traceparent",
+            "tracestate",
+            "TRACEPARENT",
+            "TRACESTATE",
+        ];
+        let secret = "secret-header-value";
+        let none = BTreeMap::new();
+        for name in names {
+            assert!(is_owned(name), "{name}");
+            let env = BTreeMap::from([(name.to_owned(), secret.to_owned())]);
+            let approved = ApprovedEnv::parse(&["MY_*".to_owned()]).unwrap();
+            for refusal in [
+                resolve_engine_env(&env, &approved, &none).unwrap_err(),
+                resolve_engine_env(&none, &approved, &env).unwrap_err(),
+                // ADR 0031 §2: a custom engine's manifest, too.
+                resolve_engine_env_with_manifest(&env, &none, &approved, &none).unwrap_err(),
+            ] {
+                assert_eq!(refusal.code(), format!("engine_env_reserved:{name}"));
+                assert!(!refusal.to_string().contains(secret));
+            }
+        }
+        // An approval cannot name them, exactly or by glob.
+        for entry in [
+            "OTEL_*",
+            "OTEL_SERVICE_NAME",
+            "SGLANG_TRACE_*",
+            "TRACEPARENT",
+        ] {
+            assert_eq!(
+                ApprovedEnv::parse(&[entry.to_owned()]).unwrap_err().code(),
+                format!("engine_env_reserved:{entry}")
+            );
+        }
+        // The table lists them as reserved.
+        let table = env_table();
+        for name in [
+            "OTEL_",
+            "SGLANG_TRACE_",
+            "SGLANG_OTLP_",
+            "TRACEPARENT",
+            "TRACESTATE",
+        ] {
+            assert!(
+                table
+                    .iter()
+                    .any(|row| row.name == name && row.class == FlagClass::Reserved),
+                "{name}"
+            );
+        }
+        // Neighbouring names are untouched.
+        for name in ["OTELX", "SGLANG_TRACER", "TRACEPARENTS"] {
+            assert!(!is_owned(name), "{name}");
+        }
+    }
 }

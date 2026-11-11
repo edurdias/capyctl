@@ -8,6 +8,8 @@ the measured defaults of §6, the server's command line and log, the SGLang salt
 stopped and after the wake until a reading shows it released (A13), `restart_only`
 decision deployments parking with LMCache, and decision deployments on SGLang running
 without LMCache until LC7 passes on a release (A10).
+**Amended by:** [ADR 0034](0034-lmcache-by-default.md) (implemented 2026-10-28): §1, §3, §4, §6, §7, §9, §14
+and the Verification, as that ADR lists.
 **Amends (with the implementation):** `SPEC.md` §7.4 (a private cache service per
 instance), §8.2 (the rendered connector is owned), §9.1 and §9.2 (LMCache beside a
 parking residency only where qualified), §10 (`cache_salt` is no longer forwarded
@@ -22,6 +24,8 @@ parking and its protections), ADR 0013 (instances), ADR 0014 (engine configurati
 measured startup peak), ADR 0017 (capability gating), ADR 0018 (registration), ADR 0019
 (memory domains), ADR 0028 (groups), ADR 0029 (llama.cpp), ADR 0030 (decision models),
 ADR 0031 (custom engines; its loopback listener check).
+**Amended by:** ADR 0038 (2026-10-28): §2's table gains a TensorRT-LLM row, LMCache
+off (`engine_unsupported`).
 
 ## Context
 
@@ -158,6 +162,7 @@ start with the connector (§8) are the live checks, and the LC rows the qualific
 | llama.cpp | no | `engine_unsupported`: "llama.cpp has no LMCache integration" |
 | TensorFold | no | `engine_unsupported`: "TensorFold has no LMCache integration" |
 | custom engine | no | `engine_unsupported`: "CapyCTL does not render options for a custom engine" |
+| TensorRT-LLM (ADR 0038 §12) | no | `engine_unsupported`: "LMCache is not qualified with TensorRT-LLM" |
 | SGLang, a decision deployment or `--disable-radix-cache` (A10) | no | `engine_unsupported`: "decision deployments on SGLang run without LMCache: …" or "SGLang with --disable-radix-cache runs without LMCache: …" |
 
 vLLM 0.32.0 and SGLang 0.5.22 are the qualified versions (the LC rows); a newer one is
@@ -371,6 +376,14 @@ Under `lmcache: required` such a deployment is refused
 `lmcache_unavailable:park_unqualified`. A later release that adds the combination to the
 table turns LMCache on for it at the next launch.
 
+*Amended 2026-10-28 by [ADR 0034](0034-lmcache-by-default.md) (§§1, 3a, 5; owner decisions and rule of 2026-10-27):* a
+parking residency runs LMCache with engine-driven transfer, which the table's rows certify
+(LC13–LC16); under `lmcache: required` a combination outside the table runs LMCache as an
+uncertified setup instead of being refused `lmcache_unavailable:park_unqualified`; and the
+advice to declare `residency: restart_only` for LMCache is withdrawn: `restart_only` is for
+models that cannot park deep. The pool of §6 is sized automatically by default
+(ADR 0034 §4, `lmcache_pool: auto`).
+
 ### 8. The engine fails to start with the connector
 
 An engine launched with the connector that exits, or does not pass readiness within its
@@ -444,6 +457,11 @@ and the JSON view `lmcache` (`state`, `reason`, `pool_bytes`, `used_bytes`,
   `retention_zero:lmcache` at placement;
 - engine and LMCache processes start with `RLIMIT_CORE` 0, so a crash writes no core dump
   of request data;
+- on TensorFold's native line ([ADR 0039](0039-tensorfold-1.md) §4), the compaction
+  options (`--compact-at`, `--compact-keep`, `--compact-memory`) are refused
+  `retention_zero:compaction` and the options that write request state to disk
+  (`--record`, `--learn*`, `--recall*`) `retention_zero:engine_disk` (exit 5), at
+  resolution for a deployment's `retention: zero` and at placement for a host's;
 - turning it on stops existing LMCache servers. A role that starts with `retention: zero`
   and finds LMCache servers it owns drains each instance using one, stops its engine and
   its server (verified gone), and relaunches it without LMCache; a parked instance using

@@ -12,7 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use capyctl_adapters::traits::{AdapterError, ChatForward, ChatSink, StreamEnded};
+use capyctl_adapters::traits::{
+    AdapterError, ChatForward, ChatSink, EmbeddingAnswered, EmbeddingSink, StreamEnded,
+};
+use capyctl_config::effective::DeploymentApi;
 use capyctl_controller::load_table::{EngineGauges, LoadView};
 use capyctl_controller::{LeaseEnd, LeaseRefused, LifecycleFault, RequestLease, ServingInstance};
 use capyctl_router::forwarders::{ForwarderError, ForwarderSource, Lane};
@@ -103,10 +106,36 @@ impl ChatForward for Engine {
             .await;
         Ok(StreamEnded::Completed)
     }
+    /// ADR 0036 §4: a valid answer streamed to the sink, without the closing
+    /// brace the router writes after `capyctl.metrics`.
+    async fn forward_embedding(
+        &self,
+        _body: &capyctl_adapters::request::InferenceRequest,
+        sink: &mut dyn EmbeddingSink,
+    ) -> Result<EmbeddingAnswered, AdapterError> {
+        let content = self.run().await?;
+        sink.progressed();
+        let client_gone = sink
+            .send(
+                format!(
+                    r#"{{"object":"list","data":[{{"object":"embedding","index":0,"embedding":[0.5,-0.25]}}],"model":"{ROUTE}","usage":{{"prompt_tokens":2,"total_tokens":2}},"served_by":"{content}""#
+                )
+                .into_bytes(),
+            )
+            .await
+            .is_err();
+        Ok(EmbeddingAnswered {
+            inputs: 1,
+            prompt_tokens: Some(2),
+            client_gone,
+        })
+    }
 }
 
 /// The lifecycle authority's view of two instances, one per host.
 struct Authority {
+    /// The API the deployment serves (chat unless a test says otherwise).
+    api: Mutex<DeploymentApi>,
     instances: Mutex<Vec<ServingInstance>>,
     /// Every lease granted: (lease id, generation, how it ended).
     leases: Mutex<Vec<(String, i64, Option<LeaseEnd>)>>,
@@ -133,6 +162,7 @@ impl Authority {
             local_tensor_parallel: 1,
         };
         Arc::new(Self {
+            api: Mutex::new(DeploymentApi::Chat),
             instances: Mutex::new(vec![instance(0, 5, "host-a"), instance(1, 6, "host-b")]),
             leases: Mutex::new(Vec::new()),
             closed: Mutex::new(HashSet::new()),
@@ -213,14 +243,11 @@ impl capyctl_controller::LifecyclePort for Authority {
     ) -> Result<Vec<capyctl_store::deployments::PublicRoute>, LifecycleFault> {
         Ok(vec![capyctl_store::deployments::PublicRoute {
             id: ROUTE.into(),
-            api: capyctl_config::effective::DeploymentApi::Chat,
+            api: *self.api.lock().unwrap(),
         }])
     }
-    fn deployment_api(
-        &self,
-        _deployment: &str,
-    ) -> Result<capyctl_config::effective::DeploymentApi, LifecycleFault> {
-        Ok(capyctl_config::effective::DeploymentApi::Chat)
+    fn deployment_api(&self, _deployment: &str) -> Result<DeploymentApi, LifecycleFault> {
+        Ok(*self.api.lock().unwrap())
     }
     fn get_deployment(
         &self,
@@ -361,6 +388,8 @@ impl ForwarderSource for Engines {
         Ok(Lane {
             forward: real.unwrap_or_else(fake),
             request_abort: false,
+            engine_trace: false,
+            trace_context: false,
         })
     }
 }
@@ -395,6 +424,7 @@ fn fixture(delay_ms: u64) -> Fixture {
         api_key: None,
         inflight: Arc::new(capyctl_router::admission::InFlight::default()),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: capyctl_trace::Tracing::off(),
     };
     Fixture {
         deps,
@@ -630,10 +660,97 @@ async fn a_stream_refused_before_forwarding_fails_over() {
     assert_eq!(f.authority.ends(6), vec![Some(LeaseEnd::Completed)]);
 }
 
-// #213 (SPEC §10): a host ingress at its forward limit answers 429 with its own
-// `inference_unavailable` code before anything reaches the engine. The router
-// reads that as not accepted: a stream fails over to the other instance, and
-// a non-streamed request too, with the refused lease closed as not accepted.
+/// ADR 0036 §§3-4: one embeddings request through the router: its status and
+/// body.
+async fn embed(f: &Fixture) -> (StatusCode, Value) {
+    let response = capyctl_router::serve_router(f.deps.clone())
+        .oneshot(
+            axum::http::Request::post("/v1/embeddings")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    json!({"model": ROUTE, "input": ["first text"]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body = serde_json::from_slice(&body)
+        .unwrap_or_else(|_| panic!("one whole JSON document: {body:?}"));
+    (status, body)
+}
+
+/// Poll `ready` until it holds, within 5 s.
+async fn until(what: &str, ready: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !ready() {
+        assert!(tokio::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+// T47 T38 (ADR 0036 §4, SPEC §10): an embeddings request refused before it
+// was sent fails over: the client gets one whole answer, from the other
+// engine, closed with `capyctl.metrics`; the refused lease closes as not
+// accepted, the other completed, and the in-flight slot is released.
+#[tokio::test]
+async fn an_embedding_refused_before_forwarding_fails_over() {
+    let f = fixture(5);
+    *f.authority.api.lock().unwrap() = DeploymentApi::Embeddings;
+    f.a.set(Mode::Refuse);
+    // Make host a the first choice so the refusal is exercised.
+    f.authority.report(6, 3, true);
+    let (status, answer) = embed(&f).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["served_by"], "answer from host-b");
+    assert_eq!(answer["data"][0]["embedding"], json!([0.5, -0.25]));
+    assert!(answer["capyctl"]["metrics"].is_object(), "{answer}");
+    assert_eq!(f.a.accepted.load(Ordering::SeqCst), 0);
+    assert_eq!(f.b.served(), 1);
+    until("both leases close", || {
+        f.authority.ends(5) == vec![Some(LeaseEnd::NotAccepted)]
+            && f.authority.ends(6) == vec![Some(LeaseEnd::Completed)]
+    })
+    .await;
+    until("the in-flight slot is released", || {
+        f.deps.inflight.current(DEPLOYMENT) == 0
+    })
+    .await;
+}
+
+// T47 T38 (ADR 0036 §4, SPEC §10): an embeddings request every instance
+// refuses before it was sent is answered 503 `unavailable` with no answer
+// byte; every lease closes as not accepted and the in-flight slot is
+// released.
+#[tokio::test]
+async fn an_embedding_every_instance_refuses_is_unavailable() {
+    let f = fixture(5);
+    *f.authority.api.lock().unwrap() = DeploymentApi::Embeddings;
+    f.a.set(Mode::Refuse);
+    f.b.set(Mode::Refuse);
+    let (status, answer) = embed(&f).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+    assert_eq!(answer["code"], "unavailable", "{answer}");
+    assert!(answer.get("data").is_none(), "{answer}");
+    assert!(answer.get("capyctl").is_none(), "{answer}");
+    assert_eq!(
+        f.a.accepted.load(Ordering::SeqCst) + f.b.accepted.load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(f.authority.ends(5), vec![Some(LeaseEnd::NotAccepted)]);
+    assert_eq!(f.authority.ends(6), vec![Some(LeaseEnd::NotAccepted)]);
+    until("the in-flight slot is released", || {
+        f.deps.inflight.current(DEPLOYMENT) == 0
+    })
+    .await;
+}
+
+// T38 #213 (SPEC §10): a host ingress at its forward limit answers 429 with
+// its own code before anything reaches the engine. Streamed and collected
+// requests fail over, closing the refused lease as not accepted.
 #[tokio::test]
 async fn an_ingress_at_capacity_fails_over_to_another_instance() {
     let app = axum::Router::new().route(

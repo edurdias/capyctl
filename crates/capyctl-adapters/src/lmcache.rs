@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use capyctl_config::lmcache::{LmcacheOffReason, GIB};
+use capyctl_config::lmcache::{
+    LmcacheOffReason, TransferMode, EVICTION_RATIO, EVICTION_TRIGGER_WATERMARK, GIB,
+};
 use capyctl_domain::completion::{
     lmcache_members, EffectObservation, ExecutionIdentities, Milestone, Presence, ProcessIdentity,
     LMCACHE_ROLE,
@@ -87,6 +89,11 @@ pub struct ServerPlan {
     pub proc_root: PathBuf,
     /// `lmcache: required`: a server that does not start fails the launch.
     pub required: bool,
+    /// ADR 0034 §1: how the launch's KV travels to and from the server
+    /// (`lmcache::transfer_mode` of the launch's residency): engine-driven
+    /// for a parking residency, which the server and the connector both
+    /// render.
+    pub transfer: TransferMode,
 }
 
 impl ServerPlan {
@@ -258,6 +265,15 @@ pub fn server_log_path(engine_log: &Path) -> PathBuf {
 /// eager pool (`--no-l1-use-lazy`: LMCache 0.5.6 `distributed/config.py`
 /// defines `--l1-use-lazy` as a `BooleanOptionalAction` defaulting to true, so
 /// the pool the charge covers is allocated at start only when it is negated).
+/// ADR 0034 §4: every server also gets `--eviction-trigger-watermark 0.8
+/// --eviction-ratio 0.2` (LMCache 0.5.6's defaults, stated so the share of
+/// the pool an automatic size assumes survives an eviction stays what it
+/// is). ADR 0034 §1: a launch with engine-driven transfer gets
+/// `--supported-transfer-mode engine_driven`, never `auto` (a server serves
+/// one mode only); any other keeps LMCache's default `lmcache_driven` and
+/// renders nothing for it. Never `--shm-name`: engine-driven chunks travel
+/// pickled over the loopback request socket (LC16 measures it), so there is
+/// no shared-memory segment to size, charge or clean up.
 /// Never `--run-script-api-enabled`, never an L2, disk, GDS, Device-DAX or P2P
 /// option. The environment is exactly `PATH`, `HOME` and the instance's
 /// `CUDA_VISIBLE_DEVICES`, when set, [`NO_USAGE_TRACKING`] and, under the
@@ -268,7 +284,7 @@ pub fn render_server(
     plan: &ServerPlan,
     telemetry: crate::engine_telemetry::EngineTelemetry,
 ) -> RenderedCommand {
-    let argv = [
+    let mut argv: Vec<String> = [
         plan.lmcache_bin.to_string_lossy().into_owned(),
         "server".into(),
         "--host".into(),
@@ -286,8 +302,18 @@ pub fn render_server(
         "--eviction-policy".into(),
         "LRU".into(),
         "--no-l1-use-lazy".into(),
+        "--eviction-trigger-watermark".into(),
+        EVICTION_TRIGGER_WATERMARK.into(),
+        "--eviction-ratio".into(),
+        EVICTION_RATIO.into(),
     ]
     .into();
+    if plan.transfer == TransferMode::EngineDriven {
+        argv.extend([
+            "--supported-transfer-mode".into(),
+            TransferMode::EngineDriven.code().into(),
+        ]);
+    }
     let mut env = std::collections::BTreeMap::from([("PATH".to_owned(), plan.path.clone())]);
     env.extend(
         NO_USAGE_TRACKING
@@ -330,23 +356,40 @@ pub const NO_USAGE_TRACKING: [(&str, &str); 1] = [("LMCACHE_TRACK_USAGE", "false
 /// `kv_both`, the server's loopback request port, and no autostart (an engine
 /// never starts a server CapyCTL does not own). LMCache 0.5.6
 /// `lmcache_mp_connector.py` reads exactly `lmcache.mp.host`,
-/// `lmcache.mp.port` and `lmcache.mp.autostart` from this extra config.
-pub fn vllm_kv_transfer_config(rpc_port: u16) -> String {
+/// `lmcache.mp.port` and `lmcache.mp.autostart` from this extra config. ADR
+/// 0034 §1: engine-driven transfer adds `lmcache.mp.mp_transfer_mode:
+/// engine_driven`, which `vllm_multi_process_adapter.py` reads from the same
+/// extra config (`ExtraConfigDefault.mp_transfer_mode` under the
+/// `lmcache.mp.` prefix); lmcache-driven transfer leaves LMCache's default.
+pub fn vllm_kv_transfer_config(rpc_port: u16, transfer: TransferMode) -> String {
+    let mode = match transfer {
+        TransferMode::EngineDriven => format!(
+            ",\"lmcache.mp.mp_transfer_mode\":\"{}\"",
+            TransferMode::EngineDriven.code()
+        ),
+        TransferMode::LmcacheDriven => String::new(),
+    };
     format!(
         "{{\"kv_connector\":\"LMCacheMPConnector\",\
          \"kv_connector_module_path\":\"lmcache.integration.vllm.lmcache_mp_connector\",\
          \"kv_role\":\"kv_both\",\
          \"kv_connector_extra_config\":{{\"lmcache.mp.host\":\"{SERVER_HOST}\",\
-         \"lmcache.mp.port\":{rpc_port},\"lmcache.mp.autostart\":false}}}}"
+         \"lmcache.mp.port\":{rpc_port},\"lmcache.mp.autostart\":false{mode}}}}}"
     )
 }
 
 /// ADR 0033 §4: SGLang's `--lmcache-config-file`, written into `dir` (made
 /// owner-only, 0700) as an owner-only (0600) file holding exactly
 /// `mp_host: 127.0.0.1` and `mp_port: <port>`, the two keys LMCache 0.5.6's
-/// `load_engine_config_with_overrides` reads for SGLang's MP connector. Never
-/// written through a symlink.
-pub fn write_sglang_config(dir: &Path, rpc_port: u16) -> std::io::Result<PathBuf> {
+/// `load_engine_config_with_overrides` reads for SGLang's MP connector. ADR
+/// 0034 §1: engine-driven transfer adds the `extra_config` mapping holding
+/// `lmcache.mp.mp_transfer_mode: engine_driven`, which the unified connector
+/// reads (`get_extra_config_value`). Never written through a symlink.
+pub fn write_sglang_config(
+    dir: &Path,
+    rpc_port: u16,
+    transfer: TransferMode,
+) -> std::io::Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -378,7 +421,14 @@ pub fn write_sglang_config(dir: &Path, rpc_port: u16) -> std::io::Result<PathBuf
     if metadata.permissions().mode() & 0o7777 != 0o600 {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    file.write_all(format!("mp_host: {SERVER_HOST}\nmp_port: {rpc_port}\n").as_bytes())?;
+    let mut text = format!("mp_host: {SERVER_HOST}\nmp_port: {rpc_port}\n");
+    if transfer == TransferMode::EngineDriven {
+        text.push_str(&format!(
+            "extra_config:\n  lmcache.mp.mp_transfer_mode: {}\n",
+            TransferMode::EngineDriven.code()
+        ));
+    }
+    file.write_all(text.as_bytes())?;
     file.sync_all()?;
     Ok(path)
 }

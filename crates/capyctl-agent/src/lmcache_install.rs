@@ -9,13 +9,18 @@
 //! text of the registered environment within bounds and executes nothing (no
 //! interpreter, no import). It passes when LMCache is 0.5.6 or a later 0.5.x
 //! release registered with the profile, its server entry point and the
-//! server options CapyCTL renders are declared, the connector the engine
-//! needs is there, and `cache_salt` is threaded from the engine to LMCache's
-//! object keys. For SGLang it verifies salt support, not file presence, and
-//! never accepts the legacy SGLang connector (owner input on LMCache issue
-//! 4825, 2026-10-22: the legacy path drops the salt). A different digest
-//! from the registered one is drift, reported for the caller to handle under
-//! `security.installation_drift` as for the engine package.
+//! server options CapyCTL renders are declared (the eviction watermark and
+//! ratio included, ADR 0034 §4), the connector the engine needs is there,
+//! and `cache_salt` is threaded from the engine to LMCache's object keys. For
+//! a launch that renders engine-driven transfer (ADR 0034 §1) it also
+//! verifies the server's `--supported-transfer-mode engine_driven` and that
+//! the engine's connector reads `lmcache.mp.mp_transfer_mode`; a release
+//! without them fails only such launches. For SGLang it verifies salt
+//! support, not file presence, and never accepts the legacy SGLang connector
+//! (owner input on LMCache issue 4825, 2026-10-22: the legacy path drops the
+//! salt). A different digest from the registered one is drift, reported for
+//! the caller to handle under `security.installation_drift` as for the engine
+//! package.
 //!
 //! A pass is not qualification (AGENTS.md): the server's start and the
 //! engine's start with the connector are the live checks.
@@ -24,9 +29,10 @@ use crate::installation::{
     dist_info, dist_info_version, interpreter, site_packages, site_packages_holding,
     FingerprintError, InstallationMeasurer,
 };
+use capyctl_config::effective::Residency;
 use capyctl_config::engine_policy::Engine;
 use capyctl_config::lmcache::{
-    engine_gate, lmcache_version_supported, LmcacheOffReason, LmcacheRegistration,
+    engine_gate, lmcache_version_supported, LmcacheOffReason, LmcacheRegistration, TransferMode,
 };
 use serde::Serialize;
 use std::io::Read;
@@ -117,18 +123,21 @@ pub fn measure_lmcache(
 /// ADR 0033 §1: the launch-time check of a vLLM or SGLang profile's LMCache,
 /// by shape. Reads files of the environment of `executable` (lexically, as
 /// ADR 0018 §1) and executes nothing. `registered` is the profile's
-/// `lmcache` registration.
+/// `lmcache` registration; `residency` determines its transfer mode and whether
+/// sleep-based parking must retain the external cache (ADR 0034 §1).
 ///
 /// Reasons, first applicable wins: `engine_unsupported` (not vLLM or
 /// SGLang), `not_installed`, `check_failed` (the installation is not one
 /// readable dist-info), `version_unsupported`, `not_registered` (installed
 /// after `engine add`), `check_failed` (a shape element missing, all of them
-/// named). Drift is reported in the pass.
+/// named), `sleep_clears_cache` (sleep discards the external cache). Drift is
+/// reported in the pass.
 pub fn check_lmcache(
     measurer: &InstallationMeasurer,
     engine: Engine,
     executable: &Path,
     registered: Option<&LmcacheRegistration>,
+    residency: Residency,
 ) -> Result<LmcacheInstall, LmcacheCheckFailure> {
     if !matches!(engine, Engine::Vllm | Engine::Sglang) {
         let off = engine_gate(engine, "");
@@ -202,8 +211,20 @@ pub fn check_lmcache(
         Engine::Vllm => shape.vllm(),
         _ => shape.sglang(),
     }
+    if capyctl_config::lmcache::transfer_mode(residency) == TransferMode::EngineDriven {
+        shape.engine_driven(engine);
+    }
+    let sleep_clears_cache =
+        engine == Engine::Vllm && residency.parks() && shape.vllm_sleep_clears_cache();
     if !shape.missing.is_empty() {
         return Err(LmcacheCheckFailure::check_failed(shape.missing.join("; ")));
+    }
+    if sleep_clears_cache {
+        return Err(LmcacheCheckFailure::new(
+            LmcacheOffReason::SleepClearsCache,
+            "vllm/v1/engine/core.py: vLLM sleep clears the external LMCache cache; \
+             this installation cannot retain LMCache through deep or host_backed parking",
+        ));
     }
     let (digest, _, _) = measurer.measure_tree(&site.join(PACKAGE)).map_err(|e| {
         LmcacheCheckFailure::check_failed(format!("LMCache's files could not be measured ({e})"))
@@ -285,10 +306,12 @@ impl Shape<'_> {
 
     /// ADR 0033 §3: `lmcache server` and every option CapyCTL renders for it
     /// (`--host --port --transport --http-host --http-port --l1-size-gb
-    /// --no-l1-use-lazy --eviction-policy LRU`). In 0.5.x the request, transport and HTTP
-    /// options are declared in `lmcache/v1/multiprocess/config.py` and the L1
-    /// size, its eager allocation (`--no-l1-use-lazy`: `--l1-use-lazy` is a
-    /// boolean option defaulting on) and the eviction policy in
+    /// --no-l1-use-lazy --eviction-policy LRU`, and ADR 0034 §4's
+    /// `--eviction-trigger-watermark --eviction-ratio` for every launch). In
+    /// 0.5.x the request, transport and HTTP options are declared in
+    /// `lmcache/v1/multiprocess/config.py` and the L1 size, its eager
+    /// allocation (`--no-l1-use-lazy`: `--l1-use-lazy` is a boolean option
+    /// defaulting on) and the eviction options in
     /// `lmcache/v1/distributed/config.py` (`add_storage_manager_args`); the
     /// `server` subcommand composes them.
     fn server(&mut self, bin: &Path) {
@@ -309,7 +332,12 @@ impl Shape<'_> {
         }
         const STORAGE_CONFIG: &str = "lmcache/v1/distributed/config.py";
         if let Some(text) = self.required(site, STORAGE_CONFIG) {
-            for option in ["--l1-size-gb", "--eviction-policy"] {
+            for option in [
+                "--l1-size-gb",
+                "--eviction-policy",
+                "--eviction-trigger-watermark",
+                "--eviction-ratio",
+            ] {
                 if !declares_option(&text, option) {
                     self.note(format!("{STORAGE_CONFIG} declares no {option} option"));
                 }
@@ -387,14 +415,31 @@ impl Shape<'_> {
         }
         const API: &str = "lmcache/v1/distributed/api.py";
         if let Some(text) = self.required(site, API) {
-            if !class_declares_field(&text, "ObjectKey", "cache_salt") {
+            if !class_declares_field(&text, "ObjectKey", "cache_salt")
+                && !identity_backed_salt(&text)
+            {
                 self.note(format!(
                     "no cache_salt support: {API} declares no cache_salt field on ObjectKey"
                 ));
             }
             let copies = function_body(&text, "ipc_key_to_object_keys").is_some_and(|body| {
-                body.contains("ipc_key.cache_salt")
-                    && call_has_argument(body, "ObjectKey", "cache_salt")
+                body.lines().any(|line| {
+                    let Some((name, source)) =
+                        line.split('#').next().unwrap_or_default().split_once('=')
+                    else {
+                        return false;
+                    };
+                    let name = name.trim();
+                    source.trim() == "ipc_key.cache_salt"
+                        && !name.is_empty()
+                        && name.chars().all(is_identifier)
+                        && call_has_argument_value(body, "ObjectKey", "cache_salt", Some(name))
+                }) || call_has_argument_value(
+                    body,
+                    "ObjectKey",
+                    "cache_salt",
+                    Some("ipc_key.cache_salt"),
+                )
             });
             if !copies {
                 self.note(format!(
@@ -445,7 +490,31 @@ impl Shape<'_> {
                     "{CONNECTOR} defines no class UnifiedLMCacheMPConnector"
                 ));
             }
-            if !call_has_argument(&text, "IPCCacheServerKey", "cache_salt") {
+            let direct = call_has_argument_value(
+                &text,
+                "IPCCacheServerKey",
+                "cache_salt",
+                Some("operation.cache_salt"),
+            );
+            let factory = call_has_argument_value(
+                &text,
+                "IPCCacheServerKey.from_token_ids",
+                "cache_salt",
+                Some("operation.cache_salt"),
+            ) && self
+                .optional(site, "lmcache/v1/multiprocess/custom_types.py")
+                .and_then(|source| {
+                    let class = class_body(&source, "IPCCacheServerKey")?;
+                    let method = block_body(class, "    def from_token_ids")?;
+                    Some(call_has_argument_value(
+                        method,
+                        "cls",
+                        "cache_salt",
+                        Some("cache_salt"),
+                    ))
+                })
+                .unwrap_or(false);
+            if !direct && !factory {
                 self.note(format!(
                     "no cache_salt support: {CONNECTOR} builds no IPCCacheServerKey with cache_salt="
                 ));
@@ -505,11 +574,150 @@ impl Shape<'_> {
             }
         }
     }
+
+    /// ADR 0034, amendment of 2026-11-10 (LC15): the known vLLM sleep
+    /// cascade clears external connectors as well as its discarded local KV.
+    /// There is no preserve-external option in that sleep API or LMCache's
+    /// CLEAR handler. Reject the installed shape, not a version guess.
+    fn vllm_sleep_clears_cache(&mut self) -> bool {
+        const CORE: &str = "vllm/v1/engine/core.py";
+        let Some(text) = self.optional(self.engine, CORE) else {
+            return false;
+        };
+        let method = |header: &str| {
+            block_body(&text, header)
+                .map(compact_code)
+                .unwrap_or_default()
+        };
+        let sleep = method("    def sleep");
+        let pause = method("    def _finish_pause");
+        let reset = method("    def _reset_caches");
+        let reset_signature = text
+            .split_once("    def _reset_caches(")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(signature, _)| compact_code(signature))
+            .unwrap_or_default();
+        sleep.contains("clear_prefix_cache=level>=1")
+            && sleep.contains("self.pause_scheduler(mode=mode,clear_cache=clear_prefix_cache)")
+            && pause.contains("self._reset_caches()")
+            && reset_signature.contains("reset_connector:bool=True")
+            && reset.contains("reset_connector=reset_connector")
+    }
+
+    /// ADR 0034 §1: what engine-driven transfer needs, verified only for a
+    /// launch that renders it. The server's `--supported-transfer-mode`
+    /// offers `engine_driven` (`lmcache/v1/multiprocess/config.py`); vLLM's
+    /// adapter takes `mp_transfer_mode` from its `lmcache.mp.`-prefixed extra
+    /// configuration (`ExtraConfigDefault`); SGLang's unified connector reads
+    /// `lmcache.mp.mp_transfer_mode` from its configuration file's
+    /// `extra_config`.
+    fn engine_driven(&mut self, engine: Engine) {
+        let site = self.lmcache;
+        const MP_CONFIG: &str = "lmcache/v1/multiprocess/config.py";
+        let mode = TransferMode::EngineDriven.code();
+        if let Some(text) = self.required(site, MP_CONFIG) {
+            if !option_choices(&text, "--supported-transfer-mode")
+                .is_some_and(|choices| choices.iter().any(|choice| choice == mode))
+            {
+                self.note(format!(
+                    "{MP_CONFIG} declares no --supported-transfer-mode option with choice {mode}"
+                ));
+            }
+        }
+        match engine {
+            Engine::Vllm => {
+                const ADAPTER: &str = "lmcache/integration/vllm/vllm_multi_process_adapter.py";
+                if let Some(text) = self.required(site, ADAPTER) {
+                    if !class_body(&text, "ExtraConfigDefault")
+                        .is_some_and(|body| assigns(body, "mp_transfer_mode"))
+                    {
+                        self.note(format!(
+                            "{ADAPTER} declares no mp_transfer_mode in ExtraConfigDefault"
+                        ));
+                    }
+                    let prefixed = text.lines().any(|line| {
+                        line.strip_prefix("_EXTRA_CONFIG_KEY_PREFIX")
+                            .and_then(|rest| rest.trim_start().strip_prefix('='))
+                            .is_some_and(|value| {
+                                matches!(value.trim(), "\"lmcache.mp.\"" | "'lmcache.mp.'")
+                            })
+                    });
+                    if !prefixed {
+                        self.note(format!(
+                            "{ADAPTER} reads its extra configuration under no lmcache.mp. prefix"
+                        ));
+                    }
+                }
+            }
+            _ => {
+                const CONNECTOR: &str =
+                    "lmcache/integration/sglang/unified_lmcache_mp_connector.py";
+                const KEY: &str = "lmcache.mp.mp_transfer_mode";
+                if let Some(text) = self.required(site, CONNECTOR) {
+                    let code = compact_code(&text);
+                    if !code.contains(&format!("get_extra_config_value(\"{KEY}\""))
+                        && !code.contains(&format!("get_extra_config_value('{KEY}'"))
+                    {
+                        self.note(format!("{CONNECTOR} does not read {KEY}"));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Whether `flag` is declared as a quoted option name.
 fn declares_option(text: &str, flag: &str) -> bool {
     text.contains(&format!("\"{flag}\"")) || text.contains(&format!("'{flag}'"))
+}
+
+/// The quoted choices of `flag`'s own `add_argument(...)` call
+/// (`choices=[...]` or `choices=(...)`), `None` when the flag or its choices
+/// are not declared.
+fn option_choices(text: &str, flag: &str) -> Option<Vec<String>> {
+    ["\"", "'"].iter().find_map(|quote| {
+        let at = text.find(&format!("{quote}{flag}{quote}"))?;
+        let rest = &text[at..];
+        let call = rest.find("add_argument(").map_or(rest, |end| &rest[..end]);
+        let after = &call[call.find("choices=")? + "choices=".len()..];
+        let close = match after.chars().next()? {
+            '[' => ']',
+            '(' => ')',
+            _ => return None,
+        };
+        let list = &after[1..after.find(close)?];
+        Some(
+            list.split(',')
+                .map(|choice| {
+                    choice
+                        .trim()
+                        .trim_matches(|c| c == '"' || c == '\'')
+                        .to_owned()
+                })
+                .filter(|choice| !choice.is_empty())
+                .collect(),
+        )
+    })
+}
+
+/// A line whose statement assigns `name` (`name = ...`, `name: T = ...`).
+fn assigns(text: &str, name: &str) -> bool {
+    text.lines().any(|line| {
+        line.trim_start().strip_prefix(name).is_some_and(|rest| {
+            let rest = rest.trim_start();
+            (rest.starts_with('=') && !rest.starts_with("=="))
+                || (rest.starts_with(':') && rest.contains('='))
+        })
+    })
+}
+
+/// `text` without comments (from `#` to the end of its line) or whitespace,
+/// so a call reads the same however it is wrapped.
+fn compact_code(text: &str) -> String {
+    text.lines()
+        .flat_map(|line| line.split('#').next().unwrap_or_default().chars())
+        .filter(|c| !c.is_whitespace())
+        .collect()
 }
 
 /// Whether `--no-<flag>` is accepted: declared outright, or `flag`'s own
@@ -549,11 +757,12 @@ fn function_body<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     block_body(text, &format!("def {name}"))
 }
 
-/// The text after a top-level line starting with `header` and then `(` or
-/// `:`, up to the next top-level line that is not the header's own
-/// continuation (`)`), a comment or blank.
+/// The text after a line starting with `header` and then `(` or `:`,
+/// up to the next statement at the header's indentation (excluding its
+/// own continuation, comments and blanks). Also handles class methods.
 fn block_body<'a>(text: &'a str, header: &str) -> Option<&'a str> {
     let mut offset = 0;
+    let indent = header.len() - header.trim_start().len();
     let mut start = None;
     for line in text.split_inclusive('\n') {
         let here = offset;
@@ -567,8 +776,9 @@ fn block_body<'a>(text: &'a str, header: &str) -> Option<&'a str> {
                 }
             }
             Some(begin) => {
-                let top_level = line.starts_with(|c: char| !c.is_whitespace());
-                if top_level && !line.starts_with(')') && !line.starts_with('#') {
+                let statement = line.trim_start();
+                let same_level = !statement.is_empty() && line.len() - statement.len() <= indent;
+                if same_level && !statement.starts_with(')') && !statement.starts_with('#') {
                     return Some(&text[begin..here]);
                 }
             }
@@ -579,7 +789,13 @@ fn block_body<'a>(text: &'a str, header: &str) -> Option<&'a str> {
 
 /// A field annotation `name:` in the class body (`cache_salt: str = ""`).
 fn class_declares_field(text: &str, class: &str, field: &str) -> bool {
-    class_body(text, class).is_some_and(|body| declares_field(body, field))
+    class_body(text, class).is_some_and(|body| {
+        body.lines().any(|line| {
+            line.strip_prefix("    ")
+                .filter(|statement| !statement.starts_with(char::is_whitespace))
+                .is_some_and(|statement| declares_field(statement, field))
+        })
+    })
 }
 
 /// A line whose statement is the annotation `name: ...`.
@@ -591,6 +807,39 @@ fn declares_field(text: &str, field: &str) -> bool {
     })
 }
 
+/// ADR 0033 §5: 0.5.7 moves matching fields into an immutable identity.
+/// A getter alone is not enough: flat construction and replacement must
+/// preserve the supplied salt in the identity that ObjectKey stores.
+fn identity_backed_salt(text: &str) -> bool {
+    if !class_declares_field(text, "ObjectKeyIdentity", "cache_salt")
+        || !class_declares_field(text, "ObjectKey", "identity")
+    {
+        return false;
+    }
+    let Some(class) = class_body(text, "ObjectKey") else {
+        return false;
+    };
+    let getter = class.contains("    @property\n    def cache_salt(")
+        && block_body(class, "    def cache_salt")
+            .is_some_and(|body| compact_code(body).contains("returnself.identity.cache_salt"));
+    let constructor = block_body(class, "    def __init__").is_some_and(|body| {
+        let code = compact_code(body);
+        call_has_argument_value(
+            body,
+            "ObjectKeyIdentity",
+            "cache_salt",
+            Some("cache_saltifcache_saltisnotNoneelse\"\""),
+        ) && call_has_argument_value(
+            body,
+            "replace",
+            "cache_salt",
+            Some("cache_saltifcache_saltisnotNoneelseidentity.cache_salt"),
+        ) && (code.contains("object.__setattr__(self,\"identity\",identity)")
+            || code.contains("object.__setattr__(self,'identity',identity)"))
+    });
+    getter && constructor
+}
+
 /// A top-level `def name(`.
 fn defines_function(text: &str, name: &str) -> bool {
     text.lines().any(|line| {
@@ -599,8 +848,8 @@ fn defines_function(text: &str, name: &str) -> bool {
     })
 }
 
-/// Whether some call `callee(...)` passes the keyword argument `argument=`.
-fn call_has_argument(text: &str, callee: &str, argument: &str) -> bool {
+/// Match a keyword's value as well when checking a salt-preserving hop.
+fn call_has_argument_value(text: &str, callee: &str, argument: &str, value: Option<&str>) -> bool {
     let opener = format!("{callee}(");
     let keyword = format!("{argument}=");
     let mut from = 0;
@@ -633,7 +882,38 @@ fn call_has_argument(text: &str, callee: &str, argument: &str) -> bool {
             .filter(|c| !c.is_whitespace())
             .collect();
         let named = arguments.match_indices(&keyword).any(|(index, _)| {
-            index == 0 || arguments[..index].ends_with(',') || arguments[..index].ends_with('(')
+            if index != 0 && !arguments[..index].ends_with(',') {
+                return false;
+            }
+            let depth = arguments[..index].chars().fold(0usize, |depth, c| match c {
+                '(' | '[' | '{' => depth + 1,
+                ')' | ']' | '}' => depth.saturating_sub(1),
+                _ => depth,
+            });
+            if depth != 0 {
+                return false;
+            }
+            let Some(value) = value else {
+                return true;
+            };
+            let rest = &arguments[index + keyword.len()..];
+            let mut depth = 0usize;
+            let end = rest
+                .char_indices()
+                .find_map(|(at, c)| match c {
+                    '(' | '[' | '{' => {
+                        depth += 1;
+                        None
+                    }
+                    ')' | ']' | '}' => {
+                        depth = depth.saturating_sub(1);
+                        None
+                    }
+                    ',' if depth == 0 => Some(at),
+                    _ => None,
+                })
+                .unwrap_or(rest.len());
+            rest[..end].trim_matches(['(', ')']) == value
         });
         if named {
             return true;
@@ -781,22 +1061,36 @@ mod tests {
         );
     }
 
+    // T45 (ADR 0033 §5): salt values, not just keyword presence, reach
+    // the direct constructor or factory; nested arguments stay separate.
     #[test]
-    fn lmcache_calls_are_matched_by_keyword_not_by_value() {
-        assert!(call_has_argument(
-            "k = IPCCacheServerKey(\n  model_name=m,\n  cache_salt=op.cache_salt,\n)",
+    fn lmcache_calls_match_salt_values() {
+        for callee in ["IPCCacheServerKey", "IPCCacheServerKey.from_token_ids"] {
+            for (arguments, expected) in [
+                ("model_name=m, cache_salt=op.cache_salt", true),
+                ("model_name=f(a,b), cache_salt=(op.cache_salt)", true),
+                ("model_name=m, salt=op.cache_salt", false),
+                ("model_name=m, cache_salt=\"\"", false),
+                ("nested=f(cache_salt=op.cache_salt), cache_salt=\"\"", false),
+            ] {
+                // The keyword belongs to the outer call, not a nested one.
+                assert_eq!(
+                    call_has_argument_value(
+                        &format!("k = {callee}({arguments})"),
+                        callee,
+                        "cache_salt",
+                        Some("op.cache_salt"),
+                    ),
+                    expected,
+                    "{callee}: {arguments}",
+                );
+            }
+        }
+        assert!(!call_has_argument_value(
+            "k = MyIPCCacheServerKey(cache_salt=op.cache_salt)",
             "IPCCacheServerKey",
-            "cache_salt"
-        ));
-        assert!(!call_has_argument(
-            "k = IPCCacheServerKey(model_name=m, salt=op.cache_salt)",
-            "IPCCacheServerKey",
-            "cache_salt"
-        ));
-        assert!(!call_has_argument(
-            "k = MyIPCCacheServerKey(cache_salt=s)",
-            "IPCCacheServerKey",
-            "cache_salt"
+            "cache_salt",
+            Some("op.cache_salt"),
         ));
     }
 
@@ -805,6 +1099,12 @@ mod tests {
         let text = "class A:\n    x: int\n\n@dataclass\nclass B:\n    cache_salt: str = \"\"\n";
         assert!(!class_declares_field(text, "A", "cache_salt"));
         assert!(class_declares_field(text, "B", "cache_salt"));
+        // T45: a constructor parameter is not a stored class field.
+        assert!(!class_declares_field(
+            "class C:\n    def __init__(\n        self,\n        cache_salt: str = \"\",\n    ):\n        pass\n",
+            "C",
+            "cache_salt",
+        ));
     }
 
     #[test]

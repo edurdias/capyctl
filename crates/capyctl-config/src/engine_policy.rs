@@ -21,6 +21,12 @@ pub enum Engine {
     /// ADR 0029: llama.cpp's `llama-server`, restart-only, one GGUF model per
     /// deployment, registered as a bare binary with `engine add`.
     Llamacpp,
+    /// ADR 0038 §1: TensorRT-LLM's `trtllm-serve`, restart-only, one Hugging
+    /// Face checkpoint on the PyTorch backend on one GPU, registered from its
+    /// virtual environment with `engine add`. The kind is spelled after the
+    /// product (owner decision 2026-10-27, question 8).
+    #[serde(rename = "tensorrt-llm")]
+    TensorrtLlm,
     /// ADR 0031: a custom engine, a program CapyCTL has no integration for,
     /// started from a host-approved manifest; restart-only, one process per
     /// instance, registered with `engine add --custom`.
@@ -29,11 +35,12 @@ pub enum Engine {
 
 impl Engine {
     /// Every engine kind, in the order lists show them.
-    pub const ALL: [Engine; 5] = [
+    pub const ALL: [Engine; 6] = [
         Engine::Vllm,
         Engine::Sglang,
         Engine::Tensorfold,
         Engine::Llamacpp,
+        Engine::TensorrtLlm,
         Engine::Custom,
     ];
 
@@ -44,6 +51,7 @@ impl Engine {
             Engine::Sglang => "sglang",
             Engine::Tensorfold => "tensorfold",
             Engine::Llamacpp => "llamacpp",
+            Engine::TensorrtLlm => "tensorrt-llm",
             Engine::Custom => "custom",
         }
     }
@@ -131,6 +139,17 @@ pub const VLLM_RESERVED_FLAGS: &[&str] = &[
     // beside HTTP (`FrontendArgs.grpc_port`, with its Rust frontend); capyctl
     // owns every listener.
     "--grpc-port",
+    // SPEC §8.2 / T21: vLLM 0.33.0's sleep backend resolves a registered
+    // module/class; its watchdog can write stack dumps to `dump_dir`.
+    // CapyCTL owns parking and disk-writing controls, including dotted JSON.
+    "--sleep-mode-backend",
+    "--watchdog-config",
+    // ADR 0036 §2: CapyCTL renders `--runner pooling` on an embeddings
+    // deployment and nothing on any other, so neither a chat deployment's
+    // extra arguments nor an embeddings one's may choose the runner or the
+    // conversion (vLLM picks `--convert auto` itself).
+    "--runner",
+    "--convert",
 ];
 
 /// Whole option families reserved for vLLM: any option whose name starts here.
@@ -143,6 +162,38 @@ const VLLM_RESERVED_FAMILIES: &[&str] = &["--ssl-", "--data-parallel-", "--capyc
 /// capyctl's default `eager` on every memory shape (amendment A21, note of
 /// 2026-10-15).
 const VLLM_SLEEP_RESERVED: &[&str] = &["--safetensors-load-strategy"];
+
+/// ADR 0037 §7 (owner decision 2026-10-27, question 7): vLLM's tracing
+/// options are CapyCTL's in every spelling, whatever the host approves. With
+/// engine tracing on the adapter renders `--otlp-traces-endpoint` in the
+/// reserved block; `--collect-detailed-traces` is never rendered. An earlier
+/// approval of `--otlp-traces-endpoint` no longer admits it.
+pub const VLLM_TRACING_OPTIONS: &[&str] = &["--otlp-traces-endpoint", "--collect-detailed-traces"];
+
+/// ADR 0037 §7 (owner decision 2026-10-27, question 7): SGLang's tracing
+/// `ServerArgs` fields (`arg_groups/fields/observability.py`), CapyCTL's in
+/// every spelling, whatever the host approves. The option is the field with
+/// `_` spelled `-`.
+pub const SGLANG_TRACING_FIELDS: &[&str] = &[
+    "enable_trace",
+    "otlp_traces_endpoint",
+    "otlp_service_name",
+    "trace_modules",
+];
+
+/// ADR 0037 §7: why the tracing options are owned, for the flag table.
+const TRACING_OWNED: &str = "CapyCTL renders engine tracing from the host's \
+     `observability.tracing.engines`, exporting only to a loopback endpoint";
+
+fn tracing_option(engine: Engine, name: &str) -> bool {
+    match engine {
+        Engine::Vllm => VLLM_TRACING_OPTIONS.contains(&name),
+        Engine::Sglang => SGLANG_TRACING_FIELDS
+            .iter()
+            .any(|field| sglang_field_option(field) == name),
+        _ => false,
+    }
+}
 
 /// ADR 0014 §3: SGLang `ServerArgs` fields capyctl owns. The option spelling is the
 /// field with `_` replaced by `-`; [`SGLANG_RESERVED_ALIASES`] adds the other
@@ -206,7 +257,15 @@ pub const SGLANG_RESERVED_FIELDS: &[&str] = &[
     "lmcache_config_file",
     "enable_flexkv",
     "flexkv_config_file",
+    // ADR 0033 §11 / T21: external cache ownership is exclusive, including
+    // the 0.5.23 dynamic backend's module-loading configuration.
+    "enable_unified_cache_external_linker",
+    "unified_cache_external_linker_backend",
+    "unified_cache_external_linker_config",
     "quantize_and_serve",
+    // ADR 0036 §2: rendered `--is-embedding` on an embeddings deployment only,
+    // so no deployment's extra arguments may set it.
+    "is_embedding",
 ];
 
 /// Other spellings SGLang's parser accepts for reserved fields.
@@ -482,6 +541,9 @@ pub fn draft_model_path(engine: Engine, args: &[String]) -> Option<String> {
         // ADR 0029 §8: llama.cpp's draft model is a GGUF file
         // (`--model-draft`), never a draft directory.
         Engine::Llamacpp => return None,
+        // ADR 0038 §1: speculative decoding is out of scope; its options and
+        // `speculative_config` are reserved.
+        Engine::TensorrtLlm => return None,
         // ADR 0031 §4: CapyCTL reads nothing from a custom engine's options.
         Engine::Custom => return None,
     };
@@ -497,7 +559,11 @@ pub fn draft_model_path(engine: Engine, args: &[String]) -> Option<String> {
             Engine::Vllm => serde_json::from_str::<serde_json::Value>(&value)
                 .ok()
                 .and_then(|config| config["model"].as_str().map(str::to_owned)),
-            Engine::Sglang | Engine::Tensorfold | Engine::Llamacpp | Engine::Custom => Some(value),
+            Engine::Sglang
+            | Engine::Tensorfold
+            | Engine::Llamacpp
+            | Engine::TensorrtLlm
+            | Engine::Custom => Some(value),
         };
     }
     named.filter(|path| Path::new(path).is_absolute())
@@ -537,6 +603,9 @@ pub const TENSORFOLD_DECLARED_DRAFTER_CONFLICT: &str = "`model.draft` names Tens
 pub const LLAMACPP_DECLARED_DRAFTER: &str = "llama.cpp takes its draft model as \
      `--model-draft <file>` in the engine arguments, inside security.approved_paths; \
      `model.draft` is not supported for llama.cpp";
+/// ADR 0038 §1: TensorRT-LLM's speculative decoding is out of scope.
+pub const TENSORRT_LLM_DECLARED_DRAFTER: &str = "TensorRT-LLM's speculative decoding is not \
+     supported in this version, so `model.draft` is refused";
 
 /// Whether `args` set `option` (abbreviations and the `=` spelling included).
 fn names_option(args: &[String], option: &str) -> Result<bool, ProfileArgError> {
@@ -582,6 +651,8 @@ pub fn declared_draft_admitted(engine: Engine, args: &[String]) -> Result<(), St
         // ADR 0029 §8: llama.cpp names its draft model with `--model-draft
         // <file>`, an approved path option; there is no declared drafter.
         Engine::Llamacpp => return Err(LLAMACPP_DECLARED_DRAFTER.into()),
+        // ADR 0038 §1: speculative decoding is out of scope in 0.2.0.
+        Engine::TensorrtLlm => return Err(TENSORRT_LLM_DECLARED_DRAFTER.into()),
         // ADR 0031 §4: a custom engine takes no typed engine field.
         Engine::Custom => return Err(
             "custom_field_unsupported:draft_model: a custom engine's manifest is its whole command"
@@ -676,7 +747,7 @@ pub fn disk_table_cache_bytes(engine: Engine, args: &[String]) -> Option<i64> {
             .iter()
             .any(|parsed| matches_name(&parsed.name, "--ple-on-ssd"))
             .then_some(TENSORFOLD_TABLE_CACHE_BYTES),
-        Engine::Vllm | Engine::Llamacpp | Engine::Custom => None,
+        Engine::Vllm | Engine::Llamacpp | Engine::TensorrtLlm | Engine::Custom => None,
     }
 }
 
@@ -758,7 +829,8 @@ const VLLM_SENSITIVE: &[(&str, Sensitivity)] = &[
             checkpoint_exempt: false,
         },
     ),
-    ("--otlp-traces-endpoint", Sensitivity::ListenerOrEgress),
+    // ADR 0037 §7: `--otlp-traces-endpoint` is owned now
+    // ([`VLLM_TRACING_OPTIONS`]), not approval-gated.
     ("--kv-transfer-config", Sensitivity::ListenerOrEgress),
     ("--kv-events-config", Sensitivity::ListenerOrEgress),
     ("--load-format", Sensitivity::ListenerOrEgress),
@@ -803,7 +875,8 @@ const SGLANG_SENSITIVE: &[(&str, Sensitivity)] = &[
             checkpoint_exempt: false,
         },
     ),
-    ("--otlp-traces-endpoint", Sensitivity::ListenerOrEgress),
+    // ADR 0037 §7: `--otlp-traces-endpoint` is owned now
+    // ([`SGLANG_TRACING_FIELDS`]), not approval-gated.
     ("--tool-server", Sensitivity::ListenerOrEgress),
     ("--kv-events-config", Sensitivity::ListenerOrEgress),
     ("--load-format", Sensitivity::ListenerOrEgress),
@@ -853,7 +926,6 @@ const SGLANG_SHAPED: &[&str] = &[
     "--gated-launch-port",
     "--file-storage-path",
     "--load-publish-endpoint",
-    "--otlp-traces-endpoint",
     "--cuda-graph-config",
     "--uno-lora-path",
     "--speculative-draft-model-path",
@@ -909,7 +981,6 @@ const VLLM_SHAPED: &[&str] = &[
     "--numa-bind",
     "--numa-bind-cpus",
     "--numa-bind-nodes",
-    "--otlp-traces-endpoint",
     "--override-generation-config",
     "--pooler-config",
     "--profiler-config",
@@ -1019,6 +1090,15 @@ pub enum ProfileArgError {
          name an LMCache connector (`lmcache`); pass a JSON object"
     )]
     LmcacheUnreadable(String),
+    /// ADR 0036 §2: llama.cpp's embeddings route refuses pooling `none`.
+    #[error(
+        "option `{0}` is `none`, and llama.cpp serves no embeddings without pooling; pick \
+         another pooling or leave it out (the model's own is used)"
+    )]
+    PoolingNone(String),
+    /// ADR 0039 §6: CapyCTL renders no drafter on TensorFold's native line.
+    #[error("{refusal} (option `{0}`)", refusal = crate::tensorfold_native::DRAFTER_REFUSAL)]
+    NativeDrafter(String),
 }
 
 /// Lowercase long-option name with `_` spelled `-`, without any `=value`.
@@ -1040,12 +1120,14 @@ pub fn reserved_options(engine: Engine, sleep_mode: bool) -> Vec<String> {
     match engine {
         Engine::Vllm => VLLM_RESERVED_FLAGS
             .iter()
+            .chain(VLLM_TRACING_OPTIONS)
             .chain(if sleep_mode { VLLM_SLEEP_RESERVED } else { &[] })
             .map(|name| (*name).to_owned())
             .collect(),
         Engine::Sglang => SGLANG_RESERVED_FIELDS
             .iter()
             .chain(SGLANG_DUMP_RESERVED.iter().map(|(field, _)| field))
+            .chain(SGLANG_TRACING_FIELDS)
             .map(|field| sglang_field_option(field))
             .chain(
                 SGLANG_RESERVED_ALIASES
@@ -1064,6 +1146,13 @@ pub fn reserved_options(engine: Engine, sleep_mode: bool) -> Vec<String> {
             .chain(crate::llamacpp::RESERVED_NEVER_RENDERED)
             .flat_map(|row| row.iter().map(|name| (*name).to_owned()))
             .collect(),
+        // ADR 0038 §3: every spelling of every reserved option, matched
+        // exactly ([`validate_tensorrt_llm_args`]).
+        Engine::TensorrtLlm => crate::tensorrt_llm::RESERVED_RENDERED
+            .iter()
+            .chain(crate::tensorrt_llm::RESERVED_NEVER_RENDERED)
+            .flat_map(|row| row.iter().map(|name| (*name).to_owned()))
+            .collect(),
         // ADR 0031 §4: CapyCTL renders none of a custom engine's options.
         Engine::Custom => Vec::new(),
     }
@@ -1075,7 +1164,7 @@ pub fn reserved_families(engine: Engine) -> &'static [&'static str] {
         Engine::Vllm => VLLM_RESERVED_FAMILIES,
         Engine::Sglang => SGLANG_RESERVED_FAMILIES,
         Engine::Tensorfold => TENSORFOLD_RESERVED_FAMILIES,
-        Engine::Llamacpp | Engine::Custom => &[],
+        Engine::Llamacpp | Engine::TensorrtLlm | Engine::Custom => &[],
     }
 }
 
@@ -1087,6 +1176,7 @@ pub fn typed_options(engine: Engine) -> &'static [(&'static str, &'static str)] 
         Engine::Sglang => SGLANG_TYPED_OPTIONS,
         Engine::Tensorfold => TENSORFOLD_TYPED_OPTIONS,
         Engine::Llamacpp => crate::llamacpp::TYPED_OPTIONS,
+        Engine::TensorrtLlm => crate::tensorrt_llm::TYPED_OPTIONS,
         Engine::Custom => &[],
     }
 }
@@ -1125,12 +1215,25 @@ fn candidate_names(name: &str) -> Vec<String> {
 fn reserved_option(engine: Engine, name: &str, sleep_mode: bool) -> bool {
     let reserved = reserved_options(engine, sleep_mode);
     candidate_names(name).iter().any(|candidate| {
-        reserved
+        reserved.iter().any(|protected| {
+            matches_name(candidate, protected)
+                    // ADR 0017 §2 / T21: vLLM 0.33.0's EnableDisableAction
+                    // pairs --enable-x with --disable-x. Destinations stay
+                    // unchanged, so both spellings own the same reservation.
+                    || (engine == Engine::Vllm
+                        && [("--enable-", "--disable-"), ("--disable-", "--enable-")]
+                            .iter()
+                            .any(|(prefix, inverse)| {
+                                protected
+                                    .strip_prefix(*prefix)
+                                    .zip(candidate.strip_prefix(*inverse))
+                                    .is_some_and(|(tail, given)| {
+                                        !given.is_empty() && tail.starts_with(given)
+                                    })
+                            }))
+        }) || reserved_families(engine)
             .iter()
-            .any(|protected| matches_name(candidate, protected))
-            || reserved_families(engine)
-                .iter()
-                .any(|family| candidate.starts_with(family))
+            .any(|family| candidate.starts_with(family))
     })
 }
 
@@ -1204,6 +1307,18 @@ pub fn sensitivity(engine: Engine, name: &str) -> Option<Sensitivity> {
                 .map(|(_, kind)| kind)
                 .or_else(|| {
                     if crate::llamacpp::ORDINARY_SHAPED.contains(&name) {
+                        None
+                    } else {
+                        shape(name)
+                    }
+                });
+        }
+        // ADR 0038 §3: Click takes exact names only, as llama-server does.
+        Engine::TensorrtLlm => {
+            return crate::tensorrt_llm::sensitive(name)
+                .map(|(_, kind)| kind)
+                .or_else(|| {
+                    if crate::tensorrt_llm::ORDINARY_SHAPED.contains(&name) {
                         None
                     } else {
                         shape(name)
@@ -1295,6 +1410,12 @@ pub(crate) fn path_within(value: &str, root: &Path) -> bool {
 #[derive(Debug, Clone)]
 pub struct ExtraArgsContext<'a> {
     pub engine: Engine,
+    /// ADR 0036 §2: the deployment's API; llama.cpp's `--pooling` is
+    /// ordinary on an embeddings deployment only.
+    pub api: crate::effective::DeploymentApi,
+    /// ADR 0039 §4: the TensorFold line, whose native parser matches names
+    /// exactly (always `Python` for the other engines).
+    pub line: crate::tensorfold_native::TensorfoldLine,
     /// Whether capyctl renders sleep mode for this launch (ADR 0014 §4).
     pub sleep_mode: bool,
     /// The installation's `security.approved_options`, normalized.
@@ -1317,6 +1438,13 @@ pub fn validate_extra_args(
 ) -> Result<(), ProfileArgError> {
     if context.engine == Engine::Llamacpp {
         return validate_llamacpp_args(args, Some(context));
+    }
+    // ADR 0039 §4: exact names, the native tables, no prefix rule.
+    if context.engine == Engine::Tensorfold && context.line.is_native() {
+        return crate::tensorfold_native::validate_args(args, Some(context));
+    }
+    if context.engine == Engine::TensorrtLlm {
+        return validate_tensorrt_llm_args(args, Some(context));
     }
     let mut seen = BTreeSet::new();
     for option in parse_options(args)? {
@@ -1436,7 +1564,15 @@ fn validate_llamacpp_args(
                 field: field.to_owned(),
             });
         }
-        if llamacpp::is_reserved(&name) {
+        // ADR 0036 §2: `--pooling` is the deployment's on an embeddings
+        // deployment, except `none`, which the OpenAI route refuses; it stays
+        // reserved on chat and decisions deployments and in host-fixed args.
+        let pooling = llamacpp::is_pooling(&name)
+            && context.is_some_and(|c| c.api == crate::effective::DeploymentApi::Embeddings);
+        if pooling && option.value.as_deref() == Some("none") {
+            return Err(ProfileArgError::PoolingNone(name));
+        }
+        if llamacpp::is_reserved(&name) && !pooling {
             return Err(ProfileArgError::Reserved(name));
         }
         let key = llamacpp::option_key(&name);
@@ -1487,12 +1623,79 @@ fn validate_llamacpp_args(
     Ok(())
 }
 
+/// ADR 0038 §3: `trtllm-serve` (Click) takes exact names only and accepts
+/// `--name=value`, so extra and host-fixed arguments are compared by exact
+/// name, after the `=value` is split off and `_` folded onto `-`, against
+/// every spelling in `tensorrt_llm.rs`'s tables. A positional token (the
+/// model, or a subcommand other than `serve`) is refused by
+/// [`parse_options`]. With `context`, the deploy-time checks of a
+/// deployment's extra arguments apply too (duplicates of host-fixed options,
+/// host approval of `--chat_template` and its path); without it, this is the
+/// check of host-fixed and rendered pass-through arguments.
+fn validate_tensorrt_llm_args(
+    args: &[String],
+    context: Option<&ExtraArgsContext<'_>>,
+) -> Result<(), ProfileArgError> {
+    use crate::tensorrt_llm;
+    let mut seen = BTreeSet::new();
+    for option in parse_options(args)? {
+        let name = option.name;
+        if let Some(field) = tensorrt_llm::typed_field(&name) {
+            return Err(ProfileArgError::ReservedField {
+                option: name,
+                field: field.to_owned(),
+            });
+        }
+        if tensorrt_llm::is_reserved(&name) {
+            return Err(ProfileArgError::Reserved(name));
+        }
+        let key = tensorrt_llm::option_key(&name);
+        let Some(context) = context else {
+            if !seen.insert(key) {
+                return Err(ProfileArgError::Duplicate(name));
+            }
+            continue;
+        };
+        if !seen.insert(key.clone()) || context.host_fixed.contains(&key) {
+            return Err(ProfileArgError::Duplicate(name));
+        }
+        let Some(kind) = sensitivity(Engine::TensorrtLlm, &name) else {
+            continue;
+        };
+        // ADR 0014 §8: an approval of any spelling approves the option.
+        let spellings = tensorrt_llm::sensitive(&name).map_or(&[][..], |(row, _)| row);
+        let approved = context.approved_options.contains(&name)
+            || spellings.iter().any(|spelling| {
+                context
+                    .approved_options
+                    .contains(&normalize_option_name(spelling))
+            });
+        if !approved {
+            return Err(ProfileArgError::Sensitive(name));
+        }
+        if let Sensitivity::Path { .. } = kind {
+            let value = option.value.as_deref().unwrap_or_default();
+            if !context
+                .approved_paths
+                .iter()
+                .any(|root| path_within(value, root))
+            {
+                return Err(ProfileArgError::PathNotApproved(name));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Host-fixed profile arguments (ADR 0014 §1). The host operator writes these,
 /// so sensitive options are theirs to pass; reserved names, configuration files
 /// and malformed lists are still refused. SGLang's protected entry takes no
-/// argument vector, so an SGLang profile carries none.
+/// argument vector, so an SGLang profile carries none. ADR 0039 §4: a
+/// TensorFold profile of the native line is checked by exact name against the
+/// native tables.
 pub fn validate_profile_args(
     engine: Engine,
+    line: crate::tensorfold_native::TensorfoldLine,
     args: &[String],
     sleep_mode: bool,
 ) -> Result<(), ProfileArgError> {
@@ -1500,6 +1703,9 @@ pub fn validate_profile_args(
         return args.first().map_or(Ok(()), |arg| {
             Err(ProfileArgError::Unsupported(normalize_option_name(arg)))
         });
+    }
+    if engine == Engine::Tensorfold && line.is_native() {
+        return crate::tensorfold_native::validate_args(args, None);
     }
     validate_rendered_args(engine, args, sleep_mode)
 }
@@ -1514,6 +1720,9 @@ pub fn validate_rendered_args(
 ) -> Result<(), ProfileArgError> {
     if engine == Engine::Llamacpp {
         return validate_llamacpp_args(args, None);
+    }
+    if engine == Engine::TensorrtLlm {
+        return validate_tensorrt_llm_args(args, None);
     }
     let mut seen = BTreeSet::new();
     for option in parse_options(args)? {
@@ -1795,7 +2004,9 @@ fn lmcache_option(name: &str) -> bool {
 /// option not listed is classed by its name's shape, and otherwise ordinary.
 pub fn flag_table(engine: Engine) -> Vec<FlagRow> {
     let mut rows = Vec::new();
-    if engine != Engine::Llamacpp {
+    // ADR 0029 §6, ADR 0038 §3: their configuration file options are rows of
+    // their own tables.
+    if !matches!(engine, Engine::Llamacpp | Engine::TensorrtLlm) {
         for name in CONFIG_FILE_OPTIONS {
             add_row(
                 &mut rows,
@@ -1847,11 +2058,15 @@ pub fn flag_table(engine: Engine) -> Vec<FlagRow> {
         );
     }
     for name in reserved_options(engine, false) {
-        let reason = match (engine, crate::llamacpp::typed_field(&name)) {
-            (Engine::Llamacpp, Some(field)) => {
-                format!("CapyCTL renders it from the typed field `{field}`")
-            }
+        let typed = match engine {
+            Engine::Llamacpp => crate::llamacpp::typed_field(&name),
+            Engine::TensorrtLlm => crate::tensorrt_llm::typed_field(&name),
+            _ => None,
+        };
+        let reason = match typed {
+            Some(field) => format!("CapyCTL renders it from the typed field `{field}`"),
             _ if lmcache_option(&name) => LMCACHE_OWNED.to_owned(),
+            _ if tracing_option(engine, &name) => TRACING_OWNED.to_owned(),
             _ => "CapyCTL renders or closes it".to_owned(),
         };
         add_row(
@@ -1898,6 +2113,10 @@ pub fn flag_table(engine: Engine) -> Vec<FlagRow> {
             .iter()
             .flat_map(|(names, _)| names.iter().copied())
             .collect(),
+        Engine::TensorrtLlm => crate::tensorrt_llm::SENSITIVE
+            .iter()
+            .flat_map(|(names, _)| names.iter().copied())
+            .collect(),
         // ADR 0031 §4: CapyCTL knows none of a custom engine's options.
         Engine::Custom => Vec::new(),
     };
@@ -1905,7 +2124,7 @@ pub fn flag_table(engine: Engine) -> Vec<FlagRow> {
         Engine::Vllm => VLLM_SHAPED,
         Engine::Sglang => SGLANG_SHAPED,
         Engine::Tensorfold => TENSORFOLD_SHAPED,
-        Engine::Llamacpp => &[],
+        Engine::Llamacpp | Engine::TensorrtLlm => &[],
         Engine::Custom => &[],
     };
     for name in explicit.into_iter().chain(shaped.iter().copied()) {
@@ -1926,23 +2145,124 @@ pub fn flag_table(engine: Engine) -> Vec<FlagRow> {
     }
     let ordinary: &[&str] = match engine {
         Engine::Llamacpp => crate::llamacpp::ORDINARY_SHAPED,
+        Engine::TensorrtLlm => crate::tensorrt_llm::ORDINARY_SHAPED,
         _ => ORDINARY_EXACT,
     };
     for name in ordinary {
         if *name == "--vision" && engine != Engine::Tensorfold {
             continue;
         }
+        let reason = match engine {
+            Engine::TensorrtLlm => {
+                "its name has a sensitive shape, but its value names no path, code or listener"
+            }
+            _ => "its exact name is ordinary although a longer option it prefixes is sensitive",
+        };
         add_row(
             &mut rows,
             row(
                 name,
                 NameMatch::Name,
                 FlagClass::Ordinary,
-                "its exact name is ordinary although a longer option it prefixes \
-                 is sensitive"
-                    .to_owned(),
+                reason.to_owned(),
             ),
         );
     }
     rows
+}
+
+#[cfg(test)]
+mod tracing_tests {
+    use super::*;
+
+    fn extras(engine: Engine, args: &[&str], approved: &[&str]) -> Result<(), ProfileArgError> {
+        let approved_options: BTreeSet<String> =
+            approved.iter().map(|name| (*name).to_owned()).collect();
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        validate_extra_args(
+            &args,
+            &ExtraArgsContext {
+                engine,
+                api: crate::effective::DeploymentApi::Chat,
+                line: crate::tensorfold_native::TensorfoldLine::Python,
+                sleep_mode: false,
+                approved_options: &approved_options,
+                approved_paths: &[],
+                checkpoint_root: None,
+                host_fixed: &BTreeSet::new(),
+            },
+        )
+    }
+
+    // T48 T03 T21 (ADR 0037 §7, owner decision 2026-10-27 q7): the engines'
+    // tracing options are owned in every spelling, whatever the host
+    // approves; an earlier approval of `--otlp-traces-endpoint` no longer
+    // admits it. The refusal names the option, never the value.
+    #[test]
+    fn tracing_options_are_owned_in_every_spelling_even_when_approved() {
+        let endpoint = "http://collector.example:4317";
+        let vllm: &[&[&str]] = &[
+            &["--otlp-traces-endpoint", endpoint],
+            &["--otlp_traces_endpoint", endpoint],
+            &["--otlp-traces-endpoint=http://collector.example:4317"],
+            &["--OTLP-Traces-Endpoint", endpoint],
+            &["--otlp-traces", endpoint],
+            &["--collect-detailed-traces", "all"],
+            &["--collect_detailed_traces=all"],
+        ];
+        let sglang: &[&[&str]] = &[
+            &["--enable-trace"],
+            &["--enable_trace"],
+            &["--otlp-traces-endpoint", endpoint],
+            &["--otlp_traces_endpoint=http://collector.example:4317"],
+            &["--otlp-service-name", "mine"],
+            &["--otlp_service_name=mine"],
+            &["--trace-modules", "request"],
+            &["--trace_modules=all"],
+        ];
+        let approvals = [
+            "--otlp-traces-endpoint",
+            "--collect-detailed-traces",
+            "--enable-trace",
+            "--otlp-service-name",
+            "--trace-modules",
+        ];
+        for (engine, cases) in [(Engine::Vllm, vllm), (Engine::Sglang, sglang)] {
+            for args in cases {
+                for approved in [&[][..], &approvals[..]] {
+                    let error = extras(engine, args, approved).unwrap_err();
+                    assert!(
+                        matches!(error, ProfileArgError::Reserved(_)),
+                        "{engine:?} {args:?}: {error}"
+                    );
+                    assert!(!error.to_string().contains("collector"), "{error}");
+                }
+            }
+        }
+        // Host-fixed vLLM arguments cannot state them either.
+        let fixed = vec!["--otlp-traces-endpoint".to_owned(), endpoint.to_owned()];
+        assert!(matches!(
+            validate_profile_args(
+                Engine::Vllm,
+                crate::tensorfold_native::TensorfoldLine::Python,
+                &fixed,
+                false
+            ),
+            Err(ProfileArgError::Reserved(_))
+        ));
+        // Neither is a sensitive (approvable) option any more.
+        for (engine, option) in [
+            (Engine::Vllm, "--otlp-traces-endpoint"),
+            (Engine::Sglang, "--otlp-traces-endpoint"),
+        ] {
+            let table = flag_table(engine);
+            let rows: Vec<_> = table.iter().filter(|row| row.name == option).collect();
+            assert_eq!(rows.len(), 1, "{engine:?} {option}");
+            assert_eq!(rows[0].class, FlagClass::Owned, "{engine:?} {option}");
+            assert_eq!(rows[0].reason, TRACING_OWNED);
+        }
+        // Unrelated options beside them stay as they were.
+        extras(Engine::Sglang, &["--enable-torch-compile"], &[]).unwrap();
+        extras(Engine::Vllm, &["--seed", "1"], &[]).unwrap();
+    }
 }

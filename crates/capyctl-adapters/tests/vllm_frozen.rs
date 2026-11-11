@@ -337,6 +337,44 @@ fn a_restart_only_deployment_has_no_park_policy() {
     assert_eq!(park_policy(&effective), ParkPolicy::Disabled);
 }
 
+/// ADR 0036 §2, §7.2: an embeddings deployment renders `--runner pooling` in
+/// the reserved block, before the marker, and parks deep with the sleep
+/// mode a deep chat deployment renders; a chat deployment renders no runner.
+// T47 T14 T21
+#[test]
+fn an_embeddings_deployment_renders_the_pooling_runner_and_sleep_mode() {
+    let (mut deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["security"]["deep_park"] = json!("enabled");
+    deployment["api"] = json!("embeddings");
+    deployment.as_object_mut().unwrap().remove("residency");
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    assert_eq!(park_policy(&effective), ParkPolicy::Enabled);
+    let plan = plan_from_effective(&effective, 8123, "l".into(), "/r".into()).unwrap();
+    assert_eq!(
+        plan.api,
+        capyctl_config::effective::DeploymentApi::Embeddings
+    );
+    let argv = render_command(&plan).unwrap().argv;
+    let marker = argv
+        .iter()
+        .position(|a| a == capyctl_adapters::vllm::USER_ARGS_MARKER)
+        .unwrap();
+    let runner = argv
+        .windows(2)
+        .position(|w| w == ["--runner", "pooling"])
+        .unwrap();
+    assert!(runner < marker, "{argv:?}");
+    assert!(!argv.iter().any(|a| a == "--convert"));
+    assert!(argv[..marker].iter().any(|a| a == "--enable-sleep-mode"));
+
+    deployment.as_object_mut().unwrap().remove("api");
+    let chat = resolve_effective(&deployment, &host).unwrap();
+    let argv = render_command(&plan_from_effective(&chat, 8123, "l".into(), "/r".into()).unwrap())
+        .unwrap()
+        .argv;
+    assert!(!argv.iter().any(|a| a == "--runner"));
+}
+
 /// Spec §3: a plan is refused rather than invented when the frozen profile
 /// carries another family's settings or the deployment serves no route.
 // T14
@@ -604,28 +642,22 @@ fn utilization(effective: &EffectiveDeployment) -> String {
     argv[at + 1].clone()
 }
 
-/// #225 (ADR 0019 §3, §4 as amended): on the issue's 96 GB card a vLLM
-/// deployment that states only its 12 GiB KV cache keeps the derived floor:
-/// a request of 0.75 of the card (71.69 GiB, Ready 72.94 GiB with the CUDA
-/// context) and `--gpu-memory-utilization 0.75`, the guard vLLM 0.29 needed
-/// on a 16 GB card. The same deployment declaring a request from its
-/// measured peak (44.15 GiB on the card: 43 GiB plus the CUDA context) is
-/// charged that and told its share, 0.45, so a 22.6 GiB model fits beside
-/// it within the card's managed limit; before, vLLM was told 0.75 and its
-/// start check asked for 71.69 GiB free. The KV bytes are 12 GiB either way.
+/// #225, ADR 0019 §§3–4 (owner decision 2026-11-09): derived and declared
+/// requests both render their own card share, without the historical 75% floor.
+/// Explicit KV bytes and CUDA-context accounting are unchanged.
 // T26 T14
 #[test]
-fn a_declared_request_takes_the_floor_off_the_cards_utilization() {
+fn derived_and_declared_requests_render_their_own_card_share() {
     const GIB: i64 = 1 << 30;
     let overhead = capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
     let derived = pro_6000(json!({"kv_cache": "12GiB"}));
-    let floor = (97887_i64 << 20) / 100 * 75;
-    assert_eq!(derived.engine_config.memory().request_bytes, floor);
+    let request = (21 * GIB / 100) * 110 + 12 * GIB;
+    assert_eq!(derived.engine_config.memory().request_bytes, request);
     assert_eq!(
         derived.ready_device_allocation(),
-        Some((Some(0), floor + overhead))
+        Some((Some(0), request + overhead))
     );
-    assert_eq!(utilization(&derived), "0.7500000000");
+    assert_eq!(utilization(&derived), "0.3671825677");
 
     let declared = pro_6000(json!({"request": "43GiB", "kv_cache": "12GiB"}));
     assert_eq!(declared.engine_config.memory().request_bytes, 43 * GIB);

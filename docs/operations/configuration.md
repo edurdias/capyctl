@@ -168,7 +168,7 @@ model:
 
 These describe the role's own engine installation. One executable is published
 as the runtime profile `local`; several as `local-vllm`, `local-sglang`,
-`local-tensorfold` and `local-llamacpp`. On a
+`local-tensorfold`, `local-llamacpp` and `local-tensorrt-llm`. On a
 host the profile is added to the document the host publishes, beside the
 profiles in `runtime_profiles` and the ones registered with `capyctl engine add`;
 a name stated twice is refused. The switches below apply to the `local`
@@ -179,8 +179,9 @@ block.
 |---|---|---|---|---|---|
 | vLLM executable | `local_engine.vllm` | `--vllm-bin <path>` | `CAPYCTL_VLLM_BIN` | none | host, standalone |
 | SGLang interpreter | `local_engine.sglang` | `--sglang-bin <path>` | `CAPYCTL_SGLANG_BIN` | none | host, standalone |
-| TensorFold executable | `local_engine.tensorfold` | `--tensorfold-bin <path>` | `CAPYCTL_TENSORFOLD_BIN` | none | host, standalone |
+| TensorFold executable (a 0.6 venv's `bin/tensorfold`, or a native release's `bin/tensorfold-native`) | `local_engine.tensorfold` | `--tensorfold-bin <path>` | `CAPYCTL_TENSORFOLD_BIN` | none | host, standalone |
 | llama.cpp `llama-server` binary | `local_engine.llamacpp` | `--llamacpp-bin <path>` | `CAPYCTL_LLAMACPP_BIN` | none | host, standalone |
+| TensorRT-LLM `trtllm-serve` | `local_engine.tensorrt-llm` | `--tensorrt-llm-bin <path>` | `CAPYCTL_TENSORRT_LLM_BIN` | none | host, standalone |
 | Build fingerprint | `local_engine.build_fingerprint` | `--engine-fingerprint <text>` | `CAPYCTL_ENGINE_FINGERPRINT` | what `<engine> --version` prints | host, standalone |
 | Host-fixed vLLM arguments | `local_engine.args` (a list) | `--engine-args "<args>"` | `CAPYCTL_ENGINE_ARGS` (space-separated) | none | host, standalone |
 | KV cache of generated deployments | `local_engine.kv_cache` | `--kv-cache <size>` | `CAPYCTL_KV_CACHE_BYTES` | `16GiB` (unified), sized from the GPU (discrete) | standalone |
@@ -197,6 +198,17 @@ deployment states `engine_config.memory.kv_cache`. SGLang takes no host-fixed
 arguments, so `args` applies to the vLLM and TensorFold profiles only. Name `runtime_dir` only
 to run from a directory you maintain yourself; CapyCTL never writes to it.
 
+A TensorFold profile has a `line`: `python` (TensorFold 0.6, a venv; the
+default, so a profile without `line` is a 0.6 profile) or `native` (TensorFold
+1.x, a release directory holding `bin/tensorfold-native`). `capyctl engine
+add` writes it from the installation's form, with the native release's
+recorded `native` block (the model families its capabilities document lists,
+and whether its `SHA256SUMS` was checked); for the role's own engine the line
+follows the file name `--tensorfold-bin` names. The line is part of the
+installation's fingerprint: a profile that changes line is drift. The native
+line needs no CUDA toolkit, so `cuda_home` does not apply to it
+([TensorFold](../guide/engines.md#tensorfold)).
+
 Engine tuning such as vLLM's loader under deep parking
 (`engine_config.vllm.safetensors_load_strategy`: `eager` or `lazy`) is a deployment
 setting, written in the deployment file like every other `engine_config` field.
@@ -207,6 +219,34 @@ wake took over two minutes to reload the weights and did not complete. A
 deployment that does not park gets no loader choice from
 CapyCTL either way. See
 [Add an engine](../guide/engines.md#vllm-weight-loading-while-parking).
+
+`engine_config.max_concurrent_requests` also sets the router's total
+in-flight request bound **per deployment**, shared by all its instances, for
+chat, decisions and embeddings. When unset, that router bound is 32, even
+when the engine's default parallelism is smaller. The declared count applies
+both below and above 32, to standalone and remote deployments. Host-fixed
+engine arguments and reported engine load do not change this admission bound;
+the engine can queue requests within it. Additional requests wait under the
+host's `resource_policy.queue` limits, or receive `429 queue_full` when no
+waiting is allowed. The management load read shows this as
+`router.in_flight_limit`. A remote host's existing ingress safeguard still
+allows at most 64 concurrent forwards in total across deployments.
+The server owns the deployment bound, so this setting needs no new host
+capability: a 0.2 server can use it with a supported 0.1 host under the
+[version-skew policy](../design/adr/0017-version-skew-and-capability-gating.md).
+
+`engine_config.cuda_graphs` keeps its boolean behavior: `false` disables
+graphs (both prefill and decode for SGLang); `true` or omission leaves the
+engine's native graph policy in place. SGLang also accepts
+`cuda_graphs: {prefill: false, decode: true}`. Both keys are required booleans:
+`false` disables only that phase with `--disable-prefill-cuda-graph` or
+`--disable-decode-cuda-graph` (and its `disabled` backend); `true` leaves that
+phase's native policy unchanged. All four combinations are accepted.
+Other engines refuse the object form. The phase switches and backends remain
+owned by this typed field and cannot be passed through `extra_args`.
+An enrolled host must advertise `cuda_graph_phases` for the object form;
+older hosts are refused before the command is sent. Scalar booleans need
+no new host capability.
 
 On a discrete GPU, a deployment's `engine_config.memory.request` is the card
 memory the engine may use (the weights, the KV cache and a margin of the
@@ -239,22 +279,43 @@ directory); see [llama.cpp](../guide/engines.md#llamacpp). The role's own
 llama.cpp never parks, as a registered one does not, and is refused while
 `/etc/llama.cpp/config.ini` exists.
 
+A TensorRT-LLM deployment takes `engine_config.context_length`,
+`engine_config.max_concurrent_requests` (32 when not set), `dtype`,
+`kv_cache_dtype` (`auto` or `fp8`), `cuda_graphs`, `trust_remote_code` and the
+block `engine_config.tensorrt-llm`: `reasoning_parser`, `tool_call_parser`
+and `llm_api_options`, a mapping of LLM API arguments (at most 64 KiB as JSON,
+lower-case keys) that CapyCTL merges into the configuration file it writes.
+A key CapyCTL renders or keeps off is refused at deploy time and again at
+launch; see [Engine options](../guide/engine-flags.md#the-configuration-file).
+The role's own TensorRT-LLM never parks and runs on one GPU, as a registered
+one does.
+
+A TensorRT-LLM profile, from `engine add` or written in `runtime_profiles`,
+may carry `companions`: a mapping from the distributions `torch`, `tensorrt`,
+`flashinfer-python`, `transformers` and `mpi4py` to the versions the version
+check read (1–128 printable characters each). Any other name, or the field on
+a profile of another engine, is refused. A TensorRT-LLM version is verified
+only beside the `torch` build its entry names, read from `companions`.
+
 A vLLM deployment on a discrete GPU gets `--gpu-memory-utilization` from its
-memory request: the request's share of the card, rounded up to a whole
-percent. When CapyCTL sizes the request (the deployment states only
-`engine_config.memory.kv_cache`, or no memory), the request is at least 75 % of
-the card and so is the share, a guard kept because vLLM 0.29 with CUDA graphs
-did not start a 4B model on a 16 GB card below 0.75; the KV cache is passed in
-bytes either way. A deployment that states `engine_config.memory.request`
-gets exactly that request's share, with no floor, so vLLM's start check asks
-only for that much of the card to be free and another model can run beside
-it. State it from the startup peak measured on the card
-(`startup.measured`, less 1.25 GiB for the CUDA context). A request smaller
-than the weights plus the KV cache is refused; leave room for the engine's
-own memory beside them, the weights × 1.10 plus the KV cache as CapyCTL sizes
-it. Unified-memory machines are
-unchanged: vLLM gets a low fixed `--gpu-memory-utilization` there and the KV
-cache in bytes.
+memory request: the request's share of the card, rounded up to ten-billionths
+between 0.01 and 0.99. When CapyCTL sizes the request (the deployment states
+only `engine_config.memory.kv_cache`, or no memory), it uses the weights × 1.10
+plus the KV cache, without the historical 75% card floor. A declared
+`engine_config.memory.request` renders its own share in the same way.
+The KV cache is passed in bytes either way. A request smaller than the weights
+plus the KV cache is refused; leave room for the engine's own memory beside
+them. State a declared request from the startup peak measured on the card
+(`startup.measured`, less 1.25 GiB for the CUDA context). Existing frozen
+revisions keep their accepted request; deploy a new revision to derive the
+smaller request. **Pending live confirmation on vLLM 0.32.0 and 0.33.0:**
+the historical vLLM 0.29 start failure below 0.75 on a 16 GB card remains
+unexplained. Unified-memory machines are unchanged: vLLM gets a low fixed
+`--gpu-memory-utilization` there and the KV cache in bytes.
+A newly derived no-floor request needs an enrolled host advertising
+`vllm_device_request_no_floor`; an older host is refused before launch.
+An absent launch-plan marker keeps the old derivation on an upgraded host,
+so a server-first or host-first upgrade cannot silently change the grant.
 
 A running host or standalone takes its engine and model settings at start. A
 live `capyctl engine add` or `remove` changes runtime profiles only; any other
@@ -337,6 +398,15 @@ whatever an approval says (`engine_env_reserved:<name>`):
   `VLLM_ALLOW_INSECURE_SERIALIZATION`, and the usage-reporting opt-outs
   `DO_NOT_TRACK`, `VLLM_DO_NOT_TRACK` and `VLLM_NO_USAGE_STATS`, which only
   the host's [`engine_telemetry`](#engine-usage-reporting) decides.
+- the engines' tracing families `OTEL_*`, `SGLANG_TRACE_*` and `SGLANG_OTLP_*`,
+  and `TRACEPARENT` and `TRACESTATE` (in any case), which only the host's
+  [`observability.tracing.engines`](#tracing) decides.
+
+On a TensorFold native profile CapyCTL also owns `TENSORFOLD_MEMORY_RESERVE_GIB`,
+and never passes `TENSORFOLD_API_KEY`, `TENSORFOLD_REQUEST_LOG`,
+`TENSORFOLD_CUDA_KERNELS`, `TF_CUDA_DEVICE`, `TF_CUDA_SEGMENTS` or
+`BRAVE_SEARCH_API_KEY`: a profile or deployment naming one is refused
+(`engine_env_reserved:<name>`), with the reason in the message.
 
 CapyCTL starts every SGLang process with `SGLANG_PLUGINS=capyctl-loads-no-plugins`,
 a plugin selection that names no plugin, so SGLang loads none. SGLang 0.5.22
@@ -430,7 +500,7 @@ The manifest's fields:
 |---|---|---|
 | `kind` | `custom_engine` | required |
 | `schema_version` | `1` | required |
-| `api` | `chat` or `decisions`: what every deployment on the engine serves; a deployment's `api` must be the same | required |
+| `api` | `chat`, `decisions` or `embeddings`: what every deployment on the engine serves; a deployment's `api` must be the same ([Embedding models](../guide/deploy.md#embedding-models)) | required |
 | `args` | the argument list after the executable, run without a shell; must hold `{host}`, `{port}` and `{model_dir}`, and may hold `{served_name}`, `{context_length}` and `{api_key}` (`{{` and `}}` are literal braces) | required |
 | `version` | a version string, shown as the engine's version | `unversioned` |
 | `environment` | an absolute directory fingerprinted in place of the default (the executable's virtual environment, else the executable alone) | the default |
@@ -495,6 +565,7 @@ a run with `--set` or `CAPYCTL_SET__…` (next section), and restart the role.
 | LMCache: `auto` (default), or `off`, which keeps LMCache off for every deployment on the machine ([below](#lmcache-and-zero-retention)) | host: `lmcache` (standalone: `host.lmcache`) |
 | Retention: `standard` (default), or `zero`: engine logs in memory, no core dumps, no LMCache ([below](#lmcache-and-zero-retention)) | host: `retention` (standalone: `host.retention`) |
 | Engines' own usage reporting: `off` (default), or `allow`, which leaves each engine's own default ([below](#engine-usage-reporting)) | host: `engine_telemetry` (standalone: `host.engine_telemetry`) |
+| Tracing: off (default) until an OTLP endpoint is named; sampling, the caller's trace context, engine spans ([below](#tracing)) | server and host: `observability.tracing` (standalone: `server.observability.tracing`, and `host.observability.tracing.engines`) |
 
 `lifecycle.activation` follows the server's lifecycle settings: the document,
 `--set lifecycle.activation=explicit` on `capyctl start host` (or
@@ -572,7 +643,8 @@ Apart from these settings, decision deployments (`api: decisions`) on SGLang,
 and SGLang deployments that state `--disable-radix-cache`, run without
 LMCache (`engine_unsupported`;
 [sgl-project/sglang#45929](https://github.com/sgl-project/sglang/issues/45929)),
-and `lmcache: required` is refused for them
+and embedding deployments (`api: embeddings`) run without it on every engine
+(`embeddings_unsupported`). `lmcache: required` is refused for all of them
 ([LMCache](../guide/engines.md#lmcache)).
 
 ### Engine usage reporting
@@ -603,6 +675,114 @@ refuses the start. It applies to launches from the next start; an engine
 already running keeps the environment it started with. See
 [data retention](data-retention.md#nothing-reported-off-the-host).
 
+### Tracing
+
+CapyCTL can take part in a distributed trace: it reads a caller's W3C
+`traceparent` and `tracestate`, records its own spans for each request (wait,
+wake, dispatch, the forward to the engine) and exports them over OTLP/HTTP
+with protobuf encoding to a collector you name. It is off until a role's
+document names an endpoint. Off, CapyCTL reads no trace header, builds no
+exporter, opens no connection and sends no trace header to a host or an
+engine. What a caller sends and gets: [Trace context](../guide/requests.md#trace-context).
+What the spans hold: [Traces](data-retention.md#traces).
+
+A server document (standalone: under `server:`, covering the whole process,
+router and embedded host):
+
+```yaml
+observability:
+  tracing:
+    endpoint: https://collector.example.internal:4318/v1/traces
+    headers_file: /etc/capyctl/otlp-headers   # optional
+    sample_ratio: 1.0                         # 0.0 to 1.0
+    caller_context: parent                    # parent | link | ignore
+```
+
+A host document:
+
+```yaml
+observability:
+  tracing:
+    endpoint: http://127.0.0.1:4318/v1/traces
+    headers_file: /etc/capyctl/otlp-headers   # optional
+    engines: off                              # off | on
+```
+
+| Field | Roles | Default | Meaning |
+|---|---|---|---|
+| `endpoint` | server, host | none: tracing off | The collector's OTLP/HTTP traces URL, used exactly as written (include the path, usually `/v1/traces`). An `http://` or `https://` URL naming a host, with no user or password in it. On a host, without it the host records no spans and passes the router's trace context on unchanged. |
+| `headers_file` | server, host | none | Headers the collector needs, such as an API key. An absolute path; refused without `endpoint`. |
+| `sample_ratio` | server | `1.0` | The share of new traces recorded, from `0.0` to `1.0`. A request that arrives with a caller's context follows the caller's sampled flag instead. An unsampled request records nothing, but still passes its context on with the sampled flag clear. Activation traces (a cold start, a wake, a switch) are recorded at every ratio. |
+| `caller_context` | server | `parent` | What the router does with a caller's valid `traceparent`: `parent` puts CapyCTL's request span in the caller's trace; `link` starts a new trace whose request span links to the caller's; `ignore` reads neither header. |
+| `engines` | host (standalone: `host.observability.tracing.engines`) | `off` | `on` lets vLLM 0.31.0 or newer and SGLang 0.5.22 or newer export their own spans to the host's endpoint ([Engine tracing](../guide/engines.md#engine-tracing)). |
+
+**Standalone.** `server.observability.tracing` takes `endpoint`,
+`headers_file`, `sample_ratio` and `caller_context` and covers the router and
+the embedded host. `host.observability.tracing` takes only `engines`; any
+other field there refuses the start. The engines export to the server block's
+endpoint, so `engines: on` needs that endpoint on loopback.
+
+**The headers file.** One `Name: value` header per line; blank lines and lines
+starting with `#` are skipped:
+
+```text
+# Collector credentials
+Authorization: Bearer 0123456789abcdef
+X-Scope-OrgID: lab
+```
+
+It must be a regular file (not a symbolic link) owned by the user CapyCTL
+runs as, with no group or other permissions (`chmod 600`), and at most 64 KiB.
+A file that breaks these rules, a line that is not `Name: value`, a name that
+is not a valid HTTP header name, an empty value or a control character in a
+value refuses the start. The message names the path and the line number,
+never the line's text. The values are never logged and never shown by
+`config show` or status, which show the path only. The file is read once,
+when the role starts.
+
+**Refused at start.** A field the block does not take; an `endpoint` that is
+not an `http` or `https` URL naming a host, or carries a user or password
+(credentials go in `headers_file`); a relative `headers_file`, or one without
+an `endpoint`; a `sample_ratio` that is not a number from 0.0 to 1.0; a
+`caller_context` other than `parent`, `link` or `ignore`; an `engines` other
+than `off` or `on`; and `engines: on` unless the endpoint is on loopback
+(`localhost`, `127.0.0.0/8` or `::1`): engines export without TLS, and their
+spans stay on the machine. An `http://` endpoint that is not on loopback is
+accepted with a warning at start:
+
+```text
+warning: tracing exports over plain HTTP to http://collector.lan:4318/v1/traces (not loopback); spans travel unencrypted
+```
+
+**Environment.** CapyCTL ignores `OTEL_*` variables in its own environment.
+Tracing never turns on, or goes to another collector, because a unit file
+carries one; the settings here are the only way in.
+
+**Export.** Spans wait in a queue in memory of at most 2048 spans and are
+sent every 5 seconds, at most 512 per request. When the queue is full, new
+spans are dropped and counted. An export that cannot reach the collector, or
+gets a retryable answer, is tried up to three more times, backing off; then the batch
+is dropped and counted. None of this delays or changes a request, a readiness check
+or a lifecycle step. A role log notice reports dropped spans and export
+failures at most once a minute. A stopping role sends what is queued for at
+most 2 seconds.
+
+**Status.** `capyctl status deployment <name>` shows the role's `tracing: off`, or
+`tracing: on → <endpoint>, spans dropped <n>` with the last export error
+since the start; `capyctl list hosts` shows the same line for each host, from
+its latest report. Each instance shows `engine tracing: on` or
+`engine tracing: off (<reason>)`. The JSON output carries the same fields
+(`tracing`, and `engine_tracing` per instance).
+
+Every field is settable by path, like any setting: `--set
+observability.tracing.endpoint=http://127.0.0.1:4318/v1/traces` on `capyctl
+start server` or `capyctl start host`, or
+`CAPYCTL_SET__OBSERVABILITY__TRACING__ENDPOINT=...`; standalone with the
+`server.` or `host.` prefix (`--set host.observability.tracing.engines=on`,
+`CAPYCTL_SET__SERVER__OBSERVABILITY__TRACING__SAMPLE_RATIO=0.1`). The settings
+belong to the role: no deployment or profile field changes them, and a change
+takes a restart.
+
 ## Any setting by its path
 
 Every setting in a server, host or standalone document can be changed without
@@ -628,7 +808,7 @@ capyctl start server --set shutdown.drain_timeout=90s
 # A host that reports its engine load every 2 seconds, from its unit file.
 CAPYCTL_SET__LOAD_REPORT_INTERVAL=2s
 
-# A host where no request waits: one beyond a model's 32 running requests, or
+# A host where no request waits: one beyond a model's running-request bound, or
 # for a model not loaded, is refused 429 at once (see the parking guide).
 capyctl start host --set resource_policy.queue.max_pending_per_deployment=0
 
@@ -758,11 +938,18 @@ takes `--set` and `CAPYCTL_SET__…` the same way.
 KV cache kept in host RAM outside the engine counts against the host-KV
 limit; on standalone that is the [LMCache](../guide/engines.md#lmcache) pool
 of each model that uses it. Standalone sets the limit at a tenth of the memory
-it observes (on a discrete-GPU machine, of host RAM): 12.17 GiB on a 128 GB
-GB10. A model is not admitted while its pool, with the pools of the models
-already running, would exceed it, so on that machine no `lmcache_pool` above
-12 GiB fits. Such a start exits 4 (`insufficient_resources`) with a message
-that names the limit and this setting:
+it observes at each start (on a discrete-GPU machine, of host RAM), so it
+differs per machine and follows the machine, not the memory in use: 12.17 GiB
+on a 128 GB GB10, about 6.1 GiB on a laptop with 61 GiB of RAM. A model's
+automatic pool (`lmcache_pool: auto`, the default) is sized to one full
+context of the model and never exceeds this limit less the model's own host
+KV; when the pools of the models already running leave less room, it shrinks
+to the room left with a warning, and with less than 1 GiB left the model runs
+without LMCache (`host_kv_room`). A stated `lmcache_pool` is not shrunk: a
+model is not admitted while it, with the pools already running, would exceed
+the limit, so on that machine no stated `lmcache_pool` above 12 GiB fits.
+Such a start exits 4 (`insufficient_resources`) with a message that names
+the limit and this setting:
 `host_kv (needs 20.0 GiB, limit 12.2 GiB; raise host.resource_policy.memory.system.host_kv_limit or lower lmcache_pool)`
 (on a host role, it names that host's
 `resource_policy.domains.<domain>.host_kv_limit`). Raise the limit with a
@@ -923,12 +1110,19 @@ CapyCTL starts each engine with a closed environment. `CAPYCTL_ENGINE_LOG`,
 `CAPYCTL_EXTRA_APPROVALS`, `CAPYCTL_RENDEZVOUS_DIR`, `CAPYCTL_OBSERVATION_DIR`,
 `CAPYCTL_VLLM_ADMIN_KEY`, `CAPYCTL_ENGINE_API_KEY` and `CAPYCTL_DEBUG_ENGINE_LOGS` are
 written by CapyCTL for the engine process; setting them yourself has no effect.
-For TensorFold it also writes `TENSORFOLD_NO_UPDATE_CHECK`, `HF_HUB_OFFLINE`,
+For TensorFold 0.6 it also writes `TENSORFOLD_NO_UPDATE_CHECK`, `HF_HUB_OFFLINE`,
 `TRANSFORMERS_OFFLINE` and `TORCH_EXTENSIONS_DIR`
 (`<state dir>/engines/tensorfold/<version>/torch_extensions`, private to the
-service user). Under `engine_telemetry: off` (the default) it writes
+service user); for TensorFold native, `TENSORFOLD_NO_UPDATE_CHECK`,
+`HF_HUB_OFFLINE`, `TENSORFOLD_CUDA_MEMORY_LIMIT_GB` (the declared allocation)
+and `TENSORFOLD_MEMORY_RESERVE_GIB=2`, and its PATH is the system's alone.
+Under `engine_telemetry: off` (the default) it writes
 `DO_NOT_TRACK=1` for every engine and `VLLM_DO_NOT_TRACK=1` and
 `VLLM_NO_USAGE_STATS=1` for vLLM ([Engine usage reporting](#engine-usage-reporting)).
+On a launch with engine tracing ([Tracing](#tracing)) it writes
+`OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf` for vLLM and SGLang,
+`OTEL_SERVICE_NAME=vllm` and `OTEL_RESOURCE_ATTRIBUTES` (the deployment and
+instance) for vLLM, and `SGLANG_TRACE_LEVEL=1` for SGLang.
 Other variables in CapyCTL's own environment do not reach an engine. The CUDA
 toolkit is the exception by design: a profile's `cuda_home` (stated as above
 for the role's own installation, detected by `capyctl engine add`, or written in

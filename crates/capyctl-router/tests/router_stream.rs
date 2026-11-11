@@ -36,6 +36,7 @@ async fn app_streaming() -> (axum::Router, Arc<InFlight>, Arc<Controller>) {
         api_key: Some("test-key".into()),
         inflight: Arc::new(capyctl_router::admission::InFlight::default()),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: capyctl_trace::Tracing::off(),
     };
     (capyctl_router::serve_router(deps), inflight, controller)
 }

@@ -45,6 +45,8 @@ fn spec(deep_park: bool) -> ProfileSpec {
         approved_env: vec![],
         trust_remote_code: false,
         lmcache: None,
+        line: Default::default(),
+        native: None,
     }
 }
 
@@ -62,8 +64,9 @@ fn llamacpp_is_a_named_engine() {
     for spelling in ["llama.cpp", "llama-cpp", "LlamaCpp", "llama-server"] {
         assert_eq!(Engine::from_name(spelling), None, "{spelling}");
     }
-    // ADR 0031 §1: the custom engine kind follows llama.cpp in the list.
-    assert!(Engine::ALL.ends_with(&[Engine::Llamacpp, Engine::Custom]));
+    // ADR 0031 §1, ADR 0038 §1: llama.cpp, then TensorRT-LLM, then the
+    // custom engine kind close the list.
+    assert!(Engine::ALL.ends_with(&[Engine::Llamacpp, Engine::TensorrtLlm, Engine::Custom]));
     assert!(ENVIRONMENT_PROFILES.contains(&"local-llamacpp"));
 }
 
@@ -131,6 +134,29 @@ fn a_dev_build_of_the_tag_commit_lists_as_the_release() {
     assert!(!is_verified_in(&table, Engine::Vllm, "0.6.0-dev+d812350"));
     assert!(!is_verified(Engine::Llamacpp, "0.6.0+d812350"));
     assert!(!is_verified(Engine::Llamacpp, "0.6.0-dev+d812350"));
+}
+
+// T42 (ADR 0029 §2): exact release-tag dev builds normalize, not arbitrary devs.
+#[test]
+fn newer_tag_fingerprints_normalize_without_qualification() {
+    for (version, commit) in [
+        ("0.7.0", "620d2225cc436ab0b001e3200e590e3b286ef9ab"),
+        ("0.9.0", "cd959bae99ff4bed22bef2604f45241c09bbb8c8"),
+    ] {
+        let table = [(Engine::Llamacpp, version)];
+        for hash in [&commit[..7], &commit[..12], commit] {
+            for suffix in ["", "-dev"] {
+                let fingerprint = format!("{version}{suffix}+{hash}");
+                assert!(is_verified_in(&table, Engine::Llamacpp, &fingerprint));
+                assert!(!is_verified(Engine::Llamacpp, &fingerprint));
+            }
+        }
+        assert!(!is_verified_in(
+            &table,
+            Engine::Llamacpp,
+            &format!("{version}-dev+abcdef0")
+        ));
+    }
 }
 
 // T42 (ADR 0029 §2): a llama.cpp listing shows the fingerprint `engine add`
@@ -204,6 +230,8 @@ fn extra(
         &args(list),
         &ExtraArgsContext {
             engine: Engine::Llamacpp,
+            api: capyctl_config::effective::DeploymentApi::Chat,
+            line: Default::default(),
             sleep_mode: false,
             approved_options: &approved,
             approved_paths: &paths,
@@ -231,12 +259,21 @@ fn every_reserved_spelling_is_refused() {
                     reserved_refusal(extra(list, &[], &[], &[]))
                         && reserved_refusal(validate_profile_args(
                             Engine::Llamacpp,
+                            Default::default(),
                             &args(list),
                             false,
                         ))
                 };
                 assert!(refused(&[&spelling]), "{spelling}");
                 assert!(refused(&[&spelling, "1"]), "{spelling} 1");
+                assert!(extra(&[&format!("{spelling}=1")], &[], &[], &[]).is_err());
+                assert!(validate_profile_args(
+                    Engine::Llamacpp,
+                    Default::default(),
+                    &args(&[&format!("{spelling}=1")]),
+                    false,
+                )
+                .is_err());
             }
         }
     }
@@ -314,7 +351,10 @@ fn the_equals_spelling_is_refused() {
             "{error}"
         );
         assert!(error.to_string().contains("llama.cpp refuses"), "{error}");
-        assert!(validate_profile_args(Engine::Llamacpp, &args(list), false).is_err());
+        assert!(
+            validate_profile_args(Engine::Llamacpp, Default::default(), &args(list), false)
+                .is_err()
+        );
     }
 }
 
@@ -343,7 +383,7 @@ fn cache_reuse_is_ordinary() {
         &["--cache-prompt"],
     ] {
         extra(list, &[], &[], &[]).unwrap_or_else(|error| panic!("{list:?}: {error}"));
-        validate_profile_args(Engine::Llamacpp, &args(list), false)
+        validate_profile_args(Engine::Llamacpp, Default::default(), &args(list), false)
             .unwrap_or_else(|error| panic!("{list:?}: {error}"));
     }
     // One option, however it is spelled, is passed once.
@@ -448,6 +488,7 @@ fn sensitive_options_need_approval_and_approved_paths() {
     // The host writes its own arguments: no approval needed there.
     validate_profile_args(
         Engine::Llamacpp,
+        Default::default(),
         &args(&["--model-draft", "/anywhere/d.gguf"]),
         false,
     )
@@ -477,7 +518,12 @@ fn forbidden_options_are_refused_even_when_approved() {
 // and an option reserved or sensitive in one spelling is so in all of them.
 #[test]
 fn the_tables_cover_every_spelling_of_their_options() {
-    let known: BTreeSet<&str> = options().into_iter().flatten().collect();
+    // Upstream v0.9.0 adds these options to the v0.6.0 fixture inventory.
+    let known: BTreeSet<&str> = options()
+        .into_iter()
+        .flatten()
+        .chain(["--connect", "--connect-code", "--models-memory-margin"])
+        .collect();
     let tables: Vec<&[&str]> = RESERVED_RENDERED
         .iter()
         .chain(RESERVED_NEVER_RENDERED)
@@ -779,6 +825,9 @@ fn declared_llamacpp_resources_bound_the_kv_cache() {
 fn hidden_inputs_in_the_environment_are_refused() {
     for name in [
         "LLAMA_ARG_CTX_SIZE",
+        "LLAMA_ARG_CONNECT",
+        "LLAMA_ARG_CONNECT_CODE",
+        "LLAMA_ARG_MODELS_MEMORY_MARGIN",
         "LLAMA_API_KEY",
         "LLAMA_SERVER_SLOTS_DEBUG",
         "LLAMA_CACHE",

@@ -28,14 +28,22 @@
 //! again at startup). Nothing in this module inspects permission bits: engine
 //! installation files get no permission rule.
 //!
+//! **Native TensorFold (ADR 0039 §2).** A native release root is measured
+//! whole (every regular file under it: the binary, its CUDA kernels, its
+//! libraries, `VERSION`, `SHA256SUMS`, the notices), so a replaced cubin is
+//! drift. Registration also checks the publisher's `SHA256SUMS` when the
+//! root holds one, and reads the binary's `capabilities --json` document in
+//! place of the Python probe, which has nothing to import on that line.
+//!
 //! Passing fingerprints and probes are not qualification evidence (AGENTS.md).
 
 use capyctl_config::custom::CustomManifest;
 use capyctl_config::engine_policy::Engine;
+use capyctl_config::tensorfold_native::{self, TensorfoldLine};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::Read,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
@@ -71,22 +79,53 @@ pub fn capability_names(engine: Engine) -> &'static [&'static str] {
         Engine::Tensorfold => &["core", "deep_park", "metrics"],
         // ADR 0029 §2: nothing is probed; deep parking is reported missing.
         Engine::Llamacpp => &["deep_park"],
+        // ADR 0038 §2: importing TensorRT-LLM starts MPI and CUDA, so it is
+        // never probed; it is restart-only and deep parking is reported missing.
+        Engine::TensorrtLlm => &["deep_park"],
         // ADR 0031 §1, §4: nothing is ever executed or probed; it cannot park.
         Engine::Custom => &["deep_park"],
     }
 }
 
 /// The installed Python package that is the engine; none for llama.cpp, a
-/// bare binary (ADR 0029 §2).
+/// bare binary (ADR 0029 §2). ADR 0038 §2: TensorRT-LLM's is its
+/// distribution, `tensorrt_llm`.
 pub fn package_name(engine: Engine) -> Option<&'static str> {
     match engine {
         Engine::Sglang => Some("sglang"),
         Engine::Vllm => Some("vllm"),
         Engine::Tensorfold => Some("tensorfold"),
+        Engine::TensorrtLlm => Some(capyctl_config::tensorrt_llm::DISTRIBUTION),
         Engine::Llamacpp => None,
         // ADR 0031 §3: a custom engine is measured from its executable and
         // environment, never through a package of its own.
         Engine::Custom => None,
+    }
+}
+
+/// Whether the capability probe (`runtime/engine_capabilities.py`, which
+/// imports the engine) runs for `engine`. ADR 0029 §2, ADR 0031 §4: nothing is
+/// probed for llama.cpp or a custom engine. ADR 0038 §2: nor for
+/// TensorRT-LLM, whose import initializes MPI and CUDA.
+fn probed(engine: Engine) -> bool {
+    match engine {
+        Engine::Sglang | Engine::Vllm | Engine::Tensorfold => true,
+        Engine::Llamacpp | Engine::TensorrtLlm | Engine::Custom => false,
+    }
+}
+
+/// ADR 0008: the import packages one installation's digest covers, under
+/// its `site-packages`: the engine package alone, or, ADR 0038 §2, every
+/// import package of TensorRT-LLM's distribution (`tensorrt_llm/` and
+/// `triton_kernels/`; the wheel's top-level `examples/` is never imported by
+/// the server and is left out).
+fn import_packages(engine: Engine) -> &'static [&'static str] {
+    match engine {
+        Engine::Sglang => &["sglang"],
+        Engine::Vllm => &["vllm"],
+        Engine::Tensorfold => &["tensorfold"],
+        Engine::TensorrtLlm => capyctl_config::tensorrt_llm::IMPORT_PACKAGES,
+        Engine::Llamacpp | Engine::Custom => &[],
     }
 }
 
@@ -173,9 +212,9 @@ pub fn site_packages_holding(
     }
 }
 
-/// #198: the closed refusal of an SGLang installed in editable mode, used by
-/// `engine add` and standalone's embedded check only; never sent over the
-/// host protocol, whose 0.1.x servers do not know it (ADR 0017 §2).
+/// #198 / #235: the closed refusal of an editable SGLang. Engine add and
+/// standalone refuse it directly; an enrolled host reports it only toward
+/// a server advertising `installation_unsupported` (ADR 0017).
 pub const EDITABLE_REFUSAL: &str = "installation_unsupported:editable";
 
 /// #198, ADR 0008 amendment 2026-10-30: the closed refusal of an installation
@@ -336,34 +375,72 @@ impl InstallationMeasurer {
 
     /// Measure one installation of `engine` started through `executable`. A
     /// custom engine measured here has no manifest: its default root (ADR
-    /// 0031 §3); [`Self::measure_profile`] takes the manifest.
+    /// 0031 §3); [`Self::measure_profile`] takes the manifest. Every engine
+    /// but TensorFold has one line; a TensorFold installation measured here
+    /// is the Python line's (ADR 0039 §1).
     pub fn measure(
         &self,
         engine: Engine,
         executable: &Path,
     ) -> Result<InstallationFingerprint, FingerprintError> {
-        self.measure_profile(engine, executable, None)
+        self.measure_profile(engine, TensorfoldLine::Python, executable, None)
     }
 
-    /// As [`Self::measure`], with a custom engine's manifest (ADR 0031 §3:
-    /// its `environment` replaces the default root, its `version` is the
-    /// fingerprint's). `custom` is ignored for every other engine.
+    /// As [`Self::measure`], on `line` (ADR 0039 §1: a native TensorFold
+    /// release is measured from its root, [`Self::measure_native`]) and with
+    /// a custom engine's manifest (ADR 0031 §3: its `environment` replaces
+    /// the default root, its `version` is the fingerprint's). `line` matters
+    /// for TensorFold only, `custom` for a custom engine only.
     pub fn measure_profile(
         &self,
         engine: Engine,
+        line: TensorfoldLine,
         executable: &Path,
         custom: Option<&CustomManifest>,
     ) -> Result<InstallationFingerprint, FingerprintError> {
         if engine == Engine::Custom {
             return self.measure_custom(executable, custom);
         }
+        if engine == Engine::Tensorfold && line.is_native() {
+            return self.measure_native(executable);
+        }
         let Some(package) = package_name(engine) else {
             return self.measure_binary(executable);
         };
         let site = site_packages(engine, executable)?;
-        let (digest, files, bytes) = self.measure_tree(&site.join(package))?;
+        let (digest, files, bytes) = match import_packages(engine) {
+            [_] => self.measure_tree(&site.join(package))?,
+            packages => self.measure_packages(&site, packages)?,
+        };
         Ok(InstallationFingerprint {
             version: version(&site, package),
+            digest,
+            files,
+            bytes,
+        })
+    }
+
+    /// ADR 0039 §2, ADR 0008: a native TensorFold installation is its release
+    /// root, the directory above `bin/tensorfold-native`, measured whole by
+    /// [`Self::measure_tree`]'s walk and bounds: the kernel set is loaded
+    /// code, so a digest of the binary alone would miss a replaced cubin. The
+    /// version is the root's `VERSION` file, else `unknown`.
+    fn measure_native(
+        &self,
+        executable: &Path,
+    ) -> Result<InstallationFingerprint, FingerprintError> {
+        let metadata =
+            std::fs::symlink_metadata(executable).map_err(|_| FingerprintError::NotFound)?;
+        if !metadata.is_file() {
+            return Err(FingerprintError::UnsafeFile);
+        }
+        let root = native_root(executable).ok_or(FingerprintError::NotFound)?;
+        let (digest, files, bytes) = self.measure_tree(root)?;
+        Ok(InstallationFingerprint {
+            version: match crate::engines::release_version(root) {
+                crate::engines::ReleaseVersion::Stated(version) => version,
+                _ => "unknown".to_owned(),
+            },
             digest,
             files,
             bytes,
@@ -382,6 +459,38 @@ impl InstallationMeasurer {
         // Forget files that left the installation, so the cache stays bounded.
         if let Ok(mut cache) = self.cache.lock() {
             cache.retain(|path, _| !path.starts_with(root) || collected.seen.contains(path));
+        }
+        let digest = manifest_digest(&mut collected.entries)?;
+        Ok((digest, collected.entries.len(), collected.total))
+    }
+
+    /// ADR 0008, ADR 0038 §2: one canonical manifest over several import
+    /// packages of `site`, each file named `<package>/<relative path>`
+    /// (bytecode caches left out, a link by its target text), within the
+    /// installation bounds. A package that is absent contributes nothing (its
+    /// absence changes the digest); one that is not a directory is refused.
+    fn measure_packages(
+        &self,
+        site: &Path,
+        packages: &[&str],
+    ) -> Result<(String, usize, u64), FingerprintError> {
+        let mut collected = Collected::default();
+        let mut roots = Vec::new();
+        for package in packages {
+            let root = site.join(package);
+            match std::fs::symlink_metadata(&root) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Ok(_) => return Err(FingerprintError::UnsafeFile),
+                Err(_) => return Err(FingerprintError::Io),
+            }
+            self.walk(&root, package.as_bytes(), &mut collected)?;
+            roots.push(root);
+        }
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.retain(|path, _| {
+                !roots.iter().any(|root| path.starts_with(root)) || collected.seen.contains(path)
+            });
         }
         let digest = manifest_digest(&mut collected.entries)?;
         Ok((digest, collected.entries.len(), collected.total))
@@ -782,6 +891,331 @@ pub fn library_version(dirs: &[&Path]) -> Option<String> {
     found
 }
 
+/// ADR 0039 §2: the release root of a native TensorFold executable, the
+/// directory above its `bin` (lexical, as resolution names it).
+pub fn native_root(executable: &Path) -> Option<&Path> {
+    executable
+        .parent()
+        .filter(|bin| bin.file_name().is_some_and(|name| name == "bin"))?
+        .parent()
+}
+
+/// ADR 0039 §2, §12: what a native TensorFold installation reports for the
+/// capabilities a launch may depend on, without running anything: it has no
+/// park path, so `deep_park` is missing.
+pub fn native_capability_report() -> CapabilityReport {
+    CapabilityReport {
+        missing: BTreeMap::from([("deep_park".to_owned(), vec!["unsupported".to_owned()])]),
+    }
+}
+
+/// ADR 0039 §2, §16: why `engine add` refuses a native TensorFold release it
+/// cannot drive: a changed archive (`SHA256SUMS`) or a capabilities document
+/// without what CapyCTL renders. Always `engine_unsupported`; never a
+/// refusal for the version being uncertified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeReleaseError(pub String);
+
+impl NativeReleaseError {
+    pub fn code(&self) -> &'static str {
+        "engine_unsupported"
+    }
+}
+
+impl std::fmt::Display for NativeReleaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The SHA-256 of one regular file, counted into `total` within the
+/// installation bounds (ADR 0008).
+fn file_sha256(path: &Path, total: &mut u64) -> Result<[u8; 32], NativeReleaseError> {
+    let unreadable = || NativeReleaseError(format!("{} cannot be read", path.display()));
+    let mut file = std::fs::File::open(path).map_err(|_| unreadable())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; CHUNK];
+    loop {
+        let n = file.read(&mut buffer).map_err(|_| unreadable())?;
+        if n == 0 {
+            break;
+        }
+        *total = total.saturating_add(n as u64);
+        if *total > MAX_BYTES {
+            return Err(NativeReleaseError(format!(
+                "the files {} lists exceed {MAX_BYTES} bytes, more than an installation may \
+                 hold",
+                tensorfold_native::CHECKSUMS_FILE
+            )));
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// ADR 0039 §2 step 2: check every file the release root's `SHA256SUMS`
+/// lists (`<64 hex>  <path>` as `sha256sum` writes it, or `<64 hex> *<path>`),
+/// each path relative, inside the root, without `..`, and no link followed
+/// out of the root. `Ok(true)` when every listed file matched, `Ok(false)`
+/// when the root holds no `SHA256SUMS` (it registers; `engine list` says
+/// the publisher's list was absent). A missing or different file refuses the
+/// installation, naming the first such file. Bounded as ADR 0008's walk (at
+/// most [`MAX_FILES`] entries and [`MAX_BYTES`] bytes).
+pub fn verify_checksums(root: &Path) -> Result<bool, NativeReleaseError> {
+    let list = root.join(tensorfold_native::CHECKSUMS_FILE);
+    let name = tensorfold_native::CHECKSUMS_FILE;
+    let metadata = match std::fs::symlink_metadata(&list) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => {
+            return Err(NativeReleaseError(format!(
+                "{} cannot be read",
+                list.display()
+            )))
+        }
+    };
+    if !metadata.is_file() {
+        return Err(NativeReleaseError(format!(
+            "{} is not a regular file",
+            list.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&list)
+        .and_then(|file| file.take(MAX_METADATA + 1).read_to_end(&mut bytes))
+        .map_err(|_| NativeReleaseError(format!("{} cannot be read", list.display())))?;
+    if bytes.len() as u64 > MAX_METADATA {
+        return Err(NativeReleaseError(format!(
+            "{} is larger than {MAX_METADATA} bytes",
+            list.display()
+        )));
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| NativeReleaseError(format!("{} is not UTF-8 text", list.display())))?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|_| NativeReleaseError(format!("{} cannot be read", root.display())))?;
+    let changed = |file: &str, what: &str| {
+        NativeReleaseError(format!(
+            "{file}, listed in {name}, {what}: the archive was changed after it was unpacked \
+             (reinstall the release from its archive)"
+        ))
+    };
+    let mut listed = 0usize;
+    let mut total = 0u64;
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        listed += 1;
+        if listed > MAX_FILES {
+            return Err(NativeReleaseError(format!(
+                "{name} lists more than {MAX_FILES} files"
+            )));
+        }
+        let entry = line
+            .get(..64)
+            .filter(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .zip(
+                line.get(64..)
+                    .and_then(|rest| rest.strip_prefix(' '))
+                    .and_then(|rest| rest.strip_prefix(' ').or_else(|| rest.strip_prefix('*')))
+                    .filter(|path| !path.is_empty()),
+            );
+        let Some((expected, file)) = entry else {
+            return Err(NativeReleaseError(format!(
+                "line {} of {name} is not `<sha256>  <path>`",
+                index + 1
+            )));
+        };
+        let relative = Path::new(file);
+        if !relative.components().all(|c| {
+            matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        }) {
+            return Err(NativeReleaseError(format!(
+                "{name} lists {file}, which is not a relative path inside the release"
+            )));
+        }
+        let path = root.join(relative);
+        if std::fs::symlink_metadata(&path).is_err() {
+            return Err(changed(file, "is missing"));
+        }
+        let Ok(target) = path.canonicalize() else {
+            return Err(changed(file, "is missing"));
+        };
+        if !target.starts_with(&canonical_root) {
+            return Err(NativeReleaseError(format!(
+                "{name} lists {file}, which leads outside the release directory {}",
+                root.display()
+            )));
+        }
+        if !std::fs::metadata(&target).is_ok_and(|m| m.is_file()) {
+            return Err(changed(file, "is not a regular file"));
+        }
+        let digest = file_sha256(&target, &mut total)?;
+        if !hex::encode(digest).eq_ignore_ascii_case(expected) {
+            return Err(changed(file, "differs from its checksum"));
+        }
+    }
+    if listed == 0 {
+        return Err(NativeReleaseError(format!(
+            "{} lists no file",
+            list.display()
+        )));
+    }
+    Ok(true)
+}
+
+/// ADR 0039 §2 step 3: read the native binary's capabilities document
+/// (`capabilities --json`), run as the version check is (60 s, cleared
+/// environment, own process group) with at most
+/// [`tensorfold_native::CAPABILITIES_LIMIT`] bytes of standard output, and
+/// check it against `version` ([`parse_native_capabilities`]). The families
+/// it lists, with their weight formats.
+pub fn native_capabilities(
+    executable: &Path,
+    version: &str,
+    timeout: Duration,
+) -> Result<BTreeMap<String, Vec<String>>, NativeReleaseError> {
+    let (status, output) = crate::engines::run_bounded(
+        executable,
+        &["capabilities", "--json"],
+        false,
+        timeout,
+        tensorfold_native::CAPABILITIES_LIMIT,
+    )
+    .map_err(|error| {
+        NativeReleaseError(match error {
+            crate::engines::RunError::Spawn => {
+                "`capabilities --json` could not be started".to_owned()
+            }
+            crate::engines::RunError::TimedOut => "`capabilities --json` timed out".to_owned(),
+            crate::engines::RunError::Output => format!(
+                "`capabilities --json` wrote more than {} bytes",
+                tensorfold_native::CAPABILITIES_LIMIT
+            ),
+        })
+    })?;
+    if !status.success() {
+        return Err(NativeReleaseError(
+            "`capabilities --json` exited unsuccessfully".to_owned(),
+        ));
+    }
+    parse_native_capabilities(&output, version)
+}
+
+/// ADR 0039 §2 step 3: the capabilities document must have `schema` 1,
+/// `engine` `"zig"`, `version` equal to the checked one, `cuda` among
+/// `backends`, every flag CapyCTL renders among `serve.flags` (with the
+/// value it renders where the flag lists `values`) and every variable it
+/// renders among `env`; anything missing is named. Unknown keys are fine.
+/// The families, `model_type` to weight formats, as the document lists them.
+pub fn parse_native_capabilities(
+    output: &[u8],
+    version: &str,
+) -> Result<BTreeMap<String, Vec<String>>, NativeReleaseError> {
+    let refuse = |what: String| {
+        NativeReleaseError(format!(
+            "the capabilities document (`capabilities --json`) {what}, so CapyCTL cannot \
+             drive this release"
+        ))
+    };
+    let document: serde_json::Value =
+        serde_json::from_slice(output).map_err(|_| refuse("is not JSON".to_owned()))?;
+    if !document.is_object() {
+        return Err(refuse("is not a JSON object".to_owned()));
+    }
+    if document["schema"].as_u64() != Some(tensorfold_native::CAPABILITIES_SCHEMA) {
+        return Err(refuse(format!(
+            "has schema {} where CapyCTL reads {}",
+            document["schema"],
+            tensorfold_native::CAPABILITIES_SCHEMA
+        )));
+    }
+    if document["engine"].as_str() != Some(tensorfold_native::CAPABILITIES_ENGINE) {
+        return Err(refuse(format!(
+            "names engine {} where CapyCTL reads {:?}",
+            document["engine"],
+            tensorfold_native::CAPABILITIES_ENGINE
+        )));
+    }
+    if document["version"].as_str() != Some(version) {
+        return Err(refuse(format!(
+            "says version {} but the binary reports {version}",
+            document["version"]
+        )));
+    }
+    let backend = tensorfold_native::CAPABILITIES_BACKEND;
+    if !document["backends"]
+        .as_array()
+        .is_some_and(|backends| backends.iter().any(|b| b.as_str() == Some(backend)))
+    {
+        return Err(refuse(format!("lists no {backend} backend")));
+    }
+    let flags = &document["serve"]["flags"];
+    for (flag, value) in tensorfold_native::REQUIRED_FLAGS {
+        let Some(entry) = flags.get(flag) else {
+            return Err(refuse(format!(
+                "lists no {flag} among serve.flags, a flag CapyCTL renders"
+            )));
+        };
+        if let (Some(value), Some(values)) = (value, entry["values"].as_array()) {
+            if !values.iter().any(|v| v.as_str() == Some(value)) {
+                return Err(refuse(format!(
+                    "does not allow {flag} {value}, which CapyCTL renders"
+                )));
+            }
+        }
+    }
+    for name in tensorfold_native::REQUIRED_ENV {
+        if !document["env"]
+            .as_array()
+            .is_some_and(|env| env.iter().any(|e| e.as_str() == Some(name)))
+        {
+            return Err(refuse(format!(
+                "lists no {name} among env, a variable CapyCTL renders"
+            )));
+        }
+    }
+    let malformed = || refuse("has no families mapping of names to format lists".to_owned());
+    let mut families = BTreeMap::new();
+    for (family, formats) in document["families"].as_object().ok_or_else(malformed)? {
+        let formats = formats
+            .as_array()
+            .ok_or_else(malformed)?
+            .iter()
+            .map(|format| format.as_str().map(str::to_owned).ok_or_else(malformed))
+            .collect::<Result<Vec<_>, _>>()?;
+        families.insert(family.clone(), formats);
+    }
+    Ok(families)
+}
+
+/// ADR 0039 §2 steps 2 and 3, after the version check read `version`: the
+/// release's `SHA256SUMS` and its capabilities document, as the profile's
+/// `native` record.
+pub fn check_native_release(
+    executable: &Path,
+    version: &str,
+    timeout: Duration,
+) -> Result<tensorfold_native::NativeRegistration, NativeReleaseError> {
+    let root = native_root(executable).ok_or_else(|| {
+        NativeReleaseError(format!(
+            "{} is not in a release's bin directory",
+            executable.display()
+        ))
+    })?;
+    let checksums_verified = verify_checksums(root)?;
+    let families = native_capabilities(executable, version, timeout)?;
+    Ok(tensorfold_native::NativeRegistration {
+        families,
+        checksums_verified,
+    })
+}
+
 /// Host policy for a launch that finds its installation drifted
 /// (`runtime_profiles.<name>.security.installation_drift`).
 pub use capyctl_config::effective::InstallationDrift;
@@ -848,21 +1282,26 @@ impl CapabilityReport {
 /// run or answered (no probe helper in the runtime directory, no interpreter,
 /// no package, a timeout, a malformed report). `None` is unknown: it refuses
 /// nothing and grants nothing. ADR 0029 §2: a llama.cpp binary has no deep-park
-/// capability and nothing is run for it; its report says so.
+/// capability and nothing is run for it; its report says so. ADR 0038 §2: nor
+/// is anything run for TensorRT-LLM, whose import starts MPI and CUDA.
+/// `cuda_home` is the selected profile's toolkit, as rendered for its launch;
+/// it is never inherited from the agent's environment.
 pub fn probe_capabilities(
     engine: Engine,
     executable: &Path,
     runtime_dir: &Path,
+    cuda_home: Option<&Path>,
     timeout: Duration,
 ) -> Option<CapabilityReport> {
-    let Some(package) = package_name(engine) else {
+    if !probed(engine) {
         return Some(CapabilityReport {
             missing: capability_names(engine)
                 .iter()
                 .map(|name| ((*name).to_owned(), vec!["unsupported".to_owned()]))
                 .collect(),
         });
-    };
+    }
+    let package = package_name(engine)?;
     let script = runtime_dir.join(PROBE_SCRIPT);
     if !std::fs::symlink_metadata(&script).is_ok_and(|m| m.is_file()) {
         return None;
@@ -892,6 +1331,12 @@ pub fn probe_capabilities(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .process_group(0);
+    // SGLang on sm_120 imports DeepGEMM while discovering its HTTP routes.
+    // DeepGEMM requires CUDA_HOME when nvcc is outside the system search path,
+    // so admission must see the same selected toolkit as the actual launch.
+    if let Some(cuda_home) = cuda_home {
+        command.env("CUDA_HOME", cuda_home);
+    }
     // ADR 0008 amendment 2026-10-17: the probe's guard runs the launch's plugin
     // closure, which accepts SGLang's own plugins only under this selection.
     if matches!(engine, Engine::Sglang) {
@@ -965,17 +1410,19 @@ impl Registration {
 /// is `unmeasured`. ADR 0031 §8: a custom profile's pinned installation
 /// digest (the one the operator approved) is the baseline, never the fresh
 /// measurement; a measurement that differs, or none, is `drifted` from
-/// registration on.
+/// registration on. ADR 0039 §2: a native TensorFold profile (`line`) is
+/// measured from its release root.
 pub fn registration(
     measurer: &InstallationMeasurer,
     engine: Option<Engine>,
+    line: TensorfoldLine,
     executable: &Path,
     custom: Option<&capyctl_config::custom::CustomProfile>,
 ) -> Registration {
     let measured = match engine {
         Some(Engine::Custom) if custom.is_none() => None,
         Some(engine) => measurer
-            .measure_profile(engine, executable, custom.map(|c| &c.manifest))
+            .measure_profile(engine, line, executable, custom.map(|c| &c.manifest))
             .ok(),
         None => None,
     };
@@ -1032,17 +1479,19 @@ pub fn custom_manifest(profile: &serde_json::Value) -> Option<CustomManifest> {
 }
 
 /// Fill one published profile's installation fields from its host document
-/// entry (`engine`, `executable` and, ADR 0031 §3, a custom engine's
-/// `custom` block with its manifest and pinned installation digest).
+/// entry (`engine`, `executable`, ADR 0039 §1 its TensorFold `line` and, ADR
+/// 0031 §3, a custom engine's `custom` block with its manifest and pinned
+/// installation digest).
 pub fn register_profile(
     measurer: &InstallationMeasurer,
     profile: &serde_json::Value,
     status: &mut capyctl_protocol::pb::RuntimeProfileStatus,
 ) {
     let engine = serde_json::from_value::<Engine>(profile["engine"].clone()).ok();
+    let line = capyctl_config::registration::profile_line(profile);
     let executable = Path::new(profile["executable"].as_str().unwrap_or(""));
     let custom = custom_profile(profile);
-    registration(measurer, engine, executable, custom.as_ref()).write(status);
+    registration(measurer, engine, line, executable, custom.as_ref()).write(status);
 }
 
 /// What an observed digest reads as when the installation could not be
@@ -1057,6 +1506,9 @@ pub struct InstallationRegistry {
     /// ADR 0031 §3: profile name → the manifest a custom engine's launch is
     /// measured with (its `environment` root).
     custom: BTreeMap<String, CustomManifest>,
+    /// ADR 0039 §2: the profiles on TensorFold's native line, measured from
+    /// their release root.
+    native: BTreeSet<String>,
     /// Profile name → the digest a launch measured instead (drift).
     drift: Mutex<BTreeMap<String, String>>,
     /// ADR 0033 §1: profile name → the LMCache digest the last launch-time
@@ -1090,6 +1542,7 @@ impl InstallationRegistry {
                 .map(|p| (p.name.clone(), p.installation_digest.clone()))
                 .collect(),
             custom: BTreeMap::new(),
+            native: BTreeSet::new(),
             drift: Mutex::new(
                 inventory
                     .profiles
@@ -1114,19 +1567,43 @@ impl InstallationRegistry {
 
     /// ADR 0031 §3: the custom engines' manifests among `profiles` (a host
     /// document's `runtime_profiles`), so their launches measure what their
-    /// registration measured.
+    /// registration measured. ADR 0039 §2: and the native TensorFold
+    /// profiles, so their launches measure the release root.
     pub fn with_profiles(mut self, profiles: &serde_json::Map<String, serde_json::Value>) -> Self {
         for (name, profile) in profiles {
             if let Some(manifest) = custom_manifest(profile) {
                 self.custom.insert(name.clone(), manifest);
             }
+            if capyctl_config::registration::profile_line(profile).is_native() {
+                self.native.insert(name.clone());
+            }
         }
         self
+    }
+
+    /// ADR 0039 §1: `profile`'s TensorFold line, as its document states it.
+    fn line(&self, profile: &str) -> TensorfoldLine {
+        if self.native.contains(profile) {
+            TensorfoldLine::Native
+        } else {
+            TensorfoldLine::Python
+        }
     }
 
     /// ADR 0031 §3: `profile` is a custom engine measured with `manifest`.
     pub fn with_custom(mut self, profile: &str, manifest: CustomManifest) -> Self {
         self.custom.insert(profile.to_owned(), manifest);
+        self
+    }
+
+    /// ADR 0039 §2: `profile` is on TensorFold's `line` (a native profile is
+    /// measured from its release root).
+    pub fn with_line(mut self, profile: &str, line: TensorfoldLine) -> Self {
+        if line.is_native() {
+            self.native.insert(profile.to_owned());
+        } else {
+            self.native.remove(profile);
+        }
         self
     }
 
@@ -1140,10 +1617,11 @@ impl InstallationRegistry {
     /// registered again); it refuses only under `installation_drift: refuse`.
     /// Returns the digest measured now (empty when it could not be measured),
     /// which keys the capability cache. ADR 0031 §3: a custom engine is
-    /// measured with the manifest its profile carries. #198: an editable
-    /// SGLang is `unmeasured` here like any other package outside
-    /// `site-packages`, never refused: this check answers an enrolled host's
-    /// launches, whose server may not know [`EDITABLE_REFUSAL`].
+    /// measured with the manifest its profile carries. ADR 0039 §2: a native
+    /// TensorFold profile's release root is measured, as at registration.
+    /// #235: an editable SGLang can never load through the protected entry,
+    /// so it is refused regardless of drift policy. The enrolled-host caller
+    /// withholds this code from a server that cannot accept it (ADR 0017).
     pub fn verify(
         &self,
         profile: &str,
@@ -1151,11 +1629,15 @@ impl InstallationRegistry {
         executable: &Path,
         policy: InstallationDrift,
     ) -> Result<String, &'static str> {
+        if let Some(reason) = unsupported_installation(engine, executable) {
+            return Err(reason);
+        }
         let custom = self.custom.get(profile);
         let measured = if engine == Engine::Custom && custom.is_none() {
             Err(FingerprintError::NotFound)
         } else {
-            self.measurer.measure_profile(engine, executable, custom)
+            self.measurer
+                .measure_profile(engine, self.line(profile), executable, custom)
         };
         let observed = measured
             .as_ref()
@@ -1176,7 +1658,8 @@ impl InstallationRegistry {
 
     /// The capability report for `profile` at installation digest `key`:
     /// cached, or probed now under the installation's interpreter. `None` is
-    /// unknown.
+    /// unknown. ADR 0039 §2: a native TensorFold profile has no interpreter
+    /// and nothing is run for it; it has no park path, which its report says.
     pub fn capabilities(
         &self,
         profile: &str,
@@ -1184,13 +1667,24 @@ impl InstallationRegistry {
         engine: Engine,
         executable: &Path,
         runtime_dir: &Path,
+        cuda_home: Option<&Path>,
     ) -> Option<CapabilityReport> {
         if let Some((cached, report)) = self.capabilities.lock().ok()?.get(profile) {
             if cached == key {
                 return Some(report.clone());
             }
         }
-        let report = probe_capabilities(engine, executable, runtime_dir, self.probe_timeout)?;
+        let report = if engine == Engine::Tensorfold && self.line(profile).is_native() {
+            native_capability_report()
+        } else {
+            probe_capabilities(
+                engine,
+                executable,
+                runtime_dir,
+                cuda_home,
+                self.probe_timeout,
+            )?
+        };
         self.capabilities
             .lock()
             .ok()?
@@ -1227,7 +1721,8 @@ impl InstallationRegistry {
     }
 
     /// ADR 0033 §1: the launch-time check of `profile`'s LMCache
-    /// ([`crate::lmcache_install::check_lmcache`]). A digest other than the
+    /// ([`crate::lmcache_install::check_lmcache`]) for a launch rendering
+    /// `residency` (ADR 0034 §1). A digest other than the
     /// registered one is drift, handled as the engine package's is (ADR
     /// 0008): flagged on the role log, and refused `installation_drift` only
     /// under `installation_drift: refuse`. The inner result is the check's
@@ -1238,13 +1733,19 @@ impl InstallationRegistry {
         engine: Engine,
         executable: &Path,
         registered: Option<&capyctl_config::lmcache::LmcacheRegistration>,
+        residency: capyctl_config::effective::Residency,
         policy: InstallationDrift,
     ) -> Result<
         Result<crate::lmcache_install::LmcacheInstall, crate::lmcache_install::LmcacheCheckFailure>,
         &'static str,
     > {
-        let checked =
-            crate::lmcache_install::check_lmcache(&self.measurer, engine, executable, registered);
+        let checked = crate::lmcache_install::check_lmcache(
+            &self.measurer,
+            engine,
+            executable,
+            registered,
+            residency,
+        );
         // ADR 0033 §1: the drift stands in status until a check measures
         // the registered digest again.
         if let (Ok(install), Ok(mut drift)) = (checked.as_ref(), self.lmcache_drift.lock()) {
@@ -1442,12 +1943,11 @@ mod tests {
         dir
     }
 
-    // T21 T22 #198 (ADR 0008 amendment 2026-10-30): an editable SGLang is
-    // named `installation_unsupported:editable` for `engine add` and the
-    // embedded check, but the shared launch-time check keeps the pre-#198
-    // rule: `unmeasured`, never refused, under either drift policy.
+    // T21 T22 — ADR 0008 / #235: the shared launch check refuses editable
+    // SGLang under both drift policies; the enrolled-host caller gates the
+    // refusal against the connected server's capabilities (ADR 0017).
     #[test]
-    fn an_editable_sglang_is_named_but_the_shared_launch_check_never_refuses_it() {
+    fn an_editable_sglang_is_refused_at_every_launch_whatever_the_policy() {
         let checkout = "/sgl-workspace/sglang/python";
         for (marker, body) in [
             (
@@ -1493,7 +1993,13 @@ mod tests {
             for policy in [InstallationDrift::Warn, InstallationDrift::Refuse] {
                 assert_eq!(
                     registered.verify("local", Engine::Sglang, &executable, policy),
-                    Ok(String::new()),
+                    Err(EDITABLE_REFUSAL),
+                    "{marker}"
+                );
+                assert_eq!(
+                    InstallationRegistry::from_inventory(&Default::default())
+                        .verify("local", Engine::Sglang, &executable, policy),
+                    Err(EDITABLE_REFUSAL),
                     "{marker}"
                 );
             }
@@ -1706,14 +2212,26 @@ mod tests {
         std::fs::write(&script, "# helper\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o666)).unwrap();
         assert_eq!(
-            probe_capabilities(Engine::Sglang, &executable, runtime.path(), PROBE_TIMEOUT),
+            probe_capabilities(
+                Engine::Sglang,
+                &executable,
+                runtime.path(),
+                None,
+                PROBE_TIMEOUT
+            ),
             None
         );
         assert!(!marker.exists(), "an unverified helper was executed");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::write(runtime.path().join("stale.pyc"), "x").unwrap();
         assert_eq!(
-            probe_capabilities(Engine::Sglang, &executable, runtime.path(), PROBE_TIMEOUT),
+            probe_capabilities(
+                Engine::Sglang,
+                &executable,
+                runtime.path(),
+                None,
+                PROBE_TIMEOUT
+            ),
             None
         );
         assert!(!marker.exists(), "an unverified helper was executed");
@@ -1727,7 +2245,13 @@ mod tests {
         let runtime = tempfile::tempdir().unwrap();
         let executable = dir.path().join("bin/python3");
         assert_eq!(
-            probe_capabilities(Engine::Sglang, &executable, runtime.path(), PROBE_TIMEOUT),
+            probe_capabilities(
+                Engine::Sglang,
+                &executable,
+                runtime.path(),
+                None,
+                PROBE_TIMEOUT
+            ),
             None,
             "no probe helper in the runtime directory"
         );
@@ -1748,8 +2272,14 @@ mod tests {
             0o755,
         )
         .unwrap();
-        let report =
-            probe_capabilities(Engine::Sglang, &executable, runtime.path(), PROBE_TIMEOUT).unwrap();
+        let report = probe_capabilities(
+            Engine::Sglang,
+            &executable,
+            runtime.path(),
+            None,
+            PROBE_TIMEOUT,
+        )
+        .unwrap();
         assert_eq!(report.available("deep_park"), Some(false));
         capyctl_config::test_support::write_executable(&executable, "#!/bin/sh\nsleep 5\n", 0o755)
             .unwrap();
@@ -1758,6 +2288,7 @@ mod tests {
                 Engine::Sglang,
                 &executable,
                 runtime.path(),
+                None,
                 Duration::from_millis(200)
             ),
             None,
@@ -1796,10 +2327,56 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                probe_capabilities(engine, &executable, runtime.path(), PROBE_TIMEOUT),
+                probe_capabilities(engine, &executable, runtime.path(), None, PROBE_TIMEOUT),
                 None
             );
             assert_eq!(std::fs::read_to_string(&seen).unwrap(), expected);
+        }
+    }
+
+    // T21 T22: launch and Park admission use the selected profile's toolkit,
+    // including when the capability report is obtained through the registry.
+    #[test]
+    fn sglang_capability_admission_probes_with_the_selected_cuda_home() {
+        let dir = venv(Engine::Sglang, "0.5.23");
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(runtime.path().join(PROBE_SCRIPT), "# helper\n").unwrap();
+        std::fs::set_permissions(
+            runtime.path().join(PROBE_SCRIPT),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let executable = dir.path().join("bin/python3");
+        let cuda_home = dir.path().join("selected-cuda");
+        capyctl_config::test_support::write_executable(
+            &executable,
+            format!(
+                "#!/bin/sh\n\
+                 [ -z \"${{HOME+x}}${{PYTHONPATH+x}}${{LD_PRELOAD+x}}\" ] || exit 19\n\
+                 if [ \"${{CUDA_HOME-unset}}\" = '{}' ]; then missing=''; \
+                 else missing='\"route:/release_memory_occupation\"'; fi\n\
+                 printf '%s\\n' '{{\"schema\":\"capyctl/engine-capabilities/v1\",\
+                 \"engine\":\"sglang\",\"capabilities\":{{\"core\":[],\"deep_park\":['\
+                 \"$missing\"'],\"metrics\":[],\"observation\":[]}}}}'\n",
+                cuda_home.display()
+            ),
+            0o755,
+        )
+        .unwrap();
+        let registry = InstallationRegistry::from_inventory(&Default::default());
+        for (profile, toolkit) in [("without", None), ("selected", Some(cuda_home.as_path()))] {
+            let report = registry
+                .capabilities(
+                    profile,
+                    "digest",
+                    Engine::Sglang,
+                    &executable,
+                    runtime.path(),
+                    toolkit,
+                )
+                .unwrap();
+            assert_eq!(report.available("deep_park"), Some(toolkit.is_some()));
         }
     }
 
@@ -1848,7 +2425,7 @@ mod tests {
         );
         // Nothing to probe: deep parking is reported missing, nothing runs.
         let report =
-            probe_capabilities(Engine::Llamacpp, &binary, dir.path(), PROBE_TIMEOUT).unwrap();
+            probe_capabilities(Engine::Llamacpp, &binary, dir.path(), None, PROBE_TIMEOUT).unwrap();
         assert_eq!(report.available("deep_park"), Some(false));
         assert_eq!(report.missing_capabilities(), vec!["deep_park"]);
     }
@@ -1875,6 +2452,96 @@ mod tests {
             measurer.measure(Engine::Llamacpp, &binary).unwrap().digest,
             installed.digest
         );
+    }
+
+    // T49 T22 (ADR 0038 §2, ADR 0008): TensorRT-LLM's digest covers both import
+    // packages of its distribution, compiled libraries included, and leaves
+    // out bytecode, the top-level `examples/` and every other package; its
+    // version is the dist-info's. Nothing is probed: the probe would import
+    // the package, which starts MPI and CUDA, so deep parking is reported
+    // missing and the interpreter never runs.
+    #[test]
+    fn a_tensorrt_llm_digest_covers_both_import_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let marker = dir.path().join("ran");
+        capyctl_config::test_support::write_executable(
+            &bin.join("python3"),
+            format!("#!/bin/sh\ntouch {}\n", marker.display()),
+            0o755,
+        )
+        .unwrap();
+        let executable = bin.join("trtllm-serve");
+        std::fs::write(&executable, "#!/bin/sh\n").unwrap();
+        let site = dir.path().join("lib/python3.12/site-packages");
+        let trt = site.join("tensorrt_llm");
+        std::fs::create_dir_all(trt.join("libs")).unwrap();
+        std::fs::create_dir_all(trt.join("__pycache__")).unwrap();
+        std::fs::write(trt.join("__init__.py"), "from ._utils import *\n").unwrap();
+        std::fs::write(trt.join("libs/libtensorrt_llm.so"), "elf").unwrap();
+        std::fs::write(trt.join("__pycache__/version.cpython-312.pyc"), "x").unwrap();
+        let kernels = site.join("triton_kernels");
+        std::fs::create_dir_all(&kernels).unwrap();
+        std::fs::write(kernels.join("__init__.py"), "").unwrap();
+        std::fs::create_dir_all(site.join("examples")).unwrap();
+        std::fs::write(site.join("examples/quickstart.py"), "print()\n").unwrap();
+        std::fs::create_dir_all(site.join("torch")).unwrap();
+        std::fs::write(site.join("torch/__init__.py"), "").unwrap();
+        let dist = site.join("tensorrt_llm-1.2.1.dist-info");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(
+            dist.join("METADATA"),
+            "Name: tensorrt_llm\nVersion: 1.2.1\n",
+        )
+        .unwrap();
+        let measurer = InstallationMeasurer::new();
+        let first = measurer.measure(Engine::TensorrtLlm, &executable).unwrap();
+        assert_eq!(first.version, "1.2.1");
+        assert_eq!(
+            first.files, 3,
+            "two tensorrt_llm files and one triton_kernels file"
+        );
+        // Bytecode, examples and other packages are not the installation.
+        std::fs::write(trt.join("__pycache__/other.cpython-312.pyc"), "y").unwrap();
+        std::fs::write(trt.join("_utils.pyc"), "y").unwrap();
+        std::fs::write(site.join("examples/quickstart.py"), "changed\n").unwrap();
+        std::fs::write(site.join("torch/__init__.py"), "changed\n").unwrap();
+        assert_eq!(
+            InstallationMeasurer::new()
+                .measure(Engine::TensorrtLlm, &executable)
+                .unwrap(),
+            first
+        );
+        // A rebuilt library, a changed kernel and a removed package each count.
+        std::fs::write(trt.join("libs/libtensorrt_llm.so"), "rebuilt").unwrap();
+        let rebuilt = measurer.measure(Engine::TensorrtLlm, &executable).unwrap();
+        assert_ne!(rebuilt.digest, first.digest, "a rebuilt library");
+        std::fs::write(kernels.join("__init__.py"), "# patched\n").unwrap();
+        let patched = measurer.measure(Engine::TensorrtLlm, &executable).unwrap();
+        assert_ne!(patched.digest, rebuilt.digest, "a changed triton_kernels");
+        std::fs::remove_dir_all(&kernels).unwrap();
+        let without = measurer.measure(Engine::TensorrtLlm, &executable).unwrap();
+        assert_ne!(without.digest, patched.digest, "triton_kernels removed");
+        assert_eq!(without.files, 2);
+        // A `triton_kernels` that is not a directory is refused.
+        std::fs::write(&kernels, "not a package").unwrap();
+        assert_eq!(
+            measurer.measure(Engine::TensorrtLlm, &executable),
+            Err(FingerprintError::UnsafeFile)
+        );
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::write(runtime.path().join(PROBE_SCRIPT), "# probes\n").unwrap();
+        let report = probe_capabilities(
+            Engine::TensorrtLlm,
+            &executable,
+            runtime.path(),
+            None,
+            PROBE_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(report.missing_capabilities(), vec!["deep_park"]);
+        assert!(!marker.exists(), "the interpreter ran");
     }
 
     /// ADR 0031 §3: a virtual environment holding the console script
@@ -1935,7 +2602,12 @@ mod tests {
         let manifest = custom_manifest_with(None, Some("2.2.0"));
         let measure = || {
             measurer
-                .measure_profile(Engine::Custom, &executable, Some(&manifest))
+                .measure_profile(
+                    Engine::Custom,
+                    TensorfoldLine::Python,
+                    &executable,
+                    Some(&manifest),
+                )
                 .unwrap()
         };
         let first = measure();
@@ -1945,7 +2617,12 @@ mod tests {
         assert_eq!(first.files, 6);
         assert_eq!(
             InstallationMeasurer::new()
-                .measure_profile(Engine::Custom, &executable, Some(&manifest))
+                .measure_profile(
+                    Engine::Custom,
+                    TensorfoldLine::Python,
+                    &executable,
+                    Some(&manifest)
+                )
                 .unwrap(),
             first,
             "a measurer without a cache computes the same digest"
@@ -1968,6 +2645,7 @@ mod tests {
             measurer
                 .measure_profile(
                     Engine::Custom,
+                    TensorfoldLine::Python,
                     &executable,
                     Some(&custom_manifest_with(None, None))
                 )
@@ -1994,7 +2672,12 @@ mod tests {
         let measurer = InstallationMeasurer::new();
         let measure = || {
             measurer
-                .measure_profile(Engine::Custom, &executable, Some(&manifest))
+                .measure_profile(
+                    Engine::Custom,
+                    TensorfoldLine::Python,
+                    &executable,
+                    Some(&manifest),
+                )
                 .unwrap()
                 .digest
         };
@@ -2022,7 +2705,12 @@ mod tests {
         std::fs::write(dir.path().join("neighbour"), "not the installation").unwrap();
         let manifest = custom_manifest_with(None, None);
         let alone = InstallationMeasurer::new()
-            .measure_profile(Engine::Custom, &executable, Some(&manifest))
+            .measure_profile(
+                Engine::Custom,
+                TensorfoldLine::Python,
+                &executable,
+                Some(&manifest),
+            )
             .unwrap();
         assert_eq!(alone.files, 1);
         assert_eq!(custom_installation(&executable, Some(&manifest)).root, None);
@@ -2036,6 +2724,7 @@ mod tests {
         assert_eq!(
             InstallationMeasurer::new().measure_profile(
                 Engine::Custom,
+                TensorfoldLine::Python,
                 &executable,
                 Some(&bounded)
             ),
@@ -2044,6 +2733,7 @@ mod tests {
         let registered = registration(
             &InstallationMeasurer::new(),
             Some(Engine::Custom),
+            TensorfoldLine::Python,
             &executable,
             Some(&capyctl_config::custom::CustomProfile::new(bounded)),
         );
@@ -2134,7 +2824,12 @@ mod tests {
         let (_, executable, _, dependency) = custom_venv(dir.path());
         let manifest = custom_manifest_with(None, Some("1.0"));
         let approved = InstallationMeasurer::new()
-            .measure_profile(Engine::Custom, &executable, Some(&manifest))
+            .measure_profile(
+                Engine::Custom,
+                TensorfoldLine::Python,
+                &executable,
+                Some(&manifest),
+            )
             .unwrap()
             .digest;
         let mut custom = capyctl_config::custom::CustomProfile::new(manifest);

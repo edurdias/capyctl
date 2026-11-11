@@ -30,6 +30,9 @@ pub fn local_host_document(raw: &Value) -> Result<Value, ConfigError> {
         "load_report_interval",
         "engine_logs",
         "engine_telemetry",
+        // ADR 0037 §12: `observability.tracing` is role-local, like
+        // `engine_logs`; no deployment is resolved against it.
+        "observability",
         "shutdown",
         "lifecycle",
     ] {

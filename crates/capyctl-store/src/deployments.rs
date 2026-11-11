@@ -6,6 +6,24 @@ use capyctl_domain::{DeploymentId, LifecycleState, OperationId};
 
 use crate::StoreError;
 
+/// SPEC §10, ADR 0014 §2 (#240): the declared router bound, projected from
+/// the pinned revision without re-resolving engine settings or reading a host.
+/// The field already exists in older snapshots; absence keeps the role's default.
+pub(crate) fn request_limit(
+    conn: &rusqlite::Connection,
+    deployment: &str,
+) -> rusqlite::Result<Option<usize>> {
+    let declared: Option<Option<u32>> = conn
+        .prepare_cached(
+            "SELECT CASE WHEN json_valid(e.effective_json) THEN json_extract(e.effective_json,'$.engine_config.common.max_concurrent_requests') END
+             FROM deployments d LEFT JOIN effective_revisions e
+               ON e.deployment_id=d.id AND e.revision=d.revision WHERE d.id=?1",
+        )?
+        .query_row([deployment], |row| row.get(0))
+        .optional()?;
+    Ok(declared.flatten().map(|count| count as usize))
+}
+
 /// A request to accept (admit) a new deployment into the store.
 pub struct AcceptDeployment {
     pub id: DeploymentId,
@@ -82,6 +100,8 @@ fn api_column(
     match value.as_deref() {
         None | Some("chat") => Ok(DeploymentApi::Chat),
         Some("decisions") => Ok(DeploymentApi::Decisions),
+        // ADR 0036 §1.
+        Some("embeddings") => Ok(DeploymentApi::Embeddings),
         Some(_) => Err(invalid_column("api")),
     }
 }
@@ -844,6 +864,13 @@ impl crate::Store {
         api.map(api_column).transpose()
     }
 
+    /// SPEC §10 (#240): this deployment's declared in-flight bound, or
+    /// `None` when undeclared. Host-fixed engine arguments and sampled running
+    /// limits are not deployment admission policy (ADR 0014 §§1–2).
+    pub fn deployment_request_limit(&self, deployment: &str) -> Result<Option<usize>, StoreError> {
+        Ok(request_limit(&self.conn, deployment)?)
+    }
+
     /// Alias resolution: route_model_id → the deployment serving it (no
     /// model-name guessing — SPEC §10).
     pub fn find_deployment_by_route(
@@ -1306,7 +1333,9 @@ mod tests {
                  INSERT INTO deployment_routes(route,deployment_id) VALUES('r',  '{id}');
                  INSERT INTO effective_revisions VALUES('{id}',1,'{{\"api\":\"decisions\"}}','f1'),
                                                        ('{id}',2,'{{\"name\":\"chat\"}}','f2'),
-                                                       ('{id}',3,'not json','f3');"
+                                                       ('{id}',3,'not json','f3'),
+                                                       ('{id}',4,'{{\"api\":\"embeddings\"}}','f4'),
+                                                       ('{id}',5,'{{\"api\":\"bogus\"}}','f5');"
             ))
             .unwrap();
         let api = |store: &Store| {
@@ -1317,7 +1346,12 @@ mod tests {
             api
         };
         assert_eq!(api(&store), DeploymentApi::Decisions);
-        for (revision, expected) in [(2, DeploymentApi::Chat), (3, DeploymentApi::Chat)] {
+        // T47 (ADR 0036 §1): an embeddings revision reads as embeddings.
+        for (revision, expected) in [
+            (2, DeploymentApi::Chat),
+            (3, DeploymentApi::Chat),
+            (4, DeploymentApi::Embeddings),
+        ] {
             store
                 .conn
                 .execute(
@@ -1327,6 +1361,12 @@ mod tests {
                 .unwrap();
             assert_eq!(api(&store), expected, "revision {revision}");
         }
+        // A value no revision can carry is corruption, never chat.
+        store
+            .conn
+            .execute("UPDATE deployments SET revision=5 WHERE id=?1", params![id])
+            .unwrap();
+        assert!(store.deployment_api(&id).is_err());
         assert_eq!(store.deployment_api("absent").unwrap(), None);
     }
 

@@ -7,14 +7,14 @@
 //! (ports, devices, ranks, memory grants, keys) never appear here: adapters
 //! render them from the grant, placement and binding.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Owner decision 2026-10-02: the requests CapyCTL keeps in flight per
-/// deployment (the router's bound), and so the sequences vLLM is started for
-/// (`--max-num-seqs`) unless the deployment sets `max_concurrent_requests` or
-/// the installation's host-fixed arguments set it. One constant, so the
-/// router's bound and the engine's cannot drift apart.
+/// SPEC §10 (#240), owner decision 2026-10-02: the default requests CapyCTL
+/// keeps in flight per deployment when `engine_config.max_concurrent_requests`
+/// is unset. A declared count overrides this bound for every inference API.
+/// Also vLLM's default `--max-num-seqs` unless the deployment or host-fixed
+/// arguments set it; host-fixed arguments do not change router admission.
 pub const MAX_REQUESTS_PER_DEPLOYMENT: u32 = 32;
 
 /// ADR 0023 §4 (amended 2026-10-03, owner decision): the requests TensorFold
@@ -50,6 +50,8 @@ pub enum LaunchSettings {
     Sglang(SglangLaunchSettings),
     Tensorfold(TensorfoldLaunchSettings),
     Llamacpp(LlamacppLaunchSettings),
+    #[serde(rename = "tensorrt-llm")]
+    TensorrtLlm(TensorrtLlmLaunchSettings),
     Custom(CustomLaunchSettings),
 }
 
@@ -60,6 +62,7 @@ impl LaunchSettings {
             Self::Sglang(settings) => &settings.common,
             Self::Tensorfold(settings) => &settings.common,
             Self::Llamacpp(settings) => &settings.common,
+            Self::TensorrtLlm(settings) => &settings.common,
             Self::Custom(settings) => &settings.common,
         }
     }
@@ -70,6 +73,7 @@ impl LaunchSettings {
             Self::Sglang(settings) => &settings.memory,
             Self::Tensorfold(settings) => &settings.memory,
             Self::Llamacpp(settings) => &settings.memory,
+            Self::TensorrtLlm(settings) => &settings.memory,
             Self::Custom(settings) => &settings.memory,
         }
     }
@@ -80,6 +84,7 @@ impl LaunchSettings {
             Self::Sglang(settings) => &mut settings.memory,
             Self::Tensorfold(settings) => &mut settings.memory,
             Self::Llamacpp(settings) => &mut settings.memory,
+            Self::TensorrtLlm(settings) => &mut settings.memory,
             Self::Custom(settings) => &mut settings.memory,
         }
     }
@@ -90,6 +95,7 @@ impl LaunchSettings {
             Self::Sglang(settings) => &settings.extra_args,
             Self::Tensorfold(settings) => &settings.extra_args,
             Self::Llamacpp(settings) => &settings.extra_args,
+            Self::TensorrtLlm(settings) => &settings.extra_args,
             // ADR 0031 §4: the manifest is the whole command.
             Self::Custom(_) => &[],
         }
@@ -101,6 +107,7 @@ impl LaunchSettings {
             Self::Sglang(settings) => &mut settings.provenance,
             Self::Tensorfold(settings) => &mut settings.provenance,
             Self::Llamacpp(settings) => &mut settings.provenance,
+            Self::TensorrtLlm(settings) => &mut settings.provenance,
             Self::Custom(settings) => &mut settings.provenance,
         }
     }
@@ -111,6 +118,7 @@ impl LaunchSettings {
             Self::Sglang(settings) => &settings.provenance,
             Self::Tensorfold(settings) => &settings.provenance,
             Self::Llamacpp(settings) => &settings.provenance,
+            Self::TensorrtLlm(settings) => &settings.provenance,
             Self::Custom(settings) => &settings.provenance,
         }
     }
@@ -127,6 +135,22 @@ pub enum SettingSource {
     /// memory arithmetic, checkpoint size). Not declarable.
     #[serde(rename = "derived")]
     Derived,
+}
+
+/// ADR 0014 §2 / #236: scalar policy keeps its existing wire format.
+/// SGLang alone also accepts independent prefill/decode policy; `true`
+/// retains the engine's native policy rather than forcing a graph backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum CudaGraphs {
+    Boolean(bool),
+    Phases { prefill: bool, decode: bool },
+}
+
+impl From<bool> for CudaGraphs {
+    fn from(enabled: bool) -> Self {
+        Self::Boolean(enabled)
+    }
 }
 
 /// ADR 0014 §2: typed parameters common to every engine family. `None` means
@@ -146,7 +170,7 @@ pub struct CommonEngineSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent_requests: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cuda_graphs: Option<bool>,
+    pub cuda_graphs: Option<CudaGraphs>,
     pub language_model_only: bool,
     pub trust_remote_code: bool,
 }
@@ -257,6 +281,11 @@ impl MemoryRequest {
 pub struct VllmLaunchSettings {
     pub common: CommonEngineSettings,
     pub memory: MemoryRequest,
+    /// ADR 0019 §§3–4 / #225: derivation marker, not an operator setting.
+    /// New derived device requests record zero; older snapshots omit it and
+    /// retain their accepted 75% floor. Declared and unified requests omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_request_floor_pct: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_size_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -415,6 +444,40 @@ impl LlamacppLaunchSettings {
         self.common
             .max_concurrent_requests
             .unwrap_or(LLAMACPP_DEFAULT_PARALLEL)
+    }
+}
+
+/// ADR 0038 §3: a TensorRT-LLM deployment's resolved settings. TensorRT-LLM
+/// has no park strategy (restart-only), so nothing here is derived from
+/// residency. `max_batch_size` is `common.max_concurrent_requests`, else
+/// [`MAX_REQUESTS_PER_DEPLOYMENT`] (owner decision 2026-10-27, question 5);
+/// `common.kv_cache_dtype` is `auto` or `fp8`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TensorrtLlmLaunchSettings {
+    pub common: CommonEngineSettings,
+    pub memory: MemoryRequest,
+    /// ADR 0024, ADR 0038 §14: the deployment's tool-call and reasoning
+    /// parser choice, in TensorRT-LLM's names, or `none`. `None` is `auto`:
+    /// chosen by model family where the checkpoint is read, at launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_parser: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_parser: Option<String>,
+    /// ADR 0038 §3 (owner decision 2026-10-27, question 6):
+    /// `engine_config.tensorrt-llm.llm_api_options`, merged under CapyCTL's
+    /// keys into the file it writes; no reserved key.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    pub llm_api_options: serde_json::Map<String, serde_json::Value>,
+    pub extra_args: Vec<String>,
+    pub provenance: BTreeMap<String, SettingSource>,
+}
+
+impl TensorrtLlmLaunchSettings {
+    /// ADR 0038 §3: the `--max_batch_size` a launch runs.
+    pub fn max_batch_size(&self) -> u32 {
+        self.common
+            .max_concurrent_requests
+            .unwrap_or(MAX_REQUESTS_PER_DEPLOYMENT)
     }
 }
 

@@ -76,6 +76,7 @@ impl CleanupGate {
             tools: None,
             settle: None,
             lmcache: None,
+            engine_tracing: None,
         })
     }
     async fn entered(&self) {
@@ -706,6 +707,7 @@ async fn stop_claim_handoff_waits_for_running_initialize_exit() {
                 tools: None,
                 settle: None,
                 lmcache: None,
+                engine_tracing: None,
             }))
         }),
     )
@@ -1057,6 +1059,7 @@ fn idle_checked_worker(
                 tools: None,
                 settle: None,
                 lmcache: None,
+                engine_tracing: None,
             }))
         }),
     )

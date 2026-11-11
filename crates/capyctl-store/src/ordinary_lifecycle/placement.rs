@@ -81,7 +81,7 @@ pub(super) fn strategy(placement: &Placement) -> Strategy {
 /// 2026-09-23: it is charged its steady (Ready) footprint. Its startup peak is
 /// serialized behind other starts on that host by the activation gate, so
 /// placement only has to know the host can hold everything once Ready.
-fn pending_charges(
+pub(super) fn pending_charges(
     tx: &Transaction<'_>,
 ) -> Result<Vec<(String, String, PhaseFootprint)>, LifecycleError> {
     let rows: Vec<(String, String)> = tx
@@ -232,7 +232,7 @@ pub(super) fn candidates(
         // (declared, measured on this host, or the placeholder), or the whole
         // managed limit for a solo first start.
         let (footprint, whole_host) =
-            super::startup::startup_footprint(tx, deployment_id, revision, &host, &e)?;
+            super::startup::startup_footprint(tx, deployment_id, revision, instance, &host, &e)?;
         let (device_options, preferred_device) =
             device_options(tx, deployment_id, revision, instance, &host)?;
         // ADR 0035 §1a: under `topology: auto` this host's N is chosen now,
@@ -256,7 +256,9 @@ pub(super) fn candidates(
             },
         };
         // ADR 0030 §1: a decisions revision is placed only on a host that
-        // declared `decisions` (ADR 0017), as its latest session recorded it;
+        // declared `decisions` (ADR 0017), and ADR 0036 §1 an embeddings
+        // revision only on one that declared `embeddings`, as its latest
+        // session recorded it;
         // the live session's own declaration still gates the launch before
         // anything is sent. The embedded host is this build and serves them.
         // ADR 0031 §9: likewise a revision on a custom engine needs
@@ -270,9 +272,31 @@ pub(super) fn candidates(
                 |r| r.get::<_, bool>(0),
             )
         };
-        let serves_api = (e.api.is_chat() || declared(capyctl_config::decisions::HOST_CAPABILITY)?)
+        let serves_api = api_capability(e.api).map_or(Ok(true), declared)?
             && (e.profile.engine != capyctl_config::engine_policy::Engine::Custom
                 || declared(capyctl_config::custom::CAPABILITY)?);
+        // ADR 0039 §§4, 15: a native TensorFold revision is placed only on a
+        // host that declared `tensorfold_native`, and a host with `retention:
+        // zero` refuses its compaction and disk-writing options.
+        let native_gate = if e.profile.engine == capyctl_config::engine_policy::Engine::Tensorfold
+            && e.profile.line.is_native()
+        {
+            use capyctl_config::tensorfold_native::{placement_refusal, HOST_CAPABILITY};
+            let (_, host_retention) = host_lmcache_settings(tx, &host, &e)?;
+            let has_native = declared(HOST_CAPABILITY)?;
+            let args: Vec<String> = e
+                .profile
+                .args
+                .iter()
+                .chain(e.engine_config.extra_args())
+                .cloned()
+                .collect();
+            placement_refusal(&args, host_retention, |name| {
+                name == HOST_CAPABILITY && has_native
+            })
+        } else {
+            None
+        };
         // ADR 0033 §§9, 10, 13: `lmcache: required` and `retention: zero`
         // are placed only where they can run, judged again here against the
         // host's current published settings and latest declaration; the host
@@ -295,6 +319,7 @@ pub(super) fn candidates(
             )
         }
         .map(|code| (code, None))
+        .or(native_gate)
         // ADR 0035 §1a: `topology: auto` refused on this host for its GPUs.
         .or(pick.refusal)
         // ADR 0035 §11: a launch on several GPUs goes only to a host that
@@ -545,8 +570,14 @@ fn device_options(
             .map(|id| on_device.host.devices.get(id).map(|p| p.domain.clone()))
             .collect::<Option<Vec<_>>>()
             .ok_or(LifecycleError::CorruptStoredData)?;
-        let (footprint, _) =
-            super::startup::startup_footprint(tx, deployment_id, revision, host, &on_device)?;
+        let (footprint, _) = super::startup::startup_footprint(
+            tx,
+            deployment_id,
+            revision,
+            instance,
+            host,
+            &on_device,
+        )?;
         options.push(DeviceOption {
             device,
             domains,
@@ -1099,6 +1130,7 @@ impl crate::Store {
                     only_ineligible &= code == "host_ineligible";
                     beyond_limits &= beyond;
                     let gate = (capyctl_config::lmcache::PLACEMENT_REFUSALS.contains(&code)
+                        || capyctl_config::tensorfold_native::PLACEMENT_REFUSALS.contains(&code)
                         || PLACEMENT_REFUSALS.contains(&code))
                     .then_some(code);
                     gated = match gated {
@@ -1163,4 +1195,33 @@ pub(crate) fn bounded_deadline(
 ) -> Result<i64, LifecycleError> {
     let (_, e) = effective(tx, fence)?;
     Ok(deadline.min(now.saturating_add(e.request_deadline_ms)))
+}
+
+/// The host capability a revision's API needs to be placed (ADR 0030 §1,
+/// ADR 0036 §1); chat needs none.
+fn api_capability(api: capyctl_config::effective::DeploymentApi) -> Option<&'static str> {
+    use capyctl_config::effective::DeploymentApi;
+    match api {
+        DeploymentApi::Chat => None,
+        DeploymentApi::Decisions => Some(capyctl_config::decisions::HOST_CAPABILITY),
+        DeploymentApi::Embeddings => Some(capyctl_config::embeddings::HOST_CAPABILITY),
+    }
+}
+
+#[cfg(test)]
+mod api_capability_tests {
+    use super::api_capability;
+    use capyctl_config::effective::DeploymentApi;
+
+    // T47 (ADR 0036 §1): an embeddings revision is placed only on a host
+    // that declared `embeddings`, not one that declared only `decisions`.
+    #[test]
+    fn each_api_needs_its_own_host_capability() {
+        assert_eq!(api_capability(DeploymentApi::Chat), None);
+        assert_eq!(api_capability(DeploymentApi::Decisions), Some("decisions"));
+        assert_eq!(
+            api_capability(DeploymentApi::Embeddings),
+            Some("embeddings")
+        );
+    }
 }

@@ -166,6 +166,16 @@ pub(crate) fn charges_device(effective: &capyctl_config::effective::EffectiveDep
 }
 
 impl NativeHostExecution {
+    /// ADR 0017 / #235: only report refusal codes the connected server
+    /// advertised accepting; the list is empty before SessionReady.
+    pub(super) fn server_takes_refusal(&self, reason: &str) -> bool {
+        let server = self
+            .server_capabilities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        capyctl_protocol::capabilities::server_takes_refusal(&server, reason)
+    }
+
     /// ADR 0008 (owner decision 2026-09-23): refuse a launch whose declared
     /// residency depends on a capability the installation's launch-time probe
     /// found missing. Both parking tiers depend on `deep_park` (controller
@@ -195,6 +205,11 @@ impl NativeHostExecution {
             effective.profile.engine,
             std::path::Path::new(&effective.profile.executable),
             &self.runtime_dir,
+            effective
+                .profile
+                .cuda_home
+                .as_deref()
+                .map(std::path::Path::new),
         ) else {
             return Ok(());
         };
@@ -238,6 +253,11 @@ impl NativeHostExecution {
             effective.profile.engine,
             executable,
             &self.runtime_dir,
+            effective
+                .profile
+                .cuda_home
+                .as_deref()
+                .map(std::path::Path::new),
         )?;
         if report.available("deep_park") == Some(false) {
             return Some("capability_missing:deep_park");
@@ -277,6 +297,9 @@ impl NativeHostExecution {
                 crate::runtime_integrity::launch_required_files(&effective),
             )
             .map_err(|_| refused("runtime_integrity"))?;
+            // ADR 0038 §3, §4: the TensorRT-LLM checkpoint's geometry, read
+            // again here, as the full admission reads it.
+            self.admit_tensorrt_llm(&effective)?;
             return self.admit_memory(&effective, command, reading);
         }
         self.admit_launch_full(command, plan, reading)
@@ -310,14 +333,17 @@ impl NativeHostExecution {
         // refuse`. Then the internals this launch depends on are probed.
         // ADR 0018 §3: the registry of the document the plan was approved under.
         let installations = self.installations_for(plan);
-        let installation = installations
-            .verify(
-                &plan.profile_name,
-                effective.profile.engine,
-                std::path::Path::new(&effective.profile.executable),
-                effective.profile.security.installation_drift,
-            )
-            .map_err(refused)?;
+        let installation = match installations.verify(
+            &plan.profile_name,
+            effective.profile.engine,
+            std::path::Path::new(&effective.profile.executable),
+            effective.profile.security.installation_drift,
+        ) {
+            // ADR 0017 / #235: a 0.1.x server cannot decode this refusal.
+            // Preserve its import-failure path without ending the session.
+            Err(reason) if !self.server_takes_refusal(reason) => String::new(),
+            verdict => verdict.map_err(refused)?,
+        };
         // ADR 0033 §§1, 9: then the launch's LMCache, when it has a grant.
         self.admit_lmcache(command, plan, &effective, &installations)?;
         self.launch_capability(
@@ -332,6 +358,10 @@ impl NativeHostExecution {
         // placement or any change).
         self.verify_checkpoint(&effective, plan)
             .map_err(|error| refused(checkpoint_refusal(error)))?;
+        // ADR 0038 §3, §4: a TensorRT-LLM checkpoint, measured as recorded,
+        // whose KV geometry CapyCTL cannot size the pool from (or a served
+        // name that cannot name its link) is refused before any effect.
+        self.admit_tensorrt_llm(&effective)?;
         self.admit_memory(&effective, command, reading)
     }
 
@@ -398,7 +428,9 @@ impl NativeHostExecution {
                 let mut result = owned.unwrap_or_default();
                 // ADR 0033 §§8, 9: the launch's own LMCache report is the
                 // launch's; a Park or Restore result carries only its own.
+                // ADR 0037 §7: likewise its engine tracing decision.
                 result.lmcache = None;
+                result.engine_tracing = String::new();
                 result.state = String::new();
                 result.model_usable = false;
                 result.owned_handle = owned_handle.clone();

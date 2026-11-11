@@ -53,6 +53,39 @@ fn lifecycle_deadline(
         .ok_or_else(|| LifecycleFault::Unavailable("clock overflow".into()))
 }
 
+/// ADR 0036 §§3, 5: the native dimension of the instance incarnation
+/// `generation` of `deployment`, read from the wake canary reference its
+/// launch recorded at readiness. Only an embedding reference holds one; a
+/// completion or decision reference, no reference yet, or an incarnation that
+/// holds no runtime is `None`.
+fn embedding_dimension_in(
+    store: &capyctl_store::Store,
+    deployment: &str,
+    generation: i64,
+) -> Result<Option<usize>, LifecycleFault> {
+    // The instance row names the incarnation's retained binding and launch.
+    let Some(instance) = store
+        .serving_instances(deployment)
+        .map_err(LifecycleFault::from)?
+        .into_iter()
+        .find(|row| row.generation == generation)
+    else {
+        return Ok(None);
+    };
+    let reference = store.wake_canary(
+        deployment,
+        instance.instance_index,
+        generation,
+        &instance.incarnation,
+    )?;
+    Ok(match reference {
+        Some(capyctl_store::wake_canary::WakeCanaryReference::Embedding(embedding)) => {
+            usize::try_from(embedding.dimension).ok()
+        }
+        _ => None,
+    })
+}
+
 /// SPEC §6.3 (W5): a wake is given the deployment's `timeouts.wake` (its
 /// Initialize window when none is recorded), within the request deadline.
 fn wake_deadline(commands: &CoordinatorCommands, deployment: &str) -> Result<i64, LifecycleFault> {
@@ -96,7 +129,8 @@ pub struct CoordinatorLifecycle {
 
 /// How one on-demand activation attempt ended before it was awaited.
 enum Activation {
-    Accepted(OperationHandle),
+    /// ADR 0037 §4: with what it does, a wake or a cold start.
+    Accepted(OperationHandle, capyctl_trace::ActivationKind),
     /// No allowed host fits as the ledger stands (W10 makes room).
     Capacity,
     Fault(LifecycleFault),
@@ -116,6 +150,9 @@ pub struct RoutingSignals {
     /// ADR 0032 §2: whether this host's current session declares the agent's
     /// request abort operation (`request_abort`).
     pub host_request_abort: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    /// ADR 0037 §6: whether this host's current session declares
+    /// `trace_context`.
+    pub host_trace_context: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
 }
 
 impl RoutingSignals {
@@ -134,6 +171,10 @@ impl RoutingSignals {
             host_request_abort: {
                 let sessions = sessions.clone();
                 std::sync::Arc::new(move |host: &str| sessions.supports_request_abort(host))
+            },
+            host_trace_context: {
+                let sessions = sessions.clone();
+                std::sync::Arc::new(move |host: &str| sessions.supports_trace_context(host))
             },
         }
     }
@@ -206,6 +247,14 @@ impl CoordinatorLifecycle {
     /// The switcher request-driven activation uses.
     pub fn switcher(&self) -> std::sync::Arc<crate::switching::Switcher> {
         self.switching.clone()
+    }
+
+    /// ADR 0037 §4: the role's tracing, shared with the coordinator's worker
+    /// and every switcher over it (they read it from the coordinator's
+    /// shared state): activation traces and the steps' host commands.
+    pub fn with_tracing(self, tracing: capyctl_trace::Tracing) -> Self {
+        self.commands.traces().set_tracing(tracing);
+        self
     }
 
     /// W10 gap (b): the router's waiting-request bounds from the host queue
@@ -358,6 +407,9 @@ impl CoordinatorLifecycle {
                 revision,
                 // Decided by the caller once the owner lock is released.
                 request_abort: false,
+                // ADR 0037 §7: the launch's own decision, recorded before its
+                // Ready; untraced when its record is unknown.
+                engine_trace: lane.as_ref().is_some_and(|lane| lane.engine_trace),
             },
             lane,
         ))
@@ -687,10 +739,13 @@ impl CoordinatorLifecycle {
             &self.wake_key(&key, deployment)?,
             wake_deadline(&self.commands, deployment)?,
         )? {
-            return Ok(Activation::Accepted(OperationHandle {
-                operation_id: capyctl_domain::OperationId(receipt.operation_id),
-                deployment_id: deployment.to_string(),
-            }));
+            return Ok(Activation::Accepted(
+                OperationHandle {
+                    operation_id: capyctl_domain::OperationId(receipt.operation_id),
+                    deployment_id: deployment.to_string(),
+                },
+                capyctl_trace::ActivationKind::Wake,
+            ));
         }
         let deadline = lifecycle_deadline(&self.commands, deployment, false)?;
         // Owner decision Q5 (ADR 0013 §9): one instance comes up for the
@@ -717,10 +772,13 @@ impl CoordinatorLifecycle {
             )) => return Ok(Activation::Capacity),
             Err(error) => return Ok(Activation::Fault(error.into())),
         };
-        Ok(Activation::Accepted(OperationHandle {
-            operation_id: capyctl_domain::OperationId(receipt.operation_id().to_string()),
-            deployment_id: deployment.to_string(),
-        }))
+        Ok(Activation::Accepted(
+            OperationHandle {
+                operation_id: capyctl_domain::OperationId(receipt.operation_id().to_string()),
+                deployment_id: deployment.to_string(),
+            },
+            capyctl_trace::ActivationKind::ColdStart,
+        ))
     }
 
     /// Whether the deployment's current revision waits for its checkpoint
@@ -739,6 +797,136 @@ impl CoordinatorLifecycle {
                         && record.state == capyctl_store::checkpoint_digests::DigestState::Pending
                 }))
         })
+    }
+
+    /// SPEC §10 steps 2–7 ([`LifecyclePort::activate_for_request`]), with
+    /// ADR 0037 §4's attributes on the activation's root: what it did
+    /// (`switch` when it released anything, else `wake` or `cold_start`)
+    /// and the victim a switch released.
+    async fn activate(
+        &self,
+        deployment: &str,
+        root: &mut capyctl_trace::Span,
+    ) -> Result<(), LifecycleFault> {
+        use capyctl_store::ordinary_lifecycle::switching::RequestView;
+        // ADR 0013 §8 rule 4: a deployment with a waiting group is never a
+        // victim while it waits.
+        let _waiting = self.switching.wait_for(deployment);
+        // T15: one request-driven activation per deployment at a time.
+        let _turn = self.switching.target_turn(deployment).await;
+        let rounds = self.switching.options().max_rounds.max(1);
+        let mut round = 0;
+        loop {
+            match self
+                .commands
+                .request_view(deployment)
+                .map_err(LifecycleFault::from)?
+            {
+                RequestView::Serving => return Ok(()),
+                // SPEC §6.1: STARTING, WAKING, DRAINING, PARKING and STOPPING
+                // queue. Wait for the transition, then look again.
+                RequestView::InFlight { operation_id } => {
+                    self.wait_terminal(&OperationHandle {
+                        operation_id: capyctl_domain::OperationId(operation_id),
+                        deployment_id: deployment.to_string(),
+                    })
+                    .await?;
+                    continue;
+                }
+                // SPEC §§6.1, 13.2: READY but closed with nothing moving (a
+                // host re-proving readiness): retryable, never an eviction.
+                RequestView::Closed => {
+                    return Err(LifecycleFault::Unavailable(format!(
+                        "dispatch to deployment {deployment} is closed; retry shortly"
+                    )))
+                }
+                RequestView::Idle => {}
+            }
+            // SPEC §6.5, §10: nothing a request may do starts or wakes an
+            // explicit activation; refused before any measuring or switching.
+            self.refuse_explicit_activation(deployment)?;
+            // Final review M11 (found live on the discrete-GPU laptop host): a
+            // revision sized from a checkpoint not yet measured cannot be
+            // placed or started until its digest is recorded (ADR 0014 §7).
+            // Answering that as "no room could be made" (429) sent clients
+            // looking for capacity; it is starting, and a retry succeeds.
+            if self.measuring_checkpoint(deployment)? {
+                return Err(LifecycleFault::Unavailable(format!(
+                    "deployment {deployment} is starting: its checkpoint is being measured \
+                     before it can be sized; retry shortly"
+                )));
+            }
+            if round >= rounds {
+                return Err(LifecycleFault::Blocked(format!(
+                    "no room could be made for deployment {deployment} after {rounds} switch round(s)"
+                )));
+            }
+            // SPEC §6.3: an operator's stop is refused before any victim is
+            // chosen; no incumbent is evicted for a request that cannot run.
+            self.refuse_operator_stop(deployment)?;
+            let room = match self.switching.make_room(deployment).await {
+                Ok(room) => room,
+                Err(crate::switching::NoRoom::Moved) => continue,
+                // A victim's park was refused on its own evidence (it serves
+                // again): the next plan stops it instead (ADR 0013 §8 rule 8,
+                // as the idle policy does), bounded like any other round.
+                Err(crate::switching::NoRoom::Fault(LifecycleFault::Failed(reason))) => {
+                    round += 1;
+                    if round >= rounds {
+                        return Err(LifecycleFault::Failed(reason));
+                    }
+                    continue;
+                }
+                Err(crate::switching::NoRoom::Fault(fault)) => return Err(fault),
+            };
+            // An earlier group on the host may have brought this deployment
+            // up while this one waited its turn (T15): join, never restart.
+            match self
+                .commands
+                .request_view(deployment)
+                .map_err(LifecycleFault::from)?
+            {
+                RequestView::Serving => return Ok(()),
+                RequestView::InFlight { .. } => continue,
+                RequestView::Closed | RequestView::Idle => {}
+            }
+            match self.activate_once(deployment)? {
+                Activation::Accepted(handle, kind) => {
+                    // ADR 0037 §4: a switch released a victim for it.
+                    let victim = room
+                        .as_ref()
+                        .and_then(|r| r.victims.first())
+                        .map(|v| v.deployment_id.clone());
+                    root.set(capyctl_trace::Attr::ActivationKind(match victim {
+                        Some(_) => capyctl_trace::ActivationKind::Switch,
+                        None => kind,
+                    }));
+                    if let Some(victim) = victim {
+                        root.set(capyctl_trace::Attr::Victim(victim));
+                    }
+                    let outcome = self.wait_terminal(&handle).await;
+                    if let Some(room) = room.as_ref().filter(|r| !r.switch_id.is_empty()) {
+                        match &outcome {
+                            Ok(_) => self.switching.completed(room, deployment),
+                            Err(error) => self.switching.activation_failed(
+                                room,
+                                deployment,
+                                &error.to_string(),
+                            ),
+                        }
+                    }
+                    outcome?;
+                    // Loop once more: Ready is confirmed by the request view,
+                    // and a restore or start that ended otherwise is seen.
+                }
+                // Another group took the room first: plan again, bounded.
+                Activation::Capacity => {
+                    round += 1;
+                    continue;
+                }
+                Activation::Fault(fault) => return Err(fault),
+            }
+        }
     }
 
     fn unsupported(what: &str) -> LifecycleFault {
@@ -767,6 +955,13 @@ impl LifecyclePort for CoordinatorLifecycle {
         self.commands
             .read(|store| store.deployment_api(deployment))?
             .ok_or_else(|| LifecycleFault::NotFound(deployment.to_owned()))
+    }
+
+    fn deployment_request_limit(&self, deployment: &str) -> Result<Option<usize>, LifecycleFault> {
+        // ADR 0017 §§2–3: admission is server-owned; an N-1 host needs no
+        // new field or capability to serve this pre-existing engine setting.
+        self.commands
+            .read(|store| store.deployment_request_limit(deployment))
     }
 
     fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, LifecycleFault> {
@@ -940,6 +1135,17 @@ impl LifecyclePort for CoordinatorLifecycle {
         Ok(Some(self.with_abort(projected)))
     }
 
+    /// ADR 0036 §§3, 5: the dimension the incarnation's recorded embedding
+    /// reference holds ([`embedding_dimension_in`]).
+    fn embedding_dimension(
+        &self,
+        deployment: &str,
+        generation: i64,
+    ) -> Result<Option<usize>, LifecycleFault> {
+        let owner = self.commands.owner_for_read()?;
+        embedding_dimension_in(owner.store(), deployment, generation)
+    }
+
     async fn open_instance_lease(
         &self,
         deployment: &str,
@@ -1000,12 +1206,35 @@ impl LifecyclePort for CoordinatorLifecycle {
         &self,
         lease_id: &str,
     ) -> Result<bool, crate::request_leases::LeaseRefused> {
-        self.leases.acknowledge(lease_id).await
+        use capyctl_store::request_lease_cancellations::CancelledEvidence;
+        self.leases
+            .acknowledge(lease_id, CancelledEvidence::Aborted)
+            .await
     }
 
-    /// ADR 0032 §7: against the deployment limit the router grants under
-    /// (`MAX_REQUESTS_PER_DEPLOYMENT`). Restarting also when every instance
-    /// holding the requests is already stopping.
+    /// ADR 0036 §4: the same acknowledgement, with the embeddings receipt.
+    async fn settle_answered_cut(
+        &self,
+        lease_id: &str,
+    ) -> Result<bool, crate::request_leases::LeaseRefused> {
+        use capyctl_store::request_lease_cancellations::CancelledEvidence;
+        self.leases
+            .acknowledge(lease_id, CancelledEvidence::Answered)
+            .await
+    }
+
+    /// ADR 0036 §4: the complete error answer of a cut embeddings request,
+    /// group-committed.
+    async fn answer_cut(
+        &self,
+        lease_id: &str,
+    ) -> Result<bool, crate::request_leases::LeaseRefused> {
+        self.leases.answer_cut(lease_id).await
+    }
+
+    /// ADR 0032 §7, SPEC §10 (#240): restart against the deployment's
+    /// declared limit, or the default when undeclared, just as the router
+    /// grants. Also joins instances already stopping.
     async fn restart_for_held_requests(
         &self,
         deployment_id: &str,
@@ -1013,7 +1242,8 @@ impl LifecyclePort for CoordinatorLifecycle {
         use capyctl_store::ordinary_lifecycle::held_restart::HeldRestartDecision;
         let decision = self.commands.restart_for_held_requests(
             deployment_id,
-            capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT as usize,
+            self.deployment_request_limit(deployment_id)?
+                .unwrap_or(capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT as usize),
         )?;
         Ok(match decision {
             HeldRestartDecision::NotHeld => crate::port::HeldRestart::NotHeld,
@@ -1108,7 +1338,7 @@ impl LifecyclePort for CoordinatorLifecycle {
 
     async fn auto_activate(&self, deployment: &str) -> Result<OperationHandle, LifecycleFault> {
         match self.activate_once(deployment)? {
-            Activation::Accepted(handle) => Ok(handle),
+            Activation::Accepted(handle, _) => Ok(handle),
             Activation::Capacity => {
                 Err(capyctl_store::lifecycle::LifecycleError::CapacityBlocked(None).into())
             }
@@ -1121,113 +1351,52 @@ impl LifecyclePort for CoordinatorLifecycle {
     /// the ledger stands, makes room on one host by switching and activates
     /// it there while holding that host's turn.
     async fn activate_for_request(&self, deployment: &str) -> Result<(), LifecycleFault> {
-        use capyctl_store::ordinary_lifecycle::switching::RequestView;
-        // ADR 0013 §8 rule 4: a deployment with a waiting group is never a
-        // victim while it waits.
-        let _waiting = self.switching.wait_for(deployment);
-        // T15: one request-driven activation per deployment at a time.
-        let _turn = self.switching.target_turn(deployment).await;
-        let rounds = self.switching.options().max_rounds.max(1);
-        let mut round = 0;
-        loop {
-            match self
-                .commands
-                .request_view(deployment)
-                .map_err(LifecycleFault::from)?
-            {
-                RequestView::Serving => return Ok(()),
-                // SPEC §6.1: STARTING, WAKING, DRAINING, PARKING and STOPPING
-                // queue. Wait for the transition, then look again.
-                RequestView::InFlight { operation_id } => {
-                    self.wait_terminal(&OperationHandle {
-                        operation_id: capyctl_domain::OperationId(operation_id),
-                        deployment_id: deployment.to_string(),
-                    })
-                    .await?;
-                    continue;
-                }
-                // SPEC §§6.1, 13.2: READY but closed with nothing moving (a
-                // host re-proving readiness): retryable, never an eviction.
-                RequestView::Closed => {
-                    return Err(LifecycleFault::Unavailable(format!(
-                        "dispatch to deployment {deployment} is closed; retry shortly"
-                    )))
-                }
-                RequestView::Idle => {}
-            }
-            // SPEC §6.5, §10: nothing a request may do starts or wakes an
-            // explicit activation; refused before any measuring or switching.
-            self.refuse_explicit_activation(deployment)?;
-            // Final review M11 (found live on the discrete-GPU laptop host): a
-            // revision sized from a checkpoint not yet measured cannot be
-            // placed or started until its digest is recorded (ADR 0014 §7).
-            // Answering that as "no room could be made" (429) sent clients
-            // looking for capacity; it is starting, and a retry succeeds.
-            if self.measuring_checkpoint(deployment)? {
-                return Err(LifecycleFault::Unavailable(format!(
-                    "deployment {deployment} is starting: its checkpoint is being measured \
-                     before it can be sized; retry shortly"
-                )));
-            }
-            if round >= rounds {
-                return Err(LifecycleFault::Blocked(format!(
-                    "no room could be made for deployment {deployment} after {rounds} switch round(s)"
-                )));
-            }
-            // SPEC §6.3: an operator's stop is refused before any victim is
-            // chosen; no incumbent is evicted for a request that cannot run.
-            self.refuse_operator_stop(deployment)?;
-            let room = match self.switching.make_room(deployment).await {
-                Ok(room) => room,
-                Err(crate::switching::NoRoom::Moved) => continue,
-                // A victim's park was refused on its own evidence (it serves
-                // again): the next plan stops it instead (ADR 0013 §8 rule 8,
-                // as the idle policy does), bounded like any other round.
-                Err(crate::switching::NoRoom::Fault(LifecycleFault::Failed(reason))) => {
-                    round += 1;
-                    if round >= rounds {
-                        return Err(LifecycleFault::Failed(reason));
-                    }
-                    continue;
-                }
-                Err(crate::switching::NoRoom::Fault(fault)) => return Err(fault),
+        self.activate(deployment, &mut capyctl_trace::Span::none())
+            .await
+    }
+
+    /// ADR 0037 §4: the router's `activation` span is the activation trace's
+    /// root (recorded whatever the sampling ratio). While the activation runs
+    /// its deployment is bound to it, so the switch's drain and release and
+    /// the worker's reserve, launch or wake, readiness and canary hang under
+    /// it; it ends here with the activation's outcome.
+    async fn activate_for_request_traced(
+        &self,
+        deployment: &str,
+        mut activation: capyctl_trace::Span,
+    ) -> Result<(), LifecycleFault> {
+        let bound = self.commands.traces().bind(deployment, activation.cx());
+        let result = self.activate(deployment, &mut activation).await;
+        drop(bound);
+        activation.set(capyctl_trace::Attr::Outcome(match &result {
+            Ok(()) => capyctl_trace::Outcome::Completed,
+            Err(LifecycleFault::Uncertain(_)) => capyctl_trace::Outcome::Uncertain,
+            Err(_) => capyctl_trace::Outcome::Failed,
+        }));
+        activation.end();
+        result
+    }
+
+    /// ADR 0037 §6 (ADR 0017): whether the host serving this instance
+    /// incarnation declared `trace_context`. An embedded instance, an unknown
+    /// incarnation and a server without host sessions: no.
+    fn trace_context(&self, deployment: &str, generation: i64) -> bool {
+        let Some(routing) = &self.routing else {
+            return false;
+        };
+        let rows = {
+            let Ok(owner) = self.commands.owner_for_read() else {
+                return false;
             };
-            // An earlier group on the host may have brought this deployment
-            // up while this one waited its turn (T15): join, never restart.
-            match self
-                .commands
-                .request_view(deployment)
-                .map_err(LifecycleFault::from)?
-            {
-                RequestView::Serving => return Ok(()),
-                RequestView::InFlight { .. } => continue,
-                RequestView::Closed | RequestView::Idle => {}
+            match owner.store().serving_instances(deployment) {
+                Ok(rows) => rows,
+                Err(_) => return false,
             }
-            match self.activate_once(deployment)? {
-                Activation::Accepted(handle) => {
-                    let outcome = self.wait_terminal(&handle).await;
-                    if let Some(room) = room.as_ref().filter(|r| !r.switch_id.is_empty()) {
-                        match &outcome {
-                            Ok(_) => self.switching.completed(room, deployment),
-                            Err(error) => self.switching.activation_failed(
-                                room,
-                                deployment,
-                                &error.to_string(),
-                            ),
-                        }
-                    }
-                    outcome?;
-                    // Loop once more: Ready is confirmed by the request view,
-                    // and a restore or start that ended otherwise is seen.
-                }
-                // Another group took the room first: plan again, bounded.
-                Activation::Capacity => {
-                    round += 1;
-                    continue;
-                }
-                Activation::Fault(fault) => return Err(fault),
-            }
-        }
+        };
+        rows.into_iter()
+            .find(|row| row.generation == generation)
+            .and_then(|row| row.remote_host)
+            .is_some_and(|host| (routing.host_trace_context)(&host))
     }
 
     async fn request_transition(
@@ -1360,3 +1529,90 @@ impl LifecyclePort for CoordinatorLifecycle {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod embedding_dimension_tests {
+    use super::embedding_dimension_in;
+    use capyctl_store::wake_canary::{
+        StoredDecisionCanary, StoredEmbeddingCanary, StoredWakeCanary, WakeCanaryReference,
+    };
+    use capyctl_testkit::fixture;
+
+    /// Before the fixture's admission reading (1200), after its observations.
+    const NOW: i64 = 1_100;
+
+    /// One started launch of a fresh deployment, with `reference` recorded
+    /// for it when given: its deployment and generation.
+    fn launch(reference: Option<WakeCanaryReference>) -> (fixture::Fixture, String, i64) {
+        let f = fixture::fixture();
+        let fence = fixture::managed(&f, "embed");
+        let accepted = f
+            .store
+            .accept_start(&f.session, &fence, NOW, NOW + 100_000)
+            .unwrap();
+        f.store
+            .arm_step(&f.session, &accepted.step_id, f.admission())
+            .unwrap();
+        let context = f
+            .store
+            .initialize_execution(&f.session, &accepted.step_id)
+            .unwrap();
+        let generation = context.token.generation;
+        if let Some(reference) = reference {
+            assert!(f
+                .store
+                .record_wake_canary(
+                    &fence.deployment_id,
+                    0,
+                    generation,
+                    &context.incarnation,
+                    &reference,
+                    NOW,
+                )
+                .unwrap());
+        }
+        (f, fence.deployment_id, generation)
+    }
+
+    // T47 (ADR 0036 §§3, 5): an incarnation's recorded embedding reference
+    // gives its native dimension; no reference, a completion or a decision
+    // reference, or another incarnation gives none.
+    #[test]
+    fn the_native_dimension_is_the_embedding_references() {
+        let embedding = WakeCanaryReference::Embedding(StoredEmbeddingCanary {
+            probe_kind: "embedding".into(),
+            probe_version: 1,
+            dimension: 3,
+            vector: vec![0.6, 0.0, -0.8],
+            tolerance: 0.02,
+        });
+        let (f, deployment, generation) = launch(Some(embedding));
+        assert_eq!(
+            embedding_dimension_in(&f.store, &deployment, generation).unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            embedding_dimension_in(&f.store, &deployment, generation + 1).unwrap(),
+            None
+        );
+        let completion = WakeCanaryReference::Completion(StoredWakeCanary {
+            prompt: "Say ready.".into(),
+            tokens: vec![1, 2],
+            text: "ready".into(),
+        });
+        let decision = WakeCanaryReference::Decision(StoredDecisionCanary {
+            probe_version: 1,
+            choice: "yes".into(),
+            probabilities: vec![("yes".into(), 0.6), ("no".into(), 0.4)],
+            tolerance: 0.05,
+        });
+        for reference in [None, Some(completion), Some(decision)] {
+            let (f, deployment, generation) = launch(reference.clone());
+            assert_eq!(
+                embedding_dimension_in(&f.store, &deployment, generation).unwrap(),
+                None,
+                "{reference:?}"
+            );
+        }
+    }
+}

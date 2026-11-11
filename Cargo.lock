@@ -296,7 +296,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "capyctl-adapters"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-agent"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -330,10 +330,11 @@ dependencies = [
  "capyctl-protocol",
  "capyctl-scheduler",
  "capyctl-testkit",
+ "capyctl-trace",
  "futures",
  "hex",
  "libc",
- "prost",
+ "prost 0.13.5",
  "rcgen",
  "reqwest",
  "rusqlite",
@@ -354,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-cli"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -369,6 +370,7 @@ dependencies = [
  "capyctl-router",
  "capyctl-store",
  "capyctl-testkit",
+ "capyctl-trace",
  "clap",
  "clap-markdown",
  "libc",
@@ -386,7 +388,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-config"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "capyctl-domain",
  "hex",
@@ -403,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-controller"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -416,6 +418,7 @@ dependencies = [
  "capyctl-scheduler",
  "capyctl-store",
  "capyctl-testkit",
+ "capyctl-trace",
  "futures",
  "hex",
  "rand_core 0.6.4",
@@ -434,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-domain"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "serde",
@@ -445,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-launchers"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "capyctl-adapters",
  "capyctl-config",
@@ -461,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-management"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "axum",
  "capyctl-adapters",
@@ -490,11 +493,11 @@ dependencies = [
 
 [[package]]
 name = "capyctl-protocol"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "capyctl-config",
  "capyctl-domain",
- "prost",
+ "prost 0.13.5",
  "serde_json",
  "sha2",
  "thiserror",
@@ -507,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-router"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -519,6 +522,7 @@ dependencies = [
  "capyctl-protocol",
  "capyctl-store",
  "capyctl-testkit",
+ "capyctl-trace",
  "futures",
  "reqwest",
  "serde",
@@ -532,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-scheduler"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "capyctl-domain",
  "proptest",
@@ -541,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "capyctl-store"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "capyctl-config",
  "capyctl-domain",
@@ -560,9 +564,10 @@ dependencies = [
 
 [[package]]
 name = "capyctl-testkit"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "async-trait",
+ "axum",
  "capyctl-adapters",
  "capyctl-config",
  "capyctl-controller",
@@ -572,6 +577,22 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "capyctl-trace"
+version = "0.2.0"
+dependencies = [
+ "axum",
+ "capyctl-domain",
+ "http",
+ "opentelemetry",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "prost 0.14.4",
+ "reqwest",
+ "thiserror",
  "tokio",
 ]
 
@@ -1005,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "harness"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "capyctl-adapters",
@@ -1525,6 +1546,46 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "opentelemetry"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c1f1a6ac9c875a4941e4c7c085b61e8f4daa326de03b4701768c3491a6ad9ee"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror",
+]
+
+[[package]]
+name = "opentelemetry-proto"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d576f5dddc3299341bcd85a04be17b2564844c0c9563214f02d85f2524d1afae"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost 0.14.4",
+]
+
+[[package]]
+name = "opentelemetry_sdk"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "372a912db2974d1990207006fd0e3aa0ef3fd4ad3be43c65cfaadf2206866061"
+dependencies = [
+ "futures-channel",
+ "futures-executor",
+ "futures-util",
+ "opentelemetry",
+ "percent-encoding",
+ "portable-atomic",
+ "rand 0.9.5",
+ "thiserror",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1617,6 +1678,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1685,7 +1752,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
 dependencies = [
  "bytes",
- "prost-derive",
+ "prost-derive 0.13.5",
+]
+
+[[package]]
+name = "prost"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
+dependencies = [
+ "bytes",
+ "prost-derive 0.14.4",
 ]
 
 [[package]]
@@ -1701,7 +1778,7 @@ dependencies = [
  "once_cell",
  "petgraph",
  "prettyplease",
- "prost",
+ "prost 0.13.5",
  "prost-types",
  "regex",
  "syn 2.0.119",
@@ -1722,12 +1799,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost-derive"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
+dependencies = [
+ "anyhow",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "prost-types"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
 dependencies = [
- "prost",
+ "prost 0.13.5",
 ]
 
 [[package]]
@@ -2477,7 +2567,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
- "prost",
+ "prost 0.13.5",
  "socket2 0.5.10",
  "tokio",
  "tokio-rustls",

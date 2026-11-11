@@ -64,6 +64,11 @@ pub struct SingleLaunchPlan {
     /// several GPUs of one host, in rank order (rank r on the r-th GPU),
     /// distinct. Empty for a launch on one GPU (encoded exactly as before).
     pub devices: Vec<String>,
+    /// ADR 0019 §§3–4, #225; ADR 0017 §3: derive a vLLM discrete request
+    /// from weights plus KV, without the historical 75% card floor. False
+    /// preserves pre-0.2.0 derivation and encodes no new field or digest bytes.
+    /// True is sent only to a host declaring `vllm_device_request_no_floor`.
+    pub vllm_device_request_no_floor: bool,
 }
 
 /// ADR 0033 §§3, 6, 7: one launch's LMCache server as the store planned it:
@@ -229,6 +234,38 @@ pub fn gguf_to_wire(gguf: &GgufFacts) -> pb::CheckpointGguf {
     wire
 }
 
+/// ADR 0034 §4: one of B and C as the wire carries a known value: positive
+/// and within the store's integers.
+fn pool_basis_value(value: u64) -> Option<u64> {
+    (value > 0 && i64::try_from(value).is_ok()).then_some(value)
+}
+
+/// ADR 0034 §4: B and C a host reported with its checkpoint sizing or
+/// digest, `None` when either is unknown (zero, and from an older host).
+pub fn pool_basis_from_wire(
+    evidence: &pb::CheckpointDigestEvidence,
+) -> Option<capyctl_config::lmcache::PoolBasis> {
+    Some(capyctl_config::lmcache::PoolBasis {
+        bytes_per_token: pool_basis_value(evidence.kv_bytes_per_token)?,
+        context_tokens: pool_basis_value(evidence.pool_context_tokens)?,
+    })
+}
+
+/// ADR 0034 §4: B and C on the wire as `(kv_bytes_per_token,
+/// pool_context_tokens)`; both zero when the host could not compute them,
+/// or either is out of range.
+pub fn pool_basis_to_wire(basis: Result<capyctl_config::lmcache::PoolBasis, String>) -> (u64, u64) {
+    basis
+        .ok()
+        .and_then(|basis| {
+            Some((
+                pool_basis_value(basis.bytes_per_token)?,
+                pool_basis_value(basis.context_tokens)?,
+            ))
+        })
+        .unwrap_or((0, 0))
+}
+
 impl TryFrom<pb::SingleLaunchPlan> for SingleLaunchPlan {
     type Error = GroupIdentityError;
     fn try_from(plan: pb::SingleLaunchPlan) -> Result<Self, Self::Error> {
@@ -327,6 +364,7 @@ impl SingleLaunchPlan {
                 .as_ref()
                 .and_then(|grant| LmcacheGrant::from_wire(grant, plan.service_port)),
             devices: plan.devices,
+            vllm_device_request_no_floor: plan.vllm_device_request_no_floor,
         })
     }
     fn to_wire(&self) -> pb::SingleLaunchPlan {
@@ -357,6 +395,7 @@ impl SingleLaunchPlan {
             checkpoint_gguf: self.checkpoint_gguf.as_ref().map(gguf_to_wire),
             lmcache: self.lmcache.as_ref().map(LmcacheGrant::to_wire),
             devices: self.devices.clone(),
+            vllm_device_request_no_floor: self.vllm_device_request_no_floor,
         }
     }
 }
@@ -634,10 +673,18 @@ pub enum MemberAction {
     /// its own key, and the result carries the answer in `probe_decision`.
     /// It never carries `max_tokens`. `false` is the readiness or completion
     /// probe and encodes and digests exactly as before.
+    ///
+    /// ADR 0036 §§5, 6 (additive): with `embedding`, the embedding probe of
+    /// an embeddings launch: the host's agent sends the fixed
+    /// `/v1/embeddings` probe request to the retained launch on loopback with
+    /// its own key, and the result carries the vector in `probe_embedding`.
+    /// It never carries `max_tokens` or `decision`. `false` encodes and
+    /// digests exactly as before.
     Probe {
         owned_handle: String,
         max_tokens: Option<u32>,
         decision: bool,
+        embedding: bool,
     },
     /// SPEC §§9.1, 10 (protocol version 2): park one retained, drained launch in
     /// place. The process group and its reservation stay owned; a park never
@@ -896,7 +943,17 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
         {
             return Err(GroupIdentityError);
         }
+        // ADR 0036 §§5, 6: the embedding flag rides a probe only, never a
+        // completion or decision probe.
+        if command.probe_embedding
+            && (probe_max_tokens.is_some()
+                || command.probe_decision
+                || !matches!(command.action, Some(Action::ProbeOwnedHandle(_))))
+        {
+            return Err(GroupIdentityError);
+        }
         let probe_decision = command.probe_decision;
+        let probe_embedding = command.probe_embedding;
         let action = match command.action.ok_or(GroupIdentityError)? {
             Action::Prepare(plan) => MemberAction::Prepare(plan.try_into()?),
             Action::Launch(plan) => MemberAction::Launch {
@@ -920,6 +977,7 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
                     owned_handle,
                     max_tokens: probe_max_tokens.take(),
                     decision: probe_decision,
+                    embedding: probe_embedding,
                 }
             }
             Action::ParkOwnedHandle(owned_handle) if owned_handle_ok(&owned_handle) => {
@@ -1051,6 +1109,17 @@ impl MemberCommand {
             },
             // ADR 0030 §4: false (every other probe) is not encoded.
             probe_decision: matches!(self.action, MemberAction::Probe { decision: true, .. }),
+            // ADR 0036 §§5, 6: false (every other probe) is not encoded.
+            probe_embedding: matches!(
+                self.action,
+                MemberAction::Probe {
+                    embedding: true,
+                    ..
+                }
+            ),
+            // ADR 0037 §6: the trace context is envelope, never command: the
+            // typed command (journaled and digested) never carries one.
+            trace_parent: String::new(),
         }
     }
 
@@ -1080,6 +1149,56 @@ impl MemberCommand {
         }
         Ok(())
     }
+}
+
+/// ADR 0037 §6: a lifecycle command as a host receives it: the typed command,
+/// exactly as [`MemberCommand::try_from`] decodes it, and the envelope's
+/// trace context. The context is not part of the command: the command's
+/// digest, its journal record and its replay never carry it, so a command
+/// replayed after a restart has none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TracedCommand {
+    pub command: MemberCommand,
+    /// The server step's W3C `traceparent`, when the envelope carried a
+    /// well-formed one; a malformed value is ignored, never an error.
+    pub trace_parent: Option<String>,
+}
+
+impl TryFrom<pb::ServerToAgent> for TracedCommand {
+    type Error = GroupIdentityError;
+    fn try_from(mut message: pb::ServerToAgent) -> Result<Self, Self::Error> {
+        let trace_parent = match &mut message.msg {
+            Some(pb::server_to_agent::Msg::ExecuteMember(command)) => {
+                Some(std::mem::take(&mut command.trace_parent)).filter(|t| is_traceparent(t))
+            }
+            _ => None,
+        };
+        Ok(Self {
+            command: MemberCommand::try_from(message)?,
+            trace_parent,
+        })
+    }
+}
+
+/// ADR 0037 §6: a version-00 W3C `traceparent` as the server writes it:
+/// `00-<32 hex>-<16 hex>-<2 hex>`, lowercase, neither ID all zeros.
+pub fn is_traceparent(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let hex = |range: std::ops::Range<usize>| {
+        bytes[range.clone()]
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+            && bytes[range].iter().any(|b| *b != b'0')
+    };
+    bytes.len() == 55
+        && bytes.starts_with(b"00-")
+        && bytes[35] == b'-'
+        && bytes[52] == b'-'
+        && hex(3..35)
+        && hex(36..52)
+        && bytes[53..55]
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
 }
 
 fn group_wire(plan: &GroupPlan) -> pb::GroupLaunchPlan {
@@ -1119,6 +1238,18 @@ fn group_wire(plan: &GroupPlan) -> pb::GroupLaunchPlan {
 /// ADR 0014 amendment A12: the most kernel build spans one launch reports.
 pub const MAX_KERNEL_BUILDS: usize = 64;
 
+/// ADR 0037 §7: the states a LaunchSingle result reports for its engine
+/// tracing: `on`, or why it is off
+/// (`capyctl_adapters::engine_tracing::TracingOutcome::code`).
+pub const ENGINE_TRACING_STATES: [&str; 6] = [
+    "on",
+    "host_off",
+    "engine_unsupported",
+    "not_installed",
+    "group",
+    "retention_zero",
+];
+
 /// ADR 0028 §9 (decided 2026-10-06): the most tokens a completion probe may
 /// ask for. Readiness asks for 1 and the wake canary for 8; the probe stays a
 /// short, bounded request either way.
@@ -1137,6 +1268,15 @@ pub const DECISION_PROBE_OPTION_MAX_BYTES: usize = 64;
 /// ADR 0030 §4: the version of the fixed decision probe this protocol knows.
 pub const DECISION_PROBE_VERSION: u32 = 1;
 
+/// ADR 0036 §§5, 6: the version of the fixed embedding probe this protocol
+/// knows (the adapters' `embedding_probe::VERSION`).
+pub const EMBEDDING_PROBE_VERSION: u32 = 1;
+
+/// ADR 0036 §§5, 6: the longest vector an embedding probe's answer may carry.
+/// The largest model ADR 0036 qualifies answers 4096 values; the bound keeps
+/// a result small (256 KiB of float32) whatever a host relays.
+pub const EMBEDDING_PROBE_MAX_DIMENSION: usize = 65_536;
+
 /// ADR 0030 §4: a decision probe's answer is well-formed: this probe version,
 /// 1..=16 unique, non-empty, bounded option names, each probability finite
 /// within [0, 1], and the choice one of the options.
@@ -1152,6 +1292,23 @@ fn decision_evidence_ok(evidence: &pb::DecisionProbeEvidence) -> bool {
                 && seen.insert(p.option.as_str())
         })
         && seen.contains(evidence.choice.as_str())
+}
+
+/// ADR 0036 §5: an embedding probe's answer is well-formed: this probe
+/// version, 1..=[`EMBEDDING_PROBE_MAX_DIMENSION`] finite values whose
+/// Euclidean norm is finite and above 1e-6.
+fn embedding_evidence_ok(evidence: &pb::EmbeddingProbeEvidence) -> bool {
+    let norm = evidence
+        .vector
+        .iter()
+        .map(|value| f64::from(*value).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    evidence.probe_version == EMBEDDING_PROBE_VERSION
+        && (1..=EMBEDDING_PROBE_MAX_DIMENSION).contains(&evidence.vector.len())
+        && evidence.vector.iter().all(|value| value.is_finite())
+        && norm.is_finite()
+        && norm > 1e-6
 }
 
 /// SPEC §13: shape and exact command binding only. The caller must establish the
@@ -1217,6 +1374,14 @@ pub fn validate_result(
     {
         return Err(GroupIdentityError);
     }
+    // ADR 0037 §7: a LaunchSingle's engine tracing decision, one closed
+    // state; nothing on any other result.
+    if !result.engine_tracing.is_empty()
+        && !(matches!(command.action, MemberAction::LaunchSingle(_))
+            && ENGINE_TRACING_STATES.contains(&result.engine_tracing.as_str()))
+    {
+        return Err(GroupIdentityError);
+    }
     // ADR 0028 §11: escalation is evidence of a completed Terminate only.
     if result.escalated
         && !(matches!(command.action, MemberAction::Terminate { .. })
@@ -1258,6 +1423,21 @@ pub fn validate_result(
         if !(matches!(command.action, MemberAction::Probe { decision: true, .. })
             && result.state == "completed"
             && decision_evidence_ok(evidence))
+        {
+            return Err(GroupIdentityError);
+        }
+    }
+    // ADR 0036 §§5, 6: an embedding answer belongs to a completed embedding
+    // probe only, and must be well-formed.
+    if let Some(evidence) = &result.probe_embedding {
+        if !(matches!(
+            command.action,
+            MemberAction::Probe {
+                embedding: true,
+                ..
+            }
+        ) && result.state == "completed"
+            && embedding_evidence_ok(evidence))
         {
             return Err(GroupIdentityError);
         }
@@ -1515,7 +1695,13 @@ pub const CHECKPOINT_REFUSALS: &[&str] = &[
 /// launch's allocation there with its free reserve kept, now or beside every
 /// claimed launch. ADR 0029 §6: `engine_config_file`: a llama.cpp launch on a
 /// host where `/etc/llama.cpp/config.ini` exists (llama-server would fill
-/// every option the command leaves unset from it).
+/// every option the command leaves unset from it). ADR 0038 §16:
+/// `kv_geometry_unsupported`: a TensorRT-LLM launch whose checkpoint, read on
+/// the launching host, has a KV geometry CapyCTL cannot size its pool from;
+/// `served_name_unsupported`: a TensorRT-LLM launch whose served name is not
+/// one path component.
+/// ADR 0017 / #235: `installation_unsupported:editable` is sent only toward
+/// a server whose SessionReady advertises `installation_unsupported`.
 pub const POLICY_REFUSALS: &[&str] = &[
     "checkpoint_mismatch",
     "checkpoint_unverified",
@@ -1530,6 +1716,9 @@ pub const POLICY_REFUSALS: &[&str] = &[
     "capability_missing:deep_park",
     "capability_missing:core",
     "engine_config_file",
+    "installation_unsupported:editable",
+    capyctl_config::tensorrt_llm::KV_GEOMETRY_UNSUPPORTED,
+    capyctl_config::tensorrt_llm::SERVED_NAME_UNSUPPORTED,
 ];
 
 /// Whether `reason` is one of the closed [`POLICY_REFUSALS`].
@@ -1885,12 +2074,17 @@ fn validate_checkpoint(
     let model_type = evidence.model_type.is_empty()
         || capyctl_config::lmcache::table_key(&evidence.model_type)
             == Some(evidence.model_type.as_str());
+    // ADR 0034 §4: B and C come together: both known (positive, within the
+    // store's integers) or both unknown (zero, and from an older host).
+    let pool_basis = pool_basis_from_wire(evidence).is_some()
+        || (evidence.kv_bytes_per_token == 0 && evidence.pool_context_tokens == 0);
     let measured = capyctl_config::effective::is_checkpoint_digest(&evidence.digest)
         && evidence.weights_bytes >= 0
         && u64::try_from(evidence.weights_bytes).is_ok_and(|w| w <= evidence.total_bytes)
         && evidence.file_count <= 65_536
         && evidence.reason.is_empty()
         && model_type
+        && pool_basis
         && evidence.state_slot_bytes.is_none_or(|bytes| bytes > 0)
         // ADR 0028 §5: a layout splits no more than the weights measured.
         && evidence.layout.as_ref().is_none_or(|layout| {
@@ -1924,6 +2118,7 @@ fn validate_checkpoint(
                 && evidence.file_count <= 65_536
                 && evidence.reason.is_empty()
                 && model_type
+                && pool_basis
                 && !evidence.full_rehash
                 && evidence.state_slot_bytes.is_none()
                 && evidence.layout.is_none()
@@ -1957,6 +2152,8 @@ fn validate_checkpoint(
                 && evidence.tables.is_none()
                 && evidence.gguf.is_none()
                 && evidence.model_type.is_empty()
+                && evidence.kv_bytes_per_token == 0
+                && evidence.pool_context_tokens == 0
                 && CHECKPOINT_REFUSALS.contains(&evidence.reason.as_str())
         }
         _ => false,

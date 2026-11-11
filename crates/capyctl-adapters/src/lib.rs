@@ -6,12 +6,17 @@ pub mod completion_probe;
 pub mod custom;
 // ADR 0030 §3: the fixed decision probe of a decisions deployment.
 pub mod decision_probe;
+mod embedding_answer;
+pub mod embedding_probe;
+pub mod embedding_request;
 pub mod engine_env;
 // SPEC §13.3 / T21: engine logs redacted as written, read back as a bounded tail.
 pub mod engine_log;
 // Owner decision 2026-10-22: the engines' own usage reporting, off unless
 // the host allows it.
 pub mod engine_telemetry;
+// ADR 0037 §§7, 11: the engines' own spans, off unless the host turns them on.
+pub mod engine_tracing;
 pub mod forward;
 // ADR 0028 §10: the engine-neutral arguments of a multi-node group member.
 pub mod group;
@@ -25,6 +30,8 @@ pub mod lmcache;
 // SPEC §9.1, §13.3 / T21 T37: the owner-only rule for capyctl's runtime helpers.
 pub mod owner_only;
 pub mod policy;
+// ADR 0038 §9: a launch's descendants outside its process group.
+pub mod process_tree;
 pub mod protected;
 pub mod resolve;
 // SPEC §10 (issue #220): an inference request as the caller sent it.
@@ -33,6 +40,8 @@ pub mod sglang;
 // SPEC §13.2 / T20: the once-only guard of a launch's residency steps.
 pub(crate) mod step_fence;
 pub mod tensorfold;
+// ADR 0038: TensorRT-LLM's `trtllm-serve` (kind `tensorrt-llm`).
+pub mod tensorrt_llm;
 pub mod traits;
 pub mod vllm;
 

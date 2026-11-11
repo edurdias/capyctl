@@ -1,14 +1,15 @@
 //! T45 (ADR 0033 §1): LMCache measured for `engine add` and checked by shape
 //! at launch, against fake environments built from excerpts of the real
-//! LMCache 0.5.6, vLLM 0.32.0 and SGLang 0.5.22 sources
+//! LMCache 0.5.6/0.5.7, vLLM 0.32.0 and SGLang 0.5.22 sources
 //! (`tests/fixtures/lmcache`). CPU tests only; they are not qualification.
 
 use capyctl_agent::installation::InstallationMeasurer;
 use capyctl_agent::lmcache_install::{
     check_lmcache, measure_lmcache, LmcacheCheckFailure, LmcacheInstall,
 };
+use capyctl_config::effective::Residency;
 use capyctl_config::engine_policy::Engine;
-use capyctl_config::lmcache::{LmcacheOffReason, LmcacheRegistration};
+use capyctl_config::lmcache::{LmcacheOffReason, LmcacheRegistration, TransferMode};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +19,13 @@ const ENTRY_POINTS: &str = "[console_scripts]\n\
 lmcache = lmcache.cli.main:main\n\
 lmcache_controller = lmcache.v1.api_server.__main__:main\n\
 lmcache_server = lmcache.v1.server.__main__:main\n";
+
+fn residency_for_transfer(transfer: TransferMode) -> Residency {
+    match transfer {
+        TransferMode::LmcacheDriven => Residency::RestartOnly,
+        TransferMode::EngineDriven => Residency::Deep,
+    }
+}
 
 fn copy_tree(from: &Path, to: &Path) {
     for entry in std::fs::read_dir(from).unwrap() {
@@ -32,7 +40,7 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
-/// A virtual environment with the engine and LMCache 0.5.6. Every program in
+/// A virtual environment with the engine and a versioned LMCache fixture. Every program in
 /// `bin` (the interpreter included) records that it ran and fails, so a
 /// check that executed anything is caught.
 struct Env {
@@ -45,6 +53,10 @@ struct Env {
 
 impl Env {
     fn new(engine: Engine) -> Self {
+        Self::with_lmcache(engine, "0.5.6")
+    }
+
+    fn with_lmcache(engine: Engine, version: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("venv");
         let site = root.join("lib/python3.12/site-packages");
@@ -67,7 +79,10 @@ impl Env {
             _ => "vllm-0.32.0",
         };
         copy_tree(&Path::new(FIXTURES).join(engine_fixture), &site);
-        copy_tree(&Path::new(FIXTURES).join("lmcache-0.5.6"), &site);
+        copy_tree(
+            &Path::new(FIXTURES).join(format!("lmcache-{version}")),
+            &site,
+        );
         let env = Self {
             _dir: dir,
             root,
@@ -75,7 +90,7 @@ impl Env {
             engine,
             measurer: InstallationMeasurer::new(),
         };
-        env.set_version("0.5.6");
+        env.set_version(version);
         env
     }
 
@@ -131,19 +146,43 @@ impl Env {
         measured.registration()
     }
 
+    /// The check of a launch with `lmcache_driven` transfer (a
+    /// `restart_only` launch today, ADR 0034 §1).
     fn check(
         &self,
         registered: Option<&LmcacheRegistration>,
     ) -> Result<LmcacheInstall, LmcacheCheckFailure> {
-        let result = check_lmcache(&self.measurer, self.engine, &self.executable(), registered);
+        self.check_as(registered, TransferMode::LmcacheDriven)
+    }
+
+    /// The check of a launch rendering `transfer`.
+    fn check_as(
+        &self,
+        registered: Option<&LmcacheRegistration>,
+        transfer: TransferMode,
+    ) -> Result<LmcacheInstall, LmcacheCheckFailure> {
+        let result = check_lmcache(
+            &self.measurer,
+            self.engine,
+            &self.executable(),
+            registered,
+            residency_for_transfer(transfer),
+        );
         self.assert_nothing_ran();
         result
     }
 
     /// The check with a registration of what is there now.
     fn check_registered(&self) -> Result<LmcacheInstall, LmcacheCheckFailure> {
+        self.check_registered_as(TransferMode::LmcacheDriven)
+    }
+
+    fn check_registered_as(
+        &self,
+        transfer: TransferMode,
+    ) -> Result<LmcacheInstall, LmcacheCheckFailure> {
         let registration = self.register();
-        self.check(Some(&registration))
+        self.check_as(Some(&registration), transfer)
     }
 
     fn assert_nothing_ran(&self) {
@@ -155,7 +194,11 @@ impl Env {
 }
 
 fn check_failed(env: &Env) -> String {
-    let failure = env.check_registered().unwrap_err();
+    check_failed_as(env, TransferMode::LmcacheDriven)
+}
+
+fn check_failed_as(env: &Env, transfer: TransferMode) -> String {
+    let failure = env.check_registered_as(transfer).unwrap_err();
     assert_eq!(failure.reason, LmcacheOffReason::CheckFailed, "{failure}");
     assert!(
         !failure.detail.contains(&*env.root.to_string_lossy()),
@@ -163,6 +206,8 @@ fn check_failed(env: &Env) -> String {
     );
     failure.detail
 }
+
+const BOTH_MODES: [TransferMode; 2] = [TransferMode::LmcacheDriven, TransferMode::EngineDriven];
 
 // T45 (ADR 0033 §1): vLLM 0.32.0 with LMCache 0.5.6 passes, reports the
 // version and the digest `engine add` records, and no drift.
@@ -178,6 +223,12 @@ fn lmcache_check_passes_on_vllm_with_lmcache_056() {
     let install = env.check(Some(&registration)).unwrap();
     assert_eq!(install.version, "0.5.6");
     assert_eq!(install.digest, registration.digest);
+    assert!(!install.drifted);
+    // T45 (ADR 0034 §1): the release carries what engine-driven transfer
+    // needs, so a parking launch passes too.
+    let install = env
+        .check_as(Some(&registration), TransferMode::EngineDriven)
+        .unwrap();
     assert!(!install.drifted);
 }
 
@@ -195,9 +246,88 @@ fn lmcache_check_passes_on_sglang_0522_with_lmcache_056() {
         "lmcache/integration/sglang/multi_process_adapter.py",
         "class LMCacheMPConnector:\n    pass\n",
     );
-    let install = env.check_registered().unwrap();
-    assert_eq!(install.version, "0.5.6");
-    assert!(!install.drifted);
+    for transfer in BOTH_MODES {
+        let install = env.check_registered_as(transfer).unwrap();
+        assert_eq!(install.version, "0.5.6");
+        assert!(!install.drifted);
+    }
+}
+
+// T45 (ADR 0033 §5, ADR 0034 §1): both real release shapes preserve salt
+// isolation for both engines and both transfer modes, without executing Python.
+#[test]
+fn lmcache_versioned_source_fixtures_preserve_salt() {
+    for version in ["0.5.6", "0.5.7"] {
+        for engine in [Engine::Vllm, Engine::Sglang] {
+            let env = Env::with_lmcache(engine, version);
+            let registration = env.register();
+            assert_eq!(registration.version, version);
+            for transfer in BOTH_MODES {
+                let install = env.check_as(Some(&registration), transfer).unwrap();
+                assert_eq!(install.version, version);
+                assert_eq!(install.digest, registration.digest);
+                assert!(!install.drifted);
+            }
+        }
+    }
+}
+
+// T45 (ADR 0033 §5): accepting the 0.5.7 identity and factory shapes must
+// not accept a salt dropped at any new hop, including the factory's return.
+#[test]
+fn lmcache_057_refuses_dropped_salt() {
+    const API: &str = "lmcache/v1/distributed/api.py";
+    const IPC: &str = "lmcache/v1/multiprocess/custom_types.py";
+    const CONNECTOR: &str = "lmcache/integration/sglang/unified_lmcache_mp_connector.py";
+    let cases = [
+        (API, "    cache_salt: str = \"\"\n", ""),
+        (API, "    identity: ObjectKeyIdentity\n", ""),
+        (API, "return self.identity.cache_salt", "return \"\""),
+        (
+            API,
+            "    @property\n    def cache_salt(self)",
+            "    def cache_salt(self)",
+        ),
+        (
+            API,
+            "cache_salt=cache_salt if cache_salt is not None else \"\",",
+            "cache_salt=\"\",",
+        ),
+        (
+            API,
+            "cache_salt=cache_salt\n                if cache_salt is not None\n                else identity.cache_salt,",
+            "cache_salt=\"\",",
+        ),
+        (
+            API,
+            "object.__setattr__(self, \"identity\", identity)",
+            "object.__setattr__(self, \"identity\", None)",
+        ),
+        (API, "    cache_salt = ipc_key.cache_salt\n", "    cache_salt = \"\"\n"),
+        (API, "                cache_salt=cache_salt,\n", ""),
+        (IPC, "    cache_salt: str = \"\"\n", ""),
+        (IPC, "            cache_salt=cache_salt,\n", "            cache_salt=\"\",\n"),
+        (
+            CONNECTOR,
+            "            cache_salt=operation.cache_salt,\n",
+            "            cache_salt=\"\",\n",
+        ),
+    ];
+    for (file, from, to) in cases {
+        for engine in [Engine::Vllm, Engine::Sglang] {
+            if engine == Engine::Vllm
+                && (file == CONNECTOR || (file == IPC && from.contains("cache_salt=cache_salt")))
+            {
+                continue;
+            }
+            for transfer in BOTH_MODES {
+                let env = Env::with_lmcache(engine, "0.5.7");
+                env.edit(file, from, to);
+                let detail = check_failed_as(&env, transfer);
+                assert!(detail.contains("no cache_salt support"), "{file}: {detail}");
+            }
+        }
+    }
 }
 
 /// A later 0.5.x release, reshaped where a release may reshape: quoted
@@ -240,8 +370,10 @@ fn lmcache_check_passes_on_a_later_05_release() {
                 "            cache_salt=(\n                operation.cache_salt\n            ),\n",
             );
         }
-        let install = env.check_registered().unwrap();
-        assert_eq!(install.version, "0.5.9");
+        for transfer in BOTH_MODES {
+            let install = env.check_registered_as(transfer).unwrap();
+            assert_eq!(install.version, "0.5.9");
+        }
     }
 }
 
@@ -267,7 +399,9 @@ fn lmcache_check_passes_on_a_later_sglang_shape() {
         "build_cache_salt(\n                    req.cache_salt, req.extra_key\n                )",
         "build_cache_salt(None, req.extra_key)",
     );
-    env.check_registered().unwrap();
+    for transfer in BOTH_MODES {
+        env.check_registered_as(transfer).unwrap();
+    }
 }
 
 // T45 (ADR 0033 §1): each missing file fails `check_failed`, naming it.
@@ -293,12 +427,21 @@ fn lmcache_check_names_each_missing_file() {
     ];
     for (engine, specific) in [(Engine::Vllm, &vllm), (Engine::Sglang, &sglang)] {
         for file in common.iter().chain(specific.iter()) {
-            let env = Env::new(engine);
-            env.remove(file);
-            let detail = check_failed(&env);
-            assert!(detail.contains(&format!("{file} is missing")), "{detail}");
+            for transfer in BOTH_MODES {
+                let env = Env::new(engine);
+                env.remove(file);
+                let detail = check_failed_as(&env, transfer);
+                assert!(detail.contains(&format!("{file} is missing")), "{detail}");
+            }
         }
     }
+    // T45 (ADR 0034 §1): vLLM's multi-process adapter is needed only by a
+    // launch with engine-driven transfer.
+    let env = Env::new(Engine::Vllm);
+    env.remove("lmcache/integration/vllm/vllm_multi_process_adapter.py");
+    env.check_registered().unwrap();
+    assert!(check_failed_as(&env, TransferMode::EngineDriven)
+        .contains("lmcache/integration/vllm/vllm_multi_process_adapter.py is missing"));
     // The console script and its declaration.
     let env = Env::new(Engine::Vllm);
     std::fs::remove_file(env.root.join("bin/lmcache")).unwrap();
@@ -356,15 +499,28 @@ fn lmcache_check_names_each_missing_server_option() {
             "\"--eviction-policy\"",
             "--eviction-policy",
         ),
+        // T45 (ADR 0034 §4): rendered for every launch.
+        (
+            "lmcache/v1/distributed/config.py",
+            "\"--eviction-trigger-watermark\"",
+            "--eviction-trigger-watermark",
+        ),
+        (
+            "lmcache/v1/distributed/config.py",
+            "\"--eviction-ratio\"",
+            "--eviction-ratio",
+        ),
     ];
     for (file, declared, option) in cases {
-        let env = Env::new(Engine::Vllm);
-        env.edit(file, declared, "\"--renamed\"");
-        let detail = check_failed(&env);
-        assert!(
-            detail.contains(&format!("{file} declares no {option} option")),
-            "{detail}"
-        );
+        for transfer in BOTH_MODES {
+            let env = Env::new(Engine::Vllm);
+            env.edit(file, declared, "\"--renamed\"");
+            let detail = check_failed_as(&env, transfer);
+            assert!(
+                detail.contains(&format!("{file} declares no {option} option")),
+                "{detail}"
+            );
+        }
     }
     let env = Env::new(Engine::Vllm);
     env.edit(
@@ -661,6 +817,7 @@ fn lmcache_check_refuses_engines_without_an_integration() {
             engine,
             &env.executable(),
             Some(&registration),
+            Residency::Deep,
         )
         .unwrap_err();
         assert_eq!(failure.reason, LmcacheOffReason::EngineUnsupported);
@@ -712,6 +869,7 @@ fn a_drifted_lmcache_is_reported_in_the_profile_status() {
             env.engine,
             &env.executable(),
             Some(&registration),
+            Residency::RestartOnly,
             policy,
         );
         env.assert_nothing_ran();
@@ -756,4 +914,183 @@ fn a_drifted_lmcache_is_reported_in_the_profile_status() {
         "",
         "measured as registered again, the drift clears"
     );
+}
+
+// T45 (ADR 0034 §1): a launch that renders engine-driven transfer needs the
+// server's `--supported-transfer-mode` with `engine_driven`, and the engine's
+// connector reading `lmcache.mp.mp_transfer_mode` (vLLM's adapter through
+// `ExtraConfigDefault` under the `lmcache.mp.` prefix, SGLang's unified
+// connector by its key). A release without one fails `check_failed`
+// naming it for such a launch only; a `restart_only` (lmcache-driven) launch
+// on the same release still passes.
+#[test]
+fn lmcache_check_names_each_missing_engine_driven_piece() {
+    const MP_CONFIG: &str = "lmcache/v1/multiprocess/config.py";
+    const ADAPTER: &str = "lmcache/integration/vllm/vllm_multi_process_adapter.py";
+    const CONNECTOR: &str = "lmcache/integration/sglang/unified_lmcache_mp_connector.py";
+    let server = |env: &Env| {
+        env.edit(
+            MP_CONFIG,
+            "choices=[\"lmcache_driven\", \"engine_driven\", \"auto\"],",
+            "choices=[\"lmcache_driven\"],",
+        )
+    };
+    let server_option =
+        |env: &Env| env.edit(MP_CONFIG, "\"--supported-transfer-mode\"", "\"--mode\"");
+    let vllm_member = |env: &Env| env.edit(ADAPTER, "    mp_transfer_mode = \"auto\"\n", "");
+    let vllm_prefix = |env: &Env| {
+        env.edit(
+            ADAPTER,
+            "_EXTRA_CONFIG_KEY_PREFIX = \"lmcache.mp.\"",
+            "_EXTRA_CONFIG_KEY_PREFIX = \"lmcache.\"",
+        )
+    };
+    let sglang_key = |env: &Env| {
+        env.edit(
+            CONNECTOR,
+            "\"lmcache.mp.mp_transfer_mode\"",
+            "\"lmcache.mp.transfer\"",
+        )
+    };
+    let missing = format!(
+        "{MP_CONFIG} declares no --supported-transfer-mode option with choice engine_driven"
+    );
+    type Removal<'a> = &'a dyn Fn(&Env);
+    let cases: [(Engine, Removal, String); 7] = [
+        (Engine::Vllm, &server, missing.clone()),
+        (Engine::Vllm, &server_option, missing.clone()),
+        (Engine::Sglang, &server, missing.clone()),
+        (Engine::Sglang, &server_option, missing),
+        (
+            Engine::Vllm,
+            &vllm_member,
+            format!("{ADAPTER} declares no mp_transfer_mode in ExtraConfigDefault"),
+        ),
+        (
+            Engine::Vllm,
+            &vllm_prefix,
+            format!("{ADAPTER} reads its extra configuration under no lmcache.mp. prefix"),
+        ),
+        (
+            Engine::Sglang,
+            &sglang_key,
+            format!("{CONNECTOR} does not read lmcache.mp.mp_transfer_mode"),
+        ),
+    ];
+    for (engine, remove, named) in cases {
+        let env = Env::new(engine);
+        remove(&env);
+        let detail = check_failed_as(&env, TransferMode::EngineDriven);
+        assert!(detail.contains(&named), "{engine:?}: {detail}");
+        env.check_registered().unwrap();
+    }
+    // The choice's own list is read, not the option's help text, and a
+    // reshaped call (single quotes, a tuple, comments) still passes.
+    let env = Env::new(Engine::Vllm);
+    env.edit(
+        MP_CONFIG,
+        "choices=[\"lmcache_driven\", \"engine_driven\", \"auto\"],",
+        "choices=('lmcache_driven', 'auto'),",
+    );
+    assert!(check_failed_as(&env, TransferMode::EngineDriven).contains("with choice engine_driven"));
+    env.edit(MP_CONFIG, "'auto')", "'engine_driven', 'auto')");
+    env.check_registered_as(TransferMode::EngineDriven).unwrap();
+    let env = Env::new(Engine::Sglang);
+    env.edit(
+        CONNECTOR,
+        "get_extra_config_value(  # type: ignore[attr-defined]\n            \"lmcache.mp.mp_transfer_mode\", None\n        )",
+        "get_extra_config_value('lmcache.mp.mp_transfer_mode', None)",
+    );
+    env.check_registered_as(TransferMode::EngineDriven).unwrap();
+}
+
+// T45 (ADR 0034, LC15 amendment): a sleep-based park must not erase the
+// external cache. Restart parking does not call sleep and remains usable.
+#[test]
+fn sleep_that_clears_external_cache_refuses_lmcache_parking_only() {
+    let env = Env::with_lmcache(Engine::Vllm, "0.5.7");
+    env.write(
+        "vllm/v1/engine/core.py",
+        r#"class EngineCore:
+    def _reset_caches(self, reset_running_requests: bool = True,
+                      reset_connector: bool = True) -> None:
+        self.reset_prefix_cache(reset_connector=reset_connector)
+    def _finish_pause(self, clear_cache: bool) -> None:
+        if clear_cache:
+            self._reset_caches()
+    def sleep(self, level: int = 1, mode = 'abort'):
+        clear_prefix_cache = level >= 1
+        self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)
+"#,
+    );
+    let registration = env.register();
+    for residency in [Residency::Deep, Residency::HostBacked] {
+        let failure = check_lmcache(
+            &env.measurer,
+            env.engine,
+            &env.executable(),
+            Some(&registration),
+            residency,
+        )
+        .unwrap_err();
+        assert_eq!(failure.reason, LmcacheOffReason::SleepClearsCache);
+        assert!(
+            failure
+                .detail
+                .contains("sleep clears the external LMCache cache"),
+            "{failure}"
+        );
+    }
+    env.check_registered().unwrap();
+    // A fixed installation that explicitly preserves the connector passes.
+    env.edit(
+        "vllm/v1/engine/core.py",
+        "self._reset_caches()",
+        "self._reset_caches(reset_connector=False)",
+    );
+    env.check_registered_as(TransferMode::EngineDriven).unwrap();
+}
+
+// T45 (ADR 0034 §1): the remote host's launch-time check, through the
+// installation registry its launches use, checks the transfer mode the
+// launch renders: a release without engine-driven transfer passes a
+// lmcache-driven launch and fails an engine-driven one `check_failed`.
+#[test]
+fn the_registry_checks_the_transfer_mode_the_launch_renders() {
+    use capyctl_agent::installation::{InstallationDrift, InstallationRegistry};
+    use capyctl_protocol::pb;
+    let env = Env::new(Engine::Vllm);
+    env.edit(
+        "lmcache/v1/multiprocess/config.py",
+        "\"--supported-transfer-mode\"",
+        "\"--mode\"",
+    );
+    let registration = env.register();
+    let registry = InstallationRegistry::from_inventory(&pb::ReportInventory {
+        profiles: vec![pb::RuntimeProfileStatus {
+            name: "vllm-lmcache".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let launch = |transfer| {
+        registry
+            .verify_lmcache(
+                "vllm-lmcache",
+                env.engine,
+                &env.executable(),
+                Some(&registration),
+                residency_for_transfer(transfer),
+                InstallationDrift::Refuse,
+            )
+            .unwrap()
+    };
+    launch(TransferMode::LmcacheDriven).unwrap();
+    let failure = launch(TransferMode::EngineDriven).unwrap_err();
+    assert_eq!(failure.reason, LmcacheOffReason::CheckFailed);
+    assert!(
+        failure.detail.contains("--supported-transfer-mode"),
+        "{failure}"
+    );
+    env.assert_nothing_ran();
 }

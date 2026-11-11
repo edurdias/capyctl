@@ -146,10 +146,10 @@ pub fn live_identity(role: &str, pid: u32) -> capyctl_domain::completion::Proces
 
 /// Process tools for a builder that starts nothing.
 ///
-/// The Fake launches no process, so there is never a recorded identity for these
-/// to signal; they exist because the coordinator gives every launch its tools.
+/// The Fake executes in process, so its virtual identities are live while
+/// the adapter is serving. These injected tools never spawn or signal a PID.
 pub fn fake_tools_factory() -> ToolsFactory {
-    Arc::new(|_association, _policy| ScriptedTool::proving())
+    Arc::new(|_association, _policy| ScriptedTool::in_process())
 }
 
 /// A coordinator that drives the Fake on every binding it is given.
@@ -229,17 +229,34 @@ impl EngineBindings for FakeBindings {
         self.profile.spec(work)
     }
 
-    /// The Fake, ignoring the plan the spec carries.
+    /// Substitute the Fake while preserving the frozen deployment's API.
     fn adapter(
         &self,
         _declared: Engine,
-        _spec: AdapterSpec,
+        spec: AdapterSpec,
         _tools: Arc<dyn OwnedProcessLaunch>,
     ) -> Result<Arc<dyn EngineAdapter>, CoordinatorError> {
         let clock = self.clock.clone();
         let engine = FakeEngine::with_lifecycle_clock(Arc::new(move || {
             clock().map_err(|_| RuntimeError::Uncertain("service observation clock failed".into()))
         }));
+        // ADR 0036 §§5, 6: an embeddings deployment must answer the fixed
+        // embedding at Initialize and at its pre-Ready restart check. A chat
+        // Fake has no embedding canary and must never stand in for this API.
+        let embeddings = match spec {
+            AdapterSpec::Vllm { api, .. }
+            | AdapterSpec::Sglang { api, .. }
+            | AdapterSpec::Llamacpp { api, .. }
+            | AdapterSpec::Custom { api, .. } => {
+                api == capyctl_config::effective::DeploymentApi::Embeddings
+            }
+            _ => false,
+        };
+        let engine = if embeddings {
+            engine.with_embeddings()
+        } else {
+            engine
+        };
         Ok(Arc::new(match &self.members {
             Some(members) => engine.with_members(members.clone()),
             None => engine,

@@ -42,8 +42,10 @@ fn option_name(token: &str) -> Option<String> {
 
 /// The option names the engine's own output says it refused: an argument
 /// parser's `argument --name: ...` and `unrecognized arguments: --name ...`,
-/// and llama-server's `error: invalid argument: --name` (ADR 0029 §6,
-/// `common/arg.cpp`). Values that follow them are never read.
+/// llama-server's `error: invalid argument: --name` (ADR 0029 §6,
+/// `common/arg.cpp`), and Click's `No such option: --name` and `Invalid
+/// value for '--name'` (`trtllm-serve`, ADR 0038 §3). Values that follow
+/// them are never read.
 pub fn rejected_options(engine_output: &str) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut push = |name: String| {
@@ -63,6 +65,17 @@ pub fn rejected_options(engine_output: &str) -> Vec<String> {
             .and_then(option_name)
         {
             push(name);
+        }
+        // ADR 0038 §3: Click names one option and may suggest another
+        // (`Did you mean --x?`), which is not the refused one.
+        for marker in ["No such option:", "Invalid value for "] {
+            if let Some(name) = line
+                .split_once(marker)
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .and_then(option_name)
+            {
+                push(name);
+            }
         }
         let mut rest = line;
         while let Some(at) = rest.find("argument ") {
@@ -145,6 +158,28 @@ pub fn summary(engine_output: &str, exit: Option<EngineExit>) -> String {
         );
         return text;
     }
+    if let Some(native) = native_summary(engine_output) {
+        // A long exit status could push the fixed words over the bound;
+        // the family name is then left out (`native_summary`'s second form).
+        let named = format!("{text}{}", native.0);
+        if named.len() <= MAX_SUMMARY_BYTES {
+            return named;
+        }
+        return format!("{text}{}", native.1);
+    }
+    // ADR 0038 §3: TensorRT-LLM's LLM API models are strict (pydantic
+    // `extra="forbid"`), so a key of the deployment's mapping that this
+    // version lacks stops the start; the line names the key and its value,
+    // so the summary names the fix in fixed words instead.
+    if engine_output.lines().any(|line| {
+        line.contains("extra_forbidden") || line.contains("Extra inputs are not permitted")
+    }) {
+        text.push_str(
+            "; TensorRT-LLM refused a key of engine_config.tensorrt-llm.llm_api_options that \
+             this version does not have: remove or correct it",
+        );
+        return text;
+    }
     // #198: the protected SGLang entry's closed line for an engine it could
     // not import (an editable install, or a dependency failing at import).
     // The code is closed; nothing else of the line or the log is named.
@@ -172,6 +207,101 @@ pub fn summary(engine_output: &str, exit: Option<EngineExit>) -> String {
         options.pop();
     }
     text
+}
+
+/// ADR 0039 §4: the native engine's refusal of a flag it does not serve, at
+/// start with exit 2 (`tensorfold serve: error: ...`). 1.0.0
+/// (`server/cli.zig:174-177`): "`<flag>` is not served by the native engine
+/// yet; serve this command with --engine python", and for a value it serves
+/// only in part "`<flag> <value>` is not served by the native engine; serve
+/// this command with --engine python". 1.1.5 (`server/cli.zig:281-284`): the
+/// same two forms ending "the Python engine 0.6.6 serves it: python -m pip
+/// install git+https://github.com/ashhart/TensorFold.git@v0.6.6". All four
+/// share this text, and the flag is the first word before it.
+const NATIVE_UNSERVED: &str = " is not served by the native engine";
+
+/// ADR 0039 §8: the native engine's start refusals when its memory budget
+/// does not hold the streams (1.0.0 `native/cuda.zig:352-353`): "the CUDA
+/// memory budget fits no stream: ... lower --context, or free device memory"
+/// and "--parallel N needs X GiB for its streams at a W-token window, and the
+/// CUDA memory budget leaves Y GiB: serve --parallel M, or lower --context".
+const NATIVE_NO_STREAM: &str = "the CUDA memory budget fits no stream";
+const NATIVE_STREAMS: &str = "for its streams at a";
+const NATIVE_BUDGET_LEAVES: &str = "the CUDA memory budget leaves";
+/// ADR 0039 §8: "the checkpoint's X GiB of weights do not fit the Y GiB the
+/// CUDA memory budget grants (...)" (1.0.0 `native/cuda.zig:339`).
+const NATIVE_WEIGHTS: &str = "GiB of weights do not fit the";
+const NATIVE_BUDGET_GRANTS: &str = "the CUDA memory budget grants";
+/// ADR 0039 §7: "the native CUDA engine has no backend for X checkpoints yet"
+/// (1.0.0 `native/cuda.zig:289`).
+const NATIVE_NO_BACKEND: &str = "the native CUDA engine has no backend for ";
+const NATIVE_NO_BACKEND_END: &str = " checkpoints yet";
+
+/// A checkpoint family as a summary may name it: 1 to 32 of `[a-z0-9_.-]`
+/// (a `config.json` `model_type` such as `nemotron_h`).
+fn family_name(text: &str) -> Option<&str> {
+    let valid = !text.is_empty()
+        && text.len() <= 32
+        && text.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-')
+        });
+    valid.then_some(text)
+}
+
+/// ADR 0039 §4, §7, §8: the summary's tail for a native-line start refusal,
+/// in fixed words: the flag the release does not serve (never its value),
+/// the settings that fit memory, or the unlisted family with the checkpoint
+/// note. The second form leaves out the family name, for the bound.
+fn native_summary(engine_output: &str) -> Option<(String, String)> {
+    let fixed = |text: String| Some((text.clone(), text));
+    for line in engine_output.lines() {
+        if let Some((head, _)) = line.split_once(NATIVE_UNSERVED) {
+            let head = head.rsplit_once("error: ").map_or(head, |(_, rest)| rest);
+            let flag = head.split_whitespace().next().and_then(option_name);
+            return fixed(match flag {
+                Some(flag) => format!(
+                    "; this TensorFold native release does not serve {flag}; a TensorFold 0.6 \
+                     installation may"
+                ),
+                None => "; this TensorFold native release does not serve an option of the \
+                         command; a TensorFold 0.6 installation may"
+                    .to_owned(),
+            });
+        }
+        if line.contains(NATIVE_NO_STREAM)
+            || (line.contains(NATIVE_STREAMS) && line.contains(NATIVE_BUDGET_LEAVES))
+        {
+            return fixed(
+                "; TensorFold native's memory budget cannot hold its streams: lower \
+                 max_concurrent_requests or context_length, or raise resources"
+                    .to_owned(),
+            );
+        }
+        if line.contains(NATIVE_WEIGHTS) && line.contains(NATIVE_BUDGET_GRANTS) {
+            return fixed(
+                "; TensorFold native's memory budget cannot hold the checkpoint's weights: \
+                 raise resources or free device memory"
+                    .to_owned(),
+            );
+        }
+        if let Some((_, rest)) = line.split_once(NATIVE_NO_BACKEND) {
+            let note = capyctl_config::tensorfold_native::CHECKPOINT_NOTE;
+            let unnamed = format!(
+                "; {note}; this native release does not serve its family; TensorFold 0.6 may"
+            );
+            let named = rest
+                .split_once(NATIVE_NO_BACKEND_END)
+                .and_then(|(family, _)| family_name(family))
+                .map(|family| {
+                    format!(
+                        "; {note}; family {family} is not served by this native release; \
+                         TensorFold 0.6 may serve it"
+                    )
+                });
+            return Some((named.unwrap_or_else(|| unnamed.clone()), unnamed));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -271,6 +401,35 @@ mod tests {
              context_length, or raise the ready allocation in resources"
         );
         assert!(!text.contains("20480"));
+        assert!(text.len() <= MAX_SUMMARY_BYTES);
+    }
+
+    // T49 T29 (ADR 0038 §3): `trtllm-serve`'s Click parser names the refused
+    // option, never the one it suggests or a value; a key its strict LLM API
+    // model refuses is named as a fix in fixed words, never with its value.
+    #[test]
+    fn trtllm_serve_rejections_name_the_option_or_the_fix() {
+        assert_eq!(
+            rejected_options("Error: No such option: --bogus_flag Did you mean --backend?"),
+            vec!["--bogus_flag"]
+        );
+        assert_eq!(
+            rejected_options(
+                "Error: Invalid value for '--log_level': 'secret' is not one of 'info'."
+            ),
+            vec!["--log_level"]
+        );
+        let output = "pydantic_core._pydantic_core.ValidationError: 1 validation error for \
+                      TorchLlmArgs\nmystery_key\n  Extra inputs are not permitted \
+                      [type=extra_forbidden, input_value=42, input_type=int]\n";
+        let text = summary(output, Some(EngineExit::Code(1)));
+        assert_eq!(
+            text,
+            "the engine exited before readiness with exit code 1; TensorRT-LLM refused a key \
+             of engine_config.tensorrt-llm.llm_api_options that this version does not have: \
+             remove or correct it"
+        );
+        assert!(!text.contains("mystery") && !text.contains("42"));
         assert!(text.len() <= MAX_SUMMARY_BYTES);
     }
 

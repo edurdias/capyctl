@@ -9,6 +9,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 capyctl-config = { workspace = true }
+# ADR 0037 §4: the activation trace and its steps.
+capyctl-trace = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 serde_json = "1"

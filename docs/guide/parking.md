@@ -36,6 +36,14 @@ for them:
 - Nemotron 3.5 Super VL on vLLM: after a park and a wake, vLLM 0.31.0 answers
   wrongly.
 
+TensorRT-LLM never parks: its deployments are `restart_only`.
+`residency: deep` or `host_backed` is refused
+(`capability_missing:deep_park`), and so is `--deep-park enabled` when you add
+it. Parking a TensorRT-LLM model stops `trtllm-serve` and waits until its
+process group has exited; waking it starts the same pinned launch again; `capyctl park
+deployment` does that stop. CapyCTL never turns on the engine's own sleep, on
+any version, the 1.4 pre-release's included.
+
 ### A model on several GPUs
 
 A model spread over several GPUs of one machine
@@ -46,8 +54,10 @@ SGLang 0.5.22. CapyCTL settles a park or wake only after every chosen GPU's
 evidence agrees; a missing reading keeps the operation uncertain and its
 memory reserved. `topology: auto` can choose several GPUs with either tier.
 The engine and model restrictions above still apply. llama.cpp stops, on
-one GPU or several. LMCache remains off for a model on several GPUs
-(`multi_gpu_unqualified`); this run did not qualify that combination.
+one GPU or several. LMCache stays off for a model on several GPUs under
+`lmcache: auto` (`multi_gpu_unqualified`): no run has qualified it. Under
+`lmcache: required` it runs, its GPUs connected to one LMCache server, as an
+uncertified setup.
 
 Switching works on whole models: to make room for a model on GPUs 0 and 1,
 CapyCTL parks or stops whatever is on either card, and a model on two GPUs
@@ -99,10 +109,15 @@ A deployment that uses [LMCache](engines.md#lmcache) keeps its LMCache server,
 and the server's pool of host RAM stays reserved, while the model is parked;
 the server stops when the model stops.
 
-- **`restart_only`** (declared, or what a decision model or a machine with
-  deep parking turned off resolves to): parking stops the engine and keeps the
-  LMCache server; waking starts the engine again on the same server, so the
-  first request after the wake can be answered from the cache. The wake is a
+- **`restart_only`** is for models that cannot park deep (decision models,
+  machines with deep parking turned off, and the models
+  [above](#how-a-model-parks) that only restart): for them LMCache keeps a
+  warm cache across the restart, which is never slower than the stop they
+  would get without it. A model that can park deep wakes sooner parked deep
+  without LMCache than restarted with it, so declaring `restart_only` to get
+  LMCache does not pay. Parking stops the engine and keeps the LMCache
+  server; waking starts the engine again on the same server, so the first
+  request after the wake can be answered from the cache. The wake is a
   start, so unless the deployment states `timeouts.wake` it may take as long
   as a start (`timeouts.initialize`, or the window CapyCTL derives for a
   start). Without LMCache such a model stops instead of parking, as before.
@@ -119,14 +134,33 @@ the server stops when the model stops.
   with a new server. The first request after that start is not answered from
   the cache. A model parked and woken repeatedly therefore alternates between
   a park and a stop when its server does not release the old KV.
-- **`deep` and `host_backed`** use LMCache only on an engine version, model
-  type and GPU combination qualified live for parking with it. This release
-  qualifies none, so a deep-parking deployment keeps parking deep and runs
-  without LMCache, and status says "LMCache off: not qualified with deep park
-  on <engine version> / <model type> / <GPU>". Parking wins: CapyCTL never
-  switches it to `restart_only` for you. To have LMCache, declare
-  `residency: restart_only`; with `lmcache: required` and a parking residency
-  the deployment is refused (`lmcache_unavailable:park_unqualified`).
+- **`deep` and `host_backed`** use LMCache with engine-driven transfer: the
+  engine copies each piece of KV to the LMCache server itself, so the server
+  never holds the engine's GPU memory and a park releases all of it. By
+  default they use LMCache only on a certified combination: an engine
+  version, model type and GPU listed in the [qualified table](engines.md#lmcache),
+  `deep` on the GB10 and `host_backed` on the one discrete GPU qualified for
+  it. This release lists none yet: the live rows that add them have not
+  run. On any other combination the deployment keeps parking and runs
+  without LMCache, and status says "LMCache off: not qualified with deep
+  park on <engine version> / <model type> / <GPU>". Parking wins: CapyCTL
+  never switches it to `restart_only` for you. A model that can park deep
+  should; it gets LMCache once its combination is certified.
+- **`lmcache: required` outside the table** runs LMCache anyway, with the
+  same rendering, as an uncertified setup: `deploy --wait` warns, status shows
+  "LMCache on (uncertified: <engine version> / <model type> / <GPU> /
+  <residency> is not in the qualified table)" and JSON `certified: false`.
+  It is never refused for being uncertified. If the engine then fails to
+  start with LMCache (a model type the transfer does not handle, for
+  example), the launch fails `lmcache_unavailable:engine_start_failed` and
+  nothing is left running.
+- **A vLLM sleep that clears the external cache** cannot preserve LMCache.
+  The launch-time check detects the known sleep-reset path in the installed
+  engine (`sleep_clears_cache`): under `auto`, parking is kept and LMCache
+  is off; under `required`, the launch is refused with
+  `lmcache_unavailable:sleep_clears_cache`. This is a compatibility failure,
+  not a refusal for being uncertified. Restart-only parking is unaffected
+  because it does not call sleep.
 
 ## Switch between models
 
@@ -207,8 +241,8 @@ requests arrive for another, this is what happens:
    (`residency: restart_only`, TensorFold, or no room for a parked copy).
    The waiting model wakes or starts.
 5. All its waiting requests are released together and run at the same time,
-   up to 32 per model, not one by one in arrival order. Requests beyond 32
-   wait for a free slot, first come first served.
+   up to `engine_config.max_concurrent_requests` per model (32 when unset).
+   Requests beyond that bound wait for a free slot, first come first served.
 
 When several models wait, the one whose requests have waited longest goes
 next; a model with waiting requests is never the one parked to make room.
@@ -246,7 +280,7 @@ next switch.
 | Waiting requests per model | `host.resource_policy.queue.max_pending_per_deployment`, default 64, 0 to 4096 | host: `resource_policy.queue.max_pending_per_deployment`, default 64, 0 to 4096 |
 | Waiting requests in total | `host.resource_policy.queue.max_pending_total`, default 256 | host: `resource_policy.queue.max_pending_total`, default 256 |
 | Bodies of waiting requests, in total | `host.resource_policy.queue.max_buffered_bytes_total`, default 64 MiB | host: `resource_policy.queue.max_buffered_bytes_total`, default 64 MiB |
-| Requests running at once per model | 32, fixed | 32, fixed |
+| Requests running at once per model | `engine_config.max_concurrent_requests`, 32 when unset | `engine_config.max_concurrent_requests`, 32 when unset |
 
 The standalone bounds have the host ranges. A reply's opening chunk, which
 only names the assistant role, is not output: TensorFold sends it before it
@@ -279,8 +313,8 @@ Each is an HTTP error with a JSON body holding `code`, `message` and
 | 503 | `unavailable` | `dispatch to deployment <deployment id> is closed; retry shortly` | The model is finishing its work before it parks. |
 | 429 | `queue_full` | `too many requests are waiting for deployment <deployment id>` | A waiting-request limit is reached. |
 | 429 | `queue_full` | `waiting requests exceed the buffered-bytes bound` | The waiting bodies would pass the byte limit. |
-| 429 | `queue_full` | `deployment <deployment id> stayed at its in-flight bound for the queue deadline` | 32 requests kept running for the whole request deadline. |
-| 429 | `queue_full` | `deployment <deployment id> is at its in-flight bound and lets no request wait; retry shortly` | 32 requests are running and the waiting limit per model is 0. |
+| 429 | `queue_full` | `deployment <deployment id> stayed at its in-flight bound for the queue deadline` | The configured running-request bound stayed full for the whole request deadline. |
+| 429 | `queue_full` | `deployment <deployment id> is at its in-flight bound and lets no request wait; retry shortly` | The configured running-request bound is full and the waiting limit per model is 0. |
 | 429 | `queue_full` | `deployment <deployment id> is not servable now and lets no request wait; retry shortly` | The model is parked, stopped or switching and the waiting limit per model is 0. Its wake or start has been asked for. A model an operator stopped, or one whose activation is explicit, is answered 409 instead (`deployment_stopped`, `deployment_inactive`). |
 
 Every 429 carries `Retry-After: 1`.
@@ -289,14 +323,14 @@ Every 429 carries `Retry-After: 1`.
 
 A client that balances across several servers may rather be refused at once
 than wait: set the waiting limit per model to 0. A request then never waits in
-CapyCTL: one beyond the 32 running requests, or one for a model that is not
+CapyCTL: one beyond the model's running-request bound, or one for a model that is not
 loaded, is answered 429 `queue_full` with `Retry-After` straight away. A
 request for a model that is parked or stopped still wakes or starts it, so a
 retry after the hint finds it loaded; a model an operator stopped, or one
 whose activation is explicit, is answered 409 instead, since a retry would
-not help. The 32 running requests per model stay
-as they are; requests above what the engine itself runs at once wait in the
-engine, as before (its waiting count is in the load read below).
+not help. The running-request bound follows `engine_config.max_concurrent_requests`
+(32 when unset); requests above what the engine itself runs at once wait in the
+engine (its waiting count is in the load read below).
 
 ```yaml
 # host.yaml (standalone: under host:)
@@ -348,8 +382,8 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
 ```
 
 - `router`: requests CapyCTL is forwarding to the model now and its bound
-  (32), and requests waiting in CapyCTL for it (to load, or for one of the
-  32) and the waiting limit.
+  (`engine_config.max_concurrent_requests`, 32 when unset), and requests waiting
+  in CapyCTL for it (to load, or for a free place) and the waiting limit.
 - `max_running`: how many requests the engine runs at once. Per instance
   `source: engine` is the engine's own figure (SGLang reports it); otherwise it
   is what CapyCTL passed or expects, by source: `declared`

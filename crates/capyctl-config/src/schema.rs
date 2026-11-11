@@ -88,6 +88,11 @@ pub enum FieldSpec {
     MapOf(&'static FieldSpec),
     /// Sequence of items, each validated against the given spec.
     Seq(&'static FieldSpec),
+    /// Any mapping, passed whole to the code that reads it, which checks its
+    /// keys and values (ADR 0038 §3: TensorRT-LLM's `llm_api_options`, whose
+    /// reserved keys resolution refuses and whose other keys the engine's
+    /// strict models check).
+    Mapping,
     /// A field that used to live here and has moved (SPEC §15.3 strictness).
     /// It is refused like an unknown field, with a message naming where the
     /// setting lives now, so an old document fails with a pointer rather than
@@ -280,6 +285,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("tensorfold", SCALAR),
         // ADR 0029 §2: the role's own `llama-server`.
         ("llamacpp", SCALAR),
+        // ADR 0038 §2: the role's own `trtllm-serve`.
+        ("tensorrt-llm", SCALAR),
         ("build_fingerprint", SCALAR),
         ("args", FieldSpec::Seq(&SCALAR)),
         ("kv_cache", BYTES),
@@ -370,7 +377,10 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("kv_cache_dtype", SCALAR),
         ("context_length", SCALAR),
         ("max_concurrent_requests", SCALAR),
-        ("cuda_graphs", SCALAR),
+        (
+            "cuda_graphs",
+            FieldSpec::ScalarOrStruct(&[("prefill", SCALAR), ("decode", SCALAR)]),
+        ),
         ("language_model_only", SCALAR),
         ("trust_remote_code", SCALAR),
         ("memory", ENGINE_MEMORY),
@@ -410,6 +420,15 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("mmproj_file", SCALAR),
             ]),
         ),
+        // ADR 0038 §3, §14: TensorRT-LLM's parser fields and LLM API options.
+        (
+            "tensorrt-llm",
+            FieldSpec::Struct(&[
+                ("tool_call_parser", SCALAR),
+                ("reasoning_parser", SCALAR),
+                ("llm_api_options", FieldSpec::Mapping),
+            ]),
+        ),
         ("accept_extra_args", SCALAR),
         ("extra_args", FieldSpec::Seq(&SCALAR)),
         // ADR 0028 §2.1: engine environment, names approved by the profile.
@@ -434,11 +453,23 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ),
         // ADR 0033 §1: the LMCache package `engine add` registered.
         ("lmcache", LMCACHE_REGISTRATION),
+        // ADR 0039 §1, §2: TensorFold's line, and a native release's record.
+        ("line", SCALAR),
+        ("native", NATIVE_REGISTRATION),
+        // ADR 0038 §2: the companion versions `engine add` read beside
+        // TensorRT-LLM's (torch, tensorrt, flashinfer-python, transformers,
+        // mpi4py), which `engine list` shows.
+        ("companions", FieldSpec::MapOf(&SCALAR)),
     ]);
     // ADR 0033 §1, contract decision 3: the LMCache package `engine add`
     // found in the registered environment, with its ADR 0008 digest.
     const LMCACHE_REGISTRATION: FieldSpec =
         FieldSpec::Struct(&[("version", SCALAR), ("digest", SCALAR)]);
+    // ADR 0039 §2, §7: what `engine add` recorded from a native release.
+    const NATIVE_REGISTRATION: FieldSpec = FieldSpec::Struct(&[
+        ("families", FieldSpec::MapOf(&FieldSpec::Seq(&SCALAR))),
+        ("checksums_verified", SCALAR),
+    ]);
     // ADR 0031 §2: the manifest as a profile carries it; its own validation
     // (placeholders, paths, the idle signal) runs at resolution.
     const CUSTOM_MANIFEST: FieldSpec = FieldSpec::Struct(&[
@@ -477,6 +508,13 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             FieldSpec::Struct(&[("max_file_bytes", BYTES), ("retained_files", SCALAR)]),
         ),
         ("lmcache", LMCACHE_REGISTRATION),
+        // ADR 0039 §1, §2: as in [`PROFILE`], so a role document (a host's
+        // own) may hold a TensorFold native profile.
+        ("line", SCALAR),
+        ("native", NATIVE_REGISTRATION),
+        // ADR 0038 §2: as in [`PROFILE`]; a host publishes its engines.yaml
+        // profiles and its own TensorRT-LLM's in its document.
+        ("companions", FieldSpec::MapOf(&SCALAR)),
         (
             "custom",
             // ADR 0031 §8: the installation digest the operator approved.
@@ -516,8 +554,53 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
     /// SPEC §10 (W10): request-driven and `--evict` switching bounds.
     const SWITCHING: &[(&str, FieldSpec)] = &[("drain_timeout", DURATION)];
     /// SPEC §17 (M80): router observability. `timing_header` adds the
-    /// `x-capyctl-timing` response header; off unless set.
-    const OBSERVABILITY: &[(&str, FieldSpec)] = &[("timing_header", SCALAR)];
+    /// `x-capyctl-timing` response header; off unless set. ADR 0037 §12:
+    /// `tracing`, the server's OTLP export, off unless an endpoint is named.
+    const OBSERVABILITY: &[(&str, FieldSpec)] = &[
+        ("timing_header", SCALAR),
+        ("tracing", FieldSpec::Struct(SERVER_TRACING)),
+    ];
+    /// ADR 0037 §12: a server's (or a standalone `server:` block's) tracing.
+    const SERVER_TRACING: &[(&str, FieldSpec)] = &[
+        ("endpoint", SCALAR),
+        ("headers_file", SCALAR),
+        ("sample_ratio", SCALAR),
+        ("caller_context", SCALAR),
+    ];
+    /// ADR 0037 §7, §12: a host's tracing. Role-local: never in the document
+    /// deployments are resolved against.
+    const HOST_OBSERVABILITY: &[(&str, FieldSpec)] = &[(
+        "tracing",
+        FieldSpec::Struct(&[
+            ("endpoint", SCALAR),
+            ("headers_file", SCALAR),
+            ("engines", SCALAR),
+        ]),
+    )];
+    /// ADR 0037 §12: a standalone `host:` block's tracing takes only
+    /// `engines`; the process exports through `server.observability.tracing`.
+    const STANDALONE_HOST_OBSERVABILITY: &[(&str, FieldSpec)] = &[(
+        "tracing",
+        FieldSpec::Struct(&[
+            ("engines", SCALAR),
+            (
+                "endpoint",
+                FieldSpec::Moved(crate::tracing::STANDALONE_HOST_TRACING),
+            ),
+            (
+                "headers_file",
+                FieldSpec::Moved(crate::tracing::STANDALONE_HOST_TRACING),
+            ),
+            (
+                "sample_ratio",
+                FieldSpec::Moved(crate::tracing::STANDALONE_HOST_TRACING),
+            ),
+            (
+                "caller_context",
+                FieldSpec::Moved(crate::tracing::STANDALONE_HOST_TRACING),
+            ),
+        ]),
+    )];
     /// ADR 0028 §11 (decided 2026-10-06): the group request-stall timeout.
     const SERVER_GROUPS: &[(&str, FieldSpec)] = &[("stall_timeout", DURATION)];
     const STANDALONE_HOST: &[(&str, FieldSpec)] = &[
@@ -547,6 +630,12 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         // Owner decision 2026-10-22: the engines' own usage reporting, as on
         // a host.
         ("engine_telemetry", SCALAR),
+        // ADR 0037 §7, §12: engine tracing; the endpoint is the server
+        // block's.
+        (
+            "observability",
+            FieldSpec::Struct(STANDALONE_HOST_OBSERVABILITY),
+        ),
     ];
     /// SPEC §6.5, §10: a host's activation policy, for every deployment that
     /// may run on it. Controller policy; never part of the document a
@@ -636,6 +725,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 // Role-local (owner decision 2026-10-22): `off` or `allow`,
                 // whether the engines' own usage reporting keeps its defaults.
                 ("engine_telemetry", SCALAR),
+                // Role-local (ADR 0037 §12): the host's OTLP export and
+                // engine tracing.
+                ("observability", FieldSpec::Struct(HOST_OBSERVABILITY)),
             ],
         },
         ConfigKind::Deployment => &KindSchema {
@@ -647,11 +739,12 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 // ADR 0030 §1: the API the deployment serves, `chat` (the
                 // default) or `decisions`.
                 ("api", SCALAR),
-                // ADR 0033 §9, §6, §10: `auto` (the default), `off` or
-                // `required`; the pool, a whole number of GiB; `standard`
-                // (the default) or `zero`.
+                // ADR 0033 §9, §6, §10, ADR 0034 §4: `auto` (the default),
+                // `off` or `required`; the pool, `auto` (the default) or a
+                // whole number of GiB, checked by resolution
+                // (`invalid_config`); `standard` (the default) or `zero`.
                 ("lmcache", SCALAR),
-                ("lmcache_pool", BYTES),
+                ("lmcache_pool", SCALAR),
                 ("retention", SCALAR),
                 // ADR 0013 §2: `host` is shorthand for `placement.hosts: [host]`.
                 ("host", SCALAR),

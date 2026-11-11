@@ -601,6 +601,15 @@ pub enum StreamEnded {
 #[derive(Debug, Clone, Copy)]
 pub struct DeliveryFailed;
 
+/// ADR 0037 §6: the W3C trace headers one forward carries, decided by the
+/// router: to a host's ingress that declared `trace_context`, or to an engine
+/// launched with engine tracing; no other forward carries any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceHeaders {
+    pub traceparent: String,
+    pub tracestate: Option<String>,
+}
+
 /// A bounded, backpressure-aware destination for one decoded payload.
 #[async_trait]
 pub trait ChatSink: Send {
@@ -619,6 +628,37 @@ pub trait ChatSink: Send {
     fn request_id(&self) -> Option<&str> {
         None
     }
+    /// ADR 0037 §6: the trace headers this forward sends. `None` sends none.
+    fn trace_headers(&self) -> Option<&TraceHeaders> {
+        None
+    }
+}
+
+/// ADR 0036 §4: where a streamed embeddings answer goes, a backpressure-aware
+/// destination for its bytes. `send` relays the next bytes to the client; an
+/// `Err(DeliveryFailed)` means the client is gone, and the forwarder then
+/// stops calling `send` but keeps reading and checking the answer to its end
+/// (owner decision 2026-10-27, question 7).
+#[async_trait]
+pub trait EmbeddingSink: Send {
+    async fn send(&mut self, bytes: Vec<u8>) -> Result<(), DeliveryFailed>;
+    /// SPEC §10: the backend produced more of the answer. The caller that
+    /// bounds the exchange measures idleness from these, never from wall time.
+    fn progressed(&mut self) {}
+}
+
+/// ADR 0036 §4: an embeddings answer that passed every check. The forwarder
+/// has sent every byte of the answer except the top-level object's closing
+/// brace; the caller writes `capyctl.metrics` (§9) and the brace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingAnswered {
+    /// The number of inputs the request carried, one `data` entry each.
+    pub inputs: usize,
+    /// The answer's `usage.prompt_tokens`, when the engine reported it.
+    pub prompt_tokens: Option<u64>,
+    /// The client went away while the answer was read (§4: the request ran
+    /// to its end anyway and settles on this answer).
+    pub client_gone: bool,
 }
 
 /// Inference forwarding: how the router reaches a deployment's engine
@@ -677,6 +717,16 @@ pub trait ChatForward: Send + Sync {
     ) -> Result<crate::answer::EngineAnswer, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
     }
+    /// ADR 0037 §6: as [`ChatForward::forward_decision`], sending `trace` as
+    /// the request's W3C trace headers. The default sends none.
+    async fn forward_decision_traced(
+        &self,
+        body: &crate::request::InferenceRequest,
+        trace: Option<&TraceHeaders>,
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
+        let _ = trace;
+        self.forward_decision(body).await
+    }
     /// Streaming chat completion: yields data payloads in order; the final
     /// `[DONE]` marker is consumed by the forwarder.
     async fn forward_chat_stream(
@@ -713,6 +763,38 @@ pub trait ChatForward: Send + Sync {
         _served: &str,
         _bound: std::time::Duration,
     ) -> Result<crate::decision_probe::DecisionAnswer, AdapterError> {
+        Err(AdapterError::UnsupportedCapability)
+    }
+    /// ADR 0036 §3-§4: one embeddings request (`POST /v1/embeddings`), sent as
+    /// one JSON body with `model` replaced by the served name, its answer
+    /// streamed into `sink` with `model` replaced by the public name and
+    /// every check of §4 applied as the bytes pass. `Ok` only for an answer
+    /// that passed them all; the closing brace is then left to the caller.
+    /// An engine 400, 413 or 422 with a complete JSON body is
+    /// [`AdapterError::Rejected`]; an engine 5xx other than 503 with a
+    /// complete JSON body is [`AdapterError::EngineError`]; anything else that
+    /// may follow a sent request is [`AdapterError::Uncertain`], including an
+    /// answer found malformed after part of it reached the sink. No wall-clock
+    /// cap of its own. The default cannot carry embeddings, refused before
+    /// sending.
+    async fn forward_embedding(
+        &self,
+        _body: &crate::request::InferenceRequest,
+        _sink: &mut dyn EmbeddingSink,
+    ) -> Result<EmbeddingAnswered, AdapterError> {
+        Err(AdapterError::UnsupportedCapability)
+    }
+    /// ADR 0036 §5: the fixed embedding probe ([`crate::embedding_probe`]) of
+    /// an embeddings deployment, through this engine's own loopback endpoint
+    /// and launch key, answering the served model `served`. Bounded by
+    /// `bound`. Only a complete answer of one finite vector with a norm above
+    /// 1e-6 is `Ok`. Never a chat request: an engine that cannot answer it is
+    /// `UnsupportedCapability`.
+    async fn embedding_probe(
+        &self,
+        _served: &str,
+        _bound: std::time::Duration,
+    ) -> Result<crate::embedding_probe::EmbeddingAnswer, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
     }
 }

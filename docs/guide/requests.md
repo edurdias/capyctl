@@ -4,7 +4,8 @@ CapyCTL serves the OpenAI chat API on port 8443 of the machine that runs it (the
 server, with several machines), on every interface, with an API key. On that
 machine the endpoint is `http://127.0.0.1:8443/v1`. Send the deployment's
 `name` as `model`. A decision model answers
-[decision requests](#decision-requests) on the same port instead of chat.
+[decision requests](#decision-requests) on the same port instead of chat, and
+an embedding model answers [embedding requests](#embedding-requests).
 
 ## The API key
 
@@ -33,7 +34,8 @@ curl -s http://127.0.0.1:8443/v1/models -H "Authorization: Bearer $KEY"
 
 Listing never wakes a model. A request without the key, or with a wrong one,
 is answered `401`. `capyctl.api` is the endpoint the model answers: `chat`
-for `/v1/chat/completions`, `decisions` for `/v1/systemone`.
+for `/v1/chat/completions`, `decisions` for `/v1/systemone`, `embeddings` for
+`/v1/embeddings`.
 
 ## Chat
 
@@ -97,30 +99,36 @@ choice, and `usage` with its details, are relayed as the engine sent them.
 A relayed chunk is the engine's own bytes: its keys keep the engine's order
 and its numbers, log probabilities included, the engine's digits.
 
-| Field | Where | vLLM 0.29–0.31 | SGLang 0.5.18–0.5.21 | TensorFold 0.6.x | llama.cpp v0.6.0 |
-|---|---|---|---|---|---|
-| `role` | delta | yes | yes (may be `null`) | yes | yes (opening chunk) |
-| `content` | delta | yes | yes | yes | yes (`null` on the opening chunk) |
-| `reasoning` | delta | yes | — | — | — |
-| `reasoning_content` | delta | — | yes | yes | yes |
-| `tool_calls` | delta | yes | yes | yes | yes |
-| `index`, `finish_reason`, `logprobs` | choice | yes | yes | `index`, `finish_reason` | yes |
-| `stop_reason`, `token_ids` | choice | yes | — | — | — |
-| `matched_stop` | choice | — | yes | — | — |
-| `prompt_tokens`, `completion_tokens`, `total_tokens` | usage | yes | yes | yes | yes |
-| `prompt_tokens_details.cached_tokens` | usage | yes (`--enable-prompt-tokens-details`) | yes (when any were cached) | yes | yes |
-| `completion_tokens_details.reasoning_tokens` | usage | yes | — | yes | — |
-| `reasoning_tokens` | usage | — | yes | — | — |
-| `metrics` | chunk | yes (usage chunk) | — | — | — |
-| `exact_mode`, `tensorfold`, `speculative` | chunk | — | — | yes (finish chunk) | — |
-| `system_fingerprint`, `timings` | chunk | — | — | — | yes (`timings` on the last chunk) |
+| Field | Where | vLLM 0.29–0.31 | SGLang 0.5.18–0.5.21 | TensorFold 0.6.x | TensorFold native 1.0.0 | llama.cpp v0.6.0 |
+|---|---|---|---|---|---|---|
+| `role` | delta | yes | yes (may be `null`) | yes | yes (opening chunk when the request sends no tools) | yes (opening chunk) |
+| `content` | delta | yes | yes | yes | yes | yes (`null` on the opening chunk) |
+| `reasoning` | delta | yes | — | — | — | — |
+| `reasoning_content` | delta | — | yes | yes | yes | yes |
+| `tool_calls` | delta | yes | yes | yes | yes | yes |
+| `index`, `finish_reason`, `logprobs` | choice | yes | yes | `index`, `finish_reason` | `index`, `finish_reason` | yes |
+| `stop_reason`, `token_ids` | choice | yes | — | — | — | — |
+| `matched_stop` | choice | — | yes | — | — | — |
+| `prompt_tokens`, `completion_tokens`, `total_tokens` | usage | yes | yes | yes | yes | yes |
+| `prompt_tokens_details.cached_tokens` | usage | yes (`--enable-prompt-tokens-details`) | yes (when any were cached) | yes | yes | yes |
+| `completion_tokens_details.reasoning_tokens` | usage | yes | — | yes | yes | — |
+| `reasoning_tokens` | usage | — | yes | — | — | — |
+| `metrics` | chunk | yes (usage chunk) | — | — | — | — |
+| `exact_mode`, `tensorfold`, `speculative` | chunk | — | — | yes (finish chunk) | yes (finish chunk) | — |
+| `system_fingerprint`, `timings` | chunk | — | — | — | — | yes (`timings` on the last chunk) |
 
 Not relayed: SGLang's `hidden_states` delta (sent only for
 `return_hidden_states`, a request field CapyCTL refuses) and vLLM's `citations`
 delta (its Cohere endpoint only). The table was read from the vLLM 0.29.0,
-SGLang 0.5.20 and TensorFold 0.6.0 and 0.6.3 sources; vLLM 0.30's `reasoning`
+SGLang 0.5.20 and TensorFold 0.6.0 and 0.6.3 sources, and from TensorFold
+native 1.0.0's source (`zig/src/server/openai.zig`, `chat.zig` and
+`tool_streaming.zig` at tag `v1.0.0`). TensorFold native 1.0.0 puts usage on
+the finish chunk, or in its own chunk with empty `choices` when the request
+sets `stream_options.include_usage`, and adds `stop_sequence` to the finish
+chunk when a stop sequence ended the answer. vLLM 0.30's `reasoning`
 was confirmed live, vLLM 0.31.0's streamed answers were relayed live, and the
-other listed versions are assumed to match until run against them.
+other listed versions, TensorFold native 1.0.0 among them, are assumed to
+match until run against them.
 
 ### When a request is cut short
 
@@ -130,6 +138,8 @@ within `queue.request_deadline`, or a stream that goes quiet for
 asks the engine to stop. That holds for streamed and non-streamed chat
 requests and for decision requests alike, and for a model served on a host,
 whose ingress closes its own engine connection when CapyCTL's goes away.
+Embedding requests are the exception: CapyCTL lets them run to their end
+([Embedding requests](#embedding-requests)).
 (Before 0.1.7, a non-streamed request whose client hung up ran on to its
 end, and a stream whose client hung up before its first token kept its
 engine connection until the engine produced that token.) Closing a
@@ -162,7 +172,8 @@ host. Decision requests are not covered: SGLang's decision endpoint takes no
 request ID.
 
 Requests that wait for the engine's next stop can add up. When they are the
-only requests a model holds and fill its 32 places, CapyCTL restarts the
+only requests a model holds and fill its configured running-request bound,
+CapyCTL restarts the
 instance holding them instead of answering new requests `429 queue_full`:
 the restart's stop settles them, the journal records
 `instance_restarted_for_held_requests` with the number of requests it
@@ -191,6 +202,8 @@ At one reading every 100 ms, 0.1 s is the smallest figure this can show.
 | vLLM 0.32.0 | Qwen3-4B-Instruct-2507, BF16 | 0.10 / 0.10 | 0.10 / 0.10 | `vllm:num_requests_running`, `vllm:num_requests_waiting` |
 | llama.cpp v0.7.0 | Qwen3-4B, Q4_K_M GGUF | 0.10 / 0.10 | 0.10 / 0.10 | `llamacpp:requests_processing`, `llamacpp:requests_deferred` |
 | TensorFold 0.6.6 | FrogNano-4B-2609, NVFP4 | 0.10 / 0.10 | 0.10 / 0.10 | `/health`: `requests_running`, `busy` |
+| TensorFold native 1.0.0 | Nemotron 3.5 Lightning 30B-A3B, MLX 4-bit | not measured yet (TF6) | not measured yet (TF6) | `/metrics`: `tensorfold:requests_running`, `tensorfold:requests_waiting` |
+| TensorFold native 1.1.5 | Nemotron 3.5 Lightning 30B-A3B, MLX 4-bit | not measured yet (TF14) | not measured yet (TF14) | `/metrics`: `tensorfold:requests_running`, `tensorfold:requests_waiting` |
 
 All four requests stopped together on every engine; none started again
 within 5 s. CapyCTL asks the engine for a stream even when your client did
@@ -255,13 +268,17 @@ the prompt. A router `decode_tokens_per_second` is the completion tokens
 after the first, over the time from that first text to the last chunk. A
 figure nobody measured is left out, never shown as zero.
 
-| Figure | vLLM 0.30, 0.31 | SGLang 0.5.21 | TensorFold 0.6.x | llama.cpp v0.6.0 |
-|---|---|---|---|---|
-| `ttft_ms` | engine: queue plus prompt | router | engine, from when it received the request; router on CUDA Qwen models | router |
-| `queue_ms` | engine | — | — | — |
-| `prefill_ms` | engine, from when it scheduled the request | — | engine, from when it queued the request (CUDA Qwen models: `prefill_s`, from when it started the request) | engine (`timings.prompt_ms`, from when a slot took the request) |
-| `decode_tokens_per_second` | engine, from its mean time between tokens | router | engine; router when it timed no decode, and on CUDA Qwen models | engine (`timings.predicted_per_second`); router when it timed no decode |
-| `cached_tokens` | engine, only with `--enable-prompt-tokens-details` | engine, only when some were cached | engine | engine |
+| Figure | vLLM 0.30, 0.31 | SGLang 0.5.21 | TensorFold 0.6.x | TensorFold native 1.0.0 | llama.cpp v0.6.0 |
+|---|---|---|---|---|---|
+| `ttft_ms` | engine: queue plus prompt | router | engine, from when it received the request; router on CUDA Qwen models | engine (`time_to_first_token`), from when it received the request; router when it sent none | router |
+| `queue_ms` | engine | — | — | — | — |
+| `prefill_ms` | engine, from when it scheduled the request | — | engine, from when it queued the request (CUDA Qwen models: `prefill_s`, from when it started the request) | engine (`prefill_seconds`) when it timed the prompt; absent when it sent `null` | engine (`timings.prompt_ms`, from when a slot took the request) |
+| `decode_tokens_per_second` | engine, from its mean time between tokens | router | engine; router when it timed no decode, and on CUDA Qwen models | engine (`tokens_per_second`: tokens after the first, over the time from the end of the prompt to the end); router when it sent 0 | engine (`timings.predicted_per_second`); router when it timed no decode |
+| `cached_tokens` | engine, only with `--enable-prompt-tokens-details` | engine, only when some were cached | engine | engine | engine |
+
+The TensorFold native 1.0.0 column is read from its source (`chat.zig` at tag
+`v1.0.0`) and from how CapyCTL reads the `tensorfold` object, which is the
+same for both TensorFold lines; it is not yet confirmed live (TF7).
 
 CapyCTL starts vLLM with `--enable-per-request-metrics` and SGLang with
 `--enable-cache-report`, and a deployment cannot turn either off (see
@@ -345,11 +362,12 @@ passes the same value to LMCache. So:
 
 CapyCTL never logs or stores the effective salt.
 
-TensorFold and llama.cpp ignore the field, so a request with a `cache_salt` for a
-model that runs on either is refused rather than served without the isolation it asks
-for. The answer is `400` with code `cache_salt_unsupported` (on a stream, an
-error event with that code), and nothing reaches the engine. The same request
-without `cache_salt` is served.
+TensorFold (0.6 and the native line) and llama.cpp do not partition their
+prefix cache by the field, so a request with a `cache_salt` for a model that
+runs on any of them is refused rather than served without the isolation it
+asks for. The answer is `400` with code `cache_salt_unsupported` (on a
+stream, an error event with that code), and nothing reaches the engine. The
+same request without `cache_salt` is served.
 
 ```text
 {"code":"cache_salt_unsupported","message":"this deployment's engine does not partition its prefix cache by cache_salt"}
@@ -417,10 +435,110 @@ waking anything; the message names the endpoint to use:
 {"code":"api_mismatch","message":"model my-decider serves the decisions API, which /v1/chat/completions does not answer; send its requests to POST /v1/systemone"}
 ```
 
+## Embedding requests
+
+A deployment with `api: embeddings` ([Embedding models](deploy.md#embedding-models))
+turns text into vectors, on `POST /v1/embeddings` (OpenAI's Embeddings API).
+It answers nothing else, and a chat or decision model does not answer it.
+
+```bash
+curl -s http://127.0.0.1:8443/v1/embeddings \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model": "my-embedder", "input": ["a quiet library", "tall shelves of old books"]}'
+```
+
+```text
+{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.0213,-0.0087,0.0441]},{"object":"embedding","index":1,"embedding":[0.0179,-0.0122,0.0398]}],"model":"my-embedder","usage":{"prompt_tokens":9,"total_tokens":9},"capyctl":{"metrics":{"inputs":{"source":"router","value":2},"input_tokens":{"source":"engine","value":9},"time_to_response_ms":{"source":"router","value":18.6},"total_ms":{"source":"router","value":20.1}}}}
+```
+
+The vectors come from your model; these are shortened to three numbers, and a
+real one has the model's dimension (2,560 for Qwen3-Embedding-4B). The request
+takes these fields and no others:
+
+- `model`: the deployment's name.
+- `input`: a non-empty string, an array of 1 to 2048 non-empty strings, an
+  array of token IDs, or an array of 1 to 2048 non-empty arrays of token IDs.
+  A token ID is a whole number from 0 to 2147483647. An array of strings and
+  token arrays mixed together is refused.
+- `encoding_format`: `float` (the default) or `base64`. With `base64` each
+  vector is a string of little-endian float32 values; the OpenAI Python
+  client asks for it when you name no format and decodes it for you.
+- `dimensions`: a positive whole number, for a model that can shorten its
+  vectors. vLLM and SGLang judge it against the model; llama.cpp always
+  answers the full vector, so on llama.cpp CapyCTL refuses any `dimensions`
+  other than the model's own.
+- `user`: a string, passed to the engine.
+
+Any other field is answered `400 invalid_request` naming it, before the model
+is woken: `stream`, `cache_salt`, and each engine's own extensions (vLLM's
+`messages` or `truncate_prompt_tokens`, SGLang's `rid`, llama.cpp's
+`content` or `embd_normalize`, images). For example:
+
+```text
+{"code":"invalid_request","message":"embeddings request field `stream` is not accepted"}
+{"code":"invalid_request","message":"malformed embeddings request: input holds more than 2048 inputs"}
+{"code":"invalid_request","message":"dimensions must be 2560: llama.cpp returns full vectors of the model's native dimension"}
+```
+
+CapyCTL does not tokenize, truncate or normalize your inputs. The engine
+judges the rest, such as an input longer than the model takes or a
+`dimensions` the model does not support, and its refusal comes back as
+`engine_rejected` with its status. A parked or stopped embedding model wakes
+or starts for the request, as a chat model does.
+
+An embedding request carries no `cache_salt`. Where the engine keeps a prefix
+cache for an embedding model, every caller of that deployment shares it.
+
+Sent to another endpoint, a request is answered `400 api_mismatch` without
+waking anything; the message names the endpoint to use:
+
+```text
+{"code":"api_mismatch","message":"model my-embedder serves the embeddings API, which /v1/chat/completions does not answer; send its requests to POST /v1/embeddings"}
+```
+
+### The answer arrives as it is made
+
+A batch of 2048 long vectors can be hundreds of megabytes of JSON, so CapyCTL
+does not wait for the whole answer and sets no limit on its size. It sends
+the engine's answer on to you as it arrives, without a `Content-Length`, and
+checks it on the way: one entry per input, each index once, every vector the
+same length (and the length you asked for in `dimensions`), only finite
+numbers, and well-formed `base64`. It replaces the `model` the engine wrote
+with the name you sent; nothing else is changed, so vLLM's `id` and
+`created` stay and the other engines' answers have neither. The answer's
+closing brace, after `capyctl.metrics`, is written only once the last check
+has passed.
+
+So a complete JSON document always means an answer that passed. If the
+engine's answer turns out malformed, or the engine closes the connection
+before it ends, CapyCTL stops sending and ends the response there: you have
+already received `200` and part of the body, and the body is incomplete JSON
+that no JSON parser accepts. Treat that as a failed request. CapyCTL never
+sends it again on its own, since the engine may have run it. An engine that
+refuses the request before answering is the ordinary `engine_rejected` or
+`engine_error`, with no partial body.
+
+### When an embedding request is cut short
+
+An embedding request is short and bounded, so a cut one is not stopped. If
+your client hangs up, or the request runs past its deadline, CapyCTL keeps
+the engine connection open, lets the engine finish, and reads and checks the
+rest of the answer without sending it anywhere. The request counts against
+its model's memory and running-request bound until then, and is finished as soon as
+a complete answer has been read. If the engine answers with a complete error
+instead, the request is finished once the engine next reports itself idle.
+Only a cut request whose answer never
+completes (the engine closes the connection, the answer is malformed, or the
+instance stops first) waits for the instance's next stop, as described in
+[When a request is cut short](#when-a-request-is-cut-short), including the
+restart when such requests fill the model's running-request bound. CapyCTL never sends
+its own request ID to the engine for an embedding request, on any engine.
+
 ## Request IDs and metrics
 
-Every answer from `/v1/chat/completions` and `/v1/systemone`, success or
-error, carries CapyCTL's ID for the request in the `X-CapyCTL-Request-Id`
+Every answer from `/v1/chat/completions`, `/v1/systemone` and
+`/v1/embeddings`, success or error, carries CapyCTL's ID for the request in
+the `X-CapyCTL-Request-Id`
 header. It is the ID of the record CapyCTL keeps of the request while an
 engine works on it, so it is the ID to quote when you look
 for the request in CapyCTL's logs. A request refused before it got that far
@@ -472,6 +590,62 @@ A decision's answer carries its figures in `capyctl.metrics`, in the same
 
 A decision generates no text, so it has no `ttft_ms` or
 `decode_tokens_per_second`. A figure nobody measured is left out.
+
+An embedding answer carries its figures in `capyctl.metrics` too, just
+before its closing brace:
+
+| Figure | What it measures |
+|---|---|
+| `total_ms` | router: from when CapyCTL received the request to the whole answer, waiting and waking included |
+| `time_to_response_ms` | router: from when CapyCTL sent the request to the engine to the whole answer |
+| `input_tokens` | engine: the answer's `usage.prompt_tokens`, when the engine sent it |
+| `inputs` | router: the number of inputs in the request |
+
+An embedding generates no text, so it has no `ttft_ms`, decode speed,
+`queue_ms`, `prefill_ms` or `cached_tokens`. An answer that failed its checks
+has no `capyctl.metrics`, since it never reaches its closing brace.
+
+### Trace context
+
+If the operator has turned tracing on
+([Tracing](../operations/configuration.md#tracing)), CapyCTL joins your
+distributed trace. Send the W3C `traceparent` header (and `tracestate` if you
+have one) as your OpenTelemetry SDK already does:
+
+```bash
+curl -s http://127.0.0.1:8443/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' \
+  -d '{"model": "my-model", "messages": [{"role": "user", "content": "hi"}]}'
+```
+
+CapyCTL reads the headers only after your key is accepted, on
+`/v1/chat/completions` and `/v1/systemone`. By default its `capyctl.request`
+span becomes a child of your span, with spans under it for admission, the
+wait for a free slot (`capyctl.queue_wait`), the wait for a model to start or
+wake (`capyctl.activation_wait`), each dispatch and forward to the engine, and
+the request's settlement. The forward span has a `first_progress` event at
+the first output, so the trace shows time to first token. A model start, wake
+or switch is its own trace (`capyctl.activation`), linked from the
+`activation_wait` of every request that waited for it. The operator can make
+CapyCTL link to your trace instead of joining it, or ignore your headers.
+
+A `traceparent` that is malformed, given twice, or has an all-zero ID is
+ignored, not refused: the request is answered as usual and starts a new
+trace, and `tracestate` is then dropped too. A `tracestate` over 512 bytes or
+32 entries is dropped. Your sampled flag decides whether the request is
+recorded.
+
+The answer carries no trace header. To find a request's spans, search the
+collector for `capyctl.request_id` equal to the answer's
+`X-CapyCTL-Request-Id`. On an SGLang model with engine tracing
+([Engine tracing](engines.md#engine-tracing)), SGLang's own span carries the
+same ID as `gen_ai.request.id` when SGLang runs one tokenizer worker.
+Your `X-Request-Id` is never put in a span. Spans hold no prompt or answer
+text ([Traces](../operations/data-retention.md#traces)).
+
+Without tracing on, the headers are not read and change nothing; they never
+reach the engine.
 
 ## When the model is parked
 

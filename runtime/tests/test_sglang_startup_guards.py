@@ -18,6 +18,34 @@ NO_PLUGINS_SELECTION = "capyctl-loads-no-plugins"
 
 
 class StartupGuardsTests(unittest.TestCase):
+    # T21: SPEC §8.2 protects the app imported by multi-tokenizer workers.
+    def test_http_app_selection_is_closed_before_any_target_import(self):
+        for value, denied in (("untrusted_target:app", True), ("", True),
+                              ("sglang.srt.entrypoints.http_server:app", False)):
+            child = self.child(f'''
+                import os, sys
+                from unittest import mock
+                from runtime.sglang_startup_guards import enforce_closed_plugins, StartupGuardError
+                os.environ["SGLANG_HTTP_SERVER_APP_PATH"] = {value!r}
+                os.environ.pop("SGLANG_PLATFORM", None)
+                os.environ.pop("SGLANG_PLUGINS", None)
+                class NoTargetImports:
+                    def find_spec(self, fullname, path=None, target=None):
+                        if fullname.startswith(("sglang", "untrusted_target")):
+                            raise AssertionError("target import attempted")
+                sys.meta_path.insert(0, NoTargetImports())
+                with mock.patch("importlib.metadata.entry_points", return_value=()):
+                    try:
+                        enforce_closed_plugins()
+                    except StartupGuardError as error:
+                        assert {denied!r} and error.code == "external_plugin_selection"
+                    else:
+                        assert not {denied!r}
+                assert "untrusted_target" not in sys.modules
+                assert "sglang" not in sys.modules
+            ''')
+            self.assertEqual(child.returncode, 0, child.stderr)
+
     def test_no_site_flag_prevents_installed_hooks_before_protected_entry(self):
         # -I disables user site and environment paths, not installed .pth code.
         # Use only a fresh stdlib-only test environment, never an engine install.
@@ -263,6 +291,56 @@ class StartupGuardsTests(unittest.TestCase):
                 self.assertIn(b"<redacted>", child.stderr)
                 self.assertIn(b"ordinary line", child.stdout)
                 self.assertIn(b"and plain", child.stdout)
+
+    # T21 / SPEC §13.3: structured access logs must format without leaking keys,
+    # including handlers bound before the startup guard and debug-log mode.
+    def test_access_log_preserves_structured_args_and_redacts_formatted_output(self):
+        for debug in ("1", "0"):
+            with self.subTest(debug=debug):
+                child = self.child(f'''
+                    import io, logging, os
+                    from copy import copy
+                    from runtime.sglang_startup_guards import install_log_scrubber
+                    os.environ["CAPYCTL_DEBUG_ENGINE_LOGS"] = {debug!r}
+                    key = "ab" * 32
+                    class AccessFormatter(logging.Formatter):
+                        def formatMessage(self, record):
+                            # Uvicorn copies the record and unpacks these five values.
+                            record = copy(record)
+                            client, method, path, version, status = record.args
+                            assert isinstance(record.args, tuple)
+                            assert isinstance(status, int)
+                            record.__dict__.update(
+                                client_addr=client, request_line=f"{{method}} {{path}} HTTP/{{version}}",
+                                status_code=status)
+                            return super().formatMessage(record)
+                    output = io.StringIO()
+                    handler = logging.StreamHandler(output)
+                    handler.setFormatter(AccessFormatter(
+                        '%(client_addr)s - "%(request_line)s" %(status_code)s'))
+                    logger = logging.getLogger("uvicorn.access")
+                    logger.addHandler(handler)
+                    logger.setLevel(logging.INFO)
+                    install_log_scrubber()
+                    logger.info('%s - "%s %s HTTP/%s" %d',
+                                "127.0.0.1:1234", "GET", "/v1/models/" + key, "1.1", 200)
+                    text = output.getvalue()
+                    assert "GET /v1/models/<redacted> HTTP/1.1" in text, text
+                    assert key not in text, text
+                    assert text.endswith('200\\n'), text
+                    # Redaction must also cover secrets assembled during interpolation.
+                    handler.setFormatter(logging.Formatter("%(message)s"))
+                    logger.info("Authorization: %s %s", "Bearer", "short-secret")
+                    logger.info("token=%(key)s count=%(count)d", {{"key": key, "count": 3}})
+                    text = output.getvalue()
+                    assert "short-secret" not in text, text
+                    assert key not in text, text
+                    assert "Bearer <redacted>" in text, text
+                    assert "count=3" in text, text
+                ''')
+                self.assertEqual(child.returncode, 0, child.stderr)
+                self.assertNotIn(b"Logging error", child.stderr)
+                self.assertNotIn(b"TypeError", child.stderr)
 
     # T37 (found live 2026-10-14): SGLang's `server_args` line keeps its model
     # paths. A `.` in a path (`.cache`, `capyctl-0.1.3`) used to end the path,

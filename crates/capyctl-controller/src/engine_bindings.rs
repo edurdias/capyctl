@@ -199,6 +199,9 @@ impl ProfileBindings {
             ),
             proc_root: PathBuf::from("/proc"),
             required: plan.required(),
+            // ADR 0034 §1: a parking residency's server serves engine-driven
+            // transfer (one GPU or several).
+            transfer: capyctl_config::lmcache::transfer_mode(effective.residency),
         }))))
     }
 
@@ -286,15 +289,26 @@ impl ProfileBindings {
         let port = endpoint
             .port()
             .ok_or_else(|| refuse("the leased endpoint names no port".into()))?;
-        // ADR 0023 §3, SPEC §13.3: without a private root nothing is launched.
-        let cache = self
-            .engine_cache
-            .as_ref()
-            .ok_or_else(|| refuse("no private engine cache".into()))?;
-        let dir = cache
-            .torch_extensions(&effective.profile.build_fingerprint)
-            .map_err(|error| refuse(error.to_string()))?;
-        let built = capyctl_agent::engine_cache::has_build(&dir);
+        // ADR 0039 §2: the native line compiles nothing, so it gets no
+        // extensions directory and needs no private root for one.
+        let dir = if effective.profile.line.is_native() {
+            None
+        } else {
+            // ADR 0023 §3, SPEC §13.3: without a private root nothing is
+            // launched.
+            let cache = self
+                .engine_cache
+                .as_ref()
+                .ok_or_else(|| refuse("no private engine cache".into()))?;
+            Some(
+                cache
+                    .torch_extensions(&effective.profile.build_fingerprint)
+                    .map_err(|error| refuse(error.to_string()))?,
+            )
+        };
+        let built = dir
+            .as_deref()
+            .is_some_and(capyctl_agent::engine_cache::has_build);
         let plan = capyctl_adapters::tensorfold::plan_from_effective(
             effective,
             port,
@@ -305,7 +319,7 @@ impl ProfileBindings {
             )
             .to_string_lossy()
             .into_owned(),
-            Some(dir.to_string_lossy().into_owned()),
+            dir.map(|dir| dir.to_string_lossy().into_owned()),
         )
         .map_err(|error| refuse(error.to_string()))?;
         Ok((plan, built))
@@ -377,6 +391,46 @@ impl ProfileBindings {
         )
         .map_err(|error| refuse(error.to_string()))
     }
+
+    /// ADR 0038 §3: the embedded TensorRT-LLM plan through the shared
+    /// builder. The launch directory is the launch's own in the role's
+    /// private per-launch root (`<state>/rendezvous/<incarnation>`, 0700),
+    /// which Initialize creates and the verified stop removes
+    /// ([`EngineBindings::launch_gone`]); without a private root nothing is
+    /// launched.
+    fn tensorrt_llm_plan(
+        &self,
+        work: &InitializeWork,
+        effective: &capyctl_config::effective::EffectiveDeployment,
+        endpoint: &reqwest::Url,
+    ) -> Result<capyctl_adapters::tensorrt_llm::PlanInputTensorrtLlm, CoordinatorError> {
+        let refuse = |what: String| {
+            CoordinatorError::Service(format!("cannot build a TensorRT-LLM launch plan: {what}"))
+        };
+        let port = endpoint
+            .port()
+            .ok_or_else(|| refuse("the leased endpoint names no port".into()))?;
+        let launch_dir = self
+            .rendezvous
+            .as_ref()
+            .and_then(|root| root.launch_dir(work.incarnation()))
+            .ok_or_else(|| {
+                refuse("the private per-launch directory is not this user's with mode 0700".into())
+            })?;
+        capyctl_adapters::tensorrt_llm::plan_from_effective(
+            effective,
+            port,
+            crate::engine_logs::standalone_log_path(
+                &self.log_dir,
+                &work.fence().deployment_id,
+                work.incarnation(),
+            )
+            .to_string_lossy()
+            .into_owned(),
+            &launch_dir,
+        )
+        .map_err(|error| refuse(error.to_string()))
+    }
 }
 
 /// ADR 0023 §3: before a TensorFold launch, clear the build locks a killed
@@ -403,6 +457,24 @@ pub(crate) fn clear_stale_build_locks(
     if capyctl_agent::engine_cache::clear_stale_locks(dir, recorded) > 0 {
         *extensions_built = capyctl_agent::engine_cache::has_build(dir);
     }
+}
+
+/// ADR 0037 §§7, 11: an embedded launch's engine tracing, from this role's
+/// host setting, its engine and registered build, the deployment's or the
+/// embedded host's zero retention, and (only when everything else would
+/// trace) the shape of its environment. An embedded launch is never a
+/// multi-node group member.
+fn embedded_engine_tracing(
+    effective: &capyctl_config::effective::EffectiveDeployment,
+) -> capyctl_adapters::engine_tracing::EngineTracing {
+    use capyctl_config::lmcache::Retention;
+    capyctl_agent::tracing_install::decide_launch(
+        effective.profile.engine,
+        &effective.profile.build_fingerprint,
+        std::path::Path::new(&effective.profile.executable),
+        effective.retention == Retention::Zero || effective.host.retention == Retention::Zero,
+        false,
+    )
 }
 
 impl EngineBindings for ProfileBindings {
@@ -439,6 +511,16 @@ impl EngineBindings for ProfileBindings {
                         work.endpoint()
                     ))
                 })?;
+                // ADR 0037 §§7, 11: the embedded launch's engine tracing, decided
+                // here as a host agent decides its own, and rendered by its plan.
+                let engine_tracing = embedded_engine_tracing(effective);
+                // Discrete GPU design §6: sized against the card's total.
+                let mut launch = self.vllm_plan(work, &self.sized(work)?)?;
+                launch.engine_tracing = capyctl_adapters::engine_tracing::VllmTrace::for_launch(
+                    &engine_tracing,
+                    &effective.name,
+                    work.instance_index(),
+                );
                 Ok(AdapterSpec::Vllm {
                     endpoint,
                     // The adapter talks to the engine with the same per-launch key
@@ -459,8 +541,7 @@ impl EngineBindings for ProfileBindings {
                         .first()
                         .cloned()
                         .unwrap_or_else(|| effective.name.clone()),
-                    // Discrete GPU design §6: sized against the card's total.
-                    launch: Some(self.vllm_plan(work, &self.sized(work)?)?),
+                    launch: Some(launch),
                     // SPEC §13.3: local-only is not unauthenticated. One fresh key
                     // per launch, hex so it survives an environment variable; the
                     // driver factory seals it under the binding before the builder
@@ -481,6 +562,7 @@ impl EngineBindings for ProfileBindings {
                     api: effective.api,
                     // ADR 0033 §§3, 6: the store's grant (or its reason off).
                     lmcache: self.lmcache(work, effective)?,
+                    engine_tracing,
                 })
             }
             Engine::Sglang => {
@@ -517,6 +599,9 @@ impl EngineBindings for ProfileBindings {
                     _ => None,
                 };
                 Ok(AdapterSpec::Sglang {
+                    // ADR 0037 §§7, 11: on, Initialize names the collector in
+                    // the descriptor.
+                    engine_tracing: embedded_engine_tracing(effective),
                     frozen,
                     // SPEC §13.3: one fresh key per role, hex so it survives the
                     // factory's decode-and-seal; the resolved-spawn factory
@@ -581,6 +666,7 @@ impl EngineBindings for ProfileBindings {
                         .first()
                         .cloned()
                         .unwrap_or_else(|| effective.name.clone()),
+                    line: profile.line,
                     launch: Some(launch),
                     extensions_built,
                 })
@@ -638,6 +724,23 @@ impl EngineBindings for ProfileBindings {
                     endpoint,
                     launch: Some(launch),
                     api_key,
+                })
+            }
+            Engine::TensorrtLlm => {
+                let endpoint = crate::port::engine_url(work.endpoint()).ok_or_else(|| {
+                    CoordinatorError::Service(format!(
+                        "frozen binding endpoint names no address: {}",
+                        work.endpoint()
+                    ))
+                })?;
+                // ADR 0038 §3, §9: no key; the engine listens on loopback.
+                let launch = self.tensorrt_llm_plan(work, &self.sized(work)?, &endpoint)?;
+                Ok(AdapterSpec::TensorrtLlm {
+                    endpoint,
+                    fingerprint: profile.build_fingerprint.clone(),
+                    // ADR 0038 §5: readiness waits for the route served.
+                    model_id: launch.served_model_name.clone(),
+                    launch: Some(launch),
                 })
             }
         }

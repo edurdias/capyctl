@@ -610,25 +610,26 @@ fn one_gpu_status_is_unchanged() {
     assert!(status.get("topology").is_none());
 }
 
-// The per-GPU charges below are pinned. On the lab's 41 GiB cards managing
-// 40 GiB, a vLLM request derived from the measured weights is the rank's
-// share of the weights x 1.10 plus the 4 GiB KV cache, and at least 0.75 of
-// the card (30.75 GiB); each GPU adds the 1.25 GiB context allowance and, on
-// two or more GPUs, the 1 GiB communication allowance (ADR 0035 §3). Without
+// T46 T11 (ADR 0035 §3, ADR 0019 §3–4, issue #225): on the lab's 41 GiB
+// cards managing 40 GiB, a newly derived vLLM request is the rank's share
+// of the measured weights x 1.10 plus the 4 GiB KV cache, without a card-share
+// floor. Each GPU adds the 1.25 GiB context allowance and, on two or more
+// GPUs, the 1 GiB communication allowance. Without
 // a recorded layout a rank's share at N is 0.9 of the weights / N plus the
 // 0.1 every rank keeps whole (ADR 0028 §5). The startup placeholder of a
 // derived vLLM request is the request, so every phase charges the same:
 //
 // | weights | N = 1                  | N = 2                          |
 // |---------|------------------------|--------------------------------|
-// | 30 GiB  | 33 + 4 + 1.25 = 38.25  | 30.75 + 1.25 + 1 = 33.0        |
-// | 40 GiB  | 44 + 4 + 1.25 = 49.25  | 30.75 + 1.25 + 1 = 33.0        |
+// | 30 GiB  | 33 + 4 + 1.25 = 38.25  | 18.15 + 4 + 1.25 + 1 = 24.4    |
+// | 40 GiB  | 44 + 4 + 1.25 = 49.25  | 24.2 + 4 + 1.25 + 1 = 30.45    |
 // | 50 GiB  | 55 + 4 + 1.25 = 60.25  | 30.25 + 4 + 1.25 + 1 = 36.5    |
 // | 100 GiB |                        | 60.5 + 4 + 1.25 + 1 = 66.75    |
 //
 // (GiB, before the integer rounding of the x 1.10.)
 const W30_N1: i64 = 41_070_624_746;
-const FLOOR_N2: i64 = 35_433_480_129;
+const W30_N2: i64 = 26_199_300_400;
+const W40_N2: i64 = 32_695_438_510;
 const W40_N1: i64 = 52_881_784_766;
 const W50_N1: i64 = 64_692_944_896;
 const W50_N2: i64 = 39_191_576_510;
@@ -642,8 +643,8 @@ const W100_N2: i64 = 71_672_266_730;
 #[test]
 fn auto_places_at_the_size_the_cards_hold() {
     for (weights, table, chosen, devices) in [
-        (30, [(1, W30_N1), (2, FLOOR_N2)], 1, vec!["gpu0"]),
-        (40, [(1, W40_N1), (2, FLOOR_N2)], 2, vec!["gpu0", "gpu1"]),
+        (30, [(1, W30_N1), (2, W30_N2)], 1, vec!["gpu0"]),
+        (40, [(1, W40_N1), (2, W40_N2)], 2, vec!["gpu0", "gpu1"]),
     ] {
         let t = lab(2, "40GiB");
         let id = t.auto("auto", weights * GIB);
@@ -664,7 +665,7 @@ fn auto_places_at_the_size_the_cards_hold() {
 // T46 (ADR 0035 §§1a, 2): `auto` chooses N from the cards' managed limits,
 // never their free memory, so the same deployment on the same cards gets the
 // same N whatever else runs. 30 GiB of weights charge 38.25 GiB at N = 1 and
-// 33.0 GiB at N = 2. With gpu0 busy the instance still runs at N = 1, on
+// 24.4 GiB at N = 2. With gpu0 busy the instance still runs at N = 1, on
 // gpu1. With both cards holding another owner's 6.25 GiB, N = 1 fits neither
 // card's free 33.75 GiB while N = 2 would: the start is not placed at N = 2;
 // the switch planner evicts one owner (the one used least recently) for
@@ -684,7 +685,7 @@ fn auto_chooses_from_the_cards_limits_never_their_free_memory() {
     let b0 = t.busy("b0", "gpu0", 100);
     let b1 = t.busy("b1", "gpu1", 110);
     let id = t.auto("auto", 30 * GIB);
-    const { assert!(40 * GIB - BUSY >= FLOOR_N2 && 40 * GIB - BUSY < W30_N1) };
+    const { assert!(40 * GIB - BUSY >= W30_N2 && 40 * GIB - BUSY < W30_N1) };
     let used = {
         let (b0, b1) = (b0.clone(), b1.clone());
         move |deployment: &str, _: i64| {
@@ -799,7 +800,7 @@ fn a_changed_size_is_journaled_and_peaks_are_kept_per_size() {
     let context = t.arm(&planned[0].0);
     assert_eq!(
         (t.charged("gpu0"), t.charged("gpu1")),
-        (FLOOR_N2, FLOOR_N2),
+        (W30_N2, W30_N2),
         "the peak measured at N = 1 never sizes a start at N = 2"
     );
     let status = t.status(&id);
@@ -833,7 +834,7 @@ fn a_changed_size_is_journaled_and_peaks_are_kept_per_size() {
 // start is refused at placement and the refusal names what would fit:
 // `insufficient_device_memory` with the per-GPU charge at the largest N the
 // host offers and how many such cards would hold it (30 GiB of weights on
-// 20 GiB cards), or `insufficient_gpus` with the number of identical GPUs
+// 8 GiB cards), or `insufficient_gpus` with the number of identical GPUs
 // that would, estimated from the candidate table (50 GiB of weights: 60.25
 // GiB per GPU at N = 1 and 36.5 GiB at N = 2, so about 5 GPUs managing
 // 24 GiB each). Nothing is placed or planned.
@@ -842,7 +843,7 @@ fn auto_refusals_name_what_would_fit() {
     let gib = |bytes: i64| format!("{bytes} bytes ({:.2} GiB)", bytes as f64 / GIB as f64);
     let mut t = lab(2, "40GiB");
     let id = t.auto("memory", 30 * GIB);
-    t.set_gpu_limits("20GiB");
+    t.set_gpu_limits("8GiB");
     match t.refused(&id, "start", StartScope::All) {
         LifecycleError::PlacementRefused(reason) => assert_eq!(
             reason,
@@ -852,10 +853,24 @@ fn auto_refusals_name_what_would_fit() {
                  GPU(s) fits; at tensor_parallel: 2 each GPU is charged {}, above the {} the \
                  largest GPU here manages; 2 identical GPUs each managing at least that would \
                  hold it)",
-                gib(FLOOR_N2),
-                gib(20 * GIB)
+                gib(W30_N2),
+                gib(8 * GIB)
             )
         ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(t.placed(&id), vec![(None, None, None)]);
+
+    // Without the removed floor, 20 GiB cards can fit this request at N = 3;
+    // the refusal must ask for more cards, not incorrectly require larger ones.
+    let mut t = lab(2, "40GiB");
+    let id = t.auto("more-cards", 30 * GIB);
+    t.set_gpu_limits("20GiB");
+    match t.refused(&id, "start", StartScope::All) {
+        LifecycleError::PlacementRefused(reason) => {
+            assert!(reason.starts_with("insufficient_gpus:"), "{reason}");
+            assert!(reason.contains("about 3 identical GPUs"), "{reason}");
+        }
         other => panic!("{other:?}"),
     }
     assert_eq!(t.placed(&id), vec![(None, None, None)]);

@@ -7,10 +7,11 @@ more than one, each in its own environment.
 
 | Engine | Versions this release knows | Environment used below |
 |---|---|---|
-| vLLM | 0.32.0, 0.31.0, 0.30.0, 0.29.0 | `~/venvs/vllm` |
-| SGLang | 0.5.21, 0.5.20 | `~/venvs/sglang` |
+| vLLM | 0.33.0 (audited; `CUSTOM yes` pending live qualification), 0.32.0, 0.31.0, 0.30.0, 0.29.0 | `~/venvs/vllm` |
+| SGLang | newest known: 0.5.23 (not yet qualified); verified: 0.5.21, 0.5.20 | `~/venvs/sglang` |
 | TensorFold | 0.6.6, 0.6.5, 0.6.3, 0.6.2, 0.6.1, 0.6.0 | `~/venvs/tensorfold` |
-| llama.cpp | v0.6.0 (every build lists as `CUSTOM yes` for now) | `~/llama.cpp` (a build, no environment) |
+| llama.cpp | v0.9.0 (newest known), v0.7.0, v0.6.0 (every build lists as `CUSTOM yes` for now) | `~/llama.cpp` (a build, no environment) |
+| TensorRT-LLM | 1.2.1, the 1.3 pre-release, 1.4.0rc3 (every installation lists as `CUSTOM yes` for now) | `~/tensorrt-llm-<version>-venv` |
 
 Another version still runs, but `capyctl engine detect` shows it as
 `CUSTOM yes` ([Custom builds](engines.md#custom-builds)). Pin the version as
@@ -54,7 +55,7 @@ shown to get one CapyCTL knows.
    as a DGX Spark. vLLM, SGLang's kernels and PyTorch 2.13.0 publish wheels
    for both, and so does the PyTorch CUDA 13.0 index.
 
-## vLLM 0.32.0, 0.31.0, 0.30.0 or 0.29.0
+## vLLM 0.33.0, 0.32.0, 0.31.0, 0.30.0 or 0.29.0
 
 1. Create the environment:
 
@@ -63,15 +64,15 @@ shown to get one CapyCTL knows.
    ```
 
 2. Install vLLM with PyTorch built for CUDA 13.0 (for an earlier version,
-   write `vllm==0.31.0`, `vllm==0.30.0` or `vllm==0.29.0`):
+   write `vllm==0.32.0`, `vllm==0.31.0`, `vllm==0.30.0` or `vllm==0.29.0`):
 
    ```bash
-   uv pip install --python ~/venvs/vllm/bin/python vllm==0.32.0 --torch-backend=cu130
+   uv pip install --python ~/venvs/vllm/bin/python vllm==0.33.0 --torch-backend=cu130
    ```
 
-   All four releases use PyTorch 2.13.0. `--torch-backend=cu130` makes `uv` take
-   PyTorch from its CUDA 13.0 index; `--torch-backend=auto` picks the index
-   from your driver instead.
+   vLLM 0.33.0 uses PyTorch 2.14.0; the earlier releases listed here use
+   PyTorch 2.13.0. `--torch-backend=cu130` makes `uv` take PyTorch from its
+   CUDA 13.0 index; `--torch-backend=auto` picks the index from your driver.
 
 3. Check it:
 
@@ -79,13 +80,15 @@ shown to get one CapyCTL knows.
    ~/venvs/vllm/bin/vllm --version
    ```
 
-   It prints the version, for example `0.32.0`. CapyCTL runs vLLM for chat;
-   [decision models](deploy.md#decision-models) need SGLang or llama.cpp.
+   It prints the version, for example `0.33.0`. This is the newest known
+   release, audited but not yet live-qualified; it still shows `CUSTOM yes`.
+   CapyCTL runs vLLM for chat, embeddings and decision models; readiness
+   checks the endpoint for the deployment's API.
 
 vLLM's own guide:
-[GPU installation](https://docs.vllm.ai/en/v0.32.0/getting_started/installation/gpu/).
+[GPU installation](https://docs.vllm.ai/en/v0.33.0/getting_started/installation/gpu/).
 
-## SGLang 0.5.21 or 0.5.20
+## SGLang 0.5.23
 
 1. Create the environment:
 
@@ -93,17 +96,19 @@ vLLM's own guide:
    uv venv --python 3.12 --seed --managed-python ~/venvs/sglang
    ```
 
-2. Install SGLang. This is SGLang's own `uv` command, pinned to 0.5.21
-   (write `0.5.20` for that version):
+2. Install the noneditable SGLang wheel, with tracing dependencies and the
+   memory saver CapyCTL uses to park models:
 
    ```bash
-   uv pip install --python ~/venvs/sglang/bin/python --prerelease=allow "sglang==0.5.21"
+   uv pip install --python ~/venvs/sglang/bin/python --prerelease=allow "sglang[tracing]==0.5.23" "torch-memory-saver==0.0.10"
    ```
 
-   Both versions need CUDA 13 and install PyTorch 2.13.0 and
-   `torch_memory_saver`, which CapyCTL uses to park SGLang models.
-   `--prerelease=allow` is needed with `uv` older than 0.12.0 and does nothing
-   on newer ones.
+   This version needs CUDA 13 and installs PyTorch 2.14.1. Install the CUDA
+   13.0 toolkit and a C++ compiler separately if absent; the driver alone does
+   not provide `nvcc`. Set `CUDA_HOME=/usr/local/cuda-13.0` and include
+   `$CUDA_HOME/bin` in `PATH` when building native dependencies.
+   Version 0.5.23 is the newest known version, not a qualified version:
+   detection still lists it as `CUSTOM yes` pending live qualification.
 
    Install SGLang as a regular package, never in editable mode (`pip install
    -e`). CapyCTL loads SGLang only from the environment's `site-packages` and
@@ -124,7 +129,7 @@ vLLM's own guide:
    ~/venvs/sglang/bin/python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
    ```
 
-   The first prints `0.5.21`, the second `2.13.0`, `13.0` and `True` (the
+   The first prints `0.5.23`, the second `2.14.1`, `13.0` and `True` (the
    version can carry a `+cu130` suffix).
 
 SGLang's own guide: [Installation](https://docs.sglang.io/docs/get-started/install).
@@ -189,7 +194,35 @@ TensorFold's own guide: the
 [runbook](https://github.com/ashhart/TensorFold/blob/v0.6.6/RUNBOOK.md)
 at the release tag.
 
-## llama.cpp v0.6.0
+## TensorFold native 1.2.6 (qualification pending)
+
+Use the [native release archive](https://github.com/ashhart/TensorFold/releases/tag/v1.2.6),
+not pip. The x86_64 archive embeds sm_120 kernels for an RTX PRO 6000;
+an aarch64 archive is also available. The plain-text CUDA workload needs
+glibc 2.28 or later and an NVIDIA R580+ driver exposing CUDA 13.0, not
+Python, PyTorch, Triton or a CUDA compiler.
+
+```bash
+mkdir -p "$HOME/tensorfold-downloads"
+cd "$HOME/tensorfold-downloads"
+curl -fLO https://github.com/ashhart/TensorFold/releases/download/v1.2.6/tensorfold-1.2.6-linux-x86_64.tar.gz
+curl -fLO https://github.com/ashhart/TensorFold/releases/download/v1.2.6/tensorfold-1.2.6-linux-x86_64.tar.gz.sha256
+sha256sum -c tensorfold-1.2.6-linux-x86_64.tar.gz.sha256
+tar -xzf tensorfold-1.2.6-linux-x86_64.tar.gz -C "$HOME"
+cd "$HOME/tensorfold-1.2.6-linux-x86_64"
+sha256sum -c SHA256SUMS
+bin/tensorfold-native --version
+capyctl engine add "$HOME/tensorfold-1.2.6-linux-x86_64" --name tensorfold-1-2-6
+```
+
+Keep the whole root, including `lib/libtfgrammar.so`. Configure local model
+storage and `restart_only` as in [TensorFold native](engines.md#tensorfold-native-1x).
+Optional vision, Drama, TP and PDF workloads need additional libraries listed
+in upstream's [runtime requirements](https://github.com/ashhart/TensorFold/blob/v1.2.6/RUNTIME.md).
+CPU tests are not qualification; live checks on the rented x86_64 RTX PRO
+6000 machine and host A remain owed.
+
+## llama.cpp v0.9.0
 
 llama.cpp is a C++ program: CapyCTL runs its `llama-server` binary, built from
 the release tag. The build needs `git`, `cmake`, a C++ compiler and a CUDA
@@ -198,13 +231,13 @@ toolkit with `nvcc` (`ls /usr/local/cuda/bin/nvcc` to check).
 1. Get the release tag:
 
    ```bash
-   git clone --branch v0.6.0 --depth 1 https://github.com/ggml-org/llama.cpp ~/llama.cpp
+   git clone --branch v0.9.0 --depth 1 https://github.com/ggml-org/llama.cpp ~/llama.cpp
    ```
 
 2. Build `llama-server` with CUDA. `-DLLAMA_BUILD_IS_DEV=OFF` makes the binary
-   report `0.6.0` rather than `0.6.0-dev`; `CMAKE_CUDA_ARCHITECTURES` limits
-   the kernels to your GPU (`89` for RTX 40 series; leave it out to build for
-   every architecture, which takes much longer):
+   report `0.9.0` rather than `0.9.0-dev`; `CMAKE_CUDA_ARCHITECTURES` limits
+   the kernels to your GPU (`89` for RTX 40 series, `120a-real` for RTX PRO
+   6000, `121a-real` for GB10; leave it out to build for every architecture):
 
    ```bash
    cd ~/llama.cpp
@@ -223,7 +256,7 @@ toolkit with `nvcc` (`ls /usr/local/cuda/bin/nvcc` to check).
    ~/llama.cpp/build/bin/llama-server --version
    ```
 
-   It prints `version: 0.6.0 (build 1, commit d81235049)` on standard error.
+   It prints a line such as `version: 0.9.0 (build 1, commit cd959bae9)` on standard error.
 
 4. Get a model as a GGUF file, in a directory of its own under `~/models`,
    for example:
@@ -236,8 +269,108 @@ Do not create `/etc/llama.cpp/config.ini`: llama-server reads it as options, so
 CapyCTL refuses to register or start llama.cpp on a machine that has it.
 
 llama.cpp's own guide: the
-[server README](https://github.com/ggml-org/llama.cpp/blob/v0.6.0/tools/server/README.md)
+[server README](https://github.com/ggml-org/llama.cpp/blob/v0.9.0/tools/server/README.md)
 at the release tag.
+
+## TensorRT-LLM 1.2.1, 1.3 pre-release or 1.4.0rc3
+
+CapyCTL runs TensorRT-LLM's `trtllm-serve` on one GPU. Three
+versions are being qualified, each with its own live rows: 1.2.1, a 1.3
+pre-release (the option tables were read from 1.3.0rc29) and 1.4.0rc3. No
+version has passed its rows yet, so the verified set is empty: every
+TensorRT-LLM installation lists as `CUSTOM yes` and runs as an uncertified
+custom setup. CapyCTL never refuses one for being uncertified.
+
+TensorRT-LLM needs an MPI runtime and a complete CUDA developer toolkit.
+On Ubuntu, an administrator can install `libopenmpi-dev` (Open MPI 4.1.6
+on Ubuntu 24.04). On x86_64, the no-system-package alternative is the
+venv-local `openmpi==4.1.8` wheel with `mpi4py==4.1.2`.
+Keep Open MPI on the audited 4.1 line for isolated-singleton operation.
+
+Use toolkit 13.1 for 1.2.1 and 13.4 for 1.4.0rc3, installed side by side.
+Without system packages, provision NVIDIA's toolkit in a user prefix, or
+assemble the complete pip toolkit components, and set `CUDA_HOME` to it.
+The engine wheel alone does not supply the developer toolkit. CUDA 13.x
+minor compatibility has PTX/JIT restrictions: an existing CUDA 13.0-capable
+driver is not proof that rc3/cu132 works. Driver or approved compatibility
+provisioning may be necessary; qualify the actual GPU and model.
+
+The steps below retain the 1.2.1 ARM64 baseline recipe:
+
+1. Create the environment:
+
+   ```bash
+   python3.12 -m venv ~/tensorrt-llm-1.2.1-venv
+   ```
+
+2. Install PyTorch first, then pin it so the wheel cannot replace it:
+
+   ```bash
+   ~/tensorrt-llm-1.2.1-venv/bin/pip install torch==2.9.1 torchvision \
+     --index-url https://download.pytorch.org/whl/cu130
+   echo "torch==2.9.1+cu130" > constraints.txt
+   ```
+
+3. Install the wheel by URL with its hash, so nothing else can be substituted:
+
+   ```bash
+   ~/tensorrt-llm-1.2.1-venv/bin/pip install -c constraints.txt \
+     --extra-index-url https://pypi.nvidia.com/ \
+     "tensorrt_llm @ https://pypi.nvidia.com/tensorrt-llm/tensorrt_llm-1.2.1-cp312-cp312-linux_aarch64.whl#sha256=4c4cf7c00e0e54fe1038ffeb4247b66664d585d054c67810ce04d1c7a018f57a"
+   ```
+
+   The extra index supplies its NVIDIA dependencies (`tensorrt`, `nvidia-*`).
+
+   For the x86_64 pip-MPI recipe, first install
+   `openmpi==4.1.8 mpi4py==4.1.2` with this environment's pip. Use the
+   [NVIDIA index](https://pypi.nvidia.com/tensorrt-llm/) wheel matching
+   Python and architecture; the 1.2.1 cp312 x86_64 wheel has SHA-256
+   `21e38958649b8d1cfd63c7f8b0fb55f695066f206c521c32dcad563cce54797b`.
+
+   ```bash
+   ~/tensorrt-llm-1.2.1-venv/bin/python -m pip install \
+     openmpi==4.1.8 mpi4py==4.1.2
+   ```
+
+   For **1.4.0rc3 on x86_64**, create a separate environment, install
+   torch `2.14.0` from `https://download.pytorch.org/whl/cu132`, and pin
+   `torch==2.14.0+cu132` in its constraints file. Install
+   `openmpi==4.1.8 mpi4py==4.1.2`, then use:
+
+   ```bash
+   ~/tensorrt-llm-1.4.0rc3-venv/bin/python -m pip install \
+     openmpi==4.1.8 mpi4py==4.1.2
+   ~/tensorrt-llm-1.4.0rc3-venv/bin/pip install -c constraints.txt \
+     --extra-index-url https://pypi.nvidia.com/ \
+     "https://pypi.nvidia.com/tensorrt-llm/tensorrt_llm-1.4.0rc3-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=9f6e685bf5c60c17b0d15aba90272e6bc6484d2cec55155b05bde946d3e97fbd"
+   ```
+
+   Inspection of mpi4py 4.1.2 shows it searches `<venv>/lib` explicitly;
+   Open MPI 4.1.8 installs `libmpi.so.40` there with
+   `$ORIGIN:$ORIGIN/openmpi` RUNPATH. No `LD_LIBRARY_PATH` is needed for
+   this wheel pair, and CapyCTL still strips inherited `LD_*` variables.
+   Confirm the loaded MPI identity and isolated-singleton behavior in the
+   live rows; wheel inspection and CPU tests are not qualification.
+
+4. Check it without importing it (an import starts MPI and CUDA):
+
+   ```bash
+   ~/tensorrt-llm-1.2.1-venv/bin/python -I -c \
+     'import importlib.metadata as m; print(m.version("tensorrt_llm"), m.version("torch"))'
+   ```
+
+   It prints `1.2.1 2.9.1+cu130`.
+
+5. Get a Hugging Face checkpoint in BF16 into a directory under `~/models`.
+   TensorRT-LLM on CapyCTL serves full-attention decoders; a model with
+   sliding windows, latent attention or recurrent layers is refused
+   (`kv_geometry_unsupported`).
+
+On its first start FlashInfer may download prebuilt kernels over the network.
+CapyCTL allows these downloads.
+
+Register it by naming `~/tensorrt-llm-1.2.1-venv/bin/trtllm-serve`
+([TensorRT-LLM](engines.md#tensorrt-llm)).
 
 ## Register it with CapyCTL
 

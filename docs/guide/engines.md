@@ -53,9 +53,10 @@ an editable install (`pip install -e`, as in the official `lmsysorg/sglang`
 image) cannot load, and `engine add` refuses it before running anything:
 `installation_unsupported:editable`, exit 17. Standalone refuses each launch of
 such an installation with the same code, including one named
-with `--sglang-bin` or `local_engine`; on a GPU machine of several the engine
-starts and fails at once with `engine_import_failed`. Reinstall SGLang without
-`-e` ([Install an engine](install-engines.md#sglang-0521-or-0520)).
+with `--sglang-bin` or `local_engine`. An enrolled host refuses it too toward
+a 0.2.0 server. Toward an older server the engine starts and fails at once with
+`engine_import_failed`, without ending the control session. Reinstall SGLang without
+`-e` ([Install an engine](install-engines.md#sglang-0523)).
 
 That output is from a first run, before CapyCTL was started: the engine is saved
 and used from the first start. If CapyCTL is running, it uses the engine at once
@@ -72,11 +73,19 @@ the CLI and the running role the same ones.
 
 ## Custom builds
 
+The newest known SGLang release is 0.5.23. Its protected launch policy is
+covered by CPU tests, but it remains `CUSTOM yes` until live qualification;
+CPU tests are not qualification. See its [installation recipe](install-engines.md#sglang-0523).
+
 `CUSTOM yes` means a version other than vLLM 0.29.0 to 0.32.0, SGLang 0.5.20 and 0.5.21 or
 TensorFold 0.6.0 to 0.6.3, 0.6.5 and 0.6.6, the versions this release of CapyCTL knows; every
 llama.cpp build shows `yes` for now ([llama.cpp](#llamacpp)). CapyCTL still runs it. A custom build is
 not a [custom engine](#custom-engines): CapyCTL still knows its options. Give it its own
-name so it does not replace your main one:
+name so it does not replace your main one.
+
+vLLM 0.33.0 is the newest known release: its launch interfaces have been
+audited, but it still shows `CUSTOM yes` until live qualification. CPU tests
+do not qualify an engine.
 
 ```bash
 capyctl engine add ~/venvs/vllm-nightly --name vllm-nightly
@@ -153,6 +162,12 @@ each running request: Qwen3.8-27B with DFlash2 holds about 16 GiB of state for 8
 requests and about 61 GiB for 32. Set `max_concurrent_requests` to run more.
 
 ## TensorFold
+
+TensorFold comes in two lines, both the engine `tensorfold` in a deployment:
+the Python line, 0.6.x, installed in a venv (this section), and the native
+line, 1.x, a single binary from a release archive
+([TensorFold native](#tensorfold-native-1x) below). Which one a deployment
+runs is a property of the engine profile it names.
 
 CapyCTL runs TensorFold 0.6.0 to 0.6.3, 0.6.5 and 0.6.6 from a plain venv. TensorFold builds
 CUDA kernels the first time it starts, so the machine needs `nvcc`, `ninja` and
@@ -315,11 +330,118 @@ minutes; CapyCTL allows it up to 30 minutes, and later starts reuse the build.
 TensorFold is checked on NVIDIA GB10 (unified memory) in this release. On a
 discrete GPU it runs, but no live check has passed there yet.
 
+### TensorFold native (1.x)
+
+TensorFold 1.0 and later is a native binary, `bin/tensorfold-native`, shipped
+as a release archive; `pip install` stops at 1.0 and the Python engine stays
+on 0.6. Unpack the archive and keep its `bin`, `lib` and `share` together;
+the directory it unpacks to is the installation:
+
+```bash
+capyctl engine add ~/tensorfold-1.0.0
+```
+
+`engine add` takes the release directory, its `bin` or the binary itself.
+It runs `tensorfold-native --version` and checks the answer against the
+`VERSION` file, checks every file `SHA256SUMS` lists (a release changed after
+it was unpacked is refused `engine_unsupported`; a release without the file
+registers, and `engine list` says the publisher's list was absent), and reads
+`tensorfold-native capabilities --json` for the flags CapyCTL renders, the
+memory cap variable and the model families the build reads. No compiler or
+CUDA toolkit is needed: nothing is built at run time, and the first start
+is an ordinary one. The fingerprint covers every file of the release,
+the CUDA kernel set under `share/tensorfold/cuda` included, so a replaced
+kernel is drift. The profile is written with `line: native`.
+
+The profile is named `tensorfold` when no profile has that name. With a
+0.6 profile already named `tensorfold`, `engine add` writes nothing and asks
+for `--name`; the two profiles live side by side, and a deployment picks one
+with `engine:`:
+
+```bash
+capyctl engine add ~/tensorfold-1.1.5 --name tensorfold-1-1-5
+```
+
+Native 1.2.6 is also a target release, not yet certified. Its x86_64 archive
+includes sm_120 kernels for RTX PRO 6000; aarch64 archives remain available.
+Use the [1.2.6 archive installation recipe](install-engines.md#tensorfold-native-126-qualification-pending)
+and register the complete root as `tensorfold-1-2-6`. CPU tests are not
+qualification; live checks on the rented x86_64 RTX PRO 6000 machine and
+host A remain owed (ADR 0039's proposed 2026-11-10 amendment).
+
+`capyctl engine detect` lists `tensorfold-native` binaries on `PATH`, in
+`~/*/bin`, `/opt/*/bin`, `/usr/local/bin` and every `--path`, with the
+version their `VERSION` file names; it runs nothing. The role's own engine
+(`--tensorfold-bin`, `local_engine.tensorfold`, `CAPYCTL_TENSORFOLD_BIN`)
+takes a `tensorfold-native` path as well.
+
+**Certified and uncertified.** CapyCTL certifies TensorFold native 1.0.0 and
+1.1.5 with Nemotron 3.5 Lightning 30B-A3B 4-bit
+(`TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit` at revision
+`d9d758fb83953437f7263256b0d96157e2a348b8`, or its earlier repository id at
+the same revision) on a GB10, each version once its live rows pass; until
+then both run as uncertified setups and say which rows certify them. Any
+other native version registers and runs as an uncertified custom setup: it is
+never refused for its version, and `engine list`, `capyctl status
+deployment` and `capyctl validate config` say it is not certified. Any other
+checkpoint runs uncertified too, with the note "not certified: TensorFold
+native certifies only Nemotron 3.5 Lightning at revision d9d758f on a GB10".
+When the checkpoint's `config.json` names a family or weight format the
+installation's capabilities document does not list, the note adds that the
+engine is expected to refuse it at start; if it does, the start fails with
+that note and points to the 0.6 line. Until the native rows pass, 0.6.6 stays
+the documented way to run Nemotron 3.5 Lightning on a GB10; once they pass,
+the native line is, and 0.6.6 stays the way for every other TensorFold model.
+
+**Deployments.** A native deployment states `resources` and
+`context_length` as a 0.6 one does, and `max_concurrent_requests` renders
+`--parallel` (8 when not set; `--parallel` in `extra_args` instead works, not
+both). The native engine reserves every stream at its full window when it
+starts, so `resources` must cover the weights plus `max_concurrent_requests`
+streams at `context_length`, plus scratch buffers, CUDA graphs and the CUDA
+context. For Nemotron 3.5 Lightning 4-bit the weights are 17.25 GiB and each
+stream at a 32768-token window about 0.29 GiB (2.3 GiB for 8), as computed
+from the engine's source; the live rows measure the rest, and the example's
+`{gpu: 30GiB, ram: 2GiB}` is the 0.6.6 figure until then. A start that does
+not fit is refused by the engine, and `capyctl status deployment` says to
+lower `max_concurrent_requests` or `context_length`, or raise `resources`;
+nothing grows past the start's admission later. CapyCTL starts it with
+`TENSORFOLD_CUDA_MEMORY_LIMIT_GB` set to the declared allocation and
+`TENSORFOLD_MEMORY_RESERVE_GIB=2`, so the engine's own reserve does not
+refuse a start CapyCTL's memory accounting admitted.
+
+Refused on the native line: `kv_cache_dtype` (its KV cache is BF16),
+`model.draft` and `--drafter` (it drafts with the checkpoint's own MTP head;
+`--no-drafts` turns that off), a `topology` (one GPU, no group), `api:
+decisions`, and `residency: deep` or `host_backed`. Its option checks compare
+exact names, as the binary does ([Engine options](engine-flags.md#tensorfold-native-100-and-115));
+1.1.5's `--idle-unload` is reserved, since the idle policy is CapyCTL's.
+`--compact-at`, `--compact-keep` and `--compact-memory` are ordinary options,
+refused under `retention: zero`, as are 1.1.5's `--record`, `--learn*` and
+`--recall*`, which write request state to disk
+([Data retention](../operations/data-retention.md#zero-data-retention)).
+Native 1.2.6's `--unix-socket` is reserved because CapyCTL owns the listener.
+Its `--prompt-cache-disk` and `--spill-gib` are ordinary options except under
+`retention: zero`, where both are refused for writing request state to disk.
+
+**Running.** The engine opens its port only once the model is loaded, so
+CapyCTL waits through refused connections, then needs `/health` to answer
+`status: ok` with the served name and `max_batch_size` equal to the
+rendered `--parallel` (`effective_args_mismatch` otherwise), the name in
+`/v1/models` and an answer to the chat probe. It is idle when `/metrics`
+reads `tensorfold:requests_running` and `tensorfold:requests_waiting` both 0;
+a stop waits for that, as on 0.6. After the probe, and whenever CapyCTL
+checks the engine again, any listener of the engine's process off
+`127.0.0.1` and `::1` stops it (`tensorfold_listener_exposed`). It never
+parks: `capyctl park deployment` is refused, and a stop and the next start
+are the restart. LMCache is off, as on 0.6.
+
 ## llama.cpp
 
-CapyCTL runs llama.cpp's `llama-server` from v0.6.0, one GGUF model per
+CapyCTL runs llama.cpp's `llama-server` from v0.6.0 through the newest known
+release, v0.9.0, one GGUF model per
 deployment. llama.cpp is a single binary, not a Python environment: build it
-([Install an engine](install-engines.md#llamacpp-v060)) and name the binary, or
+([Install an engine](install-engines.md#llamacpp-v090)) and name the binary, or
 the directory that holds it:
 
 ```bash
@@ -353,6 +475,15 @@ the engine's configuration directory at an empty one of its own.
 
 Every llama.cpp build lists as `CUSTOM yes` for now. A build of v0.6.0 runs;
 `custom` only says this release has not finished checking llama.cpp.
+The newest known release is v0.9.0 (`cd959ba`); v0.7.0 (`620d222`) is also
+recognized. Neither recognition nor CPU tests qualify a build.
+
+For `api: decisions`, llama.cpp v0.7.0 or newer is required. MiniCPM OCR
+decision models are unsupported: their two-image binary OCR contract is not
+compatible with CapyCTL's fixed text readiness and wake probe. Do not deploy
+that family with `api: decisions`; ordinary choice models retain the existing
+probe and still need live qualification. Tunnel options `--connect` and
+`--connect-code`, and router option `--models-memory-margin`, are refused.
 
 ### A llama.cpp deployment
 
@@ -452,6 +583,115 @@ choose.
 
 llama.cpp has run on a discrete NVIDIA GPU so far; a GB10 has not run it yet.
 
+## TensorRT-LLM
+
+CapyCTL runs NVIDIA TensorRT-LLM's `trtllm-serve`, engine kind
+`tensorrt-llm`: one Hugging Face checkpoint on the PyTorch backend, on one GPU
+of one host, for chat. Three versions are being qualified: 1.2.1, the 1.3
+pre-release (the tables were read from 1.3.0rc29) and 1.4.0rc3. Install one in
+its own Python environment ([Install an
+engine](install-engines.md#tensorrt-llm-121-13-pre-release-or-140rc3)) and
+name its `trtllm-serve`:
+
+```bash
+capyctl engine add ~/tensorrt-llm-1.2.1-venv/bin/trtllm-serve
+```
+
+The profile is named `tensorrt-llm` unless you pass `--name`.
+
+`engine add` never imports TensorRT-LLM and never runs `trtllm-serve`:
+importing it starts MPI and CUDA, and Open MPI could leave a daemon behind.
+It runs the environment's Python on `importlib.metadata` instead, which reads
+the version of `tensorrt_llm` and, beside it, of `torch`, `tensorrt`,
+`flashinfer-python`, `transformers` and `mpi4py`. The profile records those
+as its `companions`, and `engine list` shows them, so a changed torch or
+FlashInfer shows there. `engine detect` finds the environment by its
+`tensorrt_llm-*.dist-info` without running anything. The fingerprint covers
+the `tensorrt_llm/` and `triton_kernels/` packages, their compiled libraries
+included; torch, TensorRT, FlashInfer and the MPI library are outside it.
+
+No TensorRT-LLM version is verified yet. A verified entry names the version
+and the torch build beside it, and each is added only once its live rows pass
+(TR1–TR11 for 1.2.1, TR1a–TR11a and TR1b–TR11b for the pre-releases). Until
+then every TensorRT-LLM installation lists as `CUSTOM yes` and runs as an
+uncertified custom setup; it is never refused for being uncertified, and the
+checks below apply to it all the same. A version outside the three uses the
+option tables of the qualified version of its minor line, else 1.2.1's
+([Engine options](engine-flags.md#tensorrt-llm-121-130rc29-and-140rc1)).
+
+### A TensorRT-LLM deployment
+
+The settings TensorRT-LLM takes from the deployment:
+
+| Setting | What it does | Default |
+|---|---|---|
+| `engine_config.context_length` | Each request's window (`--max_seq_len`). | none |
+| `engine_config.max_concurrent_requests` | How many requests run together (`--max_batch_size`). | 32 |
+| `engine_config.dtype` | The weights' dtype. | `auto` |
+| `engine_config.kv_cache_dtype` | The KV cache dtype: `auto` (the model's) or `fp8`. | `auto` |
+| `engine_config.cuda_graphs` | `false` turns CUDA graphs off. | the engine's |
+| `engine_config.tensorrt-llm.reasoning_parser`, `engine_config.tensorrt-llm.tool_call_parser` | The parsers, in TensorRT-LLM's names. | by model family |
+| `engine_config.tensorrt-llm.llm_api_options` | More LLM API arguments, a mapping merged under CapyCTL's own keys. | none |
+
+CapyCTL writes the engine's configuration file itself and refuses a mapping
+that names a key it sets or keeps off
+([the configuration file](engine-flags.md#the-configuration-file)). The served
+name must be one path component (not empty, `.` or `..`, no `/`, at most 255
+bytes), because TensorRT-LLM serves the name of the model directory and
+CapyCTL links the checkpoint under it; another name is refused
+`served_name_unsupported`.
+
+The KV cache comes from the grant: CapyCTL turns `memory.kv_cache` into a
+token count from the checkpoint's `config.json` and renders it as
+`kv_cache_config.max_tokens`. A model it cannot size that way (sliding or
+per-layer attention windows, multi-head latent attention, recurrent or hybrid
+layers, encoder-decoder models) is refused `kv_geometry_unsupported`. Once the
+engine is up, CapyCTL reads the pool it built: one that cannot hold a single
+request's window stops the launch with `kv_cache_short`, and one larger than
+the rendered figure by more than a block fails it `effective_args_mismatch`.
+
+Refused for TensorRT-LLM, with the reason:
+
+- `residency: deep` or `host_backed` (`capability_missing:deep_park`), and
+  `--deep-park enabled` at `engine add`: TensorRT-LLM parks by stopping
+  ([Parking](parking.md)).
+- `topology`, on one host or across machines (`multi_gpu_unsupported`):
+  TensorRT-LLM runs on one GPU in this version.
+- `api: decisions` and embeddings (`capability_missing`).
+- `quantization` (the checkpoint carries it), `language_model_only`, and
+  `model.draft` (speculative decoding is out of scope).
+- `lmcache: required` (`engine_unsupported`): LMCache is not qualified with
+  TensorRT-LLM, and an `auto` deployment shows LMCache off with that reason.
+- Options and keys CapyCTL renders or keeps off, and the engine variables of
+  [Engine options](engine-flags.md#tensorrt-llm-121-130rc29-and-140rc1)
+  (`engine_env_reserved:<name>`), even when `approved_env` lists them.
+
+Every launch runs the model in the `trtllm-serve` process
+(`TLLM_WORKER_USE_SINGLE_PROCESS=1`) and pins Open MPI to one local process
+with no daemon and no network transport. At readiness and whenever a host
+re-proves the launch, CapyCTL checks two things: that no process the engine
+started has left its process group (else the launch stops,
+`engine_process_escaped`, naming the process), and that no process of the
+launch listens anywhere but loopback (else `engine_listener_exposed`).
+
+`trtllm-serve` listens on `127.0.0.1` with no key; `engine list` shows
+`engine key: none`. It is reached only through CapyCTL's endpoint, which
+checks your API key, but any local user can reach its port, as with llama.cpp
+and TensorFold.
+
+TensorRT-LLM reports no idle signal CapyCTL accepts (`engine list` shows
+`idle signal: none`), so a cancelled request is settled as for a custom
+engine without one ([Cancelled requests](#cancelled-requests)): it stays
+`cancelling` until the engine's next stop or restart. CapyCTL reads the
+engine's `/metrics` for load only.
+
+On first start FlashInfer may download prebuilt kernels over the network; CapyCTL
+allows this. With the host's `engine_telemetry: off`, CapyCTL sets
+`DO_NOT_TRACK=1`; TensorRT-LLM has no usage reporting of its own in 1.2.1.
+
+No TensorRT-LLM live check has passed yet. CPU and Fake-engine tests are not
+qualification.
+
 ## Custom engines
 
 A custom engine is a program CapyCTL has no integration for, such as a model's
@@ -481,7 +721,7 @@ health: /health
 | Field | What it holds | Required |
 |---|---|---|
 | `kind`, `schema_version` | `custom_engine` and `1`. | yes |
-| `api` | What every deployment on the engine serves: `chat` (`POST /v1/chat/completions`) or `decisions` (`POST /v1/systemone`, [Decision models](deploy.md#decision-models)). | yes |
+| `api` | What every deployment on the engine serves: `chat` (`POST /v1/chat/completions`), `decisions` (`POST /v1/systemone`, [Decision models](deploy.md#decision-models)) or `embeddings` (`POST /v1/embeddings`, [Embedding models](deploy.md#embedding-models)). | yes |
 | `args` | The whole argument list after the executable, with placeholders (below). | yes |
 | `version` | A version string, shown as the engine's version. Without it the engine shows `unversioned`. CapyCTL never runs the program to ask. | no |
 | `environment` | An absolute directory to fingerprint in place of the default ([Fingerprint and drift](#fingerprint-and-drift)). | no |
@@ -620,9 +860,10 @@ CapyCTL keeps, as for every engine:
 - **The port.** `{host}` and `{port}` give the engine a private loopback
   port; CapyCTL's endpoint is the only way to it from the network.
 - **Requests.** Lookup by model name, your API key, waiting, starting on
-  demand, the 32 running requests per deployment and fairness between models.
-  A request has the same shape as for any engine: chat completions, or
-  CapyCTL's decision request ([Decision requests](requests.md#decision-requests)).
+  demand, the running-request bound per deployment (32 when unset) and fairness between models.
+  A request has the same shape as for any engine: chat completions,
+  CapyCTL's decision request ([Decision requests](requests.md#decision-requests))
+  or an embedding request ([Embedding requests](requests.md#embedding-requests)).
 - **Readiness** (below).
 - **Memory.** You state `resources`; CapyCTL derives nothing. It watches the
   engine's memory and shows the startup peak (`startup.measured` in
@@ -660,17 +901,21 @@ CapyCTL refuses:
   count of running requests.
 
 A deployment's `api` must be the manifest's: `api: decisions` on a chat engine
-is refused `capability_missing:decisions`, and a chat deployment on a decisions
-engine `capability_missing:chat`. For a decision model, a `topology` or a
-parking `residency` is refused by the decision-model rules first, with their
-message ("runs on one machine", "restarts instead of parking").
+is refused `capability_missing:decisions`, `api: embeddings` on another
+engine `capability_missing:embeddings`, and a chat deployment on a decisions
+engine `capability_missing:chat`. For a decision or embedding model, a
+`topology` or a parking `residency` is refused by that model kind's rules
+first, with their message ("runs on one machine", "restarts instead of
+parking", "runs on one GPU of one machine"). An embeddings custom engine is
+never certified ([Certified and uncertified](deploy.md#certified-and-uncertified)).
 
 ### Readiness
 
 A custom engine is ready when, in order, its port accepts a connection, its
 `health` path (when the manifest has one) answers 200, and the model answers
 the same check as on any engine: a short chat request for `chat`, the fixed
-decision for `decisions` ([Decision models](deploy.md#decision-models)), sent
+decision for `decisions` ([Decision models](deploy.md#decision-models)), the
+fixed embedding for `embeddings` ([Embedding models](deploy.md#embedding-models)), sent
 with the served name and the engine key when there is one. The engine's own
 `/v1/models` is not read; its shape differs from program to program. Without
 `timeouts.initialize`, the start gets the bound CapyCTL derives for every
@@ -830,9 +1075,9 @@ process:
 - listening only on loopback, on two ports CapyCTL takes from the host's
   `endpoint_port_range`; a server found listening anywhere else is stopped
   and the model runs without it;
-- with a pool of host RAM (4 GiB by default, `lmcache_pool` to change it)
-  allocated when it starts, evicting least recently used entries, and no disk,
-  remote or peer tier;
+- with a pool of host RAM (by default sized to hold one full context of the
+  model, below; `lmcache_pool` to state a size) allocated when it starts,
+  evicting least recently used entries, and no disk, remote or peer tier;
 - with an environment of `PATH`, `HOME` and the instance's GPU only, and its
   script API off;
 - writing its output to its own log beside the engine's, through the same
@@ -841,8 +1086,22 @@ process:
 The engine connects to it: vLLM through LMCache's `LMCacheMPConnector`
 (CapyCTL renders `--kv-transfer-config` with the connector's module path and
 `autostart: false`), SGLang through `--enable-lmcache --lmcache-config-file`
-(a private file holding only the server's address). The in-process
-`LMCacheConnectorV1` is never used: it ignores `cache_salt`.
+(a private file holding only the server's address and, for a parking model,
+its transfer mode). The in-process `LMCacheConnectorV1` is never used: it
+ignores `cache_salt`.
+
+**Transfer modes.** A model that parks (`deep` or `host_backed`) uses
+engine-driven transfer: the server runs with
+`--supported-transfer-mode engine_driven`, the engine's connector with
+`lmcache.mp.mp_transfer_mode: engine_driven`, and the engine copies each
+chunk of KV through host memory to the server, which never maps the engine's
+GPU memory. A park therefore releases the engine's KV, and the memory a wake
+allocates is what the next copy reads. A `restart_only` model keeps LMCache's
+default, LMCache-driven transfer, where the server maps the engine's KV
+through CUDA IPC (and, after a restart-park, can keep the stopped engine's
+KV, which CapyCTL counts; see [parking](parking.md#parking-with-lmcache));
+it moves to engine-driven transfer once the live rows measuring its cost and
+its restart-parks pass.
 
 **Which engines.**
 
@@ -854,12 +1113,29 @@ The engine connects to it: vLLM through LMCache's `LMCacheMPConnector`
 | SGLang, a decision deployment or `--disable-radix-cache` | off: `engine_unsupported` (below) |
 | SGLang before 0.5.22 | off: "LMCache needs SGLang 0.5.22 or newer" |
 | llama.cpp, TensorFold | off: the engine has no LMCache integration |
+| any engine, an embedding deployment | off: `embeddings_unsupported` |
 | custom engine | off: CapyCTL does not render options for it |
 
 vLLM 0.32.0 and SGLang 0.5.22 with LMCache 0.5.6 are the qualified versions
 (measured on a GB10); a newer engine or a later LMCache 0.5.x is used when
 the launch-time check below passes, and is not qualified until a live run
-covers it. A deployment with a `topology` runs without LMCache.
+covers it. A deployment with a `topology` across machines runs without
+LMCache. A model on several GPUs of one machine runs without it under
+`lmcache: auto` (`multi_gpu_unqualified`), and as an uncertified setup under
+`lmcache: required`.
+
+**Parking: the certified table.** A model that parks (`deep`, or
+`host_backed` on a discrete GPU) uses LMCache by default only on a
+combination certified live: an engine version, the checkpoint's
+`model_type`, the GPU as `nvidia-smi` names it, and the residency. Rows come
+from live runs on the GB10 (`deep`) and on one discrete GPU (`host_backed`);
+only dense models with full attention can be listed, since LMCache 0.5.6's
+engine-driven transfer refuses sliding-window, recurrent and indexer layers.
+
+This release certifies no combination yet: the live runs that add rows have
+not run. Until a row lists its combination, a parking model runs without
+LMCache (`park_unqualified`), and under `lmcache: required` with it,
+uncertified.
 
 **Decision deployments on SGLang run without LMCache**, and so does any SGLang
 deployment whose arguments state `--disable-radix-cache`: SGLang 0.5.22 fails
@@ -894,14 +1170,24 @@ the engine again").
 **The launch-time check** reads files of the registered environment and runs
 nothing. It passes when LMCache is 0.5.6 or a later 0.5.x; its package holds
 the connector the engine needs, the `lmcache server` entry point and the
-server options CapyCTL renders; vLLM's KV transfer configuration accepts a
-connector module path; and SGLang declares its LMCache settings and selects
-its unified LMCache radix cache. On SGLang the check also verifies that the
+server options CapyCTL renders (the eviction watermark and ratio included);
+vLLM's KV transfer configuration accepts a connector module path; and SGLang
+declares its LMCache settings and selects its unified LMCache radix cache. For
+a parking model it also verifies engine-driven transfer: the server's
+`--supported-transfer-mode` offers `engine_driven`, vLLM's LMCache adapter
+reads `mp_transfer_mode`, and SGLang's unified connector reads
+`lmcache.mp.mp_transfer_mode`. On SGLang the check also verifies that the
 request's salt reaches LMCache: SGLang passes `cache_salt` to LMCache's
 unified connector, which puts it in the cache key, and SGLang does not use
 LMCache's older SGLang adapter (which dropped the salt, LMCache issue 4825).
 A release without that path fails the check, and its deployments run without
 LMCache until a release has it. A failed check names what was missing.
+For vLLM `deep` and `host_backed` parking, it also detects the known sleep
+path that resets the external connector and clears the LMCache server.
+Such a launch runs without LMCache under `auto` (`sleep_clears_cache`) or
+refuses `lmcache_unavailable:sleep_clears_cache` under `required`, even if
+the combination is listed as certified. `restart_only` does not call sleep
+and is unaffected. Engine-driven transfer reserves no held engine KV.
 
 **`capyctl engine list`** shows an `LMCACHE` column: the registered version,
 or `off (<reason>)` for a profile that cannot use it.
@@ -909,14 +1195,19 @@ or `off (<reason>)` for a profile that cannot use it.
 **Status.** `capyctl status deployment <name>` shows a line per instance:
 
 ```text
-LMCache   on: pool 4 GiB, used 1.3 GiB, overhead 0.8 GiB (measured), 212 hits / 260 lookups
-LMCache   off: LMCache needs vLLM 0.32.0 or newer
+LMCache   instance 0 on: pool 8.0 GiB (auto: one 32,768-token context of qwen3 at 144 KiB per token), used 1.3 GiB, overhead 0.8 GiB (measured), 212 hits / 260 lookups
+LMCache   instance 1 on (uncertified: vLLM 0.32.0 / qwen3 / NVIDIA GB10 / deep is not in the qualified table): pool 12.0 GiB (auto: one 65,536-token context of qwen3 at 144 KiB per token), used 0.2 GiB, overhead 0.8 GiB (allowance)
+warning: the LMCache pool (12 GiB) keeps about 55,900 tokens after eviction; one full context of 65,536 tokens needs 15 GiB: raise host_kv_limit or set lmcache_pool
+LMCache   instance 2 off: LMCache needs vLLM 0.32.0 or newer
 ```
 
 and `--json` an `lmcache` object (`state`, `reason`, `pool_bytes`,
-`used_bytes`, `overhead_bytes`, `measured`, `lookups`, `hits`; a figure
-CapyCTL could not read is `null`, never zero). The event `lmcache_off` records
-an instance and reason once per launch.
+`pool_source` (`auto`, `stated` or `default`), `pool_tokens`, `warning`,
+`certified`, `used_bytes`, `overhead_bytes`, `measured`, `lookups`, `hits`; a
+figure CapyCTL could not read is `null`, never zero). The event `lmcache_off`
+records an instance and reason once per launch, `lmcache_pool_short` a pool
+that keeps less than one context, and `lmcache_uncertified` a `required`
+launch outside the certified table.
 
 **Memory.** The memory CapyCTL sets aside for an instance covers the pool
 plus the server's own memory in host RAM (on a GB10, the memory the GPU uses
@@ -931,20 +1222,47 @@ window is never the measurement. The charge is never less than the server's
 GPU memory as read: a larger reading raises it. `memory.request` stays the
 engine's own GPU memory.
 
-**Long prompts.** LMCache 0.5.6 starts evicting once its pool is 80 % full,
-so the pool has to hold the prompts you want back plus whatever passes
-through it in between. Measured on a GB10 with vLLM 0.32.0 and Qwen3-4B
-(144 KiB of KV per token, 4.5 GiB for a 32,000-token prompt), after other long
-prompts had pushed a 32,000-token prompt out of the engine's cache: with a
-12 GiB pool LMCache returned 17,000 to 28,000 of its tokens and the first
-token came in 4.66 s; with a 20 GiB pool it returned all of them, in 0.35 s
-instead of 7.85 s without LMCache. The pool counts against the machine's
-host-KV limit, a tenth of memory on standalone (12.17 GiB on a 128 GB GB10),
-so a larger pool needs that limit raised too:
+**Long prompts and the pool.** LMCache 0.5.6 starts evicting once its pool
+is 80 % full and then drops a fifth of what it holds, so about 64 % of the
+pool is sure to survive; CapyCTL renders those two settings
+(`--eviction-trigger-watermark 0.8 --eviction-ratio 0.2`) so a later LMCache
+cannot change them under it. With `lmcache_pool: auto`, the default, the pool
+holds one full context of the deployment's model after an eviction: the
+context (stated `context_length`, else the one CapyCTL fits) times the
+model's KV bytes per token, divided by 0.64, rounded up to a whole GiB, and
+never below 4 GiB. Measured on a GB10 with vLLM 0.32.0 and Qwen3-4B (144 KiB
+of KV per token), a 12 GiB pool returned only 17,000 to 28,000 tokens of a
+32,000-token prompt after other long prompts, and a 20 GiB pool all of them,
+in 0.35 s instead of 7.85 s. Examples on a GB10 standalone, whose
+`host_kv_limit` is 12.17 GiB:
+
+| Model, context | Pool | Tokens kept after an eviction |
+|---|---|---|
+| Qwen3-4B, 8,192 | 4 GiB | about 18,600 |
+| Qwen3-4B, 32,768 | 8 GiB | about 37,300 |
+| Qwen3-4B, 65,536 | 12 GiB, warning | about 55,900 |
+| Qwen3-32B, 32,768 | 12 GiB, warning | about 31,500 |
+
+The pool counts against the machine's host-KV limit (a tenth of the memory
+standalone observes at each start, 12.17 GiB on a 128 GB GB10, and
+settable), so an automatic pool never exceeds that limit less the
+deployment's own host KV. When it keeps less than one context, `deploy`,
+status and the effective configuration warn ("the LMCache pool (12 GiB)
+keeps about 55,900 tokens after eviction; one full context of 65,536 tokens
+needs 15 GiB: raise host_kv_limit or set lmcache_pool"; `deploy` warns with
+`--wait`) and the event
+`lmcache_pool_short` records it once per launch; the model runs. When other
+models already hold the host-KV room, an automatic pool shrinks to the room
+left (whole GiB, at least 1 GiB) with the same warning, and with less than
+1 GiB left the model runs without LMCache (`host_kv_room`). A host with no
+`host_kv_limit` keeps automatic pools at 4 GiB. When CapyCTL cannot read the
+model's KV size or context (an unreadable configuration, or an enrolled host
+that has not sized the checkpoint yet), the pool is 4 GiB and status says
+why. A stated `lmcache_pool` is used as given: a model whose stated pool
+does not fit waits for room or is refused. To keep more:
 
 ```yaml
 # The deployment
-lmcache: required
 lmcache_pool: 20GiB
 ```
 
@@ -960,8 +1278,13 @@ document ([settings](../operations/configuration.md#standalone-host-kv-limit)).
 it and says why. With `required` it refuses to start instead:
 `lmcache_unavailable:<reason>` (`retention_zero:lmcache`,
 `host_capability_missing:lmcache`), and a failure found at launch leaves
-nothing running. A host's `lmcache: off` or `retention: zero` keeps it off
-on that machine ([settings](../operations/configuration.md#lmcache-and-zero-retention)).
+nothing running. `required` is never refused for being outside the
+certified table or for running on several GPUs: it runs LMCache as an
+uncertified setup, shown "LMCache on (uncertified: ...)" in status,
+`certified: false` in JSON, a warning from `deploy --wait` and an
+`lmcache_uncertified` event once per launch. A host's `lmcache: off` or
+`retention: zero` keeps it off on that machine
+([settings](../operations/configuration.md#lmcache-and-zero-retention)).
 
 **When the engine does not start with it.** An engine that exits or does not
 become ready with the connector is stopped with its server and started once
@@ -975,8 +1298,14 @@ with a new, empty server (`lmcache_server_exited`).
 
 **Local reach.** Any process on the machine can reach the server's loopback
 ports, as it can reach a llama.cpp engine: read its configuration, list or
-clear its cache, and store or look up KV under any salt. On a machine with
-untrusted local users, set the host's `lmcache: off` or `retention: zero`.
+clear its cache, and store or look up KV under any salt. A parking model's
+server also accepts engine-driven transfer, whose chunks arrive pickled on
+the request port, and LMCache unpickles them: any local process that reaches
+that port can make the server run code as the role's service user (CapyCTL
+passes no shared-memory segment, so this is the path every chunk takes). A
+request to LMCache for a payload format that is not pickle is drafted, not
+yet filed. On a machine with untrusted local users, set the host's
+`lmcache: off` (or `retention: zero`), or the deployment's `lmcache: off`.
 
 **Options.** CapyCTL renders the LMCache options itself: SGLang's
 `--enable-lmcache` and `--lmcache-*` are refused in `extra_args`, so is a
@@ -984,6 +1313,113 @@ vLLM `--kv-transfer-config` naming an LMCache connector, and `LMCACHE_*`
 variables are reserved. A deployment that passes another KV connector runs
 without LMCache (`kv_transfer_config_set`)
 ([engine options](engine-flags.md)).
+
+## Engine tracing
+
+With [tracing](../operations/configuration.md#tracing) on, CapyCTL's own
+spans end at its forward to the engine. vLLM and SGLang can add their own
+spans below it, sent to the same collector, when the host allows it:
+
+```yaml
+# host.yaml (standalone: host.observability.tracing.engines, with the
+# endpoint in server.observability.tracing)
+observability:
+  tracing:
+    endpoint: http://127.0.0.1:4318/v1/traces
+    engines: on
+```
+
+`engines: on` needs the endpoint on loopback (`localhost`, `127.0.0.0/8` or
+`::1`), usually an OpenTelemetry Collector on the same machine, which can
+forward over TLS with its own credentials. The engines export without TLS, and
+keeping their export on the machine keeps the promise that engines report
+nothing off the host by CapyCTL's doing. Any other endpoint refuses the
+host's start.
+
+What CapyCTL renders on a launch with engine tracing:
+
+| Engine | Options | Variables |
+|---|---|---|
+| vLLM 0.31.0 or newer | `--otlp-traces-endpoint <endpoint>` (never `--collect-detailed-traces`) | `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf`, `OTEL_SERVICE_NAME=vllm`, `OTEL_RESOURCE_ATTRIBUTES=capyctl.deployment=<name>,capyctl.instance=<index>` |
+| SGLang 0.5.22 or newer | `--enable-trace --otlp-traces-endpoint <endpoint> --otlp-service-name sglang` | `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf`, `SGLANG_TRACE_LEVEL=1` |
+
+The endpoint is passed exactly as the host states it. SGLang runs at trace
+level 1 (important steps only), because its documentation warns that finer
+levels cost throughput at large batch sizes; `SGLANG_TRACE_ASYNC` stays off,
+so no exporter process joins the launch. The engine receives `traceparent`
+(and the caller's `tracestate`) with each request, with CapyCTL's forward
+span as parent, or the host ingress's span on another machine. No other
+engine, and no launch without engine tracing, receives a trace header.
+
+Each instance says what it runs with: `engine tracing: on`, or
+`engine tracing: off (<reason>)` in `capyctl status deployment <name>`
+(`engine_tracing` with `state` and `reason` in JSON). The decision is made
+when the instance launches and holds for that launch. The reasons, in the
+order CapyCTL checks them:
+
+- `host_off`: the host's `engines` is `off` (the default), or it names no
+  endpoint.
+- `engine_unsupported`: llama.cpp, TensorFold, a custom engine, vLLM before
+  0.31.0 or SGLang before 0.5.22.
+- `group`: the model runs across machines; groups run without engine tracing
+  until a live check covers them. A model on several GPUs of one machine is
+  one launch and can trace.
+- `retention_zero`: the deployment or the machine sets `retention: zero`
+  ([zero data retention](../operations/data-retention.md#zero-data-retention)).
+- `not_installed`: the engine's environment lacks a package a traced engine
+  imports: `opentelemetry-api`, `opentelemetry-sdk`, `opentelemetry-proto`,
+  `opentelemetry-exporter-otlp-proto-common`, and the HTTP and gRPC OTLP
+  exporters with their transports (`requests`, `grpcio`). Both engines import
+  the two exporters together, so the gRPC one is needed even though CapyCTL
+  uses HTTP. CapyCTL checks the installed files and runs nothing; the engine
+  starts without tracing rather than failing. For SGLang the packages are its
+  `tracing` extra.
+
+**Owned options and names.** CapyCTL renders engine tracing itself, so the
+engines' tracing options are refused in `extra_args` and in a profile's
+arguments, in every spelling, whatever the host approves: vLLM
+`--otlp-traces-endpoint` and `--collect-detailed-traces`; SGLang
+`--enable-trace`, `--otlp-traces-endpoint`, `--otlp-service-name` and
+`--trace-modules`. The variables `OTEL_*`, `SGLANG_TRACE_*`, `SGLANG_OTLP_*`,
+`TRACEPARENT` and `TRACESTATE` (in any case) are refused in a profile or a
+deployment (`engine_env_reserved:<name>`), on every engine. An installation
+that approved `--otlp-traces-endpoint` before this release no longer admits
+it: remove it from the deployment and set `observability.tracing.engines: on`
+on the host instead ([engine options](engine-flags.md)).
+
+**SGLang's machine ID.** SGLang's per-thread spans carry the machine's
+`/etc/machine-id` in full as the attribute `host_id`, and its first 8
+characters in the span name (`... (host:0123abcd | pid:4242)`). With the
+endpoint on loopback, the ID reaches your own collector and goes wherever the
+collector sends it. The machine-id manual asks that the ID not be exposed on
+the network. To remove it before the collector forwards anything, use the
+`attributes` and `transform` processors of the OpenTelemetry Collector
+contrib distribution:
+
+```yaml
+processors:
+  attributes/drop-host-id:
+    actions:
+      - key: host_id
+        action: delete
+  transform/drop-host-id:
+    trace_statements:
+      - context: span
+        statements:
+          - replace_pattern(name, "host:[0-9a-f]+ \\| ", "")
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [attributes/drop-host-id, transform/drop-host-id]
+      exporters: [otlphttp]
+```
+
+Neither engine's spans hold prompt
+or output text; they carry token counts, sampling parameters, the served
+model name, finish reasons and the engine's request ID
+([Traces](../operations/data-retention.md#traces)).
 
 ## Tool calls and reasoning
 
@@ -1028,6 +1464,68 @@ parses tool calls and reasoning from the model's chat template, with no setting.
 [Engine options](engine-flags.md) lists, for each engine, which options are
 typed fields, which pass in `extra_args`, which need host approval and which
 CapyCTL reserves.
+
+## Embedding models
+
+A deployment with `api: embeddings` ([Embedding models](deploy.md#embedding-models))
+starts its engine as an embedding server. What CapyCTL renders, and what it
+refuses, on each engine:
+
+| Engine | Rendered | Your options | Limits |
+|---|---|---|---|
+| vLLM | `--runner pooling`; vLLM picks the conversion itself, so a generative architecture becomes an embedding model | `--pooler-config`, `--hf-overrides` (for example `{"is_matryoshka": true}` for a model that can shorten its vectors) | `dimensions` only for a model vLLM knows can shorten its vectors; `base64` and `float` only (CapyCTL refuses vLLM's `bytes` forms) |
+| SGLang | `--is-embedding` | `--json-model-override-args` | `dimensions` checked against the model's sizes |
+| llama.cpp | `--embeddings`, and `--ubatch-size` and `--batch-size` equal to the context of one slot, so any input that fits the context fits one batch | one `--pooling <type>`, never `none`; your own `--ubatch-size` or `--batch-size` wins over CapyCTL's | `dimensions` ignored by llama.cpp, so CapyCTL refuses any but the model's own |
+| TensorFold | nothing | | refused, `capability_missing:embeddings`: neither 0.6.6 nor 1.1.4 has an embeddings endpoint |
+| custom engine | whatever the manifest says (`api: embeddings`) | | restarts instead of parking |
+
+vLLM's `--runner` and `--convert` and SGLang's `--is-embedding` are reserved
+on every deployment, chat ones included, so `extra_args` cannot turn a chat
+deployment into an embedding server that would never pass its chat check. A
+profile or deployment that passed them before this release is refused with
+the usual reserved-option message. On llama.cpp `--embedding`, `--embeddings`
+and `--rerank` stay reserved everywhere, and `--pooling` on chat deployments
+([Engine options](engine-flags.md)). The larger batch sizes on llama.cpp cost
+memory; state `resources` from the measured peak, as for
+[decision models](deploy.md#decision-models).
+
+vLLM and SGLang embedding deployments park `deep` with the same calls as chat
+ones, and llama.cpp restarts. Parking an embedding server is checked by a
+live row on each engine; if it fails on an engine, that engine's embedding
+deployments restart instead.
+
+### Certified combinations
+
+CapyCTL shows `certified` on vLLM 0.32.0, SGLang 0.5.22 and llama.cpp 0.7.0
+(b11669), and runs every other version uncertified, never refused for it
+([Certified and uncertified](deploy.md#certified-and-uncertified)). A model on
+one of these engines is certified once the embedding live rows (EM1 to EM9)
+pass for it. They cover ten open-weight embedding models at pinned revisions,
+on every engine that can run each. None has run yet, so this release
+certifies no model on any engine; the table below records what each engine's
+source supports, not what has been run.
+
+| Model | Dimension | vLLM 0.32.0 | SGLang 0.5.22 | llama.cpp 0.7.0 |
+|---|---|---|---|---|
+| [Qwen3-Embedding-8B](https://huggingface.co/Qwen/Qwen3-Embedding-8B) | 4096 (shortens from 32) | registered, converted by vLLM | registered | registered, Qwen's Q8_0 GGUF |
+| [Qwen3-Embedding-4B](https://huggingface.co/Qwen/Qwen3-Embedding-4B) | 2560 (shortens from 32) | registered, converted by vLLM | registered | registered, Qwen's Q8_0 GGUF |
+| [bge-m3](https://huggingface.co/BAAI/bge-m3) | 1024 | registered | registered | registered, converted GGUF |
+| [pplx-embed-v1-0.6b](https://huggingface.co/perplexity-ai/pplx-embed-v1-0.6b) | 1024 | not registered; remote code, to be tried live | not registered; remote code, to be tried live | not supported |
+| [pplx-embed-v1-4b](https://huggingface.co/perplexity-ai/pplx-embed-v1-4b) | 2560 | not registered; remote code, to be tried live | not registered; remote code, to be tried live | not supported |
+| [multilingual-e5-large](https://huggingface.co/intfloat/multilingual-e5-large) | 1024 | registered | registered | registered, converted GGUF |
+| [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | 768 | registered | registered | registered, converted GGUF |
+| [all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) | 384 | registered | registered | registered, converted GGUF |
+| [all-mpnet-base-v2](https://huggingface.co/sentence-transformers/all-mpnet-base-v2) | 768 | not registered; to be tried live | not registered; to be tried live | not supported |
+| [Nemotron-3-Embed-1B-BF16](https://huggingface.co/nvidia/Nemotron-3-Embed-1B-BF16) | 2048 | not registered; to be tried live | not registered; to be tried live | not supported |
+
+"Registered" means the engine's source lists the architecture; whether it
+serves the model correctly is what the live rows establish. **Not
+supported** marks a combination the engine cannot run: llama.cpp's converter
+has no `PPLXQwen3Model` (pplx-embed), no MPNet (all-mpnet-base-v2) and only
+the causal form of Nemotron 3 Embed's architecture. CapyCTL does not refuse
+these; the engine fails to load the checkpoint and the start fails. The
+pplx-embed checkpoints ship their own code, so on vLLM and SGLang they need a
+profile added with `--allow-remote-code` and `engine_config.trust_remote_code: true`.
 
 ## vLLM weight loading while parking
 
@@ -1263,6 +1761,27 @@ curl -s http://127.0.0.1:8443/v1/chat/completions \
 ```text
 Jupiter is the largest planet in our solar system.
 ```
+
+### TensorFold native 1.0.0 and 1.1.5: Nemotron 3.5 Lightning 30B-A3B 4-bit
+
+The same checkpoint on TensorFold's native line
+([TensorFold native](#tensorfold-native-1x)), registered beside the 0.6.6
+profile, which keeps the name `tensorfold`:
+
+<!-- include: ../examples/deployment-tensorfold-native.yaml -->
+
+```bash
+capyctl engine add ~/tensorfold-1.0.0 --name tensorfold-1-0-0
+capyctl deploy model --file docs/examples/deployment-tensorfold-native.yaml
+capyctl start deployment nemotron-30b-native --wait
+```
+
+For 1.1.5, register `~/tensorfold-1.1.5 --name tensorfold-1-1-5` and name
+that profile in `engine:`. This release has not run either version on a
+GB10 yet: the live rows that certify them (TF1 to TF14) are still to run,
+so both start as uncertified setups and 0.6.6 above stays the documented
+way to run this model until they pass. The commands and the request are the
+same as for 0.6.6.
 
 To clean up after each one, `capyctl delete deployment <name> --stop`, then
 `capyctl engine remove <profile>` once the stop has finished. Neither touches

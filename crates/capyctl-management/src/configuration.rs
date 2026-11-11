@@ -692,8 +692,11 @@ fn registry_targets(
     fail_fast: bool,
 ) -> Result<(Vec<HostTarget>, Vec<HostRefusal>), ConfigurationFailure> {
     let config = capyctl_config::parse_strict(capyctl_config::ConfigKind::Deployment, config_json)?;
-    let decisions = capyctl_config::decisions::check_document(&config)?
-        == capyctl_config::effective::DeploymentApi::Decisions;
+    let api = capyctl_config::decisions::check_document(&config)?;
+    let decisions = api == capyctl_config::effective::DeploymentApi::Decisions;
+    // ADR 0036 §1: an embeddings deployment goes only to a host that
+    // declared `embeddings`.
+    let embeddings = api == capyctl_config::effective::DeploymentApi::Embeddings;
     let spec = capyctl_config::instances::parse_instance_spec(&config)?;
     let group = spec.group.as_ref();
     let allowed: Vec<String> = match &spec.placement.hosts {
@@ -798,17 +801,24 @@ fn registry_targets(
         // on a host that did not declare `decisions`, nor one on a custom
         // engine on a host that did not declare `custom_engines` (ADR 0017);
         // such a host is recorded refused, typed, and is sent nothing. A
-        // decisions custom engine needs both.
-        let custom = config["runtime_profile"]
-            .as_str()
-            .and_then(|requested| {
-                capyctl_config::deployment_defaults::profile_on_host(requested, &original)
-            })
-            .is_some_and(|name| {
-                original["runtime_profiles"][&name]["engine"].as_str()
-                    == Some(capyctl_config::engine_policy::Engine::Custom.name())
-            });
-        if decisions || custom {
+        // decisions custom engine needs both. ADR 0039 §15: nor one on a
+        // TensorFold native profile on a host that did not declare
+        // `tensorfold_native`.
+        let host_profile = config["runtime_profile"].as_str().and_then(|requested| {
+            capyctl_config::deployment_defaults::profile_on_host(requested, &original)
+        });
+        let published = |name: &String| &original["runtime_profiles"][name];
+        let custom = host_profile.as_ref().is_some_and(|name| {
+            published(name)["engine"].as_str()
+                == Some(capyctl_config::engine_policy::Engine::Custom.name())
+        });
+        let native = host_profile.as_ref().is_some_and(|name| {
+            published(name)["engine"].as_str()
+                == Some(capyctl_config::engine_policy::Engine::Tensorfold.name())
+                && published(name)["line"].as_str()
+                    == Some(capyctl_config::tensorfold_native::TensorfoldLine::Native.name())
+        });
+        if decisions || embeddings || custom || native {
             let declared: std::collections::BTreeSet<String> = store
                 .host_version(&publication.host_id)
                 .map_err(|_| ConfigurationFailure::Internal)?
@@ -824,12 +834,33 @@ fn registry_targets(
                     (code, "api", detail)
                 })
                 .or_else(|| {
+                    embeddings
+                        .then(|| capyctl_protocol::capabilities::embeddings_refusal(&declared))
+                        .flatten()
+                        .map(|code| {
+                            let detail = format!(
+                                "{code}: host `{selector}` cannot serve embedding models; upgrade its agent"
+                            );
+                            (code, "api", detail)
+                        })
+                })
+                .or_else(|| {
                     custom
                         .then(|| capyctl_protocol::capabilities::custom_engines_refusal(&declared))
                         .flatten()
                         .map(|code| {
                             let detail = format!(
                                 "{code}: host `{selector}` cannot run custom engines; upgrade its agent"
+                            );
+                            (code, "runtime_profile", detail)
+                        })
+                })
+                .or_else(|| {
+                    capyctl_protocol::capabilities::tensorfold_native_refusal(&declared, native)
+                        .map(|code| {
+                            let detail = format!(
+                                "{code}: host `{selector}` cannot run TensorFold's native line; \
+                                 upgrade its agent"
                             );
                             (code, "runtime_profile", detail)
                         })
@@ -1201,6 +1232,36 @@ fn add_custom_commands(view: &mut Value) {
     }
 }
 
+/// ADR 0036 §1: beside an embeddings deployment's resolved configuration,
+/// whether its engine version is one qualified live (`certification`:
+/// `certified` or `uncertified`). Status only: an uncertified version is
+/// never refused. Other APIs, and a profile that names no engine, add nothing.
+fn add_certifications(view: &mut Value) {
+    let add = |effective: &mut Value| {
+        if effective["api"] != "embeddings" {
+            return;
+        }
+        let profile = &effective["profile"];
+        let Some(engine) = profile["engine"]
+            .as_str()
+            .and_then(capyctl_config::engine_policy::Engine::from_name)
+        else {
+            return;
+        };
+        let build = profile["build_fingerprint"].as_str().unwrap_or_default();
+        effective["certification"] =
+            Value::from(capyctl_config::embeddings::certification(engine, build).name());
+    };
+    add(&mut view["effective"]);
+    if let Some(hosts) = view["hosts"].as_array_mut() {
+        for host in hosts {
+            if host["effective"].is_object() {
+                add(&mut host["effective"]);
+            }
+        }
+    }
+}
+
 /// SPEC §8.2: `GET /management/v1/deployments/{id}/effective-config`, the
 /// resolved configuration with provenance, secrets redacted.
 pub(crate) async fn effective_config(
@@ -1220,6 +1281,7 @@ pub(crate) async fn effective_config(
     match accept_blocking(permit, move || source.effective_configuration(&id)).await {
         Ok(Some(mut view)) => {
             add_custom_commands(&mut view);
+            add_certifications(&mut view);
             redact_effective(&mut view);
             view["api_version"] = Value::String("1".into());
             (StatusCode::OK, Json(view)).into_response()
@@ -1452,6 +1514,33 @@ mod lmcache_tests {
                 assert_eq!(at, path);
                 assert!(reason.contains(code), "{reason}");
             }
+        }
+    }
+
+    // T47 (ADR 0036 §1): the resolved configuration of an embeddings
+    // deployment names its engine version certified or uncertified, on the
+    // deployment and on each host; other APIs add nothing.
+    #[test]
+    fn an_embeddings_configuration_names_its_certification() {
+        let effective = |api: &str, engine: &str, build: &str| json!({"api": api, "profile": {"engine": engine, "build_fingerprint": build}});
+        let mut view = json!({
+            "effective": effective("embeddings", "vllm", "0.32.0"),
+            "hosts": [
+                {"effective": effective("embeddings", "llamacpp", "0.6.9")},
+                {"effective": null},
+            ],
+        });
+        add_certifications(&mut view);
+        assert_eq!(view["effective"]["certification"], "certified");
+        assert_eq!(
+            view["hosts"][0]["effective"]["certification"],
+            "uncertified"
+        );
+        assert!(view["hosts"][1]["effective"].is_null());
+        for (api, engine) in [("decisions", "vllm"), ("chat", "vllm"), ("embeddings", "")] {
+            let mut view = json!({"effective": effective(api, engine, "0.32.0")});
+            add_certifications(&mut view);
+            assert!(view["effective"].get("certification").is_none(), "{api}");
         }
     }
 }

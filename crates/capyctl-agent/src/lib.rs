@@ -27,6 +27,8 @@ pub mod identity;
 pub mod identity_storage;
 pub mod ingress;
 pub mod ingress_identity;
+// ADR 0037 §§1, 4, 6, 13: the host role's tracing, installed at role start.
+pub mod host_tracing;
 // ADR 0008 (owner decision 2026-09-23): installation fingerprints and
 // launch-time capability probes, instead of pinned hashes.
 pub mod installation;
@@ -36,6 +38,9 @@ pub mod lmcache_install;
 // ADR 0033 §4: per-launch private LMCache directories (SGLang's connector
 // configuration), removed on gone evidence and swept at role start.
 pub mod lmcache_dir;
+// ADR 0037 §7: engine tracing's launch-time check by shape and the
+// launch's decision, executing nothing.
+pub mod tracing_install;
 // ADR 0018 §1: resolving a named engine installation and its bounded
 // version check.
 pub mod engines;

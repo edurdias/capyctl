@@ -242,6 +242,7 @@ async fn add_custom_executes_nothing_and_writes_custom_engines_yaml() {
         capyctl_agent::installation::InstallationMeasurer::new()
             .measure_profile(
                 capyctl_config::engine_policy::Engine::Custom,
+                capyctl_config::tensorfold_native::TensorfoldLine::Python,
                 &venv.executable,
                 Some(&parsed),
             )

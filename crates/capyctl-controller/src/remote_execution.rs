@@ -43,6 +43,9 @@ pub struct RemoteLaunchBinding {
     /// Every launch, park and wake of it then needs the host's `decisions`;
     /// a host without it is refused typed before anything is sent.
     pub decisions: bool,
+    /// ADR 0036 §1: the launch serves embedding models (`api: embeddings`);
+    /// its launch and wake need the host's `embeddings`.
+    pub embeddings: bool,
     /// ADR 0031 §9: the launch runs a custom engine. Every command of it then
     /// needs the host's `custom_engines`; a host without it is refused typed
     /// before anything is sent.
@@ -55,6 +58,10 @@ pub struct RemoteLaunchBinding {
     /// command of it then needs the host's `retention`; a host without it
     /// would not honour it, and is refused typed before anything is sent.
     pub retention_zero: bool,
+    /// ADR 0039 §15: the launch's effective profile is TensorFold's native
+    /// line. Every command of it then needs the host's `tensorfold_native`; a
+    /// host without it is refused typed before anything is sent.
+    pub tensorfold_native: bool,
     /// ADR 0013 §5: the instance every command of this launch names, so the
     /// host fences it by that instance's own generation. Zero on a host that
     /// does not advertise per-instance fencing: its journal fences per
@@ -62,6 +69,18 @@ pub struct RemoteLaunchBinding {
     pub instance_index: u32,
 }
 impl RemoteLaunchBinding {
+    /// ADR 0030 §1, ADR 0036 §1: the API the launch serves, which picks its
+    /// wake canary's probe.
+    fn api(&self) -> capyctl_config::effective::DeploymentApi {
+        use capyctl_config::effective::DeploymentApi;
+        if self.decisions {
+            DeploymentApi::Decisions
+        } else if self.embeddings {
+            DeploymentApi::Embeddings
+        } else {
+            DeploymentApi::Chat
+        }
+    }
     /// ADR 0033 §13: the capabilities the deployment's declared `lmcache`
     /// and `retention` need of the host.
     fn lmcache_needs(&self, needs: &mut Vec<&'static str>) {
@@ -81,6 +100,9 @@ struct RemoteEngine {
     /// ADR 0033 (lifecycle design §10): what the host reported about the
     /// launch's LMCache, shared with the coordinator's driver of the launch.
     lmcache: Arc<capyctl_adapters::lmcache::LmcacheState>,
+    /// ADR 0037 §7: the launch's engine tracing as its host reported it,
+    /// shared with the coordinator's driver of the launch.
+    engine_tracing: Arc<capyctl_adapters::engine_tracing::TracingReport>,
 }
 /// The caller resolves this frozen plan from the selected enrolled host's
 /// approved configuration. This is construction only, never permission to send.
@@ -92,14 +114,18 @@ pub fn binding(
 ) -> ExecutionBinding {
     let binding = Arc::new(binding);
     let lmcache = Arc::new(capyctl_adapters::lmcache::LmcacheState::default());
+    let engine_tracing = Arc::new(capyctl_adapters::engine_tracing::TracingReport::default());
     let engine = Arc::new(RemoteEngine {
         sessions: sessions.clone(),
         owner,
         binding: binding.clone(),
         readiness,
         lmcache: lmcache.clone(),
+        engine_tracing: engine_tracing.clone(),
     });
-    remote_binding(engine, sessions, binding).with_lmcache(lmcache)
+    remote_binding(engine, sessions, binding)
+        .with_lmcache(lmcache)
+        .with_engine_tracing(engine_tracing)
 }
 
 /// The engine half of [`binding`] alone: the adapter the coordinator drives
@@ -117,6 +143,7 @@ pub fn engine(
         binding: Arc::new(binding),
         readiness,
         lmcache: Arc::default(),
+        engine_tracing: Arc::default(),
     })
 }
 
@@ -344,8 +371,14 @@ impl RemoteEngine {
         if b.decisions {
             needs.push(capabilities::DECISIONS);
         }
+        if b.embeddings {
+            needs.push(capabilities::EMBEDDINGS);
+        }
         if b.custom_engine {
             needs.push(capabilities::CUSTOM_ENGINES);
+        }
+        if b.tensorfold_native {
+            needs.push(capabilities::TENSORFOLD_NATIVE);
         }
         b.lmcache_needs(&mut needs);
         self.sessions
@@ -533,6 +566,15 @@ impl EngineAdapter for RemoteEngine {
         if plan.checkpoint_gguf.is_some() {
             needs.push(capabilities::CHECKPOINT_GGUF);
         }
+        // ADR 0017 §§2–3; ADR 0019 §§3–4 / #225: a host deriving the
+        // historical floor must not receive the new request's semantics.
+        if plan.vllm_device_request_no_floor {
+            needs.push(capabilities::VLLM_DEVICE_REQUEST_NO_FLOOR);
+        }
+        // #236: scalar graphs remain compatible with N-1; phase objects do not.
+        if capabilities::cuda_graph_phases_required(&plan.deployment_config) {
+            needs.push(capabilities::CUDA_GRAPH_PHASES);
+        }
         if b.instance_index != 0 {
             needs.push(capabilities::INSTANCE_INDEX);
         }
@@ -551,10 +593,18 @@ impl EngineAdapter for RemoteEngine {
         if b.decisions {
             needs.push(capabilities::DECISIONS);
         }
+        if b.embeddings {
+            needs.push(capabilities::EMBEDDINGS);
+        }
         // ADR 0031 §9: a custom engine's launch goes only to a host that
         // declared `custom_engines`.
         if b.custom_engine {
             needs.push(capabilities::CUSTOM_ENGINES);
+        }
+        // ADR 0039 §15: a native TensorFold launch goes only to a host that
+        // declared `tensorfold_native`.
+        if b.tensorfold_native {
+            needs.push(capabilities::TENSORFOLD_NATIVE);
         }
         // ADR 0033 §13: `lmcache: required` and `retention: zero` go only to
         // a host that declared what honours them.
@@ -638,6 +688,13 @@ impl EngineAdapter for RemoteEngine {
         // and its fallback, exactly as an embedded launch reports it.
         if let Some(report) = lmcache_report(&result) {
             self.lmcache.record(report);
+        }
+        // ADR 0037 §7: the launch's engine tracing as the host decided it
+        // (nothing from an older host, which traces no engine).
+        if let Some(outcome) =
+            capyctl_adapters::engine_tracing::TracingOutcome::parse(&result.engine_tracing)
+        {
+            self.engine_tracing.record(outcome);
         }
         launch_evidence(&result)?;
         let receipt = remote_receipt(&result, &devices)?;
@@ -833,8 +890,11 @@ impl EngineAdapter for RemoteEngine {
     /// ADR 0030 §4: a decisions launch's canary is the fixed decision probe,
     /// sent only to a host whose session declares `decisions` (every host
     /// that took the launch did); its answer is judged well-formed again
-    /// here. It never answers `Unsupported`, which would pass a wake
-    /// unchecked: a host without the capability is a canary not answered.
+    /// here. ADR 0036 §§5, 6: an embeddings launch's canary is the fixed
+    /// embedding probe, sent only to a host that declares `embeddings`, its
+    /// vector judged again here. Neither ever answers `Unsupported`, which
+    /// would pass a wake unchecked: a host without the capability is a
+    /// canary not answered.
     async fn wake_canary(
         &self,
         c: &capyctl_domain::completion::StepExecutionContext,
@@ -842,21 +902,37 @@ impl EngineAdapter for RemoteEngine {
         bound: std::time::Duration,
     ) -> Result<capyctl_adapters::completion_probe::CanaryAnswer, RuntimeError> {
         use capyctl_adapters::completion_probe::CanaryAnswer;
+        use capyctl_config::effective::DeploymentApi;
         let b = &self.binding;
         if c.binding_id != b.plan.binding_id || c.incarnation != b.plan.incarnation {
             return Err(RuntimeError::StaleRevision);
         }
-        if b.decisions {
-            if !self.sessions.supports(&b.host_id, capabilities::DECISIONS) {
-                return Err(RuntimeError::Uncertain(
-                    "the host no longer declares decisions; the decision probe was not sent".into(),
-                ));
+        let api = b.api();
+        match api {
+            DeploymentApi::Decisions => {
+                if !self.sessions.supports(&b.host_id, capabilities::DECISIONS) {
+                    return Err(RuntimeError::Uncertain(
+                        "the host no longer declares decisions; the decision probe was not sent"
+                            .into(),
+                    ));
+                }
             }
-        } else if !self
-            .sessions
-            .supports(&b.host_id, capabilities::ENGINE_GROUPS)
-        {
-            return Err(RuntimeError::Unsupported);
+            DeploymentApi::Embeddings => {
+                if !self.sessions.supports(&b.host_id, capabilities::EMBEDDINGS) {
+                    return Err(RuntimeError::Uncertain(
+                        "the host no longer declares embeddings; the embedding probe was not sent"
+                            .into(),
+                    ));
+                }
+            }
+            DeploymentApi::Chat => {
+                if !self
+                    .sessions
+                    .supports(&b.host_id, capabilities::ENGINE_GROUPS)
+                {
+                    return Err(RuntimeError::Unsupported);
+                }
+            }
         }
         let id = ulid::Ulid::new().to_string();
         let mut command = MemberCommand {
@@ -881,8 +957,9 @@ impl EngineAdapter for RemoteEngine {
             },
             action: MemberAction::Probe {
                 owned_handle: b.launch_command_id.clone(),
-                max_tokens: (!b.decisions).then_some(max_tokens),
-                decision: b.decisions,
+                max_tokens: (api == DeploymentApi::Chat).then_some(max_tokens),
+                decision: api == DeploymentApi::Decisions,
+                embedding: api == DeploymentApi::Embeddings,
             },
         };
         command.identity.payload_digest = command.canonical_digest();
@@ -894,7 +971,7 @@ impl EngineAdapter for RemoteEngine {
             .map_err(|_| {
                 RuntimeError::Uncertain("the host did not answer the wake canary".into())
             })?;
-        let answer = canary_evidence(b.decisions, &result)?;
+        let answer = canary_evidence(api, &result)?;
         canary_engine_alive(&c.identities, &result)?;
         Ok(CanaryAnswer {
             answer,
@@ -950,48 +1027,77 @@ fn abort_outcome(result: &pb::MemberExecutionResult) -> Result<CancellationOutco
 }
 
 /// What a host's answer to a wake canary probe proves: generated tokens or
-/// text for a chat launch (owner decision 2026-10-09), and for a decisions
+/// text for a chat launch (owner decision 2026-10-09), for a decisions
 /// launch (ADR 0030 §4) only its decision answer, of this build's probe
-/// version and judged well-formed again here, never generated text.
+/// version and judged well-formed again here, and for an embeddings launch
+/// (ADR 0036 §§5, 6) only its vector, of this build's probe version, finite
+/// and of a norm above 1e-6; never generated text for either.
 fn canary_evidence(
-    decisions: bool,
+    api: capyctl_config::effective::DeploymentApi,
     result: &pb::MemberExecutionResult,
 ) -> Result<capyctl_adapters::completion_probe::CanaryEvidence, RuntimeError> {
     use capyctl_adapters::completion_probe::{CanaryEvidence, ProbeAnswer};
-    use capyctl_adapters::decision_probe;
+    use capyctl_adapters::{decision_probe, embedding_probe};
+    use capyctl_config::effective::DeploymentApi;
     if result.state != "completed" {
         return Err(RuntimeError::Uncertain(
             "the host did not complete the wake canary".into(),
         ));
     }
-    if !decisions {
-        if result.probe_tokens.is_empty() && result.probe_text.is_empty() {
-            return Err(RuntimeError::Uncertain(
-                "the engine generated nothing for the wake canary".into(),
-            ));
+    match api {
+        DeploymentApi::Chat => {
+            if result.probe_tokens.is_empty() && result.probe_text.is_empty() {
+                return Err(RuntimeError::Uncertain(
+                    "the engine generated nothing for the wake canary".into(),
+                ));
+            }
+            Ok(CanaryEvidence::Generated(ProbeAnswer {
+                tokens: result.probe_tokens.clone(),
+                text: result.probe_text.clone(),
+            }))
         }
-        return Ok(CanaryEvidence::Generated(ProbeAnswer {
-            tokens: result.probe_tokens.clone(),
-            text: result.probe_text.clone(),
-        }));
+        DeploymentApi::Decisions => {
+            let evidence = result.probe_decision.as_ref().ok_or_else(|| {
+                RuntimeError::Uncertain(
+                    "the engine did not answer the decision probe for the wake canary".into(),
+                )
+            })?;
+            let probabilities: Vec<(String, f64)> = evidence
+                .probabilities
+                .iter()
+                .map(|p| (p.option.clone(), p.probability))
+                .collect();
+            (evidence.probe_version == decision_probe::VERSION)
+                .then(|| decision_probe::well_formed(&evidence.choice, &probabilities).ok())
+                .flatten()
+                .map(CanaryEvidence::Decision)
+                .ok_or_else(|| {
+                    RuntimeError::Uncertain(
+                        "the host relayed a malformed decision probe answer".into(),
+                    )
+                })
+        }
+        DeploymentApi::Embeddings => {
+            let evidence = result.probe_embedding.as_ref().ok_or_else(|| {
+                RuntimeError::Uncertain(
+                    "the engine did not answer the embedding probe for the wake canary".into(),
+                )
+            })?;
+            // ADR 0036 §5: the shared vector rule of the probe itself.
+            let well_formed = evidence.probe_version == embedding_probe::VERSION
+                && embedding_probe::well_formed(&evidence.vector);
+            if !well_formed {
+                return Err(RuntimeError::Uncertain(
+                    "the host relayed a malformed embedding probe answer".into(),
+                ));
+            }
+            Ok(CanaryEvidence::Embedding(
+                embedding_probe::EmbeddingAnswer {
+                    vector: evidence.vector.clone(),
+                },
+            ))
+        }
     }
-    let evidence = result.probe_decision.as_ref().ok_or_else(|| {
-        RuntimeError::Uncertain(
-            "the engine did not answer the decision probe for the wake canary".into(),
-        )
-    })?;
-    let probabilities: Vec<(String, f64)> = evidence
-        .probabilities
-        .iter()
-        .map(|p| (p.option.clone(), p.probability))
-        .collect();
-    (evidence.probe_version == decision_probe::VERSION)
-        .then(|| decision_probe::well_formed(&evidence.choice, &probabilities).ok())
-        .flatten()
-        .map(CanaryEvidence::Decision)
-        .ok_or_else(|| {
-            RuntimeError::Uncertain("the host relayed a malformed decision probe answer".into())
-        })
 }
 async fn cleanup(
     sessions: &AgentSessions,
@@ -1442,6 +1548,13 @@ fn remote_launch(
             .memory()
             .gguf
             .map(|recorded| recorded.facts),
+        // ADR 0019 §§3–4 / #225: only a newly derived discrete request
+        // records this marker; accepted historical revisions leave it absent.
+        vllm_device_request_no_floor: matches!(
+            &work.effective().engine_config,
+            capyctl_domain::launch::LaunchSettings::Vllm(settings)
+                if settings.device_request_floor_pct == Some(0)
+        ),
         // Owner decision 2026-09-23: the peak this launch reserved. ADR
         // 0019 §3: on a discrete GPU measured per domain, the card's and
         // host RAM's apart, so the host charges each where it belongs.
@@ -1508,7 +1621,9 @@ fn remote_launch(
         device_memory: work.effective().ready_device_allocation().is_some(),
         // ADR 0030 §1: a decisions launch goes only to a host that
         // declared it.
-        decisions: !work.effective().api.is_chat(),
+        decisions: work.effective().api == capyctl_config::effective::DeploymentApi::Decisions,
+        // ADR 0036 §1: likewise an embeddings launch.
+        embeddings: work.effective().api == capyctl_config::effective::DeploymentApi::Embeddings,
         // ADR 0031 §9: a custom engine's launch goes only to a host
         // that declared it.
         custom_engine: work.effective().profile.engine
@@ -1518,6 +1633,11 @@ fn remote_launch(
         lmcache_required: work.effective().lmcache
             == capyctl_config::lmcache::LmcacheMode::Required,
         retention_zero: work.effective().retention == capyctl_config::lmcache::Retention::Zero,
+        // ADR 0039 §15: a native TensorFold launch goes only to a host that
+        // declared it.
+        tensorfold_native: work.effective().profile.engine
+            == capyctl_config::engine_policy::Engine::Tensorfold
+            && work.effective().profile.line.is_native(),
     })
 }
 
@@ -1789,6 +1909,7 @@ mod tests {
                 checkpoint_layout: None,
                 checkpoint_tables: None,
                 checkpoint_gguf: None,
+                vllm_device_request_no_floor: false,
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
@@ -1798,9 +1919,11 @@ mod tests {
             instance_index: 0,
             device_memory: false,
             decisions: false,
+            embeddings: false,
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,
+            tensorfold_native: false,
         }
     }
 
@@ -1982,6 +2105,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     1000,
                 )
                 .unwrap();
@@ -2092,6 +2216,50 @@ mod tests {
         );
     }
 
+    // T09 T14 T26 T34 — SPEC §7.3; ADR 0014 §7; ADR 0019 §§3–4
+    // (#225): a newly derived discrete request carries its derivation to the
+    // host, rather than being silently re-derived with the historical floor.
+    #[test]
+    fn a_remote_vllm_device_launch_carries_its_no_floor_derivation() {
+        use capyctl_config::effective::{resolve_effective_with_checkpoint, CheckpointFacts};
+        let (_dir, owned, host, work) = remote_work(None, layout());
+        let launch = remote_launch(&owned, "controller", &work, true).unwrap();
+        assert!(launch.plan.vllm_device_request_no_floor);
+        let host_document = {
+            let owner = owned.lock().unwrap();
+            let publication = owner.store().host_publication(&host).unwrap().unwrap();
+            let config =
+                capyctl_config::remote_roles::HostConfig::parse(&publication.config_json).unwrap();
+            capyctl_config::remote_resources::local_host_document(&config.document).unwrap()
+        };
+        let deployment = serde_json::from_str(&launch.plan.deployment_config).unwrap();
+        let resolved = resolve_effective_with_checkpoint(
+            &deployment,
+            &host_document,
+            CheckpointFacts {
+                weights_bytes: launch.plan.checkpoint_weights_bytes,
+                accepted_revision: true,
+                legacy_vllm_device_floor: !launch.plan.vllm_device_request_no_floor,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.engine_config.memory().request_bytes,
+            27_917_287_336
+        );
+        assert_eq!(
+            resolved.engine_config.memory().request_bytes,
+            work.effective().engine_config.memory().request_bytes
+        );
+        assert_eq!(
+            resolved.ready_device_allocation().map(|(_, bytes)| bytes),
+            work.effective()
+                .ready_device_allocation()
+                .map(|(_, bytes)| bytes)
+        );
+    }
+
     // T26 T14 (#219, ADR 0017 version skew, ADR 0019 §3): an unmeasured
     // first start on a card is sent the server's card and host RAM figures
     // when the host takes `startup_host_bytes` (0.1.7 on). A host from 0.1.7
@@ -2114,6 +2282,7 @@ mod tests {
         );
         let card = (38_i64 << 30) + ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
         let launch = remote_launch(&owned, "controller", &work, true).unwrap();
+        assert!(!launch.plan.vllm_device_request_no_floor);
         assert_eq!(launch.plan.startup_bytes, Some(card));
         assert_eq!(
             launch.plan.startup_host_bytes,
@@ -2191,6 +2360,7 @@ mod tests {
     #[test]
     fn a_decision_canary_counts_only_a_well_formed_relayed_decision() {
         use capyctl_adapters::completion_probe::CanaryEvidence;
+        use capyctl_config::effective::DeploymentApi;
         let decided = |choice: &str, ps: [f64; 3], version: u32| {
             let mut r = result(vec![observed("api", 10, "alive")]);
             r.probe_decision = Some(pb::DecisionProbeEvidence {
@@ -2210,7 +2380,7 @@ mod tests {
         let version = capyctl_adapters::decision_probe::VERSION;
         let good = decided("billing", [0.95, 0.02, 0.03], version);
         assert!(matches!(
-            canary_evidence(true, &good),
+            canary_evidence(DeploymentApi::Decisions, &good),
             Ok(CanaryEvidence::Decision(answer)) if answer.choice == "billing"
         ));
         let mut text_only = result(vec![observed("api", 10, "alive")]);
@@ -2224,13 +2394,78 @@ mod tests {
             decided("other", [0.95, 0.02, 0.03], version),
             decided("billing", [0.95, 0.02, 0.03], version + 1),
         ] {
-            assert!(canary_evidence(true, &refused).is_err(), "{refused:?}");
+            assert!(
+                canary_evidence(DeploymentApi::Decisions, &refused).is_err(),
+                "{refused:?}"
+            );
         }
         assert!(matches!(
-            canary_evidence(false, &text_only),
+            canary_evidence(DeploymentApi::Chat, &text_only),
             Ok(CanaryEvidence::Generated(_))
         ));
-        assert!(canary_evidence(false, &good).is_err());
+        assert!(canary_evidence(DeploymentApi::Chat, &good).is_err());
+    }
+
+    /// ADR 0036 §§5, 6: an embeddings launch's wake canary counts only the
+    /// vector the host relayed, of this probe version, finite and of a norm
+    /// above 1e-6, exactly as relayed; generated text or a decision never
+    /// stands in for it, and an older host's answer without the field is a
+    /// canary not answered.
+    // T47 T20 T34
+    #[test]
+    fn an_embedding_canary_counts_only_a_well_formed_relayed_vector() {
+        use capyctl_adapters::completion_probe::CanaryEvidence;
+        use capyctl_config::effective::DeploymentApi;
+        let embedded = |vector: Vec<f32>, version: u32| {
+            let mut r = result(vec![observed("api", 10, "alive")]);
+            r.probe_embedding = Some(pb::EmbeddingProbeEvidence {
+                probe_version: version,
+                vector,
+            });
+            r
+        };
+        let version = capyctl_adapters::embedding_probe::VERSION;
+        let good = embedded(vec![0.6, -0.8, 0.0, 0.0], version);
+        assert_eq!(
+            canary_evidence(DeploymentApi::Embeddings, &good).unwrap(),
+            CanaryEvidence::Embedding(capyctl_adapters::embedding_probe::EmbeddingAnswer {
+                vector: vec![0.6, -0.8, 0.0, 0.0],
+            })
+        );
+        // An older host drops the flag and answers a readiness probe: no
+        // vector, so no canary evidence.
+        let older = result(vec![observed("api", 10, "alive")]);
+        let mut text_only = older.clone();
+        text_only.probe_text = "Ready.".into();
+        let mut decided = older.clone();
+        decided.probe_decision = Some(pb::DecisionProbeEvidence {
+            probe_version: capyctl_adapters::decision_probe::VERSION,
+            choice: "billing".into(),
+            probabilities: vec![pb::DecisionProbability {
+                option: "billing".into(),
+                probability: 1.0,
+            }],
+        });
+        let mut pending = good.clone();
+        pending.state = "attempted".into();
+        for refused in [
+            older,
+            text_only.clone(),
+            decided,
+            pending,
+            embedded(vec![], version),
+            embedded(vec![f32::NAN, 1.0], version),
+            embedded(vec![0.0, 0.0], version),
+            embedded(vec![0.6, -0.8], version + 1),
+        ] {
+            assert!(
+                canary_evidence(DeploymentApi::Embeddings, &refused).is_err(),
+                "{refused:?}"
+            );
+        }
+        // A chat or decisions launch never takes a vector as its canary.
+        assert!(canary_evidence(DeploymentApi::Chat, &good).is_err());
+        assert!(canary_evidence(DeploymentApi::Decisions, &good).is_err());
     }
 
     /// ADR 0014 amendment A12: the host's kernel builds reach the coordinator
@@ -2502,6 +2737,68 @@ mod tests {
             .record_host_version(&host, &declared(capabilities::agent_capabilities()))
             .unwrap();
         assert_eq!(recorded_for(&sessions, &remote, &identities), identities);
+    }
+
+    /// ADR 0036 §§5, 6, ADR 0017: an embeddings launch's wake canary goes
+    /// only to a host that declares `embeddings`. A host that does not (an
+    /// older peer) is a canary not answered, never `Unsupported`, which
+    /// would let the wake pass unchecked; nothing is sent to it.
+    // T47 T20 T34
+    #[tokio::test]
+    async fn an_embeddings_wake_canary_is_never_skipped_on_an_older_host() {
+        let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
+        let owned = Arc::new(Mutex::new(
+            crate::OwnedCoordinatorState::open(dir.path()).unwrap(),
+        ));
+        let authority = Arc::new(crate::enrollment::EnrollmentAuthority::new(
+            owned.clone(),
+            capyctl_agent::identity::CertificateAuthority::generate(100).unwrap(),
+        ));
+        let sessions = AgentSessions::new(authority);
+        let context = capyctl_domain::completion::StepExecutionContext {
+            token: capyctl_domain::completion::TransitionToken {
+                deployment_id: "d".into(),
+                revision: 1,
+                generation: 1,
+                operation_id: "o".into(),
+                step_id: "s".into(),
+            },
+            binding_id: "binding".into(),
+            incarnation: "incarnation".into(),
+            issued_at_ms: 1,
+            deadline_ms: capyctl_protocol::now_unix_ms() + 10_000,
+            identities: capyctl_domain::completion::ExecutionIdentities::OwnedLaunch,
+            completion_target: None,
+            grant_id: None,
+            launch_settings: None,
+        };
+        let chat = engine(
+            sessions.clone(),
+            owned.clone(),
+            binding(),
+            Default::default(),
+        );
+        let mut embeddings = binding();
+        embeddings.embeddings = true;
+        let embeddings = engine(sessions, owned, embeddings, Default::default());
+        let canary = embeddings
+            .wake_canary(&context, 8, std::time::Duration::from_secs(1))
+            .await;
+        assert!(
+            matches!(&canary, Err(RuntimeError::Uncertain(why)) if why.contains("embeddings")),
+            "{canary:?}"
+        );
+        // A chat launch on the same host keeps today's answer.
+        assert!(matches!(
+            chat.wake_canary(&context, 8, std::time::Duration::from_secs(1))
+                .await,
+            Err(RuntimeError::Unsupported)
+        ));
     }
 
     /// ADR 0033 (lifecycle design §10): a launch result's LMCache report

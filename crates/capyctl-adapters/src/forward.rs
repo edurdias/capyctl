@@ -1,8 +1,11 @@
 //! Shared, bounded text-chat transport. Terminal success is not lifecycle or
 //! readiness evidence; cancellation and partial output never prove idle.
 use crate::answer::EngineAnswer;
+use crate::embedding_answer::AnswerParser;
 use crate::request::{splice, InferenceRequest, Members, StrictValue};
-use crate::traits::{AdapterError, ChatSink, DeliveryFailed, StreamEnded};
+use crate::traits::{
+    AdapterError, ChatSink, DeliveryFailed, EmbeddingAnswered, EmbeddingSink, StreamEnded,
+};
 use futures::StreamExt;
 use serde_json::value::RawValue;
 use serde_json::{json, Value};
@@ -362,6 +365,86 @@ fn decision_uncertain() -> AdapterError {
     AdapterError::Uncertain("decision answer unverified".into())
 }
 
+fn embedding_uncertain() -> AdapterError {
+    AdapterError::Uncertain("embeddings answer unverified".into())
+}
+
+/// SPEC §§10, 13.3: diagnose uncertainty without logging a request, response,
+/// credential, URL or arbitrary upstream error text. Successful forwards
+/// allocate nothing for diagnostics.
+struct ForwardDiagnostic<'a> {
+    endpoint: &'a str,
+    started: std::time::Instant,
+    request_body_bytes: usize,
+}
+
+impl<'a> ForwardDiagnostic<'a> {
+    fn new(endpoint: &'a str, request_body_bytes: usize) -> Self {
+        Self {
+            endpoint,
+            started: std::time::Instant::now(),
+            request_body_bytes,
+        }
+    }
+
+    fn event(
+        &self,
+        phase: &str,
+        reason: &str,
+        received: usize,
+        error: Option<&reqwest::Error>,
+    ) -> Value {
+        use std::error::Error;
+
+        let mut io_kind = None;
+        let mut closed_by_peer = false;
+        let mut source = error.and_then(Error::source);
+        for _ in 0..16 {
+            let Some(cause) = source else { break };
+            if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+                io_kind = Some(format!("{:?}", io.kind()));
+                closed_by_peer |= matches!(
+                    io.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                );
+            }
+            // Hyper's incomplete-message error has no public reqwest
+            // category. Recognize its fixed wording, but never log the
+            // source's text: other errors may contain private URLs or data.
+            closed_by_peer |= cause.to_string() == "connection closed before message completed";
+            source = cause.source();
+        }
+        json!({
+            "event": "inference_forward_failed",
+            "endpoint": self.endpoint,
+            "phase": phase,
+            "reason": reason,
+            "elapsed_ms": self.started.elapsed().as_millis(),
+            "at_unix_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_millis()),
+            "request_body_bytes": self.request_body_bytes,
+            "bytes_received": received,
+            // reqwest does not expose socket-write progress or pool reuse.
+            // The supplied body length is not proof those bytes were sent.
+            "bytes_sent": null,
+            "connection_reused": null,
+            "timeout": error.is_some_and(reqwest::Error::is_timeout),
+            "connect": error.is_some_and(reqwest::Error::is_connect),
+            "body": error.is_some_and(reqwest::Error::is_body),
+            "request": error.is_some_and(reqwest::Error::is_request),
+            "closed_by_peer": closed_by_peer,
+            "io_kind": io_kind,
+        })
+    }
+
+    fn failed(&self, phase: &str, reason: &str, received: usize, error: Option<&reqwest::Error>) {
+        capyctl_domain::role_log::event(self.event(phase, reason, received, error));
+    }
+}
+
 /// The only upstream paths a forwarder may reach on an engine.
 ///
 /// SPEC §10: the router relays inference and nothing else. An engine also serves
@@ -369,8 +452,14 @@ fn decision_uncertain() -> AdapterError {
 /// and reaching any of it on a client's behalf would put engine control behind the
 /// inference port, where none of the lifecycle authority's accounting applies. The
 /// list is closed rather than filtered so a new path has to be added deliberately.
-/// ADR 0030 §2 adds the decision endpoint, for decisions deployments.
-const FORWARDED_PATHS: [&str; 3] = ["/v1/models", "/v1/chat/completions", "/v1/systemone"];
+/// ADR 0030 §2 adds the decision endpoint, for decisions deployments, and ADR
+/// 0036 §3 the embeddings endpoint, for embeddings deployments.
+const FORWARDED_PATHS: [&str; 4] = [
+    "/v1/models",
+    "/v1/chat/completions",
+    "/v1/systemone",
+    "/v1/embeddings",
+];
 
 /// Resolve one upstream URL, or refuse the path.
 ///
@@ -410,6 +499,8 @@ pub(crate) struct ChatHttp {
     endpoint: reqwest::Url,
     /// ADR 0030 §2: the engine's decision endpoint.
     decisions: reqwest::Url,
+    /// ADR 0036 §3: the engine's embeddings endpoint.
+    embeddings: reqwest::Url,
     model: String,
     key: Option<String>,
     client: reqwest::Client,
@@ -487,11 +578,14 @@ impl CacheSalt {
 }
 
 /// SPEC §10: whether an engine family partitions its prefix cache by
-/// `cache_salt`. vLLM and SGLang do; TensorFold ignores the field, and an
-/// unrecorded family is treated as not honouring it, so a requested isolation
-/// is never silently absent.
+/// `cache_salt`. vLLM and SGLang do, and so does TensorRT-LLM (ADR 0038
+/// §11: the server accepts the field, passes it to its generation call and
+/// salts its KV block reuse with it); TensorFold ignores the field on both
+/// lines (0.6, and the native line, ADR 0039 Evidence §6: no server code
+/// reads it), and an unrecorded family is treated as not honouring it, so a
+/// requested isolation is never silently absent.
 pub fn engine_honours_cache_salt(engine: Option<&str>) -> bool {
-    matches!(engine, Some("vllm" | "sglang"))
+    matches!(engine, Some("vllm" | "sglang" | "tensorrt-llm"))
 }
 
 impl ChatHttp {
@@ -501,20 +595,31 @@ impl ChatHttp {
         key: Option<String>,
         cache_salt: CacheSalt,
     ) -> Self {
+        // SPEC §10, ADR 0036 §4: inference is not replayed after acceptance
+        // becomes uncertain. Uvicorn's keepalive expiry can reset a reused
+        // socket before its protocol reads the new request's buffered bytes
+        // (vLLM 0.33.0, EM8 request 17). Keep the Client, but use one TCP
+        // connect per request: loopback here, or LAN to a host's ingress.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .pool_max_idle_per_host(0)
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(10));
+        // SPEC §10, ADR 0036 §4: the router owns request and idle bounds.
+        // A full engine receive window must not add reqwest's implicit
+        // 30-second TCP_USER_TIMEOUT to a legitimately backpressured upload.
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        let client = client.tcp_user_timeout(None);
         Self {
             endpoint: upstream(&base, "/v1/chat/completions").expect("a forwarded path"),
             decisions: upstream(&base, "/v1/systemone").expect("a forwarded path"),
+            embeddings: upstream(&base, crate::embedding_probe::PATH).expect("a forwarded path"),
             model,
             key,
             cache_salt,
             request_ids: RequestIdLane::Absent,
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .retry(reqwest::retry::never())
-                .no_proxy()
-                .connect_timeout(Duration::from_secs(10))
-                .build()
-                .expect("static client configuration"),
+            client: client.build().expect("static client configuration"),
         }
     }
 
@@ -598,6 +703,10 @@ impl ChatSink for Collecting<'_> {
     /// ADR 0032 §1: the collected path carries the observer's request ID.
     fn request_id(&self) -> Option<&str> {
         self.observer.request_id()
+    }
+    /// ADR 0037 §6: and its trace headers.
+    fn trace_headers(&self) -> Option<&crate::traits::TraceHeaders> {
+        self.observer.trace_headers()
     }
     async fn send(&mut self, chunk: String) -> Result<(), DeliveryFailed> {
         self.observer.collected(&chunk);
@@ -888,14 +997,18 @@ impl ChatHttp {
     /// transport error is `unverified()`. The caller judges every other
     /// response. `body` is the encoded request ([`InferenceRequest::encode`]);
     /// `request_id` goes as [`CAPYCTL_REQUEST_ID_HEADER`] (ADR 0032 §2: to a
-    /// host ingress only).
+    /// host ingress only). `trace` goes as the W3C `traceparent` and
+    /// `tracestate` headers (ADR 0037 §6: the router decided this lane
+    /// carries them).
     async fn post(
         &self,
         url: &reqwest::Url,
         body: Vec<u8>,
         request_id: Option<&str>,
+        trace: Option<&crate::traits::TraceHeaders>,
         unverified: fn() -> AdapterError,
     ) -> Result<reqwest::Response, AdapterError> {
+        let diagnostic = ForwardDiagnostic::new(url.path(), body.len());
         let mut send = self
             .client
             .post(url.clone())
@@ -907,7 +1020,25 @@ impl ChatHttp {
         if let Some(id) = request_id {
             send = send.header(CAPYCTL_REQUEST_ID_HEADER, id);
         }
+        if let Some(trace) = trace {
+            send = send.header("traceparent", &trace.traceparent);
+            if let Some(state) = &trace.tracestate {
+                send = send.header("tracestate", state);
+            }
+        }
         let response = send.send().await.map_err(|error| {
+            // reqwest's send covers both the upload and waiting for the
+            // response head; it cannot identify a finer phase here.
+            diagnostic.failed(
+                if error.is_connect() {
+                    "connect"
+                } else {
+                    "send_or_await_head"
+                },
+                "transport",
+                0,
+                Some(&error),
+            );
             // SPEC §10, ADR 0013 §10: a connection that was never established
             // carried no request, so nothing can be running for it and the
             // router may fail over. Any other transport error may follow a sent
@@ -956,6 +1087,15 @@ impl ChatHttp {
         &self,
         body: &InferenceRequest,
     ) -> Result<EngineAnswer, AdapterError> {
+        self.decide_traced(body, None).await
+    }
+
+    /// As [`ChatHttp::decide`], carrying `trace` (ADR 0037 §6).
+    pub(crate) async fn decide_traced(
+        &self,
+        body: &InferenceRequest,
+        trace: Option<&crate::traits::TraceHeaders>,
+    ) -> Result<EngineAnswer, AdapterError> {
         validate_decision_request(body)?;
         let public = body
             .get("model")
@@ -968,7 +1108,7 @@ impl ChatHttp {
             .encode(&[("model", &json!(self.model))])
             .map_err(|_| AdapterError::UnsupportedCapability)?;
         let response = self
-            .post(&self.decisions, request, None, decision_uncertain)
+            .post(&self.decisions, request, None, trace, decision_uncertain)
             .await?;
         if !response.status().is_success() || !content_type_is(&response, "application/json") {
             return Err(decision_uncertain());
@@ -985,6 +1125,79 @@ impl ChatHttp {
         }
         answer.set("model", json!(public));
         Ok(answer)
+    }
+
+    /// ADR 0036 §3-§4: forward one embeddings request and stream its answer
+    /// into `sink`. The request goes as one JSON body with `model` replaced
+    /// by the served name. On HTTP 200 the answer is relayed as its bytes
+    /// arrive, through the parser of [`crate::embedding_answer`]: the
+    /// engine's `model` becomes the public name, every check of §4 is applied
+    /// as the bytes pass, and the top-level closing brace is withheld for the
+    /// caller to write after `capyctl.metrics`. Nothing holds the answer, and
+    /// there is no size cap. A malformed answer, or one the engine ends
+    /// early, stops the relay and is uncertain: the engine may have run the
+    /// request. A client gone (`sink.send` failed) stops the relay only: the
+    /// answer is read and checked to its end (owner decision 2026-10-27,
+    /// question 7). No wall-clock bound of its own: the router bounds the
+    /// exchange, measuring idleness from [`EmbeddingSink::progressed`].
+    pub(crate) async fn embed(
+        &self,
+        body: &InferenceRequest,
+        sink: &mut dyn EmbeddingSink,
+    ) -> Result<EmbeddingAnswered, AdapterError> {
+        let expected = crate::embedding_request::embedding_expected(body)?;
+        let public = body
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or(AdapterError::UnsupportedCapability)?;
+        // SPEC §10, issue #220: preserve the caller's members and bytes,
+        // including an embeddings batch; only the served name is replaced.
+        let request = body
+            .encode(&[("model", &json!(self.model))])
+            .map_err(|_| AdapterError::UnsupportedCapability)?;
+        let diagnostic = ForwardDiagnostic::new("/v1/embeddings", request.len());
+        // ADR 0037 §6: trace headers are threaded through chat and decisions
+        // forwards only; an embeddings forward sends none.
+        let response = self
+            .post(&self.embeddings, request, None, None, embedding_uncertain)
+            .await?;
+        if !response.status().is_success() || !content_type_is(&response, "application/json") {
+            diagnostic.failed("await_head", "unexpected_status_or_content_type", 0, None);
+            return Err(embedding_uncertain());
+        }
+        let mut parser = AnswerParser::new(expected, public);
+        let mut client_gone = false;
+        let mut received = 0;
+        let mut stream = response.bytes_stream();
+        while let Some(bytes) = stream.next().await {
+            let bytes = bytes.map_err(|error| {
+                diagnostic.failed("read_body", "transport", received, Some(&error));
+                embedding_uncertain()
+            })?;
+            received += bytes.len();
+            sink.progressed();
+            // The bytes before a break are relayed whatever the transport's
+            // chunking; nothing from the break on ever is.
+            let mut relayed = Vec::with_capacity(bytes.len());
+            let checked = parser.feed(&bytes, &mut relayed);
+            if !client_gone && !relayed.is_empty() {
+                client_gone = sink.send(relayed).await.is_err();
+            }
+            checked.map_err(|malformed| {
+                diagnostic.failed("validate_body", malformed.0, received, None);
+                AdapterError::Uncertain(format!("embeddings answer malformed: {}", malformed.0))
+            })?;
+        }
+        let complete = parser.finish().map_err(|malformed| {
+            diagnostic.failed("validate_end", malformed.0, received, None);
+            AdapterError::Uncertain(format!("embeddings answer malformed: {}", malformed.0))
+        })?;
+        Ok(EmbeddingAnswered {
+            inputs: expected.inputs,
+            prompt_tokens: complete.prompt_tokens,
+            client_gone,
+        })
     }
 
     async fn stream_inner(
@@ -1059,7 +1272,13 @@ impl ChatHttp {
             .encode(&replace)
             .map_err(|_| AdapterError::UnsupportedCapability)?;
         let response = self
-            .post(&self.endpoint, request, header, uncertain)
+            .post(
+                &self.endpoint,
+                request,
+                header,
+                sink.trace_headers(),
+                uncertain,
+            )
             .await?;
         if !response.status().is_success() || !content_type_is(&response, "text/event-stream") {
             return Err(uncertain());
@@ -1406,6 +1625,20 @@ impl crate::traits::ChatForward for EngineForward {
     ) -> Result<EngineAnswer, AdapterError> {
         self.0.decide(body).await
     }
+    async fn forward_embedding(
+        &self,
+        body: &InferenceRequest,
+        sink: &mut dyn EmbeddingSink,
+    ) -> Result<EmbeddingAnswered, AdapterError> {
+        self.0.embed(body, sink).await
+    }
+    async fn forward_decision_traced(
+        &self,
+        body: &InferenceRequest,
+        trace: Option<&crate::traits::TraceHeaders>,
+    ) -> Result<EngineAnswer, AdapterError> {
+        self.0.decide_traced(body, trace).await
+    }
     async fn forward_chat_stream(
         &self,
         body: &crate::request::InferenceRequest,
@@ -1698,10 +1931,98 @@ fn fold_tool_calls(calls: &mut std::collections::BTreeMap<u64, Value>, deltas: &
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{assemble, probe_answered, upstream};
+    use crate::request::InferenceRequest;
     use crate::traits::AdapterError;
     use serde_json::{json, Value};
+
+    // T47 T21 (SPEC §§10, 13.3): a peer closing before its response head
+    // stays uncertain, but the role log records the safe transport category.
+    #[tokio::test]
+    async fn forward_diagnostics_classify_a_peer_closed_before_its_head() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            socket.read(&mut request).await.unwrap();
+        });
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .retry(reqwest::retry::never())
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/private?key=must-not-log"))
+            .send()
+            .await
+            .unwrap_err();
+        peer.await.unwrap();
+        let event = super::ForwardDiagnostic::new("/v1/embeddings", 4096).event(
+            "send_or_await_head",
+            "transport",
+            0,
+            Some(&error),
+        );
+        assert_eq!(event["event"], "inference_forward_failed");
+        assert_eq!(event["closed_by_peer"], true);
+        assert_eq!(event["timeout"], false);
+        assert_eq!(event["request_body_bytes"], 4096);
+        assert_eq!(event["bytes_received"], 0);
+        assert!(event["bytes_sent"].is_null());
+        assert!(event["connection_reused"].is_null());
+        let logged = event.to_string();
+        assert!(!logged.contains("must-not-log"));
+        assert!(!logged.contains("/private"));
+        assert!(!logged.contains(&address.to_string()));
+    }
+
+    // T47 T21: timeout diagnostics report measured progress, not arbitrary
+    // error text, request contents, credentials or an invented sent count.
+    #[tokio::test]
+    async fn forward_diagnostics_report_timeout_without_upstream_secrets() {
+        use std::time::Duration;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap()
+            .post(format!("http://{address}/private?key=must-not-log"))
+            .bearer_auth("secret-credential")
+            .body("secret-input")
+            .send()
+            .await
+            .unwrap_err();
+        peer.abort();
+        let event = super::ForwardDiagnostic::new("/v1/embeddings", 12).event(
+            "read_body",
+            "transport",
+            128,
+            Some(&error),
+        );
+        assert_eq!(event["timeout"], true);
+        assert_eq!(event["bytes_received"], 128);
+        assert!(event["elapsed_ms"].is_number());
+        assert!(event["at_unix_ms"].is_number());
+        let logged = event.to_string();
+        for private in [
+            "must-not-log",
+            "secret-credential",
+            "secret-input",
+            "/private",
+        ] {
+            assert!(!logged.contains(private));
+        }
+    }
 
     // T41 (ADR 0023 §7): the final chunk's `tensorfold` object survives
     // collection, beside usage.
@@ -2701,7 +3022,14 @@ mod tests {
     fn a_forwarder_reaches_the_chat_and_model_paths_and_refuses_every_other() {
         let base: reqwest::Url = "http://127.0.0.1:8000".parse().unwrap();
         // T43 (ADR 0030 §2): the decision endpoint, for decisions deployments.
-        for path in ["/v1/models", "/v1/chat/completions", "/v1/systemone"] {
+        // T47 (ADR 0036 §3): the embeddings endpoint, for embeddings
+        // deployments.
+        for path in [
+            "/v1/models",
+            "/v1/chat/completions",
+            "/v1/systemone",
+            "/v1/embeddings",
+        ] {
             assert_eq!(
                 upstream(&base, path).map(String::from),
                 Some(format!("http://127.0.0.1:8000{path}")),
@@ -2714,7 +3042,8 @@ mod tests {
             "/collective_rpc",
             "/v1/load_lora_adapter",
             "/tokenize",
-            "/v1/embeddings",
+            "/v1/embeddings/",
+            "/v1/embeddings?x=1",
             "/v1/completions",
             "/health",
             "",
@@ -2731,7 +3060,7 @@ mod tests {
         }
     }
 
-    fn decision(extra: Value) -> Value {
+    pub(crate) fn decision(extra: Value) -> Value {
         let mut body = json!({
             "model": "m",
             "state": "I was charged twice.",
@@ -2958,9 +3287,10 @@ mod tests {
         }
     }
 
-    // SPEC §10 (`cache_salt_unsupported`): only vLLM and SGLang honour the
-    // partition; a forwarder for any other engine refuses a request carrying
-    // one before connecting (the endpoint here accepts no connection).
+    // SPEC §10 (`cache_salt_unsupported`): only vLLM, SGLang and TensorRT-LLM
+    // honour the partition; a forwarder for any other engine refuses a request
+    // carrying one before connecting (the endpoint here accepts no connection).
+    // T49 (ADR 0038 §11): TensorRT-LLM salts its KV block reuse by the field.
     #[tokio::test]
     async fn a_forwarder_for_an_engine_ignoring_cache_salt_refuses_it_before_sending() {
         use super::engine_honours_cache_salt;
@@ -2969,6 +3299,7 @@ mod tests {
         assert!(!engine_honours_cache_salt(Some("tensorfold")));
         // T42 T37 (ADR 0029 §11): llama-server never reads the field.
         assert!(!engine_honours_cache_salt(Some("llamacpp")));
+        assert!(engine_honours_cache_salt(Some("tensorrt-llm")));
         assert!(!engine_honours_cache_salt(None));
         // ADR 0033 §5: the launch policy follows the same answer.
         use crate::forward::CacheSalt;
@@ -2979,7 +3310,7 @@ mod tests {
                 "{engine:?}"
             );
         }
-        for engine in ["vllm", "sglang"] {
+        for engine in ["vllm", "sglang", "tensorrt-llm"] {
             assert_eq!(
                 CacheSalt::for_launch(Some(engine), "dep-1", 3),
                 CacheSalt::Namespaced {
@@ -3250,6 +3581,121 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
     }
 
+    /// ADR 0037 §6: a sink handing the forwarder trace headers.
+    struct Tracing {
+        trace: Option<crate::traits::TraceHeaders>,
+    }
+    #[async_trait::async_trait]
+    impl crate::traits::ChatSink for Tracing {
+        fn trace_headers(&self) -> Option<&crate::traits::TraceHeaders> {
+            self.trace.as_ref()
+        }
+        async fn send(&mut self, _chunk: String) -> Result<(), crate::traits::DeliveryFailed> {
+            Ok(())
+        }
+    }
+
+    // T48 T43 (ADR 0037 §6, SPEC §10, issues #220/#223): the trace headers
+    // the router hands a forward are sent on streams, collected answers and
+    // decisions only when given. Traced decisions still preserve the caller's
+    // question order and the engine's exact probability bytes.
+    #[tokio::test]
+    async fn trace_headers_are_sent_only_when_given() {
+        type Headers = std::sync::Arc<std::sync::Mutex<Vec<axum::http::HeaderMap>>>;
+        let seen: Headers = Default::default();
+        let record = seen.clone();
+        let record_decision = seen.clone();
+        let (decision_tx, mut decision_rx) = tokio::sync::mpsc::channel(1);
+        let router = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move |headers: axum::http::HeaderMap| {
+                    record.lock().unwrap().push(headers);
+                    async {
+                        (
+                            [("content-type", "text/event-stream")],
+                            completed_sse("stop"),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1/systemone",
+                axum::routing::post(
+                    move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                        record_decision.lock().unwrap().push(headers);
+                        let tx = decision_tx.clone();
+                        async move {
+                            tx.send(body).await.unwrap();
+                            (
+                                [("content-type", "application/json")],
+                                r#"{"model":"m","answers":{"z":{"type":"noul","noul":0.100000000000000005},"a":{"type":"noul","noul":1e-05}}}"#,
+                            )
+                        }
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let forward = super::engine_forwarder(
+            format!("http://{address}").parse().unwrap(),
+            "m".into(),
+            None,
+            crate::forward::CacheSalt::for_launch(Some("sglang"), "dep-1", 1),
+        );
+        let trace = crate::traits::TraceHeaders {
+            traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into(),
+            tracestate: Some("vendor=1".into()),
+        };
+        let request: InferenceRequest = json!({"model":"public","messages":[]}).into();
+        let decision = InferenceRequest::parse(
+            br#"{"questions":{"z":{"type":"noul"},"a":{"type":"noul"}},"state":"hi","model":"public"}"#
+                .as_slice()
+                .into(),
+        )
+        .unwrap();
+        for given in [Some(trace.clone()), None] {
+            seen.lock().unwrap().clear();
+            let mut sink = Tracing {
+                trace: given.clone(),
+            };
+            forward
+                .forward_chat_stream_async(&request, &mut sink)
+                .await
+                .unwrap();
+            forward
+                .forward_chat_observed(&request, &mut sink)
+                .await
+                .unwrap();
+            let answer = forward
+                .forward_decision_traced(&decision, given.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(
+                decision_rx.recv().await.unwrap().as_ref(),
+                br#"{"questions":{"z":{"type":"noul"},"a":{"type":"noul"}},"state":"hi","model":"m"}"#
+            );
+            assert_eq!(
+                answer.encode().unwrap().as_slice(),
+                br#"{"model":"public","answers":{"z":{"type":"noul","noul":0.100000000000000005},"a":{"type":"noul","noul":1e-05}}}"#
+            );
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 3);
+            for headers in &seen {
+                let header = |name: &str| headers.get(name).map(|v| v.to_str().unwrap().to_owned());
+                assert_eq!(
+                    header("traceparent"),
+                    given.as_ref().map(|t| t.traceparent.clone())
+                );
+                assert_eq!(
+                    header("tracestate"),
+                    given.as_ref().and_then(|t| t.tracestate.clone())
+                );
+            }
+        }
+    }
+
     // T17 (ADR 0032 §4): SGLang's graceful abort ends a request with a final
     // chunk whose finish reason is `abort`, then `[DONE]`. On a lane that sent
     // CapyCTL's request ID that is the request's own final output, read
@@ -3350,5 +3796,568 @@ mod tests {
                 Err(AdapterError::Uncertain(_))
             ));
         }
+    }
+
+    type Received = std::sync::Arc<std::sync::Mutex<Vec<Value>>>;
+
+    /// An engine answering `/v1/embeddings` with `status`, the media type
+    /// `media` and `chunks` in turn, where `None` fails the transfer once
+    /// what came before had time to arrive; it records each request body.
+    async fn embedding_engine(
+        status: u16,
+        media: &'static str,
+        chunks: Vec<Option<String>>,
+    ) -> (reqwest::Url, Received) {
+        let received: Received = Default::default();
+        let record = received.clone();
+        let status = axum::http::StatusCode::from_u16(status).unwrap();
+        let router = axum::Router::new().route(
+            "/v1/embeddings",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                record.lock().unwrap().push(body);
+                let chunks = chunks.clone();
+                async move {
+                    use futures::StreamExt;
+                    let stream = futures::stream::iter(chunks).then(|chunk| async move {
+                        match chunk {
+                            Some(text) => Ok(axum::body::Bytes::from(text)),
+                            None => {
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                Err(std::io::Error::other("the engine went away"))
+                            }
+                        }
+                    });
+                    axum::response::Response::builder()
+                        .status(status)
+                        .header("content-type", media)
+                        .body(axum::body::Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        (format!("http://{address}").parse().unwrap(), received)
+    }
+
+    fn embedding_forwarder(url: reqwest::Url) -> std::sync::Arc<dyn crate::traits::ChatForward> {
+        crate::forward::engine_forwarder(
+            url,
+            "served".into(),
+            None,
+            crate::forward::CacheSalt::Refused,
+        )
+    }
+
+    /// What reached the client: the bytes, the sends tried and the progress
+    /// reports. With `gone`, every send fails: the client went away.
+    #[derive(Default)]
+    struct Relayed {
+        bytes: Vec<u8>,
+        sends: usize,
+        progressed: usize,
+        gone: bool,
+    }
+    #[async_trait::async_trait]
+    impl crate::traits::EmbeddingSink for Relayed {
+        async fn send(&mut self, bytes: Vec<u8>) -> Result<(), crate::traits::DeliveryFailed> {
+            self.sends += 1;
+            if self.gone {
+                return Err(crate::traits::DeliveryFailed);
+            }
+            self.bytes.extend(bytes);
+            Ok(())
+        }
+        fn progressed(&mut self) {
+            self.progressed += 1;
+        }
+    }
+
+    const EMBEDDING_ANSWER: &str = r#"{"id":"embd-9","object":"list","created":1,"model":"/srv/Qwen3-Embedding-4B","data":[{"index":0,"object":"embedding","embedding":[0.5,-0.25]},{"index":1,"object":"embedding","embedding":[1e-2,3]}],"usage":{"prompt_tokens":7,"total_tokens":7}}"#;
+
+    // T47 T17 (SPEC §10, ADR 0036 §4): an idle peer can expire a connection
+    // after the next upload begins but before its protocol reads those bytes.
+    // Use a fresh connection, never retry work whose acceptance is uncertain.
+    #[tokio::test]
+    async fn an_embeddings_upload_avoids_an_expired_keepalive_connection() {
+        use std::time::Duration;
+
+        let peer =
+            capyctl_testkit::held_engine::ExpiredKeepaliveEngine::start(EMBEDDING_ANSWER).await;
+        let forward = embedding_forwarder(format!("http://{}", peer.address()).parse().unwrap());
+        let first: InferenceRequest = json!({"model":"public","input":["a","b"]}).into();
+        forward
+            .forward_embedding(&first, &mut Relayed::default())
+            .await
+            .unwrap();
+        let large: InferenceRequest =
+            json!({"model":"public","input":["a".repeat(8 << 20),"b"]}).into();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            forward.forward_embedding(&large, &mut Relayed::default()),
+        )
+        .await
+        .expect("the fresh upload completes");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            peer.counts(),
+            (2, 2, 0),
+            "two fresh requests, with no reset or replay of a reused upload"
+        );
+    }
+
+    /// T47 (ADR 0036 §4, EM8): an engine under load may stop reading a large
+    /// request while earlier batches run. Only the router's request deadline
+    /// bounds this wait, not reqwest's implicit 30-second TCP_USER_TIMEOUT.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_embeddings_upload_survives_engine_backpressure_beyond_thirty_seconds() {
+        use std::time::Duration;
+
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        // Inherited by accepted sockets: the upload cannot fit in the peer's
+        // receive buffer while its application is not reading.
+        socket.set_recv_buffer_size(16 * 1024).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(16).unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/v1/embeddings",
+                axum::routing::post(|body: axum::body::Bytes| async move {
+                    assert!(body.len() > 8 << 20);
+                    ([("content-type", "application/json")], EMBEDDING_ANSWER)
+                }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(16 << 20));
+        let engine = tokio::spawn(async move {
+            // A connected socket advertises a zero receive window once full.
+            // TCP_USER_TIMEOUT expires even on loopback without packet loss.
+            tokio::time::sleep(Duration::from_secs(35)).await;
+            axum::serve(listener, app).await.unwrap();
+        });
+        let request: InferenceRequest =
+            json!({"model": "public", "input": ["a".repeat(8 << 20), "b"]}).into();
+        let mut sink = Relayed::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            embedding_forwarder(format!("http://{address}").parse().unwrap())
+                .forward_embedding(&request, &mut sink),
+        )
+        .await;
+        engine.abort();
+        let answered = result
+            .expect("the upload completes within the caller's deadline")
+            .expect("engine backpressure must not impose an implicit 30-second deadline");
+        assert_eq!(answered.inputs, 2);
+        assert_eq!(answered.prompt_tokens, Some(7));
+        assert!(sink.bytes.ends_with(br#""total_tokens":7}"#));
+    }
+
+    /// ADR 0036 §3-§4: the engine receives the served name; the client
+    /// receives the answer as it streams, with the public name in `model`,
+    /// nothing else rewritten, and without the closing brace, which the
+    /// caller writes after `capyctl.metrics`.
+    // T47
+    #[tokio::test]
+    async fn an_embeddings_answer_is_relayed_with_the_public_model_and_without_its_brace() {
+        // Split inside the engine's `model` value and inside a vector.
+        let at = EMBEDDING_ANSWER.find("Qwen3").unwrap();
+        let chunks = vec![
+            Some(EMBEDDING_ANSWER[..at].to_owned()),
+            Some(EMBEDDING_ANSWER[at..at + 70].to_owned()),
+            Some(EMBEDDING_ANSWER[at + 70..].to_owned()),
+        ];
+        let (url, received) = embedding_engine(200, "application/json", chunks).await;
+        let request: InferenceRequest =
+            json!({"model": "public", "input": ["a", "b"], "user": "u-1"}).into();
+        let mut sink = Relayed::default();
+        let answered = embedding_forwarder(url)
+            .forward_embedding(&request, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            answered,
+            crate::traits::EmbeddingAnswered {
+                inputs: 2,
+                prompt_tokens: Some(7),
+                client_gone: false,
+            }
+        );
+        assert_eq!(
+            received.lock().unwrap().as_slice(),
+            [json!({"model": "served", "input": ["a", "b"], "user": "u-1"})]
+        );
+        let relayed = String::from_utf8(sink.bytes).unwrap();
+        let expected = EMBEDDING_ANSWER.replace("/srv/Qwen3-Embedding-4B", "public");
+        assert_eq!(relayed, expected.strip_suffix('}').unwrap());
+        assert!(sink.progressed >= 1);
+        let whole: Value = serde_json::from_str(&format!("{relayed}}}")).unwrap();
+        assert_eq!(whole["model"], "public");
+        assert_eq!(whole["id"], "embd-9");
+        // The same checks judge a whole answer.
+        assert_eq!(
+            crate::embedding_request::embedding_answered(&request, EMBEDDING_ANSWER.as_bytes()),
+            Some(answered)
+        );
+        assert_eq!(
+            crate::embedding_request::embedding_answered(
+                &request,
+                &EMBEDDING_ANSWER.as_bytes()[..100]
+            ),
+            None
+        );
+    }
+
+    // T47 T19 (ADR 0036 §4, SPEC §10, issue #220): embeddings use the same
+    // byte-preserving request boundary as chat and decisions. Only `model`
+    // changes; the caller's ordering and escaped input/user stay untouched.
+    #[tokio::test]
+    async fn an_embeddings_forward_preserves_the_callers_request_bytes() {
+        let (tx, mut received) = tokio::sync::mpsc::channel(1);
+        let app = axum::Router::new().route(
+            "/v1/embeddings",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let tx = tx.clone();
+                async move {
+                    tx.send(body).await.unwrap();
+                    ([("content-type", "application/json")], EMBEDDING_ANSWER)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let request = InferenceRequest::parse(
+            br#"{"user":"\u0075","input":["z","\u0061"],"model":"public"}"#
+                .as_slice()
+                .into(),
+        )
+        .unwrap();
+        embedding_forwarder(url)
+            .forward_embedding(&request, &mut Relayed::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            received.recv().await.unwrap().as_ref(),
+            br#"{"user":"\u0075","input":["z","\u0061"],"model":"served"}"#
+        );
+    }
+
+    /// ADR 0036 §4: an answer that fails a check, is not JSON, or ends early
+    /// is uncertain; the client holds a prefix of it that no JSON parser
+    /// accepts, never the closing brace.
+    // T47
+    #[tokio::test]
+    async fn a_broken_embeddings_answer_is_uncertain_and_never_reaches_the_client_whole() {
+        let entry = |index: usize, vector: &str| {
+            format!(r#"{{"index":{index},"object":"embedding","embedding":{vector}}}"#)
+        };
+        let answer = |entries: &[String]| {
+            format!(
+                r#"{{"object":"list","model":"m","data":[{}],"usage":{{"prompt_tokens":2,"total_tokens":2}}}}"#,
+                entries.join(",")
+            )
+        };
+        let whole = answer(&[entry(0, "[1,2]"), entry(1, "[3,4]")]);
+        let long = format!("[0.{},2]", "1".repeat(63));
+        let cases: Vec<(&str, Value, Vec<Option<String>>)> = vec![
+            (
+                "wrong count",
+                json!({}),
+                vec![Some(answer(&[entry(0, "[1,2]")]))],
+            ),
+            (
+                "repeated index",
+                json!({}),
+                vec![Some(answer(&[entry(0, "[1,2]"), entry(0, "[3,4]")]))],
+            ),
+            (
+                "ragged vectors",
+                json!({}),
+                vec![Some(answer(&[entry(0, "[1,2]"), entry(1, "[3]")]))],
+            ),
+            (
+                "non-finite value",
+                json!({}),
+                vec![Some(answer(&[entry(0, "[1,2]"), entry(1, "[3,1e999]")]))],
+            ),
+            (
+                "wrong dimensions",
+                json!({"dimensions": 3}),
+                vec![Some(whole.clone())],
+            ),
+            (
+                "oversized number",
+                json!({}),
+                vec![Some(answer(&[entry(0, "[1,2]"), entry(1, &long)]))],
+            ),
+            (
+                "invalid JSON",
+                json!({}),
+                vec![Some(whole.replace("],\"usage", ",],\"usage"))],
+            ),
+            (
+                "closed connection",
+                json!({}),
+                vec![Some(whole[..90].to_owned()), None],
+            ),
+            (
+                "ended early",
+                json!({}),
+                vec![Some(whole[..whole.len() - 1].to_owned())],
+            ),
+        ];
+        let rewritten = whole.replace(r#""model":"m""#, r#""model":"public""#);
+        for (what, extra, chunks) in cases {
+            let (url, _) = embedding_engine(200, "application/json", chunks).await;
+            let mut request = json!({"model": "public", "input": ["a", "b"]});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let request: InferenceRequest = request.into();
+            let mut sink = Relayed::default();
+            let result = embedding_forwarder(url)
+                .forward_embedding(&request, &mut sink)
+                .await;
+            assert!(
+                matches!(result, Err(AdapterError::Uncertain(_))),
+                "{what}: {result:?}"
+            );
+            let relayed = String::from_utf8(sink.bytes).unwrap();
+            assert!(serde_json::from_str::<Value>(&relayed).is_err(), "{what}");
+            assert!(
+                !relayed.is_empty(),
+                "{what}: the answer streamed before the break"
+            );
+            if matches!(
+                what,
+                "wrong dimensions" | "closed connection" | "ended early"
+            ) {
+                assert!(rewritten.starts_with(&relayed), "{what}: {relayed}");
+                assert_ne!(relayed, rewritten, "{what}");
+            }
+        }
+    }
+
+    /// ADR 0036 §4, SPEC §10: an engine's complete invalid-request answer is
+    /// its rejection and its complete error answer its error, read whole as
+    /// for chat and decisions; any other answer is uncertain, and a refused
+    /// request reaches no engine.
+    // T47
+    #[tokio::test]
+    async fn engine_answers_to_an_embeddings_request_keep_their_meaning() {
+        let request: InferenceRequest = json!({"model": "public", "input": "a"}).into();
+        let error = |message: &str| Some(json!({"error": {"message": message}}).to_string());
+        let (url, _) = embedding_engine(
+            400,
+            "application/json",
+            vec![error("input (9000 tokens) is longer than the model's 8192")],
+        )
+        .await;
+        let result = embedding_forwarder(url)
+            .forward_embedding(&request, &mut Relayed::default())
+            .await;
+        assert!(
+            matches!(&result, Err(AdapterError::Rejected { status: 400, message }) if message.contains("9000 tokens")),
+            "{result:?}"
+        );
+        let (url, _) = embedding_engine(500, "application/json", vec![error("CUDA error")]).await;
+        let result = embedding_forwarder(url)
+            .forward_embedding(&request, &mut Relayed::default())
+            .await;
+        assert!(
+            matches!(&result, Err(AdapterError::EngineError { status: 500, message }) if message == "CUDA error"),
+            "{result:?}"
+        );
+        let (url, _) =
+            embedding_engine(200, "text/plain", vec![Some(EMBEDDING_ANSWER.to_owned())]).await;
+        let mut sink = Relayed::default();
+        let result = embedding_forwarder(url)
+            .forward_embedding(&request, &mut sink)
+            .await;
+        assert!(
+            matches!(result, Err(AdapterError::Uncertain(_))),
+            "{result:?}"
+        );
+        assert_eq!(sink.sends, 0);
+        let (url, received) = embedding_engine(200, "application/json", vec![]).await;
+        let result = embedding_forwarder(url)
+            .forward_embedding(
+                &crate::embedding_request::tests::embeddings(json!({"stream": true})).into(),
+                &mut Relayed::default(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AdapterError::PolicyDenied)),
+            "{result:?}"
+        );
+        assert!(received.lock().unwrap().is_empty());
+    }
+
+    /// ADR 0036 §4 (owner decision 2026-10-27, question 7): a client that
+    /// went away stops the relay, never the reading: the answer is read and
+    /// checked to its end, and a complete one is `Ok` with the client gone; a
+    /// broken one is still uncertain.
+    // T47 T17
+    #[tokio::test]
+    async fn a_client_gone_leaves_the_answer_read_and_checked_to_its_end() {
+        let request: InferenceRequest = json!({"model": "public", "input": ["a", "b"]}).into();
+        let chunks = EMBEDDING_ANSWER
+            .as_bytes()
+            .chunks(40)
+            .map(|chunk| Some(String::from_utf8(chunk.to_vec()).unwrap()))
+            .collect::<Vec<_>>();
+        let (url, _) = embedding_engine(200, "application/json", chunks).await;
+        let mut sink = Relayed {
+            gone: true,
+            ..Relayed::default()
+        };
+        let answered = embedding_forwarder(url)
+            .forward_embedding(&request, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            answered,
+            crate::traits::EmbeddingAnswered {
+                inputs: 2,
+                prompt_tokens: Some(7),
+                client_gone: true,
+            }
+        );
+        assert_eq!(sink.sends, 1, "nothing is sent after the client went away");
+        let broken = EMBEDDING_ANSWER.replace(r#""index":1"#, r#""index":0"#);
+        let (url, _) = embedding_engine(200, "application/json", vec![Some(broken)]).await;
+        let mut sink = Relayed {
+            gone: true,
+            ..Relayed::default()
+        };
+        let result = embedding_forwarder(url)
+            .forward_embedding(&request, &mut sink)
+            .await;
+        assert!(
+            matches!(result, Err(AdapterError::Uncertain(_))),
+            "{result:?}"
+        );
+    }
+
+    /// Counts what reached the client without keeping it, and lets the
+    /// engine go on once the client has the first bytes.
+    struct Streaming {
+        first: std::sync::Arc<tokio::sync::Notify>,
+        bytes: usize,
+        sends: usize,
+        largest: usize,
+        head: Vec<u8>,
+        tail: Vec<u8>,
+    }
+    #[async_trait::async_trait]
+    impl crate::traits::EmbeddingSink for Streaming {
+        async fn send(&mut self, bytes: Vec<u8>) -> Result<(), crate::traits::DeliveryFailed> {
+            if self.sends == 0 {
+                self.first.notify_one();
+            }
+            self.sends += 1;
+            self.bytes += bytes.len();
+            self.largest = self.largest.max(bytes.len());
+            if self.head.len() < 64 {
+                let take = (64 - self.head.len()).min(bytes.len());
+                self.head.extend_from_slice(&bytes[..take]);
+            }
+            self.tail
+                .extend_from_slice(&bytes[bytes.len().saturating_sub(64)..]);
+            let excess = self.tail.len().saturating_sub(64);
+            self.tail.drain(..excess);
+            Ok(())
+        }
+    }
+
+    /// ADR 0036 §4 (owner decision 2026-10-27, question 6): a 2048-input
+    /// `float` answer of 4096-dimension vectors (about 33 MB of JSON) streams
+    /// through with no cap: the client has its first bytes before the engine
+    /// has finished (the engine waits for them), and every relay is one
+    /// transport chunk, so nothing holds the answer.
+    // T47
+    #[tokio::test]
+    async fn a_large_float_answer_streams_through_before_the_engine_has_finished() {
+        const INPUTS: usize = 2048;
+        const WIDTH: usize = 4096;
+        let first = std::sync::Arc::new(tokio::sync::Notify::new());
+        let engine_waits = first.clone();
+        let vector = std::sync::Arc::new(format!("[{}0.5]", "0.5,".repeat(WIDTH - 1)));
+        let router = axum::Router::new().route(
+            "/v1/embeddings",
+            axum::routing::post(move || {
+                let waits = engine_waits.clone();
+                let vector = vector.clone();
+                async move {
+                    use futures::StreamExt;
+                    let bytes = |text: String| Ok::<_, std::io::Error>(axum::body::Bytes::from(text));
+                    let head = futures::stream::iter([bytes(
+                        r#"{"object":"list","model":"/srv/Qwen3-Embedding-8B","data":["#.into(),
+                    )]);
+                    let entries = futures::stream::unfold(0, move |index| {
+                        let waits = waits.clone();
+                        let vector = vector.clone();
+                        async move {
+                            if index == INPUTS {
+                                return None;
+                            }
+                            if index == 1 {
+                                // The engine has not finished until the client
+                                // has the start of the answer.
+                                waits.notified().await;
+                            }
+                            let comma = if index == 0 { "" } else { "," };
+                            let entry = format!(
+                                r#"{comma}{{"object":"embedding","index":{index},"embedding":{vector}}}"#
+                            );
+                            Some((bytes(entry), index + 1))
+                        }
+                    });
+                    let tail = futures::stream::iter([bytes(
+                        r#"],"usage":{"prompt_tokens":4096,"total_tokens":4096}}"#.into(),
+                    )]);
+                    axum::response::Response::builder()
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from_stream(head.chain(entries).chain(tail)))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let inputs: Vec<String> = (0..INPUTS).map(|i| format!("text {i}")).collect();
+        let request: InferenceRequest = json!({"model": "public", "input": inputs}).into();
+        let mut sink = Streaming {
+            first,
+            bytes: 0,
+            sends: 0,
+            largest: 0,
+            head: vec![],
+            tail: vec![],
+        };
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            embedding_forwarder(format!("http://{address}").parse().unwrap())
+                .forward_embedding(&request, &mut sink),
+        )
+        .await
+        .expect("the client has the answer's start before the engine finishes")
+        .unwrap();
+        assert_eq!(answered.inputs, INPUTS);
+        assert_eq!(answered.prompt_tokens, Some(4096));
+        assert!(sink.bytes > INPUTS * WIDTH * 4, "{}", sink.bytes);
+        assert!(sink.sends > 1);
+        assert!(sink.largest <= 1024 * 1024, "{}", sink.largest);
+        assert!(sink
+            .head
+            .starts_with(br#"{"object":"list","model":"public","data":[{"#));
+        assert!(sink.tail.ends_with(br#""total_tokens":4096}"#));
     }
 }

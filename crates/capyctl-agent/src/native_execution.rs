@@ -45,6 +45,8 @@ mod tensorfold;
 mod llamacpp;
 // ADR 0031: custom engines' plan, adapter and loopback check.
 mod custom;
+// ADR 0038: TensorRT-LLM's plan, adapter and ownership checks.
+mod tensorrt_llm;
 // ADR 0035 §§5, 6: launches on several GPUs of this host.
 mod local_tp;
 // ADR 0023 §6, ADR 0029 §10: the engines' own idle check before Terminate.
@@ -69,6 +71,10 @@ mod member_savers;
 mod lmcache;
 // ADR 0032 §3: the request abort of a retained SGLang launch, on loopback.
 mod request_abort;
+// ADR 0037 §7: a launch's engine tracing, decided and frozen when it launches.
+mod engine_tracing;
+// ADR 0037 §4: the host's lifecycle steps as spans under the server's step.
+mod host_spans;
 
 /// The longest one fresh `/v1/models` readiness read may take.
 const PROBE_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -158,6 +164,12 @@ pub struct NativeHostExecution {
     lmcache_verdicts: Arc<lmcache::LmcacheVerdicts>,
     /// ADR 0033 §12: the load source that samples the LMCache servers.
     host_load: Arc<crate::load::HostLoad>,
+    /// ADR 0017 / #235: the connected server's advertised refusal support.
+    /// Empty until SessionReady; replaced before each session's commands.
+    server_capabilities: Arc<Mutex<Vec<String>>>,
+    /// ADR 0037 §4: the tracing the host's lifecycle steps are recorded
+    /// with; `None` reads the host role's installed tracing.
+    tracing: Option<capyctl_trace::Tracing>,
     /// #226 (SPEC §7.2): how a launch on unified memory gives back its
     /// checkpoint's page cache before its engine starts.
     page_cache: Arc<dyn crate::page_cache::PageCacheAdvice>,
@@ -215,6 +227,8 @@ enum PreparedLaunch {
     Llamacpp(Box<capyctl_adapters::llamacpp::PlanInputLlamacpp>),
     /// ADR 0031: the plan, keyed when the manifest uses `{api_key}`.
     Custom(Box<capyctl_adapters::custom::PlanInputCustom>),
+    /// ADR 0038: the plan, with its launch directory in the private root.
+    TensorrtLlm(Box<capyctl_adapters::tensorrt_llm::PlanInputTensorrtLlm>),
 }
 
 impl NativeHostExecution {
@@ -302,6 +316,8 @@ impl NativeHostExecution {
             lmcache_dirs: None,
             lmcache_verdicts: Arc::default(),
             host_load,
+            server_capabilities: Arc::default(),
+            tracing: None,
             page_cache: Arc::new(crate::page_cache::Fadvise),
         });
         this.prime_gpu();
@@ -574,6 +590,37 @@ impl NativeHostExecution {
         Arc::make_mut(&mut self).saver = Some(saver);
         self
     }
+    /// ADR 0037 §4: record the host's lifecycle steps with `tracing` instead
+    /// of the host role's installed tracing (a test's capture).
+    pub fn with_tracing(mut self: Arc<Self>, tracing: capyctl_trace::Tracing) -> Arc<Self> {
+        Arc::make_mut(&mut self).tracing = Some(tracing);
+        self
+    }
+    fn tracing(&self) -> capyctl_trace::Tracing {
+        self.tracing
+            .clone()
+            .unwrap_or_else(crate::host_tracing::get)
+    }
+    /// ADR 0037 §§4, 6: a command's effect with its host steps recorded as
+    /// children of the server step its envelope named. A launch, wake or
+    /// park is one step around the whole effect, ending with the outcome its
+    /// result shows; a Terminate records its own steps inside.
+    async fn traced_effect(
+        self,
+        session: u64,
+        command: MemberCommand,
+        trace_parent: Option<String>,
+    ) -> Result<pb::MemberExecutionResult, SessionError> {
+        let trace = host_spans::StepTrace::new(self.tracing(), trace_parent.as_deref());
+        let mut step =
+            host_spans::whole_step(&command.action).map(|name| (name, trace.step(name, &command)));
+        let result = self.effect(session, command, trace).await;
+        if let (Some((name, step)), Ok(result)) = (step.as_mut(), &result) {
+            let (outcome, code) = host_spans::whole_outcome(*name, result);
+            step.end(outcome, code);
+        }
+        result
+    }
     /// SPEC §§9.1, 13.2: a launch leaving residency loses its readiness
     /// authority, so no replay of an earlier launch or probe reopens its gate.
     fn revoke_ready(&self, owned_handle: &str) -> Result<(), SessionError> {
@@ -668,6 +715,9 @@ impl NativeHostExecution {
             // The server accepted this revision; it keeps the rules it was
             // accepted under (SPEC §7.3 device coverage applies to writes).
             accepted_revision: true,
+            // ADR 0019 §§3–4 / #225: absent on an old server's plan, so an
+            // accepted or retained revision keeps its historical derivation.
+            legacy_vllm_device_floor: !plan.vllm_device_request_no_floor,
             ..Default::default()
         };
         let mut effective =
@@ -921,30 +971,43 @@ impl NativeHostExecution {
             Err(reason) => refused(reason),
             // Owner decision 2026-09-23 (solo first start): a size-only
             // request walks the checkpoint and hashes nothing.
-            Ok(location) if plan.size_only => {
+            Ok((location, documents)) if plan.size_only => {
                 let checkpoints = self.checkpoints.clone();
                 let sized = tokio::task::spawn_blocking(move || {
                     let size = checkpoints.size(&location.model_store, &location.checkpoint)?;
                     let weights = with_drafter(&checkpoints, &location, size.weights_bytes)?;
                     // ADR 0033 amendment A12: the model type the server's
-                    // LMCache plan compares, known before the digest.
-                    Ok::<_, CheckpointError>((size, weights, location.model_type()))
+                    // LMCache plan compares, known before the digest, and
+                    // ADR 0034 §4: B and C, which its automatic pool is
+                    // sized from.
+                    let basis = documents.pool_basis(capyctl_config::effective::CheckpointFacts {
+                        weights_bytes: Some(weights),
+                        ..Default::default()
+                    });
+                    Ok::<_, CheckpointError>((size, weights, location.model_type(), basis))
                 })
                 .await
                 .map_err(|_| SessionError)?;
                 match sized {
-                    Ok((size, weights_bytes, model_type)) => pb::CheckpointDigestEvidence {
+                    Ok((
+                        size,
+                        weights_bytes,
+                        model_type,
+                        (kv_bytes_per_token, pool_context_tokens),
+                    )) => pb::CheckpointDigestEvidence {
                         state: "sized".into(),
                         weights_bytes,
                         file_count: size.file_count,
                         total_bytes: size.total_bytes,
                         model_type: model_type.unwrap_or_default(),
+                        kv_bytes_per_token,
+                        pool_context_tokens,
                         ..Default::default()
                     },
                     Err(error) => refused(error.code()),
                 }
             }
-            Ok(location) => {
+            Ok((location, documents)) => {
                 let checkpoints = self.checkpoints.clone();
                 let measured = tokio::task::spawn_blocking(move || {
                     let verified = checkpoints.measure_declared(
@@ -962,17 +1025,29 @@ impl NativeHostExecution {
                     let (layout, tables) = location.header_facts();
                     let layout = layout.filter(|layout| layout.sharded_bytes <= weights);
                     let tables = tables.filter(|tables| tables.bytes <= weights);
+                    let state_slot_bytes = location.state_slot_bytes();
+                    let gguf = location.gguf_facts();
+                    // ADR 0034 §4: B and C, resolved with what was measured.
+                    let basis = documents.pool_basis(capyctl_config::effective::CheckpointFacts {
+                        weights_bytes: Some(weights),
+                        state_slot_bytes,
+                        layout,
+                        disk_tables: tables,
+                        gguf,
+                        ..Default::default()
+                    });
                     Ok::<_, CheckpointError>((
                         verified,
                         weights,
-                        location.state_slot_bytes(),
+                        state_slot_bytes,
                         layout,
                         tables,
                         // ADR 0029 §9: what a llama.cpp launch loads, and
                         // its GGUF header.
-                        location.gguf_facts(),
+                        gguf,
                         // ADR 0033 amendment A12: the model type.
                         location.model_type(),
+                        basis,
                     ))
                 })
                 .await
@@ -986,6 +1061,7 @@ impl NativeHostExecution {
                         tables,
                         gguf,
                         model_type,
+                        (kv_bytes_per_token, pool_context_tokens),
                     )) => {
                         let manifest = verified.manifest;
                         let mismatch = plan
@@ -1010,6 +1086,8 @@ impl NativeHostExecution {
                                 .map(capyctl_protocol::execution::tables_to_wire),
                             gguf: gguf.as_ref().map(capyctl_protocol::execution::gguf_to_wire),
                             model_type: model_type.unwrap_or_default(),
+                            kv_bytes_per_token,
+                            pool_context_tokens,
                         }
                     }
                     Err(error) => refused(error.code()),
@@ -1294,11 +1372,18 @@ impl NativeHostExecution {
     }
 
     /// Where a digest request's checkpoint lives on this host, from this host's
-    /// approved document only.
+    /// approved document only, with the deployment and host documents it was
+    /// located from (ADR 0034 §4: the pool basis is computed from them).
     fn locate(
         &self,
         plan: &DigestCheckpointPlan,
-    ) -> Result<capyctl_config::effective::CheckpointLocation, &'static str> {
+    ) -> Result<
+        (
+            capyctl_config::effective::CheckpointLocation,
+            DigestDocuments,
+        ),
+        &'static str,
+    > {
         // ADR 0018 §3: the document the plan names, as for a launch.
         let Some(set) = self.profiles.for_fingerprint(&plan.host_policy_fingerprint) else {
             return Err("unauthorized");
@@ -1310,13 +1395,16 @@ impl NativeHostExecution {
         .map_err(|_| "unauthorized")?;
         let host = capyctl_config::remote_resources::local_host_document(&set.config.document)
             .map_err(|_| "unauthorized")?;
-        capyctl_config::effective::checkpoint_location(&deployment, &host).map_err(|error| {
-            if error.code == capyctl_config::ConfigErrorCode::NotMaterializable {
-                "not_materializable"
-            } else {
-                "unauthorized"
-            }
-        })
+        let location = capyctl_config::effective::checkpoint_location(&deployment, &host).map_err(
+            |error| {
+                if error.code == capyctl_config::ConfigErrorCode::NotMaterializable {
+                    "not_materializable"
+                } else {
+                    "unauthorized"
+                }
+            },
+        )?;
+        Ok((location, DigestDocuments { deployment, host }))
     }
 
     fn scope(&self, command: &MemberCommand) -> Result<IngressScope, JournalError> {
@@ -1389,8 +1477,14 @@ impl NativeHostExecution {
             ))),
             Engine::Tensorfold => {
                 // ADR 0023 §3: a build killed mid way left its lock; cleared
-                // only while no claimed launch here may still run.
-                if let Some(cache) = &self.engine_cache {
+                // only while no claimed launch here may still run. ADR 0039
+                // §2: the native line builds nothing, so it has no extensions
+                // directory and clears no lock.
+                if let Some(cache) = self
+                    .engine_cache
+                    .as_ref()
+                    .filter(|_| effective.profile.line.is_python())
+                {
                     let dir = cache
                         .torch_extensions(&effective.profile.build_fingerprint)
                         .map_err(|_| SessionError)?;
@@ -1419,6 +1513,13 @@ impl NativeHostExecution {
                     .map_err(|_| SessionError)?,
             ))),
             Engine::Custom => Err(SessionError),
+            // ADR 0038 §13: one GPU, one process; a group member is never
+            // built (no group entry, `resolve_as`).
+            Engine::TensorrtLlm if group.is_none() => Ok(PreparedLaunch::TensorrtLlm(Box::new(
+                self.tensorrt_llm_plan(effective, plan)
+                    .map_err(|_| SessionError)?,
+            ))),
+            Engine::TensorrtLlm => Err(SessionError),
         }
     }
 
@@ -1428,6 +1529,9 @@ impl NativeHostExecution {
     /// its saver observation credential (ADR 0028 §12, R12); other workers
     /// hold none (ADR 0012: the keyed surfaces are the head's). ADR 0033 §3:
     /// `lmcache` is what a vLLM or SGLang Initialize does about LMCache.
+    /// ADR 0037 §7: `tracing` is the launch's engine tracing decision, which
+    /// a vLLM or SGLang launch renders when on (`instance` names the
+    /// deployment's instance in vLLM's resource attributes).
     #[allow(clippy::too_many_arguments)]
     fn launch_adapter(
         &self,
@@ -1438,6 +1542,8 @@ impl NativeHostExecution {
         served: &str,
         tools: Arc<dyn OwnedProcessLaunch>,
         lmcache: Option<Arc<capyctl_adapters::lmcache::LmcacheState>>,
+        tracing: &capyctl_adapters::engine_tracing::EngineTracing,
+        instance: u32,
     ) -> Result<Box<dyn EngineAdapter>, SessionError> {
         Ok(match prepared {
             PreparedLaunch::Sglang(frozen) => {
@@ -1486,6 +1592,9 @@ impl NativeHostExecution {
                 if let Some(state) = lmcache {
                     adapter = adapter.with_lmcache(state);
                 }
+                if let Some(endpoint) = tracing.endpoint() {
+                    adapter = adapter.with_trace_endpoint(endpoint);
+                }
                 Box::new(
                     adapter
                         .with_launch(*frozen)
@@ -1497,6 +1606,11 @@ impl NativeHostExecution {
             }
             PreparedLaunch::Vllm(mut launch) => {
                 launch.lmcache = lmcache;
+                launch.engine_tracing = capyctl_adapters::engine_tracing::VllmTrace::for_launch(
+                    tracing,
+                    &effective.name,
+                    instance,
+                );
                 Box::new(
                     self.vllm_adapter(effective, plan, keys, served)?
                         .with_launch(*launch)
@@ -1528,6 +1642,11 @@ impl NativeHostExecution {
                     .and_then(|custom| custom::custom_key(custom, keys));
                 Box::new(adapter.with_launch(input).with_tools(tools))
             }
+            PreparedLaunch::TensorrtLlm(input) => Box::new(
+                self.tensorrt_llm_adapter(effective, plan, served)?
+                    .with_launch(*input)
+                    .with_tools(tools),
+            ),
         })
     }
 
@@ -1553,6 +1672,7 @@ impl NativeHostExecution {
             Engine::Vllm => Box::new(self.vllm_adapter(effective, plan, Some(keys), served)?),
             Engine::Tensorfold => Box::new(self.tensorfold_adapter(effective, plan, served)?),
             Engine::Llamacpp => Box::new(self.llamacpp_adapter(effective, plan, served)?),
+            Engine::TensorrtLlm => Box::new(self.tensorrt_llm_adapter(effective, plan, served)?),
             Engine::Custom => Box::new(self.custom_adapter(effective, plan, Some(keys), served)?),
         })
     }
@@ -1612,6 +1732,23 @@ impl NativeHostExecution {
         };
         let served = effective.routes.first().cloned().ok_or(SessionError)?;
         let group = self.group_args(command).map_err(|_| SessionError)?;
+        // ADR 0037 §§7, 11: the launch's engine tracing, decided once here
+        // (the shape check reads the environment) and journaled before
+        // anything starts, so its result, a replay and a restarted host's
+        // ingress all carry this one answer. A group member never traces.
+        let host = self.clone();
+        let resolved = effective.clone();
+        let grouped = group.is_some();
+        let tracing = tokio::task::spawn_blocking(move || host.engine_tracing(&resolved, grouped))
+            .await
+            .map_err(|_| SessionError)?;
+        let journal = self.journal.clone();
+        let id = command.identity.command_id.clone();
+        let state = tracing.outcome().code();
+        tokio::task::spawn_blocking(move || journal.record_launch_engine_tracing(&id, state))
+            .await
+            .map_err(|_| SessionError)?
+            .map_err(|_| SessionError)?;
         let prepared = self.prepare(&effective, plan, &served, group)?;
         // ADR 0033 §§1, 3, 9: what Initialize does about LMCache, from the
         // grant and this host's own plan; a launch-time check that failed
@@ -1642,6 +1779,8 @@ impl NativeHostExecution {
             &served,
             tools,
             lmcache.clone(),
+            &tracing,
+            command.identity.instance_index,
         )?;
         if let Some(keys) = keys.as_ref().filter(|_| serves) {
             self.ingress
@@ -1663,9 +1802,11 @@ impl NativeHostExecution {
                     &command.identity.command_id,
                     custom::engine_access(
                         effective.profile.engine,
+                        effective.profile.line,
                         effective.profile.custom.as_ref(),
                     )
-                    .with_request_abort(request_abort::request_abort_capable(&effective)),
+                    .with_request_abort(request_abort::request_abort_capable(&effective))
+                    .with_engine_trace(tracing.is_on()),
                 )
                 .map_err(|_| SessionError)?;
         }
@@ -1693,6 +1834,17 @@ impl NativeHostExecution {
         }
         let observation = match initialized {
             Ok(observation) => observation,
+            // ADR 0038 §4, §9: a TensorRT-LLM launch the adapter could not
+            // stop (the launch tools confer no cleanup authority) is stopped
+            // here, the escaped processes with it, before the failure is
+            // reported.
+            Err(error) if effective.profile.engine == Engine::TensorrtLlm => {
+                let engine = self
+                    .stop_failed_tensorrt_llm(&command.identity.command_id, &error)
+                    .await
+                    .or_else(|| tensorrt_llm::unstopped_report(&error));
+                return Err(LaunchError { engine });
+            }
             Err(capyctl_adapters::traits::RuntimeError::LaunchFailed(text)) => {
                 if text.starts_with(capyctl_config::custom::LISTENER_EXPOSED) {
                     // ADR 0031 §7: an engine listening off loopback is
@@ -1721,6 +1873,11 @@ impl NativeHostExecution {
             // and recorded processes are its whole answer.
             return Ok(());
         }
+        // ADR 0039 §14: a native TensorFold launch checks its listeners once
+        // its probe passed, before its readiness is journaled.
+        let observation = self
+            .tensorfold_native_listeners(command, &effective, observation)
+            .await?;
         // ADR 0035 §§5, 6: a launch on several GPUs of this host names its
         // ranks and checks its listeners before its readiness is journaled.
         let observation = self
@@ -1926,9 +2083,28 @@ impl NativeHostExecution {
         // ADR 0031 §7: a custom launch's listeners are checked again
         // whenever this host re-proves it, after the probe and before the
         // gate reopens; one off loopback stops the launch. ADR 0035 §5: so
-        // are a built-in engine's on several GPUs.
+        // are a built-in engine's on several GPUs. ADR 0039 §14: and a
+        // native TensorFold launch's, on every native version. ADR 0038 §9:
+        // and a TensorRT-LLM launch's descendants and listeners, on every
+        // launch.
         let several_gpus = plan.devices.len() >= 2;
-        if effective.profile.engine == Engine::Custom || several_gpus {
+        if effective.profile.engine == Engine::TensorrtLlm {
+            let journal = self.journal.clone();
+            let owner = owned_handle.to_owned();
+            let proven = tokio::task::spawn_blocking(move || {
+                journal
+                    .inspect_owned(&owner)
+                    .is_ok_and(|recorded| tensorrt_llm::reprove_ownership(&recorded))
+            })
+            .await
+            .map_err(|_| SessionError)?;
+            if !proven {
+                return Err(SessionError);
+            }
+        } else if effective.profile.engine == Engine::Custom
+            || several_gpus
+            || tensorfold::native_line(&effective)
+        {
             let journal = self.journal.clone();
             let owner = owned_handle.to_owned();
             let checked = tokio::task::spawn_blocking(move || {
@@ -2014,15 +2190,16 @@ impl NativeHostExecution {
     /// live, ready group its readiness recorded, and the engine answers the
     /// fixed decision on loopback with the launch's own key. Nothing is
     /// recorded and no gate moves. A launch that is not a decisions
-    /// deployment is never asked (it would answer as chat); any failure or
-    /// malformed answer is an error, which the result reports as no answer.
+    /// deployment is never asked (it would answer as chat or not at all); any
+    /// failure or malformed answer is an error, which the result reports as
+    /// no answer.
     async fn decide(
         &self,
         command: &MemberCommand,
         owned_handle: &str,
     ) -> Result<capyctl_adapters::decision_probe::DecisionAnswer, SessionError> {
         let (adapter, api, served, bound) = self.retained_probe(command, owned_handle).await?;
-        if api.is_chat() {
+        if api != capyctl_config::effective::DeploymentApi::Decisions {
             return Err(SessionError);
         }
         tokio::time::timeout(bound, adapter.decision_probe(&served, bound))
@@ -2031,9 +2208,36 @@ impl NativeHostExecution {
             .map_err(|_| SessionError)
     }
 
-    /// The retained launch a completion or decision probe names, bound by
-    /// the journal's `probe_target`, as an adapter that can only question
-    /// it, with its deployment's API, served name and the probe's bound.
+    /// ADR 0036 §§5, 6: the embedding probe of a retained embeddings launch,
+    /// as [`Self::decide`] runs the decision probe: the same live, ready
+    /// launch, the fixed embedding on loopback with the launch's own key,
+    /// nothing recorded and no gate moved. A launch that is not an embeddings
+    /// deployment is never asked; any failure or malformed answer is an
+    /// error, which the result reports as no answer.
+    async fn embed(
+        &self,
+        command: &MemberCommand,
+        owned_handle: &str,
+    ) -> Result<capyctl_adapters::embedding_probe::EmbeddingAnswer, SessionError> {
+        let (adapter, api, served, bound) = self.retained_probe(command, owned_handle).await?;
+        if api != capyctl_config::effective::DeploymentApi::Embeddings {
+            return Err(SessionError);
+        }
+        let answer = tokio::time::timeout(bound, adapter.embedding_probe(&served, bound))
+            .await
+            .map_err(|_| SessionError)?
+            .map_err(|_| SessionError)?;
+        // ADR 0036 §6: a vector the protocol would refuse is no answer.
+        if answer.dimension() > capyctl_protocol::execution::EMBEDDING_PROBE_MAX_DIMENSION {
+            return Err(SessionError);
+        }
+        Ok(answer)
+    }
+
+    /// The retained launch a completion, decision or embedding probe names,
+    /// bound by the journal's `probe_target`, as an adapter that can only
+    /// question it, with its deployment's API, served name and the probe's
+    /// bound.
     async fn retained_probe(
         &self,
         command: &MemberCommand,
@@ -2092,6 +2296,7 @@ impl NativeHostExecution {
         self,
         session: u64,
         command: MemberCommand,
+        trace: host_spans::StepTrace,
     ) -> Result<pb::MemberExecutionResult, SessionError> {
         if let MemberAction::DigestCheckpoint(plan) = &command.action {
             return self.digest_checkpoint(&command, plan).await;
@@ -2163,9 +2368,14 @@ impl NativeHostExecution {
                 Err(LaunchVerdict::Uncertain) => return Err(SessionError),
             }
         }
+        // ADR 0037 §4: a fresh Terminate's stop, from closing its gate to its
+        // signalled processes, as `capyctl.host.stop`. One held back by the
+        // engine's idle gate signals nothing and ends `uncertain`.
+        let mut stop: Option<host_spans::Step> = None;
         if let MemberAction::Terminate { owned_handle, .. } = &command.action {
             match fresh {
                 Ok(true) => {
+                    stop = Some(trace.step(capyctl_trace::Name::HostStop, &command));
                     // A restarted host has no in-memory gate. Re-register the
                     // exact retained scope closed using its protected
                     // credentials. A handle this host never launched has no
@@ -2208,6 +2418,8 @@ impl NativeHostExecution {
         let mut probe = capyctl_adapters::completion_probe::ProbeAnswer::default();
         // ADR 0030 §4: what a decision probe answered.
         let mut decided: Option<capyctl_adapters::decision_probe::DecisionAnswer> = None;
+        // ADR 0036 §§5, 6: what an embedding probe answered.
+        let mut embedded: Option<capyctl_adapters::embedding_probe::EmbeddingAnswer> = None;
         let acceptance = match tokio::task::spawn_blocking(move || {
             journal.accept(
                 session,
@@ -2251,6 +2463,14 @@ impl NativeHostExecution {
                 } => {
                     decided = self.decide(&command, owned_handle).await.ok();
                 }
+                // ADR 0036 §§5, 6: and an embedding probe.
+                MemberAction::Probe {
+                    owned_handle,
+                    embedding: true,
+                    ..
+                } => {
+                    embedded = self.embed(&command, owned_handle).await.ok();
+                }
                 _ => {}
             },
             Acceptance::Fresh(ticket) => match &command.action {
@@ -2280,6 +2500,9 @@ impl NativeHostExecution {
                     .await
                     .map_err(|_| SessionError)?
                     .map_err(|_| SessionError)?;
+                    if let Some(stop) = stop.as_mut() {
+                        stop.end(capyctl_trace::Outcome::Completed, None);
+                    }
                 }
                 MemberAction::Inspect => {
                     let journal = self.journal.clone();
@@ -2295,6 +2518,7 @@ impl NativeHostExecution {
                     owned_handle,
                     max_tokens,
                     decision,
+                    embedding,
                 } => {
                     let journal = self.journal.clone();
                     let policy = Arc::new(self.clone());
@@ -2320,6 +2544,10 @@ impl NativeHostExecution {
                         None if *decision => {
                             decided = self.decide(&command, owned_handle).await.ok();
                         }
+                        // ADR 0036 §§5, 6: and an embedding probe.
+                        None if *embedding => {
+                            embedded = self.embed(&command, owned_handle).await.ok();
+                        }
                         // An engine that does not answer is ordinary evidence:
                         // the result below reports it unusable with ownership
                         // retained.
@@ -2336,6 +2564,11 @@ impl NativeHostExecution {
                 _ => return Err(SessionError),
             },
         }
+        // ADR 0037 §4: a Terminate's (or its resend's) check that the launch's
+        // processes are gone, as `capyctl.host.verify_release`: `completed`
+        // only on gone evidence for every process, `uncertain` otherwise.
+        let mut verify = matches!(command.action, MemberAction::Terminate { .. })
+            .then(|| trace.step(capyctl_trace::Name::HostVerifyRelease, &command));
         let now = capyctl_protocol::now_unix_ms();
         let mut result = self
             .journal
@@ -2362,6 +2595,10 @@ impl NativeHostExecution {
                     })
                     .collect(),
             });
+            result.probe_embedding = embedded.map(|answer| pb::EmbeddingProbeEvidence {
+                probe_version: capyctl_adapters::embedding_probe::VERSION,
+                vector: answer.vector,
+            });
         }
         if command.action.launch_plan().is_some()
             && result.state == "launched"
@@ -2382,6 +2619,14 @@ impl NativeHostExecution {
             let gone = result.state == "completed"
                 && !result.claim_retained
                 && result.processes.iter().all(|p| p.presence == "gone");
+            if let Some(verify) = verify.as_mut() {
+                let outcome = if gone {
+                    capyctl_trace::Outcome::Completed
+                } else {
+                    capyctl_trace::Outcome::Uncertain
+                };
+                verify.end(outcome, None);
+            }
             if gone {
                 if let Ok(scope) = self
                     .journal
@@ -2557,7 +2802,10 @@ fn dp_attention(deployment_config: &str) -> bool {
 /// all exited before readiness, with the exit status this host's launcher
 /// reaped (the api process first) when it knows it. ADR 0031 §7, §10: a
 /// custom launch this host stopped for listening off loopback reports that,
-/// with its closed code and the address and port (never a path or a value).
+/// with its closed code and the address and port (never a path or a value);
+/// ADR 0039 §14, §16: so does a native TensorFold launch. ADR 0038 §16: and
+/// a TensorRT-LLM launch this host stopped for a short KV pool, an escaped
+/// process or a listener off loopback.
 fn launch_failure(result: &pb::MemberExecutionResult, engine: Option<&str>) -> String {
     use capyctl_adapters::launch_failure::{summary, EngineExit};
     if let Some(exposed) = engine
@@ -2565,8 +2813,11 @@ fn launch_failure(result: &pb::MemberExecutionResult, engine: Option<&str>) -> S
         .filter(|line| {
             [
                 capyctl_config::custom::LISTENER_EXPOSED,
+                capyctl_config::tensorfold_native::LISTENER_EXPOSED,
                 capyctl_domain::local_tp::ENGINE_LISTENER_EXPOSED,
                 capyctl_domain::local_tp::TP_RANK_UNOBSERVED,
+                capyctl_config::tensorrt_llm::KV_CACHE_SHORT,
+                capyctl_config::tensorrt_llm::ENGINE_PROCESS_ESCAPED,
             ]
             .iter()
             .any(|code| line.starts_with(&format!("{code}:")))
@@ -2599,7 +2850,8 @@ fn launch_failure(result: &pb::MemberExecutionResult, engine: Option<&str>) -> S
 /// completion through the same authenticated path inference uses. HTTP liveness
 /// alone is never readiness. ADR 0030 §3: a decisions deployment answers the
 /// fixed decision instead, complete and well-formed, and is never sent a
-/// chat probe.
+/// chat probe. ADR 0036 §5: an embeddings deployment answers the fixed
+/// embedding, and is never sent a chat or decision probe.
 async fn fresh_probe(
     engine: &dyn NativeEngine,
     member: &MemberRef,
@@ -2622,13 +2874,23 @@ async fn fresh_probe(
     if listed != Readiness::Ready {
         return Err(SessionError);
     }
-    if !api.is_chat() {
-        let bound = remaining().min(PROBE_CHAT_TIMEOUT);
-        return tokio::time::timeout(bound, engine.decision_probe(served, bound))
-            .await
-            .map_err(|_| SessionError)?
-            .map(|_| ())
-            .map_err(|_| SessionError);
+    let bound = remaining().min(PROBE_CHAT_TIMEOUT);
+    match api {
+        capyctl_config::effective::DeploymentApi::Chat => {}
+        capyctl_config::effective::DeploymentApi::Decisions => {
+            return tokio::time::timeout(bound, engine.decision_probe(served, bound))
+                .await
+                .map_err(|_| SessionError)?
+                .map(|_| ())
+                .map_err(|_| SessionError);
+        }
+        capyctl_config::effective::DeploymentApi::Embeddings => {
+            return tokio::time::timeout(bound, engine.embedding_probe(served, bound))
+                .await
+                .map_err(|_| SessionError)?
+                .map(|_| ())
+                .map_err(|_| SessionError);
+        }
     }
     let body = serde_json::json!({
         "model": served,
@@ -2784,6 +3046,8 @@ impl LocalExecutionPolicy for NativeHostExecution {
             Engine::Tensorfold => Err(JournalError::Unauthorized),
             // ADR 0029 §1, §10: llama.cpp is restart-only and never parks.
             Engine::Llamacpp => Err(JournalError::Unauthorized),
+            // ADR 0038 §1, §8: TensorRT-LLM is restart-only and never parks.
+            Engine::TensorrtLlm => Err(JournalError::Unauthorized),
             // ADR 0031 §4: a custom engine is restart-only and never parks.
             Engine::Custom => Err(JournalError::Unauthorized),
         }
@@ -2820,7 +3084,18 @@ impl LocalExecutionPolicy for NativeHostExecution {
 }
 impl SessionExecution for NativeHostExecution {
     fn execute(&self, session: u64, command: MemberCommand) -> ExecutionFuture {
-        Box::pin(self.clone().effect(session, command))
+        Box::pin(
+            self.clone()
+                .effect(session, command, host_spans::StepTrace::none()),
+        )
+    }
+    fn execute_traced(
+        &self,
+        session: u64,
+        command: MemberCommand,
+        trace_parent: Option<String>,
+    ) -> ExecutionFuture {
+        Box::pin(self.clone().traced_effect(session, command, trace_parent))
     }
     fn provision(
         &self,
@@ -2893,6 +3168,12 @@ impl SessionExecution for NativeHostExecution {
             authority.ready.clear();
             let _ = self.ingress.close_all();
         }
+    }
+    fn server_ready(&self, capabilities: &[String]) {
+        *self
+            .server_capabilities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = capabilities.to_vec();
     }
     fn load_interval(&self) -> std::time::Duration {
         self.load
@@ -3108,6 +3389,38 @@ fn with_drafter(
         .ok_or(CheckpointError::TooLarge)
 }
 
+/// The deployment and this host's documents a digest request was located
+/// from.
+struct DigestDocuments {
+    deployment: serde_json::Value,
+    host: serde_json::Value,
+}
+
+impl DigestDocuments {
+    /// ADR 0034 §4: B and C of the deployment's automatic LMCache pool as
+    /// this host computes them (`lmcache::pool_basis_for_effective`, the
+    /// function the store shares), the deployment resolved here with the
+    /// facts just measured, as the store re-resolves it; on the wire as
+    /// `(kv_bytes_per_token, pool_context_tokens)`, both zero when it does
+    /// not resolve or the fit cannot read them. Reads the checkpoint's
+    /// configuration: call it off the async runtime.
+    fn pool_basis(&self, facts: capyctl_config::effective::CheckpointFacts) -> (u64, u64) {
+        capyctl_protocol::execution::pool_basis_to_wire(
+            capyctl_config::effective::resolve_effective_with_checkpoint(
+                &self.deployment,
+                &self.host,
+                capyctl_config::effective::CheckpointFacts {
+                    // The server accepted this revision before asking.
+                    accepted_revision: true,
+                    ..facts
+                },
+            )
+            .map_err(|error| error.to_string())
+            .and_then(|effective| capyctl_config::lmcache::pool_basis_for_effective(&effective)),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3163,6 +3476,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(chat.chat_requests(), 1);
+    }
+    // T47 (ADR 0036 §5, SPEC §6.1): a host re-proves an embeddings launch
+    // (after a reconnect or a wake) with the fixed embedding only: a
+    // well-formed vector passes, a malformed answer or an engine without
+    // `/v1/embeddings` fails, and no chat or decision probe is ever sent.
+    #[tokio::test]
+    async fn an_embeddings_reproof_is_the_fixed_embedding_never_chat_or_decision() {
+        use capyctl_config::effective::DeploymentApi;
+        use capyctl_testkit::fake_engine::{EmbeddingFault, FakeEmbeddings};
+        use capyctl_testkit::FakeEngine;
+        let member = MemberRef {
+            deployment_id: "d".into(),
+            member_id: "b".into(),
+        };
+        let stop = || capyctl_protocol::now_unix_ms() + 10_000;
+        let embeddings = FakeEngine::new().with_embeddings();
+        fresh_probe(
+            &embeddings,
+            &member,
+            "served",
+            DeploymentApi::Embeddings,
+            stop(),
+        )
+        .await
+        .unwrap();
+        embeddings.set_embeddings(FakeEmbeddings {
+            fault: Some(EmbeddingFault::WrongCount),
+            ..Default::default()
+        });
+        assert!(fresh_probe(
+            &embeddings,
+            &member,
+            "served",
+            DeploymentApi::Embeddings,
+            stop()
+        )
+        .await
+        .is_err());
+        assert_eq!(embeddings.embedding_requests(), 2);
+        assert_eq!(embeddings.chat_requests(), 0);
+        assert_eq!(embeddings.decision_requests(), 0);
+        // An engine that serves chat or decisions is never ready as an
+        // embeddings deployment, and is sent neither probe.
+        let chat = FakeEngine::new();
+        let decisions = FakeEngine::new().with_decisions();
+        for engine in [&chat, &decisions] {
+            assert!(
+                fresh_probe(engine, &member, "served", DeploymentApi::Embeddings, stop())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(engine.chat_requests(), 0);
+            assert_eq!(engine.decision_requests(), 0);
+        }
+        // An embedding model is never ready as a chat or decisions one.
+        let embeddings = FakeEngine::new().with_embeddings();
+        for api in [DeploymentApi::Chat, DeploymentApi::Decisions] {
+            assert!(fresh_probe(&embeddings, &member, "served", api, stop())
+                .await
+                .is_err());
+        }
+        assert_eq!(embeddings.embedding_requests(), 0);
     }
     // T37: the host document's `load_report_interval` sets the period of the
     // agent's engine load reports; omitted, it is the 1 s default.
@@ -3383,6 +3758,7 @@ mod tests {
                 checkpoint_layout: None,
                 checkpoint_tables: None,
                 checkpoint_gguf: None,
+                vllm_device_request_no_floor: false,
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
@@ -3534,6 +3910,7 @@ mod tests {
             checkpoint_layout: None,
             checkpoint_tables: None,
             checkpoint_gguf: None,
+            vllm_device_request_no_floor: false,
             startup_bytes: None,
             startup_host_bytes: None,
             lmcache: None,
@@ -3544,6 +3921,81 @@ mod tests {
             action: MemberAction::LaunchSingle(plan.clone()),
         };
         (command, plan)
+    }
+
+    // T09 T14 T26 T34 — SPEC §§7.3, 13.2; ADR 0014 §7; ADR 0019
+    // §§3–4 (#225): the plan preserves the accepted derivation at both a new
+    // start and retained-launch resolution; rendering uses that request's share.
+    #[test]
+    fn a_vllm_device_plan_preserves_legacy_or_no_floor_derivation() {
+        use capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
+        use capyctl_domain::launch::LaunchSettings;
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, mut deployment, policy) =
+            checkpoint_fixture_with(root.path(), identity_dir.path(), |document| {
+                document["resource_policy"]["domains"] = serde_json::json!({
+                    "system": {"memory": "distinct", "managed_limit": "200GiB",
+                               "free_reserve": "8GiB", "parked_limit": "64GiB"},
+                    "gpu0": {"memory": "device", "device": "gpu0",
+                             "managed_limit": "14.5GiB", "free_reserve": "1.5GiB",
+                             "parked_limit": "2GiB"}
+                });
+                document["resource_policy"]["devices"] = serde_json::json!({
+                    "gpu0": {"domain": "gpu0", "sharing": "shared"}
+                });
+            });
+        deployment.as_object_mut().unwrap().remove("resources");
+        deployment["residency"] = "restart_only".into();
+        deployment["engine_config"] = serde_json::json!({"memory": {"kv_cache": "1GiB"}});
+        deployment["devices"] = serde_json::json!([{"id": "gpu0", "sharing": "shared"}]);
+        std::fs::File::create(root.path().join("models/toy/model.safetensors"))
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+        let measured = crate::checkpoint::CheckpointVerifier::in_memory()
+            .measure(&root.path().join("models"), &root.path().join("models/toy"))
+            .unwrap()
+            .manifest;
+        assert_eq!(measured.weights_bytes, 1 << 20);
+        for (no_floor, request, utilization) in [
+            (false, 12_884_901_825, "0.7499999964"),
+            (true, 1_074_895_174, "0.0625671339"),
+        ] {
+            let (mut command, mut plan) = launch_with(&deployment, &policy, &measured.digest);
+            plan.checkpoint_weights_bytes = Some(measured.weights_bytes);
+            plan.vllm_device_request_no_floor = no_floor;
+            command.action = MemberAction::LaunchSingle(plan.clone());
+            command.identity.payload_digest = command.canonical_digest();
+            for retained in [false, true] {
+                let effective = executor.resolve_as(&command, retained).unwrap();
+                executor.verify_checkpoint(&effective, &plan).unwrap();
+                assert_eq!(effective.engine_config.memory().request_bytes, request);
+                assert_eq!(
+                    effective.ready_device_allocation(),
+                    Some((Some(0), request + ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES))
+                );
+                let LaunchSettings::Vllm(settings) = &effective.engine_config else {
+                    panic!("vLLM settings");
+                };
+                assert_eq!(settings.device_request_floor_pct, no_floor.then_some(0));
+                let effective = effective.with_device_total(|_| Some(16 << 30)).unwrap();
+                let rendered = capyctl_adapters::vllm::render_command(
+                    &executor.vllm_plan(&effective, &plan, None).unwrap(),
+                )
+                .unwrap();
+                let flag = |name: &str| {
+                    rendered
+                        .argv
+                        .windows(2)
+                        .find(|pair| pair[0] == name)
+                        .unwrap()[1]
+                        .as_str()
+                };
+                assert_eq!(flag("--gpu-memory-utilization"), utilization);
+                assert_eq!(flag("--kv-cache-memory-bytes"), "1073741824");
+            }
+        }
     }
 
     /// ADR 0014 §7 (WE3): a launch and a wake verify the recorded digest on
@@ -4408,10 +4860,134 @@ mod tests {
         deep.authorize_residency(&park, &owner).unwrap();
     }
 
+    /// The server step a lifecycle command's envelope names (ADR 0037 §6).
+    const SERVER_TRACE: [u8; 16] = [0x4b; 16];
+    const SERVER_STEP: [u8; 8] = [0x5c; 8];
+    fn server_step() -> String {
+        capyctl_trace::SpanCx {
+            trace_id: SERVER_TRACE,
+            span_id: SERVER_STEP,
+            flags: capyctl_trace::SpanCx::SAMPLED,
+        }
+        .traceparent()
+    }
+    fn host_capture() -> (capyctl_trace::Tracing, capyctl_trace::testing::Capture) {
+        // Ratio 0: a host step follows its server step's sampled flag.
+        capyctl_trace::testing::capture(
+            0.0,
+            capyctl_trace::CallerMode::Parent,
+            capyctl_trace::Service::Host,
+        )
+    }
+
+    /// ADR 0037 §§4, 6: with host tracing on, a lifecycle command's host step
+    /// (`capyctl.host.park`) is the child of the server step its envelope
+    /// named, with its outcome and closed code; a command whose envelope
+    /// carried none (a replay after a restart) records nothing.
+    // T48 T21
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_step_span_parents_to_the_envelope_context() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            sglang_fixture(root.path(), identity_dir.path(), "restart_only");
+        let (tracing, capture) = host_capture();
+        let executor = executor.with_tracing(tracing);
+        let (mut launch, _) = launch_with(&deployment, &policy, "");
+        launch.identity.payload_digest = launch.canonical_digest();
+        let session = executor.journal.connect().unwrap();
+        executor.connected(session).unwrap();
+        executor
+            .journal
+            .accept(session, &launch, capyctl_protocol::now_unix_ms(), &Admit)
+            .unwrap();
+        let mut park = MemberCommand {
+            identity: checkpoint_identity("park", "ready"),
+            action: MemberAction::Park {
+                owned_handle: "launch".into(),
+            },
+        };
+        park.identity.payload_digest = park.canonical_digest();
+
+        let refused = executor
+            .execute_traced(session, park.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(refused.refused, "residency_tier");
+        assert!(capture.spans().is_empty(), "no context, no span");
+
+        let refused = executor
+            .execute_traced(session, park.clone(), Some(server_step()))
+            .await
+            .unwrap();
+        assert_eq!(refused.refused, "residency_tier");
+        let spans = capture.spans();
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        let step = &spans[0];
+        assert_eq!(step.name, "capyctl.host.park");
+        assert_eq!(step.kind, capyctl_trace::Kind::Internal);
+        assert_eq!(step.cx.trace_id, SERVER_TRACE);
+        assert_eq!(step.parent, Some(SERVER_STEP));
+        assert_eq!(step.attr("capyctl.outcome"), Some("refused"));
+        assert_eq!(step.attr("capyctl.code"), Some("residency_tier"));
+        assert_eq!(step.error.as_deref(), Some("residency_tier"));
+        assert_eq!(
+            step.attr("capyctl.deployment"),
+            Some(park.identity.deployment_id.as_str())
+        );
+        assert_eq!(step.attr("capyctl.host"), Some("host"));
+        assert!(capture.disallowed_keys().is_empty());
+    }
+
+    /// ADR 0037 §4: a Terminate records `capyctl.host.stop` and
+    /// `capyctl.host.verify_release` under the server's step; the release is
+    /// `completed` on gone evidence for every process.
+    // T48 T41
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminate_records_its_stop_and_release_check_under_the_server_step() {
+        let port = health_stub(false).await;
+        let (_root, _ids, executor, session, api) = owned_tensorfold(port).await;
+        let (tracing, capture) = host_capture();
+        let executor = executor.with_tracing(tracing);
+        unsafe { libc::kill(api.pid as i32, libc::SIGKILL) };
+        let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while presence_of(&api) != Presence::Gone {
+            assert!(std::time::Instant::now() < gone_by, "the stand-in exits");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let result = executor
+            .execute_traced(
+                session,
+                tensorfold_terminate("terminate", 20_000),
+                Some(server_step()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.state, "completed");
+        let names: Vec<_> = capture.spans().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["capyctl.host.stop", "capyctl.host.verify_release"]);
+        for step in capture.spans() {
+            assert_eq!(step.cx.trace_id, SERVER_TRACE);
+            assert_eq!(step.parent, Some(SERVER_STEP));
+            assert_eq!(step.attr("capyctl.outcome"), Some("completed"));
+        }
+    }
+
     /// A TensorFold profile on the lab document, restart_only, with a cache root.
     fn tensorfold_fixture(
         root: &std::path::Path,
         identity_dir: &std::path::Path,
+    ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
+        tensorfold_fixture_on(root, identity_dir, false)
+    }
+
+    /// [`tensorfold_fixture`], on the Python line (0.6.0) or, with
+    /// `native`, on the native line (ADR 0039: `line: native`, a release
+    /// root's `bin/tensorfold-native` at 1.0.0).
+    fn tensorfold_fixture_on(
+        root: &std::path::Path,
+        identity_dir: &std::path::Path,
+        native: bool,
     ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
         let (executor, mut deployment, policy) =
             sglang_fixture_with(root, identity_dir, "restart_only", |document| {
@@ -4419,8 +4995,14 @@ mod tests {
                     serde_json::json!({"start": 1024, "end": 65535});
                 let profile = &mut document["runtime_profiles"]["local"];
                 profile["engine"] = "tensorfold".into();
-                profile["executable"] = "/opt/tf/bin/tensorfold".into();
-                profile["build_fingerprint"] = "0.6.0".into();
+                if native {
+                    profile["line"] = "native".into();
+                    profile["executable"] = "/opt/tensorfold-1.0.0/bin/tensorfold-native".into();
+                    profile["build_fingerprint"] = "1.0.0".into();
+                } else {
+                    profile["executable"] = "/opt/tf/bin/tensorfold".into();
+                    profile["build_fingerprint"] = "0.6.0".into();
+                }
                 profile["args"] = serde_json::json!([]);
                 profile["security"]["deep_park"] = "disabled".into();
                 profile["security"]
@@ -4442,10 +5024,20 @@ mod tests {
         policy: &str,
         port: u16,
     ) -> (MemberCommand, SingleLaunchPlan) {
+        tensorfold_launch_of(deployment, policy, port, "0.6.0")
+    }
+
+    /// [`tensorfold_launch`] for a profile at `fingerprint`.
+    fn tensorfold_launch_of(
+        deployment: &serde_json::Value,
+        policy: &str,
+        port: u16,
+        fingerprint: &str,
+    ) -> (MemberCommand, SingleLaunchPlan) {
         let (mut launch, mut plan) = launch_with(deployment, policy, "");
         plan.service_port = port;
         launch.action = MemberAction::LaunchSingle(plan.clone());
-        launch.identity.profile_fingerprint = "0.6.0".into();
+        launch.identity.profile_fingerprint = fingerprint.into();
         launch.identity.payload_digest = launch.canonical_digest();
         (launch, plan)
     }
@@ -4778,6 +5370,325 @@ mod tests {
         assert!(executor.journal.retained_command("launch").is_ok());
     }
 
+    // T41 (ADR 0039 §2, ADR 0023 §3): a native launch builds nothing. Its
+    // plan carries no extensions directory, preparing it creates none and
+    // clears no lock (a killed 0.6 build's lock under the same root stays),
+    // and it launches without a private root for one.
+    #[test]
+    fn a_native_launch_creates_no_extensions_directory_and_clears_no_lock() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            tensorfold_fixture_on(root.path(), identity_dir.path(), true);
+        let (launch, plan) = tensorfold_launch_of(&deployment, &policy, closed_port(), "1.0.0");
+        let effective = executor.resolve(&launch).unwrap();
+        assert!(effective.profile.line.is_native());
+        let (input, built) = executor.tensorfold_plan(&effective, &plan, None).unwrap();
+        assert!(!built);
+        assert_eq!(input.extensions_dir, None);
+        assert!(matches!(
+            executor.prepare(&effective, &plan, "toy", None),
+            Ok(PreparedLaunch::Tensorfold(..))
+        ));
+        let tensorfold = root.path().join("engines/tensorfold");
+        assert!(!tensorfold.exists(), "no extensions directory");
+        // The lock a killed 0.6 build of the same version would leave, in a
+        // directory the 0.6 path would clear it from.
+        let extensions = tensorfold.join("1.0.0/torch_extensions");
+        let extension = extensions.join("tensorfold_qmm_v5");
+        std::fs::create_dir_all(&extension).unwrap();
+        for dir in [
+            tensorfold.clone(),
+            tensorfold.join("1.0.0"),
+            extensions,
+            extension.clone(),
+        ] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::write(extension.join("lock"), "").unwrap();
+        assert!(matches!(
+            executor.prepare(&effective, &plan, "toy", None),
+            Ok(PreparedLaunch::Tensorfold(..))
+        ));
+        assert!(extension.join("lock").exists(), "no lock is cleared");
+        // No private root is needed: a widened one refuses 0.6, not native.
+        std::fs::set_permissions(
+            root.path().join("engines"),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        assert!(executor.resolve(&launch).is_ok());
+    }
+
+    // T41 T37 (ADR 0039 §11): the ingress binds a native launch to be
+    // sampled by its `/metrics` alone; a 0.6 launch stays a built-in one,
+    // whose sample folds `/health`.
+    #[test]
+    fn a_native_launch_is_sampled_by_its_metrics_alone() {
+        use crate::load::LaunchSignal;
+        for (native, fingerprint, signal) in [
+            (true, "1.0.0", LaunchSignal::TensorfoldNative),
+            (false, "0.6.0", LaunchSignal::Builtin),
+        ] {
+            let root = directory();
+            let identity_dir = directory();
+            let (executor, deployment, policy) =
+                tensorfold_fixture_on(root.path(), identity_dir.path(), native);
+            let (launch, _) =
+                tensorfold_launch_of(&deployment, &policy, closed_port(), fingerprint);
+            let effective = executor.resolve(&launch).unwrap();
+            let access = custom::engine_access(
+                effective.profile.engine,
+                effective.profile.line,
+                effective.profile.custom.as_ref(),
+            );
+            assert_eq!(access.signal, signal);
+            assert!(access.keyed);
+            assert_eq!(executor.retained_access(&launch).signal, signal);
+        }
+    }
+
+    // T41 (ADR 0039 §10): a native launch's stop reads `/metrics`, never
+    // `/health`: a refused connection is signalled at once, 0 and 0 at
+    // once, work at the bound is not signalled, an unanswered `/metrics` is
+    // signalled at the bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminate_reads_a_native_engines_metrics() {
+        use capyctl_testkit::tensorfold_native::{FakeTensorfoldNative, NativeRelease};
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            tensorfold_fixture_on(root.path(), identity_dir.path(), true);
+        let engine = FakeTensorfoldNative::new(NativeRelease::V1_0_0, "toy", 8);
+        let (launch, _) = tensorfold_launch_of(&deployment, &policy, engine.port(), "1.0.0");
+        let quick = std::time::Duration::from_secs(3);
+        // Still loading (no listener yet): refused, so signalled at once.
+        let started = std::time::Instant::now();
+        assert!(
+            executor
+                .idle_before_terminate(&launch, capyctl_protocol::now_unix_ms() + 10_000)
+                .await
+        );
+        assert!(started.elapsed() < quick);
+        engine.load().await;
+        engine.set_work(0, 0);
+        let started = std::time::Instant::now();
+        assert!(
+            executor
+                .idle_before_terminate(&launch, capyctl_protocol::now_unix_ms() + 10_000)
+                .await
+        );
+        assert!(started.elapsed() < quick);
+        // Work at the bound: not signalled.
+        engine.set_work(1, 2);
+        assert!(
+            !executor
+                .idle_before_terminate(&launch, capyctl_protocol::now_unix_ms() + 1_200)
+                .await
+        );
+        // `/metrics` unanswered: signalled once the bound passes.
+        engine.set_work(0, 0);
+        engine.hold_metrics(true);
+        let started = std::time::Instant::now();
+        assert!(
+            executor
+                .idle_before_terminate(
+                    &launch,
+                    capyctl_protocol::now_unix_ms() + idle_gate::IDLE_MARGIN_MS + 1_500
+                )
+                .await
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(1_300));
+        assert_eq!(
+            engine.health_reads(),
+            0,
+            "the native stop never reads /health"
+        );
+    }
+
+    /// The python3 on this test's PATH, for a stand-in that opens sockets.
+    fn python3() -> std::path::PathBuf {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|dir| dir.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .expect("python3 on PATH for the stand-in engine")
+    }
+
+    /// Renders a stand-in for the TensorFold process that listens on
+    /// `address`, writes `ready` once it does, and exits after a minute.
+    struct Listens {
+        address: &'static str,
+        ready: std::path::PathBuf,
+    }
+    impl LocalExecutionPolicy for Listens {
+        fn authorize(&self, _: &MemberCommand) -> Result<(), JournalError> {
+            Ok(())
+        }
+        fn render_launch(&self, _: &MemberCommand) -> Result<ApprovedLaunch, JournalError> {
+            let script = format!(
+                "import socket, time\ns = socket.socket()\ns.bind(({:?}, 0))\ns.listen()\n\
+                 open({:?}, 'w').close()\ntime.sleep(60)\n",
+                self.address,
+                self.ready.display().to_string()
+            );
+            Ok(ApprovedLaunch {
+                command: capyctl_adapters::traits::RenderedCommand {
+                    argv: vec![python3().display().to_string(), "-c".into(), script],
+                    env: Default::default(),
+                },
+                descriptors: None,
+            })
+        }
+    }
+
+    /// A TensorFold launch of either line, resolved, accepted and owned by
+    /// the journal, its stand-in process listening on `address`.
+    async fn owned_listening(
+        native: bool,
+        address: &'static str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<NativeHostExecution>,
+        MemberCommand,
+        EffectiveDeployment,
+        capyctl_domain::completion::ProcessIdentity,
+    ) {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) =
+            tensorfold_fixture_on(root.path(), identity_dir.path(), native);
+        let fingerprint = if native { "1.0.0" } else { "0.6.0" };
+        let (launch, plan) = tensorfold_launch_of(&deployment, &policy, closed_port(), fingerprint);
+        let effective = executor.resolve(&launch).unwrap();
+        let session = executor.journal.connect().unwrap();
+        executor.connected(session).unwrap();
+        let ready = root.path().join("listening");
+        let stand_in = Arc::new(Listens {
+            address,
+            ready: ready.clone(),
+        });
+        let now = capyctl_protocol::now_unix_ms();
+        let Acceptance::Fresh(ticket) = executor
+            .journal
+            .accept(session, &launch, now, stand_in.as_ref())
+            .unwrap()
+        else {
+            panic!("a fresh launch");
+        };
+        let tools = executor
+            .journal
+            .launch_tools(ticket, now, stand_in.clone(), Default::default())
+            .unwrap();
+        let command = stand_in.render_launch(&launch).unwrap().command;
+        let api = tools.spawn_durable(&plan.incarnation, &command).unwrap();
+        let by = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(std::time::Instant::now() < by, "the stand-in listens");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        (root, identity_dir, executor, launch, effective, api)
+    }
+
+    /// What the adapter's Initialize reports for `api` once its probe passed.
+    fn probed(
+        api: &capyctl_domain::completion::ProcessIdentity,
+    ) -> capyctl_domain::completion::EffectObservation {
+        capyctl_domain::completion::EffectObservation {
+            token: TransitionToken {
+                deployment_id: "deployment".into(),
+                revision: 1,
+                generation: 1,
+                operation_id: "operation".into(),
+                step_id: "launch".into(),
+            },
+            binding_id: "01K00000000000000000000001".into(),
+            incarnation: "01K00000000000000000000002".into(),
+            identities: vec![api.clone()],
+            observed_at_ms: 1,
+            receipt: "tensorfold ready; probe answered".into(),
+            facts: Vec::new(),
+            kernel_builds: Vec::new(),
+        }
+    }
+
+    // T41 T21 (ADR 0039 §14, ADR 0031 §7): once its probe passed, a native
+    // launch whose owned process listens off loopback is stopped with gone
+    // evidence and fails `tensorfold_listener_exposed` naming the address,
+    // reported as it is; one listening on loopback only passes, the check
+    // in its receipt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_native_launch_listening_off_loopback_is_stopped_and_fails() {
+        let (_root, _ids, executor, launch, effective, api) =
+            owned_listening(true, "0.0.0.0").await;
+        let _kill = KillOnDrop(api.pid);
+        let Err(failed) = executor
+            .tensorfold_native_listeners(&launch, &effective, probed(&api))
+            .await
+        else {
+            panic!("an exposed native launch fails");
+        };
+        let text = failed.engine.expect("the failure names its reason");
+        assert!(
+            text.starts_with(&format!(
+                "{}: an owned process listens on 0.0.0.0:",
+                capyctl_config::tensorfold_native::LISTENER_EXPOSED
+            )),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(", not on loopback; the engine was stopped"),
+            "{text}"
+        );
+        assert_eq!(presence_of(&api), Presence::Gone);
+        let reported = launch_failure(&pb::MemberExecutionResult::default(), Some(&text));
+        assert_eq!(reported, text);
+        assert!(capyctl_protocol::execution::is_launch_failure_text(
+            &reported
+        ));
+
+        let (_root, _ids, executor, launch, effective, api) =
+            owned_listening(true, "127.0.0.1").await;
+        let _kill = KillOnDrop(api.pid);
+        let Ok(ready) = executor
+            .tensorfold_native_listeners(&launch, &effective, probed(&api))
+            .await
+        else {
+            panic!("a loopback-only native launch passes");
+        };
+        assert!(ready
+            .receipt
+            .ends_with("; every owned listener is on loopback"));
+        assert_eq!(presence_of(&api), Presence::Alive);
+    }
+
+    // T41 T21 (ADR 0039 §14): the Python line is unchanged: no listener
+    // check runs after its probe, or on its re-proof.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_python_line_launch_never_runs_the_listener_check() {
+        let (_root, _ids, executor, launch, effective, api) =
+            owned_listening(false, "0.0.0.0").await;
+        let _kill = KillOnDrop(api.pid);
+        assert!(!tensorfold::native_line(&effective));
+        let Ok(unchanged) = executor
+            .tensorfold_native_listeners(&launch, &effective, probed(&api))
+            .await
+        else {
+            panic!("a 0.6 launch is never checked");
+        };
+        assert_eq!(unchanged, probed(&api));
+        assert_eq!(presence_of(&api), Presence::Alive);
+    }
+
+    // T41 (ADR 0039 §15): the session's `Connect` declares what this build
+    // implements (`session.rs` sends `agent_capabilities()`), so the server
+    // places native-line launches on this host.
+    #[test]
+    fn the_session_declares_tensorfold_native() {
+        assert!(capyctl_protocol::capabilities::agent_capabilities()
+            .contains(&capyctl_protocol::capabilities::TENSORFOLD_NATIVE.to_owned()));
+    }
+
     /// A llama.cpp host document and deployment on the SGLang lab fixture,
     /// its checkpoint holding one GGUF, with a private engine cache root.
     fn llamacpp_fixture(
@@ -5080,6 +5991,203 @@ mod tests {
         assert_eq!(custom::custom_key(&unkeyed, Some(&keys)), None);
     }
 
+    /// ADR 0038 §4: Qwen3-4B's `config.json`, a full-attention decoder.
+    const QWEN3_4B_CONFIG: &str = r#"{"architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3", "num_hidden_layers": 36, "num_attention_heads": 32,
+        "num_key_value_heads": 8, "head_dim": 128, "hidden_size": 2560,
+        "torch_dtype": "bfloat16", "max_position_embeddings": 40960,
+        "use_sliding_window": false, "max_window_layers": 36, "vocab_size": 151936}"#;
+
+    /// ADR 0038: the fixture host with its `local` profile a TensorRT-LLM
+    /// 1.2.1 environment, Qwen3-4B's geometry in the checkpoint, a
+    /// restart-only chat deployment with a 4 GiB KV cache, and the host's
+    /// private per-launch root.
+    fn tensorrt_llm_fixture(
+        root: &std::path::Path,
+        identity_dir: &std::path::Path,
+    ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
+        let (executor, mut deployment, policy) =
+            sglang_fixture_with(root, identity_dir, "restart_only", |document| {
+                let profile = &mut document["runtime_profiles"]["local"];
+                profile["engine"] = "tensorrt-llm".into();
+                profile["executable"] = "/home/u/tensorrt-llm-1.2.1-venv/bin/trtllm-serve".into();
+                profile["build_fingerprint"] = "1.2.1".into();
+                profile["args"] = serde_json::json!([]);
+                profile["env"] = serde_json::json!({});
+                profile["security"]["deep_park"] = "disabled".into();
+                profile["security"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("admin_credential_ref");
+            });
+        std::fs::write(root.join("models/toy/config.json"), QWEN3_4B_CONFIG).unwrap();
+        deployment.as_object_mut().unwrap().remove("resources");
+        deployment["engine_config"] = serde_json::json!({"memory": {"kv_cache": "4GiB"}});
+        let rendezvous = root.join("rendezvous");
+        std::fs::create_dir(&rendezvous).unwrap();
+        std::fs::set_permissions(&rendezvous, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (
+            executor.with_rendezvous_root(rendezvous),
+            deployment,
+            policy,
+        )
+    }
+
+    /// A TensorRT-LLM launch command for the fixture under `root`, on
+    /// `port`, with the checkpoint's recorded digest and the profile's
+    /// version.
+    fn tensorrt_llm_launch(
+        root: &std::path::Path,
+        deployment: &serde_json::Value,
+        policy: &str,
+        port: u16,
+    ) -> (MemberCommand, SingleLaunchPlan) {
+        let (mut launch, plan) = llamacpp_launch(root, deployment, policy, port);
+        launch.identity.profile_fingerprint = "1.2.1".into();
+        launch.identity.payload_digest = launch.canonical_digest();
+        (launch, plan)
+    }
+
+    // T49 T16 (ADR 0038 §3, §13): the host resolves and prepares a
+    // TensorRT-LLM launch from its own document: the shared builder's plan
+    // with the grant's `max_tokens`, the launch's own directory in the
+    // private per-launch root (not yet made: Initialize makes it), never a
+    // group member, and an adapter for a retained one. A host without a
+    // private root never launches it.
+    #[test]
+    fn a_tensorrt_llm_launch_prepares_from_local_policy() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = tensorrt_llm_fixture(root.path(), identity_dir.path());
+        let port = closed_port();
+        let (launch, plan) = tensorrt_llm_launch(root.path(), &deployment, &policy, port);
+        let effective = executor.resolve(&launch).unwrap();
+        assert_eq!(effective.profile.engine, Engine::TensorrtLlm);
+        let input = executor.tensorrt_llm_plan(&effective, &plan).unwrap();
+        assert_eq!(input.port, port);
+        assert_eq!(input.served_model_name, "toy");
+        assert_eq!(input.version, "1.2.1");
+        assert_eq!(input.max_tokens, 29_127, "Qwen3-4B in BF16 with 4 GiB");
+        let dir = std::path::PathBuf::from(&input.launch_dir);
+        assert_eq!(dir, root.path().join("rendezvous").join(&plan.incarnation));
+        assert!(!dir.exists(), "Initialize creates it");
+        assert!(matches!(
+            executor.prepare(&effective, &plan, "toy", None),
+            Ok(PreparedLaunch::TensorrtLlm(..))
+        ));
+        let args = capyctl_domain::group::GroupMemberArgs {
+            tensor_parallel: 2,
+            pipeline_parallel: 1,
+            nnodes: 2,
+            node_rank: 1,
+            head_address: std::net::Ipv4Addr::LOCALHOST.into(),
+            rendezvous_port: 29500,
+            own_address: std::net::Ipv4Addr::LOCALHOST.into(),
+            worker_port: None,
+            own_interface: None,
+        };
+        assert!(
+            executor
+                .prepare(&effective, &plan, "toy", Some(args))
+                .is_err(),
+            "no TensorRT-LLM group member"
+        );
+        let keys = NativeCredentials {
+            gate: [1; 32],
+            inference: [2; 32],
+            admin: [3; 32],
+        };
+        assert!(executor
+            .probe_adapter(&effective, &plan, &keys, "toy")
+            .is_ok());
+        // A root another user could enter is not private: nothing launches.
+        let shared = root.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let unprivate = executor.clone().with_rendezvous_root(shared);
+        assert!(unprivate.tensorrt_llm_plan(&effective, &plan).is_err());
+        assert!(unprivate.prepare(&effective, &plan, "toy", None).is_err());
+    }
+
+    // T49 T21 (ADR 0038 §4, §16): a checkpoint whose KV geometry CapyCTL
+    // cannot size the pool from is refused `kv_geometry_unsupported` before
+    // any effect, a closed policy refusal the wire accepts; Qwen3-4B's is
+    // admitted, and any other engine passes the check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unsized_kv_geometry_is_a_closed_launch_refusal() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = tensorrt_llm_fixture(root.path(), identity_dir.path());
+        let (launch, _) = tensorrt_llm_launch(root.path(), &deployment, &policy, closed_port());
+        let effective = executor.resolve(&launch).unwrap();
+        assert_eq!(executor.admit_tensorrt_llm(&effective), Ok(()));
+        let mut sliding: serde_json::Value = serde_json::from_str(QWEN3_4B_CONFIG).unwrap();
+        sliding["sliding_window"] = 4096.into();
+        sliding["use_sliding_window"] = true.into();
+        std::fs::write(
+            root.path().join("models/toy/config.json"),
+            sliding.to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            executor.admit_tensorrt_llm(&effective),
+            Err(LaunchVerdict::Refused("kv_geometry_unsupported"))
+        );
+        assert!(capyctl_protocol::execution::is_policy_refusal(
+            "kv_geometry_unsupported"
+        ));
+        assert!(capyctl_protocol::execution::is_policy_refusal(
+            "served_name_unsupported"
+        ));
+        let result = executor
+            .refused(&launch, Some("kv_geometry_unsupported".into()))
+            .await
+            .unwrap();
+        capyctl_protocol::execution::validate_result(&launch, &result).unwrap();
+        assert_eq!(result.refused, "kv_geometry_unsupported");
+        assert!(!result.claim_retained && !result.model_usable);
+        let other = directory();
+        let other_identity = directory();
+        let (llamacpp, deployment, policy) = llamacpp_fixture(other.path(), other_identity.path());
+        let (launch, _) = llamacpp_launch(other.path(), &deployment, &policy, closed_port());
+        let effective = llamacpp.resolve(&launch).unwrap();
+        assert_eq!(llamacpp.admit_tensorrt_llm(&effective), Ok(()));
+    }
+
+    // T49 (ADR 0038 §9): ownership that cannot be proven fails the re-proof
+    // closed and stops nothing: no api process recorded, or none alive.
+    // A failure the adapter already settled, or one that names no stopping
+    // code, is left as it is; one with nothing recorded has nothing to stop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unproven_tensorrt_llm_ownership_fails_closed() {
+        use capyctl_adapters::traits::RuntimeError;
+        use capyctl_domain::completion::{Presence, ProcessIdentity};
+        assert!(!tensorrt_llm::reprove_ownership(&[]));
+        let gone = ProcessIdentity {
+            role: "api".into(),
+            pid: u32::MAX - 1,
+            boot_id: "boot".into(),
+            start_ticks: 1,
+        };
+        assert!(!tensorrt_llm::reprove_ownership(&[(gone, Presence::Gone)]));
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, ..) = tensorrt_llm_fixture(root.path(), identity_dir.path());
+        for error in [
+            RuntimeError::LaunchFailed("the engine exited before readiness".into()),
+            RuntimeError::Uncertain("readiness deadline reached with the engine alive".into()),
+            RuntimeError::LaunchFailed(
+                "kv_cache_short: TensorRT-LLM built a KV pool of 3200 tokens".into(),
+            ),
+        ] {
+            assert_eq!(
+                executor.stop_failed_tensorrt_llm("unknown", &error).await,
+                None,
+                "{error}"
+            );
+        }
+    }
+
     async fn gauge_stub(running: u64) -> u16 {
         let app = axum::Router::new().route(
             "/metrics",
@@ -5358,58 +6466,74 @@ mod tests {
         }
     }
 
-    /// T21 T34 #198 (ADR 0017 §2, ADR 0008 amendment 2026-10-30): an
-    /// enrolled host never refuses a launch with
-    /// `installation_unsupported:editable`, a code no 0.1.x server knows (its
-    /// refusal check would end the whole control session on it). An editable
-    /// SGLang takes the pre-#198 path under either drift policy: unmeasured,
-    /// admitted on (here to the fixture's unrecorded checkpoint, the next
-    /// gate), and failed at the engine's start by the entry's
-    /// `engine_import_failed` in the free-text launch failure.
+    /// T21 T34 — ADR 0017 / #235: editable SGLang is refused only toward a
+    /// server advertising the code. No SessionReady and every 0.1.x server
+    /// keep the import-failure path; a reconnect replaces the capability list.
     #[test]
-    fn a_host_never_refuses_an_editable_sglang_with_a_code_servers_do_not_know() {
-        for policy in ["warn", "refuse"] {
-            let root = directory();
-            let identity_dir = directory();
-            let venv = root.path().join("opt/sglang");
-            let site = venv.join("lib/python3.12/site-packages");
-            std::fs::create_dir_all(site.join("sglang-0.5.22.dist-info")).unwrap();
-            std::fs::write(
+    fn an_editable_sglang_is_refused_only_toward_a_server_that_takes_the_code() {
+        use capyctl_protocol::capabilities;
+        for (server, expected) in [
+            (None, "checkpoint_mismatch"),
+            (
+                Some(vec![
+                    capabilities::LIVE_PROFILE_UPDATE.to_owned(),
+                    capabilities::LMCACHE.to_owned(),
+                ]),
+                "checkpoint_mismatch",
+            ),
+            (
+                Some(capabilities::server_capabilities()),
+                crate::installation::EDITABLE_REFUSAL,
+            ),
+        ] {
+            for policy in ["warn", "refuse"] {
+                let root = directory();
+                let identity_dir = directory();
+                let venv = root.path().join("opt/sglang");
+                let site = venv.join("lib/python3.12/site-packages");
+                std::fs::create_dir_all(site.join("sglang-0.5.22.dist-info")).unwrap();
+                std::fs::write(
                 site.join("__editable__.sglang-0.5.22.pth"),
                 "import __editable___sglang_0_5_22_finder; __editable___sglang_0_5_22_finder.install()\n",
             )
             .unwrap();
-            std::fs::create_dir_all(venv.join("bin")).unwrap();
-            std::fs::write(venv.join("bin/python3"), "").unwrap();
-            let executable = venv.join("bin/python3");
-            assert_eq!(
-                crate::installation::unsupported_installation(Engine::Sglang, &executable),
-                Some(crate::installation::EDITABLE_REFUSAL)
-            );
-            let (executor, deployment, policy_fingerprint) = sglang_fixture_with(
-                root.path(),
-                identity_dir.path(),
-                "restart_only",
-                |document| {
-                    let profile = &mut document["runtime_profiles"]["local"];
-                    profile["executable"] = executable.to_string_lossy().into_owned().into();
-                    profile["security"]["installation_drift"] = policy.into();
-                },
-            );
-            sglang_runtime(root.path());
-            let (mut launch, _) = launch_with(&deployment, &policy_fingerprint, "");
-            launch.identity.payload_digest = launch.canonical_digest();
-            let MemberAction::LaunchSingle(plan) = launch.action.clone() else {
-                panic!("a launch");
-            };
-            let verdict = executor.admit_launch(&launch, &plan, GpuReading::Now);
-            assert_eq!(
-                verdict,
-                Err(LaunchVerdict::Refused("checkpoint_mismatch")),
-                "{policy}"
-            );
-            if let Err(LaunchVerdict::Refused(reason)) = verdict {
-                assert!(capyctl_protocol::execution::is_policy_refusal(reason));
+                std::fs::create_dir_all(venv.join("bin")).unwrap();
+                std::fs::write(venv.join("bin/python3"), "").unwrap();
+                let executable = venv.join("bin/python3");
+                assert_eq!(
+                    crate::installation::unsupported_installation(Engine::Sglang, &executable),
+                    Some(crate::installation::EDITABLE_REFUSAL)
+                );
+                let (executor, deployment, policy_fingerprint) = sglang_fixture_with(
+                    root.path(),
+                    identity_dir.path(),
+                    "restart_only",
+                    |document| {
+                        let profile = &mut document["runtime_profiles"]["local"];
+                        profile["executable"] = executable.to_string_lossy().into_owned().into();
+                        profile["security"]["installation_drift"] = policy.into();
+                    },
+                );
+                sglang_runtime(root.path());
+                if let Some(server) = &server {
+                    executor.server_ready(server);
+                }
+                let (mut launch, _) = launch_with(&deployment, &policy_fingerprint, "");
+                launch.identity.payload_digest = launch.canonical_digest();
+                let MemberAction::LaunchSingle(plan) = launch.action.clone() else {
+                    panic!("a launch");
+                };
+                let verdict = executor.admit_launch(&launch, &plan, GpuReading::Now);
+                assert_eq!(verdict, Err(LaunchVerdict::Refused(expected)), "{policy}");
+                if let Err(LaunchVerdict::Refused(reason)) = verdict {
+                    assert!(capyctl_protocol::execution::is_policy_refusal(reason));
+                }
+                executor.server_ready(&[]);
+                assert_eq!(
+                    executor.admit_launch(&launch, &plan, GpuReading::Now),
+                    Err(LaunchVerdict::Refused("checkpoint_mismatch")),
+                    "a newer session's capabilities never leak into an older one"
+                );
             }
         }
     }
@@ -5840,6 +6964,42 @@ mod tests {
              29500, not on loopback; the engine was stopped",
             "tp_rank_unobserved: no distinct rank process per GPU by the initialize timeout \
              (no owned process holds memory on gpu1 (rank 1))",
+        ] {
+            let text = launch_failure(&result, Some(engine));
+            assert_eq!(text, engine);
+            assert!(capyctl_protocol::execution::is_launch_failure_text(&text));
+        }
+    }
+
+    /// ADR 0038 §16: a TensorRT-LLM launch this host stopped at readiness
+    /// reports its closed code (`kv_cache_short` with both figures,
+    /// `engine_process_escaped` naming the process, `engine_listener_exposed`
+    /// naming the address and port) in one line the wire validation accepts,
+    /// never the exit summary.
+    // T49
+    #[test]
+    fn a_stopped_tensorrt_llm_launch_reports_its_closed_code() {
+        let result = pb::MemberExecutionResult {
+            state: "launched".into(),
+            processes: vec![pb::OwnedProcessObservation {
+                role: "api".into(),
+                pid: 10,
+                boot_id: "boot-that-never-reaped".into(),
+                start_ticks: 7,
+                presence: "gone".into(),
+                rank: None,
+            }],
+            ..Default::default()
+        };
+        for engine in [
+            "kv_cache_short: TensorRT-LLM built a KV pool of 3200 tokens, less than one \
+             request's window of 16384 tokens (max_seq_len); capyctl rendered max_tokens 29127; \
+             the engine was stopped",
+            "engine_process_escaped: process 102 (a descendant of the engine's api process 100) \
+             runs in process group 102, outside the launch's process group 100; the engine and \
+             the escaped process were stopped",
+            "engine_listener_exposed: the api process 100 listens on address 0.0.0.0 port 8101, \
+             not on loopback; the engine was stopped",
         ] {
             let text = launch_failure(&result, Some(engine));
             assert_eq!(text, engine);
@@ -6361,12 +7521,13 @@ mod tests {
         assert!(executor.resolve(&launch).is_err(), "the service port");
     }
 
-    /// A vLLM 0.32.0 `restart_only` launch whose environment holds LMCache
+    /// A vLLM 0.32.0 launch of `residency` whose environment holds LMCache
     /// 0.5.6, registered, but none of the shape the check reads.
     fn lmcache_check_fixture(
         root: &std::path::Path,
         identity_dir: &std::path::Path,
         mode: &str,
+        residency: &str,
     ) -> (Arc<NativeHostExecution>, MemberCommand, SingleLaunchPlan) {
         let venv = root.join("venv");
         let site = venv.join("lib/python3.12/site-packages");
@@ -6400,7 +7561,7 @@ mod tests {
         std::fs::create_dir_all(&lmcache).unwrap();
         std::fs::set_permissions(&lmcache, std::fs::Permissions::from_mode(0o700)).unwrap();
         let executor = executor.with_lmcache_dirs(lmcache);
-        deployment["residency"] = "restart_only".into();
+        deployment["residency"] = residency.into();
         deployment["lmcache"] = mode.into();
         let (mut launch, plan) = granted(&deployment, &policy, grant());
         launch.identity.profile_fingerprint = "0.32.0".into();
@@ -6418,7 +7579,7 @@ mod tests {
         let root = directory();
         let identity_dir = directory();
         let (executor, launch, _) =
-            lmcache_check_fixture(root.path(), identity_dir.path(), "required");
+            lmcache_check_fixture(root.path(), identity_dir.path(), "required", "restart_only");
         assert_eq!(
             executor.pre_admit(&launch),
             Err(LaunchVerdict::Refused("lmcache_unavailable:check_failed"))
@@ -6434,7 +7595,7 @@ mod tests {
         let root = directory();
         let identity_dir = directory();
         let (executor, launch, plan) =
-            lmcache_check_fixture(root.path(), identity_dir.path(), "auto");
+            lmcache_check_fixture(root.path(), identity_dir.path(), "auto", "restart_only");
         // The launch goes on (refused here only by the fixture's checkpoint).
         assert_eq!(
             executor.pre_admit(&launch),
@@ -6451,6 +7612,59 @@ mod tests {
             Some(capyctl_adapters::lmcache::LmcacheReport::Off {
                 reason: capyctl_config::lmcache::LmcacheOffReason::CheckFailed,
                 connector_failed: false,
+                ..
+            })
+        ));
+    }
+
+    /// ADR 0034 §1, §3a (owner rule of 2026-10-27): this host's own plan
+    /// runs a deep `lmcache: required` launch outside the qualified table as
+    /// an uncertified setup with engine-driven transfer: it is not refused
+    /// for being uncertified, its server plan renders engine-driven
+    /// transfer, and only the launch-time check (here, an environment
+    /// without the shape) can still refuse it. Under `auto` the same launch
+    /// runs without LMCache, `park_unqualified`.
+    // T45
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_required_deep_launch_outside_the_table_runs_uncertified() {
+        use capyctl_config::lmcache::{LmcacheOffReason, TransferMode};
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, launch, plan) =
+            lmcache_check_fixture(root.path(), identity_dir.path(), "required", "deep");
+        let effective = executor.resolve(&launch).unwrap();
+        let host = executor.lmcache_plan(&effective, false);
+        assert!(host.is_on(), "{host:?}");
+        assert_eq!(host.transfer, TransferMode::EngineDriven);
+        assert_eq!(
+            host.uncertified.map(|uncertified| uncertified.reasons),
+            Some(vec![LmcacheOffReason::ParkUnqualified])
+        );
+        assert_eq!(
+            executor.server_plan(&effective, &plan).unwrap().transfer,
+            TransferMode::EngineDriven
+        );
+        // Not `park_unqualified`: the check, which also reads what
+        // engine-driven transfer needs, is what refuses it here.
+        assert_eq!(
+            executor.pre_admit(&launch),
+            Err(LaunchVerdict::Refused("lmcache_unavailable:check_failed"))
+        );
+
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, launch, plan) =
+            lmcache_check_fixture(root.path(), identity_dir.path(), "auto", "deep");
+        let effective = executor.resolve(&launch).unwrap();
+        let state = executor
+            .lmcache_state(&launch, &plan, &effective)
+            .unwrap()
+            .expect("a granted launch has LMCache state");
+        assert!(state.launch().is_none(), "no server starts");
+        assert!(matches!(
+            state.report(),
+            Some(capyctl_adapters::lmcache::LmcacheReport::Off {
+                reason: LmcacheOffReason::ParkUnqualified,
                 ..
             })
         ));

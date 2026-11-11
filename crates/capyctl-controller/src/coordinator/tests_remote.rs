@@ -554,7 +554,9 @@ impl crate::remote_readiness::ReadinessHosts for ScriptedReadiness {
             engine_log: None,
             probe_text: String::new(),
             probe_decision: None,
+            probe_embedding: None,
             lmcache: None,
+            engine_tracing: String::new(),
         };
         Box::pin(async move { session.map(|s| (s, result)).ok_or(()) })
     }
@@ -649,6 +651,7 @@ async fn host_session_loss_closes_dispatch_until_a_fresh_probe_passes() {
             owned_handle: launch.step_id.clone(),
             max_tokens: None,
             decision: false,
+            embedding: false,
         }
     );
     assert_eq!(probe.identity.expected_state, "ready");
@@ -1000,14 +1003,14 @@ async fn a_restarted_controller_resumes_a_stop_its_crashed_session_accepted() {
 
 /// A remote engine whose host refused the launch on its own policy before any
 /// effect, as `remote_execution` reports it: nothing recorded, nothing claimed.
-struct RefusingHost;
+struct RefusingHost(&'static str);
 #[async_trait::async_trait]
 impl EngineAdapter for RefusingHost {
     async fn execute_persisted(
         &self,
         _: &RuntimeCommand,
     ) -> Result<capyctl_domain::completion::EffectObservation, RuntimeError> {
-        Err(RuntimeError::Refused("checkpoint_mismatch".into()))
+        Err(RuntimeError::Refused(self.0.into()))
     }
     async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
@@ -1051,6 +1054,21 @@ impl EngineAdapter for RefusingHost {
 // T14 T20 T34
 #[tokio::test]
 async fn a_host_policy_refusal_settles_the_launch_at_once_with_its_reason() {
+    assert_host_refusal_settled("checkpoint_mismatch", "launch_failed").await;
+}
+
+// T45 T34 (ADR 0034 LC15): the failed start operation retains the host's
+// typed required-LMCache reason, rather than timing out or becoming uncertain.
+#[tokio::test]
+async fn a_required_lmcache_refusal_settles_the_start_with_its_typed_reason() {
+    assert_host_refusal_settled(
+        "lmcache_unavailable:sleep_clears_cache",
+        "lmcache_unavailable:sleep_clears_cache",
+    )
+    .await;
+}
+
+async fn assert_host_refusal_settled(reason: &'static str, code: &str) {
     let (_dir, owner, fence, observations) = setup().await;
     let host = ScriptedHost::new(true);
     let scripted = host.clone();
@@ -1062,12 +1080,12 @@ async fn a_host_policy_refusal_settles_the_launch_at_once_with_its_reason() {
             retry_cooldown: Duration::from_millis(50),
             ..Default::default()
         },
-        Arc::new(move |_: &InitializeWork| Ok(scripted.binding(Arc::new(RefusingHost)))),
+        Arc::new(move |_: &InitializeWork| Ok(scripted.binding(Arc::new(RefusingHost(reason))))),
     )
     .unwrap();
     let start = w.start(&fence, 10000).unwrap();
     assert_eq!(
-        start.wait(Duration::from_secs(60)).await.unwrap(),
+        start.wait(Duration::from_secs(5)).await.unwrap(),
         InitializeStatus::Closed
     );
     assert_eq!(
@@ -1088,8 +1106,7 @@ async fn a_host_policy_refusal_settles_the_launch_at_once_with_its_reason() {
         assert!(
             evidence
                 .iter()
-                .any(|entry| entry.contains("launch failed")
-                    && entry.contains("checkpoint_mismatch")),
+                .any(|entry| entry.contains("launch failed") && entry.contains(reason)),
             "{evidence:?}"
         );
         let operation = o
@@ -1097,7 +1114,7 @@ async fn a_host_policy_refusal_settles_the_launch_at_once_with_its_reason() {
             .latest_operation(&fence.deployment_id)
             .unwrap()
             .unwrap();
-        assert_eq!(operation.error_code.as_deref(), Some("launch_failed"));
+        assert_eq!(operation.error_code.as_deref(), Some(code));
     }
     running(&w).await;
     w.shutdown().await.unwrap();
@@ -1394,7 +1411,7 @@ async fn an_expired_drain_stop_is_reissued_when_its_host_reconnects() {
 /// session liveness and the load that host reported for exactly this launch.
 /// A lease and its endpoint are resolved for exactly that generation; once the
 /// gate closes both are refused, so the router fails over before sending.
-// T18 T33 T38
+// T18 T33 T38 T48
 #[tokio::test]
 async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence() {
     use crate::port::LifecyclePort;
@@ -1413,6 +1430,7 @@ async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence()
     let launch = ready_launch(&owner);
     let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let load = Arc::new(crate::load_table::LoadTable::new());
+    let traced = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let signals = crate::coordinator_port::RoutingSignals {
         load: load.clone(),
         host_live: {
@@ -1421,6 +1439,10 @@ async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence()
         },
         host_unresponsive: Arc::new(|_: &str| false),
         host_request_abort: Arc::new(|_: &str| false),
+        host_trace_context: {
+            let traced = traced.clone();
+            Arc::new(move |host: &str| host == "lab" && traced.load(Ordering::SeqCst))
+        },
     };
     let lifecycle =
         crate::coordinator_port::CoordinatorLifecycle::new(w.commands()).with_routing(signals);
@@ -1462,6 +1484,14 @@ async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence()
         Some(launch.step_id.as_str())
     );
     assert!(only.dispatch_open && only.host_live);
+    // T48 (ADR 0037 §6, ADR 0017): trace headers go to this instance's
+    // ingress only while its host's session declares `trace_context`, and
+    // only for the incarnation it serves.
+    assert!(!lifecycle.trace_context(&fence.deployment_id, fence.generation));
+    traced.store(true, Ordering::SeqCst);
+    assert!(lifecycle.trace_context(&fence.deployment_id, fence.generation));
+    assert!(!lifecycle.trace_context(&fence.deployment_id, fence.generation + 1));
+    assert!(!lifecycle.trace_context("another-deployment", fence.generation));
     let view = only.load.as_ref().expect("a fresh sample for this launch");
     assert_eq!(view.engine_queue(), Some(4));
     assert_eq!(view.owned_handle, launch.step_id);
@@ -1732,6 +1762,7 @@ async fn a_remote_cancelling_lease_settles_only_on_an_idle_sample_after_the_hang
                 checkpoint_layout: None,
                 checkpoint_tables: None,
                 checkpoint_gguf: None,
+                vllm_device_request_no_floor: false,
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
@@ -1741,9 +1772,11 @@ async fn a_remote_cancelling_lease_settles_only_on_an_idle_sample_after_the_hang
             instance_index: 0,
             device_memory: false,
             decisions: false,
+            embeddings: false,
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,
+            tensorfold_native: false,
         },
         Default::default(),
     ));
@@ -1894,6 +1927,7 @@ async fn a_remote_cancelling_lease_settles_while_a_stop_drains() {
                 checkpoint_layout: None,
                 checkpoint_tables: None,
                 checkpoint_gguf: None,
+                vllm_device_request_no_floor: false,
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
@@ -1903,9 +1937,11 @@ async fn a_remote_cancelling_lease_settles_while_a_stop_drains() {
             instance_index: 0,
             device_memory: false,
             decisions: false,
+            embeddings: false,
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,
+            tensorfold_native: false,
         },
         Default::default(),
     ));

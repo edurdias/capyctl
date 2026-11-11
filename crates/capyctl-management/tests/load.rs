@@ -47,6 +47,7 @@ fn router(clock: Arc<AtomicI64>) -> axum::Router {
     let deployments = [DeploymentCapacity {
         id: "dep-1".into(),
         name: "chat".into(),
+        request_limit: None,
         max_running: Some(MaxRunning {
             count: Some(32),
             source: MaxRunningSource::Default,

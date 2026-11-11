@@ -506,8 +506,10 @@ enum EngineArgs {
     },
     /// Register an installation as a runtime profile and publish it.
     Add {
-        /// A venv directory, its bin/vllm, bin/tensorfold or bin/python3, or a llama-server
-        /// binary or the directory holding it. Omit to pick interactively.
+        /// A venv directory, its bin/vllm, bin/tensorfold or bin/python3; a llama-server
+        /// binary or the directory holding it; or a TensorFold native release: its
+        /// bin/tensorfold-native, its bin directory or the release directory. Omit to
+        /// pick interactively.
         #[arg(conflicts_with = "custom")]
         path: Option<PathBuf>,
         /// A custom engine: the program to run, started with the arguments
@@ -715,15 +717,21 @@ struct RoleSettingsArgs {
     /// over CAPYCTL_SGLANG_BIN and local_engine.sglang.
     #[arg(long, value_name = "PATH", value_parser = parse_engine_path)]
     sglang_bin: Option<PathBuf>,
-    /// The TensorFold executable (`<venv>/bin/tensorfold`) this role runs as
-    /// its `local` profile. Wins over CAPYCTL_TENSORFOLD_BIN and
-    /// local_engine.tensorfold.
+    /// The TensorFold executable this role runs as its `local` profile: a
+    /// 0.6 venv's `<venv>/bin/tensorfold`, or a native release's
+    /// `<release>/bin/tensorfold-native` (the line follows the file name).
+    /// Wins over CAPYCTL_TENSORFOLD_BIN and local_engine.tensorfold.
     #[arg(long, value_name = "PATH", value_parser = parse_engine_path)]
     tensorfold_bin: Option<PathBuf>,
     /// The llama.cpp `llama-server` binary this role runs as its `local`
     /// profile. Wins over CAPYCTL_LLAMACPP_BIN and local_engine.llamacpp.
     #[arg(long, value_name = "PATH", value_parser = parse_engine_path)]
     llamacpp_bin: Option<PathBuf>,
+    /// The TensorRT-LLM `trtllm-serve` console script
+    /// (`<venv>/bin/trtllm-serve`) this role runs as its `local` profile.
+    /// Wins over CAPYCTL_TENSORRT_LLM_BIN and local_engine.tensorrt-llm.
+    #[arg(long, value_name = "PATH", value_parser = parse_engine_path)]
+    tensorrt_llm_bin: Option<PathBuf>,
     /// The build fingerprint the local engine publishes (default: what
     /// `<engine> --version` prints). Wins over CAPYCTL_ENGINE_FINGERPRINT and
     /// local_engine.build_fingerprint.
@@ -814,6 +822,7 @@ impl RoleSettingsArgs {
             sglang: self.sglang_bin.clone(),
             tensorfold: self.tensorfold_bin.clone(),
             llamacpp: self.llamacpp_bin.clone(),
+            tensorrt_llm: self.tensorrt_llm_bin.clone(),
             build_fingerprint: self.engine_fingerprint.clone(),
             args: self
                 .engine_args

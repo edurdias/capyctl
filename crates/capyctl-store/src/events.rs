@@ -231,6 +231,29 @@ pub(crate) enum EventMetadata {
         host_id: String,
         detail: String,
     },
+    /// ADR 0034 §3a, §6: a `lmcache: required` launch runs LMCache outside
+    /// the certified (qualified) set, with why. Once per launch.
+    #[serde(rename = "1")]
+    LmcacheUncertified {
+        deployment_id: String,
+        instance_index: u32,
+        generation: i64,
+        binding_id: String,
+        host_id: String,
+        detail: String,
+    },
+    /// ADR 0034 §4: a launch's automatic LMCache pool keeps fewer tokens
+    /// than one full context, or admission shrank it to the host-KV room
+    /// left; the detail is the warning. Once per launch.
+    #[serde(rename = "1")]
+    LmcachePoolShort {
+        deployment_id: String,
+        instance_index: u32,
+        generation: i64,
+        binding_id: String,
+        host_id: String,
+        detail: String,
+    },
     /// ADR 0035 §1a, §13: a start of an instance under `topology: auto`
     /// chose a tensor-parallel size other than its previous start's (the
     /// host's cards, their limits or a measured figure changed), on the GPUs
@@ -256,6 +279,25 @@ pub(crate) enum EventMetadata {
         instance_index: u32,
         generation: i64,
         count: usize,
+    },
+    /// ADR 0036 §6, EM4: a restarted embedding launch compared its fixed
+    /// probe with the reference retained before stop, before dispatch opened.
+    #[serde(rename = "1")]
+    EmbeddingCanaryChecked {
+        deployment_id: String,
+        operation_id: String,
+        instance_index: u32,
+        generation: i64,
+        incarnation: String,
+        reference_generation: i64,
+        reference_incarnation: String,
+        probe_kind: String,
+        probe_version: u32,
+        reference_dimension: u32,
+        observed_dimension: u32,
+        relative_distance: Option<f64>,
+        tolerance: f64,
+        verdict: &'static str,
     },
 }
 
@@ -400,8 +442,11 @@ impl EventMetadata {
             Self::RequestCancellationAcknowledged { .. } => "request_cancellation_acknowledged",
             Self::LmcacheOff { .. } => "lmcache_off",
             Self::LmcacheServerExited { .. } => "lmcache_server_exited",
+            Self::LmcacheUncertified { .. } => "lmcache_uncertified",
+            Self::LmcachePoolShort { .. } => "lmcache_pool_short",
             Self::TopologyAutoChanged { .. } => "topology_auto_changed",
             Self::InstanceRestartedForHeldRequests { .. } => "instance_restarted_for_held_requests",
+            Self::EmbeddingCanaryChecked { .. } => "embedding_canary_checked",
         }
     }
 
@@ -454,9 +499,16 @@ impl EventMetadata {
             Self::RequestCancellationAcknowledged { deployment_id, .. }
             | Self::LmcacheOff { deployment_id, .. }
             | Self::LmcacheServerExited { deployment_id, .. }
+            | Self::LmcacheUncertified { deployment_id, .. }
+            | Self::LmcachePoolShort { deployment_id, .. }
             | Self::TopologyAutoChanged { deployment_id, .. } => {
                 (Some(deployment_id.as_str()), None)
             }
+            Self::EmbeddingCanaryChecked {
+                deployment_id,
+                operation_id,
+                ..
+            } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::InstanceRestartedForHeldRequests {
                 deployment_id,
                 operation_id,
@@ -672,6 +724,88 @@ pub(crate) fn lmcache_server_exited_in(
     )
     .map_err(|_| crate::StoreError::Conflict)?;
     Ok(())
+}
+
+/// ADR 0034 §§3a, 4: what a launch's LMCache runs with that the operator is
+/// told once per launch, beside its plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LmcacheNote {
+    /// `lmcache_uncertified`: on outside the certified set.
+    Uncertified,
+    /// `lmcache_pool_short`: the pool's warning.
+    PoolShort,
+}
+
+impl LmcacheNote {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Uncertified => "lmcache_uncertified",
+            Self::PoolShort => "lmcache_pool_short",
+        }
+    }
+}
+
+/// Journal `note` for `launch` with a bounded, redacted `detail`, once per
+/// launch: a second one for the same deployment, instance, generation and
+/// binding records nothing and returns `false`.
+pub(crate) fn lmcache_launch_note_in(
+    tx: &Transaction<'_>,
+    launch: &LmcacheLaunch<'_>,
+    note: LmcacheNote,
+    detail: &str,
+) -> Result<bool, crate::StoreError> {
+    if !launch.valid() {
+        return Err(crate::StoreError::Conflict);
+    }
+    let detail = lmcache_detail(detail);
+    if detail.is_empty() {
+        return Err(crate::StoreError::Conflict);
+    }
+    let recorded: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM management_events
+             WHERE kind=?5 AND deployment_id=?1
+               AND json_extract(payload_json,'$.instance_index')=?2
+               AND json_extract(payload_json,'$.generation')=?3
+               AND json_extract(payload_json,'$.binding_id')=?4)",
+        params![
+            launch.deployment_id,
+            launch.instance_index,
+            launch.generation,
+            launch.binding_id,
+            note.kind()
+        ],
+        |r| r.get(0),
+    )?;
+    if recorded {
+        return Ok(false);
+    }
+    let (deployment_id, instance_index, generation, binding_id, host_id) = (
+        launch.deployment_id.to_owned(),
+        launch.instance_index,
+        launch.generation,
+        launch.binding_id.to_owned(),
+        launch.host_id.to_owned(),
+    );
+    let event = match note {
+        LmcacheNote::Uncertified => EventMetadata::LmcacheUncertified {
+            deployment_id,
+            instance_index,
+            generation,
+            binding_id,
+            host_id,
+            detail,
+        },
+        LmcacheNote::PoolShort => EventMetadata::LmcachePoolShort {
+            deployment_id,
+            instance_index,
+            generation,
+            binding_id,
+            host_id,
+            detail,
+        },
+    };
+    append_event(tx, &event).map_err(|_| crate::StoreError::Conflict)?;
+    Ok(true)
 }
 
 pub(crate) fn append_event(
@@ -1140,6 +1274,68 @@ mod tests {
             .into_iter()
             .filter(|e| e.kind.starts_with("lmcache_"))
             .collect()
+    }
+
+    #[test]
+    // T45 (ADR 0034 §§3a, 4, 7): `lmcache_uncertified` and
+    // `lmcache_pool_short` are journaled with the launch's identity and the
+    // detail, associated with the deployment, once per launch each; another
+    // binding is its own record; an invalid identity or an empty detail is
+    // refused.
+    fn lmcache_notes_are_recorded_once_per_launch() {
+        let s = Store::open_in_memory().unwrap();
+        let note = |launch: &LmcacheLaunch<'_>, note: LmcacheNote, detail: &str| {
+            let tx = Transaction::new_unchecked(&s.conn, TransactionBehavior::Immediate).unwrap();
+            let recorded = lmcache_launch_note_in(&tx, launch, note, detail);
+            tx.commit().unwrap();
+            recorded
+        };
+        let first = launch("01BX5ZZKBKACTAV9WEVGEMMVS4", 3);
+        let why = "vLLM 0.32.0 / qwen3 / NVIDIA GB10 / deep is not in the qualified table";
+        assert!(note(&first, LmcacheNote::Uncertified, why).unwrap());
+        assert!(!note(&first, LmcacheNote::Uncertified, "again").unwrap());
+        assert!(note(&first, LmcacheNote::PoolShort, "short").unwrap());
+        assert!(!note(&first, LmcacheNote::PoolShort, "short").unwrap());
+        assert!(note(
+            &launch("01BX5ZZKBKACTAV9WEVGEMMVS5", 3),
+            LmcacheNote::Uncertified,
+            why
+        )
+        .unwrap());
+        for bad in [
+            LmcacheLaunch {
+                host_id: "",
+                ..first
+            },
+            launch(first.binding_id, -1),
+        ] {
+            assert!(note(&bad, LmcacheNote::PoolShort, "short").is_err());
+        }
+        assert!(note(
+            &launch("01BX5ZZKBKACTAV9WEVGEMMVS6", 3),
+            LmcacheNote::PoolShort,
+            " "
+        )
+        .is_err());
+        let events = lmcache_events(&s);
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "lmcache_uncertified",
+                "lmcache_pool_short",
+                "lmcache_uncertified"
+            ]
+        );
+        assert_eq!(events[0].deployment_id.as_deref(), Some(DEPLOYMENT));
+        let payload: serde_json::Value = serde_json::from_str(&events[0].payload_json).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({"version": "1", "deployment_id": DEPLOYMENT,
+                "instance_index": 1, "generation": 3,
+                "binding_id": "01BX5ZZKBKACTAV9WEVGEMMVS4", "host_id": "host-a",
+                "detail": why})
+        );
     }
 
     #[test]

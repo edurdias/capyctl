@@ -295,6 +295,7 @@ fn launch() -> MemberAction {
         checkpoint_layout: None,
         checkpoint_tables: None,
         checkpoint_gguf: None,
+        vllm_device_request_no_floor: false,
         startup_bytes: Some(2 << 30),
         startup_host_bytes: None,
         lmcache: None,
@@ -469,6 +470,7 @@ async fn a_drain_only_host_refuses_start_but_allows_stop() {
             owned_handle: handle(),
             max_tokens: None,
             decision: false,
+            embedding: false,
         },
     );
     let sessions = h.sessions.clone();
@@ -519,9 +521,11 @@ async fn a_park_refused_before_sending_forgets_readiness_so_a_probe_reopens_disp
             instance_index: 0,
             device_memory: false,
             decisions: false,
+            embeddings: false,
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,
+            tensorfold_native: false,
         },
         readiness.clone(),
     );
@@ -660,6 +664,124 @@ async fn a_missing_capability_is_refused_typed_and_never_sent() {
         .expect("the wake is sent");
     assert!(!sent.restore_checkpoint_digest.is_empty());
     pending.abort();
+    h.server.abort();
+}
+
+// T14 T26 T34 — SPEC §§7.3, 13.1; ADR 0017 §§2–3; ADR 0019
+// §§3–4 (#225): an N-1 host retains ordinary launches, but neither a new
+// derivation nor phase-specific graphs may reach it, even as a digest request.
+#[tokio::test]
+async fn new_memory_and_graph_semantics_are_refused_before_any_host_request() {
+    let h = enrolled().await;
+    let mut declared = all();
+    declared.retain(|c| {
+        c != capabilities::VLLM_DEVICE_REQUEST_NO_FLOOR && c != capabilities::CUDA_GRAPH_PHASES
+    });
+    let (_send, mut stream) = h.reconciled("0.1.11", declared).await;
+    assert!(h.sessions.inspect(&h.host).unwrap().eligible);
+    for missing in [
+        capabilities::VLLM_DEVICE_REQUEST_NO_FLOOR,
+        capabilities::CUDA_GRAPH_PHASES,
+    ] {
+        let MemberAction::LaunchSingle(mut plan) = launch() else {
+            unreachable!()
+        };
+        if missing == capabilities::VLLM_DEVICE_REQUEST_NO_FLOOR {
+            plan.vllm_device_request_no_floor = true;
+        } else {
+            let mut deployment: Value = serde_json::from_str(&plan.deployment_config).unwrap();
+            deployment["engine_config"]["cuda_graphs"] = json!({"prefill": false, "decode": true});
+            plan.deployment_config = deployment.to_string();
+        }
+        assert_eq!(
+            refused(
+                &h.sessions,
+                h.command(missing, MemberAction::LaunchSingle(plan.clone()))
+            )
+            .await,
+            capabilities::missing(missing)
+        );
+        // The engine's earlier preflight also refuses before the first
+        // checkpoint measurement, rather than only gating the final launch.
+        plan.checkpoint_digest.clear();
+        let binding_id = plan.binding_id.clone();
+        let incarnation = plan.incarnation.clone();
+        let engine = remote_execution::engine(
+            h.sessions.clone(),
+            h.state.clone(),
+            RemoteLaunchBinding {
+                controller_id: h.authority.controller_id(),
+                host_id: h.host.clone(),
+                member_id: "head".into(),
+                profile_fingerprint: "unversioned".into(),
+                launch_command_id: "01K00000000000000000000005".into(),
+                plan,
+                ingress_gate_key: [7; 32],
+                instance_index: 0,
+                device_memory: false,
+                decisions: false,
+                embeddings: false,
+                custom_engine: false,
+                lmcache_required: false,
+                retention_zero: false,
+                tensorfold_native: false,
+            },
+            Default::default(),
+        );
+        let initialize = RuntimeCommand {
+            action: RuntimeAction::Initialize,
+            context: StepExecutionContext {
+                token: TransitionToken {
+                    deployment_id: "deployment".into(),
+                    revision: 1,
+                    generation: 1,
+                    operation_id: "01K00000000000000000000006".into(),
+                    step_id: "01K00000000000000000000005".into(),
+                },
+                binding_id,
+                incarnation,
+                issued_at_ms: 1,
+                deadline_ms: capyctl_protocol::now_unix_ms() + 20_000,
+                identities: ExecutionIdentities::OwnedLaunch,
+                completion_target: None,
+                grant_id: Some("grant".into()),
+                launch_settings: None,
+            },
+        };
+        assert_eq!(
+            engine.execute_persisted(&initialize).await.unwrap_err(),
+            RuntimeError::Refused(capabilities::missing(missing))
+        );
+        assert!(
+            next_command(&mut stream, Duration::from_millis(300))
+                .await
+                .is_none(),
+            "no source, checkpoint or launch request may be sent"
+        );
+    }
+    for graphs in [false, true] {
+        let MemberAction::LaunchSingle(mut plan) = launch() else {
+            unreachable!()
+        };
+        let mut deployment: Value = serde_json::from_str(&plan.deployment_config).unwrap();
+        deployment["engine_config"]["cuda_graphs"] = json!(graphs);
+        deployment["engine_config"]["max_concurrent_requests"] = json!(48);
+        plan.deployment_config = deployment.to_string();
+        let command = h.command(
+            &format!("legacy-{graphs}"),
+            MemberAction::LaunchSingle(plan),
+        );
+        let sessions = h.sessions.clone();
+        let pending = tokio::spawn(async move { sessions.execute(command).await });
+        let sent = next_command(&mut stream, Duration::from_secs(5))
+            .await
+            .expect("scalar graphs and concurrency retain N-1 support");
+        let Some(pb::execute_member::Action::LaunchSingle(plan)) = sent.action else {
+            panic!("a legacy launch");
+        };
+        assert!(!plan.vllm_device_request_no_floor);
+        pending.abort();
+    }
     h.server.abort();
 }
 
@@ -1073,9 +1195,11 @@ async fn device_domains_need_the_capability() {
             instance_index: 0,
             device_memory: true,
             decisions: false,
+            embeddings: false,
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,
+            tensorfold_native: false,
         },
         Default::default(),
     );
@@ -1164,9 +1288,11 @@ async fn a_decisions_launch_needs_the_capability() {
             instance_index: 0,
             device_memory: false,
             decisions: true,
+            embeddings: false,
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,
+            tensorfold_native: false,
         },
         Default::default(),
     );
@@ -1238,6 +1364,100 @@ async fn a_decisions_launch_needs_the_capability() {
     h.server.abort();
 }
 
+// T47 T34 (ADR 0036 §1): a host without `embeddings` stays placeable for
+// every other deployment, but a launch, park or wake of an embeddings
+// deployment there is refused `host_capability_missing:embeddings` before
+// anything is sent, so an older host never runs a chat probe against an
+// embedding server.
+#[tokio::test]
+async fn an_embeddings_launch_needs_the_capability() {
+    let h = enrolled().await;
+    let mut declared = all();
+    declared.retain(|c| c != capabilities::EMBEDDINGS);
+    let (_send, mut stream) = h
+        .published(declared, inventory(&h.host))
+        .await
+        .expect("the host connects");
+    assert!(h.sessions.inspect(&h.host).unwrap().eligible);
+    let MemberAction::LaunchSingle(plan) = launch() else {
+        unreachable!()
+    };
+    let binding_id = plan.binding_id.clone();
+    let incarnation = plan.incarnation.clone();
+    let engine = remote_execution::engine(
+        h.sessions.clone(),
+        h.state.clone(),
+        RemoteLaunchBinding {
+            controller_id: h.authority.controller_id(),
+            host_id: h.host.clone(),
+            member_id: "head".into(),
+            profile_fingerprint: "vllm-0.32.0".into(),
+            launch_command_id: "01K00000000000000000000005".into(),
+            plan,
+            ingress_gate_key: [7; 32],
+            instance_index: 0,
+            device_memory: false,
+            decisions: false,
+            embeddings: true,
+            custom_engine: false,
+            lmcache_required: false,
+            retention_zero: false,
+            tensorfold_native: false,
+        },
+        Default::default(),
+    );
+    let context = |step_id: &str, identities, grant_id: Option<String>| StepExecutionContext {
+        token: TransitionToken {
+            deployment_id: "deployment".into(),
+            revision: 1,
+            generation: 1,
+            operation_id: "01K00000000000000000000006".into(),
+            step_id: step_id.into(),
+        },
+        binding_id: binding_id.clone(),
+        incarnation: incarnation.clone(),
+        issued_at_ms: 1,
+        deadline_ms: capyctl_protocol::now_unix_ms() + 20_000,
+        identities,
+        completion_target: None,
+        grant_id,
+        launch_settings: None,
+    };
+    for action in [RuntimeAction::Park, RuntimeAction::Restore] {
+        let command = RuntimeCommand {
+            action,
+            context: context(
+                "01K00000000000000000000007",
+                ExecutionIdentities::Retained(vec![recorded()]),
+                None,
+            ),
+        };
+        assert_eq!(
+            engine.execute_persisted(&command).await.unwrap_err(),
+            RuntimeError::Refused("host_capability_missing:embeddings".into())
+        );
+    }
+    let launch = RuntimeCommand {
+        action: RuntimeAction::Initialize,
+        context: context(
+            "01K00000000000000000000005",
+            ExecutionIdentities::OwnedLaunch,
+            Some("grant".into()),
+        ),
+    };
+    assert_eq!(
+        engine.execute_persisted(&launch).await.unwrap_err(),
+        RuntimeError::Refused("host_capability_missing:embeddings".into())
+    );
+    assert!(
+        next_command(&mut stream, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "nothing was sent"
+    );
+    h.server.abort();
+}
+
 // T44 T34 (ADR 0031 §9): a host without `custom_engines` stays placeable for
 // every other deployment, but a launch on a custom engine there is refused
 // `host_capability_missing:custom_engines` before anything is sent.
@@ -1270,9 +1490,11 @@ async fn a_custom_engine_launch_needs_the_capability() {
             instance_index: 0,
             device_memory: false,
             decisions: false,
+            embeddings: false,
             custom_engine: true,
             lmcache_required: false,
             retention_zero: false,
+            tensorfold_native: false,
         },
         Default::default(),
     );
@@ -1299,6 +1521,81 @@ async fn a_custom_engine_launch_needs_the_capability() {
     assert_eq!(
         engine.execute_persisted(&launch).await.unwrap_err(),
         RuntimeError::Refused("host_capability_missing:custom_engines".into())
+    );
+    assert!(
+        next_command(&mut stream, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "nothing was sent"
+    );
+    h.server.abort();
+}
+
+// T41 T34 (ADR 0039 §15, ADR 0017): a host without `tensorfold_native` stays
+// placeable for every other deployment, but a launch whose effective
+// profile is TensorFold's native line is refused
+// `host_capability_missing:tensorfold_native` before anything is sent, so an
+// older agent never renders a native installation with the 0.6 command.
+#[tokio::test]
+async fn a_native_tensorfold_launch_needs_the_capability() {
+    let h = enrolled().await;
+    let mut declared = all();
+    declared.retain(|c| c != capabilities::TENSORFOLD_NATIVE);
+    let (_send, mut stream) = h
+        .published(declared, inventory(&h.host))
+        .await
+        .expect("the host connects");
+    assert!(h.sessions.inspect(&h.host).unwrap().eligible);
+    let MemberAction::LaunchSingle(plan) = launch() else {
+        unreachable!()
+    };
+    let binding_id = plan.binding_id.clone();
+    let incarnation = plan.incarnation.clone();
+    let engine = remote_execution::engine(
+        h.sessions.clone(),
+        h.state.clone(),
+        RemoteLaunchBinding {
+            controller_id: h.authority.controller_id(),
+            host_id: h.host.clone(),
+            member_id: "head".into(),
+            profile_fingerprint: "unversioned".into(),
+            launch_command_id: "01K00000000000000000000005".into(),
+            plan,
+            ingress_gate_key: [7; 32],
+            instance_index: 0,
+            device_memory: false,
+            decisions: false,
+            embeddings: false,
+            custom_engine: false,
+            lmcache_required: false,
+            retention_zero: false,
+            tensorfold_native: true,
+        },
+        Default::default(),
+    );
+    let launch = RuntimeCommand {
+        action: RuntimeAction::Initialize,
+        context: StepExecutionContext {
+            token: TransitionToken {
+                deployment_id: "deployment".into(),
+                revision: 1,
+                generation: 1,
+                operation_id: "01K00000000000000000000006".into(),
+                step_id: "01K00000000000000000000005".into(),
+            },
+            binding_id,
+            incarnation,
+            issued_at_ms: 1,
+            deadline_ms: capyctl_protocol::now_unix_ms() + 20_000,
+            identities: ExecutionIdentities::OwnedLaunch,
+            completion_target: None,
+            grant_id: Some("grant".into()),
+            launch_settings: None,
+        },
+    };
+    assert_eq!(
+        engine.execute_persisted(&launch).await.unwrap_err(),
+        RuntimeError::Refused("host_capability_missing:tensorfold_native".into())
     );
     assert!(
         next_command(&mut stream, Duration::from_millis(300))
@@ -1347,9 +1644,11 @@ async fn an_lmcache_required_or_zero_retention_launch_needs_the_capability() {
                 instance_index: 0,
                 device_memory: false,
                 decisions: false,
+                embeddings: false,
                 custom_engine: false,
                 lmcache_required,
                 retention_zero,
+                tensorfold_native: false,
             },
             Default::default(),
         );
@@ -1561,9 +1860,11 @@ async fn a_request_abort_is_sent_only_to_a_host_that_declared_it() {
                 instance_index: 0,
                 device_memory: false,
                 decisions: false,
+                embeddings: false,
                 custom_engine: false,
                 lmcache_required: false,
                 retention_zero: false,
+                tensorfold_native: false,
             },
             Default::default(),
         )

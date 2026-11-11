@@ -327,6 +327,7 @@ impl Fixture {
                 checkpoint_layout: None,
                 checkpoint_tables: None,
                 checkpoint_gguf: None,
+                vllm_device_request_no_floor: false,
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
@@ -406,6 +407,7 @@ fn probe(launch: &MemberCommand, id: &str) -> MemberCommand {
             owned_handle: launch.identity.command_id.clone(),
             max_tokens: None,
             decision: false,
+            embedding: false,
         },
     )
 }

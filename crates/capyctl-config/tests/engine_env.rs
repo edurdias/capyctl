@@ -11,6 +11,18 @@ fn approved(entries: &[&str]) -> ApprovedEnv {
     ApprovedEnv::parse(&entries.iter().map(|e| e.to_string()).collect::<Vec<_>>()).unwrap()
 }
 
+// T21: SPEC §8.2 closes application selection at every environment boundary.
+#[test]
+fn sglang_http_app_is_owned() {
+    let name = "SGLANG_HTTP_SERVER_APP_PATH";
+    assert!(ApprovedEnv::parse(&[name.to_string()]).is_err());
+    let wide = approved(&["SGLANG_*"]);
+    for spelling in [name, "sglang_http_server_app_path"] {
+        assert!(resolve_engine_env(&map(&[(spelling, "other:app")]), &wide, &map(&[])).is_err());
+        assert!(resolve_engine_env(&map(&[]), &wide, &map(&[(spelling, "other:app")])).is_err());
+    }
+}
+
 // T37: a deployment name must match an approval; globs match by prefix.
 #[test]
 fn deployment_names_need_an_approval() {

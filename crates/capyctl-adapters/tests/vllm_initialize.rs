@@ -47,6 +47,11 @@ struct Stub {
     decision: Option<Value>,
     chats: Arc<AtomicUsize>,
     decisions: Arc<AtomicUsize>,
+    /// ADR 0036 §5: what `POST /v1/embeddings` answers, or `None` for a
+    /// server that does not serve the route (404).
+    embedding: Option<Value>,
+    /// The bodies `POST /v1/embeddings` was sent.
+    embeddings: Arc<Mutex<Vec<Value>>>,
 }
 
 /// What the chat surface does once the model is listed. The three failures are
@@ -155,6 +160,28 @@ async fn systemone(
     Json(answer).into_response()
 }
 
+/// ADR 0036 §5: vLLM's `/v1/embeddings` on a pooling server, guarded by the
+/// same key.
+async fn embeddings(
+    State(stub): State<Stub>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    let presented = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if presented != format!("Bearer {}", stub.key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    stub.embeddings.lock().unwrap().push(body);
+    match stub.embedding.clone() {
+        Some(answer) => Json(answer).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn stub_engine(model: &str, ready_after: usize, key: &str) -> (Stub, u16) {
     serve_stub(model, ready_after, key, ChatBehaviour::Answers, 0).await
 }
@@ -188,11 +215,35 @@ async fn serve_stub_deciding(
         decision,
         chats: Arc::new(AtomicUsize::new(0)),
         decisions: Arc::new(AtomicUsize::new(0)),
+        embedding: None,
+        embeddings: Arc::new(Mutex::new(Vec::new())),
     };
+    listen(stub, port).await
+}
+
+/// ADR 0036 §5: an engine whose `/v1/embeddings` answers `embedding`.
+async fn serve_stub_embedding(model: &str, key: &str, embedding: Option<Value>) -> (Stub, u16) {
+    let stub = Stub {
+        model: model.into(),
+        key: key.into(),
+        ready_after: 0,
+        polls: Arc::new(AtomicUsize::new(0)),
+        chat: ChatBehaviour::Answers,
+        decision: None,
+        chats: Arc::new(AtomicUsize::new(0)),
+        decisions: Arc::new(AtomicUsize::new(0)),
+        embedding,
+        embeddings: Arc::new(Mutex::new(Vec::new())),
+    };
+    listen(stub, 0).await
+}
+
+async fn listen(stub: Stub, port: u16) -> (Stub, u16) {
     let app = axum::Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/systemone", post(systemone))
+        .route("/v1/embeddings", post(embeddings))
         .with_state(stub.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
@@ -931,6 +982,103 @@ async fn a_decisions_launch_is_ready_only_on_the_fixed_decision() {
         .await
         .unwrap();
     assert_eq!(stub.decisions.load(Ordering::SeqCst), 0);
+    assert_eq!(stub.chats.load(Ordering::SeqCst), 1);
+}
+
+/// ADR 0036 §5, SPEC §6.1: an embeddings launch on vLLM runs the pooling
+/// runner and is ready only on a well-formed answer to the fixed embedding,
+/// sent with the launch's key: one entry of index 0, a finite vector whose
+/// norm is above 1e-6. A malformed answer, or a server without the route,
+/// fails the step, and no chat probe is ever sent in its place. ADR 0036 §6:
+/// the wake canary is the same embedding.
+// T47
+#[tokio::test]
+async fn an_embeddings_launch_is_ready_only_on_the_fixed_embedding() {
+    use capyctl_adapters::completion_probe::CanaryEvidence;
+    use capyctl_adapters::embedding_probe;
+    use capyctl_config::effective::DeploymentApi;
+    let answer = |entries: Value| {
+        json!({
+            "id": "embd-1", "object": "list", "created": 1, "model": "gate-m",
+            "data": entries,
+            "usage": {"prompt_tokens": 17, "total_tokens": 17}
+        })
+    };
+    let entry = |vector: Value| json!({"object": "embedding", "index": 0, "embedding": vector});
+    let well_formed = answer(json!([entry(json!([0.6, -0.8]))]));
+    for (embedding, ready) in [
+        (Some(well_formed), true),
+        (Some(answer(json!([entry(json!([0.0, 0.0]))]))), false),
+        (
+            Some(answer(json!([entry(json!([0.6])), entry(json!([0.8]))]))),
+            false,
+        ),
+        (Some(answer(json!([entry(json!([]))]))), false),
+        (None, false),
+    ] {
+        let (stub, port) = serve_stub_embedding("gate-m", "k3y", embedding.clone()).await;
+        let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+        let adapter = adapter(port, Some("k3y"))
+            .with_launch(PlanInputVllm {
+                api: DeploymentApi::Embeddings,
+                ..plan(port)
+            })
+            .with_tools(tool.clone())
+            .with_engine_key("k3y".into())
+            .with_api(DeploymentApi::Embeddings);
+        let result = adapter.execute_persisted(&initialize_command(30_000)).await;
+        assert_eq!(result.is_ok(), ready, "{embedding:?}: {result:?}");
+        if let Err(RuntimeError::Uncertain(message)) = &result {
+            assert!(message.contains("embedding probe"), "{message}");
+        }
+        // ADR 0036 §2: the pooling runner, in the reserved block.
+        let argv = tool.spawned.lock().unwrap()[0].argv.clone();
+        let runner = argv.windows(2).position(|w| w == ["--runner", "pooling"]);
+        let marker = argv
+            .iter()
+            .position(|a| a == capyctl_adapters::vllm::USER_ARGS_MARKER);
+        assert!(runner.is_some() && runner < marker, "{argv:?}");
+        assert_eq!(
+            *stub.embeddings.lock().unwrap(),
+            vec![embedding_probe::request("gate-m")]
+        );
+        let canary = adapter
+            .wake_canary(
+                &initialize_command(30_000).context,
+                8,
+                Duration::from_secs(5),
+            )
+            .await;
+        if ready {
+            let CanaryEvidence::Embedding(answer) = canary.unwrap().answer else {
+                panic!("an embeddings launch's canary is its embedding");
+            };
+            assert_eq!(answer.vector, vec![0.6, -0.8]);
+        } else {
+            assert!(
+                matches!(canary, Err(RuntimeError::Uncertain(_))),
+                "{canary:?}"
+            );
+        }
+        assert_eq!(stub.embeddings.lock().unwrap().len(), 2);
+        assert_eq!(stub.chats.load(Ordering::SeqCst), 0);
+        assert_eq!(stub.decisions.load(Ordering::SeqCst), 0);
+    }
+    // A chat launch renders no runner and is never sent an embedding.
+    let (stub, port) = serve_stub_embedding("gate-m", "k3y", None).await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    adapter(port, Some("k3y"))
+        .with_launch(plan(port))
+        .with_tools(tool.clone())
+        .with_engine_key("k3y".into())
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+    assert!(!tool.spawned.lock().unwrap()[0]
+        .argv
+        .iter()
+        .any(|a| a == "--runner"));
+    assert!(stub.embeddings.lock().unwrap().is_empty());
     assert_eq!(stub.chats.load(Ordering::SeqCst), 1);
 }
 

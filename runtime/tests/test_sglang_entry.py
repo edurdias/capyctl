@@ -421,6 +421,39 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
         with self.assertRaises(entry.LaunchError):
             self.build_member(public)
 
+    # T48 (ADR 0037 §7): present only on a traced single launch: the host's
+    # http(s) OTLP endpoint, never on a group member.
+    def test_a_trace_endpoint_is_an_optional_http_url(self):
+        public = copy.deepcopy(self.public)
+        public["settings"]["trace_endpoint"] = "http://127.0.0.1:4318/v1/traces"
+        self.build(self.argv(public), self.payloads(public))
+        for value in (None, "", "127.0.0.1:4318", "ftp://127.0.0.1/x", 1, True,
+                      "http://127.0.0.1:4318/v1 traces", "http://a\nb",
+                      "http://" + "c" * 4096):
+            with self.subTest(value=value):
+                public = copy.deepcopy(self.public)
+                public["settings"]["trace_endpoint"] = value
+                self.rejects(self.argv(public), self.payloads(public))
+        public = group_public(0)
+        public["settings"]["trace_endpoint"] = "http://127.0.0.1:4318/v1/traces"
+        with self.assertRaises(entry.LaunchError):
+            self.build_member(public)
+
+    # T03 T14 / SPEC §15.3 / ADR 0014 §2 / #236: the protected descriptor
+    # accepts exactly two boolean phases, never partial or extra-key objects.
+    def test_cuda_graph_phase_policy_is_closed(self):
+        for prefill in (False, True):
+            for decode in (False, True):
+                public = copy.deepcopy(self.public)
+                public["settings"]["cuda_graphs"] = dict(prefill=prefill, decode=decode)
+                self.build(self.argv(public), self.payloads(public))
+        for policy in ({}, {"prefill": False}, {"prefill": False, "decode": 1},
+                       {"prefill": False, "decode": True, "extra": False}):
+            with self.subTest(policy=policy):
+                public = copy.deepcopy(self.public)
+                public["settings"]["cuda_graphs"] = policy
+                self.rejects(self.argv(public), self.payloads(public))
+
     def test_typed_settings_accept_any_model_values_and_refuse_bad_shapes(self):
         # E1 / ADR 0011: values pass as the engine spells them; only type,
         # range and closure are checked here.

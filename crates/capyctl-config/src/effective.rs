@@ -64,6 +64,7 @@ use crate::engine_policy::{
 use crate::lmcache::{HostLmcache, LmcacheMode, LmcacheRegistration, Retention};
 pub use crate::parked_growth::ParkedGrowthLimit;
 use crate::resource_controls::{ResourceContext, ResourceControls};
+pub use crate::tensorfold_native::{NativeRegistration, TensorfoldLine};
 use crate::{ConfigError, ConfigErrorCode};
 use capyctl_domain::launch::LaunchSettings;
 use capyctl_domain::resources as domain;
@@ -196,8 +197,8 @@ pub struct EffectiveDeployment {
     /// while `auto` so every revision frozen before it keeps its encoding.
     #[serde(skip_serializing_if = "LmcacheMode::is_auto")]
     pub lmcache: LmcacheMode,
-    /// ADR 0033 §6: the declared `lmcache_pool` in bytes; omitted unless
-    /// stated (the default is 4 GiB).
+    /// ADR 0033 §6, ADR 0034 §4: a stated `lmcache_pool` in bytes; omitted
+    /// for `auto` (the default: sized from the model and its context).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lmcache_pool_bytes: Option<u64>,
     /// ADR 0033 §10: the declared `retention`, omitted while `standard`.
@@ -342,16 +343,18 @@ impl Residency {
     }
 }
 
-/// ADR 0030 §1: the API a deployment serves. `chat` answers
+/// ADR 0030 §1, ADR 0036 §1: the API a deployment serves. `chat` answers
 /// `POST /v1/chat/completions`; `decisions` answers `POST /v1/systemone`
 /// (decision models: typed questions answered with probabilities, no
-/// generated text). The same checkpoint served both ways is two revisions.
+/// generated text); `embeddings` answers `POST /v1/embeddings` (a vector per
+/// input). The same checkpoint served two ways is two revisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DeploymentApi {
     #[default]
     Chat,
     Decisions,
+    Embeddings,
 }
 
 impl DeploymentApi {
@@ -366,6 +369,7 @@ impl DeploymentApi {
         match self {
             Self::Chat => "chat",
             Self::Decisions => "decisions",
+            Self::Embeddings => "embeddings",
         }
     }
 }
@@ -432,6 +436,16 @@ pub struct RuntimeProfile {
     /// Absent when none is, so such a profile serializes exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lmcache: Option<LmcacheRegistration>,
+    /// ADR 0039 §1: the TensorFold line of the installation, fixed at
+    /// registration from its form. Absent means `python`, so every existing
+    /// profile serializes and fingerprints exactly as before; a profile that
+    /// changes line changes its build fingerprint (drift, ADR 0008).
+    #[serde(default, skip_serializing_if = "TensorfoldLine::is_python")]
+    pub line: TensorfoldLine,
+    /// ADR 0039 §2, §7: what `engine add` recorded from a native release
+    /// (the capabilities document's families, the publisher's checksums).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeRegistration>,
 }
 
 /// Whether this profile may park at all.
@@ -1278,6 +1292,16 @@ struct RawProfile {
     /// ADR 0033 §1: the LMCache package `engine add` registered.
     #[serde(default)]
     lmcache: Option<LmcacheRegistration>,
+    /// ADR 0039 §1: `native` for a TensorFold native release.
+    #[serde(default)]
+    line: TensorfoldLine,
+    /// ADR 0039 §2, §7: the native registration's record.
+    #[serde(default)]
+    native: Option<NativeRegistration>,
+    /// ADR 0038 §2: the companion versions `engine add` read beside
+    /// TensorRT-LLM's; listed, never launched with.
+    #[serde(default)]
+    companions: BTreeMap<String, String>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1425,15 +1449,14 @@ fn check_custom_deployment(
         ));
     }
     if d.api != manifest.api {
-        let (missing, serves) = match d.api {
-            DeploymentApi::Decisions => ("decisions", "chat"),
-            DeploymentApi::Chat => ("chat", "decisions"),
-        };
+        // ADR 0031 §2, ADR 0036 §1: the deployment's API is the one missing.
         return Err(invalid(
             "api",
             format!(
-                "capability_missing:{missing}: this custom engine's manifest serves `api: \
-                 {serves}`, and every deployment on it serves the same API"
+                "capability_missing:{}: this custom engine's manifest serves `api: {}`, and \
+                 every deployment on it serves the same API",
+                d.api.name(),
+                manifest.api.name()
             ),
         ));
     }
@@ -1470,10 +1493,11 @@ fn check_custom_deployment(
     Ok(())
 }
 
-/// ADR 0033 §6, §9, §10, §14: what a deployment's `lmcache`, `lmcache_pool`
-/// and `retention` say by themselves. The pool, in bytes, when stated: a whole
-/// number of GiB, at least 1 GiB, and never beside `lmcache: off`; `lmcache:
-/// required` beside `retention: zero` is `retention_zero:lmcache`.
+/// ADR 0033 §6, §9, §10, §14, ADR 0034 §4: what a deployment's `lmcache`,
+/// `lmcache_pool` and `retention` say by themselves. The pool, in bytes,
+/// when stated: a whole number of GiB, at least 1 GiB, and never beside
+/// `lmcache: off`; `auto` (the default) is `None`. `lmcache: required` beside
+/// `retention: zero` is `retention_zero:lmcache`.
 fn lmcache_declaration(
     lmcache: LmcacheMode,
     lmcache_pool: Option<&str>,
@@ -1482,7 +1506,8 @@ fn lmcache_declaration(
     let pool = lmcache_pool
         .map(crate::lmcache::parse_pool)
         .transpose()
-        .map_err(|detail| invalid("lmcache_pool", detail))?;
+        .map_err(|detail| invalid("lmcache_pool", detail))?
+        .flatten();
     if pool.is_some() && lmcache == LmcacheMode::Off {
         return Err(invalid(
             "lmcache_pool",
@@ -1501,6 +1526,72 @@ fn lmcache_declaration(
         ));
     }
     Ok(pool)
+}
+
+/// ADR 0039 §4 (owner decision 2026-10-27, question 4), beside ADR 0033
+/// §10's [`lmcache_declaration`]: under the deployment's `retention: zero` a
+/// native TensorFold profile's host-fixed or extra arguments may name
+/// neither a compaction option (`retention_zero:compaction`) nor one that
+/// writes request state to disk (`retention_zero:engine_disk`): the option
+/// the operator asked for is refused, never silently dropped. The Python
+/// line has neither, and is unchanged.
+fn native_retention_refusal(
+    profile: &RawProfile,
+    extra_args: &[String],
+    retention: Retention,
+) -> Result<(), ConfigError> {
+    if profile.engine != Engine::Tensorfold
+        || !profile.line.is_native()
+        || retention != Retention::Zero
+    {
+        return Ok(());
+    }
+    for (args, path) in [
+        (profile.args.as_slice(), "runtime_profiles.args"),
+        (extra_args, "engine_config.extra_args"),
+    ] {
+        if let Some((code, option)) = crate::tensorfold_native::retention_zero_refusal(args) {
+            return Err(invalid(
+                path,
+                crate::tensorfold_native::retention_zero_message(code, &option),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// ADR 0039 §6, §13: the native TensorFold line serves one GPU and no group,
+/// so a `topology` is refused, naming the line and the fix, with the codes
+/// groups (ADR 0028 §16) and several GPUs (ADR 0035 §13) already use.
+fn native_topology_refusal(group: bool) -> ConfigError {
+    invalid(
+        "topology",
+        if group {
+            "group_shape_unsupported:tensorfold: the TensorFold native line has no multi-node \
+             mode; remove `topology`, or run the group on a TensorFold 0.6 profile"
+                .to_owned()
+        } else {
+            format!(
+                "{}: the TensorFold native line runs one model on one GPU; remove `topology`",
+                crate::topology::MULTI_GPU_UNSUPPORTED
+            )
+        },
+    )
+}
+
+/// Whether `document`'s runtime profile on `host` is a native TensorFold one.
+fn names_native_profile(document: &serde_json::Value, host: &serde_json::Value) -> bool {
+    let Some(name) = document
+        .get("runtime_profile")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    decode_host(host).is_ok_and(|host| {
+        host.runtime_profiles
+            .get(name)
+            .is_some_and(|profile| profile.engine == Engine::Tensorfold && profile.line.is_native())
+    })
 }
 
 pub fn resolve_effective(
@@ -1526,6 +1617,11 @@ pub fn resolve_effective_with_checkpoint(
     crate::deployment_defaults::expand(&mut document)?;
     let spec = crate::instances::parse_instance_spec(&document)?;
     if spec.local == Some(crate::topology::LocalTopology::Auto) {
+        // ADR 0039 §13: `auto` would resolve the native line to one GPU
+        // silently; a topology is refused there instead.
+        if names_native_profile(&document, host) {
+            return Err(native_topology_refusal(false));
+        }
         return multi_gpu::resolve_auto(&document, host, facts);
     }
     resolve_with(deployment, host, facts, Limits::Enforce)
@@ -1590,10 +1686,23 @@ fn resolve_with(
         .get(&d.runtime_profile)
         .ok_or_else(|| invalid("runtime_profile", "unknown runtime profile"))?
         .clone();
+    // ADR 0039 §4, beside `lmcache_declaration` above: the deployment's
+    // `retention: zero` refuses the native line's compaction and disk options.
+    native_retention_refusal(&raw_profile, d.engine_config.extra_args(), d.retention)?;
+    // ADR 0039 §6, §13: the native line runs no group and one GPU.
+    let native = raw_profile.engine == Engine::Tensorfold && raw_profile.line.is_native();
+    if native && (instance_spec.group.is_some() || local.is_some()) {
+        return Err(native_topology_refusal(instance_spec.group.is_some()));
+    }
     // ADR 0030 §1: only an installation that serves `/v1/systemone` takes a
-    // decisions deployment, refused before anything else is resolved.
-    if d.api == DeploymentApi::Decisions {
-        crate::decisions::check_engine(raw_profile.engine, &raw_profile.build_fingerprint)?;
+    // decisions deployment; ADR 0036 §1: only one with an embeddings route
+    // takes an embeddings deployment. Refused before anything else resolves.
+    match d.api {
+        DeploymentApi::Decisions => {
+            crate::decisions::check_engine(raw_profile.engine, &raw_profile.build_fingerprint)?
+        }
+        DeploymentApi::Embeddings => crate::embeddings::check_engine(raw_profile.engine)?,
+        DeploymentApi::Chat => {}
     }
     // ADR 0035 §1, §10: the engine's local multi-GPU mode, from its support
     // data, before anything else is resolved.
@@ -1609,11 +1718,19 @@ fn resolve_with(
             )));
         }
         let Some(support) = local_support else {
+            // ADR 0038 §13: tensor parallelism needs the MPI pool the single
+            // process model refuses.
+            let reason = if raw_profile.engine == Engine::TensorrtLlm {
+                "TensorRT-LLM runs on one GPU in this version".to_owned()
+            } else {
+                format!(
+                    "the {} engine has no mode that runs one model on several GPUs of one host",
+                    raw_profile.engine.name()
+                )
+            };
             return Err(unsupported(format!(
-                "{}: the {} engine has no mode that runs one model on several GPUs of one \
-                 host; remove `topology`",
+                "{}: {reason}; remove `topology`",
                 crate::topology::MULTI_GPU_UNSUPPORTED,
-                raw_profile.engine.name()
             )));
         };
         if support
@@ -1669,6 +1786,34 @@ fn resolve_with(
     if raw_profile.engine == Engine::Llamacpp {
         if let Some(reason) = crate::llamacpp::refused_env(d.engine_config.env().keys()) {
             return Err(invalid("engine_config.env", reason));
+        }
+    }
+    // ADR 0039 §5: a native TensorFold deployment's env names neither what
+    // the native line renders nor what it never carries.
+    if native {
+        if let Some(reason) =
+            crate::engine_env::tensorfold_native_refused(d.engine_config.env().keys())
+        {
+            return Err(invalid("engine_config.env", reason));
+        }
+    }
+    // ADR 0038 §3: the same names on a TensorRT-LLM deployment, and the
+    // served name the per-launch link is named after (owner decision
+    // 2026-10-27, question 3).
+    if raw_profile.engine == Engine::TensorrtLlm {
+        if let Some(reason) = crate::tensorrt_llm::refused_env(d.engine_config.env().keys()) {
+            return Err(invalid("engine_config.env", reason));
+        }
+        if let Some(reason) = d
+            .routes
+            .first()
+            .and_then(|name| crate::tensorrt_llm::served_name_refusal(name))
+        {
+            return Err(ConfigError::new(
+                ConfigErrorCode::UnsupportedCombination,
+                "routes",
+                reason,
+            ));
         }
     }
     let host = core::normalize_host(h)?;
@@ -1810,10 +1955,29 @@ fn resolve_with(
         multi_gpu::communication_allowance(ranks),
         limits,
     );
+    // ADR 0036 §7.2: an embeddings deployment parks only where its engine's
+    // support data says embeddings parking passed; a stated `deep` elsewhere
+    // is refused.
+    if d.api == DeploymentApi::Embeddings {
+        crate::embeddings::check_residency(
+            raw_profile.engine,
+            d.residency,
+            crate::embeddings::support(raw_profile.engine),
+        )?;
+    }
     let residency = d.residency.unwrap_or_else(|| {
         // ADR 0030 §7: a decisions deployment restarts instead of parking.
         if d.api == DeploymentApi::Decisions {
             return Residency::RestartOnly;
+        }
+        // ADR 0036 §7.2: an embeddings deployment that states no residency
+        // parks `deep` on vLLM and SGLang (discrete hosts too) while its
+        // engine's support data allows it, and restarts everywhere else.
+        if d.api == DeploymentApi::Embeddings {
+            return crate::embeddings::default_residency(
+                crate::embeddings::support(raw_profile.engine),
+                raw_profile.security.deep_park.is_enabled(),
+            );
         }
         // ADR 0035 §9: on several GPUs an engine parks only once its live
         // row passes; until then a deployment stating no residency restarts.
@@ -1825,13 +1989,14 @@ fn resolve_with(
         let discrete = device_sizing
             .filter(|_| !sglang_speculative)
             .map(|_| (sizing.weights_bytes, core::system_parked_limit(&host)));
-        // ADR 0023 §6, ADR 0029 §1, ADR 0031 §4: TensorFold, llama.cpp and
-        // custom engines never park, so their default is restart_only.
+        // ADR 0023 §6, ADR 0029 §1, ADR 0031 §4, ADR 0038 §1: TensorFold,
+        // llama.cpp, TensorRT-LLM and custom engines never park, so their
+        // default is restart_only.
         crate::deployment_defaults::default_residency(
             raw_profile.security.deep_park.is_enabled()
                 && !matches!(
                     raw_profile.engine,
-                    Engine::Tensorfold | Engine::Llamacpp | Engine::Custom
+                    Engine::Tensorfold | Engine::Llamacpp | Engine::TensorrtLlm | Engine::Custom
                 ),
             discrete,
         )
@@ -1946,6 +2111,8 @@ fn resolve_with(
         d.engine_config,
         engine_config::EngineInputs {
             engine: profile.engine,
+            api: d.api,
+            line: profile.line,
             residency,
             security: &profile.security,
             profile_args: &profile.args,
@@ -1960,9 +2127,10 @@ fn resolve_with(
             draft_declared: model.draft.is_some(),
         },
     )?;
-    // ADR 0030 §1 (amending ADR 0024 §1): parsers apply to chat deployments.
-    if d.api == DeploymentApi::Decisions {
-        crate::decisions::check_parsers(&engine_config)?;
+    // ADR 0030 §1, ADR 0036 §1 (amending ADR 0024 §1): parsers apply to chat
+    // deployments.
+    if d.api != DeploymentApi::Chat {
+        crate::decisions::check_parsers(&engine_config, d.api)?;
     }
     // ADR 0033 §9, §14: `lmcache: required` is refused here when the
     // deployment and its profile alone keep LMCache off; what the host
@@ -1973,8 +2141,9 @@ fn resolve_with(
         retention: d.retention,
         api: d.api,
         topology: instance_spec.group.is_some(),
-        // ADR 0035 §9: LMCache stays off on several GPUs until a row
-        // qualifies it (`multi_gpu_unqualified`).
+        // ADR 0035 §9, ADR 0034 §6: several GPUs keep LMCache off under
+        // `auto` (`multi_gpu_unqualified`) and run it uncertified under
+        // `required`, which is not refused for it.
         multi_gpu: ranks > 1,
         registration: profile.lmcache.as_ref(),
         kv_transfer_config_set: crate::engine_policy::kv_transfer_config_set(
@@ -2069,8 +2238,9 @@ fn resolve_with(
     };
     // ADR 0023 §4: the first build's bound must not be lowered by
     // the request deadline, so a TensorFold deployment's deadline, undeclared,
-    // is at least that bound, and may be declared up to it.
-    let deadline_ceiling_ms = if raw_profile.engine == Engine::Tensorfold {
+    // is at least that bound, and may be declared up to it. ADR 0039 §6: the
+    // native line builds nothing at start, so it gets no such floor.
+    let deadline_ceiling_ms = if raw_profile.engine == Engine::Tensorfold && !native {
         host.queue
             .request_deadline_ms
             .max(timeouts::TENSORFOLD_FIRST_BUILD_MS)
@@ -2104,6 +2274,7 @@ fn resolve_with(
         recipe.request_deadline_ms,
         facts,
         raw_profile.engine,
+        raw_profile.line,
         recipe.residency,
     )?;
     let recipe_fingerprint =
@@ -2138,6 +2309,8 @@ fn resolve_with(
             log_policy: profile.log_policy,
             custom: profile.custom,
             lmcache: profile.lmcache,
+            line: profile.line,
+            native: profile.native,
         },
         engine_env,
         host,

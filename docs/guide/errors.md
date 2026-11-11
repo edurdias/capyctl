@@ -19,7 +19,7 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 2 | `group_model_path_mismatch` | A SGLang group with `residency: deep` has the model at different paths on its machines; the message names both. | Put the model at the same path on every machine, or use `residency: restart_only`. |
 | 2 | `peer_address_missing` | A machine named in `placement.hosts` declares no peer address. | Set `resource_policy.groups.peer_address` (or `--peer-address`) on that machine and restart CapyCTL there. |
 | 2 | `peer_address_not_local` | The declared peer address is not on any network interface of that machine. | Declare an address the machine holds on its direct link. |
-| 2 | `engine_env_reserved:<name>` | An engine environment variable CapyCTL sets itself (for example `NCCL_*`, `GLOO_*`, `MASTER_*`, `VLLM_HOST_IP`, `CUDA_VISIBLE_DEVICES`), or any `LMCACHE_*` variable, which LMCache would read as configuration. | Remove it; CapyCTL renders these names ([the full list](../operations/configuration.md#engine-environment)). |
+| 2 | `engine_env_reserved:<name>` | An engine environment variable CapyCTL sets itself (for example `NCCL_*`, `GLOO_*`, `MASTER_*`, `VLLM_HOST_IP`, `CUDA_VISIBLE_DEVICES`), any `LMCACHE_*` variable, which LMCache would read as configuration, or an engine tracing variable: `OTEL_*`, `SGLANG_TRACE_*`, `SGLANG_OTLP_*`, `TRACEPARENT` or `TRACESTATE`, in any case; on TensorFold's native line also `TENSORFOLD_MEMORY_RESERVE_GIB`, and the variables CapyCTL never passes to it: `TENSORFOLD_API_KEY`, `TENSORFOLD_REQUEST_LOG` (it writes every request to a file), `TENSORFOLD_CUDA_KERNELS`, `TF_CUDA_DEVICE`, `TF_CUDA_SEGMENTS` and `BRAVE_SEARCH_API_KEY`. | Remove it; CapyCTL renders these names ([the full list](../operations/configuration.md#engine-environment)). For engine tracing set `observability.tracing.engines: on` on the host ([Engine tracing](engines.md#engine-tracing)). On TensorFold native use `--segments` instead of `TF_CUDA_SEGMENTS`. |
 | 2 | `engine_env_not_approved:<name>` | A deployment sets an engine variable the engine profile does not approve (on some machine of a group). | Approve it with `capyctl engine add ... --approve-env <name>` on every machine, or remove it ([Engine variables](engines.md#engine-variables)). |
 | 2 | `engine_env_conflict:<name>` | The same variable is in the file and on the command line. | Give it one way only. |
 | 2 | `custom_field_unsupported:<field>` | A deployment on a custom engine states something the engine's manifest owns: `extra_args`, `accept_extra_args`, a tool-call or reasoning parser, `memory`, a draft model or a typed engine field such as `dtype` or `max_concurrent_requests`. | Remove it; a custom engine's deployment states only `engine_config.context_length` and `engine_config.env` ([Custom engines](engines.md#custom-engines)). |
@@ -38,23 +38,31 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 4 | `host_tuning_missing:<item>` | With `require_rdma: true`, a machine lacks `memlock` (unlimited locked memory) or `infiniband` (read-write `/dev/infiniband/uverbs*`). | Fix the item as root on that machine, or set `require_rdma: false`. |
 | 5 | `unsupported` | The request is valid but this release cannot do it. | Read the message; it names the missing capability. |
 | 5 | `store_from_newer_version` | The state directory was written by a newer CapyCTL. | Run the newer binary, or restore a backup taken before the upgrade. |
-| 5 | `multi_gpu_unsupported` | The deployment names two or more GPUs without a `topology`, or asks for several GPUs on a machine with one unified-memory GPU (such as a GB10) or on an engine that runs on one GPU only (TensorFold, a custom engine). | Add `topology: {tensor_parallel: N}` with N the number of GPUs you named ([One model on several GPUs](deploy.md#one-model-on-several-gpus)); otherwise use one GPU, or several machines with `placement.hosts`. |
+| 5 | `multi_gpu_unsupported` | The deployment names two or more GPUs without a `topology`, or asks for several GPUs on a machine with one unified-memory GPU (such as a GB10) or on an engine that runs on one GPU only (TensorFold, TensorRT-LLM, a custom engine). | Add `topology: {tensor_parallel: N}` with N the number of GPUs you named ([One model on several GPUs](deploy.md#one-model-on-several-gpus)); otherwise use one GPU, or several machines with `placement.hosts`. |
 | 5 | `multi_gpu_mixed_devices` | The GPUs a deployment names differ in product or memory. | Name identical GPUs (`nvidia-smi -L` shows them). |
 | 5 | `tensor_parallel_indivisible` | On vLLM or SGLang, `tensor_parallel` does not divide the model's attention heads; the message names the head count and the numbers that divide it. | Use one of the numbers the message names, or `topology: auto`. |
 | 5 | `unsupported_gpu_topology` | The machine has both an integrated and a discrete GPU. | Not supported in this release. |
 | 5 | `host_backed_unavailable` | `residency: host_backed` on unified memory. | Use `deep`, or leave `residency` out. |
-| 5 | `capability_missing`, `capability_missing:deep_park` | `--deep-park enabled` on an engine that cannot park (TensorFold, llama.cpp, a custom engine), or a deployment asking such an engine to park (`residency: deep` or `host_backed`). | Leave `--deep-park` out; use `residency: restart_only`. |
-| 5 | `group_shape_unsupported`, `group_shape_unsupported:<engine>` | More than one rank per machine in a group, `pipeline_parallel` above 1 on one machine, or a shape the engine cannot run (TensorFold runs `tensor_parallel: 2` on exactly two machines; a custom engine, `group_shape_unsupported:custom`, runs on one machine only). | Use one machine per rank and a shape the engine supports ([Groups across machines](engines.md#groups-across-machines)); on one machine use `tensor_parallel` only; for a custom engine, remove `topology` and use `instances` for more copies. |
+| 5 | `capability_missing`, `capability_missing:deep_park` | `--deep-park enabled` on an engine that cannot park (TensorFold, llama.cpp, TensorRT-LLM, a custom engine), or a deployment asking such an engine to park (`residency: deep` or `host_backed`); on TensorFold's native line also `kv_cache_dtype` (its KV cache is BF16), `model.draft` or a `--drafter` argument (it drafts with the checkpoint's own MTP head). | Leave `--deep-park` out; use `residency: restart_only`; on TensorFold native, remove `kv_cache_dtype`, `model.draft` and `--drafter` (`--no-drafts` turns drafting off). |
+| 5 | `group_shape_unsupported`, `group_shape_unsupported:<engine>` | More than one rank per machine in a group, `pipeline_parallel` above 1 on one machine, or a shape the engine cannot run (TensorFold 0.6 runs `tensor_parallel: 2` on exactly two machines, and TensorFold's native line serves no group, `group_shape_unsupported:tensorfold`; a custom engine, `group_shape_unsupported:custom`, runs on one machine only). | Use one machine per rank and a shape the engine supports ([Groups across machines](engines.md#groups-across-machines)); on one machine use `tensor_parallel` only; for a custom engine or TensorFold native, remove `topology` and use `instances` for more copies. |
 | 5 | `group_instances_unsupported` | `instances` above 1 with a `topology` across machines. | Deploy one group per deployment. |
 | 5 | `group_drift:<field>`, `tp_drift:<field>` | The engine changed a multi-machine or multi-GPU setting CapyCTL rendered (the field is named). | Report it; the engine build behaves differently from the one CapyCTL supports. |
 | 5 | `host_capability_missing:engine_groups` | A machine runs a CapyCTL too old for groups. | Upgrade CapyCTL on that machine. |
 | 5 | `host_capability_missing:local_tensor_parallel` | A deployment with a `topology` on one machine names a machine that runs a CapyCTL too old to run a model on several GPUs; nothing was sent to it. | Upgrade CapyCTL on that machine. |
-| 5 | `capability_missing:decisions` | A deployment with `api: decisions` names an engine that cannot serve decision models: vLLM (any version: 0.32.0 answers Clef and Clef-Flash from their text output instead of their decision head), TensorFold, llama.cpp before 0.7.0, SGLang before 0.5.22, an installation whose registered build names no version, or a custom engine whose manifest says `api: chat`. | Use llama.cpp 0.7.0 or newer or SGLang 0.5.22 or newer, registered with `capyctl engine add`, or a custom engine with `api: decisions` ([Decision models](deploy.md#decision-models)). |
+| 5 | `capability_missing:decisions` | A deployment with `api: decisions` names an engine that cannot serve decision models: vLLM (any version: 0.32.0 answers Clef and Clef-Flash from their text output instead of their decision head), TensorFold, TensorRT-LLM, llama.cpp before 0.7.0, SGLang before 0.5.22, an installation whose registered build names no version, or a custom engine whose manifest says `api: chat`. | Use llama.cpp 0.7.0 or newer or SGLang 0.5.22 or newer, registered with `capyctl engine add`, or a custom engine with `api: decisions` ([Decision models](deploy.md#decision-models)). |
+| 5 | `served_name_unsupported` | On TensorRT-LLM, the deployment's served name (its first route) is empty, `.` or `..`, holds `/` or a NUL byte, or is longer than 255 bytes. TensorRT-LLM serves the name of the model directory it is given, so CapyCTL links the checkpoint under the served name. | Use a served name that is one path component ([TensorRT-LLM](engines.md#tensorrt-llm)). |
 | 5 | `capability_missing:chat` | A chat deployment (no `api`, or `api: chat`) names a custom engine whose manifest says `api: decisions`. | Add `api: decisions` to the deployment, or use a chat engine. |
 | 5 | `host_capability_missing:decisions` | A machine runs a CapyCTL too old for decision models. | Upgrade CapyCTL on that machine. |
+| 5 | `capability_missing:embeddings` | A deployment with `api: embeddings` names an engine that has no embeddings route (TensorFold, TensorRT-LLM), or a custom engine whose manifest names another `api`. | Use vLLM, SGLang or llama.cpp, or a custom engine with `api: embeddings`. |
+| 5 | `host_capability_missing:embeddings` | A machine runs a CapyCTL too old for embedding models. | Upgrade CapyCTL on that machine. |
 | 5 | `host_capability_missing:custom_engines` | The deployment's engine is a custom engine and a machine it names runs a CapyCTL too old for custom engines. | Upgrade CapyCTL on that machine. |
+| 5 | `host_capability_missing:tensorfold_native` | The deployment's engine profile is TensorFold's native line (`line: native`) and a machine it names runs a CapyCTL too old for it; nothing was sent to it. | Upgrade CapyCTL on that machine. |
+| 5 | `host_capability_missing:cuda_graph_phases` | The deployment declares independent SGLang CUDA graph phases and a machine runs a CapyCTL too old for the object form; nothing was sent to it. | Upgrade CapyCTL on that machine, or use a scalar boolean policy. |
+| 5 | `host_capability_missing:vllm_device_request_no_floor` | A newly derived discrete vLLM request has no 75% card floor, but a machine still derives the older floor; nothing was sent to it. | Upgrade CapyCTL on that machine. |
 | 5 | `lmcache_unavailable:<reason>` | A deployment with `lmcache: required` cannot use LMCache, for the reason named after the colon ([LMCache](#lmcache) lists them). A reason known before anything starts (the machine's `lmcache: off`, the engine or its version, a missing or unsupported LMCache package, a `topology`, a parking residency not qualified, the deployment's own `--kv-transfer-config`) refuses it at deploy or start; one found when the launch runs (the launch-time check, the server's start, its listener check, the engine's start with LMCache) fails the launch, and nothing is left running. | Remove the reason ([LMCache](#lmcache) says how for each), or set `lmcache: auto`, which runs without LMCache where it cannot be used. |
 | 5 | `retention_zero:lmcache` | `lmcache: required` beside `retention: zero`, the deployment's own or that of a machine it names. Zero retention never runs LMCache. | Drop `lmcache: required` or the deployment's `retention: zero`, or place it on a machine without `retention: zero`. |
+| 5 | `retention_zero:compaction` | On TensorFold's native line, `--compact-at`, `--compact-keep` or `--compact-memory` in the deployment's or the engine's arguments, beside `retention: zero` (the deployment's own or that of a machine it names). | Remove the option, or run without `retention: zero` ([Data retention](../operations/data-retention.md)). |
+| 5 | `retention_zero:engine_disk` | On TensorFold's native line, an option that writes request state to disk (`--record`, `--learn` and its `--learn-*` options, `--recall` and its `--recall-*` options) beside `retention: zero`. | Remove the option, or run without `retention: zero`. |
 | 5 | `host_capability_missing:lmcache` | A deployment with `lmcache: required` names a machine that runs a CapyCTL too old for LMCache. | Upgrade CapyCTL on that machine, or set `lmcache: auto` (it then runs there without LMCache). |
 | 5 | `host_capability_missing:retention` | A deployment with `retention: zero` names a machine that runs a CapyCTL too old to honour it. | Upgrade CapyCTL on that machine. |
 | 6 | `unreconciled` | CapyCTL cannot yet tell what an engine is doing, so it will not act on it. | Wait for the host to reconnect, then retry. |
@@ -66,10 +74,10 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 13 | `internal` | An internal, storage or I/O failure, or a launch that failed (`operation_failed`). | Read the message, `capyctl status deployment <name>` and the role's log. |
 | 14 | `host_revoked` | The server revoked this host. The host exits and is not restarted. | Bring it back (see [Several machines](several-machines.md#take-a-machine-out)). |
 | 15 | `host_ineligible` | No allowed host can take the deployment: drained, revoked, offline or too old. | Undrain, reconnect, upgrade or re-enroll the host the message names. |
-| 16 | `engine_not_found` | The path holds no `vllm`, `sglang` or `tensorfold` package and is no `llama-server` binary; or, with `--custom`, the executable is missing or is not an executable file. | Name the environment, its `bin/vllm`, `bin/tensorfold` or `bin/python3`, or a `llama-server` binary or its directory, or search with `capyctl engine detect --path <dir>`; with `--custom`, name the program itself. |
-| 17 | `engine_unsupported` | The package is not a supported engine; or `llama-server --version` printed no version line CapyCTL reads; or the machine has `/etc/llama.cpp/config.ini`, which llama-server would read as options. | Register a vLLM, SGLang, TensorFold or llama.cpp installation; for llama.cpp, remove `/etc/llama.cpp/config.ini`. |
+| 16 | `engine_not_found` | The path holds no `vllm`, `sglang` or `tensorfold` package and is no `llama-server` or `tensorfold-native` binary; or, with `--custom`, the executable is missing or is not an executable file. | Name the environment, its `bin/vllm`, `bin/tensorfold` or `bin/python3`, a `llama-server` binary or its directory, or a TensorFold native release directory or its `bin/tensorfold-native`, or search with `capyctl engine detect --path <dir>`; with `--custom`, name the program itself. |
+| 17 | `engine_unsupported` | The package is not a supported engine; or `llama-server --version` printed no version line CapyCTL reads; or the machine has `/etc/llama.cpp/config.ini`, which llama-server would read as options; or a TensorFold native release changed after it was unpacked (a file listed in its `SHA256SUMS` is missing or different), or its `capabilities --json` document lacks a flag or variable CapyCTL renders; or a `bin/tensorfold` outside a Python environment. | Register a vLLM, SGLang, TensorFold or llama.cpp installation; for llama.cpp, remove `/etc/llama.cpp/config.ini`; for TensorFold native, unpack the release archive again and register its `tensorfold-native`. |
 | 17 | `installation_unsupported:editable` | `capyctl engine add` found SGLang installed in editable mode (`pip install -e`, as in the official `lmsysorg/sglang` image): its package is in a source checkout, reached only through a `.pth` file, and CapyCTL loads SGLang from the environment's `site-packages` without running `.pth` files. Nothing was written. | Reinstall SGLang without `-e` ([Install an engine](install-engines.md#sglang-0521-or-0520)), then add it again. |
-| 18 | `engine_version_failed` | The engine's version check failed or timed out; nothing was written. | Repair the installation until its version check succeeds, then add it again. |
+| 18 | `engine_version_failed` | The engine's version check failed or timed out, or TensorFold native's version line disagrees with its `VERSION` file; nothing was written. | Repair the installation until its version check succeeds, then add it again. |
 | 19 | `profile_exists` | The engine profile name is taken. | Pass `--name`, or remove the existing profile first. |
 | 20 | `profile_in_use` | Removing or replacing the engine would affect the deployments listed. | Stop them, or rerun with `--drain`. |
 | 21 | `publish_rejected` | The server refused the updated engine list; the reason follows. | Fix what the reason names. |
@@ -107,6 +115,10 @@ A deployment on one machine can show these codes the same way:
   back intact. The wake fails and CapyCTL stops the instance;
   `capyctl status deployment <name>` shows the code as its last error. The
   next request or `capyctl start deployment <name>` loads it fresh.
+  For an embedding model (`api: embeddings`) the same check runs after every
+  wake and every restart: the fixed embedding must come back with the same
+  length and within a small relative distance of the first answer
+  ([Embedding models](deploy.md#embedding-models)).
 - `wake_reload_failed` (vLLM): during a wake, the engine reported that
   reloading the model's weights failed. The wake fails and CapyCTL stops the
   instance, as for `wake_mismatch`; the next request or
@@ -124,38 +136,69 @@ A deployment on one machine can show these codes the same way:
 - `engine_config_file` (llama.cpp): `/etc/llama.cpp/config.ini` exists on the
   machine, so llama-server would read options CapyCTL cannot check. Nothing
   starts until the file is removed.
-- `installation_unsupported:editable` (SGLang, `capyctl start standalone`):
-  the engine's SGLang is installed in editable mode, which CapyCTL cannot
-  load (the row for exit 17 above). The start is refused before anything
-  runs, whatever the profile's `installation_drift` says; this also covers an
-  engine named with `--sglang-bin` or `local_engine`, which `engine add` never
-  checked. Reinstall SGLang without `-e`. A GPU machine of several starts the
-  engine instead, which then fails `engine_import_failed` (below).
+- `effective_args_mismatch` (llama.cpp, TensorFold native): once started,
+  llama-server reported a different slot count or window, or its `/metrics`
+  or `/slots` page off, than CapyCTL started it with; or a TensorFold native
+  engine's `/health` reported a `max_batch_size` other than the
+  `--parallel` CapyCTL rendered. CapyCTL stops it. Report it: the build
+  behaves differently from llama.cpp v0.6.0 or TensorFold 1.0.0.
+- `tensorfold_listener_exposed` (TensorFold native): once the engine passed
+  its check, or when CapyCTL checked it again later, its process listened on
+  an address other than `127.0.0.1` or `::1`; the message names the address
+  and port. CapyCTL stops the engine and the start fails. Report it: CapyCTL
+  renders the engine's only listener, so this release opened one CapyCTL
+  does not expect.
+- `kv_geometry_unsupported` (TensorRT-LLM): the checkpoint's `config.json`
+  describes a model whose KV cache CapyCTL cannot size for TensorRT-LLM in
+  this version (sliding or per-layer attention windows, multi-head latent
+  attention, recurrent or hybrid layers, an encoder-decoder model, or a shape
+  or dtype it cannot read); the message names what. Nothing starts. Use
+  another engine for that model.
+- `kv_cache_short` (TensorRT-LLM): once started, the KV pool TensorRT-LLM
+  built holds less than one request's window (`context_length`); the message
+  names both figures. On a GB10 the engine sizes its pool from what the
+  machine has free at start, so other programs can make it smaller than the
+  grant. CapyCTL stops it; free memory, or lower `context_length`, and start
+  it again.
+- `effective_args_mismatch` (TensorRT-LLM): once started, TensorRT-LLM listed
+  another served name than CapyCTL gave it, or built a KV pool larger than
+  CapyCTL's `max_tokens` by more than one block. CapyCTL stops it. Report it:
+  the build behaves differently from the version CapyCTL renders for.
+- `installation_drift` (TensorRT-LLM): `/version` reported another version
+  than the one the engine profile registered. CapyCTL stops it; register the
+  installation again with `capyctl engine add`.
+- `engine_process_escaped` (TensorRT-LLM): once the engine was ready, or when
+  CapyCTL checked it again later, one of its descendant processes ran in
+  another process group than the engine's (as an MPI daemon that detaches
+  would); the message names the process. CapyCTL stops it and waits until
+  both the group and that process are gone, then fails the start.
+- `installation_unsupported:editable` (SGLang): the engine's SGLang is installed
+  in editable mode, which CapyCTL cannot load (the row for exit 17 above).
+  Standalone refuses the start before anything runs, whatever the profile's
+  `installation_drift` says; this also covers `--sglang-bin` and `local_engine`.
+  An enrolled host refuses it too when the server accepts this code (0.2.0);
+  toward a 0.1.x server it starts the engine, which fails `engine_import_failed`,
+  and keeps the control session up. Reinstall SGLang without `-e`.
 - `engine_import_failed` (SGLang): the engine exited before readiness because
   CapyCTL's interpreter could not import SGLang from the environment's
-  `site-packages`: an editable install (`pip install -e`, as in the
-  `lmsysorg/sglang` image) on a GPU machine of several, or a module SGLang
-  imports that is missing or broken. The last line of the engine log is
-  `sglang_startup_failed: engine_import_failed` with what to check; CapyCTL
-  prints no more of the error, since it can quote paths. Reinstall an
-  editable SGLang without `-e`; otherwise check that the environment's
+  `site-packages`: an editable install on an enrolled host toward a 0.1.x
+  server, or a module SGLang imports that is missing or broken. The last line
+  of the engine log is `sglang_startup_failed: engine_import_failed` with what
+  to check; CapyCTL prints no more of the error, since it can quote paths.
+  Reinstall an editable SGLang without `-e`; otherwise check that the environment's
   `bin/python3 -c "import sglang.srt.entrypoints.http_server"` succeeds,
   repair what it names, and start again.
-- `effective_args_mismatch` (llama.cpp): once started, llama-server reported a
-  different slot count or window, or its `/metrics` or `/slots` page off, than
-  CapyCTL started it with. CapyCTL stops it. Report it: the build behaves
-  differently from llama.cpp v0.6.0.
 - `custom_listener_exposed` (custom engine): once the engine passed its
   check, one of its processes listened on an address other than `127.0.0.1`
   or `::1`; the message names the address and port. CapyCTL stops the engine
   and the start fails. Make the manifest's `args` bind the engine to
   `"{host}"` ([The listener check](engines.md#the-listener-check)).
-- `engine_listener_exposed` (a model on several GPUs): once the engine was
-  ready, or when CapyCTL checked it again later, one of its processes
-  listened on an address other than `127.0.0.1` or `::1`; the message names
-  the process, the address and the port. CapyCTL stops the engine and the
-  start fails. Report it: the engine build opened a listener CapyCTL does not
-  expect.
+- `engine_listener_exposed` (TensorRT-LLM on every launch, and a model on
+  several GPUs): once the engine was ready, or when CapyCTL checked it again
+  later, one of its processes listened on an address other than `127.0.0.1`
+  or `::1`; the message names the process, the address and the port. CapyCTL
+  stops the engine and the start fails. Report it: the engine build opened a
+  listener CapyCTL does not expect.
 - `tp_rank_unobserved` (a model on several GPUs): the engine did not show one
   process of its own on each of its GPUs within the start window
   (`timeouts.initialize`). The start fails and nothing is served half-started.
@@ -176,16 +219,20 @@ The inference endpoint answers HTTP errors with a JSON body holding `code` and
   example llama.cpp refusing an input longer than its batch; the message is
   the engine's and `retryable` is `false`. On a stream it arrives as an error
   event. The request is not sent to another instance, and it counts against
-  the model's 32 running requests until the engine reports it is idle.
+  the model's configured running-request bound until the engine reports it is idle.
 - `engine_error` (500) with the message `backend completion unverified`:
   CapyCTL could not tell what the engine did with the request (the connection
   failed, or the answer was cut short or unreadable). The request stays
   counted until CapyCTL has evidence that it ended, so many of these in a row
   can fill the model's running requests (`429 queue_full`). Requests cut
   before the engine answered them fill those places the same way until the
-  engine's next stop; when they alone fill all 32, CapyCTL restarts the
+  engine's next stop; when they alone fill the configured bound, CapyCTL restarts the
   instance instead ([When a request is cut short](requests.md#when-a-request-is-cut-short)),
-  but not while an unverified request is among them. On a stream that had
+  but not while an unverified request is among them.
+  An embedding answer that fails CapyCTL's checks after part of it was sent
+  does not end with this error: you get HTTP 200 and an incomplete JSON body
+  that no JSON parser accepts ([The answer arrives as it is made](requests.md#the-answer-arrives-as-it-is-made)).
+  On a stream that had
   sent no output yet, this arrives as an error event with the same code and
   message and `retryable` set to `false`, also when the request is cut at its
   deadline; such a stream never just ends without an event.
@@ -211,6 +258,27 @@ For decision models:
   failure included: when a request you believe valid is rejected, read the
   instance's engine log ([Example: basal decision models](engines.md#example-basal-decision-models)).
 
+For embedding models:
+
+- `api_mismatch` (400): a chat or decision model asked on
+  `POST /v1/embeddings`, or an embedding model (`api: embeddings`) asked on
+  `POST /v1/chat/completions` or `POST /v1/systemone`. Nothing was woken or
+  sent; the message names the endpoint to use, for example `model my-embedder
+  serves the embeddings API, which /v1/chat/completions does not answer; send
+  its requests to POST /v1/embeddings`
+  ([Embedding requests](requests.md#embedding-requests)).
+- `invalid_request` (400) on `POST /v1/embeddings`: the body is outside the
+  embedding request's fields or shapes. The message is
+  ``embeddings request field `<name>` is not accepted`` for a field such as
+  `stream` or `cache_salt`, or `malformed embeddings request: <what>` for a
+  bad shape (an empty input, more than 2048 inputs, mixed or out-of-range
+  token IDs, an `encoding_format` other than `float` or `base64`). On
+  llama.cpp, `dimensions must be <N>: llama.cpp returns full vectors of the
+  model's native dimension` refuses a `dimensions` other than the model's own.
+- `engine_rejected` (400, 413 or 422): the engine refused the request, for
+  example an input longer than the model takes or a `dimensions` the model
+  does not support; the message is the engine's.
+
 ## LMCache
 
 `capyctl status deployment <name>` shows `LMCache   off: <why>` for an
@@ -221,11 +289,16 @@ default) then runs as without LMCache; one with `lmcache: required` is refused
 or its launch fails with `lmcache_unavailable:<reason>` (exit 5). The reasons:
 
 - `disabled`: the deployment states `lmcache: off`.
+- `host_kv_room`: the deployment's automatic pool found less than 1 GiB of
+  host-KV room left on the machine (the pools of the models already running
+  hold the rest of its `host_kv_limit`); the model runs without LMCache.
+  Raise `host_kv_limit`, or stop another model, and start it again.
 - `host_off`: the machine sets `lmcache: off`. Use another machine, or set it
   back to `auto` there.
 - `retention_zero`: the deployment or the machine sets `retention: zero`
   (`retention_zero:lmcache` under `required`).
-- `host_capability_missing`: the machine runs a CapyCTL too old for LMCache
+- `host_capability_missing`: the machine runs a CapyCTL too old for LMCache,
+  or, for a parking deployment, too old for engine-driven transfer
   (`host_capability_missing:lmcache` under `required`). Upgrade it.
 - `engine_unsupported`: llama.cpp, TensorFold or a custom engine, which have
   no LMCache integration. Use vLLM or SGLang. On SGLang, also a decision
@@ -246,12 +319,13 @@ or its launch fails with `lmcache_unavailable:<reason>` (exit 5). The reasons:
   environment and register the engine again.
 - `group_unsupported`: the deployment has a `topology` across machines; a
   group does not use LMCache.
-- `multi_gpu_unqualified`: the model runs on several GPUs of one machine;
-  LMCache is not yet qualified there. Under `topology: auto`, `lmcache:
-  required` keeps the model on one GPU instead.
+- `multi_gpu_unqualified`: the model runs on several GPUs of one machine
+  under `lmcache: auto`; LMCache is not yet certified there. With `lmcache:
+  required` it runs uncertified instead.
 - `park_unqualified`: the deployment parks with `residency: deep` (or
-  `host_backed` on a discrete GPU) on an engine version, model and GPU not
-  qualified for LMCache. Use `residency: restart_only` to keep LMCache.
+  `host_backed` on a discrete GPU) under `lmcache: auto` on an engine
+  version, model type and GPU outside the certified table. It keeps parking
+  without LMCache; with `lmcache: required` it runs LMCache uncertified.
 - `kv_transfer_config_set`: the deployment passes its own
   `--kv-transfer-config`; the engine takes one connector. Remove it to use
   LMCache.
@@ -263,28 +337,119 @@ or its launch fails with `lmcache_unavailable:<reason>` (exit 5). The reasons:
   started it once more without LMCache, and later launches of the same
   revision on the same engine skip LMCache. The detail holds the end of the
   engine log.
+- `embeddings_unsupported`: the deployment serves embeddings (`api:
+  embeddings`), which never run LMCache. Set `lmcache: auto` or leave it out.
 
 The event `lmcache_server_exited` records that an instance's LMCache server
 exited while its engine served. The instance fails, CapyCTL stops its engine
 and recovers it with a new server, whose cache starts empty.
 
-LMCache settings a deployment or a machine cannot state are refused
-`invalid_config` (exit 2): an `lmcache_pool` that is not a whole number of GiB
-of at least 1 GiB or that sits beside `lmcache: off`; an LMCache
-`--kv-transfer-config`, `--enable-lmcache` or `--lmcache-*` in `extra_args`
-(CapyCTL renders these itself); on a machine, `retention: zero` with
-`engine_logs: files`, or an `lmcache` other than `auto` or `off`.
+The event `lmcache_pool_short` records, once per launch, an automatic pool
+that keeps fewer tokens than one full context of the model after LMCache's
+eviction, or that was shrunk to the host-KV room left; its detail is the
+warning `deploy` and status show, for example "the LMCache pool (12 GiB)
+keeps about 55,900 tokens after eviction; one full context of 65,536 tokens
+needs 15 GiB: raise host_kv_limit or set lmcache_pool". The model runs.
 
-A model whose `lmcache_pool` does not fit the machine's host-KV limit, with
-the pools of the models already running there, is not started: the start
-exits 4 (`insufficient_resources`) and the message says `host_kv`, what the
-model needs, what other models already hold there, the limit and the setting
-to raise, for example
+The event `lmcache_uncertified` records, once per launch, a deployment with
+`lmcache: required` that runs LMCache outside the certified table, or on
+several GPUs of one machine. It is a custom setup no live run has
+certified, not an error; status shows "LMCache on (uncertified: ...)" with
+a failure recorded for that combination, if any.
+
+LMCache settings a deployment or a machine cannot state are refused
+`invalid_config` (exit 2): an `lmcache_pool` that is neither `auto` nor a
+whole number of GiB of at least 1 GiB, or a stated size beside
+`lmcache: off`; an LMCache `--kv-transfer-config`, `--enable-lmcache` or
+`--lmcache-*` in `extra_args` (CapyCTL renders these itself); on a machine,
+`retention: zero` with `engine_logs: files`, or an `lmcache` other than
+`auto` or `off`.
+
+A model with a stated `lmcache_pool` that does not fit the machine's host-KV
+limit, with the pools of the models already running there, is not started:
+the start exits 4 (`insufficient_resources`) and the message says `host_kv`,
+what the model needs, what other models already hold there, the limit and the
+setting to raise, for example
 `host_kv (needs 20.0 GiB, limit 12.2 GiB; raise host.resource_policy.memory.system.host_kv_limit or lower lmcache_pool)`.
 On a machine of several it names that machine's
 `resource_policy.domains.<domain>.host_kv_limit` instead. A second copy of a
 model (`instances`) that waits for that room shows the same words in its
-`LAST ERROR`.
+`LAST ERROR`. An automatic pool (`lmcache_pool: auto`, the default) is never
+refused this way: it shrinks to the room left, or the model runs without
+LMCache (`host_kv_room`).
+
+## Embedding models
+
+A deployment with `api: embeddings` ([Embedding models](deploy.md#embedding-models))
+is refused when it asks for something an embedding model cannot do in this
+release. The message is the one shown here:
+
+- On TensorFold or TensorRT-LLM, exit 5, `capability_missing:embeddings`:
+  "<engine> has no embeddings route to forward to; serve embedding models
+  on vLLM, SGLang, llama.cpp or a custom engine".
+- With `residency: deep` on llama.cpp or a custom engine, exit 5,
+  `capability_missing:deep_park`: "an embeddings deployment on <engine> does
+  not park in this version, so residency `deep` is refused; declare
+  `restart_only` or leave it out".
+- With a `topology`, `invalid_config` (exit 2): "an embeddings deployment runs
+  on one GPU of one machine in this version; remove `topology`".
+- With `residency: host_backed`, `invalid_config` (exit 2): "an embeddings
+  deployment parks `deep` or restarts in this version, so residency
+  `host_backed` is refused; declare `deep` or `restart_only`, or leave it
+  out".
+- With `--pooling none` in a llama.cpp deployment's `extra_args`,
+  `invalid_config` (exit 2): "option `--pooling` is `none`, and llama.cpp
+  serves no embeddings without pooling; pick another pooling or leave it out
+  (the model's own is used)"
+  ([Embedding models on each engine](engines.md#embedding-models)).
+
+## Tracing
+
+`capyctl status deployment <name>` shows `engine tracing: off (<reason>)` for
+an instance whose engine runs without its own spans (`engine_tracing` with
+`state: off` and `reason` in JSON). It is a status, not an error: the model
+serves, and CapyCTL's own spans are recorded as usual. The reasons
+([Engine tracing](engines.md#engine-tracing)):
+
+- `host_off`: the machine's `observability.tracing.engines` is `off` (the
+  default) or it names no endpoint.
+- `engine_unsupported`: llama.cpp, TensorFold, a custom engine, vLLM before
+  0.31.0 or SGLang before 0.5.22.
+- `group`: the model runs across machines.
+- `retention_zero`: the deployment or the machine sets `retention: zero`.
+- `not_installed`: the engine's environment lacks the OpenTelemetry packages a
+  traced engine imports. Install them there (for SGLang, its `tracing` extra).
+
+An engine tracing option in `extra_args` or a profile's arguments is refused
+with ``reserved option `<option>` is rendered by capyctl and cannot be
+passed``, whatever the host approves: vLLM `--otlp-traces-endpoint` and
+`--collect-detailed-traces`, SGLang `--enable-trace`,
+`--otlp-traces-endpoint`, `--otlp-service-name` and `--trace-modules`, in
+every spelling. A deployment that relied on an approved
+`--otlp-traces-endpoint` before this release is refused the same way: remove
+it and set `observability.tracing.engines: on` on the host.
+
+These tracing settings refuse the role's start, with a message naming the
+field ([Tracing](../operations/configuration.md#tracing)):
+
+- a field `observability.tracing` does not take (a standalone
+  `host.observability.tracing` takes only `engines`);
+- an `endpoint` that is not an `http://` or `https://` URL naming a host, or
+  one with a user or password in it;
+- a relative `headers_file`, or one without an `endpoint`;
+- a `headers_file` that cannot be opened, is a symbolic link or not a regular
+  file, is owned by another user, has group or other permissions, is larger
+  than 64 KiB, or has a line that is not `Name: value` (the message gives the
+  line number, never its text);
+- a `sample_ratio` that is not a number from 0.0 to 1.0;
+- a `caller_context` other than `parent`, `link` or `ignore`;
+- an `engines` other than `off` or `on`, or `engines: on` without an endpoint
+  on loopback (`localhost`, `127.0.0.0/8` or `::1`).
+
+`tracing: on → <endpoint>, spans dropped <n>, last export error: <error>`
+in `capyctl status deployment <name>` means the collector could not take everything. Requests
+are not affected. Check that the collector runs and that the endpoint and
+`headers_file` are right; the role log has a notice at most once a minute.
 
 ## Troubleshooting
 

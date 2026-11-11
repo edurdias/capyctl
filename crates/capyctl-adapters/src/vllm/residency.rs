@@ -15,7 +15,7 @@
 //! | `ReloadWeights`   | `POST /collective_rpc {"method":"reload_weights"}` | `WeightsUsable`     |
 //! | `InvalidateCache` | `POST /wake_up?tags=kv_cache`, `POST /reset_prefix_cache`, `/is_sleeping` false | `CacheValid` |
 //!
-//! | `Probe`           | one authenticated chat completion answered; the fixed decision (ADR 0030 §3) for a decisions deployment | `ModelUsable` |
+//! | `Probe`           | one authenticated chat completion answered; the fixed decision (ADR 0030 §3) for a decisions deployment, the fixed embedding (ADR 0036 §5) for an embeddings deployment | `ModelUsable` |
 //!
 //! None of the first four is model readiness: the caller proves a usable model
 //! with the fresh `Probe` after the last step (SPEC §6.1). Waking allocations
@@ -228,6 +228,21 @@ async fn step(
                 .map_err(|e| {
                     RuntimeError::Uncertain(crate::vllm::args::redact_text(&format!(
                         "vLLM did not answer the decision probe after waking: {e}"
+                    )))
+                })?;
+            } else if adapter.embeddings() {
+                // ADR 0036 §5, §7.2: an embeddings launch is usable after a
+                // wake only on the fixed embedding, never a chat answer.
+                let left = c.deadline_ms.saturating_sub(now_ms()?).max(0);
+                crate::traits::ChatForward::embedding_probe(
+                    adapter,
+                    adapter.served_model(),
+                    std::time::Duration::from_millis(left as u64),
+                )
+                .await
+                .map_err(|e| {
+                    RuntimeError::Uncertain(crate::vllm::args::redact_text(&format!(
+                        "vLLM did not answer the embedding probe after waking: {e}"
                     )))
                 })?;
             } else {

@@ -15,6 +15,16 @@ ADR 0029 (2026-10-09, not yet implemented): a llama.cpp installation is a bare
 `llama-server` binary; detection finds the file and executes nothing, the version
 check reads its standard error, and the fingerprint covers the shared libraries beside
 it.
+ADR 0038 (2026-10-28): a sixth installation kind, TensorRT-LLM (`tensorrt-llm`).
+Detection reads `tensorrt_llm-*.dist-info` with §1's roots and bounds and executes
+nothing; the entry point is `<env>/bin/trtllm-serve`. The bounded version check runs
+the environment's interpreter in isolated mode on `importlib.metadata` and never
+imports `tensorrt_llm` or runs `trtllm-serve` (an import initializes MPI and CUDA); the
+same query records the versions of `torch`, `tensorrt`, `flashinfer-python`,
+`transformers` and `mpi4py` as the profile's `companions`. The fingerprint covers the
+import packages `tensorrt_llm/` and `triton_kernels/`, compiled libraries included,
+excluding bytecode. A verified-set entry names the version and its `torch` build; the
+set is empty until the TR rows pass.
 
 ## Context
 
@@ -27,6 +37,11 @@ where their engine environment lives.
 ## Decision
 
 ### 1. Commands
+
+*Amended by [ADR 0039](0039-tensorfold-1.md) §2:* a third installation form joins the
+Python environment and the bare llama.cpp binary: a TensorFold native release root holding
+`bin/tensorfold-native`, its `VERSION` and `SHA256SUMS`, registered with `engine add` by
+its version line and capabilities document.
 
 `mllm engine detect [--path DIR]...`, `mllm engine add [PATH] [--name NAME] [--deep-park
 enabled|disabled] [--drift warn|refuse] [--arg ARG]...`, `mllm engine list`, `mllm engine

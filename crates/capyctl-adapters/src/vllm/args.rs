@@ -126,6 +126,13 @@ pub struct PlanInputVllm {
     /// ADR 0033: the launch's LMCache server and its report; `None` for a
     /// launch that never uses LMCache.
     pub lmcache: Option<std::sync::Arc<crate::lmcache::LmcacheState>>,
+    /// ADR 0036 §2: the API the deployment serves. An embeddings deployment
+    /// renders `--runner pooling` in the reserved block; every other renders
+    /// nothing, and vLLM's own `auto` applies.
+    pub api: capyctl_config::effective::DeploymentApi,
+    /// ADR 0037 §7: the launch's engine tracing, decided when it launched;
+    /// `None` renders nothing at all (no option, no variable).
+    pub engine_tracing: Option<crate::engine_tracing::VllmTrace>,
 }
 
 /// SPEC §13.3: the engine key is never formatted.
@@ -170,30 +177,21 @@ impl std::fmt::Debug for PlanInputVllm {
             .field("group", &self.group)
             .field("kv_transfer_config", &self.kv_transfer_config)
             .field("lmcache", &self.lmcache)
+            .field("api", &self.api)
+            .field("engine_tracing", &self.engine_tracing)
             .finish()
     }
 }
 
-/// ADR 0019 §3: the floor of a vLLM request derived for a card, and of the
-/// utilization rendered from it: vLLM 0.29 with CUDA graphs did not start a
-/// 4B model on a 16 GB card below `--gpu-memory-utilization 0.75` (observed
-/// on the discrete-GPU laptop host, 2026-09-25; the cause was not recorded).
-/// CapyCTL passes the KV cache as explicit bytes on every launch, so the floor
-/// does not size the KV pool; it guards that start failure. #225: a request
-/// the deployment declares is rendered as it is, without this floor.
-pub const DEVICE_UTILIZATION_FLOOR_PCT: u8 = 75;
-
 /// Discrete GPU design §6 (ADR 0019): round the request's share upward to
 /// ten-billionths of the card. Even an i64-sized card adds less than 1.25 GiB
 /// from rounding, keeping the gate inside the first-start device allowance.
-/// Derived requests retain their percent floor; vLLM refuses a whole card.
-pub fn device_utilization_units(request: i64, device_total: i64, floor_pct: u8) -> u64 {
+/// Derived and declared requests use the same share (ADR 0019 §§3–4, #225);
+/// vLLM accepts at least 0.01 and refuses a whole card.
+pub fn device_utilization_units(request: i64, device_total: i64) -> u64 {
     let total = i128::from(device_total.max(1));
     let share = (i128::from(request.max(0)) * 10_000_000_000 + total - 1) / total;
-    share.clamp(
-        i128::from(floor_pct.clamp(1, 99)) * 100_000_000,
-        9_900_000_000,
-    ) as u64
+    share.clamp(100_000_000, 9_900_000_000) as u64
 }
 
 #[derive(Debug, Clone, Default)]
@@ -352,6 +350,14 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
     // any argument that resolves either destination differently.
     argv.push("--no-enable-log-requests".into());
     argv.push("--no-enable-log-outputs".into());
+    // ADR 0036 §2: an embeddings deployment runs vLLM's pooling runner.
+    // vLLM picks the conversion itself (`--convert auto`), turning a
+    // generative architecture into an embedding model. Both are reserved for
+    // every deployment (`runtime/vllm_entry.py`), so nothing after the marker
+    // changes them.
+    if input.api == capyctl_config::effective::DeploymentApi::Embeddings {
+        push(&mut argv, "--runner", "pooling".into());
+    }
     // The five validated launch settings, rendered unconditionally except
     // the CPU-offload budget, which is omitted rather than sent as zero.
     push(
@@ -447,6 +453,12 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
         for (name, value) in crate::lmcache::NO_USAGE_TRACKING {
             env.insert(name.into(), value.into());
         }
+    }
+    // ADR 0037 §7: engine tracing, in the reserved block like the connector:
+    // CapyCTL owns `--otlp-traces-endpoint` (refused in pass-through), so
+    // nothing after the marker sets it beside this one.
+    if let Some(trace) = &input.engine_tracing {
+        trace.render(&mut argv, &mut env);
     }
     // ADR 0014 §6: everything after the marker is parsed by vLLM, and the entry
     // refuses it if any reserved field above resolves differently.

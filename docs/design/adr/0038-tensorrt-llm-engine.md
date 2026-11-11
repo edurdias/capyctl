@@ -6,8 +6,9 @@ question on 2026-10-27, and the answers are recorded below ("Owner decisions of
 toolkit are installed system-wide on host A (decision 4), the 1.3 and 1.4 pre-releases are
 qualified with their own rows in 0.2.0 (decision 7, §2a), and the engine kind is
 `tensorrt-llm` (decision 8). Target release 0.2.0 (retargeted from 0.1.9 on 2026-10-27,
-after 0.1.9 shipped with ADR 0035 only). Nothing is implemented; the SPEC, guide and
-operations texts this ADR lists change with the implementation, as for ADRs 0029 and 0033.
+after 0.1.9 shipped with ADR 0035 only). Implemented for 0.2.0 with the SPEC, guide and
+operations texts this ADR lists; the live rows TR1–TR11, TR1a–TR11a and TR1b–TR11b have not
+run, so no version is in the verified set yet.
 **Amends (with the implementation):** `SPEC.md` §1.1 (R01, supported engines), §9.4 (later
 backends), §20 (T49, live rows TR1–TR11 for 1.2.1, TR1a–TR11a for the 1.3 pre-release and
 TR1b–TR11b for the 1.4 pre-release); ADR 0018 §1 (a sixth installation kind: detection, the
@@ -23,6 +24,37 @@ shape this follows), ADR 0030 (decision models), ADR 0031 §6 and §7 (engines w
 idle signal; the loopback listener check), ADR 0032 (cancelled-request settlement), ADR
 0033 and ADR 0034 (LMCache), ADR 0035 (several GPUs on one host), ADR 0036 (embeddings),
 ADR 0037 (trace context).
+
+### Amendment of 2026-11-10: 1.4.0rc3 and pip MPI
+
+The 1.4 option audit now targets
+[`v1.4.0rc3`, `9e334fb`](https://github.com/NVIDIA/TensorRT-LLM/tree/v1.4.0rc3);
+1.2.1 remains the stable baseline and 1.3 remains a pre-release.
+`commands/serve.py` changes the default frontend count to eight. CapyCTL
+therefore owns and rechecks `--num_serve_frontends 1` on 1.3 and 1.4,
+never rendering that absent option on 1.2.1. The new
+`--openengine-metrics-host`, `--openengine-metrics-port`, and
+`serve_frontend_affinity_port_stride` are reserved. Restart-only operation,
+single-process MPI and conservative JSON-metrics accounting are unchanged.
+
+The x86_64 no-system-package recipe pins
+[`openmpi==4.1.8`](https://pypi.org/project/openmpi/4.1.8/) and
+[`mpi4py==4.1.2`](https://pypi.org/project/mpi4py/4.1.2/) inside the venv.
+Inspection of their downloaded wheels
+(no installation) found Open MPI's `libmpi.so` and `libmpi.so.40` under
+`.data/data/lib`, installed as `<venv>/lib`; `readelf -d` reports RUNPATH
+`$ORIGIN:$ORIGIN/openmpi`. mpi4py's `_mpiabi.py` explicitly searches
+`sys.exec_prefix/lib` for a venv before system libraries. This pair does
+not need an inherited loader path, so CapyCTL does not admit `LD_*`.
+This is source/ELF evidence, not live loader or GPU qualification.
+The 4.1.8 isolated-singleton mechanism must still be checked in TR1/TR1b.
+
+For rc3 use torch 2.14.0/cu132 with toolkit 13.4, not the 1.2.1
+torch 2.9.1/cu130 and toolkit 13.1 tuple. A user-prefix toolkit is possible;
+neither pip MPI nor the TRT wheel proves compatibility with an unchanged
+CUDA 13.0-capable driver. PTX/JIT and the actual GPU/model remain live
+checks. No qualification is marked passed by this amendment.
+
 
 ## Context
 
@@ -462,7 +494,10 @@ approves an environment for each on host A.
 
 - `serve` is always named, so no model path is read as a subcommand.
 - `<launch dir>` is a CapyCTL-owned directory per launch, mode 0700, under the role's
-  runtime directory. `model/<served name>` is a symbolic link to the verified checkpoint
+  private rendezvous root (`<state>/rendezvous/<incarnation>`; amended at implementation:
+  the runtime directory is walked by the runtime-integrity check, which refuses symbolic
+  links, and the rendezvous root is already private, cleaned at role start and removed on
+  a verified stop). `model/<served name>` is a symbolic link to the verified checkpoint
   directory, so the served ID TensorRT-LLM lists is the name CapyCTL routes (evidence §2).
   A served name that is not one path component (empty, `.`, `..`, containing `/` or NUL,
   or longer than 255 bytes) is refused at resolution, `served_name_unsupported` (owner

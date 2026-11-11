@@ -97,6 +97,9 @@ def _fake_parser(drop=(), nested=False, grpc_port=False):
     option("--enable-ssl-refresh", action="store_true")
     option("--config", default=None)
     option("--grpc", action="store_true")
+    # ADR 0036 §2: vLLM's pooling runner and conversion (0.29.0 to 0.32.0).
+    option("--runner", default="auto")
+    option("--convert", default="auto")
     option("--ssl-keyfile", default=None)
     option("--ssl-ciphers", default=None)
     option("--data-parallel-size", "-dp", type=int, default=1)
@@ -128,6 +131,9 @@ def _fake_parser(drop=(), nested=False, grpc_port=False):
     option("--kv-transfer-config", type=KVTransferConfig.parse, default=None)
     option("--download-dir", default=None)
     option("--chat-template", default=None)
+    # vLLM 0.29.0-0.32.0 `ObservabilityConfig` (ADR 0037 §7).
+    option("--otlp-traces-endpoint", default=None)
+    option("--collect-detailed-traces", default=None)
     return parser
 
 
@@ -148,6 +154,24 @@ def fake_parser_0320(drop=()):
     """The vLLM 0.32.0 serve parser: 0.31.0's nested logging, and
     `--grpc-port` (read from the installed build, 2026-10-21)."""
     return _fake_parser(drop, nested=True, grpc_port=True)
+
+
+def fake_parser_0330(drop=()):
+    """0.33.0 adds a watchdog dump path and a pluggable sleep backend."""
+    parser = fake_parser_0320(drop)
+    serve = next(action for action in parser._actions
+                 if isinstance(action, argparse._SubParsersAction)).choices["serve"]
+    serve.add_argument("--sleep-mode-backend", default="cumem")
+    serve.add_argument("--watchdog-config", type=json.loads, default={})
+    serve.add_argument("--watchdog-config.dump_dir", dest="watchdog_config",
+                       type=lambda value: {"dump_dir": value})
+    # utils/argparse_utils.py:121-152: EnableDisableAction aliases retain
+    # the original destination, alongside the legacy --no-* spellings.
+    serve.add_argument("--disable-per-request-metrics",
+                       dest="enable_per_request_metrics", action="store_false")
+    serve.add_argument("--enable-log-stats", dest="disable_log_stats",
+                       action="store_false")
+    return parser
 
 
 RESERVED = ["serve", "/models/qwen", "--host", "127.0.0.1", "--served-model-name", "route",
@@ -240,7 +264,9 @@ class ResolveTests(unittest.TestCase):
                      ["--revision", "main"], ["--distributed-executor-backend", "ray"],
                      ["--enable-log-requests"], ["--enable-log-req"],
                      ["--enable-log-outputs"], ["--enable-log-o"],
-                     ["--uvicorn-log-level", "debug"]):
+                     ["--uvicorn-log-level", "debug"],
+                     # T47 (ADR 0036 §2): no deployment picks the runner.
+                     ["--runner", "pooling"], ["--convert", "embed"]):
             with self.subTest(user=user):
                 self.refused(user)
 
@@ -414,6 +440,40 @@ class ExtraArgumentTests(unittest.TestCase):
                     resolve(extra, reserved=reserved)
                 self.assertEqual(caught.exception.code, "sensitive_option_refused")
 
+    # T48 T21 (ADR 0037 §7, owner decision 2026-10-27 q7): CapyCTL's
+    # `--otlp-traces-endpoint` in the reserved block launches; host-fixed or
+    # extra arguments naming either tracing destination are refused whatever
+    # the host approves, with or without CapyCTL's rendering.
+    def test_tracing_destinations_are_owned(self):
+        from runtime import extra_args_policy as policy
+        endpoint = "http://127.0.0.1:4318/v1/traces"
+        rendered = ["--otlp-traces-endpoint", endpoint]
+
+        def resolve(extra=(), reserved=rendered, fixed=(), approvals=None):
+            vector = RESERVED + reserved + [entry.MARKER, *fixed, entry.EXTRA_MARKER, *extra]
+            with mock.patch("sys.stderr", io.StringIO()):
+                return entry.resolve(vector, fake_parser(), approvals)
+
+        self.assertEqual(resolve().otlp_traces_endpoint, endpoint)
+        self.assertIsNone(resolve(reserved=[]).otlp_traces_endpoint)
+        self.assertIn("otlp_traces_endpoint",
+                      entry.reserved_destinations({"otlp_traces_endpoint"}, False))
+        approved = policy.parse_approvals(json.dumps({
+            "options": ["--otlp-traces-endpoint", "--collect-detailed-traces"],
+            "paths": [], "trust_remote_code": False}))
+        for reserved in (rendered, []):
+            for tokens in (["--otlp-traces-endpoint", "http://collector:4317"],
+                           ["--otlp-traces-endpoint=http://collector:4317"],
+                           ["--otlp-traces", "http://collector:4317"],
+                           ["--collect-detailed-traces", "all"]):
+                for place in ("extra", "fixed"):
+                    kwargs = {place: tokens, "reserved": reserved, "approvals": approved}
+                    with self.subTest(reserved=bool(reserved), tokens=tokens, place=place):
+                        with self.assertRaises(entry.LaunchError) as caught:
+                            resolve(**kwargs)
+                        self.assertEqual(caught.exception.code, "effective_args_mismatch")
+                        self.assertNotIn("collector", str(caught.exception))
+
     # T14 T21: a typed field cannot be restated or reversed by an extra.
     def test_extras_cannot_change_typed_fields(self):
         # ADR 0014 §4 (amended 2026-10-07): the loader is typed, sleep or not.
@@ -485,6 +545,29 @@ class VersionSkewTests(unittest.TestCase):
             with self.subTest(user=user):
                 self.refused(user, fake_parser_0320())
         self.resolve(parser=fake_parser_0310())
+
+    # T14 T21 / SPEC §8.2: new code-loading and disk-writing surfaces are
+    # owned even in host-fixed arguments; old builds need neither destination.
+    def test_the_0330_parser_keeps_the_builtin_sleep_backend_and_no_dump(self):
+        args = self.resolve(parser=fake_parser_0330())
+        self.assertEqual(args.sleep_mode_backend, "cumem")
+        self.assertEqual(args.watchdog_config, {})
+        for user in (["--sleep-mode-backend", "checkpoint"],
+                     ["--sleep-mode-backend=checkpoint"],
+                     ["--sleep-mode-b", "checkpoint"],
+                     ["--watchdog-config", '{"dump_dir":"/tmp/dumps"}'],
+                     ["--watchdog-config.dump_dir", "/tmp/dumps"]):
+            with self.subTest(user=user):
+                self.refused(user, fake_parser_0330())
+                self.refused([entry.EXTRA_MARKER, *user], fake_parser_0330())
+        self.resolve(parser=fake_parser_0320())
+
+    # T14 T21: inverse boolean aliases cannot disable required telemetry.
+    def test_the_0330_boolean_aliases_cannot_reverse_owned_destinations(self):
+        self.refused(["--disable-per-request-metrics"], fake_parser_0330())
+        self.refused(["--disable-per-request"], fake_parser_0330())
+        self.refused(["--enable-log-stats"], fake_parser_0330(),
+                     rendered=["--disable-log-stats"])
 
     # T21 / SPEC §13.3 (amended 2026-10-08; owner decision 2026-10-20): the
     # rendered block turns request and output logging off on every supported

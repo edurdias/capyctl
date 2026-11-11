@@ -24,11 +24,11 @@ class SyntheticArgs(SimpleNamespace):
     __struct_fields__ = ()  # replaced per class below
 
     def resolve_once(self):
-        disabled = getattr(self, "disable_decode_cuda_graph", False)
-        backend = "disabled" if disabled else "full"
-        self.cuda_graph_config = SimpleNamespace(
-            prefill=SimpleNamespace(backend=backend),
-            decode=SimpleNamespace(backend=backend))
+        self.cuda_graph_config = SimpleNamespace(**{
+            phase: SimpleNamespace(
+                backend="disabled" if getattr(self, "disable_" + phase + "_cuda_graph", False)
+                else "full")
+            for phase in ("prefill", "decode")})
 
     def resolved_dict(self):
         result = vars(self).copy()
@@ -73,6 +73,16 @@ class SyntheticArgs(SimpleNamespace):
         parser.add_argument("--export-metrics-to-file", action="store_true")
         parser.add_argument("--export-metrics-to-file-dir", default=None)
         parser.add_argument("--spec-trace-dir", default=None)
+        # ADR 0036 §2: the embedding-server switch.
+        parser.add_argument("--is-embedding", action="store_true")
+        # ADR 0037 §7: tracing (0.5.22 arg_groups/fields/observability.py).
+        parser.add_argument("--enable-trace", action="store_true")
+        parser.add_argument("--otlp-traces-endpoint", default="localhost:4317")
+        parser.add_argument("--otlp-service-name", default="sglang")
+        parser.add_argument("--trace-modules", default="request")
+        parser.add_argument("--enable-unified-cache-external-linker", action="store_true")
+        parser.add_argument("--unified-cache-external-linker-backend", default="mooncake")
+        parser.add_argument("--unified-cache-external-linker-config", default=None)
 
 
 SyntheticArgs.__struct_fields__ = (
@@ -84,7 +94,8 @@ SyntheticArgs.__struct_fields__ = (
     "max_mamba_cache_size", "mamba_full_memory_ratio", "speculative_draft_model_path",
     "watermark_config", "debug_tensor_dump_output_folder", "debug_tensor_dump_layers",
     "msprobe_dump_config", "export_metrics_to_file", "export_metrics_to_file_dir",
-    "spec_trace_dir")
+    "spec_trace_dir", "enable_trace", "otlp_traces_endpoint", "otlp_service_name",
+    "trace_modules")
 
 
 def synthetic_constructor(**kwargs):
@@ -181,6 +192,38 @@ class MappingTests(LaunchFixture, unittest.TestCase):
                       "cuda_graph_backend_prefill", "cuda_graph_backend_decode"):
             self.assertNotIn(graph, kwargs)
 
+    # T14 T22 / ADR 0014 §2 / SPEC §8.1 / #236: each disabled phase maps to
+    # its 0.5.22 CLI-equivalent keyword; enabled phases retain native defaults.
+    def test_cuda_graph_phases_render_independently(self):
+        for prefill in (False, True):
+            for decode in (False, True):
+                policy = dict(prefill=prefill, decode=decode)
+                with self.subTest(policy=policy):
+                    kwargs = self.seen(self.spec_with(cuda_graphs=policy))
+                    for phase, enabled in policy.items():
+                        disable = "disable_" + phase + "_cuda_graph"
+                        backend = "cuda_graph_backend_" + phase
+                        if enabled:
+                            self.assertNotIn(disable, kwargs)
+                            self.assertNotIn(backend, kwargs)
+                        else:
+                            self.assertIs(kwargs[disable], True)
+                            self.assertEqual(kwargs[backend], "disabled")
+
+    # T14 T22 / SPEC §8.1: resolved drift checks apply only to disabled phases.
+    def test_independent_disabled_phase_must_survive_resolution(self):
+        for phase in ("prefill", "decode"):
+            policy = dict(prefill=True, decode=True)
+            policy[phase] = False
+            def changed(**kwargs):
+                effective = synthetic_constructor(**kwargs)
+                effective.resolve_once()
+                effective.resolve_once = lambda: None
+                getattr(effective.cuda_graph_config, phase).backend = "full"
+                return effective
+            with self.subTest(phase=phase), self.assertRaises(mapping.ServerArgsError):
+                construct(self.spec_with(cuda_graphs=policy), self.placement(), changed)
+
     def test_residency_decides_saver_and_weight_backup(self):
         kwargs = self.seen(self.spec_with(memory_saver=True, cpu_weight_backup=True,
                                           weight_restore="cpu_backup"))
@@ -188,6 +231,30 @@ class MappingTests(LaunchFixture, unittest.TestCase):
         kwargs = self.seen(self.spec_with(memory_saver=False, cpu_weight_backup=False,
                                           weight_restore="disk_reload", cuda_graphs=None))
         self.assertIs(kwargs["enable_memory_saver"], False)
+
+    # T21: ADR 0033 §11. Parser destinations, not spelling or approval, own caches.
+    def test_external_linker_is_reserved_without_requiring_new_fields(self):
+        from runtime import extra_args_policy as policy
+        approved = policy.parse_approvals(
+            '{"options": ["--enable-unified-cache-external-linker",'
+            '"--unified-cache-external-linker-backend",'
+            '"--unified-cache-external-linker-config"], "paths": [],'
+            '"trust_remote_code": false}')
+        for extra in (["--enable-unified-cache-external-linker"],
+                      ["--enable-unified-cache-ext"],
+                      ["--unified-cache-external-linker-backend=dynamic"],
+                      ["--unified-cache-external-linker-b=dynamic"],
+                      ["--unified-cache-external-linker-config={}"],
+                      ["--unified-cache-external-linker-c={}"]):
+            with self.subTest(extra=extra):
+                with self.assertRaises(mapping.ServerArgsError) as caught:
+                    mapping.construct_server_args(self.spec_with(extra_args=extra),
+                                                  self.placement(), synthetic_constructor,
+                                                  AVAILABLE, approvals=approved)
+                self.assertEqual(caught.exception.code, "effective_args_mismatch")
+        # Old ServerArgs lacks every new struct field, yet still constructs.
+        self.public["settings"]["extra_args"] = []
+        self.seen(self.build())
 
     # T14: ADR 0024. Parsers chosen at launch reach the constructor under
     # their field names; absent, nothing is passed and the engine has none.
@@ -234,6 +301,60 @@ class MappingTests(LaunchFixture, unittest.TestCase):
                     construct(self.spec_with(max_mamba_cache_size=40, extra_args=extra),
                               self.placement(), constructor)
                 self.assertEqual(caught.exception.code, "effective_args_mismatch")
+
+    # T47 T14 (ADR 0036 §2): capyctl renders `is_embedding` only for an
+    # embeddings deployment; no extra argument may set it on any API.
+    def test_is_embedding_is_rendered_by_capyctl_only(self):
+        constructor = mock.Mock(side_effect=AssertionError("constructed"))
+        constructor.add_cli_args = SyntheticArgs.add_cli_args
+        constructor.__struct_fields__ = SyntheticArgs.__struct_fields__
+        for embedding in (False, True):
+            with self.subTest(embedding=embedding):
+                settings = {"extra_args": ["--is-embedding"]}
+                if embedding:
+                    settings["is_embedding"] = True
+                with self.assertRaises(mapping.ServerArgsError) as caught:
+                    construct(self.spec_with(**settings), self.placement(), constructor)
+                self.assertEqual(caught.exception.code, "effective_args_mismatch")
+        self.public["settings"]["extra_args"] = []
+        kwargs = self.seen(self.spec_with(is_embedding=True))
+        self.assertIs(kwargs["is_embedding"], True)
+        kwargs = self.seen(self.build_without("is_embedding"))
+        self.assertNotIn("is_embedding", kwargs)
+        # The descriptor carries the setting only as `true`.
+        with self.assertRaises(entry.LaunchError) as caught:
+            self.spec_with(is_embedding=False)
+        self.assertEqual(caught.exception.code, "invalid_descriptor")
+
+    # T43 T47 T22 / ADR 0030 §6, ADR 0036 §2: SGLang 0.5.23 resolves
+    # Clef/Clef-Flash joint heads and Kev pointer heads to embedding mode.
+    # That native prefill-only execution mode does not change the API.
+    def test_decision_head_may_resolve_to_embedding_mode(self):
+        def decision_head(**kwargs):
+            native = synthetic_constructor(**kwargs)
+            resolve = native.resolve_once
+            def resolve_decision_head():
+                resolve()
+                native.is_embedding = True
+                native.disable_radix_cache = True
+                native.chunked_prefill_size = -1
+            native.resolve_once = resolve_decision_head
+            return native
+
+        checked = construct(self.build(), self.placement(), decision_head)
+        checked.revalidate()
+        self.assertIs(checked._native.resolved_dict()["is_embedding"], True)
+
+    # T47 T22: an explicit embeddings deployment still pins its native mode.
+    def test_an_embeddings_launch_cannot_resolve_out_of_embedding_mode(self):
+        def not_embedding(**kwargs):
+            native = synthetic_constructor(**kwargs)
+            native.is_embedding = False
+            return native
+
+        with self.assertRaises(mapping.ServerArgsError) as caught:
+            construct(self.spec_with(is_embedding=True), self.placement(), not_embedding)
+        self.assertEqual(caught.exception.code, "effective_args_mismatch")
 
     # T14: ADR 0008 amendment 2026-10-08. A declared drafter's directory,
     # which capyctl materialized, reaches the constructor as the draft model
@@ -362,6 +483,61 @@ class MappingTests(LaunchFixture, unittest.TestCase):
                               unreachable)
                 self.assertEqual(caught.exception.code, "effective_args_mismatch")
 
+    # T48 T21 (ADR 0037 §7, owner decision 2026-10-27 q7): the tracing
+    # destinations are CapyCTL's, refused however spelled and whatever the
+    # host approves, before construction.
+    def test_tracing_destinations_are_refused_however_spelled(self):
+        from runtime import extra_args_policy as policy
+
+        def unreachable(**_):
+            self.fail("constructor reached")
+
+        unreachable.add_cli_args = SyntheticArgs.add_cli_args
+        unreachable.__struct_fields__ = SyntheticArgs.__struct_fields__
+        approved = policy.parse_approvals(
+            '{"options": ["--enable-trace", "--otlp-traces-endpoint", '
+            '"--otlp-service-name", "--trace-modules"], "paths": [], '
+            '"trust_remote_code": false}')
+        for extra in (["--enable-trace"], ["--enable-tr"],
+                      ["--otlp-traces-endpoint", "http://collector:4317"],
+                      ["--otlp-traces=http://collector:4317"],
+                      ["--otlp-service-name", "mine"], ["--otlp-serv=mine"],
+                      ["--trace-modules", "all"], ["--trace-mod=all"]):
+            with self.subTest(extra=extra):
+                with self.assertRaises(mapping.ServerArgsError) as caught:
+                    mapping.construct_server_args(
+                        self.spec_with(extra_args=extra), self.placement(), unreachable,
+                        AVAILABLE, approved)
+                self.assertEqual(caught.exception.code, "effective_args_mismatch")
+                self.assertNotIn("collector", str(caught.exception))
+
+    # T48 (ADR 0037 §7): a traced launch's descriptor names the endpoint, and
+    # tracing is rendered and pinned as reserved values; without it nothing
+    # is rendered. A resolution changing any pinned value is a mismatch.
+    def test_a_trace_endpoint_turns_tracing_on_as_reserved_values(self):
+        endpoint = "http://127.0.0.1:4318/v1/traces"
+        kwargs = self.seen(self.spec_with(trace_endpoint=endpoint))
+        self.assertIs(kwargs["enable_trace"], True)
+        self.assertEqual(kwargs["otlp_traces_endpoint"], endpoint)
+        self.assertEqual(kwargs["otlp_service_name"], "sglang")
+        self.assertNotIn("trace_modules", kwargs)
+        kwargs = self.seen(self.build_without("trace_endpoint"))
+        for name in ("enable_trace", "otlp_traces_endpoint", "otlp_service_name"):
+            self.assertNotIn(name, kwargs)
+        for key, replacement in (("enable_trace", False),
+                                 ("otlp_traces_endpoint", "http://elsewhere:4318"),
+                                 ("otlp_service_name", "other")):
+            def changed(**kwargs):
+                effective = synthetic_constructor(**kwargs)
+                effective.resolve_once()
+                effective.resolve_once = lambda: None
+                setattr(effective, key, replacement)
+                return effective
+            changed.add_cli_args = SyntheticArgs.add_cli_args
+            with self.subTest(key=key), self.assertRaises(mapping.ServerArgsError) as caught:
+                construct(self.spec_with(trace_endpoint=endpoint), self.placement(), changed)
+            self.assertEqual(caught.exception.code, "effective_args_mismatch")
+
     # T21 T22: ADR 0014 §8, SPEC §8.2. A sensitive destination is refused on
     # what the installed parser resolved, so an abbreviation the deploy-time
     # spelling check could not know is still caught, before construction.
@@ -406,6 +582,11 @@ class MappingTests(LaunchFixture, unittest.TestCase):
                                       AVAILABLE, approvals=approved).revalidate()
 
     def test_malformed_or_unknown_extra_arguments_are_closed_failures(self):
+        # SGLang 0.5.23 removed this formerly valid deployment extra.
+        with self.assertRaises(mapping.ServerArgsError) as removed:
+            construct(self.spec_with(extra_args=["--speculative-skip-dp-mlp-sync"]),
+                      self.placement(), synthetic_constructor)
+        self.assertEqual(removed.exception.code, "invalid_extra_args")
         for extra in (["--no-such-option", "1"], ["--port"], ["positional"], ["--help"],
                       ["--context-length", "not-a-number"]):
             with self.subTest(extra=extra):

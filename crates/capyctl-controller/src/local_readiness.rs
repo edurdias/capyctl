@@ -13,12 +13,17 @@
 //!   else might hold the port;
 //! - ADR 0030 §3: a decisions deployment also answers the fixed decision probe,
 //!   complete and well-formed, on the same key (it generates no text, and its
-//!   readiness is a decision, never a model list alone);
+//!   readiness is a decision, never a model list alone); ADR 0036 §5: an
+//!   embeddings deployment likewise answers the fixed embedding probe, never a
+//!   chat or decision probe;
 //! - every recorded process is still alive after the answer;
 //! - ADR 0033 §3: a launch's LMCache server is alive, answers `GET /status`
 //!   and listens on loopback only (an exposed one is stopped), and none is
 //!   re-proved while the host's settings say `lmcache: off` or
-//!   `retention: zero` (§§9, 10), so its dispatch stays closed.
+//!   `retention: zero` (§§9, 10), so its dispatch stays closed;
+//! - ADR 0038 §9: a TensorRT-LLM launch has no descendant of its engine
+//!   outside its process group and no owned listener off loopback; one that
+//!   fails either is stopped, the escaped process proven gone beside it.
 //!
 //! Only then does the store reopen dispatch, with a readiness receipt in the
 //! journal. A failed proof leaves the deployment charged, closed and owned; an
@@ -29,6 +34,7 @@
 //! dispatch closed until, after a passing proof, the engine's own metrics show
 //! nothing running or waiting; only then are they closed as abandoned.
 use crate::ownership::SharedCoordinatorState;
+use capyctl_config::effective::DeploymentApi;
 use capyctl_domain::completion::{Presence, ProcessIdentity};
 use capyctl_store::ordinary_lifecycle::local_recovery::LocalReadyLaunch;
 use capyctl_store::ordinary_lifecycle::recovery::RemoteReadinessEvidence;
@@ -44,11 +50,12 @@ use tokio::time::Instant;
 const PASS_INTERVAL: Duration = Duration::from_millis(250);
 /// The bound on one authenticated model-list probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-/// ADR 0030 §3: the bound on the fixed decision probe of an adopted
-/// decisions launch (an engine's first decision can be slow).
+/// ADR 0030 §3, ADR 0036 §5: the bound on the fixed decision or embedding
+/// probe of an adopted decisions or embeddings launch (an engine's first
+/// answer can be slow).
 const DECISION_TIMEOUT: Duration = Duration::from_secs(60);
-/// ADR 0031 §7: how long an exposed custom engine's processes get on
-/// SIGTERM before SIGKILL.
+/// ADR 0031 §7, ADR 0038 §9: how long an exposed custom engine's or an
+/// unowned TensorRT-LLM launch's processes get on SIGTERM before SIGKILL.
 const EXPOSED_GRACE: Duration = Duration::from_secs(5);
 /// The first wait after a failed proof, doubled per failure up to the cap.
 const FIRST_RETRY: Duration = Duration::from_millis(500);
@@ -87,14 +94,26 @@ struct Target {
     url: reqwest::Url,
     key: Option<String>,
     served: String,
-    /// ADR 0030 §1: the API the deployment serves.
-    decisions: bool,
+    /// ADR 0030 §1, ADR 0036 §1: the API the deployment serves, which picks
+    /// the probe that proves it: chat, the fixed decision or the fixed
+    /// embedding.
+    api: DeploymentApi,
     /// ADR 0031: a custom engine's manifest; its proof is the port, the
     /// health path, the API probe and the loopback check, never a model list.
     custom: Option<capyctl_config::custom::CustomProfile>,
+    /// ADR 0038: a TensorRT-LLM launch, with its profile's version; its
+    /// proof is `/health` and the served name listed, then the descendant
+    /// and listener checks (§9).
+    tensorrt_llm: Option<String>,
     /// ADR 0035 §5: a built-in engine's launch on several GPUs; its owned
     /// listeners are checked at every re-proof.
     several_gpus: bool,
+    /// ADR 0034 §1: the transfer mode the launch's LMCache server serves,
+    /// from the frozen revision's residency.
+    transfer: capyctl_config::lmcache::TransferMode,
+    /// ADR 0039 §14: a launch of TensorFold's native line; its owned
+    /// listeners are checked at every re-proof.
+    tensorfold_native: bool,
 }
 
 pub struct LocalReadiness {
@@ -280,11 +299,10 @@ impl LocalReadiness {
             .map_err(|error| format!("the deployment's revision is unreadable: {error}"))?
             .map(|configuration| configuration.effective)
             .unwrap_or(serde_json::Value::Null);
-        let decisions = match effective["api"].clone() {
-            serde_json::Value::Null => false,
-            api => !serde_json::from_value::<capyctl_config::effective::DeploymentApi>(api)
-                .map_err(|_| "the deployment's api is unreadable".to_owned())?
-                .is_chat(),
+        let api = match effective["api"].clone() {
+            serde_json::Value::Null => DeploymentApi::Chat,
+            api => serde_json::from_value(api)
+                .map_err(|_| "the deployment's api is unreadable".to_owned())?,
         };
         // ADR 0031: a custom engine's frozen manifest, re-validated.
         let custom = match effective["profile"]["engine"].as_str() {
@@ -294,6 +312,14 @@ impl LocalReadiness {
             ),
             _ => None,
         };
+        let tensorrt_llm = (effective["profile"]["engine"].as_str()
+            == Some(capyctl_config::engine_policy::Engine::TensorrtLlm.name()))
+        .then(|| {
+            effective["profile"]["build_fingerprint"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        });
         // ADR 0035 §5: the frozen revision's device list, rank-ordered, or
         // the rank processes the launch recorded.
         let several_gpus = custom.is_none()
@@ -304,13 +330,27 @@ impl LocalReadiness {
                     .identities
                     .iter()
                     .any(|identity| identity.rank_role().is_some()));
+        // ADR 0034 §1: the transfer mode of the residency the launch was
+        // rendered with (the re-proof reads only the server's ports and
+        // `/proc`, so an unreadable residency changes no proof).
+        let transfer = serde_json::from_value::<capyctl_config::effective::Residency>(
+            effective["residency"].clone(),
+        )
+        .map_or(
+            capyctl_config::lmcache::TransferMode::LmcacheDriven,
+            capyctl_config::lmcache::transfer_mode,
+        );
+        let tensorfold_native = tensorfold_native(&effective);
         Ok(Target {
             url,
             key,
             served,
-            decisions,
+            api,
             custom,
+            tensorrt_llm,
             several_gpus,
+            transfer,
+            tensorfold_native,
         })
     }
 
@@ -338,29 +378,77 @@ impl LocalReadiness {
         if ready != Readiness::Ready {
             return Err("the engine's port or health path is not answering".into());
         }
-        if target.decisions {
-            adapter
-                .decision_probe(&target.served, DECISION_TIMEOUT)
-                .await
-                .map_err(|error| {
-                    format!("the engine did not answer the decision probe: {error}")
-                })?;
-        } else {
-            let body = serde_json::json!({
-                "model": target.served,
-                "messages": [{"role": "user", "content": "Say ready."}],
-                "max_tokens": 8,
-                "temperature": 0,
-            });
-            let answer = tokio::time::timeout(DECISION_TIMEOUT, adapter.forward_chat(&body.into()))
-                .await
-                .map_err(|_| "the engine did not answer the chat probe in time".to_owned())?
-                .map_err(|error| format!("the engine did not answer the chat probe: {error}"))?;
-            if !capyctl_adapters::forward::probe_answered(&answer) {
-                return Err("the engine answered the chat probe with empty content".into());
+        match target.api {
+            DeploymentApi::Decisions => {
+                adapter
+                    .decision_probe(&target.served, DECISION_TIMEOUT)
+                    .await
+                    .map_err(|error| {
+                        format!("the engine did not answer the decision probe: {error}")
+                    })?;
+            }
+            // ADR 0036 §5: an embeddings engine is proved by the fixed
+            // embedding, never a chat or decision probe.
+            DeploymentApi::Embeddings => {
+                adapter
+                    .embedding_probe(&target.served, DECISION_TIMEOUT)
+                    .await
+                    .map_err(|error| {
+                        format!("the engine did not answer the embedding probe: {error}")
+                    })?;
+            }
+            DeploymentApi::Chat => {
+                let body = serde_json::json!({
+                    "model": target.served,
+                    "messages": [{"role": "user", "content": "Say ready."}],
+                    "max_tokens": 8,
+                    "temperature": 0,
+                });
+                let answer =
+                    tokio::time::timeout(DECISION_TIMEOUT, adapter.forward_chat(&body.into()))
+                        .await
+                        .map_err(|_| "the engine did not answer the chat probe in time".to_owned())?
+                        .map_err(|error| {
+                            format!("the engine did not answer the chat probe: {error}")
+                        })?;
+                if !capyctl_adapters::forward::probe_answered(&answer) {
+                    return Err("the engine answered the chat probe with empty content".into());
+                }
             }
         }
-        check_owned_listeners(launch, false).await
+        check_owned_listeners(launch, Listeners::Custom).await
+    }
+
+    /// ADR 0038 §5, §9: a TensorRT-LLM engine's proof: `/health` answers 200
+    /// and `/v1/models` lists the served name, then no descendant of the
+    /// engine runs outside the launch's process group and every owned
+    /// listener is on loopback. A launch that fails either is stopped, the
+    /// escaped processes proven gone beside the group, and the proof fails
+    /// `engine_process_escaped` or `engine_listener_exposed`.
+    async fn prove_tensorrt_llm(
+        &self,
+        launch: &LocalReadyLaunch,
+        target: &Target,
+        version: &str,
+    ) -> Result<(), String> {
+        use capyctl_adapters::traits::{EngineAdapter, MemberRef, Readiness};
+        let adapter = capyctl_adapters::tensorrt_llm::TensorrtLlmAdapter::new(
+            target.url.clone(),
+            version.to_owned(),
+            target.served.clone(),
+        );
+        let member = MemberRef {
+            deployment_id: launch.fence.deployment_id.clone(),
+            member_id: launch.binding_id.clone(),
+        };
+        let ready = tokio::time::timeout(PROBE_TIMEOUT, adapter.check_readiness(&member))
+            .await
+            .map_err(|_| "the engine's health and model list did not answer in time".to_owned())?
+            .map_err(|error| format!("the engine's readiness could not be read: {error}"))?;
+        if ready != Readiness::Ready {
+            return Err("the engine's health or model list does not name the route".into());
+        }
+        check_tensorrt_llm_ownership(launch).await
     }
 
     /// ADR 0033 §§3, 9, 10 (lifecycle design §5): re-prove the launch's
@@ -371,6 +459,7 @@ impl LocalReadiness {
         &self,
         launch: &LocalReadyLaunch,
         server: &[ProcessIdentity],
+        transfer: capyctl_config::lmcache::TransferMode,
     ) -> Result<(), String> {
         if self.lmcache_forbidden {
             return Err(
@@ -406,6 +495,7 @@ impl LocalReadiness {
             start_bound: Duration::from_millis(capyctl_config::lmcache::SERVER_START_BOUND_MS),
             proc_root: std::path::PathBuf::from("/proc"),
             required: false,
+            transfer,
         };
         let tools: Arc<dyn capyctl_adapters::traits::OwnedProcessLaunch> = Arc::new(
             capyctl_launchers::DurableProcessLaunch::new(Arc::new(ProveOnly)),
@@ -428,17 +518,22 @@ impl LocalReadiness {
         // that is gone or exposed is never re-admitted.
         let server = capyctl_domain::completion::lmcache_members(&launch.identities);
         if !server.is_empty() {
-            self.prove_lmcache(launch, &server).await?;
+            self.prove_lmcache(launch, &server, target.transfer).await?;
         }
-        match &target.custom {
-            Some(custom) => self.prove_custom(launch, &target, custom).await?,
-            None => self.prove_listed(&target).await?,
+        match (&target.custom, &target.tensorrt_llm) {
+            (Some(custom), _) => self.prove_custom(launch, &target, custom).await?,
+            (None, Some(version)) => self.prove_tensorrt_llm(launch, &target, version).await?,
+            (None, None) => self.prove_listed(&target).await?,
         }
         // ADR 0035 §5: a built-in engine's launch on several GPUs is checked
         // for listeners off loopback whenever it is re-proved; one is stopped
-        // and the proof fails `engine_listener_exposed`.
-        if target.several_gpus {
-            check_owned_listeners(launch, true).await?;
+        // and the proof fails `engine_listener_exposed`. ADR 0039 §14: so is
+        // every launch of TensorFold's native line, which fails
+        // `tensorfold_listener_exposed`.
+        if target.tensorfold_native {
+            check_owned_listeners(launch, Listeners::TensorfoldNative).await?;
+        } else if target.several_gpus {
+            check_owned_listeners(launch, Listeners::SeveralGpus).await?;
         }
         // SPEC §6.1: the answer must come from the recorded group, so the group is
         // proven alive on both sides of it.
@@ -446,37 +541,47 @@ impl LocalReadiness {
         let observed_at_ms = capyctl_protocol::now_unix_ms();
         self.settle_retired_leases(launch, &target, observed_at_ms)
             .await?;
-        let evidence =
-            RemoteReadinessEvidence {
-                binding_id: launch.binding_id.clone(),
-                incarnation: launch.incarnation.clone(),
-                identities: live,
-                observed_at_ms,
-                receipt: match &target.custom {
-                    Some(_) => format!(
+        let evidence = RemoteReadinessEvidence {
+            binding_id: launch.binding_id.clone(),
+            incarnation: launch.incarnation.clone(),
+            identities: live,
+            observed_at_ms,
+            receipt: match &target.custom {
+                Some(_) => format!(
                     "every recorded engine process alive with its recorded start ticks and boot; \
                      the custom engine's port and health answered, it answered the {} probe for \
                      {}, and every owned listener is on loopback",
-                    if target.decisions { "fixed decision" } else { "chat" },
+                    match target.api {
+                        DeploymentApi::Chat => "chat",
+                        DeploymentApi::Decisions => "fixed decision",
+                        DeploymentApi::Embeddings => "fixed embedding",
+                    },
                     target.served,
                 ),
-                    None => format!(
+                None => format!(
                     "every recorded engine process alive with its recorded start ticks and boot; \
-                     the engine answered an authenticated model list naming {}{}{}",
-                    target.served,
-                    if target.decisions {
-                        " and the fixed decision probe"
+                     the engine answered {} model list naming {}{}{}",
+                    if target.tensorrt_llm.is_some() {
+                        "its health and a"
                     } else {
-                        ""
+                        "an authenticated"
                     },
-                    if target.several_gpus {
+                    target.served,
+                    match target.api {
+                        DeploymentApi::Chat => "",
+                        DeploymentApi::Decisions => " and the fixed decision probe",
+                        DeploymentApi::Embeddings => " and the fixed embedding probe",
+                    },
+                    if target.tensorrt_llm.is_some() {
+                        "; no process outside the group and every owned listener is on loopback"
+                    } else if target.several_gpus || target.tensorfold_native {
                         "; every owned listener is on loopback"
                     } else {
                         ""
                     }
                 ),
-                },
-            };
+            },
+        };
         let owner = self
             .owner
             .lock()
@@ -493,7 +598,8 @@ impl LocalReadiness {
     }
 
     /// The known engines' proof: an authenticated model list naming the
-    /// route, and for a decisions deployment the fixed decision.
+    /// route, and for a decisions or embeddings deployment the fixed
+    /// decision or embedding.
     async fn prove_listed(&self, target: &Target) -> Result<(), String> {
         let mut request = self.client.get(
             target
@@ -526,16 +632,36 @@ impl LocalReadiness {
         }
         // ADR 0030 §3, SPEC §6.1: a decision model is usable only once it
         // answers the fixed decision; the model list alone is not readiness.
-        if target.decisions {
-            capyctl_adapters::decision_probe::probe_keyed(
-                &self.client,
-                &target.url,
-                target.key.as_deref(),
-                &target.served,
-                DECISION_TIMEOUT,
-            )
-            .await
-            .map_err(|error| format!("the engine did not answer the decision probe: {error}"))?;
+        // ADR 0036 §5: an embedding model likewise only once it answers the
+        // fixed embedding, never a chat or decision probe.
+        match target.api {
+            DeploymentApi::Chat => {}
+            DeploymentApi::Decisions => {
+                capyctl_adapters::decision_probe::probe_keyed(
+                    &self.client,
+                    &target.url,
+                    target.key.as_deref(),
+                    &target.served,
+                    DECISION_TIMEOUT,
+                )
+                .await
+                .map_err(|error| {
+                    format!("the engine did not answer the decision probe: {error}")
+                })?;
+            }
+            DeploymentApi::Embeddings => {
+                capyctl_adapters::embedding_probe::probe_keyed(
+                    &self.client,
+                    &target.url,
+                    target.key.as_deref(),
+                    &target.served,
+                    DECISION_TIMEOUT,
+                )
+                .await
+                .map_err(|error| {
+                    format!("the engine did not answer the embedding probe: {error}")
+                })?;
+            }
         }
         Ok(())
     }
@@ -571,6 +697,11 @@ impl LocalReadiness {
             )
         };
         let receipt = match &target.custom {
+            // ADR 0038 §7: TensorRT-LLM reports no idle signal (no
+            // `/metrics` entry reads 0 and 0, and an empty read is
+            // ambiguous), so the leases are never settled while the engine
+            // runs, as for a custom engine without one below.
+            None if target.tensorrt_llm.is_some() => return Ok(()),
             // ADR 0031 §6: a custom engine's only account of its work is its
             // manifest's idle signal, read now with its key. Without one the
             // leases are never settled while the engine runs: they stay
@@ -685,22 +816,62 @@ impl capyctl_launchers::LaunchAssociation for ProveOnly {
     }
 }
 
-/// ADR 0031 §7, ADR 0035 §5: the loopback check of every live owned process
-/// of an adopted launch (`built_in`: a built-in engine's launch on several
-/// GPUs, where a helper that exited during the read is left out). One that
-/// listens off loopback is stopped, with gone evidence, and the proof fails
-/// `custom_listener_exposed`, or for a built-in engine
-/// `engine_listener_exposed` naming the process role, address and port.
-async fn check_owned_listeners(launch: &LocalReadyLaunch, built_in: bool) -> Result<(), String> {
+/// Whose owned listeners are checked, which names the failure.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Listeners {
+    /// ADR 0031 §7: a custom engine, `custom_listener_exposed`.
+    Custom,
+    /// ADR 0035 §5: a built-in engine on several GPUs, where a helper that
+    /// exited during the read is left out; `engine_listener_exposed`.
+    SeveralGpus,
+    /// ADR 0039 §14: TensorFold's native line, read as a built-in launch;
+    /// `tensorfold_listener_exposed`.
+    TensorfoldNative,
+}
+
+/// ADR 0039 §14: the frozen revision is a TensorFold profile of the native
+/// line. A revision that cannot be read is not (the 0.6 line is the default).
+pub(crate) fn tensorfold_native(effective: &serde_json::Value) -> bool {
+    effective["profile"]["engine"].as_str()
+        == Some(capyctl_config::engine_policy::Engine::Tensorfold.name())
+        && effective["profile"]["line"].as_str()
+            == Some(capyctl_config::tensorfold_native::TensorfoldLine::Native.name())
+}
+
+/// ADR 0039 §14: the failure of a native TensorFold launch whose owned
+/// process listens off loopback, naming the address (as its host names it).
+pub(crate) fn tensorfold_listener_exposed(
+    listener: &capyctl_adapters::custom::OwnedListener,
+) -> String {
+    format!(
+        "{}: an owned process listens on {}, not on loopback",
+        capyctl_config::tensorfold_native::LISTENER_EXPOSED,
+        listener.address
+    )
+}
+
+/// ADR 0031 §7, ADR 0035 §5, ADR 0039 §14: the loopback check of every live
+/// owned process of an adopted launch. One that listens off loopback is
+/// stopped, with gone evidence, and the proof fails with the code of
+/// `kind`.
+async fn check_owned_listeners(launch: &LocalReadyLaunch, kind: Listeners) -> Result<(), String> {
+    check_listeners_in(std::path::Path::new("/proc"), launch, kind).await
+}
+
+async fn check_listeners_in(
+    root: &std::path::Path,
+    launch: &LocalReadyLaunch,
+    kind: Listeners,
+) -> Result<(), String> {
     use capyctl_adapters::custom::ListenerCheck;
     let live = alive(&launch.identities)?;
+    let root = root.to_path_buf();
     let checked = tokio::task::spawn_blocking(move || {
-        let root = std::path::Path::new("/proc");
         let presence = &capyctl_launchers::process_absence::presence;
-        if built_in {
-            capyctl_adapters::custom::check_engine_launch(root, &live, presence)
+        if kind == Listeners::Custom {
+            capyctl_adapters::custom::check_loopback(&root, &live, presence)
         } else {
-            capyctl_adapters::custom::check_loopback(root, &live, presence)
+            capyctl_adapters::custom::check_engine_launch(&root, &live, presence)
         }
     })
     .await
@@ -708,10 +879,12 @@ async fn check_owned_listeners(launch: &LocalReadyLaunch, built_in: bool) -> Res
     match checked {
         Ok(()) => Ok(()),
         Err(ListenerCheck::Exposed(listener)) => {
-            let exposed = if built_in {
-                capyctl_adapters::custom::engine_listener_exposed(&listener)
-            } else {
-                ListenerCheck::Exposed(listener).to_string()
+            let exposed = match kind {
+                Listeners::Custom => ListenerCheck::Exposed(listener).to_string(),
+                Listeners::SeveralGpus => {
+                    capyctl_adapters::custom::engine_listener_exposed(&listener)
+                }
+                Listeners::TensorfoldNative => tensorfold_listener_exposed(&listener),
             };
             let recorded = launch.identities.clone();
             let stopped = tokio::task::spawn_blocking(move || {
@@ -725,6 +898,62 @@ async fn check_owned_listeners(launch: &LocalReadyLaunch, built_in: bool) -> Res
             })
         }
         Err(unreadable) => Err(unreadable.to_string()),
+    }
+}
+
+/// ADR 0038 §9: the descendant and listener checks of an adopted
+/// TensorRT-LLM launch's live processes. A launch that fails either is
+/// stopped with gone evidence required for every recorded process and, for
+/// an escape, for each escaped process (a group stop cannot reach it).
+async fn check_tensorrt_llm_ownership(launch: &LocalReadyLaunch) -> Result<(), String> {
+    let live = alive(&launch.identities)?;
+    let checked = tokio::task::spawn_blocking(move || {
+        capyctl_adapters::tensorrt_llm::check_ownership(
+            std::path::Path::new("/proc"),
+            &live,
+            &capyctl_launchers::process_absence::presence,
+        )
+    })
+    .await
+    .map_err(|_| "the ownership check did not run".to_owned())?;
+    let failure = match checked {
+        Ok(()) => return Ok(()),
+        Err(failure) if failure.code().is_some() => failure,
+        Err(unreadable) => return Err(unreadable.to_string()),
+    };
+    let set = failure.stop_set(&launch.identities);
+    let stopped = tokio::task::spawn_blocking(move || {
+        capyctl_launchers::owned_launch::terminate_recorded(&set, EXPOSED_GRACE)
+            .map(drop)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .unwrap_or_else(|_| Err("the stop did not run".to_owned()));
+    Err(ownership_failure_text(&failure, stopped))
+}
+
+/// ADR 0038 §9: a failed ownership check, as the proof reports it. Only a
+/// stop that proved every process gone (the escaped ones included) names the
+/// closed failure; an unproven stop names no code, so the launch stays
+/// uncertain and its claim and reservations stay.
+fn ownership_failure_text(
+    failure: &capyctl_adapters::tensorrt_llm::OwnershipFailure,
+    stopped: Result<(), String>,
+) -> String {
+    match stopped {
+        Ok(()) => format!("{failure}; the engine was stopped"),
+        Err(error) => {
+            let text = failure.to_string();
+            let detail = match failure.code() {
+                Some(code) => text
+                    .replace(&format!("{code}: "), "")
+                    .replace(&format!("{code}:"), ""),
+                None => text,
+            };
+            format!(
+                "the engine failed its ownership check ({detail}); the stop is unproven: {error}"
+            )
+        }
     }
 }
 
@@ -866,5 +1095,332 @@ mod tests {
             .unwrap();
         assert!(joined.load(Ordering::SeqCst), "joined before returning");
         assert_eq!(supervisor.children.running(), 0);
+    }
+
+    /// What an engine double was asked: each request's path and whether it
+    /// carried the launch's key.
+    type Asked = Arc<Mutex<Vec<(String, bool)>>>;
+
+    /// An engine double on loopback that lists `served`, answers
+    /// `/v1/embeddings` with what `embedding` holds and counts every request.
+    async fn embedding_engine(
+        embedding: Arc<Mutex<serde_json::Value>>,
+    ) -> (reqwest::Url, Asked, tokio::task::JoinHandle<()>) {
+        let asked: Asked = Arc::default();
+        let recorded = asked.clone();
+        let engine = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let recorded = recorded.clone();
+            let embedding = embedding.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                let keyed = request
+                    .headers()
+                    .get("authorization")
+                    .is_some_and(|value| value == "Bearer k3y");
+                recorded.lock().unwrap().push((path.clone(), keyed));
+                let answer = match path.as_str() {
+                    "/v1/models" => serde_json::json!({"data": [{"id": "served"}]}),
+                    "/v1/embeddings" => embedding.lock().unwrap().clone(),
+                    _ => serde_json::json!({}),
+                };
+                axum::Json(answer)
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, engine).await.unwrap() });
+        let url = reqwest::Url::parse(&format!("http://{address}/")).unwrap();
+        (url, asked, task)
+    }
+
+    fn embedded(vector: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"object": "list", "model": "served",
+            "data": [{"object": "embedding", "index": 0, "embedding": vector}],
+            "usage": {"prompt_tokens": 3, "total_tokens": 3}})
+    }
+
+    fn paths(asked: &Asked) -> Vec<String> {
+        asked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
+
+    // T47 T20 (ADR 0036 §5, SPEC §6.1): an adopted embeddings launch on a
+    // known engine is re-proved by its model list and then the fixed
+    // embedding, with its key; a malformed vector or a zero one fails the
+    // proof, and it is never sent a chat or decision probe.
+    #[tokio::test]
+    async fn a_listed_embeddings_launch_is_proved_by_the_fixed_embedding() {
+        use capyctl_config::effective::DeploymentApi;
+        let (_state, supervisor) = supervisor();
+        let answer = Arc::new(Mutex::new(embedded(serde_json::json!([0.6, 0.8]))));
+        let (url, asked, task) = embedding_engine(answer.clone()).await;
+        let target = Target {
+            url,
+            key: Some("k3y".into()),
+            served: "served".into(),
+            api: DeploymentApi::Embeddings,
+            custom: None,
+            several_gpus: false,
+            tensorrt_llm: None,
+            transfer: capyctl_config::lmcache::TransferMode::LmcacheDriven,
+            tensorfold_native: false,
+        };
+        supervisor.prove_listed(&target).await.unwrap();
+        assert_eq!(paths(&asked), ["/v1/models", "/v1/embeddings"]);
+        assert!(asked.lock().unwrap().iter().all(|(_, keyed)| *keyed));
+        for broken in [
+            embedded(serde_json::json!([0.0, 0.0])),
+            embedded(serde_json::json!([])),
+            serde_json::json!({"object": "list", "data": [], "model": "served"}),
+        ] {
+            *answer.lock().unwrap() = broken.clone();
+            let error = supervisor.prove_listed(&target).await.unwrap_err();
+            assert!(error.contains("embedding probe"), "{broken}: {error}");
+        }
+        assert!(paths(&asked)
+            .iter()
+            .all(|path| path == "/v1/models" || path == "/v1/embeddings"));
+        task.abort();
+    }
+
+    // T47 T44 (ADR 0036 §§1, 5, ADR 0031 §5): an adopted custom engine whose
+    // manifest declares `api: embeddings` is re-proved by its port and the
+    // fixed embedding with its key, never a chat or decision probe, and then
+    // its owned listeners; a malformed vector fails the proof.
+    #[tokio::test]
+    async fn a_custom_embeddings_launch_is_proved_by_the_fixed_embedding() {
+        use capyctl_config::custom::{CustomManifest, CustomProfile};
+        use capyctl_config::effective::DeploymentApi;
+        let (_state, supervisor) = supervisor();
+        let answer = Arc::new(Mutex::new(embedded(serde_json::json!([0.6, 0.8]))));
+        let (url, asked, task) = embedding_engine(answer.clone()).await;
+        let custom = CustomProfile::new(
+            CustomManifest::parse(
+                "kind: custom_engine\nschema_version: 1\napi: embeddings\n\
+                 args: [--host, \"{host}\", --port, \"{port}\", --model, \"{model_dir}\"]\n\
+                 env: {SERVE_AUTH: \"{api_key}\"}\n",
+            )
+            .unwrap(),
+        );
+        let target = Target {
+            url,
+            key: Some("k3y".into()),
+            served: "served".into(),
+            api: DeploymentApi::Embeddings,
+            custom: Some(custom.clone()),
+            several_gpus: false,
+            tensorrt_llm: None,
+            transfer: capyctl_config::lmcache::TransferMode::LmcacheDriven,
+            tensorfold_native: false,
+        };
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let close = stat.rfind(')').unwrap();
+        let launch = LocalReadyLaunch {
+            fence: capyctl_store::lifecycle::DeploymentFence {
+                deployment_id: "d".into(),
+                revision: 1,
+                generation: 1,
+            },
+            instance_index: 0,
+            operation_id: "o".into(),
+            step_id: "s".into(),
+            binding_id: "b".into(),
+            incarnation: "i".into(),
+            identities: vec![ProcessIdentity {
+                role: "api".into(),
+                pid: std::process::id(),
+                boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                    .unwrap()
+                    .trim()
+                    .to_owned(),
+                start_ticks: stat[close + 2..]
+                    .split_whitespace()
+                    .nth(19)
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+            }],
+            dispatch_enabled: false,
+        };
+        supervisor
+            .prove_custom(&launch, &target, &custom)
+            .await
+            .unwrap();
+        assert_eq!(paths(&asked), ["/v1/embeddings"]);
+        assert!(asked.lock().unwrap().iter().all(|(_, keyed)| *keyed));
+        *answer.lock().unwrap() = embedded(serde_json::json!([1.0, "x"]));
+        let error = supervisor
+            .prove_custom(&launch, &target, &custom)
+            .await
+            .unwrap_err();
+        assert!(error.contains("embedding probe"), "{error}");
+        assert_eq!(paths(&asked), ["/v1/embeddings", "/v1/embeddings"]);
+        task.abort();
+    }
+
+    /// A fake `/proc` where process `pid` holds one TCP listener on
+    /// `address:port`.
+    fn fake_proc(pid: u32, address: [u8; 4], port: u16) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let process = root.path().join(pid.to_string());
+        std::fs::create_dir_all(process.join("fd")).unwrap();
+        std::fs::create_dir_all(process.join("net")).unwrap();
+        std::os::unix::fs::symlink("socket:[777]", process.join("fd/3")).unwrap();
+        std::fs::write(
+            process.join("net/tcp"),
+            format!(
+                "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+                 \x20  0: {:08X}:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 777 1 0 100 0 0 10 0\n",
+                u32::from_ne_bytes(address)
+            ),
+        )
+        .unwrap();
+        std::fs::write(process.join("net/tcp6"), "  sl  local_address\n").unwrap();
+        root
+    }
+
+    /// A real child process in its own group, recorded as the engine's
+    /// `api`, as an adopted launch records it. A thread reaps it once it
+    /// exits, as the role's subreaper would, so its stop is proven.
+    fn engine() -> (std::thread::JoinHandle<()>, LocalReadyLaunch) {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let start_ticks = stat[stat.rfind(')').unwrap() + 2..]
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .to_owned();
+        let launch = LocalReadyLaunch {
+            fence: capyctl_store::lifecycle::DeploymentFence {
+                deployment_id: "native".into(),
+                revision: 1,
+                generation: 1,
+            },
+            instance_index: 0,
+            operation_id: "op".into(),
+            step_id: "step".into(),
+            binding_id: "binding".into(),
+            incarnation: "inc".into(),
+            identities: vec![ProcessIdentity {
+                role: "api".into(),
+                pid,
+                boot_id,
+                start_ticks,
+            }],
+            dispatch_enabled: false,
+        };
+        let reaper = std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        (reaper, launch)
+    }
+
+    // T41 T21 (ADR 0039 §14): an adopted launch of TensorFold's native line
+    // whose owned process listens off loopback is stopped, with gone
+    // evidence, and its re-proof fails `tensorfold_listener_exposed` naming
+    // the address; one on loopback only passes the check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_native_launch_listening_off_loopback_is_stopped_at_its_re_proof() {
+        let (reaper, launch) = engine();
+        let loopback = fake_proc(launch.identities[0].pid, [127, 0, 0, 1], 8080);
+        check_listeners_in(loopback.path(), &launch, Listeners::TensorfoldNative)
+            .await
+            .unwrap();
+
+        let exposed = fake_proc(launch.identities[0].pid, [0, 0, 0, 0], 8080);
+        let failed = check_listeners_in(exposed.path(), &launch, Listeners::TensorfoldNative)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failed,
+            "tensorfold_listener_exposed: an owned process listens on 0.0.0.0:8080, \
+             not on loopback; the engine was stopped"
+        );
+        reaper.join().unwrap();
+        assert_eq!(
+            capyctl_launchers::process_absence::presence(&launch.identities[0]),
+            Presence::Gone
+        );
+    }
+
+    // T41 (ADR 0039 §14): the revisions whose re-proof checks listeners as
+    // TensorFold's native line: only a TensorFold profile of that line.
+    #[test]
+    fn only_the_native_tensorfold_line_is_checked_as_native() {
+        use serde_json::json;
+        let native = json!({"profile": {"engine": "tensorfold", "line": "native"}});
+        assert!(tensorfold_native(&native));
+        for other in [
+            json!({"profile": {"engine": "tensorfold"}}),
+            json!({"profile": {"engine": "tensorfold", "line": "python"}}),
+            json!({"profile": {"engine": "vllm", "line": "native"}}),
+            serde_json::Value::Null,
+        ] {
+            assert!(!tensorfold_native(&other), "{other}");
+        }
+    }
+
+    fn escape(pid: u32) -> capyctl_adapters::process_tree::EscapedProcess {
+        capyctl_adapters::process_tree::EscapedProcess {
+            identity: ProcessIdentity {
+                role: format!("escaped-{pid}"),
+                pid,
+                boot_id: "boot".into(),
+                start_ticks: 7,
+            },
+            group: pid,
+            launch_group: 100,
+            leader: 100,
+        }
+    }
+
+    // T49 (ADR 0038 §9): a proven stop of an escaped launch names the closed
+    // failure; an unproven one names no code, so the coordinator never
+    // settles the launch on it and its claim and reservations stay.
+    #[test]
+    fn only_a_proven_stop_names_the_ownership_failure() {
+        use capyctl_adapters::tensorrt_llm::OwnershipFailure;
+        use capyctl_config::tensorrt_llm::ENGINE_PROCESS_ESCAPED;
+        let failure = OwnershipFailure::Escaped(vec![escape(102), escape(103)]);
+        let stopped = ownership_failure_text(&failure, Ok(()));
+        assert!(stopped.starts_with(&format!("{ENGINE_PROCESS_ESCAPED}:")));
+        assert!(stopped.ends_with("; the engine was stopped"));
+        let unproven = ownership_failure_text(&failure, Err("process 102 survived".into()));
+        assert!(!unproven.contains(ENGINE_PROCESS_ESCAPED), "{unproven}");
+        assert!(unproven.contains("process 102"), "{unproven}");
+        assert!(unproven.contains("process 103"), "{unproven}");
+        assert!(unproven.ends_with("the stop is unproven: process 102 survived"));
+        let unreadable = OwnershipFailure::Unreadable("no /proc".into());
+        assert!(ownership_failure_text(&unreadable, Err("x".into())).contains("no /proc"));
+    }
+
+    // T49 (ADR 0038 §9): a TensorRT-LLM launch with no live recorded process
+    // fails its ownership check without a closed code.
+    #[test]
+    fn an_ownership_check_without_live_processes_names_no_code() {
+        assert_eq!(alive(&[]).unwrap_err(), "the launch recorded no processes");
+        let gone = ProcessIdentity {
+            role: "api".into(),
+            pid: u32::MAX - 1,
+            boot_id: "boot".into(),
+            start_ticks: 1,
+        };
+        let error = alive(&[gone]).unwrap_err();
+        assert!(!error.contains("engine_"), "{error}");
     }
 }

@@ -289,6 +289,13 @@ fn hosts(value: &Value) -> String {
                 text(&profile["installation"]["lmcache"]["observed_digest"])
             ));
         }
+        // ADR 0037 §13: a host role whose latest report says tracing is on
+        // gets its line; off (the default) stays out of the table and is in
+        // the JSON output.
+        if host["tracing"]["on"] == true {
+            let line = crate::role_tracing::status_line(host).unwrap_or_default();
+            out.push_str(&format!("{}: {line}\n", clean(name)));
+        }
     }
     out
 }
@@ -743,6 +750,24 @@ fn status(value: &Value, names: &HostNames) -> String {
             out.push_str(&line);
         }
     }
+    // ADR 0037 §13: each instance's engine tracing, on or off with why.
+    let tracing: Vec<String> = d["instances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(engine_tracing_line)
+        .collect();
+    if !tracing.is_empty() {
+        out.push('\n');
+        for line in tracing {
+            out.push_str(&line);
+        }
+    }
+    // ADR 0037 §13: the role's own tracing, `tracing: off` or on with its
+    // endpoint, spans dropped and the last export error.
+    if let Some(line) = crate::role_tracing::status_line(d) {
+        out.push_str(&format!("\n{line}\n"));
+    }
     if let Some(engine) = d["engine"].as_str() {
         out.push_str(&format!("\nEngine  {engine}\n"));
     } else if d["installation"].is_object() {
@@ -770,12 +795,20 @@ fn status(value: &Value, names: &HostNames) -> String {
         out.push_str(&line);
     }
     // ADR 0030 §1: a deployment serving decision models says so; chat, the
-    // default, adds no line.
+    // default, adds no line. ADR 0036 §1: an embeddings deployment adds its
+    // engine version's certification: `API     embeddings (certified)`.
     if let Some(api) = d["api"].as_str() {
         if !(d["engine"].is_string() || d["installation"].is_object() || d["parsers"].is_object()) {
             out.push('\n');
         }
-        out.push_str(&format!("API     {}\n", clean(api)));
+        match d["certification"].as_str() {
+            Some(certification) => out.push_str(&format!(
+                "API     {} ({})\n",
+                clean(api),
+                clean(certification)
+            )),
+            None => out.push_str(&format!("API     {}\n", clean(api))),
+        }
     }
     // ADR 0014 amendment A14: a hybrid model's state cache holds fewer
     // running requests than the deployment asked for.
@@ -787,6 +820,11 @@ fn status(value: &Value, names: &HostNames) -> String {
     }
     if let Some(line) = streams(&d["context"]["streams"]) {
         out.push_str(&line);
+    }
+    // ADR 0039 §3, §7: an uncertified TensorFold native version or
+    // checkpoint runs with these notes; nothing is refused for them.
+    for note in d["notes"].as_array().into_iter().flatten() {
+        out.push_str(&format!("note: {}\n", text(note)));
     }
     out
 }
@@ -860,8 +898,26 @@ fn topology_line(instance: &Value) -> Option<String> {
     ))
 }
 
+/// ADR 0037 §13: one instance's engine tracing line, absent when status has
+/// none: `Instance 0  engine tracing: on` or `... off (<reason>)`.
+fn engine_tracing_line(instance: &Value) -> Option<String> {
+    let tracing = instance.get("engine_tracing").filter(|t| t.is_object())?;
+    let index = text(&instance["index"]);
+    Some(match tracing["state"].as_str() {
+        Some("on") => format!("Instance {index}  engine tracing: on\n"),
+        _ => format!(
+            "Instance {index}  engine tracing: off ({})\n",
+            text(&tracing["reason"])
+        ),
+    })
+}
+
 /// ADR 0033 §9: one instance's LMCache line, absent when status has none:
-/// `LMCache   instance 0 on: pool 4.0 GiB, ...` or `... off: <why>`.
+/// `LMCache   instance 0 on: pool 4.0 GiB, ...` or `... off: <why>`. ADR
+/// 0034 §4: the pool names its basis (`pool 8.0 GiB (auto: one
+/// 32,768-token context of qwen3 at 144 KiB per token)`), and its warning
+/// follows on its own line; §3a: an uncertified run says so, `on
+/// (uncertified: <why>)`. A launch planned before ADR 0034 shows neither.
 fn lmcache_line(instance: &Value) -> Option<String> {
     let lmcache = instance.get("lmcache").filter(|l| l.is_object())?;
     let index = text(&instance["index"]);
@@ -873,7 +929,11 @@ fn lmcache_line(instance: &Value) -> Option<String> {
     }
     let mut parts = Vec::new();
     if let Some(pool) = number(&lmcache["pool_bytes"]) {
-        parts.push(format!("pool {}", gib(pool)));
+        let basis = lmcache["pool_basis"]
+            .as_str()
+            .map(|basis| format!(" ({})", clean(basis)))
+            .unwrap_or_default();
+        parts.push(format!("pool {}{basis}", gib(pool)));
     }
     if let Some(used) = number(&lmcache["used_bytes"]) {
         parts.push(format!("used {}", gib(used)));
@@ -903,10 +963,37 @@ fn lmcache_line(instance: &Value) -> Option<String> {
         (Some(hits), None) => parts.push(format!("{hits} hits")),
         _ => {}
     }
-    Some(format!(
-        "LMCache   instance {index} on: {}\n",
-        parts.join(", ")
-    ))
+    let on = match lmcache["uncertified"].as_str() {
+        Some(why) => format!("on (uncertified: {})", clean(why)),
+        None => "on".to_owned(),
+    };
+    let mut line = format!("LMCache   instance {index} {on}: {}\n", parts.join(", "));
+    if let Some(warning) = lmcache["warning"].as_str() {
+        line.push_str(&format!("warning: {}\n", clean(warning)));
+    }
+    Some(line)
+}
+
+/// ADR 0034 §§3a, 4: what `deploy` warns about one instance's LMCache: an
+/// uncertified run, and a pool short of one full context or shrunk to the
+/// room left. Empty when there is nothing to warn about.
+pub fn lmcache_warnings(instance: &Value) -> Vec<String> {
+    let lmcache = &instance["lmcache"];
+    if lmcache["state"] != "on" {
+        return Vec::new();
+    }
+    let index = text(&instance["index"]);
+    let mut warnings = Vec::new();
+    if let Some(why) = lmcache["uncertified"].as_str() {
+        warnings.push(format!(
+            "instance {index}: LMCache runs uncertified: {}",
+            clean(why)
+        ));
+    }
+    if let Some(warning) = lmcache["warning"].as_str() {
+        warnings.push(format!("instance {index}: {}", clean(warning)));
+    }
+    warnings
 }
 
 /// ADR 0033 §1: LMCache drifted from the registration `engine add` made,
@@ -993,11 +1080,12 @@ fn engines(value: &Value) -> String {
                 clean(host),
                 text(&e["profile"]),
                 text(&e["engine"]),
-                text(&e["version"]),
+                version_cell(e),
                 text(&e["custom"]),
                 text(&e["deep_park"]),
                 lmcache_cell(&e["lmcache"]),
-                // ADR 0031 §6, §7: a custom engine's idle signal and engine key.
+                // ADR 0031 §6, §7, ADR 0038 §2: a custom engine's idle signal
+                // and engine key; TensorRT-LLM's are `none`.
                 text(&e["idle_signal"]),
                 text(&e["engine_key"]),
                 state.into(),
@@ -1036,6 +1124,45 @@ fn lmcache_cell(view: &Value) -> String {
     }
 }
 
+/// ADR 0039 §1: a row's engine, with its TensorFold line when it states one
+/// (`tensorfold (native)`, `tensorfold (python)`).
+fn engine_cell(row: &Value) -> String {
+    match row["line"].as_str() {
+        Some(line) => format!("{} ({})", text(&row["engine"]), clean(line)),
+        None => text(&row["engine"]),
+    }
+}
+
+/// ADR 0039 §2, §3: each row's notes under the table, `note: <name>: <note>`
+/// (the uncertified native version, the absent checksum list).
+fn row_notes(rows: &Value, name: &str, notes: &str) -> String {
+    let mut out = String::new();
+    for row in rows.as_array().into_iter().flatten() {
+        for note in row[notes].as_array().into_iter().flatten() {
+            out.push_str(&format!("note: {}: {}\n", text(&row[name]), text(note)));
+        }
+    }
+    out
+}
+
+/// ADR 0038 §2: the listed version, followed for TensorRT-LLM by the
+/// companion versions its registration recorded, so a changed torch or
+/// TensorRT shows in the listing.
+fn version_cell(row: &Value) -> String {
+    let version = text(&row["version"]);
+    let companions: Vec<String> = row["companions"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, version)| format!("{} {}", clean(name), text(version)))
+        .collect();
+    if companions.is_empty() {
+        version
+    } else {
+        format!("{version} ({})", companions.join(", "))
+    }
+}
+
 fn local_engines(value: &Value) -> String {
     let rows: Vec<Vec<String>> = value["engines"]
         .as_array()
@@ -1045,12 +1172,13 @@ fn local_engines(value: &Value) -> String {
             vec![
                 text(&e["profile"]),
                 text(&e["source"]),
-                text(&e["engine"]),
-                text(&e["version"]),
+                engine_cell(e),
+                version_cell(e),
                 text(&e["custom"]),
                 text(&e["deep_park"]),
                 lmcache_cell(&e["lmcache"]),
-                // ADR 0031 §6, §7: a custom engine's idle signal and engine key.
+                // ADR 0031 §6, §7, ADR 0038 §2: a custom engine's idle signal
+                // and engine key; TensorRT-LLM's are `none`.
                 text(&e["idle_signal"]),
                 text(&e["engine_key"]),
                 text(&e["published"]),
@@ -1058,7 +1186,7 @@ fn local_engines(value: &Value) -> String {
             ]
         })
         .collect();
-    table(
+    let mut out = table(
         &[
             "PROFILE",
             "SOURCE",
@@ -1073,7 +1201,9 @@ fn local_engines(value: &Value) -> String {
             "DEPLOYMENTS",
         ],
         &rows,
-    )
+    );
+    out.push_str(&row_notes(&value["engines"], "profile", "notes"));
+    out
 }
 
 fn detected(value: &Value) -> String {
@@ -1083,7 +1213,7 @@ fn detected(value: &Value) -> String {
         .flatten()
         .map(|c| {
             vec![
-                text(&c["engine"]),
+                engine_cell(c),
                 text(&c["version"]),
                 text(&c["custom"]),
                 text(&c["env"]),
@@ -1091,10 +1221,21 @@ fn detected(value: &Value) -> String {
             ]
         })
         .collect();
-    table(
+    let mut out = table(
         &["ENGINE", "VERSION", "CUSTOM", "ENVIRONMENT", "SOURCE"],
         &rows,
-    )
+    );
+    // ADR 0039 §3: a detected native version that is not certified.
+    for candidate in value["candidates"].as_array().into_iter().flatten() {
+        if let Some(note) = candidate["note"].as_str() {
+            out.push_str(&format!(
+                "note: {}: {}\n",
+                text(&candidate["env"]),
+                clean(note)
+            ));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1428,6 +1569,79 @@ mod tests {
         );
     }
 
+    // T48 (ADR 0037 §13): each instance whose status carries
+    // `engine_tracing` gets `engine tracing: on` or `off (<reason>)`, after
+    // the instances table; an instance without it gets no line.
+    #[test]
+    fn status_shows_each_instances_engine_tracing() {
+        let instance = |index: u32, tracing: Option<Value>| {
+            let mut i = json!({"index": index, "host_id": "01HOSTA",
+                "observed_state": "ready", "lifecycle": "active"});
+            if let Some(tracing) = tracing {
+                i["engine_tracing"] = tracing;
+            }
+            i
+        };
+        let d = json!({"name": "m", "observed_state": "ready", "instances": [
+            instance(0, Some(json!({"state": "on"}))),
+            instance(1, Some(json!({"state": "off", "reason": "retention_zero"}))),
+            instance(2, None),
+        ]});
+        let out = render(View::Status, &d, &names());
+        assert!(
+            out.contains(
+                "\nInstance 0  engine tracing: on\n\
+                 Instance 1  engine tracing: off (retention_zero)\n"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("Instance 2  engine tracing"), "{out}");
+        let none = json!({"name": "m", "observed_state": "ready",
+            "instances": [instance(0, None)]});
+        assert!(!render(View::Status, &none, &names()).contains("engine tracing"));
+    }
+
+    // T48 (ADR 0037 §13): status shows the role's tracing line when the
+    // server reports one, and nothing when it does not (an older server).
+    #[test]
+    fn status_shows_the_roles_tracing() {
+        let mut d = json!({"name": "m", "observed_state": "ready", "instances": []});
+        assert!(!render(View::Status, &d, &names()).contains("tracing:"));
+        d["tracing"] = json!({"on": false});
+        assert!(render(View::Status, &d, &names()).contains("\ntracing: off\n"));
+        d["tracing"] = json!({"on": true, "endpoint": "http://127.0.0.1:4318/v1/traces",
+            "spans_dropped": 2, "last_export_error": "timeout"});
+        let out = render(View::Status, &d, &names());
+        assert!(
+            out.contains(
+                "\ntracing: on → http://127.0.0.1:4318/v1/traces, spans dropped 2, last export error: timeout\n"
+            ),
+            "{out}"
+        );
+    }
+
+    // T48 (ADR 0037 §13): `hosts` shows each host role's tracing below the
+    // table, from the `tracing` its latest report carried; none without it.
+    #[test]
+    fn hosts_show_each_hosts_tracing() {
+        let out = render(
+            View::Hosts,
+            &json!({"hosts": [
+                {"host_id": "01A", "name": "a", "tracing": {"on": true,
+                    "endpoint": "http://127.0.0.1:4318/v1/traces", "spans_dropped": 0}},
+                {"host_id": "01B", "name": "b", "tracing": {"on": false}},
+                {"host_id": "01C", "name": "c", "tracing": null},
+            ]}),
+            &HostNames::new(),
+        );
+        assert!(
+            out.contains("a: tracing: on → http://127.0.0.1:4318/v1/traces, spans dropped 0\n"),
+            "{out}"
+        );
+        assert!(!out.contains("b: tracing"), "{out}");
+        assert!(!out.contains("c: tracing"), "{out}");
+    }
+
     #[test]
     fn host_states_are_named() {
         let row = |host: Value| {
@@ -1524,6 +1738,31 @@ mod tests {
         assert!(api > engine && out[api..].contains("decisions"), "{out}");
     }
 
+    // T47 (ADR 0036 §1, §2): status names an embeddings deployment's API with
+    // its engine version's certification, and an instance's LMCache off
+    // with the embeddings reason where other reasons show.
+    #[test]
+    fn status_names_an_embeddings_api_and_its_certification() {
+        for certification in ["certified", "uncertified"] {
+            let d = json!({"name": "m", "observed_state": "ready", "api": "embeddings",
+                "certification": certification,
+                "installation": {"profile": "vllm", "version": "0.32.0",
+                    "executable": "/opt/vllm/bin/vllm"},
+                "instances": [{"index": 0, "observed_state": "ready",
+                    "lmcache": {"state": "off", "reason": "embeddings_unsupported",
+                        "message": "LMCache does not serve embedding models"}}]});
+            let out = render(View::Status, &d, &HostNames::new());
+            assert!(
+                out.contains(&format!("API     embeddings ({certification})\n")),
+                "{out}"
+            );
+            assert!(
+                out.contains("LMCache   instance 0 off: LMCache does not serve embedding models"),
+                "{out}"
+            );
+        }
+    }
+
     // T44 T17 (ADR 0031 §6, SPEC §10 amended 2026-10-21): status says how
     // many cancelled requests each instance still carries and what settles
     // them, the engine's idle signal or the next stop; nothing when none.
@@ -1613,6 +1852,29 @@ mod tests {
         d["context"].as_object_mut().unwrap().remove("streams");
         let out = render(View::Status, &d, &HostNames::new());
         assert!(!out.contains("Streams"), "{out}");
+    }
+
+    // T41 (ADR 0039 §3, §7): status shows a native TensorFold deployment's
+    // uncertified notes, one line each, and nothing without them.
+    #[test]
+    fn status_shows_the_native_tensorfold_notes() {
+        let mut d = json!({"name": "m", "observed_state": "ready", "instances": [],
+        "notes": [
+            "not certified: TensorFold native 1.0.3 is a custom setup; CapyCTL certifies TensorFold native 1.0.0 and 1.1.5",
+            capyctl_config::tensorfold_native::CHECKPOINT_NOTE,
+        ]});
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(
+            out.ends_with(&format!(
+                "note: not certified: TensorFold native 1.0.3 is a custom setup; CapyCTL \
+                 certifies TensorFold native 1.0.0 and 1.1.5\nnote: {}\n",
+                capyctl_config::tensorfold_native::CHECKPOINT_NOTE
+            )),
+            "{out}"
+        );
+        d.as_object_mut().unwrap().remove("notes");
+        let out = render(View::Status, &d, &HostNames::new());
+        assert!(!out.contains("note:"), "{out}");
     }
 
     // T02: status on a role with no engine names the command that adds one.
@@ -1924,6 +2186,28 @@ mod tests {
         assert!(row.contains("/metrics gauges running"), "{server}");
         assert!(row.contains("per-launch"), "{server}");
         assert!(row.contains(" yes "), "{server}");
+    }
+
+    // T49 (ADR 0038 §2): a TensorRT-LLM row shows its companion versions
+    // beside its own, `CUSTOM yes`, and `none` for its idle signal and engine
+    // key, locally and on the server.
+    #[test]
+    fn engine_views_show_tensorrt_llm_companions() {
+        let row = json!({"profile": "tensorrt-llm", "source": "engines.yaml",
+            "host_id": "01HOSTA", "host": "gpu-a", "online": true, "retiring": false,
+            "engine": "tensorrt-llm", "version": "1.2.1", "custom": true,
+            "companions": {"mpi4py": "4.1.1", "torch": "2.9.1+cu130"},
+            "deep_park": "disabled", "idle_signal": "none", "engine_key": "none",
+            "published": "published", "deployments": []});
+        for view in [View::LocalEngines, View::Engines] {
+            let out = render(view, &json!({"engines": [row.clone()]}), &HostNames::new());
+            let line = out.lines().nth(1).unwrap();
+            assert!(
+                line.contains("1.2.1 (mpi4py 4.1.1, torch 2.9.1+cu130)   yes"),
+                "{out}"
+            );
+            assert!(line.contains("   none          none   "), "{out}");
+        }
     }
 
     /// `status deployment --format json` of a Ready two-host vLLM group as

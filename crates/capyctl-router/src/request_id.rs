@@ -41,6 +41,9 @@ pub struct RequestIds {
     /// well-formed ID (more than one header included).
     caller: Result<Option<String>, ()>,
     capyctl: OnceLock<String>,
+    /// ADR 0037 §10: the request's trace travels beside its IDs. Set once,
+    /// after authentication, and only with tracing on.
+    trace: OnceLock<crate::trace::RequestTrace>,
 }
 
 impl RequestIds {
@@ -58,6 +61,7 @@ impl RequestIds {
         Self {
             caller,
             capyctl: OnceLock::new(),
+            trace: OnceLock::new(),
         }
     }
 
@@ -66,7 +70,55 @@ impl RequestIds {
         Self {
             caller: Ok(None),
             capyctl: OnceLock::new(),
+            trace: OnceLock::new(),
         }
+    }
+
+    /// ADR 0037 §2: start the request's trace, after it authenticated. With
+    /// tracing off nothing is read or built.
+    pub(crate) fn begin_trace(
+        &self,
+        tracing: &capyctl_trace::Tracing,
+        headers: &HeaderMap,
+        endpoint: crate::endpoint::Endpoint,
+    ) {
+        if let Some(trace) = crate::trace::RequestTrace::begin(tracing, headers, endpoint) {
+            let _ = self.trace.set(trace);
+        }
+    }
+
+    /// The request's trace, when tracing is on and it authenticated.
+    pub(crate) fn trace(&self) -> Option<&crate::trace::RequestTrace> {
+        self.trace.get()
+    }
+
+    /// A phase span under the request span; empty without a trace.
+    pub(crate) fn span(&self, name: capyctl_trace::Name) -> capyctl_trace::Span {
+        self.trace()
+            .map(|trace| trace.child(name))
+            .unwrap_or_default()
+    }
+
+    /// ADR 0037 §3: end the request span for an answer that is not a stream
+    /// (a streamed answer ends it at its own end).
+    pub(crate) fn end_trace(
+        &self,
+        outcome: &Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)>,
+    ) {
+        let Some(trace) = self.trace() else { return };
+        let (status, code) = match outcome {
+            Ok(response) => (response.status().as_u16(), None),
+            Err((status, Json(body))) => (status.as_u16(), body["code"].as_str()),
+        };
+        trace.finish(
+            self.capyctl(),
+            crate::trace::Ending {
+                status: Some(status),
+                outcome: crate::trace::outcome_of(status, code),
+                code,
+                cause: None,
+            },
+        );
     }
 
     /// Refuse a malformed caller ID, naming the header.

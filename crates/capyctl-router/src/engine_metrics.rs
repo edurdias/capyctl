@@ -17,6 +17,12 @@
 //! from usage on both the 0.30.0 and 0.31.0 shapes and stays absent when the
 //! engine reported none.
 //!
+//! TensorRT-LLM 1.2.1 (ADR 0038 §6) reports `cached_tokens` at the same
+//! usage path and no time to first token, prefill or queue time (its
+//! `/prometheus/metrics` stays off), so `ttft_ms` and the decode rate are
+//! the router's and the others are absent. Its load is the host's `/metrics`
+//! read, never per-request figures.
+//!
 //! An engine figure wins; the router derives `ttft_ms` and
 //! `decode_tokens_per_second` from its own clock only when the engine sent
 //! none, and labels them `router`. A figure nobody measured is absent, never
@@ -261,6 +267,57 @@ pub fn attach_decision(response: &mut EngineAnswer, timing: &RequestTiming) {
     response.set(BODY_KEY, json!({ "metrics": figures }));
 }
 
+/// ADR 0036 §9: the figures of one embeddings request, each labelled with its
+/// source as a decision's are: `total_ms` (the router's clock, from arrival)
+/// and `time_to_response_ms` (`to_response`, from the forward to the whole
+/// answer), `input_tokens` from the engine's `usage.prompt_tokens` when it
+/// sent one, and `inputs` counted by the router from the request. A figure
+/// nobody measured is absent, never zero.
+pub fn embedding_metrics(
+    answered: &capyctl_adapters::traits::EmbeddingAnswered,
+    timing: &RequestTiming,
+    to_response: Option<std::time::Duration>,
+) -> Value {
+    let mut out = Map::new();
+    let ms = |took: std::time::Duration| took.as_secs_f64() * 1000.0;
+    let mut put = |name: &str, value: Option<f64>| {
+        if let Some(value) = value {
+            out.insert(
+                name.to_owned(),
+                json!({"value": rounded(value), "source": "router"}),
+            );
+        }
+    };
+    put("total_ms", timing.phases().total.map(ms));
+    put("time_to_response_ms", to_response.map(ms));
+    if let Some(tokens) = answered.prompt_tokens {
+        out.insert(
+            "input_tokens".to_owned(),
+            json!({"value": tokens, "source": "engine"}),
+        );
+    }
+    out.insert(
+        "inputs".to_owned(),
+        json!({"value": answered.inputs, "source": "router"}),
+    );
+    Value::Object(out)
+}
+
+/// ADR 0036 §4, §9: what closes an embeddings answer that passed every check:
+/// its `capyctl.metrics` member and the top-level closing brace the forwarder
+/// withheld. Written only after the last check passed.
+pub fn embedding_tail(
+    answered: &capyctl_adapters::traits::EmbeddingAnswered,
+    timing: &RequestTiming,
+    to_response: Option<std::time::Duration>,
+) -> Vec<u8> {
+    format!(
+        ",\"{BODY_KEY}\":{}}}",
+        json!({ "metrics": embedding_metrics(answered, timing, to_response) })
+    )
+    .into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +487,30 @@ mod tests {
         assert_eq!(figures, json!({}));
     }
 
+    // T49 (ADR 0038 §6): TensorRT-LLM reports cached tokens in `usage` and
+    // no timing of its own; its time to first token and decode rate are the
+    // router's, and nobody's queue or prefill time is shown.
+    #[test]
+    fn tensorrt_llm_reports_cached_tokens_and_the_router_times_it() {
+        let answer = json!({
+            "id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "qwen3-4b",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi",
+                "reasoning_content": null}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 12, "total_tokens": 20, "completion_tokens": 8,
+                "prompt_tokens_details": {"cached_tokens": 8}}
+        });
+        assert_eq!(
+            engine_only(&answer),
+            json!({"cached_tokens": {"value": 8, "source": "engine"}})
+        );
+        let mut answer = EngineAnswer::from(answer);
+        attach(&mut answer, &router_clock());
+        let figures = &answer["capyctl"]["metrics"];
+        assert_eq!(figures["ttft_ms"]["source"], "router");
+        assert!(figures.get("queue_ms").is_none() && figures.get("prefill_ms").is_none());
+        assert_eq!(figures["cached_tokens"]["source"], "engine");
+    }
+
     // T40: chunks that carry nothing are not parsed; the ones that do are.
     #[test]
     fn only_chunks_that_may_report_are_read() {
@@ -466,7 +547,7 @@ mod tests {
         }
     }
 
-    /// llama.cpp v0.6.0 `server_slot_stats::to_json` as one answer carries it.
+    /// llama.cpp v0.9.0 `server_slot_stats::to_json` (unchanged since v0.6.0).
     fn llamacpp_timings(predicted_per_second: f64) -> Value {
         json!({"cache_n": 8, "prompt_n": 4, "prompt_ms": 12.5,
             "prompt_per_token_ms": 3.125, "prompt_per_second": 320.0,
@@ -506,7 +587,7 @@ mod tests {
         let engine = json!({
             "choices": [{"finish_reason": "stop", "index": 0,
                 "message": {"role": "assistant", "content": "hi"}}],
-            "created": 1, "model": "m", "system_fingerprint": "b1-abc",
+            "created": 1, "model": "m", "system_fingerprint": "b12110-cd959ba",
             "object": "chat.completion", "usage": llamacpp_usage(), "id": "chatcmpl-1",
             "timings": llamacpp_timings(60.0)
         });
@@ -549,7 +630,7 @@ mod tests {
 
     fn llamacpp_chunk(delta: Value, finish: Value) -> Value {
         json!({"choices": [{"finish_reason": finish, "index": 0, "delta": delta}],
-            "created": 1, "id": "chatcmpl-1", "model": "m", "system_fingerprint": "b1-abc",
+            "created": 1, "id": "chatcmpl-1", "model": "m", "system_fingerprint": "b12110-cd959ba",
             "object": "chat.completion.chunk"})
     }
 
@@ -652,5 +733,37 @@ mod tests {
         let mut bare = EngineAnswer::from(json!({"answers": {}}));
         attach_decision(&mut bare, &RequestTiming::untracked());
         assert_eq!(bare["capyctl"]["metrics"], json!({}));
+    }
+
+    // T47 (ADR 0036 §§4, 9): the tail closes the withheld object with
+    // `capyctl.metrics`: the engine's prompt tokens and the router's input
+    // count, each labelled; no engine count, no `input_tokens`; nothing about
+    // generated text, and no router clock figure that was not measured.
+    #[test]
+    fn an_embedding_tail_closes_the_answer_with_its_figures() {
+        let answered = capyctl_adapters::traits::EmbeddingAnswered {
+            inputs: 2,
+            prompt_tokens: Some(7),
+            client_gone: false,
+        };
+        let head = r#"{"object":"list","data":[],"model":"m""#;
+        let to_response = Some(std::time::Duration::from_micros(12_500));
+        let tail = embedding_tail(&answered, &RequestTiming::untracked(), to_response);
+        let whole: Value =
+            serde_json::from_slice(&[head.as_bytes(), &tail].concat()).expect("a whole document");
+        assert_eq!(
+            whole["capyctl"]["metrics"],
+            json!({
+                "time_to_response_ms": {"value": 12.5, "source": "router"},
+                "input_tokens": {"value": 7, "source": "engine"},
+                "inputs": {"value": 2, "source": "router"},
+            })
+        );
+        let uncounted = capyctl_adapters::traits::EmbeddingAnswered {
+            prompt_tokens: None,
+            ..answered
+        };
+        let figures = embedding_metrics(&uncounted, &RequestTiming::untracked(), None);
+        assert_eq!(figures, json!({"inputs": {"value": 2, "source": "router"}}));
     }
 }

@@ -61,6 +61,10 @@ RESERVED = (
     "log_config_file", "uvicorn_log_level", "disable_uvicorn_access_log",
     "distributed_executor_backend", "headless", "api_server_count", "revision",
     "code_revision", "enable_ssl_refresh", "config", "grpc",
+    # ADR 0036 §2: capyctl renders `--runner pooling` on an embeddings
+    # deployment and nothing on any other; vLLM picks the conversion itself.
+    # Both are defined in 0.29.0 through 0.32.0.
+    "runner", "convert",
 )
 # SPEC §8.2 / T21: multi-node rendezvous (0.26+ `ParallelConfig`). Compared
 # whenever the installed parser defines them; unlike RESERVED, a build without
@@ -68,8 +72,20 @@ RESERVED = (
 # vLLM 0.30 scale-out (extra serving routes) is reserved the same way, and so is
 # vLLM 0.32.0's `--grpc-port` (a second, gRPC listener beside HTTP,
 # entrypoints/launchers/cli_args.py `FrontendArgs.grpc_port`).
+# ADR 0037 §7 (owner decision 2026-10-27, question 7): vLLM's tracing
+# destinations (`ObservabilityConfig`, 0.29.0 to 0.32.0) are CapyCTL's. A
+# traced launch renders `--otlp-traces-endpoint` in the reserved block; the full
+# parse must resolve both to what the reserved block alone resolved, so an
+# extra or host-fixed argument naming either is refused whatever the host
+# approves. `--collect-detailed-traces` is never rendered.
+# SPEC §8.2 / T21: 0.33.0 adds a pluggable sleep backend (ModelConfig,
+# model.py:379) and watchdog stack dumps (WatchdogConfig.dump_dir,
+# watchdog_config.py:28). Keep the built-in allocator and no dump path;
+# neither destination exists on older builds.
 RESERVED_IF_PRESENT = ("nnodes", "node_rank", "master_addr", "master_port",
-                       "enable_scale_out", "grpc_port")
+                       "enable_scale_out", "grpc_port",
+                       "otlp_traces_endpoint", "collect_detailed_traces",
+                       "sleep_mode_backend", "watchdog_config")
 # ADR 0017 §2 (version skew): vLLM 0.31.0 moved logging into the nested
 # `--logging-config` dotted config (vllm/config/logging.py, `LoggingConfig`:
 # log_level, configure_logging, pylogging_config_file). The serve parser

@@ -42,6 +42,20 @@ def add_mp_server_args(
         help="Port to bind the request server. Default is 5555.",
     )
     mp_group.add_argument(
+        "--supported-transfer-mode",
+        type=str,
+        default="lmcache_driven",
+        choices=["lmcache_driven", "engine_driven", "auto"],
+        help="Supported transfer mode: 'lmcache_driven' for server-driven "
+        "transfer (STORE/RETRIEVE, supports CUDA IPC and CPU SHM), "
+        "'engine_driven' for engine-driven transfer (PREPARE/COMMIT), "
+        "or 'auto' to enable both transfer paths. "
+        "Default is 'lmcache_driven'.",
+    )
+    mp_group.add_argument(
+        "--isolated-ipc",
+        action=argparse.BooleanOptionalAction,
+        default=False,
 
 def add_http_frontend_args(
     parser: argparse.ArgumentParser,

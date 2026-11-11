@@ -141,6 +141,19 @@ _RESERVED_DUMP = ("watermark_config", "debug_tensor_dump_output_folder",
                   "debug_tensor_dump_layers", "debug_tensor_dump_input_file",
                   "msprobe_dump_config", "export_metrics_to_file",
                   "export_metrics_to_file_dir", "spec_trace_dir")
+# ADR 0033 §11 / T21: external cache ownership is exclusive. Refuse these
+# destinations without requiring their presence on older engine versions.
+_RESERVED_EXTERNAL_LINKER = ("enable_unified_cache_external_linker",
+                             "unified_cache_external_linker_backend",
+                             "unified_cache_external_linker_config")
+# ADR 0037 §7 (owner decision 2026-10-27, question 7): SGLang's tracing fields
+# (0.5.22 arg_groups/fields/observability.py) are CapyCTL's, refused as extra
+# arguments whatever the host approves (engine_policy.rs SGLANG_TRACING_FIELDS).
+# A traced launch's descriptor names `trace_endpoint`, and construct_server_args
+# pins them; without it nothing is pinned, so a version without them is not a
+# drift.
+_RESERVED_TRACING = ("enable_trace", "otlp_traces_endpoint", "otlp_service_name",
+                     "trace_modules")
 # Whole reserved families (ADR 0014 §3), matched on the parsed destination.
 _RESERVED_FAMILIES = ("ssl_", "modelopt_", "disaggregation_", "hicache_storage_",
                       "lmcache_", "flexkv_", "debug_tensor_dump_")
@@ -154,8 +167,12 @@ _TYPED_DESTINATIONS = frozenset({
     "cuda_graph_backend_decode", "language_model_only", "trust_remote_code",
     "max_total_tokens", "chunked_prefill_size", "tokenizer_worker_num",
 })
+# ADR 0036 §2: embedding mode is CapyCTL's to set, pinned only for an embeddings
+# deployment (see below); an extra argument may never set it.
+_RESERVED_EMBEDDING_MODE = ("is_embedding",)
 _FORBIDDEN_EXTRA = frozenset({*_RESERVED_CONSTANT, *_RESERVED_BOUND, *_RESERVED_DUMP,
-                              "config"})
+                              *_RESERVED_TRACING, *_RESERVED_EXTERNAL_LINKER,
+                              *_RESERVED_EMBEDDING_MODE, "config"})
 # ADR 0014 §4: capyctl safe defaults the deployment may override with extra args.
 _SAFE_DEFAULTS = {"detokenizer_worker_num": 1}
 
@@ -380,11 +397,21 @@ def typed_keywords(settings):
         keywords["speculative_draft_model_path"] = settings["draft_model_path"]
     if settings["language_model_only"]:
         keywords["language_model_only"] = True
-    if settings["cuda_graphs"] is False:
-        keywords.update(disable_prefill_cuda_graph=True, disable_decode_cuda_graph=True,
-                        cuda_graph_backend_prefill="disabled",
-                        cuda_graph_backend_decode="disabled")
+    # ADR 0014 §2 / #236: SGLang 0.5.22 ExecGraph's independent
+    # --disable-{prefill,decode}-cuda-graph switches and backend equivalents.
+    for phase in disabled_graph_phases(settings["cuda_graphs"]):
+        keywords["disable_" + phase + "_cuda_graph"] = True
+        keywords["cuda_graph_backend_" + phase] = "disabled"
     return keywords
+
+
+def disabled_graph_phases(policy):
+    """Scalar false disables both; true/None keep native phase defaults."""
+    if policy is False:
+        return ("prefill", "decode")
+    if type(policy) is dict:
+        return tuple(phase for phase in ("prefill", "decode") if policy[phase] is False)
+    return ()
 
 
 @dataclass(frozen=True, repr=False)
@@ -398,7 +425,7 @@ class CheckedServerArgs:
 
     _native: object = field(repr=False)
     _expected: tuple = field(repr=False)
-    _graphs_disabled: bool = field(default=False, repr=False)
+    _disabled_graph_phases: tuple = field(default=(), repr=False)
     # ADR 0028 §10: the group fields of a multi-node member, whose change is
     # named `group_drift:<field>`; empty for a single rank.
     _group_fields: tuple = field(default=(), repr=False)
@@ -433,9 +460,10 @@ class CheckedServerArgs:
                 value = resolved[key]
                 if type(value) is not type(expected) or value != expected:
                     raise ValueError()
-            if self._graphs_disabled:
+            if self._disabled_graph_phases:
                 config = resolved["cuda_graph_config"]
-                for phase in (config["prefill"], config["decode"]):
+                for name in self._disabled_graph_phases:
+                    phase = config[name]
                     if type(phase["backend"]) is not str or phase["backend"] != "disabled":
                         raise ValueError()
         except Exception:
@@ -517,6 +545,18 @@ def construct_server_args(spec, placement, guarded_constructor, available_bytes=
     if "lmcache_config_file" in settings:
         reserved.update(enable_lmcache=True,
                         lmcache_config_file=settings["lmcache_config_file"])
+    # ADR 0036 §2: render and pin embedding mode only for embeddings.
+    # Otherwise SGLang chooses: Clef decision heads need embedding mode,
+    # while chat checkpoints serving label-scored decisions do not (ADR 0030 §6).
+    if "is_embedding" in settings:
+        reserved.update(is_embedding=True)
+    # ADR 0037 §7: a traced launch exports to the host's loopback endpoint;
+    # `expected` (below) pins the three after resolution. `trace_modules`
+    # keeps SGLang's default. Absent, nothing is rendered or pinned.
+    if "trace_endpoint" in settings:
+        reserved.update(enable_trace=True,
+                        otlp_traces_endpoint=settings["trace_endpoint"],
+                        otlp_service_name="sglang")
     # ADR 0028 §10: a group member's parallelism and rendezvous come from its
     # descriptor's group, never the single-rank constants. On a worker the key
     # fields stay None (it is handed no credential, ADR 0012) and its health
@@ -549,7 +589,7 @@ def construct_server_args(spec, placement, guarded_constructor, available_bytes=
         _log_refusal(error)
         raise ServerArgsError("server_args_construction_failed") from None
     checked = CheckedServerArgs(native, tuple(expected.items()),
-                                settings["cuda_graphs"] is False,
+                                disabled_graph_phases(settings["cuda_graphs"]),
                                 GROUP_FIELDS if group is not None else (),
                                 TP_FIELDS if devices is not None else ())
     checked.revalidate()

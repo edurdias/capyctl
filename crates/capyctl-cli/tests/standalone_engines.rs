@@ -44,6 +44,8 @@ fn register(document: &std::path::Path, name: &str) {
             approved_env: vec![],
             trust_remote_code: false,
             lmcache: None,
+            line: Default::default(),
+            native: None,
         }),
     );
     write_engines(&engines, &lock, None).unwrap();
@@ -83,7 +85,6 @@ async fn deploy(
         &capyctl_config::effective::ModelSource::Local {
             path: format!("/models/{name}"),
         },
-        capyctl_config::engine_policy::Engine::Vllm,
         &capyctl_cli::standalone_config::TemplateMemory::Unified {
             capacity_bytes: support::TEST_CAPACITY_BYTES,
         },
@@ -583,6 +584,8 @@ fn standalone_publishes_a_registered_tensorfold_profile() {
             approved_env: vec![],
             trust_remote_code: false,
             lmcache: None,
+            line: Default::default(),
+            native: None,
         }),
     );
     write_engines(&engines, &lock, None).unwrap();

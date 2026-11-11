@@ -167,10 +167,9 @@ fn a_minimal_file_resolves_on_a_discrete_host() {
     let small = resolve_effective_with_checkpoint(&deployment, &host, weights(4 * GIB)).unwrap();
     assert_eq!(small.residency, Residency::HostBacked);
     let memory = small.engine_config.memory();
-    // min(4 GiB, 14848 MiB / 4) of KV cache; vLLM's request is at least 0.75
-    // of the card (16384 MiB).
+    // ADR 0019 §3, #225: default KV plus weights x 1.10, without a card-share floor.
     assert_eq!(memory.kv_cache_bytes, 3712 * MIB);
-    assert_eq!(memory.request_bytes, 16384 * MIB / 100 * 75);
+    assert_eq!(memory.request_bytes, 4 * GIB / 100 * 110 + 3712 * MIB);
     let domains: Vec<&str> = small
         .resources
         .ready

@@ -15,12 +15,28 @@ fn vllm() -> AdapterSpec {
         residency: capyctl_config::effective::Residency::Deep,
         api: capyctl_config::effective::DeploymentApi::Chat,
         lmcache: None,
+        engine_tracing: crate::engine_tracing::EngineTracing::Off(
+            crate::engine_tracing::EngineTracingOff::HostOff,
+        ),
     }
 }
 
 #[test]
 fn every_family_maps_to_its_own_spec() {
     assert_eq!(vllm().engine(), Engine::Vllm);
+    // T48 (ADR 0037 §7): only vLLM and SGLang specs carry a decision.
+    assert_eq!(
+        tensorfold().engine_tracing(),
+        crate::engine_tracing::EngineTracing::Off(
+            crate::engine_tracing::EngineTracingOff::EngineUnsupported
+        )
+    );
+    assert_eq!(
+        llamacpp().engine_tracing(),
+        crate::engine_tracing::EngineTracing::Off(
+            crate::engine_tracing::EngineTracingOff::EngineUnsupported
+        )
+    );
 }
 
 /// A profile's identity — build fingerprint, reserved-flag policy, verification
@@ -91,6 +107,7 @@ fn tensorfold() -> AdapterSpec {
         endpoint: "http://127.0.0.1:8000".parse().unwrap(),
         fingerprint: "0.6.0".into(),
         model_id: "m".into(),
+        line: capyctl_config::tensorfold_native::TensorfoldLine::Python,
         launch: None,
         extensions_built: false,
     }
@@ -103,6 +120,38 @@ fn a_tensorfold_spec_resolves_only_as_tensorfold() {
     assert!(resolve(Engine::Tensorfold, tensorfold(), None).is_ok());
     assert!(matches!(
         resolve(Engine::Vllm, tensorfold(), None),
+        Err(RuntimeError::Unsupported)
+    ));
+}
+
+// T41 (ADR 0039 §1): a TensorFold spec resolves its line; a launch plan of
+// the other line than the spec's is not this binding's launch.
+#[test]
+fn a_tensorfold_spec_and_its_plan_share_one_line() {
+    use capyctl_config::tensorfold_native::TensorfoldLine;
+    let with = |line: TensorfoldLine, plan_line: TensorfoldLine| AdapterSpec::Tensorfold {
+        endpoint: "http://127.0.0.1:8000".parse().unwrap(),
+        fingerprint: "1.0.0".into(),
+        model_id: "m".into(),
+        line,
+        launch: Some(crate::tensorfold::PlanInputTensorfold {
+            line: plan_line,
+            ..Default::default()
+        }),
+        extensions_built: false,
+    };
+    assert!(resolve(
+        Engine::Tensorfold,
+        with(TensorfoldLine::Native, TensorfoldLine::Native),
+        None
+    )
+    .is_ok());
+    assert!(matches!(
+        resolve(
+            Engine::Tensorfold,
+            with(TensorfoldLine::Native, TensorfoldLine::Python),
+            None
+        ),
         Err(RuntimeError::Unsupported)
     ));
 }
@@ -124,6 +173,26 @@ fn a_llamacpp_spec_resolves_only_as_llamacpp() {
     assert!(resolve(Engine::Llamacpp, llamacpp(), None).is_ok());
     assert!(matches!(
         resolve(Engine::Tensorfold, llamacpp(), None),
+        Err(RuntimeError::Unsupported)
+    ));
+}
+
+fn tensorrt_llm() -> AdapterSpec {
+    AdapterSpec::TensorrtLlm {
+        endpoint: "http://127.0.0.1:8000".parse().unwrap(),
+        fingerprint: "1.2.1".into(),
+        model_id: "m".into(),
+        launch: None,
+    }
+}
+
+// T49 (ADR 0038 §1): TensorRT-LLM resolves for its own family only.
+#[test]
+fn a_tensorrt_llm_spec_resolves_only_as_tensorrt_llm() {
+    assert_eq!(tensorrt_llm().engine(), Engine::TensorrtLlm);
+    assert!(resolve(Engine::TensorrtLlm, tensorrt_llm(), None).is_ok());
+    assert!(matches!(
+        resolve(Engine::Custom, tensorrt_llm(), None),
         Err(RuntimeError::Unsupported)
     ));
 }

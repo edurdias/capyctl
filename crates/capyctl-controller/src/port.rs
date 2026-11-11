@@ -61,6 +61,10 @@ pub struct RuntimeEndpoint {
     /// ([`LifecyclePort::abort_request`]). Only an SGLang 0.5.22 launch with one
     /// tokenizer worker, on a host whose session declares the abort operation.
     pub request_abort: bool,
+    /// ADR 0037 §§6, 7: the launch was started with engine tracing (its
+    /// launch-time decision, recorded before Ready, was on). Only such a
+    /// launch's engine is sent a trace context.
+    pub engine_trace: bool,
 }
 
 /// ADR 0013 §10 (unit I3): one instance of a deployment that holds a runtime,
@@ -126,6 +130,14 @@ pub trait LifecyclePort: Send + Sync {
     /// router refuses the other endpoint for it before any activation.
     fn deployment_api(&self, deployment: &str) -> Result<DeploymentApi, LifecycleFault>;
 
+    /// SPEC §10, ADR 0014 §2 (#240): the deployment's declared in-flight
+    /// bound. `None` keeps the router's default for an undeclared setting or
+    /// an authority without managed configuration. This is durable policy,
+    /// never an engine-load observation.
+    fn deployment_request_limit(&self, _deployment: &str) -> Result<Option<usize>, LifecycleFault> {
+        Ok(None)
+    }
+
     /// One deployment's current record.
     fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, LifecycleFault>;
 
@@ -186,6 +198,21 @@ pub trait LifecyclePort: Send + Sync {
         _generation: i64,
     ) -> Result<Option<RuntimeEndpoint>, LifecycleFault> {
         self.runtime_endpoint(deployment)
+    }
+
+    /// ADR 0036 §§3, 5: the native dimension of the embeddings instance
+    /// incarnation `generation`: the length of the vector its embedding
+    /// probe answered at readiness, as its recorded wake canary reference
+    /// holds it. `None` when that launch recorded no embedding reference yet
+    /// (or holds no runtime). The router refuses a llama.cpp request whose
+    /// `dimensions` differs from it. The default is an authority that
+    /// records no references.
+    fn embedding_dimension(
+        &self,
+        _deployment: &str,
+        _generation: i64,
+    ) -> Result<Option<usize>, LifecycleFault> {
+        Ok(None)
     }
 
     /// SPEC §10, ADR 0013 §10: open a durable lease charged to exactly the
@@ -266,6 +293,34 @@ pub trait LifecyclePort: Send + Sync {
         self.wait_terminal(&op).await.map(|_| ())
     }
 
+    /// ADR 0037 §4: as [`LifecyclePort::activate_for_request`], recording
+    /// the activation's steps under `activation`, the root span of its own
+    /// trace, which the router opened for the waiting requests to link to.
+    /// The authority ends it. The default records no step: it ends the span
+    /// with the activation's outcome.
+    async fn activate_for_request_traced(
+        &self,
+        deployment: &str,
+        mut activation: capyctl_trace::Span,
+    ) -> Result<(), LifecycleFault> {
+        let result = self.activate_for_request(deployment).await;
+        activation.set(capyctl_trace::Attr::Outcome(match result {
+            Ok(()) => capyctl_trace::Outcome::Completed,
+            Err(LifecycleFault::Uncertain(_)) => capyctl_trace::Outcome::Uncertain,
+            Err(_) => capyctl_trace::Outcome::Failed,
+        }));
+        activation.end();
+        result
+    }
+
+    /// ADR 0037 §6 (ADR 0017): whether the host whose ingress serves this
+    /// instance incarnation declared the `trace_context` capability, so the
+    /// router may send it trace headers. The default is an authority with no
+    /// remote hosts: none.
+    fn trace_context(&self, _deployment: &str, _generation: i64) -> bool {
+        false
+    }
+
     /// SPEC §6.3, §6.5, §10: the refusal a request gets when nothing runs or
     /// moves for `deployment` and no request may start it (an operator's stop,
     /// an explicit activation), checked without starting anything. The router
@@ -317,6 +372,36 @@ pub trait LifecyclePort: Send + Sync {
     /// is no longer an open cancelling lease of the current session (already
     /// settled, or uncertain): nothing changes. An error leaves it charged.
     async fn acknowledge_cancelled_request(
+        &self,
+        _lease_id: &str,
+    ) -> Result<bool, crate::request_leases::LeaseRefused> {
+        Ok(false)
+    }
+
+    /// ADR 0036 §4 (owner decision 2026-10-27, question 7): close the
+    /// cancelling lease `lease_id` of a cut embeddings request that the
+    /// router read to its end and whose answer was completion, journaling
+    /// `request_cancellation_acknowledged` with the embeddings receipt (no
+    /// abort was sent). `Ok(false)` when the lease is no longer an open
+    /// cancelling lease of the current session (already settled on the
+    /// engine's idle reading, or uncertain): nothing changes. An error leaves
+    /// it charged. The default is an authority with no ledger to settle.
+    async fn settle_answered_cut(
+        &self,
+        _lease_id: &str,
+    ) -> Result<bool, crate::request_leases::LeaseRefused> {
+        Ok(false)
+    }
+
+    /// ADR 0036 §4: "A complete engine error answer is answered, as today,
+    /// and settles on the engine's idle reading." Record the cancelling lease
+    /// `lease_id` of a cut embeddings request, cancelled before the engine
+    /// answered it, as answered now that its complete error answer was read,
+    /// so only an idle reading taken after that answer settles it. `Ok(false)`
+    /// when the lease is no longer an open cancelling lease of the current
+    /// session: nothing changes, and it keeps today's rule. An error leaves it
+    /// charged. The default is an authority with no ledger to record it in.
+    async fn answer_cut(
         &self,
         _lease_id: &str,
     ) -> Result<bool, crate::request_leases::LeaseRefused> {

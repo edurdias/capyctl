@@ -194,6 +194,7 @@ fn launch(digest: bool, startup: bool) -> MemberAction {
         startup_host_bytes: None,
         lmcache: None,
         devices: Vec::new(),
+        vllm_device_request_no_floor: false,
     })
 }
 
@@ -229,6 +230,7 @@ fn every_post_baseline_field_names_its_capability() {
                     owned_handle: handle(),
                     max_tokens: None,
                     decision: false,
+                    embedding: false,
                 },
                 0,
             ),
@@ -242,10 +244,25 @@ fn every_post_baseline_field_names_its_capability() {
                     owned_handle: handle(),
                     max_tokens: None,
                     decision: true,
+                    embedding: false,
                 },
                 0,
             ),
             vec![DECISIONS],
+        ),
+        // T34, T47 (ADR 0036 §§5, 6): likewise, only a host with `embeddings`
+        // is sent an embedding probe.
+        (
+            wire(
+                MemberAction::Probe {
+                    owned_handle: handle(),
+                    max_tokens: None,
+                    decision: false,
+                    embedding: true,
+                },
+                0,
+            ),
+            vec![EMBEDDINGS],
         ),
         (
             wire(
@@ -370,12 +387,18 @@ fn every_post_baseline_field_names_its_capability() {
             CHECKPOINT_TABLES,
             CHECKPOINT_GGUF,
             DECISIONS,
+            EMBEDDINGS,
             CUSTOM_ENGINES,
             STARTUP_HOST_BYTES,
             LMCACHE,
             RETENTION,
+            LMCACHE_ENGINE_DRIVEN,
             REQUEST_ABORT,
             LOCAL_TENSOR_PARALLEL,
+            TRACE_CONTEXT,
+            TENSORFOLD_NATIVE,
+            VLLM_DEVICE_REQUEST_NO_FLOOR,
+            CUDA_GRAPH_PHASES,
         ]
         .contains(name)
         {
@@ -415,6 +438,7 @@ fn the_gate_refuses_typed_before_anything_is_sent() {
             owned_handle: "h".into(),
             max_tokens: None,
             decision: false,
+            embedding: false,
         },
         0,
     );
@@ -536,7 +560,11 @@ fn live_profile_update_is_declared_both_ways() {
     // ADR 0033 §12: and `lmcache`, so a host sends its LMCache samples.
     assert_eq!(
         server_capabilities(),
-        vec![LIVE_PROFILE_UPDATE.to_owned(), LMCACHE.to_owned()]
+        vec![
+            LIVE_PROFILE_UPDATE.to_owned(),
+            LMCACHE.to_owned(),
+            INSTALLATION_UNSUPPORTED.to_owned(),
+        ]
     );
     let before = pb::SessionReady {
         controller_id: "c".into(),
@@ -596,6 +624,51 @@ fn decisions_gates_only_decision_deployments() {
         decisions_refusal(&agent_capabilities().into_iter().collect()),
         None
     );
+}
+
+// T47 T34 (ADR 0036 §1): `embeddings` is a capability every current agent
+// declares. It is no placement requirement for other deployments: only an
+// embeddings deployment is refused, typed, on a host without it, at
+// placement and as its launch's own requirement, so an older host never
+// runs a chat probe against an embedding server.
+#[test]
+fn embeddings_gates_only_embedding_deployments() {
+    use capabilities::*;
+    assert_eq!(EMBEDDINGS, "embeddings");
+    assert!(CATALOGUE.contains(&(EMBEDDINGS, Direction::ServerToHost)));
+    assert!(agent_capabilities().contains(&EMBEDDINGS.to_owned()));
+    assert!(agent_capabilities().len() <= MAX_DECLARED);
+    assert!(!PLACEMENT_REQUIRED.contains(&EMBEDDINGS));
+    assert!(is_gate_refusal(&missing(EMBEDDINGS)));
+    let current: BTreeSet<String> = agent_capabilities().into_iter().collect();
+    let older: BTreeSet<String> = current
+        .iter()
+        .filter(|name| *name != EMBEDDINGS)
+        .cloned()
+        .collect();
+    assert_eq!(
+        embeddings_refusal(&older).as_deref(),
+        Some("host_capability_missing:embeddings")
+    );
+    assert_eq!(embeddings_refusal(&current), None);
+    assert_eq!(decisions_refusal(&older), None);
+    assert_eq!(custom_engines_refusal(&older), None);
+
+    let embeddings = launch_with(serde_json::json!({"api": "embeddings"}));
+    assert_eq!(required(&embeddings), vec![CHECKPOINT_DIGEST, EMBEDDINGS]);
+    assert_eq!(
+        refusal_for(&older, &embeddings).as_deref(),
+        Some("host_capability_missing:embeddings")
+    );
+    assert_eq!(refusal_for(&current, &embeddings), None);
+    for api in ["chat", "decisions"] {
+        let other = launch_with(serde_json::json!({ "api": api }));
+        assert_eq!(required(&other), vec![CHECKPOINT_DIGEST], "{api}");
+        assert_eq!(refusal_for(&older, &other), None, "{api}");
+    }
+    // A value merely mentioning the word is no embeddings deployment.
+    let named = launch_with(serde_json::json!({"description": "embeddings"}));
+    assert_eq!(required(&named), vec![CHECKPOINT_DIGEST]);
 }
 
 // T44 T34 (ADR 0031 §9): `custom_engines` is a capability every current
@@ -709,6 +782,40 @@ fn lmcache_and_retention_gate_only_the_deployments_that_need_them() {
     assert_eq!(refusal_for(&older, &plain), None);
     assert_eq!(refusal_for(&current, &needs_lmcache), None);
     assert_eq!(refusal_for(&current, &zero), None);
+}
+
+// T45 T34 (ADR 0034 §1, ADR 0017): `lmcache_engine_driven` is a capability
+// every current agent declares beside `lmcache`. No command needs it and it
+// is no placement requirement: the server reads it to plan a parking
+// residency's LMCache (off `host_capability_missing` on a host without it),
+// so an older host is never sent anything new.
+#[test]
+fn engine_driven_lmcache_is_declared_and_needs_no_new_command_field() {
+    use capabilities::*;
+    assert_eq!(LMCACHE_ENGINE_DRIVEN, "lmcache_engine_driven");
+    assert_eq!(
+        LMCACHE_ENGINE_DRIVEN,
+        capyctl_config::lmcache::ENGINE_DRIVEN_CAPABILITY
+    );
+    assert!(CATALOGUE.contains(&(LMCACHE_ENGINE_DRIVEN, Direction::ServerToHost)));
+    assert!(agent_capabilities().contains(&LMCACHE_ENGINE_DRIVEN.to_owned()));
+    assert!(agent_capabilities().contains(&LMCACHE.to_owned()));
+    assert!(!PLACEMENT_REQUIRED.contains(&LMCACHE_ENGINE_DRIVEN));
+    assert!(agent_capabilities().len() <= MAX_DECLARED);
+    let current: BTreeSet<String> = agent_capabilities().into_iter().collect();
+    let older: BTreeSet<String> = current
+        .iter()
+        .filter(|name| *name != LMCACHE_ENGINE_DRIVEN)
+        .cloned()
+        .collect();
+    for settings in [
+        serde_json::json!({}),
+        serde_json::json!({"residency": "deep", "lmcache": "required"}),
+    ] {
+        let launch = launch_with(settings);
+        assert!(!required(&launch).contains(&LMCACHE_ENGINE_DRIVEN));
+        assert_eq!(refusal_for(&older, &launch), refusal_for(&current, &launch));
+    }
 }
 
 fn refusal_for(declared: &BTreeSet<String>, command: &pb::ExecuteMember) -> Option<String> {
@@ -911,6 +1018,33 @@ fn a_launch_on_several_gpus_needs_local_tensor_parallel() {
     );
 }
 
+// T41 T34 (ADR 0039 §15, ADR 0017): the native TensorFold line is a
+// server-to-host feature this build's agent declares; a host without it is
+// refused a native-line revision, typed, and nothing else changes for it.
+#[test]
+fn a_native_tensorfold_revision_needs_tensorfold_native() {
+    use capabilities::*;
+    assert_eq!(TENSORFOLD_NATIVE, "tensorfold_native");
+    assert!(CATALOGUE.contains(&(TENSORFOLD_NATIVE, Direction::ServerToHost)));
+    assert!(agent_capabilities().contains(&TENSORFOLD_NATIVE.to_owned()));
+    assert!(!PLACEMENT_REQUIRED.contains(&TENSORFOLD_NATIVE));
+    assert!(is_gate_refusal("host_capability_missing:tensorfold_native"));
+    let everything: BTreeSet<String> = agent_capabilities().into_iter().collect();
+    let older: BTreeSet<String> = everything
+        .iter()
+        .filter(|c| *c != TENSORFOLD_NATIVE)
+        .cloned()
+        .collect();
+    assert_eq!(tensorfold_native_refusal(&everything, true), None);
+    assert_eq!(tensorfold_native_refusal(&older, false), None);
+    assert_eq!(
+        tensorfold_native_refusal(&older, true).as_deref(),
+        Some("host_capability_missing:tensorfold_native")
+    );
+    // Every other launch is sent to such a host as before.
+    assert_eq!(refusal(false, &older, &wire(launch(true, true), 0)), None);
+}
+
 // T46 (ADR 0035 §8): the per-GPU readings are additive: a resident without
 // them encodes exactly as before, and one with them decodes back unchanged.
 #[test]
@@ -967,4 +1101,141 @@ fn the_memory_source_is_an_additive_field() {
     };
     let decoded = pb::DomainObservation::decode(bounded.encode_to_vec().as_slice()).unwrap();
     assert_eq!(decoded, bounded);
+}
+
+// T34 T26 (SPEC §20; ADR 0017 §§2–3): 0.2.0 hosts declare both additions,
+// but neither makes an otherwise supported N-1 host ineligible for old work.
+#[test]
+fn the_020_launch_capabilities_are_declared_without_requiring_an_upgrade() {
+    use capabilities::*;
+    assert_eq!(VLLM_DEVICE_REQUEST_NO_FLOOR, "vllm_device_request_no_floor");
+    assert_eq!(CUDA_GRAPH_PHASES, "cuda_graph_phases");
+    for capability in [VLLM_DEVICE_REQUEST_NO_FLOOR, CUDA_GRAPH_PHASES] {
+        assert!(CATALOGUE.contains(&(capability, Direction::ServerToHost)));
+        assert!(agent_capabilities().contains(&capability.to_owned()));
+        assert!(!PLACEMENT_REQUIRED.contains(&capability));
+        assert!(is_gate_refusal(&missing(capability)));
+    }
+    let policy = assess("0.1.11", "0.2.0");
+    assert_eq!(policy.state, Compatibility::UpgradeRecommended);
+    let older: BTreeSet<String> = agent_capabilities()
+        .into_iter()
+        .filter(|name| name != VLLM_DEVICE_REQUEST_NO_FLOOR && name != CUDA_GRAPH_PHASES)
+        .collect();
+    for command in [
+        wire(launch(true, true), 0),
+        launch_with(serde_json::json!({
+            "engine_config": {"max_concurrent_requests": 16}
+        })),
+    ] {
+        assert_eq!(refusal(policy.state.drain_only(), &older, &command), None);
+    }
+}
+
+// T34 T26 (SPEC §20; ADR 0017 §3, ADR 0019 §§3–4): only the explicit
+// no-floor marker needs the capability; an old host must not rederive it
+// using its historical 75% floor.
+#[test]
+fn a_no_floor_launch_is_refused_typed_on_a_supported_n_minus_one_host() {
+    use capabilities::*;
+    let current: BTreeSet<String> = agent_capabilities().into_iter().collect();
+    let mut older = current.clone();
+    older.remove(VLLM_DEVICE_REQUEST_NO_FLOOR);
+    let policy = assess("0.1.11", "0.2.0");
+    let MemberAction::LaunchSingle(mut plan) = launch(true, true) else {
+        unreachable!()
+    };
+    let legacy = wire(MemberAction::LaunchSingle(plan.clone()), 0);
+    assert_eq!(refusal_for(&older, &legacy), None);
+    plan.vllm_device_request_no_floor = true;
+    let command = wire(MemberAction::LaunchSingle(plan), 0);
+    assert!(required(&command).contains(&VLLM_DEVICE_REQUEST_NO_FLOOR));
+    assert_eq!(
+        refusal(policy.state.drain_only(), &older, &command).as_deref(),
+        Some("host_capability_missing:vllm_device_request_no_floor")
+    );
+    assert_eq!(refusal_for(&current, &command), None);
+}
+
+// T34 T14 (SPEC §15.3, §20; ADR 0017 §3): every SGLang phase object needs
+// the new capability, even when both phases are enabled. Scalar booleans and
+// an omitted setting keep their old N-1 behavior.
+#[test]
+fn only_sglang_phase_objects_need_the_graph_capability() {
+    use capabilities::*;
+    let current: BTreeSet<String> = agent_capabilities().into_iter().collect();
+    let mut older = current.clone();
+    older.remove(CUDA_GRAPH_PHASES);
+    let policy = assess("0.1.11", "0.2.0");
+    for prefill in [false, true] {
+        for decode in [false, true] {
+            let command = launch_with(serde_json::json!({
+                "engine": {"type": "sglang"},
+                "engine_config": {"cuda_graphs": {"prefill": prefill, "decode": decode}}
+            }));
+            assert!(required(&command).contains(&CUDA_GRAPH_PHASES));
+            assert_eq!(
+                refusal(policy.state.drain_only(), &older, &command).as_deref(),
+                Some("host_capability_missing:cuda_graph_phases")
+            );
+            assert_eq!(refusal_for(&current, &command), None);
+        }
+    }
+    for settings in [
+        serde_json::json!({}),
+        serde_json::json!({"cuda_graphs": false}),
+        serde_json::json!({"cuda_graphs": true}),
+        serde_json::json!({"max_concurrent_requests": 16}),
+    ] {
+        let command = launch_with(serde_json::json!({
+            "engine": {"type": "sglang"},
+            "engine_config": settings
+        }));
+        assert!(!required(&command).contains(&CUDA_GRAPH_PHASES));
+        assert_eq!(refusal_for(&older, &command), None);
+    }
+}
+
+// T34 T14 (SPEC §15.3, §20; ADR 0017 §3): profile-selected engines also
+// need the phase-object gate; preflight and the send fence use this helper.
+#[test]
+fn a_profile_selected_graph_object_needs_the_same_preflight_gate() {
+    let command = launch_with(serde_json::json!({
+        "engine": {"profile": "local"},
+        "engine_config": {"cuda_graphs": {"prefill": false, "decode": true}}
+    }));
+    let Some(pb::execute_member::Action::LaunchSingle(plan)) = &command.action else {
+        unreachable!()
+    };
+    assert!(capabilities::cuda_graph_phases_required(
+        &plan.deployment_config
+    ));
+    assert!(capabilities::required(&command).contains(&capabilities::CUDA_GRAPH_PHASES));
+}
+
+// T34 — ADR 0017 / #235: every 0.1.x server lacks this refusal code.
+// The host withholds only this new refusal, never an older policy refusal.
+#[test]
+fn installation_unsupported_reaches_only_a_server_that_takes_it() {
+    use capabilities::*;
+    use capyctl_protocol::execution::{is_policy_refusal, POLICY_REFUSALS};
+    const EDITABLE: &str = "installation_unsupported:editable";
+    assert_eq!(INSTALLATION_UNSUPPORTED, "installation_unsupported");
+    assert!(CATALOGUE.contains(&(INSTALLATION_UNSUPPORTED, Direction::HostToServer)));
+    assert!(agent_capabilities().contains(&INSTALLATION_UNSUPPORTED.to_owned()));
+    assert!(!PLACEMENT_REQUIRED.contains(&INSTALLATION_UNSUPPORTED));
+    assert!(is_policy_refusal(EDITABLE));
+    let older = vec![LIVE_PROFILE_UPDATE.to_owned(), LMCACHE.to_owned()];
+    for server in [older, Vec::new()] {
+        assert!(!server_takes_refusal(&server, EDITABLE), "{server:?}");
+        for reason in POLICY_REFUSALS.iter().filter(|reason| **reason != EDITABLE) {
+            assert!(server_takes_refusal(&server, reason), "{reason}");
+        }
+    }
+    for reason in POLICY_REFUSALS {
+        assert!(
+            server_takes_refusal(&server_capabilities(), reason),
+            "{reason}"
+        );
+    }
 }

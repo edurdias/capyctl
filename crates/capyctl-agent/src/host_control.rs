@@ -263,6 +263,9 @@ impl HostControl {
                     "installation": {"version": status.installation_version,
                         "digest": status.installation_digest, "state": status.installation_state},
                     "deep_park": declared["security"]["deep_park"], "deep_park_probe": probe,
+                    // ADR 0038 §2: TensorRT-LLM's companion versions, so a
+                    // role's own installation lists them as a registered one.
+                    "companions": declared["companions"],
                 }),
             );
         }

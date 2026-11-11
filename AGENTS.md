@@ -124,7 +124,7 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   above (no new environments beyond the listed exceptions) still apply to the lab
   hosts.
 - Do not change engine environments, drivers, or reboot hosts. The engine virtual
-  environments in use, all owner-approved (list updated 2026-11-09):
+  environments in use, all owner-approved (list updated 2026-11-10):
   - both hosts: SGLang 0.5.21, SGLang 0.5.22 (approved 2026-10-17, for decision
     models), vLLM 0.30.0, TensorFold 0.6.5 and TensorFold 0.6.6
     (on host B, each TensorFold venv is a byte-identical copy of host A's, made with
@@ -153,6 +153,24 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     be copied byte-identical to host B once qualified; and llama.cpp b12242 (commit
     3b4d6ab3, CUDA architecture 121a, ~/llamacpp-b12242), for comparing PrismML's
     Ternary Bonsai 2 27B (Hadamard-rotated ternary GGUF) with the NVFP4 builds;
+  - host A only, for qualifying TensorFold's native line (ADR 0039): TensorFold
+    1.0.0 at ~/tensorfold-1.0.0 (the release archive as installed, owner decision
+    2026-10-25) and TensorFold 1.1.5 at ~/tensorfold-1.1.5 (the release archive,
+    unpacked with its checksum file checked, owner decision 2026-10-27);
+  - host A, approved 2026-11-10 for the measured 0.2.0 catalog: SGLang 0.5.23
+    (~/sglang-0.5.23-venv, torch 2.14.1+cu130), TensorFold native 1.2.6
+    (~/tensorfold-1.2.6, checksum-verified aarch64 release), llama.cpp v0.9.0
+    (~/llamacpp-v0.9.0, commit cd959bae99ff4bed22bef2604f45241c09bbb8c8,
+    CUDA architecture 121a-real), TensorRT-LLM 1.4.0rc3
+    (~/tensorrt-llm-1.4.0rc3-venv, aarch64 NVIDIA wheel, torch 2.14.0+cu132,
+    pip Open MPI 4.1.8 and mpi4py), and LMCache 0.5.7 source builds in copies
+    of the latest engine environments (~/vllm-0.33.0-lmcache057-venv,
+    torch 2.14.0+cu130; ~/sglang-0.5.23-lmcache057-venv, torch 2.14.1+cu130,
+    both TORCH_CUDA_ARCH_LIST=12.1). Existing environments remain read-only;
+    the new approved installations stay after session cleanup. Measurement
+    authorization requires an idle host; owner work takes precedence. Never
+    touch anything under ~/capyctl-extract* on either host. A busy host B may
+    run only GPU-less CapyCTL control roles, never an engine or measurements.
   - the maintainer's discrete-GPU laptop, approved 2026-11-09: the official
     `lmsysorg/sglang:v0.5.22` Docker image, for the live check of #230 (an editable
     SGLang refused at `engine add`); removed after that check, to be pulled again for
@@ -163,6 +181,12 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     (~/vllm-0.32.0-venv), SGLang 0.5.22 (~/sglang-0.5.22-venv) and the llama.cpp
     v0.7.0 build (~/llamacpp-v0.7.0), made and removed by
     `scripts/live/multi-gpu/run.sh`, with their fingerprints recorded with the rows.
+  - the rented one-GPU machine for 0.2.0 (owner decision 2026-11-10), for its one
+    session only: fresh x86_64 CUDA installs of vLLM 0.32.0 and 0.33.0, SGLang 0.5.22
+    and 0.5.23 (and an editable SGLang 0.5.23 for #235), LMCache in a copy of one
+    engine's environment, the llama.cpp v0.9.0 build, TensorFold native 1.1.5 and
+    1.2.6 (x86_64 release archives) and TensorRT-LLM, made and removed by
+    `scripts/live/v020/run.sh`, with their fingerprints recorded with the rows.
 
   Use these as they are. Do not create or modify any engine environment without the
   owner's explicit approval, and add each approved one to this list.
@@ -173,6 +197,15 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   everything it created; the owner shuts the machine down straight afterwards. The
   other rules here apply to it (one live session at a time, fault injection only by
   signals to CapyCTL-owned processes, no driver, CUDA or system-package change).
+- The rented machines for 0.2.0 (owner decisions 2026-11-10): one x86_64 machine
+  with one A100 80 GB card and 160 GB of RAM (the RTX PRO 6000 first chosen was out
+  of stock; session done and deleted), then, once one was available, one x86_64
+  machine with one RTX PRO 6000 Blackwell 96 GB card, each rented from Shadeform
+  with a $20 spending cap and supervised by `scripts/live/shade_session.py`, are
+  authorized as live hosts for one session each: the 0.2.0 rows of
+  `scripts/live/v020/`, including the timing and memory rows (recorded as
+  discrete-GPU evidence) and the optional TensorFold 0.6.6 baseline for TF3. The
+  same rules apply to them as to the ADR 0035 machine above.
 - Only one live session runs on the hosts at a time.
 - Fault injection is limited to signals sent to CapyCTL-owned processes (PIDs taken
   from ownership evidence) and one bounded external memory allocation. Never change

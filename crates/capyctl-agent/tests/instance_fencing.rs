@@ -83,6 +83,7 @@ fn launch(id: &str, deployment: &str, instance: u32, generation: i64, slot: u8) 
             checkpoint_layout: None,
             checkpoint_tables: None,
             checkpoint_gguf: None,
+            vllm_device_request_no_floor: false,
             startup_bytes: None,
             startup_host_bytes: None,
             lmcache: None,

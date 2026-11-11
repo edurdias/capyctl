@@ -39,6 +39,9 @@ pub struct ServerConfig {
     /// ADR 0028 §11 (decided 2026-10-06): `groups`, the server's multi-node
     /// group settings.
     pub groups: ServerGroups,
+    /// ADR 0037 §12: `observability.tracing`, off unless an endpoint is named
+    /// ([`crate::tracing::server_tracing`]). Role-local.
+    pub tracing: crate::tracing::ServerTracing,
 }
 /// SPEC §17 (M80): `observability.timing_header` of a server (or a standalone
 /// document's `server:` block). Omitted, off; anything but a boolean is refused.
@@ -323,6 +326,10 @@ pub struct HostConfig {
     /// Owner decision 2026-10-22: `engine_telemetry`, whether the engines'
     /// own usage reporting keeps its defaults ([`engine_telemetry`]).
     pub engine_telemetry: EngineTelemetry,
+    /// ADR 0037 §7, §12: `observability.tracing`, off unless an endpoint is
+    /// named ([`crate::tracing::host_tracing`]). Role-local: never in the
+    /// document deployments are resolved against.
+    pub tracing: crate::tracing::HostTracing,
     pub document: Value,
     /// Owner decision 2026-09-25: the generic overrides (`--set`,
     /// `CAPYCTL_SET__…`) the host started with. A live reload of the document
@@ -621,6 +628,7 @@ impl ServerConfig {
             heartbeat: heartbeat_timeouts(&v)?,
             switch_drain_timeout: switch_drain_timeout(&v)?,
             timing_header: timing_header(&v)?,
+            tracing: crate::tracing::server_tracing(&v)?,
             groups: server_groups(&v)?,
         })
     }
@@ -768,6 +776,7 @@ impl HostConfig {
             lmcache: host_lmcache(&document)?,
             retention: host_retention(&document)?,
             engine_telemetry: engine_telemetry(&document)?,
+            tracing: crate::tracing::host_tracing(&document)?,
             document,
             overrides: crate::setting_overrides::SettingOverrides::none(ConfigKind::Host),
         })
@@ -797,12 +806,16 @@ impl HostConfig {
     /// (`crate::engine_settings`), to its document before it is published:
     /// the runtime directory, the engines' port range and the `local_engine`
     /// executables as the `local` runtime profiles. `probe` reads an
-    /// executable's version when no fingerprint is stated.
+    /// executable's version (ADR 0038 §2: with TensorRT-LLM's companion
+    /// versions) when no fingerprint is stated.
     pub fn with_engines(
         self,
         flags: &crate::engine_settings::EngineOverrides,
         env: &crate::engine_settings::EngineOverrides,
-        probe: &dyn Fn(crate::engine_policy::Engine, &Path) -> Result<String, String>,
+        probe: &dyn Fn(
+            crate::engine_policy::Engine,
+            &Path,
+        ) -> Result<crate::registration::CheckedVersion, String>,
     ) -> Result<Self, ConfigError> {
         let stated = crate::engine_settings::EngineOverrides::from_document(&self.document)?;
         let settings = crate::engine_settings::resolve(flags, env, &stated);

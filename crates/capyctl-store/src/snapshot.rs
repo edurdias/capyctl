@@ -165,6 +165,12 @@ pub struct DeploymentSnapshot {
     /// GPU without `auto`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topology: Option<serde_json::Value>,
+    /// ADR 0039 §3, §7: what the current revision runs as when it is not a
+    /// certified combination (a TensorFold native version or checkpoint the
+    /// owner has not certified). Notes, never a refusal. Additive; absent
+    /// when there is none or the revision does not decode.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// ADR 0014 §5 (owner decision 2026-09-25): the effective context of the
@@ -175,28 +181,33 @@ type LaunchStatus = (
     Option<capyctl_config::context_fit::ContextFit>,
     Option<capyctl_config::parsers::Parsers>,
     capyctl_config::effective::DeploymentApi,
+    Vec<String>,
 );
 
 /// ADR 0024: the parsers are chosen where the context is fitted, the same way.
-/// ADR 0030 §1: the revision's API is read from the same decode.
+/// ADR 0030 §1: the revision's API is read from the same decode. ADR 0039 §7:
+/// so are the native TensorFold notes; a remote host's checkpoint is never
+/// read here, so its notes say nothing of the checkpoint's `config.json`.
 fn context_status(
     conn: &rusqlite::Connection,
     deployment_id: &str,
 ) -> rusqlite::Result<LaunchStatus> {
     let Some((effective, remote)) = current_effective(conn, deployment_id)? else {
-        return Ok((None, None, Default::default()));
+        return Ok((None, None, Default::default(), Vec::new()));
     };
     Ok(if remote {
         (
             Some(capyctl_config::context_fit::fit_on_remote_host(&effective)),
             capyctl_config::parsers::parsers_on_remote_host(&effective),
             effective.api,
+            capyctl_config::tensorfold_native::deployment_notes(&effective, false),
         )
     } else {
         (
             Some(capyctl_config::context_fit::fit_for_effective(&effective)),
             capyctl_config::parsers::parsers_for_effective(&effective),
             effective.api,
+            capyctl_config::tensorfold_native::deployment_notes(&effective, true),
         )
     })
 }
@@ -234,6 +245,9 @@ pub struct DeploymentCapacity {
     pub name: String,
     /// `None` when the current revision does not decode.
     pub max_running: Option<capyctl_config::context_fit::MaxRunning>,
+    /// SPEC §10 (#240): the current revision's declared router bound.
+    /// `None` keeps the router default, independently of engine running limits.
+    pub request_limit: Option<usize>,
     pub instances: Vec<InstanceCapacity>,
 }
 
@@ -269,6 +283,7 @@ impl Store {
                         id: r.get(0)?,
                         name: r.get(1)?,
                         max_running: None,
+                        request_limit: None,
                         instances: Vec::new(),
                     })
                 },
@@ -303,14 +318,30 @@ impl Store {
             }
         }
         for entry in &mut deployments {
-            entry.max_running = current_effective(&tx, &entry.id)?.map(|(effective, remote)| {
-                let fit = if remote {
-                    capyctl_config::context_fit::fit_on_remote_host(&effective)
-                } else {
-                    capyctl_config::context_fit::fit_for_effective(&effective)
-                };
-                capyctl_config::context_fit::max_running_for_effective(&effective, &fit, remote)
-            });
+            // SPEC §10 / #240: project the declared bound independently of
+            // snapshot decoding, in the same lookup already needed for capacity.
+            use rusqlite::OptionalExtension;
+            let row: Option<(Option<String>, bool, Option<u32>)> = tx
+                .query_row(
+                    "SELECT e.effective_json,EXISTS(SELECT 1 FROM host_effective_revisions h JOIN enrolled_hosts x ON x.host_id=h.host_id WHERE h.deployment_id=d.id AND h.revision=d.revision),
+                            CASE WHEN json_valid(e.effective_json) THEN json_extract(e.effective_json,'$.engine_config.common.max_concurrent_requests') END
+                       FROM deployments d LEFT JOIN effective_revisions e ON e.deployment_id=d.id AND e.revision=d.revision WHERE d.id=?1",
+                    [&entry.id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let (raw, remote, declared) = row.unwrap_or((None, false, None));
+            entry.request_limit = declared.map(|count| count as usize);
+            entry.max_running = raw
+                .and_then(|raw| capyctl_config::effective::decode_effective_snapshot(&raw).ok())
+                .map(|effective| {
+                    let fit = if remote {
+                        capyctl_config::context_fit::fit_on_remote_host(&effective)
+                    } else {
+                        capyctl_config::context_fit::fit_for_effective(&effective)
+                    };
+                    capyctl_config::context_fit::max_running_for_effective(&effective, &fit, remote)
+                });
         }
         Ok(deployments)
     }
@@ -420,6 +451,12 @@ pub struct InstanceSnapshot {
     /// planned before ADR 0033 and an instance never started. Additive.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lmcache: Option<InstanceLmcache>,
+    /// ADR 0037 §13: the engine tracing of the instance's retained launch,
+    /// as decided when it launched: `on`, or `off` with its reason. Absent
+    /// for a launch recorded before engine tracing, a group instance and an
+    /// instance not running. Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_tracing: Option<crate::engine_tracing::InstanceEngineTracing>,
     /// ADR 0035 §1a, §5: an instance on several GPUs of one host, or under
     /// `topology: auto`: what was asked for (`requested`: `"auto"` or N),
     /// and once placed the size it runs at and its GPUs in rank order
@@ -494,6 +531,31 @@ pub struct InstanceLmcache {
     /// revision on its host rather than the allowances.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub measured: Option<bool>,
+    /// On only, ADR 0034 §3a, §6: `false` for a `lmcache: required` launch
+    /// run outside the certified (qualified) set, `true` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certified: Option<bool>,
+    /// On and uncertified only: why, as status shows it after
+    /// "uncertified: ".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uncertified: Option<String>,
+    /// On only, ADR 0034 §4: where the pool's size came from (`auto`,
+    /// `stated`, `default`); absent for a launch planned before ADR 0034.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_source: Option<String>,
+    /// On only: the tokens the pool keeps for sure after an eviction, when
+    /// the model's KV bytes per token is known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_tokens: Option<u64>,
+    /// On only: how the pool was sized, as status shows it (`auto: one
+    /// 32,768-token context of qwen3 at 144 KiB per token`, `stated`,
+    /// `default: <why>`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_basis: Option<String>,
+    /// On only: the pool keeps fewer tokens than one full context, or
+    /// admission shrank it to the host-KV room left; the remedy included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// ADR 0031 §6, SPEC §10: requests whose client hung up, whose deadline cut
@@ -900,6 +962,7 @@ impl Store {
                 parsers: None,
                 api: Default::default(),
                 topology: None,
+                notes: Vec::new(),
             })
         })?;
         let mut deployments = deployments;
@@ -937,7 +1000,8 @@ impl Store {
             entry.startup = crate::ordinary_lifecycle::startup::status(&tx, &entry.id)?;
             entry.parked = crate::ordinary_lifecycle::parked_charge::status(&tx, &entry.id)?;
             entry.topology = crate::ordinary_lifecycle::startup::topology_status(&tx, &entry.id)?;
-            (entry.context, entry.parsers, entry.api) = context_status(&tx, &entry.id)?;
+            (entry.context, entry.parsers, entry.api, entry.notes) =
+                context_status(&tx, &entry.id)?;
             entry.switch = crate::switch_state::status(&tx, &entry.id)?;
             entry.warm = crate::switch_state::is_warm(&tx, &entry.id)?;
             if crate::switch_state::is_explicit_activation(&tx, &entry.id)? {
@@ -1047,6 +1111,7 @@ impl Store {
                         }
                     },
                     lmcache: None,
+                    engine_tracing: None,
                     topology: None,
                     collectives: None,
                 },
@@ -1070,6 +1135,11 @@ impl Store {
                     .unwrap_or_else(|| entry.revision.clone());
                 instance.group = group_status(&tx, &deployment, instance.index, &revision)?;
                 instance.lmcache = instance_lmcache(&tx, &deployment, instance.index)?;
+                instance.engine_tracing = crate::engine_tracing::instance_engine_tracing(
+                    &tx,
+                    &deployment,
+                    instance.index,
+                )?;
                 if instance.group.is_none() {
                     instance.topology =
                         instance_topology(&tx, &deployment, instance.index, &revision)?;
@@ -1379,9 +1449,53 @@ fn instance_topology(
     }))
 }
 
+/// ADR 0034 §§3a, 4: how a launch's pool was sized and whether it runs
+/// uncertified, as `launch_lmcache` recorded it (all null for a launch
+/// planned before ADR 0034).
+struct PoolRow {
+    source: Option<String>,
+    bytes_per_token: Option<i64>,
+    context_tokens: Option<i64>,
+    unknown: Option<String>,
+    shrunk_from: Option<i64>,
+    warning: Option<String>,
+    uncertified: Option<String>,
+    model_type: Option<String>,
+}
+
+impl PoolRow {
+    /// The recorded sizing of a pool of `pool` bytes, `None` for a launch
+    /// planned before ADR 0034. A recorded source this build does not know
+    /// is corrupt.
+    fn sizing(
+        &self,
+        pool: i64,
+    ) -> Result<Option<capyctl_config::lmcache::PoolSizing>, SnapshotError> {
+        use capyctl_config::lmcache::{PoolBasis, PoolSizing, PoolSource};
+        let Some(source) = self.source.as_deref() else {
+            return Ok(None);
+        };
+        let figure = |n: Option<i64>| n.and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0);
+        Ok(Some(PoolSizing {
+            pool_bytes: u64::try_from(pool).map_err(|_| SnapshotError::CorruptData)?,
+            source: PoolSource::parse(source).ok_or(SnapshotError::CorruptData)?,
+            basis: figure(self.bytes_per_token)
+                .zip(figure(self.context_tokens))
+                .map(|(bytes_per_token, context_tokens)| PoolBasis {
+                    bytes_per_token,
+                    context_tokens,
+                }),
+            unknown: self.unknown.clone(),
+            shrunk_from: figure(self.shrunk_from),
+        }))
+    }
+}
+
 /// ADR 0033 §9: the LMCache of the newest launch of the instance's current
 /// incarnation: on or off (the host's report, else the store's plan), why it
-/// is off, the server's state and the charge the launch holds for it.
+/// is off, the server's state and the charge the launch holds for it. ADR
+/// 0034 §§3a, 4: on, whether it is certified, and how its pool was sized,
+/// with the pool's warning.
 fn instance_lmcache(
     tx: &Transaction<'_>,
     deployment: &str,
@@ -1403,6 +1517,7 @@ fn instance_lmcache(
         bool,
         bool,
         bool,
+        PoolRow,
     );
     let row: Option<Row> = tx
         .prepare_cached(
@@ -1412,7 +1527,9 @@ fn instance_lmcache(
                     EXISTS(SELECT 1 FROM management_events e WHERE e.kind='lmcache_server_exited'
                        AND e.deployment_id=l.deployment_id
                        AND json_extract(e.payload_json,'$.binding_id')=l.binding_id),
-                    i.observed_state='parked',l.held_kv_state IS 'held',l.observed_device_bytes
+                    i.observed_state='parked',l.held_kv_state IS 'held',l.observed_device_bytes,
+                    l.pool_source,l.pool_bytes_per_token,l.pool_context_tokens,l.pool_unknown,
+                    l.pool_shrunk_from,l.pool_warning,l.uncertified,l.pool_model_type
                FROM launch_lmcache l
                JOIN deployment_instances i ON i.deployment_id=l.deployment_id
                 AND i.instance_index=l.instance_index AND i.generation=l.generation
@@ -1435,6 +1552,16 @@ fn instance_lmcache(
                 r.get(13)?,
                 r.get(14)?,
                 r.get(15)?,
+                PoolRow {
+                    source: r.get(17)?,
+                    bytes_per_token: r.get(18)?,
+                    context_tokens: r.get(19)?,
+                    unknown: r.get(20)?,
+                    shrunk_from: r.get(21)?,
+                    warning: r.get(22)?,
+                    uncertified: r.get(23)?,
+                    model_type: r.get(24)?,
+                },
             ))
         })
         .optional()?;
@@ -1452,6 +1579,7 @@ fn instance_lmcache(
         exited,
         parked,
         kv_held,
+        pool_row,
     )) = row
     else {
         return Ok(None);
@@ -1489,6 +1617,12 @@ fn instance_lmcache(
             held_kv_bytes: None,
             charge_bytes: None,
             measured: None,
+            certified: None,
+            uncertified: None,
+            pool_source: None,
+            pool_tokens: None,
+            pool_basis: None,
+            warning: None,
         }));
     }
     let (Some(pool), Some(overhead), Some(device), Some(held_kv)) =
@@ -1511,6 +1645,7 @@ fn instance_lmcache(
     // server above what its charge held.
     let gpu = device.saturating_add(if held { held_kv } else { 0 });
     charge = charge.saturating_add(observed.unwrap_or(0).saturating_sub(gpu).max(0));
+    let sizing = pool_row.sizing(pool)?;
     Ok(Some(InstanceLmcache {
         state: "on".into(),
         reason: None,
@@ -1522,6 +1657,14 @@ fn instance_lmcache(
         held_kv_bytes: restart_park.then_some(held_kv),
         charge_bytes: (server != "stopped").then_some(charge),
         measured: Some(measured),
+        certified: Some(pool_row.uncertified.is_none()),
+        uncertified: pool_row.uncertified,
+        pool_source: sizing.as_ref().map(|s| s.source.code().to_owned()),
+        pool_tokens: sizing.as_ref().and_then(|s| s.tokens_kept()),
+        pool_basis: sizing
+            .as_ref()
+            .map(|s| s.basis_text(pool_row.model_type.as_deref())),
+        warning: pool_row.warning,
     }))
 }
 
@@ -1803,5 +1946,26 @@ mod capacity_tests {
             .collect();
         assert_eq!(instances, [(0, Some(4), "ready"), (1, None, "stopped")]);
         assert!(store.capacity(Some("missing")).unwrap().is_empty());
+        // T19 / SPEC §§10, 17: a declared bound remains independently
+        // readable when the rest of a revision is not decodable.
+        for (raw, expected) in [
+            (
+                r#"{"engine_config":{"common":{"max_concurrent_requests":48}}}"#,
+                Some(48),
+            ),
+            ("not json", None),
+        ] {
+            store
+                .conn
+                .execute(
+                    "UPDATE effective_revisions SET effective_json=?1 WHERE deployment_id='d'",
+                    [raw],
+                )
+                .unwrap();
+            let capacity = store.capacity(Some("d")).unwrap();
+            assert_eq!(capacity[0].request_limit, expected);
+            assert_eq!(capacity[0].max_running, None);
+            assert_eq!(store.deployment_request_limit("d").unwrap(), expected);
+        }
     }
 }

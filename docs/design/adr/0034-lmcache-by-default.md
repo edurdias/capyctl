@@ -7,9 +7,11 @@ question on 2026-10-27, and the answers are recorded below ("Owner decisions of
 is qualified in 0.2.0 (§2, §3, owner decision 7), and the model types beyond `qwen3` are
 the most-used open-weight dense chat model types on OpenRouter that fit the hosts (§2,
 owner decision 9). The owner's rule of the same day on certified combinations changes what
-`lmcache: required` does outside the qualified table (§3a, §6). Nothing is implemented
-yet; the SPEC, ADR, guide and operations texts listed in §8 change with the
-implementation.
+`lmcache: required` does outside the qualified table (§3a, §6). Implemented on
+2026-10-28 (branch `feat/lmcache-default`, store schema v60), with the texts of §8; the
+live rows LC12–LC18 have not run, so `QUALIFIED_PARKING` and the LC16/LC18 results that
+move `restart_only` to engine-driven transfer are still empty, and the model list of §2 is
+compiled and awaits the owner.
 **Amends (with the implementation):** ADR 0033 §1 (the launch-time check reads the
 transfer-mode and eviction options), §3 (the server's argument vector), §4 (the rendered
 connector), §6 (the pool size), §7 (parking residencies and the qualified table;
@@ -155,25 +157,47 @@ issue names as the one compatible with sleep. Its costs:
 
 - **Speed.** Each store and load is a copy through host memory rather than the server's
   zero-copy pull. Without a shared-memory segment (`--shm-name`, empty by default, and
-  CapyCTL passes none, A2) the chunks travel pickled over the request socket
-  ([server_transfer.py](https://github.com/LMCache/LMCache/blob/v0.5.6/lmcache/v1/multiprocess/modules/server_transfer.py),
-  `PickleTransferStrategy`). No figure for it on this hardware exists.
-- **Local code execution.** The pickle path's `commit_store` runs
-  `pickle.loads(cpu_data)` on bytes received on the server's request port
-  (`server_transfer.py`, `PickleTransferStrategy.commit_store`); the shared-memory
-  strategy keeps that path as its fallback for a non-empty payload. The request port is
-  loopback-only and unauthenticated (ADR 0033 §3, "Local reach"), so any local process
-  that reaches it can make the server unpickle its bytes, which runs code as the role's
-  service user [INFERENCE: from the handler, not exercised]. ADR 0033 accepted that a
-  local process can read, store or clear KV; this is more. Today's servers do not expose
-  it: they run the default `lmcache_driven` mode only (`server.py` registers the
-  engine-driven module only under `engine_driven` or `auto`).
-- **Hybrid models.** In 0.5.6 the engine-driven contexts refuse hybrid KV cache groups
-  (sliding-window, recurrent or indexer layers beside full attention). Multi-group support
-  is PR #4410, merged 2026-10-24; the release candidates tagged 0.5.7rc1 the same day may
-  or may not carry it [INFERENCE], and no stable release does yet
-  ([releases](https://github.com/LMCache/LMCache/releases)). Until an approved environment
-  has it, only dense full-attention model types can qualify.
+  CapyCTL passes none, A2), 0.5.6 pickles the chunks over the request socket.
+  In 0.5.7, `InlineTransferStrategy` instead validates a typed tensor envelope,
+  including group-major layouts, before writing the reserved objects
+  ([0.5.7 server_transfer.py](https://github.com/LMCache/LMCache/blob/v0.5.7/lmcache/v1/multiprocess/modules/server_transfer.py)).
+  Neither source inspection nor the older benchmark measures 0.5.7's transfer cost;
+  LC16 must measure the selected engine/torch/LMCache combination.
+- **Local reach.** The request port remains loopback-only and unauthenticated
+  (ADR 0033 §3). In 0.5.6, `PickleTransferStrategy.commit_store` calls
+  `pickle.loads(cpu_data)`; the shared-memory strategy also falls back to that path for
+  non-empty payloads. A local process reaching it can therefore run code as the role's
+  service user [INFERENCE: from the handler, not exercised]. In 0.5.7, the inline
+  strategy and shared-memory fallback use the typed envelope, not pickle; that specific
+  unpickling risk no longer describes this path. This is not authentication or a
+  general security qualification: local processes can still read, store or clear KV.
+- **Hybrid models.** The 0.5.6 engine-driven contexts refuse hybrid KV cache groups
+  (sliding-window, recurrent or indexer layers beside full attention). The 0.5.7 release
+  contains grouped engine-driven transfer
+  ([engine_driven_transfer.py](https://github.com/LMCache/LMCache/blob/v0.5.7/lmcache/v1/multiprocess/modules/engine_driven_transfer.py)).
+  This removes that source-level limitation, not the requirement to qualify each
+  engine/model/GPU/residency combination before adding a table row.
+
+### LMCache 0.5.7 dependency and isolation audit (2026-11-10)
+
+[GitHub v0.5.7](https://github.com/LMCache/LMCache/releases/tag/v0.5.7)
+is the release source; it is not published on PyPI as of this audit. Both 0.5.6 and
+0.5.7 build their stock CUDA wheels against torch 2.13.0/CUDA 13.0
+([0.5.7 pyproject.toml](https://github.com/LMCache/LMCache/blob/v0.5.7/pyproject.toml)).
+Do not replace an engine's torch to fit that wheel. Build the GitHub tag separately
+against each engine's already installed torch, without build isolation and with engine
+dependency constraints: vLLM 0.33.0/torch 2.14.0 and SGLang 0.5.23/torch 2.14.1.
+The build needs the matching CUDA toolkit and host C++ compiler; a release wheel's
+existence is not proof of ABI compatibility with either engine.
+
+The launch-time source check retains 0.5.6 support and accepts 0.5.7's
+`ObjectKeyIdentity`-backed `ObjectKey.cache_salt` only when construction, replacement
+and the getter preserve the salt. It also checks the salt passed through SGLang's
+`IPCCacheServerKey.from_token_ids` factory and its return
+([distributed/api.py](https://github.com/LMCache/LMCache/blob/v0.5.7/lmcache/v1/distributed/api.py),
+[custom_types.py](https://github.com/LMCache/LMCache/blob/v0.5.7/lmcache/v1/multiprocess/custom_types.py)).
+Versioned real-source fixtures exercise both releases and refusal when these hops
+drop the salt (T45). These CPU checks are not live qualification and add no table rows.
 
 ### The pool, the context and `host_kv_limit`
 
@@ -251,10 +275,11 @@ engine-driven transfer:
   "engine_driven"`;
 - SGLang's owner-only configuration file gains `extra_config` holding the same key,
   beside `mp_host` and `mp_port`;
-- no `--shm-name`: the pickle transport, so no shared-memory segment to size, charge or
-  clean up. LC16 measures it; if its cost fails LC16's bounds, a variant with a segment
-  is measured before anything ships with one (and its segment is then charged and
-  removed with the launch like A5's files).
+- no `--shm-name`: inline request-socket transport (pickle on 0.5.6; a validated typed
+  tensor envelope on 0.5.7), so no shared-memory segment to size, charge or clean up.
+  LC16 measures it; if its cost fails LC16's bounds, a variant with a segment is measured
+  before anything ships with one (and its segment is then charged and removed with the
+  launch like A5's files).
 
 Every other LMCache launch, `restart_only` included, moves to engine-driven transfer too
 once two rows pass: LC16's bounds, and LC18, a restart-park row on LC14's protocol that
@@ -303,6 +328,12 @@ combination under test, as LC4 was meant to be.
 
 **Pass criteria.** A combination (exact engine version, `model_type`, GPU product name,
 residency) enters the released table when, on that combination:
+
+For sleep-based parking, the installation must first preserve the external cache through
+sleep (amendment of 2026-11-10 below). LC13–LC16, including the enrolled-host LC15 row,
+cannot pass on an installation whose sleep clears LMCache. A typed refusal or an
+`auto` fallback proves the compatibility guard only: it is not a passing hit, memory,
+endurance or cost qualification and must not add a row to `QUALIFIED_PARKING`.
 
 - **Correctness (LC13, LC14).** Every first request after a wake, at temperature 0, gives
   the answer a `lmcache: off` deployment of the same model and residency gives for the same prompt;
@@ -499,9 +530,9 @@ valid size. Removed: the refusals `lmcache_unavailable:park_unqualified` and
   that `lmcache: required` outside the table runs uncertified; the `restart_only` bullet
   says it is for models that cannot park deep.
 - **`docs/guide/engines.md`**, LMCache: the qualified table, marked certified, the
-  transfer modes, the "Local reach" paragraph extended with engine-driven's pickle path and
-  the host's `lmcache: off` as its remedy (owner decision 1), "Long prompts" rewritten
-  around the automatic pool and the warning.
+  transfer modes, the "Local reach" paragraph extended with 0.5.6's pickle risk and
+  0.5.7's typed envelope, plus the host's `lmcache: off` remedy (owner decision 1),
+  and "Long prompts" rewritten around the automatic pool and the warning.
 - **`docs/operations/configuration.md`** and **`docs/guide/deploy.md`**: `lmcache_pool:
   auto`, and standalone's `host_kv_limit` as 10 % of the memory observed at start, and
   settable (owner decision 4). **`docs/guide/errors.md`**: the new reason and event, and
@@ -515,11 +546,11 @@ valid size. Removed: the refusals `lmcache_unavailable:park_unqualified` and
   from host RAM, without the restart that `restart_only` costs.
 - A deep park keeps the pool and the server's overhead charged, as every LMCache park
   does; it never holds engine KV, since the server maps none.
-- Any local process that reaches a parking deployment's LMCache request port can make
-  the server unpickle its bytes, so run code as the role's service user; once LC16 and
-  LC18 pass this holds for every LMCache deployment, `restart_only` included. The host's
-  `lmcache: off` and `retention: zero`, and the deployment's `lmcache: off`, remain the
-  remedies, and the guide says so (owner decision 1).
+- The LMCache request port is still unauthenticated loopback. On 0.5.6, engine-driven
+  transfer allows local code execution through pickle [INFERENCE: source inspection,
+  not exercised]; 0.5.7 uses the validated typed tensor envelope instead. Local KV
+  access remains possible on both. The host's `lmcache: off` and `retention: zero`,
+  and the deployment's `lmcache: off`, remain the remedies (owner decision 1).
 - Pools grow with the model and the context: a Qwen3-4B deployment with a 32k context
   holds 8 GiB instead of 4 GiB, parked or not. The cap keeps any one pool within the
   host-KV limit, and admission shrinks or drops an automatic pool rather than refusing an
@@ -545,8 +576,8 @@ valid size. Removed: the refusals `lmcache_unavailable:park_unqualified` and
 - **Unregister and re-register the connector around a park from CapyCTL.** Not
   available: the connector lives in the engine's workers, and neither engine exposes a
   call to do it; it would need upstream changes.
-- **`--supported-transfer-mode auto` on every server.** Rejected: it would expose the
-  pickle path on servers that never use it.
+- **`--supported-transfer-mode auto` on every server.** Rejected: it enables an unused
+  transfer surface (including the pickle path on 0.5.6); each server serves one mode only.
 - **Run every LMCache launch engine-driven now.** Adopted only conditionally (owner
   decision 5): every launch moves once LC16 and LC18 pass, since its cost and its
   behaviour across restart-parks are unmeasured.
@@ -658,10 +689,11 @@ memory and RAM are recorded with the rows.
 The proposal of 2026-10-24 asked nine questions; the owner answered all of them. The
 decision sections above already read as decided.
 
-1. **The pickle path:** (a), as recommended. Engine-driven transfer's pickle path is on by
-   default for parking deployments, documented beside ADR 0033's "Local reach" with the
-   host's `lmcache: off` as the remedy, and an upstream issue asking for a payload format
-   that is not pickle is drafted, not filed (§1, §8).
+1. **The pickle path:** (a), as recommended for the then-current 0.5.6. Engine-driven
+   transfer's pickle path was accepted for parking deployments, documented beside
+   ADR 0033's "Local reach" with the host's `lmcache: off` remedy. The proposed upstream
+   non-pickle format is present in 0.5.7 as a typed tensor envelope; the release-specific
+   transfer and local-reach descriptions above supersede that implementation detail.
 2. **The automatic pool:** (a), as recommended: one full context after eviction, at least
    4 GiB (§4).
 3. **A pool that does not fit the room left:** (b), as recommended: it shrinks to the room
@@ -692,3 +724,55 @@ malformed requests) are unaffected. Here it turns the qualified table into the c
 set: `lmcache: required` on a combination outside it, or on a model across several GPUs,
 runs uncertified instead of being refused (§3a, §6, §7); `lmcache: auto` keeps LMCache off
 there, and the refusals that describe the installation or a safety setting stay.
+
+## Amendment of 2026-11-10: sleep may clear the external cache
+
+LC15 on the rented discrete GPU, vLLM 0.33.0 with LMCache 0.5.7, used the intended
+`host_backed` rendering: engine-driven transfer on both sides, loopback-only listeners,
+and the same owned server throughout the wakes. Its 32k prompt was stored, but every
+post-sleep lookup missed. The engine log reports 5 GiB of KV discarded at sleep; the
+server's GPU reading stays at 416 MiB. The recorded 5 GiB `held_kv_bytes` was a CapyCTL
+accounting defect, not an IPC mapping: engine-driven launches must reserve zero held
+engine KV. LMCache-driven restart-parks retain A13's reserve and A15's guards.
+
+The installed vLLM 0.33.0 `v1/engine/core.py:993–1008` calls
+`pause_scheduler(clear_cache=True)` for sleep levels 1 and 2. Its
+`_finish_pause` and `_reset_caches` (`:932–953`) reset the external connector by default.
+The downloaded vLLM 0.32.0 wheel has the same chain (`:898–919`, `:959–974`), so this
+is not a 0.33.0-only version restriction. LMCache's
+[`LMCacheMPConnector.reset_cache`](https://github.com/LMCache/LMCache/blob/v0.5.7/lmcache/integration/vllm/lmcache_mp_connector.py)
+calls its scheduler adapter's
+[`reset_cache`](https://github.com/LMCache/LMCache/blob/v0.5.7/lmcache/integration/vllm/vllm_multi_process_adapter.py),
+which sends `CLEAR` to each server. The
+[`management.clear`](https://github.com/LMCache/LMCache/blob/v0.5.7/lmcache/v1/multiprocess/modules/management.py)
+handler clears the storage manager, with no client or model namespace. The corresponding
+0.5.6 sources have the same behavior.
+
+Neither engine's inspected sleep route exposes a preserve-external-cache argument:
+level 0 releases no GPU memory, and `release_kv_cache_memory` also resets the connector.
+LMCache 0.5.6 and 0.5.7 expose no server option to ignore `CLEAR`. Their custom server
+module extension is not a built-in preservation mode; CapyCTL does not override upstream
+cache-reset semantics with Python patches.
+
+The launch-time shape check therefore rejects this known sleep-reset chain for vLLM
+sleep-based parking with `sleep_clears_cache`. `lmcache: required` refuses
+`lmcache_unavailable:sleep_clears_cache`; `auto` keeps the requested parking residency
+and reports LMCache off with that reason and its explanation in status and events.
+Restart-only parking is unaffected: it stops the engine rather than calling sleep.
+The October checks in the status runbook
+("An enrolled host wakes a model parked with LMCache" and the held-KV bound check) used
+`restart_only`, LMCache-driven transfer and engine restarts. Their hits do not establish
+external-cache retention across sleep.
+
+LC13–LC16 still require real hits and the original memory and cost bounds on a
+compatible installation; LC15 additionally requires the enrolled-host wake canary.
+The observed parked system footprint also exceeded its bound by 677 MB: clearing the
+cache or fixing its accounting is not evidence that this memory bound now passes.
+The engine's parked RSS was 17,097,093,120 bytes with LMCache, against 14,768,627,712
+without it, while its parked GPU figure was identical (620 MiB). The selected async
+engine-driven transfer implementation returns pinned CPU staging tensors to a
+[`_staging_pool`](https://github.com/LMCache/LMCache/blob/v0.5.7/lmcache/v1/multiprocess/transfer_context/async_engine_driven.py)
+instead of freeing them after a transfer. This is consistent with the extra host RSS,
+not evidence of retained GPU KV. No live retest establishes a reduced host footprint.
+No sleep-based vLLM row is qualified by this investigation. CPU and Fake-engine tests
+are not qualification.

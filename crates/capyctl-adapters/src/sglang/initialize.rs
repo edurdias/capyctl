@@ -158,15 +158,23 @@ async fn launch(
     if let Some(connector) = &connector {
         // ADR 0033 §4: the owner-only connector file, named by the public
         // settings; the entry renders `enable_lmcache` and the file and pins
-        // both after SGLang resolved its arguments.
+        // both after SGLang resolved its arguments. ADR 0034 §1: the file
+        // names the transfer mode the server serves.
         let dir = connector.plan().config_dir.clone();
         let port = connector.rpc_port();
-        let file =
-            tokio::task::spawn_blocking(move || crate::lmcache::write_sglang_config(&dir, port))
-                .await
-                .map_err(|_| RuntimeError::Uncertain("LMCache configuration task failed".into()))?
-                .map_err(|e| RuntimeError::Uncertain(format!("LMCache configuration: {e}")))?;
+        let transfer = connector.plan().transfer;
+        let file = tokio::task::spawn_blocking(move || {
+            crate::lmcache::write_sglang_config(&dir, port, transfer)
+        })
+        .await
+        .map_err(|_| RuntimeError::Uncertain("LMCache configuration task failed".into()))?
+        .map_err(|e| RuntimeError::Uncertain(format!("LMCache configuration: {e}")))?;
         launch.rendered = launch.rendered.with_lmcache_config_file(&file)?;
+    }
+    // ADR 0037 §7: a launch decided traced names its collector in the
+    // public descriptor; the entry renders and pins the owned options.
+    if let Some(endpoint) = adapter.trace_endpoint() {
+        launch.rendered = launch.rendered.with_trace_endpoint(endpoint)?;
     }
 
     // SPEC §13.3: the private descriptor and the two credentials ride protected
@@ -484,6 +492,29 @@ async fn launch(
         .map_err(|e| {
             RuntimeError::Uncertain(redact_text(&format!(
                 "engine listed the model but did not answer the decision probe: {e}"
+            )))
+        })?;
+    } else if adapter.embeddings() {
+        // ADR 0036 §5, SPEC §6.1: an embedding server is ready when it
+        // answers the fixed embedding with one finite vector whose norm is
+        // above 1e-6. Never a chat probe in its place.
+        tokio::time::timeout(
+            probe_budget,
+            crate::traits::ChatForward::embedding_probe(
+                adapter,
+                adapter.served_name(),
+                probe_budget,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            failed(RuntimeError::Uncertain(
+                "probe deadline reached with the engine alive".into(),
+            ))
+        })?
+        .map_err(|e| {
+            RuntimeError::Uncertain(redact_text(&format!(
+                "engine listed the model but did not answer the embedding probe: {e}"
             )))
         })?;
     } else {

@@ -22,6 +22,7 @@ use capyctl_config::defaults::{resolve_startup, LoadOutcome};
 use capyctl_config::effective::ModelSource;
 use capyctl_config::engine_policy::Engine;
 pub use capyctl_config::model_settings::ModelOverrides;
+use capyctl_config::registration::CheckedVersion;
 use capyctl_config::schema::ConfigKind;
 pub use capyctl_config::setting_overrides::SettingOverrides;
 use capyctl_controller::coordinator::{
@@ -57,6 +58,7 @@ const ENGINE_BIN: &str = capyctl_config::engine_settings::VLLM_BIN_ENV;
 const SGLANG_BIN: &str = capyctl_config::engine_settings::SGLANG_BIN_ENV;
 const TENSORFOLD_BIN: &str = capyctl_config::engine_settings::TENSORFOLD_BIN_ENV;
 const LLAMACPP_BIN: &str = capyctl_config::engine_settings::LLAMACPP_BIN_ENV;
+const TENSORRT_LLM_BIN: &str = capyctl_config::engine_settings::TENSORRT_LLM_BIN_ENV;
 /// The directory model weights live under (Spec §7). Optional (owner decision
 /// 2026-09-25): `~/models` unless `--models-root`, this variable or
 /// `host.model_store.path` names another.
@@ -325,7 +327,10 @@ impl App {
         self.switcher
             .shutdown(crate::shutdown::SUPERVISION_JOIN_BOUND)
             .await;
-        self._coordinator.shutdown().await
+        let worker = self._coordinator.shutdown().await;
+        // ADR 0037 §8: a stopping role flushes its spans for at most 2 seconds.
+        self.deps.tracing.shutdown().await;
+        worker
     }
 }
 
@@ -634,7 +639,6 @@ impl App {
             name,
             name,
             &source,
-            first.installation.engine,
             &memory,
             request_deadline,
             first.installation.deep_park,
@@ -950,11 +954,14 @@ impl EnvEngineProvider {
         // SPEC §9.1 / T21 / ADR 0012: deep parking is on unless the host opts
         // out. Sleep mode follows the same switch as deep parking.
         let mut deep_park = deep_park.unwrap_or(settings.deep_park);
+        // ADR 0039 §2: the line follows the file name.
+        let line = capyctl_config::registration::executable_line(engine, &executable);
         // ADR 0023 §2, §6: an environment TensorFold install is checked
         // for its build toolchain as `engine add` checks it, and never parks.
+        // ADR 0039 §2: the toolchain check runs for the Python line only.
         if engine == Engine::Tensorfold {
             deep_park = false;
-            if fingerprint.is_none() {
+            if fingerprint.is_none() && line.is_python() {
                 let bin = executable.parent().unwrap_or(Path::new(""));
                 capyctl_config::toolchain::check(
                     bin,
@@ -979,13 +986,18 @@ impl EnvEngineProvider {
                 }
             }
         }
+        // ADR 0038 §2: TensorRT-LLM is restart-only and never parks.
+        if engine == Engine::TensorrtLlm {
+            deep_park = false;
+        }
         let trust_remote_code = settings.trust_remote_code;
         let installation_drift = settings.installation_drift;
-        let build_fingerprint = match (fingerprint, settings.build_fingerprint) {
-            (Some(registered), _) => registered.to_owned(),
-            (None, Some(declared)) => declared,
+        let checked = match (fingerprint, settings.build_fingerprint) {
+            (Some(registered), _) => CheckedVersion::from(registered),
+            (None, Some(declared)) => CheckedVersion::from(declared),
             (None, None) => probe_fingerprint(&executable, engine)?,
         };
+        let build_fingerprint = checked.build_fingerprint;
         let declared_kv = settings.kv_cache;
         let kv_cache_declared = declared_kv.is_some();
         let kv_cache_bytes = declared_kv.unwrap_or_else(|| DEFAULT_KV_CACHE.to_string());
@@ -996,14 +1008,16 @@ impl EnvEngineProvider {
         // default; an undeclared context is fitted to the KV grant at launch.
         // Explicit engine args are kept as the host's fixed args.
         let args = match engine {
-            Engine::Vllm | Engine::Tensorfold | Engine::Llamacpp => settings.args,
+            Engine::Vllm | Engine::Tensorfold | Engine::Llamacpp | Engine::TensorrtLlm => {
+                settings.args
+            }
             // ADR 0031 §1: a role's own installation is never a custom engine.
             Engine::Sglang | Engine::Custom => Vec::new(),
         };
         // ADR 0014 §2, §5: the generated standalone deployment states its KV
         // cache; its memory request is the Ready allocation it declares.
         let engine_config = serde_json::json!({"memory": {"kv_cache": kv_cache_bytes}});
-        verify_runtime(&role.runtime_dir, engine, deep_park)?;
+        verify_runtime(&role.runtime_dir, engine, line, deep_park)?;
         Ok(EngineInstallation {
             engine,
             executable,
@@ -1016,9 +1030,15 @@ impl EnvEngineProvider {
             runtime_dir: role.runtime_dir,
             args,
             installation_drift,
-            cuda_home: role.cuda_home,
+            // ADR 0039 §2: no CUDA toolkit is recorded for the native line.
+            cuda_home: role.cuda_home.filter(|_| line.is_python()),
             engine_ports: role.engine_ports,
-            registered: None,
+            // ADR 0038 §2: an environment installation has no engines.yaml
+            // profile; TensorRT-LLM's states the companion versions its check
+            // read, which the published profile carries as `engine add`
+            // writes them.
+            registered: (!checked.companions.is_empty())
+                .then(|| serde_json::json!({"companions": checked.companions})),
         })
     }
 }
@@ -1033,8 +1053,9 @@ impl EngineProvider for EnvEngineProvider {
             None => Err(no_installation(format!(
                 "this host declares no engine: set {ENGINE_BIN} (or {SGLANG_BIN} \
                  for SGLang, {TENSORFOLD_BIN} for TensorFold, {LLAMACPP_BIN} for \
-                 llama.cpp, or --vllm-bin / --sglang-bin / --tensorfold-bin / \
-                 --llamacpp-bin, or host.local_engine) to the engine's executable"
+                 llama.cpp, {TENSORRT_LLM_BIN} for TensorRT-LLM, or --vllm-bin / \
+                 --sglang-bin / --tensorfold-bin / --llamacpp-bin / \
+                 --tensorrt-llm-bin, or host.local_engine) to the engine's executable"
             ))),
         }
     }
@@ -1237,14 +1258,20 @@ fn runtime_dir(
 /// The runtime modules one installation of `engine` imports from `dir`.
 /// `deep_park` is the host's switch: with it on, a parking vLLM deployment
 /// renders sleep mode, whose entry imports the capability probes (ADR 0008).
-fn verify_runtime(dir: &Path, engine: Engine, deep_park: bool) -> Result<(), ProviderError> {
+/// ADR 0039 §2: a native TensorFold installation (`line`) imports none.
+fn verify_runtime(
+    dir: &Path,
+    engine: Engine,
+    line: capyctl_config::tensorfold_native::TensorfoldLine,
+    deep_park: bool,
+) -> Result<(), ProviderError> {
     // SPEC §9.1, §13.3 / T21 T37: the same integrity the host agent requires
     // before a launch. The engine imports capyctl's modules from this directory,
     // so one another account could rewrite is refused here, before anything
     // is served.
     capyctl_agent::runtime_integrity::verify(
         dir,
-        capyctl_agent::runtime_integrity::required_files(engine, deep_park),
+        capyctl_agent::runtime_integrity::required_files(engine, line, deep_park),
     )
     .map_err(|error| {
         no_installation(format!(
@@ -1257,8 +1284,40 @@ fn verify_runtime(dir: &Path, engine: Engine, deep_park: bool) -> Result<(), Pro
 
 /// [`probe_fingerprint`] for the host role, which states `local_engine`
 /// profiles in its document (owner rule 2026-09-25).
-pub(crate) fn engine_version(engine: Engine, executable: &Path) -> Result<String, String> {
+pub(crate) fn engine_version(engine: Engine, executable: &Path) -> Result<CheckedVersion, String> {
     probe_fingerprint(executable, engine).map_err(|error| error.to_string())
+}
+
+/// ADR 0038 §2: the role's own TensorRT-LLM is checked as `engine add`
+/// checks it: its environment resolved lexically from `bin/trtllm-serve`,
+/// then the bounded metadata-only query of its version and companion
+/// versions under the environment's interpreter. Nothing imports
+/// `tensorrt_llm` or runs `trtllm-serve`, which would start MPI and CUDA.
+fn tensorrt_llm_version(executable: &Path) -> Result<CheckedVersion, ProviderError> {
+    use capyctl_agent::engines::{check_version, resolve, VERSION_CHECK_TIMEOUT};
+    let resolved = resolve(executable).map_err(|error| {
+        no_installation(format!(
+            "{}: {error}; name a TensorRT-LLM environment's bin/trtllm-serve",
+            error.code()
+        ))
+    })?;
+    if resolved.engine != Engine::TensorrtLlm {
+        return Err(no_installation(format!(
+            "engine_unsupported: {} is not a TensorRT-LLM environment's bin/trtllm-serve",
+            executable.display()
+        )));
+    }
+    let reported = check_version(&resolved, VERSION_CHECK_TIMEOUT).map_err(|error| {
+        no_installation(format!(
+            "{}: {}: {error}; set {ENGINE_FINGERPRINT} to publish one explicitly",
+            error.code(),
+            executable.display()
+        ))
+    })?;
+    Ok(CheckedVersion {
+        build_fingerprint: reported.build_fingerprint,
+        companions: reported.companions,
+    })
 }
 
 /// What the installed engine says it is.
@@ -1266,8 +1325,19 @@ pub(crate) fn engine_version(engine: Engine, executable: &Path) -> Result<String
 /// The fingerprint pins the recipe, so it has to come from the installation rather
 /// than from a constant that would keep claiming the same build after an upgrade.
 /// A probe that fails or hangs is a refusal: an engine that cannot print its own
-/// version is not one this host should publish.
-fn probe_fingerprint(executable: &Path, engine: Engine) -> Result<String, ProviderError> {
+/// version is not one this host should publish. ADR 0038 §2: TensorRT-LLM is
+/// never asked (`trtllm-serve --version` imports the package and starts MPI);
+/// its installed metadata is read instead, with its companions.
+fn probe_fingerprint(executable: &Path, engine: Engine) -> Result<CheckedVersion, ProviderError> {
+    if engine == Engine::TensorrtLlm {
+        return tensorrt_llm_version(executable);
+    }
+    // ADR 0039 §2: the native TensorFold binary's version is read by the
+    // bounded standard-output check `engine add` runs (cleared environment,
+    // own process group), and must agree with the release's `VERSION`.
+    if capyctl_config::registration::executable_line(engine, executable).is_native() {
+        return native_fingerprint(executable).map(CheckedVersion::from);
+    }
     // ADR 0029 §2: `llama-server --version` writes to standard error.
     let reads_stderr = engine == Engine::Llamacpp;
     let (stdout, stderr) = if reads_stderr {
@@ -1334,7 +1404,8 @@ fn probe_fingerprint(executable: &Path, engine: Engine) -> Result<String, Provid
             .unwrap_or_default(),
         Engine::Vllm | Engine::Sglang => printed.trim().to_owned(),
         // ADR 0031 §1: a role's own installation is never a custom engine.
-        Engine::Custom => String::new(),
+        // ADR 0038 §2: TensorRT-LLM was read from its metadata above.
+        Engine::Custom | Engine::TensorrtLlm => String::new(),
     };
     if !status.success() || fingerprint.is_empty() {
         return Err(no_installation(format!(
@@ -1343,7 +1414,24 @@ fn probe_fingerprint(executable: &Path, engine: Engine) -> Result<String, Provid
             executable.display()
         )));
     }
-    Ok(fingerprint)
+    Ok(fingerprint.into())
+}
+
+/// ADR 0039 §2: the checked version of a native TensorFold binary, the
+/// profile's `build_fingerprint`; a binary that is not a release's
+/// `bin/tensorfold-native`, or whose version line cannot be read, is refused.
+fn native_fingerprint(executable: &Path) -> Result<String, ProviderError> {
+    let refused = |detail: String| {
+        no_installation(format!(
+            "{}: {detail}; set {ENGINE_FINGERPRINT} if this host publishes one another way",
+            executable.display()
+        ))
+    };
+    let resolved = capyctl_agent::engines::resolve(executable)
+        .map_err(|error| refused(format!("{}: {error}", error.code())))?;
+    capyctl_agent::engines::check_version(&resolved, capyctl_agent::engines::VERSION_CHECK_TIMEOUT)
+        .map(|reported| reported.build_fingerprint)
+        .map_err(|error| refused(format!("{}: {error}", error.code())))
 }
 
 /// Boot the embedded standalone graph (SPEC §15.2 no-config matrix) against the
@@ -1766,6 +1854,7 @@ async fn start_standalone_in(
         inference_auth,
         stated_host,
         group_stall_timeout,
+        (server_tracing, host_tracing),
     ) = {
         let path = match &outcome {
             LoadOutcome::Loaded(path) => PathBuf::from(path),
@@ -1841,6 +1930,12 @@ async fn start_standalone_in(
                 .and_then(|groups| groups.with_overrides(None, &|name| std::env::var(name).ok()))
                 .map_err(|error| StartError::Deploy(format!("standalone configuration: {error}")))?
                 .stall_timeout,
+            // ADR 0037 §12, T03: `server.observability.tracing` covers the
+            // whole process; `host.observability.tracing` takes only
+            // `engines`, exporting to the server block's loopback endpoint.
+            capyctl_config::tracing::standalone_tracing(&document).map_err(|error| {
+                StartError::Deploy(format!("standalone configuration: {error}"))
+            })?,
         )
     };
     // Owner decision 2026-10-20: `host.engine_logs` (validated by
@@ -1858,6 +1953,26 @@ async fn start_standalone_in(
         capyctl_config::remote_roles::engine_telemetry(&stated_host)
             .map_err(|error| StartError::Deploy(format!("standalone configuration: {error}")))?,
     );
+    // ADR 0037 §7: `host.observability.tracing.engines` holds for every
+    // launch from here on.
+    capyctl_adapters::engine_tracing::set_host_setting(
+        capyctl_adapters::engine_tracing::HostEngineTracing {
+            engines_on: host_tracing.engines == capyctl_config::EngineTracingSetting::On,
+            endpoint: host_tracing.export.as_ref().map(|e| e.endpoint.clone()),
+        },
+    );
+    // ADR 0037 §§1, 8: one tracing for the whole process (router and its
+    // embedded host), off unless the server block names an endpoint.
+    let tracing = crate::role_tracing::start(
+        server_tracing.export.as_ref(),
+        server_tracing.sample_ratio,
+        server_tracing.caller_context,
+        capyctl_trace::Service::Standalone,
+    )
+    .map_err(|detail| StartError::Deploy(format!("standalone configuration: {detail}")))?;
+    if tracing.is_on() {
+        capyctl_agent::host_tracing::install(tracing.clone());
+    }
     let db_path = state_dir.join("server").join("srv.sqlite3");
     // SPEC §15.2: an explicit document is operator configuration, not state,
     // so it does not bring the credentials a generated default would. A state
@@ -2362,6 +2477,11 @@ async fn start_standalone_in(
     // the caller serves it (`App::inference_router`), for status.
     let inference_listener =
         Arc::new(capyctl_management::inference_listener::InferenceListenerView::default());
+    // ADR 0037 §13: the role's tracing, read live by status.
+    {
+        let tracing = tracing.clone();
+        inference_listener.set_tracing(Arc::new(move || crate::role_tracing::status(&tracing)));
+    }
     let inference_listener_view = capyctl_management::inference_listener::inference_listener_router(
         capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
             .map_err(|_| StartError::MissingCredentials)?,
@@ -2379,7 +2499,9 @@ async fn start_standalone_in(
         CoordinatorLifecycle::new(coordinator.commands())
             .with_switcher(switcher.clone())
             .with_embedded_load(engine_load)
-            .with_group_stall_timeout(group_stall_timeout),
+            .with_group_stall_timeout(group_stall_timeout)
+            // ADR 0037 §4: activation traces and their steps.
+            .with_tracing(tracing.clone()),
     );
     let deps = capyctl_router::RouterDeps {
         controller: controller.clone(),
@@ -2390,6 +2512,8 @@ async fn start_standalone_in(
             controller.clone(),
         )),
         limits: capyctl_router::QueueLimits {
+            // SPEC §10 (#240): only the undeclared-setting default. The
+            // coordinator projects each deployment's configured bound live.
             max_requests_per_deployment: capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT
                 as usize,
             max_buffered_bytes_total: 64 * 1024 * 1024,
@@ -2397,6 +2521,7 @@ async fn start_standalone_in(
         api_key: Some(api_key.clone()),
         inflight,
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing,
     };
     let router = capyctl_router::serve_router(deps.clone());
     // Publish the ceiling before anything can be admitted against it. A deployment
@@ -2593,24 +2718,30 @@ mod tests {
         let vllm = script("vllm", "INFO loading\\n0.29.0\\n");
         let tensorfold = script("tensorfold", "tensorfold 0.6.0\\n\\n");
         assert_eq!(
-            probe_fingerprint(&python, Engine::Sglang).unwrap(),
+            probe_fingerprint(&python, Engine::Sglang)
+                .unwrap()
+                .build_fingerprint,
             "Python 3.12.3"
         );
         assert_eq!(
-            probe_fingerprint(&vllm, Engine::Vllm).unwrap(),
+            probe_fingerprint(&vllm, Engine::Vllm)
+                .unwrap()
+                .build_fingerprint,
             "INFO loading\n0.29.0"
         );
         assert_eq!(
-            probe_fingerprint(&tensorfold, Engine::Tensorfold).unwrap(),
+            probe_fingerprint(&tensorfold, Engine::Tensorfold)
+                .unwrap()
+                .build_fingerprint,
             "0.6.0"
         );
         assert_eq!(
             engine_version(Engine::Tensorfold, &tensorfold).unwrap(),
-            "0.6.0"
+            CheckedVersion::from("0.6.0")
         );
         assert_eq!(
             engine_version(Engine::Sglang, &python).unwrap(),
-            "Python 3.12.3"
+            CheckedVersion::from("Python 3.12.3")
         );
     }
 

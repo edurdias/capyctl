@@ -954,6 +954,7 @@ impl FakeHost {
                     checkpoint_layout: None,
                     checkpoint_tables: None,
                     checkpoint_gguf: None,
+                    vllm_device_request_no_floor: false,
                     startup_bytes: None,
                     startup_host_bytes: None,
                     lmcache: None,
@@ -978,6 +979,7 @@ impl FakeHost {
                 owned_handle,
                 max_tokens,
                 decision: _,
+                embedding: _,
             } => {
                 self.send_probe(&self.probe_command(owned_handle, max_tokens))
                     .await
@@ -1003,6 +1005,7 @@ impl FakeHost {
                 owned_handle,
                 max_tokens,
                 decision: false,
+                embedding: false,
             },
         };
         command.identity.payload_digest = command.canonical_digest();
@@ -1417,6 +1420,7 @@ fn launch(plan: GroupPlan) -> MemberAction {
             checkpoint_layout: None,
             checkpoint_tables: None,
             checkpoint_gguf: None,
+            vllm_device_request_no_floor: false,
             startup_bytes: None,
             startup_host_bytes: None,
             lmcache: None,
@@ -2071,6 +2075,7 @@ async fn head_answers_a_completion_probe_with_token_ids() {
                 owned_handle: out.owned_handle.clone(),
                 max_tokens: Some(2),
                 decision: false,
+                embedding: false,
             })
             .await
             .unwrap();
@@ -2085,6 +2090,7 @@ async fn head_answers_a_completion_probe_with_token_ids() {
                 owned_handle: out.owned_handle.clone(),
                 max_tokens: Some(1),
                 decision: false,
+                embedding: false,
             })
             .await
             .unwrap();
@@ -2095,6 +2101,7 @@ async fn head_answers_a_completion_probe_with_token_ids() {
                 owned_handle: out.owned_handle.clone(),
                 max_tokens: None,
                 decision: false,
+                embedding: false,
             })
             .await
             .unwrap();
@@ -2122,6 +2129,7 @@ async fn a_worker_answers_no_completion_probe() {
             owned_handle: out.owned_handle.clone(),
             max_tokens: Some(2),
             decision: false,
+            embedding: false,
         })
         .await
         .unwrap();

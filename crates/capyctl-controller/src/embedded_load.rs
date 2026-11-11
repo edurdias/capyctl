@@ -73,6 +73,15 @@ impl EmbeddedTargets {
                         capyctl_store::secrets::SecretRole::Inference,
                     )
                     .ok()?;
+                // ADR 0039 §11: the frozen revision selects how it is read.
+                let signal = launch_signal(
+                    &store
+                        .effective_configuration(&launch.fence.deployment_id)
+                        .ok()
+                        .flatten()
+                        .map(|configuration| configuration.effective)
+                        .unwrap_or(serde_json::Value::Null),
+                );
                 Some(LoadTarget {
                     scope: IngressScope {
                         host_id: self.host_id.clone(),
@@ -88,11 +97,23 @@ impl EmbeddedTargets {
                     owned_handle: launch.step_id,
                     target: SocketAddr::new(ip, url.port_or_known_default()?),
                     native,
-                    signal: capyctl_agent::load::LaunchSignal::Builtin,
+                    signal,
                     in_flight: 0,
                 })
             })
             .collect()
+    }
+}
+
+/// ADR 0039 §11: how an embedded launch's load is read, from its frozen
+/// revision. TensorFold's native line is read by its `/metrics` alone (its
+/// `/health` has no `busy`, so a fold would never read idle); every other
+/// launch, TensorFold 0.6 included, as a built-in engine.
+fn launch_signal(effective: &serde_json::Value) -> capyctl_agent::load::LaunchSignal {
+    if crate::local_readiness::tensorfold_native(effective) {
+        capyctl_agent::load::LaunchSignal::TensorfoldNative
+    } else {
+        capyctl_agent::load::LaunchSignal::Builtin
     }
 }
 
@@ -559,5 +580,120 @@ lmcache_mp_l1_memory_usage_bytes 1395864371
             .table()
             .lmcache_at(&other, capyctl_protocol::now_unix_ms())
             .is_none());
+    }
+
+    /// Launches on fake engines, each read with the signal its revision
+    /// selects.
+    struct Revisions(Vec<(&'static str, SocketAddr, Value)>);
+
+    impl LoadSource for Revisions {
+        fn targets(&self) -> Vec<LoadTarget> {
+            self.0
+                .iter()
+                .enumerate()
+                .map(|(n, (deployment, target, effective))| LoadTarget {
+                    scope: IngressScope {
+                        host_id: "lab".into(),
+                        deployment_id: (*deployment).into(),
+                        member_id: format!("binding-{n}"),
+                        binding_id: format!("binding-{n}"),
+                        incarnation: format!("inc-{n}"),
+                        generation: 1,
+                        revision: 1,
+                        instance_index: 0,
+                    },
+                    owned_handle: format!("step-{n}"),
+                    target: *target,
+                    native: Some([7; 32]),
+                    signal: launch_signal(effective),
+                    in_flight: 0,
+                })
+                .collect()
+        }
+    }
+
+    // T41 T37 (ADR 0039 §11): an embedded launch of TensorFold's native line
+    // reads idle on its `/metrics` 0 and 0 without reading `/health` (1.x's
+    // has no `busy`); a 0.6 launch on the same engine still folds `/health`,
+    // which here never reads idle.
+    #[tokio::test]
+    async fn an_embedded_native_launch_reads_idle_without_health() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        const IDLE: &str = "\
+# TYPE tensorfold:requests_running gauge
+tensorfold:requests_running 0
+# TYPE tensorfold:requests_waiting gauge
+tensorfold:requests_waiting 0
+# TYPE tensorfold:kv_cache_usage_ratio gauge
+tensorfold:kv_cache_usage_ratio{pool=\"0\"} 0
+";
+        const HEALTH: &str = r#"{"status":"ok","model":"toy","model_ids":["toy"],"max_batch_size":8,"warming":false,"memory":{"active":0,"cache":0,"peak":0},"live":{"connections":0,"waiting":0,"decode_tokens_per_second":0.0,"prefill_tokens_per_second":0.0}}"#;
+        async fn engine() -> (SocketAddr, Arc<AtomicUsize>) {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let counted = reads.clone();
+            let app = axum::Router::new()
+                .route("/metrics", axum::routing::get(|| async { IDLE }))
+                .route(
+                    "/health",
+                    axum::routing::get(move || {
+                        counted.fetch_add(1, SeqCst);
+                        async {
+                            (
+                                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                HEALTH,
+                            )
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (address, reads)
+        }
+        let (native, native_reads) = engine().await;
+        let (python, python_reads) = engine().await;
+        let source = Arc::new(Revisions(vec![
+            (
+                "a-native",
+                native,
+                json!({"profile": {"engine": "tensorfold", "line": "native"}}),
+            ),
+            (
+                "b-python",
+                python,
+                json!({"profile": {"engine": "tensorfold"}}),
+            ),
+        ]));
+        let reporter = LoadReporter::new(source, "lab".into()).unwrap();
+        let mut engines: Vec<_> = reporter
+            .reports()
+            .await
+            .into_iter()
+            .flat_map(|r| {
+                capyctl_protocol::reports::LoadReport::try_from(r)
+                    .unwrap()
+                    .samples
+            })
+            .map(|s| {
+                (
+                    s.deployment_id,
+                    s.engine.map(|e| (e.running, e.waiting, e.kv_usage_ppm)),
+                )
+            })
+            .collect();
+        engines.sort();
+        assert_eq!(
+            engines,
+            [
+                ("a-native".to_owned(), Some((0, 0, 0))),
+                ("b-python".to_owned(), Some((1, 0, 0))),
+            ]
+        );
+        assert_eq!(
+            (native_reads.load(SeqCst), python_reads.load(SeqCst)),
+            (0, 1)
+        );
     }
 }

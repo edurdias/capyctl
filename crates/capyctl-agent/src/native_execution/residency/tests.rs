@@ -176,7 +176,7 @@ fn frozen_restoring(endpoint: String, executable: &str, weight_restore: &str) ->
         "admin-ref".into(),
         SglangLaunchSettings {
             common: CommonEngineSettings {
-                cuda_graphs: Some(false),
+                cuda_graphs: Some(false.into()),
                 ..CommonEngineSettings::default()
             },
             memory: MemoryRequest {
@@ -255,6 +255,7 @@ fn plan() -> SingleLaunchPlan {
         checkpoint_layout: None,
         checkpoint_tables: None,
         checkpoint_gguf: None,
+        vllm_device_request_no_floor: false,
         startup_bytes: None,
         startup_host_bytes: None,
         lmcache: None,

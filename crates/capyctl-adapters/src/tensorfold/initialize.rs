@@ -1,6 +1,12 @@
 //! ADR 0023 §4: the TensorFold Initialize step: render, spawn through the
 //! director's tool, wait for `/health` and the model list while watching the
 //! process, probe once, and report the API process.
+//!
+//! ADR 0039 §9: the native line shares the skeleton without the extensions
+//! directory, the kernel build watch, the first-build bound and the group's
+//! libnccl; its readiness read takes a refused connection as still loading,
+//! and the stream count `/health` reports is verified before the probe.
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
@@ -8,9 +14,10 @@ use serde_json::json;
 use capyctl_domain::completion::{EffectObservation, ExecutionIdentities, Milestone, Presence};
 
 use super::{
-    adapter::TensorfoldAdapter,
-    args::{engine_environment, render_command},
+    adapter::{NativeReadiness, TensorfoldAdapter},
+    args::{engine_environment, render_command, PlanInputTensorfold},
 };
+use crate::llamacpp::EFFECTIVE_ARGS_MISMATCH;
 use crate::traits::{EngineAdapter, MemberRef, Readiness, RuntimeCommand, RuntimeError};
 use crate::vllm::args::redact_text;
 
@@ -26,6 +33,60 @@ fn now_ms() -> Result<i64, RuntimeError> {
         .map(|d| d.as_millis() as i64)
 }
 
+/// One readiness read: ready, not yet (with a native 503 body when that is
+/// what answered), or an error that ends the step.
+async fn ready_now(
+    adapter: &TensorfoldAdapter,
+    member: &MemberRef,
+    native: bool,
+    reported: &mut Option<u64>,
+    unavailable: &mut Option<String>,
+) -> Result<bool, RuntimeError> {
+    let unread = |e: crate::traits::AdapterError| {
+        RuntimeError::Uncertain(redact_text(&format!("readiness: {e}")))
+    };
+    if !native {
+        return match adapter.check_readiness(member).await.map_err(unread)? {
+            Readiness::Ready => Ok(true),
+            Readiness::Initializing => Ok(false),
+        };
+    }
+    *unavailable = None;
+    Ok(match adapter.native_readiness().await.map_err(unread)? {
+        NativeReadiness::Ready { max_batch_size } => {
+            *reported = max_batch_size;
+            true
+        }
+        NativeReadiness::Unavailable(body) => {
+            *unavailable = Some(body);
+            false
+        }
+        NativeReadiness::Loading | NativeReadiness::Unlisted => false,
+    })
+}
+
+/// SPEC §8.2, ADR 0039 §9: the reserved stream count is verified after the
+/// engine parsed it: `/health` `max_batch_size` must equal the `--parallel`
+/// the command carries. A difference fails the launch
+/// `effective_args_mismatch`; the coordinator then stops it on its recorded
+/// process.
+fn verify_batch_size(
+    plan: &PlanInputTensorfold,
+    reported: Option<u64>,
+) -> Result<(), RuntimeError> {
+    let Some(expected) = super::native::expected_batch_size(plan) else {
+        return Ok(());
+    };
+    if reported == Some(u64::from(expected)) {
+        return Ok(());
+    }
+    Err(RuntimeError::Uncertain(format!(
+        "{EFFECTIVE_ARGS_MISMATCH}: TensorFold native reports max_batch_size {}, the command \
+         carries --parallel {expected}",
+        reported.map_or_else(|| "none".to_owned(), |n| n.to_string())
+    )))
+}
+
 pub(super) async fn initialize(
     adapter: &TensorfoldAdapter,
     command: &RuntimeCommand,
@@ -39,6 +100,14 @@ pub(super) async fn initialize(
     {
         return Err(RuntimeError::Unsupported);
     }
+    let native = plan.line.is_native();
+    // ADR 0039 §13: the native line serves no group; refused before any
+    // effect (resolution refuses the topology first).
+    if native && plan.group.is_some() {
+        return Err(RuntimeError::Refused(
+            super::native::GROUP_UNSUPPORTED.into(),
+        ));
+    }
     // ADR 0028 §10 (found live 2026-10-15, MN3): a group member without the
     // installation's libnccl would exit `libnccl not found`; refuse before
     // any effect instead, with the closed category.
@@ -51,18 +120,25 @@ pub(super) async fn initialize(
     adapter.claim_incarnation(&context.binding_id, &context.incarnation)?;
     let mut cmd =
         render_command(&plan).map_err(|e| RuntimeError::Uncertain(format!("render: {e}")))?;
-    let (toolchain, limits) = crate::engine_env::launch_environment_noted(
-        &plan.build_env,
-        Some(&plan.engine_bin),
-        plan.cuda_home.as_deref(),
-        crate::engine_env::mem_available_bytes(),
-        plan.unified_ready_bytes,
-        crate::engine_env::cpu_count(),
-    );
-    capyctl_domain::role_log::notice(
-        capyctl_domain::role_log::Level::Notice,
-        &format!("{limits} (binding {})", context.binding_id),
-    );
+    // ADR 0039 §2, §5: the native binary compiles nothing, so it gets no
+    // toolchain and no build limits.
+    let toolchain = if native {
+        BTreeMap::new()
+    } else {
+        let (toolchain, limits) = crate::engine_env::launch_environment_noted(
+            &plan.build_env,
+            Some(&plan.engine_bin),
+            plan.cuda_home.as_deref(),
+            crate::engine_env::mem_available_bytes(),
+            plan.unified_ready_bytes,
+            crate::engine_env::cpu_count(),
+        );
+        capyctl_domain::role_log::notice(
+            capyctl_domain::role_log::Level::Notice,
+            &format!("{limits} (binding {})", context.binding_id),
+        );
+        toolchain
+    };
     cmd.env = engine_environment(
         &cmd.env,
         &plan,
@@ -75,38 +151,43 @@ pub(super) async fn initialize(
     let api = tokio::task::spawn_blocking(move || spawn_tools.spawn_durable(&incarnation, &cmd))
         .await
         .map_err(|_| RuntimeError::Uncertain("spawn task failed".into()))??;
-    // ADR 0014 amendment A12: note any kernel build until the step ends.
-    let builds = crate::kernel_builds::BuildWatch::start(tools.clone(), api.clone());
+    // ADR 0014 amendment A12: note any kernel build until the step ends. The
+    // native line builds nothing (ADR 0039 §2).
+    let mut builds =
+        (!native).then(|| crate::kernel_builds::BuildWatch::start(tools.clone(), api.clone()));
     // ADR 0028 §9, §10: rank 1 serves nothing and follows rank 0; readiness
     // is the head's, so it is never polled or probed. Its step ends once its
     // process is recorded and present: a follower serves from that one
     // process (ADR 0023 §6), so no rank process is waited for.
     if plan.group.as_ref().is_some_and(|group| !group.is_head()) {
-        let log = plan.engine_log.clone();
-        return crate::group::worker_spawned(
-            context,
-            tools,
-            api,
-            0,
-            builds,
-            || {
-                let tail = crate::launch_failure::log_tail(log.as_deref());
-                RuntimeError::LaunchFailed(format!(
-                    "{}; log tail:\n{tail}",
-                    crate::launch_failure::summary(&tail, None)
-                ))
-            },
-            format!(
-                "tensorfold {} group follower spawned; readiness is the head's",
-                adapter.fingerprint()
-            ),
-        )
-        .await;
+        if let Some(builds) = builds.take() {
+            let log = plan.engine_log.clone();
+            return crate::group::worker_spawned(
+                context,
+                tools,
+                api,
+                0,
+                builds,
+                || {
+                    let tail = crate::launch_failure::log_tail(log.as_deref());
+                    RuntimeError::LaunchFailed(format!(
+                        "{}; log tail:\n{tail}",
+                        crate::launch_failure::summary(&tail, None)
+                    ))
+                },
+                format!(
+                    "tensorfold {} group follower spawned; readiness is the head's",
+                    adapter.fingerprint()
+                ),
+            )
+            .await;
+        }
     }
     // ADR 0023 §4: the ordinary bound once a build exists, the
-    // whole (first-build) deadline otherwise.
+    // whole (first-build) deadline otherwise. ADR 0039 §6: the native line
+    // never builds, so its bound is always the ordinary one.
     let deadline = context.deadline_ms.saturating_sub(BUILDER_MARGIN_MS);
-    let warm = adapter.extensions_built();
+    let warm = native || adapter.extensions_built();
     let stop_at = if warm {
         deadline.min(now_ms()?.saturating_add(plan.warm_startup_ms))
     } else {
@@ -116,15 +197,11 @@ pub(super) async fn initialize(
         deployment_id: context.token.deployment_id.clone(),
         member_id: context.binding_id.clone(),
     };
+    let mut reported = None;
+    let mut unavailable = None;
     loop {
-        match adapter.check_readiness(&member).await {
-            Ok(Readiness::Ready) => break,
-            Ok(Readiness::Initializing) => {}
-            Err(e) => {
-                return Err(RuntimeError::Uncertain(redact_text(&format!(
-                    "readiness: {e}"
-                ))))
-            }
+        if ready_now(adapter, &member, native, &mut reported, &mut unavailable).await? {
+            break;
         }
         let presence_tools = tools.clone();
         let watched = api.clone();
@@ -147,13 +224,28 @@ pub(super) async fn initialize(
             }
         }
         if now_ms()? >= stop_at {
-            return Err(RuntimeError::Uncertain(if warm && stop_at < deadline {
+            return Err(RuntimeError::Uncertain(if native {
+                // ADR 0039 §9: a 503 that lasts to the start bound fails the
+                // launch with its body.
+                match &unavailable {
+                    Some(body) => redact_text(&format!(
+                        "the startup bound passed with the engine alive; /health answered 503: \
+                         {body}"
+                    )),
+                    None => "the startup bound passed with the engine alive (TensorFold native \
+                             was not listening or did not list the served name)"
+                        .into(),
+                }
+            } else if warm && stop_at < deadline {
                 "the ordinary startup bound passed with the engine alive (its kernels were already built)".into()
             } else {
                 "readiness deadline reached with the engine alive (the first start builds CUDA kernels)".into()
             }));
         }
         tokio::time::sleep(READINESS_POLL).await;
+    }
+    if native {
+        verify_batch_size(&plan, reported)?;
     }
     let body = json!({
         "model": plan.served_model_name,
@@ -207,6 +299,8 @@ pub(super) async fn initialize(
             Milestone::CacheValid,
             Milestone::ModelUsable,
         ],
-        kernel_builds: builds.finish(),
+        kernel_builds: builds
+            .map(crate::kernel_builds::BuildWatch::finish)
+            .unwrap_or_default(),
     })
 }

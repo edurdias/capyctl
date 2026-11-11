@@ -206,6 +206,7 @@ fn spec(engine: Engine) -> ProfileSpec {
             Engine::Sglang => "/home/u/venv/bin/python3".into(),
             Engine::Tensorfold => "/home/u/venv/bin/tensorfold".into(),
             Engine::Llamacpp => "/home/u/llama.cpp/build/bin/llama-server".into(),
+            Engine::TensorrtLlm => "/home/u/tensorrt-llm-1.2.1-venv/bin/trtllm-serve".into(),
             Engine::Custom => "/home/u/basal-venv/bin/basal-serve".into(),
         },
         build_fingerprint: "0.29.0".into(),
@@ -219,6 +220,8 @@ fn spec(engine: Engine) -> ProfileSpec {
         approved_env: vec![],
         trust_remote_code: false,
         lmcache: None,
+        line: Default::default(),
+        native: None,
     }
 }
 
@@ -286,6 +289,118 @@ fn the_verified_set_marks_custom_builds() {
     assert!(!is_verified(Engine::Sglang, "0.5.22"));
     assert!(!is_verified(Engine::Sglang, "0.5.20+custom"));
     assert!(!is_verified(Engine::Vllm, "0.5.20"));
+}
+
+/// A native TensorFold release's profile as `engine add` builds it.
+fn native_spec(version: &str, checksums_verified: bool) -> ProfileSpec {
+    use capyctl_config::tensorfold_native::{NativeRegistration, TensorfoldLine};
+    ProfileSpec {
+        executable: format!("/home/u/tensorfold-{version}/bin/tensorfold-native").into(),
+        build_fingerprint: version.into(),
+        deep_park: false,
+        line: TensorfoldLine::Native,
+        native: Some(NativeRegistration {
+            families: [("nemotron_h".to_owned(), vec!["mlx-q4g64".to_owned()])].into(),
+            checksums_verified,
+        }),
+        ..spec(Engine::Tensorfold)
+    }
+}
+
+// T41 T17 (ADR 0039 §1, §2): a native profile is written with `line: native`
+// and its `native` record and passes the resolution rules; a 0.6 profile is
+// written exactly as before (no `line`, no `native`), and the two coexist in
+// one engines.yaml under their own names.
+#[test]
+fn a_native_profile_states_its_line_and_the_06_one_is_unchanged() {
+    let native = profile_document(&native_spec("1.1.5", true));
+    assert_eq!(native["line"], "native");
+    assert_eq!(native["native"]["checksums_verified"], true);
+    assert_eq!(native["native"]["families"]["nemotron_h"][0], "mlx-q4g64");
+    assert_eq!(native["security"]["deep_park"], "disabled");
+    check_profile("tensorfold-1-1-5", &native).unwrap();
+    let mut python_spec = spec(Engine::Tensorfold);
+    python_spec.build_fingerprint = "0.6.6".into();
+    python_spec.deep_park = false;
+    let python = profile_document(&python_spec);
+    assert!(python.get("line").is_none(), "{python}");
+    assert!(python.get("native").is_none(), "{python}");
+    check_profile("tensorfold", &python).unwrap();
+    // A Python-line spec carrying a native record writes neither field.
+    let stray = profile_document(&ProfileSpec {
+        line: Default::default(),
+        ..native_spec("1.0.0", false)
+    });
+    assert!(stray.get("line").is_none() && stray.get("native").is_none());
+
+    let dir = tempfile::tempdir().unwrap();
+    let document = host_doc(dir.path());
+    let engines = engines_beside(&document);
+    let lock = lock_engines(&engines).unwrap();
+    let mut file = EnginesFile::load(&engines).unwrap();
+    file.profiles.insert("tensorfold".into(), python);
+    file.profiles
+        .insert("tensorfold-1-1-5".into(), native.clone());
+    write_engines(&file, &lock, Some(&host_value(&document))).unwrap();
+    let loaded = EnginesFile::load(&engines).unwrap();
+    assert_eq!(loaded.profiles["tensorfold-1-1-5"], native);
+    let mut host = host_value(&document);
+    merge_into_host(&mut host, &loaded).unwrap();
+    assert_eq!(
+        host["runtime_profiles"]["tensorfold-1-1-5"]["line"],
+        "native"
+    );
+    assert!(host["runtime_profiles"]["tensorfold"].get("line").is_none());
+}
+
+// T41 (ADR 0039 §1, §3): the line-aware verified set: the native line reads
+// its own certified set, never 0.6's; the file name decides a role's own
+// installation's line.
+#[test]
+fn the_line_decides_which_verified_set_a_tensorfold_version_reads() {
+    use capyctl_config::tensorfold_native::TensorfoldLine;
+    assert!(is_verified_line(
+        Engine::Tensorfold,
+        TensorfoldLine::Python,
+        "0.6.6"
+    ));
+    assert!(!is_verified_line(
+        Engine::Tensorfold,
+        TensorfoldLine::Native,
+        "0.6.6"
+    ));
+    for version in ["1.0.3", "1.2.0"] {
+        assert!(!is_verified_line(
+            Engine::Tensorfold,
+            TensorfoldLine::Native,
+            version
+        ));
+    }
+    // ADR 0039 §3: 1.0.0 and 1.1.5 are certified once their rows pass.
+    for version in ["1.0.0", "1.1.5"] {
+        assert_eq!(
+            is_verified_line(Engine::Tensorfold, TensorfoldLine::Native, version),
+            capyctl_config::tensorfold_native::is_certified(version)
+        );
+    }
+    assert!(is_verified_line(
+        Engine::Vllm,
+        TensorfoldLine::Native,
+        "0.29.0"
+    ));
+    assert_eq!(
+        executable_line(Engine::Tensorfold, Path::new("/r/bin/tensorfold-native")),
+        TensorfoldLine::Native
+    );
+    assert_eq!(
+        executable_line(Engine::Tensorfold, Path::new("/v/bin/tensorfold")),
+        TensorfoldLine::Python
+    );
+    assert_eq!(
+        profile_line(&profile_document(&native_spec("1.0.0", true))),
+        TensorfoldLine::Native
+    );
+    assert_eq!(profile_line(&profile()), TensorfoldLine::Python);
 }
 
 // ADR 0018 §3: only a change confined to runtime profiles is live.
@@ -646,4 +761,129 @@ fn profile_without_flags_is_unchanged() {
         },
     });
     assert_eq!(profile_document(&fixture), before);
+}
+
+// T49 T14 (ADR 0038 §2): a TensorRT-LLM version is verified only beside the
+// torch build its entry names; a qualified version beside another torch
+// build, or with none recorded, lists `custom`. The shipped set has no
+// TensorRT-LLM entry until TR1–TR11 (and the pre-releases' rows) pass.
+#[test]
+fn a_tensorrt_llm_version_is_verified_only_beside_its_torch_build() {
+    let table = [("1.2.1", "2.9.1+cu130"), ("1.4.0rc1", "2.10.0+cu134")];
+    let verified = |version: &str, torch: Option<&str>| {
+        is_verified_with_torch_in(&table, Engine::TensorrtLlm, version, torch)
+    };
+    assert!(verified("1.2.1", Some("2.9.1+cu130")));
+    assert!(verified("1.4.0rc1", Some("2.10.0+cu134")));
+    assert!(
+        !verified("1.2.1", Some("2.9.1+cu128")),
+        "another torch build"
+    );
+    assert!(
+        !verified("1.2.1", Some("2.10.0+cu134")),
+        "another entry's torch"
+    );
+    assert!(!verified("1.2.1", None), "no torch recorded");
+    assert!(
+        !verified("1.3.0rc1", Some("2.9.1+cu130")),
+        "an unlisted version"
+    );
+    // A version alone never counts, whatever the general table holds.
+    assert!(!is_verified_in(
+        &[(Engine::TensorrtLlm, "1.2.1")],
+        Engine::TensorrtLlm,
+        "1.2.1"
+    ));
+    // Every other engine ignores torch.
+    assert!(is_verified_with_torch_in(
+        &table,
+        Engine::Vllm,
+        "0.29.0",
+        None
+    ));
+    assert!(!is_verified_with_torch_in(
+        &table,
+        Engine::Vllm,
+        "1.2.1",
+        Some("2.9.1+cu130")
+    ));
+    // Shipped: no entry yet, so every version lists custom.
+    assert!(TENSORRT_LLM_VERIFIED.is_empty());
+    assert!(!is_verified_with_torch(
+        Engine::TensorrtLlm,
+        "1.2.1",
+        Some("2.9.1+cu130")
+    ));
+    let profile = serde_json::json!({"companions": {"torch": "2.9.1+cu130"}});
+    assert!(listed_custom(Some(Engine::TensorrtLlm), "1.2.1", &profile));
+    assert!(listed_custom(None, "1.2.1", &profile), "an unknown kind");
+    assert!(!listed_custom(Some(Engine::Vllm), "0.29.0", &profile));
+}
+
+// T41 T49 (ADR 0039 §3, ADR 0038 §2): a host listing reads a native
+// TensorFold profile against the native certified set, never the 0.6 set.
+#[test]
+fn a_listed_native_tensorfold_profile_is_read_against_its_own_set() {
+    let native = serde_json::json!({"engine": "tensorfold", "line": "native"});
+    let python = serde_json::json!({"engine": "tensorfold"});
+    assert!(listed_custom(Some(Engine::Tensorfold), "0.6.6", &native));
+    assert!(!listed_custom(Some(Engine::Tensorfold), "0.6.6", &python));
+    for version in ["1.0.0", "1.1.5"] {
+        assert_eq!(
+            listed_custom(Some(Engine::Tensorfold), version, &native),
+            !capyctl_config::tensorfold_native::is_certified(version)
+        );
+    }
+}
+
+// T49 T14 (ADR 0038 §2): a TensorRT-LLM profile records its companion
+// versions and deep park disabled, passes the resolution rules and the
+// engines file's schema, and an unlisted version is written all the same;
+// companions on another engine, an unknown companion or a malformed version
+// are refused.
+#[test]
+fn a_tensorrt_llm_profile_records_its_companions() {
+    let companions: std::collections::BTreeMap<String, String> = [
+        ("torch", "2.9.1+cu130"),
+        ("tensorrt", "10.14.1.48"),
+        ("flashinfer-python", "0.6.4"),
+        ("transformers", "4.57.3"),
+        ("mpi4py", "4.1.1"),
+    ]
+    .into_iter()
+    .map(|(name, version)| (name.to_owned(), version.to_owned()))
+    .collect();
+    let mut profile = profile_document(&ProfileSpec {
+        build_fingerprint: "9.9.9".into(),
+        deep_park: false,
+        ..spec(Engine::TensorrtLlm)
+    });
+    put_companions(&mut profile, &companions);
+    assert_eq!(profile["engine"], "tensorrt-llm");
+    assert_eq!(profile["security"]["deep_park"], "disabled");
+    assert_eq!(profile["companions"]["torch"], "2.9.1+cu130");
+    check_profile("tensorrt-llm", &profile).unwrap();
+    let text = serde_json::json!({"schema_version": 1, "kind": "engines",
+        "runtime_profiles": {"tensorrt-llm": profile.clone()}})
+    .to_string();
+    EnginesFile::parse(Path::new("engines.yaml"), &text).unwrap();
+    // Nothing recorded: the field is left out.
+    let mut bare = profile_document(&spec(Engine::Vllm));
+    put_companions(&mut bare, &Default::default());
+    assert!(bare.get("companions").is_none());
+    let mut on_vllm = profile.clone();
+    on_vllm["engine"] = "vllm".into();
+    on_vllm["executable"] = "/home/u/venv/bin/vllm".into();
+    let mut unknown = profile.clone();
+    unknown["companions"] = serde_json::json!({"numpy": "1.26.4"});
+    let mut malformed = profile.clone();
+    malformed["companions"] = serde_json::json!({"torch": "2.9.1 cu130"});
+    for (bad, what) in [
+        (on_vllm, "another engine"),
+        (unknown, "an unknown companion"),
+        (malformed, "a malformed version"),
+    ] {
+        let error = check_profile("tensorrt-llm", &bad).unwrap_err();
+        assert_eq!(error.path, "runtime_profiles.companions", "{what}: {error}");
+    }
 }

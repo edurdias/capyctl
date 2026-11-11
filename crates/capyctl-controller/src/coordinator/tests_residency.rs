@@ -64,6 +64,17 @@ impl Residency {
         fake.set_decision(response);
         Self::over(Gate::with_engine(false, fake), true, clock)
     }
+    /// ADR 0036: an engine whose Initialize is the Fake embedding model,
+    /// answering `/v1/embeddings` as `script` says and refusing chat and
+    /// decisions.
+    fn embedding_model(
+        script: capyctl_testkit::fake_engine::FakeEmbeddings,
+        clock: Arc<AtomicI64>,
+    ) -> Arc<Self> {
+        let fake = capyctl_testkit::fake_engine::FakeEngine::with_lifecycle().with_embeddings();
+        fake.set_embeddings(script);
+        Self::over(Gate::with_engine(false, fake), true, clock)
+    }
     fn over(gate: Arc<Gate>, compound: bool, clock: Arc<AtomicI64>) -> Arc<Self> {
         gate.release.add_permits(64);
         Arc::new(Self {
@@ -102,6 +113,15 @@ impl Residency {
                 ("technical".into(), technical),
             ],
         }));
+    }
+    /// ADR 0036 §6: an embeddings engine's answer to the fixed embedding
+    /// probe.
+    fn embeds(&self, vector: &[f32]) {
+        *self.canary.lock().unwrap() = Some(CanaryEvidence::Embedding(
+            capyctl_adapters::embedding_probe::EmbeddingAnswer {
+                vector: vector.to_vec(),
+            },
+        ));
     }
 }
 
@@ -160,6 +180,263 @@ async fn a_decisions_launch_is_ready_only_on_a_well_formed_decision() {
         assert_eq!(state == "ready", well_formed, "{response}");
         assert_eq!(engine.gate.engine.chat_requests(), 0);
         assert!(engine.gate.engine.decision_requests() >= 1);
+        w.shutdown().await.unwrap();
+    }
+}
+
+// T47 (ADR 0036 §5, SPEC §6.1): an embeddings launch is ready only on a
+// complete, well-formed answer to the fixed embedding; a malformed one, one
+// cut short or a zero vector leaves the start unproven and dispatch closed.
+// No chat or decision probe is ever sent.
+#[tokio::test]
+async fn an_embeddings_launch_is_ready_only_on_a_well_formed_embedding() {
+    use capyctl_testkit::fake_engine::{EmbeddingFault, FakeEmbeddings};
+    let cases = [
+        (FakeEmbeddings::default(), true),
+        (
+            FakeEmbeddings {
+                model_last: true,
+                ..Default::default()
+            },
+            true,
+        ),
+        (
+            FakeEmbeddings {
+                fault: Some(EmbeddingFault::WrongCount),
+                ..Default::default()
+            },
+            false,
+        ),
+        (
+            FakeEmbeddings {
+                fault: Some(EmbeddingFault::CutShort),
+                ..Default::default()
+            },
+            false,
+        ),
+        (
+            FakeEmbeddings {
+                vector: vec![0.0, 0.0],
+                ..Default::default()
+            },
+            false,
+        ),
+    ];
+    for (script, well_formed) in cases {
+        let (dir, owner, fence, observations) = setup().await;
+        let clock = Arc::new(AtomicI64::new(1900));
+        let engine = Residency::embedding_model(script.clone(), clock.clone());
+        let w = residency_worker(
+            owner.clone(),
+            observations,
+            engine.clone(),
+            clock,
+            IdlePolicy::default(),
+        );
+        let start = w.start(&fence, 100_000).unwrap();
+        let status = start.wait(Duration::from_secs(30)).await.unwrap();
+        assert_eq!(
+            status == InitializeStatus::Completed,
+            well_formed,
+            "{script:?}: {status:?}"
+        );
+        let (state, open, _, _) = instance(&dir, &fence.deployment_id);
+        assert_eq!(open, well_formed, "{script:?}");
+        assert_eq!(state == "ready", well_formed, "{script:?}");
+        assert_eq!(engine.gate.engine.chat_requests(), 0);
+        assert_eq!(engine.gate.engine.decision_requests(), 0);
+        assert!(engine.gate.engine.embedding_requests() >= 1);
+        w.shutdown().await.unwrap();
+    }
+}
+
+// T47 EM4 (ADR 0036 §§5, 6): the first launch records without comparing;
+// every restart compares the retained reference before dispatch opens and
+// records its operation-scoped verdict, including distance and tolerance.
+#[tokio::test]
+async fn an_embedding_restart_compares_before_ready_and_preserves_the_first_reference() {
+    use capyctl_testkit::fake_engine::FakeEmbeddings;
+    use std::os::unix::fs::PermissionsExt;
+    for (vector, passes) in [
+        (vec![0.601, 0.799], true),
+        (vec![0.8, 0.6], false),
+        (vec![0.6, 0.8, 0.0], false),
+    ] {
+        let f = fixture::fixture();
+        let fence = fixture::managed_edit(&f, "embedding-restart", |deployment, _| {
+            deployment["api"] = serde_json::json!("embeddings");
+        });
+        let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("srv.sqlite3");
+        f.sql
+            .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+            .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let owner = Arc::new(Mutex::new(
+            crate::ownership::OwnedCoordinatorState::open(dir.path()).unwrap(),
+        ));
+        let clock = Arc::new(AtomicI64::new(1900));
+        let engine = Residency::embedding_model(
+            FakeEmbeddings {
+                vector: vec![0.6, 0.8],
+                ..Default::default()
+            },
+            clock.clone(),
+        );
+        engine.embeds(&[0.6, 0.8]);
+        let slot = Arc::new(Mutex::new(engine.clone()));
+        let w = residency_worker_with(
+            owner.clone(),
+            f.observations.clone(),
+            slot.clone(),
+            clock.clone(),
+            IdlePolicy::default(),
+        );
+        ready(&w, &fence).await;
+        let baseline = embedding_reference(&owner, &dir, &engine, &fence.deployment_id);
+        let generation = instance(&dir, &fence.deployment_id).2;
+        let incarnation = engine.canaries.lock().unwrap()[0].0.clone();
+        let events = owner
+            .lock()
+            .unwrap()
+            .store()
+            .events_after(None, 1000)
+            .unwrap()
+            .events;
+        assert!(
+            !events.iter().any(|e| e.kind == "embedding_canary_checked"),
+            "a first launch has no baseline to compare"
+        );
+        let stop = w
+            .commands()
+            .administrative_stop(
+                "operator",
+                &fence.deployment_id,
+                fence.revision,
+                "stop",
+                100_000,
+            )
+            .unwrap();
+        until("the stop settled", || {
+            operation(&owner, stop.operation_id()).0 == "succeeded"
+        })
+        .await;
+        let reopened = capyctl_store::Store::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .wake_canary(&fence.deployment_id, 0, generation, &incarnation)
+                .unwrap(),
+            Some(WakeCanaryReference::Embedding(baseline.clone())),
+            "the pre-stop reference survives a store reopen"
+        );
+        drop(reopened);
+
+        let fresh = Residency::embedding_model(
+            FakeEmbeddings {
+                vector: vector.clone(),
+                ..Default::default()
+            },
+            clock.clone(),
+        );
+        fresh.embeds(&vector);
+        *slot.lock().unwrap() = fresh.clone();
+        let start = w
+            .commands()
+            .start(
+                "operator",
+                &fence.deployment_id,
+                fence.revision,
+                "restart",
+                100_000,
+            )
+            .unwrap();
+        fresh.gate.entered().await;
+        fresh.gate.release.add_permits(1);
+        until("the restart settled", || {
+            ["succeeded", "failed"].contains(&operation(&owner, start.operation_id()).0.as_str())
+        })
+        .await;
+        assert_eq!(
+            operation(&owner, start.operation_id()).0 == "succeeded",
+            passes
+        );
+        let events = owner
+            .lock()
+            .unwrap()
+            .store()
+            .events_after(None, 1000)
+            .unwrap()
+            .events;
+        let checked: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.kind == "embedding_canary_checked"
+                    && e.operation_id.as_deref() == Some(start.operation_id())
+            })
+            .collect();
+        assert_eq!(
+            checked.len(),
+            1,
+            "a restart must persist its reference comparison"
+        );
+        let payload: serde_json::Value = serde_json::from_str(&checked[0].payload_json).unwrap();
+        assert_eq!(payload["verdict"], if passes { "pass" } else { "fail" });
+        assert_eq!(payload["instance_index"], 0);
+        assert_eq!(payload["reference_generation"], generation);
+        assert_eq!(payload["reference_incarnation"], incarnation);
+        assert_eq!(payload["probe_kind"], "embedding");
+        assert_eq!(payload["probe_version"], 1);
+        assert_eq!(payload["reference_dimension"], 2);
+        assert_eq!(payload["observed_dimension"], vector.len());
+        assert_eq!(payload["tolerance"], baseline.tolerance);
+        if vector.len() == 2 {
+            let distance = ((f64::from(vector[0]) - f64::from(0.6f32)).powi(2)
+                + (f64::from(vector[1]) - f64::from(0.8f32)).powi(2))
+            .sqrt()
+                / (f64::from(0.6f32).powi(2) + f64::from(0.8f32).powi(2)).sqrt();
+            assert!((payload["relative_distance"].as_f64().unwrap() - distance).abs() < 1e-12);
+        } else {
+            assert!(
+                payload["relative_distance"].is_null(),
+                "different dimensions have no distance"
+            );
+        }
+        let (state, open, _, _) = instance(&dir, &fence.deployment_id);
+        if passes {
+            assert_eq!((state.as_str(), open), ("ready", true));
+            let ready = events
+                .iter()
+                .find(|e| {
+                    e.kind == "ready_committed"
+                        && e.operation_id.as_deref() == Some(start.operation_id())
+                })
+                .unwrap();
+            assert!(checked[0].cursor.sequence < ready.cursor.sequence);
+            assert_eq!(
+                embedding_reference(&owner, &dir, &fresh, &fence.deployment_id),
+                baseline
+            );
+        } else {
+            assert_eq!((state.as_str(), open), ("stopped", false));
+            assert_eq!(
+                operation(&owner, start.operation_id()).1.as_deref(),
+                Some("wake_mismatch")
+            );
+            assert_eq!(
+                last_error(&dir, &fence.deployment_id).as_deref(),
+                Some("wake_mismatch")
+            );
+            assert!(
+                phase(&owner, &fence.deployment_id).is_none(),
+                "released only after cleanup"
+            );
+            assert_eq!(fresh.cleanups.load(Ordering::SeqCst), 1);
+            assert!(!events.iter().any(|e| e.kind == "ready_committed"
+                && e.operation_id.as_deref() == Some(start.operation_id())));
+        }
+        assert_eq!(fresh.gate.engine.chat_requests(), 0);
+        assert_eq!(fresh.gate.engine.decision_requests(), 0);
         w.shutdown().await.unwrap();
     }
 }
@@ -373,7 +650,9 @@ fn residency_worker_with(
             let observed = clock.clone();
             let bound = slot.lock().unwrap().clone();
             let terminated = bound.clone();
-            Ok(ExecutionBinding::remote(
+            let settlement_clock = clock.clone();
+            let settled = bound.clone();
+            let binding = ExecutionBinding::remote(
                 bound,
                 Arc::new(move |context: CleanupExecutionContext| {
                     let at = observed.load(Ordering::SeqCst);
@@ -388,7 +667,22 @@ fn residency_worker_with(
                         })
                     })
                 }),
-            ))
+            );
+            Ok(
+                binding.with_settlement(Arc::new(move |context: SettlementContext| {
+                    let at = settlement_clock.load(Ordering::SeqCst);
+                    settled.cleanups.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async move {
+                        Ok(CleanupEvidence {
+                            binding_id: context.binding_id,
+                            incarnation: context.incarnation,
+                            identities: context.identities,
+                            observed_at_ms: at,
+                            receipt: "scripted host proved the failed launch gone".into(),
+                        })
+                    })
+                })),
+            )
         }),
     )
     .unwrap()
@@ -1092,6 +1386,7 @@ fn tokens(reference: WakeCanaryReference) -> Vec<u32> {
     match reference {
         WakeCanaryReference::Completion(reference) => reference.tokens,
         WakeCanaryReference::Decision(_) => panic!("a decision reference"),
+        WakeCanaryReference::Embedding(_) => panic!("an embedding reference"),
     }
 }
 
@@ -1299,6 +1594,124 @@ async fn a_chat_reference_is_never_compared_with_a_decision_answer() {
         reference(&owner, &dir, &engine, &fence.deployment_id).map(tokens),
         Some(vec![1, 2, 3])
     );
+    w.shutdown().await.unwrap();
+}
+
+/// The embedding reference a launch's readiness recorded.
+fn embedding_reference(
+    owner: &SharedCoordinatorState,
+    dir: &tempfile::TempDir,
+    engine: &Residency,
+    deployment_id: &str,
+) -> capyctl_store::wake_canary::StoredEmbeddingCanary {
+    let Some(WakeCanaryReference::Embedding(recorded)) =
+        reference(owner, dir, engine, deployment_id)
+    else {
+        panic!("no embedding reference");
+    };
+    recorded
+}
+
+// T47 T20 (ADR 0036 §§6, 7.2): the first readiness records the embedding
+// probe's vector with its dimension, kind, version and tolerance; the canary
+// runs after every wake, before the woken instance serves, and a vector
+// within the relative distance of it completes the wake, on a remote
+// (compound) and an embedded (stepwise) restore alike.
+#[tokio::test]
+async fn an_embedding_canary_within_tolerance_completes_every_wake() {
+    for compound in [true, false] {
+        let (dir, owner, fence, observations) = setup().await;
+        let clock = Arc::new(AtomicI64::new(1900));
+        let engine = Residency::new(compound, clock.clone());
+        engine.embeds(&[0.6, 0.8, 0.0, 0.0]);
+        let w = residency_worker(
+            owner.clone(),
+            observations,
+            engine.clone(),
+            clock,
+            IdlePolicy::default(),
+        );
+        ready(&w, &fence).await;
+        let recorded = embedding_reference(&owner, &dir, &engine, &fence.deployment_id);
+        assert_eq!(
+            (
+                recorded.probe_kind.as_str(),
+                recorded.probe_version,
+                recorded.dimension,
+                recorded.vector.clone(),
+                recorded.tolerance,
+            ),
+            (
+                capyctl_adapters::embedding_probe::KIND,
+                capyctl_adapters::embedding_probe::VERSION,
+                4,
+                vec![0.6, 0.8, 0.0, 0.0],
+                crate::wake_canary::EMBEDDING_TOLERANCE,
+            )
+        );
+        // A vector that moved a little (relative distance about 0.0014).
+        engine.embeds(&[0.601, 0.799, 0.0, 0.0]);
+        for _ in 0..3 {
+            let wake = park_and_wake(&w, &dir, &fence).await;
+            until("woken", || operation(&owner, &wake).0 == "succeeded").await;
+            let (state, open, _, _) = instance(&dir, &fence.deployment_id);
+            assert_eq!((state.as_str(), open), ("ready", true));
+        }
+        assert_eq!(
+            engine.canaries.lock().unwrap().len(),
+            4,
+            "readiness and three wakes"
+        );
+        assert_eq!(last_error(&dir, &fence.deployment_id), None);
+        // The reference is the first readiness's, never a wake's.
+        assert_eq!(
+            embedding_reference(&owner, &dir, &engine, &fence.deployment_id).vector,
+            [0.6, 0.8, 0.0, 0.0]
+        );
+        w.shutdown().await.unwrap();
+    }
+}
+
+// T47 T20 (ADR 0036 §6): a wake whose vector has another dimension, or lies
+// beyond the tolerance, fails `wake_mismatch` and the instance is stopped,
+// as a differing chat canary is.
+#[tokio::test]
+async fn a_changed_dimension_or_a_distant_vector_fails_the_wake() {
+    let changes: [fn(&Residency); 2] = [
+        |engine| engine.embeds(&[0.6, 0.8, 0.0]),
+        |engine| engine.embeds(&[0.8, 0.6, 0.0, 0.0]),
+    ];
+    for change in changes {
+        let (dir, owner, fence, _engine, w, wake) =
+            decide_then_wake(|engine| engine.embeds(&[0.6, 0.8, 0.0, 0.0]), change).await;
+        until("released", || phase(&owner, &fence.deployment_id).is_none()).await;
+        let (state, open, _, _) = instance(&dir, &fence.deployment_id);
+        assert_eq!((state.as_str(), open), ("stopped", false));
+        assert_eq!(
+            last_error(&dir, &fence.deployment_id).as_deref(),
+            Some("wake_mismatch")
+        );
+        assert_ne!(operation(&owner, &wake).0, "succeeded");
+        w.shutdown().await.unwrap();
+    }
+}
+
+// T47 (ADR 0036 §6): a reference of another kind is never compared with an
+// embedding answer: the wake finds no usable reference, and the launch's
+// recorded reference stays the one it recorded.
+#[tokio::test]
+async fn a_decision_reference_is_never_compared_with_an_embedding_answer() {
+    let (dir, owner, fence, engine, w, wake) = decide_then_wake(
+        |engine| engine.decides("billing", 0.95, 0.02, 0.03),
+        |engine| engine.embeds(&[0.6, 0.8]),
+    )
+    .await;
+    until("woken", || operation(&owner, &wake).0 == "succeeded").await;
+    assert_eq!(last_error(&dir, &fence.deployment_id), None);
+    assert!(matches!(
+        reference(&owner, &dir, &engine, &fence.deployment_id),
+        Some(WakeCanaryReference::Decision(_))
+    ));
     w.shutdown().await.unwrap();
 }
 

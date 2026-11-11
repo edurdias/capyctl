@@ -10,6 +10,7 @@ pub mod custom;
 pub mod defaults;
 // ADR 0030 §1, §7: what a deployment serving decision models may resolve to.
 pub mod decisions;
+pub mod embeddings;
 // Owner decision 2026-09-25 (ADR 0014 amendment): the minimal deployment file
 // and the defaults that complete it, shared by every role.
 pub mod deployment_defaults;
@@ -56,10 +57,18 @@ pub mod setting_overrides;
 pub mod standalone;
 pub mod strict_yaml;
 pub mod yaml_emit;
+// ADR 0039: TensorFold's native 1.x line beside the 0.6 Python line.
+pub mod tensorfold_native;
+// ADR 0038: TensorRT-LLM's registration constants, option, key and
+// environment tables, served-name rule, KV tokens and configuration file.
+pub mod tensorrt_llm;
 // ADR 0023 §2: TensorFold's build toolchain on the closed launch PATH.
 pub mod toolchain;
 // ADR 0028 §2: a deployment's multi-node topology and group shape.
 pub mod topology;
+// ADR 0037 §12: a role's `observability.tracing` settings and the collector's
+// headers file.
+pub mod tracing;
 // Tests across the workspace write executables through this.
 #[doc(hidden)]
 pub mod test_support;
@@ -68,3 +77,4 @@ pub use defaults::{generate_default, resolve_startup, LoadOutcome};
 pub use error::{ConfigError, ConfigErrorCode};
 pub use schema::ConfigKind;
 pub use strict_yaml::{parse_document, parse_strict, parse_strict_value, validate};
+pub use tracing::{CallerContext, EngineTracingSetting, HostTracing, ServerTracing, TracingExport};

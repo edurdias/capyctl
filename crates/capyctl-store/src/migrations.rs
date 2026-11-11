@@ -11,8 +11,8 @@ use crate::schema::{
     SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
     SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
     SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V49, SCHEMA_V5, SCHEMA_V50, SCHEMA_V51, SCHEMA_V52,
-    SCHEMA_V53, SCHEMA_V54, SCHEMA_V55, SCHEMA_V56, SCHEMA_V57, SCHEMA_V58, SCHEMA_V6, SCHEMA_V7,
-    SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V53, SCHEMA_V54, SCHEMA_V55, SCHEMA_V56, SCHEMA_V57, SCHEMA_V58, SCHEMA_V59, SCHEMA_V6,
+    SCHEMA_V60, SCHEMA_V61, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -102,6 +102,13 @@ pub const MIGRATIONS: &[&str] = &[
     // ADR 0035 §§2, 3: GPU-set resolutions, each instance's chosen set and N,
     // and the measured peak and residue keyed by N.
     SCHEMA_V58,
+    // ADR 0036 §§5, 6: an embeddings launch's wake canary reference.
+    SCHEMA_V59,
+    // ADR 0034 §§3a, 4: the reported pool basis per checkpoint, and how each
+    // launch's LMCache pool was sized and whether it runs uncertified.
+    SCHEMA_V60,
+    // ADR 0037 §7: each launch's engine tracing decision.
+    SCHEMA_V61,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -228,6 +235,12 @@ pub(crate) fn apply_through(conn: &Connection, last: i64) -> Result<(), StoreErr
         if version == 58 {
             // ADR 0035 §2: each instance's chosen GPU set and its N.
             crate::instances::migrate_v58(&tx)?;
+        }
+        if version == 60 {
+            // ADR 0034 §§3a, 4: the reported pool basis, and each launch's
+            // pool sizing and certification.
+            crate::checkpoint_digests::migrate_v60(&tx)?;
+            crate::ordinary_lifecycle::lmcache::migrate_v60(&tx)?;
         }
         if version == 28 {
             // SPEC §6.5 (ADR 0013 amendment): the warm-residency flag.
@@ -610,6 +623,103 @@ mod tests {
             assert!(conn
                 .execute("UPDATE launch_lmcache SET observed_device_bytes=?1", [bad])
                 .is_err());
+        }
+    }
+
+    /// ADR 0034 §§3a, 4 (v60): a sizing, a digest and a launch recorded
+    /// before v60 read an unknown pool basis, an unknown pool source and a
+    /// certified run; the columns take positive figures, a closed source and
+    /// bounded text only; applying v60 again changes nothing; a reported
+    /// basis reads back from the digest before the sizing.
+    // T45
+    #[test]
+    fn v60_adds_the_pool_basis_and_certification_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        apply_through(&conn, 59).unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        conn.execute(
+            "INSERT INTO checkpoint_digests(deployment_id,revision,state,host_id,expected,digest,weights_bytes,provisional,diagnostic,updated_at_ms) VALUES('a',1,'recorded','h',NULL,?1,1,0,NULL,1)",
+            [&digest],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO checkpoint_sizes(deployment_id,revision,host_id,weights_bytes,sized_at_ms) VALUES('a',1,'h',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO launch_lmcache(binding_id,deployment_id,instance_index,generation,revision,host_id,mode,planned,planned_reason) VALUES('b','a',0,1,1,'h','auto','off','disabled')",
+            [],
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            crate::checkpoint_digests::migrate_v60(&tx).unwrap();
+            crate::ordinary_lifecycle::lmcache::migrate_v60(&tx).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            crate::checkpoint_digests::recorded_pool_basis(&conn, "a", 1).unwrap(),
+            None
+        );
+        for table in ["checkpoint_digests", "checkpoint_sizes"] {
+            for bad in [0, -1] {
+                assert!(conn
+                    .execute(&format!("UPDATE {table} SET kv_bytes_per_token=?1"), [bad])
+                    .is_err());
+            }
+        }
+        conn.execute(
+            "UPDATE checkpoint_sizes SET kv_bytes_per_token=147456,pool_context_tokens=8192",
+            [],
+        )
+        .unwrap();
+        let basis = |tokens| capyctl_config::lmcache::PoolBasis {
+            bytes_per_token: 147_456,
+            context_tokens: tokens,
+        };
+        assert_eq!(
+            crate::checkpoint_digests::recorded_pool_basis(&conn, "a", 1).unwrap(),
+            Some(basis(8_192))
+        );
+        conn.execute(
+            "UPDATE checkpoint_digests SET kv_bytes_per_token=147456,pool_context_tokens=32768",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            crate::checkpoint_digests::recorded_pool_basis(&conn, "a", 1).unwrap(),
+            Some(basis(32_768))
+        );
+        let read: (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT pool_source,uncertified,pool_model_type FROM launch_lmcache",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(read, (None, None, None));
+        conn.execute(
+            "UPDATE launch_lmcache SET pool_source='auto',pool_bytes_per_token=1,pool_context_tokens=1,pool_shrunk_from=1,pool_warning='w',uncertified='u',pool_unknown='x',pool_model_type='qwen3'",
+            [],
+        )
+        .unwrap();
+        for bad in [
+            "pool_source='guessed'",
+            "pool_bytes_per_token=0",
+            "pool_shrunk_from=-1",
+            "pool_warning=''",
+            "uncertified=''",
+            "pool_model_type=''",
+            "pool_model_type=replace(hex(zeroblob(129)),'00','x')",
+        ] {
+            assert!(
+                conn.execute(&format!("UPDATE launch_lmcache SET {bad}"), [])
+                    .is_err(),
+                "{bad}"
+            );
         }
     }
 
@@ -1535,8 +1645,10 @@ mod tests {
              VALUES('a',0,3,'inc','Say ready.','[1,2]','ok',7,'op-w');",
         )
         .unwrap();
-        apply(&conn).unwrap();
-        apply(&conn).unwrap();
+        // Stop at v49: its own row shape is what this test checks (v59
+        // widens the table).
+        apply_through(&conn, 49).unwrap();
+        apply_through(&conn, 49).unwrap();
         let row: (String, String, Option<String>, String, Option<f64>) = conn
             .query_row(
                 "SELECT incarnation||'|'||prompt||'|'||tokens_json||'|'||text||'|'||recorded_at_ms,
@@ -1568,6 +1680,123 @@ mod tests {
             .is_err());
         conn.execute_batch(
             "INSERT INTO wake_canaries VALUES('a',0,4,'i','decision/v1','[]','',1,NULL,'decision',1,'{}',0.05);",
+        )
+        .unwrap();
+    }
+
+    // T47, T20 (ADR 0036 §6): completion and decision references of a v58
+    // store are carried to v59 unchanged with no vector; the rebuilt table
+    // accepts an embedding reference only with its tolerance and a vector of
+    // four bytes per dimension.
+    #[test]
+    fn v59_carries_canaries_and_types_embedding_references() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_through(&conn, 58).unwrap();
+        conn.execute_batch(
+            "INSERT INTO wake_canaries VALUES('a',0,3,'inc','Say ready.','[1,2]','ok',7,'op-w','completion',1,NULL,NULL);
+             INSERT INTO wake_canaries VALUES('a',1,3,'inc','decision/v1','[]','',8,NULL,'decision',1,'{}',0.05);",
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let rows: Vec<String> = conn
+            .prepare(
+                "SELECT kind||'|'||prompt||'|'||tokens_json||'|'||text||'|'||recorded_at_ms||'|'||coalesce(mismatch_operation_id,'')
+                        ||'|'||coalesce(decision_json,'')||'|'||coalesce(tolerance,'')||'|'||coalesce(dimension,'')||'|'||coalesce(hex(vector),'')
+                   FROM wake_canaries ORDER BY instance_index",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                "completion|Say ready.|[1,2]|ok|7|op-w||||".to_string(),
+                "decision|decision/v1|[]||8||{}|0.05||".to_string(),
+            ]
+        );
+        let insert = |values: &str| {
+            conn.execute_batch(&format!("INSERT INTO wake_canaries VALUES({values});"))
+        };
+        // A vector of the wrong length, no vector, no tolerance, or a
+        // decision answer: refused.
+        assert!(insert(
+            "'a',2,3,'i','embedding/v1','[]','',1,NULL,'embedding',1,NULL,0.02,2,x'0000803f'"
+        )
+        .is_err());
+        assert!(
+            insert("'a',2,3,'i','embedding/v1','[]','',1,NULL,'embedding',1,NULL,0.02,1,NULL")
+                .is_err()
+        );
+        assert!(insert(
+            "'a',2,3,'i','embedding/v1','[]','',1,NULL,'embedding',1,NULL,NULL,1,x'0000803f'"
+        )
+        .is_err());
+        assert!(insert(
+            "'a',2,3,'i','embedding/v1','[]','',1,NULL,'embedding',1,'{}',0.02,1,x'0000803f'"
+        )
+        .is_err());
+        // A completion row may not carry a vector.
+        assert!(
+            insert("'a',2,3,'i','p','[1]','',1,NULL,'completion',1,NULL,NULL,1,x'0000803f'")
+                .is_err()
+        );
+        insert("'a',2,3,'i','embedding/v1','[]','',1,NULL,'embedding',1,NULL,0.02,1,x'0000803f'")
+            .unwrap();
+    }
+
+    // T20 T45 T47 T48 (ADR 0036 §§5, 6, ADR 0034 §§3a, 4, ADR 0037 §7): a
+    // v58 store upgrades through v59 (embeddings canary), v60 (LMCache pool
+    // basis and certification) and v61 (engine tracing) in that order, in
+    // one open: its canaries carry no vector, its LMCache rows read an
+    // unknown pool basis and a certified run, and each launch's engine
+    // tracing table exists, empty.
+    #[test]
+    fn a_v58_store_upgrades_through_v61() {
+        assert_eq!(latest_version(), 61);
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        apply_through(&conn, 58).unwrap();
+        conn.execute_batch(
+            "INSERT INTO wake_canaries VALUES('a',0,3,'inc','Say ready.','[1,2]','ok',7,'op-w','completion',1,NULL,NULL);
+             INSERT INTO launch_lmcache(binding_id,deployment_id,instance_index,generation,revision,host_id,mode,planned,planned_reason)
+               VALUES('b','a',0,1,1,'h','auto','off','disabled');",
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        let versions: Vec<i64> = conn
+            .prepare("SELECT version FROM schema_migrations WHERE version > 58 ORDER BY version")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(versions, [59, 60, 61]);
+        let canary: (Option<i64>, Option<Vec<u8>>) = conn
+            .query_row("SELECT dimension, vector FROM wake_canaries", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(canary, (None, None));
+        let lmcache: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT pool_source, uncertified FROM launch_lmcache",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lmcache, (None, None));
+        let traced: i64 = conn
+            .query_row("SELECT count(*) FROM launch_engine_tracing", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(traced, 0);
+        conn.execute(
+            "INSERT INTO launch_engine_tracing(binding_id,state,reason) VALUES('b','off','engine_unsupported')",
+            [],
         )
         .unwrap();
     }
