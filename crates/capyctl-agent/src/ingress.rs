@@ -239,9 +239,14 @@ impl Ingress {
         Self::build(Some(tracing))
     }
     fn build(tracing: Option<Tracing>) -> Result<Arc<Self>, IngressError> {
+        // SPEC §10, ADR 0036 §10: as on the router's hop, do not reuse idle
+        // sockets for inference. Uvicorn can expire one before its protocol
+        // reads a new upload (vLLM 0.33.0, EM8 request 17). The cost is one
+        // loopback TCP connect per request; uncertain work is never replayed.
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(0)
             .connect_timeout(Duration::from_secs(5));
         // SPEC §10, ADR 0036 §10: the head bound below and the router's
         // request/idle bounds govern forwarding, not an implicit 30-second

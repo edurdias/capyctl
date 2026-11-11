@@ -26,6 +26,51 @@ async fn serve(router: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle
     (address, task)
 }
 
+// T47 T18 (SPEC §10, ADR 0036 §10): do not reuse an engine socket whose idle
+// expiration can reset an upload before its protocol receives those bytes.
+#[tokio::test]
+async fn an_ingress_embedding_upload_avoids_an_expired_keepalive_connection() {
+    const ANSWER: &str = r#"{"object":"list","model":"model","data":[{"object":"embedding","index":0,"embedding":[0.5]},{"object":"embedding","index":1,"embedding":[0.25]}]}"#;
+    let peer = capyctl_testkit::held_engine::ExpiredKeepaliveEngine::start(ANSWER).await;
+    let ingress = Ingress::new().unwrap();
+    let first = scope(1);
+    ingress
+        .register(
+            first.clone(),
+            peer.address(),
+            "model".into(),
+            [1; 32],
+            [2; 32],
+        )
+        .unwrap();
+    ingress.open(&first).unwrap();
+    let (address, task) = serve(ingress.router()).await;
+    let client = reqwest::Client::new();
+    for input in [
+        serde_json::json!(["a", "b"]),
+        serde_json::json!(["a".repeat(4 << 20), "b"]),
+    ] {
+        let response = client
+            .post(format!("http://{address}/v1/embeddings"))
+            .bearer_auth(hex::encode([1; 32]))
+            .json(&serde_json::json!({"model":"model","input":input}))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let answer = response.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer, ANSWER);
+    }
+    task.abort();
+    assert_eq!(
+        peer.counts(),
+        (2, 2, 0),
+        "two fresh requests, with no reset or replay of a reused upload"
+    );
+}
+
 // T47 T18 (ADR 0036 §10, SPEC §10): engine backpressure must not add a
 // hidden TCP deadline ahead of the ingress's head bound or router's bounds.
 #[cfg(target_os = "linux")]

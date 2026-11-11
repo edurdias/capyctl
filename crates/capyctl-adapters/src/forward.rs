@@ -595,9 +595,15 @@ impl ChatHttp {
         key: Option<String>,
         cache_salt: CacheSalt,
     ) -> Self {
+        // SPEC §10, ADR 0036 §4: inference is not replayed after acceptance
+        // becomes uncertain. Uvicorn's keepalive expiry can reset a reused
+        // socket before its protocol reads the new request's buffered bytes
+        // (vLLM 0.33.0, EM8 request 17). Keep the Client, but use one TCP
+        // connect per request: loopback here, or LAN to a host's ingress.
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
+            .pool_max_idle_per_host(0)
             .no_proxy()
             .connect_timeout(Duration::from_secs(10));
         // SPEC §10, ADR 0036 §4: the router owns request and idle bounds.
@@ -3869,6 +3875,37 @@ pub(crate) mod tests {
     }
 
     const EMBEDDING_ANSWER: &str = r#"{"id":"embd-9","object":"list","created":1,"model":"/srv/Qwen3-Embedding-4B","data":[{"index":0,"object":"embedding","embedding":[0.5,-0.25]},{"index":1,"object":"embedding","embedding":[1e-2,3]}],"usage":{"prompt_tokens":7,"total_tokens":7}}"#;
+
+    // T47 T17 (SPEC §10, ADR 0036 §4): an idle peer can expire a connection
+    // after the next upload begins but before its protocol reads those bytes.
+    // Use a fresh connection, never retry work whose acceptance is uncertain.
+    #[tokio::test]
+    async fn an_embeddings_upload_avoids_an_expired_keepalive_connection() {
+        use std::time::Duration;
+
+        let peer =
+            capyctl_testkit::held_engine::ExpiredKeepaliveEngine::start(EMBEDDING_ANSWER).await;
+        let forward = embedding_forwarder(format!("http://{}", peer.address()).parse().unwrap());
+        let first: InferenceRequest = json!({"model":"public","input":["a","b"]}).into();
+        forward
+            .forward_embedding(&first, &mut Relayed::default())
+            .await
+            .unwrap();
+        let large: InferenceRequest =
+            json!({"model":"public","input":["a".repeat(8 << 20),"b"]}).into();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            forward.forward_embedding(&large, &mut Relayed::default()),
+        )
+        .await
+        .expect("the fresh upload completes");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            peer.counts(),
+            (2, 2, 0),
+            "two fresh requests, with no reset or replay of a reused upload"
+        );
+    }
 
     /// T47 (ADR 0036 §4, EM8): an engine under load may stop reading a large
     /// request while earlier batches run. Only the router's request deadline
