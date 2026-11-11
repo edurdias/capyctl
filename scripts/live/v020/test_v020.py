@@ -380,6 +380,13 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         self.assertEqual(settings['context_length'], 8192)
         self.assertEqual(settings['max_concurrent_requests'], 2)
 
+    def test_row_summary_does_not_hash_the_private_install_tree(self):
+        from unittest import mock
+        with mock.patch('v020.manifest', side_effect=AssertionError('not an export tree')):
+            report = v020.summary(self.root, 'ISSUE225')
+        self.assertFalse(report['selected_pass'])
+        self.assertTrue((self.root / 'summary.json').is_file())
+
 
 if __name__ == '__main__':
     unittest.main()

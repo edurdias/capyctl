@@ -568,7 +568,6 @@ def summary(root, selection):
     report = aggregate(catalog, records, selected)
     atomic_json(root / 'summary.json', report)
     (root / 'summary.txt').write_text('\n'.join(f"{row['id']}: {row['verdict']}: {row['reason']}" for row in report['rows']) + '\n')
-    manifest(root)
     return report
 
 
