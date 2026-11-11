@@ -416,7 +416,7 @@ v020_setup_tensorrt TENSORRT_LLM_140RC3 1.4.0rc3 2.14.0 cu132 13.4 CUDA_HOME_TRT
             em8(ctx, {})
         self.assertEqual(launches[0]['extra']['engine_config']['max_concurrent_requests'], 16)
 
-    def test_em2_enrolls_vllm_matryoshka_without_changing_restart_fixtures(self):
+    def test_em2_enrolls_python_matryoshka_without_changing_restart_fixtures(self):
         from rows.functional import run
         from types import SimpleNamespace
         launches = []
@@ -433,6 +433,12 @@ v020_setup_tensorrt TENSORRT_LLM_140RC3 1.4.0rc3 2.14.0 cu132 13.4 CUDA_HOME_TRT
         self.assertTrue(config['accept_extra_args'])
         self.assertEqual(config['extra_args'], ['--hf-overrides', '{"is_matryoshka":true}'])
         self.assertEqual(launches[1]['extra'], {})
+        from unittest import mock
+        with mock.patch('rows.functional.EMBEDDING_ENGINES', ('sglang0523',)):
+            with self.assertRaises(Captured):
+                run(ctx, dict(id='EM2'))
+        self.assertEqual(launches[2]['extra']['engine_config']['extra_args'],
+                         ['--json-model-override-args', '{"is_matryoshka":true}'])
         ctx = v020.Context(self.root, {})
         ctx.owned = lambda name: []
         ctx.logs = lambda name: "non-default args: {'hf_overrides': {'is_matryoshka': True}}"

@@ -139,10 +139,11 @@ def run(ctx, row):
         for engine in EMBEDDING_ENGINES:
             name = row["id"].lower() + "-" + engine
             extra = {}
-            if row["id"] == "EM2" and engine.startswith("vllm"):
+            if row["id"] == "EM2" and engine.startswith(("vllm", "sglang")):
                 # ADR 0036 §2: ordinary HF overrides enroll this Matryoshka model.
+                flag = "--hf-overrides" if engine.startswith("vllm") else "--json-model-override-args"
                 extra = {"engine_config": {"accept_extra_args": True,
-                         "extra_args": ["--hf-overrides", '{"is_matryoshka":true}']}}
+                         "extra_args": [flag, '{"is_matryoshka":true}']}}
             ctx.deploy(name, engine, model="embedding", api="embeddings",
                        residency="restart_only", extra=extra)
             if extra:

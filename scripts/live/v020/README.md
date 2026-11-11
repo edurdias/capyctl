@@ -79,9 +79,10 @@ old-server/current-host version refusal. It asserts the recorded `0.2.0` host,
 `host_version_newer_than_server` in the host log, and no reconciled
 session; reconnecting backoff is expected. Other old-server fixtures enroll
 matching-old hosts by default.
-EM2 explicitly enrolls Qwen3-Embedding-4B's Matryoshka dimensions on vLLM with
-`--hf-overrides '{"is_matryoshka":true}'`; its launch evidence retains the
-requested override and effective native settings. Both Python engines must
+EM2 explicitly enrolls Qwen3-Embedding-4B's Matryoshka dimensions with
+`--hf-overrides '{"is_matryoshka":true}'` on vLLM and
+`--json-model-override-args '{"is_matryoshka":true}'` on SGLang. Launch evidence
+retains the requested override and effective native settings. Both Python engines must
 return 256-length vectors; llama.cpp must refuse with `400 invalid_request`.
 EM8 failures retain sanitized router and engine logs before managed cleanup;
 per-request evidence includes the complete request, response and elapsed timing.
