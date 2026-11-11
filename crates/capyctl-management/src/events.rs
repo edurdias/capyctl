@@ -391,6 +391,12 @@ enum Field {
     Text,
     /// ADR 0033 §14: one of the closed reasons LMCache is off.
     LmcacheReason,
+    /// ADR 0036 §6: a finite, non-negative distance or tolerance.
+    NonNegativeReal,
+    /// Different embedding dimensions have no defined relative distance.
+    OptionalNonNegativeReal,
+    /// ADR 0036 EM4: the closed comparison verdict, pass or fail.
+    CanaryVerdict,
 }
 
 const STEP_FIELDS: &[(&str, Field)] = &[
@@ -460,7 +466,10 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
     if input.get("version").and_then(Value::as_str) != Some("1") {
         return Err(Failure::Internal);
     }
-    use Field::{Id, LmcacheReason, Number, OptionalToken, Phase, Text, Token, Tokens};
+    use Field::{
+        CanaryVerdict, Id, LmcacheReason, NonNegativeReal, Number, OptionalNonNegativeReal,
+        OptionalToken, Phase, Text, Token, Tokens,
+    };
     let step = step_transition(event.kind.as_str());
     let switch_phase = event.kind.strip_prefix("switch_").filter(|phase| {
         matches!(
@@ -584,6 +593,24 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
             ("generation", Number),
             ("count", Number),
         ],
+        // ADR 0036 §6, EM4, SPEC §14: expose the comparison, not the
+        // reference vector or any launch credential, through the event stream.
+        "embedding_canary_checked" => &[
+            ("deployment_id", Id),
+            ("operation_id", Id),
+            ("instance_index", Number),
+            ("generation", Number),
+            ("incarnation", Token),
+            ("reference_generation", Number),
+            ("reference_incarnation", Token),
+            ("probe_kind", Token),
+            ("probe_version", Number),
+            ("reference_dimension", Number),
+            ("observed_dimension", Number),
+            ("relative_distance", OptionalNonNegativeReal),
+            ("tolerance", NonNegativeReal),
+            ("verdict", CanaryVerdict),
+        ],
         // ADR 0035 §1a: a `topology: auto` instance started on another
         // tensor-parallel size than its previous launch, on these GPUs.
         "topology_auto_changed" => &[
@@ -640,6 +667,20 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
                     return Err(Failure::Internal);
                 }
                 Value::String(number.to_string())
+            }
+            Field::OptionalNonNegativeReal if value.is_null() => Value::Null,
+            Field::NonNegativeReal | Field::OptionalNonNegativeReal => {
+                let number = value.as_f64().ok_or(Failure::Internal)?;
+                if !number.is_finite() || number < 0.0 {
+                    return Err(Failure::Internal);
+                }
+                value.clone()
+            }
+            Field::CanaryVerdict => {
+                if !matches!(value.as_str(), Some("pass" | "fail")) {
+                    return Err(Failure::Internal);
+                }
+                value.clone()
             }
             Field::Token => token(value)?,
             Field::OptionalToken if value.is_null() => Value::Null,

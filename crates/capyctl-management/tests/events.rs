@@ -1128,6 +1128,16 @@ fn store_shaped(kind: &str) -> (serde_json::Value, Option<String>, Option<String
             "instance_index":0,"generation":3,"count":32}),
             ids.clone(),
         ),
+        // T47 T37 EM4 (ADR 0036 §6, SPEC §14): restart verdicts expose
+        // the measurement and baseline identity, never a vector or credential.
+        "embedding_canary_checked" => (
+            serde_json::json!({"version":"1","deployment_id":DEP,"operation_id":OP,
+            "instance_index":0,"generation":3,"incarnation":"launch-current",
+            "reference_generation":1,"reference_incarnation":"launch-reference",
+            "probe_kind":"embedding","probe_version":1,"reference_dimension":2,
+            "observed_dimension":2,"relative_distance":0.001,"tolerance":0.02,"verdict":"pass"}),
+            ids.clone(),
+        ),
         // T46 T37 (ADR 0035 §1a): `auto` chose another N on these GPUs.
         "topology_auto_changed" => (
             serde_json::json!({"version":"1","deployment_id":DEP,"instance_index":0,
@@ -1198,6 +1208,69 @@ async fn every_store_event_kind_projects_through_the_events_stream() {
         assert_eq!(response.status(), 200, "{kind}");
         let text = next(&mut response.into_body().into_data_stream()).await;
         assert!(text.contains(&format!("event: {kind}\n")), "{kind}: {text}");
+    }
+}
+
+// T47 T37 EM4 (ADR 0036 §6, SPEC §14): pass and fail measurements replay
+// with closed fields. A dimension mismatch has no defined distance; an
+// unknown verdict, malformed measurement or extra credential field is refused.
+#[tokio::test]
+async fn embedding_canary_events_project_their_closed_measurements() {
+    for (verdict, distance, dimension, extra, expected) in [
+        ("pass", serde_json::json!(0.001), 2, false, 200),
+        ("fail", serde_json::json!(0.3), 2, false, 200),
+        ("fail", serde_json::Value::Null, 3, false, 200),
+        ("unknown", serde_json::json!(0.001), 2, false, 500),
+        ("fail", serde_json::json!(-0.1), 2, false, 500),
+        ("pass", serde_json::json!(0.001), 2, true, 500),
+    ] {
+        let (mut payload, deployment, operation) = store_shaped("embedding_canary_checked");
+        payload["verdict"] = verdict.into();
+        payload["relative_distance"] = distance.clone();
+        payload["observed_dimension"] = dimension.into();
+        if extra {
+            payload["engine_key"] = MANAGEMENT.into();
+        }
+        let source = fake(move |_, _| {
+            let mut e = event(1);
+            e.kind = "embedding_canary_checked".into();
+            e.payload_json = payload.to_string();
+            e.deployment_id = deployment.clone();
+            e.operation_id = operation.clone();
+            Ok(page(vec![e], 1))
+        });
+        let response = fake_app(source, options())
+            .oneshot(
+                request("/management/v1/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            expected,
+            "{verdict}, {distance}, extra={extra}"
+        );
+        let text = next(&mut response.into_body().into_data_stream()).await;
+        assert!(!text.contains(MANAGEMENT));
+        if expected == 200 {
+            let data = text
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap();
+            let projected: serde_json::Value = serde_json::from_str(data).unwrap();
+            let payload = &projected["payload"];
+            assert_eq!(payload["verdict"], verdict);
+            assert_eq!(payload["relative_distance"], distance);
+            assert_eq!(payload["tolerance"], 0.02);
+            assert_eq!(payload["reference_generation"], "1");
+            assert_eq!(payload["reference_incarnation"], "launch-reference");
+            assert_eq!(payload["incarnation"], "launch-current");
+            assert_eq!(payload["probe_kind"], "embedding");
+            assert_eq!(payload["probe_version"], "1");
+            assert_eq!(payload["observed_dimension"], dimension.to_string());
+        }
     }
 }
 
