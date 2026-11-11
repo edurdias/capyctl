@@ -237,7 +237,7 @@ class Context:
         self.command([binary, 'validate', 'config', '--file', config])
         return self.spawn([binary, 'start', 'host', '--config', config], name)
 
-    def role(self, role='standalone', old=False):
+    def role(self, role='standalone', old=False, host_old=None):
         if role in self.roles:
             return self.roles[role]
         state = self.root / 'state' / role
@@ -277,7 +277,7 @@ class Context:
         else:
             raise TimeoutError('role readiness deadline')
         if role != 'standalone':
-            self.enroll(role, old=old)
+            self.enroll(role, old=old if host_old is None else host_old)
         return info
 
     def enroll(self, role, old=False):
@@ -349,6 +349,9 @@ class Context:
         if 'llamacpp' in engine.lower() and api == 'embeddings':
             # Preserve the qualification context/slots; GGUF metadata sizes native KV.
             config['engine_config'].pop('memory')
+        if engine.upper().startswith(('TENSORRT_LLM', 'TRT_LLM')):
+            # Let the controller fit context to the fixed, block-rounded KV pool.
+            config['engine_config'].pop('context_length')
         if role != 'standalone':
             config['host'] = 'qualification-host'
         if 'tensorfold' in engine.lower():
@@ -521,7 +524,8 @@ class Context:
         # Never export raw argv: only the owned settings tested by these rows.
         allowed = {'gpu-memory-utilization', 'kv-cache-memory-bytes', 'disable-prefill-cuda-graph',
                    'disable-decode-cuda-graph', 'cuda-graph-backend-prefill', 'cuda-graph-backend-decode',
-                   'supported-transfer-mode', 'kv-transfer-config', 'is-embedding'}
+                   'supported-transfer-mode', 'kv-transfer-config', 'is-embedding',
+                   'hf-overrides', 'json-model-override-args'}
         flags = {}
         for identity in self.owned(name):
             path = Path('/proc') / str(identity['pid']) / 'cmdline'

@@ -73,12 +73,28 @@ The ISSUE235 control model also declares an 8192-token context for its explicit
 llama.cpp embedding fixtures retain the required 32768-token context and eight
 slots, deriving their native KV reservation from the GGUF rather than inheriting
 the Python-engine fixture's 5 GiB override.
-An old-server fixture enrolls the matching old host: a newer host is correctly
-refused by the server-first upgrade gate and cannot exercise editable refusal.
-The healthy control profile is registered before the editable fixture's host
-restart, so older hosts advertise it in that session rather than leaving it pending.
-OT11 expects SGLang's explicit argument-allowlist denial for `--enable-trace`;
-unlike vLLM's exporter option, that refusal does not use the word `reserved`.
+ISSUE235 keeps current-server/current-host editable refusal separate from
+old-server/current-host version refusal. It asserts the recorded `0.2.0` host,
+`refused` compatibility, the human-readable newer-host reason plus
+`host_version_newer_than_server` in the host log, and no reconciled
+session; reconnecting backoff is expected. Other old-server fixtures enroll
+matching-old hosts by default.
+EM2 explicitly enrolls Qwen3-Embedding-4B's Matryoshka dimensions with
+`--hf-overrides '{"is_matryoshka":true}'` on vLLM and
+`--json-model-override-args '{"is_matryoshka":true}'` on SGLang. Launch evidence
+retains the requested override and effective native settings. Both Python engines must
+return 256-length vectors; llama.cpp must refuse with `400 invalid_request`.
+EM8 failures retain sanitized router and engine logs before managed cleanup;
+per-request evidence includes the complete request, response and elapsed timing.
+EM8 declares 16 concurrent engine slots for its 16-client matrix cells; queue
+refusals and incomplete responses still fail the row rather than count as samples.
+OT11 checks SGLang's actual `not accepted here` profile diagnostic rather than
+requiring the word `reserved`; full sanitized refusal text remains in evidence.
+TensorRT-LLM 1.2.1 pins NumPy 1.26.4 and PyArrow 21: its NumPy `<2`
+requirement conflicts with PyArrow 26's import-time NumPy `>=2` requirement,
+which its wheel metadata does not declare. The rc3 environment is unchanged.
+TensorRT fixtures omit an implicit context length so the controller fits it to
+the fixed KV budget; TR3 expects the engine's whole-block floor, not a ceiling.
 No apt, driver update, system CUDA modification or reboot is allowed. Missing
 compilers/tools are blocking preflight errors, not permission to install packages.
 
@@ -280,7 +296,7 @@ Budgets are maximum seconds per row, not elapsed-time promises.
 | LC15 | P1 | 600 | ADR0034 §2: enrolled host through the control server, 32k park/wake/hit and passing wake canary. |
 | LC16 | P1 | 900 | ADR0034 §2: five cold/engine-evicted/post-park trials at 8k/16k/32k; wake <=1.1x off, cold TTFT <=1.1x off, 32k post-wake TTFT <=0.25x off. |
 | ISSUE236 | P1 | 1200 | SGLang 0.5.22 and 0.5.23 answer with prefill disabled and decode native in managed native ServerArgs settings |
-| ISSUE235 | P1 | 1500 | editable SGLang refused before launch by new server/host; old server/new host records engine_import_failed without reconnect or harming another model |
+| ISSUE235 | P1 | 1500 | Current server/current host refuse editable SGLang before launch; a 0.1.12 server refuses a 0.2.0 host with host_version_newer_than_server (ADR 0017 §2). |
 | ISSUE240 | P1 | 1800 | 48 durable in-flight leases coexist on a managed engine; traffic survives server-first then host upgrade from 0.1.12 to 0.2.0 |
 | EM1 | P2 | 900 | Qwen3-Embedding-4B BF16/Q8_0: native 2560 dimensions, ordered batch, API/certification/LMCache evidence and memory/start/charge. |
 | EM8 | P2 | 1800 | Embedding latency/load matrix and pinned retrieval; Qwen8B 2048-input float/base64 router memory bound. |

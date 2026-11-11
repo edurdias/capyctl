@@ -99,7 +99,8 @@ def contract(ctx, name, engine):
     ctx.assertion(all(math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-7) for a, b in zip(reference, decoded)), "base64 differs beyond float32 rounding")
     reduced = embedding(ctx, name, "qualification probe", dimensions=256)
     if engine.startswith("llama"):
-        ctx.assertion(reduced.get("status") == 400, "llama.cpp accepted non-native dimensions")
+        ctx.assertion(reduced.get("status") == 400 and "invalid_request" in json.dumps(reduced.get("body")),
+                      "llama.cpp did not refuse non-native dimensions with invalid_request")
     else:
         ctx.assertion(len(vectors(ctx, reduced, name, 1)[0]) == 256, "dimension reduction not applied")
     for inputs, fields in (("probe", {"stream": True}), ("probe", {"unknown_field": 1}), ("", {})):
@@ -137,7 +138,16 @@ def run(ctx, row):
             return tracing_refusals(ctx, evidence)
         for engine in EMBEDDING_ENGINES:
             name = row["id"].lower() + "-" + engine
-            ctx.deploy(name, engine, model="embedding", api="embeddings", residency="restart_only")
+            extra = {}
+            if row["id"] == "EM2" and engine.startswith(("vllm", "sglang")):
+                # ADR 0036 §2: ordinary HF overrides enroll this Matryoshka model.
+                flag = "--hf-overrides" if engine.startswith("vllm") else "--json-model-override-args"
+                extra = {"engine_config": {"accept_extra_args": True,
+                         "extra_args": [flag, '{"is_matryoshka":true}']}}
+            ctx.deploy(name, engine, model="embedding", api="embeddings",
+                       residency="restart_only", extra=extra)
+            if extra:
+                ctx.save(name + "-launch", dict(override=extra, settings=ctx.engine_args(name)))
             if row["id"] == "EM2":
                 evidence[engine] = contract(ctx, name, engine)
             else:
@@ -245,5 +255,6 @@ def tracing_refusals(ctx,evidence):
         path=ctx.installation(key)
         result=ctx.cli("engine","add",path,"--name","ot11-refused",*flags,check=False)
         ctx.assertion(result.returncode!=0 and reason in (result.stdout+result.stderr),"reserved tracing profile setting accepted or wrong refusal")
-        evidence.setdefault("profile_refusals",[]).append(dict(engine=key,exit_code=result.returncode,reason=reason))
+        evidence.setdefault("profile_refusals",[]).append(dict(engine=key,exit_code=result.returncode,
+                                                             reason=reason,stdout=result.stdout,stderr=result.stderr))
     return dict(verdict="pass",reason="Non-loopback exporter and reserved engine tracing profile settings refused",evidence=evidence)

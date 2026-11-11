@@ -399,6 +399,153 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         self.assertEqual(ctx.extra['engine_config']['context_length'], 8192)
         self.assertEqual(actions, ['register', 'restart'])
 
+    def test_editable_fixture_registers_control_before_host_publication(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from rows.regressions import install_editable_profile
+        config = self.root / 'host.yaml'
+        config.write_text('runtime_profiles: {}\n')
+        published = []
+        registered = []
+        process = SimpleNamespace(terminate=lambda: None, wait=lambda timeout: None)
+        info = dict(host_config=config, host_process=process, host_binary='old')
+        ctx = SimpleNamespace(root=self.root, engines={'SGLANG_EDITABLE': '/fixture'},
+                              role=lambda role: info, remaining=lambda: 60,
+                              assertion=v020.Context.assertion)
+        ctx.register = lambda engine, role: registered.append(engine)
+        ctx.spawn_host = lambda *args: published.extend(registered)
+        with mock.patch('rows.regressions.time.sleep'):
+            install_editable_profile(ctx, 'server')
+        self.assertEqual(published, ['VLLM_033'])
+
+    def test_editable_row_checks_skew_code_in_logs_not_the_ledger_reason(self):
+        from rows.regressions import editable
+        from types import SimpleNamespace
+        from unittest import mock
+        host = dict(name='qualification-host', binary_version='0.2.0',
+                    compatibility='refused', session=None)
+        version = dict(binary_version='0.2.0', compatibility='refused',
+                       reason='host 0.2.0 is newer than server 0.1.12; upgrade the server first')
+        roles, launches = [], []
+        def cli(*args, **kwargs):
+            if args[:2] == ('list', 'hosts'):
+                return SimpleNamespace(stdout=json.dumps(dict(hosts=[host])))
+            return SimpleNamespace(returncode=2, stdout='editable installation_unsupported', stderr='')
+        ctx = SimpleNamespace(
+            engines=dict(SGLANG_EDITABLE='/fixture'), deployments=[],
+            installation=lambda key: None, logs=lambda: 'host_version_newer_than_server',
+            cli=cli, assertion=v020.Context.assertion,
+            role=lambda role, **kwargs: roles.append((role, kwargs)),
+            deploy=lambda *args, **kwargs: launches.append(kwargs['role']),
+            owned=lambda name, role: [] if name == 'editable' else [dict(pid=1)],
+            events=lambda role: [], cleanup=lambda: None,
+            request=lambda *args, **kwargs: dict(status=200, body='42'),
+            sql=lambda *args, **kwargs: [version], save=lambda *args: None)
+        with mock.patch('rows.regressions.install_editable_profile', return_value=('editable', '/fixture')):
+            result = editable(ctx)
+        self.assertEqual(result['old-server']['code'], 'host_version_newer_than_server')
+        self.assertEqual(roles[-1], ('old-server', dict(old=True, host_old=False)))
+        self.assertEqual(launches, ['server'])
+
+    def test_trt121_pins_numpy_and_arrow_without_constraining_rc3(self):
+        import subprocess
+        (self.root / 'downloads').mkdir()
+        script = '''
+source "$1"
+V020=$2 BIN=$2 EVIDENCE=$2
+declare -A V020_OVERRIDES=()
+TENSORRT_LLM_121=$2/stable TENSORRT_LLM_140RC3=$2/rc3
+v020_venv() { :; }
+v020_cmd() { :; }
+v020_trt_toolkit() { :; }
+v020_freeze() { :; }
+v020_trt_availability() { :; }
+v020_trt_driver_probe() { :; }
+v020_setup_tensorrt TENSORRT_LLM_121 1.2.1 2.9.1 cu130 13.1 CUDA_HOME_TRT121
+v020_setup_tensorrt TENSORRT_LLM_140RC3 1.4.0rc3 2.14.0 cu132 13.4 CUDA_HOME_TRT140RC3
+'''
+        subprocess.run(['bash', '-c', script, 'constraints',
+                        str(Path(__file__).with_name('setup.sh')), str(self.root)], check=True)
+        stable = (self.root / 'downloads/TENSORRT_LLM_121-torch-constraints.txt').read_text()
+        rc3 = (self.root / 'downloads/TENSORRT_LLM_140RC3-torch-constraints.txt').read_text()
+        self.assertIn('numpy==1.26.4\npyarrow==21.*\n', stable)
+        self.assertNotIn('numpy', rc3)
+        self.assertNotIn('pyarrow', rc3)
+
+    def test_tracing_refusal_accepts_the_actual_sglang_policy_diagnostic(self):
+        from rows.functional import tracing_refusals
+        from types import SimpleNamespace
+        def cli(*args, **kwargs):
+            reason = ('engine_env_reserved' if any('--env=' in arg for arg in args)
+                      else 'not accepted here' if '--arg=--enable-trace' in args else 'reserved')
+            return SimpleNamespace(returncode=2, stdout='', stderr=reason)
+        ctx = SimpleNamespace(root=self.root, binary=lambda: 'capyctl', cli=cli,
+                              installation=lambda key: '/fixture',
+                              command=lambda *args, **kwargs: SimpleNamespace(
+                                  returncode=13, stdout='', stderr='loopback'),
+                              assertion=v020.Context.assertion)
+        result = tracing_refusals(ctx, {})
+        self.assertEqual(result['verdict'], 'pass')
+        self.assertEqual(len(result['evidence']['profile_refusals']), 3)
+
+    def test_embedding_load_declares_capacity_for_the_sixteen_client_cells(self):
+        from rows.measurements import em8
+        from types import SimpleNamespace
+        launches = []
+        class Captured(Exception):
+            pass
+        def deploy(*args, **kwargs):
+            launches.append(kwargs)
+            raise Captured
+        ctx = SimpleNamespace(engines={}, deploy=deploy)
+        with self.assertRaises(Captured):
+            em8(ctx, {})
+        self.assertEqual(launches[0]['extra']['engine_config']['max_concurrent_requests'], 16)
+
+    def test_tensorrt_fixture_fits_context_to_its_fixed_kv_pool(self):
+        ctx = v020.Context(self.root, {})
+        ctx.role = lambda role: None
+        ctx.register = lambda engine, role: 'profile'
+        ctx.cli = lambda *args, **kwargs: None
+        ctx.status = lambda *args: {}
+        ctx.deploy('trt', 'TENSORRT_LLM_121', extra={
+            'engine_config': {'memory': {'kv_cache': '4GiB'}}})
+        config = json.loads((self.root / 'trt.json').read_text())['engine_config']
+        self.assertNotIn('context_length', config)
+        self.assertEqual(config['memory']['kv_cache'], '4GiB')
+        ctx.deploy('explicit', 'TENSORRT_LLM_121', extra={
+            'engine_config': {'context_length': 8192}})
+        config = json.loads((self.root / 'explicit.json').read_text())['engine_config']
+        self.assertEqual(config['context_length'], 8192)
+
+    def test_em2_enrolls_python_matryoshka_without_changing_restart_fixtures(self):
+        from rows.functional import run
+        from types import SimpleNamespace
+        launches = []
+        class Captured(Exception):
+            pass
+        def deploy(*args, **kwargs):
+            launches.append(kwargs)
+            raise Captured
+        ctx = SimpleNamespace(deploy=deploy)
+        for row in ('EM2', 'EM4'):
+            with self.assertRaises(Captured):
+                run(ctx, dict(id=row))
+        config = launches[0]['extra']['engine_config']
+        self.assertTrue(config['accept_extra_args'])
+        self.assertEqual(config['extra_args'], ['--hf-overrides', '{"is_matryoshka":true}'])
+        self.assertEqual(launches[1]['extra'], {})
+        from unittest import mock
+        with mock.patch('rows.functional.EMBEDDING_ENGINES', ('sglang0523',)):
+            with self.assertRaises(Captured):
+                run(ctx, dict(id='EM2'))
+        self.assertEqual(launches[2]['extra']['engine_config']['extra_args'],
+                         ['--json-model-override-args', '{"is_matryoshka":true}'])
+        ctx = v020.Context(self.root, {})
+        ctx.owned = lambda name: []
+        ctx.logs = lambda name: "non-default args: {'hf_overrides': {'is_matryoshka': True}}"
+        self.assertEqual(ctx.engine_args('model')['resolved']['hf_overrides'], {'is_matryoshka': True})
+
     def test_llama_embeddings_keep_required_context_and_derive_kv_from_gguf(self):
         ctx = v020.Context(self.root, {})
         ctx.role = lambda role: None
@@ -414,7 +561,7 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         config = json.loads((self.root / 'python-embedding.json').read_text())
         self.assertEqual(config['engine_config']['memory']['kv_cache'], '5GiB')
 
-    def test_old_server_fixture_enrolls_an_old_host_not_a_newer_refused_host(self):
+    def test_old_server_defaults_to_old_host_but_accepts_explicit_generation_override(self):
         from types import SimpleNamespace
         from unittest import mock
         ctx = v020.Context(self.root, {})
@@ -431,6 +578,10 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         with mock.patch.object(ctx, 'enroll') as enroll:
             ctx.role('old-server', old=True)
         enroll.assert_called_once_with('old-server', old=True)
+        ctx.roles.clear()
+        with mock.patch.object(ctx, 'enroll') as enroll:
+            ctx.role('old-server', old=True, host_old=False)
+        enroll.assert_called_once_with('old-server', old=False)
 
     def test_tracing_fixture_accepts_sglang_allowlist_denial_not_only_reserved_wording(self):
         from rows.functional import tracing_refusals
@@ -579,6 +730,20 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         with self.assertRaises(AssertionError):
             ctx.spawn_host(binary, self.root / 'invalid.yaml', 'invalid-host')
         self.assertFalse(marker.exists())
+
+    def test_embedding_load_failure_retains_logs_before_cleanup(self):
+        from unittest import mock
+        from rows import measurements
+        ctx = v020.Context(self.root, {})
+        ctx.row_id = 'EM8'
+        ctx.logs = lambda: 'router backend completion unverified\nengine failed'
+        with mock.patch('rows.measurements.em8', side_effect=AssertionError('embedding request failed')):
+            result = measurements.run(ctx, dict(id='EM8'))
+        self.assertEqual(result['verdict'], 'fail')
+        diagnostic = json.loads((ctx.evidence / 'EM8-failure-logs.json').read_text())
+        self.assertIn('backend completion unverified', diagnostic['logs'])
+        self.assertIn('engine failed', diagnostic['logs'])
+        self.assertEqual(result['evidence']['failure_logs'], 'EM8-failure-logs.json')
 
     def test_router_json_timing_header_and_complete_sse_comment_are_observed(self):
         import http.server

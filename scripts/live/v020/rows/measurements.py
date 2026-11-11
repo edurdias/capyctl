@@ -195,7 +195,8 @@ def em8(ctx, evidence):
         ctx.assertion(data.get('revision') and data.get('source') and data.get('queries') and data.get('documents'), 'retrieval fixture needs source, revision, documents and queries with relevant indices')
     for engine in ('vllm033', 'sglang0523', 'llamacpp090'):
         name = 'em8-' + engine
-        ctx.deploy(name, engine, model='embedding', api='embeddings')
+        ctx.deploy(name, engine, model='embedding', api='embeddings',
+                   extra={'engine_config': {'max_concurrent_requests': 16}})
         matrix = []
         evidence[engine] = dict(matrix=matrix)
         for batch in (1,16,256):
@@ -320,6 +321,9 @@ def run(ctx,row):
             return dict(verdict='skip',reason=evidence['retrieval_skipped'],evidence=evidence)
         return dict(verdict='pass',reason='All required measurement arms and evidence bounds passed',evidence=evidence)
     except (AssertionError,ValueError,KeyError,TypeError,OSError,TimeoutError) as error:
+        if row['id'] == 'EM8':
+            ctx.save('failure-logs', dict(logs=ctx.logs()))
+            evidence['failure_logs'] = 'EM8-failure-logs.json'
         return dict(verdict='fail',reason=str(error),evidence=evidence)
 
 
@@ -550,7 +554,7 @@ def tr3(ctx,evidence,engine='TENSORRT_LLM_121'):
             block=number(logs,('tokens_per_block','block_size'))
             kv=number(logs,('kv_cache_bytes','kv_cache_size_bytes'))
             requested=number(logs,('requested_max_tokens','rendered_max_tokens'))
-            ctx.assertion(pool==math.ceil(requested/block)*block,'built TensorRT pool differs from block-rounded rendered max_tokens')
+            ctx.assertion(pool==math.floor(requested/block)*block,'built TensorRT pool differs from whole-block floor of rendered max_tokens')
             # Prove the cold launch uses only the newly-created session cache.
             if index==0:
                 proved=False
