@@ -311,6 +311,10 @@ async fn rejects_changed_response_identity_duplicate_fields_and_trailing_generat
     for sglang in [false, true] {
         for bad in [
             format!(
+                "{}data: [DONE]\n\n",
+                chunk("a", json!("stop")).replace(",\"finish_reason\":\"stop\"", "")
+            ),
+            format!(
                 "{}{}data: [DONE]\n\n",
                 chunk("a", Value::Null),
                 chunk("b", json!("stop")).replace("chat-1", "chat-2")

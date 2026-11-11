@@ -149,6 +149,7 @@ struct Script {
     /// The `/metrics` body, returned on every read.
     metrics: Mutex<Value>,
     empty_answer: AtomicBool,
+    chat_stream: Mutex<String>,
 }
 
 impl Default for Script {
@@ -161,6 +162,7 @@ impl Default for Script {
             // (16,384) and `max_tokens` (29,127) plus one block.
             metrics: Mutex::new(json!([entry(910, 1, 0, 1)])),
             empty_answer: AtomicBool::new(false),
+            chat_stream: Mutex::new(CHAT_STREAM.to_owned()),
         }
     }
 }
@@ -205,25 +207,21 @@ async fn metrics(State(stub): State<Stub>) -> axum::response::Response {
     Json(stub.script.metrics.lock().unwrap().clone()).into_response()
 }
 
-fn chunk(delta: Value, finish: Value) -> Value {
-    json!({"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1,
-        "model": SERVED, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
-}
+// T49, ADR 0038 §5: source-derived from TensorRT-LLM v1.2.1 (376f7e1),
+// serve/postprocess_handlers.py:166-308 and openai_protocol.py:496-511.
+// Null fields are omitted, each chunk gets its own UUID, and include_usage
+// enables continuous usage by default. IDs, time and generated text are fixed.
+const CHAT_STREAM: &str = include_str!("fixtures/tensorrt_llm_121_chat.sse");
 
 async fn chat(State(stub): State<Stub>, Json(body): Json<Value>) -> axum::response::Response {
     stub.chats.fetch_add(1, SeqCst);
     assert_eq!(body["model"], SERVED, "the probe names the served model");
-    let delta = if stub.script.empty_answer.load(SeqCst) {
-        json!({"content": ""})
+    let stream = stub.script.chat_stream.lock().unwrap();
+    let body = if stub.script.empty_answer.load(SeqCst) {
+        stream.replace("Ready.", "")
     } else {
-        json!({"content": "Ready."})
+        stream.clone()
     };
-    let body = format!(
-        "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-        chunk(json!({"role": "assistant", "content": ""}), Value::Null),
-        chunk(delta, Value::Null),
-        chunk(json!({}), json!("length")),
-    );
     (
         [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
         body,
@@ -458,6 +456,67 @@ async fn initialize_passes_every_step_in_order() {
         std::fs::read_link(dirs.launch_dir().join("model").join(SERVED)).unwrap(),
         dirs.checkpoint.path()
     );
+}
+
+// T49 T19, ADR 0038 §5, §11: the real stream shape works for both the
+// readiness probe's collected path and client streams. Only model is remapped;
+// JSON fields retain their bytes; SSE padding outside the JSON is discarded.
+#[tokio::test]
+async fn tensorrt_llm_121_stream_shape_is_collected_and_relayed() {
+    let (_, port) = stub_engine(|_| {}).await;
+    let adapter = TensorrtLlmAdapter::new(
+        format!("http://127.0.0.1:{port}").parse().unwrap(),
+        VERSION.into(),
+        SERVED.into(),
+    );
+    let request = json!({"model":"public","messages":[{"role":"user","content":"Say ready."}],
+        "stream_options":{"include_usage":true}});
+    let answer = adapter.forward_chat(&request.clone().into()).await.unwrap();
+    assert_eq!(answer["model"], "public");
+    assert_eq!(answer["choices"][0]["message"]["content"], "Ready.");
+    assert_eq!(answer["choices"][0]["finish_reason"], "length");
+    assert_eq!(answer["usage"]["completion_tokens"], 8);
+    let mut chunks = Vec::new();
+    let end = adapter
+        .forward_chat_stream(&request.into(), &mut |chunk| chunks.push(chunk))
+        .await
+        .unwrap();
+    assert_eq!(end, capyctl_adapters::StreamEnded::Completed);
+    let expected: Vec<_> = CHAT_STREAM
+        .split("\n\n")
+        .filter_map(|event| event.strip_prefix("data: "))
+        .filter(|data| data.trim() != "[DONE]")
+        .map(|data| data.trim().replace(SERVED, "public"))
+        .collect();
+    assert_eq!(chunks, expected);
+}
+
+// T49 T17, ADR 0038 §5: per-chunk IDs and absent non-terminal finish
+// reasons do not excuse missing terminal evidence or malformed chunks.
+#[tokio::test]
+async fn tensorrt_llm_still_requires_valid_chunks_a_finish_reason_and_done() {
+    for stream in [
+        CHAT_STREAM.replace("data: [DONE]\n\n", ""),
+        CHAT_STREAM.replace(",\"finish_reason\":\"length\"", ""),
+        CHAT_STREAM.replace("\"finish_reason\":\"length\"", "\"finish_reason\":false"),
+        CHAT_STREAM.replace("\"finish_reason\":\"length\"", "\"finish_reason\":\"abort\""),
+        CHAT_STREAM.replace("\"id\":\"chatcmpl-22222222222242228222222222222222\"", "\"id\":\"\""),
+        CHAT_STREAM.replace("\"content\":\"Ready.\"", "\"content\":42"),
+        CHAT_STREAM.replace("\"model\":\"qwen3-4b\"", "\"model\":\"wrong\""),
+        CHAT_STREAM.replace("\"role\":\"assistant\"", "\"role\":\"user\""),
+        CHAT_STREAM.replace("\"choices\":[]", "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"},\"finish_reason\":\"stop\"}]"),
+    ] {
+        let (_, port) = stub_engine(|s| *s.chat_stream.lock().unwrap() = stream).await;
+        let adapter = TensorrtLlmAdapter::new(
+            format!("http://127.0.0.1:{port}").parse().unwrap(),
+            VERSION.into(),
+            SERVED.into(),
+        );
+        assert!(matches!(
+            adapter.forward_chat(&json!({"model":"public","messages":[]}).into()).await,
+            Err(AdapterError::Uncertain(_))
+        ));
+    }
 }
 
 /// One way the stub answers otherwise than a correct launch.
