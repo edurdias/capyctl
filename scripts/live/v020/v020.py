@@ -198,7 +198,7 @@ class Context:
         value = re.sub(
             r'(?i)((?:api[_-]?key|admin[_-]?token|secret|password)[\"\x27]?\s*[:=]\s*)(\"[^\"]*\"|\x27[^\x27]*\x27|[^,\s}\]]+)',
             lambda match: match[1] + (match[2][0] + '<redacted>' + match[2][0]
-                                     if match[2][0] in "'\"" else '<redacted>'),
+                                     if match[2][0] in "'\"" else "'<redacted>'"),
             value)
         return re.sub(r'/(?:home/[^/\s\"\x27]+|root)/', '/home/me/', value)
 

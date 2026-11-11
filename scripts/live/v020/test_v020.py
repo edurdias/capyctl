@@ -132,7 +132,7 @@ class HelperTests(unittest.TestCase):
         ctx = v020.Context.__new__(v020.Context)
         ctx.owned = lambda name: []
         ctx.secrets = []
-        ctx.logs = lambda name: ctx.clean("server_args={'disable_prefill_cuda_graph': True, 'disable_decode_cuda_graph': False, 'cuda_graph_backend_prefill': 'disabled', 'cuda_graph_config': {'prefill': {'backend': 'disabled'}, 'decode': {'backend': 'full'}}, 'api_key': 'must-not-export'}")
+        ctx.logs = lambda name: ctx.clean("server_args={'disable_prefill_cuda_graph': True, 'disable_decode_cuda_graph': False, 'cuda_graph_backend_prefill': 'disabled', 'cuda_graph_config': {'prefill': {'backend': 'disabled'}, 'decode': {'backend': 'full'}}, 'api_key': 'must-not-export', 'admin_token': None}")
         settings = ctx.engine_args('phase-test')
         self.assertEqual(settings['resolved']['disable_prefill_cuda_graph'], 'True')
         self.assertEqual(settings['resolved']['disable_decode_cuda_graph'], 'False')
@@ -403,9 +403,10 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         p.lifecycle = lambda action, name: dict(status=action)
         p.retire = lambda name: None
         with mock.patch('rows.lmcache.cache_ledger', return_value=dict(
-                planned='off', state='off', reason='sleep_clears_cache', planned_reason=None)):
+                planned='off', state='off', reason='park_unqualified', planned_reason=None)):
             self.assertTrue(sleep_guard(p))
         self.assertTrue(any('not qualified' in reason for reason in p.failures))
+        self.assertFalse(any('auto sleep parking did not disable' in reason for reason in p.failures))
 
 
 if __name__ == '__main__':

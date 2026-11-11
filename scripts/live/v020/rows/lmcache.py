@@ -659,9 +659,8 @@ def sleep_guard(p):
         return False
     auto = p.deploy("auto-compatibility", "auto")
     ledger = cache_ledger(ctx, auto, p.role)
-    p.check(ledger["planned"] == "off" and ledger["state"] == "off" and
-            (ledger["planned_reason"] or ledger["reason"]) == "sleep_clears_cache",
-            "auto sleep parking did not disable LMCache with sleep_clears_cache")
+    p.check(ledger["planned"] == "off" and ledger["state"] == "off",
+            "auto sleep parking did not disable LMCache")
     park = p.lifecycle("park", auto)
     wake = p.lifecycle("wake", auto)
     response = ctx.request(auto, role=p.role)
