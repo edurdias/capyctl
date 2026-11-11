@@ -415,6 +415,56 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
             resolved=dict(is_embedding='True')))
         self.assertTrue(argv_settings(ctx, 'embedding-model')['is-embedding'])
 
+    def test_invalid_host_config_is_rejected_before_starting_a_process(self):
+        import sys
+        ctx = v020.Context(self.root, {})
+        binary = self.root / 'host-fixture'
+        marker = self.root / 'host-started'
+        binary.write_text(
+            '#!' + sys.executable + '\nimport pathlib,sys\n'
+            'if sys.argv[1:3] == ["validate","config"]: sys.exit(2)\n'
+            f'pathlib.Path({str(marker)!r}).touch()\n')
+        binary.chmod(0o700)
+        with self.assertRaises(AssertionError):
+            ctx.spawn_host(binary, self.root / 'invalid.yaml', 'invalid-host')
+        self.assertFalse(marker.exists())
+
+    def test_router_json_timing_header_and_complete_sse_comment_are_observed(self):
+        import http.server
+        import threading
+        from rows.measurements import timing_phases
+        header = json.dumps(dict(selection_ms=1.0, total_ms=None, instance=0))
+        self.assertEqual(timing_phases(dict(response_headers={'x-capyctl-timing': header})),
+                         dict(selection_ms=1.0))
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                body = (b'data: {"choices":[{"delta":{"content":"42"}}]}\n\n'
+                        b': x-capyctl-timing {"selection_ms":1.0,"total_ms":2.0}\n\n'
+                        b'data: [DONE]\n\n')
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('x-capyctl-timing', header)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *args):
+                pass
+        server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+        worker = threading.Thread(target=server.handle_request)
+        worker.start()
+        ctx = v020.Context(self.root, {})
+        cred = self.root / 'credentials'
+        cred.write_text('api_key: fixture\nadmin_token: fixture-admin\n')
+        ctx.role = lambda role: dict(port=server.server_port, cred=cred)
+        try:
+            response = ctx.request('model', stream=True)
+            self.assertEqual(timing_phases(response), dict(selection_ms=1.0, total_ms=2.0))
+            self.assertTrue(response['done'])
+        finally:
+            worker.join(timeout=5)
+            server.server_close()
+
 
 if __name__ == '__main__':
     unittest.main()

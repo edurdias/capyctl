@@ -64,6 +64,10 @@ guards leave LC13–LC16 unqualified, never passed; LC13 separately checks a
 32k external hit across restart-only parking.
 Embedding render observations accept SGLang's managed native `is_embedding`
 setting; its protected-descriptor launch does not expose an engine CLI flag.
+Every managed host configuration is validated before its process starts;
+editable profiles include log policy and distinct credential references.
+OT8 reads JSON timing headers and the complete timing SSE comment, not a
+Server-Timing-style string. TRT kernel caches are archived per attempt.
 No apt, driver update, system CUDA modification or reboot is allowed. Missing
 compilers/tools are blocking preflight errors, not permission to install packages.
 

@@ -377,11 +377,12 @@ def isolated_role(ctx, label, settings=(), environment=None):
 
 def timing_phases(response):
     headers={key.lower():value for key,value in response.get('response_headers',{}).items()}
-    value=headers.get('x-capyctl-timing','')
-    phases={}
-    for key,number_value in re.findall(r'([A-Za-z_]+)(?:;dur=|=|:)\s*([0-9.]+)',value):
-        phases[key]=float(number_value)
-    return phases
+    value=response.get('timing')
+    if value is None:
+        value=json.loads(headers.get('x-capyctl-timing','{}'))
+    return {key:float(number_value) for key,number_value in value.items()
+            if key.endswith('_ms') and isinstance(number_value,(int,float))
+            and not isinstance(number_value,bool) and math.isfinite(number_value)}
 
 
 def load_chat(ctx,name,n=200,concurrency=8,headers=None):
@@ -524,8 +525,8 @@ def sglang_levels(ctx):
 
 def tr3(ctx,evidence,engine='TENSORRT_LLM_121'):
     label='tr3-'+engine.lower().replace('_','-')
-    cache=ctx.root/(label+'-kernel-cache')
-    cache.mkdir(mode=0o700,exist_ok=False)
+    cache=ctx.root/'state'/(label+'-kernel-cache')
+    cache.mkdir(mode=0o700,parents=True,exist_ok=False)
     environment={key:str(cache/key.lower()) for key in
                  ('XDG_CACHE_HOME','TORCHINDUCTOR_CACHE_DIR','TRITON_CACHE_DIR','FLASHINFER_WORKSPACE_BASE')}
     for path in environment.values():

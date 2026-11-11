@@ -78,7 +78,7 @@ def restart(ctx, role, host=False):
     binary = ctx.binary()
     if host:
         info['host_binary'] = binary
-        info[key] = ctx.spawn([binary, 'start', 'host', '--config', info['host_config']], role + '-host-upgraded')
+        info[key] = ctx.spawn_host(binary, info['host_config'], role + '-host-upgraded')
     else:
         info['binary'] = binary
         info[key] = ctx.spawn([binary, 'start', 'server', '--config', info['config']], role + '-upgraded')
@@ -103,13 +103,18 @@ def install_editable_profile(ctx, role):
     security:
       deep_park: enabled
       installation_drift: warn
+      credential_ref: secret://engine-key
+      admin_credential_ref: secret://admin-key
+    log_policy:
+      max_file_bytes: 10MiB
+      retained_files: 2
 '''.replace('EXECUTABLE', json.dumps(str(Path(ctx.engines['SGLANG_EDITABLE']) / 'bin/python')))
     ctx.assertion('runtime_profiles: {}' in text, 'host init config lacks empty runtime_profiles; cannot safely configure editable test')
     config.write_text(text.replace('runtime_profiles: {}', profile.rstrip()))
     process = info['host_process']
     process.terminate()
     process.wait(timeout=min(60, ctx.remaining()))
-    info['host_process'] = ctx.spawn([info['host_binary'], 'start', 'host', '--config', config], role + '-host-editable')
+    info['host_process'] = ctx.spawn_host(info['host_binary'], config, role + '-host-editable')
     time.sleep(10)
     name = 'editable-' + role
     doc = dict(schema_version=1, kind='deployment', name=name, engine='editable-test',
@@ -164,7 +169,7 @@ def concurrency(ctx):
     host.terminate()
     host.wait(timeout=min(60, ctx.remaining()))
     info['host_binary'] = ctx.binary(old=True)
-    info['host_process'] = ctx.spawn([info['host_binary'], 'start', 'host', '--config', info['host_config']], role + '-host-old')
+    info['host_process'] = ctx.spawn_host(info['host_binary'], info['host_config'], role + '-host-old')
     time.sleep(10)
     name = 'concurrency-48'
     ctx.deploy(name, 'VLLM_033', role=role, extra={'engine_config': {'max_concurrent_requests': 48,

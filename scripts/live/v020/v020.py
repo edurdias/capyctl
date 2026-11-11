@@ -233,6 +233,10 @@ class Context:
                 stream.write(json.dumps(record) + '\n')
         return proc
 
+    def spawn_host(self, binary, config, name):
+        self.command([binary, 'validate', 'config', '--file', config])
+        return self.spawn([binary, 'start', 'host', '--config', config], name)
+
     def role(self, role='standalone', old=False):
         if role in self.roles:
             return self.roles[role]
@@ -291,7 +295,7 @@ class Context:
         config.write_text(text)
         self.command([binary, 'join', 'host', '--join-file', join, '--config', config])
         info['host_config'], info['host_binary'] = config, binary
-        info['host_process'] = self.spawn([binary, 'start', 'host', '--config', config], role + '-host')
+        info['host_process'] = self.spawn_host(binary, config, role + '-host')
         time.sleep(5)
 
     def cli(self, *args, role='standalone', check=True, host=False, env=None):
@@ -398,6 +402,7 @@ class Context:
                      'Authorization': 'Bearer ' + auth, **(headers or {})})
         response = conn.getresponse()
         chunks, first, raw = [], None, bytearray()
+        timing = None
         while True:
             chunk = response.readline() if stream else response.read(65536)
             if not chunk:
@@ -405,6 +410,8 @@ class Context:
             if first is None and not stream:
                 first = time.monotonic() - start
             raw.extend(chunk)
+            if stream and chunk.startswith(b': x-capyctl-timing '):
+                timing = json.loads(chunk[len(b': x-capyctl-timing '):])
             if stream and chunk.startswith(b'data:'):
                 chunks.append(chunk[5:].decode().strip())
                 if first is None and chunks[-1] != '[DONE]':
@@ -423,6 +430,8 @@ class Context:
             data = raw.decode(errors='replace')
         out = dict(status=response.status, body=data, chunks=chunks, done='[DONE]' in chunks,
                    response_headers=response_headers)
+        if timing is not None:
+            out['timing'] = timing
         if not self.functional_only:
             out.update(seconds=time.monotonic() - start, ttft_s=first)
         return out
