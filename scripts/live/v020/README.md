@@ -75,6 +75,8 @@ slots, deriving their native KV reservation from the GGUF rather than inheriting
 the Python-engine fixture's 5 GiB override.
 An old-server fixture enrolls the matching old host: a newer host is correctly
 refused by the server-first upgrade gate and cannot exercise editable refusal.
+OT11 expects SGLang's explicit argument-allowlist denial for `--enable-trace`;
+unlike vLLM's exporter option, that refusal does not use the word `reserved`.
 No apt, driver update, system CUDA modification or reboot is allowed. Missing
 compilers/tools are blocking preflight errors, not permission to install packages.
 

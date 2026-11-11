@@ -346,6 +346,26 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
             ctx.role('old-server', old=True)
         enroll.assert_called_once_with('old-server', old=True)
 
+    def test_tracing_fixture_accepts_sglang_allowlist_denial_not_only_reserved_wording(self):
+        from rows.functional import tracing_refusals
+        from types import SimpleNamespace
+        responses = iter((
+            'invalid_config: reserved option --otlp-traces-endpoint',
+            'invalid_config: option --enable-trace is not accepted here',
+            'engine_env_reserved'))
+        ctx = SimpleNamespace(
+            root=self.root, binary=lambda: 'fixture', installation=lambda key: key,
+            assertion=v020.Context.assertion,
+            command=lambda *args, **kwargs: SimpleNamespace(
+                returncode=13, stdout='', stderr='endpoint must be on loopback'),
+            cli=lambda *args, **kwargs: SimpleNamespace(
+                returncode=2, stdout='', stderr=next(responses)))
+        evidence = {}
+        result = tracing_refusals(ctx, evidence)
+        self.assertEqual(result['verdict'], 'pass')
+        self.assertEqual(len(evidence['profile_refusals']), 3)
+        self.assertEqual(evidence['profile_refusals'][1]['reason'], 'not accepted here')
+
     def test_failed_native_start_preserves_sanitized_engine_diagnostics(self):
         ctx = v020.Context(self.root, {})
         ctx.row_id = 'TEST'

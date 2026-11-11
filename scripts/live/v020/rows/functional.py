@@ -240,7 +240,7 @@ def tracing_refusals(ctx,evidence):
     evidence["non_loopback"]=dict(exit_code=result.returncode,reason="loopback")
     for key,flags,reason in (
         ("VLLM_033",["--arg=--otlp-traces-endpoint","--arg=http://127.0.0.1:14318/v1/traces"],"reserved"),
-        ("SGLANG_0523",["--arg=--enable-trace"],"reserved"),
+        ("SGLANG_0523",["--arg=--enable-trace"],"not accepted here"),
         ("VLLM_033",["--env=OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:14318"],"engine_env_reserved")):
         path=ctx.installation(key)
         result=ctx.cli("engine","add",path,"--name","ot11-refused",*flags,check=False)
