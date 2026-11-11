@@ -102,7 +102,9 @@ isolated editable 0.5.23, LMCache 0.5.7 built from its source tag in separate
 vLLM 0.33.0 and SGLang 0.5.23 environments, TensorFold native 1.2.6/1.1.5 and
 otelcol 0.164.0. LMCache builds keep the engine's torch pinned, use CUDA major
 13 and the detected GPU architecture (8.0 on the A100), and do not reuse a wheel
-compiled against another engine's torch. The shared host may supply LMCache 0.5.6.
+compiled against another engine's torch. Unified-memory cache rows accept the
+approved vLLM 0.33.0/LMCache 0.5.7 tuple as well as the existing 0.32.0/0.5.6 tuple;
+the GPU memory architecture does not select a package version.
 TensorFold 0.6.6 is an optional TF3 comparison: explicitly select TF3 to install
 it, or supply its mapping. It does not delay the default setup.
 The editable SGLang fixture disables optional Rust extensions: #235 must refuse
@@ -139,6 +141,32 @@ pins are resolved to full commits; plan entries without revisions resolve once
 and are locked in `models.lock.json` before download. No later attempt follows
 `main` again. TensorFold archives use the plan's exact SHA-256 digests; the old
 CapyCTL release verifies published SHA256SUMS and internal checksums.
+
+## Approved unified-memory qualification
+
+Measurements may run on an explicitly approved idle aarch64 host without
+`--functional-only` or `--skip-setup`. Provision only the owner-approved engine
+environments first, then supply `--engines FILE` with absolute read-only mappings
+for every engine key, including explicit empty values for unavailable engines.
+On aarch64, setup refuses an omitted engine mapping before installing tools;
+it never creates or changes engine environments. Session tools, missing models
+and the checksum-verified aarch64 old binary remain private setup artifacts.
+Supply `OTELCOL` and `CUDA_HOME` as read-only overrides too.
+
+GB10's unavailable global framebuffer counter is never converted to zero.
+Samples use numeric NVML per-process CUDA allocations and label their source
+`nvml_compute_process_allocations`, separately from physical framebuffer use.
+Host `MemAvailable` and process RSS remain separately recorded.
+
+If preparation already claimed the live marker, set
+`V020_SESSION_NAME=HostAFull` when invoking `run.sh`; the existing marker must
+contain exactly that name. The runner preserves exclusivity and removes only
+its own marker after successful teardown. An unset name retains the default
+refusal of any pre-existing marker.
+
+This harness currently enrolls a co-resident host role for LC15/LC15U, not an
+independent second machine. Rows whose catalog says remote observation is not
+implemented remain explicit skips; supplying another host cannot certify them.
 
 ## Existing shared host: functional only
 

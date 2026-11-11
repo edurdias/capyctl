@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Source from remote.sh; sourcing this file has no host-side effects.
-# Installs are authorized only on the rented x86 VM, never on the lab hosts.
+# Lab setup accepts read-only engine overrides; fresh engine installs remain VM-only.
 
 setup_plan() {
   cat <<EOF
@@ -445,7 +445,8 @@ PY
 }
 
 v020_old_binary() {
-  local name=capyctl-0.1.12-linux-x86_64 base archive stage expected
+  local name base archive stage expected
+  name=capyctl-0.1.12-linux-$(uname -m)
   base=https://github.com/edurdias/capyctl/releases/download/v0.1.12
   archive=$V020/downloads/$name.tar.gz
   v020_fetch "$base/$name.tar.gz" "$archive"
@@ -670,7 +671,7 @@ setup() (
   umask 077
   # This check deliberately precedes every write, including cache setup.
   [ "${FUNCTIONAL_ONLY:-0}" != 1 ] || { v020_setup_error 'functional-only hosts require --skip-setup and --engines; no installs permitted'; exit 1; }
-  [ "$(uname -m)" = x86_64 ] || { v020_setup_error 'setup is authorized only on the rented x86_64 VM'; exit 1; }
+  case "$(uname -m)" in x86_64|aarch64) ;; *) v020_setup_error 'unsupported setup architecture'; exit 1 ;; esac
   local tool
   for tool in python3 curl git tar flock grep nproc readlink install cc c++ make timeout; do
     command -v "$tool" >/dev/null 2>&1 || { v020_setup_error "missing prerequisite: $tool (do not install system packages)"; exit 1; }
@@ -767,6 +768,14 @@ PY
   fi
   V020_PATHS[TENSORRT_LLM]=${V020_PATHS[TENSORRT_LLM_121]}
   V020_PATHS[TRT_LLM]=${V020_PATHS[TENSORRT_LLM_121]}
+  if [ "$(uname -m)" = aarch64 ]; then
+    # The owner provisions approved lab engines separately. Even an unavailable
+    # engine must have an explicit empty mapping; setup never upgrades a lab venv.
+    for key in VLLM_032 VLLM_033 SGLANG_0522 SGLANG_0523 SGLANG_EDITABLE LMCACHE LMCACHE_SGLANG \
+      LLAMACPP TENSORFOLD_126 TENSORFOLD_115 TENSORFOLD_066 TENSORRT_LLM_121 TENSORRT_LLM_140RC3 OTELCOL CUDA_HOME; do
+      [ -n "${V020_OVERRIDES[$key]:-}" ] || { v020_setup_error "aarch64 requires an explicit read-only mapping: $key"; exit 1; }
+    done
+  fi
   export V020_MODEL_OVERRIDES=''
   for key in "${!V020_PATHS[@]}"; do
     export "$key=${V020_PATHS[$key]}"

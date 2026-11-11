@@ -5,6 +5,7 @@ umask 077
 HERE=$(cd "$(dirname "$0")" && pwd)
 TARGET='' SSH_PORT=22 OUT='' ONLY=all SKIP_SETUP=0 KEEP=0 PURGE_ONLY=0 DRY=0
 MAX_SECONDS=28200 BINARY='' REMOTE_BINARY='' ENGINES='' FUNCTIONAL_ONLY=0
+SESSION_NAME=${V020_SESSION_NAME:-}
 usage() { echo 'usage: run.sh --ssh USER@ADDR (--binary PATH | --remote-binary PATH) --out DIR [--ssh-port N] [--only rows] [--skip-setup] [--keep] [--purge-only] [--dry-run] [--max-seconds N] [--engines FILE] [--functional-only]' >&2; exit 2; }
 while [ $# -gt 0 ]; do
   case $1 in
@@ -30,6 +31,7 @@ if [ "$DRY" = 1 ]; then
 fi
 [ -n "$TARGET" ] && [ -n "$OUT" ] || usage
 [[ $TARGET =~ ^([A-Za-z0-9_.-]+@)?[A-Za-z0-9_.:-]+$ ]] || usage
+[[ $SESSION_NAME =~ ^[A-Za-z0-9_.-]*$ ]] || usage
 if [ "$FUNCTIONAL_ONLY" = 1 ]; then
   [ "$SKIP_SETUP" = 1 ] && [ -f "$ENGINES" ] || { echo 'functional-only requires --skip-setup --engines FILE' >&2; exit 2; }
 fi
@@ -92,7 +94,8 @@ if [ "$PURGE_ONLY" = 1 ]; then
   exit 0
 fi
 # Refuse an unrelated/pre-existing session before copying files into it.
-remote 'umask 077; if [ -e ~/LIVE-SESSION-IN-USE.txt ]; then exit 1; fi; mkdir -m 700 -p ~/capyctl-v020/live ~/capyctl-v020/bin ~/capyctl-v020/evidence'
+printf -v session_name '%q' "$SESSION_NAME"
+remote "umask 077; if [ -e ~/LIVE-SESSION-IN-USE.txt ]; then [ -n $session_name ] && [ \"\$(cat ~/LIVE-SESSION-IN-USE.txt)\" = $session_name ] || exit 1; fi; mkdir -m 700 -p ~/capyctl-v020/live ~/capyctl-v020/bin ~/capyctl-v020/evidence"
 READY=1
 copy -rlpt "$HERE/" "$TARGET:capyctl-v020/live/" >/dev/null
 remote 'python3 ~/capyctl-v020/live/session.py begin --root ~/capyctl-v020'
@@ -105,6 +108,7 @@ fi
 binary_digest=$(remote 'sha256sum ~/capyctl-v020/bin/capyctl')
 binary_digest=${binary_digest%% *}
 printf 'ONLY=%q\nFUNCTIONAL_ONLY=%q\nSKIP_SETUP=%q\nMAX_SECONDS=%q\n' "$ONLY" "$FUNCTIONAL_ONLY" "$SKIP_SETUP" "$MAX_SECONDS" >"$SCRATCH/session.env"
+printf 'SESSION_NAME=%q\n' "$SESSION_NAME" >>"$SCRATCH/session.env"
 if [ -n "$ENGINES" ]; then
   [ -f "$ENGINES" ] || usage
   copy "$ENGINES" "$TARGET:capyctl-v020/input-engines.env" >/dev/null

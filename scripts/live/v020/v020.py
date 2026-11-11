@@ -309,8 +309,8 @@ class Context:
     def installation(self, key):
         path = self.engines.get(key)
         if not path:
-            if self.functional_only:
-                raise UnavailableEngine('not installed on this host; qualified on the VM')
+            if key in self.engines:
+                raise UnavailableEngine('not installed on this host (explicit unavailable mapping): ' + key)
             raise AssertionError('engine installation unavailable: ' + key)
         if not Path(path).exists():
             raise AssertionError('mapped engine installation does not exist: ' + key)
@@ -474,6 +474,23 @@ class Context:
         if self.functional_only:
             raise AssertionError('measurement not allowed on this host')
         result = self.command(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits']).stdout
+        readings = result.splitlines()
+        self.assertion(bool(readings), 'missing GPU memory sample')
+        source = 'nvml_framebuffer_used'
+        if self.unified and any(not line.strip().isdigit() for line in readings):
+            # GB10 exposes no global framebuffer counter. Its per-process CUDA
+            # allocation readings are numeric; do not label this as physical FB.
+            result = self.command(['nvidia-smi', '--query-compute-apps=pid,used_memory',
+                                   '--format=csv,noheader,nounits']).stdout
+            readings = []
+            for line in result.splitlines():
+                fields = [field.strip() for field in line.split(',')]
+                self.assertion(len(fields) == 2 and all(field.isdigit() for field in fields),
+                               'missing numeric unified-memory process allocation')
+                readings.append(fields[1])
+            source = 'nvml_compute_process_allocations'
+        self.assertion(all(line.strip().isdigit() for line in readings),
+                       'missing numeric GPU memory sample')
         memory = dict((key.rstrip(':'), int(value.split()[0]) * 1024)
                       for key, value in (line.split(':', 1) for line in Path('/proc/meminfo').read_text().splitlines()))
         rss = 0
@@ -482,7 +499,8 @@ class Context:
             if path.exists():
                 match = re.search(r'VmRSS:\s+(\d+)', path.read_text())
                 rss += int(match[1]) * 1024 if match else 0
-        return dict(gpu_used_bytes=sum(int(line) for line in result.splitlines()) * 2**20,
+        return dict(gpu_used_bytes=sum(int(line) for line in readings) * 2**20,
+                    gpu_memory_source=source,
                     mem_available_bytes=memory['MemAvailable'], router_rss_bytes=rss)
 
     def logs(self, name=None):

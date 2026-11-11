@@ -125,6 +125,9 @@ class HelperTests(unittest.TestCase):
             ctx.installation('VLLM_033')
         ctx.functional_only = False
         ctx.engines['VLLM_033'] = ''
+        with self.assertRaisesRegex(v020.UnavailableEngine, 'explicit unavailable mapping'):
+            ctx.installation('VLLM_033')
+        del ctx.engines['VLLM_033']
         with self.assertRaisesRegex(AssertionError, 'unavailable'):
             ctx.installation('VLLM_033')
 
@@ -225,6 +228,83 @@ class HelperTests(unittest.TestCase):
         archived = list((self.root / 'attempts').iterdir())
         self.assertEqual(len(archived), 1)
         self.assertTrue((archived[0] / 'evidence/result-EM1.json').exists())
+
+    def test_unified_memory_uses_labelled_process_allocations_when_global_is_na(self):
+        from types import SimpleNamespace
+        ctx = v020.Context(self.root, {}, unified=True)
+        calls = []
+        def command(args):
+            calls.append(args)
+            return SimpleNamespace(stdout='[N/A]\n' if len(calls) == 1 else '12, 170\n13, 84613\n')
+        ctx.command = command
+        sample = ctx.sample()
+        self.assertEqual(sample['gpu_used_bytes'], (170 + 84613) * 2**20)
+        self.assertEqual(sample['gpu_memory_source'], 'nvml_compute_process_allocations')
+        self.assertIn('--query-compute-apps=pid,used_memory', calls[1])
+
+    def test_memory_sample_never_turns_unknown_process_allocations_into_zero(self):
+        from types import SimpleNamespace
+        ctx = v020.Context(self.root, {}, unified=True)
+        ctx.command = lambda args: SimpleNamespace(stdout='[N/A]\n')
+        with self.assertRaisesRegex(AssertionError, 'numeric unified-memory'):
+            ctx.sample()
+        ctx.unified = False
+        with self.assertRaisesRegex(AssertionError, 'numeric GPU memory'):
+            ctx.sample()
+
+    def test_lmcache_latest_tuple_is_approved_on_unified_memory(self):
+        from rows.lmcache import fixtures
+        from types import SimpleNamespace
+        def require(condition, reason):
+            if not condition:
+                raise AssertionError(reason)
+        for unified, vllm, lmcache, accepted in [
+                (True, '0.33.0', '0.5.7', True),
+                (True, '0.32.0', '0.5.6', True),
+                (False, '0.33.0', '0.5.7', True),
+                (False, '0.32.0', '0.5.6', False),
+                (True, '0.33.0', '0.5.6', False)]:
+            with self.subTest(unified=unified, vllm=vllm, lmcache=lmcache):
+                ctx = SimpleNamespace(
+                    engines={'LMCACHE': str(self.root), 'MODEL_CHAT': str(self.root)},
+                    unified=unified, assertion=require,
+                    command=lambda *a, **k: SimpleNamespace(stdout=json.dumps(
+                        {'versions': {'vllm': vllm, 'lmcache': lmcache}})))
+                if accepted:
+                    self.assertEqual(fixtures(ctx, [])['versions']['vllm'], vllm)
+                else:
+                    with self.assertRaisesRegex(AssertionError, 'approved installation'):
+                        fixtures(ctx, [])
+
+    def test_aarch64_setup_requires_every_engine_override_before_tools(self):
+        import subprocess
+        mapping = self.root / 'lab.env'
+        names = ('VLLM_032 VLLM_033 SGLANG_0522 SGLANG_0523 SGLANG_EDITABLE '
+                 'LMCACHE LMCACHE_SGLANG LLAMACPP TENSORFOLD_126 TENSORFOLD_115 '
+                 'TENSORFOLD_066 TENSORRT_LLM_121 TENSORRT_LLM_140RC3 OTELCOL CUDA_HOME').split()
+        script = '''
+source "$1"
+export HOME=$2 V020=$2/session BIN=$2/session/bin EVIDENCE=$2/session/evidence
+ENGINES_FILE=$2/lab.env
+mkdir -p "$V020"
+uname() { printf 'aarch64\\n'; }
+v020_setup_tools() { printf 'READ_ONLY_MAPPINGS_ACCEPTED\\n'; exit 0; }
+setup
+'''
+        for omitted in ('SGLANG_EDITABLE', None):
+            with self.subTest(omitted=omitted):
+                mapping.write_text(''.join(name + '=\n' for name in names if name != omitted))
+                result = subprocess.run(
+                    ['bash', '-c', script, 'lab',
+                     str(Path(__file__).with_name('setup.sh')), str(self.root)],
+                    capture_output=True, text=True)
+                if omitted:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('explicit read-only mapping: ' + omitted, result.stderr)
+                    self.assertNotIn('READ_ONLY_MAPPINGS_ACCEPTED', result.stdout)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('READ_ONLY_MAPPINGS_ACCEPTED', result.stdout)
 
     def test_trt_driver_probe_compiles_for_the_detected_gpu(self):
         import subprocess
