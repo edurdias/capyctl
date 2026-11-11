@@ -313,6 +313,21 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
                 editable(ctx)
         self.assertEqual(ctx.extra['engine_config']['context_length'], 8192)
 
+    def test_llama_embeddings_keep_required_context_and_derive_kv_from_gguf(self):
+        ctx = v020.Context(self.root, {})
+        ctx.role = lambda role: None
+        ctx.register = lambda engine, role: 'profile'
+        ctx.cli = lambda *args, **kwargs: None
+        ctx.status = lambda *args: {}
+        ctx.deploy('embedding', 'llamacpp090', model='embedding', api='embeddings')
+        config = json.loads((self.root / 'embedding.json').read_text())
+        self.assertEqual(config['engine_config']['context_length'], 32768)
+        self.assertEqual(config['engine_config']['max_concurrent_requests'], 8)
+        self.assertNotIn('memory', config['engine_config'])
+        ctx.deploy('python-embedding', 'vllm033', model='embedding', api='embeddings')
+        config = json.loads((self.root / 'python-embedding.json').read_text())
+        self.assertEqual(config['engine_config']['memory']['kv_cache'], '5GiB')
+
     def test_failed_native_start_preserves_sanitized_engine_diagnostics(self):
         ctx = v020.Context(self.root, {})
         ctx.row_id = 'TEST'

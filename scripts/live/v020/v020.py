@@ -346,6 +346,9 @@ class Context:
                       timeouts=dict(initialize='1800s'), request_deadline='1800s',
                       engine_config=dict(context_length=32768, max_concurrent_requests=8,
                                          memory=dict(kv_cache='5GiB')))
+        if 'llamacpp' in engine.lower() and api == 'embeddings':
+            # Preserve the qualification context/slots; GGUF metadata sizes native KV.
+            config['engine_config'].pop('memory')
         if role != 'standalone':
             config['host'] = 'qualification-host'
         if 'tensorfold' in engine.lower():
