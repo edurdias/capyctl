@@ -1003,14 +1003,14 @@ async fn a_restarted_controller_resumes_a_stop_its_crashed_session_accepted() {
 
 /// A remote engine whose host refused the launch on its own policy before any
 /// effect, as `remote_execution` reports it: nothing recorded, nothing claimed.
-struct RefusingHost;
+struct RefusingHost(&'static str);
 #[async_trait::async_trait]
 impl EngineAdapter for RefusingHost {
     async fn execute_persisted(
         &self,
         _: &RuntimeCommand,
     ) -> Result<capyctl_domain::completion::EffectObservation, RuntimeError> {
-        Err(RuntimeError::Refused("checkpoint_mismatch".into()))
+        Err(RuntimeError::Refused(self.0.into()))
     }
     async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
@@ -1054,6 +1054,21 @@ impl EngineAdapter for RefusingHost {
 // T14 T20 T34
 #[tokio::test]
 async fn a_host_policy_refusal_settles_the_launch_at_once_with_its_reason() {
+    assert_host_refusal_settled("checkpoint_mismatch", "launch_failed").await;
+}
+
+// T45 T34 (ADR 0034 LC15): the failed start operation retains the host's
+// typed required-LMCache reason, rather than timing out or becoming uncertain.
+#[tokio::test]
+async fn a_required_lmcache_refusal_settles_the_start_with_its_typed_reason() {
+    assert_host_refusal_settled(
+        "lmcache_unavailable:sleep_clears_cache",
+        "lmcache_unavailable:sleep_clears_cache",
+    )
+    .await;
+}
+
+async fn assert_host_refusal_settled(reason: &'static str, code: &str) {
     let (_dir, owner, fence, observations) = setup().await;
     let host = ScriptedHost::new(true);
     let scripted = host.clone();
@@ -1065,12 +1080,12 @@ async fn a_host_policy_refusal_settles_the_launch_at_once_with_its_reason() {
             retry_cooldown: Duration::from_millis(50),
             ..Default::default()
         },
-        Arc::new(move |_: &InitializeWork| Ok(scripted.binding(Arc::new(RefusingHost)))),
+        Arc::new(move |_: &InitializeWork| Ok(scripted.binding(Arc::new(RefusingHost(reason))))),
     )
     .unwrap();
     let start = w.start(&fence, 10000).unwrap();
     assert_eq!(
-        start.wait(Duration::from_secs(60)).await.unwrap(),
+        start.wait(Duration::from_secs(5)).await.unwrap(),
         InitializeStatus::Closed
     );
     assert_eq!(
@@ -1091,8 +1106,7 @@ async fn a_host_policy_refusal_settles_the_launch_at_once_with_its_reason() {
         assert!(
             evidence
                 .iter()
-                .any(|entry| entry.contains("launch failed")
-                    && entry.contains("checkpoint_mismatch")),
+                .any(|entry| entry.contains("launch failed") && entry.contains(reason)),
             "{evidence:?}"
         );
         let operation = o
@@ -1100,7 +1114,7 @@ async fn a_host_policy_refusal_settles_the_launch_at_once_with_its_reason() {
             .latest_operation(&fence.deployment_id)
             .unwrap()
             .unwrap();
-        assert_eq!(operation.error_code.as_deref(), Some("launch_failed"));
+        assert_eq!(operation.error_code.as_deref(), Some(code));
     }
     running(&w).await;
     w.shutdown().await.unwrap();

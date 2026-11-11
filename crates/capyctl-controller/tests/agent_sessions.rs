@@ -3,6 +3,7 @@ use capyctl_agent::{
     identity::{CertificateAuthority, HostKey},
     identity_storage::IdentityDirectory,
     journal::HostJournal,
+    session::{Provisioned, SessionError},
 };
 use capyctl_controller::{
     agent_sessions::AgentSessions, enrollment::EnrollmentAuthority, OwnedCoordinatorState,
@@ -12,7 +13,9 @@ use capyctl_protocol::pb::{
     agent_to_server, bootstrap_server::Bootstrap,
 };
 use std::{
+    future::Future,
     os::unix::fs::PermissionsExt,
+    pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -1410,6 +1413,89 @@ fn launch_command(
     };
     launch.identity.payload_digest = launch.canonical_digest();
     launch
+}
+
+struct RefusedProvision(&'static str);
+
+impl capyctl_agent::session::SessionExecution for RefusedProvision {
+    fn execute(
+        &self,
+        _: u64,
+        _: capyctl_protocol::execution::MemberCommand,
+    ) -> capyctl_agent::session::ExecutionFuture {
+        Box::pin(async { panic!("a refused ingress provision must not launch anything") })
+    }
+
+    fn provision(
+        &self,
+        _: capyctl_protocol::execution::MemberCommand,
+        _: [u8; 32],
+    ) -> Pin<Box<dyn Future<Output = Result<Provisioned, SessionError>> + Send>> {
+        let reason = self.0;
+        Box::pin(async move { Ok(Provisioned::Refused(reason)) })
+    }
+}
+
+// T45 T34 (ADR 0033 §9, ADR 0034 LC15): a required-LMCache refusal during
+// private-ingress admission is terminal, not an authentication failure that
+// closes the host session and leaves the start waiting for its deadline.
+#[tokio::test]
+async fn required_lmcache_provision_refusal_is_prompt_and_keeps_the_session() {
+    use capyctl_controller::agent_sessions::ProvisionOutcome;
+    for reason in [
+        "lmcache_unavailable:sleep_clears_cache",
+        "lmcache_unavailable:check_failed",
+    ] {
+        let Enrolled {
+            sessions,
+            identity,
+            host,
+            server,
+            _dirs,
+        } = enrolled_host().await;
+        let root = directory();
+        let journal = HostJournal::open(root.path(), &identity.controller_id(), &host).unwrap();
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        let session_journal = journal.clone();
+        let controller_id = identity.controller_id();
+        let task = tokio::spawn(async move {
+            capyctl_agent::session::run_session_with_execution(
+                &identity,
+                session_journal,
+                pb::ReportInventory {
+                    domains: vec![domain(1024)],
+                    ..Default::default()
+                },
+                shutdown,
+                Some(Arc::new(RefusedProvision(reason))),
+            )
+            .await
+        });
+        eventually(|| sessions.current_session(&host).is_some()).await;
+        let first = sessions.current_session(&host).unwrap();
+        let launch = launch_command(
+            controller_id,
+            &host,
+            capyctl_protocol::now_unix_ms() + 60_000,
+        );
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            sessions.provision_ingress(&launch, [7; 32]),
+        )
+        .await
+        .expect("the typed refusal must arrive before the initialization deadline")
+        .unwrap();
+        assert_eq!(outcome, ProvisionOutcome::Refused(reason.into()));
+        assert_eq!(
+            sessions.current_session(&host).as_deref(),
+            Some(first.as_str()),
+            "a valid LMCache refusal must not close the authenticated session"
+        );
+        assert!(journal.history(0, 100).unwrap().is_empty());
+        stop.send(true).unwrap();
+        task.await.unwrap().unwrap();
+        server.abort();
+    }
 }
 
 /// M16 live run 2026-09-23 (host-a, sa-27): the SGLang entry refused its

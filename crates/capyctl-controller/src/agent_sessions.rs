@@ -1396,10 +1396,15 @@ impl AgentSessions {
         if id.host_id != host {
             return Err(denied().into());
         }
-        // SPEC §13: a refusal names one closed category, never free text.
+        // SPEC §13, ADR 0033 §9: admission can refuse required LMCache before
+        // storing the ingress key, just as it can refuse a local host policy.
+        // Both use closed categories; neither is an authentication failure.
         let outcome = match result.refused.as_str() {
             "" => ProvisionOutcome::Provisioned,
-            reason if capyctl_protocol::execution::is_policy_refusal(reason) => {
+            reason
+                if capyctl_protocol::execution::is_policy_refusal(reason)
+                    || capyctl_protocol::execution::is_lmcache_refusal(reason) =>
+            {
                 ProvisionOutcome::Refused(reason.to_owned())
             }
             _ => return Err(denied().into()),
