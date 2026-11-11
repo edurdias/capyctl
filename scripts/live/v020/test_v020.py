@@ -332,6 +332,31 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
             install_editable_profile(ctx, 'server')
         self.assertEqual(published, ['VLLM_033'])
 
+    def test_trt121_pins_numpy_and_arrow_without_constraining_rc3(self):
+        import subprocess
+        (self.root / 'downloads').mkdir()
+        script = '''
+source "$1"
+V020=$2 BIN=$2 EVIDENCE=$2
+declare -A V020_OVERRIDES=()
+TENSORRT_LLM_121=$2/stable TENSORRT_LLM_140RC3=$2/rc3
+v020_venv() { :; }
+v020_cmd() { :; }
+v020_trt_toolkit() { :; }
+v020_freeze() { :; }
+v020_trt_availability() { :; }
+v020_trt_driver_probe() { :; }
+v020_setup_tensorrt TENSORRT_LLM_121 1.2.1 2.9.1 cu130 13.1 CUDA_HOME_TRT121
+v020_setup_tensorrt TENSORRT_LLM_140RC3 1.4.0rc3 2.14.0 cu132 13.4 CUDA_HOME_TRT140RC3
+'''
+        subprocess.run(['bash', '-c', script, 'constraints',
+                        str(Path(__file__).with_name('setup.sh')), str(self.root)], check=True)
+        stable = (self.root / 'downloads/TENSORRT_LLM_121-torch-constraints.txt').read_text()
+        rc3 = (self.root / 'downloads/TENSORRT_LLM_140RC3-torch-constraints.txt').read_text()
+        self.assertIn('numpy==1.26.4\npyarrow==21.*\n', stable)
+        self.assertNotIn('numpy', rc3)
+        self.assertNotIn('pyarrow', rc3)
+
     def test_tracing_refusal_accepts_the_actual_sglang_policy_diagnostic(self):
         from rows.functional import tracing_refusals
         from types import SimpleNamespace

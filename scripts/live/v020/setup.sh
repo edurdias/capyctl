@@ -576,6 +576,11 @@ v020_setup_tensorrt() {
   v020_cmd "$BIN/uv" pip install --python "$destination/bin/python" openmpi==4.1.8 mpi4py
   constraints=$V020/downloads/$key-torch-constraints.txt
   printf 'torch==%s+%s\n' "$torch_version" "$backend" >"$constraints"
+  if [ "$version" = 1.2.1 ]; then
+    # TRT 1.2.1 requires NumPy<2; PyArrow 26's wheel imports only with NumPy>=2.
+    # Keep a compatible pair instead of accepting pip's metadata-only solution.
+    printf 'numpy==1.26.4\npyarrow==21.*\n' >>"$constraints"
+  fi
   case "$version" in
     1.2.1) wheel=https://pypi.nvidia.com/tensorrt-llm/tensorrt_llm-1.2.1-cp312-cp312-linux_x86_64.whl ;;
     1.4.0rc3) wheel=https://pypi.nvidia.com/tensorrt-llm/tensorrt_llm-1.4.0rc3-cp312-cp312-manylinux_2_28_x86_64.whl ;;

@@ -88,6 +88,9 @@ EM8 declares 16 concurrent engine slots for its 16-client matrix cells; queue
 refusals and incomplete responses still fail the row rather than count as samples.
 OT11 checks SGLang's actual `not accepted here` profile diagnostic rather than
 requiring the word `reserved`; full sanitized refusal text remains in evidence.
+TensorRT-LLM 1.2.1 pins NumPy 1.26.4 and PyArrow 21: its NumPy `<2`
+requirement conflicts with PyArrow 26's import-time NumPy `>=2` requirement,
+which its wheel metadata does not declare. The rc3 environment is unchanged.
 No apt, driver update, system CUDA modification or reboot is allowed. Missing
 compilers/tools are blocking preflight errors, not permission to install packages.
 
