@@ -474,6 +474,20 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
             ctx.spawn_host(binary, self.root / 'invalid.yaml', 'invalid-host')
         self.assertFalse(marker.exists())
 
+    def test_embedding_load_failure_retains_logs_before_cleanup(self):
+        from unittest import mock
+        from rows import measurements
+        ctx = v020.Context(self.root, {})
+        ctx.row_id = 'EM8'
+        ctx.logs = lambda: 'router backend completion unverified\nengine failed'
+        with mock.patch('rows.measurements.em8', side_effect=AssertionError('embedding request failed')):
+            result = measurements.run(ctx, dict(id='EM8'))
+        self.assertEqual(result['verdict'], 'fail')
+        diagnostic = json.loads((ctx.evidence / 'EM8-failure-logs.json').read_text())
+        self.assertIn('backend completion unverified', diagnostic['logs'])
+        self.assertIn('engine failed', diagnostic['logs'])
+        self.assertEqual(result['evidence']['failure_logs'], 'EM8-failure-logs.json')
+
     def test_router_json_timing_header_and_complete_sse_comment_are_observed(self):
         import http.server
         import threading

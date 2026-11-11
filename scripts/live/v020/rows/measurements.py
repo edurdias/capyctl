@@ -320,6 +320,9 @@ def run(ctx,row):
             return dict(verdict='skip',reason=evidence['retrieval_skipped'],evidence=evidence)
         return dict(verdict='pass',reason='All required measurement arms and evidence bounds passed',evidence=evidence)
     except (AssertionError,ValueError,KeyError,TypeError,OSError,TimeoutError) as error:
+        if row['id'] == 'EM8':
+            ctx.save('failure-logs', dict(logs=ctx.logs()))
+            evidence['failure_logs'] = 'EM8-failure-logs.json'
         return dict(verdict='fail',reason=str(error),evidence=evidence)
 
 
