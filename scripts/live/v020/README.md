@@ -75,7 +75,8 @@ slots, deriving their native KV reservation from the GGUF rather than inheriting
 the Python-engine fixture's 5 GiB override.
 ISSUE235 keeps current-server/current-host editable refusal separate from
 old-server/current-host version refusal. It asserts the recorded `0.2.0` host,
-`refused` compatibility, `host_version_newer_than_server`, and no reconciled
+`refused` compatibility, the human-readable newer-host reason plus
+`host_version_newer_than_server` in the host log, and no reconciled
 session; reconnecting backoff is expected. Other old-server fixtures enroll
 matching-old hosts by default.
 EM2 explicitly enrolls Qwen3-Embedding-4B's Matryoshka dimensions on vLLM with

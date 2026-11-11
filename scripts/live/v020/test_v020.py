@@ -332,6 +332,35 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
             install_editable_profile(ctx, 'server')
         self.assertEqual(published, ['VLLM_033'])
 
+    def test_editable_row_checks_skew_code_in_logs_not_the_ledger_reason(self):
+        from rows.regressions import editable
+        from types import SimpleNamespace
+        from unittest import mock
+        host = dict(name='qualification-host', binary_version='0.2.0',
+                    compatibility='refused', session=None)
+        version = dict(binary_version='0.2.0', compatibility='refused',
+                       reason='host 0.2.0 is newer than server 0.1.12; upgrade the server first')
+        roles, launches = [], []
+        def cli(*args, **kwargs):
+            if args[:2] == ('list', 'hosts'):
+                return SimpleNamespace(stdout=json.dumps(dict(hosts=[host])))
+            return SimpleNamespace(returncode=2, stdout='editable installation_unsupported', stderr='')
+        ctx = SimpleNamespace(
+            engines=dict(SGLANG_EDITABLE='/fixture'), deployments=[],
+            installation=lambda key: None, logs=lambda: 'host_version_newer_than_server',
+            cli=cli, assertion=v020.Context.assertion,
+            role=lambda role, **kwargs: roles.append((role, kwargs)),
+            deploy=lambda *args, **kwargs: launches.append(kwargs['role']),
+            owned=lambda name, role: [] if name == 'editable' else [dict(pid=1)],
+            events=lambda role: [], cleanup=lambda: None,
+            request=lambda *args, **kwargs: dict(status=200, body='42'),
+            sql=lambda *args, **kwargs: [version], save=lambda *args: None)
+        with mock.patch('rows.regressions.install_editable_profile', return_value=('editable', '/fixture')):
+            result = editable(ctx)
+        self.assertEqual(result['old-server']['code'], 'host_version_newer_than_server')
+        self.assertEqual(roles[-1], ('old-server', dict(old=True, host_old=False)))
+        self.assertEqual(launches, ['server'])
+
     def test_trt121_pins_numpy_and_arrow_without_constraining_rc3(self):
         import subprocess
         (self.root / 'downloads').mkdir()

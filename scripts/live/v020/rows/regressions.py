@@ -165,10 +165,13 @@ def editable(ctx):
     hosts = json.loads(ctx.cli('list', 'hosts', '--json', role=role).stdout)['hosts']
     host = next(item for item in hosts if item.get('name') == 'qualification-host')
     versions = ctx.sql('SELECT binary_version,compatibility,reason FROM host_versions', role=role)
-    ctx.save('old-server-version-refusal', dict(host=host, versions=versions, logs=ctx.logs()))
+    refusal_logs = ctx.logs()
+    ctx.save('old-server-version-refusal', dict(host=host, versions=versions, logs=refusal_logs))
     ctx.assertion(any(item['binary_version'] == '0.2.0' and item['compatibility'] == 'refused'
-                      and 'host_version_newer_than_server' in item['reason'] for item in versions),
+                      and 'newer than server' in item['reason'] for item in versions),
                   'old server did not record current-host version refusal')
+    ctx.assertion('host_version_newer_than_server' in refusal_logs,
+                  'current host did not surface the explicit version-skew refusal')
     ctx.assertion(not (host.get('session') or {}).get('reconciled'),
                   'refused newer host established a reconciled session')
     evidence[role] = dict(code='host_version_newer_than_server', host=host, versions=versions)
