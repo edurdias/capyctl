@@ -772,9 +772,13 @@ fn plan_charge(
         .map(|charge| {
             (
                 LmcacheCharge {
-                    // LC1: a stopped engine's whole KV cache stays mapped by
-                    // the server until the next engine registers.
-                    held_kv_bytes: e.engine_config.memory().kv_cache_bytes.max(0),
+                    // ADR 0034 §1: engine-driven transfer maps no engine KV.
+                    // A13's held-KV reserve applies only to LMCache-driven IPC.
+                    held_kv_bytes: if plan.transfer == lc::TransferMode::LmcacheDriven {
+                        e.engine_config.memory().kv_cache_bytes.max(0)
+                    } else {
+                        0
+                    },
                     ..charge
                 },
                 measured.is_some(),

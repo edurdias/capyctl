@@ -29,6 +29,7 @@ use crate::installation::{
     dist_info, dist_info_version, interpreter, site_packages, site_packages_holding,
     FingerprintError, InstallationMeasurer,
 };
+use capyctl_config::effective::Residency;
 use capyctl_config::engine_policy::Engine;
 use capyctl_config::lmcache::{
     engine_gate, lmcache_version_supported, LmcacheOffReason, LmcacheRegistration, TransferMode,
@@ -122,20 +123,21 @@ pub fn measure_lmcache(
 /// ADR 0033 §1: the launch-time check of a vLLM or SGLang profile's LMCache,
 /// by shape. Reads files of the environment of `executable` (lexically, as
 /// ADR 0018 §1) and executes nothing. `registered` is the profile's
-/// `lmcache` registration; `transfer` is the transfer mode the launch
-/// renders (ADR 0034 §1), whose pieces are verified when it is engine-driven.
+/// `lmcache` registration; `residency` determines its transfer mode and whether
+/// sleep-based parking must retain the external cache (ADR 0034 §1).
 ///
 /// Reasons, first applicable wins: `engine_unsupported` (not vLLM or
 /// SGLang), `not_installed`, `check_failed` (the installation is not one
 /// readable dist-info), `version_unsupported`, `not_registered` (installed
 /// after `engine add`), `check_failed` (a shape element missing, all of them
-/// named). Drift is reported in the pass.
+/// named), `sleep_clears_cache` (sleep discards the external cache). Drift is
+/// reported in the pass.
 pub fn check_lmcache(
     measurer: &InstallationMeasurer,
     engine: Engine,
     executable: &Path,
     registered: Option<&LmcacheRegistration>,
-    transfer: TransferMode,
+    residency: Residency,
 ) -> Result<LmcacheInstall, LmcacheCheckFailure> {
     if !matches!(engine, Engine::Vllm | Engine::Sglang) {
         let off = engine_gate(engine, "");
@@ -209,11 +211,20 @@ pub fn check_lmcache(
         Engine::Vllm => shape.vllm(),
         _ => shape.sglang(),
     }
-    if transfer == TransferMode::EngineDriven {
+    if capyctl_config::lmcache::transfer_mode(residency) == TransferMode::EngineDriven {
         shape.engine_driven(engine);
     }
+    let sleep_clears_cache =
+        engine == Engine::Vllm && residency.parks() && shape.vllm_sleep_clears_cache();
     if !shape.missing.is_empty() {
         return Err(LmcacheCheckFailure::check_failed(shape.missing.join("; ")));
+    }
+    if sleep_clears_cache {
+        return Err(LmcacheCheckFailure::new(
+            LmcacheOffReason::SleepClearsCache,
+            "vllm/v1/engine/core.py: vLLM sleep clears the external LMCache cache; \
+             this installation cannot retain LMCache through deep or host_backed parking",
+        ));
     }
     let (digest, _, _) = measurer.measure_tree(&site.join(PACKAGE)).map_err(|e| {
         LmcacheCheckFailure::check_failed(format!("LMCache's files could not be measured ({e})"))
@@ -562,6 +573,35 @@ impl Shape<'_> {
                 ));
             }
         }
+    }
+
+    /// ADR 0034, amendment of 2026-11-10 (LC15): the known vLLM sleep
+    /// cascade clears external connectors as well as its discarded local KV.
+    /// There is no preserve-external option in that sleep API or LMCache's
+    /// CLEAR handler. Reject the installed shape, not a version guess.
+    fn vllm_sleep_clears_cache(&mut self) -> bool {
+        const CORE: &str = "vllm/v1/engine/core.py";
+        let Some(text) = self.optional(self.engine, CORE) else {
+            return false;
+        };
+        let method = |header: &str| {
+            block_body(&text, header)
+                .map(compact_code)
+                .unwrap_or_default()
+        };
+        let sleep = method("    def sleep");
+        let pause = method("    def _finish_pause");
+        let reset = method("    def _reset_caches");
+        let reset_signature = text
+            .split_once("    def _reset_caches(")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(signature, _)| compact_code(signature))
+            .unwrap_or_default();
+        sleep.contains("clear_prefix_cache=level>=1")
+            && sleep.contains("self.pause_scheduler(mode=mode,clear_cache=clear_prefix_cache)")
+            && pause.contains("self._reset_caches()")
+            && reset_signature.contains("reset_connector:bool=True")
+            && reset.contains("reset_connector=reset_connector")
     }
 
     /// ADR 0034 §1: what engine-driven transfer needs, verified only for a

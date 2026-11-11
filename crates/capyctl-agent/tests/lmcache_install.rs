@@ -7,6 +7,7 @@ use capyctl_agent::installation::InstallationMeasurer;
 use capyctl_agent::lmcache_install::{
     check_lmcache, measure_lmcache, LmcacheCheckFailure, LmcacheInstall,
 };
+use capyctl_config::effective::Residency;
 use capyctl_config::engine_policy::Engine;
 use capyctl_config::lmcache::{LmcacheOffReason, LmcacheRegistration, TransferMode};
 use std::os::unix::fs::PermissionsExt;
@@ -18,6 +19,13 @@ const ENTRY_POINTS: &str = "[console_scripts]\n\
 lmcache = lmcache.cli.main:main\n\
 lmcache_controller = lmcache.v1.api_server.__main__:main\n\
 lmcache_server = lmcache.v1.server.__main__:main\n";
+
+fn residency_for_transfer(transfer: TransferMode) -> Residency {
+    match transfer {
+        TransferMode::LmcacheDriven => Residency::RestartOnly,
+        TransferMode::EngineDriven => Residency::Deep,
+    }
+}
 
 fn copy_tree(from: &Path, to: &Path) {
     for entry in std::fs::read_dir(from).unwrap() {
@@ -158,7 +166,7 @@ impl Env {
             self.engine,
             &self.executable(),
             registered,
-            transfer,
+            residency_for_transfer(transfer),
         );
         self.assert_nothing_ran();
         result
@@ -809,7 +817,7 @@ fn lmcache_check_refuses_engines_without_an_integration() {
             engine,
             &env.executable(),
             Some(&registration),
-            TransferMode::EngineDriven,
+            Residency::Deep,
         )
         .unwrap_err();
         assert_eq!(failure.reason, LmcacheOffReason::EngineUnsupported);
@@ -861,7 +869,7 @@ fn a_drifted_lmcache_is_reported_in_the_profile_status() {
             env.engine,
             &env.executable(),
             Some(&registration),
-            TransferMode::LmcacheDriven,
+            Residency::RestartOnly,
             policy,
         );
         env.assert_nothing_ran();
@@ -996,6 +1004,53 @@ fn lmcache_check_names_each_missing_engine_driven_piece() {
     env.check_registered_as(TransferMode::EngineDriven).unwrap();
 }
 
+// T45 (ADR 0034, LC15 amendment): a sleep-based park must not erase the
+// external cache. Restart parking does not call sleep and remains usable.
+#[test]
+fn sleep_that_clears_external_cache_refuses_lmcache_parking_only() {
+    let env = Env::with_lmcache(Engine::Vllm, "0.5.7");
+    env.write(
+        "vllm/v1/engine/core.py",
+        r#"class EngineCore:
+    def _reset_caches(self, reset_running_requests: bool = True,
+                      reset_connector: bool = True) -> None:
+        self.reset_prefix_cache(reset_connector=reset_connector)
+    def _finish_pause(self, clear_cache: bool) -> None:
+        if clear_cache:
+            self._reset_caches()
+    def sleep(self, level: int = 1, mode = 'abort'):
+        clear_prefix_cache = level >= 1
+        self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)
+"#,
+    );
+    let registration = env.register();
+    for residency in [Residency::Deep, Residency::HostBacked] {
+        let failure = check_lmcache(
+            &env.measurer,
+            env.engine,
+            &env.executable(),
+            Some(&registration),
+            residency,
+        )
+        .unwrap_err();
+        assert_eq!(failure.reason, LmcacheOffReason::SleepClearsCache);
+        assert!(
+            failure
+                .detail
+                .contains("sleep clears the external LMCache cache"),
+            "{failure}"
+        );
+    }
+    env.check_registered().unwrap();
+    // A fixed installation that explicitly preserves the connector passes.
+    env.edit(
+        "vllm/v1/engine/core.py",
+        "self._reset_caches()",
+        "self._reset_caches(reset_connector=False)",
+    );
+    env.check_registered_as(TransferMode::EngineDriven).unwrap();
+}
+
 // T45 (ADR 0034 §1): the remote host's launch-time check, through the
 // installation registry its launches use, checks the transfer mode the
 // launch renders: a release without engine-driven transfer passes a
@@ -1025,7 +1080,7 @@ fn the_registry_checks_the_transfer_mode_the_launch_renders() {
                 env.engine,
                 &env.executable(),
                 Some(&registration),
-                transfer,
+                residency_for_transfer(transfer),
                 InstallationDrift::Refuse,
             )
             .unwrap()

@@ -104,6 +104,8 @@ pub enum LmcacheOffReason {
     VersionUnsupported,
     /// The launch-time check by shape failed.
     CheckFailed,
+    /// ADR 0034, amendment of 2026-11-10: sleep clears the external cache.
+    SleepClearsCache,
     /// The deployment has a `topology`.
     GroupUnsupported,
     /// ADR 0035 §9, ADR 0034 §6: an instance on several GPUs of one host
@@ -135,7 +137,7 @@ pub enum LmcacheOffReason {
 }
 
 impl LmcacheOffReason {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::Disabled,
         Self::HostOff,
         Self::EngineUnsupported,
@@ -144,6 +146,7 @@ impl LmcacheOffReason {
         Self::NotRegistered,
         Self::VersionUnsupported,
         Self::CheckFailed,
+        Self::SleepClearsCache,
         Self::GroupUnsupported,
         Self::MultiGpuUnqualified,
         Self::ParkUnqualified,
@@ -167,6 +170,7 @@ impl LmcacheOffReason {
             Self::NotRegistered => "not_registered",
             Self::VersionUnsupported => "version_unsupported",
             Self::CheckFailed => "check_failed",
+            Self::SleepClearsCache => "sleep_clears_cache",
             Self::GroupUnsupported => "group_unsupported",
             Self::MultiGpuUnqualified => "multi_gpu_unqualified",
             Self::ParkUnqualified => "park_unqualified",
@@ -191,6 +195,7 @@ impl LmcacheOffReason {
         matches!(
             self,
             Self::CheckFailed
+                | Self::SleepClearsCache
                 | Self::ServerStartFailed
                 | Self::ListenerExposed
                 | Self::EngineStartFailed
@@ -221,6 +226,9 @@ impl LmcacheOffReason {
             }
             Self::VersionUnsupported => "LMCache 0.5.6 or a later 0.5.x release is needed",
             Self::CheckFailed => "the launch-time check of the LMCache installation failed",
+            Self::SleepClearsCache => {
+                "vLLM sleep clears the external LMCache cache; LMCache cannot survive this park"
+            }
             Self::GroupUnsupported => "a deployment with a topology does not use LMCache",
             Self::MultiGpuUnqualified => "not qualified for a model on several GPUs of one host",
             Self::ParkUnqualified => "not qualified with this parking residency",

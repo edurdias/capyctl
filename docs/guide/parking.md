@@ -154,6 +154,13 @@ the server stops when the model stops.
   start with LMCache (a model type the transfer does not handle, for
   example), the launch fails `lmcache_unavailable:engine_start_failed` and
   nothing is left running.
+- **A vLLM sleep that clears the external cache** cannot preserve LMCache.
+  The launch-time check detects the known sleep-reset path in the installed
+  engine (`sleep_clears_cache`): under `auto`, parking is kept and LMCache
+  is off; under `required`, the launch is refused with
+  `lmcache_unavailable:sleep_clears_cache`. This is a compatibility failure,
+  not a refusal for being uncertified. Restart-only parking is unaffected
+  because it does not call sleep.
 
 ## Switch between models
 

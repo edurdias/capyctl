@@ -6,7 +6,7 @@ use super::*;
 use crate::ordinary_lifecycle::engine_exit::{EngineExit, ExitSource};
 use crate::ordinary_lifecycle::park::{ResidencyArm, ResidencyKind, WakeScope};
 use crate::Store;
-use capyctl_config::effective::resolve_effective;
+use capyctl_config::effective::{resolve_effective, Residency};
 use capyctl_domain::completion::{CleanupEvidence, EffectObservation, Milestone};
 use capyctl_domain::resources::{MemoryLimit, MemoryObservation};
 use serde_json::{json, Value};
@@ -507,6 +507,45 @@ fn the_charge_is_pool_plus_allowance_then_measured() {
     );
     assert_eq!(unified(&lab.footprint(&c)), (8 * GIB, GIB));
     assert_eq!(lab.events("lmcache_off", &c.deployment_id).len(), 1);
+}
+
+// T45 (ADR 0034 §1, LC15): engine-driven transfer never maps engine KV,
+// whether the host is embedded or enrolled. LMCache-driven restart parking
+// still reserves the old engine's KV until a measurement proves it released.
+#[test]
+fn engine_driven_lmcache_never_reserves_held_engine_kv() {
+    for enrolled in [false, true] {
+        let lab = Lab::new(|_| {});
+        let fence = lab.deploy("charge", |_| {});
+        if enrolled {
+            enroll(&lab, &[lc::CAPABILITY, lc::ENGINE_DRIVEN_CAPABILITY]);
+        }
+        let tx = lab.store.conn.unchecked_transaction().unwrap();
+        let (_, e) = effective(&tx, &fence).unwrap();
+        let mut plan = sized_plan(&tx, &fence.deployment_id, fence.revision, 0, "lab", &e)
+            .unwrap()
+            .plan;
+        for residency in [
+            Residency::Deep,
+            Residency::HostBacked,
+            Residency::RestartOnly,
+        ] {
+            plan.transfer = lc::transfer_mode(residency);
+            let (charge, _) =
+                plan_charge(&tx, &plan, &fence.deployment_id, fence.revision, "lab", &e)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                charge.held_kv_bytes,
+                if plan.transfer == lc::TransferMode::EngineDriven {
+                    0
+                } else {
+                    4 * GIB
+                },
+                "{residency:?}, enrolled={enrolled}"
+            );
+        }
+    }
 }
 
 // T45 T14 (ADR 0034 §4, owner decision 3): the pool counts against
