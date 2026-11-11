@@ -1743,6 +1743,13 @@ async fn an_embedded_sglang_restart_park_is_proven_quiescent_on_the_engines_gaug
         vec![live("api", 0), live("worker-0", 1)],
         vec![live(LMCACHE_ROLE, 2)],
     ));
+    // T45 T20 (ADR 0033 §7): the retained server is alive after restart
+    // park. Its binding's presence observer must agree with that evidence;
+    // tools proving an already-gone group are not a live-launch observer.
+    let tools: Arc<dyn OwnedProcessLaunch> = Arc::new(capyctl_testkit::ScriptedTool::alive(
+        live("api", 0),
+        vec![live("worker-0", 1), live(LMCACHE_ROLE, 2)],
+    ));
     let running = Arc::new(AtomicU32::new(0));
     let endpoint = sglang_gauges(running.clone()).await;
     let bound = host.clone();
@@ -1764,14 +1771,13 @@ async fn an_embedded_sglang_restart_park_is_proven_quiescent_on_the_engines_gaug
                 .with_launch(frozen)
                 .with_credentials("inference-secret".into(), "admin-secret".into())
                 .with_lmcache(state);
-            let tools: Arc<dyn OwnedProcessLaunch> = capyctl_testkit::ScriptedTool::proving();
             Ok(Arc::new(Driver {
                 engine: Arc::new(EmbeddedSglang {
                     launch: binding.engine,
                     sglang,
                 }),
                 cleanup: binding.cleanup,
-                tools: Some(tools),
+                tools: Some(tools.clone()),
                 settle: None,
                 lmcache: binding.lmcache,
                 engine_tracing: binding.engine_tracing,
