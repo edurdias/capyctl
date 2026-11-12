@@ -552,6 +552,18 @@ async fn invalid_extractions_never_activate_or_lease() {
         ("fields", json!({"x": {"type": "number", "decimals": 7}})),
         ("fields", json!({"x": {"type": "list"}})),
         ("fields", json!({"x": {"type": "estimate", "min": 0}})),
+        (
+            "fields",
+            json!({"x": {"type": "list", "items": "text", "null_threshold": 0.5}}),
+        ),
+        (
+            "fields",
+            json!({"x": {"type": "estimate", "min": 0, "max": 10, "null_threshold": 1}}),
+        ),
+        (
+            "fields",
+            json!({"x": {"type": "forecast", "min": 0, "max": 10, "null_threshold": 0.1}}),
+        ),
         ("images", json!([1])),
         (
             "images",

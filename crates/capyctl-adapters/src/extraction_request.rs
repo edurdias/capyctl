@@ -228,7 +228,11 @@ fn validate_spec(
         let valid = match setting.as_str() {
             "type" => true,
             "instructions" => value.is_string(),
-            "null_threshold" => finite(value).is_some_and(|n| n > 0.0 && n <= 1.0),
+            // ADR 0041 §3: null thresholds belong only to scalar answers.
+            "null_threshold" => {
+                !matches!(kind, List | Estimate | Forecast)
+                    && finite(value).is_some_and(|n| n > 0.0 && n <= 1.0)
+            }
             "unit" => value.is_string(),
             "integer" => value.is_boolean(),
             "decimals" => value.as_u64().is_some_and(|n| n <= 6),
@@ -316,9 +320,9 @@ mod tests {
         }
     }
 
-    // T50: semantic oddities are the engine's judgement, not the router's.
+    // T50: other semantic oddities remain the engine's judgement.
     #[test]
-    fn accepts_settings_independently_of_type() {
+    fn accepts_other_settings_independently_of_type() {
         for kind in FieldType::ALL {
             accepts(json!({
                 "type":kind.name(), "unit":"arbitrary", "integer":true,
@@ -332,6 +336,22 @@ mod tests {
         accepts(json!({"type":"estimate","min":"2026-01-01","max":"2025-01-01"}));
         accepts(json!({"type":"list","items":"text","decimals":2}));
         accepts(json!({"type":"duration","unit":"day"}));
+    }
+
+    // T50: non-scalar thresholds fail router validation, even with legal values.
+    #[test]
+    fn rejects_null_threshold_on_non_scalars() {
+        for kind in ["list", "estimate", "forecast"] {
+            for threshold in [0.00001, 0.5, 1.0] {
+                rejects(
+                    json!({
+                        "type":kind, "items":"text", "min":0, "max":10,
+                        "null_threshold":threshold
+                    }),
+                    "null_threshold",
+                );
+            }
+        }
     }
 
     // T50: every field accepts settings by shape, and rejects unknown names.

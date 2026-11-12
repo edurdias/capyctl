@@ -478,14 +478,14 @@ Only these top-level members are accepted:
 | `options` | Optional object containing only boolean `include_quantiles` and `return_state_text`. |
 
 Every field spec requires `type`, one of `text`, `number`, `date`, `time`,
-`datetime`, `duration`, `list`, `estimate`, `forecast`. Every type accepts
-any setting below; the router checks its shape, not whether it makes sense
-for that type or agrees with another setting:
+`datetime`, `duration`, `list`, `estimate`, `forecast`. Except for the scalar-only
+`null_threshold`, every type accepts any setting below; the router checks its
+shape, not whether it makes sense for that type or agrees with another setting:
 
 | Setting | Rule |
 |---|---|
 | `instructions` | String. |
-| `null_threshold` | Number, `0 < x ≤ 1`. |
+| `null_threshold` | Scalar types (`text` through `duration`) only; number, `0 < x ≤ 1`. Rejected on `list`, `estimate` and `forecast` with 400 `invalid_request`. |
 | `unit` | String. |
 | `integer` | Boolean. |
 | `decimals` | Integer 0–6. |
@@ -497,8 +497,8 @@ for that type or agrees with another setting:
 | `interval` | `step`, `minute`, `hour`, `day`, `week`, `month`, `quarter` or `year`. |
 
 An unknown setting or a value outside its shape is refused before activation.
-A setting on a type it means nothing for is forwarded; cross-setting semantics
-belong to the engine and can return as `engine_rejected`. The router reads
+Except for `null_threshold`, a setting on a type it means nothing for is forwarded;
+cross-setting semantics belong to the engine and can return as `engine_rejected`. The router reads
 supported types from the frozen custom profile, never the engine. There is
 no field-count limit or image-size limit beyond the body bound; the image
 count is at most four, and an engine's own limits return as rejections.
@@ -506,14 +506,49 @@ count is at most four, and an engine's own limits return as rejections.
 ### Answers
 
 The engine returns an `answers` object keyed by field name. Scalars (`text`
-through `duration`) carry `type`, `value` (null if undetermined), `guess`,
-`p_null` and `confidence`; text carries `span: [start, end]` character offsets
-into `state`. A list's `value` can be null or an array; text lists have
+through `duration`) carry `type`, `value`, `guess`, `p_null` and `confidence`.
+`value` is null when `p_null >= null_threshold` (the engine's default applies
+when omitted), otherwise it equals `guess`. Text carries `span: [start, end]`,
+a half-open interval in Unicode code points of `state`, not bytes or UTF-16
+code units. A list's `value` can be null or an array; text lists have
 corresponding `spans`, in the engine's order. Estimates carry `value`,
 `median`, `p10`, `p90`, `p_below` and `p_above`. Forecasts have two published
 forms: arrays for `value`, `median`, `p10` and `p90`, or a `steps` array of
 estimate objects, one entry per future step. The median and 10th–90th
 percentiles describe an 80% interval. Extra engine members are preserved.
+
+With `options.include_quantiles`, an estimate's `quantiles` is a 99-element
+array for percentiles 1 through 99; a forecast has one such array per step.
+`options.return_state_text` echoes the input as `state_text` in the response.
+`mode` and `computation` are not public response members; internal diagnostics
+use `raw['_mode']` and `raw['_computation']`.
+
+The `capyctl-extract-4b` model has an 8192-token context and reports truncation.
+It does not support PDFs or extracting text from images. Image-only `text`
+and text-list fields fail before inference with `field_unsupported_input`;
+images still support other field types. This is engine validation for that
+model, not a router restriction on other extraction models. Text spans in mixed
+requests refer to their textual `state`.
+
+Its measured `usage.state_tokens`, `image_tokens` and `schema_tokens` aggregate
+across prefix passes. Image tokens count the processor-produced visual prefix,
+including vision delimiters. Schema tokens include both schema copies, markers,
+reference/control text and candidate suffixes. `passes` counts full-prefix
+field groups, not cached candidate-suffix evaluations.
+
+### Provider compatibility
+
+A future OpenRouter-compatible `/api/alpha/extractions` boundary adapter is not
+part of 0.2.0. These differences from OpenRouter's live Extractions contract
+are deliberate; callers must use the CapyCTL contract:
+
+| Area | CapyCTL 0.2.0 | OpenRouter Extractions |
+|---|---|---|
+| Route | `POST /v1/systemone` | `/api/alpha/extractions` |
+| Images | top-level `images` | `assets` |
+| Options | top-level `options` | `provider.options` |
+| Errors | string error codes | numeric error codes |
+| Request size | 8 MiB at host ingress | Clairic: 16 MiB |
 
 CapyCTL forwards the body with the engine's served model name and returns
 the whole answer with the public name. Completion evidence follows decisions:

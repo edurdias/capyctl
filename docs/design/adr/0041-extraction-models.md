@@ -1,6 +1,6 @@
 # ADR 0041 — Extraction models (`api: extractions`, `fields` on `POST /v1/systemone`)
 
-**Status:** Accepted (owner decisions 2026-11-04 and amendment of 2026-11-10).
+**Status:** Accepted (owner decisions 2026-11-04 and amendments of 2026-11-10 and 2026-11-12).
 Target release: 0.2.0, with `integration/0.2.0` landing first and extraction support
 on top, alongside `capyctl-extract-4b`. The first engine is
 CapyCTL's own extraction server run as a custom engine (ADR 0031); no native engine
@@ -187,12 +187,12 @@ HTTP 400 `invalid_request` naming the member, before activation:
 | `options` | optional object with only `include_quantiles` and `return_state_text`, both booleans |
 
 A field spec is an object with a required `type`, one of the nine names, and any of the
-settings of Clairic's schema, each checked for its shape on every type:
+settings below, checked for shape on every type except the scalar-only threshold:
 
 | Setting | Rule |
 |---|---|
 | `instructions` | string |
-| `null_threshold` | number, `0 < x ≤ 1` |
+| `null_threshold` | scalar types (`text` through `duration`) only; number, `0 < x ≤ 1`; refused on `list`, `estimate` and `forecast` with HTTP 400 `invalid_request` |
 | `unit` | string |
 | `integer` | boolean |
 | `decimals` | integer 0 to 6 |
@@ -204,8 +204,8 @@ settings of Clairic's schema, each checked for its shape on every type:
 | `interval` | `step`, `minute`, `hour`, `day`, `week`, `month`, `quarter` or `year` |
 
 An unknown setting, or a value outside its rule, is `invalid_request` naming the field
-and the setting. A setting on a type it means nothing for (`horizon` on a `text`, say) is
-forwarded, as Clairic's schema allows it.
+and the setting. Apart from `null_threshold`, a setting on a type it means nothing
+for (`horizon` on a `text`, say) is forwarded.
 
 **Declared types.** A field whose `type` is not in the deployment's `field_types` is
 refused with HTTP 400 `field_type_unsupported` naming the field and the type, before any
@@ -241,6 +241,44 @@ signal when it has one (ADR 0031 §6), otherwise at the next verified stop.
 **Metrics.** An answer carries `capyctl.metrics` with the figures a decision carries
 (SPEC §10): `total_ms`, `time_to_response_ms`, and `input_tokens` from the engine's
 `usage`. No generated-text figure is recorded.
+
+**Day-one answer contract.** Scalar `value` is null when `p_null >= null_threshold`
+(using the engine's default threshold when omitted); otherwise it equals `guess`.
+Text `span` and text-list `spans` are half-open `[start, end)` offsets in Unicode
+code points of `state`, not bytes or UTF-16 code units. `include_quantiles` adds
+`quantiles`: a 99-element array for percentiles 1 through 99 on an estimate,
+and one such array per forecast step. `return_state_text` retains its request
+name and echoes the input under response member `state_text`, not `state`.
+`mode` and `computation` are never public response members; internal diagnostics
+use `raw['_mode']` and `raw['_computation']`.
+
+The model server reports measured `usage.state_tokens`, `image_tokens` and
+`schema_tokens`, aggregated across prefix passes. Image tokens count the
+processor-produced visual prefix including vision delimiters. Schema accounting
+includes both schema copies, markers, reference/control text and candidate suffix tokens.
+`passes` counts full-prefix field groups, not cached candidate-suffix evaluations.
+These are engine accounting semantics, not new router completion requirements.
+
+For `capyctl-extract-4b`, the context is 8192 tokens and truncation is reported.
+PDF input and extracting text from images are not supported. Image-only requests
+for `text` or `list` with `items: text` are rejected before inference with
+`field_unsupported_input`; images still support the other types. This is
+model-specific engine validation, not a router restriction on every extraction
+model. Mixed requests can extract text spans from their textual `state`.
+
+**Compatibility boundary.** A future `/api/alpha/extractions` boundary adapter
+may translate OpenRouter's live Extractions contract; it is not part of 0.2.0.
+The deliberate differences are:
+
+| Area | CapyCTL 0.2.0 | OpenRouter Extractions |
+|---|---|---|
+| Route | `POST /v1/systemone`, selected by deployment API | `/api/alpha/extractions` |
+| Image input | top-level `images` | `assets` |
+| Options | top-level `options` | `provider.options` |
+| Errors | string error codes | numeric error codes |
+| Request size | host ingress 8 MiB | Clairic: 16 MiB |
+
+No compatibility shim or additional response-readiness requirement is introduced.
 
 ### 4. Readiness is a fixed extraction
 

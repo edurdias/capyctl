@@ -12,8 +12,10 @@ the deployment API. The other API's key, whatever its value (both keys
 included), and undeclared field types are refused before activation. Lookup
 now precedes contract validation on this path, for decisions too: an unknown
 model is reported before a malformed contract. Setting shapes are checked
-on every type; their meaning and agreement belong to the engine. Responses
-use decisions' completion evidence and 16 MiB bound; host ingress checks
+on every type except scalar-only `null_threshold`, rejected on lists, estimates
+and forecasts with 400 `invalid_request`; other meaning and agreement belong
+to the engine. Responses use decisions' completion evidence and 16 MiB bound;
+host ingress checks
 its own 8 MiB request bound. Extractions use decisions' routing, admission,
 leases, settlement, request IDs, trace context and metrics; requests cut
 before a whole answer settle only at verified stop. Discovery lists
@@ -159,8 +161,25 @@ Fake-engine tests are not qualification.
 Table/record extraction is explicitly deferred to a follow-up release. The
 proposed `records` contract, readiness implications, occurrence-conditioned
 column readout, data, metrics and open questions are in
-[Extraction records](../specs/extraction-records.md). This release keeps ADR 0041's
-nine-type wire contract unchanged.
+[Extraction records](../specs/extraction-records.md). This release retains ADR 0041's
+nine field types with the pre-release wire amendments below.
+
+The day-one contract now specifies scalar nulling at `p_null >= null_threshold`,
+half-open Unicode-code-point spans, percentile 1–99 quantile arrays (one array
+per forecast step), and `state_text` echo with unchanged `return_state_text`.
+`mode` and `computation` stay internal as `raw['_mode']` and
+`raw['_computation']`. Measured state/image/schema token usage aggregates
+across prefix passes; schema accounting includes both copies, markers,
+reference/control text and candidate suffixes, while `passes` counts full-prefix
+field groups rather than cached suffix evaluations. The model's 8192-token
+context reports truncation; PDFs and image text extraction are unsupported.
+Image-only text and text-list fields are refused before inference with
+`field_unsupported_input` by the model engine, not globally by the router.
+Other image field types remain supported. The guide and ADR record deliberate
+route, images/assets, options, string-error and 8 MiB boundary differences;
+a future `/api/alpha/extractions` adapter is outside 0.2.0. Adapter and router
+regressions cover non-scalar thresholds without tightening other irrelevant
+settings.
 
 # Release note: Extraction models
 
