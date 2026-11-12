@@ -18,7 +18,7 @@ from .functional import embedding, vectors
 ROWS = [dict(id=key, priority=2, budget=budget, measurement=True, criteria=criteria)
         for key, budget, criteria in (
     ("EM1", 900, "Qwen3-Embedding-4B BF16/Q8_0: native 2560 dimensions, ordered batch, API/certification/LMCache evidence and memory/start/charge."),
-    ("EM8", 1800, "Embedding latency/load matrix and pinned retrieval; Qwen8B 2048-input float/base64 router memory bound."),
+    ("EM8", 14400, "Embedding latency/load matrix and pinned retrieval; Qwen8B 2048-input float/base64 router memory bound."),
     ("OT8", 3000, "200 requests per tracing arm/engine, phase arrays and throughput; SGLang trace levels 1 and 3."),
     ("TF2", 900, "TensorFold cold/warm readiness, full-context eight-stream device/process/host memory and startup sizing."),
     ("TF3", 1200, "TensorFold request options, drafted/no-draft greedy SHA equivalence and 1/8 stream baseline throughput."),

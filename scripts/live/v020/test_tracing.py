@@ -16,6 +16,18 @@ class Context:
 
 
 class TracingTests(unittest.TestCase):
+    def test_t48_ot7_propagates_skipped_baseline_but_not_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            ctx = Context()
+            ctx.evidence = Path(root)
+            receipt = ctx.evidence / 'result-OT8.json'
+            receipt.write_text(json.dumps(dict(verdict='skip', reason='not installed: SGLANG_0523_TRACING')))
+            with self.assertRaises(v020.UnavailableEngine):
+                tracing.ot7(ctx, {})
+            receipt.write_text(json.dumps(dict(verdict='fail', reason='missing measurements')))
+            with self.assertRaisesRegex(AssertionError, 'baseline did not pass'):
+                tracing.ot7(ctx, {})
+
     def test_ot_catalog_is_unique_and_implemented(self):
         rows = v020.select_rows(','.join('OT'+str(n) for n in range(1, 12)))
         self.assertEqual(len(rows), 11)
