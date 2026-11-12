@@ -13,16 +13,16 @@ import time
 
 
 ROWS = [
-    dict(id="LC13", priority=1, budget=1000, discrete=True,
+    dict(id="LC13", priority=1, budget=2300, discrete=True,
          criteria="ADR0034 §2: 32k park/wake correctness, whole-chunk hits, salts, store race, footprint and wake bounds; uncertified required versus auto."),
-    dict(id="LC14", priority=1, budget=1100, discrete=True,
+    dict(id="LC14", priority=1, budget=2500, discrete=True,
          criteria="ADR0034 §2: 15 alternating-prompt park/wake cycles, off-reference answers, no held KV or server stops, covered charges and <=256MiB server GPU growth."),
-    dict(id="LC15", priority=1, budget=600, discrete=True,
+    dict(id="LC15", priority=1, budget=1500, discrete=True,
          criteria="ADR0034 §2: enrolled host through the control server, 32k park/wake/hit and passing wake canary."),
-    dict(id="LC16", priority=1, budget=900, discrete=True, measurement=True,
+    dict(id="LC16", priority=1, budget=2100, discrete=True, measurement=True,
          criteria="ADR0034 §2: five cold/engine-evicted/post-park trials at 8k/16k/32k; wake <=1.1x off, cold TTFT <=1.1x off, 32k post-wake TTFT <=0.25x off.")]
 for row in ROWS:
-    row["criteria"] += " Sleep-clearing installations must refuse required and disable auto; this guard alone is not qualification (2026-11-10 amendment)."
+    row["criteria"] += " Full protocol on source-recognized vLLM 0.34.0rc1 and SGLang 0.5.23 with LMCache 0.5.7; vLLM 0.33 retains required-refusal/auto-off guard only (ADR0034 amendment)."
 ROWS += [dict(row, id=row["id"] + "U", priority=4, discrete=False, unified=True,
               measurement=row["id"] == "LC16",
               criteria=row["criteria"].replace("host_backed", "deep") + " GB10 deep-parking counterpart.")
@@ -37,7 +37,7 @@ SIZES = (8000, 16000, 32000)
 TOKENIZER = r'''
 import hashlib, importlib.metadata, json, sys
 from transformers import AutoTokenizer
-model, specifications = sys.argv[1], json.loads(sys.argv[2])
+model, specifications, engine = sys.argv[1], json.loads(sys.argv[2]), sys.argv[3]
 t = AutoTokenizer.from_pretrained(model, local_files_only=True, trust_remote_code=False)
 fixtures = {}
 for label, target in specifications:
@@ -59,23 +59,30 @@ for label, target in specifications:
     fixtures[label] = {"messages": messages, "prompt_tokens": len(tokens),
                        "whole_chunk_tokens": len(tokens) // 256 * 256,
                        "sha256": hashlib.sha256(content.encode()).hexdigest()}
-versions = {p: importlib.metadata.version(p) for p in ("vllm", "lmcache", "transformers")}
+versions = {p: importlib.metadata.version(p) for p in (engine, "lmcache", "transformers")}
 print(json.dumps({"fixtures": fixtures, "versions": versions}))
 '''
 
 
-def fixtures(ctx, specs):
-    engine = Path(ctx.engines["LMCACHE"])
+def fixtures(ctx, specs, engine_key="LMCACHE"):
+    package = "sglang" if engine_key == "LMCACHE_SGLANG" else "vllm"
+    engine = Path(ctx.engines[engine_key])
     python = engine / "bin/python" if engine.is_dir() else engine.parent / "python"
     model = Path(ctx.engines["MODEL_CHAT"])
-    result = ctx.command([python, "-c", TOKENIZER, model, json.dumps(specs)],
+    result = ctx.command([python, "-c", TOKENIZER, model, json.dumps(specs), package],
                          env={**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
                               "TOKENIZERS_PARALLELISM": "false"})
     data = json.loads(result.stdout)
-    approved = {("0.33.0", "0.5.7")}
-    if ctx.unified:
+    # T45 / ADR0034: these pins identify the measured recipe. The launch-time
+    # source-shape gate, exercised by sleep_guard, determines sleep safety.
+    approved = {
+        "LMCACHE": {("0.33.0", "0.5.7")},
+        "LMCACHE_VLLM_034": {("0.34.0rc1", "0.5.7")},
+        "LMCACHE_SGLANG": {("0.5.23", "0.5.7")},
+    }[engine_key]
+    if ctx.unified and engine_key == "LMCACHE":
         approved.add(("0.32.0", "0.5.6"))
-    actual = (data["versions"]["vllm"], data["versions"]["lmcache"])
+    actual = (data["versions"][package], data["versions"]["lmcache"])
     ctx.assertion(actual in approved,
                   "qualification engine/LMCache tuple does not match an approved installation")
     return data
@@ -202,19 +209,22 @@ def answer(response):
 
 
 class Protocol:
-    def __init__(self, ctx, row, role="standalone"):
-        self.ctx, self.row, self.role = ctx, row, role
+    def __init__(self, ctx, row, role="standalone", engine="LMCACHE"):
+        self.ctx, self.row, self.role, self.engine = ctx, row, role, engine
+        self.sglang = engine == "LMCACHE_SGLANG"
+        self.engine_config = dict(accept_extra_args=True, extra_args=[
+            "--enable-cache-report" if self.sglang else "--enable-prompt-tokens-details"])
         self.residency = "deep" if ctx.unified else "host_backed"
         self.records, self.failures, self.names = [], [], []
-        self.prefix = row["id"].lower()
+        self.prefix = row["id"].lower() + "-" + engine.lower().replace("_", "-")
         self.first_server_gpu = None
         self.server_identity = None
         self.journal_start = 0
 
     def record(self, kind, **fields):
-        value = dict(kind=kind, **fields)
+        value = dict(kind=kind, engine=self.engine, **fields)
         self.records.append(value)
-        self.ctx.save("record-" + str(len(self.records)).zfill(5), value)
+        self.ctx.save(self.engine.lower() + "-record-" + str(len(self.records)).zfill(5), value)
         return value
 
     def check(self, condition, reason):
@@ -224,11 +234,15 @@ class Protocol:
 
     def deploy(self, suffix, mode, pool=None):
         name = self.prefix + "-" + suffix
-        extra = dict(lmcache=mode, engine_config=dict(accept_extra_args=True,
-                     extra_args=["--enable-prompt-tokens-details"]))
+        extra = dict(lmcache=mode, engine_config=self.engine_config)
         if pool:
             extra["lmcache_pool"] = pool
-        self.ctx.deploy(name, "lmcache", residency=self.residency, extra=extra, role=self.role)
+        try:
+            self.ctx.deploy(name, self.engine, residency=self.residency, extra=extra, role=self.role)
+        except Exception:
+            if (self.role, name) in self.ctx.deployments:
+                self.names.append(name)
+            raise
         self.names.append(name)
         status = self.ctx.status(name, self.role)
         ledger = cache_ledger(self.ctx, name, self.role)
@@ -284,12 +298,28 @@ class Protocol:
                     connector = {key: configured.get(key) for key in ("kv_connector", "kv_connector_module_path", "kv_role")}
                     connector["extra"] = {key: extra.get(key) for key in
                                           ("lmcache.mp.host", "lmcache.mp.port", "lmcache.mp.autostart", "lmcache.mp.mp_transfer_mode")}
-        self.check(connector is not None and connector["kv_connector"] == "LMCacheMPConnector" and
-                   connector["extra"]["lmcache.mp.mp_transfer_mode"] == "engine_driven" and
-                   connector["extra"]["lmcache.mp.host"] == "127.0.0.1" and
-                   connector["extra"]["lmcache.mp.port"] == ledger["rpc_port"] and
-                   connector["extra"]["lmcache.mp.autostart"] is False,
-                   "engine connector does not match owned engine-driven server")
+                elif self.sglang and arg == "--public-settings-json":
+                    settings = json.loads(args[index + 1]).get("settings", {})
+                    config_path = settings.get("lmcache_config_file")
+                    if config_path:
+                        # ADR0033 §4: inspect only the generated, secret-free
+                        # connector file; never export the public argv wholesale.
+                        text = Path(config_path).read_text()
+                        expected = ("mp_host: 127.0.0.1\nmp_port: " + str(ledger["rpc_port"]) +
+                                    "\nextra_config:\n  lmcache.mp.mp_transfer_mode: engine_driven\n")
+                        connector = dict(kind="sglang", config_matches=text == expected)
+        if self.sglang:
+            self.check(connector is not None and connector.get("config_matches"),
+                       "SGLang connector does not match owned engine-driven server")
+        else:
+            self.check(connector is not None and connector["kv_connector"] == "LMCacheMPConnector" and
+                       connector["kv_connector_module_path"] == "lmcache.integration.vllm.lmcache_mp_connector" and
+                       connector["kv_role"] == "kv_both" and
+                       connector["extra"]["lmcache.mp.mp_transfer_mode"] == "engine_driven" and
+                       connector["extra"]["lmcache.mp.host"] == "127.0.0.1" and
+                       connector["extra"]["lmcache.mp.port"] == ledger["rpc_port"] and
+                       connector["extra"]["lmcache.mp.autostart"] is False,
+                       "engine connector does not match owned engine-driven server")
         # /status includes memory internals; /healthcheck proves readiness
         # without accidentally sampling memory in functional-only mode.
         health = cache_http(self.ctx, name, self.role, "/healthcheck")
@@ -447,15 +477,18 @@ class Protocol:
         self.record("server-continuity", health=health, failures=failures, events=events,
                     charge_raise_events=raises, supporting_measurements=measurements)
 
-    def finish(self):
+    def finish(self, guard=False):
         for name in self.names[:]:
             self.retire(name)
         measurement = "not qualified: timing and memory subparts intentionally not sampled" if self.ctx.functional_only else "numeric samples and comparisons recorded"
+        if guard:
+            measurement = "clearing-source required-refusal/auto-off guard only; not sleep qualification"
         self.record("qualification-scope", measurements=measurement, model="chat", residency=self.residency,
                     external_counter_source="owned LMCache /metrics; engine keys never read",
                     table="required uncertified rendering; no claim that auto is certified")
+        reason = ("clearing-source guard passed; " if guard else "correctness/hits passed; ") + measurement
         return dict(verdict="fail" if self.failures else "skip" if self.ctx.functional_only else "pass",
-                    reason="; ".join(dict.fromkeys(self.failures)) if self.failures else "correctness/hits passed; " + measurement,
+                    reason="; ".join(dict.fromkeys(self.failures)) if self.failures else reason,
                     evidence=self.records)
 
 
@@ -643,7 +676,7 @@ def costs(p, fixture_data):
             p.check(comparisons["postwake"]["ratio"] <= 0.25, "32k post-wake TTFT exceeds 0.25x off")
 
 
-def sleep_guard(p):
+def sleep_guard(p, qualification=True):
     """ADR 0034 amendment: a compatible refusal never certifies cache retention."""
     ctx = p.ctx
     try:
@@ -655,6 +688,9 @@ def sleep_guard(p):
         if "sleep_clears_cache" not in diagnostic:
             raise
         p.record("required-sleep-refusal", reason="sleep_clears_cache", diagnostic=diagnostic)
+        refused = p.prefix + "-required-compatibility"
+        if (p.role, refused) in ctx.deployments:
+            p.retire(refused)
     else:
         p.retire(probe)
         return False
@@ -662,6 +698,10 @@ def sleep_guard(p):
     ledger = cache_ledger(ctx, auto, p.role)
     p.check(ledger["planned"] == "off" and ledger["state"] == "off",
             "auto sleep parking did not disable LMCache")
+    # ADR0034: unchanged qualification planning may disable auto before the
+    # launch-time source gate sees it. Neither off reason qualifies sleep hits.
+    p.check((ledger["planned_reason"] or ledger["reason"]) in ("sleep_clears_cache", "park_unqualified"),
+            "auto clearing-source launch does not name a sleep/qualification off reason")
     park = p.lifecycle("park", auto)
     wake = p.lifecycle("wake", auto)
     response = ctx.request(auto, role=p.role)
@@ -669,18 +709,18 @@ def sleep_guard(p):
     p.record("auto-sleep-guard", ledger=ledger, park=park, wake=wake,
              response_status=response.get("status"), external_hits_expected=False)
     p.retire(auto)
-    p.check(False, "sleep_clears_cache: compatibility guard observed; sleep hit/memory/endurance/cost not qualified")
+    if qualification:
+        p.check(False, "sleep_clears_cache: compatibility guard observed; sleep hit/memory/endurance/cost not qualified")
     return True
 
 
 def restart_cache_check(p):
     """Keep restart-only retention distinct from unsupported sleep retention."""
     ctx = p.ctx
-    fixture = fixtures(ctx, [("restart", 32000)])["fixtures"]["restart"]
+    fixture = fixtures(ctx, [("restart", 32000)], p.engine)["fixtures"]["restart"]
     name = p.prefix + "-restart-cache"
-    ctx.deploy(name, "lmcache", residency="restart_only", role=p.role,
-               extra=dict(lmcache="required", engine_config=dict(
-                   accept_extra_args=True, extra_args=["--enable-prompt-tokens-details"])))
+    ctx.deploy(name, p.engine, residency="restart_only", role=p.role,
+               extra=dict(lmcache="required", engine_config=p.engine_config))
     p.names.append(name)
     seed = p.request(name, fixture, "restart-seed", cache=True, hit=False)
     p.lifecycle("park", name)
@@ -691,40 +731,59 @@ def restart_cache_check(p):
 
 def run(ctx, row):
     row_id = row["id"].removesuffix("U")
-    p = Protocol(ctx, row, role="server" if row_id == "LC15" else "standalone")
-    try:
-        if sleep_guard(p):
-            if row_id == "LC13":
-                restart_cache_check(p)
-            return p.finish()
-        if row_id in ("LC13", "LC15"):
-            specs = [(label, 32000) for label in ("main", "salt", "race")]
-        elif row_id == "LC14":
-            specs = [(label, 32000) for label in ["same"] + ["new-" + str(index) for index in range(1, 15, 2)]]
-        else:
-            specs = []
-            for size in SIZES:
-                for repeat in range(5):
-                    label = str(size) + "-" + str(repeat)
-                    specs.extend(((label, size), ("noise-a-" + label, 18560), ("noise-b-" + label, 18560)))
-        data = fixtures(ctx, specs)
-        ctx.save("fixtures", data)
-        p.record("tokenizer-fixtures", versions=data["versions"],
-                 artifact=ctx.row_id + "-fixtures.json",
-                 fixtures={label: {key: value for key, value in fixture.items() if key != "messages"}
-                           for label, fixture in data["fixtures"].items()})
-        if row_id == "LC13":
-            correctness(p, data)
-        elif row_id == "LC14":
-            endurance(p, data)
-        elif row_id == "LC15":
-            correctness(p, data, repeats=1, enrolled=True)
-        elif row_id == "LC16":
-            costs(p, data)
-        else:
-            raise ValueError("unknown cache row")
-        return p.finish()
-    except Exception as error:
-        p.record("protocol-error", error=type(error).__name__, reason=str(error),
-                 measurements="not sampled" if ctx.functional_only else "partial numeric evidence retained")
-        return dict(verdict="fail", reason=str(error), evidence=p.records)
+    role = "server" if row_id == "LC15" else "standalone"
+    results = []
+    # T45 / ADR0034 amendment: run both preservation recipes in full, and retain
+    # the old clearing-source guard separately. No version bypasses the source gate.
+    for engine in ("LMCACHE", "LMCACHE_VLLM_034", "LMCACHE_SGLANG"):
+        p = Protocol(ctx, row, role=role, engine=engine)
+        guard_only = engine == "LMCACHE"
+        try:
+            guarded = sleep_guard(p, qualification=not guard_only)
+            if guard_only:
+                p.check(guarded, "vLLM 0.33 clearing-source guard unexpectedly enabled sleep LMCache")
+                if guarded and row_id == "LC13":
+                    restart_cache_check(p)
+            elif guarded:
+                p.check(False, "sleep_clears_cache: full preservation protocol not qualified")
+            else:
+                if row_id in ("LC13", "LC15"):
+                    specs = [(label, 32000) for label in ("main", "salt", "race")]
+                elif row_id == "LC14":
+                    specs = [(label, 32000) for label in ["same"] + ["new-" + str(index) for index in range(1, 15, 2)]]
+                elif row_id == "LC16":
+                    specs = []
+                    for size in SIZES:
+                        for repeat in range(5):
+                            label = str(size) + "-" + str(repeat)
+                            specs.extend(((label, size), ("noise-a-" + label, 18560), ("noise-b-" + label, 18560)))
+                else:
+                    raise ValueError("unknown cache row")
+                data = fixtures(ctx, specs, engine)
+                artifact = engine.lower() + "-fixtures"
+                ctx.save(artifact, data)
+                p.record("tokenizer-fixtures", versions=data["versions"],
+                         artifact=ctx.row_id + "-" + artifact + ".json",
+                         fixtures={label: {key: value for key, value in fixture.items() if key != "messages"}
+                                   for label, fixture in data["fixtures"].items()})
+                if row_id == "LC13":
+                    correctness(p, data)
+                elif row_id == "LC14":
+                    endurance(p, data)
+                elif row_id == "LC15":
+                    correctness(p, data, repeats=1, enrolled=True)
+                else:
+                    costs(p, data)
+            results.append(p.finish(guard=guard_only))
+        except Exception as error:
+            p.record("protocol-error", error=type(error).__name__, reason=str(error),
+                     measurements="not sampled" if ctx.functional_only else "partial numeric evidence retained")
+            results.append(dict(verdict="fail", reason=engine + ": " + str(error), evidence=p.records))
+            # Failed live work must release its deployments before the next engine.
+            for name in p.names[:]:
+                p.retire(name)
+    verdict = "fail" if any(result["verdict"] == "fail" for result in results) else (
+        "skip" if any(result["verdict"] == "skip" for result in results) else "pass")
+    return dict(verdict=verdict,
+                reason="; ".join(result["reason"] for result in results),
+                evidence=[record for result in results for record in result["evidence"]])

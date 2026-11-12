@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Query, State};
+use axum::extract::{OriginalUri, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -35,6 +35,7 @@ const KEY: &str = "k3y";
 #[derive(Default)]
 struct Engine {
     calls: Vec<String>,
+    sleep_requests: Vec<String>,
     sleeping: bool,
     weights_awake: bool,
     weights_loaded: bool,
@@ -64,6 +65,7 @@ fn record(engine: &Shared, call: &str) -> Result<(), StatusCode> {
 
 async fn sleep(
     State(engine): State<Shared>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> axum::response::Response {
@@ -74,6 +76,7 @@ async fn sleep(
     if let Err(status) = record(&engine, &call) {
         return status.into_response();
     }
+    engine.lock().unwrap().sleep_requests.push(uri.to_string());
     let delay = engine.lock().unwrap().copy_delay;
     tokio::time::sleep(delay).await;
     let mut e = engine.lock().unwrap();
@@ -391,6 +394,55 @@ async fn a_deep_park_and_its_restoration_run_in_the_documented_order() {
         ]
     );
     assert!(!e.sleeping && e.weights_loaded);
+}
+
+// T45 T21 (ADR 0034, SPEC §9.1): only the source-recognized active
+// connector gets reset_connector=false, at both sleep levels. Its wake still
+// reloads weights and invalidates local KV, through the same keyed controls.
+#[tokio::test]
+async fn a_recognized_active_lmcache_sleep_preserves_only_the_connector() {
+    for (residency, level) in [(Residency::Deep, 2), (Residency::HostBacked, 1)] {
+        for active_recognized in [false, true] {
+            let engine = Shared::default();
+            let port = serve(engine.clone()).await;
+            let vllm = adapter(port, ParkPolicy::Enabled)
+                .with_residency(residency)
+                .with_preserved_lmcache(active_recognized);
+            for (action, id) in [
+                (RuntimeAction::Park, "p"),
+                (RuntimeAction::Restore, "w"),
+                (RuntimeAction::ReloadWeights, "r"),
+                (RuntimeAction::InvalidateCache, "i"),
+                (RuntimeAction::Probe, "probe"),
+            ] {
+                vllm.execute_persisted(&step(action, id)).await.unwrap();
+            }
+            let e = engine.lock().unwrap();
+            let expected = if active_recognized {
+                format!("/sleep?level={level}&reset_connector=false")
+            } else {
+                format!("/sleep?level={level}")
+            };
+            assert_eq!(e.sleep_requests, [expected]);
+            assert!(!e.sleeping && e.weights_loaded && e.kv_awake);
+            assert_eq!(
+                e.calls.iter().any(|call| call == "reload_weights"),
+                residency == Residency::Deep,
+            );
+            assert!(e.calls.iter().any(|call| call == "reset_prefix_cache"));
+        }
+    }
+    // SPEC §9.1 / T21: preservation never bypasses host opt-out.
+    let engine = Shared::default();
+    let port = serve(engine.clone()).await;
+    let vllm = adapter(port, ParkPolicy::Disabled).with_preserved_lmcache(true);
+    assert_eq!(
+        vllm.execute_persisted(&step(RuntimeAction::Park, "disabled"))
+            .await
+            .unwrap_err(),
+        RuntimeError::Unsupported,
+    );
+    assert!(engine.lock().unwrap().sleep_requests.is_empty());
 }
 
 /// SPEC §9.1 / T21: an opted-out host never reaches a sleep, wake or collective

@@ -168,10 +168,18 @@ class HelperTests(unittest.TestCase):
                 ids = [1] * 32064
                 return ids if kwargs.get('return_dict') is False else {'input_ids': ids, 'attention_mask': ids}
         transformers = types.SimpleNamespace(AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *args, **kwargs: Tokenizer()))
-        stream = io.StringIO()
-        with mock.patch.dict(sys.modules, transformers=transformers), mock.patch('sys.argv', ['probe', 'model', '[["main",32000]]']), mock.patch('importlib.metadata.version', return_value='test'), contextlib.redirect_stdout(stream):
-            exec(TOKENIZER, {})
-        self.assertEqual(json.loads(stream.getvalue())['fixtures']['main']['prompt_tokens'], 32064)
+        # T45 / ADR0034: SGLang fixtures must not import vLLM metadata.
+        for package in ('vllm', 'sglang'):
+            with self.subTest(package=package):
+                stream = io.StringIO()
+                with mock.patch.dict(sys.modules, transformers=transformers), \
+                     mock.patch('sys.argv', ['probe', 'model', '[["main",32000]]', package]), \
+                     mock.patch('importlib.metadata.version', return_value='test') as version, \
+                     contextlib.redirect_stdout(stream):
+                    exec(TOKENIZER, {})
+                self.assertEqual(json.loads(stream.getvalue())['fixtures']['main']['prompt_tokens'], 32064)
+                self.assertEqual([call.args[0] for call in version.call_args_list],
+                                 [package, 'lmcache', 'transformers'])
 
     def test_canary_uses_current_launch_reference_and_restored_journal(self):
         from rows.engines import passing_canary
@@ -252,35 +260,43 @@ class HelperTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, 'numeric GPU memory'):
             ctx.sample()
 
-    def test_lmcache_latest_tuple_is_approved_on_unified_memory(self):
+    # T45 / ADR0034: approved tuples select the fixture interpreter, not sleep safety.
+    def test_lmcache_fixtures_use_each_selected_engine_environment(self):
         from rows.lmcache import fixtures
         from types import SimpleNamespace
         def require(condition, reason):
             if not condition:
                 raise AssertionError(reason)
-        for unified, vllm, lmcache, accepted in [
-                (True, '0.33.0', '0.5.7', True),
-                (True, '0.32.0', '0.5.6', True),
-                (False, '0.33.0', '0.5.7', True),
-                (False, '0.32.0', '0.5.6', False),
-                (True, '0.33.0', '0.5.6', False)]:
-            with self.subTest(unified=unified, vllm=vllm, lmcache=lmcache):
+        for key, package, version, cache_version, accepted in [
+                ('LMCACHE_VLLM_034', 'vllm', '0.34.0rc1', '0.5.7', True),
+                ('LMCACHE_SGLANG', 'sglang', '0.5.23', '0.5.7', True),
+                ('LMCACHE', 'vllm', '0.33.0', '0.5.7', True),
+                ('LMCACHE_SGLANG', 'sglang', '0.5.23', '0.5.6', False),
+                ('LMCACHE_VLLM_034', 'vllm', '0.33.0', '0.5.7', False)]:
+            with self.subTest(key=key, version=version, cache_version=cache_version):
+                calls = []
+                environment = self.root / key
+                environment.mkdir(exist_ok=True)
+                def command(args, **kwargs):
+                    calls.append(args)
+                    return SimpleNamespace(stdout=json.dumps(
+                        {'versions': {package: version, 'lmcache': cache_version}}))
                 ctx = SimpleNamespace(
-                    engines={'LMCACHE': str(self.root), 'MODEL_CHAT': str(self.root)},
-                    unified=unified, assertion=require,
-                    command=lambda *a, **k: SimpleNamespace(stdout=json.dumps(
-                        {'versions': {'vllm': vllm, 'lmcache': lmcache}})))
+                    engines={key: str(environment), 'MODEL_CHAT': str(self.root)},
+                    unified=False, assertion=require, command=command)
                 if accepted:
-                    self.assertEqual(fixtures(ctx, [])['versions']['vllm'], vllm)
+                    self.assertEqual(fixtures(ctx, [], key)['versions'][package], version)
+                    self.assertEqual(calls[0][0], environment / 'bin/python')
+                    self.assertEqual(calls[0][-1], package)
                 else:
                     with self.assertRaisesRegex(AssertionError, 'approved installation'):
-                        fixtures(ctx, [])
+                        fixtures(ctx, [], key)
 
     def test_aarch64_setup_requires_every_engine_override_before_tools(self):
         import subprocess
         mapping = self.root / 'lab.env'
-        names = ('VLLM_032 VLLM_033 SGLANG_0522 SGLANG_0523 SGLANG_EDITABLE '
-                 'LMCACHE LMCACHE_SGLANG LLAMACPP TENSORFOLD_126 TENSORFOLD_115 '
+        names = ('VLLM_032 VLLM_033 VLLM_034 SGLANG_0522 SGLANG_0523 SGLANG_EDITABLE '
+                 'LMCACHE LMCACHE_VLLM_034 LMCACHE_SGLANG LLAMACPP TENSORFOLD_126 TENSORFOLD_115 '
                  'TENSORFOLD_066 TENSORRT_LLM_121 TENSORRT_LLM_140RC3 OTELCOL CUDA_HOME').split()
         script = '''
 source "$1"
@@ -692,25 +708,159 @@ v020_setup_tensorrt TENSORRT_LLM_140RC3 1.4.0rc3 2.14.0 cu132 13.4 CUDA_HOME_TRT
         self.assertTrue((self.root / 'summary.json').is_file())
 
     def test_sleep_cache_refusal_proves_only_the_guard_not_qualification(self):
+        # T45 / ADR0034: clearing source must refuse required and disable auto.
         from unittest import mock
         from rows.lmcache import Protocol, sleep_guard
         ctx = v020.Context(self.root, {})
         ctx.row_id, ctx.index = 'LC13', 1
         ctx.save('operation-1', dict(stderr='sleep_clears_cache', stdout=''))
         ctx.request = lambda *args, **kwargs: dict(status=200)
-        p = Protocol(ctx, dict(id='LC13'))
-        def deploy(suffix, mode):
-            if mode == 'required':
-                raise AssertionError('operation 1 failed')
-            return 'auto'
-        p.deploy = deploy
-        p.lifecycle = lambda action, name: dict(status=action)
-        p.retire = lambda name: None
-        with mock.patch('rows.lmcache.cache_ledger', return_value=dict(
-                planned='off', state='off', reason='park_unqualified', planned_reason=None)):
-            self.assertTrue(sleep_guard(p))
-        self.assertTrue(any('not qualified' in reason for reason in p.failures))
-        self.assertFalse(any('auto sleep parking did not disable' in reason for reason in p.failures))
+        for reason in ('sleep_clears_cache', 'park_unqualified'):
+            with self.subTest(reason=reason):
+                p = Protocol(ctx, dict(id='LC13'))
+                def deploy(suffix, mode):
+                    if mode == 'required':
+                        raise AssertionError('operation 1 failed')
+                    return 'auto'
+                p.deploy = deploy
+                p.lifecycle = lambda action, name: dict(status=action)
+                p.retire = lambda name: None
+                with mock.patch('rows.lmcache.cache_ledger', return_value=dict(
+                        planned='off', state='off', reason=reason, planned_reason=None)):
+                    self.assertTrue(sleep_guard(p))
+                self.assertEqual(p.failures, [
+                    'sleep_clears_cache: compatibility guard observed; sleep hit/memory/endurance/cost not qualified'])
+
+    # T45 / ADR0034: SGLang 0.5.23 --enable-cache-report exposes native OpenAI usage.
+    # sglang/v0.5.23 entrypoints/openai/protocol.py: UsageInfo / PromptTokensDetails.
+    def test_sglang_cache_protocol_reads_native_streamed_cached_tokens(self):
+        from rows.lmcache import Protocol
+        ctx = v020.Context(self.root, {}, functional_only=True)
+        ctx.row_id = 'LC16'
+        ctx.request = lambda *args, **kwargs: dict(
+            status=200, done=True, chunks=[
+                json.dumps(dict(choices=[dict(delta=dict(content='123456'))])),
+                json.dumps(dict(choices=[], usage=dict(
+                    prompt_tokens=32064, prompt_tokens_details=dict(cached_tokens=0)))),
+                '[DONE]'])
+        p = Protocol(ctx, dict(id='LC16'), engine='LMCACHE_SGLANG')
+        fixture = dict(messages=[], whole_chunk_tokens=32000, sha256='fixture')
+        result = p.request('off', fixture, 'engine-evicted', expected='123456')
+        self.assertEqual(result['cached_tokens'], 0)
+        self.assertEqual(p.failures, [])
+
+    # T45 / ADR0034: every LC13-LC16 row runs both full engines plus the old guard.
+    def test_cache_rows_run_full_protocol_for_both_preserving_engines(self):
+        from unittest import mock
+        from rows import lmcache
+        for row_id, full in [('LC13', 'correctness'), ('LC14', 'endurance'),
+                             ('LC15', 'correctness'), ('LC16', 'costs')]:
+            for unified in (False, True):
+                with self.subTest(row=row_id, unified=unified):
+                    ctx = v020.Context(self.root, {}, unified=unified)
+                    ctx.row_id = row_id + ('U' if unified else '')
+                    selected = []
+                    guarded = []
+                    def guard(protocol, qualification=True):
+                        guarded.append((protocol.engine, qualification, protocol.role))
+                        return protocol.engine == 'LMCACHE'
+                    def protocol(protocol, *args, **kwargs):
+                        selected.append((protocol.engine, kwargs.get('enrolled', False)))
+                    with mock.patch.object(lmcache, 'sleep_guard', side_effect=guard), \
+                         mock.patch.object(lmcache, 'restart_cache_check'), \
+                         mock.patch.object(lmcache, 'fixtures', return_value=dict(versions={}, fixtures={})), \
+                         mock.patch.object(lmcache, full, side_effect=protocol):
+                        result = lmcache.run(ctx, dict(id=ctx.row_id))
+                    self.assertEqual(result['verdict'], 'pass')
+                    self.assertEqual(selected, [('LMCACHE_VLLM_034', row_id == 'LC15'),
+                                                ('LMCACHE_SGLANG', row_id == 'LC15')])
+                    self.assertEqual(guarded, [
+                        ('LMCACHE', False, 'server' if row_id == 'LC15' else 'standalone'),
+                        ('LMCACHE_VLLM_034', True, 'server' if row_id == 'LC15' else 'standalone'),
+                        ('LMCACHE_SGLANG', True, 'server' if row_id == 'LC15' else 'standalone')])
+
+    # T45 / ADR0034 amendment: a preserving version with clearing source is not qualified.
+    def test_cache_row_does_not_replace_full_protocol_with_a_source_refusal(self):
+        from unittest import mock
+        from rows import lmcache
+        ctx = v020.Context(self.root, {})
+        ctx.row_id = 'LC14'
+        with mock.patch.object(lmcache, 'sleep_guard', return_value=True), \
+             mock.patch.object(lmcache, 'endurance') as full:
+            result = lmcache.run(ctx, dict(id='LC14'))
+        self.assertEqual(result['verdict'], 'fail')
+        self.assertIn('sleep_clears_cache', result['reason'])
+        full.assert_not_called()
+
+    # T45 / ADR0034: native SGLang uses its own reporting option, never vLLM's.
+    def test_cache_protocol_selects_native_reporting_arguments(self):
+        from unittest import mock
+        from rows.lmcache import Protocol
+        for key, flag in [('LMCACHE_VLLM_034', '--enable-prompt-tokens-details'),
+                          ('LMCACHE_SGLANG', '--enable-cache-report')]:
+            with self.subTest(key=key):
+                ctx = v020.Context(self.root, {})
+                ctx.deploy = mock.Mock()
+                ctx.status = lambda *args: {}
+                p = Protocol(ctx, dict(id='LC13'), engine=key)
+                with mock.patch('rows.lmcache.cache_ledger', return_value=dict(
+                        planned='off', planned_reason=None, state='off', reason=None, uncertified=0)):
+                    p.deploy('off', 'off')
+                self.assertEqual(ctx.deploy.call_args.args[1], key)
+                self.assertEqual(ctx.deploy.call_args.kwargs['extra']['engine_config']['extra_args'], [flag])
+
+    # T45 / ADR0034: SGLang's native public settings and generated YAML are checked.
+    def test_cache_rendering_checks_sglang_connector_without_vllm_flags(self):
+        from unittest import mock
+        from rows.lmcache import Protocol
+        config = self.root / 'lmcache.yaml'
+        ctx = v020.Context(self.root, {})
+        ctx.row_id = 'LC13'
+        public = json.dumps(dict(settings=dict(lmcache_config_file=str(config))))
+        server = ['lmcache', 'server', '--supported-transfer-mode', 'engine_driven',
+                  '--eviction-trigger-watermark', '0.8', '--eviction-ratio', '0.2']
+        engine = ['python', 'entry.py', '--public-settings-json', public]
+        identities = [dict(pid=10, role='lmcache'), dict(pid=11, role='engine')]
+        expected = 'mp_host: 127.0.0.1\nmp_port: 10001\nextra_config:\n  lmcache.mp.mp_transfer_mode: engine_driven\n'
+        for valid in (True, False):
+            with self.subTest(valid=valid):
+                config.write_text(expected if valid else expected.replace('10001', '10003'))
+                p = Protocol(ctx, dict(id='LC13'), engine='LMCACHE_SGLANG')
+                def cmdline(path):
+                    args = server if path.parts[-2] == '10' else engine
+                    return ('\0'.join(args) + '\0').encode()
+                with mock.patch('rows.lmcache.live_identities', return_value=identities), \
+                     mock.patch('rows.lmcache.listening_sockets', return_value=[dict(port=10001), dict(port=10002)]), \
+                     mock.patch('rows.lmcache.cache_ledger', return_value=dict(rpc_port=10001, http_port=10002, uncertified=1)), \
+                     mock.patch('rows.lmcache.cache_http', return_value=b'{}'), \
+                     mock.patch.object(Path, 'read_bytes', autospec=True, side_effect=cmdline):
+                    p.rendering('model')
+                self.assertEqual(bool(p.failures), not valid)
+                self.assertEqual(p.records[-1]['connector']['config_matches'], valid)
+                self.assertNotIn(str(config), json.dumps(p.records))
+
+    # T45 / ADR0034: full preservation rows request a fresh baseline and source-build target.
+    def test_setup_selects_fresh_vllm_preservation_environments_only_when_needed(self):
+        import subprocess
+        (self.root / 'session').mkdir()
+        script = '''
+source "$1"
+export HOME=$2 V020=$2/session BIN=$2/session/bin EVIDENCE=$2/session/evidence
+ONLY=$3
+v020_setup_tools() { printf 'BASE=%s\\nCACHE=%s\\nGUARD=%s\\n' "$VLLM_034" "$LMCACHE_VLLM_034" "$LMCACHE"; exit 0; }
+setup
+'''
+        for selection, selected in [('all', True), ('lc13', True), ('LC16U', True),
+                                    ('EM1,LC15', True), ('EM1', False)]:
+            with self.subTest(selection=selection):
+                result = subprocess.run(
+                    ['bash', '-c', script, 'setup', str(Path(__file__).with_name('setup.sh')),
+                     str(self.root), selection], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                mapping = dict(line.split('=', 1) for line in result.stdout.splitlines())
+                self.assertEqual(mapping['BASE'], str(self.root / 'session/engines/vllm-0.34.0rc1-venv') if selected else '')
+                self.assertEqual(mapping['CACHE'], str(self.root / 'session/engines/vllm-0.34.0rc1-lmcache057-venv') if selected else '')
+                self.assertEqual(mapping['GUARD'], str(self.root / 'session/engines/vllm-0.33.0-lmcache-venv'))
 
     def test_native_sglang_embedding_setting_does_not_require_cli_argv(self):
         from rows.measurements import argv_settings

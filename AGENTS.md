@@ -124,7 +124,7 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   above (no new environments beyond the listed exceptions) still apply to the lab
   hosts.
 - Do not change engine environments, drivers, or reboot hosts. The engine virtual
-  environments in use, all owner-approved (list updated 2026-11-10):
+  environments in use, all owner-approved (list updated 2026-11-11):
   - both hosts: SGLang 0.5.21, SGLang 0.5.22 (approved 2026-10-17, for decision
     models), vLLM 0.30.0, TensorFold 0.6.5 and TensorFold 0.6.6
     (on host B, each TensorFold venv is a byte-identical copy of host A's, made with
@@ -183,10 +183,14 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     `scripts/live/multi-gpu/run.sh`, with their fingerprints recorded with the rows.
   - the rented one-GPU machine for 0.2.0 (owner decision 2026-11-10), for its one
     session only: fresh x86_64 CUDA installs of vLLM 0.32.0 and 0.33.0, SGLang 0.5.22
-    and 0.5.23 (and an editable SGLang 0.5.23 for #235), LMCache in a copy of one
-    engine's environment, the llama.cpp v0.9.0 build, TensorFold native 1.1.5 and
-    1.2.6 (x86_64 release archives) and TensorRT-LLM, made and removed by
-    `scripts/live/v020/run.sh`, with their fingerprints recorded with the rows.
+    and 0.5.23 (and an editable SGLang 0.5.23 for #235), LMCache source-built
+    separately against the vLLM and SGLang environments' installed torch, the
+    llama.cpp v0.9.0 build, TensorFold native 1.1.5 and 1.2.6 (x86_64 release
+    archives) and TensorRT-LLM, made and removed by `scripts/live/v020/run.sh`,
+    with their fingerprints recorded with the rows. Owner decision 2026-11-11,
+    item 4 option A, additionally approves a fresh vLLM 0.34.0rc1 environment
+    and LMCache 0.5.7 source-built against its own torch, without build
+    isolation and with engine constraints, for LC13–LC16 preservation checks.
 
   Use these as they are. Do not create or modify any engine environment without the
   owner's explicit approval, and add each approved one to this list.

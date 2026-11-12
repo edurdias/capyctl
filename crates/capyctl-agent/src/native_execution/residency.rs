@@ -885,12 +885,29 @@ impl NativeHostExecution {
             .map_err(|_| SessionError)?;
         let served = effective.routes.first().cloned().ok_or(SessionError)?;
         Ok(match effective.profile.engine {
-            Engine::Vllm => Driver::Vllm(Box::new(self.vllm_adapter(
-                &effective,
-                plan,
-                Some(&keys),
-                &served,
-            )?)),
+            Engine::Vllm => {
+                // ADR 0034: no wire field or version guess. The journal
+                // proves this retained launch really connected to LMCache;
+                // the local source check proves sleep may preserve it.
+                // Restart-only parking never calls sleep and needs no
+                // preserving sleep API, including on older vLLM.
+                let active = effective.residency.parks()
+                    && self
+                        .journal
+                        .lmcache_on(&owner.identity.command_id)
+                        .unwrap_or(false);
+                let preserve = active
+                    && crate::lmcache_install::vllm_sleep_preservation(std::path::Path::new(
+                        &effective.profile.executable,
+                    ));
+                if active && !preserve {
+                    return Err(SessionError);
+                }
+                Driver::Vllm(Box::new(
+                    self.vllm_adapter(&effective, plan, Some(&keys), &served)?
+                        .with_preserved_lmcache(preserve),
+                ))
+            }
             Engine::Sglang => {
                 let journal = self.journal.clone();
                 let handle = owner.identity.command_id.clone();

@@ -143,6 +143,8 @@ pub enum LmcacheReport {
 pub struct LmcacheState {
     launch: Mutex<Option<LmcacheLaunch>>,
     report: Mutex<Option<LmcacheReport>>,
+    /// ADR 0034: source-recognized vLLM preservation, local to this launch.
+    vllm_preserves_sleep: std::sync::atomic::AtomicBool,
 }
 
 impl LmcacheState {
@@ -151,6 +153,7 @@ impl LmcacheState {
         Arc::new(Self {
             launch: Mutex::new(Some(launch)),
             report: Mutex::new(None),
+            vllm_preserves_sleep: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -224,6 +227,20 @@ impl LmcacheState {
     /// engine became Ready connected to it).
     pub fn is_on(&self) -> bool {
         matches!(self.report(), Some(LmcacheReport::On { .. }))
+    }
+
+    /// ADR 0034 (2026-11-11): set only from the launch-time source check.
+    pub fn set_vllm_preserves_sleep(&self, recognized: bool) {
+        self.vllm_preserves_sleep
+            .store(recognized, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Preservation is used only while the recognized launch is actually on.
+    pub fn vllm_preserves_sleep(&self) -> bool {
+        self.is_on()
+            && self
+                .vllm_preserves_sleep
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn set_report(&self, report: LmcacheReport) {

@@ -227,7 +227,7 @@ impl LmcacheOffReason {
             Self::VersionUnsupported => "LMCache 0.5.6 or a later 0.5.x release is needed",
             Self::CheckFailed => "the launch-time check of the LMCache installation failed",
             Self::SleepClearsCache => {
-                "vLLM sleep clears the external LMCache cache; LMCache cannot survive this park"
+                "the engine clears the external LMCache cache or its sleep-preservation path is unrecognized"
             }
             Self::GroupUnsupported => "a deployment with a topology does not use LMCache",
             Self::MultiGpuUnqualified => "not qualified for a model on several GPUs of one host",

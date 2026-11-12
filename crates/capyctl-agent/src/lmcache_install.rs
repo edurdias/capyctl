@@ -71,6 +71,10 @@ pub struct LmcacheInstall {
     /// and the drift shown; refuse: the launch is refused
     /// `installation_drift`) and journals it.
     pub drifted: bool,
+    /// ADR 0034 (2026-11-11): this launch's vLLM sleep chain accepts
+    /// `reset_connector=false` and drains pending stores before discarding KV.
+    /// Launch-local evidence only; never a protocol capability or qualification.
+    pub vllm_preserves_lmcache: bool,
 }
 
 /// A failing launch-time check: LMCache is off for the launch.
@@ -214,15 +218,18 @@ pub fn check_lmcache(
     if capyctl_config::lmcache::transfer_mode(residency) == TransferMode::EngineDriven {
         shape.engine_driven(engine);
     }
-    let sleep_clears_cache =
-        engine == Engine::Vllm && residency.parks() && shape.vllm_sleep_clears_cache();
+    let preserves_sleep = !residency.parks()
+        || match engine {
+            Engine::Vllm => vllm_preserves_lmcache(&engine_site),
+            _ => sglang_preserves_lmcache(&engine_site),
+        };
     if !shape.missing.is_empty() {
         return Err(LmcacheCheckFailure::check_failed(shape.missing.join("; ")));
     }
-    if sleep_clears_cache {
+    if !preserves_sleep {
         return Err(LmcacheCheckFailure::new(
             LmcacheOffReason::SleepClearsCache,
-            "vllm/v1/engine/core.py: vLLM sleep clears the external LMCache cache; \
+            "sleep clears the external LMCache cache or its preservation chain is unrecognized; \
              this installation cannot retain LMCache through deep or host_backed parking",
         ));
     }
@@ -233,6 +240,7 @@ pub fn check_lmcache(
         version,
         drifted: digest != registered.digest,
         digest,
+        vllm_preserves_lmcache: engine == Engine::Vllm && residency.parks() && preserves_sleep,
     })
 }
 
@@ -575,35 +583,6 @@ impl Shape<'_> {
         }
     }
 
-    /// ADR 0034, amendment of 2026-11-10 (LC15): the known vLLM sleep
-    /// cascade clears external connectors as well as its discarded local KV.
-    /// There is no preserve-external option in that sleep API or LMCache's
-    /// CLEAR handler. Reject the installed shape, not a version guess.
-    fn vllm_sleep_clears_cache(&mut self) -> bool {
-        const CORE: &str = "vllm/v1/engine/core.py";
-        let Some(text) = self.optional(self.engine, CORE) else {
-            return false;
-        };
-        let method = |header: &str| {
-            block_body(&text, header)
-                .map(compact_code)
-                .unwrap_or_default()
-        };
-        let sleep = method("    def sleep");
-        let pause = method("    def _finish_pause");
-        let reset = method("    def _reset_caches");
-        let reset_signature = text
-            .split_once("    def _reset_caches(")
-            .and_then(|(_, rest)| rest.split_once(')'))
-            .map(|(signature, _)| compact_code(signature))
-            .unwrap_or_default();
-        sleep.contains("clear_prefix_cache=level>=1")
-            && sleep.contains("self.pause_scheduler(mode=mode,clear_cache=clear_prefix_cache)")
-            && pause.contains("self._reset_caches()")
-            && reset_signature.contains("reset_connector:bool=True")
-            && reset.contains("reset_connector=reset_connector")
-    }
-
     /// ADR 0034 §1: what engine-driven transfer needs, verified only for a
     /// launch that renders it. The server's `--supported-transfer-mode`
     /// offers `engine_driven` (`lmcache/v1/multiprocess/config.py`); vLLM's
@@ -664,6 +643,96 @@ impl Shape<'_> {
             }
         }
     }
+}
+
+/// ADR 0034: retained host drivers re-read the local sleep chain without
+/// rehashing the LMCache package or changing any protocol/durable state.
+pub fn vllm_sleep_preservation(executable: &Path) -> bool {
+    site_packages(Engine::Vllm, executable).is_ok_and(|site| vllm_preserves_lmcache(&site))
+}
+
+/// ADR 0034, owner decision 2026-11-11: recognize the entire upstream
+/// preservation chain, not a version string or a route parameter alone.
+fn vllm_preserves_lmcache(site: &Path) -> bool {
+    let source = |path: &str| read_source(&site.join(path)).unwrap_or_default();
+    let route = source("vllm/entrypoints/serve/dev/sleep/api_router.py");
+    let asynchronous = source("vllm/v1/engine/async_llm.py");
+    let client = source("vllm/v1/engine/core_client.py");
+    let core = source("vllm/v1/engine/core.py");
+    let scheduler = source("vllm/v1/core/sched/scheduler.py");
+    let method = |text: &str, class: &str, name: &str| {
+        class_body(text, class)
+            .and_then(|body| block_body(body, &format!("    def {name}")))
+            .map(compact_code)
+            .unwrap_or_default()
+    };
+    let sleep_route = block_body(&route, "async def sleep")
+        .map(compact_code)
+        .unwrap_or_default();
+    let async_sleep = class_body(&asynchronous, "AsyncLLM")
+        .and_then(|body| block_body(body, "    async def sleep"))
+        .map(compact_code)
+        .unwrap_or_default();
+    let client_sleep = class_body(&client, "AsyncMPClient")
+        .and_then(|body| block_body(body, "    async def sleep_async"))
+        .map(compact_code)
+        .unwrap_or_default();
+    let sleep = method(&core, "EngineCore", "sleep");
+    let pause = method(&core, "EngineCore", "pause_scheduler");
+    let proc_pause = method(&core, "EngineCoreProc", "pause_scheduler");
+    let finish = method(&core, "EngineCore", "_finish_pause");
+    let reset = method(&core, "EngineCore", "_reset_caches");
+    let scheduler_reset = method(&scheduler, "Scheduler", "reset_prefix_cache");
+    let scheduler_requests = method(&scheduler, "Scheduler", "has_requests");
+    compact_code(&route).contains("@router.post(\"/sleep\")")
+        && sleep_route.contains("reset_connector:Annotated[bool,Query()]=True")
+        && sleep_route.contains("engine_client(raw_request).sleep(level,mode,reset_connector)")
+        && async_sleep.contains("self.engine_core.sleep_async(level,mode,reset_connector)")
+        && client_sleep.contains("self.call_utility_async(\"sleep\",level,mode,reset_connector)")
+        && sleep.contains("clear_prefix_cache=level>=1")
+        && sleep.contains("self.pause_scheduler(mode=mode,clear_cache=clear_prefix_cache,reset_connector=reset_connector,)")
+        && sleep.contains("model_executor.sleep(level)")
+        && pause.contains("ifclear_cacheandnotreset_connector:")
+        && pause.contains("whileself.scheduler.has_requests()orself.batch_queue:")
+        && pause.contains("self.post_step(model_executed)")
+        && pause.contains("self._finish_pause(clear_cache,reset_connector)")
+        && proc_pause.contains("ifself._pause_complete():")
+        && proc_pause.contains("engine._finish_pause(clear_cache,reset_connector)")
+        && proc_pause.contains("self._idle_state_callbacks.append(")
+        && method(&core, "EngineCoreProc", "_pause_complete").contains("returnnotself.has_work()")
+        && method(&core, "EngineCoreProc", "has_work").contains("self.scheduler.has_requests()")
+        && scheduler_requests.contains("self.connector.has_pending_push_work()")
+        && scheduler_requests.contains("self.has_finished_requests()")
+        && method(&scheduler, "Scheduler", "has_finished_requests").contains("len(self.requests)>(num_running+num_waiting)")
+        && finish.contains("self._reset_caches(reset_connector=reset_connector)")
+        && reset.contains("reset_connector=reset_connector")
+        && method(&core, "EngineCore", "reset_prefix_cache")
+            .contains("self.scheduler.reset_prefix_cache(reset_running_requests,reset_connector)")
+        && scheduler_reset.contains("ifreset_connector:reset_successful=self.reset_connector_cache()")
+}
+
+/// ADR 0034: SGLang's recognized non-clearing reset completes pending
+/// transfers and clears only local flow state. Unknown shapes stay closed.
+fn sglang_preserves_lmcache(site: &Path) -> bool {
+    let Ok(text) = read_source(
+        &site.join("sglang/srt/mem_cache/storage/lmcache/lmcache_unified_radix_cache.py"),
+    ) else {
+        return false;
+    };
+    let Some(reset) = class_body(&text, "LMCacheUnifiedRadixCache")
+        .and_then(|body| block_body(body, "    def reset"))
+    else {
+        return false;
+    };
+    let reset = compact_code(reset);
+    reset.contains("pending.operation.future.result(timeout=connector.operation_timeout)")
+        && reset.contains("connector.complete_store(pending.operation,synchronize=False)")
+        && reset.contains("connector.complete_load(flow.load,synchronize=False)")
+        && reset.contains("self._pending_stores.clear()")
+        && reset.contains("connector.end_all_sessions()")
+        && reset.contains("super().reset()")
+        && !reset.contains("connector.reset")
+        && !reset.contains("connector.clear")
 }
 
 /// Whether `flag` is declared as a quoted option name.

@@ -392,6 +392,9 @@ impl InstallationGate {
         .map_err(|_| RuntimeError::Uncertain("LMCache was not checked".into()))?;
         match checked {
             Ok(install) => {
+                lmcache
+                    .state
+                    .set_vllm_preserves_sleep(install.vllm_preserves_lmcache);
                 let drift = lmcache
                     .registered
                     .as_ref()
@@ -1130,6 +1133,7 @@ mod tests {
             std::fs::write(dir.path().join("bin").join(program), "").unwrap();
         }
         copy_tree(&fixtures.join("vllm-0.32.0"), &site);
+        copy_tree(&fixtures.join("vllm-0.34.0rc1"), &site);
         copy_tree(&fixtures.join("lmcache-0.5.6"), &site);
         let dist = site.join("lmcache-0.5.6.dist-info");
         std::fs::create_dir_all(&dist).unwrap();
@@ -1427,87 +1431,94 @@ mod tests {
         }
     }
 
-    // T45 (ADR 0034, LC15 amendment): a known destructive sleep path is off
-    // under auto and refused under required, without disabling restart parking.
+    // T45 (ADR 0034, 2026-11-11): a recognized preservation chain admits
+    // required and auto, but only active LMCache enables the sleep query.
+    // Clearing/unknown source stays off under auto and refused under required.
     #[tokio::test]
-    async fn sleep_clears_cache_is_off_for_auto_and_refused_for_required() {
+    async fn sleep_source_shape_controls_required_auto_and_preservation() {
         use capyctl_adapters::lmcache::{LmcacheLaunch, LmcacheReport, LmcacheState, ServerPlan};
         use capyctl_config::lmcache::LmcacheOffReason;
-        let (_state_dir, owner) = owned_state();
-        let (env, executable, site) = lmcache_venv();
-        let core = site.join("vllm/v1/engine/core.py");
-        std::fs::create_dir_all(core.parent().unwrap()).unwrap();
-        std::fs::write(
-            core,
-            r#"class EngineCore:
-    def _reset_caches(self, reset_connector: bool = True):
-        self.reset_prefix_cache(reset_connector=reset_connector)
-    def _finish_pause(self, clear_cache):
-        if clear_cache:
-            self._reset_caches()
-    def sleep(self, level=1, mode="abort"):
-        clear_prefix_cache = level >= 1
-        self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)
-"#,
-        )
-        .unwrap();
-        let registered = capyctl_agent::lmcache_install::measure_lmcache(
-            &capyctl_agent::installation::InstallationMeasurer::new(),
-            &executable,
-        )
-        .unwrap()
-        .unwrap()
-        .registration();
-        let installation = Arc::new(EmbeddedInstallation::register(
-            "local",
-            Engine::Vllm,
-            &executable,
-            None,
-        ));
-        for residency in [
-            Residency::Deep,
-            Residency::HostBacked,
-            Residency::RestartOnly,
+        let fixtures =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../capyctl-agent/tests/fixtures/lmcache");
+        for (source, preserves) in [
+            ("vllm-0.34.0rc1/vllm/v1/engine/core.py", true),
+            ("vllm-0.33.0/vllm/v1/engine/core.py", false),
+            ("", false),
         ] {
-            for required in [false, true] {
-                let state = LmcacheState::new(LmcacheLaunch::Start(ServerPlan {
-                    transfer: capyctl_config::lmcache::transfer_mode(residency),
-                    ..server_plan(env.path())
-                }));
-                let gate = InstallationGate {
-                    inner: Arc::new(NeverInitialized),
-                    owner: owner.clone(),
-                    installation: installation.clone(),
-                    policy: InstallationDrift::Refuse,
-                    host: "host".into(),
-                    lmcache: Some(LmcacheCheck {
-                        state: state.clone(),
-                        required,
-                        registered: Some(registered.clone()),
-                        residency,
-                    }),
-                };
-                let verdict = gate.admitted().await;
-                if !residency.parks() {
-                    assert!(verdict.is_ok(), "{verdict:?}");
-                    assert!(state.launch().is_some());
-                } else if required {
-                    assert!(matches!(
-                        verdict,
-                        Err(RuntimeError::Refused(code))
-                            if code == "lmcache_unavailable:sleep_clears_cache"
-                    ));
-                } else {
-                    assert!(verdict.is_ok(), "{verdict:?}");
-                    assert!(state.launch().is_none());
-                    assert!(matches!(
-                        state.report(),
-                        Some(LmcacheReport::Off {
-                            reason: LmcacheOffReason::SleepClearsCache,
-                            detail,
-                            ..
-                        }) if detail.contains("sleep clears the external LMCache cache")
-                    ));
+            let (_state_dir, owner) = owned_state();
+            let (env, executable, site) = lmcache_venv();
+            let text = if source.is_empty() {
+                String::new()
+            } else {
+                std::fs::read_to_string(fixtures.join(source)).unwrap()
+            };
+            std::fs::write(site.join("vllm/v1/engine/core.py"), text).unwrap();
+            let registered = capyctl_agent::lmcache_install::measure_lmcache(
+                &capyctl_agent::installation::InstallationMeasurer::new(),
+                &executable,
+            )
+            .unwrap()
+            .unwrap()
+            .registration();
+            let installation = Arc::new(EmbeddedInstallation::register(
+                "local",
+                Engine::Vllm,
+                &executable,
+                None,
+            ));
+            for residency in [
+                Residency::Deep,
+                Residency::HostBacked,
+                Residency::RestartOnly,
+            ] {
+                for required in [false, true] {
+                    let state = LmcacheState::new(LmcacheLaunch::Start(ServerPlan {
+                        transfer: capyctl_config::lmcache::transfer_mode(residency),
+                        ..server_plan(env.path())
+                    }));
+                    let gate = InstallationGate {
+                        inner: Arc::new(NeverInitialized),
+                        owner: owner.clone(),
+                        installation: installation.clone(),
+                        policy: InstallationDrift::Refuse,
+                        host: "host".into(),
+                        lmcache: Some(LmcacheCheck {
+                            state: state.clone(),
+                            required,
+                            registered: Some(registered.clone()),
+                            residency,
+                        }),
+                    };
+                    let verdict = gate.admitted().await;
+                    if preserves || !residency.parks() {
+                        assert!(verdict.is_ok(), "{source}: {verdict:?}");
+                        assert!(state.launch().is_some());
+                        assert!(!state.vllm_preserves_sleep(), "not active yet");
+                        state.record(LmcacheReport::On {
+                            server: Vec::new(),
+                            rpc_port: 25001,
+                            http_port: 25002,
+                            pool_bytes: 1 << 30,
+                        });
+                        assert_eq!(state.vllm_preserves_sleep(), preserves && residency.parks());
+                        state.turn_off(LmcacheOffReason::EngineStartFailed, "off".into());
+                        assert!(!state.vllm_preserves_sleep());
+                    } else if required {
+                        assert!(matches!(
+                            verdict, Err(RuntimeError::Refused(code))
+                                if code == "lmcache_unavailable:sleep_clears_cache"
+                        ));
+                    } else {
+                        assert!(verdict.is_ok(), "{verdict:?}");
+                        assert!(state.launch().is_none());
+                        assert!(matches!(
+                            state.report(),
+                            Some(LmcacheReport::Off {
+                                reason: LmcacheOffReason::SleepClearsCache,
+                                ..
+                            })
+                        ));
+                    }
                 }
             }
         }

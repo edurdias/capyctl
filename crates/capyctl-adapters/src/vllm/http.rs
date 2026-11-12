@@ -232,11 +232,21 @@ impl EngineHttp {
         Ok(ids)
     }
 
-    /// `POST /sleep?level=N`, bounded by the caller's operation window.
-    /// A transport failure after dispatch maps to `Uncertain` — the effect
-    /// may or may not have been applied.
-    pub async fn sleep(&self, level: u8, timeout: Duration) -> Result<SleepOutcome, HttpError> {
-        let url = self.url(&format!("/sleep?level={level}"));
+    /// `POST /sleep?level=N`, optionally preserving a recognized active
+    /// LMCache connector (ADR 0034), bounded by the caller's operation window.
+    /// A transport failure after dispatch maps to `Uncertain`.
+    pub async fn sleep(
+        &self,
+        level: u8,
+        preserve_lmcache: bool,
+        timeout: Duration,
+    ) -> Result<SleepOutcome, HttpError> {
+        let query = if preserve_lmcache {
+            format!("/sleep?level={level}&reset_connector=false")
+        } else {
+            format!("/sleep?level={level}")
+        };
+        let url = self.url(&query);
         let req = self.admin_auth(self.client.post(url)).timeout(timeout);
         self.post_outcome(req, "sleep")
             .await

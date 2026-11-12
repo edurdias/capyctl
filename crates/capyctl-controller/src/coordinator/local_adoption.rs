@@ -157,9 +157,23 @@ pub(super) fn factory(
                     Some(capyctl_adapters::lmcache::LmcacheLaunch::Start(plan))
                         if !server.is_empty() =>
                     {
-                        Some(capyctl_adapters::lmcache::LmcacheState::attached(
-                            server, plan,
-                        ))
+                        let state = capyctl_adapters::lmcache::LmcacheState::attached(server, plan);
+                        // ADR 0034 (2026-11-11): preservation evidence is
+                        // launch-local, so adoption re-reads the installed
+                        // shape; it never guesses from the saved version.
+                        let effective = work.effective();
+                        if effective.residency.parks() {
+                            let install = capyctl_agent::lmcache_install::check_lmcache(
+                                &capyctl_agent::installation::InstallationMeasurer::new(),
+                                effective.profile.engine,
+                                std::path::Path::new(&effective.profile.executable),
+                                effective.profile.lmcache.as_ref(),
+                                effective.residency,
+                            )
+                            .map_err(|failure| CoordinatorError::Service(failure.to_string()))?;
+                            state.set_vllm_preserves_sleep(install.vllm_preserves_lmcache);
+                        }
+                        Some(state)
                     }
                     _ => None,
                 };
@@ -182,6 +196,22 @@ pub(super) fn factory(
             },
         );
         let engine = bindings.adapter(declared, spec, tools.clone())?;
+        // T45 / ADR 0034, SPEC §9.1: preserved external KV is valid only
+        // with the same weights. Adoption must keep the ordinary launch's
+        // checkpoint-before-Restore gate, not merely its capability gate.
+        let engine = if lmcache.is_some() && work.effective().residency.parks() {
+            match bindings.checkpoint_verifier() {
+                Some(checkpoints) => crate::checkpoint_digests::CheckpointGate::new(
+                    engine,
+                    owner.clone(),
+                    checkpoints,
+                    work,
+                ) as Arc<dyn EngineAdapter>,
+                None => engine,
+            }
+        } else {
+            engine
+        };
         // SPEC §§6.2, 9.1: an adopted launch (one started before the rule
         // reached this host) is refused its Park and Restore as a fresh one is.
         let engine = crate::capability_gate::CapabilityGate::wrap(engine, work.effective());
