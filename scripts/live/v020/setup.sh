@@ -35,8 +35,9 @@ Setup (rented x86_64 VM only; approximately 60 minutes, downloads/installations 
      pinned to tag commit 52aeb580658571613f8ab28a075a06fa30279beb and SHA256.
   7. Recreate separate vLLM 0.33 (clearing guard) and SGLang 0.5.23 environments;
      source-build LMCache ${LMCACHE_VERSION:-0.5.7} against their exact torch.
-     vLLM 0.34 + LMCache is unavailable: opentelemetry-api >=1.45.1 conflicts
-     with LMCache <=1.40.0. Its arm skips; do not override declarations.
+     Also source-build LMCache 0.5.7 for vLLM 0.34 with the owner-approved,
+     test-only uv override: OTel 1.45.1 and Prometheus exporter 0.66b1.
+     Verify import and bounded loopback MP startup/metrics; record the exception.
      Tracing fixtures additionally create separate vLLM 0.33.0 and SGLang 0.5.23
      environments with API/SDK/OTLP exporter 1.39.1 (within engine declarations),
      and a separate SGLang 0.5.23 without its tracing extra for OT10.
@@ -415,13 +416,23 @@ PY
 v020_install_lmcache() {
   local key=$1 base_key=$2 engine=$3 destination=${!1} baseline=${!2}
   [ -n "$destination" ] || return 0
-  if [ "$base_key" = VLLM_034 ]; then
-    v020_setup_error "$(PYTHONPATH="$HERE" python3 -c 'from release_pins import LMCACHE_034_CONFLICT; print(LMCACHE_034_CONFLICT)')"
+  if [ "$base_key" = VLLM_034 ] && [ "${LMCACHE_VERSION:-0.5.7}" != 0.5.7 ]; then
+    v020_setup_error 'vLLM 0.34 test-only override requires LMCache 0.5.7'
     return 1
   fi
   [ -z "${V020_OVERRIDES[$key]:-}" ] || { v020_freeze "$destination" "$key"; return; }
   [ -n "$baseline" ] || { v020_setup_error 'LMCache recreation requires its baseline engine'; return 1; }
   local version=${LMCACHE_VERSION:-0.5.7} constraints=$V020/downloads/$key-engine-constraints.txt
+  local -a overrides=()
+  if [ "$base_key" = VLLM_034 ]; then
+    local override_file=$EVIDENCE/$key.uv-overrides.txt
+    PYTHONPATH="$HERE" "$V020/tools/bin/python" - "$override_file" <<'PY'
+import pathlib,sys
+from release_pins import LMCACHE_034_OVERRIDES
+pathlib.Path(sys.argv[1]).write_text("".join(f"{name}=={version}\n" for name,version in LMCACHE_034_OVERRIDES.items()))
+PY
+    overrides=(--override "$override_file")
+  fi
   v020_venv "$destination"
   # Reinstall instead of cp -a: copied console scripts retain old absolute shebangs.
   v020_cmd "$BIN/uv" pip install --python "$destination/bin/python" --prerelease=allow --torch-backend=cu130 \
@@ -445,7 +456,7 @@ PY
   v020_cmd env TORCH_CUDA_ARCH_LIST="$(v020_cuda_arch torch)" BUILD_WITH_CUDA=1 LMCACHE_CUDA_MAJOR=13 \
     SETUPTOOLS_SCM_PRETEND_VERSION="$version" "$BIN/uv" --no-cache pip install \
     --python "$destination/bin/python" --prerelease=allow --torch-backend=cu130 \
-    --no-build-isolation --constraint "$constraints" \
+    --no-build-isolation --constraint "$constraints" "${overrides[@]}" \
     "$V020/downloads/lmcache-$version.tar.gz"
   v020_freeze "$destination" "$key"
   "$V020/tools/bin/python" - "$EVIDENCE/$key.before.fingerprint.json" \
@@ -467,6 +478,22 @@ diff={
 }
 pathlib.Path(sys.argv[3]).write_text(json.dumps(diff,sort_keys=True,indent=2)+"\n")
 PY
+  if [ "$base_key" = VLLM_034 ]; then
+    PYTHONPATH="$HERE" "$V020/tools/bin/python" - "$EVIDENCE" "$key" <<'PY'
+import json,pathlib,sys
+from release_pins import lmcache_034_provenance
+evidence=pathlib.Path(sys.argv[1]); key=sys.argv[2]
+packages=json.loads((evidence/f"{key}.fingerprint.json").read_text())["packages"]
+source=json.loads((evidence/"lmcache-source.fingerprint.json").read_text())
+provenance=lmcache_034_provenance(packages,source)
+provenance.update(fingerprint=f"{key}.fingerprint.json",freeze_diff=f"{key}.freeze-diff.json",
+                  overrides_file=f"{key}.uv-overrides.txt",startup=f"{key}.startup.json")
+(evidence/f"{key}.dependency-override.json").write_text(json.dumps(provenance,sort_keys=True,indent=2)+"\n")
+PY
+    v020_cmd env PYTHONPATH="$HERE" "$V020/tools/bin/python" -c \
+      'from pathlib import Path; import sys; from release_pins import verify_lmcache_startup; verify_lmcache_startup(Path(sys.argv[1]),Path(sys.argv[2]),sys.argv[3])' \
+      "$destination" "$EVIDENCE" "$key"
+  fi
 }
 
 v020_tensorfold_baseline() {
@@ -888,7 +915,8 @@ PY
     v020_trt_availability "$key" false 'TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11)'
   done
   printf '%s\n' 'TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11)' >"$EVIDENCE/tensorrt-availability.txt"
-  # Artifact checks only; no engine serving, inference, or qualification in setup.
+  # Artifact checks only below; the LMCache override's model-free MP smoke
+  # above does not run an inference engine or establish qualification.
   for key in "${!V020_PATHS[@]}"; do
     value=${!key}
     if [ -n "$value" ] && [ ! -e "$value" ]; then

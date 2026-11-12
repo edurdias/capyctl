@@ -713,10 +713,32 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         self.assertEqual(result['cached_tokens'], 0)
         self.assertEqual(p.failures, [])
 
-    # T45: dependency-conflicted vLLM arm skips; SGLang still runs in full.
-    def test_cache_rows_skip_dependency_conflict_without_losing_sglang_protocol(self):
+    # T45 / ADR0034: a lookup-only metric must not qualify a retrieved hit.
+    def test_cache_hit_requires_requested_and_retrieved_counters(self):
+        from unittest import mock
+        from rows.lmcache import Protocol
+        for counters in (dict(lookup_hit_tokens=32000,lookup_requested_tokens=32064),
+                         dict(lookup_hit_tokens=32000,num_chunks_loaded=125)):
+            ctx = v020.Context(self.root, {}, functional_only=True)
+            ctx.row_id, ctx.deadline = 'LC13', 0
+            ctx.request = lambda *args, **kwargs: dict(status=200, done=True, chunks=[
+                json.dumps(dict(choices=[dict(delta=dict(content='123456'))],
+                                usage=dict(prompt_tokens=32064))), '[DONE]'])
+            p = Protocol(ctx, dict(id='LC13'), engine='LMCACHE_VLLM_034')
+            with mock.patch('rows.lmcache.metrics', side_effect=[{}, counters]):
+                p.request('on', dict(messages=[],whole_chunk_tokens=32000,sha256='fixture'),
+                          'post-wake', cache=True, hit=True)
+            self.assertTrue(any('requested-token' in failure or 'not retrieved' in failure
+                                for failure in p.failures))
+
+    # T45 / ADR0034: the owner-approved override arm runs the full protocol.
+    def test_cache_rows_run_both_preserving_arms_with_recorded_override(self):
         from unittest import mock
         from rows import lmcache
+        override = dict(reason="owner-approved test-only cap override",
+                        installed_packages={"opentelemetry-api": "1.45.1"})
+        (self.root / "evidence").mkdir()
+        (self.root / "evidence" / "LMCACHE_VLLM_034.dependency-override.json").write_text(json.dumps(override))
         for row_id, full in [('LC13', 'correctness'), ('LC14', 'endurance'),
                              ('LC15', 'correctness'), ('LC16', 'costs')]:
             for unified in (False, True):
@@ -735,12 +757,16 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
                          mock.patch.object(lmcache, 'fixtures', return_value=dict(versions={}, fixtures={})), \
                          mock.patch.object(lmcache, full, side_effect=protocol):
                         result = lmcache.run(ctx, dict(id=ctx.row_id))
-                    self.assertEqual(result['verdict'], 'skip')
-                    self.assertIn('opentelemetry-api>=1.45.1', result['reason'])
-                    self.assertEqual(selected, [('LMCACHE_SGLANG', row_id == 'LC15')])
+                    self.assertEqual(result['verdict'], 'pass')
+                    self.assertEqual(selected, [('LMCACHE_VLLM_034', row_id == 'LC15'),
+                                                ('LMCACHE_SGLANG', row_id == 'LC15')])
                     self.assertEqual(guarded, [
                         ('LMCACHE', False, 'server' if row_id == 'LC15' else 'standalone'),
+                        ('LMCACHE_VLLM_034', True, 'server' if row_id == 'LC15' else 'standalone'),
                         ('LMCACHE_SGLANG', True, 'server' if row_id == 'LC15' else 'standalone')])
+                    records = [record for record in result['evidence'] if record['engine'] == 'LMCACHE_VLLM_034']
+                    self.assertTrue(records)
+                    self.assertTrue(all(record['dependency_override'] == override for record in records))
 
     # T45 / ADR0034 amendment: a preserving version with clearing source is not qualified.
     def test_cache_row_does_not_replace_full_protocol_with_a_source_refusal(self):
@@ -755,12 +781,12 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         self.assertIn('sleep_clears_cache', result['reason'])
         full.assert_not_called()
 
-    # T45 / ADR0034: native SGLang uses its own reporting option, never vLLM's.
+    # T45 / SPEC §17: SGLang reporting is controller-owned, not an extra.
     def test_cache_protocol_selects_native_reporting_arguments(self):
         from unittest import mock
         from rows.lmcache import Protocol
         for key, flag in [('LMCACHE_VLLM_034', '--enable-prompt-tokens-details'),
-                          ('LMCACHE_SGLANG', '--enable-cache-report')]:
+                          ('LMCACHE_SGLANG', None)]:
             with self.subTest(key=key):
                 ctx = v020.Context(self.root, {})
                 ctx.deploy = mock.Mock()
@@ -770,7 +796,8 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
                         planned='off', planned_reason=None, state='off', reason=None, uncertified=0)):
                     p.deploy('off', 'off')
                 self.assertEqual(ctx.deploy.call_args.args[1], key)
-                self.assertEqual(ctx.deploy.call_args.kwargs['extra']['engine_config']['extra_args'], [flag])
+                config = ctx.deploy.call_args.kwargs['extra']['engine_config']
+                self.assertEqual(config.get('extra_args', []), [flag] if flag else [])
 
     # T45 / ADR0034: SGLang's native public settings and generated YAML are checked.
     def test_cache_rendering_checks_sglang_connector_without_vllm_flags(self):
@@ -802,13 +829,13 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
                 self.assertEqual(p.records[-1]['connector']['config_matches'], valid)
                 self.assertNotIn(str(config), json.dumps(p.records))
 
-    def test_setup_does_not_install_dependency_conflicted_cache_environment(self):
+    def test_setup_installs_owner_approved_preserving_cache_environment(self):
         from setup_selection import dependencies
         for selection in ('all', 'lc13', 'LC16U', 'EM1,LC15', 'EM1'):
             with self.subTest(selection=selection):
-                needed = dependencies(selection)
-                self.assertNotIn('VLLM_034', needed)
-                self.assertNotIn('LMCACHE_VLLM_034', needed)
+                needed = dependencies(selection, unified=selection == 'LC16U')
+                for key in ('VLLM_034', 'LMCACHE_VLLM_034'):
+                    self.assertEqual(key in needed, selection != 'EM1')
 
     def test_native_sglang_embedding_setting_does_not_require_cli_argv(self):
         from rows.measurements import argv_settings

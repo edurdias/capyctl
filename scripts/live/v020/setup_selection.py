@@ -20,6 +20,8 @@ def dependencies(selection='all', unified=False):
             models.add('CLEF' if row.get('decisions') else ('TENSORFOLD' if row['engine'] == 'tensorfold126' else 'CHAT'))
         elif key.startswith('LC'):
             engines = {'LMCACHE', 'LMCACHE_SGLANG'}
+            if key in {'LC13', 'LC14', 'LC15', 'LC16', 'LC13U', 'LC14U', 'LC15U', 'LC16U'}:
+                engines.add('LMCACHE_VLLM_034')
             models.add('CHAT')
             if key in {'LC18', 'LC12'}:
                 needed.add('CAPYCTL_' + key)

@@ -66,11 +66,64 @@ including store retention, salts, footprint and latency bounds as applicable.
 The setup adds `VLLM_034` at
 `$V020/engines/vllm-0.34.0rc1-venv` and `LMCACHE_VLLM_034` at
 `$V020/engines/vllm-0.34.0rc1-lmcache057-venv`; `$V020` defaults to
-`~/capyctl-v020`. LMCache 0.5.7 is built against that fresh engine's installed
-torch, without build isolation and with engine constraints. `LMCACHE`
-remains the vLLM 0.33 guard environment, and `LMCACHE_SGLANG` is the separate
-SGLang 0.5.23 environment. Source shape, not a version label alone, selects
-preservation. No live result or qualified-table row follows from setup.
+`~/capyctl-v020`. LMCache 0.5.7 is source-built separately against that fresh
+engine's installed torch, without build isolation and with exact engine/torch/
+kernel constraints. The owner approved a **test-only dependency override** on
+2026-11-12: `uv --override` pins OpenTelemetry API, SDK and OTLP exporter to
+1.45.1 and Prometheus exporter to 0.66b1 (whose metadata requires SDK
+`~=1.45.1`). This overrides LMCache's API `<=1.40.0` and exporter `<=0.61b0`
+bounds while preserving vLLM's API `>=1.45.1`; it does not bypass dependency
+resolution with `--no-deps`. This environment cannot be obtained by a normal
+resolver install: its upstream dependency declarations conflict. The exception
+applies only to the fresh `LMCACHE_VLLM_034` environment, never a supplied
+read-only mapping or existing engine environment.
+LC13–LC16 (and their unified-memory variants) select the complete preserving
+vLLM arm alongside the vLLM 0.33 guard and SGLang arms.
+
+Setup records `LMCACHE_VLLM_034.uv-overrides.txt` and
+`LMCACHE_VLLM_034.dependency-override.json` under the setup evidence directory:
+the latter retains the owner reason, exact installed packages, torch build
+version, source archive fingerprint, vLLM commit, and links to freeze/diff and
+startup receipts. After installation it checks `import lmcache` (30-second
+bound), then starts a model-free, loopback-only MP server with a 0.125 GiB eager
+pool and engine-driven transfer. Within 90 seconds, `/healthcheck` must succeed
+and `/metrics` must expose LMCache's native
+`lmcache_mp_event_bus_dropped_events_total` observable counter (not merely
+Python process metrics or OTel `target_info`). The server is always stopped
+(10 seconds for termination, then a 5-second kill bound).
+`LMCACHE_VLLM_034.startup.json`, `.startup.metrics.txt`, and sanitized
+`setup.log` retain this smoke evidence. Startup failure fails setup, not a
+dependency-conflict skip. No inference engine is started by this check.
+The startup receipt explicitly records `row_metrics_verified: false`.
+LMCache 0.5.7's [lookup metric subscriber](https://github.com/LMCache/LMCache/blob/v0.5.7/lmcache/v1/mp_observability/subscribers/metrics/lookup.py)
+emits hit/requested counters only on `MP_LOOKUP_PREFETCH_END`, and its
+[engine metric subscriber](https://github.com/LMCache/LMCache/blob/v0.5.7/lmcache/v1/mp_observability/subscribers/metrics/engine.py)
+emits `num_chunks_loaded` only on `MP_RETRIEVE_END` with a positive
+`retrieved_count`. Setup does not synthesize traffic or telemetry to make these
+appear. Qualification rows must validate hit/requested families after an actual
+lookup and the loaded family after an actual positive retrieval. The native
+[EventBus counter](https://github.com/LMCache/LMCache/blob/v0.5.7/lmcache/v1/mp_observability/subscribers/metrics/event_bus.py)
+is observable before traffic; its presence proves the native metrics pipeline,
+not cache hit/retrieval correctness.
+Every record for the vLLM override arm embeds the dependency-override receipt.
+Rows fail if a real request has no hit counter or requested-token increment,
+or if an expected hit has no whole-prompt retrieved-chunk counter.
+
+The first host-A run also exposed fixture errors: SGLang's cache-report flag is
+controller-owned and is no longer passed as an extra option; LC17 states its
+approximately 12.17 GiB cap as `13067437998B`, since the displayed decimal GiB
+is not an integral byte quantity. LC18 takes LMCache-off answers without trying
+to park that restart-only deployment, which has no cache server and cannot park.
+Its cache-on arm still requires all 15 restart parks and full retrieval hits.
+LC12/LC17/LC18 failures retain sanitized controller and engine logs even when a
+failed launch leaves no runtime binding. An empty launch log is not evidence of
+an expected registration failure and does not qualify or pass LC12.
+
+
+`LMCACHE` remains the vLLM 0.33 guard environment, and `LMCACHE_SGLANG` is the
+separate SGLang 0.5.23 environment. Source shape, not a version label alone,
+selects preservation. Neither the override nor its import/startup smoke is
+native qualification or a qualified-table row.
 Embedding render observations accept SGLang's managed native `is_embedding`
 setting; its protected-descriptor launch does not expose an engine CLI flag.
 Every managed host configuration is validated before its process starts;

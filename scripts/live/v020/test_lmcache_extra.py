@@ -34,11 +34,23 @@ class CacheExtraTests(unittest.TestCase):
         self.assertIn(('room3','4GiB',32768,3,True,None,False,True),calls)
         self.assertIn(('room0','1GiB',32768,0,False,None,False,True),calls)
         self.assertIn(('stated','24GiB',32768,15,False,'15GiB',False,False),calls)
+        # T45 / ADR0034 LC17: rounded display GiB is not a valid byte quantity.
+        self.assertIn(('auto32','13067437998B',32768,8,False,None,True,False),calls)
+        self.assertIn(('derived-cap','13067437998B',65536,12,True,None,False,False),calls)
 
     def test_lc17_failure_is_not_masked(self):
         with patch.object(extra,'pool_case',return_value=dict(verdict='fail',reason='missing hit',evidence=[])):
             self.assertEqual(extra.sizing(None,dict(id='LC17'))['verdict'],'fail')
 
+    # T45: startup failures without a binding must retain controller diagnostics.
+    def test_extra_failure_retains_sanitized_logs(self):
+        ctx=SimpleNamespace(save=Mock(),logs=Mock(return_value='sanitized startup error'))
+        with patch.object(extra,'sizing',side_effect=AssertionError('isolated role exited before ready')):
+            result=extra.run(ctx,dict(id='LC17'))
+        self.assertEqual(result['verdict'],'fail')
+        ctx.save.assert_called_once_with('failure-logs',dict(logs='sanitized startup error'))
+
+    # T45 / ADR0034 LC18: off has no server and cannot restart-park.
     def test_lc18_uses_restart_only_and_fifteen_full_hits(self):
         records=[]
         ctx=SimpleNamespace(unified=False)
@@ -64,6 +76,9 @@ class CacheExtraTests(unittest.TestCase):
         self.assertEqual([item[2]['expected'] for item in hits],
                          ['same' if i%2==0 else 'new-'+str(i) for i in range(15)])
         self.assertEqual(p.server_check.call_count,31)
+        self.assertEqual(p.lifecycle.call_count,30)
+        self.assertTrue(all(call.args[1]=='on' for call in p.lifecycle.call_args_list))
+        p.footprint.assert_not_called()
 
     def test_sglang_uses_its_own_offline_version_fingerprint(self):
         ctx=SimpleNamespace(engines={'LMCACHE':'/engine','MODEL_CHAT':'/model'},save=Mock())
