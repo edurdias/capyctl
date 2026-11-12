@@ -188,6 +188,10 @@ other unsalted request to that deployment. CapyCTL does not set a salt on its
 own, and never logs or stores the digest. A salt partitions a cache; it
 authorizes nothing.
 
+TensorRT-LLM is unavailable in 0.2.0; returns in 0.2.x (ADR 0038
+amendment of 2026-11-11; R01, T49). Its behavior below describes the
+retained implementation, not support in 0.2.0.
+
 TensorRT-LLM partitions its KV block reuse by that digest, so
 requests with different salts never reuse each other's blocks. It keeps no
 conversation history: CapyCTL starts it with

@@ -11,7 +11,7 @@ more than one, each in its own environment.
 | SGLang | newest known: 0.5.23 (not yet qualified); verified: 0.5.21, 0.5.20 | `~/venvs/sglang` |
 | TensorFold | 0.6.6, 0.6.5, 0.6.3, 0.6.2, 0.6.1, 0.6.0 | `~/venvs/tensorfold` |
 | llama.cpp | v0.9.0 (newest known), v0.7.0, v0.6.0 (every build lists as `CUSTOM yes` for now) | `~/llama.cpp` (a build, no environment) |
-| TensorRT-LLM | 1.2.1, the 1.3 pre-release, 1.4.0rc3 (every installation lists as `CUSTOM yes` for now) | `~/tensorrt-llm-<version>-venv` |
+| TensorRT-LLM | Unavailable in 0.2.0; returns in 0.2.x | Installation reference below is for the future return |
 
 Another version still runs, but `capyctl engine detect` shows it as
 `CUSTOM yes` ([Custom builds](engines.md#custom-builds)). Pin the version as
@@ -274,12 +274,13 @@ at the release tag.
 
 ## TensorRT-LLM 1.2.1, 1.3 pre-release or 1.4.0rc3
 
-CapyCTL runs TensorRT-LLM's `trtllm-serve` on one GPU. Three
-versions are being qualified, each with its own live rows: 1.2.1, a 1.3
-pre-release (the option tables were read from 1.3.0rc29) and 1.4.0rc3. No
-version has passed its rows yet, so the verified set is empty: every
-TensorRT-LLM installation lists as `CUSTOM yes` and runs as an uncertified
-custom setup. CapyCTL never refuses one for being uncertified.
+**Unavailable in CapyCTL 0.2.0; returns in 0.2.x.** The installation recipe
+below is retained as a future reference, not a way to enable this engine
+in 0.2.0. Registration, local-engine configuration, deployment admission and
+launch refuse it with `engine_unavailable_in_release:tensorrt_llm`; detection
+does not advertise it. Single-process mode in 1.2.1 and 1.4.0rc3 leaves
+`/metrics` iteration statistics empty, blocking KV-pool proof (ADR 0038,
+owner decision 2026-11-11; R01, T49). Custom status does not bypass this gate.
 
 TensorRT-LLM needs an MPI runtime and a complete CUDA developer toolkit.
 On Ubuntu, an administrator can install `libopenmpi-dev` (Open MPI 4.1.6

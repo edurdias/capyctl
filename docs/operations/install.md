@@ -781,10 +781,10 @@ format.
 
 CapyCTL uses engines you install yourself. Register them on the machine that runs them:
 
-    capyctl engine detect [--path DIR]        # lists vLLM/SGLang/TensorFold/TensorRT-LLM environments and llama-server binaries; runs nothing
+    capyctl engine detect [--path DIR]        # lists available engine environments and llama-server binaries; runs nothing; omits TensorRT-LLM in 0.2.0
     capyctl engine add ~/venvs/vllm           # or its bin/vllm, or bin/python3 for SGLang
     capyctl engine add ~/llama.cpp/build/bin/llama-server   # llama.cpp: the binary or its directory
-    capyctl engine add ~/tensorrt-llm-1.2.1-venv/bin/trtllm-serve   # TensorRT-LLM
+    capyctl engine add ~/tensorrt-llm-1.2.1-venv/bin/trtllm-serve   # refused in 0.2.0
     capyctl engine add ~/sglang/bin/python3 --name sglang-patched --drift refuse
     capyctl engine list
     capyctl engine remove vllm [--drain]
@@ -952,6 +952,18 @@ inference endpoint.
 
 ### Registering a TensorRT-LLM environment
 
+**Unavailable in 0.2.0; returns in 0.2.x.** The reference below describes
+the retained implementation, not a supported 0.2.0 registration path.
+Registration, local-engine configuration, admission and launch refuse
+`engine_unavailable_in_release:tensorrt_llm`; detection does not advertise
+it (ADR 0038 amendment of 2026-11-11; R01, T49).
+Existing profiles in `engines.yaml` and host `runtime_profiles` are skipped
+with a warning naming the profile and `capyctl engine remove <name>`; other
+profiles proceed. Explicit local-engine settings are refused before probes
+or fingerprinting. `engine add` returns exit 5 and the holdout code;
+explicit validation and management actions use `invalid_config` with the
+holdout code in the message.
+
 TensorRT-LLM needs an MPI runtime and a complete CUDA developer toolkit.
 Use system Open MPI 4.1.6 (`libopenmpi-dev` on Ubuntu 24.04), or on x86_64
 install `openmpi==4.1.8 mpi4py==4.1.2` inside the engine environment.
@@ -965,13 +977,13 @@ Each version lives in its own environment, `~/tensorrt-llm-<version>-venv`,
 built as [Install an engine](../guide/install-engines.md#tensorrt-llm-121-13-pre-release-or-140rc3)
 shows: torch first, a constraints file pinning it, then the wheel by URL and
 hash. The versions being qualified are 1.2.1, the 1.3 pre-release and
-1.4.0rc3; none has passed its live rows yet, so every TensorRT-LLM profile
-lists as custom and runs as an uncertified custom setup, never refused for
-its version.
+1.4.0rc3; none has passed its live rows yet. The retained implementation marks
+unverified versions custom, but the 0.2.0 holdout refuses every version.
 
-`detect` finds the environment by its `tensorrt_llm-*.dist-info` and runs
-nothing. `engine add` takes `<env>/bin/trtllm-serve` and never imports the
-engine or runs `trtllm-serve`, because an import initialises MPI and CUDA and
+The retained detector reads `tensorrt_llm-*.dist-info` without execution;
+the 0.2.0 detection output and interactive picker omit it. The retained
+registration path never imports the engine or runs `trtllm-serve`, because
+an import initialises MPI and CUDA and
 Open MPI could start a daemon outside the check's process group. Its bounded
 version check runs the environment's Python in isolated mode on
 `importlib.metadata`, and records the version as `build_fingerprint` and the

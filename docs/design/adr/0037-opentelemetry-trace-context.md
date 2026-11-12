@@ -150,7 +150,7 @@ weakening its privacy promises.
   `traceparent` and `opentelemetry` finds nothing).
 - **TensorFold.** No trace context support is known to CapyCTL's integration
   [INFERENCE: TensorFold's source was not read for this draft].
-- **TensorRT-LLM** (proposed as a native engine for 0.2.0). `trtllm-serve` has
+- **TensorRT-LLM** (held out of 0.2.0; returns in 0.2.x, ADR 0038 amendment of 2026-11-11). `trtllm-serve` has
   `--otlp_traces_endpoint` and reads the trace headers of the OpenAI request
   ([tracing.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/tracing.py),
   `serve/openai_server.py`, default branch). Its ADR decides whether this ADR's engine

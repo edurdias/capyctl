@@ -4,6 +4,16 @@ Every CapyCTL command exits 0 on success. On failure it prints one line to
 standard error, `error [<code>]: <message>`, and exits with the status below.
 With `--format json` the error is a JSON object with `code` and `message`.
 
+For the TensorRT-LLM release holdout, explicit `capyctl validate` actions report
+exit 2, `invalid_config`, with `engine_unavailable_in_release:tensorrt_llm`
+in the message; explicit management actions return HTTP 400, `invalid_config`,
+with that code in the message. Agent launch admission returns the holdout code.
+Host and standalone start skip existing TensorRT-LLM profiles in `engines.yaml`
+or host `runtime_profiles`, warning with the profile name and
+`capyctl engine remove <name>`; other profiles proceed. Explicit local-engine
+flags, environment variables or document settings instead refuse role startup
+before any probe or fingerprint. Detection and the interactive picker omit it.
+
 | Exit | Code | What it means | What to do |
 |---|---|---|---|
 | 2 | `invalid_config` | A document or command argument is invalid. | Run `capyctl validate config --file <file>` and fix what it reports. |
@@ -38,6 +48,7 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 4 | `host_tuning_missing:<item>` | With `require_rdma: true`, a machine lacks `memlock` (unlimited locked memory) or `infiniband` (read-write `/dev/infiniband/uverbs*`). | Fix the item as root on that machine, or set `require_rdma: false`. |
 | 5 | `unsupported` | The request is valid but this release cannot do it. | Read the message; it names the missing capability. |
 | 5 | `store_from_newer_version` | The state directory was written by a newer CapyCTL. | Run the newer binary, or restore a backup taken before the upgrade. |
+| 5 | `engine_unavailable_in_release:tensorrt_llm` | Explicit `engine add` refuses TensorRT-LLM in 0.2.0 before probing or writing. Its required single-process mode leaves iteration metrics empty, preventing KV-pool proof (ADR 0038; R01, T49). This exit/code pair is specific to `engine add`; see the other boundaries below. | Use another engine until its 0.2.x return; custom status does not bypass the holdout. |
 | 5 | `multi_gpu_unsupported` | The deployment names two or more GPUs without a `topology`, or asks for several GPUs on a machine with one unified-memory GPU (such as a GB10) or on an engine that runs on one GPU only (TensorFold, TensorRT-LLM, a custom engine). | Add `topology: {tensor_parallel: N}` with N the number of GPUs you named ([One model on several GPUs](deploy.md#one-model-on-several-gpus)); otherwise use one GPU, or several machines with `placement.hosts`. |
 | 5 | `multi_gpu_mixed_devices` | The GPUs a deployment names differ in product or memory. | Name identical GPUs (`nvidia-smi -L` shows them). |
 | 5 | `tensor_parallel_indivisible` | On vLLM or SGLang, `tensor_parallel` does not divide the model's attention heads; the message names the head count and the numbers that divide it. | Use one of the numbers the message names, or `topology: auto`. |

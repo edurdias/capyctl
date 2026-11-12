@@ -36,6 +36,10 @@ for them:
 - Nemotron 3.5 Super VL on vLLM: after a park and a wake, vLLM 0.31.0 answers
   wrongly.
 
+TensorRT-LLM is unavailable in 0.2.0 and returns in 0.2.x (ADR 0038,
+owner decision 2026-11-11; R01, T49). The behavior below is retained
+reference, not a bypass for `engine_unavailable_in_release:tensorrt_llm`.
+
 TensorRT-LLM never parks: its deployments are `restart_only`.
 `residency: deep` or `host_backed` is refused
 (`capability_missing:deep_park`), and so is `--deep-park enabled` when you add
