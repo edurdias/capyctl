@@ -171,6 +171,11 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     authorization requires an idle host; owner work takes precedence. Never
     touch anything under ~/capyctl-extract* on either host. A busy host B may
     run only GPU-less CapyCTL control roles, never an engine or measurements.
+  - host A, approved 2026-11-11 for LMCache through sleep on unified memory
+    (LC13U–LC16U, ADR 0034 owner decision 2026-11-11): vLLM 0.34.0rc1 with an
+    LMCache 0.5.7 source build against its own torch
+    (~/vllm-0.34.0rc1-lmcache057-venv, TORCH_CUDA_ARCH_LIST=12.1), made the same
+    way as the 0.33.0 copy above. It stays after session cleanup;
   - the maintainer's discrete-GPU laptop, approved 2026-11-09: the official
     `lmsysorg/sglang:v0.5.22` Docker image, for the live check of #230 (an editable
     SGLang refused at `engine add`); removed after that check, to be pulled again for
