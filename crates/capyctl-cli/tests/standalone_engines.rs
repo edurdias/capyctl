@@ -343,42 +343,57 @@ async fn a_name_in_both_is_refused_at_start() {
     assert_eq!(structured.code, "profile_exists", "{}", structured.message);
 }
 
-// T02 T03 (ADR 0018 amendment A3): engines.yaml shared with a newer release
-// holds a profile for an engine kind this release does not know. Standalone
-// skips it and starts with the rest; a reload keeps skipping it; a deployment
-// naming it is refused as an unpublished profile; the file still holds it.
+// T02 T03 T49 (ADR 0018 A3 / ADR 0038 amendment): unknown and held-out
+// profiles are skipped at start and reload, without changing the file.
 #[tokio::test]
-async fn a_profile_for_an_unknown_engine_kind_is_skipped_at_start() {
-    let state = support::safe_state_dir();
-    let document = standalone_doc(state.path());
-    register(&document, "only");
-    let path = engines_beside(&document);
-    {
-        let lock = lock_engines(&path).unwrap();
-        let mut engines = EnginesFile::load(&path).unwrap();
-        let mut future = engines.profiles["only"].clone();
-        future["engine"] = "futureengine".into();
-        engines.profiles.insert("future".into(), future);
-        write_engines(&engines, &lock, None).unwrap();
+async fn unavailable_profiles_are_skipped_at_start_and_reload() {
+    for kind in ["futureengine", "tensorrt-llm"] {
+        let state = support::safe_state_dir();
+        let document = standalone_doc(state.path());
+        register(&document, "only");
+        let path = engines_beside(&document);
+        {
+            let lock = lock_engines(&path).unwrap();
+            let mut engines = EnginesFile::load(&path).unwrap();
+            let mut future = engines.profiles["only"].clone();
+            future["engine"] = kind.into();
+            engines.profiles.insert("future".into(), future);
+            write_engines(&engines, &lock, None).unwrap();
+        }
+        let app = support::boot_registered_only(state.path(), &document)
+            .await
+            .expect("standalone starts and skips the unavailable kind");
+        assert_eq!(app.profiles(), vec!["only".to_string()]);
+        assert_eq!(
+            app.host_document()["runtime_profiles"]["only"]["engine"],
+            "vllm"
+        );
+        assert!(app.host_document()["runtime_profiles"]
+            .get("future")
+            .is_none());
+        let skipped = EnginesFile::load(&path).unwrap().runnable().1;
+        assert_eq!(skipped.len(), 1);
+        let warning = skipped[0].warning(&path);
+        assert!(warning.contains("profile future"), "{warning}");
+        assert!(
+            warning.contains("capyctl engine remove future"),
+            "{warning}"
+        );
+        let socket = state.path().join(SOCKET_NAME);
+        let reload = request(&socket, &ControlRequest::Add, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(reload["ok"], true, "{reload}");
+        assert_eq!(app.profiles(), vec!["only".to_string()]);
+        let (status, body) = deploy(&app, state.path(), "m", "future").await;
+        assert!(!status.is_success(), "{status} {body}");
+        assert_eq!(body["error"]["code"], "profile_not_published", "{body}");
+        assert!(EnginesFile::load(&path)
+            .unwrap()
+            .profiles
+            .contains_key("future"));
+        let _ = app.shutdown().await;
     }
-    let app = support::boot_registered_only(state.path(), &document)
-        .await
-        .expect("standalone starts and skips the unknown kind");
-    assert_eq!(app.profiles(), vec!["only".to_string()]);
-    let socket = state.path().join(SOCKET_NAME);
-    let reload = request(&socket, &ControlRequest::Add, Duration::from_secs(10))
-        .await
-        .unwrap();
-    assert_eq!(reload["ok"], true, "{reload}");
-    assert_eq!(app.profiles(), vec!["only".to_string()]);
-    let (status, body) = deploy(&app, state.path(), "m", "future").await;
-    assert!(!status.is_success(), "{status} {body}");
-    assert_eq!(body["error"]["code"], "profile_not_published", "{body}");
-    assert!(EnginesFile::load(&path)
-        .unwrap()
-        .profiles
-        .contains_key("future"));
-    let _ = app.shutdown().await;
 }
 
 /// Deploy `name` on `profile` and start it to Ready; its deployment id.

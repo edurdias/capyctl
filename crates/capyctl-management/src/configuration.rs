@@ -807,6 +807,19 @@ fn registry_targets(
         let host_profile = config["runtime_profile"].as_str().and_then(|requested| {
             capyctl_config::deployment_defaults::profile_on_host(requested, &original)
         });
+        // ADR 0038 amendment A3: retain a held-out host's refusal without
+        // preventing another allowed host from accepting the deployment.
+        if let Some(engine) = host_profile
+            .as_ref()
+            .and_then(|name| original["runtime_profiles"][name]["engine"].as_str())
+            .and_then(capyctl_config::engine_policy::Engine::from_name)
+        {
+            if let Err(error) = capyctl_config::registration::check_release_availability(engine) {
+                let reason = error.to_string();
+                single = Some(refuse(error.into(), &reason, &mut refusals));
+                continue;
+            }
+        }
         let published = |name: &String| &original["runtime_profiles"][name];
         let custom = host_profile.as_ref().is_some_and(|name| {
             published(name)["engine"].as_str()
@@ -1076,10 +1089,29 @@ fn require_published(
         .as_str()
         .unwrap_or_default()
         .to_owned();
-    if published.iter().any(|(_, document)| {
-        capyctl_config::deployment_defaults::profile_on_host(&profile, document).is_some()
-    }) {
-        Ok(profile)
+    let mut held_out = None;
+    for (_, document) in &published {
+        if let Some(name) = capyctl_config::deployment_defaults::profile_on_host(&profile, document)
+        {
+            // ADR 0038 amendment A3: an old host's held-out profile must
+            // not veto another allowed host's runnable profile.
+            if let Some(engine) = document["runtime_profiles"][&name]["engine"]
+                .as_str()
+                .and_then(capyctl_config::engine_policy::Engine::from_name)
+            {
+                if let Err(mut error) =
+                    capyctl_config::registration::check_release_availability(engine)
+                {
+                    error.path = format!("runtime_profiles.{name}.engine");
+                    held_out = Some(error);
+                    continue;
+                }
+            }
+            return Ok(profile);
+        }
+    }
+    if let Some(error) = held_out {
+        Err(error.into())
     } else {
         Err(ConfigurationFailure::ProfileNotPublished {
             profile,

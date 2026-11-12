@@ -928,17 +928,13 @@ fn an_environment_llamacpp_is_checked_and_never_parks() {
     }
 }
 
-/// ADR 0038 §2: a role's own TensorRT-LLM is declared by
-/// CAPYCTL_TENSORRT_LLM_BIN and built as `engine add` builds it: the version
-/// and companion versions read by the metadata-only check under the
-/// environment's interpreter (never `trtllm-serve`), deep park off whatever
-/// the default says, the companions published with the profile, and
-/// `local-tensorrt-llm` beside another engine.
+/// ADR 0038 amendment: an explicit TensorRT-LLM installation is refused,
+/// including beside vLLM, before either executable or interpreter is probed.
 // T49 T03
 #[test]
-fn an_environment_tensorrt_llm_is_checked_and_never_parks() {
+fn an_environment_tensorrt_llm_is_refused_before_probing() {
     use crate::roles::EngineProvider as _;
-    let Some(_guard) = isolated("an_environment_tensorrt_llm_is_checked_and_never_parks") else {
+    let Some(_guard) = isolated("an_environment_tensorrt_llm_is_refused_before_probing") else {
         return;
     };
     let dir = tempfile::TempDir::new().expect("a temporary installation");
@@ -967,38 +963,40 @@ fn an_environment_tensorrt_llm_is_checked_and_never_parks() {
     .expect("the console script");
     capyctl_config::test_support::write_executable(
         &venv.join("bin/python3"),
-        "#!/bin/sh\n[ \"$1\" = -I ] || exit 9\nprintf 'tensorrt_llm 1.2.1\\ntorch 2.9.1+cu130\\n\
-         tensorrt 10.14.1.48\\nflashinfer-python 0.6.4\\ntransformers 4.57.3\\nmpi4py 4.1.1\\n'\n",
+        format!("#!/bin/sh\ntouch {}\nexit 9\n", marker.display()),
         0o700,
     )
     .expect("the interpreter");
     std::env::set_var("CAPYCTL_TENSORRT_LLM_BIN", &bin);
-    let named = crate::roles::EnvEngineProvider::new()
+    let refused = crate::roles::EnvEngineProvider::new()
         .installations(&Default::default())
-        .expect("the environment declares an installation");
-    assert_eq!(named.len(), 1);
-    assert_eq!(named[0].profile, "local");
-    let installation = &named[0].installation;
-    assert_eq!(installation.engine, Engine::TensorrtLlm);
-    assert_eq!(installation.build_fingerprint, "1.2.1");
-    assert!(!installation.deep_park);
-    let host = host_policy(&named, "env-1", CAPACITY, None, &HostShape::NoGpu, PORTS);
-    let profile = &host["runtime_profiles"]["local"];
-    assert_eq!(profile["engine"], "tensorrt-llm");
-    assert_eq!(profile["security"]["deep_park"], "disabled");
-    assert_eq!(profile["companions"]["torch"], "2.9.1+cu130");
-    assert_eq!(profile["companions"]["mpi4py"], "4.1.1");
-    capyctl_config::registration::check_profile("local", profile)
-        .expect("the published profile passes the resolution rules");
+        .expect_err("TensorRT-LLM is held out");
+    assert!(refused
+        .to_string()
+        .contains("engine_unavailable_in_release:tensorrt_llm"));
+    assert!(refused
+        .to_string()
+        .contains("runtime_profiles.local.engine"));
 
-    std::env::set_var("CAPYCTL_VLLM_BIN", fake_engine_bin(dir.path()));
-    let named = crate::roles::EnvEngineProvider::new()
+    let vllm = dir.path().join("vllm");
+    capyctl_config::test_support::write_executable(
+        &vllm,
+        format!("#!/bin/sh\ntouch {}\nexit 9\n", marker.display()),
+        0o700,
+    )
+    .unwrap();
+    std::env::set_var("CAPYCTL_VLLM_BIN", vllm);
+    let refused = crate::roles::EnvEngineProvider::new()
         .installations(&Default::default())
-        .expect("two installations");
-    let profiles: Vec<&str> = named.iter().map(|n| n.profile.as_str()).collect();
-    assert_eq!(profiles, ["local-vllm", "local-tensorrt-llm"]);
+        .expect_err("the explicit held-out setting is refused before vLLM is probed");
+    assert!(refused
+        .to_string()
+        .contains("engine_unavailable_in_release:tensorrt_llm"));
+    assert!(refused
+        .to_string()
+        .contains("runtime_profiles.local-tensorrt-llm.engine"));
     std::env::remove_var("CAPYCTL_VLLM_BIN");
-    assert!(!marker.exists(), "trtllm-serve ran");
+    assert!(!marker.exists(), "an installation was probed");
     for name in [
         "CAPYCTL_TENSORRT_LLM_BIN",
         "CAPYCTL_MODELS_ROOT",
@@ -1006,6 +1004,30 @@ fn an_environment_tensorrt_llm_is_checked_and_never_parks() {
     ] {
         std::env::remove_var(name);
     }
+    let provider = crate::roles::EnvEngineProvider::new().with_flags(
+        capyctl_config::engine_settings::EngineOverrides {
+            tensorrt_llm: Some(bin.clone()),
+            ..Default::default()
+        },
+    );
+    let refused = provider.installations(&Default::default()).unwrap_err();
+    assert!(refused
+        .to_string()
+        .contains("engine_unavailable_in_release:tensorrt_llm"));
+    let provider = crate::roles::EnvEngineProvider::new();
+    provider
+        .configure(&serde_json::json!({
+            "local_engine": {"tensorrt-llm": bin}
+        }))
+        .unwrap();
+    let refused = provider.installations(&Default::default()).unwrap_err();
+    assert!(refused
+        .to_string()
+        .contains("engine_unavailable_in_release:tensorrt_llm"));
+    assert!(
+        !marker.exists(),
+        "a flag or local_engine installation was probed"
+    );
 }
 
 /// Spec §7: the host policy built from the environment carries the model store,

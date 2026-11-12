@@ -5,10 +5,8 @@
 //! found by file name, its version read from a `libllama.so.X.Y.Z` name.
 //! ADR 0039 §2: TensorFold's native release is a third, found by its
 //! `bin/tensorfold-native`, its version read from the root's `VERSION` file.
-//! ADR 0038 §2: TensorRT-LLM is found by its `tensorrt_llm-*.dist-info`
-//! beside `bin/trtllm-serve`, with the same roots and bounds; its `custom`
-//! marking reads the environment's `torch-*.dist-info` too, and nothing is
-//! executed (running `trtllm-serve` or importing the package starts MPI).
+//! ADR 0038 amendment A3: TensorRT-LLM metadata resolution is retained for
+//! low-level callers, but release-held-out engines are never advertised.
 use super::{packages, release_version, resolve::entry, resolve::library_dirs, site_packages};
 use capyctl_config::engine_policy::Engine;
 use capyctl_config::llamacpp::EXECUTABLE;
@@ -134,6 +132,9 @@ impl Scan<'_> {
         }
         self.examined += 1;
         for (engine, version) in packages(env) {
+            if capyctl_config::registration::check_release_availability(engine).is_err() {
+                continue;
+            }
             let entry = entry(env, engine);
             if std::fs::symlink_metadata(&entry).is_err() {
                 continue;

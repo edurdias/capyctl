@@ -315,6 +315,11 @@ impl NativeHostExecution {
     ) -> Result<(), LaunchVerdict> {
         let refused = LaunchVerdict::Refused;
         let effective = self.resolve(command).map_err(|_| refused("unauthorized"))?;
+        // ADR 0038 amendment (2026-11-11): a previously approved document
+        // cannot bypass the 0.2.0 hold-out and launch the engine.
+        if effective.profile.engine == capyctl_config::engine_policy::Engine::TensorrtLlm {
+            return Err(refused("engine_unavailable_in_release:tensorrt_llm"));
+        }
         // ADR 0029 §6: a machine-wide llama.cpp `config.ini` (one that
         // appeared after registration) refuses the launch before any effect.
         self.admit_llamacpp_config(&effective)?;

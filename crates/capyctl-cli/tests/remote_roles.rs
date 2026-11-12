@@ -639,6 +639,68 @@ fn enrolled_server(
     (server, server_root, server_config, host_root, host_config)
 }
 
+// T03 T49 (ADR 0038 amendment): both historical registration and an inline
+// host profile are skipped with a warning; vLLM still publishes and connects.
+#[test]
+fn remote_host_skips_held_out_profiles_without_losing_vllm() {
+    use capyctl_config::registration::{engines_beside, EnginesFile};
+    for inline in [false, true] {
+        let temp = root();
+        let (mut server, server_root, server_config, host_root, host_config) =
+            enrolled_server(temp.path(), "holdout-host");
+        let profile = serde_json::json!({
+            "engine": "vllm", "executable": "/bin/true", "build_fingerprint": "0.29.0",
+            "security": {"deep_park": "disabled", "trust_remote_code": false}
+        });
+        let mut held = profile.clone();
+        held["engine"] = serde_json::json!("tensorrt-llm");
+        let path = engines_beside(&host_config);
+        let mut file = EnginesFile::load(&path).unwrap();
+        file.profiles.insert("available-vllm".into(), profile);
+        if inline {
+            let mut document =
+                capyctl_config::parse_document(&fs::read_to_string(&host_config).unwrap()).unwrap();
+            document["runtime_profiles"]["historical-trt"] = held;
+            fs::write(&host_config, document.to_string()).unwrap();
+        } else {
+            file.profiles.insert("historical-trt".into(), held);
+        }
+        fs::write(&path, file.render(1)).unwrap();
+        let log = temp.path().join("host-stderr");
+        let mut host = Service(Guarded::spawn(
+            support::capyctl()
+                .args(["start", "host", "--config", host_config.to_str().unwrap()])
+                .env("CAPYCTL_STATE_DIR", &host_root)
+                .env_remove("CAPYCTL_VLLM_BIN")
+                .env_remove("CAPYCTL_SGLANG_BIN")
+                .stdout(std::process::Stdio::null())
+                .stderr(fs::File::create(&log).unwrap()),
+        ));
+        hosts(&server_root, &server_config, true, 1);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let reply = runtime
+            .block_on(capyctl_agent::control_socket::request(
+                &host_root.join("control.sock"),
+                &capyctl_agent::control_socket::ControlRequest::List,
+                std::time::Duration::from_secs(10),
+            ))
+            .unwrap();
+        assert_eq!(
+            reply["accepted"]["available-vllm"]["engine"], "vllm",
+            "{reply}"
+        );
+        assert!(reply["accepted"].get("historical-trt").is_none(), "{reply}");
+        let warning = fs::read_to_string(&log).unwrap();
+        assert!(warning.contains("profile historical-trt"), "{warning}");
+        assert!(
+            warning.contains("capyctl engine remove historical-trt"),
+            "{warning}"
+        );
+        host.stop();
+        server.stop();
+    }
+}
+
 fn revoke(
     root: &Path,
     config: &Path,

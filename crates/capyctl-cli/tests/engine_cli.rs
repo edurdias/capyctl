@@ -568,7 +568,7 @@ async fn add_without_a_path_needs_a_terminal() {
     );
 }
 
-// T37: detect lists the fake environment and runs nothing in it.
+// T37 T49: detect lists allowed environments, omits held-out TRT, and runs nothing.
 #[tokio::test]
 async fn detect_lists_candidates_and_runs_nothing() {
     let dir = private_dir();
@@ -578,6 +578,7 @@ async fn detect_lists_candidates_and_runs_nothing() {
         &env.join("bin/vllm"),
         &format!("touch {}", marker.display()),
     );
+    let trt = trtllm_env(&dir.path().join("envs/trt"), "1.4.0rc3", &marker);
     let out = execute(
         &Command::EngineDetect {
             paths: vec![dir.path().join("envs")],
@@ -592,6 +593,12 @@ async fn detect_lists_candidates_and_runs_nothing() {
         found
             .iter()
             .any(|c| c["env"] == env.to_string_lossy().as_ref() && c["engine"] == "vllm"),
+        "{out}"
+    );
+    assert!(
+        found
+            .iter()
+            .all(|c| c["engine"] != "tensorrt-llm" && c["env"] != trt.to_string_lossy().as_ref()),
         "{out}"
     );
     assert!(!marker.exists());
@@ -2096,61 +2103,92 @@ async fn engine_with_cuda(
     .await
 }
 
-// T49 T07 T21 T37 (ADR 0038 §2): `engine add` registers TensorRT-LLM as
-// `tensorrt-llm` from its venv: the version from the dist-info and the
-// metadata-only check (never `trtllm-serve`, never a probe), the version as
-// the build fingerprint, deep park disabled, the CUDA toolkit recorded and the
-// companion versions written beside it; it lists `custom` (no entry is
-// verified yet) and is not refused. `engine list` shows the companions,
-// `idle signal: none` and `engine key: none`, for a registered profile and
-// for a role's own installation alike.
+// T49 T07 T37 (SPEC R01, ADR 0038 owner decision 2026-11-11):
+// TensorRT-LLM is held out of 0.2.0, including uncertified versions and
+// --deep-park enabled. Refuse before executing, writing or publishing.
 #[tokio::test]
-async fn add_registers_tensorrt_llm_with_its_companions() {
+async fn add_refuses_tensorrt_llm_in_this_release_before_any_writes() {
+    for version in ["1.2.1", "1.4.0rc3", "9.9.9"] {
+        let dir = private_dir();
+        let marker = dir.path().join("ran");
+        let env = trtllm_env(&dir.path().join("trt"), version, &marker);
+        script(
+            &env.join("bin/python3"),
+            &format!("touch {}; exit 9", marker.display()),
+        );
+        let document = host_doc(dir.path());
+        let host_before = std::fs::read(&document).unwrap();
+        let (role, _stop) = role(&document, json!({"ok": true, "published": "published"})).await;
+        let entries_before = std::fs::read_dir(dir.path()).unwrap().count();
+        let state_entries_before = std::fs::read_dir(dir.path().join("s")).unwrap().count();
+        let executable = env.join("bin/trtllm-serve");
+        for path in [&env, &executable] {
+            for deep_park in [None, Some(DeepParkChoice::Enabled)] {
+                let mut command = add(path);
+                if let Command::EngineAdd {
+                    deep_park: requested,
+                    ..
+                } = &mut command
+                {
+                    *requested = deep_park;
+                }
+                let error = execute(&command, Some(&document), dir.path())
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.code, "engine_unavailable_in_release:tensorrt_llm",
+                    "{version}: {error:?}"
+                );
+                assert!(error.message.contains("0.2.x"), "{error:?}");
+                let encoded: Value = serde_json::from_str(&error.to_json()).unwrap();
+                assert_eq!(
+                    encoded["code"],
+                    "engine_unavailable_in_release:tensorrt_llm"
+                );
+                assert_eq!(
+                    error.exit_code(),
+                    capyctl_cli::output::ExitCode::UNSUPPORTED
+                );
+                assert!(!engines_beside(&document).exists());
+                assert!(!marker.exists(), "an installation program ran");
+                assert_eq!(std::fs::read(&document).unwrap(), host_before);
+                assert_eq!(
+                    std::fs::read_dir(dir.path()).unwrap().count(),
+                    entries_before,
+                    "the refusal must not create a registration file or lock"
+                );
+                assert_eq!(
+                    std::fs::read_dir(dir.path().join("s")).unwrap().count(),
+                    state_entries_before,
+                    "the refusal must not create a probe directory"
+                );
+                assert!(role.0.lock().unwrap().is_empty(), "the role was contacted");
+            }
+        }
+    }
+}
+
+// T49 T37 (ADR 0038 §2, owner decision 2026-11-11): historical profiles
+// remain listable without executing anything despite the registration holdout.
+#[tokio::test]
+async fn list_preserves_historical_tensorrt_llm_companions() {
     let dir = private_dir();
     let marker = dir.path().join("ran");
-    let env = trtllm_env(
-        &dir.path().join("tensorrt-llm-1.2.1-venv"),
-        "1.2.1",
-        &marker,
-    );
-    let cuda = dir.path().join("cuda-13.1");
-    std::fs::create_dir_all(cuda.join("bin")).unwrap();
-    std::fs::write(cuda.join("bin/nvcc"), "").unwrap();
+    let env = trtllm_env(&dir.path().join("trt"), "1.2.1", &marker);
     let document = host_doc(dir.path());
-    let (_role, stop) = role(&document, json!({"ok": true, "published": "published"})).await;
-    let out = engine_with_cuda(&add(&env.join("bin/trtllm-serve")), &document, &cuda)
-        .await
-        .unwrap();
-    assert_eq!(out["profile"], "tensorrt-llm");
-    assert_eq!(out["engine"], "tensorrt-llm");
-    assert_eq!(out["version"], "1.2.1");
-    assert_eq!(out["build_fingerprint"], "1.2.1");
-    assert_eq!(out["custom"], true, "no TensorRT-LLM entry is verified yet");
-    assert_eq!(out["deep_park"], "disabled");
-    assert_eq!(out["deep_park_probe"], "capability_missing");
-    assert_eq!(out["cuda_home"], cuda.to_string_lossy().as_ref());
-    assert_eq!(out["companions"]["torch"], "2.9.1+cu130");
-    assert!(out["fingerprint"]["digest"]
-        .as_str()
-        .is_some_and(|d| d.starts_with("sha256:")));
-    assert_eq!(out["published"], "published");
-    let profile = engines_of(&document).profiles["tensorrt-llm"].clone();
-    assert_eq!(
-        profile["executable"],
-        env.join("bin/trtllm-serve").to_string_lossy().as_ref()
-    );
-    assert_eq!(profile["build_fingerprint"], "1.2.1");
-    assert_eq!(profile["security"]["deep_park"], "disabled");
-    assert_eq!(profile["cuda_home"], cuda.to_string_lossy().as_ref());
-    assert_eq!(
-        profile["companions"],
-        json!({"torch": "2.9.1+cu130", "tensorrt": "10.14.1.48",
-            "flashinfer-python": "0.6.4", "transformers": "4.57.3", "mpi4py": "4.1.1"})
-    );
-    assert!(!marker.exists(), "trtllm-serve or a probe ran");
-
-    stop.send(true).unwrap();
-    until_role_stopped(&document).await;
+    let profile = json!({
+        "engine": "tensorrt-llm",
+        "executable": env.join("bin/trtllm-serve"),
+        "build_fingerprint": "1.2.1",
+        "security": {"deep_park": "disabled", "trust_remote_code": false},
+        "companions": {"torch": "2.9.1+cu130", "tensorrt": "10.14.1.48",
+            "flashinfer-python": "0.6.4", "transformers": "4.57.3", "mpi4py": "4.1.1"}
+    });
+    let mut engines = engines_of(&document);
+    engines
+        .profiles
+        .insert("tensorrt-llm".into(), profile.clone());
+    std::fs::write(engines_beside(&document), engines.render(1)).unwrap();
     let own = json!({"engine": "tensorrt-llm", "executable": "/t/bin/trtllm-serve",
         "build_fingerprint": "1.4.0rc1",
         "installation": {"version": "1.4.0rc1", "digest": "sha256:00", "state": "recorded"},
@@ -2192,41 +2230,28 @@ async fn add_registers_tensorrt_llm_with_its_companions() {
     );
 }
 
-// T49 T21 T37 (ADR 0038 §2): `--deep-park enabled` is refused
-// `capability_missing` before anything runs or is written; an unlisted
-// version registers all the same as an uncertified custom setup.
+// T49 T02 T07 (SPEC R01, ADR 0038 owner decision 2026-11-11): refusal on
+// first run creates neither a state directory nor the config/engines files.
 #[tokio::test]
-async fn add_refuses_tensorrt_llm_deep_park_and_registers_any_version() {
+async fn add_tensorrt_llm_on_a_fresh_home_writes_nothing() {
     let dir = private_dir();
     let marker = dir.path().join("ran");
-    let env = trtllm_env(&dir.path().join("trt"), "9.9.9", &marker);
-    let cuda = dir.path().join("no-cuda");
-    let document = host_doc(dir.path());
-    let deep = Command::EngineAdd {
-        path: Some(env.clone()),
-        name: None,
-        deep_park: Some(DeepParkChoice::Enabled),
-        drift: DriftChoice::Warn,
-        args: vec![],
-        approved_options: vec![],
-        approved_paths: vec![],
-        env: vec![],
-        approved_env: vec![],
-        allow_remote_code: false,
-    };
-    let error = engine_with_cuda(&deep, &document, &cuda).await.unwrap_err();
-    assert_eq!(error.code, "capability_missing", "{error:?}");
-    assert!(!engines_beside(&document).exists());
-    let out = engine_with_cuda(&add(&env), &document, &cuda)
-        .await
-        .unwrap();
-    assert_eq!(out["build_fingerprint"], "9.9.9");
-    assert_eq!(out["custom"], true);
-    assert_eq!(out["published"], "role_not_running");
-    assert_eq!(out["cuda_home"], Value::Null);
-    assert_eq!(
-        engines_of(&document).profiles["tensorrt-llm"]["build_fingerprint"],
-        "9.9.9"
+    let installation = trtllm_env(&dir.path().join("trt"), "1.2.1", &marker);
+    script(
+        &installation.join("bin/python3"),
+        &format!("touch {}; exit 9", marker.display()),
     );
-    assert!(!marker.exists(), "trtllm-serve or a probe ran");
+    let home = dir.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let state = dir.path().join("s");
+    let home_text = home.to_string_lossy().into_owned();
+    let fresh = move |key: &str| (key == "HOME").then(|| home_text.clone());
+    let error = capyctl_cli::engine::execute_in(&add(&installation), None, &state, &fresh)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "engine_unavailable_in_release:tensorrt_llm");
+    assert!(error.message.contains("0.2.x"), "{error:?}");
+    assert!(!state.exists(), "the state directory was created");
+    assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0);
+    assert!(!marker.exists(), "an installation program ran");
 }

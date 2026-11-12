@@ -79,6 +79,74 @@ fn a_valid_host_document_is_reported_valid_without_side_effects() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
 }
 
+// T03 T49 (ADR 0038 amendment): historical profiles do not invalidate the
+// role or its still-available deployment, whether inline or registered.
+#[test]
+fn validation_skips_held_out_profiles_and_keeps_vllm() {
+    for inline in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = host_document(dir.path());
+        let mut held = host["runtime_profiles"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        held["engine"] = json!("tensorrt-llm");
+        held["security"]["deep_park"] = json!("disabled");
+        if inline {
+            host["runtime_profiles"]["historical-trt"] = held;
+        } else {
+            write(
+                dir.path(),
+                "engines.yaml",
+                &json!({
+                    "schema_version": 1, "kind": "engines",
+                    "runtime_profiles": {"historical-trt": held}
+                })
+                .to_string(),
+            );
+        }
+        let file = write(dir.path(), "host.yaml", &host.to_string());
+        let (code, value, raw) = validate(&["--file", file.to_str().unwrap()]);
+        assert_eq!(code, 0, "{raw}");
+        assert_eq!(value["valid"], true, "{raw}");
+        let deployment = write(
+            dir.path(),
+            "deployment.yaml",
+            &deployment_document().to_string(),
+        );
+        let (code, value, raw) = validate(&[
+            "--file",
+            deployment.to_str().unwrap(),
+            "--host",
+            file.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{raw}");
+        assert_eq!(value["valid"], true, "{raw}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), host.to_string());
+    }
+}
+
+// T03 T49: explicit local engines remain a closed refusal, with a named path.
+#[test]
+fn validation_refuses_explicit_held_out_local_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut host = host_document(dir.path());
+    host["local_engine"] = json!({"tensorrt-llm": "/does/not/exist/trtllm-serve"});
+    let file = write(dir.path(), "host.yaml", &host.to_string());
+    let (code, value, raw) = validate(&["--file", file.to_str().unwrap()]);
+    assert_eq!(code, 2, "{raw}");
+    assert_eq!(value["code"], "invalid_config", "{raw}");
+    let message = value["message"].as_str().unwrap();
+    assert!(
+        message.contains("engine_unavailable_in_release:tensorrt_llm"),
+        "{raw}"
+    );
+    assert!(message.contains("runtime_profiles.local.engine"), "{raw}");
+}
+
 // T03
 #[test]
 fn duplicate_yaml_keys_are_a_named_error() {

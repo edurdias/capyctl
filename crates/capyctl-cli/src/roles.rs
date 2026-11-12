@@ -945,6 +945,10 @@ impl EnvEngineProvider {
         fingerprint: Option<&str>,
         deep_park: Option<bool>,
     ) -> Result<EngineInstallation, ProviderError> {
+        // ADR 0038 amendment / T49: explicit local engines are refused before
+        // fingerprinting or executing anything from the installation.
+        capyctl_config::registration::check_release_availability(engine)
+            .map_err(|error| no_installation(error.to_string()))?;
         // Owner rule 2026-09-25: every setting below is resolved flag >
         // environment > `host:` block > default (`engine_settings`); a
         // malformed value in any layer is refused, even when a registered
@@ -1048,7 +1052,16 @@ impl EngineProvider for EnvEngineProvider {
     /// set this is the vLLM one; [`Self::installations`] publishes both.
     fn installation(&self) -> Result<EngineInstallation, ProviderError> {
         let settings = self.settings()?;
-        match settings.installations().into_iter().next() {
+        let installations = settings.installations();
+        for (profile, engine, _) in &installations {
+            capyctl_config::registration::check_release_availability(*engine).map_err(
+                |mut error| {
+                    error.path = format!("runtime_profiles.{profile}.engine");
+                    no_installation(error.to_string())
+                },
+            )?;
+        }
+        match installations.into_iter().next() {
             Some((_, engine, executable)) => self.role_installation(engine, executable),
             None => Err(no_installation(format!(
                 "this host declares no engine: set {ENGINE_BIN} (or {SGLANG_BIN} \
@@ -1116,7 +1129,18 @@ impl EngineProvider for EnvEngineProvider {
         // Owner rule 2026-09-25: the same names a host gives its
         // `local_engine` profiles (`engine_settings::EngineSettings::installations`).
         let mut all = Vec::new();
-        for (profile, engine, executable) in self.settings()?.installations() {
+        let installations = self.settings()?.installations();
+        // Check every explicit setting first: another engine must not be probed
+        // before a held-out setting is refused (ADR 0038 amendment / T49).
+        for (profile, engine, _) in &installations {
+            capyctl_config::registration::check_release_availability(*engine).map_err(
+                |mut error| {
+                    error.path = format!("runtime_profiles.{profile}.engine");
+                    no_installation(error.to_string())
+                },
+            )?;
+        }
+        for (profile, engine, executable) in installations {
             all.push(named(profile, self.role_installation(engine, executable)?));
         }
         for (name, profile) in registered {

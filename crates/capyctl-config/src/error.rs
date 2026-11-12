@@ -5,6 +5,9 @@ use thiserror::Error;
 /// Machine-readable error code for a config failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ConfigErrorCode {
+    /// ADR 0038 amendment (2026-11-11): held out pending readiness qualification.
+    #[error("engine_unavailable_in_release:tensorrt_llm")]
+    EngineUnavailableInRelease,
     #[error("unknown field")]
     UnknownField,
     #[error("duplicate key")]

@@ -1084,12 +1084,10 @@ fn trtllm_env(root: &Path, version: &str) -> PathBuf {
 const TRTLLM_VERSIONS: &str = "tensorrt_llm 1.2.1\ntorch 2.9.1+cu130\ntensorrt 10.14.1.48\n\
                                flashinfer-python 0.6.4\ntransformers 4.57.3\nmpi4py \n";
 
-// T49 T37 (ADR 0038 §2): TensorRT-LLM is detected from its
-// `tensorrt_llm-*.dist-info` beside `bin/trtllm-serve` in a home-level venv
-// and under `--path`, with its version from METADATA, listed `custom` (no
-// entry is verified yet), and nothing in the environment is executed.
+// T49 T37 (ADR 0038 amendment A3): detection omits held-out TensorRT-LLM
+// environments in home and explicit roots without executing either script.
 #[test]
-fn tensorrt_llm_detection_reads_metadata_and_executes_nothing() {
+fn tensorrt_llm_detection_omits_held_out_environments_and_executes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     let env = trtllm_env(&home.join("tensorrt-llm-1.2.1-venv"), "1.2.1");
@@ -1097,24 +1095,11 @@ fn tensorrt_llm_detection_reads_metadata_and_executes_nothing() {
     let mut roots = empty_roots(&home);
     roots.extra = vec![dir.path().join("opt")];
     let found = detect(&roots, &ScanBounds::default());
-    let trt: Vec<_> = found
-        .iter()
-        .filter(|c| c.engine == Engine::TensorrtLlm)
-        .collect();
-    assert_eq!(trt.len(), 2, "{found:?}");
-    assert_eq!(trt[0].env, env);
-    assert_eq!(trt[0].entry, env.join("bin/trtllm-serve"));
-    assert_eq!(trt[0].version, "1.2.1");
-    assert_eq!(trt[0].source, "home");
-    assert_eq!(trt[1].env, listed);
-    assert_eq!(trt[1].version, "1.4.0rc1");
-    assert_eq!(trt[1].source, "path");
-    assert!(trt.iter().all(|c| c.custom), "no TensorRT-LLM entry yet");
-    // Without its console script the environment is not an installation.
-    std::fs::remove_file(env.join("bin/trtllm-serve")).unwrap();
-    assert!(!detect(&roots, &ScanBounds::default())
-        .iter()
-        .any(|c| c.env == env));
+    assert!(
+        found.iter().all(|c| c.engine != Engine::TensorrtLlm),
+        "{found:?}"
+    );
+    assert!(!found.iter().any(|c| c.env == env || c.env == listed));
     for root in [&env, &listed] {
         assert!(!root.join("ran").exists(), "detection executed {root:?}");
     }

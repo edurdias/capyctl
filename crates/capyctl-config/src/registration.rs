@@ -144,22 +144,19 @@ impl EnginesFile {
         })
     }
 
-    /// The profiles this release can run, and the ones it skips: a profile
-    /// whose `engine` names a kind this release does not know (a newer
-    /// release shares the file and wrote it). Every other profile, a known
-    /// kind or a missing or non-string `engine`, is kept and validated as
-    /// before. Writers keep every profile; only a role skips them.
+    /// The profiles this release can run, and the ones it skips: unknown
+    /// engine kinds (ADR 0018 amendment A3) and release-held-out kinds
+    /// (ADR 0038 amendment). Missing or non-string `engine` values are kept
+    /// and validated as before. Writers retain every profile on disk.
     pub fn runnable(&self) -> (Map<String, Value>, Vec<UnknownEngineProfile>) {
         let mut runnable = Map::new();
         let mut skipped = Vec::new();
         for (name, profile) in &self.profiles {
-            match profile["engine"].as_str() {
-                Some(kind) if Engine::from_name(kind).is_none() => {
-                    skipped.push(UnknownEngineProfile {
-                        profile: name.clone(),
-                        engine: kind.to_owned(),
-                    })
-                }
+            match unavailable_engine(profile) {
+                Some(kind) => skipped.push(UnknownEngineProfile {
+                    profile: name.clone(),
+                    engine: kind.to_owned(),
+                }),
                 _ => {
                     runnable.insert(name.clone(), profile.clone());
                 }
@@ -224,9 +221,9 @@ fn kind_of(path: &Path) -> ConfigKind {
     }
 }
 
-/// ADR 0018 amendment A3: a profile in engines.yaml for an engine kind this
-/// release does not know. The role skips it and starts; a deployment that
-/// names it fails as any unpublished profile does.
+/// ADR 0018 amendment A3, ADR 0038 amendment: a profile whose engine is
+/// unknown or held out of this release. Runtime documents skip it; a
+/// deployment naming it fails as any unpublished profile does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownEngineProfile {
     pub profile: String,
@@ -247,9 +244,61 @@ impl UnknownEngineProfile {
     }
 }
 
+fn available_in_release(engine: Engine) -> bool {
+    engine != Engine::TensorrtLlm
+}
+
+fn unavailable_engine(profile: &Value) -> Option<&str> {
+    let kind = profile["engine"].as_str()?;
+    match Engine::from_name(kind) {
+        Some(engine) if available_in_release(engine) => None,
+        _ => Some(kind),
+    }
+}
+
+/// ADR 0018 amendment A3, ADR 0038 amendment: remove profiles this release
+/// cannot run from an in-memory runtime/publication document. The caller
+/// emits the returned warnings with the source document's path. Source
+/// files and low-level normalization remain unchanged; malformed known
+/// profiles remain for the usual validation to reject.
+pub fn filter_runtime_profiles(document: &mut Value) -> Vec<UnknownEngineProfile> {
+    let mut skipped = Vec::new();
+    if let Some(profiles) = document
+        .get_mut("runtime_profiles")
+        .and_then(Value::as_object_mut)
+    {
+        profiles.retain(|name, profile| match unavailable_engine(profile) {
+            Some(kind) => {
+                skipped.push(UnknownEngineProfile {
+                    profile: name.clone(),
+                    engine: kind.to_owned(),
+                });
+                false
+            }
+            None => true,
+        });
+    }
+    skipped
+}
+
+/// Refuse an engine held out of this release without touching its installation.
+pub fn check_release_availability(engine: Engine) -> Result<(), ConfigError> {
+    // ADR 0038 amendment, owner decision 2026-11-11: single-process iteration
+    // statistics cannot prove the KV pool ready, so this engine cannot launch.
+    if !available_in_release(engine) {
+        return Err(ConfigError::new(
+            ConfigErrorCode::EngineUnavailableInRelease,
+            "engine",
+            "TensorRT-LLM is unavailable in CapyCTL 0.2.0; it is planned to return \
+             in a 0.2.x release after the single-process metrics readiness proof is fixed and qualified",
+        ));
+    }
+    Ok(())
+}
+
 /// ADR 0018 §2: `document` (a host document) with `engines`' profiles added.
-/// A profile name the host document already declares is refused. A profile
-/// for an engine kind this release does not know is left out (amendment A3).
+/// A profile name the host document already declares is refused. Unknown
+/// and release-held-out engine kinds are left out (amendment A3, ADR 0038).
 pub fn merge_into_host(document: &mut Value, engines: &EnginesFile) -> Result<(), ConfigError> {
     if engines.profiles.is_empty() {
         return Ok(());

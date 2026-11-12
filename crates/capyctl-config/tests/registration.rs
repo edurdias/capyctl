@@ -672,8 +672,136 @@ fn a_profile_for_an_unknown_engine_kind_is_skipped_and_kept_in_the_file() {
     assert!(!config.profiles.contains_key("future"));
 }
 
-// SPEC §15.3: only an engine kind this release does not know is skipped. A
-// known kind is validated as strictly as before, and a missing or non-string
+// T49 T03 T04 (ADR 0038 amendment): keeping an old TensorRT-LLM profile
+// never prevents another registration, and neither source document is rewritten.
+#[test]
+fn adding_an_engine_keeps_held_out_profiles_but_does_not_publish_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host_doc(dir.path());
+    let original = std::fs::read(&host).unwrap();
+    let path = engines_beside(&host);
+    let mut held_out = profile();
+    held_out["engine"] = "tensorrt-llm".into();
+    held_out["security"]["deep_park"] = "disabled".into();
+    let mut engines = EnginesFile::load(&path).unwrap();
+    engines.profiles.insert("old-trt".into(), held_out.clone());
+    let lock = lock_engines(&path).unwrap();
+    write_engines(&engines, &lock, Some(&host_value(&host))).unwrap();
+    drop(lock);
+
+    let lock = lock_engines(&path).unwrap();
+    let mut engines = EnginesFile::load(&path).unwrap();
+    engines.profiles.insert("vllm".into(), profile());
+    assert_eq!(
+        write_engines(&engines, &lock, Some(&host_value(&host))).unwrap(),
+        2
+    );
+    drop(lock);
+
+    let saved = EnginesFile::load(&path).unwrap();
+    assert_eq!(saved.profiles["old-trt"], held_out);
+    let (runnable, skipped) = saved.runnable();
+    assert_eq!(runnable.len(), 1);
+    assert!(runnable.contains_key("vllm"));
+    assert_eq!(
+        skipped,
+        vec![UnknownEngineProfile {
+            profile: "old-trt".into(),
+            engine: "tensorrt-llm".into(),
+        }]
+    );
+    let warning = skipped[0].warning(&path);
+    assert!(
+        warning.contains("capyctl engine remove old-trt"),
+        "{warning}"
+    );
+    let loaded = HostConfig::load(&host).unwrap();
+    assert_eq!(loaded.profiles, runnable);
+    assert!(loaded.document["runtime_profiles"].get("old-trt").is_none());
+    assert_eq!(std::fs::read(&host).unwrap(), original);
+}
+
+// T49 T03: a held-out profile written directly in host.yaml follows the
+// same runtime filtering rule and warning as one in engines.yaml.
+#[test]
+fn loading_a_host_skips_direct_held_out_profiles_without_rewriting_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host_doc(dir.path());
+    let mut document = host_value(&host);
+    let mut held_out = profile();
+    held_out["engine"] = "tensorrt-llm".into();
+    held_out["security"]["deep_park"] = "disabled".into();
+    document["runtime_profiles"]["old-trt"] = held_out;
+    document["runtime_profiles"]["vllm"] = profile();
+    std::fs::write(&host, document.to_string()).unwrap();
+    let original = std::fs::read(&host).unwrap();
+
+    let loaded = HostConfig::load(&host).unwrap();
+    assert_eq!(loaded.profiles.len(), 1);
+    assert!(loaded.profiles.contains_key("vllm"));
+    assert!(loaded.document["runtime_profiles"].get("old-trt").is_none());
+    assert_eq!(loaded.skipped_profiles.len(), 1);
+    let warning = loaded.skipped_profiles[0].warning(&host);
+    assert!(
+        warning.contains("capyctl engine remove old-trt"),
+        "{warning}"
+    );
+    assert_eq!(std::fs::read(&host).unwrap(), original);
+
+    let none = capyctl_config::engine_settings::EngineOverrides::default();
+    let configured = loaded
+        .with_engines(&none, &none, &|_, _| {
+            panic!("no local executable is configured")
+        })
+        .unwrap();
+    assert_eq!(configured.skipped_profiles.len(), 1);
+}
+
+// T49 T03: filtering runtime documents must not hide malformed known
+// profiles or manufacture a runtime_profiles field in a document without one.
+#[test]
+fn runtime_filtering_only_removes_unavailable_engine_profiles() {
+    for profiles in [
+        serde_json::json!({}),
+        serde_json::json!({"runtime_profiles": null}),
+        serde_json::json!({"runtime_profiles": []}),
+        serde_json::json!({"runtime_profiles": {
+            "missing": {},
+            "non-string": {"engine": 5},
+            "malformed-vllm": {"engine": "vllm", "executable": 5},
+        }}),
+    ] {
+        let mut document = profiles.clone();
+        assert!(filter_runtime_profiles(&mut document).is_empty());
+        assert_eq!(document, profiles);
+    }
+    let mut document = serde_json::json!({"runtime_profiles": {
+        "future": future_profile(),
+        "held-out": {"engine": "tensorrt-llm"},
+        "vllm": profile(),
+    }});
+    let skipped = filter_runtime_profiles(&mut document);
+    assert_eq!(
+        skipped,
+        vec![
+            UnknownEngineProfile {
+                profile: "future".into(),
+                engine: "futureengine".into(),
+            },
+            UnknownEngineProfile {
+                profile: "held-out".into(),
+                engine: "tensorrt-llm".into(),
+            },
+        ]
+    );
+    assert_eq!(
+        document,
+        serde_json::json!({"runtime_profiles": {"vllm": profile()}})
+    );
+}
+
+// SPEC §15.3: only unknown and held-out engine kinds are skipped. Other
+// known kinds remain strictly validated, and a missing or non-string
 // `engine` is still refused.
 #[test]
 fn a_known_engine_kind_is_still_validated_strictly() {

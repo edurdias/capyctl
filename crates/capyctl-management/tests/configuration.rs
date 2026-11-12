@@ -74,6 +74,283 @@ async fn json_response(response: axum::response::Response) -> Value {
     serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap()
 }
 
+// T49 T07 (SPEC §9.4; ADR 0038, owner decision 2026-11-11): TensorRT-LLM
+// is held out of 0.2.0, including a published profile selected by name or
+// engine family. Refuse creates and replacements before durable admission;
+// no runtime or resource owner may be created.
+#[tokio::test]
+async fn a_tensorrt_llm_deployment_is_refused_before_embedded_admission() {
+    for version in ["1.2.1", "1.4.0rc3"] {
+        for requested in ["local", "tensorrt-llm"] {
+            let (_directory, state, mut config, mut host) = fixture();
+            let created = json_response(
+                app(state.clone(), host.clone())
+                    .oneshot(request(
+                        "POST",
+                        "/management/v1/deployments",
+                        "original",
+                        json!({"config":config,"activate":false}),
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let id = created["deployment_id"].as_str().unwrap();
+            let profile = &mut host["runtime_profiles"]["local"];
+            profile["engine"] = json!("tensorrt-llm");
+            profile["executable"] = json!("/opt/tensorrt-llm/bin/trtllm-serve");
+            profile["build_fingerprint"] = json!(version);
+            profile["args"] = json!([]);
+            profile["env"] = json!({});
+            profile["security"]["deep_park"] = json!("disabled");
+            config["runtime_profile"] = json!(requested);
+            config["residency"] = json!("restart_only");
+            config["engine_config"] = json!({"memory":{"kv_cache":"4GiB"}});
+            let router = app(state.clone(), host);
+            let replacement = format!("/management/v1/deployments/{id}");
+            for (method, path, body) in [
+                (
+                    "POST",
+                    "/management/v1/deployments",
+                    json!({"config":config,"activate":false}),
+                ),
+                (
+                    "PUT",
+                    replacement.as_str(),
+                    json!({"config":config,"expected_revision":1}),
+                ),
+            ] {
+                let response = router
+                    .clone()
+                    .oneshot(request(method, path, method, body))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 400, "{version} {requested} {method}");
+                let body = json_response(response).await;
+                assert_eq!(body["error"]["code"], "invalid_config", "{body}");
+                let message = body["error"]["message"].as_str().unwrap();
+                assert!(
+                    message.contains("engine_unavailable_in_release:tensorrt_llm"),
+                    "{body}"
+                );
+                assert!(message.contains("0.2.x"), "{body}");
+                assert_eq!(body["error"]["retryable"], false);
+                assert!(body["error"]["operation_id"].is_null());
+            }
+            let owner = state.lock().unwrap();
+            assert_eq!(owner.store().deployment_count().unwrap(), 1);
+            assert_eq!(
+                owner
+                    .store()
+                    .effective_configuration(id)
+                    .unwrap()
+                    .unwrap()
+                    .revision,
+                1
+            );
+            assert!(owner.store().runtime_binding(id).unwrap().is_none());
+            assert!(owner.store().resource_snapshot().unwrap().owners.is_empty());
+        }
+    }
+}
+
+// T49 T07 (SPEC §9.4; ADR 0038, owner decision 2026-11-11): a registry
+// deployment is refused as a whole, not accepted with only refused hosts,
+// whether it names one host or several. No revision can later be started.
+#[tokio::test]
+async fn a_tensorrt_llm_deployment_is_refused_before_registry_admission() {
+    let (directory, state, mut config, _host) = fixture();
+    for (name, digest) in [("host-a", 'e'), ("host-b", 'f')] {
+        let id = publish_host(&state, name, digest, json!({}));
+        let owner = state.lock().unwrap();
+        let mut document: Value = serde_json::from_str(
+            &owner
+                .store()
+                .host_publication(&id)
+                .unwrap()
+                .unwrap()
+                .config_json,
+        )
+        .unwrap();
+        let profile = &mut document["runtime_profiles"]["local"];
+        profile["engine"] = json!("tensorrt-llm");
+        profile["executable"] = json!("/opt/tensorrt-llm/bin/trtllm-serve");
+        profile["build_fingerprint"] = json!("1.2.1");
+        profile["args"] = json!([]);
+        profile["env"] = json!({});
+        profile["security"]["deep_park"] = json!("disabled");
+        // This document was approved by a pre-holdout server. Current
+        // publication correctly strips TRT, so seed the historical row.
+        rusqlite::Connection::open(directory.path().join("srv.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE approved_host_publications SET config_json=?2, fingerprint=?3 WHERE host_id=?1",
+                rusqlite::params![id, document.to_string(),
+                    capyctl_config::remote_resources::policy_fingerprint(&document)],
+            )
+            .unwrap();
+    }
+    config.as_object_mut().unwrap().remove("host");
+    // Named devices need exactly one host; the multi-host case names none.
+    config.as_object_mut().unwrap().remove("devices");
+    config["residency"] = json!("restart_only");
+    config["engine_config"] = json!({"memory":{"kv_cache":"4GiB"}});
+    let router = configuration_router(
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+        Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+    );
+    for (key, hosts) in [
+        ("single", json!(["host-a"])),
+        ("multiple", json!(["host-a", "host-b"])),
+    ] {
+        config["placement"] = json!({"hosts":hosts});
+        for requested in ["local", "tensorrt-llm"] {
+            config["runtime_profile"] = json!(requested);
+            let response = router
+                .clone()
+                .oneshot(request(
+                    "POST",
+                    "/management/v1/deployments",
+                    key,
+                    json!({"config":config,"activate":false}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400, "{key} {requested}");
+            let body = json_response(response).await;
+            assert_eq!(body["error"]["code"], "invalid_config", "{body}");
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains("engine_unavailable_in_release:tensorrt_llm"),
+                "{body}"
+            );
+            assert!(message.contains("0.2.x"), "{body}");
+            assert_eq!(body["error"]["retryable"], false);
+        }
+    }
+    let owner = state.lock().unwrap();
+    assert_eq!(owner.store().deployment_count().unwrap(), 0);
+    assert!(owner.store().resource_snapshot().unwrap().owners.is_empty());
+}
+
+// T49 T07 (ADR 0038 amendment A3): a held-out profile on one old host
+// cannot veto an allowed host offering the same name or the requested family.
+#[tokio::test]
+async fn mixed_registry_hosts_admit_the_available_profile_in_either_order() {
+    for requested in ["local", "vllm"] {
+        for held_out_first in [true, false] {
+            let (directory, state, mut config, _) = fixture();
+            let held = publish_host(&state, "host-held", 'e', json!({}));
+            let available = publish_host(&state, "host-available", 'f', json!({}));
+            {
+                let owner = state.lock().unwrap();
+                let mut document: Value = serde_json::from_str(
+                    &owner
+                        .store()
+                        .host_publication(&held)
+                        .unwrap()
+                        .unwrap()
+                        .config_json,
+                )
+                .unwrap();
+                let mut profile = document["runtime_profiles"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("local")
+                    .unwrap();
+                profile["engine"] = json!("tensorrt-llm");
+                profile["executable"] = json!("/opt/tensorrt-llm/bin/trtllm-serve");
+                profile["build_fingerprint"] = json!("1.4.0rc3");
+                profile["args"] = json!([]);
+                profile["env"] = json!({});
+                profile["security"]["deep_park"] = json!("disabled");
+                document["runtime_profiles"][requested] = profile;
+                // Model a publication retained from before the holdout;
+                // the current publication boundary intentionally filters TRT.
+                rusqlite::Connection::open(directory.path().join("srv.sqlite3"))
+                    .unwrap()
+                    .execute(
+                        "UPDATE approved_host_publications SET config_json=?2, fingerprint=?3 WHERE host_id=?1",
+                        rusqlite::params![held, document.to_string(),
+                            capyctl_config::remote_resources::policy_fingerprint(&document)],
+                    )
+                    .unwrap();
+            }
+            config.as_object_mut().unwrap().remove("host");
+            config["devices"] = json!([{"sharing": "shared"}]);
+            for phase in ["cold", "ready", "parking", "wake"] {
+                config["resources"][phase]["devices"] = json!([{"sharing": "shared"}]);
+            }
+            config["runtime_profile"] = json!(requested);
+            config["placement"] = json!({"hosts": if held_out_first {
+                vec!["host-held", "host-available"]
+            } else {
+                vec!["host-available", "host-held"]
+            }});
+            let router = configuration_router(
+                ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+                Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+            );
+            let response = router
+                .clone()
+                .oneshot(request(
+                    "POST",
+                    "/management/v1/deployments",
+                    "mixed",
+                    json!({"config":config,"activate":false}),
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = json_response(response).await;
+            assert_eq!(status, 202, "{requested} {held_out_first}: {body}");
+            let id = body["deployment_id"].as_str().unwrap();
+            let snapshot = state.lock().unwrap().store().snapshot().unwrap();
+            let deployment = snapshot.deployments.iter().find(|d| d.id == id).unwrap();
+            assert!(
+                deployment
+                    .hosts
+                    .iter()
+                    .any(|host| { host.host_id == available && host.outcome == "resolved" }),
+                "{body}"
+            );
+            assert!(
+                deployment.hosts.iter().any(|host| {
+                    host.host_id == "host-held"
+                        && host.outcome == "refused"
+                        && host.diagnostic.as_deref().is_some_and(|reason| {
+                            reason.contains("engine_unavailable_in_release:tensorrt_llm")
+                        })
+                }),
+                "{requested} {held_out_first}: {body}; hosts: {:?}",
+                deployment.hosts
+            );
+
+            // A runnable but disallowed host must not defeat the explicit refusal.
+            config["placement"] = json!({"hosts":["host-held"]});
+            let response = router
+                .oneshot(request(
+                    "POST",
+                    "/management/v1/deployments",
+                    "held-only",
+                    json!({"config":config,"activate":false}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400);
+            let body = json_response(response).await;
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("engine_unavailable_in_release:tensorrt_llm"),
+                "{body}"
+            );
+            assert_eq!(state.lock().unwrap().store().deployment_count().unwrap(), 1);
+        }
+    }
+}
+
 #[tokio::test]
 async fn authenticated_configuration_accepts_replays_and_replaces_without_runtime_effects() {
     let (_directory, state, mut config, host) = fixture();

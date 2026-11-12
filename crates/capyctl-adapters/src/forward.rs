@@ -1974,7 +1974,8 @@ pub(crate) mod tests {
         let peer = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 1024];
-            socket.read(&mut request).await.unwrap();
+            // Any amount: the peer only needs the request to have started.
+            let _started = socket.read(&mut request).await.unwrap();
         });
         let error = reqwest::Client::builder()
             .no_proxy()

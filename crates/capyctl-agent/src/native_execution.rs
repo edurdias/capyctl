@@ -6048,6 +6048,29 @@ mod tests {
         (launch, plan)
     }
 
+    // T49 TR7: ADR 0038 amendment (2026-11-11) also closes previously approved
+    // launch plans before runtime integrity checks or installation measurement.
+    #[test]
+    fn release_holdout_refuses_a_previously_approved_tensorrt_llm_launch() {
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = tensorrt_llm_fixture(root.path(), identity_dir.path());
+        let (launch, plan) = tensorrt_llm_launch(root.path(), &deployment, &policy, closed_port());
+        assert_eq!(
+            executor.admit_launch_full(&launch, &plan, GpuReading::Now),
+            Err(LaunchVerdict::Refused(
+                "engine_unavailable_in_release:tensorrt_llm"
+            ))
+        );
+        assert!(capyctl_protocol::execution::is_policy_refusal(
+            "engine_unavailable_in_release:tensorrt_llm"
+        ));
+        assert!(std::fs::read_dir(root.path().join("rendezvous"))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
     // T49 T16 (ADR 0038 §3, §13): the host resolves and prepares a
     // TensorRT-LLM launch from its own document: the shared builder's plan
     // with the grant's `max_tokens`, the launch's own directory in the
