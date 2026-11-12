@@ -36,7 +36,7 @@ impl TensorrtLlmAdapter {
             http: Http::new(endpoint.clone()),
             // ADR 0038 §9: `trtllm-serve` listens on loopback without a key;
             // nothing is presented.
-            forward: crate::forward::engine_forwarder(
+            forward: crate::forward::engine_forwarder_on(
                 endpoint.clone(),
                 model_id.clone(),
                 None,
@@ -47,6 +47,8 @@ impl TensorrtLlmAdapter {
                 // refused, never forwarded unchanged. Client requests go
                 // through the router's launch-specific forwarder.
                 crate::forward::CacheSalt::Refused,
+                crate::forward::RequestIdLane::Absent,
+                Some("tensorrt-llm"),
             ),
             endpoint,
             fingerprint,

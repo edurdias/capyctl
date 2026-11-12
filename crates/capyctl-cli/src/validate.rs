@@ -105,6 +105,22 @@ pub fn validate_config_at(
         ConfigKind::Standalone => {
             let document =
                 parse_strict(kind, &overridden(&text)?).map_err(|e| named(file, Some(kind), &e))?;
+            let stated =
+                capyctl_config::engine_settings::EngineOverrides::from_document(&document["host"])
+                    .map_err(|e| named(file, Some(kind), &e))?;
+            let env = capyctl_config::engine_settings::EngineOverrides::from_process_env()
+                .map_err(|e| named(file, Some(kind), &e))?;
+            for (profile, engine, _) in
+                capyctl_config::engine_settings::resolve(&Default::default(), &env, &stated)
+                    .installations()
+            {
+                capyctl_config::registration::check_release_availability(engine).map_err(
+                    |mut e| {
+                        e.path = format!("host.runtime_profiles.{profile}.engine");
+                        named(file, Some(kind), &e)
+                    },
+                )?;
+            }
             capyctl_config::remote_roles::drain_timeout(&document)
                 .map_err(|e| named(file, Some(kind), &e))?;
             // Final review I10: the checks `start standalone` runs before any
@@ -706,13 +722,15 @@ fn read(file: &Path) -> Result<String, StructuredError> {
 }
 
 /// The stable name of a configuration error, as reported to the operator.
-fn error_name(code: ConfigErrorCode) -> &'static str {
+fn error_name(code: ConfigErrorCode) -> std::borrow::Cow<'static, str> {
     match code {
         ConfigErrorCode::UnknownField => "unknown_field",
         ConfigErrorCode::DuplicateKey => "duplicate_key",
         ConfigErrorCode::InvalidUnit => "invalid_unit",
         ConfigErrorCode::MissingRequired => "missing_required",
         ConfigErrorCode::UnsupportedCombination => "unsupported_combination",
+        // SPEC R01, ADR 0038 owner decision 2026-11-11: release holdout.
+        ConfigErrorCode::EngineUnavailableInRelease => return code.to_string().into(),
         ConfigErrorCode::ConflictingArgs => "conflicting_args",
         ConfigErrorCode::InvalidCacheRef => "invalid_cache_ref",
         ConfigErrorCode::ContradictoryConnection => "contradictory_connection",
@@ -721,6 +739,7 @@ fn error_name(code: ConfigErrorCode) -> &'static str {
         ConfigErrorCode::ModelSourceDenied => "model_source_denied",
         ConfigErrorCode::Io => "io",
     }
+    .into()
 }
 
 fn named(file: &Path, kind: Option<ConfigKind>, error: &ConfigError) -> StructuredError {

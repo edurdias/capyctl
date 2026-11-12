@@ -173,6 +173,9 @@ impl LiveForwarders {
                 runtime.revision,
             ),
             request_ids,
+            // ADR 0038 §5, §11: use the launch's stream shape through its
+            // host ingress as well as on a local engine connection.
+            runtime.engine.as_deref(),
         );
         cache.retain(|(cached, cached_generation, _, _), _| {
             cached != deployment || *cached_generation != generation

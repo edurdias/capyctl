@@ -536,6 +536,16 @@ async fn add(
         None => pick()?,
     };
     let resolved = resolve(&path).map_err(|e| error(e.code(), e.to_string()))?;
+    // SPEC R01, ADR 0038 owner decision 2026-11-11: TensorRT-LLM is held
+    // out of 0.2.0, even as an uncertified setup. Refuse before any version
+    // check, probe, registration write or publication; retain its implementation.
+    if resolved.engine == Engine::TensorrtLlm {
+        return Err(error(
+            "engine_unavailable_in_release:tensorrt_llm",
+            "TensorRT-LLM is unavailable in CapyCTL 0.2.0; it returns in 0.2.x; \
+             nothing was written",
+        ));
+    }
     // ADR 0039 §1: the line is the installation's form, fixed by resolution.
     let native = resolved.engine == Engine::Tensorfold && resolved.line.is_native();
     let named = name.is_some();
@@ -1625,6 +1635,42 @@ fn unknown_outcome(cause: &str, name: &str) -> StructuredError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T49 T37 (ADR 0038 amendment A3): the candidates consumed by the
+    // interactive picker omit TRT without hiding an allowed co-installation.
+    #[test]
+    fn picker_candidates_omit_held_out_engines() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("venv");
+        let site = root.join("lib/python3.12/site-packages");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        for (package, version, entry) in [
+            ("tensorrt_llm", "1.4.0rc3", "trtllm-serve"),
+            ("vllm", "0.29.0", "vllm"),
+        ] {
+            let metadata = site.join(format!("{package}-{version}.dist-info"));
+            std::fs::create_dir_all(&metadata).unwrap();
+            std::fs::create_dir_all(site.join(package)).unwrap();
+            std::fs::write(
+                metadata.join("METADATA"),
+                format!("Name: {package}\nVersion: {version}\n"),
+            )
+            .unwrap();
+            std::fs::write(root.join("bin").join(entry), "").unwrap();
+        }
+        let found = candidates(std::slice::from_ref(&root));
+        assert!(
+            found
+                .iter()
+                .any(|c| c.env == root && c.engine == Engine::Vllm),
+            "{found:?}"
+        );
+        assert!(
+            found.iter().all(|c| c.engine != Engine::TensorrtLlm),
+            "{found:?}"
+        );
+    }
 
     // T45 (ADR 0033 §§2, 9, 10): before any file is read, a profile is off
     // for the host's zero retention, then the host's `lmcache: off`, then

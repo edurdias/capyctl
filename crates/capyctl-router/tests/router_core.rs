@@ -979,6 +979,41 @@ fn stub_router_serving(
     (authority, deps)
 }
 
+// T49 T19, ADR 0038 §5, §11: the serving launch selects TensorRT-LLM's
+// stream shape for normal inference, not only the adapter's startup probe.
+// The host ingress relays these same bytes without parsing the chunks.
+#[tokio::test]
+async fn tensorrt_llm_stream_shape_is_selected_only_for_its_engine_family() {
+    let fixture = include_str!("../../capyctl-adapters/tests/fixtures/tensorrt_llm_121_chat.sse")
+        .replace("qwen3-4b", "served-name");
+    let (endpoint, _) = scripted_engine(200, "text/event-stream", fixture).await;
+    for family in [
+        Some("tensorrt-llm"),
+        Some("vllm"),
+        Some("sglang"),
+        Some("tensorfold"),
+        Some("llamacpp"),
+        Some("custom"),
+        None,
+    ] {
+        let (_, deps) = stub_router_on(&endpoint, family);
+        let router = capyctl_router::serve_router(deps);
+        let (status, body) = chat_once(&router, "public-alias").await;
+        if family == Some("tensorrt-llm") {
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(body["choices"][0]["message"]["content"], "Ready.");
+            assert_eq!(body["choices"][0]["finish_reason"], "length");
+            assert_eq!(body["model"], "public-alias");
+            let (status, stream) = chat_stream(&router, "public-alias").await;
+            assert_eq!(status, 200, "{stream}");
+            assert!(stream.contains("data: [DONE]"), "{stream}");
+            assert!(stream.contains("chatcmpl-22222222222242228222222222222222"));
+        } else {
+            assert_ne!(status, 200, "{family:?}: {body}");
+        }
+    }
+}
+
 async fn chat_stream(router: &axum::Router, alias: &str) -> (axum::http::StatusCode, String) {
     let response = router
         .clone()

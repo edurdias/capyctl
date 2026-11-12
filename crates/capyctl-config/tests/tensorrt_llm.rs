@@ -113,6 +113,51 @@ fn tensorrt_llm_is_a_named_engine() {
     assert!(ENVIRONMENT_PROFILES.contains(&"local-tensorrt-llm"));
 }
 
+// T49 TR7: ADR 0038 amendment (2026-11-11) keeps low-level normalization,
+// while runtime documents skip historical profiles without touching installations.
+#[test]
+fn release_holdout_retains_normalization_and_skips_registered_profiles() {
+    use capyctl_config::effective::normalize_host_policy;
+    use capyctl_config::registration::{
+        check_release_availability, filter_runtime_profiles, merge_into_host, EnginesFile,
+    };
+
+    let (_, host) = fixture();
+    normalize_host_policy(&host).expect("low-level normalization is retained");
+    let error = check_release_availability(Engine::TensorrtLlm).unwrap_err();
+    assert_eq!(error.code, ConfigErrorCode::EngineUnavailableInRelease);
+    assert!(error
+        .to_string()
+        .contains("engine_unavailable_in_release:tensorrt_llm"));
+    assert!(error.detail.contains("0.2.x"));
+
+    let file = EnginesFile::parse(
+        std::path::Path::new("/srv/config/engines.yaml"),
+        &json!({
+            "schema_version": 1,
+            "kind": "engines",
+            "runtime_profiles": host["runtime_profiles"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut document = host.clone();
+    document["runtime_profiles"] = json!({});
+    let original = document.clone();
+    let (runnable, skipped) = file.runnable();
+    assert!(runnable.is_empty());
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].profile, "local");
+    assert_eq!(skipped[0].engine, "tensorrt-llm");
+    merge_into_host(&mut document, &file).unwrap();
+    assert_eq!(document, original);
+
+    let mut runtime_document = host.clone();
+    assert_eq!(filter_runtime_profiles(&mut runtime_document), skipped);
+    assert_eq!(runtime_document["runtime_profiles"], json!({}));
+    assert!(host["runtime_profiles"].get("local").is_some());
+}
+
 // T49 T17 (ADR 0038 §2, owner rule 2026-10-27): no TensorRT-LLM version is
 // in the verified set until its live rows pass; every version lists as
 // custom and still resolves.

@@ -1,11 +1,22 @@
 # Status: TensorRT-LLM as a native engine (ADR 0038) — 2026-10-28 (branch `feat/tensorrt-llm`)
 
-ADR 0038 (Accepted 2026-10-27; target 0.2.0) is implemented: `tensorrt-llm` is the sixth
-engine kind, running NVIDIA's `trtllm-serve` for chat, `restart_only`, on one GPU of one
-host. The option, LLM API key and environment tables were read from three tags, v1.2.1,
+ADR 0038 (Accepted 2026-10-27; amended 2026-11-11; target 0.2.x) retains the
+implementation, but TensorRT-LLM is unavailable in 0.2.0. The future sixth engine
+kind runs `trtllm-serve` for chat, restart-only, on one GPU of one host.
+The option, LLM API key and environment tables were read from three tags, v1.2.1,
 v1.3.0rc29 and v1.4.0rc1, and are kept per version line (§2a); a name reserved on any line
 is refused on all three, and a version outside them uses its minor line's tables, else
 1.2.1's.
+
+**Release holdout:** the owner decision of 2026-11-11 supersedes the availability
+claims below. In 0.2.0 registration, local-engine configuration, deployment
+admission and launch refuse `engine_unavailable_in_release:tensorrt_llm`;
+detection does not advertise it. It returns in 0.2.x (ADR 0038; R01, T49).
+Existing profiles in `engines.yaml` and host `runtime_profiles` are skipped
+with a warning naming the profile and `capyctl engine remove <name>`, while
+other profiles proceed. Explicit local-engine settings refuse before probes
+or fingerprinting. Validation and management refusals use `invalid_config`
+with the holdout code in the message; `engine add` uses exit 5 and that code.
 
 - **Registration** (§2, ADR 0018 §1 amended): detection reads `tensorrt_llm-*.dist-info`
   and runs nothing; `engine add` takes `<env>/bin/trtllm-serve` and its version check runs
@@ -16,8 +27,8 @@ is refused on all three, and a version outside them uses its minor line's tables
   `triton_kernels/`. The role's own engine is `local_engine.tensorrt-llm`,
   `--tensorrt-llm-bin`, `CAPYCTL_TENSORRT_LLM_BIN` (profile `local-tensorrt-llm`).
 - **Verified set** (§2, §2a): an entry names the version and its torch build. It is empty:
-  every TensorRT-LLM installation lists as `custom` and runs as an uncertified custom
-  setup, never refused for its version (owner decision 2026-10-27, question 7).
+  the retained implementation marks every installation `custom`; the 0.2.0
+  release holdout refuses it regardless of version or custom status.
 - **Launch** (§3, §4): `trtllm-serve serve` on `127.0.0.1` and a leased port, with a
   per-launch served-name link (`served_name_unsupported` for a name that is not one path
   component) and a CapyCTL-written `llm_api_options.yaml`. A deployment adds LLM API
@@ -56,13 +67,8 @@ not qualification. The live rows on host A are still to run: TR1–TR11 for 1.2.
 TR1a–TR11a for the 1.3 pre-release and TR1b–TR11b for 1.4.0rc1; the system packages and
 environments they need are added to AGENTS.md when they are made.
 
-# Release note: TensorRT-LLM
+# Release note: TensorRT-LLM deferred to 0.2.x
 
-- **TensorRT-LLM.** CapyCTL can run NVIDIA TensorRT-LLM's `trtllm-serve` (engine kind
-  `tensorrt-llm`) for chat on one GPU, restart-only: register its environment with
-  `capyctl engine add <env>/bin/trtllm-serve` and add LLM API arguments with
-  `engine_config.tensorrt-llm.llm_api_options`. Versions 1.2.1, the 1.3 pre-release and
-  1.4.0rc1 are being qualified; until their live checks pass, every installation runs as
-  an uncertified custom setup. See [TensorRT-LLM](../guide/engines.md#tensorrt-llm) and
-  [Install an engine](../guide/install-engines.md#tensorrt-llm-121-13-pre-release-or-140rc3).
-  An `engines.yaml` with a TensorRT-LLM profile is refused by releases before 0.2.0.
+- The retained TensorRT-LLM implementation covers single-GPU, restart-only
+  execution, grant-sized KV pools, closed launch environments and process
+  ownership checks. These internals remain gated pending readiness qualification.

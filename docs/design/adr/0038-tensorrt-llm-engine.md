@@ -4,11 +4,10 @@
 question on 2026-10-27, and the answers are recorded below ("Owner decisions of
 2026-10-27"). Three answers differ from the recommendations: Open MPI and the CUDA 13.1
 toolkit are installed system-wide on host A (decision 4), the 1.3 and 1.4 pre-releases are
-qualified with their own rows in 0.2.0 (decision 7, §2a), and the engine kind is
-`tensorrt-llm` (decision 8). Target release 0.2.0 (retargeted from 0.1.9 on 2026-10-27,
-after 0.1.9 shipped with ADR 0035 only). Implemented for 0.2.0 with the SPEC, guide and
-operations texts this ADR lists; the live rows TR1–TR11, TR1a–TR11a and TR1b–TR11b have not
-run, so no version is in the verified set yet.
+originally intended to be qualified in 0.2.0 (decision 7, §2a), and the engine kind is
+`tensorrt-llm` (decision 8). **Target release: 0.2.x, not 0.2.0**, by the owner
+decision of 2026-11-11 below. The implementation is retained, but no version is
+in the verified set and the release holdout applies even to uncertified installations.
 **Amends (with the implementation):** `SPEC.md` §1.1 (R01, supported engines), §9.4 (later
 backends), §20 (T49, live rows TR1–TR11 for 1.2.1, TR1a–TR11a for the 1.3 pre-release and
 TR1b–TR11b for the 1.4 pre-release); ADR 0018 §1 (a sixth installation kind: detection, the
@@ -24,6 +23,39 @@ shape this follows), ADR 0030 (decision models), ADR 0031 §6 and §7 (engines w
 idle signal; the loopback listener check), ADR 0032 (cancelled-request settlement), ADR
 0033 and ADR 0034 (LMCache), ADR 0035 (several GPUs on one host), ADR 0036 (embeddings),
 ADR 0037 (trace context).
+
+### Accepted amendment: owner decision of 2026-11-11 — release holdout
+
+This ADR remains **Accepted**. TensorRT-LLM is unavailable in CapyCTL 0.2.0;
+the implementation is retained for its return in 0.2.x. This supersedes the
+original 0.2.0 target and the permission to run an uncertified installation
+in that release (R01, §9.4, T49).
+
+With ADR 0038's required `TLLM_WORKER_USE_SINGLE_PROCESS=1`, TensorRT-LLM
+1.2.1 and 1.4.0rc3 never populate the iteration statistics consumed by
+`/metrics`. Upstream
+[`executor/worker.py:83–86` (1.2.1)](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.1/tensorrt_llm/executor/worker.py#L83-L86)
+and [`executor/proxy.py:396–405` (1.2.1)](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.1/tensorrt_llm/executor/proxy.py#L396-L405)
+show the statistics wiring; the same paths in
+[1.4.0rc3 worker](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.4.0rc3/tensorrt_llm/executor/worker.py#L83-L86)
+and [1.4.0rc3 proxy](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.4.0rc3/tensorrt_llm/executor/proxy.py#L396-L405)
+retain this blocker. Without those statistics CapyCTL cannot prove the KV
+pool; do not weaken readiness, disable single-process ownership, or label
+the installation custom to bypass the release gate.
+
+Registration, local-engine configuration, deployment admission and launch
+must refuse it before engine execution with
+`engine_unavailable_in_release:tensorrt_llm`, with a hint that it returns in
+0.2.x. Detection must not advertise it as available. T49 covers these release
+gates; the TR rows remain qualification requirements for the future return.
+
+Existing profiles in `engines.yaml` and host `runtime_profiles` are skipped,
+not a reason to stop unrelated engines: warn with the profile name and
+`capyctl engine remove <name>`, at startup, publication and reload. Explicit
+local-engine flags, environment variables and document settings are refused
+before probes or fingerprinting. `engine add` reports exit 5 with the holdout
+code; explicit validation and management actions report `invalid_config` with
+the holdout code in the message. The shared low-level normalization is retained.
 
 ### Amendment of 2026-11-10: 1.4.0rc3 and pip MPI
 

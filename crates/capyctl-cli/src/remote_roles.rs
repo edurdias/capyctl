@@ -988,7 +988,10 @@ fn load_host(
     overrides: &capyctl_config::setting_overrides::SettingOverrides,
 ) -> Result<HostConfig, StructuredError> {
     let invalid = |e: capyctl_config::ConfigError| {
-        let e = overrides.annotate(e);
+        let mut e = overrides.annotate(e);
+        if e.code == capyctl_config::ConfigErrorCode::EngineUnavailableInRelease {
+            e.detail = format!("{}: {}", e.code, e.detail);
+        }
         error(&format!(
             "Invalid host configuration: {}: {}",
             e.path, e.detail
@@ -1003,6 +1006,11 @@ fn load_host(
         .and_then(|config| config.with_models(flags, &env, home.as_deref()))
         .and_then(|config| {
             config.with_engines(engine_flags, &engine_env, &crate::roles::engine_version)
+        })
+        .inspect(|config| {
+            for profile in &config.skipped_profiles {
+                crate::roles::role_warning(&profile.warning(path));
+            }
         })
         .map_err(invalid)
 }

@@ -315,6 +315,11 @@ option, and `--name=value` is refused because llama-server takes only
 
 ## TensorRT-LLM 1.2.1, 1.3.0rc29 and 1.4.0rc1
 
+TensorRT-LLM is unavailable in 0.2.0 and returns in 0.2.x. These retained
+tables do not enable registration or deployment; the release gate is
+`engine_unavailable_in_release:tensorrt_llm` (ADR 0038, owner decision
+2026-11-11; R01, T49).
+
 The options of `trtllm-serve serve` and the fields of its LLM API
 configuration, read from three tags: v1.2.1, v1.3.0rc29 and v1.4.0rc1
 (`crates/capyctl-config/src/tensorrt_llm.rs`). An option or key

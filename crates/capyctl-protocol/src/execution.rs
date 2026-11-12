@@ -1717,6 +1717,8 @@ pub const POLICY_REFUSALS: &[&str] = &[
     "capability_missing:core",
     "engine_config_file",
     "installation_unsupported:editable",
+    // ADR 0038 amendment, owner decision 2026-11-11.
+    "engine_unavailable_in_release:tensorrt_llm",
     capyctl_config::tensorrt_llm::KV_GEOMETRY_UNSUPPORTED,
     capyctl_config::tensorrt_llm::SERVED_NAME_UNSUPPORTED,
 ];

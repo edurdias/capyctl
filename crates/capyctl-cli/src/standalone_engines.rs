@@ -230,9 +230,15 @@ fn refused(code: &str, message: impl Into<String>) -> Value {
 /// What `registered` plus the environment would publish, or the refusal.
 fn resolve(
     provider: &dyn EngineProvider,
-    registered: &Map<String, Value>,
+    file: &EnginesFile,
 ) -> Result<Vec<NamedInstallation>, Value> {
-    for (name, profile) in registered {
+    // ADR 0018 A3 / ADR 0038 amendment: reload has the same skip boundary
+    // and named warning as role start, including held-out engine kinds.
+    let (registered, skipped) = file.runnable();
+    for profile in skipped {
+        crate::roles::role_warning(&profile.warning(&file.path));
+    }
+    for (name, profile) in &registered {
         check_profile(name, profile).map_err(|e| {
             refused(
                 "publish_rejected",
@@ -240,7 +246,7 @@ fn resolve(
             )
         })?;
     }
-    provider.installations(registered).map_err(|e| match e {
+    provider.installations(&registered).map_err(|e| match e {
         ProviderError::ProfileExists(name) => refused(
             "profile_exists",
             format!("{name} is already an environment profile; remove it and register it under another --name"),
@@ -303,8 +309,7 @@ fn reload(
     host_id: &str,
 ) -> Value {
     let registered = match EnginesFile::load_with_custom(engines) {
-        // ADR 0018 amendment A3: an unknown engine kind is skipped, as at start.
-        Ok(file) => file.runnable().0,
+        Ok(file) => file,
         Err(e) => return refused("invalid_config", format!("{}: {}", e.path, e.detail)),
     };
     let named = match resolve(provider, &registered) {
@@ -380,12 +385,10 @@ impl StandaloneControl {
             profile.to_owned(),
         );
         tokio::task::spawn_blocking(move || {
-            let mut registered = EnginesFile::load_with_custom(&engines)
-                .map_err(|e| refused("invalid_config", format!("{}: {}", e.path, e.detail)))?
-                .runnable()
-                .0;
-            registered.remove(&name);
-            resolve(provider.as_ref(), &registered).map(|_| ())
+            let mut file = EnginesFile::load_with_custom(&engines)
+                .map_err(|e| refused("invalid_config", format!("{}: {}", e.path, e.detail)))?;
+            file.profiles.remove(&name);
+            resolve(provider.as_ref(), &file).map(|_| ())
         })
         .await
         .unwrap_or_else(|_| Err(refused("internal", "checking the engines failed")))

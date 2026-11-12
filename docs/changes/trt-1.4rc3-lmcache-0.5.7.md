@@ -1,5 +1,9 @@
 # Status: TensorRT-LLM rc3 and LMCache 0.5.7 compatibility — 2026-11-10 (branch `engines/trt-1.4rc3-lmcache-0.5.7`)
 
+**Availability amended 2026-11-11:** TensorRT-LLM compatibility is retained
+for 0.2.x, not support in 0.2.0. ADR 0038's accepted holdout refuses it with
+`engine_unavailable_in_release:tensorrt_llm` (R01, T49). LMCache is unaffected.
+
 ADR 0038's 1.4 audit now targets v1.4.0rc3 (`9e334fb`), retaining
 1.2.1 and the 1.3 pre-release tables. The renderer owns and rechecks one
 serving frontend on 1.3/1.4, omits the absent option on 1.2.1, and reserves
@@ -31,6 +35,7 @@ No qualification was marked passed and no verified entry was added.
 
 # Release note: Fixes
 
-- **New engine source compatibility.** TensorRT-LLM 1.4.0rc3 is pinned to one
-  serving frontend, and LMCache 0.5.7's salt-preserving source layout passes
-  installation checks. These changes do not qualify either native stack.
+- **Engine source compatibility.** TensorRT-LLM 1.4.0rc3 frontend work is
+  retained for 0.2.x; TensorRT-LLM is unavailable in 0.2.0. LMCache 0.5.7's
+  salt-preserving source layout passes installation checks. Neither native
+  stack is qualified by these changes.

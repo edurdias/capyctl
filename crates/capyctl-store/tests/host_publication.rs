@@ -169,6 +169,102 @@ fn vllm_profile() -> serde_json::Value {
         "security":{"deep_park":"enabled","trust_remote_code":false,"credential_ref":"secret://engine-key","admin_credential_ref":"secret://admin-key"}})
 }
 
+// T49 T33 (ADR 0038 amendment): a pre-holdout host may still send its old
+// profile. Accept its valid publication, but approve only runnable profiles.
+#[test]
+fn a_publication_skips_held_out_profiles_and_keeps_other_engines() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.sqlite3");
+    let store = Store::open(&path).unwrap();
+    let host = enrolled(&store);
+    let mut document = base_document();
+    document["runtime_profiles"]["vllm"] = vllm_profile();
+    let mut held_out = vllm_profile();
+    held_out["engine"] = "tensorrt-llm".into();
+    held_out["security"]["deep_park"] = "disabled".into();
+    document["runtime_profiles"]["old-trt"] = held_out;
+    let incoming = publication(&host, &document);
+    store.publish_host_configuration(&incoming).unwrap();
+
+    let mut approved = document.clone();
+    approved["runtime_profiles"]
+        .as_object_mut()
+        .unwrap()
+        .remove("old-trt");
+    let saved = store.host_publication(&host).unwrap().unwrap();
+    assert_eq!(saved.config_json, approved.to_string());
+    assert_eq!(
+        saved.fingerprint,
+        capyctl_config::remote_resources::policy_fingerprint(&approved)
+    );
+    assert!(document["runtime_profiles"].get("old-trt").is_some());
+
+    document["runtime_profiles"]["other-vllm"] = vllm_profile();
+    store
+        .republish_host_configuration(&publication(&host, &document), &saved.fingerprint)
+        .unwrap();
+    approved["runtime_profiles"]["other-vllm"] = vllm_profile();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    let saved = store.host_publication(&host).unwrap().unwrap();
+    assert_eq!(saved.config_json, approved.to_string());
+    assert_eq!(
+        saved.fingerprint,
+        capyctl_config::remote_resources::policy_fingerprint(&approved)
+    );
+
+    let mut forged = publication(&host, &document);
+    forged.fingerprint = saved.fingerprint.clone();
+    assert!(store.publish_host_configuration(&forged).is_err());
+    assert_eq!(
+        store.host_publication(&host).unwrap().unwrap().config_json,
+        approved.to_string()
+    );
+}
+
+// T49 T33: a publication retained by a pre-holdout server loses its held-out
+// profile on live republication without requiring operator retirement.
+#[test]
+fn a_live_republication_filters_a_pre_holdout_approved_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.sqlite3");
+    let store = Store::open(&path).unwrap();
+    let host = enrolled(&store);
+    let mut document = base_document();
+    document["runtime_profiles"]["vllm"] = vllm_profile();
+    store
+        .publish_host_configuration(&publication(&host, &document))
+        .unwrap();
+
+    let mut held_out = vllm_profile();
+    held_out["engine"] = "tensorrt-llm".into();
+    held_out["security"]["deep_park"] = "disabled".into();
+    document["runtime_profiles"]["old-trt"] = held_out;
+    let legacy = publication(&host, &document);
+    // Model an approved document written by the previous server release.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE approved_host_publications SET config_json=?2, fingerprint=?3 WHERE host_id=?1",
+            rusqlite::params![host, legacy.config_json, legacy.fingerprint],
+        )
+        .unwrap();
+
+    store
+        .republish_host_configuration(&legacy, &legacy.fingerprint)
+        .unwrap();
+    document["runtime_profiles"]
+        .as_object_mut()
+        .unwrap()
+        .remove("old-trt");
+    let saved = store.host_publication(&host).unwrap().unwrap();
+    assert_eq!(saved.config_json, document.to_string());
+    assert_eq!(
+        saved.fingerprint,
+        capyctl_config::remote_resources::policy_fingerprint(&document)
+    );
+}
+
 // T07 T33 (ADR 0018 §3, §4): a live re-publication replaces the approved
 // document only when it changes runtime profiles alone, only over the
 // publication it was based on, and only drops a profile whose retirement the

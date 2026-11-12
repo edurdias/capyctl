@@ -308,6 +308,10 @@ pub struct HostConfig {
     pub runtime_dir_declared: bool,
     pub ingress: Option<HostIngress>,
     pub profiles: Map<String, Value>,
+    /// Direct role-document profiles skipped at load because their engine
+    /// is unknown or held out. The role emits A3 warnings with its document
+    /// path; registered-profile warnings come from `EnginesFile::runnable`.
+    pub skipped_profiles: Vec<crate::registration::UnknownEngineProfile>,
     /// The period of the agent's engine load reports (`load_report_interval`).
     pub load_report_interval: Duration,
     /// `shutdown.drain_timeout`: how long a signalled role lets admitted work finish.
@@ -769,6 +773,7 @@ impl HostConfig {
             runtime_dir_declared,
             ingress,
             profiles,
+            skipped_profiles: Vec::new(),
             load_report_interval,
             drain_timeout: drain_timeout(&document)?,
             activation: host_activation(&document)?,
@@ -819,11 +824,33 @@ impl HostConfig {
     ) -> Result<Self, ConfigError> {
         let stated = crate::engine_settings::EngineOverrides::from_document(&self.document)?;
         let settings = crate::engine_settings::resolve(flags, env, &stated);
+        // ADR 0038 amendment: an explicit local engine is an action gate,
+        // unlike a historical runtime profile. Refuse before any probe.
+        if settings.tensorrt_llm.is_some() {
+            crate::registration::check_release_availability(
+                crate::engine_policy::Engine::TensorrtLlm,
+            )
+            .map_err(|mut error| {
+                let name = if settings.vllm.is_some()
+                    || settings.sglang.is_some()
+                    || settings.tensorfold.is_some()
+                    || settings.llamacpp.is_some()
+                {
+                    "local-tensorrt-llm"
+                } else {
+                    "local"
+                };
+                error.path = format!("runtime_profiles.{name}.engine");
+                error
+            })?;
+        }
         let overrides = self.overrides;
+        let skipped_profiles = self.skipped_profiles;
         let mut document = self.document;
         crate::engine_settings::apply_to_host(&mut document, &settings, probe)?;
         let mut config = Self::parse(&document.to_string())?;
         config.overrides = overrides;
+        config.skipped_profiles = skipped_profiles;
         Ok(config)
     }
     pub fn template(root: &Path) -> String {
@@ -869,11 +896,13 @@ impl HostConfig {
         })?;
         let document = crate::parse_document(&text)?;
         let mut document = overrides.apply_and_validate(document)?;
+        let skipped_profiles = crate::registration::filter_runtime_profiles(&mut document);
         // ADR 0031 amendment A1: custom-engines.yaml beside it too.
         let engines = crate::registration::EnginesFile::load_with_custom(engines)?;
         crate::registration::merge_into_host(&mut document, &engines)?;
         let mut config = Self::parse(&document.to_string()).map_err(|e| overrides.annotate(e))?;
         config.overrides = overrides.clone();
+        config.skipped_profiles = skipped_profiles;
         Ok(config)
     }
 }

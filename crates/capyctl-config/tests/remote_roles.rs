@@ -696,6 +696,53 @@ fn a_host_states_its_engine_settings_three_ways() {
         .is_err());
 }
 
+// T49 T03 (ADR 0038 amendment): explicit local engine settings are refused
+// before even a different engine's executable can be probed.
+#[test]
+fn a_host_refuses_a_local_held_out_engine_before_probing() {
+    use capyctl_config::engine_settings::EngineOverrides;
+    use capyctl_config::ConfigErrorCode;
+    let bare: serde_json::Value =
+        serde_json::from_str(&HostConfig::template(Path::new("/var/lib/capyctl/host"))).unwrap();
+    let none = EngineOverrides::default();
+    let trt = EngineOverrides {
+        tensorrt_llm: Some("/opt/trt/bin/trtllm-serve".into()),
+        ..Default::default()
+    };
+    for layer in ["document", "environment", "flag"] {
+        for other_engine in [false, true] {
+            let mut document = bare.clone();
+            if layer == "document" {
+                document["local_engine"] = serde_json::json!({
+                    "tensorrt-llm": "/opt/trt/bin/trtllm-serve",
+                });
+            }
+            let flags = EngineOverrides {
+                vllm: other_engine.then(|| "/opt/vllm/bin/vllm".into()),
+                ..if layer == "flag" {
+                    trt.clone()
+                } else {
+                    none.clone()
+                }
+            };
+            let env = if layer == "environment" { &trt } else { &none };
+            let error = HostConfig::parse(&document.to_string())
+                .unwrap()
+                .with_engines(&flags, env, &|_, _| panic!("holdout precedes all probes"))
+                .unwrap_err();
+            assert_eq!(error.code, ConfigErrorCode::EngineUnavailableInRelease);
+            assert_eq!(
+                error.path,
+                if other_engine {
+                    "runtime_profiles.local-tensorrt-llm.engine"
+                } else {
+                    "runtime_profiles.local.engine"
+                }
+            );
+        }
+    }
+}
+
 // T03 (final review I8-bis): a state directory named by `--state-dir` or
 // `CAPYCTL_STATE_DIR` replaces the document's for the run, with the identity
 // directory and the managed runtime directory it implies.

@@ -279,6 +279,19 @@ directory); see [llama.cpp](../guide/engines.md#llamacpp). The role's own
 llama.cpp never parks, as a registered one does not, and is refused while
 `/etc/llama.cpp/config.ini` exists.
 
+**TensorRT-LLM is unavailable in 0.2.0; returns in 0.2.x.** Its settings
+below are retained reference only. Local-engine configuration, registration,
+deployment admission and launch fail with
+`engine_unavailable_in_release:tensorrt_llm` (ADR 0038 amendment of
+2026-11-11; R01, T49).
+Existing profiles in `engines.yaml` and host `runtime_profiles` are instead
+skipped with a warning naming the profile and `capyctl engine remove <name>`;
+other profiles proceed. Explicit `local_engine.tensorrt-llm`,
+`--tensorrt-llm-bin` or `CAPYCTL_TENSORRT_LLM_BIN` settings refuse before
+probing or fingerprinting. Explicit validation and management actions use
+`invalid_config` with the holdout code in the message; `engine add` uses
+exit 5 and the holdout code.
+
 A TensorRT-LLM deployment takes `engine_config.context_length`,
 `engine_config.max_concurrent_requests` (32 when not set), `dtype`,
 `kv_cache_dtype` (`auto` or `fp8`), `cuda_graphs`, `trust_remote_code` and the

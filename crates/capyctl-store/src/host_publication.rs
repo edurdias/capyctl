@@ -127,13 +127,18 @@ impl Store {
         {
             return Err(StoreError::Conflict);
         }
-        let config = capyctl_config::remote_roles::HostConfig::parse(&publication.config_json)
+        let mut config = capyctl_config::remote_roles::HostConfig::parse(&publication.config_json)
             .map_err(|_| StoreError::Conflict)?;
         if capyctl_config::remote_resources::policy_fingerprint(&config.document)
             != publication.fingerprint
         {
             return Err(StoreError::Conflict);
         }
+        // ADR 0038 amendment: authenticate the document the host sent before
+        // filtering historical profiles; approve only this release's runtime
+        // document and fingerprint that exact document.
+        capyctl_config::registration::filter_runtime_profiles(&mut config.document);
+        let fingerprint = capyctl_config::remote_resources::policy_fingerprint(&config.document);
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let enrolled: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM enrolled_hosts WHERE host_id=?1 AND revoked=0)",
@@ -143,7 +148,7 @@ impl Store {
         if !enrolled {
             return Err(StoreError::Conflict);
         }
-        tx.execute("INSERT INTO approved_host_publications VALUES(?1,?2,?3,?4,?5) ON CONFLICT(host_id) DO UPDATE SET config_json=excluded.config_json,boot_id=excluded.boot_id,fingerprint=excluded.fingerprint,received_at_ms=excluded.received_at_ms",params![publication.host_id,config.document.to_string(),publication.boot_id,publication.fingerprint,publication.received_at_ms])?;
+        tx.execute("INSERT INTO approved_host_publications VALUES(?1,?2,?3,?4,?5) ON CONFLICT(host_id) DO UPDATE SET config_json=excluded.config_json,boot_id=excluded.boot_id,fingerprint=excluded.fingerprint,received_at_ms=excluded.received_at_ms",params![publication.host_id,config.document.to_string(),publication.boot_id,fingerprint,publication.received_at_ms])?;
         // ADR 0018 §4: any accepted publication, this startup one as well as
         // a live re-publication, clears the confirmed retirements of profiles
         // it no longer lists. A confirmed retirement of a profile still
@@ -196,13 +201,15 @@ impl Store {
         {
             return Err(RepublishRefusal::Invalid);
         }
-        let config = capyctl_config::remote_roles::HostConfig::parse(&publication.config_json)
+        let mut config = capyctl_config::remote_roles::HostConfig::parse(&publication.config_json)
             .map_err(|_| RepublishRefusal::Invalid)?;
         if capyctl_config::remote_resources::policy_fingerprint(&config.document)
             != publication.fingerprint
         {
             return Err(RepublishRefusal::Invalid);
         }
+        capyctl_config::registration::filter_runtime_profiles(&mut config.document);
+        let fingerprint = capyctl_config::remote_resources::policy_fingerprint(&config.document);
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let enrolled: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM enrolled_hosts WHERE host_id=?1 AND revoked=0)",
@@ -225,8 +232,9 @@ impl Store {
         if current_fingerprint != previous_fingerprint {
             return Err(RepublishRefusal::PublicationChanged);
         }
-        let old: serde_json::Value =
+        let mut old: serde_json::Value =
             serde_json::from_str(&current_json).map_err(|_| RepublishRefusal::Store)?;
+        capyctl_config::registration::filter_runtime_profiles(&mut old);
         if !capyctl_config::registration::only_profiles_differ(&old, &config.document) {
             return Err(RepublishRefusal::NotProfilesOnly);
         }
@@ -253,7 +261,7 @@ impl Store {
                 publication.host_id,
                 config.document.to_string(),
                 publication.boot_id,
-                publication.fingerprint,
+                fingerprint,
                 publication.received_at_ms
             ],
         )?;

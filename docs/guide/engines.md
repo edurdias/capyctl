@@ -585,13 +585,22 @@ llama.cpp has run on a discrete NVIDIA GPU so far; a GB10 has not run it yet.
 
 ## TensorRT-LLM
 
-CapyCTL runs NVIDIA TensorRT-LLM's `trtllm-serve`, engine kind
-`tensorrt-llm`: one Hugging Face checkpoint on the PyTorch backend, on one GPU
-of one host, for chat. Three versions are being qualified: 1.2.1, the 1.3
-pre-release (the tables were read from 1.3.0rc29) and 1.4.0rc3. Install one in
-its own Python environment ([Install an
-engine](install-engines.md#tensorrt-llm-121-13-pre-release-or-140rc3)) and
-name its `trtllm-serve`:
+**Unavailable in 0.2.0; returns in 0.2.x.** Registration, local-engine
+configuration, deployment admission and launch refuse TensorRT-LLM with
+`engine_unavailable_in_release:tensorrt_llm`. Detection does not advertise it.
+The required single-process mode in 1.2.1 and 1.4.0rc3 leaves `/metrics`
+iteration statistics empty, preventing KV-pool proof (ADR 0038, accepted
+amendment of 2026-11-11; R01, T49). An uncertified installation cannot bypass
+this holdout.
+Existing profiles in `engines.yaml` and host `runtime_profiles` are skipped
+with a warning naming the profile and `capyctl engine remove <name>`; other
+profiles proceed. Explicit local-engine settings refuse before probes or
+fingerprints. See [Errors](errors.md) for the boundary-specific codes.
+
+The implementation and the following reference are retained for 0.2.x,
+not instructions for enabling support in 0.2.0. The planned engine kind is
+`tensorrt-llm`, running `trtllm-serve` for chat on one GPU. The registration
+command below is refused in 0.2.0:
 
 ```bash
 capyctl engine add ~/tensorrt-llm-1.2.1-venv/bin/trtllm-serve
@@ -599,23 +608,23 @@ capyctl engine add ~/tensorrt-llm-1.2.1-venv/bin/trtllm-serve
 
 The profile is named `tensorrt-llm` unless you pass `--name`.
 
-`engine add` never imports TensorRT-LLM and never runs `trtllm-serve`:
+The retained registration implementation never imports TensorRT-LLM or runs `trtllm-serve`:
 importing it starts MPI and CUDA, and Open MPI could leave a daemon behind.
 It runs the environment's Python on `importlib.metadata` instead, which reads
 the version of `tensorrt_llm` and, beside it, of `torch`, `tensorrt`,
 `flashinfer-python`, `transformers` and `mpi4py`. The profile records those
 as its `companions`, and `engine list` shows them, so a changed torch or
-FlashInfer shows there. `engine detect` finds the environment by its
-`tensorrt_llm-*.dist-info` without running anything. The fingerprint covers
-the `tensorrt_llm/` and `triton_kernels/` packages, their compiled libraries
+FlashInfer shows there. The retained detector reads
+`tensorrt_llm-*.dist-info` without execution; 0.2.0 omits these results.
+The fingerprint covers the `tensorrt_llm/` and `triton_kernels/` packages, their compiled libraries
 included; torch, TensorRT, FlashInfer and the MPI library are outside it.
 
 No TensorRT-LLM version is verified yet. A verified entry names the version
 and the torch build beside it, and each is added only once its live rows pass
 (TR1–TR11 for 1.2.1, TR1a–TR11a and TR1b–TR11b for the pre-releases). Until
-then every TensorRT-LLM installation lists as `CUSTOM yes` and runs as an
-uncertified custom setup; it is never refused for being uncertified, and the
-checks below apply to it all the same. A version outside the three uses the
+then the retained implementation marks TensorRT-LLM installations `CUSTOM yes`.
+That status does not permit registration or launch in 0.2.0. For the future
+return, the checks below apply to every version. A version outside the three uses the
 option tables of the qualified version of its minor line, else 1.2.1's
 ([Engine options](engine-flags.md#tensorrt-llm-121-130rc29-and-140rc1)).
 
