@@ -5,6 +5,7 @@
 setup_plan() {
   cat <<EOF
 Setup (rented x86_64 VM only; approximately 60 minutes, downloads/installations parallel):
+     Only runnable selected rows provision their engine/model/build prerequisites.
   1. Refuse FUNCTIONAL_ONLY=1: use --skip-setup and --engines on an existing host.
      Require C/C++ compilers, make, git, curl, tar, patch, python3, flock and nproc;
      no sudo, system packages, driver changes, or lab environment modifications.
@@ -30,10 +31,12 @@ Setup (rented x86_64 VM only; approximately 60 minutes, downloads/installations 
      and a separate editable SGLang 0.5.23 checkout/environment for #235.
      EM6 alone also gets a fresh vLLM 0.33.0 observational environment with a
      hashed ASGI header-name/byte-count hook; existing environments stay unchanged.
-     For all or LC13-LC16 (including U), also install fresh vLLM 0.34.0rc1.
-  7. Recreate separate vLLM 0.33 (clearing guard), vLLM 0.34.0rc1 (preservation)
-     and SGLang 0.5.23 environments from their freezes using uv; source-build
-     LMCache ${LMCACHE_VERSION:-0.5.7} against each environment's own exact torch.
+     vLLM 0.34.0rc1, when needed alone, uses official architecture-specific wheels
+     pinned to tag commit 52aeb580658571613f8ab28a075a06fa30279beb and SHA256.
+  7. Recreate separate vLLM 0.33 (clearing guard) and SGLang 0.5.23 environments;
+     source-build LMCache ${LMCACHE_VERSION:-0.5.7} against their exact torch.
+     vLLM 0.34 + LMCache is unavailable: opentelemetry-api >=1.45.1 conflicts
+     with LMCache <=1.40.0. Its arm skips; do not override declarations.
      Tracing fixtures additionally create separate vLLM 0.33.0 and SGLang 0.5.23
      environments with API/SDK/OTLP exporter 1.39.1 (within engine declarations),
      and a separate SGLang 0.5.23 without its tracing extra for OT10.
@@ -57,19 +60,14 @@ Setup (rented x86_64 VM only; approximately 60 minutes, downloads/installations 
      and the archive's own SHA256SUMS; install only bin/capyctl as bin/capyctl-old.
  11. Tracing rows run a loopback Python OTLP/HTTP protobuf receiver with the
      tracing environment's opentelemetry-proto; no collector binary is installed.
- 12. For all or explicit --only TR rows, install separate TensorRT-LLM 1.2.1 and
-     1.4.0rc3 NVIDIA cp312 wheels, torch 2.9.1/cu130 and 2.14.0/cu132 respectively.
-     Pin Open MPI 4.1.8, mpi4py and torch constraints. Install private CUDA Toolkit
-     13.1/13.4 wheels; never change the driver or system CUDA. Probe MPI without
-     inherited LD_LIBRARY_PATH, and run a tiny forced-PTX kernel for rc3. A driver/JIT
-     incompatibility makes rc3 unavailable with diagnostic evidence, not a fake pass.
-     TENSORRT_LLM/TRT_LLM name 1.2.1; version-specific engine/CUDA keys are exported.
+ 12. TensorRT-LLM is held out of 0.2.0. TR/P3-TENSORRT rows skip without
+     installing engines, CUDA 13.1/13.4, Open MPI or mpi4py.
  13. Download pinned models concurrently with engine jobs. Record sanitized package
      freezes, RECORD/binary fingerprints, source commits, model lock and availability.
      Never save credentials, environment/command-line dumps, or dependency URLs.
-     Install session-private Rust 1.99.0 and build separate LC12/LC18 source copies
-     using the committed zero-fuzz patches; record source revision and patch/binary
-     hashes. Never replace the release executable or alter an engine environment.
+     Only selected qualification rows install session-private checksum-pinned
+     protoc 29.3 and Rust 1.99.0: LC12 builds only on unified memory; LC18 on
+     either architecture. Preflight protoc before long work.
  14. Write all engine/model keys plus CUDA_HOME to engines.env; check installation
      artifacts exist. Setup does not claim live qualification or run inference.
 EOF
@@ -231,7 +229,18 @@ v020_setup_tools() {
   fi
   v020_cmd "$BIN/uv" --version
   v020_venv "$V020/tools"
-  v020_cmd "$BIN/uv" pip install --python "$V020/tools/bin/python" cmake ninja huggingface_hub
+  local key
+  local -a packages=()
+  if [ -n "$LLAMACPP" ] && [ -z "${V020_OVERRIDES[LLAMACPP]:-}" ]; then packages+=(cmake ninja); fi
+  for key in "${!V020_PATHS[@]}"; do
+    if [[ $key = MODEL_* ]] && [ -n "${!key}" ] && [ -z "${V020_OVERRIDES[$key]:-}" ]; then
+      packages+=(huggingface_hub)
+      break
+    fi
+  done
+  if [ "${#packages[@]}" -gt 0 ]; then
+    v020_cmd "$BIN/uv" pip install --python "$V020/tools/bin/python" "${packages[@]}"
+  fi
   v020_freeze "$V020/tools" tools
 }
 
@@ -304,7 +313,14 @@ v020_install_vllm() {
   fi
   if [ -z "${V020_OVERRIDES[$key]:-}" ] && [ "$reuse" = 0 ]; then
     v020_venv "$path"
-    v020_cmd "$BIN/uv" pip install --python "$path/bin/python" "vllm==$version" --torch-backend=cu130 "${tracing[@]}"
+    if [ "$version" = 0.34.0rc1 ]; then
+      local wheel
+      wheel=$("$V020/tools/bin/python" "$HERE/release_pins.py" --arch "$(uname -m)" --destination "$V020/downloads")
+      v020_cmd "$BIN/uv" pip install --python "$path/bin/python" --prerelease=allow --torch-backend=cu130 "$wheel" "${tracing[@]}"
+      printf '%s\n' 52aeb580658571613f8ab28a075a06fa30279beb >"$EVIDENCE/$key.source-commit.txt"
+    else
+      v020_cmd "$BIN/uv" pip install --python "$path/bin/python" "vllm==$version" --torch-backend=cu130 "${tracing[@]}"
+    fi
   fi
   if [ "$key" = VLLM_033_TRACING ]; then
     v020_cmd "$path/bin/python" -c 'import importlib.metadata as m; assert m.version("vllm")=="0.33.0"; assert all(m.version(n) for n in ("opentelemetry-api","opentelemetry-sdk","opentelemetry-exporter-otlp"))'
@@ -399,6 +415,10 @@ PY
 v020_install_lmcache() {
   local key=$1 base_key=$2 engine=$3 destination=${!1} baseline=${!2}
   [ -n "$destination" ] || return 0
+  if [ "$base_key" = VLLM_034 ]; then
+    v020_setup_error "$(PYTHONPATH="$HERE" python3 -c 'from release_pins import LMCACHE_034_CONFLICT; print(LMCACHE_034_CONFLICT)')"
+    return 1
+  fi
   [ -z "${V020_OVERRIDES[$key]:-}" ] || { v020_freeze "$destination" "$key"; return; }
   [ -n "$baseline" ] || { v020_setup_error 'LMCache recreation requires its baseline engine'; return 1; }
   local version=${LMCACHE_VERSION:-0.5.7} constraints=$V020/downloads/$key-engine-constraints.txt
@@ -502,6 +522,7 @@ v020_cuda_arch() {
 
 v020_build_llamacpp() {
   [ -z "${V020_OVERRIDES[LLAMACPP]:-}" ] || return 0
+  [ -n "$LLAMACPP" ] || return 0
   # Pin source: the v0.9.0 commit table in llamacpp-build.sh at 63f91fc8.
   local source=$V020/engines/llamacpp-v0.9.0 head
   v020_claim "$source"
@@ -522,6 +543,7 @@ v020_build_llamacpp() {
 v020_native_tensorfold() {
   local key=$1 version=$2 expected=$3 destination=${!1} archive stage
   [ -z "${V020_OVERRIDES[$key]:-}" ] || return 0
+  [ -n "$destination" ] || return 0
   # Exports point to the release directory, as accepted by `engine add`.
   v020_mkdir "$destination"
   archive=$V020/downloads/tensorfold-$version-linux-x86_64.tar.gz
@@ -543,6 +565,7 @@ PY
 }
 
 v020_old_binary() {
+  [ -n "${V020_NEEDED[CAPYCTL_OLD]:-}" ] || return 0
   local name base archive stage expected
   name=capyctl-0.1.12-linux-$(uname -m)
   base=https://github.com/edurdias/capyctl/releases/download/v0.1.12
@@ -569,19 +592,22 @@ PY
 
 # ADR 0034 LC12/LC18 run separate qualification builds, never the release binary.
 v020_lmcache_builds() {
+  [ -n "${V020_NEEDED[CAPYCTL_LC12]:-}${V020_NEEDED[CAPYCTL_LC18]:-}" ] || return 0
   [ -f "$V020/source.tar" ] || { v020_setup_error 'qualification source archive missing'; return 1; }
   local stage=$V020/qualification-source
   v020_mkdir "$stage"
   v020_unpack "$V020/source.tar" "$stage"
-  v020_mkdir "$V020/qualification-lc12"
-  v020_mkdir "$V020/qualification-lc18"
-  # prepare() requires absent destinations, while the ownership ledger must
-  # reserve their names before anything writes beneath them.
-  rmdir "$V020/qualification-lc12" "$V020/qualification-lc18"
+  local row
+  for row in LC12 LC18; do
+    [ -n "${V020_NEEDED[CAPYCTL_$row]:-}" ] || continue
+    v020_mkdir "$V020/qualification-${row,,}"
+    # prepare() requires an absent destination; reserve ownership first.
+    rmdir "$V020/qualification-${row,,}"
+  done
   v020_fetch https://sh.rustup.rs "$V020/downloads/qualification-rustup.sh"
   v020_cmd sh "$V020/downloads/qualification-rustup.sh" -y --no-modify-path --profile minimal --default-toolchain 1.99.0
   v020_cmd env PATH="$CARGO_HOME/bin:$PATH" "$V020/tools/bin/python" \
-    "$V020/live/lmcache_builds.py" --source "$stage" --root "$V020"
+    "$V020/live/lmcache_builds.py" --source "$stage" --root "$V020" --only "${ONLY:-all}" "${selection_flags[@]}"
 }
 
 
@@ -592,126 +618,12 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({"available":sys.argv[2]=="true"
 PY
 }
 
-v020_trt_toolkit() {
-  local key=$1 version=$2 cuda_key=$3 toolkit nvcc library
-  if [ -n "${V020_OVERRIDES[$cuda_key]:-}" ]; then
-    toolkit=${!cuda_key}
-  else
-    local environment=$V020/engines/$key-cuda-venv
-    v020_venv "$environment"
-    v020_cmd "$BIN/uv" pip install --python "$environment/bin/python" \
-      "cuda-toolkit[all]==$version.*"
-    toolkit=$("$V020/tools/bin/python" - "$environment" <<'PY'
-import pathlib,sys
-paths=sorted(pathlib.Path(sys.argv[1]).rglob("bin/nvcc"))
-if len(paths)!=1:
-    raise SystemExit("TRT CUDA toolkit has no unique nvcc")
-print(paths[0].parent.parent)
-PY
-)
-    case "$toolkit" in "$environment/"*) ;; *) v020_setup_error 'TRT toolkit escaped session'; return 1 ;; esac
-    for library in "$toolkit"/lib/*.so.*; do
-      [ -f "$library" ] || continue
-      nvcc=${library%%.so.*}.so
-      [ -e "$nvcc" ] || ln -s "$(basename "$library")" "$nvcc"
-    done
-    [ -e "$toolkit/lib64" ] || ln -s lib "$toolkit/lib64"
-    v020_toolkit_compilers "$toolkit"
-    v020_freeze "$environment" "$key-cuda"
-  fi
-  [ -x "$toolkit/bin/nvcc" ] || { v020_setup_error 'TRT CUDA compiler missing'; return 1; }
-  printf '%s\n' "$toolkit" >"$EVIDENCE/$key.cuda-home.txt"
-  export CUDA_HOME=$toolkit CUDACXX=$toolkit/bin/nvcc
-  export PATH=$toolkit/bin:$PATH LD_LIBRARY_PATH=$toolkit/lib64:$toolkit/lib
-  v020_cmd "$CUDACXX" --version
-}
-
-v020_trt_driver_probe() {
-  local key=$1 source=$V020/downloads/$1-driver-probe.cu binary=$V020/downloads/$1-driver-probe arch
-  cat >"$source" <<'CU'
-#include <cuda_runtime.h>
-#include <cstdio>
-__global__ void touch(int *value) { *value = 1; }
-int main() {
-  int *value = nullptr;
-  cudaError_t result = cudaMalloc(&value, sizeof(int));
-  if (result == cudaSuccess) {
-    touch<<<1, 1>>>(value);
-    result = cudaGetLastError();
-    if (result == cudaSuccess) result = cudaDeviceSynchronize();
-  }
-  std::printf("cuda_runtime_result=%d %s\n", static_cast<int>(result), cudaGetErrorString(result));
-  if (value != nullptr) cudaFree(value);
-  if (result == cudaSuccess) return 0;
-  return result == cudaErrorInsufficientDriver || result == cudaErrorUnsupportedPtxVersion ||
-         result == cudaErrorSystemDriverMismatch || result == cudaErrorCompatNotSupportedOnDevice ? 42 : 1;
-}
-CU
-  arch=$(v020_cuda_arch torch)
-  arch=${arch/./}
-  v020_cmd timeout 180 "$CUDACXX" -gencode "arch=compute_$arch,code=compute_$arch" \
-    -ccbin "$(command -v c++)" "$source" -o "$binary"
-  if v020_cmd timeout 60 env CUDA_FORCE_PTX_JIT=1 "$binary"; then
-    v020_trt_availability "$key" true 'installed; toolkit13.4 forced-PTX kernel succeeded; model qualification still required'
-  else
-    local result=$?
-    if [ "$result" = 42 ]; then
-      v020_trt_availability "$key" false 'driver_unsupported: CUDA error35/222/803/804 from toolkit13.4 forced-PTX kernel on the unchanged driver; see setup.log'
-    else
-      v020_trt_availability "$key" false 'CUDA preflight failed for a reason other than explicit driver incompatibility; see setup.log'
-      return 1
-    fi
-  fi
-}
-
-v020_setup_tensorrt() {
-  local key=$1 version=$2 torch_version=$3 backend=$4 toolkit_version=$5 cuda_key=$6 destination=${!1} wheel constraints
-  if [ -z "$destination" ]; then
-    v020_trt_availability "$key" false 'not selected: TensorRT installs only for all or explicit TR rows'
-    return 0
-  fi
-  if [ -n "${V020_OVERRIDES[$key]:-}" ]; then
-    v020_freeze "$destination" "$key"
-    v020_trt_availability "$key" true 'configured read-only engine override; live qualification still required'
-    return 0
-  fi
-  v020_venv "$destination"
-  v020_cmd "$BIN/uv" pip install --python "$destination/bin/python" \
-    "torch==$torch_version" torchvision --index-url "https://download.pytorch.org/whl/$backend"
-  v020_cmd "$BIN/uv" pip install --python "$destination/bin/python" openmpi==4.1.8 mpi4py
-  constraints=$V020/downloads/$key-torch-constraints.txt
-  printf 'torch==%s+%s\n' "$torch_version" "$backend" >"$constraints"
-  if [ "$version" = 1.2.1 ]; then
-    # TRT 1.2.1 requires NumPy<2; PyArrow 26's wheel imports only with NumPy>=2.
-    # Keep a compatible pair instead of accepting pip's metadata-only solution.
-    printf 'numpy==1.26.4\npyarrow==21.*\n' >>"$constraints"
-  fi
-  case "$version" in
-    1.2.1) wheel=https://pypi.nvidia.com/tensorrt-llm/tensorrt_llm-1.2.1-cp312-cp312-linux_x86_64.whl ;;
-    1.4.0rc3) wheel=https://pypi.nvidia.com/tensorrt-llm/tensorrt_llm-1.4.0rc3-cp312-cp312-manylinux_2_28_x86_64.whl ;;
-    *) v020_setup_error 'unsupported TensorRT wheel'; return 1 ;;
-  esac
-  v020_cmd "$BIN/uv" pip install --python "$destination/bin/python" --prerelease=allow \
-    --constraint "$constraints" --extra-index-url https://pypi.nvidia.com \
-    --index-strategy unsafe-best-match "$wheel"
-  v020_trt_toolkit "$key" "$toolkit_version" "$cuda_key"
-  # The managed engine does not inherit arbitrary loader settings. Prove that
-  # pip MPI resolves its own libraries without a shell LD_LIBRARY_PATH workaround.
-  if ! v020_cmd timeout 60 env -u LD_LIBRARY_PATH \
-    OMPI_MCA_ess_singleton_isolated=1 OMPI_MCA_btl=self OMPI_MCA_pml=ob1 \
-    "$destination/bin/python" -c 'from mpi4py import MPI; print(MPI.Get_library_version().splitlines()[0])'; then
-    v020_trt_availability "$key" false 'MPI loader/import failed without inherited LD_LIBRARY_PATH; see setup.log'
-    return 1
-  fi
-  v020_freeze "$destination" "$key"
-  if [ "$version" = 1.4.0rc3 ]; then
-    v020_trt_driver_probe "$key"
-  else
-    v020_trt_availability "$key" true 'installed with pinned torch and MPI; model qualification still required'
-  fi
-}
-
 v020_models() {
+  local key needed=0
+  for key in "${!V020_PATHS[@]}"; do
+    if [[ $key = MODEL_* ]] && [ -n "${!key}" ] && [ -z "${V020_OVERRIDES[$key]:-}" ]; then needed=1; fi
+  done
+  [ "$needed" = 1 ] || return 0
   v020_cmd "$V020/tools/bin/python" - "$V020" "$EVIDENCE" <<'PY'
 import concurrent.futures,hashlib,json,os,pathlib,re,sys
 from huggingface_hub import HfApi,hf_hub_download,snapshot_download
@@ -732,6 +644,8 @@ lock_path=root/"models.lock.json"
 lock=json.loads(lock_path.read_text()) if lock_path.exists() else {}
 api=HfApi()
 for key,(repo,requested,filename) in specs.items():
+    if not os.environ.get(key):
+        continue
     if key in overrides:
         continue
     if key in lock:
@@ -768,21 +682,30 @@ def download(key):
     return key,{"revision":item["revision"],"files":len(files),"bytes":sum(p.stat().st_size for p in files),
                 "config_sha256":hashlib.sha256(config.read_bytes()).hexdigest()}
 with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-    fingerprints=dict(pool.map(download,[key for key in specs if key not in overrides]))
+    fingerprints=dict(pool.map(download,[key for key in specs if key not in overrides and os.environ.get(key)]))
 (evidence/"models.fingerprint.json").write_text(json.dumps(fingerprints,indent=2,sort_keys=True)+"\n")
 print("Pinned model downloads complete:",len(fingerprints))
 PY
+}
+
+v020_preflight_protoc() {
+  [ -n "${V020_NEEDED[CAPYCTL_LC12]:-}${V020_NEEDED[CAPYCTL_LC18]:-}" ] || return 0
+  v020_mkdir "$V020/protoc-tools"
+  PROTOC=$(python3 "$setup_here/protoc_pins.py" --root "$V020")
+  export PROTOC
 }
 
 setup() (
   set +x
   set -euo pipefail
   umask 077
+  local setup_here
+  setup_here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   # This check deliberately precedes every write, including cache setup.
   [ "${FUNCTIONAL_ONLY:-0}" != 1 ] || { v020_setup_error 'functional-only hosts require --skip-setup and --engines; no installs permitted'; exit 1; }
   case "$(uname -m)" in x86_64|aarch64) ;; *) v020_setup_error 'unsupported setup architecture'; exit 1 ;; esac
   local tool
-  for tool in python3 curl git tar patch flock grep nproc readlink install cc c++ make timeout; do
+  for tool in python3 curl tar flock grep readlink; do
     command -v "$tool" >/dev/null 2>&1 || { v020_setup_error "missing prerequisite: $tool (do not install system packages)"; exit 1; }
   done
   : "${V020:?remote.sh must supply V020}" "${BIN:?remote.sh must supply BIN}" "${EVIDENCE:?remote.sh must supply EVIDENCE}"
@@ -829,18 +752,24 @@ setup() (
       V020_PATHS[VLLM_034]=$V020/engines/vllm-0.34.0rc1-venv
       V020_PATHS[LMCACHE_VLLM_034]=$V020/engines/vllm-0.34.0rc1-lmcache057-venv ;;
   esac
-  local trt_row
-  local -a trt_rows=()
-  IFS=',' read -r -a trt_rows <<<"$requested_rows"
-  for trt_row in "${trt_rows[@]}"; do
-    case "${trt_row^^}" in
-      ALL|TR|TR[0-9]*|TRT*|TENSORRT*|P3*TENSORRT*|P3*TRT*)
-        V020_PATHS[TENSORRT_LLM_121]=$V020/engines/tensorrt-llm-1.2.1-venv
-        V020_PATHS[TENSORRT_LLM_140RC3]=$V020/engines/tensorrt-llm-1.4.0rc3-venv
-        break ;;
-    esac
+  local -A V020_NEEDED=()
+  local -a selection_flags=()
+  [ "$(uname -m)" != aarch64 ] || selection_flags+=(--unified)
+  local dependencies key value overrides_file
+  dependencies=$(python3 "$setup_here/setup_selection.py" --only "$requested_rows" "${selection_flags[@]}")
+  while IFS= read -r key; do
+    [ -z "$key" ] || V020_NEEDED[$key]=1
+  done <<<"$dependencies"
+  for key in "${!V020_PATHS[@]}"; do
+    if [ -z "${V020_NEEDED[$key]:-}" ]; then V020_PATHS[$key]=''; fi
   done
-  local key value overrides_file
+  if [ -z "$dependencies" ]; then
+    # Selected rows all skip: do not bootstrap even uv/CUDA/model tools.
+    for key in "${!V020_PATHS[@]}"; do printf '%s=\n' "$key"; done >"$V020/engines.env"
+    cp -- "$V020/engines.env" "$EVIDENCE/engines.env"
+    printf '%s\n' 'SETUP_OK (selected rows need no setup; held-out rows remain skips)'
+    return 0
+  fi
   if [ -n "${ENGINES_FILE:-}" ]; then
     overrides_file=$V020/engine-overrides.tsv
     python3 - "$ENGINES_FILE" "$overrides_file" <<'PY'
@@ -868,6 +797,7 @@ pathlib.Path(sys.argv[2]).write_text("".join(rows))
 PY
     while IFS=$'\t' read -r key value; do
       [ -n "${V020_PATHS[$key]+present}" ] || { v020_setup_error 'unknown engine/model mapping key'; exit 1; }
+      [ -n "${V020_NEEDED[$key]:-}" ] || [ "$key" = CUDA_HOME ] || continue
       V020_PATHS[$key]=$value
       V020_OVERRIDES[$key]=1
     done <"$overrides_file"
@@ -889,8 +819,8 @@ PY
   if [ "$(uname -m)" = aarch64 ]; then
     # The owner provisions approved lab engines separately. Even an unavailable
     # engine must have an explicit empty mapping; setup never upgrades a lab venv.
-    for key in VLLM_032 VLLM_033 VLLM_034 SGLANG_0522 SGLANG_0523 VLLM_033_TRACING SGLANG_0523_TRACING SGLANG_0523_SDK_FREE SGLANG_EDITABLE LMCACHE LMCACHE_VLLM_034 LMCACHE_SGLANG \
-      LLAMACPP TENSORFOLD_126 TENSORFOLD_115 TENSORFOLD_066 TENSORRT_LLM_121 TENSORRT_LLM_140RC3 CUDA_HOME; do
+    for key in "${!V020_NEEDED[@]}"; do
+      case "$key" in MODEL_*|CAPYCTL_*) continue ;; esac
       [ -n "${V020_OVERRIDES[$key]:-}" ] || { v020_setup_error "aarch64 requires an explicit read-only mapping: $key"; exit 1; }
     done
   fi
@@ -901,13 +831,28 @@ PY
       V020_MODEL_OVERRIDES+=,$key
     fi
   done
+  local needs_compiler=0
+  for key in LMCACHE LMCACHE_SGLANG LMCACHE_VLLM_034 LLAMACPP; do
+    if [ -n "${!key}" ] && [ -z "${V020_OVERRIDES[$key]:-}" ]; then needs_compiler=1; fi
+  done
+  if [ "$needs_compiler" = 1 ] || [ -n "${V020_NEEDED[CAPYCTL_LC12]:-}${V020_NEEDED[CAPYCTL_LC18]:-}" ]; then
+    for tool in git patch nproc install cc c++ make timeout; do
+      command -v "$tool" >/dev/null 2>&1 || { v020_setup_error "missing prerequisite: $tool (do not install system packages)"; exit 1; }
+    done
+  fi
+  v020_preflight_protoc
   v020_setup_tools
-  v020_setup_cuda
+  local needs_cuda=0
+  for key in LMCACHE LMCACHE_VLLM_034 LMCACHE_SGLANG LLAMACPP; do
+    if [ -n "${!key}" ] && [ -z "${V020_OVERRIDES[$key]:-}" ]; then needs_cuda=1; fi
+  done
+  [ "$needs_cuda" = 0 ] || v020_setup_cuda
   v020_prepare_lmcache_source
   v020_lmcache_builds
   # Reserve the actual model destination directories before HF creates them.
   for key in MODEL_CHAT MODEL_CHAT_GGUF MODEL_EMBED MODEL_EMBED_GGUF MODEL_EMBED8 MODEL_CLEF MODEL_CLEF_GGUF MODEL_TENSORFOLD; do
     [ -z "${V020_OVERRIDES[$key]:-}" ] || continue
+    [ -n "${!key}" ] || continue
     value=${!key}
     case "$key" in *_GGUF) value=$(dirname "$value") ;; esac
     v020_mkdir "$value"
@@ -930,8 +875,6 @@ PY
   (v020_signal_observer) & pids+=("$!"); labels+=(STRACE)
   (v020_old_binary) & pids+=("$!"); labels+=(CAPYCTL_OLD)
   (v020_models) & pids+=("$!"); labels+=(MODELS)
-  (v020_setup_tensorrt TENSORRT_LLM_121 1.2.1 2.9.1 cu130 13.1 CUDA_HOME_TRT121) & pids+=("$!"); labels+=(TENSORRT_LLM_121)
-  (v020_setup_tensorrt TENSORRT_LLM_140RC3 1.4.0rc3 2.14.0 cu132 13.4 CUDA_HOME_TRT140RC3) & pids+=("$!"); labels+=(TENSORRT_LLM_140RC3)
   local failed=0 index
   for index in "${!pids[@]}"; do
     if ! wait "${pids[$index]}"; then
@@ -940,38 +883,11 @@ PY
     fi
   done
   [ "$failed" = 0 ] || exit 1
-  # Background jobs cannot update the caller's mapping. Only an explicit
-  # unavailable receipt clears a configured path; missing/malformed receipts fail.
-  local available cuda_key
+  # TensorRT-LLM is held out of 0.2.0, including setup dependencies.
   for key in TENSORRT_LLM_121 TENSORRT_LLM_140RC3; do
-    available=$("$V020/tools/bin/python" - "$EVIDENCE/$key.availability.json" <<'PY'
-import json,pathlib,sys
-receipt=json.loads(pathlib.Path(sys.argv[1]).read_text())
-if type(receipt.get("available")) is not bool or not isinstance(receipt.get("reason"),str) or not receipt["reason"]:
-    raise SystemExit("invalid TensorRT availability receipt")
-print("yes" if receipt["available"] else "no")
-PY
-)
-    if [ "$available" = no ]; then printf -v "$key" '%s' ''; fi
-    case "$key" in
-      TENSORRT_LLM_121) cuda_key=CUDA_HOME_TRT121 ;;
-      TENSORRT_LLM_140RC3) cuda_key=CUDA_HOME_TRT140RC3 ;;
-    esac
-    if [ -f "$EVIDENCE/$key.cuda-home.txt" ]; then
-      IFS= read -r value <"$EVIDENCE/$key.cuda-home.txt"
-      printf -v "$cuda_key" '%s' "$value"
-    fi
+    v020_trt_availability "$key" false 'TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11)'
   done
-  export TENSORRT_LLM=$TENSORRT_LLM_121 TRT_LLM=$TENSORRT_LLM_121
-  "$V020/tools/bin/python" - "$EVIDENCE" <<'PY'
-import json,pathlib,sys
-root=pathlib.Path(sys.argv[1])
-lines=[]
-for key in ("TENSORRT_LLM_121","TENSORRT_LLM_140RC3"):
-    receipt=json.loads((root/(key+".availability.json")).read_text())
-    lines.append(key+": "+receipt["reason"])
-(root/"tensorrt-availability.txt").write_text("\n".join(lines)+"\n")
-PY
+  printf '%s\n' 'TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11)' >"$EVIDENCE/tensorrt-availability.txt"
   # Artifact checks only; no engine serving, inference, or qualification in setup.
   for key in "${!V020_PATHS[@]}"; do
     value=${!key}
@@ -979,7 +895,9 @@ PY
       v020_setup_error "missing artifact: $key"; exit 1
     fi
   done
-  [ -x "$BIN/capyctl-old" ] || { v020_setup_error 'old release binary missing'; exit 1; }
+  if [ -n "${V020_NEEDED[CAPYCTL_OLD]:-}" ]; then
+    [ -x "$BIN/capyctl-old" ] || { v020_setup_error 'old release binary missing'; exit 1; }
+  fi
   "$V020/tools/bin/python" - "$EVIDENCE/binaries.fingerprint.json" \
     "$BIN/capyctl" "$BIN/capyctl-old" "$LLAMACPP" "$STRACE" <<'PY'
 import hashlib,json,os,pathlib,sys

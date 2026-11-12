@@ -154,8 +154,23 @@ the Python OTLP receiver. LMCache builds keep the engine's torch pinned, use CUD
 compiled against another engine's torch. Unified-memory cache rows accept the
 approved vLLM 0.33.0/LMCache 0.5.7 tuple as well as the existing 0.32.0/0.5.6 tuple;
 the GPU memory architecture does not select a package version.
-TensorFold 0.6.6 is an optional TF3 comparison: explicitly select TF3 to install
-it, or supply its mapping. It does not delay the default setup.
+Setup provisions only runnable selected rows and their dependencies. TensorFold 0.6.6
+is selected for TF3, TF9 and TF12 (including a full-catalog run), not unrelated rows.
+TR/P3-TENSORRT rows remain held out and install nothing: no TensorRT-LLM,
+CUDA 13.1/13.4, Open MPI or mpi4py.
+
+vLLM 0.34.0rc1 is not on PyPI. Its architecture-specific official wheels are pinned
+to tag commit `52aeb580658571613f8ab28a075a06fa30279beb` and SHA256 in
+`release_pins.py`; provenance records that commit. Wheel metadata requires torch
+2.14.0 (cu130 backend), torchvision 0.29.0 and torchaudio 2.11.0. Dependencies
+remain normally resolved, without `--no-deps`.
+The LMCache 0.5.7 source/no-build-isolation recipe still builds against the installed
+torch/CUDA ABI, but its runtime declarations **cannot resolve** with this rc:
+vLLM requires `opentelemetry-api>=1.45.1`, whereas LMCache 0.5.7/current dev cap it
+at `<=1.40.0` and cap `opentelemetry-exporter-prometheus<=0.61b0`. Setup does not
+install that impossible pair or change declarations. LC13–LC16 (including U)
+retain a reasoned skip for the vLLM 0.34 arm while still running the old vLLM guard
+and SGLang protocol; the row cannot pass from those remaining arms.
 The editable SGLang fixture disables optional Rust extensions: #235 must refuse
 it before any engine launch.
 
@@ -362,7 +377,11 @@ LC12's historical patch lists only Qwen3 on GB10 and restores LMCache-driven
 transfer, including the historical launch-time sleep guard; it qualifies nothing.
 LC18 changes only restart transfer in its qualification copy. Neither patch
 changes the release table or records the unrun rows as passing in the product.
-No new engine packages or environments are installed for these rows.
+Setup builds only selected qualification binaries: LC12 only on unified hardware,
+LC18 on either architecture. Before long setup work it downloads checksum-pinned
+protoc 29.3 from the official protobuf GitHub release into the private session,
+preflights its exact version and exports `PROTOC` for cargo. Both architecture pins
+live in `protoc_pins.py`; no system protobuf package is required.
 
 LC12 is unified-only and requires GB10. On host A, use existing read-only engine
 environments and prebuild/copy the qualification binary and matching receipt;

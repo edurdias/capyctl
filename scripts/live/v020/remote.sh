@@ -22,7 +22,7 @@ fi
 marker=$HOME/LIVE-SESSION-IN-USE.txt
 preflight() {
   local tool
-  for tool in python3 git curl tar cc c++ make nvidia-smi; do
+  for tool in python3 nvidia-smi; do
     command -v "$tool" >/dev/null || { printf 'BLOCKED: missing prerequisite %s\n' "$tool"; return 1; }
   done
   nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
@@ -39,6 +39,15 @@ plan() {
   printf '%s\n' 'Preflight compiler/tools/GPU; never apt, driver updates, or system CUDA changes.'
   setup_plan
   python3 "$HERE/v020.py" plan --only "$ONLY"
+  python3 - "$ONLY" "$SKIP_SETUP" <<'PY'
+import sys
+from v020 import select_rows
+from setup_selection import dependencies
+rows = sum(row['budget'] for row in select_rows(sys.argv[1]))
+setup = 3600 if sys.argv[2] != '1' and dependencies(sys.argv[1]) else 0
+print(f'Catalog worst-case row budgets: {rows}s; setup planning allowance: {setup}s; combined: {rows + setup}s ({(rows + setup)/3600:.2f}h).')
+print('Setup allowance is an estimate; the outer session deadline remains authoritative.')
+PY
   printf '%s\n' 'Roles: standalone 19743/19744; server 19843-19847; skew/upgrade 19943-19947; private state mode 700.'
   printf '%s\n' 'Copy only sanitized JSON evidence, freeze/fingerprints and summaries; SHA-256 manifest locally.'
   printf '%s\n' 'Finally delete managed deployments, stop owned roles, require GPU PID subset of preflight, remove marker; purge created paths unless --keep.'

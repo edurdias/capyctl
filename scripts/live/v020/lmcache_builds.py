@@ -21,13 +21,25 @@ def prepare(source, destination, patch):
     return dict(patch=patch.name, patch_sha256=digest(patch), source_copy=str(destination))
 
 
+def selected_builds(selection, unified):
+    from v020 import select_rows
+    selected = {row['id'] for row in select_rows(selection)}
+    return [row for row in ('lc12', 'lc18')
+            if row.upper() in selected and (row != 'lc12' or unified)]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--root', type=Path, required=True)
+    parser.add_argument('--only', default='all')
+    parser.add_argument('--unified', action='store_true')
     args = parser.parse_args()
+    builds = selected_builds(args.only, args.unified)
+    if not builds:
+        return
     here = Path(__file__).resolve().parent
-    for row in ('lc12', 'lc18'):
+    for row in builds:
         destination = args.root / ('qualification-' + row)
         receipt = prepare(args.source, destination, here / ('lmcache-' + row + '.patch'))
         target = destination / 'target'

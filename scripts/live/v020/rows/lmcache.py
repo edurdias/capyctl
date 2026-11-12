@@ -736,6 +736,10 @@ def run(ctx, row):
     # T45 / ADR0034 amendment: run both preservation recipes in full, and retain
     # the old clearing-source guard separately. No version bypasses the source gate.
     for engine in ("LMCACHE", "LMCACHE_VLLM_034", "LMCACHE_SGLANG"):
+        if engine == "LMCACHE_VLLM_034":
+            from release_pins import LMCACHE_034_CONFLICT
+            results.append(dict(verdict="skip", reason=LMCACHE_034_CONFLICT, evidence=[]))
+            continue
         p = Protocol(ctx, row, role=role, engine=engine)
         guard_only = engine == "LMCACHE"
         try:

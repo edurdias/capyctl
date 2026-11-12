@@ -302,7 +302,7 @@ class HelperTests(unittest.TestCase):
                     with self.assertRaisesRegex(AssertionError, 'approved installation'):
                         fixtures(ctx, [], key)
 
-    def test_aarch64_setup_requires_every_engine_override_before_tools(self):
+    def test_aarch64_setup_requires_selected_engine_override_before_tools(self):
         import subprocess
         mapping = self.root / 'lab.env'
         names = ('VLLM_032 VLLM_033 VLLM_034 SGLANG_0522 SGLANG_0523 SGLANG_EDITABLE '
@@ -312,6 +312,7 @@ class HelperTests(unittest.TestCase):
         script = '''
 source "$1"
 export HOME=$2 V020=$2/session BIN=$2/session/bin EVIDENCE=$2/session/evidence
+ONLY=ISSUE235
 ENGINES_FILE=$2/lab.env
 mkdir -p "$V020"
 uname() { printf 'aarch64\\n'; }
@@ -332,29 +333,6 @@ setup
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn('READ_ONLY_MAPPINGS_ACCEPTED', result.stdout)
-
-    def test_trt_driver_probe_compiles_for_the_detected_gpu(self):
-        import subprocess
-        (self.root / 'downloads').mkdir()
-        setup = Path(__file__).with_name('setup.sh')
-        script = '''
-source "$1"
-V020=$2
-CUDACXX=/unused/nvcc
-nvidia-smi() { printf '%s\\n' "$3"; }
-v020_cmd() { printf '%s\\n' "$*"; }
-v020_trt_availability() { :; }
-v020_trt_driver_probe TEST
-'''
-        # The probe must use portable PTX for this GPU, not sm_120 on an A100.
-        for capability, architecture in [('8.0', '80'), ('12.0', '120')]:
-            with self.subTest(capability=capability):
-                output = subprocess.run(
-                    ['bash', '-c', script.replace('"$3"', capability),
-                     'probe', str(setup), str(self.root)],
-                    check=True, capture_output=True, text=True).stdout
-                self.assertIn(
-                    f'arch=compute_{architecture},code=compute_{architecture}', output)
 
     def test_cuda_setup_binds_the_available_cpp_host_compiler(self):
         import shutil
@@ -475,31 +453,6 @@ printf '%s\\n' "${NVCC_CCBIN:-unset}"
         self.assertEqual(result['old-server']['code'], 'host_version_newer_than_server')
         self.assertEqual(roles[-1], ('old-server', dict(old=True, host_old=False)))
         self.assertEqual(launches, ['server'])
-
-    def test_trt121_pins_numpy_and_arrow_without_constraining_rc3(self):
-        import subprocess
-        (self.root / 'downloads').mkdir()
-        script = '''
-source "$1"
-V020=$2 BIN=$2 EVIDENCE=$2
-declare -A V020_OVERRIDES=()
-TENSORRT_LLM_121=$2/stable TENSORRT_LLM_140RC3=$2/rc3
-v020_venv() { :; }
-v020_cmd() { :; }
-v020_trt_toolkit() { :; }
-v020_freeze() { :; }
-v020_trt_availability() { :; }
-v020_trt_driver_probe() { :; }
-v020_setup_tensorrt TENSORRT_LLM_121 1.2.1 2.9.1 cu130 13.1 CUDA_HOME_TRT121
-v020_setup_tensorrt TENSORRT_LLM_140RC3 1.4.0rc3 2.14.0 cu132 13.4 CUDA_HOME_TRT140RC3
-'''
-        subprocess.run(['bash', '-c', script, 'constraints',
-                        str(Path(__file__).with_name('setup.sh')), str(self.root)], check=True)
-        stable = (self.root / 'downloads/TENSORRT_LLM_121-torch-constraints.txt').read_text()
-        rc3 = (self.root / 'downloads/TENSORRT_LLM_140RC3-torch-constraints.txt').read_text()
-        self.assertIn('numpy==1.26.4\npyarrow==21.*\n', stable)
-        self.assertNotIn('numpy', rc3)
-        self.assertNotIn('pyarrow', rc3)
 
     def test_tracing_refusal_accepts_the_actual_sglang_policy_diagnostic(self):
         from rows.functional import tracing_refusals
@@ -760,8 +713,8 @@ v020_setup_tensorrt TENSORRT_LLM_140RC3 1.4.0rc3 2.14.0 cu132 13.4 CUDA_HOME_TRT
         self.assertEqual(result['cached_tokens'], 0)
         self.assertEqual(p.failures, [])
 
-    # T45 / ADR0034: every LC13-LC16 row runs both full engines plus the old guard.
-    def test_cache_rows_run_full_protocol_for_both_preserving_engines(self):
+    # T45: dependency-conflicted vLLM arm skips; SGLang still runs in full.
+    def test_cache_rows_skip_dependency_conflict_without_losing_sglang_protocol(self):
         from unittest import mock
         from rows import lmcache
         for row_id, full in [('LC13', 'correctness'), ('LC14', 'endurance'),
@@ -782,12 +735,11 @@ v020_setup_tensorrt TENSORRT_LLM_140RC3 1.4.0rc3 2.14.0 cu132 13.4 CUDA_HOME_TRT
                          mock.patch.object(lmcache, 'fixtures', return_value=dict(versions={}, fixtures={})), \
                          mock.patch.object(lmcache, full, side_effect=protocol):
                         result = lmcache.run(ctx, dict(id=ctx.row_id))
-                    self.assertEqual(result['verdict'], 'pass')
-                    self.assertEqual(selected, [('LMCACHE_VLLM_034', row_id == 'LC15'),
-                                                ('LMCACHE_SGLANG', row_id == 'LC15')])
+                    self.assertEqual(result['verdict'], 'skip')
+                    self.assertIn('opentelemetry-api>=1.45.1', result['reason'])
+                    self.assertEqual(selected, [('LMCACHE_SGLANG', row_id == 'LC15')])
                     self.assertEqual(guarded, [
                         ('LMCACHE', False, 'server' if row_id == 'LC15' else 'standalone'),
-                        ('LMCACHE_VLLM_034', True, 'server' if row_id == 'LC15' else 'standalone'),
                         ('LMCACHE_SGLANG', True, 'server' if row_id == 'LC15' else 'standalone')])
 
     # T45 / ADR0034 amendment: a preserving version with clearing source is not qualified.
@@ -850,28 +802,13 @@ v020_setup_tensorrt TENSORRT_LLM_140RC3 1.4.0rc3 2.14.0 cu132 13.4 CUDA_HOME_TRT
                 self.assertEqual(p.records[-1]['connector']['config_matches'], valid)
                 self.assertNotIn(str(config), json.dumps(p.records))
 
-    # T45 / ADR0034: full preservation rows request a fresh baseline and source-build target.
-    def test_setup_selects_fresh_vllm_preservation_environments_only_when_needed(self):
-        import subprocess
-        (self.root / 'session').mkdir()
-        script = '''
-source "$1"
-export HOME=$2 V020=$2/session BIN=$2/session/bin EVIDENCE=$2/session/evidence
-ONLY=$3
-v020_setup_tools() { printf 'BASE=%s\\nCACHE=%s\\nGUARD=%s\\n' "$VLLM_034" "$LMCACHE_VLLM_034" "$LMCACHE"; exit 0; }
-setup
-'''
-        for selection, selected in [('all', True), ('lc13', True), ('LC16U', True),
-                                    ('EM1,LC15', True), ('EM1', False)]:
+    def test_setup_does_not_install_dependency_conflicted_cache_environment(self):
+        from setup_selection import dependencies
+        for selection in ('all', 'lc13', 'LC16U', 'EM1,LC15', 'EM1'):
             with self.subTest(selection=selection):
-                result = subprocess.run(
-                    ['bash', '-c', script, 'setup', str(Path(__file__).with_name('setup.sh')),
-                     str(self.root), selection], capture_output=True, text=True)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                mapping = dict(line.split('=', 1) for line in result.stdout.splitlines())
-                self.assertEqual(mapping['BASE'], str(self.root / 'session/engines/vllm-0.34.0rc1-venv') if selected else '')
-                self.assertEqual(mapping['CACHE'], str(self.root / 'session/engines/vllm-0.34.0rc1-lmcache057-venv') if selected else '')
-                self.assertEqual(mapping['GUARD'], str(self.root / 'session/engines/vllm-0.33.0-lmcache-venv'))
+                needed = dependencies(selection)
+                self.assertNotIn('VLLM_034', needed)
+                self.assertNotIn('LMCACHE_VLLM_034', needed)
 
     def test_native_sglang_embedding_setting_does_not_require_cli_argv(self):
         from rows.measurements import argv_settings
