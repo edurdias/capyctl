@@ -48,9 +48,11 @@ Setup (rented x86_64 VM only; approximately 60 minutes, downloads/installations 
      1.2.6 a8abf9b8d6b1109e716996eba18d5c5ce1dbe013a7808b603f81f218e0bcff3d
      1.1.5 71ee0d792b94bbe5419332e75a4c2e3975c863235d1f66ae736938e7c1d91e8a
      Verify each archive's internal SHA256SUMS as well.
-     Only explicit --only TF3 installs optional Python TensorFold v0.6.6 with
-     torch 2.13.0 cu130 and triton for the comparison; default all does not.
-     Otherwise TENSORFOLD_066 is empty unless supplied read-only by --engines.
+     Install Python TensorFold v0.6.6 in its own environment (torch 2.13.0
+     cu130), from checksum-verified commit cb2ebf0540f42604e2759b2ddef497861e928248.
+     Exact native 1.0.0 has no x86_64 archive: TENSORFOLD_100 is read-only on GB10.
+     Install checksum-verified static strace 6.3 in the session for TF5/TF13;
+     no system package or ptrace-policy change is made.
  10. Download published CapyCTL v0.1.12 x86_64 release, verify release SHA256SUMS
      and the archive's own SHA256SUMS; install only bin/capyctl as bin/capyctl-old.
  11. Tracing rows run a loopback Python OTLP/HTTP protobuf receiver with the
@@ -446,20 +448,40 @@ PY
 
 v020_tensorfold_baseline() {
   if [ -z "$TENSORFOLD_066" ]; then
-    printf '%s\n' 'not configured: optional TensorFold 0.6.6 baseline installs only for explicit --only TF3; --engines may supply it' >"$EVIDENCE/tensorfold-066-availability.txt"
+    printf '%s\n' 'not configured: TensorFold 0.6.6 supplied as explicitly unavailable' >"$EVIDENCE/tensorfold-066-availability.txt"
     return 0
   fi
   if [ -z "${V020_OVERRIDES[TENSORFOLD_066]:-}" ]; then
-    # Owner-approved recipe from quick-check/remote.sh, isolated from native TF.
+    # ADR 0039 TF9: a fresh legacy line beside the native environments.
+    local archive=$V020/downloads/tensorfold-0.6.6.tar.gz
+    v020_fetch https://codeload.github.com/ashhart/TensorFold/tar.gz/cb2ebf0540f42604e2759b2ddef497861e928248 "$archive"
+    v020_check_sha "$archive" 575ad3745d4a92ef097f43c5796a78ec16a1fafb789265bf14301b12dfb2bd42
     v020_venv "$TENSORFOLD_066"
+    # Torch pins its matching Triton dependency; do not select an unrelated
+    # latest Triton after installing the pinned CUDA torch.
     v020_cmd "$BIN/uv" pip install --python "$TENSORFOLD_066/bin/python" \
-      torch==2.13.0 triton --index-url https://download.pytorch.org/whl/cu130
+      torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
     v020_cmd "$BIN/uv" pip install --python "$TENSORFOLD_066/bin/python" \
-      'tensorfold @ git+https://github.com/ashhart/TensorFold.git@v0.6.6' ninja \
-      torch==2.13.0 --torch-backend=cu130
+      "$archive" ninja==1.11.1.4 torch==2.13.0 --torch-backend=cu130
   fi
   v020_freeze "$TENSORFOLD_066" TENSORFOLD_066
   printf '%s\n' 'configured: TensorFold 0.6.6 comparison baseline; live qualification still required' >"$EVIDENCE/tensorfold-066-availability.txt"
+}
+
+v020_signal_observer() {
+  [ -n "$STRACE" ] || return 0
+  [ -z "${V020_OVERRIDES[STRACE]:-}" ] || return 0
+  local arch expected
+  arch=$(uname -m)
+  case "$arch" in
+    x86_64) expected=4722ad596f33f695c8428269d4164fa1fa3b50b65a44b4a2034842de259f50fa ;;
+    aarch64) expected=c6e211c6e29311bc00457c876da53cc6c7299146f324a9b80700c34908055d6d ;;
+    *) v020_setup_error "no pinned signal observer for $arch"; return 1 ;;
+  esac
+  v020_claim "$STRACE"
+  v020_fetch "https://github.com/ernw/static-toolbox/releases/download/strace-v6.3/strace-6.3-$arch" "$STRACE"
+  v020_check_sha "$STRACE" "$expected"
+  chmod 700 "$STRACE"
 }
 
 # The GPU's compute capability decides the kernels built here (8.0 on an A100,
@@ -769,7 +791,8 @@ setup() (
     [LMCACHE_SGLANG]="$V020/engines/sglang-0.5.23-lmcache-venv"
     [LLAMACPP]="$V020/engines/llamacpp-v0.9.0/build/bin/llama-server"
     [TENSORFOLD_126]="$V020/engines/tensorfold-1.2.6" [TENSORFOLD_115]="$V020/engines/tensorfold-1.1.5"
-    [TENSORFOLD_066]=''
+    [TENSORFOLD_066]="$V020/engines/tensorfold-0.6.6-venv" [TENSORFOLD_100]=''
+    [STRACE]="$V020/tools/strace-6.3"
     [TENSORRT_LLM]='' [TRT_LLM]='' [TENSORRT_LLM_121]='' [TENSORRT_LLM_140RC3]=''
     [CUDA_HOME]='' [CUDA_HOME_TRT121]='' [CUDA_HOME_TRT140RC3]=''
     [MODEL_CHAT]="$V020/models/chat" [MODEL_CHAT_GGUF]="$V020/models/chat-gguf/Qwen3-4B-Q4_K_M.gguf"
@@ -777,11 +800,7 @@ setup() (
     [MODEL_EMBED8]="$V020/models/embed8" [MODEL_CLEF]="$V020/models/clef"
     [MODEL_CLEF_GGUF]="$V020/models/clef-gguf/Clef-Flash-Q8_0.gguf" [MODEL_TENSORFOLD]="$V020/models/tensorfold"
   )
-  # The optional Python comparison must not consume the default setup budget.
   local requested_rows=${ONLY:-all}
-  case ",${requested_rows^^}," in
-    *,TF3,*) V020_PATHS[TENSORFOLD_066]=$V020/engines/tensorfold-0.6.6-venv ;;
-  esac
   case ",${requested_rows^^}," in
     *,ALL,*|*,EM6,*) V020_PATHS[EM6_VLLM]=$V020/engines/vllm-0.33.0-em6-observer-venv ;;
   esac
@@ -887,6 +906,7 @@ PY
   (v020_native_tensorfold TENSORFOLD_126 1.2.6 a8abf9b8d6b1109e716996eba18d5c5ce1dbe013a7808b603f81f218e0bcff3d;
    v020_native_tensorfold TENSORFOLD_115 1.1.5 71ee0d792b94bbe5419332e75a4c2e3975c863235d1f66ae736938e7c1d91e8a) & pids+=("$!"); labels+=(TENSORFOLD)
   (v020_tensorfold_baseline) & pids+=("$!"); labels+=(TENSORFOLD_066)
+  (v020_signal_observer) & pids+=("$!"); labels+=(STRACE)
   (v020_old_binary) & pids+=("$!"); labels+=(CAPYCTL_OLD)
   (v020_models) & pids+=("$!"); labels+=(MODELS)
   (v020_setup_tensorrt TENSORRT_LLM_121 1.2.1 2.9.1 cu130 13.1 CUDA_HOME_TRT121) & pids+=("$!"); labels+=(TENSORRT_LLM_121)
@@ -940,11 +960,11 @@ PY
   done
   [ -x "$BIN/capyctl-old" ] || { v020_setup_error 'old release binary missing'; exit 1; }
   "$V020/tools/bin/python" - "$EVIDENCE/binaries.fingerprint.json" \
-    "$BIN/capyctl" "$BIN/capyctl-old" "$LLAMACPP" <<'PY'
+    "$BIN/capyctl" "$BIN/capyctl-old" "$LLAMACPP" "$STRACE" <<'PY'
 import hashlib,json,os,pathlib,sys
 fingerprints={}
 paths=[pathlib.Path(name) for name in sys.argv[2:] if name]
-for key in ("TENSORFOLD_126","TENSORFOLD_115"):
+for key in ("TENSORFOLD_126","TENSORFOLD_115","TENSORFOLD_100"):
     if os.environ[key]:
         path=pathlib.Path(os.environ[key])
         paths.append(path/"bin/tensorfold-native" if path.is_dir() else path)
@@ -959,8 +979,8 @@ for path in paths:
 pathlib.Path(sys.argv[1]).write_text(json.dumps(fingerprints,indent=2,sort_keys=True)+"\n")
 PY
   {
-    for key in VLLM_032 VLLM_033 EM6_VLLM VLLM_034 SGLANG_0522 SGLANG_0523 VLLM_033_TRACING SGLANG_0523_TRACING SGLANG_0523_SDK_FREE SGLANG_EDITABLE LMCACHE LMCACHE_VLLM_034 LMCACHE_SGLANG LLAMACPP TENSORFOLD_126 TENSORFOLD_115 TENSORFOLD_066 \
-      TENSORRT_LLM TRT_LLM TENSORRT_LLM_121 TENSORRT_LLM_140RC3 OTELCOL \
+    for key in VLLM_032 VLLM_033 EM6_VLLM VLLM_034 SGLANG_0522 SGLANG_0523 VLLM_033_TRACING SGLANG_0523_TRACING SGLANG_0523_SDK_FREE SGLANG_EDITABLE LMCACHE LMCACHE_VLLM_034 LMCACHE_SGLANG LLAMACPP TENSORFOLD_126 TENSORFOLD_115 TENSORFOLD_066 TENSORFOLD_100 \
+      TENSORRT_LLM TRT_LLM TENSORRT_LLM_121 TENSORRT_LLM_140RC3 OTELCOL STRACE \
       MODEL_CHAT MODEL_CHAT_GGUF MODEL_EMBED MODEL_EMBED_GGUF MODEL_EMBED8 MODEL_CLEF MODEL_CLEF_GGUF MODEL_TENSORFOLD \
       CUDA_HOME CUDA_HOME_TRT121 CUDA_HOME_TRT140RC3; do
       printf '%s=%s\n' "$key" "${!key}"

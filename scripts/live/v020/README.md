@@ -263,9 +263,12 @@ LMCACHE=/home/me/vllm-0.32.0-lmcache-venv
 LMCACHE_VLLM_034=
 LMCACHE_SGLANG=
 LLAMACPP=/home/me/llamacpp-v0.7.0/build/bin/llama-server
-TENSORFOLD_126=/home/me/tensorfold-1.0.0
+TENSORFOLD_126=/home/me/tensorfold-1.2.6
+TENSORFOLD_100=/home/me/tensorfold-1.0.0
+TENSORFOLD_066=/home/me/tensorfold-0.6.6-venv
 TENSORFOLD_115=/home/me/tensorfold-1.1.5
 TENSORRT_LLM=/home/me/tensorrt-llm-1.2.1-venv
+STRACE=/home/me/strace-6.3
 MODEL_CHAT=/home/me/models/qwen3-4b-instruct
 MODEL_CHAT_GGUF=/home/me/models/qwen3-4b-gguf
 MODEL_EMBED=/home/me/models/emb
@@ -276,6 +279,28 @@ MODEL_CLEF_GGUF=/home/me/models/clef-flash-gguf
 MODEL_TENSORFOLD=/home/me/models/nemotron-lightning
 CAPYCTL_OLD=/home/me/capyctl-0.1.12/bin/capyctl
 ```
+
+The ADR 0039 native rows live in `rows/tensorfold_native.py`. TF4–TF10
+require the exact 1.0.0 line on unified memory and a read-only
+`TENSORFOLD_100` mapping: upstream has no Linux x86_64 1.0.0 archive.
+TF12–TF14 use exact 1.1.5 on the rented discrete machine. They fail, rather
+than pass partially, when a required gauge, health transition, native timing,
+memory sample or journal receipt is absent. CPU tests are not qualification.
+
+The fresh recipe now includes the isolated Python TensorFold 0.6.6 environment
+(pinned source commit and SHA256, torch 2.13.0 CUDA 13.0, ninja 1.11.1.4) and
+checksum-verified static strace 6.3 under the session directory. Both additions
+need owner approval before setup. Native 1.1.5 was already in the recipe.
+TF5/TF13 trace only signal delivery and process exit on owned engine PIDs;
+they never trace request bytes or environment values. Ptrace permission must
+already be available: setup changes neither system packages nor ptrace policy.
+TF4 uses another managed deployment for memory pressure and one bounded
+scratch launch with the default reserve.
+
+Allow approximately 15–45 minutes for TF4, 5–20 for TF5/TF13, 15–45 for
+TF6/TF14, 5–15 for TF7/TF9/TF10, 10–25 for TF8, and 15–45 for TF12.
+The catalog budgets are hard bounds, not performance qualification claims.
+
 
 Mappings name actual existing versions; a 1.0.0 path does not certify 1.2.6.
 The setup-generated VM map is the authoritative example of all available keys.
@@ -394,16 +419,16 @@ Budgets are maximum seconds per row, not elapsed-time promises.
 | OT7 | P4 | 1800 | Outage/restart under traffic, dropped-span status, rate-limited notices and OT8 measured noise. |
 | OT9 | P4 | 1800 | Zero-retention engine tracing off, no engine trace headers/spans; CapyCTL spans present. |
 | OT10 | P4 | 1200 | Fresh SDK-free SGLang shape, not_installed status and successful serving. |
-| TF4 | P4 | 1 | not implemented: Needs admission pressure fixture, scratch default-reserve launch and all native refusal cases, not only capability refusals. |
-| TF5 | P4 | 1 | not implemented: Needs eight live streams, zero-gauge drain proof and a deliberately busy 30-second stop bound. |
-| TF6 | P4 | 1 | not implemented: Needs client-cut protocol with 100 ms gauges, six repeats and 32-cancellation restart proof. |
-| TF7 | P4 | 1 | not implemented: Needs enrolled host, per-pool metrics/histograms and cancelled-request remote settlement. |
-| TF8 | P4 | 1 | not implemented: Needs constrained mutually exclusive TensorFold/vLLM grants and measured fresh-launch wake canary. |
-| TF9 | P4 | 1 | not implemented: Requires approved TensorFold 0.6.6 environment, absent from fresh VM recipe. |
-| TF10 | P4 | 1 | not implemented: Needs listener enumeration after readiness and a controller re-proof trigger; ownership PID alone is insufficient. |
-| TF12 | P4 | 1 | not implemented: Needs direct health progression and startup/device memory metrics for 1.1.5, plus reserved idle-unload refusal. |
-| TF13 | P4 | 1 | not implemented: Needs in-stop health 503/draining observation, signal-to-exit timing and busy bound fixture. |
-| TF14 | P4 | 1 | not implemented: Needs TF6 cancellation protocol and TF7 enrolled-host metrics/settlement on 1.1.5. |
+| TF4 | P4 | 3600 | Native resolution/start refusals, managed admission pressure, default-reserve scratch comparison and compaction/retention policy. Unified only. |
+| TF5 | P4 | 1800 | Eight-stream drain, both zero gauges before SIGTERM, measured exit and busy 30-second no-signal bound; park refusal. Unified only. |
+| TF6 | P4 | 3600 | Four-client cuts at 100 ms gauge cadence, six repeats, held unanswered cancellation and journaled 32-cut restart. Unified only. |
+| TF7 | P4 | 1800 | Enrolled-host idle/busy reports, per-pool KV metrics, both forwarded histograms, native timings and remote settlement. Unified only. |
+| TF8 | P4 | 1800 | Mutually exclusive grants, fresh native wake inside Initialize and text completion canary. Unified only. |
+| TF9 | P4 | 1800 | Legacy 0.6.6 beside native, same checkpoint, health ok/busy, drain and verified exit. Unified only. |
+| TF10 | P4 | 1800 | Owned listener enumeration after readiness and controller-crash adoption/re-proof. Unified only. |
+| TF12 | P4 | 3600 | Exact 1.1.5 command, refused-to-ready health, startup/device/host memory, full context and 1/8-stream throughput; idle-unload refusal. |
+| TF13 | P4 | 1800 | 1.1.5 drain, SIGTERM-to-exit timing, in-stop 503/draining and busy-bound no-signal proof. |
+| TF14 | P4 | 3600 | Full 1.1.5 TF6 cancellation protocol plus TF7 enrolled-host load/latency/settlement path. |
 | TR1 | P4 | 1 | not implemented: Needs wheel provenance, non-executing detection audit, CUDA/OpenMPI companion evidence and no-CUDA-context registration observation. |
 | TR2 | P4 | 1 | not implemented: Needs direct version/readiness step evidence, rendered YAML and both tool-call/reasoning parser assertions; P3 chat is not equivalent. |
 | TR4 | P4 | 1 | not implemented: Needs the single load-reader's burst/lull observations, not direct metrics polling that starts another reader. |
