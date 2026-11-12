@@ -18,7 +18,7 @@ import sys
 import time
 
 HERE = Path(__file__).resolve().parent
-MODULES = ('regressions', 'lmcache', 'measurements', 'engines', 'functional')
+MODULES = ('regressions', 'lmcache', 'lmcache_extra', 'measurements', 'engines', 'functional')
 
 
 class SessionInterrupted(BaseException):

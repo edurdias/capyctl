@@ -1,0 +1,23 @@
+--- a/crates/capyctl-config/src/lmcache.rs
++++ b/crates/capyctl-config/src/lmcache.rs
+@@ -516,1 +516,7 @@
+-pub const QUALIFIED_PARKING: &[QualifiedParking] = &[];
++pub const QUALIFIED_PARKING: &[QualifiedParking] = &[
++    QualifiedParking { engine: "vllm", engine_version: "0.32.0", model_type: "qwen3", gpu: "NVIDIA GB10", residency: "deep" },
++    QualifiedParking { engine: "vllm", engine_version: "0.33.0", model_type: "qwen3", gpu: "NVIDIA GB10", residency: "deep" },
++    QualifiedParking { engine: "vllm", engine_version: "0.34.0rc1", model_type: "qwen3", gpu: "NVIDIA GB10", residency: "deep" },
++    QualifiedParking { engine: "sglang", engine_version: "0.5.22", model_type: "qwen3", gpu: "NVIDIA GB10", residency: "deep" },
++    QualifiedParking { engine: "sglang", engine_version: "0.5.23", model_type: "qwen3", gpu: "NVIDIA GB10", residency: "deep" },
++];
+@@ -602,3 +608,3 @@
+ pub fn transfer_mode(residency: Residency) -> TransferMode {
+-    transfer_mode_with(residency, ENGINE_DRIVEN_ROWS)
++    let _ = residency; TransferMode::LmcacheDriven
+ }
+--- a/crates/capyctl-agent/src/lmcache_install.rs
++++ b/crates/capyctl-agent/src/lmcache_install.rs
+@@ -217,3 +217,3 @@
+     let sleep_clears_cache =
+-        engine == Engine::Vllm && residency.parks() && shape.vllm_sleep_clears_cache();
++        false && engine == Engine::Vllm && residency.parks() && shape.vllm_sleep_clears_cache();
+     if !shape.missing.is_empty() {

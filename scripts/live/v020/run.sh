@@ -99,6 +99,14 @@ remote "umask 077; if [ -e ~/LIVE-SESSION-IN-USE.txt ]; then [ -n $session_name 
 READY=1
 copy -rlpt "$HERE/" "$TARGET:capyctl-v020/live/" >/dev/null
 remote 'python3 ~/capyctl-v020/live/session.py begin --root ~/capyctl-v020'
+if [ "$SKIP_SETUP" = 0 ]; then
+  # Qualification patches are applied to independent copies of this exact
+  # committed source, not to the uploaded release executable or host engines.
+  SOURCE_ROOT=$(git -C "$HERE" rev-parse --show-toplevel)
+  git -C "$SOURCE_ROOT" archive --format=tar -o "$SCRATCH/source.tar" HEAD
+  git -C "$SOURCE_ROOT" rev-parse HEAD >"$SCRATCH/source-revision.txt"
+  copy "$SCRATCH/source.tar" "$SCRATCH/source-revision.txt" "$TARGET:capyctl-v020/" >/dev/null
+fi
 if [ -n "$REMOTE_BINARY" ]; then
   printf -v source '%q' "$REMOTE_BINARY"
   remote "test -f $source && test -x $source && cp -- $source ~/capyctl-v020/bin/capyctl"
