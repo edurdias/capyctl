@@ -446,7 +446,7 @@ Budgets are maximum seconds per row, not elapsed-time promises.
 | OT11 | P4 | 300 | Non-loopback engine tracing and reserved profile argument/environment refusals. |
 | EM3 | P4 | 2400 | ADR0036: 20 start/restart/wake probes and 20 64-input batches at eight clients; measured tolerance plus margin <=0.02; 100 pinned cross-engine sentences. |
 | EM5 | P4 | 3600 | ADR0036: 2048-input running gauges, hangup/deadline engine connections and cancelling leases, 32 answer settlements without restart, killed-answer verified-stop settlement. |
-| EM6 | P4 | 1500 | ADR0036: separately enrolled host ingress validation and incremental relay, echoed request ID absent from engine headers. |
+| EM6 | P4 | 1500 | ADR0036: vLLM-only separately enrolled host ingress validation and incremental relay, echoed request ID absent from engine headers (owner decision 2026-11-11). |
 | EM7 | P4 | 2400 | ADR0036/SPEC10: mutually exclusive embedding/chat grants, automatic pool switches, deep wake canary or llama.cpp restart. |
 | EM9 | P4 | 1800 | ADR0036: five deep park/wake cycles plus parked-arrival wake; per-launch release proof, measured residue, passing canary and timings. |
 | OT1 | P4 | 1800 | ADR0037 OT1: default off; no tracing launch options, environment names or collector connections. |

@@ -176,6 +176,13 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     SGLang refused at `engine add`); removed after that check, to be pulled again for
     #235's;
   - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B;
+  - the next rented discrete-GPU session for 0.2.0 (owner approval 2026-11-11),
+    fresh on that machine and removed with it: vLLM 0.34.0rc1 and a separate copy
+    with LMCache 0.5.7 built against its installed torch; tracing-enabled vLLM
+    0.33.0 and SGLang 0.5.23 with OpenTelemetry API, SDK and OTLP exporter 1.39.1;
+    SDK-free SGLang 0.5.23; observational vLLM 0.33.0 with the EM6 header-name
+    recorder hook; TensorFold 0.6.6; and session-local checksum-pinned static
+    strace 6.3 and Rust 1.99.0. Existing host environments remain unchanged.
   - the rented two-GPU machine of ADR 0035 §14 (owner decision 2026-10-25), for
     its one session only: fresh x86_64 CUDA installs of vLLM 0.32.0
     (~/vllm-0.32.0-venv), SGLang 0.5.22 (~/sglang-0.5.22-venv) and the llama.cpp

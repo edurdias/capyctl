@@ -21,7 +21,7 @@ ROWS = [dict(id=key, priority=4, budget=budget, measurement=True, criteria=crite
         for key, budget, criteria in (
     ('EM3', 2400, 'ADR0036: 20 start/restart/wake probes and 20 64-input batches at eight clients; measured tolerance plus margin <=0.02; 100 pinned cross-engine sentences.'),
     ('EM5', 3600, 'ADR0036: 2048-input running gauges, hangup/deadline engine connections and cancelling leases, 32 answer settlements without restart, killed-answer verified-stop settlement.'),
-    ('EM6', 1500, 'ADR0036: separately enrolled host ingress validation and incremental relay, echoed request ID absent from engine headers.'),
+    ('EM6', 1500, 'ADR0036: vLLM-only separately enrolled host ingress validation and incremental relay, echoed request ID absent from engine headers (owner decision 2026-11-11).'),
     ('EM7', 2400, 'ADR0036/SPEC10: mutually exclusive embedding/chat grants, automatic pool switches, deep wake canary or llama.cpp restart.'),
     ('EM9', 1800, 'ADR0036: five deep park/wake cycles plus parked-arrival wake; per-launch release proof, measured residue, passing canary and timings.'))]
 PROBE = 'CapyCTL readiness check: a quiet library with tall shelves of old books.'
@@ -623,9 +623,12 @@ def run(ctx, row):
     try:
         {'EM3': em3, 'EM5': em5, 'EM6': em6, 'EM7': em7, 'EM9': em9}[row['id']](ctx, evidence)
         if row['id'] == 'EM6':
-            return dict(verdict='fail', reason='vLLM host-path evidence complete; full per-engine EM6 is blocked: '
-                        'SGLang protected -S entry does not execute the approved .pth hook; '
-                        'llama.cpp is not an ASGI server. No header/key capture workaround is permitted.',
+            evidence['scope'] = 'vllm only'
+            evidence['unobserved_engines'] = {
+                'sglang': 'Protected -BIS launch skips the approved .pth observational hook.',
+                'llamacpp': 'llama.cpp is not an ASGI server.',
+            }
+            return dict(verdict='pass', reason='All ADR 0036 EM6 criteria established for vLLM only (owner decision 2026-11-11)',
                         evidence=evidence)
         return dict(verdict='pass', reason='All ADR 0036 '+row['id']+' criteria established', evidence=evidence)
     except (AssertionError, ValueError, KeyError, TypeError, OSError, TimeoutError, subprocess.SubprocessError) as error:

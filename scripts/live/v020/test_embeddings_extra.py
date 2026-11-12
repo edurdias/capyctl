@@ -128,10 +128,11 @@ class EmbeddingProtocolTests(unittest.TestCase):
     def test_em6_does_not_qualify_other_engines_from_vllm_observation(self):
         with mock.patch.object(em, 'em6', side_effect=lambda ctx, evidence: evidence.update(vllm='observed')):
             result = em.run(SimpleNamespace(), dict(id='EM6'))
-        self.assertEqual(result['verdict'], 'fail')
-        self.assertEqual(result['evidence'], dict(vllm='observed'))
-        self.assertIn('SGLang', result['reason'])
-        self.assertIn('llama.cpp', result['reason'])
+        self.assertEqual(result['verdict'], 'pass')
+        self.assertEqual(result['evidence']['vllm'], 'observed')
+        self.assertEqual(result['evidence']['scope'], 'vllm only')
+        self.assertIn('-BIS', result['evidence']['unobserved_engines']['sglang'])
+        self.assertIn('not an ASGI', result['evidence']['unobserved_engines']['llamacpp'])
 
     def test_em5_requires_its_own_answer_receipt_and_preserves_connection(self):
         for has_receipt in (True, False):
