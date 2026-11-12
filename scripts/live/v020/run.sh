@@ -98,6 +98,8 @@ printf -v session_name '%q' "$SESSION_NAME"
 remote "umask 077; if [ -e ~/LIVE-SESSION-IN-USE.txt ]; then [ -n $session_name ] && [ \"\$(cat ~/LIVE-SESSION-IN-USE.txt)\" = $session_name ] || exit 1; fi; mkdir -m 700 -p ~/capyctl-v020/live ~/capyctl-v020/bin ~/capyctl-v020/evidence"
 READY=1
 copy -rlpt "$HERE/" "$TARGET:capyctl-v020/live/" >/dev/null
+# ADR 0037: share the matrix decoder/allowlist, rather than duplicate it.
+copy "$HERE/../matrix/otel_spans.py" "$TARGET:capyctl-v020/live/otel_spans.py" >/dev/null
 remote 'python3 ~/capyctl-v020/live/session.py begin --root ~/capyctl-v020'
 if [ -n "$REMOTE_BINARY" ]; then
   printf -v source '%q' "$REMOTE_BINARY"

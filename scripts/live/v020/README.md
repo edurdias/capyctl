@@ -116,7 +116,7 @@ session envelope. Priority 1 always runs first. Skips are not release qualificat
 The installed versions are vLLM 0.32.0/0.33.0, SGLang 0.5.22/0.5.23 plus an
 isolated editable 0.5.23, LMCache 0.5.7 built from its source tag in separate
 vLLM 0.33.0 and SGLang 0.5.23 environments, TensorFold native 1.2.6/1.1.5 and
-otelcol 0.164.0. LMCache builds keep the engine's torch pinned, use CUDA major
+the Python OTLP receiver. LMCache builds keep the engine's torch pinned, use CUDA major
 13 and the detected GPU architecture (8.0 on the A100), and do not reuse a wheel
 compiled against another engine's torch. Unified-memory cache rows accept the
 approved vLLM 0.33.0/LMCache 0.5.7 tuple as well as the existing 0.32.0/0.5.6 tuple;
@@ -125,6 +125,34 @@ TensorFold 0.6.6 is an optional TF3 comparison: explicitly select TF3 to install
 it, or supply its mapping. It does not delay the default setup.
 The editable SGLang fixture disables optional Rust extensions: #235 must refuse
 it before any engine launch, and setup does not install an extra Rust toolchain.
+
+Tracing qualification (ADR 0037 OT1–OT10) uses three additional fresh environments:
+`VLLM_033_TRACING`, `SGLANG_0523_TRACING` and `SGLANG_0523_SDK_FREE`.
+The tracing pair pins `opentelemetry-api`, `opentelemetry-sdk` and
+`opentelemetry-exporter-otlp` to 1.39.1, satisfying vLLM's declared `>=1.27.0`
+and SGLang's unconstrained tracing extra. Their normal freezes and metadata
+fingerprints are recorded at setup. The SDK-free SGLang omits that extra and
+setup and OT10 independently check its package shape. vLLM 0.33.0 declares
+the SDK/exporter in its common requirements, so an SDK-free vLLM would violate
+its dependencies; OT10 deliberately uses SGLang instead. Rows never install
+or remove packages in an existing environment. These new installations require
+owner approval before running setup.
+
+The tracing rows and OT8 use a Python OTLP/HTTP protobuf receiver bound only to
+`127.0.0.1:14318`. It decodes with the tracing environment's real
+`opentelemetry-proto` dependency and preserves full OTLP JSON for the content
+sentinel audit. This avoids another collector download and the core collector's
+lack of a file exporter. The receiver is not a synthetic span generator.
+OT5 and OT9 observe engine-bound header names using a bounded loopback packet
+capture, requiring `CAP_NET_RAW`; missing permission fails rather than replacing
+header observation with inference from absent spans. No raw packet, header value
+or engine key is persisted. OT6 uses separate server and enrolled-host processes
+on this VM, with TLS control enrollment and loopback private ingress.
+OT7 requires the successful `evidence/result-OT8.json` in the same session, and
+compares outage router phases to OT8's observed per-phase jitter.
+Estimated live minutes, including ordinary startup: OT1 10–20, OT2 10–25,
+OT3 15–30, OT4 15–30, OT5 15–30, OT6 20–40, OT7 10–20, OT9 10–20,
+OT10 5–10. Budgets are hard upper bounds, not qualification results.
 
 TensorRT-LLM has separate row-gated no-apt installations: 1.2.1 with torch
 2.9.1+cu130, and 1.4.0rc3 with torch 2.14.0+cu132; pip Open MPI 4.1.8 and mpi4py
@@ -167,7 +195,7 @@ for every engine key, including explicit empty values for unavailable engines.
 On aarch64, setup refuses an omitted engine mapping before installing tools;
 it never creates or changes engine environments. Session tools, missing models
 and the checksum-verified aarch64 old binary remain private setup artifacts.
-Supply `OTELCOL` and `CUDA_HOME` as read-only overrides too.
+Supply `CUDA_HOME` as a read-only override too.
 
 GB10's unavailable global framebuffer counter is never converted to zero.
 Samples use numeric NVML per-process CUDA allocations and label their source
@@ -202,7 +230,6 @@ LLAMACPP=/home/me/llamacpp-v0.7.0/build/bin/llama-server
 TENSORFOLD_126=/home/me/tensorfold-1.0.0
 TENSORFOLD_115=/home/me/tensorfold-1.1.5
 TENSORRT_LLM=/home/me/tensorrt-llm-1.2.1-venv
-OTELCOL=/home/me/otelcol-0.164.0/otelcol
 MODEL_CHAT=/home/me/models/qwen3-4b-instruct
 MODEL_CHAT_GGUF=/home/me/models/qwen3-4b-gguf
 MODEL_EMBED=/home/me/models/emb
@@ -276,7 +303,7 @@ The local transport completion records collection and purge separately from row 
 Run the new CPU helper tests and shell checks only:
 
 ```bash
-python3 -m unittest discover -s scripts/live/v020 -p test_v020.py -v
+python3 -m pytest scripts/live/v020/test_*.py
 shellcheck scripts/live/v020/run.sh scripts/live/v020/remote.sh scripts/live/v020/setup.sh
 scripts/live/v020/run.sh --dry-run
 ```
@@ -322,15 +349,15 @@ Budgets are maximum seconds per row, not elapsed-time promises.
 | EM5 | P4 | 1 | not implemented: Needs client disconnect/deadline injection and lease/engine-connection settlement observation, unavailable through collected Context.request. |
 | EM6 | P4 | 1 | not implemented: Needs separately enrolled host ingress and engine-side request-header observation. |
 | EM7 | P4 | 1 | not implemented: Needs enforced mutually exclusive memory grants and pool-switch evidence, not two independently fitting deployments. |
-| OT1 | P4 | 1 | not implemented: Needs owned-process socket and sanitized environment-name inspection to prove tracing is absent, not just successful requests. |
-| OT2 | P4 | 1 | not implemented: Needs loopback collector and trace/span parent/request-id correlation including decisions. |
-| OT3 | P4 | 1 | not implemented: Needs collector capture including engine spans and engine validation-error sentinel coverage. |
-| OT4 | P4 | 1 | not implemented: Needs collector activation links and phase timing comparison within 1 ms. |
-| OT5 | P4 | 1 | not implemented: Needs engine and router span parentage plus engine-side header observation. |
-| OT6 | P4 | 1 | not implemented: Needs independently configured server/host collectors and ingress span correlation. |
-| OT7 | P4 | 1 | not implemented: Needs controlled collector outage/restart, dropped-span counters and OT8 noise baseline. |
-| OT9 | P4 | 1 | not implemented: Needs collector evidence of CapyCTL spans present and engine spans absent under retention zero. |
-| OT10 | P4 | 1 | not implemented: Needs approved SDK-free environment and static package-shape inspection; installed environments must not be modified. |
+| OT1 | P4 | 1800 | Default-off launch environment/option names, collector sockets and successful traced-context requests. |
+| OT2 | P4 | 2400 | Standalone chat/decisions, sampled and new/malformed traces, request IDs and phase spans. |
+| OT3 | P4 | 2400 | Content sentinels absent from complete OTLP, both engines present, quoted engine errors exercised. |
+| OT4 | P4 | 2400 | Cold launch, linked park/wake, forced-switch drain/release and <=1 ms phase agreement. |
+| OT5 | P4 | 2400 | Engine span parents, SGLang request ID, llama.cpp unsupported status and no trace header. |
+| OT6 | P4 | 3000 | Co-resident separately enrolled host ingress/wake parents and context propagation without host export. |
+| OT7 | P4 | 1800 | Outage/restart under traffic, dropped-span status, rate-limited notices and OT8 measured noise. |
+| OT9 | P4 | 1800 | Zero-retention engine tracing off, no engine trace headers/spans; CapyCTL spans present. |
+| OT10 | P4 | 1200 | Fresh SDK-free SGLang shape, not_installed status and successful serving. |
 | TF4 | P4 | 1 | not implemented: Needs admission pressure fixture, scratch default-reserve launch and all native refusal cases, not only capability refusals. |
 | TF5 | P4 | 1 | not implemented: Needs eight live streams, zero-gauge drain proof and a deliberately busy 30-second stop bound. |
 | TF6 | P4 | 1 | not implemented: Needs client-cut protocol with 100 ms gauges, six repeats and 32-cancellation restart proof. |

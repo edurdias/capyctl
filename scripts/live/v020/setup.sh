@@ -28,6 +28,9 @@ Setup (rented x86_64 VM only; approximately 60 minutes, downloads/installations 
   6. In parallel, install vLLM 0.32.0 and 0.33.0 with CUDA 13 torch;
      SGLang[tracing] 0.5.22 and 0.5.23 with torch-memory-saver==0.0.10;
      and a separate editable SGLang 0.5.23 checkout/environment for #235.
+     Tracing fixtures additionally create separate vLLM 0.33.0 and SGLang 0.5.23
+     environments with API/SDK/OTLP exporter 1.39.1 (within engine declarations),
+     and a separate SGLang 0.5.23 without its tracing extra for OT10.
   7. Recreate separate vLLM 0.33 and SGLang 0.5.23 environments from their freezes
      using uv; source-build LMCache ${LMCACHE_VERSION:-0.5.7} twice against each engine's exact torch.
      Use no build isolation, the GPU's own CUDA arch and CUDA major 13; preserve engine
@@ -45,8 +48,8 @@ Setup (rented x86_64 VM only; approximately 60 minutes, downloads/installations 
      Otherwise TENSORFOLD_066 is empty unless supplied read-only by --engines.
  10. Download published CapyCTL v0.1.12 x86_64 release, verify release SHA256SUMS
      and the archive's own SHA256SUMS; install only bin/capyctl as bin/capyctl-old.
- 11. Download OpenTelemetry collector 0.164.0 x86_64; verify pinned archive SHA256.
-     Setup never starts the collector; rows must bind every receiver to loopback.
+ 11. Tracing rows run a loopback Python OTLP/HTTP protobuf receiver with the
+     tracing environment's opentelemetry-proto; no collector binary is installed.
  12. For all or explicit --only TR rows, install separate TensorRT-LLM 1.2.1 and
      1.4.0rc3 NVIDIA cp312 wheels, torch 2.9.1/cu130 and 2.14.0/cu132 respectively.
      Pin Open MPI 4.1.8, mpi4py and torch constraints. Install private CUDA Toolkit
@@ -269,19 +272,40 @@ PY
 }
 
 v020_install_vllm() {
-  local key=$1 version=$2 path=${!1}
+  local key=$1 version=$2 path=${!1} reuse=0
+  local -a tracing=()
+  if [ "$key" = VLLM_033_TRACING ]; then
+    tracing=(opentelemetry-api==1.39.1 opentelemetry-sdk==1.39.1 opentelemetry-exporter-otlp==1.39.1)
+  fi
   [ -n "$path" ] || return 0
-  if [ -z "${V020_OVERRIDES[$key]:-}" ]; then
+  if [ "$key" = VLLM_033_TRACING ] && [ -e "$path" ] && [ -z "${V020_OVERRIDES[$key]:-}" ]; then
+    v020_claim "$path"
+    reuse=1  # Immutable after creation, including a resumed setup.
+  fi
+  if [ -z "${V020_OVERRIDES[$key]:-}" ] && [ "$reuse" = 0 ]; then
     v020_venv "$path"
-    v020_cmd "$BIN/uv" pip install --python "$path/bin/python" "vllm==$version" --torch-backend=cu130
+    v020_cmd "$BIN/uv" pip install --python "$path/bin/python" "vllm==$version" --torch-backend=cu130 "${tracing[@]}"
+  fi
+  if [ "$key" = VLLM_033_TRACING ]; then
+    v020_cmd "$path/bin/python" -c 'import importlib.metadata as m; assert m.version("vllm")=="0.33.0"; assert all(m.version(n) for n in ("opentelemetry-api","opentelemetry-sdk","opentelemetry-exporter-otlp"))'
   fi
   v020_freeze "$path" "$key"
 }
 
 v020_install_sglang() {
-  local key=$1 version=$2 path=${!1} source commit
+  local key=$1 version=$2 path=${!1} source commit package="sglang[tracing]==$2" reuse=0
+  local -a tracing=()
+  if [ "$key" = SGLANG_0523_TRACING ]; then
+    tracing=(opentelemetry-api==1.39.1 opentelemetry-sdk==1.39.1 opentelemetry-exporter-otlp==1.39.1)
+  elif [ "$key" = SGLANG_0523_SDK_FREE ]; then
+    package="sglang==$version"
+  fi
   [ -n "$path" ] || return 0
-  if [ -z "${V020_OVERRIDES[$key]:-}" ]; then
+  if [[ $key = SGLANG_0523_TRACING || $key = SGLANG_0523_SDK_FREE ]] && [ -e "$path" ] && [ -z "${V020_OVERRIDES[$key]:-}" ]; then
+    v020_claim "$path"
+    reuse=1
+  fi
+  if [ -z "${V020_OVERRIDES[$key]:-}" ] && [ "$reuse" = 0 ]; then
     v020_venv "$path"
     if [ "$key" = SGLANG_EDITABLE ]; then
       source=$V020/engines/sglang-0.5.23-source
@@ -296,8 +320,15 @@ v020_install_sglang() {
         --editable "$source/python[tracing]" torch-memory-saver==0.0.10
     else
       v020_cmd "$BIN/uv" pip install --python "$path/bin/python" --prerelease=allow --torch-backend=cu130 \
-        "sglang[tracing]==$version" torch-memory-saver==0.0.10
+        "$package" torch-memory-saver==0.0.10 "${tracing[@]}"
     fi
+  fi
+  if [ "$key" = SGLANG_0523_SDK_FREE ]; then
+    # vLLM 0.33 requires the SDK in common requirements; OT10 uses SGLang.
+    v020_cmd "$path/bin/python" -c 'import importlib.metadata as m; assert m.version("sglang")=="0.5.23"; names={d.metadata["Name"].lower().replace("_","-") for d in m.distributions()}; assert not any(n=="opentelemetry-sdk" or n.startswith("opentelemetry-exporter-otlp") for n in names), "OT10 fixture is not SDK-free"'
+  fi
+  if [ "$key" = SGLANG_0523_TRACING ]; then
+    v020_cmd "$path/bin/python" -c 'import importlib.metadata as m; assert m.version("sglang")=="0.5.23"; assert all(m.version(n) for n in ("opentelemetry-api","opentelemetry-sdk","opentelemetry-exporter-otlp"))'
   fi
   v020_freeze "$path" "$key"
 }
@@ -469,17 +500,6 @@ PY
   v020_cmd "$BIN/capyctl-old" --version
 }
 
-v020_collector() {
-  [ -z "${V020_OVERRIDES[OTELCOL]:-}" ] || return 0
-  local directory=$V020/engines/otelcol-0.164.0 archive=$V020/downloads/otelcol_0.164.0_linux_amd64.tar.gz
-  v020_mkdir "$directory"
-  v020_fetch https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.164.0/otelcol_0.164.0_linux_amd64.tar.gz "$archive"
-  # SHA256 from the published v0.164.0 release asset digest.
-  v020_check_sha "$archive" 5db7cf88c2e73a7fdce02b5fa967fcd5dc73bab00b871d947481918dc5093861
-  v020_unpack "$archive" "$directory"
-  [ -x "$OTELCOL" ] || { v020_setup_error 'collector binary missing'; return 1; }
-  v020_cmd "$OTELCOL" --version
-}
 
 v020_trt_availability() {
   "$V020/tools/bin/python" - "$EVIDENCE/$1.availability.json" "$2" "$3" <<'PY'
@@ -698,13 +718,15 @@ setup() (
   local -A V020_PATHS=(
     [VLLM_032]="$V020/engines/vllm-0.32.0-venv" [VLLM_033]="$V020/engines/vllm-0.33.0-venv"
     [SGLANG_0522]="$V020/engines/sglang-0.5.22-venv" [SGLANG_0523]="$V020/engines/sglang-0.5.23-venv"
+    [VLLM_033_TRACING]="$V020/engines/vllm-0.33.0-tracing-venv"
+    [SGLANG_0523_TRACING]="$V020/engines/sglang-0.5.23-tracing-venv"
+    [SGLANG_0523_SDK_FREE]="$V020/engines/sglang-0.5.23-sdk-free-venv"
     [SGLANG_EDITABLE]="$V020/engines/sglang-0.5.23-editable-venv" [LMCACHE]="$V020/engines/vllm-0.33.0-lmcache-venv"
     [LMCACHE_SGLANG]="$V020/engines/sglang-0.5.23-lmcache-venv"
     [LLAMACPP]="$V020/engines/llamacpp-v0.9.0/build/bin/llama-server"
     [TENSORFOLD_126]="$V020/engines/tensorfold-1.2.6" [TENSORFOLD_115]="$V020/engines/tensorfold-1.1.5"
     [TENSORFOLD_066]=''
     [TENSORRT_LLM]='' [TRT_LLM]='' [TENSORRT_LLM_121]='' [TENSORRT_LLM_140RC3]=''
-    [OTELCOL]="$V020/engines/otelcol-0.164.0/otelcol"
     [CUDA_HOME]='' [CUDA_HOME_TRT121]='' [CUDA_HOME_TRT140RC3]=''
     [MODEL_CHAT]="$V020/models/chat" [MODEL_CHAT_GGUF]="$V020/models/chat-gguf/Qwen3-4B-Q4_K_M.gguf"
     [MODEL_EMBED]="$V020/models/embed" [MODEL_EMBED_GGUF]="$V020/models/embed-gguf/Qwen3-Embedding-4B-Q8_0.gguf"
@@ -776,8 +798,8 @@ PY
   if [ "$(uname -m)" = aarch64 ]; then
     # The owner provisions approved lab engines separately. Even an unavailable
     # engine must have an explicit empty mapping; setup never upgrades a lab venv.
-    for key in VLLM_032 VLLM_033 SGLANG_0522 SGLANG_0523 SGLANG_EDITABLE LMCACHE LMCACHE_SGLANG \
-      LLAMACPP TENSORFOLD_126 TENSORFOLD_115 TENSORFOLD_066 TENSORRT_LLM_121 TENSORRT_LLM_140RC3 OTELCOL CUDA_HOME; do
+    for key in VLLM_032 VLLM_033 SGLANG_0522 SGLANG_0523 VLLM_033_TRACING SGLANG_0523_TRACING SGLANG_0523_SDK_FREE SGLANG_EDITABLE LMCACHE LMCACHE_SGLANG \
+      LLAMACPP TENSORFOLD_126 TENSORFOLD_115 TENSORFOLD_066 TENSORRT_LLM_121 TENSORRT_LLM_140RC3 CUDA_HOME; do
       [ -n "${V020_OVERRIDES[$key]:-}" ] || { v020_setup_error "aarch64 requires an explicit read-only mapping: $key"; exit 1; }
     done
   fi
@@ -804,12 +826,14 @@ PY
   (v020_install_sglang SGLANG_0522 0.5.22) & pids+=("$!"); labels+=(SGLANG_0522)
   (v020_install_sglang SGLANG_0523 0.5.23; v020_install_lmcache LMCACHE_SGLANG SGLANG_0523 sglang) & pids+=("$!"); labels+=(SGLANG_0523_LMCACHE)
   (v020_install_sglang SGLANG_EDITABLE 0.5.23) & pids+=("$!"); labels+=(SGLANG_EDITABLE)
+  (v020_install_vllm VLLM_033_TRACING 0.33.0) & pids+=("$!"); labels+=(VLLM_033_TRACING)
+  (v020_install_sglang SGLANG_0523_TRACING 0.5.23) & pids+=("$!"); labels+=(SGLANG_0523_TRACING)
+  (v020_install_sglang SGLANG_0523_SDK_FREE 0.5.23) & pids+=("$!"); labels+=(SGLANG_0523_SDK_FREE)
   (v020_build_llamacpp) & pids+=("$!"); labels+=(LLAMACPP)
   (v020_native_tensorfold TENSORFOLD_126 1.2.6 a8abf9b8d6b1109e716996eba18d5c5ce1dbe013a7808b603f81f218e0bcff3d;
    v020_native_tensorfold TENSORFOLD_115 1.1.5 71ee0d792b94bbe5419332e75a4c2e3975c863235d1f66ae736938e7c1d91e8a) & pids+=("$!"); labels+=(TENSORFOLD)
   (v020_tensorfold_baseline) & pids+=("$!"); labels+=(TENSORFOLD_066)
   (v020_old_binary) & pids+=("$!"); labels+=(CAPYCTL_OLD)
-  (v020_collector) & pids+=("$!"); labels+=(OTELCOL)
   (v020_models) & pids+=("$!"); labels+=(MODELS)
   (v020_setup_tensorrt TENSORRT_LLM_121 1.2.1 2.9.1 cu130 13.1 CUDA_HOME_TRT121) & pids+=("$!"); labels+=(TENSORRT_LLM_121)
   (v020_setup_tensorrt TENSORRT_LLM_140RC3 1.4.0rc3 2.14.0 cu132 13.4 CUDA_HOME_TRT140RC3) & pids+=("$!"); labels+=(TENSORRT_LLM_140RC3)
@@ -862,7 +886,7 @@ PY
   done
   [ -x "$BIN/capyctl-old" ] || { v020_setup_error 'old release binary missing'; exit 1; }
   "$V020/tools/bin/python" - "$EVIDENCE/binaries.fingerprint.json" \
-    "$BIN/capyctl" "$BIN/capyctl-old" "$LLAMACPP" "$OTELCOL" <<'PY'
+    "$BIN/capyctl" "$BIN/capyctl-old" "$LLAMACPP" <<'PY'
 import hashlib,json,os,pathlib,sys
 fingerprints={}
 paths=[pathlib.Path(name) for name in sys.argv[2:] if name]
@@ -881,8 +905,8 @@ for path in paths:
 pathlib.Path(sys.argv[1]).write_text(json.dumps(fingerprints,indent=2,sort_keys=True)+"\n")
 PY
   {
-    for key in VLLM_032 VLLM_033 SGLANG_0522 SGLANG_0523 SGLANG_EDITABLE LMCACHE LMCACHE_SGLANG LLAMACPP TENSORFOLD_126 TENSORFOLD_115 TENSORFOLD_066 \
-      TENSORRT_LLM TRT_LLM TENSORRT_LLM_121 TENSORRT_LLM_140RC3 OTELCOL \
+    for key in VLLM_032 VLLM_033 SGLANG_0522 SGLANG_0523 VLLM_033_TRACING SGLANG_0523_TRACING SGLANG_0523_SDK_FREE SGLANG_EDITABLE LMCACHE LMCACHE_SGLANG LLAMACPP TENSORFOLD_126 TENSORFOLD_115 TENSORFOLD_066 \
+      TENSORRT_LLM TRT_LLM TENSORRT_LLM_121 TENSORRT_LLM_140RC3 \
       MODEL_CHAT MODEL_CHAT_GGUF MODEL_EMBED MODEL_EMBED_GGUF MODEL_EMBED8 MODEL_CLEF MODEL_CLEF_GGUF MODEL_TENSORFOLD \
       CUDA_HOME CUDA_HOME_TRT121 CUDA_HOME_TRT140RC3; do
       printf '%s=%s\n' "$key" "${!key}"
