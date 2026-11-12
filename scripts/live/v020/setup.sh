@@ -584,17 +584,6 @@ v020_lmcache_builds() {
     "$V020/live/lmcache_builds.py" --source "$stage" --root "$V020"
 }
 
-v020_collector() {
-  [ -z "${V020_OVERRIDES[OTELCOL]:-}" ] || return 0
-  local directory=$V020/engines/otelcol-0.164.0 archive=$V020/downloads/otelcol_0.164.0_linux_amd64.tar.gz
-  v020_mkdir "$directory"
-  v020_fetch https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.164.0/otelcol_0.164.0_linux_amd64.tar.gz "$archive"
-  # SHA256 from the published v0.164.0 release asset digest.
-  v020_check_sha "$archive" 5db7cf88c2e73a7fdce02b5fa967fcd5dc73bab00b871d947481918dc5093861
-  v020_unpack "$archive" "$directory"
-  [ -x "$OTELCOL" ] || { v020_setup_error 'collector binary missing'; return 1; }
-  v020_cmd "$OTELCOL" --version
-}
 
 v020_trt_availability() {
   "$V020/tools/bin/python" - "$EVIDENCE/$1.availability.json" "$2" "$3" <<'PY'
@@ -901,7 +890,7 @@ PY
     # The owner provisions approved lab engines separately. Even an unavailable
     # engine must have an explicit empty mapping; setup never upgrades a lab venv.
     for key in VLLM_032 VLLM_033 VLLM_034 SGLANG_0522 SGLANG_0523 VLLM_033_TRACING SGLANG_0523_TRACING SGLANG_0523_SDK_FREE SGLANG_EDITABLE LMCACHE LMCACHE_VLLM_034 LMCACHE_SGLANG \
-      LLAMACPP TENSORFOLD_126 TENSORFOLD_115 TENSORFOLD_066 TENSORRT_LLM_121 TENSORRT_LLM_140RC3 OTELCOL CUDA_HOME; do
+      LLAMACPP TENSORFOLD_126 TENSORFOLD_115 TENSORFOLD_066 TENSORRT_LLM_121 TENSORRT_LLM_140RC3 CUDA_HOME; do
       [ -n "${V020_OVERRIDES[$key]:-}" ] || { v020_setup_error "aarch64 requires an explicit read-only mapping: $key"; exit 1; }
     done
   fi
@@ -1012,7 +1001,7 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps(fingerprints,indent=2,sort_keys=
 PY
   {
     for key in VLLM_032 VLLM_033 EM6_VLLM VLLM_034 SGLANG_0522 SGLANG_0523 VLLM_033_TRACING SGLANG_0523_TRACING SGLANG_0523_SDK_FREE SGLANG_EDITABLE LMCACHE LMCACHE_VLLM_034 LMCACHE_SGLANG LLAMACPP TENSORFOLD_126 TENSORFOLD_115 TENSORFOLD_066 TENSORFOLD_100 \
-      TENSORRT_LLM TRT_LLM TENSORRT_LLM_121 TENSORRT_LLM_140RC3 OTELCOL STRACE \
+      TENSORRT_LLM TRT_LLM TENSORRT_LLM_121 TENSORRT_LLM_140RC3 STRACE \
       MODEL_CHAT MODEL_CHAT_GGUF MODEL_EMBED MODEL_EMBED_GGUF MODEL_EMBED8 MODEL_CLEF MODEL_CLEF_GGUF MODEL_TENSORFOLD \
       CUDA_HOME CUDA_HOME_TRT121 CUDA_HOME_TRT140RC3; do
       printf '%s=%s\n' "$key" "${!key}"

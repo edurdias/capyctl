@@ -399,72 +399,72 @@ Budgets are maximum seconds per row, not elapsed-time promises.
 | Row | Priority | Budget (s) | Pass criterion / explicit unimplemented protocol |
 |---|---:|---:|---|
 | ISSUE225 | P1 | 1500 | vLLM 0.32.0 and 0.33.0 each serve two co-resident models, each rendered utilization <0.75, with positive explicit KV bytes |
-| LC13 | P1 | 1000 | ADR0034 §2: 32k park/wake correctness, whole-chunk hits, salts, store race, footprint and wake bounds; uncertified required versus auto. |
-| LC14 | P1 | 1100 | ADR0034 §2: 15 alternating-prompt park/wake cycles, off-reference answers, no held KV or server stops, covered charges and <=256MiB server GPU growth. |
-| LC15 | P1 | 600 | ADR0034 §2: enrolled host through the control server, 32k park/wake/hit and passing wake canary. |
-| LC16 | P1 | 900 | ADR0034 §2: five cold/engine-evicted/post-park trials at 8k/16k/32k; wake <=1.1x off, cold TTFT <=1.1x off, 32k post-wake TTFT <=0.25x off. |
-| ISSUE236 | P1 | 1200 | SGLang 0.5.22 and 0.5.23 answer with prefill disabled and decode native in managed native ServerArgs settings |
-| ISSUE235 | P1 | 1500 | Current server/current host refuse editable SGLang before launch; a 0.1.12 server refuses a 0.2.0 host with host_version_newer_than_server (ADR 0017 §2). |
+| LC13 | P1 | 2300 | ADR0034 §2: 32k park/wake correctness, whole-chunk hits, salts, store race, footprint and wake bounds; uncertified required versus auto. Full protocol on source-recognized vLLM 0.34.0rc1 and SGLang 0.5.23 with LMCache 0.5.7; vLLM 0.33 retains required-refusal/auto-off guard only (ADR0034 amendment). |
+| LC14 | P1 | 2500 | ADR0034 §2: 15 alternating-prompt park/wake cycles, off-reference answers, no held KV or server stops, covered charges and <=256MiB server GPU growth. Full protocol on source-recognized vLLM 0.34.0rc1 and SGLang 0.5.23 with LMCache 0.5.7; vLLM 0.33 retains required-refusal/auto-off guard only (ADR0034 amendment). |
+| LC15 | P1 | 1500 | ADR0034 §2: enrolled host through the control server, 32k park/wake/hit and passing wake canary. Full protocol on source-recognized vLLM 0.34.0rc1 and SGLang 0.5.23 with LMCache 0.5.7; vLLM 0.33 retains required-refusal/auto-off guard only (ADR0034 amendment). |
+| LC16 | P1 | 2100 | ADR0034 §2: five cold/engine-evicted/post-park trials at 8k/16k/32k; wake <=1.1x off, cold TTFT <=1.1x off, 32k post-wake TTFT <=0.25x off. Full protocol on source-recognized vLLM 0.34.0rc1 and SGLang 0.5.23 with LMCache 0.5.7; vLLM 0.33 retains required-refusal/auto-off guard only (ADR0034 amendment). |
+| ISSUE236 | P1 | 1200 | SGLang 0.5.22 and 0.5.23 answer with prefill disabled and decode native in the managed native ServerArgs settings |
+| ISSUE235 | P1 | 1500 | current server/current host refuse editable SGLang before launch; a 0.1.12 server refuses a 0.2.0 host with host_version_newer_than_server (ADR 0017 §2) |
 | ISSUE240 | P1 | 1800 | 48 durable in-flight leases coexist on a managed engine; traffic survives server-first then host upgrade from 0.1.12 to 0.2.0 |
 | EM1 | P2 | 900 | Qwen3-Embedding-4B BF16/Q8_0: native 2560 dimensions, ordered batch, API/certification/LMCache evidence and memory/start/charge. |
 | EM8 | P2 | 1800 | Embedding latency/load matrix and pinned retrieval; Qwen8B 2048-input float/base64 router memory bound. |
 | OT8 | P2 | 3000 | 200 requests per tracing arm/engine, phase arrays and throughput; SGLang trace levels 1 and 3. |
 | TF2 | P2 | 900 | TensorFold cold/warm readiness, full-context eight-stream device/process/host memory and startup sizing. |
 | TF3 | P2 | 1200 | TensorFold request options, drafted/no-draft greedy SHA equivalence and 1/8 stream baseline throughput. |
-| TR3 | P2 | 3000 | TensorRT cold/three warm starts, 30-minute mixed traffic and unchanged block-rounded pool beside 20GiB allocation. |
-| TR3-140RC3 | P2 | 3000 | TensorRT-LLM 1.4.0rc3: full TR3 protocol after tiny CUDA kernel preflight. |
+| TR3 | P2 | 3000 | TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11) |
+| TR3-140RC3 | P2 | 3000 | TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11) |
 | P3-vllm033 | P3 | 600 | Register, ready, collected and SSE chat, verified stop; deep park/wake on vLLM/SGLang. |
 | P3-sglang0522 | P3 | 600 | Register, ready, collected and SSE chat, verified stop; deep park/wake on vLLM/SGLang. |
 | P3-sglang0523 | P3 | 600 | Register, ready, collected and SSE chat, verified stop; deep park/wake on vLLM/SGLang. |
 | P3-llamacpp090 | P3 | 600 | Register, ready, collected and SSE chat, verified stop; deep park/wake on vLLM/SGLang. |
 | P3-tensorfold126 | P3 | 600 | Register, ready, collected and SSE chat, verified stop; deep park/wake on vLLM/SGLang. |
-| P3-TENSORRT_LLM_121 | P3 | 600 | Register, ready, collected and SSE chat, verified stop; deep park/wake on vLLM/SGLang. |
-| P3-TENSORRT_LLM_140RC3 | P3 | 600 | Register, ready, collected and SSE chat, verified stop; deep park/wake on vLLM/SGLang. |
+| P3-TENSORRT_LLM_121 | P3 | 600 | TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11) |
+| P3-TENSORRT_LLM_140RC3 | P3 | 600 | TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11) |
 | P3-decisions-sglang0523 | P3 | 600 | Clef-Flash becomes ready and answers /v1/systemone, then stops with verified exit. |
 | P3-decisions-llamacpp090 | P3 | 600 | Clef-Flash becomes ready and answers /v1/systemone, then stops with verified exit. |
-| LC13U | P4 | 1000 | ADR0034 §2: 32k park/wake correctness, whole-chunk hits, salts, store race, footprint and wake bounds; uncertified required versus auto. GB10 deep-parking counterpart. |
-| LC14U | P4 | 1100 | ADR0034 §2: 15 alternating-prompt park/wake cycles, off-reference answers, no held KV or server stops, covered charges and <=256MiB server GPU growth. GB10 deep-parking counterpart. |
-| LC15U | P4 | 600 | ADR0034 §2: enrolled host through the control server, 32k park/wake/hit and passing wake canary. GB10 deep-parking counterpart. |
-| LC16U | P4 | 900 | ADR0034 §2: five cold/engine-evicted/post-park trials at 8k/16k/32k; wake <=1.1x off, cold TTFT <=1.1x off, 32k post-wake TTFT <=0.25x off. GB10 deep-parking counterpart. |
-| EM3 | P4 | 2400 | Twenty lifecycle probes per stage, eight-client 64-input batches, measured tolerance and 100 pinned cross-engine sentences. |
-| EM5 | P4 | 3600 | Gauges, engine connections and cancelling leases for 32 cuts; whole-answer settlement and killed-answer verified stop. |
-| EM6 | P4 | 1500 | Enrolled host path, secret-free observational vLLM ASGI headers and incremental relay. |
-| EM7 | P4 | 2400 | Mutually exclusive embedding/chat ready grants and automatic pool switching; deep canary or restart. |
-| OT1 | P4 | 1800 | Default-off launch environment/option names, collector sockets and successful traced-context requests. |
-| OT2 | P4 | 2400 | Standalone chat/decisions, sampled and new/malformed traces, request IDs and phase spans. |
-| OT3 | P4 | 2400 | Content sentinels absent from complete OTLP, both engines present, quoted engine errors exercised. |
-| OT4 | P4 | 2400 | Cold launch, linked park/wake, forced-switch drain/release and <=1 ms phase agreement. |
-| OT5 | P4 | 2400 | Engine span parents, SGLang request ID, llama.cpp unsupported status and no trace header. |
-| OT6 | P4 | 3000 | Co-resident separately enrolled host ingress/wake parents and context propagation without host export. |
-| OT7 | P4 | 1800 | Outage/restart under traffic, dropped-span status, rate-limited notices and OT8 measured noise. |
-| OT9 | P4 | 1800 | Zero-retention engine tracing off, no engine trace headers/spans; CapyCTL spans present. |
-| OT10 | P4 | 1200 | Fresh SDK-free SGLang shape, not_installed status and successful serving. |
-| TF4 | P4 | 3600 | Native resolution/start refusals, managed admission pressure, default-reserve scratch comparison and compaction/retention policy. Unified only. |
-| TF5 | P4 | 1800 | Eight-stream drain, both zero gauges before SIGTERM, measured exit and busy 30-second no-signal bound; park refusal. Unified only. |
-| TF6 | P4 | 3600 | Four-client cuts at 100 ms gauge cadence, six repeats, held unanswered cancellation and journaled 32-cut restart. Unified only. |
-| TF7 | P4 | 1800 | Enrolled-host idle/busy reports, per-pool KV metrics, both forwarded histograms, native timings and remote settlement. Unified only. |
-| TF8 | P4 | 1800 | Mutually exclusive grants, fresh native wake inside Initialize and text completion canary. Unified only. |
-| TF9 | P4 | 1800 | Legacy 0.6.6 beside native, same checkpoint, health ok/busy, drain and verified exit. Unified only. |
-| TF10 | P4 | 1800 | Owned listener enumeration after readiness and controller-crash adoption/re-proof. Unified only. |
-| TF12 | P4 | 3600 | Exact 1.1.5 command, refused-to-ready health, startup/device/host memory, full context and 1/8-stream throughput; idle-unload refusal. |
-| TF13 | P4 | 1800 | 1.1.5 drain, SIGTERM-to-exit timing, in-stop 503/draining and busy-bound no-signal proof. |
-| TF14 | P4 | 3600 | Full 1.1.5 TF6 cancellation protocol plus TF7 enrolled-host load/latency/settlement path. |
-| TR1 | P4 | 1 | not implemented: Needs wheel provenance, non-executing detection audit, CUDA/OpenMPI companion evidence and no-CUDA-context registration observation. |
-| TR2 | P4 | 1 | not implemented: Needs direct version/readiness step evidence, rendered YAML and both tool-call/reasoning parser assertions; P3 chat is not equivalent. |
-| TR4 | P4 | 1 | not implemented: Needs the single load-reader's burst/lull observations, not direct metrics polling that starts another reader. |
-| TR5 | P4 | 1 | not implemented: Needs client-cut injection, engine abort timing, uncertain leases and 32-cut single-restart proof. |
-| TR6 | P4 | 1 | not implemented: Needs per-process memory disappearance, five fresh-launch cycles and exact deep refusal code, beyond P3 verified stop. |
-| TR7 | P4 | 1 | not implemented: Needs complete pre-launch refusal matrix including reserved LLM API nested keys and exact refusal codes. |
-| TR8 | P4 | 1 | not implemented: Needs cold-start outbound sockets sampled each second and sanitized telemetry/offline environment-name assertions. |
-| TR9 | P4 | 1 | not implemented: Needs owned-process SIGKILL, process-group/listener proof and release-order evidence. |
-| TR10 | P4 | 1 | not implemented: Needs authorized unmanaged MPI baseline with process/session/listener inventory; managed throughput alone is insufficient. |
-| TR11 | P4 | 1 | not implemented: Needs enrolled host ingress and TR5's cancellation settlement protocol. |
-| LC12 | P4 | 7200 | Both engines on GB10: historical qualified LMCache-driven rendering, registration fallback or park/hit evidence, read-only fabric-handle support; qualifies nothing. |
-| LC17 | P4 | 14400 | Isolated automatic/stated pools, 32k retention with 4k interference, 12.17/24 GiB limits, second-pool room exhaustion and 15 GiB server start. |
-| LC18 | P4 | 14400 | Both engines: isolated engine-driven restart build, 15 alternating cycles with off answers, whole-prompt hits, stable covered server GPU and no held KV or stops. |
+| LC13U | P4 | 2300 | ADR0034 §2: 32k park/wake correctness, whole-chunk hits, salts, store race, footprint and wake bounds; uncertified required versus auto. Full protocol on source-recognized vLLM 0.34.0rc1 and SGLang 0.5.23 with LMCache 0.5.7; vLLM 0.33 retains required-refusal/auto-off guard only (ADR0034 amendment). GB10 deep-parking counterpart. |
+| LC14U | P4 | 2500 | ADR0034 §2: 15 alternating-prompt park/wake cycles, off-reference answers, no held KV or server stops, covered charges and <=256MiB server GPU growth. Full protocol on source-recognized vLLM 0.34.0rc1 and SGLang 0.5.23 with LMCache 0.5.7; vLLM 0.33 retains required-refusal/auto-off guard only (ADR0034 amendment). GB10 deep-parking counterpart. |
+| LC15U | P4 | 1500 | ADR0034 §2: enrolled host through the control server, 32k park/wake/hit and passing wake canary. Full protocol on source-recognized vLLM 0.34.0rc1 and SGLang 0.5.23 with LMCache 0.5.7; vLLM 0.33 retains required-refusal/auto-off guard only (ADR0034 amendment). GB10 deep-parking counterpart. |
+| LC16U | P4 | 2100 | ADR0034 §2: five cold/engine-evicted/post-park trials at 8k/16k/32k; wake <=1.1x off, cold TTFT <=1.1x off, 32k post-wake TTFT <=0.25x off. Full protocol on source-recognized vLLM 0.34.0rc1 and SGLang 0.5.23 with LMCache 0.5.7; vLLM 0.33 retains required-refusal/auto-off guard only (ADR0034 amendment). GB10 deep-parking counterpart. |
+| LC12 | P4 | 7200 | ADR0034 LC12: per-engine historical qualified lmcache_driven deep launch, registration fallback or park/hit comparison, read-only GB10 fabric-handle support; qualifies nothing. |
+| LC17 | P4 | 14400 | ADR0034 LC17: auto pool basis, 32k retention with 4k interference, derived/raised caps, second-pool room exhaustion, stated pool and 15GiB server start bound. |
+| LC18 | P4 | 14400 | ADR0034 LC18: both engines, engine-driven restart_only, 15 alternating cycles with off answers, whole-prompt hits, stable covered GPU charge, no held KV or stops. |
+| TR1 | P4 | 1 | TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11) |
+| TR2 | P4 | 1 | TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11) |
+| TR4 | P4 | 1 | TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11) |
+| TR5 | P4 | 1 | TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11) |
+| TR6 | P4 | 1 | TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11) |
+| TR7 | P4 | 1 | TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11) |
+| TR8 | P4 | 1 | TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11) |
+| TR9 | P4 | 1 | TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11) |
+| TR10 | P4 | 1 | TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11) |
+| TR11 | P4 | 1 | TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11) |
 | EM2 | P4 | 1200 | Full embedding input/encoding/dimension/error contract on vLLM, SGLang and llama.cpp. |
 | EM4 | P4 | 1200 | Restart each embeddings deployment and require a journaled passing reference canary. |
-| EM9 | P4 | 1800 | Five deep cycles plus parked-arrival wake; per-launch GPU budget, SGLang saver-map bytes, residue and passing canaries. |
 | TF1 | P4 | 120 | TensorFold 1.2.6 registration, archive checksums and native capabilities. |
 | TF11 | P4 | 120 | TensorFold 1.1.5 registration beside 1.2.6, archive checksums and native capabilities. |
 | OT11 | P4 | 300 | Non-loopback engine tracing and reserved profile argument/environment refusals. |
+| EM3 | P4 | 2400 | ADR0036: 20 start/restart/wake probes and 20 64-input batches at eight clients; measured tolerance plus margin <=0.02; 100 pinned cross-engine sentences. |
+| EM5 | P4 | 3600 | ADR0036: 2048-input running gauges, hangup/deadline engine connections and cancelling leases, 32 answer settlements without restart, killed-answer verified-stop settlement. |
+| EM6 | P4 | 1500 | ADR0036: separately enrolled host ingress validation and incremental relay, echoed request ID absent from engine headers. |
+| EM7 | P4 | 2400 | ADR0036/SPEC10: mutually exclusive embedding/chat grants, automatic pool switches, deep wake canary or llama.cpp restart. |
+| EM9 | P4 | 1800 | ADR0036: five deep park/wake cycles plus parked-arrival wake; per-launch release proof, measured residue, passing canary and timings. |
+| OT1 | P4 | 1800 | ADR0037 OT1: default off; no tracing launch options, environment names or collector connections. |
+| OT2 | P4 | 2400 | ADR0037 OT2: streamed/collected chat and decisions, caller/new/malformed traces and request IDs. |
+| OT3 | P4 | 2400 | ADR0037 OT3: all content sentinels absent from CapyCTL and both engines, including quoted validation errors. |
+| OT4 | P4 | 2400 | ADR0037 OT4: cold launch, linked wake/readiness/canary, forced-switch drain/release and <=1ms timing agreement. |
+| OT5 | P4 | 2400 | ADR0037 OT5: vLLM/SGLang span parentage, SGLang request ID and llama.cpp no trace header. |
+| OT6 | P4 | 3000 | ADR0037 OT6: separately enrolled server/host on loopback; ingress, wake and endpoint-free propagation. |
+| OT7 | P4 | 1800 | ADR0037 OT7: collector outage under traffic, OT8 noise comparison, bounded notices, dropped counters and resumed export. |
+| OT9 | P4 | 1800 | ADR0037 OT9: retention zero disables engine tracing and trace headers, while CapyCTL exports. |
+| OT10 | P4 | 1200 | ADR0037 OT10: independently verified SDK-free SGLang serves with not_installed. |
+| TF4 | P4 | 3600 | Every native resolution refusal, unlisted-family launch diagnostic, 16-stream engine refusal, reserve-pressure comparison and retention-zero compaction refusal. |
+| TF5 | P4 | 1800 | Eight running streams drain to both work gauges zero before stop; busy engine survives the 30-second bound; parking is refused. |
+| TF6 | P4 | 3600 | Four-client cuts, sampled every 100 ms, streamed and collected, three repeats each; unanswered cancellation stays held; 32 held requests restart and recover. |
+| TF7 | P4 | 1800 | Enrolled-host idle/busy reports, per-pool KV metrics, both forwarded histograms, remote cancelled-answer settlement and native request timings. |
+| TF8 | P4 | 1800 | Mutually exclusive native/vLLM grants switch in turn; fresh native wake finishes inside Initialize and passes its text completion canary. |
+| TF9 | P4 | 1800 | TensorFold 0.6.6 registers beside native, starts the same checkpoint, reports health ok/busy, drains and stops. |
+| TF10 | P4 | 1800 | Owned native process has only its IPv4 loopback listener after readiness and controller re-proof. |
+| TF12 | P4 | 3600 | 1.1.5 exact command, refused-to-ready health, startup/peak memory and 1/8-stream throughput; reserved idle-unload refusal. |
+| TF13 | P4 | 1800 | 1.1.5 eight-stream drain, SIGTERM-to-exit measurement and health 503/draining; busy 30-second bound does not signal. |
+| TF14 | P4 | 3600 | 1.1.5 complete TF6 cancellation protocol and TF7 enrolled-host reports and settlement. |

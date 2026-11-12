@@ -207,6 +207,16 @@ class HelperTests(unittest.TestCase):
         self.assertTrue(matches(record))
         self.assertFalse(matches(dict(record, start_ticks=record['start_ticks'] + 1)))
 
+    def test_tensorrt_rows_are_listed_but_never_launch(self):
+        held = [row for row in v020.rows()
+                if row['id'].startswith('TR') or row['id'].startswith('P3-TENSORRT_LLM')]
+        self.assertTrue(held)
+        reason = 'TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11)'
+        for row in held:
+            self.assertEqual(row['criteria'], reason)
+            for unified in (False, True):
+                self.assertEqual(v020.skip_reason(row, unified=unified), reason)
+
     def test_catalog_contains_all_required_rows(self):
         catalog = v020.rows()
         ids = [row['id'] for row in catalog]
@@ -298,7 +308,7 @@ class HelperTests(unittest.TestCase):
         names = ('VLLM_032 VLLM_033 VLLM_034 SGLANG_0522 SGLANG_0523 SGLANG_EDITABLE '
                  'VLLM_033_TRACING SGLANG_0523_TRACING SGLANG_0523_SDK_FREE '
                  'LMCACHE LMCACHE_VLLM_034 LMCACHE_SGLANG LLAMACPP TENSORFOLD_126 TENSORFOLD_115 '
-                 'TENSORFOLD_066 TENSORRT_LLM_121 TENSORRT_LLM_140RC3 OTELCOL CUDA_HOME').split()
+                 'TENSORFOLD_066 TENSORRT_LLM_121 TENSORRT_LLM_140RC3 CUDA_HOME').split()
         script = '''
 source "$1"
 export HOME=$2 V020=$2/session BIN=$2/session/bin EVIDENCE=$2/session/evidence

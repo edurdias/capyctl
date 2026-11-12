@@ -33,8 +33,8 @@ def fixtures(ctx, specs, engine):
     installation = Path(ctx.engines['LMCACHE'])
     python = installation / 'bin/python' if installation.is_dir() else installation.parent / 'python'
     package = 'vllm' if engine == 'vllm' else 'sglang'
-    script = TOKENIZER.replace('("vllm", "lmcache", "transformers")', repr((package, 'lmcache', 'transformers')))
-    data = json.loads(ctx.command([python, '-c', script, ctx.engines['MODEL_CHAT'], json.dumps(specs)],
+    script = TOKENIZER.replace('(engine, "lmcache", "transformers")', repr((package, 'lmcache', 'transformers')))
+    data = json.loads(ctx.command([python, '-c', script, ctx.engines['MODEL_CHAT'], json.dumps(specs), package],
         env={**os.environ, 'HF_HUB_OFFLINE':'1', 'TRANSFORMERS_OFFLINE':'1', 'TOKENIZERS_PARALLELISM':'false'}).stdout)
     versions = data['versions']
     approved = {'vllm': {'0.32.0','0.33.0','0.34.0rc1'}, 'sglang': {'0.5.22','0.5.23'}}
@@ -153,7 +153,7 @@ class ExtraProtocol(Protocol):
     def finish(self):
         for name in self.names[:]:
             self.retire(name)
-        self.record('qualification-scope', engine=self.engine, residency=self.residency,
+        self.record('qualification-scope', residency=self.residency,
                     transfer=self.transfer, release_table_mutated=False,
                     qualification='LC12 settles an inference only' if self.row['id']=='LC12' else 'live qualification only; CPU tests do not qualify')
         return dict(verdict='fail' if self.failures else 'skip' if self.ctx.functional_only else 'pass',

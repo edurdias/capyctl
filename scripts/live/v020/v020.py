@@ -32,9 +32,12 @@ class UnavailableEngine(Exception):
 def rows():
     order = {name: index for index, name in enumerate(('ISSUE225', 'LC13', 'LC14', 'LC15', 'LC16',
              'ISSUE236', 'ISSUE235', 'ISSUE240', 'EM1', 'EM8', 'OT8', 'TF2', 'TF3', 'TR3'))}
-    return sorted([dict(row, module=name) for name in MODULES
-                   for row in importlib.import_module('rows.' + name).ROWS],
-                  key=lambda row: (row['priority'], order.get(row['id'], 100)))
+    catalog = [dict(row, module=name) for name in MODULES
+               for row in importlib.import_module('rows.' + name).ROWS]
+    for row in catalog:
+        if row['id'].startswith('TR') or row['id'].startswith('P3-TENSORRT_LLM'):
+            row['criteria'] = 'TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11)'
+    return sorted(catalog, key=lambda row: (row['priority'], order.get(row['id'], 100)))
 
 
 def select_rows(value, catalog=None):
@@ -49,6 +52,8 @@ def select_rows(value, catalog=None):
 
 
 def skip_reason(row, functional_only=False, unified=False):
+    if row.get('id', '').startswith(('TR', 'P3-TENSORRT_LLM')):
+        return 'TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11)'
     if row.get('discrete') and unified:
         return 'needs a discrete GPU'
     if row.get('unified') and not unified:

@@ -98,6 +98,8 @@ def restart_canary_verdict(events):
 
 
 def run(ctx, row):
+    if row["id"].startswith("TR"):
+        return dict(verdict="skip", reason="TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11)", evidence={})
     if row["id"] in SKIPS:
         return dict(verdict="skip", reason=SKIPS[row["id"]], evidence={})
     evidence = {}

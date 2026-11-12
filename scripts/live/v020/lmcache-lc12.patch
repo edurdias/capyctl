@@ -16,8 +16,6 @@
  }
 --- a/crates/capyctl-agent/src/lmcache_install.rs
 +++ b/crates/capyctl-agent/src/lmcache_install.rs
-@@ -217,3 +217,3 @@
-     let sleep_clears_cache =
--        engine == Engine::Vllm && residency.parks() && shape.vllm_sleep_clears_cache();
-+        false && engine == Engine::Vllm && residency.parks() && shape.vllm_sleep_clears_cache();
-     if !shape.missing.is_empty() {
+@@ -221,1 +221,1 @@
+-    let preserves_sleep = !residency.parks()
++    let preserves_sleep = engine == Engine::Vllm || !residency.parks()

@@ -53,6 +53,8 @@ def passing_canary(ctx, name, restore=True):
 
 
 def run(ctx, row):
+    if row["engine"].startswith("TENSORRT_LLM"):
+        return dict(verdict="skip", reason="TensorRT-LLM is held out of 0.2.0 (ADR 0038 owner decision 2026-11-11)", evidence={})
     engine = row["engine"]
     name = row["id"].lower().replace("_", "-")
     decisions = row.get("decisions", False)
