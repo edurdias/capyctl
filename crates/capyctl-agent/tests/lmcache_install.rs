@@ -1,6 +1,6 @@
 //! T45 (ADR 0033 §1): LMCache measured for `engine add` and checked by shape
 //! at launch, against fake environments built from excerpts of the real
-//! LMCache 0.5.6/0.5.7, vLLM 0.32.0 and SGLang 0.5.22 sources
+//! LMCache 0.5.6/0.5.7, vLLM 0.32.0/0.33.0/0.34.0rc1 and SGLang 0.5.22/0.5.23 sources
 //! (`tests/fixtures/lmcache`). CPU tests only; they are not qualification.
 
 use capyctl_agent::installation::InstallationMeasurer;
@@ -79,6 +79,24 @@ impl Env {
             _ => "vllm-0.32.0",
         };
         copy_tree(&Path::new(FIXTURES).join(engine_fixture), &site);
+        // T45: compose the existing connector excerpts with the real
+        // versioned sleep/reset shape, rather than inventing a safe reset.
+        match engine {
+            Engine::Vllm => copy_tree(&Path::new(FIXTURES).join("vllm-0.34.0rc1"), &site),
+            Engine::Sglang => {
+                let relative =
+                    "sglang/srt/mem_cache/storage/lmcache/lmcache_unified_radix_cache.py";
+                let mut text = std::fs::read_to_string(site.join(relative)).unwrap();
+                text.push_str(
+                    &std::fs::read_to_string(
+                        Path::new(FIXTURES).join("sglang-0.5.23").join(relative),
+                    )
+                    .unwrap(),
+                );
+                std::fs::write(site.join(relative), text).unwrap();
+            }
+            _ => {}
+        }
         copy_tree(
             &Path::new(FIXTURES).join(format!("lmcache-{version}")),
             &site,
@@ -209,7 +227,7 @@ fn check_failed_as(env: &Env, transfer: TransferMode) -> String {
 
 const BOTH_MODES: [TransferMode; 2] = [TransferMode::LmcacheDriven, TransferMode::EngineDriven];
 
-// T45 (ADR 0033 §1): vLLM 0.32.0 with LMCache 0.5.6 passes, reports the
+// T45 (ADR 0033 §1): vLLM's connector with LMCache 0.5.6 passes, reports the
 // version and the digest `engine add` records, and no drift.
 #[test]
 fn lmcache_check_passes_on_vllm_with_lmcache_056() {
@@ -224,8 +242,8 @@ fn lmcache_check_passes_on_vllm_with_lmcache_056() {
     assert_eq!(install.version, "0.5.6");
     assert_eq!(install.digest, registration.digest);
     assert!(!install.drifted);
-    // T45 (ADR 0034 §1): the release carries what engine-driven transfer
-    // needs, so a parking launch passes too.
+    // T45 (ADR 0034 §1): compose its connector with the recognized
+    // 0.34.0rc1 sleep chain for engine-driven parking.
     let install = env
         .check_as(Some(&registration), TransferMode::EngineDriven)
         .unwrap();
@@ -1009,20 +1027,7 @@ fn lmcache_check_names_each_missing_engine_driven_piece() {
 #[test]
 fn sleep_that_clears_external_cache_refuses_lmcache_parking_only() {
     let env = Env::with_lmcache(Engine::Vllm, "0.5.7");
-    env.write(
-        "vllm/v1/engine/core.py",
-        r#"class EngineCore:
-    def _reset_caches(self, reset_running_requests: bool = True,
-                      reset_connector: bool = True) -> None:
-        self.reset_prefix_cache(reset_connector=reset_connector)
-    def _finish_pause(self, clear_cache: bool) -> None:
-        if clear_cache:
-            self._reset_caches()
-    def sleep(self, level: int = 1, mode = 'abort'):
-        clear_prefix_cache = level >= 1
-        self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)
-"#,
-    );
+    copy_tree(&Path::new(FIXTURES).join("vllm-0.33.0"), &env.site);
     let registration = env.register();
     for residency in [Residency::Deep, Residency::HostBacked] {
         let failure = check_lmcache(
@@ -1042,13 +1047,138 @@ fn sleep_that_clears_external_cache_refuses_lmcache_parking_only() {
         );
     }
     env.check_registered().unwrap();
-    // A fixed installation that explicitly preserves the connector passes.
+    // An unrecognized patch does not count as a supported preservation API.
     env.edit(
         "vllm/v1/engine/core.py",
         "self._reset_caches()",
         "self._reset_caches(reset_connector=False)",
     );
-    env.check_registered_as(TransferMode::EngineDriven).unwrap();
+    assert_eq!(
+        env.check_registered_as(TransferMode::EngineDriven)
+            .unwrap_err()
+            .reason,
+        LmcacheOffReason::SleepClearsCache,
+    );
+}
+
+// T45 (ADR 0034, 2026-11-11): recognize the real route-to-scheduler chain
+// and its pending store drain. No version string or one-hop patch suffices.
+#[test]
+fn only_the_complete_vllm_preservation_chain_passes_sleep() {
+    let env = Env::with_lmcache(Engine::Vllm, "0.5.7");
+    let registered = env.register();
+    for residency in [Residency::Deep, Residency::HostBacked] {
+        let install = check_lmcache(
+            &env.measurer,
+            env.engine,
+            &env.executable(),
+            Some(&registered),
+            residency,
+        )
+        .unwrap();
+        assert!(install.vllm_preserves_lmcache);
+    }
+    assert!(!env.check_registered().unwrap().vllm_preserves_lmcache);
+    for (file, from, to) in [
+        (
+            "vllm/entrypoints/serve/dev/sleep/api_router.py",
+            "sleep(level, mode, reset_connector)",
+            "sleep(level, mode, True)",
+        ),
+        (
+            "vllm/v1/engine/async_llm.py",
+            "sleep_async(level, mode, reset_connector)",
+            "sleep_async(level, mode, True)",
+        ),
+        (
+            "vllm/v1/engine/core_client.py",
+            "\"sleep\", level, mode, reset_connector",
+            "\"sleep\", level, mode, True",
+        ),
+        (
+            "vllm/v1/engine/core.py",
+            "reset_connector=reset_connector",
+            "reset_connector=True",
+        ),
+        (
+            "vllm/v1/engine/core.py",
+            "while self.scheduler.has_requests() or self.batch_queue:",
+            "while False:",
+        ),
+        (
+            "vllm/v1/engine/core.py",
+            "return not self.has_work()",
+            "return True",
+        ),
+        (
+            "vllm/v1/core/sched/scheduler.py",
+            "self.connector.has_pending_push_work()",
+            "False",
+        ),
+        (
+            "vllm/v1/core/sched/scheduler.py",
+            "self.has_finished_requests()",
+            "False",
+        ),
+        (
+            "vllm/v1/core/sched/scheduler.py",
+            "if reset_connector:",
+            "if True:",
+        ),
+    ] {
+        let env = Env::new(Engine::Vllm);
+        env.edit(file, from, to);
+        assert_eq!(
+            env.check_registered_as(TransferMode::EngineDriven)
+                .unwrap_err()
+                .reason,
+            LmcacheOffReason::SleepClearsCache,
+            "{file}: {from}",
+        );
+    }
+    let env = Env::new(Engine::Vllm);
+    env.remove("vllm/entrypoints/serve/dev/sleep/api_router.py");
+    assert_eq!(
+        env.check_registered_as(TransferMode::EngineDriven)
+            .unwrap_err()
+            .reason,
+        LmcacheOffReason::SleepClearsCache,
+    );
+}
+
+// T45 (ADR 0034): SGLang 0.5.23's non-clearing reset drains stores; an
+// unknown or clearing reset stays sleep_clears_cache, but restart is unaffected.
+#[test]
+fn sglang_nonclearing_reset_passes_and_unknown_or_clearing_reset_fails() {
+    const RADIX: &str = "sglang/srt/mem_cache/storage/lmcache/lmcache_unified_radix_cache.py";
+    let env = Env::with_lmcache(Engine::Sglang, "0.5.7");
+    assert!(
+        !env.check_registered_as(TransferMode::EngineDriven)
+            .unwrap()
+            .vllm_preserves_lmcache
+    );
+    for (from, to) in [
+        ("connector.end_all_sessions()", "connector.clear_cache()"),
+        ("def reset(self)", "def unknown_reset(self)"),
+        (
+            "class LMCacheUnifiedRadixCache:",
+            "class UnrelatedRadixCache:",
+        ),
+        (
+            "connector.complete_store(pending.operation, synchronize=False)",
+            "pass",
+        ),
+    ] {
+        let env = Env::with_lmcache(Engine::Sglang, "0.5.7");
+        env.edit(RADIX, from, to);
+        assert_eq!(
+            env.check_registered_as(TransferMode::EngineDriven)
+                .unwrap_err()
+                .reason,
+            LmcacheOffReason::SleepClearsCache,
+        );
+        env.check_registered().unwrap();
+    }
 }
 
 // T45 (ADR 0034 §1): the remote host's launch-time check, through the

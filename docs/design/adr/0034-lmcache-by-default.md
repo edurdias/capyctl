@@ -776,3 +776,57 @@ instead of freeing them after a transfer. This is consistent with the extra host
 not evidence of retained GPU KV. No live retest establishes a reduced host footprint.
 No sleep-based vLLM row is qualified by this investigation. CPU and Fake-engine tests
 are not qualification.
+
+## Amendment of 2026-11-11: preserve the external store where supported
+
+Owner decision, item 4 option A: sleep-based parking must keep LMCache's
+external store when the installed engine supports it. This supersedes the
+blanket limitation above, not its evidence or the qualification requirements.
+CapyCTL reads the installed source at launch; a version string alone never
+establishes preservation.
+
+- **vLLM:** the preserving shape introduced in
+  [PR #57810](https://github.com/vllm-project/vllm/pull/57810), merged
+  2026-11-08 and included in `0.34.0rc1`, accepts `reset_connector` as a
+  [sleep query parameter](https://github.com/vllm-project/vllm/blob/v0.34.0rc1/vllm/entrypoints/serve/dev/sleep/api_router.py#L22-L39),
+  threads it through the
+  [engine's pause and reset](https://github.com/vllm-project/vllm/blob/v0.34.0rc1/vllm/v1/engine/core.py#L1016-L1139),
+  and [skips the connector reset when false](https://github.com/vllm-project/vllm/blob/v0.34.0rc1/vllm/v1/core/sched/scheduler.py#L3323-L3359).
+  Pending connector stores are drained before GPU KV is discarded. Only a
+  launch with active LMCache and this recognized source shape sends
+  `POST /sleep?level=N&reset_connector=false`; this is not a JSON body.
+  Other sleep calls are unchanged. vLLM 0.32 and 0.33 retain
+  `sleep_clears_cache`: `required` refuses
+  `lmcache_unavailable:sleep_clears_cache`, and `auto` leaves LMCache off.
+- **SGLang:** the
+  [0.5.23 LMCache radix reset](https://github.com/sgl-project/sglang/blob/v0.5.23/python/sglang/srt/mem_cache/storage/lmcache/lmcache_unified_radix_cache.py#L386-L424)
+  ends sessions without clearing the connector's store, including the
+  [release/resume path](https://github.com/sgl-project/sglang/blob/v0.5.23/python/sglang/srt/managers/scheduler_components/weight_updater.py#L333-L420).
+  An installation with this recognized non-clearing shape is not disabled
+  or refused as `sleep_clears_cache`; an unrecognized or clearing shape
+  keeps the guard. No Python patch changes either engine's reset semantics.
+
+The [upstream weight invariant](https://github.com/vllm-project/vllm/blob/v0.34.0rc1/docs/features/sleep_mode.md#L159-L168)
+is mandatory: weights must remain unchanged across park and wake, or salts
+must distinguish weight versions. CapyCTL enforces the former under ADR 0014
+§7: the local `CheckpointGate::verified_wake` in
+`crates/capyctl-controller/src/checkpoint_digests.rs` runs before `Restore`,
+including adopted local LMCache sleep-parking runtimes through
+`crates/capyctl-controller/src/coordinator/local_adoption.rs`;
+the enrolled host's `checkpoint_unchanged` in
+`crates/capyctl-agent/src/native_execution/residency.rs` verifies the launch's
+recorded digest before any restore or weight reload call. A supplied new
+digest cannot replace the recorded one. `verify_checkpoint` in
+`crates/capyctl-agent/src/native_execution.rs` verifies the checkpoint against
+that digest; `launch_and_wake_refuse_a_checkpoint_that_is_not_the_recorded_one`
+covers a changed checkpoint and a mismatched supplied digest. No new salt
+scheme or weaker wake check is introduced.
+
+The loopback-only controls, per-launch key and key guard (ADR 0012) remain
+mandatory. `QUALIFIED_PARKING` is unchanged: recognizing upstream behavior
+is not certification. `required` may run a preserving installation as an
+uncertified setup; `auto` still observes the qualified-table policy.
+LC13–LC16 must run the full original correctness, store-race, memory and
+latency protocols on vLLM 0.34.0rc1 and SGLang 0.5.23 with LMCache 0.5.7.
+The vLLM 0.33 row remains a guard check, never qualification.
+CPU and Fake-engine tests are not qualification.

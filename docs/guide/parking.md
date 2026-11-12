@@ -154,13 +154,20 @@ the server stops when the model stops.
   start with LMCache (a model type the transfer does not handle, for
   example), the launch fails `lmcache_unavailable:engine_start_failed` and
   nothing is left running.
-- **A vLLM sleep that clears the external cache** cannot preserve LMCache.
-  The launch-time check detects the known sleep-reset path in the installed
-  engine (`sleep_clears_cache`): under `auto`, parking is kept and LMCache
+- **Sleep must preserve the external cache.** CapyCTL checks the installed
+  source, not just its version. On vLLM's recognized preserving path
+  (introduced in 0.34.0rc1), active LMCache adds `reset_connector=false` to
+  the sleep query; pending stores finish before GPU KV is discarded.
+  SGLang's recognized non-clearing reset (0.5.23) ends sessions without
+  clearing the store. These paths still need live qualification before
+  they enter the certified table. Older, unrecognized or clearing paths
+  keep `sleep_clears_cache`: under `auto`, parking is kept and LMCache
   is off; under `required`, the launch is refused with
-  `lmcache_unavailable:sleep_clears_cache`. This is a compatibility failure,
-  not a refusal for being uncertified. Restart-only parking is unaffected
-  because it does not call sleep.
+  `lmcache_unavailable:sleep_clears_cache`. vLLM 0.32 and 0.33 keep this
+  guard. It is a compatibility failure, not a refusal for being
+  uncertified. CapyCTL verifies unchanged checkpoint weights before wake;
+  cached KV cannot safely be reused after a weight change. Restart-only
+  parking is unaffected because it does not call sleep.
 
 ## Switch between models
 

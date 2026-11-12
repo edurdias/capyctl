@@ -1182,12 +1182,23 @@ unified connector, which puts it in the cache key, and SGLang does not use
 LMCache's older SGLang adapter (which dropped the salt, LMCache issue 4825).
 A release without that path fails the check, and its deployments run without
 LMCache until a release has it. A failed check names what was missing.
-For vLLM `deep` and `host_backed` parking, it also detects the known sleep
-path that resets the external connector and clears the LMCache server.
-Such a launch runs without LMCache under `auto` (`sleep_clears_cache`) or
-refuses `lmcache_unavailable:sleep_clears_cache` under `required`, even if
-the combination is listed as certified. `restart_only` does not call sleep
-and is unaffected. Engine-driven transfer reserves no held engine KV.
+For `deep` and `host_backed` parking it also checks that the engine preserves
+the external store. A recognized vLLM preserving path (introduced in
+0.34.0rc1) accepts and forwards the sleep query parameter
+`reset_connector=false`, drains pending stores and skips the external
+connector reset; CapyCTL sends that parameter only with active LMCache.
+SGLang's recognized non-clearing reset (0.5.23) ends sessions without
+clearing LMCache. Version strings alone do not pass either check.
+An older, unrecognized or clearing path runs without LMCache under `auto`
+(`sleep_clears_cache`) or refuses
+`lmcache_unavailable:sleep_clears_cache` under `required`, even if the
+combination is listed as certified. In particular, vLLM 0.32 and 0.33 retain
+that guard. `restart_only` does not call sleep and is unaffected.
+Preserving installations still need live qualification before `auto` can
+use LMCache with parking; `required` can run them uncertified.
+CapyCTL verifies the checkpoint before wake: preserved KV must never be
+reused with changed weights. Engine-driven transfer reserves no held
+engine KV.
 
 **`capyctl engine list`** shows an `LMCACHE` column: the registered version,
 or `off (<reason>)` for a profile that cannot use it.

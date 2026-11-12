@@ -132,9 +132,13 @@ async fn step(
     };
     let fact = match command.action {
         RuntimeAction::Park => {
-            http.sleep(adapter.park_level() as u8, remaining()?)
-                .await
-                .map_err(|e| uncertain("sleep", e))?;
+            http.sleep(
+                adapter.park_level() as u8,
+                adapter.preserves_lmcache(),
+                remaining()?,
+            )
+            .await
+            .map_err(|e| uncertain("sleep", e))?;
             // The acknowledgement alone is not the post-condition.
             if !http
                 .is_sleeping()

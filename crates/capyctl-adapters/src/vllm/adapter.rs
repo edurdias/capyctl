@@ -84,6 +84,8 @@ pub struct VllmAdapter {
     /// ADR 0033 §7: the deployment's residency is `restart_only`: with
     /// LMCache on, a park stops the engine and keeps the server.
     restart_only: bool,
+    /// ADR 0034: retained remote launches carry locally re-proven preservation.
+    preserve_lmcache: bool,
 }
 
 #[derive(Default)]
@@ -128,6 +130,7 @@ impl VllmAdapter {
             park_level: crate::vllm::residency::ParkLevel::Deep,
             api: capyctl_config::effective::DeploymentApi::Chat,
             restart_only: false,
+            preserve_lmcache: false,
         }
     }
 
@@ -161,6 +164,22 @@ impl VllmAdapter {
         };
         self.restart_only = residency == capyctl_config::effective::Residency::RestartOnly;
         self
+    }
+
+    /// ADR 0034 (2026-11-11): a retained host driver sets this only after
+    /// proving active LMCache and recognizing its installed sleep chain.
+    pub fn with_preserved_lmcache(mut self, recognized_active: bool) -> Self {
+        self.preserve_lmcache = recognized_active;
+        self
+    }
+
+    pub(super) fn preserves_lmcache(&self) -> bool {
+        self.preserve_lmcache
+            || self
+                .launch
+                .as_ref()
+                .and_then(|launch| launch.lmcache.as_ref())
+                .is_some_and(|state| state.vllm_preserves_sleep())
     }
 
     /// ADR 0033 §7: whether a Park or Restore of this launch is the
@@ -564,6 +583,7 @@ impl EngineAdapter for VllmAdapter {
                     ParkLevel::One => 1,
                     ParkLevel::Two => 2,
                 },
+                self.preserves_lmcache(),
                 std::time::Duration::from_secs(crate::vllm::http::ENGINE_CONTROL_TIMEOUT_SECS),
             )
             .await
