@@ -9,15 +9,6 @@ from .engines import document, passing_canary, stopped
 
 
 SKIPS = {
-    "OT1": "Needs owned-process socket and sanitized environment-name inspection to prove tracing is absent, not just successful requests.",
-    "OT2": "Needs loopback collector and trace/span parent/request-id correlation including decisions.",
-    "OT3": "Needs collector capture including engine spans and engine validation-error sentinel coverage.",
-    "OT4": "Needs collector activation links and phase timing comparison within 1 ms.",
-    "OT5": "Needs engine and router span parentage plus engine-side header observation.",
-    "OT6": "Needs independently configured server/host collectors and ingress span correlation.",
-    "OT7": "Needs controlled collector outage/restart, dropped-span counters and OT8 noise baseline.",
-    "OT9": "Needs collector evidence of CapyCTL spans present and engine spans absent under retention zero.",
-    "OT10": "Needs approved SDK-free environment and static package-shape inspection; installed environments must not be modified.",
     "OT11": "Needs isolated role/profile configuration refusal fixtures for non-loopback exporter and reserved tracing variables.",
     "TF1": "Exact ADR row needs 1.0.0 and 0.6.6 side-by-side registration and collision refusal; 1.2.6 lifecycle is separately P3, not equivalent.",
     "TF4": "Needs admission pressure fixture, scratch default-reserve launch and all native refusal cases, not only capability refusals.",

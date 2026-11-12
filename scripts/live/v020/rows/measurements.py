@@ -412,7 +412,9 @@ def load_chat(ctx,name,n=200,concurrency=8,headers=None):
         ctx.assertion(count>0,'SSE usage missing output token count')
         phases=timing_phases(result)
         ctx.assertion(phases,'x-capyctl-timing missing numeric router phases')
-        return dict(seconds=result['seconds'],ttft_s=result['ttft_s'],output_tokens=count,phases=phases)
+        request_id={key.lower():value for key,value in result['response_headers'].items()}.get('x-capyctl-request-id')
+        ctx.assertion(request_id,'load response has no request ID')
+        return dict(seconds=result['seconds'],ttft_s=result['ttft_s'],output_tokens=count,phases=phases,request_id=request_id)
     start=time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
         records=list(pool.map(one,range(n)))
@@ -422,14 +424,9 @@ def load_chat(ctx,name,n=200,concurrency=8,headers=None):
 
 
 def ot8(ctx,evidence):
-    collector=ctx.engines.get('OTELCOL')
-    ctx.assertion(collector and Path(collector).is_file(),'required OpenTelemetry collector unavailable: OTELCOL')
-    config=ctx.root/'ot8-collector.yaml'
-    config.write_text('receivers:\n  otlp:\n    protocols:\n      http:\n        endpoint: 127.0.0.1:14318\nexporters:\n  debug:\n    verbosity: basic\nservice:\n  telemetry:\n    logs:\n      level: info\n  pipelines:\n    traces:\n      receivers: [otlp]\n      exporters: [debug]\n')
-    collector_process=ctx.spawn([collector,'--config',config],'ot8-collector')
-    try:
-        time.sleep(1)
-        ctx.assertion(collector_process.poll() is None,'collector failed to start')
+    from .tracing import Collector, engine_status
+    import uuid
+    with Collector(ctx, 'ot8') as collector:
         for engine in ('vllm033','sglang0523','llamacpp090'):
             arms={}
             evidence[engine]=arms
@@ -442,35 +439,38 @@ def ot8(ctx,evidence):
                 if arm=='engines':
                     settings.append('host.observability.tracing.engines=on')
                 label='ot8-'+engine+'-'+arm
+                selected = ({'vllm033':'VLLM_033_TRACING', 'sglang0523':'SGLANG_0523_TRACING'}.get(engine,engine)
+                            if arm=='engines' else engine)
                 with isolated_role(ctx,label,settings):
-                    ctx.deploy(label,engine)
+                    ctx.deploy(label,selected,extra={'lmcache':'off'})
                     if arm=='engines':
-                        ctx.assertion('not_installed' not in json.dumps(ctx.status(label)),'engine tracing SDK unavailable')
-                    parent='00-1234567890abcdef1234567890abcdef-1234567890abcdef-'+('00' if arm=='unsampled' else '01')
-                    # Ten identical warm-ups are excluded from the measured arrays.
+                        engine_status(ctx,label)
+                    trace_id=uuid.uuid4().hex
+                    parent='00-'+trace_id+'-1234567890abcdef-'+('00' if arm=='unsampled' else '01')
                     load_chat(ctx,label,n=10,headers={'traceparent':parent})
                     arms[arm]=load_chat(ctx,label,headers={'traceparent':parent})
+                    arms[arm]['trace_id']=trace_id
                     stopped(ctx,label)
-                ctx.assertion(collector_process.poll() is None,'collector exited during measurement')
+                ctx.assertion(collector.process.poll() is None,'collector exited during measurement')
             baseline=arms['off']['tokens_per_s']
             for arm in arms:
                 arms[arm]['throughput_ratio_to_off']=arms[arm]['tokens_per_s']/baseline
             if engine=='sglang0523':
                 arms['direct']=sglang_levels(ctx)
-        # OT8 sets a measured cost, not an invented universal overhead threshold.
-        # Require the exporter to have delivered actual spans, not merely accepted its config.
-        time.sleep(min(6,ctx.remaining()))
-        collector_log=(ctx.root/'ot8-collector.log').read_text(errors='replace')
-        ctx.assertion(re.search(r'(?i)(spans|span count)',collector_log),'collector has no exported span evidence')
-    finally:
-        collector_process.terminate()
-        collector_process.wait(timeout=min(15,ctx.remaining()))
+        spans=collector.spans()
+        ctx.assertion(any(item['name']=='capyctl.request' for item in spans),'collector has no CapyCTL request spans')
+        for engine, marker in (('vllm033','llm_request'),('sglang0523',None)):
+            engine_spans=[item for item in spans if item['trace']==evidence[engine]['engines']['trace_id']
+                          and not item['name'].startswith('capyctl.')
+                          and (marker is None or item['name']==marker)]
+            evidence[engine]['engines']['exported_engine_spans']=len(engine_spans)
+            ctx.assertion(engine_spans,engine+': engine tracing arm exported no engine spans')
 
 
 def sglang_levels(ctx):
     """Direct comparison is required: SGLANG_TRACE_LEVEL is reserved under CapyCTL."""
     import subprocess
-    engine=Path(ctx.engines['SGLANG_0523'])
+    engine=Path(ctx.installation('SGLANG_0523_TRACING'))
     python=engine/'bin/python' if engine.is_dir() else engine.parent/'python'
     model=ctx.engines['MODEL_CHAT']
     result={}

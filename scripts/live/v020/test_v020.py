@@ -296,6 +296,7 @@ class HelperTests(unittest.TestCase):
         import subprocess
         mapping = self.root / 'lab.env'
         names = ('VLLM_032 VLLM_033 VLLM_034 SGLANG_0522 SGLANG_0523 SGLANG_EDITABLE '
+                 'VLLM_033_TRACING SGLANG_0523_TRACING SGLANG_0523_SDK_FREE '
                  'LMCACHE LMCACHE_VLLM_034 LMCACHE_SGLANG LLAMACPP TENSORFOLD_126 TENSORFOLD_115 '
                  'TENSORFOLD_066 TENSORRT_LLM_121 TENSORRT_LLM_140RC3 OTELCOL CUDA_HOME').split()
         script = '''
