@@ -95,6 +95,30 @@ requirement conflicts with PyArrow 26's import-time NumPy `>=2` requirement,
 which its wheel metadata does not declare. The rc3 environment is unchanged.
 TensorRT fixtures omit an implicit context length so the controller fits it to
 the fixed KV budget; TR3 expects the engine's whole-block floor, not a ceiling.
+EM3 now records twenty fixed probes at each lifecycle stage, twenty 64-input
+batches at eight clients, a stated tolerance margin and the checked-in
+100-sentence cross-engine comparison. EM5 observes owned engine socket metadata,
+running gauges and durable cancelling leases; its bounded SIGSTOP/SIGCONT
+holds make premature settlement visible, and its final killed-answer case
+requires verified-stop evidence. No engine key or packet payload is read.
+EM7 follows ADR 0036's embedding/chat pair, with actual ready grants that each
+fit but cannot fit together. EM9 uses separately enrolled host execution so
+SGLang's persisted saver-map before/after byte counts are available, alongside
+vLLM's per-launch parked GPU budget and owned-process samples.
+EM6 uses a separate setup-created vLLM 0.33.0 observational environment,
+`EM6_VLLM`; its hashed `.pth` ASGI hook records header names (never values),
+byte counts and monotonic timestamps. It preserves response bytes and fragments
+transport writes at 64 KiB to expose incremental host-ingress relay.
+This extra environment needs owner approval; it does not change the ordinary
+vLLM environment or install an additional package beyond that engine recipe.
+Full per-engine EM6 remains blocked, not passed from that vLLM cell: SGLang's
+protected no-site entry does not execute `.pth` hooks, and llama.cpp has no
+ASGI entrypoint. Engine-key packet capture and routing-ledger edits are forbidden.
+EM8 must run again with the binary containing `77aa6129` (idle pooling disabled).
+It records the binary SHA-256 and checkpoints every matrix cell before and after
+execution, including the 256-input, 8,192-token, sixteen-client cell.
+These are harness protocols, not qualification results; CPU tests do not qualify
+any engine. The rental must still run the rows and retain their evidence.
 No apt, driver update, system CUDA modification or reboot is allowed. Missing
 compilers/tools are blocking preflight errors, not permission to install packages.
 
@@ -318,10 +342,10 @@ Budgets are maximum seconds per row, not elapsed-time promises.
 | LC14U | P4 | 1100 | ADR0034 §2: 15 alternating-prompt park/wake cycles, off-reference answers, no held KV or server stops, covered charges and <=256MiB server GPU growth. GB10 deep-parking counterpart. |
 | LC15U | P4 | 600 | ADR0034 §2: enrolled host through the control server, 32k park/wake/hit and passing wake canary. GB10 deep-parking counterpart. |
 | LC16U | P4 | 900 | ADR0034 §2: five cold/engine-evicted/post-park trials at 8k/16k/32k; wake <=1.1x off, cold TTFT <=1.1x off, 32k post-wake TTFT <=0.25x off. GB10 deep-parking counterpart. |
-| EM3 | P4 | 1 | not implemented: Needs pinned 100-sentence cross-engine fixture and concurrent 64-input canary protocol; ordinary request success cannot establish tolerance. |
-| EM5 | P4 | 1 | not implemented: Needs client disconnect/deadline injection and lease/engine-connection settlement observation, unavailable through collected Context.request. |
-| EM6 | P4 | 1 | not implemented: Needs separately enrolled host ingress and engine-side request-header observation. |
-| EM7 | P4 | 1 | not implemented: Needs enforced mutually exclusive memory grants and pool-switch evidence, not two independently fitting deployments. |
+| EM3 | P4 | 2400 | Twenty lifecycle probes per stage, eight-client 64-input batches, measured tolerance and 100 pinned cross-engine sentences. |
+| EM5 | P4 | 3600 | Gauges, engine connections and cancelling leases for 32 cuts; whole-answer settlement and killed-answer verified stop. |
+| EM6 | P4 | 1500 | Enrolled host path, secret-free observational vLLM ASGI headers and incremental relay. |
+| EM7 | P4 | 2400 | Mutually exclusive embedding/chat ready grants and automatic pool switching; deep canary or restart. |
 | OT1 | P4 | 1 | not implemented: Needs owned-process socket and sanitized environment-name inspection to prove tracing is absent, not just successful requests. |
 | OT2 | P4 | 1 | not implemented: Needs loopback collector and trace/span parent/request-id correlation including decisions. |
 | OT3 | P4 | 1 | not implemented: Needs collector capture including engine spans and engine validation-error sentinel coverage. |
@@ -356,7 +380,7 @@ Budgets are maximum seconds per row, not elapsed-time promises.
 | LC18 | P4 | 1 | not implemented: Needs build rendering engine-driven restart transfer and 15-cycle LMCache hit, held-KV and stop-bound observations. |
 | EM2 | P4 | 1200 | Full embedding input/encoding/dimension/error contract on vLLM, SGLang and llama.cpp. |
 | EM4 | P4 | 1200 | Restart each embeddings deployment and require a journaled passing reference canary. |
-| EM9 | P4 | 900 | Five deep embedding park/wake cycles and a parked-arrival wake on each Python engine; functional evidence without memory measurements. |
+| EM9 | P4 | 1800 | Five deep cycles plus parked-arrival wake; per-launch GPU budget, SGLang saver-map bytes, residue and passing canaries. |
 | TF1 | P4 | 120 | TensorFold 1.2.6 registration, archive checksums and native capabilities. |
 | TF11 | P4 | 120 | TensorFold 1.1.5 registration beside 1.2.6, archive checksums and native capabilities. |
 | OT11 | P4 | 300 | Non-loopback engine tracing and reserved profile argument/environment refusals. |

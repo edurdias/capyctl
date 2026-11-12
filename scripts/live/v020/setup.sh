@@ -28,6 +28,8 @@ Setup (rented x86_64 VM only; approximately 60 minutes, downloads/installations 
   6. In parallel, install vLLM 0.32.0 and 0.33.0 with CUDA 13 torch;
      SGLang[tracing] 0.5.22 and 0.5.23 with torch-memory-saver==0.0.10;
      and a separate editable SGLang 0.5.23 checkout/environment for #235.
+     EM6 alone also gets a fresh vLLM 0.33.0 observational environment with a
+     hashed ASGI header-name/byte-count hook; existing environments stay unchanged.
   7. Recreate separate vLLM 0.33 and SGLang 0.5.23 environments from their freezes
      using uv; source-build LMCache ${LMCACHE_VERSION:-0.5.7} twice against each engine's exact torch.
      Use no build isolation, the GPU's own CUDA arch and CUDA major 13; preserve engine
@@ -276,6 +278,33 @@ v020_install_vllm() {
     v020_cmd "$BIN/uv" pip install --python "$path/bin/python" "vllm==$version" --torch-backend=cu130
   fi
   v020_freeze "$path" "$key"
+}
+
+v020_install_em6_observer() {
+  [ -n "$EM6_VLLM" ] || return 0
+  v020_install_vllm EM6_VLLM 0.33.0
+  if [ -n "${V020_OVERRIDES[EM6_VLLM]:-}" ]; then
+    return 0 # Supplied installations are always read-only.
+  fi
+  "$EM6_VLLM/bin/python" - "$EM6_VLLM" "$HERE/em6_observer.py" "$EVIDENCE" <<'PY'
+import hashlib,json,pathlib,sys,sysconfig
+environment,source,evidence=map(pathlib.Path,sys.argv[1:])
+site=pathlib.Path(sysconfig.get_path("purelib"))
+if not site.is_relative_to(environment):
+    raise SystemExit("EM6 hook destination escapes the fresh environment")
+module=site/"capyctl_em6_observer.py"
+output=evidence/"em6-engine-observation.jsonl"
+body=source.read_text().replace("__EM6_OUTPUT__",str(output))
+module.write_text(body)
+hook=site/"capyctl_em6_observer.pth"
+hook.write_text("import capyctl_em6_observer; capyctl_em6_observer.install()\n")
+(evidence/"EM6_VLLM.observer.json").write_text(json.dumps({
+    "engine":"vllm","version":"0.33.0","observational_environment":True,
+    "source_sha256":hashlib.sha256(source.read_bytes()).hexdigest(),
+    "installed_sha256":hashlib.sha256(module.read_bytes()).hexdigest(),
+    "pth_sha256":hashlib.sha256(hook.read_bytes()).hexdigest(),
+    "records":"header names, byte counts, monotonic timestamps; no values"}))
+PY
 }
 
 v020_install_sglang() {
@@ -697,6 +726,7 @@ setup() (
   local -A V020_OVERRIDES=()
   local -A V020_PATHS=(
     [VLLM_032]="$V020/engines/vllm-0.32.0-venv" [VLLM_033]="$V020/engines/vllm-0.33.0-venv"
+    [EM6_VLLM]=''
     [SGLANG_0522]="$V020/engines/sglang-0.5.22-venv" [SGLANG_0523]="$V020/engines/sglang-0.5.23-venv"
     [SGLANG_EDITABLE]="$V020/engines/sglang-0.5.23-editable-venv" [LMCACHE]="$V020/engines/vllm-0.33.0-lmcache-venv"
     [LMCACHE_SGLANG]="$V020/engines/sglang-0.5.23-lmcache-venv"
@@ -715,6 +745,9 @@ setup() (
   local requested_rows=${ONLY:-all}
   case ",${requested_rows^^}," in
     *,TF3,*) V020_PATHS[TENSORFOLD_066]=$V020/engines/tensorfold-0.6.6-venv ;;
+  esac
+  case ",${requested_rows^^}," in
+    *,ALL,*|*,EM6,*) V020_PATHS[EM6_VLLM]=$V020/engines/vllm-0.33.0-em6-observer-venv ;;
   esac
   local trt_row
   local -a trt_rows=()
@@ -801,6 +834,7 @@ PY
   local -a pids=() labels=()
   (v020_install_vllm VLLM_032 0.32.0) & pids+=("$!"); labels+=(VLLM_032)
   (v020_install_vllm VLLM_033 0.33.0; v020_install_lmcache LMCACHE VLLM_033 vllm) & pids+=("$!"); labels+=(VLLM_033_LMCACHE)
+  (v020_install_em6_observer) & pids+=("$!"); labels+=(EM6_VLLM)
   (v020_install_sglang SGLANG_0522 0.5.22) & pids+=("$!"); labels+=(SGLANG_0522)
   (v020_install_sglang SGLANG_0523 0.5.23; v020_install_lmcache LMCACHE_SGLANG SGLANG_0523 sglang) & pids+=("$!"); labels+=(SGLANG_0523_LMCACHE)
   (v020_install_sglang SGLANG_EDITABLE 0.5.23) & pids+=("$!"); labels+=(SGLANG_EDITABLE)
@@ -881,7 +915,7 @@ for path in paths:
 pathlib.Path(sys.argv[1]).write_text(json.dumps(fingerprints,indent=2,sort_keys=True)+"\n")
 PY
   {
-    for key in VLLM_032 VLLM_033 SGLANG_0522 SGLANG_0523 SGLANG_EDITABLE LMCACHE LMCACHE_SGLANG LLAMACPP TENSORFOLD_126 TENSORFOLD_115 TENSORFOLD_066 \
+    for key in VLLM_032 VLLM_033 EM6_VLLM SGLANG_0522 SGLANG_0523 SGLANG_EDITABLE LMCACHE LMCACHE_SGLANG LLAMACPP TENSORFOLD_126 TENSORFOLD_115 TENSORFOLD_066 \
       TENSORRT_LLM TRT_LLM TENSORRT_LLM_121 TENSORRT_LLM_140RC3 OTELCOL \
       MODEL_CHAT MODEL_CHAT_GGUF MODEL_EMBED MODEL_EMBED_GGUF MODEL_EMBED8 MODEL_CLEF MODEL_CLEF_GGUF MODEL_TENSORFOLD \
       CUDA_HOME CUDA_HOME_TRT121 CUDA_HOME_TRT140RC3; do

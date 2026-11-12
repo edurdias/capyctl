@@ -187,6 +187,7 @@ def embedding_load(ctx, name, batch, length, clients):
 
 
 def em8(ctx, evidence):
+    import hashlib
     fixture = ctx.engines.get('EMBEDDING_RETRIEVAL_SET')
     data = json.loads(Path(fixture).read_text()) if fixture and Path(fixture).is_file() else None
     if data is None:
@@ -197,12 +198,19 @@ def em8(ctx, evidence):
         name = 'em8-' + engine
         ctx.deploy(name, engine, model='embedding', api='embeddings',
                    extra={'engine_config': {'max_concurrent_requests': 16}})
+        if 'binary_sha256' not in evidence:
+            evidence['binary_sha256'] = hashlib.sha256(ctx.binary().read_bytes()).hexdigest()
         matrix = []
         evidence[engine] = dict(matrix=matrix)
         for batch in (1,16,256):
             for length in (32,512,8192):
                 for clients in (1,4,16):
+                    cell = dict(batch=batch, input_tokens=length, clients=clients)
+                    evidence[engine]['current_cell'] = cell
+                    ctx.save(name+'-matrix-progress', evidence[engine])
                     matrix.append(embedding_load(ctx,name,batch,length,clients))
+                    evidence[engine]['last_completed_cell'] = cell
+                    ctx.save(name+'-matrix-progress', evidence[engine])
         if data is not None:
             docs = vectors(ctx, embedding(ctx,name,data['documents']),name,len(data['documents']))
             hits = []

@@ -9,11 +9,6 @@ from .engines import document, passing_canary, stopped
 
 
 SKIPS = {
-    "EM3": "Needs pinned 100-sentence cross-engine fixture and concurrent 64-input canary protocol; ordinary request success cannot establish tolerance.",
-    "EM5": "Needs client disconnect/deadline injection and lease/engine-connection settlement observation, unavailable through collected Context.request.",
-    "EM6": "Needs separately enrolled host ingress and engine-side request-header observation.",
-    "EM7": "Needs enforced mutually exclusive memory grants and pool-switch evidence, not two independently fitting deployments.",
-    "EM9": "Needs per-launch parked GPU budget and SGLang saver-map unmapped evidence; status alone cannot prove deep release.",
     "OT1": "Needs owned-process socket and sanitized environment-name inspection to prove tracing is absent, not just successful requests.",
     "OT2": "Needs loopback collector and trace/span parent/request-id correlation including decisions.",
     "OT3": "Needs collector capture including engine spans and engine validation-error sentinel coverage.",
@@ -50,7 +45,7 @@ SKIPS = {
     "LC17": "Needs isolated host_kv_limit configurations and LMCache token-hit/pool-charge evidence across capped and explicit pools.",
     "LC18": "Needs build rendering engine-driven restart transfer and 15-cycle LMCache hit, held-KV and stop-bound observations.",
 }
-for implemented in ("EM9", "TF1", "TF11", "OT11"):
+for implemented in ("TF1", "TF11", "OT11"):
     SKIPS.pop(implemented)
 SKIPS = {key: "not implemented: " + reason for key, reason in SKIPS.items()}
 ROWS = [dict(id=key, priority=4, budget=1, criteria=reason) for key, reason in SKIPS.items()]
@@ -58,7 +53,6 @@ ROWS += [dict(id=key, priority=4, budget=1200, criteria=criteria) for key, crite
     ("EM2", "Full embedding input/encoding/dimension/error contract on vLLM, SGLang and llama.cpp."),
     ("EM4", "Restart each embeddings deployment and require a journaled passing reference canary."))]
 ROWS += [dict(id=key, priority=4, budget=budget, criteria=criteria) for key,budget,criteria in (
-    ("EM9",900,"Five deep embedding park/wake cycles and a parked-arrival wake on each Python engine; functional evidence without memory measurements."),
     ("TF1",120,"TensorFold 1.2.6 registration, archive checksums and native capabilities."),
     ("TF11",120,"TensorFold 1.1.5 registration beside 1.2.6, archive checksums and native capabilities."),
     ("OT11",300,"Non-loopback engine tracing and reserved profile argument/environment refusals."))]
@@ -130,8 +124,6 @@ def run(ctx, row):
         return dict(verdict="skip", reason=SKIPS[row["id"]], evidence={})
     evidence = {}
     try:
-        if row["id"] == "EM9":
-            return embedding_cycles(ctx, evidence)
         if row["id"] in ("TF1", "TF11"):
             return native_registration(ctx, row, evidence)
         if row["id"] == "OT11":
@@ -167,37 +159,6 @@ def run(ctx, row):
         return dict(verdict="fail", reason=str(error), evidence=evidence)
 
 
-def embedding_cycles(ctx,evidence):
-    engines = [
-        "vllm033" if ctx.engines.get("VLLM_033") else "vllm032",
-        "sglang0523" if ctx.engines.get("SGLANG_0523") else "sglang0522",
-    ]
-    for engine in engines:
-        name="em9-"+engine
-        ctx.deploy(name,engine,model="embedding",api="embeddings",residency="deep")
-        baseline=vectors(ctx,embedding(ctx,name,"qualification probe"),name,1)[0]
-        cycles=[]
-        evidence[engine]=cycles
-        for cycle in range(6):
-            pids={item["pid"] for item in ctx.owned(name)}
-            offset=len(ctx.events())
-            ctx.lifecycle("park",name)
-            parked=ctx.status(name)
-            ctx.assertion(parked.get("observed_state","").lower()=="parked","deep park did not settle")
-            if cycle<5:
-                ctx.lifecycle("wake",name)
-            response=embedding(ctx,name,"qualification probe")
-            vector=vectors(ctx,response,name,1)[0]
-            ctx.assertion(len(vector)==len(baseline),"wake changed native vector dimension")
-            distance=math.sqrt(sum((a-b)**2 for a,b in zip(vector,baseline)))/max(math.sqrt(sum(a*a for a in baseline)),1e-30)
-            ctx.assertion(distance<=.02,"wake embedding exceeds provisional canary tolerance")
-            events=ctx.events()[offset:]
-            canary=passing_canary(ctx,name)
-            ctx.assertion(pids=={item["pid"] for item in ctx.owned(name)},"deep wake replaced process")
-            ctx.assertion(ctx.status(name).get("observed_state","").lower()=="ready","parked-arrival request did not wake deployment")
-            cycles.append(dict(cycle=cycle+1,parked=parked,events=events,canary=canary,relative_distance=distance,implicit_wake=cycle==5))
-        stopped(ctx,name)
-    return dict(verdict="skip",reason=("measurement not allowed on this host" if ctx.functional_only else "not implemented: parked GPU-budget/saver-map release measurement"),evidence=evidence)
 
 
 def native_registration(ctx,row,evidence):
