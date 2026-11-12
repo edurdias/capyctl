@@ -57,11 +57,20 @@ attempt state. Lifecycle fixtures use restart-only decisions and a llama.cpp
 chat context/slot count that fits their declared KV budget.
 SHA-256 manifests are generated for collected/exported evidence only, not for
 per-row summaries rooted above the private model and engine installations.
-The ADR 0034 sleep-clearing amendment is checked explicitly: `required` must
-refuse `sleep_clears_cache`, and `auto` must park/wake with LMCache off (an
-unqualified auto installation may instead report `park_unqualified`). Those
-guards leave LC13–LC16 unqualified, never passed; LC13 separately checks a
-32k external hit across restart-only parking.
+The ADR 0034 sleep-preservation amendment is checked explicitly: vLLM 0.33
+must refuse `required` with `sleep_clears_cache`, and `auto` must park/wake
+with LMCache off (an unqualified auto installation may instead report
+`park_unqualified`). These guards never qualify an installation. LC13–LC16
+run their full protocols on preserving vLLM 0.34.0rc1 and SGLang 0.5.23,
+including store retention, salts, footprint and latency bounds as applicable.
+The setup adds `VLLM_034` at
+`$V020/engines/vllm-0.34.0rc1-venv` and `LMCACHE_VLLM_034` at
+`$V020/engines/vllm-0.34.0rc1-lmcache057-venv`; `$V020` defaults to
+`~/capyctl-v020`. LMCache 0.5.7 is built against that fresh engine's installed
+torch, without build isolation and with engine constraints. `LMCACHE`
+remains the vLLM 0.33 guard environment, and `LMCACHE_SGLANG` is the separate
+SGLang 0.5.23 environment. Source shape, not a version label alone, selects
+preservation. No live result or qualified-table row follows from setup.
 Embedding render observations accept SGLang's managed native `is_embedding`
 setting; its protected-descriptor launch does not expose an engine CLI flag.
 Every managed host configuration is validated before its process starts;
@@ -194,10 +203,13 @@ The file is parsed as data, never sourced as shell code. Values may be quoted;
 ```text
 VLLM_032=/home/me/vllm-0.32.0-venv
 VLLM_033=/home/me/vllm-0.33.0-venv
+VLLM_034=
 SGLANG_0522=/home/me/sglang-0.5.22-venv
 SGLANG_0523=
 SGLANG_EDITABLE=
 LMCACHE=/home/me/vllm-0.32.0-lmcache-venv
+LMCACHE_VLLM_034=
+LMCACHE_SGLANG=
 LLAMACPP=/home/me/llamacpp-v0.7.0/build/bin/llama-server
 TENSORFOLD_126=/home/me/tensorfold-1.0.0
 TENSORFOLD_115=/home/me/tensorfold-1.1.5

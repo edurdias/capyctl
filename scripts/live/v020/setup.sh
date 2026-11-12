@@ -28,11 +28,14 @@ Setup (rented x86_64 VM only; approximately 60 minutes, downloads/installations 
   6. In parallel, install vLLM 0.32.0 and 0.33.0 with CUDA 13 torch;
      SGLang[tracing] 0.5.22 and 0.5.23 with torch-memory-saver==0.0.10;
      and a separate editable SGLang 0.5.23 checkout/environment for #235.
-  7. Recreate separate vLLM 0.33 and SGLang 0.5.23 environments from their freezes
-     using uv; source-build LMCache ${LMCACHE_VERSION:-0.5.7} twice against each engine's exact torch.
+     For all or LC13-LC16 (including U), also install fresh vLLM 0.34.0rc1.
+  7. Recreate separate vLLM 0.33 (clearing guard), vLLM 0.34.0rc1 (preservation)
+     and SGLang 0.5.23 environments from their freezes using uv; source-build
+     LMCache ${LMCACHE_VERSION:-0.5.7} against each environment's own exact torch.
      Use no build isolation, the GPU's own CUDA arch and CUDA major 13; preserve engine
      constraints and disable built-wheel reuse across the different torch builds.
-     Never copy a venv's absolute shebangs.
+     Never copy a venv's absolute shebangs. Source recognition, not version alone,
+     decides whether sleep preserves the external cache (ADR0034 amendment).
   8. Build llama.cpp v0.9.0, commit cd959bae99ff4bed22bef2604f45241c09bbb8c8
      (pin source: scripts/live/llamacpp-build.sh at 63f91fc8), for the GPU's arch;
      CUDA ON, Release, IS_DEV/CONNECT/BUILD_UI/USE_PREBUILT_UI OFF; llama-server -j nproc.
@@ -162,7 +165,7 @@ v020_venv() {
 v020_freeze() {
   "$1/bin/python" - "$EVIDENCE/$2.freeze.txt" "$EVIDENCE/$2.fingerprint.json" <<'PY'
 import hashlib,importlib.metadata as metadata,json,pathlib,re,sys
-packages={}; records={}; editable=[]
+packages={}; records={}; editable=[]; sources={}
 for distribution in metadata.distributions():
     name=distribution.metadata.get("Name",""); version=distribution.version
     if not re.fullmatch(r"[A-Za-z0-9_.-]+",name) or not re.fullmatch(r"[A-Za-z0-9_.+!-]+",version):
@@ -171,11 +174,21 @@ for distribution in metadata.distributions():
     record=distribution.read_text("RECORD")
     if record is not None:
         records[name]=hashlib.sha256(record.encode()).hexdigest()
+    for entry in distribution.files or ():
+        relative=str(entry)
+        if relative.endswith(".py") and relative.startswith((
+            "vllm/entrypoints/serve/dev/sleep/", "vllm/entrypoints/api_server.py",
+            "vllm/v1/engine/", "vllm/v1/core/sched/",
+            "sglang/srt/managers/scheduler", "sglang/srt/mem_cache/storage/lmcache/",
+            "lmcache/integration/vllm/", "lmcache/integration/sglang/")):
+            path=distribution.locate_file(entry)
+            if path.is_file():
+                sources[relative]=hashlib.file_digest(path.open("rb"),"sha256").hexdigest()
     direct=distribution.read_text("direct_url.json")
     if direct and json.loads(direct).get("dir_info",{}).get("editable"):
         editable.append(name)
 pathlib.Path(sys.argv[1]).write_text("".join(f"{n}=={v}\n" for n,v in sorted(packages.items(),key=lambda p:p[0].lower())))
-pathlib.Path(sys.argv[2]).write_text(json.dumps({"packages":packages,"record_sha256":records,"editable":sorted(editable)},sort_keys=True,indent=2)+"\n")
+pathlib.Path(sys.argv[2]).write_text(json.dumps({"packages":packages,"record_sha256":records,"source_sha256":sources,"editable":sorted(editable)},sort_keys=True,indent=2)+"\n")
 PY
 }
 
@@ -306,7 +319,7 @@ v020_prepare_lmcache_source() {
   local version=${LMCACHE_VERSION:-0.5.7}
   [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { v020_setup_error 'invalid LMCache version'; return 1; }
   local needed=0 key
-  for key in LMCACHE LMCACHE_SGLANG; do
+  for key in LMCACHE LMCACHE_VLLM_034 LMCACHE_SGLANG; do
     if [ -n "${!key}" ] && [ -z "${V020_OVERRIDES[$key]:-}" ]; then needed=1; fi
   done
   [ "$needed" = 1 ] || return 0
@@ -343,7 +356,7 @@ PY
   v020_cmd "$BIN/uv" pip install --python "$destination/bin/python" --constraint "$constraints" \
     'setuptools>=77.0.3,<81' setuptools_scm ninja 'packaging>=24.2' wheel grpcio==1.78.0 grpcio-tools==1.78.0
   # uv's source wheel cache is not keyed by the baseline torch ABI. Each target
-  # must compile independently, even though both source archives have one version.
+  # must compile independently, even though the source archive has one version.
   v020_cmd env TORCH_CUDA_ARCH_LIST="$(v020_cuda_arch torch)" BUILD_WITH_CUDA=1 LMCACHE_CUDA_MAJOR=13 \
     SETUPTOOLS_SCM_PRETEND_VERSION="$version" "$BIN/uv" --no-cache pip install \
     --python "$destination/bin/python" --prerelease=allow --torch-backend=cu130 \
@@ -697,6 +710,7 @@ setup() (
   local -A V020_OVERRIDES=()
   local -A V020_PATHS=(
     [VLLM_032]="$V020/engines/vllm-0.32.0-venv" [VLLM_033]="$V020/engines/vllm-0.33.0-venv"
+    [VLLM_034]='' [LMCACHE_VLLM_034]=''
     [SGLANG_0522]="$V020/engines/sglang-0.5.22-venv" [SGLANG_0523]="$V020/engines/sglang-0.5.23-venv"
     [SGLANG_EDITABLE]="$V020/engines/sglang-0.5.23-editable-venv" [LMCACHE]="$V020/engines/vllm-0.33.0-lmcache-venv"
     [LMCACHE_SGLANG]="$V020/engines/sglang-0.5.23-lmcache-venv"
@@ -715,6 +729,11 @@ setup() (
   local requested_rows=${ONLY:-all}
   case ",${requested_rows^^}," in
     *,TF3,*) V020_PATHS[TENSORFOLD_066]=$V020/engines/tensorfold-0.6.6-venv ;;
+  esac
+  case ",${requested_rows^^}," in
+    *,ALL,*|*,LC13,*|*,LC14,*|*,LC15,*|*,LC16,*|*,LC13U,*|*,LC14U,*|*,LC15U,*|*,LC16U,*)
+      V020_PATHS[VLLM_034]=$V020/engines/vllm-0.34.0rc1-venv
+      V020_PATHS[LMCACHE_VLLM_034]=$V020/engines/vllm-0.34.0rc1-lmcache057-venv ;;
   esac
   local trt_row
   local -a trt_rows=()
@@ -776,7 +795,7 @@ PY
   if [ "$(uname -m)" = aarch64 ]; then
     # The owner provisions approved lab engines separately. Even an unavailable
     # engine must have an explicit empty mapping; setup never upgrades a lab venv.
-    for key in VLLM_032 VLLM_033 SGLANG_0522 SGLANG_0523 SGLANG_EDITABLE LMCACHE LMCACHE_SGLANG \
+    for key in VLLM_032 VLLM_033 VLLM_034 SGLANG_0522 SGLANG_0523 SGLANG_EDITABLE LMCACHE LMCACHE_VLLM_034 LMCACHE_SGLANG \
       LLAMACPP TENSORFOLD_126 TENSORFOLD_115 TENSORFOLD_066 TENSORRT_LLM_121 TENSORRT_LLM_140RC3 OTELCOL CUDA_HOME; do
       [ -n "${V020_OVERRIDES[$key]:-}" ] || { v020_setup_error "aarch64 requires an explicit read-only mapping: $key"; exit 1; }
     done
@@ -801,6 +820,7 @@ PY
   local -a pids=() labels=()
   (v020_install_vllm VLLM_032 0.32.0) & pids+=("$!"); labels+=(VLLM_032)
   (v020_install_vllm VLLM_033 0.33.0; v020_install_lmcache LMCACHE VLLM_033 vllm) & pids+=("$!"); labels+=(VLLM_033_LMCACHE)
+  (v020_install_vllm VLLM_034 0.34.0rc1; v020_install_lmcache LMCACHE_VLLM_034 VLLM_034 vllm) & pids+=("$!"); labels+=(VLLM_034_LMCACHE)
   (v020_install_sglang SGLANG_0522 0.5.22) & pids+=("$!"); labels+=(SGLANG_0522)
   (v020_install_sglang SGLANG_0523 0.5.23; v020_install_lmcache LMCACHE_SGLANG SGLANG_0523 sglang) & pids+=("$!"); labels+=(SGLANG_0523_LMCACHE)
   (v020_install_sglang SGLANG_EDITABLE 0.5.23) & pids+=("$!"); labels+=(SGLANG_EDITABLE)
@@ -881,7 +901,7 @@ for path in paths:
 pathlib.Path(sys.argv[1]).write_text(json.dumps(fingerprints,indent=2,sort_keys=True)+"\n")
 PY
   {
-    for key in VLLM_032 VLLM_033 SGLANG_0522 SGLANG_0523 SGLANG_EDITABLE LMCACHE LMCACHE_SGLANG LLAMACPP TENSORFOLD_126 TENSORFOLD_115 TENSORFOLD_066 \
+    for key in VLLM_032 VLLM_033 VLLM_034 SGLANG_0522 SGLANG_0523 SGLANG_EDITABLE LMCACHE LMCACHE_VLLM_034 LMCACHE_SGLANG LLAMACPP TENSORFOLD_126 TENSORFOLD_115 TENSORFOLD_066 \
       TENSORRT_LLM TRT_LLM TENSORRT_LLM_121 TENSORRT_LLM_140RC3 OTELCOL \
       MODEL_CHAT MODEL_CHAT_GGUF MODEL_EMBED MODEL_EMBED_GGUF MODEL_EMBED8 MODEL_CLEF MODEL_CLEF_GGUF MODEL_TENSORFOLD \
       CUDA_HOME CUDA_HOME_TRT121 CUDA_HOME_TRT140RC3; do
