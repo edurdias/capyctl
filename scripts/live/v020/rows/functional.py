@@ -22,9 +22,6 @@ SKIPS = {
     "TR9": "Needs owned-process SIGKILL, process-group/listener proof and release-order evidence.",
     "TR10": "Needs authorized unmanaged MPI baseline with process/session/listener inventory; managed throughput alone is insufficient.",
     "TR11": "Needs enrolled host ingress and TR5's cancellation settlement protocol.",
-    "LC12": "Needs historical lmcache_driven rendering and GB10 fabric-handle readout; fresh VM is discrete and must not alter existing GB10 environments.",
-    "LC17": "Needs isolated host_kv_limit configurations and LMCache token-hit/pool-charge evidence across capped and explicit pools.",
-    "LC18": "Needs build rendering engine-driven restart transfer and 15-cycle LMCache hit, held-KV and stop-bound observations.",
 }
 for implemented in ("TF1", "TF11", "OT11"):
     SKIPS.pop(implemented)

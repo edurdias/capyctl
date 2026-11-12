@@ -18,7 +18,7 @@ import sys
 import time
 
 HERE = Path(__file__).resolve().parent
-MODULES = ('regressions', 'lmcache', 'measurements', 'engines', 'functional', 'embeddings_extra', 'tracing', 'tensorfold_native')
+MODULES = ('regressions', 'lmcache', 'lmcache_extra', 'measurements', 'engines', 'functional', 'embeddings_extra', 'tracing', 'tensorfold_native')
 
 
 class SessionInterrupted(BaseException):

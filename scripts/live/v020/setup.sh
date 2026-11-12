@@ -6,7 +6,7 @@ setup_plan() {
   cat <<EOF
 Setup (rented x86_64 VM only; approximately 60 minutes, downloads/installations parallel):
   1. Refuse FUNCTIONAL_ONLY=1: use --skip-setup and --engines on an existing host.
-     Require C/C++ compilers, make, git, curl, tar, python3, flock and nproc;
+     Require C/C++ compilers, make, git, curl, tar, patch, python3, flock and nproc;
      no sudo, system packages, driver changes, or lab environment modifications.
   2. Keep every writable tool, cache, model and engine below \$V020 (${V020:-<session root>}).
      Record each owned directory in created.txt BEFORE creating it; refuse existing
@@ -67,6 +67,9 @@ Setup (rented x86_64 VM only; approximately 60 minutes, downloads/installations 
  13. Download pinned models concurrently with engine jobs. Record sanitized package
      freezes, RECORD/binary fingerprints, source commits, model lock and availability.
      Never save credentials, environment/command-line dumps, or dependency URLs.
+     Install session-private Rust 1.99.0 and build separate LC12/LC18 source copies
+     using the committed zero-fuzz patches; record source revision and patch/binary
+     hashes. Never replace the release executable or alter an engine environment.
  14. Write all engine/model keys plus CUDA_HOME to engines.env; check installation
      artifacts exist. Setup does not claim live qualification or run inference.
 EOF
@@ -564,6 +567,34 @@ PY
   v020_cmd "$BIN/capyctl-old" --version
 }
 
+# ADR 0034 LC12/LC18 run separate qualification builds, never the release binary.
+v020_lmcache_builds() {
+  [ -f "$V020/source.tar" ] || { v020_setup_error 'qualification source archive missing'; return 1; }
+  local stage=$V020/qualification-source
+  v020_mkdir "$stage"
+  v020_unpack "$V020/source.tar" "$stage"
+  v020_mkdir "$V020/qualification-lc12"
+  v020_mkdir "$V020/qualification-lc18"
+  # prepare() requires absent destinations, while the ownership ledger must
+  # reserve their names before anything writes beneath them.
+  rmdir "$V020/qualification-lc12" "$V020/qualification-lc18"
+  v020_fetch https://sh.rustup.rs "$V020/downloads/qualification-rustup.sh"
+  v020_cmd sh "$V020/downloads/qualification-rustup.sh" -y --no-modify-path --profile minimal --default-toolchain 1.99.0
+  v020_cmd env PATH="$CARGO_HOME/bin:$PATH" "$V020/tools/bin/python" \
+    "$V020/live/lmcache_builds.py" --source "$stage" --root "$V020"
+}
+
+v020_collector() {
+  [ -z "${V020_OVERRIDES[OTELCOL]:-}" ] || return 0
+  local directory=$V020/engines/otelcol-0.164.0 archive=$V020/downloads/otelcol_0.164.0_linux_amd64.tar.gz
+  v020_mkdir "$directory"
+  v020_fetch https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.164.0/otelcol_0.164.0_linux_amd64.tar.gz "$archive"
+  # SHA256 from the published v0.164.0 release asset digest.
+  v020_check_sha "$archive" 5db7cf88c2e73a7fdce02b5fa967fcd5dc73bab00b871d947481918dc5093861
+  v020_unpack "$archive" "$directory"
+  [ -x "$OTELCOL" ] || { v020_setup_error 'collector binary missing'; return 1; }
+  v020_cmd "$OTELCOL" --version
+}
 
 v020_trt_availability() {
   "$V020/tools/bin/python" - "$EVIDENCE/$1.availability.json" "$2" "$3" <<'PY'
@@ -762,7 +793,7 @@ setup() (
   [ "${FUNCTIONAL_ONLY:-0}" != 1 ] || { v020_setup_error 'functional-only hosts require --skip-setup and --engines; no installs permitted'; exit 1; }
   case "$(uname -m)" in x86_64|aarch64) ;; *) v020_setup_error 'unsupported setup architecture'; exit 1 ;; esac
   local tool
-  for tool in python3 curl git tar flock grep nproc readlink install cc c++ make timeout; do
+  for tool in python3 curl git tar patch flock grep nproc readlink install cc c++ make timeout; do
     command -v "$tool" >/dev/null 2>&1 || { v020_setup_error "missing prerequisite: $tool (do not install system packages)"; exit 1; }
   done
   : "${V020:?remote.sh must supply V020}" "${BIN:?remote.sh must supply BIN}" "${EVIDENCE:?remote.sh must supply EVIDENCE}"
@@ -884,6 +915,7 @@ PY
   v020_setup_tools
   v020_setup_cuda
   v020_prepare_lmcache_source
+  v020_lmcache_builds
   # Reserve the actual model destination directories before HF creates them.
   for key in MODEL_CHAT MODEL_CHAT_GGUF MODEL_EMBED MODEL_EMBED_GGUF MODEL_EMBED8 MODEL_CLEF MODEL_CLEF_GGUF MODEL_TENSORFOLD; do
     [ -z "${V020_OVERRIDES[$key]:-}" ] || continue

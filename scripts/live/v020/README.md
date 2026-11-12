@@ -157,7 +157,7 @@ the GPU memory architecture does not select a package version.
 TensorFold 0.6.6 is an optional TF3 comparison: explicitly select TF3 to install
 it, or supply its mapping. It does not delay the default setup.
 The editable SGLang fixture disables optional Rust extensions: #235 must refuse
-it before any engine launch, and setup does not install an extra Rust toolchain.
+it before any engine launch.
 
 Tracing qualification (ADR 0037 OT1–OT10) uses three additional fresh environments:
 `VLLM_033_TRACING`, `SGLANG_0523_TRACING` and `SGLANG_0523_SDK_FREE`.
@@ -353,6 +353,26 @@ not a retrieval-score claim. Full TF3 comparison needs the optional 0.6.6 baseli
 LMCache `required` can test uncertified engine-driven transport without silently
 changing the product's qualification table.
 
+ADR 0034's LC12 and LC18 use isolated qualification binaries, never the release
+executable. Setup installs the pinned Rust 1.99.0 toolchain in the session,
+copies the committed source uploaded by `run.sh`, applies the committed
+`lmcache-lc12.patch` or `lmcache-lc18.patch` with zero fuzz, and builds each copy
+separately. Each row verifies the binary and patch hashes from its build receipt.
+LC12's historical patch lists only Qwen3 on GB10 and restores LMCache-driven
+transfer, including the historical launch-time sleep guard; it qualifies nothing.
+LC18 changes only restart transfer in its qualification copy. Neither patch
+changes the release table or records the unrun rows as passing in the product.
+No new engine packages or environments are installed for these rows.
+
+LC12 is unified-only and requires GB10. On host A, use existing read-only engine
+environments and prebuild/copy the qualification binary and matching receipt;
+do not run setup or modify an engine environment there. LC18 runs both existing
+LMCache engine environments. LC17 uses private standalone controllers to
+reproduce the ADR's 12.17 GiB host-KV limit on a discrete machine, raises it to
+24 GiB, and leaves a parked 1 GiB private pool charged for the 3 GiB/no-room
+tests. The 15 GiB server start is observed from the host's read-only ownership
+journal before engine readiness. CPU tests do not qualify any of these rows.
+
 The SHA256SUMS manifest covers durable evidence and settings, excluding itself
 and symlinks. `settings.json` stores the binary hash and nonsecret flags, never
 SSH targets, full command lines, environment dumps or credentials. Raw remote
@@ -439,9 +459,9 @@ Budgets are maximum seconds per row, not elapsed-time promises.
 | TR9 | P4 | 1 | not implemented: Needs owned-process SIGKILL, process-group/listener proof and release-order evidence. |
 | TR10 | P4 | 1 | not implemented: Needs authorized unmanaged MPI baseline with process/session/listener inventory; managed throughput alone is insufficient. |
 | TR11 | P4 | 1 | not implemented: Needs enrolled host ingress and TR5's cancellation settlement protocol. |
-| LC12 | P4 | 1 | not implemented: Needs historical lmcache_driven rendering and GB10 fabric-handle readout; fresh VM is discrete and must not alter existing GB10 environments. |
-| LC17 | P4 | 1 | not implemented: Needs isolated host_kv_limit configurations and LMCache token-hit/pool-charge evidence across capped and explicit pools. |
-| LC18 | P4 | 1 | not implemented: Needs build rendering engine-driven restart transfer and 15-cycle LMCache hit, held-KV and stop-bound observations. |
+| LC12 | P4 | 7200 | Both engines on GB10: historical qualified LMCache-driven rendering, registration fallback or park/hit evidence, read-only fabric-handle support; qualifies nothing. |
+| LC17 | P4 | 14400 | Isolated automatic/stated pools, 32k retention with 4k interference, 12.17/24 GiB limits, second-pool room exhaustion and 15 GiB server start. |
+| LC18 | P4 | 14400 | Both engines: isolated engine-driven restart build, 15 alternating cycles with off answers, whole-prompt hits, stable covered server GPU and no held KV or stops. |
 | EM2 | P4 | 1200 | Full embedding input/encoding/dimension/error contract on vLLM, SGLang and llama.cpp. |
 | EM4 | P4 | 1200 | Restart each embeddings deployment and require a journaled passing reference canary. |
 | EM9 | P4 | 1800 | Five deep cycles plus parked-arrival wake; per-launch GPU budget, SGLang saver-map bytes, residue and passing canaries. |

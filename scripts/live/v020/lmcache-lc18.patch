@@ -1,0 +1,7 @@
+--- a/crates/capyctl-config/src/lmcache.rs
++++ b/crates/capyctl-config/src/lmcache.rs
+@@ -602,3 +602,3 @@
+ pub fn transfer_mode(residency: Residency) -> TransferMode {
+-    transfer_mode_with(residency, ENGINE_DRIVEN_ROWS)
++    transfer_mode_with(residency, EngineDrivenRows { lc16_passed: true, lc18_passed: true })
+ }
