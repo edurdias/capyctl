@@ -42,6 +42,12 @@ Only the owner publishes a release. Contributors and automation stop at a draft.
      their `.sha256` files into one directory with `install.sh`, then run
      `packaging/release.sh --sums <dir>`.
 
+   ADR 0040 §13: `BUILDINFO` records `web_bundle`, the SHA-256 digest of a
+   sorted SHA-256 manifest of every file under `web/dist/` (relative paths,
+   independent of timestamps). Both builds must embed this same bundle and
+   produce byte-identical archives. Development builds without `web/dist/`
+   instead serve a small no-UI page; packaging never accepts that substitute.
+
 3. **Run the privacy scan locally.** Hosted runners do not have the private
    denylist, so their packaging check reports the denylist and lab-host checks
    as `SKIP`. Before publishing, run on a maintainer machine that has

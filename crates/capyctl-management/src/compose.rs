@@ -107,6 +107,8 @@ pub fn compose(
 
 /// What a standalone role's management listener serves.
 pub struct StandaloneRoutes {
+    /// ADR 0040 §13: public static routes, including the sign-in page.
+    pub ui: Router,
     pub actions: Arc<OwnedActionSource>,
     pub check_sources: Arc<dyn crate::check::SourceProvider>,
     /// The names the embedded host answers to for a drain.
@@ -130,6 +132,7 @@ pub fn standalone(
         verifier,
         public_address,
         [
+            routes.ui,
             crate::lifecycle_router(routes.actions.clone()),
             crate::check::router(routes.actions.configuration().clone(), routes.check_sources),
             // SPEC §4.3: the explicit drain of the embedded host, by its
@@ -152,6 +155,8 @@ pub fn standalone(
 
 /// What a server's management listener serves.
 pub struct ServerRoutes {
+    /// ADR 0040 §13: public static routes, including the sign-in page.
+    pub ui: Router,
     pub actions: Arc<OwnedActionSource>,
     /// Whether an enrolled host is connected now (drain answers).
     pub presence: HostPresence,
@@ -177,6 +182,7 @@ pub fn server(
         verifier,
         public_address,
         [
+            routes.ui,
             crate::lifecycle_router(routes.actions.clone()),
             crate::check::router(
                 routes.actions.configuration().clone(),
@@ -204,6 +210,12 @@ pub fn server(
 
 /// ADR 0040 §§2–4: resolve the principal, or refuse.
 async fn resolve(State(access): State<Arc<Access>>, mut request: Request, next: Next) -> Response {
+    // ADR 0040 §§2, 13: the bundle must load before a browser can sign in.
+    // Only management paths enter authorization; their unknown routes stay closed.
+    let path = request.uri().path();
+    if path != "/management" && !path.starts_with("/management/") {
+        return next.run(request).await;
+    }
     let mut response = match principal(&access, &request) {
         Outcome::Admin => {
             request.extensions_mut().insert(Principal::Admin);
