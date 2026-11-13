@@ -1,12 +1,62 @@
 """CPU contract tests for ADR 0039 rows; never native qualification."""
 import math
 import unittest
+import os
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from rows.measurements import isolated_role
 
 import v020
 from rows import tensorfold_native as tf
 
 
 class NativeContracts(unittest.TestCase):
+    def test_t41_isolated_reproof_cleans_replacement_controller(self):
+        # T41 / ADR 0039 TF10: replacing a controller cannot leak its listeners
+        # into the following qualification rows, even on an assertion failure.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / 'state/isolated-test'
+            original, replacement = Mock(), Mock()
+            original.poll.return_value = None
+            def spawn(*args, **kwargs):
+                (state / 'identity').mkdir()
+                (state / 'identity/credentials').touch()
+                (root / 'test.log').write_text('ready')
+                return original
+            ctx = SimpleNamespace(root=root, roles={}, registered=set(), deployments=[],
+                                  binary=lambda: 'capyctl', model_store=root,
+                                  remaining=lambda: 30, cleanup=Mock(),
+                                  assertion=lambda condition, message: self.assertTrue(condition, message))
+            with patch.dict(os.environ, XDG_CONFIG_HOME=directory), \
+                    patch('subprocess.Popen', side_effect=spawn), \
+                    patch('rows.measurements.socket.socket') as socket:
+                socket.return_value.__enter__.return_value.connect_ex.return_value = 111
+                with self.assertRaisesRegex(AssertionError, 'injected'):
+                    with isolated_role(ctx, 'test') as info:
+                        info['process'] = replacement
+                        raise AssertionError('injected')
+            replacement.terminate.assert_called_once()
+            replacement.wait.assert_called_once()
+            original.terminate.assert_not_called()
+            self.assertEqual(ctx.roles, {})
+
+    def test_t41_topology_fixture_reaches_native_refusal_gate(self):
+        # T41: never mistake an invalid short resource form for native refusal.
+        ctx = SimpleNamespace(row_id='TF4', model_store=Path('/models'),
+                              register=lambda key: key, root=Path('/tmp'),
+                              assertion=lambda condition, message: self.assertTrue(condition, message),
+                              owned=lambda name: [])
+        result = SimpleNamespace(returncode=2, stdout='', stderr='group_unsupported topology tensorfold')
+        with patch.object(tf, 'install', return_value=result) as install:
+            tf.refused(ctx, '1.0.0', 'topology', dict(topology=dict(tensor_parallel=2)), ['group_unsupported'])
+        value = install.call_args.args[1]
+        self.assertNotIn('devices', value)
+        self.assertNotIn('gpu', value['resources'])
+
     def test_tf5_tf6_require_both_whole_gauges(self):
         self.assertEqual(tf.work('tensorfold:requests_running 4\ntensorfold:requests_waiting 0\n'),
                          dict(running=4, waiting=0))

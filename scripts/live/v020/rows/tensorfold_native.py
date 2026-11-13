@@ -204,8 +204,9 @@ def cut_protocol(ctx, name, role, evidence):
                     observations.append(sample)
                     return sample['running'] == sample['waiting'] == 0
                 until(ctx, idle, 300)
-                trials.append(dict(stream=stream, repeat=repeat + 1, cut_at=cut_at,
-                                   idle_after_s=observations[-1]['at'] - cut_at, samples=observations))
+                trial = dict(stream=stream, repeat=repeat + 1, cut_at=cut_at,
+                             idle_after_s=observations[-1]['at'] - cut_at, samples=observations)
+                trials.append(trial)
                 evidence['cuts'] = trials
                 # Unanswered collected cuts are held until verified exit, never
                 # erased by the gauge returning zero (SPEC §10, ADR 0032 item 6).
@@ -213,9 +214,13 @@ def cut_protocol(ctx, name, role, evidence):
                     held = leases(ctx, name, role)
                     ctx.assertion(any(row['answered'] == 0 for row in held), 'unanswered client cut did not remain cancelling')
                     evidence.setdefault('held_before_stop', []).append(held)
-                    ctx.stop(name, role)
-                    ctx.assertion(not leases(ctx, name, role), 'verified stop did not settle held cancellation')
-                    ctx.lifecycle('start', name, role)
+                # T41 / ADR 0032 item 6: a streamed cut can also precede its
+                # first output. Reset every trial by verified exit, rather than
+                # exhausting admission with eight unanswered cancellations.
+                trial['held_after_cut'] = leases(ctx, name, role)
+                ctx.stop(name, role)
+                ctx.assertion(not leases(ctx, name, role), 'verified stop did not settle held cancellation')
+                ctx.lifecycle('start', name, role)
             finally:
                 for client in clients:
                     client.close()
@@ -307,8 +312,10 @@ def host_path(ctx, version, evidence):
         response = ctx.request(name, role=role)
         answered(ctx, response)
         native = response['body'].get('tensorfold', {})
-        ctx.assertion(all(isinstance(native.get(key), (int, float)) and math.isfinite(native[key]) and native[key] >= 0
-                          for key in ('ttft_ms', 'prefill_ms')), 'native per-request timings absent')
+        # T41 / ADR 0039 §11: engine fields retain upstream names and seconds.
+        ctx.assertion(all(isinstance(native.get(key), (int, float)) and not isinstance(native[key], bool)
+                          and math.isfinite(native[key]) and native[key] >= 0
+                          for key in ('time_to_first_token', 'prefill_seconds')), 'native per-request timings absent')
         latency = until(ctx, lambda: forwarded_histograms(management(ctx, name, role, 'latency')))
         evidence.update(remote_idle=idle, remote_busy=busy, pool_samples=pools,
                         cancelled_answered=held, settlement_receipts=receipts,
@@ -375,7 +382,8 @@ def legacy(ctx, evidence):
         port = endpoint(ctx, name, 'standalone')
         health = get(ctx, port, '/health')
         body = json.loads(health['body'])
-        ctx.assertion(health['status'] == 200 and body.get('status') == 'ok' and body.get('busy') is False,
+        ctx.assertion(health['status'] == 200 and body.get('ok') is True and
+                      body.get('busy') is False and body.get('requests_running') == 0,
                       '0.6.6 idle health contract changed')
         clients = [Client(ctx, name, 'standalone', True) for _ in range(4)]
         def busy():
@@ -436,8 +444,8 @@ def stop_protocol(ctx, version, evidence):
     name = 'q-' + ctx.row_id.lower() + '-stop'
     launch(ctx, name, version)
     refusal = ctx.cli('park', 'deployment', name, check=False)
-    ctx.assertion(refusal.returncode != 0 and 'restart' in (refusal.stdout + refusal.stderr).lower(),
-                  'TensorFold park was not refused as restart-only')
+    ctx.assertion(refusal.returncode == 5 and 'unsupported_capability' in (refusal.stdout + refusal.stderr),
+                  'TensorFold park was not refused as unsupported')
     clients = []
     observations = []
     port = endpoint(ctx, name, 'standalone')
@@ -563,6 +571,9 @@ def refused(ctx, version, label, extra, needles):
     value = configuration(ctx, 'q-' + ctx.row_id.lower() + '-' + label, version, extra)
     if 'topology' in extra:
         value.pop('devices', None)
+        # T41 / ADR 0039 §6: reach the topology gate, not the short-form
+        # resource validator (which requires one selected device).
+        value['resources'] = dict(ram='2GiB')
     result = install(ctx, value, check=False)
     diagnostic = (result.stdout + result.stderr).lower()
     ctx.assertion(result.returncode != 0, label + ' was not refused at resolution')
@@ -671,7 +682,15 @@ def reproof(ctx, evidence):
         '--listen', '127.0.0.1:19753', '--management-listen', '127.0.0.1:19754',
         '--engine-ports', '19790-19819', '--models-root', ctx.model_store,
         '--model-sources-path', ctx.root / 'sources', '--json'], 'tf10-reproof')
-    until(ctx, lambda: ctx.status(name).get('observed_state', '').lower() == 'ready', 300)
+    def ready():
+        ctx.assertion(info['process'].poll() is None, 're-proof controller exited before ready')
+        result = ctx.cli('status', 'deployment', name, '--json', check=False)
+        if result.returncode:
+            ctx.assertion('management_unavailable' in result.stderr,
+                          're-proof status failed: ' + result.stderr)
+            return None
+        return json.loads(result.stdout).get('observed_state', '').lower() == 'ready'
+    until(ctx, ready, 300)
     after = live_identities(ctx, name, 'standalone')
     ctx.assertion(before == after, 'controller re-proof replaced rather than adopted the owned launch')
     sockets_after = listening_sockets(ctx, after)
@@ -681,18 +700,30 @@ def reproof(ctx, evidence):
     evidence.update(identities=after, after_readiness=sockets_before, after_reproof=sockets_after,
                     response=response, events=ctx.events())
     ctx.stop(name)
-    info['process'].terminate()
-    info['process'].wait(timeout=30)
+    # isolated_role owns the replacement controller's lifetime, including
+    # failure paths; leave its management socket available for cleanup.
 
 
 def switching(ctx, evidence):
     name, other = 'q-tf8-native', 'q-tf8-vllm'
-    # On the 128-GiB GB10 pool these declarations cannot coexist, even though
-    # their checkpoints individually fit. SPEC §10 must revoke before grant.
-    launch(ctx, name, extra=dict(resources=dict(gpu='80GiB', ram='2GiB')))
+    # T41 / ADR 0039 TF8: size against the published managed pool, not
+    # physical RAM. Each grant fits alone and their sum cannot fit.
+    limits = []
+    for row in ctx.sql('SELECT policy_json FROM host_resource_policies'):
+        for domain in json.loads(row['policy_json']).get('domains', {}).values():
+            if domain.get('memory') == 'unified':
+                value = domain['managed_limit']
+                limits.append(value if isinstance(value, int) else int(value.removesuffix('B')))
+    ctx.assertion(len(limits) == 1, 'one unified managed memory domain required')
+    gpu_bytes = limits[0] * 3 // 5 - 2 * 2**30
+    ctx.assertion(gpu_bytes >= 30 * 2**30, 'managed pool is too small for the TF8 checkpoints')
+    resources = dict(gpu=str(gpu_bytes) + 'B', ram='2GiB')
+    evidence['managed_limit_bytes'] = limits[0]
+    evidence['each_grant_bytes'] = gpu_bytes + 2 * 2**30
+    launch(ctx, name, extra=dict(resources=resources))
     before = live_identities(ctx, name, 'standalone')
     other_spec = configuration(ctx, other, '1.0.0')
-    other_spec.update(engine=ctx.register('vllm032'), model='chat', resources=dict(gpu='80GiB', ram='2GiB'),
+    other_spec.update(engine=ctx.register('vllm032'), model='chat', resources=resources,
                       engine_config=dict(context_length=32768, max_concurrent_requests=8, memory=dict(kv_cache='5GiB')))
     install(ctx, other_spec)
     first = ctx.request(other)
@@ -725,7 +756,7 @@ def admission(ctx, evidence):
     failures = {
         'kv-dtype': (dict(engine_config=dict(kv_cache_dtype='int8')), ['kv_cache_dtype', 'native']),
         'draft': (dict(model=dict(path='tensorfold', draft=dict(type='local', path=str(ctx.model_store / 'chat')))), ['model.draft', 'native']),
-        'topology': (dict(topology=dict(tensor_parallel=2)), ['topology', 'tensorfold']),
+        'topology': (dict(topology=dict(tensor_parallel=2)), ['group_unsupported']),
         'parking': (dict(residency='deep'), ['residency', 'restart']),
         'zero-compaction': (dict(retention='zero', engine_config=dict(accept_extra_args=True, extra_args=['--compact-at', 'auto'])),
                             ['retention_zero:compaction']),

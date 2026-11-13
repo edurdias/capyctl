@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import re
+import socket
 import statistics
 import threading
 import time
@@ -374,12 +375,20 @@ def isolated_role(ctx, label, settings=(), environment=None):
             ctx.cleanup()
         finally:
             os.environ['XDG_CONFIG_HOME']=previous_config
+            # T41 / ADR 0039 TF10 can replace the controller during re-proof.
+            # Stop the current owner, not the dead process captured on entry.
+            process = info['process']
             process.terminate()
             try:
                 process.wait(timeout=min(30,ctx.remaining()))
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+            for port in (info['port'], info['port'] + 1):
+                with socket.socket() as listener:
+                    listener.settimeout(1)
+                    ctx.assertion(listener.connect_ex(('127.0.0.1', port)) != 0,
+                                  'isolated role listener survived controller cleanup')
             ctx.roles.pop('standalone',None)
             if original is not None:
                 ctx.roles['standalone']=original
