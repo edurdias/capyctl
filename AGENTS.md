@@ -179,6 +179,20 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     environment only, the owner approved overriding LMCache 0.5.7's
     opentelemetry-api <=1.40.0 and opentelemetry-exporter-prometheus <=0.61b0
     caps on 2026-11-12, because vLLM 0.34.0rc1 requires opentelemetry-api >=1.45.1;
+  - host A, approved 2026-11-13 so the 0.2.0 tracing, EM6 and #235 rows run on
+    the sparks instead of a rental, in the home directory and kept after the
+    session: SGLang 0.5.23 with OpenTelemetry API, SDK and OTLP exporter 1.39.1;
+    SDK-free SGLang 0.5.23; an observational vLLM 0.33.0 with the EM6 header-name
+    recorder hook; an editable SGLang 0.5.23 checkout for #235; and, only if the
+    existing ~/vllm-0.33.0-venv lacks the OTLP exporter, a tracing copy of vLLM
+    0.33.0. Each is made with the rental recipe in `scripts/live/v020/setup.sh`
+    for aarch64 and recorded with its freeze and fingerprint;
+  - the maintainer's discrete-GPU laptop, approved 2026-11-13 for the discrete
+    LMCache rows LC13–LC16 (ADR 0034), in the home directory: vLLM 0.33.0 and
+    SGLang 0.5.23 each with an LMCache 0.5.7 source build against its own torch,
+    and vLLM 0.34.0rc1 with LMCache 0.5.7 under the same test-only OpenTelemetry
+    override as host A's. They run only while the owner has paused the laptop's
+    own GPU work;
   - the maintainer's discrete-GPU laptop, approved 2026-11-09: the official
     `lmsysorg/sglang:v0.5.22` Docker image, for the live check of #230 (an editable
     SGLang refused at `engine add`); removed after that check, to be pulled again for
