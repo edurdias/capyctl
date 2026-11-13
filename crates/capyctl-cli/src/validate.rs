@@ -632,6 +632,9 @@ fn host_policy_document(
     Ok((config.name, local))
 }
 
+/// ADR 0018 amendment A4: the engines file the role will load, which is the
+/// state directory's, or before the role's first start after the upgrade the
+/// file beside the host document that the start brings over.
 fn host_engines_path(
     path: &Path,
     overrides: &capyctl_config::setting_overrides::SettingOverrides,
@@ -645,7 +648,15 @@ fn host_engines_path(
     })?;
     let document = overrides.apply_and_validate(capyctl_config::parse_document(&source)?)?;
     let host = capyctl_config::remote_roles::HostConfig::parse(&document.to_string())?;
-    Ok(capyctl_config::registration::engines_path(&host.state_dir))
+    let current = capyctl_config::registration::engines_path(&host.state_dir);
+    if current.exists() {
+        return Ok(current);
+    }
+    Ok(
+        capyctl_config::registration::legacy_engines_path(Some(path), None)
+            .filter(|legacy| legacy.exists())
+            .unwrap_or(current),
+    )
 }
 
 /// The document kind, taken from the strict parse of each known kind. A kind

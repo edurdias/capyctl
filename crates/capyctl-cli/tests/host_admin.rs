@@ -122,13 +122,29 @@ async fn detected_builtin_add_is_published_and_remove_is_accepted() {
         refused["error"]["code"], "confirmation_required",
         "{refused}"
     );
-    let (status, added) = call(
+    // Security review finding 3 (ADR 0040 §10, KTD12): extra directories do
+    // not self-approve; the add needs the preview's digest and the typed name.
+    let request = json!({"path":candidate["entry"],"paths":[installation],"name":"vllm-api"});
+    let (status, refused) = call(
         &base,
         &token,
         "/hosts/standalone/engines",
-        Some(json!({"path":candidate["entry"],"paths":[installation],"name":"vllm-api"})),
+        Some(request.clone()),
     )
     .await;
+    assert!(!status.is_success());
+    assert_eq!(
+        refused["error"]["code"], "confirmation_required",
+        "{refused}"
+    );
+    let mut preview = request.clone();
+    preview["preview"] = json!(true);
+    let (status, previewed) = call(&base, &token, "/hosts/standalone/engines", Some(preview)).await;
+    assert!(status.is_success(), "{status} {previewed}");
+    let mut confirmed = request;
+    confirmed["digest"] = previewed["digest"].clone();
+    confirmed["confirm_name"] = json!("vllm-api");
+    let (status, added) = call(&base, &token, "/hosts/standalone/engines", Some(confirmed)).await;
     assert!(status.is_success(), "{status} {added}");
     assert!(app.profiles().contains(&"vllm-api".into()));
     let (status, engines) = call(&base, &token, "/engines", None).await;

@@ -376,6 +376,9 @@ fn every_post_baseline_field_names_its_capability() {
             RETENTION,
             REQUEST_ABORT,
             LOCAL_TENSOR_PARALLEL,
+            // ADR 0040 §10, KTD11: the server sends host administration only to
+            // a host that declares it.
+            HOST_ADMIN,
         ]
         .contains(name)
         {
