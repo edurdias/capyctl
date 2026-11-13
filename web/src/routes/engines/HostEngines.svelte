@@ -30,17 +30,20 @@
   // `engine detect --path`: extra directories, one per line or comma.
   let searchPaths = $state('');
   let candidates = $state<Candidate[] | null>(null);
+  // The directories the shown candidates were found with.
+  let detectedPaths = $state<string[]>([]);
   let names = $state<Record<string, string>>({});
 
   async function detect(): Promise<void> {
     const paths = searchPaths.split(/[\n,]/).map((path) => path.trim()).filter((path) => path !== '');
     await run(async () => {
       candidates = await detectEngines(host.host_id, paths);
+      detectedPaths = paths;
     });
   }
 
   async function add(candidate: Candidate): Promise<void> {
-    if (await run(() => addEngine(host.host_id, candidate, (names[candidate.entry] ?? '').trim()))) {
+    if (await run(() => addEngine(host.host_id, candidate, (names[candidate.entry] ?? '').trim(), detectedPaths))) {
       onchange();
     }
   }

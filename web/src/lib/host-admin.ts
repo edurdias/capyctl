@@ -59,9 +59,15 @@ export async function detectEngines(host: string, paths: string[]): Promise<Cand
   return (await request<{ candidates: Candidate[] }>(HOST_ADMIN.detected(host, paths))).candidates;
 }
 
-// KTD11: a built-in add takes a detected candidate.
-export function addEngine(host: string, candidate: Candidate, name: string): Promise<unknown> {
-  return mutate(HOST_ADMIN.addEngine(host), { path: candidate.entry, ...(name ? { name } : {}) });
+// KTD11: a built-in add takes a detected candidate. A candidate found only
+// under an extra search directory is added with those directories, as
+// `engine add --path` does; without them the host asks for confirmation.
+export function addEngine(host: string, candidate: Candidate, name: string, paths: string[]): Promise<unknown> {
+  return mutate(HOST_ADMIN.addEngine(host), {
+    path: candidate.entry,
+    ...(name ? { name } : {}),
+    ...(paths.length > 0 ? { paths } : {}),
+  });
 }
 
 // Answers 202; the engines list then shows the profile `retiring`.

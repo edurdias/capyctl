@@ -116,6 +116,35 @@ describe('host administration', () => {
     await tick();
     expect(text()).toContain('Update CapyCTL on the host and restart it, then try again.');
   });
+
+  // KTD11 (plan U8): a candidate found under an extra directory is added
+  // with those directories, so the host does not ask for a confirmation.
+  it('adds a detected engine with the extra directories it was found under', async () => {
+    const adds: Call[] = [];
+    role({
+      snapshots: [snapshotWith([])],
+      route: (call) => {
+        if (call.url.startsWith(`${HOST}/engines/detected`)) {
+          return json({ candidates: [{ engine: 'vllm', version: '0.32.0', custom: false, entry: '/opt/vllm/bin/vllm', source: 'path' }] });
+        }
+        if (call.method === 'POST' && call.url === `${HOST}/engines`) {
+          adds.push(call);
+          return json({ profile: 'vllm' });
+        }
+        return undefined;
+      },
+    });
+    await open('/engines');
+    button('Detect engines').click();
+    await tick();
+    await type('search-paths', '/opt/vllm, /srv/engines');
+    button('Detect').click();
+    await tick();
+    button('Add').click();
+    await tick();
+    expect(adds).toHaveLength(1);
+    expect(JSON.parse(adds[0].body ?? '{}')).toEqual({ path: '/opt/vllm/bin/vllm', paths: ['/opt/vllm', '/srv/engines'] });
+  });
 });
 
 describe('invitations', () => {
