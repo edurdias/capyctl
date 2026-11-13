@@ -65,6 +65,13 @@ The security fixes:
   without dropping the session.
 - Unknown non-management paths on the management listener answer 404.
 
+ADR 0018 amendment A4 (owner decision 2026-11-13) moves the engines files into the role's
+state directory (`capyctl_config::registration::engines_path`), which the role, the CLI and
+host administration all resolve. A role's start brings an existing file over once: it is moved
+when the old location is writable and copied when it is read-only, as under the system units. The
+packaged-layout test `packaged_layout_host_admin_add_remove_with_read_only_config_directory`
+fails before and passes after.
+
 # Release note: New features
 
 - **A web UI.** A standalone role and a server now serve a web UI at `/ui/` on their
@@ -82,3 +89,9 @@ The security fixes:
   ([network access](../operations/network-access.md#web-ui-off-the-machine)). The store
   moves to a new schema version, so an older binary refuses it; revoke all sessions after
   restoring a state backup ([data retention](../operations/data-retention.md#web-ui-sessions-and-sign-in-links)).
+- **Registered engines now live in the role's state directory** (for example
+  `/var/lib/capyctl/host/engines.yaml`), so an installed service can add and remove engines
+  from the web UI. On its first start after the upgrade, a role brings an existing
+  `engines.yaml` (and `custom-engines.yaml`) over by itself. Under the system units the old file
+  in `/etc/capyctl` is left in place and no longer read; you may delete it
+  ([install](../operations/install.md)).
