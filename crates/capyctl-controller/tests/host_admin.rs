@@ -865,11 +865,20 @@ async fn cancelling_the_caller_preserves_a_dispatched_engine_add() {
         .unwrap()
         .profiles
         .contains_key("vllm"));
-    let listed = a
-        .control
-        .handle(capyctl_agent::control_socket::ControlRequest::List)
-        .await;
-    assert_eq!(listed["accepted"]["vllm"]["engine"], "vllm");
+    // The server records the publication before its acknowledgement reaches the
+    // host, and the host's accepted view changes on that acknowledgement.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while a
+            .control
+            .handle(capyctl_agent::control_socket::ControlRequest::List)
+            .await["accepted"]["vllm"]["engine"]
+            != "vllm"
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the host accepts the published profile");
     let reply = request(&h.sessions, &h.host, detect(), Duration::from_secs(30))
         .await
         .unwrap();
