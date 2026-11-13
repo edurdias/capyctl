@@ -28,7 +28,7 @@ use std::{
     sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Semaphore};
 
 /// ADR 0040 §4: the session cookie's name.
 pub const SESSION_COOKIE: &str = "capyctl_session";
@@ -106,6 +106,7 @@ pub struct SessionVerifier {
     store: Arc<Mutex<Store>>,
     table: RwLock<HashMap<Digest, UiSession>>,
     revocations: broadcast::Sender<Revocation>,
+    exchanges: Arc<Semaphore>,
 }
 
 /// A session the composition resolved from a cookie.
@@ -129,6 +130,7 @@ impl SessionVerifier {
             store: Arc::new(Mutex::new(store)),
             table: RwLock::new(table),
             revocations: broadcast::channel(64).0,
+            exchanges: Arc::new(Semaphore::new(4)),
         }))
     }
 
@@ -223,7 +225,11 @@ impl SessionVerifier {
 
     /// ADR 0040 §5: spend a sign-in link and create a session, returning its
     /// cookie token. `None` when the link is unknown, used or expired.
-    async fn sign_in(&self, link: &str, label: String) -> Result<Option<(String, UiSession)>, ()> {
+    async fn sign_in(
+        self: &Arc<Self>,
+        link: &str,
+        label: String,
+    ) -> Result<Option<(String, UiSession)>, ()> {
         let Some(link) = token_digest(link) else {
             return Ok(None);
         };
@@ -231,54 +237,60 @@ impl SessionVerifier {
         let digest = sha256(token.as_bytes());
         let fingerprint = self.fingerprint;
         let now = now_ms();
-        let stored_label = label.clone();
-        let outcome = self
-            .blocking(move |store| {
-                store.consume_ui_signin_link(&link, &digest, &fingerprint, &stored_label, now)
-            })
-            .await?;
-        let SigninOutcome::SignedIn { session_id } = outcome else {
-            return Ok(None);
-        };
-        let session = UiSession {
-            id: session_id,
-            label,
-            created_at_ms: now,
-            last_seen_at_ms: now,
-            cookie_refreshed_at_ms: now,
-        };
-        self.table
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(digest, session.clone());
-        Ok(Some((token, session)))
+        let verifier = self.clone();
+        // ADR 0040 §§5–6: one owned worker serializes the store, table and
+        // notification. Dropping the HTTP wait cannot interrupt write-through.
+        tokio::task::spawn_blocking(move || {
+            let store = verifier.store.lock().map_err(|_| ())?;
+            let mut table = verifier.table.write().map_err(|_| ())?;
+            let outcome = store
+                .consume_ui_signin_link(&link, &digest, &fingerprint, &label, now)
+                .map_err(|_| ())?;
+            let SigninOutcome::SignedIn { session_id } = outcome else {
+                return Ok(None);
+            };
+            let session = UiSession {
+                id: session_id,
+                label,
+                created_at_ms: now,
+                last_seen_at_ms: now,
+                cookie_refreshed_at_ms: now,
+            };
+            table.insert(digest, session.clone());
+            Ok(Some((token, session)))
+        })
+        .await
+        .map_err(|_| ())?
     }
 
     /// ADR 0040 §6: delete session `id` and end what it holds open.
-    async fn revoke(&self, id: String) -> Result<bool, ()> {
-        let stored = id.clone();
-        let existed = self
-            .blocking(move |store| store.revoke_ui_session(&stored))
-            .await?;
-        self.table
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .retain(|_, session| session.id != id);
-        let _ = self.revocations.send(Revocation::Session(id));
-        Ok(existed)
+    async fn revoke(self: &Arc<Self>, id: String) -> Result<bool, ()> {
+        let verifier = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = verifier.store.lock().map_err(|_| ())?;
+            let mut table = verifier.table.write().map_err(|_| ())?;
+            let existed = store.revoke_ui_session(&id).map_err(|_| ())?;
+            table.retain(|_, session| session.id != id);
+            let _ = verifier.revocations.send(Revocation::Session(id));
+            Ok(existed)
+        })
+        .await
+        .map_err(|_| ())?
     }
 
     /// ADR 0040 §6: delete every session and end what they hold open.
-    async fn revoke_all(&self) -> Result<usize, ()> {
-        let count = self
-            .blocking(|store| store.revoke_all_ui_sessions())
-            .await?;
-        self.table
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .clear();
-        let _ = self.revocations.send(Revocation::All);
-        Ok(count)
+    async fn revoke_all(self: &Arc<Self>) -> Result<usize, ()> {
+        let verifier = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = verifier.store.lock().map_err(|_| ())?;
+            let mut table = verifier.table.write().map_err(|_| ())?;
+            let count = store.revoke_all_ui_sessions().map_err(|_| ())?;
+            table.clear();
+            let _ = verifier.revocations.send(Revocation::All);
+            Ok(count)
+        })
+        .await
+        .map_err(|_| ())?
     }
 }
 
@@ -337,6 +349,9 @@ async fn issue_link(State(verifier): State<Arc<SessionVerifier>>, request: Reque
 /// ADR 0040 §5: the unauthenticated exchange. It ignores any cookie it is
 /// sent and sets a fresh one; the composition already applied §4's checks.
 async fn exchange(State(verifier): State<Arc<SessionVerifier>>, request: Request) -> Response {
+    let Ok(permit) = verifier.exchanges.clone().try_acquire_owned() else {
+        return error(StatusCode::TOO_MANY_REQUESTS, "queue_full", true);
+    };
     if request.uri().query().is_some() {
         return error(StatusCode::BAD_REQUEST, "invalid_request", false);
     }
@@ -347,7 +362,11 @@ async fn exchange(State(verifier): State<Arc<SessionVerifier>>, request: Request
     let Ok(Exchange { token }) = serde_json::from_slice(&body) else {
         return error(StatusCode::BAD_REQUEST, "invalid_request", false);
     };
-    match verifier.sign_in(&token, label).await {
+    let exchange = tokio::spawn(async move {
+        let _permit = permit;
+        verifier.sign_in(&token, label).await
+    });
+    match exchange.await.unwrap_or(Err(())) {
         Ok(Some((cookie, session))) => {
             let mut response = (
                 StatusCode::CREATED,
@@ -573,4 +592,138 @@ pub(crate) fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|t| t.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn verifier() -> Arc<SessionVerifier> {
+        SessionVerifier::open(
+            ManagementCredentials::from_trusted_resolver(
+                "management-credential-012345678901234567890",
+                "inference-credential-0123456789012345678901",
+            )
+            .unwrap(),
+            Store::open_in_memory().unwrap(),
+        )
+        .unwrap()
+    }
+
+    // ADR 0040 §§5–6 / KTD7 / T16: concurrent exchanges and revoke-all
+    // always leave the authoritative store and authorization table identical.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sign_in_and_revoke_all_serialize_write_through() {
+        let verifier = verifier();
+        for _ in 0..32 {
+            let (link, _) = verifier.issue_link().await.unwrap();
+            let signing = {
+                let verifier = verifier.clone();
+                tokio::spawn(async move { verifier.sign_in(&link, "browser".into()).await })
+            };
+            verifier.revoke_all().await.unwrap();
+            signing.await.unwrap().unwrap();
+            let stored = verifier.store.lock().unwrap().ui_session_digests().unwrap();
+            let table = verifier.table.read().unwrap();
+            assert_eq!(stored.len(), table.len());
+            for (digest, session) in stored {
+                assert_eq!(table.get(&digest), Some(&session));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    // ADR 0040 §6 / KTD7 / T16: disconnecting after dispatch cannot strand
+    // a deleted session in the authorization table or suppress revocation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_revoke_finishes_table_update_and_broadcast() {
+        let verifier = SessionVerifier::open(
+            ManagementCredentials::from_trusted_resolver(
+                "management-credential-012345678901234567890",
+                "inference-credential-0123456789012345678901",
+            )
+            .unwrap(),
+            Store::open_in_memory().unwrap(),
+        )
+        .unwrap();
+        let (link, _) = verifier.issue_link().await.unwrap();
+        let (_, session) = verifier
+            .sign_in(&link, "browser".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut revocations = verifier.revocations.subscribe();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = {
+            let verifier = verifier.clone();
+            std::thread::spawn(move || {
+                let _table = verifier.table.write().unwrap();
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        };
+        entered_rx.recv().unwrap();
+        let revoking = {
+            let verifier = verifier.clone();
+            let id = session.id.clone();
+            tokio::spawn(async move { verifier.revoke(id).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while verifier.store.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        revoking.abort();
+        let _ = revoking.await;
+        release_tx.send(()).unwrap();
+        blocker.join().unwrap();
+        let completed = verifier.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = completed.store.lock().unwrap();
+            assert!(store.ui_sessions().unwrap().is_empty());
+            assert!(!completed.holds(&session.id));
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            revocations.recv().await.unwrap(),
+            Revocation::Session(_)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod exchange_limit_tests {
+    use super::*;
+
+    // ADR 0040 §5 / KTD7 / T16: excess unauthenticated work is rejected
+    // before any body read or blocking store task can be scheduled.
+    #[tokio::test]
+    async fn exchange_concurrency_is_bounded() {
+        let verifier = SessionVerifier::open(
+            ManagementCredentials::from_trusted_resolver(
+                "management-credential-012345678901234567890",
+                "inference-credential-0123456789012345678901",
+            )
+            .unwrap(),
+            Store::open_in_memory().unwrap(),
+        )
+        .unwrap();
+        let _permits = verifier
+            .exchanges
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let request = Request::builder().body(Body::empty()).unwrap();
+        let response = exchange(State(verifier), request).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
 }

@@ -212,12 +212,6 @@ async fn prepare(
     let executable = resolve_custom(&request.executable)
         .map_err(|e| error(e.code(), format!("{e}; nothing was written")))?;
     let manifest = read_manifest(&request.manifest)?;
-    match request.operation {
-        CustomOperation::Add => refuse_existing(target, name)?,
-        CustomOperation::Change => {
-            current_custom(target, name)?;
-        }
-    }
     // ADR 0031 §3: the installation's identity, from its files only.
     let (measured, layout) = {
         let (executable, manifest, measurer) =
@@ -335,6 +329,15 @@ async fn prepare(
     })
 }
 
+// ADR 0040 §11: registry validation is separate from measuring digest
+// inputs. Confirmation must compare the preview before these checks.
+fn validate_current(target: &Target, request: &CustomEngine) -> Result<(), HostAdminError> {
+    match request.operation {
+        CustomOperation::Add => refuse_existing(target, &request.name),
+        CustomOperation::Change => current_custom(target, &request.name).map(|_| ()),
+    }
+}
+
 /// ADR 0040 §11: custom-engines.yaml holding `name`, which a change needs.
 fn current_custom(target: &Target, name: &str) -> Result<EnginesFile, HostAdminError> {
     let path = custom_engines(target);
@@ -395,6 +398,7 @@ pub async fn preview_custom(
     measurer: &Arc<InstallationMeasurer>,
 ) -> Result<CustomPreview, HostAdminError> {
     let prepared = prepare(target, request, measurer).await?;
+    validate_current(target, request)?;
     let revision = match request.operation {
         CustomOperation::Add => None,
         CustomOperation::Change => Some(current_custom(target, &prepared.name)?.revision),
@@ -426,39 +430,39 @@ pub async fn confirm_custom(
     if typed_name != request.name {
         return Err(stale_name(&request.name));
     }
-    let prepared = prepare(target, request, measurer).await?;
+    // ADR 0040 §11 / KTD11: absence is evidence that a preview input
+    // vanished. Preserve unrelated permission/configuration failures.
+    if matches!(
+        std::fs::metadata(&request.executable),
+        Err(failure) if failure.kind() == std::io::ErrorKind::NotFound
+    ) {
+        return Err(error(
+            CONFIRMATION_STALE,
+            "the executable no longer exists; preview it again; nothing was written",
+        ));
+    }
     let path = custom_engines(target);
     // ADR 0031 amendment A1: the one lock both engines files share, then the
     // name re-checked against both files and the role document.
     let lock = lock_engines_for(&path, service_owner(target))
         .map_err(|e| error("internal", format!("{}: {}", e.path, e.detail)))?;
     let mut custom = EnginesFile::load(&path).map_err(|e| error("invalid_config", e.detail))?;
+    let prepared = prepare(target, request, measurer).await?;
     let revision = match request.operation {
         CustomOperation::Add => None,
         CustomOperation::Change => Some(custom.revision),
     };
-    if digest_of(request, &prepared, revision) != digest {
+    if digest_of(request, &prepared, revision) != digest
+        || (request.operation == CustomOperation::Change
+            && !custom.profiles.contains_key(&request.name))
+    {
         return Err(error(
             CONFIRMATION_STALE,
             "the installation, the manifest, the request or custom-engines.yaml changed since \
              the preview; preview it again; nothing was written",
         ));
     }
-    match request.operation {
-        CustomOperation::Add => refuse_existing(target, &prepared.name)?,
-        CustomOperation::Change => {
-            if !custom.profiles.contains_key(&prepared.name) {
-                return Err(error(
-                    CONFIRMATION_STALE,
-                    format!(
-                        "{} no longer has {}; nothing was written",
-                        path.display(),
-                        prepared.name
-                    ),
-                ));
-            }
-        }
-    }
+    validate_current(target, request)?;
     custom
         .profiles
         .insert(prepared.name.clone(), prepared.profile);

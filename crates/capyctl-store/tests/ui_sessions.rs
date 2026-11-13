@@ -366,3 +366,18 @@ fn the_session_table_load_returns_each_session_with_its_digest() {
     store.revoke_ui_session(&first).unwrap();
     assert_eq!(store.ui_session_digests().unwrap().len(), 1);
 }
+
+// ADR 0040 §5 / KTD7 / T16: an unknown exchange cannot contend with a writer.
+#[test]
+fn unknown_link_does_not_acquire_the_sqlite_write_lock() {
+    let (_dir, path, reader) = store();
+    let writer = rusqlite::Connection::open(path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert_eq!(
+        reader
+            .consume_ui_signin_link(&digest(99), &digest(98), &ADMIN_A, "unknown", 0)
+            .unwrap(),
+        SigninOutcome::Unknown
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+}

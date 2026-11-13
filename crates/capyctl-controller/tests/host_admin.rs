@@ -25,6 +25,7 @@ use capyctl_protocol::{
     },
     version::BINARY_VERSION,
 };
+use prost::Message;
 use serde_json::{json, Value};
 use std::{
     os::unix::fs::PermissionsExt,
@@ -144,7 +145,9 @@ async fn enrolled() -> Harness {
     let tls = ServerTlsConfig::new()
         .identity(Identity::from_pem(cert.pem, key.private_key_pem()))
         .client_ca_root(Certificate::from_pem(&ca_pem));
-    let service = AgentControlServer::from_arc(sessions.clone());
+    let service = AgentControlServer::from_arc(sessions.clone())
+        .max_encoding_message_size(capyctl_protocol::SERVER_MESSAGE_BYTES)
+        .max_decoding_message_size(capyctl_protocol::HOST_MESSAGE_BYTES);
     let server = tokio::spawn(async move {
         let _ = Server::builder()
             .tls_config(tls)
@@ -222,6 +225,8 @@ impl Harness {
                 .unwrap();
         }
         let mut stream = AgentControlClient::new(channel)
+            .max_decoding_message_size(capyctl_protocol::SERVER_MESSAGE_BYTES)
+            .max_encoding_message_size(capyctl_protocol::HOST_MESSAGE_BYTES)
             .session(ReceiverStream::new(recv))
             .await
             .unwrap()
@@ -265,7 +270,7 @@ async fn eventually(mut done: impl FnMut() -> bool) {
     .unwrap();
 }
 
-// ADR 0040 §10, ADR 0017: a host that did not declare `host_admin` is
+// T34 / ADR 0040 §10 / KTD11: a host that did not declare `host_admin` is
 // refused typed and sent nothing.
 #[tokio::test]
 async fn a_host_without_the_capability_is_refused_and_sent_nothing() {
@@ -283,31 +288,33 @@ async fn a_host_without_the_capability_is_refused_and_sent_nothing() {
     h.server.abort();
 }
 
-// ADR 0017: a drain-only host is refused `host_upgrade_required` and sent
-// nothing, even when it names the capability.
+// T34 / ADR 0040 §10 / KTD11: version refusal takes precedence over a
+// missing capability, including hosts predating capability declarations.
 #[tokio::test]
 async fn a_drain_only_host_is_refused_upgrade_required() {
-    let h = enrolled().await;
-    let (_send, mut stream) = h
-        .reconciled("", vec![capabilities::HOST_ADMIN.to_owned()])
-        .await;
-    let refused = request(&h.sessions, &h.host, detect(), Duration::from_secs(5))
-        .await
-        .unwrap_err();
-    assert_eq!(refused, Refusal::HostUpgradeRequired);
-    assert_eq!(refused.code(), "host_upgrade_required");
-    assert_eq!(next(&mut stream, Duration::from_millis(500)).await, None);
-    h.server.abort();
+    for declared in [vec![], vec![capabilities::HOST_ADMIN.to_owned()]] {
+        let h = enrolled().await;
+        let (_send, mut stream) = h.reconciled("", declared).await;
+        let refused = request(&h.sessions, &h.host, detect(), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(refused, Refusal::HostUpgradeRequired);
+        assert_eq!(refused.code(), "host_upgrade_required");
+        assert_eq!(next(&mut stream, Duration::from_millis(500)).await, None);
+        h.server.abort();
+    }
 }
 
-// ADR 0040 §10: a host with no live session is answered at once, without
-// waiting out the deadline.
+// T34 / ADR 0040 §10 / KTD11: a host with no live session is answered at
+// once, even without a previously recorded capability declaration.
 #[tokio::test]
 async fn an_offline_host_is_refused_at_once() {
     let h = enrolled().await;
-    let opened = h
-        .reconciled(BINARY_VERSION, capabilities::agent_capabilities())
-        .await;
+    let refused = request(&h.sessions, &h.host, detect(), Duration::from_secs(30))
+        .await
+        .unwrap_err();
+    assert_eq!(refused, Refusal::ObservationStale);
+    let opened = h.reconciled(BINARY_VERSION, vec![]).await;
     drop(opened);
     eventually(|| h.sessions.inspect(&h.host).is_some_and(|v| !v.online)).await;
     let started = tokio::time::Instant::now();
@@ -405,6 +412,188 @@ async fn an_unanswered_request_answers_deadline_exceeded() {
         next(&mut stream, Duration::from_secs(1)).await,
         Some(server_to_agent::Msg::HostAdminRequest(_))
     ));
+    h.server.abort();
+}
+
+// T34 / ADR 0040 §10 / KTD11: a replacement session's declaration alone
+// authorizes dispatch; an old session's outstanding operation is not replayed.
+#[tokio::test]
+async fn capability_and_dispatch_follow_the_current_session() {
+    let h = enrolled().await;
+    let (_old_send, mut old_stream) = h
+        .reconciled(BINARY_VERSION, capabilities::agent_capabilities())
+        .await;
+    let sessions = h.sessions.clone();
+    let host = h.host.clone();
+    let asked =
+        tokio::spawn(
+            async move { request(&sessions, &host, detect(), Duration::from_secs(30)).await },
+        );
+    assert!(matches!(
+        next(&mut old_stream, Duration::from_secs(5)).await,
+        Some(server_to_agent::Msg::HostAdminRequest(_))
+    ));
+    let without: Vec<String> = capabilities::agent_capabilities()
+        .into_iter()
+        .filter(|c| c != capabilities::HOST_ADMIN)
+        .collect();
+    let (_send, mut stream) = h.reconciled(BINARY_VERSION, without).await;
+    let lost = tokio::time::timeout(Duration::from_secs(5), asked)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(lost, Refusal::OutcomeUnknown);
+    let refused = request(&h.sessions, &h.host, detect(), Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), "host_capability_missing:host_admin");
+    assert_eq!(next(&mut stream, Duration::from_millis(500)).await, None);
+
+    let (send, mut stream) = h
+        .reconciled(BINARY_VERSION, capabilities::agent_capabilities())
+        .await;
+    let sessions = h.sessions.clone();
+    let host = h.host.clone();
+    let asked =
+        tokio::spawn(
+            async move { request(&sessions, &host, detect(), Duration::from_secs(5)).await },
+        );
+    let Some(server_to_agent::Msg::HostAdminRequest(sent)) =
+        next(&mut stream, Duration::from_secs(5)).await
+    else {
+        panic!("expected a HostAdminRequest on the replacement session");
+    };
+    send.send(pb::AgentToServer {
+        msg: Some(agent_to_server::Msg::HostAdminReply(pb::HostAdminReply {
+            request_id: sent.request_id.clone(),
+            result_json: "{}".into(),
+            ..Default::default()
+        })),
+    })
+    .await
+    .unwrap();
+    assert_eq!(asked.await.unwrap().unwrap().request_id, sent.request_id);
+    h.server.abort();
+}
+
+/// A detection operation whose complete ServerToAgent frame has `bytes`
+/// encoded bytes, including the request id, deadline and nested wrappers.
+fn detect_sized(bytes: usize) -> Op {
+    let mut wire = pb::ServerToAgent {
+        msg: Some(server_to_agent::Msg::HostAdminRequest(
+            pb::HostAdminRequest {
+                request_id: "0".repeat(26),
+                deadline_unix_ms: capyctl_protocol::now_unix_ms() + 30_000,
+                op: Some(Op::Detect(pb::DetectEngines {
+                    extra_dirs: vec!["x".repeat(bytes)],
+                })),
+            },
+        )),
+    };
+    let overhead = wire.encoded_len() - bytes;
+    let Some(server_to_agent::Msg::HostAdminRequest(request)) = wire.msg.as_mut() else {
+        unreachable!();
+    };
+    let Some(Op::Detect(detect)) = request.op.as_mut() else {
+        unreachable!();
+    };
+    detect.extra_dirs[0].truncate(bytes - overhead);
+    assert_eq!(wire.encoded_len(), bytes);
+    let Some(server_to_agent::Msg::HostAdminRequest(request)) = wire.msg else {
+        unreachable!();
+    };
+    request.op.unwrap()
+}
+
+// T19 T37 / ADR 0040 §§10–11 / KTD11–12: all host-admin operations obey
+// the complete 64 KiB wire bound before enqueueing; refusal keeps the stream
+// usable and never truncates the references protecting a model-store prune.
+#[tokio::test]
+async fn oversized_requests_are_refused_without_ending_the_session() {
+    let h = enrolled().await;
+    let (send, mut stream) = h
+        .reconciled(BINARY_VERSION, capabilities::agent_capabilities())
+        .await;
+    let session_id = h.sessions.inspect(&h.host).unwrap().session_id;
+    let limit = capyctl_protocol::SERVER_MESSAGE_BYTES;
+    let manifest = "x".repeat(48 * 1024);
+    let custom = pb::CustomEngineSpec {
+        manifest,
+        env: [("CONFIG".into(), "x".repeat(20 * 1024))]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let oversized = [
+        detect_sized(limit + 1),
+        Op::PreviewBuiltin(pb::BuiltinEngine {
+            args: vec!["x".repeat(limit)],
+            ..Default::default()
+        }),
+        Op::AddBuiltin(pb::AddBuiltinEngine {
+            extra_dirs: vec!["x".repeat(limit)],
+            ..Default::default()
+        }),
+        Op::PreviewCustom(custom.clone()),
+        Op::ConfirmCustom(pb::ConfirmCustomEngine {
+            engine: Some(custom),
+            ..Default::default()
+        }),
+        Op::ModelStoreList(pb::ModelStoreList {
+            referenced: vec!["x".repeat(256); 256],
+        }),
+        Op::ModelStorePrune(pb::ModelStorePrune {
+            referenced: vec!["x".repeat(256); 256],
+            apply: true,
+        }),
+        Op::PinAndSize(pb::PinAndSize {
+            sources: vec!["x".repeat(limit)],
+        }),
+    ];
+    for op in oversized {
+        let refused = request(&h.sessions, &h.host, op, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(refused, Refusal::RequestTooLarge);
+        assert_eq!(refused.code(), "request_too_large");
+    }
+    assert_eq!(next(&mut stream, Duration::from_millis(500)).await, None);
+
+    // The limit itself is accepted, not reserved for protobuf overhead.
+    let sessions = h.sessions.clone();
+    let host = h.host.clone();
+    let asked = tokio::spawn(async move {
+        request(
+            &sessions,
+            &host,
+            detect_sized(limit),
+            Duration::from_secs(30),
+        )
+        .await
+    });
+    let Some(server_to_agent::Msg::HostAdminRequest(sent)) =
+        next(&mut stream, Duration::from_secs(5)).await
+    else {
+        panic!("expected an exactly 64 KiB HostAdminRequest");
+    };
+    let wire = pb::ServerToAgent {
+        msg: Some(server_to_agent::Msg::HostAdminRequest(sent.clone())),
+    };
+    assert_eq!(wire.encoded_len(), limit);
+    send.send(pb::AgentToServer {
+        msg: Some(agent_to_server::Msg::HostAdminReply(pb::HostAdminReply {
+            request_id: sent.request_id,
+            result_json: "{}".into(),
+            ..Default::default()
+        })),
+    })
+    .await
+    .unwrap();
+    assert_eq!(asked.await.unwrap().unwrap().result_json, "{}");
+    let current = h.sessions.inspect(&h.host).unwrap();
+    assert!(current.online && current.reconciled);
+    assert_eq!(current.session_id, session_id);
     h.server.abort();
 }
 
@@ -569,6 +758,123 @@ async fn load_reports_continue_while_an_operation_runs() {
     h.server.abort();
 }
 
+/// Hold a real host-local operation after dispatch, without tying its
+/// lifetime to the controller's caller.
+struct DelayedAdmin {
+    service: Arc<HostAdminService>,
+    started: Arc<tokio::sync::Notify>,
+    released: Arc<tokio::sync::Semaphore>,
+}
+
+impl HostAdminHandler for DelayedAdmin {
+    fn handle(self: Arc<Self>, request: pb::HostAdminRequest) -> ReplyFuture {
+        Box::pin(async move {
+            let _permit = if matches!(request.op.as_ref(), Some(Op::AddBuiltin(_))) {
+                self.started.notify_one();
+                Some(self.released.acquire().await.unwrap())
+            } else {
+                None
+            };
+            self.service.clone().handle(request).await
+        })
+    }
+}
+
+// T08 T37 / ADR 0040 §§10–11 / KTD7, KTD11–12: cancellation ends only the
+// caller's wait. An already dispatched, confirmed engine add still writes and
+// publishes its profile; its late reply does not end the control session.
+#[tokio::test]
+async fn cancelling_the_caller_preserves_a_dispatched_engine_add() {
+    let h = enrolled().await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let released = Arc::new(tokio::sync::Semaphore::new(0));
+    let (signal, gate) = (started.clone(), released.clone());
+    let host_id = h.host.clone();
+    let a = agent(
+        &h,
+        move |dir, control| {
+            Arc::new(DelayedAdmin {
+                service: host_service(dir, control, host_id),
+                started: signal,
+                released: gate,
+            })
+        },
+        None,
+    )
+    .await;
+    let session_id = h.sessions.inspect(&h.host).unwrap().session_id;
+    let elsewhere = a.dir.path().join("elsewhere");
+    let env = vllm_env(&elsewhere.join("vllm-env"));
+    let engine = pb::BuiltinEngine {
+        path: env.display().to_string(),
+        name: "vllm".into(),
+        ..Default::default()
+    };
+    let preview = request(
+        &h.sessions,
+        &h.host,
+        Op::PreviewBuiltin(engine.clone()),
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert!(preview.error_code.is_empty(), "{}", preview.error_message);
+    let preview: Value = serde_json::from_str(&preview.result_json).unwrap();
+    let digest = preview["digest"].as_str().unwrap().to_owned();
+    let sessions = h.sessions.clone();
+    let host = h.host.clone();
+    let asked = tokio::spawn(async move {
+        request(
+            &sessions,
+            &host,
+            Op::AddBuiltin(pb::AddBuiltinEngine {
+                engine: Some(engine),
+                extra_dirs: vec![elsewhere.display().to_string()],
+                digest,
+                typed_name: "vllm".into(),
+            }),
+            Duration::from_secs(30),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    asked.abort();
+    assert!(asked.await.unwrap_err().is_cancelled());
+    let engines = capyctl_config::registration::engines_beside(&a.document);
+    assert!(!engines.exists(), "the dispatched add is still held");
+    released.add_permits(1);
+    eventually(|| {
+        h.state
+            .lock()
+            .unwrap()
+            .store()
+            .host_publication(&h.host)
+            .unwrap()
+            .is_some_and(|publication| publication.config_json.contains("\"vllm\""))
+    })
+    .await;
+    assert!(capyctl_config::registration::EnginesFile::load(&engines)
+        .unwrap()
+        .profiles
+        .contains_key("vllm"));
+    let listed = a
+        .control
+        .handle(capyctl_agent::control_socket::ControlRequest::List)
+        .await;
+    assert_eq!(listed["accepted"]["vllm"]["engine"], "vllm");
+    let reply = request(&h.sessions, &h.host, detect(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert!(reply.error_code.is_empty(), "{}", reply.error_message);
+    let current = h.sessions.inspect(&h.host).unwrap();
+    assert!(current.online && current.reconciled);
+    assert_eq!(current.session_id, session_id);
+    a.stop().await;
+    h.server.abort();
+}
+
 fn script(path: &Path, body: &str) {
     capyctl_config::test_support::write_executable(path, format!("#!/bin/sh\n{body}\n"), 0o755)
         .unwrap();
@@ -678,9 +984,9 @@ impl capyctl_controller::profile_retirement::ProfileRetirements for UnusedProfil
     }
 }
 
-// ADR 0040 §10: the server adds a built-in engine the host detects under an
-// extra search directory; the host writes its engines file and publishes the
-// profile live, and the server approves it.
+// T37 / ADR 0040 §§10–11 / KTD11–12: the server adds a built-in engine
+// detected under an extra search directory only after preview confirmation;
+// the host writes and publishes its profile, and the server approves it.
 #[tokio::test]
 async fn a_detected_builtin_engine_is_added_through_the_server() {
     let h = enrolled().await;
@@ -718,16 +1024,30 @@ async fn a_detected_builtin_engine_is_added_through_the_server() {
         "{detected}"
     );
 
+    let engine = pb::BuiltinEngine {
+        path: env.display().to_string(),
+        name: "vllm".into(),
+        ..Default::default()
+    };
+    let preview = request(
+        &h.sessions,
+        &h.host,
+        Op::PreviewBuiltin(engine.clone()),
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert!(preview.error_code.is_empty(), "{}", preview.error_message);
+    let preview: Value = serde_json::from_str(&preview.result_json).unwrap();
+
     let added = request(
         &h.sessions,
         &h.host,
         Op::AddBuiltin(pb::AddBuiltinEngine {
-            engine: Some(pb::BuiltinEngine {
-                path: env.display().to_string(),
-                ..Default::default()
-            }),
+            engine: Some(engine),
             extra_dirs: vec![elsewhere.display().to_string()],
-            ..Default::default()
+            digest: preview["digest"].as_str().unwrap().into(),
+            typed_name: "vllm".into(),
         }),
         Duration::from_secs(30),
     )

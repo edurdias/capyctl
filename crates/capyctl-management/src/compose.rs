@@ -219,11 +219,14 @@ pub fn server(
 
 /// ADR 0040 §§2–4: resolve the principal, or refuse.
 async fn resolve(State(access): State<Arc<Access>>, mut request: Request, next: Next) -> Response {
-    // ADR 0040 §§2, 13: the bundle must load before a browser can sign in.
-    // Only management paths enter authorization; their unknown routes stay closed.
+    // ADR 0040 §§2, 13: only the explicit UI namespace is public. Unknown
+    // non-management paths are 404 here, before an inner authenticated fallback.
     let path = request.uri().path();
-    if path != "/management" && !path.starts_with("/management/") {
+    if path == "/" || path == "/ui" || path.starts_with("/ui/") {
         return next.run(request).await;
+    }
+    if path != "/management" && !path.starts_with("/management/") {
+        return error(axum::http::StatusCode::NOT_FOUND, "not_found", false);
     }
     let mut response = match principal(&access, &request) {
         Outcome::Admin => {
@@ -339,7 +342,15 @@ fn from_the_box(request: &Request) -> bool {
 }
 
 fn forwarded(headers: &HeaderMap) -> bool {
-    headers.contains_key("x-forwarded-for") || headers.contains_key(header::FORWARDED)
+    headers.keys().any(|name| {
+        let name = name.as_str();
+        name.starts_with("x-forwarded-")
+            || name.starts_with("tailscale-")
+            || matches!(
+                name,
+                "forwarded" | "x-real-ip" | "via" | "cf-connecting-ip" | "true-client-ip"
+            )
+    })
 }
 
 /// The one `capyctl_session` cookie value; `None` without one, or with two.

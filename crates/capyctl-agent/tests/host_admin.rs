@@ -229,11 +229,30 @@ async fn a_builtin_add_runs_code_only_on_a_detected_candidate() {
     assert!(engines_profiles(&target).is_empty());
     assert_eq!(role.asked(), 0);
 
-    let added = host_admin::add_builtin(
+    // ADR 0040 §10 / KTD11 / T18: caller-supplied discovery roots do
+    // not authorize execution, even when they reveal this installation.
+    let refused = host_admin::add_builtin(
         &target,
         &builtin(&env, false),
         &toolchain,
         BuiltinApproval::Detected(&detected),
+        &measurer,
+        &role,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, CONFIRMATION_REQUIRED);
+    assert!(engines_profiles(&target).is_empty());
+    assert_eq!(role.asked(), 0);
+
+    // The host's fixed PATH snapshot may authorize the same candidate.
+    let mut fixed = roots(&home, vec![]);
+    fixed.path_dirs = vec![env.join("bin")];
+    let added = host_admin::add_builtin(
+        &target,
+        &builtin(&env, false),
+        &toolchain,
+        BuiltinApproval::Detected(&fixed),
         &measurer,
         &role,
     )
@@ -439,6 +458,106 @@ async fn confirming_after_an_installation_file_changed_is_stale() {
     assert_eq!(refused.code, CONFIRMATION_STALE, "{refused}");
     assert!(custom_profiles(&target).is_empty());
     assert_eq!(role.asked(), 0);
+}
+
+// ADR 0040 §11 / KTD11 / T18: disappearance invalidates the preview,
+// rather than returning the fresh-request executable validation error.
+#[tokio::test]
+async fn confirming_after_the_executable_disappeared_is_stale() {
+    let dir = private_dir();
+    let target = host(dir.path());
+    let venv = venv(dir.path());
+    let measurer = Arc::new(InstallationMeasurer::new());
+    let role = Role::published();
+    let request = custom(&venv, "serve", CustomOperation::Add);
+    let preview = host_admin::preview_custom(&target, &request, &measurer)
+        .await
+        .unwrap();
+    std::fs::remove_file(&request.executable).unwrap();
+    let refused = host_admin::confirm_custom(
+        &target,
+        &request,
+        &preview.digest,
+        "serve",
+        &measurer,
+        &role,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, CONFIRMATION_STALE);
+    assert!(custom_profiles(&target).is_empty());
+    assert_eq!(role.asked(), 0);
+}
+
+// ADR 0040 §11 / KTD11 / T18: a removed custom profile cannot be
+// recreated by confirming an earlier change preview.
+#[tokio::test]
+async fn confirming_after_the_custom_profile_disappeared_is_stale() {
+    let dir = private_dir();
+    let target = host(dir.path());
+    let venv = venv(dir.path());
+    let measurer = Arc::new(InstallationMeasurer::new());
+    let role = Role::published();
+    let add = custom(&venv, "serve", CustomOperation::Add);
+    let preview = host_admin::preview_custom(&target, &add, &measurer)
+        .await
+        .unwrap();
+    host_admin::confirm_custom(&target, &add, &preview.digest, "serve", &measurer, &role)
+        .await
+        .unwrap();
+    let change = custom(&venv, "serve", CustomOperation::Change);
+    let preview = host_admin::preview_custom(&target, &change, &measurer)
+        .await
+        .unwrap();
+    std::fs::remove_file(custom_engines_beside(&target.engines)).unwrap();
+    let asked = role.asked();
+    let refused =
+        host_admin::confirm_custom(&target, &change, &preview.digest, "serve", &measurer, &role)
+            .await
+            .unwrap_err();
+    assert_eq!(refused.code, CONFIRMATION_STALE);
+    assert!(custom_profiles(&target).is_empty());
+    assert_eq!(role.asked(), asked);
+}
+
+// ADR 0040 §11 / KTD11 / T18: compare the installation digest before
+// reporting a registry conflict introduced after the preview.
+#[tokio::test]
+async fn stale_custom_digest_precedes_a_new_profile_conflict() {
+    let dir = private_dir();
+    let target = host(dir.path());
+    let venv = venv(dir.path());
+    let measurer = Arc::new(InstallationMeasurer::new());
+    let role = Role::published();
+    let request = custom(&venv, "serve", CustomOperation::Add);
+    let preview = host_admin::preview_custom(&target, &request, &measurer)
+        .await
+        .unwrap();
+    host_admin::confirm_custom(
+        &target,
+        &request,
+        &preview.digest,
+        "serve",
+        &measurer,
+        &role,
+    )
+    .await
+    .unwrap();
+    std::fs::write(&venv.dependency, "VERSION = 2\n").unwrap();
+    let asked = role.asked();
+    let refused = host_admin::confirm_custom(
+        &target,
+        &request,
+        &preview.digest,
+        "serve",
+        &measurer,
+        &role,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, CONFIRMATION_STALE);
+    assert_eq!(role.asked(), asked);
+    assert!(custom_profiles(&target).contains_key("serve"));
 }
 
 // ADR 0040 §11: the profile's environment value changed after the preview.

@@ -417,6 +417,8 @@ async fn provider_failures_keep_the_management_error_envelope() {
         ("invalid_request", 400),
         ("invalid_config", 400),
         ("custom_manifest_invalid", 400),
+        // ADR 0040 §10 / KTD11 / T16: bounded control messages fail locally.
+        ("request_too_large", 413),
         ("host_not_found", 404),
         ("profile_not_found", 404),
         ("confirmation_required", 409),

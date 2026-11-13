@@ -128,7 +128,7 @@ impl HostAdminSource for StandaloneAdmin {
                 .map_err(|_| invalid("Engine detection failed")),
                 Operation::Add(body) => {
                     let add: Add = parse(body)?;
-                    let roots = ScanRoots::from_env(add.paths);
+                    let roots = ScanRoots::from_env(vec![]);
                     let request = BuiltinAdd {
                         host_id: self.control.host_id.clone(),
                         path: add.path,
@@ -159,6 +159,19 @@ impl HostAdminSource for StandaloneAdmin {
                         return Ok(
                             json!({"command":preview.command,"summary":preview.summary,"digest":preview.digest}),
                         );
+                    }
+                    // ADR 0040 §10 / KTD11: paths may aid preview, but may
+                    // not turn an unconfirmed request into permission to run.
+                    if !add.paths.is_empty()
+                        && (add.digest.as_deref().unwrap_or_default().is_empty()
+                            || add.confirm_name.as_deref().unwrap_or_default().is_empty())
+                    {
+                        return Err(Failure {
+                            code: host_admin::CONFIRMATION_REQUIRED.into(),
+                            message:
+                                "extra search directories require a preview digest and typed name"
+                                    .into(),
+                        });
                     }
                     let approval = match (&add.digest, &add.confirm_name) {
                         (Some(digest), Some(typed_name)) => {

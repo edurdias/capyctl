@@ -5,6 +5,7 @@ use capyctl_protocol::{
     pb::{self, agent_control_server::AgentControl, agent_to_server, server_to_agent},
     version,
 };
+use prost::Message;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -673,7 +674,7 @@ struct PendingAdmin {
     session_id: String,
     reply: tokio::sync::oneshot::Sender<pb::HostAdminReply>,
 }
-/// Forgets a host administration request its caller stopped waiting for.
+/// Forgets only the reply wait; a dispatched operation keeps running on the host.
 pub(crate) struct AdminGuard {
     pending: Arc<Mutex<BTreeMap<String, PendingAdmin>>>,
     id: String,
@@ -797,7 +798,8 @@ impl AgentSessions {
     /// ADR 0040 §10, ADR 0017: send one host administration operation to
     /// `host`'s live session, or refuse it without sending anything. The
     /// receiver yields the host's reply; it is closed (never answered) when
-    /// the session ends first. Dropping the guard forgets the request.
+    /// the session ends first. Dropping the guard forgets only the reply wait,
+    /// never an operation already dispatched to the host.
     pub(crate) fn send_host_admin(
         &self,
         host: &str,
@@ -811,12 +813,6 @@ impl AgentSessions {
         crate::host_admin_remote::Refusal,
     > {
         use crate::host_admin_remote::Refusal;
-        // ADR 0017: judged on the live session, or on the latest one recorded.
-        if !self.supports(host, capabilities::HOST_ADMIN) {
-            return Err(Refusal::CapabilityMissing(capabilities::missing(
-                capabilities::HOST_ADMIN,
-            )));
-        }
         let sessions = self
             .sessions
             .lock()
@@ -831,13 +827,15 @@ impl AgentSessions {
         if session.drain_only {
             return Err(Refusal::HostUpgradeRequired);
         }
+        // ADR 0017: capability and dispatch use this same session under one
+        // lock, so reconnect cannot substitute a host that never declared it.
+        if !session.capabilities.contains(capabilities::HOST_ADMIN) {
+            return Err(Refusal::CapabilityMissing(capabilities::missing(
+                capabilities::HOST_ADMIN,
+            )));
+        }
         let outgoing = session.outgoing.as_ref().ok_or(Refusal::ObservationStale)?;
         let id = ulid::Ulid::new().to_string();
-        let (reply, received) = tokio::sync::oneshot::channel();
-        let mut pending = self.admin.lock().map_err(|_| Refusal::ObservationStale)?;
-        if pending.len() >= MAX_PENDING_ADMIN {
-            return Err(Refusal::Busy);
-        }
         let message = pb::ServerToAgent {
             msg: Some(server_to_agent::Msg::HostAdminRequest(
                 pb::HostAdminRequest {
@@ -847,9 +845,20 @@ impl AgentSessions {
                 },
             )),
         };
+        // ADR 0040 §§10–11 / KTD11–12: bound the entire encoded frame, not
+        // just the manifest. A refusal must not tear down the control stream
+        // or discard any model-store references to make a prune fit.
+        if message.encoded_len() > capyctl_protocol::SERVER_MESSAGE_BYTES {
+            return Err(Refusal::RequestTooLarge);
+        }
+        let mut pending = self.admin.lock().map_err(|_| Refusal::ObservationStale)?;
+        if pending.len() >= MAX_PENDING_ADMIN {
+            return Err(Refusal::Busy);
+        }
         if !send_command(outgoing, message) {
             return Err(Refusal::Busy);
         }
+        let (reply, received) = tokio::sync::oneshot::channel();
         pending.insert(
             id.clone(),
             PendingAdmin {

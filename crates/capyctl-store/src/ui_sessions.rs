@@ -78,6 +78,25 @@ impl Store {
         label: &str,
         now_ms: i64,
     ) -> Result<SigninOutcome, StoreError> {
+        // ADR 0040 §5: unknown, spent and expired links never take SQLite's
+        // writer lock. Recheck under IMMEDIATE below for concurrent consumers.
+        let available: Option<(Vec<u8>, i64, Option<i64>)> = self.conn
+            .query_row(
+                "SELECT admin_fingerprint,expires_at_ms,consumed_at_ms FROM ui_signin_links WHERE token_digest=?1",
+                [&link[..]],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        match available {
+            None => return Ok(SigninOutcome::Unknown),
+            Some((_, _, Some(_))) => return Ok(SigninOutcome::Used),
+            Some((fingerprint, expires, _))
+                if fingerprint != admin_fingerprint[..] || now_ms >= expires =>
+            {
+                return Ok(SigninOutcome::Expired);
+            }
+            Some(_) => {}
+        }
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let stored: Option<(Vec<u8>, i64, Option<i64>)> = tx
             .query_row(

@@ -128,11 +128,17 @@ impl HostAdminService {
             }
             Op::AddBuiltin(add) => {
                 let request = self.builtin(add.engine.unwrap_or_default())?;
-                let roots = self.roots_with(add.extra_dirs);
-                // ADR 0040 §10: a previewed digest confirms; otherwise the
-                // add must name a detected candidate.
+                // ADR 0040 §10 / KTD11: request-controlled scan roots never
+                // authorize execution without the preview confirmation.
+                if add.digest.is_empty() && !add.extra_dirs.is_empty() {
+                    return Err(HostAdminError {
+                        code: host_admin::CONFIRMATION_REQUIRED,
+                        message: "extra search directories require a preview digest and typed name"
+                            .into(),
+                    });
+                }
                 let approval = if add.digest.is_empty() {
-                    BuiltinApproval::Detected(&roots)
+                    BuiltinApproval::Detected(&self.roots)
                 } else {
                     BuiltinApproval::Confirmed {
                         digest: &add.digest,

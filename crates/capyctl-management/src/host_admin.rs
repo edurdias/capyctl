@@ -95,7 +95,7 @@ impl Failure {
                 StatusCode::BAD_REQUEST
             }
             "unsupported_media_type" => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "body_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large" | "request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
             "not_found" | "host_not_found" | "profile_not_found" => StatusCode::NOT_FOUND,
             "unsupported_capability" | "host_upgrade_required" => StatusCode::UNPROCESSABLE_ENTITY,
             "observation_stale" | "agent_unreachable" => StatusCode::SERVICE_UNAVAILABLE,
@@ -119,15 +119,27 @@ impl Failure {
     }
 }
 
-async fn execute(source: &dyn HostAdminSource, host: String, operation: Operation) -> Response {
+async fn execute(
+    source: Arc<dyn HostAdminSource>,
+    principal: crate::ui_sessions::Principal,
+    host: String,
+    operation: Operation,
+) -> Response {
     let status = if matches!(&operation, Operation::Remove { .. }) {
         StatusCode::ACCEPTED
     } else {
         StatusCode::OK
     };
-    match source.execute(host, operation).await {
-        Ok(value) => (status, Json(value)).into_response(),
-        Err(failure) => failure.response(),
+    // ADR 0040 §6 / KTD7: revocation ends the wait, not a dispatched operation.
+    let work = tokio::spawn(async move { source.execute(host, operation).await });
+    tokio::select! {
+        biased;
+        _ = principal.revoked() => crate::error(StatusCode::UNAUTHORIZED, "unauthenticated", false),
+        result = work => match result {
+            Ok(Ok(value)) => (status, Json(value)).into_response(),
+            Ok(Err(failure)) => failure.response(),
+            Err(_) => crate::error(StatusCode::INTERNAL_SERVER_ERROR, "internal", false),
+        },
     }
 }
 
@@ -195,6 +207,7 @@ async fn body(request: Request) -> Result<Value, Failure> {
 async fn detect(
     State(source): State<Arc<dyn HostAdminSource>>,
     Path(host): Path<String>,
+    axum::Extension(principal): axum::Extension<crate::ui_sessions::Principal>,
     request: Request,
 ) -> Response {
     let query = Query::<Vec<(String, String)>>::try_from_uri(request.uri());
@@ -216,29 +229,31 @@ async fn detect(
     if !bytes.is_empty() {
         return Failure::invalid().response();
     }
-    execute(source.as_ref(), host, Operation::Detect { paths }).await
+    execute(source, principal, host, Operation::Detect { paths }).await
 }
 
 async fn model_store(
     State(source): State<Arc<dyn HostAdminSource>>,
     Path(host): Path<String>,
+    axum::Extension(principal): axum::Extension<crate::ui_sessions::Principal>,
     request: Request,
 ) -> Response {
     if let Err(failure) = empty(request).await {
         return failure.response();
     }
-    execute(source.as_ref(), host, Operation::ModelStore).await
+    execute(source, principal, host, Operation::ModelStore).await
 }
 
 async fn config(
     State(source): State<Arc<dyn HostAdminSource>>,
     Path(host): Path<String>,
+    axum::Extension(principal): axum::Extension<crate::ui_sessions::Principal>,
     request: Request,
 ) -> Response {
     if let Err(failure) = empty(request).await {
         return failure.response();
     }
-    execute(source.as_ref(), host, Operation::Config).await
+    execute(source, principal, host, Operation::Config).await
 }
 
 fn fields(value: &Value, allowed: &[&str], required: &[&str]) -> bool {
@@ -280,6 +295,7 @@ fn settings(value: &Value) -> bool {
 async fn add(
     State(source): State<Arc<dyn HostAdminSource>>,
     Path(host): Path<String>,
+    axum::Extension(principal): axum::Extension<crate::ui_sessions::Principal>,
     request: Request,
 ) -> Response {
     let value = match body(request).await {
@@ -324,12 +340,13 @@ async fn add(
     {
         return Failure::invalid().response();
     }
-    execute(source.as_ref(), host, Operation::Add(value)).await
+    execute(source, principal, host, Operation::Add(value)).await
 }
 
 async fn remove(
     State(source): State<Arc<dyn HostAdminSource>>,
     Path((host, name)): Path<(String, String)>,
+    axum::Extension(principal): axum::Extension<crate::ui_sessions::Principal>,
     request: Request,
 ) -> Response {
     let value = match body(request).await {
@@ -342,7 +359,8 @@ async fn remove(
         return Failure::invalid().response();
     }
     execute(
-        source.as_ref(),
+        source,
+        principal,
         host,
         Operation::Remove { name, body: value },
     )
@@ -352,6 +370,7 @@ async fn remove(
 async fn prune(
     State(source): State<Arc<dyn HostAdminSource>>,
     Path(host): Path<String>,
+    axum::Extension(principal): axum::Extension<crate::ui_sessions::Principal>,
     request: Request,
 ) -> Response {
     let value = match body(request).await {
@@ -361,7 +380,7 @@ async fn prune(
     if !fields(&value, &["apply"], &["apply"]) || !value["apply"].is_boolean() {
         return Failure::invalid().response();
     }
-    execute(source.as_ref(), host, Operation::Prune(value)).await
+    execute(source, principal, host, Operation::Prune(value)).await
 }
 
 fn custom(value: &Value, confirm: bool) -> Result<(), Failure> {
@@ -402,6 +421,7 @@ fn custom(value: &Value, confirm: bool) -> Result<(), Failure> {
 async fn preview(
     State(source): State<Arc<dyn HostAdminSource>>,
     Path(host): Path<String>,
+    axum::Extension(principal): axum::Extension<crate::ui_sessions::Principal>,
     request: Request,
 ) -> Response {
     let value = match body(request).await {
@@ -411,12 +431,13 @@ async fn preview(
     if let Err(failure) = custom(&value, false) {
         return failure.response();
     }
-    execute(source.as_ref(), host, Operation::Preview(value)).await
+    execute(source, principal, host, Operation::Preview(value)).await
 }
 
 async fn confirm(
     State(source): State<Arc<dyn HostAdminSource>>,
     Path(host): Path<String>,
+    axum::Extension(principal): axum::Extension<crate::ui_sessions::Principal>,
     request: Request,
 ) -> Response {
     let value = match body(request).await {
@@ -426,5 +447,5 @@ async fn confirm(
     if let Err(failure) = custom(&value, true) {
         return failure.response();
     }
-    execute(source.as_ref(), host, Operation::Confirm(value)).await
+    execute(source, principal, host, Operation::Confirm(value)).await
 }

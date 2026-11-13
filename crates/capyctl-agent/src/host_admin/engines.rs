@@ -351,6 +351,14 @@ async fn check_approval(
     match approval {
         BuiltinApproval::Operator => Ok(()),
         BuiltinApproval::Detected(roots) => {
+            // ADR 0040 §10 / KTD11: extra directories are for discovery,
+            // never an execution grant supplied by the remote caller.
+            if !roots.extra.is_empty() {
+                return Err(error(
+                    CONFIRMATION_REQUIRED,
+                    "extra search directories require a preview digest and typed name; nothing was written",
+                ));
+            }
             let named =
                 |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             let wanted = named(&request.path);

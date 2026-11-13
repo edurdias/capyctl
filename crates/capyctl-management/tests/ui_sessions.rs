@@ -15,6 +15,7 @@ use capyctl_management::{
 };
 use capyctl_store::Store;
 use serde_json::Value;
+use std::future::Future;
 use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 use tower::ServiceExt;
 
@@ -584,4 +585,178 @@ async fn rotating_the_admin_token_by_restart_ends_sessions_and_links() {
         .unwrap();
     assert_eq!(response.status(), 401);
     assert!(response.headers().get("set-cookie").is_none());
+}
+
+// ADR 0040 §3 / KTD7 / T16: a local forwarding hop cannot relay the admin token.
+#[tokio::test]
+async fn every_proxy_header_refuses_the_admin_token() {
+    let dir = state_dir();
+    let router = role(dir.path(), ADMIN);
+    for name in [
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-forwarded-anything",
+        "forwarded",
+        "x-real-ip",
+        "via",
+        "cf-connecting-ip",
+        "true-client-ip",
+        "tailscale-user-login",
+        "tailscale-anything",
+    ] {
+        let response = from(&router, LOOPBACK)
+            .oneshot(
+                Request::get("/management/v1/snapshot")
+                    .header("authorization", format!("Bearer {ADMIN}"))
+                    .header(name, "relay")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401, "{name}");
+    }
+}
+
+// ADR 0040 §6 / KTD7 / T16: revocation ends a host-admin wait while the
+// already dispatched host operation retains ownership and finishes.
+#[tokio::test]
+async fn revoked_host_admin_wait_does_not_cancel_the_operation() {
+    use capyctl_management::host_admin::{self, Failure, HostAdminSource, Operation};
+    struct Blocking {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        finished: tokio::sync::Notify,
+    }
+    impl HostAdminSource for Blocking {
+        fn execute(
+            &self,
+            _: String,
+            _: Operation,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<Value, Failure>> + Send + '_>> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                self.finished.notify_one();
+                Ok(serde_json::json!({}))
+            })
+        }
+    }
+    let verifier = SessionVerifier::open(
+        ManagementCredentials::from_trusted_resolver(ADMIN, INFERENCE).unwrap(),
+        Store::open_in_memory().unwrap(),
+    )
+    .unwrap();
+    let source = Arc::new(Blocking {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        finished: tokio::sync::Notify::new(),
+    });
+    let router = compose(verifier, Some(PUBLIC), [host_admin::router(source.clone())]);
+    let session = sign_in(&router, ADMIN).await;
+    let pending = tokio::spawn(
+        from(&router, REMOTE).oneshot(
+            browser("GET", "/management/v1/hosts/host/config", &session.token)
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    );
+    source.entered.notified().await;
+    let revoked = from(&router, LOOPBACK)
+        .oneshot(
+            Request::post(format!("/management/v1/ui/sessions/{}/revoke", session.id))
+                .header("authorization", format!("Bearer {ADMIN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), 200);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    source.release.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        source.finished.notified(),
+    )
+    .await
+    .unwrap();
+}
+
+// ADR 0040 §6 / KTD7 / T16: revocation interrupts even the first store read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revocation_interrupts_blocked_initial_event_read() {
+    use capyctl_management::{
+        events::{EventSource, EventStreamOptions},
+        read_only_router_with_event_options, SnapshotSource, SnapshotUnavailable,
+    };
+    use capyctl_store::events::{EventPage, EventReadError};
+    struct Blocked {
+        entered: tokio::sync::Notify,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl SnapshotSource for Blocked {
+        fn snapshot(&self) -> Result<capyctl_store::snapshot::Snapshot, SnapshotUnavailable> {
+            Err(SnapshotUnavailable)
+        }
+    }
+    impl EventSource for Blocked {
+        fn events_after(&self, _: Option<&str>, _: usize) -> Result<EventPage, EventReadError> {
+            self.entered.notify_one();
+            self.release.lock().unwrap().recv().unwrap();
+            Ok(EventPage {
+                events: vec![],
+                high_water: capyctl_store::events::EventCursor {
+                    incarnation: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                    sequence: 0,
+                },
+            })
+        }
+    }
+    let (release, receiver) = std::sync::mpsc::channel();
+    let source = Arc::new(Blocked {
+        entered: tokio::sync::Notify::new(),
+        release: std::sync::Mutex::new(receiver),
+    });
+    let verifier = SessionVerifier::open(
+        ManagementCredentials::from_trusted_resolver(ADMIN, INFERENCE).unwrap(),
+        Store::open_in_memory().unwrap(),
+    )
+    .unwrap();
+    let router = compose(
+        verifier,
+        Some(PUBLIC),
+        [
+            read_only_router_with_event_options(source.clone(), EventStreamOptions::default())
+                .unwrap(),
+        ],
+    );
+    let session = sign_in(&router, ADMIN).await;
+    let pending = tokio::spawn(
+        from(&router, REMOTE).oneshot(
+            browser("GET", "/management/v1/events", &session.token)
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    );
+    source.entered.notified().await;
+    let response = from(&router, LOOPBACK)
+        .oneshot(
+            Request::post(format!("/management/v1/ui/sessions/{}/revoke", session.id))
+                .header("authorization", format!("Bearer {ADMIN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), pending).await;
+    // Always release the blocking worker, including on a regression failure.
+    release.send(()).unwrap();
+    assert_eq!(result.unwrap().unwrap().unwrap().status(), 401);
 }
