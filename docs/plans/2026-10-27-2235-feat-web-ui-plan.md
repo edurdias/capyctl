@@ -779,7 +779,7 @@ Considered and not built:
   - A host without the capability is refused `host_capability_missing:host_admin`, and no message is sent to it.
   - A disconnected host is refused `observation_stale` without waiting for the deadline.
   - A session lost while a request is outstanding answers `outcome_unknown`.
-  - A remove answers 202, and the host's engine shows `retiring` until it is gone.
+  - A remove shows the host's engine `retiring` while the request is outstanding and answers 202 once the removal is published (removing an engine in use is refused, so retirement is short). *(Amended 2026-11-13.)*
   - While a long add runs, the host keeps publishing load reports, so its session loop is not blocked.
   - A custom engine confirmed through the server is pinned on the host. A stale digest is refused (KTD12).
 - **Verification:** the harness tests pass.
