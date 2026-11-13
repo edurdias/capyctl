@@ -376,6 +376,33 @@ Conformance tests added with the implementation (tests cite ADR 0040):
    history, a minimal chat-only playground, and a rich playground.
 9. **Desktop and phone are both targets.** Rejected: desktop-only and full parity on a phone.
 10. **A classic sidebar layout.** Rejected: a model-cards-first home and a memory-map-first
-    home.
+    home. *Amended by owner decision 2026-11-13, below.*
 11. **Adding a model uses a guided form with a YAML view.** Rejected: a form only and a YAML
     editor only.
+
+## Owner decision of 2026-11-13: the screens are redone
+
+A design review of the first build (2026-11-12, against the screens running on a fake role,
+with sparkDash as the reference) found the data and action layer sound and the screens
+weak: the Overview led with no answer, dropped the live readings the role already serves
+(KV cache fill, queue, time to first token, time per output token, reserved memory per
+model, failure reasons, download progress), showed every action as a button whatever the
+state, and used one orange for brand, links, state and errors. The owner chose to redo the
+screens on the review's recommendations, keeping `web/src/lib/` and every server contract
+in this ADR. That amends decision 10 and plan R10, R34, R35 and U14:
+
+- **Navigation stays a sidebar on desktop; the home is cards.** The Overview leads with a
+  one-line status, then one card per host with a memory bar segmented per model (parked
+  models hatched), then one card per model with its engine, state, reserved memory and live
+  readings. Decision 10's rejection of a cards-first home is withdrawn.
+- **On a phone, a docked tab bar** (Overview, Models, Playground, More) replaces the
+  collapsed menu.
+- **One primary action per state, the rest in a menu.** An unavailable action is shown in
+  the menu with its reason as text, so a reason is still visible without a tooltip.
+- **State has its own colours** (ready, starting, stopping or parking, parked or stopped,
+  failed), separate from the brand orange, which keeps brand, links, the primary button and
+  focus. Danger red was already an exception to the stone-and-orange palette.
+
+Telemetry the role does not serve yet (token counters for true throughput, GPU utilisation,
+temperature and power, a server-side history for trend lines) is out of this decision; the
+screens keep a short client-side history over the existing 5-second reads.

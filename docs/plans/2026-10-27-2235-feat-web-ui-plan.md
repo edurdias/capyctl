@@ -49,7 +49,7 @@ The groundwork is already in place. The F2 design defined a versioned snapshot, 
 - **Custom engines can be added and changed from any signed-in session.** (session-settled: user-directed — chosen over loopback-only sessions and CLI-only: full parity.) This reverses ADR 0031's owner decision of 2026-10-20 that `engine add --custom` confirms on a terminal on the box. Accepted risk: anyone holding a session who can reach the bind address can run any program as the CapyCTL user, so Tailscale ACLs or the LAN are the only boundary. Governs R25.
 - **The playground keeps conversation history only in the browser.** (session-settled: user-directed — chosen over no history, a minimal chat-only playground, and a rich playground: survives a reload without breaking the promise in `docs/operations/data-retention.md`.) Governs R29–R33.
 - **Desktop and phone are both targets.** (session-settled: user-directed — chosen over desktop-only and full parity on a phone: watching and quick actions from a phone over Tailscale.) Governs R36.
-- **A classic sidebar layout.** (session-settled: user-directed — chosen over a model-cards-first home and a memory-map-first home, shown as sketches.) Governs R35.
+- **A classic sidebar layout.** (session-settled: user-directed — chosen over a model-cards-first home and a memory-map-first home, shown as sketches.) Governs R35. *Amended by owner decision 2026-11-13 (ADR 0040): the sidebar stays for navigation on desktop, the Overview is cards (host memory segmented per model, then model cards), and a phone gets a docked tab bar. Governs U20.*
 - **Adding a model uses a guided form with a YAML view.** (session-settled: user-directed — chosen over a form only and a YAML editor only: easy by default, with the CLI's own file format visible.) Governs R20–R22.
 - **The UI is built into the role and goes through the API.** It is served by the role's own binary. Every capability lands first in the management API, so the CLI can use it as well. A separately installed companion app was rejected as a second install and a version-skew surface. A UI that reaches engines or the store directly was rejected because it breaks SPEC §14 and the F2 design's "not permission to invent a separate UI control path". Governs R1, R4.
 - **The playground goes through CapyCTL's router, authorized by the browser session.** The inference key never reaches a browser, and inference authentication for apps stays as it is. Governs R33.
@@ -73,7 +73,7 @@ The groundwork is already in place. The F2 design defined a versioned snapshot, 
 
 **Watch**
 
-- R10. The Overview shows, per host, its health and the GPU memory and host RAM in use. Per model it shows the state (ready, parked, stopped, starting or failed, and the transitions between them), plus requests in flight and recent activity.
+- R10. The Overview leads with a one-line status (hosts online, memory free, models by state, requests in flight). Per host it shows its health and its memory in use, split by the model holding it (parked models marked). Per model it shows its engine, state (ready, parked, stopped, starting or failed, and the transitions between them), reserved memory, the live readings the role serves (requests in flight and waiting, KV cache fill, time to first token, time per output token), why it failed when it did, and recent activity from history. *(Amended 2026-11-13.)*
 - R11. The UI updates live from the event stream. After a disconnect it resumes from its cursor, or reloads the snapshot when the cursor has expired, and never starts or repeats an operation by reconnecting.
 - R12. A model's page shows its instances and their hosts, its parking residency, load, latency (separating CapyCTL's timings from the engine's), effective configuration and the redacted end of its engine log.
 - R13. A host's page shows its GPUs, memory, installed engines and the models placed on it.
@@ -109,8 +109,8 @@ The groundwork is already in place. The F2 design defined a versioned snapshot, 
 
 **Look and devices**
 
-- R34. The UI uses the CapyCTL brand: the logos and mascot in `docs/brand/` and the palette in `site/src/styles/tokens.css`, with dark and light themes that follow the system setting.
-- R35. The layout is a left sidebar with Overview, Models, Hosts, Engines, Playground, Activity and Settings. On narrow screens the sidebar collapses into a menu.
+- R34. The UI uses the CapyCTL brand: the logos and mascot in `docs/brand/` and the palette in `site/src/styles/tokens.css`, with dark and light themes that follow the system setting. State has its own colours beside the palette (ready, starting, stopping or parking, parked or stopped, failed); brand orange keeps brand, links, the primary button and focus. *(Amended 2026-11-13.)*
+- R35. On desktop, a left sidebar with Overview, Models, Hosts, Engines, Playground, Activity and Settings. On a phone, a docked tab bar with Overview, Models, Playground and More. *(Amended 2026-11-13.)*
 - R36. On a phone, the Overview, model actions and the playground are fully usable. The setup flows (R20–R28) work on a phone but are designed desktop-first.
 
 ```mermaid
@@ -516,6 +516,7 @@ Considered and not built:
 | U17 | Playground UI | `web/src/routes/playground` | U10, U12 |
 | U18 | Settings | `web/src/routes/settings` | U4, U12 |
 | U19 | Documentation and change file | `docs/operations/`, `docs/guide/web-ui.md`, `docs/changes/web-ui.md` | all |
+| U20 | Screens redone (owner decision 2026-11-13) | `web/src/routes/`, `web/src/components/`, `web/src/styles/` | U13–U18 |
 
 ### U1. ADR 0040 and amendment notes
 
@@ -905,7 +906,7 @@ Considered and not built:
 - **Dependencies:** U6, U13.
 - **Files:** `web/src/routes/models/`, `web/src/routes/hosts/`, `web/src/components/` (action bar, confirm dialog), tests in `web/tests/`.
 - **Approach:**
-  - Buttons follow the hints: an unavailable action shows disabled, with its reason as visible text rather than only a tooltip. Delete under `delete_requires_cleanup` reads "Stop and delete" (KTD16).
+  - Actions follow the hints: one primary action per state, the rest in a menu; an unavailable action appears in the menu with its reason as visible text, not only a tooltip (amended by U20). Delete under `delete_requires_cleanup` reads "Stop and delete" (KTD16).
   - Delete, Drain and Revoke require confirmation.
   - KTD16's composites, retries and lost-response handling apply.
 - **Test scenarios:**
@@ -1017,6 +1018,23 @@ Considered and not built:
   - The release note goes under the section for new features.
 - **Test expectation:** none, documentation only. `scripts/test-assemble-changes.sh` covers the change file format.
 - **Verification:** the docs build in `site/` passes (`npm run check`), and the change file assembles.
+
+### U20. Screens redone (owner decision 2026-11-13)
+
+- **Goal:** Replace the first build's screens with ones that answer the operator's questions at a glance, on the same `web/src/lib/` and server contracts.
+- **Requirements:** R10, R12, R16, R34, R35, R36 as amended 2026-11-13; ADR 0040 owner decision of 2026-11-13.
+- **Dependencies:** U13–U18 (their `lib/` code and tests stay; their routes and components are rewritten).
+- **Files:** `web/src/routes/`, `web/src/components/`, `web/src/styles/`, tests in `web/tests/`.
+- **Approach, in order:**
+  1. Visual system: state colours separate from brand orange, a type scale with large tabular numerals and small uppercase labels, styled inputs, selects and text areas, sidebar icons with counts.
+  2. Overview: the status line; host cards with a memory bar segmented per model from `startup` and `parked` reservations (parked hatched); model cards (dense rows on desktop) with engine, state (elapsed time while transitioning, download progress from `model_sources`), reserved memory, and in flight, waiting, KV %, TTFT p50 and per-stream tok/s derived from TPOT p50 (labelled as derived); recent activity from history, not only since the page opened.
+  3. Actions: one primary per state (ready: Park; parked: Start; stopped: Start; failed: Start and "Why?"), the rest in a menu with reasons; busy state on the card; confirmations unchanged.
+  4. Model page: a header with engine, host, context, reserved memory and actions; a "Why" panel from `latest_operation`, `last_error` and `conditions` with the engine log tail; metric tiles with short trend lines from a client-side history of the 5-second reads; latency in humanised units; configuration and log as collapsible sections; no instance actions repeating the deployment's for a single instance.
+  5. Phone: the docked tab bar; one action per model card; label spacing fixed.
+  6. Engines: a table per host (profile, engine, version, models using it, menu with Remove); detection behind a button; the custom engine in a dialog keeping the preview and type-to-confirm flow.
+- **Not in scope:** token counters, GPU telemetry and server-side history; the role does not serve them yet.
+- **Test scenarios:** the U13–U18 scenarios that describe behaviour still pass, rewritten where they asserted markup; the primary action per state; an unavailable action's reason in the menu; segments per model sum to the reserved bytes and parked ones are marked; a failed model shows its reason; the phone layout keeps labels and values apart; recent activity is filled from history on first load.
+- **Verification:** `npm run lint`, `npm run check`, `npm test` and `npm run build` in `web/`; the screens checked in a browser at desktop and phone sizes against a fake role.
 
 ---
 
