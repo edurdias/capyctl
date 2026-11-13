@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import ConfirmDialog from '../../components/ConfirmDialog.svelte';
   import Refusal from '../../components/Refusal.svelte';
-  import { ApiError, signedOut } from '../../lib/api';
+  import { ApiError, request, signedOut } from '../../lib/api';
   import { BUILD_ASSETS } from '../../lib/endpoints';
   import { listSessions, revokeAllSessions, revokeSession, signOut, type UiSession } from '../../lib/sessions';
 
@@ -13,6 +13,7 @@
   let busy = $state(false);
   let confirmingAll = $state(false);
   let commit = $state<string | null>(null);
+  let roleVersion = $state<string | null>(null);
 
   function failed(caught: unknown): void {
     error =
@@ -49,9 +50,20 @@
     }
   }
 
+  async function loadRoleVersion(): Promise<void> {
+    try {
+      // U18: the hosts inventory exposes the role's actual running version.
+      const inventory = await request<{ server_version?: string }>('/management/v1/hosts');
+      roleVersion = inventory.server_version ?? null;
+    } catch {
+      // Session and build information remain useful when inventory is unavailable.
+    }
+  }
+
   onMount(() => {
     void load();
     void loadCommit();
+    void loadRoleVersion();
   });
 
   async function act(run: () => Promise<void>): Promise<void> {
@@ -143,7 +155,8 @@
 
   <h2>About</h2>
   <p>
-    {#if commit}Built from commit <code>{commit.slice(0, 12)}</code>.{:else}Build information is not available.{/if}
+    {#if commit}Version (build commit) <code>{commit.slice(0, 12)}</code>.{:else}Version information is not available.{/if}
+    {#if roleVersion}Running role version <code>{roleVersion}</code>.{/if}
     <a href={BUILD_ASSETS.licenses} target="_blank" rel="noopener">Third-party licenses</a>
   </p>
 </section>

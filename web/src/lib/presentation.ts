@@ -1,5 +1,5 @@
 import type { DeploymentSnapshot, HintedAction, ObservedState } from './types';
-import type { EngineRow, LatencySeries, LoadDeployment, MemoryDomain } from './reads';
+import type { EngineRow, LatencyReport, LatencySeries, LoadDeployment, MemoryDomain } from './reads';
 
 // ADR 0040, owner decision 2026-11-13: display-only calculations; the role
 // remains the authority for actions, reservations and readings.
@@ -32,10 +32,16 @@ export function memorySegments(deployments: DeploymentSnapshot[], host: string, 
     let bytes = 0;
     for (const i of d.instances) {
       if (i.host_id !== host || ['stopped', 'failed'].includes(i.observed_state) || (i.observed_state === 'parked') !== parked) continue;
+      // ADR 0019 / SPEC R10: a device budget belongs only to the
+      // instance's assigned GPUs, split evenly across that assignment.
+      const devices = Array.isArray(i.devices) ? i.devices.flatMap((device) =>
+        typeof device === 'string' ? [device] : device && typeof device.id === 'string' ? [device.id] : []) : [];
+      if (domain.kind === 'device' && !devices.includes(domain.device_id ?? domain.domain_id)) continue;
       const measured = parked ? d.parked?.measured?.find((m) => m.host_id === host && m.domain === domain.domain_id) : undefined;
       const startup = i.startup ?? d.startup;
-      bytes += parked ? measured?.bytes ?? (domain.kind === 'device' ? 0 : d.parked?.bytes ?? 0)
-        : domain.kind === 'device' ? startup?.device_bytes ?? startup?.bytes ?? 0
+      // A total parked reservation is not evidence of residence in RAM.
+      bytes += parked ? measured?.bytes ?? (domain.kind === 'unified' ? d.parked?.bytes ?? 0 : 0)
+        : domain.kind === 'device' ? (startup?.device_bytes ?? startup?.bytes ?? 0) / devices.length
         : domain.kind === 'host' ? startup?.host_bytes ?? (startup?.device_bytes ? 0 : startup?.bytes) ?? 0
         : startup?.bytes ?? 0;
     }
@@ -45,6 +51,14 @@ export function memorySegments(deployments: DeploymentSnapshot[], host: string, 
 export function kvPercent(load: LoadDeployment | null | undefined): number | null {
   const samples = (load?.instances ?? []).flatMap((i) => i.sample?.fresh && i.sample.engine?.kv_usage_ppm != null ? [i.sample.engine.kv_usage_ppm] : []);
   return samples.length ? samples.reduce((a, b) => a + b, 0) / samples.length / 10000 : null;
+}
+export function currentSeries(report: LatencyReport, deployment: DeploymentSnapshot): LatencySeries[] {
+  // SPEC §17 / R13: retained histograms from another launch are not current.
+  return report.deployments.find((d) => d.deployment_id === deployment.id)?.instances
+    .filter((scope) => scope.generation != null
+      && deployment.instances.some((i) => (scope.instance === null || i.index === scope.instance)
+        && i.generation != null && i.generation === String(scope.generation)))
+    .flatMap((scope) => scope.series) ?? [];
 }
 export function timing(series: LatencySeries[], metric: 'ttft' | 'tpot' | 'request'): LatencySeries | undefined {
   // SPEC §17: use the role's canonical histogram names (timing.rs and

@@ -1,58 +1,59 @@
+/// <reference types="node" />
 // ADR 0040 (plan KTD15, U12): refusal and state wording.
+import { readdirSync, readFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { parseError } from '../src/lib/api';
 import type { ObservedState } from '../src/lib/types';
 import { describeRefusal, MANAGEMENT_REFUSALS, ROUTER_REFUSALS, STATE_WORDS, stateWord } from '../src/lib/vocabulary';
 
-// Every code the management envelope carries
-// (crates/capyctl-management/src), plus KTD5's origin_refused.
-const MANAGEMENT_CODES = [
-  'unauthenticated',
-  'origin_refused',
-  'invalid_request',
-  'unsupported_media_type',
-  'identity_conflict',
-  'host_not_revoked',
-  'queue_full',
-  'not_found',
-  'method_not_allowed',
-  'internal',
-  'invalid_cursor',
-  'cursor_expired',
-  'invalid_config',
-  'body_too_large',
-  'deadline_exceeded',
-  'unsupported_capability',
-  'revision_conflict',
-  'idempotency_conflict',
-  'route_conflict',
-  'runtime_retained',
-  'delete_requires_cleanup',
-  'reconciliation_required',
-  'checkpoint_digest_pending',
-  'checkpoint_mismatch',
-  'checkpoint_unusable',
-  'model_source_pending',
-  'model_source_failed',
-  'host_policy_denied',
-  'capacity_blocked',
-  'host_ineligible',
-  'profile_not_published',
-  'startup_requires_empty_host',
-  'switch_failed',
-  'still_stopping',
-  'lifecycle_conflict',
-  'host_not_found',
-  'forbidden',
-  'observation_stale',
-  'snapshot_unavailable',
-  // ADR 0040 §§10, 11: host administration (crates/capyctl-agent/src/host_admin.rs).
+// Read Rust directly: these files are outside Vite's web-root allowlist.
+function rustSources(directory: URL): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = new URL(entry.name + (entry.isDirectory() ? '/' : ''), directory);
+    if (entry.isDirectory()) return rustSources(path);
+    return entry.isFile() && entry.name.endsWith('.rs') ? [readFileSync(path, 'utf8')] : [];
+  });
+}
+
+const sourceRoot = pathToFileURL(`${process.cwd()}/../crates/`);
+const agentSourceDirectory = new URL('capyctl-agent/src/', sourceRoot);
+const managementSources = [
+  ...rustSources(new URL('capyctl-management/src/', sourceRoot)),
+  ...rustSources(new URL('host_admin/', agentSourceDirectory)),
+  ...readdirSync(agentSourceDirectory, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && /^host_admin.*\.rs$/.test(entry.name))
+    .map((entry) => readFileSync(new URL(entry.name, agentSourceDirectory), 'utf8')),
+];
+
+function managementCodes(sources: string[]): string[] {
+  const codes = new Set<string>();
+  const patterns = [
+    /StatusCode::[A-Z_]+\s*,\s*"([a-z][a-z_:]+)"/g,
+    /(?:"code"|\bcode)\s*:\s*"([a-z][a-z_:]+)"/g,
+    /\b(?:error|refusal)\(\s*"([a-z][a-z_:]+)"/g,
+    // Host-admin wire error constants; unrelated string constants do not match.
+    /\bconst\s+(?:CONFIRMATION_\w+|DEADLINE_EXCEEDED|HOST_ADMIN_BUSY|REPLY_TOO_LARGE)\s*:\s*&str\s*=\s*"([a-z][a-z_:]+)"/g,
+    // The host-admin closed-code conversion passes through these wire codes.
+    /"([a-z][a-z_:]+)"\s*=>\s*"\1"/g,
+  ];
+  for (const source of sources) {
+    const production = source.split('#[cfg(test)]')[0];
+    for (const pattern of patterns) {
+      for (const match of production.matchAll(pattern)) codes.add(match[1]);
+    }
+  }
+  return [...codes].sort();
+}
+
+// These codes arrive through typed controller failures, not literal management
+// constructors. Keep this small boundary explicit rather than duplicating all codes.
+const MANAGEMENT_CODES = [...new Set([
+  ...managementCodes(managementSources),
   'host_capability_missing:host_admin',
   'host_upgrade_required',
   'outcome_unknown',
-  'confirmation_stale',
-  'agent_unreachable',
-];
+])].sort();
 
 // Every code the router envelope carries (crates/capyctl-router/src/chat.rs).
 const ROUTER_CODES = [
@@ -97,9 +98,48 @@ describe('refusal vocabulary', () => {
     expect(text.action).toBeTruthy();
   });
 
-  it('lists exactly the codes the server sends', () => {
-    expect(Object.keys(MANAGEMENT_REFUSALS).sort()).toEqual([...MANAGEMENT_CODES].sort());
+  it('covers the Rust management and host-admin error constructors', () => {
+    expect(managementSources.length).toBeGreaterThan(0);
+    expect(MANAGEMENT_REFUSALS).toHaveProperty('shutting_down');
+    expect(MANAGEMENT_CODES).toContain('profile_exists');
+    for (const code of MANAGEMENT_CODES) expect(MANAGEMENT_REFUSALS).toHaveProperty(code);
     expect(Object.keys(ROUTER_REFUSALS).sort()).toEqual([...ROUTER_CODES].sort());
+  });
+
+  it('extracts error codes without treating unrelated Rust strings as refusals', () => {
+    expect(managementCodes([`
+      let engine = "not_a_refusal";
+      let details = json!({"name": "another_unrelated_value"});
+      error(StatusCode::CONFLICT, "profile_in_use", false);
+      error("engine_unsupported", "explanation");
+      Failure { code: "observation_stale".into(), message: "details".into() };
+      json!({"code": "invalid_config"});
+      pub const CONFIRMATION_STALE: &str = "confirmation_stale";
+      pub const OTHER: &str = "not_an_error";
+      #[cfg(test)]
+      fn test_only() { error("test_only_code", "details"); }
+    `])).toEqual([
+      'confirmation_stale', 'engine_unsupported', 'invalid_config',
+      'observation_stale', 'profile_in_use',
+    ]);
+  });
+
+  it.each([
+    'shutting_down', 'profile_in_use', 'profile_exists', 'publish_rejected',
+    'confirmation_required', 'custom_manifest_invalid', 'engine_unsupported',
+    'host_admin_busy', 'reply_too_large', 'host_upgrade_required',
+    'observation_stale', 'outcome_unknown', 'confirmation_stale',
+  ])('provides plain reasons and actions for host-admin code %s', (code) => {
+    expect(MANAGEMENT_REFUSALS[code]?.reason).toBeTruthy();
+    expect(MANAGEMENT_REFUSALS[code]?.action).toBeTruthy();
+  });
+
+  it('does not promise that retrying a timed-out host change is safe', () => {
+    const { reason, action } = MANAGEMENT_REFUSALS.deadline_exceeded;
+    expect(reason).toContain('did not answer');
+    expect(action).toContain('may already have happened');
+    expect(action).toContain('Check the current state');
+    expect(action).not.toMatch(/does not repeat|safe.*retry|retry safely/i);
   });
 
   it('falls back to the server message for an unknown code in either envelope', () => {

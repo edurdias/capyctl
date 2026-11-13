@@ -18,6 +18,8 @@ export class ApiError extends Error {
   readonly operationId: string | null;
   readonly details: Record<string, unknown>;
   readonly envelope: Envelope;
+  // C1: check refusals carry parser errors beside the management envelope.
+  readonly body: unknown;
 
   constructor(init: {
     status: number;
@@ -27,6 +29,7 @@ export class ApiError extends Error {
     operationId: string | null;
     details: Record<string, unknown>;
     envelope: Envelope;
+    body?: unknown;
   }) {
     super(init.message);
     this.name = 'ApiError';
@@ -36,6 +39,7 @@ export class ApiError extends Error {
     this.operationId = init.operationId;
     this.details = init.details;
     this.envelope = init.envelope;
+    this.body = init.body;
   }
 }
 
@@ -54,6 +58,7 @@ export function parseError(status: number, body: unknown): ApiError {
       operationId: typeof error.operation_id === 'string' ? error.operation_id : null,
       details: isRecord(error.details) ? error.details : {},
       envelope: 'management',
+      body,
     });
   }
   if (isRecord(body) && typeof body.code === 'string') {
@@ -65,6 +70,7 @@ export function parseError(status: number, body: unknown): ApiError {
       operationId: null,
       details: {},
       envelope: 'router',
+      body,
     });
   }
   return new ApiError({
@@ -75,6 +81,7 @@ export function parseError(status: number, body: unknown): ApiError {
     operationId: null,
     details: {},
     envelope: 'none',
+    body,
   });
 }
 

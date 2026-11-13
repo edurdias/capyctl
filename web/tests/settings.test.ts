@@ -16,6 +16,12 @@ function sessionsRole() {
   return role({
     snapshots: [snapshotWith([])],
     route: (call) => {
+      if (call.url === '/ui/BUILD_COMMIT') {
+        return new Response('0123456789abcdef0123456789abcdef01234567\n');
+      }
+      if (call.url === '/management/v1/hosts') {
+        return json({ api_version: '1', server_version: '0.1.9', hosts: [] });
+      }
       if (call.url === '/management/v1/ui/sessions' && call.method === 'GET') {
         return json({ api_version: '1', sessions: SESSIONS });
       }
@@ -38,6 +44,15 @@ function rows(): string[] {
 }
 
 describe('settings', () => {
+  // T16 / U18: use the packaged build asset, not the SPA fallback.
+  it('shows the packaged build version', async () => {
+    sessionsRole();
+    await open('/settings');
+    expect(document.body.textContent).toContain('Version (build commit)');
+    expect(document.body.textContent).toContain('0123456789ab');
+    expect(document.body.textContent).toContain('Running role version 0.1.9');
+  });
+
   it('marks this device and removes a revoked session’s row', async () => {
     const server = sessionsRole();
     await open('/settings');

@@ -2,7 +2,7 @@
   import { href, link } from '../lib/router';
   import { hostHealth, type HostRow } from '../lib/reads';
   import { snapshot } from '../lib/state';
-  import { gib, memorySegments } from '../lib/presentation';
+  import { gib, memorySegments, relative } from '../lib/presentation';
   let { host }: { host: HostRow } = $props();
   const domains = $derived((host.session?.domains ?? []).filter((d) => d.capacity_bytes > 0 && d.available_bytes >= 0));
   const warnings = $derived(host.session?.memory_warnings ?? []);
@@ -17,7 +17,8 @@
     {@const scale = Math.max(domain.capacity_bytes, reserved)}
     {@const other = Math.max(0, used - reserved)}
     <div class="memory">
-      <div class="fact"><span class="muted">{domain.kind === 'device' ? `GPU ${domain.device_id ?? domain.domain_id}` : domain.kind === 'unified' ? 'Unified memory' : 'Host RAM'}</span><span>{gib(domain.available_bytes)} free</span></div>
+      <!-- SPEC R10, R15: retained observations never promise currently free memory. -->
+      <div class="fact"><span class="muted">{domain.kind === 'device' ? `GPU ${domain.device_id ?? domain.domain_id}` : domain.kind === 'unified' ? 'Unified memory' : 'Host RAM'}</span><span>{gib(domain.available_bytes)} available at last reading{domain.observed_at_unix_ms != null ? ` · ${relative(domain.observed_at_unix_ms)} ago` : domain.observed_at_unix != null ? ` · ${relative(domain.observed_at_unix * 1000)} ago` : ''}</span></div>
       <div class="bar" role="meter" aria-label={domain.kind === 'device' ? `GPU ${domain.device_id ?? domain.domain_id}` : domain.kind === 'unified' ? 'Unified memory' : 'Host RAM'} aria-valuemin={0} aria-valuemax={domain.capacity_bytes} aria-valuenow={used} aria-valuetext={`${(used / 1024 ** 3).toFixed(1)} of ${(domain.capacity_bytes / 1024 ** 3).toFixed(1)} GiB`}>
         {#each segments as segment (segment.id)}<span class="segment" class:parked={segment.parked} data-model-segment={segment.name} data-bytes={segment.bytes} style:width={`${segment.bytes / scale * 100}%`} style:--segment-colour={`var(--memory-${segment.colour})`} title={`${segment.name}: ${gib(segment.bytes)}${segment.parked ? ' parked' : ''}`}></span>{/each}
         <span class="other" style:width={`${Math.min(other, Math.max(0, scale - reserved)) / scale * 100}%`}></span>
@@ -27,7 +28,7 @@
         {#if other > 0}<span><i class="other"></i>Other use <strong>{gib(other)}</strong></span>{/if}
         <span class="muted">{gib(domain.capacity_bytes)} total</span>
       </div>
-      {#if reserved > domain.capacity_bytes}<p class="warning">Reservations exceed this domain's capacity.</p>{/if}
+      {#if reserved > domain.capacity_bytes}<p class="warning">Models need more memory than this {domain.kind === 'device' ? 'GPU' : 'host'} has.</p>{/if}
     </div>
   {/each}
   {#if warnings.length > 0}

@@ -3,7 +3,6 @@
 
 // ADR 0040 §6: browser sessions.
 export const SESSIONS = {
-  current: '/management/v1/ui/session',
   list: '/management/v1/ui/sessions',
   revoke: (id: string) => `/management/v1/ui/sessions/${encodeURIComponent(id)}/revoke`,
   revokeAll: '/management/v1/ui/sessions/revoke-all',

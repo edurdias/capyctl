@@ -1,4 +1,5 @@
 import { ApiError, request } from './api';
+import { DEPLOYMENTS } from './setup-endpoints';
 
 // Wire shapes of the management reads the watch views use (SPEC R10, R12,
 // R13). Each one names the handler that writes it.
@@ -11,10 +12,13 @@ export interface MemoryDomain {
   capacity_bytes: number;
   available_bytes: number;
   device_id?: string;
+  observed_at_unix_ms?: number;
+  observed_at_unix?: number;
 }
 
 export interface HostSession {
   online?: boolean;
+  unresponsive?: boolean;
   drain_pending?: boolean;
   domains?: MemoryDomain[];
   memory_warnings?: string[];
@@ -83,7 +87,7 @@ export interface LatencySeries {
 export interface LatencyReport {
   deployments: {
     deployment_id: string;
-    instances: { instance: number | null; host_id: string | null; engine: string | null; series: LatencySeries[] }[];
+    instances: { instance: number | null; generation?: number | null; host_id: string | null; engine: string | null; series: LatencySeries[] }[];
   }[];
 }
 
@@ -110,6 +114,9 @@ export function hostHealth(host: HostRow): string {
   }
   if (!host.online) {
     return 'offline';
+  }
+  if (host.session?.unresponsive) {
+    return 'unresponsive';
   }
   if (host.session?.drain_pending) {
     return 'draining';
@@ -138,7 +145,7 @@ export function readLatency(deployment: string): Promise<LatencyReport> {
 }
 
 export function readEffectiveConfig(deployment: string): Promise<EffectiveConfig> {
-  return request<EffectiveConfig>(`/management/v1/deployments/${encodeURIComponent(deployment)}/effective-config`);
+  return request<EffectiveConfig>(DEPLOYMENTS.effectiveConfig(deployment));
 }
 
 export function readEngineLog(deployment: string, instance: number, kib = 64): Promise<EngineLog> {

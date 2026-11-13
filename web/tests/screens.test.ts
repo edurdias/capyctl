@@ -37,8 +37,9 @@ describe('U20 model action grammar', () => {
 describe('U20 Overview', () => {
   it('shows reservations per model and marks parked memory, without counting stopped models', async () => {
     role({ snapshots: [snapshotWith([
-      deployment({ name: 'active', startup: { bytes: 16 * GiB, provenance: 'declared', device_bytes: 12 * GiB, host_bytes: 4 * GiB } }),
-      deployment({ id: 'park', name: 'sleeping', observed_state: 'parked', parked: { bytes: 8 * GiB, provenance: 'measured' }, instances: [instance(0, 'parked')] }),
+      // SPEC R10 / ADR 0019: device residence needs assignment and domain evidence.
+      deployment({ name: 'active', startup: { bytes: 16 * GiB, provenance: 'declared', device_bytes: 12 * GiB, host_bytes: 4 * GiB }, instances: [{ ...instance(0, 'ready'), devices: [{ id: 'GPU-0' }] }] }),
+      deployment({ id: 'park', name: 'sleeping', observed_state: 'parked', parked: { bytes: 8 * GiB, provenance: 'measured', measured: [{ host_id: 'gpu-box', installation: 'engine', domain: 'gpu0', bytes: 8 * GiB, measured_at_ms: 1 }] }, instances: [{ ...instance(0, 'parked'), devices: [{ id: 'GPU-0' }] }] }),
       deployment({ id: 'off', name: 'off', observed_state: 'stopped', startup: { bytes: GiB, provenance: 'declared' }, instances: [instance(0, 'stopped')] }),
     ])] });
     await open('/');
@@ -63,6 +64,18 @@ describe('U20 Overview', () => {
     expect(block.querySelector('summary')?.textContent).toContain('2 memory warnings');
     expect([...block.querySelectorAll('li')].map((li) => li.textContent)).toEqual(warnings);
     expect(document.querySelector('.host .chip.warning')).toBeNull();
+  });
+  // SPEC R10, R15: silence and old readings must not promise currently free RAM.
+  it('labels an unresponsive host and its retained memory reading', async () => {
+    role({ snapshots: [snapshotWith([])], route: (call) => call.url === '/management/v1/hosts'
+      ? json({ hosts: [{ ...STANDALONE_HOST, session: { ...STANDALONE_HOST.session, unresponsive: true,
+        domains: STANDALONE_HOST.session.domains.map((domain) => ({ ...domain, observed_at_unix_ms: Date.now() - 60_000 })) } }] })
+      : undefined });
+    await open('/');
+    const host = document.querySelector('.host')!;
+    expect(host.querySelector('header .chip')?.textContent).toContain('unresponsive');
+    expect(host.textContent).toContain('available at last reading · 1m ago');
+    expect(host.textContent).not.toContain('GiB free');
   });
 
   it('fills recent activity from retained history on first load and deduplicates live events', async () => {
@@ -108,7 +121,7 @@ describe('U20 model detail', () => {
   });
 
   it('humanises latency, preserves sources, samples trends and avoids duplicate single-instance actions', async () => {
-    const server = role({ snapshots: [snapshotWith([deployment({ actions: [{ action: 'park', available: true }] })])], route: (call) => call.url.includes('/metrics/latency?') ? json({ deployments: [{ deployment_id: DEPLOYMENT_ID, instances: [{ instance: 0, host_id: 'gpu-box', engine: 'vllm', series: [
+    const server = role({ snapshots: [snapshotWith([deployment({ actions: [{ action: 'park', available: true }] })])], route: (call) => call.url.includes('/metrics/latency?') ? json({ deployments: [{ deployment_id: DEPLOYMENT_ID, instances: [{ instance: 0, generation: 1, host_id: 'gpu-box', engine: 'vllm', series: [
       { name: 'router_time_to_first_content', tier: 'router', source: 'capyctl', count: 12, p50_seconds: 15.2, p95_seconds: 18.3 },
       { name: 'engine_inter_token_latency', tier: 'engine', source: 'engine', count: 12, p50_seconds: 0.025, p95_seconds: 0.04 },
     ] }] }] }) : undefined });
@@ -179,7 +192,7 @@ describe('U20 Engines', () => {
 it('derives per-stream tok/s from the served inter-token p50 and renders fresh KV and queue readings', async () => {
   role({ snapshots: [snapshotWith([deployment()])], route: (call) => {
     if (call.url.startsWith('/management/v1/metrics/load')) return json({ deployments: [{ deployment_id: DEPLOYMENT_ID, router: { in_flight: 3, waiting: 2 }, instances: [{ index: 0, sample: { fresh: true, engine: { kv_usage_ppm: 250000 } } }] }] });
-    if (call.url.startsWith('/management/v1/metrics/latency')) return json({ deployments: [{ deployment_id: DEPLOYMENT_ID, instances: [{ series: [{ name: 'engine_inter_token_latency', tier: 'engine', source: 'engine', count: 5, p50_seconds: 0.025, p95_seconds: 0.04 }] }] }] });
+    if (call.url.startsWith('/management/v1/metrics/latency')) return json({ deployments: [{ deployment_id: DEPLOYMENT_ID, instances: [{ instance: 0, generation: 1, host_id: 'gpu-box', engine: 'vllm', series: [{ name: 'engine_inter_token_latency', tier: 'engine', source: 'engine', count: 5, p50_seconds: 0.025, p95_seconds: 0.04 }] }] }] });
     return undefined;
   } });
   await open('/');
@@ -193,7 +206,7 @@ it('derives per-stream tok/s from the served inter-token p50 and renders fresh K
 
 describe('U20 current versus retained measurements', () => {
   function retainedLatency() {
-    return json({ deployments: [{ deployment_id: DEPLOYMENT_ID, instances: [{ series: [
+    return json({ deployments: [{ deployment_id: DEPLOYMENT_ID, instances: [{ instance: 0, generation: 1, host_id: 'gpu-box', engine: 'vllm', series: [
       { name: 'router_time_to_first_content', tier: 'router', source: 'capyctl', count: 12, p50_seconds: 0.21, p95_seconds: 0.53 },
       { name: 'engine_inter_token_latency', tier: 'engine', source: 'engine', count: 12, p50_seconds: 0.0295, p95_seconds: 0.0385 },
     ] }] }] });
@@ -205,12 +218,21 @@ describe('U20 current versus retained measurements', () => {
     expect([...card.querySelectorAll('.metric strong')].map((value) => value.textContent)).toEqual(['–', '–']);
   });
   it.each<ObservedState>(['failed', 'stopped'])('does not call retained %s-model measurements live', async (state) => {
-    role({ snapshots: [snapshotWith([deployment({ observed_state: state })])], route: (call) => call.url.startsWith('/management/v1/metrics/latency') ? retainedLatency() : undefined });
+    // SPEC R13: an older launch remains useful only as explicitly previous readings.
+    role({ snapshots: [snapshotWith([deployment({ observed_state: state, instances: [{ ...instance(0, state), generation: '2' }] })])], route: (call) => call.url.startsWith('/management/v1/metrics/latency') ? retainedLatency() : undefined });
     await open(`/models/${DEPLOYMENT_ID}`);
     expect([...document.querySelectorAll('.metrics .numeral')].map((value) => value.textContent)).toEqual(['210 ms', '530 ms', '30 ms', '12']);
     expect(document.querySelector('.section-heading')?.textContent).toContain('Previous readings');
     expect([...document.querySelectorAll('.metrics article small')].every((caption) => caption.textContent?.startsWith('Previous · '))).toBe(true);
     expect(document.querySelector('.measurements summary')?.textContent).toContain('Previous');
+  });
+  // SPEC R13: a ready model must not inherit the previous launch's percentiles.
+  it('excludes older-generation measurements from live detail readings', async () => {
+    role({ snapshots: [snapshotWith([deployment({ instances: [{ ...instance(0, 'ready'), generation: '2' }] })])], route: (call) => call.url.startsWith('/management/v1/metrics/latency') ? retainedLatency() : undefined });
+    await open(`/models/${DEPLOYMENT_ID}`);
+    expect(document.querySelector('.metrics')?.textContent).not.toContain('210 ms');
+    expect(document.querySelector('.metrics')?.textContent).not.toContain('30 ms');
+    expect(document.querySelector('.measurements')).toBeNull();
   });
   it.each<ObservedState>(['failed', 'stopped'])('omits empty tiles when a %s model has no retained measurements', async (state) => {
     role({ snapshots: [snapshotWith([deployment({ observed_state: state })])] });

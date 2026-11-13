@@ -7,6 +7,7 @@
     retryable,
     send,
     waitForStop,
+    type ActionBody,
     type Attempt,
     type Receipt,
   } from '../lib/operate';
@@ -55,7 +56,7 @@
   let changedElsewhere = $state(false);
   // The request a Retry resends unchanged (same key, same body), and what to
   // do once it is accepted.
-  let retry = $state<{ attempt: Attempt; then: (receipt: Receipt) => Promise<void> } | null>(null);
+  let retry = $state<{ attempt: Attempt; then?: (receipt: Receipt) => Promise<void> } | null>(null);
   let offerEvict = $state(false);
   let confirming = $state(false);
   let confirmStop = $state(false);
@@ -63,17 +64,31 @@
   const waiting = new AbortController();
   onDestroy(() => waiting.abort());
 
-  async function run(attempt: Attempt, progress: string, then: (receipt: Receipt) => Promise<void> = async () => {}) {
+  async function run(attempt: Attempt, progress: string, then?: (receipt: Receipt) => Promise<void>) {
+    if (waiting.signal.aborted) return;
     busy = progress;
     error = null;
     changedElsewhere = false;
     retry = null;
     offerEvict = false;
     try {
-      const receipt = await send(attempt);
-      await then(receipt);
+      let receipt: Receipt;
+      try {
+        receipt = await send(attempt);
+      } catch (caught) {
+        // SPEC §6.3 / delete.rs: a model holding nothing may refuse Stop.
+        // Continue through the same wait and fresh-snapshot checks, never
+        // through a separate, unguarded Delete continuation.
+        if (then !== undefined && (attempt.body as ActionBody).action === 'stop' && caught instanceof ApiError && caught.code === 'lifecycle_conflict') {
+          receipt = {};
+        } else {
+          throw caught;
+        }
+      }
+      waiting.signal.throwIfAborted();
+      await then?.(receipt);
     } catch (caught) {
-      if (caught instanceof DOMException && caught.name === 'AbortError') {
+      if (waiting.signal.aborted || (caught instanceof DOMException && caught.name === 'AbortError')) {
         return;
       }
       const failure = caught instanceof ApiError ? caught : null;
@@ -123,13 +138,19 @@
     void run(attemptFor('start', true), 'Making room and starting…');
   }
 
-  // crates/capyctl-cli/src/client/delete.rs: stop, wait for the stop to
-  // settle on the event stream, then send the ordinary delete, which the
-  // server checks again.
-  async function deleteAfterStop(receipt: Receipt) {
+  // SPEC §6.3, plan KTD16 / delete.rs: stop, wait for cleanup evidence, then
+  // re-read the revision for ordinary Delete. Closing the screen at any
+  // asynchronous boundary leaves the stopped model intact.
+  async function deleteAfterStop(receipt: Receipt, deadlineMs: number) {
     busy = 'Waiting for the model to stop…';
-    await waitForStop(deployment.id, receipt.operation_id ?? null, waiting.signal);
-    await run(deploymentAttempt(deployment, 'delete'), 'Deleting…');
+    await waitForStop(deployment.id, receipt.operation_id ?? null, deadlineMs, waiting.signal);
+    waiting.signal.throwIfAborted();
+    const current = await reloadSnapshot(waiting.signal);
+    waiting.signal.throwIfAborted();
+    const target = current.deployments.find((value) => value.id === deployment.id);
+    if (target !== undefined) {
+      await run(deploymentAttempt(target, 'delete'), 'Deleting…');
+    }
   }
 
   function confirmDelete() {
@@ -138,12 +159,9 @@
       void run(deploymentAttempt(deployment, 'delete'), 'Deleting…');
       return;
     }
-    void run(deploymentAttempt(deployment, 'stop'), 'Stopping…', deleteAfterStop).then(() => {
-      // SPEC §6.3: a model holding nothing has nothing to stop; delete it.
-      if (error?.code === 'lifecycle_conflict') {
-        void run(deploymentAttempt(deployment, 'delete'), 'Deleting…');
-      }
-    });
+    const stop = deploymentAttempt(deployment, 'stop');
+    const deadlineMs = (stop.body as ActionBody).deadline_ms;
+    void run(stop, 'Stopping…', (receipt) => deleteAfterStop(receipt, deadlineMs));
   }
 </script>
 

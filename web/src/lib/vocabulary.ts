@@ -43,6 +43,22 @@ export interface Refusal {
 // drain.rs, enrollment.rs, metrics.rs, hosts.rs), plus `origin_refused`
 // from ADR 0040's request checks (plan KTD5).
 export const MANAGEMENT_REFUSALS: Record<string, Refusal> = {
+  admin_required: {
+    reason: 'This action needs access from the CapyCTL box.',
+    action: 'Run the administrative command on the box.',
+  },
+  sign_in_link_refused: {
+    reason: 'This sign-in link cannot be used.',
+    action: 'Run `capyctl open ui` on the box to create a new link.',
+  },
+  capability_missing: {
+    reason: 'This host does not support the requested action.',
+    action: 'Update CapyCTL on the host and reconnect it.',
+  },
+  toolchain_missing: {
+    reason: 'The host is missing tools needed to install this engine.',
+    action: 'Install the engine’s required tools on the host, then detect it again.',
+  },
   unauthenticated: {
     reason: 'This browser is not signed in.',
     action: 'Run `capyctl open ui` on the box and open the link it prints.',
@@ -101,7 +117,7 @@ export const MANAGEMENT_REFUSALS: Record<string, Refusal> = {
   },
   deadline_exceeded: {
     reason: 'CapyCTL did not answer in time.',
-    action: 'Retry; a retry does not repeat an action that already went through.',
+    action: 'The change may already have happened. Check the current state on the host before trying again.',
   },
   unsupported_capability: {
     reason: 'This CapyCTL role or host cannot do that.',
@@ -192,14 +208,54 @@ export const MANAGEMENT_REFUSALS: Record<string, Refusal> = {
     action: 'Read it on the host itself.',
   },
   observation_stale: {
-    reason: 'The host is not connected.',
-    action: 'Check that the host is running; retry once it reconnects.',
+    reason: 'CapyCTL does not have a current view of this host.',
+    action: 'Check that the host is connected and wait for its details to refresh before starting another change.',
   },
   snapshot_unavailable: {
     reason: 'CapyCTL could not read its current state.',
     action: 'Wait a moment and try again.',
   },
   // ADR 0040 §§10, 11: host administration.
+  shutting_down: {
+    reason: 'CapyCTL is shutting down.',
+    action: 'Wait for CapyCTL to restart and check the current state before trying again.',
+  },
+  profile_in_use: {
+    reason: 'A model still uses this engine profile.',
+    action: 'Move or remove the models using this profile before removing it.',
+  },
+  profile_exists: {
+    reason: 'An engine profile already uses that name.',
+    action: 'Choose another name, or review the existing profile before changing it.',
+  },
+  profile_not_found: {
+    reason: 'That engine profile no longer exists.',
+    action: 'Refresh the engines list and choose an existing profile.',
+  },
+  publish_rejected: {
+    reason: 'The running CapyCTL role did not accept the engine profile.',
+    action: 'Check the host’s engines and configuration before making another change.',
+  },
+  confirmation_required: {
+    reason: 'This engine change needs your approval.',
+    action: 'Request a preview, review the command and its effects, then confirm it.',
+  },
+  custom_manifest_invalid: {
+    reason: 'The custom engine manifest is not valid.',
+    action: 'Correct the manifest using the details, then request a new preview.',
+  },
+  engine_unsupported: {
+    reason: 'This engine installation does not support the requested setup.',
+    action: 'Choose a supported engine installation or change the requested settings.',
+  },
+  host_admin_busy: {
+    reason: 'The host is busy with other configuration changes.',
+    action: 'Wait for those changes to finish, refresh the host’s details, then try again.',
+  },
+  reply_too_large: {
+    reason: 'The host’s answer was too large to send.',
+    action: 'Check the host’s configuration and engines directly before repeating a change.',
+  },
   'host_capability_missing:host_admin': {
     reason: 'This host runs an older CapyCTL that cannot be managed from here.',
     action: 'Update CapyCTL on the host and restart it, then try again.',
@@ -209,12 +265,12 @@ export const MANAGEMENT_REFUSALS: Record<string, Refusal> = {
     action: 'Update CapyCTL on the host and restart it, then try again.',
   },
   outcome_unknown: {
-    reason: 'The host disconnected before it answered, so the change may or may not have happened.',
-    action: 'Check the host’s engines list once it reconnects before trying again.',
+    reason: 'The host did not return a confirmed answer, so the change may or may not have happened.',
+    action: 'Check the host’s current configuration and engines before trying again.',
   },
   confirmation_stale: {
-    reason: 'The engine changed on the host after you reviewed it.',
-    action: 'Review the new command below and confirm again.',
+    reason: 'The host’s details changed after you reviewed the change.',
+    action: 'Request a new preview, review it, and confirm again.',
   },
   agent_unreachable: {
     reason: 'CapyCTL could not reach the role on the host, so the outcome is unknown.',

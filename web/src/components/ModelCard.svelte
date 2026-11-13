@@ -3,14 +3,15 @@
   import { href, link } from '../lib/router';
   import { snapshot } from '../lib/state';
   import { livePoll } from '../lib/poll';
-  import { readLatency, type EngineRow, type LatencySeries, type LoadDeployment } from '../lib/reads';
+  import { readLatency, type EngineRow, type LatencyReport, type LoadDeployment } from '../lib/reads';
   import type { DeploymentSnapshot } from '../lib/types';
-  import { duration, engineName, gib, kvPercent, reservation, timing } from '../lib/presentation';
+  import { currentSeries, duration, engineName, gib, kvPercent, reservation, timing } from '../lib/presentation';
   import ActionBar from './ActionBar.svelte';
   import StateBadge from './StateBadge.svelte';
 
   let { deployment, load, engines }: { deployment: DeploymentSnapshot; load: LoadDeployment | null; engines: EngineRow[] } = $props();
-  let series = $state<LatencySeries[]>([]);
+  let latency = $state<LatencyReport>({ deployments: [] });
+  const series = $derived(currentSeries(latency, deployment));
   let busy = $state<string | null>(null);
   // ADR 0040 owner decision 2026-11-13: retained histograms are not live
   // readings for a model that cannot currently serve requests.
@@ -23,8 +24,7 @@
   const total = $derived(downloads.reduce((sum, s) => sum + s.bytes_total, 0));
   const since = $derived($snapshot?.operations.find((o) => o.id === deployment.latest_operation?.id)?.accepted_at);
   onMount(() => livePoll(async () => {
-    const report = await readLatency(deployment.id);
-    series = report.deployments.find((d) => d.deployment_id === deployment.id)?.instances.flatMap((i) => i.series) ?? [];
+    latency = await readLatency(deployment.id);
   }, 5000));
 </script>
 

@@ -1,7 +1,8 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import Refusal from '../../components/Refusal.svelte';
   import { ApiError } from '../../lib/api';
-  import { decide, type DecisionResult, type QuestionType } from '../../lib/playground';
+  import { decide, playgroundError, type DecisionResult, type QuestionType } from '../../lib/playground';
   import { snapshot } from '../../lib/state';
   import type { DeploymentSnapshot } from '../../lib/types';
   import { stateWord } from '../../lib/vocabulary';
@@ -22,6 +23,10 @@
   let error = $state<ApiError | null>(null);
   let offerStart = $state(false);
 
+  // SPEC R31: leaving the playground cancels its outstanding inference.
+  const controller = new AbortController();
+  onDestroy(() => controller.abort());
+
   const stopped = $derived(offerStart || stateWord(live.observed_state, live.suspended) === 'stopped');
 
   async function ask(event: SubmitEvent): Promise<void> {
@@ -41,13 +46,13 @@
           .split('\n')
           .map((line) => line.trim())
           .filter((line) => line.length > 0),
-      });
+      }, controller.signal);
     } catch (caught) {
-      if (!(caught instanceof ApiError)) {
-        throw caught;
+      if (controller.signal.aborted) {
+        return;
       }
-      error = caught;
-      offerStart = caught.code === 'deployment_stopped';
+      error = playgroundError(caught);
+      offerStart = error.code === 'deployment_stopped';
     } finally {
       outstanding = false;
     }

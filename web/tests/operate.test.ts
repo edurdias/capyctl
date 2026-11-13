@@ -1,6 +1,8 @@
 // ADR 0040 §8 (plan U14, KTD16): lifecycle actions, drain and revoke,
 // driven through the mounted App against the management API's shapes.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { waitForStop } from '../src/lib/operate';
+import { navigate } from '../src/lib/router';
 import type { Call } from './helpers';
 import { cursor, json, managementError } from './helpers';
 import {
@@ -29,6 +31,15 @@ function body(call: Call): Record<string, unknown> {
 
 function accepted(operation = '01JBX7Q4M2N8P0R5S7T9V1W3OP'): Response {
   return json({ api_version: '1', operation_id: operation, deployment_id: DEPLOYMENT_ID, joined: false, revision: '3' }, 202);
+}
+
+async function confirmStopAndDelete(): Promise<void> {
+  document.querySelector<HTMLDetailsElement>('[data-model="chat"] details.overflow summary')!.click();
+  await tick();
+  button('Stop and delete').click();
+  await tick();
+  button('Stop and delete', dialog()).click();
+  await tick();
 }
 
 describe('lifecycle actions', () => {
@@ -98,7 +109,7 @@ describe('lifecycle actions', () => {
         // The refresh after the first event: the stop is still running.
         snapshotWith([{ ...ready, observed_state: 'stopping' }], 6, [stopping]),
         // After the next event: it has settled.
-        snapshotWith([{ ...ready, observed_state: 'stopped', ready_instances: 0 }], 7, [{ ...stopping, state: 'succeeded' }]),
+        snapshotWith([{ ...ready, revision: '4', observed_state: 'stopped', ready_instances: 0 }], 7, [{ ...stopping, state: 'succeeded' }]),
       ],
       route: (call) => {
         if (call.url !== ACTIONS) {
@@ -129,6 +140,145 @@ describe('lifecycle actions', () => {
     await tick(1000);
     expect(actions.map((call) => body(call).action)).toEqual(['stop', 'delete']);
     expect(actions[1].headers.get('Idempotency-Key')).not.toBe(actions[0].headers.get('Idempotency-Key'));
+    expect(body(actions[1]).expected_revision).toBe(4);
+    expect(server.calls.filter((call) => call.url === '/management/v1/snapshot')).toHaveLength(4);
+  });
+
+  // SPEC R16, plan KTD16: leaving before Stop answers must never send Delete.
+  it.each(['accepted', 'lifecycle_conflict'])('abandons stop-delete when the screen closes before Stop returns %s', async (answer) => {
+    let finishStop!: (response: Response) => void;
+    const ready = deployment({ actions: [{ action: 'delete', available: false, reason: 'delete_requires_cleanup' }] });
+    const actions: Call[] = [];
+    const server = role({
+      snapshots: [snapshotWith([ready]), snapshotWith([deployment({ observed_state: 'stopped' })], 6)],
+      route: (call) => {
+        if (call.url !== ACTIONS) return undefined;
+        actions.push(call);
+        return actions.length === 1
+          ? new Promise<Response>((resolve) => { finishStop = resolve; })
+          : accepted();
+      },
+    });
+    await open('/');
+    await confirmStopAndDelete();
+    navigate('/hosts');
+    await tick();
+    finishStop(answer === 'accepted' ? accepted() : managementError(409, 'lifecycle_conflict'));
+    await tick();
+    server.streams[0].event(cursor(6), 'ordinary_cleanup_completed', DEPLOYMENT_ID);
+    await tick(1000);
+    expect(actions.map((call) => body(call).action)).toEqual(['stop']);
+  });
+
+  // SPEC R16, plan KTD16: closing the screen also cancels an active wait.
+  it('never deletes after the screen closes during the stop wait', async () => {
+    const ready = deployment({ actions: [{ action: 'delete', available: false, reason: 'delete_requires_cleanup' }] });
+    const actions: Call[] = [];
+    const server = role({
+      snapshots: [snapshotWith([ready]), snapshotWith([deployment({ observed_state: 'stopped' })], 6)],
+      route: (call) => {
+        if (call.url !== ACTIONS) return undefined;
+        actions.push(call);
+        return accepted();
+      },
+    });
+    await open('/');
+    await confirmStopAndDelete();
+    expect(document.body.textContent).toContain('Waiting for the model to stop…');
+    navigate('/hosts');
+    await tick();
+    server.streams[0].event(cursor(6), 'ordinary_cleanup_completed', DEPLOYMENT_ID);
+    await tick(1000);
+    expect(actions.map((call) => body(call).action)).toEqual(['stop']);
+  });
+
+  // SPEC §6.3, plan KTD16: recheck the current revision before ordinary Delete.
+  it('does not delete if the screen closes during the final snapshot recheck', async () => {
+    let reads = 0;
+    let finishSnapshot!: (response: Response) => void;
+    const ready = deployment({ actions: [{ action: 'delete', available: false, reason: 'delete_requires_cleanup' }] });
+    const stopped = snapshotWith([deployment({ revision: '4', observed_state: 'stopped' })], 6);
+    const actions: Call[] = [];
+    const server = role({
+      snapshots: [snapshotWith([ready]), stopped],
+      route: (call) => {
+        if (call.url === '/management/v1/snapshot' && ++reads === 3) {
+          return new Promise<Response>((resolve) => { finishSnapshot = resolve; });
+        }
+        if (call.url !== ACTIONS) return undefined;
+        actions.push(call);
+        return accepted();
+      },
+    });
+    await open('/');
+    await confirmStopAndDelete();
+    server.streams[0].event(cursor(6), 'ordinary_cleanup_completed', DEPLOYMENT_ID);
+    await tick(250);
+    expect(reads).toBe(3);
+    navigate('/hosts');
+    await tick();
+    finishSnapshot(json(stopped));
+    await tick();
+    expect(actions.map((call) => body(call).action)).toEqual(['stop']);
+  });
+
+  // SPEC §6.3, plan KTD16: a refused Stop still rechecks before Delete.
+  it('deletes with the fresh revision after Stop reports lifecycle_conflict', async () => {
+    const ready = deployment({ actions: [{ action: 'delete', available: false, reason: 'delete_requires_cleanup' }] });
+    const actions: Call[] = [];
+    role({
+      snapshots: [snapshotWith([ready]), snapshotWith([deployment({ revision: '4', observed_state: 'stopped' })], 6)],
+      route: (call) => {
+        if (call.url !== ACTIONS) return undefined;
+        actions.push(call);
+        return actions.length === 1 ? managementError(409, 'lifecycle_conflict') : accepted();
+      },
+    });
+    await open('/');
+    await confirmStopAndDelete();
+    expect(actions.map((call) => body(call).action)).toEqual(['stop', 'delete']);
+    expect(body(actions[1]).expected_revision).toBe(4);
+  });
+
+  // SPEC §6.3: delete.rs bounds waiting by Stop's deadline plus 10 seconds.
+  it('leaves the deployment intact once the stop deadline and CLI wait margin pass', async () => {
+    const ready = deployment({
+      actions: [{ action: 'delete', available: false, reason: 'delete_requires_cleanup' }],
+      timeouts: { request_deadline_ms: 100, initialize_ms: 100, stop_ms: 10 },
+    });
+    const actions: Call[] = [];
+    const server = role({
+      snapshots: [snapshotWith([ready]), snapshotWith([deployment({ observed_state: 'stopped' })], 6)],
+      route: (call) => {
+        if (call.url !== ACTIONS) return undefined;
+        actions.push(call);
+        return accepted();
+      },
+    });
+    await open('/');
+    await confirmStopAndDelete();
+    await tick(10_009);
+    expect(document.body.textContent).toContain('Waiting for the model to stop…');
+    await tick(1);
+    expect(document.body.textContent).not.toContain('Waiting for the model to stop…');
+    expect(document.body.textContent).toContain('The model is still running or still being stopped.');
+    expect(buttons('Retry')).toHaveLength(0);
+
+    server.streams[0].event(cursor(6), 'ordinary_cleanup_completed', DEPLOYMENT_ID);
+    await tick(1000);
+    expect(actions.map((call) => body(call).action)).toEqual(['stop']);
+  });
+
+  // Plan KTD16: an already-aborted signal and an abort queued with settlement
+  // both cancel the wait, even when the snapshot already reads stopped.
+  it.each(['before', 'during'])('rejects a stop wait aborted %s subscription', async (when) => {
+    role({ snapshots: [snapshotWith([deployment({ observed_state: 'stopped' })])] });
+    await open('/');
+    const controller = new AbortController();
+    if (when === 'before') controller.abort();
+    const waiting = waitForStop(DEPLOYMENT_ID, null, Date.now() + 100, controller.signal);
+    if (when === 'during') controller.abort();
+    await expect(waiting).rejects.toMatchObject({ name: 'AbortError' });
   });
 
   // SPEC §13 (plan KTD16): a Retry is the same request; a click a new one.
