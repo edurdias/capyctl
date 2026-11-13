@@ -739,6 +739,7 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         session_verifier,
         config.management_public_address.as_deref(),
         capyctl_management::compose::ServerRoutes {
+            ui: capyctl_webui::router(),
             actions,
             presence,
             enrollment: authority.clone(),

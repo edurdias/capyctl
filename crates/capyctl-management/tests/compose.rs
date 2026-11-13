@@ -98,6 +98,7 @@ async fn roles() -> Roles {
         verifier(dir.path(), "standalone-sessions.sqlite3"),
         Some("https://box.tail1234.ts.net"),
         StandaloneRoutes {
+            ui: Router::new().route("/ui/", axum::routing::get(|| async { "sign in" })),
             actions: actions.clone(),
             check_sources: Arc::new(capyctl_management::check::UnavailableSources),
             host_names: vec!["lab".into(), "standalone".into()],
@@ -125,6 +126,7 @@ async fn roles() -> Roles {
         verifier(dir.path(), "server-sessions.sqlite3"),
         None,
         ServerRoutes {
+            ui: Router::new().route("/ui/", axum::routing::get(|| async { "sign in" })),
             actions,
             presence: Arc::new(|_: &str| true),
             enrollment: authority,
@@ -258,6 +260,15 @@ async fn status(router: &Router, request: Request<Body>, who: As) -> u16 {
 async fn every_route_of_both_roles_needs_a_principal() {
     let roles = roles().await;
     let id = &roles.id;
+    // ADR 0040 §13: public assets do not weaken any management route below.
+    for router in [&roles.standalone, &roles.server] {
+        let response = router
+            .clone()
+            .oneshot(Request::get("/ui/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
     let invalid = json!({});
     let invitation = json!({"host_name": "host-a", "lifetime_seconds": 300});
     let common: Vec<(&str, String, Option<&Value>)> = vec![

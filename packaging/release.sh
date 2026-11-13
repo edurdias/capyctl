@@ -75,6 +75,18 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ] ||
 fi
 
 commit=$(git rev-parse HEAD)
+# ADR 0040 §13 / KTD17: never package a missing or stale UI bundle.
+if [ ! -f web/dist/index.html ]; then
+  echo "web/dist/index.html is missing; run npm ci && npm run build in web/" >&2
+  exit 1
+fi
+if [ ! -f web/dist/BUILD_COMMIT ] || [ "$(cat web/dist/BUILD_COMMIT)" != "$commit" ]; then
+  echo "web/dist/BUILD_COMMIT differs from HEAD; rebuild web/ before packaging" >&2
+  exit 1
+fi
+# Hash names and contents, not timestamps or checkout-specific absolute paths.
+web_bundle=$(cd web/dist && find . -type f -print0 | LC_ALL=C sort -z |
+  xargs -0 sha256sum | sha256sum | cut -c1-64)
 # `capyctl version` reports the commit BUILDINFO records (`-dirty` for a dirty
 # tree); `capyctl --version` stays `capyctl <version>`. Exported, so the
 # shipped-binary check's rebuild sees the same value and stays a no-op.
@@ -175,6 +187,7 @@ arch: $arch
 toolchain: $toolchain
 source_date: $build_time
 runtime_manifest: $runtime_manifest
+web_bundle: $web_bundle
 EOF
 chmod 0644 "$pkg/BUILDINFO"
 

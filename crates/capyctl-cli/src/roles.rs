@@ -2457,6 +2457,7 @@ async fn start_standalone_in(
         session_verifier,
         management_listener.public_address.as_deref(),
         capyctl_management::compose::StandaloneRoutes {
+            ui: capyctl_webui::router(),
             actions: source,
             // ADR 0040 §9: pin with this host's resolved document settings.
             check_sources: Arc::new(capyctl_management::check::StandaloneSources(Arc::new(

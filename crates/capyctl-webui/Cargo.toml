@@ -1,0 +1,22 @@
+[package]
+name = "capyctl-webui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+# ADR 0040 §13 / KTD17: embed even debug builds; never depend on runtime files.
+rust-embed = { version = "~8.13.0", features = ["deterministic-timestamps", "debug-embed"] }
+mime_guess = "2"
+
+[dev-dependencies]
+tokio.workspace = true
+tower = { version = "0.5", features = ["util"] }
+capyctl-management = { path = "../capyctl-management" }
+capyctl-controller.workspace = true
+capyctl-agent.workspace = true
+capyctl-store.workspace = true
+capyctl-testkit.workspace = true
+tempfile.workspace = true
+serde_json = "1"
