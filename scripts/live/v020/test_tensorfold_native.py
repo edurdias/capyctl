@@ -50,9 +50,9 @@ class NativeContracts(unittest.TestCase):
                               register=lambda key: key, root=Path('/tmp'),
                               assertion=lambda condition, message: self.assertTrue(condition, message),
                               owned=lambda name: [])
-        result = SimpleNamespace(returncode=2, stdout='', stderr='group_unsupported topology tensorfold')
+        result = SimpleNamespace(returncode=2, stdout='', stderr='multi_gpu_unsupported: the TensorFold native line')
         with patch.object(tf, 'install', return_value=result) as install:
-            tf.refused(ctx, '1.0.0', 'topology', dict(topology=dict(tensor_parallel=2)), ['group_unsupported'])
+            tf.refused(ctx, '1.0.0', 'topology', dict(topology=dict(tensor_parallel=2)), ['multi_gpu_unsupported'])
         value = install.call_args.args[1]
         self.assertNotIn('devices', value)
         self.assertNotIn('gpu', value['resources'])
@@ -118,6 +118,28 @@ class NativeContracts(unittest.TestCase):
         self.assertEqual([event['signal'] for event in events], ['SIGTERM', 'exit'])
         self.assertAlmostEqual(events[1]['at'] - events[0]['at'], 1.25)
         self.assertEqual(tf.trace_signals('stop accepted at 1234'), [])
+
+    def test_topology_refusals_require_the_exact_shared_code_for_each_shape(self):
+        # TF4 / ADR 0039 owner-decision amendment, 2026-11-12.
+        ctx = SimpleNamespace(row_id='TF4', model_store=Path('/models'),
+                              register=lambda key: key, root=Path('/tmp'),
+                              assertion=lambda condition, message: self.assertTrue(condition, message),
+                              owned=lambda name: [])
+        for hosts, code in ((None, 'multi_gpu_unsupported'),
+                            (['a', 'b'], 'group_shape_unsupported:tensorfold')):
+            extra = dict(topology=dict(tensor_parallel=2))
+            if hosts:
+                extra['placement'] = dict(hosts=hosts)
+            for actual in (code, 'group_unsupported', 'multi_gpu_unsupported',
+                           'group_shape_unsupported:tensorfold', code + '_wrong'):
+                with self.subTest(hosts=hosts, actual=actual):
+                    result = SimpleNamespace(returncode=2, stdout='', stderr=actual + ': the TensorFold native line')
+                    with patch.object(tf, 'install', return_value=result):
+                        if actual == code:
+                            tf.refused(ctx, '1.0.0', 'topology', extra, [])
+                        else:
+                            with self.assertRaises(AssertionError):
+                                tf.refused(ctx, '1.0.0', 'topology', extra, [])
 
     def test_tf_rows_registered_once_and_exact_100_gated(self):
         wanted = {'TF4', 'TF5', 'TF6', 'TF7', 'TF8', 'TF9', 'TF10', 'TF12', 'TF13', 'TF14'}

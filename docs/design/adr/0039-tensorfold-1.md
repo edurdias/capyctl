@@ -381,7 +381,7 @@ commit.
 | Idle signal | `/health` `busy`, `requests_running` | `/metrics` `requests_running`, `requests_waiting`, one snapshot | native idle read; no `/health` fold in load reports |
 | Memory | grows by use inside the cap | admitted in full at start; cap and reserve | charge = model + streams × full window |
 | Models on CUDA | many families | `nemotron_h`, `mlx-q4g64` only | refusal from the capabilities document |
-| Groups | `--tp 2` across two hosts | none on CUDA | `group_unsupported` |
+| Groups | `--tp 2` across two hosts | none on CUDA | `multi_gpu_unsupported` on one host; `group_shape_unsupported:tensorfold` across hosts |
 | Parking | none | none | `restart_only` |
 | Release check | on unless turned off | none | the switch stays rendered |
 
@@ -573,7 +573,10 @@ refusals at resolution, each naming the native line and the fix:
   no drafter on the native line; TensorFold native drafts with the checkpoint's own MTP
   head". 1.0 refuses `--drafter` itself; 1.1.5 serves it (Evidence §9), and this ADR does
   not design its use.
-- a `topology` (groups, ADR 0028; several GPUs, ADR 0035): `group_unsupported`.
+- a `topology`: `multi_gpu_unsupported` for several GPUs on one host (ADR 0035),
+  or `group_shape_unsupported:tensorfold` for a multi-host shape (ADR 0028).
+  Owner-decision amendment, 2026-11-12: use these shared topology refusal codes,
+  not `group_unsupported`; the native line still refuses both shapes before launch.
 - `api: decisions`: `capability_missing:decisions`, as today (ADR 0030); 1.0's
   `/v1/decisions` checks requests but scores no labels yet (`RELEASE-NOTES-1.0.0.md:23`).
 - `api: embeddings` if ADR 0036 lands: refused; 1.0 has no embeddings route, and 1.1.5's
@@ -739,7 +742,9 @@ Python environment; `engine_version_failed` (18) for a version line that cannot 
 disagrees with `VERSION`; `add` without `--name` when a `tensorfold` profile exists.
 No version or checkpoint is refused for being uncertified. Resolution:
 `capability_missing` (`kv_cache_dtype`, `model.draft`, parking),
-`capability_missing:decisions`, `group_unsupported`; resolution or placement:
+`capability_missing:decisions`, `multi_gpu_unsupported` for a one-host topology,
+`group_shape_unsupported:tensorfold` for a multi-host shape (owner-decision
+amendment, 2026-11-12, matching §6); resolution or placement:
 `retention_zero:compaction`, `retention_zero:engine_disk` (exit 5). Placement:
 `host_capability_missing:tensorfold_native`. Launch: `effective_args_mismatch`
 (`max_batch_size`), `tensorfold_listener_exposed`.
@@ -917,7 +922,7 @@ figures.
 | TF1 | Registration: `engine detect` lists `~/tensorfold-1.0.0/bin/tensorfold-native` at 1.0.0 from `VERSION`; `engine add` checks the version on standard output, every `SHA256SUMS` line and the capabilities document, writes `line: native`, deep park disabled, no toolchain asked; with the 0.6.6 profile already named `tensorfold`, `add` without `--name` refuses and asks for it, and `add --name tensorfold-1.0.0` registers beside the 0.6.6 profile, which stays listed; `engine list` shows the digest, `verified` once the rows pass, and "LMCache off: TensorFold has no LMCache integration". |
 | TF2 | Start and memory: the rendered command is exactly §4's; ready after the connection opens, `/health` `status: ok` with the served name and `max_batch_size` 8; cold and warm start times; the startup line's model bytes, stream count and stream bytes (compared with 0.29 GiB computed here); peak `device_memory_peak_bytes` under 8 concurrent full-context requests, CapyCTL's per-process reading of the engine and the pool's `MemAvailable` drop, which together set the recipe figure and say whether the cap needs the context's difference taken off (§8). |
 | TF3 | Requests: chat streamed and collected, thinking on and off, greedy and sampled (the docs disagree), `reasoning_content`, the `tensorfold` object passed through, `cache_salt` refused, a `--no-drafts` deployment answering the same greedy tokens (`token_sha`) as a drafted one; decode tokens per second at 1 and 8 streams against 0.6.6 on the same requests. |
-| TF4 | Refusals and admission: `kv_cache_dtype`, `model.draft`, a `topology` and a parking residency refused at resolution; a Qwen3-4B BF16 checkpoint runs uncertified with the unlisted-family note, the engine refuses it at start, and the launch failure shows the note and names the 0.6 line; `max_concurrent_requests: 16` at a 262,144-token context under the 32 GiB cap (17.25 GiB of weights and 16 streams of 1.82 GiB) refused by the engine with the fix shown; with another deployment holding memory so that the pool's free memory is between the engine's default reserve and its need, the launch with `TENSORFOLD_MEMORY_RESERVE_GIB=2` (rendered) starts where the default reserve (set by hand in a scratch run) refuses; `--compact-at auto` in `extra_args` starts and compacts nothing by default otherwise, and the same deployment with `retention: zero` is refused `retention_zero:compaction` before any launch. |
+| TF4 | Refusals and admission: `kv_cache_dtype`, `model.draft`, a one-host `topology` with exactly `multi_gpu_unsupported`, a multi-host topology with exactly `group_shape_unsupported:tensorfold` (owner-decision amendment, 2026-11-12), and a parking residency refused at resolution; a Qwen3-4B BF16 checkpoint runs uncertified with the unlisted-family note, the engine refuses it at start, and the launch failure shows the note and names the 0.6 line; `max_concurrent_requests: 16` at a 262,144-token context under the 32 GiB cap (17.25 GiB of weights and 16 streams of 1.82 GiB) refused by the engine with the fix shown; with another deployment holding memory so that the pool's free memory is between the engine's default reserve and its need, the launch with `TENSORFOLD_MEMORY_RESERVE_GIB=2` (rendered) starts where the default reserve (set by hand in a scratch run) refuses; `--compact-at auto` in `extra_args` starts and compacts nothing by default otherwise, and the same deployment with `retention: zero` is refused `retention_zero:compaction` before any launch. |
 | TF5 | Idle gate and stop: a stop under 8 running streams waits for CapyCTL's drain, reads the two gauges at 0, signals, and the process is gone within the measured time (expected about 2 s); a stop with the engine still busy at the 30 s bound is not signalled and reported uncertain; `capyctl park deployment` refused. |
 | TF6 | Cancelled requests: the "How quickly each engine stops" protocol (four long generations, clients killed once the gauges read four, the gauges read every 100 ms), streamed and not, three repeats each, for the guide's table; a request cut before any output stays `cancelling` until the next verified stop; 32 such requests restart the instance (ADR 0032 item 7), journaled, and the next request is served. |
 | TF7 | Host path: host A as a host of a server on the control host; load reports read idle when the engine is idle and busy under load, with `kv_cache_usage_ratio` per pool and both histograms forwarded; a cancelled answered request settles on the remote idle reading; per-request `ttft_ms` and `prefill_ms` from the `tensorfold` object. |

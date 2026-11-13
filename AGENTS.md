@@ -124,7 +124,7 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   above (no new environments beyond the listed exceptions) still apply to the lab
   hosts.
 - Do not change engine environments, drivers, or reboot hosts. The engine virtual
-  environments in use, all owner-approved (list updated 2026-11-11):
+  environments in use, all owner-approved (list updated 2026-11-12):
   - both hosts: SGLang 0.5.21, SGLang 0.5.22 (approved 2026-10-17, for decision
     models), vLLM 0.30.0, TensorFold 0.6.5 and TensorFold 0.6.6
     (on host B, each TensorFold venv is a byte-identical copy of host A's, made with
@@ -175,7 +175,10 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     (LC13U–LC16U, ADR 0034 owner decision 2026-11-11): vLLM 0.34.0rc1 with an
     LMCache 0.5.7 source build against its own torch
     (~/vllm-0.34.0rc1-lmcache057-venv, TORCH_CUDA_ARCH_LIST=12.1), made the same
-    way as the 0.33.0 copy above. It stays after session cleanup;
+    way as the 0.33.0 copy above. It stays after session cleanup. For this test
+    environment only, the owner approved overriding LMCache 0.5.7's
+    opentelemetry-api <=1.40.0 and opentelemetry-exporter-prometheus <=0.61b0
+    caps on 2026-11-12, because vLLM 0.34.0rc1 requires opentelemetry-api >=1.45.1;
   - the maintainer's discrete-GPU laptop, approved 2026-11-09: the official
     `lmsysorg/sglang:v0.5.22` Docker image, for the live check of #230 (an editable
     SGLang refused at `engine add`); removed after that check, to be pulled again for
@@ -188,6 +191,10 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     SDK-free SGLang 0.5.23; observational vLLM 0.33.0 with the EM6 header-name
     recorder hook; TensorFold 0.6.6; and session-local checksum-pinned static
     strace 6.3 and Rust 1.99.0. Existing host environments remain unchanged.
+    The vLLM 0.34.0rc1 LMCache 0.5.7 copy is a test environment only: the owner
+    approved overriding LMCache's opentelemetry-api <=1.40.0 and
+    opentelemetry-exporter-prometheus <=0.61b0 caps on 2026-11-12 because this
+    vLLM version requires opentelemetry-api >=1.45.1.
   - the rented two-GPU machine of ADR 0035 §14 (owner decision 2026-10-25), for
     its one session only: fresh x86_64 CUDA installs of vLLM 0.32.0
     (~/vllm-0.32.0-venv), SGLang 0.5.22 (~/sglang-0.5.22-venv) and the llama.cpp
@@ -203,6 +210,10 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     item 4 option A, additionally approves a fresh vLLM 0.34.0rc1 environment
     and LMCache 0.5.7 source-built against its own torch, without build
     isolation and with engine constraints, for LC13–LC16 preservation checks.
+    This test environment uses the same owner-approved 2026-11-12 override of
+    LMCache 0.5.7's opentelemetry-api <=1.40.0 and
+    opentelemetry-exporter-prometheus <=0.61b0 caps: vLLM 0.34.0rc1 requires
+    opentelemetry-api >=1.45.1.
 
   Use these as they are. Do not create or modify any engine environment without the
   owner's explicit approval, and add each approved one to this list.

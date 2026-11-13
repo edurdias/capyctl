@@ -217,13 +217,14 @@ to tag commit `52aeb580658571613f8ab28a075a06fa30279beb` and SHA256 in
 `release_pins.py`; provenance records that commit. Wheel metadata requires torch
 2.14.0 (cu130 backend), torchvision 0.29.0 and torchaudio 2.11.0. Dependencies
 remain normally resolved, without `--no-deps`.
-The LMCache 0.5.7 source/no-build-isolation recipe still builds against the installed
-torch/CUDA ABI, but its runtime declarations **cannot resolve** with this rc:
-vLLM requires `opentelemetry-api>=1.45.1`, whereas LMCache 0.5.7/current dev cap it
-at `<=1.40.0` and cap `opentelemetry-exporter-prometheus<=0.61b0`. Setup does not
-install that impossible pair or change declarations. LC13–LC16 (including U)
-retain a reasoned skip for the vLLM 0.34 arm while still running the old vLLM guard
-and SGLang protocol; the row cannot pass from those remaining arms.
+The LMCache 0.5.7 source/no-build-isolation recipe builds against the installed
+torch/CUDA ABI. Its ordinary runtime declarations conflict with this rc:
+vLLM requires `opentelemetry-api>=1.45.1`, whereas LMCache caps it at `<=1.40.0`
+and caps `opentelemetry-exporter-prometheus<=0.61b0`. The owner-approved
+2026-11-12 test-only override described above resolves the fresh vLLM 0.34
+arm with OpenTelemetry 1.45.1 and Prometheus exporter 0.66b1. LC13–LC16
+(including U) exercise that arm; neither the override nor startup smoke
+establishes native-engine qualification.
 The editable SGLang fixture disables optional Rust extensions: #235 must refuse
 it before any engine launch.
 
@@ -479,7 +480,7 @@ Budgets are maximum seconds per row, not elapsed-time promises.
 | ISSUE235 | P1 | 1500 | current server/current host refuse editable SGLang before launch; a 0.1.12 server refuses a 0.2.0 host with host_version_newer_than_server (ADR 0017 §2) |
 | ISSUE240 | P1 | 1800 | 48 durable in-flight leases coexist on a managed engine; traffic survives server-first then host upgrade from 0.1.12 to 0.2.0 |
 | EM1 | P2 | 900 | Qwen3-Embedding-4B BF16/Q8_0: native 2560 dimensions, ordered batch, API/certification/LMCache evidence and memory/start/charge. |
-| EM8 | P2 | 1800 | Embedding latency/load matrix and pinned retrieval; Qwen8B 2048-input float/base64 router memory bound. |
+| EM8 | P2 | 14400 | Embedding latency/load matrix and pinned retrieval; Qwen8B 2048-input float/base64 router memory bound. |
 | OT8 | P2 | 3000 | 200 requests per tracing arm/engine, phase arrays and throughput; SGLang trace levels 1 and 3. |
 | TF2 | P2 | 900 | TensorFold cold/warm readiness, full-context eight-stream device/process/host memory and startup sizing. |
 | TF3 | P2 | 1200 | TensorFold request options, drafted/no-draft greedy SHA equivalence and 1/8 stream baseline throughput. |
@@ -530,7 +531,7 @@ Budgets are maximum seconds per row, not elapsed-time promises.
 | OT7 | P4 | 1800 | ADR0037 OT7: collector outage under traffic, OT8 noise comparison, bounded notices, dropped counters and resumed export. |
 | OT9 | P4 | 1800 | ADR0037 OT9: retention zero disables engine tracing and trace headers, while CapyCTL exports. |
 | OT10 | P4 | 1200 | ADR0037 OT10: independently verified SDK-free SGLang serves with not_installed. |
-| TF4 | P4 | 3600 | Every native resolution refusal, unlisted-family launch diagnostic, 16-stream engine refusal, reserve-pressure comparison and retention-zero compaction refusal. |
+| TF4 | P4 | 3600 | Native refusals, exactly multi_gpu_unsupported on one host and group_shape_unsupported:tensorfold across hosts, unlisted-family launch diagnostic, 16-stream engine refusal, reserve-pressure comparison and retention-zero compaction refusal. |
 | TF5 | P4 | 1800 | Eight running streams drain to both work gauges zero before stop; busy engine survives the 30-second bound; parking is refused. |
 | TF6 | P4 | 3600 | Four-client cuts, sampled every 100 ms, streamed and collected, three repeats each; unanswered cancellation stays held; 32 held requests restart and recover. |
 | TF7 | P4 | 1800 | Enrolled-host idle/busy reports, per-pool KV metrics, both forwarded histograms, remote cancelled-answer settlement and native request timings. |

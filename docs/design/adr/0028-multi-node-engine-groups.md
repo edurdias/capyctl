@@ -385,7 +385,9 @@ failover. The initialization timeout is the deployment's `timeouts.initialize`.
 
 *Amended by [ADR 0039](0039-tensorfold-1.md) §13:* TensorFold's group support below is
 its Python (0.6) line's; the native line serves no group, and a `topology` on it is
-refused `group_unsupported`.
+refused `group_shape_unsupported:tensorfold` (ADR 0039 owner-decision amendment,
+2026-11-12). A one-host multi-GPU topology is refused `multi_gpu_unsupported`
+(ADR 0035).
 
 The controller, store, agent and protocol know only the group plan. Each adapter turns
 one member of a plan into its engine's command through one shared input,

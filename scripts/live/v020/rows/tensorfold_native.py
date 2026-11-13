@@ -22,7 +22,7 @@ from .measurements import isolated_role
 
 
 CRITERIA = {
-    'TF4': 'Every native resolution refusal, unlisted-family launch diagnostic, 16-stream engine refusal, reserve-pressure comparison and retention-zero compaction refusal.',
+    'TF4': 'Native refusals, exactly multi_gpu_unsupported on one host and group_shape_unsupported:tensorfold across hosts, unlisted-family launch diagnostic, 16-stream engine refusal, reserve-pressure comparison and retention-zero compaction refusal.',
     'TF5': 'Eight running streams drain to both work gauges zero before stop; busy engine survives the 30-second bound; parking is refused.',
     'TF6': 'Four-client cuts, sampled every 100 ms, streamed and collected, three repeats each; unanswered cancellation stays held; 32 held requests restart and recover.',
     'TF7': 'Enrolled-host idle/busy reports, per-pool KV metrics, both forwarded histograms, remote cancelled-answer settlement and native request timings.',
@@ -578,6 +578,11 @@ def refused(ctx, version, label, extra, needles):
     diagnostic = (result.stdout + result.stderr).lower()
     ctx.assertion(result.returncode != 0, label + ' was not refused at resolution')
     ctx.assertion(all(needle.lower() in diagnostic for needle in needles), label + ' refusal did not name its native criterion')
+    if 'topology' in extra:
+        code = ('group_shape_unsupported:tensorfold' if len(extra.get('placement', {}).get('hosts', [])) > 1
+                else 'multi_gpu_unsupported')
+        ctx.assertion(re.search(r'\b' + re.escape(code) + r'(?=:\s|\s|$)', diagnostic) is not None,
+                      label + ' refusal did not return exactly ' + code)
     ctx.assertion(not ctx.owned(value['name']), 'resolution refusal created process ownership')
     return dict(exit_code=result.returncode, diagnostic=diagnostic)
 
@@ -756,7 +761,9 @@ def admission(ctx, evidence):
     failures = {
         'kv-dtype': (dict(engine_config=dict(kv_cache_dtype='int8')), ['kv_cache_dtype', 'native']),
         'draft': (dict(model=dict(path='tensorfold', draft=dict(type='local', path=str(ctx.model_store / 'chat')))), ['model.draft', 'native']),
-        'topology': (dict(topology=dict(tensor_parallel=2)), ['group_unsupported']),
+        'topology-one-host': (dict(topology=dict(tensor_parallel=2)), ['multi_gpu_unsupported']),
+        'topology-multi-host': (dict(topology=dict(tensor_parallel=2), placement=dict(hosts=['a', 'b'])),
+                                ['group_shape_unsupported:tensorfold']),
         'parking': (dict(residency='deep'), ['residency', 'restart']),
         'zero-compaction': (dict(retention='zero', engine_config=dict(accept_extra_args=True, extra_args=['--compact-at', 'auto'])),
                             ['retention_zero:compaction']),
