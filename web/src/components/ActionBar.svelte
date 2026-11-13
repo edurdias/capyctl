@@ -13,13 +13,14 @@
   import { reloadSnapshot } from '../lib/state';
   import type { ActionHint, DeploymentSnapshot, HintedAction } from '../lib/types';
   import { describeRefusal } from '../lib/vocabulary';
+  import { primaryAction } from '../lib/presentation';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import Refusal from './Refusal.svelte';
 
   // SPEC R16–R18 (ADR 0040 §8, plan KTD16): a model's lifecycle actions, or one
   // instance's when `instance` is set, offered as the snapshot's hints say.
   // The server's validation still decides; a refusal shows its reason.
-  let { deployment, instance }: { deployment: DeploymentSnapshot; instance?: number } = $props();
+  let { deployment, instance, onbusy }: { deployment: DeploymentSnapshot; instance?: number; onbusy?: (busy: string | null) => void } = $props();
 
   const LABELS: Record<HintedAction, string> = {
     start: 'Start',
@@ -47,6 +48,9 @@
   }
 
   let busy = $state<string | null>(null);
+  let menu = $state<HTMLDetailsElement>();
+  const primary = $derived(hints.find((h) => h.action === primaryAction(instance === undefined ? deployment.observed_state : deployment.instances.find((i) => i.index === instance)?.observed_state ?? deployment.observed_state) && h.available));
+  $effect(() => { onbusy?.(busy); });
   let error = $state<ApiError | null>(null);
   let changedElsewhere = $state(false);
   // The request a Retry resends unchanged (same key, same body), and what to
@@ -106,6 +110,7 @@
   }
 
   function press(hint: ActionHint) {
+    if (menu) menu.open = false;
     if (hint.action === 'delete') {
       confirmStop = stopsFirst(hint);
       confirming = true;
@@ -143,23 +148,27 @@
 </script>
 
 {#if hints.length > 0}
-  <div class="actions">
+  <div class="actions" aria-busy={busy !== null}>
     <div class="buttons">
-      {#each hints as hint (hint.action)}
-        {@const enabled = hint.available || stopsFirst(hint)}
-        <div class="action">
-          <button
-            type="button"
-            class:danger={hint.action === 'delete'}
-            disabled={!enabled || busy !== null}
-            onclick={() => press(hint)}>{label(hint)}</button
-          >
-          {#if !enabled && hint.reason}
-            <!-- Plan U14: the reason is visible text, not only a tooltip. -->
-            <span class="why">{describeRefusal({ code: hint.reason, message: hint.reason, envelope: 'management' }).reason}</span>
-          {/if}
-        </div>
-      {/each}
+      {#if primary}
+        <button type="button" class="primary" disabled={busy !== null} onclick={() => press(primary)}>{#if busy}<span class="spinner" aria-hidden="true"></span>{/if}{label(primary)}</button>
+      {/if}
+      {#if hints.some((hint) => hint !== primary)}
+        <details class="overflow" bind:this={menu}>
+          <summary aria-label={`More actions for ${deployment.name}${instance === undefined ? '' : ` instance ${instance}`}`}>⋯</summary>
+          <div class="menu-items">
+            {#each hints.filter((hint) => hint !== primary) as hint (hint.action)}
+              {@const enabled = hint.available || stopsFirst(hint)}
+              <div>
+                <button type="button" class:danger={hint.action === 'delete'} disabled={!enabled || busy !== null} onclick={() => press(hint)}>{label(hint)}</button>
+                {#if !enabled && hint.reason}
+                  <span class="why">{describeRefusal({ code: hint.reason, message: hint.reason, envelope: 'management' }).reason}</span>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        </details>
+      {/if}
     </div>
     {#if busy}
       <p class="busy" role="status">{busy}</p>
@@ -200,44 +209,11 @@
 </ConfirmDialog>
 
 <style>
-  .buttons {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-  }
-  .action {
-    display: flex;
-    flex-direction: column;
-    gap: 0.125rem;
-  }
-  .why {
-    font-size: 0.8125rem;
-    color: var(--capyctl-muted);
-    max-width: 14rem;
-  }
-  .danger {
-    color: var(--capyctl-danger);
-  }
-  .busy,
-  .changed {
-    margin: 0.5rem 0;
-  }
-  .follow-up {
-    display: flex;
-    gap: 0.5rem;
-    margin-top: 0.5rem;
-  }
-  /* SPEC R36: on a phone each action is a full-width button. */
-  @media (max-width: 767.98px) {
-    .buttons,
-    .follow-up {
-      flex-direction: column;
-    }
-    .why {
-      max-width: none;
-    }
-    button {
-      width: 100%;
-    }
-  }
+  .buttons, .follow-up { display: flex; align-items: flex-start; gap: 0.5rem; }
+  .danger { color: var(--capyctl-danger); }
+  .busy, .changed { margin: 0.5rem 0; font-size: 0.8125rem; }
+  .follow-up { margin-top: 0.5rem; flex-wrap: wrap; }
+  .spinner { display: inline-block; width: 0.75rem; height: 0.75rem; margin-right: 0.375rem; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
 </style>
