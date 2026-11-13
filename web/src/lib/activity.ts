@@ -1,7 +1,7 @@
 import { createParser } from 'eventsource-parser';
 import { ApiError, parseError, signedOut, uiHeaders } from './api';
 import { EVENTS_PATH } from './events';
-import type { EventKind, ManagementEvent, ManagementEventData } from './types';
+import { STREAM_ERROR_EVENT, type EventKind, type ManagementEvent, type ManagementEventData } from './types';
 
 // SPEC R14, R15: each event kind in the guide's words. Internal terms
 // (leases, epochs, reservations, fencing) never appear.
@@ -78,9 +78,11 @@ export interface ActivityPage {
 // and including sequence `through`, then closes the stream. The stream sends
 // a heartbeat only once it has nothing more, so a heartbeat ends the read too.
 async function readRange(after: string | null, through: number, signal: AbortSignal): Promise<ManagementEvent[]> {
+  signal.throwIfAborted();
   const controller = new AbortController();
   const abort = () => controller.abort();
-  signal.addEventListener('abort', abort);
+  signal.addEventListener('abort', abort, { once: true });
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   try {
     // ADR 0040 (plan KTD8): the cursor travels in Last-Event-ID.
     const headers = uiHeaders({ Accept: 'text/event-stream' });
@@ -94,6 +96,7 @@ async function readRange(after: string | null, through: number, signal: AbortSig
       cache: 'no-store',
       signal: controller.signal,
     });
+    signal.throwIfAborted();
     if (!response.ok || response.body === null) {
       if (response.status === 401) {
         signedOut();
@@ -110,7 +113,13 @@ async function readRange(after: string | null, through: number, signal: AbortSig
     let done = false;
     const parser = createParser({
       onEvent: (message) => {
-        if (done || message.id === undefined || message.event === undefined) {
+        if (done) {
+          return;
+        }
+        if (message.event === STREAM_ERROR_EVENT) {
+          throw parseError(200, JSON.parse(message.data));
+        }
+        if (message.id === undefined || message.event === undefined) {
           return;
         }
         const sequence = cursorParts(message.id).sequence;
@@ -127,19 +136,41 @@ async function readRange(after: string | null, through: number, signal: AbortSig
         done = true;
       },
     });
-    const reader = response.body.getReader();
+    reader = response.body.getReader();
     const decoder = new TextDecoder();
     while (!done) {
       const { done: ended, value } = await reader.read();
       if (ended) {
-        break;
+        // SPEC R14: only reaching `through` or the server's caught-up
+        // heartbeat proves this page complete. A lifetime end is not proof,
+        // so the caller must retry this page instead of advancing past it.
+        throw new Error('Activity stream ended before the page was complete.');
       }
       parser.feed(decoder.decode(value, { stream: true }));
     }
-    controller.abort();
+    signal.throwIfAborted();
     return events;
+  } catch (caught) {
+    signal.throwIfAborted();
+    if (caught instanceof ApiError) {
+      throw caught;
+    }
+    throw new ApiError({
+      status: 0,
+      code: null,
+      message: 'Activity stopped arriving before this page was complete. Show older events to try again.',
+      retryable: true,
+      operationId: null,
+      details: {},
+      envelope: 'none',
+    });
   } finally {
     signal.removeEventListener('abort', abort);
+    controller.abort();
+    if (reader !== null) {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
   }
 }
 

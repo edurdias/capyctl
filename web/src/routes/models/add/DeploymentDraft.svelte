@@ -3,8 +3,8 @@
   import Refusal from '../../../components/Refusal.svelte';
   import YamlEditor from '../../../components/yaml-editor/YamlEditor.svelte';
   import { ApiError } from '../../../lib/api';
-  import { checkDeployment, type CheckResult, type Fit } from '../../../lib/deployment-check';
-  import { applyField, hasComments, parseDraft, readForm, RESIDENCIES, type Field } from '../../../lib/deployment-draft';
+  import { checkDeployment, checkErrors, type CheckResult, type Fit } from '../../../lib/deployment-check';
+  import { applyField, hasComments, parseDraft, readForm, RESIDENCIES, type DraftError, type Field } from '../../../lib/deployment-draft';
   import { lostResponse } from '../../../lib/operate';
   import { UNKNOWN_FIT_REASONS } from '../../../lib/vocabulary';
 
@@ -70,7 +70,7 @@
       inFlight = controller;
       checkDeployment(current, controller.signal).then(
         (answer) => {
-          if (inFlight === controller) {
+          if (inFlight === controller && !controller.signal.aborted && current === text) {
             inFlight = null;
             checking = false;
             result = answer;
@@ -78,7 +78,7 @@
           }
         },
         (error: unknown) => {
-          if (inFlight === controller) {
+          if (inFlight === controller && !controller.signal.aborted && current === text) {
             inFlight = null;
             checking = false;
             checkError = error instanceof ApiError ? error : lostResponse();
@@ -91,29 +91,33 @@
   onDestroy(() => {
     clearTimeout(timer);
     inFlight?.abort();
+    inFlight = null;
   });
 
   // Errors in the text show at once; the server's own once it answers.
-  const errors = $derived(invalid ? draft.errors : (result?.errors ?? []));
+  // C1: HTTP 400 still carries errors[].position beside the error envelope.
+  const serverErrors = $derived(checkErrors(checkError));
+  const errors = $derived(serverErrors.length > 0 ? serverErrors : (invalid ? draft.errors : (result?.errors ?? [])));
 
-  function where(error: { line?: number; column?: number }): string {
-    if (error.line === undefined) {
-      return '';
+  function where(error: DraftError): string {
+    if (!error.position) {
+      return error.path ? `${error.path}: ` : '';
     }
-    return error.column === undefined ? `Line ${error.line}: ` : `Line ${error.line}, column ${error.column}: `;
+    return `Line ${error.position.line}, column ${error.position.column}: `;
   }
 
   function fitText(fit: Fit): string {
-    const on = fit.host_id ? ` on ${fit.host_id}` : '';
     switch (fit.verdict) {
       case 'fits':
-        return `It fits in memory${on}.`;
+        return 'It fits in memory.';
       case 'needs_room':
-        return `It fits${on}, but starting it will switch other models out to make room.`;
-      case 'does_not_fit':
-        return `It does not fit in memory${on}: ${fit.limit ?? 'a memory limit is too small'}. You can still add it and change it later.`;
+        return 'It fits, but starting it will switch other models out to make room.';
+      case 'does_not_fit': {
+        const limit = typeof fit.limit === 'object' && fit.limit !== null ? JSON.stringify(fit.limit) : fit.limit;
+        return `It does not fit in memory: ${limit ?? 'a memory limit is too small'}. You can still add it and change it later.`;
+      }
       default:
-        return UNKNOWN_FIT_REASONS[fit.reason ?? ''] ?? 'CapyCTL cannot tell yet whether the model fits.';
+        return UNKNOWN_FIT_REASONS[fit.reason ?? ''] ?? fit.reason ?? 'CapyCTL cannot tell yet whether the model fits.';
     }
   }
 
@@ -225,9 +229,21 @@
   {:else if checkError}
     <Refusal error={checkError} />
   {:else if result}
-    <p class="fit" data-verdict={result.fit.verdict}>{fitText(result.fit)}</p>
-    {#if result.fit.estimated}
+    <p class="fit" data-verdict={result.verdict}>{fitText(result)}</p>
+    {#if result.estimated}
       <p class="muted">{ESTIMATED}</p>
+    {/if}
+    {#if result.hosts.length > 0}
+      <ul aria-label="Fit by host">
+        {#each result.hosts as host (host.host_id)}
+          <li data-host={host.host_id} data-verdict={host.verdict}>
+            <strong>{host.host_id}:</strong> {fitText(host)}
+            {#if host.estimated}
+              <span class="muted">{ESTIMATED}</span>
+            {/if}
+          </li>
+        {/each}
+      </ul>
     {/if}
   {:else if checking}
     <p class="muted">Checking whether it fits…</p>

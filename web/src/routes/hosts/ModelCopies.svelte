@@ -3,6 +3,7 @@
   import Refusal from '../../components/Refusal.svelte';
   import type { ApiError } from '../../lib/api';
   import { modelCopies, pruneCopies, type ModelCopy } from '../../lib/host-admin';
+  import { gib } from '../../lib/presentation';
 
   // SPEC R27 (ADR 0040 §10): the model copies on a host, and pruning the
   // ones no deployment uses.
@@ -36,7 +37,6 @@
     }
   }
 
-  const gib = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
   const unused = $derived((copies ?? []).filter((copy) => !copy.referenced).length);
 </script>
 

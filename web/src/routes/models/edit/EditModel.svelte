@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { stringify } from 'yaml';
   import Refusal from '../../../components/Refusal.svelte';
   import { ApiError, request } from '../../../lib/api';
   import { replaceDeployment, type CheckResult } from '../../../lib/deployment-check';
@@ -11,9 +10,8 @@
   import { DEPLOYMENTS } from '../../../lib/setup-endpoints';
   import DeploymentDraft from '../add/DeploymentDraft.svelte';
 
-  // SPEC R23 (plan U15): edit a model's configuration. The draft starts from
-  // the effective configuration, secrets redacted as the server sends them,
-  // and is replaced against the revision it was read at.
+  // SPEC R23 (plan U15), C2: edit the accepted source, with secrets redacted,
+  // and replace it against the revision it was read at.
   let { id }: { id: string } = $props();
 
   let text = $state('');
@@ -23,12 +21,8 @@
   async function load(): Promise<void> {
     loadError = null;
     try {
-      const view = await request<{ revision: number | string; effective: Record<string, unknown> }>(DEPLOYMENTS.effectiveConfig(id));
-      // configuration.rs `add_custom_commands`: a view of the command, not
-      // part of the deployment file.
-      const config = { ...view.effective };
-      delete config.custom_command;
-      text = stringify(config);
+      const view = await request<{ revision: string; config: Record<string, unknown>; yaml: string }>(DEPLOYMENTS.source(id));
+      text = view.yaml;
       revision = Number(view.revision);
       error = null;
     } catch (failure) {

@@ -3,7 +3,7 @@
   import Refusal from '../../components/Refusal.svelte';
   import { ApiError } from '../../lib/api';
   import { deleteConversation, loadConversation, saveConversation, type ChatMessage } from '../../lib/history';
-  import { streamChat } from '../../lib/playground';
+  import { playgroundError, streamChat } from '../../lib/playground';
   import { snapshot } from '../../lib/state';
   import type { DeploymentSnapshot } from '../../lib/types';
   import { stateWord } from '../../lib/vocabulary';
@@ -67,14 +67,11 @@
       }
       keep([...asked, answer]);
     } catch (caught) {
-      if (caught instanceof DOMException && caught.name === 'AbortError') {
+      if (controller.signal.aborted) {
         return;
       }
-      if (!(caught instanceof ApiError)) {
-        throw caught;
-      }
-      error = caught;
-      offerStart = caught.code === 'deployment_stopped';
+      error = playgroundError(caught);
+      offerStart = error.code === 'deployment_stopped';
     } finally {
       outstanding = false;
       streaming = null;

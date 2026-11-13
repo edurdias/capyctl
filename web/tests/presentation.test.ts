@@ -1,8 +1,8 @@
 // ADR 0040 owner decision 2026-11-13 / plan U20: display calculations only.
 import { describe, expect, it } from 'vitest';
-import { duration, kvPercent, memorySegments, primaryAction, reservation, sparkPoints, timing, trend } from '../src/lib/presentation';
+import { currentSeries, duration, kvPercent, memorySegments, primaryAction, reservation, sparkPoints, timing, trend } from '../src/lib/presentation';
 import { deployment, instance } from './fixtures';
-import type { LatencySeries } from '../src/lib/reads';
+import { hostHealth, type HostRow, type LatencyReport, type LatencySeries } from '../src/lib/reads';
 const domain = { domain_id: 'unified', kind: 'unified', capacity_bytes: 128, available_bytes: 80 };
 
 describe('U20 memory accounting', () => {
@@ -21,18 +21,42 @@ describe('U20 memory accounting', () => {
     expect(new Set(segments.map((s) => s.id)).size).toBe(2);
   });
   it('uses split startup budgets on discrete domains without duplicating host bytes', () => {
-    const model = deployment({ startup: { bytes: 25, provenance: 'declared', device_bytes: 20, host_bytes: 5 } });
-    expect(memorySegments([model], 'gpu-box', { ...domain, kind: 'device' })[0].bytes).toBe(20);
+    const model = deployment({ startup: { bytes: 25, provenance: 'declared', device_bytes: 20, host_bytes: 5 }, instances: [{ ...instance(0, 'ready'), devices: [{ id: 'gpu0' }, { id: 'gpu1' }] }] });
+    expect(memorySegments([model], 'gpu-box', { ...domain, domain_id: 'gpu0', device_id: 'gpu0', kind: 'device' })[0].bytes).toBe(10);
+    expect(memorySegments([model], 'gpu-box', { ...domain, domain_id: 'gpu1', device_id: 'gpu1', kind: 'device' })[0].bytes).toBe(10);
+    expect(memorySegments([model], 'gpu-box', { ...domain, domain_id: 'gpu2', device_id: 'gpu2', kind: 'device' })).toEqual([]);
     expect(memorySegments([model], 'gpu-box', { ...domain, kind: 'host' })[0].bytes).toBe(5);
   });
   it('uses measured parked domain bytes and excludes stopped instances', () => {
-    const model = deployment({ parked: { bytes: 10, provenance: 'measured', measured: [{ host_id: 'gpu-box', installation: 'engine', domain: 'gpu0', bytes: 2, measured_at_ms: 1 }] }, instances: [instance(0, 'parked'), instance(1, 'stopped')] });
+    const model = deployment({ parked: { bytes: 10, provenance: 'measured', measured: [{ host_id: 'gpu-box', installation: 'engine', domain: 'gpu0', bytes: 2, measured_at_ms: 1 }] }, instances: [{ ...instance(0, 'parked'), devices: [{ id: 'gpu0' }] }, instance(1, 'stopped')] });
     expect(memorySegments([model], 'gpu-box', { ...domain, domain_id: 'gpu0', kind: 'device' })[0].bytes).toBe(2);
     expect(reservation(deployment({ startup: { bytes: 20, provenance: 'declared' }, instances: [instance(0, 'stopped')] }))).toBe(0);
+  });
+  // SPEC R10 / ADR 0019: an unsplit parked total cannot identify RAM residence.
+  it('does not invent host RAM or GPU residence from an unmeasured parked budget', () => {
+    const model = deployment({ parked: { bytes: 10, provenance: 'placeholder' }, instances: [{ ...instance(0, 'parked'), devices: ['gpu0'] }] });
+    expect(memorySegments([model], 'gpu-box', { ...domain, kind: 'host' })).toEqual([]);
+    expect(memorySegments([model], 'gpu-box', { ...domain, domain_id: 'gpu0', kind: 'device' })).toEqual([]);
   });
 });
 
 describe('U20 telemetry presentation', () => {
+  // SPEC R10, R13: retain host health and fence historical launch histograms.
+  it('keeps an online but silent host unresponsive', () => {
+    expect(hostHealth({ online: true, revoked: false, session: { unresponsive: true } } as HostRow)).toBe('unresponsive');
+  });
+  it('selects the current instance generation, including generation-scoped engine reports', () => {
+    const old: LatencySeries = { name: 'engine_inter_token_latency', source: 'engine', tier: 'engine', count: 8, p50_seconds: 9, p95_seconds: 10 };
+    const current = { ...old, p50_seconds: 1 };
+    const report: LatencyReport = { deployments: [{ deployment_id: 'dep-1', instances: [
+      { instance: 0, generation: 1, host_id: 'gpu-box', engine: 'vllm', series: [old] },
+      { instance: null, generation: 2, host_id: 'gpu-box', engine: 'vllm', series: [current] },
+      { instance: 1, generation: 2, host_id: 'gpu-box', engine: 'vllm', series: [old] },
+    ] }] };
+    const model = deployment({ id: 'dep-1', instances: [{ ...instance(0, 'ready'), generation: '2' }] });
+    expect(currentSeries(report, model)).toEqual([current]);
+    expect(currentSeries(report, { ...model, instances: [{ ...instance(0, 'ready'), generation: '3' }] })).toEqual([]);
+  });
   it.each([[15.2, '15.2 s'], [0.025, '25 ms'], [null, '–']])('humanises %s seconds', (input, expected) => expect(duration(input as number | null)).toBe(expected));
   it('bounds the client trend to 24 actual reads and does not turn missing values into zero', () => {
     let samples: (number | null)[] = [];

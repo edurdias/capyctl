@@ -8,6 +8,8 @@ export const DEPLOYMENTS = {
   create: '/management/v1/deployments',
   replace: (id: string) => `/management/v1/deployments/${encodeURIComponent(id)}`,
   check: '/management/v1/deployments/check',
+  // C2: edit the accepted source, never the frozen effective deployment.
+  source: (id: string) => `/management/v1/deployments/${encodeURIComponent(id)}/source`,
   effectiveConfig: (id: string) => `/management/v1/deployments/${encodeURIComponent(id)}/effective-config`,
 } as const;
 

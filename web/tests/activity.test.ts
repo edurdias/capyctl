@@ -62,4 +62,51 @@ describe('Activity', () => {
     expect(document.body.textContent).toContain('Older events are not kept');
     expect(document.body.textContent).not.toContain('Show older events');
   });
+
+  // SPEC R14: a short or failed stream is not a completed history page.
+  it.each(['ended', 'terminal error'])('retries the same page without skipping after its stream %s', async (ending) => {
+    const requests: Array<string | null> = [];
+    role({
+      snapshots: [snapshotWith([deployment()], 120)],
+      route: (call) => {
+        if (call.url !== EVENTS || call.headers.get('Last-Event-ID') === cursor(120)) {
+          return undefined;
+        }
+        const after = call.headers.get('Last-Event-ID');
+        requests.push(after);
+        const stream = new StreamMock(call.signal);
+        if (requests.length === 1) {
+          page(stream, 71, 85);
+          if (ending === 'terminal error') {
+            stream.raw('event: management_stream_error\ndata: {"api_version":"1","error":{"code":"internal","resnapshot_required":false,"retryable":true}}\n\n');
+          }
+          stream.end();
+        } else if (after === cursor(70)) {
+          page(stream, 71, 120);
+        } else if (after === cursor(20)) {
+          page(stream, 21, 70);
+        } else {
+          throw new Error(`unexpected cursor ${after}`);
+        }
+        return stream.response;
+      },
+    });
+    await open('/activity');
+    await tick();
+    expect(requests).toEqual([cursor(70)]);
+    expect(document.querySelectorAll('.events li')).toHaveLength(0);
+    expect(document.querySelector('[role="alert"]')).not.toBeNull();
+    expect(document.body.textContent).not.toContain('Older events are not kept');
+
+    button('Show older events').click();
+    await tick();
+    expect(requests).toEqual([cursor(70), cursor(70)]);
+    expect(document.querySelectorAll('.events li')).toHaveLength(50);
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+
+    button('Show older events').click();
+    await tick();
+    expect(requests).toEqual([cursor(70), cursor(70), cursor(20)]);
+    expect(document.querySelectorAll('.events li')).toHaveLength(100);
+  });
 });

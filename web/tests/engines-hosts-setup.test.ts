@@ -97,12 +97,131 @@ describe('custom engines', () => {
     await tick();
     expect(previews).toHaveLength(2);
     expect(text()).toContain('/opt/engine/serve-v2 --port {port}');
-    expect(text()).toContain('The engine changed on the host after you reviewed it.');
+    expect(text()).toContain('The host’s details changed after you reviewed the change.');
     expect(button('Confirm').disabled).toBe(true);
   });
 });
 
 describe('host administration', () => {
+  // SPEC R27, ADR 0040 §10 (U16)
+  it('lists model copies and reloads after pruning only unused copies', async () => {
+    const used = { key: 'models/chat', bytes: 4 * 1024 ** 3, referenced: true };
+    const unused = { key: 'models/old', bytes: 2 * 1024 ** 3, referenced: false };
+    const prunes: Call[] = [];
+    let lists = 0;
+    role({
+      snapshots: [snapshotWith([])],
+      route: (call) => {
+        if (call.url === `${HOST}/model-store`) {
+          lists += 1;
+          return json({ copies: prunes.length ? [used] : [used, unused] });
+        }
+        if (call.url === `${HOST}/model-store/prune`) {
+          prunes.push(call);
+          return json({ removed: [{ key: unused.key, bytes: unused.bytes }], removed_bytes: unused.bytes });
+        }
+        return undefined;
+      },
+    });
+    await open(`/hosts/${STANDALONE_HOST.host_id}`);
+    expect(text()).toContain('models/chat');
+    expect(text()).toContain('4.0 GiB');
+    expect(text()).toContain('models/old');
+    expect(text()).toContain('2.0 GiB (unused)');
+    expect(button('Remove unused copies').disabled).toBe(false);
+    button('Remove unused copies').click();
+    await tick();
+    expect(prunes).toHaveLength(1);
+    expect(prunes[0].method).toBe('POST');
+    expect(JSON.parse(prunes[0].body ?? '{}')).toEqual({ apply: true });
+    expect(lists).toBe(2);
+    expect(text()).toContain('Removed 1 copy, 2.0 GiB.');
+    expect(text()).toContain('models/chat');
+    expect(text()).not.toContain('models/old');
+    expect(button('Remove unused copies').disabled).toBe(true);
+  });
+
+  // SPEC R27, ADR 0040 §10 (U16)
+  it('shows an empty model store without offering pruning', async () => {
+    const api = role({
+      snapshots: [snapshotWith([])],
+      route: (call) => call.url === `${HOST}/model-store` ? json({ copies: [] }) : undefined,
+    });
+    await open(`/hosts/${STANDALONE_HOST.host_id}`);
+    expect(text()).toContain('No model has been downloaded to this host.');
+    expect(buttons('Remove unused copies')).toHaveLength(0);
+    expect(api.posts()).toHaveLength(0);
+  });
+
+  // SPEC R24, ADR 0040 §10 (U16)
+  it('preserves an in-use engine and its model usage when removal is refused', async () => {
+    const removals: Call[] = [];
+    const engine = { host_id: STANDALONE_HOST.host_id, host: STANDALONE_HOST.name, online: true, profile: 'sglang-main', engine: 'sglang', version: '0.5.22', custom: false, retiring: false, deployments: ['chat', 'coder'] };
+    role({
+      snapshots: [snapshotWith([])],
+      route: (call) => {
+        if (call.url === '/management/v1/engines') {
+          return json({ engines: [engine] });
+        }
+        if (call.url === `${HOST}/engines/sglang-main/remove`) {
+          removals.push(call);
+          return managementError(409, 'profile_in_use');
+        }
+        return undefined;
+      },
+    });
+    await open('/engines');
+    document.querySelector('details.overflow')?.setAttribute('open', '');
+    button('Remove').click();
+    await tick();
+    expect(removals).toHaveLength(1);
+    expect(removals[0].method).toBe('POST');
+    expect(JSON.parse(removals[0].body ?? '{}')).toEqual({});
+    expect(document.querySelector('[role="alert"]')).not.toBeNull();
+    const row = document.querySelector('tbody tr')!;
+    expect(row.textContent).toContain('sglang-main');
+    expect(row.textContent).toContain('chat, coder');
+    expect(row.textContent).toContain('2 models');
+    expect(row.textContent).toContain('available');
+    expect(text()).not.toContain('being removed');
+    expect(button('Remove').disabled).toBe(false);
+  });
+
+  // SPEC R24, ADR 0040 §10 (U16): a 202 is not completed removal.
+  it('follows accepted removal through retiring until the engine disappears', async () => {
+    const removals: Call[] = [];
+    const engine = { host_id: STANDALONE_HOST.host_id, host: STANDALONE_HOST.name, online: true, profile: 'sglang-main', engine: 'sglang', version: '0.5.22', custom: false, retiring: false, deployments: [] };
+    let gone = false;
+    role({
+      snapshots: [snapshotWith([])],
+      route: (call) => {
+        if (call.url === '/management/v1/engines') {
+          return json({ engines: gone ? [] : [{ ...engine, retiring: removals.length > 0 }] });
+        }
+        if (call.url === `${HOST}/engines/sglang-main/remove`) {
+          removals.push(call);
+          return json({ retiring: true }, 202);
+        }
+        return undefined;
+      },
+    });
+    await open('/engines');
+    document.querySelector('details.overflow')?.setAttribute('open', '');
+    button('Remove').click();
+    await tick();
+    expect(removals).toHaveLength(1);
+    expect(text()).toContain('sglang-main');
+    expect(text()).toContain('being removed');
+    expect(buttons('Remove')).toHaveLength(0);
+    expect(document.querySelector('[aria-label="Actions for sglang-main"]')).toBeNull();
+    gone = true;
+    await tick(5000);
+    expect(text()).not.toContain('sglang-main');
+    expect(text()).not.toContain('being removed');
+    expect(text()).toContain('No engines are installed on this host.');
+    expect(removals).toHaveLength(1);
+  });
+
   // ADR 0040 §10
   it('shows the update instruction when the host refuses host_capability_missing:host_admin', async () => {
     role({

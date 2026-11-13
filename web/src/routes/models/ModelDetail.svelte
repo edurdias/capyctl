@@ -6,8 +6,8 @@
   import StateBadge from '../../components/StateBadge.svelte';
   import { ApiError } from '../../lib/api';
   import { livePoll } from '../../lib/poll';
-  import { duration, engineName, gib, kvPercent, reservation, sparkPoints, timing, trend } from '../../lib/presentation';
-  import { readEffectiveConfig, readEngineLog, readEngines, readLatency, readLoad, type EffectiveConfig, type EngineLog, type EngineRow, type LatencySeries, type LoadDeployment } from '../../lib/reads';
+  import { currentSeries, duration, engineName, gib, kvPercent, reservation, sparkPoints, timing, trend } from '../../lib/presentation';
+  import { readEffectiveConfig, readEngineLog, readEngines, readLatency, readLoad, type EffectiveConfig, type EngineLog, type EngineRow, type LatencyReport, type LoadDeployment } from '../../lib/reads';
   import { href, link } from '../../lib/router';
   import { snapshot } from '../../lib/state';
   let { id }: { id: string } = $props();
@@ -18,7 +18,10 @@
   let busy = $state<string | null>(null);
   let engines = $state<EngineRow[]>([]);
   let load = $state<LoadDeployment | null>(null);
-  let series = $state<LatencySeries[]>([]);
+  let latency = $state<LatencyReport>({ deployments: [] });
+  // SPEC R13: current launches drive live tiles; older launches are previous evidence only.
+  const series = $derived(deployment ? live ? currentSeries(latency, deployment)
+    : latency.deployments.find((d) => d.deployment_id === deployment.id)?.instances.flatMap((i) => i.series) ?? [] : []);
   let samples = $state<Record<string, (number | null)[]>>({});
   let config = $state<EffectiveConfig | null>(null);
   let configError = $state<ApiError | null>(null);
@@ -53,7 +56,7 @@
   onMount(() => livePoll(async () => {
     const [loadReport, latencyReport] = await Promise.all([readLoad(id), readLatency(id)]);
     load = loadReport.deployments.find((d) => d.deployment_id === id) ?? null;
-    series = latencyReport.deployments.find((d) => d.deployment_id === id)?.instances.flatMap((i) => i.series) ?? [];
+    latency = latencyReport;
     samples = live ? Object.fromEntries(metrics().map((m) => [m.key, trend(samples[m.key] ?? [], m.value)])) : {};
   }, 5000));
   onMount(() => {

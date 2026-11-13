@@ -5,8 +5,9 @@ import { isMap, isScalar, isSeq, parseDocument, type Document } from 'yaml';
 
 export interface DraftError {
   message: string;
-  line?: number;
-  column?: number;
+  path?: string | null;
+  // C1: parser lines are 1-based and columns are 0-based.
+  position?: { line: number; column: number } | null;
 }
 
 export interface Draft {
@@ -19,8 +20,9 @@ export function parseDraft(text: string): Draft {
   const doc = parseDocument(text, { prettyErrors: false });
   const errors: DraftError[] = doc.errors.map((error) => ({
     message: error.message.split('\n')[0],
-    line: error.linePos?.[0]?.line,
-    column: error.linePos?.[0]?.col,
+    position: error.linePos?.[0]
+      ? { line: error.linePos[0].line, column: error.linePos[0].col - 1 }
+      : null,
   }));
   if (errors.length === 0 && doc.contents !== null && !isMap(doc.contents)) {
     errors.push({ message: 'A deployment file is a mapping of fields, such as `name: my-model`.' });
@@ -165,6 +167,6 @@ export function hasComments(text: string): boolean {
   return /(^|\s)#/.test(text);
 }
 
-// What the effective-config read writes in place of a secret
+// What the accepted-source read writes in place of a secret
 // (crates/capyctl-management/src/configuration.rs `REDACTED`).
 export const REDACTED = '[redacted]';

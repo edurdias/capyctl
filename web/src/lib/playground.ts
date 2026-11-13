@@ -40,6 +40,21 @@ function lostAnswer(): ApiError {
   });
 }
 
+// SPEC R15, R30–R31: transport failures belong in the playground's refusal UI.
+export function playgroundError(caught: unknown): ApiError {
+  return caught instanceof ApiError
+    ? caught
+    : new ApiError({
+        status: 0,
+        code: null,
+        message: 'The connection to the model was interrupted. Please try again.',
+        retryable: true,
+        operationId: null,
+        details: {},
+        envelope: 'none',
+      });
+}
+
 async function refusal(response: Response): Promise<ApiError> {
   let body: unknown = undefined;
   try {
@@ -57,7 +72,12 @@ export async function streamChat(model: string, messages: ChatMessage[], handler
   const sentAt = performance.now();
   const response = await send(PLAYGROUND.chat, {
     method: 'POST',
-    body: { model, messages: messages.map(({ role, content }) => ({ role, content })), stream: true },
+    body: {
+      model,
+      messages: messages.map(({ role, content }) => ({ role, content })),
+      stream: true,
+      stream_options: { include_usage: true },
+    },
     headers: { Accept: 'text/event-stream' },
     signal: handlers.signal,
   });
@@ -71,13 +91,15 @@ export async function streamChat(model: string, messages: ChatMessage[], handler
   let content = '';
   let firstAt: number | null = null;
   let lastAt: number | null = null;
-  let chunks = 0;
   let reportedTokens: number | null = null;
   let done = false;
   let failure: ApiError | null = null;
 
   const parser = createParser({
     onEvent: (event) => {
+      if (done || failure !== null) {
+        return;
+      }
       if (event.data === '[DONE]') {
         done = true;
         return;
@@ -103,7 +125,6 @@ export async function streamChat(model: string, messages: ChatMessage[], handler
       const now = performance.now();
       firstAt ??= now;
       lastAt = now;
-      chunks += 1;
       content += text;
       handlers.onContent(text);
     },
@@ -121,21 +142,22 @@ export async function streamChat(model: string, messages: ChatMessage[], handler
   if (failure !== null) {
     throw failure;
   }
-  if (!done && firstAt === null) {
+  // SPEC R30, R32: EOF is not completion; never save a truncated answer.
+  if (!done) {
     throw lostAnswer();
   }
-  return { content, timings: timings(sentAt, firstAt, lastAt, reportedTokens ?? chunks) };
+  return { content, timings: timings(sentAt, firstAt, lastAt, reportedTokens) };
 }
 
-function timings(sentAt: number, firstAt: number | null, lastAt: number | null, tokens: number): Timings | null {
+function timings(sentAt: number, firstAt: number | null, lastAt: number | null, tokens: number | null): Timings | null {
   if (firstAt === null || lastAt === null) {
     return null;
   }
   const generating = (lastAt - firstAt) / 1000;
   return {
     ttft_ms: firstAt - sentAt,
-    // The first token's arrival starts the clock, so it is not counted.
-    tokens_per_second: generating > 0 && tokens > 1 ? (tokens - 1) / generating : null,
+    // SPEC R30: SSE chunks are not tokens; omit throughput without usage.
+    tokens_per_second: tokens !== null && generating > 0 && tokens > 1 ? (tokens - 1) / generating : null,
   };
 }
 
@@ -204,11 +226,12 @@ function answerOf(answer: RawAnswer): DecisionAnswer {
 
 // SPEC R31: a typed question to `/v1/systemone`; the answer is never
 // streamed.
-export async function decide(model: string, state: string, question: DecisionQuestion): Promise<DecisionResult> {
+export async function decide(model: string, state: string, question: DecisionQuestion, signal?: AbortSignal): Promise<DecisionResult> {
   const sentAt = performance.now();
   const answer = await request<{ answers?: Record<string, RawAnswer> }>(PLAYGROUND.decisions, {
     method: 'POST',
     body: { model, state, questions: { question: questionBody(question) } },
+    signal,
   });
   const answers = Object.fromEntries(Object.entries(answer?.answers ?? {}).map(([id, raw]) => [id, answerOf(raw)]));
   return { answers, total_ms: performance.now() - sentAt };

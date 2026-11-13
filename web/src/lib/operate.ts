@@ -144,6 +144,9 @@ export async function revokeHost(host: string): Promise<void> {
 }
 
 const OPEN: Record<string, true> = { pending: true, running: true };
+// client.rs `WAIT_MARGIN_MS`: allow cleanup evidence to arrive after Stop's
+// own deadline, but never leave Stop and delete waiting indefinitely.
+const WAIT_MARGIN_MS = 10_000;
 
 // crates/capyctl-cli/src/client/delete.rs: the stop has settled once the
 // deployment has no open operation and the stop itself (when one was
@@ -157,30 +160,45 @@ function stopSettled(value: Snapshot, deploymentId: string, operationId: string 
   if (deployment === undefined || deployment.observed_state === 'stopped') {
     return true;
   }
-  return operationId !== null && operations.some((op) => op.id === operationId);
+  return operationId === null || operations.some((op) => op.id === operationId);
 }
 
-// Resolves once the live snapshot, kept current by the event stream, shows
-// the stop settled. Rejects with an AbortError when `signal` aborts (the
-// screen closed: the model is left stopped and plain Delete is offered next
-// time, plan KTD16).
-export function waitForStop(deploymentId: string, operationId: string | null, signal: AbortSignal): Promise<void> {
+// SPEC §6.3, plan KTD16: wait for the live snapshot to show cleanup settled,
+// bounded exactly as delete.rs does. Closing the screen abandons only this
+// wait, not the accepted Stop; ordinary Delete must not follow an abort.
+export function waitForStop(deploymentId: string, operationId: string | null, deadlineMs: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) {
+    return Promise.reject(new DOMException('The wait was abandoned.', 'AbortError'));
+  }
   return new Promise((resolve, reject) => {
     let unsubscribe: (() => void) | null = null;
+    let finished = false;
     const finish = (done: () => void) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
       signal.removeEventListener('abort', onAbort);
       unsubscribe?.();
       unsubscribe = null;
       done();
     };
     const onAbort = () => finish(() => reject(new DOMException('The wait was abandoned.', 'AbortError')));
+    const remaining = Math.max(deadlineMs - Date.now() + WAIT_MARGIN_MS, WAIT_MARGIN_MS);
+    const timer = setTimeout(() => finish(() => reject(new ApiError({
+      status: 409,
+      code: 'delete_requires_cleanup',
+      message: 'Cleanup is still pending. The model has not been deleted.',
+      retryable: false,
+      operationId,
+      details: {},
+      envelope: 'none',
+    }))), remaining);
     signal.addEventListener('abort', onAbort);
-    let settled = false;
     unsubscribe = snapshot.subscribe((value) => {
-      if (!settled && value !== null && stopSettled(value, deploymentId, operationId)) {
-        settled = true;
-        // The subscription may still be starting; let it return first.
-        queueMicrotask(() => finish(resolve));
+      if (!finished && value !== null && stopSettled(value, deploymentId, operationId)) {
+        // The subscription may still be starting; let it return first. An
+        // abort before this continuation wins over the observed settlement.
+        queueMicrotask(() => signal.aborted ? onAbort() : finish(resolve));
       }
     });
   });
