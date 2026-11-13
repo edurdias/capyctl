@@ -1,7 +1,7 @@
 <script lang="ts">
   import Refusal from '../../components/Refusal.svelte';
   import type { ApiError } from '../../lib/api';
-  import { addEngine, detectEngines, removeEngine, type Candidate } from '../../lib/host-admin';
+  import { addEngine, builtinRequest, confirmEngine, detectEngines, previewEngine, removeEngine, type BuiltinRequest, type Candidate, type CustomPreview } from '../../lib/host-admin';
   import type { EngineRow, HostRow } from '../../lib/reads';
   import CustomEngine from './CustomEngine.svelte';
 
@@ -42,9 +42,46 @@
     });
   }
 
+  // ADR 0040 §10, KTD12: a candidate found only under extra directories is
+  // previewed and confirmed with the typed profile name before it runs.
+  let confirming = $state<{ candidate: Candidate; request: BuiltinRequest; preview: CustomPreview; name: string } | null>(null);
+  let typed = $state('');
+
   async function add(candidate: Candidate): Promise<void> {
-    if (await run(() => addEngine(host.host_id, candidate, (names[candidate.entry] ?? '').trim(), detectedPaths))) {
+    const name = (names[candidate.entry] ?? '').trim();
+    const request = builtinRequest(candidate, name, detectedPaths);
+    if (detectedPaths.length === 0) {
+      if (await run(() => addEngine(host.host_id, request))) {
+        onchange();
+      }
+      return;
+    }
+    await review(candidate, request, name || candidate.engine);
+  }
+
+  async function review(candidate: Candidate, request: BuiltinRequest, name: string): Promise<void> {
+    typed = '';
+    await run(async () => {
+      confirming = { candidate, request, preview: await previewEngine(host.host_id, request), name };
+    });
+  }
+
+  async function confirm(): Promise<void> {
+    if (confirming === null) {
+      return;
+    }
+    const shown = confirming;
+    if (await run(() => confirmEngine(host.host_id, shown.request, shown.preview.digest, typed))) {
+      confirming = null;
+      typed = '';
       onchange();
+      return;
+    }
+    // The host measured something else since the preview: show the new command.
+    if (error?.code === 'confirmation_stale') {
+      const stale = error;
+      await review(shown.candidate, shown.request, shown.name);
+      error = stale;
     }
   }
 
@@ -97,6 +134,17 @@
       </ul>
     {/if}
   {/if}
+  {#if confirming}
+    <div class="review" role="group" aria-label="Confirm the engine">
+      <h4>CapyCTL will run this command on {host.name}</h4>
+      <pre class="command">{confirming.preview.command.join(' ')}</pre>
+      <pre class="summary">{confirming.preview.summary}</pre>
+      <p>It was found outside the host's usual places, and it runs as the CapyCTL user. Type <strong>{confirming.name}</strong> to confirm.</p>
+      <input name="engine-confirm" aria-label="Type the profile name to confirm" bind:value={typed} autocomplete="off" />
+      <button type="button" disabled={busy || typed !== confirming.name} onclick={() => void confirm()}>Confirm</button>
+      <button type="button" disabled={busy} onclick={() => { confirming = null; typed = ''; }}>Cancel</button>
+    </div>
+  {/if}
 
   </section>{/if}
   <!-- ADR 0040 §11 and owner decision 2026-11-13: keep preview and typed
@@ -119,6 +167,10 @@
   td:has(.overflow[open]) { position: relative; }
   .table-scroll:has(.overflow[open]) { min-height: 12rem; }
   dialog { width: 40rem; }
+  .review { margin-top: 1rem; display: grid; gap: 0.5rem; }
+  .review h4 { margin: 0; }
+  .review pre { margin: 0; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .review > button { justify-self: start; }
   li {
     display: flex;
     gap: 0.75rem;

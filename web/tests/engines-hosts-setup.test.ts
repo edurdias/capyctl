@@ -236,10 +236,13 @@ describe('host administration', () => {
     expect(text()).toContain('Update CapyCTL on the host and restart it, then try again.');
   });
 
-  // KTD11 (plan U8): a candidate found under an extra directory is added
-  // with those directories, so the host does not ask for a confirmation.
-  it('adds a detected engine with the extra directories it was found under', async () => {
-    const adds: Call[] = [];
+  // KTD11, KTD12, ADR 0040 §10 (security review finding 3): a candidate found
+  // only under extra directories runs nothing until the owner reviews the
+  // command and types the profile name; the confirmation carries the
+  // preview's digest and the same directories. A stale digest re-previews.
+  it('previews and confirms an engine found under extra directories', async () => {
+    const adds: Record<string, unknown>[] = [];
+    let digest = 'sha256:first';
     role({
       snapshots: [snapshotWith([])],
       route: (call) => {
@@ -247,7 +250,15 @@ describe('host administration', () => {
           return json({ candidates: [{ engine: 'vllm', version: '0.32.0', custom: false, entry: '/opt/vllm/bin/vllm', source: 'path' }] });
         }
         if (call.method === 'POST' && call.url === `${HOST}/engines`) {
-          adds.push(call);
+          const body = JSON.parse(call.body ?? '{}') as Record<string, unknown>;
+          adds.push(body);
+          if (body.preview === true) {
+            return json({ command: ['/opt/vllm/bin/vllm', 'serve'], summary: 'vllm 0.32.0', digest });
+          }
+          if (body.digest !== digest) {
+            digest = 'sha256:second';
+            return managementError(409, 'confirmation_stale');
+          }
           return json({ profile: 'vllm' });
         }
         return undefined;
@@ -261,8 +272,53 @@ describe('host administration', () => {
     await tick();
     button('Add').click();
     await tick();
-    expect(adds).toHaveLength(1);
-    expect(JSON.parse(adds[0].body ?? '{}')).toEqual({ path: '/opt/vllm/bin/vllm', paths: ['/opt/vllm', '/srv/engines'] });
+    const paths = ['/opt/vllm', '/srv/engines'];
+    expect(adds).toEqual([{ path: '/opt/vllm/bin/vllm', paths, preview: true }]);
+    expect(text()).toContain('/opt/vllm/bin/vllm serve');
+    const confirm = Array.from(document.querySelectorAll('button')).find((b) => b.textContent === 'Confirm' && b.closest('.review'))!;
+    expect(confirm.disabled).toBe(true);
+    await type('engine-confirm', 'vllm');
+    expect(confirm.disabled).toBe(false);
+    // The host changed under the preview: the first confirmation is stale.
+    digest = 'sha256:changed';
+    confirm.click();
+    await tick();
+    await tick();
+    expect(adds.slice(1)).toEqual([
+      { path: '/opt/vllm/bin/vllm', paths, digest: 'sha256:first', confirm_name: 'vllm' },
+      { path: '/opt/vllm/bin/vllm', paths, preview: true },
+    ]);
+    await type('engine-confirm', 'vllm');
+    Array.from(document.querySelectorAll('button')).find((b) => b.textContent === 'Confirm' && b.closest('.review'))!.click();
+    await tick();
+    expect(adds.at(-1)).toEqual({ path: '/opt/vllm/bin/vllm', paths, digest: 'sha256:second', confirm_name: 'vllm' });
+    expect(document.querySelector('.review')).toBeNull();
+  });
+
+  // KTD11: a candidate under the host's own search roots is added directly.
+  it('adds an engine found in the usual places without a confirmation', async () => {
+    const adds: Record<string, unknown>[] = [];
+    role({
+      snapshots: [snapshotWith([])],
+      route: (call) => {
+        if (call.url.startsWith(`${HOST}/engines/detected`)) {
+          return json({ candidates: [{ engine: 'vllm', version: '0.32.0', custom: false, entry: '/usr/bin/vllm', source: 'path' }] });
+        }
+        if (call.method === 'POST' && call.url === `${HOST}/engines`) {
+          adds.push(JSON.parse(call.body ?? '{}') as Record<string, unknown>);
+          return json({ profile: 'vllm' });
+        }
+        return undefined;
+      },
+    });
+    await open('/engines');
+    button('Detect engines').click();
+    await tick();
+    button('Detect').click();
+    await tick();
+    button('Add').click();
+    await tick();
+    expect(adds).toEqual([{ path: '/usr/bin/vllm' }]);
   });
 });
 

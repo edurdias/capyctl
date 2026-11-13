@@ -59,15 +59,31 @@ export async function detectEngines(host: string, paths: string[]): Promise<Cand
   return (await request<{ candidates: Candidate[] }>(HOST_ADMIN.detected(host, paths))).candidates;
 }
 
-// KTD11: a built-in add takes a detected candidate. A candidate found only
-// under an extra search directory is added with those directories, as
-// `engine add --path` does; without them the host asks for confirmation.
-export function addEngine(host: string, candidate: Candidate, name: string, paths: string[]): Promise<unknown> {
-  return mutate(HOST_ADMIN.addEngine(host), {
-    path: candidate.entry,
-    ...(name ? { name } : {}),
-    ...(paths.length > 0 ? { paths } : {}),
-  });
+// KTD11, ADR 0040 §10: a built-in add takes a detected candidate. One the host
+// finds under its own search roots is added directly; one found only under
+// extra directories runs nothing until the owner reviews the command and
+// types the profile name (KTD12), so it is previewed first and confirmed with
+// the preview's digest. The extra directories travel with both requests.
+export interface BuiltinRequest {
+  path: string;
+  name?: string;
+  paths?: string[];
+}
+
+export function builtinRequest(candidate: Candidate, name: string, paths: string[]): BuiltinRequest {
+  return { path: candidate.entry, ...(name ? { name } : {}), ...(paths.length > 0 ? { paths } : {}) };
+}
+
+export function addEngine(host: string, request: BuiltinRequest): Promise<unknown> {
+  return mutate(HOST_ADMIN.addEngine(host), request);
+}
+
+export function previewEngine(host: string, request: BuiltinRequest): Promise<CustomPreview> {
+  return mutate(HOST_ADMIN.addEngine(host), { ...request, preview: true });
+}
+
+export function confirmEngine(host: string, request: BuiltinRequest, digest: string, typedName: string): Promise<unknown> {
+  return mutate(HOST_ADMIN.addEngine(host), { ...request, digest, confirm_name: typedName });
 }
 
 // Answers 202; the engines list then shows the profile `retiring`.
