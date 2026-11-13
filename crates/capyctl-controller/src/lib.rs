@@ -19,6 +19,8 @@ pub mod engine_exit;
 // SPEC §13.3 / T21: an instance's bounded, redacted engine log tail.
 pub mod engine_logs;
 pub mod enrollment;
+// ADR 0040 §10: host administration carried to a host's control session.
+pub mod host_admin_remote;
 pub mod host_publication;
 pub mod profile_retirement;
 // ADR 0028 §5–§9: reserve, prepare, launch and prove a multi-node group.

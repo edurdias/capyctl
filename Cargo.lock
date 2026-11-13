@@ -392,6 +392,7 @@ dependencies = [
  "hex",
  "libc",
  "regex",
+ "reqwest",
  "saphyr-parser",
  "serde",
  "serde_json",

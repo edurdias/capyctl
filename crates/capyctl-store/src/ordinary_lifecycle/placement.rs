@@ -1164,3 +1164,108 @@ pub(crate) fn bounded_deadline(
     let (_, e) = effective(tx, fence)?;
     Ok(deadline.min(now.saturating_add(e.request_deadline_ms)))
 }
+
+/// ADR 0040 §9: a deployment check's answer for one host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckedFit {
+    /// It fits beside everything the host holds now.
+    Fits,
+    /// It fits the host's managed memory, but not beside what the host
+    /// holds now; the models to switch out are not named.
+    NeedsRoom,
+    /// It cannot fit the host even empty: the limit, worded as a start's
+    /// placement refusal names it.
+    DoesNotFit(String),
+    /// The host has no current resource policy (it has not reported its
+    /// memory).
+    NoObservations,
+}
+
+/// ADR 0040 §9: whether a resolution `e` of an unstored deployment (with its
+/// per-GPU resolutions `devices`, discrete GPU design §7) fits its host, by
+/// the same ledger, limits and fit rule a start's placement judges
+/// ([`candidates`]): against what the host holds now, then against the host
+/// empty. Reads only; nothing is reserved or recorded.
+pub(crate) fn check_fit(
+    tx: &Transaction<'_>,
+    e: &EffectiveDeployment,
+    devices: &[(String, serde_json::Value, EffectiveDeployment)],
+) -> Result<CheckedFit, LifecycleError> {
+    let host = &e.host.name;
+    let Some(policy) = read_selected_policy(tx, host).map_err(resource)? else {
+        return Ok(CheckedFit::NoObservations);
+    };
+    let limits: Vec<MemoryLimit> = policy
+        .controls
+        .domains
+        .iter()
+        .map(|(id, d)| MemoryLimit {
+            domain: id.clone(),
+            managed_bytes: d.managed_limit,
+            free_reserve_bytes: d.free_reserve,
+            reserve_absorbs_unmanaged: d.memory == capyctl_config::effective::DomainMemory::Device,
+            host_kv_bytes: d.host_kv_limit,
+            parked_bytes: d.parked_limit,
+        })
+        .collect();
+    let ledger = read_snapshot(tx).map_err(resource)?;
+    let mut scoped = scoped_to_domain_hosts(tx, &ledger, limits.iter().map(|l| l.domain.as_str()))
+        .map_err(resource)?;
+    super::startup::steady_view(tx, &mut scoped)?;
+    for (on, owner, footprint) in pending_charges(tx)? {
+        if on == *host && !scoped.owners.contains_key(&owner) {
+            scoped.owners.insert(owner, footprint);
+        }
+    }
+    let mut options = Vec::with_capacity(devices.len());
+    for (device, _, on_device) in devices {
+        let domains = capyctl_config::instances::set_ids(device)
+            .into_iter()
+            .map(|id| on_device.host.devices.get(id).map(|p| p.domain.clone()))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(LifecycleError::CorruptStoredData)?;
+        options.push(DeviceOption {
+            device: device.clone(),
+            domains,
+            footprint: super::phase(&on_device.resources.cold, ResourcePhase::Cold),
+        });
+    }
+    // Nothing in the ledger is this owner: the deployment is not stored.
+    const OWNER: &str = "deployment-check";
+    let mut candidate = HostCandidate {
+        host_id: host.clone(),
+        eligible: true,
+        instances_here: 0,
+        footprint: super::phase(&e.resources.cold, ResourcePhase::Cold),
+        limits,
+        ledger: scoped,
+        max_parked: policy.controls.max_parked as usize,
+        occupied: false,
+        whole_host: false,
+        device_options: options,
+        preferred_device: None,
+        gate: None,
+        gate_detail: None,
+        host_kv_remedy: HostKvRemedy::default(),
+    };
+    if capyctl_scheduler::placement::candidate_fits(&candidate, OWNER).is_ok() {
+        return Ok(CheckedFit::Fits);
+    }
+    candidate.ledger.owners.clear();
+    Ok(
+        match place(
+            std::slice::from_ref(&candidate),
+            OWNER,
+            Strategy::Spread,
+            None,
+            None,
+        ) {
+            Ok(_) => CheckedFit::NeedsRoom,
+            Err(refused) => CheckedFit::DoesNotFit(format!(
+                "{}: {}",
+                refused.code(),
+                refused.detail(std::slice::from_ref(&candidate), OWNER)
+            )),
+        },
+    )
+}

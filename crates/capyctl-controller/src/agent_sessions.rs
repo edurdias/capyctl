@@ -667,6 +667,26 @@ impl Drop for ProvisionGuard {
         }
     }
 }
+/// ADR 0040 §10: a HostAdminRequest awaiting its reply on one session.
+struct PendingAdmin {
+    host: String,
+    session_id: String,
+    reply: tokio::sync::oneshot::Sender<pb::HostAdminReply>,
+}
+/// Forgets a host administration request its caller stopped waiting for.
+pub(crate) struct AdminGuard {
+    pending: Arc<Mutex<BTreeMap<String, PendingAdmin>>>,
+    id: String,
+}
+impl Drop for AdminGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.id);
+        }
+    }
+}
+/// The most host administration requests outstanding across all hosts.
+const MAX_PENDING_ADMIN: usize = 128;
 struct PendingCommand {
     command: capyctl_protocol::execution::MemberCommand,
     /// The terminal result and the authenticated host session it arrived on.
@@ -716,6 +736,8 @@ pub struct AgentSessions {
     tasks: Arc<crate::supervised::Children>,
     /// ADR 0032 §3: request aborts in flight per host ([`AbortSlot`]).
     aborts: Arc<Mutex<BTreeMap<String, usize>>>,
+    /// ADR 0040 §10: host administration requests awaiting their reply.
+    admin: Arc<Mutex<BTreeMap<String, PendingAdmin>>>,
 }
 /// Suspends dispatch to every engine on the named host.
 pub type DrainHook = Arc<dyn Fn(&str) + Send + Sync>;
@@ -768,7 +790,96 @@ impl AgentSessions {
             heartbeat,
             tasks: Default::default(),
             aborts: Default::default(),
+            admin: Default::default(),
         })
+    }
+
+    /// ADR 0040 §10, ADR 0017: send one host administration operation to
+    /// `host`'s live session, or refuse it without sending anything. The
+    /// receiver yields the host's reply; it is closed (never answered) when
+    /// the session ends first. Dropping the guard forgets the request.
+    pub(crate) fn send_host_admin(
+        &self,
+        host: &str,
+        op: pb::host_admin_request::Op,
+        deadline_unix_ms: i64,
+    ) -> Result<
+        (
+            AdminGuard,
+            tokio::sync::oneshot::Receiver<pb::HostAdminReply>,
+        ),
+        crate::host_admin_remote::Refusal,
+    > {
+        use crate::host_admin_remote::Refusal;
+        // ADR 0017: judged on the live session, or on the latest one recorded.
+        if !self.supports(host, capabilities::HOST_ADMIN) {
+            return Err(Refusal::CapabilityMissing(capabilities::missing(
+                capabilities::HOST_ADMIN,
+            )));
+        }
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Refusal::ObservationStale)?;
+        let Some(session) = sessions
+            .get(host)
+            .filter(|s| s.view.online && s.view.reconciled)
+        else {
+            return Err(Refusal::ObservationStale);
+        };
+        // ADR 0017: a drain-only host takes nothing that changes it.
+        if session.drain_only {
+            return Err(Refusal::HostUpgradeRequired);
+        }
+        let outgoing = session.outgoing.as_ref().ok_or(Refusal::ObservationStale)?;
+        let id = ulid::Ulid::new().to_string();
+        let (reply, received) = tokio::sync::oneshot::channel();
+        let mut pending = self.admin.lock().map_err(|_| Refusal::ObservationStale)?;
+        if pending.len() >= MAX_PENDING_ADMIN {
+            return Err(Refusal::Busy);
+        }
+        let message = pb::ServerToAgent {
+            msg: Some(server_to_agent::Msg::HostAdminRequest(
+                pb::HostAdminRequest {
+                    request_id: id.clone(),
+                    deadline_unix_ms,
+                    op: Some(op),
+                },
+            )),
+        };
+        if !send_command(outgoing, message) {
+            return Err(Refusal::Busy);
+        }
+        pending.insert(
+            id.clone(),
+            PendingAdmin {
+                host: host.to_owned(),
+                session_id: session.view.session_id.clone(),
+                reply,
+            },
+        );
+        Ok((
+            AdminGuard {
+                pending: self.admin.clone(),
+                id,
+            },
+            received,
+        ))
+    }
+    /// ADR 0040 §10: a reply settles its request only from the session the
+    /// request went out on. A reply nobody waits for any more is dropped.
+    fn receive_host_admin(&self, host: &str, session_id: &str, reply: pb::HostAdminReply) {
+        let Ok(mut pending) = self.admin.lock() else {
+            return;
+        };
+        let matches = pending
+            .get(&reply.request_id)
+            .is_some_and(|p| p.host == host && p.session_id == session_id);
+        if matches {
+            if let Some(p) = pending.remove(&reply.request_id) {
+                let _ = p.reply.send(reply);
+            }
+        }
     }
 
     /// End every host session and join its serve task, aborting any still
@@ -1561,6 +1672,13 @@ impl AgentSessions {
                                     }
                                     page.complete
                                 }
+                                // ADR 0040 §10: only a host that declared `host_admin`
+                                // answers host administration requests.
+                                Some(agent_to_server::Msg::HostAdminReply(reply)) if s.view.reconciled && s.capabilities.contains(capabilities::HOST_ADMIN) => {
+                                    if reply.request_id.is_empty() || reply.request_id.len() > capabilities::MAX_REQUEST_ID { return Err(denied()); }
+                                    after = After::Admin(Box::new(reply));
+                                    false
+                                }
                                 Some(agent_to_server::Msg::MemberResult(result)) if s.view.reconciled => {
                                     after = After::Result(Box::new(result));
                                     false
@@ -1750,6 +1868,9 @@ impl AgentSessions {
                             After::Provision(result) => {
                                 self.receive_provision(&host, *result).map_err(|status| *status)?;
                             }
+                            After::Admin(reply) => {
+                                self.receive_host_admin(&host, &id, *reply);
+                            }
                         }
                         if let Some(exit) = exited {
                             // SPEC §13.2 (W13): the exited instance's dispatch closes
@@ -1811,6 +1932,11 @@ impl AgentSessions {
                 self.load.forget_host(&host);
             }
         }
+        // ADR 0040 §10: requests outstanding on the lost session end
+        // unanswered; their callers learn `outcome_unknown`.
+        if let Ok(mut pending) = self.admin.lock() {
+            pending.retain(|_, p| p.session_id != id);
+        }
         // SPEC §13.2: whoever supervises this host's engines learns of the loss now.
         self.changed();
         if let Err(status) = result {
@@ -1839,6 +1965,8 @@ enum After {
     Retire(pb::RetireProfile),
     Result(Box<pb::MemberExecutionResult>),
     Provision(Box<pb::IngressProvisioned>),
+    /// ADR 0040 §10: a host administration reply.
+    Admin(Box<pb::HostAdminReply>),
 }
 fn now() -> i64 {
     capyctl_protocol::now_unix_ms() / 1000

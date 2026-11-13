@@ -575,52 +575,9 @@ impl ConfigurationSource for SharedConfigurationSource {
                 },
             )
             .map_err(|_| ConfigurationFailure::Internal)?;
-        let (targets, refusals) = match &self.host {
-            HostSource::Embedded { document, id } => {
-                let policy = store
-                    .resource_policy(id)
-                    .map_err(|_| ConfigurationFailure::Internal)?
-                    .ok_or(ConfigurationFailure::ReconciliationRequired)?;
-                // A snapshot of the current document: an engine added or
-                // removed later does not change this request.
-                let document = document
-                    .read()
-                    .map_err(|_| ConfigurationFailure::Internal)?
-                    .clone();
-                // ADR 0018 §7 (owner decision 2026-09-25): fail fast, storing
-                // nothing, when the embedded host does not publish the profile.
-                let (ConfigurationCommand::Create { config_json }
-                | ConfigurationCommand::Replace { config_json, .. }) = &command;
-                // ADR 0028 §2: standalone is one host and cannot run a group.
-                capyctl_config::topology::refuse_in_standalone(&capyctl_config::parse_strict(
-                    capyctl_config::ConfigKind::Deployment,
-                    config_json,
-                )?)?;
-                if !retry {
-                    require_published(config_json, vec![(id.clone(), document.clone())])?;
-                }
-                let host = capyctl_config::effective::compose_current_resource_controls(
-                    &document,
-                    &policy.context,
-                    &policy.controls,
-                )
-                .map_err(|_| ConfigurationFailure::ReconciliationRequired)?;
-                (
-                    vec![HostTarget {
-                        host_id: id.clone(),
-                        host_name: id.clone(),
-                        trusted_host: host,
-                        scoped: false,
-                    }],
-                    Vec::new(),
-                )
-            }
-            HostSource::Registry => {
-                let (ConfigurationCommand::Create { config_json }
-                | ConfigurationCommand::Replace { config_json, .. }) = &command;
-                registry_targets(store, config_json, !retry)?
-            }
-        };
+        let (ConfigurationCommand::Create { config_json }
+        | ConfigurationCommand::Replace { config_json, .. }) = &command;
+        let (targets, refusals) = self.targets(store, config_json, !retry)?;
         match command {
             ConfigurationCommand::Create { config_json } => store
                 .create_managed_configuration_on_hosts(
@@ -671,6 +628,60 @@ impl ConfigurationSource for SharedConfigurationSource {
                     other => other,
                 }
             }
+        }
+    }
+}
+impl SharedConfigurationSource {
+    /// ADR 0013 §3: every allowed host `config_json` is resolved against
+    /// (the embedded host, or the registry's), with the refusals recorded
+    /// beside them. `fail_fast` refuses a profile no allowed host publishes
+    /// (ADR 0018 §7). Shared by the deploy and the deployment check (ADR
+    /// 0040 §9).
+    pub(crate) fn targets(
+        &self,
+        store: &capyctl_store::Store,
+        config_json: &str,
+        fail_fast: bool,
+    ) -> Result<(Vec<HostTarget>, Vec<HostRefusal>), ConfigurationFailure> {
+        match &self.host {
+            HostSource::Embedded { document, id } => {
+                let policy = store
+                    .resource_policy(id)
+                    .map_err(|_| ConfigurationFailure::Internal)?
+                    .ok_or(ConfigurationFailure::ReconciliationRequired)?;
+                // A snapshot of the current document: an engine added or
+                // removed later does not change this request.
+                let document = document
+                    .read()
+                    .map_err(|_| ConfigurationFailure::Internal)?
+                    .clone();
+                // ADR 0028 §2: standalone is one host and cannot run a group.
+                capyctl_config::topology::refuse_in_standalone(&capyctl_config::parse_strict(
+                    capyctl_config::ConfigKind::Deployment,
+                    config_json,
+                )?)?;
+                // ADR 0018 §7 (owner decision 2026-09-25): fail fast, storing
+                // nothing, when the embedded host does not publish the profile.
+                if fail_fast {
+                    require_published(config_json, vec![(id.clone(), document.clone())])?;
+                }
+                let host = capyctl_config::effective::compose_current_resource_controls(
+                    &document,
+                    &policy.context,
+                    &policy.controls,
+                )
+                .map_err(|_| ConfigurationFailure::ReconciliationRequired)?;
+                Ok((
+                    vec![HostTarget {
+                        host_id: id.clone(),
+                        host_name: id.clone(),
+                        trusted_host: host,
+                        scoped: false,
+                    }],
+                    Vec::new(),
+                ))
+            }
+            HostSource::Registry => registry_targets(store, config_json, fail_fast),
         }
     }
 }

@@ -153,6 +153,11 @@ impl OwnedActionSource {
         &self.commands
     }
 
+    /// The configuration authority, for the deployment check (ADR 0040 §9).
+    pub(crate) fn configuration(&self) -> &Arc<SharedConfigurationSource> {
+        &self.configuration
+    }
+
     /// SPEC §4.3, §6.3: the Stop an explicit drain issues is the ordinary one,
     /// so the deployment stays eligible for on-demand activation; its cleanup
     /// still completes only on evidence that the recorded processes are gone.

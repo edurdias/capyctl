@@ -151,6 +151,12 @@ pub const REQUEST_ABORT: &str = "request_abort";
 /// `host_capability_missing:local_tensor_parallel` before anything is sent.
 /// Any other launch needs nothing new.
 pub const LOCAL_TENSOR_PARALLEL: &str = "local_tensor_parallel";
+/// ADR 0040 §10 (amending this table): the host runs host administration
+/// operations: the server's HostAdminRequest and the host's HostAdminReply.
+/// The server sends a HostAdminRequest only to a host that declared it; any
+/// other host is refused `host_capability_missing:host_admin` and sent
+/// nothing (an older host would end its session on the unknown message).
+pub const HOST_ADMIN: &str = "host_admin";
 
 /// ADR 0018: bounds on the new messages' strings and lists.
 pub const MAX_REQUEST_ID: usize = 64;
@@ -202,6 +208,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (RETENTION, Direction::ServerToHost),
     (REQUEST_ABORT, Direction::ServerToHost),
     (LOCAL_TENSOR_PARALLEL, Direction::ServerToHost),
+    (HOST_ADMIN, Direction::ServerToHost),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.

@@ -65,5 +65,7 @@ pub mod host_control;
 // ADR 0040 §10, §11: host administration shared by the CLI and a role's
 // management routes (engines, custom engines, model copies, configuration).
 pub mod host_admin;
+// ADR 0040 §10: host administration carried from a server to this host.
+pub mod host_admin_remote;
 
 pub mod native_execution;

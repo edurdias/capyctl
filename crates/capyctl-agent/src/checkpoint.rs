@@ -292,7 +292,7 @@ fn encodable(path: &str) -> bool {
             .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
-fn is_weight(path: &str) -> bool {
+pub(crate) fn is_weight(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
     WEIGHT_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
 }

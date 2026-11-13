@@ -12,6 +12,7 @@ mod config;
 mod custom;
 mod engines;
 mod model_store;
+mod pin_and_size;
 
 pub use config::{effective_config, ConfigLayers};
 pub use custom::{
@@ -23,6 +24,7 @@ pub use engines::{
     BuiltinPreview, Toolchain,
 };
 pub use model_store::{list_copies, model_store, prune_copies};
+pub use pin_and_size::pin_and_size;
 
 use crate::control_socket::{request, ClientError, ControlRequest};
 use capyctl_config::custom::CustomManifest;
