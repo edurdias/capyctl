@@ -199,3 +199,20 @@ fn only_the_management_listener_takes_remote() {
     document["listeners"]["inference"]["public_address"] = json!("http://box:8443");
     assert!(ServerConfig::parse(&document.to_string()).is_err());
 }
+
+// T14: configured origins compare identically to browser Origin headers.
+#[test]
+fn public_addresses_normalize_default_ports_and_ipv6() {
+    for (input, expected) in [
+        ("http://BOX:80", "http://box"),
+        ("https://BOX:443", "https://box"),
+        ("http://[0:0:0:0:0:0:0:1]:80", "http://[::1]"),
+        ("https://[2001:0db8::1]:8443", "https://[2001:db8::1]:8443"),
+    ] {
+        let listener = capyctl_config::standalone::management_listener(&standalone(
+            json!({"public_address": input}),
+        ))
+        .unwrap();
+        assert_eq!(listener.public_address.as_deref(), Some(expected));
+    }
+}

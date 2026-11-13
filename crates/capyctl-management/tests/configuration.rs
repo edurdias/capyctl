@@ -224,6 +224,12 @@ impl capyctl_management::events::EventSource for RejectingSource {
     }
 }
 impl capyctl_management::configuration::ConfigurationSource for RejectingSource {
+    fn deployment_source(
+        &self,
+        _: &str,
+    ) -> Result<Option<Value>, capyctl_management::configuration::ConfigurationFailure> {
+        Err(capyctl_management::configuration::ConfigurationFailure::Unsupported)
+    }
     fn accept(
         &self,
         _: &str,
@@ -1666,6 +1672,144 @@ fn group_hosts(
         )),
     );
     (router, ids)
+}
+
+// T03 T14 / U7 / ADR 0040 §9: group previews resolve all members together.
+#[tokio::test]
+async fn a_registry_group_preview_checks_all_members_without_writing() {
+    use capyctl_management::check::{self, PinFuture};
+    let (_directory, state, config, _host) = fixture();
+    let (_, ids) = group_hosts(&state, [Some("192.0.2.10"), Some("192.0.2.11")], [true; 2]);
+    let before = state.lock().unwrap().store().deployment_count().unwrap();
+    let sources = Arc::new(
+        |_: &capyctl_store::managed_configuration::HostTarget, sources: Vec<String>| -> PinFuture {
+            Box::pin(async move {
+                Ok(sources
+                    .into_iter()
+                    .map(|source| capyctl_protocol::pb::PinnedSource {
+                        pinned: source.clone(),
+                        source,
+                        weight_bytes: Some(1 << 30),
+                        estimated: true,
+                        error: String::new(),
+                    })
+                    .collect())
+            })
+        },
+    );
+    let router = support::composed(
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+        check::router(
+            Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+            sources,
+            None,
+        ),
+    );
+    let response = router
+        .oneshot(request(
+            "POST",
+            "/management/v1/deployments/check",
+            "group-check",
+            json!({"config":group_config(config)}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = json_response(response).await;
+    let hosts = body["hosts"].as_array().unwrap();
+    assert_eq!(hosts.len(), 2, "{body}");
+    for id in ids {
+        let host = hosts.iter().find(|host| host["host_id"] == id).unwrap();
+        assert_eq!(host["reason"], "no_observations", "{body}");
+    }
+    assert_eq!(
+        state.lock().unwrap().store().deployment_count().unwrap(),
+        before
+    );
+}
+
+// T03 T14 / U7 / C1: the selected verdict and normalized document belong to one host.
+#[tokio::test]
+async fn preview_selects_the_fitting_hosts_pin() {
+    use capyctl_controller::coordinator::{
+        CoordinatorError, CoordinatorOptions, ObservationFuture, ServiceObservation,
+    };
+    use capyctl_management::check::{self, PinFuture};
+    struct CurrentMemory;
+    impl ServiceObservation for CurrentMemory {
+        fn observe(&self, host: String) -> ObservationFuture {
+            Box::pin(async move {
+                Ok(vec![capyctl_domain::resources::MemoryObservation {
+                    domain: capyctl_config::remote_resources::ledger_key(
+                        &host, "domain", "unified",
+                    ),
+                    capacity_bytes: 1 << 40,
+                    available_bytes: 1 << 40,
+                    sampled_at_ms: 1000,
+                }])
+            })
+        }
+    }
+    let (_directory, state, _, _) = fixture();
+    let a = publish_host(&state, "host-a", 'e', json!({}));
+    let b = publish_host(&state, "host-b", 'f', json!({}));
+    let first = std::cmp::min(a, b);
+    let worker = capyctl_testkit::spawn_fake_coordinator(
+        state.clone(),
+        Arc::new(CurrentMemory),
+        Arc::new(|| Ok::<_, CoordinatorError>(1000)),
+        CoordinatorOptions::default(),
+    )
+    .unwrap();
+    let sources = Arc::new(
+        move |host: &capyctl_store::managed_configuration::HostTarget,
+              sources: Vec<String>|
+              -> PinFuture {
+            let first = host.host_id == first;
+            Box::pin(async move {
+                Ok(sources
+                    .into_iter()
+                    .map(|source| capyctl_protocol::pb::PinnedSource {
+                        source,
+                        pinned: format!(
+                            "org/model@{}",
+                            if first {
+                                "a".repeat(40)
+                            } else {
+                                "b".repeat(40)
+                            }
+                        ),
+                        weight_bytes: Some(if first { 1 << 50 } else { 1 << 30 }),
+                        estimated: true,
+                        error: String::new(),
+                    })
+                    .collect())
+            })
+        },
+    );
+    let configuration = Arc::new(SharedConfigurationSource::from_registry(state, "owner").unwrap());
+    let router = support::composed(
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+        check::router(configuration, sources, Some(worker.commands())),
+    );
+    let response = router.oneshot(request("POST", "/management/v1/deployments/check", "pins-check", json!({"config":{
+        "name":"preview","engine":"vllm","model":{"hf":"org/model"},"placement":{"hosts":["host-a","host-b"]}
+    }}))).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body = json_response(response).await;
+    assert_eq!(body["verdict"], "fits", "{body}");
+    assert_eq!(
+        body["config"]["model"]["source"]["revision"],
+        "b".repeat(40),
+        "{body}"
+    );
+    let selected = body["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|host| host["verdict"] == "fits")
+        .unwrap();
+    assert_eq!(body["config"], selected["config"]);
 }
 
 /// The golden deployment as a TP 2 group headed by host B. It keeps the

@@ -71,6 +71,17 @@ host administration all resolve. A role's start brings an existing file over onc
 when the old location is writable and copied when it is read-only, as under the system units. The
 packaged-layout test `packaged_layout_host_admin_add_remove_with_read_only_config_directory`
 fails before and passes after.
+The review fixes add regression cases for behavior that was failing before the fixes:
+Edit now reads the accepted source document and numeric revision rather than the frozen
+effective configuration; fit previews use start's observed-memory admission, include
+drafter weights, preserve Hugging Face file and credential selections, and retain offline
+hosts as unknown results. Revocation ends a deployment-check wait without cancelling work
+already sent to a host. Source-route authorization is exercised on both roles, and the
+route table now rejects a missing route rather than accepting equal 404 responses.
+Additional cases cover suspended lifecycle hints, temporary UI entry redirects,
+extensionless embedded assets, canonical browser origins and management overrides applied
+before document validation. These tests are CPU regression evidence, not native-engine
+qualification.
 
 # Release note: New features
 

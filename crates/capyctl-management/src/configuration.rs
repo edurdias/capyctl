@@ -398,6 +398,9 @@ pub trait ConfigurationSource: Send + Sync + 'static {
         Err(ConfigurationFailure::Unsupported)
     }
 
+    /// ADR 0040 §9: the accepted source document, not the frozen effective view.
+    fn deployment_source(&self, deployment: &str) -> Result<Option<Value>, ConfigurationFailure>;
+
     /// SPEC §6.3, ADR 0008: every model-store key (`sources/...`) a deployment
     /// that still exists references. A deleted deployment's copies are not in
     /// it; that is what `capyctl prune sources` may reclaim.
@@ -501,6 +504,23 @@ impl EventSource for SharedConfigurationSource {
     }
 }
 impl ConfigurationSource for SharedConfigurationSource {
+    fn deployment_source(&self, deployment: &str) -> Result<Option<Value>, ConfigurationFailure> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ConfigurationFailure::Internal)?;
+        state
+            .store()
+            .deployment_source(deployment)
+            .map(|found| {
+                found.map(|(id, revision, config)| {
+                    serde_json::json!({
+                        "deployment_id": id, "revision": revision, "config": config
+                    })
+                })
+            })
+            .map_err(|_| ConfigurationFailure::Internal)
+    }
     fn effective_configuration(
         &self,
         deployment: &str,

@@ -19,3 +19,6 @@ libc = "0.2"
 # ADR 0040 §9: the pinning `deploy model --file` and the roles share asks the
 # Hugging Face API.
 reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -209,8 +209,6 @@ pub struct App {
     /// Owner decision 2026-09-25: the document's
     /// `server.listeners.management.bind`, or `127.0.0.1:7443`.
     management_bind: std::net::SocketAddr,
-    /// ADR 0040 §1: the document's `server.listeners.management.public_address`.
-    management_public_address: Option<String>,
     /// Design §9: the document's `server.listeners.inference.authentication`
     /// (`api_key` unless it states `none`).
     inference_auth: capyctl_config::standalone::InferenceAuth,
@@ -252,13 +250,6 @@ impl App {
     /// `CAPYCTL_MANAGEMENT_ADDR` overrides it ([`management_override`]).
     pub fn management_bind(&self) -> std::net::SocketAddr {
         self.management_bind
-    }
-
-    /// ADR 0040 §1: the origin the standalone document states for reaching
-    /// the management listener from off the box
-    /// (`server.listeners.management.public_address`), if any.
-    pub fn management_public_address(&self) -> Option<&str> {
-        self.management_public_address.as_deref()
     }
 
     /// Design §9: the inference authentication the standalone document
@@ -2544,7 +2535,8 @@ async fn start_standalone_in(
                     models.policy.clone(),
                     models.models_root.clone(),
                     Arc::new(|name| std::env::var(name).ok()),
-                ),
+                )
+                .with_secrets_dir(Some(state_dir.join("secrets"))),
             ))),
             // SPEC §4.3: the embedded host drains by its published name or
             // the `standalone` alias the CLI uses.
@@ -2680,7 +2672,6 @@ async fn start_standalone_in(
         config_notices,
         inference_bind,
         management_bind: management_listener.bind,
-        management_public_address: management_listener.public_address,
         inference_auth,
         inference_listener,
     })

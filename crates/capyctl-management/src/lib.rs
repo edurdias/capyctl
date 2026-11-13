@@ -32,6 +32,7 @@ mod action_hints;
 pub mod actions;
 pub mod check;
 pub mod configuration;
+mod deployment_source;
 // ADR 0040 §§2–4: the one composition point and principal resolution.
 pub mod compose;
 mod credentials;
@@ -266,6 +267,10 @@ fn routes(state: Arc<AppState>, include_events: bool) -> Router {
             .route(
                 "/management/v1/deployments/{id}/effective-config",
                 get(configuration::effective_config),
+            )
+            .route(
+                "/management/v1/deployments/{id}/source",
+                get(deployment_source::get),
             )
             // SPEC §6.3, ADR 0008: the store keys deployments still reference,
             // for the host-side `capyctl prune sources`.

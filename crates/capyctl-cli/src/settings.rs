@@ -101,10 +101,36 @@ pub fn role_overrides(
     flags: &NamedLayer,
 ) -> Result<SettingOverrides, ConfigError> {
     let overrides = SettingOverrides::from_process(kind, sets)?;
-    if !overrides.is_empty() {
-        overrides.check_named(&named_values(kind, flags, &env_layer()?))?;
+    let named = named_values(kind, flags, &env_layer()?);
+    overrides.check_named(&named)?;
+    // ADR 0040 §1: listener authorization and bind must be applied together,
+    // before validation (including an off-box bind stated in YAML).
+    let mut environment: Vec<(String, String)> = std::env::vars()
+        .filter(|(key, _)| key.starts_with(capyctl_config::setting_overrides::SET_ENV_PREFIX))
+        .collect();
+    for value in named {
+        if value.path.ends_with("listeners.management.remote")
+            || value.path.ends_with("listeners.management.bind")
+        {
+            let key = format!(
+                "{}{}",
+                capyctl_config::setting_overrides::SET_ENV_PREFIX,
+                value.path.replace('.', "__").to_uppercase()
+            );
+            if !environment
+                .iter()
+                .any(|(existing, _)| existing.eq_ignore_ascii_case(&key))
+            {
+                let text = value
+                    .value
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| value.value.to_string());
+                environment.push((key, text));
+            }
+        }
     }
-    Ok(overrides)
+    SettingOverrides::parse(kind, sets, &environment)
 }
 
 /// A configuration error as the roles print it: `<path>: <detail>`.
@@ -257,4 +283,39 @@ pub fn render_table(value: &serde_json::Value) -> String {
             .unwrap_or_else(|| "no document; defaults".to_owned()),
         crate::table::table(&["SETTING", "VALUE", "SOURCE"], &rows)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // T03 / ADR 0040: named listener flags authorize YAML before validation.
+    #[test]
+    fn management_flags_are_applied_before_listener_validation() {
+        for (kind, prefix) in [
+            (ConfigKind::Standalone, "server."),
+            (ConfigKind::Server, ""),
+        ] {
+            let flags = NamedLayer {
+                management_remote: Some(true),
+                ..Default::default()
+            };
+            let overrides = role_overrides(kind, &[], &flags).unwrap();
+            let mut document = if kind == ConfigKind::Standalone {
+                json!({"server": {"listeners": {"management": {"bind": "0.0.0.0:7443"}}}})
+            } else {
+                json!({"listeners": {"management": {"bind": "0.0.0.0:7443"}}})
+            };
+            overrides.apply(&mut document).unwrap();
+            let pointer = format!("/{}listeners/management", prefix.replace('.', "/"));
+            let block = document.pointer(&pointer).unwrap();
+            assert!(capyctl_config::standalone::listener_remote(block, "remote").unwrap());
+            assert!(capyctl_config::standalone::management_address(
+                block["bind"].as_str().unwrap(),
+                true,
+            )
+            .is_some());
+        }
+    }
 }

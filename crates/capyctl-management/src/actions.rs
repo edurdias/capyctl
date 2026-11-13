@@ -909,6 +909,12 @@ impl ConfigurationSource for OwnedActionSource {
         self.configuration
             .checkpoint_digest_state(deployment_id, revision)
     }
+    fn deployment_source(
+        &self,
+        deployment: &str,
+    ) -> Result<Option<serde_json::Value>, ConfigurationFailure> {
+        self.configuration.deployment_source(deployment)
+    }
     fn effective_configuration(
         &self,
         deployment: &str,

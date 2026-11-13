@@ -23,6 +23,7 @@ impl Assets for Fixed {
             "index.html" => Some(Cow::Borrowed(INDEX)),
             "assets/app-a1b2c3d4.js" => Some(Cow::Borrowed(SCRIPT)),
             "licenses.txt" => Some(Cow::Borrowed(b"Third-party notices")),
+            "health" => Some(Cow::Borrowed(b"bundled extensionless asset")),
             _ => None,
         }
     }
@@ -49,12 +50,12 @@ fn security_headers(response: &Response) {
     assert_eq!(response.headers()["referrer-policy"], "same-origin");
 }
 
-// U11: both entry redirects use the canonical bundle root.
+// T16 / U11 / ADR 0040 §13: entry redirects are temporary, not browser-pinned.
 #[tokio::test]
 async fn root_and_ui_redirect_to_ui_slash() {
     for path in ["/", "/ui"] {
         let response = get(router_with_assets::<Fixed>(), path).await;
-        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
         assert_eq!(response.headers()["location"], "/ui/");
     }
 }
@@ -69,6 +70,19 @@ async fn extensionless_paths_serve_index_without_caching() {
         assert_eq!(response.headers()["content-type"], "text/html");
         assert_eq!(bytes(response).await, INDEX);
     }
+}
+
+// T16 / U11 / ADR 0040 §13: existing extensionless files precede SPA fallback.
+#[tokio::test]
+async fn extensionless_assets_are_not_replaced_by_the_index() {
+    let response = get(router_with_assets::<Fixed>(), "/ui/health").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-cache");
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/octet-stream"
+    );
+    assert_eq!(bytes(response).await, b"bundled extensionless asset");
 }
 
 // U11 / KTD18: Vite names these assets with content hashes.

@@ -22,8 +22,11 @@ use capyctl_agent::{
 };
 use capyctl_config::model_source::ModelSourcePolicy;
 use capyctl_controller::{
-    agent_sessions::AgentSessions, enrollment::EnrollmentAuthority,
-    ownership::SharedCoordinatorState, OwnedCoordinatorState,
+    agent_sessions::AgentSessions,
+    coordinator::{CoordinatorOptions, OwnedCoordinator},
+    enrollment::EnrollmentAuthority,
+    ownership::SharedCoordinatorState,
+    OwnedCoordinatorState,
 };
 use capyctl_management::{
     check, configuration::SharedConfigurationSource, host_admin_remote::RemoteHostAdmin,
@@ -143,6 +146,7 @@ struct Harness {
     host: String,
     server: tokio::task::JoinHandle<()>,
     dirs: (tempfile::TempDir, tempfile::TempDir),
+    worker: OwnedCoordinator,
 }
 
 impl Drop for Harness {
@@ -162,6 +166,13 @@ async fn enrolled() -> Harness {
     let cert = ca.issue_server("localhost", &key, now()).unwrap();
     let authority = Arc::new(EnrollmentAuthority::new(state.clone(), ca));
     let sessions = AgentSessions::new(authority.clone());
+    let worker = capyctl_testkit::spawn_fake_coordinator(
+        state.clone(),
+        sessions.clone(),
+        Arc::new(|| Ok(capyctl_protocol::now_unix_ms())),
+        CoordinatorOptions::default(),
+    )
+    .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!(
         "https://localhost:{}",
@@ -212,6 +223,7 @@ async fn enrolled() -> Harness {
         host,
         server,
         dirs: (state_dir, storage_dir),
+        worker,
     }
 }
 
@@ -400,6 +412,7 @@ fn app(h: &Harness) -> Router {
     check::router(
         configuration,
         RemoteHostAdmin::new(h.state.clone(), h.sessions.clone()),
+        Some(h.worker.commands()),
     )
     .layer(Extension(Principal::Admin))
 }
@@ -479,9 +492,9 @@ async fn server_check_refuses_an_offline_host_even_after_a_successful_pin() {
     a.stop().await;
     eventually(|| h.sessions.inspect(&h.host).is_some_and(|v| !v.online)).await;
     let (status, value) = request(&app, &h.host).await;
-    assert_eq!(status, 503, "{value}");
-    assert_eq!(value["error"]["code"], "observation_stale", "{value}");
-    assert_eq!(value["error"]["retryable"], false);
+    assert_eq!(status, 200, "{value}");
+    assert_eq!(value["verdict"], "unknown", "{value}");
+    assert_eq!(value["reason"], "host_unavailable", "{value}");
     assert_eq!(*hub.references.lock().unwrap(), vec!["main", SHA]);
 }
 
@@ -493,12 +506,9 @@ async fn server_check_refuses_a_host_without_host_admin() {
     let h = enrolled().await;
     let a = agent(&h, &hub, false).await;
     let (status, value) = request(&app(&h), "spark").await;
-    assert_eq!(status, 422, "{value}");
-    assert_eq!(
-        value["error"]["code"], "host_capability_missing:host_admin",
-        "{value}"
-    );
-    assert_eq!(value["error"]["retryable"], false);
+    assert_eq!(status, 200, "{value}");
+    assert_eq!(value["verdict"], "unknown", "{value}");
+    assert_eq!(value["reason"], "host_unavailable", "{value}");
     assert!(hub.references.lock().unwrap().is_empty());
     a.stop().await;
 }

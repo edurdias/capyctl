@@ -230,6 +230,9 @@ impl Hub {
     }
 }
 
+/// Written-out model and drafter sources shared by CLI and management pinning.
+pub const HF_SOURCES: [&str; 2] = ["/model/source", "/model/draft"];
+
 /// Pin each Hugging Face shorthand of a raw deployment document (the model's
 /// and, ADR 0008 amendment 2026-10-08, its drafter's) with `pin`, called
 /// with the shorthand's field name, the repository and the reference.
@@ -244,6 +247,33 @@ where
             let commit = pin(field, repo.clone(), reference).await?;
             pin_hf(document, at, &repo, &commit);
         }
+    }
+    // T14 / ADR 0008: pin written-out sources in place; replacing them with a
+    // shorthand would discard file selection and credential references.
+    for at in HF_SOURCES {
+        let Some(source) = document.pointer_mut(at) else {
+            continue;
+        };
+        let source = if source.get("huggingface").is_some() {
+            &mut source["huggingface"]
+        } else if source.get("type").and_then(Value::as_str) == Some("huggingface") {
+            source
+        } else {
+            continue;
+        };
+        let Some(repo) = source.get("repo").and_then(Value::as_str) else {
+            continue;
+        };
+        let reference = source
+            .get("revision")
+            .and_then(Value::as_str)
+            .unwrap_or("main");
+        if crate::model_source::is_commit_sha(reference) {
+            continue;
+        }
+        let field = format!("{}.revision", at.trim_start_matches('/').replace('/', "."));
+        let commit = pin(field, repo.to_owned(), reference.to_owned()).await?;
+        source["revision"] = Value::String(commit);
     }
     Ok(())
 }

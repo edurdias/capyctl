@@ -14,9 +14,7 @@ use support::process::{free_port, Guarded};
 
 use capyctl_cli::grammar::parse_invocation;
 
-/// ADR 0040 §1: `--management-listen 0.0.0.0:7443 --management-remote` is
-/// accepted on both roles that serve the management API; without
-/// `--management-remote` it is refused with the loopback message.
+/// T03 / ADR 0040 §1: grammar defers authorization until YAML and --set are read.
 #[test]
 fn management_listen_off_loopback_needs_management_remote() {
     for role in ["standalone", "server"] {
@@ -31,21 +29,31 @@ fn management_listen_off_loopback_needs_management_remote() {
         .unwrap();
         assert_eq!(i.management_listen, Some("0.0.0.0:7443".parse().unwrap()));
         assert!(i.management_remote);
-        // The test environment is not expected to set the variable; when it
-        // does the refusal below does not apply.
-        if std::env::var_os("CAPYCTL_MANAGEMENT_REMOTE").is_none() {
-            let Err(refused) = parse_invocation([
-                "capyctl",
-                "start",
-                role,
-                "--management-listen",
-                "0.0.0.0:7443",
-            ]) else {
-                panic!("accepted without --management-remote");
-            };
-            let refused = refused.to_string();
-            assert!(refused.contains("must be a loopback address"), "{refused}");
-        }
+        let deferred = parse_invocation([
+            "capyctl",
+            "start",
+            role,
+            "--management-listen",
+            "0.0.0.0:7443",
+        ])
+        .unwrap();
+        assert!(!deferred.management_remote);
+        let path = if role == "standalone" {
+            "server.listeners.management.remote=true"
+        } else {
+            "listeners.management.remote=true"
+        };
+        let generic = parse_invocation([
+            "capyctl",
+            "start",
+            role,
+            "--management-listen",
+            "0.0.0.0:7443",
+            "--set",
+            path,
+        ])
+        .unwrap();
+        assert_eq!(generic.management_listen, deferred.management_listen);
     }
     // A host serves no management API.
     assert!(parse_invocation(["capyctl", "start", "host", "--management-remote"]).is_err());

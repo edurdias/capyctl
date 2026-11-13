@@ -11,7 +11,10 @@ use capyctl_config::{
     deployment_pin::{Hub, CLI_TOKEN_HINT},
     model_source::ModelSourcePolicy,
 };
-use capyctl_controller::OwnedCoordinatorState;
+use capyctl_controller::{
+    coordinator::{CoordinatorOptions, ObservationFuture, OwnedCoordinator, ServiceObservation},
+    OwnedCoordinatorState,
+};
 use capyctl_management::{
     check::{self, StandaloneSources},
     configuration::SharedConfigurationSource,
@@ -38,11 +41,22 @@ fn directory() -> tempfile::TempDir {
     dir
 }
 
+struct Readings(Mutex<Vec<capyctl_domain::resources::MemoryObservation>>);
+
+impl ServiceObservation for Readings {
+    fn observe(&self, _: String) -> ObservationFuture {
+        let readings = self.0.lock().unwrap().clone();
+        Box::pin(async move { Ok(readings) })
+    }
+}
+
 struct Preview {
     dir: tempfile::TempDir,
     owner: Arc<Mutex<OwnedCoordinatorState>>,
     host: Value,
     app: Router,
+    readings: Arc<Readings>,
+    worker: OwnedCoordinator,
 }
 
 impl Preview {
@@ -56,11 +70,10 @@ impl Preview {
         let mut host = golden["input"]["host"].clone();
         host["model_store"]["path"] = json!(dir.path());
         edit(&mut host);
-        if observed {
+        let observations = if observed {
             let effective =
                 capyctl_config::effective::resolve_effective(&golden["input"]["deployment"], &host)
                     .unwrap();
-            let owned = owner.lock().unwrap();
             let observations: Vec<_> = effective
                 .host
                 .domains
@@ -72,11 +85,23 @@ impl Preview {
                     sampled_at_ms: 1000,
                 })
                 .collect();
+            let owned = owner.lock().unwrap();
             owned
                 .store()
                 .import_resource_policy(owned.session(), &effective.host, &observations, 1000)
                 .unwrap();
-        }
+            observations
+        } else {
+            Vec::new()
+        };
+        let readings = Arc::new(Readings(Mutex::new(observations)));
+        let worker = capyctl_testkit::spawn_fake_coordinator(
+            owner.clone(),
+            readings.clone(),
+            Arc::new(|| Ok(1000)),
+            CoordinatorOptions::default(),
+        )
+        .unwrap();
         // As with SourceStore's loopback transport in other integration
         // tests, serve the host's HTTPS mirror over loopback HTTP only.
         let policy = ModelSourcePolicy {
@@ -95,13 +120,19 @@ impl Preview {
         ));
         let configuration =
             Arc::new(SharedConfigurationSource::new(owner.clone(), host.clone(), "owner").unwrap());
-        let app = check::router(configuration, Arc::new(StandaloneSources(pinner)))
-            .layer(Extension(Principal::Admin));
+        let app = check::router(
+            configuration,
+            Arc::new(StandaloneSources(pinner)),
+            Some(worker.commands()),
+        )
+        .layer(Extension(Principal::Admin));
         Self {
             dir,
             owner,
             host,
             app,
+            readings,
+            worker,
         }
     }
 
@@ -497,11 +528,168 @@ async fn server_provider_refuses_until_host_admin_forwarding_is_installed() {
     let mut p = Preview::new(true, |_| {});
     let configuration =
         Arc::new(SharedConfigurationSource::new(p.owner.clone(), p.host.clone(), "owner").unwrap());
-    p.app = check::router(configuration, Arc::new(check::UnavailableSources))
-        .layer(Extension(Principal::Admin));
+    p.app = check::router(
+        configuration,
+        Arc::new(check::UnavailableSources),
+        Some(p.worker.commands()),
+    )
+    .layer(Extension(Principal::Admin));
     let (status, value) = p
         .request(json!({"config":{"name":"preview","engine":"vllm","model":"/weights"}}))
         .await;
-    assert_eq!(status, 503);
-    assert_eq!(value["error"]["code"], "unsupported_capability");
+    assert_eq!(status, 200, "{value}");
+    assert_eq!(value["verdict"], "unknown", "{value}");
+    assert_eq!(value["reason"], "host_unavailable", "{value}");
+}
+
+// T29 / ADR 0040 §9: physical admission and its refusal figures are shared
+// with Start even when the model fits the configured managed limit.
+#[tokio::test]
+async fn low_observed_free_memory_returns_the_actual_start_refusal() {
+    let p = Preview::new(true, |_| {});
+    p.measure(json!("/weights"), 1 << 30);
+    for observation in p.readings.0.lock().unwrap().iter_mut() {
+        observation.available_bytes = 20 << 30;
+    }
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../capyctl-config/tests/fixtures/f2-deployment.json"
+    ))
+    .unwrap();
+    let mut config = fixture["deployment"].clone();
+    config["name"] = json!("preview");
+    config["routes"] = json!(["preview"]);
+    config["model"] = json!("/weights");
+    let (status, value) = p.request(json!({"config": config})).await;
+    assert_eq!(status, 200, "{value}");
+    assert_eq!(value["verdict"], "does_not_fit", "{value}");
+    let observations = p.readings.0.lock().unwrap().clone();
+    let owned = p.owner.lock().unwrap();
+    let store = owned.store();
+    let receipt = store
+        .create_stopped_managed_configuration(
+            owned.session(),
+            "owner",
+            "low-free-start",
+            &json!({"config": value["config"]}).to_string(),
+            &p.host,
+            1000,
+        )
+        .unwrap();
+    let start = store
+        .accept_start(
+            owned.session(),
+            &capyctl_store::lifecycle::DeploymentFence {
+                deployment_id: receipt.deployment_id,
+                revision: receipt.revision,
+                generation: receipt.generation,
+            },
+            1000,
+            100_000,
+        )
+        .unwrap();
+    let policy = store.resource_policy("lab").unwrap().unwrap();
+    let limits: Vec<_> = policy
+        .controls
+        .domains
+        .iter()
+        .map(|(domain, control)| capyctl_domain::resources::MemoryLimit {
+            domain: domain.clone(),
+            managed_bytes: control.managed_limit,
+            free_reserve_bytes: control.free_reserve,
+            reserve_absorbs_unmanaged: control.memory
+                == capyctl_config::effective::DomainMemory::Device,
+            host_kv_bytes: control.host_kv_limit,
+            parked_bytes: control.parked_limit,
+        })
+        .collect();
+    let error = store
+        .arm_step(
+            owned.session(),
+            &start.step_id,
+            capyctl_scheduler::residency::AdmissionContext::new(
+                &observations,
+                &limits,
+                1000,
+                policy.controls.observation_ttl_ms,
+                policy.controls.max_parked as usize,
+            ),
+        )
+        .unwrap_err();
+    let capyctl_store::lifecycle::LifecycleError::Rejected(reason) = error else {
+        panic!("expected physical capacity refusal, got {error:?}");
+    };
+    assert!(reason.contains("insufficient_memory"), "{reason}");
+    assert_eq!(value["limit"], reason);
+}
+
+// T14 / ADR 0040 §9: a drafter's source is sized along with the main
+// checkpoint. Sparse files keep this a metadata-only preview regression.
+#[tokio::test]
+async fn drafter_weights_are_included_in_the_fit_estimate() {
+    let p = Preview::new(true, |host| {
+        host["runtime_profiles"]["local"]["security"]["approved_options"] =
+            json!(["--speculative-config"]);
+    });
+    let model = p.dir.path().join("main-model");
+    let draft = p.dir.path().join("draft-model");
+    for (path, size) in [(&model, 1_u64 << 30), (&draft, 64_u64 << 30)] {
+        std::fs::create_dir(path).unwrap();
+        std::fs::File::create(path.join("model.safetensors"))
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+    }
+    let (status, value) = p
+        .request(json!({"config":{
+            "name":"preview", "engine":"vllm", "residency":"restart_only",
+            "model":{"path":model,"draft":draft},
+            "engine_config":{
+                "accept_extra_args":true,
+                "extra_args":["--speculative-config",
+                    json!({"method":"draft_model","num_speculative_tokens":4}).to_string()]
+            }
+        }}))
+        .await;
+    assert_eq!(status, 200, "{value}");
+    assert_eq!(value["estimated"], true, "{value}");
+    assert_eq!(value["verdict"], "does_not_fit", "{value}");
+}
+
+// T14 / ADR 0040 §9: structured source selectors survive the host pin/size
+// round trip instead of silently widening a selected-file deployment.
+#[tokio::test]
+async fn structured_huggingface_files_survive_the_check() {
+    let hub = mirror(Some(1 << 30), None).await;
+    let p = Preview::new(true, |host| {
+        host["model_sources"] = json!({"huggingface_endpoint":hub.endpoint()});
+    });
+    let source = json!({
+        "type":"huggingface", "repo":"org/model", "revision":SHA,
+        "files":["model.safetensors"]
+    });
+    let (status, value) = p
+        .request(json!({"config":{
+            "name":"preview", "engine":"vllm", "model":{"source":source}
+        }}))
+        .await;
+    assert_eq!(status, 200, "{value}");
+    assert_eq!(value["verdict"], "fits", "{value}");
+    assert_eq!(value["estimated"], true, "{value}");
+    assert_eq!(value["config"]["model"]["source"]["files"], source["files"]);
+    assert_eq!(value["config"]["model"]["source"]["revision"], SHA);
+}
+
+// T14 / U7 / ADR 0040 §9: sources not sized by the preview are unknown,
+// never a zero-byte estimate from an empty source traversal.
+#[tokio::test]
+async fn an_unsized_http_checkpoint_is_unknown_not_zero_bytes() {
+    let p = Preview::new(true, |_| {});
+    let (status, value) = p.request(json!({"config":{
+        "name":"preview","engine":"vllm","model":{"source":{
+            "type":"http","url":"https://example.invalid/model.safetensors","sha256":"a".repeat(64)
+        }}
+    }})).await;
+    assert_eq!(status, 200, "{value}");
+    assert_eq!(value["verdict"], "unknown", "{value}");
+    assert_eq!(value["estimated"], false, "{value}");
 }

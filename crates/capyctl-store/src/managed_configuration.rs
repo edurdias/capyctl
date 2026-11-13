@@ -791,11 +791,15 @@ impl crate::Store {
     /// ([`resolve_on_host`]) with `weights_bytes` as the checkpoint's weights
     /// when they are known, and judged by a start's placement rule against
     /// memory charged now. A read-only transaction: nothing is stored.
+    #[allow(clippy::too_many_arguments)]
     pub fn check_deployment_fit(
         &self,
         config: &Value,
         targets: &[HostTarget],
         weights_bytes: Option<i64>,
+        observations: &[capyctl_domain::resources::MemoryObservation],
+        residents: &[capyctl_domain::resources::ProcessResident],
+        now_ms: i64,
     ) -> Result<Vec<FitCheck>> {
         let instance_spec = capyctl_config::instances::parse_instance_spec(config)
             .map_err(ManagedConfigurationError::Rejected)?;
@@ -838,6 +842,9 @@ impl crate::Store {
                     &tx,
                     &resolved.effective,
                     &resolved.devices,
+                    observations,
+                    residents,
+                    now_ms,
                 )
                 .map_err(|_| ManagedConfigurationError::CorruptStoredData)?
                 {
@@ -875,27 +882,83 @@ impl crate::Store {
         Ok(checks)
     }
 
-    /// ADR 0040 §9: the weights measured for the checkpoint `source` (an
-    /// effective revision's `model.source`), the latest recorded digest of
-    /// any revision of any deployment that resolved to the same source.
-    pub fn recorded_weights(
-        &self,
-        source: &capyctl_config::model_source::ModelSource,
-    ) -> Result<Option<i64>> {
-        let source =
-            serde_json::to_string(source).map_err(|_| ManagedConfigurationError::Invalid)?;
-        Ok(self
+    /// ADR 0040 §9, ADR 0014 amendment A6: reuse measured weights only on
+    /// the measuring host, for the same source and declared drafter.
+    pub fn recorded_weights(&self, config: &Value, host_id: &str) -> Result<Option<i64>> {
+        let source = if let Some(path) = config.pointer("/model/path").and_then(Value::as_str) {
+            capyctl_config::model_source::ModelSource::Local {
+                path: path.to_owned(),
+            }
+        } else {
+            serde_json::from_value(
+                config
+                    .pointer("/model/source")
+                    .cloned()
+                    .ok_or(ManagedConfigurationError::Invalid)?,
+            )
+            .map_err(|_| ManagedConfigurationError::Invalid)?
+        };
+        let drafter: Option<capyctl_config::model_source::ModelSource> = config
+            .pointer("/model/draft")
+            .filter(|draft| !draft.is_null())
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| ManagedConfigurationError::Invalid)?;
+        // JSON object order is not identity: accepted documents and frozen
+        // typed snapshots serialize their fields in different orders.
+        let mut statement = self.conn.prepare(
+            "SELECT json_extract(r.effective_json,'$.model.source'),
+                    json_extract(r.effective_json,'$.model.draft.source'), d.weights_bytes
+             FROM checkpoint_digests d JOIN effective_revisions r
+               ON r.deployment_id=d.deployment_id AND r.revision=d.revision
+             WHERE d.state='recorded' AND d.host_id=?1 ORDER BY d.updated_at_ms DESC",
+        )?;
+        let rows = statement.query_map([host_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (recorded_source, recorded_drafter, weights) = row?;
+            let recorded_source: capyctl_config::model_source::ModelSource =
+                serde_json::from_str(&recorded_source)
+                    .map_err(|_| ManagedConfigurationError::CorruptStoredData)?;
+            let recorded_drafter: Option<capyctl_config::model_source::ModelSource> =
+                recorded_drafter
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|_| ManagedConfigurationError::CorruptStoredData)?;
+            if source == recorded_source && drafter == recorded_drafter {
+                return Ok(Some(weights));
+            }
+        }
+        Ok(None)
+    }
+
+    /// ADR 0040 §9: editing starts from the accepted source, not its frozen
+    /// host-specific effective configuration.
+    pub fn deployment_source(&self, id: &str) -> Result<Option<(String, i64, Value)>> {
+        let source: Option<(String, i64, String)> = self
             .conn
             .query_row(
-                "SELECT d.weights_bytes FROM checkpoint_digests d JOIN effective_revisions r
-                   ON r.deployment_id=d.deployment_id AND r.revision=d.revision
-                  WHERE d.state='recorded'
-                    AND json(json_extract(r.effective_json,'$.model.source'))=json(?1)
-                  ORDER BY d.updated_at_ms DESC LIMIT 1",
-                [source],
-                |r| r.get(0),
+                "SELECT d.id,d.revision,s.config_json FROM deployments d
+             JOIN managed_configuration_sources s ON s.deployment_id=d.id AND s.revision=d.revision
+             WHERE d.id=?1 OR d.name=?1 ORDER BY d.id=?1 DESC LIMIT 1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
-            .optional()?)
+            .optional()?;
+        source
+            .map(|(id, revision, source)| {
+                let source = serde_json::from_str(&source)
+                    .map_err(|_| ManagedConfigurationError::Invalid)?;
+                Ok((id, revision, source))
+            })
+            .transpose()
     }
 }
 
@@ -1312,3 +1375,73 @@ pub(crate) fn reseal_migrated_receipt(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod recorded_weights_tests {
+    use crate::Store;
+    use rusqlite::params;
+    use serde_json::json;
+
+    // T14 / ADR 0014 A6, ADR 0040 §9: measurements include the drafter
+    // and belong to the host that measured the files.
+    #[test]
+    fn recorded_weights_require_the_same_host_source_and_drafter() {
+        let store = Store::open_in_memory().unwrap();
+        let config = json!({"model":{"source":{"type":"local","path":"model"}}});
+        store.conn.execute_batch(
+            "INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version,revision)
+             VALUES('d','chat','model','stopped',0,0,1,1,1);",
+        ).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO effective_revisions VALUES('d',1,?1,'f')",
+                [config.to_string()],
+            )
+            .unwrap();
+        store.conn.execute(
+            "INSERT INTO checkpoint_digests(deployment_id,revision,state,host_id,weights_bytes,updated_at_ms,provisional,digest)
+             VALUES('d',1,'recorded','host-a',123,1,0,'digest')", [],
+        ).unwrap();
+        assert_eq!(
+            store.recorded_weights(&config, "host-a").unwrap(),
+            Some(123)
+        );
+        assert_eq!(store.recorded_weights(&config, "host-b").unwrap(), None);
+        let mut different = config.clone();
+        different["model"]["source"]["path"] = json!("another");
+        assert_eq!(store.recorded_weights(&different, "host-a").unwrap(), None);
+        different = config.clone();
+        different["model"]["draft"] = json!({"type":"local","path":"draft"});
+        assert_eq!(store.recorded_weights(&different, "host-a").unwrap(), None);
+        let mut frozen = different.clone();
+        frozen["model"]["draft"] = json!({
+            "source": different["model"]["draft"],
+            "resolved_path": "/models/draft"
+        });
+        store
+            .conn
+            .execute(
+                "UPDATE effective_revisions SET effective_json=?1",
+                [frozen.to_string()],
+            )
+            .unwrap();
+        assert_eq!(store.recorded_weights(&config, "host-a").unwrap(), None);
+        assert_eq!(
+            store.recorded_weights(&different, "host-a").unwrap(),
+            Some(123)
+        );
+        store
+            .conn
+            .execute(
+                "INSERT INTO managed_configuration_sources VALUES('d',1,?1)",
+                params![config.to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            store.deployment_source("chat").unwrap(),
+            Some(("d".into(), 1, config))
+        );
+        assert_eq!(store.deployment_source("missing").unwrap(), None);
+    }
+}

@@ -34,8 +34,8 @@ pub fn router() -> Router {
 /// KTD17: explicit routes only, so this merges with either role's fallback.
 pub fn router_with_assets<A: Assets>() -> Router {
     Router::new()
-        .route("/", get(|| async { Redirect::permanent("/ui/") }))
-        .route("/ui", get(|| async { Redirect::permanent("/ui/") }))
+        .route("/", get(|| async { Redirect::temporary("/ui/") }))
+        .route("/ui", get(|| async { Redirect::temporary("/ui/") }))
         .route("/ui/", get(|| async { asset::<A>("index.html") }))
         .route("/ui/{*path}", get(path::<A>))
         .layer(middleware::from_fn(headers))
@@ -46,7 +46,8 @@ async fn path<A: Assets>(Path(path): Path<String>) -> Response {
     if path.split('/').any(|part| part == ".." || part == ".") || path.contains(['\\', '\0']) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let name = if FilePath::new(&path).extension().is_none() {
+    // ADR 0040 §13: existing bundle files win over the SPA route fallback.
+    let name = if FilePath::new(&path).extension().is_none() && A::get(&path).is_none() {
         "index.html"
     } else {
         &path

@@ -963,15 +963,14 @@ fn generic_overrides_and_config_show_parse() {
     ])
     .unwrap();
     assert_eq!(i.management_listen, Some("127.0.0.1:7543".parse().unwrap()));
-    for bad in ["0.0.0.0:7543", "127.0.0.1:0", "localhost"] {
+    for bad in ["127.0.0.1:0", "localhost"] {
         assert!(
             parse_invocation(["capyctl", "start", "standalone", "--management-listen", bad])
                 .is_err(),
             "{bad}"
         );
     }
-    // Final review I8: the server takes `--management-listen` too, with the
-    // same loopback rule.
+    // T03 / ADR 0040: defer remote authorization until YAML and --set are read.
     let i = parse_invocation([
         "capyctl",
         "start",
@@ -988,7 +987,7 @@ fn generic_overrides_and_config_show_parse() {
         "--management-listen",
         "0.0.0.0:7543"
     ])
-    .is_err());
+    .is_ok());
     assert!(parse_invocation([
         "capyctl",
         "start",
