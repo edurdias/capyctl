@@ -1160,6 +1160,53 @@ async fn serve_host(
         ),
     };
     let updates = capyctl_agent::session::ProfileUpdates::new(host_profiles);
+    // ADR 0040 §10: remote operations and the local socket share the same
+    // host authority, even when the optional socket cannot be bound.
+    let handler = capyctl_agent::host_control::HostControl::new(
+        document.clone(),
+        engines.clone(),
+        config.clone(),
+        updates.clone(),
+        journal.clone(),
+    );
+    let models = capyctl_config::model_settings::resolve(
+        &config.document,
+        &Default::default(),
+        &Default::default(),
+        capyctl_config::model_settings::default_models_root(
+            std::env::var_os("HOME").as_deref().map(Path::new),
+        )
+        .as_deref(),
+    )
+    .map_err(|_| unavailable())?;
+    updates.serve_host_admin(Arc::new(
+        capyctl_agent::host_admin_remote::HostAdminService {
+            host_id: host.clone(),
+            target: capyctl_agent::host_admin::Target {
+                role_document: document.clone(),
+                kind: capyctl_agent::host_admin::RoleKind::Host,
+                engines: engines.clone(),
+                state_dir: config.state_dir.clone(),
+                socket: config
+                    .state_dir
+                    .join(capyctl_agent::control_socket::SOCKET_NAME),
+            },
+            roots: capyctl_agent::engines::ScanRoots::from_env(Vec::new()),
+            toolchain: Default::default(),
+            cuda_home_env: std::env::var("CUDA_HOME").ok(),
+            measurer: Arc::new(capyctl_agent::installation::InstallationMeasurer::new()),
+            role: capyctl_agent::host_admin_remote::InProcessRole(handler.clone()),
+            model_env: capyctl_config::model_settings::ModelOverrides::from_env(&|name| {
+                std::env::var(name).ok()
+            })
+            .map_err(|_| unavailable())?,
+            pinner: Arc::new(capyctl_agent::host_admin::CachedSourcePinner::new(
+                models.policy,
+                models.models_root,
+                Arc::new(|name| std::env::var(name).ok()),
+            )),
+        },
+    ));
     // ADR 0018 §3: the local control channel, bound only inside the role's
     // 0700 state directory. A socket that cannot be bound (unsafe directory,
     // path too long, another role) is reported and the role runs without it.
@@ -1169,13 +1216,6 @@ async fn serve_host(
         .join(capyctl_agent::control_socket::SOCKET_NAME);
     let control_server = match capyctl_agent::control_socket::ControlServer::bind(&control_socket) {
         Ok(server) => {
-            let handler = capyctl_agent::host_control::HostControl::new(
-                document.clone(),
-                engines.clone(),
-                config.clone(),
-                updates.clone(),
-                journal.clone(),
-            );
             // SAFETY: geteuid has no preconditions and cannot fail.
             let uid = unsafe { libc::geteuid() };
             Some(tokio::spawn(server.serve(handler, uid, control_shutdown)))
