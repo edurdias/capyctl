@@ -334,9 +334,11 @@ def pool_case(ctx,row,label,limit,context,expected,warning,pool=None,retention=F
 def sizing(ctx,row):
     results=[]
     for args in (
-        ('auto32','12.17GiB',32768,8,False,None,True,False),
-        ('auto8','12.17GiB',8192,4,False,None,False,False),
-        ('derived-cap','12.17GiB',65536,12,True,None,False,False),
+        # T45 / ADR0034 LC17: 12.17GiB is a displayed approximation.
+        # Byte quantities must be integral (effective::parse_bytes); round down.
+        ('auto32','13067437998B',32768,8,False,None,True,False),
+        ('auto8','13067437998B',8192,4,False,None,False,False),
+        ('derived-cap','13067437998B',65536,12,True,None,False,False),
         ('raised-cap','24GiB',65536,15,False,None,False,False),
         ('room3','4GiB',32768,3,True,None,False,True),
         ('room0','1GiB',32768,0,False,None,False,True),
@@ -365,4 +367,7 @@ def run(ctx,row):
         failures=[r['reason'] for r in results if r['verdict']!='pass']
         return dict(verdict='fail' if failures else 'pass',reason='; '.join(failures) or row['id']+' criteria passed on both engines',evidence=results)
     except Exception as error:
+        # T45: failed starts can leave no runtime binding for logs(name).
+        # Retain sanitized controller/server logs too, before the session is gone.
+        ctx.save('failure-logs',dict(logs=ctx.logs()))
         return dict(verdict='fail',reason=type(error).__name__+': '+str(error),evidence=results)

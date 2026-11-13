@@ -25,18 +25,26 @@ class SetupSelectionTests(unittest.TestCase):
         self.assertIn('EM6_VLLM', dependencies('EM6'))
 
     def test_preservation_rows_include_base_and_cache(self):
-        needed = dependencies('LC13')
-        self.assertTrue({'VLLM_033', 'LMCACHE', 'SGLANG_0523',
-                         'LMCACHE_SGLANG', 'MODEL_CHAT'} <= needed)
-        self.assertNotIn('CAPYCTL_LC18', needed)
-        self.assertNotIn('LMCACHE_VLLM_034', needed)
-        self.assertNotIn('VLLM_034', needed)
+        for row in ('LC13', 'LC14', 'LC15', 'LC16'):
+            with self.subTest(row=row):
+                needed = dependencies(row)
+                self.assertTrue({'VLLM_033', 'LMCACHE', 'VLLM_034',
+                                 'LMCACHE_VLLM_034', 'SGLANG_0523',
+                                 'LMCACHE_SGLANG', 'MODEL_CHAT'} <= needed)
+                self.assertNotIn('CAPYCTL_LC18', needed)
+                self.assertTrue({'VLLM_034', 'LMCACHE_VLLM_034'} <=
+                                dependencies(row + 'U', unified=True))
 
     def test_full_discrete_catalog_does_not_install_unified_or_trt(self):
         needed = dependencies()
         self.assertNotIn('TENSORFOLD_100', needed)
         self.assertNotIn('CAPYCTL_LC12', needed)
         self.assertFalse(any('TENSORRT' in key for key in needed))
+        self.assertTrue({'VLLM_034', 'LMCACHE_VLLM_034'} <= needed)
+
+    def test_other_cache_rows_do_not_install_preserving_vllm(self):
+        for row in ('LC17', 'LC18'):
+            self.assertNotIn('LMCACHE_VLLM_034', dependencies(row))
 
     def test_skipped_selection_never_bootstraps_tools(self):
         import subprocess

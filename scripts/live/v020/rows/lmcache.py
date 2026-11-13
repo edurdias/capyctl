@@ -212,17 +212,21 @@ class Protocol:
     def __init__(self, ctx, row, role="standalone", engine="LMCACHE"):
         self.ctx, self.row, self.role, self.engine = ctx, row, role, engine
         self.sglang = engine == "LMCACHE_SGLANG"
-        self.engine_config = dict(accept_extra_args=True, extra_args=[
-            "--enable-cache-report" if self.sglang else "--enable-prompt-tokens-details"])
+        # SPEC §17: CapyCTL always renders SGLang's reserved cache-report flag.
+        self.engine_config = ({} if self.sglang else
+                              dict(accept_extra_args=True, extra_args=["--enable-prompt-tokens-details"]))
         self.residency = "deep" if ctx.unified else "host_backed"
         self.records, self.failures, self.names = [], [], []
         self.prefix = row["id"].lower() + "-" + engine.lower().replace("_", "-")
         self.first_server_gpu = None
         self.server_identity = None
         self.journal_start = 0
+        self.dependency_override = None
 
     def record(self, kind, **fields):
         value = dict(kind=kind, engine=self.engine, **fields)
+        if self.dependency_override is not None:
+            value["dependency_override"] = self.dependency_override
         self.records.append(value)
         self.ctx.save(self.engine.lower() + "-record-" + str(len(self.records)).zfill(5), value)
         return value
@@ -413,10 +417,14 @@ class Protocol:
             while True:
                 after = metrics(self.ctx, name, self.role)
                 requested = (counter(after, "requested") or 0) - (counter(before, "requested") or 0)
-                if requested > 0 or time.monotonic() >= until:
+                retrieved = (counter(after, "loaded") or 0) - (counter(before, "loaded") or 0)
+                complete = requested > 0 and (not hit or retrieved * CHUNK >= fixture["whole_chunk_tokens"])
+                if complete or time.monotonic() >= until:
                     break
                 time.sleep(0.1)
             self.check(counter(after, "hit") is not None, "LMCache emitted no token hit counter")
+            self.check(counter(after, "requested") is not None and requested > 0,
+                       "LMCache emitted no requested-token increment")
         delta = {key: value - before.get(key, 0) for key, value in after.items()}
         hits = (counter(after, "hit") or 0) - (counter(before, "hit") or 0)
         loaded = (counter(after, "loaded") or 0) - (counter(before, "loaded") or 0)
@@ -424,8 +432,10 @@ class Protocol:
         if cache and hit is not None:
             self.check(hits >= fixture["whole_chunk_tokens"] if hit else hits == 0,
                        label + (": missing whole-chunk external hit" if hit else ": crossed a salt/cold isolation boundary"))
-            if hit and counter(after, "loaded") is not None:
-                self.check(loaded * CHUNK >= fixture["whole_chunk_tokens"], label + ": lookup hit was not retrieved")
+            if hit:
+                self.check(counter(after, "loaded") is not None and
+                           loaded * CHUNK >= fixture["whole_chunk_tokens"],
+                           label + ": lookup hit was not retrieved")
         entry = dict(label=label, prompt_sha256=fixture["sha256"], expected_chunk_tokens=fixture["whole_chunk_tokens"],
                      answer=content, off_answer=expected, usage=usage, salt=salt,
                      external_hit_tokens=hits, loaded_chunks=loaded, counters_before=before,
@@ -582,9 +592,12 @@ def endurance(p, fixture_data):
     references, baseline = {}, []
     for index, label in enumerate(labels):
         p.request(off, data[label], "off-seed-" + str(index))
-        p.lifecycle("park", off)
-        baseline.append(p.memory(off, "off-cycle-" + str(index)))
-        p.lifecycle("wake", off)
+        # T45 / ADR0034 LC18: restart-only without LMCache cannot park
+        # (ADR0033 §7). Its answers are the reference, not a deep-park footprint.
+        if p.residency != "restart_only":
+            p.lifecycle("park", off)
+            baseline.append(p.memory(off, "off-cycle-" + str(index)))
+            p.lifecycle("wake", off)
         references[label] = p.request(off, data[label], "off-cycle-" + str(index), expected=references.get(label))["answer"]
     p.retire(off)
     on = p.deploy("on", "required")
@@ -594,7 +607,8 @@ def endurance(p, fixture_data):
         p.request(on, data[label], "on-seed-" + str(index), cache=True, expected=references[label])
         p.lifecycle("park", on)
         parked = p.memory(on, "on-park-" + str(index), cache=True)
-        p.footprint(baseline[index], parked)
+        if p.residency != "restart_only":
+            p.footprint(baseline[index], parked)
         p.server_check(on)
         p.lifecycle("wake", on)
         p.request(on, data[label], "on-cycle-" + str(index), cache=True, expected=references[label], hit=True)
@@ -736,13 +750,15 @@ def run(ctx, row):
     # T45 / ADR0034 amendment: run both preservation recipes in full, and retain
     # the old clearing-source guard separately. No version bypasses the source gate.
     for engine in ("LMCACHE", "LMCACHE_VLLM_034", "LMCACHE_SGLANG"):
-        if engine == "LMCACHE_VLLM_034":
-            from release_pins import LMCACHE_034_CONFLICT
-            results.append(dict(verdict="skip", reason=LMCACHE_034_CONFLICT, evidence=[]))
-            continue
         p = Protocol(ctx, row, role=role, engine=engine)
         guard_only = engine == "LMCACHE"
         try:
+            if engine == "LMCACHE_VLLM_034":
+                receipt = ctx.root / "evidence" / "LMCACHE_VLLM_034.dependency-override.json"
+                p.dependency_override = json.loads(receipt.read_text())
+                ctx.assertion(bool(p.dependency_override.get("reason")),
+                              "missing test-only dependency override provenance")
+                p.record("test-environment-override")
             guarded = sleep_guard(p, qualification=not guard_only)
             if guard_only:
                 p.check(guarded, "vLLM 0.33 clearing-source guard unexpectedly enabled sleep LMCache")
