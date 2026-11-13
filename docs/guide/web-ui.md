@@ -39,24 +39,39 @@ allows.
 
 ## What you can do
 
-- **Overview**: every model with its state (ready, parked, stopped, and the
-  steps in between), what each host holds in GPU memory and host RAM, and
-  which model the router is switching to. Changes appear within about two
-  seconds.
-- **Models**: a model's detail, and the actions its state allows: start,
-  park, wake, stop and delete. When an action is refused, the UI says why, and
-  offers **Make room and start** or **Stop and delete** where those apply.
-  Add a model with a guided form or as YAML; the UI checks the deployment and
-  whether it fits in memory before you save it.
+- **Overview**: a status line (hosts online, memory free, models by state,
+  requests in flight); for each host, its memory with one segment per model
+  holding it (a parked model's share is hatched); and every model with its
+  engine, state (ready, parked, stopped, failed, and the steps in between, with
+  how long a step has been running and a download's progress), the memory it
+  reserves and, while it is ready, its readings: time to first token, tokens
+  per second per stream (derived from the engine's time per output token),
+  requests in flight and waiting, and how full its KV cache is. Recent activity
+  is listed under the models. Changes appear within about two seconds.
+- **Models**: each model shows one main action for its state (**Park** when
+  ready, **Start** when parked, stopped or failed); the others (stop,
+  preinitialize, delete) are in the **⋯** menu, and an action its state does
+  not allow is shown there with the reason. When an action is refused, the UI
+  says why, and offers **Make room and start** or **Stop and delete** where
+  those apply. A failed model has a **Why?** panel with the reason, the hint and
+  the end of its engine log. A model's page shows its readings with short
+  trends from the time the page has been open, its latency by source, its
+  effective configuration and its engine log. Add a model with a guided form
+  or as YAML; the UI checks the deployment and whether it fits in memory before
+  you save it.
 - **Hosts** (server): enrolled hosts, draining and revoking them, inviting a
   new host, the models copied on each host, and each host's settings.
-- **Engines**: detect, add and remove engines, including a
-  [custom engine](engines.md#custom-engines), which you confirm by typing its
-  name.
+- **Engines**: a table per host of its engines, their versions and the models
+  using each; detect and add engines, remove one from its menu, and add a
+  [custom engine](engines.md#custom-engines) in a dialog, which you confirm by
+  typing its name.
 - **Playground**: chat with a model, or send a decision request, and see the
   timings. History stays in the browser.
 - **Activity**: the event log.
 - **Settings**: your signed-in browsers, and the version.
+
+On a phone the sections are in a tab bar at the bottom: Overview, Models,
+Playground, and More for the rest.
 
 The UI acts through the same management API as the CLI, so everything it does
 is recorded and refused in the same way.

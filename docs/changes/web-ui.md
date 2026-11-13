@@ -7,7 +7,11 @@ listener: `remote: true`, `--management-remote`, `CAPYCTL_MANAGEMENT_REMOTE`, wi
 `public_address` for sign-in links and the extra accepted origin), SPEC §13.3 and ADR 0031 §8
 (custom engines confirmed from the browser), ADR 0017 (host administration carried from the
 server to a host behind the `host_admin` capability) and ADR 0008 (deployment pinning and a
-fit check on the server). What changed: one composition point authorizes every management
+fit check on the server). The owner decision of 2026-11-13 redid the screens on a design
+review (ADR 0040, plan U20): a status line, host memory segmented per model, model rows with
+their live readings and one primary action per state with the rest in a menu, a Why panel
+for a failed model, state colours apart from the brand orange, a phone tab bar, and engines
+as a table with dialogs. What changed: one composition point authorizes every management
 route for the admin token or a browser session; the admin token is accepted only from
 loopback or the connection's own local address and never with forwarding headers; sessions
 and one-time sign-in links live in the store by SHA-256 digest, with the `capyctl_session`
@@ -27,10 +31,13 @@ engine, signed in from a phone over a non-loopback address, before a release shi
 # Release note: New features
 
 - **A web UI.** A standalone role and a server now serve a web UI at `/ui/` on their
-  management address: watch models, hosts, engines and memory live; start, park, wake,
-  stop and delete models; add and edit deployments with a memory fit check; manage
-  engines, hosts, invitations and model copies; and chat with or test a model in the
-  playground. Sign a browser in with `capyctl open ui`, which prints a one-time link and a
+  management address: the Overview shows each host's memory split by the models holding
+  it, and each model's state, reserved memory and live readings (time to first token,
+  tokens per second per stream, requests in flight and waiting, KV cache fill); start,
+  park, wake, stop and delete models, with a **Why?** panel when one fails; add and edit
+  deployments with a memory fit check; manage engines, hosts, invitations and model copies;
+  and chat with or test a model in the playground. On a phone the sections sit in a tab
+  bar. Sign a browser in with `capyctl open ui`, which prints a one-time link and a
   QR code ([The web UI](../guide/web-ui.md)). The management listener stays on loopback
   unless you set `remote: true` (`--management-remote`, `CAPYCTL_MANAGEMENT_REMOTE`); from
   another machine only a signed-in browser is accepted, and `public_address` names the
