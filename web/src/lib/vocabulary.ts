@@ -203,6 +203,12 @@ export const MANAGEMENT_REFUSALS: Record<string, Refusal> = {
     reason: 'That host is not known to CapyCTL.',
     action: 'Go back to the Hosts page; it may have been removed.',
   },
+  // ADR 0040 (review blocker 2): Edit's `GET …/deployments/{id}/source` for a
+  // deployment with no accepted document.
+  deployment_not_found: {
+    reason: 'That model is no longer deployed.',
+    action: 'Go back to Models and refresh the list; it may have been deleted.',
+  },
   forbidden: {
     reason: 'This engine log was written in debug mode and is never sent off the host.',
     action: 'Read it on the host itself.',
