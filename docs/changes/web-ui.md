@@ -44,6 +44,27 @@ document rather than a nonexistent host.yaml; on servers it describes the stored
 approved document, available without contacting the host. Server deployment checks pin
 and size through the chosen host using that host's model-source endpoint and token.
 
+The milestone review of 2026-11-13 (a security review and a code review of the whole
+branch) found no critical security issue and four blockers, fixed before merge. Failing
+before, passing after:
+- The Add and Edit screens read a nested `fit` the check never sends; the web tests now use the
+  handler's real response shape.
+- Edit loaded the frozen effective deployment. It now loads the accepted source document from
+  `GET /management/v1/deployments/{id}/source`.
+- The fit check ignored observed free memory; it now applies start's admission.
+- A packaged host could not write `engines.yaml` (ADR 0018 amendment A4, below).
+
+The security fixes:
+- Unknown sign-in links no longer take the store's write lock, and exchanges are bounded.
+- Session write-through is serialized and safe to cancel.
+- Revocation ends host-admin waits and blocked event reads without cancelling a dispatched
+  operation.
+- An engine found only under extra directories needs the preview and typed confirmation.
+- The admin token is refused beside any forwarding or proxy header.
+- Host control requests use one capability-checked session and refuse an oversized frame
+  without dropping the session.
+- Unknown non-management paths on the management listener answer 404.
+
 # Release note: New features
 
 - **A web UI.** A standalone role and a server now serve a web UI at `/ui/` on their
