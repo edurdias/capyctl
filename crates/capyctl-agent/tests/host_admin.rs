@@ -175,6 +175,11 @@ fn detection_finds_an_installation_only_under_an_extra_directory() {
     };
     assert!(!listed(&roots(&home, vec![])));
     assert!(listed(&roots(&home, vec![elsewhere])));
+    // KTD11: PATH candidates use the same detection as extra directories.
+    // Supply the role's PATH snapshot without mutating the test process.
+    let mut on_path = roots(&home, vec![]);
+    on_path.path_dirs = vec![env.join("bin")];
+    assert!(listed(&on_path));
 }
 
 // ADR 0040 §10: a remote built-in add runs a detected candidate; one naming

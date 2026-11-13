@@ -111,6 +111,8 @@ pub struct StandaloneRoutes {
     pub ui: Router,
     pub actions: Arc<OwnedActionSource>,
     pub check_sources: Arc<dyn crate::check::SourceProvider>,
+    /// ADR 0040 §10: the embedded host's in-process administration.
+    pub host_admin: Arc<dyn crate::host_admin::HostAdminSource>,
     /// The names the embedded host answers to for a drain.
     pub host_names: Vec<String>,
     pub installations: Arc<EmbeddedInstallations>,
@@ -135,6 +137,7 @@ pub fn standalone(
             routes.ui,
             crate::lifecycle_router(routes.actions.clone()),
             crate::check::router(routes.actions.configuration().clone(), routes.check_sources),
+            crate::host_admin::router(routes.host_admin),
             // SPEC §4.3: the explicit drain of the embedded host, by its
             // published name or the `standalone` alias the CLI uses.
             crate::drain::drain_router(routes.actions, routes.host_names),
@@ -188,6 +191,8 @@ pub fn server(
                 routes.actions.configuration().clone(),
                 Arc::new(crate::check::UnavailableSources),
             ),
+            // ADR 0040 §10: never administer the server machine as a host.
+            crate::host_admin::router(Arc::new(crate::host_admin::UnavailableHostAdmin)),
             // SPEC §4.3: the explicit drain of an enrolled host.
             crate::drain::drain_router_with_presence(routes.actions, Vec::new(), routes.presence),
             crate::enrollment::enrollment_router(

@@ -2452,12 +2452,46 @@ async fn start_standalone_in(
     // the caller serves it (`App::inference_router`), for status.
     let inference_listener =
         Arc::new(capyctl_management::inference_listener::InferenceListenerView::default());
+    // ADR 0040 §10: the API and local CLI share one in-process control
+    // handler and its mutation lock.
+    let engine_control = engines.as_ref().map(|engines| {
+        crate::standalone_engines::StandaloneControl::new(
+            engines.clone(),
+            provider.clone(),
+            embedded.clone(),
+            retirements,
+            coordinator.commands(),
+            declared_host.name.clone(),
+        )
+    });
+    let host_admin: Arc<dyn capyctl_management::host_admin::HostAdminSource> =
+        match (&engines, &engine_control) {
+            (Some(engines), Some(control)) => {
+                let role_document = match &outcome {
+                    LoadOutcome::Loaded(path) => PathBuf::from(path),
+                    LoadOutcome::Generated { config_path, .. } => config_path.clone(),
+                };
+                Arc::new(crate::standalone_engines::StandaloneAdmin {
+                    control: control.clone(),
+                    target: capyctl_agent::host_admin::Target {
+                        role_document,
+                        kind: capyctl_agent::host_admin::RoleKind::Standalone,
+                        engines: engines.clone(),
+                        state_dir: state_dir.to_path_buf(),
+                        socket: state_dir.join(capyctl_agent::control_socket::SOCKET_NAME),
+                    },
+                    owner: owner.clone(),
+                })
+            }
+            _ => Arc::new(capyctl_management::host_admin::UnavailableHostAdmin),
+        };
     // ADR 0040 §2: every management route is authorized at one point.
     let management = capyctl_management::compose::standalone(
         session_verifier,
         management_listener.public_address.as_deref(),
         capyctl_management::compose::StandaloneRoutes {
             ui: capyctl_webui::router(),
+            host_admin,
             actions: source,
             // ADR 0040 §9: pin with this host's resolved document settings.
             check_sources: Arc::new(capyctl_management::check::StandaloneSources(Arc::new(
@@ -2585,18 +2619,13 @@ async fn start_standalone_in(
              so there is no engines.yaml to reload"
                 .into(),
         ),
-        Some(engines) => {
+        Some(_) => {
             let socket = state_dir.join(capyctl_agent::control_socket::SOCKET_NAME);
             match capyctl_agent::control_socket::ControlServer::bind(&socket) {
                 Ok(server) => {
-                    let handler = crate::standalone_engines::StandaloneControl::new(
-                        engines.clone(),
-                        provider.clone(),
-                        embedded.clone(),
-                        retirements,
-                        coordinator.commands(),
-                        declared_host.name.clone(),
-                    );
+                    let handler = engine_control.clone().ok_or_else(|| {
+                        StartError::Deploy("engine control handler is unavailable".into())
+                    })?;
                     // SAFETY: geteuid has no preconditions and cannot fail.
                     let uid = unsafe { libc::geteuid() };
                     // Supervised: it stops, and removes its file, with the role.

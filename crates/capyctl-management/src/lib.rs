@@ -42,6 +42,8 @@ pub mod enrollment;
 // ADR 0018 §4: runtime profile retirement over the ordinary stop path.
 pub mod engines;
 pub mod events;
+// ADR 0040 §§10–11: role-injected host administration.
+pub mod host_admin;
 pub mod hosts;
 // Design §9: the inference listener's bind and authentication, for status.
 pub mod inference_listener;
