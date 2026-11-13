@@ -269,10 +269,10 @@ user, and a write needs a temporary file and `engines.yaml.lock` in the same dir
   directory once, with its revision line, the state directory owner and mode 0600, and
   leaves a one-line note in the role log. It moves the file where the previous location is
   writable; under the system units, where `/etc/capyctl` is read-only to the service, it
-  copies it and leaves the old file, which is no longer read and may be deleted. The
-  installer's upgrade, running as root, moves it. No manual step is needed. When both exist,
-  the state directory's copy wins and the old one is left untouched, with a warning naming
-  it. `custom-engines.yaml` follows the same rule.
+  copies it and leaves the old file, which is no longer read and may be deleted. No manual
+  step is needed, and the installer does not touch role configuration or state. When both
+  exist, the state directory's copy wins and the old one is left untouched, with a warning
+  naming it. `custom-engines.yaml` follows the same rule.
 - §2's write rules stand (lock, temporary file, rename, directory sync, revision line, the
   32 KiB bound, refusing a profile declared in both files); "the CLI is the only writer"
   and "a running role only reads it" are withdrawn.
