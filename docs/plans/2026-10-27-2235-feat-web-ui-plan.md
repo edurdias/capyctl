@@ -751,7 +751,7 @@ Considered and not built:
   - Confirming with the wrong typed name is refused.
   - A manifest above the size cap is refused.
   - Listing model copies marks the ones deployments reference. Prune deletes only copies unreferenced when it was requested.
-  - Host config returns the same document `inspect config --role host --effective` prints.
+  - Host config returns the effective configuration of the host the role runs: on a standalone role that is its embedded host's document (a standalone has no `host.yaml`, so `inspect config --role host --effective` would describe defaults, not the running host); on a server, the host's stored approved document (U9). *(Amended 2026-11-13.)*
   - The existing `capyctl engine` and `prune sources` CLI tests pass unchanged.
 - **Verification:** the agent, CLI and management suites pass.
 
