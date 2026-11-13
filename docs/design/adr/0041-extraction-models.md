@@ -180,9 +180,10 @@ HTTP 400 `invalid_request` naming the member, before activation:
 | Member | Rule |
 |---|---|
 | `model` | required, a non-empty string |
-| `state` | optional string; absent or empty only when `images` is non-empty (CapyCTL adds no default). Text answers are spans of this string |
+| `state` | optional string; absent or empty only when `images` is non-empty or a PDF asset is supplied. With a PDF, the only non-empty accepted value is its sole asset key; that key is not source text |
 | `fields` | required, an object with at least one member; each name matches `^[A-Za-z_][A-Za-z0-9_.\-]{0,63}$`; each value a field spec (below) |
 | `images` | optional array of at most 4 items, each a string beginning `data:` (any case) or an object with exactly `content_type` and `base64`, both strings. CapyCTL does not decode them; their bytes count toward the body bound |
+| `assets` | optional named map with exactly one non-empty key and a closed object: `format: "pdf"`, non-empty canonical standard-base64 `data_base64`, and optional `type: "document"`. No other formats or members, multiple assets, non-empty text plus PDF, or non-empty `images` plus PDF |
 | `reference_date` | optional string, an ISO calendar date `YYYY-MM-DD` |
 | `options` | optional object with only `include_quantiles` and `return_state_text`, both booleans |
 
@@ -224,7 +225,11 @@ non-empty object of objects each naming a string `type`, the rule decisions use 
 leaves the request uncertain. The response is read whole up to the decision bound (16
 MiB); a longer one (99 quantiles per estimate with `include_quantiles`, a state echoed by
 `return_state_text`) is uncertain, is never replayed and is held until the instance
-stops, as for decisions. CapyCTL does not judge individual answers on the request path.
+stops, as for decisions. CapyCTL does not judge individual answers on the request path,
+except PDF evidence: `state_text` is mandatory, reported text spans must match that
+returned text in Unicode code points, and optional `page`/parallel `pages` must be
+positive one-based page numbers (or null when no single page applies). An invalid
+PDF response leaves the exchange uncertain, never completed against the asset key.
 The host ingress permits `/v1/systemone` for an extraction launch with this contract and
 its own body check (8 MiB; a larger body is refused with HTTP 400 on a host, so a body at
 Clairic's own 16 MiB limit is not accepted there), choosing the contract from the
@@ -245,10 +250,13 @@ signal when it has one (ADR 0031 §6), otherwise at the next verified stop.
 **Day-one answer contract.** Scalar `value` is null when `p_null >= null_threshold`
 (using the engine's default threshold when omitted); otherwise it equals `guess`.
 Text `span` and text-list `spans` are half-open `[start, end)` offsets in Unicode
-code points of `state`, not bytes or UTF-16 code units. `include_quantiles` adds
-`quantiles`: a 99-element array for percentiles 1 through 99 on an estimate,
-and one such array per forecast step. `return_state_text` retains its request
-name and echoes the input under response member `state_text`, not `state`.
+code points of `state`, not bytes or UTF-16 code units; for PDF input they index the
+mandatory returned `state_text` instead. A single-page span may include `page`;
+a list may include `pages`, parallel to `spans`, with null for a cross-page span.
+`include_quantiles` adds `quantiles`: a 99-element array for percentiles 1 through
+99 on an estimate, and one such array per forecast step. `return_state_text`
+echoes the input under response member `state_text`, not `state`; PDF input always
+returns `state_text`, even when this option is absent or false.
 `mode` and `computation` are never public response members; internal diagnostics
 use `raw['_mode']` and `raw['_computation']`.
 
@@ -260,11 +268,24 @@ includes both schema copies, markers, reference/control text and candidate suffi
 These are engine accounting semantics, not new router completion requirements.
 
 For `ShardioAI/extract-4b`, the context is 8192 tokens and truncation is reported.
-PDF input and extracting text from images are not supported. Image-only requests
+Text-layer PDF input is opt-in through the restricted `assets` contract above;
+extracting text from images remains unsupported. Image-only requests
 for `text` or `list` with `items: text` are rejected before inference with
 `field_unsupported_input`; images still support the other types. This is
 model-specific engine validation, not a router restriction on every extraction
 model. Mixed requests can extract text spans from their textual `state`.
+
+**PDF amendment (2026-11-12).** The engine alone decodes and converts PDFs on CPU;
+CapyCTL forwards the asset and state unchanged, apart from the normal model-name
+replacement. Conversion produces deterministic, column-aware reading order and
+aligned rows for ruled tables, with `[Page N]\n` markers. Page offsets bracket the
+page content excluding those markers. The converter rejects scanned/no-text,
+encrypted, malformed and over-limit documents with `unsupported_input`; CapyCTL
+relays the engine rejection under its existing `engine_rejected` envelope.
+The engine defaults to a decoded PDF maximum of 4 MiB and 32 pages, configurable
+through engine arguments. These are engine limits, not decoded limits enforced
+by CapyCTL; the unchanged 8 MiB HTTP request envelope includes base64 overhead.
+Existing checkpoints and default training recipes do not change.
 
 **Compatibility boundary.** A future `/api/alpha/extractions` boundary adapter
 may translate OpenRouter's live Extractions contract; it is not part of 0.2.0.
@@ -273,12 +294,14 @@ The deliberate differences are:
 | Area | CapyCTL 0.2.0 | OpenRouter Extractions |
 |---|---|---|
 | Route | `POST /v1/systemone`, selected by deployment API | `/api/alpha/extractions` |
-| Image input | top-level `images` | `assets` |
+| Asset input | existing top-level `images`; OpenRouter-aligned named `assets` map restricted to one PDF | broader `assets` support |
 | Options | top-level `options` | `provider.options` |
 | Errors | string error codes | numeric error codes |
 | Request size | host ingress 8 MiB | Clairic: 16 MiB |
 
-No compatibility shim or additional response-readiness requirement is introduced.
+Only the named PDF asset map is aligned with OpenRouter. No broader boundary
+adapter, compatibility shim or additional response-readiness requirement is
+introduced; the fixed text-only readiness probe remains unchanged.
 
 ### 4. Readiness is a fixed extraction
 

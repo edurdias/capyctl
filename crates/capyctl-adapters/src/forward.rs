@@ -998,7 +998,7 @@ impl ChatHttp {
         trace: Option<&crate::traits::TraceHeaders>,
     ) -> Result<EngineAnswer, AdapterError> {
         validate_decision_request(body)?;
-        self.systemone_traced(body, trace).await
+        self.systemone_traced(body, trace, false).await
     }
 
     // ADR 0041 §3: extraction and decision exchanges share transport, bound,
@@ -1008,13 +1008,15 @@ impl ChatHttp {
         body: &InferenceRequest,
         trace: Option<&crate::traits::TraceHeaders>,
     ) -> Result<EngineAnswer, AdapterError> {
-        self.systemone_traced(body, trace).await
+        self.systemone_traced(body, trace, body.get("assets").is_some())
+            .await
     }
 
     async fn systemone_traced(
         &self,
         body: &InferenceRequest,
         trace: Option<&crate::traits::TraceHeaders>,
+        pdf: bool,
     ) -> Result<EngineAnswer, AdapterError> {
         let public = body
             .get("model")
@@ -1032,6 +1034,7 @@ impl ChatHttp {
         if !response.status().is_success() || !content_type_is(&response, "application/json") {
             return Err(decision_uncertain());
         }
+        let fields = body.get("fields").unwrap_or(&Value::Null);
         let body = read_whole(response, DECISION_RESPONSE_LIMIT)
             .await
             .ok_or_else(decision_uncertain)?;
@@ -1039,7 +1042,9 @@ impl ChatHttp {
         // key is not an answer. SPEC §10 (issue #223): the caller receives
         // the engine's bytes, its probabilities exactly as it wrote them.
         let mut answer = EngineAnswer::parse(body.into()).map_err(|_| decision_uncertain())?;
-        if !decision_answered(&answer) {
+        if !decision_answered(&answer)
+            || (pdf && !crate::extraction_request::pdf_answered(&answer, fields))
+        {
             return Err(decision_uncertain());
         }
         answer.set("model", json!(public));
@@ -2992,6 +2997,61 @@ pub(crate) mod tests {
             json!({"error": {"message": "x"}}),
         ] {
             assert!(!decision_answered(&body), "{body}");
+        }
+    }
+
+    // T50: PDF asset-value bytes survive the normal outer-envelope encoding.
+    #[tokio::test]
+    async fn pdf_forwarding_preserves_assets_and_checks_returned_text() {
+        const RAW: &str = r#"{"model":"public","state":"invoice","assets": { "invoice": {"format":"pdf","data_base64":"JVBERi0="} },"fields":{"x":{"type":"text"}},"options":{"return_state_text":false}}"#;
+        for (answer, valid) in [
+            (
+                json!({"state_text":"[Page 1]\né🙂","answers":{"x":{"type":"text","value":"é🙂","guess":"é🙂","span":[9,11],"page":1}}}),
+                true,
+            ),
+            (
+                json!({"answers":{"x":{"type":"text","value":"é🙂","guess":"é🙂","span":[9,11]}}}),
+                false,
+            ),
+            (
+                json!({"state_text":"invoice","answers":{"x":{"type":"text","value":"é🙂","guess":"é🙂","span":[9,11]}}}),
+                false,
+            ),
+        ] {
+            let app = axum::Router::new().route(
+                "/v1/systemone",
+                axum::routing::post(move |body: axum::body::Bytes| {
+                    let answer = answer.clone();
+                    async move {
+                        let forwarded: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let mut expected: serde_json::Value = serde_json::from_str(RAW).unwrap();
+                        expected["model"] = json!("served");
+                        assert_eq!(forwarded, expected);
+                        // Existing encoding rewrites top-level key separators, not values.
+                        assert!(std::str::from_utf8(&body).unwrap().contains(
+                            r#""assets":{ "invoice": {"format":"pdf","data_base64":"JVBERi0="} }"#
+                        ));
+                        axum::Json(answer)
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let forward = super::engine_forwarder(
+                format!("http://{address}").parse().unwrap(),
+                "served".into(),
+                None,
+                super::CacheSalt::for_launch(Some("custom"), "pdf", 1),
+            );
+            let request = InferenceRequest::parse(RAW.as_bytes().into()).unwrap();
+            let result = forward.forward_extraction(&request).await;
+            assert_eq!(result.is_ok(), valid);
+            if let Ok(answer) = result {
+                assert_eq!(answer["state_text"], "[Page 1]\né🙂");
+                assert_eq!(answer["model"], "public");
+            }
+            server.abort();
         }
     }
 

@@ -53,6 +53,122 @@ pub fn extraction_answered(answer: &Value) -> bool {
     crate::forward::decision_answered(answer)
 }
 
+/// ADR 0041 §3: PDF spans refer to the engine's returned text, never the asset key.
+pub(crate) fn pdf_answered(answer: &Value, fields: &Value) -> bool {
+    if !extraction_answered(answer) {
+        return false;
+    }
+    let Some(state) = answer.get("state_text").and_then(Value::as_str) else {
+        return false;
+    };
+    let state_len = state.chars().count() as u64;
+    answer["answers"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .all(|(name, answer)| {
+            let text_list = fields[name]["type"] == "list" && fields[name]["items"] == "text";
+            let span_bounds = |span: &Value| {
+                span.as_array()
+                    .filter(|span| span.len() == 2)
+                    .is_some_and(|span| match (span[0].as_u64(), span[1].as_u64()) {
+                        (Some(start), Some(end)) => start < end && end <= state_len,
+                        _ => false,
+                    })
+            };
+            let span_matches = |span: &Value, text: &Value| {
+                let Some(text) = text.as_str() else {
+                    return span.is_null() && text.is_null();
+                };
+                let Some(span) = span.as_array().filter(|span| span.len() == 2) else {
+                    return false;
+                };
+                let (Some(start), Some(end)) = (span[0].as_u64(), span[1].as_u64()) else {
+                    return false;
+                };
+                start < end
+                    && end <= state_len
+                    && state
+                        .chars()
+                        .skip(start as usize)
+                        .take((end - start) as usize)
+                        .eq(text.chars())
+            };
+            let page_valid = |page: &Value| page.is_null() || page.as_u64().is_some_and(|n| n > 0);
+            if answer.get("page").is_some_and(|page| !page_valid(page)) {
+                return false;
+            }
+            if answer["type"] == "text" {
+                if !answer.get("span").is_some_and(|span| {
+                    span_matches(span, answer.get("guess").unwrap_or(&answer["value"]))
+                }) {
+                    return false;
+                }
+            } else if let Some(spans) = answer.get("spans").filter(|spans| !spans.is_null()) {
+                let Some(spans) = spans.as_array() else {
+                    return false;
+                };
+                let Some(values) = answer.get("value").and_then(Value::as_array) else {
+                    return false;
+                };
+                if spans.len() != values.len()
+                    || !spans.iter().zip(values).all(|(span, text)| {
+                        if text_list {
+                            span_matches(span, text)
+                        } else {
+                            span.is_null() || span_bounds(span)
+                        }
+                    })
+                {
+                    return false;
+                }
+            } else if text_list && answer.get("value").is_some_and(|value| !value.is_null()) {
+                return false;
+            }
+            answer.get("pages").is_none_or(|pages| {
+                pages.is_null()
+                    || pages.as_array().is_some_and(|pages| {
+                        answer
+                            .get("spans")
+                            .and_then(Value::as_array)
+                            .is_some_and(|spans| {
+                                pages.len() == spans.len() && pages.iter().all(page_valid)
+                            })
+                    })
+            })
+        })
+}
+
+// Validate canonical standard base64 without decoding or allocating PDF bytes.
+fn standard_base64(data: &str) -> bool {
+    fn digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = data.as_bytes();
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return false;
+    }
+    let padding = if bytes.ends_with(b"==") {
+        2
+    } else {
+        usize::from(bytes.ends_with(b"="))
+    };
+    let content = &bytes[..bytes.len() - padding];
+    content.iter().all(|byte| digit(*byte).is_some())
+        && match padding {
+            2 => digit(content[content.len() - 1]).is_some_and(|n| n & 15 == 0),
+            1 => digit(content[content.len() - 1]).is_some_and(|n| n & 3 == 0),
+            _ => true,
+        }
+}
+
 /// Strict ISO calendar date, including Gregorian leap-year rules.
 pub(crate) fn valid_date(value: &str) -> bool {
     let bytes = value.as_bytes();
@@ -97,6 +213,7 @@ pub fn validate_extraction_request(
             "state",
             "fields",
             "images",
+            "assets",
             "reference_date",
             "options",
         ]
@@ -134,13 +251,52 @@ pub fn validate_extraction_request(
             return Err(invalid("images items must be data: strings or objects with exactly string content_type and base64"));
         }
     }
-    match body.get("state") {
-        None if !images.is_empty() => {}
-        Some(Value::String(state)) if !state.is_empty() || !images.is_empty() => {}
-        _ => {
-            return Err(invalid(
-                "state must be a string, non-empty unless images is non-empty",
-            ))
+    if let Some(assets) = body.get("assets") {
+        let assets = assets
+            .as_object()
+            .filter(|assets| assets.len() == 1)
+            .ok_or_else(|| invalid("assets must contain exactly one named PDF"))?;
+        let (name, asset) = assets.iter().next().unwrap();
+        let _asset = asset
+            .as_object()
+            .filter(|asset| {
+                !name.is_empty()
+                    && asset
+                        .keys()
+                        .all(|key| ["format", "data_base64", "type"].contains(&key.as_str()))
+                    && asset.get("format").and_then(Value::as_str) == Some("pdf")
+                    && asset
+                        .get("data_base64")
+                        .and_then(Value::as_str)
+                        .is_some_and(standard_base64)
+                    && asset
+                        .get("type")
+                        .is_none_or(|kind| kind.as_str() == Some("document"))
+            })
+            .ok_or_else(|| {
+                invalid("assets must contain a closed PDF asset with standard data_base64")
+            })?;
+        if !images.is_empty() {
+            return Err(invalid("images and PDF assets cannot be combined"));
+        }
+        match body.get("state") {
+            None => {}
+            Some(Value::String(state)) if state.is_empty() || state == name => {}
+            _ => {
+                return Err(invalid(
+                    "PDF state must be absent, empty, or the sole asset key",
+                ))
+            }
+        }
+    } else {
+        match body.get("state") {
+            None if !images.is_empty() => {}
+            Some(Value::String(state)) if !state.is_empty() || !images.is_empty() => {}
+            _ => {
+                return Err(invalid(
+                    "state must be a string, non-empty unless images is non-empty",
+                ))
+            }
         }
     }
     if body
@@ -272,6 +428,144 @@ mod tests {
 
     fn request(spec: Value) -> Value {
         json!({"model":"extract", "state":"input", "fields":{"field":spec}})
+    }
+
+    // T50: named PDF assets are shape-checked, never converted by CapyCTL.
+    #[test]
+    fn pdf_asset_boundaries() {
+        let pdf = json!({"format":"pdf","data_base64":"JVBERi0="});
+        let mut body = request(json!({"type":"text"}));
+        body["assets"] = json!({"invoice":pdf});
+        body["options"] = json!({"return_state_text":false});
+        for state in [None, Some(""), Some("invoice")] {
+            body.as_object_mut().unwrap().remove("state");
+            if let Some(state) = state {
+                body["state"] = json!(state);
+            }
+            assert_eq!(validate_extraction_request(&body, &FieldType::ALL), Ok(()));
+        }
+        body["assets"]["invoice"]["type"] = json!("document");
+        body["images"] = json!([]);
+        assert!(validate_extraction_request(&body, &FieldType::ALL).is_ok());
+        for state in [json!("other text"), json!(null), json!(["invoice"])] {
+            body["state"] = state;
+            assert!(validate_extraction_request(&body, &FieldType::ALL).is_err());
+        }
+        body["state"] = json!("invoice");
+        body["images"] = json!(["data:image/png;base64,AAAA"]);
+        assert!(validate_extraction_request(&body, &FieldType::ALL).is_err());
+        body.as_object_mut().unwrap().remove("images");
+        for assets in [
+            json!(null),
+            json!([]),
+            json!({}),
+            json!({"":pdf}),
+            json!({"invoice":pdf,"second":pdf}),
+            json!({"invoice":null}),
+            json!({"invoice":{"format":"png","data_base64":"AAAA"}}),
+            json!({"invoice":{"format":"PDF","data_base64":"AAAA"}}),
+            json!({"invoice":{"format":"pdf"}}),
+            json!({"invoice":{"format":"pdf","data_base64":1}}),
+            json!({"invoice":{"format":"pdf","data_base64":"AAAA","extra":true}}),
+            json!({"invoice":{"format":"pdf","data_base64":"AAAA","type":"image"}}),
+        ] {
+            body["assets"] = assets;
+            assert!(
+                validate_extraction_request(&body, &FieldType::ALL).is_err(),
+                "{body}"
+            );
+        }
+        for data in [
+            "", "x", "AA", "AA-_", "AA A", "AA\nA", "====", "A===", "AB==", "AAB=",
+        ] {
+            body["assets"] = json!({"invoice":{"format":"pdf","data_base64":data}});
+            assert!(
+                validate_extraction_request(&body, &FieldType::ALL).is_err(),
+                "{data:?}"
+            );
+        }
+        for data in ["AAAA", "AA==", "AAA=", "+/8="] {
+            body["assets"] = json!({"invoice":{"format":"pdf","data_base64":data}});
+            assert!(validate_extraction_request(&body, &FieldType::ALL).is_ok());
+        }
+    }
+
+    // T50: PDF evidence uses echoed Unicode text, not the request's asset key.
+    #[test]
+    fn pdf_response_evidence() {
+        fn pdf_answered(answer: &Value) -> bool {
+            super::pdf_answered(
+                answer,
+                &json!({
+                    "text":{"type":"text"},
+                    "list":{"type":"list","items":"text"}
+                }),
+            )
+        }
+        let mut answer = json!({
+            "state_text":"[Page 1]\né🙂 invoice",
+            "answers":{
+                "text":{"type":"text","value":"é🙂","guess":"é🙂","span":[9,11],"page":1},
+                "list":{"type":"list","value":["é🙂","invoice"],"spans":[[9,11],[12,19]],"pages":[1,1]}
+            }
+        });
+        assert!(pdf_answered(&answer));
+        for state in [json!(null), json!(12), json!("invoice")] {
+            let mut bad = answer.clone();
+            bad["state_text"] = state;
+            assert!(!pdf_answered(&bad));
+        }
+        let mut missing = answer.clone();
+        missing.as_object_mut().unwrap().remove("state_text");
+        assert!(!pdf_answered(&missing));
+        for (member, value) in [
+            ("span", json!([9, 15])),
+            ("span", json!([0, 2])),
+            ("page", json!(0)),
+            ("page", json!("1")),
+        ] {
+            let mut bad = answer.clone();
+            bad["answers"]["text"][member] = value;
+            assert!(!pdf_answered(&bad));
+        }
+        for pages in [json!([1]), json!([1, 0]), json!("1")] {
+            let mut bad = answer.clone();
+            bad["answers"]["list"]["pages"] = pages;
+            assert!(!pdf_answered(&bad));
+        }
+        answer["answers"]["text"]
+            .as_object_mut()
+            .unwrap()
+            .remove("page");
+        answer["answers"]["list"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pages");
+        assert!(pdf_answered(&answer));
+        let mut missing_spans = answer.clone();
+        missing_spans["answers"]["list"]
+            .as_object_mut()
+            .unwrap()
+            .remove("spans");
+        assert!(!pdf_answered(&missing_spans));
+        assert!(extraction_answered(
+            &json!({"answers":{"x":{"type":"text"}}})
+        ));
+        let typed_lists = json!({
+            "state_text":"[Page 1]\n1,250 USD; 12 November 2026",
+            "answers":{
+                "numbers":{"type":"list","value":[1250],"spans":[[9,14]],"pages":[1]},
+                "dates":{"type":"list","value":["2026-11-12"],"spans":[[20,36]],"pages":[1]}
+            }
+        });
+        let fields = json!({
+            "numbers":{"type":"list","items":"number"},
+            "dates":{"type":"list","items":"date"}
+        });
+        assert!(super::pdf_answered(&typed_lists, &fields));
+        let mut bad = typed_lists.clone();
+        bad["answers"]["dates"]["spans"] = json!([[20, 100]]);
+        assert!(!super::pdf_answered(&bad, &fields));
     }
 
     fn accepts(spec: Value) {
