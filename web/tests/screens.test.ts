@@ -48,6 +48,23 @@ describe('U20 Overview', () => {
     expect(document.querySelector('.status-line')?.textContent).toContain('1 online');
   });
 
+  // Found on a real standalone role, 2026-11-13: two full-sentence warnings
+  // were drawn as one chip with no break between them.
+  it('lists each host memory warning on its own line under a count', async () => {
+    const warnings = [
+      'gpu0 memory has 2.9 GiB available, less than its 14.7 GiB managed limit plus its 0.0 GiB free reserve (14.7 GiB): a deployment near the limit cannot be admitted until 11.8 GiB more is free',
+      'system memory has 16.5 GiB available, less than its 30.6 GiB managed limit plus its 12.2 GiB free reserve (42.9 GiB): a deployment near the limit cannot be admitted until 26.4 GiB more is free',
+    ];
+    role({ snapshots: [snapshotWith([deployment()])], route: (call) => (call.url === '/management/v1/hosts'
+      ? json({ api_version: '1', hosts: [{ ...STANDALONE_HOST, session: { ...STANDALONE_HOST.session, memory_warnings: warnings } }] })
+      : undefined) });
+    await open('/');
+    const block = document.querySelector('.host .warnings')!;
+    expect(block.querySelector('summary')?.textContent).toContain('2 memory warnings');
+    expect([...block.querySelectorAll('li')].map((li) => li.textContent)).toEqual(warnings);
+    expect(document.querySelector('.host .chip.warning')).toBeNull();
+  });
+
   it('fills recent activity from retained history on first load and deduplicates live events', async () => {
     let history: StreamMock | undefined;
     const server = role({ snapshots: [snapshotWith([deployment()])], route: (call) => {

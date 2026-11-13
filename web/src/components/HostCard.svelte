@@ -5,6 +5,7 @@
   import { gib, memorySegments } from '../lib/presentation';
   let { host }: { host: HostRow } = $props();
   const domains = $derived((host.session?.domains ?? []).filter((d) => d.capacity_bytes > 0 && d.available_bytes >= 0));
+  const warnings = $derived(host.session?.memory_warnings ?? []);
 </script>
 
 <article class="host panel" data-host={host.host_id}>
@@ -29,7 +30,13 @@
       {#if reserved > domain.capacity_bytes}<p class="warning">Reservations exceed this domain's capacity.</p>{/if}
     </div>
   {/each}
-  {#each host.session?.memory_warnings ?? [] as warning (warning)}<span class="chip warning">{warning}</span>{/each}
+  {#if warnings.length > 0}
+    <!-- `session.memory_warnings` are full sentences, so they get their own
+         wrapped lines under a count, not chips. -->
+    <details class="warnings"><summary><span aria-hidden="true">▲</span>{warnings.length === 1 ? '1 memory warning' : `${warnings.length} memory warnings`}</summary>
+      <ul>{#each warnings as warning (warning)}<li>{warning}</li>{/each}</ul>
+    </details>
+  {/if}
 </article>
 <style>
   header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-bottom: 1.25rem; }
@@ -46,4 +53,8 @@
   i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; }
   strong { font-weight: 500; color: var(--capyctl-text); }
   .warning { color: var(--state-changing); margin-top: 0.75rem; }
+  .warnings { margin-top: 1rem; border-left: 3px solid var(--state-changing); padding: 0 0 0 0.75rem; font-size: 0.8125rem; }
+  .warnings summary { color: var(--state-changing); padding: 0.25rem 0; display: flex; gap: 0.5rem; align-items: center; }
+  .warnings ul { margin: 0.25rem 0 0; padding-left: 1rem; color: var(--capyctl-muted); }
+  .warnings li { overflow-wrap: anywhere; margin: 0.25rem 0; }
 </style>
