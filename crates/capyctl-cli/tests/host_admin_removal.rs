@@ -9,7 +9,7 @@ async fn api_remove_in_use_returns_the_cli_profile_in_use_code() {
     let state = support::safe_state_dir();
     let config = state.path().join("standalone.yaml");
     std::fs::write(&config, "schema_version: 1\nkind: standalone\nname: local\nhost:\n  name: local\n  runtime_profiles: {}\n").unwrap();
-    let engines = capyctl_config::registration::engines_beside(&config);
+    let engines = capyctl_config::registration::engines_path(state.path());
     let lock = capyctl_config::registration::lock_engines(&engines).unwrap();
     let mut file = capyctl_config::registration::EnginesFile::load(&engines).unwrap();
     file.profiles.insert(

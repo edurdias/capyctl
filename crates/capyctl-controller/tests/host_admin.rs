@@ -78,7 +78,10 @@ fn fit_to_host(domain: &mut Value) {
 
 /// The inventory a prepared host reports.
 fn inventory(host: &str) -> pb::ReportInventory {
-    let document = prepared_document();
+    inventory_document(host, &prepared_document())
+}
+
+fn inventory_document(host: &str, document: &Value) -> pb::ReportInventory {
     let config = capyctl_config::remote_roles::HostConfig::parse(&document.to_string()).unwrap();
     let now = capyctl_protocol::now_unix_ms();
     pb::ReportInventory {
@@ -667,17 +670,20 @@ async fn agent(
     let etc = dir.path().join("etc");
     std::fs::create_dir(&etc).unwrap();
     let document = etc.join("host.yaml");
-    std::fs::write(&document, prepared_document().to_string()).unwrap();
-    let config =
-        capyctl_config::remote_roles::HostConfig::parse(&prepared_document().to_string()).unwrap();
-    let profiles = HostProfiles::new(ProfileSet::new(config.clone(), inventory(&h.host)));
+    let mut host = prepared_document();
+    host["state_dir"] = json!(dir.path().join("state"));
+    host["identity_dir"] = json!(dir.path().join("state/identity"));
+    std::fs::write(&document, host.to_string()).unwrap();
+    let config = capyctl_config::remote_roles::HostConfig::parse(&host.to_string()).unwrap();
+    let inv = inventory_document(&h.host, &host);
+    let profiles = HostProfiles::new(ProfileSet::new(config.clone(), inv.clone()));
     let updates = ProfileUpdates::new(profiles);
     let journal =
         capyctl_agent::journal::HostJournal::open(dir.path(), &h.identity.controller_id(), &h.host)
             .unwrap();
     let control = HostControl::new(
         document.clone(),
-        capyctl_config::registration::engines_beside(&document),
+        capyctl_config::test_support::host_engines_path(&document),
         config,
         updates.clone(),
         journal.clone(),
@@ -686,7 +692,7 @@ async fn agent(
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     let identity =
         PendingEnrollment::load(&IdentityDirectory::open(h.dirs.1.path()).unwrap()).unwrap();
-    let (inv, u) = (inventory(&h.host), updates.clone());
+    let u = updates.clone();
     let session = tokio::spawn(async move {
         let _ =
             run_session_with_updates(&identity, journal, inv, shutdown, execution, None, Some(u))
@@ -842,7 +848,7 @@ async fn cancelling_the_caller_preserves_a_dispatched_engine_add() {
         .unwrap();
     asked.abort();
     assert!(asked.await.unwrap_err().is_cancelled());
-    let engines = capyctl_config::registration::engines_beside(&a.document);
+    let engines = capyctl_config::test_support::host_engines_path(&a.document);
     assert!(!engines.exists(), "the dispatched add is still held");
     released.add_permits(1);
     eventually(|| {
@@ -909,7 +915,7 @@ fn host_service(dir: &Path, control: Arc<HostControl>, host_id: String) -> Arc<H
     Arc::new(HostAdminService {
         host_id,
         target: Target {
-            engines: capyctl_config::registration::engines_beside(&document),
+            engines: capyctl_config::test_support::host_engines_path(&document),
             role_document: document,
             kind: RoleKind::Host,
             socket: state.join(capyctl_agent::control_socket::SOCKET_NAME),
@@ -1190,7 +1196,7 @@ health: /health
     assert!(preview.error_code.is_empty(), "{}", preview.error_message);
     let preview: Value = serde_json::from_str(&preview.result_json).unwrap();
     let file = capyctl_config::registration::custom_engines_beside(
-        &capyctl_config::registration::engines_beside(&a.document),
+        &capyctl_config::test_support::host_engines_path(&a.document),
     );
     assert!(!file.exists(), "preview writes nothing");
     std::fs::write(&dependency, "VERSION = 2\n").unwrap();

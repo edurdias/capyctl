@@ -36,8 +36,13 @@ refused: an opt-out that was mistyped must not be read as "on".
 | Role document | (none) | `--config <file>` | `CAPYCTL_CONFIG` | the running role's ([Which role a command uses](#which-role-a-command-uses)), else `<state root>/config/<role>.yaml` | server, host, standalone, `capyctl engine` |
 | State root | `state_dir` at the top of a standalone document named by `--config` or `CAPYCTL_CONFIG` | `--state-dir <dir>` | `CAPYCTL_STATE_DIR` | `$XDG_STATE_HOME/capyctl`, else `~/.local/state/capyctl` | every command |
 | Role state directory | `state_dir` (server, host); `server.state_dir`, `host.state_dir` (standalone) | `--state-dir <dir>` | `CAPYCTL_STATE_DIR` | `<state root>` (server, host); `<state root>/server`, `<state root>/host` (standalone) | server, host, standalone |
-| Registered engines file | (none) | `--config` (the file beside it) | `CAPYCTL_CONFIG` (the file beside it), `XDG_CONFIG_HOME` | `~/.config/capyctl/engines.yaml` | host, standalone, `capyctl engine` |
-| Registered custom engines file | (none) | `--config` (the file beside it) | `CAPYCTL_CONFIG` (the file beside it), `XDG_CONFIG_HOME` | `~/.config/capyctl/custom-engines.yaml` | host, standalone, `capyctl engine` |
+| Registered engines file | role's `state_dir` | `--state-dir <dir>` | `CAPYCTL_STATE_DIR` | `<role state directory>/engines.yaml` | host, standalone, `capyctl engine` |
+| Registered custom engines file | role's `state_dir` | `--state-dir <dir>` | `CAPYCTL_STATE_DIR` | `<role state directory>/custom-engines.yaml` | host, standalone, `capyctl engine` |
+
+For engines files, standalone uses its state root, not the embedded host's
+`<state root>/host` subdirectory. On upgrade, both legacy files are moved
+once, or copied when their old directory is read-only; the state-local files
+then take precedence (ADR 0018 amendment A4).
 
 The role document cannot name itself, so it has no YAML form. The state root
 is where CapyCTL looks for the implicit role document, so its YAML form is read
@@ -375,7 +380,7 @@ A custom engine is a program CapyCTL has no integration for, registered with
 | When the installation's files change | `security.installation_drift: warn\|refuse` | `--drift warn\|refuse` | (none) | `warn` |
 
 `capyctl engine add --custom` writes the profile to `custom-engines.yaml`,
-beside `engines.yaml` (the same directory, found the same way), with the same
+beside `engines.yaml` in the role's state directory (ADR 0018 amendment A4), with the same
 first line, `# capyctl-document-revision: N`, and the same lock. `engines.yaml`
 refuses a profile with `engine: custom`, and `custom-engines.yaml` refuses any
 other engine. A profile name is unique across both files and the role's own

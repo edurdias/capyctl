@@ -5,7 +5,7 @@ mod support;
 use capyctl_agent::control_socket::{ControlHandler, ControlRequest, ControlServer};
 use capyctl_cli::engine::{execute, execute_with, resolve_target};
 use capyctl_cli::grammar::{Command, DeepParkChoice, DriftChoice};
-use capyctl_config::registration::{engines_beside, EnginesFile};
+use capyctl_config::registration::EnginesFile;
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -57,7 +57,7 @@ fn host_doc(dir: &Path) -> PathBuf {
 }
 
 fn engines_of(document: &Path) -> EnginesFile {
-    EnginesFile::load(&engines_beside(document)).unwrap()
+    EnginesFile::load(&capyctl_config::test_support::host_engines_path(document)).unwrap()
 }
 
 struct Role(Mutex<Vec<ControlRequest>>, Value);
@@ -213,7 +213,7 @@ async fn add_records_approved_options_and_paths() {
 }
 
 /// Validates `deployment` against the golden host document with the
-/// engines.yaml `engine add` wrote beside `document` copied beside it.
+/// engines.yaml registered in the golden host's state directory.
 fn validate_on_registered(document: &Path, deployment: &Value) -> (i32, Value, String) {
     let dir = private_dir();
     let golden: Value = serde_json::from_str(include_str!(
@@ -225,7 +225,12 @@ fn validate_on_registered(document: &Path, deployment: &Value) -> (i32, Value, S
     host["identity_dir"] = json!(dir.path().join("s/identity"));
     let host_file = dir.path().join("host.yaml");
     std::fs::write(&host_file, host.to_string()).unwrap();
-    std::fs::copy(engines_beside(document), engines_beside(&host_file)).unwrap();
+    std::fs::create_dir_all(dir.path().join("s")).unwrap();
+    std::fs::copy(
+        capyctl_config::test_support::host_engines_path(document),
+        capyctl_config::test_support::host_engines_path(&host_file),
+    )
+    .unwrap();
     let deployment_file = dir.path().join("deployment.yaml");
     std::fs::write(&deployment_file, deployment.to_string()).unwrap();
     let out = support::capyctl()
@@ -312,12 +317,15 @@ async fn add_refuses_an_existing_name() {
     execute(&add(&env), Some(&document), dir.path())
         .await
         .unwrap();
-    let before = std::fs::read(engines_beside(&document)).unwrap();
+    let before = std::fs::read(capyctl_config::test_support::host_engines_path(&document)).unwrap();
     let error = execute(&add(&env), Some(&document), dir.path())
         .await
         .unwrap_err();
     assert_eq!(error.code, "profile_exists");
-    assert_eq!(std::fs::read(engines_beside(&document)).unwrap(), before);
+    assert_eq!(
+        std::fs::read(capyctl_config::test_support::host_engines_path(&document)).unwrap(),
+        before
+    );
     let mut host: Value =
         serde_json::from_str(&std::fs::read_to_string(&document).unwrap()).unwrap();
     host["runtime_profiles"]["sg"] = engines_of(&document).profiles["vllm"].clone();
@@ -412,9 +420,9 @@ async fn add_on_a_fresh_home_is_the_first_run() {
     let meta = std::fs::metadata(&state).unwrap();
     assert!(meta.is_dir());
     assert_eq!(meta.mode() & 0o777, 0o700, "the state root is owner-only");
-    // The probe's scratch directory is gone; nothing else is left behind.
-    assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
-    let engines = EnginesFile::load(&home.join(".config/capyctl/engines.yaml")).unwrap();
+    // Only registration state remains; the probe's scratch directory is gone.
+    assert_eq!(std::fs::read_dir(&state).unwrap().count(), 2);
+    let engines = EnginesFile::load(&state.join("engines.yaml")).unwrap();
     assert_eq!(engines.revision, 1);
     assert!(engines.profiles.contains_key("vllm"));
     // The same command lists it, as not yet seen by a role.
@@ -452,7 +460,7 @@ async fn add_version_mismatch_writes_nothing() {
         .await
         .unwrap_err();
     assert_eq!(error.code, "engine_version_failed");
-    assert!(!engines_beside(&document).exists());
+    assert!(!capyctl_config::test_support::host_engines_path(&document).exists());
 }
 
 // T21 (owner decision 2026-09-25): a probe that reports deep park missing
@@ -550,7 +558,7 @@ async fn detect_lists_candidates_and_runs_nothing() {
     assert!(!marker.exists());
 }
 
-// Owner decision 2026-09-25: which role document and which engines file.
+// T04, ADR 0018 amendment A4: CLI and role resolve the same state-local file.
 #[test]
 fn target_resolution_follows_the_documented_order() {
     let dir = private_dir();
@@ -567,23 +575,23 @@ fn target_resolution_follows_the_documented_order() {
     .unwrap();
     let cfg = config_home.to_string_lossy().into_owned();
     let env = |key: &str| (key == "XDG_CONFIG_HOME").then(|| cfg.clone());
-    // --config dir/x.yaml → dir/engines.yaml.
+    // A named host uses its document's state directory.
     let t = resolve_target(Some(&explicit), &state, &env).unwrap();
     assert_eq!(
         (t.role_document.clone(), t.engines.clone()),
-        (explicit.clone(), dir.path().join("engines.yaml"))
+        (explicit.clone(), dir.path().join("s/engines.yaml"))
     );
     // Both implicit documents: ambiguous.
     assert_eq!(
         resolve_target(None, &state, &env).unwrap_err().code,
         "invalid_config"
     );
-    // Implicit standalone: its document in the state dir, engines in the config home.
+    // An implicit standalone uses the selected state root.
     std::fs::remove_file(config_home.join("capyctl/host.yaml")).unwrap();
     let t = resolve_target(None, &state, &env).unwrap();
     assert_eq!(t.kind, capyctl_cli::engine::RoleKind::Standalone);
-    assert_eq!(t.engines, config_home.join("capyctl/engines.yaml"));
-    // Implicit host: the same engines file.
+    assert_eq!(t.engines, state.join("engines.yaml"));
+    // An implicit host uses its own document's state directory.
     std::fs::remove_file(state.join("config/standalone.yaml")).unwrap();
     std::fs::copy(&explicit, config_home.join("capyctl/host.yaml")).unwrap();
     let t = resolve_target(None, &state, &env).unwrap();
@@ -591,7 +599,7 @@ fn target_resolution_follows_the_documented_order() {
         (t.kind, t.engines),
         (
             capyctl_cli::engine::RoleKind::Host,
-            config_home.join("capyctl/engines.yaml")
+            dir.path().join("s/engines.yaml")
         )
     );
     // $CAPYCTL_CONFIG counts as naming the document.
@@ -603,8 +611,26 @@ fn target_resolution_follows_the_documented_order() {
     };
     assert_eq!(
         resolve_target(None, &state, &named).unwrap().engines,
-        dir.path().join("engines.yaml")
+        dir.path().join("s/engines.yaml")
     );
+    let from_role =
+        capyctl_cli::engine::role_engines(&dir.path().join("s"), Some(&explicit), &env).unwrap();
+    assert_eq!(
+        resolve_target(Some(&explicit), &state, &env)
+            .unwrap()
+            .engines,
+        from_role
+    );
+    let overridden = |key: &str| {
+        if key == "CAPYCTL_STATE_DIR" {
+            Some(state.to_string_lossy().into_owned())
+        } else {
+            env(key)
+        }
+    };
+    let target = resolve_target(Some(&explicit), &state, &overridden).unwrap();
+    assert_eq!(target.engines, state.join("engines.yaml"));
+    assert_eq!(target.socket, state.join("control.sock"));
 }
 
 // T16 T32: removal in use is refused with the list, nothing written.
@@ -797,7 +823,7 @@ async fn remove_without_an_answer_reports_an_unknown_outcome() {
     let env = vllm_env(&dir.path().join("v"), "0.29.0", "0.29.0", &[]);
     let document = host_doc(dir.path());
     let _ = execute(&add(&env), Some(&document), dir.path()).await;
-    let before = std::fs::read(engines_beside(&document)).unwrap();
+    let before = std::fs::read(capyctl_config::test_support::host_engines_path(&document)).unwrap();
     let socket = resolve_target(Some(&document), Path::new("/nonexistent"), &|k| {
         (k == "HOME").then(|| "/home/u".into())
     })
@@ -831,7 +857,10 @@ async fn remove_without_an_answer_reports_an_unknown_outcome() {
         "{}",
         error.message
     );
-    assert_eq!(std::fs::read(engines_beside(&document)).unwrap(), before);
+    assert_eq!(
+        std::fs::read(capyctl_config::test_support::host_engines_path(&document)).unwrap(),
+        before
+    );
 }
 
 /// A role that answers `remove` and `add` each its own way.
@@ -903,7 +932,7 @@ async fn remove_retires_then_writes_and_reloads() {
     let engines = engines_of(&document);
     assert!(!engines.profiles.contains_key("vllm"));
     assert_eq!(
-        std::fs::metadata(engines_beside(&document))
+        std::fs::metadata(capyctl_config::test_support::host_engines_path(&document))
             .unwrap()
             .permissions()
             .mode()
@@ -967,7 +996,7 @@ fn capyctl(home: &Path, args: &[&str]) -> String {
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("PIPX_HOME")
         .env_remove("CAPYCTL_CONFIG")
-        .env("CAPYCTL_STATE_DIR", home.join("state"))
+        .env("CAPYCTL_STATE_DIR", home.join("s"))
         .args(args)
         .output()
         .unwrap();
@@ -1164,7 +1193,7 @@ async fn add_refuses_tensorfold_without_its_toolchain() {
     assert!(error
         .message
         .contains(&env.join("bin").display().to_string()));
-    assert!(!engines_beside(&document).exists());
+    assert!(!capyctl_config::test_support::host_engines_path(&document).exists());
 }
 
 /// A llama.cpp build directory: `llama-server --version` runs `body`, and
@@ -1301,7 +1330,7 @@ async fn add_refuses_llamacpp_deep_park_an_unparsable_version_and_arguments() {
         "{}",
         error.message
     );
-    assert!(!engines_beside(&document).exists());
+    assert!(!capyctl_config::test_support::host_engines_path(&document).exists());
 }
 
 // T42 T37 (ADR 0029 §2): a machine with `/etc/llama.cpp/config.ini` refuses
@@ -1330,7 +1359,7 @@ async fn add_refuses_llamacpp_beside_a_system_config_file() {
         error.message
     );
     assert!(!marker.exists(), "the binary never ran");
-    assert!(!engines_beside(&document).exists());
+    assert!(!capyctl_config::test_support::host_engines_path(&document).exists());
 }
 
 #[test]
@@ -1542,4 +1571,41 @@ fn list_shows_lmcache_on_or_off_with_the_reason() {
         !marker.exists(),
         "engine list ran a program of an environment"
     );
+}
+
+// T04, ADR 0018 amendment A4: whichever starts first, the offline CLI or
+// the role, migrates and writes the same file without resetting revisions.
+#[tokio::test]
+async fn offline_cli_migrates_before_remove_and_role_reads_the_same_state_file() {
+    let dir = private_dir();
+    let installation = vllm_env(&dir.path().join("v"), "0.29.0", "0.29.0", &[]);
+    let document = host_doc(dir.path());
+    let added = execute(&add(&installation), Some(&document), dir.path())
+        .await
+        .unwrap();
+    let destination = dir.path().join("s/engines.yaml");
+    let legacy = dir.path().join("engines.yaml");
+    assert_eq!(added["engines_file"], destination.to_str().unwrap());
+    std::fs::rename(&destination, &legacy).unwrap();
+    let revision = EnginesFile::load(&legacy).unwrap().revision;
+    let removed = execute(
+        &Command::EngineRemove {
+            name: "vllm".into(),
+            drain: false,
+        },
+        Some(&document),
+        dir.path(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed["engines_file"], destination.to_str().unwrap());
+    assert_eq!(removed["revision"], revision + 1);
+    assert!(!legacy.exists());
+    let role_file =
+        capyctl_cli::engine::role_engines(&dir.path().join("s"), Some(&document), &|key| {
+            (key == "HOME").then(|| dir.path().to_string_lossy().into_owned())
+        })
+        .unwrap();
+    assert_eq!(role_file, destination);
+    assert!(EnginesFile::load(&role_file).unwrap().profiles.is_empty());
 }

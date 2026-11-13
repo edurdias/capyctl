@@ -2005,15 +2005,19 @@ async fn start_standalone_in(
     // SPEC §8 (amended 2026-10-01): what this host publishes about its engines
     // is what it has. There is no fallback installation: a host with none
     // starts and publishes none. ADR 0018 §5: the environment's
-    // installations and the profiles registered in engines.yaml (beside
-    // `--config`, else `<config home>/capyctl/engines.yaml`); a name declared in
-    // both is refused `profile_exists`. The standalone document is never written.
-    let engines = crate::engine::role_engines(config, &|key| match &config_home {
-        ConfigHome::Process => std::env::var(key).ok().filter(|value| !value.is_empty()),
-        ConfigHome::Isolated(home) => {
-            (key == "XDG_CONFIG_HOME").then(|| home.to_string_lossy().into_owned())
-        }
-    });
+    // installations and the profiles registered in the state directory's
+    // engines.yaml (ADR 0018 amendment A4); duplicate names are refused.
+    // The standalone document is never written.
+    let engines = Some(crate::engine::role_engines(
+        state_dir,
+        config,
+        &|key| match &config_home {
+            ConfigHome::Process => std::env::var(key).ok().filter(|value| !value.is_empty()),
+            ConfigHome::Isolated(home) => {
+                (key == "XDG_CONFIG_HOME").then(|| home.to_string_lossy().into_owned())
+            }
+        },
+    )?);
     // ADR 0018 amendment A3: a profile for an engine kind this release does
     // not know (a newer release wrote it) is skipped with a warning.
     let registered = match &engines {

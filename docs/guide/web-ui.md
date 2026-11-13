@@ -91,6 +91,12 @@ Playground, and More for the rest.
 The UI acts through the same management API as the CLI, so everything it does
 is recorded and refused in the same way.
 
+Engine additions and removals write `engines.yaml` or `custom-engines.yaml`
+in the host or standalone role's state directory, using the same lock and
+atomic write as `capyctl engine` (ADR 0018 amendment A4). With packaged
+services, `/etc/capyctl` stays read-only; the writable state directories are
+`/var/lib/capyctl/host` and `/var/lib/capyctl/standalone`.
+
 ## Use it from another device
 
 The management address stays on loopback unless you allow it off the machine
