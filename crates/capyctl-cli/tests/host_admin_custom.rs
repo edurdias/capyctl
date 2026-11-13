@@ -119,7 +119,7 @@ async fn custom_preview_confirm_pins_and_stale_or_wrong_name_refuses() {
     assert!(app.profiles().contains(&"serve-api".into()));
     let file = capyctl_config::registration::EnginesFile::load(
         &capyctl_config::registration::custom_engines_beside(
-            &capyctl_config::registration::engines_beside(&config),
+            &capyctl_config::registration::engines_path(state.path()),
         ),
     )
     .unwrap();

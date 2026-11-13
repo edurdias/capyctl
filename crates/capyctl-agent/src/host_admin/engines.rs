@@ -575,8 +575,8 @@ pub async fn add_builtin(
     publish(channel, target, out, revision, &target.engines).await
 }
 
-/// ADR 0018 §4 (review decision C1): the CLI is the only writer of
-/// engines.yaml. With no role running it edits the file (amendment A3).
+/// ADR 0018 §4, amendment A4: CLI and role administration share this writer.
+/// With no role running it edits the file (amendment A3).
 /// Otherwise remove asks the running role to retire the profile, waits
 /// for the confirmation, then writes engines.yaml without it and asks the
 /// role to reload, which publishes the removal. A retry after any failure

@@ -213,7 +213,7 @@ fn custom_of(named: &NamedInstallation) -> Option<capyctl_config::custom::Custom
 
 /// The standalone role's control-socket handler.
 pub struct StandaloneControl {
-    /// The role's engines.yaml (`engines_path` of its `--config`).
+    /// ADR 0018 amendment A4: the role state directory's engines.yaml.
     engines: PathBuf,
     provider: Arc<dyn EngineProvider>,
     host: Arc<EmbeddedHost>,

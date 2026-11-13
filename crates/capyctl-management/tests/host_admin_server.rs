@@ -275,6 +275,8 @@ impl Harness {
         std::fs::create_dir(dir.path().join("etc")).unwrap();
         let document = dir.path().join("etc/host.yaml");
         let mut host_document = prepared_document();
+        host_document["state_dir"] = json!(dir.path().join("state"));
+        host_document["identity_dir"] = json!(dir.path().join("state/identity"));
         host_document["model_store"]["path"] = json!(dir.path().join("models"));
         let config =
             capyctl_config::remote_roles::HostConfig::parse(&host_document.to_string()).unwrap();
@@ -292,7 +294,7 @@ impl Harness {
         .unwrap();
         let control = HostControl::new(
             document.clone(),
-            capyctl_config::registration::engines_beside(&document),
+            capyctl_config::test_support::host_engines_path(&document),
             config,
             updates.clone(),
             journal.clone(),
@@ -449,7 +451,7 @@ fn host_service(
     Arc::new(HostAdminService {
         host_id,
         target: Target {
-            engines: capyctl_config::registration::engines_beside(&document),
+            engines: capyctl_config::test_support::host_engines_path(&document),
             role_document: document,
             kind: RoleKind::Host,
             socket: state.join(capyctl_agent::control_socket::SOCKET_NAME),
@@ -709,7 +711,7 @@ async fn remove_returns_202_and_server_list_shows_retiring_until_host_removal() 
         let (status, list) = http(&router, "GET", "/management/v1/engines", None).await;
         assert_eq!(status, 200, "{list}");
         assert_eq!(engine(&list, &h.host, "vllm").unwrap()["retiring"], true);
-        let file = capyctl_config::registration::engines_beside(&a.document);
+        let file = capyctl_config::test_support::host_engines_path(&a.document);
         assert!(
             capyctl_config::registration::EnginesFile::load(&file)
                 .unwrap()
@@ -813,7 +815,7 @@ async fn long_real_add_keeps_host_load_reports_flowing() {
     let second = sampled().unwrap();
     eventually(|| sampled().is_some_and(|at| at > second)).await;
     assert!(!asked.is_finished(), "the actual add is still probing");
-    assert!(!capyctl_config::registration::engines_beside(&a.document).exists());
+    assert!(!capyctl_config::test_support::host_engines_path(&a.document).exists());
     std::fs::write(&release, b"release").unwrap();
     let (status, result) = tokio::time::timeout(Duration::from_secs(10), asked)
         .await
@@ -857,7 +859,7 @@ async fn custom_preview_confirm_pins_on_host_and_refuses_confirmation_stale() {
         .as_str()
         .is_some_and(|text| !text.is_empty()));
     let file = capyctl_config::registration::custom_engines_beside(
-        &capyctl_config::registration::engines_beside(&a.document),
+        &capyctl_config::test_support::host_engines_path(&a.document),
     );
     assert!(!file.exists(), "preview writes nothing");
     std::fs::write(&dependency, "VERSION = 2\n").unwrap();

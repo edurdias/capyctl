@@ -859,16 +859,21 @@ impl HostConfig {
         }))
         .expect("serializable role template")
     }
-    /// ADR 0018 §2: the host document at `path` with the engines registered
-    /// beside it (`engines.yaml`) merged in. The file itself is never
-    /// rewritten; a profile name declared in both is refused.
+    /// ADR 0018 amendment A4: merge registered engines from the host's state
+    /// directory. The role document itself is never rewritten.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        Self::load_with_engines(path, &crate::registration::engines_beside(path))
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            ConfigError::new(
+                ConfigErrorCode::Io,
+                path.display().to_string(),
+                e.to_string(),
+            )
+        })?;
+        let config = Self::parse(&text)?;
+        Self::load_with_engines(path, &crate::registration::engines_path(&config.state_dir))
     }
-    /// As [`HostConfig::load`], with the engines file named explicitly: the
-    /// role resolves it by the same rule as `capyctl engine` (ADR 0018 §2), which
-    /// for a host started without a named document is
-    /// `<config home>/capyctl/engines.yaml`, not the file beside it.
+    /// As [`HostConfig::load`], with the effective state-local engines file
+    /// named explicitly by the caller (ADR 0018 amendment A4).
     pub fn load_with_engines(path: &Path, engines: &Path) -> Result<Self, ConfigError> {
         Self::load_with_overrides(
             path,

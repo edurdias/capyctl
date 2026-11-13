@@ -14,7 +14,7 @@ use capyctl_agent::host_admin::{
 use capyctl_agent::installation::InstallationMeasurer;
 use capyctl_config::custom::MANIFEST_INVALID;
 use capyctl_config::effective::InstallationDrift;
-use capyctl_config::registration::{custom_engines_beside, engines_beside, EnginesFile};
+use capyctl_config::registration::{custom_engines_beside, engines_path, EnginesFile};
 use capyctl_config::setting_overrides::{NamedLayer, SettingOverrides};
 use capyctl_config::toolchain::ToolchainSearch;
 use capyctl_config::ConfigKind;
@@ -80,7 +80,7 @@ fn host(dir: &Path) -> Target {
     )
     .unwrap();
     Target {
-        engines: engines_beside(&document),
+        engines: engines_path(&state),
         role_document: document,
         kind: RoleKind::Host,
         socket: state.join(SOCKET_NAME),
@@ -813,4 +813,79 @@ fn host_effective_config_names_each_values_source() {
     assert!(settings
         .iter()
         .any(|s| s["path"] == "name" && s["value"] == "capyctl-host" && s["source"] == "yaml"));
+}
+
+// T04 T44, ADR 0018 amendment A4 / ADR 0040 §10–§11: the packaged
+// configuration directory is read-only; both registrations and removals
+// write only the role's state directory, including their shared lock.
+#[tokio::test]
+async fn packaged_layout_host_admin_add_remove_with_read_only_config_directory() {
+    let dir = private_dir();
+    let configuration = dir.path().join("etc");
+    std::fs::create_dir(&configuration).unwrap();
+    let mut target = host(dir.path());
+    let document = configuration.join("host.yaml");
+    std::fs::rename(&target.role_document, &document).unwrap();
+    target.role_document = document;
+    let before = std::fs::read(&target.role_document).unwrap();
+    let installation = vllm_env(&dir.path().join("vllm-env"));
+    let custom_installation = venv(dir.path());
+    std::fs::set_permissions(&configuration, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let role = Role::answering(json!({"ok":true,"published":true,"retired":true}));
+    let measurer = Arc::new(InstallationMeasurer::new());
+    let toolchain_search = search(dir.path());
+    let toolchain = Toolchain {
+        cuda_home_env: None,
+        search: &toolchain_search,
+    };
+    let added = host_admin::add_builtin(
+        &target,
+        &builtin(&installation, false),
+        &toolchain,
+        BuiltinApproval::Operator,
+        &measurer,
+        &role,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        added["engines_file"],
+        target.state_dir.join("engines.yaml").to_str().unwrap()
+    );
+    let request = custom(&custom_installation, "serve", CustomOperation::Add);
+    let preview = host_admin::preview_custom(&target, &request, &measurer)
+        .await
+        .unwrap();
+    let added = host_admin::confirm_custom(
+        &target,
+        &request,
+        &preview.digest,
+        "serve",
+        &measurer,
+        &role,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        added["engines_file"],
+        target
+            .state_dir
+            .join("custom-engines.yaml")
+            .to_str()
+            .unwrap()
+    );
+    assert!(target.state_dir.join("engines.yaml.lock").is_file());
+    for name in ["vllm", "serve"] {
+        let removed = host_admin::remove(&target, name, false, &role)
+            .await
+            .unwrap();
+        assert_eq!(removed["removed"], name);
+    }
+    assert!(engines_profiles(&target).is_empty());
+    assert!(custom_profiles(&target).is_empty());
+    assert_eq!(std::fs::read(&target.role_document).unwrap(), before);
+    assert!(!configuration.join("engines.yaml").exists());
+    assert!(!configuration.join("custom-engines.yaml").exists());
+    assert!(!configuration.join("engines.yaml.lock").exists());
+    std::fs::set_permissions(configuration, std::fs::Permissions::from_mode(0o700)).unwrap();
 }

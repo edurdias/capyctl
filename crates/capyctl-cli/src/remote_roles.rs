@@ -240,12 +240,25 @@ fn read_config(path: &Path) -> Result<String, StructuredError> {
 fn role_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|value| !value.is_empty())
 }
-/// ADR 0018 §2: a host's engines file, by the same rule as `capyctl engine`:
-/// beside the named document, else `<config home>/capyctl/engines.yaml`. With
-/// no config home at all it stays beside the document the host loads.
-fn host_engines(named: Option<&Path>, document: &Path) -> PathBuf {
-    crate::engine::role_engines(named, &role_env)
-        .unwrap_or_else(|| capyctl_config::registration::engines_beside(document))
+/// ADR 0018 amendment A4: migrate before loading, using the effective host
+/// state directory, including generic and named state-directory overrides.
+fn host_engines(
+    invocation: &Invocation,
+    named: Option<&Path>,
+    document: &Path,
+    overrides: &capyctl_config::setting_overrides::SettingOverrides,
+) -> Result<PathBuf, StructuredError> {
+    let value = capyctl_config::parse_document(&read_config(document)?)
+        .and_then(|value| overrides.apply_and_validate(value))
+        .and_then(|value| HostConfig::parse(&value.to_string()))
+        .map_err(|e| error(&format!("Invalid host configuration: {}", e.detail)))?;
+    let state = invocation
+        .state_dir
+        .clone()
+        .or_else(|| role_env("CAPYCTL_STATE_DIR").map(PathBuf::from))
+        .unwrap_or(value.state_dir);
+    crate::engine::role_engines(&state, named, &role_env)
+        .map_err(|e| error(&format!("{}: {}", e.path, e.detail)))
 }
 /// Final review I8-bis (every setting three ways, standalone's precedence): a
 /// server's or host's state directory is `--state-dir`, else
@@ -1520,7 +1533,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 // resolved by the same rule as `capyctl engine`; the document
                 // itself was already read above for the size and existence
                 // checks.
-                let engines = host_engines(named.as_deref(), &path);
+                let engines = host_engines(invocation, named.as_deref(), &path, &overrides)?;
                 // Owner rule 2026-09-25: a deprecated variable name is
                 // warned about once.
                 for warning in capyctl_config::engine_settings::deprecation_warnings(&|key| {
@@ -1573,7 +1586,6 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             // ADR 0018 §2: `read_config` keeps the existing size/existence
             // checks; the host document is loaded merged with `engines.yaml`.
             read_config(&path)?;
-            let engines = host_engines(named.as_deref(), &path);
             // Owner decision 2026-09-25: the generic overrides apply here as
             // at `start host` (final review I8: `join host --set` too), so
             // both find the same identity.
@@ -1587,6 +1599,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                     crate::settings::describe(&e)
                 ))
             })?;
+            let engines = host_engines(invocation, named.as_deref(), &path, &overrides)?;
             let mut config = load_host(
                 &path,
                 &engines,

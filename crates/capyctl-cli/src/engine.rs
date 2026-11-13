@@ -140,7 +140,7 @@ pub async fn execute_with(
             // ADR 0028 §2.1: refused before anything runs or is written.
             let (profile_env, approved_env) = engine_add_env(env_flags, approved_env, env)
                 .map_err(|r| error("invalid_config", r.code()))?;
-            let target = resolve_target(config, state_dir, env)?;
+            let target = write_target(config, state_dir, env)?;
             check_socket(&target)?;
             let path = match path {
                 Some(path) => path.clone(),
@@ -188,7 +188,7 @@ pub async fn execute_with(
             // written.
             let (profile_env, approved_env) = engine_add_env(env_flags, approved_env, env)
                 .map_err(|r| error("invalid_config", r.code()))?;
-            let target = resolve_target(config, state_dir, env)?;
+            let target = write_target(config, state_dir, env)?;
             check_socket(&target)?;
             let request = CustomEngine {
                 host_id: CLI_HOST.to_owned(),
@@ -205,11 +205,27 @@ pub async fn execute_with(
         }
         Command::EngineList => list(&resolve_target(config, state_dir, env)?).await,
         Command::EngineRemove { name, drain } => {
-            let target = resolve_target(config, state_dir, env)?;
+            let target = write_target(config, state_dir, env)?;
             Ok(host_admin::remove(&target, name, *drain, &ControlSocket(&target.socket)).await?)
         }
         _ => Err(error("invalid_config", "not an engine command")),
     }
+}
+
+fn write_target(
+    config: Option<&Path>,
+    state_dir: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Target, StructuredError> {
+    let target = resolve_target(config, state_dir, env)?;
+    let named = named_role_document(config, env).or_else(|| {
+        crate::local_role::host_document(state_dir)
+            .filter(|(_, named)| *named)
+            .map(|(path, _)| path)
+    });
+    role_engines(&target.state_dir, named.as_deref(), env)
+        .map_err(|e| error("invalid_config", format!("{}: {}", e.path, e.detail)))?;
+    Ok(target)
 }
 
 /// ADR 0018 §1: with no path, an operator at a terminal picks a candidate.

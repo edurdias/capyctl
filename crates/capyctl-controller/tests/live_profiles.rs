@@ -48,6 +48,13 @@ fn prepared_document() -> Value {
     host
 }
 
+fn prepared_document_at(root: &std::path::Path) -> Value {
+    let mut host = prepared_document();
+    host["state_dir"] = json!(root.join("state"));
+    host["identity_dir"] = json!(root.join("state/identity"));
+    host
+}
+
 /// The agent reports real host memory; shrink the policy to fit a small runner.
 fn fit_to_host(domain: &mut Value) {
     let bytes = |v: &Value| capyctl_config::effective::parse_bytes(v.as_str().unwrap()).unwrap();
@@ -70,7 +77,10 @@ fn fit_to_host(domain: &mut Value) {
 
 /// The inventory a prepared host reports.
 fn inventory(host: &str) -> pb::ReportInventory {
-    let document = prepared_document();
+    inventory_document(host, &prepared_document())
+}
+
+fn inventory_document(host: &str, document: &Value) -> pb::ReportInventory {
     let config = capyctl_config::remote_roles::HostConfig::parse(&document.to_string()).unwrap();
     let now = capyctl_protocol::now_unix_ms();
     pb::ReportInventory {
@@ -753,17 +763,18 @@ async fn agent(h: &Harness) -> Agent {
     let etc = dir.path().join("etc");
     std::fs::create_dir(&etc).unwrap();
     let document = etc.join("host.yaml");
-    std::fs::write(&document, prepared_document().to_string()).unwrap();
-    let config =
-        capyctl_config::remote_roles::HostConfig::parse(&prepared_document().to_string()).unwrap();
-    let profiles = HostProfiles::new(ProfileSet::new(config.clone(), inventory(&h.host)));
+    let host = prepared_document_at(dir.path());
+    std::fs::write(&document, host.to_string()).unwrap();
+    let config = capyctl_config::remote_roles::HostConfig::parse(&host.to_string()).unwrap();
+    let inv = inventory_document(&h.host, &host);
+    let profiles = HostProfiles::new(ProfileSet::new(config.clone(), inv.clone()));
     let updates = ProfileUpdates::new(profiles);
     let journal =
         capyctl_agent::journal::HostJournal::open(dir.path(), &h.identity.controller_id(), &h.host)
             .unwrap();
     let control = HostControl::new(
         document.clone(),
-        capyctl_config::registration::engines_beside(&document),
+        capyctl_config::test_support::host_engines_path(&document),
         config,
         updates.clone(),
         journal.clone(),
@@ -773,7 +784,7 @@ async fn agent(h: &Harness) -> Agent {
     // the harness's identity directory.
     let identity =
         PendingEnrollment::load(&IdentityDirectory::open(h.dirs.1.path()).unwrap()).unwrap();
-    let (inv, u) = (inventory(&h.host), updates.clone());
+    let u = updates.clone();
     let session = tokio::spawn(async move {
         let _ =
             run_session_with_updates(&identity, journal, inv, shutdown, None, None, Some(u)).await;
@@ -797,8 +808,8 @@ async fn agent(h: &Harness) -> Agent {
 
 /// `engine add`'s write: `vllm` into the engines file beside `document`.
 fn add_vllm_to(document: &std::path::Path) {
-    use capyctl_config::registration::{engines_beside, lock_engines, write_engines};
-    let path = engines_beside(document);
+    use capyctl_config::registration::{lock_engines, write_engines};
+    let path = capyctl_config::test_support::host_engines_path(document);
     let lock = lock_engines(&path).unwrap();
     let mut engines = EnginesFile::load(&path).unwrap();
     let with: Value = serde_json::from_str(&with_vllm("x").approved_host_config_json).unwrap();
@@ -910,7 +921,7 @@ async fn a_confirmed_retirement_writes_nothing_and_the_reload_publishes_the_remo
         a.control.handle(ControlRequest::Add).await["published"],
         "published"
     );
-    let engines_path = capyctl_config::registration::engines_beside(&a.document);
+    let engines_path = capyctl_config::test_support::host_engines_path(&a.document);
     let host_before = std::fs::read(&a.document).unwrap();
     let engines_before = std::fs::read(&engines_path).unwrap();
     // The scripted service confirms without the store row the publication
@@ -988,7 +999,7 @@ async fn a_removal_in_use_writes_nothing() {
         a.control.handle(ControlRequest::Add).await["published"],
         "published"
     );
-    let engines = capyctl_config::registration::engines_beside(&a.document);
+    let engines = capyctl_config::test_support::host_engines_path(&a.document);
     let before = std::fs::read(&engines).unwrap();
     let reply = a
         .control
@@ -1025,7 +1036,7 @@ async fn a_removal_in_use_writes_nothing() {
 async fn a_removal_without_a_session_writes_nothing() {
     let dir = directory();
     let document = dir.path().join("host.yaml");
-    std::fs::write(&document, prepared_document().to_string()).unwrap();
+    std::fs::write(&document, prepared_document_at(dir.path()).to_string()).unwrap();
     let journal = capyctl_agent::journal::HostJournal::open(dir.path(), "c", "h").unwrap();
     add_vllm_to(&document);
     let config = capyctl_config::remote_roles::HostConfig::load(&document).unwrap();
@@ -1033,7 +1044,7 @@ async fn a_removal_without_a_session_writes_nothing() {
     let updates = ProfileUpdates::new(HostProfiles::new(set));
     let control = HostControl::new(
         document.clone(),
-        capyctl_config::registration::engines_beside(&document),
+        capyctl_config::test_support::host_engines_path(&document),
         config,
         updates,
         journal,
@@ -1046,7 +1057,7 @@ async fn a_removal_without_a_session_writes_nothing() {
         .await;
     assert_eq!(reply["code"], "agent_unreachable", "{reply}");
     assert!(
-        EnginesFile::load(&capyctl_config::registration::engines_beside(&document))
+        EnginesFile::load(&capyctl_config::test_support::host_engines_path(&document))
             .unwrap()
             .profiles
             .contains_key("vllm")
@@ -1060,7 +1071,7 @@ async fn a_removal_without_a_session_writes_nothing() {
 async fn a_peer_without_live_updates_gets_the_restart_fallback() {
     let dir = directory();
     let document = dir.path().join("host.yaml");
-    std::fs::write(&document, prepared_document().to_string()).unwrap();
+    std::fs::write(&document, prepared_document_at(dir.path()).to_string()).unwrap();
     let journal = capyctl_agent::journal::HostJournal::open(dir.path(), "c", "h").unwrap();
     let config = capyctl_config::remote_roles::HostConfig::load(&document).unwrap();
     let updates = ProfileUpdates::new(HostProfiles::new(ProfileSet::new(
@@ -1071,7 +1082,7 @@ async fn a_peer_without_live_updates_gets_the_restart_fallback() {
     updates.observe_session(Some(&[]));
     let control = HostControl::new(
         document.clone(),
-        capyctl_config::registration::engines_beside(&document),
+        capyctl_config::test_support::host_engines_path(&document),
         config,
         updates.clone(),
         journal,
@@ -1091,7 +1102,7 @@ async fn a_peer_without_live_updates_gets_the_restart_fallback() {
     updates
         .profiles()
         .replace(ProfileSet::new(loaded, with_vllm("h")));
-    let engines = capyctl_config::registration::engines_beside(&document);
+    let engines = capyctl_config::test_support::host_engines_path(&document);
     let before = std::fs::read(&engines).unwrap();
     let reply = control
         .handle(ControlRequest::Remove {
@@ -1114,7 +1125,7 @@ async fn a_peer_without_live_updates_gets_the_restart_fallback() {
 async fn an_add_without_a_session_waits_for_the_next_one() {
     let dir = directory();
     let document = dir.path().join("host.yaml");
-    std::fs::write(&document, prepared_document().to_string()).unwrap();
+    std::fs::write(&document, prepared_document_at(dir.path()).to_string()).unwrap();
     let journal = capyctl_agent::journal::HostJournal::open(dir.path(), "c", "h").unwrap();
     let config = capyctl_config::remote_roles::HostConfig::load(&document).unwrap();
     let updates = ProfileUpdates::new(HostProfiles::new(ProfileSet::new(
@@ -1123,7 +1134,7 @@ async fn an_add_without_a_session_waits_for_the_next_one() {
     )));
     let control = HostControl::new(
         document.clone(),
-        capyctl_config::registration::engines_beside(&document),
+        capyctl_config::test_support::host_engines_path(&document),
         config,
         updates.clone(),
         journal,
@@ -1135,7 +1146,7 @@ async fn an_add_without_a_session_waits_for_the_next_one() {
     assert!(accepted.config.profiles.contains_key("vllm"));
     assert!(!updates.profiles().publishing());
     // The engines file loses `vllm` behind the role's back: not accepted.
-    let engines = capyctl_config::registration::engines_beside(&document);
+    let engines = capyctl_config::test_support::host_engines_path(&document);
     std::fs::remove_file(&engines).unwrap();
     let reply = control.handle(ControlRequest::Add).await;
     assert_eq!(reply["code"], "agent_unreachable", "{reply}");

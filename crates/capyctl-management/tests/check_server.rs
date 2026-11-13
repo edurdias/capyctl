@@ -266,7 +266,7 @@ async fn agent(h: &Harness, mirror: &Mirror, serve_admin: bool) -> Agent {
             .unwrap();
     let control = HostControl::new(
         path.clone(),
-        capyctl_config::registration::engines_beside(&path),
+        capyctl_config::test_support::host_engines_path(&path),
         config,
         updates.clone(),
         journal.clone(),
@@ -286,7 +286,7 @@ async fn agent(h: &Harness, mirror: &Mirror, serve_admin: bool) -> Agent {
         updates.serve_host_admin(Arc::new(HostAdminService {
             host_id: h.host.clone(),
             target: Target {
-                engines: capyctl_config::registration::engines_beside(&path),
+                engines: capyctl_config::test_support::host_engines_path(&path),
                 role_document: path,
                 kind: RoleKind::Host,
                 socket: dir

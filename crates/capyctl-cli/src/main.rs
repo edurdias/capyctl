@@ -160,10 +160,21 @@ fn main() -> ExitCode {
             Ok(runtime) => runtime,
             Err(_) => return ExitCode::from(output::ExitCode::INTERNAL.0 as u8),
         };
-        return match runtime.block_on(capyctl_cli::engine::execute(
+        return match runtime.block_on(capyctl_cli::engine::execute_in(
             &invocation.command,
             invocation.config.as_deref(),
             &state_root,
+            &|key| {
+                if key == "CAPYCTL_STATE_DIR" {
+                    invocation
+                        .state_dir
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .or_else(|| std::env::var(key).ok().filter(|value| !value.is_empty()))
+                } else {
+                    std::env::var(key).ok().filter(|value| !value.is_empty())
+                }
+            },
         )) {
             Ok(value) => {
                 emit(&invocation.command, &value, format, &context);

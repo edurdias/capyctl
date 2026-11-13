@@ -1,9 +1,5 @@
-//! ADR 0018 §2 (review decision 2026-09-25): a role resolves its role
-//! document and its engines file by the same rule as `capyctl engine`:
-//! `--config`, else `$CAPYCTL_CONFIG`, names the document and the engines file
-//! sits beside it; with neither, the engines file is
-//! `<config home>/capyctl/engines.yaml`. So `capyctl engine` and the running role
-//! always agree on the file.
+//! ADR 0018 amendment A4: CLI and role read the engines file in the
+//! effective role state directory, whether or not the document is named.
 //!
 //! Each case makes the engines file the role should read a directory, so the
 //! role refuses at load naming that path, before it binds a listener or
@@ -62,7 +58,7 @@ fn refused_naming(output: &Output, path: &Path) {
 
 // T01
 #[test]
-fn a_host_named_by_capyctl_config_reads_the_engines_file_beside_it() {
+fn a_host_named_by_capyctl_config_reads_the_state_engines_file() {
     let root = private_dir();
     mkdir(&root.path().join("home"));
     mkdir(&root.path().join("state"));
@@ -74,7 +70,7 @@ fn a_host_named_by_capyctl_config_reads_the_engines_file_beside_it() {
         capyctl_config::remote_roles::HostConfig::template(&root.path().join("state")),
     )
     .unwrap();
-    let engines = dir.join("engines.yaml");
+    let engines = root.path().join("state/engines.yaml");
     mkdir(&engines);
     let output = start("host", root.path(), &[("CAPYCTL_CONFIG", &document)]);
     refused_naming(&output, &engines);
@@ -82,7 +78,7 @@ fn a_host_named_by_capyctl_config_reads_the_engines_file_beside_it() {
 
 // T01
 #[test]
-fn a_host_without_a_named_document_reads_the_config_home_engines_file() {
+fn a_host_without_a_named_document_reads_the_state_engines_file() {
     let root = private_dir();
     let state = root.path().join("state");
     mkdir(&root.path().join("home"));
@@ -94,7 +90,7 @@ fn a_host_without_a_named_document_reads_the_config_home_engines_file() {
     )
     .unwrap();
     let config_home = root.path().join("xdg");
-    let engines = config_home.join("capyctl/engines.yaml");
+    let engines = state.join("engines.yaml");
     mkdir(&engines);
     let output = start("host", root.path(), &[("XDG_CONFIG_HOME", &config_home)]);
     refused_naming(&output, &engines);
@@ -102,7 +98,7 @@ fn a_host_without_a_named_document_reads_the_config_home_engines_file() {
 
 // T01
 #[test]
-fn a_standalone_named_by_capyctl_config_reads_the_engines_file_beside_it() {
+fn a_standalone_named_by_capyctl_config_reads_the_state_engines_file() {
     let root = private_dir();
     mkdir(&root.path().join("home"));
     mkdir(&root.path().join("state"));
@@ -114,7 +110,7 @@ fn a_standalone_named_by_capyctl_config_reads_the_engines_file_beside_it() {
         "schema_version: 1\nkind: standalone\nname: local\nhost:\n  name: local\n  runtime_profiles: {}\n",
     )
     .unwrap();
-    let engines = dir.join("engines.yaml");
+    let engines = root.path().join("state/engines.yaml");
     mkdir(&engines);
     let output = start("standalone", root.path(), &[("CAPYCTL_CONFIG", &document)]);
     refused_naming(&output, &engines);

@@ -3,9 +3,7 @@
 //! tests; not qualification.
 mod support;
 use capyctl_agent::control_socket::{request, ControlRequest, SOCKET_NAME};
-use capyctl_config::registration::{
-    engines_beside, lock_engines, write_engines, EnginesFile, ProfileSpec,
-};
+use capyctl_config::registration::{lock_engines, write_engines, EnginesFile, ProfileSpec};
 use capyctl_controller::LifecyclePort as _;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
@@ -25,7 +23,8 @@ fn standalone_doc(state: &std::path::Path) -> std::path::PathBuf {
 
 /// `engine add`'s write: `name` into engines.yaml beside the standalone document.
 fn register(document: &std::path::Path, name: &str) {
-    let path = engines_beside(document);
+    let path =
+        capyctl_config::registration::engines_path(document.parent().unwrap().parent().unwrap());
     let lock = lock_engines(&path).unwrap();
     let mut engines = EnginesFile::load(&path).unwrap();
     engines.profiles.insert(
@@ -51,7 +50,8 @@ fn register(document: &std::path::Path, name: &str) {
 
 /// `engine remove`'s write: `name` out of engines.yaml beside the document.
 fn unregister(document: &std::path::Path, name: &str) {
-    let path = engines_beside(document);
+    let path =
+        capyctl_config::registration::engines_path(document.parent().unwrap().parent().unwrap());
     let lock = lock_engines(&path).unwrap();
     let mut engines = EnginesFile::load(&path).unwrap();
     engines.profiles.remove(name);
@@ -223,10 +223,14 @@ async fn standalone_remove_retires_and_the_reload_unpublishes() {
     .await
     .unwrap();
     assert_eq!(reply, serde_json::json!({"ok": true, "retired": true}));
-    assert!(EnginesFile::load(&engines_beside(&document))
+    assert!(
+        EnginesFile::load(&capyctl_config::registration::engines_path(
+            document.parent().unwrap().parent().unwrap()
+        ))
         .unwrap()
         .profiles
-        .contains_key("vllm-patched"));
+        .contains_key("vllm-patched")
+    );
     unregister(&document, "vllm-patched");
     let reload = request(&socket, &ControlRequest::Add, Duration::from_secs(10))
         .await
@@ -320,10 +324,14 @@ async fn standalone_remove_in_use_is_refused_with_the_list() {
     .unwrap();
     assert_eq!(reply["code"], "profile_in_use", "{reply}");
     assert_eq!(reply["deployments"], serde_json::json!(["busy-model"]));
-    assert!(EnginesFile::load(&engines_beside(&document))
+    assert!(
+        EnginesFile::load(&capyctl_config::registration::engines_path(
+            document.parent().unwrap().parent().unwrap()
+        ))
         .unwrap()
         .profiles
-        .contains_key("vllm-patched"));
+        .contains_key("vllm-patched")
+    );
     assert!(app.profiles().contains(&"vllm-patched".to_string()));
     let _ = app.shutdown().await;
 }
@@ -352,7 +360,8 @@ async fn a_profile_for_an_unknown_engine_kind_is_skipped_at_start() {
     let state = support::safe_state_dir();
     let document = standalone_doc(state.path());
     register(&document, "only");
-    let path = engines_beside(&document);
+    let path =
+        capyctl_config::registration::engines_path(document.parent().unwrap().parent().unwrap());
     {
         let lock = lock_engines(&path).unwrap();
         let mut engines = EnginesFile::load(&path).unwrap();
@@ -428,10 +437,12 @@ async fn a_removed_profile_never_starts_again() {
     .unwrap();
     assert_eq!(reply["ok"], true, "{reply}");
     // The operator's CLI writes engines.yaml, then asks for the reload.
-    if EnginesFile::load(&engines_beside(&document))
-        .unwrap()
-        .profiles
-        .contains_key("vllm-patched")
+    if EnginesFile::load(&capyctl_config::registration::engines_path(
+        document.parent().unwrap().parent().unwrap(),
+    ))
+    .unwrap()
+    .profiles
+    .contains_key("vllm-patched")
     {
         unregister(&document, "vllm-patched");
     }
@@ -565,7 +576,8 @@ fn standalone_publishes_a_registered_tensorfold_profile() {
     let state = support::safe_state_dir();
     let document = standalone_doc(state.path());
     let env = tensorfold_env(&state.path().join("tf"), "0.6.0", &["ninja", "nvcc", "c++"]);
-    let path = engines_beside(&document);
+    let path =
+        capyctl_config::registration::engines_path(document.parent().unwrap().parent().unwrap());
     let lock = lock_engines(&path).unwrap();
     let mut engines = EnginesFile::load(&path).unwrap();
     engines.profiles.insert(
