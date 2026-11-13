@@ -52,7 +52,7 @@ impl std::error::Error for PrepareError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubFile {
     pub path: String,
-    pub size: u64,
+    pub size: Option<u64>,
 }
 
 /// The Hugging Face API at `endpoint`, asked with `token` when there is one.
@@ -92,6 +92,8 @@ impl Hub {
     /// refusal for a private repository names.
     pub fn new(endpoint: reqwest::Url, token: Option<String>, token_hint: &'static str) -> Self {
         let client = reqwest::Client::builder()
+            // SPEC §13.3: never downgrade a real hub request (or its token).
+            .https_only(endpoint.scheme() == "https")
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .build()
@@ -217,21 +219,14 @@ impl Hub {
         if listing.sha != commit {
             return Err("the listing names another commit".to_owned());
         }
-        listing
+        Ok(listing
             .siblings
             .into_iter()
-            .map(|sibling| {
-                let size = sibling
-                    .lfs
-                    .map(|lfs| lfs.size)
-                    .or(sibling.size)
-                    .ok_or_else(|| format!("the listing gives no size for {}", sibling.rfilename))?;
-                Ok(HubFile {
-                    path: sibling.rfilename,
-                    size,
-                })
+            .map(|sibling| HubFile {
+                path: sibling.rfilename,
+                size: sibling.lfs.map(|lfs| lfs.size).or(sibling.size),
             })
-            .collect()
+            .collect())
     }
 }
 

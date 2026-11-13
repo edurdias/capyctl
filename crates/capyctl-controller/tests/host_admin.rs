@@ -412,15 +412,13 @@ use capyctl_agent::control_socket::ControlHandler;
 use capyctl_agent::engines::ScanRoots;
 use capyctl_agent::host_admin::{RoleKind, Target};
 use capyctl_agent::host_admin_remote::{
-    HostAdminHandler, HostAdminService, InProcessRole, ReplyFuture, SourcePinner,
+    HostAdminHandler, HostAdminService, InProcessRole, ReplyFuture,
 };
 use capyctl_agent::host_control::HostControl;
 use capyctl_agent::profiles::{HostProfiles, ProfileSet};
 use capyctl_agent::session::{
     run_session_with_updates, ExecutionFuture, LoadFuture, ProfileUpdates, SessionExecution,
 };
-use std::future::Future;
-use std::pin::Pin;
 
 /// A real host session serving host administration with `handler`.
 struct Agent {
@@ -571,17 +569,6 @@ async fn load_reports_continue_while_an_operation_runs() {
     h.server.abort();
 }
 
-struct NoPinner;
-
-impl SourcePinner for NoPinner {
-    fn pin_and_size(
-        &self,
-        _: Vec<String>,
-    ) -> Pin<Box<dyn Future<Output = Vec<pb::PinnedSource>> + Send + '_>> {
-        Box::pin(async { vec![] })
-    }
-}
-
 fn script(path: &Path, body: &str) {
     capyctl_config::test_support::write_executable(path, format!("#!/bin/sh\n{body}\n"), 0o755)
         .unwrap();
@@ -607,52 +594,102 @@ fn vllm_env(root: &Path) -> PathBuf {
     root.to_path_buf()
 }
 
+fn host_service(dir: &Path, control: Arc<HostControl>, host_id: String) -> Arc<HostAdminService> {
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let state = dir.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let document = dir.join("etc/host.yaml");
+    Arc::new(HostAdminService {
+        host_id,
+        target: Target {
+            engines: capyctl_config::registration::engines_beside(&document),
+            role_document: document,
+            kind: RoleKind::Host,
+            socket: state.join(capyctl_agent::control_socket::SOCKET_NAME),
+            state_dir: state,
+        },
+        roots: ScanRoots {
+            path_dirs: vec![],
+            home: Some(home.clone()),
+            xdg_data: Some(home.join(".local/share")),
+            pipx_home: None,
+            conda_roots: vec![],
+            opt: None,
+            system_bins: vec![],
+            extra: vec![],
+        },
+        toolchain: capyctl_config::toolchain::ToolchainSearch {
+            system: dir.join("no-bin").display().to_string(),
+            default_cuda_home: dir.join("no-cuda"),
+            system_root: dir.join("no-root"),
+        },
+        cuda_home_env: None,
+        measurer: Arc::new(capyctl_agent::installation::InstallationMeasurer::new()),
+        role: InProcessRole(control),
+        model_env: Default::default(),
+        pinner: Arc::new(capyctl_agent::host_admin::CachedSourcePinner::new(
+            Default::default(),
+            dir.to_path_buf(),
+            Arc::new(|_| None),
+        )),
+    })
+}
+
+/// The harness has no running deployments: retire through the real store,
+/// while the production service additionally drains any runtime holders.
+struct UnusedProfileRetirements(SharedCoordinatorState);
+impl capyctl_controller::profile_retirement::ProfileRetirements for UnusedProfileRetirements {
+    fn begin(
+        &self,
+        host: &str,
+        profile: &str,
+        key: &str,
+        drain: bool,
+    ) -> capyctl_controller::profile_retirement::RetirementStep {
+        assert!(!drain);
+        let owned = self.0.lock().unwrap();
+        let now = capyctl_protocol::now_unix_ms();
+        let outcome = owned
+            .store()
+            .begin_profile_retirement(host, profile, key, now, now + 30_000, false)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            capyctl_store::profile_retirement::RetirementStart::Clear
+        );
+        assert!(
+            owned
+                .store()
+                .profile_retirement(host, profile)
+                .unwrap()
+                .is_some(),
+            "retiring stays published until the host removes the profile"
+        );
+        capyctl_controller::profile_retirement::RetirementStep::Confirmed
+    }
+    fn poll(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Option<capyctl_controller::profile_retirement::RetirementStep> {
+        panic!("an unused profile retires synchronously")
+    }
+}
+
 // ADR 0040 §10: the server adds a built-in engine the host detects under an
 // extra search directory; the host writes its engines file and publishes the
 // profile live, and the server approves it.
 #[tokio::test]
 async fn a_detected_builtin_engine_is_added_through_the_server() {
     let h = enrolled().await;
+    h.sessions
+        .with_profile_retirements(Arc::new(UnusedProfileRetirements(h.state.clone())));
     let host_id = h.host.clone();
     let a = agent(
         &h,
-        move |dir, control| {
-            let home = dir.join("home");
-            std::fs::create_dir_all(&home).unwrap();
-            let state = dir.join("state");
-            std::fs::create_dir_all(&state).unwrap();
-            let document = dir.join("etc/host.yaml");
-            Arc::new(HostAdminService {
-                host_id,
-                target: Target {
-                    engines: capyctl_config::registration::engines_beside(&document),
-                    role_document: document,
-                    kind: RoleKind::Host,
-                    socket: state.join(capyctl_agent::control_socket::SOCKET_NAME),
-                    state_dir: state,
-                },
-                roots: ScanRoots {
-                    path_dirs: vec![],
-                    home: Some(home.clone()),
-                    xdg_data: Some(home.join(".local/share")),
-                    pipx_home: None,
-                    conda_roots: vec![],
-                    opt: None,
-                    system_bins: vec![],
-                    extra: vec![],
-                },
-                toolchain: capyctl_config::toolchain::ToolchainSearch {
-                    system: dir.join("no-bin").display().to_string(),
-                    default_cuda_home: dir.join("no-cuda"),
-                    system_root: dir.join("no-root"),
-                },
-                cuda_home_env: None,
-                measurer: Arc::new(capyctl_agent::installation::InstallationMeasurer::new()),
-                role: InProcessRole(control),
-                model_env: Default::default(),
-                pinner: Arc::new(NoPinner),
-            })
-        },
+        move |dir, control| host_service(dir, control, host_id),
         None,
     )
     .await;
@@ -715,6 +752,191 @@ async fn a_detected_builtin_engine_is_added_through_the_server() {
         .handle(capyctl_agent::control_socket::ControlRequest::List)
         .await;
     assert_eq!(list["accepted"]["vllm"]["engine"], "vllm", "{list}");
+    let removed = request(
+        &h.sessions,
+        &h.host,
+        Op::Remove(pb::RemoveEngine {
+            name: "vllm".into(),
+            drain: false,
+        }),
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed.error_code, "", "{}", removed.error_message);
+    let list = a
+        .control
+        .handle(capyctl_agent::control_socket::ControlRequest::List)
+        .await;
+    assert!(list["accepted"].get("vllm").is_none(), "{list}");
+    assert!(h
+        .state
+        .lock()
+        .unwrap()
+        .store()
+        .profile_retirement(&h.host, "vllm")
+        .unwrap()
+        .is_none());
+    a.stop().await;
+    h.server.abort();
+}
+
+// U9 / ADR 0040 §§9–10: real host dispatch sizes a local checkpoint, with
+// its source identity and request id carried intact through the protocol.
+#[tokio::test]
+async fn pin_and_size_runs_on_the_host_and_returns_weight_sizes() {
+    let h = enrolled().await;
+    let host_id = h.host.clone();
+    let a = agent(
+        &h,
+        move |dir, control| host_service(dir, control, host_id),
+        None,
+    )
+    .await;
+    let model = a.dir.path().join("checkpoint");
+    std::fs::create_dir(&model).unwrap();
+    std::fs::write(model.join("model.safetensors"), vec![0; 4096]).unwrap();
+    std::fs::write(model.join("config.json"), b"{}").unwrap();
+    let source = model.display().to_string();
+    let reply = request(
+        &h.sessions,
+        &h.host,
+        Op::PinAndSize(pb::PinAndSize {
+            sources: vec![source.clone()],
+        }),
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert!(!reply.request_id.is_empty());
+    assert!(reply.error_code.is_empty(), "{}", reply.error_message);
+    assert!(reply.result_json.is_empty());
+    let answers = reply.pin_and_size.unwrap().sources;
+    assert_eq!(answers.len(), 1);
+    assert_eq!(answers[0].source, source);
+    assert_eq!(answers[0].pinned, source);
+    assert_eq!(answers[0].weight_bytes, Some(4096));
+    assert!(answers[0].estimated);
+    assert!(answers[0].error.is_empty());
+    a.stop().await;
+    h.server.abort();
+}
+
+// U9 / AE6: custom confirmations cross the same protocol. Changed files
+// invalidate the digest before anything is written; a fresh confirmation
+// pins the actual installation on the host and publishes it to the server.
+#[tokio::test]
+async fn custom_confirmation_is_pinned_on_the_host_and_stale_digest_is_refused() {
+    let h = enrolled().await;
+    let host_id = h.host.clone();
+    let a = agent(
+        &h,
+        move |dir, control| host_service(dir, control, host_id),
+        None,
+    )
+    .await;
+    let root = a.dir.path().join("serve-venv");
+    let site = root.join("lib/python3.12/site-packages/serve_dep");
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    std::fs::create_dir_all(&site).unwrap();
+    std::fs::write(root.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+    let dependency = site.join("__init__.py");
+    std::fs::write(&dependency, "VERSION = 1\n").unwrap();
+    let executed = a.dir.path().join("executed");
+    let executable = root.join("bin/serve");
+    script(&executable, &format!("touch {}", executed.display()));
+    let spec = pb::CustomEngineSpec {
+        operation: "add".into(),
+        name: "serve".into(),
+        executable: executable.display().to_string(),
+        manifest: r#"kind: custom_engine
+schema_version: 1
+api: decisions
+version: "2.2.0"
+args: [--host, "{host}", --port, "{port}", --model, "{model_dir}"]
+health: /health
+"#
+        .into(),
+        ..Default::default()
+    };
+    let preview = request(
+        &h.sessions,
+        &h.host,
+        Op::PreviewCustom(spec.clone()),
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert!(preview.error_code.is_empty(), "{}", preview.error_message);
+    let preview: Value = serde_json::from_str(&preview.result_json).unwrap();
+    let file = capyctl_config::registration::custom_engines_beside(
+        &capyctl_config::registration::engines_beside(&a.document),
+    );
+    assert!(!file.exists(), "preview writes nothing");
+    std::fs::write(&dependency, "VERSION = 2\n").unwrap();
+    let stale = request(
+        &h.sessions,
+        &h.host,
+        Op::ConfirmCustom(pb::ConfirmCustomEngine {
+            engine: Some(spec.clone()),
+            digest: preview["digest"].as_str().unwrap().into(),
+            typed_name: "serve".into(),
+        }),
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stale.error_code, "confirmation_stale");
+    assert!(!file.exists());
+    let fresh = request(
+        &h.sessions,
+        &h.host,
+        Op::PreviewCustom(spec.clone()),
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert!(fresh.error_code.is_empty(), "{}", fresh.error_message);
+    let fresh: Value = serde_json::from_str(&fresh.result_json).unwrap();
+    assert_ne!(preview["digest"], fresh["digest"]);
+    let confirmed = request(
+        &h.sessions,
+        &h.host,
+        Op::ConfirmCustom(pb::ConfirmCustomEngine {
+            engine: Some(spec),
+            digest: fresh["digest"].as_str().unwrap().into(),
+            typed_name: "serve".into(),
+        }),
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert!(
+        confirmed.error_code.is_empty(),
+        "{}",
+        confirmed.error_message
+    );
+    let confirmed: Value = serde_json::from_str(&confirmed.result_json).unwrap();
+    let profiles = capyctl_config::registration::EnginesFile::load(&file)
+        .unwrap()
+        .profiles;
+    assert_eq!(
+        profiles["serve"]["custom"]["installation_digest"],
+        confirmed["fingerprint"]["digest"]
+    );
+    let approved = h
+        .state
+        .lock()
+        .unwrap()
+        .store()
+        .host_publication(&h.host)
+        .unwrap()
+        .unwrap();
+    assert!(approved.config_json.contains("\"serve\""));
+    assert!(
+        !executed.exists(),
+        "custom registration never executes the program"
+    );
     a.stop().await;
     h.server.abort();
 }

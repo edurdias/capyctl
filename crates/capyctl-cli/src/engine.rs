@@ -297,7 +297,6 @@ pub fn engine_add_env(
     Ok((profile_env, approved))
 }
 
-
 /// Found live 2026-10-03: a role cannot listen on a control socket whose
 /// path a Unix socket cannot hold, so nothing is saved for one it could
 /// never publish to.
