@@ -139,7 +139,11 @@ pub fn standalone(
             routes.ui,
             routes.playground,
             crate::lifecycle_router(routes.actions.clone()),
-            crate::check::router(routes.actions.configuration().clone(), routes.check_sources),
+            crate::check::router(
+                routes.actions.configuration().clone(),
+                routes.check_sources,
+                Some(routes.actions.commands().clone()),
+            ),
             crate::host_admin::router(routes.host_admin),
             // SPEC §4.3: the explicit drain of the embedded host, by its
             // published name or the `standalone` alias the CLI uses.
@@ -195,7 +199,11 @@ pub fn server(
             routes.ui,
             routes.playground,
             crate::lifecycle_router(routes.actions.clone()),
-            crate::check::router(routes.actions.configuration().clone(), routes.check_sources),
+            crate::check::router(
+                routes.actions.configuration().clone(),
+                routes.check_sources,
+                Some(routes.actions.commands().clone()),
+            ),
             crate::host_admin::router(routes.host_admin),
             // SPEC §4.3: the explicit drain of an enrolled host.
             crate::drain::drain_router_with_presence(routes.actions, Vec::new(), routes.presence),

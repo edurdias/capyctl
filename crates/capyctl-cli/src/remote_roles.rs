@@ -1216,11 +1216,14 @@ async fn serve_host(
                 std::env::var(name).ok()
             })
             .map_err(|_| unavailable())?,
-            pinner: Arc::new(capyctl_agent::host_admin::CachedSourcePinner::new(
-                models.policy,
-                models.models_root,
-                Arc::new(|name| std::env::var(name).ok()),
-            )),
+            pinner: Arc::new(
+                capyctl_agent::host_admin::CachedSourcePinner::new(
+                    models.policy,
+                    models.models_root,
+                    Arc::new(|name| std::env::var(name).ok()),
+                )
+                .with_secrets_dir(Some(config.state_dir.join("secrets"))),
+            ),
         },
     ));
     // ADR 0018 §3: the local control channel, bound only inside the role's

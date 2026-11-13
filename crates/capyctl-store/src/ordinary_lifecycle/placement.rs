@@ -139,20 +139,7 @@ pub(super) fn candidates(
         let Some(policy) = read_selected_policy(tx, &e.host.name).map_err(resource)? else {
             continue;
         };
-        let limits: Vec<MemoryLimit> = policy
-            .controls
-            .domains
-            .iter()
-            .map(|(id, d)| MemoryLimit {
-                domain: id.clone(),
-                managed_bytes: d.managed_limit,
-                free_reserve_bytes: d.free_reserve,
-                reserve_absorbs_unmanaged: d.memory
-                    == capyctl_config::effective::DomainMemory::Device,
-                host_kv_bytes: d.host_kv_limit,
-                parked_bytes: d.parked_limit,
-            })
-            .collect();
+        let limits = memory_limits(&policy);
         let mut scoped =
             scoped_to_domain_hosts(tx, &ledger, limits.iter().map(|l| l.domain.as_str()))
                 .map_err(resource)?;
@@ -228,131 +215,162 @@ pub(super) fn candidates(
             ],
             |r| r.get(0),
         )?;
-        // Owner decision 2026-09-23: the instance's own startup peak
-        // (declared, measured on this host, or the placeholder), or the whole
-        // managed limit for a solo first start.
-        let (footprint, whole_host) =
-            super::startup::startup_footprint(tx, deployment_id, revision, &host, &e)?;
         let (device_options, preferred_device) =
             device_options(tx, deployment_id, revision, instance, &host)?;
-        // ADR 0035 §1a: under `topology: auto` this host's N is chosen now,
-        // from its cards' managed limits, and only that N's sets are options.
-        let pick = match e.topology.as_ref().and_then(|t| t.auto.as_ref()) {
-            Some(table) => auto_pick(
-                tx,
-                deployment_id,
-                revision,
-                &e,
-                table,
-                &limits,
-                device_options,
-                preferred_device,
-            )?,
-            None => AutoPick {
-                tensor_parallel: e.local_tensor_parallel(),
-                options: device_options,
-                preferred: preferred_device,
-                refusal: None,
-            },
-        };
-        // ADR 0030 §1: a decisions revision is placed only on a host that
-        // declared `decisions` (ADR 0017), as its latest session recorded it;
-        // the live session's own declaration still gates the launch before
-        // anything is sent. The embedded host is this build and serves them.
-        // ADR 0031 §9: likewise a revision on a custom engine needs
-        // `custom_engines`; a decisions custom engine needs both.
-        let declared = |capability: &str| {
-            tx.query_row(
-                "SELECT NOT EXISTS(SELECT 1 FROM enrolled_hosts WHERE host_id=?1)
-                     OR EXISTS(SELECT 1 FROM host_versions v, json_each(v.capabilities_json) c
-                                WHERE v.host_id=?1 AND c.value=?2)",
-                params![host, capability],
-                |r| r.get::<_, bool>(0),
-            )
-        };
-        let serves_api = (e.api.is_chat() || declared(capyctl_config::decisions::HOST_CAPABILITY)?)
-            && (e.profile.engine != capyctl_config::engine_policy::Engine::Custom
-                || declared(capyctl_config::custom::CAPABILITY)?);
-        // ADR 0033 §§9, 10, 13: `lmcache: required` and `retention: zero`
-        // are placed only where they can run, judged again here against the
-        // host's current published settings and latest declaration; the host
-        // is refused with the typed code, not as a generic ineligible one.
-        let gate = {
-            use capyctl_config::lmcache::{placement_refusal, CAPABILITY, RETENTION_CAPABILITY};
-            let (host_lmcache, host_retention) = host_lmcache_settings(tx, &host, &e)?;
-            let has_lmcache = declared(CAPABILITY)?;
-            let has_retention = declared(RETENTION_CAPABILITY)?;
-            placement_refusal(
-                e.lmcache,
-                e.retention,
-                host_lmcache,
-                host_retention,
-                |name| match name {
-                    CAPABILITY => has_lmcache,
-                    RETENTION_CAPABILITY => has_retention,
-                    _ => false,
-                },
-            )
-        }
-        .map(|code| (code, None))
-        // ADR 0035 §1a: `topology: auto` refused on this host for its GPUs.
-        .or(pick.refusal)
-        // ADR 0035 §11: a launch on several GPUs goes only to a host that
-        // declared `local_tensor_parallel`; the live session's declaration
-        // still gates it before anything is sent.
-        .or((pick.tensor_parallel > 1
-            && !declared(capyctl_config::topology::LOCAL_TP_CAPABILITY)?)
-        .then_some((capyctl_config::topology::LOCAL_TP_CAPABILITY_MISSING, None)));
-        // ADR 0033 §6, ADR 0025 amendment of 2026-10-23: a refusal by the
-        // host-KV limit names the setting to raise (standalone's own on its
-        // embedded host, the only host not enrolled) and what to lower: the
-        // LMCache pool when the need holds more than the revision declares.
-        let host_kv_remedy = {
-            let kv = |f: &PhaseFootprint| -> i64 {
-                f.allocations
-                    .iter()
-                    .map(|a| a.host_kv_bytes)
-                    .fold(0, i64::saturating_add)
-            };
-            let declared = kv(&super::phase(&e.resources.cold, ResourcePhase::Cold));
-            HostKvRemedy {
-                standalone: !tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM enrolled_hosts WHERE host_id=?1)",
-                    [&host],
-                    |r| r.get::<_, bool>(0),
-                )?,
-                lmcache_pool: kv(&footprint) > declared,
-                declared: declared > 0,
-            }
-        };
-        candidates.push(HostCandidate {
-            gate: gate.as_ref().map(|(code, _)| *code),
-            gate_detail: gate.and_then(|(_, detail)| detail),
-            host_kv_remedy,
-            device_options: pick.options,
-            preferred_device: pick.preferred,
-            occupied,
-            whole_host,
-            // ADR 0018 §4: nor while the deployment's profile is retiring on
-            // this host, or absent from the host's current approved document.
-            // Exclusion only: nothing already placed is stopped or released.
-            eligible: serves_api
-                && eligible.is_none_or(|set| set.contains(&host))
-                && match &profile {
-                    Some(profile) => {
-                        crate::profile_retirement::profile_placeable(tx, &host, profile)?
-                    }
-                    None => true,
-                },
-            host_id: host,
-            instances_here,
-            footprint,
+        let mut candidate = candidate(
+            tx,
+            deployment_id,
+            revision,
+            &e,
+            &policy,
             limits,
-            ledger: scoped,
-            max_parked: policy.controls.max_parked as usize,
-        });
+            scoped,
+            device_options,
+            preferred_device,
+        )?;
+        candidate.occupied = occupied;
+        // ADR 0018 §4: exclude a retiring or absent profile, without stopping
+        // anything already placed.
+        candidate.eligible &= eligible.is_none_or(|set| set.contains(&host))
+            && match &profile {
+                Some(profile) => crate::profile_retirement::profile_placeable(tx, &host, profile)?,
+                None => true,
+            };
+        candidate.instances_here = instances_here;
+        candidates.push(candidate);
     }
     Ok(candidates)
+}
+
+fn memory_limits(policy: &ResourcePolicySnapshot) -> Vec<MemoryLimit> {
+    policy
+        .controls
+        .domains
+        .iter()
+        .map(|(id, d)| MemoryLimit {
+            domain: id.clone(),
+            managed_bytes: d.managed_limit,
+            free_reserve_bytes: d.free_reserve,
+            reserve_absorbs_unmanaged: d.memory == capyctl_config::effective::DomainMemory::Device,
+            host_kv_bytes: d.host_kv_limit,
+            parked_bytes: d.parked_limit,
+        })
+        .collect()
+}
+
+/// ADR 0040 §9: a preview and a stored start build the same candidate,
+/// including the startup charge, LMCache pool, capability gates and chosen N.
+#[allow(clippy::too_many_arguments)]
+fn candidate(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    revision: i64,
+    e: &EffectiveDeployment,
+    policy: &ResourcePolicySnapshot,
+    limits: Vec<MemoryLimit>,
+    scoped: capyctl_domain::resources::LedgerSnapshot,
+    device_options: Vec<DeviceOption>,
+    preferred_device: Option<String>,
+) -> Result<HostCandidate, LifecycleError> {
+    let host = &e.host.name;
+    // Owner decision 2026-09-23: the instance's own startup peak, or the
+    // whole managed limit for a solo first start.
+    let (footprint, whole_host) =
+        super::startup::startup_footprint(tx, deployment_id, revision, host, e)?;
+    // ADR 0035 §1a: only the chosen N's sets are placement options.
+    let pick = match e.topology.as_ref().and_then(|t| t.auto.as_ref()) {
+        Some(table) => auto_pick(
+            tx,
+            deployment_id,
+            revision,
+            e,
+            table,
+            &limits,
+            device_options,
+            preferred_device,
+        )?,
+        None => AutoPick {
+            tensor_parallel: e.local_tensor_parallel(),
+            options: device_options,
+            preferred: preferred_device,
+            refusal: None,
+        },
+    };
+    // ADR 0030 §1, ADR 0031 §9: the current host must serve the deployment's
+    // API and engine. The embedded host is this build and serves them.
+    let declared = |capability: &str| {
+        tx.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM enrolled_hosts WHERE host_id=?1)
+                 OR EXISTS(SELECT 1 FROM host_versions v, json_each(v.capabilities_json) c
+                            WHERE v.host_id=?1 AND c.value=?2)",
+            params![host, capability],
+            |r| r.get::<_, bool>(0),
+        )
+    };
+    let serves_api = (e.api.is_chat() || declared(capyctl_config::decisions::HOST_CAPABILITY)?)
+        && (e.profile.engine != capyctl_config::engine_policy::Engine::Custom
+            || declared(capyctl_config::custom::CAPABILITY)?);
+    // ADR 0033 §§9, 10, 13: judge LMCache and retention against the host's
+    // current publication and declaration, just as a start does.
+    let gate = {
+        use capyctl_config::lmcache::{placement_refusal, CAPABILITY, RETENTION_CAPABILITY};
+        let (host_lmcache, host_retention) = host_lmcache_settings(tx, host, e)?;
+        let has_lmcache = declared(CAPABILITY)?;
+        let has_retention = declared(RETENTION_CAPABILITY)?;
+        placement_refusal(
+            e.lmcache,
+            e.retention,
+            host_lmcache,
+            host_retention,
+            |name| match name {
+                CAPABILITY => has_lmcache,
+                RETENTION_CAPABILITY => has_retention,
+                _ => false,
+            },
+        )
+    }
+    .map(|code| (code, None))
+    .or(pick.refusal)
+    // ADR 0035 §11: several GPUs need the local-TP capability.
+    .or((pick.tensor_parallel > 1
+        && !declared(capyctl_config::topology::LOCAL_TP_CAPABILITY)?)
+    .then_some((capyctl_config::topology::LOCAL_TP_CAPABILITY_MISSING, None)));
+    // ADR 0033 §6, ADR 0025 amendment of 2026-10-23: name the same host-KV
+    // setting and LMCache pool remedy a start's refusal names.
+    let host_kv_remedy = {
+        let kv = |f: &PhaseFootprint| -> i64 {
+            f.allocations
+                .iter()
+                .map(|a| a.host_kv_bytes)
+                .fold(0, i64::saturating_add)
+        };
+        let declared = kv(&super::phase(&e.resources.cold, ResourcePhase::Cold));
+        HostKvRemedy {
+            standalone: !tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM enrolled_hosts WHERE host_id=?1)",
+                [host],
+                |r| r.get::<_, bool>(0),
+            )?,
+            lmcache_pool: kv(&footprint) > declared,
+            declared: declared > 0,
+        }
+    };
+    Ok(HostCandidate {
+        gate: gate.as_ref().map(|(code, _)| *code),
+        gate_detail: gate.and_then(|(_, detail)| detail),
+        host_kv_remedy,
+        device_options: pick.options,
+        preferred_device: pick.preferred,
+        occupied: false,
+        whole_host,
+        eligible: serves_api,
+        host_id: host.clone(),
+        instances_here: 0,
+        footprint,
+        limits,
+        ledger: scoped,
+        max_parked: policy.controls.max_parked as usize,
+    })
 }
 
 /// ADR 0035 §§1a, 11, 13: the placement refusals of a deployment on several
@@ -540,18 +558,13 @@ fn device_options(
     for (device, raw) in rows {
         let on_device =
             decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
-        let domains = capyctl_config::instances::set_ids(&device)
-            .into_iter()
-            .map(|id| on_device.host.devices.get(id).map(|p| p.domain.clone()))
-            .collect::<Option<Vec<_>>>()
-            .ok_or(LifecycleError::CorruptStoredData)?;
-        let (footprint, _) =
-            super::startup::startup_footprint(tx, deployment_id, revision, host, &on_device)?;
-        options.push(DeviceOption {
+        options.push(device_option(
+            tx,
+            deployment_id,
+            revision,
             device,
-            domains,
-            footprint,
-        });
+            &on_device,
+        )?);
     }
     if options.is_empty() {
         return Ok((options, None));
@@ -565,6 +578,44 @@ fn device_options(
         .optional()?
         .flatten();
     Ok((options, preferred))
+}
+
+/// ADR 0019 §7, ADR 0033 §6: every device option carries its actual startup
+/// and LMCache charge, in both a preview and a stored placement.
+fn device_option(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    revision: i64,
+    device: String,
+    e: &EffectiveDeployment,
+) -> Result<DeviceOption, LifecycleError> {
+    let domains = capyctl_config::instances::set_ids(&device)
+        .into_iter()
+        .map(|id| e.host.devices.get(id).map(|p| p.domain.clone()))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(LifecycleError::CorruptStoredData)?;
+    let (footprint, _) =
+        super::startup::startup_footprint(tx, deployment_id, revision, &e.host.name, e)?;
+    Ok(DeviceOption {
+        device,
+        domains,
+        footprint,
+    })
+}
+
+fn selected_footprint<'a>(
+    candidate: &'a HostCandidate,
+    device: Option<&str>,
+) -> Result<&'a PhaseFootprint, LifecycleError> {
+    match device {
+        Some(device) => candidate
+            .device_options
+            .iter()
+            .find(|option| option.device == device)
+            .map(|option| &option.footprint)
+            .ok_or(LifecycleError::CorruptStoredData),
+        None => Ok(&candidate.footprint),
+    }
 }
 
 /// ADR 0013 §4, §5: get instance `instance` ready for a start: join a start in
@@ -1190,24 +1241,18 @@ pub(crate) fn check_fit(
     tx: &Transaction<'_>,
     e: &EffectiveDeployment,
     devices: &[(String, serde_json::Value, EffectiveDeployment)],
+    observations: &[capyctl_domain::resources::MemoryObservation],
+    residents: &[capyctl_domain::resources::ProcessResident],
+    now_ms: i64,
 ) -> Result<CheckedFit, LifecycleError> {
+    use capyctl_scheduler::residency::{admit_phase, validate_admission_context};
+    use capyctl_scheduler::sequence::forecast_removal;
+
     let host = &e.host.name;
     let Some(policy) = read_selected_policy(tx, host).map_err(resource)? else {
         return Ok(CheckedFit::NoObservations);
     };
-    let limits: Vec<MemoryLimit> = policy
-        .controls
-        .domains
-        .iter()
-        .map(|(id, d)| MemoryLimit {
-            domain: id.clone(),
-            managed_bytes: d.managed_limit,
-            free_reserve_bytes: d.free_reserve,
-            reserve_absorbs_unmanaged: d.memory == capyctl_config::effective::DomainMemory::Device,
-            host_kv_bytes: d.host_kv_limit,
-            parked_bytes: d.parked_limit,
-        })
-        .collect();
+    let limits = memory_limits(&policy);
     let ledger = read_snapshot(tx).map_err(resource)?;
     let mut scoped = scoped_to_domain_hosts(tx, &ledger, limits.iter().map(|l| l.domain.as_str()))
         .map_err(resource)?;
@@ -1217,55 +1262,203 @@ pub(crate) fn check_fit(
             scoped.owners.insert(owner, footprint);
         }
     }
-    let mut options = Vec::with_capacity(devices.len());
-    for (device, _, on_device) in devices {
-        let domains = capyctl_config::instances::set_ids(device)
-            .into_iter()
-            .map(|id| on_device.host.devices.get(id).map(|p| p.domain.clone()))
-            .collect::<Option<Vec<_>>>()
-            .ok_or(LifecycleError::CorruptStoredData)?;
-        options.push(DeviceOption {
-            device: device.clone(),
-            domains,
-            footprint: super::phase(&on_device.resources.cold, ResourcePhase::Cold),
-        });
-    }
-    // Nothing in the ledger is this owner: the deployment is not stored.
+    // No stored deployment can have an empty id. Reuse the startup/LMCache
+    // construction without borrowing measurements or fallbacks from one.
+    const UNSTORED: &str = "";
     const OWNER: &str = "deployment-check";
-    let mut candidate = HostCandidate {
-        host_id: host.clone(),
-        eligible: true,
-        instances_here: 0,
-        footprint: super::phase(&e.resources.cold, ResourcePhase::Cold),
-        limits,
-        ledger: scoped,
-        max_parked: policy.controls.max_parked as usize,
-        occupied: false,
-        whole_host: false,
-        device_options: options,
-        preferred_device: None,
-        gate: None,
-        gate_detail: None,
-        host_kv_remedy: HostKvRemedy::default(),
-    };
-    if capyctl_scheduler::placement::candidate_fits(&candidate, OWNER).is_ok() {
-        return Ok(CheckedFit::Fits);
+    let options = devices
+        .iter()
+        .map(|(device, _, on_device)| device_option(tx, UNSTORED, 0, device.clone(), on_device))
+        .collect::<Result<_, _>>()?;
+    let mut candidate = candidate(tx, UNSTORED, 0, e, &policy, limits, scoped, options, None)?;
+    let mut floors = super::observed_floors(
+        tx,
+        &candidate.ledger,
+        OWNER,
+        &policy,
+        observations,
+        residents,
+    )?;
+    let context = AdmissionContext::new(
+        observations,
+        &candidate.limits,
+        now_ms,
+        policy.controls.observation_ttl_ms,
+        candidate.max_parked,
+    )
+    .with_resident_floors(&floors);
+    // SPEC §7.2: a policy alone cannot stand in for a current physical
+    // observation. Missing, stale or malformed evidence is unknown.
+    if validate_admission_context(&candidate.ledger, context).is_err() {
+        return Ok(CheckedFit::NoObservations);
     }
-    candidate.ledger.owners.clear();
-    Ok(
-        match place(
-            std::slice::from_ref(&candidate),
+    let choose = |candidate: &HostCandidate| {
+        place(
+            std::slice::from_ref(candidate),
             OWNER,
             Strategy::Spread,
             None,
             None,
-        ) {
-            Ok(_) => CheckedFit::NeedsRoom,
-            Err(refused) => CheckedFit::DoesNotFit(format!(
+        )
+    };
+    if let Ok(placed) = choose(&candidate) {
+        let next = selected_footprint(&candidate, placed.device.as_deref())?;
+        if admit_phase(&candidate.ledger, OWNER, next, context).is_ok() {
+            return Ok(CheckedFit::Fits);
+        }
+    }
+    // ADR 0007: forecasting an empty host restores only resident bytes the
+    // same process sample attributes to its owners, never their reservations.
+    // Actual cleanup must still be verified before any real start can arm.
+    let mut empty_observations = observations.to_vec();
+    while let Some(owner) = candidate.ledger.owners.keys().next().cloned() {
+        forecast_removal(
+            &mut candidate.ledger,
+            &mut empty_observations,
+            &mut floors,
+            &owner,
+        );
+    }
+    let placed = match choose(&candidate) {
+        Ok(placed) => placed,
+        Err(refused) => {
+            return Ok(CheckedFit::DoesNotFit(format!(
                 "{}: {}",
                 refused.code(),
                 refused.detail(std::slice::from_ref(&candidate), OWNER)
-            )),
-        },
+            )));
+        }
+    };
+    let next = selected_footprint(&candidate, placed.device.as_deref())?;
+    let context = AdmissionContext::new(
+        &empty_observations,
+        &candidate.limits,
+        now_ms,
+        policy.controls.observation_ttl_ms,
+        candidate.max_parked,
     )
+    .with_resident_floors(&floors);
+    Ok(match admit_phase(&candidate.ledger, OWNER, next, context) {
+        Ok(()) => CheckedFit::NeedsRoom,
+        Err(error) => CheckedFit::DoesNotFit(error.to_string()),
+    })
+}
+
+#[cfg(test)]
+mod check_tests {
+    use super::*;
+    use capyctl_domain::resources::MemoryObservation;
+    use serde_json::json;
+
+    fn fixture() -> (
+        crate::Store,
+        CoordinatorSession,
+        serde_json::Value,
+        serde_json::Value,
+    ) {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../capyctl-config/tests/fixtures/f2-deployment.json"
+        ))
+        .unwrap();
+        let store = crate::Store::open_in_memory().unwrap();
+        let session = store.begin_coordinator_session().unwrap();
+        (
+            store,
+            session,
+            fixture["deployment"].clone(),
+            fixture["host"].clone(),
+        )
+    }
+
+    // T29: ADR 0040 §9 uses start's physical free-memory admission, not just
+    // its managed limit, and preserves the exact refusal figures.
+    #[test]
+    fn low_observed_free_memory_does_not_fit_with_the_start_limit() {
+        let (store, session, config, host) = fixture();
+        let effective = capyctl_config::effective::resolve_effective(&config, &host).unwrap();
+        let observations = [MemoryObservation {
+            domain: "unified".into(),
+            capacity_bytes: 64 << 30,
+            available_bytes: 20 << 30,
+            sampled_at_ms: 100,
+        }];
+        store
+            .import_resource_policy(&session, &effective.host, &observations, 100)
+            .unwrap();
+        let checked = {
+            let tx =
+                Transaction::new_unchecked(&store.conn, TransactionBehavior::Deferred).unwrap();
+            check_fit(&tx, &effective, &[], &observations, &[], 100).unwrap()
+        };
+        let receipt = store
+            .create_stopped_managed_configuration(
+                &session,
+                "owner",
+                "physical-fit",
+                &json!({"config": config}).to_string(),
+                &host,
+                100,
+            )
+            .unwrap();
+        let start = store
+            .accept_start(
+                &session,
+                &DeploymentFence {
+                    deployment_id: receipt.deployment_id,
+                    revision: receipt.revision,
+                    generation: receipt.generation,
+                },
+                100,
+                100_100,
+            )
+            .unwrap();
+        let policy = store
+            .resource_policy(&effective.host.name)
+            .unwrap()
+            .unwrap();
+        let limits = memory_limits(&policy);
+        let error = store
+            .arm_step(
+                &session,
+                &start.step_id,
+                AdmissionContext::new(
+                    &observations,
+                    &limits,
+                    100,
+                    policy.controls.observation_ttl_ms,
+                    policy.controls.max_parked as usize,
+                ),
+            )
+            .unwrap_err();
+        let LifecycleError::Rejected(reason) = error else {
+            panic!("expected physical capacity refusal, got {error:?}");
+        };
+        assert!(reason.contains("insufficient_memory"), "{reason}");
+        assert_eq!(checked, CheckedFit::DoesNotFit(reason));
+    }
+
+    // T29: without fresh evidence a persisted policy is not an observation.
+    #[test]
+    fn missing_or_stale_physical_evidence_is_unknown() {
+        let (store, session, config, host) = fixture();
+        let effective = capyctl_config::effective::resolve_effective(&config, &host).unwrap();
+        let observations = [MemoryObservation {
+            domain: "unified".into(),
+            capacity_bytes: 64 << 30,
+            available_bytes: 60 << 30,
+            sampled_at_ms: 100,
+        }];
+        store
+            .import_resource_policy(&session, &effective.host, &observations, 100)
+            .unwrap();
+        let tx = Transaction::new_unchecked(&store.conn, TransactionBehavior::Deferred).unwrap();
+        assert_eq!(
+            check_fit(&tx, &effective, &[], &[], &[], 100).unwrap(),
+            CheckedFit::NoObservations
+        );
+        assert_eq!(
+            check_fit(&tx, &effective, &[], &observations, &[], 10_000).unwrap(),
+            CheckedFit::NoObservations
+        );
+    }
 }

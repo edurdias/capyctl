@@ -1182,6 +1182,24 @@ impl Store {
                 entry.hosts.push(host);
             }
         }
+        // ADR 0040 §8 / SPEC §6.4: an uncertain observation is not itself a
+        // startable state. Mirror prepare's retained-runtime check without
+        // releasing any accounting or replaying a dispatch.
+        let uncertain_actions = budget.read(&tx,
+            "SELECT i.deployment_id,i.instance_index,
+             (EXISTS(SELECT 1 FROM runtime_bindings b WHERE b.deployment_id=i.deployment_id AND b.instance_index=i.instance_index AND b.state!='released')
+              OR EXISTS(SELECT 1 FROM lifecycle_runs r WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND r.state NOT IN ('succeeded','failed')))
+             AND NOT EXISTS(SELECT 1 FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND o.kind='initialize' AND r.state IN ('queued','running','uncertain')),
+             i.observed_state='ready'
+             FROM deployment_instances i",
+            |r| Ok(((r.get::<_, String>(0)?, r.get::<_, u32>(1)?), (boolean(r, 2)?, boolean(r, 3)?))),
+        )?.into_iter().fold(
+            std::collections::BTreeMap::<String, std::collections::BTreeMap<u32, (bool, bool)>>::new(),
+            |mut by_deployment, ((deployment, index), gates)| {
+                by_deployment.entry(deployment).or_default().insert(index, gates);
+                by_deployment
+            },
+        );
         for entry in &mut deployments {
             if entry.desired_instances == 0 {
                 entry.desired_instances =
@@ -1215,8 +1233,54 @@ impl Store {
             if entry.kind == "model" {
                 for instance in &mut entry.instances {
                     instance.actions = instance_actions(instance);
+                    if instance.observed_state == "uncertain"
+                        && uncertain_actions
+                            .get(&entry.id)
+                            .and_then(|instances| instances.get(&instance.index))
+                            .is_some_and(|(retained, _)| *retained)
+                    {
+                        instance.actions[0] = ActionHint::new(
+                            HintedAction::Start,
+                            Some(ActionRefusal::RuntimeRetained),
+                        );
+                    }
+                    // SPEC §6.3: suspension closes administrative activation too.
+                    if entry.suspended && instance.actions[0].refusal.is_none() {
+                        instance.actions[0] =
+                            ActionHint::new(HintedAction::Start, Some(ActionRefusal::Conflict));
+                    }
                 }
                 entry.actions = deployment_actions(entry);
+                if !entry.suspended
+                    && entry.instances.iter().any(|i| i.lifecycle == "active")
+                    && entry
+                        .instances
+                        .iter()
+                        .filter(|i| i.lifecycle == "active")
+                        .all(|i| i.actions[0].refusal == Some(ActionRefusal::RuntimeRetained))
+                {
+                    entry.actions[0] =
+                        ActionHint::new(HintedAction::Start, Some(ActionRefusal::RuntimeRetained));
+                }
+                if entry
+                    .instances
+                    .iter()
+                    .any(|i| i.observed_state == "uncertain")
+                    && entry
+                        .instances
+                        .iter()
+                        .filter(|i| i.lifecycle == "active")
+                        .all(|i| {
+                            i.observed_state != "parking"
+                                && !uncertain_actions
+                                    .get(&entry.id)
+                                    .and_then(|instances| instances.get(&i.index))
+                                    .is_some_and(|(_, ready)| *ready)
+                        })
+                {
+                    entry.actions[2] =
+                        ActionHint::new(HintedAction::Park, Some(ActionRefusal::Conflict));
+                }
             }
         }
         let routes = budget.read(
@@ -1846,8 +1910,8 @@ const RUNNING: [&str; 4] = ["ready", "reconciling", "stopping", "parking"];
 /// alone, each as the action's acceptance refuses it. A state that does not
 /// decide (`uncertain`, a stop hidden behind `queued`) hints nothing, and
 /// a refusal that depends on configuration (a deployment that never parks)
-/// or runtime conditions is left to the handler. `suspended` is not an input:
-/// a deployment marked suspended reads as stopped.
+/// or runtime conditions is left to the handler. Suspension blocks a start
+/// even though the deployment's observed state can still read as stopped.
 pub fn deployment_actions(deployment: &DeploymentSnapshot) -> Vec<ActionHint> {
     use ActionRefusal::*;
     let all = &deployment.instances;
@@ -1855,8 +1919,11 @@ pub fn deployment_actions(deployment: &DeploymentSnapshot) -> Vec<ActionHint> {
     let is = |i: &InstanceSnapshot, states: &[&str]| states.contains(&i.observed_state.as_str());
     // SPEC §6.3: a start starts every active instance, waking a parked one;
     // refused when each already runs.
-    let start =
-        (active().next().is_some() && active().all(|i| is(i, &RUNNING))).then_some(RuntimeRetained);
+    let start = if active().next().is_some() && active().all(|i| is(i, &RUNNING)) {
+        Some(RuntimeRetained)
+    } else {
+        deployment.suspended.then_some(Conflict)
+    };
     // SPEC §6.3: an operator's Stop of a deployment holding nothing is
     // recorded; refused when every instance holding a runtime is already
     // stopping (`stop_in_transaction`).

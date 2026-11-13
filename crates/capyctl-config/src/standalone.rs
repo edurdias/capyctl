@@ -141,7 +141,7 @@ pub fn listener_public_address(
     value
         .as_str()
         .filter(|text| public_origin(text))
-        .map(|text| Some(text.to_owned()))
+        .map(|text| Some(normalize_public_origin(text)))
         .ok_or_else(|| {
             refuse(
                 path,
@@ -182,6 +182,34 @@ pub fn public_origin(text: &str) -> bool {
                 && digits.parse::<u16>().is_ok_and(|port| port != 0)
         });
     host_ok && port_ok
+}
+
+/// ADR 0040 §1: serialize the same origin a browser sends, including default
+/// ports and the canonical bracketed IPv6 spelling. Call after `public_origin`.
+pub fn normalize_public_origin(text: &str) -> String {
+    let (scheme, authority) = text.split_once("://").expect("validated origin");
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, port) = rest.split_once(']').expect("validated IPv6 origin");
+        (
+            format!(
+                "[{}]",
+                host.parse::<std::net::Ipv6Addr>().expect("validated IPv6")
+            ),
+            port,
+        )
+    } else {
+        let (host, port) = authority.split_at(authority.find(':').unwrap_or(authority.len()));
+        (host.to_ascii_lowercase(), port)
+    };
+    let port = port
+        .strip_prefix(':')
+        .map(|port| port.parse::<u16>().expect("validated port"));
+    match port {
+        Some(port) if !((scheme == "http" && port == 80) || (scheme == "https" && port == 443)) => {
+            format!("{scheme}://{host}:{port}")
+        }
+        _ => format!("{scheme}://{host}"),
+    }
 }
 
 /// SPEC §16.5, ADR 0040 §1: the management listener of a standalone

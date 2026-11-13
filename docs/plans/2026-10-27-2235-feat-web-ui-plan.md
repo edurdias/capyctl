@@ -680,9 +680,9 @@ Considered and not built:
 - **Approach:** A pure function maps a deployment's desired state, aggregate state and instance states to the availability of each action (start, stop, park, preinitialize, delete; start and stop for instances) with a typed reason. Management maps the reasons to the same codes its handlers return. Runtime-dependent refusals are not hinted.
 - **Patterns to follow:** the aggregate-state derivation already in `snapshot.rs`; the error mapping in `crates/capyctl-management/src/configuration.rs`.
 - **Test scenarios:**
-  - A stopped deployment offers start, preinitialize and delete, and refuses stop with a reason.
+  - A stopped deployment offers start, stop, preinitialize and delete: Stop is an idempotent recorded stop even when no runtime remains.
   - A ready deployment offers stop and park. Delete is unavailable with `delete_requires_cleanup`, the code the handler returns.
-  - A deployment mid-transition (stopping) offers no lifecycle action, and each carries `lifecycle_conflict`.
+  - A stopping deployment still offers Preinitialize; other actions follow the handler's actual state refusals (`lifecycle_conflict`, `runtime_retained`, `delete_requires_cleanup`, or `reconciliation_required`), not a blanket transition ban.
   - A suspended deployment's actions match a stopped one's.
   - Parity in both directions, in-process, for each state the function covers: an action hinted available is not refused by the handler for a state reason, and an action hinted unavailable is refused by the handler with the hinted code.
 - **Verification:** the snapshot JSON gains `actions` fields, and existing snapshot tests pass unchanged.
@@ -865,7 +865,7 @@ Considered and not built:
   - The sidebar becomes a menu below 768 px.
   - A shell-level indicator reads "Reconnecting…" while the event client has been in Reconnecting or Backoff for more than a few seconds, and live values are marked possibly out of date until the stream returns.
   - The API client sends JSON with same-origin `fetch`, adds `X-CapyCTL-UI: 1` to every request (KTD5), and parses both error envelopes.
-  - The state store applies events on top of the snapshot per KTD8's state machine.
+  - **Amendment (2026-11-13):** event notifications coalesce snapshot reloads instead of being applied as state patches. Events are not complete deployment or host documents; reloading the authoritative snapshot avoids reconstructing partial state incorrectly. A notification during a reload schedules another read, and reconnect recovery reloads without replaying actions.
   - The sign-in route runs KTD6's exchange. A 401 from the exchange shows the instructions page with a line saying the link was already used or has expired.
   - Any 401 routes to the sign-in instructions page.
 - **Test scenarios:**

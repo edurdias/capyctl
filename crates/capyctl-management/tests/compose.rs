@@ -66,6 +66,12 @@ fn verifier(dir: &std::path::Path, name: &str) -> Arc<SessionVerifier> {
 
 /// Both roles' composed routers over one owned coordinator.
 async fn roles() -> Roles {
+    roles_with_sources(Arc::new(capyctl_management::check::UnavailableSources)).await
+}
+
+async fn roles_with_sources(
+    check_sources: Arc<dyn capyctl_management::check::SourceProvider>,
+) -> Roles {
     let source = fixture::owned_source().await;
     let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -90,6 +96,27 @@ async fn roles() -> Roles {
     let host = document["input"]["host"].clone();
     let configuration =
         Arc::new(SharedConfigurationSource::new(owner.clone(), host.clone(), "owner").unwrap());
+    {
+        let owned = owner.lock().unwrap();
+        owned
+            .store()
+            .create_stopped_managed_configuration(
+                owned.session(),
+                "owner",
+                "compose-source",
+                &json!({"config":{"name":"source-model","engine":"vllm","model":"/weights"}})
+                    .to_string(),
+                &host,
+                1900,
+            )
+            .unwrap();
+        owned.store().create_stopped_managed_configuration(
+            owned.session(), "owner", "compose-secret-source",
+            &json!({"config":{"name":"secret-source","engine":"vllm","model":{"source":{
+                "type":"huggingface","repo":"org/model","revision":"0123456789abcdef0123456789abcdef01234567","token_ref":"secret://private-hub"
+            }}}}).to_string(), &host, 1900,
+        ).unwrap();
+    }
     let actions = Arc::new(OwnedActionSource::new(configuration, worker.commands()).unwrap());
     let latency: Arc<dyn LatencySource> = Arc::new(|_: Option<&str>| json!({"api_version": "1"}));
     let load: Arc<dyn LoadSource> =
@@ -102,7 +129,7 @@ async fn roles() -> Roles {
             ui: Router::new().route("/ui/", axum::routing::get(|| async { "sign in" })),
             playground: capyctl_management::playground::router(Router::new()),
             actions: actions.clone(),
-            check_sources: Arc::new(capyctl_management::check::UnavailableSources),
+            check_sources,
             host_admin: Arc::new(UnavailableHostAdmin),
             host_names: vec!["lab".into(), "standalone".into()],
             installations: installations.clone(),
@@ -253,13 +280,32 @@ fn request(method: &str, uri: &str, body: Option<&Value>, who: As, token: &str) 
 }
 
 async fn status(router: &Router, request: Request<Body>, who: As) -> u16 {
+    let must_exist = request.uri().path() != "/management/v1/no-such-route";
+    let uri = request.uri().clone();
     let peer = match who {
         As::Admin => "127.0.0.1:50000",
         As::Nobody | As::Session => "198.51.100.7:50000",
     };
     let response = from(router, peer).oneshot(request).await.unwrap();
     assert_eq!(response.headers()["cache-control"], "no-store");
-    response.status().as_u16()
+    let status = response.status().as_u16();
+    if must_exist && status == 404 {
+        // T21 / ADR 0040 §2: a matched handler may return 404 (for example
+        // the empty inference fixture), but an unsupported method must still
+        // find its route. Equal fallback 404s cannot satisfy this table.
+        let probe = Request::builder()
+            .method("OPTIONS")
+            .uri(uri)
+            .header("authorization", format!("Bearer {ADMIN}"))
+            .body(Body::empty())
+            .unwrap();
+        let probe = from(router, "127.0.0.1:50000")
+            .oneshot(probe)
+            .await
+            .unwrap();
+        assert_eq!(probe.status(), 405, "missing route in authorization table");
+    }
+    status
 }
 
 // ADR 0040 §2: every route of both roles' composed routers refuses a request
@@ -318,6 +364,11 @@ async fn every_route_of_both_roles_needs_a_principal() {
         (
             "GET",
             format!("/management/v1/deployments/{id}/effective-config"),
+            None,
+        ),
+        (
+            "GET",
+            format!("/management/v1/deployments/{id}/source"),
             None,
         ),
         ("GET", "/management/v1/model-sources".into(), None),
@@ -493,4 +544,131 @@ async fn revoking_a_session_ends_its_event_stream() {
             "the other session's stream continues"
         );
     }
+}
+
+// T21 / U7 / ADR 0040 §9: both roles expose accepted, editable source, not effective config.
+#[tokio::test]
+async fn accepted_source_is_editable_and_uses_a_numeric_revision_on_both_roles() {
+    let roles = roles().await;
+    for router in [&roles.standalone, &roles.server] {
+        let response = from(router, "127.0.0.1:50000")
+            .oneshot(request(
+                "GET",
+                "/management/v1/deployments/source-model/source",
+                None,
+                As::Admin,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap())
+                .unwrap();
+        assert!(body["revision"].is_i64(), "{body}");
+        assert_eq!(body["config"]["name"], "source-model");
+        assert_eq!(body["config"]["model"]["path"], "/weights");
+        assert!(body["config"].get("selected_devices").is_none(), "{body}");
+        assert!(body["config"].get("host").is_none(), "{body}");
+        assert_eq!(
+            capyctl_config::parse_strict(
+                capyctl_config::ConfigKind::Deployment,
+                body["yaml"].as_str().unwrap()
+            )
+            .unwrap(),
+            body["config"]
+        );
+        let response = from(router, "127.0.0.1:50000")
+            .oneshot(request(
+                "GET",
+                "/management/v1/deployments/secret-source/source",
+                None,
+                As::Admin,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("private-hub"));
+        let redacted: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            redacted["config"]["model"]["source"]["token_ref"],
+            "[redacted]"
+        );
+        let response = from(router, "127.0.0.1:50000")
+            .oneshot(request(
+                "GET",
+                "/management/v1/deployments/missing/source",
+                None,
+                As::Admin,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "deployment_not_found");
+    }
+}
+
+// T21 / U7 / KTD7: revoke ends only the wait, not dispatched host work.
+#[tokio::test]
+async fn revocation_ends_check_wait_without_cancelling_host_work() {
+    use capyctl_management::check::PinFuture;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let completed = Arc::new(tokio::sync::Notify::new());
+    let signals = (entered.clone(), release.clone(), completed.clone());
+    let sources = Arc::new(
+        move |_: &capyctl_store::managed_configuration::HostTarget, _: Vec<String>| -> PinFuture {
+            let (entered, release, completed) = signals.clone();
+            Box::pin(async move {
+                entered.notify_one();
+                release.notified().await;
+                completed.notify_one();
+                Ok(Vec::new())
+            })
+        },
+    );
+    let roles = roles_with_sources(sources).await;
+    let router = &roles.standalone;
+    let session = sign_in(router).await;
+    let body = json!({"config":{"name":"check","engine":"vllm","model":"/weights"}});
+    let pending = tokio::spawn(from(router, "198.51.100.7:50000").oneshot(request(
+        "POST",
+        "/management/v1/deployments/check",
+        Some(&body),
+        As::Session,
+        &session.token,
+    )));
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        status(
+            router,
+            request(
+                "POST",
+                &format!("/management/v1/ui/sessions/{}/revoke", session.id),
+                None,
+                As::Admin,
+                ""
+            ),
+            As::Admin
+        )
+        .await,
+        200
+    );
+    let response = tokio::time::timeout(Duration::from_secs(1), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), completed.notified())
+        .await
+        .unwrap();
 }

@@ -44,6 +44,18 @@ document rather than a nonexistent host.yaml; on servers it describes the stored
 approved document, available without contacting the host. Server deployment checks pin
 and size through the chosen host using that host's model-source endpoint and token.
 
+The review fixes add regression cases for behavior that was failing before the fixes:
+Edit now reads the accepted source document and numeric revision rather than the frozen
+effective configuration; fit previews use start's observed-memory admission, include
+drafter weights, preserve Hugging Face file and credential selections, and retain offline
+hosts as unknown results. Revocation ends a deployment-check wait without cancelling work
+already sent to a host. Source-route authorization is exercised on both roles, and the
+route table now rejects a missing route rather than accepting equal 404 responses.
+Additional cases cover suspended lifecycle hints, temporary UI entry redirects,
+extensionless embedded assets, canonical browser origins and management overrides applied
+before document validation. These tests are CPU regression evidence, not native-engine
+qualification.
+
 # Release note: New features
 
 - **A web UI.** A standalone role and a server now serve a web UI at `/ui/` on their

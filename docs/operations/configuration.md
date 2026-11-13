@@ -88,8 +88,9 @@ When more than one role keeps its state under the same root:
 - `config show` with more than one role is refused, naming them; choose with
   `--role` or `--config`.
 
-The management API is served on loopback only, on every role, so another
-machine is managed by running the command on it (for example over `ssh`).
+The management API listens on loopback by default on server and standalone
+roles. The owner can opt into off-box access with `remote: true` (see below).
+Host roles have no management listener.
 
 ## Listeners
 

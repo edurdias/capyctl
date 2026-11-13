@@ -1584,32 +1584,6 @@ where
         } => (*management_listen, *management_remote),
         _ => (None, false),
     };
-    // SPEC §16.5: `--management-listen` is a loopback address. ADR 0040 §1:
-    // the loopback check runs once `remote` is known, and only when neither
-    // `--management-remote` nor CAPYCTL_MANAGEMENT_REMOTE sets it (the role
-    // checks the address again against its document's `remote`).
-    if let Some(address) = management_listen {
-        let remote = management_remote
-            || std::env::var(crate::roles::MANAGEMENT_REMOTE_ENV)
-                .ok()
-                .and_then(|text| {
-                    capyctl_config::engine_settings::boolean(
-                        crate::roles::MANAGEMENT_REMOTE_ENV,
-                        &text,
-                    )
-                    .ok()
-                })
-                .unwrap_or(false);
-        if !remote && !address.ip().is_loopback() {
-            return Err(CliError::Clap(clap::Error::raw(
-                clap::error::ErrorKind::ValueValidation,
-                format!(
-                    "invalid value '{address}' for '--management-listen <ADDR:PORT>': \
-                     {MANAGEMENT_LOOPBACK}\n"
-                ),
-            )));
-        }
-    }
     // ADR 0028 §11 (decided 2026-10-06): `--group-stall-timeout` on `start
     // server`, the role that runs groups.
     let group_stall_timeout = match &cli.command {

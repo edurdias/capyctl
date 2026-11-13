@@ -54,8 +54,20 @@ impl ServiceObservation for Gate {
     }
 }
 
+struct LiveMembers(Vec<std::process::Child>);
+
+impl Drop for LiveMembers {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 struct Setup {
     _dir: tempfile::TempDir,
+    _members: LiveMembers,
     owner: Arc<Mutex<OwnedCoordinatorState>>,
     worker: OwnedCoordinator,
     gate: tokio::sync::watch::Sender<bool>,
@@ -71,7 +83,7 @@ impl Setup {
     }
 }
 
-async fn setup() -> Setup {
+async fn setup(live_members: bool) -> Setup {
     let source = fixture::owned_source().await;
     let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -80,13 +92,43 @@ async fn setup() -> Setup {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let owner = Arc::new(Mutex::new(OwnedCoordinatorState::open(dir.path()).unwrap()));
     let (gate, _) = tokio::sync::watch::channel(true);
-    let worker = capyctl_testkit::spawn_fake_coordinator(
+    // T16: the Fake and coordinator verify both recorded members after a
+    // park/restore. These stand-in engine processes belong to this fixture.
+    let members = LiveMembers(if live_members {
+        (0..2)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("600")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    });
+    let clock: capyctl_controller::coordinator::ServiceClock =
+        Arc::new(|| Ok::<_, CoordinatorError>(1900));
+    let runtime = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime");
+    let bindings = if live_members {
+        capyctl_testkit::fake_bindings_with_members(
+            clock.clone(),
+            dir.path().join("logs"),
+            runtime,
+            vec![
+                capyctl_testkit::live_identity("api", members.0[0].id()),
+                capyctl_testkit::live_identity("worker-0", members.0[1].id()),
+            ],
+        )
+    } else {
+        capyctl_testkit::fake_bindings(clock.clone(), dir.path().join("logs"), runtime)
+    };
+    let worker = OwnedCoordinator::spawn_resolved(
         owner.clone(),
         Arc::new(Gate {
             values: source.observations.clone(),
             open: gate.clone(),
         }),
-        Arc::new(|| Ok::<_, CoordinatorError>(1900)),
+        clock,
         // A protocol bound short enough that a stop with a long deadline
         // drains for the whole `stop_drain_timeout` (see `stopping`).
         CoordinatorOptions {
@@ -94,6 +136,8 @@ async fn setup() -> Setup {
             terminate_grace: Duration::from_secs(1),
             ..Default::default()
         },
+        bindings,
+        capyctl_testkit::fake_tools_factory(),
     )
     .unwrap();
     let host: Value = serde_json::from_str(include_str!(
@@ -112,6 +156,7 @@ async fn setup() -> Setup {
     );
     Setup {
         _dir: dir,
+        _members: members,
         owner,
         worker,
         gate,
@@ -210,14 +255,95 @@ async fn wait_for(s: &Setup, state: &str) {
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("the deployment reaches {state}"));
+    .unwrap_or_else(|_| {
+        let owner = s.owner.lock().unwrap();
+        let snapshot = owner.store().snapshot().unwrap();
+        let d = snapshot.deployments.iter().find(|d| d.id == s.id).unwrap();
+        panic!(
+            "expected {state}, observed {}: {:?}",
+            d.observed_state, d.latest_operation
+        );
+    });
 }
 
 /// A fresh setup with the deployment held in `state`.
 async fn in_state(state: &str) -> Setup {
-    let s = setup().await;
+    let s = setup(matches!(state, "parked" | "parking" | "waking")).await;
     match state {
         "stopped" => {}
+        "suspended" => {
+            s.owner
+                .lock()
+                .unwrap()
+                .store()
+                .set_suspended(&s.id, true)
+                .unwrap();
+        }
+        "parked" | "waking" => {
+            let (status, answer) = send(&s, &s.id, "to-ready", "start", 10000).await;
+            assert_eq!(status, 202, "{answer}");
+            wait_for(&s, "ready").await;
+            let (status, answer) = send(&s, &s.id, "to-parked", "park", 10000).await;
+            assert_eq!(status, 202, "{answer}");
+            wait_for(&s, "parked").await;
+            if state == "waking" {
+                s.gate.send_replace(false);
+                let (status, answer) = send(&s, &s.id, "to-waking", "start", 10000).await;
+                assert_eq!(status, 202, "{answer}");
+                wait_for(&s, "waking").await;
+            }
+        }
+        // T16 / U6: seed durable failure/reconciliation evidence after the
+        // real launch completes; the handlers still execute against that ledger.
+        "failed" | "reconciling" | "uncertain" => {
+            let (status, answer) = send(&s, &s.id, "to-ready", "start", 10000).await;
+            assert_eq!(status, 202, "{answer}");
+            wait_for(&s, "ready").await;
+            if state == "failed" {
+                let (status, answer) = send(&s, &s.id, "to-stopped", "stop", 10000).await;
+                assert_eq!(status, 202, "{answer}");
+                wait_for(&s, "stopped").await;
+            }
+            let _owner = s.owner.lock().unwrap();
+            let sql = rusqlite::Connection::open(s._dir.path().join("srv.sqlite3")).unwrap();
+            match state {
+                "failed" => {
+                    sql.execute(
+                        "UPDATE deployments SET admin_stopped=0 WHERE id=?1",
+                        [&s.id],
+                    )
+                    .unwrap();
+                    sql.execute("UPDATE deployment_instances SET desired_state='ready',admission_enabled=0 WHERE deployment_id=?1", [&s.id]).unwrap();
+                    sql.execute(
+                        "UPDATE lifecycle_runs SET action='activate' WHERE deployment_id=?1",
+                        [&s.id],
+                    )
+                    .unwrap();
+                    // SPEC §6 / T30: retry requires a verified failed
+                    // initialize, not merely a failed display-state derivation.
+                    sql.execute(
+                        "UPDATE operations SET kind='initialize',state='failed',error_code='launch_failed'
+                         WHERE id IN (SELECT operation_id FROM lifecycle_runs WHERE deployment_id=?1 AND generation=(SELECT generation FROM deployment_instances WHERE deployment_id=?1 AND instance_index=0))",
+                        [&s.id],
+                    ).unwrap();
+                    sql.execute(
+                        "UPDATE lifecycle_runs SET state='failed' WHERE deployment_id=?1 AND generation=(SELECT generation FROM deployment_instances WHERE deployment_id=?1 AND instance_index=0)",
+                        [&s.id],
+                    ).unwrap();
+                }
+                "reconciling" => {
+                    sql.execute(
+                        "UPDATE deployment_instances SET dispatch_enabled=0 WHERE deployment_id=?1",
+                        [&s.id],
+                    )
+                    .unwrap();
+                }
+                "uncertain" => {
+                    sql.execute("UPDATE deployment_instances SET observed_state='stopped',dispatch_enabled=0 WHERE deployment_id=?1", [&s.id]).unwrap();
+                }
+                _ => unreachable!(),
+            }
+        }
         "ready" => {
             let (status, start) = send(&s, &s.id, "to-ready", "start", 10000).await;
             assert_eq!(status, 202, "{start}");
@@ -232,7 +358,7 @@ async fn in_state(state: &str) -> Setup {
         }
         // SPEC §6.3: a stop drains the requests already accepted before it
         // terminates. One request in flight holds the stop in its drain.
-        "stopping" => {
+        "stopping" | "parking" => {
             let (status, start) = send(&s, &s.id, "to-ready", "start", 10000).await;
             assert_eq!(status, 202, "{start}");
             wait_for(&s, "ready").await;
@@ -251,9 +377,10 @@ async fn in_state(state: &str) -> Setup {
                     .unwrap();
                 assert!(granted[0].is_ok(), "{granted:?}");
             }
-            let (status, stop) = send(&s, &s.id, "to-stopping", "stop", 60000).await;
+            let action = if state == "parking" { "park" } else { "stop" };
+            let (status, stop) = send(&s, &s.id, "to-draining", action, 60000).await;
             assert_eq!(status, 202, "{stop}");
-            wait_for(&s, "stopping").await;
+            wait_for(&s, state).await;
         }
         other => unreachable!("{other}"),
     }
@@ -338,10 +465,9 @@ async fn a_stopping_deployment_offers_no_lifecycle_action_but_preinitialize() {
     s.shutdown().await;
 }
 
-// ADR 0040 §8: suspend and resume get no hints, and a deployment marked
-// suspended reads as stopped, actions included.
+// T16 / ADR 0040 §8: suspension closes activation even while observed stopped.
 #[tokio::test]
-async fn a_suspended_deployment_offers_what_a_stopped_one_does() {
+async fn a_suspended_deployment_refuses_start_until_resumed() {
     let s = in_state("stopped").await;
     let stopped = deployment(&s).await;
     s.owner
@@ -353,10 +479,14 @@ async fn a_suspended_deployment_offers_what_a_stopped_one_does() {
     let suspended = deployment(&s).await;
     assert_eq!(suspended["suspended"], true);
     assert_eq!(suspended["observed_state"], "stopped");
-    assert_eq!(suspended["actions"], stopped["actions"]);
+    assert_ne!(suspended["actions"], stopped["actions"]);
     assert_eq!(
-        suspended["instances"][0]["actions"],
-        stopped["instances"][0]["actions"]
+        hints(&suspended["actions"])[0],
+        ("start".into(), Some("lifecycle_conflict".into()))
+    );
+    assert_eq!(
+        hints(&suspended["instances"][0]["actions"])[0],
+        ("start".into(), Some("lifecycle_conflict".into()))
     );
     let listed: Vec<String> = hints(&suspended["actions"])
         .into_iter()
@@ -366,13 +496,25 @@ async fn a_suspended_deployment_offers_what_a_stopped_one_does() {
     s.shutdown().await;
 }
 
-// ADR 0040 §8: parity with the handlers, in both directions, for every state
+// T16 / U6 / ADR 0040 §8: parity with the handlers, in both directions, for every state
 // the Fake reaches in-process. An action hinted available is accepted; an
 // action hinted unavailable is refused with the hinted code. Each action runs
 // against its own fresh copy of the state, since an accepted one changes it.
 #[tokio::test]
 async fn hints_agree_with_the_handlers_in_both_directions() {
-    for state in ["stopped", "ready", "queued", "stopping"] {
+    for state in [
+        "stopped",
+        "suspended",
+        "failed",
+        "ready",
+        "queued",
+        "stopping",
+        "parked",
+        "parking",
+        "waking",
+        "reconciling",
+        "uncertain",
+    ] {
         let targets = DEPLOYMENT_ACTIONS
             .iter()
             .map(|action| (false, *action))
@@ -380,7 +522,14 @@ async fn hints_agree_with_the_handlers_in_both_directions() {
         for (instance, action) in targets {
             let s = in_state(state).await;
             let d = deployment(&s).await;
-            assert_eq!(d["observed_state"], state);
+            assert_eq!(
+                d["observed_state"],
+                if state == "suspended" {
+                    "stopped"
+                } else {
+                    state
+                }
+            );
             let (actions, path) = if instance {
                 (
                     &d["instances"][0]["actions"],

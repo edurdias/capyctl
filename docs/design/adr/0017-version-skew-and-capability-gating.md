@@ -1,6 +1,9 @@
 # ADR 0017 — Host/server version skew policy and capability gating
 
 **Status:** Accepted (owner decision 2026-09-24).
+**Amended by:** ADR 0040 §10: host administration is capability-gated; an older
+host without that capability keeps serving existing work but cannot accept
+host-administration operations.
 **Amends:** `SPEC.md` §13.1 ("rejects ... incompatible protocol/schema versions"): it
 defines which host and server releases are compatible, what an incompatible host may
 still do, and how additive protocol fields reach older hosts.
