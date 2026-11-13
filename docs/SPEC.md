@@ -692,7 +692,7 @@ A web UI built into the server and standalone roles is served under `/ui/` on th
 |---|---|---|
 | Server YAML | Listeners, authentication, enrollment, state location, scheduler and lifecycle defaults. | Host executable paths, static copies of all enrolled hosts, individual deployment records. |
 | Host YAML | Server identity reference, approved inventory, aggregate boundaries, storage pools, ingress, runtime profiles, supervision. | Model-specific allocations, global routing, private independent swap scheduling. |
-| Engines file (`engines.yaml`) | Runtime profiles registered with `capyctl engine add`, beside the role's configuration file; written only by `capyctl engine add` and `remove`, merged with the role document at load. | Anything else; a profile name the role document also declares. |
+| Engines file (`engines.yaml`) | Runtime profiles registered with `capyctl engine add` or the web UI, in the role's state directory (ADR 0018 amendment A4); written by `capyctl engine add`/`remove` and by the role's host administration, merged with the role document at load. | Anything else; a profile name the role document also declares. |
 | Deployment YAML | Model identity, runtime profile, placement/topology, per-host budgets, cache choice, route, lifecycle overrides. | Agent secrets, executable installation, controller credentials. |
 | Cache-service record | Unique physical allocation, backend identity, client quotas, lifetime and storage policy. | Duplicate per-client charging of the full service. |
 | CLI context | Selected management endpoint and credential reference. | A running service role. |
@@ -726,6 +726,10 @@ A deployment gains `lmcache` (`auto`, the default, `off` or `required`), `lmcach
 > **Amended by [ADR 0035](design/adr/0035-multi-gpu-one-host.md)** (owner decisions 2026-10-25).
 
 `topology` without two or more `placement.hosts` is one instance on N GPUs of one host (`host`, `placement.selector`, `strategy`, `max_per_host` and `instances` stay allowed, and standalone accepts it); `pipeline_parallel` above 1 there is refused. `topology: auto` lets CapyCTL choose N, and is refused beside named hosts, `devices`, `resources`, `memory.request` and `memory.startup`. `devices` beside `topology` pins exactly N identical GPUs (`topology_devices_mismatch`, `multi_gpu_mixed_devices`).
+
+> **Amended by [ADR 0018](design/adr/0018-engine-registration.md) amendment A4** (owner decision 2026-11-13).
+
+The engines files (`engines.yaml`, `custom-engines.yaml`) live in the role's state directory, which the service user writes, and the role itself writes them when engines are added or removed through its management API (ADR 0040 §10–§11), under the same lock and atomic write. A file at the previous location is moved into the state directory once at start.
 
 ### 15.2 No-config behavior
 

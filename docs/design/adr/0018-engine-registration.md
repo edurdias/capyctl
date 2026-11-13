@@ -248,3 +248,29 @@ profile, so the newer release still finds it, and `engine remove` can remove
 it. A profile of a known kind, or one whose `engine` is missing or not a
 string, is validated as strictly as before. This helps only releases that
 carry it; an older binary still refuses such a file.
+
+## Amendment A4: the engines file lives in the role's state directory (owner decision 2026-11-13)
+
+ADR 0040 lets a signed-in browser add and remove engines (§10, §11), so the running role now
+writes `engines.yaml` itself, through the shared host administration module, not only the
+`capyctl engine` CLI. Under the system units the role cannot write beside its document:
+`/etc/capyctl` is root-owned and `ProtectSystem=strict` keeps it read-only for the service
+user, and a write needs a temporary file and `engines.yaml.lock` in the same directory
+(milestone review of 2026-11-13, blocker 3). The owner decided:
+
+- The engines file moves to the role's state directory: `<state dir>/engines.yaml` (for
+  example `/var/lib/capyctl/host/engines.yaml`, `/var/lib/capyctl/standalone/engines.yaml`),
+  which the service already writes. The CLI and the role resolve the same path from the
+  state directory, by the same rule as every other state file. `/etc/capyctl` stays
+  read-only to the service.
+- On the first start of a release that carries this amendment, a role that finds no
+  `engines.yaml` in its state directory but one at the previous location (beside its
+  document, or `~/.config/capyctl/engines.yaml` without one) moves it into the state
+  directory once, with its revision line, owner and mode 0600, and leaves a one-line note
+  in the role log. When both exist, the state directory's copy wins and the old one is
+  left untouched, with a warning naming it.
+- §2's write rules stand (lock, temporary file, rename, directory sync, revision line, the
+  32 KiB bound, refusing a profile declared in both files); "the CLI is the only writer"
+  and "a running role only reads it" are withdrawn.
+
+SPEC §15.2's table entry for the engines file changes accordingly.
