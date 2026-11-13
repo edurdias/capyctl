@@ -40,6 +40,7 @@ pub fn render(command: &Command, value: &Value, context: &Context) -> String {
         Command::Delete { deployment, .. } => delete(deployment, value),
         Command::Init(target) => init(*target, value),
         Command::Invite { .. } => invite(value),
+        Command::OpenUi { .. } => open_ui(value),
         Command::Join { .. } => Detail::new("Joined the server")
             .row("Host ID", s(&value["host_id"]))
             .render(),
@@ -84,6 +85,25 @@ fn generic(command: &Command, value: &Value) -> String {
         .unwrap_or("command")
         .to_lowercase();
     record(&format!("{name} done"), value)
+}
+
+/// ADR 0040 §5 / KTD6; ADR 0021: generate the QR only for the text view.
+fn open_ui(value: &Value) -> String {
+    let url = s(&value["url"]);
+    let code = qrcode::QrCode::new(url.as_bytes()).expect("validated sign-in URL fits a QR code");
+    let qr = code
+        .render::<qrcode::render::unicode::Dense1x2>()
+        .dark_color(qrcode::render::unicode::Dense1x2::Light)
+        .light_color(qrcode::render::unicode::Dense1x2::Dark)
+        .build();
+    let mut text = format!("{url}\n\n{qr}\n\nThis one-time link expires in 10 minutes.\n");
+    if value["loopback_only"] == true {
+        text.push_str(
+            "A phone needs the off-box setting: remote: true and a reachable management bind \
+             (for example your Tailscale address).\n",
+        );
+    }
+    text
 }
 
 /// ADR 0021: `engine flags` as two tables, options then environment, each

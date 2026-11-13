@@ -74,6 +74,10 @@ pub enum Resource {
 pub enum Command {
     Start(Role),
     Init(InitTarget),
+    /// ADR 0040 §5: issue a one-time browser sign-in link.
+    OpenUi {
+        address: Option<String>,
+    },
     /// SPEC §4.1: a short-lived, single-use host invitation. ADR 0016: with
     /// `recover`, the invitation re-enrolls the revoked host `name` (its name
     /// or id) under its same identity instead of enrolling a new host.
@@ -237,6 +241,7 @@ impl Command {
         match self {
             Command::Start(role) => format!("start {role:?}").to_lowercase(),
             Command::Init(target) => format!("init {target:?}").to_lowercase(),
+            Command::OpenUi { .. } => "open ui".into(),
             Command::Invite { name, recover } => {
                 format!(
                     "invite host {name}{}",
@@ -372,6 +377,11 @@ enum CliCommand {
     Init {
         #[command(subcommand)]
         target: InitTarget,
+    },
+    /// Print a one-time sign-in link and QR code for the web UI.
+    Open {
+        #[command(subcommand)]
+        target: OpenTarget,
     },
     /// Create a single-use invitation file that lets a GPU machine join the
     /// server. With `--recover`, let a revoked host rejoin as itself.
@@ -1123,6 +1133,16 @@ enum ConfigArgs {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+enum OpenTarget {
+    /// Sign a browser in to the server or standalone role on this machine.
+    Ui {
+        /// The browser-facing origin, instead of public_address or the management bind.
+        #[arg(long, value_name = "ORIGIN", value_parser = parse_ui_address)]
+        address: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum HostWord {
     Host,
@@ -1154,6 +1174,9 @@ impl From<CliCommand> for Command {
                 },
             },
             CliCommand::Init { target } => Command::Init(target),
+            CliCommand::Open {
+                target: OpenTarget::Ui { address },
+            } => Command::OpenUi { address },
             CliCommand::Invite {
                 host,
                 name,
@@ -1697,6 +1720,16 @@ pub fn parse_env_flag(raw: &str) -> Result<(String, String), String> {
         Some((name, value)) if !name.is_empty() => Ok((name.to_owned(), value.to_owned())),
         _ => Err(format!("`{raw}` must be NAME=VALUE with a non-empty name")),
     }
+}
+
+/// ADR 0040 §5 / KTD6: use the same origin rules as public_address.
+fn parse_ui_address(text: &str) -> Result<String, String> {
+    capyctl_config::standalone::public_origin(text)
+        .then(|| text.to_owned())
+        .ok_or_else(|| {
+            "must be an origin with http:// or https:// and no path, e.g. http://100.64.1.2:7443"
+                .to_owned()
+        })
 }
 
 /// Owner rule 2026-09-25: `--hf-endpoint`, an https:// URL.

@@ -382,6 +382,7 @@ dependencies = [
  "clap",
  "clap-markdown",
  "libc",
+ "qrcode",
  "reqwest",
  "serde",
  "serde_json",
@@ -1805,6 +1806,12 @@ checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
 dependencies = [
  "prost",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"

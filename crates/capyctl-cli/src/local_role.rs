@@ -79,6 +79,51 @@ pub struct Target {
     pub role: &'static str,
     pub source: Source,
 }
+impl Target {
+    /// ADR 0040 §5: use the selected role's document and the same effective
+    /// setting overrides and listener validation as role startup, not another
+    /// unvalidated public-address lookup.
+    pub fn management_public_address(
+        &self,
+        config: Option<&Path>,
+    ) -> Result<Option<String>, StructuredError> {
+        use capyctl_config::{setting_overrides::SettingOverrides, ConfigKind};
+        let (role, kind) = if self.role == "server" {
+            (crate::grammar::Role::Server, ConfigKind::Server)
+        } else {
+            (crate::grammar::Role::Standalone, ConfigKind::Standalone)
+        };
+        let document = crate::engine::named_role_document(config, &|key| {
+            std::env::var(key).ok().filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| role_document(&self.journal_root, role));
+        let text = match std::fs::read_to_string(&document) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(invalid(format!("{}: {error}", document.display()))),
+        };
+        let refused = |error: capyctl_config::ConfigError| {
+            invalid(format!(
+                "{}: {}",
+                document.display(),
+                crate::settings::describe(&error)
+            ))
+        };
+        let overrides = SettingOverrides::from_process(kind, &[]).map_err(refused)?;
+        let parsed = capyctl_config::parse_document(&text)
+            .and_then(|parsed| overrides.apply_and_validate(parsed))
+            .map_err(refused)?;
+        match kind {
+            ConfigKind::Standalone => capyctl_config::standalone::management_listener(&parsed)
+                .map(|listener| listener.public_address),
+            _ => capyctl_config::standalone::listener_public_address(
+                &parsed["listeners"]["management"],
+                "listeners.management.public_address",
+            ),
+        }
+        .map_err(refused)
+    }
+}
 
 fn endpoint(address: SocketAddr) -> String {
     format!("http://{address}/management/v1")
