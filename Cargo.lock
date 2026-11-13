@@ -475,6 +475,7 @@ dependencies = [
 name = "capyctl-management"
 version = "0.1.12"
 dependencies = [
+ "async-trait",
  "axum",
  "capyctl-adapters",
  "capyctl-agent",
@@ -491,6 +492,7 @@ dependencies = [
  "http-body-util",
  "libc",
  "rand_core 0.6.4",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

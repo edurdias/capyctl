@@ -145,7 +145,7 @@ impl DrainReport {
     }
 }
 
-/// Admission control for one inference-carrying listener.
+/// Admission control shared by a role's inference-carrying services.
 ///
 /// Every admitted request is counted from the moment it is admitted until its
 /// response body is finished or dropped, so a streamed answer counts for as long
@@ -169,6 +169,8 @@ impl Admission {
     }
 
     /// Wrap `router` so its requests are admitted, counted and drainable.
+    /// ADR 0040 §12: the inference listener and keyless playground service
+    /// must use the same `Admission`, so closing and draining cover both.
     pub fn gate(self: &Arc<Self>, router: Router) -> Router {
         router.layer(axum::middleware::from_fn_with_state(self.clone(), admit))
     }

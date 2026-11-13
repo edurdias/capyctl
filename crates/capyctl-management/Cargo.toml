@@ -23,14 +23,16 @@ serde.workspace = true
 rand_core = { version = "0.6", features = ["getrandom"] }
 hex.workspace = true
 http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
+async-trait.workspace = true
+reqwest.workspace = true
 capyctl-adapters.workspace = true
 capyctl-testkit.workspace = true
 capyctl-scheduler.workspace = true
 capyctl-domain.workspace = true
 tempfile.workspace = true
-tower = { version = "0.5", features = ["util"] }
 rusqlite.workspace = true
 # SPEC §§10, 17: the load route served with the router's composed report.
 capyctl-router = { path = "../capyctl-router" }

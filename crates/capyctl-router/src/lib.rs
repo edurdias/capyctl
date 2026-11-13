@@ -52,7 +52,8 @@ pub struct RouterDeps {
     pub forwards: Arc<dyn forwarders::ForwarderSource>,
     pub limits: QueueLimits,
     /// Shared inference API key (F1: single-owner lab; per-client keys later).
-    /// `None` only when the operator turned authentication off (design §9).
+    /// `None` when inference authentication is off (design §9), or for the
+    /// management-authorized playground instance (ADR 0040 §12).
     pub api_key: Option<String>,
     /// Conservative in-flight accounting (released only on confirmed end).
     pub inflight: Arc<admission::InFlight>,
@@ -83,9 +84,9 @@ pub fn serve_router(deps: RouterDeps) -> axum::Router {
 fn authorized(headers: &HeaderMap, deps: &RouterDeps) -> bool {
     use subtle::ConstantTimeEq;
     match &deps.api_key {
-        // Design §9: no key only when the operator chose `authentication:
-        // none` (document, `--no-inference-auth` or CAPYCTL_INFERENCE_AUTH); the
-        // role warns at start when that listener is not on loopback.
+        // Design §9: the operator may disable the inference listener's key
+        // check. ADR 0040 §12: management also uses a separate keyless
+        // instance, reachable only through its session authorization.
         None => true,
         Some(expected) => headers
             .get(axum::http::header::AUTHORIZATION)

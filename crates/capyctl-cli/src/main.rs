@@ -534,7 +534,7 @@ async fn serve_standalone(
         .await
         .map_err(|e| roles::listen_failed("management", management_address, e))?;
     roles::record_management_address(state_dir, management_address);
-    let admission = shutdown::Admission::new();
+    let admission = app.admission();
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let mut inference = tokio::spawn(shutdown::serve(
         listener,
