@@ -650,133 +650,116 @@ fn resolve_on_host(
     resolve: HostResolver<'_>,
 ) -> Result<Resolved> {
     let group = instance_spec.group.as_ref();
-                let mut command = scoped_source(host, &config)?;
-                // ADR 0019: `devices: [{id: gpu1}]` takes this host's sharing.
-                capyctl_config::deployment_defaults::fill_device_sharing(
-                    &mut command,
-                    &host.trusted_host,
-                );
-                // ADR 0019 (discrete GPU design §7): a deployment that pins
-                // no device is resolved once per GPU of a discrete host, and
-                // placement picks the GPU. The host's own resolution is the
-                // lowest-index GPU's.
-                let choices =
-                    capyctl_config::instances::device_choices(&command, &host.trusted_host)
-                        .map_err(ManagedConfigurationError::Rejected)?;
-                let recipe = |document: &Value| -> Result<Value> {
-                    // ADR 0013 §2: unnamed device claims take this host's
-                    // devices, and the per-host recipe carries no
-                    // deployment-level field.
-                    let mut source =
-                        capyctl_config::instances::assign_devices(document, &host.trusted_host)
-                            .map_err(ManagedConfigurationError::Rejected)?;
-                    if let Some(object) = source.as_object_mut() {
-                        for field in ["instances", "placement", "host"] {
-                            // ADR 0028 §2: a group member's recipe keeps
-                            // its rank-ordered host list, so it resolves as
-                            // the group it is; placement is outside the
-                            // recipe fingerprint either way.
-                            if field == "placement" && group.is_some() {
-                                continue;
-                            }
-                            object.remove(field);
-                        }
-                    }
-                    Ok(source)
-                };
-                // ADR 0035 §1a: under `topology: auto` the host's own row is
-                // the `auto` document's own resolution, which records the
-                // candidate table placement chooses N from (and is the N this
-                // host's cards hold now, on its lowest set); each set of each
-                // size is a choice beside it, resolved as the explicit N.
-                let auto =
-                    instance_spec.local == Some(capyctl_config::topology::LocalTopology::Auto);
-                let own =
-                    || -> Result<(Value, capyctl_config::effective::EffectiveDeployment, bool)> {
-                        let source = recipe(&command)?;
-                        let (mut effective, provisional) =
-                            resolve(&source, &host.trusted_host)?;
-                        effective.routes.sort();
-                        Ok((source, effective, provisional))
-                    };
-                let mut devices = Vec::new();
-                let (source, effective, provisional) = if choices.len() > 1 {
-                    // Final review I7 (design §7): each GPU is judged on its
-                    // own. A GPU the deployment cannot fit is not a placement
-                    // option for it; the host is refused only when no GPU
-                    // resolves, and the host's own row is the first GPU that
-                    // does.
-                    let mut first_error = None;
-                    let mut resolved_on = Vec::new();
-                    for (device, choice) in &choices {
-                        let attempt = recipe(choice).and_then(|source| {
-                            resolve(&source, &host.trusted_host)
-                                .map(|resolution| (source, resolution))
-                        });
-                        match attempt {
-                            Ok((source, (mut on_device, device_provisional))) => {
-                                on_device.routes.sort();
-                                resolved_on.push((
-                                    device.clone(),
-                                    source,
-                                    on_device,
-                                    device_provisional,
-                                ));
-                            }
-                            Err(ManagedConfigurationError::Sql(error)) => {
-                                return Err(ManagedConfigurationError::Sql(error))
-                            }
-                            Err(error) => {
-                                first_error.get_or_insert(error);
-                            }
-                        }
-                    }
-                    let (source, effective, provisional) = if auto {
-                        own()?
-                    } else {
-                        let Some((_, source, effective, provisional)) =
-                            resolved_on.first().cloned()
-                        else {
-                            return Err(first_error.unwrap_or(ManagedConfigurationError::Invalid));
-                        };
-                        (source, effective, provisional)
-                    };
-                    // One checkpoint, one set of facts: every GPU's
-                    // resolution is provisional exactly when the host's is.
-                    if resolved_on.iter().any(|(.., p)| *p != provisional) {
-                        return Err(ManagedConfigurationError::Invalid);
-                    }
-                    devices = resolved_on
-                        .into_iter()
-                        .map(|(device, source, on_device, _)| (device, source, on_device))
-                        .collect();
-                    (source, effective, provisional)
-                } else if auto {
-                    own()?
-                } else {
-                    let source = recipe(choices.first().map_or(&command, |(_, first)| first))?;
-                    let (mut effective, provisional) =
-                        resolve(&source, &host.trusted_host)?;
-                    effective.routes.sort();
-                    (source, effective, provisional)
-                };
-                let policy = read_selected_policy(&tx, &effective.host.name)
-                    .map_err(|_| ManagedConfigurationError::PolicyConflict)?
-                    .ok_or(ManagedConfigurationError::PolicyConflict)?;
-                if policy.context != ResourceContext::from_host(&effective.host)
-                    || policy.controls != ResourceControls::from_host(&effective.host)
-                {
-                    return Err(ManagedConfigurationError::PolicyConflict);
+    let mut command = scoped_source(host, config)?;
+    // ADR 0019: `devices: [{id: gpu1}]` takes this host's sharing.
+    capyctl_config::deployment_defaults::fill_device_sharing(&mut command, &host.trusted_host);
+    // ADR 0019 (discrete GPU design §7): a deployment that pins
+    // no device is resolved once per GPU of a discrete host, and
+    // placement picks the GPU. The host's own resolution is the
+    // lowest-index GPU's.
+    let choices = capyctl_config::instances::device_choices(&command, &host.trusted_host)
+        .map_err(ManagedConfigurationError::Rejected)?;
+    let recipe = |document: &Value| -> Result<Value> {
+        // ADR 0013 §2: unnamed device claims take this host's
+        // devices, and the per-host recipe carries no
+        // deployment-level field.
+        let mut source = capyctl_config::instances::assign_devices(document, &host.trusted_host)
+            .map_err(ManagedConfigurationError::Rejected)?;
+        if let Some(object) = source.as_object_mut() {
+            for field in ["instances", "placement", "host"] {
+                // ADR 0028 §2: a group member's recipe keeps
+                // its rank-ordered host list, so it resolves as
+                // the group it is; placement is outside the
+                // recipe fingerprint either way.
+                if field == "placement" && group.is_some() {
+                    continue;
                 }
-                Ok(Resolved {
-                    host_id: host.host_id.clone(),
-                    host_name: host.host_name.clone(),
-                    command,
-                    source,
-                    effective,
-                    provisional,
-                    devices,
-                })
+                object.remove(field);
+            }
+        }
+        Ok(source)
+    };
+    // ADR 0035 §1a: under `topology: auto` the host's own row is
+    // the `auto` document's own resolution, which records the
+    // candidate table placement chooses N from (and is the N this
+    // host's cards hold now, on its lowest set); each set of each
+    // size is a choice beside it, resolved as the explicit N.
+    let auto = instance_spec.local == Some(capyctl_config::topology::LocalTopology::Auto);
+    let own = || -> Result<(Value, capyctl_config::effective::EffectiveDeployment, bool)> {
+        let source = recipe(&command)?;
+        let (mut effective, provisional) = resolve(&source, &host.trusted_host)?;
+        effective.routes.sort();
+        Ok((source, effective, provisional))
+    };
+    let mut devices = Vec::new();
+    let (source, effective, provisional) = if choices.len() > 1 {
+        // Final review I7 (design §7): each GPU is judged on its
+        // own. A GPU the deployment cannot fit is not a placement
+        // option for it; the host is refused only when no GPU
+        // resolves, and the host's own row is the first GPU that
+        // does.
+        let mut first_error = None;
+        let mut resolved_on = Vec::new();
+        for (device, choice) in &choices {
+            let attempt = recipe(choice).and_then(|source| {
+                resolve(&source, &host.trusted_host).map(|resolution| (source, resolution))
+            });
+            match attempt {
+                Ok((source, (mut on_device, device_provisional))) => {
+                    on_device.routes.sort();
+                    resolved_on.push((device.clone(), source, on_device, device_provisional));
+                }
+                Err(ManagedConfigurationError::Sql(error)) => {
+                    return Err(ManagedConfigurationError::Sql(error))
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        let (source, effective, provisional) = if auto {
+            own()?
+        } else {
+            let Some((_, source, effective, provisional)) = resolved_on.first().cloned() else {
+                return Err(first_error.unwrap_or(ManagedConfigurationError::Invalid));
+            };
+            (source, effective, provisional)
+        };
+        // One checkpoint, one set of facts: every GPU's
+        // resolution is provisional exactly when the host's is.
+        if resolved_on.iter().any(|(.., p)| *p != provisional) {
+            return Err(ManagedConfigurationError::Invalid);
+        }
+        devices = resolved_on
+            .into_iter()
+            .map(|(device, source, on_device, _)| (device, source, on_device))
+            .collect();
+        (source, effective, provisional)
+    } else if auto {
+        own()?
+    } else {
+        let source = recipe(choices.first().map_or(&command, |(_, first)| first))?;
+        let (mut effective, provisional) = resolve(&source, &host.trusted_host)?;
+        effective.routes.sort();
+        (source, effective, provisional)
+    };
+    let policy = read_selected_policy(tx, &effective.host.name)
+        .map_err(|_| ManagedConfigurationError::PolicyConflict)?
+        .ok_or(ManagedConfigurationError::PolicyConflict)?;
+    if policy.context != ResourceContext::from_host(&effective.host)
+        || policy.controls != ResourceControls::from_host(&effective.host)
+    {
+        return Err(ManagedConfigurationError::PolicyConflict);
+    }
+    Ok(Resolved {
+        host_id: host.host_id.clone(),
+        host_name: host.host_name.clone(),
+        command,
+        source,
+        effective,
+        provisional,
+        devices,
+    })
 }
 
 /// ADR 0040 §9: a deployment check's verdict on one allowed host.
@@ -848,7 +831,9 @@ impl crate::Store {
         let mut checks = Vec::with_capacity(ordered.len());
         for host in ordered {
             let fit = match resolve_on_host(&tx, host, config, &instance_spec, &resolve) {
-                Ok(resolved) if resolved.provisional => HostFit::Unknown("weights_unknown"),
+                Ok(resolved) if resolved.provisional || weights_bytes.is_none() => {
+                    HostFit::Unknown("weights_unknown")
+                }
                 Ok(resolved) => match crate::ordinary_lifecycle::placement::check_fit(
                     &tx,
                     &resolved.effective,
@@ -897,7 +882,8 @@ impl crate::Store {
         &self,
         source: &capyctl_config::model_source::ModelSource,
     ) -> Result<Option<i64>> {
-        let source = serde_json::to_string(source).map_err(|_| ManagedConfigurationError::Invalid)?;
+        let source =
+            serde_json::to_string(source).map_err(|_| ManagedConfigurationError::Invalid)?;
         Ok(self
             .conn
             .query_row(

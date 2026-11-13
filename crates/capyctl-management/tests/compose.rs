@@ -99,6 +99,7 @@ async fn roles() -> Roles {
         Some("https://box.tail1234.ts.net"),
         StandaloneRoutes {
             actions: actions.clone(),
+            check_sources: Arc::new(capyctl_management::check::UnavailableSources),
             host_names: vec!["lab".into(), "standalone".into()],
             installations: installations.clone(),
             engine_logs: StandaloneEngineLogs::new(owner.clone(), dir.path().join("logs")),
@@ -273,6 +274,11 @@ async fn every_route_of_both_roles_needs_a_principal() {
             Some(&invalid),
         ),
         ("POST", "/management/v1/deployments".into(), Some(&invalid)),
+        (
+            "POST",
+            "/management/v1/deployments/check".into(),
+            Some(&invalid),
+        ),
         (
             "PUT",
             format!("/management/v1/deployments/{id}"),

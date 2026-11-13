@@ -4,6 +4,16 @@
 //! commands. No listener or inference routes are composed here.
 //! ADR 0040 §2: a role serves its routers only through [`compose::compose`],
 //! which resolves the principal every router's `authenticate` layer reads.
+//!
+//! ADR 0040 §9: `POST /management/v1/deployments/check` accepts exactly one
+//! of `{"yaml":"…"}` and `{"config":{…}}`. It returns normalized `config`,
+//! emitted `yaml`, `errors` (including parser positions), and per-host
+//! `hosts` verdicts: `fits`, `needs_room`, `does_not_fit` with its `limit`,
+//! or `unknown` with its `reason`. Size-based verdicts carry `estimated`.
+//! No deployment, receipt, reservation or event is stored. A standalone
+//! host pins and sizes in-process with its own model-source settings and
+//! caches repository/reference pins. The server route currently refuses
+//! `unsupported_capability` until its host-admin provider is installed.
 use axum::{
     extract::{Request, State},
     http::{header, StatusCode},
@@ -20,6 +30,7 @@ use tokio::sync::Semaphore;
 // ADR 0040 §8: the snapshot's supported-action hints, as handler codes.
 mod action_hints;
 pub mod actions;
+pub mod check;
 pub mod configuration;
 // ADR 0040 §§2–4: the one composition point and principal resolution.
 pub mod compose;

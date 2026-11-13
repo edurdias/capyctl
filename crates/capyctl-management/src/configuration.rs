@@ -632,6 +632,32 @@ impl ConfigurationSource for SharedConfigurationSource {
     }
 }
 impl SharedConfigurationSource {
+    /// ADR 0040 §9: a host without its first observation still has a
+    /// document to validate against; the fit check reports it as unknown.
+    pub(crate) fn check_targets(
+        &self,
+        store: &capyctl_store::Store,
+        config_json: &str,
+    ) -> Result<(Vec<HostTarget>, Vec<HostRefusal>), ConfigurationFailure> {
+        match self.targets(store, config_json, false) {
+            Err(ConfigurationFailure::ReconciliationRequired) => match &self.host {
+                HostSource::Embedded { document, id } => Ok((
+                    vec![HostTarget {
+                        host_id: id.clone(),
+                        host_name: id.clone(),
+                        trusted_host: document
+                            .read()
+                            .map_err(|_| ConfigurationFailure::Internal)?
+                            .clone(),
+                        scoped: false,
+                    }],
+                    Vec::new(),
+                )),
+                HostSource::Registry => Err(ConfigurationFailure::ReconciliationRequired),
+            },
+            result => result,
+        }
+    }
     /// ADR 0013 §3: every allowed host `config_json` is resolved against
     /// (the embedded host, or the registry's), with the refusals recorded
     /// beside them. `fail_fast` refuses a profile no allowed host publishes

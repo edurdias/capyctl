@@ -108,6 +108,7 @@ pub fn compose(
 /// What a standalone role's management listener serves.
 pub struct StandaloneRoutes {
     pub actions: Arc<OwnedActionSource>,
+    pub check_sources: Arc<dyn crate::check::SourceProvider>,
     /// The names the embedded host answers to for a drain.
     pub host_names: Vec<String>,
     pub installations: Arc<EmbeddedInstallations>,
@@ -130,6 +131,7 @@ pub fn standalone(
         public_address,
         [
             crate::lifecycle_router(routes.actions.clone()),
+            crate::check::router(routes.actions.configuration().clone(), routes.check_sources),
             // SPEC §4.3: the explicit drain of the embedded host, by its
             // published name or the `standalone` alias the CLI uses.
             crate::drain::drain_router(routes.actions, routes.host_names),
@@ -176,6 +178,10 @@ pub fn server(
         public_address,
         [
             crate::lifecycle_router(routes.actions.clone()),
+            crate::check::router(
+                routes.actions.configuration().clone(),
+                Arc::new(crate::check::UnavailableSources),
+            ),
             // SPEC §4.3: the explicit drain of an enrolled host.
             crate::drain::drain_router_with_presence(routes.actions, Vec::new(), routes.presence),
             crate::enrollment::enrollment_router(

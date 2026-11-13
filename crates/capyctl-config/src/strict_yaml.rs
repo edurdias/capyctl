@@ -525,82 +525,6 @@ fn check_value(value: &Value, spec: &FieldSpec, path: &str) -> Result<(), Config
     }
 }
 
-/// ADR 0040 §9: `value` as block YAML that [`parse_document`] reads back
-/// as the same value. A string is written plain only when it would be read
-/// back as that string; otherwise it is double-quoted with JSON's escapes,
-/// which YAML's double-quoted style shares.
-pub fn to_yaml(value: &Value) -> String {
-    fn text(s: &str) -> String {
-        let safe = s.bytes().enumerate().all(|(i, b)| {
-            b.is_ascii_alphanumeric()
-                || matches!(b, b'_' | b'/')
-                || (i > 0 && matches!(b, b'.' | b'@' | b'-' | b'+'))
-        });
-        if !s.is_empty() && safe && scalar_value(s, ScalarStyle::Plain) == s {
-            s.to_owned()
-        } else {
-            Value::String(s.to_owned()).to_string()
-        }
-    }
-    fn scalar(value: &Value) -> String {
-        match value {
-            Value::String(s) => text(s),
-            Value::Object(_) => "{}".to_owned(),
-            Value::Array(_) => "[]".to_owned(),
-            other => other.to_string(),
-        }
-    }
-    fn nested(value: &Value) -> bool {
-        match value {
-            Value::Object(map) => !map.is_empty(),
-            Value::Array(items) => !items.is_empty(),
-            _ => false,
-        }
-    }
-    fn emit(value: &Value, indent: usize, out: &mut String) {
-        let pad = " ".repeat(indent);
-        match value {
-            Value::Object(map) if !map.is_empty() => {
-                for (key, item) in map {
-                    out.push_str(&pad);
-                    out.push_str(&text(key));
-                    out.push(':');
-                    if nested(item) {
-                        out.push('\n');
-                        emit(item, indent + 2, out);
-                    } else {
-                        out.push(' ');
-                        out.push_str(&scalar(item));
-                        out.push('\n');
-                    }
-                }
-            }
-            Value::Array(items) if !items.is_empty() => {
-                for item in items {
-                    out.push_str(&pad);
-                    out.push('-');
-                    if nested(item) {
-                        out.push('\n');
-                        emit(item, indent + 2, out);
-                    } else {
-                        out.push(' ');
-                        out.push_str(&scalar(item));
-                        out.push('\n');
-                    }
-                }
-            }
-            other => {
-                out.push_str(&pad);
-                out.push_str(&scalar(other));
-                out.push('\n');
-            }
-        }
-    }
-    let mut out = String::new();
-    emit(value, 0, &mut out);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,7 +557,7 @@ mod tests {
             "nested": [[1, 2], [{"a": {"b": [3]}}], {"c": "/abs/path"}],
             "odd key: #": "v",
         });
-        let text = to_yaml(&value);
+        let text = crate::yaml_emit::to_block_yaml(&value);
         assert_eq!(parse_document(&text).unwrap(), value, "{text}");
     }
 

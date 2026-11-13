@@ -24,7 +24,7 @@ pub use engines::{
     BuiltinPreview, Toolchain,
 };
 pub use model_store::{list_copies, model_store, prune_copies};
-pub use pin_and_size::pin_and_size;
+pub use pin_and_size::{pin_and_size, CachedSourcePinner};
 
 use crate::control_socket::{request, ClientError, ControlRequest};
 use capyctl_config::custom::CustomManifest;

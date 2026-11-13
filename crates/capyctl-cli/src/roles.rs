@@ -2458,6 +2458,14 @@ async fn start_standalone_in(
         management_listener.public_address.as_deref(),
         capyctl_management::compose::StandaloneRoutes {
             actions: source,
+            // ADR 0040 §9: pin with this host's resolved document settings.
+            check_sources: Arc::new(capyctl_management::check::StandaloneSources(Arc::new(
+                capyctl_agent::host_admin::CachedSourcePinner::new(
+                    models.policy.clone(),
+                    models.models_root.clone(),
+                    Arc::new(|name| std::env::var(name).ok()),
+                ),
+            ))),
             // SPEC §4.3: the embedded host drains by its published name or
             // the `standalone` alias the CLI uses.
             host_names: vec![declared_host.name.clone(), "standalone".to_owned()],

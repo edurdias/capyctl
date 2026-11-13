@@ -6,6 +6,7 @@
 //! host to run it (`HostAdminRequest`'s `pin_and_size`).
 
 use std::path::{Path, PathBuf};
+use std::{collections::BTreeMap, future::Future, pin::Pin};
 
 use capyctl_config::deployment_defaults::split_hf;
 use capyctl_config::deployment_pin::{hub_endpoint, Hub, HOST_TOKEN_HINT};
@@ -14,6 +15,67 @@ use capyctl_protocol::pb;
 
 use crate::checkpoint::{is_weight, CheckpointVerifier};
 use crate::sources::{read_secret, Environment, HF_TOKEN_VARIABLES};
+
+/// ADR 0040 §9: resolved repository/reference pins and their reported sizes
+/// survive debounced checks. Local paths are sized afresh; failures are not
+/// cached. The mutex also coalesces concurrent checks of the same reference.
+pub struct CachedSourcePinner {
+    policy: ModelSourcePolicy,
+    model_store: PathBuf,
+    environment: Environment,
+    pins: tokio::sync::Mutex<BTreeMap<String, pb::PinnedSource>>,
+}
+
+impl CachedSourcePinner {
+    pub fn new(policy: ModelSourcePolicy, model_store: PathBuf, environment: Environment) -> Self {
+        Self {
+            policy,
+            model_store,
+            environment,
+            pins: Default::default(),
+        }
+    }
+}
+
+impl crate::host_admin_remote::SourcePinner for CachedSourcePinner {
+    fn pin_and_size(
+        &self,
+        sources: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Vec<pb::PinnedSource>> + Send + '_>> {
+        Box::pin(async move {
+            let mut pins = self.pins.lock().await;
+            let mut answers = Vec::with_capacity(sources.len());
+            for source in sources {
+                let key = source.strip_prefix(HF_PREFIX).map(|hf| {
+                    let (repo, reference) = split_hf(hf);
+                    format!("{repo}@{}", reference.unwrap_or("main"))
+                });
+                if let Some(answer) = key.as_ref().and_then(|key| pins.get(key)) {
+                    let mut answer = answer.clone();
+                    answer.source = source;
+                    answers.push(answer);
+                    continue;
+                }
+                let mut result = pin_and_size(
+                    &self.policy,
+                    &self.model_store,
+                    &self.environment,
+                    vec![source.clone()],
+                )
+                .await;
+                let answer = result.pop().expect("one source has one answer");
+                if answer.error.is_empty() {
+                    if let Some(key) = key {
+                        pins.insert(key, answer.clone());
+                        pins.insert(answer.pinned.clone(), answer.clone());
+                    }
+                }
+                answers.push(answer);
+            }
+            answers
+        })
+    }
+}
 
 /// The prefix of a Hugging Face source: `hf:<owner/repo>[@<branch, tag or
 /// commit>]`, the reference `main` when none is written. Any other source is
@@ -114,7 +176,7 @@ async fn pin_hf(hub: &Hub, shorthand: &str) -> Result<(String, Option<u64>), Str
         let bytes = files
             .iter()
             .filter(|file| is_weight(&file.path))
-            .try_fold(0u64, |sum, file| sum.checked_add(file.size))?;
+            .try_fold(0u64, |sum, file| sum.checked_add(file.size?))?;
         (bytes > 0).then_some(bytes)
     });
     Ok((format!("{repo}@{commit}"), weights))
