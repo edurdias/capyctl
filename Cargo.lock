@@ -498,6 +498,8 @@ dependencies = [
  "subtle",
  "tempfile",
  "tokio",
+ "tokio-stream",
+ "tonic",
  "tower",
  "ulid",
 ]

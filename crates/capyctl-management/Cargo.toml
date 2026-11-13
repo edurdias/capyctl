@@ -34,3 +34,6 @@ tower = { version = "0.5", features = ["util"] }
 rusqlite.workspace = true
 # SPEC §§10, 17: the load route served with the router's composed report.
 capyctl-router = { path = "../capyctl-router" }
+# ADR 0040 §§9–10: real server-to-host mTLS management tests.
+tonic = { workspace = true, features = ["tls-ring"] }
+tokio-stream = { version = "0.1", features = ["net"] }

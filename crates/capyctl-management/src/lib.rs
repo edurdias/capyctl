@@ -44,6 +44,7 @@ pub mod engines;
 pub mod events;
 // ADR 0040 §§10–11: role-injected host administration.
 pub mod host_admin;
+pub mod host_admin_remote;
 pub mod hosts;
 // Design §9: the inference listener's bind and authentication, for status.
 pub mod inference_listener;

@@ -161,6 +161,8 @@ pub struct ServerRoutes {
     /// ADR 0040 §13: public static routes, including the sign-in page.
     pub ui: Router,
     pub actions: Arc<OwnedActionSource>,
+    pub check_sources: Arc<dyn crate::check::SourceProvider>,
+    pub host_admin: Arc<dyn crate::host_admin::HostAdminSource>,
     /// Whether an enrolled host is connected now (drain answers).
     pub presence: HostPresence,
     pub enrollment: Arc<EnrollmentAuthority>,
@@ -187,12 +189,8 @@ pub fn server(
         [
             routes.ui,
             crate::lifecycle_router(routes.actions.clone()),
-            crate::check::router(
-                routes.actions.configuration().clone(),
-                Arc::new(crate::check::UnavailableSources),
-            ),
-            // ADR 0040 §10: never administer the server machine as a host.
-            crate::host_admin::router(Arc::new(crate::host_admin::UnavailableHostAdmin)),
+            crate::check::router(routes.actions.configuration().clone(), routes.check_sources),
+            crate::host_admin::router(routes.host_admin),
             // SPEC §4.3: the explicit drain of an enrolled host.
             crate::drain::drain_router_with_presence(routes.actions, Vec::new(), routes.presence),
             crate::enrollment::enrollment_router(

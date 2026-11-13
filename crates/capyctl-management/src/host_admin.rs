@@ -89,7 +89,7 @@ impl Failure {
         }
     }
 
-    fn response(self) -> Response {
+    pub(crate) fn response(self) -> Response {
         let status = match self.code.as_str() {
             "invalid_request" | "invalid_config" | "custom_manifest_invalid" => {
                 StatusCode::BAD_REQUEST
