@@ -22,6 +22,9 @@ pub enum Refusal {
     /// Too many requests outstanding, or the session's queue is full;
     /// nothing was sent.
     Busy,
+    /// The complete encoded request exceeds the server-to-host message
+    /// limit; nothing was sent and the control session remains usable.
+    RequestTooLarge,
 }
 
 impl Refusal {
@@ -34,6 +37,7 @@ impl Refusal {
             Self::OutcomeUnknown => "outcome_unknown",
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::Busy => "host_admin_busy",
+            Self::RequestTooLarge => "request_too_large",
         }
     }
 }
@@ -41,6 +45,10 @@ impl Refusal {
 /// ADR 0040 §10: run `op` on `host` and wait at most `deadline` for its
 /// answer. The reply is the host's: `result_json`, `pin_and_size`, or the
 /// host's own refusal in `error_code` and `error_message`.
+///
+/// ADR 0040 §10 / KTD7, KTD11: cancellation or expiry ends only this wait,
+/// not an operation already dispatched to the host. An uncertain outcome
+/// is never retried automatically.
 pub async fn request(
     sessions: &AgentSessions,
     host: &str,

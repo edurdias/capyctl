@@ -236,6 +236,8 @@ async fn query_duplicate_auth_and_control_routes_fail_closed() {
         ("GET", "/management/v1/snapshot", true, 401),
         ("POST", "/management/v1/snapshot", false, 405),
         ("POST", "/management/v1/deployments", false, 404),
+        // ADR 0040 §2 / T16: inference paths are not management resources;
+        // returning 404 does not authenticate or expose a control route.
         ("GET", "/v1/models", false, 404),
         ("GET", "/management/v1/events", false, 404),
     ] {

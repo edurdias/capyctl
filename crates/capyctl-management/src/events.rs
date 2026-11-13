@@ -233,10 +233,14 @@ pub(crate) async fn subscribe(State(state): State<Arc<AppState>>, request: Reque
     };
     let options = state.event_options.clone();
     let deadline = tokio::time::Instant::now() + options.lifetime;
-    let first = match tokio::time::timeout_at(deadline, read(&state, after)).await {
-        Ok(Ok(page)) => page,
-        Ok(Err(e)) => return e.response(),
-        Err(_) => return Failure::Busy.response(),
+    let first = tokio::select! {
+        biased;
+        _ = principal.revoked() => return error(StatusCode::UNAUTHORIZED, "unauthenticated", false),
+        result = tokio::time::timeout_at(deadline, read(&state, after)) => match result {
+            Ok(Ok(page)) => page,
+            Ok(Err(e)) => return e.response(),
+            Err(_) => return Failure::Busy.response(),
+        },
     };
     let (tx, rx) = mpsc::channel(options.channel_capacity);
     tokio::spawn(async move {

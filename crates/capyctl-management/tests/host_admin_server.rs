@@ -490,17 +490,33 @@ fn engine<'a>(list: &'a Value, host: &str, profile: &str) -> Option<&'a Value> {
         .find(|row| row["host_id"] == host && row["profile"] == profile)
 }
 
-async fn add_vllm(router: &Router, host: &str, dir: &Path) -> Value {
-    let env = vllm_env(&dir.join("elsewhere/vllm-env"));
-    let (status, result) = http(
+// ADR 0040 §10 / KTD11 / T32: discovery paths do not authorize execution.
+// Preview only measures files, so this also works before a blocked probe.
+async fn confirmed_vllm_body(router: &Router, host: &str, mut body: Value) -> Value {
+    body["preview"] = json!(true);
+    let (status, preview) = http(
         router,
         "POST",
         &host_uri(host, "/engines"),
-        Some(json!({
-            "path": env, "paths": [dir.join("elsewhere")]
-        })),
+        Some(body.clone()),
     )
     .await;
+    assert_eq!(status, 200, "{preview}");
+    body["preview"] = json!(false);
+    body["digest"] = preview["digest"].clone();
+    body["confirm_name"] = json!("vllm");
+    body
+}
+
+async fn add_vllm(router: &Router, host: &str, dir: &Path) -> Value {
+    let env = vllm_env(&dir.join("elsewhere/vllm-env"));
+    let body = confirmed_vllm_body(
+        router,
+        host,
+        json!({"path": env, "paths": [dir.join("elsewhere")]}),
+    )
+    .await;
+    let (status, result) = http(router, "POST", &host_uri(host, "/engines"), Some(body)).await;
     assert_eq!(status, 200, "{result}");
     assert_eq!(result["published"], "published", "{result}");
     result
@@ -526,13 +542,20 @@ async fn detected_builtin_add_over_http_publishes_in_the_server_engines_list() {
         .unwrap()
         .iter()
         .any(|candidate| candidate["env"] == json!(env) && candidate["engine"] == "vllm"));
-    let (status, added) = http(
+    // ADR 0040 §10 / KTD11 / T32: finding an installation through caller
+    // paths is not permission to execute it without preview confirmation.
+    let body = json!({"path": env, "paths": [a.dir.path().join("elsewhere")]});
+    let (status, refused) = http(
         &router,
         "POST",
         &host_uri(&h.host, "/engines"),
-        Some(json!({"path": env, "paths": [a.dir.path().join("elsewhere")]})),
+        Some(body.clone()),
     )
     .await;
+    assert_ne!(status, 200, "{refused}");
+    assert_eq!(refused["error"]["code"], "confirmation_required");
+    let body = confirmed_vllm_body(&router, &h.host, body).await;
+    let (status, added) = http(&router, "POST", &host_uri(&h.host, "/engines"), Some(body)).await;
     assert_eq!(status, 200, "{added}");
     assert_eq!(added["profile"], "vllm", "{added}");
     assert_eq!(added["published"], "published", "{added}");
@@ -765,7 +788,16 @@ async fn long_real_add_keeps_host_load_reports_flowing() {
     ));
     let router = h.router();
     let uri = host_uri(&h.host, "/engines");
-    let body = json!({"path": env, "paths": [a.dir.path().join("elsewhere")]});
+    let body = confirmed_vllm_body(
+        &router,
+        &h.host,
+        json!({"path": env, "paths": [a.dir.path().join("elsewhere")]}),
+    )
+    .await;
+    assert!(
+        !entered.exists(),
+        "preview must not execute the blocked probe"
+    );
     let asked = tokio::spawn(async move { http(&router, "POST", &uri, Some(body)).await });
     eventually(|| entered.exists()).await;
     let table = h.sessions.load_table();
