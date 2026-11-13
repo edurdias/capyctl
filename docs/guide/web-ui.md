@@ -30,6 +30,21 @@ specific address. On the default loopback address the link works only on the
 machine itself, and the command says that a phone needs the
 [off-box setting](#use-it-from-another-device).
 
+To use a different browser-facing address for one link, give its full origin,
+including `http://` or `https://` and no path:
+
+```bash
+capyctl open ui --address http://100.64.0.21:7443
+```
+
+This changes the link, not the listener; off-box access still needs the setting
+below. For scripts, JSON prints the URL and its expiry (`expires_at_ms`, Unix
+milliseconds), without a QR code:
+
+```bash
+capyctl open ui --format json
+```
+
 A browser that is not signed in, or whose session was revoked, shows a page
 telling you to run `capyctl open ui`.
 

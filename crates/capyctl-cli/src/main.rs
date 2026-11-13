@@ -178,6 +178,28 @@ fn main() -> ExitCode {
             }
         };
     }
+    // ADR 0040 §5: the admin credential stays on this machine; only the
+    // one-time sign-in link is printed for the browser.
+    if let Command::OpenUi { address } = &invocation.command {
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(_) => return ExitCode::from(output::ExitCode::INTERNAL.0 as u8),
+        };
+        return match runtime.block_on(capyctl_cli::open_ui::execute(
+            &state_root,
+            invocation.config.as_deref(),
+            address.as_deref(),
+        )) {
+            Ok(value) => {
+                emit(&invocation.command, &value, format, &context);
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                output::print_error(&err, format);
+                ExitCode::from(err.exit_code().0 as u8)
+            }
+        };
+    }
     // SPEC §4.3: explicit drain, through the server's or the standalone role's
     // management API. Stopping a role itself is a signal (SPEC §14 has no verb).
     if let Command::Drain { host, wait } = &invocation.command {
