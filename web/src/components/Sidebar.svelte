@@ -35,7 +35,7 @@
           use:link
           onclick={onnavigate}
           aria-current={current(section.path, $route) ? 'page' : undefined}
-        ><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d={section.icon} /></svg><span>{section.label}</span>{#if section.path === '/models' && ready !== undefined}<small aria-label={`${ready} models ready`}>{ready}</small>{:else if section.path === '/hosts' && online !== null}<small aria-label={`${online} hosts online`}>{online}</small>{/if}</a
+        ><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d={section.icon} /></svg><span>{section.label}</span>{#if section.path === '/models' && ready !== undefined}<small aria-label={`${ready} of ${$snapshot?.deployments.length ?? 0} models ready`}>{ready}/{$snapshot?.deployments.length ?? 0} ready</small>{:else if section.path === '/hosts' && online !== null}<small aria-label={`${online} hosts online`}>{online} online</small>{/if}</a
         >
       </li>
     {/each}
@@ -68,7 +68,7 @@
   li a {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: 0.5rem;
     padding: 0.5rem 0.75rem;
     border-radius: 6px;
     color: var(--capyctl-text);
@@ -83,7 +83,7 @@
     font-weight: 600;
     box-shadow: inset 3px 0 0 var(--capyctl-accent);
   }
-  small { margin-left: auto; color: var(--capyctl-muted); font-size: 0.75rem; }
+  small { margin-left: auto; color: var(--capyctl-muted); font-size: 0.6875rem; white-space: nowrap; }
   /* ADR 0040 owner decision: More opens the remaining sections above the dock. */
   @media (max-width: 767.98px) {
     .sidebar {

@@ -12,6 +12,7 @@
   import { snapshot } from '../../lib/state';
   let { id }: { id: string } = $props();
   const deployment = $derived($snapshot?.deployments.find((d) => d.id === id));
+  const live = $derived(deployment?.observed_state === 'ready');
   const why = $derived(deployment?.observed_state === 'failed' || Boolean(deployment?.latest_operation?.error_code));
   const since = $derived($snapshot?.operations.find((o) => o.id === deployment?.latest_operation?.id)?.accepted_at);
   let busy = $state<string | null>(null);
@@ -32,7 +33,7 @@
     const ttft = timing(series, 'ttft');
     const tpot = timing(series, 'tpot');
     const requests = timing(series, 'request');
-    return [
+    const readings = [
       { key: 'flight', label: 'In flight', value: load?.router.in_flight ?? null, text: String(load?.router.in_flight ?? '–'), source: 'CapyCTL router' },
       { key: 'waiting', label: 'Waiting', value: load?.router.waiting ?? null, text: String(load?.router.waiting ?? '–'), source: 'CapyCTL router' },
       { key: 'kv', label: 'KV cache', value: kvPercent(load), text: kvPercent(load) === null ? '–' : `${kvPercent(load)!.toFixed(1)}%`, source: 'Fresh engine samples · mean' },
@@ -42,6 +43,9 @@
       { key: 'requests', label: 'Requests measured', value: requests?.count ?? ttft?.count ?? null, text: String(requests?.count ?? ttft?.count ?? '–'), source: requests ? `${requests.source} · ${requests.tier}` : ttft ? `${ttft.source} · ${ttft.tier}` : '' },
       { key: 'duration', label: 'Request p50', value: requests?.p50_seconds ?? null, text: duration(requests?.p50_seconds), source: requests ? `${requests.source} · ${requests.tier}` : '' },
     ];
+    // Retained histograms belong to previous runs when the model is not
+    // ready. Keep them in the explicitly historical disclosure, not live tiles.
+    return live ? readings : readings.map((metric) => ({ ...metric, value: null, text: '–', source: 'Not ready' }));
   }
   // ADR 0040 owner decision 2026-11-13: 24 samples of the existing 5 s
   // reads, only in this browser. Percentiles stay split by their source.
@@ -110,14 +114,14 @@
     {#if deployment.switch}<p class="notice">Making room · {deployment.switch.role === 'target' ? 'Starting after other models release memory' : `Releasing memory for ${deployment.switch.target}`} · {deployment.switch.phase.replaceAll('_', ' ')}</p>{/if}
     {#each deployment.model_sources ?? [] as source (`${source.host_id}:${source.source_key}`)}{#if source.state === 'downloading'}<div class="download panel"><div class="fact"><span>Downloading model · {source.host_id}</span><span>{gib(source.bytes_done)} of {gib(source.bytes_total)}</span></div><progress aria-label="Model download" value={source.bytes_done} max={source.bytes_total || 1}></progress></div>{/if}{/each}
 
-    <div class="section-heading"><h2>Live readings</h2><span class="muted">5 s refresh · trends from this visit</span></div>
+    <div class="section-heading"><h2>{live ? 'Live readings' : 'Readings'}</h2><span class="muted">{live ? '5 s refresh · trends from this visit' : 'Not ready · live readings paused'}</span></div>
     <div class="metrics">
       {#each metrics() as metric (metric.key)}
-        <article class="metric panel"><span class="eyebrow">{metric.label}</span><strong class="numeral">{metric.text}</strong><svg viewBox="0 0 100 28" preserveAspectRatio="none" aria-label={`${metric.label} trend, ${(samples[metric.key] ?? []).filter((v) => v !== null).length} readings`} role="img"><polyline points={sparkPoints(samples[metric.key] ?? [])} fill="none" stroke="currentColor" stroke-width="1.5" vector-effect="non-scaling-stroke" /></svg><small class="muted">{metric.source || 'No measurements'}</small></article>
+        <article class="metric panel"><span class="eyebrow">{metric.label}</span><strong class="numeral">{metric.text}</strong><svg viewBox="0 0 100 28" preserveAspectRatio="none" aria-label={`${metric.label} trend, ${live ? (samples[metric.key] ?? []).filter((v) => v !== null).length : 0} readings`} role="img"><polyline points={live ? sparkPoints(samples[metric.key] ?? []) : ''} fill="none" stroke="currentColor" stroke-width="1.5" vector-effect="non-scaling-stroke" /></svg><small class="muted">{metric.source || 'No measurements'}</small></article>
       {/each}
     </div>
     {#if series.length}
-      <details class="measurements"><summary>All latency readings by source</summary><div class="table-scroll"><table><thead><tr><th>Measure</th><th>Source</th><th>Requests</th><th>p50</th><th>p95</th></tr></thead><tbody>{#each series as row, index (index)}<tr><td>{row.name.replaceAll('_', ' ')}</td><td>{row.source} · {row.tier}</td><td>{row.count}</td><td>{duration(row.p50_seconds)}</td><td>{duration(row.p95_seconds)}</td></tr>{/each}</tbody></table></div></details>
+      <details class="measurements"><summary>{live ? 'All latency readings by source' : 'Previous latency readings by source'}</summary><div class="table-scroll"><table><thead><tr><th>Measure</th><th>Source</th><th>Requests</th><th>p50</th><th>p95</th></tr></thead><tbody>{#each series as row, index (index)}<tr><td>{row.name.replaceAll('_', ' ')}</td><td>{row.source} · {row.tier}</td><td>{row.count}</td><td>{duration(row.p50_seconds)}</td><td>{duration(row.p95_seconds)}</td></tr>{/each}</tbody></table></div></details>
     {/if}
     {#if deployment.instances.length > 1}
       <h2>Instances</h2><div class="instances">{#each deployment.instances as instance (instance.index)}<article class="panel" data-instance={instance.index}><div class="facts"><strong>Instance {instance.index}</strong><span>{instance.host_id ?? 'Not placed'}</span><StateBadge state={instance.observed_state} /></div><div class="instance-actions"><ActionBar {deployment} instance={instance.index} /><button type="button" onclick={() => readLog(instance.index)}>Engine log</button></div></article>{/each}</div>

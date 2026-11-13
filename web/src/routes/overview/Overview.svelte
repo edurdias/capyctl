@@ -28,7 +28,7 @@
 
 <section class="overview">
   <h1>Overview</h1>
-  <p class="status-line">{hosts?.filter((h) => !h.revoked).length ?? '–'} host{hosts?.length === 1 ? '' : 's'} · <span class="online">{hosts?.filter((h) => h.online && !h.revoked).length ?? '–'} online</span> · {gib(free)} free of {gib(capacity)} · {count('ready')} ready · {count('parked')} parked · {count('stopped')} stopped{#if count('failed')} · <span class="failed">{count('failed')} failed</span>{/if} · {load?.deployments.reduce((sum, d) => sum + d.router.in_flight, 0) ?? '–'} in flight</p>
+  <p class="status-line">{`${hosts?.filter((h) => !h.revoked).length ?? '–'} host${hosts?.filter((h) => !h.revoked).length === 1 ? '' : 's'} · `}<span class="online">{hosts?.filter((h) => h.online && !h.revoked).length ?? '–'} online</span>{` · ${gib(free)} free of ${gib(capacity)} · ${count('ready')} ready · ${count('parked')} parked · ${count('stopped')} stopped`}{#if count('failed')}<span class="failed">{` · ${count('failed')} failed`}</span>{/if}{` · ${load?.deployments.reduce((sum, d) => sum + d.router.in_flight, 0) ?? '–'} in flight`}</p>
 
   <h2>Hosts</h2>
   {#if hosts === null}

@@ -170,6 +170,38 @@ it('derives per-stream tok/s from the served inter-token p50 and renders fresh K
   expect(card.textContent).toContain('tok/s / stream derived');
   expect(card.querySelectorAll('.metric strong')[1].textContent).toBe('40.0');
   expect(card.textContent).toContain('3 in flight · 2 waiting');
-  expect(card.querySelector('.support .fact > span:first-child')?.textContent).toBe('KV');
-  expect(card.querySelector('.support .fact > span:last-child')?.textContent).toBe('25.0%');
+  expect(card.querySelector('.kv > span')?.textContent).toBe('KV');
+  expect(card.querySelector('.kv > strong')?.textContent).toBe('25.0%');
+});
+
+describe('U20 current versus retained measurements', () => {
+  function retainedLatency() {
+    return json({ deployments: [{ deployment_id: DEPLOYMENT_ID, instances: [{ series: [
+      { name: 'router_time_to_first_content', tier: 'router', source: 'capyctl', count: 12, p50_seconds: 0.21, p95_seconds: 0.53 },
+      { name: 'engine_inter_token_latency', tier: 'engine', source: 'engine', count: 12, p50_seconds: 0.0295, p95_seconds: 0.0385 },
+    ] }] }] });
+  }
+  it.each<ObservedState>(['parked', 'stopped', 'failed', 'starting'])('does not present retained latency or throughput as current for a %s model', async (state) => {
+    role({ snapshots: [snapshotWith([deployment({ observed_state: state })])], route: (call) => call.url.startsWith('/management/v1/metrics/latency') ? retainedLatency() : undefined });
+    await open('/');
+    const card = document.querySelector('[data-model="chat"]')!;
+    expect([...card.querySelectorAll('.metric strong')].map((value) => value.textContent)).toEqual(['–', '–']);
+  });
+  it.each<ObservedState>(['failed', 'stopped'])('does not call retained %s-model measurements live', async (state) => {
+    role({ snapshots: [snapshotWith([deployment({ observed_state: state })])], route: (call) => call.url.startsWith('/management/v1/metrics/latency') ? retainedLatency() : undefined });
+    await open(`/models/${DEPLOYMENT_ID}`);
+    expect([...document.querySelectorAll('.metrics .numeral')].map((value) => value.textContent)).toEqual(Array(8).fill('–'));
+    expect(document.querySelector('.section-heading')?.textContent).toContain('Not ready');
+    expect(document.querySelector('.measurements summary')?.textContent).toContain('Previous');
+  });
+
+  it('labels sidebar counts and renders every status separator with spaces', async () => {
+    role({ snapshots: [snapshotWith([deployment(), deployment({ id: 'off', observed_state: 'stopped' }), deployment({ id: 'bad', observed_state: 'failed' })])] });
+    await open('/');
+    expect(document.querySelector('#sidebar a[href="/ui/models"] small')?.textContent).toBe('1/3 ready');
+    expect(document.querySelector('#sidebar a[href="/ui/hosts"] small')?.textContent).toBe('1 online');
+    const status = document.querySelector('.status-line')!.textContent!;
+    expect(status).toContain('1 stopped · 1 failed · ');
+    expect(status.split(' · ')).toHaveLength(8);
+  });
 });
