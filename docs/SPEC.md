@@ -831,9 +831,9 @@ An extraction deployment on a custom profile whose manifest declares
 `api: extractions` and the required `field_types`:
 
 ```yaml
-name: my-extractor
-engine: capyctl-extract
-model: my-extraction-checkpoint
+name: extract-4b
+engine: shardio-extract
+model: ShardioAI/extract-4b
 api: extractions
 resources: {gpu: 16GiB, ram: 8GiB}
 ```

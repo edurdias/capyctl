@@ -1,7 +1,7 @@
 # Extraction records
 
 **Status: proposed, follow-up release only. Not part of 0.2.0 or the initial
-`capyctl-extract-4b` release.** ADR 0041's nine field types and wire contract remain
+`ShardioAI/extract-4b` release.** ADR 0041's nine field types and wire contract remain
 unchanged. This note proposes a tenth type; it does not authorize implementation,
 training, additional hardware use or changes to current readiness checks.
 

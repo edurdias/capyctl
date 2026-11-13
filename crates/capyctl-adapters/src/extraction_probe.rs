@@ -557,7 +557,7 @@ mod tests {
 
     fn engine() -> Value {
         json!({
-            "model": "served",
+            "model": "extract-4b",
             "answers": {
                 "order_id": {"type": "text", "value": "A-88412", "guess": "A-88412", "span": [6, 13], "p_null": 0.1, "confidence": 0.5},
                 "amount_paid": {"type": "number", "value": 649.0, "guess": 649.0, "p_null": 0.1, "confidence": 0.5},
@@ -623,9 +623,9 @@ mod tests {
     #[test]
     fn exact_fixed_request() {
         assert_eq!(
-            request("served", &FieldType::ALL),
+            request("extract-4b", &FieldType::ALL),
             json!({
-                "model": "served",
+                "model": "extract-4b",
                 "state": "Order A-88412 was delivered on 2026-09-28 at 14:30 with a cracked screen and a dented corner. The customer paid 649.00 USD and wrote on 2026-10-09. Returns logged on the last five days: 12, 15, 11, 14, 13.",
                 "reference_date": "2026-10-09",
                 "fields": {
@@ -647,7 +647,7 @@ mod tests {
     #[test]
     fn declared_types_choose_exactly_their_fields() {
         for (kind, field) in FIELDS {
-            let request = request("served", &[kind]);
+            let request = request("extract-4b", &[kind]);
             let fields = request["fields"].as_object().unwrap();
             assert_eq!(fields.len(), 1);
             assert_eq!(fields[field]["type"], kind.name());
@@ -665,7 +665,7 @@ mod tests {
             [FieldType::Text, FieldType::Estimate]
         );
         assert_eq!(
-            request("served", &[FieldType::Text, FieldType::Text])["fields"]
+            request("extract-4b", &[FieldType::Text, FieldType::Text])["fields"]
                 .as_object()
                 .unwrap()
                 .len(),

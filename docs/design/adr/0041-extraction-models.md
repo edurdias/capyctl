@@ -2,7 +2,7 @@
 
 **Status:** Accepted (owner decisions 2026-11-04 and amendments of 2026-11-10 and 2026-11-12).
 Target release: 0.2.0, with `integration/0.2.0` landing first and extraction support
-on top, alongside `capyctl-extract-4b`. The first engine is
+on top, alongside `ShardioAI/extract-4b` (served as `extract-4b`). The first engine is
 CapyCTL's own extraction server run as a custom engine (ADR 0031); no native engine
 serves extractions, and every native engine is refused until one does and is qualified.
 **Amends (with the implementation):** `SPEC.md` §6.1 (readiness of an extraction model and
@@ -259,7 +259,7 @@ includes both schema copies, markers, reference/control text and candidate suffi
 `passes` counts full-prefix field groups, not cached candidate-suffix evaluations.
 These are engine accounting semantics, not new router completion requirements.
 
-For `capyctl-extract-4b`, the context is 8192 tokens and truncation is reported.
+For `ShardioAI/extract-4b`, the context is 8192 tokens and truncation is reported.
 PDF input and extracting text from images are not supported. Image-only requests
 for `text` or `list` with `items: text` are rejected before inference with
 `field_unsupported_input`; images still support the other types. This is
@@ -406,9 +406,10 @@ fields the model answers without sending one.
 
 ### 9. CapyCTL's extraction model
 
-The model, `capyctl-extract-4b`, and its server live in their own repository,
-`capyctl-extract` (a private GitHub repository until weights ship; names decided by the
-owner 2026-11-04).
+The model, `ShardioAI/extract-4b` on Hugging Face (served as `extract-4b`), and
+its `shardio-extract` server live in the private GitHub repository
+[`ShardioAI/extract`](https://github.com/ShardioAI/extract). The owner transferred
+it from `edurdias/capyctl-extract`; see the ownership amendment below.
 CapyCTL depends only on its server speaking §3's contract and declaring its types in a
 custom-engine manifest (§2). The original decisions below are superseded where noted
 by the amendment of 2026-11-10:
@@ -568,3 +569,28 @@ Table/record extraction is deferred to a follow-up release. It is not another
 spelling of `list`, is not an accepted field type, and does not change this
 release's probes. The proposed contract, model approach and remaining decisions
 are in [Extraction records](../../specs/extraction-records.md).
+
+## Amendment of 2026-11-12: ShardioAI ownership and publication
+
+The owner moved the model project under ShardioAI. The private GitHub repository
+is now [`ShardioAI/extract`](https://github.com/ShardioAI/extract), transferred
+from `edurdias/capyctl-extract`. This supersedes the repository/server/model names
+recorded in the original 2026-11-04 decisions, without rewriting their history.
+
+The public Hugging Face model ID is `ShardioAI/extract-4b`; CapyCTL serves it as
+`extract-4b`. The Python package is `shardio_extract`, with module commands
+`python -m shardio_extract.<module>` and the `shardio-extract` server executable.
+There is no old-package compatibility alias. Existing checkpoint metadata and
+state-dict keys remain loadable without migration.
+
+Packaging defaults to `ShardioAI/extract-4b`, retains `--publisher ORG/REPO`,
+and never uploads. Hugging Face publication waits for the owner's approval;
+the name is not a claim that weights have been published or qualified. This
+amendment does not release either project or change its version.
+
+Approved host directories, including `~/capyctl-extract-train-venv`,
+`~/capyctl-extract-serve-venv`, `~/capyctl-extract-runs/` and
+`~/capyctl-extract-src-*`, retain their names. Renaming the code does not
+authorize changing an engine environment. The wire contract, nine field types,
+readiness/wake checks, and outstanding live/model-quality gates are unchanged.
+

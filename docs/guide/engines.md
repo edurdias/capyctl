@@ -1034,15 +1034,16 @@ tell the two apart. A basal release that reports its running and queued
 requests can be given an `idle` entry in a new manifest, with no CapyCTL
 change.
 
-### Example: CapyCTL's extraction server
+### Example: ShardioAI's extraction server
 
-CapyCTL's own model, `capyctl-extract-4b`, and its server, `capyctl-extract`,
-live in a separate repository. Its recipe is selected after pilot training;
-the main run and live server qualification remain release gates. This is the
-custom-engine contract for it, not an installation recipe or a claim that
-released weights are available. Table/record extraction is deferred.
+The model `ShardioAI/extract-4b`, served as `extract-4b` by `shardio-extract`,
+lives in the private repository
+[`ShardioAI/extract`](https://github.com/ShardioAI/extract). Publication waits
+for the owner; this name is not a claim that released weights are available.
+Model quality and live server qualification remain release gates. This is the
+custom-engine contract, not an installation recipe. Table/record extraction is deferred.
 
-```yaml title="capyctl-extract.yaml"
+```yaml title="shardio-extract.yaml"
 kind: custom_engine
 schema_version: 1
 api: extractions
@@ -1056,8 +1057,8 @@ Once the server and a trained checkpoint are available in an approved
 environment, registration uses the normal custom-engine command:
 
 ```bash
-capyctl engine add --custom ~/capyctl-extract-venv/bin/capyctl-extract \
-  --name capyctl-extract --manifest capyctl-extract.yaml
+capyctl engine add --custom ~/capyctl-extract-serve-venv/bin/shardio-extract \
+  --name shardio-extract --manifest shardio-extract.yaml
 ```
 
 The confirmation shows `field_types` beside `api`, so the administrator
@@ -1066,8 +1067,9 @@ support, remove every extraction engine with `capyctl engine remove`.
 Older releases strictly read `custom-engines.yaml` and refuse the whole
 file if a manifest contains `field_types`, preventing role startup.
 
-The executable path illustrates an installation in a virtual environment;
-CapyCTL fingerprints that environment and its interpreter. The manifest
+The approved serving directory keeps its original name; renaming the package does
+not authorize reinstalling or changing that environment. CapyCTL fingerprints
+the executable, environment and interpreter. The manifest
 passes loopback `{host}`, the assigned `{port}`, the checkpoint directory
 and the served name directly, never through a shell. This example has no
 `{api_key}` or `idle`: the engine listener is unauthenticated on loopback,
@@ -1078,9 +1080,9 @@ if another extraction manifest supplies an idle signal. That signal can
 settle complete engine error answers; without it they also wait for stop.
 
 ```yaml title="extractor.yaml"
-name: my-extractor
-engine: capyctl-extract
-model: my-extraction-checkpoint
+name: extract-4b
+engine: shardio-extract
+model: ShardioAI/extract-4b
 api: extractions
 resources: {gpu: 16GiB, ram: 8GiB}
 ```
@@ -1090,8 +1092,8 @@ checkpoint must be under your models directory, and resources must cover
 its measured peak. The launch's argument shape is:
 
 ```text
-/home/me/capyctl-extract-venv/bin/capyctl-extract --host 127.0.0.1 --port <port> \
-    --model /home/me/models/my-extraction-checkpoint --served-name <served-name>
+/home/me/capyctl-extract-serve-venv/bin/shardio-extract --host 127.0.0.1 --port <port> \
+    --model /home/me/models/ShardioAI/extract-4b --served-name extract-4b
 ```
 
 The port, `/health`, the fixed extraction of every declared type and the

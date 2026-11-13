@@ -446,7 +446,7 @@ A deployment with `api: extractions`
 curl -s http://127.0.0.1:8443/v1/systemone \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{
-    "model": "my-extractor",
+    "model": "extract-4b",
     "state": "Order A-88412 cost 649.00 USD and arrived on 2026-09-28.",
     "reference_date": "2026-10-09",
     "fields": {
@@ -523,7 +523,7 @@ array for percentiles 1 through 99; a forecast has one such array per step.
 `mode` and `computation` are not public response members; internal diagnostics
 use `raw['_mode']` and `raw['_computation']`.
 
-The `capyctl-extract-4b` model has an 8192-token context and reports truncation.
+The `ShardioAI/extract-4b` model (served as `extract-4b`) has an 8192-token context and reports truncation.
 It does not support PDFs or extracting text from images. Image-only `text`
 and text-list fields fail before inference with `field_unsupported_input`;
 images still support other field types. This is engine validation for that

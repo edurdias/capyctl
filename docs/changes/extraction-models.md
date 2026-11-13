@@ -181,6 +181,23 @@ a future `/api/alpha/extractions` adapter is outside 0.2.0. Adapter and router
 regressions cover non-scalar thresholds without tightening other irrelevant
 settings.
 
+The owner moved the model project to the private GitHub repository
+[`ShardioAI/extract`](https://github.com/ShardioAI/extract), transferred from
+`edurdias/capyctl-extract`. Its Hugging Face ID is `ShardioAI/extract-4b`, served
+as `extract-4b` by `shardio-extract`; Python module commands use
+`shardio_extract`. ADR 0041's ownership amendment supersedes the old names
+without rewriting the smoke/qualification records above. Packaging defaults to
+that Hub ID and never uploads; publication waits for the owner. Approved
+host environment/run/source paths keep their original names. No repository or
+Hub resource is created by this code change, and no release/version change is
+implied. The guide and extraction probe/router fixtures use the new identities;
+CPU and Fake-engine tests remain non-qualification.
+
+Rename verification on 2026-11-12: `scripts/ci-local.sh` passed all eight fast
+steps under its four-core/16 GiB limits; the extraction router suite passed
+all 10 tests, including raw-byte model-ID rewriting from `ShardioAI/extract-4b`
+to served name `extract-4b`. No live host was accessed for this rename.
+
 # Release note: Extraction models
 
 - **Typed extraction at `POST /v1/systemone`.** A deployment with

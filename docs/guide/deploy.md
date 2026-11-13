@@ -280,7 +280,7 @@ Only a [custom engine](engines.md#custom-engines) with `api: extractions`
 can serve it. Every native engine at every version is refused with
 `capability_missing:extractions`. The manifest declares the types it answers:
 
-```yaml title="capyctl-extract.yaml"
+```yaml title="shardio-extract.yaml"
 kind: custom_engine
 schema_version: 1
 api: extractions
@@ -290,12 +290,12 @@ args: [--host, "{host}", --port, "{port}", --model, "{model_dir}", --served-name
 health: /health
 ```
 
-For a registered profile named `capyctl-extract`, a deployment might be:
+For a registered profile named `shardio-extract`, a deployment might be:
 
 ```yaml title="extractor.yaml"
-name: my-extractor
-engine: capyctl-extract
-model: my-extraction-checkpoint
+name: extract-4b
+engine: shardio-extract
+model: ShardioAI/extract-4b
 api: extractions
 resources: {gpu: 16GiB, ram: 8GiB}
 ```
@@ -345,10 +345,11 @@ forecasts have an inclusive one-step tolerance, probabilities an inclusive
 stops the instance. With restart-only residency and no LMCache, a restart
 records a new reference.
 
-**CapyCTL's own extraction model is not live-qualified.**
-The model is `capyctl-extract-4b` and its server `capyctl-extract`; both live in
-a separate repository. Its recipe is selected after pilot training; the main
-training run and first qualification on host A remain release gates. CPU and
+**ShardioAI's extraction model is not live-qualified or published.**
+The model ID is `ShardioAI/extract-4b`, served as `extract-4b` by `shardio-extract`;
+source lives in the private repository
+[`ShardioAI/extract`](https://github.com/ShardioAI/extract). Publication waits for
+the owner. Model quality and qualification on host A remain release gates. CPU and
 fake-engine tests are not qualification. Table/record extraction is deferred
 to a follow-up release.
 
