@@ -56,7 +56,7 @@ function checkWith(fit: Pick<Fit, 'verdict'> & Partial<Fit>) {
 const SOURCE_CONFIG = { name: 'qwen', engine: 'vllm', model: { hf: 'Qwen/Qwen3-4B' } };
 const SOURCE_YAML = '# accepted source\nname: qwen\nengine: vllm\nmodel: {hf: Qwen/Qwen3-4B}\n';
 
-function sourceBody(revision = '4', config: Record<string, unknown> = SOURCE_CONFIG, yaml = SOURCE_YAML) {
+function sourceBody(revision: number | string = 4, config: Record<string, unknown> = SOURCE_CONFIG, yaml = SOURCE_YAML) {
   return { api_version: '1', deployment_id: DEPLOYMENT_ID, revision, config, yaml };
 }
 
@@ -456,7 +456,7 @@ describe('edit a model', () => {
       snapshots: [snapshotWith([])],
       route: (call) => {
         if (call.url === SOURCE) {
-          return json(sourceBody('31'));
+          return json(sourceBody(31));
         }
         if (call.url === CHECK) {
           expect(JSON.parse(call.body ?? '{}')).toEqual({ yaml: SOURCE_YAML });
@@ -491,7 +491,7 @@ describe('edit a model', () => {
       route: (call) => {
         if (call.url === SOURCE) {
           const config = { ...SOURCE_CONFIG, engine_config: { args: ['--api-key=[redacted]'] } };
-          return json(sourceBody('4', config, stringify(config)));
+          return json(sourceBody(4, config, stringify(config)));
         }
         return call.url === CHECK ? checkWith({ verdict: 'fits' })(call) : undefined;
       },

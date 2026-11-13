@@ -21,7 +21,7 @@
   async function load(): Promise<void> {
     loadError = null;
     try {
-      const view = await request<{ revision: string; config: Record<string, unknown>; yaml: string }>(DEPLOYMENTS.source(id));
+      const view = await request<{ revision: number | string; config: Record<string, unknown>; yaml: string }>(DEPLOYMENTS.source(id));
       text = view.yaml;
       revision = Number(view.revision);
       error = null;
