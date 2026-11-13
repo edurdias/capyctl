@@ -230,6 +230,7 @@ async fn both_roles_compose_public_ui_and_authorized_management_without_panickin
             ui: router_with_assets::<Fixed>(),
             actions: actions.clone(),
             check_sources: Arc::new(capyctl_management::check::UnavailableSources),
+            host_admin: Arc::new(capyctl_management::host_admin::UnavailableHostAdmin),
             host_names: vec!["lab".into()],
             installations: installations.clone(),
             engine_logs: StandaloneEngineLogs::new(owner.clone(), dir.path().join("logs")),
@@ -251,12 +252,18 @@ async fn both_roles_compose_public_ui_and_authorized_management_without_panickin
         capyctl_agent::identity::CertificateAuthority::generate(100).unwrap(),
     ));
     let sessions = AgentSessions::new(authority.clone());
+    let host_admin = capyctl_management::host_admin_remote::RemoteHostAdmin::new(
+        owner.clone(),
+        sessions.clone(),
+    );
     let server = compose::server(
         verifier("server.sqlite3"),
         None,
         ServerRoutes {
             ui: router_with_assets::<Fixed>(),
             actions,
+            check_sources: host_admin.clone(),
+            host_admin,
             presence: Arc::new(|_: &str| true),
             enrollment: authority,
             bootstrap_address: "https://controller.example:7444".into(),

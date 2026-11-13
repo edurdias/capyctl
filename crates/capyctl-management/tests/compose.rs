@@ -124,12 +124,18 @@ async fn roles() -> Roles {
         capyctl_agent::identity::CertificateAuthority::generate(100).unwrap(),
     ));
     let sessions = AgentSessions::new(authority.clone());
+    let host_admin = capyctl_management::host_admin_remote::RemoteHostAdmin::new(
+        owner.clone(),
+        sessions.clone(),
+    );
     let server = compose::server(
         verifier(dir.path(), "server-sessions.sqlite3"),
         None,
         ServerRoutes {
             ui: Router::new().route("/ui/", axum::routing::get(|| async { "sign in" })),
             actions,
+            check_sources: host_admin.clone(),
+            host_admin,
             presence: Arc::new(|_: &str| true),
             enrollment: authority,
             bootstrap_address: "https://controller.example:7444".into(),

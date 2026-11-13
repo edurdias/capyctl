@@ -31,11 +31,18 @@ engine, signed in from a phone over a non-loopback address, before a release shi
 U8 mounts host-scoped engine detection, built-in registration and removal, custom-engine
 preview and confirmation, model-copy listing and explicit pruning, and effective host
 configuration. Standalone uses the shared agent operations and one in-process control
-handler under the same mutation lock as the CLI socket. A server mounts the routes but
-refuses them until U9b supplies its remote provider; it never administers the server's
-own machine. Custom confirmation binds the host, name, manifest, settings, measured
-installation and change revision. On standalone, effective host configuration describes
-the synthesized running host document rather than a nonexistent host.yaml.
+handler under the same mutation lock as the CLI socket. Servers carry these operations
+over the chosen host's correlated control session, gated by `host_admin`; they never
+administer the server's own machine. Adds, confirmations and removal wait up to
+180 seconds, other operations up to 30 seconds. Offline hosts refuse promptly with
+`observation_stale`; lost sessions answer `outcome_unknown`, without automatic retry.
+Removal answers 202 after publication; concurrent engine reads show `retiring` until
+the host publishes its removal. Custom confirmation
+binds the host, name, manifest, settings, measured installation and change revision.
+On standalone, effective host configuration describes the synthesized running host
+document rather than a nonexistent host.yaml; on servers it describes the stored
+approved document, available without contacting the host. Server deployment checks pin
+and size through the chosen host using that host's model-source endpoint and token.
 
 # Release note: New features
 

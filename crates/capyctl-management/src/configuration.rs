@@ -93,11 +93,16 @@ pub enum ConfigurationFailure {
     ModelSourcePending,
     /// ADR 0008: the declared remote model source failed terminally.
     ModelSourceFailed,
+    /// ADR 0040 §§9–10: preserve a chosen host's administration refusal.
+    HostAdmin(crate::host_admin::Failure),
     Internal,
 }
 impl ConfigurationFailure {
     pub(crate) fn response(self) -> Response {
         use ConfigurationFailure::*;
+        if let HostAdmin(failure) = self {
+            return failure.response();
+        }
         if let InvalidConfigReason { path, reason } = &self {
             let message = format!("Invalid deployment configuration: {reason}");
             return (
@@ -179,7 +184,8 @@ impl ConfigurationFailure {
             | CapacityBlockedBecause(_)
             | HostIneligible(_)
             | CheckpointUnusable(_)
-            | ProfileNotPublished { .. } => {
+            | ProfileNotPublished { .. }
+            | HostAdmin(_) => {
                 unreachable!("answered above")
             }
             LifecycleConflict => (

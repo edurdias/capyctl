@@ -734,6 +734,10 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
             .map_err(|_| unavailable())?,
     )
     .map_err(|_| unavailable())?;
+    let host_admin = capyctl_management::host_admin_remote::RemoteHostAdmin::new(
+        owner.clone(),
+        sessions.clone(),
+    );
     // ADR 0040 §2: every management route is authorized at one point.
     let management = capyctl_management::compose::server(
         session_verifier,
@@ -741,6 +745,8 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         capyctl_management::compose::ServerRoutes {
             ui: capyctl_webui::router(),
             actions,
+            check_sources: host_admin.clone(),
+            host_admin,
             presence,
             enrollment: authority.clone(),
             bootstrap_address: config.bootstrap_address.clone(),
