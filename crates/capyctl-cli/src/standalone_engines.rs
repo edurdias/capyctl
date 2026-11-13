@@ -5,6 +5,8 @@
 //! writes engines.yaml; the CLI rewrites it once the retirement is confirmed
 //! and then asks for the reload. The standalone document is never written.
 //! Nothing here reaches an engine.
+mod admin;
+pub use admin::StandaloneAdmin;
 use capyctl_agent::control_socket::{ControlHandler, ControlRequest};
 use capyctl_config::model_settings::ModelSettings;
 use capyctl_config::registration::{check_profile, EnginesFile, ENVIRONMENT_PROFILES};

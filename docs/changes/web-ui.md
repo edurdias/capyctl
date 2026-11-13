@@ -28,6 +28,15 @@ app's unit tests. CPU and Fake-engine tests are not qualification. The live
 check still needed: on the lab hosts, a server with a host against at least one native
 engine, signed in from a phone over a non-loopback address, before a release ships the UI.
 
+U8 mounts host-scoped engine detection, built-in registration and removal, custom-engine
+preview and confirmation, model-copy listing and explicit pruning, and effective host
+configuration. Standalone uses the shared agent operations and one in-process control
+handler under the same mutation lock as the CLI socket. A server mounts the routes but
+refuses them until U9b supplies its remote provider; it never administers the server's
+own machine. Custom confirmation binds the host, name, manifest, settings, measured
+installation and change revision. On standalone, effective host configuration describes
+the synthesized running host document rather than a nonexistent host.yaml.
+
 # Release note: New features
 
 - **A web UI.** A standalone role and a server now serve a web UI at `/ui/` on their
