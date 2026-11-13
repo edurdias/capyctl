@@ -84,6 +84,10 @@ export function role(options: { snapshots: Snapshot[]; route?: Route }) {
     }
     if (call.url === '/management/v1/events') {
       const stream = new StreamMock(call.signal);
+      if (!call.headers.has('Last-Event-ID')) {
+        stream.raw(': history complete\n\n');
+        return stream.response;
+      }
       streams.push(stream);
       return stream.response;
     }

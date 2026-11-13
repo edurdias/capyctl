@@ -72,6 +72,11 @@ describe('lifecycle actions', () => {
       snapshots: [snapshotWith([deployment({ actions: [{ action: 'start', available: false, reason: 'runtime_retained' }] })])],
     });
     await open('/');
+    const menu = document.querySelector<HTMLDetailsElement>('[data-model="chat"] details.overflow')!;
+    expect(menu.open).toBe(false);
+    menu.querySelector('summary')!.click();
+    await tick();
+    expect(menu.open).toBe(true);
     expect(button('Start').disabled).toBe(true);
     expect(document.querySelector('.why')?.textContent).toBe('The model’s engine is still being cleaned up.');
   });
@@ -104,6 +109,8 @@ describe('lifecycle actions', () => {
       },
     });
     await open('/');
+    document.querySelector<HTMLDetailsElement>('[data-model="chat"] details.overflow summary')!.click();
+    await tick();
     expect(buttons('Delete')).toHaveLength(0);
     button('Stop and delete').click();
     await tick();

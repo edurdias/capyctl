@@ -19,6 +19,16 @@
   /* Not in the site palette: a failed model must read differently from a
      stopped one. Red 400 on stone 900, red 700 on stone 50 (both over 4.5:1). */
   --capyctl-danger: #f87171;
+  /* ADR 0040, owner decision 2026-11-13: state is not brand. */
+  --state-ready: #4ade80;
+  --state-starting: #60a5fa;
+  --state-changing: #facc15;
+  --memory-0: #67b7cc;
+  --memory-1: #a78bfa;
+  --memory-2: #6ee7b7;
+  --memory-3: #e879a8;
+  --memory-4: #a3b86c;
+  --memory-5: #8ca8e8;
 
   --capyctl-font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   --capyctl-font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
@@ -43,5 +53,8 @@
     --capyctl-code-muted: #a8a29e;
     --capyctl-code-accent: #fb923c;
     --capyctl-danger: #b91c1c;
+    --state-ready: #15803d;
+    --state-starting: #1d4ed8;
+    --state-changing: #a16207;
   }
 }

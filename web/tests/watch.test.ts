@@ -60,6 +60,7 @@ describe('model detail', () => {
           : undefined,
     });
     await open(`/models/${DEPLOYMENT_ID}`);
+    document.querySelector<HTMLDetailsElement>('.disclosure:last-child summary')!.click();
     button('Engine log').click();
     await tick();
     const pre = document.querySelector('pre.log');
@@ -75,6 +76,7 @@ describe('model detail', () => {
       route: (call) => (call.url === LOG ? managementError(404, 'not_found') : undefined),
     });
     await open(`/models/${DEPLOYMENT_ID}`);
+    document.querySelector<HTMLDetailsElement>('.disclosure:last-child summary')!.click();
     button('Engine log').click();
     await tick();
     expect(document.body.textContent).toContain('has no running engine');

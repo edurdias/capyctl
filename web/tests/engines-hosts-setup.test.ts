@@ -37,6 +37,8 @@ function preview(executable: string, digest: string): Response {
 }
 
 async function fillCustom(): Promise<void> {
+  button('Add custom engine…').click();
+  await tick();
   await type('custom-name', 'my-engine');
   await type('custom-executable', '/opt/engine/serve');
   await type('custom-manifest', 'api: openai\n');
@@ -108,6 +110,8 @@ describe('host administration', () => {
       route: (call) => (call.url.startsWith(`${HOST}/engines/detected`) ? managementError(409, 'host_capability_missing:host_admin') : undefined),
     });
     await open('/engines');
+    button('Detect engines').click();
+    await tick();
     button('Detect').click();
     await tick();
     expect(text()).toContain('Update CapyCTL on the host and restart it, then try again.');

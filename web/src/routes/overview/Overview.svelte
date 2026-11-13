@@ -7,12 +7,17 @@
   import { readHosts, readLoad, type HostRow, type LoadReport } from '../../lib/reads';
   import { href, link } from '../../lib/router';
   import { snapshot } from '../../lib/state';
+  import { gib } from '../../lib/presentation';
 
   // SPEC R10, F3: host memory, the models with their states and actions, and
   // recent activity, live from the snapshot, the event stream and the
   // load and host reads.
   let hosts = $state<HostRow[] | null>(null);
   let load = $state<LoadReport | null>(null);
+  const domains = $derived((hosts ?? []).filter((h) => !h.revoked && h.online).flatMap((h) => h.session?.domains ?? []).filter((d) => d.capacity_bytes > 0 && d.available_bytes >= 0));
+  const free = $derived(domains.reduce((sum, d) => sum + d.available_bytes, 0));
+  const capacity = $derived(domains.reduce((sum, d) => sum + d.capacity_bytes, 0));
+  const count = (state: string) => $snapshot?.deployments.filter((d) => d.observed_state === state).length ?? 0;
 
   onMount(() =>
     livePoll(async () => {
@@ -23,6 +28,7 @@
 
 <section class="overview">
   <h1>Overview</h1>
+  <p class="status-line">{`${hosts?.filter((h) => !h.revoked).length ?? '–'} host${hosts?.filter((h) => !h.revoked).length === 1 ? '' : 's'} · `}<span class="online">{hosts?.filter((h) => h.online && !h.revoked).length ?? '–'} online</span>{` · ${gib(free)} free of ${gib(capacity)} · ${count('ready')} ready · ${count('parked')} parked · ${count('stopped')} stopped`}{#if count('failed')}<span class="failed">{` · ${count('failed')} failed`}</span>{/if}{` · ${load?.deployments.reduce((sum, d) => sum + d.router.in_flight, 0) ?? '–'} in flight`}</p>
 
   <h2>Hosts</h2>
   {#if hosts === null}
@@ -47,18 +53,21 @@
     <ModelList deployments={$snapshot.deployments} {load} />
   {/if}
 
-  <h2>Recent activity</h2>
-  <RecentActivity limit={8} />
+  <div class="activity panel"><h2>Recent activity</h2><RecentActivity limit={8} /></div>
 </section>
 
 <style>
+  .status-line { color: var(--capyctl-muted); margin: -0.25rem 0 2rem; line-height: 1.9; }
+  .online { color: var(--state-ready); } .failed { color: var(--capyctl-danger); }
+  .activity { margin-top: 1.5rem; }
+  .activity h2 { margin-top: 0; }
   .overview h2 {
     margin-top: 1.5rem;
     font-size: 1.125rem;
   }
   .hosts {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 24rem), 1fr));
     gap: 1rem;
   }
   .empty {

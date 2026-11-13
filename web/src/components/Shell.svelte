@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, type Component } from 'svelte';
-  import { route } from '../lib/router';
+  import { href, link, route } from '../lib/router';
   import { startLiveState } from '../lib/state';
   import Activity from '../routes/activity/Activity.svelte';
   import Engines from '../routes/engines/Engines.svelte';
@@ -38,18 +38,6 @@
 
 <div class="shell">
   <header class="phone-header">
-    <button
-      type="button"
-      class="menu"
-      aria-controls="sidebar"
-      aria-expanded={menuOpen}
-      onclick={() => (menuOpen = !menuOpen)}
-    >
-      <span class="visually-hidden">Menu</span>
-      <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">
-        <path d="M3 6h18M3 12h18M3 18h18" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
-      </svg>
-    </button>
     <Brand height={36} />
   </header>
   <Sidebar open={menuOpen} onnavigate={() => (menuOpen = false)} />
@@ -57,19 +45,29 @@
     <ReconnectingIndicator />
     <Screen />
   </main>
+  <!-- ADR 0040, owner decision 2026-11-13: quick actions from a phone. -->
+  <nav class="phone-tabs" aria-label="Phone navigation">
+    <a href={href('/')} use:link aria-current={$route === '/' ? 'page' : undefined} onclick={() => menuOpen = false}><span aria-hidden="true">▦</span>Overview</a>
+    <a href={href('/models')} use:link aria-current={$route.startsWith('/models') ? 'page' : undefined} onclick={() => menuOpen = false}><span aria-hidden="true">◇</span>Models</a>
+    <a href={href('/playground')} use:link aria-current={$route === '/playground' ? 'page' : undefined} onclick={() => menuOpen = false}><span aria-hidden="true">▷</span>Playground</a>
+    <button type="button" aria-controls="sidebar" aria-expanded={menuOpen} onclick={() => menuOpen = !menuOpen}><span aria-hidden="true">···</span>More</button>
+  </nav>
 </div>
 
 <style>
   .shell {
     min-height: 100vh;
     display: grid;
-    grid-template-columns: 15rem minmax(0, 1fr);
+    grid-template-columns: 13.5rem minmax(0, 1fr);
   }
   .phone-header {
     display: none;
   }
+  .phone-tabs { display: none; }
   .content {
-    padding: 1.5rem 2rem;
+    padding: 2rem 2.5rem;
+    max-width: 1600px;
+    width: 100%;
     min-width: 0;
   }
   /* SPEC R35, R36: on a phone the sidebar becomes a menu and the main area
@@ -90,18 +88,12 @@
       background: var(--capyctl-bg);
       border-bottom: 1px solid var(--capyctl-rule);
     }
-    .menu {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 2.75rem;
-      height: 2.75rem;
-      padding: 0;
-      border: none;
-      background: transparent;
-    }
+    .phone-tabs { display: grid; grid-template-columns: repeat(4, 1fr); position: fixed; bottom: 0; left: 0; right: 0; z-index: 12; background: var(--capyctl-bg); border-top: 1px solid var(--capyctl-rule); padding: 0.375rem 0 max(0.375rem, env(safe-area-inset-bottom)); }
+    .phone-tabs a, .phone-tabs button { display: flex; flex-direction: column; align-items: center; gap: 0.125rem; text-decoration: none; color: var(--capyctl-muted); font-size: 0.6875rem; border: none; padding: 0.25rem; background: transparent; }
+    .phone-tabs span { font-size: 1.375rem; line-height: 1.25; }
+    .phone-tabs a[aria-current='page'], .phone-tabs button[aria-expanded='true'] { color: var(--capyctl-accent-text); }
     .content {
-      padding: 1rem;
+      padding: 1.25rem 1rem 6rem;
     }
   }
 </style>

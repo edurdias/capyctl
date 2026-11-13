@@ -44,6 +44,10 @@ describe('app shell', () => {
         return Promise.reject(new TypeError('Failed to fetch'));
       }
       const stream = new StreamMock(call.signal);
+      if (!call.headers.has('Last-Event-ID')) {
+        stream.raw(': history complete\n\n');
+        return stream.response;
+      }
       streams.push(stream);
       return stream.response;
     });
@@ -90,8 +94,9 @@ describe('app shell', () => {
   it('shows the sidebar sections and the brand', () => {
     installFetch(() => new Promise<Response>(() => {}));
     render();
-    const labels = Array.from(document.querySelectorAll('nav[aria-label="Sections"] li a'), (a) => a.textContent);
+    const labels = Array.from(document.querySelectorAll('nav[aria-label="Sections"] li a > span'), (a) => a.textContent);
     expect(labels).toEqual(['Overview', 'Models', 'Hosts', 'Engines', 'Playground', 'Activity', 'Settings']);
-    expect(document.querySelector('img[alt="CapyCTL"]')?.getAttribute('src')).toMatch(/horizontal-dark\.png$/);
+    expect(document.querySelector('.brand')?.textContent).toBe('CapyCTL');
+    expect(document.querySelector('.brand img')?.getAttribute('src')).toMatch(/favicon\.png$/);
   });
 });
