@@ -32,6 +32,37 @@ def field(number, value):
 
 
 class EmbeddingProtocolTests(unittest.TestCase):
+    def test_t47_em9_waits_for_latest_same_launch_sample(self):
+        valid = dict(last_step_id='current', stop_operation_id=None)
+        ctx = SimpleNamespace(assertion=require, remaining=lambda: 60,
+                              sql=mock.Mock(side_effect=[[], [dict(valid, last_step_id='old')], [valid]]))
+        with mock.patch.object(em, 'latest_park', return_value=[
+                dict(id='current', state='completed', evidence=dict(milestones=['memory_released']))]), \
+             mock.patch.object(em.time, 'sleep'), \
+             mock.patch.object(em, 'process_memory', side_effect=RuntimeError('sample accepted')):
+            with self.assertRaisesRegex(RuntimeError, 'sample accepted'):
+                em.parked_proof(ctx, 'embed', 'vllm033', 'server')
+        self.assertEqual(ctx.sql.call_count, 3)
+
+    def test_t47_em7_reads_stored_policy_for_both_memory_topologies(self):
+        for memory, domain in [('device', 'host/gpu0'), ('unified', 'host/system'),
+                               ('unified', 'host/domain/unified')]:
+            policy = dict(context=dict(device_domains={'host/device/gpu0': domain}),
+                          controls=dict(domains={domain: dict(memory=memory, managed_limit=60)}))
+            ctx = SimpleNamespace(sql=lambda _: [dict(policy_json=json.dumps(policy))])
+            self.assertEqual(em.policy_limit(ctx), 60)
+            records = [dict(name='embed', footprint_json=json.dumps(dict(
+                phase='ready', allocations=[[domain, 55, 0]])))]
+            self.assertEqual(em.device_charge(records, 'embed', memory == 'unified'), (domain, 55))
+
+    def test_t47_em5_uses_supported_deadline(self):
+        ctx = SimpleNamespace(deploy=mock.Mock(), save=mock.Mock())
+        with mock.patch.object(em, 'EMBEDDING_ENGINES', ['vllm033']), \
+             mock.patch.object(em, 'isolated_role'), mock.patch.object(em, 'cut_batch'), \
+             mock.patch.object(em, 'stopped'):
+            em.em5(ctx, {})
+        self.assertEqual(ctx.deploy.call_args.kwargs['extra']['request_deadline'], '30s')
+
     def test_catalog_replaces_skips_without_duplicates(self):
         catalog = v020.rows()
         for key in ('EM3', 'EM5', 'EM6', 'EM7', 'EM9'):

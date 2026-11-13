@@ -637,6 +637,10 @@ def ot7(ctx, evidence):
     path = ctx.evidence / 'result-OT8.json'
     ctx.assertion(path.exists(), 'OT7 requires a completed OT8 measurement receipt')
     receipt = json.loads(path.read_text())
+    if receipt.get('verdict') == 'skip':
+        # ADR 0037 OT7 needs OT8's measured noise, not an invented bound.
+        from v020 import UnavailableEngine
+        raise UnavailableEngine('OT7 prerequisite OT8 skipped: ' + receipt.get('reason', 'unavailable'))
     ctx.assertion(receipt.get('verdict') == 'pass', 'OT8 baseline did not pass')
     arms = receipt['evidence']['vllm033']
     off = arms['off']['requests']

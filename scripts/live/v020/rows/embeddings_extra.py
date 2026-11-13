@@ -136,12 +136,17 @@ def parked_proof(ctx, name, engine, role='standalone'):
     records = latest_park(ctx, name, role)
     ctx.assertion(any(item['state'] == 'completed' and 'memory_released' in item['evidence'].get('milestones', [])
                       for item in records), 'park lacks committed per-launch MemoryReleased evidence')
-    residues = ctx.sql('''SELECT r.generation,r.domain,r.first_bytes,r.last_bytes,r.parks,r.last_step_id,
+    def measured_residues():
+        return ctx.sql('''SELECT r.generation,r.domain,r.first_bytes,r.last_bytes,r.parks,r.last_step_id,
         r.measured_at_ms,r.stop_operation_id FROM parked_launch_residues r JOIN deployments d ON d.id=r.deployment_id
         JOIN deployment_instances i ON i.deployment_id=d.id AND i.instance_index=r.instance_index
         AND i.generation=r.generation WHERE d.name=?''', (name,), role=role)
-    ctx.assertion(bool(residues) and all(item['stop_operation_id'] is None for item in residues),
-                  'missing same-launch measured parked residues or park became stop')
+    # ADR 0036 §7: host samples arrive after lifecycle completion. Wait for
+    # this park's measurement, never accept an earlier park's residue.
+    steps = {record['id'] for record in records}
+    residues = wait_for(ctx, lambda: (items if (items := measured_residues())
+        and all(item['stop_operation_id'] is None and item['last_step_id'] in steps for item in items) else None),
+        'missing same-launch measured parked residues or park became stop', seconds=60)
     ctx.assertion(all(item['last_step_id'] in {record['id'] for record in records} for item in residues),
                   'parked residue is stale: it does not belong to the latest park')
     memory = process_memory(ctx)
@@ -391,11 +396,11 @@ def cut_batch(ctx, name, engine, mode, index, kill=False):
             if conn.sock:
                 conn.sock.shutdown(socket.SHUT_RDWR)
             conn.close()
-        # Deadline mode leaves the client alone: the configured 5-second
-        # request deadline must cause the durable cancellation itself.
+        # ADR 0036 §4: leave the client alone in deadline mode. The minimum
+        # supported deployment deadline is 30 seconds, including initialization.
         cancelling = wait_for(ctx, lambda: [item for item in leases(ctx, name)
                                             if item['id'] == lease_id and item['cancelled_at_ms'] is not None],
-                              'cut lease never became cancelling', seconds=8)
+                              'cut lease never became cancelling', seconds=35 if mode == 'deadline' else 8)
         cut_at = cancelling[0]['cancelled_at_ms']/1000
         after_cut = connection_states(ctx, name)
         overlap = {item['inode'] for item in sockets} & {item['inode'] for item in after_cut}
@@ -449,7 +454,7 @@ def em5(ctx, evidence):
         with isolated_role(ctx, 'em5-'+engine):
             name = 'em5-'+engine
             ctx.deploy(name, engine, model='embedding', api='embeddings',
-                       extra=dict(request_deadline='5s'))
+                       extra=dict(request_deadline='30s'))
             trials = []
             evidence[engine] = dict(cuts=trials)
             for index in range(32):
@@ -463,8 +468,12 @@ def policy_limit(ctx):
     policies = ctx.sql('SELECT policy_json FROM host_resource_policies')
     for item in policies:
         doc = json.loads(item['policy_json'])
-        for domain in doc.get('domains', {}).values():
-            if domain.get('memory') == 'device':
+        # StoredPolicy nests controls; gpu0 maps to system on unified hosts.
+        domains = doc['controls']['domains']
+        device_domain = next(domain for device, domain in doc['context']['device_domains'].items()
+                             if device.rsplit('/', 1)[-1] == 'gpu0')
+        for key, domain in domains.items():
+            if key == device_domain and domain.get('memory') in ('device', 'unified'):
                 value = domain['managed_limit']
                 if isinstance(value, int):
                     return value
@@ -479,13 +488,15 @@ def grant_snapshot(ctx, names):
         JOIN deployments d ON d.id=r.deployment_id WHERE d.name IN ({marks})''', tuple(names))
 
 
-def device_charge(records, name):
+def device_charge(records, name, unified=False):
     matching = [json.loads(item['footprint_json']) for item in records if item['name'] == name]
     if len(matching) != 1 or matching[0]['phase'] != 'ready':
         raise AssertionError('missing ready resource owner for '+name)
-    values = {domain: count for domain, count, _ in matching[0]['allocations'] if 'gpu0' in domain}
+    pools = ('system', 'unified') if unified else ('gpu0',)
+    values = {domain: count for domain, count, _ in matching[0]['allocations']
+              if domain.rsplit('/', 1)[-1] in pools}
     if len(values) != 1:
-        raise AssertionError('missing single gpu0 ready grant')
+        raise AssertionError('missing single device-memory ready grant')
     return next(iter(values.items()))
 
 
@@ -514,8 +525,8 @@ def em7(ctx, evidence):
             evidence[engine] = dict(managed_limit_bytes=limit, each_request_bytes=request,
                                     combined_request_bytes=request*2, switched_to_chat=first)
             ctx.assertion(request*2 > limit, 'EM7 fixtures fit together')
-            embed_domain, embed_charge = device_charge(initial_grant, embed)
-            chat_domain, chat_charge = device_charge(first['grants'], chat)
+            embed_domain, embed_charge = device_charge(initial_grant, embed, ctx.unified)
+            chat_domain, chat_charge = device_charge(first['grants'], chat, ctx.unified)
             ctx.assertion(embed_domain == chat_domain and max(embed_charge, chat_charge) <= limit
                           and embed_charge+chat_charge > limit,
                           'actual ready grants are not individually fitting and mutually exclusive')
