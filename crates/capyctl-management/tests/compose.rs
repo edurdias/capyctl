@@ -100,6 +100,7 @@ async fn roles() -> Roles {
         Some("https://box.tail1234.ts.net"),
         StandaloneRoutes {
             ui: Router::new().route("/ui/", axum::routing::get(|| async { "sign in" })),
+            playground: capyctl_management::playground::router(Router::new()),
             actions: actions.clone(),
             check_sources: Arc::new(capyctl_management::check::UnavailableSources),
             host_admin: Arc::new(UnavailableHostAdmin),
@@ -133,6 +134,7 @@ async fn roles() -> Roles {
         None,
         ServerRoutes {
             ui: Router::new().route("/ui/", axum::routing::get(|| async { "sign in" })),
+            playground: capyctl_management::playground::router(Router::new()),
             actions,
             check_sources: host_admin.clone(),
             host_admin,
@@ -296,6 +298,16 @@ async fn every_route_of_both_roles_needs_a_principal() {
         (
             "POST",
             "/management/v1/deployments/check".into(),
+            Some(&invalid),
+        ),
+        (
+            "POST",
+            "/management/v1/playground/chat/completions".into(),
+            Some(&invalid),
+        ),
+        (
+            "POST",
+            "/management/v1/playground/systemone".into(),
             Some(&invalid),
         ),
         (

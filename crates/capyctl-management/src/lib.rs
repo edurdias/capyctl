@@ -52,6 +52,8 @@ pub mod inference_listener;
 pub mod installation;
 // SPEC §17 (M80): router, ingress and engine latency distributions.
 pub mod metrics;
+// ADR 0040 §12: the browser-session-authorized inference forward.
+pub mod playground;
 // ADR 0040 §§4–7: the session verifier and the browser session routes.
 pub mod ui_sessions;
 

@@ -109,6 +109,8 @@ pub fn compose(
 pub struct StandaloneRoutes {
     /// ADR 0040 §13: public static routes, including the sign-in page.
     pub ui: Router,
+    /// ADR 0040 §12: routes over the role's admission-gated keyless router.
+    pub playground: Router,
     pub actions: Arc<OwnedActionSource>,
     pub check_sources: Arc<dyn crate::check::SourceProvider>,
     /// ADR 0040 §10: the embedded host's in-process administration.
@@ -135,6 +137,7 @@ pub fn standalone(
         public_address,
         [
             routes.ui,
+            routes.playground,
             crate::lifecycle_router(routes.actions.clone()),
             crate::check::router(routes.actions.configuration().clone(), routes.check_sources),
             crate::host_admin::router(routes.host_admin),
@@ -160,6 +163,8 @@ pub fn standalone(
 pub struct ServerRoutes {
     /// ADR 0040 §13: public static routes, including the sign-in page.
     pub ui: Router,
+    /// ADR 0040 §12: routes over the role's admission-gated keyless router.
+    pub playground: Router,
     pub actions: Arc<OwnedActionSource>,
     pub check_sources: Arc<dyn crate::check::SourceProvider>,
     pub host_admin: Arc<dyn crate::host_admin::HostAdminSource>,
@@ -188,6 +193,7 @@ pub fn server(
         public_address,
         [
             routes.ui,
+            routes.playground,
             crate::lifecycle_router(routes.actions.clone()),
             crate::check::router(routes.actions.configuration().clone(), routes.check_sources),
             crate::host_admin::router(routes.host_admin),

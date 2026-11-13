@@ -228,6 +228,7 @@ async fn both_roles_compose_public_ui_and_authorized_management_without_panickin
         None,
         StandaloneRoutes {
             ui: router_with_assets::<Fixed>(),
+            playground: axum::Router::new(),
             actions: actions.clone(),
             check_sources: Arc::new(capyctl_management::check::UnavailableSources),
             host_admin: Arc::new(capyctl_management::host_admin::UnavailableHostAdmin),
@@ -261,6 +262,7 @@ async fn both_roles_compose_public_ui_and_authorized_management_without_panickin
         None,
         ServerRoutes {
             ui: router_with_assets::<Fixed>(),
+            playground: axum::Router::new(),
             actions,
             check_sources: host_admin.clone(),
             host_admin,

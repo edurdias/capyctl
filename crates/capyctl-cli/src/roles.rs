@@ -186,6 +186,8 @@ pub struct App {
     /// Servable router (F1: the standalone role's inference surface).
     router: axum::Router,
     management: axum::Router,
+    /// ADR 0040 §12: one shutdown gate for inference and playground work.
+    admission: Arc<crate::shutdown::Admission>,
     deps: capyctl_router::RouterDeps,
     api_key: String,
     /// The embedded role's supervisors: readiness (SPEC §4.3, P3: re-proves
@@ -220,6 +222,11 @@ impl App {
     /// SPEC §16.5: mount only on the separate loopback management listener.
     pub fn management_router(&self) -> axum::Router {
         self.management.clone()
+    }
+
+    /// ADR 0040 §12: the listener closes the same gate the playground uses.
+    pub fn admission(&self) -> Arc<crate::shutdown::Admission> {
+        self.admission.clone()
     }
 
     /// SPEC §15.3: the standalone document's accepted-but-ignored values, one
@@ -2485,35 +2492,6 @@ async fn start_standalone_in(
             }
             _ => Arc::new(capyctl_management::host_admin::UnavailableHostAdmin),
         };
-    // ADR 0040 §2: every management route is authorized at one point.
-    let management = capyctl_management::compose::standalone(
-        session_verifier,
-        management_listener.public_address.as_deref(),
-        capyctl_management::compose::StandaloneRoutes {
-            ui: capyctl_webui::router(),
-            host_admin,
-            actions: source,
-            // ADR 0040 §9: pin with this host's resolved document settings.
-            check_sources: Arc::new(capyctl_management::check::StandaloneSources(Arc::new(
-                capyctl_agent::host_admin::CachedSourcePinner::new(
-                    models.policy.clone(),
-                    models.models_root.clone(),
-                    Arc::new(|name| std::env::var(name).ok()),
-                ),
-            ))),
-            // SPEC §4.3: the embedded host drains by its published name or
-            // the `standalone` alias the CLI uses.
-            host_names: vec![declared_host.name.clone(), "standalone".to_owned()],
-            // ADR 0008: the registered installation, shown by standalone status.
-            installations: embedded.installations(),
-            engine_logs,
-            owner,
-            host: standalone_host,
-            latency,
-            load,
-            inference_listener: inference_listener.clone(),
-        },
-    );
     let controller = Arc::new(
         CoordinatorLifecycle::new(coordinator.commands())
             .with_switcher(switcher.clone())
@@ -2538,6 +2516,45 @@ async fn start_standalone_in(
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
     };
     let router = capyctl_router::serve_router(deps.clone());
+    // ADR 0040 §12 / KTD13: share lifecycle, wake joins and metrics, but
+    // never resolve an inference credential on behalf of the browser.
+    let admission = crate::shutdown::Admission::new();
+    let playground = capyctl_management::playground::router(admission.gate(
+        capyctl_router::serve_router(capyctl_router::RouterDeps {
+            api_key: None,
+            ..deps.clone()
+        }),
+    ));
+    // ADR 0040 §2: every management route is authorized at one point.
+    let management = capyctl_management::compose::standalone(
+        session_verifier,
+        management_listener.public_address.as_deref(),
+        capyctl_management::compose::StandaloneRoutes {
+            ui: capyctl_webui::router(),
+            playground,
+            host_admin,
+            actions: source,
+            // ADR 0040 §9: pin with this host's resolved document settings.
+            check_sources: Arc::new(capyctl_management::check::StandaloneSources(Arc::new(
+                capyctl_agent::host_admin::CachedSourcePinner::new(
+                    models.policy.clone(),
+                    models.models_root.clone(),
+                    Arc::new(|name| std::env::var(name).ok()),
+                ),
+            ))),
+            // SPEC §4.3: the embedded host drains by its published name or
+            // the `standalone` alias the CLI uses.
+            host_names: vec![declared_host.name.clone(), "standalone".to_owned()],
+            // ADR 0008: the registered installation, shown by standalone status.
+            installations: embedded.installations(),
+            engine_logs,
+            owner,
+            host: standalone_host,
+            latency,
+            load,
+            inference_listener: inference_listener.clone(),
+        },
+    );
     // Publish the ceiling before anything can be admitted against it. A deployment
     // cannot be qualified until the host has said what it will allow, and the policy
     // is imported with the observation that justifies it rather than on its own.
@@ -2651,6 +2668,7 @@ async fn start_standalone_in(
         gpu_shape,
         router,
         management,
+        admission,
         deps,
         api_key,
         supervision,

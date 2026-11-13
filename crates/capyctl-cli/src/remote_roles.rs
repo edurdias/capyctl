@@ -695,7 +695,7 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
             }
         }))
     };
-    let inference = capyctl_router::serve_router(capyctl_router::RouterDeps {
+    let deps = capyctl_router::RouterDeps {
         controller: controller.clone(),
         forwards: Arc::new(capyctl_router::forwarders::LiveForwarders::new(controller)),
         limits: capyctl_router::QueueLimits {
@@ -711,7 +711,17 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         },
         inflight,
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
-    });
+    };
+    // ADR 0040 §12 / KTD13: both inference entrances share one shutdown
+    // gate, lifecycle, activation join and metrics; only the key check differs.
+    let admission = crate::shutdown::Admission::new();
+    let inference = admission.gate(capyctl_router::serve_router(deps.clone()));
+    let playground = capyctl_management::playground::router(admission.gate(
+        capyctl_router::serve_router(capyctl_router::RouterDeps {
+            api_key: None,
+            ..deps
+        }),
+    ));
     // SPEC §4.3: the explicit drain of an enrolled host. Owner decision 4: an
     // offline host's drain is accepted at once with its Stops pending.
     let presence = {
@@ -744,6 +754,7 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         config.management_public_address.as_deref(),
         capyctl_management::compose::ServerRoutes {
             ui: capyctl_webui::router(),
+            playground,
             actions,
             check_sources: host_admin.clone(),
             host_admin,
@@ -787,8 +798,6 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
     // running on their hosts and the next start adopts and re-proves them.
     let bound = config.drain_timeout;
     let mut signals = crate::shutdown::Signals::install().map_err(|_| unavailable())?;
-    let admission = crate::shutdown::Admission::new();
-    let inference = admission.gate(inference);
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let stopping = |mut stopped: tokio::sync::watch::Receiver<bool>| async move {
         let _ = stopped.wait_for(|stopped| *stopped).await;
