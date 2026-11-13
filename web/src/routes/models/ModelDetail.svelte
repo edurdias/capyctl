@@ -43,17 +43,18 @@
       { key: 'requests', label: 'Requests measured', value: requests?.count ?? ttft?.count ?? null, text: String(requests?.count ?? ttft?.count ?? '–'), source: requests ? `${requests.source} · ${requests.tier}` : ttft ? `${ttft.source} · ${ttft.tier}` : '' },
       { key: 'duration', label: 'Request p50', value: requests?.p50_seconds ?? null, text: duration(requests?.p50_seconds), source: requests ? `${requests.source} · ${requests.tier}` : '' },
     ];
-    // Retained histograms belong to previous runs when the model is not
-    // ready. Keep them in the explicitly historical disclosure, not live tiles.
-    return live ? readings : readings.map((metric) => ({ ...metric, value: null, text: '–', source: 'Not ready' }));
+    // Retained measurements are useful evidence, but not live telemetry.
+    // Omit absent values instead of filling a stopped model with empty tiles.
+    return live ? readings : readings.filter((metric) => metric.value !== null);
   }
+  const visibleMetrics = $derived(metrics());
   // ADR 0040 owner decision 2026-11-13: 24 samples of the existing 5 s
   // reads, only in this browser. Percentiles stay split by their source.
   onMount(() => livePoll(async () => {
     const [loadReport, latencyReport] = await Promise.all([readLoad(id), readLatency(id)]);
     load = loadReport.deployments.find((d) => d.deployment_id === id) ?? null;
     series = latencyReport.deployments.find((d) => d.deployment_id === id)?.instances.flatMap((i) => i.series) ?? [];
-    samples = Object.fromEntries(metrics().map((m) => [m.key, trend(samples[m.key] ?? [], m.value)]));
+    samples = live ? Object.fromEntries(metrics().map((m) => [m.key, trend(samples[m.key] ?? [], m.value)])) : {};
   }, 5000));
   onMount(() => {
     readEngines().then((value) => engines = value).catch(() => {});
@@ -114,12 +115,21 @@
     {#if deployment.switch}<p class="notice">Making room · {deployment.switch.role === 'target' ? 'Starting after other models release memory' : `Releasing memory for ${deployment.switch.target}`} · {deployment.switch.phase.replaceAll('_', ' ')}</p>{/if}
     {#each deployment.model_sources ?? [] as source (`${source.host_id}:${source.source_key}`)}{#if source.state === 'downloading'}<div class="download panel"><div class="fact"><span>Downloading model · {source.host_id}</span><span>{gib(source.bytes_done)} of {gib(source.bytes_total)}</span></div><progress aria-label="Model download" value={source.bytes_done} max={source.bytes_total || 1}></progress></div>{/if}{/each}
 
-    <div class="section-heading"><h2>{live ? 'Live readings' : 'Readings'}</h2><span class="muted">{live ? '5 s refresh · trends from this visit' : 'Not ready · live readings paused'}</span></div>
-    <div class="metrics">
-      {#each metrics() as metric (metric.key)}
-        <article class="metric panel"><span class="eyebrow">{metric.label}</span><strong class="numeral">{metric.text}</strong><svg viewBox="0 0 100 28" preserveAspectRatio="none" aria-label={`${metric.label} trend, ${live ? (samples[metric.key] ?? []).filter((v) => v !== null).length : 0} readings`} role="img"><polyline points={live ? sparkPoints(samples[metric.key] ?? []) : ''} fill="none" stroke="currentColor" stroke-width="1.5" vector-effect="non-scaling-stroke" /></svg><small class="muted">{metric.source || 'No measurements'}</small></article>
-      {/each}
-    </div>
+    {#if live || visibleMetrics.length > 0}
+      <div class="section-heading"><h2>{live ? 'Live readings' : 'Previous readings'}</h2>{#if live}<span class="muted">5 s refresh · trends from this visit</span>{/if}</div>
+      <div class="metrics">
+        {#each visibleMetrics as metric (metric.key)}
+          <article class="metric panel">
+            <span class="eyebrow">{metric.label}</span>
+            <strong class="numeral">{metric.text}</strong>
+            {#if live}<svg viewBox="0 0 100 28" preserveAspectRatio="none" aria-label={`${metric.label} trend, ${(samples[metric.key] ?? []).filter((v) => v !== null).length} readings`} role="img"><polyline points={sparkPoints(samples[metric.key] ?? [])} fill="none" stroke="currentColor" stroke-width="1.5" vector-effect="non-scaling-stroke" /></svg>{/if}
+            <small class="muted">{live ? metric.source || 'No measurements' : `Previous · ${metric.source}`}</small>
+          </article>
+        {/each}
+      </div>
+    {:else}
+      <p class="muted">Readings appear while the model is ready.</p>
+    {/if}
     {#if series.length}
       <details class="measurements"><summary>{live ? 'All latency readings by source' : 'Previous latency readings by source'}</summary><div class="table-scroll"><table><thead><tr><th>Measure</th><th>Source</th><th>Requests</th><th>p50</th><th>p95</th></tr></thead><tbody>{#each series as row, index (index)}<tr><td>{row.name.replaceAll('_', ' ')}</td><td>{row.source} · {row.tier}</td><td>{row.count}</td><td>{duration(row.p50_seconds)}</td><td>{duration(row.p95_seconds)}</td></tr>{/each}</tbody></table></div></details>
     {/if}

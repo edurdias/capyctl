@@ -190,9 +190,16 @@ describe('U20 current versus retained measurements', () => {
   it.each<ObservedState>(['failed', 'stopped'])('does not call retained %s-model measurements live', async (state) => {
     role({ snapshots: [snapshotWith([deployment({ observed_state: state })])], route: (call) => call.url.startsWith('/management/v1/metrics/latency') ? retainedLatency() : undefined });
     await open(`/models/${DEPLOYMENT_ID}`);
-    expect([...document.querySelectorAll('.metrics .numeral')].map((value) => value.textContent)).toEqual(Array(8).fill('–'));
-    expect(document.querySelector('.section-heading')?.textContent).toContain('Not ready');
+    expect([...document.querySelectorAll('.metrics .numeral')].map((value) => value.textContent)).toEqual(['210 ms', '530 ms', '30 ms', '12']);
+    expect(document.querySelector('.section-heading')?.textContent).toContain('Previous readings');
+    expect([...document.querySelectorAll('.metrics article small')].every((caption) => caption.textContent?.startsWith('Previous · '))).toBe(true);
     expect(document.querySelector('.measurements summary')?.textContent).toContain('Previous');
+  });
+  it.each<ObservedState>(['failed', 'stopped'])('omits empty tiles when a %s model has no retained measurements', async (state) => {
+    role({ snapshots: [snapshotWith([deployment({ observed_state: state })])] });
+    await open(`/models/${DEPLOYMENT_ID}`);
+    expect(document.querySelector('.metrics')).toBeNull();
+    expect(document.body.textContent).toContain('Readings appear while the model is ready.');
   });
 
   it('labels sidebar counts and renders every status separator with spaces', async () => {
