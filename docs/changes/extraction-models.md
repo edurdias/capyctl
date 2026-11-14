@@ -310,6 +310,59 @@ python3 ~/shardio-extract-t50/post_probe.py retained-policy-reconnect
 python3 ~/shardio-extract-t50/run_fault.py
 ```
 
+## Focused typed-list package recheck — 2026-11-14
+
+The owner authorized a focused follow-up on the private
+`extract-4b-bf16-rebuilt-9d9c5de` package (typed splitting of merged number/date
+list spans), using the same CapyCTL `302a42f` binary and isolated controller/host
+state, loopback ports and durable-identity guard. The exact recheck is:
+
+1. `Scores: 12, 25, 38.` as `list`/`items:number`, with and without
+   `instructions: List all scores`; require `[12,25,38]`.
+2. One routed field of each of the nine types, including a three-date list;
+   one image with total 66; then the exact baseline Unicode-text request,
+   requiring complete answer equality.
+3. One list `null_threshold` request must return 400 `invalid_request`.
+4. Require Ready on the nine-type startup probe and read its persisted typed
+   canary; capture ten sequential warm text latencies.
+5. Delete the run deployment with verified stop, then stop own roles/guard;
+   require empty accounting, no own GPU processes and all own ports free.
+
+**Focused recheck: PASS for every requested check.** This closes the specific
+numeric-list failure on the new package; it does not convert the earlier
+package's historical FAIL or the unexercised full-T50 requirements into passes.
+No CapyCTL code or approved serving environment changed.
+
+| Check | Result and evidence |
+|---|---|
+| Provenance | PASS. Same `302a42f` binary SHA-256 `3cf82b7bbc5b68542afb9df9c3f541ccca6f5d1dc087ebd20cf0bc5d28e86720`; new runtime SHA-256 `0e224bb2dd289ff61130a4071d12a9fab668e32e09a804f599b488f41c10dc27`; manifest SHA-256 `90b438a207cc46be5e6e6ee3fe727e5013aa72c2733a7723e40c8ff3ce991f0e`. Registered `t50-9d9c5de`, using the unchanged pinned standalone-runtime launcher described above. Measured checkpoint digest `sha256:f565c2d79a69ff0b14796d9993d673e09f028ab85832a6f5d3924499932b4c79`, weights 11,916,161,380 bytes. |
+| Scores without instructions | PASS. `Scores: 12, 25, 38.` with `{"type":"list","items":"number"}` returns HTTP 200, `[12.0,25.0,38.0]`, confidence 0.9808759689; wall 137.947 ms. |
+| Scores with instructions | PASS. Adding `instructions:"List all scores"` returns HTTP 200, `[12.0,25.0,38.0]`, confidence 0.9879462123; wall 127.819 ms. |
+| Text | PASS. `Zoë García`, Unicode span `[9,19]`, exact state_text echo. |
+| Number | PASS. Quantity 3 × price 20 plus 10% tax returns 66.0. |
+| Date | PASS. Delivery date returns `2026-11-20`. |
+| Time | PASS. Meeting at 14:30 returns `14:30:00`. |
+| Datetime | PASS. Delivery returns `2026-11-20T14:30:00`. |
+| Duration | PASS. Three-hour repair returns 3.0 with unit hours. |
+| List | PASS. All three dates returned: `2026-11-01`, `2026-11-08`, `2026-11-15`. |
+| Estimate | PASS. Comparable prices 90–130 return median 110, p10 90 and p90 130. |
+| Forecast | PASS. Monthly history 10,20,30 returns 40,50,60 for the next three steps. |
+| Image | PASS. PNG `TOTAL 66.00` returns 66.0; 138 input tokens = 77 image + 61 schema, one pass, zero output tokens; wall 639.585 ms. |
+| Order independence | PASS. Complete Unicode-text answer after that image equals the pre-image baseline exactly, including probabilities/confidence; post-image wall 73.561 ms. |
+| Rejection | PASS. List `null_threshold:0.5` returns HTTP 400 `invalid_request`, naming `scores.null_threshold`; wall 6.041 ms. |
+| Startup canary | PASS. Deploy/activate/wait reaches Ready, admission/dispatch true, in 89.76 s including process startup and checkpoint measurement. Before smoke requests, read-only ledger records extraction/v1, all nine canonical types and typed answers for new deployment `01M7E04H1D9GY7WQ0H07S0PG21`, incarnation `01M7E04H2AJATTCXPS49QBCVEB`; the old deployment's separate historical canary is not confused with this row. |
+| Warm latency | PASS for measurement. Ten sequential identical text requests: wall median 61.671 ms, nearest-rank p90 63.591 ms, range 59.390–64.175 ms; 55 input tokens, one pass each. |
+| Safety/cleanup | PASS. Only owner EngineCore was on GPU before launch; MemAvailable 45,698 MiB. All own ports checked free; durable-identity guard remained active without interruption and exited 0. Deployment deleted with verified stop; final read-only accounting has no leases, owners, reservations or endpoints and every binding released. Own engine PID 2904612 and role PIDs 2904442/2904467 are gone. Final nvidia-smi lists only owner EngineCore 1914989 at 73,592 MiB; owner capyctl/worker remain, MemAvailable 45,679 MiB. `ss -ltn` shows no own listener; all selected ports bind with SO_REUSEADDR. Initial plain-bind cleanup probes encountered only recently closed/TIME_WAIT sockets on 48443/48100, not surviving listeners. |
+
+The focused requests and summary live on A in
+`~/shardio-extract-t50/evidence-9d9c5de/`, copied locally to
+`target/live/t50-requalification/evidence-9d9c5de/`. Startup/final read-only
+ledger snapshots are `ledger-9d9c5de-{first-ready,final}.json` in A's
+`~/shardio-extract-t50/evidence/` and the local
+`target/live/t50-requalification/evidence/`. The request driver is
+`~/shardio-extract-t50/focus_9d9c5de.py`, run with the approved serving Python.
+Nothing was installed, published or uploaded; host B was not accessed.
+
 # Release note: Extraction models
 
 - **Typed extraction at `POST /v1/systemone`.** A deployment with
