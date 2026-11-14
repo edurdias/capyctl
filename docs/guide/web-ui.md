@@ -93,7 +93,7 @@ is recorded and refused in the same way.
 
 Engine additions and removals write `engines.yaml` or `custom-engines.yaml`
 in the host or standalone role's state directory, using the same lock and
-atomic write as `capyctl engine` (ADR 0018 amendment A4). With packaged
+atomic write as `capyctl engine add` and `capyctl engine remove`. With packaged
 services, `/etc/capyctl` stays read-only; the writable state directories are
 `/var/lib/capyctl/host` and `/var/lib/capyctl/standalone`.
 
