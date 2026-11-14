@@ -85,7 +85,12 @@ fn candidates(tx: &Transaction<'_>) -> Result<Vec<Candidate>, LifecycleError> {
             "SELECT i.deployment_id,i.instance_index,i.state,i.revision,i.generation,i.pending_start_until_ms,
                     EXISTS(SELECT 1 FROM runtime_bindings b WHERE b.deployment_id=i.deployment_id AND b.instance_index=i.instance_index AND b.state!='released'),
                     EXISTS(SELECT 1 FROM lifecycle_runs r WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND r.action='stop' AND r.state IN ('queued','running','uncertain')),
-                    EXISTS(SELECT 1 FROM lifecycle_runs r WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND r.action='activate' AND r.state IN ('queued','running','uncertain')),
+                    EXISTS(SELECT 1 FROM lifecycle_runs r WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND r.action='activate' AND r.state IN ('queued','running','uncertain')
+                           AND NOT (r.state='queued' AND EXISTS(
+                               SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id
+                                WHERE s.operation_id=r.operation_id AND o.kind='initialize'
+                                  AND s.state='planned' AND s.grant_id IS NULL
+                                  AND json_extract(s.step_json,'$.execution') IS NULL))),
                     (d.admin_stopped=1 OR d.suspended=1 OR i.operator_stopped=1),
                     d.revision,n.instances
                FROM deployment_instances i JOIN deployments d ON d.id=i.deployment_id
@@ -210,7 +215,11 @@ fn act(
                 // long its verified cleanup takes.
                 reanchor(tx, c, now)?;
             }
-            // A start in flight settles first; a stop in flight is waited on.
+            // An armed or uncertain start settles first. A queued ordinary
+            // Initialize with no grant/execution can instead take the verified
+            // unarmed-stop path below, even if admission failed and closed.
+            // That path proves no effects and the worker awaits its task's
+            // exit before releasing its binding, lease and claim.
             return Ok(None);
         }
         if surplus {

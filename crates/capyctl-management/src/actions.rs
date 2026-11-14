@@ -850,9 +850,8 @@ fn command_failure(error: CoordinatorCommandError) -> ConfigurationFailure {
             // Explained with each host's reason by `OwnedActionSource::explain`.
             LifecycleError::HostIneligible => F::HostIneligible(String::new()),
             LifecycleError::QueueFull => F::QueueFull,
-            LifecycleError::Stale | LifecycleError::ReconciliationRequired => {
-                F::ReconciliationRequired
-            }
+            LifecycleError::Stale => F::LifecycleStateChanged,
+            LifecycleError::ReconciliationRequired => F::ReconciliationRequired,
             LifecycleError::Sql(_)
             | LifecycleError::CorruptStoredData
             | LifecycleError::Rejected(_) => F::Internal,
@@ -1252,6 +1251,27 @@ mod tests {
         )))
         .await;
         assert_eq!(error["code"], "reconciliation_required", "{error}");
+    }
+
+    // T08 T16: a stale lifecycle fence is not a missing resource policy.
+    #[tokio::test]
+    async fn a_stale_lifecycle_names_the_changed_state_instead_of_the_resource_policy() {
+        let response =
+            command_failure(CoordinatorCommandError::Lifecycle(LifecycleError::Stale)).response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "reconciliation_required");
+        assert_eq!(body["error"]["retryable"], true);
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("Lifecycle state"), "{message}");
+        assert!(message.contains("session"), "{message}");
+        assert!(!message.contains("resource policy"), "{message}");
     }
 
     /// ADR 0014 §7 (found live on a 16 GB card): a revision whose memory does

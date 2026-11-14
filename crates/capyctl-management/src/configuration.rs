@@ -81,6 +81,8 @@ pub enum ConfigurationFailure {
     /// started; the same start succeeds once it settles.
     StillStopping,
     LifecycleConflict,
+    /// The lifecycle fence or its coordinator session changed, not its policy.
+    LifecycleStateChanged,
     /// ADR 0014 §7 (WE3): activation waits for the checkpoint digest.
     CheckpointDigestPending,
     /// ADR 0014 §7: the checkpoint is not the declared or recorded one.
@@ -187,6 +189,12 @@ impl ConfigurationFailure {
                 "lifecycle_conflict",
                 "Lifecycle state does not permit this action",
                 false,
+            ),
+            LifecycleStateChanged => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "reconciliation_required",
+                "Lifecycle state or its coordinator session changed; inspect the deployment status and retry the action",
+                true,
             ),
             InvalidRequest => (
                 StatusCode::BAD_REQUEST,
