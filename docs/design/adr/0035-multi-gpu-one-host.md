@@ -488,6 +488,49 @@ key guard, and no engine control path goes through ingress or the router. Status
 - Wire: `ProcessResidency` gains a repeated per-device entry (device id, bytes) beside
   `device_bytes`, which stays their sum; additive field numbers, under the capability of §11.
 
+#### Amendment — outside GPU holders (owner decision 2026-11-13)
+
+Per-GPU observations also explain outside holders under **Other use**. Reuse the
+same NVIDIA sample; do not introduce a second parser. Exclude recorded live
+process identities (including adopted engines), and descendants of the current
+CapyCTL process, following at most eight ancestor levels. These readings are
+diagnostic only: they do not change reservations, admission, placement, or
+authority to stop a process (SPEC §7.2, T16, T26, T29).
+
+Keep at most 16 rows per GPU, sorted by bytes descending; sum the remaining
+holders into a count and byte total. Each row contains `pid` (u32), nullable
+`name` (at most 64 characters), `bytes` (u64), nullable `capyctl_state_dir`
+(at most 512 bytes), and `other_capyctl` (boolean). A hidden or unreadable name
+stays null; the UI says `process`. Another CapyCTL is labelled
+`another CapyCTL (<state directory or unknown>)`.
+The existing NVIDIA query has a three-second timeout and bounded output; the
+process-description pass has a 500 ms deadline. An incomplete ownership pass
+omits the diagnostic, rather than labelling this CapyCTL's engines as outside.
+
+Collection is read-only: read `comm`, `stat` for parent IDs, and only a CapyCTL
+ancestor's argv to recognize `start <role>` and extract `--state-dir`. Never
+signal outside processes or read their environment. Do not expose command
+arguments; the only argument information allowed is another CapyCTL's state
+directory. The data is visible to management clients, including signed-in
+browsers; it may disclose local process names and state-directory paths.
+
+The optional `outside_gpu_processes` capability is host-to-server and never a
+placement requirement. Wire `DomainObservation` gains repeated
+`OutsideProcess outside_processes` and optional
+`OutsideProcessRemainder outside_processes_remainder` at the next unused field
+numbers; optional string fields preserve null names and state directories.
+Optional diagnostic rows must fit the existing host-message size bound. When
+needed, keep the largest holders and add omitted rows to each GPU's remainder;
+if even a minimal diagnostic cannot fit, omit it rather than breaking the
+host's observation.
+
+Snapshot and host-session domains flatten the data into optional
+`outside_processes: [{pid, name, bytes, capyctl_state_dir, other_capyctl}]`
+and `outside_processes_remainder: {count, bytes}`. Both are absent when the
+reading is unavailable or has no rows; the remainder is absent when no rows
+were omitted. Bytes and counts are JSON numbers. These fields do not wrap the
+array in a `processes` object. Old hosts remain usable without the capability.
+
 ### 9. Parking
 
 - **vLLM and SGLang: `deep` and `host_backed` at N > 1** use the same calls as one GPU (the

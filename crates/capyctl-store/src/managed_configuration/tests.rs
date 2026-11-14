@@ -30,6 +30,7 @@ fn unchanged_command_replays_after_persisted_policy_and_profile_changes() {
             "policy",
             &current.controls,
             &[capyctl_domain::resources::MemoryObservation {
+                outside_processes: None,
                 domain: "unified".into(),
                 capacity_bytes: 64 << 30,
                 available_bytes: 60 << 30,
@@ -161,6 +162,7 @@ fn stopped_acceptance_replays_original_receipt_and_never_opens_dispatch() {
     let session = store.begin_coordinator_session().unwrap();
     let effective = capyctl_config::effective::resolve_effective(&config, &host).unwrap();
     let observations = vec![capyctl_domain::resources::MemoryObservation {
+        outside_processes: None,
         domain: "unified".into(),
         capacity_bytes: 64 << 30,
         available_bytes: 60 << 30,
@@ -203,6 +205,7 @@ fn setup() -> (Store, CoordinatorSession, Value, Value) {
             &session,
             &effective.host,
             &[capyctl_domain::resources::MemoryObservation {
+                outside_processes: None,
                 domain: "unified".into(),
                 capacity_bytes: 64 << 30,
                 available_bytes: 60 << 30,
@@ -503,6 +506,7 @@ fn two_connections_race_for_one_route_without_partial_loser() {
             &session,
             &effective.host,
             &[capyctl_domain::resources::MemoryObservation {
+                outside_processes: None,
                 domain: "unified".into(),
                 capacity_bytes: 64 << 30,
                 available_bytes: 60 << 30,

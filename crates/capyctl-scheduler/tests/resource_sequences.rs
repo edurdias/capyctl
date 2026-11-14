@@ -26,6 +26,7 @@ fn park_before_wake_fits_without_cold_restart() {
         .into(),
     };
     let obs = [MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 128,
         available_bytes: 58,
@@ -96,6 +97,7 @@ fn both_parked_is_not_enough_without_each_wake_path() {
         .into(),
     };
     let obs = [MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 128,
         available_bytes: 110,
@@ -134,6 +136,7 @@ fn cleanup_credits_only_qualified_floors_and_preserves_inputs() {
     };
     let original = initial.clone();
     let obs = [MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 100,
         available_bytes: 60,
@@ -172,6 +175,7 @@ fn cleanup_credits_only_qualified_floors_and_preserves_inputs() {
             // T29: without credited floors, the forecast is short of the
             // memory available, and says by how much.
             reason: ResourceError::InsufficientAvailable(Box::new(AvailableShortfall {
+                outside_processes: None,
                 domain: "system".into(),
                 device: false,
                 available_bytes: 60,
@@ -213,6 +217,7 @@ fn cleanup_rejects_impossible_attribution_before_removal() {
         owners: [("a".into(), f(ResourcePhase::Ready, 40))].into(),
     };
     let obs = [MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 100,
         available_bytes: 70,
@@ -269,6 +274,7 @@ fn cleanup_after_phase_uses_forecast_floor_and_phase_wrapper_is_equivalent() {
         .into(),
     };
     let obs = [MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 100,
         available_bytes: 20,
@@ -334,6 +340,7 @@ fn aggregate_floor_validation_preserves_phase_error_precedence() {
         .into(),
     };
     let obs = [MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 100,
         available_bytes: 40,

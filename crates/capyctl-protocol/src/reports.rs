@@ -6,6 +6,67 @@
 use crate::pb;
 use capyctl_domain::completion::ProcessIdentity;
 use capyctl_domain::group::GroupIdentityError;
+use prost::Message;
+
+/// ADR 0035 §8 / SPEC §7.2: optional outside-holder diagnostics must fit the
+/// existing host-message bound. Keep the largest rows and aggregate omissions
+/// per GPU; leave every non-diagnostic field untouched. The sampler supplies
+/// each GPU's rows in descending byte order. Reserve space for session framing
+/// and fields the session adds after inventory collection.
+pub fn bound_outside_processes(inventory: &mut pb::ReportInventory) {
+    const LIMIT: usize = crate::HOST_MESSAGE_BYTES - 1024;
+    let mut report_bytes = inventory.encoded_len();
+    if report_bytes <= LIMIT {
+        return;
+    }
+    // Cache each domain's length, then update only the removed row, remainder
+    // and enclosing length prefixes. Never encode or clone the whole report.
+    let mut smallest = std::collections::BinaryHeap::with_capacity(inventory.domains.len());
+    for (index, domain) in inventory.domains.iter().enumerate() {
+        if let Some(row) = domain.outside_processes.last() {
+            smallest.push(std::cmp::Reverse((row.bytes, index, domain.encoded_len())));
+        }
+    }
+    while report_bytes > LIMIT {
+        let Some(std::cmp::Reverse((_, index, old_domain_bytes))) = smallest.pop() else {
+            // An oversized baseline cannot be repaired by optional diagnostics.
+            break;
+        };
+        let domain = &mut inventory.domains[index];
+        let old_remainder_bytes = domain
+            .outside_processes_remainder
+            .as_ref()
+            .map_or(0, |r| delimited_field_bytes(r.encoded_len()));
+        let removed = domain.outside_processes.pop().expect("queued outside row");
+        let removed_bytes = delimited_field_bytes(removed.encoded_len());
+        let next_bytes = domain.outside_processes.last().map(|row| row.bytes);
+        if next_bytes.is_some() {
+            let remainder = domain.outside_processes_remainder.get_or_insert_default();
+            remainder.count = remainder.count.saturating_add(1);
+            remainder.bytes = remainder.bytes.saturating_add(removed.bytes);
+        } else {
+            // No row fits for this GPU: unavailable is represented by omitting
+            // both fields, never by publishing a remainder without any rows.
+            domain.outside_processes_remainder = None;
+        }
+        let new_remainder_bytes = domain
+            .outside_processes_remainder
+            .as_ref()
+            .map_or(0, |r| delimited_field_bytes(r.encoded_len()));
+        let new_domain_bytes =
+            old_domain_bytes - removed_bytes - old_remainder_bytes + new_remainder_bytes;
+        report_bytes = report_bytes - delimited_field_bytes(old_domain_bytes)
+            + delimited_field_bytes(new_domain_bytes);
+        if let Some(bytes) = next_bytes {
+            smallest.push(std::cmp::Reverse((bytes, index, new_domain_bytes)));
+        }
+    }
+}
+
+/// Inventory domains and their outside fields all use one-byte protobuf keys.
+fn delimited_field_bytes(payload_bytes: usize) -> usize {
+    1 + prost::encoding::encoded_len_varint(payload_bytes as u64) + payload_bytes
+}
 
 /// SPEC §17: the most load samples one report may carry. A host reports one
 /// sample per Ready scope, so this bounds cardinality well above any real host.

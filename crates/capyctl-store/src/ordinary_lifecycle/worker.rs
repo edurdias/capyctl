@@ -850,6 +850,7 @@ mod retired_planned_tests {
         let store = Store::open_in_memory().unwrap();
         let old = store.begin_coordinator_session().unwrap();
         let observations = vec![MemoryObservation {
+            outside_processes: None,
             domain: "unified".into(),
             capacity_bytes: 64 << 30,
             available_bytes: 60 << 30,

@@ -21,6 +21,7 @@ fn setup() -> (Store, CoordinatorSession, Value, Value) {
             &session,
             &effective.host,
             &[capyctl_domain::resources::MemoryObservation {
+                outside_processes: None,
                 domain: "unified".into(),
                 capacity_bytes: 64 << 30,
                 available_bytes: 60 << 30,
@@ -513,6 +514,7 @@ fn a_declared_request_the_measured_weights_do_not_resolve_names_its_reason() {
     let effective = capyctl_config::effective::resolve_effective(&sized, &host).unwrap();
     // Each card's 16,376 MiB.
     let observation = |domain: &str, bytes: i64| capyctl_domain::resources::MemoryObservation {
+        outside_processes: None,
         domain: domain.into(),
         capacity_bytes: bytes,
         available_bytes: bytes,
@@ -620,6 +622,7 @@ fn a_derived_request_larger_than_the_card_refuses_the_start_with_its_code() {
     sized["engine_config"] = json!({"memory": {"request": "10GiB", "kv_cache": "2GiB"}});
     let effective = capyctl_config::effective::resolve_effective(&sized, &host).unwrap();
     let observation = |domain: &str, gib: i64| capyctl_domain::resources::MemoryObservation {
+        outside_processes: None,
         domain: domain.into(),
         capacity_bytes: gib << 30,
         available_bytes: gib << 30,

@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { button, deployment, DEPLOYMENT_ID, instance, open, role, setUp, snapshotWith, STANDALONE_HOST, tearDown, tick } from './fixtures';
 import { cursor, json, StreamMock } from './helpers';
 import type { ObservedState } from '../src/lib/types';
+import { OUTSIDE_GPU_HOLDERS } from './fixtures';
+import hostCardSource from '../src/components/HostCard.svelte?raw';
 
 beforeEach(setUp);
 afterEach(tearDown);
@@ -47,6 +49,37 @@ describe('U20 Overview', () => {
     expect(segments.reduce((sum, s) => sum + Number(s.dataset.bytes), 0)).toBe(24 * GiB);
     expect(segments.filter((s) => s.classList.contains('parked')).map((s) => s.dataset.modelSegment)).toEqual(['sleeping']);
     expect(document.querySelector('.status-line')?.textContent).toContain('1 online');
+  });
+
+  // T16 / ADR 0035 §8 / SPEC §7.2: these rows explain, never reclaim, outside use.
+  it('lists outside holders, hidden names, other installations and the summed remainder', async () => {
+    role({ snapshots: [snapshotWith([])], route: (call) => call.url === '/management/v1/hosts'
+      ? json({ hosts: [{ ...STANDALONE_HOST, session: { domains: [
+        { ...STANDALONE_HOST.session.domains[0], ...OUTSIDE_GPU_HOLDERS },
+      ] } }] }) : undefined });
+    await open('/');
+    const rows = [...document.querySelectorAll('.outside-processes li')].map((row) => row.textContent);
+    expect(rows).toEqual([
+      'python · PID 101 · 3.0 GiB',
+      'process · PID 102 · 2.0 GiB',
+      `capyctl · PID 103 · 1.0 GiB · another CapyCTL (${OUTSIDE_GPU_HOLDERS.outside_processes[2].capyctl_state_dir})`,
+      'capyctl · PID 104 · 1.0 GiB · another CapyCTL (unknown)',
+      'and 4 more · 1.0 GiB',
+    ]);
+    expect(document.querySelector('.outside-processes button')).toBeNull();
+  });
+
+  // T16: jsdom has no layout; enforce the 390px wrapping contract in component CSS.
+  it('allows long outside-holder paths to wrap at phone widths without truncation', () => {
+    expect(hostCardSource).toMatch(/\.outside-processes\s*\{[^}]*min-width:\s*0;[^}]*max-width:\s*100%/);
+    expect(hostCardSource).toMatch(/\.outside-processes li\s*\{[^}]*white-space:\s*normal;[^}]*overflow-wrap:\s*anywhere/);
+  });
+
+  // T16: unavailable and empty observations must not imply a zero-byte reading.
+  it('omits outside holders when optional fields are absent', async () => {
+    role({ snapshots: [snapshotWith([])] });
+    await open('/');
+    expect(document.querySelector('.outside-processes')).toBeNull();
   });
 
   // Found on a real standalone role, 2026-11-13: two full-sentence warnings

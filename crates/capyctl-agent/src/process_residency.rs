@@ -19,11 +19,14 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use capyctl_domain::resources::{DeviceBytes, ProcessResident};
+use capyctl_domain::resources::{
+    DeviceBytes, OutsideProcess, OutsideProcessRemainder, OutsideProcesses, ProcessResident,
+};
 
 /// How often a new sample is started when one is asked for.
 pub const REFRESH: Duration = Duration::from_secs(2);
@@ -41,9 +44,17 @@ pub type GpuReading = (u32, String, i64);
 /// Reads GPU memory per (process, GPU).
 pub type GpuCollector = dyn Fn() -> Option<Vec<GpuReading>> + Send + Sync;
 
+/// ADR 0035 §8 amendment: the largest outside holders shown on each device.
+pub const MAX_OUTSIDE_PROCESSES: usize = 16;
+const ANCESTOR_LEVELS: usize = 8;
+const PROC_BOUND: Duration = Duration::from_millis(500);
+type Sample = (Vec<ProcessResident>, BTreeMap<String, OutsideProcesses>);
+type OwnedCollector =
+    dyn Fn() -> Option<Vec<capyctl_domain::completion::ProcessIdentity>> + Send + Sync;
+
 #[derive(Default)]
 struct State {
-    last: Option<(Instant, Vec<ProcessResident>)>,
+    last: Option<(Instant, Sample)>,
     running: bool,
 }
 
@@ -51,6 +62,7 @@ struct State {
 pub struct ResidencySampler {
     state: Mutex<State>,
     collect: Arc<GpuCollector>,
+    owned: Mutex<Option<Arc<OwnedCollector>>>,
 }
 
 impl ResidencySampler {
@@ -77,7 +89,16 @@ impl ResidencySampler {
         Arc::new(Self {
             state: Mutex::default(),
             collect,
+            owned: Mutex::default(),
         })
+    }
+
+    /// Exclude recorded live engines as well as this role's descendants.
+    /// A failed ownership read omits the diagnostic rather than mislabelling.
+    pub fn set_owned_processes(&self, collect: Arc<OwnedCollector>) {
+        if let Ok(mut owned) = self.owned.lock() {
+            *owned = Some(collect);
+        }
     }
 
     /// The latest sample no older than [`MAX_AGE`], keeping only processes
@@ -85,8 +106,13 @@ impl ResidencySampler {
     /// when the sample is older than [`REFRESH`] a new one is started in the
     /// background and a later call reports it.
     pub fn current(self: &Arc<Self>) -> Vec<ProcessResident> {
+        self.current_with_outside().0
+    }
+
+    /// One cached compute-apps sample, including informational outside holders.
+    pub fn current_with_outside(self: &Arc<Self>) -> Sample {
         let Ok(mut state) = self.state.lock() else {
-            return Vec::new();
+            return Sample::default();
         };
         let stale = state
             .last
@@ -98,7 +124,7 @@ impl ResidencySampler {
             let spawned = std::thread::Builder::new()
                 .name("capyctl-residency".into())
                 .spawn(move || {
-                    let sample = this.sample_now();
+                    let sample = this.sample_with_outside();
                     if let Ok(mut state) = this.state.lock() {
                         state.last = Some((Instant::now(), sample));
                         state.running = false;
@@ -109,12 +135,15 @@ impl ResidencySampler {
             }
         }
         match &state.last {
-            Some((at, sample)) if at.elapsed() < MAX_AGE => sample
-                .iter()
-                .filter(|p| start_ticks(p.pid) == Some(p.start_ticks))
-                .cloned()
-                .collect(),
-            _ => Vec::new(),
+            Some((at, (residents, outside))) if at.elapsed() < MAX_AGE => (
+                residents
+                    .iter()
+                    .filter(|p| start_ticks(p.pid) == Some(p.start_ticks))
+                    .cloned()
+                    .collect(),
+                outside.clone(),
+            ),
+            _ => Sample::default(),
         }
     }
 
@@ -123,7 +152,12 @@ impl ResidencySampler {
     /// every few tens of seconds), for which a cached sample is always past
     /// [`MAX_AGE`] (found live on a 16 GB discrete GPU).
     pub fn sample_fresh(&self) -> Vec<ProcessResident> {
-        let sample = self.sample_now();
+        self.sample_fresh_with_outside().0
+    }
+
+    /// A single fresh reading shared by admission evidence and outside holders.
+    pub fn sample_fresh_with_outside(&self) -> Sample {
+        let sample = self.sample_with_outside();
         if let Ok(mut state) = self.state.lock() {
             state.last = Some((Instant::now(), sample.clone()));
         }
@@ -134,54 +168,80 @@ impl ResidencySampler {
     /// process, with its GPU memory per GPU (`per_device`) and their sum
     /// (`device_bytes`); its host pages are read once, never per GPU.
     pub fn sample_now(&self) -> Vec<ProcessResident> {
-        let Some(gpu) = (self.collect)() else {
-            return Vec::new();
-        };
-        let Some(boot_id) = boot_id() else {
-            return Vec::new();
-        };
-        let mut processes: Vec<(u32, Vec<DeviceBytes>)> = Vec::new();
-        for (pid, device, bytes) in gpu {
-            let Ok(bytes) = u64::try_from(bytes) else {
-                return Vec::new();
-            };
-            let at = match processes.iter().position(|(p, _)| *p == pid) {
-                Some(at) => at,
-                None => {
-                    processes.push((pid, Vec::new()));
-                    processes.len() - 1
-                }
-            };
-            let per_device = &mut processes[at].1;
-            match per_device.iter_mut().find(|d| d.device == device) {
-                Some(entry) => entry.bytes = entry.bytes.saturating_add(bytes),
-                None => per_device.push(DeviceBytes { device, bytes }),
-            }
-        }
-        processes
-            .into_iter()
-            .take(MAX_PROCESSES)
-            .filter_map(|(pid, per_device)| {
-                let start_ticks = start_ticks(pid)?;
-                let anonymous = anonymous_resident_bytes(pid)?;
-                let gpu_bytes = per_device.iter().try_fold(0_i64, |sum, d| {
-                    sum.checked_add(i64::try_from(d.bytes).ok()?)
-                })?;
-                // ADR 0019: the two figures stay separate so a discrete host
-                // credits each to its own domain; a unified host credits the
-                // sum (ADR 0007).
-                Some(ProcessResident {
-                    pid,
-                    boot_id: boot_id.clone(),
-                    start_ticks,
-                    bytes: gpu_bytes.checked_add(anonymous)?,
-                    device_bytes: gpu_bytes,
-                    host_bytes: anonymous,
-                    per_device,
-                })
-            })
-            .collect()
+        self.sample_with_outside().0
     }
+
+    fn sample_with_outside(&self) -> Sample {
+        let Some(gpu) = (self.collect)() else {
+            return Sample::default();
+        };
+        let collect = self.owned.lock().ok().and_then(|owned| owned.clone());
+        let outside = match collect {
+            Some(collect) => match collect() {
+                Some(owned) => {
+                    let boot = boot_id();
+                    let rows = gpu.iter().filter(|(pid, _, _)| {
+                        !owned.iter().any(|identity| {
+                            identity.pid == *pid
+                                && Some(identity.boot_id.as_str()) == boot.as_deref()
+                                && start_ticks(*pid) == Some(identity.start_ticks)
+                        })
+                    });
+                    outside_processes(rows, Path::new("/proc"), std::process::id())
+                }
+                None => BTreeMap::new(),
+            },
+            None => outside_processes(&gpu, Path::new("/proc"), std::process::id()),
+        };
+        (resident_processes(gpu), outside)
+    }
+}
+
+fn resident_processes(gpu: Vec<GpuReading>) -> Vec<ProcessResident> {
+    let Some(boot_id) = boot_id() else {
+        return Vec::new();
+    };
+    let mut processes: Vec<(u32, Vec<DeviceBytes>)> = Vec::new();
+    for (pid, device, bytes) in gpu {
+        let Ok(bytes) = u64::try_from(bytes) else {
+            return Vec::new();
+        };
+        let at = match processes.iter().position(|(p, _)| *p == pid) {
+            Some(at) => at,
+            None => {
+                processes.push((pid, Vec::new()));
+                processes.len() - 1
+            }
+        };
+        let per_device = &mut processes[at].1;
+        match per_device.iter_mut().find(|d| d.device == device) {
+            Some(entry) => entry.bytes = entry.bytes.saturating_add(bytes),
+            None => per_device.push(DeviceBytes { device, bytes }),
+        }
+    }
+    processes
+        .into_iter()
+        .take(MAX_PROCESSES)
+        .filter_map(|(pid, per_device)| {
+            let start_ticks = start_ticks(pid)?;
+            let anonymous = anonymous_resident_bytes(pid)?;
+            let gpu_bytes = per_device.iter().try_fold(0_i64, |sum, d| {
+                sum.checked_add(i64::try_from(d.bytes).ok()?)
+            })?;
+            // ADR 0019: the two figures stay separate so a discrete host
+            // credits each to its own domain; a unified host credits the
+            // sum (ADR 0007).
+            Some(ProcessResident {
+                pid,
+                boot_id: boot_id.clone(),
+                start_ticks,
+                bytes: gpu_bytes.checked_add(anonymous)?,
+                device_bytes: gpu_bytes,
+                host_bytes: anonymous,
+                per_device,
+            })
+        })
+        .collect()
 }
 
 /// ADR 0035 §8: the host device id (`gpuN`, N the driver's index) of each GPU
@@ -192,6 +252,164 @@ pub fn inventory_devices(sample: &crate::gpu_memory::GpuSample) -> BTreeMap<Stri
         .iter()
         .map(|device| (device.uuid.clone(), format!("gpu{}", device.index)))
         .collect()
+}
+
+/// ADR 0035 §8 (owner decision 2026-11-13): identify outside GPU holders.
+/// Only comm, stat and a CapyCTL ancestor's argv are read. No argv other than
+/// the state directory leaves this function; unreadable processes retain bytes.
+fn outside_processes<'a>(
+    gpu: impl IntoIterator<Item = &'a GpuReading>,
+    proc_root: &Path,
+    own_pid: u32,
+) -> BTreeMap<String, OutsideProcesses> {
+    let deadline = Instant::now() + PROC_BOUND;
+    let mut identities = BTreeMap::new();
+    let mut devices: BTreeMap<String, Vec<OutsideProcess>> = BTreeMap::new();
+    for (pid, device, bytes) in gpu {
+        if Instant::now() >= deadline {
+            // An incomplete ownership pass must not label our own engines outside.
+            return BTreeMap::new();
+        }
+        let Ok(bytes) = u64::try_from(*bytes) else {
+            continue;
+        };
+        if bytes == 0 {
+            continue;
+        }
+        let identity = identities
+            .entry(*pid)
+            .or_insert_with(|| process_description(proc_root, *pid, own_pid));
+        let Some((name, capyctl)) = identity else {
+            continue;
+        };
+        devices
+            .entry(device.clone())
+            .or_default()
+            .push(OutsideProcess {
+                pid: *pid,
+                name: name.clone(),
+                bytes,
+                capyctl_state_dir: capyctl.clone().flatten(),
+                other_capyctl: capyctl.is_some(),
+            });
+    }
+    devices
+        .into_iter()
+        .map(|(device, mut processes)| {
+            processes.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes).then(a.pid.cmp(&b.pid)));
+            let remainder =
+                (processes.len() > MAX_OUTSIDE_PROCESSES).then(|| OutsideProcessRemainder {
+                    count: (processes.len() - MAX_OUTSIDE_PROCESSES) as u32,
+                    bytes: processes[MAX_OUTSIDE_PROCESSES..]
+                        .iter()
+                        .fold(0_u64, |sum, p| sum.saturating_add(p.bytes)),
+                });
+            processes.truncate(MAX_OUTSIDE_PROCESSES);
+            (
+                device,
+                OutsideProcesses {
+                    processes,
+                    remainder,
+                },
+            )
+        })
+        .collect()
+}
+
+/// None is ours; Some preserves an unknown name and unknown CapyCTL ownership.
+fn process_description(
+    root: &Path,
+    pid: u32,
+    own_pid: u32,
+) -> Option<(Option<String>, Option<Option<String>>)> {
+    let name = proc_text(&root.join(pid.to_string()).join("comm"), 256)
+        .and_then(|text| safe_text(text.trim(), 64));
+    let mut ancestor = pid;
+    let mut capyctl = None;
+    for level in 0..=ANCESTOR_LEVELS {
+        if ancestor == own_pid {
+            return None;
+        }
+        if level > 0 {
+            let directory = root.join(ancestor.to_string());
+            if proc_text(&directory.join("comm"), 256).is_some_and(|comm| comm.trim() == "capyctl")
+            {
+                if let Some(argv) = proc_bytes(&directory.join("cmdline"), 64 * 1024) {
+                    if let Some(state_dir) = capyctl_state_dir(&argv) {
+                        capyctl = Some(state_dir);
+                    }
+                }
+            }
+        }
+        let Some(parent) = proc_text(&root.join(ancestor.to_string()).join("stat"), 4096)
+            .and_then(|stat| parent_pid(&stat))
+        else {
+            break;
+        };
+        if parent == 0 || parent == ancestor {
+            break;
+        }
+        ancestor = parent;
+    }
+    Some((name, capyctl))
+}
+
+fn proc_bytes(path: &Path, bound: usize) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(bound as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= bound).then_some(bytes)
+}
+
+fn proc_text(path: &Path, bound: usize) -> Option<String> {
+    String::from_utf8(proc_bytes(path, bound)?).ok()
+}
+
+fn safe_text(text: &str, bound: usize) -> Option<String> {
+    (!text.is_empty() && text.len() <= bound && !text.chars().any(char::is_control))
+        .then(|| text.to_owned())
+}
+
+fn parent_pid(stat: &str) -> Option<u32> {
+    stat.get(stat.rfind(')')? + 2..)?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// A recognized role ancestor, with only --state-dir retained. An absent,
+/// inaccessible or oversized directory is explicitly unknown.
+fn capyctl_state_dir(argv: &[u8]) -> Option<Option<String>> {
+    let mut args = argv.split(|byte| *byte == 0);
+    let program = std::str::from_utf8(args.next()?).ok()?;
+    if Path::new(program).file_name()? != "capyctl" {
+        return None;
+    }
+    let mut start = false;
+    let mut role = false;
+    let mut state_dir = None;
+    while let Some(arg) = args.next() {
+        if arg == b"--state-dir" {
+            state_dir = args
+                .next()
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(|value| safe_text(value, 512));
+            start = false;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix(b"--state-dir=") {
+            state_dir = std::str::from_utf8(value)
+                .ok()
+                .and_then(|value| safe_text(value, 512));
+        }
+        role |= start && matches!(arg, b"host" | b"standalone" | b"server");
+        start = arg == b"start";
+    }
+    role.then_some(state_dir)
 }
 
 /// Parse `nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory
@@ -380,6 +598,97 @@ fn status_kib(status: &str, name: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn proc_fixture() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    fn fixture_process(root: &Path, pid: u32, parent: u32, name: &str, argv: Option<&[u8]>) {
+        let directory = root.join(pid.to_string());
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("comm"), format!("{name}\n")).unwrap();
+        std::fs::write(
+            directory.join("stat"),
+            format!("{pid} ({name}) S {parent} 0 0"),
+        )
+        .unwrap();
+        if let Some(argv) = argv {
+            std::fs::write(directory.join("cmdline"), argv).unwrap();
+        }
+    }
+
+    // T26 T29: a scheduler two parents below a different CapyCTL reports
+    // only its comm and that role's state directory, never its other args.
+    #[test]
+    fn outside_holder_finds_a_capyctl_two_parents_up() {
+        let root = proc_fixture();
+        fixture_process(root.path(), 10, 11, "sglang::scheduler", None);
+        fixture_process(root.path(), 11, 12, "python", None);
+        fixture_process(root.path(), 12, 1, "capyctl", Some(
+            b"/usr/local/bin/capyctl\0--state-dir\0/home/owner/shardio\0--api-key\0SECRET\0start\0standalone\0",
+        ));
+        let sample = outside_processes(&[(10, "gpu0".into(), 12800 << 20)], root.path(), 999);
+        let process = &sample["gpu0"].processes[0];
+        assert_eq!(process.name.as_deref(), Some("sglang::scheduler"));
+        assert_eq!(
+            process.capyctl_state_dir.as_deref(),
+            Some("/home/owner/shardio")
+        );
+        assert!(process.other_capyctl);
+        assert!(!serde_json::to_string(process).unwrap().contains("SECRET"));
+        assert!(outside_processes(&[(10, "gpu0".into(), 1)], root.path(), 12).is_empty());
+    }
+
+    // T26: hidden /proc keeps the driver's PID and bytes. No NVIDIA tool or
+    // no compute-app rows produces no optional outside-process observation.
+    #[test]
+    fn hidden_process_and_absent_nvidia_are_not_errors() {
+        let root = proc_fixture();
+        let sample = outside_processes(&[(50, "gpu0".into(), 1024)], root.path(), 999);
+        let process = &sample["gpu0"].processes[0];
+        assert_eq!((process.pid, process.bytes), (50, 1024));
+        assert_eq!(process.name, None);
+        assert_eq!(process.capyctl_state_dir, None);
+        assert!(!process.other_capyctl);
+        let no_tool = ResidencySampler::with_collector(Arc::new(|| None));
+        assert!(no_tool.sample_fresh_with_outside().1.is_empty());
+        let no_rows = ResidencySampler::with_collector(Arc::new(|| Some(Vec::new())));
+        assert!(no_rows.sample_fresh_with_outside().1.is_empty());
+    }
+
+    // T26: rows are largest first and remaining count and bytes are retained.
+    #[test]
+    fn outside_rows_are_capped_and_remainder_is_summed() {
+        let root = proc_fixture();
+        let rows: Vec<_> = (1..=20)
+            .map(|pid| (pid, "gpu0".into(), i64::from(pid)))
+            .collect();
+        let sample = outside_processes(&rows, root.path(), 999);
+        let device = &sample["gpu0"];
+        assert_eq!(device.processes.len(), 16);
+        assert_eq!(device.processes[0].pid, 20);
+        assert_eq!(
+            device.remainder,
+            Some(OutsideProcessRemainder {
+                count: 4,
+                bytes: 10
+            })
+        );
+        assert_eq!(capyctl_state_dir(b"capyctl\0start\0host\0"), Some(None));
+        assert_eq!(
+            capyctl_state_dir(b"capyctl\0--state-dir=/safe\0start\0host\0"),
+            Some(Some("/safe".into()))
+        );
+        assert_eq!(capyctl_state_dir(b"python\0start\0host\0"), None);
+        assert_eq!(parent_pid("10 (a ) tricky) S 12 0"), Some(12));
+    }
+
+    // T26: opt-in, read-only laptop evidence. This never starts an engine.
+    #[test]
+    #[ignore = "reads the real NVIDIA driver and /proc; run explicitly on a GPU host"]
+    fn live_outside_gpu_processes() {
+        let (_, outside) = ResidencySampler::nvidia().sample_fresh_with_outside();
+        println!("{}", serde_json::to_string_pretty(&outside).unwrap());
+    }
 
     fn inventory() -> BTreeMap<String, String> {
         BTreeMap::from([

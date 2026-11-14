@@ -115,6 +115,34 @@ Top level:
 The snapshot holds other collections too. They are CapyCTL's own records, and
 a controller does not need them.
 
+GPU domain observations and host-session domains may also carry optional
+outside-holder diagnostics (ADR 0035 §8, SPEC §7.2):
+
+```json
+{
+  "outside_processes": [
+    {"pid": 1234, "name": null, "bytes": 1073741824,
+     "capyctl_state_dir": null, "other_capyctl": false}
+  ],
+  "outside_processes_remainder": {"count": 2, "bytes": 536870912}
+}
+```
+
+These are flattened fields, not a nested `processes` object. Both are absent
+when unavailable or empty; the remainder is absent unless rows were omitted.
+Rows have numeric PID and bytes, nullable name and state directory, and boolean
+`other_capyctl`. At most 16 rows per GPU appear, largest bytes first; the
+remainder sums omitted holders. Names stop at 64 characters and state
+directories at 512 bytes. The optional host-to-server capability
+`outside_gpu_processes` is not required for placement. These are read-only
+diagnostics, not ownership, reclaimable capacity or permission to signal a
+process. Collection never reads environments or exposes command arguments
+other than another CapyCTL's state directory; treat names and paths as local
+information visible to authenticated management clients.
+To stay within the host-message size bound, a large report may keep fewer
+rows, adding omitted holders to the remainder. Diagnostics that cannot fit
+are absent; they never prevent the memory observation from arriving.
+
 For each deployment:
 
 - `id`, `name`, and `revision`: the revision the next change must name.

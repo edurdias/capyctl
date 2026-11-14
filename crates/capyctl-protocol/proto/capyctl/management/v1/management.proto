@@ -281,6 +281,22 @@ message DomainObservation {
   // `meminfo:cgroup_v1_unread` or `meminfo:cgroup_v2_unreadable`. Status only;
   // empty for a device domain and from an older host.
   string memory_source = 10;
+  // ADR 0035 §8 / SPEC §7.2 (owner decision 2026-11-13, additive,
+  // capability `outside_gpu_processes`): GPU holders outside this CapyCTL.
+  // Status only, never ownership evidence. Both absent when unavailable/empty.
+  repeated OutsideProcess outside_processes = 11;
+  optional OutsideProcessRemainder outside_processes_remainder = 12;
+}
+message OutsideProcess {
+  uint32 pid = 1;
+  optional string name = 2;                 // safe process name, at most 64 characters
+  uint64 bytes = 3;
+  optional string capyctl_state_dir = 4;    // at most 512 bytes; only for other_capyctl
+  bool other_capyctl = 5;
+}
+message OutsideProcessRemainder {
+  uint32 count = 1;
+  uint64 bytes = 2;
 }
 message ProcessResidency {
   uint32 pid = 1;

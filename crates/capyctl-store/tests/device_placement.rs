@@ -98,6 +98,7 @@ fn gpus(gpu0_managed: &str) -> Gpus {
 
 fn observation(domain: &str, at: i64) -> MemoryObservation {
     MemoryObservation {
+        outside_processes: None,
         domain: domain.into(),
         capacity_bytes: 1 << 40,
         available_bytes: 1 << 40,
@@ -632,6 +633,7 @@ fn a_host_backed_victim_is_planned_a_stop_when_observed_host_ram_cannot_take_its
             capyctl_store::ordinary_lifecycle::switching::PlanningObservations::new();
         if system_available > 0 {
             let observation = |domain: &str, capacity: i64, available: i64| MemoryObservation {
+                outside_processes: None,
                 domain: domain.into(),
                 capacity_bytes: capacity,
                 available_bytes: available,
@@ -726,6 +728,7 @@ fn a_victim_whose_switch_park_was_refused_for_memory_is_reported_host_ram_full()
     let low: Vec<_> = [("system", 32, 9), ("gpu0", 23, 11), ("gpu1", 31, 31)]
         .iter()
         .map(|(domain, capacity, available)| MemoryObservation {
+            outside_processes: None,
             domain: (*domain).into(),
             capacity_bytes: capacity * GIB,
             available_bytes: available * GIB,

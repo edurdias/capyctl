@@ -48,6 +48,7 @@ fn fixture() -> (
                 capacity_bytes: 64_i64 << 30,
                 available_bytes: 64_i64 << 30,
                 sampled_at_ms: 1000,
+                outside_processes: None,
             }],
             1000,
         )
@@ -773,6 +774,7 @@ async fn current_policy_is_composed_without_breaking_historical_retries() {
                     capacity_bytes: 64_i64 << 30,
                     available_bytes: 64_i64 << 30,
                     sampled_at_ms: now,
+                    outside_processes: None,
                 }],
                 now,
             )
@@ -879,6 +881,7 @@ async fn registry_configuration_freezes_selected_host_and_replays() {
                     capacity_bytes: 64_i64 << 30,
                     available_bytes: 64_i64 << 30,
                     sampled_at_ms: 1000,
+                    outside_processes: None,
                 }],
                 1000,
             )
@@ -1067,6 +1070,7 @@ fn publish_host(
                 capacity_bytes: 64_i64 << 30,
                 available_bytes: 64_i64 << 30,
                 sampled_at_ms: 1000,
+                outside_processes: None,
             }],
             1000,
         )
@@ -1746,6 +1750,7 @@ async fn preview_selects_the_fitting_hosts_pin() {
                     capacity_bytes: 1 << 40,
                     available_bytes: 1 << 40,
                     sampled_at_ms: 1000,
+                    outside_processes: None,
                 }])
             })
         }

@@ -30,6 +30,7 @@ fn a_parking_deployment_gets_a_declared_identity() {
     let store = Store::open_in_memory().unwrap();
     let session = store.begin_coordinator_session().unwrap();
     let observations = vec![MemoryObservation {
+        outside_processes: None,
         domain: "unified".into(),
         capacity_bytes: 64 << 30,
         available_bytes: 60 << 30,
@@ -99,6 +100,7 @@ pub(super) fn armed_ordinary() -> (
     let store = Store::open_in_memory().unwrap();
     let session = store.begin_coordinator_session().unwrap();
     let observations = vec![MemoryObservation {
+        outside_processes: None,
         domain: "unified".into(),
         capacity_bytes: 64 << 30,
         available_bytes: 60 << 30,

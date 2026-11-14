@@ -595,6 +595,7 @@ mod tests {
         assert_eq!(ledger_only[0].release, Release::Park);
         let observe = |available: i64| {
             vec![capyctl_domain::resources::MemoryObservation {
+                outside_processes: None,
                 domain: "unified".into(),
                 capacity_bytes: 64 * GIB,
                 available_bytes: available,

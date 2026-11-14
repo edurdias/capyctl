@@ -1160,6 +1160,7 @@ async fn real_elapsed_service_clock_bounds_provenance_before_send() {
                     capacity_bytes: 1_i64 << 50,
                     available_bytes: 1_i64 << 50,
                     sampled_at_ms: now,
+                    outside_processes: None,
                 }])
             })
         }
@@ -3584,6 +3585,7 @@ mod native {
                     capacity_bytes: 1_i64 << 50,
                     available_bytes: 1_i64 << 50,
                     sampled_at_ms: now,
+                    outside_processes: None,
                 })
                 .collect();
             store
@@ -3861,6 +3863,7 @@ mod native {
                     capacity_bytes: 1_i64 << 50,
                     available_bytes: 1_i64 << 50,
                     sampled_at_ms: now,
+                    outside_processes: None,
                 })
                 .collect();
             store

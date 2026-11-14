@@ -417,8 +417,65 @@ async fn standalone_serves_its_embedded_host_at_the_inventory_routes() {
                 installations: capyctl_controller::installation_gate::EmbeddedInstallations::new(),
                 domains: Arc::new(|| {
                     Box::pin(async {
-                        vec![json!({"domain_id": "system", "kind": "host",
-                    "capacity_bytes": 64_i64 << 30, "available_bytes": 32_i64 << 30})]
+                        let observation = |domain: &str, outside_processes| {
+                            capyctl_domain::resources::MemoryObservation {
+                                domain: domain.into(),
+                                capacity_bytes: 64_i64 << 30,
+                                available_bytes: 32_i64 << 30,
+                                sampled_at_ms: 1000,
+                                outside_processes,
+                            }
+                        };
+                        let outside = capyctl_domain::resources::OutsideProcesses {
+                            processes: vec![
+                                capyctl_domain::resources::OutsideProcess {
+                                    pid: 42,
+                                    name: Some("trainer".into()),
+                                    bytes: 24 << 30,
+                                    capyctl_state_dir: Some("/home/user/other-capyctl".into()),
+                                    other_capyctl: true,
+                                },
+                                capyctl_domain::resources::OutsideProcess {
+                                    pid: 43,
+                                    name: None,
+                                    bytes: 2 << 30,
+                                    capyctl_state_dir: None,
+                                    other_capyctl: false,
+                                },
+                            ],
+                            remainder: Some(capyctl_domain::resources::OutsideProcessRemainder {
+                                count: 3,
+                                bytes: 1 << 30,
+                            }),
+                        };
+                        vec![
+                            capyctl_management::hosts::standalone_domain(
+                                observation("system", None),
+                                false,
+                                "meminfo",
+                            ),
+                            capyctl_management::hosts::standalone_domain(
+                                observation("accelerator", Some(outside)),
+                                true,
+                                "meminfo",
+                            ),
+                            capyctl_management::hosts::standalone_domain(
+                                observation("idle", None),
+                                true,
+                                "meminfo",
+                            ),
+                            capyctl_management::hosts::standalone_domain(
+                                observation(
+                                    "empty",
+                                    Some(capyctl_domain::resources::OutsideProcesses {
+                                        processes: Vec::new(),
+                                        remainder: None,
+                                    }),
+                                ),
+                                true,
+                                "meminfo",
+                            ),
+                        ]
                     })
                 }),
                 memory_warnings: Arc::new(std::sync::OnceLock::from(vec![
@@ -466,6 +523,29 @@ async fn standalone_serves_its_embedded_host_at_the_inventory_routes() {
         row["session"]["domains"][0]["available_bytes"],
         32_i64 << 30
     );
+    // T26 T29 / ADR 0035 §8: snapshot holders are flattened, with nullable
+    // metadata retained; host RAM and an unavailable/empty GPU sample omit them.
+    let domains = &row["session"]["domains"];
+    assert!(domains[0].get("outside_processes").is_none());
+    assert!(domains[0].get("outside_processes_remainder").is_none());
+    assert_eq!(domains[1]["domain_id"], "accelerator");
+    assert_eq!(
+        domains[1]["outside_processes"],
+        json!([
+            {"pid":42, "name":"trainer", "bytes":24_u64 << 30,
+                "capyctl_state_dir":"/home/user/other-capyctl", "other_capyctl":true},
+            {"pid":43, "name":null, "bytes":2_u64 << 30,
+                "capyctl_state_dir":null, "other_capyctl":false}
+        ])
+    );
+    assert_eq!(
+        domains[1]["outside_processes_remainder"],
+        json!({"count":3, "bytes":1_u64 << 30}),
+    );
+    assert!(domains[2].get("outside_processes").is_none());
+    assert!(domains[2].get("outside_processes_remainder").is_none());
+    assert!(domains[3].get("outside_processes").is_none());
+    assert!(domains[3].get("outside_processes_remainder").is_none());
     // Server parity: the binary's capabilities, profile eligibility and the
     // installation's missing capabilities, reconciled, drain and observed time.
     assert!(row["capabilities"]

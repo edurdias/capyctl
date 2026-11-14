@@ -207,6 +207,7 @@ mod lru_tests {
 
     fn observed() -> Vec<MemoryObservation> {
         vec![MemoryObservation {
+            outside_processes: None,
             domain: "unified".into(),
             capacity_bytes: 128 * GIB,
             available_bytes: 128 * GIB,
@@ -368,6 +369,7 @@ mod lru_tests {
         // 16 GiB in use: the Ready owner's 10 and the parked owner's 4, both
         // credited, and 2 of the host's own.
         let observations = vec![MemoryObservation {
+            outside_processes: None,
             domain: "unified".into(),
             capacity_bytes: 32 * GIB,
             available_bytes: 16 * GIB,

@@ -83,6 +83,7 @@ impl Preview {
                     capacity_bytes: 128 << 30,
                     available_bytes: 120 << 30,
                     sampled_at_ms: 1000,
+                    outside_processes: None,
                 })
                 .collect();
             let owned = owner.lock().unwrap();
@@ -346,6 +347,8 @@ async fn model_that_fits_only_on_an_empty_host_needs_room() {
     let (status, value) = p.request(json!({"config":config})).await;
     assert_eq!(status, 200, "{value}");
     assert_eq!(value["verdict"], "needs_room", "{value}");
+    assert!(value["reason"].is_null(), "{value}");
+    assert!(value["hosts"][0]["reason"].is_null(), "{value}");
 }
 
 // U7 R21: metadata gives an estimate even before any deployment exists.
@@ -542,26 +545,53 @@ async fn server_provider_refuses_until_host_admin_forwarding_is_installed() {
     assert_eq!(value["reason"], "host_unavailable", "{value}");
 }
 
-// T29 / ADR 0040 §9: physical admission and its refusal figures are shared
+// T26 T29 / ADR 0035 §8 / SPEC §7.2: admission's holder explanation is shared
 // with Start even when the model fits the configured managed limit.
 #[tokio::test]
 async fn low_observed_free_memory_returns_the_actual_start_refusal() {
-    let p = Preview::new(true, |_| {});
+    let p = Preview::new(true, |host| {
+        host["resource_policy"]["domains"]["unified"]["memory"] = json!("distinct");
+        host["resource_policy"]["domains"]["vram"] = json!({
+            "memory":"device","device":"gpu0","managed_limit":"64GiB","free_reserve":"1GiB",
+            "parked_limit":"0B"
+        });
+        host["resource_policy"]["devices"]["gpu0"]["domain"] = json!("vram");
+    });
     p.measure(json!("/weights"), 1 << 30);
     for observation in p.readings.0.lock().unwrap().iter_mut() {
-        observation.available_bytes = 20 << 30;
+        if observation.domain == "vram" {
+            observation.available_bytes = 1 << 30;
+        }
     }
-    let fixture: Value = serde_json::from_str(include_str!(
-        "../../capyctl-config/tests/fixtures/f2-deployment.json"
-    ))
-    .unwrap();
-    let mut config = fixture["deployment"].clone();
-    config["name"] = json!("preview");
-    config["routes"] = json!(["preview"]);
-    config["model"] = json!("/weights");
+    let config = json!({"name":"preview","engine":"vllm","model":"/weights",
+        "engine_config":{"memory":{"kv_cache":"16GiB"}}});
+    let (status, absent) = p.request(json!({"config": config.clone()})).await;
+    assert_eq!(status, 200, "{absent}");
+    assert_eq!(absent["verdict"], "does_not_fit", "{absent}");
+    for observation in p.readings.0.lock().unwrap().iter_mut() {
+        if observation.domain == "vram" {
+            observation.outside_processes = Some(capyctl_domain::resources::OutsideProcesses {
+                processes: vec![capyctl_domain::resources::OutsideProcess {
+                    pid: 4242,
+                    name: Some("trainer".into()),
+                    bytes: 24 << 30,
+                    capyctl_state_dir: None,
+                    other_capyctl: false,
+                }],
+                remainder: None,
+            });
+        }
+    }
     let (status, value) = p.request(json!({"config": config})).await;
     assert_eq!(status, 200, "{value}");
     assert_eq!(value["verdict"], "does_not_fit", "{value}");
+    let limit = value["limit"].as_str().unwrap();
+    assert!(
+        limit.starts_with(absent["limit"].as_str().unwrap()),
+        "{limit}"
+    );
+    assert!(limit.contains("trainer"), "{limit}");
+    assert!(limit.contains("4242"), "{limit}");
     let observations = p.readings.0.lock().unwrap().clone();
     let owned = p.owner.lock().unwrap();
     let store = owned.store();
@@ -575,6 +605,23 @@ async fn low_observed_free_memory_returns_the_actual_start_refusal() {
             1000,
         )
         .unwrap();
+    // First start still needs digest evidence for this newly stored revision;
+    // preview's size-only evidence belongs to the earlier measurement.
+    let recorded = store
+        .record_checkpoint_digest(
+            owned.session(),
+            &receipt.deployment_id,
+            receipt.revision,
+            "lab",
+            &format!("sha256:{}", "a".repeat(64)),
+            1 << 30,
+            1000,
+        )
+        .unwrap();
+    assert!(matches!(
+        recorded,
+        capyctl_store::checkpoint_digests::RecordOutcome::Recorded { .. }
+    ));
     let start = store
         .accept_start(
             owned.session(),
@@ -618,7 +665,7 @@ async fn low_observed_free_memory_returns_the_actual_start_refusal() {
     let capyctl_store::lifecycle::LifecycleError::Rejected(reason) = error else {
         panic!("expected physical capacity refusal, got {error:?}");
     };
-    assert!(reason.contains("insufficient_memory"), "{reason}");
+    assert!(reason.contains("insufficient_device_memory"), "{reason}");
     assert_eq!(value["limit"], reason);
 }
 

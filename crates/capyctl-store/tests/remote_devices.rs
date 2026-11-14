@@ -72,6 +72,7 @@ fn discrete_host() -> (Value, Value) {
 
 fn observation(domain: &str, at: i64) -> MemoryObservation {
     MemoryObservation {
+        outside_processes: None,
         domain: domain.into(),
         capacity_bytes: 1 << 40,
         available_bytes: 1 << 40,
@@ -411,6 +412,7 @@ fn a_remote_unified_host_is_credited_the_resident_sum_as_before() {
         assert_eq!(planned.len(), 2);
         t.ready(&planned[0].0, 100);
         let observations = vec![MemoryObservation {
+            outside_processes: None,
             domain: t.scoped("domain", "unified"),
             capacity_bytes: 64 * GIB,
             available_bytes: 30 * GIB,
@@ -480,6 +482,7 @@ fn a_remote_discrete_host_is_credited_per_domain() {
         let observations: Vec<_> = ["system", "gpu0", "gpu1"]
             .iter()
             .map(|d| MemoryObservation {
+                outside_processes: None,
                 domain: t.scoped("domain", d),
                 capacity_bytes: if *d == "gpu1" { 32 * GIB } else { 1 << 40 },
                 available_bytes: if *d == "gpu1" { 20 * GIB } else { 1 << 40 },

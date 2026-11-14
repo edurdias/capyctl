@@ -221,6 +221,7 @@ mod tests {
             capacity_bytes: 64 << 30,
             available_bytes: 40 << 30,
             sampled_at_ms: 12_345,
+            outside_processes: None,
         }
     }
 

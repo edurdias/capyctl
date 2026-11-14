@@ -808,11 +808,21 @@ fn the_inventory_refreshes_a_device_domain_from_the_gpu() {
         let unknown = |domain: &str| pb::DomainObservation {
             domain_id: domain.into(),
             kind: "system".into(),
+            device_id: if domain == "gpu0" {
+                "gpu0".into()
+            } else {
+                String::new()
+            },
             observed_bytes: -1,
             capacity_bytes: -1,
             available_bytes: -1,
             ..Default::default()
         };
+        let residency =
+            capyctl_agent::process_residency::ResidencySampler::with_collector(Arc::new(|| {
+                Some(vec![(u32::MAX - 1, "gpu0".into(), 1 << 30)])
+            }));
+        residency.sample_fresh_with_outside();
         NativeHostExecution::new(
             journal,
             Ingress::new().unwrap(),
@@ -831,6 +841,7 @@ fn the_inventory_refreshes_a_device_domain_from_the_gpu() {
             },
         )
         .with_gpu_sampler(gpu)
+        .with_process_residency(residency)
     };
     let sample = capyctl_agent::gpu_memory::parse_query_gpu(
         "0, GPU-11111111-2222-3333-4444-555555555555, 00000000:01:00.0, RTX, 16376, 1536, 14840\n",
@@ -863,9 +874,14 @@ fn the_inventory_refreshes_a_device_domain_from_the_gpu() {
     assert_eq!(gpu.observed_bytes, 14840 << 20);
     assert_eq!(gpu.observed_at_unix_ms, 11_000);
     assert_eq!(gpu.observed_at_unix, 11);
+    assert_eq!(gpu.outside_processes.len(), 1);
+    assert_eq!(gpu.outside_processes[0].pid, u32::MAX - 1);
+    assert_eq!(gpu.outside_processes[0].name, None);
+    assert_eq!(gpu.outside_processes[0].bytes, 1 << 30);
     let system = domain(&inventory, "system");
     assert!(system.capacity_bytes > 0, "host RAM is read from meminfo");
     assert_ne!(system.capacity_bytes, gpu.capacity_bytes);
+    assert!(system.outside_processes.is_empty());
 
     let unobserved = execution(Arc::new(|| None), "unobserved");
     unobserved.inventory();
@@ -879,6 +895,7 @@ fn the_inventory_refreshes_a_device_domain_from_the_gpu() {
         (-1, -1, -1),
         "an unobserved device is published as unknown"
     );
+    assert!(gpu.outside_processes.is_empty());
     assert!(domain(&inventory, "system").capacity_bytes > 0);
 
     // T33: a collector that hangs far past the heartbeat period never holds

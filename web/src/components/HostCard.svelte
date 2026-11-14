@@ -28,6 +28,20 @@
         {#if other > 0}<span><i class="other"></i>Other use <strong>{gib(other)}</strong></span>{/if}
         <span class="muted">{gib(domain.capacity_bytes)} total</span>
       </div>
+      <!-- ADR 0035 §8 / SPEC §7.2: diagnostic holders, not reclaimable memory. -->
+      {#if domain.outside_processes?.length}
+        <div class="outside-processes">
+          <span class="muted">Other use processes</span>
+          <ul>
+            {#each domain.outside_processes as process (process.pid)}
+              <li>{process.name ?? 'process'} · PID {process.pid} · {gib(process.bytes)}{process.other_capyctl ? ` · another CapyCTL (${process.capyctl_state_dir ?? 'unknown'})` : ''}</li>
+            {/each}
+            {#if domain.outside_processes_remainder}
+              <li>and {domain.outside_processes_remainder.count} more · {gib(domain.outside_processes_remainder.bytes)}</li>
+            {/if}
+          </ul>
+        </div>
+      {/if}
       {#if reserved > domain.capacity_bytes}<p class="warning">Models need more memory than this {domain.kind === 'device' ? 'GPU' : 'host'} has.</p>{/if}
     </div>
   {/each}
@@ -58,4 +72,7 @@
   .warnings summary { color: var(--state-changing); padding: 0.25rem 0; display: flex; gap: 0.5rem; align-items: center; }
   .warnings ul { margin: 0.25rem 0 0; padding-left: 1rem; color: var(--capyctl-muted); }
   .warnings li { overflow-wrap: anywhere; margin: 0.25rem 0; }
+  .outside-processes { min-width: 0; max-width: 100%; margin-top: 0.5rem; font-size: 0.75rem; }
+  .outside-processes ul { margin: 0.25rem 0 0; padding-left: 1rem; }
+  .outside-processes li { white-space: normal; overflow-wrap: anywhere; }
 </style>

@@ -1,5 +1,6 @@
 import { ApiError, request } from './api';
 import { DEPLOYMENTS } from './setup-endpoints';
+import type { OutsideProcess, OutsideProcessRemainder } from './types';
 
 // Wire shapes of the management reads the watch views use (SPEC R10, R12,
 // R13). Each one names the handler that writes it.
@@ -14,6 +15,8 @@ export interface MemoryDomain {
   device_id?: string;
   observed_at_unix_ms?: number;
   observed_at_unix?: number;
+  outside_processes?: OutsideProcess[];
+  outside_processes_remainder?: OutsideProcessRemainder;
 }
 
 export interface HostSession {

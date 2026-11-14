@@ -767,7 +767,7 @@ fn resolve_on_host(
 pub enum HostFit {
     Fits,
     /// It fits the host's managed memory, not beside what it holds now.
-    NeedsRoom,
+    NeedsRoom(Option<String>),
     /// The limit, worded as the deploy's or the start's refusal names it.
     DoesNotFit(String),
     /// A closed reason it cannot be told: `no_observations` (the host has
@@ -849,8 +849,8 @@ impl crate::Store {
                 .map_err(|_| ManagedConfigurationError::CorruptStoredData)?
                 {
                     crate::ordinary_lifecycle::placement::CheckedFit::Fits => HostFit::Fits,
-                    crate::ordinary_lifecycle::placement::CheckedFit::NeedsRoom => {
-                        HostFit::NeedsRoom
+                    crate::ordinary_lifecycle::placement::CheckedFit::NeedsRoom(reason) => {
+                        HostFit::NeedsRoom(reason)
                     }
                     crate::ordinary_lifecycle::placement::CheckedFit::DoesNotFit(limit) => {
                         HostFit::DoesNotFit(limit)

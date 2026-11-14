@@ -85,6 +85,7 @@ fn world(max_parked: [u32; 2]) -> World {
                 host,
                 &policy,
                 &[MemoryObservation {
+                    outside_processes: None,
                     domain: "unified".into(),
                     capacity_bytes: 1 << 40,
                     available_bytes: 1 << 40,
@@ -173,6 +174,7 @@ impl World {
             .domains
             .keys()
             .map(|domain| MemoryObservation {
+                outside_processes: None,
                 domain: domain.clone(),
                 capacity_bytes: 1 << 40,
                 available_bytes: available,

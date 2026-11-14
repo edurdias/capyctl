@@ -94,6 +94,7 @@ pub fn fixture_with(edit: impl FnOnce(&mut Value, &mut Value)) -> Fixture {
         .domains
         .keys()
         .map(|domain| MemoryObservation {
+            outside_processes: None,
             domain: domain.clone(),
             capacity_bytes: 1_i64 << 50,
             available_bytes: 1_i64 << 50,

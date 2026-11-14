@@ -157,6 +157,10 @@ pub const LOCAL_TENSOR_PARALLEL: &str = "local_tensor_parallel";
 /// other host is refused `host_capability_missing:host_admin` and sent
 /// nothing (an older host would end its session on the unknown message).
 pub const HOST_ADMIN: &str = "host_admin";
+/// ADR 0035 §8 / SPEC §7.2 (owner decision 2026-11-13): bounded GPU
+/// holders outside this CapyCTL in `DomainObservation`. Status only; never
+/// required for placement or a server-to-host command.
+pub const OUTSIDE_GPU_PROCESSES: &str = "outside_gpu_processes";
 
 /// ADR 0018: bounds on the new messages' strings and lists.
 pub const MAX_REQUEST_ID: usize = 64;
@@ -209,6 +213,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (REQUEST_ABORT, Direction::ServerToHost),
     (LOCAL_TENSOR_PARALLEL, Direction::ServerToHost),
     (HOST_ADMIN, Direction::ServerToHost),
+    (OUTSIDE_GPU_PROCESSES, Direction::HostToServer),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.
