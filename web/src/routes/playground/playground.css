@@ -1,6 +1,9 @@
 /* SPEC R30–R31, R35–R36 / ADR 0040 §12: a bounded page, not a transcript
    underneath the fixed phone navigation. Other routes retain their shell. */
-.shell:has(> .content > .playground) { height: 100dvh; min-height: 0; overflow: hidden; }
+/* `clip`, not `hidden`: a hidden-overflow box can still be scrolled by
+   focusing the composer (a phone keyboard, scrollIntoView), which slid the
+   whole page up under the header. A clipped box has no scroll position. */
+.shell:has(> .content > .playground) { height: 100dvh; min-height: 0; overflow: clip; }
 .shell > .content:has(> .playground) { display: flex; flex-direction: column; min-height: 0; }
 .playground { position: relative; display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; width: 100%; max-width: 72rem; margin-inline: auto; }
 .playground-header { display: flex; align-items: center; gap: 1rem; flex-shrink: 0; padding-bottom: 1rem; border-bottom: 1px solid var(--capyctl-rule); }
