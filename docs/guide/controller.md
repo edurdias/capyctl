@@ -116,7 +116,7 @@ The snapshot holds other collections too. They are CapyCTL's own records, and
 a controller does not need them.
 
 GPU domain observations and host-session domains may also carry optional
-outside-holder diagnostics (ADR 0035 §8, SPEC §7.2):
+outside-holder diagnostics:
 
 ```json
 {

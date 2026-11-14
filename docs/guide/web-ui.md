@@ -101,7 +101,6 @@ Collection excludes this CapyCTL's descendants, bounds names to 64 characters
 and state directories to 512 bytes, never reads environments, and does not
 expose command arguments other than another CapyCTL's state directory.
 Process names and state-directory paths are visible to signed-in browsers.
-See [ADR 0035 §8](../design/adr/0035-multi-gpu-one-host.md#8-per-process-readings-per-gpu).
 
 The UI acts through the same management API as the CLI, so everything it does
 is recorded and refused in the same way.
