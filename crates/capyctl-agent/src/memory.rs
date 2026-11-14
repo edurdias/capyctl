@@ -128,6 +128,7 @@ pub fn parse_meminfo(input: &str, sampled_at_ms: i64) -> Result<HostMemorySample
             capacity_bytes: total,
             available_bytes: available,
             sampled_at_ms,
+            outside_processes: None,
         },
         swap_used_bytes: swap_total - swap_free,
         source: MemorySource::Meminfo,

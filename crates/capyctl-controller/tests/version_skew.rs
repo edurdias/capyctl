@@ -1679,3 +1679,24 @@ async fn a_request_abort_is_sent_only_to_a_host_that_declared_it() {
     assert!(h.sessions.abort_slot(&h.host).is_some());
     h.server.abort();
 }
+
+// T16 T26 T34 (ADR 0035 §8 / SPEC §7.2): an older host without outside
+// process diagnostics remains eligible, with no missing-required warning.
+#[tokio::test]
+async fn outside_gpu_processes_is_never_required_for_placement() {
+    let h = enrolled().await;
+    let mut declared = all();
+    declared.retain(|c| c != capabilities::OUTSIDE_GPU_PROCESSES);
+    let (_send, _stream) = h.reconciled(BINARY_VERSION, declared).await;
+    let view = h.sessions.inspect(&h.host).unwrap();
+    assert_eq!(view.compatibility, "supported");
+    assert!(view.capabilities_missing.is_empty());
+    assert!(view.eligible);
+    assert!(h.sessions.eligible_hosts().unwrap().contains(&h.host));
+    let snapshot = serde_json::to_value(view).unwrap();
+    assert!(snapshot["domains"][0].get("outside_processes").is_none());
+    assert!(snapshot["domains"][0]
+        .get("outside_processes_remainder")
+        .is_none());
+    h.server.abort();
+}

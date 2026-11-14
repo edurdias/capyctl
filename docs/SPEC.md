@@ -307,6 +307,22 @@ On a discrete-GPU host each GPU's memory is a `device` domain observed from the 
 
 One GPU, or with `topology` several identical GPUs of one host, serve one model; CapyCTL picks them unless the deployment pins them (`devices`, exactly N). A model on N GPUs stays one owner with one allocation in each chosen GPU's `device` domain, each charged one rank (its share of the weights by ADR 0028's formula with `T = N`, its KV cache, the margin, the CUDA context allowance and a communication allowance), and one allocation in the system domain with an engine overhead per rank; admission checks every domain together, so the charge is all or nothing. Process readings are per process and GPU, and each GPU's domain is credited only with the bytes on that GPU. `topology: auto` chooses the smallest N whose per-GPU charge fits the cards' managed limits (never their free memory) at placement and keeps it for the launch's life.
 
+**Observation note (owner decision 2026-11-13, ADR 0035 §8, T16):** GPU
+domains may report outside GPU holders, read-only, under the optional
+host-to-server `outside_gpu_processes` capability; it is never required for
+placement. Snapshot fields are optional `outside_processes` (an array of
+`{pid, name, bytes, capyctl_state_dir, other_capyctl}`, with nullable name and
+state directory) and `outside_processes_remainder` (`{count, bytes}`). Both
+are absent for unavailable or empty readings. Keep at most 16 rows per GPU,
+largest bytes first, summing the rest; names are bounded to 64 characters and
+state directories to 512 bytes. Exclude recorded live process identities and
+the current CapyCTL's descendants (ancestor lookup bounded to eight levels).
+Use the existing bounded NVIDIA sampler and a bounded process-description pass;
+optional diagnostics must stay within the existing observation message bound.
+Never read environments, expose arguments other than another CapyCTL's state
+directory, or signal outside processes. This diagnostic does not change
+admission accounting or ownership.
+
 ### 7.3 Reservation lifecycle
 
 | Owner/state | What stays charged |

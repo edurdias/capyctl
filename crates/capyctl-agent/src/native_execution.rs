@@ -452,6 +452,10 @@ impl NativeHostExecution {
         mut self: Arc<Self>,
         sampler: Arc<crate::process_residency::ResidencySampler>,
     ) -> Arc<Self> {
+        let journal = self.journal.clone();
+        sampler.set_owned_processes(Arc::new(move || {
+            journal.with_claimed_processes(<[_]>::to_vec).ok()
+        }));
         self.host_load.set_residency(sampler.clone());
         Arc::make_mut(&mut self).residency = Some(sampler);
         self
@@ -2940,6 +2944,9 @@ impl SessionExecution for NativeHostExecution {
         let declared = !device_domains(&self.profiles.accepted().config.document).is_empty();
         if let Some(gpu) = self.gpu.as_ref().filter(|_| declared) {
             let _ = gpu.fresh();
+            if let Some(residency) = &self.residency {
+                let _ = residency.sample_fresh_with_outside();
+            }
         }
         self.inventory()
     }
@@ -2964,10 +2971,10 @@ impl SessionExecution for NativeHostExecution {
         let memory = reading.memory;
         // ADR 0007: availability first, then the processes still alive, so a
         // process that grew in between is under-credited, never over-credited.
-        let residents = self
+        let (residents, mut outside) = self
             .residency
             .as_ref()
-            .map(|sampler| sampler.current())
+            .map(|sampler| sampler.current_with_outside())
             .unwrap_or_default();
         let domain = &mut inventory.domains[host];
         domain.observed_bytes = memory.available_bytes;
@@ -3026,6 +3033,27 @@ impl SessionExecution for NativeHostExecution {
                         domain.capacity_bytes = memory.total_bytes;
                         domain.observed_at_unix = sampled_at_ms / 1000;
                         domain.observed_at_unix_ms = sampled_at_ms;
+                        if let Some(holders) = outside.remove(&domain.device_id) {
+                            domain.outside_processes = holders
+                                .processes
+                                .into_iter()
+                                .map(|p| pb::OutsideProcess {
+                                    pid: p.pid,
+                                    name: p.name,
+                                    bytes: p.bytes,
+                                    capyctl_state_dir: p.capyctl_state_dir,
+                                    other_capyctl: p.other_capyctl,
+                                })
+                                .collect();
+                            domain.outside_processes_remainder =
+                                holders.remainder.map(|r| pb::OutsideProcessRemainder {
+                                    count: r.count,
+                                    bytes: r.bytes,
+                                });
+                        } else {
+                            domain.outside_processes.clear();
+                            domain.outside_processes_remainder = None;
+                        }
                     }
                     // SPEC §7.2: an unobserved device is unknown (`-1`), which
                     // closes admission on its domain; RAM never stands in.
@@ -3033,6 +3061,8 @@ impl SessionExecution for NativeHostExecution {
                         domain.observed_bytes = -1;
                         domain.available_bytes = -1;
                         domain.capacity_bytes = -1;
+                        domain.outside_processes.clear();
+                        domain.outside_processes_remainder = None;
                     }
                 }
                 domain.residents.clear();
@@ -3044,6 +3074,8 @@ impl SessionExecution for NativeHostExecution {
         // ADR 0028 §12 (R12): each SGLang group member's saver map, from this
         // host's own observation directory; never waits for a read.
         inventory.member_savers = self.reported_member_savers();
+        // ADR 0035 §8: optional diagnostics never crowd out an observation.
+        capyctl_protocol::reports::bound_outside_processes(&mut inventory);
         Some(inventory)
     }
 }

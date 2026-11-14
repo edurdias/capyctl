@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write;
 
+use serde::Serialize;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -46,6 +48,8 @@ pub struct AvailableShortfall {
     pub pending_bytes: i64,
     pub free_reserve_bytes: i64,
     pub short_bytes: i64,
+    /// ADR 0035 §8 / SPEC §7.2: explanatory only, never resident credit.
+    pub outside_processes: Option<OutsideProcesses>,
 }
 
 impl std::fmt::Display for AvailableShortfall {
@@ -78,13 +82,58 @@ impl std::fmt::Display for AvailableShortfall {
             gib(self.available_bytes),
             gib(self.free_reserve_bytes),
             gib(self.short_bytes)
-        )
+        )?;
+        if let Some(reason) = outside_processes_reason(self.outside_processes.as_ref()) {
+            write!(f, "; {reason}")?;
+        }
+        Ok(())
     }
 }
 
 /// Bytes shown to the operator, in GiB with one decimal.
 pub fn gib(bytes: i64) -> String {
     format!("{:.1} GiB", bytes.max(0) as f64 / (1u64 << 30) as f64)
+}
+
+/// ADR 0035 §8 / SPEC §7.2: name at most three largest outside GPU holders.
+/// Plain wording shared by warnings, admission refusals and free-memory checks;
+/// callers must attach it only when observed available memory is limiting.
+pub fn outside_processes_reason(outside: Option<&OutsideProcesses>) -> Option<String> {
+    let outside = outside?;
+    let mut largest: [Option<&OutsideProcess>; 3] = [None; 3];
+    for process in &outside.processes {
+        let mut candidate = Some(process);
+        for slot in &mut largest {
+            if candidate.is_some_and(|p| slot.is_none_or(|s| p.bytes > s.bytes)) {
+                std::mem::swap(slot, &mut candidate);
+            }
+        }
+    }
+    largest[0]?;
+    let mut reason = String::from("outside GPU processes: ");
+    for (index, process) in largest.into_iter().flatten().enumerate() {
+        if index > 0 {
+            reason.push_str(", ");
+        }
+        write!(
+            reason,
+            "PID {} {} ({:.1} GiB",
+            process.pid,
+            process.name.as_deref().unwrap_or("unknown"),
+            process.bytes as f64 / (1u64 << 30) as f64
+        )
+        .expect("writing to a string");
+        if process.other_capyctl {
+            write!(
+                reason,
+                "; another CapyCTL, state dir {}",
+                process.capyctl_state_dir.as_deref().unwrap_or("unknown")
+            )
+            .expect("writing to a string");
+        }
+        reason.push(')');
+    }
+    Some(reason)
 }
 
 /// A domain's own name: an enrolled host's ledger key
@@ -129,7 +178,7 @@ pub fn headroom_warning(
     } else {
         String::new()
     };
-    Some(format!(
+    let mut warning = format!(
         "{} memory has {} available{held}, less than its {} managed limit plus its {} free \
          reserve ({}): a deployment near the limit cannot be admitted until {} more is free",
         local_domain(&limit.domain),
@@ -138,7 +187,34 @@ pub fn headroom_warning(
         gib(reserve),
         gib(needed),
         gib(needed - covered)
-    ))
+    );
+    if let Some(reason) = outside_processes_reason(observation.outside_processes.as_ref()) {
+        write!(warning, "; {reason}").expect("writing to a string");
+    }
+    Some(warning)
+}
+
+/// ADR 0035 §8 / SPEC §7.2: diagnostic GPU holders outside this CapyCTL's
+/// process tree. These bytes never grant admission credit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutsideProcess {
+    pub pid: u32,
+    pub name: Option<String>,
+    pub bytes: u64,
+    pub capyctl_state_dir: Option<String>,
+    pub other_capyctl: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutsideProcessRemainder {
+    pub count: u32,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutsideProcesses {
+    pub processes: Vec<OutsideProcess>,
+    pub remainder: Option<OutsideProcessRemainder>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +223,8 @@ pub struct MemoryObservation {
     pub capacity_bytes: i64,
     pub available_bytes: i64,
     pub sampled_at_ms: i64,
+    /// Unavailable or no rows is `None`; never a source of resident credit.
+    pub outside_processes: Option<OutsideProcesses>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,6 +514,7 @@ fn phase_names_include_transient_parking() {
 #[test]
 fn the_free_memory_refusal_names_its_figures() {
     let refusal = ResourceError::InsufficientAvailable(Box::new(AvailableShortfall {
+        outside_processes: None,
         domain: "system".into(),
         device: false,
         available_bytes: 118 << 30,
@@ -478,6 +557,7 @@ fn the_headroom_warning_appears_only_when_available_memory_falls_short() {
         parked_bytes: None,
     };
     let observed = |available: i64| MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 122 * GIB,
         available_bytes: available,
@@ -513,10 +593,119 @@ fn the_headroom_warning_appears_only_when_available_memory_falls_short() {
         ..limit
     };
     let card = MemoryObservation {
+        outside_processes: None,
         domain: "gpu0".into(),
         capacity_bytes: 16 * GIB,
         available_bytes: 15 * GIB,
         sampled_at_ms: 1,
     };
     assert_eq!(headroom_warning(&device, &card, 0), None);
+}
+
+// T26, T29: ADR 0035 §8 / SPEC §7.2 names only the largest outside holders,
+// never their arguments, and identifies another CapyCTL even without its path.
+#[test]
+fn outside_holder_wording_is_bounded_and_preserves_unknowns() {
+    let holder =
+        |pid, bytes, name: Option<&str>, other_capyctl, state: Option<&str>| OutsideProcess {
+            pid,
+            bytes,
+            name: name.map(str::to_owned),
+            other_capyctl,
+            capyctl_state_dir: state.map(str::to_owned),
+        };
+    let outside = OutsideProcesses {
+        processes: vec![
+            holder(1, 1 << 30, Some("small"), false, None),
+            holder(3, 3 << 30, Some("python"), true, Some("/srv/other")),
+            holder(4, 4 << 30, None, true, None),
+            holder(2, 2 << 30, Some("worker"), false, None),
+        ],
+        remainder: Some(OutsideProcessRemainder { count: 7, bytes: 7 }),
+    };
+    assert_eq!(
+        outside_processes_reason(Some(&outside)).unwrap(),
+        "outside GPU processes: PID 4 unknown (4.0 GiB; another CapyCTL, state dir unknown), \
+         PID 3 python (3.0 GiB; another CapyCTL, state dir /srv/other), PID 2 worker (2.0 GiB)"
+    );
+    assert_eq!(outside_processes_reason(None), None);
+    assert_eq!(
+        outside_processes_reason(Some(&OutsideProcesses {
+            processes: vec![],
+            remainder: None,
+        })),
+        None
+    );
+}
+
+// T26, T29: outside holders explain a headroom warning only while free memory
+// is short; unavailable/empty attribution keeps the existing wording unchanged.
+#[test]
+fn headroom_warning_appends_outside_holders_only_when_free_is_short() {
+    let limit = MemoryLimit {
+        domain: "gpu0".into(),
+        managed_bytes: 14 << 30,
+        free_reserve_bytes: 2 << 30,
+        reserve_absorbs_unmanaged: true,
+        host_kv_bytes: None,
+        parked_bytes: None,
+    };
+    let mut observation = MemoryObservation {
+        domain: "gpu0".into(),
+        capacity_bytes: 16 << 30,
+        available_bytes: 8 << 30,
+        sampled_at_ms: 1,
+        outside_processes: None,
+    };
+    let original = headroom_warning(&limit, &observation, 0).unwrap();
+    observation.outside_processes = Some(OutsideProcesses {
+        processes: vec![],
+        remainder: None,
+    });
+    assert_eq!(headroom_warning(&limit, &observation, 0).unwrap(), original);
+    observation
+        .outside_processes
+        .as_mut()
+        .unwrap()
+        .processes
+        .push(OutsideProcess {
+            pid: 42,
+            name: Some("python".into()),
+            bytes: 8 << 30,
+            capyctl_state_dir: None,
+            other_capyctl: false,
+        });
+    let reason = outside_processes_reason(observation.outside_processes.as_ref()).unwrap();
+    assert_eq!(
+        headroom_warning(&limit, &observation, 0).unwrap(),
+        format!("{original}; {reason}")
+    );
+    observation.available_bytes = 16 << 30;
+    assert_eq!(headroom_warning(&limit, &observation, 0), None);
+}
+
+// T26, T29: wire/snapshot adapters can serialize unavailable process metadata
+// as null instead of inventing an empty process name or CapyCTL state directory.
+#[test]
+fn outside_process_metadata_serializes_unknown_fields_as_null() {
+    let outside = OutsideProcesses {
+        processes: vec![OutsideProcess {
+            pid: 7,
+            name: None,
+            bytes: 1,
+            capyctl_state_dir: None,
+            other_capyctl: true,
+        }],
+        remainder: Some(OutsideProcessRemainder { count: 2, bytes: 3 }),
+    };
+    assert_eq!(
+        serde_json::to_value(outside).unwrap(),
+        serde_json::json!({
+            "processes": [{
+                "pid": 7, "name": null, "bytes": 1,
+                "capyctl_state_dir": null, "other_capyctl": true
+            }],
+            "remainder": {"count": 2, "bytes": 3}
+        })
+    );
 }

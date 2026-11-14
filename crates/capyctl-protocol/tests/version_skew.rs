@@ -971,3 +971,260 @@ fn the_memory_source_is_an_additive_field() {
     let decoded = pb::DomainObservation::decode(bounded.encode_to_vec().as_slice()).unwrap();
     assert_eq!(decoded, bounded);
 }
+
+// T16 T26 T34 (ADR 0035 §8 / SPEC §7.2): diagnostics never gate placement
+// or commands, and old servers skip their additive fields.
+#[test]
+fn outside_gpu_processes_is_optional_host_to_server_evidence() {
+    use capabilities::*;
+    assert_eq!(OUTSIDE_GPU_PROCESSES, "outside_gpu_processes");
+    assert!(CATALOGUE.contains(&(OUTSIDE_GPU_PROCESSES, Direction::HostToServer)));
+    assert!(agent_capabilities().contains(&OUTSIDE_GPU_PROCESSES.to_owned()));
+    assert!(!PLACEMENT_REQUIRED.contains(&OUTSIDE_GPU_PROCESSES));
+    let mut older: BTreeSet<_> = agent_capabilities().into_iter().collect();
+    older.remove(OUTSIDE_GPU_PROCESSES);
+    for command in [
+        wire(launch(true, true), 0),
+        wire(MemberAction::Inspect, 0),
+        wire(local_launch(&["gpu0", "gpu1"], true), 0),
+    ] {
+        assert!(!required(&command).contains(&OUTSIDE_GPU_PROCESSES));
+        assert_eq!(refusal(false, &older, &command), None);
+    }
+
+    // The pre-addition server's complete DomainObservation schema.
+    #[derive(Clone, PartialEq, Message)]
+    struct OlderDomain {
+        #[prost(string, tag = "1")]
+        domain_id: String,
+        #[prost(string, tag = "2")]
+        kind: String,
+        #[prost(int64, tag = "3")]
+        observed_bytes: i64,
+        #[prost(int64, tag = "4")]
+        observed_at_unix: i64,
+        #[prost(int64, tag = "5")]
+        capacity_bytes: i64,
+        #[prost(int64, tag = "6")]
+        available_bytes: i64,
+        #[prost(int64, tag = "7")]
+        observed_at_unix_ms: i64,
+        #[prost(message, repeated, tag = "8")]
+        residents: Vec<pb::ProcessResidency>,
+        #[prost(string, tag = "9")]
+        device_id: String,
+        #[prost(string, tag = "10")]
+        memory_source: String,
+    }
+    let older = OlderDomain {
+        domain_id: "gpu0".into(),
+        kind: "device".into(),
+        observed_bytes: 4 << 30,
+        observed_at_unix: 123,
+        capacity_bytes: 16 << 30,
+        available_bytes: 4 << 30,
+        observed_at_unix_ms: 123_000,
+        residents: vec![],
+        device_id: "gpu0".into(),
+        memory_source: String::new(),
+    };
+    let mut current = pb::DomainObservation::decode(older.encode_to_vec().as_slice()).unwrap();
+    assert!(current.outside_processes.is_empty());
+    assert!(current.outside_processes_remainder.is_none());
+    assert_eq!(current.encode_to_vec(), older.encode_to_vec());
+    current.outside_processes = vec![
+        pb::OutsideProcess {
+            pid: 7,
+            name: None,
+            bytes: 2 << 30,
+            capyctl_state_dir: None,
+            other_capyctl: false,
+        },
+        pb::OutsideProcess {
+            pid: 8,
+            name: Some("capyctl".into()),
+            bytes: 1 << 30,
+            capyctl_state_dir: Some("/home/user/.capyctl".into()),
+            other_capyctl: true,
+        },
+    ];
+    current.outside_processes_remainder = Some(pb::OutsideProcessRemainder {
+        count: 2,
+        bytes: 1 << 29,
+    });
+    let encoded = current.encode_to_vec();
+    assert_eq!(
+        pb::DomainObservation::decode(encoded.as_slice()).unwrap(),
+        current
+    );
+    assert_eq!(OlderDomain::decode(encoded.as_slice()).unwrap(), older);
+    // Optional strings distinguish unknown (null) from a present empty value.
+    let unknown = pb::OutsideProcess::default();
+    let present = pb::OutsideProcess {
+        name: Some(String::new()),
+        capyctl_state_dir: Some(String::new()),
+        ..unknown.clone()
+    };
+    assert_ne!(unknown.encode_to_vec(), present.encode_to_vec());
+    assert_eq!(
+        pb::OutsideProcess::decode(present.encode_to_vec().as_slice()).unwrap(),
+        present
+    );
+}
+
+// T16 T26 (ADR 0035 §8): four GPUs with every bounded row still fit the
+// existing 64-KiB observation allowance; no protocol limit is increased.
+#[test]
+fn bounded_outside_gpu_rows_fit_the_existing_observation_allowance() {
+    let report = pb::AgentToServer {
+        msg: Some(pb::agent_to_server::Msg::ReportInventory(
+            pb::ReportInventory {
+                domains: (0..4)
+                    .map(|gpu| pb::DomainObservation {
+                        domain_id: format!("gpu{gpu}"),
+                        device_id: format!("gpu{gpu}"),
+                        kind: "device".into(),
+                        capacity_bytes: 48 << 30,
+                        available_bytes: 8 << 30,
+                        outside_processes: (1..=16)
+                            .map(|pid| pb::OutsideProcess {
+                                pid,
+                                name: Some("\u{10400}".repeat(64)),
+                                bytes: 1 << 30,
+                                capyctl_state_dir: Some(format!("/{}", "a".repeat(511))),
+                                other_capyctl: true,
+                            })
+                            .collect(),
+                        outside_processes_remainder: Some(pb::OutsideProcessRemainder {
+                            count: 5,
+                            bytes: 2 << 30,
+                        }),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        )),
+    };
+    assert!(report.encoded_len() <= 64 * 1024);
+    assert!(report.encoded_len() <= capyctl_protocol::HOST_MESSAGE_BYTES);
+}
+
+fn maximal_outside_inventory() -> pb::ReportInventory {
+    pb::ReportInventory {
+        domains: (0..128)
+            .map(|gpu| pb::DomainObservation {
+                domain_id: format!("gpu{gpu}"),
+                device_id: format!("gpu{gpu}"),
+                kind: "device".into(),
+                capacity_bytes: 48 << 30,
+                available_bytes: 8 << 30,
+                outside_processes: (1..=16)
+                    .map(|pid| pb::OutsideProcess {
+                        pid,
+                        name: Some("\u{10400}".repeat(64)),
+                        bytes: u64::from(17 - pid) << 20,
+                        capyctl_state_dir: Some(format!("/{}", "a".repeat(511))),
+                        other_capyctl: true,
+                    })
+                    .collect(),
+                outside_processes_remainder: Some(pb::OutsideProcessRemainder {
+                    count: 5,
+                    bytes: 2 << 20,
+                }),
+                ..Default::default()
+            })
+            .collect(),
+        host_boot_id: "b".repeat(36),
+        policy_fingerprint: "a".repeat(64),
+        ..Default::default()
+    }
+}
+
+// T16 T26 T34 (ADR 0035 §8 / SPEC §7.2): all 128 observed device domains
+// with 2048 maximal rows fit the unchanged transport bound after trimming.
+// Omitted rows remain in each GPU's summed remainder, largest rows survive,
+// and the baseline inventory retains its exact encoding.
+#[test]
+fn maximal_outside_inventory_is_trimmed_with_per_gpu_remainders() {
+    use capyctl_protocol::reports::bound_outside_processes;
+    const LIMIT: usize = capyctl_protocol::HOST_MESSAGE_BYTES - 1024;
+    let mut report = maximal_outside_inventory();
+    assert!(report.encoded_len() > capyctl_protocol::HOST_MESSAGE_BYTES);
+    let mut baseline = report.clone();
+    for domain in &mut baseline.domains {
+        domain.outside_processes.clear();
+        domain.outside_processes_remainder = None;
+    }
+    let baseline = baseline.encode_to_vec();
+    bound_outside_processes(&mut report);
+    assert!(report.encoded_len() <= LIMIT);
+    let mut kept = 0;
+    let mut smallest_kept = u64::MAX;
+    let mut largest_omitted = 0;
+    for domain in &report.domains {
+        assert!(!domain.outside_processes.is_empty());
+        assert!(domain.outside_processes.len() < 16);
+        let remainder = domain.outside_processes_remainder.as_ref().unwrap();
+        assert_eq!(domain.outside_processes.len() as u32 + remainder.count, 21);
+        assert_eq!(
+            domain
+                .outside_processes
+                .iter()
+                .map(|row| row.bytes)
+                .sum::<u64>()
+                + remainder.bytes,
+            (1_u64..=16).sum::<u64>() * (1 << 20) + (2 << 20)
+        );
+        for (index, row) in domain.outside_processes.iter().enumerate() {
+            assert_eq!(row.pid, index as u32 + 1);
+            smallest_kept = smallest_kept.min(row.bytes);
+        }
+        let first_omitted = 16 - domain.outside_processes.len() as u64;
+        largest_omitted = largest_omitted.max(first_omitted << 20);
+        kept += domain.outside_processes.len();
+    }
+    assert!(kept < 2048);
+    assert!(smallest_kept >= largest_omitted);
+    let encoded = report.encode_to_vec();
+    bound_outside_processes(&mut report);
+    assert_eq!(report.encode_to_vec(), encoded, "bounding is idempotent");
+    let frame = pb::AgentToServer {
+        msg: Some(pb::agent_to_server::Msg::ReportInventory(report.clone())),
+    };
+    assert!(frame.encoded_len() <= capyctl_protocol::HOST_MESSAGE_BYTES);
+    for domain in &mut report.domains {
+        domain.outside_processes.clear();
+        domain.outside_processes_remainder = None;
+    }
+    assert_eq!(report.encode_to_vec(), baseline);
+}
+
+// T16 T26 (ADR 0035 §8 / SPEC §7.2): a GPU whose final row cannot fit loses
+// both optional fields. Oversized non-diagnostic data is never modified.
+#[test]
+fn outside_diagnostics_are_omitted_only_when_no_row_fits() {
+    use capyctl_protocol::reports::bound_outside_processes;
+    const LIMIT: usize = capyctl_protocol::HOST_MESSAGE_BYTES - 1024;
+    let mut report = maximal_outside_inventory();
+    report.domains.truncate(1);
+    report.domains[0].outside_processes.truncate(1);
+    let mut baseline = report.clone();
+    baseline.domains[0].outside_processes.clear();
+    baseline.domains[0].outside_processes_remainder = None;
+    let padding = "x".repeat(LIMIT - baseline.encoded_len() - 128);
+    baseline.approved_host_config_json = padding.clone();
+    report.approved_host_config_json = padding;
+    assert!(baseline.encoded_len() <= LIMIT);
+    assert!(report.encoded_len() > LIMIT);
+    bound_outside_processes(&mut report);
+    assert_eq!(report, baseline);
+
+    baseline
+        .approved_host_config_json
+        .push_str(&"x".repeat(1024));
+    assert!(baseline.encoded_len() > LIMIT);
+    let original = baseline.encode_to_vec();
+    bound_outside_processes(&mut baseline);
+    assert_eq!(baseline.encode_to_vec(), original);
+}

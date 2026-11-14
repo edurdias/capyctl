@@ -90,6 +90,7 @@ reports. Every feature added since is named in `mllm_protocol::capabilities::CAT
 | `load_latency` | host to server | `LoadSample.latency` |
 | `host_draining` | host to server | HostDraining and its acknowledgement |
 | `process_residency` | host to server | `DomainObservation.residents` |
+| `outside_gpu_processes` | host to server | Optional `DomainObservation.outside_processes` and `outside_processes_remainder`; read-only diagnostics, never required for placement (ADR 0035 §8, owner decision 2026-11-13) |
 | `installation_fingerprint` | host to server | the installation fields of `RuntimeProfileStatus` |
 | `host_admin` | server to host | HostAdminRequest and its HostAdminReply (added by [ADR 0040](0040-web-ui.md) §10, owner decisions 2026-10-27) |
 

@@ -39,6 +39,7 @@ fn resident(pid: u32, per_gpu: &[(&str, i64)]) -> ProcessResident {
 
 fn read(domain: &str, at: i64) -> MemoryObservation {
     MemoryObservation {
+        outside_processes: None,
         domain: domain.into(),
         capacity_bytes: 48 * GIB,
         available_bytes: 40 * GIB,

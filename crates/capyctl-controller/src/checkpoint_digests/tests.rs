@@ -57,6 +57,7 @@ fn fixture_on(edit: impl FnOnce(&mut Value, &mut Value, &Path)) -> Fixture {
                     capacity_bytes: 64 << 30,
                     available_bytes: 60 << 30,
                     sampled_at_ms: 1,
+                    outside_processes: None,
                 }],
                 1,
             )

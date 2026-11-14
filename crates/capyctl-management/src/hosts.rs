@@ -374,6 +374,35 @@ pub type DomainSampler = Arc<
         + Sync,
 >;
 
+/// SPEC §7.2 / ADR 0035 §8: standalone publishes the same flattened device
+/// observation as an enrolled host, with no holder fields when unavailable.
+pub fn standalone_domain(
+    observation: capyctl_domain::resources::MemoryObservation,
+    device: bool,
+    memory_source: &str,
+) -> serde_json::Value {
+    let mut domain = serde_json::json!({
+        "domain_id": observation.domain,
+        "kind": if device { "device" } else { "host" },
+        "capacity_bytes": observation.capacity_bytes,
+        "available_bytes": observation.available_bytes,
+    });
+    if device {
+        if let Some(outside) = observation
+            .outside_processes
+            .filter(|outside| !outside.processes.is_empty())
+        {
+            domain["outside_processes"] = serde_json::json!(outside.processes);
+            if let Some(remainder) = outside.remainder {
+                domain["outside_processes_remainder"] = serde_json::json!(remainder);
+            }
+        }
+    } else {
+        domain["memory_source"] = memory_source.into();
+    }
+    domain
+}
+
 struct StandaloneState {
     owner: SharedCoordinatorState,
     host: StandaloneHost,

@@ -694,6 +694,7 @@ mod tests {
             capacity_bytes: 100,
             available_bytes: 60,
             sampled_at_ms: 100,
+            outside_processes: None,
         }];
         let floors: Vec<_> = initial
             .owners

@@ -102,6 +102,7 @@ fn admit_measured(
             capacity_bytes: 1_i64 << 50,
             available_bytes: 1_i64 << 50,
             sampled_at_ms: 1000,
+            outside_processes: None,
         })
         .collect();
     store
@@ -529,6 +530,7 @@ fn discrete_work(golden: &str) -> InitializeWork {
             capacity_bytes: 1_i64 << 50,
             available_bytes: 1_i64 << 50,
             sampled_at_ms: 1000,
+            outside_processes: None,
         })
         .collect();
     store

@@ -113,12 +113,14 @@ async fn a_memory_refused_deployment_starts_after_replacing_its_request() {
             capacity_bytes: 32 << 30,
             available_bytes: 30 << 30,
             sampled_at_ms: 1900,
+            outside_processes: None,
         },
         MemoryObservation {
             domain: "gpu0".into(),
             capacity_bytes: 24 << 30,
             available_bytes: 4 << 30,
             sampled_at_ms: 1900,
+            outside_processes: None,
         },
     ];
     let mut config = golden["input"]["deployment"].clone();

@@ -10,6 +10,7 @@
 //! an unavailable reading as "no memory in use" would admit work the host cannot
 //! hold, which is the specific failure aggregate accounting exists to prevent.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -17,13 +18,24 @@ use std::sync::Arc;
 use capyctl_agent::gpu_memory::{GpuSample, GpuSampler};
 use capyctl_agent::memory::{HostMemorySample, MemorySource};
 use capyctl_controller::coordinator::{CoordinatorError, ObservationFuture, ServiceObservation};
-use capyctl_domain::resources::MemoryObservation;
+use capyctl_domain::resources::{MemoryObservation, OutsideProcesses, ProcessResident};
 
 /// [`HostMemoryObservation::observe_sourced`]'s answer.
 pub type SourcedObservationFuture = Pin<
     Box<
         dyn Future<Output = Result<(Vec<MemoryObservation>, MemorySource), CoordinatorError>>
             + Send,
+    >,
+>;
+
+type SampledObservationFuture = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    (Vec<MemoryObservation>, MemorySource, Vec<ProcessResident>),
+                    CoordinatorError,
+                >,
+            > + Send,
     >,
 >;
 
@@ -67,12 +79,14 @@ pub fn observe_domains(
     domains: &[ObservedDomain],
     host: &HostMemorySample,
     gpu: Option<&GpuSample>,
+    outside: &BTreeMap<String, OutsideProcesses>,
 ) -> Vec<MemoryObservation> {
     domains
         .iter()
         .filter_map(|observed| match observed {
             ObservedDomain::Host(domain) => Some(MemoryObservation {
                 domain: domain.clone(),
+                outside_processes: None,
                 ..host.memory.clone()
             }),
             // SPEC §7.2: VRAM is read from the device, never substituted with RAM.
@@ -89,6 +103,9 @@ pub fn observe_domains(
                     capacity_bytes: memory.total_bytes,
                     available_bytes: memory.free_bytes,
                     sampled_at_ms: sample.sampled_at_ms,
+                    // ADR 0035 §8 / SPEC §7.2: holders belong only to this GPU,
+                    // under the domain its resource policy publishes.
+                    outside_processes: outside.get(&format!("gpu{index}")).cloned(),
                 })
             }
         })
@@ -148,6 +165,7 @@ pub fn fixed_memory(capacity_bytes: i64, available_bytes: i64) -> MemoryReader {
                 capacity_bytes,
                 available_bytes,
                 sampled_at_ms: i64::try_from(sampled_at_ms).map_err(|error| error.to_string())?,
+                outside_processes: None,
             },
             swap_used_bytes: 0,
             source: MemorySource::Meminfo,
@@ -208,6 +226,15 @@ impl HostMemoryObservation {
     /// The observations, with the source that bounded host memory (SPEC
     /// §7.2): `/proc/meminfo`, or a cgroup v2 limit.
     pub fn observe_sourced(&self) -> SourcedObservationFuture {
+        let sampled = self.observe_sampled();
+        Box::pin(async move {
+            sampled
+                .await
+                .map(|(observed, source, _)| (observed, source))
+        })
+    }
+
+    fn observe_sampled(&self) -> SampledObservationFuture {
         let domains = self.domains.clone();
         let reader = self.reader.clone();
         let gpu = self.gpu.clone().filter(|_| {
@@ -215,6 +242,7 @@ impl HostMemoryObservation {
                 .iter()
                 .any(|d| matches!(d, ObservedDomain::Device { .. }))
         });
+        let residency = self.residency.clone();
         Box::pin(async move {
             // Synchronous and short: `/proc` and cgroup reads, not a syscall
             // that blocks.
@@ -231,11 +259,20 @@ impl HostMemoryObservation {
                     .flatten(),
                 None => None,
             };
-            // A host domain reports the one host reading; on a unified host its
-            // single domain is that whole physical pool.
+            // ADR 0035 §8 / SPEC §7.2: collect residents and outside holders
+            // together, once per observation, never with a second compute-apps query.
+            let (residents, outside) = match residency {
+                Some(sampler) => {
+                    tokio::task::spawn_blocking(move || sampler.sample_fresh_with_outside())
+                        .await
+                        .unwrap_or_default()
+                }
+                None => (Vec::new(), BTreeMap::new()),
+            };
             Ok((
-                observe_domains(&domains, &host, sample.as_ref()),
+                observe_domains(&domains, &host, sample.as_ref(), &outside),
                 host.source,
+                residents,
             ))
         })
     }
@@ -244,24 +281,13 @@ impl HostMemoryObservation {
 impl ServiceObservation for HostMemoryObservation {
     fn observe_with_residents(
         &self,
-        host_id: String,
+        _host_id: String,
     ) -> capyctl_controller::coordinator::ResidentObservationFuture {
-        let observed = self.observe(host_id);
-        let residency = self.residency.clone();
+        let sampled = self.observe_sampled();
         Box::pin(async move {
-            // Availability first, then the processes still alive (ADR 0007).
-            // A sample taken for this observation: admission asks rarely, so
-            // a cached one would be past its age bound (found live on a 16 GB
-            // discrete GPU). The collector is a bounded process, so it runs
-            // off the async thread.
-            let observed = observed.await?;
-            let residents = match residency {
-                Some(sampler) => tokio::task::spawn_blocking(move || sampler.sample_fresh())
-                    .await
-                    .unwrap_or_default(),
-                None => Vec::new(),
-            };
-            Ok((observed, residents))
+            sampled
+                .await
+                .map(|(observed, _, residents)| (observed, residents))
         })
     }
 
@@ -351,6 +377,7 @@ mod tests {
                 capacity_bytes,
                 available_bytes,
                 sampled_at_ms,
+                outside_processes: None,
             },
             swap_used_bytes: 0,
             source: MemorySource::Meminfo,
@@ -394,7 +421,7 @@ mod tests {
                 index: 0,
             },
         ];
-        let observed = observe_domains(&domains, &host, Some(&gpu));
+        let observed = observe_domains(&domains, &host, Some(&gpu), &BTreeMap::new());
         assert_eq!(observed[0].domain, "system");
         assert_eq!(observed[0].capacity_bytes, 61 << 30);
         assert_eq!(observed[1].domain, "gpu0");
@@ -414,7 +441,7 @@ mod tests {
                 index: 0,
             },
         ];
-        let observed = observe_domains(&domains, &host, None);
+        let observed = observe_domains(&domains, &host, None, &BTreeMap::new());
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].domain, "system");
     }
@@ -429,13 +456,13 @@ mod tests {
             index: 1,
         }];
         let gpu = capyctl_agent::gpu_memory::parse_query_gpu(DISCRETE_ROW, 2).unwrap();
-        assert!(observe_domains(&domains, &host, Some(&gpu)).is_empty());
+        assert!(observe_domains(&domains, &host, Some(&gpu), &BTreeMap::new()).is_empty());
         let integrated = capyctl_agent::gpu_memory::parse_query_gpu(
             "1, GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee, 0000000F:01:00.0, GB10, [N/A], [N/A], [N/A]\n",
             2,
         )
         .unwrap();
-        assert!(observe_domains(&domains, &host, Some(&integrated)).is_empty());
+        assert!(observe_domains(&domains, &host, Some(&integrated), &BTreeMap::new()).is_empty());
     }
 
     /// The domain list follows the published policy: a device domain is read
@@ -526,6 +553,94 @@ mod tests {
             2,
             "a unified host never runs the GPU collector"
         );
+    }
+
+    // T26 T29 / ADR 0035 §8: the device id is not necessarily its domain's
+    // name; neither another card nor host RAM may inherit these holders.
+    #[test]
+    fn outside_holders_follow_the_device_domain_mapping() {
+        let outside = OutsideProcesses {
+            processes: vec![capyctl_domain::resources::OutsideProcess {
+                pid: 42,
+                name: Some("trainer".into()),
+                bytes: 2 << 30,
+                capyctl_state_dir: None,
+                other_capyctl: false,
+            }],
+            remainder: Some(capyctl_domain::resources::OutsideProcessRemainder {
+                count: 2,
+                bytes: 1 << 30,
+            }),
+        };
+        let gpu = capyctl_agent::gpu_memory::parse_query_gpu(DISCRETE_ROW, 5).unwrap();
+        let domains = [
+            ObservedDomain::Host("gpu0".into()),
+            ObservedDomain::Device {
+                domain: "accelerator".into(),
+                index: 0,
+            },
+        ];
+        let observed = observe_domains(
+            &domains,
+            &host_sample(8 << 30, 4 << 30, 5),
+            Some(&gpu),
+            &BTreeMap::from([("gpu0".into(), outside.clone())]),
+        );
+        assert_eq!(observed[0].outside_processes, None);
+        assert_eq!(observed[1].domain, "accelerator");
+        assert_eq!(observed[1].outside_processes, Some(outside));
+        let absent = observe_domains(
+            &domains,
+            &host_sample(8 << 30, 4 << 30, 5),
+            Some(&gpu),
+            &BTreeMap::new(),
+        );
+        assert!(absent.iter().all(|o| o.outside_processes.is_none()));
+    }
+
+    // T26 T29 / ADR 0035 §8: snapshot and admission both sample holders, and
+    // admission's resident evidence never causes a second compute-apps run.
+    #[tokio::test]
+    async fn sourced_and_resident_observations_each_collect_processes_once() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let collected = calls.clone();
+        let me = std::process::id();
+        let residency = capyctl_agent::process_residency::ResidencySampler::with_collector(
+            Arc::new(move || {
+                collected.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(vec![
+                    (1, "gpu0".into(), 2 << 30),
+                    (me, "gpu0".into(), 1 << 20),
+                ])
+            }),
+        );
+        let observation = HostMemoryObservation::with_domains(vec![
+            ObservedDomain::Host("system".into()),
+            ObservedDomain::Device {
+                domain: "accelerator".into(),
+                index: 0,
+            },
+        ])
+        .with_memory_reader(fixed_memory(8 << 30, 4 << 30))
+        .with_gpu_sampler(Arc::new(|| {
+            capyctl_agent::gpu_memory::parse_query_gpu(DISCRETE_ROW, 5)
+        }))
+        .with_process_residency(residency);
+        let (sourced, _) = observation.observe_sourced().await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (with_residents, residents) = observation
+            .observe_with_residents("host".into())
+            .await
+            .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(residents.iter().any(|resident| resident.pid == me));
+        for observations in [&sourced, &with_residents] {
+            assert!(observations[0].outside_processes.is_none());
+            let outside = observations[1].outside_processes.as_ref().unwrap();
+            assert_eq!(outside.processes.len(), 1);
+            assert_eq!(outside.processes[0].pid, 1);
+            assert_eq!(outside.processes[0].bytes, 2 << 30);
+        }
     }
 
     /// A host that declared no domain has nothing to admit against. Reporting an

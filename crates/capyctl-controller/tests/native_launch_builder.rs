@@ -39,6 +39,7 @@ fn accepted_work(fixture: &str, mutate: impl Fn(&mut Value, &mut Value)) -> Work
             capacity_bytes: 1_i64 << 50,
             available_bytes: 1_i64 << 50,
             sampled_at_ms: 1000,
+            outside_processes: None,
         })
         .collect();
     store

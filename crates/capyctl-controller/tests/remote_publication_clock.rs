@@ -87,6 +87,8 @@ async fn enrolled(
             device_id: String::new(),
             memory_source: String::new(),
             residents: vec![],
+            outside_processes: Vec::new(),
+            outside_processes_remainder: None,
             domain_id: "unified".into(),
             kind: "system".into(),
             observed_bytes: 100 << 30,

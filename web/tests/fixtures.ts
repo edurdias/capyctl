@@ -66,6 +66,17 @@ export const STANDALONE_HOST = {
   compatibility_reason: null,
 };
 
+// ADR 0035 §8 / SPEC §7.2, T16: flattened domain fields, nullable privacy data.
+export const OUTSIDE_GPU_HOLDERS = {
+  outside_processes: [
+    { pid: 101, name: 'python', bytes: 3 * 1024 ** 3, capyctl_state_dir: null, other_capyctl: false },
+    { pid: 102, name: null, bytes: 2 * 1024 ** 3, capyctl_state_dir: null, other_capyctl: false },
+    { pid: 103, name: 'capyctl', bytes: 1024 ** 3, capyctl_state_dir: `/home/operator/${'another-installation/'.repeat(20)}`, other_capyctl: true },
+    { pid: 104, name: 'capyctl', bytes: 1024 ** 3, capyctl_state_dir: null, other_capyctl: true },
+  ],
+  outside_processes_remainder: { count: 4, bytes: 1024 ** 3 },
+};
+
 export type Route = (call: Call) => Response | Promise<Response> | undefined;
 
 // A role answering the shell's reads: the snapshot (each read takes the next

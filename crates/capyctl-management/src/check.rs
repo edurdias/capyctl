@@ -310,7 +310,7 @@ async fn run(
         {
             let (verdict, reason, limit) = match check.fit {
                 HostFit::Fits => ("fits", None, None),
-                HostFit::NeedsRoom => ("needs_room", None, None),
+                HostFit::NeedsRoom(reason) => ("needs_room", reason, None),
                 HostFit::DoesNotFit(limit) => ("does_not_fit", None, Some(limit)),
                 HostFit::Unknown(reason) => ("unknown", Some(reason.to_owned()), None),
                 HostFit::Refused(reason) => ("unknown", Some(reason), None),

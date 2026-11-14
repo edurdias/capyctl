@@ -181,6 +181,11 @@ pub struct DomainView {
     /// `cgroup_v2:<cgroup>` when a container or unit limit did). Status only.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub memory_source: String,
+    /// ADR 0035 §8 / SPEC §7.2: outside GPU holders are diagnostic only.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub outside_processes: Vec<capyctl_domain::resources::OutsideProcess>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outside_processes_remainder: Option<capyctl_domain::resources::OutsideProcessRemainder>,
     /// ADR 0007: per-process resident memory sampled beside this domain's
     /// availability (`process_residency`). Evidence for admission only; never
     /// shown in status.
@@ -224,6 +229,9 @@ impl DomainView {
                     }
                     && per_device_valid(r, devices)
             });
+        let (outside_processes, outside_processes_remainder) = outside_processes_of(d)
+            .map(|outside| (outside.processes, outside.remainder))
+            .unwrap_or_default();
         Self {
             domain_id: d.domain_id.clone(),
             kind: d.kind.clone(),
@@ -234,6 +242,8 @@ impl DomainView {
             observed_at_unix_ms: d.observed_at_unix_ms.min(capyctl_protocol::now_unix_ms()),
             device_id: d.device_id.clone(),
             memory_source: d.memory_source.clone(),
+            outside_processes,
+            outside_processes_remainder,
             residents: if valid {
                 d.residents
                     .iter()
@@ -296,6 +306,70 @@ fn per_device_valid(
 }
 /// ADR 0007: the most processes one domain report may attribute memory to.
 pub const MAX_RESIDENTS: usize = 256;
+
+/// ADR 0035 §8 / SPEC §7.2: bound diagnostic evidence independently of
+/// ownership credit. Missing data from an older host remains valid.
+const MAX_OUTSIDE_PROCESSES: usize = 16;
+fn outside_processes_valid(d: &pb::DomainObservation) -> bool {
+    if d.outside_processes.is_empty() && d.outside_processes_remainder.is_none() {
+        return true;
+    }
+    let Ok(capacity) = u64::try_from(d.capacity_bytes) else {
+        return false;
+    };
+    let safe = |s: &str| {
+        !s.is_empty()
+            && s.chars().all(|c| {
+                !c.is_control() && !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            })
+    };
+    d.kind == "device"
+        && !d.outside_processes.is_empty()
+        && d.outside_processes.len() <= MAX_OUTSIDE_PROCESSES
+        && d.outside_processes.iter().all(|p| {
+            p.pid > 0
+                && p.bytes > 0
+                && p.bytes <= capacity
+                && p.name
+                    .as_deref()
+                    .is_none_or(|name| name.chars().count() <= 64 && safe(name))
+                && p.capyctl_state_dir
+                    .as_deref()
+                    .is_none_or(|dir| p.other_capyctl && dir.len() <= 512 && safe(dir))
+        })
+        && d.outside_processes_remainder
+            .as_ref()
+            .is_none_or(|r| r.count > 0 && r.bytes > 0 && r.bytes <= capacity)
+}
+
+pub(crate) fn outside_processes_of(
+    d: &pb::DomainObservation,
+) -> Option<capyctl_domain::resources::OutsideProcesses> {
+    if !outside_processes_valid(d)
+        || (d.outside_processes.is_empty() && d.outside_processes_remainder.is_none())
+    {
+        return None;
+    }
+    Some(capyctl_domain::resources::OutsideProcesses {
+        processes: d
+            .outside_processes
+            .iter()
+            .map(|p| capyctl_domain::resources::OutsideProcess {
+                pid: p.pid,
+                name: p.name.clone(),
+                bytes: p.bytes,
+                capyctl_state_dir: p.capyctl_state_dir.clone(),
+                other_capyctl: p.other_capyctl,
+            })
+            .collect(),
+        remainder: d.outside_processes_remainder.as_ref().map(|r| {
+            capyctl_domain::resources::OutsideProcessRemainder {
+                count: r.count,
+                bytes: r.bytes,
+            }
+        }),
+    })
+}
 #[derive(Clone, serde::Serialize)]
 pub struct ProfileView {
     pub name: String,
@@ -484,6 +558,7 @@ fn inventory_shape_valid(inventory: &pb::ReportInventory, host: &str) -> bool {
                 }
                 // SPEC §7.2: a status token, bounded, in cgroup path characters.
                 && (d.memory_source.is_empty() || memory_source_valid(&d.memory_source))
+                && outside_processes_valid(d)
         })
         && inventory.profiles.iter().all(|p| {
             bounded_name(&p.name)
@@ -2332,6 +2407,16 @@ impl crate::coordinator::ServiceObservation for AgentSessions {
                     capacity_bytes: d.capacity_bytes,
                     available_bytes: d.available_bytes,
                     sampled_at_ms: d.observed_at_unix_ms,
+                    outside_processes: if d.outside_processes.is_empty()
+                        && d.outside_processes_remainder.is_none()
+                    {
+                        None
+                    } else {
+                        Some(capyctl_domain::resources::OutsideProcesses {
+                            processes: d.outside_processes,
+                            remainder: d.outside_processes_remainder,
+                        })
+                    },
                 })
                 .collect();
             Ok((observed, residents))
@@ -2861,5 +2946,146 @@ mod memory_source_tests {
             );
         }
         assert!(!bounded_name("user@1000.service"));
+    }
+}
+
+#[cfg(test)]
+mod outside_process_tests {
+    use super::*;
+
+    fn domain() -> pb::DomainObservation {
+        pb::DomainObservation {
+            domain_id: "gpu0".into(),
+            kind: "device".into(),
+            device_id: "gpu0".into(),
+            capacity_bytes: 16 << 30,
+            available_bytes: 8 << 30,
+            outside_processes: vec![pb::OutsideProcess {
+                pid: 42,
+                name: None,
+                bytes: 4 << 30,
+                capyctl_state_dir: None,
+                other_capyctl: false,
+            }],
+            outside_processes_remainder: Some(pb::OutsideProcessRemainder {
+                count: 3,
+                bytes: 1 << 30,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn inventory(d: pb::DomainObservation) -> pb::ReportInventory {
+        pb::ReportInventory {
+            domains: vec![d],
+            envelope: Some(pb::Envelope {
+                host_id: "host-a".into(),
+                protocol_version: capyctl_protocol::PROTOCOL_VERSION.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    // T16 T26 T34 (ADR 0035 §8 / SPEC §7.2): snapshot fields flatten the
+    // diagnostics, retain nullable strings, and disappear for older hosts.
+    #[test]
+    fn outside_holders_are_flattened_and_absent_when_unreported() {
+        let d = domain();
+        let view = DomainView::all(std::slice::from_ref(&d)).remove(0);
+        let json = serde_json::to_value(view).unwrap();
+        assert_eq!(json["outside_processes"][0]["pid"], 42);
+        assert_eq!(json["outside_processes"][0]["bytes"], 4_u64 << 30);
+        assert!(json["outside_processes"][0]["name"].is_null());
+        assert!(json["outside_processes"][0]["capyctl_state_dir"].is_null());
+        assert_eq!(json["outside_processes_remainder"]["count"], 3);
+        assert_eq!(json["outside_processes_remainder"]["bytes"], 1_u64 << 30);
+        assert!(json["outside_processes"].is_array());
+        assert!(outside_processes_of(&d).is_some());
+        let mut older = d;
+        older.outside_processes.clear();
+        older.outside_processes_remainder = None;
+        assert!(inventory_shape_valid(&inventory(older.clone()), "host-a"));
+        assert!(outside_processes_of(&older).is_none());
+        let json = serde_json::to_value(DomainView::all(&[older]).remove(0)).unwrap();
+        assert!(json.get("outside_processes").is_none());
+        assert!(json.get("outside_processes_remainder").is_none());
+        assert!(outside_processes_valid(&pb::DomainObservation::default()));
+    }
+
+    // T16 T26 (ADR 0035 §8 / SPEC §7.2): row/count/size bounds and safe
+    // strings are checked before host data reaches management clients.
+    #[test]
+    fn outside_holders_are_bounded_without_granting_resident_credit() {
+        let mut full = domain();
+        full.outside_processes = (1..=16)
+            .map(|pid| pb::OutsideProcess {
+                pid,
+                name: Some("\u{10400}".repeat(64)),
+                bytes: 1 << 29,
+                capyctl_state_dir: Some(format!("/{}", "x".repeat(511))),
+                other_capyctl: true,
+            })
+            .collect();
+        assert!(inventory_shape_valid(&inventory(full.clone()), "host-a"));
+        let view = DomainView::all(std::slice::from_ref(&full)).remove(0);
+        assert_eq!(view.outside_processes.len(), 16);
+        assert!(
+            view.residents.is_empty(),
+            "outside holders grant no ownership credit"
+        );
+        for case in [
+            "too_many",
+            "zero_pid",
+            "zero_bytes",
+            "over_capacity",
+            "overflow",
+            "empty_rows",
+            "negative_capacity",
+            "long_name",
+            "control_name",
+            "bidi_name",
+            "long_dir",
+            "control_dir",
+            "not_capyctl",
+            "zero_count",
+            "zero_remainder",
+            "large_remainder",
+            "system",
+        ] {
+            let mut bad = full.clone();
+            match case {
+                "too_many" => bad.outside_processes.push(bad.outside_processes[0].clone()),
+                "zero_pid" => bad.outside_processes[0].pid = 0,
+                "empty_rows" => bad.outside_processes.clear(),
+                "negative_capacity" => bad.capacity_bytes = -1,
+                "zero_bytes" => bad.outside_processes[0].bytes = 0,
+                "over_capacity" => bad.outside_processes[0].bytes = (16 << 30) + 1,
+                "overflow" => bad.outside_processes[0].bytes = u64::MAX,
+                "long_name" => bad.outside_processes[0].name = Some("x".repeat(65)),
+                "control_name" => bad.outside_processes[0].name = Some("x\u{1b}[2J".into()),
+                "bidi_name" => bad.outside_processes[0].name = Some("x\u{202e}".into()),
+                "long_dir" => bad.outside_processes[0].capyctl_state_dir = Some("x".repeat(513)),
+                "control_dir" => bad.outside_processes[0].capyctl_state_dir = Some("/x\n".into()),
+                "not_capyctl" => bad.outside_processes[0].other_capyctl = false,
+                "zero_count" => bad.outside_processes_remainder.as_mut().unwrap().count = 0,
+                "zero_remainder" => bad.outside_processes_remainder.as_mut().unwrap().bytes = 0,
+                "large_remainder" => {
+                    bad.outside_processes_remainder.as_mut().unwrap().bytes = u64::MAX
+                }
+                "system" => {
+                    bad.kind = "system".into();
+                    bad.device_id.clear();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !inventory_shape_valid(&inventory(bad.clone()), "host-a"),
+                "{case}"
+            );
+            assert!(outside_processes_of(&bad).is_none(), "{case}");
+            let json = serde_json::to_value(DomainView::all(&[bad]).remove(0)).unwrap();
+            assert!(json.get("outside_processes").is_none(), "{case}");
+        }
     }
 }

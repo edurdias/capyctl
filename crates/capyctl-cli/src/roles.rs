@@ -2260,6 +2260,12 @@ async fn start_standalone_in(
     // already resident here instead of charging them twice. ADR 0033 §6, A1:
     // the same per-process sample measures the LMCache servers' GPU memory.
     let residency = capyctl_agent::process_residency::ResidencySampler::nvidia();
+    // ADR 0035 §8 / SPEC §7.2: an adopted engine can outlive its original
+    // parent; recorded runtime identities are owned, not outside holders.
+    residency.set_owned_processes({
+        let owner = owner.clone();
+        Arc::new(move || owner.lock().ok()?.store().retained_processes().ok())
+    });
     let coordinator = OwnedCoordinator::spawn_resolved(
         owner.clone(),
         Arc::new(
@@ -2304,7 +2310,7 @@ async fn start_standalone_in(
     // verified cleanup. Supervised with readiness, so it ends with it.
     supervision.supervise(
         capyctl_controller::engine_exit::EngineExits::new(coordinator.commands())
-            .with_process_residency(residency)
+            .with_process_residency(residency.clone())
             .spawn_local_until(supervision.cancel_signal()),
     );
     let configuration = Arc::new(
@@ -2326,7 +2332,8 @@ async fn start_standalone_in(
             &declared_host.domains,
         ))
         .with_memory_reader(memory.clone())
-        .with_gpu_sampler(gpu.clone()),
+        .with_gpu_sampler(gpu.clone())
+        .with_process_residency(residency.clone()),
         &declared_host,
         switch_drain_timeout + Duration::from_secs(60),
     )
@@ -2369,14 +2376,20 @@ async fn start_standalone_in(
         installations: embedded.installations(),
         domains: {
             let observed = crate::host_observation::observed_domains(&declared_host.domains);
-            let (memory, gpu) = (memory.clone(), gpu.clone());
+            let (memory, gpu, residency) = (memory.clone(), gpu.clone(), residency.clone());
             Arc::new(move || {
-                let (observed, memory, gpu) = (observed.clone(), memory.clone(), gpu.clone());
+                let (observed, memory, gpu, residency) = (
+                    observed.clone(),
+                    memory.clone(),
+                    gpu.clone(),
+                    residency.clone(),
+                );
                 Box::pin(async move {
                     let kinds = observed.clone();
                     let Ok((observations, source)) = HostMemoryObservation::with_domains(observed)
                         .with_memory_reader(memory)
                         .with_gpu_sampler(gpu)
+                        .with_process_residency(residency)
                         .observe_sourced()
                         .await
                     else {
@@ -2388,18 +2401,7 @@ async fn start_standalone_in(
                                 let device = kinds.iter().any(|d| {
                                     matches!(d, crate::host_observation::ObservedDomain::Device { domain, .. } if *domain == o.domain)
                                 });
-                                let mut domain = serde_json::json!({
-                                    "domain_id": o.domain,
-                                    "kind": if device { "device" } else { "host" },
-                                    "capacity_bytes": o.capacity_bytes,
-                                    "available_bytes": o.available_bytes,
-                                });
-                                // SPEC §7.2: what bounded a host domain's reading,
-                                // `/proc/meminfo` or a cgroup v2 limit.
-                                if !device {
-                                    domain["memory_source"] = source.token().into();
-                                }
-                                domain
+                                capyctl_management::hosts::standalone_domain(o, device, &source.token())
                             })
                             .collect()
                 })
@@ -2562,6 +2564,7 @@ async fn start_standalone_in(
         )
         .with_memory_reader(memory.clone())
         .with_gpu_sampler(gpu.clone())
+        .with_process_residency(residency.clone())
         .observe(declared_host.name.clone())
         .await
         .map_err(|error| StartError::Deploy(error.to_string()))?;

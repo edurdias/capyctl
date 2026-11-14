@@ -350,11 +350,27 @@ export interface HostPolicyRevision {
   revision: string;
 }
 
+// ADR 0035 §8 / SPEC §7.2: read-only, bounded outside GPU holders.
+export interface OutsideProcess {
+  pid: number;
+  name: string | null;
+  bytes: number;
+  capyctl_state_dir: string | null;
+  other_capyctl: boolean;
+}
+
+export interface OutsideProcessRemainder {
+  count: number;
+  bytes: number;
+}
+
 export interface DomainObservation {
   domain_id: string;
   kind: string;
   observed_bytes?: string | null;
   observed_at?: string | null;
+  outside_processes?: OutsideProcess[];
+  outside_processes_remainder?: OutsideProcessRemainder;
 }
 
 export interface Snapshot {

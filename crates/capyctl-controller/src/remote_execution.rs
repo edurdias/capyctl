@@ -1924,6 +1924,7 @@ mod tests {
                     capacity_bytes: 1 << 40,
                     available_bytes: 1 << 40,
                     sampled_at_ms: 1,
+                    outside_processes: None,
                 })
                 .to_vec();
             store

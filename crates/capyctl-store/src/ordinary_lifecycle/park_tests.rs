@@ -259,6 +259,7 @@ impl Lab {
 
 fn observed(now: i64) -> Vec<MemoryObservation> {
     vec![MemoryObservation {
+        outside_processes: None,
         domain: "unified".into(),
         capacity_bytes: 64 << 30,
         available_bytes: 60 << 30,
@@ -1045,6 +1046,7 @@ fn a_park_that_increases_nothing_arms_when_free_memory_is_low() {
     let park = lab.park(&a, "park-low", 1_100);
     // 8 GiB held and in use; only 10 GiB free, below the 16 GiB free reserve.
     let low = vec![MemoryObservation {
+        outside_processes: None,
         domain: "unified".into(),
         capacity_bytes: 64 << 30,
         available_bytes: 10 << 30,
@@ -1084,6 +1086,7 @@ fn a_park_is_charged_only_what_it_adds_beyond_its_own_charge() {
     let limits = lab.limits();
     let arm = |available: i64, now: i64| {
         let observation = vec![MemoryObservation {
+            outside_processes: None,
             domain: "unified".into(),
             capacity_bytes: 64 << 30,
             available_bytes: available,
@@ -1114,6 +1117,7 @@ fn a_park_is_charged_only_what_it_adds_beyond_its_own_charge() {
     let park = unified.park(&u, "park-unified", 1_100);
     let limits = unified.limits();
     let observation = vec![MemoryObservation {
+        outside_processes: None,
         domain: "unified".into(),
         capacity_bytes: 64 << 30,
         available_bytes: 17 << 30,
@@ -1148,6 +1152,7 @@ fn a_switch_park_that_host_memory_cannot_take_is_refused() {
     let limits = lab.limits();
     let low = |now: i64| {
         vec![MemoryObservation {
+            outside_processes: None,
             domain: "unified".into(),
             capacity_bytes: 64 << 30,
             available_bytes: (33 << 30) / 2,
@@ -1277,6 +1282,7 @@ fn a_wake_beside_a_ready_engine_is_credited_its_resident_memory() {
     // free. Charging S's 16 GiB again leaves 38 - 10 - 16 = 12 GiB, below
     // the 16 GiB reserve.
     let observation = vec![MemoryObservation {
+        outside_processes: None,
         domain: "unified".into(),
         capacity_bytes: 64 << 30,
         available_bytes: 38 << 30,
@@ -1327,6 +1333,7 @@ fn resident_floors_are_bounded_lower_bounds() {
     let ledger = lab.store.resource_snapshot().unwrap();
     let observation = |available: i64| {
         vec![MemoryObservation {
+            outside_processes: None,
             domain: "unified".into(),
             capacity_bytes: 64 << 30,
             available_bytes: available << 30,
@@ -1410,6 +1417,7 @@ fn a_two_domain_owner_is_credited_per_domain() {
         },
     ];
     let observation = |domain: &str| MemoryObservation {
+        outside_processes: None,
         domain: domain.into(),
         capacity_bytes: 64 << 30,
         available_bytes: 32 << 30,
@@ -1497,6 +1505,7 @@ fn device_bytes_are_credited_to_the_domain_of_their_gpu() {
         allocation("system", 10),
     ];
     let observation = |domain: &str| MemoryObservation {
+        outside_processes: None,
         domain: domain.into(),
         capacity_bytes: 48 << 30,
         available_bytes: 20 << 30,
@@ -1612,6 +1621,7 @@ fn a_parked_owner_is_credited_on_every_domain_kind() {
         },
     ];
     let observation = |domain: &str| MemoryObservation {
+        outside_processes: None,
         domain: domain.into(),
         capacity_bytes: 64 << 30,
         available_bytes: 32 << 30,

@@ -88,6 +88,20 @@ allows.
 On a phone the sections are in a tab bar at the bottom: Overview, Models,
 Playground, and More for the rest.
 
+Under a GPU's **Other use**, hosts with the optional `outside_gpu_processes`
+capability list outside holders by name (or `process` when hidden), PID and
+GiB. Another installation is marked **another CapyCTL** with its state
+directory, or `unknown`. Up to 16 holders appear, largest first; **and N more**
+gives the count and summed GiB of the rest. No list means the reading is
+unavailable or has no rows, not proof that outside use is zero. Driver and
+other overhead can make the list differ from the Other use total.
+
+This is read-only information, not a control for stopping another process.
+Collection excludes this CapyCTL's descendants, bounds names to 64 characters
+and state directories to 512 bytes, never reads environments, and does not
+expose command arguments other than another CapyCTL's state directory.
+Process names and state-directory paths are visible to signed-in browsers.
+
 The UI acts through the same management API as the CLI, so everything it does
 is recorded and refused in the same way.
 

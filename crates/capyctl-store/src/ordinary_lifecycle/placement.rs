@@ -1237,7 +1237,7 @@ pub enum CheckedFit {
     Fits,
     /// It fits the host's managed memory, but not beside what the host
     /// holds now; the models to switch out are not named.
-    NeedsRoom,
+    NeedsRoom(Option<String>),
     /// It cannot fit the host even empty: the limit, worded as a start's
     /// placement refusal names it.
     DoesNotFit(String),
@@ -1315,10 +1315,22 @@ pub(crate) fn check_fit(
             None,
         )
     };
+    let mut free_memory_reason = None;
     if let Ok(placed) = choose(&candidate) {
         let next = selected_footprint(&candidate, placed.device.as_deref())?;
-        if admit_phase(&candidate.ledger, OWNER, next, context).is_ok() {
-            return Ok(CheckedFit::Fits);
+        match admit_phase(&candidate.ledger, OWNER, next, context) {
+            Ok(()) => return Ok(CheckedFit::Fits),
+            Err(capyctl_domain::resources::ResourceError::InsufficientAvailable(shortfall))
+                if shortfall
+                    .outside_processes
+                    .as_ref()
+                    .is_some_and(|outside| !outside.processes.is_empty()) =>
+            {
+                // ADR 0035 §8 / SPEC §7.2: preserve the actual observed-free
+                // refusal for downstream fit output, not a managed-limit guess.
+                free_memory_reason = Some(shortfall.to_string());
+            }
+            Err(_) => {}
         }
     }
     // ADR 0007: forecasting an empty host restores only resident bytes the
@@ -1353,7 +1365,7 @@ pub(crate) fn check_fit(
     )
     .with_resident_floors(&floors);
     Ok(match admit_phase(&candidate.ledger, OWNER, next, context) {
-        Ok(()) => CheckedFit::NeedsRoom,
+        Ok(()) => CheckedFit::NeedsRoom(free_memory_reason),
         Err(error) => CheckedFit::DoesNotFit(error.to_string()),
     })
 }
@@ -1391,6 +1403,16 @@ mod check_tests {
         let (store, session, config, host) = fixture();
         let effective = capyctl_config::effective::resolve_effective(&config, &host).unwrap();
         let observations = [MemoryObservation {
+            outside_processes: Some(capyctl_domain::resources::OutsideProcesses {
+                processes: vec![capyctl_domain::resources::OutsideProcess {
+                    pid: 42,
+                    name: Some("python".into()),
+                    bytes: 8 << 30,
+                    capyctl_state_dir: Some("/srv/other".into()),
+                    other_capyctl: true,
+                }],
+                remainder: None,
+            }),
             domain: "unified".into(),
             capacity_bytes: 64 << 30,
             available_bytes: 20 << 30,
@@ -1448,6 +1470,10 @@ mod check_tests {
             panic!("expected physical capacity refusal, got {error:?}");
         };
         assert!(reason.contains("insufficient_memory"), "{reason}");
+        assert!(
+            reason.contains("PID 42 python (8.0 GiB; another CapyCTL, state dir /srv/other)"),
+            "{reason}"
+        );
         assert_eq!(checked, CheckedFit::DoesNotFit(reason));
     }
 
@@ -1457,6 +1483,7 @@ mod check_tests {
         let (store, session, config, host) = fixture();
         let effective = capyctl_config::effective::resolve_effective(&config, &host).unwrap();
         let observations = [MemoryObservation {
+            outside_processes: None,
             domain: "unified".into(),
             capacity_bytes: 64 << 30,
             available_bytes: 60 << 30,

@@ -204,6 +204,7 @@ fn parked_residue_is_credited_per_gpu() {
         }
     };
     let read = |domain: &str, at: i64| MemoryObservation {
+        outside_processes: None,
         domain: domain.into(),
         capacity_bytes: 41 * GIB,
         available_bytes: 30 * GIB,
