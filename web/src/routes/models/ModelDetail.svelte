@@ -6,7 +6,7 @@
   import StateBadge from '../../components/StateBadge.svelte';
   import { ApiError } from '../../lib/api';
   import { livePoll } from '../../lib/poll';
-  import { currentSeries, duration, engineName, gib, kvPercent, reservation, sparkPoints, timing, trend } from '../../lib/presentation';
+  import { currentSeries, duration, engineName, gib, kvPercent, reservation, sparkPoints, streamRate, timing, trend } from '../../lib/presentation';
   import { readEffectiveConfig, readEngineLog, readEngines, readLatency, readLoad, type EffectiveConfig, type EngineLog, type EngineRow, type LatencyReport, type LoadDeployment } from '../../lib/reads';
   import { href, link } from '../../lib/router';
   import { snapshot } from '../../lib/state';
@@ -43,8 +43,9 @@
       { key: 'ttft50', label: 'TTFT p50', value: ttft?.p50_seconds ?? null, text: duration(ttft?.p50_seconds), source: ttft ? `${ttft.source} · ${ttft.tier}` : '' },
       { key: 'ttft95', label: 'TTFT p95', value: ttft?.p95_seconds ?? null, text: duration(ttft?.p95_seconds), source: ttft ? `${ttft.source} · ${ttft.tier}` : '' },
       { key: 'tpot', label: 'TPOT p50', value: tpot?.p50_seconds ?? null, text: duration(tpot?.p50_seconds), source: tpot ? `${tpot.source} · ${tpot.tier}` : '' },
-      // The same derived figure the model card shows: one stream's decode rate.
-      { key: 'rate', label: 'Tokens/s per stream', value: tpot?.p50_seconds ? 1 / tpot.p50_seconds : null, text: tpot?.p50_seconds ? (1 / tpot.p50_seconds).toFixed(1) : '–', source: tpot ? `From TPOT p50 · ${tpot.source}` : '' },
+      // The same figure the model card shows: tokens over the time that
+      // produced them (1 / mean inter-token latency), as the playground measures.
+      { key: 'rate', label: 'Tokens/s per stream', value: streamRate(tpot), text: streamRate(tpot)?.toFixed(1) ?? '–', source: tpot ? `Mean of ${tpot.count} tokens · ${tpot.source}` : '' },
       { key: 'requests', label: 'Requests measured', value: requests?.count ?? ttft?.count ?? null, text: String(requests?.count ?? ttft?.count ?? '–'), source: requests ? `${requests.source} · ${requests.tier}` : ttft ? `${ttft.source} · ${ttft.tier}` : '' },
       { key: 'duration', label: 'Request p50', value: requests?.p50_seconds ?? null, text: duration(requests?.p50_seconds), source: requests ? `${requests.source} · ${requests.tier}` : '' },
     ];

@@ -75,6 +75,15 @@ export function timing(series: LatencySeries[], metric: 'ttft' | 'tpot' | 'reque
   }
   return undefined;
 }
+// One stream's decode rate: tokens divided by the time that produced them,
+// which is 1 / the mean inter-token latency (sum / count). It is what the
+// playground measures per answer. 1 / p50 is not: the engine's buckets are
+// wide (vLLM's 10–25 ms bucket held 477 of 503 tokens), so an interpolated
+// median read 56 tokens/s where the stream ran at 63.
+export function streamRate(tpot: LatencySeries | undefined): number | null {
+  const mean = tpot?.mean_seconds;
+  return mean != null && mean > 0 ? 1 / mean : null;
+}
 export function trend(samples: (number | null)[], value: number | null, capacity = 24): (number | null)[] {
   return [...samples.slice(-(capacity - 1)), value];
 }

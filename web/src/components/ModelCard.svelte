@@ -5,7 +5,7 @@
   import { livePoll } from '../lib/poll';
   import { readLatency, type EngineRow, type LatencyReport, type LoadDeployment } from '../lib/reads';
   import type { DeploymentSnapshot } from '../lib/types';
-  import { currentSeries, duration, engineName, gib, kvPercent, reservation, timing } from '../lib/presentation';
+  import { currentSeries, duration, engineName, gib, kvPercent, reservation, streamRate, timing } from '../lib/presentation';
   import ActionBar from './ActionBar.svelte';
   import StateBadge from './StateBadge.svelte';
 
@@ -18,6 +18,7 @@
   const live = $derived(deployment.observed_state === 'ready');
   const ttft = $derived(live ? timing(series, 'ttft') : undefined);
   const tpot = $derived(live ? timing(series, 'tpot') : undefined);
+  const rate = $derived(streamRate(tpot));
   const kv = $derived(live ? kvPercent(load) : null);
   const downloads = $derived(deployment.model_sources?.filter((s) => s.state === 'downloading') ?? []);
   const done = $derived(downloads.reduce((sum, s) => sum + s.bytes_done, 0));
@@ -37,7 +38,7 @@
   <div class="state"><StateBadge state={deployment.observed_state} suspended={deployment.suspended} {since} {busy} /></div>
   <div class="reserved fact"><span class="eyebrow">Reserved</span><strong>{gib(reservation(deployment))}</strong></div>
   <div class="metric ttft"><span class="eyebrow">TTFT p50</span><strong>{duration(ttft?.p50_seconds)}</strong></div>
-  <div class="metric rate"><span class="eyebrow">tok/s / stream <small>derived</small></span><strong>{tpot?.p50_seconds ? (1 / tpot.p50_seconds).toFixed(1) : '–'}</strong></div>
+  <div class="metric rate"><span class="eyebrow">tok/s / stream <small>mean</small></span><strong>{rate === null ? '–' : rate.toFixed(1)}</strong></div>
   <div class="support"><span class="eyebrow">Requests</span><span class="queue">{load?.router.in_flight ?? '–'} in flight · {load?.router.waiting ?? '–'} waiting</span></div>
   <div class="kv"><span class="eyebrow">KV</span><strong>{kv === null ? '–' : `${kv.toFixed(1)}%`}</strong></div>
   <div class="card-actions">

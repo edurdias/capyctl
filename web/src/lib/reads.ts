@@ -82,6 +82,9 @@ export interface LatencySeries {
   count: number;
   p50_seconds: number | null;
   p95_seconds: number | null;
+  // The histogram's sum divided by its count: exact, not estimated inside a
+  // bucket as the percentiles are.
+  mean_seconds?: number | null;
 }
 
 export interface LatencyReport {

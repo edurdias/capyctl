@@ -60,7 +60,7 @@ allows.
   engine, state (ready, parked, stopped, failed, and the steps in between, with
   how long a step has been running and a download's progress), the memory it
   reserves and, while it is ready, its readings: time to first token, tokens
-  per second per stream (derived from the engine's time per output token),
+  per second per stream (tokens divided by the time the engine spent producing them, the same measure as the playground),
   requests in flight and waiting, and how full its KV cache is. Recent activity
   is listed under the models. Changes appear within about two seconds.
 - **Models**: each model shows one main action for its state (**Park** when

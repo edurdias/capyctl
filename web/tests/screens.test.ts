@@ -123,16 +123,16 @@ describe('U20 model detail', () => {
   it('humanises latency, preserves sources, samples trends and avoids duplicate single-instance actions', async () => {
     const server = role({ snapshots: [snapshotWith([deployment({ actions: [{ action: 'park', available: true }] })])], route: (call) => call.url.includes('/metrics/latency?') ? json({ deployments: [{ deployment_id: DEPLOYMENT_ID, instances: [{ instance: 0, generation: 1, host_id: 'gpu-box', engine: 'vllm', series: [
       { name: 'router_time_to_first_content', tier: 'router', source: 'capyctl', count: 12, p50_seconds: 15.2, p95_seconds: 18.3 },
-      { name: 'engine_inter_token_latency', tier: 'engine', source: 'engine', count: 12, p50_seconds: 0.025, p95_seconds: 0.04 },
+      { name: 'engine_inter_token_latency', tier: 'engine', source: 'engine', count: 12, p50_seconds: 0.025, p95_seconds: 0.04, mean_seconds: 0.016 },
     ] }] }] }) : undefined });
     await open(`/models/${DEPLOYMENT_ID}`);
     expect(document.querySelector('.metrics')?.textContent).toContain('15.2 s');
     expect(document.querySelector('.metrics')?.textContent).toContain('25 ms');
     expect(document.querySelector('.metrics')?.textContent).toContain('capyctl · router');
     expect(document.querySelector('.metrics')?.textContent).toContain('engine · engine');
-    // The same derived per-stream rate the model card shows: 1 / 25 ms.
+    // Tokens over decode time (1 / the 16 ms mean), not 1 / the bucket-estimated 25 ms median.
     const rate = Array.from(document.querySelectorAll('.metrics .metric')).find((m) => m.querySelector('.eyebrow')?.textContent === 'Tokens/s per stream');
-    expect(rate?.querySelector('.numeral')?.textContent).toBe('40.0');
+    expect(rate?.querySelector('.numeral')?.textContent).toBe('62.5');
     expect(document.querySelectorAll('.actions')).toHaveLength(1);
     expect(document.querySelectorAll('.metrics svg[aria-label*="1 readings"]')).toHaveLength(5);
     await tick(5000);
@@ -195,13 +195,14 @@ describe('U20 Engines', () => {
 it('derives per-stream tok/s from the served inter-token p50 and renders fresh KV and queue readings', async () => {
   role({ snapshots: [snapshotWith([deployment()])], route: (call) => {
     if (call.url.startsWith('/management/v1/metrics/load')) return json({ deployments: [{ deployment_id: DEPLOYMENT_ID, router: { in_flight: 3, waiting: 2 }, instances: [{ index: 0, sample: { fresh: true, engine: { kv_usage_ppm: 250000 } } }] }] });
-    if (call.url.startsWith('/management/v1/metrics/latency')) return json({ deployments: [{ deployment_id: DEPLOYMENT_ID, instances: [{ instance: 0, generation: 1, host_id: 'gpu-box', engine: 'vllm', series: [{ name: 'engine_inter_token_latency', tier: 'engine', source: 'engine', count: 5, p50_seconds: 0.025, p95_seconds: 0.04 }] }] }] });
+    if (call.url.startsWith('/management/v1/metrics/latency')) return json({ deployments: [{ deployment_id: DEPLOYMENT_ID, instances: [{ instance: 0, generation: 1, host_id: 'gpu-box', engine: 'vllm', series: [{ name: 'engine_inter_token_latency', tier: 'engine', source: 'engine', count: 5, p50_seconds: 0.025, p95_seconds: 0.04, mean_seconds: 0.016 }] }] }] });
     return undefined;
   } });
   await open('/');
   const card = document.querySelector('[data-model="chat"]')!;
-  expect(card.textContent).toContain('tok/s / stream derived');
-  expect(card.querySelectorAll('.metric strong')[1].textContent).toBe('40.0');
+  expect(card.textContent).toContain('tok/s / stream mean');
+  // Tokens over decode time (1 / 16 ms), not 1 / the 25 ms median.
+  expect(card.querySelectorAll('.metric strong')[1].textContent).toBe('62.5');
   expect(card.textContent).toContain('3 in flight · 2 waiting');
   expect(card.querySelector('.kv > span')?.textContent).toBe('KV');
   expect(card.querySelector('.kv > strong')?.textContent).toBe('25.0%');
@@ -211,7 +212,7 @@ describe('U20 current versus retained measurements', () => {
   function retainedLatency() {
     return json({ deployments: [{ deployment_id: DEPLOYMENT_ID, instances: [{ instance: 0, generation: 1, host_id: 'gpu-box', engine: 'vllm', series: [
       { name: 'router_time_to_first_content', tier: 'router', source: 'capyctl', count: 12, p50_seconds: 0.21, p95_seconds: 0.53 },
-      { name: 'engine_inter_token_latency', tier: 'engine', source: 'engine', count: 12, p50_seconds: 0.0295, p95_seconds: 0.0385 },
+      { name: 'engine_inter_token_latency', tier: 'engine', source: 'engine', count: 12, p50_seconds: 0.0295, p95_seconds: 0.0385, mean_seconds: 0.025 },
     ] }] }] });
   }
   it.each<ObservedState>(['parked', 'stopped', 'failed', 'starting'])('does not present retained latency or throughput as current for a %s model', async (state) => {
@@ -224,7 +225,7 @@ describe('U20 current versus retained measurements', () => {
     // SPEC R13: an older launch remains useful only as explicitly previous readings.
     role({ snapshots: [snapshotWith([deployment({ observed_state: state, instances: [{ ...instance(0, state), generation: '2' }] })])], route: (call) => call.url.startsWith('/management/v1/metrics/latency') ? retainedLatency() : undefined });
     await open(`/models/${DEPLOYMENT_ID}`);
-    expect([...document.querySelectorAll('.metrics .numeral')].map((value) => value.textContent)).toEqual(['210 ms', '530 ms', '30 ms', '33.9', '12']);
+    expect([...document.querySelectorAll('.metrics .numeral')].map((value) => value.textContent)).toEqual(['210 ms', '530 ms', '30 ms', '40.0', '12']);
     expect(document.querySelector('.section-heading')?.textContent).toContain('Previous readings');
     expect([...document.querySelectorAll('.metrics article small')].every((caption) => caption.textContent?.startsWith('Previous · '))).toBe(true);
     expect(document.querySelector('.measurements summary')?.textContent).toContain('Previous');
