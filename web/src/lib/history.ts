@@ -3,10 +3,11 @@
 // response bodies.
 
 export interface Timings {
-  // Client-measured, from send to the first content chunk.
+  // Client-measured, from send to the first generated token (reasoning
+  // included).
   ttft_ms: number;
-  // Content chunks (or the engine's token count, when it sends one) per
-  // second after the first.
+  // The engine's completion token count per second after the first
+  // generated token; null when the engine sends no count.
   tokens_per_second: number | null;
 }
 

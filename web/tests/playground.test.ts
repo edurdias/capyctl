@@ -81,6 +81,34 @@ describe('playground chat', () => {
     expect(document.querySelector('.timings')?.textContent).toContain('20.0 tokens/s');
   });
 
+  // SPEC R30, AE7: a reasoning model streams its reasoning before its answer,
+  // and the engine's token count includes it. Timing from the first answer
+  // chunk divided every token by the answer's time alone (found live: 600
+  // tokens/s shown for a Qwen3 stream decoding at 63).
+  it('times tokens/s and first token from the first reasoning token', async () => {
+    const server = chatRole();
+    await open('/playground');
+    await say('Hello');
+    const reasoning = (text: string) => `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: text }, index: 0 }] })}\n\n`;
+
+    await tick(300);
+    server.answers[0].raw(reasoning('Let me think'));
+    await tick(900);
+    server.answers[0].raw(reasoning(' about it.'));
+    await tick(100);
+    server.answers[0].raw(chunk('Hi'));
+    server.answers[0].raw(chunk(' there'));
+    server.answers[0].raw('data: {"choices":[],"usage":{"completion_tokens":21}}\n\n');
+    server.answers[0].raw('data: [DONE]\n\n');
+    server.answers[0].end();
+    await tick();
+
+    // Reasoning is timed but not shown as the answer.
+    expect(messages()).toEqual(['Hello', 'Hi there']);
+    expect(document.querySelector('.timings')?.textContent).toContain('First token 0.30 s');
+    expect(document.querySelector('.timings')?.textContent).toContain('20.0 tokens/s');
+  });
+
   // SPEC R32, AE8
   it('reloads a saved conversation identically', async () => {
     const conversation: ChatMessage[] = [

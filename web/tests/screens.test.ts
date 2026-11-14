@@ -130,8 +130,11 @@ describe('U20 model detail', () => {
     expect(document.querySelector('.metrics')?.textContent).toContain('25 ms');
     expect(document.querySelector('.metrics')?.textContent).toContain('capyctl · router');
     expect(document.querySelector('.metrics')?.textContent).toContain('engine · engine');
+    // The same derived per-stream rate the model card shows: 1 / 25 ms.
+    const rate = Array.from(document.querySelectorAll('.metrics .metric')).find((m) => m.querySelector('.eyebrow')?.textContent === 'Tokens/s per stream');
+    expect(rate?.querySelector('.numeral')?.textContent).toBe('40.0');
     expect(document.querySelectorAll('.actions')).toHaveLength(1);
-    expect(document.querySelectorAll('.metrics svg[aria-label*="1 readings"]')).toHaveLength(4);
+    expect(document.querySelectorAll('.metrics svg[aria-label*="1 readings"]')).toHaveLength(5);
     await tick(5000);
     expect(server.calls.filter((c) => c.url.includes('/metrics/latency?'))).toHaveLength(2);
     expect(document.querySelector('.metrics svg[aria-label^="TTFT p50"]')?.getAttribute('aria-label')).toContain('2 readings');
@@ -221,7 +224,7 @@ describe('U20 current versus retained measurements', () => {
     // SPEC R13: an older launch remains useful only as explicitly previous readings.
     role({ snapshots: [snapshotWith([deployment({ observed_state: state, instances: [{ ...instance(0, state), generation: '2' }] })])], route: (call) => call.url.startsWith('/management/v1/metrics/latency') ? retainedLatency() : undefined });
     await open(`/models/${DEPLOYMENT_ID}`);
-    expect([...document.querySelectorAll('.metrics .numeral')].map((value) => value.textContent)).toEqual(['210 ms', '530 ms', '30 ms', '12']);
+    expect([...document.querySelectorAll('.metrics .numeral')].map((value) => value.textContent)).toEqual(['210 ms', '530 ms', '30 ms', '33.9', '12']);
     expect(document.querySelector('.section-heading')?.textContent).toContain('Previous readings');
     expect([...document.querySelectorAll('.metrics article small')].every((caption) => caption.textContent?.startsWith('Previous · '))).toBe(true);
     expect(document.querySelector('.measurements summary')?.textContent).toContain('Previous');

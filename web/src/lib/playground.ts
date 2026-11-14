@@ -19,8 +19,11 @@ export interface ChatResult {
   timings: Timings | null;
 }
 
+// A reasoning model (Qwen3 thinking, for one) streams its reasoning before its
+// answer in `reasoning_content` (vLLM, SGLang) or `reasoning`. The engine's
+// `completion_tokens` counts both, so both are generated tokens for timing.
 interface ChunkChoice {
-  delta?: { content?: string | null };
+  delta?: { content?: string | null; reasoning_content?: string | null; reasoning?: string | null };
 }
 
 interface Chunk {
@@ -118,13 +121,21 @@ export async function streamChat(model: string, messages: ChatMessage[], handler
       if (typeof chunk.usage?.completion_tokens === 'number') {
         reportedTokens = chunk.usage.completion_tokens;
       }
-      const text = (chunk.choices ?? []).map((choice) => choice.delta?.content ?? '').join('');
-      if (text.length === 0) {
+      const choices = chunk.choices ?? [];
+      const text = choices.map((choice) => choice.delta?.content ?? '').join('');
+      const reasoned = choices.some((choice) => (choice.delta?.reasoning_content ?? choice.delta?.reasoning ?? '') !== '');
+      if (text.length === 0 && !reasoned) {
         return;
       }
+      // SPEC R30: time to first token and the decode rate both start at the
+      // first generated token, reasoning included, so the rate divides the
+      // engine's token count by the time that produced all of them.
       const now = performance.now();
       firstAt ??= now;
       lastAt = now;
+      if (text.length === 0) {
+        return;
+      }
       content += text;
       handlers.onContent(text);
     },
