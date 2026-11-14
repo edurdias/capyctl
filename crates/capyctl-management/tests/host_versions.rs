@@ -2,6 +2,7 @@
 //! and the version skew verdict of its latest session, with the reason, even
 //! while the host is offline. CPU-only; not qualification of any engine.
 
+mod support;
 use axum::{body::Body, http::Request};
 use capyctl_controller::{
     agent_sessions::{AgentSessions, SERVER_VERSION},
@@ -73,10 +74,9 @@ async fn list_hosts_shows_versions_and_upgrade_required() {
         }
     }
     let admin = "a".repeat(32);
-    let router = hosts_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(&admin, &"b".repeat(32)).unwrap(),
-        owned,
-        AgentSessions::new(authority),
+        hosts_router(owned, AgentSessions::new(authority)),
     );
     let response = router
         .oneshot(

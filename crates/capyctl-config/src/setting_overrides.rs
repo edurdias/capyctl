@@ -294,8 +294,8 @@ fn canonical(path: &str, value: &Value) -> String {
     let under_sources = path.contains("model_sources.");
     match (leaf, text.as_str()) {
         ("huggingface" | "http", "disabled") if under_sources => "denied".into(),
-        ("trust_remote_code" | "timing_header", "1" | "on") => "true".into(),
-        ("trust_remote_code" | "timing_header", "0" | "off") => "false".into(),
+        ("trust_remote_code" | "timing_header" | "remote", "1" | "on") => "true".into(),
+        ("trust_remote_code" | "timing_header" | "remote", "0" | "off") => "false".into(),
         _ => text,
     }
 }
@@ -701,6 +701,14 @@ const NAMED_FORMS: &[(&str, Scope, &str, &str)] = &[
         "--management-listen",
         "CAPYCTL_MANAGEMENT_ADDR",
     ),
+    // ADR 0040 §1: whether the management listener may bind off loopback,
+    // named alike on the server and in standalone.
+    (
+        "listeners.management.remote",
+        Scope::Server,
+        "--management-remote",
+        "CAPYCTL_MANAGEMENT_REMOTE",
+    ),
     ("state_dir", Scope::Role, "--state-dir", "CAPYCTL_STATE_DIR"),
     // ADR 0028 §11 (decided 2026-10-06): the group request-stall timeout.
     (
@@ -746,6 +754,9 @@ pub struct NamedLayer {
     pub inference_auth: Option<String>,
     /// `--management-listen` / `CAPYCTL_MANAGEMENT_ADDR` (server and standalone).
     pub management_bind: Option<String>,
+    /// ADR 0040 §1: `--management-remote` / `CAPYCTL_MANAGEMENT_REMOTE`
+    /// (server and standalone).
+    pub management_remote: Option<bool>,
     /// `--state-dir` / `CAPYCTL_STATE_DIR` (the state root; a server's or
     /// host's own state directory).
     pub state_dir: Option<std::path::PathBuf>,
@@ -857,6 +868,10 @@ impl NamedLayer {
                 "listeners.management.bind",
                 self.management_bind.clone().map(Value::String),
             ),
+            (
+                "listeners.management.remote",
+                self.management_remote.map(Value::Bool),
+            ),
             ("state_dir", path_text(&self.state_dir)),
             (
                 "groups.stall_timeout",
@@ -961,6 +976,8 @@ pub fn defaults(
                 Value::from(crate::standalone::DEFAULT_INFERENCE_BIND),
             ),
             ("listeners.inference.authentication", Value::from("api_key")),
+            // ADR 0040 §1: the management listener stays on loopback.
+            ("listeners.management.remote", Value::from(false)),
         ]
         .into_iter()
         .map(|(path, value)| (format!("{prefix}{path}"), value))

@@ -408,137 +408,10 @@ impl crate::Store {
         let mut resolved: Vec<Resolved> = Vec::new();
         let mut single_error = None;
         for host in &ordered {
-            let attempt = (|| {
-                let mut command = scoped_source(host, &config)?;
-                // ADR 0019: `devices: [{id: gpu1}]` takes this host's sharing.
-                capyctl_config::deployment_defaults::fill_device_sharing(
-                    &mut command,
-                    &host.trusted_host,
-                );
-                // ADR 0019 (discrete GPU design §7): a deployment that pins
-                // no device is resolved once per GPU of a discrete host, and
-                // placement picks the GPU. The host's own resolution is the
-                // lowest-index GPU's.
-                let choices =
-                    capyctl_config::instances::device_choices(&command, &host.trusted_host)
-                        .map_err(ManagedConfigurationError::Rejected)?;
-                let recipe = |document: &Value| -> Result<Value> {
-                    // ADR 0013 §2: unnamed device claims take this host's
-                    // devices, and the per-host recipe carries no
-                    // deployment-level field.
-                    let mut source =
-                        capyctl_config::instances::assign_devices(document, &host.trusted_host)
-                            .map_err(ManagedConfigurationError::Rejected)?;
-                    if let Some(object) = source.as_object_mut() {
-                        for field in ["instances", "placement", "host"] {
-                            // ADR 0028 §2: a group member's recipe keeps
-                            // its rank-ordered host list, so it resolves as
-                            // the group it is; placement is outside the
-                            // recipe fingerprint either way.
-                            if field == "placement" && group.is_some() {
-                                continue;
-                            }
-                            object.remove(field);
-                        }
-                    }
-                    Ok(source)
-                };
-                // ADR 0035 §1a: under `topology: auto` the host's own row is
-                // the `auto` document's own resolution, which records the
-                // candidate table placement chooses N from (and is the N this
-                // host's cards hold now, on its lowest set); each set of each
-                // size is a choice beside it, resolved as the explicit N.
-                let auto =
-                    instance_spec.local == Some(capyctl_config::topology::LocalTopology::Auto);
-                let own =
-                    || -> Result<(Value, capyctl_config::effective::EffectiveDeployment, bool)> {
-                        let source = recipe(&command)?;
-                        let (mut effective, provisional) =
-                            resolve_for_acceptance(&source, &host.trusted_host)?;
-                        effective.routes.sort();
-                        Ok((source, effective, provisional))
-                    };
-                let mut devices = Vec::new();
-                let (source, effective, provisional) = if choices.len() > 1 {
-                    // Final review I7 (design §7): each GPU is judged on its
-                    // own. A GPU the deployment cannot fit is not a placement
-                    // option for it; the host is refused only when no GPU
-                    // resolves, and the host's own row is the first GPU that
-                    // does.
-                    let mut first_error = None;
-                    let mut resolved_on = Vec::new();
-                    for (device, choice) in &choices {
-                        let attempt = recipe(choice).and_then(|source| {
-                            resolve_for_acceptance(&source, &host.trusted_host)
-                                .map(|resolution| (source, resolution))
-                        });
-                        match attempt {
-                            Ok((source, (mut on_device, device_provisional))) => {
-                                on_device.routes.sort();
-                                resolved_on.push((
-                                    device.clone(),
-                                    source,
-                                    on_device,
-                                    device_provisional,
-                                ));
-                            }
-                            Err(ManagedConfigurationError::Sql(error)) => {
-                                return Err(ManagedConfigurationError::Sql(error))
-                            }
-                            Err(error) => {
-                                first_error.get_or_insert(error);
-                            }
-                        }
-                    }
-                    let (source, effective, provisional) = if auto {
-                        own()?
-                    } else {
-                        let Some((_, source, effective, provisional)) =
-                            resolved_on.first().cloned()
-                        else {
-                            return Err(first_error.unwrap_or(ManagedConfigurationError::Invalid));
-                        };
-                        (source, effective, provisional)
-                    };
-                    // One checkpoint, one set of facts: every GPU's
-                    // resolution is provisional exactly when the host's is.
-                    if resolved_on.iter().any(|(.., p)| *p != provisional) {
-                        return Err(ManagedConfigurationError::Invalid);
-                    }
-                    devices = resolved_on
-                        .into_iter()
-                        .map(|(device, source, on_device, _)| (device, source, on_device))
-                        .collect();
-                    (source, effective, provisional)
-                } else if auto {
-                    own()?
-                } else {
-                    let source = recipe(choices.first().map_or(&command, |(_, first)| first))?;
-                    let (mut effective, provisional) =
-                        resolve_for_acceptance(&source, &host.trusted_host)?;
-                    effective.routes.sort();
-                    (source, effective, provisional)
-                };
-                let policy = read_selected_policy(&tx, &effective.host.name)
-                    .map_err(|_| ManagedConfigurationError::PolicyConflict)?
-                    .ok_or(ManagedConfigurationError::PolicyConflict)?;
-                if policy.context != ResourceContext::from_host(&effective.host)
-                    || policy.controls != ResourceControls::from_host(&effective.host)
-                {
-                    return Err(ManagedConfigurationError::PolicyConflict);
-                }
-                Ok((command, source, effective, provisional, devices))
-            })();
+            let attempt =
+                resolve_on_host(&tx, host, &config, &instance_spec, &resolve_for_acceptance);
             match attempt {
-                Ok((command, source, effective, provisional, devices)) => resolved.push(Resolved {
-                    host_id: host.host_id.clone(),
-                    host_name: host.host_name.clone(),
-                    command,
-                    source,
-                    effective,
-                    provisional,
-                    devices,
-                }),
+                Ok(host_resolution) => resolved.push(host_resolution),
                 Err(ManagedConfigurationError::Sql(error)) => {
                     return Err(ManagedConfigurationError::Sql(error))
                 }
@@ -756,6 +629,336 @@ fn resolve_for_acceptance(
             .map_err(ManagedConfigurationError::Rejected)
         }
         Err(error) => Err(ManagedConfigurationError::Rejected(error)),
+    }
+}
+
+/// How one host resolves a deployment document: with the placeholder a new
+/// revision is frozen with ([`resolve_for_acceptance`]), or (ADR 0040 §9)
+/// with the weights a deployment check sized.
+type HostResolver<'a> =
+    &'a dyn Fn(&Value, &Value) -> Result<(capyctl_config::effective::EffectiveDeployment, bool)>;
+
+/// ADR 0013 §3: `config` resolved on one allowed `host` as the acceptance
+/// freezes it, with `resolve`, and checked against the host's current
+/// resource policy. Reads only; the acceptance and the deployment check
+/// (ADR 0040 §9) share it.
+fn resolve_on_host(
+    tx: &Transaction<'_>,
+    host: &HostTarget,
+    config: &Value,
+    instance_spec: &capyctl_config::instances::InstanceSpec,
+    resolve: HostResolver<'_>,
+) -> Result<Resolved> {
+    let group = instance_spec.group.as_ref();
+    let mut command = scoped_source(host, config)?;
+    // ADR 0019: `devices: [{id: gpu1}]` takes this host's sharing.
+    capyctl_config::deployment_defaults::fill_device_sharing(&mut command, &host.trusted_host);
+    // ADR 0019 (discrete GPU design §7): a deployment that pins
+    // no device is resolved once per GPU of a discrete host, and
+    // placement picks the GPU. The host's own resolution is the
+    // lowest-index GPU's.
+    let choices = capyctl_config::instances::device_choices(&command, &host.trusted_host)
+        .map_err(ManagedConfigurationError::Rejected)?;
+    let recipe = |document: &Value| -> Result<Value> {
+        // ADR 0013 §2: unnamed device claims take this host's
+        // devices, and the per-host recipe carries no
+        // deployment-level field.
+        let mut source = capyctl_config::instances::assign_devices(document, &host.trusted_host)
+            .map_err(ManagedConfigurationError::Rejected)?;
+        if let Some(object) = source.as_object_mut() {
+            for field in ["instances", "placement", "host"] {
+                // ADR 0028 §2: a group member's recipe keeps
+                // its rank-ordered host list, so it resolves as
+                // the group it is; placement is outside the
+                // recipe fingerprint either way.
+                if field == "placement" && group.is_some() {
+                    continue;
+                }
+                object.remove(field);
+            }
+        }
+        Ok(source)
+    };
+    // ADR 0035 §1a: under `topology: auto` the host's own row is
+    // the `auto` document's own resolution, which records the
+    // candidate table placement chooses N from (and is the N this
+    // host's cards hold now, on its lowest set); each set of each
+    // size is a choice beside it, resolved as the explicit N.
+    let auto = instance_spec.local == Some(capyctl_config::topology::LocalTopology::Auto);
+    let own = || -> Result<(Value, capyctl_config::effective::EffectiveDeployment, bool)> {
+        let source = recipe(&command)?;
+        let (mut effective, provisional) = resolve(&source, &host.trusted_host)?;
+        effective.routes.sort();
+        Ok((source, effective, provisional))
+    };
+    let mut devices = Vec::new();
+    let (source, effective, provisional) = if choices.len() > 1 {
+        // Final review I7 (design §7): each GPU is judged on its
+        // own. A GPU the deployment cannot fit is not a placement
+        // option for it; the host is refused only when no GPU
+        // resolves, and the host's own row is the first GPU that
+        // does.
+        let mut first_error = None;
+        let mut resolved_on = Vec::new();
+        for (device, choice) in &choices {
+            let attempt = recipe(choice).and_then(|source| {
+                resolve(&source, &host.trusted_host).map(|resolution| (source, resolution))
+            });
+            match attempt {
+                Ok((source, (mut on_device, device_provisional))) => {
+                    on_device.routes.sort();
+                    resolved_on.push((device.clone(), source, on_device, device_provisional));
+                }
+                Err(ManagedConfigurationError::Sql(error)) => {
+                    return Err(ManagedConfigurationError::Sql(error))
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        let (source, effective, provisional) = if auto {
+            own()?
+        } else {
+            let Some((_, source, effective, provisional)) = resolved_on.first().cloned() else {
+                return Err(first_error.unwrap_or(ManagedConfigurationError::Invalid));
+            };
+            (source, effective, provisional)
+        };
+        // One checkpoint, one set of facts: every GPU's
+        // resolution is provisional exactly when the host's is.
+        if resolved_on.iter().any(|(.., p)| *p != provisional) {
+            return Err(ManagedConfigurationError::Invalid);
+        }
+        devices = resolved_on
+            .into_iter()
+            .map(|(device, source, on_device, _)| (device, source, on_device))
+            .collect();
+        (source, effective, provisional)
+    } else if auto {
+        own()?
+    } else {
+        let source = recipe(choices.first().map_or(&command, |(_, first)| first))?;
+        let (mut effective, provisional) = resolve(&source, &host.trusted_host)?;
+        effective.routes.sort();
+        (source, effective, provisional)
+    };
+    let policy = read_selected_policy(tx, &effective.host.name)
+        .map_err(|_| ManagedConfigurationError::PolicyConflict)?
+        .ok_or(ManagedConfigurationError::PolicyConflict)?;
+    if policy.context != ResourceContext::from_host(&effective.host)
+        || policy.controls != ResourceControls::from_host(&effective.host)
+    {
+        return Err(ManagedConfigurationError::PolicyConflict);
+    }
+    Ok(Resolved {
+        host_id: host.host_id.clone(),
+        host_name: host.host_name.clone(),
+        command,
+        source,
+        effective,
+        provisional,
+        devices,
+    })
+}
+
+/// ADR 0040 §9: a deployment check's verdict on one allowed host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostFit {
+    Fits,
+    /// It fits the host's managed memory, not beside what it holds now.
+    NeedsRoom,
+    /// The limit, worded as the deploy's or the start's refusal names it.
+    DoesNotFit(String),
+    /// A closed reason it cannot be told: `no_observations` (the host has
+    /// not reported its memory) or `weights_unknown`.
+    Unknown(&'static str),
+    /// The configuration does not resolve on this host, with the reason the
+    /// deploy would give.
+    Refused(String),
+}
+
+/// ADR 0040 §9: the verdict on one allowed host, in host order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FitCheck {
+    pub host_id: String,
+    pub fit: HostFit,
+}
+
+impl crate::Store {
+    /// ADR 0040 §9: whether the strict deployment document `config` fits
+    /// each allowed host of `targets`, resolved as the acceptance resolves it
+    /// ([`resolve_on_host`]) with `weights_bytes` as the checkpoint's weights
+    /// when they are known, and judged by a start's placement rule against
+    /// memory charged now. A read-only transaction: nothing is stored.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_deployment_fit(
+        &self,
+        config: &Value,
+        targets: &[HostTarget],
+        weights_bytes: Option<i64>,
+        observations: &[capyctl_domain::resources::MemoryObservation],
+        residents: &[capyctl_domain::resources::ProcessResident],
+        now_ms: i64,
+    ) -> Result<Vec<FitCheck>> {
+        let instance_spec = capyctl_config::instances::parse_instance_spec(config)
+            .map_err(ManagedConfigurationError::Rejected)?;
+        let ordered: Vec<&HostTarget> = match instance_spec.group.as_ref() {
+            None => {
+                let mut ordered: Vec<&HostTarget> = targets
+                    .iter()
+                    .filter(|t| {
+                        instance_spec.placement.allows(&t.host_id)
+                            || instance_spec.placement.allows(&t.host_name)
+                    })
+                    .collect();
+                ordered.sort_by(|a, b| a.host_id.cmp(&b.host_id));
+                ordered
+            }
+            Some(shape) => group_members(shape, targets)?,
+        };
+        let resolve = |source: &Value, host: &Value| match weights_bytes {
+            Some(weights) => capyctl_config::effective::resolve_effective_with_checkpoint(
+                source,
+                host,
+                capyctl_config::effective::CheckpointFacts {
+                    weights_bytes: Some(weights),
+                    ..Default::default()
+                },
+            )
+            .map(|effective| (effective, false))
+            .map_err(ManagedConfigurationError::Rejected),
+            None => resolve_for_acceptance(source, host),
+        };
+        // Deferred and never committed: a read-only view, rolled back on drop.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let mut checks = Vec::with_capacity(ordered.len());
+        for host in ordered {
+            let fit = match resolve_on_host(&tx, host, config, &instance_spec, &resolve) {
+                Ok(resolved) if resolved.provisional || weights_bytes.is_none() => {
+                    HostFit::Unknown("weights_unknown")
+                }
+                Ok(resolved) => match crate::ordinary_lifecycle::placement::check_fit(
+                    &tx,
+                    &resolved.effective,
+                    &resolved.devices,
+                    observations,
+                    residents,
+                    now_ms,
+                )
+                .map_err(|_| ManagedConfigurationError::CorruptStoredData)?
+                {
+                    crate::ordinary_lifecycle::placement::CheckedFit::Fits => HostFit::Fits,
+                    crate::ordinary_lifecycle::placement::CheckedFit::NeedsRoom => {
+                        HostFit::NeedsRoom
+                    }
+                    crate::ordinary_lifecycle::placement::CheckedFit::DoesNotFit(limit) => {
+                        HostFit::DoesNotFit(limit)
+                    }
+                    crate::ordinary_lifecycle::placement::CheckedFit::NoObservations => {
+                        HostFit::Unknown("no_observations")
+                    }
+                },
+                Err(ManagedConfigurationError::Sql(error)) => {
+                    return Err(ManagedConfigurationError::Sql(error))
+                }
+                Err(ManagedConfigurationError::PolicyConflict) => {
+                    HostFit::Unknown("no_observations")
+                }
+                // SPEC §7.2: the deploy's own refusal of a model the device
+                // domain can never hold names the limit.
+                Err(ManagedConfigurationError::Rejected(error))
+                    if error.detail.starts_with("insufficient_device_memory") =>
+                {
+                    HostFit::DoesNotFit(error.detail)
+                }
+                Err(error) => HostFit::Refused(error.to_string()),
+            };
+            checks.push(FitCheck {
+                host_id: host.host_id.clone(),
+                fit,
+            });
+        }
+        Ok(checks)
+    }
+
+    /// ADR 0040 §9, ADR 0014 amendment A6: reuse measured weights only on
+    /// the measuring host, for the same source and declared drafter.
+    pub fn recorded_weights(&self, config: &Value, host_id: &str) -> Result<Option<i64>> {
+        let source = if let Some(path) = config.pointer("/model/path").and_then(Value::as_str) {
+            capyctl_config::model_source::ModelSource::Local {
+                path: path.to_owned(),
+            }
+        } else {
+            serde_json::from_value(
+                config
+                    .pointer("/model/source")
+                    .cloned()
+                    .ok_or(ManagedConfigurationError::Invalid)?,
+            )
+            .map_err(|_| ManagedConfigurationError::Invalid)?
+        };
+        let drafter: Option<capyctl_config::model_source::ModelSource> = config
+            .pointer("/model/draft")
+            .filter(|draft| !draft.is_null())
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| ManagedConfigurationError::Invalid)?;
+        // JSON object order is not identity: accepted documents and frozen
+        // typed snapshots serialize their fields in different orders.
+        let mut statement = self.conn.prepare(
+            "SELECT json_extract(r.effective_json,'$.model.source'),
+                    json_extract(r.effective_json,'$.model.draft.source'), d.weights_bytes
+             FROM checkpoint_digests d JOIN effective_revisions r
+               ON r.deployment_id=d.deployment_id AND r.revision=d.revision
+             WHERE d.state='recorded' AND d.host_id=?1 ORDER BY d.updated_at_ms DESC",
+        )?;
+        let rows = statement.query_map([host_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (recorded_source, recorded_drafter, weights) = row?;
+            let recorded_source: capyctl_config::model_source::ModelSource =
+                serde_json::from_str(&recorded_source)
+                    .map_err(|_| ManagedConfigurationError::CorruptStoredData)?;
+            let recorded_drafter: Option<capyctl_config::model_source::ModelSource> =
+                recorded_drafter
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|_| ManagedConfigurationError::CorruptStoredData)?;
+            if source == recorded_source && drafter == recorded_drafter {
+                return Ok(Some(weights));
+            }
+        }
+        Ok(None)
+    }
+
+    /// ADR 0040 §9: editing starts from the accepted source, not its frozen
+    /// host-specific effective configuration.
+    pub fn deployment_source(&self, id: &str) -> Result<Option<(String, i64, Value)>> {
+        let source: Option<(String, i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT d.id,d.revision,s.config_json FROM deployments d
+             JOIN managed_configuration_sources s ON s.deployment_id=d.id AND s.revision=d.revision
+             WHERE d.id=?1 OR d.name=?1 ORDER BY d.id=?1 DESC LIMIT 1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        source
+            .map(|(id, revision, source)| {
+                let source = serde_json::from_str(&source)
+                    .map_err(|_| ManagedConfigurationError::Invalid)?;
+                Ok((id, revision, source))
+            })
+            .transpose()
     }
 }
 
@@ -1172,3 +1375,73 @@ pub(crate) fn reseal_migrated_receipt(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod recorded_weights_tests {
+    use crate::Store;
+    use rusqlite::params;
+    use serde_json::json;
+
+    // T14 / ADR 0014 A6, ADR 0040 §9: measurements include the drafter
+    // and belong to the host that measured the files.
+    #[test]
+    fn recorded_weights_require_the_same_host_source_and_drafter() {
+        let store = Store::open_in_memory().unwrap();
+        let config = json!({"model":{"source":{"type":"local","path":"model"}}});
+        store.conn.execute_batch(
+            "INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version,revision)
+             VALUES('d','chat','model','stopped',0,0,1,1,1);",
+        ).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO effective_revisions VALUES('d',1,?1,'f')",
+                [config.to_string()],
+            )
+            .unwrap();
+        store.conn.execute(
+            "INSERT INTO checkpoint_digests(deployment_id,revision,state,host_id,weights_bytes,updated_at_ms,provisional,digest)
+             VALUES('d',1,'recorded','host-a',123,1,0,'digest')", [],
+        ).unwrap();
+        assert_eq!(
+            store.recorded_weights(&config, "host-a").unwrap(),
+            Some(123)
+        );
+        assert_eq!(store.recorded_weights(&config, "host-b").unwrap(), None);
+        let mut different = config.clone();
+        different["model"]["source"]["path"] = json!("another");
+        assert_eq!(store.recorded_weights(&different, "host-a").unwrap(), None);
+        different = config.clone();
+        different["model"]["draft"] = json!({"type":"local","path":"draft"});
+        assert_eq!(store.recorded_weights(&different, "host-a").unwrap(), None);
+        let mut frozen = different.clone();
+        frozen["model"]["draft"] = json!({
+            "source": different["model"]["draft"],
+            "resolved_path": "/models/draft"
+        });
+        store
+            .conn
+            .execute(
+                "UPDATE effective_revisions SET effective_json=?1",
+                [frozen.to_string()],
+            )
+            .unwrap();
+        assert_eq!(store.recorded_weights(&config, "host-a").unwrap(), None);
+        assert_eq!(
+            store.recorded_weights(&different, "host-a").unwrap(),
+            Some(123)
+        );
+        store
+            .conn
+            .execute(
+                "INSERT INTO managed_configuration_sources VALUES('d',1,?1)",
+                params![config.to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            store.deployment_source("chat").unwrap(),
+            Some(("d".into(), 1, config))
+        );
+        assert_eq!(store.deployment_source("missing").unwrap(), None);
+    }
+}

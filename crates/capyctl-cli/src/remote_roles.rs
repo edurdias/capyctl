@@ -240,12 +240,25 @@ fn read_config(path: &Path) -> Result<String, StructuredError> {
 fn role_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|value| !value.is_empty())
 }
-/// ADR 0018 §2: a host's engines file, by the same rule as `capyctl engine`:
-/// beside the named document, else `<config home>/capyctl/engines.yaml`. With
-/// no config home at all it stays beside the document the host loads.
-fn host_engines(named: Option<&Path>, document: &Path) -> PathBuf {
-    crate::engine::role_engines(named, &role_env)
-        .unwrap_or_else(|| capyctl_config::registration::engines_beside(document))
+/// ADR 0018 amendment A4: migrate before loading, using the effective host
+/// state directory, including generic and named state-directory overrides.
+fn host_engines(
+    invocation: &Invocation,
+    named: Option<&Path>,
+    document: &Path,
+    overrides: &capyctl_config::setting_overrides::SettingOverrides,
+) -> Result<PathBuf, StructuredError> {
+    let value = capyctl_config::parse_document(&read_config(document)?)
+        .and_then(|value| overrides.apply_and_validate(value))
+        .and_then(|value| HostConfig::parse(&value.to_string()))
+        .map_err(|e| error(&format!("Invalid host configuration: {}", e.detail)))?;
+    let state = invocation
+        .state_dir
+        .clone()
+        .or_else(|| role_env("CAPYCTL_STATE_DIR").map(PathBuf::from))
+        .unwrap_or(value.state_dir);
+    crate::engine::role_engines(&state, named, &role_env)
+        .map_err(|e| error(&format!("{}: {}", e.path, e.detail)))
 }
 /// Final review I8-bis (every setting three ways, standalone's precedence): a
 /// server's or host's state directory is `--state-dir`, else
@@ -410,11 +423,12 @@ pub(crate) fn management_context(
 ) -> Result<(String, String), StructuredError> {
     // Final review I8: `CAPYCTL_MANAGEMENT_ADDR`, else the address the server
     // recorded when it started (a `--management-listen` start), else the
-    // document's, as for standalone.
-    let address = crate::roles::management_override(None)
+    // document's, as for standalone. ADR 0040 §1: an unspecified bind is
+    // reached through loopback.
+    let address = crate::roles::client_management_override()
         .map_err(|e| error(&e.to_string()))?
         .or_else(|| crate::roles::recorded_management_address(&config.state_dir))
-        .unwrap_or(config.management);
+        .unwrap_or(crate::roles::connectable(config.management));
     Ok((
         format!("http://{address}/management/v1"),
         load_credentials(config)?.admin_token,
@@ -456,35 +470,29 @@ pub(crate) fn wait_limits(
 /// (reported by hosts, or sampled by standalone from its own engines). The
 /// store is read under the owner lock; the report is composed after it is
 /// released.
-pub(crate) fn load_view(
-    credentials: ManagementCredentials,
+pub(crate) fn load_source(
     owner: Arc<Mutex<capyctl_controller::OwnedCoordinatorState>>,
     inflight: Arc<capyctl_router::admission::InFlight>,
     loads: Arc<capyctl_controller::load_table::LoadTable>,
-) -> axum::Router {
+) -> Arc<dyn capyctl_management::metrics::LoadSource> {
     use capyctl_management::metrics::LoadRead;
-    capyctl_management::metrics::load_router(
-        credentials,
-        Arc::new(move |deployment: Option<&str>| {
-            let read = match owner.lock() {
-                Ok(owner) => owner.store().capacity(deployment),
-                Err(_) => return LoadRead::Unavailable,
-            };
-            match read {
-                Ok(found) if deployment.is_some() && found.is_empty() => {
-                    LoadRead::UnknownDeployment
-                }
-                Ok(found) => LoadRead::Report(capyctl_router::capacity::capacity_report(
-                    &found,
-                    &inflight,
-                    capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT as usize,
-                    Some(&loads),
-                    capyctl_protocol::now_unix_ms(),
-                )),
-                Err(_) => LoadRead::Unavailable,
-            }
-        }),
-    )
+    Arc::new(move |deployment: Option<&str>| {
+        let read = match owner.lock() {
+            Ok(owner) => owner.store().capacity(deployment),
+            Err(_) => return LoadRead::Unavailable,
+        };
+        match read {
+            Ok(found) if deployment.is_some() && found.is_empty() => LoadRead::UnknownDeployment,
+            Ok(found) => LoadRead::Report(capyctl_router::capacity::capacity_report(
+                &found,
+                &inflight,
+                capyctl_domain::launch::MAX_REQUESTS_PER_DEPLOYMENT as usize,
+                Some(&loads),
+                capyctl_protocol::now_unix_ms(),
+            )),
+            Err(_) => LoadRead::Unavailable,
+        }
+    })
 }
 
 /// The control-plane server's durable state.
@@ -673,27 +681,19 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
     // SPEC §17 (M80): the timing header names the engine family the host reports.
     inflight.latency.set_host_latency(sessions.latency_table());
     // SPEC §17 (M80): router, host ingress and engine latency, read together.
-    let latency_view = {
+    let latency = {
         let (recorder, hosts) = (inflight.latency.clone(), sessions.latency_table());
-        capyctl_management::metrics::latency_router(
-            management_credentials(&credentials)?,
-            Arc::new(move |deployment: Option<&str>| {
-                capyctl_router::timing::latency_report(
-                    &recorder,
-                    &hosts.snapshot(deployment),
-                    deployment,
-                )
-            }),
-        )
+        Arc::new(move |deployment: Option<&str>| {
+            capyctl_router::timing::latency_report(
+                &recorder,
+                &hosts.snapshot(deployment),
+                deployment,
+            )
+        })
     };
     // SPEC §§10, 17 (owner decision 2026-10-08): live load, read by an
     // operator or an external router.
-    let load_view = load_view(
-        management_credentials(&credentials)?,
-        owner.clone(),
-        inflight.clone(),
-        sessions.load_table(),
-    );
+    let load = load_source(owner.clone(), inflight.clone(), sessions.load_table());
     // SPEC §10 step 1, §16.2 (W10 gap b): waiting requests are bounded by the
     // hosts' published `resource_policy.queue` (the tightest of them), read
     // again as hosts enroll and publish.
@@ -708,7 +708,7 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
             }
         }))
     };
-    let inference = capyctl_router::serve_router(capyctl_router::RouterDeps {
+    let deps = capyctl_router::RouterDeps {
         controller: controller.clone(),
         forwards: Arc::new(capyctl_router::forwarders::LiveForwarders::new(controller)),
         limits: capyctl_router::QueueLimits {
@@ -724,65 +724,71 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         },
         inflight,
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
-    });
+    };
+    // ADR 0040 §12 / KTD13: both inference entrances share one shutdown
+    // gate, lifecycle, activation join and metrics; only the key check differs.
+    let admission = crate::shutdown::Admission::new();
+    let inference = admission.gate(capyctl_router::serve_router(deps.clone()));
+    let playground = capyctl_management::playground::router(admission.gate(
+        capyctl_router::serve_router(capyctl_router::RouterDeps {
+            api_key: None,
+            ..deps
+        }),
+    ));
     // SPEC §4.3: the explicit drain of an enrolled host. Owner decision 4: an
     // offline host's drain is accepted at once with its Stops pending.
     let presence = {
         let sessions = sessions.clone();
         Arc::new(move |host: &str| sessions.current_session(host).is_some())
     };
-    let drain = capyctl_management::drain::drain_router_with_presence(
+    // Design §9: the inference listener's bind and authentication.
+    let inference_listener_view =
+        Arc::new(capyctl_management::inference_listener::InferenceListenerView::default());
+    inference_listener_view.set(crate::exposure::listener_view(
+        config.inference,
+        config.inference_auth,
+    ));
+    // ADR 0040 §§2, 7: the role's one session verifier, on its own
+    // connection to the store the owner holds. Opening it deletes the
+    // sessions and sign-in links another admin token issued.
+    let session_verifier = capyctl_management::ui_sessions::SessionVerifier::open(
         management_credentials(&credentials)?,
-        actions.clone(),
-        Vec::new(),
-        presence,
+        capyctl_store::Store::open(&config.state_dir.join("srv.sqlite3"))
+            .map_err(|_| unavailable())?,
+    )
+    .map_err(|_| unavailable())?;
+    let host_admin = capyctl_management::host_admin_remote::RemoteHostAdmin::new(
+        owner.clone(),
+        sessions.clone(),
     );
-    let management =
-        capyctl_management::lifecycle_router(management_credentials(&credentials)?, actions)
-            .merge(drain)
-            .merge(
-                capyctl_management::enrollment::enrollment_router(
-                    management_credentials(&credentials)?,
-                    authority.clone(),
-                    config.bootstrap_address.clone(),
-                    config.control_address.clone(),
-                )
-                .map_err(|_| unavailable())?
-                .reset_fallback(),
-            )
+    // ADR 0040 §2: every management route is authorized at one point.
+    let management = capyctl_management::compose::server(
+        session_verifier,
+        config.management_public_address.as_deref(),
+        capyctl_management::compose::ServerRoutes {
+            ui: capyctl_webui::router(),
+            playground,
+            actions,
+            check_sources: host_admin.clone(),
+            host_admin,
+            presence,
+            enrollment: authority.clone(),
+            bootstrap_address: config.bootstrap_address.clone(),
+            control_address: config.control_address.clone(),
             // SPEC §13.3 / T21: an instance's engine log, read on its host.
-            .merge(capyctl_management::engine_log::engine_log_router(
-                management_credentials(&credentials)?,
-                capyctl_management::engine_log::RemoteEngineLogs::new(
-                    owner.clone(),
-                    sessions.clone(),
-                    authority.controller_id(),
-                ),
-            ))
-            .merge(capyctl_management::hosts::hosts_router(
-                management_credentials(&credentials)?,
-                owner,
+            engine_logs: capyctl_management::engine_log::RemoteEngineLogs::new(
+                owner.clone(),
                 sessions.clone(),
-            ))
-            .merge(latency_view)
-            .merge(load_view)
-            // Design §9: the inference listener's bind and authentication.
-            .merge(
-                capyctl_management::inference_listener::inference_listener_router(
-                    management_credentials(&credentials)?,
-                    {
-                        let view = Arc::new(
-                            capyctl_management::inference_listener::InferenceListenerView::default(
-                            ),
-                        );
-                        view.set(crate::exposure::listener_view(
-                            config.inference,
-                            config.inference_auth,
-                        ));
-                        view
-                    },
-                ),
-            );
+                authority.controller_id(),
+            ),
+            owner,
+            sessions: sessions.clone(),
+            latency,
+            load,
+            inference_listener: inference_listener_view,
+        },
+    )
+    .map_err(|_| unavailable())?;
     let management_listener = tokio::net::TcpListener::bind(config.management)
         .await
         .map_err(|e| listen_failed("management", config.management, &e))?;
@@ -805,8 +811,6 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
     // running on their hosts and the next start adopts and re-proves them.
     let bound = config.drain_timeout;
     let mut signals = crate::shutdown::Signals::install().map_err(|_| unavailable())?;
-    let admission = crate::shutdown::Admission::new();
-    let inference = admission.gate(inference);
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let stopping = |mut stopped: tokio::sync::watch::Receiver<bool>| async move {
         let _ = stopped.wait_for(|stopped| *stopped).await;
@@ -1185,6 +1189,56 @@ async fn serve_host(
         ),
     };
     let updates = capyctl_agent::session::ProfileUpdates::new(host_profiles);
+    // ADR 0040 §10: remote operations and the local socket share the same
+    // host authority, even when the optional socket cannot be bound.
+    let handler = capyctl_agent::host_control::HostControl::new(
+        document.clone(),
+        engines.clone(),
+        config.clone(),
+        updates.clone(),
+        journal.clone(),
+    );
+    let models = capyctl_config::model_settings::resolve(
+        &config.document,
+        &Default::default(),
+        &Default::default(),
+        capyctl_config::model_settings::default_models_root(
+            std::env::var_os("HOME").as_deref().map(Path::new),
+        )
+        .as_deref(),
+    )
+    .map_err(|_| unavailable())?;
+    updates.serve_host_admin(Arc::new(
+        capyctl_agent::host_admin_remote::HostAdminService {
+            host_id: host.clone(),
+            target: capyctl_agent::host_admin::Target {
+                role_document: document.clone(),
+                kind: capyctl_agent::host_admin::RoleKind::Host,
+                engines: engines.clone(),
+                state_dir: config.state_dir.clone(),
+                socket: config
+                    .state_dir
+                    .join(capyctl_agent::control_socket::SOCKET_NAME),
+            },
+            roots: capyctl_agent::engines::ScanRoots::from_env(Vec::new()),
+            toolchain: Default::default(),
+            cuda_home_env: std::env::var("CUDA_HOME").ok(),
+            measurer: Arc::new(capyctl_agent::installation::InstallationMeasurer::new()),
+            role: capyctl_agent::host_admin_remote::InProcessRole(handler.clone()),
+            model_env: capyctl_config::model_settings::ModelOverrides::from_env(&|name| {
+                std::env::var(name).ok()
+            })
+            .map_err(|_| unavailable())?,
+            pinner: Arc::new(
+                capyctl_agent::host_admin::CachedSourcePinner::new(
+                    models.policy,
+                    models.models_root,
+                    Arc::new(|name| std::env::var(name).ok()),
+                )
+                .with_secrets_dir(Some(config.state_dir.join("secrets"))),
+            ),
+        },
+    ));
     // ADR 0018 §3: the local control channel, bound only inside the role's
     // 0700 state directory. A socket that cannot be bound (unsafe directory,
     // path too long, another role) is reported and the role runs without it.
@@ -1194,13 +1248,6 @@ async fn serve_host(
         .join(capyctl_agent::control_socket::SOCKET_NAME);
     let control_server = match capyctl_agent::control_socket::ControlServer::bind(&control_socket) {
         Ok(server) => {
-            let handler = capyctl_agent::host_control::HostControl::new(
-                document.clone(),
-                engines.clone(),
-                config.clone(),
-                updates.clone(),
-                journal.clone(),
-            );
             // SAFETY: geteuid has no preconditions and cannot fail.
             let uid = unsafe { libc::geteuid() };
             Some(tokio::spawn(server.serve(handler, uid, control_shutdown)))
@@ -1461,13 +1508,21 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 )?;
                 // Final review I8: `--management-listen` >
                 // CAPYCTL_MANAGEMENT_ADDR > the document, as for standalone.
-                if let Some(address) =
-                    crate::roles::management_override(invocation.management_listen)
-                        .map_err(|e| error(&e.to_string()))?
-                {
-                    config = config.with_management(address).map_err(|_| {
+                // ADR 0040 §1: off loopback only with this run's `remote`
+                // (`--management-remote` > CAPYCTL_MANAGEMENT_REMOTE > the
+                // document).
+                let remote = crate::roles::management_remote_override(invocation.management_remote)
+                    .map_err(|e| error(&e.to_string()))?;
+                let address = crate::roles::management_override(
+                    invocation.management_listen,
+                    remote.unwrap_or(config.management_remote),
+                )
+                .map_err(|e| error(&e.to_string()))?;
+                if address.is_some() || remote.is_some() {
+                    let shown = address.unwrap_or(config.management);
+                    config = config.with_management(address, remote).map_err(|_| {
                         error(&format!(
-                            "management address {address} collides with another server listener \
+                            "management address {shown} collides with another server listener \
                              or is not a loopback address with a non-zero port"
                         ))
                     })?;
@@ -1481,7 +1536,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 // resolved by the same rule as `capyctl engine`; the document
                 // itself was already read above for the size and existence
                 // checks.
-                let engines = host_engines(named.as_deref(), &path);
+                let engines = host_engines(invocation, named.as_deref(), &path, &overrides)?;
                 // Owner rule 2026-09-25: a deprecated variable name is
                 // warned about once.
                 for warning in capyctl_config::engine_settings::deprecation_warnings(&|key| {
@@ -1534,7 +1589,6 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             // ADR 0018 §2: `read_config` keeps the existing size/existence
             // checks; the host document is loaded merged with `engines.yaml`.
             read_config(&path)?;
-            let engines = host_engines(named.as_deref(), &path);
             // Owner decision 2026-09-25: the generic overrides apply here as
             // at `start host` (final review I8: `join host --set` too), so
             // both find the same identity.
@@ -1548,6 +1602,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                     crate::settings::describe(&e)
                 ))
             })?;
+            let engines = host_engines(invocation, named.as_deref(), &path, &overrides)?;
             let mut config = load_host(
                 &path,
                 &engines,

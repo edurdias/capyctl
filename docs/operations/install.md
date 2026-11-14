@@ -187,6 +187,12 @@ Building needs stable Rust and the Protocol Buffers compiler `protoc` on
 distribution's package). A build over non-interactive SSH must see the same
 `PATH` as your login shell.
 
+A release also embeds the [web UI](../guide/web-ui.md). Build it in `web/`
+first, with Node 22, from the same commit: `npm ci && npm run build`.
+`release.sh` refuses to package when `web/dist/index.html` is missing or was
+built from another commit, and records the bundle's digest in `BUILDINFO`.
+A development build without it serves a page saying the build has no web UI.
+
 ## Installing with install.sh
 
 The project site serves the installer; each release also publishes a copy
@@ -434,9 +440,9 @@ Where each setting comes from, highest precedence first:
 | Setting | Source |
 |---|---|
 | Role document | `--config <file>`, else `$CAPYCTL_CONFIG`, else `<state root>/config/standalone.yaml`, else generated there. |
-| Registered engines (`engines.yaml`) | Beside the document named by `--config` or `$CAPYCTL_CONFIG`, else `$XDG_CONFIG_HOME/capyctl/engines.yaml` (`~/.config/capyctl/engines.yaml`). `capyctl engine` uses the same rule, so it and the running role read the same file. A host follows the same rule. |
+| Registered engines (`engines.yaml`, `custom-engines.yaml`) | In the role's effective state directory. `capyctl engine` and the running role use the same state-directory rule (ADR 0018 amendment A4). |
 | State root | `--state-dir`, else `CAPYCTL_STATE_DIR`, else the top-level `state_dir` of the document named by `--config` or `$CAPYCTL_CONFIG`, else `$XDG_STATE_HOME/capyctl`, else `~/.local/state/capyctl`. The document may state `server.state_dir` and `host.state_dir` only as `<state root>/server` and `<state root>/host` (relative paths resolve against the document's directory); any other value is refused. |
-| Listener addresses | Inference: `--listen`, else `CAPYCTL_INFERENCE_ADDR`, else `server.listeners.inference.bind`, else `0.0.0.0:8443`. Management: `--management-listen`, else `CAPYCTL_MANAGEMENT_ADDR` (`CAPYCTL_STANDALONE_MANAGEMENT_ADDR` is still read, with a warning), else `server.listeners.management.bind`, else `127.0.0.1:7443`; loopback only. |
+| Listener addresses | Inference: `--listen`, else `CAPYCTL_INFERENCE_ADDR`, else `server.listeners.inference.bind`, else `0.0.0.0:8443`. Management: `--management-listen`, else `CAPYCTL_MANAGEMENT_ADDR` (`CAPYCTL_STANDALONE_MANAGEMENT_ADDR` is still read, with a warning), else `server.listeners.management.bind`, else `127.0.0.1:7443`; loopback by default, with off-box access allowed by `--management-remote`, `CAPYCTL_MANAGEMENT_REMOTE` or `server.listeners.management.remote: true`. |
 | Engine installation | `--vllm-bin` / `--sglang-bin` and the other engine flags, else `CAPYCTL_VLLM_BIN` / `CAPYCTL_SGLANG_BIN` and the other variables, else `host.local_engine`, `host.runtime_dir` and `host.resource_policy.endpoint_port_range`; plus engines registered with `capyctl engine add`. See the [settings reference](configuration.md#engine-installation). |
 | Models directory | `--models-root`, else `CAPYCTL_MODELS_ROOT`, else `host.model_store.path`, else `~/models` (created). See "Models and downloads". |
 | Model downloads | `--model-sources` / `--model-sources-max`, else `CAPYCTL_MODEL_SOURCES` / `CAPYCTL_MODEL_SOURCES_MAX`, else `host.model_sources`, else allowed with a 500 GiB cap. |
@@ -753,6 +759,23 @@ The inference endpoint listens on `0.0.0.0:8443` and requires the API key.
 address to loopback or a Tailscale address, how to turn the key off (and why
 not to), and how to put a TLS reverse proxy in front for the internet.
 
+## Opening the web UI
+
+A server or standalone role serves the [web UI](../guide/web-ui.md) at `/ui/`
+on its management address. Sign a browser in from the machine, with the same
+state directory as the role:
+
+```bash
+sudo -u capyctl env CAPYCTL_STATE_DIR=/var/lib/capyctl/standalone capyctl open ui
+```
+
+It prints a one-time sign-in link and a QR code; the link works once, for 10
+minutes. On the default loopback address only a browser on the machine can
+use it. To reach the UI from a phone or laptop, allow the management listener
+off the machine with `remote: true` and bind a Tailscale address, or keep it
+on loopback behind `tailscale serve` with `public_address`
+([network access](network-access.md#web-ui-off-the-machine)).
+
 ## Command output
 
 Commands print text unless `--json` (or `--format json`) is given, whether or
@@ -809,16 +832,22 @@ with a server starts it as before, and the engine fails at once with
 0.1.x servers do not know the new code (the host-side refusal is planned for
 0.2.0, behind a capability). Reinstall SGLang without
 `-e` ([Install an engine](../guide/install-engines.md#sglang-0521-or-0520)).
-`engines.yaml` sits beside the role's configuration file (`--config
-dir/host.yaml` means `dir/engines.yaml`). Without `--config`, on a host machine
-it sits beside the document the host was started with (the host records it),
-and otherwise it is `~/.config/capyctl/engines.yaml`, for a host and for
-standalone alike. The role
-merges it with its own document at start; a profile name declared in both is
+`engines.yaml` and `custom-engines.yaml` live in the role's state directory
+(ADR 0018 amendment A4), not beside its configuration. The CLI and running
+role resolve the same state directory. The first time a role or `capyctl engine`
+command of this release finds no engines file in its state directory but an
+old one beside the named document (or in `~/.config/capyctl` without one), it
+copies it there, keeping its revision, owned by the state directory's user,
+with mode 0600, and logs one line naming both files. The old file is never
+moved or changed: another role with another state directory, or an older
+release, may still read it. From then on this role reads only its copy, so
+edits to the old file no longer reach it; delete the old file once nothing
+else uses it. No manual upgrade step is needed. The role merges registered
+profiles with its document at start; a profile name declared in both is
 refused. Its first line records its revision (`# capyctl-document-revision: N`).
 The running role listens on `<state_dir>/control.sock` (mode 0600; only the
-role's own user and root are served) for these commands. Only the `capyctl engine`
-command writes `engines.yaml`; the running role only reads it.
+role's own user and root are served) for these commands. The CLI and the role's
+host administration (including the web UI) write the files under the same lock.
 
 `engine remove` removes only profiles `engine add` registered; one you wrote
 into `host.yaml` stays yours to edit. It is refused while a deployment on this
@@ -876,10 +905,11 @@ value and the figures behind it at every launch. To choose other limits, put
 `env` or the deployment's `engine_config.env`; that value is used as written.
 
 **With the system units, run `capyctl engine` as root with the unit's
-`--config`.** The host unit reads `/etc/capyctl/host.yaml`, so its `engines.yaml`
-is `/etc/capyctl/engines.yaml`. `/etc/capyctl` is root's (mode 0750, group `capyctl`),
-and the unit makes `/etc` read-only to the role (`ProtectSystem=strict`), so
-the role never writes there; `capyctl engine` does, and only root can:
+`--config`.** The host unit reads `/etc/capyctl/host.yaml` and stores registered
+engines in `/var/lib/capyctl/host/engines.yaml` (and `custom-engines.yaml`).
+`/etc/capyctl` stays root-owned and read-only under `ProtectSystem=strict`.
+Both units already grant write access to their state directory through
+`StateDirectory=capyctl`; no extra service write path is needed:
 
     sudo capyctl engine add /opt/venvs/vllm --config /etc/capyctl/host.yaml
     sudo capyctl engine list --config /etc/capyctl/host.yaml
@@ -887,17 +917,18 @@ the role never writes there; `capyctl engine` does, and only root can:
 
 Run as root, the command keeps an existing `engines.yaml`'s owner and mode, and
 creates a new one (and its lock) owned by the role's service user (the owner of
-the host's `state_dir`, `capyctl`), mode 0600, so the role can read it. It talks to
-the role over `<state_dir>/control.sock`, which serves root as well as the
-service user. Root also runs the named installation's version check and
-deep-park probe, so name only an installation you trust. Keep the `--config`
-here: a command finds the role running on the machine through the state root
-of the user who runs it, and root's is not the service user's, so without it
-root's `~/.config/capyctl/engines.yaml` is a different file than the one the role
-reads. Run as the service user, `capyctl engine` finds the host without it. The packaged standalone unit
-starts without `--config`, so its `engines.yaml` is the service user's
-`/var/lib/capyctl/.config/capyctl/engines.yaml`, which the service user can write:
+the host's `state_dir`, `capyctl`), mode 0600, so the role can read and write it.
+It talks to the role over `<state_dir>/control.sock`, which serves root as well
+as the service user. Root also runs the named installation's version check and
+deep-park probe, so name only an installation you trust. Keep `--config` here
+so the command finds the host's document and its state directory rather than
+root's own state. A named `--state-dir` overrides the document's directory.
+The packaged standalone unit uses
+`/var/lib/capyctl/standalone/engines.yaml` and `custom-engines.yaml`:
 `sudo -u capyctl env CAPYCTL_STATE_DIR=/var/lib/capyctl/standalone capyctl engine add …`.
+On upgrade, old engines files are migrated automatically, even when `/etc`
+is read-only: the role keeps a private state-local copy and leaves the old
+file for optional deletion. Later starts warn naming that unused old file.
 
 `engine add` also works before any role has ever started — the first-run path
 of adding an engine, then starting the role for the first time (standalone
@@ -1402,6 +1433,9 @@ know. So:
   with the old binary. A restored store does not know about engines launched
   after the backup was taken; drain the affected hosts first (`capyctl drain
   host`), then stop the role, restore, and start it.
+- A restored store also brings back web UI sessions you revoked after the
+  backup was taken. After a restore, select **Revoke all sessions** in the
+  UI's **Settings**, then sign in again with `capyctl open ui`.
 - Never copy state between hosts or reuse a host's state under a different
   name: identities are bound to it. Losing a host's identity
   requires re-enrollment, not a copied directory.

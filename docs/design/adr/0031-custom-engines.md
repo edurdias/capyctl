@@ -354,6 +354,13 @@ sandbox", made explicit:
   would write every answer to a file. The guide says so; the engine log is still
   redacted.
 
+> **Amended by [ADR 0040](0040-web-ui.md) §11** (owner decisions 2026-10-27). A signed-in
+> browser session may add or change a custom engine through the management API, reversing
+> the 2026-10-20 decision that confirmation happens only on a terminal on the box. The
+> server previews the manifest and returns a digest; the add carries that digest and the
+> owner-typed profile name, the host re-measures, and any difference is refused
+> `confirmation_stale`. The CLI keeps its terminal confirmation.
+
 ### 9. Host capability and gating
 
 A host that implements this ADR declares `custom_engines` (ADR 0017). The server places a

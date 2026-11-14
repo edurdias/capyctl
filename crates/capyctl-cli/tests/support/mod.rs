@@ -120,6 +120,21 @@ pub fn safe_state_dir() -> tempfile::TempDir {
     tempfile::TempDir::new_in(home).expect("a state directory under an owner-only root")
 }
 
+/// Serve a role's management router the way the role does: ADR 0040 §3 decides
+/// admin-token acceptance from each connection's peer and local addresses, so
+/// the router refuses requests served without them.
+pub async fn serve_management(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+) -> std::io::Result<()> {
+    use capyctl_management::compose::{ManagementPeer, RoleListener};
+    axum::serve(
+        RoleListener::new(listener),
+        router.into_make_service_with_connect_info::<ManagementPeer>(),
+    )
+    .await
+}
+
 /// Boot standalone on the testkit's Fake installation.
 ///
 /// Passing the installation in is what keeps these tests from depending on whatever

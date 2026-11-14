@@ -3,6 +3,13 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+/// ADR 0018 amendment A4: engines for a test's host document, without
+/// loading or validating the registered engines themselves.
+pub fn host_engines_path(document: &Path) -> std::path::PathBuf {
+    let text = std::fs::read_to_string(document).expect("host fixture exists");
+    let host = crate::remote_roles::HostConfig::parse(&text).expect("valid host fixture");
+    crate::registration::engines_path(&host.state_dir)
+}
 /// Writes an executable that a test runs next, so the run never fails with
 /// `ETXTBSY` ("Text file busy").
 ///

@@ -20,11 +20,10 @@
 //!   pin it.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use capyctl_config::deployment_defaults::{expand_home, pin_hf, unpinned_hf, HF_SHORTHANDS};
-use capyctl_config::model_source::{is_commit_sha, ModelSource, DEFAULT_HUGGINGFACE_ENDPOINT};
-use capyctl_config::ConfigKind;
+use capyctl_config::deployment_defaults::expand_home;
+use capyctl_config::deployment_pin::{self, hub_endpoint, Hub, CLI_TOKEN_HINT};
+use capyctl_config::model_source::DEFAULT_HUGGINGFACE_ENDPOINT;
 use serde_json::Value;
 
 use crate::output::StructuredError;
@@ -79,19 +78,17 @@ pub fn with_home_expanded(text: &str) -> String {
 /// The deployment document `deploy model --file` sends: the file with a `~/`
 /// model path expanded and each Hugging Face reference (the model's and,
 /// ADR 0008 amendment 2026-10-08, its drafter's) pinned, strictly parsed and
-/// completed with the defaults.
+/// completed with the defaults. ADR 0040 §9: the pinning is shared with a
+/// role's deployment check (`capyctl_config::deployment_pin`).
 pub async fn prepare(text: &str, endpoint: &reqwest::Url) -> Result<Value, StructuredError> {
-    let mut document =
-        capyctl_config::parse_document(text).map_err(|error| invalid(error.to_string()))?;
-    expand_home(&mut document, home().as_deref());
-    for at in HF_SHORTHANDS {
-        if let Some((repo, reference)) = unpinned_hf(&document, at) {
-            let field = format!("{}.hf", at.trim_start_matches('/').replace('/', "."));
-            let commit = pin(endpoint, &field, &repo, &reference).await?;
-            pin_hf(&mut document, at, &repo, &commit);
-        }
-    }
-    capyctl_config::parse_strict_value(ConfigKind::Deployment, document)
+    // Owner rule 2026-09-25: a private repository is pinned with the token
+    // in `CAPYCTL_HF_TOKEN` (else `HF_TOKEN`); a secret is never a flag.
+    let token = capyctl_agent::sources::HF_TOKEN_VARIABLES
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()));
+    let hub = Hub::new(endpoint.clone(), token, CLI_TOKEN_HINT);
+    deployment_pin::prepare(text, home().as_deref(), &hub)
+        .await
         .map_err(|error| invalid(error.to_string()))
 }
 
@@ -134,14 +131,7 @@ fn pin_endpoint_with(
             None => ("endpoint", DEFAULT_HUGGINGFACE_ENDPOINT.to_owned()),
         },
     };
-    let url = reqwest::Url::parse(text.trim_end_matches('/'))
-        .map_err(|_| invalid(format!("{name} is not a URL: {text:?}")))?;
-    let loopback =
-        url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1") | Some("localhost"));
-    if url.scheme() != "https" && !loopback {
-        return Err(invalid(format!("{name} must be an https:// URL: {text:?}")));
-    }
-    Ok(url)
+    hub_endpoint(name, &text).map_err(invalid)
 }
 
 /// `model_sources.huggingface_endpoint` of the host document `config` names
@@ -159,77 +149,6 @@ fn document_endpoint(state_dir: &Path, config: Option<&Path>) -> Option<String> 
         _ => &document["model_sources"],
     };
     sources["huggingface_endpoint"].as_str().map(str::to_owned)
-}
-
-/// ADR 0008: the commit `reference` (a branch or tag) of `repo` names now.
-/// `field` names the shorthand (`model.hf`, `model.draft.hf`) in a refusal.
-async fn pin(
-    base: &reqwest::Url,
-    field: &str,
-    repo: &str,
-    reference: &str,
-) -> Result<String, StructuredError> {
-    // The repository shape is the one a pinned source accepts.
-    ModelSource::HuggingFace {
-        repo: repo.to_owned(),
-        revision: "0".repeat(40),
-        files: Vec::new(),
-        token_ref: None,
-    }
-    .validate()
-    .map_err(|error| invalid(format!("{field}: {}", error.detail)))?;
-    if reference.is_empty()
-        || !reference
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    {
-        return Err(invalid(format!(
-            "{field}: `{reference}` is not a branch or tag name; write `{repo}@<40-character commit>`"
-        )));
-    }
-    let url = format!(
-        "{}/api/models/{repo}/revision/{reference}",
-        base.as_str().trim_end_matches('/')
-    );
-    let unpinnable = |why: &str| {
-        invalid(format!(
-            "{field}: cannot pin `{repo}@{reference}` to a commit ({why}); write \
-             `{repo}@<40-character commit>` in the file"
-        ))
-    };
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|_| unpinnable("no HTTP client"))?;
-    // Owner rule 2026-09-25: a private repository is pinned with the token
-    // in `CAPYCTL_HF_TOKEN` (else `HF_TOKEN`); a secret is never a flag.
-    let mut request = client.get(&url);
-    if let Some(token) = capyctl_agent::sources::HF_TOKEN_VARIABLES
-        .iter()
-        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
-    {
-        request = request.bearer_auth(token.trim());
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|_| unpinnable("Hugging Face cannot be reached"))?;
-    if !response.status().is_success() {
-        return Err(unpinnable(&format!(
-            "Hugging Face answered {}; a private repository needs CAPYCTL_HF_TOKEN or HF_TOKEN, or a pinned commit",
-            response.status().as_u16()
-        )));
-    }
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|_| unpinnable("the answer is not JSON"))?;
-    body["sha"]
-        .as_str()
-        .filter(|sha| is_commit_sha(sha))
-        .map(str::to_owned)
-        .ok_or_else(|| unpinnable("the answer names no commit"))
 }
 
 #[cfg(test)]

@@ -2253,3 +2253,216 @@ fn a_role_prints_text_when_asked_and_json_when_piped() {
     let banner: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(banner["ready"], true);
 }
+
+/// ADR 0040 §12: exercise the real session exchange, not a principal injected
+/// by a test. Neither this helper nor a browser resolves the inference key.
+async fn playground_session(management: &str, admin: &str) -> String {
+    let client = reqwest::Client::new();
+    let link = client
+        .post(format!(
+            "http://{management}/management/v1/ui/sign-in-links"
+        ))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(link.status(), 201);
+    let link: Value = link.json().await.unwrap();
+    let session = client
+        .post(format!("http://{management}/management/v1/ui/sessions"))
+        .header("x-capyctl-ui", "1")
+        .header("origin", format!("http://{management}"))
+        .json(&json!({"token": link["token"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(session.status(), 201);
+    session.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+fn playground_chat(
+    management: &str,
+    cookie: &str,
+    content: &str,
+    stream: bool,
+) -> reqwest::RequestBuilder {
+    reqwest::Client::new()
+        .post(format!(
+            "http://{management}/management/v1/playground/chat/completions"
+        ))
+        .header("cookie", cookie)
+        .header("x-capyctl-ui", "1")
+        .header("origin", format!("http://{management}"))
+        .json(&json!({
+            "model": "w11-model",
+            "stream": stream,
+            "messages": [{"role": "user", "content": content}]
+        }))
+}
+
+fn bodies_are_absent(directory: &Path, sentinels: &[&str]) {
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        if kind.is_dir() {
+            bodies_are_absent(&entry.path(), sentinels);
+        } else if kind.is_file() {
+            let bytes = std::fs::read(entry.path()).unwrap();
+            for sentinel in sentinels {
+                assert!(
+                    !bytes
+                        .windows(sentinel.len())
+                        .any(|part| part == sentinel.as_bytes()),
+                    "a playground body reached {}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+}
+
+/// U10 / ADR 0040 §12, T17 T18 T21: the standalone role serves a session
+/// without the inference key, counts its stream in the real shutdown drain,
+/// refuses late work identically on both listeners and persists no bodies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn standalone_playground_shares_shutdown_admission_and_keeps_bodies_private() {
+    const PROMPT: &str = "u10-private-prompt-7f664edab26f";
+    const ANSWER: &str = "fake-vllm-answer";
+    let installation = Installation::new();
+    let role = installation.start(Some(20));
+    let stderr = role.stderr.clone();
+    let deployed = deploy(&installation);
+    let deployment = deployed["deployment"]["id"].as_str().unwrap();
+    let credentials =
+        std::fs::read_to_string(installation.state().join("identity/credentials")).unwrap();
+    let admin = credentials
+        .lines()
+        .find_map(|line| line.strip_prefix("admin_token: "))
+        .unwrap();
+    let cookie = playground_session(&installation.management, admin).await;
+    let response = playground_chat(&installation.management, &cookie, PROMPT, false)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let answer: Value = response.json().await.unwrap();
+    assert_eq!(
+        answer["choices"][0]["message"]["content"],
+        "fake-vllm-answer 0 "
+    );
+    let mut streaming = playground_chat(&installation.management, &cookie, "slow", true)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(streaming.status(), 200);
+    streaming.chunk().await.unwrap().unwrap();
+    role.signal();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let inference = chat_request(&installation, "late", false)
+        .send()
+        .await
+        .unwrap();
+    let playground = playground_chat(&installation.management, &cookie, "late", false)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(inference.status(), 503);
+    assert_eq!(playground.status(), inference.status());
+    assert_eq!(
+        playground.headers()["retry-after"],
+        inference.headers()["retry-after"]
+    );
+    assert_eq!(
+        playground.json::<Value>().await.unwrap(),
+        inference.json::<Value>().await.unwrap()
+    );
+    let mut rest = Vec::new();
+    while let Some(chunk) = streaming.chunk().await.unwrap() {
+        rest.extend_from_slice(&chunk);
+    }
+    assert!(String::from_utf8_lossy(&rest).contains("[DONE]"));
+    let (status, report) = role.exit(Duration::from_secs(25));
+    assert!(status.success());
+    assert_eq!(report["drain"]["in_flight_at_close"], 1);
+    assert_eq!(report["drain"]["drained"], true);
+    let log = stderr_of(&stderr);
+    assert!(!log.is_empty(), "the real role emitted lifecycle logs");
+    assert!(!log.contains(PROMPT));
+    assert!(!log.contains(ANSWER));
+    let store =
+        capyctl_store::Store::open(&installation.state().join("server/srv.sqlite3")).unwrap();
+    for evidence in store.journal_evidence_of(deployment).unwrap() {
+        assert!(!evidence.contains(PROMPT));
+        assert!(!evidence.contains(ANSWER));
+    }
+    // Includes the actual SQLite store, WAL and rollback journal, if present,
+    // as well as every other regular file the role wrote in its state tree.
+    bodies_are_absent(&installation.state(), &[PROMPT, ANSWER]);
+}
+
+/// U10 / ADR 0040 §12, T17 T18: the server also gates its keyless service
+/// with the exact admission object used by its inference listener.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_playground_shares_shutdown_admission() {
+    use tokio::io::AsyncWriteExt;
+    let roles = TwoRoles::new();
+    let server = roles.start("server");
+    server.expect_line(
+        |line| line.contains("\"role\":\"server\"") && line.contains("\"ready\":true"),
+        Duration::from_secs(60),
+    );
+    let config: Value =
+        capyctl_config::parse_document(&std::fs::read_to_string(&roles.server_config).unwrap())
+            .unwrap();
+    let management = config["listeners"]["management"]["bind"].as_str().unwrap();
+    let credentials: Value = serde_json::from_slice(
+        &std::fs::read(roles.server_state.join("identity/server-credentials.json")).unwrap(),
+    )
+    .unwrap();
+    let admin = credentials["admin_token"].as_str().unwrap();
+    let cookie = playground_session(management, admin).await;
+    // A real inference upload keeps the listener alive during its drain.
+    // Finish/drop it after the refusals, so no deliberately hung task remains.
+    let mut upload = tokio::net::TcpStream::connect(&roles.inference)
+        .await
+        .unwrap();
+    upload
+        .write_all(
+            format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: 1024\r\n\r\n{{",
+                roles.inference,
+                roles.api_key()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    server.signal();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let inference = roles.chat("late", false).send().await.unwrap();
+    let playground = playground_chat(management, &cookie, "late", false)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(inference.status(), 503);
+    assert_eq!(playground.status(), inference.status());
+    assert_eq!(
+        playground.headers()["retry-after"],
+        inference.headers()["retry-after"]
+    );
+    assert_eq!(
+        playground.json::<Value>().await.unwrap(),
+        inference.json::<Value>().await.unwrap()
+    );
+    drop(upload);
+    let report = final_report(server, "server", Duration::from_secs(25));
+    assert_eq!(report["drain"]["in_flight_at_close"], 1);
+    assert_eq!(report["drain"]["drained"], true);
+}

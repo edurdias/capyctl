@@ -1,6 +1,6 @@
-//! ADR 0018 §2: `engines.yaml`, the capyctl-owned file engine registration
-//! writes beside the role's document. The role's own document is never
-//! rewritten. CPU tests only; they are not qualification.
+//! ADR 0018 §2, amendment A4: state-local engines registration.
+//! The role's own document is never rewritten.
+//! CPU tests only; they are not qualification.
 use capyctl_config::registration::*;
 use capyctl_config::remote_roles::HostConfig;
 use std::os::unix::fs::PermissionsExt;
@@ -8,6 +8,7 @@ use std::path::Path;
 
 fn host_doc(dir: &Path) -> std::path::PathBuf {
     let path = dir.join("host.yaml");
+    std::fs::create_dir_all(dir.join("state")).unwrap();
     std::fs::write(
         &path,
         format!(
@@ -36,24 +37,20 @@ fn host_value(path: &Path) -> serde_json::Value {
     .unwrap()
 }
 
-// ADR 0018 §2 (owner decision 2026-09-25): the engines file sits beside the
-// role's configuration file; without one, under the user's config home.
+// T04, ADR 0018 amendment A4 / SPEC §15.1: one state-local resolver.
 #[test]
-fn the_engines_file_sits_beside_the_role_document() {
+fn the_engines_file_lives_in_the_role_state_directory() {
     assert_eq!(
-        engines_path(
-            Some(Path::new("/etc/capyctl/x.yaml")),
-            Path::new("/home/u/.config")
-        ),
+        engines_path(Path::new("/var/lib/capyctl/host")),
+        Path::new("/var/lib/capyctl/host/engines.yaml")
+    );
+    assert_eq!(
+        legacy_engines_path(Some(Path::new("/etc/capyctl/x.yaml")), None).unwrap(),
         Path::new("/etc/capyctl/engines.yaml")
     );
     assert_eq!(
-        engines_path(None, Path::new("/home/u/.config")),
+        legacy_engines_path(None, Some(Path::new("/home/u/.config"))).unwrap(),
         Path::new("/home/u/.config/capyctl/engines.yaml")
-    );
-    assert_eq!(
-        engines_beside(Path::new("/r/host.yaml")),
-        Path::new("/r/engines.yaml")
     );
     let env = |k: &str| (k == "HOME").then(|| "/home/u".to_string());
     assert_eq!(config_home(&env).unwrap(), Path::new("/home/u/.config"));
@@ -68,7 +65,7 @@ fn a_write_creates_the_engines_file_and_never_touches_the_host_document() {
     let dir = tempfile::tempdir().unwrap();
     let host = host_doc(dir.path());
     let before = std::fs::read(&host).unwrap();
-    let path = engines_beside(&host);
+    let path = capyctl_config::test_support::host_engines_path(&host);
     let mut engines = EnginesFile::load(&path).unwrap();
     assert_eq!((engines.revision, engines.profiles.len()), (0, 0));
     engines.profiles.insert("vllm".into(), profile());
@@ -111,7 +108,7 @@ fn a_name_in_both_files_is_refused() {
     let mut document = host_value(&host);
     document["runtime_profiles"]["vllm"] = profile();
     std::fs::write(&host, document.to_string()).unwrap();
-    let path = engines_beside(&host);
+    let path = capyctl_config::test_support::host_engines_path(&host);
     let mut engines = EnginesFile::load(&path).unwrap();
     engines.profiles.insert("vllm".into(), profile());
     let lock = lock_engines(&path).unwrap();
@@ -138,7 +135,7 @@ fn a_name_in_both_files_is_refused() {
 fn concurrent_writers_never_lose_an_update() {
     let dir = tempfile::tempdir().unwrap();
     let host = host_doc(dir.path());
-    let path = engines_beside(&host);
+    let path = capyctl_config::test_support::host_engines_path(&host);
     let workers: Vec<_> = ["a", "b", "c", "d"]
         .into_iter()
         .map(|name| {
@@ -163,7 +160,7 @@ fn concurrent_writers_never_lose_an_update() {
 fn a_document_over_the_publication_bound_is_not_written() {
     let dir = tempfile::tempdir().unwrap();
     let host = host_doc(dir.path());
-    let path = engines_beside(&host);
+    let path = capyctl_config::test_support::host_engines_path(&host);
     let mut engines = EnginesFile::load(&path).unwrap();
     for i in 0..80 {
         let mut p = profile();
@@ -314,7 +311,7 @@ fn a_rewrite_keeps_the_owner_and_mode_and_a_new_file_takes_the_named_owner() {
     use std::os::unix::fs::MetadataExt;
     let dir = tempfile::tempdir().unwrap();
     let host = host_doc(dir.path());
-    let path = engines_beside(&host);
+    let path = capyctl_config::test_support::host_engines_path(&host);
     let me = std::fs::metadata(dir.path()).unwrap();
     let owner = Some((me.uid(), me.gid()));
     let lock = lock_engines_for(&path, owner).unwrap();
@@ -322,7 +319,7 @@ fn a_rewrite_keeps_the_owner_and_mode_and_a_new_file_takes_the_named_owner() {
     engines.profiles.insert("vllm".into(), profile());
     write_engines(&engines, &lock, None).unwrap();
     drop(lock);
-    for file in [path.clone(), dir.path().join("engines.yaml.lock")] {
+    for file in [path.clone(), path.with_file_name("engines.yaml.lock")] {
         let meta = std::fs::metadata(&file).unwrap();
         assert_eq!((meta.uid(), meta.gid()), (me.uid(), me.gid()), "{file:?}");
         assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{file:?}");
@@ -477,7 +474,7 @@ fn approvals_are_written_and_reach_the_host_document() {
 
     let dir = tempfile::tempdir().unwrap();
     let host = host_doc(dir.path());
-    let path = engines_beside(&host);
+    let path = capyctl_config::test_support::host_engines_path(&host);
     let mut engines = EnginesFile::load(&path).unwrap();
     engines
         .profiles
@@ -517,7 +514,7 @@ fn future_profile() -> serde_json::Value {
 fn a_profile_for_an_unknown_engine_kind_is_skipped_and_kept_in_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let host = host_doc(dir.path());
-    let path = engines_beside(&host);
+    let path = capyctl_config::test_support::host_engines_path(&host);
     let mut engines = EnginesFile::load(&path).unwrap();
     engines.profiles.insert("vllm".into(), profile());
     engines.profiles.insert("future".into(), future_profile());
@@ -582,14 +579,15 @@ fn a_known_engine_kind_is_still_validated_strictly() {
         let dir = tempfile::tempdir().unwrap();
         let host = host_doc(dir.path());
         std::fs::write(
-            engines_beside(&host),
+            capyctl_config::test_support::host_engines_path(&host),
             format!(
                 "kind: engines\nschema_version: 1\nruntime_profiles:\n  broken: {broken}\n  future: {}\n",
                 future_profile()
             ),
         )
         .unwrap();
-        let loaded = EnginesFile::load(&engines_beside(&host)).unwrap();
+        let loaded =
+            EnginesFile::load(&capyctl_config::test_support::host_engines_path(&host)).unwrap();
         let (runnable, skipped) = loaded.runnable();
         assert_eq!(skipped.len(), 1, "only `future` is skipped");
         assert!(
@@ -646,4 +644,131 @@ fn profile_without_flags_is_unchanged() {
         },
     });
     assert_eq!(profile_document(&fixture), before);
+}
+
+// T04 T44, ADR 0018 amendment A4: a one-time copy, preserving bytes and
+// revision, owned by the state directory's owner at 0600, for both files. The
+// old file is left exactly as it was, so a second role with another state
+// directory, or an older release, still finds it.
+#[test]
+fn migration_copies_both_engines_files_once_and_leaves_the_old_ones() {
+    use std::os::unix::fs::MetadataExt;
+    let root = tempfile::tempdir().unwrap();
+    let old_dir = root.path().join("config");
+    std::fs::create_dir(&old_dir).unwrap();
+    let legacy = old_dir.join(ENGINES_FILE);
+    let original = "# capyctl-document-revision: 42\noriginal bytes\n";
+    for name in [ENGINES_FILE, CUSTOM_ENGINES_FILE] {
+        std::fs::write(old_dir.join(name), original).unwrap();
+        std::fs::set_permissions(old_dir.join(name), std::fs::Permissions::from_mode(0o640))
+            .unwrap();
+    }
+    for role in ["first-state", "second-state"] {
+        let state = root.path().join(role);
+        let lock = lock_engines(&engines_path(&state)).unwrap();
+        let notices = migrate_engines(&lock, &legacy).unwrap();
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().all(|message| message.contains("copied")));
+        let owner = std::fs::metadata(&state).unwrap();
+        for name in [ENGINES_FILE, CUSTOM_ENGINES_FILE] {
+            let text = std::fs::read_to_string(state.join(name)).unwrap();
+            assert_eq!(text, original);
+            assert_eq!(revision_of(&text), 42);
+            let metadata = std::fs::metadata(state.join(name)).unwrap();
+            assert_eq!((metadata.uid(), metadata.gid()), (owner.uid(), owner.gid()));
+            assert_eq!(metadata.mode() & 0o777, 0o600);
+            let old = std::fs::metadata(old_dir.join(name)).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(old_dir.join(name)).unwrap(),
+                original
+            );
+            assert_eq!(old.mode() & 0o777, 0o640);
+        }
+        assert!(migrate_engines(&lock, &legacy).unwrap().is_empty());
+    }
+}
+
+// T04 T44, ADR 0018 amendment A4: the state copy wins independently for
+// each file, and the old file is never read or changed again.
+#[test]
+fn migration_keeps_state_files_and_leaves_legacy_files_untouched() {
+    let root = tempfile::tempdir().unwrap();
+    let old = root.path().join("etc");
+    let state = root.path().join("state");
+    std::fs::create_dir(&old).unwrap();
+    let lock = lock_engines(&engines_path(&state)).unwrap();
+    for name in [ENGINES_FILE, CUSTOM_ENGINES_FILE] {
+        std::fs::write(old.join(name), "old").unwrap();
+        std::fs::write(state.join(name), "state").unwrap();
+    }
+    assert!(migrate_engines(&lock, &engines_path(&old))
+        .unwrap()
+        .is_empty());
+    for name in [ENGINES_FILE, CUSTOM_ENGINES_FILE] {
+        assert_eq!(std::fs::read_to_string(old.join(name)).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(state.join(name)).unwrap(), "state");
+    }
+}
+
+// T04, ADR 0018 amendment A4: no old file means no file is invented.
+#[test]
+fn migration_without_legacy_files_is_a_noop() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let lock = lock_engines(&engines_path(&state)).unwrap();
+    assert!(
+        migrate_engines(&lock, &root.path().join("absent/engines.yaml"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!engines_path(&state).exists());
+    assert!(!custom_engines_beside(&engines_path(&state)).exists());
+}
+
+// T04 T44, ADR 0018 amendment A4: packaged /etc may be read-only to the
+// service. A durable private copy replaces the old file as authority.
+#[test]
+fn migration_copies_from_read_only_directory_and_later_state_wins() {
+    use std::os::unix::fs::MetadataExt;
+    // Root bypasses chmod's directory write restriction.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let old = root.path().join("etc");
+    let state = root.path().join("state");
+    std::fs::create_dir(&old).unwrap();
+    for name in [ENGINES_FILE, CUSTOM_ENGINES_FILE] {
+        std::fs::write(
+            old.join(name),
+            "# capyctl-document-revision: 19\noriginal\n",
+        )
+        .unwrap();
+    }
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let lock = lock_engines(&engines_path(&state)).unwrap();
+    let notices = migrate_engines(&lock, &engines_path(&old)).unwrap();
+    assert_eq!(notices.len(), 2);
+    assert!(notices
+        .iter()
+        .all(|text| text.contains("copied") && text.contains("can be deleted")));
+    let owner = std::fs::metadata(&state).unwrap();
+    for name in [ENGINES_FILE, CUSTOM_ENGINES_FILE] {
+        assert_eq!(
+            std::fs::read(old.join(name)).unwrap(),
+            std::fs::read(state.join(name)).unwrap()
+        );
+        let metadata = std::fs::metadata(state.join(name)).unwrap();
+        assert_eq!((metadata.uid(), metadata.gid()), (owner.uid(), owner.gid()));
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        std::fs::write(state.join(name), "authoritative").unwrap();
+    }
+    assert!(migrate_engines(&lock, &engines_path(&old))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        std::fs::read_to_string(engines_path(&state)).unwrap(),
+        "authoritative"
+    );
+    std::fs::set_permissions(old, std::fs::Permissions::from_mode(0o700)).unwrap();
 }

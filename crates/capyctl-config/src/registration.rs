@@ -1,8 +1,7 @@
-//! ADR 0018 §2 (owner decision 2026-09-25): engine registration writes only
-//! `engines.yaml`, a capyctl-owned file beside the role's configuration file,
-//! and (ADR 0031 amendment A1) `custom-engines.yaml` beside it for custom
-//! engines. The host or standalone document is never rewritten; the role
-//! merges them at load, and a profile name declared twice is refused. Writes
+//! ADR 0018 §2, amendment A4: engine registration writes `engines.yaml`
+//! in the role's state directory, and (ADR 0031 amendment A1)
+//! `custom-engines.yaml` beside it. The role document is never rewritten;
+//! the role merges them at load, and a profile name declared twice is refused. Writes
 //! hold `engines.yaml.lock` (one lock for both files, amendment A1), go
 //! through a temporary file, sync and rename, and
 //! record the revision on the first line (a comment the parser ignores).
@@ -30,23 +29,25 @@ fn io(path: &Path, error: impl std::fmt::Display) -> ConfigError {
     )
 }
 
-/// ADR 0018 §2: `dir/x.yaml` → `dir/engines.yaml`.
-pub fn engines_beside(role_document: &Path) -> PathBuf {
-    // A bare relative name (`host.yaml`) has an empty parent, which names the
-    // working directory; say so, so the directory can be opened and synced.
-    role_document
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
-        .join(ENGINES_FILE)
+/// ADR 0018 amendment A4 / SPEC §15.1: the single engines-file resolver.
+pub fn engines_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(ENGINES_FILE)
 }
 
-/// ADR 0018 §2: beside the role document named with `--config`; without one,
-/// `<config home>/capyctl/engines.yaml`, for a host and for standalone alike.
-pub fn engines_path(role_document: Option<&Path>, config_home: &Path) -> PathBuf {
+/// The pre-A4 location, used only for one-time migration.
+pub fn legacy_engines_path(
+    role_document: Option<&Path>,
+    config_home: Option<&Path>,
+) -> Option<PathBuf> {
     match role_document {
-        Some(document) => engines_beside(document),
-        None => config_home.join("capyctl").join(ENGINES_FILE),
+        Some(document) => Some(
+            document
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .join(ENGINES_FILE),
+        ),
+        None => config_home.map(|home| home.join("capyctl").join(ENGINES_FILE)),
     }
 }
 
@@ -310,12 +311,10 @@ pub fn lock_engines(path: &Path) -> Result<EnginesLock, ConfigError> {
     lock_engines_for(path, None)
 }
 
-/// As [`lock_engines`], naming who owns what this write creates. Controller
-/// ruling C1: the CLI is the only writer of engines.yaml, and under the
-/// system units it runs as root (`sudo capyctl engine …`); the file and its
-/// lock are then created for the role's service user (`owner`, uid and gid),
-/// mode 0600, so the service can read the file. An existing file keeps its
-/// owner and mode (see [`write_engines`]).
+/// As [`lock_engines`], naming who owns what this write creates. ADR 0018
+/// §2, amendment A4: under sudo the file and lock belong to the state
+/// directory's service user, mode 0600. An existing file keeps its owner
+/// and mode (see [`write_engines`]).
 pub fn lock_engines_for(
     path: &Path,
     owner: Option<(u32, u32)>,
@@ -383,6 +382,63 @@ fn give(file: &File, (uid, gid): (u32, u32)) -> std::io::Result<()> {
         return Ok(());
     }
     std::os::unix::fs::fchown(file, Some(uid), Some(gid))
+}
+
+/// ADR 0018 amendment A4: bring both legacy files into the state directory
+/// while holding the same lock as writers, returning one notice per copy for
+/// the role log. The old file is copied, never moved or removed: it may be
+/// shared by another role with another state directory, or still read by an
+/// older release, and under the system units its directory is read-only to
+/// the service. The private, state-owned copy is authoritative from then on.
+pub fn migrate_engines(lock: &EnginesLock, legacy: &Path) -> Result<Vec<String>, ConfigError> {
+    use std::os::unix::fs::MetadataExt;
+    let mut notices = Vec::new();
+    for old in [legacy.to_path_buf(), custom_engines_beside(legacy)] {
+        let destination = if old.file_name() == Some(std::ffi::OsStr::new(CUSTOM_ENGINES_FILE)) {
+            custom_engines_beside(&lock.path)
+        } else {
+            lock.path.clone()
+        };
+        if old == destination {
+            continue;
+        }
+        match fs::symlink_metadata(&old) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(io(&old, e)),
+        }
+        if destination.try_exists().map_err(|e| io(&destination, e))? {
+            continue;
+        }
+        let mut source = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&old)
+            .map_err(|e| io(&old, e))?;
+        refuse_hardlink(&old, &source, lock.owner)?;
+        let directory = destination.parent().expect("engines path has a parent");
+        let state_owner = fs::metadata(directory).map_err(|e| io(directory, e))?;
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(directory).map_err(|e| io(directory, e))?;
+        std::io::copy(&mut source, &mut temporary).map_err(|e| io(&old, e))?;
+        let file = temporary.as_file();
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| io(temporary.path(), e))?;
+        give(file, (state_owner.uid(), state_owner.gid())).map_err(|e| io(temporary.path(), e))?;
+        file.sync_all().map_err(|e| io(temporary.path(), e))?;
+        temporary
+            .persist(&destination)
+            .map_err(|e| io(&destination, e.error))?;
+        File::open(directory)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| io(directory, e))?;
+        notices.push(format!(
+            "copied {} to {}; this role reads only the copy from now on, and the old file can be deleted once nothing else uses it",
+            old.display(),
+            destination.display()
+        ));
+    }
+    Ok(notices)
 }
 
 /// ADR 0018 §2: write `file` under `lock` at the next revision and return it.

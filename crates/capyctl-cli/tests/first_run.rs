@@ -96,7 +96,7 @@ fn engine_add_with_no_role_running_saves_and_succeeds() {
         &[],
     );
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
-    let engines = root.path().join("home/.config/capyctl/engines.yaml");
+    let engines = root.path().join("state/engines.yaml");
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["published"], "role_not_running", "{}", text(&output));
     // The notice is part of the result: with `--json` it is the `notice` field.
@@ -185,10 +185,7 @@ fn engine_add_with_a_state_dir_too_long_for_its_socket_writes_nothing() {
         text(&output)
     );
     assert!(
-        !root
-            .path()
-            .join("home/.config/capyctl/engines.yaml")
-            .exists(),
+        !root.path().join("state/engines.yaml").exists(),
         "{}",
         text(&output)
     );
@@ -236,7 +233,7 @@ fn engine_add_refuses_an_editable_sglang_before_anything_runs() {
             ran.display()
         ),
     );
-    let engines = root.path().join("home/.config/capyctl/engines.yaml");
+    let engines = root.path().join("state/engines.yaml");
     let output = capyctl(
         root.path(),
         root.path(),
@@ -289,7 +286,7 @@ impl ControlHandler for Role {
 /// A host document in `dir` whose private state directory holds a scripted
 /// role socket that publishes every `add`.
 async fn host_with_role(root: &Path) -> (PathBuf, Arc<Role>, tokio::sync::watch::Sender<bool>) {
-    let state = root.join("s");
+    let state = root.join("state");
     mkdir(&state);
     let dir = root.join("etc");
     mkdir(&dir);
@@ -306,7 +303,7 @@ async fn host_with_role(root: &Path) -> (PathBuf, Arc<Role>, tokio::sync::watch:
 }
 
 // T01 T07 (ADR 0018 §2): `engine add --config host.yaml` with a path relative
-// to the working directory saves the profile beside the document and asks the
+// to the working directory saves the profile in the state directory and asks the
 // running role to publish it (found 2026-09-25: it saved, then failed to sync
 // the empty parent directory and never asked the role).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -338,11 +335,14 @@ async fn engine_add_with_a_relative_config_publishes() {
     assert_eq!(result["published"], "published", "{}", text(&output));
     assert_eq!(
         result["engines_file"],
-        dir.join("engines.yaml").to_string_lossy().as_ref(),
+        root.path()
+            .join("state/engines.yaml")
+            .to_string_lossy()
+            .as_ref(),
         "the engines file is named absolutely"
     );
     assert_eq!(role.0.load(Ordering::SeqCst), 1, "the role was asked");
-    assert!(dir.join("engines.yaml").is_file());
+    assert!(root.path().join("state/engines.yaml").is_file());
 }
 
 // T01 (ADR 0018 §2): `$CAPYCTL_CONFIG` relative to the working directory is

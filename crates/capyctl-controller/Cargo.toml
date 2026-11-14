@@ -25,6 +25,7 @@ async-trait = { workspace = true }
 
 capyctl-agent.workspace = true
 capyctl-protocol.workspace = true
+prost.workspace = true
 tonic = { workspace = true, features = ["tls-ring"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 

@@ -2,8 +2,18 @@
 //!
 //! Optional mutations accept stopped configurations and owned Start/Stop
 //! commands. No listener or inference routes are composed here.
-//! The trusted service must resolve independent credentials and
-//! mount this router ONLY on its separate loopback (or TLS) management listener.
+//! ADR 0040 §2: a role serves its routers only through [`compose::compose`],
+//! which resolves the principal every router's `authenticate` layer reads.
+//!
+//! ADR 0040 §9: `POST /management/v1/deployments/check` accepts exactly one
+//! of `{"yaml":"…"}` and `{"config":{…}}`. It returns normalized `config`,
+//! emitted `yaml`, `errors` (including parser positions), and per-host
+//! `hosts` verdicts: `fits`, `needs_room`, `does_not_fit` with its `limit`,
+//! or `unknown` with its `reason`. Size-based verdicts carry `estimated`.
+//! No deployment, receipt, reservation or event is stored. A standalone
+//! host pins and sizes in-process with its own model-source settings and
+//! caches repository/reference pins. The server route currently refuses
+//! `unsupported_capability` until its host-admin provider is installed.
 use axum::{
     extract::{Request, State},
     http::{header, StatusCode},
@@ -17,8 +27,14 @@ use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
+// ADR 0040 §8: the snapshot's supported-action hints, as handler codes.
+mod action_hints;
 pub mod actions;
+pub mod check;
 pub mod configuration;
+mod deployment_source;
+// ADR 0040 §§2–4: the one composition point and principal resolution.
+pub mod compose;
 mod credentials;
 pub mod drain;
 // SPEC §13.3 / T21: one instance's bounded, redacted engine log tail.
@@ -27,6 +43,9 @@ pub mod enrollment;
 // ADR 0018 §4: runtime profile retirement over the ordinary stop path.
 pub mod engines;
 pub mod events;
+// ADR 0040 §§10–11: role-injected host administration.
+pub mod host_admin;
+pub mod host_admin_remote;
 pub mod hosts;
 // Design §9: the inference listener's bind and authentication, for status.
 pub mod inference_listener;
@@ -34,6 +53,10 @@ pub mod inference_listener;
 pub mod installation;
 // SPEC §17 (M80): router, ingress and engine latency distributions.
 pub mod metrics;
+// ADR 0040 §12: the browser-session-authorized inference forward.
+pub mod playground;
+// ADR 0040 §§4–7: the session verifier and the browser session routes.
+pub mod ui_sessions;
 
 /// Hashes only; intentionally neither Debug nor Serialize. This validates token
 /// syntax/distinctness, not randomness or provenance. Inputs MUST come from the
@@ -106,7 +129,6 @@ impl SnapshotSource for StoreSnapshotSource {
     }
 }
 struct AppState {
-    credentials: ManagementCredentials,
     source: Arc<dyn SnapshotSource>,
     reads: Arc<Semaphore>,
     events: Option<Arc<dyn events::EventSource>>,
@@ -123,12 +145,8 @@ struct AppState {
 
 /// At most two queued/running blocking reads per router. Cancellation retains a
 /// permit inside its worker until the actual read completes. No unbounded queue.
-pub fn snapshot_router(
-    credentials: ManagementCredentials,
-    source: Arc<dyn SnapshotSource>,
-) -> Router {
+pub fn snapshot_router(source: Arc<dyn SnapshotSource>) -> Router {
     let state = Arc::new(AppState {
-        credentials,
         source,
         reads: Arc::new(Semaphore::new(2)),
         events: None,
@@ -144,23 +162,18 @@ pub fn snapshot_router(
 
 /// Combined historical snapshot and durable SSE provider. Mount once on the
 /// separately secured management listener; this does not start a listener.
-pub fn read_only_router<T: SnapshotSource + events::EventSource>(
-    credentials: ManagementCredentials,
-    source: Arc<T>,
-) -> Router {
-    read_only_router_with_event_options(credentials, source, events::EventStreamOptions::default())
+pub fn read_only_router<T: SnapshotSource + events::EventSource>(source: Arc<T>) -> Router {
+    read_only_router_with_event_options(source, events::EventStreamOptions::default())
         .expect("default event options are bounded")
 }
 
 /// Configurable service limits may only tighten the built-in upper bounds.
 pub fn read_only_router_with_event_options<T: SnapshotSource + events::EventSource>(
-    credentials: ManagementCredentials,
     source: Arc<T>,
     options: events::EventStreamOptions,
 ) -> Result<Router, &'static str> {
     options.validate()?;
     let state = Arc::new(AppState {
-        credentials,
         source: source.clone(),
         reads: Arc::new(Semaphore::new(2)),
         events: Some(source),
@@ -179,12 +192,10 @@ pub fn read_only_router_with_event_options<T: SnapshotSource + events::EventSour
 pub fn configuration_router<
     T: SnapshotSource + events::EventSource + configuration::ConfigurationSource,
 >(
-    credentials: ManagementCredentials,
     source: Arc<T>,
 ) -> Router {
     let options = events::EventStreamOptions::default();
     let state = Arc::new(AppState {
-        credentials,
         source: source.clone(),
         reads: Arc::new(Semaphore::new(2)),
         events: Some(source.clone()),
@@ -200,14 +211,10 @@ pub fn configuration_router<
 
 /// Compose Start and Stop with the same owned snapshot and configuration
 /// authority. Retain OwnedCoordinator outside this router.
-pub fn lifecycle_router(
-    credentials: ManagementCredentials,
-    source: Arc<actions::OwnedActionSource>,
-) -> Router {
+pub fn lifecycle_router(source: Arc<actions::OwnedActionSource>) -> Router {
     let options = events::EventStreamOptions::default();
     routes(
         Arc::new(AppState {
-            credentials,
             source: source.clone(),
             reads: Arc::new(Semaphore::new(2)),
             events: Some(source.clone()),
@@ -261,6 +268,10 @@ fn routes(state: Arc<AppState>, include_events: bool) -> Router {
                 "/management/v1/deployments/{id}/effective-config",
                 get(configuration::effective_config),
             )
+            .route(
+                "/management/v1/deployments/{id}/source",
+                get(deployment_source::get),
+            )
             // SPEC §6.3, ADR 0008: the store keys deployments still reference,
             // for the host-side `capyctl prune sources`.
             .route(
@@ -273,15 +284,18 @@ fn routes(state: Arc<AppState>, include_events: bool) -> Router {
     router
         .fallback(not_found)
         .method_not_allowed_fallback(method_denied)
-        .layer(middleware::from_fn_with_state(state.clone(), authenticate))
+        .layer(middleware::from_fn(authenticate))
         .with_state(state)
 }
-async fn authenticate(
-    State(state): State<Arc<AppState>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let mut response = if state.credentials.accepts(&request) {
+/// ADR 0040 §2: whether the composition resolved a principal for `request`.
+fn authorized(request: &Request) -> bool {
+    request
+        .extensions()
+        .get::<ui_sessions::Principal>()
+        .is_some()
+}
+async fn authenticate(request: Request, next: Next) -> Response {
+    let mut response = if authorized(&request) {
         next.run(request).await
     } else {
         error(StatusCode::UNAUTHORIZED, "unauthenticated", false)
@@ -304,7 +318,9 @@ async fn snapshot(State(state): State<Arc<AppState>>, request: Request) -> Respo
     let source = state.source.clone();
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        source.snapshot()
+        let mut snapshot = source.snapshot()?;
+        action_hints::map_reasons(&mut snapshot);
+        Ok::<_, SnapshotUnavailable>(snapshot)
     })
     .await
     {
@@ -321,6 +337,11 @@ async fn method_denied() -> Response {
 fn error(status: StatusCode, code: &'static str, retryable: bool) -> Response {
     let message = match code {
         "unauthenticated" => "Management authentication required",
+        // ADR 0040 §4: a browser request that failed the request checks.
+        "origin_refused" => "Browser request refused: missing UI header, wrong origin or not JSON",
+        // ADR 0040 §5: only the admin token issues a sign-in link.
+        "admin_required" => "Only the admin token on the box can issue a sign-in link",
+        "sign_in_link_refused" => "This sign-in link was already used or has expired",
         "invalid_request" => "Invalid request",
         "unsupported_media_type" => "JSON content type required",
         "identity_conflict" => "Host identity request conflicts with current state",

@@ -1,6 +1,6 @@
 //! Administrator-only invitation/revocation API on the existing protected
 //! management listener. The same controller-owned authority serves bootstrap.
-use crate::{error, ManagementCredentials};
+use crate::error;
 use axum::{
     body::to_bytes,
     extract::{Path, Request, State},
@@ -15,7 +15,6 @@ use serde::Deserialize;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 struct EnrollmentState {
-    credentials: ManagementCredentials,
     authority: Arc<EnrollmentAuthority>,
     bootstrap_address: String,
     control_address: String,
@@ -34,7 +33,6 @@ struct Invite {
 /// Mount only on the authenticated loopback/TLS management listener. Bootstrap
 /// address is trusted server configuration, never request-controlled redirect data.
 pub fn enrollment_router(
-    credentials: ManagementCredentials,
     authority: Arc<EnrollmentAuthority>,
     bootstrap_address: String,
     control_address: String,
@@ -42,7 +40,6 @@ pub fn enrollment_router(
     validate_address(&control_address)?;
     validate_address(&bootstrap_address)?;
     let state = Arc::new(EnrollmentState {
-        credentials,
         authority,
         bootstrap_address,
         control_address,
@@ -53,7 +50,7 @@ pub fn enrollment_router(
         .route("/management/v1/hosts/{id}/revoke", post(revoke))
         .fallback(crate::not_found)
         .method_not_allowed_fallback(crate::method_denied)
-        .layer(middleware::from_fn_with_state(state.clone(), authenticate))
+        .layer(middleware::from_fn(authenticate))
         .with_state(state))
 }
 fn validate_address(bootstrap_address: &str) -> Result<(), &'static str> {
@@ -73,12 +70,9 @@ fn validate_address(bootstrap_address: &str) -> Result<(), &'static str> {
     }
     Ok(())
 }
-async fn authenticate(
-    State(state): State<Arc<EnrollmentState>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let mut response = if !state.credentials.accepts(&request) {
+/// ADR 0040 §2: the principal is the composition's.
+async fn authenticate(request: Request, next: Next) -> Response {
+    let mut response = if !crate::authorized(&request) {
         error(StatusCode::UNAUTHORIZED, "unauthenticated", false)
     } else if request.uri().query().is_some() {
         error(StatusCode::BAD_REQUEST, "invalid_request", false)

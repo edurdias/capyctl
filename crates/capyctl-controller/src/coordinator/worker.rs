@@ -424,6 +424,12 @@ impl CoordinatorCommands {
         (self.shared.clock)().map_err(Into::into)
     }
 
+    /// ADR 0040 §9: read the same physical evidence a start observes, without
+    /// accepting work, reserving memory or holding the store lock across I/O.
+    pub fn observe_for_check(&self, host: String) -> ResidentObservationFuture {
+        self.shared.observations.observe_with_residents(host)
+    }
+
     /// Accept a deployment durably and return what was accepted.
     ///
     /// Acceptance is idempotent on the caller's key: a response lost after the

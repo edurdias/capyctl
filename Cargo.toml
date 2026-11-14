@@ -5,7 +5,7 @@ members = [
   "crates/capyctl-protocol", "crates/capyctl-controller", "crates/capyctl-router",
   "crates/capyctl-agent", "crates/capyctl-adapters", "crates/capyctl-launchers",
   "crates/capyctl-config", "crates/capyctl-cli", "crates/capyctl-management",
-  "crates/capyctl-testkit", "tests/harness",
+  "crates/capyctl-testkit", "crates/capyctl-webui", "tests/harness",
 ]
 
 [workspace.package]

@@ -186,6 +186,8 @@ pub struct App {
     /// Servable router (F1: the standalone role's inference surface).
     router: axum::Router,
     management: axum::Router,
+    /// ADR 0040 §12: one shutdown gate for inference and playground work.
+    admission: Arc<crate::shutdown::Admission>,
     deps: capyctl_router::RouterDeps,
     api_key: String,
     /// The embedded role's supervisors: readiness (SPEC §4.3, P3: re-proves
@@ -218,6 +220,11 @@ impl App {
     /// SPEC §16.5: mount only on the separate loopback management listener.
     pub fn management_router(&self) -> axum::Router {
         self.management.clone()
+    }
+
+    /// ADR 0040 §12: the listener closes the same gate the playground uses.
+    pub fn admission(&self) -> Arc<crate::shutdown::Admission> {
+        self.admission.clone()
     }
 
     /// SPEC §15.3: the standalone document's accepted-but-ignored values, one
@@ -342,28 +349,66 @@ pub const INFERENCE_ADDR_ENV: &str = "CAPYCTL_INFERENCE_ADDR";
 /// it, with a deprecation warning.
 pub const DEPRECATED_INFERENCE_ADDR_ENV: &str = "CAPYCTL_STANDALONE_INFERENCE_ADDR";
 /// Owner decision 2026-09-25: the standalone management address for one
-/// run, for the role and its client commands alike (loopback only).
+/// run, for the role and its client commands alike (loopback only, unless
+/// this run's `remote` is set, ADR 0040 §1).
 pub const MANAGEMENT_ADDR_ENV: &str = "CAPYCTL_MANAGEMENT_ADDR";
 /// The standalone-only name [`MANAGEMENT_ADDR_ENV`] replaces. Still read,
 /// after it, with a deprecation warning.
 pub const DEPRECATED_MANAGEMENT_ADDR_ENV: &str = "CAPYCTL_STANDALONE_MANAGEMENT_ADDR";
+/// ADR 0040 §1: whether the management listener may bind off loopback for
+/// one run, on the server and standalone roles alike (`--management-remote`
+/// wins over it).
+pub const MANAGEMENT_REMOTE_ENV: &str = "CAPYCTL_MANAGEMENT_REMOTE";
+
+/// ADR 0040 §1: this run's `remote`, if a named form states it:
+/// `--management-remote` (`flag`), then `CAPYCTL_MANAGEMENT_REMOTE` (`true`,
+/// `false`, `1`, `0`, `on`, `off`; a malformed value is refused with its
+/// name). `None` leaves it to the document.
+pub fn management_remote_override(flag: bool) -> Result<Option<bool>, StartError> {
+    if flag {
+        return Ok(Some(true));
+    }
+    match std::env::var(MANAGEMENT_REMOTE_ENV) {
+        Ok(text) if !text.is_empty() => {
+            capyctl_config::engine_settings::boolean(MANAGEMENT_REMOTE_ENV, &text)
+                .map(Some)
+                .map_err(|error| StartError::Setting(crate::settings::describe(&error)))
+        }
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(StartError::Setting(format!(
+            "{MANAGEMENT_REMOTE_ENV} must be true or false"
+        ))),
+    }
+}
 
 /// SPEC §16.5, owner decision 2026-09-25: the run-time override of the
-/// standalone management bind, if any: `--management-listen`, then
+/// management bind, if any: `--management-listen`, then
 /// `CAPYCTL_MANAGEMENT_ADDR`, then the deprecated
-/// `CAPYCTL_STANDALONE_MANAGEMENT_ADDR`. Each must be a loopback address with a
-/// non-zero port; a bad one is refused with its name.
+/// `CAPYCTL_STANDALONE_MANAGEMENT_ADDR`. Each must be an address with a
+/// non-zero port, on loopback unless this run's `remote` is set (ADR 0040
+/// §1); a bad one is refused with its name.
 pub fn management_override(
     flag: Option<std::net::SocketAddr>,
+    remote: bool,
 ) -> Result<Option<std::net::SocketAddr>, StartError> {
     use capyctl_config::standalone::management_address;
+    let rule = if remote {
+        "an address with a non-zero port that is not multicast, e.g. 0.0.0.0:7443"
+    } else {
+        "a loopback address with a port, e.g. 127.0.0.1:7443"
+    };
     if let Some(address) = flag {
-        return management_address(&address.to_string())
+        return management_address(&address.to_string(), remote)
             .map(Some)
             .ok_or_else(|| {
-                StartError::Setting(format!(
-                    "--management-listen {address} must be a loopback address with a non-zero port"
-                ))
+                StartError::Setting(if remote {
+                    format!("--management-listen {address} must be {rule}")
+                } else {
+                    format!(
+                        "--management-listen {address} must be a loopback address with a \
+                         non-zero port"
+                    )
+                })
             });
     }
     let (variable, value) = match std::env::var_os(MANAGEMENT_ADDR_ENV) {
@@ -376,13 +421,81 @@ pub fn management_override(
     value
         .into_string()
         .ok()
-        .and_then(|text| management_address(&text))
+        .and_then(|text| management_address(&text, remote))
         .map(Some)
-        .ok_or_else(|| {
-            StartError::Setting(format!(
-                "{variable} must be a loopback address with a port, e.g. 127.0.0.1:7443"
-            ))
-        })
+        .ok_or_else(|| StartError::Setting(format!("{variable} must be {rule}")))
+}
+
+/// ADR 0040 §1: the address a client on this box connects to for a
+/// management listener bound at `bind`: an unspecified bind (`0.0.0.0`,
+/// `::`) is reached through loopback on the same port; any other address as
+/// it is.
+pub fn connectable(bind: std::net::SocketAddr) -> std::net::SocketAddr {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    match bind.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => (Ipv4Addr::LOCALHOST, bind.port()).into(),
+        IpAddr::V6(ip) if ip.is_unspecified() => (Ipv6Addr::LOCALHOST, bind.port()).into(),
+        _ => bind,
+    }
+}
+
+/// The management address a client command names with
+/// `CAPYCTL_MANAGEMENT_ADDR` (or its deprecated alias), if any: on loopback
+/// unless `CAPYCTL_MANAGEMENT_REMOTE` is set (ADR 0040 §1), and reached
+/// through loopback when unspecified ([`connectable`]).
+pub fn client_management_override() -> Result<Option<std::net::SocketAddr>, StartError> {
+    let remote = management_remote_override(false)?.unwrap_or(false);
+    Ok(management_override(None, remote)?.map(connectable))
+}
+
+/// SPEC §16.5, ADR 0040 §1: the management address a standalone role binds
+/// this run when a named form moves it, checked before the boot so a bad
+/// override refuses without side effects. The address is
+/// `--management-listen` (`listen`), else `CAPYCTL_MANAGEMENT_ADDR` (or its
+/// deprecated alias); `None` is the document's bind
+/// ([`App::management_bind`]). It is on loopback unless this run's `remote`
+/// is set: `--management-remote` (`remote_flag`), else
+/// `CAPYCTL_MANAGEMENT_REMOTE`, else the document's `remote`.
+///
+/// The document at `path`, with `overrides` applied, is read for its
+/// `remote` (a missing one is generated at the boot and states only the
+/// overrides); a document the role refuses is left to the boot, which names
+/// the refusal.
+pub fn standalone_management_override(
+    path: &Path,
+    overrides: &SettingOverrides,
+    listen: Option<std::net::SocketAddr>,
+    remote_flag: bool,
+) -> Result<Option<std::net::SocketAddr>, StartError> {
+    let document = match std::fs::read_to_string(path) {
+        Ok(text) => capyctl_config::parse_document(&text)
+            .and_then(|document| overrides.apply_and_validate(document))
+            .ok(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut document = serde_json::json!({});
+            overrides.apply(&mut document).ok().map(|()| document)
+        }
+        Err(_) => None,
+    };
+    let stated = document
+        .and_then(|document| capyctl_config::standalone::management_listener(&document).ok());
+    let named = management_remote_override(remote_flag)?;
+    let remote = named
+        .or(stated.as_ref().map(|listener| listener.remote))
+        .unwrap_or(false);
+    let address = management_override(listen, remote)?;
+    // ADR 0040 §1: `CAPYCTL_MANAGEMENT_REMOTE=false` takes an off-box
+    // document bind back to the loopback rule.
+    if let (None, Some(listener)) = (address, &stated) {
+        if !remote && !listener.bind.ip().is_loopback() {
+            return Err(StartError::Setting(format!(
+                "{MANAGEMENT_REMOTE_ENV} is false, so the management listener binds a \
+                 loopback address; server.listeners.management.bind is {}",
+                listener.bind
+            )));
+        }
+    }
+    Ok(address)
 }
 
 /// Print a role warning that may carry the legacy `warning: ` prefix; the sink
@@ -516,12 +629,13 @@ pub fn record_management_address(state_dir: &Path, address: std::net::SocketAddr
     }
 }
 
-/// The management address a role under `state_dir` recorded, when it is a
-/// loopback address (SPEC §16.5: management never leaves loopback, so a
-/// recorded value that is not one is ignored).
+/// The management address a role under `state_dir` recorded, as a client on
+/// this box reaches it. ADR 0040 §1: the role records only the address it
+/// was allowed to bind, so an off-box one is accepted, and an unspecified
+/// bind is reached through loopback ([`connectable`]).
 pub fn recorded_management_address(state_dir: &Path) -> Option<std::net::SocketAddr> {
     let text = std::fs::read_to_string(recorded_management_path(state_dir)).ok()?;
-    capyctl_config::standalone::management_address(text.trim())
+    capyctl_config::standalone::parse_management_address(text.trim()).map(connectable)
 }
 
 /// Owner decision 2026-09-25: the management address a client command uses
@@ -533,7 +647,7 @@ pub fn recorded_management_address(state_dir: &Path) -> Option<std::net::SocketA
 /// ([`recorded_management_address`]), so a role started with
 /// `--management-listen` is found without the variable.
 pub fn standalone_management_address(state_dir: &Path) -> Result<std::net::SocketAddr, StartError> {
-    if let Some(address) = management_override(None)? {
+    if let Some(address) = client_management_override()? {
         return Ok(address);
     }
     // Final review I8: the address the role serves on this run, which a
@@ -566,7 +680,9 @@ pub fn standalone_management_address(state_dir: &Path) -> Result<std::net::Socke
     let parsed = capyctl_config::parse_document(&text)
         .and_then(|parsed| overrides.apply_and_validate(parsed))
         .map_err(refused)?;
-    capyctl_config::standalone::management_bind(&parsed).map_err(refused)
+    capyctl_config::standalone::management_bind(&parsed)
+        .map(connectable)
+        .map_err(refused)
 }
 
 impl App {
@@ -1762,7 +1878,7 @@ async fn start_standalone_in(
         timing_header,
         config_notices,
         inference_bind,
-        management_bind,
+        management_listener,
         inference_auth,
         stated_host,
         group_stall_timeout,
@@ -1819,8 +1935,9 @@ async fn start_standalone_in(
             capyctl_config::standalone::inference_bind(&document).map_err(|error| {
                 StartError::Deploy(format!("standalone configuration: {error}"))
             })?,
-            // Owner decision 2026-09-25: validated by `check_honoured` above.
-            capyctl_config::standalone::management_bind(&document).map_err(|error| {
+            // Owner decision 2026-09-25, ADR 0040 §1: validated by
+            // `check_honoured` above.
+            capyctl_config::standalone::management_listener(&document).map_err(|error| {
                 StartError::Deploy(format!("standalone configuration: {error}"))
             })?,
             // Design §9: `server.listeners.inference.authentication`
@@ -1879,15 +1996,19 @@ async fn start_standalone_in(
     // SPEC §8 (amended 2026-10-01): what this host publishes about its engines
     // is what it has. There is no fallback installation: a host with none
     // starts and publishes none. ADR 0018 §5: the environment's
-    // installations and the profiles registered in engines.yaml (beside
-    // `--config`, else `<config home>/capyctl/engines.yaml`); a name declared in
-    // both is refused `profile_exists`. The standalone document is never written.
-    let engines = crate::engine::role_engines(config, &|key| match &config_home {
-        ConfigHome::Process => std::env::var(key).ok().filter(|value| !value.is_empty()),
-        ConfigHome::Isolated(home) => {
-            (key == "XDG_CONFIG_HOME").then(|| home.to_string_lossy().into_owned())
-        }
-    });
+    // installations and the profiles registered in the state directory's
+    // engines.yaml (ADR 0018 amendment A4); duplicate names are refused.
+    // The standalone document is never written.
+    let engines = Some(crate::engine::role_engines(
+        state_dir,
+        config,
+        &|key| match &config_home {
+            ConfigHome::Process => std::env::var(key).ok().filter(|value| !value.is_empty()),
+            ConfigHome::Isolated(home) => {
+                (key == "XDG_CONFIG_HOME").then(|| home.to_string_lossy().into_owned())
+            }
+        },
+    )?);
     // ADR 0018 amendment A3: a profile for an engine kind this release does
     // not know (a newer release wrote it) is skipped with a warning.
     let registered = match &engines {
@@ -2161,9 +2282,14 @@ async fn start_standalone_in(
         .lines()
         .find_map(|line| line.strip_prefix("admin_token: "))
         .ok_or(StartError::MissingCredentials)?;
-    let management_credentials =
+    // ADR 0040 §§2, 7: the role's one session verifier, on its own store
+    // connection. Opening it deletes the sessions and sign-in links another
+    // admin token issued, then loads the session table.
+    let session_verifier = capyctl_management::ui_sessions::SessionVerifier::open(
         capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-            .map_err(|_| StartError::MissingCredentials)?;
+            .map_err(|_| StartError::MissingCredentials)?,
+        Store::open(&db_path)?,
+    )?;
     // SPEC §4.3 (P3): the Ready engines a previous run left running are adopted
     // by the coordinator at start; this supervisor re-proves each one locally
     // before dispatch reopens.
@@ -2219,29 +2345,11 @@ async fn start_standalone_in(
             .map_err(|_| StartError::Deploy("management actions unavailable".into()))?
             .with_switcher(switcher.clone()),
     );
-    // SPEC §4.3: the explicit drain of the embedded host, by its published name
-    // or the `standalone` alias the CLI uses.
-    let drain = capyctl_management::drain::drain_router(
-        capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-            .map_err(|_| StartError::MissingCredentials)?,
-        source.clone(),
-        vec![declared_host.name.clone(), "standalone".to_owned()],
-    );
-    // ADR 0008: the registered installation, shown by standalone status.
-    let installation_view = capyctl_management::installation::installation_router(
-        capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-            .map_err(|_| StartError::MissingCredentials)?,
-        embedded.installations(),
-    );
     // SPEC §13.3 / T21: an instance's engine log, read in-process from the
     // embedded host's log directory (no agent session in a standalone role).
-    let engine_log_view = capyctl_management::engine_log::engine_log_router(
-        capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-            .map_err(|_| StartError::MissingCredentials)?,
-        capyctl_management::engine_log::StandaloneEngineLogs::new(
-            owner.clone(),
-            state_dir.join("logs"),
-        ),
+    let engine_logs = capyctl_management::engine_log::StandaloneEngineLogs::new(
+        owner.clone(),
+        state_dir.join("logs"),
     );
     // SPEC §4.2: the same host and engine inventory a server serves, for the
     // one embedded host: its published document (so `engine add` shows at
@@ -2252,34 +2360,29 @@ async fn start_standalone_in(
     let load_owner = owner.clone();
     // SPEC §7.2: set once the policy is published below.
     let memory_warnings = Arc::new(std::sync::OnceLock::new());
-    let hosts_view = capyctl_management::hosts::standalone_hosts_router(
-        capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-            .map_err(|_| StartError::MissingCredentials)?,
-        owner,
-        capyctl_management::hosts::StandaloneHost {
-            host_id: declared_host.name.clone(),
-            document: {
-                let embedded = embedded.clone();
-                Arc::new(move || embedded.document())
-            },
-            installations: embedded.installations(),
-            domains: {
-                let observed = crate::host_observation::observed_domains(&declared_host.domains);
-                let (memory, gpu) = (memory.clone(), gpu.clone());
-                Arc::new(move || {
-                    let (observed, memory, gpu) = (observed.clone(), memory.clone(), gpu.clone());
-                    Box::pin(async move {
-                        let kinds = observed.clone();
-                        let Ok((observations, source)) =
-                            HostMemoryObservation::with_domains(observed)
-                                .with_memory_reader(memory)
-                                .with_gpu_sampler(gpu)
-                                .observe_sourced()
-                                .await
-                        else {
-                            return Vec::new();
-                        };
-                        observations
+    let standalone_host = capyctl_management::hosts::StandaloneHost {
+        host_id: declared_host.name.clone(),
+        document: {
+            let embedded = embedded.clone();
+            Arc::new(move || embedded.document())
+        },
+        installations: embedded.installations(),
+        domains: {
+            let observed = crate::host_observation::observed_domains(&declared_host.domains);
+            let (memory, gpu) = (memory.clone(), gpu.clone());
+            Arc::new(move || {
+                let (observed, memory, gpu) = (observed.clone(), memory.clone(), gpu.clone());
+                Box::pin(async move {
+                    let kinds = observed.clone();
+                    let Ok((observations, source)) = HostMemoryObservation::with_domains(observed)
+                        .with_memory_reader(memory)
+                        .with_gpu_sampler(gpu)
+                        .observe_sourced()
+                        .await
+                    else {
+                        return Vec::new();
+                    };
+                    observations
                             .into_iter()
                             .map(|o| {
                                 let device = kinds.iter().any(|d| {
@@ -2299,12 +2402,11 @@ async fn start_standalone_in(
                                 domain
                             })
                             .collect()
-                    })
                 })
-            },
-            memory_warnings: memory_warnings.clone(),
+            })
         },
-    );
+        memory_warnings: memory_warnings.clone(),
+    };
     // SPEC §17 (M80): the router's per-request latency distributions.
     let inflight = Arc::new(capyctl_router::admission::InFlight::default());
     inflight.latency.set_timing_header(timing_header);
@@ -2332,28 +2434,18 @@ async fn start_standalone_in(
     // names the engine family from the same table.
     let engine_latency = embedded_load.latency_table();
     inflight.latency.set_host_latency(engine_latency.clone());
-    let latency_view = {
+    let latency = {
         let recorder = inflight.latency.clone();
-        capyctl_management::metrics::latency_router(
-            capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-                .map_err(|_| StartError::MissingCredentials)?,
-            Arc::new(move |deployment: Option<&str>| {
-                capyctl_router::timing::latency_report(
-                    &recorder,
-                    &engine_latency.snapshot(deployment),
-                    deployment,
-                )
-            }),
-        )
+        Arc::new(move |deployment: Option<&str>| {
+            capyctl_router::timing::latency_report(
+                &recorder,
+                &engine_latency.snapshot(deployment),
+                deployment,
+            )
+        })
     };
     supervision.supervise(embedded_load.spawn_until(supervision.cancel_signal()));
-    let load_view = crate::remote_roles::load_view(
-        capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-            .map_err(|_| StartError::MissingCredentials)?,
-        load_owner,
-        inflight.clone(),
-        engine_load.clone(),
-    );
+    let load = crate::remote_roles::load_source(load_owner, inflight.clone(), engine_load.clone());
     // ADR 0018 §4, §5: removal retires through the store, as a server does.
     let retirements = Arc::new(capyctl_management::engines::StoreRetirements::new(
         source.clone(),
@@ -2362,19 +2454,39 @@ async fn start_standalone_in(
     // the caller serves it (`App::inference_router`), for status.
     let inference_listener =
         Arc::new(capyctl_management::inference_listener::InferenceListenerView::default());
-    let inference_listener_view = capyctl_management::inference_listener::inference_listener_router(
-        capyctl_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-            .map_err(|_| StartError::MissingCredentials)?,
-        inference_listener.clone(),
-    );
-    let management = capyctl_management::lifecycle_router(management_credentials, source)
-        .merge(drain)
-        .merge(installation_view)
-        .merge(hosts_view)
-        .merge(engine_log_view)
-        .merge(latency_view)
-        .merge(load_view)
-        .merge(inference_listener_view);
+    // ADR 0040 §10: the API and local CLI share one in-process control
+    // handler and its mutation lock.
+    let engine_control = engines.as_ref().map(|engines| {
+        crate::standalone_engines::StandaloneControl::new(
+            engines.clone(),
+            provider.clone(),
+            embedded.clone(),
+            retirements,
+            coordinator.commands(),
+            declared_host.name.clone(),
+        )
+    });
+    let host_admin: Arc<dyn capyctl_management::host_admin::HostAdminSource> =
+        match (&engines, &engine_control) {
+            (Some(engines), Some(control)) => {
+                let role_document = match &outcome {
+                    LoadOutcome::Loaded(path) => PathBuf::from(path),
+                    LoadOutcome::Generated { config_path, .. } => config_path.clone(),
+                };
+                Arc::new(crate::standalone_engines::StandaloneAdmin {
+                    control: control.clone(),
+                    target: capyctl_agent::host_admin::Target {
+                        role_document,
+                        kind: capyctl_agent::host_admin::RoleKind::Standalone,
+                        engines: engines.clone(),
+                        state_dir: state_dir.to_path_buf(),
+                        socket: state_dir.join(capyctl_agent::control_socket::SOCKET_NAME),
+                    },
+                    owner: owner.clone(),
+                })
+            }
+            _ => Arc::new(capyctl_management::host_admin::UnavailableHostAdmin),
+        };
     let controller = Arc::new(
         CoordinatorLifecycle::new(coordinator.commands())
             .with_switcher(switcher.clone())
@@ -2399,6 +2511,46 @@ async fn start_standalone_in(
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
     };
     let router = capyctl_router::serve_router(deps.clone());
+    // ADR 0040 §12 / KTD13: share lifecycle, wake joins and metrics, but
+    // never resolve an inference credential on behalf of the browser.
+    let admission = crate::shutdown::Admission::new();
+    let playground = capyctl_management::playground::router(admission.gate(
+        capyctl_router::serve_router(capyctl_router::RouterDeps {
+            api_key: None,
+            ..deps.clone()
+        }),
+    ));
+    // ADR 0040 §2: every management route is authorized at one point.
+    let management = capyctl_management::compose::standalone(
+        session_verifier,
+        management_listener.public_address.as_deref(),
+        capyctl_management::compose::StandaloneRoutes {
+            ui: capyctl_webui::router(),
+            playground,
+            host_admin,
+            actions: source,
+            // ADR 0040 §9: pin with this host's resolved document settings.
+            check_sources: Arc::new(capyctl_management::check::StandaloneSources(Arc::new(
+                capyctl_agent::host_admin::CachedSourcePinner::new(
+                    models.policy.clone(),
+                    models.models_root.clone(),
+                    Arc::new(|name| std::env::var(name).ok()),
+                )
+                .with_secrets_dir(Some(state_dir.join("secrets"))),
+            ))),
+            // SPEC §4.3: the embedded host drains by its published name or
+            // the `standalone` alias the CLI uses.
+            host_names: vec![declared_host.name.clone(), "standalone".to_owned()],
+            // ADR 0008: the registered installation, shown by standalone status.
+            installations: embedded.installations(),
+            engine_logs,
+            owner,
+            host: standalone_host,
+            latency,
+            load,
+            inference_listener: inference_listener.clone(),
+        },
+    );
     // Publish the ceiling before anything can be admitted against it. A deployment
     // cannot be qualified until the host has said what it will allow, and the policy
     // is imported with the observation that justifies it rather than on its own.
@@ -2480,18 +2632,13 @@ async fn start_standalone_in(
              so there is no engines.yaml to reload"
                 .into(),
         ),
-        Some(engines) => {
+        Some(_) => {
             let socket = state_dir.join(capyctl_agent::control_socket::SOCKET_NAME);
             match capyctl_agent::control_socket::ControlServer::bind(&socket) {
                 Ok(server) => {
-                    let handler = crate::standalone_engines::StandaloneControl::new(
-                        engines.clone(),
-                        provider.clone(),
-                        embedded.clone(),
-                        retirements,
-                        coordinator.commands(),
-                        declared_host.name.clone(),
-                    );
+                    let handler = engine_control.clone().ok_or_else(|| {
+                        StartError::Deploy("engine control handler is unavailable".into())
+                    })?;
                     // SAFETY: geteuid has no preconditions and cannot fail.
                     let uid = unsafe { libc::geteuid() };
                     // Supervised: it stops, and removes its file, with the role.
@@ -2517,13 +2664,14 @@ async fn start_standalone_in(
         gpu_shape,
         router,
         management,
+        admission,
         deps,
         api_key,
         supervision,
         switcher,
         config_notices,
         inference_bind,
-        management_bind,
+        management_bind: management_listener.bind,
         inference_auth,
         inference_listener,
     })

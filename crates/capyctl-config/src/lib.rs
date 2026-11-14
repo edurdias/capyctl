@@ -13,6 +13,9 @@ pub mod decisions;
 // Owner decision 2026-09-25 (ADR 0014 amendment): the minimal deployment file
 // and the defaults that complete it, shared by every role.
 pub mod deployment_defaults;
+// ADR 0008, ADR 0040 §9: Hugging Face references pinned to commits, shared
+// by `deploy model --file` and a role's deployment check.
+pub mod deployment_pin;
 pub mod effective;
 pub mod engine_env;
 pub mod engine_policy;

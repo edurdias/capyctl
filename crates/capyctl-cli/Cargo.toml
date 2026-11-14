@@ -14,6 +14,7 @@ capyctl-agent = { workspace = true }
 capyctl-config = { workspace = true }
 capyctl-controller = { workspace = true }
 capyctl-management = { path = "../capyctl-management" }
+capyctl-webui = { path = "../capyctl-webui" }
 ulid = { workspace = true }
 capyctl-store = { workspace = true }
 capyctl-router = { path = "../capyctl-router" }
@@ -29,6 +30,7 @@ tempfile = { workspace = true }
 libc = "0.2"
 sha2 = { workspace = true }
 async-trait = { workspace = true }
+qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 clap-markdown = "=0.1.5"

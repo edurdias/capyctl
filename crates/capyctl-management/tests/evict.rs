@@ -5,6 +5,7 @@
 //! The Fake engine refuses every park before any effect, so a victim is
 //! released by a verified stop on the plan's next round (ADR 0013 §8 rule 8).
 //! CPU and Fake-engine only: nothing here qualifies an engine recipe.
+mod support;
 use axum::{
     body::{to_bytes, Body},
     http::Request,
@@ -123,13 +124,13 @@ async fn lab_with(managed_gib: i64, ineligible: Option<Ineligible>) -> Lab {
             ..Default::default()
         },
     ));
-    let app = lifecycle_router(
+    let app = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(
+        lifecycle_router(Arc::new(
             OwnedActionSource::new(configuration, worker.commands())
                 .unwrap()
                 .with_switcher(switcher.clone()),
-        ),
+        )),
     );
     Lab {
         a: source.fence.deployment_id.clone(),

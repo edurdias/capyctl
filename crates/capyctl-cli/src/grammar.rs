@@ -74,6 +74,10 @@ pub enum Resource {
 pub enum Command {
     Start(Role),
     Init(InitTarget),
+    /// ADR 0040 §5: issue a one-time browser sign-in link.
+    OpenUi {
+        address: Option<String>,
+    },
     /// SPEC §4.1: a short-lived, single-use host invitation. ADR 0016: with
     /// `recover`, the invitation re-enrolls the revoked host `name` (its name
     /// or id) under its same identity instead of enrolling a new host.
@@ -237,6 +241,7 @@ impl Command {
         match self {
             Command::Start(role) => format!("start {role:?}").to_lowercase(),
             Command::Init(target) => format!("init {target:?}").to_lowercase(),
+            Command::OpenUi { .. } => "open ui".into(),
             Command::Invite { name, recover } => {
                 format!(
                     "invite host {name}{}",
@@ -372,6 +377,11 @@ enum CliCommand {
     Init {
         #[command(subcommand)]
         target: InitTarget,
+    },
+    /// Print a one-time sign-in link and QR code for the web UI.
+    Open {
+        #[command(subcommand)]
+        target: OpenTarget,
     },
     /// Create a single-use invitation file that lets a GPU machine join the
     /// server. With `--recover`, let a revoked host rejoin as itself.
@@ -851,10 +861,19 @@ enum StartTarget {
         #[arg(long)]
         no_inference_auth: bool,
         /// Serve the management API on this loopback address for this run
-        /// (default 127.0.0.1:7443). Wins over CAPYCTL_MANAGEMENT_ADDR and
+        /// (default 127.0.0.1:7443), or on any address with
+        /// --management-remote. Wins over CAPYCTL_MANAGEMENT_ADDR and
         /// listeners.management.bind.
         #[arg(long, value_name = "ADDR:PORT", value_parser = parse_management_listen)]
         management_listen: Option<SocketAddr>,
+        // ADR 0040 §1. (A `//` comment: a doc comment would become
+        // user-facing help text.)
+        /// Allow the management API, and the web UI, on an address other
+        /// than loopback for this run, such as a Tailscale address or
+        /// 0.0.0.0. Served over plain HTTP. Wins over
+        /// CAPYCTL_MANAGEMENT_REMOTE and listeners.management.remote.
+        #[arg(long)]
+        management_remote: bool,
         // ADR 0028 §11 (decided 2026-10-06). (A `//` comment: a doc comment
         // would become user-facing help text.)
         /// How long a request to a multi-node group may wait for its first
@@ -901,10 +920,18 @@ enum StartTarget {
         #[arg(long, value_name = "SIZE", value_parser = parse_kv_cache)]
         kv_cache: Option<String>,
         /// Serve the management API on this loopback address for this run
-        /// (default 127.0.0.1:7443). Wins over CAPYCTL_MANAGEMENT_ADDR and
+        /// (default 127.0.0.1:7443), or on any address with
+        /// --management-remote. Wins over CAPYCTL_MANAGEMENT_ADDR and
         /// server.listeners.management.bind.
         #[arg(long, value_name = "ADDR:PORT", value_parser = parse_management_listen)]
         management_listen: Option<SocketAddr>,
+        // ADR 0040 §1.
+        /// Allow the management API, and the web UI, on an address other
+        /// than loopback for this run, such as a Tailscale address or
+        /// 0.0.0.0. Served over plain HTTP. Wins over
+        /// CAPYCTL_MANAGEMENT_REMOTE and server.listeners.management.remote.
+        #[arg(long)]
+        management_remote: bool,
         #[command(flatten)]
         overrides: SetArgs,
     },
@@ -1106,6 +1133,16 @@ enum ConfigArgs {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+enum OpenTarget {
+    /// Sign a browser in to the server or standalone role on this machine.
+    Ui {
+        /// The browser-facing origin, instead of public_address or the management bind.
+        #[arg(long, value_name = "ORIGIN", value_parser = parse_ui_address)]
+        address: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum HostWord {
     Host,
@@ -1137,6 +1174,9 @@ impl From<CliCommand> for Command {
                 },
             },
             CliCommand::Init { target } => Command::Init(target),
+            CliCommand::Open {
+                target: OpenTarget::Ui { address },
+            } => Command::OpenUi { address },
             CliCommand::Invite {
                 host,
                 name,
@@ -1365,8 +1405,10 @@ pub struct Invocation {
     /// start, `validate config` or `config show`.
     pub sets: Vec<String>,
     /// Owner decision 2026-09-25: `--management-listen` on `start
-    /// standalone`.
+    /// standalone` and `start server`.
     pub management_listen: Option<SocketAddr>,
+    /// ADR 0040 §1: `--management-remote` on the same starts.
+    pub management_remote: bool,
     /// ADR 0028 §11 (decided 2026-10-06): `--group-stall-timeout` on `start
     /// server`.
     pub group_stall_timeout: Option<std::time::Duration>,
@@ -1525,18 +1567,22 @@ where
         _ => Vec::new(),
     };
     // Final review I8: `--management-listen` on both roles that serve the
-    // management API (a host has none).
-    let management_listen = match &cli.command {
+    // management API (a host has none); ADR 0040 §1: and `--management-remote`.
+    let (management_listen, management_remote) = match &cli.command {
         CliCommand::Start {
             target:
                 StartTarget::Standalone {
-                    management_listen, ..
+                    management_listen,
+                    management_remote,
+                    ..
                 }
                 | StartTarget::Server {
-                    management_listen, ..
+                    management_listen,
+                    management_remote,
+                    ..
                 },
-        } => *management_listen,
-        _ => None,
+        } => (*management_listen, *management_remote),
+        _ => (None, false),
     };
     // ADR 0028 §11 (decided 2026-10-06): `--group-stall-timeout` on `start
     // server`, the role that runs groups.
@@ -1624,6 +1670,7 @@ where
         state_dir: cli.state_dir.map(|dir| crate::engine::absolute(&dir)),
         sets,
         management_listen,
+        management_remote,
         group_stall_timeout,
     })
 }
@@ -1647,6 +1694,16 @@ pub fn parse_env_flag(raw: &str) -> Result<(String, String), String> {
         Some((name, value)) if !name.is_empty() => Ok((name.to_owned(), value.to_owned())),
         _ => Err(format!("`{raw}` must be NAME=VALUE with a non-empty name")),
     }
+}
+
+/// ADR 0040 §5 / KTD6: use the same origin rules as public_address.
+fn parse_ui_address(text: &str) -> Result<String, String> {
+    capyctl_config::standalone::public_origin(text)
+        .then(|| text.to_owned())
+        .ok_or_else(|| {
+            "must be an origin with http:// or https:// and no path, e.g. http://100.64.1.2:7443"
+                .to_owned()
+        })
 }
 
 /// Owner rule 2026-09-25: `--hf-endpoint`, an https:// URL.
@@ -1764,12 +1821,17 @@ fn parse_role(text: &str) -> Result<Role, String> {
     }
 }
 
-/// Owner decision 2026-09-25: `--management-listen`, a loopback address with
-/// a non-zero port (SPEC §16.5: management never leaves loopback).
+/// The refusal of a `--management-listen` that is not loopback, without
+/// `remote`.
+const MANAGEMENT_LOOPBACK: &str =
+    "must be a loopback address and port such as 127.0.0.1:7443 (non-zero port)";
+
+/// Owner decision 2026-09-25: `--management-listen`, an address with a
+/// non-zero port. ADR 0040 §1: parsing is split from the loopback check,
+/// which needs `remote` ([`parse_invocation`]).
 fn parse_management_listen(text: &str) -> Result<SocketAddr, String> {
-    capyctl_config::standalone::management_address(text).ok_or_else(|| {
-        "must be a loopback address and port such as 127.0.0.1:7443 (non-zero port)".to_owned()
-    })
+    capyctl_config::standalone::parse_management_address(text)
+        .ok_or_else(|| MANAGEMENT_LOOPBACK.to_owned())
 }
 
 /// ADR 0028 §11 (decided 2026-10-06): `--group-stall-timeout <duration>`.

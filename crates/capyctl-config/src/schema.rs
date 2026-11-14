@@ -128,8 +128,14 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
 
     // Listener entry shape (per SPEC §16): each named listener carries
     // bind address + authentication mode; unknown entry fields rejected.
-    const LISTENER_ENTRY_FIELDS: &[(&str, FieldSpec)] =
-        &[("bind", SCALAR), ("authentication", SCALAR)];
+    // ADR 0040 §1: `remote` and `public_address`, which the roles accept on
+    // the management listener only.
+    const LISTENER_ENTRY_FIELDS: &[(&str, FieldSpec)] = &[
+        ("bind", SCALAR),
+        ("authentication", SCALAR),
+        ("remote", SCALAR),
+        ("public_address", SCALAR),
+    ];
     static LISTENER_ENTRY: FieldSpec = FieldSpec::Struct(LISTENER_ENTRY_FIELDS);
     const LISTENERS: FieldSpec = FieldSpec::MapOf(&LISTENER_ENTRY);
     const SCHEDULER: &[(&str, FieldSpec)] = &[(

@@ -24,6 +24,7 @@ nothing about their use off the host unless the host allows it; see
 | Engine caches | Prefix and KV cache of recent requests | GPU memory of the running engine | While the engine runs; discarded when it parks or stops | Partition with `cache_salt`; not covered by `retention: zero` |
 | LMCache | KV of recent request prefixes, keyed by a digest of the deployment, its revision and the request's salt | Host RAM of the instance's private loopback LMCache server | While the model runs or is parked; gone when it stops | `lmcache: off` on the deployment or the host, or `retention: zero` |
 | Wake canary references | A fixed probe prompt and the engine's answer to it | Server or standalone database | Replaced by the next launch of the same instance | Cannot be turned off |
+| Web UI sessions and sign-in links | A SHA-256 digest of each session token and sign-in link token; a session's id, browser name (from its user agent), creation and last-use times | Server or standalone database | A sign-in link: works once, within 10 minutes; deleted when the next link is issued after that. A session: until signed out or revoked, or the admin token is replaced and the role restarted | Revoke sessions in the UI's Settings |
 
 ## Request records
 
@@ -57,6 +58,29 @@ steps) and the evidence each produced, so a restarted role can finish or
 undo work it had started. It holds no inference bodies. The host journal does
 not record engine log tails or probe text. Completed command payloads are
 cleared, but the rows themselves are never pruned.
+
+## Web UI sessions and sign-in links
+
+`capyctl open ui` stores a sign-in link, and signing a browser in stores a
+session. The database holds only a SHA-256 digest of each token, never the
+token itself: the link token exists only in the printed link, and the
+session token only in the browser's `capyctl_session` cookie. A session row
+also holds a random id, a label taken from the browser's user agent, when it
+was created and when it was last used, and a fingerprint of the admin token it
+was issued under.
+
+A sign-in link signs in one browser, within 10 minutes of being issued; a
+used or expired link is refused. Links are deleted once their 10 minutes have
+passed, when the next link is issued. A session lasts across restarts until
+you sign it out or revoke it in the UI's **Settings**; revoking deletes its
+row. Replacing the admin token in the role's credentials file and restarting
+the role deletes every session and every link, because their fingerprint no
+longer matches.
+
+Restoring a backup of the role's state brings back every session and link the
+backup holds, including sessions revoked after it was taken. After a restore,
+select **Revoke all sessions** in **Settings**, then sign in again with
+`capyctl open ui`.
 
 ## Latency and load figures
 

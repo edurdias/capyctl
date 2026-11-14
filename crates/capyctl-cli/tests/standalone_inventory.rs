@@ -31,7 +31,7 @@ async fn standalone_lists_its_host_and_engines() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let router = app.management_router();
-    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    let server = tokio::spawn(async move { support::serve_management(listener, router).await });
     // Only this test in this binary reads the management address.
     std::env::set_var(capyctl_cli::roles::MANAGEMENT_ADDR_ENV, address.to_string());
 

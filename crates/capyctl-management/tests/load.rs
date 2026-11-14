@@ -3,6 +3,7 @@
 //! that names no deployment `404 not_found`, and serves the report the router
 //! composes from its counts and the host-reported samples, fresh or stale.
 //! CPU tests with in-memory doubles; they never qualify a native engine.
+mod support;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -86,9 +87,9 @@ fn router(clock: Arc<AtomicI64>) -> axum::Router {
             NOW,
         )
         .unwrap();
-    load_router(
+    support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(move |deployment: Option<&str>| {
+        load_router(Arc::new(move |deployment: Option<&str>| {
             let selected: Vec<_> = deployments
                 .iter()
                 .filter(|d| deployment.is_none_or(|id| d.id == id))
@@ -104,7 +105,7 @@ fn router(clock: Arc<AtomicI64>) -> axum::Router {
                 Some(loads.as_ref()),
                 clock.load(Ordering::SeqCst),
             ))
-        }),
+        })),
     )
 }
 

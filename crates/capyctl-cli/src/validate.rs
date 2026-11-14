@@ -300,7 +300,8 @@ fn resolve_on_host(
         return Err(invalid(format!(
             "{}: host `{name}` declares no runtime profile, in its document or in {}; register one with `capyctl engine add` (deploy refuses it: no_runtime_profiles)",
             host_file.display(),
-            capyctl_config::registration::engines_beside(host_file).display()
+            host_engines_path(host_file, &capyctl_config::setting_overrides::SettingOverrides::none(ConfigKind::Host))
+                .map_err(|e| named(host_file, Some(ConfigKind::Host), &e))?.display()
         )));
     }
     // Owner decision 2026-09-25: an engine family names the host's one
@@ -599,14 +600,14 @@ fn resolve_for_acceptance(
 }
 
 /// The host document as host publication and the agent resolve against it:
-/// merged with the `engines.yaml` beside it (ADR 0018 §2, as the host role
-/// loads it), the role-local settings removed and the resource policy
+/// merged with the state-local `engines.yaml` (ADR 0018 amendment A4), the
+/// role-local settings removed and the resource policy
 /// normalized.
 fn host_policy_document(
     path: &Path,
     overrides: &capyctl_config::setting_overrides::SettingOverrides,
 ) -> Result<(String, Value), ConfigError> {
-    let engines = capyctl_config::registration::engines_beside(path);
+    let engines = host_engines_path(path, overrides)?;
     // Owner decision 2026-09-25: the models directory and the model-source
     // policy as the host role resolves them (without its run's flags).
     let config =
@@ -629,6 +630,33 @@ fn host_policy_document(
     let local = capyctl_config::remote_resources::local_host_document(&config.document)?;
     capyctl_config::effective::normalize_host_policy(&local)?;
     Ok((config.name, local))
+}
+
+/// ADR 0018 amendment A4: the engines file the role will load, which is the
+/// state directory's, or before the role's first start after the upgrade the
+/// file beside the host document that the start brings over.
+fn host_engines_path(
+    path: &Path,
+    overrides: &capyctl_config::setting_overrides::SettingOverrides,
+) -> Result<std::path::PathBuf, ConfigError> {
+    let source = std::fs::read_to_string(path).map_err(|e| {
+        ConfigError::new(
+            ConfigErrorCode::Io,
+            path.display().to_string(),
+            e.to_string(),
+        )
+    })?;
+    let document = overrides.apply_and_validate(capyctl_config::parse_document(&source)?)?;
+    let host = capyctl_config::remote_roles::HostConfig::parse(&document.to_string())?;
+    let current = capyctl_config::registration::engines_path(&host.state_dir);
+    if current.exists() {
+        return Ok(current);
+    }
+    Ok(
+        capyctl_config::registration::legacy_engines_path(Some(path), None)
+            .filter(|legacy| legacy.exists())
+            .unwrap_or(current),
+    )
 }
 
 /// The document kind, taken from the strict parse of each known kind. A kind

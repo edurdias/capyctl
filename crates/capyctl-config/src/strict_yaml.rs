@@ -41,7 +41,7 @@ fn duration_regex() -> &'static regex::Regex {
 
 /// Parse `text` strictly for `kind` and return the normalized JSON view.
 pub fn parse_strict(kind: ConfigKind, text: &str) -> Result<Value, ConfigError> {
-    parse_strict_value(kind, build_value(text)?)
+    parse_strict_value(kind, parse_document(text)?)
 }
 
 /// The document tree of `text` (duplicate keys refused), before any schema
@@ -50,6 +50,19 @@ pub fn parse_strict(kind: ConfigKind, text: &str) -> Result<Value, ConfigError> 
 /// [`parse_strict_value`].
 pub fn parse_document(text: &str) -> Result<Value, ConfigError> {
     build_value(text)
+}
+
+/// Where in a document a parse error was found (1-based line and column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Position {
+    pub line: usize,
+    pub column: usize,
+}
+
+/// ADR 0040 §9: [`parse_document`], with the position of the event the
+/// error was found at (a duplicate key at its second occurrence).
+pub fn parse_document_at(text: &str) -> Result<Value, (ConfigError, Position)> {
+    build_located(text)
 }
 
 /// [`parse_strict`] on a tree [`parse_document`] built.
@@ -84,6 +97,11 @@ pub fn validate(text: &str, expected: ConfigKind) -> Result<(), ConfigError> {
 /// Build a `serde_json::Value` from the event stream, rejecting duplicate
 /// mapping keys as they are inserted.
 pub(crate) fn build_value(text: &str) -> Result<Value, ConfigError> {
+    build_located(text).map_err(|(error, _)| error)
+}
+
+/// [`build_value`], with where the error was found.
+fn build_located(text: &str) -> Result<Value, (ConfigError, Position)> {
     enum Frame {
         Map(Map<String, Value>),
         Seq(Vec<Value>),
@@ -179,18 +197,42 @@ pub(crate) fn build_value(text: &str) -> Result<Value, ConfigError> {
             }
             match self.stack.last_mut() {
                 None => self.result = Some(scalar_value(scalar, style)),
-                Some(Frame::Map(_)) => self.pending_key = Some(as_key(scalar)),
+                Some(Frame::Map(map)) => {
+                    // A duplicate is refused at the key itself, so its
+                    // position is the second occurrence's.
+                    if map.contains_key(scalar) {
+                        let mut full = self.path.clone();
+                        full.push(scalar.to_owned());
+                        return Err(ConfigError::new(
+                            ConfigErrorCode::DuplicateKey,
+                            full.join("."),
+                            format!("duplicate key `{scalar}`"),
+                        ));
+                    }
+                    self.pending_key = Some(as_key(scalar))
+                }
                 Some(Frame::Seq(seq)) => seq.push(scalar_value(scalar, style)),
             }
             Ok(())
         }
     }
 
-    fn scan_err(e: saphyr_parser::ScanError) -> ConfigError {
-        ConfigError::new(
-            ConfigErrorCode::SchemaVersion,
-            "",
-            format!("YAML parse error: {e}"),
+    fn at(marker: &saphyr_parser::Marker) -> Position {
+        Position {
+            line: marker.line(),
+            // saphyr's line is 1-based, its column 0-based.
+            column: marker.col() + 1,
+        }
+    }
+    fn scan_err(e: saphyr_parser::ScanError) -> (ConfigError, Position) {
+        let position = at(e.marker());
+        (
+            ConfigError::new(
+                ConfigErrorCode::SchemaVersion,
+                "",
+                format!("YAML parse error: {e}"),
+            ),
+            position,
         )
     }
 
@@ -203,7 +245,8 @@ pub(crate) fn build_value(text: &str) -> Result<Value, ConfigError> {
     };
     let mut doc_count = 0usize;
     for ev in Parser::new_from_str(text) {
-        let (event, _span) = ev.map_err(scan_err)?;
+        let (event, span) = ev.map_err(scan_err)?;
+        let located = |error: ConfigError| (error, at(&span.start));
         match event {
             Event::Nothing | Event::StreamStart | Event::StreamEnd | Event::DocumentEnd => {}
             // Config files are single-document: reject any second document
@@ -211,33 +254,39 @@ pub(crate) fn build_value(text: &str) -> Result<Value, ConfigError> {
             Event::DocumentStart(_) => {
                 doc_count += 1;
                 if doc_count > 1 {
-                    return Err(ConfigError::new(
+                    return Err(located(ConfigError::new(
                         ConfigErrorCode::SchemaVersion,
                         "",
                         format!(
                             "multi-document YAML stream rejected (document {doc_count}); \
                              configs must contain exactly one document"
                         ),
-                    ));
+                    )));
                 }
             }
             Event::Alias(_) => {
-                return Err(ConfigError::new(
+                return Err(located(ConfigError::new(
                     ConfigErrorCode::SchemaVersion,
                     "",
                     "anchors/aliases are not supported in strict configs",
-                ));
+                )));
             }
-            Event::Scalar(scalar, style, _anchor_id, _tag) => b.scalar(&scalar, style)?,
+            Event::Scalar(scalar, style, _anchor_id, _tag) => {
+                b.scalar(&scalar, style).map_err(located)?
+            }
             Event::MappingStart(_anchor_id, _tag) => b.start_node(Frame::Map(Map::new())),
-            Event::MappingEnd => b.end_node()?,
+            Event::MappingEnd => b.end_node().map_err(located)?,
             Event::SequenceStart(_anchor_id, _tag) => b.start_node(Frame::Seq(Vec::new())),
-            Event::SequenceEnd => b.end_node()?,
+            Event::SequenceEnd => b.end_node().map_err(located)?,
         }
     }
 
-    b.result
-        .ok_or_else(|| ConfigError::new(ConfigErrorCode::SchemaVersion, "", "empty YAML document"))
+    b.result.ok_or_else(|| {
+        (
+            ConfigError::new(ConfigErrorCode::SchemaVersion, "", "empty YAML document"),
+            Position { line: 1, column: 1 },
+        )
+    })
 }
 
 /// A plain YAML scalar's value (`true`, `30`, `30s`), typed exactly as the
@@ -491,6 +540,34 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // ADR 0040 §9: the emitted YAML reads back as the same value, with
+    // strings that look like other types (or need quoting) kept strings.
+    #[test]
+    fn emitted_yaml_reads_back_as_the_same_value() {
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "name": "qwen",
+            "model": {"source": {"type": "huggingface", "repo": "Qwen/Qwen3-4B",
+                                  "revision": "0123456789abcdef0123456789abcdef01234567"}},
+            "quoted": ["true", "8", "", "a: b", "~/x", "-x", "null", "naïve \"q\"\n"],
+            "numbers": [0, -3, 1.5, true, false, null],
+            "empty": {}, "none": [],
+            "nested": [[1, 2], [{"a": {"b": [3]}}], {"c": "/abs/path"}],
+            "odd key: #": "v",
+        });
+        let text = crate::yaml_emit::to_block_yaml(&value);
+        assert_eq!(parse_document(&text).unwrap(), value, "{text}");
+    }
+
+    // ADR 0040 §9: a duplicate key is reported at its second occurrence.
+    #[test]
+    fn a_duplicate_key_is_located_at_its_second_occurrence() {
+        let (error, at) = parse_document_at("name: a\nmodel:\n  path: x\n  path: y\n").unwrap_err();
+        assert_eq!(error.code, ConfigErrorCode::DuplicateKey);
+        assert_eq!(error.path, "model.path");
+        assert_eq!((at.line, at.column), (4, 3));
     }
 
     #[test]

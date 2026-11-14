@@ -186,6 +186,11 @@ pub struct ProfileUpdates {
     receiver: tokio::sync::Mutex<mpsc::Receiver<ProfileRequest>>,
     connected: watch::Sender<bool>,
     server: watch::Sender<std::collections::BTreeSet<String>>,
+    /// ADR 0040 §10: the host's administration operations, once the role
+    /// installs them. A session declares `host_admin` only then.
+    host_admin: std::sync::OnceLock<Arc<dyn crate::host_admin_remote::HostAdminHandler>>,
+    /// The operations running now, at most `MAX_RUNNING`.
+    host_admin_running: Arc<tokio::sync::Semaphore>,
 }
 
 enum ProfileRequest {
@@ -240,7 +245,16 @@ impl ProfileUpdates {
             receiver: tokio::sync::Mutex::new(receiver),
             connected: watch::channel(false).0,
             server: watch::channel(Default::default()).0,
+            host_admin: std::sync::OnceLock::new(),
+            host_admin_running: Arc::new(tokio::sync::Semaphore::new(
+                crate::host_admin_remote::MAX_RUNNING,
+            )),
         })
+    }
+    /// ADR 0040 §10: serve the server's host administration requests with
+    /// `handler` from the next session on. Installed once.
+    pub fn serve_host_admin(&self, handler: Arc<dyn crate::host_admin_remote::HostAdminHandler>) {
+        let _ = self.host_admin.set(handler);
     }
     pub fn profiles(&self) -> &Arc<crate::profiles::HostProfiles> {
         &self.profiles
@@ -567,7 +581,16 @@ async fn connect_once(
         // ADR 0017: the server judges this build's version against its own
         // and sends only the post-baseline features declared here.
         binary_version: capyctl_protocol::version::BINARY_VERSION.into(),
-        capabilities: capyctl_protocol::capabilities::agent_capabilities(),
+        capabilities: capyctl_protocol::capabilities::agent_capabilities()
+            .into_iter()
+            // ADR 0040 §10: declared only by a host that runs the operations.
+            .filter(|name| {
+                name != capyctl_protocol::capabilities::HOST_ADMIN
+                    || updates
+                        .as_ref()
+                        .is_some_and(|u| u.host_admin.get().is_some())
+            })
+            .collect(),
     })))
     .await
     .map_err(end("outbound stream closed"))?;
@@ -1026,6 +1049,51 @@ async fn connect_once(
                 }
                 if terminal {
                     retiring.remove(&id);
+                }
+            }
+            // ADR 0040 §10: run outside this loop; the task answers with the
+            // request id. A session ending meanwhile drops the answer (the
+            // server answers its caller `outcome_unknown`).
+            Some(server_to_agent::Msg::HostAdminRequest(request))
+                if fence.is_some()
+                    && updates
+                        .as_ref()
+                        .is_some_and(|u| u.host_admin.get().is_some()) =>
+            {
+                let Some(u) = updates.as_ref() else { continue };
+                let Some(handler) = u.host_admin.get().cloned() else {
+                    continue;
+                };
+                if request.request_id.is_empty()
+                    || request.request_id.len() > capyctl_protocol::capabilities::MAX_REQUEST_ID
+                {
+                    return Err(SessionEnd::fixed(
+                        "controller sent an invalid admin request",
+                    ));
+                }
+                let reports = reports.clone();
+                match u.host_admin_running.clone().try_acquire_owned() {
+                    Ok(permit) => {
+                        tokio::spawn(async move {
+                            let reply = handler.handle(request).await;
+                            drop(permit);
+                            let _ = reports
+                                .send(frame(agent_to_server::Msg::HostAdminReply(reply)))
+                                .await;
+                        });
+                    }
+                    Err(_) => {
+                        let reply = pb::HostAdminReply {
+                            request_id: request.request_id,
+                            ..crate::host_admin_remote::refusal(
+                                crate::host_admin_remote::HOST_ADMIN_BUSY,
+                                "too many host administration operations are running",
+                            )
+                        };
+                        reports
+                            .try_send(frame(agent_to_server::Msg::HostAdminReply(reply)))
+                            .map_err(end("outbound report queue is full"))?;
+                    }
                 }
             }
             // Legacy raw argv and commands before reconciliation remain denied.

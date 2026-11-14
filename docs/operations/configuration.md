@@ -36,8 +36,14 @@ refused: an opt-out that was mistyped must not be read as "on".
 | Role document | (none) | `--config <file>` | `CAPYCTL_CONFIG` | the running role's ([Which role a command uses](#which-role-a-command-uses)), else `<state root>/config/<role>.yaml` | server, host, standalone, `capyctl engine` |
 | State root | `state_dir` at the top of a standalone document named by `--config` or `CAPYCTL_CONFIG` | `--state-dir <dir>` | `CAPYCTL_STATE_DIR` | `$XDG_STATE_HOME/capyctl`, else `~/.local/state/capyctl` | every command |
 | Role state directory | `state_dir` (server, host); `server.state_dir`, `host.state_dir` (standalone) | `--state-dir <dir>` | `CAPYCTL_STATE_DIR` | `<state root>` (server, host); `<state root>/server`, `<state root>/host` (standalone) | server, host, standalone |
-| Registered engines file | (none) | `--config` (the file beside it) | `CAPYCTL_CONFIG` (the file beside it), `XDG_CONFIG_HOME` | `~/.config/capyctl/engines.yaml` | host, standalone, `capyctl engine` |
-| Registered custom engines file | (none) | `--config` (the file beside it) | `CAPYCTL_CONFIG` (the file beside it), `XDG_CONFIG_HOME` | `~/.config/capyctl/custom-engines.yaml` | host, standalone, `capyctl engine` |
+| Registered engines file | role's `state_dir` | `--state-dir <dir>` | `CAPYCTL_STATE_DIR` | `<role state directory>/engines.yaml` | host, standalone, `capyctl engine` |
+| Registered custom engines file | role's `state_dir` | `--state-dir <dir>` | `CAPYCTL_STATE_DIR` | `<role state directory>/custom-engines.yaml` | host, standalone, `capyctl engine` |
+
+For engines files, standalone uses its state root, not the embedded host's
+`<state root>/host` subdirectory. After an upgrade, the first role or
+`capyctl engine add`/`list`/`remove` run copies an older engines file (beside the
+role document, or in `~/.config/capyctl`) into the state directory once and
+leaves the old file unchanged; from then on only the state-directory copy is read.
 
 The role document cannot name itself, so it has no YAML form. The state root
 is where CapyCTL looks for the implicit role document, so its YAML form is read
@@ -88,8 +94,9 @@ When more than one role keeps its state under the same root:
 - `config show` with more than one role is refused, naming them; choose with
   `--role` or `--config`.
 
-The management API is served on loopback only, on every role, so another
-machine is managed by running the command on it (for example over `ssh`).
+The management API listens on loopback by default on server and standalone
+roles. The owner can opt into off-box access with `remote: true` (see below).
+Host roles have no management listener.
 
 ## Listeners
 
@@ -98,6 +105,8 @@ machine is managed by running the command on it (for example over `ssh`).
 | Inference address | `listeners.inference.bind` (server); `server.listeners.inference.bind` (standalone) | `--listen <addr:port>` | `CAPYCTL_INFERENCE_ADDR` (`CAPYCTL_STANDALONE_INFERENCE_ADDR` still read, with a warning) | `0.0.0.0:8443` | server, standalone |
 | Inference API key required | `listeners.inference.authentication: api_key\|none` (server; `server.` prefix in standalone) | `--no-inference-auth` | `CAPYCTL_INFERENCE_AUTH=none` | `api_key` | server, standalone |
 | Management address | `listeners.management.bind` (server); `server.listeners.management.bind` (standalone) | `--management-listen <addr:port>` | `CAPYCTL_MANAGEMENT_ADDR` (`CAPYCTL_STANDALONE_MANAGEMENT_ADDR` still read, with a warning) | `127.0.0.1:7443` | server, standalone, and their client commands |
+| Management listener off the box | `listeners.management.remote: true` (server); `server.listeners.management.remote` (standalone) | `--management-remote` | `CAPYCTL_MANAGEMENT_REMOTE` (`true`, `false`, `1`, `0`, `on`, `off`) | `false` (loopback only) | server, standalone |
+| Address in sign-in links | `listeners.management.public_address` (server); `server.listeners.management.public_address` (standalone): an origin such as `http://box:7443` or `https://box.tail1234.ts.net` | (none; `capyctl open ui --address <origin>` for one link) | (none) | none | server, standalone |
 | Server bootstrap and control listeners | `listeners.bootstrap`, `listeners.control` | (none) | (none) | `127.0.0.1:7444`, `:7445` | server |
 
 The inference listener serves every interface by default and requires the
@@ -107,7 +116,16 @@ reverse proxy. A server or standalone document that still states the old
 default `127.0.0.1:8443` is updated once on the first start of 0.1.0
 ([install](install.md#upgrading-to-010)).
 
-The management address stays on loopback in every form (any port). A host
+The management address stays on loopback (any port) unless `remote` is set;
+with `remote`, `bind` may be any address with a port, such as `0.0.0.0:7443`
+or a Tailscale address, and the [web UI](../guide/web-ui.md) and the
+management API are reachable there over plain HTTP
+([network access](network-access.md#web-ui-off-the-machine)). From another
+machine only a signed-in browser is accepted; the admin token works only from
+the machine itself. `public_address` names the origin a browser uses when it
+is not the bind address, as with `tailscale serve`, and is the address
+`capyctl open ui` puts in sign-in links. `remote` and `public_address` are
+refused on the inference listener. A host
 has no management listener. Each start records the address it serves on in
 `<state directory>/run/management-address` (owner-only), and client commands
 (`capyctl status`, `capyctl deploy`, ...) find it from `CAPYCTL_MANAGEMENT_ADDR`, else
@@ -364,7 +382,7 @@ A custom engine is a program CapyCTL has no integration for, registered with
 | When the installation's files change | `security.installation_drift: warn\|refuse` | `--drift warn\|refuse` | (none) | `warn` |
 
 `capyctl engine add --custom` writes the profile to `custom-engines.yaml`,
-beside `engines.yaml` (the same directory, found the same way), with the same
+beside `engines.yaml` in the role's state directory, with the same
 first line, `# capyctl-document-revision: N`, and the same lock. `engines.yaml`
 refuses a profile with `engine: custom`, and `custom-engines.yaml` refuses any
 other engine. A profile name is unique across both files and the role's own
@@ -466,6 +484,7 @@ CapyCTL writes or reads, or environment variables.
 |---|---|---|---|
 | Inference API key and management admin token | standalone: `<state root>/identity/credentials` (owner-only, `api_key:` and `admin_token:` lines), generated on first start; server: `<identity_dir>/server-credentials.json` (owner-only JSON), created by `init server` | (none) | Generated, never typed or printed; read the file to use them ([network access](network-access.md#default)). |
 | Server enrollment and host identity | `identity_dir` (`<state dir>/identity`) | (none) | Created by `init server` and `join host`. |
+| Web UI sessions and sign-in links | the server or standalone database (SHA-256 digests only; the browser holds the session in its `capyctl_session` cookie) | (none) | Issued by `capyctl open ui` and the sign-in page; replacing the admin token and restarting the role ends them all ([data retention](data-retention.md#web-ui-sessions-and-sign-in-links)). |
 | Per-launch engine keys | written by CapyCTL for each launch | (none) | Never an operator setting. |
 | Hugging Face token for a source that names none | `model_sources.huggingface_token_file` (absolute path to an owner-only file) | `CAPYCTL_HF_TOKEN`, else `HF_TOKEN` | The variable wins over the file. The host that downloads reads it; `deploy model` also uses the variable to pin a private repository. |
 | Hugging Face token for one source | `model.source.token_ref: secret://<name>` in the deployment (`type: huggingface`), naming `<state dir>/secrets/<name>` on the host (owner-only) | (none) | Wins over the host's default token. |

@@ -2,6 +2,7 @@
 //! deployment and host installation whose launch enables vLLM development mode.
 //! CPU tests of this surface are not qualification of any native engine recipe.
 
+mod support;
 use axum::{body::Body, http::Request};
 use capyctl_adapters::vllm::{plan_from_effective, render_command};
 use capyctl_config::effective::resolve_effective;
@@ -148,10 +149,9 @@ async fn the_host_view_marks_published_installations() {
         }
     }
     let admin = "a".repeat(32);
-    let router = hosts_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(&admin, &"b".repeat(32)).unwrap(),
-        owned,
-        AgentSessions::new(authority),
+        hosts_router(owned, AgentSessions::new(authority)),
     );
     let response = router
         .oneshot(

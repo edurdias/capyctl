@@ -558,8 +558,7 @@ fn lmcache_environment_names_are_reserved() {
 #[test]
 fn the_lmcache_registration_round_trips_through_engines_yaml() {
     use capyctl_config::registration::{
-        check_profile, engines_beside, lock_engines, profile_document, write_engines, EnginesFile,
-        ProfileSpec,
+        check_profile, lock_engines, profile_document, write_engines, EnginesFile, ProfileSpec,
     };
     let spec = ProfileSpec {
         engine: Engine::Vllm,
@@ -601,7 +600,7 @@ fn the_lmcache_registration_round_trips_through_engines_yaml() {
     let dir = tempfile::tempdir().unwrap();
     let host_path = dir.path().join("host.yaml");
     std::fs::write(&host_path, HostConfig::template(&dir.path().join("state"))).unwrap();
-    let path = engines_beside(&host_path);
+    let path = capyctl_config::test_support::host_engines_path(&host_path);
     let mut engines = EnginesFile::load(&path).unwrap();
     engines.profiles.insert("vllm".into(), profile.clone());
     let lock = lock_engines(&path).unwrap();

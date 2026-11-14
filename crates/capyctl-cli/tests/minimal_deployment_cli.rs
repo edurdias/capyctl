@@ -65,7 +65,8 @@ async fn a_minimal_file_deploys_on_standalone() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let router = app.management_router();
-    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let server =
+        tokio::spawn(async move { support::serve_management(listener, router).await.unwrap() });
     let management = [(capyctl_cli::roles::MANAGEMENT_ADDR_ENV, address.as_str())];
 
     let file = dir.path().join("mini.yaml");

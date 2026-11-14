@@ -1,6 +1,9 @@
 # ADR 0017 — Host/server version skew policy and capability gating
 
 **Status:** Accepted (owner decision 2026-09-24).
+**Amended by:** ADR 0040 §10: host administration is capability-gated; an older
+host without that capability keeps serving existing work but cannot accept
+host-administration operations.
 **Amends:** `SPEC.md` §13.1 ("rejects ... incompatible protocol/schema versions"): it
 defines which host and server releases are compatible, what an incompatible host may
 still do, and how additive protocol fields reach older hosts.
@@ -88,6 +91,7 @@ reports. Every feature added since is named in `mllm_protocol::capabilities::CAT
 | `host_draining` | host to server | HostDraining and its acknowledgement |
 | `process_residency` | host to server | `DomainObservation.residents` |
 | `installation_fingerprint` | host to server | the installation fields of `RuntimeProfileStatus` |
+| `host_admin` | server to host | HostAdminRequest and its HostAdminReply (added by [ADR 0040](0040-web-ui.md) §10, owner decisions 2026-10-27) |
 
 The agent declares every capability it implements in `Connect.capabilities` (field 8,
 additive; at most 64 short lowercase names, else the session is refused). The two earlier

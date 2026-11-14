@@ -153,6 +153,11 @@ impl OwnedActionSource {
         &self.commands
     }
 
+    /// The configuration authority, for the deployment check (ADR 0040 §9).
+    pub(crate) fn configuration(&self) -> &Arc<SharedConfigurationSource> {
+        &self.configuration
+    }
+
     /// SPEC §4.3, §6.3: the Stop an explicit drain issues is the ordinary one,
     /// so the deployment stays eligible for on-demand activation; its cleanup
     /// still completes only on evidence that the recorded processes are gone.
@@ -902,6 +907,12 @@ impl ConfigurationSource for OwnedActionSource {
     fn checkpoint_digest_state(&self, deployment_id: &str, revision: i64) -> Option<String> {
         self.configuration
             .checkpoint_digest_state(deployment_id, revision)
+    }
+    fn deployment_source(
+        &self,
+        deployment: &str,
+    ) -> Result<Option<serde_json::Value>, ConfigurationFailure> {
+        self.configuration.deployment_source(deployment)
     }
     fn effective_configuration(
         &self,

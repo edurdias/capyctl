@@ -248,3 +248,35 @@ profile, so the newer release still finds it, and `engine remove` can remove
 it. A profile of a known kind, or one whose `engine` is missing or not a
 string, is validated as strictly as before. This helps only releases that
 carry it; an older binary still refuses such a file.
+
+## Amendment A4: the engines file lives in the role's state directory (owner decision 2026-11-13)
+
+ADR 0040 lets a signed-in browser add and remove engines (§10, §11), so the running role now
+writes `engines.yaml` itself, through the shared host administration module, not only the
+`capyctl engine` CLI. Under the system units the role cannot write beside its document:
+`/etc/capyctl` is root-owned and `ProtectSystem=strict` keeps it read-only for the service
+user, and a write needs a temporary file and `engines.yaml.lock` in the same directory
+(milestone review of 2026-11-13, blocker 3). The owner decided:
+
+- The engines file moves to the role's state directory: `<state dir>/engines.yaml` (for
+  example `/var/lib/capyctl/host/engines.yaml`, `/var/lib/capyctl/standalone/engines.yaml`),
+  which the service already writes. The CLI and the role resolve the same path from the
+  state directory, by the same rule as every other state file. `/etc/capyctl` stays
+  read-only to the service.
+- The first time a role or `capyctl engine` command of a release that carries this
+  amendment finds no `engines.yaml` in its state directory but one at the previous location
+  (beside its document, or `~/.config/capyctl/engines.yaml` without one), it copies it into
+  the state directory, with its revision line, the state directory owner and mode 0600,
+  and leaves a one-line note in the role log. The old file is never moved or changed:
+  under the system units `/etc/capyctl` is read-only to the service, another role with
+  another state directory may share the same old file (found 2026-11-13: a demo role
+  started with its own state directory would have taken the operator's
+  `~/.config/capyctl/engines.yaml`), and an older release still reads it. From then on the
+  role reads only its copy; the old file may be deleted once nothing else uses it. No
+  manual step is needed, and the installer does not touch role configuration or state.
+  `custom-engines.yaml` follows the same rule.
+- §2's write rules stand (lock, temporary file, rename, directory sync, revision line, the
+  32 KiB bound, refusing a profile declared in both files); "the CLI is the only writer"
+  and "a running role only reads it" are withdrawn.
+
+SPEC §15.1's table entry for the engines file changes accordingly.

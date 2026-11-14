@@ -1,5 +1,6 @@
 //! ADR 0018 §4: retiring a runtime profile through the ordinary stop path,
 //! and `GET /management/v1/engines`. Fake-engine tests; not qualification.
+mod support;
 use axum::{
     body::{to_bytes, Body},
     http::Request,
@@ -97,7 +98,7 @@ async fn setup() -> Setup {
     let source = Arc::new(OwnedActionSource::new(configuration, worker.commands()).unwrap());
     let credentials =
         || ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap();
-    let actions = lifecycle_router(credentials(), source);
+    let actions = support::composed(credentials(), lifecycle_router(source));
     Setup {
         dir,
         owner,
@@ -363,10 +364,12 @@ async fn the_engines_listing_shows_published_profiles() {
         setup.owner.clone(),
         capyctl_agent::identity::CertificateAuthority::generate(100).unwrap(),
     ));
-    let router = capyctl_management::hosts::hosts_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        setup.owner.clone(),
-        capyctl_controller::agent_sessions::AgentSessions::new(authority),
+        capyctl_management::hosts::hosts_router(
+            setup.owner.clone(),
+            capyctl_controller::agent_sessions::AgentSessions::new(authority),
+        ),
     );
     let request = Request::builder()
         .uri("/management/v1/engines")
@@ -404,23 +407,25 @@ async fn standalone_serves_its_embedded_host_at_the_inventory_routes() {
     host["name"] = json!("lab");
     host["runtime_profiles"]["local"]["build_fingerprint"] = json!("0.29.0+patched");
     let published = host.clone();
-    let router = capyctl_management::hosts::standalone_hosts_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        setup.owner.clone(),
-        capyctl_management::hosts::StandaloneHost {
-            host_id: "lab".into(),
-            document: Arc::new(move || published.clone()),
-            installations: capyctl_controller::installation_gate::EmbeddedInstallations::new(),
-            domains: Arc::new(|| {
-                Box::pin(async {
-                    vec![json!({"domain_id": "system", "kind": "host",
-                        "capacity_bytes": 64_i64 << 30, "available_bytes": 32_i64 << 30})]
-                })
-            }),
-            memory_warnings: Arc::new(std::sync::OnceLock::from(vec![
-                "system memory has 32.0 GiB available".to_owned(),
-            ])),
-        },
+        capyctl_management::hosts::standalone_hosts_router(
+            setup.owner.clone(),
+            capyctl_management::hosts::StandaloneHost {
+                host_id: "lab".into(),
+                document: Arc::new(move || published.clone()),
+                installations: capyctl_controller::installation_gate::EmbeddedInstallations::new(),
+                domains: Arc::new(|| {
+                    Box::pin(async {
+                        vec![json!({"domain_id": "system", "kind": "host",
+                    "capacity_bytes": 64_i64 << 30, "available_bytes": 32_i64 << 30})]
+                    })
+                }),
+                memory_warnings: Arc::new(std::sync::OnceLock::from(vec![
+                    "system memory has 32.0 GiB available".to_owned(),
+                ])),
+            },
+        ),
     );
     let get = |uri: &str, token: Option<&str>| {
         let mut request = Request::builder().uri(uri);

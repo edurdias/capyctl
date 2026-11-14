@@ -25,7 +25,8 @@ impl EventSource for StoreSnapshotSource {
 }
 
 /// Upper bounds are enforced at router construction. A finite lifetime forces
-/// fresh authentication on reconnect; fixed credentials do not support revocation.
+/// fresh authentication on reconnect, and a revoked session's stream ends at
+/// once (ADR 0040 §6).
 #[derive(Clone)]
 pub struct EventStreamOptions {
     pub max_streams: usize,
@@ -213,6 +214,15 @@ async fn read(state: &Arc<AppState>, after: Option<String>) -> Result<Page, Fail
 }
 
 pub(crate) async fn subscribe(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    // ADR 0040 §6: the composition resolved the principal; a session's
+    // stream ends when the session is revoked.
+    let Some(principal) = request
+        .extensions()
+        .get::<crate::ui_sessions::Principal>()
+        .cloned()
+    else {
+        return error(StatusCode::UNAUTHORIZED, "unauthenticated", false);
+    };
     let after = match requested_cursor(&request) {
         Ok(v) => v,
         Err(e) => return e.response(),
@@ -223,10 +233,14 @@ pub(crate) async fn subscribe(State(state): State<Arc<AppState>>, request: Reque
     };
     let options = state.event_options.clone();
     let deadline = tokio::time::Instant::now() + options.lifetime;
-    let first = match tokio::time::timeout_at(deadline, read(&state, after)).await {
-        Ok(Ok(page)) => page,
-        Ok(Err(e)) => return e.response(),
-        Err(_) => return Failure::Busy.response(),
+    let first = tokio::select! {
+        biased;
+        _ = principal.revoked() => return error(StatusCode::UNAUTHORIZED, "unauthenticated", false),
+        result = tokio::time::timeout_at(deadline, read(&state, after)) => match result {
+            Ok(Ok(page)) => page,
+            Ok(Err(e)) => return e.response(),
+            Err(_) => return Failure::Busy.response(),
+        },
     };
     let (tx, rx) = mpsc::channel(options.channel_capacity);
     tokio::spawn(async move {
@@ -237,6 +251,7 @@ pub(crate) async fn subscribe(State(state): State<Arc<AppState>>, request: Reque
         tokio::select! {
             _ = tx.closed() => {},
             _ = tokio::time::sleep_until(deadline) => {},
+            _ = principal.revoked() => {},
             _ = work => {},
         }
     });

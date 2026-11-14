@@ -89,7 +89,8 @@ async fn start_evict_reports_victims_and_replays_by_request_id() {
     let address = listener.local_addr().unwrap();
     std::env::set_var(capyctl_cli::roles::MANAGEMENT_ADDR_ENV, address.to_string());
     let router = app.management_router();
-    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let server =
+        tokio::spawn(async move { support::serve_management(listener, router).await.unwrap() });
     let config = capyctl_cli::standalone_config::deployment_document(
         "evict-model",
         "evict-model",

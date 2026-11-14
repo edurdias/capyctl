@@ -293,6 +293,12 @@ Engine listeners stay on loopback with per-launch keys and mllm's key-guard midd
 the allowlisted inference routes. The router's constant-time key comparison, method and
 path allowlist, header stripping and queue bounds apply unchanged on every bind.
 
+> **Amended by [ADR 0040](0040-web-ui.md) §1–§3** (owner decisions 2026-10-27). With the
+> opt-in `remote: true` the management listener may bind off the box, over plain HTTP, for
+> the built-in web UI; off the box the only management credential is a browser session, and
+> the admin bearer token is still accepted only from loopback or the connection's own local
+> address.
+
 ### 10a. Upgrading a generated policy whose machine changed shape
 
 Decided 2026-09-25. Standalone generates its host's resource policy from the
