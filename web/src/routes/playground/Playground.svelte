@@ -2,9 +2,9 @@
   import { snapshot } from '../../lib/state';
   import Chat from './Chat.svelte';
   import Decision from './Decision.svelte';
+  import './playground.css';
 
-  // SPEC R29–R32 (ADR 0040 §12): try any chat or decision model. The mode
-  // follows the deployment's API.
+  // SPEC R29–R32 (ADR 0040 §12): the selected deployment determines the API.
   const deployments = $derived(
     [...($snapshot?.deployments ?? [])].sort((a, b) => a.name.localeCompare(b.name)),
   );
@@ -12,47 +12,33 @@
   const selected = $derived(deployments.find((d) => d.id === chosen) ?? deployments[0] ?? null);
 </script>
 
-<section>
+{#snippet heading()}
   <h1>Playground</h1>
-  <p class="muted">Conversations are kept only in this browser. CapyCTL stores no prompts or answers.</p>
-  {#if $snapshot === null}
-    <p class="muted">Reading models…</p>
-  {:else if selected === null}
-    <p class="muted">There are no models to try yet.</p>
-  {:else}
-    <label>
-      Model
+  {#if selected}
+    <label class="playground-model">
+      <span class="visually-hidden">Model</span>
       <select value={selected.id} onchange={(event) => (chosen = event.currentTarget.value)}>
         {#each deployments as deployment (deployment.id)}
-          <option value={deployment.id}>
-            {deployment.name}{deployment.api === 'decisions' ? ' (decisions)' : ''}
-          </option>
+          <option value={deployment.id}>{deployment.name}{deployment.api === 'decisions' ? ' (decisions)' : ''}</option>
         {/each}
       </select>
     </label>
+  {/if}
+{/snippet}
+
+<section class="playground" aria-label="Playground">
+  {#if $snapshot === null || selected === null}
+    <header class="playground-header">{@render heading()}</header>
+    <div class="playground-empty">
+      <p class="muted">{$snapshot === null ? 'Reading models…' : 'There are no models to try yet.'}</p>
+    </div>
+  {:else}
     {#key selected.id}
       {#if selected.api === 'decisions'}
-        <Decision deployment={selected} />
+        <Decision deployment={selected} {heading} />
       {:else}
-        <Chat deployment={selected} />
+        <Chat deployment={selected} {heading} />
       {/if}
     {/key}
   {/if}
 </section>
-
-<style>
-  label {
-    display: flex;
-    flex-direction: column;
-    gap: 0.375rem;
-    max-width: 24rem;
-  }
-  select {
-    font: inherit;
-    padding: 0.5rem;
-    border-radius: 6px;
-    border: 1px solid var(--capyctl-rule);
-    background: var(--capyctl-bg);
-    color: var(--capyctl-text);
-  }
-</style>

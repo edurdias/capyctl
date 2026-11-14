@@ -157,7 +157,7 @@ export async function streamChat(model: string, messages: ChatMessage[], handler
   if (!done) {
     throw lostAnswer();
   }
-  return { content, timings: timings(sentAt, firstAt, lastAt, reportedTokens) };
+  return { content: content.trim(), timings: timings(sentAt, firstAt, lastAt, reportedTokens) };
 }
 
 function timings(sentAt: number, firstAt: number | null, lastAt: number | null, tokens: number | null): Timings | null {
@@ -167,8 +167,10 @@ function timings(sentAt: number, firstAt: number | null, lastAt: number | null, 
   const generating = (lastAt - firstAt) / 1000;
   return {
     ttft_ms: firstAt - sentAt,
-    // SPEC R30: SSE chunks are not tokens; omit throughput without usage.
-    tokens_per_second: tokens !== null && generating > 0 && tokens > 1 ? (tokens - 1) / generating : null,
+    // SPEC R30: SSE chunks are not tokens. Short samples amplify transport
+    // batching and tokens with no visible delta (e.g. an empty think block),
+    // so show a rate only with >=16 reported tokens over >=0.5 s of decode.
+    tokens_per_second: tokens !== null && generating >= 0.5 && tokens >= 16 ? (tokens - 1) / generating : null,
   };
 }
 

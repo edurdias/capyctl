@@ -191,6 +191,37 @@ describe('U20 phone navigation', () => {
   });
 });
 
+// SPEC R31, R35–R36 / ADR 0040 §12: the decision input and Ask stay docked.
+describe('Playground decision layout', () => {
+  it('keeps the input and Ask outside the scroll area without changing the request', async () => {
+    const server = role({
+      snapshots: [snapshotWith([deployment({ api: 'decisions' })])],
+      route: (call) => call.url.endsWith('/playground/systemone')
+        ? json({ answers: { question: { type: 'noul', noul: 0.8 } } })
+        : undefined,
+    });
+    await open('/playground');
+    const scroll = document.querySelector('.playground-scroll')!;
+    const composer = document.querySelector('.playground-composer')!;
+    const input = composer.querySelector<HTMLTextAreaElement>('textarea')!;
+    expect(scroll.contains(composer)).toBe(false);
+    expect(scroll.querySelector('.decision-fields')).not.toBeNull();
+    input.value = 'Is it ready?';
+    input.dispatchEvent(new Event('input'));
+    const type = document.querySelector<HTMLSelectElement>('.decision-fields select')!;
+    type.value = 'noul';
+    type.dispatchEvent(new Event('change'));
+    await tick();
+    button('Ask', composer).click();
+    await tick();
+    expect(JSON.parse(server.posts().find((call) => call.url.endsWith('/playground/systemone'))!.body!)).toMatchObject({
+      model: 'chat', state: 'Is it ready?', questions: { question: { type: 'noul' } },
+    });
+    expect(scroll.querySelector('.decision-results')?.textContent).toContain('yes');
+    expect(scroll.querySelector('.decision-results')?.textContent).toContain('80.0%');
+  });
+});
+
 describe('U20 Engines', () => {
   it('shows the per-host table and model usage, with removal in a menu', async () => {
     role({ snapshots: [snapshotWith([])], route: (call) => call.url === '/management/v1/engines' ? json({ engines: [{ host_id: 'gpu-box', host: 'gpu-box', online: true, profile: 'sglang-main', engine: 'sglang', version: '0.5.22', custom: false, retiring: false, deployments: ['chat', 'coder'] }] }) : undefined });

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, type Snippet } from 'svelte';
   import Refusal from '../../components/Refusal.svelte';
   import { ApiError } from '../../lib/api';
   import { decide, playgroundError, type DecisionResult, type QuestionType } from '../../lib/playground';
@@ -7,10 +7,11 @@
   import type { DeploymentSnapshot } from '../../lib/types';
   import { stateWord } from '../../lib/vocabulary';
   import StartModel from './StartModel.svelte';
+  import { autoGrow, followContent } from './interactions';
 
   // SPEC R31: a typed question to a decision model, answered with the
   // probability of each option.
-  let { deployment }: { deployment: DeploymentSnapshot } = $props();
+  let { deployment, heading }: { deployment: DeploymentSnapshot; heading: Snippet } = $props();
 
   const live = $derived($snapshot?.deployments.find((d) => d.id === deployment.id) ?? deployment);
 
@@ -59,15 +60,13 @@
   }
 </script>
 
+<header class="playground-header">{@render heading()}</header>
+<div class="playground-scroll" use:followContent={result}>
 {#if stopped}
   <StartModel deployment={live} onstarted={() => (offerStart = false)} />
 {/if}
 
-<form onsubmit={ask}>
-  <label>
-    Input
-    <textarea bind:value={input} rows="4"></textarea>
-  </label>
+<form id="decision-question" class="decision-fields" onsubmit={ask}>
   <label>
     Question type
     <select bind:value={type}>
@@ -86,15 +85,14 @@
       <textarea bind:value={options} rows="3"></textarea>
     </label>
   {/if}
-  <div class="buttons">
-    <button type="submit" class="primary" disabled={outstanding}>{outstanding ? 'Asking…' : 'Ask'}</button>
-  </div>
+  <p class="muted">Ask a typed question to see the probability of each option. CapyCTL stores no prompts or answers.</p>
 </form>
 
 {#if error}
   <Refusal {error} />
 {/if}
 
+<div class="decision-results" aria-live="polite">
 {#if result}
   {#each Object.entries(result.answers) as [id, answer] (id)}
     <div class="answer">
@@ -113,33 +111,15 @@
   {/each}
   <p class="muted">Answered in {(result.total_ms / 1000).toFixed(2)} s</p>
 {/if}
+</div>
+</div>
+<div class="playground-composer decision-composer">
+  <label class="visually-hidden" for="decision-input">Input</label>
+  <textarea id="decision-input" form="decision-question" bind:value={input} use:autoGrow={input} rows="1" placeholder="Ask a decision question"></textarea>
+  <button form="decision-question" type="submit" class="primary" disabled={outstanding}>{outstanding ? 'Asking…' : 'Ask'}</button>
+</div>
 
 <style>
-  form {
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-    margin: 1rem 0;
-  }
-  label {
-    display: flex;
-    flex-direction: column;
-    gap: 0.375rem;
-  }
-  textarea,
-  input,
-  select {
-    font: inherit;
-    padding: 0.5rem;
-    border-radius: 6px;
-    border: 1px solid var(--capyctl-rule);
-    background: var(--capyctl-bg);
-    color: var(--capyctl-text);
-  }
-  .buttons {
-    display: flex;
-    justify-content: flex-end;
-  }
   th {
     text-align: left;
     font-weight: normal;

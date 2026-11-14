@@ -69,9 +69,9 @@ describe('playground chat', () => {
     server.answers[0].raw(chunk(''));
     await tick(400);
     server.answers[0].raw(chunk('Hi'));
-    await tick(500);
+    await tick(1000);
     server.answers[0].raw(chunk(' there'));
-    server.answers[0].raw('data: {"choices":[],"usage":{"completion_tokens":11}}\n\n');
+    server.answers[0].raw('data: {"choices":[],"usage":{"completion_tokens":21}}\n\n');
     server.answers[0].raw('data: [DONE]\n\n');
     server.answers[0].end();
     await tick();
@@ -148,6 +148,15 @@ describe('playground chat', () => {
 
     button('Delete conversation').click();
     await tick();
+    expect(window.localStorage.getItem(KEY)).not.toBeNull();
+    expect(document.querySelector('dialog[open]')?.textContent).toContain('Delete conversation?');
+    button('Cancel').click();
+    await tick();
+    expect(messages()).toEqual(['Hello']);
+    button('Delete conversation').click();
+    await tick();
+    button('Delete', document.querySelector('dialog[open]')!).click();
+    await tick();
     expect(window.localStorage.getItem(KEY)).toBeNull();
     expect(messages()).toEqual([]);
   });
@@ -206,19 +215,19 @@ describe('playground chat', () => {
     expect(JSON.parse(start!.body!)).toMatchObject({ action: 'start', expected_revision: 3 });
   });
 
-  // SPEC R29, AE7: the pending answer reads "Waking model…" until the first
-  // chunk, and Send stays disabled until the response ends.
-  it('shows Waking model… for a parked model until the first chunk, with Send disabled until the end', async () => {
+  // SPEC R29, AE7: show the snapshot state and elapsed waiting time.
+  it('shows the waking model and elapsed seconds, with Send disabled until the end', async () => {
     const server = chatRole('parked');
     await open('/playground');
     await say('Hello');
 
-    expect(document.body.textContent).toContain('Waking model…');
+    await tick(12000);
+    expect(document.querySelector('.pending')?.textContent).toContain('Waking chat · parked · 12 s');
     expect(button('Send').disabled).toBe(true);
 
     server.answers[0].raw(chunk('Hi'));
     await tick();
-    expect(document.body.textContent).not.toContain('Waking model…');
+    expect(document.querySelector('.pending')).toBeNull();
     expect(button('Send').disabled).toBe(true);
 
     server.answers[0].raw('data: [DONE]\n\n');
@@ -261,6 +270,104 @@ describe('playground chat', () => {
     expect(document.querySelector('.timings')?.textContent).toContain('First token');
     expect(document.querySelector('.timings')?.textContent).not.toContain('tokens/s');
     expect(loadConversation(DEPLOYMENT_ID)[1].timings?.tokens_per_second).toBeNull();
+  });
+
+  // SPEC R30, AE7: short streams cannot provide a meaningful decode rate.
+  it.each([[15, 200], [21, 200], [15, 1000]])('omits tokens/s for %i tokens over %i ms', async (tokens, duration) => {
+    const server = chatRole();
+    await open('/playground');
+    await say('Hello');
+    server.answers[0].raw(chunk('Short'));
+    await tick(duration);
+    server.answers[0].raw(chunk(' answer'));
+    server.answers[0].raw(`data: {"choices":[],"usage":{"completion_tokens":${tokens}}}\n\n`);
+    server.answers[0].raw('data: [DONE]\n\n');
+    server.answers[0].end();
+    await tick();
+    expect(document.querySelector('.timings')?.textContent).toContain('First token');
+    expect(document.querySelector('.timings')?.textContent).not.toContain('tokens/s');
+  });
+
+  // SPEC R30, R32: ignore outer whitespace from empty thinking blocks only.
+  it('trims assistant whitespace while streaming and saving, preserving internal whitespace', async () => {
+    const server = chatRole();
+    await open('/playground');
+    await say('Hello');
+    server.answers[0].raw(chunk('\n\n'));
+    server.answers[0].raw(chunk('Hi\n\n  there  \n'));
+    await tick();
+    expect(messages()).toEqual(['Hello', 'Hi\n\n  there']);
+    server.answers[0].raw('data: [DONE]\n\n');
+    server.answers[0].end();
+    await tick();
+    expect(loadConversation(DEPLOYMENT_ID)[1].content).toBe('Hi\n\n  there');
+  });
+
+  // SPEC R30, R35–R36: scroll only messages; the composer stays outside.
+  it('keeps the composer outside the scrolling message list and delete in the header', async () => {
+    chatRole();
+    await open('/playground');
+    const scroll = document.querySelector('.playground-scroll')!;
+    const composer = document.querySelector('.playground-composer')!;
+    expect(scroll.querySelector('.messages')).not.toBeNull();
+    expect(scroll.contains(composer)).toBe(false);
+    expect(composer.querySelector('textarea')?.rows).toBe(1);
+    expect(document.querySelector('.playground-header')?.contains(button('Delete conversation'))).toBe(true);
+  });
+
+  // SPEC R30, R35–R36: do not pull the reader away from older messages.
+  it('follows new content until the reader scrolls up, and resumes at the bottom', async () => {
+    const server = chatRole();
+    await open('/playground');
+    const scroll = document.querySelector<HTMLElement>('.playground-scroll')!;
+    let height = 1000;
+    Object.defineProperties(scroll, {
+      scrollHeight: { get: () => height },
+      clientHeight: { value: 300 },
+    });
+    await say('Hello');
+    expect(scroll.scrollTop).toBe(1000);
+    scroll.scrollTop = 100;
+    scroll.dispatchEvent(new Event('scroll'));
+    height = 1200;
+    server.answers[0].raw(chunk('First part'));
+    await tick();
+    expect(scroll.scrollTop).toBe(100);
+    scroll.scrollTop = 900;
+    scroll.dispatchEvent(new Event('scroll'));
+    height = 1400;
+    server.answers[0].raw(chunk(' and more'));
+    await tick();
+    expect(scroll.scrollTop).toBe(1400);
+  });
+
+  // SPEC R30, R35–R36: touch keyboards need Enter for multiline prompts.
+  it.each([false, true])('handles Enter with coarse pointer %s', async (coarse) => {
+    const matchMedia = vi.fn((query: string) => ({ matches: query === '(pointer: coarse)' && coarse }));
+    vi.stubGlobal('matchMedia', matchMedia);
+    try {
+      const server = chatRole();
+      await open('/playground');
+      const box = document.querySelector<HTMLTextAreaElement>('#playground-message')!;
+      box.value = 'Hello';
+      box.dispatchEvent(new Event('input'));
+      flushSync();
+      const shift = new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true, cancelable: true });
+      box.dispatchEvent(shift);
+      expect(shift.defaultPrevented).toBe(false);
+      const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+      box.dispatchEvent(enter);
+      await tick();
+      expect(enter.defaultPrevented).toBe(!coarse);
+      expect(server.answers).toHaveLength(coarse ? 0 : 1);
+      if (coarse) {
+        button('Send').click();
+        await tick();
+        expect(server.answers).toHaveLength(1);
+      }
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   // SPEC R15, R29–R30: in-band router refusals retain their own envelope.

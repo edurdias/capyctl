@@ -1,0 +1,36 @@
+/* SPEC R30–R31, R35–R36 / ADR 0040 §12: a bounded page, not a transcript
+   underneath the fixed phone navigation. Other routes retain their shell. */
+.shell:has(> .content > .playground) { height: 100dvh; min-height: 0; overflow: hidden; }
+.shell > .content:has(> .playground) { display: flex; flex-direction: column; min-height: 0; }
+.playground { position: relative; display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; width: 100%; max-width: 72rem; margin-inline: auto; }
+.playground-header { display: flex; align-items: center; gap: 1rem; flex-shrink: 0; padding-bottom: 1rem; border-bottom: 1px solid var(--capyctl-rule); }
+.playground-header h1 { margin: 0; font-size: 1.5rem; }
+.playground-model { flex: 1; min-width: 0; max-width: 24rem; }
+.playground-model select { width: 100%; min-width: 0; text-overflow: ellipsis; }
+.playground-header .conversation-delete { margin-left: auto; padding: 0.375rem 0.5rem; font-size: 0.8125rem; color: var(--capyctl-muted); background: transparent; border-color: transparent; }
+.playground-scroll { flex: 1; min-height: 0; min-width: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 1rem 0.25rem; overflow-wrap: anywhere; }
+.playground-empty { max-width: 42ch; margin: auto; padding: 2rem 1rem; text-align: center; }
+.playground-empty h2 { margin-top: 0; }
+.playground .messages { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1rem; }
+.playground .messages li { align-self: flex-start; max-width: min(85%, 70ch); min-width: 0; padding: 0.75rem 1rem; border-radius: 12px; background: var(--capyctl-surface); border: 1px solid var(--capyctl-rule); }
+.playground .messages li.user { align-self: flex-end; background: color-mix(in srgb, var(--capyctl-accent) 12%, var(--capyctl-bg)); border-color: color-mix(in srgb, var(--capyctl-accent) 25%, var(--capyctl-rule)); }
+.playground .messages .content { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.playground .timings, .playground .pending { margin: 0.375rem 0 0; font-size: 0.8125rem; }
+.playground .pending { margin: 0; }
+.playground-composer { flex-shrink: 0; display: flex; align-items: flex-end; gap: 0.75rem; border-top: 1px solid var(--capyctl-rule); background: var(--capyctl-bg); padding: 0.75rem 0 max(0px, env(safe-area-inset-bottom)); }
+.playground-composer textarea { flex: 1; min-width: 0; min-height: 2.75rem; max-height: 9rem; line-height: 1.5; resize: none; overflow-y: auto; }
+.playground-composer button { min-height: 2.75rem; }
+.playground .decision-fields { display: flex; flex-direction: column; gap: 0.75rem; max-width: 48rem; margin-inline: auto; }
+.playground .decision-fields label { display: flex; flex-direction: column; gap: 0.375rem; }
+.playground .decision-results { max-width: 48rem; margin: 1.5rem auto 0; }
+.playground .decision-composer { justify-content: flex-end; }
+@media (max-width: 767.98px) {
+  .shell:has(> .content > .playground) { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: 3.5rem minmax(0, 1fr); padding-bottom: calc(4.5rem + env(safe-area-inset-bottom)); }
+  .shell > .content:has(> .playground) { padding: 0.75rem 1rem 0; }
+  .playground-header { gap: 0.5rem; flex-wrap: wrap; padding-bottom: 0.5rem; }
+  .playground-header h1 { font-size: 1.25rem; }
+  .playground-model { max-width: none; }
+  .playground-header .conversation-delete { padding: 0.25rem 0; flex-basis: 100%; text-align: right; }
+  .playground-scroll { scrollbar-gutter: auto; }
+  .playground-composer { gap: 0.5rem; padding-bottom: max(0.5rem, env(safe-area-inset-bottom)); }
+}
