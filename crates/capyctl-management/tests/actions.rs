@@ -157,9 +157,11 @@ async fn a_memory_refused_deployment_starts_after_replacing_its_request() {
     .unwrap();
     let configuration =
         Arc::new(SharedConfigurationSource::new(owner.clone(), host.clone(), "owner").unwrap());
-    let app = lifecycle_router(
+    let app = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(OwnedActionSource::new(configuration, worker.commands()).unwrap()),
+        lifecycle_router(Arc::new(
+            OwnedActionSource::new(configuration, worker.commands()).unwrap(),
+        )),
     );
     let refused = value(
         app.clone()
