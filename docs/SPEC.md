@@ -729,7 +729,7 @@ A deployment gains `lmcache` (`auto`, the default, `off` or `required`), `lmcach
 
 > **Amended by [ADR 0018](design/adr/0018-engine-registration.md) amendment A4** (owner decision 2026-11-13).
 
-The engines files (`engines.yaml`, `custom-engines.yaml`) live in the role's state directory, which the service user writes, and the role itself writes them when engines are added or removed through its management API (ADR 0040 §10–§11), under the same lock and atomic write. A file at the previous location is moved into the state directory once at start.
+The engines files (`engines.yaml`, `custom-engines.yaml`) live in the role's state directory, which the service user writes, and the role itself writes them when engines are added or removed through its management API (ADR 0040 §10–§11), under the same lock and atomic write. A file at the previous location is copied into the state directory once and left unchanged.
 
 ### 15.2 No-config behavior
 

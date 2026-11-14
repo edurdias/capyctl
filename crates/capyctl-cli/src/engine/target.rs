@@ -75,15 +75,8 @@ pub fn role_engines(
     let owner = (unsafe { libc::geteuid() } == 0).then(|| (metadata.uid(), metadata.gid()));
     let lock = lock_engines_for(&path, owner)?;
     if let Some(legacy) = legacy_engines_path(named, config_home(env).as_deref()) {
-        for (warning, message) in migrate_engines(&lock, &legacy)? {
-            capyctl_domain::role_log::notice(
-                if warning {
-                    capyctl_domain::role_log::Level::Warning
-                } else {
-                    capyctl_domain::role_log::Level::Notice
-                },
-                &message,
-            );
+        for message in migrate_engines(&lock, &legacy)? {
+            capyctl_domain::role_log::notice(capyctl_domain::role_log::Level::Notice, &message);
         }
     }
     Ok(path)

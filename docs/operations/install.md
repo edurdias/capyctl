@@ -834,15 +834,15 @@ with a server starts it as before, and the engine fails at once with
 `-e` ([Install an engine](../guide/install-engines.md#sglang-0521-or-0520)).
 `engines.yaml` and `custom-engines.yaml` live in the role's state directory
 (ADR 0018 amendment A4), not beside its configuration. The CLI and running
-role resolve the same state directory. On first start, an old file beside
-the named document (or in `~/.config/capyctl` without one) moves there once,
-keeping its revision and owner, with mode 0600. If the old directory is
-read-only, the role copies it into its state directory, owned by the state
-directory's user, and logs that the old file is no longer read and can be
-deleted. No manual upgrade step is needed; deleting the old file is optional.
-The offline CLI does the same under the engines lock before a write.
-If both copies exist, the state copy wins and a warning names the untouched
-old file. The role merges registered
+role resolve the same state directory. The first time a role or `capyctl engine`
+command of this release finds no engines file in its state directory but an
+old one beside the named document (or in `~/.config/capyctl` without one), it
+copies it there, keeping its revision, owned by the state directory's user,
+with mode 0600, and logs one line naming both files. The old file is never
+moved or changed: another role with another state directory, or an older
+release, may still read it. From then on this role reads only its copy, so
+edits to the old file no longer reach it; delete the old file once nothing
+else uses it. No manual upgrade step is needed. The role merges registered
 profiles with its document at start; a profile name declared in both is
 refused. Its first line records its revision (`# capyctl-document-revision: N`).
 The running role listens on `<state_dir>/control.sock` (mode 0600; only the

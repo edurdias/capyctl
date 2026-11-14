@@ -384,14 +384,13 @@ fn give(file: &File, (uid, gid): (u32, u32)) -> std::io::Result<()> {
     std::os::unix::fs::fchown(file, Some(uid), Some(gid))
 }
 
-/// ADR 0018 amendment A4: move both legacy files while holding the same
-/// lock as writers. Each notice is `(warning, message)` for the role log.
-/// Read-only legacy directories are copied instead; that private state-owned
-/// copy is authoritative and the old file may be deleted later.
-pub fn migrate_engines(
-    lock: &EnginesLock,
-    legacy: &Path,
-) -> Result<Vec<(bool, String)>, ConfigError> {
+/// ADR 0018 amendment A4: bring both legacy files into the state directory
+/// while holding the same lock as writers, returning one notice per copy for
+/// the role log. The old file is copied, never moved or removed: it may be
+/// shared by another role with another state directory, or still read by an
+/// older release, and under the system units its directory is read-only to
+/// the service. The private, state-owned copy is authoritative from then on.
+pub fn migrate_engines(lock: &EnginesLock, legacy: &Path) -> Result<Vec<String>, ConfigError> {
     use std::os::unix::fs::MetadataExt;
     let mut notices = Vec::new();
     for old in [legacy.to_path_buf(), custom_engines_beside(legacy)] {
@@ -409,14 +408,6 @@ pub fn migrate_engines(
             Err(e) => return Err(io(&old, e)),
         }
         if destination.try_exists().map_err(|e| io(&destination, e))? {
-            notices.push((
-                true,
-                format!(
-                    "{} exists; using {} and leaving the old file untouched",
-                    old.display(),
-                    destination.display()
-                ),
-            ));
             continue;
         }
         let mut source = OpenOptions::new()
@@ -425,82 +416,29 @@ pub fn migrate_engines(
             .open(&old)
             .map_err(|e| io(&old, e))?;
         refuse_hardlink(&old, &source, lock.owner)?;
-        let metadata = source.metadata().map_err(|e| io(&old, e))?;
-        let mut copied = false;
-        match fs::rename(&old, &destination) {
-            Ok(()) => {
-                source
-                    .set_permissions(fs::Permissions::from_mode(0o600))
-                    .map_err(|e| io(&destination, e))?;
-                source.sync_all().map_err(|e| io(&destination, e))?;
-            }
-            Err(e) if e.raw_os_error() == Some(libc::EXDEV) || readonly_migration(&e) => {
-                let directory = destination.parent().expect("engines path has a parent");
-                let state_owner = fs::metadata(directory).map_err(|e| io(directory, e))?;
-                let owner = if e.raw_os_error() == Some(libc::EXDEV) {
-                    (metadata.uid(), metadata.gid())
-                } else {
-                    (state_owner.uid(), state_owner.gid())
-                };
-                let mut temporary =
-                    tempfile::NamedTempFile::new_in(directory).map_err(|e| io(directory, e))?;
-                std::io::copy(&mut source, &mut temporary).map_err(|e| io(&old, e))?;
-                give(temporary.as_file(), owner).map_err(|e| io(temporary.path(), e))?;
-                temporary
-                    .as_file()
-                    .sync_all()
-                    .map_err(|e| io(temporary.path(), e))?;
-                let installed = temporary
-                    .persist(&destination)
-                    .map_err(|e| io(&destination, e.error))?;
-                File::open(directory)
-                    .and_then(|d| d.sync_all())
-                    .map_err(|e| io(directory, e))?;
-                match fs::remove_file(&old) {
-                    Ok(()) => {}
-                    Err(e) if readonly_migration(&e) => {
-                        copied = true;
-                        give(&installed, (state_owner.uid(), state_owner.gid()))
-                            .map_err(|e| io(&destination, e))?;
-                        installed.sync_all().map_err(|e| io(&destination, e))?;
-                    }
-                    Err(e) => return Err(io(&old, e)),
-                }
-            }
-            Err(e) => return Err(io(&old, e)),
-        }
-        for directory in [
-            destination.parent(),
-            (!copied).then(|| old.parent()).flatten(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            File::open(directory)
-                .and_then(|d| d.sync_all())
-                .map_err(|e| io(directory, e))?;
-        }
-        notices.push((
-            false,
-            if copied {
-                format!(
-                    "copied {} to {}; the old file is no longer read and can be deleted",
-                    old.display(),
-                    destination.display()
-                )
-            } else {
-                format!("moved {} to {}", old.display(), destination.display())
-            },
+        let directory = destination.parent().expect("engines path has a parent");
+        let state_owner = fs::metadata(directory).map_err(|e| io(directory, e))?;
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(directory).map_err(|e| io(directory, e))?;
+        std::io::copy(&mut source, &mut temporary).map_err(|e| io(&old, e))?;
+        let file = temporary.as_file();
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| io(temporary.path(), e))?;
+        give(file, (state_owner.uid(), state_owner.gid())).map_err(|e| io(temporary.path(), e))?;
+        file.sync_all().map_err(|e| io(temporary.path(), e))?;
+        temporary
+            .persist(&destination)
+            .map_err(|e| io(&destination, e.error))?;
+        File::open(directory)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| io(directory, e))?;
+        notices.push(format!(
+            "copied {} to {}; this role reads only the copy from now on, and the old file can be deleted once nothing else uses it",
+            old.display(),
+            destination.display()
         ));
     }
     Ok(notices)
-}
-
-fn readonly_migration(error: &std::io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(libc::EROFS | libc::EACCES | libc::EPERM)
-    )
 }
 
 /// ADR 0018 §2: write `file` under `lock` at the next revision and return it.

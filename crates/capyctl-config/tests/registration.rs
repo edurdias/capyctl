@@ -646,49 +646,52 @@ fn profile_without_flags_is_unchanged() {
     assert_eq!(profile_document(&fixture), before);
 }
 
-// T04 T44, ADR 0018 amendment A4: one-time move, preserving bytes,
-// revision and ownership, tightening permissions to 0600 for both files.
+// T04 T44, ADR 0018 amendment A4: a one-time copy, preserving bytes and
+// revision, owned by the state directory's owner at 0600, for both files. The
+// old file is left exactly as it was, so a second role with another state
+// directory, or an older release, still finds it.
 #[test]
-fn migration_moves_both_engines_files_once_with_revision_owner_and_private_mode() {
+fn migration_copies_both_engines_files_once_and_leaves_the_old_ones() {
     use std::os::unix::fs::MetadataExt;
     let root = tempfile::tempdir().unwrap();
-    let old_dir = root.path().join("etc");
+    let old_dir = root.path().join("config");
     std::fs::create_dir(&old_dir).unwrap();
     let legacy = old_dir.join(ENGINES_FILE);
+    let original = "# capyctl-document-revision: 42\noriginal bytes\n";
     for name in [ENGINES_FILE, CUSTOM_ENGINES_FILE] {
-        std::fs::write(
-            old_dir.join(name),
-            "# capyctl-document-revision: 42\noriginal bytes\n",
-        )
-        .unwrap();
+        std::fs::write(old_dir.join(name), original).unwrap();
         std::fs::set_permissions(old_dir.join(name), std::fs::Permissions::from_mode(0o640))
             .unwrap();
     }
-    let owner = std::fs::metadata(&legacy).unwrap();
-    let state = root.path().join("state");
-    let lock = lock_engines(&engines_path(&state)).unwrap();
-    let notices = migrate_engines(&lock, &legacy).unwrap();
-    assert_eq!(notices.len(), 2);
-    assert!(notices
-        .iter()
-        .all(|(warning, message)| !warning && message.contains("moved")));
-    for name in [ENGINES_FILE, CUSTOM_ENGINES_FILE] {
-        let destination = state.join(name);
-        let text = std::fs::read_to_string(&destination).unwrap();
-        assert_eq!(text, "# capyctl-document-revision: 42\noriginal bytes\n");
-        assert_eq!(revision_of(&text), 42);
-        let metadata = std::fs::metadata(destination).unwrap();
-        assert_eq!((metadata.uid(), metadata.gid()), (owner.uid(), owner.gid()));
-        assert_eq!(metadata.mode() & 0o777, 0o600);
-        assert!(!old_dir.join(name).exists());
+    for role in ["first-state", "second-state"] {
+        let state = root.path().join(role);
+        let lock = lock_engines(&engines_path(&state)).unwrap();
+        let notices = migrate_engines(&lock, &legacy).unwrap();
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().all(|message| message.contains("copied")));
+        let owner = std::fs::metadata(&state).unwrap();
+        for name in [ENGINES_FILE, CUSTOM_ENGINES_FILE] {
+            let text = std::fs::read_to_string(state.join(name)).unwrap();
+            assert_eq!(text, original);
+            assert_eq!(revision_of(&text), 42);
+            let metadata = std::fs::metadata(state.join(name)).unwrap();
+            assert_eq!((metadata.uid(), metadata.gid()), (owner.uid(), owner.gid()));
+            assert_eq!(metadata.mode() & 0o777, 0o600);
+            let old = std::fs::metadata(old_dir.join(name)).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(old_dir.join(name)).unwrap(),
+                original
+            );
+            assert_eq!(old.mode() & 0o777, 0o640);
+        }
+        assert!(migrate_engines(&lock, &legacy).unwrap().is_empty());
     }
-    assert!(migrate_engines(&lock, &legacy).unwrap().is_empty());
 }
 
 // T04 T44, ADR 0018 amendment A4: the state copy wins independently for
-// each file; an old file is left untouched and named by a warning.
+// each file, and the old file is never read or changed again.
 #[test]
-fn migration_keeps_state_files_and_warns_about_untouched_legacy_files() {
+fn migration_keeps_state_files_and_leaves_legacy_files_untouched() {
     let root = tempfile::tempdir().unwrap();
     let old = root.path().join("etc");
     let state = root.path().join("state");
@@ -698,11 +701,10 @@ fn migration_keeps_state_files_and_warns_about_untouched_legacy_files() {
         std::fs::write(old.join(name), "old").unwrap();
         std::fs::write(state.join(name), "state").unwrap();
     }
-    let notices = migrate_engines(&lock, &engines_path(&old)).unwrap();
-    assert_eq!(notices.len(), 2);
-    for (name, (warning, message)) in [ENGINES_FILE, CUSTOM_ENGINES_FILE].iter().zip(notices) {
-        assert!(warning);
-        assert!(message.contains(old.join(name).to_str().unwrap()));
+    assert!(migrate_engines(&lock, &engines_path(&old))
+        .unwrap()
+        .is_empty());
+    for name in [ENGINES_FILE, CUSTOM_ENGINES_FILE] {
         assert_eq!(std::fs::read_to_string(old.join(name)).unwrap(), "old");
         assert_eq!(std::fs::read_to_string(state.join(name)).unwrap(), "state");
     }
@@ -747,9 +749,9 @@ fn migration_copies_from_read_only_directory_and_later_state_wins() {
     let lock = lock_engines(&engines_path(&state)).unwrap();
     let notices = migrate_engines(&lock, &engines_path(&old)).unwrap();
     assert_eq!(notices.len(), 2);
-    assert!(notices.iter().all(|(warning, text)| !warning
-        && text.contains("no longer read")
-        && text.contains("can be deleted")));
+    assert!(notices
+        .iter()
+        .all(|text| text.contains("copied") && text.contains("can be deleted")));
     let owner = std::fs::metadata(&state).unwrap();
     for name in [ENGINES_FILE, CUSTOM_ENGINES_FILE] {
         assert_eq!(
@@ -761,9 +763,9 @@ fn migration_copies_from_read_only_directory_and_later_state_wins() {
         assert_eq!(metadata.mode() & 0o777, 0o600);
         std::fs::write(state.join(name), "authoritative").unwrap();
     }
-    let notices = migrate_engines(&lock, &engines_path(&old)).unwrap();
-    assert_eq!(notices.len(), 2);
-    assert!(notices.iter().all(|(warning, _)| *warning));
+    assert!(migrate_engines(&lock, &engines_path(&old))
+        .unwrap()
+        .is_empty());
     assert_eq!(
         std::fs::read_to_string(engines_path(&state)).unwrap(),
         "authoritative"

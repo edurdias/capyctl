@@ -1574,7 +1574,8 @@ fn list_shows_lmcache_on_or_off_with_the_reason() {
 }
 
 // T04, ADR 0018 amendment A4: whichever starts first, the offline CLI or
-// the role, migrates and writes the same file without resetting revisions.
+// the role, copies and writes the same file without resetting revisions; the
+// old file is left as it was.
 #[tokio::test]
 async fn offline_cli_migrates_before_remove_and_role_reads_the_same_state_file() {
     let dir = private_dir();
@@ -1588,6 +1589,7 @@ async fn offline_cli_migrates_before_remove_and_role_reads_the_same_state_file()
     assert_eq!(added["engines_file"], destination.to_str().unwrap());
     std::fs::rename(&destination, &legacy).unwrap();
     let revision = EnginesFile::load(&legacy).unwrap().revision;
+    let legacy_bytes = std::fs::read(&legacy).unwrap();
     let removed = execute(
         &Command::EngineRemove {
             name: "vllm".into(),
@@ -1600,7 +1602,7 @@ async fn offline_cli_migrates_before_remove_and_role_reads_the_same_state_file()
     .unwrap();
     assert_eq!(removed["engines_file"], destination.to_str().unwrap());
     assert_eq!(removed["revision"], revision + 1);
-    assert!(!legacy.exists());
+    assert_eq!(std::fs::read(&legacy).unwrap(), legacy_bytes);
     let role_file =
         capyctl_cli::engine::role_engines(&dir.path().join("s"), Some(&document), &|key| {
             (key == "HOME").then(|| dir.path().to_string_lossy().into_owned())

@@ -67,10 +67,12 @@ The security fixes:
 
 ADR 0018 amendment A4 (owner decision 2026-11-13) moves the engines files into the role's
 state directory (`capyctl_config::registration::engines_path`), which the role, the CLI and
-host administration all resolve. A role's start brings an existing file over once: it is moved
-when the old location is writable and copied when it is read-only, as under the system units. The
-packaged-layout test `packaged_layout_host_admin_add_remove_with_read_only_config_directory`
-fails before and passes after.
+host administration all resolve. The first role or `capyctl engine` command of the release
+copies an existing file into the state directory once and never moves or changes the old
+one, which another role or an older release may still read. The packaged-layout test
+`packaged_layout_host_admin_add_remove_with_read_only_config_directory` fails before and
+passes after.
+
 The review fixes add regression cases for behavior that was failing before the fixes:
 Edit now reads the accepted source document and numeric revision rather than the frozen
 effective configuration; fit previews use start's observed-memory admission, include
@@ -102,7 +104,7 @@ qualification.
   restoring a state backup ([data retention](../operations/data-retention.md#web-ui-sessions-and-sign-in-links)).
 - **Registered engines now live in the role's state directory** (for example
   `/var/lib/capyctl/host/engines.yaml`), so an installed service can add and remove engines
-  from the web UI. On its first start after the upgrade, a role brings an existing
-  `engines.yaml` (and `custom-engines.yaml`) over by itself. Under the system units the old file
-  in `/etc/capyctl` is left in place and no longer read; you may delete it
+  from the web UI. The first time it runs, a role copies an existing `engines.yaml` (and
+  `custom-engines.yaml`) there by itself, and from then on reads only its copy. The old file
+  is left as it was, so an older release still finds it; delete it once nothing else uses it
   ([install](../operations/install.md)).
