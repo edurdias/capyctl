@@ -1221,6 +1221,12 @@ async fn measured_then_started_again(
             .optional()
             .unwrap()
     };
+    // The measurement is recorded after Ready (worker.rs `drive`: it waits for
+    // a fresh per-process observation first), so wait for it rather than read
+    // it once: under the CI-shaped suite's load the single read came first.
+    if ready_gpu.is_some() {
+        until("the measurement recorded at Ready", || measured().is_some()).await;
+    }
     assert_eq!(
         measured(),
         ready_gpu.map(|gpu| (0, gpu)),
