@@ -82,6 +82,195 @@ async fn setup_with_observations(
     (dir, owner, worker, source.fence.deployment_id.clone(), app)
 }
 
+// T08 T16 T30: a memory-refused queued Initialize is superseded through verified
+// cleanup before its smaller replacement starts.
+#[tokio::test]
+async fn a_memory_refused_deployment_starts_after_replacing_its_request() {
+    let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let owner = Arc::new(Mutex::new(OwnedCoordinatorState::open(dir.path()).unwrap()));
+    let golden: Value = serde_json::from_str(include_str!(
+        "../../capyctl-config/tests/fixtures/effective-vllm-golden.json"
+    ))
+    .unwrap();
+    let mut host = golden["input"]["host"].clone();
+    host["runtime_profiles"]["local"]["build_fingerprint"] = json!("qualification-fake-v1");
+    host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
+        json!("secret://another-admin");
+    host["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "24GiB",
+                   "free_reserve": "1GiB", "host_kv_limit": "4GiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "16GiB",
+                 "free_reserve": "1GiB"}
+    });
+    host["resource_policy"]["devices"] = json!({
+        "gpu0": {"domain": "gpu0", "sharing": "shared",
+                 "physical_gpu_uuid": "GPU-00000000-0000-0000-0000-000000000000"}
+    });
+    let observations = vec![
+        MemoryObservation {
+            domain: "system".into(),
+            capacity_bytes: 32 << 30,
+            available_bytes: 30 << 30,
+            sampled_at_ms: 1900,
+        },
+        MemoryObservation {
+            domain: "gpu0".into(),
+            capacity_bytes: 24 << 30,
+            available_bytes: 4 << 30,
+            sampled_at_ms: 1900,
+        },
+    ];
+    let mut config = golden["input"]["deployment"].clone();
+    config.as_object_mut().unwrap().remove("resources");
+    config["devices"] = json!([{"id": "gpu0", "sharing": "shared"}]);
+    config["residency"] = json!("restart_only");
+    config["engine_config"] = json!({"memory": {"request": "4GiB", "kv_cache": "256MiB"}});
+    let id = {
+        let o = owner.lock().unwrap();
+        o.store()
+            .import_resource_policy(
+                o.session(),
+                &capyctl_config::effective::normalize_host_policy(&host).unwrap(),
+                &observations,
+                1900,
+            )
+            .unwrap();
+        o.store()
+            .create_stopped_managed_configuration(
+                o.session(),
+                "owner",
+                "create",
+                &json!({"config": config}).to_string(),
+                &host,
+                1900,
+            )
+            .unwrap()
+            .deployment_id
+    };
+    let worker = capyctl_testkit::spawn_fake_coordinator(
+        owner.clone(),
+        Arc::new(Observations(observations)),
+        Arc::new(|| Ok::<_, CoordinatorError>(1900)),
+        CoordinatorOptions::default(),
+    )
+    .unwrap();
+    let configuration =
+        Arc::new(SharedConfigurationSource::new(owner.clone(), host.clone(), "owner").unwrap());
+    let app = lifecycle_router(
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+        Arc::new(OwnedActionSource::new(configuration, worker.commands()).unwrap()),
+    );
+    let refused = value(
+        app.clone()
+            .oneshot(request(&id, "too-large", "start"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(refused["operation_id"].is_string(), "{refused}");
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let attempted: bool = sql
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM journal_entries WHERE state='given_up')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if attempted {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let failure: String = sql
+        .query_row(
+            "SELECT evidence FROM journal_entries WHERE state='attempt_failed' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(failure.contains("insufficient_device_memory"), "{failure}");
+    assert!(owner
+        .lock()
+        .unwrap()
+        .store()
+        .resource_snapshot()
+        .unwrap()
+        .owners
+        .is_empty());
+    config["engine_config"]["memory"]["request"] = json!("1GiB");
+    {
+        let o = owner.lock().unwrap();
+        o.store()
+            .replace_stopped_managed_configuration(
+                o.session(),
+                "owner",
+                "replace",
+                &id,
+                &json!({"expected_revision": 1, "config": config}).to_string(),
+                &host,
+                1900,
+            )
+            .unwrap();
+    }
+    let mut start = request(&id, "smaller", "start");
+    *start.body_mut() = Body::from(
+        json!({"expected_revision": 2, "action": "start", "deadline_ms": 10000}).to_string(),
+    );
+    let response = app.oneshot(start).await.unwrap();
+    let status = response.status();
+    let started = value(response).await;
+    if status != 202 {
+        assert_eq!(status, 409, "{started}; worker: {:?}", worker.status());
+        assert_eq!(started["error"]["code"], "runtime_retained", "{started}");
+        assert!(started["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("verified cleanup"));
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let ready: bool = sql.query_row(
+                "SELECT revision=2 AND observed_state='ready' FROM deployment_instances WHERE deployment_id=?1",
+                [&id],
+                |r| r.get(0),
+            ).unwrap();
+            if ready {
+                break;
+            }
+            assert!(matches!(worker.status(), capyctl_controller::coordinator::WorkerStatus::Running),
+                "worker stopped: {:?}", worker.status());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("the smaller revision starts after its predecessor's cleanup");
+    let cancelled: bool = sql.query_row(
+        "SELECT state='failed' AND error_code='stopped_before_initialize_armed' FROM operations WHERE id=?1",
+        [refused["operation_id"].as_str().unwrap()],
+        |r| r.get(0),
+    ).unwrap();
+    assert!(
+        cancelled,
+        "the old queued initialization was cancelled without executing"
+    );
+    assert_eq!(
+        owner
+            .lock()
+            .unwrap()
+            .store()
+            .resource_snapshot()
+            .unwrap()
+            .owners[&id]
+            .phase,
+        capyctl_domain::resources::ResourcePhase::Ready
+    );
+    worker.shutdown().await.unwrap();
+}
+
 struct BeforeArm {
     entered: Arc<tokio::sync::Semaphore>,
     release: Arc<tokio::sync::Semaphore>,

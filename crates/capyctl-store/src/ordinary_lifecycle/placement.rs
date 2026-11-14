@@ -648,6 +648,20 @@ pub(crate) fn prepare(
         )
         .optional()?;
     if let Some((revision, generation)) = in_flight {
+        let declared: i64 = tx.query_row(
+            "SELECT revision FROM deployments WHERE id=?1",
+            [deployment_id],
+            |r| r.get(0),
+        )?;
+        // ADR 0013 §7 (Q8): a replaced Initialize must stop before the new
+        // revision starts. Joining a closed old plan reports a stale fence
+        // instead of the retained ownership that is actually blocking it.
+        // Count-only revisions still share and join their original runtime.
+        if crate::instances::runtime_revision(tx, deployment_id, revision)?
+            != crate::instances::runtime_revision(tx, deployment_id, declared)?
+        {
+            return Ok(Prepared::Running);
+        }
         return Ok(Prepared::Joined(DeploymentFence {
             deployment_id: deployment_id.into(),
             revision,
