@@ -40,3 +40,17 @@ export function autoGrow(node: HTMLTextAreaElement, value: string) {
   update(value);
   return { update, destroy() { node.removeEventListener('input', resize); } };
 }
+
+// SPEC R30, R35–R36: Cmd+Enter (Ctrl+Enter off a Mac) sends from any device,
+// a phone or tablet with a hardware keyboard included. Plain Enter also sends
+// with a fine pointer; on a touch keyboard it stays a newline, and Shift+Enter
+// is always a newline. An IME composition is never interrupted.
+export function submitOnEnter(event: KeyboardEvent): void {
+  if (event.key !== 'Enter' || event.isComposing || event.shiftKey) return;
+  const shortcut = event.metaKey || event.ctrlKey;
+  if (!shortcut && window.matchMedia?.('(pointer: coarse)').matches) return;
+  const field = event.currentTarget;
+  if (!(field instanceof HTMLTextAreaElement || field instanceof HTMLInputElement)) return;
+  event.preventDefault();
+  field.form?.requestSubmit();
+}

@@ -7,7 +7,7 @@
   import type { DeploymentSnapshot } from '../../lib/types';
   import { stateWord } from '../../lib/vocabulary';
   import StartModel from './StartModel.svelte';
-  import { autoGrow, followContent } from './interactions';
+  import { autoGrow, followContent, submitOnEnter } from './interactions';
 
   // SPEC R31: a typed question to a decision model, answered with the
   // probability of each option.
@@ -115,7 +115,7 @@
 </div>
 <div class="playground-composer decision-composer">
   <label class="visually-hidden" for="decision-input">Input</label>
-  <textarea id="decision-input" form="decision-question" bind:value={input} use:autoGrow={input} rows="1" placeholder="Ask a decision question"></textarea>
+  <textarea id="decision-input" form="decision-question" bind:value={input} use:autoGrow={input} onkeydown={submitOnEnter} rows="1" placeholder="Ask a decision question"></textarea>
   <button form="decision-question" type="submit" class="primary" disabled={outstanding}>{outstanding ? 'Asking…' : 'Ask'}</button>
 </div>
 

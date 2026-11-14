@@ -8,7 +8,7 @@
   import { snapshot } from '../../lib/state';
   import type { DeploymentSnapshot } from '../../lib/types';
   import { stateWord } from '../../lib/vocabulary';
-  import { autoGrow, followContent } from './interactions';
+  import { autoGrow, followContent, submitOnEnter } from './interactions';
   import StartModel from './StartModel.svelte';
 
   // SPEC R29, R30, R32 (ADR 0040 §12): text-only, browser-local chat.
@@ -74,14 +74,6 @@
     }
   }
 
-  // SPEC R30, R35–R36: Enter sends on desktop, not on a touch keyboard.
-  function keydown(event: KeyboardEvent): void {
-    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && !window.matchMedia?.('(pointer: coarse)').matches) {
-      event.preventDefault();
-      if (event.currentTarget instanceof HTMLTextAreaElement) event.currentTarget.form?.requestSubmit();
-    }
-  }
-
   function clear(): void {
     deleteConversation(deployment.id);
     messages = [];
@@ -138,7 +130,7 @@
 </div>
 <form class="playground-composer" onsubmit={sendMessage}>
   <label class="visually-hidden" for="playground-message">Message</label>
-  <textarea id="playground-message" bind:value={draft} use:autoGrow={draft} onkeydown={keydown} rows="1" placeholder="Send a message"></textarea>
+  <textarea id="playground-message" bind:value={draft} use:autoGrow={draft} onkeydown={submitOnEnter} rows="1" placeholder="Send a message"></textarea>
   <button type="submit" class="primary" disabled={outstanding}>Send</button>
 </form>
 <ConfirmDialog open={confirming} title="Delete conversation?" confirmLabel="Delete" onconfirm={clear} oncancel={() => (confirming = false)}>

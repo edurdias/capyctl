@@ -370,6 +370,27 @@ describe('playground chat', () => {
     }
   });
 
+  // SPEC R30, R35–R36: Cmd+Enter (Ctrl+Enter off a Mac) sends from any device,
+  // a touch device with a hardware keyboard included.
+  it.each(['metaKey', 'ctrlKey'] as const)('sends on %s+Enter even with a coarse pointer', async (modifier) => {
+    vi.stubGlobal('matchMedia', vi.fn((query: string) => ({ matches: query === '(pointer: coarse)' })));
+    try {
+      const server = chatRole();
+      await open('/playground');
+      const box = document.querySelector<HTMLTextAreaElement>('#playground-message')!;
+      box.value = 'Hello';
+      box.dispatchEvent(new Event('input'));
+      flushSync();
+      const send = new KeyboardEvent('keydown', { key: 'Enter', [modifier]: true, bubbles: true, cancelable: true });
+      box.dispatchEvent(send);
+      await tick();
+      expect(send.defaultPrevented).toBe(true);
+      expect(server.answers).toHaveLength(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   // SPEC R15, R29–R30: in-band router refusals retain their own envelope.
   it('preserves the code, message, and retryability of an in-band refusal', async () => {
     const server = chatRole();
