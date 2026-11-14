@@ -555,6 +555,84 @@ fn a_count_increase_while_running_keeps_running_instances() {
     assert_eq!(t.owners(), vec![format!("deployment:{id}/instance:1")]);
 }
 
+// T08 T10 T16 T33: a replaced queued start is cancelled only through the
+// ordinary no-effects proof; armed and uncertain starts must still settle first.
+#[test]
+fn replacing_a_queued_start_preserves_ownership_until_its_unarmed_stop_completes() {
+    for state in ["planned", "armed", "uncertain"] {
+        let t = two_hosts("32GiB");
+        let id = t.deploy("deploy", json!({"instances": 1})).deployment_id;
+        t.start(&id, "start", StartScope::All, None);
+        let (step, _, host) = t.planned(&id).pop().unwrap();
+        if state != "planned" {
+            let (observations, limits, ttl, max_parked) = t.admission(&host);
+            t.store
+                .arm_initialize_with_context(
+                    &t.session,
+                    &step,
+                    AdmissionContext::new(&observations, &limits, NOW, ttl, max_parked),
+                )
+                .unwrap();
+            if state == "uncertain" {
+                t.store
+                    .mark_initialize_uncertain(&t.session, &step, NOW)
+                    .unwrap();
+            }
+        } else {
+            t.store
+                .close_instance_admission_at(
+                    &id,
+                    0,
+                    t.store.deployment_instances(&id).unwrap()[0]
+                        .generation
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        let mut changed = t.config["engine_config"].clone();
+        changed["memory"]["kv_cache"] = json!("2GiB");
+        t.replace(
+            &id,
+            "replace",
+            1,
+            json!({"instances": 1, "engine_config": changed}),
+        );
+        let before = t.store.resource_snapshot().unwrap();
+        let done = t.reconcile();
+        assert_eq!(t.store.resource_snapshot().unwrap(), before);
+        if state != "planned" {
+            assert!(done.is_empty(), "a {state} launch must settle: {done:?}");
+            assert!(!before.owners.is_empty());
+            continue;
+        }
+        let [Reconciled::Stopped {
+            operation_id,
+            reason: "revision",
+            ..
+        }] = done.as_slice()
+        else {
+            panic!("the queued old revision must be stopped: {done:?}");
+        };
+        assert_eq!(
+            t.store.runtime_binding(&id).unwrap().unwrap().state,
+            "reserved"
+        );
+        let stop = t.store.next_unarmed_stop(&t.session).unwrap().unwrap();
+        assert_eq!(&stop.operation_id, operation_id);
+        assert!(t
+            .store
+            .complete_unarmed_stop(&t.session, &stop.step_id)
+            .unwrap());
+        assert!(t.store.runtime_binding(&id).unwrap().is_none());
+        let done = t.reconcile();
+        assert!(
+            matches!(done.as_slice(), [Reconciled::Started { instance: 0, .. }]),
+            "{done:?}"
+        );
+        assert_eq!(t.store.runtime_binding(&id).unwrap().unwrap().revision, 2);
+    }
+}
+
 /// ADR 0013 §7: a count decrease while running retires surplus instances in
 /// the ADR order (a stopped one first) and drains a running surplus instance
 /// with verified cleanup before its row is removed.
