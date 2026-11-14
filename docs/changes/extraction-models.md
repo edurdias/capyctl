@@ -198,6 +198,118 @@ steps under its four-core/16 GiB limits; the extraction router suite passed
 all 10 tests, including raw-byte model-ID rewriting from `ShardioAI/extract-4b`
 to served name `extract-4b`. No live host was accessed for this rename.
 
+## Private-package T50 re-qualification — 2026-11-14
+
+The target is host A's private
+`~/shardio-extract-latency/release-path/extract-4b-bf16-rebuilt-c4db434`,
+served as `extract-4b`, with its standalone `extraction_model.py`, not the
+previous rc1 or the serving environment's older installed model loader.
+CapyCTL source is `302a42f`, including the startup-reference and retained-host
+recovery fixes. This run uses its own work directory, state and free ports;
+the owner's paused stack is not controlled or reconfigured.
+
+### Exact live checklist
+
+Each row requires captured request/response or lifecycle/ledger evidence.
+An unexercised check is not a pass; CPU tests do not establish live qualification.
+
+| Check | Procedure and pass criterion |
+|---|---|
+| Safety and provenance | Wait for GB10Runner; only owner EngineCore remains on GPU, at least 25 GB available before launch. Monitor owner process CPU in two consecutive samples, foreign GPU processes and available memory; stop on >20% core twice, a foreign GPU arrival or <8 GB available. Record source, binary and package hashes; check every selected port is free. |
+| Plumbing and discovery | Register a pinned custom manifest with all nine canonical types; deploy through the shipped CapyCTL controller/router/host ingress, not direct engine HTTP. Verify Ready, public model rewriting, discovery API/types, metrics and completed lease settlement. |
+| Manifest and deployment contract | Check canonical normalization with a text/number subset and undeclared date rejection before activation. Refuse invalid field types, native extraction engine, topology, parking residency and parser. Legacy fingerprints and old-host capability exclusions require separate coverage; never falsify a live host or rewrite a ledger. |
+| Request contract before activation | While stopped, refuse empty fields, unknown setting/type, invalid name, missing list items, invalid reference date, other API's questions key (including null/both keys), wrong endpoint, and non-scalar null_threshold (list, estimate, forecast). Confirm no activation or lease. |
+| Every field type | Route text with Unicode span validation; number including 3 × 20 plus 10% tax = 66; ISO date, clock time, datetime retaining clock, duration, text/number/date lists, bounded estimate and multi-step forecast. Compare factual answers with explicit input; report quality independently of wire validity. |
+| Images and unsupported inputs | Route an image request for supported non-text types; image-only text and text-list must return engine rejection field_unsupported_input, not inference results. Mixed text/image text spans must index textual state. |
+| State echo and internal members | return_state_text returns exact state_text (not state); no public mode/computation. Scalar value/guess obey p_null against explicit null_threshold. |
+| Quantiles | include_quantiles produces 99 ordered values for estimate and 99 per forecast step, consistent with p10/median/p90 and declared bounds. |
+| Token accounting | Capture measured state_tokens, image_tokens, schema_tokens, input_tokens, output_tokens and passes; images report nonzero visual tokens, generated output is zero and totals reflect full-prefix passes rather than fabricated counts. |
+| Truncation | Send text over the 8192-token serving limit; verify explicit truncation reporting and bounded successful response or documented engine rejection, never silent truncation. |
+| Startup canary | At the first Ready observation, read only the typed wake_canaries row and launch receipt; verify the actual nine-type startup answer is durable before dispatch, without a second best-effort canary. |
+| Restart | Verified stop releases owned resources, endpoints and leases; start reaches Ready with a new startup reference and repeats the same deterministic text answer. Custom restart-only does not claim parking/wake or changed-answer injection. |
+| Reconnect | Restart only this run's host role while engine is retained; require authenticated reproof, typed extraction, restored ingress and a successful routed request. Repeat after an unrelated approved-profile publication to exercise retained policy recovery. |
+| Request-order independence | Capture fresh text baseline, run an image request, then repeat the identical text request several times; answers must match baseline exactly (rope-state regression), excluding timing metadata. |
+| Rejection and uncertain settlement | Complete engine JSON 400 (min > max) closes its lease; interrupt a request only using identity-verified signals to this run's engine and confirm retention until verified stop. |
+| Latency | Capture cold initialization and per-request wall/router/engine timings; repeated fixed text requests yield sample count, median, p90 and range, without comparing unmatched cache conditions. |
+| Optional PDF dependency | Check approved environment without installing; if PDF libraries are absent, record finding and skip PDF checks rather than changing the environment. |
+| Cleanup | Stop/delete this run's deployments and roles, verify no own GPU processes/listeners remain, and read-only ledger shows no active ownership/reservations/leases. Leave owner processes untouched and publish nothing. |
+
+### Observed results
+
+**Overall: FAIL for model quality; not a release-gate T50 pass.** The simple
+numeric-list request below returns an empty list with high confidence, including
+when explicit instructions are added. No CapyCTL implementation defect was
+established by that response. The controller/router/host path passes the
+exercised wire, readiness, typed-reference and retained-host-recovery checks.
+
+The approved environment remains unchanged. Its older installed
+`capyctl_extract.server` HTTP shell was used with a private launcher that loads
+the package's standalone runtime and uses that runtime's request validators,
+model and decoder. It does not load the older installed model implementation.
+The launcher is pinned as a custom executable; this qualifies that exact
+launcher/package combination, not a newly installed `shardio-extract` CLI.
+Engine keys were neither read nor printed.
+
+| Check | Result and non-secret evidence |
+|---|---|
+| Build/provenance | PASS. On A, Cargo 1.98.1 built `302a42f` with existing `~/.local/bin/protoc` 27.3: `PATH="$HOME/.local/bin:$PATH" ~/.cargo/bin/cargo build --release --locked --bin capyctl` in `~/shardio-extract-t50/source`. The initial build without that PATH failed for missing protoc; nothing was installed. Binary SHA-256 `3cf82b7bbc5b68542afb9df9c3f541ccca6f5d1dc087ebd20cf0bc5d28e86720`; package manifest SHA-256 `e6f2a2664ddf08a7933d127e9fc9be3adc40fbeb8aaa57ae6b3b0d03f338766a`; runtime SHA-256 `41ae28eb48c7c73e19e71ac1438bf0348caec69d443bb632cc04687c33b4c4fb`. |
+| Isolation/safety | PASS for the exercised run. GB10Runner released A before GPU work. Initial available memory was 44,610 MiB; the final guard explicitly monitored the owner's container processes and EngineCore 1914989, using read-only host-journal and server-ledger PID/boot/start-time ownership. No actual foreign GPU process, owner CPU threshold breach or <8 GB memory event was observed. All listeners were checked free: management 47443, inference 48443, bootstrap/control 47444/47445, ingress 49443 and engine range 48100–48109, all loopback. |
+| Checkpoint and plumbing | PASS. Measured checkpoint digest `sha256:bded05806ba1a8db2186b6fb21551d203c6fb3131c369db256f310aa7694876e`, weights 11,916,161,380 bytes. Ready with admission/dispatch enabled; `/v1/models` exposes `extractions` and all nine types. Routed responses carry public `model: extract-4b` and measured router metrics. The initial absolute model reference outside the configured model store failed closed with `invalid_root`; correcting this run's store root and relative reference resolved it without changing the package. |
+| Manifest validation/normalization | PASS. `[number, text]` registers as `[text, number]`; empty, duplicate and unknown declared types each exit 27 `custom_manifest_invalid`, writing nothing. The stopped subset rejects date with HTTP 400 `field_type_unsupported` and remains stopped with admission/dispatch false. |
+| Deployment refusals | PASS for `deep`, `host_backed`, topology and parser (exit 2, named reason). Native-profile attempt could not reach native capability resolution because no native profile was published (`profile_not_published`, exit 24): NOT EXERCISED for that requirement. No owner engine/profile was borrowed. |
+| Request refusals | PASS. Empty fields, unknown setting/type, invalid name, missing list items and invalid reference date return 400 `invalid_request`; `questions:null`, both keys, chat and embeddings return 400 `api_mismatch`. List/estimate/forecast `null_threshold` each returns 400 `invalid_request`. Cold malformed requests leave desired state stopped, admission/dispatch false and no inference lease. |
+| Text | PASS. `Customer Zoë García ordered blue chairs.` → `Zoë García`, span `[9,19]`, verified in Unicode code points. |
+| Number | PASS for the tested computation. `Quantity 3 at price 20 each, plus 10% tax.` → 66.0. |
+| Date/time/datetime/duration | PASS for the fixtures: `2026-11-20`, `14:30:00`, datetime retaining `T14:30:00`, and 3 hours. Startup probe also returns 11 days between its explicit dates. |
+| Lists | Text/date PASS: all three damaged items and all three ISO dates. Number-list quality FAIL: `{"state":"Scores: 12, 25, 38.","fields":{"scores":{"type":"list","items":"number"}}}` → `value:[]`, confidence 0.9808759689. Adding `instructions:"List all scores"` still returns `[]`, confidence 0.9879462123. Both are complete HTTP 200 answers, not transport errors. |
+| Estimate/forecast | PASS for the fixtures. Comparables 90,100,110,120,130 → median 110, p10 90, p90 130. Monthly history 10,20,30 → forecast 40,50,60. This is fixture evidence, not a general quality score. |
+| Image | PASS. Generated 480×160 PNG with `TOTAL 66.00` → 66.0, HTTP 200, 654.306 ms wall. Mixed image/text preserves textual name/span. Image-only text and text-list both return 400 `engine_rejected`, message `text extraction requires non-empty state`. The router intentionally wraps the engine's rejection; its original error code is not exposed in that envelope. |
+| Echo/nulling/internal members | PASS. Exact `state_text` echo, no response `state`; no public `mode` or `computation` in observed answers. Unknown delivery date with threshold 0.01 has p_null 0.9609517455 and value null. |
+| Quantiles | PASS. Estimate has 99 quantiles; forecast has three ordered 99-element arrays, matching the corresponding constant step medians. |
+| Usage | PASS for observed accounting consistency: text 55 = 8 state + 0 image + 47 schema; image 138 = 0 + 77 + 61; mixed 132 = 8 + 77 + 47. Every captured successful response reconciles input components, output_tokens is 0 and passes is 1. Exact processor tokenization and multi-prefix aggregation were not independently instrumented. |
+| Truncation | PASS. Overlong repeated text returns HTTP 200, `truncated:true`, input_tokens 8192 = 8161 state + 31 schema, 2606.225 ms wall. Short requests report false. This tests reporting, not overlong-input answer quality. |
+| Startup reference | PASS. First Ready read-only ledger has extraction/v1 canary, all nine canonical declared types and complete typed answers, same launch incarnation. The initial reference has amount 649, order A-88412, datetime `2026-09-28T14:30:00`, both damage spans and duration 11. No missing-canary regression reproduced. |
+| Reconnect | PASS under the corrected harness: own host role restart retains engine PID 2851120/start tick 244268276, same incarnation and reservation, and serves the exact baseline answer (80.954 ms). |
+| Retained profile recovery | PASS. After Ready, publishing unrelated `t50-unrelated` then restarting only the own host role again retains the same engine/canary and serves the exact baseline answer (81.693 ms), with admission/dispatch enabled. |
+| Rope-state order independence | PASS. Fresh text and all three identical text requests after image/mixed-image requests have exactly equal complete answers, including confidence and p_null. |
+| Latency | PASS for measurement. First successful cold initialization took 77.51 s including CLI overhead. Ten sequential warm Unicode-name text requests: wall median 61.626 ms, nearest-rank p90 62.316 ms, range 58.414–65.295 ms; 55 input tokens, one pass. No unsupported speedup comparison. |
+| PDF | SKIPPED as authorized: approved environment lacks `pdfplumber` and `pdfminer` (also no pymupdf). No dependencies installed and no PDF request claimed qualified. |
+| Unchanged fingerprints, old-host exclusion, comparison mismatch boundaries | NOT EXERCISED LIVE. No capability falsification, alternate old-host deployment, ledger write or changed-model injection. Restart-only custom engines do not support a parking wake; existing CPU tests are not relabelled live evidence. |
+| Explicit restart | PASS. `stop deployment extract-4b` starts an asynchronous verified stop; `start deployment extract-4b --wait` waits for that stop, then reaches generation 4 with a new engine PID 2852128 and a new typed canary. Prior binding is released. Complete text answers equal the pre-stop baseline; restart response is 75.971 ms. The immediate post-stop snapshot is transitional, not falsely labelled fully released. |
+| Complete rejection and uncertain request settlement | PASS for observed retention/closure. Normal complete JSON 400 rejection leaves no request lease. Identity-verified SIGSTOP to owned engine 2852128 followed by a two-second client timeout leaves an inflight request lease and the full reservation held. Identity-verified SIGKILL, stop and verified deletion then release the lease and reservation. The sampled lease was still inflight, so this does not claim the cancelling transition was sampled. |
+| Final cleanup | PASS. Both run deployments deleted with `delete deployment … --stop`; final read-only ledger has empty request_leases, resource_owners, reservations and endpoint_leases, and every runtime binding released. Own roles 2851008/2851785 stopped; guard exits 0. All selected ports are free, no live owned engine identity remains, and nvidia-smi lists only unchanged owner EngineCore 1914989 at 73,592 MiB. Owner capyctl 1849524 and worker 1849416 remain; MemAvailable is 44,626 MiB. No host B access, installation, upload or publication occurred. |
+
+The safety harness interrupted twice, without a genuine safety-limit violation.
+Its first ancestry-only implementation called the retained orphaned engine
+foreign after a host-role restart. Its second server-ledger-only implementation
+missed an initializing engine, whose identity was already durable in the host
+journal but not yet in the server's successful launch binding. Each interruption
+stopped only this run's roles; orphaned engines were subsequently signalled only
+after PID, boot ID and start ticks matched this run's read-only ownership
+evidence. The owner explicitly approved resuming with the corrected union of
+host-journal and server-ledger identities. These are harness defects, not
+CapyCTL reconnect failures. The final guard includes all explicit owner-stack
+PIDs and sums their CPU, a stricter condition than checking each separately.
+
+
+Non-secret per-request and read-only-ledger evidence is retained on A at
+`~/shardio-extract-t50/evidence/` and locally at
+`target/live/t50-requalification/evidence/` in the qualification worktree.
+Representative commands (each remote invocation used the required SSH
+ControlPath and BatchMode options) were:
+
+```sh
+capyctl --state-dir ~/shardio-extract-t50/server \
+  --config ~/shardio-extract-t50/server.yaml deploy model \
+  --file ~/shardio-extract-t50/deployment.yaml
+capyctl --state-dir ~/shardio-extract-t50/server \
+  --config ~/shardio-extract-t50/server.yaml start deployment extract-4b --wait
+~/capyctl-extract-serve-venv/bin/python ~/shardio-extract-t50/warm.py
+python3 ~/shardio-extract-t50/restart_host.py
+python3 ~/shardio-extract-t50/post_probe.py retained-policy-reconnect
+python3 ~/shardio-extract-t50/run_fault.py
+```
+
 # Release note: Extraction models
 
 - **Typed extraction at `POST /v1/systemone`.** A deployment with
