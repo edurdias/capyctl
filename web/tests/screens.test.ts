@@ -316,6 +316,6 @@ describe('U20 current versus retained measurements', () => {
     expect(document.querySelector('#sidebar a[href="/ui/hosts"] small')?.textContent).toBe('1 online');
     const status = document.querySelector('.status-line')!.textContent!;
     expect(status).toContain('1 stopped · 1 failed · ');
-    expect(status.split(' · ')).toHaveLength(8);
+    expect(status.split(' · ')).toHaveLength(9);
   });
 });

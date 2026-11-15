@@ -220,17 +220,12 @@ fn hosts(value: &Value) -> String {
                 .as_str()
                 .filter(|n| !n.is_empty())
                 .unwrap_or(id);
-            let domains = host["session"]["domains"].as_array();
-            let memory = match domains.filter(|d| !d.is_empty()) {
-                Some(domains) => {
-                    let sum = |key: &str| domains.iter().filter_map(|d| number(&d[key])).sum();
-                    format!(
-                        "{} / {}",
-                        gib(sum("available_bytes")),
-                        gib(sum("capacity_bytes"))
-                    )
-                }
-                None => "-".into(),
+            let (gpu, ram) = match host["session"]["domains"]
+                .as_array()
+                .filter(|d| !d.is_empty())
+            {
+                Some(domains) => memory_columns(domains),
+                None => ("-".into(), "-".into()),
             };
             let engines = host["session"]["profiles"]
                 .as_array()
@@ -242,7 +237,8 @@ fn hosts(value: &Value) -> String {
                 yes_no(host["eligible"] == true),
                 text(&host["binary_version"]),
                 text(&host["compatibility"]),
-                memory,
+                gpu,
+                ram,
                 engines,
             ]
         })
@@ -254,7 +250,8 @@ fn hosts(value: &Value) -> String {
             "ELIGIBLE",
             "VERSION",
             "COMPATIBILITY",
-            "MEMORY (FREE / TOTAL)",
+            "GPU (FREE / TOTAL)",
+            "RAM (FREE / TOTAL)",
             "ENGINES",
         ],
         &rows,
@@ -291,6 +288,37 @@ fn hosts(value: &Value) -> String {
         }
     }
     out
+}
+
+/// SPEC §7.2, ADR 0019 (found live 2026-11-14): a discrete GPU's own memory
+/// and host RAM are separate pools, and only GPU memory decides whether a
+/// model fits on the card, so they are never added together (a 16 GB card
+/// beside 61 GiB of RAM read as 77 GiB). A host with no device domain (a
+/// unified-memory machine such as a GB10) has one pool, shown under GPU.
+fn memory_columns(domains: &[Value]) -> (String, String) {
+    let usable: Vec<&Value> = domains
+        .iter()
+        .filter(|d| number(&d["capacity_bytes"]).is_some_and(|c| c > 0))
+        .collect();
+    let pair = |gpu: Option<bool>| {
+        let sum = |key: &str| {
+            usable
+                .iter()
+                .filter(|d| gpu.is_none_or(|gpu| (d["kind"] == "device") == gpu))
+                .filter_map(|d| number(&d[key]))
+                .sum::<i64>()
+        };
+        format!(
+            "{} / {}",
+            gib(sum("available_bytes")),
+            gib(sum("capacity_bytes"))
+        )
+    };
+    if usable.iter().any(|d| d["kind"] == "device") {
+        (pair(Some(true)), pair(Some(false)))
+    } else {
+        (pair(None), "unified".into())
+    }
 }
 
 /// The hosts an instance runs on, by name: its placed host, or every member
@@ -1317,6 +1345,45 @@ mod tests {
             .nth(1)
             .unwrap()
             .starts_with("gpu-a   online   yes"));
+    }
+
+    // T07 (SPEC §7.2, ADR 0019; found live 2026-11-14): a discrete GPU's
+    // memory and host RAM are separate columns, never one sum; a unified host
+    // shows its single pool under GPU.
+    #[test]
+    fn hosts_show_gpu_memory_and_host_ram_separately() {
+        let host = |name: &str, domains: Value| {
+            json!({"host_id": name, "name": name, "revoked": false, "online": true,
+                "eligible": true, "binary_version": "0.1.0", "compatibility": "supported",
+                "session": {"reconciled": true, "domains": domains, "profiles": []}})
+        };
+        let out = render(
+            View::Hosts,
+            &json!({"hosts": [
+                host("laptop", json!([
+                    {"kind": "device", "available_bytes": 3_i64 << 30, "capacity_bytes": 16_i64 << 30},
+                    {"kind": "system", "available_bytes": 40_i64 << 30, "capacity_bytes": 64_i64 << 30}])),
+                host("gb10", json!([
+                    {"kind": "system", "available_bytes": 96_i64 << 30, "capacity_bytes": 128_i64 << 30}])),
+            ]}),
+            &HostNames::new(),
+        );
+        let header = out.lines().next().unwrap();
+        assert!(
+            header.contains("GPU (FREE / TOTAL)") && header.contains("RAM (FREE / TOTAL)"),
+            "{out}"
+        );
+        let laptop = out.lines().find(|l| l.starts_with("laptop")).unwrap();
+        assert!(
+            laptop.contains("3.0 GiB / 16.0 GiB") && laptop.contains("40.0 GiB / 64.0 GiB"),
+            "{out}"
+        );
+        assert!(!out.contains("80.0 GiB"), "{out}");
+        let gb10 = out.lines().find(|l| l.starts_with("gb10")).unwrap();
+        assert!(
+            gb10.contains("96.0 GiB / 128.0 GiB") && gb10.contains("unified"),
+            "{out}"
+        );
     }
 
     // SPEC §7.2 (found live 2026-10-09): a host's memory headroom warning is

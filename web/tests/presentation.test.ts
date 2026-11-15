@@ -3,40 +3,40 @@ import { describe, expect, it } from 'vitest';
 import { currentSeries, duration, kvPercent, memorySegments, primaryAction, reservation, sparkPoints, timing, trend } from '../src/lib/presentation';
 import { deployment, instance } from './fixtures';
 import { hostHealth, type HostRow, type LatencyReport, type LatencySeries } from '../src/lib/reads';
-const domain = { domain_id: 'unified', kind: 'unified', capacity_bytes: 128, available_bytes: 80 };
+const domain = { domain_id: 'system', kind: 'system', capacity_bytes: 128, available_bytes: 80 };
 
 describe('U20 memory accounting', () => {
   it('sums per-instance startup and parked reservations, scoped to host', () => {
     const active = deployment({ startup: { bytes: 20, provenance: 'declared' }, instances: [instance(0, 'ready'), instance(1, 'ready'), { ...instance(2, 'ready'), host_id: 'other' }] });
     const parked = deployment({ id: 'parked', name: 'parked', parked: { bytes: 8, provenance: 'placeholder' }, instances: [instance(0, 'parked')] });
-    const segments = memorySegments([active, parked], 'gpu-box', domain);
+    const segments = memorySegments([active, parked], 'gpu-box', domain, 'unified');
     expect(segments.map((s) => [s.bytes, s.parked])).toEqual([[40, false], [8, true]]);
     expect(segments.reduce((sum, s) => sum + s.bytes, 0)).toBe(48);
     expect(reservation(active)).toBe(60);
     expect(reservation(parked)).toBe(8);
   });
   it('separates active and parked instances of the same model', () => {
-    const segments = memorySegments([deployment({ startup: { bytes: 20, provenance: 'declared' }, parked: { bytes: 5, provenance: 'placeholder' }, instances: [instance(0, 'ready'), instance(1, 'parked')] })], 'gpu-box', domain);
+    const segments = memorySegments([deployment({ startup: { bytes: 20, provenance: 'declared' }, parked: { bytes: 5, provenance: 'placeholder' }, instances: [instance(0, 'ready'), instance(1, 'parked')] })], 'gpu-box', domain, 'unified');
     expect(segments.map((s) => [s.bytes, s.parked])).toEqual([[20, false], [5, true]]);
     expect(new Set(segments.map((s) => s.id)).size).toBe(2);
   });
   it('uses split startup budgets on discrete domains without duplicating host bytes', () => {
     const model = deployment({ startup: { bytes: 25, provenance: 'declared', device_bytes: 20, host_bytes: 5 }, instances: [{ ...instance(0, 'ready'), devices: [{ id: 'gpu0' }, { id: 'gpu1' }] }] });
-    expect(memorySegments([model], 'gpu-box', { ...domain, domain_id: 'gpu0', device_id: 'gpu0', kind: 'device' })[0].bytes).toBe(10);
-    expect(memorySegments([model], 'gpu-box', { ...domain, domain_id: 'gpu1', device_id: 'gpu1', kind: 'device' })[0].bytes).toBe(10);
-    expect(memorySegments([model], 'gpu-box', { ...domain, domain_id: 'gpu2', device_id: 'gpu2', kind: 'device' })).toEqual([]);
-    expect(memorySegments([model], 'gpu-box', { ...domain, kind: 'host' })[0].bytes).toBe(5);
+    expect(memorySegments([model], 'gpu-box', { ...domain, domain_id: 'gpu0', device_id: 'gpu0', kind: 'device' }, 'gpu')[0].bytes).toBe(10);
+    expect(memorySegments([model], 'gpu-box', { ...domain, domain_id: 'gpu1', device_id: 'gpu1', kind: 'device' }, 'gpu')[0].bytes).toBe(10);
+    expect(memorySegments([model], 'gpu-box', { ...domain, domain_id: 'gpu2', device_id: 'gpu2', kind: 'device' }, 'gpu')).toEqual([]);
+    expect(memorySegments([model], 'gpu-box', domain, 'ram')[0].bytes).toBe(5);
   });
   it('uses measured parked domain bytes and excludes stopped instances', () => {
     const model = deployment({ parked: { bytes: 10, provenance: 'measured', measured: [{ host_id: 'gpu-box', installation: 'engine', domain: 'gpu0', bytes: 2, measured_at_ms: 1 }] }, instances: [{ ...instance(0, 'parked'), devices: [{ id: 'gpu0' }] }, instance(1, 'stopped')] });
-    expect(memorySegments([model], 'gpu-box', { ...domain, domain_id: 'gpu0', kind: 'device' })[0].bytes).toBe(2);
+    expect(memorySegments([model], 'gpu-box', { ...domain, domain_id: 'gpu0', kind: 'device' }, 'gpu')[0].bytes).toBe(2);
     expect(reservation(deployment({ startup: { bytes: 20, provenance: 'declared' }, instances: [instance(0, 'stopped')] }))).toBe(0);
   });
   // SPEC R10 / ADR 0019: an unsplit parked total cannot identify RAM residence.
   it('does not invent host RAM or GPU residence from an unmeasured parked budget', () => {
     const model = deployment({ parked: { bytes: 10, provenance: 'placeholder' }, instances: [{ ...instance(0, 'parked'), devices: ['gpu0'] }] });
-    expect(memorySegments([model], 'gpu-box', { ...domain, kind: 'host' })).toEqual([]);
-    expect(memorySegments([model], 'gpu-box', { ...domain, domain_id: 'gpu0', kind: 'device' })).toEqual([]);
+    expect(memorySegments([model], 'gpu-box', domain, 'ram')).toEqual([]);
+    expect(memorySegments([model], 'gpu-box', { ...domain, domain_id: 'gpu0', kind: 'device' }, 'gpu')).toEqual([]);
   });
 });
 

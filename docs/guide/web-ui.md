@@ -54,7 +54,7 @@ allows.
 
 ## What you can do
 
-- **Overview**: a status line (hosts online, memory free, models by state,
+- **Overview**: a status line (hosts online, GPU memory and host RAM free, models by state,
   requests in flight); for each host, its memory with one segment per model
   holding it (a parked model's share is hatched); and every model with its
   engine, state (ready, parked, stopped, failed, and the steps in between, with
