@@ -58,7 +58,7 @@ export const STANDALONE_HOST = {
   session: {
     domains: [
       { domain_id: 'gpu0', kind: 'device', device_id: 'GPU-0', capacity_bytes: 24 * 1024 ** 3, available_bytes: 8 * 1024 ** 3 },
-      { domain_id: 'host', kind: 'host', capacity_bytes: 64 * 1024 ** 3, available_bytes: 32 * 1024 ** 3 },
+      { domain_id: 'system', kind: 'system', capacity_bytes: 64 * 1024 ** 3, available_bytes: 32 * 1024 ** 3 },
     ],
   },
   binary_version: '1.0.0',

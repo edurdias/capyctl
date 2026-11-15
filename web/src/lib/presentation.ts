@@ -10,6 +10,39 @@ export function primaryAction(state: ObservedState): HintedAction | null {
 }
 
 export function gib(bytes: number): string { return `${(bytes / 1024 ** 3).toFixed(1)} GiB`; }
+
+// SPEC R10, R15: a GPU's own memory (VRAM) and host RAM are separate pools, and
+// only GPU memory decides whether a model fits on a discrete GPU, so they are
+// never added together. A host with no GPU domain (a unified-memory machine
+// such as a GB10) has one pool that serves the GPU and the CPU alike.
+export type MemoryPool = 'gpu' | 'ram' | 'unified';
+export function memoryPool(domain: MemoryDomain, hostDomains: MemoryDomain[]): MemoryPool {
+  if (domain.kind === 'device') return 'gpu';
+  return hostDomains.some((d) => d.kind === 'device') ? 'ram' : 'unified';
+}
+export function memoryLabel(domain: MemoryDomain, hostDomains: MemoryDomain[]): string {
+  const pool = memoryPool(domain, hostDomains);
+  return pool === 'gpu' ? `GPU ${domain.device_id ?? domain.domain_id}` : pool === 'ram' ? 'Host RAM' : 'Unified memory (GPU and CPU)';
+}
+export interface MemoryTotals { gpuFree: number; gpuCapacity: number; ramFree: number; ramCapacity: number }
+// Per host, then summed: unified memory counts as GPU memory, since that is
+// the pool a model loads into there.
+export function memoryTotals(hosts: MemoryDomain[][]): MemoryTotals {
+  const totals: MemoryTotals = { gpuFree: 0, gpuCapacity: 0, ramFree: 0, ramCapacity: 0 };
+  for (const domains of hosts) {
+    for (const domain of domains) {
+      if (domain.capacity_bytes <= 0 || domain.available_bytes < 0) continue;
+      if (memoryPool(domain, domains) === 'ram') {
+        totals.ramFree += domain.available_bytes;
+        totals.ramCapacity += domain.capacity_bytes;
+      } else {
+        totals.gpuFree += domain.available_bytes;
+        totals.gpuCapacity += domain.capacity_bytes;
+      }
+    }
+  }
+  return totals;
+}
 export function duration(seconds: number | null | undefined): string {
   if (seconds == null) return '–';
   return seconds >= 1 ? `${seconds.toFixed(1)} s` : `${(seconds * 1000).toFixed(0)} ms`;
@@ -27,7 +60,10 @@ export function reservation(d: DeploymentSnapshot): number {
     : i.observed_state === 'parked' ? (d.parked?.bytes ?? 0) : (i.startup?.bytes ?? d.startup?.bytes ?? 0)), 0);
 }
 export interface MemorySegment { id: string; name: string; bytes: number; parked: boolean; colour: number }
-export function memorySegments(deployments: DeploymentSnapshot[], host: string, domain: MemoryDomain): MemorySegment[] {
+// The pool comes from `memoryPool`: the server sends `device` and `system`
+// kinds only, never `host` or `unified`, so matching those strings drew a
+// model's whole footprint in host RAM and no parked memory on unified hosts.
+export function memorySegments(deployments: DeploymentSnapshot[], host: string, domain: MemoryDomain, pool: MemoryPool): MemorySegment[] {
   return deployments.flatMap((d, colour) => [false, true].flatMap((parked) => {
     let bytes = 0;
     for (const i of d.instances) {
@@ -36,13 +72,13 @@ export function memorySegments(deployments: DeploymentSnapshot[], host: string, 
       // instance's assigned GPUs, split evenly across that assignment.
       const devices = Array.isArray(i.devices) ? i.devices.flatMap((device) =>
         typeof device === 'string' ? [device] : device && typeof device.id === 'string' ? [device.id] : []) : [];
-      if (domain.kind === 'device' && !devices.includes(domain.device_id ?? domain.domain_id)) continue;
+      if (pool === 'gpu' && !devices.includes(domain.device_id ?? domain.domain_id)) continue;
       const measured = parked ? d.parked?.measured?.find((m) => m.host_id === host && m.domain === domain.domain_id) : undefined;
       const startup = i.startup ?? d.startup;
       // A total parked reservation is not evidence of residence in RAM.
-      bytes += parked ? measured?.bytes ?? (domain.kind === 'unified' ? d.parked?.bytes ?? 0 : 0)
-        : domain.kind === 'device' ? (startup?.device_bytes ?? startup?.bytes ?? 0) / devices.length
-        : domain.kind === 'host' ? startup?.host_bytes ?? (startup?.device_bytes ? 0 : startup?.bytes) ?? 0
+      bytes += parked ? measured?.bytes ?? (pool === 'unified' ? d.parked?.bytes ?? 0 : 0)
+        : pool === 'gpu' ? (startup?.device_bytes ?? startup?.bytes ?? 0) / devices.length
+        : pool === 'ram' ? startup?.host_bytes ?? (startup?.device_bytes ? 0 : startup?.bytes) ?? 0
         : startup?.bytes ?? 0;
     }
     return bytes > 0 ? [{ id: `${d.id}:${parked ? 'parked' : 'active'}`, name: d.name, bytes, parked, colour: colour % 6 }] : [];

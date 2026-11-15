@@ -4,7 +4,7 @@ import { get } from 'svelte/store';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { reloadSnapshot, snapshot as snapshotStore } from '../src/lib/state';
 import { cursor, json, managementError } from './helpers';
-import { button, deployment, DEPLOYMENT_ID, instance, open, role, setUp, snapshotWith, tearDown, tick } from './fixtures';
+import { button, deployment, DEPLOYMENT_ID, instance, open, role, setUp, snapshotWith, STANDALONE_HOST, tearDown, tick } from './fixtures';
 
 beforeEach(setUp);
 afterEach(tearDown);
@@ -45,6 +45,31 @@ describe('Overview', () => {
       ['GPU GPU-0', '16.0 of 24.0 GiB'],
       ['Host RAM', '32.0 of 64.0 GiB'],
     ]);
+  });
+
+  // SPEC R10, R15 (found live 2026-11-14): VRAM and host RAM are separate
+  // pools; adding them made a 16 GB card read as 77 GiB of memory.
+  it('reports GPU memory and host RAM separately in the status line', async () => {
+    role({ snapshots: [snapshotWith([])] });
+    await open('/');
+    const status = document.querySelector('.status-line')?.textContent ?? '';
+    expect(status).toContain('8.0 GiB GPU free of 24.0 GiB · 32.0 GiB RAM free of 64.0 GiB');
+    expect(status).not.toContain('free of 88.0 GiB');
+  });
+
+  // SPEC R10: a unified-memory host (no GPU domain, e.g. a GB10) has one pool
+  // that the GPU and the CPU share.
+  it('shows one unified pool on a host with no GPU domain', async () => {
+    const unified = { ...STANDALONE_HOST, session: { ...STANDALONE_HOST.session, domains: [
+      { domain_id: 'system', kind: 'system', capacity_bytes: 128 * 1024 ** 3, available_bytes: 96 * 1024 ** 3 },
+    ] } };
+    role({ snapshots: [snapshotWith([])], route: (call) => (call.url === '/management/v1/hosts' ? json({ api_version: '1', hosts: [unified] }) : undefined) });
+    await open('/');
+    const meters = Array.from(document.querySelectorAll('[role="meter"]'), (m) => m.getAttribute('aria-label'));
+    expect(meters).toEqual(['Unified memory (GPU and CPU)']);
+    const status = document.querySelector('.status-line')?.textContent ?? '';
+    expect(status).toContain('96.0 GiB GPU free of 128.0 GiB');
+    expect(status).not.toContain('RAM free');
   });
 
   // SPEC R11, AE4 (plan KTD8): recovery must not restore an older snapshot.

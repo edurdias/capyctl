@@ -227,8 +227,8 @@ capyctl park deployment <name>
 
 ```text
 $ capyctl list hosts
-NAME      STATE    ELIGIBLE   VERSION   COMPATIBILITY   MEMORY (FREE / TOTAL)   ENGINES
-gpu-box   online   yes        0.1.12    supported       46.5 GiB / 77.2 GiB     vllm
+NAME      STATE    ELIGIBLE   VERSION   COMPATIBILITY   GPU (FREE / TOTAL)    RAM (FREE / TOTAL)    ENGINES
+gpu-box   online   yes        0.1.12    supported       12.3 GiB / 16.0 GiB   34.2 GiB / 61.2 GiB   vllm
 
 $ capyctl list deployments
 NAME           STATE    READY   REVISION   HOSTS

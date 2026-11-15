@@ -7,16 +7,16 @@
   import { readHosts, readLoad, type HostRow, type LoadReport } from '../../lib/reads';
   import { href, link } from '../../lib/router';
   import { snapshot } from '../../lib/state';
-  import { gib } from '../../lib/presentation';
+  import { gib, memoryTotals } from '../../lib/presentation';
 
   // SPEC R10, F3: host memory, the models with their states and actions, and
   // recent activity, live from the snapshot, the event stream and the
   // load and host reads.
   let hosts = $state<HostRow[] | null>(null);
   let load = $state<LoadReport | null>(null);
-  const domains = $derived((hosts ?? []).filter((h) => !h.revoked && h.online).flatMap((h) => h.session?.domains ?? []).filter((d) => d.capacity_bytes > 0 && d.available_bytes >= 0));
-  const free = $derived(domains.reduce((sum, d) => sum + d.available_bytes, 0));
-  const capacity = $derived(domains.reduce((sum, d) => sum + d.capacity_bytes, 0));
+  // SPEC R10, R15: GPU memory and host RAM stay separate (presentation.ts `memoryPool`).
+  const memory = $derived(memoryTotals((hosts ?? []).filter((h) => !h.revoked && h.online).map((h) => h.session?.domains ?? [])));
+  const memoryText = $derived(`${gib(memory.gpuFree)} GPU free of ${gib(memory.gpuCapacity)}${memory.ramCapacity > 0 ? ` · ${gib(memory.ramFree)} RAM free of ${gib(memory.ramCapacity)}` : ''}`);
   const count = (state: string) => $snapshot?.deployments.filter((d) => d.observed_state === state).length ?? 0;
 
   onMount(() =>
@@ -28,7 +28,7 @@
 
 <section class="overview">
   <h1>Overview</h1>
-  <p class="status-line">{`${hosts?.filter((h) => !h.revoked).length ?? '–'} host${hosts?.filter((h) => !h.revoked).length === 1 ? '' : 's'} · `}<span class="online">{hosts?.filter((h) => h.online && !h.revoked).length ?? '–'} online</span>{` · ${gib(free)} free of ${gib(capacity)} · ${count('ready')} ready · ${count('parked')} parked · ${count('stopped')} stopped`}{#if count('failed')}<span class="failed">{` · ${count('failed')} failed`}</span>{/if}{` · ${load?.deployments.reduce((sum, d) => sum + d.router.in_flight, 0) ?? '–'} in flight`}</p>
+  <p class="status-line">{`${hosts?.filter((h) => !h.revoked).length ?? '–'} host${hosts?.filter((h) => !h.revoked).length === 1 ? '' : 's'} · `}<span class="online">{hosts?.filter((h) => h.online && !h.revoked).length ?? '–'} online</span>{` · ${memoryText} · ${count('ready')} ready · ${count('parked')} parked · ${count('stopped')} stopped`}{#if count('failed')}<span class="failed">{` · ${count('failed')} failed`}</span>{/if}{` · ${load?.deployments.reduce((sum, d) => sum + d.router.in_flight, 0) ?? '–'} in flight`}</p>
 
   <h2>Hosts</h2>
   {#if hosts === null}
