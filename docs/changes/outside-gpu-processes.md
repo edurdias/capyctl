@@ -6,7 +6,7 @@ T16/T26/T29/T34 coverage includes fixture process trees, a CapyCTL ancestor two 
 
 Rustfmt and clippy for the touched crates (`--all-targets --locked`, warnings denied) also passed.
 
-The ignored, read-only live sampler test found PID 1094140 holding 13,553,893,376 bytes (12.6 GiB), identified another CapyCTL and its Shardio state directory, and also listed the demo's engine as another installation. Linux `comm` reports the scheduler's name as `sglang::schedul`; no engine arguments were used to expand it. CPU and Fake-engine tests are not qualification; this live check qualifies only the read-only observation, not a new engine recipe. No process was signalled for the live check and neither running installation was changed.
+The ignored, read-only live sampler test found PID 1094140 holding 13,553,893,376 bytes (12.6 GiB), identified another CapyCTL and its state directory, and also listed the demo's engine as another installation. Linux `comm` reports the scheduler's name as `sglang::schedul`; no engine arguments were used to expand it. CPU and Fake-engine tests are not qualification; this live check qualifies only the read-only observation, not a new engine recipe. No process was signalled for the live check and neither running installation was changed.
 
 # Release note: Memory
 
