@@ -69,6 +69,12 @@ became harder to audit than the code they described.
   move the report to the slice's `archive/` directory.
 - **Prose is normal English**, in documents and commit messages, regardless of
   chat style settings.
+- **Keep published material neutral.** Never name the downstream platforms,
+  services or customers that run CapyCTL, or their internal identifiers
+  (recipe, build or node IDs), in tracked files, test fixtures, commit
+  messages, pull request titles and bodies, issues or release notes. Describe
+  such a setup by what it is ("another CapyCTL installation", "a production
+  SGLang recipe") and give its flags or numbers.
 - Local working notes (per-unit reports, review ledgers) are gitignored, so
   anything written there is unrecoverable once removed. Archive rather than delete.
 

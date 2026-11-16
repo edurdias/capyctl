@@ -624,14 +624,14 @@ mod tests {
         fixture_process(root.path(), 10, 11, "sglang::scheduler", None);
         fixture_process(root.path(), 11, 12, "python", None);
         fixture_process(root.path(), 12, 1, "capyctl", Some(
-            b"/usr/local/bin/capyctl\0--state-dir\0/home/owner/shardio\0--api-key\0SECRET\0start\0standalone\0",
+            b"/usr/local/bin/capyctl\0--state-dir\0/home/owner/other-capyctl\0--api-key\0SECRET\0start\0standalone\0",
         ));
         let sample = outside_processes(&[(10, "gpu0".into(), 12800 << 20)], root.path(), 999);
         let process = &sample["gpu0"].processes[0];
         assert_eq!(process.name.as_deref(), Some("sglang::scheduler"));
         assert_eq!(
             process.capyctl_state_dir.as_deref(),
-            Some("/home/owner/shardio")
+            Some("/home/owner/other-capyctl")
         );
         assert!(process.other_capyctl);
         assert!(!serde_json::to_string(process).unwrap().contains("SECRET"));
