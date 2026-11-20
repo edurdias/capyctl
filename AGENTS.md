@@ -177,6 +177,15 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     Its `environment-fingerprint.json` records Python 3.12.3, capyctl-extract
     0.1.0, torch 2.14.1+cu130, torchvision 0.29.1+cu130, transformers 5.22.1,
     peft 0.21.2, pillow 13.0.0, flash-linear-attention 0.6.0 and fla-core 0.6.0;
+  - host B, for measuring CapyCTL's extraction model (owner approvals November
+    2026): the evaluation environment ~/capyctl-extract-eval-venv, a copy of
+    ~/capyctl-extract-train-venv plus pdfplumber 0.11.9, reportlab 5.1.0 and their
+    dependencies (cffi, charset-normalizer, cryptography, pdfminer.six, pycparser,
+    pypdfium2), used for the benchmark; and ~/vllm-0.32.0-extract-venv (approved
+    2026-11-19), a byte-for-byte copy of host A's ~/vllm-0.32.0-venv with only the
+    extraction patch and its inference package added, for qualifying vLLM serving of
+    the extraction model; its fingerprint and patch hash are in capyctl-extract's
+    `docs/plans/vllm-serving.md`;
   - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B;
   - the rented two-GPU machine of ADR 0035 §14 (owner decision 2026-10-25), for
     its one session only: fresh x86_64 CUDA installs of vLLM 0.32.0
@@ -197,6 +206,11 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   approval in principle 2026-11-04, ADR 0041 §9): its GPU model, session length
   and the script that sets it up and removes everything it created come back to
   the owner before anything is rented; the rules above apply to it.
+- Two rented H100 80 GB machines (Massed Compute through Shade, owner decision
+  2026-11-20), for one session of the extraction model's vLLM qualification only:
+  fresh HOME-only x86_64 installs of vLLM 0.32.0 with the extraction patch and of
+  the model's reference runtime, with a $40 spend cap. Both were deleted on
+  2026-11-20 after $29.94 of spend.
 - Only one live session runs on the hosts at a time.
 - Fault injection is limited to signals sent to CapyCTL-owned processes (PIDs taken
   from ownership evidence) and one bounded external memory allocation. Never change
