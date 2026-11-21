@@ -1,6 +1,6 @@
-# Status: Inkling 2 Mini engine environment approved on host A — 2026-11-20 (branch `docs/approve-inkling-env`)
+# Status: Inkling 2 Mini engine environments approved on the lab hosts — 2026-11-20 (branch `docs/approve-inkling-env`)
 
-Owner decision, 2026-11-20: host A may get a new engine environment for
+Owner decision, 2026-11-20: host A and host B may get a new engine environment for
 Thinking Machines' Inkling 2 Mini, SGLang built from PR #51926 (commit
 `92e894ef`, the first SGLang source with this model and SM121 kernels), in
 `~/sglang-inkling-pr51926-venv`, made by the capyctl-recipes Inkling

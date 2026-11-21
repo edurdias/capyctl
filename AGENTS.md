@@ -163,7 +163,7 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     `lmsysorg/sglang:v0.5.22` Docker image, for the live check of #230 (an editable
     SGLang refused at `engine add`); removed after that check, to be pulled again for
     #235's;
-  - host A, approved 2026-11-20, for Thinking Machines' Inkling 2 Mini: SGLang
+  - host A and host B, approved 2026-11-20, for Thinking Machines' Inkling 2 Mini: SGLang
     built from PR #51926 (commit 92e894ef, the first SGLang source with the model
     and SM121 kernels) in ~/sglang-inkling-pr51926-venv, with its Rust toolchain
     and caches inside the venv, made by the capyctl-recipes Inkling comparison's
