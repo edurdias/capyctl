@@ -168,7 +168,10 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     and SM121 kernels) in ~/sglang-inkling-pr51926-venv, with its Rust toolchain
     and caches inside the venv, made by the capyctl-recipes Inkling comparison's
     `install.sh`; the owner also approved a loader patch in that venv only, so
-    attention projections can load as FP8 for a requantized checkpoint;
+    attention projections can load as FP8 for a requantized checkpoint; and, for
+    reproducing a published community recipe as written, vLLM's
+    `vllm/vllm-openai:inkling-2-mini` Docker image pinned by digest
+    (`sha256:c2dc759f…`, a 0.35 pre-release);
   - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B;
   - the rented two-GPU machine of ADR 0035 §14 (owner decision 2026-10-25), for
     its one session only: fresh x86_64 CUDA installs of vLLM 0.32.0
