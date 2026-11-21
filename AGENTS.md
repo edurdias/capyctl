@@ -130,7 +130,7 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   above (no new environments beyond the listed exceptions) still apply to the lab
   hosts.
 - Do not change engine environments, drivers, or reboot hosts. The engine virtual
-  environments in use, all owner-approved (list updated 2026-11-09):
+  environments in use, all owner-approved (list updated 2026-11-20):
   - both hosts: SGLang 0.5.21, SGLang 0.5.22 (approved 2026-10-17, for decision
     models), vLLM 0.30.0, TensorFold 0.6.5 and TensorFold 0.6.6
     (on host B, each TensorFold venv is a byte-identical copy of host A's, made with
@@ -163,6 +163,15 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     `lmsysorg/sglang:v0.5.22` Docker image, for the live check of #230 (an editable
     SGLang refused at `engine add`); removed after that check, to be pulled again for
     #235's;
+  - host A and host B, approved 2026-11-20, for Thinking Machines' Inkling 2 Mini: SGLang
+    built from PR #51926 (commit 92e894ef, the first SGLang source with the model
+    and SM121 kernels) in ~/sglang-inkling-pr51926-venv, with its Rust toolchain
+    and caches inside the venv, made by the capyctl-recipes Inkling comparison's
+    `install.sh`; the owner also approved a loader patch in that venv only, so
+    attention projections can load as FP8 for a requantized checkpoint; and, for
+    reproducing a published community recipe as written, vLLM's
+    `vllm/vllm-openai:inkling-2-mini` Docker image pinned by digest
+    (`sha256:c2dc759f…`, a 0.35 pre-release);
   - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B;
   - the rented two-GPU machine of ADR 0035 §14 (owner decision 2026-10-25), for
     its one session only: fresh x86_64 CUDA installs of vLLM 0.32.0
