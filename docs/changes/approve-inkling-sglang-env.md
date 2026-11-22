@@ -1,4 +1,4 @@
-# Status: Inkling 2 Mini engine environments approved on the lab hosts — 2026-11-20 (branch `docs/approve-inkling-env`)
+# Status: Inkling 2 Mini, Qwen3.5-9B and 16 GB laptop environments approved — 2026-11-21 (branch `docs/approve-inkling-env`)
 
 Owner decision, 2026-11-20: host A and host B may get a new engine environment for
 Thinking Machines' Inkling 2 Mini, SGLang built from PR #51926 (commit
@@ -9,10 +9,19 @@ The owner also approved a loader patch in that venv only, so attention
 projections can load as FP8 for a requantized checkpoint, and the use of vLLM's
 `vllm/vllm-openai:inkling-2-mini` Docker image pinned by digest
 (`sha256:c2dc759f…`, a 0.35 pre-release) to reproduce a published community
-recipe as written. No approved release
-of SGLang, vLLM or llama.cpp supports the model yet. AGENTS.md's list of
-approved environments records both. Documentation only; no code or tests
-changed. CPU and Fake-engine tests are not qualification; the environment is
-qualified by the comparison's live runs.
+recipe as written. No approved release of SGLang, vLLM or llama.cpp supports
+the model yet.
+
+Owner decisions, 2026-11-21: host A may get an isolated llm-compressor
+environment (`~/llmcompressor-venv`) as a checkpoint builder only, for a
+Qwen3.5-9B INT4 checkpoint in the compressed-tensors format (ModelOpt 0.47.0's
+INT4 export does not load in the approved SGLang or vLLM); and the maintainer's
+laptop may get SGLang 0.5.22 in a home-directory venv (`~/sglang-0.5.22-venv`)
+for qualifying 16 GB recipes, with the laptop's own node engine stopped while
+testing.
+
+AGENTS.md's list of approved environments records all of them. Documentation
+only; no code or tests changed. CPU and Fake-engine tests are not
+qualification; each environment is qualified by the live runs that use it.
 
 # Release note: none
