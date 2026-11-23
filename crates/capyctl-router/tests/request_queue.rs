@@ -64,6 +64,12 @@ fn refuse(what: &str) -> LifecycleFault {
 
 #[async_trait::async_trait]
 impl capyctl_controller::LifecyclePort for Authority {
+    fn deployment_inputs(
+        &self,
+        _: &str,
+    ) -> Result<Vec<capyctl_config::extractions::InputKind>, LifecycleFault> {
+        Ok(Vec::new())
+    }
     fn deployment_field_types(
         &self,
         _: &str,
@@ -83,6 +89,7 @@ impl capyctl_controller::LifecyclePort for Authority {
             id: ROUTE.into(),
             api: capyctl_config::effective::DeploymentApi::Chat,
             field_types: Vec::new(),
+            inputs: Vec::new(),
         }])
     }
     fn deployment_api(

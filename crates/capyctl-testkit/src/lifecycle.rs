@@ -381,9 +381,15 @@ impl LifecycleState {
                 if let Some((declared, answer)) = &self.extractions {
                     // ADR 0041 §4: a wake never falls back to a chat completion.
                     self.extraction_probes += 1;
-                    let request = capyctl_adapters::extraction_probe::request("fake", declared);
+                    let request = capyctl_adapters::extraction_probe::request(
+                        "fake",
+                        declared,
+                        &capyctl_config::extractions::InputKind::ALL,
+                    );
                     capyctl_adapters::extraction_request::validate_extraction_request(
-                        &request, declared,
+                        &request,
+                        declared,
+                        &capyctl_config::extractions::InputKind::ALL,
                     )
                     .map_err(|e| RuntimeError::Uncertain(e.to_string()))?;
                     capyctl_adapters::extraction_probe::well_formed(answer, declared)
@@ -422,9 +428,15 @@ impl LifecycleState {
                 // ADR 0041 §4: Initialize must prove the declared extraction types.
                 self.extraction_probes += 1;
                 self.work_sequence += 1;
-                let request = capyctl_adapters::extraction_probe::request(&model, declared);
+                let request = capyctl_adapters::extraction_probe::request(
+                    &model,
+                    declared,
+                    &capyctl_config::extractions::InputKind::ALL,
+                );
                 capyctl_adapters::extraction_request::validate_extraction_request(
-                    &request, declared,
+                    &request,
+                    declared,
+                    &capyctl_config::extractions::InputKind::ALL,
                 )
                 .map_err(|e| RuntimeError::Uncertain(e.to_string()))?;
                 let answer = capyctl_adapters::extraction_probe::well_formed(answer, declared)
@@ -574,7 +586,11 @@ mod tests {
             assert_eq!(engine.extraction_requests(), 1);
             assert_eq!(engine.chat_requests(), 0);
         }
-        let body = capyctl_adapters::extraction_probe::request("fake", &[FieldType::Text]);
+        let body = capyctl_adapters::extraction_probe::request(
+            "fake",
+            &[FieldType::Text],
+            &capyctl_config::extractions::InputKind::ALL,
+        );
         assert!(engine.forward_extraction(&body.into()).await.is_err());
         assert_eq!(engine.extraction_requests(), 2);
     }

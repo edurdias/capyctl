@@ -120,6 +120,57 @@ fn manifest_types_are_closed_and_required_only_for_extractions() {
         assert!(CustomManifest::from_value(input).is_err());
     }
 }
+
+// T50: input sets survive freezing, preserve omitted digests, and are closed.
+#[test]
+fn extraction_inputs_are_canonical_frozen_and_backward_compatible() {
+    use capyctl_config::extractions::InputKind;
+    let legacy = CustomManifest::from_value(manifest("extractions")).unwrap();
+    assert_eq!(legacy.extraction_inputs(), InputKind::ALL);
+    assert!(serde_json::to_value(&legacy)
+        .unwrap()
+        .get("inputs")
+        .is_none());
+    let mut declared = manifest("extractions");
+    declared["inputs"] = json!(["pdf", "text", "image"]);
+    let parsed = CustomManifest::from_value(declared.clone()).unwrap();
+    assert_eq!(parsed.inputs.as_deref(), Some(InputKind::ALL.as_slice()));
+    declared["inputs"] = json!(["image", "pdf", "text"]);
+    assert_eq!(
+        parsed.digest(),
+        CustomManifest::from_value(declared).unwrap().digest()
+    );
+    assert_ne!(parsed.digest(), legacy.digest());
+    let (deployment, mut host) = fixture("extractions");
+    let mut text_only = manifest("extractions");
+    text_only["inputs"] = json!(["text"]);
+    let profile = CustomProfile::new(CustomManifest::from_value(text_only).unwrap());
+    host["runtime_profiles"]["local"]["custom"] = serde_json::to_value(profile).unwrap();
+    let effective = resolve(&deployment, &host).unwrap();
+    let frozen = decode_effective_snapshot(&serde_json::to_string(&effective).unwrap()).unwrap();
+    assert_eq!(
+        frozen.profile.custom.unwrap().manifest.extraction_inputs(),
+        [InputKind::Text]
+    );
+    for inputs in [
+        Value::Null,
+        json!([]),
+        json!(["text", "text"]),
+        json!(["audio"]),
+    ] {
+        let mut invalid = manifest("extractions");
+        invalid["inputs"] = inputs;
+        assert_eq!(
+            CustomManifest::from_value(invalid).unwrap_err().code,
+            "custom_manifest_invalid"
+        );
+    }
+    for api in ["chat", "decisions", "embeddings"] {
+        let mut invalid = manifest(api);
+        invalid["inputs"] = json!(["text"]);
+        assert!(CustomManifest::from_value(invalid).is_err());
+    }
+}
 // T50: extraction documents cannot request topology, parking, or parsers.
 #[test]
 fn extraction_scope_is_refused_before_resolution() {
@@ -225,7 +276,11 @@ fn custom_engines_file_loads_and_round_trips_extraction_profiles() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join(CUSTOM_ENGINES_FILE);
     let (_, host) = fixture("extractions");
-    let profile = host["runtime_profiles"]["local"].clone();
+    let mut profile = host["runtime_profiles"]["local"].clone();
+    let mut custom = CustomProfile::from_value(&profile["custom"]).unwrap();
+    custom.manifest.inputs = Some(vec![capyctl_config::extractions::InputKind::Text]);
+    custom = CustomProfile::new(custom.manifest);
+    profile["custom"] = serde_json::to_value(custom).unwrap();
     let source = json!({
         "schema_version": 1,
         "kind": "custom_engines",
@@ -242,6 +297,10 @@ fn custom_engines_file_loads_and_round_trips_extraction_profiles() {
     let merged = EnginesFile::load_with_custom(&directory.path().join(ENGINES_FILE)).unwrap();
     assert_eq!(merged.profiles["extract"], profile);
     let stored = CustomProfile::from_value(&merged.profiles["extract"]["custom"]).unwrap();
+    assert_eq!(
+        stored.manifest.extraction_inputs(),
+        [capyctl_config::extractions::InputKind::Text]
+    );
     assert_eq!(
         stored.manifest.field_types,
         Some(vec![

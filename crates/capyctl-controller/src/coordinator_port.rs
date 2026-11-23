@@ -972,6 +972,14 @@ impl LifecyclePort for CoordinatorLifecycle {
             .read(|store| store.deployment_field_types(deployment))
     }
 
+    fn deployment_inputs(
+        &self,
+        deployment: &str,
+    ) -> Result<Vec<capyctl_config::extractions::InputKind>, LifecycleFault> {
+        self.commands
+            .read(|store| store.deployment_inputs(deployment))
+    }
+
     fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, LifecycleFault> {
         self.commands.read(|store| store.get_deployment(id))
     }

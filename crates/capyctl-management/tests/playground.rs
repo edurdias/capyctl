@@ -583,10 +583,17 @@ impl capyctl_controller::LifecyclePort for Authority {
             id: "chat".into(),
             api: self.api,
             field_types: Vec::new(),
+            inputs: Vec::new(),
         }])
     }
     fn deployment_api(&self, _: &str) -> Result<DeploymentApi, LifecycleFault> {
         Ok(self.api)
+    }
+    fn deployment_inputs(
+        &self,
+        _: &str,
+    ) -> Result<Vec<capyctl_config::extractions::InputKind>, LifecycleFault> {
+        Ok(Vec::new())
     }
     fn deployment_field_types(
         &self,

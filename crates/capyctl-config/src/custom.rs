@@ -196,6 +196,13 @@ pub struct CustomManifest {
         deserialize_with = "deserialize_field_types"
     )]
     pub field_types: Option<Vec<crate::extractions::FieldType>>,
+    /// ADR 0041 §2: omission preserves existing manifests and accepts all inputs.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_inputs"
+    )]
+    pub inputs: Option<Vec<crate::extractions::InputKind>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -251,7 +258,25 @@ fn deserialize_field_types<'de, D: serde::Deserializer<'de>>(
     Ok(Some(types))
 }
 
+fn deserialize_inputs<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<crate::extractions::InputKind>>, D::Error> {
+    let mut inputs = Vec::<crate::extractions::InputKind>::deserialize(deserializer)?;
+    inputs.sort_unstable();
+    Ok(Some(inputs))
+}
+
 impl CustomManifest {
+    /// ADR 0041 §2: old frozen manifests retain their accepted source kinds.
+    pub fn extraction_inputs(&self) -> &[crate::extractions::InputKind] {
+        if self.api != DeploymentApi::Extractions {
+            return &[];
+        }
+        self.inputs
+            .as_deref()
+            .unwrap_or(&crate::extractions::InputKind::ALL)
+    }
+
     /// ADR 0031 §2: read a manifest file's text: YAML (duplicate keys
     /// refused), at most 64 KiB, closed, then [`Self::validate`]d.
     pub fn parse(text: &str) -> Result<Self, ManifestError> {
@@ -319,6 +344,23 @@ impl CustomManifest {
                 ))
             }
             (_, None) => {}
+        }
+        if let Some(inputs) = &self.inputs {
+            if self.api != DeploymentApi::Extractions {
+                return Err(ManifestError::invalid(
+                    "`inputs` is only accepted with api: extractions",
+                ));
+            }
+            if inputs.is_empty()
+                || inputs
+                    .iter()
+                    .enumerate()
+                    .any(|(index, input)| inputs[..index].contains(input))
+            {
+                return Err(ManifestError::invalid(
+                    "`inputs` must contain non-empty, distinct input kinds",
+                ));
+            }
         }
         if let Some(version) = &self.version {
             if version.trim().is_empty()
@@ -541,6 +583,9 @@ impl CustomProfile {
         // ADR 0041 §2: normalize hand-built manifests before profile identity.
         if let Some(types) = &mut manifest.field_types {
             types.sort_unstable();
+        }
+        if let Some(inputs) = &mut manifest.inputs {
+            inputs.sort_unstable();
         }
         let manifest_digest = manifest.digest();
         Self {

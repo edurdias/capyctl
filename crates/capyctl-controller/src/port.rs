@@ -144,6 +144,11 @@ pub trait LifecyclePort: Send + Sync {
         deployment: &str,
     ) -> Result<Vec<capyctl_config::extractions::FieldType>, LifecycleFault>;
 
+    fn deployment_inputs(
+        &self,
+        deployment: &str,
+    ) -> Result<Vec<capyctl_config::extractions::InputKind>, LifecycleFault>;
+
     /// One deployment's current record.
     fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, LifecycleFault>;
 
@@ -473,6 +478,16 @@ impl LifecyclePort for Controller {
             .lock()
             .unwrap()
             .deployment_field_types(deployment)
+            .map_err(Into::into)
+    }
+    fn deployment_inputs(
+        &self,
+        deployment: &str,
+    ) -> Result<Vec<capyctl_config::extractions::InputKind>, LifecycleFault> {
+        self.store_ref()
+            .lock()
+            .unwrap()
+            .deployment_inputs(deployment)
             .map_err(Into::into)
     }
     fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, LifecycleFault> {

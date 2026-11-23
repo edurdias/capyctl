@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use capyctl_config::effective::DeploymentApi;
-use capyctl_config::extractions::FieldType;
+use capyctl_config::extractions::{FieldType, InputKind};
 use capyctl_controller::{LeaseEnd, LeaseRefused, LifecycleFault, RequestLease};
 use capyctl_router::{QueueLimits, RouterDeps};
 use serde_json::{json, Value};
@@ -26,6 +26,7 @@ struct Authority {
     endpoint: String,
     leases: Mutex<Vec<Option<LeaseEnd>>>,
     field_types: Vec<FieldType>,
+    inputs: Vec<InputKind>,
 }
 
 impl Authority {
@@ -57,6 +58,9 @@ fn refuse(what: &str) -> LifecycleFault {
 
 #[async_trait::async_trait]
 impl capyctl_controller::LifecyclePort for Authority {
+    fn deployment_inputs(&self, _: &str) -> Result<Vec<InputKind>, LifecycleFault> {
+        Ok(self.inputs.clone())
+    }
     fn find_deployment_by_route(
         &self,
         route: &str,
@@ -70,6 +74,7 @@ impl capyctl_controller::LifecyclePort for Authority {
             id: ROUTE.into(),
             api: self.api,
             field_types: self.field_types.clone(),
+            inputs: self.inputs.clone(),
         }])
     }
     fn deployment_api(&self, deployment: &str) -> Result<DeploymentApi, LifecycleFault> {
@@ -271,6 +276,7 @@ fn stack(api: DeploymentApi, endpoint: &str) -> (Arc<Authority>, RouterDeps, axu
         endpoint: endpoint.into(),
         leases: Mutex::new(Vec::new()),
         field_types: FieldType::ALL.to_vec(),
+        inputs: InputKind::ALL.to_vec(),
     });
     let port = authority.clone() as Arc<dyn capyctl_controller::LifecyclePort>;
     let deps = RouterDeps {
@@ -529,6 +535,7 @@ async fn invalid_extractions_never_activate_or_lease() {
         endpoint,
         leases: Mutex::new(Vec::new()),
         field_types: vec![FieldType::Text],
+        inputs: InputKind::ALL.to_vec(),
     });
     let port = authority.clone() as Arc<dyn capyctl_controller::LifecyclePort>;
     deps.controller = port.clone();
@@ -645,6 +652,10 @@ async fn discovery_names_extractions_and_canonical_types_without_activation() {
     assert_eq!(body["data"][0]["id"], ROUTE);
     assert_eq!(body["data"][0]["capyctl"]["api"], "extractions");
     assert_eq!(
+        body["data"][0]["capyctl"]["inputs"],
+        json!(["text", "image", "pdf"])
+    );
+    assert_eq!(
         body["data"][0]["capyctl"]["field_types"],
         json!([
             "text", "number", "date", "time", "datetime", "duration", "list", "estimate",
@@ -683,4 +694,63 @@ async fn extraction_responses_preserve_request_ids() {
         }
     }
     assert_eq!(authority.ends(), vec![Some(LeaseEnd::Completed)]);
+}
+
+// T50: input declarations refuse unsupported sources before lifecycle work.
+#[tokio::test]
+async fn frozen_inputs_gate_media_before_activation_and_dispatch() {
+    let (endpoint, seen) =
+        engine(Reply::Answer(200, "application/json", answer().to_string())).await;
+    for inputs in [
+        vec![InputKind::Text],
+        vec![InputKind::Image, InputKind::Pdf],
+    ] {
+        let (_, mut deps, _) = stack(DeploymentApi::Extractions, &endpoint);
+        let authority = Arc::new(Authority {
+            api: DeploymentApi::Extractions,
+            ready: AtomicBool::new(false),
+            activations: AtomicUsize::new(0),
+            endpoint: endpoint.clone(),
+            leases: Mutex::new(Vec::new()),
+            field_types: FieldType::ALL.to_vec(),
+            inputs: inputs.clone(),
+        });
+        let port = authority.clone() as Arc<dyn capyctl_controller::LifecyclePort>;
+        deps.controller = port.clone();
+        deps.forwards = Arc::new(capyctl_router::forwarders::LiveForwarders::new(port));
+        let router = capyctl_router::serve_router(deps);
+        let mut text = extraction_body();
+        text.as_object_mut().unwrap().remove("images");
+        let mut image = text.clone();
+        image["state"] = json!("");
+        image["images"] = json!(["data:image/png;base64,AAAA"]);
+        let mut mixed = image.clone();
+        mixed["state"] = json!("Paid 12.50 USD");
+        let mut pdf = text.clone();
+        pdf["state"] = json!("invoice");
+        pdf["assets"] = json!({"invoice": {"format": "pdf", "data_base64": "JVBERi0="}});
+        let rejected = if inputs == vec![InputKind::Text] {
+            vec![image, mixed, pdf]
+        } else {
+            vec![text.clone()]
+        };
+        for sent in rejected {
+            let (status, body) = decide(&router, &sent).await;
+            assert_eq!(status, 400, "{body}");
+            assert_eq!(body["code"], "input_unsupported", "{body}");
+        }
+        assert_eq!(authority.activations.load(Ordering::SeqCst), 0);
+        assert!(authority.ends().is_empty());
+        assert!(seen.lock().unwrap().is_empty());
+        let (status, discovery) = send(&router, "/v1/models", Vec::new()).await;
+        assert_eq!(status, 200);
+        assert_eq!(discovery["data"][0]["capyctl"]["inputs"], json!(inputs));
+        if inputs == vec![InputKind::Text] {
+            let (status, body) = decide(&router, &text).await;
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(authority.activations.load(Ordering::SeqCst), 1);
+            assert_eq!(seen.lock().unwrap().len(), 1);
+            seen.lock().unwrap().clear();
+        }
+    }
 }

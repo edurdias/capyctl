@@ -167,7 +167,7 @@ async fn add_custom_reports_the_extraction_field_types_for_confirmation() {
         dir.path(),
         &MANIFEST.replace(
             "api: decisions",
-            "api: extractions\nfield_types: [number, text]",
+            "api: extractions\nfield_types: [number, text]\ninputs: [text]",
         ),
     );
     let (_role, _stop) = role(&document, json!({"ok": true, "published": "published"})).await;
@@ -180,6 +180,7 @@ async fn add_custom_reports_the_extraction_field_types_for_confirmation() {
     .unwrap();
     assert_eq!(out["api"], "extractions");
     assert_eq!(out["field_types"], json!(["text", "number"]));
+    assert_eq!(out["inputs"], json!(["text"]));
     assert!(!marker.exists(), "confirmation must not execute the engine");
 }
 

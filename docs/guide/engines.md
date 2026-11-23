@@ -697,6 +697,7 @@ health: /health
 | `kind`, `schema_version` | `custom_engine` and `1`. | yes |
 | `api` | What every deployment on the engine serves: `chat` (`POST /v1/chat/completions`), `decisions` (`POST /v1/systemone`, `questions`), `embeddings` (`POST /v1/embeddings`) or `extractions` (`POST /v1/systemone`, `fields`; [Extraction models](deploy.md#extraction-models)). | yes |
 | `field_types` | Non-empty, distinct types from `text`, `number`, `date`, `time`, `datetime`, `duration`, `list`, `estimate`, `forecast`. Required for `extractions`, refused for other APIs (`custom_manifest_invalid`). Stored in this canonical order; changing the set changes the digest and creates a new profile. `list` covers text, number and date items. | only extractions |
+| `inputs` | Accepted extraction source kinds: a non-empty, distinct subset of `text`, `image`, `pdf`, stored in that order. Optional for `extractions` (defaults to all three), refused for other APIs. Unknown kinds are refused with `custom_manifest_invalid`. An explicit declaration is digested and frozen; omitting it preserves existing digests. | no |
 | `args` | The whole argument list after the executable, with placeholders (below). | yes |
 | `version` | A version string, shown as the engine's version. Without it the engine shows `unversioned`. CapyCTL never runs the program to ask. | no |
 | `environment` | An absolute directory to fingerprint in place of the default ([Fingerprint and drift](#fingerprint-and-drift)). | no |
@@ -890,7 +891,8 @@ A custom engine is ready when, in order, its port accepts a connection, its
 the same check as on any engine: a short chat request for `chat`, the fixed
 decision for `decisions` ([Decision models](deploy.md#decision-models)), the
 fixed embedding for `embeddings` ([Embedding models](deploy.md#embedding-models)),
-or the fixed extraction of the declared types for `extractions`
+or the fixed extraction of the declared types using a declared input kind
+(text preferred, otherwise a fixed image or PDF source) for `extractions`
 ([Extraction models](deploy.md#the-readiness-extraction)), sent
 with the served name and the engine key when there is one. The engine's own
 `/v1/models` is not read; its shape differs from program to program. Without
@@ -1052,6 +1054,7 @@ kind: custom_engine
 schema_version: 1
 api: extractions
 field_types: [text, number, date, time, datetime, duration, list, estimate, forecast]
+inputs: [text, image, pdf]
 args: [serve, "{model_dir}", --host, "{host}", --port, "{port}", --served-model-name, "{served_name}", --max-model-len, "{context_length}"]
 health: /health
 ```
@@ -1063,8 +1066,11 @@ capyctl engine add --custom ~/venvs/vllm-extraction/bin/vllm \
   --name vllm-extraction --manifest vllm-extraction.yaml
 ```
 
-The confirmation shows `field_types` beside `api`, so the administrator
-approves both. **Before downgrading** to a release without extraction
+The confirmation shows `field_types` and effective `inputs` beside `api`, so
+the administrator approves both output types and input support. Discovery shows
+the input kinds as `capyctl.inputs`; undeclared kinds are refused before activation.
+Readiness is not live qualification of every declared input kind.
+**Before downgrading** to a release without extraction
 support, remove every extraction engine with `capyctl engine remove`.
 Older releases strictly read `custom-engines.yaml` and refuse the whole
 file if a manifest contains `field_types`, preventing role startup.

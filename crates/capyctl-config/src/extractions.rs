@@ -8,6 +8,27 @@ use serde_json::Value;
 pub const HOST_CAPABILITY: &str = "extractions";
 pub const CAPABILITY_MISSING: &str = "capability_missing:extractions";
 
+/// ADR 0041 §2: accepted source kinds, in canonical manifest order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputKind {
+    Text,
+    Image,
+    Pdf,
+}
+
+impl InputKind {
+    pub const ALL: [Self; 3] = [Self::Text, Self::Image, Self::Pdf];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Image => "image",
+            Self::Pdf => "pdf",
+        }
+    }
+}
+
 /// ADR 0041 §2: declaration order is the canonical manifest order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

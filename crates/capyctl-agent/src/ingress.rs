@@ -76,6 +76,7 @@ pub struct EngineAccess {
     pub api: capyctl_config::effective::DeploymentApi,
     /// ADR 0041 §2, §3: declared types from that launch's frozen manifest.
     pub field_types: Option<Arc<[capyctl_config::extractions::FieldType]>>,
+    pub inputs: Option<Arc<[capyctl_config::extractions::InputKind]>>,
 }
 impl EngineAccess {
     /// A built-in engine: read by its family's `/metrics`, always keyed.
@@ -88,6 +89,7 @@ impl EngineAccess {
             engine_trace: false,
             api: capyctl_config::effective::DeploymentApi::Chat,
             field_types: None,
+            inputs: None,
         }
     }
     /// ADR 0031 §6, §7: a custom engine, read by its manifest's idle signal
@@ -101,6 +103,11 @@ impl EngineAccess {
             engine_trace: false,
             api: custom.manifest.api,
             field_types: custom.manifest.field_types.as_deref().map(Arc::from),
+            inputs: custom
+                .manifest
+                .field_types
+                .as_ref()
+                .map(|_| Arc::from(custom.manifest.extraction_inputs())),
         }
     }
     /// ADR 0031 §6, AGENTS.md (uncertainty must retain accounting): a launch
@@ -115,6 +122,7 @@ impl EngineAccess {
             engine_trace: false,
             api: capyctl_config::effective::DeploymentApi::Chat,
             field_types: None,
+            inputs: None,
         }
     }
     /// ADR 0032 §2: the same access, with whether the launch's engine takes
@@ -564,13 +572,18 @@ impl Kind {
         self,
         body: &serde_json::Value,
         declared: Option<&[capyctl_config::extractions::FieldType]>,
+        inputs: Option<&[capyctl_config::extractions::InputKind]>,
     ) -> bool {
         match self {
             Self::Chat => capyctl_adapters::forward::chat_request_allowed(body),
             Self::Decision => capyctl_adapters::forward::decision_request_allowed(body),
             Self::Extraction => declared.is_some_and(|declared| {
-                capyctl_adapters::extraction_request::validate_extraction_request(body, declared)
+                inputs.is_some_and(|inputs| {
+                    capyctl_adapters::extraction_request::validate_extraction_request(
+                        body, declared, inputs,
+                    )
                     .is_ok()
+                })
             }),
             Self::Embedding => capyctl_adapters::embedding_request::embedding_request_allowed(body),
         }
@@ -695,13 +708,14 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
-        .map_or((true, false, false, None, None), |(_, engine)| {
+        .map_or((true, false, false, None, None, None), |(_, engine)| {
             (
                 engine.keyed,
                 engine.request_abort,
                 engine.engine_trace,
                 Some(engine.api),
                 engine.field_types.clone(),
+                engine.inputs.clone(),
             )
         });
     let Some(kind) = kind.for_launch(access.3) else {
@@ -721,7 +735,7 @@ async fn forward(ingress: Arc<Ingress>, request: Request, kind: Kind) -> Respons
         request,
         kind,
         guard,
-        (access.0, access.1, access.4.as_deref()),
+        (access.0, access.1, access.4.as_deref(), access.5.as_deref()),
         received,
         &mut trace,
     )
@@ -847,10 +861,11 @@ async fn relay(
     request: Request,
     kind: Kind,
     guard: InFlight,
-    (keyed, request_abort, declared): (
+    (keyed, request_abort, declared, inputs): (
         bool,
         bool,
         Option<&[capyctl_config::extractions::FieldType]>,
+        Option<&[capyctl_config::extractions::InputKind]>,
     ),
     received: Instant,
     trace: &mut IngressTrace,
@@ -899,7 +914,7 @@ async fn relay(
     if value.get("model").and_then(serde_json::Value::as_str) != Some(entry.model.as_str()) {
         return failure(StatusCode::BAD_REQUEST);
     }
-    if !kind.allowed(&value, declared) {
+    if !kind.allowed(&value, declared, inputs) {
         return failure(StatusCode::BAD_REQUEST);
     }
     if !entry.open.load(Ordering::SeqCst) {

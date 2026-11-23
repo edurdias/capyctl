@@ -290,6 +290,7 @@ kind: custom_engine
 schema_version: 1
 api: extractions
 field_types: [text, number, date, time, datetime, duration, list, estimate, forecast]
+inputs: [text, image, pdf]
 args: [serve, "{model_dir}", --host, "{host}", --port, "{port}", --served-model-name, "{served_name}", --max-model-len, "{context_length}"]
 health: /health
 ```
@@ -314,13 +315,19 @@ distinct and drawn from the nine names above; it is stored in that order.
 Changing the set changes the manifest digest and creates a new profile.
 Other APIs must not declare `field_types`.
 
-`field_types` declares output types only, not text-only or media input support.
-The manifest has no input-capability declaration. CapyCTL validates the request
-shape but leaves input support to the engine: a text-only engine must reject
-unsupported image input. The readiness probe uses text only and does not qualify
-image or PDF handling.
+`inputs` declares accepted source kinds independently of the output `field_types`.
+It is optional: omitting it keeps support for all three kinds and preserves the
+existing manifest digest. An explicit declaration is a non-empty, distinct subset
+of `text`, `image`, `pdf`, stored in that order. Unknown kinds and declarations
+on other APIs are refused. Changing the declared set changes the digest; the
+declaration is frozen with the deployment.
 
-`engine add --custom` shows the field types beside the API for confirmation.
+CapyCTL refuses undeclared input kinds with HTTP 400 `input_unsupported` before
+waiting or activation. `GET /v1/models` advertises the effective set as
+`capyctl.inputs`. These declarations do not qualify an engine's input handling.
+
+`engine add --custom` shows field types and effective inputs beside the API for
+confirmation.
 **Before downgrading** to a release without extraction support, remove every
 extraction engine with `capyctl engine remove`. Older releases refuse all of
 `custom-engines.yaml` when a manifest contains `field_types`, so their role
@@ -340,9 +347,11 @@ An extraction deployment:
 After the port and optional health path answer, CapyCTL sends a fixed
 readiness extraction
 to the launch's own loopback endpoint, with its served name and its own key
-when present. It contains one field per declared type. Readiness requires
-exactly those answers, matching types and well-formed values; it does not
-check factual accuracy. Null scalar and list values are allowed; list order
+when present. It contains one field per declared type and uses only a declared
+input kind: text when available, otherwise a fixed image or PDF source.
+Readiness requires exactly those answers, matching types and well-formed values;
+it does not check factual accuracy or qualify every declared input kind.
+Null scalar and list values are allowed; list order
 is the engine's. The probe accepts times with `Z` or `±HH:MM`, durations
 with no fractional part, and either forecast form (arrays or `steps`
 objects); every form present must be well-formed. `/health` and

@@ -1,6 +1,6 @@
 //! ADR 0041 §§4–5: the fixed extraction readiness probe and wake canary.
 //! The request is sent to the launch's loopback endpoint, never through ingress.
-use capyctl_config::extractions::{FieldType, PROBE_FIELDS as FIELDS};
+use capyctl_config::extractions::{FieldType, InputKind, PROBE_FIELDS as FIELDS};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
@@ -70,7 +70,7 @@ pub fn relayed_answer(
 }
 
 /// ADR 0041 §4: exactly one fixed field per declared type, in canonical order.
-pub fn request(served: &str, declared: &[FieldType]) -> Value {
+pub fn request(served: &str, declared: &[FieldType], inputs: &[InputKind]) -> Value {
     let mut fields = Map::new();
     for (kind, name) in &FIELDS {
         if !declared.contains(kind) {
@@ -101,7 +101,22 @@ pub fn request(served: &str, declared: &[FieldType]) -> Value {
         };
         fields.insert((*name).into(), spec);
     }
-    json!({"model": served, "state": STATE, "reference_date": "2026-10-09", "fields": fields})
+    let mut body = json!({"model": served, "reference_date": "2026-10-09", "fields": fields});
+    // ADR 0041 §4: never send a source kind outside the frozen declaration.
+    if inputs.contains(&InputKind::Text) {
+        body["state"] = json!(STATE);
+    } else if inputs.contains(&InputKind::Image) {
+        body["images"] = json!([{
+            "content_type": "image/png",
+            "base64": include_str!("extraction-probe.png.base64")
+        }]);
+    } else {
+        body["assets"] = json!({"probe": {
+            "format": "pdf",
+            "data_base64": include_str!("extraction-probe.pdf.base64")
+        }});
+    }
+    body
 }
 
 fn failure(field: &str, member: &str) -> String {
@@ -511,20 +526,26 @@ pub(crate) async fn probe(
     key: Option<&reqwest::header::HeaderValue>,
     served: &str,
     declared: &[FieldType],
+    inputs: &[InputKind],
     bound: std::time::Duration,
 ) -> Result<ExtractionAnswer, AdapterError> {
     let url = base
         .join(PATH)
         .map_err(|_| AdapterError::Uncertain("extraction probe: no endpoint".into()))?;
-    let response = crate::completion_probe::post_json(
-        client,
-        url,
-        key,
-        &request(served, declared),
-        bound,
-        "extraction probe",
-    )
-    .await?;
+    if inputs.is_empty() {
+        return Err(AdapterError::UnsupportedCapability);
+    }
+    let body = request(served, declared, inputs);
+    let response =
+        crate::completion_probe::post_json(client, url, key, &body, bound, "extraction probe")
+            .await?;
+    if body.get("assets").is_some()
+        && !crate::extraction_request::pdf_answered(&response, &body["fields"])
+    {
+        return Err(AdapterError::Uncertain(
+            "extraction probe: invalid PDF source evidence".into(),
+        ));
+    }
     well_formed(&response, declared).map_err(AdapterError::Uncertain)
 }
 
@@ -535,6 +556,7 @@ pub async fn probe_keyed(
     key: Option<&str>,
     served: &str,
     declared: &[FieldType],
+    inputs: &[InputKind],
     bound: std::time::Duration,
 ) -> Result<ExtractionAnswer, AdapterError> {
     let header = match key {
@@ -543,7 +565,16 @@ pub async fn probe_keyed(
         })?),
         None => None,
     };
-    probe(client, base, header.as_ref(), served, declared, bound).await
+    probe(
+        client,
+        base,
+        header.as_ref(),
+        served,
+        declared,
+        inputs,
+        bound,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -623,7 +654,7 @@ mod tests {
     #[test]
     fn exact_fixed_request() {
         assert_eq!(
-            request("extractor", &FieldType::ALL),
+            request("extractor", &FieldType::ALL, &InputKind::ALL),
             json!({
                 "model": "extractor",
                 "state": "Order A-88412 was delivered on 2026-09-28 at 14:30 with a cracked screen and a dented corner. The customer paid 649.00 USD and wrote on 2026-10-09. Returns logged on the last five days: 12, 15, 11, 14, 13.",
@@ -643,11 +674,49 @@ mod tests {
         );
     }
 
+    // T50: readiness and wake probes never send undeclared source kinds.
+    #[test]
+    fn readiness_uses_only_a_declared_input_kind() {
+        for inputs in [
+            vec![InputKind::Text],
+            vec![InputKind::Image],
+            vec![InputKind::Pdf],
+            vec![InputKind::Image, InputKind::Pdf],
+            InputKind::ALL.to_vec(),
+        ] {
+            let body = request("extractor", &FieldType::ALL, &inputs);
+            assert!(
+                crate::extraction_request::validate_extraction_request(
+                    &body,
+                    &FieldType::ALL,
+                    &inputs
+                )
+                .is_ok(),
+                "{body}"
+            );
+            if inputs.contains(&InputKind::Text) {
+                assert_eq!(body["state"], STATE);
+                assert!(body.get("images").is_none());
+                assert!(body.get("assets").is_none());
+            } else {
+                assert!(body.get("state").is_none());
+                assert_eq!(
+                    body.get("images").is_some(),
+                    inputs.contains(&InputKind::Image)
+                );
+                assert_eq!(
+                    body.get("assets").is_some(),
+                    !inputs.contains(&InputKind::Image)
+                );
+            }
+        }
+    }
+
     // T50: subsets use the same fields and canonical declaration order.
     #[test]
     fn declared_types_choose_exactly_their_fields() {
         for (kind, field) in FIELDS {
-            let request = request("extractor", &[kind]);
+            let request = request("extractor", &[kind], &InputKind::ALL);
             let fields = request["fields"].as_object().unwrap();
             assert_eq!(fields.len(), 1);
             assert_eq!(fields[field]["type"], kind.name());
@@ -665,7 +734,11 @@ mod tests {
             [FieldType::Text, FieldType::Estimate]
         );
         assert_eq!(
-            request("extractor", &[FieldType::Text, FieldType::Text])["fields"]
+            request(
+                "extractor",
+                &[FieldType::Text, FieldType::Text],
+                &InputKind::ALL
+            )["fields"]
                 .as_object()
                 .unwrap()
                 .len(),

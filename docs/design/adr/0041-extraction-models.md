@@ -1,7 +1,7 @@
 # ADR 0041 — Extraction models (`api: extractions`, `fields` on `POST /v1/systemone`)
 
 **Status:** Accepted (generic API decisions of 2026-11-04, PDF contract amendment of
-2026-11-12, and release-scope decision of 2026-11-23).
+2026-11-12, and release-scope and input-kind amendments of 2026-11-23).
 Target release: 0.2.0, in one combined integration and extraction release-candidate
 pull request. Extraction is an engine capability, independent of any model project.
 Current built-in native engine paths remain refused; a patched engine that serves
@@ -11,7 +11,7 @@ its wake check), §10 (a second closed shape on `POST /v1/systemone`, chosen by 
 deployment's `api`), §15.1/§16 (a fourth `api` value), §20 (T50); ADR 0030 §§1, 2, 5
 (`api` gains `extractions`; `/v1/systemone` answers `fields` for extraction deployments;
 `capyctl.api` gains a value); ADR 0031 §2 (a custom engine's manifest `api` gains
-`extractions`, with `field_types`).
+`extractions`, with `field_types` and optional `inputs`).
 **Related:** ADR 0012 (deep parking), ADR 0013 (instances and request leases), ADR 0017
 (capability gating), ADR 0024 (parsers apply to chat only), ADR 0028 (groups), ADR 0032
 (settling a cancelled request), ADR 0033 (LMCache), ADR 0035 (several GPUs on one host),
@@ -96,15 +96,16 @@ capability `extractions` (ADR 0017); the server never places an extractions depl
 a host without it (`host_capability_missing:extractions`), and an extractions custom
 engine needs both `custom_engines` and `extractions`.
 
-### 2. The manifest declares the field types it answers
+### 2. The manifest declares output types and accepted inputs
 
-ADR 0031's manifest gains `api: extractions` and a field `field_types`:
+ADR 0031's manifest gains `api: extractions`, `field_types` and optional `inputs`:
 
 ```yaml
 kind: custom_engine
 schema_version: 1
 api: extractions
 field_types: [text, number, date, time, datetime, duration, list, estimate, forecast]
+inputs: [text, image, pdf]
 version: "0.1.0"
 args: [--host, "{host}", --port, "{port}", --model, "{model_dir}", --served-name, "{served_name}"]
 health: /health
@@ -124,6 +125,16 @@ Changing `field_types` changes the manifest's digest, so it is a new profile, as
 manifest change is (ADR 0031 §3). `engine add --custom` shows `field_types` beside `api`
 in what it asks the administrator to confirm (ADR 0031 §8), since it is part of what they
 approve.
+
+`inputs` is optional and allowed only with `api: extractions`. When present it
+is a non-empty list of distinct names from the closed set `text`, `image`, `pdf`;
+any non-empty subset is allowed. Unknown names, duplicates, an empty list or
+declaration on another API are `custom_manifest_invalid`. Deserialization stores
+the set in that canonical order. An absent declaration means all three kinds
+and remains absent from serialization, preserving existing manifest digests.
+An explicit declaration is digested with the manifest and frozen in the custom
+profile; changing it changes the digest. Approval shows the effective inputs
+alongside `api` and `field_types`.
 
 **Downgrade.** `custom-engines.yaml` is read strictly (ADR 0031 A1), so a release before
 this one refuses the whole file once it holds a manifest with `field_types`, and its role
@@ -147,10 +158,11 @@ selection, request lease, request IDs, trace context and metrics as decisions (A
 router looks the deployment up before it validates the body: authenticate, check
 `X-Request-Id`, read the body under the bound, read `model`, look the deployment up
 (`unknown_model`), refuse a mismatched API (`api_mismatch`), validate the body against the
-deployment's contract (`invalid_request`, `field_type_unsupported`), then wait, activate,
-admit and lease. For decisions this moves one observable thing: an unknown model is now
-reported before a malformed body. The `api` and the `field_types` are those of the
-deployment's current frozen revision.
+deployment's contract (`invalid_request`, `field_type_unsupported`,
+`input_unsupported`), then wait, activate, admit and lease. For decisions this
+moves one observable thing: an unknown model is now reported before a malformed
+body. The `api`, `field_types` and effective inputs come from the deployment's
+current frozen revision.
 
 **Shape mismatch.** A body that carries the other API's key, whatever its value (`null`
 included), is refused with HTTP 400 `api_mismatch` before any waiting or activation,
@@ -200,6 +212,12 @@ for (`horizon` on a `text`, say) is forwarded.
 refused with HTTP 400 `field_type_unsupported` naming the field and the type, before any
 waiting or activation. The router reads the declared types from the frozen revision's
 custom profile, never from the engine.
+
+**Declared inputs.** Non-empty `state` requires `text`, except a PDF's sole asset
+key, which is not source text. Non-empty `images` requires `image`; a PDF asset
+requires `pdf`. Mixed text/image requests require both. Empty media does not
+require a capability. A kind absent from the frozen custom profile's effective
+inputs is HTTP 400 `input_unsupported`, naming the kind, before waiting or activation.
 
 CapyCTL sets no limit on the number of fields, and none on the size of images beyond the
 body bound (the count is the contract's four); an engine's own limit comes back as its
@@ -253,10 +271,10 @@ or enforce a particular inference architecture through usage accounting.
 **PDF amendment (2026-11-12).** The engine alone decodes and converts PDFs;
 CapyCTL forwards the asset and state unchanged, apart from the normal model-name
 replacement. Returned `state_text` is the source of text-span evidence, not the
-asset key. Unsupported, malformed or over-limit input is the engine's to reject;
-CapyCTL relays a complete rejection under its existing `engine_rejected`
-envelope. Engine-specific decoded-size and page limits do not replace CapyCTL's
-unchanged 8 MiB HTTP request bound, which includes base64 overhead.
+asset key. Input kinds are gated against the manifest before activation;
+malformed decoded media and engine-specific limits remain the engine's to reject.
+CapyCTL relays a complete rejection under `engine_rejected`. Decoded-size and
+page limits do not replace the unchanged 8 MiB HTTP bound, including base64 overhead.
 
 **Compatibility boundary.** A future `/api/alpha/extractions` boundary adapter
 may translate OpenRouter's live Extractions contract; it is not part of 0.2.0.
@@ -270,17 +288,18 @@ The deliberate differences are:
 | Errors | string error codes | numeric error codes |
 
 Only the named PDF asset map is aligned with OpenRouter. No broader boundary
-adapter, compatibility shim or additional response-readiness requirement is
-introduced; the fixed text-only readiness probe remains unchanged.
+adapter or compatibility shim is introduced. Readiness uses a fixed source of a
+declared kind as specified below.
 
 ### 4. Readiness is a fixed extraction
 
 A decisions deployment proves readiness with a fixed decision (ADR 0030 §3); an
 extractions deployment sends one fixed `/v1/systemone` request with **one field of each
 type its manifest declares**, to the launch's own loopback endpoint with its own key,
-never through ingress or the router. It is version `1` of the probe of kind `extraction`
-(`crates/capyctl-adapters/src/extraction_probe.rs`). The request, with every type
-declared:
+never through ingress or the router. Text is preferred when declared; otherwise
+the request uses a fixed image or PDF source using only a declared input kind.
+The probe kind is `extraction` (`crates/capyctl-adapters/src/extraction_probe.rs`).
+The text request, with every output type declared, is:
 
 ```json
 {
@@ -303,9 +322,10 @@ declared:
 
 A manifest that declares fewer types gets the same request with only the fields of its
 types. CapyCTL sends the request's members in a fixed order (sorted by name), so the
-bytes are the same for every launch with the same declared types; the order carries no
-meaning. The state is ASCII, so character offsets mean the same in every unit an engine
-may count in.
+bytes are the same for every launch with the same declared types and selected
+input kind; the order carries no meaning. The text source is ASCII. Media probes
+use fixed sources and the corresponding source-text evidence for span validation.
+Readiness is not live qualification of every declared kind or extraction quality.
 
 The answer is ready evidence when it is a whole JSON object whose `answers` object has
 exactly the requested field names, each answer's `type` equal to the field's type, and
@@ -365,9 +385,9 @@ follow without a new probe.
 
 ### 6. Discovery
 
-`GET /v1/models` keeps its shape. An extractions entry has `capyctl.api: "extractions"`
-and `capyctl.field_types`, the declared types in canonical order, so a client knows which
-fields the model answers without sending one.
+`GET /v1/models` keeps its shape. An extractions entry has `capyctl.api: "extractions"`,
+`capyctl.field_types` and effective `capyctl.inputs`, each set in canonical order,
+so clients discover output types and source kinds without waking the model.
 
 ### 7. Refusal codes
 
@@ -378,10 +398,12 @@ fields the model answers without sending one.
 | document check | invalid `topology` / `residency` | a `topology`, or `deep` or `host_backed` (§1) |
 | resolution | `custom_field_unsupported:<parser>` | a parser (ADR 0031 §4) |
 | `engine add --custom` | `custom_manifest_invalid` | `field_types` missing with `api: extractions`, present with another `api`, empty, duplicated, or naming an unknown type |
+| `engine add --custom` | `custom_manifest_invalid` | `inputs` present on another API, empty, duplicated, or naming an unknown kind |
 | placement | `host_capability_missing:extractions` | a host without the capability |
 | router (400) | `api_mismatch` | the wrong endpoint, or a body with the other System One API's key (§3) |
 | router (400) | `invalid_request` | a body outside the `fields` contract (§3) |
 | router (400) | `field_type_unsupported` | a field of a type the deployment does not declare (§3) |
+| router (400) | `input_unsupported` | a source kind absent from the deployment's effective inputs (§3), before activation |
 | readiness | none: the instance never becomes ready, and the start fails as a decision model's does | the fixed extraction is not answered well-formed (§4) |
 | wake | `wake_mismatch` | §5 |
 
@@ -449,9 +471,10 @@ spelling of `list`, is not an accepted field type, and does not change this
 release's probes. The proposed contract and remaining decisions are in
 [Extraction records](../../specs/extraction-records.md).
 
-**Input-capability gap.** A manifest declares `field_types`, not accepted input
-modalities. The router therefore cannot reject images or PDFs before activation
-based on a text-only engine's declaration. Engines must reject unsupported inputs
-themselves; the fixed text-only readiness probe proves no image or PDF support.
-No text-only/media capability declaration or media qualification is included in
-this release. The current PDF completion checks remain strict.
+**Input-kind amendment (2026-11-23).** Optional `inputs` closes the input-capability
+gap: declarations are validated, canonicalized, approved, digested and frozen.
+Omission retains all three input kinds without changing existing digests.
+Discovery advertises the effective set; the router refuses undeclared source kinds
+before activation. Readiness selects a fixed source using only a declared kind,
+preferring text. Neither declarations nor readiness qualify media handling live.
+The current PDF completion checks remain strict.
