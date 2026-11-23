@@ -272,7 +272,8 @@ with the new answers.
 ## Extraction models
 
 An extraction model returns typed values from a text state and, optionally,
-images in one forward pass, without generating tokens. It answers `fields`
+images. Some models use learned readout heads; others generate field values
+in parallel slots. It answers `fields`
 on `POST /v1/systemone`, not a decision model's `questions`
 ([Extraction requests](requests.md#extraction-requests)).
 
@@ -352,6 +353,48 @@ source lives in the private repository
 the owner. Model quality and qualification on host A remain release gates. CPU and
 fake-engine tests are not qualification. Table/record extraction is deferred
 to a follow-up release.
+
+### Clairic-flash
+
+Cloudflare's [Clairic-flash](https://huggingface.co/Cloudflare/clairic-flash)
+is a separate Apache-2.0 Qwen3.5-9B extraction model. The `clairic-extract`
+entrypoint in [the extraction server repository](https://github.com/ShardioAI/extract)
+wraps its own `load_release_model`/`systemone` runtime, not our 4B heads.
+See that repository's `docs/clairic-flash.md`, `manifest/clairic-flash.yaml`
+and `manifest/clairic-flash-deployment.yaml` for setup and deferred live checks.
+The model/runtime snapshot is pinned to
+`36ad68b999560f56b57ef16a22180f8cb83c6d77`. These are candidate configuration
+files, not a measured or live-qualified recipe.
+
+Register `clairic-extract` with `capyctl engine add --custom`, the supplied
+manifest and profile name `clairic-flash`; the deployment uses `api: extractions`
+and `engine_config.context_length: 8192`. The wrapper loads before binding,
+serves `/health`, `/v1/models` and `/v1/systemone`, uses the per-launch bearer
+key, and keeps the existing nine-type readiness probe unchanged. A native
+null scalar has no invented non-null guess to make readiness pass.
+
+The wrapper declares **text and images**, including image-only text/list
+answers with genuine null spans. The ordinary extraction completion check
+does not impose PDF-specific text-span evidence on image requests. Our own
+model's text-only release decision does not restrict Clairic-flash. Native
+Clairic also supports rendered PDFs, but the wrapper currently rejects PDF
+assets: its visual-only answers do not meet the existing strict PDF evidence
+contract. [ADR 0042](../design/adr/0042-visual-pdf-extraction-evidence.md)
+proposes an explicit visual-evidence declaration and null spans; it is not
+approved or implemented. The extra native field types (`boolean`, `enum`,
+`object`, `compute`) remain outside CapyCTL's closed nine-type API.
+
+Native inference concurrency is one; the wrapper serializes calls off the
+HTTP event loop. There is no idle signal, so cancelled exchanges settle at
+verified stop. Explicit SDPA attention avoids the Hopper-only x86_64 kernel
+on aarch64 Blackwell. The upstream 65,273-token default is not the candidate's
+8,192-token limit. About 18 GB of bf16 parameter storage alone is not a
+memory reservation: loading, vision, KV state, parallel field prefixes and
+heads add to it. The supplied 32-GiB GPU/8-GiB RAM reservation is an unmeasured
+starting point, not a hardware guarantee. Missing dependencies or package
+changes on a lab host require owner approval. CPU and fake-backend tests
+are not qualification; no new environment or live run is implied.
+
 
 ## Embedding models
 
