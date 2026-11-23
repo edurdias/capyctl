@@ -332,7 +332,7 @@ fn a_native_profile_states_its_line_and_the_06_one_is_unchanged() {
 
     let dir = tempfile::tempdir().unwrap();
     let document = host_doc(dir.path());
-    let engines = engines_beside(&document);
+    let engines = capyctl_config::test_support::host_engines_path(&document);
     let lock = lock_engines(&engines).unwrap();
     let mut file = EnginesFile::load(&engines).unwrap();
     file.profiles.insert("tensorfold".into(), python);

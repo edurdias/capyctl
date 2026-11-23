@@ -103,6 +103,17 @@ Before downgrading below extraction support, remove extraction registrations:
 older readers refuse a custom manifest containing `field_types`. No lab host,
 model weights or protected evaluation partition is accessed by this integration.
 
+## Verification
+
+The focused store run, `cargo test -p capyctl-store --all-targets --locked --
+--test-threads=4`, passed 570 tests across 21 suites, including preservation of
+released v59 authentication and refusal of conflicting pre-release databases
+without writes. Initial integration checks exposed stale registration paths,
+router-auth composition and fixture signatures; the fixtures now use the
+merged APIs rather than reintroducing old compatibility paths. Required fast
+and deep `scripts/ci-local.sh` results are recorded in the review pull request.
+CPU and Fake-engine checks do not replace the live gates described above.
+
 # Release note: 0.2.0
 
 - **Typed extraction as an engine capability.** Engines or patched engines

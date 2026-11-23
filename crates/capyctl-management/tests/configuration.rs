@@ -2354,9 +2354,11 @@ fn native_hosts(
             .unwrap();
         ids.push(id);
     }
-    let router = configuration_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+        configuration_router(Arc::new(
+            SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap(),
+        )),
     );
     (router, ids)
 }

@@ -153,6 +153,7 @@ fn deps(
         api_key: None,
         inflight: Arc::new(capyctl_router::admission::InFlight::default()),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: capyctl_trace::Tracing::off(),
     }
 }
 
@@ -581,10 +582,17 @@ impl capyctl_controller::LifecyclePort for Authority {
         Ok(vec![capyctl_store::deployments::PublicRoute {
             id: "chat".into(),
             api: self.api,
+            field_types: Vec::new(),
         }])
     }
     fn deployment_api(&self, _: &str) -> Result<DeploymentApi, LifecycleFault> {
         Ok(self.api)
+    }
+    fn deployment_field_types(
+        &self,
+        _: &str,
+    ) -> Result<Vec<capyctl_config::extractions::FieldType>, LifecycleFault> {
+        Ok(Vec::new())
     }
     fn get_deployment(
         &self,
@@ -614,6 +622,7 @@ impl capyctl_controller::LifecyclePort for Authority {
             deployment_id: "dep-chat".into(),
             revision: 1,
             request_abort: false,
+            engine_trace: false,
         }))
     }
     async fn open_request_lease(

@@ -75,9 +75,9 @@ async fn the_inference_listener_view_is_authenticated() {
 #[tokio::test]
 async fn the_view_carries_the_roles_live_tracing_status() {
     let view = Arc::new(InferenceListenerView::default());
-    let router = inference_listener_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        view.clone(),
+        inference_listener_router(view.clone()),
     );
     const PATH: &str = "/management/v1/inference-listener";
     let read = || async {

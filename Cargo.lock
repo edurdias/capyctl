@@ -492,6 +492,7 @@ dependencies = [
  "capyctl-scheduler",
  "capyctl-store",
  "capyctl-testkit",
+ "capyctl-trace",
  "futures",
  "hex",
  "http-body-util",

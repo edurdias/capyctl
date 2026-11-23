@@ -20,6 +20,8 @@ async fn api_remove_in_use_returns_the_cli_profile_in_use_code() {
                 executable: "/bin/true".into(),
                 build_fingerprint: "0.29.0".into(),
                 deep_park: false,
+                line: Default::default(),
+                native: None,
                 installation_drift: capyctl_config::effective::InstallationDrift::Warn,
                 args: vec![],
                 cuda_home: None,
@@ -54,7 +56,6 @@ async fn api_remove_in_use_returns_the_cli_profile_in_use_code() {
         &capyctl_config::effective::ModelSource::Local {
             path: "/models/busy-model".into(),
         },
-        capyctl_config::engine_policy::Engine::Vllm,
         &capyctl_cli::standalone_config::TemplateMemory::Unified {
             capacity_bytes: support::TEST_CAPACITY_BYTES,
         },

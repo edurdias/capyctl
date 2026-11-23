@@ -5,7 +5,7 @@
 //! `null`. ADR 0037 §13: the same read carries the role's tracing status
 //! (`tracing: off` or on with its endpoint, spans dropped and the last export
 //! error), read live at each request.
-use crate::{error, ManagementCredentials};
+use crate::error;
 use axum::{
     extract::{Request, State},
     http::{header, StatusCode},
