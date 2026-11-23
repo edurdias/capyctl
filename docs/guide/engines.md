@@ -1109,8 +1109,8 @@ request shape does not establish engine support. The fixed readiness probe is
 text-only and does not qualify image or PDF handling.
 
 CPU and fake-engine tests do not qualify an engine or checkpoint. Live
-qualification must cover the actual patched installation and contract
-([ADR 0041](../design/adr/0041-extraction-models.md)).
+qualification must cover the actual patched installation and the extraction
+contract.
 
 ## LMCache
 

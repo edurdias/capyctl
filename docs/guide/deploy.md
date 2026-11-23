@@ -337,8 +337,8 @@ An extraction deployment:
 
 ### The readiness extraction
 
-After the port and optional health path answer, CapyCTL sends the exact
-[ADR 0041 §4 probe](../design/adr/0041-extraction-models.md#4-readiness-is-a-fixed-extraction)
+After the port and optional health path answer, CapyCTL sends a fixed
+readiness extraction
 to the launch's own loopback endpoint, with its served name and its own key
 when present. It contains one field per declared type. Readiness requires
 exactly those answers, matching types and well-formed values; it does not
@@ -349,7 +349,7 @@ objects); every form present must be well-formed. `/health` and
 `/v1/models` alone are not readiness.
 
 The first answer becomes the launch's wake reference, with probe version and
-declared types. [ADR 0041 §5](../design/adr/0041-extraction-models.md#5-the-wake-check)
+declared types. The wake check
 compares scalar guesses (and text spans), not scalar value nullness; lists
 must repeat items and spans in order or be null in both. Estimates and
 forecasts have an inclusive one-step tolerance, probabilities an inclusive

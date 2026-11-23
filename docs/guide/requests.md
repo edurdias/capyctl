@@ -548,7 +548,7 @@ naming a string `type`. The response is read whole up to 16 MiB; a longer
 answer is uncertain, never replayed and held until the instance stops.
 Ingress has its own 8 MiB request bound, returning HTTP 400 above it.
 Individual answers are not judged on the request path. The stricter typed
-checks in [ADR 0041 §4](../design/adr/0041-extraction-models.md#4-readiness-is-a-fixed-extraction)
+checks of the readiness extraction ([The readiness extraction](deploy.md#the-readiness-extraction))
 apply only to the fixed readiness probe. It accepts time zone suffixes
 `Z` or `±HH:MM`, durations with no fractional part, null lists, and either
 published forecast form (every form present must be well-formed).
@@ -571,7 +571,7 @@ published forecast form (every form present must be well-formed).
 Answers carry `capyctl.metrics.total_ms`, `time_to_response_ms` and
 `input_tokens` from engine usage, as decisions do; there is no generated-text
 figure. Request IDs, trace context, waiting, admission, instance selection
-and leases are the same as for decisions. A request cut by a hang-up or
+and request accounting are the same as for decisions. A request cut by a hang-up or
 deadline before its whole answer settles only at the next verified stop;
 the restart for held requests applies. A complete engine error leaves the
 request `cancelling`, settled on the manifest's idle signal when present,
