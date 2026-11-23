@@ -163,7 +163,7 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     `lmsysorg/sglang:v0.5.22` Docker image, for the live check of #230 (an editable
     SGLang refused at `engine add`); removed after that check, to be pulled again for
     #235's;
-  - host A and host B, approved 2026-11-20, for Thinking Machines' Inkling 2 Mini: SGLang
+  - the lab hosts, approved 2026-11-20, for Thinking Machines' Inkling 2 Mini: SGLang
     built from PR #51926 (commit 92e894ef, the first SGLang source with the model
     and SM121 kernels) in ~/sglang-inkling-pr51926-venv, with its Rust toolchain
     and caches inside the venv, made by the capyctl-recipes Inkling comparison's
@@ -172,13 +172,12 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     reproducing a published community recipe as written, vLLM's
     `vllm/vllm-openai:inkling-2-mini` Docker image pinned by digest
     (`sha256:c2dc759f…`, a 0.35 pre-release);
-  - host A, approved 2026-11-21, for building a Qwen3.5-9B INT4 checkpoint in the
+  - the lab hosts, approved 2026-11-21, for building INT4 checkpoints in the
     compressed-tensors format: an isolated llm-compressor environment
     (~/llmcompressor-venv), a builder only, never registered or run as an engine;
-  - the maintainer's discrete-GPU laptop, approved 2026-11-21: SGLang 0.5.22 in a
-    home-directory venv (~/sglang-0.5.22-venv), for qualifying 16 GB recipes
-    (clef-flash, Qwen3.5-9B), with the laptop's own node engine stopped while
-    testing;
+  - maintainers' local machines with a 16 GB GPU, approved 2026-11-21: SGLang 0.5.22
+    in a home-directory venv (~/sglang-0.5.22-venv), for qualifying 16 GB recipes,
+    with any other GPU workload on that machine stopped while testing;
   - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B;
   - the rented two-GPU machine of ADR 0035 §14 (owner decision 2026-10-25), for
     its one session only: fresh x86_64 CUDA installs of vLLM 0.32.0
