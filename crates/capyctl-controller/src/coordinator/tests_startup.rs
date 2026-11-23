@@ -992,7 +992,16 @@ async fn weights_sized_while_the_digest_is_pending_trigger_the_solo_first_start(
         let o = owner.lock().unwrap();
         assert!(o
             .store()
-            .record_checkpoint_weights(o.session(), &id, big.revision, "lab", 24 * GIB, None, 1700)
+            .record_checkpoint_weights(
+                o.session(),
+                &id,
+                big.revision,
+                "lab",
+                24 * GIB,
+                None,
+                None,
+                1700
+            )
             .unwrap());
         let digest = o
             .store()

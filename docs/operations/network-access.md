@@ -127,6 +127,18 @@ then run any model you have deployed, wake parked models, and use your GPU and
 power, and on a shared or public network that is everyone nearby. There is no
 fallback key: if the credentials file cannot be read, the role refuses to start.
 
+## Trace headers
+
+With [tracing](configuration.md#tracing) on, the router reads a caller's
+`traceparent` and `tracestate` only after the API key is accepted. A request
+that fails authentication gets no span, and its trace headers are not read,
+so a client without the key cannot make CapyCTL record or export anything.
+With the key off, every caller counts as authenticated: anyone who can reach
+the address can choose whether its requests are sampled, and so add spans to
+your collector's load, up to CapyCTL's bounded queue. Trace headers never
+reach an engine from the network: CapyCTL replaces them with its own, and
+sends them only to a launch with engine tracing.
+
 ## Internet exposure through a TLS reverse proxy
 
 CapyCTL does not terminate TLS. To reach the endpoint from the internet, keep CapyCTL
@@ -269,9 +281,19 @@ After=tailscaled.service
   each get a key generated for that launch and checked by CapyCTL's guard;
   TensorFold has no key. The router
   is the only path from the network to an engine, and it forwards only the
-  allowlisted inference routes: `POST /v1/chat/completions`, and
-  `POST /v1/systemone` for decision models. A model running across machines
-  also opens peer ports; see below.
+  allowlisted inference routes: `POST /v1/chat/completions`,
+  `POST /v1/systemone` for decision and extraction models and
+  `POST /v1/embeddings` for embedding models. A host's ingress checks each
+  request against the same closed contract the router uses, choosing
+  `questions` or `fields` for `/v1/systemone` from the launch's `api`, never
+  from the body. It refuses a body over 8 MiB with HTTP 400. The extraction
+  contract accepts up to four images, checks setting shapes, and refuses
+  unknown settings; cross-setting semantics belong to the engine
+  ([Extraction requests](../guide/requests.md#extraction-requests)).
+  An embedding answer passes on as it arrives without being held whole;
+  decision and extraction responses are read whole up to 16 MiB, and a
+  longer response is uncertain, never replayed and held until verified stop.
+  A model running across machines also opens peer ports; see below.
 
 ## Multi-node groups
 

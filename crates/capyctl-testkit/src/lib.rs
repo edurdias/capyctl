@@ -27,8 +27,12 @@ mod lifecycle;
 pub mod ports;
 mod provider;
 mod scripted_tool;
+pub mod tensorfold_native;
 
-pub use fake_engine::{FakeEngine, BUFFER_RESIDUE, FULL_RESIDENT_BYTES, LEVEL1_RETAINED_BYTES};
+pub use fake_engine::{
+    EmbeddingFault, FakeEmbeddings, FakeEngine, BUFFER_RESIDUE, FULL_RESIDENT_BYTES,
+    LEVEL1_RETAINED_BYTES,
+};
 pub use fake_group::{FakeGroup, JournalState, RankEnd};
 pub use fake_launcher::FakeLauncher;
 pub use held_engine::HeldEngine;
@@ -38,6 +42,7 @@ pub use provider::{
     fake_tools_factory, live_identity, spawn_fake_coordinator, NO_NETWORK_ORIGIN,
 };
 pub use scripted_tool::ScriptedTool;
+pub use tensorfold_native::{FakeTensorfoldNative, NativeHealthMode, NativeRelease};
 
 use capyctl_domain::launch::{
     CommonEngineSettings, LaunchSettings, MemoryRequest, SettingSource, SglangLaunchSettings,
@@ -53,6 +58,7 @@ use capyctl_domain::launch::{
 pub fn vllm_launch_settings() -> LaunchSettings {
     LaunchSettings::Vllm(VllmLaunchSettings {
         common: CommonEngineSettings::default(),
+        device_request_floor_pct: None,
         memory: MemoryRequest {
             request_bytes: 8 << 30,
             kv_cache_bytes: 4 << 30,
@@ -91,7 +97,7 @@ pub fn vllm_launch_settings() -> LaunchSettings {
 pub fn sglang_launch_settings() -> SglangLaunchSettings {
     SglangLaunchSettings {
         common: CommonEngineSettings {
-            cuda_graphs: Some(false),
+            cuda_graphs: Some(false.into()),
             ..CommonEngineSettings::default()
         },
         // Request = weights (4 GiB here) + KV + margin (ADR 0014 §5), so the

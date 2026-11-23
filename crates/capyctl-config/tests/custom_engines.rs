@@ -220,6 +220,35 @@ fn the_api_must_match_the_manifest() {
     );
 }
 
+// T47 T44 (ADR 0036 §1, §7.2, owner decision 2026-10-27 question 8): a
+// manifest may serve `api: embeddings`; its deployments must say so, resolve
+// `restart_only`, and refuse `deep` and `host_backed`.
+#[test]
+fn a_custom_engine_serves_embeddings_when_its_manifest_does() {
+    let (deployment, host) = fixture("embeddings");
+    let effective = resolve(&deployment, &host).unwrap();
+    assert_eq!(effective.api, DeploymentApi::Embeddings);
+    assert_eq!(effective.residency, Residency::RestartOnly);
+    for tier in ["deep", "host_backed"] {
+        let mut parked = deployment.clone();
+        parked["residency"] = tier.into();
+        let error = resolve(&parked, &host).unwrap_err();
+        assert_eq!(error.path, "residency", "{tier}: {error}");
+    }
+    let mut chat = deployment.clone();
+    chat.as_object_mut().unwrap().remove("api");
+    refused(
+        &resolve(&chat, &host).unwrap_err(),
+        "api",
+        "capability_missing:chat",
+    );
+    let (mut decisions, host) = fixture("decisions");
+    decisions["api"] = "embeddings".into();
+    let error = resolve(&decisions, &host).unwrap_err();
+    refused(&error, "api", "capability_missing:embeddings");
+    assert!(error.detail.contains("`api: decisions`"), "{error}");
+}
+
 // T44 T14 (ADR 0031 §4, §10): CapyCTL renders none of a custom engine's
 // options, so every engine_config field but `context_length` and `env` is
 // refused by name, an explicit `false` or `[]` too.

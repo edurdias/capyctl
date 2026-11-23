@@ -79,7 +79,6 @@ async fn prune_uses_current_references_instead_of_the_last_listing() {
         "retained-source",
         "retained-source",
         &source,
-        capyctl_config::engine_policy::Engine::Vllm,
         &capyctl_cli::standalone_config::TemplateMemory::Unified {
             capacity_bytes: support::TEST_CAPACITY_BYTES,
         },

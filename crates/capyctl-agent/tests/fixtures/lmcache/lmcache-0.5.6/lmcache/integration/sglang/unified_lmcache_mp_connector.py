@@ -7,6 +7,10 @@ class UnifiedLMCacheMPConnector:
         *,
         config_file: Optional[str],
 
+        self._mp_transfer_mode = config.get_extra_config_value(  # type: ignore[attr-defined]
+            "lmcache.mp.mp_transfer_mode", None
+        )
+
     @staticmethod
     def build_cache_salt(cache_salt: Optional[str], extra_key: Optional[str]) -> str:
         """Combine SGLang's salt and extra key into one LMCache namespace."""

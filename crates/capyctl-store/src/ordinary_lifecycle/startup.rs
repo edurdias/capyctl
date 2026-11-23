@@ -384,14 +384,15 @@ pub(super) fn cold(
     )
 }
 
-/// The startup footprint an instance of this revision would reserve if it were
-/// accepted now on `host` (placement judges it before any plan exists), and
-/// whether it is a solo first start that needs the whole host. ADR 0033 §6:
-/// with the LMCache charge a start there would be granted.
+/// The startup footprint `instance` of this revision would reserve if it
+/// were accepted now on `host` (placement judges it before any plan exists),
+/// and whether it is a solo first start that needs the whole host. ADR 0033
+/// §6: with the LMCache charge a start there would be granted.
 pub(super) fn startup_footprint(
     tx: &Transaction<'_>,
     deployment_id: &str,
     revision: i64,
+    instance: u32,
     host: &str,
     e: &EffectiveDeployment,
 ) -> Result<(PhaseFootprint, bool), LifecycleError> {
@@ -401,6 +402,7 @@ pub(super) fn startup_footprint(
             tx,
             deployment_id,
             revision,
+            instance,
             host,
             e,
             with_startup(e, frozen.bytes, &frozen.domains),
@@ -425,19 +427,22 @@ pub(super) fn steady(
     )
 }
 
-/// The Ready footprint a start of this revision on `host` would hold, with
-/// the LMCache charge it would be granted (no plan exists yet).
+/// The Ready footprint a start of `instance` of this revision on `host`
+/// would hold, with the LMCache charge it would be granted (no plan exists
+/// yet).
 pub(super) fn prospective_steady(
-    conn: &rusqlite::Connection,
+    tx: &Transaction<'_>,
     deployment_id: &str,
     revision: i64,
+    instance: u32,
     host: &str,
     e: &EffectiveDeployment,
 ) -> Result<PhaseFootprint, LifecycleError> {
     super::lmcache::prospective(
-        conn,
+        tx,
         deployment_id,
         revision,
+        instance,
         host,
         e,
         phase(&e.resources.ready, ResourcePhase::Ready),

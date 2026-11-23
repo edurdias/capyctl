@@ -8,6 +8,7 @@ use capyctl_config::engine_policy::{
     Engine, ProfileArgError, TENSORFOLD_DRAFTS_CONFLICT, TENSORFOLD_PARALLEL,
 };
 
+use capyctl_config::tensorfold_native::TensorfoldLine;
 use capyctl_domain::group::GroupMemberArgs;
 
 use crate::traits::RenderedCommand;
@@ -34,10 +35,14 @@ pub const ENGINE_ENV_ALLOWLIST: &[&str] = &[
     "DO_NOT_TRACK",
 ];
 /// Variables taken from the agent's own environment.
-const PASS_THROUGH: &[&str] = &["HOME", "CUDA_VISIBLE_DEVICES"];
+pub(super) const PASS_THROUGH: &[&str] = &["HOME", "CUDA_VISIBLE_DEVICES"];
 
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct PlanInputTensorfold {
+    /// ADR 0039 §1: the installation's line, from the effective profile.
+    /// The Python line (0.6.x) renders as ADR 0023 says; the native line
+    /// (1.x) renders ADR 0039 §4 and §5 (`super::native`).
+    pub line: TensorfoldLine,
     pub engine_bin: String,
     pub engine_path_extra: Option<String>,
     pub cuda_home: Option<String>,
@@ -128,6 +133,7 @@ pub fn installation_nccl_lib(engine_bin: &str) -> Option<String> {
 impl std::fmt::Debug for PlanInputTensorfold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PlanInputTensorfold")
+            .field("line", &self.line)
             .field("engine_bin", &self.engine_bin)
             .field("engine_path_extra", &self.engine_path_extra)
             .field("cuda_home", &self.cuda_home)
@@ -168,6 +174,10 @@ pub enum TensorfoldArgsError {
     DraftsConflict,
     #[error("TensorFold runs a group only as TP 2, PP 1 on exactly two hosts")]
     GroupShape,
+    /// ADR 0039 §4, §6, §13: what the native line never renders (a drafter,
+    /// a KV cache type, a group member), with the refusal's own text.
+    #[error("{0}")]
+    NativeRefused(String),
 }
 
 /// ADR 0028 §2, §10: TensorFold 0.6.5 serves a group only as two ranks, one GPU
@@ -239,6 +249,10 @@ fn check_typed(input: &PlanInputTensorfold, typed: &[String]) -> Result<(), Tens
 }
 
 pub fn render_command(input: &PlanInputTensorfold) -> Result<RenderedCommand, TensorfoldArgsError> {
+    // ADR 0039 §1: only the rendering and the environment branch on the line.
+    if input.line.is_native() {
+        return super::native::render_command(input);
+    }
     if input.context_length == 0 {
         return Err(TensorfoldArgsError::NoContext);
     }
@@ -367,7 +381,7 @@ pub fn render_command(input: &PlanInputTensorfold) -> Result<RenderedCommand, Te
 
 /// `bytes` in GiB, rounded down to a whole MiB, written exactly (a MiB is
 /// 1/1024 GiB, a finite decimal): `58`, `58.5`.
-fn gib_text(bytes: i64) -> String {
+pub(super) fn gib_text(bytes: i64) -> String {
     let mib = bytes >> 20;
     let (whole, rest) = (mib / 1024, mib % 1024);
     if rest == 0 {
@@ -380,7 +394,9 @@ fn gib_text(bytes: i64) -> String {
 
 /// The closed environment one launch starts with (SPEC §13.3): the rendered
 /// variables, the closed PATH, the toolchain limits, a few pass-throughs and,
-/// unless the host allows usage reporting, `DO_NOT_TRACK=1`.
+/// unless the host allows usage reporting, `DO_NOT_TRACK=1`. A native-line
+/// plan gets ADR 0039 §5's environment instead, which builds nothing and so
+/// takes no `toolchain`.
 pub fn engine_environment(
     rendered: &BTreeMap<String, String>,
     plan: &PlanInputTensorfold,
@@ -388,6 +404,9 @@ pub fn engine_environment(
     toolchain: &BTreeMap<String, String>,
     telemetry: crate::engine_telemetry::EngineTelemetry,
 ) -> BTreeMap<String, String> {
+    if plan.line.is_native() {
+        return super::native::engine_environment(rendered, plan, inherited, telemetry);
+    }
     let mut env = BTreeMap::new();
     for name in PASS_THROUGH {
         if let Some(value) = inherited(name) {

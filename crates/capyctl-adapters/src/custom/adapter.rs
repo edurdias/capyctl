@@ -28,6 +28,8 @@ pub struct CustomAdapter {
     claimed: Mutex<Option<(String, String)>>,
     /// ADR 0030 §1, ADR 0031 §2: the API the manifest serves.
     api: DeploymentApi,
+    /// ADR 0041 §4: the frozen manifest's declared extraction field types.
+    field_types: Vec<capyctl_config::extractions::FieldType>,
     /// ADR 0031 §5: the manifest's health path.
     health: Option<String>,
     /// ADR 0031 §6: the manifest's idle signal.
@@ -64,6 +66,7 @@ impl CustomAdapter {
             tools: None,
             claimed: Mutex::new(None),
             api: DeploymentApi::Chat,
+            field_types: Vec::new(),
             health: None,
             idle: None,
             proc_root: std::path::PathBuf::from("/proc"),
@@ -83,6 +86,15 @@ impl CustomAdapter {
     /// ADR 0031 §2: the API every deployment on the manifest serves.
     pub fn with_api(mut self, api: DeploymentApi) -> Self {
         self.api = api;
+        self
+    }
+
+    /// ADR 0041 §4: probe only the types approved in the launch's manifest.
+    pub fn with_field_types(
+        mut self,
+        field_types: Vec<capyctl_config::extractions::FieldType>,
+    ) -> Self {
+        self.field_types = field_types;
         self
     }
 
@@ -106,7 +118,16 @@ impl CustomAdapter {
 
     /// ADR 0030 §3: whether readiness is the fixed decision probe.
     pub(super) fn decisions(&self) -> bool {
-        !self.api.is_chat()
+        self.api == DeploymentApi::Decisions
+    }
+
+    pub(super) fn extractions(&self) -> bool {
+        self.api == DeploymentApi::Extractions
+    }
+
+    /// ADR 0036 §1, §5: whether readiness is the fixed embedding probe.
+    pub(super) fn embeddings(&self) -> bool {
+        self.api == DeploymentApi::Embeddings
     }
 
     pub(super) fn launch_parts(
@@ -157,6 +178,39 @@ impl CustomAdapter {
             self.http.base(),
             self.http.key(),
             served,
+            bound,
+        )
+        .await
+    }
+
+    /// ADR 0036 §5: the fixed embedding, on the loopback port with the key.
+    pub(super) async fn embed_probe(
+        &self,
+        served: &str,
+        bound: std::time::Duration,
+    ) -> Result<crate::embedding_probe::EmbeddingAnswer, AdapterError> {
+        crate::embedding_probe::probe(
+            self.http.probes(),
+            self.http.base(),
+            self.http.key(),
+            served,
+            bound,
+        )
+        .await
+    }
+
+    /// ADR 0041 §4: the fixed extraction, on loopback with the launch's key.
+    pub(super) async fn extract_probe(
+        &self,
+        served: &str,
+        bound: std::time::Duration,
+    ) -> Result<crate::extraction_probe::ExtractionAnswer, AdapterError> {
+        crate::extraction_probe::probe(
+            self.http.probes(),
+            self.http.base(),
+            self.http.key(),
+            served,
+            &self.field_types,
             bound,
         )
         .await
@@ -267,40 +321,60 @@ impl EngineAdapter for CustomAdapter {
         Some(self.http.idle(signal).await)
     }
 
-    /// ADR 0031 §5, ADR 0030 §4: a decisions launch's wake check is the fixed
-    /// decision, observed when its answer arrived. A custom engine never
-    /// parks, so only the reference at its first readiness is asked. A chat
-    /// launch has no canary: its check after a restart is the startup chat
-    /// probe its Initialize runs.
+    /// ADR 0031 §5, ADR 0030 §4, ADR 0036 §6: a decisions launch's wake
+    /// check is the fixed decision, an embeddings launch's the fixed
+    /// embedding, observed when its answer arrived. A custom engine never
+    /// parks, so only the reference at its first readiness and the check
+    /// after a restart are asked. A chat launch has no canary: its check
+    /// after a restart is the startup chat probe its Initialize runs.
     async fn wake_canary(
         &self,
         _context: &capyctl_domain::completion::StepExecutionContext,
         _max_tokens: u32,
         bound: std::time::Duration,
     ) -> Result<crate::completion_probe::CanaryAnswer, RuntimeError> {
-        if !self.decisions() {
+        use crate::completion_probe::{CanaryAnswer, CanaryEvidence};
+        let answer = if self.decisions() {
+            CanaryEvidence::Decision(self.decide(&self.model_id, bound).await.map_err(|e| {
+                RuntimeError::Uncertain(format!(
+                    "the custom engine did not answer the decision probe: {e}"
+                ))
+            })?)
+        } else if self.embeddings() {
+            CanaryEvidence::Embedding(self.embed_probe(&self.model_id, bound).await.map_err(
+                |e| {
+                    RuntimeError::Uncertain(format!(
+                        "the custom engine did not answer the embedding probe: {e}"
+                    ))
+                },
+            )?)
+        } else if self.extractions() {
+            // ADR 0041 §5: never substitute another API's wake evidence.
+            CanaryEvidence::Extraction(self.extract_probe(&self.model_id, bound).await.map_err(
+                |e| {
+                    RuntimeError::Uncertain(format!(
+                        "the custom engine did not answer the extraction probe: {e}"
+                    ))
+                },
+            )?)
+        } else {
             return Err(RuntimeError::Unsupported);
-        }
-        let answer = self.decide(&self.model_id, bound).await.map_err(|e| {
-            RuntimeError::Uncertain(format!(
-                "the custom engine did not answer the decision probe: {e}"
-            ))
-        })?;
+        };
         let observed_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
             .ok_or_else(|| RuntimeError::Uncertain("the clock is before the epoch".into()))?;
-        Ok(crate::completion_probe::CanaryAnswer {
-            answer: crate::completion_probe::CanaryEvidence::Decision(answer),
+        Ok(CanaryAnswer {
+            answer,
             observed_at_ms,
         })
     }
 }
 
-/// ADR 0031 §4: chat and decisions through the generic forwarder; an
-/// engine's 4xx keeps the existing rejected mapping. No per-request engine
-/// figures are read.
+/// ADR 0031 §4: chat, decisions and (ADR 0036 §3) embeddings through the
+/// generic forwarder; an engine's 4xx keeps the existing rejected mapping.
+/// No per-request engine figures are read.
 #[async_trait]
 impl ChatForward for CustomAdapter {
     async fn forward_chat_stream_async(
@@ -333,6 +407,25 @@ impl ChatForward for CustomAdapter {
         self.forward.forward_decision(body).await
     }
 
+    // ADR 0041 §3: use the same collected transport as decisions.
+    async fn forward_extraction(
+        &self,
+        body: &crate::request::InferenceRequest,
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
+        self.forward_extraction_traced(body, None).await
+    }
+
+    async fn forward_extraction_traced(
+        &self,
+        body: &crate::request::InferenceRequest,
+        trace: Option<&crate::traits::TraceHeaders>,
+    ) -> Result<crate::answer::EngineAnswer, AdapterError> {
+        if !self.extractions() {
+            return Err(AdapterError::UnsupportedCapability);
+        }
+        self.forward.forward_extraction_traced(body, trace).await
+    }
+
     async fn forward_chat_stream(
         &self,
         body: &crate::request::InferenceRequest,
@@ -354,5 +447,41 @@ impl ChatForward for CustomAdapter {
             return Err(AdapterError::UnsupportedCapability);
         }
         self.decide(served, bound).await
+    }
+
+    /// ADR 0036 §3-§4: an embeddings request through the generic
+    /// forwarder, streamed with its incremental checks.
+    async fn forward_embedding(
+        &self,
+        body: &crate::request::InferenceRequest,
+        sink: &mut dyn crate::traits::EmbeddingSink,
+    ) -> Result<crate::traits::EmbeddingAnswered, AdapterError> {
+        self.forward.forward_embedding(body, sink).await
+    }
+
+    /// ADR 0036 §5: the fixed embedding probe, on the loopback port with the
+    /// launch's key. A chat or decisions custom engine is not asked one.
+    async fn embedding_probe(
+        &self,
+        served: &str,
+        bound: std::time::Duration,
+    ) -> Result<crate::embedding_probe::EmbeddingAnswer, AdapterError> {
+        if !self.embeddings() {
+            return Err(AdapterError::UnsupportedCapability);
+        }
+        self.embed_probe(served, bound).await
+    }
+
+    /// ADR 0041 §4: use the frozen declaration, never all types from the API.
+    async fn extraction_probe(
+        &self,
+        served: &str,
+        declared: &[capyctl_config::extractions::FieldType],
+        bound: std::time::Duration,
+    ) -> Result<crate::extraction_probe::ExtractionAnswer, AdapterError> {
+        if !self.extractions() || declared != self.field_types {
+            return Err(AdapterError::UnsupportedCapability);
+        }
+        self.extract_probe(served, bound).await
     }
 }

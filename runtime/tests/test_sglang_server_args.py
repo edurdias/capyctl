@@ -24,11 +24,11 @@ class SyntheticArgs(SimpleNamespace):
     __struct_fields__ = ()  # replaced per class below
 
     def resolve_once(self):
-        disabled = getattr(self, "disable_decode_cuda_graph", False)
-        backend = "disabled" if disabled else "full"
-        self.cuda_graph_config = SimpleNamespace(
-            prefill=SimpleNamespace(backend=backend),
-            decode=SimpleNamespace(backend=backend))
+        self.cuda_graph_config = SimpleNamespace(**{
+            phase: SimpleNamespace(
+                backend="disabled" if getattr(self, "disable_" + phase + "_cuda_graph", False)
+                else "full")
+            for phase in ("prefill", "decode")})
 
     def resolved_dict(self):
         result = vars(self).copy()
@@ -73,6 +73,13 @@ class SyntheticArgs(SimpleNamespace):
         parser.add_argument("--export-metrics-to-file", action="store_true")
         parser.add_argument("--export-metrics-to-file-dir", default=None)
         parser.add_argument("--spec-trace-dir", default=None)
+        # ADR 0036 §2: the embedding-server switch.
+        parser.add_argument("--is-embedding", action="store_true")
+        # ADR 0037 §7: tracing (0.5.22 arg_groups/fields/observability.py).
+        parser.add_argument("--enable-trace", action="store_true")
+        parser.add_argument("--otlp-traces-endpoint", default="localhost:4317")
+        parser.add_argument("--otlp-service-name", default="sglang")
+        parser.add_argument("--trace-modules", default="request")
 
 
 SyntheticArgs.__struct_fields__ = (
@@ -84,7 +91,8 @@ SyntheticArgs.__struct_fields__ = (
     "max_mamba_cache_size", "mamba_full_memory_ratio", "speculative_draft_model_path",
     "watermark_config", "debug_tensor_dump_output_folder", "debug_tensor_dump_layers",
     "msprobe_dump_config", "export_metrics_to_file", "export_metrics_to_file_dir",
-    "spec_trace_dir")
+    "spec_trace_dir", "enable_trace", "otlp_traces_endpoint", "otlp_service_name",
+    "trace_modules")
 
 
 def synthetic_constructor(**kwargs):
@@ -140,6 +148,7 @@ class MappingTests(LaunchFixture, unittest.TestCase):
             "nnodes": 1, "node_rank": 0, "gpu_id_step": 1,
             "mem_fraction_static": 0.0625, "enable_memory_saver": True,
             "enable_weights_cpu_backup": False, "enable_draft_weights_cpu_backup": False,
+            "is_embedding": False,
             "cpu_offload_gb": 0, "disaggregation_mode": "null",
             "enable_hierarchical_cache": False, "enable_lmcache": False,
             "enable_flexkv": False, "grpc_port": None, "grpc_mode": False,
@@ -180,6 +189,38 @@ class MappingTests(LaunchFixture, unittest.TestCase):
         for graph in ("disable_prefill_cuda_graph", "disable_decode_cuda_graph",
                       "cuda_graph_backend_prefill", "cuda_graph_backend_decode"):
             self.assertNotIn(graph, kwargs)
+
+    # T14 T22 / ADR 0014 §2 / SPEC §8.1 / #236: each disabled phase maps to
+    # its 0.5.22 CLI-equivalent keyword; enabled phases retain native defaults.
+    def test_cuda_graph_phases_render_independently(self):
+        for prefill in (False, True):
+            for decode in (False, True):
+                policy = dict(prefill=prefill, decode=decode)
+                with self.subTest(policy=policy):
+                    kwargs = self.seen(self.spec_with(cuda_graphs=policy))
+                    for phase, enabled in policy.items():
+                        disable = "disable_" + phase + "_cuda_graph"
+                        backend = "cuda_graph_backend_" + phase
+                        if enabled:
+                            self.assertNotIn(disable, kwargs)
+                            self.assertNotIn(backend, kwargs)
+                        else:
+                            self.assertIs(kwargs[disable], True)
+                            self.assertEqual(kwargs[backend], "disabled")
+
+    # T14 T22 / SPEC §8.1: resolved drift checks apply only to disabled phases.
+    def test_independent_disabled_phase_must_survive_resolution(self):
+        for phase in ("prefill", "decode"):
+            policy = dict(prefill=True, decode=True)
+            policy[phase] = False
+            def changed(**kwargs):
+                effective = synthetic_constructor(**kwargs)
+                effective.resolve_once()
+                effective.resolve_once = lambda: None
+                getattr(effective.cuda_graph_config, phase).backend = "full"
+                return effective
+            with self.subTest(phase=phase), self.assertRaises(mapping.ServerArgsError):
+                construct(self.spec_with(cuda_graphs=policy), self.placement(), changed)
 
     def test_residency_decides_saver_and_weight_backup(self):
         kwargs = self.seen(self.spec_with(memory_saver=True, cpu_weight_backup=True,
@@ -234,6 +275,30 @@ class MappingTests(LaunchFixture, unittest.TestCase):
                     construct(self.spec_with(max_mamba_cache_size=40, extra_args=extra),
                               self.placement(), constructor)
                 self.assertEqual(caught.exception.code, "effective_args_mismatch")
+
+    # T47 T14 (ADR 0036 §2): capyctl renders `is_embedding` for an embeddings
+    # deployment; no extra argument may set it, chat or embeddings.
+    def test_is_embedding_is_rendered_by_capyctl_only(self):
+        constructor = mock.Mock(side_effect=AssertionError("constructed"))
+        constructor.add_cli_args = SyntheticArgs.add_cli_args
+        constructor.__struct_fields__ = SyntheticArgs.__struct_fields__
+        for embedding in (False, True):
+            with self.subTest(embedding=embedding):
+                settings = {"extra_args": ["--is-embedding"]}
+                if embedding:
+                    settings["is_embedding"] = True
+                with self.assertRaises(mapping.ServerArgsError) as caught:
+                    construct(self.spec_with(**settings), self.placement(), constructor)
+                self.assertEqual(caught.exception.code, "effective_args_mismatch")
+        self.public["settings"]["extra_args"] = []
+        kwargs = self.seen(self.spec_with(is_embedding=True))
+        self.assertIs(kwargs["is_embedding"], True)
+        kwargs = self.seen(self.build_without("is_embedding"))
+        self.assertIs(kwargs["is_embedding"], False)
+        # The descriptor carries the setting only as `true`.
+        with self.assertRaises(entry.LaunchError) as caught:
+            self.spec_with(is_embedding=False)
+        self.assertEqual(caught.exception.code, "invalid_descriptor")
 
     # T14: ADR 0008 amendment 2026-10-08. A declared drafter's directory,
     # which capyctl materialized, reaches the constructor as the draft model
@@ -361,6 +426,61 @@ class MappingTests(LaunchFixture, unittest.TestCase):
                     construct(self.spec_with(extra_args=extra), self.placement(),
                               unreachable)
                 self.assertEqual(caught.exception.code, "effective_args_mismatch")
+
+    # T48 T21 (ADR 0037 §7, owner decision 2026-10-27 q7): the tracing
+    # destinations are CapyCTL's, refused however spelled and whatever the
+    # host approves, before construction.
+    def test_tracing_destinations_are_refused_however_spelled(self):
+        from runtime import extra_args_policy as policy
+
+        def unreachable(**_):
+            self.fail("constructor reached")
+
+        unreachable.add_cli_args = SyntheticArgs.add_cli_args
+        unreachable.__struct_fields__ = SyntheticArgs.__struct_fields__
+        approved = policy.parse_approvals(
+            '{"options": ["--enable-trace", "--otlp-traces-endpoint", '
+            '"--otlp-service-name", "--trace-modules"], "paths": [], '
+            '"trust_remote_code": false}')
+        for extra in (["--enable-trace"], ["--enable-tr"],
+                      ["--otlp-traces-endpoint", "http://collector:4317"],
+                      ["--otlp-traces=http://collector:4317"],
+                      ["--otlp-service-name", "mine"], ["--otlp-serv=mine"],
+                      ["--trace-modules", "all"], ["--trace-mod=all"]):
+            with self.subTest(extra=extra):
+                with self.assertRaises(mapping.ServerArgsError) as caught:
+                    mapping.construct_server_args(
+                        self.spec_with(extra_args=extra), self.placement(), unreachable,
+                        AVAILABLE, approved)
+                self.assertEqual(caught.exception.code, "effective_args_mismatch")
+                self.assertNotIn("collector", str(caught.exception))
+
+    # T48 (ADR 0037 §7): a traced launch's descriptor names the endpoint, and
+    # tracing is rendered and pinned as reserved values; without it nothing
+    # is rendered. A resolution changing any pinned value is a mismatch.
+    def test_a_trace_endpoint_turns_tracing_on_as_reserved_values(self):
+        endpoint = "http://127.0.0.1:4318/v1/traces"
+        kwargs = self.seen(self.spec_with(trace_endpoint=endpoint))
+        self.assertIs(kwargs["enable_trace"], True)
+        self.assertEqual(kwargs["otlp_traces_endpoint"], endpoint)
+        self.assertEqual(kwargs["otlp_service_name"], "sglang")
+        self.assertNotIn("trace_modules", kwargs)
+        kwargs = self.seen(self.build_without("trace_endpoint"))
+        for name in ("enable_trace", "otlp_traces_endpoint", "otlp_service_name"):
+            self.assertNotIn(name, kwargs)
+        for key, replacement in (("enable_trace", False),
+                                 ("otlp_traces_endpoint", "http://elsewhere:4318"),
+                                 ("otlp_service_name", "other")):
+            def changed(**kwargs):
+                effective = synthetic_constructor(**kwargs)
+                effective.resolve_once()
+                effective.resolve_once = lambda: None
+                setattr(effective, key, replacement)
+                return effective
+            changed.add_cli_args = SyntheticArgs.add_cli_args
+            with self.subTest(key=key), self.assertRaises(mapping.ServerArgsError) as caught:
+                construct(self.spec_with(trace_endpoint=endpoint), self.placement(), changed)
+            self.assertEqual(caught.exception.code, "effective_args_mismatch")
 
     # T21 T22: ADR 0014 §8, SPEC §8.2. A sensitive destination is refused on
     # what the installed parser resolved, so an abbreviation the deploy-time

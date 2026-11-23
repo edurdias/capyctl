@@ -485,6 +485,15 @@ impl HostJournal {
         // `LaunchLmcacheReport`). Evidence only, same schema version like
         // member_exits: an older journal simply has no report.
         tx.execute_batch("CREATE TABLE IF NOT EXISTS launch_lmcache(command_id TEXT PRIMARY KEY REFERENCES commands(command_id),report BLOB NOT NULL);")?;
+        // ADR 0037 §7: a LaunchSingle's engine tracing decision, frozen when
+        // it launched (`on` or the off reason's code). Evidence only, same
+        // schema version like member_exits: an older journal has none, and
+        // its launches are reported and re-bound untraced.
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS launch_engine_tracing(command_id TEXT PRIMARY KEY REFERENCES commands(command_id),state TEXT NOT NULL);")?;
+        // ADR 0018 §3; SPEC §13.2: the exact locally approved profile set
+        // retained launches may need after a host restart. Like the other
+        // additive evidence tables, old journals have no saved document.
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS launch_profiles(command_id TEXT PRIMARY KEY REFERENCES commands(command_id),config_json TEXT NOT NULL,inventory BLOB NOT NULL);")?;
         let bound: (String, String) = tx.query_row(
             "SELECT controller,host FROM authority WHERE singleton=1",
             [],
@@ -810,6 +819,105 @@ impl HostJournal {
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         load_command(&db, command_id)
     }
+    /// ADR 0018 §3; SPEC §13.2: keep the locally approved document before
+    /// its accepted launch gains effect authority. It is immutable evidence
+    /// bound to this journal's controller, host and exact command digest,
+    /// never authorization for another launch.
+    pub(crate) fn record_launch_profile(
+        &self,
+        session: u64,
+        command: &MemberCommand,
+        profile: &crate::profiles::ProfileSet,
+    ) -> Result<(), JournalError> {
+        let _gate = self.transition.lock().map_err(|_| JournalError::Storage)?;
+        self.validate()?;
+        self.check_session(session)?;
+        let plan = command
+            .action
+            .launch_plan()
+            .ok_or(JournalError::Unauthorized)?;
+        if command.identity.controller_id != self.controller
+            || command.identity.member.host_id != self.host
+            || profile.fingerprint != plan.host_policy_fingerprint
+            || profile.inventory.policy_fingerprint != plan.host_policy_fingerprint
+            || capyctl_config::remote_resources::policy_fingerprint(&profile.config.document)
+                != plan.host_policy_fingerprint
+        {
+            return Err(JournalError::Unauthorized);
+        }
+        let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+        let id = &command.identity.command_id;
+        if load_command(&db, id)? != *command || record(&db, id)?.state != CommandState::Accepted {
+            return Err(JournalError::Conflict);
+        }
+        let document = profile.config.document.to_string();
+        let inventory = profile.inventory.encode_to_vec();
+        let existing: Option<(String, Vec<u8>)> = db
+            .query_row(
+                "SELECT config_json,inventory FROM launch_profiles WHERE command_id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            return if existing == (document, inventory) {
+                Ok(())
+            } else {
+                Err(JournalError::Conflict)
+            };
+        }
+        db.execute(
+            "INSERT INTO launch_profiles(command_id,config_json,inventory) VALUES(?1,?2,?3)",
+            params![id, document, inventory],
+        )?;
+        Ok(())
+    }
+
+    /// The original approved profile set of exactly this retained command.
+    /// Absence on an older journal is not permission to use today's policy.
+    pub(crate) fn launch_profile(
+        &self,
+        owned: &MemberCommand,
+    ) -> Result<Option<crate::profiles::ProfileSet>, JournalError> {
+        self.validate()?;
+        let plan = owned
+            .action
+            .launch_plan()
+            .ok_or(JournalError::Unauthorized)?;
+        if owned.identity.controller_id != self.controller
+            || owned.identity.member.host_id != self.host
+        {
+            return Err(JournalError::Unauthorized);
+        }
+        let saved: Option<(String, Vec<u8>)> = {
+            let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+            let id = &owned.identity.command_id;
+            if load_command(&db, id)? != *owned || !record(&db, id)?.claim_retained {
+                return Err(JournalError::Conflict);
+            }
+            db.query_row(
+                "SELECT config_json,inventory FROM launch_profiles WHERE command_id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+        };
+        let Some((document, inventory)) = saved else {
+            return Ok(None);
+        };
+        let config = capyctl_config::remote_roles::HostConfig::parse(&document)
+            .map_err(|_| JournalError::Storage)?;
+        let inventory =
+            pb::ReportInventory::decode(inventory.as_slice()).map_err(|_| JournalError::Storage)?;
+        if capyctl_config::remote_resources::policy_fingerprint(&config.document)
+            != plan.host_policy_fingerprint
+            || inventory.policy_fingerprint != plan.host_policy_fingerprint
+        {
+            return Err(JournalError::Conflict);
+        }
+        Ok(Some(crate::profiles::ProfileSet::new(config, inventory)))
+    }
+
     pub fn history(
         &self,
         after_sequence: i64,
@@ -848,11 +956,21 @@ impl HostJournal {
     /// unresolved results are never compacted. Pagination bounds resume replies.
     pub fn compact_completed(&self, through_sequence: i64) -> Result<usize, JournalError> {
         self.validate()?;
-        let db = self.db.lock().map_err(|_| JournalError::Storage)?;
-        Ok(db.execute(
+        let mut db = self.db.lock().map_err(|_| JournalError::Storage)?;
+        let tx = db.transaction()?;
+        let compacted = tx.execute(
             "UPDATE commands SET body=NULL,state=4 WHERE sequence<=?1 AND state=3 AND claim=0",
             [through_sequence],
-        )?)
+        )?;
+        // ADR 0018 §3: the full approved document is retained execution
+        // context, not part of a completed command's identity tombstone.
+        tx.execute(
+            "DELETE FROM launch_profiles WHERE command_id IN
+             (SELECT command_id FROM commands WHERE sequence<=?1 AND state=4 AND claim=0)",
+            [through_sequence],
+        )?;
+        tx.commit()?;
+        Ok(compacted)
     }
     pub fn execute(
         self: &Arc<Self>,
@@ -1319,6 +1437,17 @@ impl HostJournal {
                 until_unix_ms: build.until_ms,
             })
             .collect();
+        // ADR 0041 §§4–5: persist the original fixed answer with readiness,
+        // so a redelivered launch never substitutes a second extraction.
+        result.probe_extraction =
+            observation
+                .extraction_probe
+                .as_ref()
+                .map(|answer| pb::ExtractionProbeEvidence {
+                    probe_version: answer.probe_version,
+                    declared_field_types: answer.declared_field_types.clone(),
+                    answers_json: answer.answers_json.clone(),
+                });
         capyctl_protocol::execution::validate_result(&command, &result)
             .map_err(|_| JournalError::Conflict)?;
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
@@ -2002,6 +2131,8 @@ impl HostJournal {
             probe_text: String::new(),
             // ADR 0030 §4: nor a decision probe's answer.
             probe_decision: None,
+            probe_embedding: None,
+            probe_extraction: None,
             // ADR 0033 §§8, 9: a LaunchSingle's or a Restore's own LMCache
             // report, as journaled when its Initialize ended.
             lmcache: match command.action {
@@ -2010,6 +2141,15 @@ impl HostJournal {
                     lmcache_report(&db, command_id)?.map(|report| report.to_wire())
                 }
                 _ => None,
+            },
+            // ADR 0037 §7: a LaunchSingle's engine tracing, as journaled
+            // when it launched; empty for every other command.
+            engine_tracing: match command.action {
+                MemberAction::LaunchSingle(_) => {
+                    let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+                    engine_tracing_state(&db, command_id)?.unwrap_or_default()
+                }
+                _ => String::new(),
             },
         };
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
@@ -2090,6 +2230,7 @@ impl HostJournal {
                 // ADR 0014 amendment A12: they travel with the readiness proof.
                 if result.model_usable {
                     result.kernel_builds = previous.kernel_builds;
+                    result.probe_extraction = previous.probe_extraction;
                 }
             }
         }
@@ -2232,6 +2373,46 @@ impl HostJournal {
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         Ok(lmcache_report(&db, owned_handle)?
             .is_some_and(|report| report.state == LaunchLmcacheState::On))
+    }
+
+    /// ADR 0037 §7: journal the engine tracing decision of the launch
+    /// `command_id` (`on` or the off reason's code; a group member's is
+    /// `group`), before its engine starts, so a replay reports it and a
+    /// restarted host binds the launch's ingress with it. The first decision
+    /// stands: it was frozen with the launch.
+    pub fn record_launch_engine_tracing(
+        &self,
+        command_id: &str,
+        state: &str,
+    ) -> Result<(), JournalError> {
+        self.validate()?;
+        if !capyctl_protocol::execution::ENGINE_TRACING_STATES.contains(&state) {
+            return Err(JournalError::Unauthorized);
+        }
+        let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+        let command = load_command(&db, command_id)?;
+        if !matches!(
+            command.action,
+            MemberAction::LaunchSingle(_) | MemberAction::Launch { .. }
+        ) {
+            return Err(JournalError::Unauthorized);
+        }
+        db.execute(
+            "INSERT INTO launch_engine_tracing(command_id,state) VALUES(?1,?2) ON CONFLICT(command_id) DO NOTHING",
+            params![command_id, state],
+        )?;
+        Ok(())
+    }
+
+    /// ADR 0037 §7: the journaled engine tracing decision of the launch
+    /// `owned_handle`, if one was journaled.
+    pub fn launch_engine_tracing(
+        &self,
+        owned_handle: &str,
+    ) -> Result<Option<String>, JournalError> {
+        self.validate()?;
+        let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+        engine_tracing_state(&db, owned_handle)
     }
 
     /// ADR 0033 §4 (lifecycle design §1.8): the incarnation of every launch
@@ -2402,6 +2583,17 @@ fn lmcache_report(
                 .ok_or(JournalError::Storage)
         })
         .transpose()
+}
+
+/// ADR 0037 §7: the journaled engine tracing state of `command_id`, if any.
+fn engine_tracing_state(db: &Connection, command_id: &str) -> Result<Option<String>, JournalError> {
+    Ok(db
+        .query_row(
+            "SELECT state FROM launch_engine_tracing WHERE command_id=?1",
+            [command_id],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 /// ADR 0027, ADR 0033 §3: `current` is still the launch `expected` names:

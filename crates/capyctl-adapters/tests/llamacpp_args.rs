@@ -7,7 +7,7 @@ use capyctl_adapters::llamacpp::{
     LlamacppDirs, LlamacppPlanError, PlanInputLlamacpp,
 };
 use capyctl_config::effective::{
-    resolve_effective_with_checkpoint, CheckpointFacts, EffectiveDeployment,
+    resolve_effective_with_checkpoint, CheckpointFacts, DeploymentApi, EffectiveDeployment,
 };
 use capyctl_domain::launch::LlamacppGpuLayers;
 use serde_json::{json, Value};
@@ -162,7 +162,7 @@ fn reserved_pass_through_options_are_refused_at_render() {
 #[test]
 fn the_recheck_refuses_a_reserved_option_in_the_final_vector() {
     let block = strings(BLOCK);
-    recheck_rendered(&block).unwrap();
+    recheck_rendered(&block, DeploymentApi::Chat).unwrap();
     for (tail, refused) in [
         (&["--ctx-size", "4096"][..], "--ctx-size"),
         (&["--ctx_size", "4096"], "--ctx-size"),
@@ -176,7 +176,7 @@ fn the_recheck_refuses_a_reserved_option_in_the_final_vector() {
         let mut argv = block.clone();
         argv.extend(strings(tail));
         assert_eq!(
-            recheck_rendered(&argv),
+            recheck_rendered(&argv, DeploymentApi::Chat),
             Err(LlamacppArgsError::RenderedReserved(refused.into())),
             "{tail:?}"
         );
@@ -187,9 +187,153 @@ fn the_recheck_refuses_a_reserved_option_in_the_final_vector() {
         .cloned()
         .collect();
     assert_eq!(
-        recheck_rendered(&without),
+        recheck_rendered(&without, DeploymentApi::Chat),
         Err(LlamacppArgsError::RenderedReserved("--metrics".into()))
     );
+}
+
+fn embeddings_plan() -> PlanInputLlamacpp {
+    PlanInputLlamacpp {
+        api: DeploymentApi::Embeddings,
+        ..plan()
+    }
+}
+
+// T47 T14 (ADR 0036 §2): an embeddings deployment renders `--embeddings`,
+// and `--ubatch-size` and `--batch-size` equal to the slot window
+// (pad256(15000) = 15104), after CapyCTL's chat block and before the
+// arguments; a chat deployment renders none of them.
+#[test]
+fn an_embeddings_deployment_renders_its_option_and_batch_sizes() {
+    let argv = render_command(&embeddings_plan()).unwrap().argv;
+    let mut expected = strings(BLOCK);
+    expected.extend(strings(&[
+        "--embeddings",
+        "--ubatch-size",
+        "15104",
+        "--batch-size",
+        "15104",
+    ]));
+    assert_eq!(argv, expected);
+    let chat = render_command(&plan()).unwrap().argv;
+    for option in ["--embeddings", "--ubatch-size", "--batch-size"] {
+        assert!(!chat.iter().any(|token| token == option), "{option}");
+    }
+}
+
+// T47 T14 (ADR 0036 §2): a batch size the arguments state wins, host-fixed
+// or the deployment's, in either spelling; the other is still rendered.
+#[test]
+fn an_explicit_batch_size_wins() {
+    let count = |argv: &[String], option: &str| argv.iter().filter(|t| *t == option).count();
+    let value = |argv: &[String], option: &str| {
+        argv.windows(2)
+            .find(|w| w[0] == option)
+            .map(|w| w[1].clone())
+    };
+    let mut input = embeddings_plan();
+    input.extra_args = strings(&["--batch-size", "2048"]);
+    let argv = render_command(&input).unwrap().argv;
+    assert_eq!(count(&argv, "--batch-size"), 1);
+    assert_eq!(value(&argv, "--batch-size").as_deref(), Some("2048"));
+    assert_eq!(value(&argv, "--ubatch-size").as_deref(), Some("15104"));
+    let mut input = embeddings_plan();
+    input.engine_args = strings(&["--ubatch_size", "512"]);
+    let argv = render_command(&input).unwrap().argv;
+    assert_eq!(count(&argv, "--ubatch-size"), 0);
+    assert_eq!(value(&argv, "--ubatch_size").as_deref(), Some("512"));
+    assert_eq!(value(&argv, "--batch-size").as_deref(), Some("15104"));
+}
+
+// T47 T14 (ADR 0036 §2): the deployment's own `--pooling` is ordinary on an
+// embeddings deployment, once and never `none`; it stays reserved in the
+// host-fixed arguments and on a chat deployment, as do `--embedding` and
+// `--embeddings` everywhere.
+#[test]
+fn pooling_is_the_embeddings_deployments_own() {
+    let mut input = embeddings_plan();
+    input.extra_args = strings(&["--pooling", "last"]);
+    let argv = render_command(&input).unwrap().argv;
+    assert_eq!(argv[argv.len() - 2..], strings(&["--pooling", "last"]));
+    for (api, fixed, extra) in [
+        (
+            DeploymentApi::Embeddings,
+            &[][..],
+            &["--pooling", "none"][..],
+        ),
+        (DeploymentApi::Embeddings, &["--pooling", "mean"], &[]),
+        (DeploymentApi::Chat, &[], &["--pooling", "mean"]),
+        (DeploymentApi::Embeddings, &[], &["--embedding"]),
+        (DeploymentApi::Embeddings, &[], &["--embeddings"]),
+        (DeploymentApi::Chat, &[], &["--embeddings"]),
+    ] {
+        let mut input = PlanInputLlamacpp { api, ..plan() };
+        input.engine_args = strings(fixed);
+        input.extra_args = strings(extra);
+        assert!(
+            matches!(render_command(&input), Err(LlamacppArgsError::Reserved(_))),
+            "{api:?} {fixed:?} {extra:?}"
+        );
+    }
+    let mut input = embeddings_plan();
+    input.extra_args = strings(&["--pooling", "mean", "--pooling", "cls"]);
+    assert!(matches!(
+        render_command(&input),
+        Err(LlamacppArgsError::Duplicate(_))
+    ));
+    input.extra_args = strings(&["--pooling"]);
+    assert!(matches!(
+        render_command(&input),
+        Err(LlamacppArgsError::Malformed(_))
+    ));
+}
+
+// T47 T14 (ADR 0036 §2, SPEC §8.2): the recheck holds an embeddings vector to
+// `--embeddings` exactly once and `--pooling` at most once, never `none`,
+// and refuses either on a chat vector.
+#[test]
+fn the_recheck_knows_the_embeddings_options() {
+    let embeddings = DeploymentApi::Embeddings;
+    let rendered = render_command(&embeddings_plan()).unwrap().argv;
+    recheck_rendered(&rendered, embeddings).unwrap();
+    let mut pooled = rendered.clone();
+    pooled.extend(strings(&["--pooling", "mean"]));
+    recheck_rendered(&pooled, embeddings).unwrap();
+    let without: Vec<String> = rendered
+        .iter()
+        .filter(|token| *token != "--embeddings")
+        .cloned()
+        .collect();
+    for (argv, api, refused) in [
+        (without, embeddings, "--embeddings"),
+        (
+            [rendered.clone(), strings(&["--embedding"])].concat(),
+            embeddings,
+            "--embeddings",
+        ),
+        (
+            [pooled.clone(), strings(&["--pooling", "cls"])].concat(),
+            embeddings,
+            "--pooling",
+        ),
+        (
+            [rendered.clone(), strings(&["--pooling", "none"])].concat(),
+            embeddings,
+            "--pooling",
+        ),
+        (rendered.clone(), DeploymentApi::Chat, "--embeddings"),
+        (
+            [strings(BLOCK), strings(&["--pooling", "mean"])].concat(),
+            DeploymentApi::Chat,
+            "--pooling",
+        ),
+    ] {
+        assert_eq!(
+            recheck_rendered(&argv, api),
+            Err(LlamacppArgsError::RenderedReserved(refused.into())),
+            "{api:?} {argv:?}"
+        );
+    }
 }
 
 // T42 (ADR 0029 §10): llama-server splits `--alias` at commas and trims it, so
@@ -432,5 +576,45 @@ fn a_draft_model_outside_the_approved_paths_is_refused_at_launch() {
                 Err(LlamacppPlanError::PathNotApproved(name)) if name == "--model-draft"
             ));
         }
+    }
+}
+
+// T47 T14 (ADR 0036 §2): a resolved embeddings deployment's plan carries its
+// API, and its command renders `--embeddings`, the batch sizes at the slot
+// window and the deployment's own `--pooling`; the same deployment as chat
+// renders none of them.
+#[test]
+fn the_builder_renders_an_embeddings_deployment() {
+    let checkpoint = tempfile::tempdir().unwrap();
+    touch(checkpoint.path(), &["e5-large-f16.gguf"]);
+    let (mut deployment, host) = fixture(checkpoint.path());
+    deployment["api"] = "embeddings".into();
+    deployment["engine_config"] = json!({"context_length": 512, "accept_extra_args": true,
+        "extra_args": ["--pooling", "mean"]});
+    let effective = resolve_measured(&deployment, &host);
+    let plan = plan_from_effective(&effective, 8101, "/l/i.log".into(), &dirs()).unwrap();
+    assert_eq!(plan.api, DeploymentApi::Embeddings);
+    let argv = render_command(&plan).unwrap().argv;
+    for pair in [
+        ["--ubatch-size", "512"],
+        ["--batch-size", "512"],
+        ["--pooling", "mean"],
+    ] {
+        assert!(argv.windows(2).any(|w| w == pair), "{pair:?}: {argv:?}");
+    }
+    assert_eq!(argv.iter().filter(|t| *t == "--embeddings").count(), 1);
+    deployment.as_object_mut().unwrap().remove("api");
+    deployment["engine_config"] = json!({"context_length": 512});
+    let chat = plan_from_effective(
+        &resolve_measured(&deployment, &host),
+        8101,
+        "/l/i.log".into(),
+        &dirs(),
+    )
+    .unwrap();
+    assert_eq!(chat.api, DeploymentApi::Chat);
+    let argv = render_command(&chat).unwrap().argv;
+    for option in ["--embeddings", "--ubatch-size", "--batch-size"] {
+        assert!(!argv.iter().any(|t| t == option), "{option}");
     }
 }

@@ -34,6 +34,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::engine_policy::{option_names, typed_field_option, Engine};
+use crate::tensorfold_native::TensorfoldLine;
 
 // ADR 0029 §9: llama.cpp's KV cache and request from the GGUF header.
 pub mod llamacpp;
@@ -312,10 +313,9 @@ fn draft_shape(inputs: &FitInputs<'_>) -> Result<Option<KvShape>, String> {
     }
 }
 
-/// The largest block-aligned context the grant holds for `shape` (and the
-/// draft model's `draft`, whose KV shares the grant), capped at the model's
-/// maximum position.
-fn fitted_tokens(
+/// Key plus value bytes for one token of `shape` (and the draft model's
+/// `draft`, whose KV shares the grant), at the launch's element width.
+fn per_token_bytes(
     inputs: &FitInputs<'_>,
     shape: &KvShape,
     draft: Option<&KvShape>,
@@ -331,6 +331,18 @@ fn fitted_tokens(
             .and_then(|bytes| bytes.checked_add(per_token))
             .ok_or("the KV bytes per token overflow")?;
     }
+    Ok(per_token)
+}
+
+/// The largest block-aligned context the grant holds for `shape` (and the
+/// draft model's `draft`, whose KV shares the grant), capped at the model's
+/// maximum position.
+fn fitted_tokens(
+    inputs: &FitInputs<'_>,
+    shape: &KvShape,
+    draft: Option<&KvShape>,
+) -> Result<u64, String> {
+    let per_token = per_token_bytes(inputs, shape, draft)?;
     let grant = u64::try_from(inputs.kv_cache_bytes)
         .ok()
         .filter(|bytes| *bytes > 0)
@@ -493,6 +505,7 @@ pub fn read_model_config(checkpoint_root: &Path) -> Result<Value, String> {
 /// 0008 amendment 2026-10-08); without one, the arguments may name a draft.
 pub fn fit_for_launch(
     engine: Engine,
+    line: TensorfoldLine,
     settings: &LaunchSettings,
     profile_args: &[String],
     checkpoint_root: Option<&Path>,
@@ -508,6 +521,15 @@ pub fn fit_for_launch(
         LaunchSettings::Sglang(s) => (&s.common, &s.memory, None, 0),
         LaunchSettings::Tensorfold(s) => (&s.common, &s.memory, None, 0),
         LaunchSettings::Llamacpp(s) => (&s.common, &s.memory, None, 0),
+        // ADR 0038 §3, §4: TensorRT-LLM's pool is `kv_cache_config.max_tokens`
+        // in blocks of `tokens_per_block`; a fitted `--max_seq_len` is held to
+        // whole blocks so the built pool holds one window.
+        LaunchSettings::TensorrtLlm(s) => (
+            &s.common,
+            &s.memory,
+            Some(crate::tensorrt_llm::tokens_per_block(&s.llm_api_options)),
+            0,
+        ),
         // ADR 0031 §4: CapyCTL fits nothing for a custom engine; a declared
         // context reaches it only through its placeholder, and otherwise the
         // manifest, the host's own command, decides.
@@ -614,7 +636,7 @@ pub fn fit_for_launch(
             Err(refusal) => fit.warning = Some(refusal),
         }
     }
-    fit.streams = launch_streams(settings, profile_args, config.as_ref().ok());
+    fit.streams = launch_streams(settings, line, profile_args, config.as_ref().ok());
     fit
 }
 
@@ -638,13 +660,18 @@ pub fn vllm_default_max_num_seqs(
 /// passes TensorFold: the deployment's `max_concurrent_requests`, else
 /// `TENSORFOLD_DEFAULT_PARALLEL`. `None` when the
 /// extra or host-fixed arguments pass `--parallel` themselves (they win;
-/// beside a declared count they are refused at resolution).
-pub fn tensorfold_parallel(settings: &LaunchSettings, profile_args: &[String]) -> Option<u32> {
+/// beside a declared count they are refused at resolution). ADR 0039 §4: on
+/// the native line `--parallel` is found by its exact name.
+pub fn tensorfold_parallel(
+    settings: &LaunchSettings,
+    line: TensorfoldLine,
+    profile_args: &[String],
+) -> Option<u32> {
     let LaunchSettings::Tensorfold(s) = settings else {
         return None;
     };
     let passed = |args: &[String]| {
-        crate::engine_policy::tensorfold_parallel(args).map_or(true, |found| found.is_some())
+        crate::tensorfold_native::parallel_on(line, args).map_or(true, |found| found.is_some())
     };
     if passed(profile_args) || passed(&s.extra_args) {
         return None;
@@ -657,19 +684,31 @@ pub fn tensorfold_parallel(settings: &LaunchSettings, profile_args: &[String]) -
 }
 
 /// The model families whose CUDA engine TensorFold 0.6.3 to 0.6.5 runs one request at
-/// a time whatever `--parallel` says (`families/nemotron_h`).
+/// a time whatever `--parallel` says (`families/nemotron_h`). ADR 0039
+/// Evidence §6: the native line shares each round among them, so this is the
+/// Python line's alone.
 const TENSORFOLD_ONE_AT_A_TIME: &[&str] = &["nemotron_h"];
 
 /// The streams a launch decodes together, for status: TensorFold's
 /// `--parallel` and llama.cpp's slots; `None` for the other engines.
 fn launch_streams(
     settings: &LaunchSettings,
+    line: TensorfoldLine,
     profile_args: &[String],
     config: Option<&Value>,
 ) -> Option<Streams> {
     match settings {
         LaunchSettings::Llamacpp(s) => Some(llamacpp_streams(s)),
-        _ => tensorfold_streams(settings, profile_args, config),
+        LaunchSettings::TensorrtLlm(s) => Some(Streams {
+            count: Some(s.max_batch_size()),
+            source: if s.common.max_concurrent_requests.is_some() {
+                StreamsSource::Declared
+            } else {
+                StreamsSource::Default
+            },
+            reason: None,
+        }),
+        _ => tensorfold_streams(settings, line, profile_args, config),
     }
 }
 
@@ -692,13 +731,19 @@ fn llamacpp_streams(settings: &capyctl_domain::launch::LlamacppLaunchSettings) -
 /// this machine reads it.
 fn tensorfold_streams(
     settings: &LaunchSettings,
+    line: TensorfoldLine,
     profile_args: &[String],
     config: Option<&Value>,
 ) -> Option<Streams> {
     let LaunchSettings::Tensorfold(s) = settings else {
         return None;
     };
-    let mut streams = match tensorfold_parallel(settings, profile_args) {
+    let found = |args: &[String]| {
+        crate::tensorfold_native::parallel_on(line, args)
+            .ok()
+            .flatten()
+    };
+    let mut streams = match tensorfold_parallel(settings, line, profile_args) {
         Some(count) => Streams {
             count: Some(count),
             source: if s.common.max_concurrent_requests.is_some() {
@@ -709,22 +754,18 @@ fn tensorfold_streams(
             reason: None,
         },
         None => {
-            let extra = crate::engine_policy::tensorfold_parallel(&s.extra_args)
-                .ok()
-                .flatten();
-            let (value, source) = match extra {
+            let (value, source) = match found(&s.extra_args) {
                 Some(value) => (value, StreamsSource::ExtraArgs),
-                None => (
-                    crate::engine_policy::tensorfold_parallel(profile_args)
-                        .ok()
-                        .flatten()
-                        .flatten(),
-                    StreamsSource::HostFixed,
-                ),
+                None => (found(profile_args).flatten(), StreamsSource::HostFixed),
             };
-            // TensorFold's `auto` is one request at a time on CUDA.
+            // TensorFold 0.6's `auto` is one request at a time on CUDA;
+            // ADR 0039 Evidence §2: the native line's is up to eight.
+            let auto = match line {
+                TensorfoldLine::Python => 1,
+                TensorfoldLine::Native => crate::tensorfold_native::PARALLEL_AUTO,
+            };
             let count = value.and_then(|value| match value.trim().to_ascii_lowercase() {
-                auto if auto == "auto" => Some(1),
+                text if text == "auto" => Some(auto),
                 number => number
                     .parse::<i64>()
                     .ok()
@@ -737,7 +778,9 @@ fn tensorfold_streams(
             }
         }
     };
-    let family = config.and_then(|config| config["model_type"].as_str());
+    let family = config
+        .filter(|_| line.is_python())
+        .and_then(|config| config["model_type"].as_str());
     if let Some(family) = family.filter(|family| TENSORFOLD_ONE_AT_A_TIME.contains(family)) {
         if streams.count.is_some_and(|count| count > 1) {
             streams.count = Some(1);
@@ -795,11 +838,69 @@ fn speculative_tokens(args: &[String]) -> Option<u32> {
 pub fn fit_for_effective(effective: &crate::effective::EffectiveDeployment) -> ContextFit {
     fit_for_launch(
         effective.profile.engine,
+        effective.profile.line,
         &sized_on_device(effective),
         &effective.profile.args,
         effective.model.resolved_path.as_deref().map(Path::new),
         draft_root(effective),
     )
+}
+
+/// ADR 0034 §4: the KV bytes per token the fit sizes a vLLM or SGLang launch
+/// of `effective` with, on the machine that reads its checkpoint: the
+/// checkpoint's (sliding-window and hybrid layers counted as full
+/// attention, SGLang's gated-delta-net hybrids by their attention layers as
+/// amendment A14 sizes them) plus a draft model's, at the launch's element
+/// width. Any engine without LMCache, or a shape the fit cannot read, is an
+/// error naming why.
+pub fn bytes_per_token_for_effective(
+    effective: &crate::effective::EffectiveDeployment,
+) -> Result<u64, String> {
+    let engine = effective.profile.engine;
+    let (common, memory) = match &effective.engine_config {
+        LaunchSettings::Vllm(s) => (&s.common, &s.memory),
+        LaunchSettings::Sglang(s) => (&s.common, &s.memory),
+        _ => return Err("CapyCTL sizes no KV cache for this engine".into()),
+    };
+    let root = effective
+        .model
+        .resolved_path
+        .as_deref()
+        .map(Path::new)
+        .ok_or("the deployment resolves to no checkpoint directory")?;
+    let config = read_model_config(root)?;
+    let mut shape = KvShape::from_config(&config)?;
+    if engine == Engine::Sglang {
+        if let Some(layers) = sglang_pool::gated_delta_attention_layers(&config) {
+            shape.layers = layers;
+        }
+    }
+    let args: Vec<String> = effective
+        .profile
+        .args
+        .iter()
+        .chain(effective.engine_config.extra_args())
+        .cloned()
+        .collect();
+    let draft = draft_root(effective)
+        .map(Path::to_path_buf)
+        .or_else(|| crate::engine_policy::draft_model_path(engine, &args).map(Into::into))
+        .map(|path| read_model_config(&path));
+    let inputs = FitInputs {
+        declared: None,
+        kv_cache_bytes: memory.kv_cache_bytes,
+        kv_cache_dtype: common.kv_cache_dtype.as_deref(),
+        dtype: common.dtype.as_deref(),
+        block_tokens: None,
+        reserved_blocks: 0,
+        draft: draft
+            .as_ref()
+            .map(|config| config.as_ref().map_err(String::as_str)),
+        vllm: None,
+        sglang: engine == Engine::Sglang,
+    };
+    let draft = draft_shape(&inputs)?;
+    per_token_bytes(&inputs, &shape, draft.as_ref())
 }
 
 /// ADR 0008 amendment 2026-10-08: a declared drafter's directory on the
@@ -840,10 +941,12 @@ pub fn fit_on_remote_host(effective: &crate::effective::EffectiveDeployment) -> 
         LaunchSettings::Sglang(s) => s.common.context_length,
         LaunchSettings::Tensorfold(s) => s.common.context_length,
         LaunchSettings::Llamacpp(s) => s.common.context_length,
+        LaunchSettings::TensorrtLlm(s) => s.common.context_length,
         LaunchSettings::Custom(s) => s.common.context_length,
     };
     let fit = fit_for_launch(
         effective.profile.engine,
+        effective.profile.line,
         &effective.engine_config,
         &effective.profile.args,
         None,
@@ -859,7 +962,12 @@ pub fn fit_on_remote_host(effective: &crate::effective::EffectiveDeployment) -> 
             ),
             warning: None,
             running_limit: None,
-            streams: launch_streams(&effective.engine_config, &effective.profile.args, None),
+            streams: launch_streams(
+                &effective.engine_config,
+                effective.profile.line,
+                &effective.profile.args,
+                None,
+            ),
         },
     }
 }
@@ -961,7 +1069,9 @@ pub fn max_running_for_effective(
             (None, None) if remote => MaxRunning::of(None, MaxRunningSource::OnHost),
             (None, None) => MaxRunning::of(None, MaxRunningSource::EngineDefault),
         },
-        LaunchSettings::Tensorfold(_) | LaunchSettings::Llamacpp(_) => match &fit.streams {
+        LaunchSettings::Tensorfold(_)
+        | LaunchSettings::Llamacpp(_)
+        | LaunchSettings::TensorrtLlm(_) => match &fit.streams {
             Some(streams) => MaxRunning {
                 count: streams.count,
                 source: match streams.source {

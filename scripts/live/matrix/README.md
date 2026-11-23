@@ -39,6 +39,7 @@ $M/run_row.sh ENG3 --tag a -- a va-4         # remove refused in use, then --dra
 $M/run_row.sh ENG2 --no-e0 -- a                # standalone, both engines, environment profiles
 $M/run_row.sh ENG4 --no-e0 -- b                # rc.3 fallbacks; needs CAPYCTL_RC3_LOCAL/CAPYCTL_RC3_REMOTE
 $M/run_row.sh LC2 --no-e0 -- a                 # llama.cpp on GB10 (LC1-LC6); first scripts/live/llamacpp-build.sh source model
+$M/run_row.sh OT1 --no-e0 -- a                 # ADR 0037 tracing (OT1-OT11, "OpenTelemetry rows" below); the collector binary first
 $M/roles.sh down
 ```
 
@@ -73,6 +74,7 @@ still parses every remote script with `bash -n`. `run_row.sh … --dry-run` writ
 | `rows/ENG1.sh`, `rows/ENG2.sh`, `rows/ENG3.sh`, `rows/ENG4.sh` | ADR 0018 engine registration rows, written and first run live 2026-09-25 (results in the status runbook). ENG1: `engine detect`/`add` of the existing vLLM and SGLang venvs on a host running under a transient systemd user unit (`roles.sh host-doc-bare`, `host-up-systemd`), `host.yaml` unchanged, both new profiles serve and stop clean. ENG2: standalone with `CAPYCTL_VLLM_BIN` and `CAPYCTL_SGLANG_BIN` both set publishes `local-vllm`/`local-sglang`; `engine remove` on one is refused (environment profile); a deployment on each serves; a registered `vllm-reg` serves with a stated context length, and the row records what a deployment without one does. ENG3 (sources ENG1.sh): `engine remove` of a profile in use is refused `profile_in_use`, then `--drain` stops the deployment through the ordinary path and removes it only on stop evidence; a start afterwards is refused, and `engine add` republishes it. ENG4 (sources ENG1.sh): the rc.3 version-skew fallbacks — a new CLI against an rc.3 agent (`agent_unreachable`, `engines.yaml` written but never read by the old agent) and a new agent against an rc.3 server (`published=restart_required`), gated on `CAPYCTL_RC3_LOCAL`/`CAPYCTL_RC3_REMOTE` naming existing rc.3 binaries. Only the existing engine venvs named in `hosts.local.env` are used; no venv is created |
 | `rows/MN1.sh` … `rows/MN8.sh`, `grouplib.sh`, `gen_group.py`, `rdma_counters.py`, `tests/test_rdma_counters.py` | Multi-node group rows (ADR 0028, design section 17.2; see "Multi-node group rows" below). `gen_group.py` writes the two-rank group fixtures `vg-30`, `sg-30` and `tg-n35` (`topology.tensor_parallel: 2`, `placement.hosts: [HOST_A, HOST_B]`, per-member memory). `grouplib.sh` holds the group checks: the read-only preflight, status and ledger views per member (`ledger.py group`, `ledger.py members`), RDMA transport, and verified cleanup on both hosts. `fault.sh member` signals a member's recorded identity. `rdma_counters.py` reads `/sys/class/infiniband` port counters (and RDMA operation counters where the driver has them) read-only; its tests run with `python3 -m unittest discover -s scripts/live/matrix/tests` |
 | `rows/LC1.sh` … `rows/LC6.sh`, `llamacpp_rows.sh`, `llamacpp_probe.py` | ADR 0029 llama.cpp rows for a GB10 host, each in a standalone role with its own state directory while the host's matrix role is down (as ENG2). `scripts/live/llamacpp-build.sh source model` builds llama-server v0.6.0 for sm_121 in the home directory and stages Qwen3-4B Q4_K_M first. LC1 `engine add`; LC2 chat, streams, tool calls, start time and memory (MemAvailable, process RSS, nvidia-smi, the GGUF's page-cache bytes) under the default mmap load and `--load-mode none`; LC3 park refused, stop, start; LC4 llama.cpp and vLLM switching under a lowered managed limit; LC5 hang-up mid-decode and mid-prefill; LC6 per-request figures and the load read under 3 streams (no MTP model). `llamacpp_probe.py` runs on the host from the synced tree. |
+| `rows/OT1.sh` … `rows/OT11.sh`, `otel_rows.sh`, `otel_collector.sh`, `templates/otelcol.yaml`, `otel_probe.py`, `otel_spans.py`, `tests/test_otel.py` | ADR 0037 OpenTelemetry rows (see "OpenTelemetry rows" below). `otel_collector.sh` starts the OpenTelemetry Collector release binary the owner placed on the host (`OTELCOL_BIN`) with `templates/otelcol.yaml`: one OTLP/HTTP receiver on loopback and a file exporter into the row's evidence directory on the host; it records the binary's version and SHA-256 and stops it by its recorded identity. `otel_rows.sh` runs the standalone role of every row but OT6 (as the LC rows), registers the approved environments with `engine add` into the row's own `XDG_CONFIG_HOME`, writes short-form deployments and copies the host's evidence directory into `host-<a\|b>/`. `otel_probe.py` runs on the host: requests with or without a caller trace context (sampled, unsampled, six malformed kinds), OT3's sentinels, loads with per-request `x-capyctl-timing`, the tracing options and variable names of engine and role processes, sockets on the collector's ports, the tracing packages of an environment (by files), and stamped log lines. `otel_spans.py` reads the collector's file on the control host: spans per service, keys outside §5's allow-list, each request's span tree against the caller's context, engine spans and their parents, activation traces, span durations beside the timing header, sentinel counts and OT8's cost table. `tests/test_otel.py` checks both helpers' parsing and arithmetic (`python3 -m unittest discover -s scripts/live/matrix/tests`) |
 
 ## Rules the harness keeps
 
@@ -186,3 +188,56 @@ $M/run_row.sh MN6 --tag vllm -- vllm          # also sglang, tensorfold
 $M/run_row.sh MN7 --tag vllm -- vllm
 $M/run_row.sh MN8 --tag vllm -- vllm
 ```
+
+## OpenTelemetry rows (OT1-OT11)
+
+ADR 0037's live qualification. The collector is the OpenTelemetry Collector release
+binary that the owner placed in the home directory on host A and host B (owner decision
+2026-10-27, question 11); no receiver script is part of this tree. Each row starts its own
+collector run with `templates/otelcol.yaml` (an OTLP/HTTP receiver on `127.0.0.1:OTELCOL_PORT`,
+a file exporter writing `collector-<label>.jsonl`), records `otelcol-binary.txt` (version
+and SHA-256, checked against `OTELCOL_SHA256` when it is set) and stops the collector at its
+end. On the host, everything a row writes is under `<run root>/otel-evidence/<row>/` and
+is copied into the row's evidence as `host-<a|b>/`; the summaries (`spans-<label>.json`,
+`sentinels.json`, `cost-*.json`) are written beside it.
+
+Every row but OT6 stops the host's matrix role, runs a standalone role with its own state
+and config directories and restarts the matrix role at the end. OT6 uses the matrix roles:
+the server's endpoint is a loopback port on the control host (`OT_TUNNEL_PORT`) that an SSH
+local forward, started and stopped by the row, carries to host A's collector, so no
+collector listens beyond loopback. In `hosts.local.env`: `OTELCOL_BIN`, the approved
+environments (`OT_VLLM_VENV_DIR` vLLM 0.32.0, `OT_SGLANG_VENV_DIR` SGLang 0.5.22,
+`OT_LLAMACPP_DIR` llama.cpp v0.7.0) and the models (`OT_CHAT_MODEL` Qwen3-4B,
+`OT_GGUF_MODEL` its Q4_K_M GGUF, `OT_DECISION_MODEL` Clef-Flash). The rows' headers say
+what each records.
+
+| Row | What the script does |
+|---|---|
+| OT1 | No tracing setting; each engine (and a decision) answers requests with and without a valid traceparent; `ss` on the collector's ports, each engine's tracing options and variable names, the collector's file (expected empty) |
+| OT2 | Endpoint on, timing header on; streamed and collected chat with a sampled caller context, a decision, requests without one and with six malformed ones; span trees against the caller's context |
+| OT3 | Endpoint and engine tracing on; fresh sentinels in the message, system prompt, tool definition and arguments, `cache_salt`, `X-Request-Id`, an unknown model name, two fields an engine refuses quoting them, and a decision; sentinel counts in the collector's file |
+| OT4 | Under a lowered managed limit (default 40GiB): a cold start, a wake after a park, a switch both ways; activation traces and span durations beside `x-capyctl-timing` |
+| OT5 | Engine tracing on; vLLM, SGLang and llama.cpp in turn: status, rendered options and variables, engine spans and their parents, `gen_ai.request.id` on SGLang |
+| OT6 | Server and host A exporting (host A also with engine tracing); `capyctl.ingress` and engine spans under it, a wake's host step; then host A restarted without an endpoint while the engines keep running |
+| OT7 | The collector stopped 20 s into a timed load and restarted after it; every answer, the role log's notices stamped, status's dropped spans, export after the restart |
+| OT8 | Per engine, 200 requests per arm: off, sampled, unsampled, engine tracing; on SGLang, direct launches at trace levels 1 and 3 beside one without tracing; cost tables |
+| OT9 | Engine tracing on; a `retention: zero` deployment and one without it |
+| OT10 | The first environment without the OpenTelemetry packages (approved ones, then `OT_NOSDK_ENV`); its deployment's status and answers |
+| OT11 | Start refused for engine tracing with a non-loopback endpoint (standalone and the host role); engine options and `OTEL_*` refused in profiles and deployments |
+
+```bash
+M=scripts/live/matrix
+$M/run_row.sh OT1 --no-e0 -- a
+$M/run_row.sh OT2 --no-e0 -- a                    # chat on vllm (or: -- a sglang)
+$M/run_row.sh OT3 --no-e0 -- a
+$M/run_row.sh OT4 --no-e0 -- a                    # optional managed limit, default 40GiB
+$M/run_row.sh OT5 --no-e0 -- a
+$M/run_row.sh OT6 -- a                            # the matrix roles up (roles.sh up)
+$M/run_row.sh OT7 --no-e0 -- a                    # optional engine and seconds down (vllm 180)
+$M/run_row.sh OT8 --no-e0 --tag vllm -- a vllm    # also sglang, llamacpp
+$M/run_row.sh OT9 --no-e0 -- a
+$M/run_row.sh OT10 --no-e0 -- a
+$M/run_row.sh OT11 --no-e0 -- a
+```
+
+The standalone rows take `b` as well (`--tag b -- b`) to run on host B with its collector.

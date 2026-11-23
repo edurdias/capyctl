@@ -6,6 +6,7 @@ use axum::{
     Router,
 };
 use capyctl_agent::ingress::{EngineAccess, Ingress, IngressScope};
+use capyctl_config::effective::DeploymentApi;
 use std::sync::{Arc, Mutex};
 fn scope(generation: i64) -> IngressScope {
     IngressScope {
@@ -614,6 +615,13 @@ async fn decision_requests_pass_only_on_their_own_path_and_contract() {
     ingress
         .register(live.clone(), native_addr, "model".into(), [1; 32], [2; 32])
         .unwrap();
+    ingress
+        .bind_handle(
+            &live,
+            "launch-decision",
+            EngineAccess::builtin().with_api(DeploymentApi::Decisions),
+        )
+        .unwrap();
     ingress.open(&live).unwrap();
     let (address, task) = serve(ingress.clone().router()).await;
     let post = |path: &'static str, body: serde_json::Value| async move {
@@ -638,10 +646,18 @@ async fn decision_requests_pass_only_on_their_own_path_and_contract() {
     let chat = serde_json::json!({"model": "model", "messages": []});
     let mut extended = decision("model", "hi");
     extended["chat_template_kwargs"] = serde_json::json!({});
+    // T50: ADR 0041 §3: extraction fields never select a different contract.
+    let fields = serde_json::json!({
+        "model": "model", "state": "hi", "fields": {"value": {"type": "text"}}
+    });
+    let mut both = decision("model", "hi");
+    both["fields"] = serde_json::Value::Null;
     for (path, body) in [
         ("/v1/systemone", decision("other", "hi")),
         ("/v1/systemone", chat.clone()),
         ("/v1/systemone", extended),
+        ("/v1/systemone", fields),
+        ("/v1/systemone", both),
         ("/v1/chat/completions", decision("model", "hi")),
     ] {
         assert_eq!(
@@ -677,6 +693,351 @@ async fn decision_requests_pass_only_on_their_own_path_and_contract() {
         .as_str()
         .unwrap()
         .contains("must be provided"));
+    task.abort();
+    native_task.abort();
+}
+
+// T50: ADR 0041 §3 chooses System One's contract from the frozen launch,
+// including its declared types, never from the body's fields or questions.
+#[tokio::test]
+async fn extraction_launch_accepts_only_fields_of_its_declared_types() {
+    use capyctl_config::custom::{CustomManifest, CustomProfile};
+    let custom = CustomProfile::new(
+        CustomManifest::parse(
+            &KEYED_MANIFEST.replace("api: chat", "api: extractions\nfield_types: [text]"),
+        )
+        .unwrap(),
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let native = Router::new().fallback(move |request: Request<Body>| {
+        let seen = recorded.clone();
+        async move {
+            let path = request.uri().path().to_owned();
+            let headers = request.headers().clone();
+            let body = axum::body::to_bytes(request.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            seen.lock().unwrap().push((path, headers, value));
+            Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"model","answers":{"order":{"type":"text","value":"A-88412"}}}"#,
+                ))
+                .unwrap()
+        }
+    });
+    let (native_addr, native_task) = serve(native).await;
+    let (tracing, capture) = capyctl_trace::testing::capture(
+        1.0,
+        capyctl_trace::CallerMode::Parent,
+        capyctl_trace::Service::Host,
+    );
+    let ingress = Ingress::traced(tracing).unwrap();
+    let live = scope(1);
+    ingress
+        .register(live.clone(), native_addr, "model".into(), [1; 32], [2; 32])
+        .unwrap();
+    ingress
+        .bind_handle(&live, "launch-extraction", EngineAccess::custom(&custom))
+        .unwrap();
+    // Re-registering without the frozen profile cannot replace its contract.
+    ingress
+        .bind_handle(&live, "launch-extraction", EngineAccess::unknown())
+        .unwrap();
+    ingress.open(&live).unwrap();
+    let (address, task) = serve(ingress.clone().router()).await;
+    let post = |path: &'static str, body: serde_json::Value| async move {
+        reqwest::Client::new()
+            .post(format!("http://{address}{path}"))
+            .bearer_auth(hex::encode([1; 32]))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    };
+    let extraction = serde_json::json!({
+        "model": "model", "state": "Order A-88412",
+        "fields": {"order": {"type": "text", "instructions": "Order number"}}
+    });
+    let response = post("/v1/systemone", extraction.clone()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let answer: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(answer["answers"]["order"]["value"], "A-88412");
+    let spans = ingress_spans(&capture, 1).await;
+    assert_eq!(spans[0].attr("http.route"), Some("/v1/systemone"));
+    assert_eq!(spans[0].attr("capyctl.endpoint"), Some("extractions"));
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "/v1/systemone");
+        assert_eq!(seen[0].2, extraction);
+        assert_eq!(
+            seen[0].1["authorization"],
+            format!("Bearer {}", hex::encode([2; 32]))
+        );
+    }
+    let mut both = extraction.clone();
+    both["questions"] = serde_json::Value::Null;
+    let mut undeclared = extraction.clone();
+    undeclared["fields"]["order"]["type"] = "number".into();
+    let mut other_model = extraction.clone();
+    other_model["model"] = "other".into();
+    let mut oversized = extraction.clone();
+    oversized["state"] = "x".repeat(8 * 1024 * 1024).into();
+    for (path, body) in [
+        (
+            "/v1/systemone",
+            serde_json::json!({
+                "model": "model", "state": "Order A-88412",
+                "questions": {"q": {"type": "noul", "instructions": "Order?"}}
+            }),
+        ),
+        ("/v1/systemone", both),
+        ("/v1/systemone", undeclared),
+        ("/v1/systemone", other_model),
+        ("/v1/systemone", oversized),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"model":"model","messages":[]}),
+        ),
+        (
+            "/v1/embeddings",
+            serde_json::json!({"model":"model","input":"Order"}),
+        ),
+    ] {
+        assert_eq!(post(path, body).await.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert_eq!(ingress.current_requests(&live).unwrap(), 0);
+    task.abort();
+    native_task.abort();
+}
+
+// T47 T21 (ADR 0036 §3, §10, SPEC §10): the ingress forwards exactly
+// `POST /v1/embeddings` besides chat completions and decisions, with its own
+// closed contract and fixed upstream path, for the registered served name
+// only. An embeddings body on another path, a chat or decision body on the
+// embeddings path, another model, a field outside OpenAI's contract
+// (`stream`, `cache_salt`, an engine extension) or any other path never
+// reaches the engine; an engine's 400 is relayed as `engine_rejected`.
+#[tokio::test]
+async fn embedding_requests_pass_only_on_their_own_path_and_contract() {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recorded = seen.clone();
+    let native = Router::new().fallback(move |request: Request<Body>| {
+        let seen = recorded.clone();
+        async move {
+            let path = request.uri().path().to_owned();
+            let body = axum::body::to_bytes(request.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            seen.lock().unwrap().push(path);
+            let (status, answer) = if value["input"] == "reject me" {
+                (400, r#"{"error":{"code":400,"message":"input is longer than the model's context","type":"invalid_request_error"}}"#)
+            } else {
+                (200, r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.6,0.8]}],"model":"model","usage":{"prompt_tokens":3,"total_tokens":3}}"#)
+            };
+            Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(Body::from(answer))
+                .unwrap()
+        }
+    });
+    let (native_addr, native_task) = serve(native).await;
+    let ingress = Ingress::new().unwrap();
+    let live = scope(1);
+    ingress
+        .register(live.clone(), native_addr, "model".into(), [1; 32], [2; 32])
+        .unwrap();
+    ingress.open(&live).unwrap();
+    let (address, task) = serve(ingress.clone().router()).await;
+    let post = |path: &'static str, body: serde_json::Value| async move {
+        reqwest::Client::new()
+            .post(format!("http://{address}{path}"))
+            .bearer_auth(hex::encode([1; 32]))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    };
+    let embedding = |model: &str, input: serde_json::Value| serde_json::json!({"model": model, "input": input, "encoding_format": "float"});
+    let response = post("/v1/embeddings", embedding("model", "hi".into())).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let answer: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        answer["data"][0]["embedding"],
+        serde_json::json!([0.6, 0.8])
+    );
+    let batch = embedding("model", serde_json::json!(["a", "b"]));
+    assert_eq!(post("/v1/embeddings", batch).await.status(), StatusCode::OK);
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        ["/v1/embeddings", "/v1/embeddings"]
+    );
+
+    let chat = serde_json::json!({"model": "model", "messages": []});
+    let decision = serde_json::json!({"model": "model", "state": "hi",
+        "questions": {"q": {"type": "noul", "instructions": "Angry?"}}});
+    let with = |field: &str, value: serde_json::Value| {
+        let mut body = embedding("model", "hi".into());
+        body[field] = value;
+        body
+    };
+    for (path, body) in [
+        ("/v1/embeddings", embedding("other", "hi".into())),
+        ("/v1/embeddings", embedding("model", "".into())),
+        ("/v1/embeddings", embedding("model", serde_json::json!([]))),
+        ("/v1/embeddings", chat.clone()),
+        ("/v1/embeddings", decision),
+        ("/v1/embeddings", with("stream", true.into())),
+        ("/v1/embeddings", with("cache_salt", "s".into())),
+        (
+            "/v1/embeddings",
+            with("rid", "01JAAAAAAAAAAAAAAAAAAAAAAA".into()),
+        ),
+        ("/v1/embeddings", with("truncate_prompt_tokens", 8.into())),
+        ("/v1/embeddings", with("embd_normalize", 2.into())),
+        ("/v1/chat/completions", embedding("model", "hi".into())),
+        ("/v1/systemone", embedding("model", "hi".into())),
+    ] {
+        assert_eq!(
+            post(path, body.clone()).await.status(),
+            StatusCode::BAD_REQUEST,
+            "{path} {body}"
+        );
+    }
+    for path in [
+        "/v1/embeddings/",
+        "/v1/embeddings?stream=true",
+        "/embeddings",
+        "/v2/embeddings",
+    ] {
+        assert!(
+            !post(path, embedding("model", "hi".into()))
+                .await
+                .status()
+                .is_success(),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "nothing else reached the engine"
+    );
+
+    let response = post("/v1/embeddings", embedding("model", "reject me".into())).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let answer: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(answer["error"]["code"], "engine_rejected", "{answer}");
+    assert!(answer["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("longer than the model's context"));
+    task.abort();
+    native_task.abort();
+}
+
+// T47 (ADR 0036 §4, §10): an embeddings answer is relayed unchanged as its
+// bytes arrive, never read whole and never capped. The engine sends the
+// answer's opening and then holds the rest; the caller reads that opening
+// before the engine sends another byte. The rest, an answer larger than the
+// request bound, the bound on a read engine error answer and a decision's
+// answer bound together, then arrives byte for byte. The engine connection
+// stays open while the caller keeps reading, and closes once the answer ends.
+#[tokio::test]
+async fn an_embedding_answer_is_relayed_as_it_arrives_without_a_cap() {
+    use futures::StreamExt;
+    const OPENING: &str =
+        r#"{"object":"list","model":"model","data":[{"object":"embedding","index":0,"embedding":["#;
+    const CLOSING: &str = r#"0.5]}],"usage":{"prompt_tokens":1,"total_tokens":1}}"#;
+    let piece = "0.125,".repeat(1 << 17);
+    let pieces = 2 * capyctl_adapters::forward::DECISION_RESPONSE_LIMIT / piece.len() + 2;
+    let expected_len = OPENING.len() + piece.len() * pieces + CLOSING.len();
+    assert!(expected_len > 2 * capyctl_adapters::forward::DECISION_RESPONSE_LIMIT);
+    let release = Arc::new(tokio::sync::Notify::new());
+    let held = release.clone();
+    let native = Router::new().route(
+        "/v1/embeddings",
+        post(move || {
+            let release = held.clone();
+            let piece = piece.clone();
+            async move {
+                let opening = futures::stream::once(async {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        OPENING.as_bytes(),
+                    ))
+                });
+                let rest = futures::stream::once(async move {
+                    release.notified().await;
+                })
+                .flat_map(move |()| {
+                    futures::stream::iter((0..pieces).map({
+                        let piece = axum::body::Bytes::from(piece.clone());
+                        move |_| Ok(piece.clone())
+                    }))
+                })
+                .chain(futures::stream::once(async {
+                    Ok(axum::body::Bytes::from_static(CLOSING.as_bytes()))
+                }));
+                Response::builder()
+                    .header("content-type", "application/json")
+                    .body(Body::from_stream(opening.chain(rest)))
+                    .unwrap()
+            }
+        }),
+    );
+    let (native_addr, native_task) = serve(native).await;
+    let ingress = Ingress::new().unwrap();
+    let live = scope(1);
+    ingress
+        .register(live.clone(), native_addr, "model".into(), [1; 32], [2; 32])
+        .unwrap();
+    ingress.open(&live).unwrap();
+    let (address, task) = serve(ingress.clone().router()).await;
+    let mut response = reqwest::Client::new()
+        .post(format!("http://{address}/v1/embeddings"))
+        .bearer_auth(hex::encode([1; 32]))
+        .json(&serde_json::json!({"model": "model", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bound = std::time::Duration::from_secs(10);
+    let mut received = Vec::new();
+    tokio::time::timeout(bound, async {
+        while received.len() < OPENING.len() {
+            received.extend_from_slice(&response.chunk().await.unwrap().unwrap());
+        }
+    })
+    .await
+    .expect("the answer's opening arrives before the engine sends the rest");
+    assert_eq!(received, OPENING.as_bytes());
+    assert_eq!(ingress.current_requests(&live).unwrap(), 1);
+    release.notify_one();
+    tokio::time::timeout(bound, async {
+        while let Some(chunk) = response.chunk().await.unwrap() {
+            received.extend_from_slice(&chunk);
+        }
+    })
+    .await
+    .expect("the rest of the answer arrives");
+    assert_eq!(received.len(), expected_len);
+    assert!(received.starts_with(OPENING.as_bytes()));
+    assert!(received.ends_with(CLOSING.as_bytes()));
+    let answer: serde_json::Value = serde_json::from_slice(&received).unwrap();
+    assert_eq!(answer["data"][0]["index"], 0);
+    tokio::time::timeout(bound, async {
+        while ingress.current_requests(&live).unwrap() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the forwarding slot is freed at the answer's end");
     task.abort();
     native_task.abort();
 }
@@ -816,8 +1177,10 @@ async fn the_native_key_reaches_only_an_engine_that_takes_it() {
 // forwarded request (the router cancelled it: its client hung up or its
 // deadline cut it), the ingress drops its engine connection within a bound
 // and the request's forwarding slot is freed. A chat request before the
-// engine's response head and after a head and an opening chunk, and a
-// decision, whose answer comes whole.
+// engine's response head and after a head and an opening chunk, a
+// decision, whose answer comes whole, and an embeddings request (T47: the
+// router's own going away closes it; a cut embeddings request keeps its
+// router connection, ADR 0036 §4).
 #[tokio::test]
 async fn the_engine_connection_closes_when_the_upstream_goes_away() {
     let chat = serde_json::json!({"model":"model","messages":[],"stream":true});
@@ -827,6 +1190,11 @@ async fn the_engine_connection_closes_when_the_upstream_goes_away() {
         ("/v1/chat/completions", chat.clone(), false),
         ("/v1/chat/completions", chat, true),
         ("/v1/systemone", decision, false),
+        (
+            "/v1/embeddings",
+            serde_json::json!({"model": "model", "input": "hi"}),
+            false,
+        ),
     ] {
         let engine = if opening {
             capyctl_testkit::HeldEngine::opening().await
@@ -843,6 +1211,14 @@ async fn the_engine_connection_closes_when_the_upstream_goes_away() {
                 [1; 32],
                 [2; 32],
             )
+            .unwrap();
+        let api = match path {
+            "/v1/systemone" => DeploymentApi::Decisions,
+            "/v1/embeddings" => DeploymentApi::Embeddings,
+            _ => DeploymentApi::Chat,
+        };
+        ingress
+            .bind_handle(&live, "launch", EngineAccess::builtin().with_api(api))
             .unwrap();
         ingress.open(&live).unwrap();
         let (address, task) = serve(ingress.clone().router()).await;
@@ -894,13 +1270,13 @@ async fn the_engine_connection_closes_when_the_upstream_goes_away() {
     }
 }
 
-// T17 (ADR 0032 §1, §2): the router's CapyCTL request ID is consumed by the
-// ingress. On a launch whose engine takes it, a chat request reaches the
-// engine with it as `rid` in the body; a launch without the capability, a
-// decision, and a request without the header get none. Neither ID ever
-// reaches the engine as a header. A malformed or repeated ID is refused
-// (400) before the engine is reached, and a caller's own `rid` stays
-// refused on a capable launch.
+// T17 T47 (ADR 0032 §1, §2, ADR 0036 §4): the router's CapyCTL request ID is
+// consumed by the ingress. On a launch whose engine takes it, a chat request
+// reaches the engine with it as `rid` in the body; a launch without the
+// capability, a decision, an embeddings request and a request without the
+// header get none. Neither ID ever reaches the engine as a header. A
+// malformed or repeated ID is refused (400) before the engine is reached,
+// and a caller's own `rid` stays refused on a capable launch.
 #[tokio::test]
 async fn the_capyctl_request_id_becomes_rid_only_on_a_capable_chat_launch() {
     type Seen = Arc<Mutex<Vec<(String, axum::http::HeaderMap, serde_json::Value)>>>;
@@ -924,6 +1300,8 @@ async fn the_capyctl_request_id_becomes_rid_only_on_a_capable_chat_launch() {
             seen.lock().unwrap().push((path.clone(), headers, value));
             let answer = if path == "/v1/systemone" {
                 r#"{"model":"model","answers":{"q":{"type":"noul","noul":0.6}}}"#
+            } else if path == "/v1/embeddings" {
+                r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[1.0]}],"model":"model"}"#
             } else {
                 "{}"
             };
@@ -967,6 +1345,34 @@ async fn the_capyctl_request_id_becomes_rid_only_on_a_capable_chat_launch() {
         .bind_handle(&plain, "launch-plain", EngineAccess::builtin())
         .unwrap();
     ingress.open(&plain).unwrap();
+    for (deployment, api, gate) in [
+        ("decisions", DeploymentApi::Decisions, 5),
+        ("embeddings", DeploymentApi::Embeddings, 7),
+    ] {
+        let launch = IngressScope {
+            deployment_id: deployment.into(),
+            ..scope(1)
+        };
+        ingress
+            .register(
+                launch.clone(),
+                native_addr,
+                "model".into(),
+                [gate; 32],
+                [gate + 1; 32],
+            )
+            .unwrap();
+        ingress
+            .bind_handle(
+                &launch,
+                deployment,
+                EngineAccess::builtin()
+                    .with_api(api)
+                    .with_request_abort(true),
+            )
+            .unwrap();
+        ingress.open(&launch).unwrap();
+    }
     let (address, task) = serve(ingress.clone().router()).await;
     const ID: &str = "01JAAAAAAAAAAAAAAAAAAAAAAA";
     let post = |gate: u8, path: &'static str, ids: Vec<&'static str>, body: serde_json::Value| async move {
@@ -1021,13 +1427,24 @@ async fn the_capyctl_request_id_becomes_rid_only_on_a_capable_chat_launch() {
 
     // A decision, even on a capable launch: dropped.
     assert_eq!(
-        post(1, "/v1/systemone", vec![ID], decision.clone()).await,
+        post(5, "/v1/systemone", vec![ID], decision.clone()).await,
         StatusCode::OK
     );
     let (path, headers, body) = take().remove(0);
     assert_eq!(path, "/v1/systemone");
     assert!(no_id_headers(&headers));
     assert_eq!(body, decision);
+
+    // An embeddings request, even on a capable launch: dropped (ADR 0036 §4).
+    let embedding = serde_json::json!({"model": "model", "input": ["a", "b"]});
+    assert_eq!(
+        post(7, "/v1/embeddings", vec![ID], embedding.clone()).await,
+        StatusCode::OK
+    );
+    let (path, headers, body) = take().remove(0);
+    assert_eq!(path, "/v1/embeddings");
+    assert!(no_id_headers(&headers));
+    assert_eq!(body, embedding);
 
     // A malformed or repeated ID is refused before the engine, on either
     // launch and either path.
@@ -1047,7 +1464,8 @@ async fn the_capyctl_request_id_becomes_rid_only_on_a_capable_chat_launch() {
         ),
         (1, "/v1/chat/completions", vec![ID, ID], chat.clone()),
         (3, "/v1/chat/completions", vec!["not-a-ulid"], chat.clone()),
-        (1, "/v1/systemone", vec!["not-a-ulid"], decision.clone()),
+        (5, "/v1/systemone", vec!["not-a-ulid"], decision.clone()),
+        (7, "/v1/embeddings", vec!["not-a-ulid"], embedding.clone()),
     ] {
         assert_eq!(
             post(gate, path, ids.clone(), body).await,
@@ -1095,4 +1513,249 @@ async fn the_capyctl_request_id_becomes_rid_only_on_a_capable_chat_launch() {
     assert_eq!(raw.lock().unwrap().len(), 1, "nothing more was sent");
     task.abort();
     native_task.abort();
+}
+
+/// ADR 0037 §6 fixture: a native engine that records each request's trace
+/// headers, and an ingress with two open launches of one deployment:
+/// `traced` (gate 1, engine tracing on) and `plain` (gate 3, off).
+type TraceSeen = Arc<Mutex<Vec<(Option<String>, Option<String>)>>>;
+async fn trace_fixture(
+    tracing: capyctl_trace::Tracing,
+) -> (
+    std::net::SocketAddr,
+    TraceSeen,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    let seen: TraceSeen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let native = Router::new().fallback(move |request: Request<Body>| {
+        let seen = recorded.clone();
+        async move {
+            let header = |name: &str| {
+                request
+                    .headers()
+                    .get(name)
+                    .map(|v| v.to_str().unwrap().to_owned())
+            };
+            seen.lock()
+                .unwrap()
+                .push((header("traceparent"), header("tracestate")));
+            Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap()
+        }
+    });
+    let (native_addr, native_task) = serve(native).await;
+    let ingress = Ingress::traced(tracing).unwrap();
+    let traced = IngressScope {
+        deployment_id: "traced".into(),
+        ..scope(1)
+    };
+    let plain = IngressScope {
+        deployment_id: "plain".into(),
+        ..scope(1)
+    };
+    for (scope, gate, native, engine_trace) in
+        [(&traced, 1u8, 2u8, true), (&plain, 3u8, 4u8, false)]
+    {
+        ingress
+            .register(
+                scope.clone(),
+                native_addr,
+                "model".into(),
+                [gate; 32],
+                [native; 32],
+            )
+            .unwrap();
+        ingress
+            .bind_handle(
+                scope,
+                &format!("launch-{gate}"),
+                EngineAccess::builtin().with_engine_trace(engine_trace),
+            )
+            .unwrap();
+        ingress.open(scope).unwrap();
+    }
+    let (address, task) = serve(ingress.clone().router()).await;
+    (address, seen, vec![task, native_task])
+}
+
+/// The router's forward span as its `traceparent` carries it.
+const ROUTER_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+const ROUTER_SPAN: &str = "b7ad6b7169203331";
+fn router_parent() -> String {
+    format!("00-{ROUTER_TRACE}-{ROUTER_SPAN}-01")
+}
+
+/// Post a chat request through the ingress and read its whole answer.
+async fn post_traced(
+    address: std::net::SocketAddr,
+    gate: u8,
+    headers: &[(&str, &str)],
+) -> StatusCode {
+    let mut request = reqwest::Client::new()
+        .post(format!("http://{address}/v1/chat/completions"))
+        .bearer_auth(hex::encode([gate; 32]))
+        .header("x-capyctl-request-id", "01JAAAAAAAAAAAAAAAAAAAAAAA");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = request
+        .json(&serde_json::json!({"model":"model","messages":[]}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    response.bytes().await.unwrap();
+    status
+}
+
+/// The ingress spans recorded so far, once `count` have ended (a relayed
+/// body's span ends when the server polls its end).
+async fn ingress_spans(
+    capture: &capyctl_trace::testing::Capture,
+    count: usize,
+) -> Vec<capyctl_trace::testing::Recorded> {
+    for _ in 0..200 {
+        let spans = capture.named("capyctl.ingress");
+        if spans.len() >= count {
+            return spans;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    capture.named("capyctl.ingress")
+}
+
+fn hex_bytes<const N: usize>(text: &str) -> [u8; N] {
+    hex::decode(text).unwrap().try_into().unwrap()
+}
+
+// T48, T19 (ADR 0037 §6): a request that fails the ingress's authentication
+// creates no span and its trace headers are never read or forwarded.
+#[tokio::test]
+async fn an_unauthenticated_request_ignores_trace_headers_and_makes_no_span() {
+    let (tracing, capture) = capyctl_trace::testing::capture(
+        1.0,
+        capyctl_trace::CallerMode::Parent,
+        capyctl_trace::Service::Host,
+    );
+    let (address, seen, tasks) = trace_fixture(tracing).await;
+    let parent = router_parent();
+    let status = post_traced(
+        address,
+        9,
+        &[("traceparent", &parent), ("tracestate", "vendor=1")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(capture.spans().is_empty(), "{:?}", capture.spans());
+    assert!(seen.lock().unwrap().is_empty());
+    tasks.iter().for_each(|t| t.abort());
+}
+
+// T48 (ADR 0037 §§3, 5, 6): with host tracing on, `capyctl.ingress` (server
+// kind) is the child of the router's forward span; a launch with engine
+// tracing is sent a rebuilt `traceparent` naming the ingress span as parent
+// (sampled flag kept) with the router's `tracestate`; a launch without it
+// is sent neither header. A malformed context is ignored: a new trace.
+#[tokio::test]
+async fn the_ingress_span_parents_to_the_router_and_only_a_traced_engine_gets_context() {
+    let (tracing, capture) = capyctl_trace::testing::capture(
+        1.0,
+        capyctl_trace::CallerMode::Parent,
+        capyctl_trace::Service::Host,
+    );
+    let (address, seen, tasks) = trace_fixture(tracing).await;
+    let parent = router_parent();
+    let context = [("traceparent", parent.as_str()), ("tracestate", "vendor=1")];
+
+    // Engine tracing on: the ingress span is the engine's parent.
+    assert_eq!(post_traced(address, 1, &context).await, StatusCode::OK);
+    let spans = ingress_spans(&capture, 1).await;
+    assert_eq!(spans.len(), 1);
+    let span = &spans[0];
+    assert_eq!(span.kind, capyctl_trace::Kind::Server);
+    assert_eq!(span.cx.trace_id, hex_bytes::<16>(ROUTER_TRACE));
+    assert_eq!(span.parent, Some(hex_bytes::<8>(ROUTER_SPAN)));
+    assert_eq!(span.attr("capyctl.deployment"), Some("traced"));
+    assert_eq!(span.attr("capyctl.outcome"), Some("completed"));
+    assert_eq!(span.attr("http.route"), Some("/v1/chat/completions"));
+    assert_eq!(
+        span.attr("capyctl.request_id"),
+        Some("01JAAAAAAAAAAAAAAAAAAAAAAA")
+    );
+    let sent = std::mem::take(&mut *seen.lock().unwrap());
+    assert_eq!(
+        sent,
+        [(
+            Some(format!(
+                "00-{ROUTER_TRACE}-{}-01",
+                hex::encode(span.cx.span_id)
+            )),
+            Some("vendor=1".to_owned()),
+        )]
+    );
+
+    // An unsampled router context: still propagated, flag clear.
+    let unsampled = format!("00-{ROUTER_TRACE}-{ROUTER_SPAN}-00");
+    assert_eq!(
+        post_traced(address, 1, &[("traceparent", &unsampled)]).await,
+        StatusCode::OK
+    );
+    let (header, state) = seen.lock().unwrap().remove(0);
+    let header = header.unwrap();
+    assert!(header.starts_with(&format!("00-{ROUTER_TRACE}-")) && header.ends_with("-00"));
+    assert_ne!(header, unsampled, "the ingress span is the parent");
+    assert_eq!(state, None);
+
+    // Engine tracing off: the span is recorded, the engine gets nothing.
+    capture.clear();
+    assert_eq!(post_traced(address, 3, &context).await, StatusCode::OK);
+    let spans = ingress_spans(&capture, 1).await;
+    assert_eq!(spans[0].parent, Some(hex_bytes::<8>(ROUTER_SPAN)));
+    assert_eq!(spans[0].attr("capyctl.deployment"), Some("plain"));
+    assert_eq!(std::mem::take(&mut *seen.lock().unwrap()), [(None, None)]);
+
+    // Malformed (uppercase hex): ignored, never refused; a new trace.
+    capture.clear();
+    let malformed = router_parent().to_uppercase();
+    assert_eq!(
+        post_traced(
+            address,
+            1,
+            &[("traceparent", &malformed), ("tracestate", "vendor=1")]
+        )
+        .await,
+        StatusCode::OK
+    );
+    let spans = ingress_spans(&capture, 1).await;
+    assert_eq!(spans[0].parent, None);
+    assert_ne!(spans[0].cx.trace_id, hex_bytes::<16>(ROUTER_TRACE));
+    let (header, state) = seen.lock().unwrap().remove(0);
+    assert_eq!(header, Some(spans[0].cx.traceparent()));
+    assert_eq!(state, None);
+    assert!(capture.disallowed_keys().is_empty());
+    tasks.iter().for_each(|t| t.abort());
+}
+
+// T48 (ADR 0037 §6): a host without an endpoint records nothing and passes
+// the router's context on unchanged, and only to a launch with engine
+// tracing.
+#[tokio::test]
+async fn a_host_without_an_endpoint_passes_the_router_context_on_unchanged() {
+    let (address, seen, tasks) = trace_fixture(capyctl_trace::Tracing::off()).await;
+    let parent = router_parent();
+    let context = [("traceparent", parent.as_str()), ("tracestate", "vendor=1")];
+    assert_eq!(post_traced(address, 1, &context).await, StatusCode::OK);
+    assert_eq!(post_traced(address, 3, &context).await, StatusCode::OK);
+    assert_eq!(
+        std::mem::take(&mut *seen.lock().unwrap()),
+        [
+            (Some(parent.clone()), Some("vendor=1".to_owned())),
+            (None, None)
+        ]
+    );
+    tasks.iter().for_each(|t| t.abort());
 }

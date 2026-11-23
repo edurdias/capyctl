@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 mod support;
 use support::process::{free_port, free_ports, output_within, Guarded};
 
-use capyctl_config::effective::{Engine, ModelSource};
+use capyctl_config::effective::ModelSource;
 use serde_json::{json, Value};
 
 /// A vLLM stand-in: `serve <model> --port P --served-model-name R`, the key only
@@ -457,7 +457,6 @@ fn deploy_with_deadline(installation: &Installation, request_deadline: &str) -> 
                 .to_string_lossy()
                 .into_owned(),
         },
-        Engine::Vllm,
         &support::binary_template_memory(),
         request_deadline,
         // The host runs with CAPYCTL_DEEP_PARK=off (ADR 0012 opt-out), so

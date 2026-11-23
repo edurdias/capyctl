@@ -22,6 +22,7 @@ use capyctl_config::registration::{
     check_profile, custom_profile_document, lock_engines_for, valid_profile_name, write_engines,
     CustomProfileSpec, EnginesFile, ENVIRONMENT_PROFILES,
 };
+use capyctl_config::tensorfold_native::TensorfoldLine;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -219,7 +220,12 @@ async fn prepare(
         tokio::task::spawn_blocking(move || {
             let layout = custom_installation(&executable, Some(&manifest));
             let measured = measurer
-                .measure_profile(Engine::Custom, &executable, Some(&manifest))
+                .measure_profile(
+                    Engine::Custom,
+                    TensorfoldLine::Python,
+                    &executable,
+                    Some(&manifest),
+                )
                 .ok();
             (measured, layout)
         })
@@ -290,6 +296,10 @@ async fn prepare(
         "deep_park": "disabled",
         "engines_file": custom_engines(target),
     });
+    // ADR 0041 §2: the declared field types are part of the approval.
+    if let Some(types) = &manifest.field_types {
+        out["field_types"] = json!(types);
+    }
     // ADR 0031 §8: the approval is this summary.
     let mut summary = format!(
         "custom engine {name}\n  executable:   {}\n  arguments:    {}\n  api:          {}\n  version:      {}\n  environment:  {}\n  approved env: {}\n  pinned root:  {}\n  interpreter:  {}\n  installation: {installation}\n  idle signal:  {}\n  engine key:   {}\n  drift:        {}\n",
@@ -308,6 +318,10 @@ async fn prepare(
         if manifest.uses_api_key() { key.to_owned() } else { format!("none ({NO_KEY_CAVEAT})") },
         out["installation_drift"].as_str().unwrap_or_default(),
     );
+    if let Some(types) = &manifest.field_types {
+        let names: Vec<&str> = types.iter().map(|t| t.name()).collect();
+        summary.push_str(&format!("  field types:  {}\n", names.join(", ")));
+    }
     // ADR 0031 §7: a key in the argument vector is readable by every local user.
     if manifest.api_key_in_args() {
         let warning = "the engine key is in the argument list, visible to every local user in \

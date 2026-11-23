@@ -46,6 +46,9 @@ fn wire(incarnation: &str, max_bytes: u32) -> pb::ExecuteMember {
         group_member_launch: None,
         probe_max_tokens: 0,
         probe_decision: false,
+        probe_embedding: false,
+        probe_extraction: false,
+        trace_parent: String::new(),
     }
 }
 

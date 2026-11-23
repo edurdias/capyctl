@@ -97,6 +97,9 @@ def _fake_parser(drop=(), nested=False, grpc_port=False):
     option("--enable-ssl-refresh", action="store_true")
     option("--config", default=None)
     option("--grpc", action="store_true")
+    # ADR 0036 §2: vLLM's pooling runner and conversion (0.29.0 to 0.32.0).
+    option("--runner", default="auto")
+    option("--convert", default="auto")
     option("--ssl-keyfile", default=None)
     option("--ssl-ciphers", default=None)
     option("--data-parallel-size", "-dp", type=int, default=1)
@@ -128,6 +131,9 @@ def _fake_parser(drop=(), nested=False, grpc_port=False):
     option("--kv-transfer-config", type=KVTransferConfig.parse, default=None)
     option("--download-dir", default=None)
     option("--chat-template", default=None)
+    # vLLM 0.29.0-0.32.0 `ObservabilityConfig` (ADR 0037 §7).
+    option("--otlp-traces-endpoint", default=None)
+    option("--collect-detailed-traces", default=None)
     return parser
 
 
@@ -240,7 +246,9 @@ class ResolveTests(unittest.TestCase):
                      ["--revision", "main"], ["--distributed-executor-backend", "ray"],
                      ["--enable-log-requests"], ["--enable-log-req"],
                      ["--enable-log-outputs"], ["--enable-log-o"],
-                     ["--uvicorn-log-level", "debug"]):
+                     ["--uvicorn-log-level", "debug"],
+                     # T47 (ADR 0036 §2): no deployment picks the runner.
+                     ["--runner", "pooling"], ["--convert", "embed"]):
             with self.subTest(user=user):
                 self.refused(user)
 
@@ -413,6 +421,40 @@ class ExtraArgumentTests(unittest.TestCase):
                 with self.assertRaises(entry.LaunchError) as caught:
                     resolve(extra, reserved=reserved)
                 self.assertEqual(caught.exception.code, "sensitive_option_refused")
+
+    # T48 T21 (ADR 0037 §7, owner decision 2026-10-27 q7): CapyCTL's
+    # `--otlp-traces-endpoint` in the reserved block launches; host-fixed or
+    # extra arguments naming either tracing destination are refused whatever
+    # the host approves, with or without CapyCTL's rendering.
+    def test_tracing_destinations_are_owned(self):
+        from runtime import extra_args_policy as policy
+        endpoint = "http://127.0.0.1:4318/v1/traces"
+        rendered = ["--otlp-traces-endpoint", endpoint]
+
+        def resolve(extra=(), reserved=rendered, fixed=(), approvals=None):
+            vector = RESERVED + reserved + [entry.MARKER, *fixed, entry.EXTRA_MARKER, *extra]
+            with mock.patch("sys.stderr", io.StringIO()):
+                return entry.resolve(vector, fake_parser(), approvals)
+
+        self.assertEqual(resolve().otlp_traces_endpoint, endpoint)
+        self.assertIsNone(resolve(reserved=[]).otlp_traces_endpoint)
+        self.assertIn("otlp_traces_endpoint",
+                      entry.reserved_destinations({"otlp_traces_endpoint"}, False))
+        approved = policy.parse_approvals(json.dumps({
+            "options": ["--otlp-traces-endpoint", "--collect-detailed-traces"],
+            "paths": [], "trust_remote_code": False}))
+        for reserved in (rendered, []):
+            for tokens in (["--otlp-traces-endpoint", "http://collector:4317"],
+                           ["--otlp-traces-endpoint=http://collector:4317"],
+                           ["--otlp-traces", "http://collector:4317"],
+                           ["--collect-detailed-traces", "all"]):
+                for place in ("extra", "fixed"):
+                    kwargs = {place: tokens, "reserved": reserved, "approvals": approved}
+                    with self.subTest(reserved=bool(reserved), tokens=tokens, place=place):
+                        with self.assertRaises(entry.LaunchError) as caught:
+                            resolve(**kwargs)
+                        self.assertEqual(caught.exception.code, "effective_args_mismatch")
+                        self.assertNotIn("collector", str(caught.exception))
 
     # T14 T21: a typed field cannot be restated or reversed by an extra.
     def test_extras_cannot_change_typed_fields(self):

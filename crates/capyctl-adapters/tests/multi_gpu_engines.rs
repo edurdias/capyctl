@@ -355,23 +355,24 @@ fn llamacpp_split_and_device_options_stay_reserved() {
     input.cuda_namespaces = vec![CudaNamespace::PciIndex(0), CudaNamespace::PciIndex(1)];
     input.tensor_split = vec![1, 1];
     let argv = render_llamacpp(&input).unwrap().argv;
-    assert!(recheck_rendered(&argv).is_ok());
+    let chat = capyctl_config::effective::DeploymentApi::Chat;
+    assert!(recheck_rendered(&argv, chat).is_ok());
     let replace = |from: &str, to: &str| -> Vec<String> {
         argv.iter()
             .map(|t| if t == from { to.to_owned() } else { t.clone() })
             .collect()
     };
     for changed in [replace("layer", "row"), replace("layer", "tensor")] {
-        assert!(recheck_rendered(&changed).is_err());
+        assert!(recheck_rendered(&changed, chat).is_err());
     }
     // One split option alone, or twice, is no split CapyCTL renders.
     let at = argv.iter().position(|t| t == "--main-gpu").unwrap();
     let mut alone = argv.clone();
     alone.drain(at..at + 2);
-    assert!(recheck_rendered(&alone).is_err());
+    assert!(recheck_rendered(&alone, chat).is_err());
     let mut twice = argv.clone();
     twice.extend(["--main-gpu".to_owned(), "0".to_owned()]);
-    assert!(recheck_rendered(&twice).is_err());
+    assert!(recheck_rendered(&twice, chat).is_err());
 }
 
 // T46 T21 (ADR 0035 §§9, 10): qualified multi-GPU deep parking renders

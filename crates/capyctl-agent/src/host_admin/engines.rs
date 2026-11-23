@@ -17,9 +17,10 @@ use crate::installation::{InstallationFingerprint, InstallationMeasurer, UNMEASU
 use capyctl_config::effective::InstallationDrift;
 use capyctl_config::engine_policy::Engine;
 use capyctl_config::registration::{
-    check_profile, lock_engines_for, profile_document, valid_profile_name, write_engines,
-    EnginesFile, ProfileSpec, ENVIRONMENT_PROFILES,
+    check_profile, lock_engines_for, profile_document, put_companions, valid_profile_name,
+    write_engines, EnginesFile, ProfileSpec, ENVIRONMENT_PROFILES,
 };
+use capyctl_config::tensorfold_native::{NativeRegistration, TensorfoldLine};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -40,8 +41,15 @@ pub fn detected(roots: &ScanRoots) -> Value {
     let rows: Vec<Value> = candidates(roots)
         .into_iter()
         .map(|c| {
+            // ADR 0039 §1, §3: metadata-only discovery names the native line
+            // and its uncertified-version note, without running the candidate.
+            let line = (c.engine == Engine::Tensorfold).then(|| c.line.name());
+            let note =
+                (c.engine == Engine::Tensorfold && c.line.is_native() && c.version != "unknown")
+                    .then(|| capyctl_config::tensorfold_native::version_note(&c.version))
+                    .flatten();
             json!({"engine": c.engine.name(), "version": c.version, "custom": c.custom,
-            "env": c.env, "entry": c.entry, "source": c.source})
+            "env": c.env, "entry": c.entry, "source": c.source, "line": line, "note": note})
         })
         .collect();
     json!({"candidates": rows})
@@ -115,6 +123,8 @@ fn check_builtin(
     toolchain: &Toolchain<'_>,
 ) -> Result<Checked, HostAdminError> {
     let resolved = resolve(&request.path).map_err(|e| error(e.code(), e.to_string()))?;
+    // ADR 0039 §1: the line is the installation's form, fixed by resolution.
+    let native = resolved.engine == Engine::Tensorfold && resolved.line.is_native();
     let name = request
         .name
         .clone()
@@ -128,10 +138,37 @@ fn check_builtin(
     // Owner rule 2026-09-25: on a host as in standalone, these names are the
     // role's own installation (`local_engine`, `--vllm-bin`, `CAPYCTL_VLLM_BIN`).
     if ENVIRONMENT_PROFILES.contains(&name.as_str()) {
-        return Err(error("profile_exists", format!("{name} is reserved for the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin / --llamacpp-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN / CAPYCTL_LLAMACPP_BIN or local_engine); use --name")));
+        return Err(error("profile_exists", format!("{name} is reserved for the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin / --llamacpp-bin / --tensorrt-llm-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN / CAPYCTL_LLAMACPP_BIN / CAPYCTL_TENSORRT_LLM_BIN or local_engine); use --name")));
+    }
+    // ADR 0039 §2: never replace an existing TensorFold profile. ADR 0040
+    // §10: preview executes nothing, so the suggestion uses discovery's
+    // version; registration checks the binary's version only after approval.
+    if native && request.name.is_none() && registered_or_declared(target, &name)? {
+        let version = &resolved.version;
+        let suggested = format!("{name}-{}", version.replace('.', "-"));
+        return Err(error(
+            "profile_exists",
+            format!(
+                "profile {name} exists (typically the TensorFold 0.6 profile); name this native \
+                 release {version} with --name, for example --name {suggested}; nothing was \
+                 written"
+            ),
+        ));
     }
     // Checked before anything runs, and again under the lock when writing.
     refuse_existing(target, &name)?;
+    // ADR 0039 §5: refuse names the native line cannot carry before
+    // anything runs or is written.
+    if native {
+        if let Some(reason) = capyctl_config::engine_env::tensorfold_native_refused(
+            request.approved_env.iter().chain(request.env.keys()),
+        ) {
+            return Err(error(
+                "invalid_config",
+                format!("{reason}; nothing was written"),
+            ));
+        }
+    }
     // #198, ADR 0008 amendment 2026-10-30: an installation the engine's
     // protected entry can never import (an editable SGLang, reached only
     // through a .pth file the entry never runs) is refused before anything
@@ -151,12 +188,14 @@ fn check_builtin(
             ),
         ));
     }
-    // SPEC §13.3 amendment (owner decision 2026-09-25). ADR 0029 §2: nothing
-    // compiles at run time for llama.cpp, so no toolkit is recorded for it.
+    // SPEC §13.3, ADR 0029 §2, ADR 0039 §2: llama.cpp and TensorFold's
+    // native line compile nothing at run time and record no toolkit.
+    // ADR 0038 §2: TensorRT-LLM records one, without checking its toolchain.
     let cuda_home = match resolved.engine {
         // ADR 0031 §1: `--custom` registers through its own path.
         Engine::Llamacpp | Engine::Custom => None,
-        Engine::Vllm | Engine::Sglang | Engine::Tensorfold => {
+        Engine::Tensorfold if native => None,
+        Engine::Vllm | Engine::Sglang | Engine::Tensorfold | Engine::TensorrtLlm => {
             capyctl_config::registration::detect_cuda_home_in(
                 toolchain.cuda_home_env.as_deref(),
                 &toolchain.search.default_cuda_home,
@@ -171,7 +210,7 @@ fn check_builtin(
         if let Some(family) = match resolved.engine {
             Engine::Tensorfold => Some("TensorFold"),
             Engine::Llamacpp => Some("llama.cpp"),
-            Engine::Vllm | Engine::Sglang => None,
+            Engine::Vllm | Engine::Sglang | Engine::TensorrtLlm => None,
             // ADR 0031 §1: `--custom` registers through its own path.
             Engine::Custom => Some("a custom engine"),
         } {
@@ -185,23 +224,30 @@ fn check_builtin(
         }
     }
     if resolved.engine == Engine::Tensorfold {
-        // ADR 0023 §2: TensorFold has no park path; refuse a request for one
-        // before anything runs or is written.
+        // ADR 0023 §2, ADR 0039 §12: neither line has a park path.
         if request.deep_park == Some(true) {
             return Err(error(
                 "capability_missing",
-                "TensorFold has no sleep or release API; it runs restart_only, so \
-                 --deep-park enabled is refused and nothing was written",
+                if native {
+                    "TensorFold native has no park path; it runs restart_only, so \
+                     --deep-park enabled is refused and nothing was written"
+                } else {
+                    "TensorFold has no sleep or release API; it runs restart_only, so \
+                     --deep-park enabled is refused and nothing was written"
+                },
             ));
         }
-        let bin = resolved.executable.parent().unwrap_or(&resolved.env);
-        capyctl_config::toolchain::check(bin, cuda_home.as_deref(), &toolchain.search.system)
-            .map_err(|missing| {
+        // ADR 0039 §2: the native release needs no build toolchain.
+        if !native {
+            let bin = resolved.executable.parent().unwrap_or(&resolved.env);
+            capyctl_config::toolchain::check(bin, cuda_home.as_deref(), &toolchain.search.system)
+                .map_err(|missing| {
                 error(
                     "toolchain_missing",
                     format!("{}; nothing was written", missing.for_engine_add()),
                 )
             })?;
+        }
     }
     if resolved.engine == Engine::Llamacpp {
         // ADR 0029 §2: llama.cpp has no deep-park capability, and a
@@ -223,6 +269,14 @@ fn check_builtin(
             ));
         }
     }
+    // ADR 0038 §2, §8: TensorRT-LLM is restart-only; no toolchain check.
+    if resolved.engine == Engine::TensorrtLlm && request.deep_park == Some(true) {
+        return Err(error(
+            "capability_missing",
+            "TensorRT-LLM's sleep mode is a prototype its server does not expose; it runs \
+             restart_only, so --deep-park enabled is refused and nothing was written",
+        ));
+    }
     Ok(Checked {
         resolved,
         name,
@@ -235,14 +289,19 @@ async fn measure_files(
     measurer: &Arc<InstallationMeasurer>,
     resolved: &Resolved,
 ) -> Result<Result<InstallationFingerprint, ()>, HostAdminError> {
-    let (measurer, engine, executable) = (
+    let (measurer, engine, line, executable) = (
         measurer.clone(),
         resolved.engine,
+        resolved.line,
         resolved.executable.clone(),
     );
-    tokio::task::spawn_blocking(move || measurer.measure(engine, &executable).map_err(|_| ()))
-        .await
-        .map_err(|_| error("internal", "measuring the installation failed"))
+    tokio::task::spawn_blocking(move || {
+        measurer
+            .measure_profile(engine, line, &executable, None)
+            .map_err(|_| ())
+    })
+    .await
+    .map_err(|_| error("internal", "measuring the installation failed"))
 }
 
 /// ADR 0040 §10, §11: what a built-in add's confirmation covers.
@@ -258,6 +317,7 @@ fn builtin_fields(
         "host_id": request.host_id,
         "profile": checked.name,
         "engine": checked.resolved.engine.name(),
+        "line": checked.resolved.line,
         "version": checked.resolved.version,
         "executable": executable,
         "args": request.args,
@@ -413,9 +473,13 @@ struct Registration {
     deep_park_missing: Option<bool>,
     /// ADR 0033 §1: the LMCache of a vLLM or SGLang environment.
     lmcache: Option<crate::lmcache_install::LmcacheMeasurement>,
+    /// ADR 0039 §2, §7: native capabilities and checksum evidence.
+    native: Option<NativeRegistration>,
 }
 
 /// ADR 0018 §1 step 3: executed only now, because the operator named it.
+/// ADR 0039 §2: a native release checks SHA256SUMS and capabilities
+/// instead of running a Python probe.
 fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, HostAdminError> {
     let reported = check_version(resolved, VERSION_CHECK_TIMEOUT).map_err(|e| {
         error(
@@ -427,6 +491,34 @@ fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, HostA
         )
     })?;
     let measurer = InstallationMeasurer::new();
+    if resolved.engine == Engine::Tensorfold && resolved.line.is_native() {
+        let native = crate::installation::check_native_release(
+            &resolved.executable,
+            &reported.version,
+            VERSION_CHECK_TIMEOUT,
+        )
+        .map_err(|e| {
+            error(
+                e.code(),
+                format!("{}: {e}; nothing was written", resolved.env.display()),
+            )
+        })?;
+        let fingerprint = measurer
+            .measure_profile(
+                Engine::Tensorfold,
+                TensorfoldLine::Native,
+                &resolved.executable,
+                None,
+            )
+            .ok();
+        return Ok(Registration {
+            reported,
+            fingerprint,
+            deep_park_missing: None,
+            lmcache: None,
+            native: Some(native),
+        });
+    }
     let fingerprint = measurer.measure(resolved.engine, &resolved.executable).ok();
     // ADR 0033 §1: LMCache's version and digest, read from the environment's
     // files (nothing runs); recorded only when found and measurable, and
@@ -437,7 +529,7 @@ fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, HostA
                 .ok()
                 .flatten()
         }
-        Engine::Tensorfold | Engine::Llamacpp | Engine::Custom => None,
+        Engine::Tensorfold | Engine::Llamacpp | Engine::TensorrtLlm | Engine::Custom => None,
     };
     // review decision 2026-09-25: `engine add` before any role has started
     // is the first run. The state root the role will use is created
@@ -477,18 +569,26 @@ fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, HostA
         fingerprint,
         deep_park_missing: report.and_then(|r| r.available("deep_park")).map(|a| !a),
         lmcache,
+        native: None,
     })
 }
 
 /// ADR 0018 §2: lock engines.yaml, re-check the name against both files,
 /// validate, write. The role document is never written. The revision written.
-fn write_profile(target: &Target, name: &str, spec: &ProfileSpec) -> Result<u64, HostAdminError> {
+/// ADR 0038 §2: companions are the versions the metadata-only check read.
+fn write_profile(
+    target: &Target,
+    name: &str,
+    spec: &ProfileSpec,
+    companions: &BTreeMap<String, String>,
+) -> Result<u64, HostAdminError> {
     let lock = lock_engines_for(&target.engines, service_owner(target))
         .map_err(|e| error("internal", format!("{}: {}", e.path, e.detail)))?;
     let mut engines =
         EnginesFile::load(&target.engines).map_err(|e| error("invalid_config", e.detail))?;
     refuse_existing(target, name)?;
-    let profile = profile_document(spec);
+    let mut profile = profile_document(spec);
+    put_companions(&mut profile, companions);
     check_profile(name, &profile)
         .map_err(|e| error("invalid_config", format!("{}: {}", e.path, e.detail)))?;
     engines.profiles.insert(name.to_owned(), profile);
@@ -527,17 +627,20 @@ pub async fn add_builtin(
     // Owner decision 2026-09-25: missing deep park is recorded as disabled unless asked.
     let deep = match request.deep_park {
         Some(asked) => asked,
-        // ADR 0023 §2, ADR 0029 §2: TensorFold and llama.cpp are disabled even
-        // when the probe could not run.
+        // ADR 0023 §2, ADR 0029 §2, ADR 0038 §2: restart-only engines
+        // remain disabled even when the probe could not run.
         None => {
-            !matches!(resolved.engine, Engine::Tensorfold | Engine::Llamacpp)
-                && registration.deep_park_missing != Some(true)
+            !matches!(
+                resolved.engine,
+                Engine::Tensorfold | Engine::Llamacpp | Engine::TensorrtLlm
+            ) && registration.deep_park_missing != Some(true)
         }
     };
     let spec = ProfileSpec {
         engine: resolved.engine,
         executable: resolved.executable.clone(),
-        // ADR 0029 §2: llama.cpp's is `<version>+<commit>`.
+        // ADR 0029 §2: llama.cpp's is `<version>+<commit>`. ADR 0039 §2:
+        // a native release's is the checked version.
         build_fingerprint: registration.reported.build_fingerprint.clone(),
         deep_park: deep,
         installation_drift: request.drift,
@@ -556,13 +659,23 @@ pub async fn add_builtin(
             .lmcache
             .as_ref()
             .map(crate::lmcache_install::LmcacheMeasurement::registration),
+        line: resolved.line,
+        native: registration.native.clone(),
     };
-    let revision = write_profile(target, &name, &spec)?;
-    let out = json!({
+    let companions = &registration.reported.companions;
+    let revision = write_profile(target, &name, &spec, companions)?;
+    let mut out = json!({
         "profile": name, "engine": resolved.engine.name(),
         "version": registration.reported.version,
         "build_fingerprint": spec.build_fingerprint,
-        "custom": !capyctl_config::registration::is_verified(resolved.engine, &spec.build_fingerprint),
+        "custom": !capyctl_config::registration::is_verified_profile(
+            resolved.engine,
+            resolved.line,
+            &spec.build_fingerprint,
+            companions
+                .get(capyctl_config::tensorrt_llm::TORCH)
+                .map(String::as_str),
+        ),
         "executable": resolved.executable,
         "fingerprint": registration.fingerprint.map(|f| json!({"version": f.version, "digest": f.digest})),
         "deep_park": if deep { "enabled" } else { "disabled" }, "deep_park_probe": probe,
@@ -572,6 +685,31 @@ pub async fn add_builtin(
         // ADR 0033 §1: what was recorded, or null when LMCache was not found.
         "lmcache": spec.lmcache,
     });
+    // ADR 0039 §3: native registration reports its checked capabilities,
+    // uncertified-version note and absent checksum list, not the 0.6 set.
+    if resolved.engine == Engine::Tensorfold {
+        out["line"] = json!(resolved.line.name());
+        if resolved.line.is_native() {
+            let note = capyctl_config::tensorfold_native::version_note(&spec.build_fingerprint);
+            let checksums_verified = spec.native.as_ref().map(|n| n.checksums_verified);
+            let mut notes: Vec<String> = note.iter().cloned().collect();
+            if checksums_verified == Some(false) {
+                notes.push(
+                    "the publisher's checksum list (SHA256SUMS) was absent, so the \
+                     release's files were not checked against it at registration"
+                        .to_owned(),
+                );
+            }
+            out["note"] = json!(note);
+            out["checksums_verified"] = json!(checksums_verified);
+            out["families"] = json!(spec.native.as_ref().map(|n| &n.families));
+            out["notes"] = json!(notes);
+        }
+    }
+    // ADR 0038 §2: show the recorded companion versions.
+    if resolved.engine == Engine::TensorrtLlm {
+        out["companions"] = json!(companions);
+    }
     publish(channel, target, out, revision, &target.engines).await
 }
 
@@ -590,7 +728,7 @@ pub async fn remove(
 ) -> Result<Value, HostAdminError> {
     if ENVIRONMENT_PROFILES.contains(&name) && !registered_or_declared(target, name)? {
         return Err(error("invalid_config", format!(
-            "{name} comes from the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin / --llamacpp-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN / CAPYCTL_LLAMACPP_BIN or local_engine); unset it and restart the role instead"
+            "{name} comes from the role's own installation (--vllm-bin / --sglang-bin / --tensorfold-bin / --llamacpp-bin / --tensorrt-llm-bin, CAPYCTL_VLLM_BIN / CAPYCTL_SGLANG_BIN / CAPYCTL_TENSORFOLD_BIN / CAPYCTL_LLAMACPP_BIN / CAPYCTL_TENSORRT_LLM_BIN or local_engine); unset it and restart the role instead"
         )));
     }
     // ADR 0031 amendment A1: the profile is in engines.yaml or in

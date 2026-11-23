@@ -139,6 +139,9 @@ pub fn plan_from_effective(
             .map_err(|_| LlamacppPlanError::UnpinnableDevice)?
             .unwrap_or_default(),
         tensor_split: tensor_split(effective)?,
+        // ADR 0036 §2: an embeddings deployment renders `--embeddings` and
+        // its batch sizes.
+        api: effective.api,
     })
 }
 

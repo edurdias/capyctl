@@ -110,6 +110,10 @@ struct Script {
     chat_loading: AtomicUsize,
     /// What `/v1/systemone` answers; 404 when `None`.
     decision: Mutex<Option<Value>>,
+    /// T50: assert the fixed extraction request uses exactly these declared types.
+    extraction_types: Option<Vec<capyctl_config::extractions::FieldType>>,
+    /// What `/v1/embeddings` answers; 422 when `None`.
+    embedding: Mutex<Option<Value>>,
     /// The idle route's status and body.
     idle: Mutex<Option<(StatusCode, String)>>,
     /// The bearer key every request must carry, when set.
@@ -122,6 +126,7 @@ struct Stub {
     health_reads: Arc<AtomicUsize>,
     chats: Arc<AtomicUsize>,
     decisions: Arc<AtomicUsize>,
+    embeddings: Arc<AtomicUsize>,
     models: Arc<AtomicUsize>,
     idle_reads: Arc<AtomicUsize>,
     unauthorized: Arc<AtomicUsize>,
@@ -212,9 +217,39 @@ async fn systemone(
         return refused;
     }
     assert_eq!(body["model"], "basal", "the probe names the served model");
+    if let Some(declared) = &stub.script.extraction_types {
+        assert_eq!(
+            body,
+            capyctl_adapters::extraction_probe::request("basal", declared)
+        );
+    }
     match stub.script.decision.lock().unwrap().clone() {
         Some(answer) => Json(answer).into_response(),
         // basal answers every failure 422.
+        None => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "model loading"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn embeddings(
+    State(stub): State<Stub>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    stub.embeddings.fetch_add(1, SeqCst);
+    if let Some(refused) = stub.refused(&headers) {
+        return refused;
+    }
+    assert_eq!(
+        body,
+        capyctl_adapters::embedding_probe::request("basal"),
+        "the fixed probe names the served model"
+    );
+    match stub.script.embedding.lock().unwrap().clone() {
+        Some(answer) => Json(answer).into_response(),
         None => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({"error": "model loading"})),
@@ -240,6 +275,7 @@ async fn stub_engine(script: Script) -> (Stub, u16) {
         health_reads: Arc::default(),
         chats: Arc::default(),
         decisions: Arc::default(),
+        embeddings: Arc::default(),
         models: Arc::default(),
         idle_reads: Arc::default(),
         unauthorized: Arc::default(),
@@ -249,6 +285,7 @@ async fn stub_engine(script: Script) -> (Stub, u16) {
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/systemone", post(systemone))
+        .route("/v1/embeddings", post(embeddings))
         .route("/metrics", get(idle))
         .route("/stats", get(idle))
         .with_state(stub.clone());
@@ -274,6 +311,12 @@ const CHAT: &str = "kind: custom_engine\nschema_version: 1\napi: chat\n\
 const DECISIONS: &str =
     "kind: custom_engine\nschema_version: 1\napi: decisions\nversion: \"2.2.0\"\n\
     args: [--mode, eager, --host, \"{host}\", --port, \"{port}\", --model, \"{model_dir}\"]\n\
+    health: /health\n";
+
+const EMBEDDINGS: &str =
+    "kind: custom_engine\nschema_version: 1\napi: embeddings\nversion: \"0.3.0\"\n\
+    args: [--host, \"{host}\", --port, \"{port}\", --model, \"{model_dir}\"]\n\
+    env: {SERVE_AUTH: \"{api_key}\"}\n\
     health: /health\n";
 
 const KEYED: &str = "kind: custom_engine\nschema_version: 1\napi: chat\n\
@@ -311,6 +354,7 @@ fn adapter(port: u16, manifest: &CustomManifest, key: Option<&str>) -> CustomAda
         key.map(str::to_owned),
     )
     .with_api(manifest.api)
+    .with_field_types(manifest.field_types.clone().unwrap_or_default())
     .with_health(manifest.health.clone())
     .with_idle(manifest.idle.clone())
 }
@@ -481,6 +525,144 @@ async fn a_decisions_engine_is_ready_only_after_the_fixed_decision() {
         .await
         .unwrap();
     assert!(matches!(&canary.answer, CanaryEvidence::Decision(d) if d.choice == "billing"));
+}
+
+// T50: ADR 0041 §4: health alone and a malformed extraction are not ready;
+// the frozen manifest's subset gets a smaller fixed request, never a chat probe.
+#[tokio::test]
+async fn an_extractions_engine_is_ready_only_after_its_declared_fixed_extraction() {
+    use capyctl_adapters::completion_probe::CanaryEvidence;
+    use capyctl_config::extractions::FieldType;
+    let script = Script {
+        key: Some("launch-key".into()),
+        extraction_types: Some(vec![FieldType::Number, FieldType::Date]),
+        decision: Mutex::new(Some(json!({"answers": {
+            "amount_paid": {"type":"number","guess":649.001,"value":649.001,
+                "p_null":0.1,"confidence":0.9},
+            "delivered_on": {"type":"date","guess":"2026-09-28","value":"2026-09-28",
+                "p_null":0.1,"confidence":0.9}
+        }}))),
+        ..Script::default()
+    };
+    let (stub, port) = stub_engine(script).await;
+    let proc_root = fake_proc([127, 0, 0, 1], port);
+    let manifest = manifest(
+        "kind: custom_engine\nschema_version: 1\napi: extractions\n\
+         field_types: [date, number]\n\
+         args: [--host, \"{host}\", --port, \"{port}\", --model, \"{model_dir}\"]\n\
+         env: {SERVE_AUTH: \"{api_key}\"}\nhealth: /health\n",
+    );
+    let engine = launching(
+        port,
+        &manifest,
+        Some("launch-key"),
+        ScriptedTool::new(Presence::Alive),
+        proc_root.path(),
+    );
+    let started = tokio::spawn({
+        let command = initialize_command(30_000);
+        async move {
+            let observation = engine.execute_persisted(&command).await?;
+            Ok::<_, RuntimeError>((engine, observation))
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert!(
+        !started.is_finished(),
+        "a number off the probe's grid is not readiness"
+    );
+    assert!(stub.decisions.load(SeqCst) >= 2);
+    *stub.script.decision.lock().unwrap() = Some(json!({"answers": {
+        "amount_paid": {"type":"number","guess":649.0,"value":null,
+            "p_null":0.1,"confidence":0.9},
+        "delivered_on": {"type":"date","guess":"2026-09-28","value":"2026-09-28",
+            "p_null":0.1,"confidence":0.9}
+    }}));
+    let (engine, observation) = started.await.unwrap().unwrap();
+    assert!(observation.receipt.contains("fixed extraction"));
+    assert_eq!(stub.chats.load(SeqCst), 0, "never a chat probe");
+    assert_eq!(stub.embeddings.load(SeqCst), 0, "never an embedding probe");
+    assert_eq!(stub.models.load(SeqCst), 0, "never a model list");
+    assert_eq!(stub.unauthorized.load(SeqCst), 0, "key on every read");
+    let evidence = observation
+        .extraction_probe
+        .as_ref()
+        .expect("the initial extraction answer");
+    assert_eq!(
+        evidence.probe_version,
+        capyctl_adapters::extraction_probe::VERSION
+    );
+    assert_eq!(evidence.declared_field_types, ["number", "date"]);
+    let initial: Value = serde_json::from_slice(&evidence.answers_json).unwrap();
+    assert_eq!(
+        initial,
+        stub.script.decision.lock().unwrap().as_ref().unwrap()["answers"]
+    );
+    // The startup result remains the first answer when a later probe changes.
+    stub.script.decision.lock().unwrap().as_mut().unwrap()["answers"]["amount_paid"]["guess"] =
+        json!(650.0);
+    stub.script.decision.lock().unwrap().as_mut().unwrap()["answers"]["amount_paid"]["value"] =
+        json!(650.0);
+    let canary = engine
+        .wake_canary(
+            &initialize_command(30_000).context,
+            8,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(canary.answer, CanaryEvidence::Extraction(answer)
+        if answer.declared == [FieldType::Number, FieldType::Date]
+            && answer.answers["amount_paid"]["guess"] == 650.0));
+    assert_eq!(initial["amount_paid"]["guess"], 649.0);
+}
+
+// T47 T44 (ADR 0036 §1, §5, ADR 0031 §5): an embeddings custom engine is
+// ready only on a well-formed answer to the fixed embedding, with its key,
+// never a chat or decision probe; its wake check is that embedding.
+#[tokio::test]
+async fn an_embeddings_engine_is_ready_only_after_the_fixed_embedding() {
+    use capyctl_adapters::completion_probe::CanaryEvidence;
+    let entry = |vector: Value| json!({"object": "embedding", "index": 0, "embedding": vector});
+    let answer =
+        |vector: Value| json!({"object": "list", "model": "basal", "data": [entry(vector)]});
+    let script = Script {
+        key: Some("k3y".into()),
+        // A zero vector is no answer: the launch keeps waiting.
+        embedding: Mutex::new(Some(answer(json!([0.0, 0.0])))),
+        ..Script::default()
+    };
+    let (stub, port) = stub_engine(script).await;
+    let proc_root = fake_proc([127, 0, 0, 1], port);
+    let manifest = manifest(EMBEDDINGS);
+    let engine = launching(
+        port,
+        &manifest,
+        Some("k3y"),
+        ScriptedTool::new(Presence::Alive),
+        proc_root.path(),
+    );
+    let started = tokio::spawn({
+        let command = initialize_command(30_000);
+        async move { engine.execute_persisted(&command).await.map(|_| engine) }
+    });
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert!(!started.is_finished(), "a zero vector is not readiness");
+    assert!(stub.embeddings.load(SeqCst) >= 2);
+    *stub.script.embedding.lock().unwrap() = Some(answer(json!([0.6, 0.8])));
+    let engine = started.await.unwrap().unwrap();
+    assert_eq!(stub.chats.load(SeqCst), 0, "never a chat probe");
+    assert_eq!(stub.decisions.load(SeqCst), 0, "never a decision probe");
+    assert_eq!(stub.unauthorized.load(SeqCst), 0, "the key on every probe");
+    let canary = engine
+        .wake_canary(
+            &initialize_command(30_000).context,
+            8,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(&canary.answer, CanaryEvidence::Embedding(e) if e.vector == [0.6, 0.8]));
 }
 
 // T44 (ADR 0031 §5): a health path that never answers 200 keeps the launch

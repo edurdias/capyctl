@@ -86,9 +86,14 @@ Add a field to choose something yourself, for example:
 - `lmcache: off` to run without [LMCache](engines.md#lmcache), the private
   KV cache in host RAM that every vLLM 0.32.0+ and SGLang 0.5.22+ deployment
   gets by default (decision deployments on SGLang excepted, for now), or
-  `lmcache: required` to refuse to start without it.
-  `lmcache_pool: 8GiB` sets its RAM pool (a whole number of GiB, 4 GiB by
-  default); it is refused beside `lmcache: off`.
+  `lmcache: required` to refuse to start without it (outside the certified
+  table, or on several GPUs, it runs uncertified, and `deploy --wait` says so).
+  `lmcache_pool` is `auto` by default: a RAM pool that holds one full context
+  of the model after LMCache's eviction, at least 4 GiB and within the
+  machine's `host_kv_limit` (a tenth of the memory standalone observes at
+  each start, and settable), with a warning when one context does not fit.
+  `lmcache_pool: 8GiB` states a size instead (a whole number of GiB, at least
+  1 GiB); it is refused beside `lmcache: off`.
 - `retention: zero` to keep this deployment's engine output in memory, start
   it with no core dumps and never give it LMCache
   ([zero data retention](../operations/data-retention.md#zero-data-retention)).
@@ -263,6 +268,207 @@ for each of the three options and no other, each between 0 and 1, summing to
 whichever team it picks. Any change to the request is a new version of the
 check, and a wake reference recorded with an older version is never compared
 with the new answers.
+
+## Extraction models
+
+Extraction is an engine capability: an engine returns typed values for `fields`
+on `POST /v1/systemone`, rather than a decision model's `questions`
+([Extraction requests](requests.md#extraction-requests)). The checkpoint must
+support the engine's extraction implementation; this is not a model-specific
+server integration.
+
+The current built-in engine paths refuse `api: extractions` with
+`capability_missing:extractions`. Native support requires a qualified amendment;
+choosing a newer version or renaming a built-in profile does not enable it.
+A patched or custom variant of vLLM, SGLang, llama.cpp, TensorRT-LLM or
+TensorFold can instead use the existing [custom-engine registration](engines.md#example-a-patched-extraction-engine),
+provided it serves the `fields` contract. The manifest declares the types it
+actually answers. For a patched vLLM executable, for example:
+
+```yaml title="vllm-extraction.yaml"
+kind: custom_engine
+schema_version: 1
+api: extractions
+field_types: [text, number, date, time, datetime, duration, list, estimate, forecast]
+args: [serve, "{model_dir}", --host, "{host}", --port, "{port}", --served-model-name, "{served_name}", --max-model-len, "{context_length}"]
+health: /health
+```
+
+For a registered profile named `vllm-extraction`, a deployment might be:
+
+```yaml title="extractor.yaml"
+name: extractor
+engine: vllm-extraction
+model: example/extractor
+api: extractions
+resources: {gpu: 16GiB, ram: 8GiB}
+engine_config: {context_length: 8192}
+```
+
+The model names a local checkpoint under your models directory. The context
+length and resource figures illustrate the document shape, not measured limits
+or requirements. Set them for your engine and checkpoint, measuring peak memory
+before relying on the deployment.
+`api` is part of the frozen revision. `field_types` must be non-empty,
+distinct and drawn from the nine names above; it is stored in that order.
+Changing the set changes the manifest digest and creates a new profile.
+Other APIs must not declare `field_types`.
+
+`field_types` declares output types only, not text-only or media input support.
+The manifest has no input-capability declaration. CapyCTL validates the request
+shape but leaves input support to the engine: a text-only engine must reject
+unsupported image input. The readiness probe uses text only and does not qualify
+image or PDF handling.
+
+`engine add --custom` shows the field types beside the API for confirmation.
+**Before downgrading** to a release without extraction support, remove every
+extraction engine with `capyctl engine remove`. Older releases refuse all of
+`custom-engines.yaml` when a manifest contains `field_types`, so their role
+will not start.
+
+An extraction deployment:
+
+- runs on one machine and refuses a `topology`, including several GPUs;
+- resolves `restart_only`; `deep` and `host_backed` are refused;
+- refuses tool-call and reasoning parsers; CapyCTL does no extraction readout;
+- has LMCache off, as every custom engine does;
+- requires both `custom_engines` and `extractions` on the host. A host without
+  the latter is never selected (`host_capability_missing:extractions`).
+
+### The readiness extraction
+
+After the port and optional health path answer, CapyCTL sends a fixed
+readiness extraction
+to the launch's own loopback endpoint, with its served name and its own key
+when present. It contains one field per declared type. Readiness requires
+exactly those answers, matching types and well-formed values; it does not
+check factual accuracy. Null scalar and list values are allowed; list order
+is the engine's. The probe accepts times with `Z` or `±HH:MM`, durations
+with no fractional part, and either forecast form (arrays or `steps`
+objects); every form present must be well-formed. `/health` and
+`/v1/models` alone are not readiness.
+
+The first answer becomes the launch's wake reference, with probe version and
+declared types. The wake check
+compares scalar guesses (and text spans), not scalar value nullness; lists
+must repeat items and spans in order or be null in both. Estimates and
+forecasts have an inclusive one-step tolerance, probabilities an inclusive
+0.05 tolerance; a probability present in only one answer fails. A mismatch
+stops the instance. With restart-only residency and no LMCache, a restart
+records a new reference.
+
+CPU and fake-engine tests do not qualify a patched engine, its checkpoint or its
+supported inputs. Live qualification must cover the actual engine installation
+and extraction contract; this example makes no quality or release claim.
+
+## Embedding models
+
+An embedding model turns text into a vector of numbers, for search,
+retrieval and finding near-duplicates. It is served at `POST /v1/embeddings`
+([Embedding requests](requests.md#embedding-requests)) rather than at chat
+completions. Say so with `api`:
+
+```yaml title="embedder.yaml"
+name: embedder
+engine: vllm
+model: Qwen/Qwen3-Embedding-4B
+api: embeddings
+```
+
+`api: embeddings` is part of the deployment's revision, as `decisions` is.
+CapyCTL starts the engine as an embedding server: vLLM with
+`--runner pooling`, SGLang with `--is-embedding`, llama.cpp with
+`--embeddings` and batch sizes that fit any input
+([Embedding models on each engine](engines.md#embedding-models)). In this
+release an `embeddings` deployment:
+
+- runs on vLLM, SGLang, llama.cpp or a
+  [custom engine](engines.md#custom-engines) whose manifest says
+  `api: embeddings`. TensorFold and TensorRT-LLM have no embeddings endpoint
+  and are refused with `capability_missing:embeddings`
+  ([Exit codes and errors](errors.md));
+- runs on one GPU of one machine: a `topology` is refused;
+- parks `deep` on vLLM and SGLang when it states no `residency` (on a
+  discrete GPU too, unless the engine profile turned deep parking off), and
+  restarts on llama.cpp and custom engines. `host_backed` is refused
+  everywhere, and `deep` is refused on llama.cpp and custom engines with
+  `capability_missing:deep_park`;
+- runs without [LMCache](engines.md#lmcache): status shows it off with the
+  reason `embeddings_unsupported`, and `lmcache: required` is refused;
+- has no tool-call or reasoning parser: `tool_call_parser`,
+  `reasoning_parser` and those options in `extra_args` are refused;
+- runs only on machines whose CapyCTL serves embedding models; an older one
+  is never chosen, and naming it is refused with
+  `host_capability_missing:embeddings`.
+
+Memory is sized as for any deployment of the same checkpoint. An embedding
+model holds little KV cache, since the engine keeps it only while it reads
+each input, so a deployment that states `resources` from its measured peak
+(`capyctl status deployment embedder --json`, `startup.measured`) often needs
+far less than the default.
+
+### Certified and uncertified
+
+`capyctl status deployment <name>` shows the API with its certification,
+`API     embeddings (certified)` or `API     embeddings (uncertified)`. CapyCTL
+shows `certified` on vLLM 0.32.0, SGLang 0.5.22 and llama.cpp 0.7.0, the
+versions the embedding live rows run on, and `uncertified` on every other
+version and on custom engines. A certified combination is a model, at a
+pinned revision, on one of those engine versions once its live rows have
+passed. Those rows have not run yet, so no model is certified on any engine
+in this release; [Embedding models on each engine](engines.md#embedding-models)
+lists the models they cover.
+
+An uncertified setup is never refused for being uncertified. An older vLLM
+or SGLang that serves embeddings, another checkpoint, or a custom engine runs
+with the same request checks, readiness check and wake check, and parks as
+the certified version would. CapyCTL promises nothing more about it: a fault
+shows as a failed start, a failed request or a failed wake check.
+
+### Chat checkpoints served as embeddings
+
+A generative checkpoint can be served as embeddings too. vLLM converts it
+itself (it pools the last token's hidden state), and SGLang serves
+decoder-style models with `--is-embedding`. The same weights served as `chat`
+and as `embeddings` are two revisions, two deployments with their own names,
+and the embeddings one runs uncertified. Whether the vectors are any good for
+retrieval depends on the model: a checkpoint trained for embeddings usually
+does far better.
+
+### The readiness check
+
+An embedding model generates no text, so CapyCTL proves it ready with an
+embedding instead. It sends this exact request, with `model` set to the name
+the engine serves the model under, straight to the engine on its private
+port:
+
+```json
+{
+  "model": "<the engine's served model name>",
+  "input": "CapyCTL readiness check: a quiet library with tall shelves of old books.",
+  "encoding_format": "float"
+}
+```
+
+The model is ready when it answers one vector of finite numbers that is not
+all zeros (its length above 1e-6); it does not have to be of length 1. The
+vector's length is recorded as the model's dimension, which llama.cpp
+deployments use to check `dimensions`. A model that answers malformed, or not
+at all, never becomes ready, and CapyCTL never sends it a chat request in
+place of the embedding. The same check runs after a restart, after every
+wake, and when a machine reconnects or CapyCTL restarts with the model still
+running.
+
+The first answer is kept as the reference for the wake check
+([Parking](parking.md#park-and-wake)). After every wake and every restart
+CapyCTL sends the same request again and compares the new vector with the
+reference: the same length, and a relative distance (`‖v − r‖ / ‖r‖`) within
+a tolerance. A model that fails is stopped with `wake_mismatch`. The
+tolerance is 0.02 for now (for vectors of length 1, a cosine similarity of
+0.9998); it is provisional, and a live measurement still to be made sets the
+final figure. Any change to
+the request is a new version of the check, and a reference recorded with
+another version is never compared with the new answers.
 
 ## Deploy and start
 

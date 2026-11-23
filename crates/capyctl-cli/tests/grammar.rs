@@ -761,6 +761,9 @@ fn engine_flags_are_parsed_on_start_standalone_and_host() {
             // T42 (ADR 0029 §2).
             "--llamacpp-bin",
             "/opt/llama.cpp/bin/llama-server",
+            // T49 (ADR 0038 §2).
+            "--tensorrt-llm-bin",
+            "/home/u/tensorrt-llm-1.2.1-venv/bin/trtllm-serve",
             "--engine-fingerprint",
             "vllm 0.29.0",
             "--engine-args",
@@ -800,6 +803,7 @@ fn engine_flags_are_parsed_on_start_standalone_and_host() {
                 sglang: Some("/opt/sglang/bin/python3".into()),
                 tensorfold: Some("/opt/tensorfold/bin/tensorfold".into()),
                 llamacpp: Some("/opt/llama.cpp/bin/llama-server".into()),
+                tensorrt_llm: Some("/home/u/tensorrt-llm-1.2.1-venv/bin/trtllm-serve".into()),
                 build_fingerprint: Some("vllm 0.29.0".into()),
                 args: Some(vec![
                     "--enforce-eager".into(),

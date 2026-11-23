@@ -1,6 +1,7 @@
 //! ADR 0030 §2: the public inference endpoints that dispatch to a deployment,
 //! and the API each one answers. A deployment answers exactly one of them, the
-//! one its `api` names; the other is refused before any activation.
+//! one its `api` names; the others are refused before any activation (ADR
+//! 0036 §3: embeddings is the third).
 
 use axum::http::StatusCode;
 use axum::Json;
@@ -15,6 +16,11 @@ pub enum Endpoint {
     ChatCompletions,
     /// `POST /v1/systemone`, answered by `api: decisions` deployments.
     Decisions,
+    /// ADR 0036 §3: `POST /v1/embeddings`, answered by `api: embeddings`
+    /// deployments.
+    Embeddings,
+    /// ADR 0041 §3: the extraction contract on `POST /v1/systemone`.
+    Extractions,
 }
 
 impl Endpoint {
@@ -22,7 +28,8 @@ impl Endpoint {
     pub const fn path(self) -> &'static str {
         match self {
             Self::ChatCompletions => "/v1/chat/completions",
-            Self::Decisions => "/v1/systemone",
+            Self::Decisions | Self::Extractions => "/v1/systemone",
+            Self::Embeddings => "/v1/embeddings",
         }
     }
 
@@ -31,6 +38,8 @@ impl Endpoint {
         match self {
             Self::ChatCompletions => DeploymentApi::Chat,
             Self::Decisions => DeploymentApi::Decisions,
+            Self::Embeddings => DeploymentApi::Embeddings,
+            Self::Extractions => DeploymentApi::Extractions,
         }
     }
 
@@ -39,12 +48,15 @@ impl Endpoint {
         match api {
             DeploymentApi::Chat => Self::ChatCompletions,
             DeploymentApi::Decisions => Self::Decisions,
+            DeploymentApi::Embeddings => Self::Embeddings,
+            DeploymentApi::Extractions => Self::Extractions,
         }
     }
 
     /// SPEC §10, ADR 0030 §2: refuse a request whose fields this endpoint can
     /// never forward, before any accounting, activation or engine is touched.
-    /// Each endpoint has its own closed contract.
+    /// Each endpoint has its own closed contract (ADR 0036 §3: OpenAI's for
+    /// embeddings).
     pub fn validate(
         self,
         body: &serde_json::Value,
@@ -53,12 +65,20 @@ impl Endpoint {
             Self::ChatCompletions => crate::chat::validate_request(body),
             Self::Decisions => capyctl_adapters::forward::validate_decision_request(body)
                 .map_err(|refusal| crate::chat::refusal("invalid_request", &refusal.to_string())),
+            Self::Extractions => Err(crate::chat::refusal(
+                "invalid_request",
+                "extraction validation requires the deployment's declared field types",
+            )),
+            Self::Embeddings => capyctl_adapters::embedding_request::validate_embedding_request(
+                body,
+            )
+            .map_err(|refusal| crate::chat::refusal("invalid_request", &refusal.to_string())),
         }
     }
 }
 
 /// ADR 0030 §2: a deployment answers only the endpoint its `api` names. The
-/// other endpoint is refused with `api_mismatch`, naming the one to use,
+/// others are refused with `api_mismatch`, naming the one to use,
 /// before the request waits, activates anything or takes a slot. The engine
 /// itself may answer both (llama.cpp v0.7.0 still answers chat completions
 /// for a decision model), so this refusal is the router's own.
@@ -75,7 +95,15 @@ pub(crate) fn check_api(
     if api == endpoint.api() {
         return Ok(());
     }
-    Err(crate::chat::refusal(
+    Err(api_mismatch(api, model, endpoint))
+}
+
+pub(crate) fn api_mismatch(
+    api: DeploymentApi,
+    model: &str,
+    endpoint: Endpoint,
+) -> (StatusCode, Json<serde_json::Value>) {
+    crate::chat::refusal(
         "api_mismatch",
         &format!(
             "model {model} serves the {} API, which {} does not answer; send its requests to POST {}",
@@ -83,5 +111,5 @@ pub(crate) fn check_api(
             endpoint.path(),
             Endpoint::serving(api).path(),
         ),
-    ))
+    )
 }

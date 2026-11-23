@@ -101,6 +101,17 @@ pub const CHECKPOINT_GGUF: &str = "checkpoint_gguf";
 /// refused `host_capability_missing:decisions` before anything is sent, so an
 /// older host never receives a deployment whose checks it would run as chat.
 pub const DECISIONS: &str = capyctl_config::decisions::HOST_CAPABILITY;
+/// ADR 0036 §1: the host serves embedding models (`api: embeddings`): it
+/// resolves the field, proves such a deployment ready with a fixed embedding
+/// rather than generated text, and forwards `/v1/embeddings`. The server
+/// places an embeddings deployment only on a host that declared it; any
+/// other host is refused `host_capability_missing:embeddings` before
+/// anything is sent, so an older host never runs a chat probe against an
+/// embedding server.
+pub const EMBEDDINGS: &str = capyctl_config::embeddings::HOST_CAPABILITY;
+/// ADR 0041 §1: extraction launches need a host that serves the fields contract
+/// and proves readiness with its declared extraction types.
+pub const EXTRACTIONS: &str = capyctl_config::extractions::HOST_CAPABILITY;
 /// ADR 0031 §9: the host runs custom engines (a profile of kind `custom`:
 /// the manifest's command, its placeholders, the loopback check). The server
 /// places a deployment whose selected profile is a custom engine only on a
@@ -134,6 +145,15 @@ pub const LMCACHE: &str = capyctl_config::lmcache::CAPABILITY;
 /// `host_capability_missing:retention` before anything is sent, since it
 /// would not honour it.
 pub const RETENTION: &str = capyctl_config::lmcache::RETENTION_CAPABILITY;
+/// ADR 0034 §1: the host renders engine-driven LMCache transfer for a
+/// parking residency (`--supported-transfer-mode engine_driven` on the
+/// server, `lmcache.mp.mp_transfer_mode` on the connector) and its
+/// launch-time check verifies the installation offers it. The server plans
+/// LMCache for a parking residency only on a host that declared it; on any
+/// other the launch runs with LMCache off (`host_capability_missing`), since
+/// an older host would render lmcache-driven transfer for it, which deep
+/// parking breaks. Nothing new travels on the wire for it.
+pub const LMCACHE_ENGINE_DRIVEN: &str = capyctl_config::lmcache::ENGINE_DRIVEN_CAPABILITY;
 /// ADR 0032 §2, §3: the host's ingress sets CapyCTL's request ID as SGLang's
 /// `rid` on a capable launch, and the host runs the AbortRequest action (an
 /// abort posted to a retained launch's engine on loopback). The server sends
@@ -151,6 +171,33 @@ pub const REQUEST_ABORT: &str = "request_abort";
 /// `host_capability_missing:local_tensor_parallel` before anything is sent.
 /// Any other launch needs nothing new.
 pub const LOCAL_TENSOR_PARALLEL: &str = "local_tensor_parallel";
+/// ADR 0037 §6: the host reads W3C trace context: `traceparent` and
+/// `tracestate` on the router's forward to its ingress, and
+/// `ExecuteMember.trace_parent` on a lifecycle command. Neither is part of a
+/// command's digest, so a host without it is never refused anything: the
+/// server simply sends it neither (ADR 0017), and the trace ends at the
+/// server's span.
+pub const TRACE_CONTEXT: &str = "trace_context";
+/// ADR 0039 §15: the host runs TensorFold's native line (a release root's
+/// `tensorfold-native`: its render and environment, its readiness and idle
+/// reads, the loopback check). The server places a revision whose effective
+/// profile is `line: native` only on a host that declared it; any other is
+/// refused `host_capability_missing:tensorfold_native` before anything is
+/// sent, so an older host never renders a native installation with the 0.6
+/// command.
+pub const TENSORFOLD_NATIVE: &str = capyctl_config::tensorfold_native::HOST_CAPABILITY;
+/// ADR 0019 §§3–4, #225; ADR 0017 §3: a launch plan's true
+/// `vllm_device_request_no_floor` selects weights-plus-KV discrete request
+/// derivation. An older host would ignore it and rederive the historical
+/// 75% floor. False/absent needs no capability and keeps that old derivation.
+pub const VLLM_DEVICE_REQUEST_NO_FLOOR: &str = "vllm_device_request_no_floor";
+/// SPEC §15.3, #236; ADR 0017 §3: a launch deployment's SGLang-only
+/// `engine_config.cuda_graphs` phase object. Older hosts accept only scalar
+/// booleans, which continue to need no new capability.
+pub const CUDA_GRAPH_PHASES: &str = "cuda_graph_phases";
+/// ADR 0017 / #235: the server accepts the editable-SGLang policy refusal.
+/// A host sends it only after SessionReady advertises this capability.
+pub const INSTALLATION_UNSUPPORTED: &str = "installation_unsupported";
 /// ADR 0040 §10 (amending this table): the host runs host administration
 /// operations: the server's HostAdminRequest and the host's HostAdminReply.
 /// The server sends a HostAdminRequest only to a host that declared it; any
@@ -168,9 +215,21 @@ pub const MAX_RETIREMENT_DEPLOYMENTS: usize = 256;
 pub const MAX_REASON: usize = 512;
 
 /// ADR 0018: what this server advertises in `SessionReady.capabilities`.
-/// ADR 0033 §12: `lmcache`, so a host sends its LMCache samples.
+/// ADR 0033 §12: `lmcache`, so a host sends its LMCache samples; #235:
+/// `installation_unsupported`, so an upgraded host may report that refusal.
 pub fn server_capabilities() -> Vec<String> {
-    vec![LIVE_PROFILE_UPDATE.to_owned(), LMCACHE.to_owned()]
+    vec![
+        LIVE_PROFILE_UPDATE.to_owned(),
+        LMCACHE.to_owned(),
+        INSTALLATION_UNSUPPORTED.to_owned(),
+    ]
+}
+
+/// ADR 0017 / #235: unknown refusal codes must not end an older server's
+/// control session. Every pre-existing refusal still passes unchanged.
+pub fn server_takes_refusal(server: &[String], reason: &str) -> bool {
+    !reason.starts_with("installation_unsupported:")
+        || server.iter().any(|name| name == INSTALLATION_UNSUPPORTED)
 }
 
 /// Which way a feature's messages flow.
@@ -206,12 +265,20 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (CHECKPOINT_TABLES, Direction::ServerToHost),
     (CHECKPOINT_GGUF, Direction::ServerToHost),
     (DECISIONS, Direction::ServerToHost),
+    (EMBEDDINGS, Direction::ServerToHost),
+    (EXTRACTIONS, Direction::ServerToHost),
     (CUSTOM_ENGINES, Direction::ServerToHost),
     (STARTUP_HOST_BYTES, Direction::ServerToHost),
     (LMCACHE, Direction::ServerToHost),
     (RETENTION, Direction::ServerToHost),
+    (LMCACHE_ENGINE_DRIVEN, Direction::ServerToHost),
     (REQUEST_ABORT, Direction::ServerToHost),
     (LOCAL_TENSOR_PARALLEL, Direction::ServerToHost),
+    (TRACE_CONTEXT, Direction::ServerToHost),
+    (TENSORFOLD_NATIVE, Direction::ServerToHost),
+    (VLLM_DEVICE_REQUEST_NO_FLOOR, Direction::ServerToHost),
+    (CUDA_GRAPH_PHASES, Direction::ServerToHost),
+    (INSTALLATION_UNSUPPORTED, Direction::HostToServer),
     (HOST_ADMIN, Direction::ServerToHost),
     (OUTSIDE_GPU_PROCESSES, Direction::HostToServer),
 ];
@@ -303,6 +370,8 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
                 needs.push(LMCACHE);
             }
             lmcache_needs(&plan.deployment_config, &mut needs);
+            api_needs(&plan.deployment_config, &mut needs);
+            launch_feature_needs(plan, &mut needs);
         }
         // ADR 0028 §14: a group plan carries fields an older host would drop.
         Some(Action::Prepare(_) | Action::Launch(_)) => needs.push(ENGINE_GROUPS),
@@ -340,6 +409,14 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
     if command.probe_decision {
         needs.push(DECISIONS);
     }
+    // ADR 0041 §1: older agents must never drop the extraction flag.
+    if command.probe_extraction {
+        needs.push(EXTRACTIONS);
+    }
+    // ADR 0036 §§5, 6, ADR 0017: likewise for the embedding flag.
+    if command.probe_embedding {
+        needs.push(EMBEDDINGS);
+    }
     // ADR 0014 amendment A20: a group member's own launch carries the tables
     // as a single launch does.
     if let Some(plan) = command.group_member_launch.as_ref() {
@@ -350,11 +427,42 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
             needs.push(LMCACHE);
         }
         lmcache_needs(&plan.deployment_config, &mut needs);
+        api_needs(&plan.deployment_config, &mut needs);
+        launch_feature_needs(plan, &mut needs);
     }
     needs.sort_by_key(|need| CATALOGUE.iter().position(|(name, _)| name == need));
     // ADR 0033: a grant and `lmcache: required` both name `lmcache`.
     needs.dedup();
     needs
+}
+
+/// ADR 0017 §3: the 0.2.0 launch features apply equally to single launches
+/// and a group member's own launch.
+fn launch_feature_needs(plan: &pb::SingleLaunchPlan, needs: &mut Vec<&'static str>) {
+    if plan.vllm_device_request_no_floor {
+        needs.push(VLLM_DEVICE_REQUEST_NO_FLOOR);
+    }
+    if cuda_graph_phases_required(&plan.deployment_config) {
+        needs.push(CUDA_GRAPH_PHASES);
+    }
+}
+
+/// SPEC §15.3, #236; ADR 0017 §3: whether a deployment carries the
+/// SGLang-only graph phase object. Resolution validates the engine, which
+/// may be selected through a host profile rather than the deployment's type.
+/// Scalar booleans need no capability. Used by preflight and the send fence
+/// so an older host is refused before any preliminary request is sent.
+pub fn cuda_graph_phases_required(deployment_config: &str) -> bool {
+    if !deployment_config.contains("cuda_graphs") {
+        return false;
+    }
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(deployment_config) else {
+        return false;
+    };
+    document
+        .get("engine_config")
+        .and_then(|settings| settings.get("cuda_graphs"))
+        .is_some_and(serde_json::Value::is_object)
 }
 
 /// ADR 0033 §13: what a launch's deployment document needs of the host: a
@@ -377,6 +485,28 @@ fn lmcache_needs(deployment_config: &str, needs: &mut Vec<&'static str>) {
     }
     if retention == Retention::Zero {
         needs.push(RETENTION);
+    }
+}
+
+/// ADR 0036 §1, ADR 0041 §1: non-chat launch documents need their API's
+/// capability; an older host would otherwise prove them with a chat probe.
+/// A document that does not parse needs nothing here; the host refuses it.
+fn api_needs(deployment_config: &str, needs: &mut Vec<&'static str>) {
+    // Only a document that names a gated API value is parsed.
+    if !deployment_config.contains("embeddings") && !deployment_config.contains("extractions") {
+        return;
+    }
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(deployment_config) else {
+        return;
+    };
+    match document.get("api").and_then(serde_json::Value::as_str) {
+        Some("embeddings") => needs.push(EMBEDDINGS),
+        Some("extractions") => {
+            // ADR 0041 §1: extraction engines are custom and require both.
+            needs.push(EXTRACTIONS);
+            needs.push(CUSTOM_ENGINES);
+        }
+        _ => {}
     }
 }
 
@@ -432,6 +562,17 @@ pub fn decisions_refusal(host_capabilities: &BTreeSet<String>) -> Option<String>
     (!host_capabilities.contains(DECISIONS)).then(|| missing(DECISIONS))
 }
 
+/// ADR 0036 §1: the typed refusal for placing an embeddings deployment on a
+/// host that did not declare `embeddings`, or `None` when it may be placed.
+pub fn embeddings_refusal(host_capabilities: &BTreeSet<String>) -> Option<String> {
+    (!host_capabilities.contains(EMBEDDINGS)).then(|| missing(EMBEDDINGS))
+}
+
+/// ADR 0041 §1: an old host must never receive an extraction deployment.
+pub fn extractions_refusal(host_capabilities: &BTreeSet<String>) -> Option<String> {
+    (!host_capabilities.contains(EXTRACTIONS)).then(|| missing(EXTRACTIONS))
+}
+
 /// ADR 0031 §9: the typed refusal for placing a deployment on a custom
 /// engine on a host that did not declare `custom_engines`, or `None` when it
 /// may be placed. A decisions custom engine needs [`decisions_refusal`] too.
@@ -469,6 +610,16 @@ pub fn local_tensor_parallel_refusal(
         .then(|| missing(LOCAL_TENSOR_PARALLEL))
 }
 
+/// ADR 0039 §15: the typed refusal for placing a revision of TensorFold's
+/// native line on a host that did not declare `tensorfold_native`, or `None`
+/// when it may be placed. Any other revision needs nothing new.
+pub fn tensorfold_native_refusal(
+    host_capabilities: &BTreeSet<String>,
+    native: bool,
+) -> Option<String> {
+    (native && !host_capabilities.contains(TENSORFOLD_NATIVE)).then(|| missing(TENSORFOLD_NATIVE))
+}
+
 /// ADR 0017: why `command` may not be sent to a host with this policy state
 /// and capability set, or `None` when it may.
 pub fn refusal(
@@ -483,4 +634,39 @@ pub fn refusal(
         .into_iter()
         .find(|need| !capabilities.contains(*need))
         .map(missing)
+}
+
+#[cfg(test)]
+mod extraction_tests {
+    use super::*;
+
+    // T50: the launch document gates extraction before anything reaches an old host.
+    #[test]
+    fn extraction_launch_requires_both_host_capabilities() {
+        let command = pb::ExecuteMember {
+            action: Some(pb::execute_member::Action::LaunchSingle(
+                pb::SingleLaunchPlan {
+                    deployment_config: r#"{"api":"extractions"}"#.into(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let needs = required(&command);
+        assert!(needs.contains(&EXTRACTIONS));
+        assert!(needs.contains(&CUSTOM_ENGINES));
+        for (declared, expected) in [
+            (vec![CUSTOM_ENGINES], Some(missing(EXTRACTIONS))),
+            (vec![EXTRACTIONS], Some(missing(CUSTOM_ENGINES))),
+            (vec![EXTRACTIONS, CUSTOM_ENGINES], None),
+        ] {
+            let declared = declared.into_iter().map(String::from).collect();
+            assert_eq!(refusal(false, &declared, &command), expected);
+        }
+        assert_eq!(
+            extractions_refusal(&BTreeSet::new()),
+            Some(missing(EXTRACTIONS))
+        );
+        assert!(is_gate_refusal(&missing(EXTRACTIONS)));
+    }
 }

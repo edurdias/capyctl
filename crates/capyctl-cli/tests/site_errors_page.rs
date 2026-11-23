@@ -138,6 +138,15 @@ fn group_codes_are_documented_with_their_exit_code() {
             "host_capability_missing:decisions",
             "host_capability_missing:decisions",
         ),
+        // T47 (ADR 0036 §1).
+        (
+            "capability_missing:embeddings",
+            "capability_missing:embeddings",
+        ),
+        (
+            "host_capability_missing:embeddings",
+            "host_capability_missing:embeddings",
+        ),
         // T45 (ADR 0033 §14).
         (
             "lmcache_unavailable:<reason>",
@@ -157,6 +166,13 @@ fn group_codes_are_documented_with_their_exit_code() {
             "host_capability_missing:local_tensor_parallel",
             "host_capability_missing:local_tensor_parallel",
         ),
+        // T41 (ADR 0039 §4, §15, §16).
+        (
+            "host_capability_missing:tensorfold_native",
+            "host_capability_missing:tensorfold_native",
+        ),
+        ("retention_zero:compaction", "retention_zero:compaction"),
+        ("retention_zero:engine_disk", "retention_zero:engine_disk"),
     ] {
         let exit = StructuredError {
             code: "invalid_config",

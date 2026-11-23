@@ -81,7 +81,7 @@ pub(super) fn strategy(placement: &Placement) -> Strategy {
 /// 2026-09-23: it is charged its steady (Ready) footprint. Its startup peak is
 /// serialized behind other starts on that host by the activation gate, so
 /// placement only has to know the host can hold everything once Ready.
-fn pending_charges(
+pub(super) fn pending_charges(
     tx: &Transaction<'_>,
 ) -> Result<Vec<(String, String, PhaseFootprint)>, LifecycleError> {
     let rows: Vec<(String, String)> = tx
@@ -221,6 +221,7 @@ pub(super) fn candidates(
             tx,
             deployment_id,
             revision,
+            instance,
             &e,
             &policy,
             limits,
@@ -265,6 +266,7 @@ fn candidate(
     tx: &Transaction<'_>,
     deployment_id: &str,
     revision: i64,
+    instance: u32,
     e: &EffectiveDeployment,
     policy: &ResourcePolicySnapshot,
     limits: Vec<MemoryLimit>,
@@ -276,7 +278,7 @@ fn candidate(
     // Owner decision 2026-09-23: the instance's own startup peak, or the
     // whole managed limit for a solo first start.
     let (footprint, whole_host) =
-        super::startup::startup_footprint(tx, deployment_id, revision, host, e)?;
+        super::startup::startup_footprint(tx, deployment_id, revision, instance, host, e)?;
     // ADR 0035 §1a: only the chosen N's sets are placement options.
     let pick = match e.topology.as_ref().and_then(|t| t.auto.as_ref()) {
         Some(table) => auto_pick(
@@ -296,8 +298,9 @@ fn candidate(
             refusal: None,
         },
     };
-    // ADR 0030 §1, ADR 0031 §9: the current host must serve the deployment's
-    // API and engine. The embedded host is this build and serves them.
+    // ADR 0030 §1, ADR 0036 §1, ADR 0041 §1, ADR 0031 §9: the current
+    // host must serve the deployment's API and engine. The embedded host
+    // is this build and serves them.
     let declared = |capability: &str| {
         tx.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM enrolled_hosts WHERE host_id=?1)
@@ -307,9 +310,30 @@ fn candidate(
             |r| r.get::<_, bool>(0),
         )
     };
-    let serves_api = (e.api.is_chat() || declared(capyctl_config::decisions::HOST_CAPABILITY)?)
+    let serves_api = api_capability(e.api).map_or(Ok(true), declared)?
         && (e.profile.engine != capyctl_config::engine_policy::Engine::Custom
             || declared(capyctl_config::custom::CAPABILITY)?);
+    // ADR 0039 §§4, 15: native TensorFold needs its own host capability,
+    // and retention: zero refuses its compaction and disk-writing options.
+    let native_gate = if e.profile.engine == capyctl_config::engine_policy::Engine::Tensorfold
+        && e.profile.line.is_native()
+    {
+        use capyctl_config::tensorfold_native::{placement_refusal, HOST_CAPABILITY};
+        let (_, host_retention) = host_lmcache_settings(tx, host, e)?;
+        let has_native = declared(HOST_CAPABILITY)?;
+        let args: Vec<String> = e
+            .profile
+            .args
+            .iter()
+            .chain(e.engine_config.extra_args())
+            .cloned()
+            .collect();
+        placement_refusal(&args, host_retention, |name| {
+            name == HOST_CAPABILITY && has_native
+        })
+    } else {
+        None
+    };
     // ADR 0033 §§9, 10, 13: judge LMCache and retention against the host's
     // current publication and declaration, just as a start does.
     let gate = {
@@ -330,6 +354,7 @@ fn candidate(
         )
     }
     .map(|code| (code, None))
+    .or(native_gate)
     .or(pick.refusal)
     // ADR 0035 §11: several GPUs need the local-TP capability.
     .or((pick.tensor_parallel > 1
@@ -562,6 +587,7 @@ fn device_options(
             tx,
             deployment_id,
             revision,
+            instance,
             device,
             &on_device,
         )?);
@@ -586,6 +612,7 @@ fn device_option(
     tx: &Transaction<'_>,
     deployment_id: &str,
     revision: i64,
+    instance: u32,
     device: String,
     e: &EffectiveDeployment,
 ) -> Result<DeviceOption, LifecycleError> {
@@ -595,7 +622,7 @@ fn device_option(
         .collect::<Option<Vec<_>>>()
         .ok_or(LifecycleError::CorruptStoredData)?;
     let (footprint, _) =
-        super::startup::startup_footprint(tx, deployment_id, revision, &e.host.name, e)?;
+        super::startup::startup_footprint(tx, deployment_id, revision, instance, &e.host.name, e)?;
     Ok(DeviceOption {
         device,
         domains,
@@ -1164,6 +1191,7 @@ impl crate::Store {
                     only_ineligible &= code == "host_ineligible";
                     beyond_limits &= beyond;
                     let gate = (capyctl_config::lmcache::PLACEMENT_REFUSALS.contains(&code)
+                        || capyctl_config::tensorfold_native::PLACEMENT_REFUSALS.contains(&code)
                         || PLACEMENT_REFUSALS.contains(&code))
                     .then_some(code);
                     gated = match gated {
@@ -1230,6 +1258,42 @@ pub(crate) fn bounded_deadline(
     Ok(deadline.min(now.saturating_add(e.request_deadline_ms)))
 }
 
+/// The host capability a revision's API needs to be placed (ADR 0030 §1,
+/// ADR 0036 §1); chat needs none.
+fn api_capability(api: capyctl_config::effective::DeploymentApi) -> Option<&'static str> {
+    use capyctl_config::effective::DeploymentApi;
+    match api {
+        DeploymentApi::Chat => None,
+        DeploymentApi::Decisions => Some(capyctl_config::decisions::HOST_CAPABILITY),
+        DeploymentApi::Embeddings => Some(capyctl_config::embeddings::HOST_CAPABILITY),
+        // ADR 0041 §1: custom engine capability alone is insufficient.
+        DeploymentApi::Extractions => Some(capyctl_config::extractions::HOST_CAPABILITY),
+    }
+}
+
+#[cfg(test)]
+mod api_capability_tests {
+    use super::api_capability;
+    use capyctl_config::effective::DeploymentApi;
+
+    // T47 (ADR 0036 §1): an embeddings revision is placed only on a host
+    // that declared `embeddings`, not one that declared only `decisions`.
+    #[test]
+    fn each_api_needs_its_own_host_capability() {
+        assert_eq!(api_capability(DeploymentApi::Chat), None);
+        assert_eq!(api_capability(DeploymentApi::Decisions), Some("decisions"));
+        assert_eq!(
+            api_capability(DeploymentApi::Embeddings),
+            Some("embeddings")
+        );
+        // T50: extraction needs its own declaration, not just custom engines.
+        assert_eq!(
+            api_capability(DeploymentApi::Extractions),
+            Some("extractions")
+        );
+    }
+}
+
 /// ADR 0040 §9: a deployment check's answer for one host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckedFit {
@@ -1282,9 +1346,11 @@ pub(crate) fn check_fit(
     const OWNER: &str = "deployment-check";
     let options = devices
         .iter()
-        .map(|(device, _, on_device)| device_option(tx, UNSTORED, 0, device.clone(), on_device))
+        .map(|(device, _, on_device)| device_option(tx, UNSTORED, 0, 0, device.clone(), on_device))
         .collect::<Result<_, _>>()?;
-    let mut candidate = candidate(tx, UNSTORED, 0, e, &policy, limits, scoped, options, None)?;
+    let mut candidate = candidate(
+        tx, UNSTORED, 0, 0, e, &policy, limits, scoped, options, None,
+    )?;
     let mut floors = super::observed_floors(
         tx,
         &candidate.ledger,

@@ -25,8 +25,11 @@ struct Authority {
     api: DeploymentApi,
     ready: AtomicBool,
     activations: AtomicUsize,
+    route_reads: AtomicUsize,
+    api_reads: AtomicUsize,
     endpoint: String,
     leases: Mutex<Vec<Option<LeaseEnd>>>,
+    request_limit: Mutex<Option<usize>>,
     /// ADR 0030 §3: an engine whose activation is proven by the fixed
     /// decision probe, as an adapter's Initialize proves it; `None` is ready
     /// on activation.
@@ -62,10 +65,17 @@ fn refuse(what: &str) -> LifecycleFault {
 
 #[async_trait::async_trait]
 impl capyctl_controller::LifecyclePort for Authority {
+    fn deployment_field_types(
+        &self,
+        _: &str,
+    ) -> Result<Vec<capyctl_config::extractions::FieldType>, LifecycleFault> {
+        Ok(Vec::new())
+    }
     fn find_deployment_by_route(
         &self,
         route: &str,
     ) -> Result<Option<capyctl_store::deployments::DeploymentRow>, LifecycleFault> {
+        self.route_reads.fetch_add(1, Ordering::SeqCst);
         Ok((route == ROUTE).then(|| self.row()))
     }
     fn list_enabled_routes(
@@ -74,11 +84,16 @@ impl capyctl_controller::LifecyclePort for Authority {
         Ok(vec![capyctl_store::deployments::PublicRoute {
             id: ROUTE.into(),
             api: self.api,
+            field_types: Vec::new(),
         }])
     }
     fn deployment_api(&self, deployment: &str) -> Result<DeploymentApi, LifecycleFault> {
+        self.api_reads.fetch_add(1, Ordering::SeqCst);
         assert_eq!(deployment, DEPLOYMENT);
         Ok(self.api)
+    }
+    fn deployment_request_limit(&self, _deployment: &str) -> Result<Option<usize>, LifecycleFault> {
+        Ok(*self.request_limit.lock().unwrap())
     }
     fn get_deployment(
         &self,
@@ -109,6 +124,7 @@ impl capyctl_controller::LifecyclePort for Authority {
                 deployment_id: DEPLOYMENT.into(),
                 revision: 1,
                 request_abort: false,
+                engine_trace: false,
             }),
         )
     }
@@ -121,6 +137,9 @@ impl capyctl_controller::LifecyclePort for Authority {
             self.ready.load(Ordering::SeqCst),
             "SPEC §10: nothing is dispatched before the deployment is READY"
         );
+        if let Some(limit) = *self.request_limit.lock().unwrap() {
+            assert_eq!(_max, limit, "the durable lease uses the admission bound");
+        }
         let mut leases = self.leases.lock().unwrap();
         leases.push(None);
         Ok(Some(RequestLease::unrecorded(
@@ -311,8 +330,11 @@ fn stack(api: DeploymentApi, endpoint: &str) -> (Arc<Authority>, RouterDeps, axu
         api,
         ready: AtomicBool::new(false),
         activations: AtomicUsize::new(0),
+        route_reads: AtomicUsize::new(0),
+        api_reads: AtomicUsize::new(0),
         endpoint: endpoint.into(),
         leases: Mutex::new(Vec::new()),
+        request_limit: Mutex::new(None),
         fake: None,
     });
     let port = authority.clone() as Arc<dyn capyctl_controller::LifecyclePort>;
@@ -326,9 +348,61 @@ fn stack(api: DeploymentApi, endpoint: &str) -> (Arc<Authority>, RouterDeps, axu
         api_key: None,
         inflight: Arc::new(capyctl_router::admission::InFlight::default()),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: capyctl_trace::Tracing::off(),
     };
     let router = capyctl_router::serve_router(deps.clone());
     (authority, deps, router)
+}
+
+// T19 T43 (SPEC §10, ADR 0030 §2, #240): decision admission and whole-
+// deployment lease grants use the declared bound, including counts above 32.
+#[tokio::test]
+async fn decisions_use_the_declared_concurrency_for_admission_and_leases() {
+    use capyctl_router::balance::Plan;
+    use capyctl_router::endpoint::Endpoint;
+    use capyctl_router::request_id::RequestIds;
+    use capyctl_router::timing::RequestTiming;
+
+    for limit in [2, 48] {
+        let (authority, deps, router) = stack(DeploymentApi::Decisions, "http://127.0.0.1:9");
+        authority.ready.store(true, Ordering::SeqCst);
+        *authority.request_limit.lock().unwrap() = Some(limit);
+        let mut waiting = deps.inflight.waiting.limits();
+        waiting.max_pending_per_deployment = 0;
+        deps.inflight.waiting.set_limits(waiting);
+        let mut held = Vec::new();
+        for _ in 0..limit {
+            let ids = Arc::new(RequestIds::untracked());
+            let received = tokio::time::Instant::now();
+            let (deployment, guard, view) = capyctl_router::chat::admit_timed(
+                &deps,
+                Endpoint::Decisions,
+                ROUTE,
+                1,
+                received,
+                &mut RequestTiming::untracked(),
+                &ids,
+            )
+            .await
+            .unwrap();
+            let mut plan = Plan::new(
+                &deps,
+                &deployment,
+                view,
+                ids,
+                received + Duration::from_secs(5),
+            )
+            .unwrap();
+            held.push((guard, plan.next().await.unwrap()));
+        }
+        let (status, body) = decide(&router, &decision_body()).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert_eq!(body["code"], "queue_full");
+        for (guard, attempt) in held {
+            assert!(attempt.settle(LeaseEnd::NotAccepted).await);
+            drop(guard);
+        }
+    }
 }
 
 // T43 (ADR 0030 §§2-3): a decisions deployment on the Fake engine becomes
@@ -341,8 +415,11 @@ async fn a_fake_decision_model_becomes_ready_and_answers_through_the_router() {
         api: DeploymentApi::Decisions,
         ready: AtomicBool::new(false),
         activations: AtomicUsize::new(0),
+        route_reads: AtomicUsize::new(0),
+        api_reads: AtomicUsize::new(0),
         endpoint: "http://127.0.0.1:9".into(),
         leases: Mutex::new(Vec::new()),
+        request_limit: Mutex::new(None),
         fake: Some(fake.clone()),
     });
     let port = authority.clone() as Arc<dyn capyctl_controller::LifecyclePort>;
@@ -359,6 +436,7 @@ async fn a_fake_decision_model_becomes_ready_and_answers_through_the_router() {
         api_key: None,
         inflight: Arc::new(capyctl_router::admission::InFlight::default()),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: capyctl_trace::Tracing::off(),
     });
     let (status, body) = send(
         &router,
@@ -418,6 +496,9 @@ async fn a_decision_is_admitted_forwarded_and_settled_like_chat() {
     let (status, body) = decide(&router, &sent).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(authority.activations.load(Ordering::SeqCst), 1);
+    // T50 / ADR 0041 §3: contract selection and admission share one frozen lookup.
+    assert_eq!(authority.route_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(authority.api_reads.load(Ordering::SeqCst), 1);
     let mut expected = sent.clone();
     expected["model"] = json!(SERVED);
     assert_eq!(
@@ -929,4 +1010,62 @@ async fn models_name_each_api_without_waking() {
         assert_eq!(listed["data"][0]["capyctl"]["api"], api.name(), "{listed}");
         assert_eq!(authority.activations.load(Ordering::SeqCst), 0);
     }
+}
+
+// T50
+// ADR 0041 §3: deployment lookup precedes contract validation on System One.
+#[tokio::test]
+async fn unknown_model_precedes_a_malformed_decision_contract() {
+    let (authority, _deps, router) = stack(DeploymentApi::Decisions, "http://127.0.0.1:9");
+    let (status, body) = decide(
+        &router,
+        &json!({"model": "missing", "questions": null, "unexpected": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "unknown_model");
+    assert_eq!(authority.activations.load(Ordering::SeqCst), 0);
+    assert!(authority.ends().is_empty());
+}
+
+// T50: the System One ordering change must not alter the chat contract.
+#[tokio::test]
+async fn chat_and_embeddings_keep_their_empty_model_contract_refusal() {
+    let (authority, _deps, router) = stack(DeploymentApi::Chat, "http://127.0.0.1:9");
+    let mut request = chat_body(false);
+    request["model"] = json!("");
+    let (status, body) = send(
+        &router,
+        "/v1/chat/completions",
+        request.to_string().into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(body["message"], "malformed chat request: model is required");
+    let (status, body) = send(
+        &router,
+        "/v1/embeddings",
+        json!({"model": "", "input": "hello"})
+            .to_string()
+            .into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(
+        body["message"],
+        "malformed embeddings request: model is required"
+    );
+    let (status, body) = send(
+        &router,
+        "/v1/chat/completions",
+        json!({"model": "missing", "messages": [], "unsupported": true})
+            .to_string()
+            .into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(authority.activations.load(Ordering::SeqCst), 0);
 }

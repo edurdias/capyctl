@@ -446,7 +446,11 @@ mod tests {
         ] {
             crate::runtime_integrity::verify(
                 &dir,
-                crate::runtime_integrity::required_files(engine, sleep),
+                crate::runtime_integrity::required_files(
+                    engine,
+                    capyctl_config::tensorfold_native::TensorfoldLine::Python,
+                    sleep,
+                ),
             )
             .unwrap();
         }

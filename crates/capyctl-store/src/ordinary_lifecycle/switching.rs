@@ -2038,7 +2038,7 @@ fn plan_start_in(
             let e =
                 decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
             // ADR 0033 §6: with the LMCache charge a start there is granted.
-            let steady = super::startup::prospective_steady(tx, target, revision, &host, &e)?;
+            let steady = super::startup::prospective_steady(tx, target, revision, k, &host, &e)?;
             assumed
                 .charges
                 .push((host, instance_owner_id(target, k), steady));

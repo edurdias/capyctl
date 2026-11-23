@@ -152,6 +152,89 @@ fn a_launch_with_lmcache_renders_its_telemetry_off() {
     );
 }
 
+// T47 T14 (ADR 0036 §2): an embeddings launch adds `is_embedding: true` to
+// its public settings, which the entry renders as the reserved
+// `is_embedding`; nothing else in the descriptor changes, and a launch
+// without it carries no such setting.
+#[test]
+fn an_embeddings_launch_carries_is_embedding_and_nothing_else() {
+    let chat = SglangLaunch::from_frozen(&frozen(metadata(1), settings())).unwrap();
+    assert!(public_args(&chat)["settings"].get("is_embedding").is_none());
+    let mut expected = public_args(&chat);
+    expected["settings"]["is_embedding"] = serde_json::json!(true);
+    let embedding = SglangLaunch::from_frozen(&frozen(metadata(1), settings()))
+        .unwrap()
+        .with_embedding();
+    assert_eq!(public_args(&embedding), expected);
+}
+
+// T48 (ADR 0037 §7): a traced launch names its collector in the public
+// descriptor (`trace_endpoint`, which the entry renders as `enable_trace`,
+// `otlp_traces_endpoint` and `otlp_service_name=sglang`) and renders the
+// protocol and span level beside the plugin selection; never
+// `SGLANG_TRACE_ASYNC`. An untraced launch renders none of it.
+#[test]
+fn a_traced_launch_names_its_collector_and_renders_protocol_and_level() {
+    let launch = SglangLaunch::from_frozen(&frozen(metadata(1), settings())).unwrap();
+    assert!(launch.public_metadata()["settings"]
+        .get("trace_endpoint")
+        .is_none());
+    let render = |launch: &SglangLaunch| {
+        launch
+            .render_for_launcher(
+                ProtectedDescriptorFds::for_launcher(3, 4, 5).unwrap(),
+                wrapper(),
+            )
+            .unwrap()
+    };
+    let untraced = render(&launch);
+    assert!(!untraced
+        .env
+        .keys()
+        .any(|k| k.starts_with("OTEL_") || k.starts_with("SGLANG_TRACE")));
+    let launch = launch
+        .with_trace_endpoint("http://127.0.0.1:4318/v1/traces")
+        .unwrap();
+    assert_eq!(
+        launch.public_metadata()["settings"]["trace_endpoint"],
+        "http://127.0.0.1:4318/v1/traces"
+    );
+    let traced = render(&launch);
+    assert_eq!(
+        traced.env,
+        [
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL".to_owned(),
+                "http/protobuf".to_owned()
+            ),
+            (
+                "SGLANG_PLUGINS".to_owned(),
+                "capyctl-loads-no-plugins".to_owned()
+            ),
+            ("SGLANG_TRACE_LEVEL".to_owned(), "1".to_owned()),
+        ]
+        .into()
+    );
+    // The options travel only in the descriptor, never as native argv.
+    assert!(!traced
+        .argv
+        .iter()
+        .any(|a| a.starts_with("--otlp") || a == "--enable-trace"));
+    for bad in [
+        "",
+        "127.0.0.1:4317",
+        "grpc://127.0.0.1:4317",
+        "http://127.0.0.1:4318/v1/traces extra",
+    ] {
+        assert!(matches!(
+            SglangLaunch::from_frozen(&frozen(metadata(1), settings()))
+                .unwrap()
+                .with_trace_endpoint(bad),
+            Err(RuntimeError::Unsupported)
+        ));
+    }
+}
+
 #[test]
 fn wrapper_rejects_relative_symlink_nonregular_and_untrusted_writes() {
     use std::os::unix::fs::{symlink, PermissionsExt};
@@ -299,7 +382,7 @@ fn typed_settings_and_extra_arguments_render_for_any_model() {
     config.common.kv_cache_dtype = Some("fp8_e4m3".into());
     config.common.context_length = Some(32768);
     config.common.max_concurrent_requests = Some(16);
-    config.common.cuda_graphs = Some(true);
+    config.common.cuda_graphs = Some(true.into());
     config.common.language_model_only = true;
     config.common.trust_remote_code = true;
     config.max_total_tokens = Some(65536);
@@ -324,6 +407,25 @@ fn typed_settings_and_extra_arguments_render_for_any_model() {
         settings["extra_args"],
         json!(["--reasoning-parser", "qwen3"])
     );
+}
+
+/// ADR 0014 §2 / SPEC §8.1 / #236: frozen launch descriptors preserve each
+/// phase, rather than collapsing either mixed policy to a boolean.
+// T14 T22
+#[test]
+fn frozen_cuda_graph_phases_reach_the_protected_descriptor() {
+    for prefill in [false, true] {
+        for decode in [false, true] {
+            let mut config = settings();
+            config.common.cuda_graphs =
+                Some(capyctl_domain::launch::CudaGraphs::Phases { prefill, decode });
+            let launch = SglangLaunch::from_frozen(&frozen(metadata(1), config)).unwrap();
+            assert_eq!(
+                public_args(&launch)["settings"]["cuda_graphs"],
+                json!({"prefill": prefill, "decode": decode})
+            );
+        }
+    }
 }
 
 /// Shapes the entry would refuse are refused before rendering; reserved

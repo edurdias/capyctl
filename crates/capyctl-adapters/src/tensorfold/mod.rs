@@ -1,11 +1,14 @@
 //! TensorFold adapter module (ADR 0023). Engine-specific endpoints and launch
-//! parameters for TensorFold live here and only here (SPEC §9).
+//! parameters for TensorFold live here and only here (SPEC §9). One module
+//! serves both lines (ADR 0039 §1): the Python line (0.6.x) and the native
+//! line (1.x, `native.rs`); what differs branches on the plan's line.
 pub mod adapter;
 pub mod args;
 mod frozen;
 pub mod http;
 mod idle;
 mod initialize;
+pub mod native;
 
 pub use adapter::TensorfoldAdapter;
 pub use args::{

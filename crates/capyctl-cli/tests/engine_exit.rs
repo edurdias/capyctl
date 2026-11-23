@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use capyctl_config::effective::{Engine, ModelSource};
+use capyctl_config::effective::ModelSource;
 use serde_json::{json, Value};
 
 mod support;
@@ -409,7 +409,6 @@ impl Installation {
                     .to_string_lossy()
                     .into_owned(),
             },
-            Engine::Vllm,
             &support::binary_template_memory(),
             capyctl_cli::standalone_config::DEFAULT_REQUEST_DEADLINE,
             // The host runs with CAPYCTL_DEEP_PARK=off (ADR 0012 opt-out), so

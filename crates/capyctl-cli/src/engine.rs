@@ -21,6 +21,7 @@ use capyctl_config::effective::InstallationDrift;
 use capyctl_config::engine_env::{is_owned, ApprovedEnv, EnvRefusal};
 use capyctl_config::engine_policy::Engine;
 use capyctl_config::registration::{EnginesFile, ENGINES_FILE};
+use capyctl_config::tensorfold_native::{NativeRegistration, TensorfoldLine};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -248,10 +249,11 @@ fn pick() -> Result<PathBuf, StructuredError> {
     for (i, c) in found.iter().enumerate() {
         let _ = writeln!(
             stderr,
-            "{:>3}  {} {}{}  {}",
+            "{:>3}  {} {}{}{}  {}",
             i + 1,
             c.engine.name(),
             c.version,
+            if c.line.is_native() { " (native)" } else { "" },
             if c.custom { " (custom)" } else { "" },
             c.env.display()
         );
@@ -312,6 +314,44 @@ pub fn engine_add_env(
     ApprovedEnv::parse(&approved)?;
     Ok((profile_env, approved))
 }
+
+/// ADR 0039 §1, §2, §3: what `engine add` and `engine list` say about a
+/// TensorFold profile beyond the common fields: its `line` and, on the
+/// native line, the uncertified-version note, whether the publisher's
+/// `SHA256SUMS` was checked, the capabilities document's families, and
+/// `notes` (the version note, and the absent checksum list). Empty for any
+/// other engine.
+fn native_view(
+    engine: Engine,
+    line: TensorfoldLine,
+    version: &str,
+    native: Option<&NativeRegistration>,
+) -> Value {
+    if engine != Engine::Tensorfold {
+        return json!({});
+    }
+    if line.is_python() {
+        return json!({"line": line.name()});
+    }
+    let note = capyctl_config::tensorfold_native::version_note(version);
+    let checksums_verified = native.map(|n| n.checksums_verified);
+    let mut notes: Vec<String> = note.iter().cloned().collect();
+    if checksums_verified == Some(false) {
+        notes.push(CHECKSUMS_ABSENT.to_owned());
+    }
+    json!({
+        "line": line.name(),
+        "note": note,
+        "checksums_verified": checksums_verified,
+        "families": native.map(|n| &n.families),
+        "notes": notes,
+    })
+}
+
+/// ADR 0039 §2: what `engine add` and `engine list` say of a native release
+/// registered without the publisher's checksum list.
+const CHECKSUMS_ABSENT: &str = "the publisher's checksum list (SHA256SUMS) was absent, so the \
+     release's files were not checked against it at registration";
 
 /// Found live 2026-10-03: a role cannot listen on a control socket whose
 /// path a Unix socket cannot hold, so nothing is saved for one it could
@@ -426,11 +466,21 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
             if known.contains(name) {
                 continue;
             }
-            let profile = json!({
+            // ADR 0038 §2: a role's own TensorRT-LLM lists its companions.
+            let mut profile = json!({
                 "engine": entry["engine"], "executable": entry["executable"],
                 "build_fingerprint": entry["build_fingerprint"],
                 "security": {"deep_park": entry["deep_park"]},
+                "companions": entry["companions"],
             });
+            // ADR 0039 §2: the role's own installation takes its line from
+            // its file name.
+            if let Some(engine) = entry["engine"].as_str().and_then(Engine::from_name) {
+                let executable = Path::new(entry["executable"].as_str().unwrap_or_default());
+                if capyctl_config::registration::executable_line(engine, executable).is_native() {
+                    profile["line"] = json!(TensorfoldLine::Native.name());
+                }
+            }
             all.push((name.clone(), profile, "environment"));
         }
     }
@@ -440,24 +490,47 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
         .map(|(name, profile, source)| {
             let kind = profile["engine"].as_str().and_then(Engine::from_name);
             let engine = kind.unwrap_or(Engine::Vllm);
+            let line = capyctl_config::registration::profile_line(&profile);
             let accepted = role.as_ref().map(|r| r["accepted"].get(&name).cloned());
+            // ADR 0039 §2: a native release lists the version `engine add`
+            // checked (its `build_fingerprint`), as llama.cpp does; the
+            // host's measurement reads only the `VERSION` file.
             let reported = accepted
                 .clone()
                 .flatten()
-                .and_then(|a| a["installation"]["version"].as_str().map(str::to_owned));
+                .and_then(|a| a["installation"]["version"].as_str().map(str::to_owned))
+                .filter(|_| line.is_python());
             let version = capyctl_config::registration::listed_version(
                 kind,
                 reported.as_deref(),
                 profile["build_fingerprint"].as_str(),
             );
             // ADR 0031 §6, §7: a custom engine's idle signal (or `none`) and
-            // whether its launches carry a per-launch engine key.
+            // whether its launches carry a per-launch engine key. ADR 0038
+            // §2, §7: TensorRT-LLM reports no idle signal and takes no engine
+            // key.
             let manifest = capyctl_agent::installation::custom_manifest(&profile);
-            json!({
+            let native = profile
+                .get("native")
+                .and_then(|n| serde_json::from_value::<NativeRegistration>(n.clone()).ok());
+            let view = native_view(engine, line, &version, native.as_ref());
+            let tensorrt_llm = kind == Some(Engine::TensorrtLlm);
+            let companions = &profile["companions"];
+            let mut row = json!({
                 "profile": name, "source": source, "engine": profile["engine"], "version": version,
-                "custom": !capyctl_config::registration::is_verified(engine, &version),
-                "idle_signal": manifest.as_ref().map(|m| m.idle.as_ref().map_or_else(|| "none".to_owned(), |idle| idle.describe())),
-                "engine_key": manifest.as_ref().map(engine_key),
+                // ADR 0039 §3, ADR 0038 §2: by each kind's own verified set.
+                "custom": !capyctl_config::registration::is_verified_profile(
+                    engine,
+                    line,
+                    &version,
+                    companions[capyctl_config::tensorrt_llm::TORCH].as_str(),
+                ),
+                "idle_signal": manifest
+                    .as_ref()
+                    .map(|m| m.idle.as_ref().map_or_else(|| "none".to_owned(), |idle| idle.describe()))
+                    .or_else(|| tensorrt_llm.then(|| "none".to_owned())),
+                "engine_key": manifest.as_ref().map(engine_key).or(tensorrt_llm.then_some("none")),
+                "companions": tensorrt_llm.then(|| companions.clone()),
                 "api": manifest.as_ref().map(|m| m.api),
                 "executable": profile["executable"],
                 "fingerprint": accepted.clone().flatten().map(|a| a["installation"].clone()),
@@ -469,7 +542,11 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
                     .map(|r| r["users"][&name].clone())
                     .filter(|users| !users.is_null())
                     .unwrap_or(json!([])),
-            })
+            });
+            if let (Some(fields), Some(object)) = (view.as_object(), row.as_object_mut()) {
+                object.extend(fields.clone());
+            }
+            row
         })
         .collect();
     // ADR 0033 §9: the host's `lmcache` and `retention` as the running role
@@ -559,11 +636,15 @@ fn listed_lmcache(
             registration.as_ref(),
         ));
     };
+    // ADR 0034 §1: the listing checks what every LMCache launch needs
+    // (lmcache-driven transfer); a parking launch's engine-driven pieces
+    // are checked when it launches.
     match capyctl_agent::lmcache_install::check_lmcache(
         measurer,
         engine,
         Path::new(executable),
         registration.as_ref(),
+        capyctl_config::lmcache::TransferMode::LmcacheDriven,
     ) {
         Ok(install) => {
             let registered = registration.map_or(install.version, |r| r.version);

@@ -64,6 +64,12 @@ fn refuse(what: &str) -> LifecycleFault {
 
 #[async_trait::async_trait]
 impl capyctl_controller::LifecyclePort for Authority {
+    fn deployment_field_types(
+        &self,
+        _: &str,
+    ) -> Result<Vec<capyctl_config::extractions::FieldType>, LifecycleFault> {
+        Ok(Vec::new())
+    }
     fn find_deployment_by_route(
         &self,
         route: &str,
@@ -76,6 +82,7 @@ impl capyctl_controller::LifecyclePort for Authority {
         Ok(vec![capyctl_store::deployments::PublicRoute {
             id: ROUTE.into(),
             api: capyctl_config::effective::DeploymentApi::Chat,
+            field_types: Vec::new(),
         }])
     }
     fn deployment_api(
@@ -224,6 +231,7 @@ fn fixture(limits: WaitLimits) -> Fixture {
             limits,
         )),
         activation_join: Arc::new(capyctl_router::WakeJoin::new()),
+        tracing: capyctl_trace::Tracing::off(),
     };
     Fixture {
         deps,

@@ -140,7 +140,17 @@ impl VllmAdapter {
     /// ADR 0030 §3: whether readiness, the post-wake probe and the wake
     /// canary are the fixed decision probe rather than a generation.
     pub(super) fn decisions(&self) -> bool {
-        !self.api.is_chat()
+        self.api == capyctl_config::effective::DeploymentApi::Decisions
+    }
+
+    pub(super) fn extractions(&self) -> bool {
+        self.api == capyctl_config::effective::DeploymentApi::Extractions
+    }
+
+    /// ADR 0036 §5: whether readiness, the post-wake probe and the wake
+    /// canary are the fixed embedding probe, never a generation.
+    pub(super) fn embeddings(&self) -> bool {
+        self.api == capyctl_config::effective::DeploymentApi::Embeddings
     }
 
     /// ADR 0010, discrete GPU design §5: park at the level the deployment's
@@ -630,7 +640,8 @@ impl EngineAdapter for VllmAdapter {
     /// completion probe on this engine's own loopback endpoint and key,
     /// observed when its answer arrived. ADR 0030 §4: a decisions launch's
     /// canary is the fixed decision probe instead (a decision model's
-    /// reference is its answer, never a generation), and it never answers
+    /// reference is its answer, never a generation), and ADR 0036 §6 an
+    /// embeddings launch's the fixed embedding probe; neither ever answers
     /// `Unsupported` (that would pass a wake unchecked).
     async fn wake_canary(
         &self,
@@ -639,8 +650,9 @@ impl EngineAdapter for VllmAdapter {
         bound: std::time::Duration,
     ) -> Result<crate::completion_probe::CanaryAnswer, RuntimeError> {
         use crate::completion_probe::{CanaryAnswer, CanaryEvidence};
-        let answer = if self.decisions() {
-            CanaryEvidence::Decision(
+        use capyctl_config::effective::DeploymentApi;
+        let answer = match self.api {
+            DeploymentApi::Decisions => CanaryEvidence::Decision(
                 crate::traits::ChatForward::decision_probe(self, self.served_model(), bound)
                     .await
                     .map_err(|e| {
@@ -648,9 +660,18 @@ impl EngineAdapter for VllmAdapter {
                             "vLLM did not answer the decision probe: {e}"
                         )))
                     })?,
-            )
-        } else {
-            CanaryEvidence::Generated(
+            ),
+            DeploymentApi::Embeddings => CanaryEvidence::Embedding(
+                crate::traits::ChatForward::embedding_probe(self, self.served_model(), bound)
+                    .await
+                    .map_err(|e| {
+                        RuntimeError::Uncertain(crate::vllm::args::redact_text(&format!(
+                            "vLLM did not answer the embedding probe: {e}"
+                        )))
+                    })?,
+            ),
+            DeploymentApi::Extractions => return Err(RuntimeError::Unsupported),
+            DeploymentApi::Chat => CanaryEvidence::Generated(
                 crate::traits::ChatForward::complete_probe(
                     self,
                     self.served_model(),
@@ -663,7 +684,7 @@ impl EngineAdapter for VllmAdapter {
                         "vLLM did not answer the wake canary: {e}"
                     )))
                 })?,
-            )
+            ),
         };
         let observed_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -726,5 +747,24 @@ impl crate::traits::ChatForward for VllmAdapter {
         bound: std::time::Duration,
     ) -> Result<crate::decision_probe::DecisionAnswer, AdapterError> {
         self.http.decision_probe(served, bound).await
+    }
+    /// ADR 0036 §3-§4: an embeddings request, streamed through the shared
+    /// forwarder's incremental checks with `model` rewritten both ways.
+    async fn forward_embedding(
+        &self,
+        body: &crate::request::InferenceRequest,
+        sink: &mut dyn crate::traits::EmbeddingSink,
+    ) -> Result<crate::traits::EmbeddingAnswered, AdapterError> {
+        self.forward.embed(body, sink).await
+    }
+    /// ADR 0036 §5: the fixed embedding on this engine's loopback endpoint
+    /// with its inference key, which the guard admits on `/v1`, as the
+    /// completion probe.
+    async fn embedding_probe(
+        &self,
+        served: &str,
+        bound: std::time::Duration,
+    ) -> Result<crate::embedding_probe::EmbeddingAnswer, AdapterError> {
+        self.http.embedding_probe(served, bound).await
     }
 }

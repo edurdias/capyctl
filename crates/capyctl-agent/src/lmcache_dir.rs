@@ -74,7 +74,8 @@ mod tests {
     fn a_launch_directory_is_written_retired_and_swept() {
         let (_temp, dirs) = dirs();
         let dir = dirs.launch_dir(INCARNATION).unwrap();
-        let file = capyctl_adapters::lmcache::write_sglang_config(&dir, 8100).unwrap();
+        let deep = capyctl_config::lmcache::TransferMode::EngineDriven;
+        let file = capyctl_adapters::lmcache::write_sglang_config(&dir, 8100, deep).unwrap();
         assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
         assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
         assert!(dirs.retire(INCARNATION));
@@ -82,9 +83,9 @@ mod tests {
         assert!(!dirs.retire(INCARNATION));
 
         let kept = dirs.launch_dir(INCARNATION).unwrap();
-        capyctl_adapters::lmcache::write_sglang_config(&kept, 8100).unwrap();
+        capyctl_adapters::lmcache::write_sglang_config(&kept, 8100, deep).unwrap();
         let stale = dirs.launch_dir("01K00000000000000000000003").unwrap();
-        capyctl_adapters::lmcache::write_sglang_config(&stale, 8102).unwrap();
+        capyctl_adapters::lmcache::write_sglang_config(&stale, 8102, deep).unwrap();
         let keep = [INCARNATION.to_owned()].into_iter().collect();
         assert_eq!(dirs.sweep(&keep), 1);
         assert!(kept.exists());

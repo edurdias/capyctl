@@ -1,0 +1,22 @@
+# Nemotron 3.5 Lightning 30B-A3B 4-bit on TensorFold native 1.0.0 on one GB10 machine
+# (docs/guide/engines.md, "TensorFold native 1.0.0 and 1.1.5: Nemotron 3.5 Lightning").
+# `capyctl deploy model --file deployment-tensorfold-native.yaml`.
+# Parsed by the product: `capyctl validate config --file docs/examples/deployment-tensorfold-native.yaml`.
+schema_version: 1
+kind: deployment
+name: nemotron-30b-native
+# The profile `capyctl engine add ~/tensorfold-1.0.0 --name tensorfold-1-0-0` registered
+# beside the 0.6.6 profile named `tensorfold`; `engine:` names a profile.
+engine: tensorfold-1-0-0
+# The checkpoint TensorFold native certifies, pinned to its revision.
+model: {hf: TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit@d9d758fb83953437f7263256b0d96157e2a348b8}
+# TensorFold cannot free its memory while it runs, so the model never parks.
+residency: restart_only
+devices: [{id: gpu0}]
+# TensorFold native reserves the weights (17.25 GiB) and every stream at its full
+# window when it starts: 8 streams at 32768 tokens are about 2.3 GiB, plus scratch,
+# CUDA graphs and the CUDA context. The figure below is the one the 0.6.6 example
+# declares; the live rows (TF2) measure the native peak.
+resources: {gpu: 30GiB, ram: 2GiB}
+engine_config:
+  context_length: 32768

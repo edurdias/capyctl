@@ -554,7 +554,10 @@ impl crate::remote_readiness::ReadinessHosts for ScriptedReadiness {
             engine_log: None,
             probe_text: String::new(),
             probe_decision: None,
+            probe_embedding: None,
+            probe_extraction: None,
             lmcache: None,
+            engine_tracing: String::new(),
         };
         Box::pin(async move { session.map(|s| (s, result)).ok_or(()) })
     }
@@ -649,6 +652,8 @@ async fn host_session_loss_closes_dispatch_until_a_fresh_probe_passes() {
             owned_handle: launch.step_id.clone(),
             max_tokens: None,
             decision: false,
+            embedding: false,
+            extraction: false,
         }
     );
     assert_eq!(probe.identity.expected_state, "ready");
@@ -1394,7 +1399,7 @@ async fn an_expired_drain_stop_is_reissued_when_its_host_reconnects() {
 /// session liveness and the load that host reported for exactly this launch.
 /// A lease and its endpoint are resolved for exactly that generation; once the
 /// gate closes both are refused, so the router fails over before sending.
-// T18 T33 T38
+// T18 T33 T38 T48
 #[tokio::test]
 async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence() {
     use crate::port::LifecyclePort;
@@ -1413,6 +1418,7 @@ async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence()
     let launch = ready_launch(&owner);
     let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let load = Arc::new(crate::load_table::LoadTable::new());
+    let traced = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let signals = crate::coordinator_port::RoutingSignals {
         load: load.clone(),
         host_live: {
@@ -1421,6 +1427,10 @@ async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence()
         },
         host_unresponsive: Arc::new(|_: &str| false),
         host_request_abort: Arc::new(|_: &str| false),
+        host_trace_context: {
+            let traced = traced.clone();
+            Arc::new(move |host: &str| host == "lab" && traced.load(Ordering::SeqCst))
+        },
     };
     let lifecycle =
         crate::coordinator_port::CoordinatorLifecycle::new(w.commands()).with_routing(signals);
@@ -1462,6 +1472,14 @@ async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence()
         Some(launch.step_id.as_str())
     );
     assert!(only.dispatch_open && only.host_live);
+    // T48 (ADR 0037 §6, ADR 0017): trace headers go to this instance's
+    // ingress only while its host's session declares `trace_context`, and
+    // only for the incarnation it serves.
+    assert!(!lifecycle.trace_context(&fence.deployment_id, fence.generation));
+    traced.store(true, Ordering::SeqCst);
+    assert!(lifecycle.trace_context(&fence.deployment_id, fence.generation));
+    assert!(!lifecycle.trace_context(&fence.deployment_id, fence.generation + 1));
+    assert!(!lifecycle.trace_context("another-deployment", fence.generation));
     let view = only.load.as_ref().expect("a fresh sample for this launch");
     assert_eq!(view.engine_queue(), Some(4));
     assert_eq!(view.owned_handle, launch.step_id);
@@ -1732,6 +1750,7 @@ async fn a_remote_cancelling_lease_settles_only_on_an_idle_sample_after_the_hang
                 checkpoint_layout: None,
                 checkpoint_tables: None,
                 checkpoint_gguf: None,
+                vllm_device_request_no_floor: false,
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
@@ -1741,9 +1760,12 @@ async fn a_remote_cancelling_lease_settles_only_on_an_idle_sample_after_the_hang
             instance_index: 0,
             device_memory: false,
             decisions: false,
+            embeddings: false,
+            extraction_types: Vec::new(),
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,
+            tensorfold_native: false,
         },
         Default::default(),
     ));
@@ -1894,6 +1916,7 @@ async fn a_remote_cancelling_lease_settles_while_a_stop_drains() {
                 checkpoint_layout: None,
                 checkpoint_tables: None,
                 checkpoint_gguf: None,
+                vllm_device_request_no_floor: false,
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
@@ -1903,9 +1926,12 @@ async fn a_remote_cancelling_lease_settles_while_a_stop_drains() {
             instance_index: 0,
             device_memory: false,
             decisions: false,
+            embeddings: false,
+            extraction_types: Vec::new(),
             custom_engine: false,
             lmcache_required: false,
             retention_zero: false,
+            tensorfold_native: false,
         },
         Default::default(),
     ));

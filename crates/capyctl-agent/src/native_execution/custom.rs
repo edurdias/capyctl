@@ -15,6 +15,7 @@ use capyctl_adapters::custom::{
 use capyctl_config::custom::CustomProfile;
 use capyctl_config::effective::EffectiveDeployment;
 use capyctl_config::engine_policy::Engine;
+use capyctl_config::tensorfold_native::TensorfoldLine;
 use capyctl_domain::completion::ProcessIdentity;
 use capyctl_protocol::execution::SingleLaunchPlan;
 
@@ -34,11 +35,20 @@ pub(super) fn custom_key(
 
 /// ADR 0031 §6, §7: how the ingress and the load reporter read and key a
 /// launch's engine, from the profile it was approved under. A custom engine
-/// without its profile is unknown, never a built-in one.
-pub(super) fn engine_access(engine: Engine, custom: Option<&CustomProfile>) -> EngineAccess {
+/// without its profile is unknown, never a built-in one. ADR 0039 §11: a
+/// TensorFold profile of the native line is read by its `/metrics` alone.
+pub(super) fn engine_access(
+    engine: Engine,
+    line: TensorfoldLine,
+    custom: Option<&CustomProfile>,
+) -> EngineAccess {
     match (engine, custom) {
         (Engine::Custom, Some(custom)) => EngineAccess::custom(custom),
         (Engine::Custom, None) => EngineAccess::unknown(),
+        (Engine::Tensorfold, _) if line.is_native() => EngineAccess {
+            signal: crate::load::LaunchSignal::TensorfoldNative,
+            ..EngineAccess::builtin()
+        },
         _ => EngineAccess::builtin(),
     }
 }
@@ -65,21 +75,43 @@ impl NativeHostExecution {
     /// unknown when that profile is no longer held, never today's. ADR 0032
     /// §2: whether it takes CapyCTL's request ID, from its own resolution
     /// only (not capable when that no longer resolves), as its abort decides.
+    /// ADR 0037 §7: whether its engine traces, as journaled when it launched
+    /// (never decided again: the host's setting may have changed since).
+    /// ADR 0039 §11: a TensorFold launch's line is the one it was approved
+    /// under ([`Self::frozen_line`]).
     pub(super) fn retained_access(
         &self,
         owned: &capyctl_protocol::execution::MemberCommand,
     ) -> EngineAccess {
+        // ADR 0041 §3: a retained launch's frozen document chooses the contract.
+        let api = owned
+            .action
+            .launch_plan()
+            .and_then(|plan| {
+                serde_json::from_str::<serde_json::Value>(&plan.deployment_config).ok()
+            })
+            .and_then(|document| document.get("api").cloned())
+            .and_then(|api| serde_json::from_value(api).ok())
+            .unwrap_or_default();
         let request_abort = self
             .resolve_retained(owned)
             .is_ok_and(|effective| super::request_abort::request_abort_capable(&effective));
         owned
             .action
             .launch_plan()
-            .and_then(|plan| self.frozen_engine(owned, plan))
-            .map_or_else(EngineAccess::unknown, |(engine, custom)| {
-                engine_access(engine, custom.as_ref())
+            .and_then(|plan| {
+                let (engine, custom) = self.frozen_engine(owned, plan)?;
+                let line = if engine == Engine::Tensorfold {
+                    self.frozen_line(owned, plan)
+                } else {
+                    TensorfoldLine::default()
+                };
+                Some(engine_access(engine, line, custom.as_ref()))
             })
+            .unwrap_or_else(EngineAccess::unknown)
+            .with_api(api)
             .with_request_abort(request_abort)
+            .with_engine_trace(self.frozen_engine_trace(&owned.identity.command_id))
     }
     /// ADR 0031 §2: the launch plan. The key is the adapter's to give it
     /// ([`Self::custom_adapter`]), from the launch's own credentials.
@@ -132,6 +164,7 @@ pub(super) fn custom_adapter_for(
     Ok(
         CustomAdapter::new(endpoint, fingerprint, served.into(), key)
             .with_api(custom.manifest.api)
+            .with_field_types(custom.manifest.field_types.clone().unwrap_or_default())
             .with_health(custom.manifest.health.clone())
             .with_idle(custom.manifest.idle.clone()),
     )

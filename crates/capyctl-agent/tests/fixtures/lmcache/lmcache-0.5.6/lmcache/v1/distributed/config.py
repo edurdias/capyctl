@@ -118,4 +118,16 @@ def add_storage_manager_args(
     )
     eviction_group.add_argument(
         "--eviction-trigger-watermark",
+        type=float,
+        default=0.8,
+        help="The memory usage watermark to trigger eviction (0.0 to 1.0). "
+        "Default is 0.8.",
+    )
+    eviction_group.add_argument(
+        "--eviction-ratio",
+        type=float,
+        default=0.2,
+        help="The fraction of memory to evict when triggered (0.0 to 1.0). "
+        "Default is 0.2.",
+    )
 

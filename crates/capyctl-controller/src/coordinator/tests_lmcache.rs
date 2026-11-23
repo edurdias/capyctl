@@ -287,6 +287,7 @@ impl Launch {
             receipt: "scripted host".into(),
             facts,
             kernel_builds: Vec::new(),
+            extraction_probe: None,
         }
     }
 
@@ -1780,6 +1781,7 @@ async fn an_embedded_sglang_restart_park_is_proven_quiescent_on_the_engines_gaug
                 tools: Some(tools),
                 settle: None,
                 lmcache: binding.lmcache,
+                engine_tracing: binding.engine_tracing,
             }))
         }),
     )

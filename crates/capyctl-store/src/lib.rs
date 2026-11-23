@@ -9,6 +9,8 @@ pub mod deployments;
 pub mod development_controls;
 pub mod dispatch;
 pub mod enrollment;
+// ADR 0037 §7: each launch's engine tracing decision, for the lane and status.
+pub mod engine_tracing;
 pub mod events;
 // ADR 0028 §5, §11: multi-node group plans, member owners and settlement.
 pub mod groups;
@@ -76,6 +78,15 @@ pub enum StoreError {
          store from a backup taken before the upgrade. The store was not modified"
     )]
     FromNewerVersion { found: i64, supported: i64 },
+    /// Pre-release extraction builds reused the released v59 migration number.
+    /// Never interpret their version stamps as the released migration sequence.
+    #[error(
+        "the state store at schema version {found} lacks the released v59 UI-auth schema; \
+         pre-release extraction/0.2.0 builds used incompatible migration numbering. \
+         No migrations were applied. Back up the store and, only after verified cleanup \
+         of all owned engines, recreate it with this capyctl; do not edit its version stamps"
+    )]
+    IncompatiblePrereleaseSchema { found: i64 },
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
     #[error(transparent)]

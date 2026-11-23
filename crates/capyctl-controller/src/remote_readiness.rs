@@ -432,6 +432,8 @@ impl RemoteReadiness {
                 owned_handle: launch.step_id.clone(),
                 max_tokens: None,
                 decision: false,
+                embedding: false,
+                extraction: false,
             },
         };
         command.identity.payload_digest = command.canonical_digest();

@@ -28,7 +28,7 @@ use capyctl_adapters::traits::{
 };
 use capyctl_adapters::vllm::{render_command, PlanInputVllm, VllmAdapter, USER_ARGS_MARKER};
 use capyctl_adapters::ParkPolicy;
-use capyctl_config::lmcache::LmcacheOffReason;
+use capyctl_config::lmcache::{LmcacheOffReason, TransferMode};
 use capyctl_domain::completion::{
     ExecutionIdentities, Milestone, Presence, ProcessIdentity, StepExecutionContext,
     TransitionToken,
@@ -60,6 +60,8 @@ fn server_plan(http_port: u16, proc_root: &Path, required: bool) -> ServerPlan {
         start_bound: Duration::from_secs(5),
         proc_root: proc_root.to_path_buf(),
         required,
+        // A `restart_only` launch's transfer (ADR 0034 §1).
+        transfer: TransferMode::LmcacheDriven,
     }
 }
 
@@ -348,40 +350,59 @@ fn vllm_adapter(port: u16, plan: PlanInputVllm, tool: Arc<Tool>) -> VllmAdapter 
 
 // ---------------------------------------------------------- the server command
 
-// T45 T37 (ADR 0033 §3): the server's argument vector, exactly; LMCache 0.5.6
-// spells these options so (`multiprocess/config.py`: --host, --port,
-// --transport; --http-host, --http-port; `distributed/config.py`:
-// --l1-size-gb, --eviction-policy, --l1-use-lazy as a BooleanOptionalAction
-// that defaults to lazy, hence the negation).
+// T45 T37 (ADR 0033 §3, ADR 0034 §§1, 4): the server's argument vector,
+// exactly; LMCache 0.5.6 spells these options so (`multiprocess/config.py`:
+// --host, --port, --transport, --supported-transfer-mode; --http-host,
+// --http-port; `distributed/config.py`: --l1-size-gb, --eviction-policy,
+// --l1-use-lazy as a BooleanOptionalAction that defaults to lazy, hence the
+// negation, --eviction-trigger-watermark, --eviction-ratio). A
+// `restart_only` launch (lmcache-driven transfer) gains only the eviction
+// options; a deep launch (engine-driven) also `--supported-transfer-mode
+// engine_driven`, never `auto` and never `--shm-name`.
 #[test]
 fn the_server_argv_is_exactly_capyctls() {
     let root = tempfile::tempdir().unwrap();
-    let command = render_server(
-        &server_plan(25002, root.path(), false),
+    let restart_only = server_plan(25002, root.path(), false);
+    let command = render_server(&restart_only, EngineTelemetry::Off);
+    let base = [
+        "/opt/venv/bin/lmcache",
+        "server",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "25001",
+        "--transport",
+        "zmq",
+        "--http-host",
+        "127.0.0.1",
+        "--http-port",
+        "25002",
+        "--l1-size-gb",
+        "4",
+        "--eviction-policy",
+        "LRU",
+        "--no-l1-use-lazy",
+        "--eviction-trigger-watermark",
+        "0.8",
+        "--eviction-ratio",
+        "0.2",
+    ];
+    assert_eq!(command.argv, base);
+    let deep = render_server(
+        &ServerPlan {
+            transfer: TransferMode::EngineDriven,
+            ..restart_only
+        },
         EngineTelemetry::Off,
     );
     assert_eq!(
-        command.argv,
-        [
-            "/opt/venv/bin/lmcache",
-            "server",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "25001",
-            "--transport",
-            "zmq",
-            "--http-host",
-            "127.0.0.1",
-            "--http-port",
-            "25002",
-            "--l1-size-gb",
-            "4",
-            "--eviction-policy",
-            "LRU",
-            "--no-l1-use-lazy",
-        ]
+        deep.argv,
+        base.iter()
+            .copied()
+            .chain(["--supported-transfer-mode", "engine_driven"])
+            .collect::<Vec<_>>()
     );
+    assert!(!deep.argv.iter().any(|a| a == "auto"));
     // T37: no script API, no lazy pool, no tier beyond host RAM.
     for refused in [
         "--run-script-api-enabled",
@@ -393,11 +414,14 @@ fn the_server_argv_is_exactly_capyctls() {
         "--enable-p2p",
     ] {
         assert!(!command.argv.iter().any(|a| a == refused), "{refused}");
+        assert!(!deep.argv.iter().any(|a| a == refused), "{refused}");
     }
-    assert!(!command
-        .argv
-        .iter()
-        .any(|a| a.contains("l2") || a.contains("p2p") || a.contains("gds") || a.contains("disk")));
+    for argv in [&command.argv, &deep.argv] {
+        assert!(!argv.iter().any(|a| a.contains("l2")
+            || a.contains("p2p")
+            || a.contains("gds")
+            || a.contains("disk")));
+    }
 }
 
 // T45 T21 T37 (ADR 0033 §3, A7; owner decision 2026-10-22): the server's
@@ -461,14 +485,16 @@ fn the_server_env_is_exactly_its_names_with_telemetry_off() {
 
 // ----------------------------------------------------------------- connectors
 
-// T45 (ADR 0033 §4): vLLM's connector, exactly: LMCache's MP connector by
-// module path, both roles, the server's loopback request port, no autostart.
+// T45 (ADR 0033 §4, ADR 0034 §1): vLLM's connector, exactly: LMCache's MP
+// connector by module path, both roles, the server's loopback request port,
+// no autostart, and for engine-driven transfer `lmcache.mp.mp_transfer_mode`.
 // LMCache 0.5.6 `lmcache_mp_connector.py` reads `lmcache.mp.host`,
-// `lmcache.mp.port` (and adds `tcp://`) and `mp_server_launcher.py` reads
-// `lmcache.mp.autostart`.
+// `lmcache.mp.port` (and adds `tcp://`), `mp_server_launcher.py` reads
+// `lmcache.mp.autostart`, and `vllm_multi_process_adapter.py` reads
+// `mp_transfer_mode` under the `lmcache.mp.` prefix.
 #[test]
 fn the_vllm_connector_is_the_adrs_json() {
-    let rendered = vllm_kv_transfer_config(25001);
+    let rendered = vllm_kv_transfer_config(25001, TransferMode::LmcacheDriven);
     assert_eq!(
         rendered,
         "{\"kv_connector\":\"LMCacheMPConnector\",\
@@ -491,6 +517,31 @@ fn the_vllm_connector_is_the_adrs_json() {
             }
         })
     );
+    let deep = vllm_kv_transfer_config(25001, TransferMode::EngineDriven);
+    assert_eq!(
+        deep,
+        "{\"kv_connector\":\"LMCacheMPConnector\",\
+         \"kv_connector_module_path\":\"lmcache.integration.vllm.lmcache_mp_connector\",\
+         \"kv_role\":\"kv_both\",\
+         \"kv_connector_extra_config\":{\"lmcache.mp.host\":\"127.0.0.1\",\
+         \"lmcache.mp.port\":25001,\"lmcache.mp.autostart\":false,\
+         \"lmcache.mp.mp_transfer_mode\":\"engine_driven\"}}"
+    );
+    let parsed: Value = serde_json::from_str(&deep).unwrap();
+    assert_eq!(
+        parsed,
+        json!({
+            "kv_connector": "LMCacheMPConnector",
+            "kv_connector_module_path": "lmcache.integration.vllm.lmcache_mp_connector",
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": {
+                "lmcache.mp.host": "127.0.0.1",
+                "lmcache.mp.port": 25001,
+                "lmcache.mp.autostart": false,
+                "lmcache.mp.mp_transfer_mode": "engine_driven"
+            }
+        })
+    );
 }
 
 // T45 T14 (ADR 0033 §§4, 11): the owned connector renders in the reserved block,
@@ -499,7 +550,7 @@ fn the_vllm_connector_is_the_adrs_json() {
 fn the_vllm_connector_renders_before_the_marker() {
     let mut plan = vllm_plan(8100, None, None);
     plan.extra_args = vec!["--max-num-seqs".into(), "4".into()];
-    plan.kv_transfer_config = Some(vllm_kv_transfer_config(25001));
+    plan.kv_transfer_config = Some(vllm_kv_transfer_config(25001, TransferMode::LmcacheDriven));
     let argv = render_command(&plan).unwrap().argv;
     let flag = argv
         .iter()
@@ -507,7 +558,10 @@ fn the_vllm_connector_renders_before_the_marker() {
         .unwrap();
     let marker = argv.iter().position(|a| a == USER_ARGS_MARKER).unwrap();
     assert!(flag < marker, "{argv:?}");
-    assert_eq!(argv[flag + 1], vllm_kv_transfer_config(25001));
+    assert_eq!(
+        argv[flag + 1],
+        vllm_kv_transfer_config(25001, TransferMode::LmcacheDriven)
+    );
     assert_eq!(
         argv.iter().filter(|a| *a == "--kv-transfer-config").count(),
         1
@@ -521,14 +575,16 @@ fn the_vllm_connector_renders_before_the_marker() {
         .any(|a| a == "--kv-transfer-config"));
 }
 
-// T45 T37 (ADR 0033 §4): SGLang's connector file holds exactly two keys, is
-// 0600 inside a 0700 directory, and is never written through a symlink.
+// T45 T37 (ADR 0033 §4, ADR 0034 §1): SGLang's connector file holds exactly
+// two keys for lmcache-driven transfer, and for engine-driven transfer the
+// `extra_config` mapping naming it beside them; it is 0600 inside a 0700
+// directory, and is never written through a symlink.
 #[test]
 fn the_sglang_config_file_is_two_keys_owner_only() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("lmcache").join("i-1");
-    let path = write_sglang_config(&dir, 25001).unwrap();
+    let path = write_sglang_config(&dir, 25001, TransferMode::LmcacheDriven).unwrap();
     assert_eq!(path, dir.join("config.yaml"));
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
@@ -539,11 +595,22 @@ fn the_sglang_config_file_is_two_keys_owner_only() {
     assert_eq!(mode(&dir), 0o700);
     // Written again (a restart-parked launch's wake), still exactly two keys.
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    write_sglang_config(&dir, 25009).unwrap();
+    write_sglang_config(&dir, 25009, TransferMode::LmcacheDriven).unwrap();
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
         "mp_host: 127.0.0.1\nmp_port: 25009\n"
     );
+    assert_eq!(mode(&path), 0o600);
+    // A deep launch's (engine-driven transfer), owner-only as well.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    write_sglang_config(&dir, 25001, TransferMode::EngineDriven).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "mp_host: 127.0.0.1\nmp_port: 25001\n\
+         extra_config:\n  lmcache.mp.mp_transfer_mode: engine_driven\n"
+    );
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(mode(&dir), 0o700);
     assert_eq!(mode(&path), 0o600);
     // A symlink in the file's place is refused, its target untouched.
     let other = root.path().join("other");
@@ -551,7 +618,9 @@ fn the_sglang_config_file_is_two_keys_owner_only() {
     let target = root.path().join("target");
     std::fs::write(&target, "kept").unwrap();
     std::os::unix::fs::symlink(&target, other.join("config.yaml")).unwrap();
-    assert!(write_sglang_config(&other, 25001).is_err());
+    for transfer in [TransferMode::LmcacheDriven, TransferMode::EngineDriven] {
+        assert!(write_sglang_config(&other, 25001, transfer).is_err());
+    }
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "kept");
 }
 
@@ -719,7 +788,10 @@ async fn a_vllm_launch_starts_its_server_first_and_reports_both_groups() {
         .position(|a| a == "--kv-transfer-config")
         .unwrap();
     assert!(flag < argv.iter().position(|a| a == USER_ARGS_MARKER).unwrap());
-    assert_eq!(argv[flag + 1], vllm_kv_transfer_config(25001));
+    assert_eq!(
+        argv[flag + 1],
+        vllm_kv_transfer_config(25001, TransferMode::LmcacheDriven)
+    );
     let roles: BTreeSet<&str> = observation
         .identities
         .iter()

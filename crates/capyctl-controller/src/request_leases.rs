@@ -284,17 +284,41 @@ impl RequestLeaseWriter {
     }
 
     /// ADR 0032 §4: close the cancelling lease `lease_id` on its request's own
-    /// final output, read whole after the engine was asked to abort it.
-    /// `Ok(false)` when it is no longer an open cancelling lease of this
-    /// session; nothing changed. An error leaves it charged.
-    pub async fn acknowledge(&self, lease_id: &str) -> Result<bool, LeaseRefused> {
+    /// final output, read whole after the engine was asked to abort it; ADR
+    /// 0036 §4: or on the answer of a cut embeddings request read to its end.
+    /// `evidence` names which, for the journaled receipt. `Ok(false)` when it
+    /// is no longer an open cancelling lease of this session; nothing
+    /// changed. An error leaves it charged.
+    pub async fn acknowledge(
+        &self,
+        lease_id: &str,
+        evidence: capyctl_store::request_lease_cancellations::CancelledEvidence,
+    ) -> Result<bool, LeaseRefused> {
         match self
             .submit(LeaseWrite::AcknowledgeCancelled {
                 lease_id: lease_id.to_owned(),
+                evidence,
             })
             .await?
         {
             Answer::Settled(closed) => Ok(closed),
+            Answer::Granted(_) => Err(LeaseRefused::Unavailable("unexpected ledger answer".into())),
+        }
+    }
+
+    /// ADR 0036 §4: record the cancelling lease `lease_id` of a cut
+    /// embeddings request as answered, now that the engine's complete error
+    /// answer was read, so it settles on an idle reading taken after it.
+    /// `Ok(false)` when it is no longer an open cancelling lease of this
+    /// session; nothing changed. An error leaves it as it was: charged.
+    pub async fn answer_cut(&self, lease_id: &str) -> Result<bool, LeaseRefused> {
+        match self
+            .submit(LeaseWrite::AnswerCancelled {
+                lease_id: lease_id.to_owned(),
+            })
+            .await?
+        {
+            Answer::Settled(changed) => Ok(changed),
             Answer::Granted(_) => Err(LeaseRefused::Unavailable("unexpected ledger answer".into())),
         }
     }

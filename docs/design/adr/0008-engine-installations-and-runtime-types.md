@@ -421,19 +421,18 @@ The safety argument of the 2026-10-19 amendment does not carry over, so:
   failure before any effect. Registration still publishes it `unmeasured`;
   a regular package in `site-packages` is never refused, whatever lies
   beside it.
-- Both refusals stay inside one binary: `engine add` is local, and
+- In 0.1.11 both refusals stay inside one binary: `engine add` is local, and
   standalone's refusal reaches status only as the operation's reason text
   (`launch_failed`), with a fixed operator hint (reinstall SGLang without
-  `-e`). Neither crosses the host protocol.
-- An enrolled host keeps the pre-amendment path: the launch-time
-  installation check calls an editable SGLang `unmeasured` and refuses
-  nothing, the launch starts, and the entry fails it with
-  `engine_import_failed` in the free-text launch failure every server
-  accepts. ADR 0017 §2: a patch release (0.1.11) never changes the protocol,
-  and a 0.1.x server's refusal check does not know the new code (it would
-  end the host's whole control session on it). The host-side refusal is
-  planned for 0.2.0, behind a new ADR 0017 capability the server advertises
-  in `SessionReady` (branch `feat/sglang-editable-host-refusal`).
+  `-e`). Neither crosses the host protocol in a patch release (ADR 0017 §2).
+- From 0.2.0 (#235), the shared launch check refuses an editable SGLang too.
+  The host reports `installation_unsupported:editable` only to a server
+  advertising `installation_unsupported` in SessionReady; the host declares
+  the same capability in Connect. Until SessionReady, and toward any 0.1.x
+  server, the host keeps the previous path: unmeasured, started, then failed
+  by the protected entry with `engine_import_failed`. Every older refusal
+  still reaches the server. This prevents a refusal unknown to an older
+  server from ending the whole control session.
 - The entry's failed engine import gets its own closed code,
   `engine_import_failed`, with a fixed hint and no exception text; the launch
   failure summary names it, and status shows its hint.

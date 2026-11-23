@@ -400,7 +400,21 @@ pub struct EffectObservation {
     /// build during this step, in the host's clock. Empty when none was seen
     /// or the launcher cannot see one.
     pub kernel_builds: Vec<KernelBuild>,
+    /// ADR 0041 §§4–5: the original fixed extraction answer that proved this
+    /// launch ready, carried through the host result for durable reference storage.
+    pub extraction_probe: Option<ExtractionProbeEvidence>,
 }
+
+/// ADR 0041 §4: the bounded extraction answer relayed with a launch or probe.
+/// Raw answers retain unrecognized members without a domain dependency on API types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtractionProbeEvidence {
+    pub probe_version: u32,
+    pub declared_field_types: Vec<String>,
+    pub answers_json: Vec<u8>,
+}
+
+pub const EXTRACTION_PROBE_MAX_BYTES: usize = 256 * 1024;
 
 /// ADR 0014 amendment A12: a span of host time, in Unix milliseconds, during
 /// which a compiler ran in an engine's process group. It may start before the

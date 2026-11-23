@@ -19,7 +19,7 @@ use crate::admission::InFlight;
 
 /// The report for `deployments`, read at `now_ms` on the controller clock.
 /// `loads` is `None` where no host reports load (the standalone role's
-/// embedded engine); `in_flight_limit` is the router's per-deployment bound.
+/// embedded engine); `in_flight_limit` is the router's undeclared-setting default.
 pub fn capacity_report(
     deployments: &[DeploymentCapacity],
     inflight: &InFlight,
@@ -51,7 +51,7 @@ pub fn capacity_report(
                 "name": deployment.name,
                 "router": {
                     "in_flight": inflight.current(id),
-                    "in_flight_limit": in_flight_limit,
+                    "in_flight_limit": deployment.request_limit.unwrap_or(in_flight_limit),
                     "waiting": inflight.waiting.waiting(id),
                     "waiting_limit": waiting_limit,
                 },

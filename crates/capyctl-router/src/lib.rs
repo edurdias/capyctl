@@ -2,13 +2,16 @@
 //! admission, queue bounds, and dispatch; it never chooses models or runs a
 //! second scheduler (SPEC §10), and never imports engine crates — dispatch
 //! reaches engines through adapters behind `ChatForward`. It answers chat
-//! completions and, for decisions deployments, decision requests (ADR 0030).
+//! completions and, for decisions deployments, decision requests (ADR 0030),
+//! and for embeddings deployments, embedding requests (ADR 0036).
 
 pub mod admission;
 pub mod balance;
 // SPEC §§10, 17 (owner decision 2026-10-08): the management load read.
 pub mod capacity;
 pub mod chat;
+// ADR 0036 §§3-4: embedding requests, their answers streamed through.
+mod embeddings;
 // ADR 0030 §2: the inference endpoints and the API each answers.
 pub mod endpoint;
 pub mod forwarders;
@@ -22,6 +25,8 @@ pub mod switch;
 pub mod engine_metrics;
 // SPEC §17 (M80): per-request timings and their bounded distributions.
 pub mod timing;
+// ADR 0037 §§2, 3: one request's spans.
+pub(crate) mod trace;
 
 pub use switch::WakeJoin;
 
@@ -61,6 +66,9 @@ pub struct RouterDeps {
     /// the same non-READY deployment join ONE wake — no double-spawn, no
     /// duplicate Start operations.
     pub activation_join: Arc<WakeJoin<(StatusCode, Json<serde_json::Value>)>>,
+    /// ADR 0037 §1: the role's tracing; off unless its document names an
+    /// endpoint, and then nothing is read, recorded or sent.
+    pub tracing: capyctl_trace::Tracing,
 }
 
 #[derive(Clone)]
@@ -75,6 +83,8 @@ pub fn serve_router(deps: RouterDeps) -> axum::Router {
         .route("/v1/chat/completions", post(chat_completions))
         // ADR 0030 §2: decision requests, for `api: decisions` deployments.
         .route("/v1/systemone", post(systemone))
+        // ADR 0036 §3: embedding requests, for `api: embeddings` deployments.
+        .route("/v1/embeddings", post(embeddings_handler))
         .layer(axum::middleware::map_response(retry_after))
         .with_state(state)
 }
@@ -108,7 +118,10 @@ fn err_json(code: &str, message: &str) -> (StatusCode, Json<serde_json::Value>) 
             "queue_full" => StatusCode::TOO_MANY_REQUESTS,
             "request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
             // SPEC §14: a malformed request is the client's error, not a 500.
-            "invalid_request" => StatusCode::BAD_REQUEST,
+            // ADR 0041 §3: contract and shape refusals precede activation.
+            "invalid_request" | "api_mismatch" | "field_type_unsupported" => {
+                StatusCode::BAD_REQUEST
+            }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         },
         Json(if code == "queue_full" {
@@ -152,11 +165,16 @@ async fn list_models(
     let data: Vec<serde_json::Value> = routes
         .into_iter()
         .map(|route| {
-            serde_json::json!({
+            let mut entry = serde_json::json!({
                 "id": route.id,
                 "object": "model",
                 "capyctl": {"api": route.api.name()},
-            })
+            });
+            // ADR 0041 §6: other APIs retain their discovery shape.
+            if route.api == capyctl_config::effective::DeploymentApi::Extractions {
+                entry["capyctl"]["field_types"] = serde_json::json!(route.field_types);
+            }
+            entry
         })
         .collect();
     Ok(Json(serde_json::json!({ "object": "list", "data": data })))
@@ -171,12 +189,16 @@ struct Received {
     model: String,
     /// The size of the body as received.
     body_bytes: usize,
+    endpoint: endpoint::Endpoint,
+    resolved: Option<(
+        capyctl_store::deployments::DeploymentRow,
+        capyctl_config::effective::DeploymentApi,
+    )>,
 }
 
 /// Authenticate, check the caller's request ID, read the body under its
-/// bound, parse it and validate it against `endpoint`'s contract, before any
-/// accounting, activation or engine is touched (SPEC §10, T19 T21; ADR 0030
-/// §2).
+/// bound and parse it. ADR 0041 §3: System One looks up the frozen deployment
+/// before selecting and validating its contract, still before accounting or activation.
 async fn receive(
     deps: &RouterDeps,
     headers: &HeaderMap,
@@ -195,6 +217,10 @@ async fn receive(
             "missing or valid api key required",
         ));
     }
+    // ADR 0037 §2: the trace headers are read only after authentication, so
+    // an unauthenticated client cannot make CapyCTL record or export
+    // anything; a malformed one is ignored, never refused.
+    ids.begin_trace(&deps.tracing, headers, endpoint);
     // SPEC §10 (owner decision 2026-10-19): a malformed `X-Request-Id` is the
     // client's error, refused before the body is read.
     ids.check()?;
@@ -215,16 +241,82 @@ async fn receive(
     let Some(model) = request["model"].as_str().map(str::to_owned) else {
         return Err(err_json("invalid_request", "model is required"));
     };
-    // SPEC §10, T19 T21: a request that can never be forwarded is refused
-    // before any accounting, activation or engine is touched.
-    endpoint.validate(&request)?;
-    // The parsed request holds the bytes it was parsed from.
+    let mut resolved = None;
+    if endpoint == endpoint::Endpoint::Decisions && model.is_empty() {
+        return Err(err_json("invalid_request", "model is required"));
+    }
+    // ADR 0041 §3: System One selects its contract only after looking up
+    // the frozen deployment API; unknown_model precedes contract errors.
+    let endpoint = if endpoint == endpoint::Endpoint::Decisions {
+        let deployment = deps
+            .controller
+            .find_deployment_by_route(&model)
+            .map_err(chat::map_controller)?
+            .ok_or_else(|| {
+                err_json(
+                    "unknown_model",
+                    &format!("no deployment serves model id {model}"),
+                )
+            })?;
+        let api = deps
+            .controller
+            .deployment_api(&deployment.id)
+            .map_err(chat::map_controller)?;
+        let selected = match api {
+            capyctl_config::effective::DeploymentApi::Extractions => {
+                endpoint::Endpoint::Extractions
+            }
+            capyctl_config::effective::DeploymentApi::Decisions => endpoint::Endpoint::Decisions,
+            _ => {
+                return Err(endpoint::api_mismatch(api, &model, endpoint));
+            }
+        };
+        if api == capyctl_config::effective::DeploymentApi::Extractions {
+            if let Some(trace) = ids.trace() {
+                trace.extraction();
+            }
+        }
+        if let Some(key) = capyctl_adapters::extraction_request::other_api_key(api, &request) {
+            return Err(err_json(
+                "api_mismatch",
+                &format!(
+                    "model {model} answers {} requests with `{}`, not `{key}`; use POST /v1/systemone",
+                    api.name(),
+                    if api == capyctl_config::effective::DeploymentApi::Extractions { "fields" } else { "questions" },
+                ),
+            ));
+        }
+        if selected == endpoint::Endpoint::Extractions {
+            let types = deps
+                .controller
+                .deployment_field_types(&deployment.id)
+                .map_err(chat::map_controller)?;
+            capyctl_adapters::extraction_request::validate_extraction_request(&request, &types)
+                .map_err(|refusal| {
+                    let code = match refusal {
+                        capyctl_adapters::extraction_request::ExtractionRequestRefusal::FieldTypeUnsupported { .. } => "field_type_unsupported",
+                        _ => "invalid_request",
+                    };
+                    err_json(code, &refusal.to_string())
+                })?;
+        } else {
+            selected.validate(&request)?;
+        }
+        resolved = Some((deployment, api));
+        selected
+    } else {
+        endpoint.validate(&request)?;
+        endpoint
+    };
+    // The parsed request retains the caller's raw bytes for forwarding.
     Ok(Received {
         at,
         timing,
         request,
         model,
         body_bytes,
+        endpoint,
+        resolved,
     })
 }
 
@@ -238,6 +330,9 @@ async fn chat_completions(
 ) -> axum::response::Response {
     let ids = Arc::new(request_id::RequestIds::read(&headers));
     let outcome = chat_completion(&state.deps, &headers, body, &ids).await;
+    // ADR 0037 §3: the request span ends with the answer (a stream's at its
+    // own end).
+    ids.end_trace(&outcome);
     ids.stamp(outcome)
 }
 
@@ -254,6 +349,8 @@ async fn chat_completion(
         request: v,
         model,
         body_bytes,
+        endpoint: _,
+        resolved: _,
     } = receive(deps, headers, ids, body, endpoint).await?;
     if v["stream"].as_bool() == Some(true) {
         // Streaming path: resolve + activate, then bridge the engine's SSE.
@@ -262,8 +359,16 @@ async fn chat_completion(
         // slot in arrival order within its deadline. Accounting is registered
         // before the response is built; the stream guard releases when the
         // backend stream ends.
-        let (deployment_id, guard, view) =
-            chat::admit_timed(deps, endpoint, &model, body_bytes, received, &mut timing).await?;
+        let (deployment_id, guard, view) = chat::admit_timed(
+            deps,
+            endpoint,
+            &model,
+            body_bytes,
+            received,
+            &mut timing,
+            ids,
+        )
+        .await?;
         // ADR 0013 §10 (I3): choose an instance; SPEC §10: its durable lease is
         // held from before the first byte reaches the engine until the backend
         // stream ends. Refusals before any offer are ordinary HTTP errors.
@@ -279,6 +384,10 @@ async fn chat_completion(
         let header = timing.header_enabled().then(|| timing.header_value());
         let bounds = stream::StreamBounds::for_request(received, &deps.inflight.waiting.limits());
         let sse = stream::stream_planned_timed(first, Some(plan), v, guard, timing, bounds);
+        // ADR 0037 §3: the stream ends the request span at its last byte.
+        if let Some(trace) = ids.trace() {
+            trace.defer();
+        }
         let mut response = sse.into_response();
         if let Some(value) = header.and_then(|h| h.parse().ok()) {
             response.headers_mut().insert(timing::TIMING_HEADER, value);
@@ -296,19 +405,18 @@ async fn chat_completion(
         ids.clone(),
     )
     .await?;
+    // ADR 0037 §5: the answer's token counts and finish reasons.
+    trace::record_answer(ids, &answer);
     // SPEC §17 (owner decision 2026-10-09): every answer carries its figures.
     engine_metrics::attach(&mut answer, &timing);
     Ok(with_timing(chat::relay(&answer)?, &timing))
 }
 
-/// `POST /v1/systemone` — ADR 0030 §2: a decision request, admitted, leased
-/// and settled exactly as a chat completion, for `api: decisions` deployments
-/// only. It is never streamed. The answer is the engine's bytes, with `model`
-/// the public name, plus the request's figures in `capyctl.metrics` (SPEC
-/// §17, owner decision 2026-10-19; see [`engine_metrics::attach_decision`]);
-/// everything else, `usage` and every probability, is as the engine wrote it
-/// (SPEC §10, issue #223). Its timings are recorded like any request's, and
-/// it carries the request's IDs as a chat answer does (SPEC §10).
+/// `POST /v1/systemone` — ADR 0041 §3: decisions and extractions are admitted,
+/// leased and settled identically. The deployment selects the closed contract.
+/// The answer keeps the engine's bytes, with the public `model` and the same
+/// non-generative `capyctl.metrics`; usage and probabilities retain their spelling
+/// (SPEC §10, issue #223).
 async fn systemone(
     state: axum::extract::State<AppState>,
     headers: HeaderMap,
@@ -316,6 +424,7 @@ async fn systemone(
 ) -> axum::response::Response {
     let ids = Arc::new(request_id::RequestIds::read(&headers));
     let outcome = decision(&state.deps, &headers, body, &ids).await;
+    ids.end_trace(&outcome);
     ids.stamp(outcome)
 }
 
@@ -327,7 +436,8 @@ async fn decision(
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     let endpoint = endpoint::Endpoint::Decisions;
     let received = receive(deps, headers, ids, body, endpoint).await?;
-    let (mut answer, timing) = chat::dispatch_timed(
+    let endpoint = received.endpoint;
+    let (mut answer, timing) = chat::dispatch_resolved_timed(
         deps,
         endpoint,
         &received.model,
@@ -336,10 +446,49 @@ async fn decision(
         received.at,
         received.timing,
         ids.clone(),
+        received.resolved,
     )
     .await?;
+    trace::record_answer(ids, &answer);
     engine_metrics::attach_decision(&mut answer, &timing);
     Ok(with_timing(chat::relay(&answer)?, &timing))
+}
+
+/// `POST /v1/embeddings` — ADR 0036 §§3-4: an embedding request, admitted,
+/// leased and failed over exactly as a decision, for `api: embeddings`
+/// deployments only. Its answer is streamed through as it arrives, checked
+/// as it passes, with `model` the public name; `capyctl.metrics` (§9) and the
+/// closing brace come only after the last check passed. It carries the
+/// request's IDs as a chat answer does (SPEC §10).
+async fn embeddings_handler(
+    state: axum::extract::State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> axum::response::Response {
+    let ids = Arc::new(request_id::RequestIds::read(&headers));
+    let outcome = embedding(&state.deps, &headers, body, &ids).await;
+    ids.end_trace(&outcome);
+    ids.stamp(outcome)
+}
+
+async fn embedding(
+    deps: &RouterDeps,
+    headers: &HeaderMap,
+    body: axum::body::Body,
+    ids: &Arc<request_id::RequestIds>,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    let endpoint = endpoint::Endpoint::Embeddings;
+    let received = receive(deps, headers, ids, body, endpoint).await?;
+    embeddings::dispatch(
+        deps,
+        &received.model,
+        received.request,
+        received.body_bytes,
+        received.at,
+        received.timing,
+        ids.clone(),
+    )
+    .await
 }
 
 /// SPEC §17: the request's timing header, when the operator enabled it.

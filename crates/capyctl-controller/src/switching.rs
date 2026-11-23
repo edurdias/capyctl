@@ -97,6 +97,9 @@ pub struct Room {
     commands: Option<CoordinatorCommands>,
     /// Started by an operator's `--evict`, not by a waiting request.
     pub explicit: bool,
+    /// ADR 0037 §4: an operator's switch's own activation root, and its
+    /// target bound to it until the start it made room for ends.
+    trace: Option<(capyctl_trace::Span, crate::activation_trace::Bound)>,
 }
 
 impl Drop for Room {
@@ -446,6 +449,8 @@ impl Switcher {
             return Err(NoRoom::Moved);
         }
         let mut rooms: Vec<Room> = Vec::new();
+        let all: Vec<SwitchVictim> = steps.iter().flat_map(|s| s.victims.clone()).collect();
+        let mut trace = self.explicit_root(target, true, &all);
         for host in hosts {
             let here: Vec<&StartStep> = steps.iter().filter(|s| s.host == host).collect();
             let victims: Vec<SwitchVictim> = here.iter().flat_map(|s| s.victims.clone()).collect();
@@ -485,6 +490,10 @@ impl Switcher {
                 // A failure path records its own end; this covers one that
                 // returned without it.
                 let _ = self.commands.end_switch(&switch_id);
+                if let Some((mut root, _)) = trace.take() {
+                    root.set(capyctl_trace::Attr::Outcome(capyctl_trace::Outcome::Failed));
+                    root.end();
+                }
                 // Hosts already released stay released and on-demand eligible
                 // (ADR 0013 §8 rule 6); their switches end as failed, since
                 // nothing is started.
@@ -507,7 +516,13 @@ impl Switcher {
                 victims,
                 commands: Some(self.commands.clone()),
                 explicit: true,
+                trace: None,
             });
+        }
+        // ADR 0037 §4: the first room holds the operator's switch root until
+        // the start ends ([`Switcher::finish_in_background`]).
+        if let Some(first) = rooms.first_mut() {
+            first.trace = trace;
         }
         Ok(rooms)
     }
@@ -518,7 +533,18 @@ impl Switcher {
     pub fn finish_in_background(self: &Arc<Self>, room: Room, target: String, operation: String) {
         let switcher = self.clone();
         self.background.track(tokio::spawn(async move {
+            let mut room = room;
             let outcome = switcher.settled(&operation).await;
+            // ADR 0037 §4: the operator's switch ends with its start.
+            if let Some((mut root, bound)) = room.trace.take() {
+                drop(bound);
+                root.set(capyctl_trace::Attr::Outcome(match &outcome {
+                    Ok(()) => capyctl_trace::Outcome::Completed,
+                    Err(LifecycleFault::Uncertain(_)) => capyctl_trace::Outcome::Uncertain,
+                    Err(_) => capyctl_trace::Outcome::Failed,
+                }));
+                root.end();
+            }
             if !room.switch_id.is_empty() {
                 match outcome {
                     Ok(()) => switcher.completed(&room, &target),
@@ -527,6 +553,43 @@ impl Switcher {
             }
             drop(room);
         }));
+    }
+
+    /// ADR 0037 §4: an operator's switch (`--evict`) is an activation of its
+    /// own: a new trace whose root its drain, its releases and the start's
+    /// steps hang under, with the first victim. A waiting request's switch
+    /// runs under the request's activation, already bound.
+    fn explicit_root(
+        &self,
+        target: &str,
+        explicit: bool,
+        victims: &[SwitchVictim],
+    ) -> Option<(capyctl_trace::Span, crate::activation_trace::Bound)> {
+        let traces = self.commands.traces();
+        if !explicit || !traces.is_on() || traces.bound(target).is_some() {
+            return None;
+        }
+        let mut root = traces.root(capyctl_trace::ActivationKind::Switch, target);
+        if let Some(victim) = victims.first() {
+            root.set(capyctl_trace::Attr::Victim(victim.deployment_id.clone()));
+        }
+        let bound = traces.bind(target, root.cx());
+        Some((root, bound))
+    }
+
+    /// ADR 0037 §5 (`capyctl.park_tier`): the tier a victim parks at, as
+    /// its current revision declares it (`deep`, `host_backed`); read only
+    /// while tracing is on, and absent when it cannot be read.
+    fn park_tier(&self, deployment: &str) -> Option<String> {
+        if !self.commands.traces().is_on() {
+            return None;
+        }
+        let configuration = self
+            .commands
+            .read(|store| store.effective_configuration(deployment))
+            .ok()??;
+        let tier = configuration.effective.get("residency")?.as_str()?;
+        Some(tier.to_owned())
     }
 
     /// Make room for one instance of `target` (`only` names it), recording
@@ -589,6 +652,7 @@ impl Switcher {
                     victims: Vec::new(),
                     commands: None,
                     explicit,
+                    trace: None,
                 }))
             }
             SwitchPlan::Impossible(code) => return Err(NoRoom::Fault(capacity(target, &code))),
@@ -649,6 +713,7 @@ impl Switcher {
             &detail,
             explicit,
         );
+        let mut trace = self.explicit_root(target, explicit, &victims);
         let active = Active::enter(self);
         let released = self
             .release(
@@ -664,6 +729,10 @@ impl Switcher {
             // A failure path records its own end; this covers one that
             // returned without it.
             let _ = self.commands.end_switch(&switch_id);
+            if let Some((mut root, _)) = trace.take() {
+                root.set(capyctl_trace::Attr::Outcome(capyctl_trace::Outcome::Failed));
+                root.end();
+            }
         }
         released?;
         Ok(Some(Room {
@@ -674,6 +743,7 @@ impl Switcher {
             victims,
             commands: Some(self.commands.clone()),
             explicit,
+            trace,
         }))
     }
 
@@ -717,6 +787,15 @@ impl Switcher {
                 tokio::time::sleep(self.options.poll.min(closes_at - now)).await;
             }
         }
+        // ADR 0037 §4: `capyctl.drain` (step 4, admission closed until every
+        // victim's requests settle) and one `capyctl.release` per victim (step
+        // 5), under the activation the target is bound to.
+        let traces = self.commands.traces();
+        let parent = traces.bound(target);
+        let mut drain = traces.step(parent, capyctl_trace::Name::Drain);
+        if let Some(victim) = victims.first() {
+            drain.set(capyctl_trace::Attr::Victim(victim.deployment_id.clone()));
+        }
         let mut closed: Vec<&SwitchVictim> = Vec::new();
         for v in victims {
             match self
@@ -739,6 +818,7 @@ impl Switcher {
                         &reason,
                         explicit,
                     );
+                    drain.fail("victim_moved");
                     return Err(LifecycleFault::Unavailable(format!(
                         "switch to {target} failed: {reason}; retry shortly"
                     )));
@@ -794,17 +874,30 @@ impl Switcher {
                     &reason,
                     explicit,
                 );
+                drain.fail("drain_timeout");
                 return Err(LifecycleFault::Unavailable(format!(
                     "switch to {target} failed: {reason}; retry shortly"
                 )));
             }
             tokio::time::sleep(self.options.poll).await;
         }
+        drain.completed();
         // Step 5 (release): park or stop each victim; each completes only
         // on its own evidence.
         let mut operations = Vec::new();
+        let mut steps = Vec::new();
         for (index, v) in closed.iter().enumerate() {
             let key = format!("switch:{switch_id}:{}:{}", v.deployment_id, v.instance);
+            let mut step = traces.step(parent, capyctl_trace::Name::Release);
+            step.set(capyctl_trace::Attr::Victim(v.deployment_id.clone()));
+            if v.parks {
+                if let Some(tier) = self.park_tier(&v.deployment_id) {
+                    step.set(capyctl_trace::Attr::ParkTier(tier));
+                }
+            }
+            // ADR 0037 §6: bound before the release is accepted, so the
+            // victim's park or stop command carries the release's context.
+            let bound = traces.bind(&v.deployment_id, step.cx());
             match self.commands.accept_switch_release(
                 SWITCH_PRINCIPAL,
                 &v.deployment_id,
@@ -813,11 +906,16 @@ impl Switcher {
                 &key,
                 v.parks,
             ) {
-                Ok(release) => operations.push((*v, release)),
+                Ok(release) => {
+                    operations.push((*v, release));
+                    steps.push((step, bound));
+                }
                 Err(error) => {
                     // Nothing was accepted for this victim or the rest:
                     // they serve again. Those already accepted proceed.
                     self.reopen(&closed[index..]);
+                    step.fail("release_refused");
+                    drop(bound);
                     let reason = format!(
                         "release of {}/{} refused: {error}",
                         v.deployment_id, v.instance
@@ -840,8 +938,15 @@ impl Switcher {
         // refused on its own evidence is stopped then) rather than one still
         // in flight (owner decision 2026-09-25: a start may release several).
         let mut first_failure: Option<(String, LifecycleFault)> = None;
-        for (v, release) in &operations {
-            if let Err(error) = self.settled(&release.operation_id).await {
+        for ((v, release), (step, bound)) in operations.iter().zip(steps) {
+            let settled = self.settled(&release.operation_id).await;
+            drop(bound);
+            match &settled {
+                Ok(()) => step.completed(),
+                Err(LifecycleFault::Uncertain(_)) => step.end(capyctl_trace::Outcome::Uncertain),
+                Err(_) => step.fail("release_failed"),
+            }
+            if let Err(error) = settled {
                 if first_failure.is_none() {
                     let reason = format!(
                         "{} of {}/{} did not complete: {error}",

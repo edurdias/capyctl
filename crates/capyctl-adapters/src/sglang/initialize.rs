@@ -90,6 +90,10 @@ pub(super) async fn initialize(
     adapter: &SglangAdapter,
     command: &RuntimeCommand,
 ) -> Result<EffectObservation, RuntimeError> {
+    // ADR 0041 §1: no native engine is qualified for extractions.
+    if adapter.extractions() {
+        return Err(RuntimeError::Unsupported);
+    }
     let context = &command.context;
     // Unsupported when any part is missing: a builder without its launch, its
     // tools or its credentials cannot launch anything, and must not half-run
@@ -115,6 +119,10 @@ pub(super) async fn restore_engine(
     adapter: &SglangAdapter,
     command: &RuntimeCommand,
 ) -> Result<EffectObservation, RuntimeError> {
+    // ADR 0041 §1: an extraction launch cannot restart as a chat engine.
+    if adapter.extractions() {
+        return Err(RuntimeError::Unsupported);
+    }
     let parts = adapter.launch_parts()?;
     crate::lmcache::restore_server(command)?;
     if !matches!(
@@ -158,15 +166,23 @@ async fn launch(
     if let Some(connector) = &connector {
         // ADR 0033 §4: the owner-only connector file, named by the public
         // settings; the entry renders `enable_lmcache` and the file and pins
-        // both after SGLang resolved its arguments.
+        // both after SGLang resolved its arguments. ADR 0034 §1: the file
+        // names the transfer mode the server serves.
         let dir = connector.plan().config_dir.clone();
         let port = connector.rpc_port();
-        let file =
-            tokio::task::spawn_blocking(move || crate::lmcache::write_sglang_config(&dir, port))
-                .await
-                .map_err(|_| RuntimeError::Uncertain("LMCache configuration task failed".into()))?
-                .map_err(|e| RuntimeError::Uncertain(format!("LMCache configuration: {e}")))?;
+        let transfer = connector.plan().transfer;
+        let file = tokio::task::spawn_blocking(move || {
+            crate::lmcache::write_sglang_config(&dir, port, transfer)
+        })
+        .await
+        .map_err(|_| RuntimeError::Uncertain("LMCache configuration task failed".into()))?
+        .map_err(|e| RuntimeError::Uncertain(format!("LMCache configuration: {e}")))?;
         launch.rendered = launch.rendered.with_lmcache_config_file(&file)?;
+    }
+    // ADR 0037 §7: a launch decided traced names its collector in the
+    // public descriptor; the entry renders and pins the owned options.
+    if let Some(endpoint) = adapter.trace_endpoint() {
+        launch.rendered = launch.rendered.with_trace_endpoint(endpoint)?;
     }
 
     // SPEC §13.3: the private descriptor and the two credentials ride protected
@@ -486,6 +502,29 @@ async fn launch(
                 "engine listed the model but did not answer the decision probe: {e}"
             )))
         })?;
+    } else if adapter.embeddings() {
+        // ADR 0036 §5, SPEC §6.1: an embedding server is ready when it
+        // answers the fixed embedding with one finite vector whose norm is
+        // above 1e-6. Never a chat probe in its place.
+        tokio::time::timeout(
+            probe_budget,
+            crate::traits::ChatForward::embedding_probe(
+                adapter,
+                adapter.served_name(),
+                probe_budget,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            failed(RuntimeError::Uncertain(
+                "probe deadline reached with the engine alive".into(),
+            ))
+        })?
+        .map_err(|e| {
+            RuntimeError::Uncertain(redact_text(&format!(
+                "engine listed the model but did not answer the embedding probe: {e}"
+            )))
+        })?;
     } else {
         let body = json!({
             "model": adapter.served_name(),
@@ -557,6 +596,7 @@ async fn launch(
             Milestone::ModelUsable,
         ],
         kernel_builds: builds.finish(),
+        extraction_probe: None,
     })
 }
 

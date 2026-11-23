@@ -273,6 +273,18 @@ const GROUP_CODES: &[(&str, Named, Option<ExitCode>)] = &[
         Named::Bare,
         Some(ExitCode::UNSUPPORTED),
     ),
+    // ADR 0036 §1: a host too old to serve embedding models.
+    (
+        "host_capability_missing:embeddings",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
+    // ADR 0041 §7: extraction version skew is an unsupported operation.
+    (
+        "host_capability_missing:extractions",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
     // ADR 0031 §9: a host too old to run custom engines.
     (
         "host_capability_missing:custom_engines",
@@ -310,6 +322,25 @@ const GROUP_CODES: &[(&str, Named, Option<ExitCode>)] = &[
         Named::Bare,
         Some(ExitCode::UNSUPPORTED),
     ),
+    // ADR 0039 §§4, 15, 16: a host too old to run TensorFold's native line,
+    // and the native line's compaction and disk-writing options under a
+    // deployment's or a host's `retention: zero`, refused at resolution or
+    // placement as `retention_zero:lmcache` is.
+    (
+        "host_capability_missing:tensorfold_native",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
+    (
+        "retention_zero:compaction",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
+    (
+        "retention_zero:engine_disk",
+        Named::Bare,
+        Some(ExitCode::UNSUPPORTED),
+    ),
     // ADR 0031 §10: a manifest refused at `engine add` (or a profile's copy
     // refused at role start), and resolution's custom engine refusals.
     (
@@ -342,6 +373,9 @@ const GROUP_CODES: &[(&str, Named, Option<ExitCode>)] = &[
         Some(ExitCode::INVALID_CONFIG),
     ),
     ("custom_listener_exposed", Named::Bare, None),
+    // ADR 0039 §14: the custom engine's loopback check under a TensorFold
+    // reason; a launch failure, never a refusal with its own exit.
+    ("tensorfold_listener_exposed", Named::Bare, None),
     // ADR 0023 §2: an existing code keeps its exit when a configuration
     // refusal carries it (`capability_missing:deep_park`).
     (
@@ -745,6 +779,27 @@ pub fn json_string(s: &str) -> String {
 mod format_tests {
     use super::OutputFormat;
 
+    // T50 (ADR 0041 §7): native refusal and old-host refusal preserve their
+    // closed codes in text and JSON and both exit as unsupported.
+    #[test]
+    fn extraction_refusals_keep_their_codes_and_exit() {
+        for code in [
+            "capability_missing:extractions",
+            "host_capability_missing:extractions",
+        ] {
+            let error = super::StructuredError {
+                code: "invalid_config",
+                message: format!("{code}: extraction models are unavailable"),
+            };
+            assert_eq!(error.closed_code(), code);
+            assert_eq!(error.exit_code(), super::ExitCode::UNSUPPORTED);
+            assert!(error.to_string().contains(code));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&error.to_json()).unwrap()["code"],
+                code
+            );
+        }
+    }
     // ADR 0021: a command result is indented on a terminal and one compact
     // line when piped or redirected.
     #[test]

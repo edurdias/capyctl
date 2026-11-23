@@ -86,7 +86,7 @@ pub(super) async fn initialize(
         ))
     };
     let mut last_probe: Option<String> = None;
-    loop {
+    let extraction_probe = loop {
         match present(api.clone()).await? {
             Presence::Alive => {}
             Presence::Gone => return Err(exited()),
@@ -103,7 +103,7 @@ pub(super) async fn initialize(
         if ready == Readiness::Ready {
             let budget = Duration::from_millis(u64::try_from(stop_at - now_ms()?).unwrap_or(0));
             match probe(adapter, &plan.values.served_name, budget).await {
-                Ok(()) => break,
+                Ok(evidence) => break evidence,
                 Err(reason) => last_probe = Some(reason),
             }
         }
@@ -116,7 +116,7 @@ pub(super) async fn initialize(
             })));
         }
         tokio::time::sleep(READINESS_POLL).await;
-    }
+    };
     if present(api.clone()).await? == Presence::Gone {
         return Err(exited());
     }
@@ -172,9 +172,14 @@ pub(super) async fn initialize(
         identities,
         observed_at_ms: now_ms()?,
         receipt: format!(
-            "custom engine {} ready on {}; probe answered; listeners on loopback",
+            "custom engine {} ready on {}; {}probe answered; listeners on loopback",
             adapter.fingerprint(),
-            adapter.endpoint()
+            adapter.endpoint(),
+            if adapter.extractions() {
+                "fixed extraction "
+            } else {
+                ""
+            }
         ),
         facts: vec![
             Milestone::AllocationsRestored,
@@ -183,20 +188,40 @@ pub(super) async fn initialize(
             Milestone::ModelUsable,
         ],
         kernel_builds: Vec::new(),
+        extraction_probe,
     })
 }
 
-/// ADR 0031 §5: the existing probe of the profile's API, unchanged: the
-/// fixed decision of ADR 0030 §3 for `decisions` (never a chat probe in its
-/// place), the bounded startup chat probe for `chat`; the served name as
-/// `model`, the key when the manifest uses one. The reason it failed, if it
-/// did.
-async fn probe(adapter: &CustomAdapter, served: &str, budget: Duration) -> Result<(), String> {
+/// ADR 0031 §5: the profile's own API probe, with its served name and key:
+/// a fixed decision (ADR 0030 §3), embedding (ADR 0036 §5), extraction of
+/// the declared types (ADR 0041 §4), or the bounded startup chat probe.
+/// Another API's answer never substitutes. Returns the failure reason.
+async fn probe(
+    adapter: &CustomAdapter,
+    served: &str,
+    budget: Duration,
+) -> Result<Option<capyctl_domain::completion::ExtractionProbeEvidence>, String> {
     if adapter.decisions() {
         return match tokio::time::timeout(budget, adapter.decide(served, budget)).await {
-            Ok(Ok(_)) => Ok(()),
+            Ok(Ok(_)) => Ok(None),
             Ok(Err(e)) => Err(format!("the decision probe was not answered: {e}")),
             Err(_) => Err("the decision probe outlasted the startup window".into()),
+        };
+    }
+    if adapter.embeddings() {
+        return match tokio::time::timeout(budget, adapter.embed_probe(served, budget)).await {
+            Ok(Ok(_)) => Ok(None),
+            Ok(Err(e)) => Err(format!("the embedding probe was not answered: {e}")),
+            Err(_) => Err("the embedding probe outlasted the startup window".into()),
+        };
+    }
+    // ADR 0041 §4: port and manifest health have passed; now only extraction
+    // evidence of the declared types proves this launch ready.
+    if adapter.extractions() {
+        return match tokio::time::timeout(budget, adapter.extract_probe(served, budget)).await {
+            Ok(Ok(answer)) => crate::extraction_probe::evidence(&answer).map(Some),
+            Ok(Err(e)) => Err(format!("the extraction probe was not answered: {e}")),
+            Err(_) => Err("the extraction probe outlasted the startup window".into()),
         };
     }
     let body = json!({
@@ -209,7 +234,7 @@ async fn probe(adapter: &CustomAdapter, served: &str, budget: Duration) -> Resul
         None => Err("the chat probe outlasted the startup window".into()),
         Some(Err(e)) => Err(format!("the chat probe was not answered: {e}")),
         // ADR 0023 §6: a non-empty content or reasoning answers.
-        Some(Ok(answer)) if crate::forward::probe_answered(&answer) => Ok(()),
+        Some(Ok(answer)) if crate::forward::probe_answered(&answer) => Ok(None),
         Some(Ok(_)) => Err("the engine answered the chat probe with empty content".into()),
     }
 }

@@ -639,36 +639,27 @@ fn swap_space_is_never_rendered() {
 
 /// Discrete GPU design §6 (ADR 0019): on a discrete device vLLM gets the KV
 /// bytes of the grant and a `--gpu-memory-utilization` that is the device
-/// request's share of the card, rounded up to 0.0000000001, at least the floor given
-/// (0.75 for a derived request: vLLM 0.29 with CUDA graphs did not start a 4B
-/// model on a 16 GB card below it; none for a declared one, #225) and at most
-/// 0.99.
+/// request's share of the card, rounded up to 0.0000000001, between 0.01
+/// and 0.99 for both derived and declared requests (#225).
 // T26
 #[test]
 fn a_discrete_launch_renders_kv_bytes_and_utilization() {
-    use capyctl_adapters::vllm::{device_utilization_units, DEVICE_UTILIZATION_FLOOR_PCT};
-    let floor = DEVICE_UTILIZATION_FLOOR_PCT;
+    use capyctl_adapters::vllm::device_utilization_units;
     assert_eq!(
-        device_utilization_units(12 << 30, 16376 << 20, floor),
+        device_utilization_units(12 << 30, 16376 << 20),
         7_503_663_899
     );
     assert_eq!(
-        device_utilization_units(2 << 30, 16376 << 20, floor),
-        7_500_000_000
-    );
-    assert_eq!(
-        device_utilization_units(20 << 30, 16376 << 20, floor),
-        9_900_000_000
-    );
-    // #225: a declared request's share, as it is.
-    assert_eq!(
-        device_utilization_units(2 << 30, 16376 << 20, 1),
+        device_utilization_units(2 << 30, 16376 << 20),
         1_250_610_650
     );
-    assert_eq!(device_utilization_units(0, 16376 << 20, 1), 100_000_000);
+    assert_eq!(
+        device_utilization_units(20 << 30, 16376 << 20),
+        9_900_000_000
+    );
+    assert_eq!(device_utilization_units(0, 16376 << 20), 100_000_000);
     // A card total that was never observed cannot divide anything.
-    assert_eq!(device_utilization_units(12 << 30, 0, floor), 9_900_000_000);
-    assert_eq!(device_utilization_units(12 << 30, 0, 1), 9_900_000_000);
+    assert_eq!(device_utilization_units(12 << 30, 0), 9_900_000_000);
     let mut input = base_input();
     input.granted.gpu_utilization_units = Some(7_503_663_899);
     input.granted.kv_cache_bytes = Some(4 << 30);
@@ -689,7 +680,7 @@ fn declared_share_on_large_card_fits_first_start_charge() {
     let request = (135_i64 << 30) + (1 << 27);
     let charged = request + (5_i64 << 28);
     let mut input = base_input();
-    input.granted.gpu_utilization_units = Some(device_utilization_units(request, total, 1));
+    input.granted.gpu_utilization_units = Some(device_utilization_units(request, total));
     let argv = render_command(&input).unwrap().argv;
     let share: f64 = argv
         .windows(2)

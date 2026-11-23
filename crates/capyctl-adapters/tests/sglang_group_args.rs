@@ -109,6 +109,19 @@ fn single_reference_descriptor() -> Value {
     })
 }
 
+// T48 (ADR 0037 §7): a group member never traces (`group`): its descriptor
+// refuses a collector.
+#[test]
+fn a_group_member_descriptor_refuses_engine_tracing() {
+    for rank in [0, 1] {
+        let launch = SglangLaunch::from_frozen(&frozen_sglang_group(rank)).unwrap();
+        assert!(matches!(
+            launch.with_trace_endpoint("http://127.0.0.1:4318/v1/traces"),
+            Err(RuntimeError::Unsupported)
+        ));
+    }
+}
+
 // T22: the public descriptor carries the group; a worker's endpoint is its loopback port.
 #[test]
 fn sglang_group_descriptor() {

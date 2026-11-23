@@ -347,6 +347,8 @@ fn restate_engine_fields(
         ],
         Some("tensorfold") => &["max_tokens", "thinking"],
         Some("llamacpp") => &["n_gpu_layers", "gguf_file", "mmproj_file"],
+        // ADR 0038 §3, §14.
+        Some("tensorrt-llm") => &["tool_call_parser", "reasoning_parser", "llm_api_options"],
         _ => return Err(invalid("snapshot.engine_config", "unsupported engine")),
     };
     let prefix = engine.expect("engine checked above");
@@ -499,6 +501,11 @@ pub(super) fn declared_engine_config(
             // #219: a placeholder startup (it records its graph allowance)
             // beside a request declared for a card is kept as frozen.
             legacy_device_placeholder: memory.get("startup_graphs_bytes").is_some(),
+            // #225: omission is the frozen pre-0.2.0 derived-request rule.
+            // Exact snapshot equality rejects markers other than zero.
+            legacy_vllm_device_floor: engine == Some("vllm")
+                && !declared("memory.request")
+                && object.get("device_request_floor_pct").is_none(),
             // ADR 0014 amendment A13: the graphs-off default beside the
             // memory saver, as frozen before it was dropped.
             legacy_sglang_graphs_off: engine == Some("sglang")

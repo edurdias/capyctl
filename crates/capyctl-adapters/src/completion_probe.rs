@@ -46,13 +46,16 @@ pub struct CanaryAnswer {
     pub observed_at_ms: i64,
 }
 
-/// What a wake canary's probe answered: what a chat deployment generated, or
-/// (ADR 0030 §4) a decisions deployment's answer to the fixed decision probe.
-/// The two are never compared with each other.
+/// What a wake canary's probe answered: generated chat, a fixed decision
+/// (ADR 0030 §4), a fixed embedding (ADR 0036 §6), or the declared fixed
+/// extractions (ADR 0041 §5). Different probe kinds are never compared.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CanaryEvidence {
     Generated(ProbeAnswer),
     Decision(crate::decision_probe::DecisionAnswer),
+    Embedding(crate::embedding_probe::EmbeddingAnswer),
+    /// ADR 0041 §§4–5: the declared types and their fixed extraction answers.
+    Extraction(crate::extraction_probe::ExtractionAnswer),
 }
 
 /// vLLM, TensorFold and llama.cpp: OpenAI `/v1/completions` asking for the
@@ -153,6 +156,20 @@ pub(crate) async fn post_json(
     bound: std::time::Duration,
     what: &str,
 ) -> Result<Value, AdapterError> {
+    post_json_within(client, url, key, body, bound, what, MAX_BODY).await
+}
+
+/// [`post_json`] reading at most `limit` bytes of answer (ADR 0036 §5: one
+/// embedding vector is larger than a few token ids).
+pub(crate) async fn post_json_within(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    key: Option<&reqwest::header::HeaderValue>,
+    body: &Value,
+    bound: std::time::Duration,
+    what: &str,
+    limit: usize,
+) -> Result<Value, AdapterError> {
     let failed = |detail: &str| AdapterError::Uncertain(format!("{what}: {detail}"));
     let mut request = client.post(url).json(body).timeout(bound);
     if let Some(key) = key {
@@ -164,7 +181,7 @@ pub(crate) async fn post_json(
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| failed("body"))? {
-        if bytes.len() + chunk.len() > MAX_BODY {
+        if bytes.len() + chunk.len() > limit {
             return Err(failed("body too large"));
         }
         bytes.extend_from_slice(&chunk);

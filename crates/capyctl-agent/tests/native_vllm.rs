@@ -408,6 +408,7 @@ impl Fixture {
                 checkpoint_layout: None,
                 checkpoint_tables: None,
                 checkpoint_gguf: None,
+                vllm_device_request_no_floor: false,
                 startup_bytes: None,
                 startup_host_bytes: None,
                 lmcache: None,
@@ -882,6 +883,8 @@ impl Fixture {
                 owned_handle: "launch".into(),
                 max_tokens: None,
                 decision: false,
+                embedding: false,
+                extraction: false,
             },
         })
     }
@@ -983,6 +986,8 @@ async fn a_restarted_host_serves_again_only_after_a_fresh_probe() {
         owned_handle: "never-launched".into(),
         max_tokens: None,
         decision: false,
+        embedding: false,
+        extraction: false,
     };
     let unknown = sign(unknown);
     let nothing = host

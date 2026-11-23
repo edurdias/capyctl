@@ -1331,6 +1331,118 @@ CREATE TABLE IF NOT EXISTS ui_sessions(
 );
 "#;
 
+/// v60 (ADR 0036 §§5, 6): an embeddings launch's wake canary reference. The
+/// table gains the kind `embedding` and two columns, `dimension` and
+/// `vector` (the reference as little-endian float32 bytes, four per
+/// dimension); an embedding row carries its tolerance and no completion or
+/// decision answer. Every row recorded before v60 is copied unchanged with
+/// both columns null. Forward-only.
+pub const SCHEMA_V60: &str = r#"
+CREATE TABLE wake_canaries_v60(
+  deployment_id TEXT NOT NULL,
+  instance_index INTEGER NOT NULL CHECK(instance_index>=0),
+  generation INTEGER NOT NULL,
+  incarnation TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  tokens_json TEXT NOT NULL,
+  text TEXT NOT NULL,
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0),
+  mismatch_operation_id TEXT,
+  kind TEXT NOT NULL CHECK(kind IN ('completion','decision','embedding')),
+  probe_version INTEGER NOT NULL CHECK(probe_version>=1),
+  decision_json TEXT,
+  tolerance REAL,
+  dimension INTEGER,
+  vector BLOB,
+  CHECK((kind='completion' AND decision_json IS NULL AND tolerance IS NULL AND dimension IS NULL AND vector IS NULL
+         AND (tokens_json<>'[]' OR text<>''))
+     OR (kind='decision' AND decision_json IS NOT NULL AND tolerance IS NOT NULL AND dimension IS NULL AND vector IS NULL
+         AND tokens_json='[]' AND text='')
+     OR (kind='embedding' AND decision_json IS NULL AND tolerance IS NOT NULL AND dimension>=1
+         AND typeof(vector)='blob' AND length(vector)=4*dimension AND tokens_json='[]' AND text='')),
+  PRIMARY KEY(deployment_id,instance_index,generation)
+);
+INSERT INTO wake_canaries_v60(deployment_id,instance_index,generation,incarnation,prompt,tokens_json,text,recorded_at_ms,mismatch_operation_id,kind,probe_version,decision_json,tolerance,dimension,vector)
+  SELECT deployment_id,instance_index,generation,incarnation,prompt,tokens_json,text,recorded_at_ms,mismatch_operation_id,kind,probe_version,decision_json,tolerance,NULL,NULL FROM wake_canaries;
+DROP TABLE wake_canaries;
+ALTER TABLE wake_canaries_v60 RENAME TO wake_canaries;
+"#;
+
+/// v61 (ADR 0034 §§3a, 4): LMCache by default.
+///
+/// - `checkpoint_sizes` and `checkpoint_digests` gain `kv_bytes_per_token`
+///   and `pool_context_tokens`, B and C as the host that read the checkpoint
+///   reported them with its sizing or its digest (as v55 added the model
+///   type), so the store sizes an automatic pool for an enrolled host's
+///   launch. A row written before v61, or by a host from before ADR 0034,
+///   reads null: an unknown basis, the 4 GiB default.
+/// - `launch_lmcache` gains how its pool was sized (`pool_source`, B and C,
+///   why they were unknown, the size before admission shrank it, the
+///   warning, the model type its basis names) and `uncertified`, the detail
+///   of a `lmcache: required` launch
+///   run outside the qualified table. A row written before v61 reads null:
+///   a pool of unknown source, certified.
+///
+/// The columns are added by `checkpoint_digests::migrate_v61` and
+/// `lmcache::migrate_v61` only when missing. Additive and forward-only.
+pub const SCHEMA_V61: &str =
+    "-- LMCache pool basis and uncertified runs (checkpoint_digests::migrate_v61, lmcache::migrate_v61)";
+
+/// v62 (ADR 0037 §7): each launch's engine tracing decision, frozen when it
+/// launched: `on`, or the off reason's code. Read by the router's lane and by
+/// status; a launch recorded before engine tracing has no row (untraced).
+pub const SCHEMA_V62: &str = r#"
+CREATE TABLE IF NOT EXISTS launch_engine_tracing(
+  binding_id TEXT PRIMARY KEY REFERENCES runtime_bindings(id),
+  state TEXT NOT NULL CHECK(state IN ('on','off')),
+  reason TEXT CHECK((state='on' AND reason IS NULL) OR (state='off' AND reason IS NOT NULL AND reason IN
+    ('host_off','engine_unsupported','not_installed','group','retention_zero')))
+);
+"#;
+
+/// v63 (ADR 0041 §4): an extraction launch's reference keeps its declared
+/// field types and the complete answers object. Existing reference kinds,
+/// payloads, launch identities and mismatch markers are copied unchanged;
+/// their new extraction-only columns remain null. Forward-only.
+pub const SCHEMA_V63: &str = r#"
+CREATE TABLE wake_canaries_v63(
+  deployment_id TEXT NOT NULL,
+  instance_index INTEGER NOT NULL CHECK(instance_index>=0),
+  generation INTEGER NOT NULL,
+  incarnation TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  tokens_json TEXT NOT NULL,
+  text TEXT NOT NULL,
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0),
+  mismatch_operation_id TEXT,
+  kind TEXT NOT NULL CHECK(kind IN ('completion','decision','embedding','extraction')),
+  probe_version INTEGER NOT NULL CHECK(probe_version>=1),
+  decision_json TEXT,
+  tolerance REAL,
+  dimension INTEGER,
+  vector BLOB,
+  declared_field_types_json TEXT,
+  answers_json TEXT,
+  CHECK((kind='completion' AND decision_json IS NULL AND tolerance IS NULL AND dimension IS NULL AND vector IS NULL
+         AND declared_field_types_json IS NULL AND answers_json IS NULL AND (tokens_json<>'[]' OR text<>''))
+     OR (kind='decision' AND decision_json IS NOT NULL AND tolerance IS NOT NULL AND dimension IS NULL AND vector IS NULL
+         AND declared_field_types_json IS NULL AND answers_json IS NULL AND tokens_json='[]' AND text='')
+     OR (kind='embedding' AND decision_json IS NULL AND tolerance IS NOT NULL AND dimension>=1
+         AND typeof(vector)='blob' AND length(vector)=4*dimension
+         AND declared_field_types_json IS NULL AND answers_json IS NULL AND tokens_json='[]' AND text='')
+     OR (kind='extraction' AND decision_json IS NULL AND tolerance IS NULL AND dimension IS NULL AND vector IS NULL
+         AND declared_field_types_json IS NOT NULL AND json_valid(declared_field_types_json)
+         AND json_type(declared_field_types_json)='array' AND json_array_length(declared_field_types_json)>0
+         AND answers_json IS NOT NULL AND json_valid(answers_json) AND json_type(answers_json)='object'
+         AND json(answers_json)<>'{}' AND tokens_json='[]' AND text='')),
+  PRIMARY KEY(deployment_id,instance_index,generation)
+);
+INSERT INTO wake_canaries_v63(deployment_id,instance_index,generation,incarnation,prompt,tokens_json,text,recorded_at_ms,mismatch_operation_id,kind,probe_version,decision_json,tolerance,dimension,vector,declared_field_types_json,answers_json)
+  SELECT deployment_id,instance_index,generation,incarnation,prompt,tokens_json,text,recorded_at_ms,mismatch_operation_id,kind,probe_version,decision_json,tolerance,dimension,vector,NULL,NULL FROM wake_canaries;
+DROP TABLE wake_canaries;
+ALTER TABLE wake_canaries_v63 RENAME TO wake_canaries;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -176,7 +176,7 @@ fn frozen_with(endpoint: String, weight_restore: &str) -> NativeLaunch {
         "admin-ref".into(),
         SglangLaunchSettings {
             common: CommonEngineSettings {
-                cuda_graphs: Some(false),
+                cuda_graphs: Some(false.into()),
                 ..CommonEngineSettings::default()
             },
             memory: MemoryRequest {

@@ -11,6 +11,8 @@ capyctl-adapters = { workspace = true }
 capyctl-config = { workspace = true }
 capyctl-controller = { path = "../capyctl-controller" }
 capyctl-domain = { workspace = true }
+# ADR 0037: request spans and W3C trace context.
+capyctl-trace = { workspace = true }
 capyctl-store = { path = "../capyctl-store" }
 # Only for `reqwest::Url`: the adapter forwarder is built from a parsed base URL,
 # and parsing it here keeps a malformed stored endpoint a router-side refusal.

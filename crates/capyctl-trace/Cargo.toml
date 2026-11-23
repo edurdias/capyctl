@@ -1,0 +1,29 @@
+[package]
+name = "capyctl-trace"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+capyctl-domain = { workspace = true }
+thiserror = { workspace = true }
+# ADR 0037 §8: the span model, the sampler and the OTLP messages only. No
+# default features: no metrics or logs, and no `internal-logs` (which would
+# pull a `tracing` subscriber path into CapyCTL's role logs).
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
+# ADR 0037 §8: OTLP/HTTP protobuf messages only (`gen-tonic-messages` is prost
+# message types, no tonic and no gRPC stack). `opentelemetry-otlp` is not used:
+# its HTTP exporter reads `OTEL_EXPORTER_OTLP_*` from the environment, which
+# §8 forbids, and its client brings a second reqwest and TLS stack.
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"] }
+# The message encoder `opentelemetry-proto` 0.33 is generated for.
+prost = "0.14"
+# ADR 0037 §8: the export rides the workspace's reqwest and rustls.
+reqwest = { workspace = true }
+http = "1"
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }

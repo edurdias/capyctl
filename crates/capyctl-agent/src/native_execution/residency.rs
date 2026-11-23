@@ -836,12 +836,19 @@ impl NativeHostExecution {
                     deployment_id: owner.identity.deployment_id.clone(),
                     member_id: plan.binding_id.clone(),
                 };
-                // ADR 0030 §3: a decisions launch answers the fixed decision.
+                // ADR 0030 §3: a decisions launch answers the fixed decision;
+                // ADR 0036 §5: an embeddings launch the fixed embedding.
                 if fresh_probe(
                     probe.as_ref(),
                     &member,
                     &served,
                     effective.api,
+                    &effective
+                        .profile
+                        .custom
+                        .as_ref()
+                        .and_then(|custom| custom.manifest.field_types.clone())
+                        .unwrap_or_default(),
                     run.stop_at_ms,
                 )
                 .await
@@ -936,6 +943,8 @@ impl NativeHostExecution {
             Engine::Tensorfold => return Err(SessionError),
             // ADR 0029 §1, §10: llama.cpp never parks.
             Engine::Llamacpp => return Err(SessionError),
+            // ADR 0038 §1, §8: TensorRT-LLM is restart-only and never parks.
+            Engine::TensorrtLlm => return Err(SessionError),
             // ADR 0031 §4: a custom engine never parks.
             Engine::Custom => return Err(SessionError),
         })

@@ -401,12 +401,13 @@ fn refusals_carry_their_codes() {
     let error = refusal(&deployment(tp(8)), &h);
     assert!(error.contains("insufficient_gpus"), "{error}");
     assert!(error.contains("what would fit"), "{error}");
-    // LMCache stays off on several GPUs, so `required` is refused.
+    // ADR 0034 §6: several GPUs are no reason to refuse `required`; this
+    // profile registers no LMCache, which is.
     let mut required = deployment(tp(2));
     required["lmcache"] = "required".into();
     let error = refusal(&required, &h);
     assert!(
-        error.contains("lmcache_unavailable:multi_gpu_unqualified"),
+        error.contains("lmcache_unavailable:not_installed"),
         "{error}"
     );
     // A decisions deployment keeps its own refusal of any topology.
@@ -568,9 +569,11 @@ fn auto_single_gpu_preserves_layout_for_snapshot_validation() {
     round_trips(&e);
 }
 
-// T46: required LMCache still narrows auto to one GPU after parking qualifies.
+// T46 T45 (ADR 0034 §6, amending ADR 0035 §1a): `lmcache: required` no
+// longer narrows `topology: auto` to one GPU: a model on several GPUs runs
+// LMCache uncertified rather than being refused.
 #[test]
-fn auto_narrows_to_one_gpu_for_required_lmcache() {
+fn auto_no_longer_narrows_to_one_gpu_for_required_lmcache() {
     let mut h = host(4);
     h["runtime_profiles"]["local"]["lmcache"] = json!({"version": "0.5.6",
         "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"});
@@ -583,12 +586,15 @@ fn auto_narrows_to_one_gpu_for_required_lmcache() {
     d["residency"] = "restart_only".into();
     let e = resolve_effective_with_checkpoint(&d, &h, small).unwrap();
     let table = e.topology.as_ref().unwrap().auto.as_ref().unwrap();
-    assert_eq!(table_peaks(table).len(), 1);
+    assert!(table_peaks(table).len() > 1, "{table:?}");
     assert!(table
         .excluded
         .iter()
-        .all(|x| x.reason == "lmcache_unavailable:multi_gpu_unqualified"));
-    assert_eq!(e.local_tensor_parallel(), 1);
+        .all(|x| !x.reason.contains("multi_gpu_unqualified")));
+    let mut explicit = d.clone();
+    explicit["topology"] = json!({"tensor_parallel": 2});
+    let e = resolve_effective_with_checkpoint(&explicit, &h, small).unwrap();
+    assert_eq!(e.local_tensor_parallel(), 2);
 }
 
 // T46: before the weights are measured no N is chosen; when no size fits,

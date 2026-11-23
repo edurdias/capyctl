@@ -9,13 +9,18 @@
 //! text of the registered environment within bounds and executes nothing (no
 //! interpreter, no import). It passes when LMCache is 0.5.6 or a later 0.5.x
 //! release registered with the profile, its server entry point and the
-//! server options CapyCTL renders are declared, the connector the engine
-//! needs is there, and `cache_salt` is threaded from the engine to LMCache's
-//! object keys. For SGLang it verifies salt support, not file presence, and
-//! never accepts the legacy SGLang connector (owner input on LMCache issue
-//! 4825, 2026-10-22: the legacy path drops the salt). A different digest
-//! from the registered one is drift, reported for the caller to handle under
-//! `security.installation_drift` as for the engine package.
+//! server options CapyCTL renders are declared (the eviction watermark and
+//! ratio included, ADR 0034 §4), the connector the engine needs is there,
+//! and `cache_salt` is threaded from the engine to LMCache's object keys. For
+//! a launch that renders engine-driven transfer (ADR 0034 §1) it also
+//! verifies the server's `--supported-transfer-mode engine_driven` and that
+//! the engine's connector reads `lmcache.mp.mp_transfer_mode`; a release
+//! without them fails only such launches. For SGLang it verifies salt
+//! support, not file presence, and never accepts the legacy SGLang connector
+//! (owner input on LMCache issue 4825, 2026-10-22: the legacy path drops the
+//! salt). A different digest from the registered one is drift, reported for
+//! the caller to handle under `security.installation_drift` as for the engine
+//! package.
 //!
 //! A pass is not qualification (AGENTS.md): the server's start and the
 //! engine's start with the connector are the live checks.
@@ -26,7 +31,7 @@ use crate::installation::{
 };
 use capyctl_config::engine_policy::Engine;
 use capyctl_config::lmcache::{
-    engine_gate, lmcache_version_supported, LmcacheOffReason, LmcacheRegistration,
+    engine_gate, lmcache_version_supported, LmcacheOffReason, LmcacheRegistration, TransferMode,
 };
 use serde::Serialize;
 use std::io::Read;
@@ -117,7 +122,8 @@ pub fn measure_lmcache(
 /// ADR 0033 §1: the launch-time check of a vLLM or SGLang profile's LMCache,
 /// by shape. Reads files of the environment of `executable` (lexically, as
 /// ADR 0018 §1) and executes nothing. `registered` is the profile's
-/// `lmcache` registration.
+/// `lmcache` registration; `transfer` is the transfer mode the launch
+/// renders (ADR 0034 §1), whose pieces are verified when it is engine-driven.
 ///
 /// Reasons, first applicable wins: `engine_unsupported` (not vLLM or
 /// SGLang), `not_installed`, `check_failed` (the installation is not one
@@ -129,6 +135,7 @@ pub fn check_lmcache(
     engine: Engine,
     executable: &Path,
     registered: Option<&LmcacheRegistration>,
+    transfer: TransferMode,
 ) -> Result<LmcacheInstall, LmcacheCheckFailure> {
     if !matches!(engine, Engine::Vllm | Engine::Sglang) {
         let off = engine_gate(engine, "");
@@ -201,6 +208,9 @@ pub fn check_lmcache(
     match engine {
         Engine::Vllm => shape.vllm(),
         _ => shape.sglang(),
+    }
+    if transfer == TransferMode::EngineDriven {
+        shape.engine_driven(engine);
     }
     if !shape.missing.is_empty() {
         return Err(LmcacheCheckFailure::check_failed(shape.missing.join("; ")));
@@ -285,10 +295,12 @@ impl Shape<'_> {
 
     /// ADR 0033 §3: `lmcache server` and every option CapyCTL renders for it
     /// (`--host --port --transport --http-host --http-port --l1-size-gb
-    /// --no-l1-use-lazy --eviction-policy LRU`). In 0.5.x the request, transport and HTTP
-    /// options are declared in `lmcache/v1/multiprocess/config.py` and the L1
-    /// size, its eager allocation (`--no-l1-use-lazy`: `--l1-use-lazy` is a
-    /// boolean option defaulting on) and the eviction policy in
+    /// --no-l1-use-lazy --eviction-policy LRU`, and ADR 0034 §4's
+    /// `--eviction-trigger-watermark --eviction-ratio` for every launch). In
+    /// 0.5.x the request, transport and HTTP options are declared in
+    /// `lmcache/v1/multiprocess/config.py` and the L1 size, its eager
+    /// allocation (`--no-l1-use-lazy`: `--l1-use-lazy` is a boolean option
+    /// defaulting on) and the eviction options in
     /// `lmcache/v1/distributed/config.py` (`add_storage_manager_args`); the
     /// `server` subcommand composes them.
     fn server(&mut self, bin: &Path) {
@@ -309,7 +321,12 @@ impl Shape<'_> {
         }
         const STORAGE_CONFIG: &str = "lmcache/v1/distributed/config.py";
         if let Some(text) = self.required(site, STORAGE_CONFIG) {
-            for option in ["--l1-size-gb", "--eviction-policy"] {
+            for option in [
+                "--l1-size-gb",
+                "--eviction-policy",
+                "--eviction-trigger-watermark",
+                "--eviction-ratio",
+            ] {
                 if !declares_option(&text, option) {
                     self.note(format!("{STORAGE_CONFIG} declares no {option} option"));
                 }
@@ -505,11 +522,121 @@ impl Shape<'_> {
             }
         }
     }
+
+    /// ADR 0034 §1: what engine-driven transfer needs, verified only for a
+    /// launch that renders it. The server's `--supported-transfer-mode`
+    /// offers `engine_driven` (`lmcache/v1/multiprocess/config.py`); vLLM's
+    /// adapter takes `mp_transfer_mode` from its `lmcache.mp.`-prefixed extra
+    /// configuration (`ExtraConfigDefault`); SGLang's unified connector reads
+    /// `lmcache.mp.mp_transfer_mode` from its configuration file's
+    /// `extra_config`.
+    fn engine_driven(&mut self, engine: Engine) {
+        let site = self.lmcache;
+        const MP_CONFIG: &str = "lmcache/v1/multiprocess/config.py";
+        let mode = TransferMode::EngineDriven.code();
+        if let Some(text) = self.required(site, MP_CONFIG) {
+            if !option_choices(&text, "--supported-transfer-mode")
+                .is_some_and(|choices| choices.iter().any(|choice| choice == mode))
+            {
+                self.note(format!(
+                    "{MP_CONFIG} declares no --supported-transfer-mode option with choice {mode}"
+                ));
+            }
+        }
+        match engine {
+            Engine::Vllm => {
+                const ADAPTER: &str = "lmcache/integration/vllm/vllm_multi_process_adapter.py";
+                if let Some(text) = self.required(site, ADAPTER) {
+                    if !class_body(&text, "ExtraConfigDefault")
+                        .is_some_and(|body| assigns(body, "mp_transfer_mode"))
+                    {
+                        self.note(format!(
+                            "{ADAPTER} declares no mp_transfer_mode in ExtraConfigDefault"
+                        ));
+                    }
+                    let prefixed = text.lines().any(|line| {
+                        line.strip_prefix("_EXTRA_CONFIG_KEY_PREFIX")
+                            .and_then(|rest| rest.trim_start().strip_prefix('='))
+                            .is_some_and(|value| {
+                                matches!(value.trim(), "\"lmcache.mp.\"" | "'lmcache.mp.'")
+                            })
+                    });
+                    if !prefixed {
+                        self.note(format!(
+                            "{ADAPTER} reads its extra configuration under no lmcache.mp. prefix"
+                        ));
+                    }
+                }
+            }
+            _ => {
+                const CONNECTOR: &str =
+                    "lmcache/integration/sglang/unified_lmcache_mp_connector.py";
+                const KEY: &str = "lmcache.mp.mp_transfer_mode";
+                if let Some(text) = self.required(site, CONNECTOR) {
+                    let code = compact_code(&text);
+                    if !code.contains(&format!("get_extra_config_value(\"{KEY}\""))
+                        && !code.contains(&format!("get_extra_config_value('{KEY}'"))
+                    {
+                        self.note(format!("{CONNECTOR} does not read {KEY}"));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Whether `flag` is declared as a quoted option name.
 fn declares_option(text: &str, flag: &str) -> bool {
     text.contains(&format!("\"{flag}\"")) || text.contains(&format!("'{flag}'"))
+}
+
+/// The quoted choices of `flag`'s own `add_argument(...)` call
+/// (`choices=[...]` or `choices=(...)`), `None` when the flag or its choices
+/// are not declared.
+fn option_choices(text: &str, flag: &str) -> Option<Vec<String>> {
+    ["\"", "'"].iter().find_map(|quote| {
+        let at = text.find(&format!("{quote}{flag}{quote}"))?;
+        let rest = &text[at..];
+        let call = rest.find("add_argument(").map_or(rest, |end| &rest[..end]);
+        let after = &call[call.find("choices=")? + "choices=".len()..];
+        let close = match after.chars().next()? {
+            '[' => ']',
+            '(' => ')',
+            _ => return None,
+        };
+        let list = &after[1..after.find(close)?];
+        Some(
+            list.split(',')
+                .map(|choice| {
+                    choice
+                        .trim()
+                        .trim_matches(|c| c == '"' || c == '\'')
+                        .to_owned()
+                })
+                .filter(|choice| !choice.is_empty())
+                .collect(),
+        )
+    })
+}
+
+/// A line whose statement assigns `name` (`name = ...`, `name: T = ...`).
+fn assigns(text: &str, name: &str) -> bool {
+    text.lines().any(|line| {
+        line.trim_start().strip_prefix(name).is_some_and(|rest| {
+            let rest = rest.trim_start();
+            (rest.starts_with('=') && !rest.starts_with("=="))
+                || (rest.starts_with(':') && rest.contains('='))
+        })
+    })
+}
+
+/// `text` without comments (from `#` to the end of its line) or whitespace,
+/// so a call reads the same however it is wrapped.
+fn compact_code(text: &str) -> String {
+    text.lines()
+        .flat_map(|line| line.split('#').next().unwrap_or_default().chars())
+        .filter(|c| !c.is_whitespace())
+        .collect()
 }
 
 /// Whether `--no-<flag>` is accepted: declared outright, or `flag`'s own

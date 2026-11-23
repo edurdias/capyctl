@@ -56,7 +56,7 @@ _EXPLICIT = {
         "download_dir": PATH, "tokenizer": PATH_EXEMPT, "chat_template": PATH_EXEMPT,
         "lora_modules": PATH, "speculative_config": SPECULATIVE, "generation_config": PATH,
         "allowed_local_media_path": PATH, "hf_config_path": PATH,
-        "otlp_traces_endpoint": EGRESS, "kv_transfer_config": EGRESS,
+        "kv_transfer_config": EGRESS,
         "kv_events_config": EGRESS, "load_format": EGRESS,
         "allowed_media_domains": EGRESS, "hf_token": EGRESS,
     },
@@ -65,10 +65,21 @@ _EXPLICIT = {
         "download_dir": PATH, "chat_template": PATH_EXEMPT,
         "completion_template": PATH_EXEMPT, "lora_paths": PATH,
         "speculative_draft_model_path": PATH, "file_storage_path": PATH,
-        "otlp_traces_endpoint": EGRESS, "tool_server": EGRESS,
+        "tool_server": EGRESS,
         "kv_events_config": EGRESS, "load_format": EGRESS,
         "remote_instance_weight_loader_seed_instance_ip": EGRESS,
     },
+}
+
+# ADR 0037 §7 (owner decision 2026-10-27, question 7): the engines' tracing
+# destinations are CapyCTL's, refused in the deployment's extras whatever the
+# host approves (engine_policy.rs VLLM_TRACING_OPTIONS, SGLANG_TRACING_FIELDS).
+# CapyCTL renders them itself, outside the extras: vLLM's reserved block,
+# SGLang's launch descriptor (`trace_endpoint`).
+OWNED = {
+    "vllm": frozenset(("otlp_traces_endpoint", "collect_detailed_traces")),
+    "sglang": frozenset(("enable_trace", "otlp_traces_endpoint", "otlp_service_name",
+                         "trace_modules")),
 }
 
 
@@ -216,6 +227,9 @@ def check(engine, supplied, approvals, checkpoint):
     the installed parser resolved it, to its parsed value.
     """
     for dest, value in supplied.items():
+        # ADR 0037 §7: no approval admits an owned destination.
+        if dest in OWNED.get(engine, ()):
+            raise Refused()
         kind = classify(engine, dest)
         if kind is None:
             continue

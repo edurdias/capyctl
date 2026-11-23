@@ -64,6 +64,17 @@ impl Residency {
         fake.set_decision(response);
         Self::over(Gate::with_engine(false, fake), true, clock)
     }
+    /// ADR 0036: an engine whose Initialize is the Fake embedding model,
+    /// answering `/v1/embeddings` as `script` says and refusing chat and
+    /// decisions.
+    fn embedding_model(
+        script: capyctl_testkit::fake_engine::FakeEmbeddings,
+        clock: Arc<AtomicI64>,
+    ) -> Arc<Self> {
+        let fake = capyctl_testkit::fake_engine::FakeEngine::with_lifecycle().with_embeddings();
+        fake.set_embeddings(script);
+        Self::over(Gate::with_engine(false, fake), true, clock)
+    }
     fn over(gate: Arc<Gate>, compound: bool, clock: Arc<AtomicI64>) -> Arc<Self> {
         gate.release.add_permits(64);
         Arc::new(Self {
@@ -103,6 +114,137 @@ impl Residency {
             ],
         }));
     }
+    /// ADR 0036 §6: an embeddings engine's answer to the fixed embedding
+    /// probe.
+    fn embeds(&self, vector: &[f32]) {
+        *self.canary.lock().unwrap() = Some(CanaryEvidence::Embedding(
+            capyctl_adapters::embedding_probe::EmbeddingAnswer {
+                vector: vector.to_vec(),
+            },
+        ));
+    }
+}
+
+fn extraction_model(clock: Arc<AtomicI64>) -> Arc<Residency> {
+    let fake = capyctl_testkit::FakeEngine::with_lifecycle().with_extractions(
+        vec![capyctl_config::extractions::FieldType::Number],
+        serde_json::json!({"answers": {"amount_paid": {
+            "type": "number", "value": 649, "guess": 649,
+            "p_null": 0.01, "confidence": 0.99
+        }}}),
+    );
+    let engine = Residency::over(Gate::with_engine(false, fake), true, clock);
+    // A second probe cannot supply the first-readiness reference.
+    engine.canary_fails.store(true, Ordering::SeqCst);
+    engine
+}
+
+// T50 (ADR 0041 §§4–5): the answer that proved readiness must be durable
+// before Initialize succeeds, even when a second extraction would fail.
+#[tokio::test]
+async fn extraction_readiness_persists_the_first_answer_without_a_second_probe() {
+    let (dir, owner, fence, observations) = setup().await;
+    let clock = Arc::new(AtomicI64::new(1900));
+    let engine = extraction_model(clock.clone());
+    let w = residency_worker(
+        owner,
+        observations,
+        engine.clone(),
+        clock,
+        IdlePolicy::default(),
+    );
+    ready(&w, &fence).await;
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    let (kind, version, declared, answer): (String, u32, String, String) = sql
+        .query_row(
+            "SELECT kind,probe_version,declared_field_types_json,answers_json
+             FROM wake_canaries WHERE deployment_id=?1 AND instance_index=0",
+            [&fence.deployment_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .expect("a successful extraction launch already has its first answer");
+    assert_eq!((kind.as_str(), version), ("extraction", 1));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&declared).unwrap(),
+        serde_json::json!(["number"])
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&answer).unwrap()["amount_paid"]["guess"],
+        649
+    );
+    assert!(
+        engine.canaries.lock().unwrap().is_empty(),
+        "no second probe"
+    );
+    assert_eq!(engine.gate.engine.extraction_requests(), 1);
+    w.shutdown().await.unwrap();
+}
+
+// T50 (ADR 0041 §5, SPEC §6.1): an unwritable startup reference fails the
+// launch, with dispatch closed; it is not silently deferred until a wake.
+#[tokio::test]
+async fn extraction_reference_storage_failure_fails_the_launch() {
+    let (dir, owner, fence, observations) = setup().await;
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    sql.execute_batch(
+        "CREATE TRIGGER refuse_extraction_reference BEFORE INSERT ON wake_canaries
+         BEGIN SELECT RAISE(FAIL, 'injected extraction reference storage failure'); END;",
+    )
+    .unwrap();
+    let clock = Arc::new(AtomicI64::new(1900));
+    let engine = extraction_model(clock.clone());
+    let observed = clock.clone();
+    let w = residency_worker_with(
+        owner.clone(),
+        observations,
+        Arc::new(Mutex::new(engine)),
+        clock,
+        IdlePolicy::default(),
+        Some(Arc::new(move |context: SettlementContext| {
+            let at = observed.load(Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(CleanupEvidence {
+                    binding_id: context.binding_id,
+                    incarnation: context.incarnation,
+                    identities: context.identities,
+                    observed_at_ms: at,
+                    receipt: "scripted host verified failed extraction engine gone".into(),
+                })
+            })
+        })),
+    );
+    let start = w.start(&fence, 100_000).unwrap();
+    let status = start.wait(Duration::from_secs(30)).await.unwrap();
+    assert_ne!(status, InitializeStatus::Completed, "{status:?}");
+    assert!(!instance(&dir, &fence.deployment_id).1);
+    assert_eq!(
+        sql.query_row("SELECT COUNT(*) FROM wake_canaries", [], |r| r
+            .get::<_, u32>(0))
+            .unwrap(),
+        0
+    );
+    until("the failed extraction launch is released", || {
+        phase(&owner, &fence.deployment_id).is_none()
+    })
+    .await;
+    let entries = owner
+        .lock()
+        .unwrap()
+        .store()
+        .journal_evidence(start.operation_id())
+        .unwrap();
+    assert!(
+        entries.iter().any(
+            |entry| entry.contains("could not persist the initial extraction canary reference")
+        ),
+        "the storage failure must have a clear reason: {entries:?}"
+    );
+    assert_eq!(
+        phase(&owner, &fence.deployment_id),
+        None,
+        "verified cleanup settled the failed launch"
+    );
+    w.shutdown().await.unwrap();
 }
 
 // T43 (ADR 0030 §3, SPEC §6.1): a decisions launch is ready only on a
@@ -160,6 +302,72 @@ async fn a_decisions_launch_is_ready_only_on_a_well_formed_decision() {
         assert_eq!(state == "ready", well_formed, "{response}");
         assert_eq!(engine.gate.engine.chat_requests(), 0);
         assert!(engine.gate.engine.decision_requests() >= 1);
+        w.shutdown().await.unwrap();
+    }
+}
+
+// T47 (ADR 0036 §5, SPEC §6.1): an embeddings launch is ready only on a
+// complete, well-formed answer to the fixed embedding; a malformed one, one
+// cut short or a zero vector leaves the start unproven and dispatch closed.
+// No chat or decision probe is ever sent.
+#[tokio::test]
+async fn an_embeddings_launch_is_ready_only_on_a_well_formed_embedding() {
+    use capyctl_testkit::fake_engine::{EmbeddingFault, FakeEmbeddings};
+    let cases = [
+        (FakeEmbeddings::default(), true),
+        (
+            FakeEmbeddings {
+                model_last: true,
+                ..Default::default()
+            },
+            true,
+        ),
+        (
+            FakeEmbeddings {
+                fault: Some(EmbeddingFault::WrongCount),
+                ..Default::default()
+            },
+            false,
+        ),
+        (
+            FakeEmbeddings {
+                fault: Some(EmbeddingFault::CutShort),
+                ..Default::default()
+            },
+            false,
+        ),
+        (
+            FakeEmbeddings {
+                vector: vec![0.0, 0.0],
+                ..Default::default()
+            },
+            false,
+        ),
+    ];
+    for (script, well_formed) in cases {
+        let (dir, owner, fence, observations) = setup().await;
+        let clock = Arc::new(AtomicI64::new(1900));
+        let engine = Residency::embedding_model(script.clone(), clock.clone());
+        let w = residency_worker(
+            owner.clone(),
+            observations,
+            engine.clone(),
+            clock,
+            IdlePolicy::default(),
+        );
+        let start = w.start(&fence, 100_000).unwrap();
+        let status = start.wait(Duration::from_secs(30)).await.unwrap();
+        assert_eq!(
+            status == InitializeStatus::Completed,
+            well_formed,
+            "{script:?}: {status:?}"
+        );
+        let (state, open, _, _) = instance(&dir, &fence.deployment_id);
+        assert_eq!(open, well_formed, "{script:?}");
+        assert_eq!(state == "ready", well_formed, "{script:?}");
+        assert_eq!(engine.gate.engine.chat_requests(), 0);
+        assert_eq!(engine.gate.engine.decision_requests(), 0);
+        assert!(engine.gate.engine.embedding_requests() >= 1);
         w.shutdown().await.unwrap();
     }
 }
@@ -222,6 +430,7 @@ impl EngineAdapter for Residency {
                 receipt: format!("scripted {:?}", command.action),
                 facts,
                 kernel_builds: Vec::new(),
+                extraction_probe: None,
             }),
         }
     }
@@ -342,6 +551,7 @@ fn residency_worker(
         Arc::new(Mutex::new(engine)),
         clock,
         idle,
+        None,
     )
 }
 
@@ -353,6 +563,7 @@ fn residency_worker_with(
     slot: Arc<Mutex<Arc<Residency>>>,
     clock: Arc<AtomicI64>,
     idle: IdlePolicy,
+    settlement: Option<SettlementExecutor>,
 ) -> OwnedCoordinator {
     let now = clock.clone();
     let engine = slot.lock().unwrap().clone();
@@ -373,7 +584,7 @@ fn residency_worker_with(
             let observed = clock.clone();
             let bound = slot.lock().unwrap().clone();
             let terminated = bound.clone();
-            Ok(ExecutionBinding::remote(
+            let binding = ExecutionBinding::remote(
                 bound,
                 Arc::new(move |context: CleanupExecutionContext| {
                     let at = observed.load(Ordering::SeqCst);
@@ -388,7 +599,11 @@ fn residency_worker_with(
                         })
                     })
                 }),
-            ))
+            );
+            Ok(match &settlement {
+                Some(settle) => binding.with_settlement(settle.clone()),
+                None => binding,
+            })
         }),
     )
     .unwrap()
@@ -1092,6 +1307,8 @@ fn tokens(reference: WakeCanaryReference) -> Vec<u32> {
     match reference {
         WakeCanaryReference::Completion(reference) => reference.tokens,
         WakeCanaryReference::Decision(_) => panic!("a decision reference"),
+        WakeCanaryReference::Embedding(_) => panic!("an embedding reference"),
+        WakeCanaryReference::Extraction(_) => panic!("an extraction reference"),
     }
 }
 
@@ -1302,6 +1519,124 @@ async fn a_chat_reference_is_never_compared_with_a_decision_answer() {
     w.shutdown().await.unwrap();
 }
 
+/// The embedding reference a launch's readiness recorded.
+fn embedding_reference(
+    owner: &SharedCoordinatorState,
+    dir: &tempfile::TempDir,
+    engine: &Residency,
+    deployment_id: &str,
+) -> capyctl_store::wake_canary::StoredEmbeddingCanary {
+    let Some(WakeCanaryReference::Embedding(recorded)) =
+        reference(owner, dir, engine, deployment_id)
+    else {
+        panic!("no embedding reference");
+    };
+    recorded
+}
+
+// T47 T20 (ADR 0036 §§6, 7.2): the first readiness records the embedding
+// probe's vector with its dimension, kind, version and tolerance; the canary
+// runs after every wake, before the woken instance serves, and a vector
+// within the relative distance of it completes the wake, on a remote
+// (compound) and an embedded (stepwise) restore alike.
+#[tokio::test]
+async fn an_embedding_canary_within_tolerance_completes_every_wake() {
+    for compound in [true, false] {
+        let (dir, owner, fence, observations) = setup().await;
+        let clock = Arc::new(AtomicI64::new(1900));
+        let engine = Residency::new(compound, clock.clone());
+        engine.embeds(&[0.6, 0.8, 0.0, 0.0]);
+        let w = residency_worker(
+            owner.clone(),
+            observations,
+            engine.clone(),
+            clock,
+            IdlePolicy::default(),
+        );
+        ready(&w, &fence).await;
+        let recorded = embedding_reference(&owner, &dir, &engine, &fence.deployment_id);
+        assert_eq!(
+            (
+                recorded.probe_kind.as_str(),
+                recorded.probe_version,
+                recorded.dimension,
+                recorded.vector.clone(),
+                recorded.tolerance,
+            ),
+            (
+                capyctl_adapters::embedding_probe::KIND,
+                capyctl_adapters::embedding_probe::VERSION,
+                4,
+                vec![0.6, 0.8, 0.0, 0.0],
+                crate::wake_canary::EMBEDDING_TOLERANCE,
+            )
+        );
+        // A vector that moved a little (relative distance about 0.0014).
+        engine.embeds(&[0.601, 0.799, 0.0, 0.0]);
+        for _ in 0..3 {
+            let wake = park_and_wake(&w, &dir, &fence).await;
+            until("woken", || operation(&owner, &wake).0 == "succeeded").await;
+            let (state, open, _, _) = instance(&dir, &fence.deployment_id);
+            assert_eq!((state.as_str(), open), ("ready", true));
+        }
+        assert_eq!(
+            engine.canaries.lock().unwrap().len(),
+            4,
+            "readiness and three wakes"
+        );
+        assert_eq!(last_error(&dir, &fence.deployment_id), None);
+        // The reference is the first readiness's, never a wake's.
+        assert_eq!(
+            embedding_reference(&owner, &dir, &engine, &fence.deployment_id).vector,
+            [0.6, 0.8, 0.0, 0.0]
+        );
+        w.shutdown().await.unwrap();
+    }
+}
+
+// T47 T20 (ADR 0036 §6): a wake whose vector has another dimension, or lies
+// beyond the tolerance, fails `wake_mismatch` and the instance is stopped,
+// as a differing chat canary is.
+#[tokio::test]
+async fn a_changed_dimension_or_a_distant_vector_fails_the_wake() {
+    let changes: [fn(&Residency); 2] = [
+        |engine| engine.embeds(&[0.6, 0.8, 0.0]),
+        |engine| engine.embeds(&[0.8, 0.6, 0.0, 0.0]),
+    ];
+    for change in changes {
+        let (dir, owner, fence, _engine, w, wake) =
+            decide_then_wake(|engine| engine.embeds(&[0.6, 0.8, 0.0, 0.0]), change).await;
+        until("released", || phase(&owner, &fence.deployment_id).is_none()).await;
+        let (state, open, _, _) = instance(&dir, &fence.deployment_id);
+        assert_eq!((state.as_str(), open), ("stopped", false));
+        assert_eq!(
+            last_error(&dir, &fence.deployment_id).as_deref(),
+            Some("wake_mismatch")
+        );
+        assert_ne!(operation(&owner, &wake).0, "succeeded");
+        w.shutdown().await.unwrap();
+    }
+}
+
+// T47 (ADR 0036 §6): a reference of another kind is never compared with an
+// embedding answer: the wake finds no usable reference, and the launch's
+// recorded reference stays the one it recorded.
+#[tokio::test]
+async fn a_decision_reference_is_never_compared_with_an_embedding_answer() {
+    let (dir, owner, fence, engine, w, wake) = decide_then_wake(
+        |engine| engine.decides("billing", 0.95, 0.02, 0.03),
+        |engine| engine.embeds(&[0.6, 0.8]),
+    )
+    .await;
+    until("woken", || operation(&owner, &wake).0 == "succeeded").await;
+    assert_eq!(last_error(&dir, &fence.deployment_id), None);
+    assert!(matches!(
+        reference(&owner, &dir, &engine, &fence.deployment_id),
+        Some(WakeCanaryReference::Decision(_))
+    ));
+    w.shutdown().await.unwrap();
+}
+
 // T20 (owner decision 2026-10-09): a new launch records its own reference;
 // the earlier launch's answer never judges it.
 #[tokio::test]
@@ -1317,6 +1652,7 @@ async fn a_new_launch_records_a_new_reference() {
         slot.clone(),
         clock.clone(),
         IdlePolicy::default(),
+        None,
     );
     ready(&w, &fence).await;
     let stop = w.stop("owner", &fence, "stop", 100_000).unwrap();
@@ -1450,6 +1786,7 @@ async fn a_failed_wake_is_stopped_and_starts_fresh(
         slot.clone(),
         clock.clone(),
         IdlePolicy::default(),
+        None,
     );
     ready(&w, &fence).await;
     let generation = instance(&dir, &fence.deployment_id).2;

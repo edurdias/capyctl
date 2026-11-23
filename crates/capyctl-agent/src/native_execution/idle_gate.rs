@@ -1,7 +1,8 @@
 //! Spec §5, ADR 0023 §6, ADR 0029 §10, ADR 0031 §6: before a Terminate
-//! signals a launch whose engine counts its own work (TensorFold's `/health`,
-//! llama.cpp's `/metrics`, a custom engine's idle signal), the host waits for
-//! those counters to read idle, bounded, after CapyCTL's own drain.
+//! signals a launch whose engine counts its own work (TensorFold 0.6's
+//! `/health`, TensorFold native's and llama.cpp's `/metrics` (ADR 0039 §10),
+//! a custom engine's idle signal), the host waits for those counters to read
+//! idle, bounded, after CapyCTL's own drain.
 use super::NativeHostExecution;
 use crate::session::SessionError;
 use capyctl_adapters::llamacpp::LlamacppAdapter;
@@ -33,9 +34,9 @@ impl NativeHostExecution {
     /// manifest, as it was approved: from its resolution, or, when that no
     /// longer resolves (a moved checkpoint, a changed port range), from the
     /// profile its plan names in the document it was approved under. Never
-    /// from the host's current profile set: `None` when that document is no
-    /// longer held, and the launch's idleness is then unknown (AGENTS.md:
-    /// uncertainty must retain accounting). A legacy retained launch, which
+    /// from the host's current profile set: an exact journal-bound set may
+    /// survive a restart (ADR 0018 §3), otherwise idleness is unknown and
+    /// accounting stays retained. A legacy retained launch, which
     /// resolves against today's document (owner decision 2026-09-22),
     /// predates custom engines, so a custom engine found that way is not
     /// taken as its own.
@@ -44,13 +45,38 @@ impl NativeHostExecution {
         owned: &MemberCommand,
         plan: &SingleLaunchPlan,
     ) -> Option<(Engine, Option<CustomProfile>)> {
-        let set = self.profiles.for_fingerprint(&plan.host_policy_fingerprint);
+        let set = self.retained_profile(owned).ok().flatten();
         if let Ok(effective) = self.resolve_retained(owned) {
             if set.is_some() || effective.profile.engine != Engine::Custom {
                 return Some((effective.profile.engine, effective.profile.custom));
             }
         }
         super::custom::frozen_profile(set.as_deref()?, &plan.profile_name)
+    }
+
+    /// ADR 0039 §1, §10: the TensorFold line a retained launch was approved
+    /// under, which decides its idle read (`/health` on 0.6, `/metrics` on
+    /// the native line): from its resolution, else from the profile its plan
+    /// names in the document it was approved under (no `line` there is the
+    /// Python line).
+    pub(super) fn frozen_line(
+        &self,
+        owned: &MemberCommand,
+        plan: &SingleLaunchPlan,
+    ) -> capyctl_config::tensorfold_native::TensorfoldLine {
+        if let Ok(effective) = self.resolve_retained(owned) {
+            return effective.profile.line;
+        }
+        self.retained_profile(owned)
+            .ok()
+            .flatten()
+            .and_then(|set| {
+                serde_json::from_value(
+                    set.config.document["runtime_profiles"][&plan.profile_name]["line"].clone(),
+                )
+                .ok()
+            })
+            .unwrap_or_default()
     }
 
     /// Spec §5, ADR 0023 §6: whether a Terminate of `owned_handle` may signal.
@@ -118,8 +144,9 @@ impl NativeHostExecution {
     /// llama.cpp, answers 503), or the bound (`ENGINE_IDLE_BOUND` or the
     /// command's remaining time) passed without a busy answer. A launch whose
     /// engine keeps no such counters (vLLM and SGLang drain on CapyCTL's own
-    /// leases, a custom engine without an idle signal) is clear by this check.
-    /// A launch whose approved profile is no longer held is not: its
+    /// leases, a custom engine without an idle signal, TensorRT-LLM, whose
+    /// `/metrics` is never idle evidence, ADR 0038 §7) is clear by this
+    /// check. A launch whose approved profile is no longer held is not: its
     /// idleness is unknown, so it waits the whole bound, as an idle signal
     /// that never answers does.
     pub(crate) async fn idle_before_terminate(
@@ -143,6 +170,11 @@ impl NativeHostExecution {
                 // ADR 0031 §6: without an idle signal the stop proceeds on
                 // CapyCTL's own drain.
                 Engine::Custom if idle_signal.is_some() => {}
+                // ADR 0038 §7: TensorRT-LLM reports no idle signal, so its
+                // stop proceeds on CapyCTL's own drain too; reading
+                // `/metrics` here would also consume the load sampler's
+                // entries.
+                Engine::TensorrtLlm => return true,
                 _ => return true,
             }
         }
@@ -197,7 +229,10 @@ impl NativeHostExecution {
                     Err(_) => return false,
                 }
             }
-            _ => Box::new(TensorfoldAdapter::new(endpoint, fingerprint, String::new())),
+            _ => Box::new(
+                TensorfoldAdapter::new(endpoint, fingerprint, String::new())
+                    .with_line(self.frozen_line(owned, plan)),
+            ),
         };
         let member = MemberRef {
             deployment_id: owned.identity.deployment_id.clone(),

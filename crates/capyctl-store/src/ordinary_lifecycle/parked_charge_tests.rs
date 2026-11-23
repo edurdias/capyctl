@@ -231,6 +231,7 @@ impl Lab {
                     receipt: "fake host".into(),
                     facts: kind.facts().to_vec(),
                     kernel_builds: Vec::new(),
+                    extraction_probe: None,
                 },
                 now,
             )

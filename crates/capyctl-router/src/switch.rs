@@ -59,6 +59,47 @@ pub struct WakeJoin<E> {
 struct JoinSlot<E> {
     tx: tokio::sync::watch::Sender<Option<Result<u64, E>>>,
     claimed: std::sync::atomic::AtomicBool,
+    /// ADR 0037 §4: the activation's root span context, set by the caller
+    /// that started it, under the map's lock, before anyone can join.
+    activation: std::sync::OnceLock<capyctl_trace::SpanCx>,
+}
+
+impl<E> JoinSlot<E> {
+    fn new() -> Self {
+        Self {
+            tx: tokio::sync::watch::channel(None).0,
+            claimed: std::sync::atomic::AtomicBool::new(false),
+            activation: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+/// ADR 0037 §4: what a request learned on joining an activation: whether it
+/// started it, and the activation trace's root span to link to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Joined {
+    pub started: bool,
+    pub activation: Option<capyctl_trace::SpanCx>,
+}
+
+/// The wait for a joined activation's outcome.
+pub struct JoinWait<E> {
+    // Holds the slot, and with it the sender, so `changed` returns only when
+    // the outcome lands.
+    _slot: Arc<JoinSlot<E>>,
+    rx: tokio::sync::watch::Receiver<Option<Result<u64, E>>>,
+}
+
+impl<E: Clone> JoinWait<E> {
+    /// The activation's outcome.
+    pub async fn outcome(mut self) -> Result<u64, E> {
+        loop {
+            if let Some(r) = self.rx.borrow().clone() {
+                return r;
+            }
+            let _ = self.rx.changed().await;
+        }
+    }
 }
 
 impl<E: Clone> Default for WakeJoin<E> {
@@ -88,12 +129,7 @@ impl<E: Clone> WakeJoin<E> {
             let mut wakes = self.wakes.lock().unwrap();
             let slot = wakes
                 .entry(key.to_string())
-                .or_insert_with(|| {
-                    Arc::new(JoinSlot {
-                        tx: tokio::sync::watch::channel(None).0,
-                        claimed: std::sync::atomic::AtomicBool::new(false),
-                    })
-                })
+                .or_insert_with(|| Arc::new(JoinSlot::new()))
                 .clone();
             let rx = slot.tx.subscribe();
             (slot, rx)
@@ -142,22 +178,55 @@ impl<E: Clone + Send + Sync + 'static> WakeJoin<E> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<u64, E>> + Send + 'static,
     {
-        let (slot, mut rx) = {
+        let tracing = capyctl_trace::Tracing::off();
+        let (_, wait) = self.join_detached_traced(key, |_| wake(), aborted, &tracing);
+        wait.outcome().await
+    }
+
+    /// As [`WakeJoin::join_detached`], tracing the activation (ADR 0037 §4):
+    /// the caller that starts it opens the activation trace's root span,
+    /// `capyctl.activation`, and hands it to `wake`; every caller learns, at
+    /// once, whether it started the activation and the root span's context,
+    /// so its own wait can link to it however long it waits.
+    pub fn join_detached_traced<F, Fut>(
+        self: &Arc<Self>,
+        key: &str,
+        wake: F,
+        aborted: E,
+        tracing: &capyctl_trace::Tracing,
+    ) -> (Joined, JoinWait<E>)
+    where
+        F: FnOnce(capyctl_trace::Span) -> Fut,
+        Fut: Future<Output = Result<u64, E>> + Send + 'static,
+    {
+        let (slot, rx, root) = {
             let mut wakes = self.wakes.lock().unwrap_or_else(|p| p.into_inner());
             let slot = wakes
                 .entry(key.to_string())
-                .or_insert_with(|| {
-                    Arc::new(JoinSlot {
-                        tx: tokio::sync::watch::channel(None).0,
-                        claimed: std::sync::atomic::AtomicBool::new(false),
-                    })
-                })
+                .or_insert_with(|| Arc::new(JoinSlot::new()))
                 .clone();
             let rx = slot.tx.subscribe();
-            (slot, rx)
+            // Claimed under the lock, so a caller that joins always finds
+            // the root span's context already set.
+            let root = (!slot.claimed.swap(true, std::sync::atomic::Ordering::SeqCst)).then(|| {
+                let root = tracing.span(
+                    capyctl_trace::Name::Activation,
+                    capyctl_trace::Parent::Root,
+                    &[],
+                );
+                if let Some(cx) = root.cx() {
+                    let _ = slot.activation.set(cx);
+                }
+                root
+            });
+            (slot, rx, root)
         };
-        if !slot.claimed.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            let task = wake();
+        let joined = Joined {
+            started: root.is_some(),
+            activation: slot.activation.get().copied(),
+        };
+        if let Some(root) = root {
+            let task = wake(root);
             let join = self.clone();
             let owned = slot.clone();
             let key = key.to_string();
@@ -173,14 +242,7 @@ impl<E: Clone + Send + Sync + 'static> WakeJoin<E> {
                 publish.send(outcome);
             });
         }
-        loop {
-            if let Some(r) = rx.borrow().clone() {
-                return r;
-            }
-            // The slot (and its sender) is held here, so `changed` returns
-            // only when the outcome lands.
-            let _ = rx.changed().await;
-        }
+        (joined, JoinWait { _slot: slot, rx })
     }
 }
 

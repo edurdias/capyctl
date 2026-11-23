@@ -81,6 +81,25 @@ fn a_pre_e1_sglang_revision_migrates_with_the_pinned_values_explicit() {
     decode_effective_snapshot(&migrated.effective_json).unwrap();
 }
 
+// T14 T33 — ADR 0014 §2 / #236: the new phase object exactly represents
+// independent graph policy from an accepted pre-E1 SGLang revision.
+#[test]
+fn pre_e1_sglang_independent_graph_phases_migrate_without_approximation() {
+    for (prefill, decode) in [(false, true), (true, false)] {
+        let mut legacy = fixture("sglang");
+        legacy["profile"]["launch_settings"]["prefill_cuda_graphs"] = json!(prefill);
+        legacy["profile"]["launch_settings"]["decode_cuda_graphs"] = json!(decode);
+        let migrated = migrate_legacy_effective(&legacy.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            migrated.engine_config["cuda_graphs"],
+            json!({"prefill": prefill, "decode": decode})
+        );
+        decode_effective_snapshot(&migrated.effective_json).unwrap();
+    }
+}
+
 fn refused(mutate: impl FnOnce(&mut Value), engine: &str) -> String {
     let mut legacy = fixture(engine);
     mutate(&mut legacy);

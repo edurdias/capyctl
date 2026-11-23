@@ -146,6 +146,89 @@ fn an_installation_cuda_home_is_published_only_when_named() {
         .is_none());
 }
 
+/// ADR 0039 §1, §2: TensorFold's native line is published as `line: native`
+/// (and a registered profile keeps its `native` record), like `cuda_home`,
+/// only for a `tensorfold-native` installation; the 0.6 profile beside it
+/// publishes neither, and every one passes the profile rules.
+// T41
+#[test]
+fn a_native_tensorfold_profile_publishes_its_line_beside_the_06_one() {
+    use capyctl_config::tensorfold_native::{NativeRegistration, TensorfoldLine};
+    let spec = |executable: &str, version: &str, line: TensorfoldLine| {
+        capyctl_config::registration::ProfileSpec {
+            engine: Engine::Tensorfold,
+            executable: executable.into(),
+            build_fingerprint: version.into(),
+            deep_park: false,
+            installation_drift: Default::default(),
+            args: vec![],
+            cuda_home: None,
+            approved_options: vec![],
+            approved_paths: vec![],
+            env: Default::default(),
+            approved_env: vec![],
+            trust_remote_code: false,
+            lmcache: None,
+            line,
+            native: line.is_native().then(|| NativeRegistration {
+                families: [("nemotron_h".to_owned(), vec!["mlx-q4g64".to_owned()])].into(),
+                checksums_verified: false,
+            }),
+        }
+    };
+    let registered = |executable: &str, version: &str, line: TensorfoldLine| {
+        let mut installation = installed(Engine::Tensorfold, executable);
+        installation.build_fingerprint = version.into();
+        installation.registered = Some(capyctl_config::registration::profile_document(&spec(
+            executable, version, line,
+        )));
+        installation
+    };
+    let python = registered("/opt/tf/bin/tensorfold", "0.6.6", TensorfoldLine::Python);
+    let native = registered(
+        "/opt/tensorfold-1.1.5/bin/tensorfold-native",
+        "1.1.5",
+        TensorfoldLine::Native,
+    );
+    let mut local = installed(
+        Engine::Tensorfold,
+        "/home/u/tensorfold-1.0.0/bin/tensorfold-native",
+    );
+    local.build_fingerprint = "1.0.0".into();
+    let host = host_policy(
+        &[
+            ("tensorfold", python),
+            ("tensorfold-1-1-5", native),
+            ("local-tensorfold", local),
+        ]
+        .map(|(profile, installation)| {
+            capyctl_controller::engine_provider::NamedInstallation {
+                profile: profile.into(),
+                installation,
+            }
+        }),
+        "env-1",
+        CAPACITY,
+        None,
+        &HostShape::NoGpu,
+        PORTS,
+    );
+    let profiles = &host["runtime_profiles"];
+    assert!(profiles["tensorfold"].get("line").is_none());
+    assert!(profiles["tensorfold"].get("native").is_none());
+    assert_eq!(profiles["tensorfold-1-1-5"]["line"], "native");
+    assert_eq!(
+        profiles["tensorfold-1-1-5"]["native"]["checksums_verified"],
+        false
+    );
+    assert_eq!(profiles["local-tensorfold"]["line"], "native");
+    assert!(profiles["local-tensorfold"].get("native").is_none());
+    for name in ["tensorfold", "tensorfold-1-1-5", "local-tensorfold"] {
+        capyctl_config::registration::check_profile(name, &profiles[name])
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+    }
+}
+
 /// Deep-park paths are the host's decision, not the adapter's (SPEC §9.1, T21), so
 /// the profile must carry the host's switch, including an opt-out, rather than
 /// leaving it to be re-derived.
@@ -243,7 +326,6 @@ fn the_installation_drift_policy_is_carried_by_the_profile() {
             "d",
             "d",
             &local("/srv/models/d"),
-            Engine::Vllm,
             &TemplateMemory::Unified {
                 capacity_bytes: CAPACITY,
             },
@@ -348,7 +430,6 @@ fn every_phase_is_declared_and_the_peak_is_a_transition() {
         "m",
         "m",
         &local("/models/m"),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -387,7 +468,6 @@ fn a_parked_deployment_holds_no_device() {
         "m",
         "m",
         &local("/models/m"),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -417,7 +497,6 @@ fn the_deployment_names_its_installation() {
         "m",
         "route-m",
         &local("/models/m"),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -438,7 +517,6 @@ fn the_deployment_states_its_model_source() {
         "m",
         "m",
         &local("/models/m"),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -459,7 +537,6 @@ fn the_deployment_states_its_model_source() {
             files: vec![],
             token_ref: None,
         },
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -516,7 +593,6 @@ fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
         "m",
         "m",
         &local("/models/m"),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -555,7 +631,6 @@ fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
         "m",
         "m",
         &local("/models/m"),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -586,7 +661,6 @@ fn a_standalone_deployment_with_a_group_topology_is_refused() {
         "m",
         "m",
         &local("/models/m"),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -710,6 +784,76 @@ fn an_environment_tensorfold_is_checked_and_never_parks() {
     }
 }
 
+/// ADR 0039 §2: `--tensorfold-bin` naming a native release's
+/// `tensorfold-native` is the native line: no toolchain check (none exists
+/// here), its version read by the standard-output check, no CUDA toolkit
+/// published, deep park off, and the published profile says `line: native`.
+// T41
+#[test]
+fn a_native_tensorfold_bin_needs_no_toolchain_and_publishes_line_native() {
+    use crate::roles::EngineProvider as _;
+    let Some(_guard) =
+        isolated("a_native_tensorfold_bin_needs_no_toolchain_and_publishes_line_native")
+    else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("a temporary installation");
+    std::env::set_var("CAPYCTL_MODELS_ROOT", dir.path());
+    std::env::set_var("CAPYCTL_RUNTIME_DIR", private_runtime(dir.path()));
+    std::env::set_var("CAPYCTL_CUDA_HOME", "/usr/local/cuda");
+    std::env::remove_var("CAPYCTL_DEEP_PARK");
+    let root = dir.path().join("tensorfold-1.0.0");
+    let bin = root.join("bin/tensorfold-native");
+    std::fs::create_dir_all(bin.parent().unwrap()).expect("a bin directory");
+    capyctl_config::test_support::write_executable(
+        &bin,
+        "#!/bin/sh\necho 'tensorfold-native 1.0.0'\n",
+        0o700,
+    )
+    .expect("the engine script");
+    std::fs::write(root.join("VERSION"), "1.0.0\n").expect("VERSION");
+    let named = crate::roles::EnvEngineProvider::new()
+        .with_flags(capyctl_config::engine_settings::EngineOverrides {
+            tensorfold: Some(bin.clone()),
+            ..Default::default()
+        })
+        .with_toolchain_search(capyctl_config::toolchain::ToolchainSearch {
+            system: String::new(),
+            default_cuda_home: dir.path().join("no-cuda"),
+            ..Default::default()
+        })
+        .installations(&Default::default())
+        .expect("a native release needs no toolchain");
+    assert_eq!(named.len(), 1);
+    let installation = &named[0].installation;
+    assert_eq!(installation.engine, Engine::Tensorfold);
+    assert_eq!(installation.build_fingerprint, "1.0.0");
+    assert!(!installation.deep_park);
+    assert_eq!(installation.cuda_home, None);
+    let host = host_policy(&named, "env-1", CAPACITY, None, &HostShape::NoGpu, PORTS);
+    let profile = &host["runtime_profiles"]["local"];
+    assert_eq!(profile["line"], "native");
+    assert!(profile.get("cuda_home").is_none(), "{profile}");
+    // A VERSION that disagrees with the binary refuses the start.
+    std::fs::write(root.join("VERSION"), "1.0.1\n").expect("VERSION");
+    let message = crate::roles::EnvEngineProvider::new()
+        .with_flags(capyctl_config::engine_settings::EngineOverrides {
+            tensorfold: Some(bin),
+            ..Default::default()
+        })
+        .installation()
+        .expect_err("a disagreeing VERSION refuses the start")
+        .to_string();
+    assert!(message.contains("engine_version_failed"), "{message}");
+    for name in [
+        "CAPYCTL_MODELS_ROOT",
+        "CAPYCTL_RUNTIME_DIR",
+        "CAPYCTL_CUDA_HOME",
+    ] {
+        std::env::remove_var(name);
+    }
+}
+
 /// ADR 0029 §2: a role's own llama.cpp is declared by CAPYCTL_LLAMACPP_BIN,
 /// publishes `<version>+<commit>` read from `--version`'s standard error with
 /// deep park off, is `local-llamacpp` beside another engine, and is refused
@@ -784,6 +928,86 @@ fn an_environment_llamacpp_is_checked_and_never_parks() {
     }
 }
 
+/// ADR 0038 §2: a role's own TensorRT-LLM is declared by
+/// CAPYCTL_TENSORRT_LLM_BIN and built as `engine add` builds it: the version
+/// and companion versions read by the metadata-only check under the
+/// environment's interpreter (never `trtllm-serve`), deep park off whatever
+/// the default says, the companions published with the profile, and
+/// `local-tensorrt-llm` beside another engine.
+// T49 T03
+#[test]
+fn an_environment_tensorrt_llm_is_checked_and_never_parks() {
+    use crate::roles::EngineProvider as _;
+    let Some(_guard) = isolated("an_environment_tensorrt_llm_is_checked_and_never_parks") else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("a temporary installation");
+    std::env::set_var("CAPYCTL_MODELS_ROOT", dir.path());
+    std::env::set_var("CAPYCTL_RUNTIME_DIR", private_runtime(dir.path()));
+    std::env::remove_var("CAPYCTL_DEEP_PARK");
+    std::env::remove_var("CAPYCTL_ENGINE_FINGERPRINT");
+    let venv = dir.path().join("tensorrt-llm-1.2.1-venv");
+    let site = venv.join("lib/python3.12/site-packages");
+    let dist = site.join("tensorrt_llm-1.2.1.dist-info");
+    std::fs::create_dir_all(&dist).expect("a dist-info");
+    std::fs::create_dir_all(site.join("tensorrt_llm")).expect("the package");
+    std::fs::write(
+        dist.join("METADATA"),
+        "Name: tensorrt_llm\nVersion: 1.2.1\n",
+    )
+    .expect("the metadata");
+    std::fs::create_dir_all(venv.join("bin")).expect("a bin directory");
+    let marker = dir.path().join("served");
+    let bin = venv.join("bin/trtllm-serve");
+    capyctl_config::test_support::write_executable(
+        &bin,
+        format!("#!/bin/sh\ntouch {}\n", marker.display()),
+        0o700,
+    )
+    .expect("the console script");
+    capyctl_config::test_support::write_executable(
+        &venv.join("bin/python3"),
+        "#!/bin/sh\n[ \"$1\" = -I ] || exit 9\nprintf 'tensorrt_llm 1.2.1\\ntorch 2.9.1+cu130\\n\
+         tensorrt 10.14.1.48\\nflashinfer-python 0.6.4\\ntransformers 4.57.3\\nmpi4py 4.1.1\\n'\n",
+        0o700,
+    )
+    .expect("the interpreter");
+    std::env::set_var("CAPYCTL_TENSORRT_LLM_BIN", &bin);
+    let named = crate::roles::EnvEngineProvider::new()
+        .installations(&Default::default())
+        .expect("the environment declares an installation");
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0].profile, "local");
+    let installation = &named[0].installation;
+    assert_eq!(installation.engine, Engine::TensorrtLlm);
+    assert_eq!(installation.build_fingerprint, "1.2.1");
+    assert!(!installation.deep_park);
+    let host = host_policy(&named, "env-1", CAPACITY, None, &HostShape::NoGpu, PORTS);
+    let profile = &host["runtime_profiles"]["local"];
+    assert_eq!(profile["engine"], "tensorrt-llm");
+    assert_eq!(profile["security"]["deep_park"], "disabled");
+    assert_eq!(profile["companions"]["torch"], "2.9.1+cu130");
+    assert_eq!(profile["companions"]["mpi4py"], "4.1.1");
+    capyctl_config::registration::check_profile("local", profile)
+        .expect("the published profile passes the resolution rules");
+
+    std::env::set_var("CAPYCTL_VLLM_BIN", fake_engine_bin(dir.path()));
+    let named = crate::roles::EnvEngineProvider::new()
+        .installations(&Default::default())
+        .expect("two installations");
+    let profiles: Vec<&str> = named.iter().map(|n| n.profile.as_str()).collect();
+    assert_eq!(profiles, ["local-vllm", "local-tensorrt-llm"]);
+    std::env::remove_var("CAPYCTL_VLLM_BIN");
+    assert!(!marker.exists(), "trtllm-serve ran");
+    for name in [
+        "CAPYCTL_TENSORRT_LLM_BIN",
+        "CAPYCTL_MODELS_ROOT",
+        "CAPYCTL_RUNTIME_DIR",
+    ] {
+        std::env::remove_var(name);
+    }
+}
+
 /// Spec §7: the host policy built from the environment carries the model store,
 /// the deep-park switch and the flags the profile passes, and the deployment
 /// standalone generates carries the engine configuration (ADR 0014 §1) — and
@@ -835,7 +1059,6 @@ fn host_policy_from_env_is_complete() {
         "m",
         "m",
         &local(models.join("m").to_str().expect("a utf-8 path")),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -1138,7 +1361,6 @@ fn an_sglang_host_that_opts_out_of_deep_park_deploys_restart_only() {
         "m",
         "m",
         &local(models.join("m").to_str().expect("a utf-8 path")),
-        installation.engine,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },
@@ -1173,12 +1395,11 @@ fn an_sglang_host_that_opts_out_of_deep_park_deploys_restart_only() {
 // T21
 #[test]
 fn the_residency_follows_the_deep_park_switch_for_every_engine() {
-    let residency = |engine, deep_park| {
+    let residency = |deep_park| {
         deployment_document(
             "m",
             "m",
             &local("/models/m"),
-            engine,
             &TemplateMemory::Unified {
                 capacity_bytes: CAPACITY,
             },
@@ -1189,10 +1410,8 @@ fn the_residency_follows_the_deep_park_switch_for_every_engine() {
         .expect("the unified template")["residency"]
             .clone()
     };
-    assert_eq!(residency(Engine::Sglang, true), "deep");
-    assert_eq!(residency(Engine::Sglang, false), "restart_only");
-    assert_eq!(residency(Engine::Vllm, true), "deep");
-    assert_eq!(residency(Engine::Vllm, false), "restart_only");
+    assert_eq!(residency(true), "deep");
+    assert_eq!(residency(false), "restart_only");
 }
 
 /// SPEC §3.3 / ADR 0001 (owner decision 2026-09-24): without
@@ -1311,6 +1530,8 @@ fn registered(executable: &std::path::Path) -> serde_json::Map<String, serde_jso
             approved_env: vec![],
             trust_remote_code: false,
             lmcache: None,
+            line: Default::default(),
+            native: None,
         },
     );
     [("vllm-patched".to_string(), profile)]
@@ -1501,7 +1722,6 @@ fn source() -> ModelSource {
 fn a_discrete_template_states_a_request_and_derives_phases() {
     let memory = TemplateMemory::Device {
         managed_limit: 15 << 30,
-        device_total: 16376 << 20,
         weights_bytes: Some(6 << 30),
         system_parked_limit: 15 << 30,
         kv_cache_bytes: None,
@@ -1510,7 +1730,6 @@ fn a_discrete_template_states_a_request_and_derives_phases() {
         "a",
         "a",
         &source(),
-        Engine::Sglang,
         &memory,
         DEFAULT_REQUEST_DEADLINE,
         true,
@@ -1521,7 +1740,7 @@ fn a_discrete_template_states_a_request_and_derives_phases() {
     // The picker chooses the GPU (discrete GPU design §7); the deployment
     // parser requires the key, so the template pins nothing with an empty list.
     assert_eq!(doc["devices"], serde_json::json!([]));
-    let (request, kv) = device_request(Engine::Sglang, 6 << 30, 15 << 30, 16376 << 20);
+    let (request, kv) = device_request(6 << 30, 15 << 30);
     assert_eq!(kv, (15i64 << 30) / 4); // min(4 GiB, 3.75 GiB)
     assert_eq!(
         doc["engine_config"]["memory"]["request"],
@@ -1531,14 +1750,11 @@ fn a_discrete_template_states_a_request_and_derives_phases() {
     assert_eq!(doc["residency"], "host_backed");
 }
 
-// T26: vLLM's request never falls below 0.75 of the card.
+// T26 — ADR 0019 §§3–4, #225: derived requests have no card-share floor.
 #[test]
-fn the_vllm_request_has_a_floor() {
-    let (small, _) = device_request(Engine::Vllm, 2 << 30, 15 << 30, 16376 << 20);
-    assert!(small >= (16376i64 << 20) / 100 * 75);
-    // SGLang has no floor: weights x 1.10 plus the KV cache.
-    let (sglang, kv) = device_request(Engine::Sglang, 2 << 30, 15 << 30, 16376 << 20);
-    assert_eq!(sglang, (2i64 << 30) / 100 * 110 + kv);
+fn the_vllm_request_follows_weights_and_kv_without_a_floor() {
+    let (small, kv) = device_request(2 << 30, 15 << 30);
+    assert_eq!(small, (2i64 << 30) / 100 * 110 + kv);
 }
 
 // Owner decision 2: host_backed is the discrete default when the copy fits.
@@ -1566,7 +1782,6 @@ fn the_default_tier_follows_the_host() {
 fn a_model_larger_than_the_device_is_refused() {
     let memory = TemplateMemory::Device {
         managed_limit: 15 << 30,
-        device_total: 16376 << 20,
         weights_bytes: Some(16 << 30),
         system_parked_limit: 15 << 30,
         kv_cache_bytes: None,
@@ -1575,7 +1790,6 @@ fn a_model_larger_than_the_device_is_refused() {
         "a",
         "a",
         &source(),
-        Engine::Vllm,
         &memory,
         DEFAULT_REQUEST_DEADLINE,
         true,
@@ -1587,7 +1801,7 @@ fn a_model_larger_than_the_device_is_refused() {
         TemplateError::InsufficientDeviceMemory { .. }
     ));
     assert!(error.to_string().starts_with("insufficient_device_memory"));
-    let (request, _) = device_request(Engine::Vllm, 16 << 30, 15 << 30, 16376 << 20);
+    let (request, _) = device_request(16 << 30, 15 << 30);
     let charged = request + capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
     assert!(error.to_string().contains(&charged.to_string()), "{error}");
     assert!(
@@ -1605,7 +1819,6 @@ fn the_unified_template_is_unchanged() {
         "a",
         "a",
         &source(),
-        Engine::Vllm,
         &TemplateMemory::Unified {
             capacity_bytes: 128 << 30,
         },
@@ -1643,10 +1856,8 @@ fn the_discrete_template_resolves_and_fits_the_card() {
             "a",
             "a",
             &source(),
-            engine,
             &TemplateMemory::Device {
                 managed_limit: limits.managed_limit,
-                device_total: gpu.total_bytes,
                 weights_bytes: Some(6 * GIB),
                 system_parked_limit: system_parked,
                 kv_cache_bytes: None,
@@ -1712,7 +1923,6 @@ fn card_memory(weights_bytes: Option<i64>, kv_cache_bytes: Option<i64>) -> Templ
     let gpu = rtx(0, 16376, 1536).memory.unwrap();
     TemplateMemory::Device {
         managed_limit: device_limits(&gpu, MAX_PARKED).managed_limit,
-        device_total: gpu.total_bytes,
         weights_bytes,
         system_parked_limit: 61 * GIB / 100 * PARKED_FRACTION,
         kv_cache_bytes,
@@ -1731,7 +1941,6 @@ fn a_remote_source_on_a_discrete_host_is_sized_once_downloaded() {
             "a",
             "a",
             &hugging_face(),
-            engine,
             &card_memory(None, None),
             DEFAULT_REQUEST_DEADLINE,
             true,
@@ -1774,12 +1983,7 @@ fn a_remote_source_on_a_discrete_host_is_sized_once_downloaded() {
         .unwrap_or_else(|error| panic!("{engine:?}: {error}"));
         let (_, device) = sized.ready_device_allocation().expect("on the card");
         let gpu = rtx(0, 16376, 1536).memory.unwrap();
-        let (local, _) = device_request(
-            engine,
-            8 * GIB,
-            device_limits(&gpu, MAX_PARKED).managed_limit,
-            gpu.total_bytes,
-        );
+        let (local, _) = device_request(8 * GIB, device_limits(&gpu, MAX_PARKED).managed_limit);
         assert_eq!(
             device,
             local + capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES,
@@ -1791,7 +1995,6 @@ fn a_remote_source_on_a_discrete_host_is_sized_once_downloaded() {
         "a",
         "a",
         &hugging_face(),
-        Engine::Vllm,
         &card_memory(None, None),
         DEFAULT_REQUEST_DEADLINE,
         false,
@@ -1810,7 +2013,6 @@ fn a_declared_kv_cache_is_honoured_within_the_card_or_refused() {
         "a",
         "a",
         &source(),
-        Engine::Sglang,
         &card_memory(Some(8 * GIB), Some(2 * GIB)),
         DEFAULT_REQUEST_DEADLINE,
         true,
@@ -1830,7 +2032,6 @@ fn a_declared_kv_cache_is_honoured_within_the_card_or_refused() {
         "a",
         "a",
         &hugging_face(),
-        Engine::Sglang,
         &card_memory(None, Some(2 * GIB)),
         DEFAULT_REQUEST_DEADLINE,
         true,
@@ -1848,7 +2049,6 @@ fn a_declared_kv_cache_is_honoured_within_the_card_or_refused() {
             "a",
             "a",
             &source(),
-            Engine::Sglang,
             &card_memory(weights, Some(kv)),
             DEFAULT_REQUEST_DEADLINE,
             true,
@@ -2015,25 +2215,20 @@ fn the_standalone_installation_follows_flag_env_document_default() {
     }
 }
 
-// T26 (final review I3): found live on the discrete-GPU laptop host, vLLM
-// 0.29 held 13.2 GiB of the 16 GB card against a 12.0 GiB reservation (the
-// CUDA context and graphs sit outside the request). The device domain is now
-// charged the request plus that overhead, so the planner's figure and what
-// the launch check sees on the card agree; before, the ledger under-charged
-// the card by about 1.2 GiB.
+// T26 T11 (ADR 0019 §3–4, issue #225): removing the derived request's 75%
+// floor does not remove the separate CUDA-context charge. Historical held-byte
+// measurements from the old floored launch are not evidence for this smaller
+// launch; live confirmation on vLLM 0.32.0 and 0.33.0 remains pending.
 #[test]
-fn a_discrete_charge_covers_what_vllm_holds_on_the_card() {
-    const MEASURED_HELD: i64 = 13_516 << 20; // 13.2 GiB
+fn a_discrete_charge_adds_vllm_context_to_its_no_floor_request() {
     let gpu = rtx(0, 16376, 1536).memory.unwrap();
     let limits = device_limits(&gpu, MAX_PARKED);
     let weights = 8_040_000_000;
-    let (request, _) = device_request(Engine::Vllm, weights, limits.managed_limit, gpu.total_bytes);
-    assert!(request < MEASURED_HELD, "the request alone under-charges");
+    let (request, _) = device_request(weights, limits.managed_limit);
     let doc = deployment_document(
         "a",
         "a",
         &source(),
-        Engine::Vllm,
         &card_memory(Some(weights), None),
         DEFAULT_REQUEST_DEADLINE,
         true,
@@ -2054,7 +2249,10 @@ fn a_discrete_charge_covers_what_vllm_holds_on_the_card() {
         capyctl_config::effective::resolve_effective_with_checkpoint(&chosen, &host, facts)
             .unwrap();
     let (_, charged) = effective.ready_device_allocation().unwrap();
-    assert!(charged >= MEASURED_HELD, "{charged} < {MEASURED_HELD}");
+    assert_eq!(
+        charged,
+        request + capyctl_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES
+    );
     assert!(charged <= limits.managed_limit);
     // vLLM is still told the request, not the charge: the overhead is what it
     // holds beyond the fraction capyctl renders.
@@ -2098,6 +2296,8 @@ fn drafter_profile(options: &[&str], paths: &[&str]) -> serde_json::Value {
         approved_env: vec![],
         trust_remote_code: false,
         lmcache: None,
+        line: Default::default(),
+        native: None,
     })
 }
 
@@ -2124,7 +2324,6 @@ fn drafter_on_standalone(
         "d",
         "d",
         &local("/srv/models/d"),
-        Engine::Tensorfold,
         &TemplateMemory::Unified {
             capacity_bytes: CAPACITY,
         },

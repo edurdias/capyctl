@@ -104,6 +104,15 @@ maps to whichever switch the installed build accepts; a build that has none refu
 field at launch with a named error. A typed field and its native spelling in `extra_args`
 together are a duplicate and refused.
 
+Owner decision 2026-11-09 (#236, 0.2.0): SGLang also accepts
+`cuda_graphs: {prefill: bool, decode: bool}`, with both keys required.
+A false phase renders SGLang 0.5.22's `--disable-prefill-cuda-graph` or
+`--disable-decode-cuda-graph` and its disabled backend; a true phase leaves
+the native policy unchanged. Scalar booleans keep their existing encoding
+and behavior. Other engines refuse the object. An enrolled host must declare
+`cuda_graph_phases` before receiving it (ADR 0017); old scalar launches
+remain compatible. Legacy independent phase settings migrate exactly.
+
 ### 3. Reserved settings (always refused, rendered by mllm)
 
 **vLLM** keeps `VLLM_RESERVED_FLAGS` (`engine_policy.rs:13-40`: host, port, model,
