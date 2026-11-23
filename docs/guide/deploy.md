@@ -271,42 +271,54 @@ with the new answers.
 
 ## Extraction models
 
-An extraction model returns typed values from a text state and, optionally,
-images in one forward pass, without generating tokens. It answers `fields`
-on `POST /v1/systemone`, not a decision model's `questions`
-([Extraction requests](requests.md#extraction-requests)).
+Extraction is an engine capability: an engine returns typed values for `fields`
+on `POST /v1/systemone`, rather than a decision model's `questions`
+([Extraction requests](requests.md#extraction-requests)). The checkpoint must
+support the engine's extraction implementation; this is not a model-specific
+server integration.
 
-Only a [custom engine](engines.md#custom-engines) with `api: extractions`
-can serve it. Every native engine at every version is refused with
-`capability_missing:extractions`. The manifest declares the types it answers:
+The current built-in engine paths refuse `api: extractions` with
+`capability_missing:extractions`. Native support requires a qualified amendment;
+choosing a newer version or renaming a built-in profile does not enable it.
+A patched or custom variant of vLLM, SGLang, llama.cpp, TensorRT-LLM or
+TensorFold can instead use the existing [custom-engine registration](engines.md#example-a-patched-extraction-engine),
+provided it serves the `fields` contract. The manifest declares the types it
+actually answers. For a patched vLLM executable, for example:
 
-```yaml title="shardio-extract.yaml"
+```yaml title="vllm-extraction.yaml"
 kind: custom_engine
 schema_version: 1
 api: extractions
 field_types: [text, number, date, time, datetime, duration, list, estimate, forecast]
-version: "0.1.0"
-args: [--host, "{host}", --port, "{port}", --model, "{model_dir}", --served-name, "{served_name}"]
+args: [serve, "{model_dir}", --host, "{host}", --port, "{port}", --served-model-name, "{served_name}", --max-model-len, "{context_length}"]
 health: /health
 ```
 
-For a registered profile named `shardio-extract`, a deployment might be:
+For a registered profile named `vllm-extraction`, a deployment might be:
 
 ```yaml title="extractor.yaml"
-name: extract-4b
-engine: shardio-extract
-model: ShardioAI/extract-4b
+name: extractor
+engine: vllm-extraction
+model: example/extractor
 api: extractions
 resources: {gpu: 16GiB, ram: 8GiB}
+engine_config: {context_length: 8192}
 ```
 
-The model names a local checkpoint under your models directory; the resource
-figures illustrate the document shape, not a measured requirement. Set them
-from your checkpoint's measured peak before relying on the deployment.
+The model names a local checkpoint under your models directory. The context
+length and resource figures illustrate the document shape, not measured limits
+or requirements. Set them for your engine and checkpoint, measuring peak memory
+before relying on the deployment.
 `api` is part of the frozen revision. `field_types` must be non-empty,
 distinct and drawn from the nine names above; it is stored in that order.
 Changing the set changes the manifest digest and creates a new profile.
 Other APIs must not declare `field_types`.
+
+`field_types` declares output types only, not text-only or media input support.
+The manifest has no input-capability declaration. CapyCTL validates the request
+shape but leaves input support to the engine: a text-only engine must reject
+unsupported image input. The readiness probe uses text only and does not qualify
+image or PDF handling.
 
 `engine add --custom` shows the field types beside the API for confirmation.
 **Before downgrading** to a release without extraction support, remove every
@@ -345,13 +357,9 @@ forecasts have an inclusive one-step tolerance, probabilities an inclusive
 stops the instance. With restart-only residency and no LMCache, a restart
 records a new reference.
 
-**ShardioAI's extraction model is not live-qualified or published.**
-The model ID is `ShardioAI/extract-4b`, served as `extract-4b` by `shardio-extract`;
-source lives in the private repository
-[`ShardioAI/extract`](https://github.com/ShardioAI/extract). Publication waits for
-the owner. Model quality and qualification on host A remain release gates. CPU and
-fake-engine tests are not qualification. Table/record extraction is deferred
-to a follow-up release.
+CPU and fake-engine tests do not qualify a patched engine, its checkpoint or its
+supported inputs. Live qualification must cover the actual engine installation
+and extraction contract; this example makes no quality or release claim.
 
 ## Embedding models
 

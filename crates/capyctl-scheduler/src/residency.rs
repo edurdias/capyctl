@@ -284,6 +284,7 @@ pub fn admit_phase(
             // figures; the rule itself is unchanged.
             return Err(ResourceError::InsufficientAvailable(Box::new(
                 AvailableShortfall {
+                    outside_processes: o.outside_processes.clone(),
                     domain: l.domain.clone(),
                     device: l.reserve_absorbs_unmanaged,
                     available_bytes: o.available_bytes,

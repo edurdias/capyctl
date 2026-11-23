@@ -2,6 +2,7 @@
 //! listener's effective bind and whether it requires the API key, so status
 //! can repeat the start warning. It is served only to the management
 //! credential.
+mod support;
 use capyctl_management::{
     inference_listener::{inference_listener_router, InferenceListenerView},
     ManagementCredentials,
@@ -34,9 +35,9 @@ async fn body(response: axum::response::Response) -> serde_json::Value {
 #[tokio::test]
 async fn the_inference_listener_view_is_authenticated() {
     let view = Arc::new(InferenceListenerView::default());
-    let router = inference_listener_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        view.clone(),
+        inference_listener_router(view.clone()),
     );
     const PATH: &str = "/management/v1/inference-listener";
     for token in [None, Some(INFERENCE)] {

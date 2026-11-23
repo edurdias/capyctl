@@ -45,6 +45,7 @@ fn request(deployment: &str, name: &str, bytes: i64) -> GrantRequest {
 
 fn observations() -> [MemoryObservation; 1] {
     [MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 128,
         available_bytes: 128,

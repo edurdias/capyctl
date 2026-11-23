@@ -609,6 +609,7 @@ mod transaction_fault_tests {
             )
             .unwrap();
         let obs = [MemoryObservation {
+            outside_processes: None,
             domain: "system".into(),
             capacity_bytes: 128,
             available_bytes: 128,
@@ -648,6 +649,7 @@ mod transaction_fault_tests {
     fn caller_rollback_reverts_transaction_local_reservation() {
         let (store, request) = fixture();
         let observations = [MemoryObservation {
+            outside_processes: None,
             domain: "system".into(),
             capacity_bytes: 128,
             available_bytes: 128,
@@ -693,6 +695,7 @@ mod transaction_fault_tests {
     fn caller_sql_failure_then_drop_reverts_transaction_local_reservation() {
         let (store, request) = fixture();
         let observations = [MemoryObservation {
+            outside_processes: None,
             domain: "system".into(),
             capacity_bytes: 128,
             available_bytes: 128,
@@ -741,6 +744,7 @@ mod transaction_fault_tests {
     fn caller_commit_persists_transaction_local_reservation() {
         let (store, request) = fixture();
         let observations = [MemoryObservation {
+            outside_processes: None,
             domain: "system".into(),
             capacity_bytes: 128,
             available_bytes: 128,
@@ -785,6 +789,7 @@ mod transaction_fault_tests {
     fn caller_transaction_replay_is_recorded_and_changed_identity_conflicts() {
         let (store, request) = fixture();
         let observations = [MemoryObservation {
+            outside_processes: None,
             domain: "system".into(),
             capacity_bytes: 128,
             available_bytes: 128,
@@ -883,6 +888,7 @@ mod transaction_fault_tests {
             .unwrap();
         request.next.allocations[0].domain = "host-a/domain/unified".into();
         let observations = [MemoryObservation {
+            outside_processes: None,
             domain: "host-a/domain/unified".into(),
             capacity_bytes: 128,
             available_bytes: 128,
@@ -971,6 +977,7 @@ mod transaction_fault_tests {
     fn changed_revision_terminal_operation_and_corrupt_ledger_block_grants() {
         let (store, mut request) = fixture();
         let obs = [MemoryObservation {
+            outside_processes: None,
             domain: "system".into(),
             capacity_bytes: 128,
             available_bytes: 128,

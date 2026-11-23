@@ -12,3 +12,5 @@ __pycache__/
 /scripts/private-denylist.txt
 /target-ci
 /.worktrees/
+/web/dist
+/web/node_modules

@@ -29,6 +29,8 @@ Tasks:
 - [Parking and switching](parking.md): more models than your GPU holds.
 - [How requests wait and models switch](parking.md#how-requests-wait-and-models-switch):
   two apps, two models, one GPU.
+- [The web UI](web-ui.md): watch and run your setup from a browser on your
+  desktop or phone; sign in with `capyctl open ui`.
 - [Driving CapyCTL from a controller](controller.md): the management API
   from a program: create, start, watch, retry.
 - [Run in a container](../operations/install.md#running-in-a-container): a
@@ -40,7 +42,7 @@ Reference: [CLI](/docs/reference/cli/), [configuration files](configuration.md),
 [data retention](../operations/data-retention.md),
 [installer options](installer.md), [exit codes and errors](errors.md).
 
-What changed in the latest release: [release notes for 0.1.11](../operations/release-notes-0.1.11.md).
+What changed in the latest release: [release notes for 0.1.12](../operations/release-notes-0.1.12.md).
 
 CapyCTL does not install engines or GPU drivers. Bring your own vLLM, SGLang or
 TensorFold installation, llama.cpp build or other server;

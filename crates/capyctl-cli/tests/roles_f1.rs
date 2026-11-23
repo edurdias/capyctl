@@ -214,7 +214,8 @@ impl SampledStandalone {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let router = app.management_router();
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let server =
+            tokio::spawn(async move { support::serve_management(listener, router).await.unwrap() });
         Self {
             app,
             id,

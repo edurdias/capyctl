@@ -14,6 +14,7 @@ fn short(
 ) -> Result<(), ResourceError> {
     Err(ResourceError::InsufficientAvailable(Box::new(
         AvailableShortfall {
+            outside_processes: None,
             domain: domain.into(),
             device,
             available_bytes: available,
@@ -61,6 +62,7 @@ fn admission_enforces_device_claim_conflicts() {
         }],
     };
     let observations = [MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 100,
         available_bytes: 90,
@@ -123,6 +125,7 @@ fn aggregate_resident_floors_cannot_exceed_observed_usage() {
         owners: [("a".into(), footprint(40)), ("b".into(), footprint(40))].into(),
     };
     let observations = [MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 100,
         available_bytes: 30,
@@ -212,6 +215,7 @@ fn wake_replaces_parked_residue() {
         .into(),
     };
     let observations = [MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 128,
         available_bytes: 60,
@@ -269,6 +273,7 @@ fn reservation_slack_is_not_physical_credit() {
         owners: [("a".into(), f(ResourcePhase::Parked, 48))].into(),
     };
     let obs = [MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 128,
         available_bytes: 32,
@@ -360,6 +365,7 @@ fn installed_capacity_is_not_available_memory() {
         owners: Default::default(),
     };
     let mut obs = [MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 128,
         available_bytes: 20,
@@ -413,6 +419,7 @@ fn two_proposals_cannot_spend_one_epoch() {
         devices: vec![],
     };
     let obs = [MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 128,
         available_bytes: 128,
@@ -478,6 +485,7 @@ fn a_domain_the_candidate_adds_nothing_to_is_not_judged_on_free_memory() {
     };
     // 10 free, below the 16 reserve.
     let obs = [MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 128,
         available_bytes: 10,
@@ -551,6 +559,7 @@ fn a_device_reserve_absorbs_unaccounted_memory() {
     };
     let observed = |available| {
         [MemoryObservation {
+            outside_processes: None,
             domain: "gpu0".into(),
             capacity_bytes: 16376 * MIB,
             available_bytes: available,
@@ -628,4 +637,109 @@ fn a_device_reserve_does_not_absorb_attributed_engine_memory() {
         ..limit
     };
     assert_eq!(host.required_free(capacity, available, 0), 1310 * MIB);
+}
+
+// T26, T29: ADR 0035 §8 / SPEC §7.2: outside GPU holders are explanation,
+// never resident credit, and only an observed-free refusal names them.
+#[test]
+fn outside_holders_enrich_only_observed_free_refusals() {
+    use capyctl_domain::resources::{OutsideProcess, OutsideProcesses};
+
+    let snapshot = LedgerSnapshot {
+        epoch: 0,
+        owners: Default::default(),
+    };
+    let mut observations = [MemoryObservation {
+        domain: "gpu0".into(),
+        capacity_bytes: 16 << 30,
+        available_bytes: 8 << 30,
+        sampled_at_ms: 100,
+        outside_processes: Some(OutsideProcesses {
+            processes: vec![OutsideProcess {
+                pid: 42,
+                name: Some("python".into()),
+                bytes: 8 << 30,
+                capyctl_state_dir: Some("/srv/other".into()),
+                other_capyctl: true,
+            }],
+            remainder: None,
+        }),
+    }];
+    let mut limits = [MemoryLimit {
+        domain: "gpu0".into(),
+        managed_bytes: 14 << 30,
+        free_reserve_bytes: 2 << 30,
+        reserve_absorbs_unmanaged: true,
+        host_kv_bytes: None,
+        parked_bytes: None,
+    }];
+    let next = PhaseFootprint {
+        phase: ResourcePhase::Cold,
+        allocations: vec![Allocation {
+            domain: "gpu0".into(),
+            bytes: 10 << 30,
+            host_kv_bytes: 0,
+        }],
+        devices: vec![],
+    };
+    let error = admit_phase(
+        &snapshot,
+        "candidate",
+        &next,
+        AdmissionContext::new(&observations, &limits, 101, 60, 4),
+    )
+    .unwrap_err();
+    let ResourceError::InsufficientAvailable(shortfall) = &error else {
+        panic!("expected observed-free refusal: {error:?}");
+    };
+    assert_eq!(
+        shortfall.outside_processes,
+        observations[0].outside_processes
+    );
+    let reason = error.to_string();
+    assert!(
+        reason.starts_with("insufficient_device_memory:"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("PID 42 python (8.0 GiB; another CapyCTL, state dir /srv/other)"),
+        "{reason}"
+    );
+    // The same holder does not explain a managed-policy limit.
+    limits[0].managed_bytes = 9 << 30;
+    assert_eq!(
+        admit_phase(
+            &snapshot,
+            "candidate",
+            &next,
+            AdmissionContext::new(&observations, &limits, 101, 60, 4)
+        ),
+        Err(ResourceError::Insufficient)
+    );
+    limits[0].managed_bytes = 14 << 30;
+    observations[0].outside_processes = None;
+    let without_holders = admit_phase(
+        &snapshot,
+        "candidate",
+        &next,
+        AdmissionContext::new(&observations, &limits, 101, 60, 4),
+    )
+    .unwrap_err()
+    .to_string();
+    assert_eq!(
+        reason.split_once("; outside GPU processes:").unwrap().0,
+        without_holders
+    );
+    // Diagnostic holder bytes cannot prevent a charge that physically fits.
+    observations[0].outside_processes = shortfall.outside_processes.clone();
+    observations[0].available_bytes = 16 << 30;
+    assert_eq!(
+        admit_phase(
+            &snapshot,
+            "candidate",
+            &next,
+            AdmissionContext::new(&observations, &limits, 101, 60, 4)
+        ),
+        Ok(())
+    );
 }

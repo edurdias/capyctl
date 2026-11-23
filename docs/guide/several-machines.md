@@ -58,7 +58,7 @@ capyctl start server --config ~/server.yaml
 ```
 
 ```text
-capyctl 0.1.11 server ready
+capyctl 0.1.12 server ready
 
   Inference     0.0.0.0:8443 (API key required)
   Management    127.0.0.1:7443
@@ -142,7 +142,7 @@ capyctl start host --config ~/host.yaml
 ```
 
 ```text
-capyctl 0.1.11 host ready
+capyctl 0.1.12 host ready
 
   Engines       none: run `capyctl engine add <path>`
   Ingress       100.64.0.21:8444
@@ -193,8 +193,8 @@ capyctl list engines
 ```
 
 ```text
-NAME      STATE    ELIGIBLE   VERSION   COMPATIBILITY   MEMORY (FREE / TOTAL)   ENGINES
-gpu-box   online   yes        0.1.11    supported       46.8 GiB / 77.2 GiB     vllm
+NAME      STATE    ELIGIBLE   VERSION   COMPATIBILITY   GPU (FREE / TOTAL)    RAM (FREE / TOTAL)    ENGINES
+gpu-box   online   yes        0.1.12    supported       12.6 GiB / 16.0 GiB   34.2 GiB / 61.2 GiB   vllm
 HOST      PROFILE   ENGINE   VERSION   CUSTOM   DEEP PARK   STATE    DEPLOYMENTS
 gpu-box   vllm      vllm     0.31.0    no       enabled     online   -
 ```

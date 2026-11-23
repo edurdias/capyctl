@@ -11,8 +11,9 @@
 //! download lock is held or anything outside `sources/`. Without a referenced
 //! set it removes nothing.
 use crate::output::StructuredError;
+use capyctl_agent::host_admin;
 use capyctl_config::model_settings::ModelOverrides;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -24,26 +25,9 @@ fn error(code: &'static str, message: impl Into<String>) -> StructuredError {
 }
 
 /// The sources store a host document names (ADR 0008; owner ruling
-/// 2026-09-25), resolved by the host role's rule
-/// (`capyctl_config::model_settings`) with `env` as the environment's layer:
-/// `model_sources.path`, else the models directory (`model_store.path`, else
-/// `CAPYCTL_MODELS_ROOT`, else `~/models`), under which downloads live in
-/// `sources/`.
+/// 2026-09-25); ADR 0040 §10: resolved in `capyctl_agent::host_admin`.
 fn model_store(host_config: &Path, env: &ModelOverrides) -> Result<PathBuf, StructuredError> {
-    use capyctl_config::model_settings::{default_models_root, resolve};
-    let text = std::fs::read_to_string(host_config)
-        .map_err(|_| error("invalid_config", "Cannot read the host configuration"))?;
-    let host = capyctl_config::parse_strict(capyctl_config::ConfigKind::Host, &text)
-        .map_err(|e| error("invalid_config", format!("Invalid host configuration: {e}")))?;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let settings = resolve(
-        &host,
-        &ModelOverrides::default(),
-        env,
-        default_models_root(home.as_deref()).as_deref(),
-    )
-    .map_err(invalid)?;
-    Ok(settings.policy.root(&settings.models_root).to_path_buf())
+    Ok(host_admin::model_store(host_config, env)?)
 }
 
 fn invalid(e: capyctl_config::ConfigError) -> StructuredError {
@@ -80,23 +64,7 @@ pub fn prune_store(
     apply: bool,
 ) -> Result<Value, StructuredError> {
     let store = model_store(host_config, env)?;
-    let report = capyctl_agent::sources::prune(&store, referenced, apply).map_err(|_| {
-        error(
-            "internal",
-            "Cannot read or change the model store's sources",
-        )
-    })?;
-    let bytes =
-        |items: &[capyctl_agent::sources::PrunedSource]| items.iter().map(|s| s.bytes).sum::<u64>();
-    Ok(json!({
-        "model_store": store,
-        "applied": report.applied,
-        // Without --apply these are the copies that would be removed.
-        "removed": report.removed,
-        "removed_bytes": bytes(&report.removed),
-        "kept": report.kept,
-        "skipped": report.skipped,
-    }))
+    Ok(host_admin::prune_copies(&store, referenced, apply)?)
 }
 
 pub async fn execute(
@@ -141,6 +109,7 @@ pub async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     // SPEC §6.3 (ADR 0008): the CLI prunes only what the referenced set does
     // not name, lists without --apply, and refuses a malformed referenced set.

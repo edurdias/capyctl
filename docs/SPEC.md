@@ -321,6 +321,22 @@ On a discrete-GPU host each GPU's memory is a `device` domain observed from the 
 
 One GPU, or with `topology` several identical GPUs of one host, serve one model; CapyCTL picks them unless the deployment pins them (`devices`, exactly N). A model on N GPUs stays one owner with one allocation in each chosen GPU's `device` domain, each charged one rank (its share of the weights by ADR 0028's formula with `T = N`, its KV cache, the margin, the CUDA context allowance and a communication allowance), and one allocation in the system domain with an engine overhead per rank; admission checks every domain together, so the charge is all or nothing. Process readings are per process and GPU, and each GPU's domain is credited only with the bytes on that GPU. `topology: auto` chooses the smallest N whose per-GPU charge fits the cards' managed limits (never their free memory) at placement and keeps it for the launch's life.
 
+**Observation note (owner decision 2026-11-13, ADR 0035 §8, T16):** GPU
+domains may report outside GPU holders, read-only, under the optional
+host-to-server `outside_gpu_processes` capability; it is never required for
+placement. Snapshot fields are optional `outside_processes` (an array of
+`{pid, name, bytes, capyctl_state_dir, other_capyctl}`, with nullable name and
+state directory) and `outside_processes_remainder` (`{count, bytes}`). Both
+are absent for unavailable or empty readings. Keep at most 16 rows per GPU,
+largest bytes first, summing the rest; names are bounded to 64 characters and
+state directories to 512 bytes. Exclude recorded live process identities and
+the current CapyCTL's descendants (ancestor lookup bounded to eight levels).
+Use the existing bounded NVIDIA sampler and a bounded process-description pass;
+optional diagnostics must stay within the existing observation message bound.
+Never read environments, expose arguments other than another CapyCTL's state
+directory, or signal outside processes. This diagnostic does not change
+admission accounting or ownership.
+
 ### 7.3 Reservation lifecycle
 
 | Owner/state | What stays charged |
@@ -520,9 +536,9 @@ Note (2026-10-17, ADR 0030 §§2, 5): the inference surface also includes non-st
 
 Note (2026-11-04, [ADR 0041](design/adr/0041-extraction-models.md) §3): `POST /v1/systemone` has a second closed shape, chosen by the deployment's `api`, never the body. Decisions retain `questions`; extractions take `fields`. Carrying the other API's key, whatever its value (including null or when both keys are present), is HTTP 400 `api_mismatch` before waiting or activation. Other deployment APIs refuse this path; extraction deployments refuse chat completions and embeddings, naming `POST /v1/systemone`. The router authenticates, checks `X-Request-Id`, reads the bounded body and `model`, looks up the deployment (`unknown_model`), checks the API, then validates the contract before waiting, activation, admission and leasing. For decisions too, an unknown model is now reported before a malformed contract. API and field types come from the current frozen revision.
 
-The closed extraction contract, field names, nine types and setting shapes are specified in ADR 0041 §3 and [Extraction requests](guide/requests.md#extraction-requests). `state` has no default and may be absent or empty only with images. Every setting is accepted on every field type when its shape is valid; cross-setting semantics belong to the engine. `items` is required for lists and `min` and `max` for estimates and forecasts; `horizon` is optional. Unknown members or invalid setting shapes are HTTP 400 `invalid_request` naming them. A type absent from the frozen custom profile's `field_types` is HTTP 400 `field_type_unsupported`, naming field and type, before waiting or activation.
+The closed extraction contract, field names, nine types and setting shapes are specified in ADR 0041 §3 and [Extraction requests](guide/requests.md#extraction-requests). `state` has no default and may be absent or empty only with non-empty images or the accepted single-PDF `assets` input. With a PDF, non-empty `state` may only be the sole asset key; text plus PDF and images plus PDF are refused. Settings are accepted on every field type when their shapes are valid, except `null_threshold`, which is scalar-only (`text` through `duration`); cross-setting semantics belong to the engine. `items` is required for lists and `min` and `max` for estimates and forecasts; `horizon` is optional. Unknown members or invalid setting shapes are HTTP 400 `invalid_request` naming them. A type absent from the frozen custom profile's `field_types` is HTTP 400 `field_type_unsupported`, naming field and type, before waiting or activation.
 
-Extractions use decisions' API key, body bound, lookup by model, waiting, activation, admission, instance selection, leases, request IDs, trace context and metrics. The engine receives the served model name; the whole response returns with the public model name. Completion evidence follows decisions: a whole JSON object whose `answers` is a non-empty object of objects each naming a string `type`; complete JSON engine 400, 413 or 422 answers are `engine_rejected`; other outcomes remain uncertain. The response is read whole up to 16 MiB; a longer response is uncertain, never replayed and held until the instance stops. Individual answers are not judged on the request path. Engine limits beyond the contract and body bound return as engine rejections. Ingress chooses the contract from the launch's `api` and checks its own 8 MiB body bound (HTTP 400 above it). A request cut by a hang-up or deadline before its whole answer settles only at the next verified stop; the restart for held requests applies. A complete engine error leaves it `cancelling`, settled on the manifest's idle signal when present, otherwise at the next verified stop. Answers carry `capyctl.metrics.total_ms`, `time_to_response_ms` and `input_tokens` from engine usage, with no generated-text figure. `GET /v1/models` adds `capyctl.api: "extractions"` and `capyctl.field_types` in canonical order.
+Extractions use decisions' API key, body bound, lookup by model, waiting, activation, admission, instance selection, leases, request IDs, trace context and metrics. The engine receives the served model name; the whole response returns with the public model name. Completion evidence follows decisions: a whole JSON object whose `answers` is a non-empty object of objects each naming a string `type`; complete JSON engine 400, 413 or 422 answers are `engine_rejected`; other outcomes remain uncertain. The response is read whole up to 16 MiB; a longer response is uncertain, never replayed and held until the instance stops. Individual answers are not otherwise judged on the request path, except for PDF evidence: returned `state_text` is mandatory, reported text spans must match it in Unicode code points, and optional page evidence must use positive one-based page numbers or null where no single page applies (ADR 0041 §3). Invalid PDF evidence remains uncertain, never completed against the asset key. Engine limits beyond the contract and body bound return as engine rejections. Ingress chooses the contract from the launch's `api` and checks its own 8 MiB body bound (HTTP 400 above it). A request cut by a hang-up or deadline before its whole answer settles only at the next verified stop; the restart for held requests applies. A complete engine error leaves it `cancelling`, settled on the manifest's idle signal when present, otherwise at the next verified stop. Answers carry `capyctl.metrics.total_ms`, `time_to_response_ms` and `input_tokens` from engine usage, with no generated-text figure. `GET /v1/models` adds `capyctl.api: "extractions"` and `capyctl.field_types` in canonical order.
 
 Resolve model aliases to explicit deployments. A deployment with several instances is served by all of its READY instances; the router selects among instances with open admission using its own in-flight counts and fresh host-reported engine load, and fails over to another instance only before upstream acceptance (ADR 0013). Preserve supported payloads, tool calls, structured-output parameters, reasoning fields, multimodal content, and stream events. Do not tokenize, rewrite prompts, silently substitute models, or execute client tools. Any model-name remapping in responses must be documented and limited.
 
@@ -667,6 +683,10 @@ The inference listener may be reachable from the network. It requires the API ke
 
 Every engine's output is kept at the engine's default level in its launch's private owner-only log, written through a redacting writer: the launch's own credentials (engine and admin keys, observation credentials, secret-named environment values) are replaced by value, and URL credentials, URL query strings and fragments (presigned URLs), secret-named assignments, Hugging Face tokens, bearer values and long credential-shaped runs by rule. The log rotates at a fixed size, so each launch's log is bounded. Request logging stays off for every engine, so prompts and completions are not logged by default. An authenticated management read returns a bounded, redacted tail of one instance's engine log. A log written under `--debug-engine-logs` is raw development output and is never served.
 
+> **Amended by [ADR 0040](design/adr/0040-web-ui.md)** (owner decisions 2026-10-27).
+
+A management API now introduces programs: a signed-in browser session may add or change a custom engine on a host, confirmed by the profile name over a server-enforced digest of a preview (`confirmation_stale` on any difference), with the CLI's terminal confirmation kept (ADR 0040 §11). Accepted risk: anyone holding a session who can reach the management bind can run any program as the CapyCTL user, on a server on every enrolled host.
+
 ## 14. Action-first CLI and interfaces
 
 Canonical grammar: `capyctl <action> <resource> [identifier] [options]`.
@@ -729,6 +749,10 @@ The management API is the source of semantics for CLI, future UI, and integratio
 
 `capyctl engine detect|add|list|remove` and `capyctl list engines` (§4.2) add nine closed codes to the error vocabulary, each with a stable CLI exit: `engine_not_found` (16, the named or picked path has no `vllm-*`/`sglang-*` `dist-info`), `engine_unsupported` (17, its engine family is not one CapyCTL integrates), `engine_version_failed` (18, the bounded version check failed or timed out), `profile_exists` (19, the name is already registered, declared in the role document, or reserved for a standalone environment profile), `profile_in_use` (20, `engine remove` without `--drain` while a deployment on this machine uses the profile, naming it), `publish_rejected` (21, the running role validated the profile like a startup publication and refused it; the previous approved snapshot is kept), `agent_unreachable` (22, a role is listening on `<state_dir>/control.sock` but did not take or answer the request; with no role listening, `add` and `remove` edit `engines.yaml` under its lock and succeed, and the role publishes the change at its next start, ADR 0018 amendment A3), `not_interactive` (23, `engine add` needs an operator choice — a name or a `detect` pick — and stdin is not a terminal). A deploy naming a `runtime_profile` that no allowed host publishes is refused at once, nothing stored: `profile_not_published` (HTTP 409, CLI exit 24), naming the profile, each allowed host with the profiles it publishes, and the fix (`capyctl engine add <path> --name <profile>` on a host, then deploy again). Exit code 9 stays unused.
 
+> **Amended by [ADR 0040](design/adr/0040-web-ui.md)** (owner decisions 2026-10-27).
+
+A web UI built into the server and standalone roles is served under `/ui/` on the management listener and acts only through the management API. Browser sessions, created from one-time sign-in links (`capyctl open ui`), are a second management credential with the admin token's authority; the admin bearer token is accepted only from loopback or the connection's own local address. The management API gains sign-in links and sessions, supported-action hints in the snapshot, `POST /management/v1/deployments/check`, host-scoped engine, model-copy and host-configuration routes (capability `host_admin`), custom-engine preview and confirmation, and a playground route (ADR 0040 §2–§12).
+
 ## 15. Configuration model and generated defaults
 
 ### 15.1 Separation of authority
@@ -737,7 +761,7 @@ The management API is the source of semantics for CLI, future UI, and integratio
 |---|---|---|
 | Server YAML | Listeners, authentication, enrollment, state location, scheduler and lifecycle defaults. | Host executable paths, static copies of all enrolled hosts, individual deployment records. |
 | Host YAML | Server identity reference, approved inventory, aggregate boundaries, storage pools, ingress, runtime profiles, supervision. | Model-specific allocations, global routing, private independent swap scheduling. |
-| Engines file (`engines.yaml`) | Runtime profiles registered with `capyctl engine add`, beside the role's configuration file; written only by `capyctl engine add` and `remove`, merged with the role document at load. | Anything else; a profile name the role document also declares. |
+| Engines file (`engines.yaml`) | Runtime profiles registered with `capyctl engine add` or the web UI, in the role's state directory (ADR 0018 amendment A4); written by `capyctl engine add`/`remove` and by the role's host administration, merged with the role document at load. | Anything else; a profile name the role document also declares. |
 | Deployment YAML | Model identity, runtime profile, placement/topology, per-host budgets, cache choice, route, lifecycle overrides. | Agent secrets, executable installation, controller credentials. |
 | Cache-service record | Unique physical allocation, backend identity, client quotas, lifetime and storage policy. | Duplicate per-client charging of the full service. |
 | CLI context | Selected management endpoint and credential reference. | A running service role. |
@@ -781,11 +805,16 @@ A server document gains `observability.tracing` with `endpoint` (an `http` or `h
 
 > **Amended by [ADR 0041](design/adr/0041-extraction-models.md) §§1–2** (owner decisions 2026-11-04).
 
-`api` gains a fourth value, `extractions`, part of the frozen revision and its identity; revisions without it keep their fingerprints. Only a custom engine with a matching manifest is accepted; every native engine at every version is refused with `capability_missing:extractions`. A custom API mismatch is `capability_missing:<requested-api>`. Extractions run on one machine without a `topology`, resolve `restart_only` and refuse `deep` and `host_backed`; tool-call and reasoning parsers are refused (`custom_field_unsupported:<parser>`). LMCache resolves off as for every custom engine. Placement requires both host capabilities `custom_engines` and `extractions`; a host without the latter is refused with `host_capability_missing:extractions`.
+`api` gains a fourth value, `extractions`, part of the frozen revision and its identity; revisions without it keep their fingerprints. Currently only a custom engine with a matching manifest is accepted; every built-in native engine path at every currently supported version is refused with `capability_missing:extractions`. The engine-support target includes vLLM, SGLang, llama.cpp, TensorRT-LLM and TensorFold, including patched/custom versions serving `/v1/systemone` with `fields`; this does not claim native support. A patched executable can use the existing custom-engine mechanism; enabling its built-in native path requires a qualified implementation. A custom API mismatch is `capability_missing:<requested-api>`. Extractions run on one machine without a `topology`, resolve `restart_only` and refuse `deep` and `host_backed`; tool-call and reasoning parsers are refused (`custom_field_unsupported:<parser>`). LMCache resolves off as for every custom engine. Placement requires both host capabilities `custom_engines` and `extractions`; a host without the latter is refused with `host_capability_missing:extractions`.
 
 An extraction manifest requires `field_types`, a non-empty list of distinct names from `text`, `number`, `date`, `time`, `datetime`, `duration`, `list`, `estimate`, `forecast`; unknown, duplicate or missing types and the field on any other API are `custom_manifest_invalid`. Serialization uses that canonical order, so its digest names the set; changing the set creates a new profile. Other APIs omit the field and retain their manifest digests. `list` covers text, number and date items.
 
+`field_types` does not declare accepted input modalities. A text-only engine must reject unsupported images or PDFs itself; the router cannot reject them before activation from the manifest. The fixed text-only readiness probe proves no media support. No text-only/media capability declaration is included in 0.2.0.
+
 `engine add --custom` shows `field_types` beside `api` for administrator confirmation. Before downgrading to a release without extraction support, remove every extraction engine with `capyctl engine remove`: older releases refuse the whole `custom-engines.yaml` file if any manifest carries `field_types`, preventing role startup.
+> **Amended by [ADR 0018](design/adr/0018-engine-registration.md) amendment A4** (owner decision 2026-11-13).
+
+The engines files (`engines.yaml`, `custom-engines.yaml`) live in the role's state directory, which the service user writes, and the role itself writes them when engines are added or removed through its management API (ADR 0040 §10–§11), under the same lock and atomic write. A file at the previous location is copied into the state directory once and left unchanged.
 
 ### 15.2 No-config behavior
 
@@ -827,13 +856,13 @@ The canonical examples use `memory.system` for the host's system physical domain
 
 > **Added by [ADR 0041](design/adr/0041-extraction-models.md)** (owner decisions 2026-11-04).
 
-An extraction deployment on a custom profile whose manifest declares
-`api: extractions` and the required `field_types`:
+An extraction deployment on a custom profile for a patched vLLM executable whose
+manifest declares `api: extractions` and the required `field_types`:
 
 ```yaml
-name: extract-4b
-engine: shardio-extract
-model: ShardioAI/extract-4b
+name: extractor
+engine: vllm-extraction
+model: example/extractor
 api: extractions
 resources: {gpu: 16GiB, ram: 8GiB}
 ```
@@ -843,8 +872,9 @@ profile name and checkpoint are examples, not a qualified installation.
 It runs restart-only on one machine, without a `topology` or parsers, with
 LMCache off, on a host advertising `custom_engines` and `extractions`.
 See [Extraction models](guide/deploy.md#extraction-models) for the manifest
-and fixed readiness request. CapyCTL's own model is untrained; CPU and
-fake-engine tests are not qualification, and no live run has qualified it.
+and fixed readiness request. The example requires a patched engine that serves
+the extraction contract; unpatched native vLLM remains refused. CPU and
+fake-engine tests are not live engine qualification.
 
 ### 16.1 Server: policy and durable state
 
@@ -1113,6 +1143,10 @@ The generated shape states `inference.bind: "0.0.0.0:8443"` (with `authenticatio
 
 `host.resource_policy.memory.system.managed_limit` and `free_reserve` take `auto` (50 % and 20 % of the observed memory), a size (`90GiB`) or a whole percentage (`75%`), by YAML, `--set` or `CAPYCTL_SET__…`. Together they must fit the observed memory. They apply to the `unified` domain, or to host RAM's `system` domain on a discrete machine, and the stored policy follows them at every start.
 
+> **Amended by [ADR 0040](design/adr/0040-web-ui.md)** (owner decisions 2026-10-27).
+
+The management listener stays on loopback unless the owner sets `server.listeners.management.remote: true` (`--management-remote`, `CAPYCTL_MANAGEMENT_REMOTE`), which allows a non-loopback `bind` over plain HTTP without a warning; optional `public_address` names the origin used in sign-in links (ADR 0040 §1).
+
 ## 17. Observability and benchmark evidence
 
 Record operation/generation IDs, state transitions, participant states, reservation decisions, cleanup evidence, queue depth/bytes, activation progress, and failures. Status must distinguish configured capacity, granted reservation, observed use, and unknown observations. Protect high-cardinality metrics from unbounded user input.
@@ -1241,7 +1275,7 @@ Added standalone/remote role boundaries, per-host agents and head-only ingress, 
 
 ### Later amendments
 
-- 2026-11-04, [ADR 0041](design/adr/0041-extraction-models.md) (implementation landing; owner decisions of 2026-11-04): extraction models, a fourth `api` value `extractions`, custom engines only with manifest `field_types` and the host capability `extractions` (§15.1, §16); a second closed `POST /v1/systemone` shape selected by deployment API, pre-activation shape and type refusals, discovery and decision-equivalent routing, leases, settlement and metrics (§10); fixed extraction readiness of declared types and its typed wake check (§6.1); conformance row T50 (§20).
+- 2026-11-04, [ADR 0041](design/adr/0041-extraction-models.md) (implementation landing; generic API decisions of 2026-11-04 and combined release-scope decision of 2026-11-23): extraction support ships in the combined 0.2.0 integration release-candidate pull request, preserving main's browser-auth schema v59 and adding embeddings, LMCache defaults, tracing and extraction at v60–63; a fourth `api` value `extractions`, currently custom engines only with manifest `field_types` and the host capability `extractions` (§15.1, §16); a second closed `POST /v1/systemone` shape selected by deployment API, pre-activation shape and type refusals, discovery and decision-equivalent routing, leases, settlement and metrics (§10); fixed extraction readiness of declared types and its typed wake check (§6.1); conformance row T50 (§20).
 
 - 2026-10-28, [ADR 0034](design/adr/0034-lmcache-by-default.md) (implementation landing; owner decisions and rule of 2026-10-27): parking residencies use LMCache with engine-driven transfer, on certified combinations by default and as an uncertified setup under `lmcache: required` (no longer refused, also on several GPUs of one host); `lmcache_pool: auto`, the default, sizes the pool to one full context of the model after eviction, capped at `host_kv_limit`, shrunk to the room left or off (`host_kv_room`) instead of refused (§7.4, §9.1, §9.2, §15.1, §20, T45, LC12–LC18).
 - 2026-10-27, [ADR 0036](design/adr/0036-embeddings.md) (implementation landing; owner decisions of 2026-10-27): embedding models, a third `api` value `embeddings`, refused on TensorFold, with a `topology`, `host_backed`, a parser or `lmcache: required`, `certified` or `uncertified` by engine version and never refused for it, and the host capability `embeddings` (§15.1, T47); readiness on a fixed embedding and a canary comparing vectors by relative distance after every wake and restart (§6.1); `deep` parking on vLLM and SGLang, `restart_only` on llama.cpp and custom engines (§6.2, §9.1, §9.2); non-streaming `POST /v1/embeddings` with OpenAI's closed contract, the answer streamed through with incremental checks and `model` rewritten and no size limit, and a cut request read to its end and settled on its answer (§10, T47).

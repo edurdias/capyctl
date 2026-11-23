@@ -5,6 +5,8 @@
 //! writes engines.yaml; the CLI rewrites it once the retirement is confirmed
 //! and then asks for the reload. The standalone document is never written.
 //! Nothing here reaches an engine.
+mod admin;
+pub use admin::StandaloneAdmin;
 use capyctl_agent::control_socket::{ControlHandler, ControlRequest};
 use capyctl_config::model_settings::ModelSettings;
 use capyctl_config::registration::{check_profile, EnginesFile, ENVIRONMENT_PROFILES};
@@ -211,7 +213,7 @@ fn custom_of(named: &NamedInstallation) -> Option<capyctl_config::custom::Custom
 
 /// The standalone role's control-socket handler.
 pub struct StandaloneControl {
-    /// The role's engines.yaml (`engines_path` of its `--config`).
+    /// ADR 0018 amendment A4: the role state directory's engines.yaml.
     engines: PathBuf,
     provider: Arc<dyn EngineProvider>,
     host: Arc<EmbeddedHost>,

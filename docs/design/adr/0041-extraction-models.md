@@ -1,10 +1,11 @@
 # ADR 0041 — Extraction models (`api: extractions`, `fields` on `POST /v1/systemone`)
 
-**Status:** Accepted (owner decisions 2026-11-04 and amendments of 2026-11-10 and 2026-11-12).
-Target release: 0.2.0, with `integration/0.2.0` landing first and extraction support
-on top, alongside `ShardioAI/extract-4b` (served as `extract-4b`). The first engine is
-CapyCTL's own extraction server run as a custom engine (ADR 0031); no native engine
-serves extractions, and every native engine is refused until one does and is qualified.
+**Status:** Accepted (generic API decisions of 2026-11-04, PDF contract amendment of
+2026-11-12, and release-scope decision of 2026-11-23).
+Target release: 0.2.0, in one combined integration and extraction release-candidate
+pull request. Extraction is an engine capability, independent of any model project.
+Current built-in native engine paths remain refused; a patched engine that serves
+the contract can use the existing custom-engine manifest mechanism (ADR 0031).
 **Amends (with the implementation):** `SPEC.md` §6.1 (readiness of an extraction model and
 its wake check), §10 (a second closed shape on `POST /v1/systemone`, chosen by the
 deployment's `api`), §15.1/§16 (a fourth `api` value), §20 (T50); ADR 0030 §§1, 2, 5
@@ -18,12 +19,9 @@ ADR 0036 (embeddings), ADR 0037 (trace context).
 
 ## Context
 
-On 2026-10-19 Cloudflare announced Clairic, "a new class of System One-style models:
-extraction models" ([blog](https://blog.cloudflare.com/clairic-extraction-model/),
-[model reference](https://developers.cloudflare.com/workers-ai/models/clairic/), read
-2026-11-03). Where a decision model (ADR 0030) gives a probability to every option the
-caller lists, an extraction model returns values the caller cannot list in advance, in one
-forward pass and with no generated tokens:
+Typed extraction returns named values from a caller's state rather than selecting
+from enumerated decision options (ADR 0030) or requiring clients to parse chat
+output. The contract covers:
 
 - **extracted** text, a span of the input with its character offsets;
 - **computed** numbers, dates, times, datetimes, durations and lists, read from the input
@@ -32,40 +30,30 @@ forward pass and with no generated tokens:
   caller declares, with a median and an 80% interval;
 - **forecast** values, one estimate per future step of a series.
 
-The request is a `state` (text, up to four images) and a map of typed `fields`. Each
-scalar answer carries `value` (null when the input does not determine it), `guess`,
-`p_null` and `confidence`; an estimate carries `median`, `p10`, `p90`, `p_below` and
-`p_above`. Clairic's input schema
-([schema-input.json](https://developers.cloudflare.com/workers-ai/models/clairic/schema-input.json))
-lists `model`, `state`, `fields`, `images`, `reference_date` and `options`; the schema
-itself does not close the object, but the hosted endpoint answers any other member with
-HTTP 422 (observed by a gateway on 2026-10-23, [Bifrost #8958](https://github.com/maximhq/bifrost/issues/8958)).
-For a forecast, the launch post shows `value`, `median`, `p10` and `p90` as arrays of one
-number per step, and the output schema
-([schema-output.json](https://developers.cloudflare.com/workers-ai/models/clairic/schema-output.json))
-names `steps`, "one estimate per step"; both forms are published.
+The request is a `state`, optional media and a map of typed `fields`. Each scalar
+answer carries `value` (null when the input does not determine it), `guess`,
+`p_null` and `confidence`; an estimate carries `median`, `p10`, `p90`, `p_below`
+and `p_above`. Engines own the inference implementation, including whether it
+generates tokens internally. CapyCTL owns the typed boundary, routing and evidence.
 
-### What serves it
+### Engine support boundary
 
-Read 2026-11-03:
+The accepted engine-support target includes vLLM, SGLang, llama.cpp, TensorRT-LLM
+and TensorFold, including patched or custom versions that serve
+`POST /v1/systemone` with `fields`. This is not a claim that their current native
+implementations serve the contract: none of CapyCTL's built-in unpatched engine
+paths does, and those paths remain refused.
 
-| Server | Extraction support |
-|---|---|
-| Clairic | hosted on Workers AI only (`@cf/cloudflare/clairic`); open weights promised "soon", no date |
-| llama.cpp v0.7.0, SGLang 0.5.22, vLLM 0.32.0 | `/v1/systemone` with `questions` only; no `fields` anywhere |
-| kenari (a hosted gateway) | `POST /v1/systemone` with `fields` in place of `questions`, exactly one of the two ([docs](http://kenari.id/en/docs/systemone)) |
-| Bifrost (a gateway) | proposes a separate `POST /v1/extractions` ([issue #8958](https://github.com/maximhq/bifrost/issues/8958)) |
-| open models | `tasksource/UltraBERT-380M-clairic-extraction` and GLiNER2 return spans only (no numbers, dates or distributions) and ship no server; NuExtract3 writes JSON token by token, as a chat model |
+A patched executable can be registered with `capyctl engine add --custom` using
+a manifest declaring `api: extractions` and its supported `field_types`. For
+example, `vllm-extraction` can name a profile for a patched vLLM installation.
+Registration does not qualify the engine or enable its built-in native path.
+Native support requires an engine release implementing the contract and live
+qualification before its capability gate is opened.
 
-No engine CapyCTL runs can serve an extraction model, and none exists in open weights with
-the whole type set. The owner decided (2026-11-04) that CapyCTL builds its own: a model
-trained from an open base, and a server for it that CapyCTL runs as a custom engine. This
-ADR records the decisions about that model (§9) and decides what CapyCTL needs to run it
-and any later extraction model.
+### Baseline before extraction support
 
-### What CapyCTL does today
-
-- `api` is `chat`, `decisions` or `embeddings` (`DeploymentApi`,
+- Before this implementation, `api` is `chat`, `decisions` or `embeddings` (`DeploymentApi`,
   `crates/capyctl-config/src/effective.rs`). `chat` is omitted from the frozen revision,
   so a revision without `api` keeps its fingerprint.
 - `POST /v1/systemone` is ADR 0030's closed decision contract: `model`, `state`,
@@ -76,8 +64,8 @@ and any later extraction model.
   of its serialized form and part of the profile and the recipe fingerprint.
 - Readiness of a non-chat model is a fixed request of the model's API, judged
   well-formed (ADR 0030 §3, ADR 0036); the first answer of a launch is the wake canary's
-  reference, stored by kind and probe version in `wake_canaries` (its shape from schema
-  59; the store is at schema 61).
+  reference, stored by kind and probe version in `wake_canaries`. On the combined
+  integration, embeddings extend it at schema v60 and extractions at v63.
 
 ## Decision
 
@@ -86,11 +74,11 @@ and any later extraction model.
 `api` gains a fourth value, `extractions`. It is part of the frozen revision and of its
 identity, as ADR 0030 §1 made `decisions`; revisions without it keep their fingerprints.
 
-Resolution accepts `api: extractions` only on a custom engine whose manifest says
-`api: extractions` (§2). Every native engine, at every version, is refused with
-`capability_missing:extractions`: none serves the contract. A native engine is admitted
-by amendment once a release serves this contract and is qualified live; the first planned
-is llama.cpp, with the model's output layers ported (§9).
+Resolution currently accepts `api: extractions` only on a custom engine whose
+manifest says `api: extractions` (§2). Every built-in native engine path, at every
+currently supported version, is refused with `capability_missing:extractions`:
+none serves the contract. The engine-support target above does not bypass this
+gate; enabling a native path requires a qualified implementation and an amendment.
 
 An extraction deployment keeps ADR 0030 §7's scope:
 
@@ -231,9 +219,8 @@ returned text in Unicode code points, and optional `page`/parallel `pages` must 
 positive one-based page numbers (or null when no single page applies). An invalid
 PDF response leaves the exchange uncertain, never completed against the asset key.
 The host ingress permits `/v1/systemone` for an extraction launch with this contract and
-its own body check (8 MiB; a larger body is refused with HTTP 400 on a host, so a body at
-Clairic's own 16 MiB limit is not accepted there), choosing the contract from the
-launch's `api`, never from the body.
+its own body check (8 MiB; a larger body is refused with HTTP 400 on a host),
+choosing the contract from the launch's `api`, never from the body.
 
 **Settlement.** An extraction request is settled as a decision is (SPEC §10, ADR 0032):
 the engine takes no request ID, so a request cut by a hang-up or a deadline before its
@@ -257,35 +244,19 @@ a list may include `pages`, parallel to `spans`, with null for a cross-page span
 99 on an estimate, and one such array per forecast step. `return_state_text`
 echoes the input under response member `state_text`, not `state`; PDF input always
 returns `state_text`, even when this option is absent or false.
-`mode` and `computation` are never public response members; internal diagnostics
-use `raw['_mode']` and `raw['_computation']`.
+`mode` and `computation` are never public response members; engine diagnostics
+do not add members to the public contract.
 
-The model server reports measured `usage.state_tokens`, `image_tokens` and
-`schema_tokens`, aggregated across prefix passes. Image tokens count the
-processor-produced visual prefix including vision delimiters. Schema accounting
-includes both schema copies, markers, reference/control text and candidate suffix tokens.
-`passes` counts full-prefix field groups, not cached candidate-suffix evaluations.
-These are engine accounting semantics, not new router completion requirements.
+Engines report their measured input usage; CapyCTL does not infer model internals
+or enforce a particular inference architecture through usage accounting.
 
-For `ShardioAI/extract-4b`, the context is 8192 tokens and truncation is reported.
-Text-layer PDF input is opt-in through the restricted `assets` contract above;
-extracting text from images remains unsupported. Image-only requests
-for `text` or `list` with `items: text` are rejected before inference with
-`field_unsupported_input`; images still support the other types. This is
-model-specific engine validation, not a router restriction on every extraction
-model. Mixed requests can extract text spans from their textual `state`.
-
-**PDF amendment (2026-11-12).** The engine alone decodes and converts PDFs on CPU;
+**PDF amendment (2026-11-12).** The engine alone decodes and converts PDFs;
 CapyCTL forwards the asset and state unchanged, apart from the normal model-name
-replacement. Conversion produces deterministic, column-aware reading order and
-aligned rows for ruled tables, with `[Page N]\n` markers. Page offsets bracket the
-page content excluding those markers. The converter rejects scanned/no-text,
-encrypted, malformed and over-limit documents with `unsupported_input`; CapyCTL
-relays the engine rejection under its existing `engine_rejected` envelope.
-The engine defaults to a decoded PDF maximum of 4 MiB and 32 pages, configurable
-through engine arguments. These are engine limits, not decoded limits enforced
-by CapyCTL; the unchanged 8 MiB HTTP request envelope includes base64 overhead.
-Existing checkpoints and default training recipes do not change.
+replacement. Returned `state_text` is the source of text-span evidence, not the
+asset key. Unsupported, malformed or over-limit input is the engine's to reject;
+CapyCTL relays a complete rejection under its existing `engine_rejected`
+envelope. Engine-specific decoded-size and page limits do not replace CapyCTL's
+unchanged 8 MiB HTTP request bound, which includes base64 overhead.
 
 **Compatibility boundary.** A future `/api/alpha/extractions` boundary adapter
 may translate OpenRouter's live Extractions contract; it is not part of 0.2.0.
@@ -297,7 +268,6 @@ The deliberate differences are:
 | Asset input | existing top-level `images`; OpenRouter-aligned named `assets` map restricted to one PDF | broader `assets` support |
 | Options | top-level `options` | `provider.options` |
 | Errors | string error codes | numeric error codes |
-| Request size | host ingress 8 MiB | Clairic: 16 MiB |
 
 Only the named PDF asset map is aligned with OpenRouter. No broader boundary
 adapter, compatibility shim or additional response-readiness requirement is
@@ -353,11 +323,9 @@ no value is compared with the state's facts, and a `null` `value` is well-formed
 | `duration` | `guess` a finite number with no fractional part (`11` and `11.0` both pass) |
 | `list` | `value` null (then `spans` null or absent), or an array of strings with `spans` an array of the same length, each span valid for the state as for `text` and equal to its item; `confidence`, if present, finite in [0, 1]. An empty list is well-formed; the order of the items is the engine's |
 | `estimate` | `value`, `median`, `p10`, `p90` finite with `0 ≤ p10 ≤ median ≤ p90 ≤ 100`, `value` within [0, 100], each with no fractional part (the step-1 grid); `p_below` and `p_above` finite in [0, 1] |
-| `forecast` | at least one of the two published forms, and every form present well-formed: `value`, `median`, `p10` and `p90` arrays of 2 numbers (the launch post's form), or `steps` an array of 2 objects each with `value`, `median`, `p10` and `p90` (the output schema's form); each step obeys the estimate's order, bounds and grid rules; `p_below` and `p_above` are optional here and, when present (per step or per object), finite in [0, 1] |
+| `forecast` | at least one of the two accepted forms, and every form present well-formed: `value`, `median`, `p10` and `p90` arrays of 2 numbers, or `steps` an array of 2 objects each with `value`, `median`, `p10` and `p90`; each step obeys the estimate's order, bounds and grid rules; `p_below` and `p_above` are optional here and, when present (per step or per object), finite in [0, 1] |
 
-The accepted `time` and `datetime` spellings are CapyCTL's reading of ISO 8601; Clairic's
-documentation shows only `2026-07-01T13:34:00` [INFERENCE: no other spelling was
-observed].
+The accepted `time` and `datetime` spellings follow the ISO 8601 forms above.
 
 Members the table does not name (`mean`, `unit`, `quantiles`, `usage`, `truncated`, ...)
 are allowed and ignored. The kind, the version and the declared types are recorded with
@@ -385,10 +353,9 @@ decisions. A later answer passes when, field by field:
 
 Every tolerance is inclusive, with the decision canary's `1e-9` allowance for decimal
 answers read as binary floats (ADR 0030 §4, `wake_canary.rs`), so a move from `0.85` to
-`0.90` passes as it does for a decision. Discrete answers must repeat exactly (owner decision
-2026-11-04): they are a copied span or a value decoded from a class, not a regression,
-so batching noise moves their probabilities, not the value itself [INFERENCE: true of
-CapyCTL's own model (§9); measured on no engine yet].
+`0.90` passes as it does for a decision. Discrete answers must repeat exactly
+(owner decision 2026-11-04). This is the wake-evidence contract, not a claim about
+the numerical behavior of an unqualified engine.
 
 Anything else fails with `wake_mismatch`, and the instance is stopped, as today. With
 `restart_only` (§1) and no LMCache, every restart records a new first answer, so in the
@@ -420,43 +387,17 @@ fields the model answers without sending one.
 
 ### 8. Out of scope
 
-- Any native engine (§1), groups, several GPUs (ADR 0035 refuses custom engines),
-  parking and LMCache.
-- The web UI playground (ADR 0040, not yet on this branch): extraction requests follow
-  when both land.
-- Validating answers on the request path, and any CapyCTL limit on the number of fields
-  or the size of images.
-
-### 9. CapyCTL's extraction model
-
-The model, `ShardioAI/extract-4b` on Hugging Face (served as `extract-4b`), and
-its `shardio-extract` server live in the private GitHub repository
-[`ShardioAI/extract`](https://github.com/ShardioAI/extract). The owner transferred
-it from `edurdias/capyctl-extract`; see the ownership amendment below.
-CapyCTL depends only on its server speaking §3's contract and declaring its types in a
-custom-engine manifest (§2). The original decisions below are superseded where noted
-by the amendment of 2026-11-10:
-
-| Topic | Decision |
-|---|---|
-| Base | Qwen3.5-4B-Base (Apache-2.0; text and images fused; the base of Kev-4B, which llama.cpp already serves) |
-| Types | All nine: text, number, date, time, datetime, duration, list, estimate, forecast |
-| Images | In the first model (up to 4, as Clairic); text and text-list fields answer only from the `state` string, since a one-pass model cannot copy text out of an image |
-| Training | Frozen backbone, rank-256 LoRA adapters and new output layers (span start and end, `p_null`, typed value heads, distributions on the declared grid), trained with cross-entropy, Brier and CRPS/pinball losses; then weight-space edits only to fix specific failures found in evaluation, each kept only if held-out scores improve |
-| Data | Commercial-clean only: permissive sources (tasksource's `extraction` config filtered on `license_use`), code-generated data, and model-generated data only from models whose terms allow it; weights ship under Apache-2.0 |
-| Hardware | Pilot runs on host A (one approved training environment, scheduled around live sessions); full runs on rented GPUs, set up and removed by a script as ADR 0035 §14's machine is |
-| Serving | Its own server first (this ADR's custom engine), then a llama.cpp port of its output layers; both checked against the same test set |
-
-Each environment this needs is an engine environment under AGENTS.md's rules. The
-original 2026-11-04 approval covered training and serving environments on host A
-and a rented machine in principle. Subsequent approvals and the installed training
-versions on both hosts are recorded in AGENTS.md; see the amendment below.
+- Built-in native extraction paths until qualified (§1), groups, several GPUs
+  (ADR 0035 refuses custom engines), parking and LMCache.
+- Model architecture, training, quality evaluation and model publication.
+- General validation of answers on the request path beyond the PDF evidence
+  requirements in §3, and any CapyCTL limit on field count or decoded media size.
 
 ## Consequences
 
 - A fourth `api` value reaches every closed match: config, the custom manifest, the
   protocol's probe and evidence messages, the store's API column and wake-canary table
-  (schema 62), the router, the host ingress, trace attributes, the controller's readiness,
+  (schema 63), the router, the host ingress, trace attributes, the controller's readiness,
   remote execution and canary, management's placement gate, the CLI's exit codes, and the
   fake engine.
 - Documentation changes with the implementation: the SPEC sections above, the guide
@@ -475,145 +416,42 @@ versions on both hosts are recorded in AGENTS.md; see the amendment below.
   only on a well-formed fixed extraction of the declared types; the canary passes within
   tolerance and fails on a changed value, a move of more than one step or a probability
   moved by more than 0.05.
-- CPU and fake-engine tests are not qualification. The first live qualification is the
-  model's own server on host A, after its environment is approved.
+- CPU and fake-engine tests are not qualification. Each engine implementation must
+  be qualified live; custom registration alone is not such evidence.
 
 ## Alternatives considered
 
-- **`POST /v1/extractions`.** Rejected by the owner (2026-11-04): Clairic's request body
-  works unchanged on `/v1/systemone`, and kenari serves it there; the deployment's `api`
-  already tells CapyCTL which contract applies.
+- **`POST /v1/extractions`.** Rejected by the owner (2026-11-04): the deployment's
+  `api` already tells CapyCTL which contract applies on `/v1/systemone`.
 - **`api: decisions` accepting both shapes.** Rejected: readiness could not tell which
   shape to probe, and a wrong-shape request would wake the model only to be refused, the
   failure ADR 0030 §1 designed out.
 - **One `api: systemone` with a list of shapes.** Rejected: it renames ADR 0030's frozen
   value and changes every decisions revision's fingerprint.
-- **A fixed probe of all nine types for every model.** Chosen first, then replaced by the
-  declared types (owner, 2026-11-04): it would leave any model with fewer types, an open
-  Clairic among them, never ready.
-- **Extraction on top of chat models in the router.** Rejected: it generates tokens, and
-  SPEC §10 forbids the router to rewrite prompts.
+- **A fixed probe of all nine types for every model.** Chosen first, then replaced by
+  declared types (owner, 2026-11-04): it would leave any engine implementing fewer
+  types never ready.
+- **Extraction on top of chat models in the router.** Rejected: inference belongs
+  to the engine, and SPEC §10 forbids the router to rewrite prompts.
 
-## Owner decisions of 2026-11-04
+## Amendment of 2026-11-23: combined 0.2.0 integration
 
-1. Base model: Qwen3.5-4B-Base.
-2. Field types: all nine.
-3. Images: in the first model.
-4. Training: adapters and output layers, then weight-space edits as a repair step.
-5. Data: commercial-clean only.
-6. Training hardware: pilots on host A, full runs rented.
-7. Code: a new repository.
-8. Serving: own server first, then llama.cpp.
-9. Deployment: `api: extractions`; the endpoint `POST /v1/systemone` with `fields`.
-10. Readiness: one field per declared type (manifest `field_types`); the wake canary
-    allows one grid step on estimates and forecasts and 0.05 on probabilities.
-11. Environments: training and serving environments on host A, and a rented machine in
-    principle (details first); no copy on host B.
-12. Names: the repository and server `capyctl-extract`, the model `capyctl-extract-4b`.
-13. Release: the first release after `capyctl-extract-4b` is trained.
-14. Branches: `feat/extraction-models` stays local until it is rebased onto `main`;
-    `capyctl-extract` is a private GitHub repository.
-
-## Amendment of 2026-11-10: initial model and release scope
-
-The owner approved the following architecture after experiments E1–E10 in the
-`capyctl-extract` repository. It replaces the provisional rank-256 recipe in §9.
-**The wire contract is unchanged:** the nine field types, request and answer shapes,
-manifest declarations, discovery, readiness probe and wake comparisons in §§1–7
-remain as accepted. Model internals and evidence pointers are not additional API
-members, and CapyCTL does not execute arithmetic in the router.
-
-### Architecture
-
-- Freeze Qwen3.5-4B-Base; train rank-64 LoRA on the attention projections and
-  extraction output heads.
-- Put the schema first, including each field's schema before the state. The earlier
-  BIO list head failed qualifier selection until this layout was introduced.
-- Use the v7 span-set list head. Do not include the refinement layer: it gave no
-  gain at 15 million tokens.
-- Compute scalar values in the extraction server's code. Heads select operand
-  pointers, an operation and a unit; exact Decimal and calendar execution handles
-  copy plus 13 operations. Direct value heads remain auxiliary fallback heads.
-  A digit-wise year head represents years.
-- For estimates, point at comparable samples and execute exact empirical quantiles
-  in code. Forecast evidence can be per-step scenarios or ordered history; history
-  uses a seasonal-naive forecaster in code. Learned distribution heads remain the
-  fallback when evidence is unavailable. These pointers select evidence in the
-  input; they do not add a new response shape.
-
-### Recipe and hardware
-
-Data v8 mixes the compositional v6 generator (60%), commercially filtered
-tasksource data (30%) and rendered receipt images (10%). The optimizer is AdamW
-at `2e-4`, one parameter group, 20 warmup steps, warmup-stable-decay with a 20%
-decay phase, approximately 64K tokens per step, and bf16.
-
-Experiments used an RTX PRO 6000 rental and the two Spark hosts. Host B's training
-environment was subsequently approved on 2026-11-04 ("use it as well") and made
-the same way as host A's; installed versions, including flash-linear-attention
-and fla-core, are in AGENTS.md. Two-Spark DDP measured 1.73× one Spark. The rank-0
-resume broadcast fix made the distributed run crash-safe. This records completed
-experiments and approvals, not permission for another rental or live session.
-
-### Measured evidence and limits
-
-At 15 million training tokens, seeds 42 and 7 respectively, on the held-out
-compositional suite:
-
-| Metric | Seed 42 | Seed 7 |
-|---|---:|---:|
-| Text | 0.90 | 0.92 |
-| Number | 0.78 | 0.68 |
-| Duration | 0.75 | 0.75 |
-| Date | 0.91 | 0.84 |
-| Datetime | 0.84 | 0.74 |
-| Time | 0.91 | 0.82 |
-| Non-empty lists, exact | 0.44 | 0.46 |
-| Tasksource text | 0.66 | 0.64 |
-| Null accuracy | 0.997 | 0.976 |
-| Confidence ECE, uncalibrated | 0.14 | 0.18 |
-
-List item F1 was 0.88. Evidence-pointer estimates had 24% lower pinball loss
-than bounds-only estimates, and history forecasts improved by 61–65%.
-Per-step scenario forecasts were not learned: their improvements were −1% and
-−8%, so they are not a demonstrated strength of this release. These are pilot
-measurements, not results of the 100-million-token main run or live engine
-qualification. The main run is being launched separately; its results and serving
-qualification remain release gates.
-
-### Release boundary
-
-Extraction support ships with 0.2.0 after the integration line, preserving its
-embeddings and tracing support. This supersedes the original decisions 13–14;
-the extraction branch is `feat/extraction-models-0.2.0`, based on
-`integration/0.2.0-on-0.1.11`.
+The owner chose one release-candidate pull request containing the 0.2.0
+integration and extraction support, rather than requiring the integration to land
+separately. Main's schema v59 remains the browser-auth migration; embeddings,
+LMCache defaults, tracing and extraction use v60–63 in that order. Earlier
+integration databases with conflicting v59–62 stamps are refused rather than
+migrated under the wrong schema assumptions. Existing integration behavior,
+readiness evidence and lifecycle/lease gates remain intact.
 
 Table/record extraction is deferred to a follow-up release. It is not another
 spelling of `list`, is not an accepted field type, and does not change this
-release's probes. The proposed contract, model approach and remaining decisions
-are in [Extraction records](../../specs/extraction-records.md).
+release's probes. The proposed contract and remaining decisions are in
+[Extraction records](../../specs/extraction-records.md).
 
-## Amendment of 2026-11-12: ShardioAI ownership and publication
-
-The owner moved the model project under ShardioAI. The private GitHub repository
-is now [`ShardioAI/extract`](https://github.com/ShardioAI/extract), transferred
-from `edurdias/capyctl-extract`. This supersedes the repository/server/model names
-recorded in the original 2026-11-04 decisions, without rewriting their history.
-
-The public Hugging Face model ID is `ShardioAI/extract-4b`; CapyCTL serves it as
-`extract-4b`. The Python package is `shardio_extract`, with module commands
-`python -m shardio_extract.<module>` and the `shardio-extract` server executable.
-There is no old-package compatibility alias. Existing checkpoint metadata and
-state-dict keys remain loadable without migration.
-
-Packaging defaults to `ShardioAI/extract-4b`, retains `--publisher ORG/REPO`,
-and never uploads. Hugging Face publication waits for the owner's approval;
-the name is not a claim that weights have been published or qualified. This
-amendment does not release either project or change its version.
-
-Approved host directories, including `~/capyctl-extract-train-venv`,
-`~/capyctl-extract-serve-venv`, `~/capyctl-extract-runs/` and
-`~/capyctl-extract-src-*`, retain their names. Renaming the code does not
-authorize changing an engine environment. The wire contract, nine field types,
-readiness/wake checks, and outstanding live/model-quality gates are unchanged.
-
+**Input-capability gap.** A manifest declares `field_types`, not accepted input
+modalities. The router therefore cannot reject images or PDFs before activation
+based on a text-only engine's declaration. Engines must reject unsupported inputs
+themselves; the fixed text-only readiness probe proves no image or PDF support.
+No text-only/media capability declaration or media qualification is included in
+this release. The current PDF completion checks remain strict.

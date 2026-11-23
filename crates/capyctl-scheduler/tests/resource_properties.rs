@@ -11,7 +11,7 @@ proptest! {
         let state = LedgerSnapshot { epoch: 1, owners: [
             ("a".into(), f(ResourcePhase::Parked, old)),
         ].into() };
-        let obs = [MemoryObservation { domain: "system".into(), capacity_bytes: 128,
+        let obs = [MemoryObservation { outside_processes: None, domain: "system".into(), capacity_bytes: 128,
             available_bytes: 128 - old, sampled_at_ms: 100 }];
         let limits = [MemoryLimit { domain: "system".into(), managed_bytes: peak,
             free_reserve_bytes: 12, reserve_absorbs_unmanaged: false, host_kv_bytes: None, parked_bytes: None }];
@@ -41,6 +41,7 @@ fn categories_and_domains_do_not_create_capacity() {
         owners: [("a".into(), f("system", 40, 9))].into(),
     };
     let obs = [MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 128,
         available_bytes: 88,
@@ -167,6 +168,7 @@ fn parked_and_timestamp_limits_are_enforced() {
         devices: vec![],
     };
     let mut obs = [MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 128,
         available_bytes: 128,
@@ -235,12 +237,14 @@ fn spare_system_memory_cannot_cover_a_full_discrete_gpu() {
     };
     let obs = [
         MemoryObservation {
+            outside_processes: None,
             domain: "system".into(),
             capacity_bytes: 128,
             available_bytes: 128,
             sampled_at_ms: 100,
         },
         MemoryObservation {
+            outside_processes: None,
             domain: "gpu-memory:0".into(),
             capacity_bytes: 48,
             available_bytes: 48,

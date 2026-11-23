@@ -59,6 +59,7 @@ impl Fixture {
                 capacity_bytes: 100,
                 available_bytes: 100,
                 sampled_at_ms: 100,
+                outside_processes: None,
             }],
             floors: vec![],
             limits: vec![MemoryLimit {
@@ -741,6 +742,7 @@ fn retained_recipe_matching_ignores_allocation_and_device_order() {
         capacity_bytes: 100,
         available_bytes: 100,
         sampled_at_ms: 100,
+        outside_processes: None,
     });
     f.limits.push(MemoryLimit {
         domain: "other".into(),
@@ -839,6 +841,7 @@ mod host_scoped {
             capacity_bytes: 100,
             available_bytes: 100,
             sampled_at_ms: 1_000,
+            outside_processes: None,
         }];
         for id in ["host-one", "host-two"] {
             store
@@ -877,6 +880,7 @@ mod host_scoped {
             capacity_bytes: 100,
             available_bytes: 100,
             sampled_at_ms: 100,
+            outside_processes: None,
         }];
         let limits = vec![MemoryLimit {
             domain: ours.clone(),

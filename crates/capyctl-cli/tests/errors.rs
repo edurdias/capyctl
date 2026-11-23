@@ -104,6 +104,29 @@ fn a_store_from_a_newer_version_is_a_non_restartable_refusal() {
     }
 }
 
+// T33: ambiguous prerelease schemas require recovery, not a restart loop.
+#[test]
+fn an_incompatible_prerelease_store_is_a_non_restartable_refusal() {
+    for error in [
+        capyctl_cli::roles::StartError::Store(
+            capyctl_store::StoreError::IncompatiblePrereleaseSchema { found: 59 },
+        ),
+        capyctl_cli::roles::StartError::Ownership(capyctl_controller::OwnedStateError::Store(
+            capyctl_store::StoreError::IncompatiblePrereleaseSchema { found: 59 },
+        )),
+    ] {
+        let e = StructuredError::from(error);
+        assert_eq!(e.code, capyctl_cli::output::STORE_FROM_NEWER_VERSION);
+        assert_eq!(e.exit_code(), ExitCode::UNSUPPORTED);
+        assert!(e.message.contains("59"), "{}", e.message);
+        assert!(
+            e.message.contains("pre-release") && e.message.contains("Back up"),
+            "{}",
+            e.message
+        );
+    }
+}
+
 // T06 (SPEC §4.1, ADR 0016, owner decision 2026-09-24): a host the controller
 // revoked exits with its own code, distinct from every other one, and says
 // how to recover with the real CLI verbs. The packaged host units list this

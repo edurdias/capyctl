@@ -12,7 +12,7 @@ use crate::schema::{
     SCHEMA_V39, SCHEMA_V4, SCHEMA_V40, SCHEMA_V41, SCHEMA_V42, SCHEMA_V43, SCHEMA_V44, SCHEMA_V45,
     SCHEMA_V46, SCHEMA_V47, SCHEMA_V48, SCHEMA_V49, SCHEMA_V5, SCHEMA_V50, SCHEMA_V51, SCHEMA_V52,
     SCHEMA_V53, SCHEMA_V54, SCHEMA_V55, SCHEMA_V56, SCHEMA_V57, SCHEMA_V58, SCHEMA_V59, SCHEMA_V6,
-    SCHEMA_V60, SCHEMA_V61, SCHEMA_V62, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V60, SCHEMA_V61, SCHEMA_V62, SCHEMA_V63, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1. Not formatted by
@@ -102,15 +102,17 @@ pub const MIGRATIONS: &[&str] = &[
     // ADR 0035 §§2, 3: GPU-set resolutions, each instance's chosen set and N,
     // and the measured peak and residue keyed by N.
     SCHEMA_V58,
-    // ADR 0036 §§5, 6: an embeddings launch's wake canary reference.
+    // ADR 0040 §§4, 5, 7: browser sessions and one-time sign-in links.
     SCHEMA_V59,
+    // ADR 0036 §§5, 6: an embeddings launch's wake canary reference.
+    SCHEMA_V60,
     // ADR 0034 §§3a, 4: the reported pool basis per checkpoint, and how each
     // launch's LMCache pool was sized and whether it runs uncertified.
-    SCHEMA_V60,
-    // ADR 0037 §7: each launch's engine tracing decision.
     SCHEMA_V61,
-    // ADR 0041 §4: an extraction launch's wake canary reference.
+    // ADR 0037 §7: each launch's engine tracing decision.
     SCHEMA_V62,
+    // ADR 0041 §4: an extraction launch's wake canary reference.
+    SCHEMA_V63,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -158,6 +160,20 @@ pub(crate) fn apply_through(conn: &Connection, last: i64) -> Result<(), StoreErr
             found: current,
             supported: latest_version(),
         });
+    }
+    // Released v59 is browser auth. Pre-release extraction builds used v59
+    // for embeddings and v60–62 for other changes, so their stamps cannot
+    // safely select this migration sequence. Refuse before any write.
+    if current >= 59 {
+        let has_released_v59: bool = conn.query_row(
+            "SELECT COUNT(*)=2 FROM sqlite_master
+              WHERE type='table' AND name IN ('ui_sessions','ui_signin_links')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_released_v59 {
+            return Err(StoreError::IncompatiblePrereleaseSchema { found: current });
+        }
     }
     for (index, sql) in MIGRATIONS.iter().enumerate() {
         let version = (index + 1) as i64;
@@ -238,11 +254,11 @@ pub(crate) fn apply_through(conn: &Connection, last: i64) -> Result<(), StoreErr
             // ADR 0035 §2: each instance's chosen GPU set and its N.
             crate::instances::migrate_v58(&tx)?;
         }
-        if version == 60 {
+        if version == 61 {
             // ADR 0034 §§3a, 4: the reported pool basis, and each launch's
             // pool sizing and certification.
-            crate::checkpoint_digests::migrate_v60(&tx)?;
-            crate::ordinary_lifecycle::lmcache::migrate_v60(&tx)?;
+            crate::checkpoint_digests::migrate_v61(&tx)?;
+            crate::ordinary_lifecycle::lmcache::migrate_v61(&tx)?;
         }
         if version == 28 {
             // SPEC §6.5 (ADR 0013 amendment): the warm-residency flag.
@@ -260,6 +276,103 @@ pub(crate) fn apply_through(conn: &Connection, last: i64) -> Result<(), StoreErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T33: ambiguous pre-release version stamps never select a released
+    // migration, including when no migration would otherwise be needed.
+    #[test]
+    fn prerelease_extraction_schemas_are_refused_without_writes() {
+        for version in 59..=62 {
+            let conn = Connection::open_in_memory().unwrap();
+            apply_through(&conn, 58).unwrap();
+            conn.execute_batch(SCHEMA_V60).unwrap();
+            if version >= 60 {
+                let tx = conn.unchecked_transaction().unwrap();
+                crate::checkpoint_digests::migrate_v61(&tx).unwrap();
+                crate::ordinary_lifecycle::lmcache::migrate_v61(&tx).unwrap();
+                tx.commit().unwrap();
+            }
+            if version >= 61 {
+                conn.execute_batch(SCHEMA_V62).unwrap();
+            }
+            if version >= 62 {
+                conn.execute_batch(SCHEMA_V63).unwrap();
+            }
+            for stamp in 59..=version {
+                conn.execute("INSERT INTO schema_migrations VALUES(?1)", [stamp])
+                    .unwrap();
+            }
+            let schema = || {
+                conn.prepare("SELECT sql FROM sqlite_master ORDER BY name")
+                    .unwrap()
+                    .query_map([], |r| r.get::<_, Option<String>>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            let changes = || {
+                conn.query_row("SELECT total_changes()", [], |r| r.get::<_, i64>(0))
+                    .unwrap()
+            };
+            let before = schema();
+            let changes_before = changes();
+            for last in [version, latest_version()] {
+                let error = apply_through(&conn, last).unwrap_err();
+                assert!(matches!(
+                    &error,
+                    StoreError::IncompatiblePrereleaseSchema { found } if *found == version
+                ));
+                let message = error.to_string();
+                assert!(message.contains("pre-release extraction/0.2.0"));
+                assert!(message.contains("Back up the store"));
+                assert!(message.contains("recreate"));
+                assert_eq!(changes(), changes_before);
+                assert_eq!(schema(), before);
+            }
+        }
+    }
+
+    // T33: a released main v59 store keeps its authentication state while
+    // acquiring all extraction integration migrations.
+    #[test]
+    fn released_v59_authentication_survives_the_extraction_upgrade() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_through(&conn, 59).unwrap();
+        conn.execute_batch(
+            "INSERT INTO ui_signin_links VALUES(zeroblob(32),zeroblob(32),100,7);
+             INSERT INTO ui_sessions VALUES('00000000000000000000000000',
+                 zeroblob(32),zeroblob(32),'browser',1,2,3);",
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let session: (String, String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT session_id,label,created_at_ms,last_seen_at_ms,cookie_refreshed_at_ms
+                   FROM ui_sessions WHERE token_digest=zeroblob(32) AND admin_fingerprint=zeroblob(32)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            session,
+            (
+                "00000000000000000000000000".into(),
+                "browser".into(),
+                1,
+                2,
+                3
+            )
+        );
+        let link: (i64, i64) = conn
+            .query_row(
+                "SELECT expires_at_ms,consumed_at_ms FROM ui_signin_links
+                  WHERE token_digest=zeroblob(32) AND admin_fingerprint=zeroblob(32)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(link, (100, 7));
+    }
 
     #[test]
     fn v9_preserves_history_and_enforces_association_foreign_keys() {
@@ -474,6 +587,45 @@ mod tests {
         .unwrap();
     }
 
+    // T33 (ADR 0040 §§4, 5, 7, v59): migrating a v58 store keeps every existing
+    // row, adds the session and sign-in link tables empty, and stamps the
+    // store at `MIGRATIONS.len()`.
+    #[test]
+    fn v59_adds_ui_sessions_and_keeps_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        apply_through(&conn, 58).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version,revision) VALUES('a','a','model','ready',1,0,4,1,2);
+            INSERT INTO startup_measurements(deployment_id,revision,host_id,installation,tensor_parallel,domain,peak_bytes,step_id,measured_at_ms) VALUES('a',2,'host-a','vllm@1',2,'gpu0',12,'s1',7);
+            INSERT INTO enrolled_hosts(host_id,host_name,key_digest) VALUES('h1','lab','k1');"#,
+        )
+        .unwrap();
+        let rows = |conn: &Connection| -> (i64, i64, i64, i64) {
+            conn.query_row(
+                "SELECT (SELECT current_generation FROM deployments WHERE id='a'),
+                        (SELECT revision FROM deployments WHERE id='a'),
+                        (SELECT peak_bytes FROM startup_measurements WHERE tensor_parallel=2),
+                        (SELECT COUNT(*) FROM enrolled_hosts WHERE host_name='lab')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        };
+        let before = rows(&conn);
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(rows(&conn), before);
+        assert_eq!(before, (4, 2, 12, 1));
+        let n = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(n("SELECT COUNT(*) FROM ui_sessions"), 0);
+        assert_eq!(n("SELECT COUNT(*) FROM ui_signin_links"), 0);
+        assert_eq!(
+            n("SELECT MAX(version) FROM schema_migrations"),
+            MIGRATIONS.len() as i64
+        );
+    }
+
     /// ADR 0019 §3 (v52): a startup peak recorded before the per-domain key
     /// keeps its value and takes the domain of its revision's one cold
     /// allocation; one whose revision is not stored is not carried over. A
@@ -628,17 +780,17 @@ mod tests {
         }
     }
 
-    /// ADR 0034 §§3a, 4 (v60): a sizing, a digest and a launch recorded
-    /// before v60 read an unknown pool basis, an unknown pool source and a
+    /// ADR 0034 §§3a, 4 (v61): a sizing, a digest and a launch recorded
+    /// before v61 read an unknown pool basis, an unknown pool source and a
     /// certified run; the columns take positive figures, a closed source and
-    /// bounded text only; applying v60 again changes nothing; a reported
+    /// bounded text only; applying v61 again changes nothing; a reported
     /// basis reads back from the digest before the sizing.
     // T45
     #[test]
-    fn v60_adds_the_pool_basis_and_certification_idempotently() {
+    fn v61_adds_the_pool_basis_and_certification_idempotently() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-        apply_through(&conn, 59).unwrap();
+        apply_through(&conn, 60).unwrap();
         let digest = format!("sha256:{}", "a".repeat(64));
         conn.execute(
             "INSERT INTO checkpoint_digests(deployment_id,revision,state,host_id,expected,digest,weights_bytes,provisional,diagnostic,updated_at_ms) VALUES('a',1,'recorded','h',NULL,?1,1,0,NULL,1)",
@@ -658,8 +810,8 @@ mod tests {
         apply(&conn).unwrap();
         {
             let tx = conn.unchecked_transaction().unwrap();
-            crate::checkpoint_digests::migrate_v60(&tx).unwrap();
-            crate::ordinary_lifecycle::lmcache::migrate_v60(&tx).unwrap();
+            crate::checkpoint_digests::migrate_v61(&tx).unwrap();
+            crate::ordinary_lifecycle::lmcache::migrate_v61(&tx).unwrap();
             tx.commit().unwrap();
         }
         assert_eq!(
@@ -1647,7 +1799,7 @@ mod tests {
              VALUES('a',0,3,'inc','Say ready.','[1,2]','ok',7,'op-w');",
         )
         .unwrap();
-        // Stop at v49: its own row shape is what this test checks (v59
+        // Stop at v49: its own row shape is what this test checks (v60
         // widens the table).
         apply_through(&conn, 49).unwrap();
         apply_through(&conn, 49).unwrap();
@@ -1686,21 +1838,21 @@ mod tests {
         .unwrap();
     }
 
-    // T47, T20 (ADR 0036 §6): completion and decision references of a v58
-    // store are carried to v59 unchanged with no vector; the rebuilt table
+    // T47, T20 (ADR 0036 §6): completion and decision references of a v59
+    // store are carried to v60 unchanged with no vector; the rebuilt table
     // accepts an embedding reference only with its tolerance and a vector of
     // four bytes per dimension.
     #[test]
-    fn v59_carries_canaries_and_types_embedding_references() {
+    fn v60_carries_canaries_and_types_embedding_references() {
         let conn = Connection::open_in_memory().unwrap();
-        apply_through(&conn, 58).unwrap();
+        apply_through(&conn, 59).unwrap();
         conn.execute_batch(
             "INSERT INTO wake_canaries VALUES('a',0,3,'inc','Say ready.','[1,2]','ok',7,'op-w','completion',1,NULL,NULL);
              INSERT INTO wake_canaries VALUES('a',1,3,'inc','decision/v1','[]','',8,NULL,'decision',1,'{}',0.05);",
         )
         .unwrap();
-        apply_through(&conn, 59).unwrap();
-        apply_through(&conn, 59).unwrap();
+        apply_through(&conn, 60).unwrap();
+        apply_through(&conn, 60).unwrap();
         let rows: Vec<String> = conn
             .prepare(
                 "SELECT kind||'|'||prompt||'|'||tokens_json||'|'||text||'|'||recorded_at_ms||'|'||coalesce(mismatch_operation_id,'')
@@ -1749,14 +1901,14 @@ mod tests {
             .unwrap();
     }
 
-    // T20 T45 T47 T48 (ADR 0036 §§5, 6, ADR 0034 §§3a, 4, ADR 0037 §7): a
-    // v58 store upgrades through v59 (embeddings canary), v60 (LMCache pool
-    // basis and certification) and v61 (engine tracing) in that order, in
-    // one open: its canaries carry no vector, its LMCache rows read an
-    // unknown pool basis and a certified run, and each launch's engine
-    // tracing table exists, empty.
+    // T20 T33 T45 T47 T48 (ADR 0040 §§4, 5, 7, ADR 0036 §§5, 6,
+    // ADR 0034 §§3a, 4, ADR 0037 §7): a v58 store upgrades through v59
+    // (browser auth), v60 (embeddings canary), v61 (LMCache pool basis and
+    // certification) and v62 (engine tracing) in that order, in one open:
+    // its canaries carry no vector, its LMCache rows read an unknown pool
+    // basis and a certified run, and the new tables exist, empty.
     #[test]
-    fn a_v58_store_upgrades_through_v61() {
+    fn a_v58_store_upgrades_through_v62() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         apply_through(&conn, 58).unwrap();
@@ -1766,7 +1918,7 @@ mod tests {
                VALUES('b','a',0,1,1,'h','auto','off','disabled');",
         )
         .unwrap();
-        apply_through(&conn, 61).unwrap();
+        apply_through(&conn, 62).unwrap();
         let versions: Vec<i64> = conn
             .prepare("SELECT version FROM schema_migrations WHERE version > 58 ORDER BY version")
             .unwrap()
@@ -1774,7 +1926,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(versions, [59, 60, 61]);
+        assert_eq!(versions, [59, 60, 61, 62]);
         let canary: (Option<i64>, Option<Vec<u8>>) = conn
             .query_row("SELECT dimension, vector FROM wake_canaries", [], |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -1795,6 +1947,12 @@ mod tests {
             })
             .unwrap();
         assert_eq!(traced, 0);
+        for table in ["ui_signin_links", "ui_sessions"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0);
+        }
         conn.execute(
             "INSERT INTO launch_engine_tracing(binding_id,state,reason) VALUES('b','off','engine_unsupported')",
             [],
@@ -1802,14 +1960,14 @@ mod tests {
         .unwrap();
     }
 
-    // T50: ADR 0041 §4: v62 preserves every v61 reference byte-for-byte,
+    // T50: ADR 0041 §4: v63 preserves every v62 reference byte-for-byte,
     // including mismatch markers, while admitting only the extraction payload
     // shape and keeping the existing kinds' constraints and primary-key index.
     #[test]
-    fn v62_preserves_all_canary_kinds_and_types_extraction_payloads() {
-        assert_eq!(latest_version(), 62);
+    fn v63_preserves_all_canary_kinds_and_types_extraction_payloads() {
+        assert_eq!(latest_version(), 63);
         let conn = Connection::open_in_memory().unwrap();
-        apply_through(&conn, 61).unwrap();
+        apply_through(&conn, 62).unwrap();
         conn.execute_batch(
             "INSERT INTO wake_canaries VALUES('a',0,3,'chat','Say ready.','[1,2]','ok',7,'op-w','completion',1,NULL,NULL,NULL,NULL);
              INSERT INTO wake_canaries VALUES('a',1,4,'decision','decision/v1','[]','',8,'op-d','decision',1,'{\"choice\":\"yes\",\"probabilities\":[[\"yes\",1.0]]}',0.05,NULL,NULL);

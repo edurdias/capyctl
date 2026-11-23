@@ -31,7 +31,8 @@ async fn the_quickstart_deployment_places_on_a_fresh_standalone() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let router = app.management_router();
-    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let server =
+        tokio::spawn(async move { support::serve_management(listener, router).await.unwrap() });
     let credentials = std::fs::read_to_string(state.path().join("identity/credentials")).unwrap();
     let admin = credentials
         .lines()

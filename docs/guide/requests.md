@@ -446,7 +446,7 @@ A deployment with `api: extractions`
 curl -s http://127.0.0.1:8443/v1/systemone \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{
-    "model": "extract-4b",
+    "model": "extractor",
     "state": "Order A-88412 cost 649.00 USD and arrived on 2026-09-28.",
     "reference_date": "2026-10-09",
     "fields": {
@@ -520,35 +520,26 @@ percentiles describe an 80% interval. Extra engine members are preserved.
 With `options.include_quantiles`, an estimate's `quantiles` is a 99-element
 array for percentiles 1 through 99; a forecast has one such array per step.
 `options.return_state_text` echoes the input as `state_text` in the response.
-`mode` and `computation` are not public response members; internal diagnostics
-use `raw['_mode']` and `raw['_computation']`.
+There are no public `mode` or `computation` response members.
 
-The `ShardioAI/extract-4b` model (served as `extract-4b`) has an 8192-token context and reports truncation.
-It does not support PDFs or extracting text from images. Image-only `text`
-and text-list fields fail before inference with `field_unsupported_input`;
-images still support other field types. This is engine validation for that
-model, not a router restriction on other extraction models. Text spans in mixed
-requests refer to their textual `state`.
+### Input support
 
-Its measured `usage.state_tokens`, `image_tokens` and `schema_tokens` aggregate
-across prefix passes. Image tokens count the processor-produced visual prefix,
-including vision delimiters. Schema tokens include both schema copies, markers,
-reference/control text and candidate suffixes. `passes` counts full-prefix
-field groups, not cached candidate-suffix evaluations.
+The custom manifest's `field_types` declares output types only. It cannot
+declare text-only or media input support, and `/v1/models` does not advertise
+those input capabilities. CapyCTL validates the closed request shape, not whether
+the engine supports its inputs. A text-only engine must reject unsupported
+image input; accepting an `images` member at the router is not a claim that the
+engine can process it or extract text from it. Text spans in mixed requests
+still refer to textual `state`. The fixed readiness probe uses text only and
+does not qualify media handling.
 
-### Provider compatibility
+PDF files and PDF request members are not part of this contract. CapyCTL does
+not parse PDFs or perform OCR. Convert a PDF to text in `state`, or to page
+images only when the engine supports them, within the four-image and body
+bounds. Context length, truncation behavior and usage details depend on the
+engine and checkpoint; the router does not supply a universal token limit.
 
-A future OpenRouter-compatible `/api/alpha/extractions` boundary adapter is not
-part of 0.2.0. These differences from OpenRouter's live Extractions contract
-are deliberate; callers must use the CapyCTL contract:
-
-| Area | CapyCTL 0.2.0 | OpenRouter Extractions |
-|---|---|---|
-| Route | `POST /v1/systemone` | `/api/alpha/extractions` |
-| Images | top-level `images` | `assets` |
-| Options | top-level `options` | `provider.options` |
-| Errors | string error codes | numeric error codes |
-| Request size | 8 MiB at host ingress | Clairic: 16 MiB |
+### Response forwarding and completion
 
 CapyCTL forwards the body with the engine's served model name and returns
 the whole answer with the public name. Completion evidence follows decisions:

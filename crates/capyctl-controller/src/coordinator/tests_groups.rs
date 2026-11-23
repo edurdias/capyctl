@@ -1122,6 +1122,7 @@ impl ServiceObservation for WorldObservations {
                     capacity_bytes: 1 << 50,
                     available_bytes: 1 << 50,
                     sampled_at_ms: now,
+                    outside_processes: None,
                 })
                 .collect(),
             None => self
@@ -1709,6 +1710,7 @@ impl GroupWorld {
                         capacity_bytes: 1 << 50,
                         available_bytes: 1 << 50,
                         sampled_at_ms: 1,
+                        outside_processes: None,
                     }],
                     1,
                 )

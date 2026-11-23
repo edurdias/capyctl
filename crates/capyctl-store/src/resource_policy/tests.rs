@@ -58,6 +58,7 @@ fn host() -> HostPolicy {
 
 fn observations() -> Vec<MemoryObservation> {
     vec![MemoryObservation {
+        outside_processes: None,
         domain: "system".into(),
         capacity_bytes: 100,
         available_bytes: 90,
@@ -1392,6 +1393,7 @@ fn discrete_host() -> HostPolicy {
 fn discrete_observations() -> Vec<MemoryObservation> {
     let mut all = observations();
     all.push(MemoryObservation {
+        outside_processes: None,
         domain: "gpu0".into(),
         capacity_bytes: 80,
         available_bytes: 70,

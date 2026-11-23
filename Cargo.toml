@@ -5,12 +5,12 @@ members = [
   "crates/capyctl-protocol", "crates/capyctl-controller", "crates/capyctl-router",
   "crates/capyctl-agent", "crates/capyctl-adapters", "crates/capyctl-launchers",
   "crates/capyctl-config", "crates/capyctl-cli", "crates/capyctl-management",
-  "crates/capyctl-testkit", "crates/capyctl-trace", "tests/harness",
+  "crates/capyctl-testkit", "crates/capyctl-trace", "crates/capyctl-webui", "tests/harness",
 ]
 
 [workspace.package]
 edition = "2021"
-version = "0.1.11"
+version = "0.1.12"
 license = "Apache-2.0"
 
 [workspace.dependencies]

@@ -16,7 +16,7 @@
 //! host-reported engine load and the running limit with its source. A
 //! deployment ID that names none is `404 not_found`. It reads the store, so
 //! reads are bounded like the snapshot's: two at a time, the rest refused.
-use crate::{error, ManagementCredentials};
+use crate::error;
 use axum::{
     extract::{Request, State},
     http::{header, StatusCode},
@@ -43,43 +43,21 @@ where
 }
 
 struct MetricsState {
-    credentials: ManagementCredentials,
     source: Arc<dyn LatencySource>,
 }
 
-/// The routes of this module share one authentication.
-trait Authenticated: Send + Sync + 'static {
-    fn credentials(&self) -> &ManagementCredentials;
-}
-impl Authenticated for MetricsState {
-    fn credentials(&self) -> &ManagementCredentials {
-        &self.credentials
-    }
-}
-
-pub fn latency_router(
-    credentials: ManagementCredentials,
-    source: Arc<dyn LatencySource>,
-) -> Router {
-    let state = Arc::new(MetricsState {
-        credentials,
-        source,
-    });
+pub fn latency_router(source: Arc<dyn LatencySource>) -> Router {
+    let state = Arc::new(MetricsState { source });
     Router::new()
         .route("/management/v1/metrics/latency", get(latency))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            authenticate::<MetricsState>,
-        ))
+        .layer(middleware::from_fn(authenticate))
         .with_state(state)
 }
 
-async fn authenticate<S: Authenticated>(
-    State(state): State<Arc<S>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let mut response = if !state.credentials().accepts(&request) {
+/// The routes of this module share one authentication. ADR 0040 §2: the
+/// principal is the composition's.
+async fn authenticate(request: Request, next: Next) -> Response {
+    let mut response = if !crate::authorized(&request) {
         error(StatusCode::UNAUTHORIZED, "unauthenticated", false)
     } else {
         next.run(request).await
@@ -142,29 +120,19 @@ where
 }
 
 struct LoadState {
-    credentials: ManagementCredentials,
     source: Arc<dyn LoadSource>,
     /// At most two blocking reads at once, as the snapshot route.
     reads: Arc<Semaphore>,
 }
-impl Authenticated for LoadState {
-    fn credentials(&self) -> &ManagementCredentials {
-        &self.credentials
-    }
-}
 
-pub fn load_router(credentials: ManagementCredentials, source: Arc<dyn LoadSource>) -> Router {
+pub fn load_router(source: Arc<dyn LoadSource>) -> Router {
     let state = Arc::new(LoadState {
-        credentials,
         source,
         reads: Arc::new(Semaphore::new(2)),
     });
     Router::new()
         .route("/management/v1/metrics/load", get(load))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            authenticate::<LoadState>,
-        ))
+        .layer(middleware::from_fn(authenticate))
         .with_state(state)
 }
 

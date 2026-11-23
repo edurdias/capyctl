@@ -238,43 +238,50 @@ fn a_selector_the_host_labels_do_not_match_is_refused() {
     );
 }
 
-// T03 T07 (ADR 0018 §2): a runtime profile registered with `capyctl engine add`
-// lives in the engines.yaml beside the host document, where the host role
-// merges it and deploy finds it published; validate resolves against the same
-// merged document instead of refusing the profile as unknown.
+// T03 T07 (ADR 0018 §2, amendment A4): a runtime profile registered with
+// `capyctl engine add` lives in the engines.yaml in the host's state
+// directory, where the host role merges it and deploy finds it published;
+// validate resolves against the same merged document instead of refusing the
+// profile as unknown. Before the role's first start after the upgrade, the
+// file beside the host document, which that start brings over, is the one.
 #[test]
-fn a_profile_registered_beside_the_host_document_resolves() {
-    let dir = tempfile::tempdir().unwrap();
-    let host = write(
-        dir.path(),
-        "host.yaml",
-        &host_document(dir.path()).to_string(),
-    );
-    let profile = host_document(dir.path())["runtime_profiles"]["local"].clone();
-    write(
-        dir.path(),
-        "engines.yaml",
-        &json!({"schema_version": 1, "kind": "engines",
-            "runtime_profiles": {"registered": profile}})
-        .to_string(),
-    );
-    let mut doc = deployment_document();
-    doc["runtime_profile"] = json!("registered");
-    let deployment = write(dir.path(), "deployment.yaml", &doc.to_string());
-    let (code, value, raw) = validate(&[
-        "--file",
-        deployment.to_str().unwrap(),
-        "--host",
-        host.to_str().unwrap(),
-    ]);
-    assert_eq!(code, 0, "{raw}");
-    assert_eq!(value["valid"], true, "{raw}");
-    // What only a running server can check is named, not implied.
-    let unchecked = value["requires_server"].to_string();
-    assert!(
-        unchecked.contains("host_unpublished") && unchecked.contains("route_conflict"),
-        "{raw}"
-    );
+fn a_registered_profile_resolves_from_the_state_directory_or_before_migration() {
+    for beside_document in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let host_doc = host_document(dir.path());
+        let host = write(dir.path(), "host.yaml", &host_doc.to_string());
+        let engines_dir = if beside_document {
+            dir.path().to_path_buf()
+        } else {
+            let state = std::path::PathBuf::from(host_doc["state_dir"].as_str().unwrap());
+            std::fs::create_dir_all(&state).unwrap();
+            state
+        };
+        write(
+            &engines_dir,
+            "engines.yaml",
+            &json!({"schema_version": 1, "kind": "engines",
+                "runtime_profiles": {"registered": host_doc["runtime_profiles"]["local"].clone()}})
+            .to_string(),
+        );
+        let mut doc = deployment_document();
+        doc["runtime_profile"] = json!("registered");
+        let deployment = write(dir.path(), "deployment.yaml", &doc.to_string());
+        let (code, value, raw) = validate(&[
+            "--file",
+            deployment.to_str().unwrap(),
+            "--host",
+            host.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "beside_document={beside_document}: {raw}");
+        assert_eq!(value["valid"], true, "{raw}");
+        // What only a running server can check is named, not implied.
+        let unchecked = value["requires_server"].to_string();
+        assert!(
+            unchecked.contains("host_unpublished") && unchecked.contains("route_conflict"),
+            "{raw}"
+        );
+    }
 }
 
 // T03

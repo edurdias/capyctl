@@ -197,6 +197,7 @@ fn setup() -> (Store, crate::dispatch::CoordinatorSession, Value, Value) {
             &session,
             &effective.host,
             &[capyctl_domain::resources::MemoryObservation {
+                outside_processes: None,
                 domain: "unified".into(),
                 capacity_bytes: 64 << 30,
                 available_bytes: 60 << 30,

@@ -35,9 +35,18 @@ Only the owner publishes a release. Contributors and automation stop at a draft.
      `scripts/verify-packaging.sh`, and uploads a `release-assets` artifact
      holding both tarballs, `install.sh` and `SHA256SUMS`. It never publishes.
    - Or build locally on one x86_64 and one aarch64 Linux machine with the same
-     Rust version: `packaging/release.sh dist` on each, copy both tarballs and
+     Rust version. First build the web UI from the same commit with Node 22
+     (`cd web && npm ci && npm run build`); `release.sh` refuses to package
+     when `web/dist/index.html` is missing or was built from another commit.
+     Then run `packaging/release.sh dist` on each, copy both tarballs and
      their `.sha256` files into one directory with `install.sh`, then run
      `packaging/release.sh --sums <dir>`.
+
+   ADR 0040 §13: `BUILDINFO` records `web_bundle`, the SHA-256 digest of a
+   sorted SHA-256 manifest of every file under `web/dist/` (relative paths,
+   independent of timestamps). Both builds must embed this same bundle and
+   produce byte-identical archives. Development builds without `web/dist/`
+   instead serve a small no-UI page; packaging never accepts that substitute.
 
 3. **Run the privacy scan locally.** Hosted runners do not have the private
    denylist, so their packaging check reports the denylist and lab-host checks

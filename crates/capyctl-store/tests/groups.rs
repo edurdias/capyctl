@@ -217,6 +217,7 @@ impl Fixture {
                 (
                     host.clone(),
                     [MemoryObservation {
+                        outside_processes: None,
                         domain: domain(host),
                         capacity_bytes: bytes,
                         available_bytes: bytes,

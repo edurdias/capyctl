@@ -3,6 +3,7 @@
 //! through the ordinary cleanup path when the host reconnects; the host takes
 //! no new placements while any of them is unsettled. Fake-engine tests only;
 //! not qualification.
+mod support;
 use axum::{
     body::{to_bytes, Body},
     http::Request,
@@ -99,13 +100,15 @@ async fn setup() -> Setup {
     let source = Arc::new(OwnedActionSource::new(configuration, worker.commands()).unwrap());
     let credentials =
         || ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap();
-    let actions = lifecycle_router(credentials(), source.clone());
+    let actions = support::composed(credentials(), lifecycle_router(source.clone()));
     let presence = online.clone();
-    let drain = drain_router_with_presence(
+    let drain = support::composed(
         credentials(),
-        source,
-        Vec::new(),
-        Arc::new(move |host: &str| host == "lab" && presence.load(Ordering::SeqCst)),
+        drain_router_with_presence(
+            source,
+            Vec::new(),
+            Arc::new(move |host: &str| host == "lab" && presence.load(Ordering::SeqCst)),
+        ),
     );
     Setup {
         dir,

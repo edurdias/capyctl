@@ -32,6 +32,7 @@ fn setup() -> (Store, CoordinatorSession, Value, Value) {
             &session,
             &effective.host,
             &[capyctl_domain::resources::MemoryObservation {
+                outside_processes: None,
                 domain: "unified".into(),
                 capacity_bytes: 64 << 30,
                 available_bytes: 60 << 30,
@@ -308,6 +309,7 @@ fn a_local_source_has_no_record() {
             &session2,
             &effective.host,
             &[capyctl_domain::resources::MemoryObservation {
+                outside_processes: None,
                 domain: "unified".into(),
                 capacity_bytes: 64 << 30,
                 available_bytes: 60 << 30,

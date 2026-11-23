@@ -1,3 +1,4 @@
+mod support;
 use axum::{
     body::{to_bytes, Body},
     http::Request,
@@ -16,9 +17,9 @@ async fn loopback_http_preserves_seeded_sqlite_cursor_without_new_session() {
     let store = Store::open_in_memory().unwrap();
     store.begin_coordinator_session().unwrap();
     let expected = store.snapshot().unwrap().cursor.to_string();
-    let router = snapshot_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(StoreSnapshotSource::new(store)),
+        snapshot_router(Arc::new(StoreSnapshotSource::new(store))),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -54,9 +55,11 @@ async fn loopback_http_preserves_seeded_sqlite_cursor_without_new_session() {
 }
 
 fn app() -> axum::Router {
-    snapshot_router(
+    support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        Arc::new(StoreSnapshotSource::new(Store::open_in_memory().unwrap())),
+        snapshot_router(Arc::new(StoreSnapshotSource::new(
+            Store::open_in_memory().unwrap(),
+        ))),
     )
 }
 
@@ -122,9 +125,9 @@ async fn auth_precedes_source_and_errors_never_include_provider_details() {
         }
     }
     let source = Arc::new(Failure(AtomicUsize::new(0)));
-    let router = snapshot_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        source.clone(),
+        snapshot_router(source.clone()),
     );
     for auth in [
         format!("Bearer {INFERENCE}"),
@@ -197,9 +200,9 @@ async fn cancelled_reads_retain_bounded_worker_capacity() {
         }
     }
     let _release = Release(source.clone());
-    let router = snapshot_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        source,
+        snapshot_router(source),
     );
     let request = || {
         Request::builder()
@@ -233,6 +236,8 @@ async fn query_duplicate_auth_and_control_routes_fail_closed() {
         ("GET", "/management/v1/snapshot", true, 401),
         ("POST", "/management/v1/snapshot", false, 405),
         ("POST", "/management/v1/deployments", false, 404),
+        // ADR 0040 §2 / T16: inference paths are not management resources;
+        // returning 404 does not authenticate or expose a control route.
         ("GET", "/v1/models", false, 404),
         ("GET", "/management/v1/events", false, 404),
     ] {

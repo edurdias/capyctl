@@ -8,7 +8,7 @@ is qualified in 0.2.0 (§2, §3, owner decision 7), and the model types beyond `
 the most-used open-weight dense chat model types on OpenRouter that fit the hosts (§2,
 owner decision 9). The owner's rule of the same day on certified combinations changes what
 `lmcache: required` does outside the qualified table (§3a, §6). Implemented on
-2026-10-28 (branch `feat/lmcache-default`, store schema v60), with the texts of §8; the
+2026-10-28 (branch `feat/lmcache-default`, store schema v61 after integration with main), with the texts of §8; the
 live rows LC12–LC18 have not run, so `QUALIFIED_PARKING` and the LC16/LC18 results that
 move `restart_only` to engine-driven transfer are still empty, and the model list of §2 is
 compiled and awaits the owner.

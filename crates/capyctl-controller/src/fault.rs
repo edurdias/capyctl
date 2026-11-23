@@ -104,6 +104,7 @@ impl From<StoreError> for LifecycleFault {
             StoreError::Sql(_) => Self::Unavailable(error.to_string()),
             StoreError::Io(_) => Self::Unavailable(error.to_string()),
             StoreError::FromNewerVersion { .. } => Self::Unavailable(error.to_string()),
+            StoreError::IncompatiblePrereleaseSchema { .. } => Self::Unavailable(error.to_string()),
         }
     }
 }

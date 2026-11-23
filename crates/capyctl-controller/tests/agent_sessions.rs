@@ -535,6 +535,8 @@ fn domain(observed_bytes: i64) -> pb::DomainObservation {
         available_bytes: observed_bytes,
         observed_at_unix_ms: capyctl_protocol::now_unix_ms(),
         residents: vec![],
+        outside_processes: Vec::new(),
+        outside_processes_remainder: None,
     }
 }
 /// An executor whose single launch-like effect outlives several controller
@@ -1683,10 +1685,9 @@ async fn raw_session_reporting(
     host: &str,
     domains: Vec<pb::DomainObservation>,
 ) -> Result<RawSession, Box<tonic::Status>> {
-    raw_session_declaring(identity, host, domains, vec![]).await
+    raw_session_reporting_capabilities(identity, host, domains, vec![]).await
 }
-/// As [`raw_session_reporting`], its Connect declaring `capabilities`.
-async fn raw_session_declaring(
+async fn raw_session_reporting_capabilities(
     identity: &PendingEnrollment,
     host: &str,
     domains: Vec<pb::DomainObservation>,
@@ -2233,7 +2234,7 @@ async fn a_step_context_rides_the_envelope_only_to_a_declaring_host() {
         } else {
             vec![]
         };
-        let mut raw = raw_session_declaring(&identity, &host, vec![], capabilities)
+        let mut raw = raw_session_reporting_capabilities(&identity, &host, vec![], capabilities)
             .await
             .unwrap();
         assert_eq!(sessions.supports_trace_context(&host), declares);
@@ -2360,5 +2361,92 @@ async fn the_latest_host_tracing_status_is_kept() {
     );
     let shown = serde_json::to_value(sessions.inspect(&host).unwrap()).unwrap();
     assert_eq!(shown["tracing"]["spans_dropped"], 7);
+    server.abort();
+}
+
+// T16 T26 T34 (ADR 0035 §8 / SPEC §7.2): the management-facing session
+// snapshot exposes outside holders, and observations retain them without
+// requiring a capability that old hosts cannot declare.
+#[tokio::test]
+async fn outside_gpu_holders_reach_the_session_snapshot_and_observation() {
+    let Enrolled {
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs,
+    } = enrolled_host().await;
+    let gpu = pb::DomainObservation {
+        domain_id: "gpu-memory".into(),
+        kind: "device".into(),
+        device_id: "gpu0".into(),
+        outside_processes: vec![
+            pb::OutsideProcess {
+                pid: 42,
+                name: None,
+                bytes: 1024,
+                capyctl_state_dir: None,
+                other_capyctl: false,
+            },
+            pb::OutsideProcess {
+                pid: 43,
+                name: Some("capyctl".into()),
+                bytes: 512,
+                capyctl_state_dir: Some("/home/other/.capyctl".into()),
+                other_capyctl: true,
+            },
+        ],
+        outside_processes_remainder: Some(pb::OutsideProcessRemainder {
+            count: 2,
+            bytes: 256,
+        }),
+        ..domain(2048)
+    };
+    // Deliberately no outside_gpu_processes declaration: it is never a gate.
+    let raw = raw_session_reporting_capabilities(
+        &identity,
+        &host,
+        vec![gpu],
+        vec![capyctl_protocol::capabilities::DEVICE_MEMORY_DOMAINS.into()],
+    )
+    .await
+    .unwrap();
+    let snapshot = serde_json::to_value(sessions.snapshot()).unwrap();
+    let d = &snapshot[0]["domains"][0];
+    assert!(d["outside_processes"].is_array());
+    assert_eq!(d["outside_processes"][0]["pid"], 42);
+    assert!(d["outside_processes"][0]["name"].is_null());
+    assert!(d["outside_processes"][0]["capyctl_state_dir"].is_null());
+    assert_eq!(
+        d["outside_processes"][1]["capyctl_state_dir"],
+        "/home/other/.capyctl"
+    );
+    assert_eq!(d["outside_processes_remainder"]["count"], 2);
+    let observed = capyctl_controller::coordinator::ServiceObservation::observe(
+        sessions.as_ref(),
+        host.clone(),
+    )
+    .await
+    .unwrap();
+    let outside = observed[0].outside_processes.as_ref().unwrap();
+    assert_eq!(outside.processes.len(), 2);
+    assert_eq!(outside.processes[0].bytes, 1024);
+    assert_eq!(outside.remainder.as_ref().unwrap().bytes, 256);
+    drop(raw);
+
+    let raw = raw_session_reporting(&identity, &host, vec![domain(2048)])
+        .await
+        .unwrap();
+    let snapshot = serde_json::to_value(sessions.snapshot()).unwrap();
+    assert!(snapshot[0]["domains"][0].get("outside_processes").is_none());
+    assert!(snapshot[0]["domains"][0]
+        .get("outside_processes_remainder")
+        .is_none());
+    let observed =
+        capyctl_controller::coordinator::ServiceObservation::observe(sessions.as_ref(), host)
+            .await
+            .unwrap();
+    assert!(observed[0].outside_processes.is_none());
+    drop(raw);
     server.abort();
 }

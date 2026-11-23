@@ -1,13 +1,13 @@
 # Extraction records
 
-**Status: proposed, follow-up release only. Not part of 0.2.0 or the initial
-`ShardioAI/extract-4b` release.** ADR 0041's nine field types and wire contract remain
-unchanged. This note proposes a tenth type; it does not authorize implementation,
-training, additional hardware use or changes to current readiness checks.
+**Status: proposed, follow-up release only. Not part of 0.2.0.** ADR 0041's nine
+field types and wire contract remain unchanged. This note proposes a tenth type;
+it does not authorize implementation, additional hardware use or changes to
+current readiness checks.
 
 ## Goal
 
-Extract a table as rows of typed columns in one model pass, preserving which cells
+Extract a table as rows of typed columns in one response, preserving which cells
 belong together. A flat list of names and a separate list of prices cannot express
 that association reliably. Target examples are receipt line items, invoice rows,
 rosters and repeated prose records. A `records` value is not an unstructured JSON
@@ -47,10 +47,10 @@ row with no determined cells is represented remain open below.
 
 Row order follows the source, not model confidence. Each row is a distinct
 occurrence: identical repeated rows must not be deduplicated. Text spans retain
-ADR 0041's offsets into the state string. Image-only text transcription would
-require a separate decision; this proposal does not silently expand the initial
-model's text-copy contract. Arithmetic cells use operand evidence and the existing
-exact compute executor, scoped to the selected row.
+ADR 0041's offsets into the state string, or returned `state_text` for PDF input.
+Image-only text transcription would require a separate decision; this proposal
+does not expand the current text-span evidence contract. Engines own arithmetic
+and row association; CapyCTL does not prescribe an internal computation method.
 
 The router must validate the new field schema before activation: a nonempty column
 map, supported column types, closed settings and any accepted size bounds. The
@@ -87,45 +87,34 @@ this note is not a schema that clients should send today.
 
 CPU tests prove these boundaries, not model quality or native engine qualification.
 
-## Model approach
+## Engine implementation and qualification
 
-Reuse the frozen backbone, schema-first layout and attention LoRA. Predict row
-count, then perform occurrence-conditioned column readout: row/occurrence queries
-identify each row, and each column's schema-conditioned head reads that occurrence.
-Reuse span heads for copied cells and operand/operation/unit heads plus the exact
-Decimal/calendar executor for computed cells. Condition pointers on the row so a
-price cannot be paired with the next product merely because both are plausible.
+The contract does not prescribe a backbone, readout architecture or computation
+executor. An engine implementing records must preserve row association, source
+order and duplicate occurrences while obeying the accepted scalar contracts.
+Overflow needs an explicit outcome: silent truncation or a confident partial
+table is not an acceptable implicit policy.
 
-A count and readout design needs an explicit maximum row count and behavior on
-overflow; neither truncation nor returning a confident partial table is an
-acceptable implicit policy. Train count, row association, cell presence, span and
-compute targets jointly. Evaluate row ordering and duplicate occurrences directly.
-This is a proposed approach, not a measured successor to the v7 list head. It must
-show improvement on held-out records before replacing or extending released heads.
+Qualification cases should cover typed tables and repeated prose with varying
+row counts, column names and descriptions, column order, irrelevant totals,
+missing cells, duplicate rows, units, dates, qualifiers and interleaved
+distractors. Include empty and absent tables, count overflow, repeated values,
+cross-row arithmetic traps and long tables. Test text, PDF and image input only
+as supported by the engine; existing field-type declarations do not declare
+input modalities. Report those input subsets separately and check existing
+scalar/list tasks for regressions.
 
-## Data and evaluation
+Semantic evaluation should report whole-table exact match, row count accuracy,
+ordered row exact match, cell exact match by type, row-association
+precision/recall/F1, text-span exact match, computed-value accuracy,
+missing-cell/null accuracy and confidence calibration. State matching rules:
+unordered row matching can diagnose cell quality but must not hide incorrect
+source order. Stratify by row count and table length, and measure inference
+latency and memory as tables grow.
 
-Generate tables and repeated prose from typed source records, retaining exact row
-identity, order, cell spans and computation operands. Vary row counts, column names
-and descriptions, column order, irrelevant totals, missing cells, duplicate rows,
-units, dates, qualifiers and interleaved distractor records. Render receipt/table
-images with the same provenance; image evidence must obey the accepted copy
-contract. Use only commercially permitted external datasets, checking source
-licenses before including them.
-
-Split by templates, source documents and entities, with held-out combinations of
-schemas and computations. Include empty/absent tables, count overflow, repeated
-values, cross-row arithmetic traps and long tables. Report text and image subsets
-separately, and evaluate current scalar/list tasks to detect regressions.
-
-Required metrics include whole-table exact match, row count accuracy, ordered row
-exact match, cell exact match by type, row-association precision/recall/F1, text
-span exact match, computed-value accuracy, missing-cell/null accuracy, and
-confidence calibration. Report matching rules explicitly: unordered row matching
-can diagnose cell quality but must not hide incorrect source order. Stratify by
-row count and table length; measure inference latency and memory as readout scales.
-Acceptance thresholds and a live qualification matrix must be agreed before the
-follow-up ships; pilot scalar/list scores are not evidence for records readiness.
+Acceptance thresholds and a live qualification matrix must be agreed before
+records support ships. These engine-quality measurements remain separate from
+CapyCTL's shape-only readiness evidence.
 
 ## Open questions
 
@@ -141,5 +130,5 @@ follow-up ships; pilot scalar/list scores are not evidence for records readiness
    state-string offsets?
 6. Does negotiation use a new capability or a versioned extraction contract, and
    what manifest/probe migrations make mixed-version hosts fail closed?
-7. Does occurrence-conditioned readout learn duplicate and long-table association
-   reliably enough, and which losses and capacity are needed beyond a row count?
+7. What live engine evidence establishes reliable association of duplicate rows
+   and long tables within the declared size bounds?

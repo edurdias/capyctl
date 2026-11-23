@@ -7,7 +7,7 @@ use capyctl_cli::engine::{execute, resolve_target};
 use capyctl_cli::grammar::{parse, Command, DeepParkChoice, DriftChoice};
 use capyctl_cli::output::{ExitCode, StructuredError};
 use capyctl_config::custom::CustomManifest;
-use capyctl_config::registration::{custom_engines_beside, engines_beside, EnginesFile};
+use capyctl_config::registration::{custom_engines_beside, EnginesFile};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -236,7 +236,8 @@ async fn add_custom_executes_nothing_and_writes_custom_engines_yaml() {
         "{out}"
     );
     assert!(out.get("warnings").is_none(), "{out}");
-    let written = custom_engines_beside(&engines_beside(&document));
+    let written =
+        custom_engines_beside(&capyctl_config::test_support::host_engines_path(&document));
     assert_eq!(out["engines_file"], written.to_string_lossy().as_ref());
     let custom = EnginesFile::load(&written).unwrap();
     assert_eq!(custom.revision, 1);
@@ -257,7 +258,7 @@ async fn add_custom_executes_nothing_and_writes_custom_engines_yaml() {
     assert_eq!(profile["custom"]["installation_digest"], shown);
     assert_eq!(profile["security"]["deep_park"], "disabled");
     assert!(
-        !engines_beside(&document).exists(),
+        !capyctl_config::test_support::host_engines_path(&document).exists(),
         "a custom registration never touches engines.yaml"
     );
     assert_eq!(std::fs::read(&document).unwrap(), host_before);
@@ -297,7 +298,7 @@ async fn engines_yaml_stays_compatible_with_0_1_5() {
     execute(&add_vllm(&vllm, None), Some(&document), dir.path())
         .await
         .unwrap();
-    let engines = engines_beside(&document);
+    let engines = capyctl_config::test_support::host_engines_path(&document);
     let before = std::fs::read(&engines).unwrap();
     let manifest = manifest_file(dir.path(), MANIFEST);
     execute(
@@ -424,7 +425,7 @@ async fn add_custom_refuses_before_anything_runs() {
         19,
     );
     assert!(!marker.exists(), "nothing ran");
-    let custom = custom_engines_beside(&engines_beside(&document));
+    let custom = custom_engines_beside(&capyctl_config::test_support::host_engines_path(&document));
     assert!(!custom.exists(), "nothing was written");
 
     // A name in one file is refused in the other, either way round.
@@ -487,7 +488,10 @@ fn add_custom_without_a_terminal_needs_yes() {
         "{stderr}"
     );
     assert!(!marker.exists());
-    assert!(!custom_engines_beside(&engines_beside(&document)).exists());
+    assert!(
+        !custom_engines_beside(&capyctl_config::test_support::host_engines_path(&document))
+            .exists()
+    );
 }
 
 // T44 (ADR 0031 §1): `--custom` excludes the positional path and every flag
@@ -641,7 +645,7 @@ async fn list_shows_the_idle_signal_and_engine_key_and_remove_finds_it() {
     )
     .await
     .unwrap();
-    let custom = custom_engines_beside(&engines_beside(&document));
+    let custom = custom_engines_beside(&capyctl_config::test_support::host_engines_path(&document));
     assert_eq!(removed["engines_file"], custom.to_string_lossy().as_ref());
     let left = EnginesFile::load(&custom).unwrap();
     assert!(!left.profiles.contains_key("plain"));

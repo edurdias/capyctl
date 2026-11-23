@@ -42,6 +42,7 @@ fn server(base: u32) -> Vec<ProcessIdentity> {
 
 fn observed(now: i64) -> Vec<MemoryObservation> {
     vec![MemoryObservation {
+        outside_processes: None,
         domain: "unified".into(),
         capacity_bytes: 64 << 30,
         available_bytes: 60 << 30,

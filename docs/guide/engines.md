@@ -1,8 +1,9 @@
 # Add an engine
 
-CapyCTL runs the vLLM, SGLang, TensorFold or llama.cpp you already have. It does not install engines.
-To install one first, see [Install an engine](install-engines.md). A program
-that is none of these can run as a [custom engine](#custom-engines).
+CapyCTL runs the vLLM, SGLang, TensorFold, llama.cpp or TensorRT-LLM you already
+have. It does not install engines. To install one first, see
+[Install an engine](install-engines.md). An executable outside those built-in
+launch or API contracts can run as a [custom engine](#custom-engines).
 You register each installation once per machine; CapyCTL calls it an engine
 profile, and a deployment names the profile in `engine`.
 
@@ -629,7 +630,7 @@ Refused for TensorRT-LLM, with the reason:
   ([Parking](parking.md)).
 - `topology`, on one host or across machines (`multi_gpu_unsupported`):
   TensorRT-LLM runs on one GPU in this version.
-- `api: decisions` and embeddings (`capability_missing`).
+- `api: decisions`, `embeddings` and `extractions` (`capability_missing`).
 - `quantization` (the checkpoint carries it), `language_model_only`, and
   `model.draft` (speculative decoding is out of scope).
 - `lmcache: required` (`engine_unsupported`): LMCache is not qualified with
@@ -666,16 +667,17 @@ qualification.
 
 ## Custom engines
 
-A custom engine is a program CapyCTL has no integration for, such as a model's
-own server. You write down how to start it, in a manifest, and CapyCTL runs it,
-sends it requests, counts its memory and keeps its log, as for any engine.
+A custom engine registration describes an executable whose launch or API contract
+CapyCTL's built-in integrations do not cover. You write down how to start it in
+a manifest, and CapyCTL runs it, sends it requests, counts its memory and keeps
+its log, as for any engine.
 
-It is not a [custom build](#custom-builds). A custom build is another version
-of vLLM, SGLang, TensorFold or llama.cpp, and CapyCTL still builds and checks
-its command line as that engine's. A custom engine's options are unknown to
-CapyCTL, so it checks none of them: the command in the manifest runs as
-written, and a deployment cannot add to it. Use one when no supported engine
-serves the model.
+This differs from a [custom build](#custom-builds) registered through a built-in
+engine path: there CapyCTL still builds and checks the engine's command line.
+Custom-engine registration can also run a patched variant of a major engine,
+such as vLLM serving the extraction `fields` contract. Its options are unknown to
+CapyCTL, so the command in the manifest runs as written, and a deployment cannot
+add to it. Renaming a built-in profile alone does not add API support.
 
 ### The manifest
 
@@ -1034,31 +1036,31 @@ tell the two apart. A basal release that reports its running and queued
 requests can be given an `idle` entry in a new manifest, with no CapyCTL
 change.
 
-### Example: ShardioAI's extraction server
+### Example: a patched extraction engine
 
-The model `ShardioAI/extract-4b`, served as `extract-4b` by `shardio-extract`,
-lives in the private repository
-[`ShardioAI/extract`](https://github.com/ShardioAI/extract). Publication waits
-for the owner; this name is not a claim that released weights are available.
-Model quality and live server qualification remain release gates. This is the
-custom-engine contract, not an installation recipe. Table/record extraction is deferred.
+Extraction is an engine capability, not a model-specific server integration.
+A patched or custom variant of vLLM, SGLang, llama.cpp, TensorRT-LLM or TensorFold
+may serve typed `fields` at `POST /v1/systemone` through custom-engine
+registration. Current built-in engine paths refuse `api: extractions` with
+`capability_missing:extractions`; native support requires a qualified amendment.
+This example assumes an already-installed patched vLLM executable that implements
+the declared field types and accepts vLLM's `serve` options. It is not an engine
+installation recipe or a claim of native support.
 
-```yaml title="shardio-extract.yaml"
+```yaml title="vllm-extraction.yaml"
 kind: custom_engine
 schema_version: 1
 api: extractions
 field_types: [text, number, date, time, datetime, duration, list, estimate, forecast]
-version: "0.1.0"
-args: [--host, "{host}", --port, "{port}", --model, "{model_dir}", --served-name, "{served_name}"]
+args: [serve, "{model_dir}", --host, "{host}", --port, "{port}", --served-model-name, "{served_name}", --max-model-len, "{context_length}"]
 health: /health
 ```
 
-Once the server and a trained checkpoint are available in an approved
-environment, registration uses the normal custom-engine command:
+Register that patched executable with the existing custom-engine command:
 
 ```bash
-capyctl engine add --custom ~/capyctl-extract-serve-venv/bin/shardio-extract \
-  --name shardio-extract --manifest shardio-extract.yaml
+capyctl engine add --custom ~/venvs/vllm-extraction/bin/vllm \
+  --name vllm-extraction --manifest vllm-extraction.yaml
 ```
 
 The confirmation shows `field_types` beside `api`, so the administrator
@@ -1067,11 +1069,9 @@ support, remove every extraction engine with `capyctl engine remove`.
 Older releases strictly read `custom-engines.yaml` and refuse the whole
 file if a manifest contains `field_types`, preventing role startup.
 
-The approved serving directory keeps its original name; renaming the package does
-not authorize reinstalling or changing that environment. CapyCTL fingerprints
-the executable, environment and interpreter. The manifest
-passes loopback `{host}`, the assigned `{port}`, the checkpoint directory
-and the served name directly, never through a shell. This example has no
+CapyCTL fingerprints the executable, environment and interpreter. The manifest
+passes loopback `{host}`, the assigned `{port}`, the checkpoint directory,
+served name and context length directly, never through a shell. This example has no
 `{api_key}` or `idle`: the engine listener is unauthenticated on loopback,
 and a cancelled request stays charged until verified stop or restart.
 The outer inference endpoint still requires CapyCTL's API key.
@@ -1080,29 +1080,36 @@ if another extraction manifest supplies an idle signal. That signal can
 settle complete engine error answers; without it they also wait for stop.
 
 ```yaml title="extractor.yaml"
-name: extract-4b
-engine: shardio-extract
-model: ShardioAI/extract-4b
+name: extractor
+engine: vllm-extraction
+model: example/extractor
 api: extractions
 resources: {gpu: 16GiB, ram: 8GiB}
+engine_config: {context_length: 8192}
 ```
 
-These resources are illustrative, not measured requirements. The local
-checkpoint must be under your models directory, and resources must cover
-its measured peak. The launch's argument shape is:
+The context length and resources are illustrative, not measured limits or
+requirements. The local checkpoint must be under your models directory; choose
+a context supported by the engine and checkpoint and resources that cover its
+measured peak. The launch's argument shape is:
 
 ```text
-/home/me/capyctl-extract-serve-venv/bin/shardio-extract --host 127.0.0.1 --port <port> \
-    --model /home/me/models/ShardioAI/extract-4b --served-name extract-4b
+/home/me/venvs/vllm-extraction/bin/vllm serve /home/me/models/example/extractor \
+    --host 127.0.0.1 --port <port> --served-model-name extractor --max-model-len 8192
 ```
 
 The port, `/health`, the fixed extraction of every declared type and the
 listener check must pass before requests are admitted. Extractions are
 restart-only on one machine, with no `topology`, parsers, parking or
-LMCache; the host needs `custom_engines` and `extractions`. No native engine
-is accepted. CPU and fake-engine tests are not qualification, and no live
-run has qualified this model. Its first qualification requires its own
-server on host A after approval of the environment
+LMCache; the host needs `custom_engines` and `extractions`.
+`field_types` declares output types, not text-only or media input capabilities.
+There is currently no manifest declaration for supported inputs. A text-only
+engine must reject unsupported image input itself; router acceptance of the
+request shape does not establish engine support. The fixed readiness probe is
+text-only and does not qualify image or PDF handling.
+
+CPU and fake-engine tests do not qualify an engine or checkpoint. Live
+qualification must cover the actual patched installation and contract
 ([ADR 0041](../design/adr/0041-extraction-models.md)).
 
 ## LMCache

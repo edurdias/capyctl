@@ -58,6 +58,7 @@ fn residents(base: u32, quarters: [i64; 2]) -> Vec<ProcessResident> {
 
 fn observed(now: i64) -> Vec<MemoryObservation> {
     vec![MemoryObservation {
+        outside_processes: None,
         domain: "unified".into(),
         capacity_bytes: 64 * GIB,
         available_bytes: 50 * GIB,

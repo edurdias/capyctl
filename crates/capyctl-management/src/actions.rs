@@ -153,6 +153,11 @@ impl OwnedActionSource {
         &self.commands
     }
 
+    /// The configuration authority, for the deployment check (ADR 0040 §9).
+    pub(crate) fn configuration(&self) -> &Arc<SharedConfigurationSource> {
+        &self.configuration
+    }
+
     /// SPEC §4.3, §6.3: the Stop an explicit drain issues is the ordinary one,
     /// so the deployment stays eligible for on-demand activation; its cleanup
     /// still completes only on evidence that the recorded processes are gone.
@@ -850,9 +855,8 @@ fn command_failure(error: CoordinatorCommandError) -> ConfigurationFailure {
             // Explained with each host's reason by `OwnedActionSource::explain`.
             LifecycleError::HostIneligible => F::HostIneligible(String::new()),
             LifecycleError::QueueFull => F::QueueFull,
-            LifecycleError::Stale | LifecycleError::ReconciliationRequired => {
-                F::ReconciliationRequired
-            }
+            LifecycleError::Stale => F::LifecycleStateChanged,
+            LifecycleError::ReconciliationRequired => F::ReconciliationRequired,
             LifecycleError::Sql(_)
             | LifecycleError::CorruptStoredData
             | LifecycleError::Rejected(_) => F::Internal,
@@ -903,6 +907,12 @@ impl ConfigurationSource for OwnedActionSource {
     fn checkpoint_digest_state(&self, deployment_id: &str, revision: i64) -> Option<String> {
         self.configuration
             .checkpoint_digest_state(deployment_id, revision)
+    }
+    fn deployment_source(
+        &self,
+        deployment: &str,
+    ) -> Result<Option<serde_json::Value>, ConfigurationFailure> {
+        self.configuration.deployment_source(deployment)
     }
     fn effective_configuration(
         &self,
@@ -1252,6 +1262,27 @@ mod tests {
         )))
         .await;
         assert_eq!(error["code"], "reconciliation_required", "{error}");
+    }
+
+    // T08 T16: a stale lifecycle fence is not a missing resource policy.
+    #[tokio::test]
+    async fn a_stale_lifecycle_names_the_changed_state_instead_of_the_resource_policy() {
+        let response =
+            command_failure(CoordinatorCommandError::Lifecycle(LifecycleError::Stale)).response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "reconciliation_required");
+        assert_eq!(body["error"]["retryable"], true);
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("Lifecycle state"), "{message}");
+        assert!(message.contains("session"), "{message}");
+        assert!(!message.contains("resource policy"), "{message}");
     }
 
     /// ADR 0014 §7 (found live on a 16 GB card): a revision whose memory does

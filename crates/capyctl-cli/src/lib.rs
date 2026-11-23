@@ -16,6 +16,7 @@ pub mod host_observation;
 // commands use without --config.
 pub mod local_role;
 pub mod managed_runtime;
+pub mod open_ui;
 pub mod output;
 pub mod policy_migration;
 // SPEC §6.3, ADR 0008: `capyctl prune sources`.

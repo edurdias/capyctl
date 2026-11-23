@@ -14,8 +14,8 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 const DEPLOYMENT: &str = "dep-extract";
-const ROUTE: &str = "ShardioAI/extract-4b";
-const SERVED: &str = "extract-4b";
+const ROUTE: &str = "example/extractor";
+const SERVED: &str = "extractor";
 
 /// One deployment serving `api`, parked until a request activates it, whose
 /// engine runs at `endpoint`. Every lease it grants is recorded with its end.
@@ -37,7 +37,7 @@ impl Authority {
         };
         capyctl_store::deployments::DeploymentRow {
             id: DEPLOYMENT.into(),
-            name: "extract-4b".into(),
+            name: "extractor".into(),
             kind: "llamacpp".into(),
             route_model_id: Some(ROUTE.into()),
             desired_state: capyctl_domain::LifecycleState::Ready,
@@ -231,7 +231,7 @@ async fn engine(reply: Reply) -> (String, Seen) {
                     Reply::Broken => {
                         let parts = futures::stream::iter([
                             Ok(axum::body::Bytes::from_static(
-                                b"{\"model\":\"extract-4b\",\"answers\":{",
+                                b"{\"model\":\"extractor\",\"answers\":{",
                             )),
                             Err(std::io::Error::other("the engine went away")),
                         ]);
@@ -378,7 +378,7 @@ async fn extraction_preserves_field_order_and_numeric_spelling() {
             *captured.lock().unwrap() = body.to_vec();
             (
                 [("content-type", "application/json")],
-                r#"{"model":"extract-4b","answers":{"z":{"type":"number","value":1.2500e1,"guess":12.500,"confidence":0.9000,"p_null":1e-1},"a":{"type":"text","value":"Paid"}},"usage":{"input_tokens":87,"output_tokens":0}}"#,
+                r#"{"model":"extractor","answers":{"z":{"type":"number","value":1.2500e1,"guess":12.500,"confidence":0.9000,"p_null":1e-1},"a":{"type":"text","value":"Paid"}},"usage":{"input_tokens":87,"output_tokens":0}}"#,
             )
         }
     });
@@ -386,7 +386,7 @@ async fn extraction_preserves_field_order_and_numeric_spelling() {
     let endpoint = format!("http://{}", socket.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
     let (authority, _, router) = stack(DeploymentApi::Extractions, &endpoint);
-    let request = r#"{"model":"ShardioAI/extract-4b","state":"Paid 12.50 USD","fields":{"z":{"type":"number","instructions":"Amount"},"a":{"type":"text","instructions":"Action"}}}"#;
+    let request = r#"{"model":"example/extractor","state":"Paid 12.50 USD","fields":{"z":{"type":"number","instructions":"Amount"},"a":{"type":"text","instructions":"Action"}}}"#;
     let response = router
         .oneshot(
             axum::http::Request::builder()
@@ -402,7 +402,7 @@ async fn extraction_preserves_field_order_and_numeric_spelling() {
     assert_eq!(
         seen.lock().unwrap().as_slice(),
         request
-            .replacen("\"ShardioAI/extract-4b\"", "\"extract-4b\"", 1)
+            .replacen("\"example/extractor\"", "\"extractor\"", 1)
             .as_bytes()
     );
     let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
@@ -454,11 +454,11 @@ async fn an_unverified_extraction_answer_leaves_the_lease_uncertain() {
     let truncated = answer().to_string();
     let truncated = truncated[..truncated.len() / 2].to_owned();
     let duplicated =
-        r#"{"model":"extract-4b","answers":{"q":{"type":"noul","noul":0.5}},"answers":{}}"#;
+        r#"{"model":"extractor","answers":{"q":{"type":"noul","noul":0.5}},"answers":{}}"#;
     let cut_error = LLAMA_TOO_LARGE[..LLAMA_TOO_LARGE.len() / 2].to_owned();
     for reply in [
         Reply::Answer(200, "application/json", truncated),
-        Reply::Answer(200, "application/json", r#"{"model":"extract-4b"}"#.into()),
+        Reply::Answer(200, "application/json", r#"{"model":"extractor"}"#.into()),
         Reply::Answer(200, "application/json", r#"{"answers":{"q":0.5}}"#.into()),
         Reply::Answer(200, "application/json", duplicated.into()),
         Reply::Answer(200, "text/plain", answer().to_string()),

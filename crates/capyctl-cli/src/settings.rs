@@ -28,6 +28,8 @@ pub fn flag_layer(invocation: &Invocation) -> NamedLayer {
         management_bind: invocation
             .management_listen
             .map(|address| address.to_string()),
+        // ADR 0040 §1: a switch; absent states nothing.
+        management_remote: invocation.management_remote.then_some(true),
         state_dir: invocation.state_dir.clone(),
         // ADR 0028 §11: in its YAML form, whole seconds as `<n>s`.
         group_stall_timeout: invocation.group_stall_timeout.map(duration_text),
@@ -56,6 +58,15 @@ pub fn env_layer() -> Result<NamedLayer, ConfigError> {
         inference_auth: env(crate::exposure::INFERENCE_AUTH_ENV),
         management_bind: env(crate::roles::MANAGEMENT_ADDR_ENV)
             .or_else(|| env(crate::roles::DEPRECATED_MANAGEMENT_ADDR_ENV)),
+        // ADR 0040 §1: a malformed value is refused with the variable's name.
+        management_remote: env(crate::roles::MANAGEMENT_REMOTE_ENV)
+            .map(|value| {
+                capyctl_config::engine_settings::boolean(
+                    crate::roles::MANAGEMENT_REMOTE_ENV,
+                    &value,
+                )
+            })
+            .transpose()?,
         state_dir: env(STATE_DIR_ENV).map(PathBuf::from),
         // ADR 0028 §11: a malformed value is refused with the variable's name.
         group_stall_timeout: env(capyctl_config::remote_roles::GROUP_STALL_TIMEOUT_ENV)
@@ -90,10 +101,36 @@ pub fn role_overrides(
     flags: &NamedLayer,
 ) -> Result<SettingOverrides, ConfigError> {
     let overrides = SettingOverrides::from_process(kind, sets)?;
-    if !overrides.is_empty() {
-        overrides.check_named(&named_values(kind, flags, &env_layer()?))?;
+    let named = named_values(kind, flags, &env_layer()?);
+    overrides.check_named(&named)?;
+    // ADR 0040 §1: listener authorization and bind must be applied together,
+    // before validation (including an off-box bind stated in YAML).
+    let mut environment: Vec<(String, String)> = std::env::vars()
+        .filter(|(key, _)| key.starts_with(capyctl_config::setting_overrides::SET_ENV_PREFIX))
+        .collect();
+    for value in named {
+        if value.path.ends_with("listeners.management.remote")
+            || value.path.ends_with("listeners.management.bind")
+        {
+            let key = format!(
+                "{}{}",
+                capyctl_config::setting_overrides::SET_ENV_PREFIX,
+                value.path.replace('.', "__").to_uppercase()
+            );
+            if !environment
+                .iter()
+                .any(|(existing, _)| existing.eq_ignore_ascii_case(&key))
+            {
+                let text = value
+                    .value
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| value.value.to_string());
+                environment.push((key, text));
+            }
+        }
     }
-    Ok(overrides)
+    SettingOverrides::parse(kind, sets, &environment)
 }
 
 /// A configuration error as the roles print it: `<path>: <detail>`.
@@ -124,7 +161,7 @@ pub fn config_show(
     state_root: &std::path::Path,
 ) -> Result<serde_json::Value, crate::output::StructuredError> {
     use crate::grammar::Role;
-    use serde_json::{json, Value};
+    use serde_json::json;
     let invalid = |message: String| crate::output::StructuredError {
         code: "invalid_config",
         message,
@@ -204,48 +241,19 @@ pub fn config_show(
         .map_err(|e| located(overrides.annotate(e)))?;
     let env_values = env_layer().map_err(located)?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let mut effective: std::collections::BTreeMap<String, (Value, Source)> = Default::default();
-    let mut put = |path: String, value: Value, source: Source| {
-        effective.insert(path, (value, source));
-    };
-    for (path, value) in
-        capyctl_config::setting_overrides::defaults(kind, home.as_deref(), state_root)
-    {
-        put(path, value, Source::Default);
-    }
-    if let Some(document) = &stated {
-        for (path, value) in capyctl_config::setting_overrides::leaves(document) {
-            put(path, value, Source::Yaml);
-        }
-    }
-    for value in env_values.values(kind, Source::Env) {
-        put(value.path, value.value, value.source);
-    }
-    for value in flags.values(kind, Source::Flag) {
-        put(value.path, value.value, value.source);
-    }
-    for item in overrides
-        .effective()
-        .into_iter()
-        .filter(|item| item.source == Source::Env)
-        .chain(
-            overrides
-                .effective()
-                .into_iter()
-                .filter(|item| item.source == Source::Set),
-        )
-    {
-        put(item.path.clone(), item.value.clone(), item.source);
-    }
-    let settings: Vec<Value> = effective
-        .into_iter()
-        .map(|(path, (value, source))| json!({"path": path, "value": value, "source": source.as_str()}))
-        .collect();
-    Ok(json!({
-        "role": kind.as_str(),
-        "document": stated.as_ref().map(|_| path.display().to_string()),
-        "settings": settings,
-    }))
+    // ADR 0040 §10: the merge a host's configuration route shares.
+    Ok(capyctl_agent::host_admin::effective_config(
+        kind,
+        &path,
+        stated.as_ref(),
+        capyctl_agent::host_admin::ConfigLayers {
+            env: &env_values,
+            flags: &flags,
+            overrides: &overrides,
+        },
+        home.as_deref(),
+        state_root,
+    ))
 }
 
 /// `config show` as a table: SETTING, VALUE, SOURCE, after a line naming the
@@ -275,4 +283,39 @@ pub fn render_table(value: &serde_json::Value) -> String {
             .unwrap_or_else(|| "no document; defaults".to_owned()),
         crate::table::table(&["SETTING", "VALUE", "SOURCE"], &rows)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // T03 / ADR 0040: named listener flags authorize YAML before validation.
+    #[test]
+    fn management_flags_are_applied_before_listener_validation() {
+        for (kind, prefix) in [
+            (ConfigKind::Standalone, "server."),
+            (ConfigKind::Server, ""),
+        ] {
+            let flags = NamedLayer {
+                management_remote: Some(true),
+                ..Default::default()
+            };
+            let overrides = role_overrides(kind, &[], &flags).unwrap();
+            let mut document = if kind == ConfigKind::Standalone {
+                json!({"server": {"listeners": {"management": {"bind": "0.0.0.0:7443"}}}})
+            } else {
+                json!({"listeners": {"management": {"bind": "0.0.0.0:7443"}}})
+            };
+            overrides.apply(&mut document).unwrap();
+            let pointer = format!("/{}listeners/management", prefix.replace('.', "/"));
+            let block = document.pointer(&pointer).unwrap();
+            assert!(capyctl_config::standalone::listener_remote(block, "remote").unwrap());
+            assert!(capyctl_config::standalone::management_address(
+                block["bind"].as_str().unwrap(),
+                true,
+            )
+            .is_some());
+        }
+    }
 }

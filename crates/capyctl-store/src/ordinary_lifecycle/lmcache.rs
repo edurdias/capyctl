@@ -352,15 +352,15 @@ pub(crate) fn migrate_v57(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// v60 (ADR 0034 §§3a, 4): add to `launch_lmcache`, each unless a store
-/// rolled back from v60 or later still has it: how the launch's pool was
+/// v61 (ADR 0034 §§3a, 4): add to `launch_lmcache`, each unless a store
+/// rolled back from v61 or later still has it: how the launch's pool was
 /// sized (`pool_source`; B and C, `pool_bytes_per_token` and
 /// `pool_context_tokens`; `pool_unknown`, why they were unknown;
 /// `pool_shrunk_from`, the pool before admission shrank it to the room
 /// left; `pool_warning`; `pool_model_type`, the checkpoint's model type the
 /// basis names) and `uncertified`, the detail of a `lmcache: required`
 /// launch run outside the qualified table.
-pub(crate) fn migrate_v60(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+pub(crate) fn migrate_v61(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     for (column, definition) in [
         (
             "pool_source",

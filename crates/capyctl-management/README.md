@@ -8,6 +8,17 @@ Narrow read constructors expose only those routes. Optional constructors compose
 stopped configuration, candidate creation, and owned Start/Stop submission.
 No constructor starts a listener or exposes inference routes.
 
+`playground::router` adds `POST /management/v1/playground/chat/completions`
+and `POST /management/v1/playground/systemone` (ADR 0040 §12). A role supplies
+a second inference router with `api_key: None`, behind the same shutdown
+admission gate as its inference listener. Mount it through `compose` for
+session or admin-token authorization. The forward moves the body without
+buffering, passes only Content-Type and X-Request-Id, and streams the router's
+response unchanged, including refusals and its body limit. Browser disconnect
+or session revocation drops the forward, even while waiting for admission or
+activation. Prompts and answers are never stored, journaled or logged here;
+conversation history belongs only to the browser.
+
 `lifecycle_router` adds `POST /management/v1/deployments/{id}/actions` to the
 configuration and candidate boundaries. Construct `OwnedActionSource` from a
 `SharedConfigurationSource` and the existing worker's `CoordinatorCommands`;

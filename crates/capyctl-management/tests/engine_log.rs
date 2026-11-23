@@ -3,6 +3,7 @@
 //! credential only. The source here reads real files through the same
 //! bounded reader a host uses; a raw development log is never served, and a
 //! host without the capability is refused typed (T34).
+mod support;
 use capyctl_controller::engine_logs::{local_tail, TailFailure};
 use capyctl_management::{
     engine_log::{
@@ -59,9 +60,9 @@ impl EngineLogSource for Fake {
 }
 
 fn router(fake: Arc<Fake>) -> axum::Router {
-    engine_log_router(
+    support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        fake,
+        engine_log_router(fake),
     )
 }
 

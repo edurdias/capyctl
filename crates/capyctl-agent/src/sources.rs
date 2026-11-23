@@ -114,7 +114,7 @@ pub enum SourceStatus {
 }
 
 /// A secret value. Never printed, serialized or compared in the open.
-struct Secret(String);
+pub(crate) struct Secret(pub(crate) String);
 
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -226,7 +226,7 @@ fn io_failure(_: io::Error) -> SourceFailure {
 /// SPEC §13.3: a secret file's contents, trimmed. A credential is private
 /// state: a regular file with no group or other access, owned by the account
 /// this agent runs as, holding one printable value without spaces.
-fn read_secret(path: &Path) -> Result<Secret, SourceFailure> {
+pub(crate) fn read_secret(path: &Path) -> Result<Secret, SourceFailure> {
     let unavailable = || SourceFailure::new(reason::SECRET_UNAVAILABLE);
     let metadata = fs::symlink_metadata(path).map_err(|_| unavailable())?;
     // SAFETY: geteuid has no preconditions.

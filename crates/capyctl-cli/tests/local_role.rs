@@ -303,7 +303,7 @@ async fn on_a_host_machine_server_commands_say_to_run_them_on_the_server() {
 
 // T01: a host started with a named document (`--config /etc/...`) records
 // it; later commands on the machine find that document without --config, and
-// `engine add` saves beside it, where the host reads its engines.
+// `engine add` saves in its state directory (ADR 0018 amendment A4).
 #[test]
 fn a_host_named_with_a_document_is_found_without_config() {
     let machine = Machine::new();
@@ -324,7 +324,7 @@ fn a_host_named_with_a_document_is_found_without_config() {
     let env = vllm_env(&machine.root.path().join("v"));
     let out = machine.capyctl(&["engine", "add", env.to_str().unwrap()], &[]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
-    let beside = named.parent().unwrap().join("engines.yaml");
+    let beside = machine.state().join("engines.yaml");
     assert!(
         std::fs::read_to_string(&beside)
             .unwrap_or_default()

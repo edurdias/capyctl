@@ -43,6 +43,8 @@ pub mod serving;
 pub mod snapshot;
 // W10 gaps: dispatch closure reasons, switch in progress, warm residency.
 pub mod switch_state;
+// ADR 0040 §§4, 5, 7: browser sessions and one-time sign-in links.
+pub mod ui_sessions;
 // Owner decision 2026-10-09: single-launch wake canary references.
 pub mod wake_canary;
 // SPEC §6.3 (W6): `delete deployment` after verified cleanup, leaving a tombstone.
@@ -76,6 +78,15 @@ pub enum StoreError {
          store from a backup taken before the upgrade. The store was not modified"
     )]
     FromNewerVersion { found: i64, supported: i64 },
+    /// Pre-release extraction builds reused the released v59 migration number.
+    /// Never interpret their version stamps as the released migration sequence.
+    #[error(
+        "the state store at schema version {found} lacks the released v59 UI-auth schema; \
+         pre-release extraction/0.2.0 builds used incompatible migration numbering. \
+         No migrations were applied. Back up the store and, only after verified cleanup \
+         of all owned engines, recreate it with this capyctl; do not edit its version stamps"
+    )]
+    IncompatiblePrereleaseSchema { found: i64 },
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
     #[error(transparent)]

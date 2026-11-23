@@ -69,6 +69,12 @@ became harder to audit than the code they described.
   move the report to the slice's `archive/` directory.
 - **Prose is normal English**, in documents and commit messages, regardless of
   chat style settings.
+- **Keep published material neutral.** Never name the downstream platforms,
+  services or customers that run CapyCTL, or their internal identifiers
+  (recipe, build or node IDs), in tracked files, test fixtures, commit
+  messages, pull request titles and bodies, issues or release notes. Describe
+  such a setup by what it is ("another CapyCTL installation", "a production
+  SGLang recipe") and give its flags or numbers.
 - Local working notes (per-unit reports, review ledgers) are gitignored, so
   anything written there is unrecoverable once removed. Archive rather than delete.
 
@@ -124,7 +130,7 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   above (no new environments beyond the listed exceptions) still apply to the lab
   hosts.
 - Do not change engine environments, drivers, or reboot hosts. The engine virtual
-  environments in use, all owner-approved (list updated 2026-11-09):
+  environments in use, all owner-approved (list updated 2026-11-20):
   - both hosts: SGLang 0.5.21, SGLang 0.5.22 (approved 2026-10-17, for decision
     models), vLLM 0.30.0, TensorFold 0.6.5 and TensorFold 0.6.6
     (on host B, each TensorFold venv is a byte-identical copy of host A's, made with
@@ -148,21 +154,22 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
     fork (~/exllamav3-mia-venv, commit 63b32f00, torch 2.13.0 cu130) with their
     deployment kit (~/mia-kit, commit 12421873), approved 2026-11-03 for comparing
     their EXL3 Qwen3.8-27B checkpoint as a custom engine (ADR 0031);
-  - host A, approved 2026-11-09: vLLM 0.33.0 (~/vllm-0.33.0-venv), for qualifying
-    it (#239) and the DFlash prefix-cache fix, to be copied byte-identical to host B
-    once qualified; and a llama.cpp build at b11556 or newer in the home directory,
-    for comparing PrismML's Ternary Bonsai 2 27B (Hadamard-rotated ternary GGUF) with
-    the NVFP4 builds;
+  - host A, approved 2026-11-09, made 2026-11-10: vLLM 0.33.0 (~/vllm-0.33.0-venv,
+    torch 2.14.0+cu130), for qualifying it (#239) and the DFlash prefix-cache fix, to
+    be copied byte-identical to host B once qualified; and llama.cpp b12242 (commit
+    3b4d6ab3, CUDA architecture 121a, ~/llamacpp-b12242), for comparing PrismML's
+    Ternary Bonsai 2 27B (Hadamard-rotated ternary GGUF) with the NVFP4 builds;
   - host A only, for qualifying TensorFold's native line (ADR 0039): TensorFold
     1.0.0 at ~/tensorfold-1.0.0 (the release archive as installed, owner decision
     2026-10-25) and TensorFold 1.1.5 at ~/tensorfold-1.1.5 (the release archive,
     unpacked with its checksum file checked, owner decision 2026-10-27);
   - the maintainer's discrete-GPU laptop, approved 2026-11-09: the official
     `lmsysorg/sglang:v0.5.22` Docker image, for the live check of #230 (an editable
-    SGLang refused at `engine add`);
-  - host A, for CapyCTL's own extraction model (ADR 0041 §9), approved 2026-11-04:
+    SGLang refused at `engine add`); removed after that check, to be pulled again for
+    #235's;
+  - host A, for extraction-model experiments, approved 2026-11-04:
     the training environment ~/capyctl-extract-train-venv, made 2026-11-04 with
-    capyctl-extract's `scripts/spark/setup-train-venv.sh` (Python 3.12.3, torch
+    the approved training installer (Python 3.12.3, torch
     2.14.1+cu130, torchvision 0.29.1+cu130, transformers 5.22.1, peft 0.21.2,
     datasets 5.1.0, pillow 13.0.0), then flash-linear-attention 0.6.0 and fla-core
     0.6.0 added (owner approval 2026-11-04, for the Gated DeltaNet kernels); used
@@ -170,28 +177,49 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   - host B, the same training environment, made the same way (owner approval
     2026-11-04: "use it as well"), so both hosts can train together over the
     direct link;
-  - host A, approved 2026-11-10 for live qualification of the capyctl-extract
+  - host A, approved 2026-11-10 for live qualification of an extraction-capable
     custom engine (`api: extractions`, T50): a dedicated serving environment
-    ~/capyctl-extract-serve-venv, created 2026-11-10 with the model repository's
-    `scripts/spark/setup-train-venv.sh --profile serve` (noneditable install).
-    Its `environment-fingerprint.json` records Python 3.12.3, capyctl-extract
-    0.1.0, torch 2.14.1+cu130, torchvision 0.29.1+cu130, transformers 5.22.1,
+    ~/capyctl-extract-serve-venv, created 2026-11-10 with the approved serving
+    installer (noneditable install). Its `environment-fingerprint.json` records
+    Python 3.12.3, the extraction inference package 0.1.0,
+    torch 2.14.1+cu130, torchvision 0.29.1+cu130, transformers 5.22.1,
     peft 0.21.2, pillow 13.0.0, flash-linear-attention 0.6.0 and fla-core 0.6.0;
-  - host B, for measuring CapyCTL's extraction model (owner approvals November
+  - host B, for extraction-model evaluation (owner approvals November
     2026): the evaluation environment ~/capyctl-extract-eval-venv, a copy of
     ~/capyctl-extract-train-venv plus pdfplumber 0.11.9, reportlab 5.1.0 and their
     dependencies (cffi, charset-normalizer, cryptography, pdfminer.six, pycparser,
     pypdfium2), used for the benchmark; and ~/vllm-0.32.0-extract-venv (approved
     2026-11-19), a byte-for-byte copy of host A's ~/vllm-0.32.0-venv with only the
-    extraction patch and its inference package added, for qualifying vLLM serving of
-    the extraction model; its fingerprint and patch hash are in capyctl-extract's
-    `docs/plans/vllm-serving.md`;
+    extraction patch and its inference package added, for qualifying vLLM's
+    extraction capability; its fingerprint and patch hash remain with the
+    approved environment's qualification evidence;
+  - the lab hosts, approved 2026-11-20, for Thinking Machines' Inkling 2 Mini: SGLang
+    built from PR #51926 (commit 92e894ef, the first SGLang source with the model
+    and SM121 kernels) in ~/sglang-inkling-pr51926-venv, with its Rust toolchain
+    and caches inside the venv, made by the capyctl-recipes Inkling comparison's
+    `install.sh`; the owner also approved a loader patch in that venv only, so
+    attention projections can load as FP8 for a requantized checkpoint; and, for
+    reproducing a published community recipe as written, vLLM's
+    `vllm/vllm-openai:inkling-2-mini` Docker image pinned by digest
+    (`sha256:c2dc759f…`, a 0.35 pre-release);
+  - the lab hosts, approved 2026-11-21, for building INT4 checkpoints in the
+    compressed-tensors format: an isolated llm-compressor environment
+    (~/llmcompressor-venv), a builder only, never registered or run as an engine;
+  - maintainers' local machines with a 16 GB GPU, approved 2026-11-21: SGLang 0.5.22
+    in a home-directory venv (~/sglang-0.5.22-venv), for qualifying 16 GB recipes,
+    with any other GPU workload on that machine stopped while testing;
   - earlier, still allowed: SGLang 0.5.20 on both hosts and vLLM 0.29 on host B;
   - the rented two-GPU machine of ADR 0035 §14 (owner decision 2026-10-25), for
     its one session only: fresh x86_64 CUDA installs of vLLM 0.32.0
     (~/vllm-0.32.0-venv), SGLang 0.5.22 (~/sglang-0.5.22-venv) and the llama.cpp
     v0.7.0 build (~/llamacpp-v0.7.0), made and removed by
     `scripts/live/multi-gpu/run.sh`, with their fingerprints recorded with the rows.
+  - a rented single-L40S machine (owner decision 2026-11-11, while the lab hosts
+    trained), for its one session only: fresh x86_64 installs of vLLM 0.32.0,
+    vLLM 0.33.0 (both `--torch-backend=cu130`), SGLang 0.5.22 and NVIDIA's CUDA
+    13.0 toolkit wheels (as `cuda_home`), all in the home directory and deleted
+    with the machine (Shadeform, supervised by `scripts/live/shade_session.py`;
+    results in `docs/changes/live-checks-l40s-2026-11-11.md`).
 
   Use these as they are. Do not create or modify any engine environment without the
   owner's explicit approval, and add each approved one to this list.
@@ -202,14 +230,14 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   everything it created; the owner shuts the machine down straight afterwards. The
   other rules here apply to it (one live session at a time, fault injection only by
   signals to CapyCTL-owned processes, no driver, CUDA or system-package change).
-- A rented machine for full training runs of CapyCTL's extraction model (owner
-  approval in principle 2026-11-04, ADR 0041 §9): its GPU model, session length
-  and the script that sets it up and removes everything it created come back to
-  the owner before anything is rented; the rules above apply to it.
+- A rented machine for extraction-model training experiments (owner approval
+  in principle 2026-11-04): its GPU model, session length and the script that
+  sets it up and removes everything it created come back to the owner before
+  anything is rented; the rules above apply to it.
 - Two rented H100 80 GB machines (Massed Compute through Shade, owner decision
-  2026-11-20), for one session of the extraction model's vLLM qualification only:
-  fresh HOME-only x86_64 installs of vLLM 0.32.0 with the extraction patch and of
-  the model's reference runtime, with a $40 spend cap. Both were deleted on
+  2026-11-20), for one session qualifying a vLLM extraction patch only:
+  fresh HOME-only x86_64 installs of vLLM 0.32.0 with that patch and of
+  its reference runtime, with a $40 spend cap. Both were deleted on
   2026-11-20 after $29.94 of spend.
 - Only one live session runs on the hosts at a time.
 - Fault injection is limited to signals sent to CapyCTL-owned processes (PIDs taken

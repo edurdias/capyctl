@@ -1299,14 +1299,46 @@ DROP TABLE parked_measurements;
 ALTER TABLE parked_measurements_v58 RENAME TO parked_measurements;
 "#;
 
-/// v59 (ADR 0036 §§5, 6): an embeddings launch's wake canary reference. The
+/// v59 (ADR 0040 §§4, 5, 7): browser sessions and one-time sign-in links.
+///
+/// - Both are keyed by the SHA-256 digest (32 bytes) of a 256-bit random
+///   token; the token itself is never stored.
+/// - Each records the fingerprint (32 bytes) of the admin token's digest it
+///   was issued under, so a role started with another admin token deletes
+///   them (§7).
+/// - A session's id is a random ULID, never its digest. Its label is a short
+///   name derived from the browser's user agent.
+/// - A link is spent by setting `consumed_at_ms`; it stays until pruned after
+///   its expiry, so a second use reads as used.
+///
+/// Additive and forward-only.
+pub const SCHEMA_V59: &str = r#"
+CREATE TABLE IF NOT EXISTS ui_signin_links(
+  token_digest BLOB PRIMARY KEY CHECK(typeof(token_digest)='blob' AND length(token_digest)=32),
+  admin_fingerprint BLOB NOT NULL CHECK(typeof(admin_fingerprint)='blob' AND length(admin_fingerprint)=32),
+  expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms>=0),
+  consumed_at_ms INTEGER CHECK(consumed_at_ms IS NULL OR consumed_at_ms>=0)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ui_signin_links_expiry ON ui_signin_links(expires_at_ms);
+CREATE TABLE IF NOT EXISTS ui_sessions(
+  session_id TEXT PRIMARY KEY CHECK(length(session_id)=26),
+  token_digest BLOB NOT NULL UNIQUE CHECK(typeof(token_digest)='blob' AND length(token_digest)=32),
+  admin_fingerprint BLOB NOT NULL CHECK(typeof(admin_fingerprint)='blob' AND length(admin_fingerprint)=32),
+  label TEXT NOT NULL CHECK(length(label)<=128),
+  created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0),
+  last_seen_at_ms INTEGER NOT NULL CHECK(last_seen_at_ms>=0),
+  cookie_refreshed_at_ms INTEGER NOT NULL CHECK(cookie_refreshed_at_ms>=0)
+);
+"#;
+
+/// v60 (ADR 0036 §§5, 6): an embeddings launch's wake canary reference. The
 /// table gains the kind `embedding` and two columns, `dimension` and
 /// `vector` (the reference as little-endian float32 bytes, four per
 /// dimension); an embedding row carries its tolerance and no completion or
-/// decision answer. Every row recorded before v59 is copied unchanged with
+/// decision answer. Every row recorded before v60 is copied unchanged with
 /// both columns null. Forward-only.
-pub const SCHEMA_V59: &str = r#"
-CREATE TABLE wake_canaries_v59(
+pub const SCHEMA_V60: &str = r#"
+CREATE TABLE wake_canaries_v60(
   deployment_id TEXT NOT NULL,
   instance_index INTEGER NOT NULL CHECK(instance_index>=0),
   generation INTEGER NOT NULL,
@@ -1330,36 +1362,36 @@ CREATE TABLE wake_canaries_v59(
          AND typeof(vector)='blob' AND length(vector)=4*dimension AND tokens_json='[]' AND text='')),
   PRIMARY KEY(deployment_id,instance_index,generation)
 );
-INSERT INTO wake_canaries_v59(deployment_id,instance_index,generation,incarnation,prompt,tokens_json,text,recorded_at_ms,mismatch_operation_id,kind,probe_version,decision_json,tolerance,dimension,vector)
+INSERT INTO wake_canaries_v60(deployment_id,instance_index,generation,incarnation,prompt,tokens_json,text,recorded_at_ms,mismatch_operation_id,kind,probe_version,decision_json,tolerance,dimension,vector)
   SELECT deployment_id,instance_index,generation,incarnation,prompt,tokens_json,text,recorded_at_ms,mismatch_operation_id,kind,probe_version,decision_json,tolerance,NULL,NULL FROM wake_canaries;
 DROP TABLE wake_canaries;
-ALTER TABLE wake_canaries_v59 RENAME TO wake_canaries;
+ALTER TABLE wake_canaries_v60 RENAME TO wake_canaries;
 "#;
 
-/// v60 (ADR 0034 §§3a, 4): LMCache by default.
+/// v61 (ADR 0034 §§3a, 4): LMCache by default.
 ///
 /// - `checkpoint_sizes` and `checkpoint_digests` gain `kv_bytes_per_token`
 ///   and `pool_context_tokens`, B and C as the host that read the checkpoint
 ///   reported them with its sizing or its digest (as v55 added the model
 ///   type), so the store sizes an automatic pool for an enrolled host's
-///   launch. A row written before v60, or by a host from before ADR 0034,
+///   launch. A row written before v61, or by a host from before ADR 0034,
 ///   reads null: an unknown basis, the 4 GiB default.
 /// - `launch_lmcache` gains how its pool was sized (`pool_source`, B and C,
 ///   why they were unknown, the size before admission shrank it, the
 ///   warning, the model type its basis names) and `uncertified`, the detail
 ///   of a `lmcache: required` launch
-///   run outside the qualified table. A row written before v60 reads null:
+///   run outside the qualified table. A row written before v61 reads null:
 ///   a pool of unknown source, certified.
 ///
-/// The columns are added by `checkpoint_digests::migrate_v60` and
-/// `lmcache::migrate_v60` only when missing. Additive and forward-only.
-pub const SCHEMA_V60: &str =
-    "-- LMCache pool basis and uncertified runs (checkpoint_digests::migrate_v60, lmcache::migrate_v60)";
+/// The columns are added by `checkpoint_digests::migrate_v61` and
+/// `lmcache::migrate_v61` only when missing. Additive and forward-only.
+pub const SCHEMA_V61: &str =
+    "-- LMCache pool basis and uncertified runs (checkpoint_digests::migrate_v61, lmcache::migrate_v61)";
 
-/// ADR 0037 §7: each launch's engine tracing decision, frozen when it
+/// v62 (ADR 0037 §7): each launch's engine tracing decision, frozen when it
 /// launched: `on`, or the off reason's code. Read by the router's lane and by
 /// status; a launch recorded before engine tracing has no row (untraced).
-pub const SCHEMA_V61: &str = r#"
+pub const SCHEMA_V62: &str = r#"
 CREATE TABLE IF NOT EXISTS launch_engine_tracing(
   binding_id TEXT PRIMARY KEY REFERENCES runtime_bindings(id),
   state TEXT NOT NULL CHECK(state IN ('on','off')),
@@ -1368,12 +1400,12 @@ CREATE TABLE IF NOT EXISTS launch_engine_tracing(
 );
 "#;
 
-/// v62 (ADR 0041 §4): an extraction launch's reference keeps its declared
+/// v63 (ADR 0041 §4): an extraction launch's reference keeps its declared
 /// field types and the complete answers object. Existing reference kinds,
 /// payloads, launch identities and mismatch markers are copied unchanged;
 /// their new extraction-only columns remain null. Forward-only.
-pub const SCHEMA_V62: &str = r#"
-CREATE TABLE wake_canaries_v62(
+pub const SCHEMA_V63: &str = r#"
+CREATE TABLE wake_canaries_v63(
   deployment_id TEXT NOT NULL,
   instance_index INTEGER NOT NULL CHECK(instance_index>=0),
   generation INTEGER NOT NULL,
@@ -1405,10 +1437,10 @@ CREATE TABLE wake_canaries_v62(
          AND json(answers_json)<>'{}' AND tokens_json='[]' AND text='')),
   PRIMARY KEY(deployment_id,instance_index,generation)
 );
-INSERT INTO wake_canaries_v62(deployment_id,instance_index,generation,incarnation,prompt,tokens_json,text,recorded_at_ms,mismatch_operation_id,kind,probe_version,decision_json,tolerance,dimension,vector,declared_field_types_json,answers_json)
+INSERT INTO wake_canaries_v63(deployment_id,instance_index,generation,incarnation,prompt,tokens_json,text,recorded_at_ms,mismatch_operation_id,kind,probe_version,decision_json,tolerance,dimension,vector,declared_field_types_json,answers_json)
   SELECT deployment_id,instance_index,generation,incarnation,prompt,tokens_json,text,recorded_at_ms,mismatch_operation_id,kind,probe_version,decision_json,tolerance,dimension,vector,NULL,NULL FROM wake_canaries;
 DROP TABLE wake_canaries;
-ALTER TABLE wake_canaries_v62 RENAME TO wake_canaries;
+ALTER TABLE wake_canaries_v63 RENAME TO wake_canaries;
 "#;
 
 #[cfg(test)]

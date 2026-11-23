@@ -1140,6 +1140,28 @@ pub(crate) fn arm(
     arm_with_context(tx, s, id, context, &[]).map(|(arm, _)| arm)
 }
 
+/// ADR 0007: a preview and an armed start attribute the same coherent
+/// process sample to the same durable owners. Nothing is credited from a
+/// reservation alone, and this read never changes the ledger.
+fn observed_floors(
+    tx: &Transaction<'_>,
+    ledger: &capyctl_domain::resources::LedgerSnapshot,
+    owner: &str,
+    policy: &ResourcePolicySnapshot,
+    observations: &[capyctl_domain::resources::MemoryObservation],
+    residents: &[capyctl_domain::resources::ProcessResident],
+) -> Result<Vec<capyctl_domain::resources::ResidentFloor>, LifecycleError> {
+    Ok(crate::resident_floors::resident_floors(
+        tx,
+        ledger,
+        owner,
+        observations,
+        residents,
+        &crate::resident_floors::domain_kinds(&policy.controls),
+        &crate::resident_floors::domain_devices(policy),
+    )?)
+}
+
 pub(crate) fn arm_with_context(
     tx: &Transaction<'_>,
     s: &CoordinatorSession,
@@ -1185,14 +1207,13 @@ pub(crate) fn arm_with_context(
     // ADR 0007 (found live 2026-09-23, matrix M33): Ready engines on this
     // host are credited what the host sampled for their own processes, so
     // memory they already hold is not charged a second time.
-    let floors = crate::resident_floors::resident_floors(
+    let floors = observed_floors(
         tx,
         &ledger,
         &p.owner(),
+        &policy,
         context.observations,
         residents,
-        &crate::resident_floors::domain_kinds(&policy.controls),
-        &crate::resident_floors::domain_devices(&policy),
     )?;
     let context = AdmissionContext {
         resident_floors: &floors,

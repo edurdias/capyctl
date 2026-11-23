@@ -124,6 +124,7 @@ pub fn publish(
                 // clock that leads within the bound above is not a future sample;
                 // it is received now, and the ledger never sees a future time.
                 sampled_at_ms: observation.observed_at_unix_ms.min(now),
+                outside_processes: crate::agent_sessions::outside_processes_of(observation),
             });
         }
         state
@@ -538,6 +539,7 @@ mod tests {
                     capacity_bytes: 128 << 30,
                     available_bytes: 100 << 30,
                     sampled_at_ms: now,
+                    outside_processes: None,
                 }];
                 let ttl = policy.controls.observation_ttl_ms;
                 let (_, context) = store

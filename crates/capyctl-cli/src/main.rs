@@ -160,16 +160,49 @@ fn main() -> ExitCode {
             Ok(runtime) => runtime,
             Err(_) => return ExitCode::from(output::ExitCode::INTERNAL.0 as u8),
         };
-        return match runtime.block_on(capyctl_cli::engine::execute(
+        return match runtime.block_on(capyctl_cli::engine::execute_in(
             &invocation.command,
             invocation.config.as_deref(),
             &state_root,
+            &|key| {
+                if key == "CAPYCTL_STATE_DIR" {
+                    invocation
+                        .state_dir
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .or_else(|| std::env::var(key).ok().filter(|value| !value.is_empty()))
+                } else {
+                    std::env::var(key).ok().filter(|value| !value.is_empty())
+                }
+            },
         )) {
             Ok(value) => {
                 emit(&invocation.command, &value, format, &context);
                 // ADR 0018 §3: `engine add` with no role running says where
                 // the profile was saved and what to run next.
                 notice_on_stderr(&value, format);
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                output::print_error(&err, format);
+                ExitCode::from(err.exit_code().0 as u8)
+            }
+        };
+    }
+    // ADR 0040 §5: the admin credential stays on this machine; only the
+    // one-time sign-in link is printed for the browser.
+    if let Command::OpenUi { address } = &invocation.command {
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(_) => return ExitCode::from(output::ExitCode::INTERNAL.0 as u8),
+        };
+        return match runtime.block_on(capyctl_cli::open_ui::execute(
+            &state_root,
+            invocation.config.as_deref(),
+            address.as_deref(),
+        )) {
+            Ok(value) => {
+                emit(&invocation.command, &value, format, &context);
                 ExitCode::SUCCESS
             }
             Err(err) => {
@@ -474,8 +507,15 @@ async fn serve_standalone(
     }
     // Owner decision 2026-09-25: `--management-listen` >
     // CAPYCTL_MANAGEMENT_ADDR (or its deprecated alias) > the document, checked
-    // before the boot so a bad override refuses without side effects.
-    let management_override = roles::management_override(invocation.management_listen)?;
+    // before the boot so a bad override refuses without side effects. ADR 0040
+    // §1: off loopback only with this run's `remote` (`--management-remote` >
+    // CAPYCTL_MANAGEMENT_REMOTE > the document).
+    let management_override = roles::standalone_management_override(
+        config.unwrap_or(&implicit),
+        overrides,
+        invocation.management_listen,
+        invocation.management_remote,
+    )?;
     if let Some(warning) = roles::deprecated_management_env_warning(invocation.management_listen) {
         roles::role_warning(&warning);
     }
@@ -505,7 +545,7 @@ async fn serve_standalone(
         .await
         .map_err(|e| roles::listen_failed("management", management_address, e))?;
     roles::record_management_address(state_dir, management_address);
-    let admission = shutdown::Admission::new();
+    let admission = app.admission();
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let mut inference = tokio::spawn(shutdown::serve(
         listener,

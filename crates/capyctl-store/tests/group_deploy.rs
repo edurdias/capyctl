@@ -83,6 +83,7 @@ fn world() -> World {
 
 fn observed() -> MemoryObservation {
     MemoryObservation {
+        outside_processes: None,
         domain: "unified".into(),
         capacity_bytes: 1 << 40,
         available_bytes: 1 << 40,

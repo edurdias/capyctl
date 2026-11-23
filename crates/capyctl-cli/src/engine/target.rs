@@ -1,27 +1,13 @@
-//! ADR 0018 §2 (owner decision 2026-09-25): which role document, engines
-//! file and role socket an `capyctl engine` command acts on. The engines file
-//! sits beside the role document named with `--config` (or `$CAPYCTL_CONFIG`);
-//! otherwise it is `<config home>/capyctl/engines.yaml`, for a host and for
-//! standalone alike, which is where the role looks too.
+//! ADR 0018 amendment A4: CLI and roles share the engines file in the
+//! effective role state directory. The old configuration-adjacent location
+//! is consulted only for one-time migration.
 use crate::output::StructuredError;
 use capyctl_agent::control_socket::SOCKET_NAME;
-use capyctl_config::registration::{config_home, engines_beside, engines_path};
+pub use capyctl_agent::host_admin::{RoleKind, Target};
+use capyctl_config::registration::{
+    config_home, engines_path, legacy_engines_path, lock_engines_for, migrate_engines,
+};
 use std::path::{Path, PathBuf};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoleKind {
-    Host,
-    Standalone,
-}
-
-#[derive(Debug, Clone)]
-pub struct Target {
-    pub role_document: PathBuf,
-    pub kind: RoleKind,
-    pub engines: PathBuf,
-    pub state_dir: PathBuf,
-    pub socket: PathBuf,
-}
 
 pub(crate) fn invalid(message: impl Into<String>) -> StructuredError {
     StructuredError {
@@ -33,7 +19,7 @@ pub(crate) fn invalid(message: impl Into<String>) -> StructuredError {
 /// ADR 0018 §2 (review decision 2026-09-25): the role document a command
 /// names: `--config`, else `$CAPYCTL_CONFIG`. `capyctl engine` and the roles (`start
 /// host`, `join host`, `start standalone`) share this rule, so they agree on
-/// the document and on the engines file beside it.
+/// the document.
 ///
 /// The path is made absolute against the working directory before use (found
 /// walking the guides 2026-09-25: a relative `--config host.yaml` put the
@@ -58,14 +44,42 @@ pub fn absolute(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// ADR 0018 §2: a role's engines file: beside its named document, else
-/// `<config home>/capyctl/engines.yaml`; `None` when neither `XDG_CONFIG_HOME`
-/// nor `HOME` is set.
-pub fn role_engines(named: Option<&Path>, env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    match named {
-        Some(document) => Some(engines_beside(document)),
-        None => config_home(env).map(|home| engines_path(None, &home)),
+/// ADR 0018 amendment A4: resolve the state-local file and migrate once,
+/// under the engines lock, before a role reads or an offline CLI writes.
+pub fn role_engines(
+    state: &Path,
+    named: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<PathBuf, capyctl_config::ConfigError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let path = engines_path(&absolute(state));
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(state)
+        .map_err(|e| {
+            capyctl_config::ConfigError::new(
+                capyctl_config::ConfigErrorCode::Io,
+                state.display().to_string(),
+                e.to_string(),
+            )
+        })?;
+    let metadata = std::fs::metadata(state).map_err(|e| {
+        capyctl_config::ConfigError::new(
+            capyctl_config::ConfigErrorCode::Io,
+            state.display().to_string(),
+            e.to_string(),
+        )
+    })?;
+    // ADR 0018 §2: sudo creates the lock for the service user.
+    let owner = (unsafe { libc::geteuid() } == 0).then(|| (metadata.uid(), metadata.gid()));
+    let lock = lock_engines_for(&path, owner)?;
+    if let Some(legacy) = legacy_engines_path(named, config_home(env).as_deref()) {
+        for message in migrate_engines(&lock, &legacy)? {
+            capyctl_domain::role_log::notice(capyctl_domain::role_log::Level::Notice, &message);
+        }
     }
+    Ok(path)
 }
 
 /// The role document: `--config`; else `$CAPYCTL_CONFIG`; else the host role
@@ -83,18 +97,12 @@ pub fn resolve_target(
 ) -> Result<Target, StructuredError> {
     let home = config_home(env)
         .ok_or_else(|| invalid("neither XDG_CONFIG_HOME nor HOME is set; pass --config"))?;
-    let mut named = named_role_document(explicit, env);
+    let named = named_role_document(explicit, env);
     let chosen = match named.clone() {
         Some(path) => path,
         None => {
             let host = match crate::local_role::host_document(state_dir) {
-                // A host started with a named document keeps its engines
-                // file beside it, as when it is named here.
-                Some((path, true)) => {
-                    named = Some(path.clone());
-                    Some(path)
-                }
-                Some((path, false)) => Some(path),
+                Some((path, _)) => Some(path),
                 None => Some(home.join("capyctl/host.yaml")).filter(|p| p.exists()),
             };
             let standalone = Some(state_dir.join("config/standalone.yaml")).filter(|p| p.exists());
@@ -110,7 +118,7 @@ pub fn resolve_target(
                 (None, Some(standalone)) => standalone,
                 (None, None) => {
                     return Ok(Target {
-                        engines: engines_path(None, &home),
+                        engines: engines_path(&absolute(state_dir)),
                         role_document: state_dir.join("config/standalone.yaml"),
                         kind: RoleKind::Standalone,
                         socket: state_dir.join(SOCKET_NAME),
@@ -145,8 +153,12 @@ pub fn resolve_target(
             }
         }
     };
+    let state = env("CAPYCTL_STATE_DIR")
+        .filter(|value| !value.is_empty())
+        .map(|value| absolute(Path::new(&value)))
+        .unwrap_or(state);
     Ok(Target {
-        engines: engines_path(named.as_deref(), &home),
+        engines: engines_path(&absolute(&state)),
         role_document: chosen,
         kind,
         socket: state.join(SOCKET_NAME),

@@ -57,7 +57,7 @@ fn valid_model_type(model_type: Option<&str>) -> bool {
         .is_none_or(|model_type| capyctl_config::lmcache::table_key(model_type) == Some(model_type))
 }
 
-/// ADR 0034 §4: B and C as the v60 columns hold them, both positive (a
+/// ADR 0034 §4: B and C as the v61 columns hold them, both positive (a
 /// basis naming zero, or beyond SQLite's integers, is refused as invalid);
 /// `None` (an older host, or a shape the fit cannot read) writes NULL.
 fn pool_basis_columns(
@@ -91,10 +91,10 @@ pub(crate) fn recorded_model_type(
     )
 }
 
-/// v60 (ADR 0034 §4): add `kv_bytes_per_token` and `pool_context_tokens`
+/// v61 (ADR 0034 §4): add `kv_bytes_per_token` and `pool_context_tokens`
 /// to `checkpoint_digests` and `checkpoint_sizes`, each unless a store
-/// rolled back from v60 or later still has it.
-pub(crate) fn migrate_v60(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+/// rolled back from v61 or later still has it.
+pub(crate) fn migrate_v61(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     for table in ["checkpoint_digests", "checkpoint_sizes"] {
         for column in ["kv_bytes_per_token", "pool_context_tokens"] {
             let present: bool = tx.query_row(

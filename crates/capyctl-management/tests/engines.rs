@@ -1,5 +1,6 @@
 //! ADR 0018 §4: retiring a runtime profile through the ordinary stop path,
 //! and `GET /management/v1/engines`. Fake-engine tests; not qualification.
+mod support;
 use axum::{
     body::{to_bytes, Body},
     http::Request,
@@ -97,7 +98,7 @@ async fn setup() -> Setup {
     let source = Arc::new(OwnedActionSource::new(configuration, worker.commands()).unwrap());
     let credentials =
         || ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap();
-    let actions = lifecycle_router(credentials(), source);
+    let actions = support::composed(credentials(), lifecycle_router(source));
     Setup {
         dir,
         owner,
@@ -363,10 +364,12 @@ async fn the_engines_listing_shows_published_profiles() {
         setup.owner.clone(),
         capyctl_agent::identity::CertificateAuthority::generate(100).unwrap(),
     ));
-    let router = capyctl_management::hosts::hosts_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        setup.owner.clone(),
-        capyctl_controller::agent_sessions::AgentSessions::new(authority),
+        capyctl_management::hosts::hosts_router(
+            setup.owner.clone(),
+            capyctl_controller::agent_sessions::AgentSessions::new(authority),
+        ),
     );
     let request = Request::builder()
         .uri("/management/v1/engines")
@@ -404,23 +407,82 @@ async fn standalone_serves_its_embedded_host_at_the_inventory_routes() {
     host["name"] = json!("lab");
     host["runtime_profiles"]["local"]["build_fingerprint"] = json!("0.29.0+patched");
     let published = host.clone();
-    let router = capyctl_management::hosts::standalone_hosts_router(
+    let router = support::composed(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
-        setup.owner.clone(),
-        capyctl_management::hosts::StandaloneHost {
-            host_id: "lab".into(),
-            document: Arc::new(move || published.clone()),
-            installations: capyctl_controller::installation_gate::EmbeddedInstallations::new(),
-            domains: Arc::new(|| {
-                Box::pin(async {
-                    vec![json!({"domain_id": "system", "kind": "host",
-                        "capacity_bytes": 64_i64 << 30, "available_bytes": 32_i64 << 30})]
-                })
-            }),
-            memory_warnings: Arc::new(std::sync::OnceLock::from(vec![
-                "system memory has 32.0 GiB available".to_owned(),
-            ])),
-        },
+        capyctl_management::hosts::standalone_hosts_router(
+            setup.owner.clone(),
+            capyctl_management::hosts::StandaloneHost {
+                host_id: "lab".into(),
+                document: Arc::new(move || published.clone()),
+                installations: capyctl_controller::installation_gate::EmbeddedInstallations::new(),
+                domains: Arc::new(|| {
+                    Box::pin(async {
+                        let observation = |domain: &str, outside_processes| {
+                            capyctl_domain::resources::MemoryObservation {
+                                domain: domain.into(),
+                                capacity_bytes: 64_i64 << 30,
+                                available_bytes: 32_i64 << 30,
+                                sampled_at_ms: 1000,
+                                outside_processes,
+                            }
+                        };
+                        let outside = capyctl_domain::resources::OutsideProcesses {
+                            processes: vec![
+                                capyctl_domain::resources::OutsideProcess {
+                                    pid: 42,
+                                    name: Some("trainer".into()),
+                                    bytes: 24 << 30,
+                                    capyctl_state_dir: Some("/home/user/other-capyctl".into()),
+                                    other_capyctl: true,
+                                },
+                                capyctl_domain::resources::OutsideProcess {
+                                    pid: 43,
+                                    name: None,
+                                    bytes: 2 << 30,
+                                    capyctl_state_dir: None,
+                                    other_capyctl: false,
+                                },
+                            ],
+                            remainder: Some(capyctl_domain::resources::OutsideProcessRemainder {
+                                count: 3,
+                                bytes: 1 << 30,
+                            }),
+                        };
+                        vec![
+                            capyctl_management::hosts::standalone_domain(
+                                observation("system", None),
+                                false,
+                                "meminfo",
+                            ),
+                            capyctl_management::hosts::standalone_domain(
+                                observation("accelerator", Some(outside)),
+                                true,
+                                "meminfo",
+                            ),
+                            capyctl_management::hosts::standalone_domain(
+                                observation("idle", None),
+                                true,
+                                "meminfo",
+                            ),
+                            capyctl_management::hosts::standalone_domain(
+                                observation(
+                                    "empty",
+                                    Some(capyctl_domain::resources::OutsideProcesses {
+                                        processes: Vec::new(),
+                                        remainder: None,
+                                    }),
+                                ),
+                                true,
+                                "meminfo",
+                            ),
+                        ]
+                    })
+                }),
+                memory_warnings: Arc::new(std::sync::OnceLock::from(vec![
+                    "system memory has 32.0 GiB available".to_owned(),
+                ])),
+            },
+        ),
     );
     let get = |uri: &str, token: Option<&str>| {
         let mut request = Request::builder().uri(uri);
@@ -461,6 +523,29 @@ async fn standalone_serves_its_embedded_host_at_the_inventory_routes() {
         row["session"]["domains"][0]["available_bytes"],
         32_i64 << 30
     );
+    // T26 T29 / ADR 0035 §8: snapshot holders are flattened, with nullable
+    // metadata retained; host RAM and an unavailable/empty GPU sample omit them.
+    let domains = &row["session"]["domains"];
+    assert!(domains[0].get("outside_processes").is_none());
+    assert!(domains[0].get("outside_processes_remainder").is_none());
+    assert_eq!(domains[1]["domain_id"], "accelerator");
+    assert_eq!(
+        domains[1]["outside_processes"],
+        json!([
+            {"pid":42, "name":"trainer", "bytes":24_u64 << 30,
+                "capyctl_state_dir":"/home/user/other-capyctl", "other_capyctl":true},
+            {"pid":43, "name":null, "bytes":2_u64 << 30,
+                "capyctl_state_dir":null, "other_capyctl":false}
+        ])
+    );
+    assert_eq!(
+        domains[1]["outside_processes_remainder"],
+        json!({"count":3, "bytes":1_u64 << 30}),
+    );
+    assert!(domains[2].get("outside_processes").is_none());
+    assert!(domains[2].get("outside_processes_remainder").is_none());
+    assert!(domains[3].get("outside_processes").is_none());
+    assert!(domains[3].get("outside_processes_remainder").is_none());
     // Server parity: the binary's capabilities, profile eligibility and the
     // installation's missing capabilities, reconciled, drain and observed time.
     assert!(row["capabilities"]

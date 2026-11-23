@@ -99,6 +99,7 @@ fn lab(count: usize, managed: &str) -> Lab {
 
 fn observation(domain: &str, at: i64) -> MemoryObservation {
     MemoryObservation {
+        outside_processes: None,
         domain: domain.into(),
         capacity_bytes: 1 << 40,
         available_bytes: 1 << 40,

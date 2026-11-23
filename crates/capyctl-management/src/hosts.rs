@@ -1,5 +1,5 @@
 //! SPEC §4.2: inventory reads report enrollment and connectivity separately.
-use crate::{error, ManagementCredentials};
+use crate::error;
 use axum::{
     extract::{Request, State},
     http::{header, StatusCode},
@@ -11,18 +11,12 @@ use axum::{
 use capyctl_controller::{agent_sessions::AgentSessions, ownership::SharedCoordinatorState};
 use std::sync::Arc;
 struct HostState {
-    credentials: ManagementCredentials,
     owner: SharedCoordinatorState,
     sessions: Arc<AgentSessions>,
     reads: Arc<tokio::sync::Semaphore>,
 }
-pub fn hosts_router(
-    credentials: ManagementCredentials,
-    owner: SharedCoordinatorState,
-    sessions: Arc<AgentSessions>,
-) -> Router {
+pub fn hosts_router(owner: SharedCoordinatorState, sessions: Arc<AgentSessions>) -> Router {
     let state = Arc::new(HostState {
-        credentials,
         owner,
         sessions,
         reads: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -30,20 +24,14 @@ pub fn hosts_router(
     Router::new()
         .route("/management/v1/hosts", get(hosts))
         .route("/management/v1/engines", get(engines))
-        .layer(middleware::from_fn_with_state(state.clone(), authenticate))
+        .layer(middleware::from_fn(guard))
         .with_state(state)
 }
-async fn authenticate(
-    State(state): State<Arc<HostState>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    guard(&state.credentials, request, next).await
-}
 /// The authentication and response headers every inventory read shares, on a
-/// server and on a standalone role alike.
-async fn guard(credentials: &ManagementCredentials, request: Request, next: Next) -> Response {
-    let mut response = if !credentials.accepts(&request) {
+/// server and on a standalone role alike. ADR 0040 §2: the principal is the
+/// composition's.
+async fn guard(request: Request, next: Next) -> Response {
+    let mut response = if !crate::authorized(&request) {
         error(StatusCode::UNAUTHORIZED, "unauthenticated", false)
     } else if request.uri().query().is_some() {
         error(StatusCode::BAD_REQUEST, "invalid_request", false)
@@ -399,8 +387,36 @@ pub type DomainSampler = Arc<
         + Sync,
 >;
 
+/// SPEC §7.2 / ADR 0035 §8: standalone publishes the same flattened device
+/// observation as an enrolled host, with no holder fields when unavailable.
+pub fn standalone_domain(
+    observation: capyctl_domain::resources::MemoryObservation,
+    device: bool,
+    memory_source: &str,
+) -> serde_json::Value {
+    let mut domain = serde_json::json!({
+        "domain_id": observation.domain,
+        "kind": if device { "device" } else { "host" },
+        "capacity_bytes": observation.capacity_bytes,
+        "available_bytes": observation.available_bytes,
+    });
+    if device {
+        if let Some(outside) = observation
+            .outside_processes
+            .filter(|outside| !outside.processes.is_empty())
+        {
+            domain["outside_processes"] = serde_json::json!(outside.processes);
+            if let Some(remainder) = outside.remainder {
+                domain["outside_processes_remainder"] = serde_json::json!(remainder);
+            }
+        }
+    } else {
+        domain["memory_source"] = memory_source.into();
+    }
+    domain
+}
+
 struct StandaloneState {
-    credentials: ManagementCredentials,
     owner: SharedCoordinatorState,
     host: StandaloneHost,
     reads: Arc<tokio::sync::Semaphore>,
@@ -411,13 +427,8 @@ struct StandaloneState {
 /// built from the host itself. Same authentication, same read limit, same
 /// JSON shapes, so `list hosts`, `list engines` and `inspect host` read the
 /// same on every role.
-pub fn standalone_hosts_router(
-    credentials: ManagementCredentials,
-    owner: SharedCoordinatorState,
-    host: StandaloneHost,
-) -> Router {
+pub fn standalone_hosts_router(owner: SharedCoordinatorState, host: StandaloneHost) -> Router {
     let state = Arc::new(StandaloneState {
-        credentials,
         owner,
         host,
         reads: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -425,12 +436,7 @@ pub fn standalone_hosts_router(
     Router::new()
         .route("/management/v1/hosts", get(standalone_hosts))
         .route("/management/v1/engines", get(standalone_engines))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            |State(state): State<Arc<StandaloneState>>, request: Request, next: Next| async move {
-                guard(&state.credentials, request, next).await
-            },
-        ))
+        .layer(middleware::from_fn(guard))
         .with_state(state)
 }
 

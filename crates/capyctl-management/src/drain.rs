@@ -20,7 +20,6 @@
 //! drain of an enrolled host that issued a Stop records a durable marker, and
 //! the host is not a placement candidate while any of those Stops is unsettled
 //! (`Store::host_drain_pending`).
-use crate::ManagementCredentials;
 use crate::{actions::OwnedActionSource, configuration::ConfigurationFailure, error};
 use axum::{
     extract::{Request, State},
@@ -37,7 +36,6 @@ const MAX_BODY: usize = 4096;
 const BODY_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct DrainState {
-    credentials: ManagementCredentials,
     source: Arc<OwnedActionSource>,
     /// The names this router answers for its embedded host; empty on a server,
     /// whose hosts are all enrolled remote hosts.
@@ -59,24 +57,18 @@ struct DrainCommand {
 
 /// The drain router of a role whose hosts are all reachable in process (the
 /// standalone role's embedded host).
-pub fn drain_router(
-    credentials: ManagementCredentials,
-    source: Arc<OwnedActionSource>,
-    embedded_host: Vec<String>,
-) -> Router {
-    drain_router_with_presence(credentials, source, embedded_host, Arc::new(|_: &str| true))
+pub fn drain_router(source: Arc<OwnedActionSource>, embedded_host: Vec<String>) -> Router {
+    drain_router_with_presence(source, embedded_host, Arc::new(|_: &str| true))
 }
 
 /// The drain router of a server, which learns whether each enrolled host is
 /// connected from `presence`.
 pub fn drain_router_with_presence(
-    credentials: ManagementCredentials,
     source: Arc<OwnedActionSource>,
     embedded_host: Vec<String>,
     presence: HostPresence,
 ) -> Router {
     let state = Arc::new(DrainState {
-        credentials,
         source,
         embedded_host,
         presence,
@@ -87,16 +79,13 @@ pub fn drain_router_with_presence(
             "/management/v1/hosts/{host}/drain",
             axum::routing::post(drain),
         )
-        .layer(middleware::from_fn_with_state(state.clone(), authenticate))
+        .layer(middleware::from_fn(authenticate))
         .with_state(state)
 }
 
-async fn authenticate(
-    State(state): State<Arc<DrainState>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let mut response = if !state.credentials.accepts(&request) {
+/// ADR 0040 §2: the principal is the composition's.
+async fn authenticate(request: Request, next: Next) -> Response {
+    let mut response = if !crate::authorized(&request) {
         error(StatusCode::UNAUTHORIZED, "unauthenticated", false)
     } else if request.uri().query().is_some() {
         error(StatusCode::BAD_REQUEST, "invalid_request", false)
