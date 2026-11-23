@@ -502,6 +502,7 @@ fn engine_add(value: &Value) -> String {
     .row("API", s(&value["api"]))
     // ADR 0041 §2: an extraction engine's declared field types.
     .row("Field types", words(&value["field_types"], ", "))
+    .row("Inputs", words(&value["inputs"], ", "))
     .row("Environment", words(&value["environment"], ", "))
     .row("Pinned root", s(&value["root"]))
     .row("Interpreter", s(&value["interpreter"]))

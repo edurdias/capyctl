@@ -1,6 +1,6 @@
 //! ADR 0041 §3: the closed extraction request and whole-response evidence.
 use capyctl_config::effective::DeploymentApi;
-use capyctl_config::extractions::FieldType;
+use capyctl_config::extractions::{FieldType, InputKind};
 use serde_json::{Map, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12,12 +12,22 @@ pub enum ExtractionRequestRefusal {
         field: String,
         field_type: FieldType,
     },
+    InputUnsupported {
+        input: InputKind,
+    },
 }
 
 impl std::fmt::Display for ExtractionRequestRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidRequest { detail } => f.write_str(detail),
+            Self::InputUnsupported { input } => {
+                write!(
+                    f,
+                    "input kind `{}` is not supported by this extraction engine",
+                    input.name()
+                )
+            }
             Self::FieldTypeUnsupported { field, field_type } => {
                 write!(
                     f,
@@ -203,6 +213,7 @@ fn finite(value: &Value) -> Option<f64> {
 pub fn validate_extraction_request(
     body: &Value,
     declared: &[FieldType],
+    inputs: &[InputKind],
 ) -> Result<(), ExtractionRequestRefusal> {
     let body = body
         .as_object()
@@ -297,6 +308,23 @@ pub fn validate_extraction_request(
                     "state must be a string, non-empty unless images is non-empty",
                 ))
             }
+        }
+    }
+    // ADR 0041 §3: a PDF asset's state is a reference, not text input.
+    for (input, present) in [
+        (InputKind::Pdf, body.contains_key("assets")),
+        (InputKind::Image, !images.is_empty()),
+        (
+            InputKind::Text,
+            !body.contains_key("assets")
+                && body
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .is_some_and(|state| !state.is_empty()),
+        ),
+    ] {
+        if present && !inputs.contains(&input) {
+            return Err(ExtractionRequestRefusal::InputUnsupported { input });
         }
     }
     if body
@@ -430,6 +458,39 @@ mod tests {
         json!({"model":"extract", "state":"input", "fields":{"field":spec}})
     }
 
+    // T50: actual source kinds, not empty containers or PDF keys, gate dispatch.
+    #[test]
+    fn declared_inputs_gate_each_source_kind() {
+        let mut body = request(json!({"type":"text"}));
+        assert_eq!(
+            validate_extraction_request(&body, &FieldType::ALL, &[InputKind::Image]),
+            Err(ExtractionRequestRefusal::InputUnsupported {
+                input: InputKind::Text
+            })
+        );
+        body["images"] = json!([]);
+        assert!(validate_extraction_request(&body, &FieldType::ALL, &[InputKind::Text]).is_ok());
+        body["images"] = json!(["data:image/png;base64,AAAA"]);
+        assert_eq!(
+            validate_extraction_request(&body, &FieldType::ALL, &[InputKind::Text]),
+            Err(ExtractionRequestRefusal::InputUnsupported {
+                input: InputKind::Image
+            })
+        );
+        body["state"] = json!("");
+        assert!(validate_extraction_request(&body, &FieldType::ALL, &[InputKind::Image]).is_ok());
+        body["images"] = json!([]);
+        body["assets"] = json!({"invoice":{"format":"pdf","data_base64":"JVBERi0="}});
+        body["state"] = json!("invoice");
+        assert_eq!(
+            validate_extraction_request(&body, &FieldType::ALL, &[InputKind::Text]),
+            Err(ExtractionRequestRefusal::InputUnsupported {
+                input: InputKind::Pdf
+            })
+        );
+        assert!(validate_extraction_request(&body, &FieldType::ALL, &[InputKind::Pdf]).is_ok());
+    }
+
     // T50: named PDF assets are shape-checked, never converted by CapyCTL.
     #[test]
     fn pdf_asset_boundaries() {
@@ -442,18 +503,21 @@ mod tests {
             if let Some(state) = state {
                 body["state"] = json!(state);
             }
-            assert_eq!(validate_extraction_request(&body, &FieldType::ALL), Ok(()));
+            assert_eq!(
+                validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL),
+                Ok(())
+            );
         }
         body["assets"]["invoice"]["type"] = json!("document");
         body["images"] = json!([]);
-        assert!(validate_extraction_request(&body, &FieldType::ALL).is_ok());
+        assert!(validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_ok());
         for state in [json!("other text"), json!(null), json!(["invoice"])] {
             body["state"] = state;
-            assert!(validate_extraction_request(&body, &FieldType::ALL).is_err());
+            assert!(validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_err());
         }
         body["state"] = json!("invoice");
         body["images"] = json!(["data:image/png;base64,AAAA"]);
-        assert!(validate_extraction_request(&body, &FieldType::ALL).is_err());
+        assert!(validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_err());
         body.as_object_mut().unwrap().remove("images");
         for assets in [
             json!(null),
@@ -471,7 +535,7 @@ mod tests {
         ] {
             body["assets"] = assets;
             assert!(
-                validate_extraction_request(&body, &FieldType::ALL).is_err(),
+                validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_err(),
                 "{body}"
             );
         }
@@ -480,13 +544,13 @@ mod tests {
         ] {
             body["assets"] = json!({"invoice":{"format":"pdf","data_base64":data}});
             assert!(
-                validate_extraction_request(&body, &FieldType::ALL).is_err(),
+                validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_err(),
                 "{data:?}"
             );
         }
         for data in ["AAAA", "AA==", "AAA=", "+/8="] {
             body["assets"] = json!({"invoice":{"format":"pdf","data_base64":data}});
-            assert!(validate_extraction_request(&body, &FieldType::ALL).is_ok());
+            assert!(validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_ok());
         }
     }
 
@@ -570,14 +634,14 @@ mod tests {
 
     fn accepts(spec: Value) {
         assert_eq!(
-            validate_extraction_request(&request(spec), &FieldType::ALL),
+            validate_extraction_request(&request(spec), &FieldType::ALL, &InputKind::ALL),
             Ok(())
         );
     }
 
     fn rejects(spec: Value, setting: &str) {
         let Err(ExtractionRequestRefusal::InvalidRequest { detail }) =
-            validate_extraction_request(&request(spec), &FieldType::ALL)
+            validate_extraction_request(&request(spec), &FieldType::ALL, &InputKind::ALL)
         else {
             panic!("expected invalid setting {setting}");
         };
@@ -770,7 +834,7 @@ mod tests {
             assert!(!valid_date(date), "{date}");
             let mut body = request(json!({"type":"text"}));
             body["reference_date"] = json!(date);
-            assert!(validate_extraction_request(&body, &FieldType::ALL).is_err());
+            assert!(validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_err());
         }
     }
 
@@ -783,7 +847,7 @@ mod tests {
             json!({}),
             json!({"model":"x","state":"x","fields":{}}),
         ] {
-            assert!(validate_extraction_request(&body, &FieldType::ALL).is_err());
+            assert!(validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_err());
         }
         for (key, value) in [
             ("model", json!("")),
@@ -800,7 +864,7 @@ mod tests {
             let mut body = request(json!({"type":"text"}));
             body[key] = value;
             assert!(
-                validate_extraction_request(&body, &FieldType::ALL).is_err(),
+                validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_err(),
                 "{key}"
             );
         }
@@ -808,7 +872,7 @@ mod tests {
             let mut body = request(json!({"type":"text"}));
             body["fields"] = json!({name:{"type":"text"}});
             assert!(
-                validate_extraction_request(&body, &FieldType::ALL).is_ok(),
+                validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_ok(),
                 "{name}"
             );
         }
@@ -816,7 +880,7 @@ mod tests {
             let mut body = request(json!({"type":"text"}));
             body["fields"] = json!({name:{"type":"text"}});
             assert!(
-                validate_extraction_request(&body, &FieldType::ALL).is_err(),
+                validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_err(),
                 "{name}"
             );
         }
@@ -826,7 +890,7 @@ mod tests {
         ] {
             let mut body = request(json!({"type":"text"}));
             body["options"] = options;
-            assert!(validate_extraction_request(&body, &FieldType::ALL).is_ok());
+            assert!(validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_ok());
         }
         for options in [
             json!({"unknown":true}),
@@ -835,7 +899,7 @@ mod tests {
         ] {
             let mut body = request(json!({"type":"text"}));
             body["options"] = options;
-            assert!(validate_extraction_request(&body, &FieldType::ALL).is_err());
+            assert!(validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_err());
         }
     }
 
@@ -850,9 +914,9 @@ mod tests {
             let mut body = request(json!({"type":"text"}));
             body.as_object_mut().unwrap().remove("state");
             body["images"] = images;
-            assert!(validate_extraction_request(&body, &FieldType::ALL).is_ok());
+            assert!(validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_ok());
             body["state"] = json!("");
-            assert!(validate_extraction_request(&body, &FieldType::ALL).is_ok());
+            assert!(validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_ok());
         }
         for images in [
             json!(null),
@@ -866,13 +930,13 @@ mod tests {
         ] {
             let mut body = request(json!({"type":"text"}));
             body["images"] = images;
-            assert!(validate_extraction_request(&body, &FieldType::ALL).is_err());
+            assert!(validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_err());
         }
         let mut body = request(json!({"type":"text"}));
         body["images"] = json!([]);
-        assert!(validate_extraction_request(&body, &FieldType::ALL).is_ok());
+        assert!(validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_ok());
         body.as_object_mut().unwrap().remove("state");
-        assert!(validate_extraction_request(&body, &FieldType::ALL).is_err());
+        assert!(validate_extraction_request(&body, &FieldType::ALL, &InputKind::ALL).is_err());
     }
 
     // T50: unsupported declarations and API mismatch retain explicit identities.
@@ -886,7 +950,7 @@ mod tests {
                 _ => json!({"type":kind.name()}),
             };
             assert_eq!(
-                validate_extraction_request(&request(spec), &[]),
+                validate_extraction_request(&request(spec), &[], &InputKind::ALL),
                 Err(ExtractionRequestRefusal::FieldTypeUnsupported {
                     field: "field".into(),
                     field_type: kind

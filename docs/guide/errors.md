@@ -278,9 +278,15 @@ then checks API mismatch and body shape before waiting or activation.
 - `field_type_unsupported` (400): a field's type is absent from the frozen
   custom profile's `field_types`. The message names the field and type;
   nothing waits or wakes.
+- `input_unsupported` (400): the request uses a source kind absent from the
+  frozen custom profile's effective `inputs`. The message names `text`, `image`
+  or `pdf`; nothing waits or wakes. Non-empty `state` counts as text except a
+  PDF asset key, non-empty `images` counts as image, and a PDF asset counts as
+  PDF. Empty media does not require an input capability.
 - `engine_rejected`: an engine 400, 413 or 422 with a complete JSON body,
-  including the engine's own limits or setting semantics. CapyCTL does not
-  judge individual answers on the request path. Responses above 16 MiB are
+  including the engine's own limits or setting semantics. Apart from PDF
+  source-text and span evidence, CapyCTL does not judge individual answers on
+  the request path. Responses above 16 MiB are
   uncertain, never replayed and held until verified stop; host ingress
   refuses request bodies above 8 MiB with HTTP 400.
 

@@ -84,6 +84,7 @@ pub struct PublicRoute {
     pub api: capyctl_config::effective::DeploymentApi,
     /// ADR 0041 §6: declared types from the current frozen custom manifest.
     pub field_types: Vec<capyctl_config::extractions::FieldType>,
+    pub inputs: Vec<capyctl_config::extractions::InputKind>,
 }
 
 /// ADR 0030 §1: the frozen revision's `api` (`e` is its `effective_revisions`
@@ -818,7 +819,9 @@ impl crate::Store {
             // and clears the column, so both have to be read. The gate is the
             // same for either: admission open and the deployment not suspended.
             "SELECT r.route, {API_COLUMN}, CASE WHEN json_valid(e.effective_json) \
-             THEN json_extract(e.effective_json,'$.profile.custom.manifest.field_types') END FROM (\
+             THEN json_extract(e.effective_json,'$.profile.custom.manifest.field_types') END, \
+             CASE WHEN json_valid(e.effective_json) THEN \
+             json_extract(e.effective_json,'$.profile.custom.manifest.inputs') END FROM (\
                SELECT route_model_id AS route, id AS deployment_id FROM deployments \
                  WHERE route_model_id IS NOT NULL \
                UNION \
@@ -836,20 +839,32 @@ impl crate::Store {
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(id, api, types)| {
+            .map(|(id, api, types, inputs)| {
+                let api = api_column(api)?;
                 Ok(PublicRoute {
                     id,
-                    api: api_column(api)?,
+                    api,
                     field_types: types
                         .map(|json| {
                             serde_json::from_str(&json).map_err(|_| invalid_column("field_types"))
                         })
                         .transpose()?
                         .unwrap_or_default(),
+                    inputs: if api == capyctl_config::effective::DeploymentApi::Extractions {
+                        inputs
+                            .map(|json| {
+                                serde_json::from_str(&json).map_err(|_| invalid_column("inputs"))
+                            })
+                            .transpose()?
+                            .unwrap_or_else(|| capyctl_config::extractions::InputKind::ALL.to_vec())
+                    } else {
+                        Vec::new()
+                    },
                 })
             })
             .collect()
@@ -907,6 +922,38 @@ impl crate::Store {
             Some((false, _)) => Err(invalid_column("field_types")),
             Some((true, Some(json))) => {
                 serde_json::from_str(&json).map_err(|_| invalid_column("field_types"))
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// T50: input contracts come from the frozen revision, not live configuration.
+    pub fn deployment_inputs(
+        &self,
+        deployment: &str,
+    ) -> Result<Vec<capyctl_config::extractions::InputKind>, StoreError> {
+        let row: Option<(bool, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT e.effective_json IS NULL OR json_valid(e.effective_json), \
+             CASE WHEN json_valid(e.effective_json) THEN \
+             json_extract(e.effective_json,'$.profile.custom.manifest.inputs') END \
+             FROM deployments d LEFT JOIN effective_revisions e \
+             ON e.deployment_id=d.id AND e.revision=d.revision WHERE d.id=?1",
+                [deployment],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match row {
+            Some((false, _)) => Err(invalid_column("inputs")),
+            Some((true, Some(json))) => {
+                serde_json::from_str(&json).map_err(|_| invalid_column("inputs"))
+            }
+            Some((true, None))
+                if self.deployment_api(deployment)?
+                    == Some(capyctl_config::effective::DeploymentApi::Extractions) =>
+            {
+                Ok(capyctl_config::extractions::InputKind::ALL.to_vec())
             }
             _ => Ok(Vec::new()),
         }
@@ -1323,6 +1370,7 @@ mod tests {
                 id: "managed-route".to_string(),
                 api: capyctl_config::effective::DeploymentApi::Chat,
                 field_types: Vec::new(),
+                inputs: Vec::new(),
             }],
             "a managed route is listed"
         );
@@ -1430,6 +1478,74 @@ mod tests {
             .unwrap();
         assert!(store.deployment_api(&id).is_err());
         assert_eq!(store.deployment_api("absent").unwrap(), None);
+    }
+
+    // T50: discovery and validation read input declarations from frozen revisions.
+    #[test]
+    fn frozen_inputs_default_and_explicit_survive_closed_admission() {
+        use capyctl_config::extractions::InputKind;
+        let store = Store::open_in_memory().unwrap();
+        let accepted = store.accept_deployment(req("managed", "managed")).unwrap();
+        let id = accepted.deployment_id.to_string();
+        store
+            .conn
+            .execute(
+                "INSERT INTO deployment_routes(route,deployment_id) VALUES('extractor',?1)",
+                [&id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO effective_revisions VALUES(?1,1,?2,'f1')",
+                params![id, r#"{"api":"extractions"}"#],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE deployments SET admission_enabled=1 WHERE id=?1",
+                [&id],
+            )
+            .unwrap();
+        assert_eq!(store.deployment_inputs(&id).unwrap(), InputKind::ALL);
+        assert_eq!(
+            store.list_enabled_routes().unwrap()[0].inputs,
+            InputKind::ALL
+        );
+        store
+            .conn
+            .execute(
+                "INSERT INTO effective_revisions VALUES(?1,2,?2,'f2')",
+                params![
+                    id,
+                    r#"{"api":"extractions","profile":{"custom":{"manifest":{"inputs":["text"]}}}}"#
+                ],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE deployments SET revision=2 WHERE id=?1", [&id])
+            .unwrap();
+        assert_eq!(store.deployment_inputs(&id).unwrap(), vec![InputKind::Text]);
+        assert_eq!(
+            store.list_enabled_routes().unwrap()[0].inputs,
+            vec![InputKind::Text]
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE deployments SET admission_enabled=0 WHERE id=?1",
+                [&id],
+            )
+            .unwrap();
+        assert_eq!(store.deployment_inputs(&id).unwrap(), vec![InputKind::Text]);
+        assert!(store.list_enabled_routes().unwrap().is_empty());
+        store.conn.execute(
+            "UPDATE effective_revisions SET effective_json='not json' WHERE deployment_id=?1 AND revision=2",
+            [&id],
+        ).unwrap();
+        assert!(store.deployment_inputs(&id).is_err());
     }
 
     // T50 / ADR 0041 §3: corrupt frozen JSON cannot become an empty declaration.

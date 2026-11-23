@@ -112,6 +112,7 @@ struct Script {
     decision: Mutex<Option<Value>>,
     /// T50: assert the fixed extraction request uses exactly these declared types.
     extraction_types: Option<Vec<capyctl_config::extractions::FieldType>>,
+    extraction_inputs: Option<Vec<capyctl_config::extractions::InputKind>>,
     /// What `/v1/embeddings` answers; 422 when `None`.
     embedding: Mutex<Option<Value>>,
     /// The idle route's status and body.
@@ -220,7 +221,14 @@ async fn systemone(
     if let Some(declared) = &stub.script.extraction_types {
         assert_eq!(
             body,
-            capyctl_adapters::extraction_probe::request("basal", declared)
+            capyctl_adapters::extraction_probe::request(
+                "basal",
+                declared,
+                stub.script
+                    .extraction_inputs
+                    .as_deref()
+                    .unwrap_or(&capyctl_config::extractions::InputKind::ALL)
+            )
         );
     }
     match stub.script.decision.lock().unwrap().clone() {
@@ -231,6 +239,48 @@ async fn systemone(
             Json(json!({"error": "model loading"})),
         )
             .into_response(),
+    }
+}
+
+// T50: the frozen declaration controls readiness on the actual HTTP boundary.
+#[tokio::test]
+async fn extraction_readiness_respects_image_only_and_pdf_only_engines() {
+    use capyctl_config::extractions::{FieldType, InputKind};
+    for input in [InputKind::Image, InputKind::Pdf] {
+        let script = Script {
+            extraction_types: Some(vec![FieldType::Number]),
+            extraction_inputs: Some(vec![input]),
+            decision: Mutex::new(Some(json!({
+                "state_text": capyctl_adapters::extraction_probe::STATE,
+                "answers": {"amount_paid": {
+                    "type":"number", "guess":649.0, "value":649.0,
+                    "p_null":0.1, "confidence":0.9
+                }}
+            }))),
+            ..Script::default()
+        };
+        let (stub, port) = stub_engine(script).await;
+        let manifest = manifest(&format!(
+            "kind: custom_engine\nschema_version: 1\napi: extractions\n\
+             field_types: [number]\ninputs: [{}]\n\
+             args: [--host, \"{{host}}\", --port, \"{{port}}\", --model, \"{{model_dir}}\"]\n",
+            input.name()
+        ));
+        let proc_root = fake_proc([127, 0, 0, 1], port);
+        let engine = launching(
+            port,
+            &manifest,
+            None,
+            ScriptedTool::new(Presence::Alive),
+            proc_root.path(),
+        );
+        let observation = engine
+            .execute_persisted(&initialize_command(30_000))
+            .await
+            .unwrap();
+        assert!(observation.extraction_probe.is_some());
+        assert_eq!(stub.chats.load(SeqCst), 0);
+        assert!(stub.decisions.load(SeqCst) > 0);
     }
 }
 
@@ -355,6 +405,7 @@ fn adapter(port: u16, manifest: &CustomManifest, key: Option<&str>) -> CustomAda
     )
     .with_api(manifest.api)
     .with_field_types(manifest.field_types.clone().unwrap_or_default())
+    .with_inputs(manifest.extraction_inputs().to_vec())
     .with_health(manifest.health.clone())
     .with_idle(manifest.idle.clone())
 }

@@ -6301,7 +6301,14 @@ mod tests {
                         (status, serde_json::json!({}))
                     } else if method == axum::http::Method::POST && uri.path() == "/v1/systemone" {
                         let body = serde_json::from_slice(&body).unwrap();
-                        assert_eq!(body, extraction_probe::request("toy", &[FieldType::Number]));
+                        assert_eq!(
+                            body,
+                            extraction_probe::request(
+                                "toy",
+                                &[FieldType::Number],
+                                &capyctl_config::extractions::InputKind::ALL
+                            )
+                        );
                         (StatusCode::OK, engine.extraction_response(&body).unwrap())
                     } else {
                         (StatusCode::NOT_FOUND, serde_json::json!({}))
@@ -6427,7 +6434,11 @@ mod tests {
             client
                 .post(format!("http://{ingress_address}/v1/systemone"))
                 .bearer_auth(hex::encode([7; 32]))
-                .json(&extraction_probe::request("toy", &[FieldType::Number]))
+                .json(&extraction_probe::request(
+                    "toy",
+                    &[FieldType::Number],
+                    &capyctl_config::extractions::InputKind::ALL,
+                ))
         };
         let replay = restarted
             .execute(fresh_session, launch.clone())

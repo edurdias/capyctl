@@ -30,6 +30,7 @@ pub struct CustomAdapter {
     api: DeploymentApi,
     /// ADR 0041 §4: the frozen manifest's declared extraction field types.
     field_types: Vec<capyctl_config::extractions::FieldType>,
+    inputs: Vec<capyctl_config::extractions::InputKind>,
     /// ADR 0031 §5: the manifest's health path.
     health: Option<String>,
     /// ADR 0031 §6: the manifest's idle signal.
@@ -67,6 +68,7 @@ impl CustomAdapter {
             claimed: Mutex::new(None),
             api: DeploymentApi::Chat,
             field_types: Vec::new(),
+            inputs: Vec::new(),
             health: None,
             idle: None,
             proc_root: std::path::PathBuf::from("/proc"),
@@ -95,6 +97,12 @@ impl CustomAdapter {
         field_types: Vec<capyctl_config::extractions::FieldType>,
     ) -> Self {
         self.field_types = field_types;
+        self
+    }
+
+    /// ADR 0041 §4: readiness must use a source the engine accepts.
+    pub fn with_inputs(mut self, inputs: Vec<capyctl_config::extractions::InputKind>) -> Self {
+        self.inputs = inputs;
         self
     }
 
@@ -211,6 +219,7 @@ impl CustomAdapter {
             self.http.key(),
             served,
             &self.field_types,
+            &self.inputs,
             bound,
         )
         .await

@@ -721,6 +721,7 @@ impl EngineBindings for ProfileBindings {
                     api: manifest.api,
                     // ADR 0041 §4: readiness follows the frozen manifest.
                     field_types: manifest.field_types.clone().unwrap_or_default(),
+                    inputs: manifest.extraction_inputs().to_vec(),
                     idle: manifest.idle.clone(),
                     health: manifest.health.clone(),
                     endpoint,

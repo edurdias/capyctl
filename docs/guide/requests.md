@@ -35,8 +35,8 @@ curl -s http://127.0.0.1:8443/v1/models -H "Authorization: Bearer $KEY"
 
 Listing never wakes a model. A request without the key, or with a wrong one,
 is answered `401`. `capyctl.api` is the endpoint the model answers: `chat`
-for `/v1/chat/completions`, `decisions` for `/v1/systemone`, `embeddings` for
-`/v1/embeddings`.
+for `/v1/chat/completions`, `decisions` or `extractions` for `/v1/systemone`,
+and `embeddings` for `/v1/embeddings`.
 
 ## Chat
 
@@ -471,9 +471,10 @@ Only these top-level members are accepted:
 | Member | Rule |
 |---|---|
 | `model` | Required non-empty string. |
-| `state` | Optional string; absent or empty only when `images` is non-empty. CapyCTL adds no default. Text answers are spans of this string. |
+| `state` | Optional string; absent or empty only with non-empty `images` or a PDF asset. With PDF input, a non-empty value must be the sole asset key, not source text. |
 | `fields` | Required object with at least one member. Each name matches `^[A-Za-z_][A-Za-z0-9_.\-]{0,63}$`; each value is a field spec. |
 | `images` | Optional array of at most four items: a string beginning `data:` (any case), or an object with exactly `content_type` and `base64`, both strings. CapyCTL does not decode them; their bytes count toward the body bound. |
+| `assets` | Optional map containing exactly one non-empty key and a PDF object with `format: "pdf"`, non-empty canonical standard-base64 `data_base64`, and optional `type: "document"`. No other members or formats; no non-empty text or images alongside PDF. |
 | `reference_date` | Optional ISO calendar date string, `YYYY-MM-DD`. |
 | `options` | Optional object containing only boolean `include_quantiles` and `return_state_text`. |
 
@@ -509,8 +510,9 @@ The engine returns an `answers` object keyed by field name. Scalars (`text`
 through `duration`) carry `type`, `value`, `guess`, `p_null` and `confidence`.
 `value` is null when `p_null >= null_threshold` (the engine's default applies
 when omitted), otherwise it equals `guess`. Text carries `span: [start, end]`,
-a half-open interval in Unicode code points of `state`, not bytes or UTF-16
-code units. A list's `value` can be null or an array; text lists have
+a half-open interval in Unicode code points of `state` (or returned `state_text`
+for a PDF), not bytes or UTF-16 code units. A list's `value` can be null or an
+array; text lists have
 corresponding `spans`, in the engine's order. Estimates carry `value`,
 `median`, `p10`, `p90`, `p_below` and `p_above`. Forecasts have two published
 forms: arrays for `value`, `median`, `p10` and `p90`, or a `steps` array of
@@ -520,24 +522,35 @@ percentiles describe an 80% interval. Extra engine members are preserved.
 With `options.include_quantiles`, an estimate's `quantiles` is a 99-element
 array for percentiles 1 through 99; a forecast has one such array per step.
 `options.return_state_text` echoes the input as `state_text` in the response.
+PDF answers always include `state_text`, even when this option is absent or false.
 There are no public `mode` or `computation` response members.
 
 ### Input support
 
-The custom manifest's `field_types` declares output types only. It cannot
-declare text-only or media input support, and `/v1/models` does not advertise
-those input capabilities. CapyCTL validates the closed request shape, not whether
-the engine supports its inputs. A text-only engine must reject unsupported
-image input; accepting an `images` member at the router is not a claim that the
-engine can process it or extract text from it. Text spans in mixed requests
-still refer to textual `state`. The fixed readiness probe uses text only and
-does not qualify media handling.
+The custom manifest's `field_types` declares output types; `inputs` separately
+declares accepted source kinds. Omitting `inputs` defaults to `text`, `image`,
+and `pdf` for backward compatibility. An explicit set must be non-empty, distinct,
+and contain only those names; it is stored in that order and frozen with the
+custom profile.
 
-PDF files and PDF request members are not part of this contract. CapyCTL does
-not parse PDFs or perform OCR. Convert a PDF to text in `state`, or to page
-images only when the engine supports them, within the four-image and body
-bounds. Context length, truncation behavior and usage details depend on the
-engine and checkpoint; the router does not supply a universal token limit.
+A non-empty `state` requires `text`, except when it names the sole PDF asset:
+that key is not source text. Non-empty `images` requires `image`; a PDF asset
+requires `pdf`. Mixed text and images requires both kinds. Empty media does not
+require a capability. An undeclared kind gets HTTP 400 `input_unsupported`,
+naming the kind, before waiting or activation.
+
+PDF input uses the named `assets` map with one PDF containing `format: "pdf"`
+and non-empty canonical standard-base64 `data_base64`; optional `type` must be
+`"document"`. With a PDF, `state` is absent, empty, or the asset key; non-empty
+text and images cannot accompany it. The engine, not CapyCTL, decodes the PDF.
+The returned `state_text` is required and supplies the source for text spans;
+text spans in mixed text/image requests still refer to textual `state`.
+Decoded-size and page limits, context length and truncation depend on the engine
+and checkpoint; the HTTP body bound includes base64 overhead.
+
+Readiness prefers text when declared, otherwise a fixed image or PDF source
+using only a declared kind. It does not qualify every declared input kind or
+establish extraction quality.
 
 ### Response forwarding and completion
 
@@ -547,8 +560,12 @@ a whole JSON object whose `answers` is a non-empty object of objects each
 naming a string `type`. The response is read whole up to 16 MiB; a longer
 answer is uncertain, never replayed and held until the instance stops.
 Ingress has its own 8 MiB request bound, returning HTTP 400 above it.
-Individual answers are not judged on the request path. The stricter typed
-checks of the readiness extraction ([The readiness extraction](deploy.md#the-readiness-extraction))
+For PDF input, `state_text` is mandatory, text spans must match that source in
+Unicode code points, and optional `page`/parallel `pages` use positive one-based
+page numbers or null when no single page applies. Invalid PDF evidence leaves
+the exchange uncertain. Other individual answers are not judged on the request
+path. The stricter typed checks of the readiness extraction
+([The readiness extraction](deploy.md#the-readiness-extraction))
 apply only to the fixed readiness probe. It accepts time zone suffixes
 `Z` or `±HH:MM`, durations with no fractional part, null lists, and either
 published forecast form (every form present must be well-formed).
@@ -563,11 +580,13 @@ published forecast form (every form present must be well-formed).
   member or the field and setting.
 - `field_type_unsupported` (400): a field's type is not in the deployment's
   declared types, naming the field and type before waiting or activation.
+- `input_unsupported` (400): a source kind is not in the deployment's declared
+  inputs, naming the kind before waiting or activation.
 - `engine_rejected`: a complete JSON engine rejection (HTTP 400, 413 or 422),
   including the engine's own limits.
 
-`GET /v1/models` shows `capyctl.api: "extractions"` and
-`capyctl.field_types`, in canonical order, without waking the model.
+`GET /v1/models` shows `capyctl.api: "extractions"`, `capyctl.field_types`,
+and effective `capyctl.inputs`, in canonical order, without waking the model.
 Answers carry `capyctl.metrics.total_ms`, `time_to_response_ms` and
 `input_tokens` from engine usage, as decisions do; there is no generated-text
 figure. Request IDs, trace context, waiting, admission, instance selection

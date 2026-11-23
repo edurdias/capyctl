@@ -299,6 +299,7 @@ async fn prepare(
     // ADR 0041 §2: the declared field types are part of the approval.
     if let Some(types) = &manifest.field_types {
         out["field_types"] = json!(types);
+        out["inputs"] = json!(manifest.extraction_inputs());
     }
     // ADR 0031 §8: the approval is this summary.
     let mut summary = format!(
@@ -321,6 +322,12 @@ async fn prepare(
     if let Some(types) = &manifest.field_types {
         let names: Vec<&str> = types.iter().map(|t| t.name()).collect();
         summary.push_str(&format!("  field types:  {}\n", names.join(", ")));
+        let inputs: Vec<&str> = manifest
+            .extraction_inputs()
+            .iter()
+            .map(|input| input.name())
+            .collect();
+        summary.push_str(&format!("  inputs:       {}\n", inputs.join(", ")));
     }
     // ADR 0031 §7: a key in the argument vector is readable by every local user.
     if manifest.api_key_in_args() {

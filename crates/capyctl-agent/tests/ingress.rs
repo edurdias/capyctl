@@ -703,9 +703,10 @@ async fn decision_requests_pass_only_on_their_own_path_and_contract() {
 async fn extraction_launch_accepts_only_fields_of_its_declared_types() {
     use capyctl_config::custom::{CustomManifest, CustomProfile};
     let custom = CustomProfile::new(
-        CustomManifest::parse(
-            &KEYED_MANIFEST.replace("api: chat", "api: extractions\nfield_types: [text]"),
-        )
+        CustomManifest::parse(&KEYED_MANIFEST.replace(
+            "api: chat",
+            "api: extractions\nfield_types: [text]\ninputs: [text]",
+        ))
         .unwrap(),
     );
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -786,6 +787,13 @@ async fn extraction_launch_accepts_only_fields_of_its_declared_types() {
     other_model["model"] = "other".into();
     let mut oversized = extraction.clone();
     oversized["state"] = "x".repeat(8 * 1024 * 1024).into();
+    let mut image = extraction.clone();
+    image["images"] = serde_json::json!(["data:image/png;base64,AAAA"]);
+    let pdf = serde_json::json!({
+        "model": "model", "state": "invoice",
+        "assets": {"invoice":{"format":"pdf","data_base64":"JVBERi0="}},
+        "fields": {"order":{"type":"text"}}
+    });
     for (path, body) in [
         (
             "/v1/systemone",
@@ -798,6 +806,8 @@ async fn extraction_launch_accepts_only_fields_of_its_declared_types() {
         ("/v1/systemone", undeclared),
         ("/v1/systemone", other_model),
         ("/v1/systemone", oversized),
+        ("/v1/systemone", image),
+        ("/v1/systemone", pdf),
         (
             "/v1/chat/completions",
             serde_json::json!({"model":"model","messages":[]}),

@@ -119,7 +119,7 @@ fn err_json(code: &str, message: &str) -> (StatusCode, Json<serde_json::Value>) 
             "request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
             // SPEC §14: a malformed request is the client's error, not a 500.
             // ADR 0041 §3: contract and shape refusals precede activation.
-            "invalid_request" | "api_mismatch" | "field_type_unsupported" => {
+            "invalid_request" | "api_mismatch" | "field_type_unsupported" | "input_unsupported" => {
                 StatusCode::BAD_REQUEST
             }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -173,6 +173,7 @@ async fn list_models(
             // ADR 0041 §6: other APIs retain their discovery shape.
             if route.api == capyctl_config::effective::DeploymentApi::Extractions {
                 entry["capyctl"]["field_types"] = serde_json::json!(route.field_types);
+                entry["capyctl"]["inputs"] = serde_json::json!(route.inputs);
             }
             entry
         })
@@ -291,10 +292,15 @@ async fn receive(
                 .controller
                 .deployment_field_types(&deployment.id)
                 .map_err(chat::map_controller)?;
-            capyctl_adapters::extraction_request::validate_extraction_request(&request, &types)
+            let inputs = deps
+                .controller
+                .deployment_inputs(&deployment.id)
+                .map_err(chat::map_controller)?;
+            capyctl_adapters::extraction_request::validate_extraction_request(&request, &types, &inputs)
                 .map_err(|refusal| {
                     let code = match refusal {
                         capyctl_adapters::extraction_request::ExtractionRequestRefusal::FieldTypeUnsupported { .. } => "field_type_unsupported",
+                        capyctl_adapters::extraction_request::ExtractionRequestRefusal::InputUnsupported { .. } => "input_unsupported",
                         _ => "invalid_request",
                     };
                     err_json(code, &refusal.to_string())

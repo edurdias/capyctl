@@ -825,6 +825,7 @@ fn a_custom_profile_builds_a_custom_spec() {
         fingerprint,
         api,
         field_types,
+        inputs,
         api_key: Some(key),
         idle: Some(idle),
         health,
@@ -839,6 +840,10 @@ fn a_custom_profile_builds_a_custom_spec() {
     assert!(
         field_types.is_empty(),
         "only extraction manifests declare types"
+    );
+    assert!(
+        inputs.is_empty(),
+        "only extraction manifests declare inputs"
     );
     assert_eq!(health.as_deref(), Some("/health"));
     assert_eq!(idle.json, vec!["queue.running"]);

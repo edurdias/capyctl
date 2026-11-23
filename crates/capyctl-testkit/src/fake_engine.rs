@@ -348,8 +348,12 @@ impl FakeEngine {
             .unwrap()
             .clone()
             .ok_or(AdapterError::UnsupportedCapability)?;
-        capyctl_adapters::extraction_request::validate_extraction_request(body, &declared)
-            .map_err(|error| AdapterError::Uncertain(error.to_string()))?;
+        capyctl_adapters::extraction_request::validate_extraction_request(
+            body,
+            &declared,
+            &capyctl_config::extractions::InputKind::ALL,
+        )
+        .map_err(|error| AdapterError::Uncertain(error.to_string()))?;
         self.extraction_requests.fetch_add(1, Ordering::SeqCst);
         if response.get("model").is_some() {
             response["model"] = body["model"].clone();
@@ -857,7 +861,9 @@ impl capyctl_adapters::traits::ChatForward for FakeEngine {
         _bound: Duration,
     ) -> Result<capyctl_adapters::extraction_probe::ExtractionAnswer, AdapterError> {
         let response = self.extraction_response(&capyctl_adapters::extraction_probe::request(
-            served, declared,
+            served,
+            declared,
+            &capyctl_config::extractions::InputKind::ALL,
         ))?;
         capyctl_adapters::extraction_probe::well_formed(&response, declared)
             .map_err(AdapterError::Uncertain)
@@ -973,7 +979,11 @@ mod tests {
         let engine = FakeEngine::new()
             .with_decisions()
             .with_extractions(vec![FieldType::Number], response.clone());
-        let request = capyctl_adapters::extraction_probe::request("served", &[FieldType::Number]);
+        let request = capyctl_adapters::extraction_probe::request(
+            "served",
+            &[FieldType::Number],
+            &capyctl_config::extractions::InputKind::ALL,
+        );
         assert_eq!(
             engine
                 .forward_extraction(&request.clone().into())

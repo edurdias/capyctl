@@ -165,6 +165,7 @@ pub(super) fn custom_adapter_for(
         CustomAdapter::new(endpoint, fingerprint, served.into(), key)
             .with_api(custom.manifest.api)
             .with_field_types(custom.manifest.field_types.clone().unwrap_or_default())
+            .with_inputs(custom.manifest.extraction_inputs().to_vec())
             .with_health(custom.manifest.health.clone())
             .with_idle(custom.manifest.idle.clone()),
     )
