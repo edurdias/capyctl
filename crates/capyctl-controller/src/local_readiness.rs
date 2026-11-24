@@ -819,6 +819,8 @@ fn custom_adapter(
     )
     .with_api(custom.manifest.api)
     .with_field_types(custom.manifest.field_types.clone().unwrap_or_default())
+    // ADR 0041 §4, SPEC §13.2: re-proof uses the frozen accepted inputs too.
+    .with_inputs(custom.manifest.extraction_inputs().to_vec())
     .with_health(custom.manifest.health.clone())
     .with_idle(custom.manifest.idle.clone())
 }
@@ -1281,6 +1283,153 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("embedding probe"), "{error}");
         assert_eq!(paths(&asked), ["/v1/embeddings", "/v1/embeddings"]);
+        task.abort();
+    }
+
+    // T33 T44 T50 (SPEC §13.2, ADR 0041 §4): standalone re-proof rebuilds
+    // the custom adapter with the frozen inputs, including an omitted declaration.
+    // Liveness alone and malformed extraction answers never establish readiness.
+    #[tokio::test]
+    async fn an_adopted_custom_extraction_uses_its_declared_inputs_for_reproof() {
+        use capyctl_config::custom::{CustomManifest, CustomProfile};
+        use capyctl_config::extractions::FieldType;
+        use capyctl_testkit::FakeEngine;
+
+        let (_state, supervisor) = supervisor();
+        let answer = serde_json::json!({"answers": {"amount_paid": {
+            "type": "number", "guess": 649, "value": 649,
+            "p_null": 0.1, "confidence": 0.9
+        }}, "state_text": capyctl_adapters::extraction_probe::STATE});
+        let engine = Arc::new(FakeEngine::new().with_extractions(vec![FieldType::Number], answer));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new().fallback({
+            let asked = asked.clone();
+            let engine = engine.clone();
+            move |request: axum::extract::Request| {
+                let asked = asked.clone();
+                let engine = engine.clone();
+                async move {
+                    assert_eq!(request.headers()["authorization"], "Bearer k3y");
+                    let path = request.uri().path().to_owned();
+                    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap();
+                    let body = if path == "/health" {
+                        serde_json::Value::Null
+                    } else {
+                        assert_eq!(path, "/v1/systemone");
+                        serde_json::from_slice(&bytes).unwrap()
+                    };
+                    let answer = if path == "/health" {
+                        serde_json::json!({})
+                    } else {
+                        engine.extraction_response(&body).unwrap()
+                    };
+                    asked.lock().unwrap().push((path, body));
+                    axum::Json(answer)
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url: reqwest::Url = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let close = stat.rfind(')').unwrap();
+        let launch = LocalReadyLaunch {
+            fence: capyctl_store::lifecycle::DeploymentFence {
+                deployment_id: "d".into(),
+                revision: 1,
+                generation: 1,
+            },
+            instance_index: 0,
+            operation_id: "o".into(),
+            step_id: "s".into(),
+            binding_id: "b".into(),
+            incarnation: "i".into(),
+            identities: vec![ProcessIdentity {
+                role: "api".into(),
+                pid: std::process::id(),
+                boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                    .unwrap()
+                    .trim()
+                    .to_owned(),
+                start_ticks: stat[close + 2..]
+                    .split_whitespace()
+                    .nth(19)
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+            }],
+            dispatch_enabled: false,
+        };
+        for inputs in [
+            "inputs: [text]\n",
+            "inputs: [image]\n",
+            "inputs: [pdf]\n",
+            "",
+        ] {
+            let custom = CustomProfile::new(
+                CustomManifest::parse(&format!(
+                    "kind: custom_engine\nschema_version: 1\napi: extractions\n\
+                 field_types: [number]\n{inputs}health: /health\n\
+                 args: [\"{{host}}\", \"{{port}}\", \"{{model_dir}}\"]\n"
+                ))
+                .unwrap(),
+            );
+            let target = Target {
+                url: url.clone(),
+                key: Some("k3y".into()),
+                served: "served".into(),
+                api: DeploymentApi::Extractions,
+                custom: Some(custom.clone()),
+                several_gpus: false,
+                tensorrt_llm: None,
+                transfer: capyctl_config::lmcache::TransferMode::LmcacheDriven,
+                tensorfold_native: false,
+            };
+            let result = supervisor.prove_custom(&launch, &target, &custom).await;
+            assert!(result.is_ok(), "{inputs:?}: {result:?}");
+            let requests = std::mem::take(&mut *asked.lock().unwrap());
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].0, "/health");
+            assert_eq!(requests[1].0, "/v1/systemone");
+            assert_eq!(
+                requests[1].1,
+                capyctl_adapters::extraction_probe::request(
+                    "served",
+                    &[FieldType::Number],
+                    custom.manifest.extraction_inputs()
+                )
+            );
+        }
+        engine.set_extraction(vec![FieldType::Number], serde_json::json!({"answers": {}}));
+        let custom = CustomProfile::new(
+            CustomManifest::parse(
+                "kind: custom_engine\nschema_version: 1\napi: extractions\n\
+             field_types: [number]\ninputs: [text]\nhealth: /health\n\
+             args: [\"{host}\", \"{port}\", \"{model_dir}\"]\n",
+            )
+            .unwrap(),
+        );
+        let target = Target {
+            url,
+            key: Some("k3y".into()),
+            served: "served".into(),
+            api: DeploymentApi::Extractions,
+            custom: Some(custom.clone()),
+            several_gpus: false,
+            tensorrt_llm: None,
+            transfer: capyctl_config::lmcache::TransferMode::LmcacheDriven,
+            tensorfold_native: false,
+        };
+        assert!(supervisor
+            .prove_custom(&launch, &target, &custom)
+            .await
+            .unwrap_err()
+            .contains("fixed extraction probe"));
+        assert_eq!(engine.extraction_requests(), 5);
         task.abort();
     }
 
