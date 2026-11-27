@@ -389,13 +389,14 @@ pub fn apply_stated_memory(
     if shares.is_empty() {
         return Ok(());
     }
-    let Some(domain) = host["resource_policy"]["domains"]
-        .as_object_mut()
-        .and_then(|domains| {
-            domains
-                .values_mut()
-                .find(|domain| domain["memory"] != "device")
-        })
+    let Some((domain_id, domain)) =
+        host["resource_policy"]["domains"]
+            .as_object_mut()
+            .and_then(|domains| {
+                domains
+                    .iter_mut()
+                    .find(|(_, domain)| domain["memory"] != "device")
+            })
     else {
         return Ok(());
     };
@@ -410,13 +411,19 @@ pub fn apply_stated_memory(
     }
     let managed = bytes(domain, "managed_limit");
     let reserve = bytes(domain, "free_reserve");
-    if managed.saturating_add(reserve) > capacity_bytes {
+    // SPEC §16.5 / ADR 0025 §1: exact bytes make small boot-to-boot
+    // shortfalls visible; GiB rounding alone hid the cause of #275.
+    let sum = i128::from(managed) + i128::from(reserve);
+    if sum > i128::from(capacity_bytes) {
         return Err(format!(
-            "host.resource_policy.memory.system: the managed limit ({:.1} GiB) and the free \
-             reserve ({:.1} GiB) together exceed the {:.1} GiB of memory this host has",
+            "host.resource_policy.memory.system: resource policy domain `{domain_id}`: \
+             managed_limit {managed} bytes ({:.1} GiB) + free_reserve {reserve} bytes \
+             ({:.1} GiB) exceeds observed capacity {capacity_bytes} bytes ({:.1} GiB) \
+             by {} bytes",
             managed as f64 / GIB,
             reserve as f64 / GIB,
             capacity_bytes as f64 / GIB,
+            sum - i128::from(capacity_bytes),
         ));
     }
     if let Some((_, parked)) = shares.iter().find(|(field, _)| *field == "parked_limit") {

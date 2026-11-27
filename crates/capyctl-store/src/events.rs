@@ -58,6 +58,19 @@ pub(crate) enum EventWriteError {
     #[error(transparent)]
     Serialization(#[from] serde_json::Error),
 }
+/// SPEC §16.5 / ADR 0025 §1: a revised ceiling records the capacity observed
+/// when it was resolved, alongside the old and new limits. Older policies did
+/// not retain their observed capacity; never infer it from rounded limits.
+#[derive(Serialize)]
+pub(crate) struct PolicyMemoryChange {
+    pub domain: String,
+    pub observed_capacity_bytes: i64,
+    pub previous_managed_limit_bytes: i64,
+    pub previous_free_reserve_bytes: i64,
+    pub managed_limit_bytes: i64,
+    pub free_reserve_bytes: i64,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "version")]
 pub(crate) enum EventMetadata {
@@ -131,6 +144,8 @@ pub(crate) enum EventMetadata {
         current_revision: i64,
         ledger_epoch: u64,
         session_epoch: i64,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        memory_changes: Vec<PolicyMemoryChange>,
     },
     /// ADR 0019: the embedded host's generated policy was replaced because
     /// the machine it describes changed shape, after every owner charged

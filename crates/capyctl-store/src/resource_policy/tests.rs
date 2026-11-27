@@ -94,7 +94,7 @@ fn bootstrap_is_durable_and_reopen_prefers_persisted_policy() {
     local.domains.get_mut("system").unwrap().managed_limit = 99;
     assert!(matches!(
         store.import_resource_policy(&session, &local, &observations(), 11_000),
-        Err(ResourcePolicyError::Invalid)
+        Err(ResourcePolicyError::CapacityExceeded { .. })
     ));
     assert_eq!(
         store
@@ -154,8 +154,52 @@ fn reopen_applies_changed_queue_bounds_and_memory_limits() {
     assert_eq!(again.revision, 2);
 }
 
+// T26 T33 (SPEC §7.2, §16.5, ADR 0025 §1): explicit bytes are not shrunk
+// after a reboot. Refusal preserves the revision, ledger and history.
 #[test]
-fn bootstrap_rejects_untrusted_observation_shapes_and_capacity() {
+fn absolute_policy_exceeding_reboot_capacity_is_refused_with_figures() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    let mut policy = host();
+    let domain = policy.domains.get_mut("system").unwrap();
+    domain.managed_limit = 117_596_853_000;
+    domain.free_reserve = 13_066_317_000;
+    let mut observed = observations();
+    observed[0].capacity_bytes = 130_663_170_048;
+    observed[0].available_bytes = 130_663_170_048;
+    store
+        .import_resource_policy(&session, &policy, &observed, 11_000)
+        .unwrap();
+    let before = store.resource_policy("host-a").unwrap();
+    let ledger = store.resource_snapshot().unwrap();
+    let events: i64 = store
+        .conn
+        .query_row("SELECT count(*) FROM management_events", [], |r| r.get(0))
+        .unwrap();
+    observed[0].capacity_bytes = 130_662_936_576;
+    observed[0].available_bytes = 130_662_936_576;
+    let error = store
+        .import_resource_policy(&session, &policy, &observed, 11_000)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "resource policy domain `system`: managed_limit 117596853000 bytes + free_reserve \
+         13066317000 bytes exceeds observed capacity 130662936576 bytes by 233424 bytes"
+    );
+    assert_eq!(store.resource_policy("host-a").unwrap(), before);
+    assert_eq!(store.resource_snapshot().unwrap(), ledger);
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT count(*) FROM management_events", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        events
+    );
+}
+
+#[test]
+fn bootstrap_rejects_untrusted_observation_shapes() {
     for bad in [
         vec![],
         vec![observations()[0].clone(), observations()[0].clone()],
@@ -171,11 +215,6 @@ fn bootstrap_rejects_untrusted_observation_shapes_and_capacity() {
             sampled_at_ms: 8_999,
             ..observations()[0].clone()
         }],
-        vec![MemoryObservation {
-            capacity_bytes: 99,
-            available_bytes: 90,
-            ..observations()[0].clone()
-        }],
     ] {
         let store = crate::Store::open_in_memory().unwrap();
         let session = store.begin_coordinator_session().unwrap();
@@ -183,6 +222,33 @@ fn bootstrap_rejects_untrusted_observation_shapes_and_capacity() {
             store.import_resource_policy(&session, &host(), &bad, 11_000),
             Err(ResourcePolicyError::Invalid)
         ));
+    }
+}
+
+// T03 T26: capacity checks keep exact diagnostics even if the sum would
+// overflow an i64; neither bootstrap nor an update may accept such limits.
+#[test]
+fn bootstrap_reports_capacity_excess_without_overflow() {
+    for (managed, reserve, excess) in [
+        (80, 20, 1),
+        (i64::MAX, i64::MAX, 18_446_744_073_709_551_515_i128),
+    ] {
+        let store = crate::Store::open_in_memory().unwrap();
+        let session = store.begin_coordinator_session().unwrap();
+        let mut policy = host();
+        policy.domains.get_mut("system").unwrap().managed_limit = managed;
+        policy.domains.get_mut("system").unwrap().free_reserve = reserve;
+        let mut observed = observations();
+        observed[0].capacity_bytes = 99;
+        let error = store
+            .import_resource_policy(&session, &policy, &observed, 11_000)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ResourcePolicyError::CapacityExceeded { excess_bytes, .. } if excess_bytes == excess
+        ));
+        assert!(store.resource_policy("host-a").unwrap().is_none());
+        assert_eq!(store.resource_snapshot().unwrap().epoch, 0);
     }
 }
 
