@@ -75,6 +75,17 @@ pub enum ResourcePolicyError {
     StaleSession,
     #[error("invalid resource policy input")]
     Invalid,
+    #[error(
+        "resource policy domain `{domain}`: managed_limit {managed_limit} bytes + free_reserve \
+         {free_reserve} bytes exceeds observed capacity {capacity_bytes} bytes by {excess_bytes} bytes"
+    )]
+    CapacityExceeded {
+        domain: String,
+        managed_limit: i64,
+        free_reserve: i64,
+        capacity_bytes: i64,
+        excess_bytes: i128,
+    },
     #[error("resource policy revision conflict")]
     RevisionConflict,
     #[error("idempotency conflict")]
@@ -387,13 +398,17 @@ fn validate_observations(
             .domains
             .get(&observation.domain)
             .ok_or(ResourcePolicyError::Invalid)?;
-        if domain
-            .managed_limit
-            .checked_add(domain.free_reserve)
-            .filter(|sum| *sum <= observation.capacity_bytes)
-            .is_none()
-        {
-            return Err(ResourcePolicyError::Invalid);
+        // SPEC §16.5 / ADR 0025 §1: no tolerance or silent shrinking of bytes.
+        // Widen before adding so even overflowing input reports its exact excess.
+        let sum = i128::from(domain.managed_limit) + i128::from(domain.free_reserve);
+        if sum > i128::from(observation.capacity_bytes) {
+            return Err(ResourcePolicyError::CapacityExceeded {
+                domain: observation.domain.clone(),
+                managed_limit: domain.managed_limit,
+                free_reserve: domain.free_reserve,
+                capacity_bytes: observation.capacity_bytes,
+                excess_bytes: sum - i128::from(observation.capacity_bytes),
+            });
         }
     }
     Ok(())
@@ -833,9 +848,12 @@ impl crate::Store {
                 }
                 return Err(ResourcePolicyError::RevisionConflict);
             }
+            // SPEC §16.5 / ADR 0025 §1 (#275): the caller already resolved
+            // today's document against today's capacity. Validate that replacement,
+            // not yesterday's limits, before applying it as an ordinary revision.
             validate_observations(
                 &current.context,
-                &current.controls,
+                &controls,
                 observations,
                 now_ms,
                 current.controls.observation_ttl_ms,
@@ -1023,6 +1041,23 @@ impl crate::Store {
                 current_revision: revision,
                 ledger_epoch: epoch,
                 session_epoch: session.epoch(),
+                memory_changes: observations
+                    .iter()
+                    .filter_map(|observation| {
+                        let previous = current.controls.domains.get(&observation.domain)?;
+                        let next = controls.domains.get(&observation.domain)?;
+                        (previous.managed_limit != next.managed_limit
+                            || previous.free_reserve != next.free_reserve)
+                            .then(|| crate::events::PolicyMemoryChange {
+                                domain: observation.domain.clone(),
+                                observed_capacity_bytes: observation.capacity_bytes,
+                                previous_managed_limit_bytes: previous.managed_limit,
+                                previous_free_reserve_bytes: previous.free_reserve,
+                                managed_limit_bytes: next.managed_limit,
+                                free_reserve_bytes: next.free_reserve,
+                            })
+                    })
+                    .collect(),
             },
         )
         .map_err(map_event)?;

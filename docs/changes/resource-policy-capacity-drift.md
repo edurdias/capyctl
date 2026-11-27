@@ -1,0 +1,11 @@
+# Status: Standalone limits follow reboot capacity changes — 2026-11-27 (branch `fix/resource-policy-capacity-drift`)
+
+Issue #275: standalone resolved percentage limits against the current memory at every start, but the store checked the previous revision against that memory before accepting the replacement. A reboot that reduced capacity by 233,472 bytes therefore refused an otherwise valid 90% managed / 10% reserve policy. In accordance with SPEC §16.5 and ADR 0025 §1, publication now validates the newly resolved limits, then applies the ordinary revision and ledger update. The update event records the observed capacity and the previous and replacement memory limits; an unchanged publication creates no revision or update event. Existing reservations remain charged.
+
+Explicit byte limits are not reduced to fit. Both standalone document validation and store validation name the domain, managed limit, free reserve, observed capacity and exact excess when refusing them. Capacity arithmetic also reports sums above the signed 64-bit range without overflow.
+
+The regression test uses the exact issue figures, reopens the persisted server store between starts, and covers reduced capacity, increased capacity, unchanged starts and the journaled limits. It failed before the fix with `Invalid` when publishing the smaller capacity. Additional tests cover explicit-byte refusal without ledger or policy mutation and overflowing sums. A store-to-management event-stream test verifies that operators receive the observed capacity and replacement limits as lossless integer strings; malformed evidence is refused, while historical events and valid long domain names still replay. CPU and Fake-engine tests are not native-engine qualification. A live standalone restart after a reboot that changes memory capacity has not been run.
+
+# Release note: Fixes
+
+- **Standalone starts after small reboot memory changes.** Percentage and automatic memory limits follow the capacity observed at the current start without discarding server state. Explicit byte limits that do not fit are still refused, now with the domain, limits, capacity and exact excess in the error. Policy update events include the observed capacity and the old and new limits.

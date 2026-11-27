@@ -464,6 +464,51 @@ fn token(value: &Value) -> Result<Value, Failure> {
     Ok(value.clone())
 }
 
+// SPEC §16.5 / ADR 0025 §1: expose the observed capacity and revised limits,
+// preserving the event API's closed fields and lossless integer strings.
+fn policy_memory_changes(value: &Value) -> Result<Value, Failure> {
+    let changes = value.as_array().ok_or(Failure::Internal)?;
+    if changes.len() > 256 {
+        return Err(Failure::Internal);
+    }
+    let mut projected = Vec::with_capacity(changes.len());
+    let mut domains = std::collections::BTreeSet::new();
+    for change in changes {
+        let change = change.as_object().ok_or(Failure::Internal)?;
+        if change.len() != 6 {
+            return Err(Failure::Internal);
+        }
+        // Domain names follow the resource-policy contract, not the event
+        // token's 256-byte bound; the whole payload is already capped at 16 KiB.
+        let domain = change
+            .get("domain")
+            .and_then(Value::as_str)
+            .filter(|domain| !domain.is_empty())
+            .ok_or(Failure::Internal)?;
+        if !domains.insert(domain) {
+            return Err(Failure::Internal);
+        }
+        let mut output = Map::new();
+        output.insert("domain".into(), Value::String(domain.into()));
+        for field in [
+            "observed_capacity_bytes",
+            "previous_managed_limit_bytes",
+            "previous_free_reserve_bytes",
+            "managed_limit_bytes",
+            "free_reserve_bytes",
+        ] {
+            let bytes = change
+                .get(field)
+                .and_then(Value::as_i64)
+                .filter(|bytes| *bytes >= 0)
+                .ok_or(Failure::Internal)?;
+            output.insert(field.into(), Value::String(bytes.to_string()));
+        }
+        projected.push(Value::Object(output));
+    }
+    Ok(Value::Array(projected))
+}
+
 // SPEC §14: events are a required management operation. Every kind the store
 // journals (`capyctl_store::events::EventMetadata`) has a closed field schema
 // here; a kind without one is corruption, and the stream reports it as such.
@@ -471,11 +516,18 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
     if event.payload_json.len() > 16 * 1024 || event.recorded_at_ms < 0 {
         return Err(Failure::Internal);
     }
-    let input = unique_object(&event.payload_json)?;
+    let mut input = unique_object(&event.payload_json)?;
     if input.get("version").and_then(Value::as_str) != Some("1") {
         return Err(Failure::Internal);
     }
     use Field::{Id, LmcacheReason, Number, OptionalToken, Phase, Text, Token, Tokens};
+    // Absent in historical records and queue-only updates. No other event
+    // kind may carry this optional field.
+    let memory_changes = if event.kind == "host_resource_policy_updated" {
+        input.remove("memory_changes")
+    } else {
+        None
+    };
     let step = step_transition(event.kind.as_str());
     let switch_phase = event.kind.strip_prefix("switch_").filter(|phase| {
         matches!(
@@ -682,6 +734,9 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
             }
         };
         payload.insert(field.to_owned(), projected);
+    }
+    if let Some(changes) = memory_changes {
+        payload.insert("memory_changes".into(), policy_memory_changes(&changes)?);
     }
     // The indexed columns must agree with the payload they were written from.
     let deployment_field = if switch_phase.is_some() {

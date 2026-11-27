@@ -812,6 +812,114 @@ async fn every_supported_kind_projects_only_known_fields_and_wide_integer_string
     }
 }
 
+// T26 T33 (SPEC §16.5, ADR 0025 §1, #275): the journaled replacement limits
+// and current observed capacity must survive the management event projection.
+#[tokio::test]
+async fn policy_memory_changes_project_exact_bytes_to_event_stream() {
+    let f = fixture::fixture_with(|_, host| {
+        host["resource_policy"]["domains"]["unified"]["managed_limit"] =
+            serde_json::json!("117596853000B");
+        host["resource_policy"]["domains"]["unified"]["free_reserve"] =
+            serde_json::json!("13066317000B");
+    });
+    let cursor = f.store.snapshot().unwrap().cursor.to_string();
+    let mut controls = f.store.resource_policy("lab").unwrap().unwrap().controls;
+    controls.domains.get_mut("unified").unwrap().managed_limit = 117_596_642_850;
+    controls.domains.get_mut("unified").unwrap().free_reserve = 13_066_293_650;
+    let mut observed = f.observations.clone();
+    observed[0].capacity_bytes = 130_662_936_576;
+    observed[0].available_bytes = 130_662_936_576;
+    f.store
+        .update_resource_policy(
+            &f.session, "owner", "lab", 1, "reboot", &controls, &observed, 1000,
+        )
+        .unwrap();
+    let app = support::composed(
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+        read_only_router(Arc::new(StoreSnapshotSource::new(
+            Store::open(&f._dir.path().join("ordinary.db")).unwrap(),
+        ))),
+    );
+    let response = app
+        .oneshot(
+            request(&format!("/management/v1/events?after={cursor}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body().into_data_stream();
+    let frame = next(&mut body).await;
+    let data = frame
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(data).unwrap();
+    assert_eq!(
+        json["payload"]["memory_changes"][0],
+        serde_json::json!({
+            "domain": "unified",
+            "observed_capacity_bytes": "130662936576",
+            "previous_managed_limit_bytes": "117596853000",
+            "previous_free_reserve_bytes": "13066317000",
+            "managed_limit_bytes": "117596642850",
+            "free_reserve_bytes": "13066293650"
+        })
+    );
+}
+
+// T26 T37: the added structured evidence keeps the event API closed and
+// bounded; malformed byte values or domain records fail before SSE headers.
+#[tokio::test]
+async fn policy_memory_changes_reject_corruption_and_keep_valid_domain_names() {
+    for corruption in 0..8 {
+        let source = fake(move |_, _| {
+            let mut e = event(1);
+            e.kind = "host_resource_policy_updated".into();
+            let (mut payload, deployment, operation) = store_shaped(&e.kind);
+            let mut change = serde_json::json!({
+                "domain":"unified", "observed_capacity_bytes":100,
+                "previous_managed_limit_bytes":80, "previous_free_reserve_bytes":20,
+                "managed_limit_bytes":79, "free_reserve_bytes":20
+            });
+            match corruption {
+                0 => change["managed_limit_bytes"] = serde_json::json!(-1),
+                1 => change["unexpected"] = serde_json::json!(1),
+                2 => {
+                    change.as_object_mut().unwrap().remove("free_reserve_bytes");
+                }
+                3 => change["domain"] = serde_json::json!(""),
+                4 => change["observed_capacity_bytes"] = serde_json::json!(u64::MAX),
+                7 => change["domain"] = serde_json::json!("d".repeat(300)),
+                _ => {}
+            }
+            payload["memory_changes"] = match corruption {
+                5 => serde_json::json!([change.clone(), change]),
+                6 => change,
+                _ => serde_json::json!([change]),
+            };
+            e.deployment_id = deployment;
+            e.operation_id = operation;
+            e.payload_json = payload.to_string();
+            Ok(page(vec![e], 1))
+        });
+        let response = fake_app(source, options())
+            .oneshot(
+                request("/management/v1/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if corruption == 7 { 200 } else { 500 },
+            "corruption {corruption}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn page_count_bytes_order_and_identity_corruption_fail_before_headers() {
     for case in 0..5 {

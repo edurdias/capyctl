@@ -2473,6 +2473,103 @@ fn stated_memory_limits_replace_the_derived_ones() {
     assert_eq!(host, derived_unified());
 }
 
+// T01 T26 T33 (SPEC §16.5, ADR 0025 §1, #275): resolve the same percentage
+// document at each boot, then publish it through the real durable policy path.
+#[test]
+fn percentage_policy_survives_reboot_capacity_drift() {
+    use capyctl_domain::resources::MemoryObservation;
+
+    const FIRST: i64 = 130_663_170_048;
+    const SMALLER: i64 = 130_662_936_576;
+    let stated = json!({"resource_policy": {"memory": {"system": {
+        "managed_limit": "90%", "free_reserve": "10%"}}}});
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.sqlite3");
+    for (capacity, revision, changed, managed, reserve) in [
+        (FIRST, 1, true, 117_596_853_000, 13_066_317_000),
+        (SMALLER, 2, true, 117_596_642_850, 13_066_293_650),
+        (SMALLER, 2, false, 117_596_642_850, 13_066_293_650),
+        (FIRST, 3, true, 117_596_853_000, 13_066_317_000),
+        (FIRST, 3, false, 117_596_853_000, 13_066_317_000),
+    ] {
+        let mut document = host_policy(&[], "env", capacity, None, &HostShape::Unified, PORTS);
+        document["model_store"]["path"] = json!("/srv/models");
+        apply_stated_memory(&mut document, &stated, capacity).unwrap();
+        let host = capyctl_config::effective::normalize_host_policy(&document).unwrap();
+        let store = capyctl_store::Store::open(&path).unwrap();
+        let session = store.begin_coordinator_session().unwrap();
+        let observation = MemoryObservation {
+            domain: DOMAIN.into(),
+            capacity_bytes: capacity,
+            available_bytes: capacity,
+            sampled_at_ms: 10_000,
+            outside_processes: None,
+        };
+        let imported = store
+            .import_resource_policy(&session, &host, &[observation], 10_000)
+            .expect("a freshly resolved percentage policy must replace the old limits");
+        assert_eq!((imported.revision, imported.changed), (revision, changed));
+        let domain = &imported.controls.domains[DOMAIN];
+        assert_eq!(
+            (domain.managed_limit, domain.free_reserve),
+            (managed, reserve)
+        );
+        assert!(managed + reserve <= capacity);
+        assert_eq!(store.resource_snapshot().unwrap().epoch, revision as u64);
+        assert_eq!(
+            store
+                .resource_policy("standalone")
+                .unwrap()
+                .unwrap()
+                .controls,
+            imported.controls
+        );
+        let updates: Vec<_> = store
+            .events_after(None, 100)
+            .unwrap()
+            .events
+            .into_iter()
+            .filter(|event| event.kind == "host_resource_policy_updated")
+            .collect();
+        assert_eq!(updates.len(), (revision - 1) as usize);
+        if changed && revision > 1 {
+            let event: Value = serde_json::from_str(&updates.last().unwrap().payload_json).unwrap();
+            assert_eq!(event["memory_changes"][0]["domain"], DOMAIN);
+            assert_eq!(
+                event["memory_changes"][0]["observed_capacity_bytes"],
+                capacity
+            );
+            assert_eq!(event["memory_changes"][0]["managed_limit_bytes"], managed);
+            assert_eq!(event["memory_changes"][0]["free_reserve_bytes"], reserve);
+            let previous = if revision == 2 { FIRST } else { SMALLER };
+            assert_eq!(
+                event["memory_changes"][0]["previous_managed_limit_bytes"],
+                previous / 100 * 90
+            );
+        }
+    }
+}
+
+// T03 T26 (SPEC §16.5, ADR 0025 §1): byte limits stay explicit, and a small
+// capacity shortfall must remain visible rather than rounding away in GiB.
+#[test]
+fn absolute_memory_limits_report_the_exact_capacity_shortfall() {
+    let stated = json!({"resource_policy": {"memory": {"system": {
+        "managed_limit": "117596853000B", "free_reserve": "13066317000B"}}}});
+    let capacity = 130_662_936_576;
+    let mut host = host_policy(&[], "env", capacity, None, &HostShape::Unified, PORTS);
+    let error = apply_stated_memory(&mut host, &stated, capacity).unwrap_err();
+    for figure in [
+        "unified",
+        "117596853000",
+        "13066317000",
+        "130662936576",
+        "233424",
+    ] {
+        assert!(error.contains(figure), "{error} must name {figure}");
+    }
+}
+
 // T03: the managed limit and the free reserve are simultaneous constraints on
 // one memory, so together they must fit what the host observes; the parked and
 // host-KV sub-limits never exceed a lowered managed limit.
